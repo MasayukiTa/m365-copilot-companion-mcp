@@ -57,7 +57,7 @@
 > ひとこと添えると: 「Cowork（社内導入された M365 系・Claude 系のエージェント基盤の総称）
 > は禁止されたが、Microsoft の純正製品なら問題ないだろう」というロジックが通る職場であれば、
 > 本ツールにも目はあります。ただし運用は必ず **明示的に承認を取る** ことを原則としてください。
-> 「禁止されていない」≠「許可されている」を取り違えると、半年後の内部監査で確実にお声がかかります。
+> 「禁止されていない」≠「許可されている」を取り違えると、いずれ然るべきタイミングで然るべき方からお声がかかります。
 
 ---
 
@@ -78,6 +78,9 @@
 | **PDF / OCR** | `read_pdf`, `pdf_info`, `ocr_image`, `ocr_pdf` | デジタル PDF もスキャン PDF も。OCR は Tesseract 経由 |
 | **画像（自己検証）** | `read_image`, `image_info` | エージェントが自分で作った図を **見返して** 確認できる |
 | **PowerPoint** | `create_pptx`, `pptx_from_markdown`, `pptx_info`, `pptx_add_slide`, `pptx_add_image`, `pptx_add_table`, `pptx_replace_image`, `pptx_export_png` | スライド生成 → 画像/表埋込 → **各スライドを PNG 化して自己確認** までフル装備 |
+| **Word (.docx)** | `create_docx`, `docx_from_markdown`, `docx_info`, `read_docx` | 文書生成と読解。markdown 一発から正式文書まで |
+| **Outlook (mail / calendar)** | `outlook_inbox`, `outlook_send_mail`, `outlook_calendar`, `outlook_create_event` | ローカル Outlook を COM で操作。**Graph API 不要、認証は今ログイン中のプロファイルそのまま**。送信系は既定で「下書き保存」 |
+| **クリップボード / スクリーン** | `clipboard_get`, `clipboard_set`, `screenshot` | 「いまコピーしたこれ見て」「いま画面に映ってるもの撮って」 |
 | **図 / 数式** | `render_diagram` (mermaid / graphviz / plantuml / d2 を [Kroki](https://kroki.io) 経由), `render_mermaid_png`, `render_math` (matplotlib mathtext。LaTeX 不要) | アーキ図と数式を即生成 |
 | **Web** | `web_fetch`, `web_search`, `web_search_news`, `github_file` | DuckDuckGo 検索、URL 取得、GitHub raw 取得 |
 | **データベース** | `sqlite_*` 6 種、`odbc_*` 6 種 | SQLite と Windows / Entra 統合認証経由の社内 SQL Server / Azure SQL。**read-only 強制**、verb ホワイトリスト |
@@ -271,6 +274,10 @@ m365-copilot-companion-mcp/
 │   ├── ocr_ops.py           # Tesseract ラッパー
 │   ├── image_ops.py         # read_image, image_info（自己検証）
 │   ├── pptx_ops.py          # PowerPoint 生成 + COM エクスポート
+│   ├── docx_ops.py          # Word (.docx) 生成・読解
+│   ├── outlook_ops.py       # Outlook COM (mail / calendar)
+│   ├── clipboard_ops.py     # クリップボード読み書き
+│   ├── screenshot_ops.py    # スクリーンキャプチャ
 │   ├── diagram_ops.py       # Kroki ベースの図生成
 │   ├── render_ops.py        # matplotlib mathtext の数式レンダラ
 │   ├── web_ops.py           # web_fetch, github_file
@@ -455,6 +462,9 @@ are about 30 lines of Python plus an entry in the `TOOLS` tuple.
 | **PDF / OCR** | `read_pdf`, `pdf_info`, `ocr_image`, `ocr_pdf` | Digital and scanned. |
 | **Image (self-verify)** | `read_image`, `image_info` | The agent can finally see what it just made. |
 | **PowerPoint** | `create_pptx`, `pptx_from_markdown`, `pptx_info`, `pptx_add_slide`, `pptx_add_image`, `pptx_add_table`, `pptx_replace_image`, `pptx_export_png` | Generate decks, embed real charts, then render each slide back to PNG to audit. |
+| **Word (.docx)** | `create_docx`, `docx_from_markdown`, `docx_info`, `read_docx` | Author and read Word documents. Markdown in, .docx out. |
+| **Outlook (mail / calendar)** | `outlook_inbox`, `outlook_send_mail`, `outlook_calendar`, `outlook_create_event` | Drive the locally installed Outlook over COM. **No Graph API required** — inherits the signed-in user's mailbox and calendar. Sends save to Drafts by default. |
+| **Clipboard / screen capture** | `clipboard_get`, `clipboard_set`, `screenshot` | "Look at what I just copied" / "Take a snap of my screen and check what's open." |
 | **Diagrams / math** | `render_diagram` (mermaid / graphviz / plantuml / d2 via [Kroki](https://kroki.io)), `render_mermaid_png`, `render_math` (matplotlib mathtext, no LaTeX install needed) | Architecture diagrams and equations on demand. |
 | **Web** | `web_fetch`, `web_search`, `web_search_news`, `github_file` | DuckDuckGo search, URL fetching, raw GitHub file pulls. |
 | **Databases** | `sqlite_*` and `odbc_*` (six each) | Read-only SQL over Windows / Entra integrated auth. No DBA involvement required. |

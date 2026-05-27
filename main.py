@@ -5,6 +5,8 @@ from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 
 from tools.archive_ops import zip_create, zip_extract, zip_list
+from tools.clipboard_ops import clipboard_get, clipboard_set
+from tools.docx_ops import create_docx, docx_from_markdown, docx_info, read_docx
 from tools.code_exec import run_python, shell_exec
 from tools.coding_ops import (
     diff_files,
@@ -42,6 +44,13 @@ from tools.file_ops import (
 from tools.image_ops import image_info, read_image
 from tools.memory_ops import memory_delete, memory_list, memory_load, memory_save
 from tools.notify_ops import notify_desktop
+from tools.outlook_ops import (
+    outlook_calendar,
+    outlook_create_event,
+    outlook_inbox,
+    outlook_send_mail,
+)
+from tools.screenshot_ops import screenshot
 from tools.odbc_ops import (
     odbc_columns,
     odbc_connections,
@@ -163,6 +172,12 @@ TOOLS = (
     create_pptx, pptx_from_markdown, pptx_info,
     pptx_add_slide, pptx_add_image, pptx_add_table, pptx_replace_image,
     pptx_export_png,
+    # docx (Word documents)
+    create_docx, docx_from_markdown, docx_info, read_docx,
+    # outlook (mail + calendar via local COM, no Graph API)
+    outlook_inbox, outlook_send_mail, outlook_calendar, outlook_create_event,
+    # clipboard / screen capture
+    clipboard_get, clipboard_set, screenshot,
     # task management
     todo_write, todo_list, todo_clear,
     # env / introspection
