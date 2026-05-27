@@ -1,0 +1,29 @@
+{
+  "_template": "facts_template.json",
+  "_note": "ユーザー基本情報・好み等の恒久情報。facts/user_profile.json として使う",
+  "name": "",
+  "email": "",
+  "company": "",
+  "role": "",
+  "environment": {
+    "os": "",
+    "home": "",
+    "mcp_root": "",
+    "memory_root": ""
+  },
+  "projects": [
+    {
+      "name": "",
+      "status": "active|paused|done",
+      "topic_id": ""
+    }
+  ],
+  "preferences": {
+    "language": "ja-JP",
+    "communication_style": [],
+    "tools_in_use": []
+  },
+  "dislikes": [],
+  "expectations_for_agent": [],
+  "last_updated": ""
+}

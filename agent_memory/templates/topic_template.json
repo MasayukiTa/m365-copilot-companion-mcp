@@ -1,0 +1,49 @@
+{
+  "_template": "topic_template.json",
+  "_note": "新規トピック作成時にこのファイルをコピーして topics/<topic_id>.json として使う",
+  "topic_id": "<snake_case_unique_id>",
+  "title": "<人間可読タイトル>",
+  "status": "active",
+  "created": "<ISO8601 UTC>",
+  "updated": "<ISO8601 UTC>",
+  "tags": [],
+  "keywords": [],
+  "summary": "<2-4行の要約。次回セッション再開時に最初に読む部分>",
+  "data_sources": [
+    {
+      "path": "",
+      "note": ""
+    }
+  ],
+  "method": [],
+  "key_facts": [
+    {
+      "fact": "",
+      "confidence": "high|medium|low"
+    }
+  ],
+  "hypotheses": [
+    {
+      "label": "",
+      "claim": "",
+      "evidence": ""
+    }
+  ],
+  "decisions": [
+    {
+      "decision": "",
+      "rationale": "",
+      "when": "<ISO8601 UTC>"
+    }
+  ],
+  "artifacts": [
+    {
+      "path": "",
+      "type": "report|figure|data|code|other",
+      "note": ""
+    }
+  ],
+  "open_questions": [],
+  "next_actions": [],
+  "related_topics": []
+}

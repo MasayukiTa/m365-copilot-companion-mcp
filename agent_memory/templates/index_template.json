@@ -1,0 +1,40 @@
+{
+  "_template": "index_template.json",
+  "_note": "トップインデックス。agent_memory/index.json として使う",
+  "version": "1.0",
+  "last_updated": "<ISO8601 UTC>",
+  "owner": "<email>",
+  "description": "エージェント疑似メモリのトップインデックス。セッション開始時に最初に読む。",
+  "facts": [
+    {
+      "id": "user_profile",
+      "file": "facts/user_profile.json",
+      "title": ""
+    }
+  ],
+  "topics": [
+    {
+      "id": "",
+      "title": "",
+      "status": "active",
+      "tags": [],
+      "keywords": [],
+      "last_active": "",
+      "file": "topics/<id>.json",
+      "one_liner": ""
+    }
+  ],
+  "boot_protocol": [
+    "1. このindex.jsonを読む",
+    "2. ユーザー発話のキーワードから該当topicを特定（keywords/tagsで一致）",
+    "3. 該当topic JSONを読んで前回までの文脈を復元",
+    "4. 必要ならfacts/user_profile.jsonも参照",
+    "5. 『前回は〜の続きですね』と入る"
+  ],
+  "shutdown_protocol": [
+    "1. このセッションで新しく出た key_facts / decisions / next_actions を抽出",
+    "2. 該当 topic JSON の updated/key_facts/decisions/next_actions を更新",
+    "3. sessions/YYYY-MM-DD_<topic>.json にセッション要約を保存",
+    "4. このindex.json の last_updated と該当 topic の last_active を更新"
+  ]
+}

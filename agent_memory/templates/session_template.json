@@ -1,0 +1,12 @@
+{
+  "_template": "session_template.json",
+  "_note": "セッション要約。sessions/YYYY-MM-DD_<label>.json として保存",
+  "session_id": "<YYYY-MM-DD_label>",
+  "date": "<YYYY-MM-DD>",
+  "duration_minutes_approx": 0,
+  "topics_touched": [],
+  "narrative": [],
+  "outputs_created": [],
+  "user_feedback_notes": [],
+  "next_session_starter_hint": ""
+}
