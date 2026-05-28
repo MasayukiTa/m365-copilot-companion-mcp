@@ -69,7 +69,9 @@
 
 | カテゴリ | 主なツール | 何のために |
 |---|---|---|
-| **コード実行** | `run_python`, `shell_exec`, `run_python_in_background`, `run_in_background`, `job_wait`, `job_status`, `job_output`, `job_list`, `job_kill` | コードを走らせる、長いやつは投げて待つ、暴走したら殺す |
+| **コード実行 (Python / shell)** | `run_python`, `shell_exec`, `run_python_in_background`, `run_in_background`, `job_wait`, `job_status`, `job_output`, `job_list`, `job_kill` | コードを走らせる、長いやつは投げて待つ、暴走したら殺す |
+| **PowerShell 専用** | `pwsh_exec`, `pwsh_exec_file`, `shell_which` | `cmd.exe` 経由ではなく **PowerShell 5.1 / 7 を直接叩く**（`-NoProfile -NonInteractive -ExecutionPolicy Bypass` 込みなのでスクリプト即動く） |
+| **プロセス / サービス / レジストリ** | `process_list`, `process_info`, `process_kill`, `service_status`, `registry_read` | タスクマネージャ + サービスマネージャ + レジストリエディタの読み口（kill は unlock 必須） |
 | **ファイル I/O** | `read_file`, `write_file`, `append_file`, `list_directory`, `glob`, `find_files`, `copy_path`, `move_path`, `trash_path`, `create_directory`, `delete_path` | 許可ディレクトリ内のファイルを自在に。`trash_path` はゴミ箱送りで誤操作復元可 |
 | **ファイル法医学** | `hash_file`, `find_duplicates`, `dir_size`, `file_metadata` | 「80 GB どこいった？」を 1 プロンプトで解明 |
 | **編集・検索** | `grep`, `replace_in_file`, `multi_edit`, `diff_files`, `python_check` | 原子的な複数編集。「ファイル半分食われた」事故が起きない |
@@ -453,7 +455,9 @@ are about 30 lines of Python plus an entry in the `TOOLS` tuple.
 
 | Category | Tools | What it's for |
 |---|---|---|
-| **Code execution** | `run_python`, `shell_exec`, `run_python_in_background`, `run_in_background`, `job_wait`, `job_status`, `job_output`, `job_list`, `job_kill` | Run code. Wait for results. Kill the runaway. |
+| **Code execution (Python / shell)** | `run_python`, `shell_exec`, `run_python_in_background`, `run_in_background`, `job_wait`, `job_status`, `job_output`, `job_list`, `job_kill` | Run code. Wait for results. Kill the runaway. |
+| **PowerShell** | `pwsh_exec`, `pwsh_exec_file`, `shell_which` | Dedicated PowerShell entry points with `-NoProfile -NonInteractive -ExecutionPolicy Bypass` defaults. Works against Windows PowerShell 5.1 or PowerShell 7 if installed. |
+| **Processes / services / registry** | `process_list`, `process_info`, `process_kill`, `service_status`, `registry_read` | Task Manager + Services + Registry Editor as MCP tools (kill requires unlock). |
 | **File I/O** | `read_file`, `write_file`, `append_file`, `list_directory`, `glob`, `find_files`, `copy_path`, `move_path`, `trash_path`, `create_directory`, `delete_path` | Read, write, move, delete inside the allowed base. |
 | **File forensics** | `hash_file`, `find_duplicates`, `dir_size`, `file_metadata` | "Where did 80 GB go?" — answered in one prompt. |
 | **Editing / search** | `grep`, `replace_in_file`, `multi_edit`, `diff_files`, `python_check` | Atomic multi-edit. No more "the agent ate half my file." |

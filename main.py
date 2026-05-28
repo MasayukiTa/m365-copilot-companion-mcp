@@ -50,6 +50,9 @@ from tools.outlook_ops import (
     outlook_inbox,
     outlook_send_mail,
 )
+from tools.process_ops import process_info, process_kill, process_list
+from tools.registry_ops import registry_read, service_status
+from tools.shell_extra import pwsh_exec, pwsh_exec_file, shell_which
 from tools.screenshot_ops import screenshot
 from tools.odbc_ops import (
     odbc_columns,
@@ -127,8 +130,12 @@ mcp = FastMCP(
 TOOLS = (
     # code execution
     run_python, shell_exec,
+    pwsh_exec, pwsh_exec_file, shell_which,
     run_in_background, run_python_in_background,
     job_status, job_wait, job_output, job_list, job_kill,
+    # processes / services / registry (Windows host introspection)
+    process_list, process_info, process_kill,
+    service_status, registry_read,
     # files (read)
     read_file, list_directory, glob, find_files,
     # files (write / mutate)
