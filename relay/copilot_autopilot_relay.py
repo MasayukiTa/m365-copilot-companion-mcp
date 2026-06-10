@@ -67,6 +67,10 @@ COPILOT_SELECTORS = {
     # it can read back the user's own message, which broke STUCK detection.
     "assistant_msg": ".fai-CopilotMessage",
     "assistant_msg_fallback": '[data-testid="copilot-message-reply-div"]',
+    # The Send button. Pressing Enter in this rich editor does NOT reliably submit
+    # (the text just sits in the composer) -- clicking this button does. aria-label
+    # is locale-specific; cover JP + EN.
+    "send_button": 'button[aria-label="送信"], button[aria-label="Send"]',
 }
 
 PROTOCOL = (
@@ -140,8 +144,33 @@ class CopilotWebDriver:
         composer.click()
         composer.fill("")  # contenteditable: clear any leftover text
         self.page.keyboard.type(one_line)   # via CDP -> lands in the page, not the OS
-        self.page.wait_for_timeout(200)
-        self.page.keyboard.press("Enter")
+        self.page.wait_for_timeout(300)
+        # SUBMIT via the Send button -- Enter is unreliable in this editor and
+        # frequently leaves the text sitting in the composer unsent.
+        submitted = False
+        btn = self.page.locator(COPILOT_SELECTORS["send_button"]).first
+        try:
+            if btn.count() > 0 and btn.is_enabled():
+                btn.click()
+                submitted = True
+        except Exception:
+            submitted = False
+        if not submitted:
+            self.page.keyboard.press("Enter")
+        # verify the composer actually cleared; if not, retry once.
+        self.page.wait_for_timeout(600)
+        try:
+            leftover = (composer.inner_text() or "").strip()
+        except Exception:
+            leftover = ""
+        if leftover:
+            try:
+                if btn.count() > 0 and btn.is_enabled():
+                    btn.click()
+                else:
+                    self.page.keyboard.press("Enter")
+            except Exception:
+                self.page.keyboard.press("Enter")
 
     def wait_for_idle(self, timeout_s: int = 1800, dwell_s: float = 4.0,
                       appear_timeout_s: int = 180) -> bool:
