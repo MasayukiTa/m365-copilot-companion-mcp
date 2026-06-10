@@ -67,12 +67,36 @@ COPILOT_SELECTORS = {
 }
 
 PROTOCOL = (
-    "あなたはこのゴールに向けて、ツールを使いながら段階的に作業を進めます。"
+    "あなたはこのゴールに向けて、ツールを使いながら自律的に作業します。"
+    "重いゴールは一発で終わらせようとせず、自分で小さなステップに分割し、"
+    "1ターンに1〜数ステップずつ着実に進めてください。"
     "各ターンの最後の行に必ず次のいずれかを書いてください: "
-    "まだ続きがある場合は CONTINUE、すべて完了したら DONE、"
-    "行き詰まって人手が要る場合は FAIL: と理由。"
-    "まず最初のステップを実行してください。\nGoal: "
+    "まだ続きがある場合は CONTINUE、ゴール全体が完了したら DONE、"
+    "行き詰まって人手が要る場合は STUCK: と理由。"
+    "まず全体を小ステップに分割し、最初のステップを実行してください。\nGoal: "
 )
+
+CONTINUE_JOB = (
+    "次のステップを実行してください。ゴール全体が完了したら最後の行に DONE、"
+    "まだ続きがあれば CONTINUE、行き詰まったら STUCK: 理由 と書いてください。"
+)
+FIX_JOB = (
+    "直前の失敗の原因を分析し、ツールで修正してから続けてください。"
+    "どうしても無理なら最後の行に STUCK: 理由 と書いてください。"
+)
+NUDGE_JOB = (
+    "前のステップがまだ完了していないようです。今の状況を1行で報告し、"
+    "可能なら次に進んでください。"
+)
+
+
+def default_notify(title: str, body: str) -> None:
+    """Best-effort Windows toast; never raises into the control loop."""
+    try:
+        from tools.notify_ops import notify_desktop
+        notify_desktop(title, body[:240])
+    except Exception:
+        pass
 
 
 class CopilotWebDriver:
@@ -130,48 +154,122 @@ class CopilotWebDriver:
         return "\n".join(lines).strip()
 
 
-def run_relay(driver: CopilotWebDriver, goal: str, run_id: str, max_turns: int) -> str:
-    # Pull any prior context for this run id so the loop benefits from memory.
+def run_relay(
+    driver,
+    goal: str,
+    run_id: str = "relay",
+    max_turns: int = 20,
+    per_turn_timeout_s: int = 1800,
+    max_no_progress: int = 3,
+    max_timeouts: int = 2,
+    notify=default_notify,
+    sleep_s: float = 1.0,
+) -> str:
+    """Run the autonomous loop unattended. Returns one of:
+    DONE | STUCK | MAXTURNS | ABORTED. Notifies on every terminal outcome.
+
+    Reliability guards (so a hands-off run never spins forever or dies silently):
+      * per-turn completion timeout (max_timeouts consecutive -> STUCK)
+      * no-progress detection: identical answer for max_no_progress turns -> STUCK
+      * agent self-reported STUCK: -> STUCK
+      * hard max_turns cap -> MAXTURNS
+      * kill-switch (stop_check) every turn -> ABORTED
+      * send/read exceptions -> STUCK (never crash unattended)
+    Every turn is written to the run-log (operator D) and cross-session memory.
+    """
     prior = memory_load(f"relay.{run_id}.context", scope="relay")
     context = "" if prior.startswith("[memory_load") else f"\n(前回までの文脈: {prior})\n"
 
-    turn = 0
     job = PROTOCOL + goal + context
-    final = "MAXTURNS"
+    turn = 0
+    no_progress = 0
+    timeouts = 0
+    last_norm = None
+    outcome: str | None = None
+    reason = ""
+
     while turn < max_turns:
         if stop_check().startswith("STOP"):
-            final = "ABORTED"
+            outcome, reason = "ABORTED", "kill-switch"
             break
         turn += 1
-        driver.send(job)
-        ok = driver.wait_for_idle()
-        resp = driver.read_last_response() if ok else "[timeout/aborted]"
+        try:
+            driver.send(job)
+        except Exception as e:
+            outcome, reason = "STUCK", f"send failed: {type(e).__name__}: {e}"
+            break
 
-        # record to BOTH the audit log (operator D) and cross-session memory.
+        try:
+            ok = driver.wait_for_idle(timeout_s=per_turn_timeout_s)
+        except Exception as e:
+            outcome, reason = "STUCK", f"wait failed: {type(e).__name__}: {e}"
+            break
+
+        if not ok:
+            timeouts += 1
+            runlog_append(run_id, {"turn": turn, "event": "turn_timeout", "count": timeouts})
+            if timeouts >= max_timeouts:
+                outcome, reason = "STUCK", "turn did not finish (repeated timeout)"
+                break
+            job = NUDGE_JOB
+            continue
+        timeouts = 0
+
+        try:
+            resp = driver.read_last_response()
+        except Exception as e:
+            outcome, reason = "STUCK", f"read failed: {type(e).__name__}: {e}"
+            break
+
         runlog_append(run_id, {"turn": turn, "job_excerpt": job[:160],
                                "response_excerpt": resp[:500]})
         memory_save(f"relay.{run_id}.turn{turn}", resp[:4000], scope="relay",
                     tags=["relay", run_id])
+        print(f"[relay turn {turn}] {resp[:160].replace(chr(10), ' ')}")
+
+        norm = " ".join(resp.lower().split())[:300]
+        no_progress = no_progress + 1 if norm and norm == last_norm else 0
+        last_norm = norm
 
         up = resp.upper()
         last_line = (resp.strip().splitlines() or [""])[-1].upper()
-        print(f"[relay turn {turn}] {resp[:160].replace(chr(10), ' ')}")
-        if "FAIL" in last_line:
-            job = "直前の FAIL の原因を分析し、ツールで修正してから作業を続けてください。"
-        elif "DONE" in up:  # matches DONE and RELAY_DONE sentinels
-            final = "DONE"
-            break
-        else:
-            job = "次のステップを実行してください。完了していれば最後の行に DONE と書いてください。"
-        time.sleep(1.0)
 
-    # persist a compact summary so a future run can resume with context.
+        if "STUCK" in up:
+            outcome, reason = "STUCK", "agent reported STUCK"
+            break
+        if "DONE" in up and "FAIL" not in last_line:
+            outcome = "DONE"
+            break
+        if no_progress >= max_no_progress:
+            outcome, reason = "STUCK", f"no progress for {no_progress + 1} turns"
+            break
+        if "FAIL" in last_line:
+            job = FIX_JOB
+        else:
+            job = CONTINUE_JOB
+        time.sleep(sleep_s)
+
+    if outcome is None:
+        outcome, reason = "MAXTURNS", f"reached max_turns={max_turns} without DONE"
+
     memory_save(f"relay.{run_id}.context",
-                f"last_status={final} turns={turn}", scope="relay", tags=["relay", run_id])
+                f"last_status={outcome} turns={turn} reason={reason}",
+                scope="relay", tags=["relay", run_id])
+
+    titles = {
+        "DONE":     ("✅ Relay 完了", f"ゴール達成 ({turn} ターン): {goal[:120]}"),
+        "STUCK":    ("⚠ Relay 停止 (要確認)", f"{reason} / {turn} ターンで停止"),
+        "MAXTURNS": ("⏹ Relay 上限到達", f"{turn} ターンで DONE に至らず"),
+        "ABORTED":  ("⏹ Relay 中止", "kill-switch により停止"),
+    }
+    title, body = titles.get(outcome, ("Relay", outcome))
+    notify(title, body)
+
     print("\n--- run-log (operator D) ---")
     print(runlog_summarize(run_id))
-    print(f"\nrelay finished: {final} in {turn} turn(s). History saved to memory scope 'relay'.")
-    return final
+    print(f"\nrelay finished: {outcome} ({reason}) in {turn} turn(s). "
+          f"History in memory scope 'relay'. Notification sent.")
+    return outcome
 
 
 def find_conversation_page(context, conversation_url: str):

@@ -182,6 +182,15 @@
   確認でき、次回の relay は前回の文脈を memory から引き継いで再開します。
 - **止められる・問える。** `stop_request()`（kill-switch）を毎ターン＆長時間
   待機中もポーリング。HITL ゲートと組み合わせれば要所で人間に確認を取れます。
+- **完了でも停滞でも必ず通知。** ゴール達成（DONE）・行き詰まり（STUCK）・
+  上限到達（MAXTURNS）・中止（ABORTED）のいずれでも `notify_desktop` でデスクトップ
+  通知。重いタスクを投げて別作業に戻り、終わった/止まった時だけ気づけます。
+  停滞は「無進捗が続く・ターンがタイムアウト・エージェントが STUCK 申告」で自動検知。
+
+> 制御ループの信頼性は `relay/test_relay_loop.py` で**全終了パスを検証済み**
+> （DONE / 無進捗STUCK / FAIL→自己修復 / タイムアウトSTUCK / エージェントSTUCK /
+> MAXTURNS / kill-switch の 7 シナリオ、各々で通知発火を確認）。ブラウザ無しで
+> モックドライバにより決定的にテストできます。
 
 **一回だけのセットアップ**（再ログイン不要・Playwright のブラウザ DL も不要 ―
 既にログイン済みの Edge に attach するだけ）:
@@ -749,6 +758,17 @@ goal ──▶ [ relay ] ──CDP──▶ [ your Copilot tab in Edge ]
   `runlog_summarize`; the next relay run resumes with context pulled from memory.
 - **Stoppable and gateable.** `stop_request()` (kill-switch) is polled every turn
   and during long waits; combine with the HITL gate to ask a human at key points.
+- **Always notifies -- on success AND on stall.** Whether the goal completes
+  (DONE), gets stuck (STUCK), hits the turn cap (MAXTURNS) or is aborted
+  (ABORTED), it fires a desktop notification via `notify_desktop`. Throw a heavy
+  task at it, go do other work, and you only get pulled back when it finishes or
+  stalls. Stall is auto-detected from: no progress across turns, a turn timing
+  out, or the agent self-reporting STUCK.
+
+> The control loop's reliability is **proven across every terminal path** in
+> `relay/test_relay_loop.py` (7 scenarios: DONE / no-progress STUCK / FAIL->fix /
+> timeout STUCK / agent STUCK / MAXTURNS / kill-switch, each asserting the
+> notification fires) -- deterministically, with a mock driver, no browser needed.
 
 **One-time setup** (no re-login, no Playwright browser download -- it attaches to
 the Edge you are already signed into):
