@@ -29,10 +29,12 @@ from tools.gate_ops import stop_check
 
 load_dotenv()
 
-# The Researcher agent URL embeds tenant/agent GUIDs, so it is NOT hardcoded here
-# (this file is public). Set it in .env (gitignored):
+# Agent URLs embed tenant/agent GUIDs, so they are NOT hardcoded here (this file is
+# public). Set them in .env (gitignored):
 #   MCP_RESEARCHER_AGENT_URL=https://m365.cloud.microsoft/chat/agent/P_....dr_work
+#   MCP_ANALYST_AGENT_URL=https://m365.cloud.microsoft/chat/agent/P_....diceberry
 RESEARCHER_URL = os.environ.get("MCP_RESEARCHER_AGENT_URL", "")
+ANALYST_URL = os.environ.get("MCP_ANALYST_AGENT_URL", "")
 
 
 @dataclass
@@ -58,7 +60,20 @@ RESEARCHER = AgentProfile(
     end_timeout_s=1800, dwell_s=12.0, appear_timeout_s=300,
 )
 
-PROFILES = {p.name: p for p in (PLAIN, RESEARCHER)}
+# Analyst ("アナリスト") analyses an UPLOADED data file. Unlike the Researcher it has
+# NO model picker (cannot be switched to Claude) and runs on its default model.
+# NOTE on value: the implementation agent already has read_excel / run_python /
+# summarize_table locally, so prefer doing analysis with those. The Analyst is only
+# worth delegating to for its built-in analysis/visualisation UI on a file. Per spec
+# §5 its numeric claims must be ground-verified with the local tools (operator ③).
+ANALYST = AgentProfile(
+    name="analyst",
+    url=ANALYST_URL,      # from MCP_ANALYST_AGENT_URL (.env) -- not committed
+    model_picker=None,
+    end_timeout_s=900, dwell_s=8.0, appear_timeout_s=180,
+)
+
+PROFILES = {p.name: p for p in (PLAIN, RESEARCHER, ANALYST)}
 
 
 def open_agent(page, profile: AgentProfile) -> bool:
@@ -240,5 +255,65 @@ def ask_agent(page, query: str, profile: AgentProfile = RESEARCHER,
         "model": model_set,
         "result": drv.read_last_response() if ok else "",
         "clarification": clarification,
+        "elapsed_s": round(time.time() - t0, 1),
+    }
+
+
+def upload_file(page, file_path: str, timeout_s: float = 30.0) -> bool:
+    """Attach a local data file to the composer via the hidden <input type=file>
+    (bypasses the OS file dialog). Returns True once set_input_files succeeds."""
+    inp = page.locator('input[type="file"][accept*="csv"]').first
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            if inp.count() > 0:
+                break
+        except Exception:
+            pass
+        page.wait_for_timeout(500)
+    try:
+        inp.set_input_files(file_path)
+    except Exception:
+        try:
+            page.locator('input[type="file"]').first.set_input_files(file_path)
+        except Exception:
+            return False
+    # give the attachment chip a moment to register before we send the instruction
+    page.wait_for_timeout(2500)
+    return True
+
+
+def analyze(page, file_path: str, instruction: str, profile: AgentProfile = ANALYST,
+            run_id: str = "analyze") -> dict:
+    """Delegate a data-analysis step to the Analyst agent: open it, upload the local
+    data file, send the instruction, wait out the turn, return the analysis.
+
+    Returns {ok, result, elapsed_s}. Per spec §5 the caller MUST ground-verify any
+    numeric claims with the local tools (run_python etc.) -- the Analyst's prose is
+    not the source of truth.
+    """
+    t0 = time.time()
+    if not profile.url:
+        return {"ok": False, "result": "", "elapsed_s": 0,
+                "error": "MCP_ANALYST_AGENT_URL not set in .env"}
+    if not os.path.isfile(file_path):
+        return {"ok": False, "result": "", "elapsed_s": 0,
+                "error": f"file not found: {file_path}"}
+    drv = CopilotWebDriver(page)
+    if not open_agent(page, profile):
+        return {"ok": False, "result": "", "elapsed_s": 0,
+                "error": "composer never rendered"}
+    if not upload_file(page, file_path):
+        return {"ok": False, "result": "", "elapsed_s": round(time.time() - t0, 1),
+                "error": "file upload failed"}
+    if stop_check().startswith("STOP"):
+        return {"ok": False, "result": "", "elapsed_s": 0,
+                "error": "aborted by kill-switch before send"}
+    drv.send(instruction)
+    ok = drv.wait_for_idle(timeout_s=profile.end_timeout_s, dwell_s=profile.dwell_s,
+                           appear_timeout_s=profile.appear_timeout_s)
+    return {
+        "ok": ok,
+        "result": drv.read_last_response() if ok else "",
         "elapsed_s": round(time.time() - t0, 1),
     }

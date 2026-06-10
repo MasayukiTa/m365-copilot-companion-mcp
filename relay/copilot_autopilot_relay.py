@@ -80,8 +80,12 @@ PROTOCOL = (
     "1ターンに1〜数ステップずつ着実に進めてください。"
     "外部の深い調査が必要なときは、その行に `RESEARCH: <調べてほしいこと>` と書いて止まってください。"
     "こちらが深い調査(Claude)を行い、結果を渡すので、それを使って続行できます。"
+    "ローカルのデータファイルを専用ツールで分析させたいときは、その行に "
+    "`ANALYZE: <ファイルの絶対パス> | <分析指示>` と書いてください"
+    "（ただし単純な集計は自分の run_python/read_excel の方が速く確実です）。"
     "各ターンの最後の行に必ず次のいずれかを書いてください: "
     "まだ続きがある場合は CONTINUE、深い調査を依頼する場合は RESEARCH: と内容、"
+    "データ分析を依頼する場合は ANALYZE: と内容、"
     "ゴール全体が完了したら DONE、行き詰まって人手が要る場合は STUCK: と理由。"
     "まず全体を小ステップに分割し、最初のステップを実行してください。\nGoal: "
 )
@@ -121,6 +125,23 @@ def extract_research(resp: str) -> str:
         if m and m.group(1).strip():
             return m.group(1).strip()
     return ""
+
+
+def extract_analyze(resp: str):
+    """Pull (file_path, instruction) out of an `ANALYZE: <path> | <instruction>`
+    line. Returns None if no analysis was requested."""
+    for line in (resp or "").splitlines():
+        m = re.match(r"\s*ANALYZE\s*[:：]\s*(.+)", line, re.IGNORECASE)
+        if m and m.group(1).strip():
+            body = m.group(1).strip()
+            if "|" in body:
+                path, instr = body.split("|", 1)
+                path, instr = path.strip(), instr.strip()
+            else:
+                path, instr = body, "添付データを分析し、要点を短くまとめてください。"
+            if path:
+                return path, instr
+    return None
 
 
 def default_notify(title: str, body: str) -> None:
@@ -317,6 +338,7 @@ def run_relay(
     no_progress = 0
     timeouts = 0
     research_count = 0
+    analyze_count = 0
     last_norm = None
     outcome: str | None = None
     reason = ""
@@ -410,6 +432,54 @@ def run_relay(
             time.sleep(sleep_s)
             continue
         # ---- end deep-dive delegation ----
+
+        # ---- data-analysis delegation (spec §5: analyst node) ----
+        az = extract_analyze(resp)
+        if az and browser_context is not None:
+            apath, ainstr = az
+            analyze_count += 1
+            if analyze_count > max_research:
+                job = ("これ以上は分析を依頼できません（上限到達）。自前ツールで分析するか、"
+                       "無理なら最後の行に STUCK: 理由 と書いてください。")
+                time.sleep(sleep_s)
+                continue
+            notify("📊 Relay 分析開始", apath[:80])
+            runlog_append(run_id, {"turn": turn, "event": "analyze_start", "file": apath[:200]})
+            print(f"[relay turn {turn}] -> ANALYZE delegated: {apath[:80]}")
+            ares = {"ok": False, "result": "", "error": "not run"}
+            apage = None
+            try:
+                from .agent_profiles import ANALYST, analyze
+                apage = browser_context.new_page()
+                ares = analyze(apage, apath, ainstr, ANALYST)
+            except Exception as e:
+                ares = {"ok": False, "result": "", "error": f"{type(e).__name__}: {e}"}
+            finally:
+                try:
+                    if apage is not None:
+                        apage.close()
+                except Exception:
+                    pass
+                try:
+                    driver.page.bring_to_front()
+                except Exception:
+                    pass
+            rep = (ares.get("result") or "")[:3000] if ares.get("ok") else ""
+            runlog_append(run_id, {"turn": turn, "event": "analyze_done",
+                                   "ok": bool(ares.get("ok")), "len": len(rep),
+                                   "elapsed_s": ares.get("elapsed_s"),
+                                   "error": ares.get("error", "")})
+            print(f"[relay turn {turn}] <- ANALYZE done ok={ares.get('ok')} len={len(rep)}")
+            if rep:
+                job = ("依頼した分析が完了しました。以下が結果です。**数値は鵜呑みにせず、必ず "
+                       "run_python / read_excel などの自前ツールで再計算して地上検証してから**使ってください。\n"
+                       f"--- 分析結果 ---\n{rep}\n--- 分析結果ここまで ---\n" + CONTINUE_JOB)
+            else:
+                job = (f"分析を試みましたが結果を取得できませんでした（{ares.get('error', 'timeout/empty')}）。"
+                       "自前ツールで分析するか、無理なら最後の行に STUCK: 理由 と書いてください。")
+            time.sleep(sleep_s)
+            continue
+        # ---- end data-analysis delegation ----
 
         up = resp.upper()
         last_line = (resp.strip().splitlines() or [""])[-1].upper()
