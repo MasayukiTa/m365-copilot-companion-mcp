@@ -1,7 +1,7 @@
 # m365-copilot-companion-mcp
 
 > Microsoft 365 Copilot に **手** を生やすやつ。
-> あなたの貸与ノート PC の上で動く。**100+ ツール**（執筆時点で 117）、
+> あなたの貸与ノート PC の上で動く。**100+ ツール**（執筆時点で 143）、
 > 追加課金ゼロ、構築おおむね 1 人日。
 
 🇯🇵 **このページは日本語版です。English version follows below ↓**
@@ -36,7 +36,7 @@
                                                   ファイル · Python · DB · Office 生成
 ```
 
-> **ツール数について正直に**: `main.py` には 117 個のツールが登録されています。ただし
+> **ツール数について正直に**: `main.py` には 143 個のツールが登録されています。ただし
 > **クローン直後に全部が動くわけではありません**。Outlook 本体・PowerPoint・Tesseract・
 > ODBC ドライバ・Windows 環境などを前提とするものが含まれます。**いま自分の環境で実際に
 > 有効なツールは `list_my_tools` を叩けば分かります**。前提条件は下のカタログにタグで明記しています。
@@ -152,65 +152,66 @@
 2. `write_file` で `tools/your_ops.py` を生成する
 3. `run_python` でロジックを動作確認する
 
-——ここまでをチャットの中で完結できる。あとは `main.py` の `TOOLS` に 1 行足して再起動すれば、**自分で書いたツールが次回から常設ツールになる**。「◯◯の API を叩くツールが欲しい」と頼めば、エージェントが雛形を書いて検証し、登録手順まで提示します。つまりこのサーバーは **使いながら自分で育つ**。117 は出発点にすぎません。
+——ここまでをチャットの中で完結できる。あとは `main.py` の `TOOLS` に 1 行足して再起動すれば、**自分で書いたツールが次回から常設ツールになる**。「◯◯の API を叩くツールが欲しい」と頼めば、エージェントが雛形を書いて検証し、登録手順まで提示します。つまりこのサーバーは **使いながら自分で育つ**。143 は出発点にすぎません。
 
 ---
 
-## 🔁 自動リレー — Copilot を“裏で勝手に回す”（目玉機能）
+## 🔁 重いタスクを“勝手に最後まで回す”ループ（目玉機能）
 
-ここがこのプロジェクトの一番尖った部分です。`relay/copilot_autopilot_relay.py` は、
-**ゴールを1つ渡すと、あなたの M365 Copilot エージェントを自律的に完了まで駆動する**
-スタンドアロンのコントローラ（中継器）です。
+ブラウザ自動化も外部スクリプトも要りません。ループは **Copilot エージェント自身が
+タスク管理ツールを叩き続けること**で回ります。エンドユーザーの PC に Claude は不要、
+画面の占有もゼロです。
 
 ```
-ゴール投入 ──▶ [ relay ] ──CDP──▶ [ Edge のあなたの Copilot タブ ]
-                  ▲  完了検知して次を自動投入             │ MCP ツールで実作業
-                  └───────────── 応答を読む ◀────────────┘
+重いゴール
+   │  task_plan(goal, [step1, step2, ...])     ← エージェントが一度だけ分割
+   ▼
+[ step1 を実作業ツールで実行 ] ─▶ task_advance(result) ─▶ 次のステップを返す
+[ step2 を実作業ツールで実行 ] ─▶ task_advance(result) ─▶ ...
+        ...                                          最後のステップ完了で
+                                                     自動 DONE + デスクトップ通知
 ```
 
-**何がすごいか:**
+**仕組み:**
 
-- **あなたの作業を一切邪魔しない。** ブラウザを Chrome DevTools Protocol 経由で
-  駆動するため、**OS のマウスカーソルもキーボードフォーカスも奪いません**。
-  relay が裏で Copilot 会話を回している間、あなたは別ウィンドウで普通に入力作業を
-  続けられます。スクショ＋クリックの自動化（=画面を占有する）とは根本的に違います。
-- **Claude も人間もループに不在。** 唯一の知能は Copilot エージェント自身（固定
-  オラクル）。relay 側は「完了を検知して次の job を投げる」決定的な配管だけで、
-  生成 AI を一切使いません。だから**完全無人で回り続けます**。
-- **記録される。** 各ターンを **クロスセッション memory** と **監査ラン
-  ログ（operator D）** の両方に保存。後から `runlog_summarize` で収束の軌跡を
-  確認でき、次回の relay は前回の文脈を memory から引き継いで再開します。
-- **止められる・問える。** `stop_request()`（kill-switch）を毎ターン＆長時間
-  待機中もポーリング。HITL ゲートと組み合わせれば要所で人間に確認を取れます。
-- **完了でも停滞でも必ず通知。** ゴール達成（DONE）・行き詰まり（STUCK）・
-  上限到達（MAXTURNS）・中止（ABORTED）のいずれでも `notify_desktop` でデスクトップ
-  通知。重いタスクを投げて別作業に戻り、終わった/止まった時だけ気づけます。
-  停滞は「無進捗が続く・ターンがタイムアウト・エージェントが STUCK 申告」で自動検知。
+- **ループは Copilot のツール実行ループそのもの。** エージェントが `task_plan` で
+  ゴールを小ステップに割り、各ステップを `run_python` などで実行しては
+  `task_advance` を呼ぶ。返り値が次の指示になるので、エージェントは自分で全完了まで
+  歩き続けます。中継器も打鍵も送信ボタン操作も一切なし。
+- **ターンをまたいでも再開できる。** 計画と進捗は
+  `<MCP_ALLOWED_BASE>/.companion_tasks/<id>.json` に永続化。1 ターンで終わらない
+  重量級でも、次ターンで `task_status(task_id)` を呼べば中断点から続きます。
+- **完了でも停滞でも必ず通知。** 最後のステップを `task_advance` した瞬間に自動で
+  DONE 判定＋`notify_desktop`。行き詰まったらエージェントが `task_stuck(reason)` を
+  呼んでデスクトップ通知。重いタスクを投げて別作業に戻り、**終わった/止まった時だけ
+  気づけます**。
+- **記録される。** 各ステップを監査ランログ（operator D）に追記。完了タスクは
+  クロスセッション memory にも保存され、後から `runlog_summarize` / `task_list` で
+  軌跡を追えます。
 
-> 制御ループの信頼性は `relay/test_relay_loop.py` で**全終了パスを検証済み**
-> （DONE / 無進捗STUCK / FAIL→自己修復 / タイムアウトSTUCK / エージェントSTUCK /
-> MAXTURNS / kill-switch の 7 シナリオ、各々で通知発火を確認）。ブラウザ無しで
-> モックドライバにより決定的にテストできます。
+**使うツール（companion 標準ツール、追加インストール不要）:**
 
-**一回だけのセットアップ**（再ログイン不要・Playwright のブラウザ DL も不要 ―
-既にログイン済みの Edge に attach するだけ）:
+| ツール | 役割 |
+|---|---|
+| `task_plan(goal, steps)` | ゴールを順序付きステップに分割して保存し、 step 1 を返す |
+| `task_advance(task_id, result)` | 現ステップを完了記録し、次を返す（最後なら自動 DONE＋通知） |
+| `task_status(task_id)` | 計画と進捗を表示（次ターンでの再開用） |
+| `task_stuck(task_id, reason)` | 停滞としてマークしデスクトップ通知 |
+| `task_finish(task_id, summary)` | 明示的に DONE にして通知 |
+| `task_list()` | 全タスクの状態一覧 |
 
-```powershell
-.\.venv\Scripts\pip.exe install -r requirements-relay.txt
+**システムプロンプトに一文入れるだけ**で発動します:
 
-# Edge を debug ポート付きで起動（Chrome でも可）
-& "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --remote-debugging-port=9222
-# → その Edge で M365 Copilot を開き、MCP エージェントで新規チャットを開始し、
-#   会話 URL をコピー
-
-.\.venv\Scripts\python.exe relay\copilot_autopilot_relay.py `
-  --conversation-url "https://m365.cloud.microsoft/chat/agent/.../conversation/..." `
-  --goal "copilot_loop_demo に data.csv(10行)を作り、合計と平均を出す stats.py を書き、self-test を足して PASS させ、SUMMARY にまとめる" `
-  --max-turns 12
+```
+重い・複数ステップのゴールを受けたら、まず task_plan(goal, steps) で分割し、
+各ステップを実行するたびに task_advance を呼び、全完了まで自分で歩き続けること。
+進められなくなったら task_stuck を呼ぶこと。
 ```
 
-> セレクタはライブの M365 Copilot DOM から採取済み（`COPILOT_SELECTORS` に隔離）。
-> Microsoft が DOM を変えたらそこだけ直せば動きます。
+> なぜブラウザ自動化を使わないのか: M365 Copilot の入力欄は会話中「送信」ボタンが
+> 「停止」ボタンに変わるなど DOM が状態で揺れ、外部から打鍵・送信を駆動するのは
+> 脆く・画面も占有します。**ループはエージェントのツール実行に内在させるのが正解**で、
+> Claude も Playwright も不要になります。
 
 ---
 
@@ -574,7 +575,7 @@ PR や Issue 歓迎。お願い:
 
 A personal-use **Model Context Protocol (MCP) server** that turns one
 laptop into a fully-capable agent backend for **Microsoft 365 Copilot**,
-**Claude Desktop**, or any other MCP-aware client. **100+ tools** (117 at
+**Claude Desktop**, or any other MCP-aware client. **100+ tools** (143 at
 the time of writing). Zero external API keys. Built in roughly a day.
 
 > **If this README is long or you're not sure what runs on your machine**:
@@ -600,7 +601,7 @@ One user, one companion, one laptop. Nothing is centralised. Nothing
 leaves the box you wouldn't want it to. Costs **zero** beyond the M365
 Copilot licence you already have.
 
-> **Honest note on the tool count**: `main.py` registers 117 tools, but
+> **Honest note on the tool count**: `main.py` registers 143 tools, but
 > **not all of them run on a fresh clone**. Some require Outlook,
 > PowerPoint, Tesseract, an ODBC driver, or Windows. **Run `list_my_tools`
 > to see what's actually live in your environment.** Requirements are
@@ -726,67 +727,68 @@ The powerful part: **the agent can author new tools on the fly.**
 `run_python` to test it — all inside the chat. Add one line to `TOOLS`,
 restart, and the tool it just wrote becomes permanent. Ask "I want a tool
 that calls X's API" and it'll scaffold, test, and hand you the
-registration step. The server **grows as you use it.** 117 is the floor.
+registration step. The server **grows as you use it.** 143 is the floor.
 
 ---
 
-## 🔁 Autonomous relay — drive Copilot in the background (the headline feature)
+## 🔁 Self-driving loop for heavy tasks (the headline feature)
 
-The sharpest part of the project. `relay/copilot_autopilot_relay.py` is a
-standalone controller (the "frame") that, given a single goal, **drives your
-M365 Copilot agent to completion autonomously**.
+No browser automation, no external script. The loop is **the Copilot agent calling
+task-management tools in its own tool-use loop**. The end user needs no Claude
+installed and nothing on screen is taken over.
 
 ```
-goal ──▶ [ relay ] ──CDP──▶ [ your Copilot tab in Edge ]
-            ▲  detect completion, inject next job        │ does the real work via MCP
-            └──────────────── read the answer ◀──────────┘
+heavy goal
+   │  task_plan(goal, [step1, step2, ...])      ← agent decomposes once
+   ▼
+[ do step1 with real tools ] ─▶ task_advance(result) ─▶ returns next step
+[ do step2 with real tools ] ─▶ task_advance(result) ─▶ ...
+        ...                                       last step completed ->
+                                                  auto DONE + desktop notification
 ```
 
-**Why it matters:**
+**How it works:**
 
-- **It does not interfere with your other work.** It drives the page through the
-  Chrome DevTools Protocol, so keystrokes and clicks are dispatched into the tab
-  **without moving your OS cursor or stealing keyboard focus**. The relay pumps a
-  Copilot conversation in one tab while you keep typing in other windows. That is
-  the whole point versus screenshot-and-click automation, which owns your screen.
-- **No Claude and no human in the loop.** The only intelligence is the Copilot
-  agent itself (the fixed oracle). The frame is deterministic plumbing -- detect
-  completion, decide, inject the next job -- and makes zero model calls. So it
-  runs fully unattended.
-- **Everything is recorded.** Each turn is saved to **cross-session memory** and
-  an **audit run-log (operator D)**. Inspect the convergence trajectory later with
-  `runlog_summarize`; the next relay run resumes with context pulled from memory.
-- **Stoppable and gateable.** `stop_request()` (kill-switch) is polled every turn
-  and during long waits; combine with the HITL gate to ask a human at key points.
-- **Always notifies -- on success AND on stall.** Whether the goal completes
-  (DONE), gets stuck (STUCK), hits the turn cap (MAXTURNS) or is aborted
-  (ABORTED), it fires a desktop notification via `notify_desktop`. Throw a heavy
-  task at it, go do other work, and you only get pulled back when it finishes or
-  stalls. Stall is auto-detected from: no progress across turns, a turn timing
-  out, or the agent self-reporting STUCK.
+- **The loop IS Copilot's tool-use loop.** The agent splits the goal with
+  `task_plan`, does each step with `run_python` et al., then calls `task_advance`;
+  the return value is the next instruction, so the agent walks itself to the end.
+  No frame, no keystrokes, no Send-button driving.
+- **Resumable across turns.** Plan and progress persist to
+  `<MCP_ALLOWED_BASE>/.companion_tasks/<id>.json`. If a heavy task does not finish
+  in one turn, a later turn calls `task_status(task_id)` and continues from the
+  break point.
+- **Always notifies -- on completion AND on stall.** The moment the last step is
+  `task_advance`-d, it auto-marks DONE and fires `notify_desktop`. If the agent
+  hits a dead end it calls `task_stuck(reason)`, which also notifies. Throw a heavy
+  task at it, go do other work, **get pulled back only when it finishes or stalls.**
+- **Everything is recorded.** Each step is appended to the audit run-log
+  (operator D); completed tasks are also saved to cross-session memory. Trace the
+  trajectory later with `runlog_summarize` / `task_list`.
 
-> The control loop's reliability is **proven across every terminal path** in
-> `relay/test_relay_loop.py` (7 scenarios: DONE / no-progress STUCK / FAIL->fix /
-> timeout STUCK / agent STUCK / MAXTURNS / kill-switch, each asserting the
-> notification fires) -- deterministically, with a mock driver, no browser needed.
+**Tools (standard companion tools, nothing extra to install):**
 
-**One-time setup** (no re-login, no Playwright browser download -- it attaches to
-the Edge you are already signed into):
+| Tool | Role |
+|---|---|
+| `task_plan(goal, steps)` | Split goal into ordered steps, store, return step 1 |
+| `task_advance(task_id, result)` | Record current step, return next (auto DONE+notify on last) |
+| `task_status(task_id)` | Show plan and progress (for resuming in a later turn) |
+| `task_stuck(task_id, reason)` | Mark stuck and fire a desktop notification |
+| `task_finish(task_id, summary)` | Explicitly mark DONE and notify |
+| `task_list()` | List all tasks and their status |
 
-```powershell
-.\.venv\Scripts\pip.exe install -r requirements-relay.txt
+**One line in the system prompt** turns it on:
 
-# Launch Edge with the debug port (Chrome works too)
-& "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --remote-debugging-port=9222
-# In that Edge: open M365 Copilot, start a NEW chat with your MCP agent, copy the URL.
-
-.\.venv\Scripts\python.exe relay\copilot_autopilot_relay.py `
-  --conversation-url "https://m365.cloud.microsoft/chat/agent/.../conversation/..." `
-  --goal "..." --max-turns 12
+```
+When given a heavy or multi-step goal, first call task_plan(goal, steps) to split
+it, then call task_advance after doing each step, and keep walking the steps to
+completion yourself. If you can no longer proceed, call task_stuck.
 ```
 
-> Selectors were captured from the live M365 Copilot DOM and isolated in
-> `COPILOT_SELECTORS` -- if Microsoft changes the DOM, patch just that block.
+> Why not browser automation: the M365 Copilot composer's DOM shifts with state
+> (the "Send" button becomes a "Stop" button mid-response), so driving keystrokes
+> and submits from outside is brittle and owns your screen. **The loop belongs
+> inside the agent's tool-use** -- which removes the need for Claude or Playwright
+> entirely.
 
 ---
 

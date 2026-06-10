@@ -44,6 +44,9 @@ from tools.file_ops import (
 from tools.image_ops import image_info, read_image
 from tools.memory_ops import memory_delete, memory_list, memory_load, memory_save
 from tools.notify_ops import notify_desktop
+from tools.orchestrate_ops import (
+    task_plan, task_advance, task_status, task_stuck, task_finish, task_list,
+)
 from tools.outlook_ops import (
     outlook_calendar,
     outlook_create_event,
@@ -205,6 +208,9 @@ TOOLS = (
     clipboard_get, clipboard_set, screenshot,
     # task management
     todo_write, todo_list, todo_clear,
+    # heavy-task loop: agent decomposes once, then walks steps via its own
+    # tool-use loop; auto-notifies on completion and on a stuck dead-end.
+    task_plan, task_advance, task_status, task_stuck, task_finish, task_list,
     # orchestration: audit/replay run-log (operator D)
     runlog_append, runlog_read, runlog_list, runlog_summarize,
     # orchestration: human-in-the-loop gate + kill-switch (operator E)

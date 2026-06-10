@@ -1,7 +1,0 @@
-# Extra dependency for the autonomous relay (relay/copilot_autopilot_relay.py).
-# Not needed for the MCP server itself. Install only if you want the hands-off relay:
-#   .venv\Scripts\pip.exe install -r requirements-relay.txt
-#
-# connect_over_cdp attaches to your already-running Edge/Chrome, so no Playwright
-# browser download is required (no `playwright install`).
-playwright>=1.50
