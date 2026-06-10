@@ -144,6 +144,24 @@ def extract_analyze(resp: str):
     return None
 
 
+def _adjust_backoff(ok, turn_elapsed, backoff_s, base_elapsed,
+                    backoff_step_s, backoff_max_s, slow_factor):
+    """Pure adaptive-throttle step (spec §6). Returns (new_backoff, new_base, reason).
+
+      * a turn that timed out         -> raise backoff hard (2 steps)
+      * a turn >slow_factor x the fastest healthy turn (and >20s) -> raise 1 step
+      * an otherwise healthy turn      -> decay backoff by half a step
+    `base_elapsed` tracks the fastest healthy turn = the "not throttled" baseline.
+    """
+    if not ok:
+        return min(backoff_max_s, backoff_s + backoff_step_s * 2), base_elapsed, "turn_timeout"
+    if base_elapsed is None or turn_elapsed < base_elapsed:
+        base_elapsed = turn_elapsed
+    if base_elapsed and turn_elapsed > base_elapsed * slow_factor and turn_elapsed > 20:
+        return min(backoff_max_s, backoff_s + backoff_step_s), base_elapsed, "slow_turn"
+    return max(0.0, backoff_s - backoff_step_s * 0.5), base_elapsed, "healthy"
+
+
 def default_notify(title: str, body: str) -> None:
     """Best-effort Windows toast; never raises into the control loop."""
     try:
@@ -312,6 +330,10 @@ def run_relay(
     browser_context=None,
     research_model: str = "Claude",
     max_research: int = 3,
+    throttle: bool = True,
+    backoff_step_s: float = 20.0,
+    backoff_max_s: float = 300.0,
+    slow_factor: float = 2.5,
 ) -> str:
     """Run the autonomous loop unattended. Returns one of:
     DONE | STUCK | MAXTURNS | ABORTED. Notifies on every terminal outcome.
@@ -339,6 +361,8 @@ def run_relay(
     timeouts = 0
     research_count = 0
     analyze_count = 0
+    backoff_s = 0.0          # adaptive throttle: extra cool-down added between turns
+    base_elapsed = None      # fastest healthy turn so far -> the "not throttled" baseline
     last_norm = None
     outcome: str | None = None
     reason = ""
@@ -348,6 +372,7 @@ def run_relay(
             outcome, reason = "ABORTED", "kill-switch"
             break
         turn += 1
+        t_send = time.time()
         try:
             driver.send(job)
         except Exception as e:
@@ -359,6 +384,24 @@ def run_relay(
         except Exception as e:
             outcome, reason = "STUCK", f"wait failed: {type(e).__name__}: {e}"
             break
+        turn_elapsed = time.time() - t_send
+
+        # Adaptive throttle (spec §6): the laptop cannot see Microsoft's fair-use
+        # ceiling directly, so infer "being throttled" from the agent's own
+        # responsiveness -- a turn that times out, or runs much slower than the
+        # fastest healthy turn, raises a cool-down added between turns; healthy
+        # turns decay it. Every change is logged so "when did it start being
+        # throttled" is visible in the run-log (operator D).
+        if throttle:
+            prev = backoff_s
+            backoff_s, base_elapsed, t_reason = _adjust_backoff(
+                ok, turn_elapsed, backoff_s, base_elapsed,
+                backoff_step_s, backoff_max_s, slow_factor)
+            if abs(backoff_s - prev) > 0.1:
+                runlog_append(run_id, {"turn": turn, "event": "throttle", "reason": t_reason,
+                                       "turn_elapsed_s": round(turn_elapsed, 1),
+                                       "base_s": round(base_elapsed or 0, 1),
+                                       "backoff_s": round(backoff_s, 1)})
 
         if not ok:
             timeouts += 1
@@ -367,6 +410,7 @@ def run_relay(
                 outcome, reason = "STUCK", "turn did not finish (repeated timeout)"
                 break
             job = NUDGE_JOB
+            time.sleep(sleep_s + backoff_s)
             continue
         timeouts = 0
 
@@ -429,7 +473,7 @@ def run_relay(
             else:
                 job = (f"調査を試みましたが結果を取得できませんでした（{rres.get('error', 'timeout/empty')}）。"
                        "調査結果なしで可能な範囲で進めるか、無理なら最後の行に STUCK: 理由 と書いてください。")
-            time.sleep(sleep_s)
+            time.sleep(sleep_s + backoff_s)
             continue
         # ---- end deep-dive delegation ----
 
@@ -477,7 +521,7 @@ def run_relay(
             else:
                 job = (f"分析を試みましたが結果を取得できませんでした（{ares.get('error', 'timeout/empty')}）。"
                        "自前ツールで分析するか、無理なら最後の行に STUCK: 理由 と書いてください。")
-            time.sleep(sleep_s)
+            time.sleep(sleep_s + backoff_s)
             continue
         # ---- end data-analysis delegation ----
 
@@ -497,7 +541,7 @@ def run_relay(
             job = FIX_JOB
         else:
             job = CONTINUE_JOB
-        time.sleep(sleep_s)
+        time.sleep(sleep_s + backoff_s)
 
     if outcome is None:
         outcome, reason = "MAXTURNS", f"reached max_turns={max_turns} without DONE"
