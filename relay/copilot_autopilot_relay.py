@@ -129,6 +129,39 @@ class CopilotWebDriver:
     def _answers(self):
         return self.page.locator(COPILOT_SELECTORS["assistant_msg"])
 
+    def _send_button(self):
+        return self.page.locator(COPILOT_SELECTORS["send_button"]).first
+
+    def _composer_text(self) -> str:
+        """Current composer text, minus zero-width junk."""
+        try:
+            t = self.page.locator(COPILOT_SELECTORS["composer"]).first.inner_text() or ""
+        except Exception:
+            t = ""
+        return t.replace("​", "").replace("‌", "").strip()
+
+    def _wait_send_armed(self, timeout_s: float = 12.0) -> bool:
+        """Wait until the Send button is present AND enabled.
+
+        Two facts this guards against, both learned the hard way:
+          * The Send button only ARMS a beat after real text is typed -- clicking
+            immediately after typing finds nothing and silently no-ops.
+          * WHILE the agent turn is running, the Send button is REPLACED by the
+            Stop (square) button, so `送信` is simply absent. Its (re)appearance is
+            therefore the reliable "the turn is idle and ready" signal (spec §7:
+            judge by an element that only exists after completion).
+        """
+        deadline = time.time() + timeout_s
+        btn = self._send_button()
+        while time.time() < deadline:
+            try:
+                if btn.count() > 0 and btn.is_enabled():
+                    return True
+            except Exception:
+                pass
+            self.page.wait_for_timeout(400)
+        return False
+
     def send(self, text: str) -> None:
         # CRITICAL: a newline in the Copilot composer SUBMITS the message. Collapse
         # all whitespace (incl. newlines) to single spaces so the whole job is sent
@@ -141,36 +174,34 @@ class CopilotWebDriver:
         except Exception:
             self._count_before = 0
         composer = self.page.locator(COPILOT_SELECTORS["composer"]).first
-        composer.click()
-        composer.fill("")  # contenteditable: clear any leftover text
-        self.page.keyboard.type(one_line)   # via CDP -> lands in the page, not the OS
-        self.page.wait_for_timeout(300)
-        # SUBMIT via the Send button -- Enter is unreliable in this editor and
-        # frequently leaves the text sitting in the composer unsent.
-        submitted = False
-        btn = self.page.locator(COPILOT_SELECTORS["send_button"]).first
-        try:
-            if btn.count() > 0 and btn.is_enabled():
-                btn.click()
-                submitted = True
-        except Exception:
-            submitted = False
-        if not submitted:
-            self.page.keyboard.press("Enter")
-        # verify the composer actually cleared; if not, retry once.
-        self.page.wait_for_timeout(600)
-        try:
-            leftover = (composer.inner_text() or "").strip()
-        except Exception:
-            leftover = ""
-        if leftover:
-            try:
-                if btn.count() > 0 and btn.is_enabled():
-                    btn.click()
-                else:
+
+        # Type -> wait for Send to ARM -> force-click -> verify composer emptied.
+        # Retry a few times; if it never empties, RAISE so run_relay records a real
+        # STUCK instead of pretending the turn was submitted.
+        for attempt in range(3):
+            composer.click()
+            self.page.keyboard.press("Control+a")   # clear via keyboard, not fill("")
+            self.page.keyboard.press("Delete")       # -- fill("") leaves the editor
+            self.page.wait_for_timeout(150)          #    in a state where Send won't arm
+            self.page.keyboard.type(one_line)        # CDP insert -> bypasses the OS IME
+            if self._wait_send_armed(timeout_s=12.0):
+                try:
+                    self._send_button().click(force=True, timeout=4000)
+                except Exception:
+                    pass
+            else:
+                # Send never armed (rare): last-ditch Enter.
+                try:
                     self.page.keyboard.press("Enter")
-            except Exception:
-                self.page.keyboard.press("Enter")
+                except Exception:
+                    pass
+            self.page.wait_for_timeout(800)
+            if not self._composer_text():
+                return  # composer emptied => message was submitted
+        raise RuntimeError(
+            "send failed: composer still holds text after 3 attempts "
+            "(Send button never submitted the message)"
+        )
 
     def wait_for_idle(self, timeout_s: int = 1800, dwell_s: float = 4.0,
                       appear_timeout_s: int = 180) -> bool:
