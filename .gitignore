@@ -30,6 +30,10 @@ dist/
 .companion_runs/
 .companion_gates/
 
+# Demo artifacts that agents may emit into the server CWD via relative paths
+copilot_loop_demo/
+companion_loop_demo/
+
 # ======================================================================
 # Agent Memory (個人情報・社外秘を含むため原則すべて非公開)
 # ----------------------------------------------------------------------

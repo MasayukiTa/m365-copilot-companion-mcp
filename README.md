@@ -156,6 +156,55 @@
 
 ---
 
+## 🔁 自動リレー — Copilot を“裏で勝手に回す”（目玉機能）
+
+ここがこのプロジェクトの一番尖った部分です。`relay/copilot_autopilot_relay.py` は、
+**ゴールを1つ渡すと、あなたの M365 Copilot エージェントを自律的に完了まで駆動する**
+スタンドアロンのコントローラ（中継器）です。
+
+```
+ゴール投入 ──▶ [ relay ] ──CDP──▶ [ Edge のあなたの Copilot タブ ]
+                  ▲  完了検知して次を自動投入             │ MCP ツールで実作業
+                  └───────────── 応答を読む ◀────────────┘
+```
+
+**何がすごいか:**
+
+- **あなたの作業を一切邪魔しない。** ブラウザを Chrome DevTools Protocol 経由で
+  駆動するため、**OS のマウスカーソルもキーボードフォーカスも奪いません**。
+  relay が裏で Copilot 会話を回している間、あなたは別ウィンドウで普通に入力作業を
+  続けられます。スクショ＋クリックの自動化（=画面を占有する）とは根本的に違います。
+- **Claude も人間もループに不在。** 唯一の知能は Copilot エージェント自身（固定
+  オラクル）。relay 側は「完了を検知して次の job を投げる」決定的な配管だけで、
+  生成 AI を一切使いません。だから**完全無人で回り続けます**。
+- **記録される。** 各ターンを **クロスセッション memory** と **監査ラン
+  ログ（operator D）** の両方に保存。後から `runlog_summarize` で収束の軌跡を
+  確認でき、次回の relay は前回の文脈を memory から引き継いで再開します。
+- **止められる・問える。** `stop_request()`（kill-switch）を毎ターン＆長時間
+  待機中もポーリング。HITL ゲートと組み合わせれば要所で人間に確認を取れます。
+
+**一回だけのセットアップ**（再ログイン不要・Playwright のブラウザ DL も不要 ―
+既にログイン済みの Edge に attach するだけ）:
+
+```powershell
+.\.venv\Scripts\pip.exe install -r requirements-relay.txt
+
+# Edge を debug ポート付きで起動（Chrome でも可）
+& "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --remote-debugging-port=9222
+# → その Edge で M365 Copilot を開き、MCP エージェントで新規チャットを開始し、
+#   会話 URL をコピー
+
+.\.venv\Scripts\python.exe relay\copilot_autopilot_relay.py `
+  --conversation-url "https://m365.cloud.microsoft/chat/agent/.../conversation/..." `
+  --goal "copilot_loop_demo に data.csv(10行)を作り、合計と平均を出す stats.py を書き、self-test を足して PASS させ、SUMMARY にまとめる" `
+  --max-turns 12
+```
+
+> セレクタはライブの M365 Copilot DOM から採取済み（`COPILOT_SELECTORS` に隔離）。
+> Microsoft が DOM を変えたらそこだけ直せば動きます。
+
+---
+
 ## 🚀 セットアップ（あなた個人の PC で）
 
 ### 0. 前提
@@ -669,6 +718,55 @@ The powerful part: **the agent can author new tools on the fly.**
 restart, and the tool it just wrote becomes permanent. Ask "I want a tool
 that calls X's API" and it'll scaffold, test, and hand you the
 registration step. The server **grows as you use it.** 117 is the floor.
+
+---
+
+## 🔁 Autonomous relay — drive Copilot in the background (the headline feature)
+
+The sharpest part of the project. `relay/copilot_autopilot_relay.py` is a
+standalone controller (the "frame") that, given a single goal, **drives your
+M365 Copilot agent to completion autonomously**.
+
+```
+goal ──▶ [ relay ] ──CDP──▶ [ your Copilot tab in Edge ]
+            ▲  detect completion, inject next job        │ does the real work via MCP
+            └──────────────── read the answer ◀──────────┘
+```
+
+**Why it matters:**
+
+- **It does not interfere with your other work.** It drives the page through the
+  Chrome DevTools Protocol, so keystrokes and clicks are dispatched into the tab
+  **without moving your OS cursor or stealing keyboard focus**. The relay pumps a
+  Copilot conversation in one tab while you keep typing in other windows. That is
+  the whole point versus screenshot-and-click automation, which owns your screen.
+- **No Claude and no human in the loop.** The only intelligence is the Copilot
+  agent itself (the fixed oracle). The frame is deterministic plumbing -- detect
+  completion, decide, inject the next job -- and makes zero model calls. So it
+  runs fully unattended.
+- **Everything is recorded.** Each turn is saved to **cross-session memory** and
+  an **audit run-log (operator D)**. Inspect the convergence trajectory later with
+  `runlog_summarize`; the next relay run resumes with context pulled from memory.
+- **Stoppable and gateable.** `stop_request()` (kill-switch) is polled every turn
+  and during long waits; combine with the HITL gate to ask a human at key points.
+
+**One-time setup** (no re-login, no Playwright browser download -- it attaches to
+the Edge you are already signed into):
+
+```powershell
+.\.venv\Scripts\pip.exe install -r requirements-relay.txt
+
+# Launch Edge with the debug port (Chrome works too)
+& "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --remote-debugging-port=9222
+# In that Edge: open M365 Copilot, start a NEW chat with your MCP agent, copy the URL.
+
+.\.venv\Scripts\python.exe relay\copilot_autopilot_relay.py `
+  --conversation-url "https://m365.cloud.microsoft/chat/agent/.../conversation/..." `
+  --goal "..." --max-turns 12
+```
+
+> Selectors were captured from the live M365 Copilot DOM and isolated in
+> `COPILOT_SELECTORS` -- if Microsoft changes the DOM, patch just that block.
 
 ---
 
