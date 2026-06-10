@@ -112,37 +112,111 @@ def set_model(page, profile: AgentProfile, model_name: str = "Claude") -> bool:
     return model_name.lower() in current_model(page, profile).lower()
 
 
-def ask_agent(page, query: str, profile: AgentProfile = RESEARCHER,
-              model_name: str | None = "Claude", run_id: str = "research") -> dict:
-    """Full deep-dive step: open the agent (fresh chat), optionally switch model,
-    send the query, wait out the long streaming turn by DOM state, return the report.
+# The Researcher does NOT run on the first message: it first replies with a SCOPING
+# step (clarifying questions + an explicit "go ahead" escape hatch) and only runs the
+# multi-minute deep research AFTER you approve. So a one-shot send-and-wait stops at
+# the clarification, not the report. ask_agent() handles the two stages.
+CLARIFY_MARKERS = ("go ahead", "to make sure", "make sure i cover",
+                   "問題ないですか", "でよいですか", "含めますか", "限定しますか")
+# Elements that appear ONLY once the deep-research report is finished (spec §7).
+DONE_MARKERS = ("ステップで完了", "推論が", "に変換:", "PowerPoint", "インフォグラフィック")
+DEFAULT_APPROVAL = ("go ahead でお願いします。設定はお任せ（best judgment）で、"
+                    "調査を開始して最終レポートまで進めてください。")
 
-    Returns {ok, model, result, elapsed_s}. `ok` is False on timeout / kill-switch /
-    setup failure -- the caller (the relay / operator ③) should ground-verify any
-    numeric claims with the local tools rather than trusting the prose.
+
+def _looks_like_clarification(text: str) -> bool:
+    t = (text or "").lower()
+    has_clarify = any(m.lower() in t for m in CLARIFY_MARKERS)
+    has_done = any(m.lower() in t for m in DONE_MARKERS)
+    # short-ish, asks/offers go-ahead, and is NOT already a finished report
+    return has_clarify and not has_done and len(text) < 1500
+
+
+def _wait_research_done(drv: CopilotWebDriver, profile: AgentProfile) -> bool:
+    """Wait out the long deep-research turn. Completion = a NEW answer block, then
+    its text is non-placeholder AND (carries a completion marker OR has been stable
+    for the dwell). Polls the kill-switch. Tolerant of multi-minute streaming with
+    intermediate pauses (uses a long dwell, so a pause is not mistaken for done)."""
+    deadline = time.time() + profile.end_timeout_s
+    appear_deadline = time.time() + min(profile.appear_timeout_s, profile.end_timeout_s)
+    while time.time() < appear_deadline:
+        if stop_check().startswith("STOP"):
+            return False
+        try:
+            if drv._answers().count() > drv._count_before:
+                break
+        except Exception:
+            pass
+        time.sleep(1.0)
+    last, stable_since = None, None
+    from .copilot_autopilot_relay import _is_processing
+    while time.time() < deadline:
+        if stop_check().startswith("STOP"):
+            return False
+        t = drv.read_last_response()
+        if _is_processing(t):
+            last, stable_since = None, None
+        elif t == last:
+            has_marker = any(m in t for m in DONE_MARKERS)
+            if stable_since and (time.time() - stable_since) >= (
+                    profile.dwell_s if has_marker else profile.dwell_s * 2):
+                return True
+        else:
+            last, stable_since = t, time.time()
+        time.sleep(2.0)
+    return False
+
+
+def ask_agent(page, query: str, profile: AgentProfile = RESEARCHER,
+              model_name: str | None = "Claude", approval: str = DEFAULT_APPROVAL,
+              run_id: str = "research") -> dict:
+    """Full deep-dive step: open the agent (fresh chat), switch model (Anthropic /
+    Claude), send the query, AUTO-APPROVE the scoping step, then wait out the long
+    deep-research turn by DOM state and return the report.
+
+    Returns {ok, model, result, clarification, elapsed_s}. `ok` is False on timeout /
+    kill-switch / setup failure. The caller (relay / operator ③) should ground-verify
+    any numeric claims with the local tools rather than trusting the prose.
     """
     t0 = time.time()
     drv = CopilotWebDriver(page)
     if not open_agent(page, profile):
-        return {"ok": False, "model": "", "result": "", "elapsed_s": 0,
-                "error": "composer never rendered"}
+        return {"ok": False, "model": "", "result": "", "clarification": "",
+                "elapsed_s": 0, "error": "composer never rendered"}
     model_set = ""
     if model_name and profile.model_picker:
-        ok_model = set_model(page, profile, model_name)
-        model_set = current_model(page, profile)
-        if not ok_model:
-            return {"ok": False, "model": model_set, "result": "", "elapsed_s": 0,
+        if not set_model(page, profile, model_name):
+            return {"ok": False, "model": current_model(page, profile), "result": "",
+                    "clarification": "", "elapsed_s": 0,
                     "error": f"could not switch model to {model_name}"}
+        model_set = current_model(page, profile)
     if stop_check().startswith("STOP"):
-        return {"ok": False, "model": model_set, "result": "", "elapsed_s": 0,
-                "error": "aborted by kill-switch before send"}
+        return {"ok": False, "model": model_set, "result": "", "clarification": "",
+                "elapsed_s": 0, "error": "aborted by kill-switch before send"}
+
+    # Stage 1: send the query, wait for the (short) scoping reply.
     drv.send(query)
-    ok = drv.wait_for_idle(timeout_s=profile.end_timeout_s,
-                           dwell_s=profile.dwell_s,
-                           appear_timeout_s=profile.appear_timeout_s)
+    if not drv.wait_for_idle(timeout_s=600, dwell_s=4.0,
+                             appear_timeout_s=profile.appear_timeout_s):
+        return {"ok": False, "model": model_set, "result": "", "clarification": "",
+                "elapsed_s": round(time.time() - t0, 1),
+                "error": "no scoping reply"}
+    first = drv.read_last_response()
+
+    # Stage 2: if it's a scoping step, approve it and wait out the real research.
+    clarification = ""
+    if _looks_like_clarification(first) and approval:
+        clarification = first
+        drv.send(approval)
+        ok = _wait_research_done(drv, profile)
+    else:
+        # already a full answer (e.g. a trivial query that did not need scoping)
+        ok = True
+
     return {
         "ok": ok,
         "model": model_set,
         "result": drv.read_last_response() if ok else "",
+        "clarification": clarification,
         "elapsed_s": round(time.time() - t0, 1),
     }
