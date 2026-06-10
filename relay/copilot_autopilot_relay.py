@@ -61,9 +61,12 @@ from tools.runlog_ops import runlog_append, runlog_summarize  # operator D: audi
 # --- Selectors captured from the live M365 Copilot DOM (2026-06) ------------
 COPILOT_SELECTORS = {
     "composer": "#m365-chat-editor-target-element",          # contenteditable, role=textbox
-    "loading": '[data-testid="loading-message"]',            # present while the turn is streaming
-    "assistant_msg": '[data-testid="chatOutput"]',           # one per agent answer
-    "assistant_msg_fallback": ".fai-CopilotMessage",         # alternate answer container
+    # The agent's reply lives in .fai-CopilotMessage (one per AGENT turn). This is
+    # the reliable signal: its count rises only when the agent answers, and its
+    # inner_text is the answer. NOTE: data-testid="chatOutput" was NOT reliable --
+    # it can read back the user's own message, which broke STUCK detection.
+    "assistant_msg": ".fai-CopilotMessage",
+    "assistant_msg_fallback": '[data-testid="copilot-message-reply-div"]',
 }
 
 PROTOCOL = (
@@ -90,6 +93,19 @@ NUDGE_JOB = (
 )
 
 
+# Placeholder text Copilot shows in the answer block WHILE it is still working.
+# Treat these as "not finished" so completion detection never stabilizes on them.
+PROCESSING_MARKERS = ("処理中", "生成しています", "考えています", "working on it",
+                      "thinking", "...")
+
+
+def _is_processing(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return True
+    return any(m.lower() in t for m in PROCESSING_MARKERS) and len(t) < 40
+
+
 def default_notify(title: str, body: str) -> None:
     """Best-effort Windows toast; never raises into the control loop."""
     try:
@@ -104,51 +120,86 @@ class CopilotWebDriver:
 
     def __init__(self, page):
         self.page = page
+        self._count_before = 0  # number of answer blocks before the current send
+
+    def _answers(self):
+        return self.page.locator(COPILOT_SELECTORS["assistant_msg"])
 
     def send(self, text: str) -> None:
+        # CRITICAL: a newline in the Copilot composer SUBMITS the message. Collapse
+        # all whitespace (incl. newlines) to single spaces so the whole job is sent
+        # as ONE message with a single trailing Enter.
+        one_line = " ".join(str(text).split())
+        # remember how many answer blocks exist now, so wait_for_idle can detect a
+        # genuinely NEW one (rather than re-reading the previous turn's answer).
+        try:
+            self._count_before = self._answers().count()
+        except Exception:
+            self._count_before = 0
         composer = self.page.locator(COPILOT_SELECTORS["composer"]).first
         composer.click()
-        composer.fill("")  # contenteditable: clear
-        # type via CDP so it lands in the page, not the OS
-        self.page.keyboard.type(text)
+        composer.fill("")  # contenteditable: clear any leftover text
+        self.page.keyboard.type(one_line)   # via CDP -> lands in the page, not the OS
+        self.page.wait_for_timeout(200)
         self.page.keyboard.press("Enter")
 
-    def wait_for_idle(self, timeout_s: int = 1800, dwell_s: float = 2.5) -> bool:
-        """Done when the loading indicator is gone AND the last answer text is
-        stable for `dwell_s`. Polls the kill-switch so STOP aborts promptly."""
+    def wait_for_idle(self, timeout_s: int = 1800, dwell_s: float = 4.0,
+                      appear_timeout_s: int = 180) -> bool:
+        """Completion = a NEW answer block appears, then its text stops changing
+        for `dwell_s`. We do NOT rely on the loading indicator: that element stays
+        present (and even 'visible') in the DOM while idle, so it is useless as a
+        signal. Polls the kill-switch so STOP aborts promptly."""
         deadline = time.time() + timeout_s
-        # give the loading indicator a moment to appear first
-        time.sleep(1.0)
-        last_text, stable_since = None, None
+        # 1) wait for a brand-new answer block to appear.
+        appear_deadline = time.time() + min(appear_timeout_s, timeout_s)
+        appeared = False
+        while time.time() < appear_deadline:
+            if stop_check().startswith("STOP"):
+                return False
+            try:
+                if self._answers().count() > self._count_before:
+                    appeared = True
+                    break
+            except Exception:
+                pass
+            time.sleep(1.0)
+        if not appeared:
+            return False
+        # 2) wait for the last answer's REAL text to stabilize. While the block
+        # still shows a processing placeholder ("処理中です" etc.), keep waiting --
+        # otherwise we would lock onto the placeholder as the final answer.
+        last, stable_since = None, None
         while time.time() < deadline:
             if stop_check().startswith("STOP"):
                 return False
-            loading = self.page.locator(COPILOT_SELECTORS["loading"]).count() > 0
-            text = self.read_last_response()
-            if not loading and text:
-                if text == last_text:
-                    if stable_since and (time.time() - stable_since) >= dwell_s:
-                        return True
-                else:
-                    last_text, stable_since = text, time.time()
+            t = self.read_last_response()
+            if _is_processing(t):
+                last, stable_since = None, None
+            elif t == last:
+                if stable_since and (time.time() - stable_since) >= dwell_s:
+                    return True
             else:
-                last_text, stable_since = None, None
+                last, stable_since = t, time.time()
             time.sleep(1.0)
         return False
 
     def read_last_response(self) -> str:
-        loc = self.page.locator(COPILOT_SELECTORS["assistant_msg"])
+        loc = self._answers()
         if loc.count() == 0:
             loc = self.page.locator(COPILOT_SELECTORS["assistant_msg_fallback"])
         if loc.count() == 0:
             return ""
-        txt = loc.last.inner_text() or ""
-        # strip the "<agent> said:\n<agent>\n" prefix Copilot prepends
-        for marker in (" said:\n",):
-            if marker in txt:
-                txt = txt.split(marker, 1)[1]
-        lines = [l for l in txt.splitlines()]
-        # drop a leading duplicated agent-name line if present
+        try:
+            txt = loc.last.inner_text() or ""
+        except Exception:
+            return ""
+        # strip the "<agent> said:" prefix Copilot prepends, then a duplicated
+        # agent-name line if present.
+        if " said:" in txt:
+            txt = txt.split(" said:", 1)[1]
+        lines = txt.splitlines()
+        while lines and not lines[0].strip():
+            lines = lines[1:]
         if len(lines) >= 2 and lines[0].strip() and lines[0].strip() == lines[1].strip():
             lines = lines[1:]
         return "\n".join(lines).strip()
@@ -273,13 +324,14 @@ def run_relay(
 
 
 def find_conversation_page(context, conversation_url: str):
-    target = conversation_url.split("?")[0]
-    for pg in context.pages:
-        if target and target in pg.url:
-            return pg
-    # fall back: navigate the first page to the conversation
+    """Always load the target URL fresh (a bare agent URL starts a NEW chat) and
+    wait for the composer to render before returning."""
     pg = context.pages[0] if context.pages else context.new_page()
-    pg.goto(conversation_url)
+    pg.goto(conversation_url, wait_until="domcontentloaded")
+    for _ in range(30):
+        pg.wait_for_timeout(1000)
+        if pg.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+            break
     return pg
 
 
@@ -292,6 +344,8 @@ def main():
     ap.add_argument("--goal", required=True, help="The goal to pursue autonomously")
     ap.add_argument("--run-id", default="relay", help="Identifier for run-log + memory keys")
     ap.add_argument("--max-turns", type=int, default=12)
+    ap.add_argument("--per-turn-timeout", type=int, default=1800,
+                    help="Max seconds to wait for a single agent turn to finish")
     args = ap.parse_args()
 
     from playwright.sync_api import sync_playwright
@@ -302,7 +356,8 @@ def main():
         page = find_conversation_page(context, args.conversation_url)
         page.bring_to_front()
         driver = CopilotWebDriver(page)
-        run_relay(driver, args.goal, args.run_id, args.max_turns)
+        run_relay(driver, args.goal, args.run_id, args.max_turns,
+                  per_turn_timeout_s=args.per_turn_timeout)
 
 
 if __name__ == "__main__":
