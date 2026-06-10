@@ -47,6 +47,7 @@ NOTES
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
 from pathlib import Path
@@ -77,9 +78,11 @@ PROTOCOL = (
     "あなたはこのゴールに向けて、ツールを使いながら自律的に作業します。"
     "重いゴールは一発で終わらせようとせず、自分で小さなステップに分割し、"
     "1ターンに1〜数ステップずつ着実に進めてください。"
+    "外部の深い調査が必要なときは、その行に `RESEARCH: <調べてほしいこと>` と書いて止まってください。"
+    "こちらが M365 リサーチ ツール(Claude)で調査し、結果を渡すので、それを使って続行できます。"
     "各ターンの最後の行に必ず次のいずれかを書いてください: "
-    "まだ続きがある場合は CONTINUE、ゴール全体が完了したら DONE、"
-    "行き詰まって人手が要る場合は STUCK: と理由。"
+    "まだ続きがある場合は CONTINUE、深い調査を依頼する場合は RESEARCH: と内容、"
+    "ゴール全体が完了したら DONE、行き詰まって人手が要る場合は STUCK: と理由。"
     "まず全体を小ステップに分割し、最初のステップを実行してください。\nGoal: "
 )
 
@@ -108,6 +111,16 @@ def _is_processing(text: str) -> bool:
     if not t:
         return True
     return any(m.lower() in t for m in PROCESSING_MARKERS) and len(t) < 40
+
+
+def extract_research(resp: str) -> str:
+    """Pull the query out of a `RESEARCH: <...>` line if the agent asked for a
+    deep-dive. Returns '' if no research was requested."""
+    for line in (resp or "").splitlines():
+        m = re.match(r"\s*RESEARCH\s*[:：]\s*(.+)", line, re.IGNORECASE)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return ""
 
 
 def default_notify(title: str, body: str) -> None:
@@ -275,6 +288,9 @@ def run_relay(
     max_timeouts: int = 2,
     notify=default_notify,
     sleep_s: float = 1.0,
+    browser_context=None,
+    research_model: str = "Claude",
+    max_research: int = 3,
 ) -> str:
     """Run the autonomous loop unattended. Returns one of:
     DONE | STUCK | MAXTURNS | ABORTED. Notifies on every terminal outcome.
@@ -287,6 +303,11 @@ def run_relay(
       * kill-switch (stop_check) every turn -> ABORTED
       * send/read exceptions -> STUCK (never crash unattended)
     Every turn is written to the run-log (operator D) and cross-session memory.
+
+    Deep-dive delegation (spec §5): if `browser_context` is given and the agent
+    writes a `RESEARCH: <query>` line, the relay opens the M365 Researcher agent in
+    a side page, runs a Claude/Anthropic deep research, and feeds the report back
+    into the implementation agent's next turn. Capped at `max_research` per run.
     """
     prior = memory_load(f"relay.{run_id}.context", scope="relay")
     context = "" if prior.startswith("[memory_load") else f"\n(前回までの文脈: {prior})\n"
@@ -295,6 +316,7 @@ def run_relay(
     turn = 0
     no_progress = 0
     timeouts = 0
+    research_count = 0
     last_norm = None
     outcome: str | None = None
     reason = ""
@@ -341,6 +363,53 @@ def run_relay(
         norm = " ".join(resp.lower().split())[:300]
         no_progress = no_progress + 1 if norm and norm == last_norm else 0
         last_norm = norm
+
+        # ---- deep-dive delegation (spec §5: researcher node) ----
+        rq = extract_research(resp)
+        if rq and browser_context is not None:
+            research_count += 1
+            if research_count > max_research:
+                job = ("これ以上は調査を依頼できません（上限到達）。今ある情報で進めるか、"
+                       "無理なら最後の行に STUCK: 理由 と書いてください。")
+                time.sleep(sleep_s)
+                continue
+            notify("🔎 Relay 調査開始", rq[:80])
+            runlog_append(run_id, {"turn": turn, "event": "research_start", "query": rq[:200]})
+            print(f"[relay turn {turn}] -> RESEARCH delegated: {rq[:80]}")
+            rres = {"ok": False, "result": "", "error": "not run"}
+            rpage = None
+            try:
+                from .agent_profiles import RESEARCHER, ask_agent
+                rpage = browser_context.new_page()
+                rres = ask_agent(rpage, rq, RESEARCHER, model_name=research_model)
+            except Exception as e:
+                rres = {"ok": False, "result": "", "error": f"{type(e).__name__}: {e}"}
+            finally:
+                try:
+                    if rpage is not None:
+                        rpage.close()
+                except Exception:
+                    pass
+                try:
+                    driver.page.bring_to_front()
+                except Exception:
+                    pass
+            report = (rres.get("result") or "")[:3500] if rres.get("ok") else ""
+            runlog_append(run_id, {"turn": turn, "event": "research_done",
+                                   "ok": bool(rres.get("ok")), "len": len(report),
+                                   "elapsed_s": rres.get("elapsed_s"),
+                                   "error": rres.get("error", "")})
+            print(f"[relay turn {turn}] <- RESEARCH done ok={rres.get('ok')} "
+                  f"len={len(report)} elapsed={rres.get('elapsed_s')}s")
+            if report:
+                job = ("依頼された調査が完了しました。以下が結果です。これを踏まえて作業を続けてください。\n"
+                       f"--- 調査結果 ---\n{report}\n--- 調査結果ここまで ---\n" + CONTINUE_JOB)
+            else:
+                job = (f"調査を試みましたが結果を取得できませんでした（{rres.get('error', 'timeout/empty')}）。"
+                       "調査結果なしで可能な範囲で進めるか、無理なら最後の行に STUCK: 理由 と書いてください。")
+            time.sleep(sleep_s)
+            continue
+        # ---- end deep-dive delegation ----
 
         up = resp.upper()
         last_line = (resp.strip().splitlines() or [""])[-1].upper()
@@ -406,6 +475,8 @@ def main():
     ap.add_argument("--max-turns", type=int, default=12)
     ap.add_argument("--per-turn-timeout", type=int, default=1800,
                     help="Max seconds to wait for a single agent turn to finish")
+    ap.add_argument("--no-research", action="store_true",
+                    help="Disable RESEARCH: delegation to the Researcher agent")
     args = ap.parse_args()
 
     from playwright.sync_api import sync_playwright
@@ -417,7 +488,8 @@ def main():
         page.bring_to_front()
         driver = CopilotWebDriver(page)
         run_relay(driver, args.goal, args.run_id, args.max_turns,
-                  per_turn_timeout_s=args.per_turn_timeout)
+                  per_turn_timeout_s=args.per_turn_timeout,
+                  browser_context=None if args.no_research else context)
 
 
 if __name__ == "__main__":

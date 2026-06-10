@@ -86,30 +86,52 @@ def current_model(page, profile: AgentProfile) -> str:
 
 def set_model(page, profile: AgentProfile, model_name: str = "Claude") -> bool:
     """Switch the agent's model (e.g. to 'Claude' = Anthropic deep research).
-    Returns True once the picker button reflects the requested model."""
+    Returns True once the picker button reflects the requested model.
+
+    Patient + retrying: on a freshly opened page the picker button and its menu
+    render a beat AFTER the composer, so we wait for each to appear before clicking
+    (clicking too early was the silent failure in the relay's side-page path)."""
     if not profile.model_picker:
         return False
     btn = page.locator(profile.model_picker).first
+    # 1) wait for the picker button itself to render (up to ~15s).
+    for _ in range(30):
+        try:
+            if btn.count() > 0 and btn.is_visible():
+                break
+        except Exception:
+            pass
+        page.wait_for_timeout(500)
     if model_name.lower() in current_model(page, profile).lower():
         return True  # already selected
-    try:
-        btn.click()
-    except Exception:
-        return False
-    page.wait_for_timeout(600)
-    # The options are menuitemradio rows; pick the one mentioning the model name.
     opt = page.locator('[role="menuitemradio"]').filter(has_text=model_name).first
-    try:
-        opt.click()
-    except Exception:
-        # close the menu and report failure rather than leaving it half-open
+    for _attempt in range(3):
+        try:
+            btn.click()
+        except Exception:
+            page.wait_for_timeout(500)
+            continue
+        # 2) wait for the menu option to render, then click it.
+        clicked = False
+        for _ in range(12):
+            try:
+                if opt.count() > 0 and opt.is_visible():
+                    opt.click()
+                    clicked = True
+                    break
+            except Exception:
+                pass
+            page.wait_for_timeout(400)
+        page.wait_for_timeout(800)
+        if model_name.lower() in current_model(page, profile).lower():
+            return True
+        # not switched yet -> close any open menu and retry
         try:
             page.keyboard.press("Escape")
         except Exception:
             pass
-        return False
-    page.wait_for_timeout(800)
-    return model_name.lower() in current_model(page, profile).lower()
+        page.wait_for_timeout(500)
+    return False
 
 
 # The Researcher does NOT run on the first message: it first replies with a SCOPING
