@@ -61,6 +61,14 @@ from tools.gate_ops import (
 )
 from tools.process_ops import process_info, process_kill, process_list
 from tools.runlog_ops import runlog_append, runlog_list, runlog_read, runlog_summarize
+from tools.verify_ops import (
+    verify_python,
+    verify_numeric_close,
+    verify_file_contains,
+    verify_json_schema,
+    verify_table_stat,
+)
+from tools.foundry import forge_tool, forge_list, forge_read, forge_delete
 from tools.registry_ops import registry_read, service_status
 from tools.shell_extra import pwsh_exec, pwsh_exec_file, shell_which
 from tools.screenshot_ops import screenshot
@@ -202,6 +210,11 @@ TOOLS = (
     # orchestration: human-in-the-loop gate + kill-switch (operator E)
     gate_ask, gate_poll, gate_answer, gate_list,
     stop_request, stop_check, stop_clear,
+    # orchestration: verification-loop helpers (operator C)
+    verify_python, verify_numeric_close, verify_file_contains,
+    verify_json_schema, verify_table_stat,
+    # orchestration: tool foundry (operator A) - forged tools live after restart
+    forge_tool, forge_list, forge_read, forge_delete,
     # env / introspection
     list_my_tools, env_info, pip_install, which,
     # security
@@ -210,6 +223,19 @@ TOOLS = (
 
 for tool in TOOLS:
     mcp.tool()(register(tool))
+
+# Auto-register forged tools (operator A). Safe when tools/auto is empty:
+# load_auto_tools() returns [] and any failing forged module is skipped.
+try:
+    from tools.auto_loader import load_auto_tools
+
+    for _mod_name, _forged in load_auto_tools():
+        try:
+            mcp.tool()(register(_forged))
+        except Exception:
+            pass
+except Exception:
+    pass
 
 
 if __name__ == "__main__":
