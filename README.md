@@ -175,7 +175,19 @@
 ```powershell
 git clone https://github.com/MasayukiTa/m365-copilot-companion-mcp.git
 cd m365-copilot-companion-mcp
+```
 
+**ワンクリック セットアップ（推奨）** — venv 作成・依存インストール・`.env`（ランダム秘密入り）自動生成までを一括:
+
+```powershell
+.\setup.ps1
+# 外部ツール(devtunnel + Tesseract OCR)も winget で入れるなら:
+.\setup.ps1 -WithExternalTools
+```
+
+手動でやる場合:
+
+```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -681,7 +693,20 @@ registration step. The server **grows as you use it.** 117 is the floor.
 ```powershell
 git clone https://github.com/MasayukiTa/m365-copilot-companion-mcp.git
 cd m365-copilot-companion-mcp
+```
 
+**One-click setup (recommended)** — creates the venv, installs dependencies,
+and generates a `.env` with fresh random secrets:
+
+```powershell
+.\setup.ps1
+# Also install external tools (devtunnel + Tesseract OCR) via winget:
+.\setup.ps1 -WithExternalTools
+```
+
+Or do it by hand:
+
+```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt

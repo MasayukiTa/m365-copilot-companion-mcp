@@ -8,7 +8,7 @@
     2. The Dev Tunnel host *silently drops* -> the devtunnel process stays alive but
        "Host connections" falls to 0 -> kill the stale host and re-host.
 
-  Checking only whether the processes exist is NOT enough — the tunnel host can be a
+  Checking only whether the processes exist is NOT enough -- the tunnel host can be a
   live process with zero relay connections, which is exactly the state that breaks
   Copilot Studio. This script polls the actual connection counts.
 
