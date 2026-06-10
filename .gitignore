@@ -27,6 +27,8 @@ dist/
 .unlock_state.json
 .todo_state.json
 .memory_state.json
+.companion_runs/
+.companion_gates/
 
 # ======================================================================
 # Agent Memory (個人情報・社外秘を含むため原則すべて非公開)

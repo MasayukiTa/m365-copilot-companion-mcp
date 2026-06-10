@@ -398,6 +398,46 @@ MCP ツールを公開している。
 
 ## 🛠 トラブルシュート
 
+> **🔌 まず最初に疑うこと — Copilot がこう言い出したら、ほぼ MCP/トンネル切れです:**
+> 日本語: **「申し訳ございません。それに応答できませんでした。他に何かお手伝いできることはありますか?」**
+> 英語: （同等の "Sorry, I couldn't respond to that…" 系。正確な文言は未確認）
+>
+> この文言が出たら、エージェントの故障ではなく **MCP サーバーか Dev Tunnel が落ちている**
+> 可能性が高い。確認順:
+> 1. ローカルでサーバー生存: `Test-NetConnection localhost -Port 8000`
+> 2. トンネルが host 中か: `devtunnel show <tunnel> | Select-String "Host connections"`（**0 なら切れ**。プロセスは生きていても host 接続だけ落ちることがある）
+> 3. supervisor が動いているか（下記「常時起動」参照）。動いていれば数十秒で自動復活する
+> 4. 手動復旧: サーバー起動 → `devtunnel host <tunnel>`
+
+### 常時起動 / 切断対策（supervisor）
+
+Dev Tunnel の host 接続は、**プロセスが生きていても relay 接続だけが静かに落ちる**ことがあります
+（これが上の Copilot エラーの主因）。同梱の `supervisor.ps1` は、ポート 8000 とトンネルの
+`Host connections` を定期監視し、落ちていれば自動で張り直します（誤検知防止のデバウンス＋
+接続確立待ち付き）。
+
+手動で起動:
+
+```powershell
+powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass `
+  -File .\supervisor.ps1 -TunnelName <あなたのトンネル名>
+```
+
+**ログオンのたびに自動起動**させたい場合（管理者権限不要。Task Scheduler が組織ポリシーで
+弾かれる環境でも通る方法）— **スタートアップ フォルダ**にランチャを置く:
+
+```powershell
+$startup = [Environment]::GetFolderPath('Startup')
+$root = (Get-Location).Path
+@"
+@echo off
+powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "$root\supervisor.ps1" -TunnelName <あなたのトンネル名>
+"@ | Set-Content -Encoding ASCII (Join-Path $startup "start-companion-supervisor.cmd")
+```
+
+これで再起動・スリープ復帰後もログオン時に supervisor が立ち上がり、サーバー＋トンネルを
+復活させます（多重起動は内部の mutex で防止）。
+
 | 症状 | 対処 |
 |---|---|
 | ツール一覧に出るのに呼ぶとエラー | そのツールの前提タグ（🪟 / 📦）を確認。対応する OS / アプリ / ライブラリを入れるか、その環境では使わない |
@@ -778,6 +818,52 @@ You operate a companion on the user's PC exposing many MCP tools.
 ---
 
 ## 🛠 Troubleshooting
+
+> **🔌 First thing to suspect — if Copilot starts saying it can't respond,
+> the MCP server or tunnel has probably dropped.**
+> Japanese (confirmed): **「申し訳ございません。それに応答できませんでした。他に何かお手伝いできることはありますか?」**
+> English: the equivalent "Sorry, I couldn't respond to that…" message (exact
+> wording not yet captured).
+>
+> When you see it, suspect a dead MCP server / Dev Tunnel before blaming the
+> agent. Check, in order:
+> 1. Server alive locally: `Test-NetConnection localhost -Port 8000`
+> 2. Tunnel actually hosting: `devtunnel show <tunnel> | Select-String "Host connections"`
+>    (**0 means dropped** — the process can be alive while the host connection is gone)
+> 3. Is the supervisor running? (see below) — if so it self-heals within tens of seconds
+> 4. Manual recovery: start the server, then `devtunnel host <tunnel>`
+
+### Keeping it alive (supervisor)
+
+A Dev Tunnel host connection can **silently drop while the process stays
+alive** — that's the usual cause of the Copilot error above. The bundled
+`supervisor.ps1` polls port 8000 and the tunnel's `Host connections`, and
+re-hosts automatically when either is down (with debounce against false
+positives and a wait-for-established step so it never kills a host that's
+still connecting).
+
+Run it manually:
+
+```powershell
+powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass `
+  -File .\supervisor.ps1 -TunnelName <your-tunnel-name>
+```
+
+To **auto-start at every logon** (no admin needed — works even where Task
+Scheduler is blocked by org policy), drop a launcher into the **Startup
+folder**:
+
+```powershell
+$startup = [Environment]::GetFolderPath('Startup')
+$root = (Get-Location).Path
+@"
+@echo off
+powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "$root\supervisor.ps1" -TunnelName <your-tunnel-name>
+"@ | Set-Content -Encoding ASCII (Join-Path $startup "start-companion-supervisor.cmd")
+```
+
+It then comes back after reboot / sleep-wake at logon and revives the
+server + tunnel (a mutex prevents duplicate instances).
 
 | Symptom | Fix |
 |---|---|
