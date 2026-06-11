@@ -33,6 +33,7 @@ from .copilot_autopilot_relay import (
     CONTINUE_JOB, COPILOT_SELECTORS, CopilotWebDriver, FIX_JOB, PROTOCOL,
     REFUTE_FIX_JOB, VERIFY_FIX_JOB, _is_processing, default_notify, reported_stuck,
 )
+from .planner import PLAN_PROMPT, extract_plan, plan_ready
 
 TERMINAL = ("done", "stuck", "maxturns", "error", "cancelled")
 # non-terminal but not yet occupying a tab; counts as "still running" for the loop.
@@ -130,7 +131,7 @@ class RelayWorker:
 
     def __init__(self, goal, name, max_turns=1000, dwell_s=4.0,
                  per_turn_timeout_s=240, max_no_progress=3, max_verify_attempts=3,
-                 refuter=False, max_refute=2):
+                 refuter=False, max_refute=2, plan_mode=False):
         self.page = None
         self.drv = None
         text, checks, cwd = goal_fields(goal)
@@ -158,7 +159,12 @@ class RelayWorker:
         self.dwell_s = dwell_s
         self.per_turn_timeout_s = per_turn_timeout_s
         self.max_no_progress = max_no_progress
-        self.job = PROTOCOL + self.goal
+        # plan-first: turn 1 proposes a plan and pauses for approval (a steer) before
+        # executing. plan_steps is surfaced so the cockpit can show / let the user pick.
+        self.plan_mode = plan_mode
+        self.plan_steps = []
+        self._plan_approved = False
+        self.job = (PLAN_PROMPT + self.goal) if plan_mode else (PROTOCOL + self.goal)
         self.turn = 0
         self.no_progress = 0
         self.last_norm = None
@@ -262,6 +268,18 @@ class RelayWorker:
         last_line = (resp.strip().splitlines() or [""])[-1].upper()
         if reported_stuck(resp):
             self.status, self.outcome, self.reason = "stuck", "STUCK", "agent reported STUCK"
+            return
+        # plan phase (plan_mode): capture the proposed plan and PAUSE for approval; a steer
+        # (approve as-is, or an edit) resumes into execution. Don't run DONE/CONTINUE yet.
+        if self.plan_mode and not self._plan_approved:
+            if plan_ready(resp):
+                self.plan_steps = extract_plan(resp)
+                self.status = "awaiting"
+                self.reason = "計画提示・承認待ち (%d ステップ)" % len(self.plan_steps)
+                return
+            self.job = ("実行計画を番号付きステップで完成させ、最後の行に PLAN_READY と"
+                        "書いてください（まだ実装はしないこと）。")
+            self.status = "ready"
             return
         if "DONE" in up and "FAIL" not in last_line:
             self._on_done_claimed()
@@ -371,6 +389,13 @@ class RelayWorker:
             return True
         if self.status == PENDING:
             return False                 # not attached yet; the fleet attaches it
+        if self.status == "awaiting":
+            # plan proposed; paused for human approval. A steer (approval or an edit) is
+            # the resume signal -- it becomes the next turn via _begin_send's steer path.
+            if self.steer_msgs:
+                self._plan_approved = True
+                self.status = "ready"
+            return False
         if self.status == "verifying":
             return self._poll_verify()
         if self.status == "refuting":
@@ -405,7 +430,8 @@ class RelayWorker:
 
 def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     notify=default_notify, on_tick=None, max_concurrent=None,
-                    mc_box=None, add_box=None, refuter=False, max_refute=2):
+                    mc_box=None, add_box=None, refuter=False, max_refute=2,
+                    plan_mode=False):
     """Drive len(goals) autonomous relays in parallel to completion, but never with
     more than `max_concurrent` tabs open at once (defaults to what free RAM allows).
     A goal's tab is opened only when a slot frees and CLOSED the moment it finishes.
@@ -420,7 +446,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     if mc_box is None:
         mc_box = [max_concurrent]
     workers = [RelayWorker(g, "w%d" % i, max_turns=max_turns,
-                           refuter=refuter, max_refute=max_refute)
+                           refuter=refuter, max_refute=max_refute, plan_mode=plan_mode)
                for i, g in enumerate(goals)]
     pending = list(workers)            # FIFO queue of not-yet-attached workers
 

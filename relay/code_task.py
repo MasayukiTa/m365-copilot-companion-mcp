@@ -90,6 +90,9 @@ def main():
     ap.add_argument("--refuter", action="store_true",
                     help="after a candidate DONE, an independent reviewer tries to refute "
                          "it before accepting (operator B; doubles oracle cost)")
+    ap.add_argument("--plan", action="store_true",
+                    help="plan-first: propose a numbered plan and pause for your approval "
+                         "(approve or edit via a steer in the cockpit) before executing")
     ap.add_argument("--no-map", action="store_true",
                     help="do not prepend a repo map to the goal (saves prompt size on a "
                          "huge tree; default is to prime the agent with the map)")
@@ -146,6 +149,8 @@ def main():
            "--agent-url", args.agent_url, "--state-dir", state_dir]
     if args.refuter:
         cmd.append("--refuter")
+    if args.plan:
+        cmd.append("--plan")
     print("  launching: fleet_runner (1 tab, auto-verified)\n")
     return subprocess.call(cmd, cwd=repo)
 
