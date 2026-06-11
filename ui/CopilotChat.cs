@@ -77,8 +77,8 @@ class ChatWindow : Window
         if (k == "m1s") return ja ? "Copilot 側の会話は残す（最も安全）" : "Keeps the Copilot conversation (safest)";
         if (k == "m2t") return ja ? "Copilot で開いて手動削除" : "Open in Copilot to delete manually";
         if (k == "m2s") return ja ? "その会話を Copilot で開く。1クリックで削除" : "Opens it in Copilot; delete it there in one click";
-        if (k == "m3t") return ja ? "Copilot 会話も自動削除（実験的）" : "Also auto-delete the Copilot conversation (experimental)";
-        if (k == "m3s") return ja ? "失敗時は自動で「Copilot で開く」に切替" : "Falls back to 'open in Copilot' on failure";
+        if (k == "m3t") return ja ? "Copilot 会話も自動削除" : "Also auto-delete the Copilot conversation";
+        if (k == "m3s") return ja ? "Copilot 側の会話も実際に消えます（失敗時は開いて手動）" : "Actually removes it on the Copilot side too (opens it for manual delete if that fails)";
         if (k == "del_note") return (ja ? "選んだ方法が次回の既定になります（現在: モード " : "Your choice becomes the default (current: mode ") + _deleteMode + "）";
         if (k == "t_local") return ja ? "ローカルから削除しました（Copilot 側は残しています）。" : "Deleted locally (kept on the Copilot side).";
         if (k == "t_open") return ja ? "Copilot で開きました。Copilot 上で会話を削除してください。" : "Opened in Copilot. Delete the conversation there.";

@@ -64,50 +64,74 @@ def _wait_composer(timeout=40):
 
 
 def _try_delete_conversation(url):
-    """Best-effort delete of the backing Copilot conversation. KNOWN LIMITATION: in
-    the agent-scoped view, the per-conversation menus surface the agent switcher,
-    not a delete -- so this commonly returns (False, reason) and the caller falls
-    back to opening the conversation for a manual delete. Honest about failure;
-    never deletes a different conversation (we only act on the active one)."""
-    if not url:
-        return False, "no url"
-    PAGE.goto(url, wait_until="domcontentloaded")
-    _wait_composer()
-    PAGE.wait_for_timeout(800)
-    # try the active conversation's own options menu, then a delete item by text
-    triggers = ['button[data-testid="overflow-menu-button"]',
-                'button[aria-label*="オプション"]', 'button[aria-label*="More actions"]',
-                'button[aria-label*="More options"]']
-    del_texts = ["会話を削除", "チャットを削除", "この会話を削除", "Delete conversation", "削除", "Delete"]
-    confirm_texts = ["削除", "Delete", "はい", "OK"]
-    for sel in triggers:
-        loc = PAGE.locator(sel)
-        if loc.count() == 0:
-            continue
+    """Delete the backing Copilot conversation for real, by id, via the GENERAL
+    /chat view (its history lists conversations from every agent as bare-UUID rows
+    and -- unlike the agent-scoped view -- exposes a working per-conversation delete).
+    Targets ONLY the exact conversation id; never touches another. Restores the
+    bridge to a fresh agent chat afterward. Returns (ok, reason)."""
+    if not url or "/conversation/" not in url:
+        return False, "no conversation id in url"
+    cid = url.split("/conversation/")[1].split("?")[0].split("#")[0]
+    ok, reason = False, "not run"
+    try:
+        PAGE.goto("https://m365.cloud.microsoft/chat", wait_until="domcontentloaded")
+        PAGE.wait_for_timeout(8000)             # let the history sidebar populate
         try:
-            loc.first.click(force=True, timeout=2500)
-            PAGE.wait_for_timeout(600)
-            for txt in del_texts:
-                mi = PAGE.get_by_role("menuitem", name=txt, exact=False)
-                if mi.count() > 0:
-                    mi.first.click(timeout=2500)
-                    PAGE.wait_for_timeout(600)
-                    for ct in confirm_texts:    # confirmation dialog, if any
-                        cb = PAGE.get_by_role("button", name=ct, exact=False)
-                        if cb.count() > 0:
-                            try:
-                                cb.first.click(timeout=2000)
-                            except Exception:
-                                pass
-                            break
-                    return True, "deleted"
-            try:
-                PAGE.keyboard.press("Escape")
-            except Exception:
-                pass
+            PAGE.keyboard.press("Escape")        # dismiss any stale grounding popup
         except Exception:
             pass
-    return False, "no per-conversation delete control in this view"
+        row = PAGE.locator('button[id="%s"]' % cid)
+        if row.count() == 0:                     # one reload in case the list was stale
+            PAGE.reload(wait_until="domcontentloaded")
+            PAGE.wait_for_timeout(6000)
+            row = PAGE.locator('button[id="%s"]' % cid)
+        if row.count() == 0:
+            ok, reason = False, "conversation row not found in /chat history"
+        else:
+            row.first.scroll_into_view_if_needed()
+            row.first.hover()
+            PAGE.wait_for_timeout(800)
+            # element-dispatch click the row's "More" button -- a coordinate click
+            # lands on the agent-switcher/grounding menu instead (the old failure).
+            handle = PAGE.evaluate_handle(
+                """(cid) => { const b = document.getElementById(cid); if (!b) return null;
+                    const p = b.parentElement; if (!p) return null;
+                    return [].slice.call(p.querySelectorAll('button')).find(
+                        function (x) { return x !== b && x.getAttribute('aria-haspopup') === 'menu'; }) || null; }""",
+                cid)
+            el = handle.as_element()
+            if el is None:
+                ok, reason = False, "More button not found for row"
+            else:
+                el.click()
+                PAGE.wait_for_timeout(700)
+                mi = PAGE.locator('[role="menuitem"][aria-label="削除"]')
+                if mi.count() == 0:
+                    mi = PAGE.get_by_role("menuitem", name="削除", exact=True)
+                mi.first.click(timeout=3000)
+                PAGE.wait_for_timeout(700)
+                cb = PAGE.locator('[role="alertdialog"] button:has-text("削除する")')
+                if cb.count() == 0:
+                    cb = PAGE.get_by_role("button", name="削除する")
+                cb.first.click(timeout=3000)
+                PAGE.wait_for_timeout(1300)
+                gone = PAGE.evaluate("(cid) => !document.getElementById(cid)", cid)
+                ok = bool(gone)
+                reason = "deleted" if ok else "delete did not apply"
+    except Exception as e:
+        try:
+            PAGE.keyboard.press("Escape")
+        except Exception:
+            pass
+        ok, reason = False, "%s: %s" % (type(e).__name__, str(e))
+    # restore the bridge to a fresh agent chat so the next message goes to the agent
+    try:
+        if AGENT_URL:
+            PAGE.goto(AGENT_URL, wait_until="domcontentloaded")
+            _wait_composer()
+    except Exception:
+        pass
+    return ok, reason
 
 
 def _is_proc(t: str) -> bool:
