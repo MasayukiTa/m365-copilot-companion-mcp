@@ -1143,6 +1143,18 @@ class CockpitWindow : Window
     {
         _history.Clear(); _archivedKeys.Clear();
         try { if (File.Exists(_historyPath)) File.Delete(_historyPath); } catch (Exception) { }
+        // also dismiss a FINISHED run's result cards (W0..) -- but never wipe a LIVE run.
+        try
+        {
+            var st = ReadStatus();
+            bool running = st != null && st.ContainsKey("running") && Convert.ToBoolean(st["running"])
+                           && !(st.ContainsKey("idle") && Convert.ToBoolean(st["idle"]));
+            if (!running)
+                File.WriteAllText(_statusPath,
+                    "{\"total\":0,\"done_count\":0,\"running\":false,\"idle\":true,\"workers\":[]}",
+                    Encoding.UTF8);
+        }
+        catch (Exception) { }
         ForceRender();
     }
     void ArchiveTerminal(Dictionary<string, object> root)
