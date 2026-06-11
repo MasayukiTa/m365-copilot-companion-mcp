@@ -99,3 +99,6 @@ ui/*.exe
 
 # parallel fleet live status (runtime)
 .fleet/
+
+# vendored VirtualDesktop tool (built from thirdparty/VirtualDesktop11.cs)
+thirdparty/*.exe
