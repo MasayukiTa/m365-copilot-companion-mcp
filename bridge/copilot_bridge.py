@@ -137,10 +137,21 @@ AGENT_URL = ""   # bare agent URL (a fresh chat); set at startup
 
 
 def _wait_composer(timeout=40):
+    surfaced = False
     for _ in range(timeout):
         PAGE.wait_for_timeout(1000)
         if PAGE.locator(COPILOT_SELECTORS["composer"]).count() > 0:
             return True
+        # the dedicated Edge runs hidden in the background -- if a sign-in page shows up,
+        # bring it to the foreground once so the user can authenticate.
+        if not surfaced:
+            try:
+                from relay.edge_recover import surface, looks_like_login
+                if looks_like_login(PAGE.url):
+                    surface()
+                    surfaced = True
+            except Exception:
+                pass
     return False
 
 
