@@ -415,10 +415,16 @@ class CockpitWindow : Window
     {
         try
         {
-            var fbd = new System.Windows.Forms.FolderBrowserDialog();
-            fbd.Description = _lang == 0 ? "コーディング対象のフォルダを選択" : "Pick a folder to code on";
-            if (fbd.ShowDialog() != System.Windows.Forms.DialogResult.OK) return;
-            string folder = fbd.SelectedPath;
+            // Modern Explorer-style picker (the old WinForms tree dialog is clunky): the
+            // user browses to the target folder and picks ANY file in it; we use its
+            // parent folder. Reliable + no COM.
+            var ofd = new Microsoft.Win32.OpenFileDialog();
+            ofd.Title = _lang == 0 ? "対象フォルダ内の任意のファイルを選択（その親フォルダが対象になります）"
+                                   : "Pick ANY file inside the target folder (its parent folder is used)";
+            ofd.Filter = _lang == 0 ? "すべてのファイル|*.*" : "All files|*.*";
+            ofd.CheckFileExists = true;
+            if (ofd.ShowDialog() != true) return;
+            string folder = Path.GetDirectoryName(ofd.FileName);
             if (string.IsNullOrEmpty(folder)) return;
             string instr = PromptInstruction();
             if (string.IsNullOrEmpty(instr)) return;
