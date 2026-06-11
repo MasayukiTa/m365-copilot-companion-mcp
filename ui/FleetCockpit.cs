@@ -121,6 +121,7 @@ class CockpitWindow : Window
         if (k == "applies_next") return ja ? "次回起動から適用" : "applies next run";
         if (k == "start") return ja ? "並列実行を開始" : "Start parallel run";
         if (k == "goalhint") return ja ? "1行に1ゴール（複数可）" : "One goal per line";
+        if (k == "folder") return ja ? "フォルダ → ゴール生成" : "Folder -> goals";
         return k;
     }
     string StatusLabel(string s)
@@ -303,7 +304,7 @@ class CockpitWindow : Window
     }
 
     TextBox _goalInput;
-    Button _startBtn;
+    Button _startBtn, _folderBtn;
     TextBlock _startNote;
 
     // ④ task-injection: type goals (one per line) and launch a fleet from here.
@@ -334,6 +335,12 @@ class CockpitWindow : Window
         _startBtn.Padding = new Thickness(14, 0, 14, 0);
         _startBtn.Click += delegate { StartFleet(); };
         rightCol.Children.Add(_startBtn);
+        _folderBtn = new Button();
+        _folderBtn.Cursor = Cursors.Hand; _folderBtn.BorderThickness = new Thickness(1);
+        _folderBtn.Height = 30; _folderBtn.MinWidth = 150; _folderBtn.FontSize = 12;
+        _folderBtn.Margin = new Thickness(0, 6, 0, 0); _folderBtn.Padding = new Thickness(10, 0, 10, 0);
+        _folderBtn.Click += delegate { FolderToGoals(); };
+        rightCol.Children.Add(_folderBtn);
         _startNote = new TextBlock();
         _startNote.FontSize = 11; _startNote.Margin = new Thickness(2, 4, 0, 0);
         _startNote.TextWrapping = TextWrapping.Wrap; _startNote.MaxWidth = 150;
@@ -393,6 +400,97 @@ class CockpitWindow : Window
         {
             _startNote.Text = (_lang == 0 ? "起動失敗: " : "Failed: ") + ex.Message;
         }
+    }
+
+    // ③ Codex-style: pick a folder + instruction -> folder_coder generates one goal per
+    // file -> load them into the goal box for review, then Start runs them in parallel.
+    void FolderToGoals()
+    {
+        try
+        {
+            var fbd = new System.Windows.Forms.FolderBrowserDialog();
+            fbd.Description = _lang == 0 ? "コーディング対象のフォルダを選択" : "Pick a folder to code on";
+            if (fbd.ShowDialog() != System.Windows.Forms.DialogResult.OK) return;
+            string folder = fbd.SelectedPath;
+            if (string.IsNullOrEmpty(folder)) return;
+            string instr = PromptInstruction();
+            if (string.IsNullOrEmpty(instr)) return;
+
+            string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+            string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+            if (!File.Exists(py)) py = "python";
+            string outFile = Path.Combine(Path.GetDirectoryName(_statusPath), "folder_goals.txt");
+
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = py;
+            psi.Arguments = "-m relay.folder_coder --folder \"" + folder + "\" --instruction \""
+                + instr.Replace("\"", "'") + "\" --mode per-file --out \"" + outFile + "\"";
+            psi.WorkingDirectory = repo; psi.UseShellExecute = false; psi.CreateNoWindow = true;
+            try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+
+            var p = new System.Diagnostics.Process();
+            p.StartInfo = psi; p.EnableRaisingEvents = true;
+            p.Exited += delegate
+            {
+                Dispatcher.BeginInvoke((Action)delegate
+                {
+                    try
+                    {
+                        if (File.Exists(outFile))
+                        {
+                            _goalInput.Text = File.ReadAllText(outFile, Encoding.UTF8).TrimEnd();
+                            _startNote.Text = _lang == 0 ? "ゴール生成完了。内容を確認して「開始」。"
+                                                         : "Goals ready. Review, then Start.";
+                        }
+                        else _startNote.Text = _lang == 0 ? "ゴール生成に失敗" : "Goal generation failed";
+                    }
+                    catch (Exception) { }
+                });
+            };
+            p.Start();
+            _startNote.Text = _lang == 0 ? "ゴールを生成中…" : "Generating goals...";
+        }
+        catch (Exception ex)
+        {
+            _startNote.Text = (_lang == 0 ? "フォルダ処理失敗: " : "Folder error: ") + ex.Message;
+        }
+    }
+
+    string PromptInstruction()
+    {
+        var w = new Window();
+        w.Title = _lang == 0 ? "フォルダへの指示" : "Instruction";
+        w.Width = 480; w.Height = 230; w.Background = Bg;
+        w.WindowStartupLocation = WindowStartupLocation.CenterOwner; w.Owner = this;
+        var sp = new StackPanel(); sp.Margin = new Thickness(16);
+        var lbl = new TextBlock();
+        lbl.Text = _lang == 0 ? "各ファイルに適用する指示（編集はMCPツールで実行されます）:"
+                              : "Instruction applied to each file (edits run via MCP tools):";
+        lbl.Foreground = Fg; lbl.TextWrapping = TextWrapping.Wrap; lbl.Margin = new Thickness(0, 0, 0, 8);
+        sp.Children.Add(lbl);
+        var tb = new TextBox();
+        tb.MinHeight = 64; tb.AcceptsReturn = true; tb.TextWrapping = TextWrapping.Wrap;
+        tb.Background = BtnBg; tb.Foreground = Fg; tb.BorderBrush = Border;
+        tb.BorderThickness = new Thickness(1); tb.Padding = new Thickness(8); tb.CaretBrush = Fg;
+        sp.Children.Add(tb);
+        var btns = new StackPanel(); btns.Orientation = Orientation.Horizontal;
+        btns.HorizontalAlignment = HorizontalAlignment.Right; btns.Margin = new Thickness(0, 12, 0, 0);
+        string[] box = new string[1];
+        var ok = new Button();
+        ok.Content = _lang == 0 ? "生成" : "Generate"; ok.IsDefault = true;
+        ok.Background = Accent; ok.Foreground = White; ok.BorderThickness = new Thickness(0);
+        ok.Padding = new Thickness(14, 4, 14, 4); ok.Cursor = Cursors.Hand; ok.FontWeight = FontWeights.SemiBold;
+        ok.Click += delegate { box[0] = tb.Text; w.DialogResult = true; };
+        var cancel = new Button();
+        cancel.Content = _lang == 0 ? "取消" : "Cancel"; cancel.IsCancel = true;
+        cancel.Margin = new Thickness(8, 0, 0, 0); cancel.Padding = new Thickness(14, 4, 14, 4);
+        cancel.Cursor = Cursors.Hand; cancel.Background = BtnBg; cancel.Foreground = Fg;
+        cancel.BorderBrush = Border; cancel.BorderThickness = new Thickness(1);
+        btns.Children.Add(ok); btns.Children.Add(cancel);
+        sp.Children.Add(btns);
+        w.Content = sp;
+        bool? r = w.ShowDialog();
+        return (r == true) ? box[0] : null;
     }
 
     ContentControl _iconHost;
@@ -515,6 +613,7 @@ class CockpitWindow : Window
             _goalInput.BorderBrush = Border; _goalInput.CaretBrush = Fg;
         }
         if (_startBtn != null) { _startBtn.Background = Accent; _startBtn.Foreground = White; }
+        if (_folderBtn != null) { _folderBtn.Background = BtnBg; _folderBtn.Foreground = Fg; _folderBtn.BorderBrush = Border; }
         if (_startNote != null) _startNote.Foreground = Muted;
         if (_mtBanner != null)
         {
@@ -532,6 +631,7 @@ class CockpitWindow : Window
         if (_maxLbl != null) _maxLbl.Text = T("maxtabs") + " (" + T("applies_next") + ")";
         if (_maxValue != null) _maxValue.Text = _maxtabs.ToString();
         if (_startBtn != null) _startBtn.Content = T("start");
+        if (_folderBtn != null) _folderBtn.Content = T("folder");
         if (_goalInput != null) _goalInput.ToolTip = T("goalhint");
         if (_startNote != null && string.IsNullOrEmpty(_startNote.Text)) _startNote.Text = T("goalhint");
         if (_mtApplyNow != null) _mtApplyNow.Content = _lang == 0 ? "今すぐ反映" : "Apply now";
@@ -836,6 +936,8 @@ class CockpitWindow : Window
             col.Children.Add(quote);
         }
 
+        if (!terminal) col.Children.Add(SteerRow(name));
+
         card.Child = col;
         if (!string.IsNullOrEmpty(conv))
         {
@@ -845,6 +947,47 @@ class CockpitWindow : Window
             card.ToolTip = _lang == 0 ? "クリックでこの会話をメインに表示" : "Click to open this conversation in the chat";
         }
         return card;
+    }
+
+    // ② steering: inject a mid-task instruction into this worker's conversation.
+    UIElement SteerRow(string name)
+    {
+        var dp = new DockPanel();
+        dp.Margin = new Thickness(0, 10, 0, 0);
+        // clicks inside this row must not bubble to the card's open-conversation handler
+        dp.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; };
+
+        var send = new Button();
+        send.Content = _lang == 0 ? "割り込み" : "Steer";
+        send.Background = Accent; send.Foreground = White; send.BorderThickness = new Thickness(0);
+        send.Padding = new Thickness(12, 4, 12, 4); send.Cursor = Cursors.Hand; send.FontSize = 12;
+        send.FontWeight = FontWeights.SemiBold;
+        DockPanel.SetDock(send, Dock.Right);
+        dp.Children.Add(send);
+
+        var tb = new TextBox();
+        tb.FontSize = 12.5; tb.Padding = new Thickness(8, 5, 8, 5);
+        tb.BorderThickness = new Thickness(1); tb.Background = BtnBg; tb.Foreground = Fg;
+        tb.BorderBrush = Border; tb.CaretBrush = Fg; tb.Margin = new Thickness(0, 0, 8, 0);
+        tb.ToolTip = _lang == 0 ? "回答待ち中でも割り込み指示を送れます（次のターンに最優先で反映）"
+                                : "Inject a steering instruction (applied on the next turn)";
+        string nm = name;
+        send.Click += delegate
+        {
+            string t = (tb.Text ?? "").Trim();
+            if (t.Length > 0) { RequestSteer(nm, t); tb.Text = ""; }
+        };
+        tb.KeyDown += delegate (object s, KeyEventArgs e)
+        {
+            if (e.Key == Key.Return)
+            {
+                string t = (tb.Text ?? "").Trim();
+                if (t.Length > 0) { RequestSteer(nm, t); tb.Text = ""; }
+                e.Handled = true;
+            }
+        };
+        dp.Children.Add(tb);
+        return dp;
     }
 
     UIElement MakeReleaseContent()
@@ -889,38 +1032,57 @@ class CockpitWindow : Window
     }
 
     // ── cockpit -> fleet control channel ─────────────────────────────────────────
-    void RequestClose(string name)
+    // Merge into the pending command file so concurrent commands don't clobber each
+    // other before the fleet (polling ~1s) consumes them.
+    Dictionary<string, object> ReadCommands()
     {
         try
         {
-            var closes = new List<object>();
             if (File.Exists(_commandsPath))
             {
-                try
-                {
-                    var ex = (Dictionary<string, object>)_js.DeserializeObject(File.ReadAllText(_commandsPath, Encoding.UTF8));
-                    if (ex != null && ex.ContainsKey("close") && ex["close"] is object[])
-                        foreach (object o in (object[])ex["close"]) closes.Add(o);
-                }
-                catch (Exception) { }
+                var ex = _js.DeserializeObject(File.ReadAllText(_commandsPath, Encoding.UTF8)) as Dictionary<string, object>;
+                if (ex != null) return ex;
             }
-            if (!closes.Contains(name)) closes.Add(name);
-            var cmd = new Dictionary<string, object>();
-            cmd["close"] = closes;
-            File.WriteAllText(_commandsPath, _js.Serialize(cmd), Encoding.UTF8);
         }
         catch (Exception) { }
+        return new Dictionary<string, object>();
+    }
+    void WriteCommands(Dictionary<string, object> cmd)
+    {
+        try { File.WriteAllText(_commandsPath, _js.Serialize(cmd), Encoding.UTF8); }
+        catch (Exception) { }
+    }
+
+    void RequestClose(string name)
+    {
+        var cmd = ReadCommands();
+        var closes = new List<object>();
+        if (cmd.ContainsKey("close") && cmd["close"] is object[])
+            foreach (object o in (object[])cmd["close"]) closes.Add(o);
+        if (!closes.Contains(name)) closes.Add(name);
+        cmd["close"] = closes;
+        WriteCommands(cmd);
     }
 
     void RequestSetMaxtabs(int n)
     {
-        try
-        {
-            var cmd = new Dictionary<string, object>();
-            cmd["set_maxtabs"] = n;
-            File.WriteAllText(_commandsPath, _js.Serialize(cmd), Encoding.UTF8);
-        }
-        catch (Exception) { }
+        var cmd = ReadCommands();
+        cmd["set_maxtabs"] = n;
+        WriteCommands(cmd);
+    }
+
+    void RequestSteer(string name, string text)
+    {
+        if (string.IsNullOrEmpty(text)) return;
+        var cmd = ReadCommands();
+        var steers = new List<object>();
+        if (cmd.ContainsKey("steer") && cmd["steer"] is object[])
+            foreach (object o in (object[])cmd["steer"]) steers.Add(o);
+        var item = new Dictionary<string, object>();
+        item["worker"] = name; item["text"] = text;
+        steers.Add(item);
+        cmd["steer"] = steers;
+        WriteCommands(cmd);
     }
 
     // ① groundwork: ask the chat to open this conversation (it polls open.json).
