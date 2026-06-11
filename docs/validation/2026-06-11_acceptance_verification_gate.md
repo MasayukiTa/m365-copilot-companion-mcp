@@ -131,6 +131,47 @@ false-FAIL し得るため `--verify` には束ねず明示 opt-in**。真の意
 - tracing の**実ライブ記録**はサーバを `MCP_TRACE_TOOLCALLS=1` で再起動して初めて出る（本追補では
   スキーマ無破壊までを実機確認、実記録はユニットで確認）。
 
+## 追補 2026-06-12 (2): 自然言語フロントドア・自動検証検出・反証器(operator B)
+
+**動機（ユーザー指摘）**: 「Claude Code は goals ファイルや --verify フラグなんて書かない。自然言語で
+言えばやってくれる」。実際コックピットの「フォルダ→ゴール」は `--mode per-file`（ファイル1個=ゴール1個）
+＋検証なしで、「バグ直して」のような横断タスクにゴールが洪水のように出て無意味だった（=「動かん」の正体）。
+
+### (4) 自動検証検出 `relay/project_introspect.py`
+フォルダを見て**検証方法を自分で決める**: pytest 設定/`test_*.py`/`tests/` があり pytest が
+インストール済なら `pytest -q`、テストはあるが pytest 未導入なら compile にフォールバック＋注記、
+テストが無く .py だけなら `compileall`（構文ゲート）、`package.json` の test script があれば `npm test`。
+`--check-cmd` を書かずに検証が自動で付く。
+
+### (5) 自然言語フロントドア `relay/code_task.py`
+`code_task -i "落ちてるテストを直して" -f C:\proj` だけで、検証を自動付与した**1タスク**として実行
+（per-file 洪水ではない）。エージェントが必要な所を自分で探して編集、枠はプロジェクトの**実テスト/コンパイル
+が実際に通るまで DONE にしない**。コックピット③（FolderToGoals）も per-file 廃止→ code_task 直接起動に
+置換（csc コンパイル確認済。実行中 exe はロックされるので反映には閉じて build_cockpit.bat 再実行）。
+
+### (6) 反証器 operator B `relay/refuter.py`（spec §4B）
+機械検証で捕まらない意味的誤り（ゴール誤読・エッジケース無視・症状隠し・要件を実際は検証しないテスト）対策。
+DONE 候補に対し**独立した第2の Copilot 会話**を side-page で開き「達成できていない具体的欠陥を探せ→
+REFUTED:<理由> か UPHELD」。REFUTED なら実装側に再注入。**既定OFF・予算上限**（`--refuter --max-refute N`、
+spec §4B のコスト2倍を考慮）。run_relay に結線。UNCLEAR はループを縛らないため「通す」扱い。
+
+### ライブ実証（自然言語コーディングが実機で通った）
+バグ入りミニプロジェクト（`calc.py: return a-b`＝バグ、`test_calc.py: assert add(2,3)==5` が失敗）を作り、
+`code_task -i "calc.py のバグを直して pytest が通る状態にして" -f <proj>` を実機 Copilot に流した:
+- 自動で **pytest 検証を選定** → エージェントが `calc.py` を `a+b` に修正 → 枠が**実 pytest 実行→1 passed**
+  → **outcome DONE / verified True /「acceptance verified (1 check(s))」/ 3ターン 131s**。
+- goals ファイル・フラグ・per-file 指定なし。**= Claude Code 体験（自然言語 in、検証済み work out）を実機実証**。
+- 副次修正: **pytest が venv 未導入だった**（テスト検証が環境エラーで落ちる「動かん」要因）→ `pip install pytest`
+  ＋ requirements.txt に追加。detect は pytest が import 可能なときだけ pytest を採用するよう堅牢化。
+
+テスト: project_introspect/code_task 12・refuter 10 を追加。**全体 82/82**
+（acceptance 20・fleet-verify 12・folder-verify 8・relay-loop 9・code-task 12・refuter 10・trace 11）。
+
+### 残（追補2）
+- 反証器は run_relay(単一CLI)に結線済だが、code_task/フリート経路（並列の主UX）への結線は未（フリートは
+  単一スレッドで side-page 反証がブロッキングになるため設計検討要）。当面は単一タスクの精査用。
+- attach 中 Edge hard-reset で worker 終端ERROR の堅牢化（追補1の残）は依然未対応。
+
 ## 限界・残（正直に）
 
 - ゲートはユーザ（オペレータ）がチェックを与えたゴールにだけ効く。チェック無しゴールは

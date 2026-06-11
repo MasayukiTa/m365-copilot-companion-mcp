@@ -114,6 +114,15 @@ VERIFY_FIX_JOB = (
     "通る状態になったら最後の行に再度 DONE と書いてください。"
     "どうしても無理なら最後の行に STUCK: 理由 と書いてください。"
 )
+# Sent back when an INDEPENDENT reviewer (operator B refuter) found a concrete defect in
+# a claimed-done result. %s = the reviewer's concrete reason.
+REFUTE_FIX_JOB = (
+    "独立したレビュアーがあなたの完了報告を精査し、ゴールが達成されていない具体的な問題を"
+    "指摘しました:\n--- レビュアーの指摘 ---\n%s\n--- 指摘ここまで ---\n"
+    "この指摘が妥当かを自分で確認し、妥当なら修正してください。妥当でない（既に満たしている）"
+    "と判断した場合はその根拠を示してください。対応後、ゴールが満たせていれば最後の行に再度 "
+    "DONE、無理なら STUCK: 理由 と書いてください。"
+)
 NUDGE_JOB = (
     "前のステップがまだ完了していないようです。今の状況を1行で報告し、"
     "可能なら次に進んでください。"
@@ -362,6 +371,8 @@ def run_relay(
     checks=None,
     cwd: str | None = None,
     max_verify_attempts: int = 3,
+    refuter: bool = False,
+    max_refute: int = 2,
 ) -> str:
     """Run the autonomous loop unattended. Returns one of:
     DONE | STUCK | MAXTURNS | ABORTED. Notifies on every terminal outcome.
@@ -390,6 +401,7 @@ def run_relay(
     research_count = 0
     analyze_count = 0
     verify_attempts = 0
+    refute_count = 0
     checks_norm = normalize_checks(checks)      # spec 3-3 acceptance gate (empty -> trust DONE)
     backoff_s = 0.0          # adaptive throttle: extra cool-down added between turns
     base_elapsed = None      # fastest healthy turn so far -> the "not throttled" baseline
@@ -563,26 +575,49 @@ def run_relay(
             break
         if "DONE" in up and "FAIL" not in last_line:
             # spec 3-3 verification GATE: never trust a self-reported DONE when the goal
-            # carries acceptance checks. Re-derive ground truth locally; on pass, finish;
-            # on fail, hand the agent the REAL output and keep working (bounded retries).
-            if not checks_norm:
-                outcome = "DONE"
-                break
-            passed, detail = run_all_blocking(checks_norm, cwd=cwd)
-            runlog_append(run_id, {"turn": turn, "event": "verify", "passed": passed,
-                                   "attempt": verify_attempts + 1, "detail": detail[:400]})
-            print(f"[relay turn {turn}] verify {'PASS' if passed else 'FAIL'}: {detail[:120]}")
-            if passed:
-                outcome = "DONE"
-                break
-            verify_attempts += 1
-            if verify_attempts >= max_verify_attempts:
-                outcome = "STUCK"
-                reason = f"acceptance check failed {verify_attempts}x: {detail[:200]}"
-                break
-            job = VERIFY_FIX_JOB % (detail or "(no detail)")
-            time.sleep(sleep_s + backoff_s)
-            continue
+            # carries acceptance checks. Re-derive ground truth locally; on fail, hand the
+            # agent the REAL output and keep working (bounded retries).
+            if checks_norm:
+                passed, detail = run_all_blocking(checks_norm, cwd=cwd)
+                runlog_append(run_id, {"turn": turn, "event": "verify", "passed": passed,
+                                       "attempt": verify_attempts + 1, "detail": detail[:400]})
+                print(f"[relay turn {turn}] verify {'PASS' if passed else 'FAIL'}: {detail[:120]}")
+                if not passed:
+                    verify_attempts += 1
+                    if verify_attempts >= max_verify_attempts:
+                        outcome = "STUCK"
+                        reason = f"acceptance check failed {verify_attempts}x: {detail[:200]}"
+                        break
+                    job = VERIFY_FIX_JOB % (detail or "(no detail)")
+                    time.sleep(sleep_s + backoff_s)
+                    continue
+            # spec 4B refuter (operator B): machine checks passed (or none) -> a CANDIDATE
+            # DONE. Optionally have an independent reviewer try to refute it before we
+            # accept. A real refutation is fed back; otherwise the DONE stands. OFF by
+            # default + budget-capped (it doubles oracle cost).
+            if refuter and browser_context is not None and refute_count < max_refute:
+                refute_count += 1
+                from .refuter import run_refuter
+                conv_url = ""
+                try:
+                    conv_url = driver.page.url
+                except Exception:
+                    pass
+                kind, rreason = run_refuter(browser_context, conv_url, goal, resp,
+                                            notify=notify, runlog=runlog_append,
+                                            run_id=run_id, turn=turn)
+                try:
+                    driver.page.bring_to_front()
+                except Exception:
+                    pass
+                print(f"[relay turn {turn}] refuter: {kind} {rreason[:100]}")
+                if kind == "REFUTED":
+                    notify("🧐 Relay 反証あり", rreason[:80])
+                    job = REFUTE_FIX_JOB % rreason
+                    time.sleep(sleep_s + backoff_s)
+                    continue
+            outcome = "DONE"
+            break
         if no_progress >= max_no_progress:
             outcome, reason = "STUCK", f"no progress for {no_progress + 1} turns"
             break
@@ -647,6 +682,12 @@ def main():
                          "(spec 3-3 gate); on failure the real output is fed back to the agent.")
     ap.add_argument("--check-cwd", default=None,
                     help="working directory the acceptance check(s) run in (default: repo)")
+    ap.add_argument("--refuter", action="store_true",
+                    help="operator B: after a candidate DONE, have an INDEPENDENT Copilot "
+                         "review try to refute it; a real refutation is fed back. Doubles "
+                         "oracle cost, so off by default and capped (--max-refute).")
+    ap.add_argument("--max-refute", type=int, default=2,
+                    help="max refuter rounds per run (default 2)")
     args = ap.parse_args()
 
     checks = None
@@ -668,7 +709,8 @@ def main():
         run_relay(driver, args.goal, args.run_id, args.max_turns,
                   per_turn_timeout_s=args.per_turn_timeout,
                   browser_context=None if args.no_research else context,
-                  checks=checks, cwd=args.check_cwd)
+                  checks=checks, cwd=args.check_cwd,
+                  refuter=args.refuter, max_refute=args.max_refute)
 
 
 if __name__ == "__main__":
