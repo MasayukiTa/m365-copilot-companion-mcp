@@ -92,6 +92,7 @@ class RelayWorker:
         self.goal = goal
         self.name = name
         self.conv_url = ""         # filled once the conversation gets its /conversation/<id>
+        self.steer_msgs = []       # user steering messages to inject on the next turn(s)
         self.max_turns = max_turns
         self.dwell_s = dwell_s
         self.per_turn_timeout_s = per_turn_timeout_s
@@ -154,10 +155,21 @@ class RelayWorker:
         except Exception:
             pass
 
+    def steer(self, text):
+        """Queue a user steering message; injected as the worker's next turn (Codex-
+        style mid-task redirection). Takes priority over CONTINUE/FIX."""
+        if text:
+            self.steer_msgs.append(text)
+
     def _begin_send(self):
         if self.turn >= self.max_turns:
             self.status, self.outcome, self.reason = "maxturns", "MAXTURNS", "reached max_turns"
             return
+        # a queued steering message preempts the normal CONTINUE/FIX job for this turn
+        if self.steer_msgs:
+            self.job = ("【ユーザーからの追加指示】" + self.steer_msgs.pop(0)
+                        + "\n上記を最優先で踏まえて作業を続行してください。"
+                        "完了なら DONE、無理なら FAIL と理由を書いてください。")
         self.turn += 1
         try:
             self._count_before = self.drv._answers().count()
