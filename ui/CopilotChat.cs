@@ -132,7 +132,7 @@ class ChatWindow : Window
         _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveSettings(); UpdateChrome(); RefreshConvList(); };
         _themeBtn = Btn(T("theme"), "Panel", "Muted", true);
         _themeBtn.Height = 34; _themeBtn.FontSize = 12;
-        _themeBtn.Click += delegate { _dark = !_dark; ApplyTheme(); _themeBtn.Content = T("theme"); };
+        _themeBtn.Click += delegate { _dark = !_dark; ApplyTheme(); _themeBtn.Content = T("theme"); SaveSettings(); };
         bottom.Children.Add(_langBtn); bottom.Children.Add(_themeBtn);
         Grid.SetRow(bottom, 2); side.Children.Add(bottom);
 
@@ -369,13 +369,16 @@ class ChatWindow : Window
                 int v;
                 if (ln.StartsWith("deletemode=") && int.TryParse(ln.Substring(11).Trim(), out v)) _deleteMode = v;
                 else if (ln.StartsWith("lang=") && int.TryParse(ln.Substring(5).Trim(), out v)) _lang = v;
+                else if (ln.StartsWith("dark=")) _dark = ln.Substring(5).Trim() != "0";
             }
+            ApplyTheme();     // _dark may have changed -> re-apply (shared with the cockpit)
         }
         catch { }
     }
+    // Shared with the cockpit -> preserve the 'dark' key and write all three.
     void SaveSettings()
     {
-        try { Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile)); File.WriteAllText(SettingsFile, "deletemode=" + _deleteMode + "\nlang=" + _lang + "\n", Encoding.UTF8); }
+        try { Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile)); File.WriteAllText(SettingsFile, "deletemode=" + _deleteMode + "\nlang=" + _lang + "\ndark=" + (_dark ? "1" : "0") + "\n", Encoding.UTF8); }
         catch { }
     }
     void UpdateChrome()

@@ -17,6 +17,7 @@ using System.IO;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Threading;
@@ -36,14 +37,16 @@ class CockpitWindow : Window
 {
     static Color C(string hex) { return (Color)ColorConverter.ConvertFromString(hex); }
 
-    // the sibling app slate palette
-    static readonly Brush Bg     = new SolidColorBrush(C("#0f172a"));
-    static readonly Brush CardBg = new SolidColorBrush(C("#1e293b"));
-    static readonly Brush Border = new SolidColorBrush(C("#334155"));
-    static readonly Brush Fg     = new SolidColorBrush(C("#f8fafc"));
-    static readonly Brush Muted  = new SolidColorBrush(C("#94a3b8"));
-    static readonly Brush Accent = new SolidColorBrush(C("#ea580c"));   // E_EMPHASIS
+    // the sibling app palette -- theme-dependent brushes (swapped on light/dark toggle).
+    Brush Bg, CardBg, Border, Fg, Muted, QuoteBg;
+    static readonly Brush Accent = new SolidColorBrush(C("#ea580c"));   // E_EMPHASIS (const)
     static readonly Brush White  = new SolidColorBrush(C("#ffffff"));
+
+    bool _dark = true;
+    Button _themeBtn;
+    static readonly string SettingsFile = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "copilot-bridge", "settings.txt");
 
     readonly string _statusPath;
     StackPanel _cards;
@@ -52,9 +55,27 @@ class CockpitWindow : Window
     string _lastSig = "";
     JavaScriptSerializer _js = new JavaScriptSerializer();
 
+    void ApplyThemeBrushes()
+    {
+        if (_dark)
+        {
+            Bg = new SolidColorBrush(C("#0f172a")); CardBg = new SolidColorBrush(C("#1e293b"));
+            Border = new SolidColorBrush(C("#334155")); Fg = new SolidColorBrush(C("#f8fafc"));
+            Muted = new SolidColorBrush(C("#94a3b8")); QuoteBg = new SolidColorBrush(C("#0b1220"));
+        }
+        else
+        {
+            Bg = new SolidColorBrush(C("#ffffff")); CardBg = new SolidColorBrush(C("#f8fafc"));
+            Border = new SolidColorBrush(C("#e2e8f0")); Fg = new SolidColorBrush(C("#0f172a"));
+            Muted = new SolidColorBrush(C("#64748b")); QuoteBg = new SolidColorBrush(C("#f1f5f9"));
+        }
+    }
+
     public CockpitWindow(string path)
     {
         _statusPath = ResolvePath(path);
+        _dark = LoadDark();                 // honor the shared chat/cockpit theme setting
+        ApplyThemeBrushes();
         Title = "並列自律フリート — Cockpit";
         Width = 1080; Height = 760;
         Background = Bg;
@@ -74,33 +95,106 @@ class CockpitWindow : Window
         return Path.GetFullPath(Path.Combine(exeDir, "..", ".fleet", "status.json"));
     }
 
+    Border _headBar;
+    ScrollViewer _sv;
+
     void BuildChrome()
     {
         var root = new DockPanel();
-        var head = new StackPanel();
-        head.Margin = new Thickness(28, 22, 28, 8);
-        DockPanel.SetDock(head, Dock.Top);
+        _headBar = new Border();
+        _headBar.Padding = new Thickness(28, 22, 22, 8);
+        DockPanel.SetDock(_headBar, Dock.Top);
 
+        var headRow = new DockPanel();
+        // theme toggle, pinned right
+        _themeBtn = new Button();
+        _themeBtn.Content = _dark ? "☀" : "☾";
+        _themeBtn.FontSize = 16; _themeBtn.Width = 38; _themeBtn.Height = 32;
+        _themeBtn.Cursor = Cursors.Hand; _themeBtn.BorderThickness = new Thickness(1);
+        _themeBtn.VerticalAlignment = VerticalAlignment.Top;
+        _themeBtn.ToolTip = "テーマ (ダーク/ライト)";
+        _themeBtn.Click += delegate { _dark = !_dark; SaveDark(); ApplyTheme(); };
+        DockPanel.SetDock(_themeBtn, Dock.Right);
+        headRow.Children.Add(_themeBtn);
+
+        var head = new StackPanel();
         _header = new TextBlock();
-        _header.Foreground = Fg;
         _header.FontSize = 22; _header.FontWeight = FontWeights.SemiBold;
         _header.Text = "🛰  並列自律フリート";
         head.Children.Add(_header);
 
         _sub = new TextBlock();
-        _sub.Foreground = Muted;
         _sub.FontSize = 13; _sub.Margin = new Thickness(0, 4, 0, 0);
         _sub.Text = "status.json を待機中…  " + _statusPath;
         head.Children.Add(_sub);
-        root.Children.Add(head);
+        headRow.Children.Add(head);
+        _headBar.Child = headRow;
+        root.Children.Add(_headBar);
 
-        var sv = new ScrollViewer();
-        sv.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
-        sv.Padding = new Thickness(20, 6, 20, 24);
+        _sv = new ScrollViewer();
+        _sv.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+        _sv.Padding = new Thickness(20, 6, 20, 24);
         _cards = new StackPanel();
-        sv.Content = _cards;
-        root.Children.Add(sv);
+        _sv.Content = _cards;
+        root.Children.Add(_sv);
         Content = root;
+        PaintChrome();
+    }
+
+    // Apply the current theme brushes to the persistent chrome (window, header bar,
+    // texts, toggle). Cards pick up the brushes when they are (re)built in Render().
+    void PaintChrome()
+    {
+        Background = Bg;
+        _headBar.Background = Bg;
+        _header.Foreground = Fg;
+        _sub.Foreground = Muted;
+        _themeBtn.Content = _dark ? "☀" : "☾";
+        _themeBtn.Background = CardBg;
+        _themeBtn.Foreground = Fg;
+        _themeBtn.BorderBrush = Border;
+        if (_sv != null) _sv.Background = Bg;
+    }
+
+    // Live theme switch: swap brushes, repaint chrome, force a full card rebuild.
+    void ApplyTheme()
+    {
+        ApplyThemeBrushes();
+        PaintChrome();
+        _lastSig = "";                 // invalidate so the next tick re-renders cards
+        Dictionary<string, object> root = ReadStatus();
+        if (root != null) { _lastSig = Sig(root); Render(root); }
+    }
+
+    bool LoadDark()
+    {
+        try
+        {
+            if (File.Exists(SettingsFile))
+                foreach (string ln in File.ReadAllLines(SettingsFile))
+                    if (ln.StartsWith("dark=")) return ln.Substring(5).Trim() != "0";
+        }
+        catch (Exception) { }
+        return true;       // default dark
+    }
+
+    void SaveDark()
+    {
+        try
+        {
+            var lines = new List<string>();
+            bool found = false;
+            if (File.Exists(SettingsFile))
+                foreach (string ln in File.ReadAllLines(SettingsFile))
+                {
+                    if (ln.StartsWith("dark=")) { lines.Add("dark=" + (_dark ? "1" : "0")); found = true; }
+                    else lines.Add(ln);
+                }
+            if (!found) lines.Add("dark=" + (_dark ? "1" : "0"));
+            Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile));
+            File.WriteAllText(SettingsFile, string.Join("\n", lines.ToArray()) + "\n", Encoding.UTF8);
+        }
+        catch (Exception) { }
     }
 
     void OnTick(object sender, EventArgs e)
@@ -268,7 +362,7 @@ class CockpitWindow : Window
         if (!string.IsNullOrEmpty(body))
         {
             var quote = new Border();
-            quote.Background = new SolidColorBrush(C("#0b1220"));
+            quote.Background = QuoteBg;
             quote.BorderBrush = Border; quote.BorderThickness = new Thickness(0, 0, 0, 0);
             quote.CornerRadius = new CornerRadius(8);
             quote.Padding = new Thickness(12, 10, 12, 10);
