@@ -48,6 +48,7 @@ STATUS_PILL = {
     "pending":   ("待機列", "muted"),    # queued -- no tab open yet (memory discipline)
     "ready":     ("準備",   "muted"),
     "waiting":   ("実行中", "good"),     # A_GOOD blue -- a turn is streaming server-side
+    "awaiting":  ("承認待ち", "muted"),  # plan proposed, paused for the user to approve/edit
     "verifying": ("検証中", "good"),     # spec 3-3: running the acceptance check locally
     "refuting":  ("反証中", "good"),     # spec 4B: an independent reviewer is checking it
     "done":      ("完了",   "done"),     # finished cleanly
@@ -128,6 +129,7 @@ def _snapshot(workers, started, total, max_concurrent=0):
             "conv_url": getattr(w, "conv_url", ""),
             "verified": getattr(w, "verified", None),
             "verify_attempts": getattr(w, "verify_attempts", 0),
+            "plan": getattr(w, "plan_steps", []),     # surfaced so the cockpit can show/pick
             "last": (w.last_response or "")[:600],
         } for w in workers],
     }
@@ -177,6 +179,10 @@ def main():
                          "Off by default; doubles oracle cost.")
     ap.add_argument("--max-refute", type=int, default=2,
                     help="max refuter rounds per goal (default 2)")
+    ap.add_argument("--plan", action="store_true",
+                    help="plan-first: each goal proposes a numbered plan and pauses for "
+                         "approval (status 'awaiting'); approve or edit it with a steer to "
+                         "start execution. The plan is in status.json (workers[].plan).")
     ap.add_argument("--state-dir", default=os.path.join(_repo_root(), ".fleet"),
                     help="where to write the live status.json the cockpit reads")
     args = ap.parse_args()
@@ -356,7 +362,8 @@ def main():
                                       max_turns=args.max_turns, poll_s=args.poll_s,
                                       notify=default_notify, on_tick=on_tick,
                                       max_concurrent=max_conc, mc_box=mc_box, add_box=add_box,
-                                      refuter=args.refuter, max_refute=args.max_refute)
+                                      refuter=args.refuter, max_refute=args.max_refute,
+                                      plan_mode=args.plan)
             for r in res:
                 results_by_goal[r["goal"]] = r
             pending = []                                   # finished cleanly
