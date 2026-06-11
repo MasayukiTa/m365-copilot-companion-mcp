@@ -140,7 +140,7 @@ def _wrap(text, checks, cwd):
 
 
 def generate_goals(folder, instruction, mode="per-file", exts=None, max_files=200,
-                   verify=False, check_cmd=None):
+                   verify=False, check_cmd=None, import_smoke=False):
     """Turn one folder + one instruction into a list of fleet GOALs.
 
     `mode` is one of:
@@ -177,6 +177,8 @@ def generate_goals(folder, instruction, mode="per-file", exts=None, max_files=20
         if mode == "per-file":          # review is read-only -> no acceptance check
             if verify and rel.lower().endswith(".py"):
                 checks.append({"type": "py_compile", "path": rel})
+            if import_smoke and rel.lower().endswith(".py"):
+                checks.append({"type": "import_smoke", "path": rel})
             if check_cmd:
                 checks.append({"type": "shell", "cmd": check_cmd})
         out.append(_wrap(text, checks, folder_disp))
@@ -249,13 +251,19 @@ def main():
                     help="shell command run as an acceptance check on every EDIT goal "
                          '(and the single-mode goal), e.g. "python -m pytest -q". DONE is '
                          "accepted only if it exits 0; on failure the real output is fed back.")
+    ap.add_argument("--import-smoke", action="store_true",
+                    help="attach an import_smoke check to each per-file Python EDIT goal: "
+                         "the module must actually IMPORT (catches load-time errors a "
+                         "compile misses). Opt-in: importing runs module-level code and may "
+                         "false-fail for modules that need special context.")
     args = ap.parse_args()
 
     out = args.out or _default_out(args.folder)
 
     goals = generate_goals(args.folder, args.instruction, mode=args.mode,
                            exts=args.ext, max_files=args.max,
-                           verify=args.verify, check_cmd=args.check_cmd)
+                           verify=args.verify, check_cmd=args.check_cmd,
+                           import_smoke=args.import_smoke)
 
     if not goals:
         print("folder_coder: no matching files in %s -- nothing to do."
