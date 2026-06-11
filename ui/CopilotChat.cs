@@ -70,6 +70,8 @@ class ChatWindow : Window
         if (k == "delete") return ja ? "削除" : "Delete";
         if (k == "generating") return ja ? "生成中" : "Generating";
         if (k == "cancel") return ja ? "キャンセル" : "Cancel";
+        if (k == "copy") return ja ? "コピー" : "Copy";
+        if (k == "stop") return ja ? "停止" : "Stop";
         if (k == "del_head") return ja ? "を削除 — 方法を選んでください" : " — choose how to delete";
         if (k == "m1t") return ja ? "このアプリからのみ削除" : "Delete from this app only";
         if (k == "m1s") return ja ? "Copilot 側の会話は残す（最も安全）" : "Keeps the Copilot conversation (safest)";
@@ -90,6 +92,9 @@ class ChatWindow : Window
     Panel _pendingContent;   // holds the typing dots, then the streamed text
     TextBox _pendingText;
     volatile bool _started;
+    StackPanel _pendingOuter;            // the assistant block for the in-flight turn (Tag holds final text)
+    bool _generating;                    // true while a reply is streaming; _send acts as Stop
+    System.Net.HttpWebRequest _activeReq;// the in-flight stream request (Abort to stop)
 
     public ChatWindow()
     {
@@ -173,7 +178,11 @@ class ChatWindow : Window
         Grid.SetColumn(_input, 0); bar.Children.Add(_input);
         _send = Btn(T("send"), "Accent", "AccentFg", false);
         _send.Width = 92; _send.Margin = new Thickness(8, 0, 0, 0); _send.FontWeight = FontWeights.SemiBold; _send.MinHeight = 50;
-        _send.Click += delegate { DoSend(); };
+        _send.Click += delegate
+        {
+            if (_generating) { try { if (_activeReq != null) _activeReq.Abort(); } catch { } }
+            else DoSend();
+        };
         Grid.SetColumn(_send, 1); bar.Children.Add(_send);
         var barBorder = new Border { Child = bar, BorderThickness = new Thickness(0, 1, 0, 0) };
         SetRef(barBorder, Border.BorderBrushProperty, "Border");
@@ -466,24 +475,53 @@ class ChatWindow : Window
         _scroll.ScrollToEnd();
     }
 
-    // assistant: small "Copilot" label + full-width plain text (no bubble). Returns the
-    // content panel so a live turn can swap dots -> text.
-    Panel AddAssistantContainer()
+    // assistant: small "Copilot" label (+ hover copy button) + full-width plain text
+    // (no bubble). Returns the content panel so a live turn can swap dots -> text; also
+    // hands back the outer block via 'outer' so callers can stash the message text on
+    // its .Tag for the copy button to read at click time.
+    Panel AddAssistantContainer(out StackPanel outer)
     {
-        var outer = new StackPanel { Margin = new Thickness(0, 8, 40, 14) };
-        var lbl = new TextBlock { Text = "Copilot", FontSize = 12, Margin = new Thickness(2, 0, 0, 5), FontWeight = FontWeights.SemiBold };
+        var block = new StackPanel { Margin = new Thickness(0, 8, 40, 14) };
+        // header row: "Copilot" label on the left, hover-revealed copy button on the right
+        var header = new DockPanel { Margin = new Thickness(0, 0, 0, 5) };
+        var lbl = new TextBlock { Text = "Copilot", FontSize = 12, Margin = new Thickness(2, 0, 0, 0), FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center };
         SetRef(lbl, TextBlock.ForegroundProperty, "Muted");
+        var blockRef = block;
+        var copy = new Button
+        {
+            Content = "", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 12,
+            Width = 26, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
+            Cursor = Cursors.Hand, Visibility = Visibility.Hidden, ToolTip = T("copy")
+        };
+        SetRef(copy, ForegroundProperty, "Muted");
+        copy.Click += delegate
+        {
+            var txt = blockRef.Tag as string;
+            if (txt == null) txt = "";
+            try { System.Windows.Clipboard.SetText(txt); } catch { }
+        };
+        DockPanel.SetDock(copy, Dock.Right);
+        header.Children.Add(copy); header.Children.Add(lbl);
         var content = new StackPanel();
-        outer.Children.Add(lbl); outer.Children.Add(content);
-        _messages.Children.Add(outer);
+        block.Children.Add(header); block.Children.Add(content);
+        var copyRef = copy;
+        block.MouseEnter += delegate { copyRef.Visibility = Visibility.Visible; };
+        block.MouseLeave += delegate { copyRef.Visibility = Visibility.Hidden; };
+        _messages.Children.Add(block);
         _scroll.ScrollToEnd();
+        outer = block;
         return content;
     }
 
+    // convenience overload for callers that only need the content panel
+    Panel AddAssistantContainer() { StackPanel ignore; return AddAssistantContainer(out ignore); }
+
     void AddAssistant(string text)
     {
-        var content = AddAssistantContainer();
-        content.Children.Add(Md.Render(text));   // rendered markdown (code blocks, lists, bold, ...)
+        StackPanel outer;
+        var content = AddAssistantContainer(out outer);
+        outer.Tag = text;                          // copy button reads this on click
+        content.Children.Add(Md.Render(text));     // rendered markdown (code blocks, lists, bold, ...)
     }
 
     TextBox MakeText(string text)
@@ -533,10 +571,12 @@ class ChatWindow : Window
         if (!_all.Contains(_conv)) { _all.Insert(0, _conv); }
         RefreshConvList();
         AddUser(text);
-        _pendingContent = AddAssistantContainer();
+        StackPanel outer;
+        _pendingContent = AddAssistantContainer(out outer);
+        _pendingOuter = outer;
         _pendingContent.Children.Add(MakeTyping());   // <- ShuttleScope waiting indicator, shown immediately
         _pendingText = null; _started = false;
-        _send.IsEnabled = false;
+        _generating = true; _send.Content = T("stop"); _send.IsEnabled = true;   // _send now acts as Stop
         SetRef(_statusDot, BackgroundProperty, "Accent");
         new Thread((ThreadStart)delegate { Stream(text); }) { IsBackground = true }.Start();
     }
@@ -545,11 +585,14 @@ class ChatWindow : Window
     {
         var full = new StringBuilder();
         var content = _pendingContent;
+        var outer = _pendingOuter;
+        string errMsg = null;
         try
         {
             var url = _bridge + "/stream?msg=" + Uri.EscapeDataString(msg);
             var req = (HttpWebRequest)WebRequest.Create(url);
             req.Timeout = 600000; req.ReadWriteTimeout = 600000;
+            _activeReq = req;
             using (var resp = (HttpWebResponse)req.GetResponse())
             using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
             {
@@ -575,18 +618,23 @@ class ChatWindow : Window
         }
         catch (Exception ex)
         {
-            var msgErr = ex.Message;
-            Dispatcher.BeginInvoke(new Action(delegate
-            {
-                content.Children.Clear(); content.Children.Add(MakeText("[bridge error: " + msgErr + "]"));
-            }));
+            // An aborted request (Stop) throws here; keep whatever streamed so far.
+            // Only surface a bridge error when it wasn't a deliberate abort.
+            bool aborted = ex is WebException && ((WebException)ex).Status == WebExceptionStatus.RequestCanceled;
+            if (!aborted && full.Length == 0) errMsg = ex.Message;
         }
+        _activeReq = null;
         var answer = full.ToString();
+        var errFinal = errMsg;
         Dispatcher.BeginInvoke(new Action(delegate
         {
-            _send.IsEnabled = true; _input.Focus();
+            _generating = false; _send.Content = T("send"); _send.IsEnabled = true; _input.Focus();
             SetRef(_statusDot, BackgroundProperty, "Border");
-            if (answer.Length > 0) { content.Children.Clear(); content.Children.Add(Md.Render(answer)); _scroll.ScrollToEnd(); }
+            // render whatever we got (full / partial / error); always clear the typing indicator
+            content.Children.Clear();
+            if (answer.Length > 0) { content.Children.Add(Md.Render(answer)); _scroll.ScrollToEnd(); }
+            else if (errFinal != null) { content.Children.Add(MakeText("[bridge error: " + errFinal + "]")); }
+            if (outer != null) outer.Tag = answer;   // copy button reads this on click
             _conv.Messages.Add(new Msg("A", answer));
             SaveConversation(_conv);
         }));
