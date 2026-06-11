@@ -44,6 +44,15 @@ LASTMSG = '[data-testid="lastChatMessage"]'    # populates when the turn is DONE
 PAGE = None      # set at startup
 DRIVER = None
 BUSY = False     # single conversation -> serialize requests
+AGENT_URL = ""   # bare agent URL (a fresh chat); set at startup
+
+
+def _wait_composer(timeout=40):
+    for _ in range(timeout):
+        PAGE.wait_for_timeout(1000)
+        if PAGE.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+            return True
+    return False
 
 
 def _is_proc(t: str) -> bool:
@@ -126,8 +135,45 @@ class Handler(BaseHTTPRequestHandler):
             msg = (qs.get("msg") or [""])[0]
             self._stream(msg)
             return
+        if parsed.path == "/new":          # start a fresh Copilot conversation
+            global BUSY
+            if BUSY:
+                self._json({"ok": False, "error": "busy"}); return
+            ok = False
+            try:
+                if AGENT_URL:
+                    PAGE.goto(AGENT_URL, wait_until="domcontentloaded")
+                    ok = _wait_composer()
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)}); return
+            self._json({"ok": ok, "url": PAGE.url})
+            return
+        if parsed.path == "/conv":         # current conversation URL (for saving)
+            self._json({"url": PAGE.url})
+            return
+        if parsed.path == "/switch":       # continue a saved conversation
+            if BUSY:
+                self._json({"ok": False, "error": "busy"}); return
+            url = (urllib.parse.parse_qs(parsed.query).get("url") or [""])[0]
+            ok = False
+            try:
+                if url:
+                    PAGE.goto(url, wait_until="domcontentloaded")
+                    ok = _wait_composer()
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)}); return
+            self._json({"ok": ok, "url": PAGE.url})
+            return
         self.send_response(404)
         self.end_headers()
+
+    def _json(self, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _sse(self, data: dict, event: str | None = None):
         chunk = (f"event: {event}\n" if event else "") + f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -195,7 +241,7 @@ def _find_or_open_agent(ctx):
 
 
 def main():
-    global PAGE, DRIVER
+    global PAGE, DRIVER, AGENT_URL
     cdp = os.environ.get("MCP_CDP_URL", "http://localhost:9222")
     port = int(os.environ.get("MCP_BRIDGE_PORT", "8765"))
     from playwright.sync_api import sync_playwright
@@ -204,6 +250,10 @@ def main():
         ctx = br.contexts[0] if br.contexts else br.new_context()
         PAGE = _find_or_open_agent(ctx)
         DRIVER = CopilotWebDriver(PAGE)
+        # bare agent URL (a fresh chat) for /new; strip any /conversation/<id> suffix
+        AGENT_URL = os.environ.get("MCP_IMPL_AGENT_URL", "").strip()
+        if not AGENT_URL and "/chat/agent/" in (PAGE.url or ""):
+            AGENT_URL = (PAGE.url or "").split("/conversation/")[0]
         # single-threaded ON PURPOSE: Playwright sync objects are not thread-safe,
         # so every request must run in the same thread that owns the page.
         srv = HTTPServer(("127.0.0.1", port), Handler)
