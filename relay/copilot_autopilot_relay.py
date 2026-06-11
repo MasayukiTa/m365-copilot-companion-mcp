@@ -297,6 +297,15 @@ class CopilotWebDriver:
                 self.page.wait_for_timeout(250)
                 if not self._composer_text():
                     return  # composer emptied => message was submitted
+                # STRONGER success signal: if a new answer block has appeared, the agent
+                # is already replying, so the send DID go through -- even if the composer
+                # is slow to visually clear under memory pressure. Without this, a laggy
+                # composer caused false 'send failed' + a double-send on retry.
+                try:
+                    if self._answers().count() > self._count_before:
+                        return
+                except Exception:
+                    pass
                 if i and i % 4 == 0:             # ~every 1s, nudge a re-armed Send button
                     try:
                         btn = self._send_button()

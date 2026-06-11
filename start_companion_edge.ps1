@@ -170,6 +170,14 @@ $arguments += @(
     "--disable-background-timer-throttling",
     "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
+    # trim memory footprint (this profile only ever shows M365 Copilot). These are safe
+    # for SSO -- we deliberately do NOT touch background-networking, which token refresh
+    # can use. process-per-site consolidates M365's same-site tabs into one renderer.
+    "--disable-extensions",
+    "--disable-sync",
+    "--disable-component-update",
+    "--disable-features=Translate,MediaRouter,OptimizationHints",
+    "--process-per-site",
     $Url
 )
 
