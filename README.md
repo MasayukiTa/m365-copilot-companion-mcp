@@ -148,7 +148,7 @@
 | **PowerShell 専用** | `pwsh_exec`, `pwsh_exec_file`, `shell_which` | 🪟 | `cmd.exe` 経由ではなく PowerShell 5.1 / 7 を直接叩く（`-NoProfile -NonInteractive -ExecutionPolicy Bypass` 込み） |
 | **プロセス / サービス / レジストリ** | `process_list`, `process_info`, `process_kill`, `service_status`, `registry_read` | 🪟📦`psutil` | タスクマネージャ + サービス + レジストリの読み口（kill は unlock 必須） |
 | **ファイル I/O** | `read_file`, `write_file`, `append_file`, `list_directory`, `glob`, `find_files`, `copy_path`, `move_path`, `trash_path`, `create_directory`, `delete_path` | 🟢 | 許可ディレクトリ内のファイルを自在に。`trash_path` はゴミ箱送りで復元可 |
-| **ファイル法医学** | `hash_file`, `find_duplicates`, `dir_size`, `file_metadata` | 🟢 | 「80 GB どこいった？」を 1 プロンプトで解明 |
+| **ファイル/ディスク調査** | `hash_file`, `find_duplicates`, `dir_size`, `file_metadata` | 🟢 | ハッシュ・重複検出・容量・メタ情報。「80 GB どこいった？」を 1 プロンプトで。※ファイル“検索”は上の `glob` / `find_files`、本文検索は `grep` の方 |
 | **編集・検索** | `grep`, `replace_in_file`, `multi_edit`, `diff_files`, `python_check` | 🟢 | 原子的な複数編集。「ファイル半分食われた」事故が起きない |
 | **Git** | `git_status`, `git_diff`, `git_log`, `git_branch`, `git_blame`, `git_add`, `git_commit`, `git_checkout` | 📦`git` | 読みも書きも。`git_blame` でツッコむ相手を特定 |
 | **表 / JSON** | `read_excel`, `write_excel`, `summarize_table`, `read_json`, `write_json` | 🟢 | Excel / CSV / JSON を一級市民として扱う |
@@ -264,7 +264,7 @@ Premium / Direct Line を使わず、Copilot エージェントを **手元の�
 
 ### 0. 前提
 
-- **Windows 10 / 11**（PowerShell 5+）。多くは macOS / Linux でも動きますが、🪟 タグのツール（PowerShell・プロセス・レジストリ・スケジューラ・通知・Outlook・スクリーン）は Windows 専用
+- **Windows 10 / 11**（PowerShell 5+）。macOS / Linux でも**動くと思います**が、**筆者は Mac を持っていないので未確認**です（正直に言います）。なお 🪟 タグのツール（PowerShell・プロセス・レジストリ・スケジューラ・通知・Outlook・スクリーン）は Windows 専用
 - **Python 3.10 以降**（3.11 推奨）
 - **Git**
 - 任意（対応するツールを使うときだけ）:
@@ -448,7 +448,7 @@ m365-copilot-companion-mcp/
 │   ├── jobs.py              # 非同期ジョブ管理
 │   ├── process_ops.py       # 🪟 process_list / process_info / process_kill
 │   ├── registry_ops.py      # 🪟 registry_read / service_status
-│   ├── file_ops.py          # ファイル I/O + 法医学
+│   ├── file_ops.py          # ファイル I/O + ディスク調査
 │   ├── search_ops.py        # glob, find_files
 │   ├── archive_ops.py       # zip 操作
 │   ├── coding_ops.py        # grep, multi_edit, git_*, diff_files, python_check
@@ -824,7 +824,7 @@ what's **live in your environment**.
 | **PowerShell** | `pwsh_exec`, `pwsh_exec_file`, `shell_which` | 🪟 | Dedicated PowerShell with `-NoProfile -NonInteractive -ExecutionPolicy Bypass` defaults. |
 | **Processes / services / registry** | `process_list`, `process_info`, `process_kill`, `service_status`, `registry_read` | 🪟📦`psutil` | Task Manager + Services + Registry, read-side (kill needs unlock). |
 | **File I/O** | `read_file`, `write_file`, `append_file`, `list_directory`, `glob`, `find_files`, `copy_path`, `move_path`, `trash_path`, `create_directory`, `delete_path` | 🟢 | Read, write, move, delete inside the allowed base. |
-| **File forensics** | `hash_file`, `find_duplicates`, `dir_size`, `file_metadata` | 🟢 | "Where did 80 GB go?" in one prompt. |
+| **File & disk inspection** | `hash_file`, `find_duplicates`, `dir_size`, `file_metadata` | 🟢 | Hashes, duplicate detection, disk usage, metadata. "Where did 80 GB go?" in one prompt. (File *search* is `glob`/`find_files`; text search is `grep`.) |
 | **Editing / search** | `grep`, `replace_in_file`, `multi_edit`, `diff_files`, `python_check` | 🟢 | Atomic multi-edit. |
 | **Git** | `git_status`, `git_diff`, `git_log`, `git_branch`, `git_blame`, `git_add`, `git_commit`, `git_checkout` | 📦`git` | Reads and writes. |
 | **Tabular / JSON** | `read_excel`, `write_excel`, `summarize_table`, `read_json`, `write_json` | 🟢 | First-class spreadsheet handling. |
@@ -953,8 +953,9 @@ app on your own machine** — no Premium, no Direct Line. Both ride the same
 
 ### 0. Prereqs
 
-- **Windows 10/11** (PowerShell 5+). Cross-platform mostly, but 🪟-tagged
-  tools (PowerShell, processes, registry, scheduler, notifications,
+- **Windows 10/11** (PowerShell 5+). It *probably* works on macOS / Linux too,
+  but **I don't own a Mac so I genuinely haven't tested it** (being honest). The
+  🪟-tagged tools (PowerShell, processes, registry, scheduler, notifications,
   Outlook, screenshot) are Windows-only.
 - **Python 3.10+** (3.11 recommended).
 - **Git**.
