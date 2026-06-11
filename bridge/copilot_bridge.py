@@ -42,12 +42,93 @@ LOADING = '[data-testid="loading-message"]'   # holds the GROWING partial answer
 LASTMSG = '[data-testid="lastChatMessage"]'    # populates when the turn is DONE
 
 HELP_TEXT = (
-    "## 使えるスラッシュコマンド\n"
+    "## 使えるスラッシュコマンド\n\n"
+    "### 委譲コマンド（別エージェントへ委譲・数分）\n"
     "- `/research <調べたいこと>` — M365 リサーチ ツールを **Claude (Anthropic)** に切替えて deep research（確認→承認→本実行、数分）。`/deepresearch` `/dr` も同じ。\n"
-    "- `/analyze <ファイルの絶対パス> | <分析指示>` — アナリストにデータファイルを渡して分析（数値は鵜呑みにせず自分でも確かめて）。\n"
-    "- `/help` — このヘルプ。\n\n"
+    "- `/analyze <ファイルの絶対パス> | <分析指示>` — アナリストにデータファイルを渡して分析（数値は鵜呑みにせず自分でも確かめて）。`/an` も同じ。\n\n"
+    "### プロンプトテンプレート（このエージェントが即応答・通常ストリーム）\n"
+    "- `/summarize <文章/トピック>` — 要点を箇条書きで簡潔に要約。\n"
+    "- `/translate <言語> <文章>` — 指定言語へ翻訳。\n"
+    "- `/plan <ゴール>` — 具体的な手順プランを作成。\n"
+    "- `/critique <文章>` — 批判的レビュー（長所/短所/リスク）。\n"
+    "- `/proofread <文章>` — 校正し、修正版＋変更点リストを返す。\n"
+    "- `/rewrite <スタイル> <文章>` — 指定スタイルで書き直し。\n"
+    "- `/brainstorm <トピック>` — 10 個のアイデアを発想。\n"
+    "- `/steps <タスク>` — 番号付きの実行可能ステップに分解。\n"
+    "- `/eli5 <トピック>` — できるだけ易しく説明。\n"
+    "- `/proscons <トピック>` — 賛否（メリット/デメリット）を表で。\n"
+    "- `/table <説明>` — 説明に沿った Markdown 表を作成。\n\n"
+    "### その他\n"
+    "- `/history` — （HTTP `GET /history?url=...` 経由）会話全文をロール付きで取得。\n"
+    "- `/help` — このヘルプ。`/?` `/commands` も同じ。\n\n"
     "それ以外の文は、そのまま Copilot エージェントに送られます。"
 )
+
+# Slash commands that are pure prompt-templates: they transform the user's args
+# into a fully-written instruction and send it through the NORMAL streaming path,
+# so the answer streams back like an ordinary turn (no delegation / side page).
+# value = (usage_hint, builder(arg) -> templated prompt string)
+PROMPT_TEMPLATES = {
+    "summarize": (
+        "/summarize <要約したい文章またはトピック>",
+        lambda a: "次の内容を、日本語で簡潔に箇条書き（3〜6点）で要約してください。"
+                  "重要な事実・結論を漏らさず、冗長な表現は省いてください。\n\n--- 対象 ---\n" + a,
+    ),
+    "translate": (
+        "/translate <言語> <翻訳したい文章>",
+        lambda a: (lambda parts: (
+            "次の文章を【" + parts[0] + "】に翻訳してください。"
+            "自然で読みやすい訳文だけを返し、原文の意味を正確に保ってください。\n\n--- 原文 ---\n" + parts[1]
+        ))((a.split(None, 1) + [""])[:2]),
+    ),
+    "plan": (
+        "/plan <達成したいゴール>",
+        lambda a: "次のゴールを達成するための、具体的で実行可能なステップバイステップの計画を日本語で作成してください。"
+                  "各ステップに番号を振り、必要なら所要時間・前提条件・注意点も添えてください。\n\n--- ゴール ---\n" + a,
+    ),
+    "critique": (
+        "/critique <批評したい文章/案>",
+        lambda a: "次の内容を批判的にレビューしてください。日本語で、(1) 長所 (2) 短所 (3) リスク・懸念 "
+                  "(4) 改善提案 の見出しに分けて、それぞれ箇条書きで挙げてください。\n\n--- 対象 ---\n" + a,
+    ),
+    "proofread": (
+        "/proofread <校正したい文章>",
+        lambda a: "次の文章を校正してください。まず『修正版』として誤字脱字・文法・表現を直した全文を示し、"
+                  "続いて『変更点』として何をどう直したかを箇条書きで列挙してください。日本語で回答してください。\n\n--- 原文 ---\n" + a,
+    ),
+    "rewrite": (
+        "/rewrite <スタイル> <書き直したい文章>",
+        lambda a: (lambda parts: (
+            "次の文章を【" + parts[0] + "】のスタイルで書き直してください。"
+            "内容の意味は保ったまま、トーンと表現だけを変えてください。書き直した文章だけを返してください。\n\n--- 原文 ---\n" + parts[1]
+        ))((a.split(None, 1) + [""])[:2]),
+    ),
+    "brainstorm": (
+        "/brainstorm <発想したいトピック>",
+        lambda a: "次のトピックについて、多様な切り口で 10 個のアイデアをブレインストーミングしてください。"
+                  "番号付きリストで、各アイデアは1〜2文で簡潔に説明してください。日本語で。\n\n--- トピック ---\n" + a,
+    ),
+    "steps": (
+        "/steps <分解したいタスク>",
+        lambda a: "次のタスクを、実行可能で具体的な番号付きステップに分解してください。"
+                  "各ステップは1行で、動詞から始める形で書いてください。日本語で。\n\n--- タスク ---\n" + a,
+    ),
+    "eli5": (
+        "/eli5 <やさしく説明してほしいトピック>",
+        lambda a: "次のトピックを、専門用語を避けて、とてもやさしく（小学生にもわかるように）説明してください。"
+                  "身近なたとえを使っても構いません。日本語で。\n\n--- トピック ---\n" + a,
+    ),
+    "proscons": (
+        "/proscons <賛否を知りたいトピック>",
+        lambda a: "次のトピックについて、メリット（Pros）とデメリット（Cons）を Markdown の表形式で整理してください。"
+                  "表は2列（メリット／デメリット）で、それぞれ複数行挙げてください。日本語で。\n\n--- トピック ---\n" + a,
+    ),
+    "table": (
+        "/table <表にしたい内容の説明>",
+        lambda a: "次の説明に沿って、適切な列とデータを持つ Markdown の表を作成してください。"
+                  "表のあとに、必要なら1〜2文の補足を添えてください。日本語で。\n\n--- 説明 ---\n" + a,
+    ),
+}
 
 PAGE = None      # set at startup
 DRIVER = None
@@ -147,6 +228,104 @@ def _text(sel: str) -> str:
         return ""
 
 
+# JS run inside the page to scrape every turn in DOM order with its author role.
+# Discovered from the live M365 Copilot DOM: each turn is a
+# [data-testid="m365-chat-llm-web-ui-chat-message"] block containing the user
+# bubble [data-testid="chatQuestion"] (text prefixed "You said: ") and the
+# assistant bubble .fai-CopilotMessage (text prefixed "<agent> said: <agent>").
+# Returns an ordered array of {role, text}; tolerates a turn that is missing
+# either bubble (role inferred from which selector matched).
+_SCRAPE_JS = r"""
+() => {
+  function clean(s){ return (s||'').replace(/​/g,'').replace(/‌/g,'').trim(); }
+  function stripPrefix(s){
+    // drop a leading "<author> said:" prefix, then a duplicated author line/word
+    s = clean(s);
+    var idx = s.indexOf(' said:');
+    var author = '';
+    if (idx !== -1 && idx < 80){ author = s.slice(0, idx).trim(); s = s.slice(idx + 6); }
+    var lines = s.split('\n');
+    while (lines.length && !lines[0].trim()) lines.shift();
+    // assistant innerText is "<author> said: <author>\n<body>" -> the body's
+    // first line repeats the author; drop it when it equals the captured author
+    if (lines.length && author && lines[0].trim() === author) lines.shift();
+    else if (lines.length >= 2 && lines[0].trim() && lines[0].trim() === lines[1].trim()) lines.shift();
+    return lines.join('\n').trim();
+  }
+  function stripUser(s){
+    s = clean(s);
+    var idx = s.indexOf(' said:');           // "You said: ..." / "<name> said: ..."
+    if (idx !== -1 && idx < 80) s = s.slice(idx + 6);
+    return clean(s);
+  }
+  var out = [];
+  try {
+    var turns = document.querySelectorAll('[data-testid="m365-chat-llm-web-ui-chat-message"]');
+    turns.forEach(function(turn){
+      var q = turn.querySelector('[data-testid="chatQuestion"]');
+      if (q){ var ut = stripUser(q.innerText); if (ut) out.push({role:'user', text:ut}); }
+      var a = turn.querySelector('.fai-CopilotMessage')
+           || turn.querySelector('[data-testid="copilot-message-reply-div"]')
+           || turn.querySelector('[data-testid="copilot-message-div"]');
+      if (a){ var at = stripPrefix(a.innerText); if (at) out.push({role:'assistant', text:at}); }
+    });
+    if (out.length === 0){
+      // fallback: assistant bubbles only, in DOM order
+      document.querySelectorAll('.fai-CopilotMessage').forEach(function(a){
+        var at = stripPrefix(a.innerText); if (at) out.push({role:'assistant', text:at});
+      });
+    }
+  } catch (e) { return {__error: String(e)}; }
+  return out;
+}
+"""
+
+
+TURN_SEL = '[data-testid="m365-chat-llm-web-ui-chat-message"]'
+
+
+def _wait_turns(timeout=30):
+    """After navigating to a conversation, the turn blocks AND the assistant reply
+    bubbles inside them render a few seconds AFTER the composer appears (the user
+    bubble paints first, the .fai-CopilotMessage a beat later). Poll until at least
+    one turn block exists AND it carries an assistant bubble, so the scrape never
+    races ahead and captures only the user turns. Then settle briefly. If turns
+    exist but no assistant bubble ever appears (a conversation with a pending/only
+    user turn), proceed anyway after the timeout."""
+    saw_turn = False
+    for _ in range(timeout):
+        try:
+            turns = PAGE.locator(TURN_SEL).count()
+            if turns > 0:
+                saw_turn = True
+                if PAGE.locator(".fai-CopilotMessage").count() > 0:
+                    PAGE.wait_for_timeout(900)   # let the last bubble's text settle
+                    return True
+        except Exception:
+            pass
+        PAGE.wait_for_timeout(1000)
+    return saw_turn
+
+
+def _scrape_history():
+    """Scrape all messages of the currently loaded conversation, in order.
+    Returns a list of {"role": "...", "text": "..."}. Raises on a page error."""
+    _wait_turns()
+    res = PAGE.evaluate(_SCRAPE_JS)
+    if isinstance(res, dict) and res.get("__error"):
+        raise RuntimeError("scrape failed: " + str(res.get("__error")))
+    out = []
+    for m in (res or []):
+        try:
+            role = (m.get("role") or "").strip() or "assistant"
+            text = (m.get("text") or "").strip()
+        except Exception:
+            continue
+        if text:
+            out.append({"role": role, "text": text})
+    return out
+
+
 PAGE_HTML = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Copilot (local bridge)</title>
@@ -243,6 +422,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": str(e)}); return
             self._json({"ok": ok, "url": PAGE.url})
             return
+        if parsed.path == "/history":      # scrape ALL turns of a conversation in order
+            if BUSY:
+                self._json({"ok": False, "error": "busy"}); return
+            url = (urllib.parse.parse_qs(parsed.query).get("url") or [""])[0]
+            try:
+                if url:
+                    PAGE.goto(url, wait_until="domcontentloaded")
+                    _wait_composer()
+                messages = _scrape_history()
+            except Exception as e:
+                self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}); return
+            self._json({"ok": True, "url": PAGE.url, "messages": messages})
+            return
         if parsed.path == "/delete":       # best-effort: delete the Copilot conversation
             if BUSY:
                 self._json({"ok": False, "error": "busy"}); return
@@ -272,12 +464,20 @@ class Handler(BaseHTTPRequestHandler):
     def _command(self, cmd):
         head = cmd.split(None, 1)[0].lower()
         arg = cmd[len(cmd.split(None, 1)[0]):].strip()
-        if head in ("/help", "/?", "/commands"):
+        # normalise: case-insensitive, tolerate a missing leading slash
+        token = head.lstrip("/")
+        if token in ("help", "?", "commands"):
             self._sse({"delta": HELP_TEXT}); self._sse({}, "done"); return
-        if head in ("/research", "/deepresearch", "/dr"):
+        if token in ("research", "deepresearch", "dr"):
             self._delegate("researcher", arg); return
-        if head in ("/analyze", "/an"):
+        if token in ("analyze", "an"):
             self._delegate("analyst", arg); return
+        if token in PROMPT_TEMPLATES:           # prompt-template -> normal streaming path
+            usage, build = PROMPT_TEMPLATES[token]
+            if not arg.strip():
+                self._sse({"delta": "使い方: " + usage}); self._sse({}, "done"); return
+            self._stream_text(build(arg.strip()))
+            return
         self._sse({"delta": "未知のコマンド `" + head + "`。`/help` で一覧を表示します。"})
         self._sse({}, "done")
 
@@ -325,7 +525,6 @@ class Handler(BaseHTTPRequestHandler):
             BUSY = False
 
     def _stream(self, msg: str):
-        global BUSY
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -337,6 +536,14 @@ class Handler(BaseHTTPRequestHandler):
         if msg.strip().startswith("/"):     # slash commands (/research, /analyze, /help)
             self._command(msg.strip())
             return
+        self._stream_text(msg)
+
+    def _stream_text(self, msg: str):
+        """Send `msg` to the agent and stream the answer back over the ALREADY-open
+        SSE response (the normal send/stream path). Used both for plain messages and
+        for prompt-template slash commands so templated answers stream like a normal
+        turn. Respects the BUSY guard; always emits a terminating `done` event."""
+        global BUSY
         if BUSY:
             self._sse({"delta": "[busy: 直前の応答を生成中です]"})
             self._sse({}, "done")
