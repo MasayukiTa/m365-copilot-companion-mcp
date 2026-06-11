@@ -206,6 +206,17 @@ def main():
                     mc_box[0] = max(1, int(cmd["set_maxtabs"]))
                 except Exception:
                     pass
+            # steering: {"steer": {"worker":"w0","text":"..."}} or a list of such
+            steer = cmd.get("steer")
+            if steer is not None:
+                items = steer if isinstance(steer, list) else [steer]
+                for it in items:
+                    try:
+                        w = by_name.get(it.get("worker"))
+                        if w is not None and w.status not in TERMINAL:
+                            w.steer(it.get("text", ""))
+                    except Exception:
+                        pass
         except Exception:
             pass
 
