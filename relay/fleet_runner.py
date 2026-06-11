@@ -1,0 +1,199 @@
+"""fleet_runner.py -- launch N autonomous relays in parallel and stream live status.
+
+This is the LAUNCHER for relay_fleet: give it several goals and it drives that many
+Copilot conversations at once, each pursued to DONE by its own deterministic relay
+loop, advanced from one thread in a non-blocking round-robin (relay_fleet.py).
+
+Where the official Cowork gives you one autonomous track, this gives you N -- and
+because the slow part (the agent's turn) happens server-side, N turns overlap while
+the client only does cheap polls. That's the parallelism edge over Cowork.
+
+It writes a live snapshot to <state_dir>/status.json after every round-robin sweep
+(atomic temp-then-rename, so a reader never sees a half-written file) and prints a
+compact live table to stdout. The WPF cockpit (ui/FleetCockpit.exe) tails that JSON.
+
+  # goals inline
+  python -m relay.fleet_runner --agent-url <URL> -g "ゴールA" -g "ゴールB"
+  # goals from a file (one per line, blank lines and # comments ignored)
+  python -m relay.fleet_runner --agent-url <URL> --goals-file goals.txt
+
+The agent URL embeds a tenant GUID, so it is NOT hardcoded: pass --agent-url or set
+MCP_IMPL_AGENT_URL / MCP_FLEET_AGENT_URL in .env (gitignored).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+
+# allow running both as `python -m relay.fleet_runner` and `python relay/fleet_runner.py`
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from relay.relay_fleet import (  # noqa: E402
+    TERMINAL, auto_concurrency, avail_phys_mb, run_relay_fleet,
+)
+from relay.copilot_autopilot_relay import default_notify  # noqa: E402
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# A worker's status -> (pill label, design-language colour key). The cockpit maps the
+# key to a brush; we keep the vocabulary aligned with the WPF the sibling app palette.
+STATUS_PILL = {
+    "pending":  ("待機列", "muted"),    # queued -- no tab open yet (memory discipline)
+    "ready":    ("準備",   "muted"),
+    "waiting":  ("実行中", "good"),     # A_GOOD blue -- a turn is streaming server-side
+    "done":     ("完了",   "done"),     # finished cleanly
+    "stuck":    ("停滞",   "bad"),       # B_BAD red
+    "maxturns": ("上限",   "bad"),
+    "error":    ("エラー", "bad"),
+}
+
+
+def _repo_root():
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _read_goals(args):
+    goals = list(args.goal or [])
+    if args.goals_file:
+        with open(args.goals_file, encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s and not s.startswith("#"):
+                    goals.append(s)
+    return goals
+
+
+def _snapshot(workers, started, total, max_concurrent=0):
+    done = sum(1 for w in workers if w.status in TERMINAL)
+    open_tabs = sum(1 for w in workers if getattr(w, "page", None) is not None)
+    return {
+        "started": started,
+        "updated": time.time(),
+        "total": total,
+        "done_count": done,
+        "running": done < total,
+        "max_concurrent": max_concurrent,
+        "open_tabs": open_tabs,
+        "avail_mb": round(avail_phys_mb()),
+        "workers": [{
+            "name": w.name,
+            "goal": w.goal,
+            "status": w.status,
+            "pill": STATUS_PILL.get(w.status, (w.status, "muted"))[0],
+            "color": STATUS_PILL.get(w.status, (w.status, "muted"))[1],
+            "outcome": w.outcome,
+            "turn": w.turn,
+            "max_turns": w.max_turns,
+            "reason": w.reason,
+            "closed": getattr(w, "closed", False),
+            "last": (w.last_response or "")[:600],
+        } for w in workers],
+    }
+
+
+def _write_atomic(path, payload):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    os.replace(tmp, path)   # atomic on Windows + POSIX
+
+
+def _print_table(workers, total):
+    done = sum(1 for w in workers if w.status in TERMINAL)
+    line = "  ".join(
+        "%s[%s t%d/%d]" % (w.name, STATUS_PILL.get(w.status, (w.status,))[0],
+                           w.turn, w.max_turns)
+        for w in workers)
+    sys.stdout.write("\r\033[K[fleet %d/%d] %s" % (done, total, line))
+    sys.stdout.flush()
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Launch N autonomous Copilot relays in parallel with live status.")
+    ap.add_argument("--cdp-url", default=os.environ.get("MCP_CDP_URL", "http://localhost:9222"))
+    ap.add_argument("--agent-url", default=(os.environ.get("MCP_FLEET_AGENT_URL")
+                                            or os.environ.get("MCP_IMPL_AGENT_URL", "")))
+    ap.add_argument("-g", "--goal", action="append", help="a goal (repeatable)")
+    ap.add_argument("--goals-file", help="file with one goal per line (# comments ok)")
+    ap.add_argument("--max-turns", type=int, default=12)
+    ap.add_argument("--max-concurrent", type=int, default=0,
+                    help="max tabs open at once (0 = auto from free RAM)")
+    ap.add_argument("--poll-s", type=float, default=1.0)
+    ap.add_argument("--state-dir", default=os.path.join(_repo_root(), ".fleet"),
+                    help="where to write the live status.json the cockpit reads")
+    args = ap.parse_args()
+
+    goals = _read_goals(args)
+    if not goals:
+        ap.error("no goals -- pass -g/--goal (repeatable) or --goals-file")
+    if not args.agent_url:
+        ap.error("no agent URL -- pass --agent-url or set MCP_FLEET_AGENT_URL in .env")
+
+    os.makedirs(args.state_dir, exist_ok=True)
+    status_path = os.path.join(args.state_dir, "status.json")
+    started = time.time()
+
+    max_conc = args.max_concurrent if args.max_concurrent > 0 else auto_concurrency(len(goals))
+
+    # write an initial 'launching' snapshot so the cockpit shows something at once
+    _write_atomic(status_path, {"started": started, "updated": started,
+                                "total": len(goals), "done_count": 0, "running": True,
+                                "max_concurrent": max_conc, "open_tabs": 0,
+                                "avail_mb": round(avail_phys_mb()),
+                                "workers": [{"name": "w%d" % i, "goal": g,
+                                             "status": "pending", "pill": "待機列",
+                                             "color": "muted", "outcome": None,
+                                             "turn": 0, "max_turns": args.max_turns,
+                                             "reason": "", "closed": False, "last": ""}
+                                            for i, g in enumerate(goals)]})
+
+    print("fleet: %d goal(s) -> %s" % (len(goals), args.agent_url))
+    print("       live status: %s" % status_path)
+    print("       free RAM: %d MB  ->  max %d tab(s) open at once (close-on-done frees each)"
+          % (round(avail_phys_mb()), max_conc))
+
+    def on_tick(workers):
+        try:
+            _write_atomic(status_path, _snapshot(workers, started, len(goals), max_conc))
+        except Exception:
+            pass
+        _print_table(workers, len(goals))
+
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(args.cdp_url)
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        results = run_relay_fleet(context, goals, args.agent_url,
+                                  max_turns=args.max_turns, poll_s=args.poll_s,
+                                  notify=default_notify, on_tick=on_tick,
+                                  max_concurrent=max_conc)
+
+    # final snapshot + summary
+    elapsed = round(time.time() - started, 1)
+    final = {"started": started, "updated": time.time(), "total": len(goals),
+             "done_count": len(goals), "running": False, "elapsed_s": elapsed,
+             "workers": [{"name": r["name"], "goal": r["goal"], "status": "done",
+                          "pill": (r["outcome"] or "?"), "color":
+                          "done" if r["outcome"] == "DONE" else "bad",
+                          "outcome": r["outcome"], "turn": r["turns"],
+                          "max_turns": args.max_turns, "reason": r["reason"],
+                          "last": ""} for r in results]}
+    _write_atomic(status_path, final)
+    print("\n\n=== fleet complete in %ss ===" % elapsed)
+    for r in results:
+        print("  %-4s %-8s turns=%d  %s" % (r["name"], r["outcome"], r["turns"],
+                                            (r["goal"][:60] + "...") if len(r["goal"]) > 60 else r["goal"]))
+        if r["reason"]:
+            print("       reason: %s" % r["reason"])
+
+
+if __name__ == "__main__":
+    main()
