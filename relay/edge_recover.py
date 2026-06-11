@@ -75,18 +75,27 @@ def surface(port=9222):
     import subprocess
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ps1 = os.path.join(repo, "start_companion_edge.ps1")
+    fleet = os.path.join(repo, ".fleet")
     # tell the background keeper to stop re-hiding the window while the user signs in
     try:
-        fleet = os.path.join(repo, ".fleet")
         os.makedirs(fleet, exist_ok=True)
         open(os.path.join(fleet, "edge_keep_pause"), "w").write(str(time.time()))
     except Exception:
         pass
+    mode = ""
+    try:
+        mf = os.path.join(fleet, "edge_mode")
+        if os.path.isfile(mf):
+            mode = open(mf).read().strip()
+    except Exception:
+        pass
+    # headless has no window to bring forward -> relaunch HEADED so the user can sign in
+    flag = "-Foreground" if mode == "headless" else "-Surface"
     try:
         subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
-             "-Surface", "-Port", str(port)],
-            cwd=repo, timeout=15,
+             flag, "-Port", str(port)],
+            cwd=repo, timeout=60 if flag == "-Foreground" else 15,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except Exception:

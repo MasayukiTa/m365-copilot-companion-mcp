@@ -33,12 +33,28 @@ param(
     [switch]$Background,
     # Just bring the (already-running) companion Edge to the foreground -- used when
     # sign-in is required. Does not launch anything.
-    [switch]$Surface
+    [switch]$Surface,
+    # TRUE BACKGROUND (recommended): run Edge with --headless=new -- there is NO window
+    # at all (nothing in the taskbar, no flash, zero foreground interference), yet CDP,
+    # SSO auto-sign-in, and sends all work (verified). The only caveat: if interactive
+    # sign-in is ever required (SSO usually persists so this is rare), relaunch once with
+    # -Foreground to sign in, then go back to -Headless. The mode is remembered so
+    # -HardReset / auto-recovery relaunch in the same mode.
+    [switch]$Headless
 )
 
 $ErrorActionPreference = "Stop"
 
 $dataDir = Join-Path $env:LOCALAPPDATA "copilot-companion-edge"
+
+# Remember the chosen window mode so recovery (-HardReset) relaunches the same way.
+$modeFile = Join-Path $PSScriptRoot ".fleet\edge_mode"
+if ($Headless) { try { New-Item -ItemType Directory -Force (Split-Path $modeFile) | Out-Null; Set-Content -Path $modeFile -Value "headless" -Encoding ascii } catch {} }
+if ($Foreground) { try { New-Item -ItemType Directory -Force (Split-Path $modeFile) | Out-Null; Set-Content -Path $modeFile -Value "headed" -Encoding ascii } catch {} }
+$useHeadless = $Headless
+if (-not $Headless -and -not $Foreground -and (Test-Path $modeFile)) {
+    if ((Get-Content $modeFile -Raw -ErrorAction SilentlyContinue).Trim() -eq "headless") { $useHeadless = $true }
+}
 
 # --- Win32 window helpers (hide to background / surface for auth) --------------
 # Find() enumerates ALL top-level windows (including HIDDEN ones) belonging to the
@@ -134,7 +150,12 @@ if (-not $edge) {
 }
 if (-not $edge) { throw "msedge.exe not found. Install Microsoft Edge or pass its path." }
 
-$arguments = @(
+$arguments = @()
+if ($useHeadless) {
+    # true background: no window at all. (verified: CDP + SSO + sends all work headless)
+    $arguments += "--headless=new"
+}
+$arguments += @(
     "--user-data-dir=$dataDir",
     "--remote-debugging-port=$Port",
     "--no-first-run",
@@ -186,7 +207,11 @@ if ($Background) {
 if ($ready) {
     Write-Host ""
     Write-Host "Ready: CDP endpoint is up on http://127.0.0.1:$Port"
-    if ($Background) {
+    if ($useHeadless) {
+        Write-Host "Running TRUE BACKGROUND (headless: no window, no taskbar, zero foreground"
+        Write-Host "interference). CDP + SSO + sends all work. If sign-in is ever needed,"
+        Write-Host "relaunch once with -Foreground to sign in, then -Headless again."
+    } elseif ($Background) {
         # True background via a SEPARATE virtual desktop. This is the robust approach:
         # CDP is desktop-independent, so the tab keeps running and the send path works
         # while the window simply is not on the user's current desktop. This avoids the
