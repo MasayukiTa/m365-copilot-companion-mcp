@@ -118,6 +118,13 @@ relay が Copilot を駆動する際、エージェントの MCP ツール呼び
 
 合計テストは **58/58**（acceptance 18・fleet-verify 12・folder-verify 8・relay-loop 9・trace 11）。
 
+### (3) 意味的チェック: import_smoke（構文を超える）
+`acceptance.py` に `import_smoke` 種別を追加。py_compile（構文のみ）を超えて**実際に import**し、
+読込時エラー（モジュールスコープの未定義名・壊れた import・初期化失敗）を捕捉する。folder_coder に
+`--import-smoke`（opt-in）。**注: import は副作用があり、特殊コンテキストを要するモジュールでは
+false-FAIL し得るため `--verify` には束ねず明示 opt-in**。真の意味的正しさは `--check-cmd "pytest…"`。
+テスト追加で acceptance は **20/20**（全体 **60/60**）。
+
 ### 残課題（追補）
 - attach 中に Edge が hard-reset されると worker が**終端 ERROR**になりゴールが失われる（上記1回目）。
   回復可能扱い（pending 戻し or FleetContextLost 化）にする堅牢化は別途。
