@@ -47,7 +47,7 @@
 
 ---
 
-## 🏆 こいつ、なにができるのか（ちょっと自慢させて）
+## 🏆 こいつ、なにができるのか
 
 「ファイル読むくらいしかしてくれない Copilot」を、**追加課金ゼロ・ライセンス内・ノート PC 1 台**でここまで盛りました。順に自慢します。
 
@@ -658,6 +658,98 @@ Copilot licence you already have.
 
 ---
 
+## 🏆 What this thing actually pulls off
+
+The "Copilot that only reads files" gets dragged this far on **zero extra
+spend, inside the licence you already have, on one laptop.** Bragging, in
+order:
+
+- **🧰 137 hands and feet** — files / Python / shell / Excel / Word /
+  PowerPoint / PDF / OCR / SQLite / corporate DB (ODBC) / Outlook /
+  screenshots / scheduler… If Copilot has no hands, grow it some. **And you
+  can write your own new tools and make them permanent** (the tool foundry).
+  117 is the floor.
+- **🤖 A relay that runs unattended** — hand it one goal and it drives your
+  Copilot agent to completion in the background (over CDP) **without
+  stealing your keyboard**. Desktop notification whether it finishes or
+  stalls. It's Microsoft's paid autonomous-agent idea, rebuilt for free by
+  politely hijacking a browser tab.
+- **🔬 Research is delegated to Claude** — flip M365's "Research" tool over to
+  **Anthropic / Claude** to run deep research, then merge the result back into
+  the build loop (just write `RESEARCH:`). **Analysis is delegated to the
+  Analyst**, and the numbers get re-checked on the ground with our own tools
+  (don't trust — verify).
+- **🚀 A small fleet in parallel** — several conversations driven round-robin
+  on one thread (fleet) **plus an adaptive throttle that detects the early
+  signs of being rate-limited and slows itself down**. Maximum throughput
+  short of getting cut off.
+- **🧾 Explainable and stoppable** — every turn lands in an audit log
+  (operator D), a human is asked at the checkpoints that matter (HITL gate),
+  and a kill-switch stops it dead. Nobody gets to say "no evidence it ran."
+- **💬 A Claude-Code-style chat UI with zero Node, zero Premium, zero Direct
+  Line** — a connection you were told needs Premium, intercepted by
+  **differentially scraping the browser's response**. A Python-only streaming
+  bridge **plus a native WPF app built with nothing but the .NET that ships
+  with Windows** (markdown / code-block rendering, dark/light, JP/EN, history,
+  copy/stop). All another PC needs is **Python and Edge**. See the
+  [screenshot](#-native-chat-ui-python--edge-only-no-node) below.
+- **🛠 One-click-ish to install too** — `setup.bat` **secures a Python without
+  admin rights**, and if it jams partway it tells you "do just this bit by
+  hand and re-run," so the bootstrap is **resumable** rather than all-or-nothing.
+
+> In fairness: the "drive Copilot from outside" and "free custom UI" parts are
+> **not an officially sanctioned path — they just politely hijack a browser**.
+> If Microsoft changes the DOM, fixing it is on you. There's a fair-use
+> ceiling too. **Whatever you blow up over there is not our problem** (it's
+> important enough that it's written below as well).
+
+> On the competition: Microsoft officially has both MCP integration and
+> "computer use" (UI automation, Claude Sonnet 4.5 support). On capability,
+> robustness, and scale theirs is naturally ahead and outclasses this repo
+> handily. But this repo's whole pitch is **"the combination — plain licence
+> only, all local, fully unattended, with a free homegrown UI on top."** As
+> far as I looked, no OSS in this exact shape exists (plenty of GitHub Copilot
+> reverse-engineering, but not M365 Copilot done this way).
+
+### 🆚 Frontier's "Cowork" — which is honestly better?
+
+No jokes in this section. **Bottom line up front: on the single axis of
+autonomous execution, the official [Cowork](https://learn.microsoft.com/en-us/microsoft-365/copilot/cowork/)
+is the real, sturdy thing.** Cowork is Microsoft's official Frontier feature:
+Copilot itself carries out long, multi-step tasks (sending mail, setting up
+meetings, drafting documents, posting to Teams, managing schedules), grasps
+the whole context of your work through **Work IQ**, and ships with built-in
+Claude-made skills. Official, supported, with admin governance, on mobile and
+desktop. **This "hijack-a-browser-and-loop-it-unattended" relay is, at the
+end of the day, an unofficial hack. No bravado here.**
+
+That said, the few axes where this companion **genuinely beats** Cowork are
+specifically these (no exaggeration, just facts):
+
+| Axis | Cowork (Frontier) | This companion |
+|---|---|---|
+| **Availability** | **Requires Frontier preview enrollment** (org must turn it on, subject to seats) | **Just a plain M365 Copilot licence.** Works even when Frontier is absent or blocked |
+| **Reach** | Inside the M365 cloud (mail / calendar / Teams / SharePoint / docs) | **Your local PC**: files, local Python execution, corporate DB (ODBC), shell, Office generation on disk, screenshots. Cowork fundamentally can't touch your local machine |
+| **Transparency / extensibility** | Skills are built in (fixed, contents not visible) | Every tool is **readable and self-extensible** (tool foundry). Every turn lands in an **audit log** and a **kill-switch** stops it. The code is all in your hands |
+| **Custom UI** | The M365 screen | A **custom chat UI** that needs neither Node nor Premium, hackable however you like |
+
+> In short: for **advanced assistant work that lives entirely in the cloud**,
+> Cowork wins. For **running your own machine, your own data, your own code /
+> getting by on just a licence where Frontier isn't available / needing to see,
+> rewrite, and stop everything yourself**, the companion has the edge. **The
+> smartest move isn't either-or — it's using both**: when Cowork shows up, hand
+> it the cloud work and just add the local hands here. That's the realistic
+> answer.
+
+> (Author's note: this companion does not claim to be a "replacement for the
+> official thing." It's **a personal tool for filling the local gaps the
+> official products can't reach — with restraint, at your own
+> responsibility.** Destructive operations always get a confirmation, deletes
+> are designed not to misfire, and what it can't do is written down as "can't."
+> That's the intent.)
+
+---
+
 ## ⚠️ Before you go any further
 
 This is a thing you run **on a machine you control**, against accounts
@@ -833,6 +925,27 @@ the Edge you are already signed into):
 
 > Selectors were captured from the live M365 Copilot DOM and isolated in
 > `COPILOT_SELECTORS` -- if Microsoft changes the DOM, patch just that block.
+
+---
+
+## 💬 Native chat UI (Python + Edge only, no Node)
+
+Two front-ends ship with this so you can use the Copilot agent **like a local
+app on your own machine** — no Premium, no Direct Line. Both ride the same
+"bridge → CDP → Copilot" path underneath, and all another PC needs is
+**Python + Edge** (no Chrome, no Node).
+
+- **Python bridge** (`bridge/copilot_bridge.py`): serves a fully self-contained
+  HTML chat using nothing but the stdlib `http.server`, and **streams Copilot's
+  response token-by-token via differential scraping**. `python
+  bridge\copilot_bridge.py` → open `http://127.0.0.1:8765` in your browser.
+- **Native WPF app** (`ui/CopilotChat.cs`): a **completely JS-free** desktop chat
+  built with nothing but the `csc.exe` that ships with Windows. Markdown /
+  code-block rendering, dark/light, JP/EN toggle, a conversation-history sidebar
+  (rename, delete), copy/stop buttons. Build and launch it with
+  `ui\build_and_run.bat`.
+
+![native WPF chat UI](docs/chat-ui.png)
 
 ---
 
