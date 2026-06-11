@@ -38,6 +38,14 @@ TERMINAL = ("done", "stuck", "maxturns", "error", "cancelled")
 PENDING = "pending"
 
 
+class FleetContextLost(Exception):
+    """Raised when the underlying Edge/CDP context died mid-run (wedged or hard-reset).
+    Carries the goals that had not finished, so the runner can reconnect and resume."""
+    def __init__(self, unfinished):
+        super().__init__("fleet CDP context lost")
+        self.unfinished = unfinished
+
+
 class _MEMORYSTATUSEX(ctypes.Structure):
     _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
                 ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
@@ -271,7 +279,19 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         return sum(1 for w in workers
                    if w.page is not None and w.status not in TERMINAL)
 
+    def _unfinished():
+        return [w.goal for w in workers if w.outcome not in ("DONE", "CANCELLED")]
+
     while any(w.status not in TERMINAL for w in workers) or (add_box and len(add_box) > 0):
+        # auto-recovery: if the Edge/CDP context has died (wedged, or hard-reset by the
+        # watchdog) a LIVE probe raises -> bail out with the unfinished goals so the
+        # runner can reconnect to a fresh Edge and resume them. NB: context.pages is a
+        # cached property and never raises -- cookies() actually round-trips to CDP.
+        try:
+            context.cookies()
+        except Exception:
+            raise FleetContextLost(_unfinished())
+
         # goals added mid-run (e.g. from the native chat while at capacity) join the
         # queue here -- priority items jump to the front, but still wait for a free slot
         # so the tab budget is never exceeded.

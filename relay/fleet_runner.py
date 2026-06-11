@@ -148,6 +148,13 @@ def main():
                     help="max tabs open at once. -1 = use the cockpit's setting "
                          "(maxtabs, default 3); 0 = auto from free RAM; N = exactly N")
     ap.add_argument("--poll-s", type=float, default=1.0)
+    ap.add_argument("--stall-s", type=int, default=150,
+                    help="if status.json stops updating this long while running, the "
+                         "watchdog hard-resets the wedged Edge (0 = disable watchdog)")
+    ap.add_argument("--max-recover", type=int, default=3,
+                    help="max auto-recovery reconnect attempts after a wedged Edge")
+    ap.add_argument("--no-auto-recover", action="store_true",
+                    help="disable auto-recovery (single connection, no reconnect)")
     ap.add_argument("--state-dir", default=os.path.join(_repo_root(), ".fleet"),
                     help="where to write the live status.json the cockpit reads")
     args = ap.parse_args()
@@ -243,13 +250,82 @@ def main():
         _print_table(workers, len(goals))
 
     from playwright.sync_api import sync_playwright
-    with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(args.cdp_url)
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
-        results = run_relay_fleet(context, goals, args.agent_url,
-                                  max_turns=args.max_turns, poll_s=args.poll_s,
-                                  notify=default_notify, on_tick=on_tick,
-                                  max_concurrent=max_conc, mc_box=mc_box, add_box=add_box)
+    from relay.relay_fleet import FleetContextLost
+    from relay.edge_recover import cdp_alive, hard_reset
+
+    try:
+        port = int(args.cdp_url.rsplit(":", 1)[-1].split("/")[0])
+    except Exception:
+        port = 9222
+
+    # Watchdog (separate thread, NO Playwright): if status.json stops advancing while a
+    # run is live, the dedicated Edge is wedged -> hard-reset it. Killing it unblocks the
+    # main thread's synchronous attach(), whose context then probes dead -> the run loop
+    # raises FleetContextLost and we reconnect + resume below.
+    import threading
+    stop_wd = threading.Event()
+
+    def _watchdog():
+        last_seen, last_change = None, time.time()
+        while not stop_wd.is_set():
+            stop_wd.wait(5)
+            if stop_wd.is_set() or args.stall_s <= 0:
+                continue
+            try:
+                d = json.load(open(status_path, encoding="utf-8"))
+                if not d.get("running") or d.get("idle"):
+                    last_change = time.time(); continue
+                u = d.get("updated")
+                if u != last_seen:
+                    last_seen, last_change = u, time.time()
+                elif time.time() - last_change > args.stall_s:
+                    print("\n[watchdog] fleet stalled %ds -> hard-resetting the Edge" % args.stall_s)
+                    hard_reset(port)
+                    last_change = time.time()
+            except Exception:
+                pass
+
+    if args.stall_s > 0 and not args.no_auto_recover:
+        threading.Thread(target=_watchdog, daemon=True).start()
+
+    results_by_goal = {}
+    pending = list(goals)
+    attempt = 0
+    while pending:
+        if not cdp_alive(args.cdp_url):
+            print("[recover] Edge unreachable -> hard reset before (re)connecting")
+            hard_reset(port)
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.connect_over_cdp(args.cdp_url, timeout=20000)
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                res = run_relay_fleet(context, pending, args.agent_url,
+                                      max_turns=args.max_turns, poll_s=args.poll_s,
+                                      notify=default_notify, on_tick=on_tick,
+                                      max_concurrent=max_conc, mc_box=mc_box, add_box=add_box)
+            for r in res:
+                results_by_goal[r["goal"]] = r
+            pending = []                                   # finished cleanly
+        except FleetContextLost as e:
+            attempt += 1
+            pending = e.unfinished
+            print("\n[recover] Edge context lost; resuming %d goal(s) (attempt %d/%d)"
+                  % (len(pending), attempt, args.max_recover))
+            if args.no_auto_recover or attempt > args.max_recover:
+                print("[recover] giving up (auto-recover off or attempts exhausted)")
+                break
+            if not cdp_alive(args.cdp_url):
+                hard_reset(port)
+        except Exception as e:
+            attempt += 1
+            print("\n[recover] %s while connecting; hard reset + retry (attempt %d/%d)"
+                  % (type(e).__name__, attempt, args.max_recover))
+            if args.no_auto_recover or attempt > args.max_recover:
+                break
+            hard_reset(port)
+
+    stop_wd.set()
+    results = [results_by_goal[g] for g in goals if g in results_by_goal]
 
     # final snapshot + summary
     elapsed = round(time.time() - started, 1)
