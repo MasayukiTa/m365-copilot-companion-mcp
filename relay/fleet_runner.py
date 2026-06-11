@@ -353,16 +353,24 @@ def main():
     stop_wd.set()
     results = [results_by_goal[g] for g in goals if g in results_by_goal]
 
-    # final snapshot + summary
+    # final snapshot + summary -- reflect the REAL outcome of each goal, not a blanket
+    # "done" (which made failed/stuck goals show as green 完了).
+    def _ostatus(o):
+        if o == "DONE": return "done"
+        if o == "CANCELLED": return "cancelled"
+        if o == "MAXTURNS": return "maxturns"
+        if o == "STUCK": return "stuck"
+        return "error"
+
     elapsed = round(time.time() - started, 1)
+    done_count = sum(1 for r in results if r["outcome"] == "DONE")
     final = {"started": started, "updated": time.time(), "total": len(goals),
-             "done_count": len(goals), "running": False, "elapsed_s": elapsed,
-             "workers": [{"name": r["name"], "goal": r["goal"], "status": "done",
-                          "pill": (r["outcome"] or "?"), "color":
-                          "done" if r["outcome"] == "DONE" else "bad",
+             "done_count": done_count, "running": False, "elapsed_s": elapsed,
+             "workers": [{"name": r["name"], "goal": r["goal"],
+                          "status": _ostatus(r["outcome"]),
                           "outcome": r["outcome"], "turn": r["turns"],
                           "max_turns": args.max_turns, "reason": r["reason"],
-                          "last": ""} for r in results]}
+                          "conv_url": "", "closed": True, "last": ""} for r in results]}
     _write_atomic(status_path, final)
     print("\n\n=== fleet complete in %ss ===" % elapsed)
     for r in results:
