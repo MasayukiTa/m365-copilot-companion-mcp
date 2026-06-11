@@ -241,8 +241,34 @@ def main():
         except Exception:
             pass
 
+    convs_path = os.path.join(args.state_dir, "conversations.json")
+
+    def _register_convs(workers):
+        # session-shared conversation registry: every fleet conversation is added so the
+        # native chat can list/read/delete it too (and vice versa). Dedup by url.
+        try:
+            existing = []
+            if os.path.isfile(convs_path):
+                try:
+                    existing = json.load(open(convs_path, encoding="utf-8"))
+                except Exception:
+                    existing = []
+            urls = set(e.get("url") for e in existing if isinstance(e, dict))
+            changed = False
+            for w in workers:
+                u = getattr(w, "conv_url", "")
+                if u and u not in urls:
+                    existing.append({"url": u, "title": (w.goal or "")[:60],
+                                     "source": "fleet", "ts": time.time()})
+                    urls.add(u); changed = True
+            if changed:
+                _write_atomic(convs_path, existing)
+        except Exception:
+            pass
+
     def on_tick(workers):
         _drain_commands(workers)
+        _register_convs(workers)
         try:
             _write_atomic(status_path, _snapshot(workers, started, len(goals), mc_box[0]))
         except Exception:
