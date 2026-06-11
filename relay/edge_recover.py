@@ -68,6 +68,30 @@ def hard_reset(port=9222, wait=True):
         return False
 
 
+def surface(port=9222):
+    """Bring the (minimized, background) companion Edge to the foreground -- used when
+    sign-in is required so the user can complete it. Shells out to the launcher's
+    -Surface mode (Win32 restore + foreground); no Playwright, thread-safe."""
+    import subprocess
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ps1 = os.path.join(repo, "start_companion_edge.ps1")
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
+             "-Surface", "-Port", str(port)],
+            cwd=repo, timeout=15,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+
+def looks_like_login(url):
+    u = (url or "").lower()
+    return ("login.microsoftonline" in u or "login.live.com" in u
+            or "/signin" in u or "oauth2/authorize" in u)
+
+
 def close_all_tabs(cdp_url="http://localhost:9222", connect_timeout_ms=8000,
                    open_url=None):
     """Close every tab of the Edge at `cdp_url`, one by one, leaving exactly one fresh

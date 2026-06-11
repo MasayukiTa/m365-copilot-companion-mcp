@@ -24,12 +24,48 @@ param(
     # launching, so wedged tabs are NOT restored. Use this when the dedicated Edge has
     # stopped responding (CDP dead) and the fleet's attach() stalls. For a still-
     # responsive Edge, prefer closing tabs one by one: python -m relay.edge_recover
-    [switch]$HardReset
+    [switch]$HardReset,
+    # Keep the window visible instead of minimizing it to the background.
+    [switch]$Foreground,
+    # Just bring the (already-running) companion Edge to the foreground -- used when
+    # sign-in is required. Does not launch anything.
+    [switch]$Surface
 )
 
 $ErrorActionPreference = "Stop"
 
 $dataDir = Join-Path $env:LOCALAPPDATA "copilot-companion-edge"
+
+# --- Win32 window helpers (minimize to background / surface for auth) ----------
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Cw {
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+}
+"@
+function Get-CompanionWindow {
+    $procs = Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
+             Where-Object { $_.CommandLine -match 'copilot-companion-edge' }
+    foreach ($pp in $procs) {
+        $pr = Get-Process -Id $pp.ProcessId -ErrorAction SilentlyContinue
+        if ($pr -and $pr.MainWindowHandle -ne [IntPtr]::Zero) { return $pr.MainWindowHandle }
+    }
+    return [IntPtr]::Zero
+}
+
+if ($Surface) {
+    $h = Get-CompanionWindow
+    if ($h -ne [IntPtr]::Zero) {
+        [Cw]::ShowWindow($h, 9) | Out-Null    # SW_RESTORE
+        [Cw]::SetForegroundWindow($h) | Out-Null
+        Write-Host "Companion Edge brought to the foreground."
+    } else {
+        Write-Host "No companion Edge window found (is it running?)."
+    }
+    exit 0
+}
 
 if ($HardReset) {
     Write-Host "HardReset: killing companion Edge and clearing session-restore state ..."
@@ -82,6 +118,11 @@ $arguments = @(
     # clean (recovery normally closes tabs one by one via relay\edge_recover.py)
     "--hide-crash-restore-bubble",
     "--disable-session-crashed-bubble",
+    # keep the tab fully active even while the window is minimized in the background,
+    # so the agent's streaming/turn-detection is not throttled
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
     $Url
 )
 
@@ -100,7 +141,19 @@ while ((Get-Date) -lt $deadline) {
     if ($up) {
         Write-Host ""
         Write-Host "Ready: CDP endpoint is up on http://127.0.0.1:$Port"
-        Write-Host "If this profile is new, sign in to M365 once in the window that opened."
+        if (-not $Foreground) {
+            # minimize to the background -- CDP keeps driving it; the user never has to
+            # look at it. It is surfaced automatically only when sign-in is required.
+            $h = [IntPtr]::Zero
+            for ($i = 0; $i -lt 10 -and $h -eq [IntPtr]::Zero; $i++) {
+                Start-Sleep -Milliseconds 400
+                $h = Get-CompanionWindow
+            }
+            if ($h -ne [IntPtr]::Zero) { [Cw]::ShowWindow($h, 6) | Out-Null }   # SW_MINIMIZE
+            Write-Host "Running in the background (minimized). Sign-in only: .\start_companion_edge.ps1 -Surface"
+        } else {
+            Write-Host "If this profile is new, sign in to M365 once in the window that opened."
+        }
         exit 0
     }
 }
