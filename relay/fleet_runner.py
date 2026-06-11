@@ -390,6 +390,8 @@ def main():
                           "status": _ostatus(r["outcome"]),
                           "outcome": r["outcome"], "turn": r["turns"],
                           "max_turns": args.max_turns, "reason": r["reason"],
+                          "verified": r.get("verified"),
+                          "verify_attempts": r.get("verify_attempts", 0),
                           "conv_url": "", "closed": True, "last": ""} for r in results]}
     _write_atomic(status_path, final)
     print("\n\n=== fleet complete in %ss ===" % elapsed)

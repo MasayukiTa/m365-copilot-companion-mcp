@@ -440,4 +440,6 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     notify("🛰 並列自律フリート 完了",
            "%d ゴール: %s" % (len(workers), ", ".join(w.outcome or "?" for w in workers)))
     return [{"name": w.name, "goal": w.goal, "outcome": w.outcome,
-             "turns": w.turn, "reason": w.reason} for w in workers]
+             "turns": w.turn, "reason": w.reason,
+             "verified": w.verified, "verify_attempts": w.verify_attempts}
+            for w in workers]
