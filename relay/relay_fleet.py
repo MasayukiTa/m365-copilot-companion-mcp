@@ -93,6 +93,7 @@ class RelayWorker:
         self.name = name
         self.conv_url = ""         # filled once the conversation gets its /conversation/<id>
         self.steer_msgs = []       # user steering messages to inject on the next turn(s)
+        self._last_was_steer = False   # so the FOLLOWING continue bridges off the steer
         self.max_turns = max_turns
         self.dwell_s = dwell_s
         self.per_turn_timeout_s = per_turn_timeout_s
@@ -170,6 +171,9 @@ class RelayWorker:
             self.job = ("【ユーザーからの追加指示】" + self.steer_msgs.pop(0)
                         + "\n上記を最優先で踏まえて作業を続行してください。"
                         "完了なら DONE、無理なら FAIL と理由を書いてください。")
+            self._last_was_steer = True
+        else:
+            self._last_was_steer = False
         self.turn += 1
         try:
             self._count_before = self.drv._answers().count()
@@ -199,7 +203,14 @@ class RelayWorker:
             self.status, self.outcome = "stuck", "STUCK"
             self.reason = "no progress for %d turns" % (self.no_progress + 1)
             return
-        self.job = FIX_JOB if "FAIL" in last_line else CONTINUE_JOB
+        if "FAIL" in last_line:
+            self.job = FIX_JOB
+        elif self._last_was_steer:
+            # bridge off the steer instead of a raw CONTINUE so the redirection sticks
+            self.job = ("先ほどの追加指示を踏まえて作業を続行してください。"
+                        "完了なら DONE、無理なら FAIL と理由を書いてください。")
+        else:
+            self.job = CONTINUE_JOB
         self.status = "ready"
 
     def poll(self):
@@ -238,7 +249,7 @@ class RelayWorker:
 
 def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     notify=default_notify, on_tick=None, max_concurrent=None,
-                    mc_box=None):
+                    mc_box=None, add_box=None):
     """Drive len(goals) autonomous relays in parallel to completion, but never with
     more than `max_concurrent` tabs open at once (defaults to what free RAM allows).
     A goal's tab is opened only when a slot frees and CLOSED the moment it finishes.
@@ -260,7 +271,20 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         return sum(1 for w in workers
                    if w.page is not None and w.status not in TERMINAL)
 
-    while any(w.status not in TERMINAL for w in workers):
+    while any(w.status not in TERMINAL for w in workers) or (add_box and len(add_box) > 0):
+        # goals added mid-run (e.g. from the native chat while at capacity) join the
+        # queue here -- priority items jump to the front, but still wait for a free slot
+        # so the tab budget is never exceeded.
+        if add_box:
+            while add_box:
+                item = add_box.pop(0)
+                nw = RelayWorker(item.get("text", ""), "w%d" % len(workers), max_turns=max_turns)
+                workers.append(nw)
+                if item.get("priority"):
+                    pending.insert(0, nw)
+                else:
+                    pending.append(nw)
+
         # fill free tab slots from the pending queue (memory-bounded, live cap)
         while pending and _active_open() < max(1, mc_box[0]):
             w = pending.pop(0)

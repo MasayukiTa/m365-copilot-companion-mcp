@@ -88,6 +88,7 @@ def _read_goals(args):
 
 
 def _snapshot(workers, started, total, max_concurrent=0):
+    total = len(workers)        # dynamic: goals can be added mid-run (native chat queue)
     done = sum(1 for w in workers if w.status in TERMINAL)
     open_tabs = sum(1 for w in workers if getattr(w, "page", None) is not None)
     return {
@@ -187,6 +188,7 @@ def main():
           % (max_conc, round(avail_phys_mb())))
 
     mc_box = [max_conc]                # live concurrency cap (cockpit can change it)
+    add_box = []                       # goals queued mid-run (native chat / cockpit)
 
     def _drain_commands(workers):
         # cockpit -> fleet control channel. {"close":["w2"], "set_maxtabs":5}. Consume.
@@ -217,6 +219,18 @@ def main():
                             w.steer(it.get("text", ""))
                     except Exception:
                         pass
+            # native chat / cockpit queued a new goal into the running fleet
+            add = cmd.get("add_goal")
+            if add is not None:
+                items = add if isinstance(add, list) else [add]
+                for it in items:
+                    try:
+                        if isinstance(it, dict) and it.get("text"):
+                            add_box.append({"text": it["text"], "priority": bool(it.get("priority"))})
+                        elif isinstance(it, str) and it:
+                            add_box.append({"text": it, "priority": False})
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -235,7 +249,7 @@ def main():
         results = run_relay_fleet(context, goals, args.agent_url,
                                   max_turns=args.max_turns, poll_s=args.poll_s,
                                   notify=default_notify, on_tick=on_tick,
-                                  max_concurrent=max_conc, mc_box=mc_box)
+                                  max_concurrent=max_conc, mc_box=mc_box, add_box=add_box)
 
     # final snapshot + summary
     elapsed = round(time.time() - started, 1)
