@@ -25,8 +25,12 @@ param(
     # stopped responding (CDP dead) and the fleet's attach() stalls. For a still-
     # responsive Edge, prefer closing tabs one by one: python -m relay.edge_recover
     [switch]$HardReset,
-    # Keep the window visible instead of minimizing it to the background.
+    # Keep the window visible (this is the DEFAULT now -- it is the stable mode).
     [switch]$Foreground,
+    # EXPERIMENTAL: minimize + keep minimized via edge_keeper. Driving a backgrounded
+    # CDP Edge has proven flaky (the tab renderer can be discarded -> TargetClosedError),
+    # so this is opt-in. Default is the stable foreground mode.
+    [switch]$Background,
     # Just bring the (already-running) companion Edge to the foreground -- used when
     # sign-in is required. Does not launch anything.
     [switch]$Surface
@@ -155,11 +159,12 @@ Write-Host "  port:    $Port"
 Start-Process -FilePath $edge -ArgumentList $arguments | Out-Null
 
 function Hide-Companion {
-    if ($Foreground) { return }
+    if (-not $Background) { return }
     $h = Get-CompanionWindow
-    # SW_HIDE (0) removes the window from the taskbar AND Alt-Tab entirely -- truly
-    # background, no minimized button, no orange taskbar flash. CDP still drives it.
-    if ($h -ne [IntPtr]::Zero) { [Cw]::ShowWindow($h, 0) | Out-Null }
+    # SW_MINIMIZE (6), NOT SW_HIDE: fully hiding makes Edge discard the tab renderer
+    # (the driver then hits TargetClosedError). Minimized is stable and CDP keeps driving
+    # it; edge_keeper keeps it minimized so it stays out of the way after launch.
+    if ($h -ne [IntPtr]::Zero) { [Cw]::ShowWindow($h, 6) | Out-Null }
 }
 
 # Hide from the very first moment the window exists, and keep hiding while CDP comes up
@@ -172,18 +177,27 @@ while ((Get-Date) -lt $deadline) {
     if ($ready) { break }
     Start-Sleep -Milliseconds 200
 }
-# M365 finishes loading after CDP is up and may re-show the window -- keep hiding a bit.
-$extra = (Get-Date).AddSeconds(5)
-while ((Get-Date) -lt $extra) { Hide-Companion; Start-Sleep -Milliseconds 250 }
+# (background mode only) keep minimizing briefly while M365 finishes loading.
+if ($Background) {
+    $extra = (Get-Date).AddSeconds(5)
+    while ((Get-Date) -lt $extra) { Hide-Companion; Start-Sleep -Milliseconds 250 }
+}
 
 if ($ready) {
     Write-Host ""
     Write-Host "Ready: CDP endpoint is up on http://127.0.0.1:$Port"
-    if (-not $Foreground) {
-        Write-Host "Running FULLY in the background (hidden -- not in the taskbar)."
-        Write-Host "Surface for sign-in:  .\start_companion_edge.ps1 -Surface"
+    if ($Background) {
+        # opt-in experimental background: keep it minimized. Kill any prior keeper first.
+        Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+            Where-Object { $_.CommandLine -match 'edge_keeper.ps1' } |
+            ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {} }
+        $keeper = Join-Path $PSScriptRoot "edge_keeper.ps1"
+        Start-Process powershell -WindowStyle Hidden -ArgumentList @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $keeper, "-Port", "$Port") | Out-Null
+        Write-Host "Running minimized (experimental background). If sends start failing,"
+        Write-Host "relaunch WITHOUT -Background (foreground is the stable mode)."
     } else {
-        Write-Host "If this profile is new, sign in to M365 once in the window that opened."
+        Write-Host "Visible (stable mode). Sign in to M365 here if this profile is new."
     }
     exit 0
 }
