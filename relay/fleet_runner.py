@@ -174,6 +174,8 @@ def main():
                     help="max auto-recovery reconnect attempts after a wedged Edge")
     ap.add_argument("--no-auto-recover", action="store_true",
                     help="disable auto-recovery (single connection, no reconnect)")
+    ap.add_argument("--no-recycle", action="store_true",
+                    help="disable the pre-run auto-recycle of a bloated/low-RAM Edge")
     ap.add_argument("--refuter", action="store_true",
                     help="operator B: after a candidate DONE, an INDEPENDENT reviewer "
                          "(non-blocking side chat) tries to refute it before accepting. "
@@ -315,7 +317,7 @@ def main():
 
     from playwright.sync_api import sync_playwright
     from relay.relay_fleet import FleetContextLost
-    from relay.edge_recover import cdp_alive, hard_reset
+    from relay.edge_recover import cdp_alive, companion_edge_mb, hard_reset, should_recycle
 
     try:
         port = int(args.cdp_url.rsplit(":", 1)[-1].split("/")[0])
@@ -351,6 +353,19 @@ def main():
 
     if args.stall_s > 0 and not args.no_auto_recover:
         threading.Thread(target=_watchdog, daemon=True).start()
+
+    # pre-run auto-recycle: the dedicated Edge accumulates memory across runs and the
+    # heavy M365 SPA gets flaky under pressure. If it has bloated or free RAM is low,
+    # hard-reset it now for a lean, reliable start (only touches the dedicated profile).
+    if not args.no_auto_recover and not args.no_recycle:
+        try:
+            emb = companion_edge_mb()
+            recycle, why = should_recycle(emb, avail_phys_mb())
+            if recycle:
+                print("[recycle] %s -> hard-resetting the companion Edge for a clean start" % why)
+                hard_reset(port)
+        except Exception:
+            pass
 
     results_by_goal = {}
     pending = list(goals)

@@ -178,6 +178,27 @@ def extract_analyze(resp: str):
     return None
 
 
+def extract_forge(resp: str):
+    """Pull (tool_name, code) from an operator-A forge request: a `FORGE: <name>` line plus
+    a fenced ```python ... ``` block carrying the full module source. Returns None if no
+    forge was requested or no code block is present."""
+    m = re.search(r"FORGE\s*[:：]\s*([A-Za-z_]\w*)", resp or "")
+    if not m:
+        return None
+    cm = re.search(r"```(?:python)?\s*\n(.*?)```", resp or "", re.DOTALL)
+    if not cm or not cm.group(1).strip():
+        return None
+    return m.group(1), cm.group(1)
+
+
+# Appended to the goal only when forge mode is on, so tasks don't forge spuriously.
+FORGE_HINT = (
+    "\n（任意・operator A）処理の中で再利用可能な新しいツールがあると有効な場合は、その行に "
+    "`FORGE: <関数名>` と書き、続けて ```python ... ``` に完全なモジュールソースを書いてください。"
+    "こちらで構文検証して tools/auto/ に配置します（実行はされず、サーバ再起動後に Copilot から使えます）。"
+)
+
+
 def _adjust_backoff(ok, turn_elapsed, backoff_s, base_elapsed,
                     backoff_step_s, backoff_max_s, slow_factor):
     """Pure adaptive-throttle step (spec §6). Returns (new_backoff, new_base, reason).
@@ -403,6 +424,8 @@ def run_relay(
     refuter: bool = False,
     max_refute: int = 2,
     review_lenses=None,
+    forge: bool = False,
+    max_forge: int = 3,
 ) -> str:
     """Run the autonomous loop unattended. Returns one of:
     DONE | STUCK | MAXTURNS | ABORTED. Notifies on every terminal outcome.
@@ -424,12 +447,13 @@ def run_relay(
     prior = memory_load(f"relay.{run_id}.context", scope="relay")
     context = "" if prior.startswith("[memory_load") else f"\n(前回までの文脈: {prior})\n"
 
-    job = PROTOCOL + goal + context
+    job = PROTOCOL + goal + context + (FORGE_HINT if forge else "")
     turn = 0
     no_progress = 0
     timeouts = 0
     research_count = 0
     analyze_count = 0
+    forge_count = 0
     verify_attempts = 0
     refute_count = 0
     checks_norm = normalize_checks(checks)      # spec 3-3 acceptance gate (empty -> trust DONE)
@@ -597,6 +621,30 @@ def run_relay(
             continue
         # ---- end data-analysis delegation ----
 
+        # ---- tool foundry (operator A): the agent forges a reusable tool ----
+        fg = extract_forge(resp) if forge else None
+        if fg:
+            fname, fcode = fg
+            forge_count += 1
+            if forge_count > max_forge:
+                job = ("これ以上は新しいツールを作成できません（上限）。既存のツールで作業を続けてください。"
+                       + CONTINUE_JOB)
+                time.sleep(sleep_s + backoff_s)
+                continue
+            try:
+                from tools.foundry import forge_core
+                fres = forge_core(fname, fcode)
+            except Exception as e:
+                fres = f"[forge error: {type(e).__name__}: {e}]"
+            runlog_append(run_id, {"turn": turn, "event": "forge", "name": fname,
+                                   "result": fres[:200]})
+            print(f"[relay turn {turn}] FORGE {fname}: {fres[:100]}")
+            job = ("ツール作成結果: " + fres + "\n（このツールは枠側では利用可、Copilot からは"
+                   "サーバ再起動後に利用可能。）今は既存のツールで作業を続けてください。" + CONTINUE_JOB)
+            time.sleep(sleep_s + backoff_s)
+            continue
+        # ---- end tool foundry ----
+
         up = resp.upper()
         last_line = (resp.strip().splitlines() or [""])[-1].upper()
 
@@ -734,6 +782,10 @@ def main():
                     help="review with a perspective-diverse PANEL (correctness / edge "
                          "cases / security), majority vote, instead of one reviewer. "
                          "Implies --refuter. More thorough, ~3x the review cost.")
+    ap.add_argument("--forge", action="store_true",
+                    help="operator A: let the agent forge reusable tools mid-task with a "
+                         "FORGE: <name> + ```python``` block. Staged + compile-checked under "
+                         "tools/auto/ (never executed); Copilot sees them after a restart.")
     args = ap.parse_args()
 
     checks = None
@@ -758,7 +810,8 @@ def main():
                   browser_context=None if args.no_research else context,
                   checks=checks, cwd=args.check_cwd,
                   refuter=args.refuter or args.panel, max_refute=args.max_refute,
-                  review_lenses=list(PANEL_LENSES) if args.panel else None)
+                  review_lenses=list(PANEL_LENSES) if args.panel else None,
+                  forge=args.forge)
 
 
 if __name__ == "__main__":

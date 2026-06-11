@@ -26,6 +26,33 @@ def _safe_name(name: str) -> bool:
     return bool(name) and name.isidentifier() and not keyword.iskeyword(name)
 
 
+def forge_core(name: str, code: str) -> str:
+    """Write + syntax-check + stage a forged module under tools/auto/, WITHOUT the unlock
+    gate. The orchestrator (the frame) is the trusted local operator and may forge tools
+    directly (spec operator A); only the MCP-exposed forge_tool() enforces require_unlocked
+    for remote callers. Forging never EXECUTES the code -- it only compiles it; activation
+    happens at the next server start (auto_loader) or on a deliberate import."""
+    if not _safe_name(name):
+        return f"[forge error: {name!r} is not a safe Python identifier]"
+    AUTO_DIR.mkdir(parents=True, exist_ok=True)
+    target = _validate_path(str(AUTO_DIR / f"{name}.py"))
+    target.write_text(code, encoding="utf-8")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            py_compile.compile(str(target), cfile=str(Path(tmp) / "check.pyc"), doraise=True)
+    except Exception as ce:
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        return f"[forge error: did not compile, discarded: {type(ce).__name__}: {ce}]"
+    return (
+        f"forged tools/auto/{name}.py ({len(code)} chars), syntax OK. "
+        "Usable by the framework now; Copilot/MCP clients see it after a server restart "
+        "(and Copilot Studio connector re-sync)."
+    )
+
+
 def forge_tool(name: str, code: str) -> str:
     """Write, syntax-check, and stage a new tool module under tools/auto/.
 
@@ -46,27 +73,7 @@ def forge_tool(name: str, code: str) -> str:
     if locked:
         return locked
     try:
-        if not _safe_name(name):
-            return f"[forge_tool error: {name!r} is not a safe Python identifier]"
-        AUTO_DIR.mkdir(parents=True, exist_ok=True)
-        target = _validate_path(str(AUTO_DIR / f"{name}.py"))
-        target.write_text(code, encoding="utf-8")
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                py_compile.compile(
-                    str(target), cfile=str(Path(tmp) / "check.pyc"), doraise=True
-                )
-        except Exception as ce:
-            try:
-                target.unlink()
-            except OSError:
-                pass
-            return f"[forge_tool error: did not compile, discarded: {type(ce).__name__}: {ce}]"
-        return (
-            f"forged tools/auto/{name}.py ({len(code)} chars), syntax OK.\n"
-            "Available to the framework on next import; Copilot/MCP clients see it "
-            "only after the server is restarted (and Copilot Studio connector re-synced)."
-        )
+        return forge_core(name, code)
     except Exception as e:
         return f"[forge_tool error: {type(e).__name__}: {e}]"
 
