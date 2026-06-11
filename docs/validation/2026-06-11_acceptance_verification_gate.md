@@ -192,9 +192,33 @@ checks＋反証の合成（verify pass→refuting→done verified）／非ブロ
 合計 **92/92**（acceptance 20・fleet-verify 12・folder-verify 8・relay-loop 9・code-task 12・refuter 10・
 fleet-refute 10・trace 11）。`main.py`（サーバ全ツール）もビルド成功。
 
-### 残（追補3）
-- フリート反証の**実機ライブ**は未走（2倍コスト＋数分。side-page 機構は research/analyst 委譲で実機実証済の同型、
-  ユニットで挙動確認）。必要なら `code_task --refuter` でライブ精査可能。
+## 追補 2026-06-12 (4): フリート反証の実機ライブ実証 ＋ 観測由来の堅牢化3点
+
+`code_task --refuter` を実機 Copilot に複数回流して反証を実地検証し、その過程で見えた信頼性問題を潰した。
+
+### 実機で確立したこと
+- **フリート反証が end-to-end でライブ動作**: 2回の完走 run（113s／146.8s）で **outcome DONE・verified True・
+  refuter#1 発火**。非ブロッキング `RefuterSession`＋worker `refuting`状態＋ループ処理が実機エージェント相手に機能。
+- **クリーンな判定（UPHELD）をライブ取得**: 直接経路 `run_refuter`（nudge 込み）で、正しい実装に対し独立レビュアーが
+  実際にレビュー→**UPHELD** を返すことを実証。
+
+### 観測由来の堅牢化（すべてテスト緑・コミット）
+1. **send 信頼性**: 低RAM(~2.4GB)下で M365 composer の submit が遅く「composer still holds text after 3 attempts」
+   で turn1 STUCK が頻発。`send()` の空待ち窓を 6s→12s に拡張＋**約1秒毎に再arm した送信ボタンを再クリック**
+   （load 起因の no-op クリック対策）。改善後この送信失敗は解消（次 run は別要因に変化）。成功送信には無影響・
+   二重送信も減る。
+2. **反証 nudge**: レビュアーは初回「ファイルとテストを確認します」と**前置きだけ返し判定に到達しない**（実装者の
+   CONTINUE と同じ）。プロンプトで「前置きで終わらせず即判定」を強制＋UNCLEAR なら判定を促す nudge を最大2回
+   （run_refuter／RefuterSession 両方）。これで UNCLEAR→**UPHELD**（直接経路で実証）。
+3. **STUCK 誤検知**: `"STUCK" 部分文字列`マッチは、エージェントが単に語に言及しただけで完走を誤って中断していた。
+   `reported_stuck()`＝**`STUCK:`/`STUCK：` マーカー必須**に厳格化（両ループ）。
+
+### 正直な残（環境側）
+- 低RAM(~2.4GB空き)で M365 SPA composer が遅く、send は緩和済だが完全には安定しない。
+- エージェントが自明タスクでも**本物の STUCK: を返す**ことがある（MCP サーバはローカル稼働=PID:8000 LISTENING 確認済
+  だが、ツール利用/応答の実機安定性は変動）。フリート反証判定も負荷時に UNCLEAR になり得る（ループは機械検証済
+  DONE を安全に受理）。**安定運用には空きRAM確保／Edge プロファイル再作成が有効**。
+- 反証の実機判定品質（UPHELD/REFUTED を毎回クリーンに）は nudge で改善したが、負荷時はなお UNCLEAR の余地。
 
 ## 限界・残（正直に）
 

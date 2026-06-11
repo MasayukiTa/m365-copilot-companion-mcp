@@ -135,6 +135,15 @@ PROCESSING_MARKERS = ("処理中", "生成しています", "考えています"
                       "thinking", "...")
 
 
+def reported_stuck(resp: str) -> bool:
+    """True only when the agent really declared STUCK with the protocol marker
+    ('STUCK:' / 'STUCK：'). A bare substring match on 'STUCK' false-fires when the agent
+    merely mentions the word (e.g. 'STUCKではありません' or echoes the protocol), which was
+    seen to abort a perfectly fine run."""
+    up = (resp or "").upper()
+    return "STUCK:" in up or "STUCK：" in up
+
+
 def _is_processing(text: str) -> bool:
     t = (text or "").strip().lower()
     if not t:
@@ -280,10 +289,21 @@ class CopilotWebDriver:
             # right after a fresh page). POLL for the composer to empty instead of one
             # fixed 800ms check -- the short check was the real cause of the false
             # "Send button never submitted" failures (and the retry then double-typed).
-            for _ in range(24):                  # up to ~6s
+            # Window is generous (12s) because under memory pressure the M365 SPA can take
+            # many seconds to clear the composer; a too-short window both falsely fails AND
+            # causes the retry to double-send. Re-click the Send button each second in case
+            # it re-armed without submitting (a load-induced no-op click).
+            for i in range(48):                  # up to ~12s
                 self.page.wait_for_timeout(250)
                 if not self._composer_text():
                     return  # composer emptied => message was submitted
+                if i and i % 4 == 0:             # ~every 1s, nudge a re-armed Send button
+                    try:
+                        btn = self._send_button()
+                        if btn.count() > 0 and btn.is_enabled():
+                            btn.click(force=True, timeout=2000)
+                    except Exception:
+                        pass
         raise RuntimeError(
             "send failed: composer still holds text after 3 attempts "
             "(Send button never submitted the message)"
@@ -570,7 +590,7 @@ def run_relay(
         up = resp.upper()
         last_line = (resp.strip().splitlines() or [""])[-1].upper()
 
-        if "STUCK" in up:
+        if reported_stuck(resp):
             outcome, reason = "STUCK", "agent reported STUCK"
             break
         if "DONE" in up and "FAIL" not in last_line:

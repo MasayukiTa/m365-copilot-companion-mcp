@@ -31,7 +31,7 @@ import time
 from .acceptance import Check, normalize_checks
 from .copilot_autopilot_relay import (
     CONTINUE_JOB, COPILOT_SELECTORS, CopilotWebDriver, FIX_JOB, PROTOCOL,
-    REFUTE_FIX_JOB, VERIFY_FIX_JOB, _is_processing, default_notify,
+    REFUTE_FIX_JOB, VERIFY_FIX_JOB, _is_processing, default_notify, reported_stuck,
 )
 
 TERMINAL = ("done", "stuck", "maxturns", "error", "cancelled")
@@ -260,7 +260,7 @@ class RelayWorker:
         self.last_norm = norm
         up = resp.upper()
         last_line = (resp.strip().splitlines() or [""])[-1].upper()
-        if "STUCK" in up:
+        if reported_stuck(resp):
             self.status, self.outcome, self.reason = "stuck", "STUCK", "agent reported STUCK"
             return
         if "DONE" in up and "FAIL" not in last_line:
@@ -324,6 +324,10 @@ class RelayWorker:
             return False
         kind, reason = r
         self._refuter_session = None
+        # surface the verdict in status.json (reason) so the run is observable live
+        self.reason = ("refuter#%d: %s%s"
+                       % (self.refute_count, kind,
+                          (": " + reason) if reason else ""))[:300]
         if kind == "REFUTED":
             self.job = REFUTE_FIX_JOB % (reason or "(no reason)")
             self.status = "ready"
