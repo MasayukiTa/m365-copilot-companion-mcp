@@ -78,6 +78,7 @@ class ChatWindow : Window
         if (k == "router_q") return ja ? "🔍 これは調査向きの依頼です。researcher で深掘りしますか？" : "🔍 This looks like research. Run it on the researcher?";
         if (k == "router_research") return ja ? "researcher で深掘り" : "Deep research";
         if (k == "router_normal") return ja ? "そのまま送信" : "Send as-is";
+        if (k == "loadingconv") return ja ? "会話を読み込み中…" : "Loading conversation…";
         if (k == "fleetview") return ja ? "並列タスクの会話" : "Parallel task";
         if (k == "fleetview_note") return ja ? "▼ 並列タスクの会話を表示中。ここに入力すると、この会話に割り込めます。" : "▼ Viewing a parallel-task conversation. Type here to steer it.";
         if (k == "del_head") return ja ? "を削除 — 方法を選んでください" : " — choose how to delete";
@@ -218,17 +219,86 @@ class ChatWindow : Window
         LoadConversations();
         Loaded += delegate { _input.Focus(); };
 
-        // ① watch for the cockpit asking to open a parallel-task conversation here
-        _openPath = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet", "open.json"));
+        // ① watch for the cockpit asking to open a parallel-task conversation here, and
+        // sync the session-shared conversation registry (fleet + chat conversations).
+        string fleetDir = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet"));
+        _openPath = Path.Combine(fleetDir, "open.json");
+        _convsPath = Path.Combine(fleetDir, "conversations.json");
         try { _openMtime = File.Exists(_openPath) ? File.GetLastWriteTimeUtc(_openPath).Ticks : 0; }
         catch { _openMtime = 0; }
         var openTimer = new DispatcherTimer();
         openTimer.Interval = TimeSpan.FromMilliseconds(800);
-        openTimer.Tick += delegate { CheckOpenRequest(); };
+        openTimer.Tick += delegate { CheckOpenRequest(); SyncRegistry(); };
         openTimer.Start();
+        SyncRegistry();
     }
 
     string _openPath; long _openMtime;
+    string _convsPath; long _convsMtime;
+
+    static string SS(Dictionary<string, object> d, string k)
+    { return (d.ContainsKey(k) && d[k] != null) ? d[k].ToString() : ""; }
+
+    List<object> ReadConvsRegistry()
+    {
+        try
+        {
+            if (File.Exists(_convsPath))
+            {
+                var a = _cjs.DeserializeObject(File.ReadAllText(_convsPath, Encoding.UTF8)) as object[];
+                if (a != null) return new List<object>(a);
+            }
+        }
+        catch { }
+        return new List<object>();
+    }
+    // Add this conversation to the shared registry so the cockpit/other side lists it.
+    void RegisterConv(string url, string title, string source)
+    {
+        if (string.IsNullOrEmpty(url)) return;
+        try
+        {
+            var list = ReadConvsRegistry();
+            foreach (var o in list) { var d = o as Dictionary<string, object>; if (d != null && SS(d, "url") == url) return; }
+            var e = new Dictionary<string, object>(); e["url"] = url; e["title"] = title ?? ""; e["source"] = source; e["ts"] = 0;
+            list.Add(e);
+            File.WriteAllText(_convsPath, _cjs.Serialize(list), Encoding.UTF8);
+            _convsMtime = File.GetLastWriteTimeUtc(_convsPath).Ticks;
+        }
+        catch { }
+    }
+    // Pull any conversations from the shared registry (e.g. fleet ones) into the sidebar
+    // as lazy placeholders -- clicking loads their content via /history.
+    void SyncRegistry()
+    {
+        try
+        {
+            if (!File.Exists(_convsPath)) return;
+            long m = File.GetLastWriteTimeUtc(_convsPath).Ticks;
+            if (m == _convsMtime) return;
+            _convsMtime = m;
+            bool added = false;
+            foreach (var o in ReadConvsRegistry())
+            {
+                var d = o as Dictionary<string, object>;
+                if (d == null) continue;
+                string url = SS(d, "url");
+                if (string.IsNullOrEmpty(url)) continue;
+                bool exists = false;
+                foreach (var c in _all) if (c.ConvUrl == url) { exists = true; break; }
+                if (!exists)
+                {
+                    var c = new Conversation();
+                    c.ConvUrl = url;
+                    c.Title = SS(d, "title");
+                    _all.Add(c);
+                    added = true;
+                }
+            }
+            if (added) RefreshConvList();
+        }
+        catch { }
+    }
     readonly JavaScriptSerializer _cjs = new JavaScriptSerializer();
 
     // Poll .fleet/open.json (written by the cockpit when a card is clicked) and, when it
@@ -269,19 +339,22 @@ class ChatWindow : Window
                 }
         }
         catch { }
+        var loaded = msgs;
         Dispatcher.BeginInvoke(new Action(delegate
         {
-            var c = new Conversation();
-            c.ConvUrl = url;
-            c.Title = T("fleetview");
-            foreach (var m in msgs) c.Messages.Add(m);
+            // reuse the existing sidebar entry for this conversation if present (dedup
+            // by URL) so a fleet/registry conversation isn't duplicated
+            Conversation c = null;
+            foreach (var x in _all) { if (x.ConvUrl == url) { c = x; break; } }
+            if (c == null) { c = new Conversation(); c.ConvUrl = url; c.Title = T("fleetview"); _all.Insert(0, c); }
+            c.Messages.Clear();
+            foreach (var m in loaded) c.Messages.Add(m);
             _conv = c;
-            if (_all.Count == 0 || _all[0].Id != c.Id) _all.Insert(0, c);
             _messages.Children.Clear();
             var note = new TextBlock { Text = T("fleetview_note"), TextWrapping = TextWrapping.Wrap, FontSize = 12.5, Margin = new Thickness(2, 2, 2, 10) };
             SetRef(note, TextBlock.ForegroundProperty, "Muted");
             _messages.Children.Add(note);
-            foreach (var m in msgs) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
+            foreach (var m in loaded) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
             RefreshConvList();
             _scroll.ScrollToEnd();
         }));
@@ -399,7 +472,7 @@ class ChatWindow : Window
             Grid.SetColumn(trash, 1); rowGrid.Children.Add(trash);
             rowBorder.Child = rowGrid;
             // empty/untitled new chat is not a deletable target -> never reveal its trash
-            rowBorder.MouseEnter += delegate { if (cc.Messages.Count > 0) trash.Visibility = Visibility.Visible; };
+            rowBorder.MouseEnter += delegate { if (cc.Messages.Count > 0 || !string.IsNullOrEmpty(cc.ConvUrl)) trash.Visibility = Visibility.Visible; };
             rowBorder.MouseLeave += delegate { trash.Visibility = Visibility.Hidden; };
             _convList.Children.Add(rowBorder);
         }
@@ -419,6 +492,17 @@ class ChatWindow : Window
     {
         _conv = c;
         _messages.Children.Clear();
+        // a registry/fleet conversation we haven't loaded yet -> pull it via /history
+        if (c.Messages.Count == 0 && !string.IsNullOrEmpty(c.ConvUrl))
+        {
+            var note = new TextBlock { Text = T("loadingconv"), FontSize = 12.5, Margin = new Thickness(2, 2, 2, 10) };
+            SetRef(note, TextBlock.ForegroundProperty, "Muted");
+            _messages.Children.Add(note);
+            RefreshConvList();
+            string url = c.ConvUrl;
+            new Thread((ThreadStart)delegate { OpenFromFleet(url); }) { IsBackground = true }.Start();
+            return;
+        }
         foreach (var m in c.Messages) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
         RefreshConvList();
         if (!string.IsNullOrEmpty(c.ConvUrl))
@@ -843,7 +927,7 @@ class ChatWindow : Window
             _conv.Messages.Add(new Msg("A", answer));
             SaveConversation(_conv);
         }));
-        try { var j = HttpGet("/conv"); var u = ExtractField(j, "url"); if (!string.IsNullOrEmpty(u)) { _conv.ConvUrl = u; Dispatcher.BeginInvoke(new Action(delegate { SaveConversation(_conv); })); } } catch { }
+        try { var j = HttpGet("/conv"); var u = ExtractField(j, "url"); if (!string.IsNullOrEmpty(u)) { _conv.ConvUrl = u; Dispatcher.BeginInvoke(new Action(delegate { SaveConversation(_conv); RegisterConv(u, _conv.Title, "chat"); })); } } catch { }
     }
 
     // ── persistence (manual base64 store) ───────────────────────────────────────
