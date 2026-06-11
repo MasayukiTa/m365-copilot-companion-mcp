@@ -41,6 +41,14 @@ load_dotenv()
 LOADING = '[data-testid="loading-message"]'   # holds the GROWING partial answer
 LASTMSG = '[data-testid="lastChatMessage"]'    # populates when the turn is DONE
 
+HELP_TEXT = (
+    "## 使えるスラッシュコマンド\n"
+    "- `/research <調べたいこと>` — M365 リサーチ ツールを **Claude (Anthropic)** に切替えて deep research（確認→承認→本実行、数分）。`/deepresearch` `/dr` も同じ。\n"
+    "- `/analyze <ファイルの絶対パス> | <分析指示>` — アナリストにデータファイルを渡して分析（数値は鵜呑みにせず自分でも確かめて）。\n"
+    "- `/help` — このヘルプ。\n\n"
+    "それ以外の文は、そのまま Copilot エージェントに送られます。"
+)
+
 PAGE = None      # set at startup
 DRIVER = None
 BUSY = False     # single conversation -> serialize requests
@@ -237,6 +245,61 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(chunk.encode("utf-8"))
         self.wfile.flush()
 
+    def _command(self, cmd):
+        head = cmd.split(None, 1)[0].lower()
+        arg = cmd[len(cmd.split(None, 1)[0]):].strip()
+        if head in ("/help", "/?", "/commands"):
+            self._sse({"delta": HELP_TEXT}); self._sse({}, "done"); return
+        if head in ("/research", "/deepresearch", "/dr"):
+            self._delegate("researcher", arg); return
+        if head in ("/analyze", "/an"):
+            self._delegate("analyst", arg); return
+        self._sse({"delta": "未知のコマンド `" + head + "`。`/help` で一覧を表示します。"})
+        self._sse({}, "done")
+
+    def _delegate(self, kind, arg):
+        """Run a /research or /analyze command by delegating to the Researcher
+        (Claude) or Analyst agent on a side page; stream the report back."""
+        global BUSY
+        if not arg:
+            usage = "/research <調べたいこと>" if kind == "researcher" else "/analyze <絶対パス> | <分析指示>"
+            self._sse({"delta": "使い方: " + usage}); self._sse({}, "done"); return
+        if BUSY:
+            self._sse({"delta": "[busy: 直前の処理を実行中です]"}); self._sse({}, "done"); return
+        BUSY = True
+        page = None
+        try:
+            from relay.agent_profiles import ANALYST, RESEARCHER, analyze, ask_agent
+            page = PAGE.context.new_page()
+            if kind == "researcher":
+                self._sse({"delta": "🔬 Claude で deep research を実行中…（確認→承認→本実行、数分かかります）\n\n"})
+                res = ask_agent(page, arg, RESEARCHER, model_name="Claude")
+            else:
+                if "|" in arg:
+                    path, instr = arg.split("|", 1); path = path.strip(); instr = instr.strip()
+                else:
+                    path, instr = arg.strip(), "添付データを分析し、要点を短くまとめてください。"
+                self._sse({"delta": "📊 アナリストで分析中…（" + path + "）\n\n"})
+                res = analyze(page, path, instr, ANALYST)
+            if res.get("ok"):
+                self._sse({"delta": res.get("result", "") or "(空の結果)"})
+            else:
+                self._sse({"delta": "[失敗: " + str(res.get("error", "")) + "]"})
+            self._sse({}, "done")
+        except Exception as e:
+            try:
+                self._sse({"delta": "[command error: " + type(e).__name__ + ": " + str(e) + "]"})
+                self._sse({}, "done")
+            except Exception:
+                pass
+        finally:
+            try:
+                if page is not None:
+                    page.close()
+            except Exception:
+                pass
+            BUSY = False
+
     def _stream(self, msg: str):
         global BUSY
         self.send_response(200)
@@ -246,6 +309,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if not msg.strip():
             self._sse({}, "done")
+            return
+        if msg.strip().startswith("/"):     # slash commands (/research, /analyze, /help)
+            self._command(msg.strip())
             return
         if BUSY:
             self._sse({"delta": "[busy: 直前の応答を生成中です]"})
