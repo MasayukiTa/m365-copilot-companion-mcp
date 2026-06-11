@@ -220,6 +220,48 @@ fleet-refute 10・trace 11）。`main.py`（サーバ全ツール）もビルド
   DONE を安全に受理）。**安定運用には空きRAM確保／Edge プロファイル再作成が有効**。
 - 反証の実機判定品質（UPHELD/REFUTED を毎回クリーンに）は nudge で改善したが、負荷時はなお UNCLEAR の余地。
 
+## 追補 2026-06-12 (5): リポマップ・プライミング（catch-up）＋ 多視点レビューパネル（差別化）
+
+### catch-up: コードベース理解 `relay/repo_map.py`
+フォルダを stdlib `ast` で解析し「ファイルツリー＋各 Python の top-level def/class のシグネチャ＋docstring
+1行」を ~4KB に圧縮した地図を生成。`code_task` が**ゴール冒頭にこの地図を注入**＝エージェントが盲目的 grep
+でなく Claude Code/aider 同様に**地図を持って着手**。既定ON（`--no-map` で無効）。dry-run で relay/ の
+3916字マップ生成を確認（全関数シグネチャ＋docstring が正確に並ぶ）。test_repo_map 9/9。
+
+### 差別化: 多視点レビューパネル（Claude Code に無い）
+反証を観点多様化。全レビュープロンプトが**①正しさ ②境界値・エラー処理 ③セキュリティ**の3観点を当てる
+（無コスト強化、両経路に適用）。厳密版として単一relay経路に `--panel`: **3観点の独立レビュアー×多数決**
+（`aggregate_panel`＝過半数 REFUTED で初めて差し戻し。少数の過敏な指摘では縛らない）。フリート/code_task は
+多視点化した単一レビュアー（パネルの N 独立セッションはコスト/状態増のため単一relay限定、フリート版は将来）。
+test_refuter 15/15（集約・観点プロンプト・パネル統合）。
+
+全体 **106/106**、`main.py` ビルド成功。
+
+## 追補 2026-06-12 (6): プラン提示UX（catch-up）＋ レビューパネルのフリート展開（差別化）
+
+**前提訂正（ユーザー）**: impl エージェントの中身は **Opus 4.8（＝Claude 本体と同じ）**。よって「生の知能差」
+という構造的天井は存在しない。残る差は **UI 駆動の信頼性とUX/機能の充足のみ**＝原理的に Claude Code 近傍まで到達可。
+
+### catch-up: プラン提示→承認→実行（Claude Code の看板ループ）`relay/planner.py`
+既存の steering(割り込み)チャネルの上に「計画フェーズ」を追加。`--plan` で各ゴールの**turn1 が番号付き計画だけ
+を出して PLAN_READY で停止**（status `awaiting`／pill 承認待ち）、計画は status.json(`workers[].plan`)に出る。
+ユーザーは**そのまま承認 or 編集を steer で送る**→既存の steer 経路で次ターンに注入され実行開始。worker に
+`plan_mode`＋`awaiting`状態。test_planner 14/14（計画抽出・承認待ち・steer再開・実行・未完計画nudge）。
+
+### 差別化: レビューパネルをフリート（並列の主UX）へ
+`RefuterSession` に lens を持たせ、worker が**観点ごとに独立レビュアーを逐次（非ブロッキング）実行→多数決集約**。
+`fleet_runner --panel` / `code_task --panel`。これで自然言語コーディングでも N 独立レビュアーのパネルが効く。
+test_fleet_refute に panel 2 ケース追加（過半REFUTED→差し戻し／少数→done）= 12/12。
+
+### operator A（foundry）状況
+`tools/foundry.py`(forge_tool=書込＋compile検証＋tools/auto/へstage, forge_list/read/delete)＋
+`auto_loader.load_auto_tools()`(起動時登録)は**実装済・安全**(restart-to-activate、版依存ホット登録は回避)。
+残=「agent がタスク中にツールを要求して forge」するループ統合（loose結合・コーディングでの価値限定・Copilotは
+再起動後認識のため、別途の集中タスク推奨）。
+
+全体テスト **121/121**（acceptance20・fleet-verify12・folder-verify8・relay-loop9・code-task12・refuter15・
+fleet-refute12・trace11・repo-map9・planner14）、`main.py` ビルド成功。
+
 ## 限界・残（正直に）
 
 - ゲートはユーザ（オペレータ）がチェックを与えたゴールにだけ効く。チェック無しゴールは
