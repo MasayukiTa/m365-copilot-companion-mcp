@@ -95,6 +95,20 @@ def main():
     for n in notes:
         print("    - " + n)
 
+    # pre-flight RAM check: under memory pressure the heavy M365 SPA is slow and sends /
+    # turns get flaky. Warn loudly so a failed run isn't a mystery (the companion Edge tab
+    # alone wants ~0.3-0.6 GB).
+    try:
+        from relay.relay_fleet import avail_phys_mb
+        free_mb = avail_phys_mb()
+        if free_mb < 1500 and not args.dry_run:
+            print("  WARNING: only %d MB free RAM. The M365 Copilot tab is heavy (~0.5 GB) "
+                  "and runs get flaky below ~1.5 GB free. Consider closing apps, or "
+                  "recreating the companion Edge profile, for reliable runs."
+                  % round(free_mb))
+    except Exception:
+        pass
+
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     state_dir = args.state_dir or os.path.join(repo, ".fleet")
     os.makedirs(state_dir, exist_ok=True)
