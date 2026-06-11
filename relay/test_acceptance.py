@@ -57,6 +57,17 @@ def main():
     p, d = run_check_blocking({"type": "py_compile", "path": bad})
     check("py_compile_bad_fail", (not p) and ("SyntaxError" in d or "invalid syntax" in d))
 
+    # 6b. import_smoke: good module imports (pass), module with a bad import fails
+    pkgdir = os.path.join(tmp, "pkg_imp")
+    os.makedirs(pkgdir, exist_ok=True)
+    open(os.path.join(pkgdir, "okmod.py"), "w", encoding="utf-8").write("VALUE = 41 + 1\n")
+    open(os.path.join(pkgdir, "badmod.py"), "w", encoding="utf-8").write(
+        "import this_module_does_not_exist_xyz\n")
+    p, d = run_check_blocking({"type": "import_smoke", "path": "pkg_imp/okmod.py"}, cwd=tmp)
+    check("import_smoke_pass", p)
+    p, d = run_check_blocking({"type": "import_smoke", "path": "pkg_imp/badmod.py"}, cwd=tmp)
+    check("import_smoke_fail", (not p) and ("ModuleNotFoundError" in d or "No module named" in d))
+
     # 7. file_exists pass + relative-to-cwd resolution
     p, d = run_check_blocking({"type": "file_exists", "path": "good.py"}, cwd=tmp)
     check("file_exists_cwd_pass", p)

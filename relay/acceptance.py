@@ -42,7 +42,7 @@ import time
 MAX_DETAIL = 1500
 
 # Process-backed check types vs. instant (filesystem) check types.
-_PROC_TYPES = frozenset({"shell", "pytest", "python", "py_compile"})
+_PROC_TYPES = frozenset({"shell", "pytest", "python", "py_compile", "import_smoke"})
 _FILE_TYPES = frozenset({"file_exists", "file_contains"})
 VALID_TYPES = _PROC_TYPES | _FILE_TYPES
 
@@ -103,6 +103,8 @@ class Check:
             return "python " + str(s.get("path") or "-c")[:80]
         if self.type == "py_compile":
             return "py_compile " + str(s.get("path", ""))[:80]
+        if self.type == "import_smoke":
+            return "import_smoke " + str(s.get("module") or s.get("path", ""))[:80]
         if self.type == "file_exists":
             return "file_exists " + str(s.get("path", ""))[:80]
         if self.type == "file_contains":
@@ -132,6 +134,18 @@ class Check:
             return [sys.executable, "-c",
                     "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)",
                     str(s.get("path", ""))], False
+        if self.type == "import_smoke":
+            # actually IMPORT the module -> catches load-time errors a compile misses
+            # (undefined names at module scope, bad imports, failing init). Derive a
+            # dotted module from `module`, or from `path` relative to cwd if not given.
+            mod = s.get("module")
+            if not mod and s.get("path"):
+                rel = str(s["path"])
+                rel = rel[:-3] if rel.lower().endswith(".py") else rel
+                mod = rel.replace("\\", "/").strip("/").replace("/", ".")
+            return [sys.executable, "-c",
+                    "import importlib,sys; importlib.import_module(sys.argv[1])",
+                    str(mod or "")], False
         return None, False
 
     def start(self):
