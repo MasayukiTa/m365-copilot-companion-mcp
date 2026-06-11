@@ -237,6 +237,13 @@
 & "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --remote-debugging-port=9222
 # → その Edge で M365 Copilot を開き、MCP エージェントで新規チャットを開始し、
 #   会話 URL をコピー
+#
+# 【推奨】普段使いの Edge とは別の「専用・隔離 Edge」を使う:
+#   .\start_companion_edge.ps1
+# 別プロファイル(別 user-data-dir)＋固定ポートで起動するので、(1) debug ポートが
+# 確実に bind し、(2) 本体 Edge に M365 タブを何枚開いても RAM を奪い合わず、本体の
+# クラッシュに巻き込まれない。重い M365 タブ多数 → メモリ枯渇 → Edge 落ち →
+# ポート 9222 消失、という並列実行の典型的な失敗をこれで断つ。SSO 済みなら無ログインで attach。
 
 .\.venv\Scripts\python.exe relay\copilot_autopilot_relay.py `
   --conversation-url "https://m365.cloud.microsoft/chat/agent/.../conversation/..." `
