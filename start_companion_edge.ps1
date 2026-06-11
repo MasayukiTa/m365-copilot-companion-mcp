@@ -187,15 +187,32 @@ if ($ready) {
     Write-Host ""
     Write-Host "Ready: CDP endpoint is up on http://127.0.0.1:$Port"
     if ($Background) {
-        # opt-in experimental background: keep it minimized. Kill any prior keeper first.
+        # True background via a SEPARATE virtual desktop. This is the robust approach:
+        # CDP is desktop-independent, so the tab keeps running and the send path works
+        # while the window simply is not on the user's current desktop. This avoids the
+        # SW_HIDE-discards-renderer failure and is cleaner than perpetual minimizing.
+        $mover = Join-Path $PSScriptRoot "move_companion_to_desktop.ps1"
+        if (Test-Path $mover) {
+            try {
+                & $mover
+            } catch {
+                Write-Host "move_companion_to_desktop.ps1 failed: $($_.Exception.Message)"
+                Write-Host "Falling back to the minimize keeper."
+            }
+        } else {
+            Write-Host "move_companion_to_desktop.ps1 not found; using the minimize keeper only."
+        }
+        # Belt-and-suspenders: also run the minimize keeper, so that IF the window ever
+        # lands back on the current desktop (e.g. the user removes the 2nd desktop) it is
+        # still kept out of the way. Kill any prior keeper first.
         Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
             Where-Object { $_.CommandLine -match 'edge_keeper.ps1' } |
             ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {} }
         $keeper = Join-Path $PSScriptRoot "edge_keeper.ps1"
         Start-Process powershell -WindowStyle Hidden -ArgumentList @(
             "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $keeper, "-Port", "$Port") | Out-Null
-        Write-Host "Running minimized (experimental background). If sends start failing,"
-        Write-Host "relaunch WITHOUT -Background (foreground is the stable mode)."
+        Write-Host "Running in the background on a separate virtual desktop. If sends start"
+        Write-Host "failing, relaunch WITHOUT -Background (foreground is the stable mode)."
     } else {
         Write-Host "Visible (stable mode). Sign in to M365 here if this profile is new."
     }
