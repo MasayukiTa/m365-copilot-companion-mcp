@@ -116,3 +116,96 @@ def run_refuter(context, conversation_url: str, goal: str, final_response: str,
         except Exception:
             pass
     return verdict
+
+
+class RefuterSession:
+    """Non-blocking refuter for the FLEET (single-thread round-robin): a blocking
+    side-page wait would freeze every other worker for minutes. start() opens the side
+    chat and sends the refuter prompt (a brief one-off, like opening any tab); poll()
+    then checks for the verdict without blocking -- returning None while the reviewer is
+    still thinking, or (kind, reason) when its answer stabilises. Mirrors the worker's own
+    send/wait state machine. Never raises; any failure yields ("UNCLEAR", "")."""
+
+    def __init__(self, context, base_url, goal, final_response,
+                 dwell_s=4.0, timeout_s=600):
+        self.context = context
+        self.base_url = base_url
+        self.goal = goal
+        self.final = final_response
+        self.dwell_s = dwell_s
+        self.timeout_s = timeout_s
+        self.page = None
+        self.drv = None
+        self._count_before = 0
+        self._t_send = None
+        self._last = None
+        self._stable_since = None
+        self._done = None          # verdict tuple once finished
+
+    def start(self):
+        import time
+        from .copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver
+        try:
+            if self.context is None or not self.base_url:
+                self._finish(("UNCLEAR", ""))
+                return self
+            self.page = self.context.new_page()
+            self.page.goto(self.base_url, wait_until="domcontentloaded", timeout=45000)
+            appeared = False
+            for _ in range(40):
+                self.page.wait_for_timeout(1000)
+                if self.page.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+                    appeared = True
+                    break
+            if not appeared:
+                self._finish(("UNCLEAR", ""))
+                return self
+            self.drv = CopilotWebDriver(self.page)
+            self._count_before = self.drv._answers().count()
+            self.drv._count_before = self._count_before
+            self.drv.send(build_refuter_prompt(self.goal, self.final))
+            self._t_send = time.time()
+        except Exception:
+            self._finish(("UNCLEAR", ""))
+        return self
+
+    def poll(self):
+        """None while the reviewer is still answering; else (kind, reason)."""
+        import time
+        from .copilot_autopilot_relay import _is_processing
+        if self._done is not None:
+            return self._done
+        if self.drv is None:
+            return self._done
+        try:
+            if self._t_send and time.time() - self._t_send > self.timeout_s:
+                self._finish(("UNCLEAR", ""))
+                return self._done
+            if self.drv._answers().count() <= self._count_before:
+                return None
+            t = self.drv.read_last_response()
+            if _is_processing(t):
+                self._last, self._stable_since = None, None
+                return None
+            if t == self._last:
+                if self._stable_since and (time.time() - self._stable_since) >= self.dwell_s:
+                    self._finish(parse_verdict(t))
+                    return self._done
+                return None
+            self._last, self._stable_since = t, time.time()
+            return None
+        except Exception:
+            self._finish(("UNCLEAR", ""))
+            return self._done
+
+    def _finish(self, verdict):
+        self._done = verdict
+        self.close()
+
+    def close(self):
+        try:
+            if self.page is not None:
+                self.page.close()
+        except Exception:
+            pass
+        self.page = None
