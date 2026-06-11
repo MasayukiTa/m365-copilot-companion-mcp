@@ -799,8 +799,43 @@ class ChatWindow : Window
     {
         StackPanel outer;
         var content = AddAssistantContainer(out outer);
-        outer.Tag = text;                          // copy button reads this on click
-        content.Children.Add(Md.Render(text));     // rendered markdown (code blocks, lists, bold, ...)
+        RenderAssistantBody(content, outer, text);
+    }
+
+    // Render the answer as a SELECTABLE read-only TextBox (TextBlocks can't be selected,
+    // so the markdown render could not be copied). Light markdown cleanup for readability;
+    // the copy button still copies the full text via outer.Tag.
+    void RenderAssistantBody(Panel content, StackPanel outer, string text)
+    {
+        content.Children.Clear();
+        var tb = new TextBox
+        {
+            Text = PlainText(text), IsReadOnly = true, IsTabStop = false,
+            BorderThickness = new Thickness(0), Background = Brushes.Transparent,
+            TextWrapping = TextWrapping.Wrap, FontSize = 14, Padding = new Thickness(0),
+            VerticalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
+        };
+        SetRef(tb, ForegroundProperty, "Fg");
+        SetRef(tb, TextBox.SelectionBrushProperty, "Accent");
+        content.Children.Add(tb);
+        if (outer != null) outer.Tag = text;
+    }
+
+    static string PlainText(string md)
+    {
+        if (md == null) return "";
+        var sb = new StringBuilder();
+        string[] lines = md.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n');
+        foreach (var raw in lines)
+        {
+            string ln = raw;
+            int h = 0; while (h < ln.Length && ln[h] == '#') h++;
+            if (h > 0 && h < ln.Length && ln[h] == ' ') ln = ln.Substring(h + 1);   // heading -> plain
+            ln = ln.Replace("**", "").Replace("`", "");                              // drop bold/code markers
+            sb.Append(ln).Append('\n');
+        }
+        return sb.ToString().TrimEnd('\n');
     }
 
     TextBox MakeText(string text)
@@ -1110,9 +1145,8 @@ class ChatWindow : Window
             SetRef(_statusDot, BackgroundProperty, "Border");
             // render whatever we got (full / partial / error); always clear the typing indicator
             content.Children.Clear();
-            if (answer.Length > 0) { content.Children.Add(Md.Render(answer)); _scroll.ScrollToEnd(); }
-            else if (errFinal != null) { content.Children.Add(MakeText("[bridge error: " + errFinal + "]")); }
-            if (outer != null) outer.Tag = answer;   // copy button reads this on click
+            if (answer.Length > 0) { RenderAssistantBody(content, outer, answer); _scroll.ScrollToEnd(); }
+            else if (errFinal != null) { content.Children.Add(MakeText("[bridge error: " + errFinal + "]")); if (outer != null) outer.Tag = errFinal; }
             _conv.Messages.Add(new Msg("A", answer));
             SaveConversation(_conv);
         }));
