@@ -585,10 +585,24 @@ class Handler(BaseHTTPRequestHandler):
                 if not _is_proc(partial) and len(partial) > sent:
                     self._sse({"delta": partial[sent:]})
                     sent = len(partial)
-                # done: lastChatMessage populated (final answer)
+                # lastChatMessage populated -- but it can KEEP GROWING after it first
+                # appears, so finishing immediately truncates the tail. Stream its growth
+                # and only finish once it has been STABLE for ~1.2s.
                 if final and not _is_proc(final):
-                    if len(final) > sent:
-                        self._sse({"delta": final[sent:]})
+                    stable_text, stable_since = final, time.time()
+                    while time.time() - t0 < 600:
+                        if len(final) > sent:
+                            self._sse({"delta": final[sent:]})
+                            sent = len(final)
+                        if final == stable_text:
+                            if time.time() - stable_since >= 1.2:
+                                break
+                        else:
+                            stable_text, stable_since = final, time.time()
+                        time.sleep(0.3)
+                        final = _text(LASTMSG)
+                        if _is_proc(final):
+                            final = stable_text
                     self._sse({}, "done")
                     return
                 time.sleep(0.3)
