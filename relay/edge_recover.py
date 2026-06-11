@@ -75,6 +75,13 @@ def surface(port=9222):
     import subprocess
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ps1 = os.path.join(repo, "start_companion_edge.ps1")
+    # tell the background keeper to stop re-hiding the window while the user signs in
+    try:
+        fleet = os.path.join(repo, ".fleet")
+        os.makedirs(fleet, exist_ok=True)
+        open(os.path.join(fleet, "edge_keep_pause"), "w").write(str(time.time()))
+    except Exception:
+        pass
     try:
         subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,

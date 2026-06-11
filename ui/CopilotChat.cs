@@ -82,6 +82,7 @@ class ChatWindow : Window
         if (k == "attach") return ja ? "ファイル/画像を添付（画像は Ctrl+V で貼り付けも可）" : "Attach a file/image (or paste an image with Ctrl+V)";
         if (k == "attach_btn") return ja ? "＋ 添付" : "+ Attach";
         if (k == "attach_fail") return ja ? "添付に失敗:" : "Attach failed:";
+        if (k == "open_cockpit") return ja ? "並列実行を開く" : "Open parallel execution";
         if (k == "loadingconv") return ja ? "会話を読み込み中…" : "Loading conversation…";
         if (k == "fleetview") return ja ? "並列タスクの会話" : "Parallel task";
         if (k == "fleetview_note") return ja ? "▼ 並列タスクの会話を表示中。ここに入力すると、この会話に割り込めます。" : "▼ Viewing a parallel-task conversation. Type here to steer it.";
@@ -140,6 +141,10 @@ class ChatWindow : Window
         Grid.SetRow(convScroll, 1); side.Children.Add(convScroll);
 
         var bottom = new StackPanel { Margin = new Thickness(12, 8, 12, 12) };
+        var cockpitBtn = Btn(T("open_cockpit"), "Accent", "AccentFg", false);
+        cockpitBtn.Height = 36; cockpitBtn.Margin = new Thickness(0, 0, 0, 8); cockpitBtn.FontSize = 12.5; cockpitBtn.FontWeight = FontWeights.SemiBold;
+        cockpitBtn.Click += delegate { OpenCockpit(); };
+        bottom.Children.Add(cockpitBtn);
         _langBtn = Btn(T("lang"), "Panel", "Muted", true);
         _langBtn.Height = 34; _langBtn.Margin = new Thickness(0, 0, 0, 6); _langBtn.FontSize = 12;
         _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveSettings(); UpdateChrome(); RefreshConvList(); };
@@ -378,6 +383,25 @@ class ChatWindow : Window
         return b;
     }
     void SetRef(FrameworkElement el, DependencyProperty p, string key) { el.SetResourceReference(p, key); }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+    // Launch (or focus) the parallel-execution cockpit -- so the user never has to close
+    // everything and restart just to reach it.
+    void OpenCockpit()
+    {
+        try
+        {
+            var existing = System.Diagnostics.Process.GetProcessesByName("FleetCockpit");
+            if (existing.Length > 0)
+            {
+                try { if (existing[0].MainWindowHandle != IntPtr.Zero) SetForegroundWindow(existing[0].MainWindowHandle); } catch { }
+                return;
+            }
+            string exe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "FleetCockpit.exe");
+            if (File.Exists(exe)) System.Diagnostics.Process.Start(exe);
+        }
+        catch { }
+    }
 
     // Replace the default WPF button chrome (which forces an unreadable light-blue
     // hover highlight) with a flat template: the button's own Background + a
