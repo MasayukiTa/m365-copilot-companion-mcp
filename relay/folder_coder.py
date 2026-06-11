@@ -29,6 +29,7 @@ stdlib only -- no third-party imports, so it runs anywhere the repo's Python doe
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -129,17 +130,33 @@ _TPL_SINGLE = (
 )
 
 
-def generate_goals(folder, instruction, mode="per-file", exts=None, max_files=200):
-    """Turn one folder + one instruction into a list of fleet GOAL strings.
+def _wrap(text, checks, cwd):
+    """A goal is a plain string when it has no acceptance check (back-compat), or a
+    dict {"text","checks","cwd"} when it does -- the shape fleet_runner parses from a
+    goals-file JSON line and the verification gate (spec 3-3) consumes."""
+    if checks:
+        return {"text": text, "checks": checks, "cwd": cwd}
+    return text
+
+
+def generate_goals(folder, instruction, mode="per-file", exts=None, max_files=200,
+                   verify=False, check_cmd=None):
+    """Turn one folder + one instruction into a list of fleet GOALs.
 
     `mode` is one of:
       * "per-file" -- one EDIT goal per scanned file (the default).
       * "review"   -- one READ-ONLY review goal per scanned file.
       * "single"   -- exactly one goal covering the whole folder (no scan needed).
 
-    For per-file / review the folder is scanned via `scan_folder(folder, exts,
-    max_files)`; "single" ignores `exts`/`max_files` and returns a one-element list.
-    Returns a list[str] of ready-to-run goal lines. Raises ValueError on bad mode.
+    Acceptance gate (spec 3-3): when `verify` is set, each per-file Python EDIT goal
+    gets a `py_compile` check so a self-reported DONE is only accepted if the file still
+    compiles (the frame proves the edit did not break the file). `check_cmd`, if given,
+    attaches a shell check (e.g. "python -m pytest -q") to every EDIT goal (and to the
+    single-mode goal) so DONE means the project command actually passed. Review goals are
+    read-only, so they never carry checks. Goals with a check are emitted as dicts (JSON
+    lines); plain goals stay strings.
+
+    Returns a list of goals (str or dict). Raises ValueError on bad mode.
     """
     if mode not in VALID_MODES:
         raise ValueError("mode must be one of %s, got %r" % (VALID_MODES, mode))
@@ -147,28 +164,42 @@ def generate_goals(folder, instruction, mode="per-file", exts=None, max_files=20
     folder_disp = os.path.abspath(folder)
 
     if mode == "single":
-        return [_TPL_SINGLE.format(folder=folder_disp, instruction=instruction)]
+        text = _TPL_SINGLE.format(folder=folder_disp, instruction=instruction)
+        checks = [{"type": "shell", "cmd": check_cmd}] if check_cmd else []
+        return [_wrap(text, checks, folder_disp)]
 
     tpl = _TPL_PER_FILE if mode == "per-file" else _TPL_REVIEW
     rels = scan_folder(folder, exts=exts, max_files=max_files)
-    return [
-        tpl.format(folder=folder_disp, relpath=rel, instruction=instruction)
-        for rel in rels
-    ]
+    out = []
+    for rel in rels:
+        text = tpl.format(folder=folder_disp, relpath=rel, instruction=instruction)
+        checks = []
+        if mode == "per-file":          # review is read-only -> no acceptance check
+            if verify and rel.lower().endswith(".py"):
+                checks.append({"type": "py_compile", "path": rel})
+            if check_cmd:
+                checks.append({"type": "shell", "cmd": check_cmd})
+        out.append(_wrap(text, checks, folder_disp))
+    return out
 
 
 def write_goals_file(goals, path):
     """Write `goals` one per line to `path` (UTF-8, no BOM). Returns `path`.
 
-    The format matches what `fleet_runner --goals-file` expects: one goal per
-    line. A trailing newline is written so the file ends cleanly.
+    The format matches what `fleet_runner --goals-file` expects: one goal per line. A
+    plain-string goal is written verbatim; a goal that carries an acceptance check is a
+    dict and is written as a single-line JSON object (fleet_runner detects the leading
+    '{' and parses it). A trailing newline is written so the file ends cleanly.
     """
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         for g in goals:
-            f.write(g + "\n")
+            if isinstance(g, dict):
+                f.write(json.dumps(g, ensure_ascii=False) + "\n")
+            else:
+                f.write(g + "\n")
     return path
 
 
@@ -210,12 +241,21 @@ def main():
                     help="max files to turn into goals (default 200)")
     ap.add_argument("--out", default=None,
                     help="goals file to write (default: <folder>\\.fleet_goals.txt)")
+    ap.add_argument("--verify", action="store_true",
+                    help="attach a py_compile acceptance check to each per-file Python "
+                         "EDIT goal: a self-reported DONE is only accepted if the file "
+                         "still compiles (spec 3-3 verification gate)")
+    ap.add_argument("--check-cmd", default=None,
+                    help="shell command run as an acceptance check on every EDIT goal "
+                         '(and the single-mode goal), e.g. "python -m pytest -q". DONE is '
+                         "accepted only if it exits 0; on failure the real output is fed back.")
     args = ap.parse_args()
 
     out = args.out or _default_out(args.folder)
 
     goals = generate_goals(args.folder, args.instruction, mode=args.mode,
-                           exts=args.ext, max_files=args.max)
+                           exts=args.ext, max_files=args.max,
+                           verify=args.verify, check_cmd=args.check_cmd)
 
     if not goals:
         print("folder_coder: no matching files in %s -- nothing to do."
@@ -223,11 +263,16 @@ def main():
         print("  (check --ext / --max, or use --mode single)")
         return 1
 
-    print("folder_coder: %d goal(s)  mode=%s  folder=%s"
-          % (len(goals), args.mode, os.path.abspath(args.folder)))
+    nverify = sum(1 for g in goals if isinstance(g, dict) and g.get("checks"))
+    print("folder_coder: %d goal(s) (%d with acceptance check)  mode=%s  folder=%s"
+          % (len(goals), nverify, args.mode, os.path.abspath(args.folder)))
     print("-" * 70)
     for i, g in enumerate(goals, 1):
-        print("%3d. %s" % (i, g))
+        if isinstance(g, dict):
+            tags = ", ".join(c.get("type", "?") for c in g.get("checks", []))
+            print("%3d. [check: %s] %s" % (i, tags, g.get("text", "")))
+        else:
+            print("%3d. %s" % (i, g))
     print("-" * 70)
 
     write_goals_file(goals, out)

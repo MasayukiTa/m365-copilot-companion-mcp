@@ -32,7 +32,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from relay.relay_fleet import (  # noqa: E402
-    TERMINAL, auto_concurrency, avail_phys_mb, run_relay_fleet,
+    TERMINAL, auto_concurrency, avail_phys_mb, goal_fields, run_relay_fleet,
 )
 from relay.copilot_autopilot_relay import default_notify  # noqa: E402
 
@@ -48,6 +48,7 @@ STATUS_PILL = {
     "pending":   ("待機列", "muted"),    # queued -- no tab open yet (memory discipline)
     "ready":     ("準備",   "muted"),
     "waiting":   ("実行中", "good"),     # A_GOOD blue -- a turn is streaming server-side
+    "verifying": ("検証中", "good"),     # spec 3-3: running the acceptance check locally
     "done":      ("完了",   "done"),     # finished cleanly
     "stuck":     ("停滞",   "bad"),       # B_BAD red
     "maxturns":  ("上限",   "bad"),
@@ -77,13 +78,25 @@ def _repo_root():
 
 
 def _read_goals(args):
+    """Goals come from -g flags and/or a goals file. A goals-file line is either:
+      * plain text                -> a goal with no acceptance check (back-compat), or
+      * a JSON object starting '{' -> {"goal"/"text": str, "check"/"checks": ..., "cwd": ...}
+        carrying a machine-checkable acceptance gate (spec 3-3). folder_coder --verify
+        emits these. Bad JSON falls back to treating the line as plain text."""
     goals = list(args.goal or [])
     if args.goals_file:
         with open(args.goals_file, encoding="utf-8") as f:
             for line in f:
                 s = line.strip()
-                if s and not s.startswith("#"):
-                    goals.append(s)
+                if not s or s.startswith("#"):
+                    continue
+                if s.startswith("{"):
+                    try:
+                        goals.append(json.loads(s))
+                        continue
+                    except Exception:
+                        pass            # not valid JSON -> treat the raw line as a goal
+                goals.append(s)
     return goals
 
 
@@ -112,6 +125,8 @@ def _snapshot(workers, started, total, max_concurrent=0):
             "reason": w.reason,
             "closed": getattr(w, "closed", False),
             "conv_url": getattr(w, "conv_url", ""),
+            "verified": getattr(w, "verified", None),
+            "verify_attempts": getattr(w, "verify_attempts", 0),
             "last": (w.last_response or "")[:600],
         } for w in workers],
     }
@@ -164,6 +179,10 @@ def main():
         ap.error("no goals -- pass -g/--goal (repeatable) or --goals-file")
     if not args.agent_url:
         ap.error("no agent URL -- pass --agent-url or set MCP_FLEET_AGENT_URL in .env")
+    # a goal may be a plain string or a dict carrying acceptance checks; gtexts is the
+    # display/keying text for each, so dict goals don't break snapshots or result lookup.
+    gtexts = [goal_fields(g)[0] for g in goals]
+    nverify = sum(1 for g in goals if goal_fields(g)[1])
 
     os.makedirs(args.state_dir, exist_ok=True)
     status_path = os.path.join(args.state_dir, "status.json")
@@ -182,14 +201,15 @@ def main():
                                 "total": len(goals), "done_count": 0, "running": True,
                                 "max_concurrent": max_conc, "open_tabs": 0,
                                 "avail_mb": round(avail_phys_mb()),
-                                "workers": [{"name": "w%d" % i, "goal": g,
+                                "workers": [{"name": "w%d" % i, "goal": gtexts[i],
                                              "status": "pending", "pill": "待機列",
                                              "color": "muted", "outcome": None,
                                              "turn": 0, "max_turns": args.max_turns,
                                              "reason": "", "closed": False, "last": ""}
-                                            for i, g in enumerate(goals)]})
+                                            for i in range(len(goals))]})
 
-    print("fleet: %d goal(s) -> %s" % (len(goals), args.agent_url))
+    print("fleet: %d goal(s) (%d with acceptance check) -> %s"
+          % (len(goals), nverify, args.agent_url))
     print("       live status: %s" % status_path)
     print("       max %d tab(s) open at once (close-on-done frees each); free RAM now %d MB"
           % (max_conc, round(avail_phys_mb())))
@@ -351,7 +371,7 @@ def main():
             hard_reset(port)
 
     stop_wd.set()
-    results = [results_by_goal[g] for g in goals if g in results_by_goal]
+    results = [results_by_goal[t] for t in gtexts if t in results_by_goal]
 
     # final snapshot + summary -- reflect the REAL outcome of each goal, not a blanket
     # "done" (which made failed/stuck goals show as green 完了).
@@ -359,7 +379,7 @@ def main():
         if o == "DONE": return "done"
         if o == "CANCELLED": return "cancelled"
         if o == "MAXTURNS": return "maxturns"
-        if o == "STUCK": return "stuck"
+        if o in ("STUCK", "VERIFY_FAILED"): return "stuck"
         return "error"
 
     elapsed = round(time.time() - started, 1)
