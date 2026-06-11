@@ -50,6 +50,10 @@ class ChatWindow : Window
     Conversation _conv = new Conversation();
     List<Conversation> _all = new List<Conversation>();
     string _renamingId = null;
+    int _deleteMode = 1;                 // 1=local only, 2=open in Copilot, 3=auto (experimental)
+    Border _banner; StackPanel _bannerBody;
+    static readonly string SettingsFile = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "copilot-bridge", "settings.txt");
 
     // streaming state
     Panel _pendingContent;   // holds the typing dots, then the streamed text
@@ -137,6 +141,20 @@ class ChatWindow : Window
         SetRef(barBorder, Border.BorderBrushProperty, "Border");
         Grid.SetRow(barBorder, 2); main.Children.Add(barBorder);
 
+        // delete-mode banner (overlays the top of the message area)
+        _deleteMode = LoadDeleteMode();
+        _banner = new Border
+        {
+            Visibility = Visibility.Collapsed, VerticalAlignment = VerticalAlignment.Top,
+            Margin = new Thickness(24, 12, 24, 0), CornerRadius = new CornerRadius(12),
+            BorderThickness = new Thickness(1), Padding = new Thickness(16, 13, 16, 15),
+            MaxWidth = 560, HorizontalAlignment = HorizontalAlignment.Center
+        };
+        SetRef(_banner, BackgroundProperty, "Panel"); SetRef(_banner, Border.BorderBrushProperty, "Accent");
+        _bannerBody = new StackPanel(); _banner.Child = _bannerBody;
+        Panel.SetZIndex(_banner, 100);
+        Grid.SetRow(_banner, 1); main.Children.Add(_banner);
+
         Grid.SetColumn(main, 1); root.Children.Add(main);
         Content = root;
 
@@ -206,7 +224,7 @@ class ChatWindow : Window
             var miR = new MenuItem { Header = "名前を変更" };
             miR.Click += delegate { _renamingId = cc.Id; RefreshConvList(); };
             var miD = new MenuItem { Header = "削除" };
-            miD.Click += delegate { DeleteConversation(cc); };
+            miD.Click += delegate { ShowDeleteBanner(cc); };
             menu.Items.Add(miR); menu.Items.Add(miD);
             b.ContextMenu = menu;
             _convList.Children.Add(b);
@@ -233,7 +251,7 @@ class ChatWindow : Window
             new Thread((ThreadStart)delegate { try { HttpGet("/switch?url=" + Uri.EscapeDataString(c.ConvUrl)); } catch { } }) { IsBackground = true }.Start();
     }
 
-    void DeleteConversation(Conversation c)
+    void DeleteLocal(Conversation c)
     {
         try { var p = Path_(c.Id); if (File.Exists(p)) File.Delete(p); } catch { }
         _all.Remove(c);
@@ -243,6 +261,95 @@ class ChatWindow : Window
             else { _conv = new Conversation(); _all.Add(_conv); _messages.Children.Clear(); }
         }
         RefreshConvList();
+    }
+
+    // ── delete-mode banner (3 choices, like Claude Code's modes) ────────────────
+    int LoadDeleteMode()
+    {
+        try { foreach (var ln in File.ReadAllLines(SettingsFile)) if (ln.StartsWith("deletemode=")) return int.Parse(ln.Substring(11).Trim()); }
+        catch { }
+        return 1;
+    }
+    void SaveDeleteMode(int m)
+    {
+        try { Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile)); File.WriteAllText(SettingsFile, "deletemode=" + m + "\n", Encoding.UTF8); }
+        catch { }
+    }
+    void HideBanner() { _banner.Visibility = Visibility.Collapsed; }
+
+    void ShowDeleteBanner(Conversation c)
+    {
+        _bannerBody.Children.Clear();
+        var title = c.Title.Length > 24 ? c.Title.Substring(0, 24) + "…" : c.Title;
+        var head = new TextBlock { Text = "「" + title + "」を削除 — 方法を選んでください", FontWeight = FontWeights.SemiBold, FontSize = 13.5, Margin = new Thickness(0, 0, 0, 10), TextWrapping = TextWrapping.Wrap };
+        SetRef(head, TextBlock.ForegroundProperty, "Fg");
+        _bannerBody.Children.Add(head);
+        _bannerBody.Children.Add(ModeButton(c, 1, "このアプリからのみ削除", "Copilot 側の会話は残す（最も安全）"));
+        _bannerBody.Children.Add(ModeButton(c, 2, "Copilot で開いて手動削除", "その会話を Copilot で開く。1クリックで削除"));
+        _bannerBody.Children.Add(ModeButton(c, 3, "Copilot 会話も自動削除（実験的）", "失敗時は自動で「Copilot で開く」に切替"));
+        var foot = new DockPanel { Margin = new Thickness(0, 8, 0, 0) };
+        var note = new TextBlock { Text = "選んだ方法が次回の既定になります（現在: モード " + _deleteMode + "）", FontSize = 11.5, VerticalAlignment = VerticalAlignment.Center };
+        SetRef(note, TextBlock.ForegroundProperty, "Muted");
+        var cancel = new Button { Content = "キャンセル", BorderThickness = new Thickness(0), Background = Brushes.Transparent, Cursor = Cursors.Hand, FontSize = 12.5, Padding = new Thickness(6, 2, 6, 2) };
+        SetRef(cancel, ForegroundProperty, "Muted");
+        cancel.Click += delegate { HideBanner(); };
+        DockPanel.SetDock(cancel, Dock.Right);
+        foot.Children.Add(cancel); foot.Children.Add(note);
+        _bannerBody.Children.Add(foot);
+        _banner.Visibility = Visibility.Visible;
+    }
+
+    Button ModeButton(Conversation c, int mode, string title, string sub)
+    {
+        var sp = new StackPanel();
+        var t = new TextBlock { Text = mode + ". " + title, FontWeight = FontWeights.SemiBold, FontSize = 13 };
+        SetRef(t, TextBlock.ForegroundProperty, "Fg");
+        var s = new TextBlock { Text = sub, FontSize = 11.5, Margin = new Thickness(0, 2, 0, 0), TextWrapping = TextWrapping.Wrap };
+        SetRef(s, TextBlock.ForegroundProperty, "Muted");
+        sp.Children.Add(t); sp.Children.Add(s);
+        var b = new Button { Content = sp, HorizontalContentAlignment = HorizontalAlignment.Left, Margin = new Thickness(0, 3, 0, 3), Padding = new Thickness(11, 8, 11, 9), BorderThickness = new Thickness(1), Cursor = Cursors.Hand };
+        SetRef(b, BackgroundProperty, "PanelAlt");
+        SetRef(b, Control.BorderBrushProperty, _deleteMode == mode ? "Accent" : "Border");
+        var cc = c;
+        b.Click += delegate { _deleteMode = mode; SaveDeleteMode(mode); HideBanner(); ExecuteDelete(cc, mode); };
+        return b;
+    }
+
+    void ExecuteDelete(Conversation c, int mode)
+    {
+        var url = c.ConvUrl;
+        DeleteLocal(c);
+        if (mode == 1) { Toast("ローカルから削除しました（Copilot 側は残しています）。"); return; }
+        if (mode == 2)
+        {
+            if (!string.IsNullOrEmpty(url)) new Thread((ThreadStart)delegate { try { HttpGet("/switch?url=" + Uri.EscapeDataString(url)); } catch { } }) { IsBackground = true }.Start();
+            Toast("Copilot で開きました。Copilot 上で会話を削除してください。");
+            return;
+        }
+        // mode 3: best-effort auto, fall back to "open in Copilot"
+        if (string.IsNullOrEmpty(url)) { Toast("Copilot 会話 URL 不明のため、ローカルのみ削除しました。"); return; }
+        new Thread((ThreadStart)delegate
+        {
+            bool ok = false;
+            try { var j = HttpGet("/delete?url=" + Uri.EscapeDataString(url)); ok = j != null && j.Contains("\"ok\": true"); } catch { }
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                if (ok) Toast("Copilot 会話も自動削除しました。");
+                else
+                {
+                    Toast("自動削除はできませんでした。Copilot で開きます（手動で削除してください）。");
+                    new Thread((ThreadStart)delegate { try { HttpGet("/switch?url=" + Uri.EscapeDataString(url)); } catch { } }) { IsBackground = true }.Start();
+                }
+            }));
+        }) { IsBackground = true }.Start();
+    }
+
+    void Toast(string text)
+    {
+        var tb = new TextBlock { Text = text, FontSize = 12, TextAlignment = TextAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 10, 0, 4), TextWrapping = TextWrapping.Wrap };
+        SetRef(tb, TextBlock.ForegroundProperty, "Muted");
+        _messages.Children.Add(tb);
+        _scroll.ScrollToEnd();
     }
 
     // ── message rendering (Claude-like: user bubble, assistant plain) ───────────
