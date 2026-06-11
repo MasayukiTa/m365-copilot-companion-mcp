@@ -29,9 +29,10 @@ class Msg { public string Role; public string Text; public Msg(string r, string 
 class Conversation
 {
     public string Id = Guid.NewGuid().ToString("N").Substring(0, 12);
-    public string Title = "新しいチャット";
+    public string Title = "";        // empty = untitled (shows the localized default)
     public string ConvUrl = "";
     public List<Msg> Messages = new List<Msg>();
+    public bool Untitled() { return string.IsNullOrEmpty(Title); }
 }
 
 class ChatWindow : Window
@@ -51,9 +52,39 @@ class ChatWindow : Window
     List<Conversation> _all = new List<Conversation>();
     string _renamingId = null;
     int _deleteMode = 1;                 // 1=local only, 2=open in Copilot, 3=auto (experimental)
+    int _lang = 0;                       // 0=Japanese, 1=English
     Border _banner; StackPanel _bannerBody;
+    Button _newBtn, _themeBtn, _langBtn;
     static readonly string SettingsFile = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "copilot-bridge", "settings.txt");
+
+    string T(string k)
+    {
+        bool ja = _lang == 0;
+        if (k == "newchat") return ja ? "新しいチャット" : "New chat";
+        if (k == "newchat_btn") return ja ? "＋   新しいチャット" : "＋   New chat";
+        if (k == "send") return ja ? "送信" : "Send";
+        if (k == "theme") return (_dark ? "☀" : "☾") + (ja ? "   テーマ (ダーク/ライト)" : "   Theme (dark/light)");
+        if (k == "lang") return ja ? "🌐   English へ" : "🌐   日本語へ";
+        if (k == "rename") return ja ? "名前を変更" : "Rename";
+        if (k == "delete") return ja ? "削除" : "Delete";
+        if (k == "generating") return ja ? "生成中" : "Generating";
+        if (k == "cancel") return ja ? "キャンセル" : "Cancel";
+        if (k == "del_head") return ja ? "を削除 — 方法を選んでください" : " — choose how to delete";
+        if (k == "m1t") return ja ? "このアプリからのみ削除" : "Delete from this app only";
+        if (k == "m1s") return ja ? "Copilot 側の会話は残す（最も安全）" : "Keeps the Copilot conversation (safest)";
+        if (k == "m2t") return ja ? "Copilot で開いて手動削除" : "Open in Copilot to delete manually";
+        if (k == "m2s") return ja ? "その会話を Copilot で開く。1クリックで削除" : "Opens it in Copilot; delete it there in one click";
+        if (k == "m3t") return ja ? "Copilot 会話も自動削除（実験的）" : "Also auto-delete the Copilot conversation (experimental)";
+        if (k == "m3s") return ja ? "失敗時は自動で「Copilot で開く」に切替" : "Falls back to 'open in Copilot' on failure";
+        if (k == "del_note") return (ja ? "選んだ方法が次回の既定になります（現在: モード " : "Your choice becomes the default (current: mode ") + _deleteMode + "）";
+        if (k == "t_local") return ja ? "ローカルから削除しました（Copilot 側は残しています）。" : "Deleted locally (kept on the Copilot side).";
+        if (k == "t_open") return ja ? "Copilot で開きました。Copilot 上で会話を削除してください。" : "Opened in Copilot. Delete the conversation there.";
+        if (k == "t_nourl") return ja ? "Copilot 会話 URL 不明のため、ローカルのみ削除しました。" : "No Copilot URL; deleted locally only.";
+        if (k == "t_auto_ok") return ja ? "Copilot 会話も自動削除しました。" : "Auto-deleted the Copilot conversation too.";
+        if (k == "t_auto_fail") return ja ? "自動削除はできませんでした。Copilot で開きます（手動で削除してください）。" : "Auto-delete failed. Opening in Copilot (delete it manually).";
+        return k;
+    }
 
     // streaming state
     Panel _pendingContent;   // holds the typing dots, then the streamed text
@@ -68,6 +99,7 @@ class ChatWindow : Window
         SetRef(this, BackgroundProperty, "Bg");
         ApplyTheme();
         AddButtonStyle();
+        LoadSettings();
 
         var root = new Grid();
         root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(260) });
@@ -80,19 +112,24 @@ class ChatWindow : Window
         side.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         SetRef(side, BackgroundProperty, "PanelAlt");
 
-        var newBtn = Btn("＋   新しいチャット", "Panel", "Fg", true);
-        newBtn.Height = 40; newBtn.Margin = new Thickness(12, 14, 12, 8); newBtn.FontWeight = FontWeights.SemiBold;
-        newBtn.Click += delegate { NewChat(); };
-        Grid.SetRow(newBtn, 0); side.Children.Add(newBtn);
+        _newBtn = Btn(T("newchat_btn"), "Panel", "Fg", true);
+        _newBtn.Height = 40; _newBtn.Margin = new Thickness(12, 14, 12, 8); _newBtn.FontWeight = FontWeights.SemiBold;
+        _newBtn.Click += delegate { NewChat(); };
+        Grid.SetRow(_newBtn, 0); side.Children.Add(_newBtn);
 
         _convList = new StackPanel { Margin = new Thickness(8, 4, 8, 4) };
         var convScroll = new ScrollViewer { Content = _convList, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
         Grid.SetRow(convScroll, 1); side.Children.Add(convScroll);
 
-        var themeBtn = Btn("☀   テーマ切替 (ダーク/ライト)", "Panel", "Muted", true);
-        themeBtn.Height = 36; themeBtn.Margin = new Thickness(12, 8, 12, 12); themeBtn.FontSize = 12;
-        themeBtn.Click += delegate { _dark = !_dark; ApplyTheme(); themeBtn.Content = (_dark ? "☀" : "☾") + "   テーマ切替 (ダーク/ライト)"; };
-        Grid.SetRow(themeBtn, 2); side.Children.Add(themeBtn);
+        var bottom = new StackPanel { Margin = new Thickness(12, 8, 12, 12) };
+        _langBtn = Btn(T("lang"), "Panel", "Muted", true);
+        _langBtn.Height = 34; _langBtn.Margin = new Thickness(0, 0, 0, 6); _langBtn.FontSize = 12;
+        _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveSettings(); UpdateChrome(); RefreshConvList(); };
+        _themeBtn = Btn(T("theme"), "Panel", "Muted", true);
+        _themeBtn.Height = 34; _themeBtn.FontSize = 12;
+        _themeBtn.Click += delegate { _dark = !_dark; ApplyTheme(); _themeBtn.Content = T("theme"); };
+        bottom.Children.Add(_langBtn); bottom.Children.Add(_themeBtn);
+        Grid.SetRow(bottom, 2); side.Children.Add(bottom);
 
         var sideBorder = new Border { Child = side, BorderThickness = new Thickness(0, 0, 1, 0) };
         SetRef(sideBorder, Border.BorderBrushProperty, "Border");
@@ -134,7 +171,7 @@ class ChatWindow : Window
         _input.PreviewKeyDown += delegate (object s, KeyEventArgs e)
         { if (e.Key == Key.Enter && (Keyboard.Modifiers & ModifierKeys.Shift) == 0) { e.Handled = true; DoSend(); } };
         Grid.SetColumn(_input, 0); bar.Children.Add(_input);
-        _send = Btn("送信", "Accent", "AccentFg", false);
+        _send = Btn(T("send"), "Accent", "AccentFg", false);
         _send.Width = 92; _send.Margin = new Thickness(8, 0, 0, 0); _send.FontWeight = FontWeights.SemiBold; _send.MinHeight = 50;
         _send.Click += delegate { DoSend(); };
         Grid.SetColumn(_send, 1); bar.Children.Add(_send);
@@ -143,7 +180,6 @@ class ChatWindow : Window
         Grid.SetRow(barBorder, 2); main.Children.Add(barBorder);
 
         // delete-mode banner (overlays the top of the message area)
-        _deleteMode = LoadDeleteMode();
         _banner = new Border
         {
             Visibility = Visibility.Collapsed, VerticalAlignment = VerticalAlignment.Top,
@@ -209,6 +245,7 @@ class ChatWindow : Window
             Set("Border", "#334155"); Set("Fg", "#e2e8f0"); Set("Muted", "#94a3b8");
             Set("UserBg", "#334155"); Set("Accent", "#ea580c"); Set("AccentFg", "#ffffff");
             Set("Hover", "#26ffffff"); Set("Press", "#3dffffff");   // translucent white overlay
+            Set("CodeBg", "#0b1220");
         }
         else
         {
@@ -216,6 +253,7 @@ class ChatWindow : Window
             Set("Border", "#e2e8f0"); Set("Fg", "#0f172a"); Set("Muted", "#64748b");
             Set("UserBg", "#eef2f7"); Set("Accent", "#ea580c"); Set("AccentFg", "#ffffff");
             Set("Hover", "#18000000"); Set("Press", "#2b000000");   // translucent black overlay
+            Set("CodeBg", "#f1f5f9");
         }
     }
 
@@ -246,17 +284,18 @@ class ChatWindow : Window
             var rowGrid = new Grid();
             rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var dt = cc.Untitled() ? T("newchat") : cc.Title;
             var b = new Button
             {
-                Content = cc.Title.Length > 26 ? cc.Title.Substring(0, 26) + "…" : cc.Title,
+                Content = dt.Length > 26 ? dt.Substring(0, 26) + "…" : dt,
                 HorizontalContentAlignment = HorizontalAlignment.Left, Height = 36,
                 Padding = new Thickness(9, 0, 9, 0), BorderThickness = new Thickness(0), Cursor = Cursors.Hand,
                 Background = Brushes.Transparent, FontSize = 13,
-                FontWeight = cc.Id == _conv.Id ? FontWeights.SemiBold : FontWeights.Normal, ToolTip = cc.Title
+                FontWeight = cc.Id == _conv.Id ? FontWeights.SemiBold : FontWeights.Normal, ToolTip = dt
             };
             SetRef(b, ForegroundProperty, cc.Id == _conv.Id ? "Fg" : "Muted");
             b.Click += delegate { OpenConversation(cc); };
-            var miR = new MenuItem { Header = "名前を変更" };   // rename stays on right-click
+            var miR = new MenuItem { Header = T("rename") };   // rename stays on right-click
             miR.Click += delegate { _renamingId = cc.Id; RefreshConvList(); };
             var menu = new ContextMenu(); menu.Items.Add(miR); b.ContextMenu = menu;
             Grid.SetColumn(b, 0); rowGrid.Children.Add(b);
@@ -265,13 +304,14 @@ class ChatWindow : Window
             {
                 Content = "", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 13,
                 Width = 32, Height = 36, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
-                Cursor = Cursors.Hand, Visibility = Visibility.Hidden, ToolTip = "削除"
+                Cursor = Cursors.Hand, Visibility = Visibility.Hidden, ToolTip = T("delete")
             };
             SetRef(trash, ForegroundProperty, "Muted");
             trash.Click += delegate { ShowDeleteBanner(cc); };
             Grid.SetColumn(trash, 1); rowGrid.Children.Add(trash);
             rowBorder.Child = rowGrid;
-            rowBorder.MouseEnter += delegate { trash.Visibility = Visibility.Visible; };
+            // empty/untitled new chat is not a deletable target -> never reveal its trash
+            rowBorder.MouseEnter += delegate { if (cc.Messages.Count > 0) trash.Visibility = Visibility.Visible; };
             rowBorder.MouseLeave += delegate { trash.Visibility = Visibility.Hidden; };
             _convList.Children.Add(rowBorder);
         }
@@ -310,34 +350,47 @@ class ChatWindow : Window
     }
 
     // ── delete-mode banner (3 choices, like Claude Code's modes) ────────────────
-    int LoadDeleteMode()
+    void LoadSettings()
     {
-        try { foreach (var ln in File.ReadAllLines(SettingsFile)) if (ln.StartsWith("deletemode=")) return int.Parse(ln.Substring(11).Trim()); }
+        try
+        {
+            if (!File.Exists(SettingsFile)) return;
+            foreach (var ln in File.ReadAllLines(SettingsFile))
+            {
+                int v;
+                if (ln.StartsWith("deletemode=") && int.TryParse(ln.Substring(11).Trim(), out v)) _deleteMode = v;
+                else if (ln.StartsWith("lang=") && int.TryParse(ln.Substring(5).Trim(), out v)) _lang = v;
+            }
+        }
         catch { }
-        return 1;
     }
-    void SaveDeleteMode(int m)
+    void SaveSettings()
     {
-        try { Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile)); File.WriteAllText(SettingsFile, "deletemode=" + m + "\n", Encoding.UTF8); }
+        try { Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile)); File.WriteAllText(SettingsFile, "deletemode=" + _deleteMode + "\nlang=" + _lang + "\n", Encoding.UTF8); }
         catch { }
+    }
+    void UpdateChrome()
+    {
+        _newBtn.Content = T("newchat_btn"); _themeBtn.Content = T("theme"); _langBtn.Content = T("lang"); _send.Content = T("send");
     }
     void HideBanner() { _banner.Visibility = Visibility.Collapsed; }
 
     void ShowDeleteBanner(Conversation c)
     {
         _bannerBody.Children.Clear();
-        var title = c.Title.Length > 24 ? c.Title.Substring(0, 24) + "…" : c.Title;
-        var head = new TextBlock { Text = "「" + title + "」を削除 — 方法を選んでください", FontWeight = FontWeights.SemiBold, FontSize = 13.5, Margin = new Thickness(0, 0, 0, 10), TextWrapping = TextWrapping.Wrap };
+        var raw = c.Untitled() ? T("newchat") : c.Title;
+        var title = raw.Length > 24 ? raw.Substring(0, 24) + "…" : raw;
+        var head = new TextBlock { Text = (_lang == 0 ? "「" + title + "」" : "\"" + title + "\"") + T("del_head"), FontWeight = FontWeights.SemiBold, FontSize = 13.5, Margin = new Thickness(0, 0, 0, 10), TextWrapping = TextWrapping.Wrap };
         SetRef(head, TextBlock.ForegroundProperty, "Fg");
         _bannerBody.Children.Add(head);
-        _bannerBody.Children.Add(ModeButton(c, 1, "このアプリからのみ削除", "Copilot 側の会話は残す（最も安全）"));
-        _bannerBody.Children.Add(ModeButton(c, 2, "Copilot で開いて手動削除", "その会話を Copilot で開く。1クリックで削除"));
-        _bannerBody.Children.Add(ModeButton(c, 3, "Copilot 会話も自動削除（実験的）", "失敗時は自動で「Copilot で開く」に切替"));
-        var foot = new DockPanel { Margin = new Thickness(0, 8, 0, 0) };
-        var note = new TextBlock { Text = "選んだ方法が次回の既定になります（現在: モード " + _deleteMode + "）", FontSize = 11.5, VerticalAlignment = VerticalAlignment.Center };
+        _bannerBody.Children.Add(ModeButton(c, 1, T("m1t"), T("m1s")));
+        _bannerBody.Children.Add(ModeButton(c, 2, T("m2t"), T("m2s")));
+        _bannerBody.Children.Add(ModeButton(c, 3, T("m3t"), T("m3s")));
+        var foot = new DockPanel { Margin = new Thickness(0, 10, 0, 0) };
+        var note = new TextBlock { Text = T("del_note"), FontSize = 11.5, VerticalAlignment = VerticalAlignment.Center, TextWrapping = TextWrapping.Wrap };
         SetRef(note, TextBlock.ForegroundProperty, "Muted");
-        var cancel = new Button { Content = "キャンセル", BorderThickness = new Thickness(0), Background = Brushes.Transparent, Cursor = Cursors.Hand, FontSize = 12.5, Padding = new Thickness(6, 2, 6, 2) };
-        SetRef(cancel, ForegroundProperty, "Muted");
+        var cancel = new Button { Content = T("cancel"), BorderThickness = new Thickness(1), Cursor = Cursors.Hand, FontSize = 12.5, Padding = new Thickness(16, 5, 16, 6), FontWeight = FontWeights.SemiBold };
+        SetRef(cancel, BackgroundProperty, "PanelAlt"); SetRef(cancel, ForegroundProperty, "Fg"); SetRef(cancel, Control.BorderBrushProperty, "Border");
         cancel.Click += delegate { HideBanner(); };
         DockPanel.SetDock(cancel, Dock.Right);
         foot.Children.Add(cancel); foot.Children.Add(note);
@@ -348,7 +401,7 @@ class ChatWindow : Window
     Button ModeButton(Conversation c, int mode, string title, string sub)
     {
         var sp = new StackPanel();
-        var t = new TextBlock { Text = mode + ". " + title, FontWeight = FontWeights.SemiBold, FontSize = 13 };
+        var t = new TextBlock { Text = mode + ". " + title, FontWeight = FontWeights.SemiBold, FontSize = 13, TextWrapping = TextWrapping.Wrap };
         SetRef(t, TextBlock.ForegroundProperty, "Fg");
         var s = new TextBlock { Text = sub, FontSize = 11.5, Margin = new Thickness(0, 2, 0, 0), TextWrapping = TextWrapping.Wrap };
         SetRef(s, TextBlock.ForegroundProperty, "Muted");
@@ -357,7 +410,7 @@ class ChatWindow : Window
         SetRef(b, BackgroundProperty, "PanelAlt");
         SetRef(b, Control.BorderBrushProperty, _deleteMode == mode ? "Accent" : "Border");
         var cc = c;
-        b.Click += delegate { _deleteMode = mode; SaveDeleteMode(mode); HideBanner(); ExecuteDelete(cc, mode); };
+        b.Click += delegate { _deleteMode = mode; SaveSettings(); HideBanner(); ExecuteDelete(cc, mode); };
         return b;
     }
 
@@ -365,25 +418,25 @@ class ChatWindow : Window
     {
         var url = c.ConvUrl;
         DeleteLocal(c);
-        if (mode == 1) { Toast("ローカルから削除しました（Copilot 側は残しています）。"); return; }
+        if (mode == 1) { Toast(T("t_local")); return; }
         if (mode == 2)
         {
             if (!string.IsNullOrEmpty(url)) new Thread((ThreadStart)delegate { try { HttpGet("/switch?url=" + Uri.EscapeDataString(url)); } catch { } }) { IsBackground = true }.Start();
-            Toast("Copilot で開きました。Copilot 上で会話を削除してください。");
+            Toast(T("t_open"));
             return;
         }
         // mode 3: best-effort auto, fall back to "open in Copilot"
-        if (string.IsNullOrEmpty(url)) { Toast("Copilot 会話 URL 不明のため、ローカルのみ削除しました。"); return; }
+        if (string.IsNullOrEmpty(url)) { Toast(T("t_nourl")); return; }
         new Thread((ThreadStart)delegate
         {
             bool ok = false;
             try { var j = HttpGet("/delete?url=" + Uri.EscapeDataString(url)); ok = j != null && j.Contains("\"ok\": true"); } catch { }
             Dispatcher.BeginInvoke(new Action(delegate
             {
-                if (ok) Toast("Copilot 会話も自動削除しました。");
+                if (ok) Toast(T("t_auto_ok"));
                 else
                 {
-                    Toast("自動削除はできませんでした。Copilot で開きます（手動で削除してください）。");
+                    Toast(T("t_auto_fail"));
                     new Thread((ThreadStart)delegate { try { HttpGet("/switch?url=" + Uri.EscapeDataString(url)); } catch { } }) { IsBackground = true }.Start();
                 }
             }));
@@ -430,7 +483,7 @@ class ChatWindow : Window
     void AddAssistant(string text)
     {
         var content = AddAssistantContainer();
-        content.Children.Add(MakeText(text));
+        content.Children.Add(Md.Render(text));   // rendered markdown (code blocks, lists, bold, ...)
     }
 
     TextBox MakeText(string text)
@@ -463,7 +516,7 @@ class ChatWindow : Window
             tt.BeginAnimation(TranslateTransform.YProperty, anim);
             row.Children.Add(dot);
         }
-        var lbl = new TextBlock { Text = "生成中", FontSize = 12.5, Margin = new Thickness(6, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center };
+        var lbl = new TextBlock { Text = T("generating"), FontSize = 12.5, Margin = new Thickness(6, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center };
         SetRef(lbl, TextBlock.ForegroundProperty, "Muted");
         row.Children.Add(lbl);
         return row;
@@ -476,7 +529,7 @@ class ChatWindow : Window
         if (text.Length == 0 || !_send.IsEnabled) return;
         _input.Clear();
         _conv.Messages.Add(new Msg("U", text));
-        if (_conv.Title == "新しいチャット") { _conv.Title = text; }
+        if (_conv.Untitled()) { _conv.Title = text; }
         if (!_all.Contains(_conv)) { _all.Insert(0, _conv); }
         RefreshConvList();
         AddUser(text);
@@ -533,6 +586,7 @@ class ChatWindow : Window
         {
             _send.IsEnabled = true; _input.Focus();
             SetRef(_statusDot, BackgroundProperty, "Border");
+            if (answer.Length > 0) { content.Children.Clear(); content.Children.Add(Md.Render(answer)); _scroll.ScrollToEnd(); }
             _conv.Messages.Add(new Msg("A", answer));
             SaveConversation(_conv);
         }));

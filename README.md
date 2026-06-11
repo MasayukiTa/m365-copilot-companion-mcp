@@ -214,6 +214,17 @@
 
 ---
 
+## 💬 ネイティブチャット UI（Python + Edge だけ・Node 不要）
+
+Premium / Direct Line を使わず、Copilot エージェントを **手元のローカルアプリのように** 使える 2 つのフロントエンドを同梱しています。どちらも裏は同じ「ブリッジ → CDP → Copilot」経路で、別 PC の要件は **Python + Edge のみ**（Chrome も Node も不要）。
+
+- **Python ブリッジ** (`bridge/copilot_bridge.py`): stdlib の `http.server` だけで自己完結の HTML チャットを配信し、Copilot の応答を **差分スクレイピングでトークン単位ストリーミング**。`python bridge\copilot_bridge.py` → ブラウザで `http://127.0.0.1:8765`。
+- **ネイティブ WPF アプリ** (`ui/CopilotChat.cs`): Windows 同梱の `csc.exe` だけでビルドする **完全 JS フリー** のデスクトップチャット。マークダウン/コードブロック整形・ダーク/ライト・日本語/英語切替・会話履歴サイドバー（リネーム・削除）。`ui\build_and_run.bat` でビルド＆起動。
+
+![ネイティブ WPF チャット UI](docs/chat-ui.png)
+
+---
+
 ## 🚀 セットアップ（あなた個人の PC で）
 
 ### 0. 前提
