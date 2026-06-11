@@ -55,6 +55,53 @@ def _wait_composer(timeout=40):
     return False
 
 
+def _try_delete_conversation(url):
+    """Best-effort delete of the backing Copilot conversation. KNOWN LIMITATION: in
+    the agent-scoped view, the per-conversation menus surface the agent switcher,
+    not a delete -- so this commonly returns (False, reason) and the caller falls
+    back to opening the conversation for a manual delete. Honest about failure;
+    never deletes a different conversation (we only act on the active one)."""
+    if not url:
+        return False, "no url"
+    PAGE.goto(url, wait_until="domcontentloaded")
+    _wait_composer()
+    PAGE.wait_for_timeout(800)
+    # try the active conversation's own options menu, then a delete item by text
+    triggers = ['button[data-testid="overflow-menu-button"]',
+                'button[aria-label*="オプション"]', 'button[aria-label*="More actions"]',
+                'button[aria-label*="More options"]']
+    del_texts = ["会話を削除", "チャットを削除", "この会話を削除", "Delete conversation", "削除", "Delete"]
+    confirm_texts = ["削除", "Delete", "はい", "OK"]
+    for sel in triggers:
+        loc = PAGE.locator(sel)
+        if loc.count() == 0:
+            continue
+        try:
+            loc.first.click(force=True, timeout=2500)
+            PAGE.wait_for_timeout(600)
+            for txt in del_texts:
+                mi = PAGE.get_by_role("menuitem", name=txt, exact=False)
+                if mi.count() > 0:
+                    mi.first.click(timeout=2500)
+                    PAGE.wait_for_timeout(600)
+                    for ct in confirm_texts:    # confirmation dialog, if any
+                        cb = PAGE.get_by_role("button", name=ct, exact=False)
+                        if cb.count() > 0:
+                            try:
+                                cb.first.click(timeout=2000)
+                            except Exception:
+                                pass
+                            break
+                    return True, "deleted"
+            try:
+                PAGE.keyboard.press("Escape")
+            except Exception:
+                pass
+        except Exception:
+            pass
+    return False, "no per-conversation delete control in this view"
+
+
 def _is_proc(t: str) -> bool:
     t = (t or "").strip()
     return (not t) or (any(m in t for m in PROCESSING_MARKERS) and len(t) < 40)
@@ -163,6 +210,16 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json({"ok": False, "error": str(e)}); return
             self._json({"ok": ok, "url": PAGE.url})
+            return
+        if parsed.path == "/delete":       # best-effort: delete the Copilot conversation
+            if BUSY:
+                self._json({"ok": False, "error": "busy"}); return
+            url = (urllib.parse.parse_qs(parsed.query).get("url") or [""])[0]
+            try:
+                ok, reason = _try_delete_conversation(url)
+            except Exception as e:
+                ok, reason = False, str(e)
+            self._json({"ok": ok, "error": reason})
             return
         self.send_response(404)
         self.end_headers()
