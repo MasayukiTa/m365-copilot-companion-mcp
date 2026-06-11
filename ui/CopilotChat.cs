@@ -1,4 +1,4 @@
-// CopilotChat.cs -- native Windows (WPF) chat front-end for an M365 Copilot agent.
+﻿// CopilotChat.cs -- native Windows (WPF) chat front-end for an M365 Copilot agent.
 // NO Node, NO JS, NO browser engine: pure .NET (built into Windows). Talks to the
 // Python bridge's SSE endpoint over HTTP and renders the streamed answer natively.
 //
@@ -240,25 +240,40 @@ class ChatWindow : Window
                 _convList.Children.Add(ed);
                 continue;
             }
+            // row = background border (active/inactive) holding [ title | hover trash ]
+            var rowBorder = new Border { CornerRadius = new CornerRadius(7), Margin = new Thickness(0, 1, 0, 1) };
+            SetRef(rowBorder, BackgroundProperty, cc.Id == _conv.Id ? "Panel" : "PanelAlt");
+            var rowGrid = new Grid();
+            rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             var b = new Button
             {
-                Content = cc.Title.Length > 30 ? cc.Title.Substring(0, 30) + "…" : cc.Title,
-                HorizontalContentAlignment = HorizontalAlignment.Left, Height = 36, Margin = new Thickness(0, 1, 0, 1),
+                Content = cc.Title.Length > 26 ? cc.Title.Substring(0, 26) + "…" : cc.Title,
+                HorizontalContentAlignment = HorizontalAlignment.Left, Height = 36,
                 Padding = new Thickness(9, 0, 9, 0), BorderThickness = new Thickness(0), Cursor = Cursors.Hand,
-                FontSize = 13, FontWeight = cc.Id == _conv.Id ? FontWeights.SemiBold : FontWeights.Normal,
-                ToolTip = cc.Title
+                Background = Brushes.Transparent, FontSize = 13,
+                FontWeight = cc.Id == _conv.Id ? FontWeights.SemiBold : FontWeights.Normal, ToolTip = cc.Title
             };
-            SetRef(b, BackgroundProperty, cc.Id == _conv.Id ? "Panel" : "PanelAlt");
             SetRef(b, ForegroundProperty, cc.Id == _conv.Id ? "Fg" : "Muted");
             b.Click += delegate { OpenConversation(cc); };
-            var menu = new ContextMenu();
-            var miR = new MenuItem { Header = "名前を変更" };
+            var miR = new MenuItem { Header = "名前を変更" };   // rename stays on right-click
             miR.Click += delegate { _renamingId = cc.Id; RefreshConvList(); };
-            var miD = new MenuItem { Header = "削除" };
-            miD.Click += delegate { ShowDeleteBanner(cc); };
-            menu.Items.Add(miR); menu.Items.Add(miD);
-            b.ContextMenu = menu;
-            _convList.Children.Add(b);
+            var menu = new ContextMenu(); menu.Items.Add(miR); b.ContextMenu = menu;
+            Grid.SetColumn(b, 0); rowGrid.Children.Add(b);
+            // trash icon (Segoe MDL2 Assets), revealed on row hover
+            var trash = new Button
+            {
+                Content = "", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 13,
+                Width = 32, Height = 36, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
+                Cursor = Cursors.Hand, Visibility = Visibility.Hidden, ToolTip = "削除"
+            };
+            SetRef(trash, ForegroundProperty, "Muted");
+            trash.Click += delegate { ShowDeleteBanner(cc); };
+            Grid.SetColumn(trash, 1); rowGrid.Children.Add(trash);
+            rowBorder.Child = rowGrid;
+            rowBorder.MouseEnter += delegate { trash.Visibility = Visibility.Visible; };
+            rowBorder.MouseLeave += delegate { trash.Visibility = Visibility.Hidden; };
+            _convList.Children.Add(rowBorder);
         }
     }
 
