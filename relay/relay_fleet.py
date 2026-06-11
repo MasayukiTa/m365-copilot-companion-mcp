@@ -33,7 +33,7 @@ from .copilot_autopilot_relay import (
     _is_processing, default_notify,
 )
 
-TERMINAL = ("done", "stuck", "maxturns", "error")
+TERMINAL = ("done", "stuck", "maxturns", "error", "cancelled")
 # non-terminal but not yet occupying a tab; counts as "still running" for the loop.
 PENDING = "pending"
 
@@ -85,12 +85,13 @@ class RelayWorker:
     """One conversation running one goal to completion, as a non-blocking machine.
     Starts WITHOUT a tab (status 'pending'); attach() opens one, close() frees it."""
 
-    def __init__(self, goal, name, max_turns=12, dwell_s=4.0,
+    def __init__(self, goal, name, max_turns=1000, dwell_s=4.0,
                  per_turn_timeout_s=240, max_no_progress=3):
         self.page = None
         self.drv = None
         self.goal = goal
         self.name = name
+        self.conv_url = ""         # filled once the conversation gets its /conversation/<id>
         self.max_turns = max_turns
         self.dwell_s = dwell_s
         self.per_turn_timeout_s = per_turn_timeout_s
@@ -133,6 +134,25 @@ class RelayWorker:
             pass
         self.page = None
         self.drv = None
+
+    def cancel(self):
+        """User asked to stop+release this one from the cockpit. Mark terminal so the
+        loop won't reopen it, then free its tab."""
+        if self.status in TERMINAL:
+            self.close()
+            return
+        self.status, self.outcome = "cancelled", "CANCELLED"
+        self.reason = "手動で停止・タブ解放しました"
+        self.close()
+
+    def _capture_url(self):
+        try:
+            if self.page is not None:
+                u = self.page.url
+                if "/conversation/" in u:
+                    self.conv_url = u
+        except Exception:
+            pass
 
     def _begin_send(self):
         if self.turn >= self.max_turns:
@@ -178,8 +198,10 @@ class RelayWorker:
             return False                 # not attached yet; the fleet attaches it
         if self.status == "ready":
             self._begin_send()
+            self._capture_url()
             return self.status in TERMINAL
         if self.status == "waiting":
+            self._capture_url()
             if time.time() - self._t_send > self.per_turn_timeout_s:
                 self.status, self.outcome, self.reason = "stuck", "STUCK", "turn timeout"
                 return True
@@ -202,7 +224,7 @@ class RelayWorker:
         return False
 
 
-def run_relay_fleet(context, goals, agent_url, max_turns=12, poll_s=1.0,
+def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     notify=default_notify, on_tick=None, max_concurrent=None):
     """Drive len(goals) autonomous relays in parallel to completion, but never with
     more than `max_concurrent` tabs open at once (defaults to what free RAM allows).
