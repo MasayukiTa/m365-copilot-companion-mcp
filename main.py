@@ -61,6 +61,7 @@ from tools.gate_ops import (
 )
 from tools.process_ops import process_info, process_kill, process_list
 from tools.runlog_ops import runlog_append, runlog_list, runlog_read, runlog_summarize
+from tools.trace_ops import toolcalls_tail
 from tools.verify_ops import (
     verify_python,
     verify_numeric_close,
@@ -207,6 +208,8 @@ TOOLS = (
     todo_write, todo_list, todo_clear,
     # orchestration: audit/replay run-log (operator D)
     runlog_append, runlog_read, runlog_list, runlog_summarize,
+    # orchestration: tool-call trace (observability; only records when MCP_TRACE_TOOLCALLS set)
+    toolcalls_tail,
     # orchestration: human-in-the-loop gate + kill-switch (operator E)
     gate_ask, gate_poll, gate_answer, gate_list,
     stop_request, stop_check, stop_clear,

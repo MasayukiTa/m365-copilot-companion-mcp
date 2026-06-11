@@ -1,14 +1,22 @@
 from typing import Callable, Optional
 
+from .trace_ops import wrap_for_trace
+
 _REGISTERED: list[dict] = []
 
 
 def register(fn: Callable) -> Callable:
-    """Decorator that records a tool's name and first-line docstring for introspection."""
+    """Decorator that records a tool's name and first-line docstring for introspection.
+
+    Also applies the optional tool-call tracer (operator-D-adjacent observability): when
+    MCP_TRACE_TOOLCALLS is set, every invocation is logged so the relay/cockpit can show
+    a Claude-Code-style trail of what the agent actually did. The wrapper preserves the
+    function signature, so FastMCP's schema generation is unaffected; when the env flag
+    is unset (default) wrap_for_trace returns fn unchanged -- zero behaviour change."""
     doc = (fn.__doc__ or "").strip()
     summary = doc.splitlines()[0] if doc else "(no description)"
     _REGISTERED.append({"name": fn.__name__, "summary": summary})
-    return fn
+    return wrap_for_trace(fn)
 
 
 def list_my_tools(filter: Optional[str] = None) -> str:
