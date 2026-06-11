@@ -55,6 +55,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+from relay.acceptance import normalize_checks, run_all_blocking  # spec 3-3 verify gate
 from tools.gate_ops import stop_check                     # operator E: kill-switch
 from tools.memory_ops import memory_load, memory_save     # cross-session history
 from tools.runlog_ops import runlog_append, runlog_summarize  # operator D: audit
@@ -83,10 +84,13 @@ PROTOCOL = (
     "ローカルのデータファイルを専用ツールで分析させたいときは、その行に "
     "`ANALYZE: <ファイルの絶対パス> | <分析指示>` と書いてください"
     "（ただし単純な集計は自分の run_python/read_excel の方が速く確実です）。"
+    "DONE と書く前に、可能な限り自分でテストやコマンドを実際に実行して結果を確かめてください"
+    "（出力やテストが通ることを確認してから DONE と書く。こちらでも同じ検証を自動で行い、"
+    "通らなければ実際の結果を返すので、その時は修正して再度 DONE と書いてください）。"
     "各ターンの最後の行に必ず次のいずれかを書いてください: "
     "まだ続きがある場合は CONTINUE、深い調査を依頼する場合は RESEARCH: と内容、"
     "データ分析を依頼する場合は ANALYZE: と内容、"
-    "ゴール全体が完了したら DONE、行き詰まって人手が要る場合は STUCK: と理由。"
+    "ゴール全体が完了し検証も通ったら DONE、行き詰まって人手が要る場合は STUCK: と理由。"
     "まず全体を小ステップに分割し、最初のステップを実行してください。\nGoal: "
 )
 
@@ -96,6 +100,18 @@ CONTINUE_JOB = (
 )
 FIX_JOB = (
     "直前の失敗の原因を分析し、ツールで修正してから続けてください。"
+    "どうしても無理なら最後の行に STUCK: 理由 と書いてください。"
+)
+# Sent back to the agent when it reported DONE but the frame's OWN acceptance check
+# (spec 3-3 verification loop) failed. We hand it the GROUND TRUTH -- the real command
+# output -- not a vague "you might be wrong", so it fixes the actual defect. %s = detail.
+VERIFY_FIX_JOB = (
+    "あなたは DONE と報告しましたが、こちらの自動検証（ローカルで実際に実行）で不合格でした。"
+    "実際の検証結果は次のとおりです:\n"
+    "--- 検証結果 ---\n%s\n--- 検証結果ここまで ---\n"
+    "この結果を踏まえて原因を特定し、ツールで修正してください。"
+    "修正後は可能なら自分でも同じ検証を実行して通ることを確かめ、"
+    "通る状態になったら最後の行に再度 DONE と書いてください。"
     "どうしても無理なら最後の行に STUCK: 理由 と書いてください。"
 )
 NUDGE_JOB = (
@@ -343,6 +359,9 @@ def run_relay(
     backoff_step_s: float = 20.0,
     backoff_max_s: float = 300.0,
     slow_factor: float = 2.5,
+    checks=None,
+    cwd: str | None = None,
+    max_verify_attempts: int = 3,
 ) -> str:
     """Run the autonomous loop unattended. Returns one of:
     DONE | STUCK | MAXTURNS | ABORTED. Notifies on every terminal outcome.
@@ -370,6 +389,8 @@ def run_relay(
     timeouts = 0
     research_count = 0
     analyze_count = 0
+    verify_attempts = 0
+    checks_norm = normalize_checks(checks)      # spec 3-3 acceptance gate (empty -> trust DONE)
     backoff_s = 0.0          # adaptive throttle: extra cool-down added between turns
     base_elapsed = None      # fastest healthy turn so far -> the "not throttled" baseline
     last_norm = None
@@ -541,8 +562,27 @@ def run_relay(
             outcome, reason = "STUCK", "agent reported STUCK"
             break
         if "DONE" in up and "FAIL" not in last_line:
-            outcome = "DONE"
-            break
+            # spec 3-3 verification GATE: never trust a self-reported DONE when the goal
+            # carries acceptance checks. Re-derive ground truth locally; on pass, finish;
+            # on fail, hand the agent the REAL output and keep working (bounded retries).
+            if not checks_norm:
+                outcome = "DONE"
+                break
+            passed, detail = run_all_blocking(checks_norm, cwd=cwd)
+            runlog_append(run_id, {"turn": turn, "event": "verify", "passed": passed,
+                                   "attempt": verify_attempts + 1, "detail": detail[:400]})
+            print(f"[relay turn {turn}] verify {'PASS' if passed else 'FAIL'}: {detail[:120]}")
+            if passed:
+                outcome = "DONE"
+                break
+            verify_attempts += 1
+            if verify_attempts >= max_verify_attempts:
+                outcome = "STUCK"
+                reason = f"acceptance check failed {verify_attempts}x: {detail[:200]}"
+                break
+            job = VERIFY_FIX_JOB % (detail or "(no detail)")
+            time.sleep(sleep_s + backoff_s)
+            continue
         if no_progress >= max_no_progress:
             outcome, reason = "STUCK", f"no progress for {no_progress + 1} turns"
             break
@@ -600,7 +640,22 @@ def main():
                     help="Max seconds to wait for a single agent turn to finish")
     ap.add_argument("--no-research", action="store_true",
                     help="Disable RESEARCH: delegation to the Researcher agent")
+    ap.add_argument("--check", default=None,
+                    help="acceptance check(s) as JSON -- a single check object or a list. "
+                         'e.g. \'{"type":"shell","cmd":"python -m pytest -q"}\'. When set, a '
+                         "self-reported DONE is verified locally before the run is accepted "
+                         "(spec 3-3 gate); on failure the real output is fed back to the agent.")
+    ap.add_argument("--check-cwd", default=None,
+                    help="working directory the acceptance check(s) run in (default: repo)")
     args = ap.parse_args()
+
+    checks = None
+    if args.check:
+        import json
+        try:
+            checks = json.loads(args.check)
+        except Exception as e:
+            ap.error(f"--check is not valid JSON: {e}")
 
     from playwright.sync_api import sync_playwright
 
@@ -612,7 +667,8 @@ def main():
         driver = CopilotWebDriver(page)
         run_relay(driver, args.goal, args.run_id, args.max_turns,
                   per_turn_timeout_s=args.per_turn_timeout,
-                  browser_context=None if args.no_research else context)
+                  browser_context=None if args.no_research else context,
+                  checks=checks, cwd=args.check_cwd)
 
 
 if __name__ == "__main__":

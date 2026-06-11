@@ -28,9 +28,10 @@ from __future__ import annotations
 import ctypes
 import time
 
+from .acceptance import Check, normalize_checks
 from .copilot_autopilot_relay import (
     CONTINUE_JOB, COPILOT_SELECTORS, CopilotWebDriver, FIX_JOB, PROTOCOL,
-    _is_processing, default_notify,
+    VERIFY_FIX_JOB, _is_processing, default_notify,
 )
 
 TERMINAL = ("done", "stuck", "maxturns", "error", "cancelled")
@@ -104,15 +105,43 @@ def _open_fresh(context, url):
     return pg
 
 
+def goal_fields(goal):
+    """Normalize a goal into (text, checks, cwd). A goal is either a plain string
+    (no acceptance check -- legacy/back-compat) or a dict
+    {"text"|"goal": str, "check"|"checks": dict|list, "cwd": str}. This is how a
+    goal carries machine-checkable acceptance criteria into the verification gate."""
+    if isinstance(goal, dict):
+        text = goal.get("text") or goal.get("goal") or ""
+        checks = normalize_checks(goal.get("checks") or goal.get("check"))
+        cwd = goal.get("cwd") or None
+        return text, checks, cwd
+    return str(goal), [], None
+
+
 class RelayWorker:
     """One conversation running one goal to completion, as a non-blocking machine.
-    Starts WITHOUT a tab (status 'pending'); attach() opens one, close() frees it."""
+    Starts WITHOUT a tab (status 'pending'); attach() opens one, close() frees it.
+
+    Acceptance gate (spec 3-3): if the goal carries `checks`, a Copilot "DONE" does
+    NOT end the worker -- it moves to the 'verifying' state, where the frame runs the
+    checks LOCALLY (acceptance.Check). Pass -> real DONE; fail -> the actual failure is
+    re-injected and the agent keeps working, up to max_verify_attempts (then STUCK with
+    outcome VERIFY_FAILED). No checks -> DONE is accepted as before (back-compat)."""
 
     def __init__(self, goal, name, max_turns=1000, dwell_s=4.0,
-                 per_turn_timeout_s=240, max_no_progress=3):
+                 per_turn_timeout_s=240, max_no_progress=3, max_verify_attempts=3):
         self.page = None
         self.drv = None
-        self.goal = goal
+        text, checks, cwd = goal_fields(goal)
+        self.goal = text
+        self.checks = checks
+        self.cwd = cwd
+        self.max_verify_attempts = max_verify_attempts
+        self.verify_attempts = 0
+        self.verified = None          # None=not checked, True/False after a gate ran
+        self.last_verify_detail = ""
+        self._pending_checks = []     # acceptance.Check specs left to run this gate
+        self._active_check = None     # the Check currently running (non-blocking)
         self.name = name
         self.conv_url = ""         # filled once the conversation gets its /conversation/<id>
         self.steer_msgs = []       # user steering messages to inject on the next turn(s)
@@ -121,7 +150,7 @@ class RelayWorker:
         self.dwell_s = dwell_s
         self.per_turn_timeout_s = per_turn_timeout_s
         self.max_no_progress = max_no_progress
-        self.job = PROTOCOL + goal
+        self.job = PROTOCOL + self.goal
         self.turn = 0
         self.no_progress = 0
         self.last_norm = None
@@ -220,7 +249,7 @@ class RelayWorker:
             self.status, self.outcome, self.reason = "stuck", "STUCK", "agent reported STUCK"
             return
         if "DONE" in up and "FAIL" not in last_line:
-            self.status, self.outcome = "done", "DONE"
+            self._on_done_claimed()
             return
         if self.no_progress >= self.max_no_progress:
             self.status, self.outcome = "stuck", "STUCK"
@@ -236,12 +265,65 @@ class RelayWorker:
             self.job = CONTINUE_JOB
         self.status = "ready"
 
+    def _on_done_claimed(self):
+        """Copilot reported DONE. With no acceptance checks, trust it (back-compat).
+        With checks, enter the verification gate instead of finishing."""
+        if not self.checks:
+            self.status, self.outcome = "done", "DONE"
+            self.verified = False
+            return
+        self._pending_checks = list(self.checks)
+        self._active_check = None
+        self.status = "verifying"
+        self._advance_check()
+
+    def _advance_check(self):
+        """Start the next pending check, or finish the gate if all have passed."""
+        if not self._pending_checks:
+            self.status, self.outcome = "done", "DONE"
+            self.verified = True
+            self.reason = "acceptance verified (%d check(s))" % len(self.checks)
+            return
+        self._active_check = Check(self._pending_checks[0], cwd=self.cwd).start()
+
+    def _poll_verify(self):
+        """Drive the running acceptance check non-blockingly. On pass, advance to the
+        next check (all pass -> DONE). On fail, re-inject the GROUND TRUTH and let the
+        agent keep working, up to max_verify_attempts (then STUCK/VERIFY_FAILED)."""
+        if self._active_check is None:
+            self._advance_check()
+            return self.status in TERMINAL
+        r = self._active_check.poll()
+        if r is None:
+            return False                 # still running -- the other workers keep moving
+        passed, detail = r
+        self.last_verify_detail = detail
+        if passed:
+            self._pending_checks.pop(0)
+            self._active_check = None
+            self._advance_check()
+            return self.status in TERMINAL
+        self.verify_attempts += 1
+        self.verified = False
+        if self.verify_attempts >= self.max_verify_attempts:
+            self.status, self.outcome = "stuck", "VERIFY_FAILED"
+            self.reason = ("acceptance check failed %d time(s): %s"
+                           % (self.verify_attempts, (detail or "")[:200]))
+            return True
+        self.job = VERIFY_FIX_JOB % (detail or "(no detail)")
+        self._pending_checks = []
+        self._active_check = None
+        self.status = "ready"
+        return False
+
     def poll(self):
         """Advance one non-blocking step. Returns True when terminal."""
         if self.status in TERMINAL:
             return True
         if self.status == PENDING:
             return False                 # not attached yet; the fleet attaches it
+        if self.status == "verifying":
+            return self._poll_verify()
         if self.status == "ready":
             self._begin_send()
             self._capture_url()
@@ -295,7 +377,10 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                    if w.page is not None and w.status not in TERMINAL)
 
     def _unfinished():
-        return [w.goal for w in workers if w.outcome not in ("DONE", "CANCELLED")]
+        # reconstruct the full goal (incl. acceptance checks/cwd) so a resume after a
+        # wedged Edge keeps verifying -- returning bare text would drop the gate.
+        return [{"text": w.goal, "checks": w.checks, "cwd": w.cwd}
+                for w in workers if w.outcome not in ("DONE", "CANCELLED")]
 
     while any(w.status not in TERMINAL for w in workers) or (add_box and len(add_box) > 0):
         # auto-recovery: if the Edge/CDP context has died (wedged, or hard-reset by the
@@ -313,7 +398,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         if add_box:
             while add_box:
                 item = add_box.pop(0)
-                nw = RelayWorker(item.get("text", ""), "w%d" % len(workers), max_turns=max_turns)
+                # item may carry checks/cwd too; goal_fields reads them (priority ignored)
+                nw = RelayWorker(item, "w%d" % len(workers), max_turns=max_turns)
                 workers.append(nw)
                 if item.get("priority"):
                     pending.insert(0, nw)
