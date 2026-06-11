@@ -409,8 +409,10 @@ class CockpitWindow : Window
         }
     }
 
-    // ③ Codex-style: pick a folder + instruction -> folder_coder generates one goal per
-    // file -> load them into the goal box for review, then Start runs them in parallel.
+    // ③ Claude-Code-style: pick a folder + a plain-language instruction -> code_task runs
+    // it as ONE self-verifying task. It auto-detects how to verify (pytest if there is a
+    // test suite, else compile; npm test for Node) and only accepts DONE once that
+    // actually passes. No per-file fan-out, no goals to review -- you say it, it runs.
     void FolderToGoals()
     {
         try
@@ -432,36 +434,23 @@ class CockpitWindow : Window
             string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
             string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
             if (!File.Exists(py)) py = "python";
-            string outFile = Path.Combine(Path.GetDirectoryName(_statusPath), "folder_goals.txt");
+            string stateDir = Path.GetDirectoryName(_statusPath);
 
+            // code_task: natural language in, auto-verified autonomous run out. Writes the
+            // same status.json this cockpit already tails, so the task shows up live.
             var psi = new System.Diagnostics.ProcessStartInfo();
             psi.FileName = py;
-            psi.Arguments = "-m relay.folder_coder --folder \"" + folder + "\" --instruction \""
-                + instr.Replace("\"", "'") + "\" --mode per-file --out \"" + outFile + "\"";
+            psi.Arguments = "-m relay.code_task -i \"" + instr.Replace("\"", "'")
+                + "\" -f \"" + folder + "\" --state-dir \"" + stateDir + "\"";
             psi.WorkingDirectory = repo; psi.UseShellExecute = false; psi.CreateNoWindow = true;
             try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
 
             var p = new System.Diagnostics.Process();
-            p.StartInfo = psi; p.EnableRaisingEvents = true;
-            p.Exited += delegate
-            {
-                Dispatcher.BeginInvoke((Action)delegate
-                {
-                    try
-                    {
-                        if (File.Exists(outFile))
-                        {
-                            _goalInput.Text = File.ReadAllText(outFile, Encoding.UTF8).TrimEnd();
-                            _startNote.Text = _lang == 0 ? "ゴール生成完了。内容を確認して「開始」。"
-                                                         : "Goals ready. Review, then Start.";
-                        }
-                        else _startNote.Text = _lang == 0 ? "ゴール生成に失敗" : "Goal generation failed";
-                    }
-                    catch (Exception) { }
-                });
-            };
+            p.StartInfo = psi;
             p.Start();
-            _startNote.Text = _lang == 0 ? "ゴールを生成中…" : "Generating goals...";
+            _startNote.Text = _lang == 0
+                ? "コーディングタスクを開始（検証方法は自動検出。テスト/コンパイルが通るまで完了しません）。"
+                : "Coding task started (verification auto-detected; not done until tests/compile pass).";
         }
         catch (Exception ex)
         {
