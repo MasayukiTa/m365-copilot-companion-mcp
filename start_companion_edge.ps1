@@ -19,12 +19,34 @@
 
 param(
     [int]$Port = $(if ($env:MCP_CDP_PORT) { [int]$env:MCP_CDP_PORT } else { 9222 }),
-    [string]$Url = "https://m365.cloud.microsoft/chat"
+    [string]$Url = "https://m365.cloud.microsoft/chat",
+    # Recovery: kill the companion Edge and WIPE its session-restore state before
+    # launching, so wedged tabs are NOT restored. Use this when the dedicated Edge has
+    # stopped responding (CDP dead) and the fleet's attach() stalls. For a still-
+    # responsive Edge, prefer closing tabs one by one: python -m relay.edge_recover
+    [switch]$HardReset
 )
 
 $ErrorActionPreference = "Stop"
 
 $dataDir = Join-Path $env:LOCALAPPDATA "copilot-companion-edge"
+
+if ($HardReset) {
+    Write-Host "HardReset: killing companion Edge and clearing session-restore state ..."
+    Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
+        Where-Object { $_.CommandLine -match 'copilot-companion-edge' } |
+        ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {} }
+    Start-Sleep -Seconds 2
+    # Deleting these makes Edge come up clean instead of restoring the wedged tabs.
+    $def = Join-Path $dataDir "Default"
+    foreach ($n in @("Current Session", "Current Tabs", "Last Session", "Last Tabs")) {
+        $f = Join-Path $def $n
+        if (Test-Path $f) { Remove-Item $f -Force -ErrorAction SilentlyContinue }
+    }
+    $sess = Join-Path $def "Sessions"
+    if (Test-Path $sess) { Remove-Item $sess -Recurse -Force -ErrorAction SilentlyContinue }
+    Write-Host "HardReset: session state cleared."
+}
 
 # Idempotent: if something is already listening on the port, assume the companion
 # Edge is up and do nothing (avoid spawning a second instance / fighting for the port).
@@ -56,6 +78,10 @@ $arguments = @(
     "--no-first-run",
     "--no-default-browser-check",
     "--remote-allow-origins=*",
+    # suppress the "restore pages?" / crashed-session bubble so a kill+relaunch comes up
+    # clean (recovery normally closes tabs one by one via relay\edge_recover.py)
+    "--hide-crash-restore-bubble",
+    "--disable-session-crashed-bubble",
     $Url
 )
 
