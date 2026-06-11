@@ -112,6 +112,8 @@ class CockpitWindow : Window
                                    : "Not running — start with python -m relay.fleet_runner to see goals here.";
         if (k == "stale") return ja ? "更新が止まっています（フリート停止？）" : "no updates (fleet stopped?)";
         if (k == "applies_next") return ja ? "次回起動から適用" : "applies next run";
+        if (k == "start") return ja ? "並列実行を開始" : "Start parallel run";
+        if (k == "goalhint") return ja ? "1行に1ゴール（複数可）" : "One goal per line";
         return k;
     }
     string StatusLabel(string s)
@@ -280,6 +282,7 @@ class CockpitWindow : Window
 
         _headBar.Child = headRow;
         root.Children.Add(_headBar);
+        root.Children.Add(BuildInputBar());
 
         _sv = new ScrollViewer();
         _sv.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
@@ -289,6 +292,99 @@ class CockpitWindow : Window
         root.Children.Add(_sv);
         Content = root;
         PaintChrome();
+    }
+
+    TextBox _goalInput;
+    Button _startBtn;
+    TextBlock _startNote;
+
+    // ④ task-injection: type goals (one per line) and launch a fleet from here.
+    UIElement BuildInputBar()
+    {
+        _inBar = new Border();
+        _inBar.Padding = new Thickness(26, 2, 18, 10);
+        DockPanel.SetDock(_inBar, Dock.Top);
+
+        var grid = new Grid();
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        _goalInput = new TextBox();
+        _goalInput.AcceptsReturn = true; _goalInput.TextWrapping = TextWrapping.Wrap;
+        _goalInput.MinHeight = 40; _goalInput.MaxHeight = 120;
+        _goalInput.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+        _goalInput.FontSize = 13; _goalInput.Padding = new Thickness(10, 8, 10, 8);
+        _goalInput.BorderThickness = new Thickness(1);
+        _goalInput.VerticalContentAlignment = VerticalAlignment.Top;
+        Grid.SetColumn(_goalInput, 0); grid.Children.Add(_goalInput);
+
+        var rightCol = new StackPanel();
+        rightCol.Margin = new Thickness(10, 0, 0, 0);
+        _startBtn = new Button();
+        _startBtn.Cursor = Cursors.Hand; _startBtn.BorderThickness = new Thickness(0);
+        _startBtn.Height = 40; _startBtn.MinWidth = 150; _startBtn.FontWeight = FontWeights.SemiBold;
+        _startBtn.Padding = new Thickness(14, 0, 14, 0);
+        _startBtn.Click += delegate { StartFleet(); };
+        rightCol.Children.Add(_startBtn);
+        _startNote = new TextBlock();
+        _startNote.FontSize = 11; _startNote.Margin = new Thickness(2, 4, 0, 0);
+        _startNote.TextWrapping = TextWrapping.Wrap; _startNote.MaxWidth = 150;
+        rightCol.Children.Add(_startNote);
+        Grid.SetColumn(rightCol, 1); grid.Children.Add(rightCol);
+
+        _inBar.Child = grid;
+        return _inBar;
+    }
+    Border _inBar;
+
+    void StartFleet()
+    {
+        try
+        {
+            // refuse if a fleet is already running (both would write the same status.json)
+            Dictionary<string, object> st = ReadStatus();
+            if (st != null && st.ContainsKey("running") && Convert.ToBoolean(st["running"])
+                && !(st.ContainsKey("idle") && Convert.ToBoolean(st["idle"])))
+            {
+                _startNote.Text = _lang == 0 ? "実行中です。完了後に。" : "Already running.";
+                return;
+            }
+            var goals = new List<string>();
+            foreach (string ln in (_goalInput.Text ?? "").Replace("\r", "").Split('\n'))
+            {
+                string s = ln.Trim();
+                if (s.Length > 0 && !s.StartsWith("#")) goals.Add(s);
+            }
+            if (goals.Count == 0)
+            {
+                _startNote.Text = _lang == 0 ? "ゴールを入力してください。" : "Enter goals (one per line).";
+                return;
+            }
+
+            string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+            string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+            if (!File.Exists(py)) py = "python";
+            // hand the goals to the fleet via a UTF-8 file (avoids any arg-encoding issues)
+            string goalsFile = Path.Combine(Path.GetDirectoryName(_statusPath), "goals_input.txt");
+            File.WriteAllText(goalsFile, string.Join("\n", goals.ToArray()) + "\n", new UTF8Encoding(false));
+
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = py;
+            psi.Arguments = "-m relay.fleet_runner --goals-file \"" + goalsFile + "\"";
+            psi.WorkingDirectory = repo;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+            System.Diagnostics.Process.Start(psi);
+            _goalInput.Text = "";
+            _startNote.Text = (_lang == 0 ? "開始しました（" : "Started (") + goals.Count
+                              + (_lang == 0 ? " 件）" : " goals)");
+            _lastSig = "";   // force a re-render once status.json starts updating
+        }
+        catch (Exception ex)
+        {
+            _startNote.Text = (_lang == 0 ? "起動失敗: " : "Failed: ") + ex.Message;
+        }
     }
 
     ContentControl _iconHost;
@@ -352,6 +448,14 @@ class CockpitWindow : Window
         _langBtn.Content = MakeIcon("translate", 18, Fg);
         if (_maxLbl != null) _maxLbl.Foreground = Muted;
         if (_maxValue != null) _maxValue.Foreground = Fg;
+        if (_inBar != null) _inBar.Background = Bg;
+        if (_goalInput != null)
+        {
+            _goalInput.Background = BtnBg; _goalInput.Foreground = Fg;
+            _goalInput.BorderBrush = Border; _goalInput.CaretBrush = Fg;
+        }
+        if (_startBtn != null) { _startBtn.Background = Accent; _startBtn.Foreground = White; }
+        if (_startNote != null) _startNote.Foreground = Muted;
         Relabel();
     }
 
@@ -359,6 +463,9 @@ class CockpitWindow : Window
     {
         if (_maxLbl != null) _maxLbl.Text = T("maxtabs") + " (" + T("applies_next") + ")";
         if (_maxValue != null) _maxValue.Text = _maxtabs.ToString();
+        if (_startBtn != null) _startBtn.Content = T("start");
+        if (_goalInput != null) _goalInput.ToolTip = T("goalhint");
+        if (_startNote != null && string.IsNullOrEmpty(_startNote.Text)) _startNote.Text = T("goalhint");
     }
 
     void ApplyTheme()
