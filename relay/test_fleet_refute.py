@@ -42,6 +42,7 @@ class FakeSession:
     def __init__(self, context, base_url, goal, final, **kw):
         self._v = FakeSession.scripted.pop(0) if FakeSession.scripted else ("UPHELD", "")
         self._left = FakeSession.polls_until
+        self.lens = kw.get("lens", "")
 
     def start(self):
         return self
@@ -64,9 +65,10 @@ def settle(w, steps=400):
         time.sleep(0.005)
 
 
-def worker(refuter=True, max_refute=2, checks=None):
+def worker(refuter=True, max_refute=2, checks=None, review_lenses=None):
     g = {"text": "g", "checks": checks} if checks else "g"
-    w = RelayWorker(g, "w0", refuter=refuter, max_refute=max_refute)
+    w = RelayWorker(g, "w0", refuter=refuter, max_refute=max_refute,
+                    review_lenses=review_lenses)
     w._context = object()          # truthy -> refuter allowed
     w._agent_url = "https://m365.cloud.microsoft/chat/agent/T_x.y"
     return w
@@ -120,6 +122,21 @@ def main():
     w = worker(refuter=False)
     w._decide("DONE")
     check("refuter_off_immediate_done", w.status == "done" and w.outcome == "DONE")
+
+    # 6b. FLEET PANEL: three lenses run in turn; majority REFUTED -> reinject combined
+    FakeSession.scripted = [("REFUTED", "境界値"), ("REFUTED", "型不一致"), ("UPHELD", "")]
+    w = worker(review_lenses=["correctness", "edge", "security"])
+    w._decide("DONE")
+    settle(w)
+    check("fleet_panel_majority_reinject", w.status == "ready"
+          and "境界値" in w.job and "型不一致" in w.job)
+
+    # 6c. FLEET PANEL: minority refute -> upheld -> done
+    FakeSession.scripted = [("REFUTED", "x"), ("UPHELD", ""), ("UPHELD", "")]
+    w = worker(review_lenses=["correctness", "edge", "security"])
+    w._decide("DONE")
+    settle(w)
+    check("fleet_panel_minority_done", w.status == "done" and w.outcome == "DONE")
 
     # --- attach robustness ---
     class FlakyContext:

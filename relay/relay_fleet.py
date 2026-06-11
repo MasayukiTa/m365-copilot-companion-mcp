@@ -131,7 +131,7 @@ class RelayWorker:
 
     def __init__(self, goal, name, max_turns=1000, dwell_s=4.0,
                  per_turn_timeout_s=240, max_no_progress=3, max_verify_attempts=3,
-                 refuter=False, max_refute=2, plan_mode=False):
+                 refuter=False, max_refute=2, plan_mode=False, review_lenses=None):
         self.page = None
         self.drv = None
         text, checks, cwd = goal_fields(goal)
@@ -149,6 +149,11 @@ class RelayWorker:
         self.max_refute = max_refute
         self.refute_count = 0
         self._refuter_session = None
+        # review panel (operator B, perspective-diverse): a list of lenses runs one
+        # independent reviewer each, aggregated by majority. Empty = single reviewer.
+        self.review_lenses = list(review_lenses) if review_lenses else []
+        self._panel_queue = []
+        self._panel_results = []
         self._context = None          # stored at attach() so we can open the side page
         self._agent_url = ""          # bare agent URL -> a fresh independent chat
         self.name = name
@@ -326,22 +331,45 @@ class RelayWorker:
         otherwise finish now."""
         if (self.refuter and self._context is not None
                 and self.refute_count < self.max_refute):
-            from .refuter import RefuterSession
             self.refute_count += 1
-            self._refuter_session = RefuterSession(
-                self._context, self._agent_url or "", self.goal, self.last_response).start()
+            if self.review_lenses:
+                self._panel_queue = list(self.review_lenses)
+                self._panel_results = []
+                self._start_next_lens()
+            else:
+                from .refuter import RefuterSession
+                self._refuter_session = RefuterSession(
+                    self._context, self._agent_url or "", self.goal,
+                    self.last_response).start()
             self.status = "refuting"
             return
         self.status, self.outcome = "done", "DONE"
 
+    def _start_next_lens(self):
+        from .refuter import RefuterSession
+        lens = self._panel_queue.pop(0)
+        self._refuter_session = RefuterSession(
+            self._context, self._agent_url or "", self.goal,
+            self.last_response, lens=lens).start()
+
     def _poll_refute(self):
-        """Drive the non-blocking refuter. REFUTED -> feed the reason back and keep
-        working; UPHELD/UNCLEAR -> accept the DONE."""
+        """Drive the non-blocking refuter / review panel. REFUTED -> feed the reason back
+        and keep working; UPHELD/UNCLEAR -> accept. A panel runs one independent reviewer
+        per lens in turn, then aggregates by majority."""
         r = self._refuter_session.poll()
         if r is None:
             return False
         kind, reason = r
-        self._refuter_session = None
+        if self.review_lenses:
+            self._panel_results.append((self._refuter_session.lens, kind, reason))
+            self._refuter_session = None
+            if self._panel_queue:                  # consult the remaining lenses first
+                self._start_next_lens()
+                return False
+            from .refuter import aggregate_panel    # all in -> majority vote
+            kind, reason = aggregate_panel(self._panel_results)
+        else:
+            self._refuter_session = None
         # surface the verdict in status.json (reason) so the run is observable live
         self.reason = ("refuter#%d: %s%s"
                        % (self.refute_count, kind,
@@ -431,7 +459,7 @@ class RelayWorker:
 def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     notify=default_notify, on_tick=None, max_concurrent=None,
                     mc_box=None, add_box=None, refuter=False, max_refute=2,
-                    plan_mode=False):
+                    plan_mode=False, review_lenses=None):
     """Drive len(goals) autonomous relays in parallel to completion, but never with
     more than `max_concurrent` tabs open at once (defaults to what free RAM allows).
     A goal's tab is opened only when a slot frees and CLOSED the moment it finishes.
@@ -446,7 +474,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     if mc_box is None:
         mc_box = [max_concurrent]
     workers = [RelayWorker(g, "w%d" % i, max_turns=max_turns,
-                           refuter=refuter, max_refute=max_refute, plan_mode=plan_mode)
+                           refuter=refuter, max_refute=max_refute, plan_mode=plan_mode,
+                           review_lenses=review_lenses)
                for i, g in enumerate(goals)]
     pending = list(workers)            # FIFO queue of not-yet-attached workers
 
@@ -478,7 +507,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 item = add_box.pop(0)
                 # item may carry checks/cwd too; goal_fields reads them (priority ignored)
                 nw = RelayWorker(item, "w%d" % len(workers), max_turns=max_turns,
-                                 refuter=refuter, max_refute=max_refute)
+                                 refuter=refuter, max_refute=max_refute,
+                                 plan_mode=plan_mode, review_lenses=review_lenses)
                 workers.append(nw)
                 if item.get("priority"):
                     pending.insert(0, nw)
