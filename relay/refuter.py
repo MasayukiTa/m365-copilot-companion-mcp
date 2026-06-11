@@ -21,11 +21,20 @@ REFUTER_INSTRUCTION = (
     "あなたは厳格なレビュアーです。別のエージェントが下記のゴールに対して『完了(DONE)』と"
     "報告しました。あなたの仕事は、その完了を鵜呑みにせず、ゴールが本当には達成されていない"
     "具体的な理由を全力で探すことです（ゴールの読み違い、見落とされたエッジケース、症状だけ"
-    "を隠す修正、要件を実際には検証していないテスト等）。\n"
-    "判定を最後の行に必ず次の形式で書いてください:\n"
+    "を隠す修正、要件を実際には検証していないテスト等）。必要ならツール"
+    "(read_file / grep / run_python など)で実物のファイルやテストを今すぐ確認してください。\n"
+    "重要: 『確認します』『調べます』等の前置きだけで終わらせないこと。**このターン内で確認まで"
+    "済ませ、必ず回答の最後の行に判定を書く**こと。形式は次のどちらか:\n"
     "・本当に達成されていない具体的欠陥が一つでもあれば: REFUTED: <その欠陥を1〜2文で>\n"
     "・全力で探しても具体的欠陥が見つからなければ: UPHELD\n"
     "推測や些末な好みではなく、ゴール未達と言える具体的根拠のみを REFUTED の理由にしてください。"
+)
+
+# Nudge sent when the reviewer answered without a clear verdict (e.g. it only said
+# "I'll check the files"). Asks it to finish and emit the marker now.
+REFUTER_NUDGE = (
+    "確認は済みましたか。前置きは不要です。今の判定を、最後の行に "
+    "REFUTED: <理由> もしくは UPHELD の形式で必ず1行で書いてください。"
 )
 
 
@@ -74,7 +83,7 @@ def agent_base_url(conversation_url: str) -> str:
 
 def run_refuter(context, conversation_url: str, goal: str, final_response: str,
                 notify=None, runlog=None, run_id: str = "relay", turn: int = 0,
-                timeout_s: int = 600):
+                timeout_s: int = 600, max_nudges: int = 2):
     """Open an independent side-page Copilot chat and ask it to refute the claimed DONE.
     Returns (kind, reason). Never raises into the control loop -- any failure yields
     ("UNCLEAR", "") so the loop falls back to accepting the DONE. Mirrors the research/
@@ -98,9 +107,16 @@ def run_refuter(context, conversation_url: str, goal: str, final_response: str,
         drv = CopilotWebDriver(page)
         drv.send(build_refuter_prompt(goal, final_response))
         ok = drv.wait_for_idle(timeout_s=timeout_s)
-        if not ok:
-            return ("UNCLEAR", "")
-        verdict = parse_verdict(drv.read_last_response())
+        verdict = parse_verdict(drv.read_last_response()) if ok else ("UNCLEAR", "")
+        # the reviewer often answers a preamble first ("I'll check the files") -- nudge it
+        # to actually emit the verdict, like the implementer needs a CONTINUE.
+        nudges = 0
+        while verdict[0] == "UNCLEAR" and nudges < max_nudges:
+            nudges += 1
+            drv.send(REFUTER_NUDGE)
+            if not drv.wait_for_idle(timeout_s=timeout_s):
+                break
+            verdict = parse_verdict(drv.read_last_response())
     except Exception:
         verdict = ("UNCLEAR", "")
     finally:
@@ -127,19 +143,21 @@ class RefuterSession:
     send/wait state machine. Never raises; any failure yields ("UNCLEAR", "")."""
 
     def __init__(self, context, base_url, goal, final_response,
-                 dwell_s=4.0, timeout_s=600):
+                 dwell_s=4.0, timeout_s=600, max_nudges=2):
         self.context = context
         self.base_url = base_url
         self.goal = goal
         self.final = final_response
         self.dwell_s = dwell_s
         self.timeout_s = timeout_s
+        self.max_nudges = max_nudges
         self.page = None
         self.drv = None
         self._count_before = 0
         self._t_send = None
         self._last = None
         self._stable_since = None
+        self._nudges_used = 0
         self._done = None          # verdict tuple once finished
 
     def start(self):
@@ -189,7 +207,12 @@ class RefuterSession:
                 return None
             if t == self._last:
                 if self._stable_since and (time.time() - self._stable_since) >= self.dwell_s:
-                    self._finish(parse_verdict(t))
+                    verdict = parse_verdict(t)
+                    # preamble-only answer ("I'll check...") -> nudge for the verdict
+                    if verdict[0] == "UNCLEAR" and self._nudges_used < self.max_nudges:
+                        self._nudge()
+                        return None
+                    self._finish(verdict)
                     return self._done
                 return None
             self._last, self._stable_since = t, time.time()
@@ -197,6 +220,18 @@ class RefuterSession:
         except Exception:
             self._finish(("UNCLEAR", ""))
             return self._done
+
+    def _nudge(self):
+        import time
+        self._nudges_used += 1
+        try:
+            self._count_before = self.drv._answers().count()
+            self.drv._count_before = self._count_before
+            self.drv.send(REFUTER_NUDGE)
+            self._t_send = time.time()
+            self._last, self._stable_since = None, None
+        except Exception:
+            self._finish(("UNCLEAR", ""))
 
     def _finish(self, verdict):
         self._done = verdict
