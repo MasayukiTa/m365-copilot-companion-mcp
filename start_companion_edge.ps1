@@ -36,29 +36,51 @@ $ErrorActionPreference = "Stop"
 
 $dataDir = Join-Path $env:LOCALAPPDATA "copilot-companion-edge"
 
-# --- Win32 window helpers (minimize to background / surface for auth) ----------
+# --- Win32 window helpers (hide to background / surface for auth) --------------
+# Find() enumerates ALL top-level windows (including HIDDEN ones) belonging to the
+# companion Edge process -- necessary because once SW_HIDE'd the window no longer shows
+# up as Get-Process.MainWindowHandle (Windows only reports VISIBLE main windows).
 Add-Type @"
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Text;
 public class Cw {
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] static extern int GetClassName(IntPtr h, StringBuilder s, int max);
+  [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr h);
+  delegate bool EnumProc(IntPtr h, IntPtr p);
+  public static IntPtr Find(int[] pids) {
+    IntPtr found = IntPtr.Zero;
+    HashSet<int> set = new HashSet<int>(pids);
+    EnumWindows(delegate(IntPtr h, IntPtr p) {
+      uint pid; GetWindowThreadProcessId(h, out pid);
+      if (set.Contains((int)pid)) {
+        StringBuilder sb = new StringBuilder(64); GetClassName(h, sb, 64);
+        if (sb.ToString() == "Chrome_WidgetWin_1" && GetWindowTextLength(h) > 0) { found = h; return false; }
+      }
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
 }
 "@
 function Get-CompanionWindow {
-    $procs = Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
-             Where-Object { $_.CommandLine -match 'copilot-companion-edge' }
-    foreach ($pp in $procs) {
-        $pr = Get-Process -Id $pp.ProcessId -ErrorAction SilentlyContinue
-        if ($pr -and $pr.MainWindowHandle -ne [IntPtr]::Zero) { return $pr.MainWindowHandle }
-    }
-    return [IntPtr]::Zero
+    $pids = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
+              Where-Object { $_.CommandLine -match 'copilot-companion-edge' } |
+              ForEach-Object { [int]$_.ProcessId })
+    if ($pids.Count -eq 0) { return [IntPtr]::Zero }
+    return [Cw]::Find($pids)
 }
 
 if ($Surface) {
     $h = Get-CompanionWindow
     if ($h -ne [IntPtr]::Zero) {
-        [Cw]::ShowWindow($h, 9) | Out-Null    # SW_RESTORE
+        [Cw]::ShowWindow($h, 5) | Out-Null    # SW_SHOW   (un-hide)
+        [Cw]::ShowWindow($h, 9) | Out-Null    # SW_RESTORE (un-minimize + activate)
         [Cw]::SetForegroundWindow($h) | Out-Null
         Write-Host "Companion Edge brought to the foreground."
     } else {
@@ -132,30 +154,38 @@ Write-Host "  profile: $dataDir   (isolated from your main Edge)"
 Write-Host "  port:    $Port"
 Start-Process -FilePath $edge -ArgumentList $arguments | Out-Null
 
-# Wait for the CDP endpoint to come up so the caller knows it is ready.
-$deadline = (Get-Date).AddSeconds(30)
-while ((Get-Date) -lt $deadline) {
-    Start-Sleep -Milliseconds 700
-    $up = $false
-    try { $up = [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) } catch { }
-    if ($up) {
-        Write-Host ""
-        Write-Host "Ready: CDP endpoint is up on http://127.0.0.1:$Port"
-        if (-not $Foreground) {
-            # minimize to the background -- CDP keeps driving it; the user never has to
-            # look at it. It is surfaced automatically only when sign-in is required.
-            $h = [IntPtr]::Zero
-            for ($i = 0; $i -lt 10 -and $h -eq [IntPtr]::Zero; $i++) {
-                Start-Sleep -Milliseconds 400
-                $h = Get-CompanionWindow
-            }
-            if ($h -ne [IntPtr]::Zero) { [Cw]::ShowWindow($h, 6) | Out-Null }   # SW_MINIMIZE
-            Write-Host "Running in the background (minimized). Sign-in only: .\start_companion_edge.ps1 -Surface"
-        } else {
-            Write-Host "If this profile is new, sign in to M365 once in the window that opened."
-        }
-        exit 0
-    }
+function Hide-Companion {
+    if ($Foreground) { return }
+    $h = Get-CompanionWindow
+    # SW_HIDE (0) removes the window from the taskbar AND Alt-Tab entirely -- truly
+    # background, no minimized button, no orange taskbar flash. CDP still drives it.
+    if ($h -ne [IntPtr]::Zero) { [Cw]::ShowWindow($h, 0) | Out-Null }
 }
-Write-Host "Edge launched, but the CDP port did not come up within 30s. Check the Edge window."
+
+# Hide from the very first moment the window exists, and keep hiding while CDP comes up
+# so any re-show/flash during launch + initial page load is swallowed immediately.
+$deadline = (Get-Date).AddSeconds(30)
+$ready = $false
+while ((Get-Date) -lt $deadline) {
+    Hide-Companion
+    try { $ready = [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) } catch { }
+    if ($ready) { break }
+    Start-Sleep -Milliseconds 200
+}
+# M365 finishes loading after CDP is up and may re-show the window -- keep hiding a bit.
+$extra = (Get-Date).AddSeconds(5)
+while ((Get-Date) -lt $extra) { Hide-Companion; Start-Sleep -Milliseconds 250 }
+
+if ($ready) {
+    Write-Host ""
+    Write-Host "Ready: CDP endpoint is up on http://127.0.0.1:$Port"
+    if (-not $Foreground) {
+        Write-Host "Running FULLY in the background (hidden -- not in the taskbar)."
+        Write-Host "Surface for sign-in:  .\start_companion_edge.ps1 -Surface"
+    } else {
+        Write-Host "If this profile is new, sign in to M365 once in the window that opened."
+    }
+    exit 0
+}
+Write-Host "Edge launched, but the CDP port did not come up within 30s. Try -Surface."
 exit 1
