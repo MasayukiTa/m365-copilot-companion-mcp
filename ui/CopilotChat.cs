@@ -17,6 +17,7 @@ using System.Text;
 using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
@@ -193,11 +194,21 @@ class ChatWindow : Window
         SetRef(_input, Control.BorderBrushProperty, "Border");
         _input.PreviewKeyDown += delegate (object s, KeyEventArgs e)
         {
+            // slash-command autocomplete navigation (when the popup is open)
+            if (_cmdPopup != null && _cmdPopup.IsOpen && _cmdList.Items.Count > 0)
+            {
+                if (e.Key == Key.Down) { _cmdList.SelectedIndex = Math.Min(_cmdList.SelectedIndex + 1, _cmdList.Items.Count - 1); _cmdList.ScrollIntoView(_cmdList.SelectedItem); e.Handled = true; return; }
+                if (e.Key == Key.Up) { _cmdList.SelectedIndex = Math.Max(_cmdList.SelectedIndex - 1, 0); _cmdList.ScrollIntoView(_cmdList.SelectedItem); e.Handled = true; return; }
+                if (e.Key == Key.Enter || e.Key == Key.Tab) { AcceptCommand(); e.Handled = true; return; }
+                if (e.Key == Key.Escape) { _cmdPopup.IsOpen = false; e.Handled = true; return; }
+            }
             if (e.Key == Key.V && (Keyboard.Modifiers & ModifierKeys.Control) != 0 && Clipboard.ContainsImage())
             { e.Handled = true; PasteImage(); return; }
             if (e.Key == Key.Enter && (Keyboard.Modifiers & ModifierKeys.Shift) == 0) { e.Handled = true; DoSend(); }
         };
+        _input.TextChanged += delegate { UpdateCmdPopup(); };
         Grid.SetColumn(_input, 0); bar.Children.Add(_input);
+        BuildCmdPopup();
         _send = Btn(T("send"), "Accent", "AccentFg", false);
         _send.Width = 92; _send.Margin = new Thickness(8, 0, 0, 0); _send.FontWeight = FontWeights.SemiBold; _send.MinHeight = 50;
         _send.Click += delegate
@@ -383,6 +394,75 @@ class ChatWindow : Window
         return b;
     }
     void SetRef(FrameworkElement el, DependencyProperty p, string key) { el.SetResourceReference(p, key); }
+
+    // ── slash-command autocomplete (type "/" to see commands, like Claude Code) ──
+    Popup _cmdPopup; ListBox _cmdList;
+    static readonly string[][] _commands = {
+        new[]{"/help","コマンド一覧を表示"},
+        new[]{"/research","Claude researcher で深掘り調査"},
+        new[]{"/analyze","アナリストでファイルを分析"},
+        new[]{"/summarize","要約する"},
+        new[]{"/translate","翻訳: /translate <言語> <文>"},
+        new[]{"/plan","ステップ計画を作る"},
+        new[]{"/critique","批判的にレビュー"},
+        new[]{"/proofread","校正して修正版を返す"},
+        new[]{"/rewrite","文体を変えて書き直す"},
+        new[]{"/brainstorm","アイデアを10個出す"},
+        new[]{"/steps","手順に分解"},
+        new[]{"/eli5","やさしく説明"},
+        new[]{"/proscons","賛否を表で"},
+        new[]{"/table","表を作る"},
+    };
+    void BuildCmdPopup()
+    {
+        _cmdList = new ListBox { MaxHeight = 240, BorderThickness = new Thickness(0) };
+        SetRef(_cmdList, BackgroundProperty, "Panel");
+        _cmdList.PreviewMouseLeftButtonUp += delegate { AcceptCommand(); };
+        var border = new Border { Child = _cmdList, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(4) };
+        SetRef(border, BackgroundProperty, "Panel"); SetRef(border, Border.BorderBrushProperty, "Accent");
+        _cmdPopup = new Popup { PlacementTarget = _input, Placement = PlacementMode.Top, StaysOpen = false, Width = 560 };
+        _cmdPopup.Child = border;
+    }
+    ListBoxItem MakeCmdItem(string name, string desc)
+    {
+        var sp = new StackPanel { Orientation = Orientation.Horizontal };
+        var n = new TextBlock { Text = name, FontWeight = FontWeights.SemiBold, MinWidth = 110 };
+        SetRef(n, TextBlock.ForegroundProperty, "Accent");
+        var d = new TextBlock { Text = desc, Margin = new Thickness(8, 0, 0, 0) };
+        SetRef(d, TextBlock.ForegroundProperty, "Muted");
+        sp.Children.Add(n); sp.Children.Add(d);
+        return new ListBoxItem { Content = sp, Tag = name, Padding = new Thickness(6, 4, 6, 4) };
+    }
+    void UpdateCmdPopup()
+    {
+        try
+        {
+            string t = _input.Text;
+            if (t.Length >= 1 && t[0] == '/' && t.IndexOf(' ') < 0 && t.IndexOf('\n') < 0)
+            {
+                string pre = t.ToLower();
+                _cmdList.Items.Clear();
+                foreach (var c in _commands)
+                    if (c[0].StartsWith(pre)) _cmdList.Items.Add(MakeCmdItem(c[0], c[1]));
+                if (_cmdList.Items.Count > 0) { _cmdList.SelectedIndex = 0; _cmdPopup.IsOpen = true; }
+                else _cmdPopup.IsOpen = false;
+            }
+            else if (_cmdPopup != null) _cmdPopup.IsOpen = false;
+        }
+        catch { }
+    }
+    void AcceptCommand()
+    {
+        if (_cmdList.SelectedItem == null && _cmdList.Items.Count > 0) _cmdList.SelectedIndex = 0;
+        var item = _cmdList.SelectedItem as ListBoxItem;
+        if (item != null)
+        {
+            _input.Text = (item.Tag as string) + " ";
+            _input.CaretIndex = _input.Text.Length;
+        }
+        if (_cmdPopup != null) _cmdPopup.IsOpen = false;
+        _input.Focus();
+    }
 
     [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
     // Launch (or focus) the parallel-execution cockpit -- so the user never has to close
