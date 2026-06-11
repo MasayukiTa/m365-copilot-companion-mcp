@@ -32,6 +32,42 @@ except Exception:
     pass
 
 
+def cdp_alive(cdp_url="http://localhost:9222", timeout_ms=5000):
+    """Quick health check: can we reach the Edge over CDP? (Used by the fleet's auto-
+    recovery to tell a live Edge from a wedged/dead one.) MUST be called from a thread
+    that is NOT inside another Playwright sync call -- the sync API is not re-entrant."""
+    from playwright.sync_api import sync_playwright
+    try:
+        with sync_playwright() as p:
+            b = p.chromium.connect_over_cdp(cdp_url, timeout=timeout_ms)
+            _ = b.contexts
+            try:
+                b.close()
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
+def hard_reset(port=9222, wait=True):
+    """Kill the companion Edge, wipe its session-restore state, relaunch -- by invoking
+    start_companion_edge.ps1 -HardReset (the verified path). Safe to call from a thread:
+    it shells out to PowerShell and touches NO Playwright. Returns True on success."""
+    import subprocess
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ps1 = os.path.join(repo, "start_companion_edge.ps1")
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
+             "-HardReset", "-Port", str(port)],
+            cwd=repo, timeout=120 if wait else 5,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+
 def close_all_tabs(cdp_url="http://localhost:9222", connect_timeout_ms=8000,
                    open_url=None):
     """Close every tab of the Edge at `cdp_url`, one by one, leaving exactly one fresh
