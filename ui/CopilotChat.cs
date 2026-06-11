@@ -73,6 +73,11 @@ class ChatWindow : Window
         if (k == "cancel") return ja ? "キャンセル" : "Cancel";
         if (k == "copy") return ja ? "コピー" : "Copy";
         if (k == "stop") return ja ? "停止" : "Stop";
+        if (k == "fleet_queued") return ja ? "⏳ 並列実行が満杯のため待機列に追加しました（空き枠で実行）。先頭に ! を付けると強制優先。" : "⏳ Fleet is full — queued (runs when a slot frees). Prefix ! to force priority.";
+        if (k == "fleet_forced") return ja ? "⏳ 強制優先で待機列の先頭に追加しました。" : "⏳ Forced to the front of the queue.";
+        if (k == "router_q") return ja ? "🔍 これは調査向きの依頼です。researcher で深掘りしますか？" : "🔍 This looks like research. Run it on the researcher?";
+        if (k == "router_research") return ja ? "researcher で深掘り" : "Deep research";
+        if (k == "router_normal") return ja ? "そのまま送信" : "Send as-is";
         if (k == "fleetview") return ja ? "並列タスクの会話" : "Parallel task";
         if (k == "fleetview_note") return ja ? "▼ 並列タスクの会話を表示中。ここに入力すると、この会話に割り込めます。" : "▼ Viewing a parallel-task conversation. Type here to steer it.";
         if (k == "del_head") return ja ? "を削除 — 方法を選んでください" : " — choose how to delete";
@@ -187,7 +192,10 @@ class ChatWindow : Window
             else DoSend();
         };
         Grid.SetColumn(_send, 1); bar.Children.Add(_send);
-        var barBorder = new Border { Child = bar, BorderThickness = new Thickness(0, 1, 0, 0) };
+        var barStack = new StackPanel { MaxWidth = 760, HorizontalAlignment = HorizontalAlignment.Center };
+        barStack.Children.Add(BuildRouterBar());
+        barStack.Children.Add(bar);
+        var barBorder = new Border { Child = barStack, BorderThickness = new Thickness(0, 1, 0, 0) };
         SetRef(barBorder, Border.BorderBrushProperty, "Border");
         Grid.SetRow(barBorder, 2); main.Children.Add(barBorder);
 
@@ -639,7 +647,37 @@ class ChatWindow : Window
     {
         var text = _input.Text.Trim();
         if (text.Length == 0 || !_send.IsEnabled) return;
+
+        // #3: while a fleet is at capacity, a native send would open a 4th heavy tab
+        // and blow the memory budget -> route it into the fleet queue instead. Prefix
+        // "!" forces priority (jumps the queue). Slash-commands are never rerouted.
+        int[] fs = FleetState();
+        if (fs[0] == 1 && fs[2] > 0 && fs[1] >= fs[2] && !text.StartsWith("/"))
+        {
+            bool force = text.StartsWith("!");
+            string body = force ? text.Substring(1).Trim() : text;
+            if (body.Length == 0) return;
+            _input.Clear(); HideRouter();
+            EnqueueToFleet(body, force);
+            AddUser(text);
+            AddAssistant(force ? T("fleet_forced") : T("fleet_queued"));
+            return;
+        }
+
+        // #2: research-intent auto-router -- propose the researcher (confirm, not auto,
+        // to avoid false positives), the way Claude Code surfaces a tool.
+        if (!text.StartsWith("/") && !_routerShown && DetectResearch(text))
+        {
+            ShowRouter(text);
+            return;
+        }
+        HideRouter();
         _input.Clear();
+        SendText(text);
+    }
+
+    void SendText(string text)
+    {
         _conv.Messages.Add(new Msg("U", text));
         if (_conv.Untitled()) { _conv.Title = text; }
         if (!_all.Contains(_conv)) { _all.Insert(0, _conv); }
@@ -653,6 +691,99 @@ class ChatWindow : Window
         _generating = true; _send.Content = T("stop"); _send.IsEnabled = true;   // _send now acts as Stop
         SetRef(_statusDot, BackgroundProperty, "Accent");
         new Thread((ThreadStart)delegate { Stream(text); }) { IsBackground = true }.Start();
+    }
+
+    // ── #3 fleet-aware routing ───────────────────────────────────────────────────
+    // returns [running(0/1), openTabs, maxConcurrent]
+    int[] FleetState()
+    {
+        try
+        {
+            string sp = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet", "status.json"));
+            if (!File.Exists(sp)) return new int[] { 0, 0, 0 };
+            string txt;
+            using (var fsr = new FileStream(sp, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var sr = new StreamReader(fsr, Encoding.UTF8)) txt = sr.ReadToEnd();
+            var d = _cjs.DeserializeObject(txt) as Dictionary<string, object>;
+            if (d == null) return new int[] { 0, 0, 0 };
+            bool running = d.ContainsKey("running") && Convert.ToBoolean(d["running"]);
+            bool idle = d.ContainsKey("idle") && Convert.ToBoolean(d["idle"]);
+            int open = d.ContainsKey("open_tabs") && d["open_tabs"] != null ? Convert.ToInt32(d["open_tabs"]) : 0;
+            int maxc = d.ContainsKey("max_concurrent") && d["max_concurrent"] != null ? Convert.ToInt32(d["max_concurrent"]) : 0;
+            return new int[] { (running && !idle) ? 1 : 0, open, maxc };
+        }
+        catch { return new int[] { 0, 0, 0 }; }
+    }
+
+    void EnqueueToFleet(string text, bool priority)
+    {
+        try
+        {
+            string cp = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet", "commands.json"));
+            var cmd = new Dictionary<string, object>();
+            if (File.Exists(cp))
+            {
+                try { var ex = _cjs.DeserializeObject(File.ReadAllText(cp, Encoding.UTF8)) as Dictionary<string, object>; if (ex != null) cmd = ex; } catch { }
+            }
+            var adds = new List<object>();
+            if (cmd.ContainsKey("add_goal") && cmd["add_goal"] is object[]) foreach (var o in (object[])cmd["add_goal"]) adds.Add(o);
+            var item = new Dictionary<string, object>(); item["text"] = text; item["priority"] = priority;
+            adds.Add(item);
+            cmd["add_goal"] = adds;
+            File.WriteAllText(cp, _cjs.Serialize(cmd), Encoding.UTF8);
+        }
+        catch { }
+    }
+
+    // ── #2 research-intent detection + confirm bar ───────────────────────────────
+    static readonly string[] _researchHints = {
+        "調査", "調べて", "深掘り", "リサーチ", "最新情報", "出典", "比較して", "下調べ",
+        "research", "investigate", "look up", "deep dive", "find out", "compare "
+    };
+    bool DetectResearch(string msg)
+    {
+        string m = msg.ToLower();
+        foreach (var h in _researchHints) if (m.Contains(h.ToLower())) return true;
+        return false;
+    }
+
+    Border _routerBar; bool _routerShown; string _routerText = "";
+    Button _routerResearch, _routerNormal; TextBlock _routerLbl;
+
+    UIElement BuildRouterBar()
+    {
+        _routerBar = new Border { Visibility = Visibility.Collapsed, CornerRadius = new CornerRadius(10), BorderThickness = new Thickness(1), Padding = new Thickness(12, 8, 10, 8), Margin = new Thickness(0, 0, 0, 8) };
+        SetRef(_routerBar, BackgroundProperty, "Panel"); SetRef(_routerBar, Border.BorderBrushProperty, "Accent");
+        var dp = new DockPanel();
+        var btns = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
+        DockPanel.SetDock(btns, Dock.Right);
+        _routerResearch = Btn("", "Accent", "AccentFg", false);
+        _routerResearch.Padding = new Thickness(12, 3, 12, 3); _routerResearch.FontSize = 12; _routerResearch.FontWeight = FontWeights.SemiBold;
+        _routerResearch.Click += delegate { var t = _routerText; HideRouter(); _input.Clear(); SendText("/research " + t); };
+        _routerNormal = Btn("", "Panel", "Muted", true);
+        _routerNormal.Padding = new Thickness(12, 3, 12, 3); _routerNormal.FontSize = 12; _routerNormal.Margin = new Thickness(8, 0, 0, 0);
+        _routerNormal.Click += delegate { var t = _routerText; HideRouter(); _input.Clear(); SendText(t); };
+        btns.Children.Add(_routerResearch); btns.Children.Add(_routerNormal);
+        dp.Children.Add(btns);
+        _routerLbl = new TextBlock { VerticalAlignment = VerticalAlignment.Center, FontSize = 12.5, TextWrapping = TextWrapping.Wrap };
+        SetRef(_routerLbl, TextBlock.ForegroundProperty, "Fg");
+        dp.Children.Add(_routerLbl);
+        _routerBar.Child = dp;
+        return _routerBar;
+    }
+    void ShowRouter(string text)
+    {
+        _routerText = text;
+        _routerLbl.Text = T("router_q");
+        _routerResearch.Content = T("router_research");
+        _routerNormal.Content = T("router_normal");
+        _routerBar.Visibility = Visibility.Visible;
+        _routerShown = true;
+    }
+    void HideRouter()
+    {
+        if (_routerBar != null) _routerBar.Visibility = Visibility.Collapsed;
+        _routerShown = false;
     }
 
     void Stream(string msg)
