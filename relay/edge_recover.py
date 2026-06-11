@@ -102,6 +102,40 @@ def surface(port=9222):
         return False
 
 
+def companion_edge_mb(profile_marker="copilot-companion-edge"):
+    """Total resident memory (MB) of the DEDICATED companion Edge -- isolated from the
+    user's main Edge by matching `profile_marker` (its user-data-dir) in the command line.
+    Returns 0.0 if psutil is unavailable or no matching process is found."""
+    try:
+        import psutil
+    except Exception:
+        return 0.0
+    total = 0
+    for p in psutil.process_iter(["name", "cmdline"]):
+        try:
+            nm = (p.info.get("name") or "").lower()
+            if "msedge" not in nm:
+                continue
+            cmd = " ".join(p.info.get("cmdline") or [])
+            if profile_marker in cmd:
+                total += p.memory_info().rss
+        except Exception:
+            continue
+    return total / (1024.0 * 1024.0)
+
+
+def should_recycle(edge_mb, free_mb, edge_cap_mb=1500.0, free_floor_mb=1000.0):
+    """Decide whether to hard-reset the companion Edge BEFORE a run, to keep it lean.
+    Returns (recycle: bool, reason: str). Recycle when the dedicated Edge has bloated past
+    `edge_cap_mb`, or free RAM has dropped below `free_floor_mb` (the heavy M365 SPA is
+    unreliable under pressure -- a fresh profile state stabilizes it)."""
+    if edge_mb and edge_mb > edge_cap_mb:
+        return (True, "companion Edge at %d MB (> %d cap)" % (round(edge_mb), round(edge_cap_mb)))
+    if free_mb and free_mb < free_floor_mb:
+        return (True, "only %d MB free RAM (< %d floor)" % (round(free_mb), round(free_floor_mb)))
+    return (False, "")
+
+
 def looks_like_login(url):
     u = (url or "").lower()
     return ("login.microsoftonline" in u or "login.live.com" in u
