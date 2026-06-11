@@ -35,6 +35,7 @@ from relay.relay_fleet import (  # noqa: E402
     TERMINAL, auto_concurrency, avail_phys_mb, goal_fields, run_relay_fleet,
 )
 from relay.copilot_autopilot_relay import default_notify  # noqa: E402
+from relay.refuter import PANEL_LENSES  # noqa: E402
 
 try:
     from dotenv import load_dotenv
@@ -179,6 +180,10 @@ def main():
                          "Off by default; doubles oracle cost.")
     ap.add_argument("--max-refute", type=int, default=2,
                     help="max refuter rounds per goal (default 2)")
+    ap.add_argument("--panel", action="store_true",
+                    help="review with a perspective-diverse PANEL (correctness / edge / "
+                         "security), one independent reviewer per lens, majority vote. "
+                         "Implies --refuter; ~3x the review cost.")
     ap.add_argument("--plan", action="store_true",
                     help="plan-first: each goal proposes a numbered plan and pauses for "
                          "approval (status 'awaiting'); approve or edit it with a steer to "
@@ -362,8 +367,9 @@ def main():
                                       max_turns=args.max_turns, poll_s=args.poll_s,
                                       notify=default_notify, on_tick=on_tick,
                                       max_concurrent=max_conc, mc_box=mc_box, add_box=add_box,
-                                      refuter=args.refuter, max_refute=args.max_refute,
-                                      plan_mode=args.plan)
+                                      refuter=args.refuter or args.panel,
+                                      max_refute=args.max_refute, plan_mode=args.plan,
+                                      review_lenses=(list(PANEL_LENSES) if args.panel else None))
             for r in res:
                 results_by_goal[r["goal"]] = r
             pending = []                                   # finished cleanly

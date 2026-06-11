@@ -180,11 +180,12 @@ class RefuterSession:
     send/wait state machine. Never raises; any failure yields ("UNCLEAR", "")."""
 
     def __init__(self, context, base_url, goal, final_response,
-                 dwell_s=4.0, timeout_s=600, max_nudges=2):
+                 dwell_s=4.0, timeout_s=600, max_nudges=2, lens=""):
         self.context = context
         self.base_url = base_url
         self.goal = goal
         self.final = final_response
+        self.lens = lens               # panel reviewer focus (correctness/edge/security)
         self.dwell_s = dwell_s
         self.timeout_s = timeout_s
         self.max_nudges = max_nudges
@@ -218,7 +219,7 @@ class RefuterSession:
             self.drv = CopilotWebDriver(self.page)
             self._count_before = self.drv._answers().count()
             self.drv._count_before = self._count_before
-            self.drv.send(build_refuter_prompt(self.goal, self.final))
+            self.drv.send(build_refuter_prompt(self.goal, self.final, lens=self.lens))
             self._t_send = time.time()
         except Exception:
             self._finish(("UNCLEAR", ""))
