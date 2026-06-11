@@ -21,6 +21,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Threading;
+using System.Web.Script.Serialization;
 
 class Program { [STAThread] static void Main() { new Application().Run(new ChatWindow()); } }
 
@@ -72,6 +73,8 @@ class ChatWindow : Window
         if (k == "cancel") return ja ? "キャンセル" : "Cancel";
         if (k == "copy") return ja ? "コピー" : "Copy";
         if (k == "stop") return ja ? "停止" : "Stop";
+        if (k == "fleetview") return ja ? "並列タスクの会話" : "Parallel task";
+        if (k == "fleetview_note") return ja ? "▼ 並列タスクの会話を表示中。ここに入力すると、この会話に割り込めます。" : "▼ Viewing a parallel-task conversation. Type here to steer it.";
         if (k == "del_head") return ja ? "を削除 — 方法を選んでください" : " — choose how to delete";
         if (k == "m1t") return ja ? "このアプリからのみ削除" : "Delete from this app only";
         if (k == "m1s") return ja ? "Copilot 側の会話は残す（最も安全）" : "Keeps the Copilot conversation (safest)";
@@ -206,6 +209,74 @@ class ChatWindow : Window
 
         LoadConversations();
         Loaded += delegate { _input.Focus(); };
+
+        // ① watch for the cockpit asking to open a parallel-task conversation here
+        _openPath = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet", "open.json"));
+        try { _openMtime = File.Exists(_openPath) ? File.GetLastWriteTimeUtc(_openPath).Ticks : 0; }
+        catch { _openMtime = 0; }
+        var openTimer = new DispatcherTimer();
+        openTimer.Interval = TimeSpan.FromMilliseconds(800);
+        openTimer.Tick += delegate { CheckOpenRequest(); };
+        openTimer.Start();
+    }
+
+    string _openPath; long _openMtime;
+    readonly JavaScriptSerializer _cjs = new JavaScriptSerializer();
+
+    // Poll .fleet/open.json (written by the cockpit when a card is clicked) and, when it
+    // changes, load that conversation into the main chat (view + steerable via /switch).
+    void CheckOpenRequest()
+    {
+        try
+        {
+            if (!File.Exists(_openPath)) return;
+            long m = File.GetLastWriteTimeUtc(_openPath).Ticks;
+            if (m == _openMtime) return;
+            _openMtime = m;
+            var d = _cjs.DeserializeObject(File.ReadAllText(_openPath, Encoding.UTF8)) as Dictionary<string, object>;
+            if (d == null || !d.ContainsKey("url") || d["url"] == null) return;
+            string url = d["url"].ToString();
+            if (string.IsNullOrEmpty(url)) return;
+            new Thread((ThreadStart)delegate { OpenFromFleet(url); }) { IsBackground = true }.Start();
+        }
+        catch { }
+    }
+
+    void OpenFromFleet(string url)
+    {
+        try { HttpGet("/switch?url=" + Uri.EscapeDataString(url)); } catch { }
+        var msgs = new List<Msg>();
+        try
+        {
+            string hist = HttpGet("/history?url=" + Uri.EscapeDataString(url));
+            var root = _cjs.DeserializeObject(hist) as Dictionary<string, object>;
+            if (root != null && root.ContainsKey("messages") && root["messages"] is object[])
+                foreach (object o in (object[])root["messages"])
+                {
+                    var md = o as Dictionary<string, object>;
+                    if (md == null) continue;
+                    string role = md.ContainsKey("role") && md["role"] != null ? md["role"].ToString() : "assistant";
+                    string text = md.ContainsKey("text") && md["text"] != null ? md["text"].ToString() : "";
+                    msgs.Add(new Msg(role.StartsWith("user") ? "U" : "A", text));
+                }
+        }
+        catch { }
+        Dispatcher.BeginInvoke(new Action(delegate
+        {
+            var c = new Conversation();
+            c.ConvUrl = url;
+            c.Title = T("fleetview");
+            foreach (var m in msgs) c.Messages.Add(m);
+            _conv = c;
+            if (_all.Count == 0 || _all[0].Id != c.Id) _all.Insert(0, c);
+            _messages.Children.Clear();
+            var note = new TextBlock { Text = T("fleetview_note"), TextWrapping = TextWrapping.Wrap, FontSize = 12.5, Margin = new Thickness(2, 2, 2, 10) };
+            SetRef(note, TextBlock.ForegroundProperty, "Muted");
+            _messages.Children.Add(note);
+            foreach (var m in msgs) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
+            RefreshConvList();
+            _scroll.ScrollToEnd();
+        }));
     }
 
     // ── small helpers ───────────────────────────────────────────────────────────
