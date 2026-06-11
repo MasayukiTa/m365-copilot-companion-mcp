@@ -96,3 +96,6 @@ desktop.ini
 .cache/
 
 ui/*.exe
+
+# parallel fleet live status (runtime)
+.fleet/
