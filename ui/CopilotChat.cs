@@ -4,9 +4,11 @@
 //
 //   [ this WPF app ] --HTTP/SSE--> [ Python bridge ] --CDP--> [ Copilot ]
 //
-// Design language follows the sibling app v1.1 (grayscale-first N_GRAY slate, with the
-// single E_EMPHASIS orange reserved for the primary action). Build with the C#
-// compiler that ships with Windows: ui\build_and_run.bat
+// Palette = the sibling app Design Language v1.1 (grayscale-first N_GRAY slate; the
+// single E_EMPHASIS orange #ea580c for the primary action). The waiting indicator
+// matches the sibling app's chat loader (three slate dots, animate-bounce, staggered);
+// the rest leans toward a clean, refined Claude-like layout.
+// Build with the Windows-only csc.exe (legacy C# 5): ui\build_and_run.bat
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -17,13 +19,10 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 using System.Windows.Threading;
 
-class Program
-{
-    [STAThread]
-    static void Main() { new Application().Run(new ChatWindow()); }
-}
+class Program { [STAThread] static void Main() { new Application().Run(new ChatWindow()); } }
 
 class Msg { public string Role; public string Text; public Msg(string r, string t) { Role = r; Text = t; } }
 
@@ -41,7 +40,6 @@ class ChatWindow : Window
     static readonly string StoreDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "copilot-bridge", "chats");
 
-    // ── the sibling app N_GRAY (slate) + E_EMPHASIS ────────────────────────────────
     static Color C(string hex) { return (Color)ColorConverter.ConvertFromString(hex); }
     bool _dark = true;
     StackPanel _messages, _convList;
@@ -51,24 +49,23 @@ class ChatWindow : Window
     Border _statusDot;
     Conversation _conv = new Conversation();
     List<Conversation> _all = new List<Conversation>();
+    string _renamingId = null;
 
-    // streaming/thinking state
-    TextBox _pending;
+    // streaming state
+    Panel _pendingContent;   // holds the typing dots, then the streamed text
+    TextBox _pendingText;
     volatile bool _started;
-    bool _thinking;
-    int _frame;
-    DispatcherTimer _think;
 
     public ChatWindow()
     {
         Title = "Copilot — native (WPF, no JS)";
-        Width = 1080; Height = 760;
+        Width = 1120; Height = 780;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         SetRef(this, BackgroundProperty, "Bg");
         ApplyTheme();
 
         var root = new Grid();
-        root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(248) });
+        root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(260) });
         root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
         // ── sidebar ──
@@ -78,30 +75,18 @@ class ChatWindow : Window
         side.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         SetRef(side, BackgroundProperty, "PanelAlt");
 
-        var newBtn = new Button
-        {
-            Content = "＋  新しいチャット", Height = 40, Margin = new Thickness(12, 14, 12, 8),
-            FontWeight = FontWeights.SemiBold, Cursor = Cursors.Hand, BorderThickness = new Thickness(1)
-        };
-        SetRef(newBtn, BackgroundProperty, "Panel");
-        SetRef(newBtn, ForegroundProperty, "Fg");
-        SetRef(newBtn, Control.BorderBrushProperty, "Border");
-        newBtn.Click += (s, e) => NewChat();
+        var newBtn = Btn("＋   新しいチャット", "Panel", "Fg", true);
+        newBtn.Height = 40; newBtn.Margin = new Thickness(12, 14, 12, 8); newBtn.FontWeight = FontWeights.SemiBold;
+        newBtn.Click += delegate { NewChat(); };
         Grid.SetRow(newBtn, 0); side.Children.Add(newBtn);
 
         _convList = new StackPanel { Margin = new Thickness(8, 4, 8, 4) };
         var convScroll = new ScrollViewer { Content = _convList, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
         Grid.SetRow(convScroll, 1); side.Children.Add(convScroll);
 
-        var themeBtn = new Button
-        {
-            Content = "☀  ライト / ダーク", Height = 36, Margin = new Thickness(12, 8, 12, 12),
-            Cursor = Cursors.Hand, BorderThickness = new Thickness(1)
-        };
-        SetRef(themeBtn, BackgroundProperty, "Panel");
-        SetRef(themeBtn, ForegroundProperty, "Muted");
-        SetRef(themeBtn, Control.BorderBrushProperty, "Border");
-        themeBtn.Click += (s, e) => { _dark = !_dark; ApplyTheme(); themeBtn.Content = _dark ? "☀  ライト / ダーク" : "☾  ライト / ダーク"; };
+        var themeBtn = Btn("☀   テーマ切替 (ダーク/ライト)", "Panel", "Muted", true);
+        themeBtn.Height = 36; themeBtn.Margin = new Thickness(12, 8, 12, 12); themeBtn.FontSize = 12;
+        themeBtn.Click += delegate { _dark = !_dark; ApplyTheme(); themeBtn.Content = (_dark ? "☀" : "☾") + "   テーマ切替 (ダーク/ライト)"; };
         Grid.SetRow(themeBtn, 2); side.Children.Add(themeBtn);
 
         var sideBorder = new Border { Child = side, BorderThickness = new Thickness(0, 0, 1, 0) };
@@ -114,44 +99,39 @@ class ChatWindow : Window
         main.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
         main.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
-        var headPanel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(18, 12, 18, 12) };
-        _statusDot = new Border { Width = 10, Height = 10, CornerRadius = new CornerRadius(5), Margin = new Thickness(0, 4, 8, 0) };
-        SetRef(_statusDot, BackgroundProperty, "Accent");
-        var headText = new TextBlock { Text = "Copilot  ·  native bridge (.NET WPF, no Node / no JS)", FontWeight = FontWeights.SemiBold, FontSize = 14 };
+        var headPanel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(22, 13, 22, 13) };
+        _statusDot = new Border { Width = 9, Height = 9, CornerRadius = new CornerRadius(5), Margin = new Thickness(0, 4, 9, 0) };
+        SetRef(_statusDot, BackgroundProperty, "Border");
+        var headText = new TextBlock { Text = "Copilot", FontWeight = FontWeights.SemiBold, FontSize = 14.5 };
         SetRef(headText, TextBlock.ForegroundProperty, "Fg");
         headPanel.Children.Add(_statusDot); headPanel.Children.Add(headText);
         var headBorder = new Border { Child = headPanel, BorderThickness = new Thickness(0, 0, 0, 1) };
         SetRef(headBorder, Border.BorderBrushProperty, "Border");
         Grid.SetRow(headBorder, 0); main.Children.Add(headBorder);
 
-        _messages = new StackPanel { Margin = new Thickness(18, 12, 18, 12), MaxWidth = 820, HorizontalAlignment = HorizontalAlignment.Stretch };
-        _scroll = new ScrollViewer { Content = _messages, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+        _messages = new StackPanel { Margin = new Thickness(0, 8, 0, 8), MaxWidth = 760, HorizontalAlignment = HorizontalAlignment.Center };
+        _scroll = new ScrollViewer { Content = _messages, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Padding = new Thickness(24, 4, 24, 4) };
         Grid.SetRow(_scroll, 1); main.Children.Add(_scroll);
 
-        var bar = new Grid { Margin = new Thickness(14, 10, 14, 14) };
+        var bar = new Grid { Margin = new Thickness(0, 10, 0, 16), MaxWidth = 760, HorizontalAlignment = HorizontalAlignment.Center };
         bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         _input = new TextBox
         {
-            MinHeight = 48, MaxHeight = 170, AcceptsReturn = true, TextWrapping = TextWrapping.Wrap,
-            VerticalScrollBarVisibility = ScrollBarVisibility.Auto, FontSize = 14, Padding = new Thickness(11),
-            BorderThickness = new Thickness(1), VerticalContentAlignment = VerticalAlignment.Center
+            MinHeight = 50, MaxHeight = 180, AcceptsReturn = true, TextWrapping = TextWrapping.Wrap,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto, FontSize = 14, Padding = new Thickness(13, 12, 13, 12),
+            BorderThickness = new Thickness(1), VerticalContentAlignment = VerticalAlignment.Center, MinWidth = 560
         };
         SetRef(_input, BackgroundProperty, "Panel");
         SetRef(_input, ForegroundProperty, "Fg");
         SetRef(_input, TextBox.CaretBrushProperty, "Fg");
         SetRef(_input, Control.BorderBrushProperty, "Border");
-        _input.PreviewKeyDown += (s, e) =>
+        _input.PreviewKeyDown += delegate (object s, KeyEventArgs e)
         { if (e.Key == Key.Enter && (Keyboard.Modifiers & ModifierKeys.Shift) == 0) { e.Handled = true; DoSend(); } };
         Grid.SetColumn(_input, 0); bar.Children.Add(_input);
-        _send = new Button
-        {
-            Content = "送信", Width = 92, Margin = new Thickness(8, 0, 0, 0), FontWeight = FontWeights.SemiBold,
-            BorderThickness = new Thickness(0), Cursor = Cursors.Hand
-        };
-        SetRef(_send, BackgroundProperty, "Accent");
-        SetRef(_send, ForegroundProperty, "AccentFg");
-        _send.Click += (s, e) => DoSend();
+        _send = Btn("送信", "Accent", "AccentFg", false);
+        _send.Width = 92; _send.Margin = new Thickness(8, 0, 0, 0); _send.FontWeight = FontWeights.SemiBold; _send.MinHeight = 50;
+        _send.Click += delegate { DoSend(); };
         Grid.SetColumn(_send, 1); bar.Children.Add(_send);
         var barBorder = new Border { Child = bar, BorderThickness = new Thickness(0, 1, 0, 0) };
         SetRef(barBorder, Border.BorderBrushProperty, "Border");
@@ -160,19 +140,18 @@ class ChatWindow : Window
         Grid.SetColumn(main, 1); root.Children.Add(main);
         Content = root;
 
-        _think = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(280) };
-        _think.Tick += (s, e) =>
-        {
-            if (!_thinking || _pending == null) return;
-            string[] f = { "●  ∙  ∙", "∙  ●  ∙", "∙  ∙  ●", "∙  ●  ∙" };
-            _pending.Text = "考えています   " + f[_frame++ % f.Length];
-        };
-
         LoadConversations();
-        Loaded += (s, e) => _input.Focus();
+        Loaded += delegate { _input.Focus(); };
     }
 
-    // ── theming (DynamicResource swap) ─────────────────────────────────────────
+    // ── small helpers ───────────────────────────────────────────────────────────
+    Button Btn(string content, string bg, string fg, bool bordered)
+    {
+        var b = new Button { Content = content, Cursor = Cursors.Hand, BorderThickness = new Thickness(bordered ? 1 : 0) };
+        SetRef(b, BackgroundProperty, bg); SetRef(b, ForegroundProperty, fg);
+        if (bordered) SetRef(b, Control.BorderBrushProperty, "Border");
+        return b;
+    }
     void SetRef(FrameworkElement el, DependencyProperty p, string key) { el.SetResourceReference(p, key); }
     void Set(string key, string hex) { Application.Current.Resources[key] = new SolidColorBrush(C(hex)); }
     void ApplyTheme()
@@ -180,41 +159,63 @@ class ChatWindow : Window
         if (_dark)
         {
             Set("Bg", "#0f172a"); Set("Panel", "#1e293b"); Set("PanelAlt", "#0b1220");
-            Set("Border", "#334155"); Set("Fg", "#f1f5f9"); Set("Muted", "#94a3b8");
-            Set("UserFg", "#8db0fe"); Set("Accent", "#ea580c"); Set("AccentFg", "#ffffff");
+            Set("Border", "#334155"); Set("Fg", "#e2e8f0"); Set("Muted", "#94a3b8");
+            Set("UserBg", "#334155"); Set("Accent", "#ea580c"); Set("AccentFg", "#ffffff");
         }
         else
         {
-            Set("Bg", "#f8fafc"); Set("Panel", "#ffffff"); Set("PanelAlt", "#f1f5f9");
-            Set("Border", "#cbd5e1"); Set("Fg", "#0f172a"); Set("Muted", "#475569");
-            Set("UserFg", "#3b4cc0"); Set("Accent", "#ea580c"); Set("AccentFg", "#ffffff");
+            Set("Bg", "#ffffff"); Set("Panel", "#f8fafc"); Set("PanelAlt", "#f1f5f9");
+            Set("Border", "#e2e8f0"); Set("Fg", "#0f172a"); Set("Muted", "#64748b");
+            Set("UserBg", "#eef2f7"); Set("Accent", "#ea580c"); Set("AccentFg", "#ffffff");
         }
     }
 
-    // ── conversation list (left) ────────────────────────────────────────────────
+    // ── sidebar list with rename / delete ───────────────────────────────────────
     void RefreshConvList()
     {
         _convList.Children.Clear();
         foreach (var c in _all)
         {
             var cc = c;
+            if (_renamingId == cc.Id)
+            {
+                var ed = new TextBox { Text = cc.Title, Margin = new Thickness(0, 2, 0, 2), Padding = new Thickness(7, 5, 7, 5), BorderThickness = new Thickness(1) };
+                SetRef(ed, BackgroundProperty, "Panel"); SetRef(ed, ForegroundProperty, "Fg"); SetRef(ed, Control.BorderBrushProperty, "Accent");
+                ed.Loaded += delegate { ed.Focus(); ed.SelectAll(); };
+                ed.KeyDown += delegate (object s, KeyEventArgs e)
+                {
+                    if (e.Key == Key.Enter) { cc.Title = ed.Text.Trim().Length > 0 ? ed.Text.Trim() : cc.Title; _renamingId = null; SaveConversation(cc); RefreshConvList(); }
+                    else if (e.Key == Key.Escape) { _renamingId = null; RefreshConvList(); }
+                };
+                ed.LostFocus += delegate { if (_renamingId == cc.Id) { cc.Title = ed.Text.Trim().Length > 0 ? ed.Text.Trim() : cc.Title; _renamingId = null; SaveConversation(cc); RefreshConvList(); } };
+                _convList.Children.Add(ed);
+                continue;
+            }
             var b = new Button
             {
-                Content = c.Title.Length > 26 ? c.Title.Substring(0, 26) + "…" : c.Title,
-                HorizontalContentAlignment = HorizontalAlignment.Left, Height = 34, Margin = new Thickness(0, 2, 0, 2),
-                Padding = new Thickness(8, 0, 8, 0), BorderThickness = new Thickness(0), Cursor = Cursors.Hand,
-                FontWeight = cc.Id == _conv.Id ? FontWeights.SemiBold : FontWeights.Normal
+                Content = cc.Title.Length > 30 ? cc.Title.Substring(0, 30) + "…" : cc.Title,
+                HorizontalContentAlignment = HorizontalAlignment.Left, Height = 36, Margin = new Thickness(0, 1, 0, 1),
+                Padding = new Thickness(9, 0, 9, 0), BorderThickness = new Thickness(0), Cursor = Cursors.Hand,
+                FontSize = 13, FontWeight = cc.Id == _conv.Id ? FontWeights.SemiBold : FontWeights.Normal,
+                ToolTip = cc.Title
             };
             SetRef(b, BackgroundProperty, cc.Id == _conv.Id ? "Panel" : "PanelAlt");
             SetRef(b, ForegroundProperty, cc.Id == _conv.Id ? "Fg" : "Muted");
-            b.Click += (s, e) => OpenConversation(cc);
+            b.Click += delegate { OpenConversation(cc); };
+            var menu = new ContextMenu();
+            var miR = new MenuItem { Header = "名前を変更" };
+            miR.Click += delegate { _renamingId = cc.Id; RefreshConvList(); };
+            var miD = new MenuItem { Header = "削除" };
+            miD.Click += delegate { DeleteConversation(cc); };
+            menu.Items.Add(miR); menu.Items.Add(miD);
+            b.ContextMenu = menu;
             _convList.Children.Add(b);
         }
     }
 
     void NewChat()
     {
-        new Thread(() => HttpGet("/new")) { IsBackground = true }.Start();  // reset bridge conversation
+        new Thread((ThreadStart)delegate { try { HttpGet("/new"); } catch { } }) { IsBackground = true }.Start();
         _conv = new Conversation();
         _all.Insert(0, _conv);
         _messages.Children.Clear();
@@ -226,10 +227,93 @@ class ChatWindow : Window
     {
         _conv = c;
         _messages.Children.Clear();
-        foreach (var m in c.Messages) AddBubble(m.Role == "U" ? "You" : "Copilot", m.Text, m.Role == "U");
+        foreach (var m in c.Messages) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
         RefreshConvList();
         if (!string.IsNullOrEmpty(c.ConvUrl))
-            new Thread(() => HttpGet("/switch?url=" + Uri.EscapeDataString(c.ConvUrl))) { IsBackground = true }.Start();
+            new Thread((ThreadStart)delegate { try { HttpGet("/switch?url=" + Uri.EscapeDataString(c.ConvUrl)); } catch { } }) { IsBackground = true }.Start();
+    }
+
+    void DeleteConversation(Conversation c)
+    {
+        try { var p = Path_(c.Id); if (File.Exists(p)) File.Delete(p); } catch { }
+        _all.Remove(c);
+        if (_conv.Id == c.Id)
+        {
+            if (_all.Count > 0) OpenConversation(_all[0]);
+            else { _conv = new Conversation(); _all.Add(_conv); _messages.Children.Clear(); }
+        }
+        RefreshConvList();
+    }
+
+    // ── message rendering (Claude-like: user bubble, assistant plain) ───────────
+    void AddUser(string text)
+    {
+        var tb = new TextBox
+        {
+            Text = text, IsReadOnly = true, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
+            TextWrapping = TextWrapping.Wrap, IsTabStop = false, FontFamily = new FontFamily("Segoe UI"), FontSize = 14
+        };
+        SetRef(tb, ForegroundProperty, "Fg");
+        var bubble = new Border { Child = tb, CornerRadius = new CornerRadius(14), Padding = new Thickness(14, 10, 14, 11), Margin = new Thickness(40, 10, 0, 10), HorizontalAlignment = HorizontalAlignment.Right, MaxWidth = 560 };
+        SetRef(bubble, BackgroundProperty, "UserBg");
+        _messages.Children.Add(bubble);
+        _scroll.ScrollToEnd();
+    }
+
+    // assistant: small "Copilot" label + full-width plain text (no bubble). Returns the
+    // content panel so a live turn can swap dots -> text.
+    Panel AddAssistantContainer()
+    {
+        var outer = new StackPanel { Margin = new Thickness(0, 8, 40, 14) };
+        var lbl = new TextBlock { Text = "Copilot", FontSize = 12, Margin = new Thickness(2, 0, 0, 5), FontWeight = FontWeights.SemiBold };
+        SetRef(lbl, TextBlock.ForegroundProperty, "Muted");
+        var content = new StackPanel();
+        outer.Children.Add(lbl); outer.Children.Add(content);
+        _messages.Children.Add(outer);
+        _scroll.ScrollToEnd();
+        return content;
+    }
+
+    void AddAssistant(string text)
+    {
+        var content = AddAssistantContainer();
+        content.Children.Add(MakeText(text));
+    }
+
+    TextBox MakeText(string text)
+    {
+        var tb = new TextBox
+        {
+            Text = text, IsReadOnly = true, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
+            TextWrapping = TextWrapping.Wrap, IsTabStop = false, FontFamily = new FontFamily("Segoe UI"), FontSize = 14, Padding = new Thickness(2, 0, 0, 0)
+        };
+        SetRef(tb, ForegroundProperty, "Fg");
+        return tb;
+    }
+
+    // the sibling app chat loader: three slate dots, staggered animate-bounce.
+    FrameworkElement MakeTyping()
+    {
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(2, 4, 0, 4) };
+        for (int i = 0; i < 3; i++)
+        {
+            var dot = new Border { Width = 7, Height = 7, CornerRadius = new CornerRadius(4), Margin = new Thickness(0, 0, 5, 0), VerticalAlignment = VerticalAlignment.Center };
+            SetRef(dot, BackgroundProperty, "Muted");
+            var tt = new TranslateTransform();
+            dot.RenderTransform = tt;
+            var anim = new DoubleAnimation
+            {
+                From = 3, To = -4, Duration = new Duration(TimeSpan.FromMilliseconds(420)),
+                AutoReverse = true, RepeatBehavior = RepeatBehavior.Forever,
+                BeginTime = TimeSpan.FromMilliseconds(i * 150), EasingFunction = new SineEase { EasingMode = EasingMode.EaseInOut }
+            };
+            tt.BeginAnimation(TranslateTransform.YProperty, anim);
+            row.Children.Add(dot);
+        }
+        var lbl = new TextBlock { Text = "生成中", FontSize = 12.5, Margin = new Thickness(6, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center };
+        SetRef(lbl, TextBlock.ForegroundProperty, "Muted");
+        row.Children.Add(lbl);
+        return row;
     }
 
     // ── send / stream ───────────────────────────────────────────────────────────
@@ -239,40 +323,22 @@ class ChatWindow : Window
         if (text.Length == 0 || !_send.IsEnabled) return;
         _input.Clear();
         _conv.Messages.Add(new Msg("U", text));
-        if (_conv.Title == "新しいチャット") { _conv.Title = text; RefreshConvList(); }
-        if (!_all.Contains(_conv)) { _all.Insert(0, _conv); RefreshConvList(); }
-        AddBubble("You", text, true);
-        _pending = AddBubble("Copilot", "", false);
-        _started = false; _thinking = true; _frame = 0; _think.Start();
+        if (_conv.Title == "新しいチャット") { _conv.Title = text; }
+        if (!_all.Contains(_conv)) { _all.Insert(0, _conv); }
+        RefreshConvList();
+        AddUser(text);
+        _pendingContent = AddAssistantContainer();
+        _pendingContent.Children.Add(MakeTyping());   // <- the sibling app waiting indicator, shown immediately
+        _pendingText = null; _started = false;
         _send.IsEnabled = false;
         SetRef(_statusDot, BackgroundProperty, "Accent");
-        new Thread(() => Stream(text, _pending)) { IsBackground = true }.Start();
+        new Thread((ThreadStart)delegate { Stream(text); }) { IsBackground = true }.Start();
     }
 
-    TextBox AddBubble(string who, string text, bool isUser)
-    {
-        var stack = new StackPanel();
-        var lbl = new TextBlock { Text = who, FontSize = 12, Margin = new Thickness(0, 0, 0, 4) };
-        SetRef(lbl, TextBlock.ForegroundProperty, "Muted");
-        var tb = new TextBox
-        {
-            Text = text, IsReadOnly = true, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
-            TextWrapping = TextWrapping.Wrap, IsTabStop = false,
-            FontFamily = new FontFamily(isUser ? "Segoe UI" : "Cascadia Mono, Consolas"),
-            FontSize = isUser ? 14 : 13.5
-        };
-        SetRef(tb, ForegroundProperty, isUser ? "UserFg" : "Fg");
-        stack.Children.Add(lbl); stack.Children.Add(tb);
-        var border = new Border { Child = stack, CornerRadius = new CornerRadius(10), Padding = new Thickness(13, 9, 13, 11), Margin = new Thickness(0, 6, 0, 6) };
-        SetRef(border, BackgroundProperty, "Panel");
-        _messages.Children.Add(border);
-        _scroll.ScrollToEnd();
-        return tb;
-    }
-
-    void Stream(string msg, TextBox target)
+    void Stream(string msg)
     {
         var full = new StringBuilder();
+        var content = _pendingContent;
         try
         {
             var url = _bridge + "/stream?msg=" + Uri.EscapeDataString(msg);
@@ -291,10 +357,10 @@ class ChatWindow : Window
                         if (!string.IsNullOrEmpty(d))
                         {
                             full.Append(d);
-                            Dispatcher.BeginInvoke(new Action(() =>
+                            Dispatcher.BeginInvoke(new Action(delegate
                             {
-                                if (!_started) { _started = true; _thinking = false; _think.Stop(); target.Text = ""; }
-                                target.AppendText(d); _scroll.ScrollToEnd();
+                                if (!_started) { _started = true; content.Children.Clear(); _pendingText = MakeText(""); content.Children.Add(_pendingText); }
+                                _pendingText.AppendText(d); _scroll.ScrollToEnd();
                             }));
                         }
                     }
@@ -303,22 +369,26 @@ class ChatWindow : Window
         }
         catch (Exception ex)
         {
-            Dispatcher.BeginInvoke(new Action(() => { _thinking = false; _think.Stop(); target.AppendText("\n[bridge error: " + ex.Message + "]"); }));
+            var msgErr = ex.Message;
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                content.Children.Clear(); content.Children.Add(MakeText("[bridge error: " + msgErr + "]"));
+            }));
         }
         var answer = full.ToString();
-        Dispatcher.BeginInvoke(new Action(() =>
+        Dispatcher.BeginInvoke(new Action(delegate
         {
-            _thinking = false; _think.Stop(); _send.IsEnabled = true; _input.Focus();
+            _send.IsEnabled = true; _input.Focus();
             SetRef(_statusDot, BackgroundProperty, "Border");
             _conv.Messages.Add(new Msg("A", answer));
             SaveConversation(_conv);
         }));
-        try { var j = HttpGet("/conv"); var u = ExtractField(j, "url"); if (!string.IsNullOrEmpty(u)) { _conv.ConvUrl = u; Dispatcher.BeginInvoke(new Action(() => SaveConversation(_conv))); } } catch { }
+        try { var j = HttpGet("/conv"); var u = ExtractField(j, "url"); if (!string.IsNullOrEmpty(u)) { _conv.ConvUrl = u; Dispatcher.BeginInvoke(new Action(delegate { SaveConversation(_conv); })); } } catch { }
     }
 
-    // ── persistence (manual, base64 -- no JSON lib needed) ──────────────────────
+    // ── persistence (manual base64 store) ───────────────────────────────────────
     string Path_(string id) { return Path.Combine(StoreDir, id + ".chat"); }
-    static string B64(string s) { return Convert.ToBase64String(Encoding.UTF8.GetBytes(s ?? "")); }
+    static string B64(string s) { return Convert.ToBase64String(Encoding.UTF8.GetBytes(s == null ? "" : s)); }
     static string UnB64(string s) { try { return Encoding.UTF8.GetString(Convert.FromBase64String(s)); } catch { return ""; } }
 
     void SaveConversation(Conversation c)
@@ -327,7 +397,7 @@ class ChatWindow : Window
         {
             Directory.CreateDirectory(StoreDir);
             var sb = new StringBuilder();
-            sb.Append("CONV\t").Append(c.ConvUrl ?? "").Append('\n');
+            sb.Append("CONV\t").Append(c.ConvUrl == null ? "" : c.ConvUrl).Append('\n');
             sb.Append("TITLE\t").Append(B64(c.Title)).Append('\n');
             foreach (var m in c.Messages) sb.Append(m.Role).Append('\t').Append(B64(m.Text)).Append('\n');
             File.WriteAllText(Path_(c.Id), sb.ToString(), Encoding.UTF8);
@@ -343,7 +413,7 @@ class ChatWindow : Window
             if (Directory.Exists(StoreDir))
             {
                 var files = new List<string>(Directory.GetFiles(StoreDir, "*.chat"));
-                files.Sort((a, b) => File.GetLastWriteTime(b).CompareTo(File.GetLastWriteTime(a)));
+                files.Sort(delegate (string a, string b) { return File.GetLastWriteTime(b).CompareTo(File.GetLastWriteTime(a)); });
                 foreach (var f in files)
                 {
                     var c = new Conversation { Id = Path.GetFileNameWithoutExtension(f), Messages = new List<Msg>() };
@@ -360,12 +430,11 @@ class ChatWindow : Window
             }
         }
         catch { }
-        if (_all.Count > 0) { _conv = _all[0]; foreach (var m in _conv.Messages) AddBubble(m.Role == "U" ? "You" : "Copilot", m.Text, m.Role == "U"); }
+        if (_all.Count > 0) { _conv = _all[0]; foreach (var m in _conv.Messages) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); } }
         else { _conv = new Conversation(); _all.Add(_conv); }
         RefreshConvList();
     }
 
-    // ── helpers ─────────────────────────────────────────────────────────────────
     string HttpGet(string path)
     {
         var req = (HttpWebRequest)WebRequest.Create(_bridge + path);
@@ -375,7 +444,6 @@ class ChatWindow : Window
             return sr.ReadToEnd();
     }
 
-    // pull the string value of "field" out of a small json.dumps(ensure_ascii=False) object
     static string ExtractField(string json, string field)
     {
         if (json == null) return null;
