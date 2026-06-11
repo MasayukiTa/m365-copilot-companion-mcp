@@ -67,6 +67,7 @@ class ChatWindow : Window
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         SetRef(this, BackgroundProperty, "Bg");
         ApplyTheme();
+        AddButtonStyle();
 
         var root = new Grid();
         root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(260) });
@@ -171,6 +172,34 @@ class ChatWindow : Window
         return b;
     }
     void SetRef(FrameworkElement el, DependencyProperty p, string key) { el.SetResourceReference(p, key); }
+
+    // Replace the default WPF button chrome (which forces an unreadable light-blue
+    // hover highlight) with a flat template: the button's own Background + a
+    // color-independent translucent overlay on hover/press, content always on top.
+    void AddButtonStyle()
+    {
+        const string xaml =
+            "<Style xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'" +
+            " xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' TargetType='Button'>" +
+            "<Setter Property='Template'><Setter.Value>" +
+            "<ControlTemplate TargetType='Button'>" +
+            "<Border Background='{TemplateBinding Background}' BorderBrush='{TemplateBinding BorderBrush}'" +
+            " BorderThickness='{TemplateBinding BorderThickness}' CornerRadius='7' SnapsToDevicePixels='True'>" +
+            "<Grid><Border x:Name='ov' Background='Transparent' CornerRadius='7'/>" +
+            "<ContentPresenter Margin='{TemplateBinding Padding}'" +
+            " HorizontalAlignment='{TemplateBinding HorizontalContentAlignment}'" +
+            " VerticalAlignment='{TemplateBinding VerticalContentAlignment}'/></Grid></Border>" +
+            "<ControlTemplate.Triggers>" +
+            "<Trigger Property='IsMouseOver' Value='True'>" +
+            "<Setter TargetName='ov' Property='Background' Value='{DynamicResource Hover}'/></Trigger>" +
+            "<Trigger Property='IsPressed' Value='True'>" +
+            "<Setter TargetName='ov' Property='Background' Value='{DynamicResource Press}'/></Trigger>" +
+            "<Trigger Property='IsEnabled' Value='False'><Setter Property='Opacity' Value='0.5'/></Trigger>" +
+            "</ControlTemplate.Triggers></ControlTemplate>" +
+            "</Setter.Value></Setter></Style>";
+        var style = (Style)System.Windows.Markup.XamlReader.Parse(xaml);
+        Application.Current.Resources[typeof(Button)] = style;
+    }
     void Set(string key, string hex) { Application.Current.Resources[key] = new SolidColorBrush(C(hex)); }
     void ApplyTheme()
     {
@@ -179,12 +208,14 @@ class ChatWindow : Window
             Set("Bg", "#0f172a"); Set("Panel", "#1e293b"); Set("PanelAlt", "#0b1220");
             Set("Border", "#334155"); Set("Fg", "#e2e8f0"); Set("Muted", "#94a3b8");
             Set("UserBg", "#334155"); Set("Accent", "#ea580c"); Set("AccentFg", "#ffffff");
+            Set("Hover", "#26ffffff"); Set("Press", "#3dffffff");   // translucent white overlay
         }
         else
         {
             Set("Bg", "#ffffff"); Set("Panel", "#f8fafc"); Set("PanelAlt", "#f1f5f9");
             Set("Border", "#e2e8f0"); Set("Fg", "#0f172a"); Set("Muted", "#64748b");
             Set("UserBg", "#eef2f7"); Set("Accent", "#ea580c"); Set("AccentFg", "#ffffff");
+            Set("Hover", "#18000000"); Set("Press", "#2b000000");   // translucent black overlay
         }
     }
 
