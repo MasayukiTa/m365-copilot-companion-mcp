@@ -22,6 +22,10 @@ sys.path.insert(0, str(REPO))
 from relay.copilot_autopilot_relay import run_relay
 from tools.gate_ops import stop_clear, stop_request
 
+PY = sys.executable
+PASS_CHECK = {"type": "shell", "argv": [PY, "-c", "print('ok')"]}
+FAIL_CHECK = {"type": "shell", "argv": [PY, "-c", "import sys;sys.exit(1)"]}
+
 
 class MockDriver:
     """Scripted driver: returns canned responses; optional per-turn idle flags."""
@@ -105,6 +109,18 @@ def main():
             "ABORTED"))
     finally:
         stop_clear()  # IMPORTANT: never leave the kill-switch set
+
+    # 8. acceptance gate: DONE + passing check -> DONE (verified, not just claimed)
+    results.append(run_case(
+        "verify_pass",
+        MockDriver(["progress CONTINUE", "all set DONE"]),
+        "DONE", checks=PASS_CHECK))
+
+    # 9. acceptance gate: DONE but check keeps failing -> STUCK (VERIFY_FAILED) at the cap
+    results.append(run_case(
+        "verify_fail_cap",
+        MockDriver(["claim DONE", "still claim DONE", "still claim DONE"]),
+        "STUCK", checks=FAIL_CHECK, max_verify_attempts=2))
 
     total = len(results)
     passed = sum(results)
