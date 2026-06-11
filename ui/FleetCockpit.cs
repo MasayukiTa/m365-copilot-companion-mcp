@@ -51,6 +51,7 @@ class CockpitWindow : Window
     long _settingsMtime = 0;
 
     readonly string _statusPath, _commandsPath, _historyPath, _openPath;
+    string _convsPath;
     System.Collections.Generic.HashSet<string> _archivedKeys = new System.Collections.Generic.HashSet<string>();
     List<object> _history = new List<object>();
     int _openSeq = 0;
@@ -78,6 +79,7 @@ class CockpitWindow : Window
         _commandsPath = Path.Combine(dir, "commands.json");
         _historyPath = Path.Combine(dir, "history.json");
         _openPath = Path.Combine(dir, "open.json");
+        _convsPath = Path.Combine(dir, "conversations.json");
         LoadGlyphs();
         LoadHistory();
         LoadSettings();
@@ -120,7 +122,7 @@ class CockpitWindow : Window
         if (k == "stale") return ja ? "更新が止まっています（フリート停止？）" : "no updates (fleet stopped?)";
         if (k == "applies_next") return ja ? "次回起動から適用" : "applies next run";
         if (k == "start") return ja ? "並列実行を開始" : "Start parallel run";
-        if (k == "goalhint") return ja ? "1行に1ゴール（複数可）" : "One goal per line";
+        if (k == "goalhint") return ja ? "1行に1ゴール（複数可）・Ctrl+Enter で開始" : "One goal per line · Ctrl+Enter to start";
         if (k == "folder") return ja ? "フォルダ → ゴール生成" : "Folder -> goals";
         return k;
     }
@@ -325,6 +327,11 @@ class CockpitWindow : Window
         _goalInput.FontSize = 13; _goalInput.Padding = new Thickness(10, 8, 10, 8);
         _goalInput.BorderThickness = new Thickness(1);
         _goalInput.VerticalContentAlignment = VerticalAlignment.Top;
+        _goalInput.PreviewKeyDown += delegate (object s, KeyEventArgs e)
+        {
+            if (e.Key == Key.Return && (Keyboard.Modifiers & ModifierKeys.Control) != 0)
+            { e.Handled = true; StartFleet(); }
+        };
         Grid.SetColumn(_goalInput, 0); grid.Children.Add(_goalInput);
 
         var rightCol = new StackPanel();
@@ -682,7 +689,10 @@ class CockpitWindow : Window
             return;
         }
         UpdateHeader(root);                 // live elapsed every tick
-        ArchiveTerminal(root);              // stack finished/released tasks into history
+        // only archive while the run is LIVE -- otherwise the finished run's final
+        // snapshot would re-add cleared tasks every tick (Clear would never stick).
+        bool runningNow = !root.ContainsKey("running") || Convert.ToBoolean(root["running"]);
+        if (runningNow) ArchiveTerminal(root);
         string sig = Sig(root);
         if (sig == _lastSig) return;
         _lastSig = sig;
