@@ -20,6 +20,7 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
+using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using System.Web.Script.Serialization;
 
@@ -73,11 +74,14 @@ class ChatWindow : Window
         if (k == "cancel") return ja ? "キャンセル" : "Cancel";
         if (k == "copy") return ja ? "コピー" : "Copy";
         if (k == "stop") return ja ? "停止" : "Stop";
-        if (k == "fleet_queued") return ja ? "⏳ 並列実行が満杯のため待機列に追加しました（空き枠で実行）。先頭に ! を付けると強制優先。" : "⏳ Fleet is full — queued (runs when a slot frees). Prefix ! to force priority.";
-        if (k == "fleet_forced") return ja ? "⏳ 強制優先で待機列の先頭に追加しました。" : "⏳ Forced to the front of the queue.";
-        if (k == "router_q") return ja ? "🔍 これは調査向きの依頼です。researcher で深掘りしますか？" : "🔍 This looks like research. Run it on the researcher?";
+        if (k == "fleet_queued") return ja ? "並列実行が満杯のため待機列に追加しました（空き枠で実行）。先頭に ! を付けると強制優先。" : "Fleet is full — queued (runs when a slot frees). Prefix ! to force priority.";
+        if (k == "fleet_forced") return ja ? "強制優先で待機列の先頭に追加しました。" : "Forced to the front of the queue.";
+        if (k == "router_q") return ja ? "これは調査向きの依頼です。researcher で深掘りしますか？" : "This looks like research. Run it on the researcher?";
         if (k == "router_research") return ja ? "researcher で深掘り" : "Deep research";
         if (k == "router_normal") return ja ? "そのまま送信" : "Send as-is";
+        if (k == "attach") return ja ? "ファイル/画像を添付（画像は Ctrl+V で貼り付けも可）" : "Attach a file/image (or paste an image with Ctrl+V)";
+        if (k == "attach_btn") return ja ? "＋ 添付" : "+ Attach";
+        if (k == "attach_fail") return ja ? "添付に失敗:" : "Attach failed:";
         if (k == "loadingconv") return ja ? "会話を読み込み中…" : "Loading conversation…";
         if (k == "fleetview") return ja ? "並列タスクの会話" : "Parallel task";
         if (k == "fleetview_note") return ja ? "▼ 並列タスクの会話を表示中。ここに入力すると、この会話に割り込めます。" : "▼ Viewing a parallel-task conversation. Type here to steer it.";
@@ -183,7 +187,11 @@ class ChatWindow : Window
         SetRef(_input, TextBox.CaretBrushProperty, "Fg");
         SetRef(_input, Control.BorderBrushProperty, "Border");
         _input.PreviewKeyDown += delegate (object s, KeyEventArgs e)
-        { if (e.Key == Key.Enter && (Keyboard.Modifiers & ModifierKeys.Shift) == 0) { e.Handled = true; DoSend(); } };
+        {
+            if (e.Key == Key.V && (Keyboard.Modifiers & ModifierKeys.Control) != 0 && Clipboard.ContainsImage())
+            { e.Handled = true; PasteImage(); return; }
+            if (e.Key == Key.Enter && (Keyboard.Modifiers & ModifierKeys.Shift) == 0) { e.Handled = true; DoSend(); }
+        };
         Grid.SetColumn(_input, 0); bar.Children.Add(_input);
         _send = Btn(T("send"), "Accent", "AccentFg", false);
         _send.Width = 92; _send.Margin = new Thickness(8, 0, 0, 0); _send.FontWeight = FontWeights.SemiBold; _send.MinHeight = 50;
@@ -195,6 +203,7 @@ class ChatWindow : Window
         Grid.SetColumn(_send, 1); bar.Children.Add(_send);
         var barStack = new StackPanel { MaxWidth = 760, HorizontalAlignment = HorizontalAlignment.Center };
         barStack.Children.Add(BuildRouterBar());
+        barStack.Children.Add(BuildAttachRow());
         barStack.Children.Add(bar);
         var barBorder = new Border { Child = barStack, BorderThickness = new Thickness(0, 1, 0, 0) };
         SetRef(barBorder, Border.BorderBrushProperty, "Border");
@@ -775,6 +784,7 @@ class ChatWindow : Window
         _generating = true; _send.Content = T("stop"); _send.IsEnabled = true;   // _send now acts as Stop
         SetRef(_statusDot, BackgroundProperty, "Accent");
         new Thread((ThreadStart)delegate { Stream(text); }) { IsBackground = true }.Start();
+        ClearChips();   // the attached file(s) go with this message; reset the chip row
     }
 
     // ── #3 fleet-aware routing ───────────────────────────────────────────────────
@@ -868,6 +878,81 @@ class ChatWindow : Window
     {
         if (_routerBar != null) _routerBar.Visibility = Visibility.Collapsed;
         _routerShown = false;
+    }
+
+    // ── attachments: file picker + image paste -> upload to the composer ─────────
+    StackPanel _attachChips;
+    UIElement BuildAttachRow()
+    {
+        _attachChips = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 6) };
+        var attach = new Button
+        {
+            Content = T("attach_btn"), FontSize = 12,
+            Height = 30, Cursor = Cursors.Hand, BorderThickness = new Thickness(1),
+            Padding = new Thickness(10, 0, 10, 0), ToolTip = T("attach")
+        };
+        SetRef(attach, BackgroundProperty, "Panel"); SetRef(attach, ForegroundProperty, "Muted"); SetRef(attach, Control.BorderBrushProperty, "Border");
+        attach.Click += delegate { AttachFile(); };
+        _attachChips.Children.Add(attach);
+        return _attachChips;
+    }
+
+    void AttachFile()
+    {
+        var dlg = new Microsoft.Win32.OpenFileDialog();
+        dlg.Filter = "対応ファイル|*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.pdf;*.docx;*.xlsx;*.pptx;*.csv;*.txt;*.md;*.json;*.xml;*.py;*.js;*.ts;*.cs;*.html;*.eml|すべて (*.*)|*.*";
+        if (dlg.ShowDialog() == true) UploadFile(dlg.FileName);
+    }
+
+    void PasteImage()
+    {
+        try
+        {
+            var img = Clipboard.GetImage();
+            if (img == null) return;
+            string path = Path.Combine(Path.GetTempPath(), "copilot_paste_" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".png");
+            using (var fs = new FileStream(path, FileMode.Create))
+            {
+                var enc = new PngBitmapEncoder();
+                enc.Frames.Add(BitmapFrame.Create(img));
+                enc.Save(fs);
+            }
+            UploadFile(path);
+        }
+        catch { }
+    }
+
+    void UploadFile(string path)
+    {
+        var chip = AddChip(Path.GetFileName(path), true);
+        new Thread((ThreadStart)delegate
+        {
+            string r = null;
+            try { r = HttpGet("/upload?path=" + Uri.EscapeDataString(path)); } catch { }
+            bool ok = r != null && r.Contains("\"ok\": true");
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                if (ok) { var t = chip.Child as TextBlock; if (t != null) t.Text = "" + Path.GetFileName(path); }
+                else { _attachChips.Children.Remove(chip); AddAssistant(T("attach_fail") + " " + Path.GetFileName(path)); }
+            }));
+        }) { IsBackground = true }.Start();
+    }
+
+    Border AddChip(string name, bool pending)
+    {
+        var b = new Border { CornerRadius = new CornerRadius(7), Padding = new Thickness(8, 3, 8, 3), Margin = new Thickness(6, 0, 0, 0), BorderThickness = new Thickness(1) };
+        SetRef(b, BackgroundProperty, "Panel"); SetRef(b, Border.BorderBrushProperty, "Border");
+        var t = new TextBlock { Text = (pending ? "… " : "") + name, FontSize = 12 };
+        SetRef(t, TextBlock.ForegroundProperty, "Fg");
+        b.Child = t;
+        _attachChips.Children.Add(b);
+        return b;
+    }
+
+    void ClearChips()
+    {
+        if (_attachChips == null) return;
+        while (_attachChips.Children.Count > 1) _attachChips.Children.RemoveAt(_attachChips.Children.Count - 1);
     }
 
     void Stream(string msg)
