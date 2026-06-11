@@ -167,10 +167,34 @@ spec §4B のコスト2倍を考慮）。run_relay に結線。UNCLEAR はルー
 テスト: project_introspect/code_task 12・refuter 10 を追加。**全体 82/82**
 （acceptance 20・fleet-verify 12・folder-verify 8・relay-loop 9・code-task 12・refuter 10・trace 11）。
 
-### 残（追補2）
-- 反証器は run_relay(単一CLI)に結線済だが、code_task/フリート経路（並列の主UX）への結線は未（フリートは
-  単一スレッドで side-page 反証がブロッキングになるため設計検討要）。当面は単一タスクの精査用。
-- attach 中 Edge hard-reset で worker 終端ERROR の堅牢化（追補1の残）は依然未対応。
+## 追補 2026-06-12 (3): 反証器のフリート結線 ＋ attach 堅牢化
+
+追補2の2つの残課題を解消した。
+
+### 反証器をフリート（並列の主UX）へ — 非ブロッキング化
+フリートは単一スレッドのラウンドロビンなので、side-page の反証を同期で待つと他ワーカーを数分固める。
+`refuter.RefuterSession`（ノンブロッキング: `start()` で側チャットを開き反証プロンプト送信＝一度きりの短い操作、
+`poll()` が判定確定まで None を返す。worker 自身の send/wait と同型）を追加。`RelayWorker` に `refuting` 状態を
+追加し、機械チェック通過（またはチェック無し）で候補DONE→予算内なら反証セッション開始→REFUTED なら理由を
+`REFUTE_FIX_JOB` で再注入し継続、UPHELD/UNCLEAR なら受理。`fleet_runner --refuter/--max-refute`、
+`code_task --refuter` で利用可。pill「反証中」。**これで自然言語 code_task でも反証が効く**（既定OFF・予算上限）。
+
+### attach 堅牢化（追補1の残）
+attach 失敗時、`context.cookies()` を probe して**Edge 全体が死んでいれば `FleetContextLost` を送出**→runner が
+再接続して未完ゴール（当該ゴール含む）を再開。コンテキストが生きている単発の開通失敗は従来どおり worker ERROR。
+これで「watchdog の hard-reset が attach に当たって worker 終端ERROR→ゴール消失」が解消。
+
+### テスト（追補3）
+`relay/test_fleet_refute.py` **10/10**: 候補DONE→UPHELD→done／REFUTED→理由再注入→ready／予算上限で受理／
+checks＋反証の合成（verify pass→refuting→done verified）／非ブロッキング（数回 poll で確定）／反証OFFで即done／
+**Edge全体死亡→FleetContextLost（ゴール再開可）**／生存コンテキストの単発失敗→ERROR で run 完走。
+
+合計 **92/92**（acceptance 20・fleet-verify 12・folder-verify 8・relay-loop 9・code-task 12・refuter 10・
+fleet-refute 10・trace 11）。`main.py`（サーバ全ツール）もビルド成功。
+
+### 残（追補3）
+- フリート反証の**実機ライブ**は未走（2倍コスト＋数分。side-page 機構は research/analyst 委譲で実機実証済の同型、
+  ユニットで挙動確認）。必要なら `code_task --refuter` でライブ精査可能。
 
 ## 限界・残（正直に）
 

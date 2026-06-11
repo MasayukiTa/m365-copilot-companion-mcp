@@ -72,6 +72,9 @@ def main():
                          '(on top of auto-detected verification), e.g. "ruff check ."')
     ap.add_argument("--no-verify", action="store_true",
                     help="skip auto-detected verification (accept a self-reported DONE)")
+    ap.add_argument("--refuter", action="store_true",
+                    help="after a candidate DONE, an independent reviewer tries to refute "
+                         "it before accepting (operator B; doubles oracle cost)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the detected verification + goal and exit (do not run)")
     ap.add_argument("--state-dir", default=None,
@@ -108,6 +111,8 @@ def main():
     cmd = [sys.executable, "-m", "relay.fleet_runner", "--goals-file", goals_file,
            "--max-concurrent", "1", "--max-turns", str(args.max_turns),
            "--agent-url", args.agent_url, "--state-dir", state_dir]
+    if args.refuter:
+        cmd.append("--refuter")
     print("  launching: fleet_runner (1 tab, auto-verified)\n")
     return subprocess.call(cmd, cwd=repo)
 
