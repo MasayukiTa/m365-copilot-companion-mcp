@@ -34,10 +34,12 @@ except Exception:
     pass
 
 
-def build_goal(instruction, folder, extra_check=None, no_verify=False):
+def build_goal(instruction, folder, extra_check=None, no_verify=False,
+               with_map=True, map_chars=4000):
     """Turn a natural-language instruction + folder into one self-verifying goal dict.
     Verification is auto-detected unless no_verify; extra_check (a shell command string)
-    is appended on top of whatever was detected."""
+    is appended on top of whatever was detected. When with_map, a compact repo map is
+    prepended so the agent starts oriented (like Claude Code/aider) instead of blind."""
     folder = os.path.abspath(folder)
     checks, notes = [], []
     if not no_verify:
@@ -46,10 +48,23 @@ def build_goal(instruction, folder, extra_check=None, no_verify=False):
     if extra_check:
         checks.append({"type": "shell", "cmd": extra_check, "cwd": folder})
         notes.append("extra check: %s" % extra_check)
-    text = ("対象リポジトリ %s に対して、次の作業を行ってください: %s\n"
-            "必要なファイルを list_directory / grep / read_file で調べ、"
-            "replace_in_file / write_file で編集してください。"
-            % (folder, instruction))
+    prefix = ""
+    if with_map:
+        try:
+            from relay.repo_map import build_map
+            m = build_map(folder, max_chars=map_chars)
+            if m:
+                prefix = ("まず下記のリポジトリ地図で全体構成を把握してから着手してください"
+                          "（詳細は read_file で確認）。\n--- リポジトリ地図 ---\n%s\n"
+                          "--- 地図ここまで ---\n\n" % m)
+                notes.append("repo map primed (%d chars)" % len(m))
+        except Exception:
+            pass
+    text = (prefix
+            + "対象リポジトリ %s に対して、次の作業を行ってください: %s\n"
+              "必要なファイルを list_directory / grep / read_file で調べ、"
+              "replace_in_file / write_file で編集してください。"
+              % (folder, instruction))
     goal = {"text": text, "cwd": folder}
     if checks:
         goal["checks"] = checks
@@ -75,6 +90,9 @@ def main():
     ap.add_argument("--refuter", action="store_true",
                     help="after a candidate DONE, an independent reviewer tries to refute "
                          "it before accepting (operator B; doubles oracle cost)")
+    ap.add_argument("--no-map", action="store_true",
+                    help="do not prepend a repo map to the goal (saves prompt size on a "
+                         "huge tree; default is to prime the agent with the map)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the detected verification + goal and exit (do not run)")
     ap.add_argument("--state-dir", default=None,
@@ -87,7 +105,8 @@ def main():
         ap.error("no agent URL -- pass --agent-url or set MCP_FLEET_AGENT_URL in .env")
 
     goal, notes = build_goal(args.instruction, args.folder,
-                             extra_check=args.extra_check, no_verify=args.no_verify)
+                             extra_check=args.extra_check, no_verify=args.no_verify,
+                             with_map=not args.no_map)
 
     print("code_task: %s" % args.instruction)
     print("  folder: %s" % os.path.abspath(args.folder))

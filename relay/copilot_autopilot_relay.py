@@ -402,6 +402,7 @@ def run_relay(
     max_verify_attempts: int = 3,
     refuter: bool = False,
     max_refute: int = 2,
+    review_lenses=None,
 ) -> str:
     """Run the autonomous loop unattended. Returns one of:
     DONE | STUCK | MAXTURNS | ABORTED. Notifies on every terminal outcome.
@@ -626,15 +627,27 @@ def run_relay(
             # default + budget-capped (it doubles oracle cost).
             if refuter and browser_context is not None and refute_count < max_refute:
                 refute_count += 1
-                from .refuter import run_refuter
+                from .refuter import run_refuter, aggregate_panel
                 conv_url = ""
                 try:
                     conv_url = driver.page.url
                 except Exception:
                     pass
-                kind, rreason = run_refuter(browser_context, conv_url, goal, resp,
-                                            notify=notify, runlog=runlog_append,
-                                            run_id=run_id, turn=turn)
+                if review_lenses:
+                    # perspective-diverse panel: N independent reviewers, majority vote
+                    panel = []
+                    for lens in review_lenses:
+                        k, r = run_refuter(browser_context, conv_url, goal, resp,
+                                           notify=notify, runlog=runlog_append,
+                                           run_id=run_id, turn=turn, lens=lens)
+                        panel.append((lens, k, r))
+                    kind, rreason = aggregate_panel(panel)
+                    runlog_append(run_id, {"turn": turn, "event": "panel",
+                                           "verdict": kind, "votes": [p[1] for p in panel]})
+                else:
+                    kind, rreason = run_refuter(browser_context, conv_url, goal, resp,
+                                                notify=notify, runlog=runlog_append,
+                                                run_id=run_id, turn=turn)
                 try:
                     driver.page.bring_to_front()
                 except Exception:
@@ -717,6 +730,10 @@ def main():
                          "oracle cost, so off by default and capped (--max-refute).")
     ap.add_argument("--max-refute", type=int, default=2,
                     help="max refuter rounds per run (default 2)")
+    ap.add_argument("--panel", action="store_true",
+                    help="review with a perspective-diverse PANEL (correctness / edge "
+                         "cases / security), majority vote, instead of one reviewer. "
+                         "Implies --refuter. More thorough, ~3x the review cost.")
     args = ap.parse_args()
 
     checks = None
@@ -735,11 +752,13 @@ def main():
         page = find_conversation_page(context, args.conversation_url)
         page.bring_to_front()
         driver = CopilotWebDriver(page)
+        from relay.refuter import PANEL_LENSES
         run_relay(driver, args.goal, args.run_id, args.max_turns,
                   per_turn_timeout_s=args.per_turn_timeout,
                   browser_context=None if args.no_research else context,
                   checks=checks, cwd=args.check_cwd,
-                  refuter=args.refuter, max_refute=args.max_refute)
+                  refuter=args.refuter or args.panel, max_refute=args.max_refute,
+                  review_lenses=list(PANEL_LENSES) if args.panel else None)
 
 
 if __name__ == "__main__":
