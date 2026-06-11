@@ -456,6 +456,20 @@ class Handler(BaseHTTPRequestHandler):
                 ok, reason = False, str(e)
             self._json({"ok": ok, "error": reason})
             return
+        if parsed.path == "/upload":       # attach a local file/image to the composer
+            path = (urllib.parse.parse_qs(parsed.query).get("path") or [""])[0]
+            try:
+                if not path or not os.path.isfile(path):
+                    self._json({"ok": False, "error": "file not found"}); return
+                inp = PAGE.locator('input[type="file"][accept*="csv"]').first
+                if inp.count() == 0:
+                    inp = PAGE.locator('input[type="file"]').first
+                inp.set_input_files(path)
+                PAGE.wait_for_timeout(2200)     # let the attachment chip register
+                self._json({"ok": True, "name": os.path.basename(path)})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
+            return
         self.send_response(404)
         self.end_headers()
 
