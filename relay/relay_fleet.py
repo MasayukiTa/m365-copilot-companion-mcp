@@ -80,20 +80,25 @@ def _open_fresh(context, url):
     surfaced once so the user can authenticate."""
     from .edge_recover import surface, looks_like_login
     pg = context.new_page()
-    try:
-        pg.goto(url, wait_until="domcontentloaded", timeout=60000)
-    except Exception:
-        pass
     surfaced = False
-    for _ in range(45):
-        pg.wait_for_timeout(1000)
-        if pg.locator(COPILOT_SELECTORS["composer"]).count() > 0:
-            return pg
-        if not surfaced:
+    # Up to 3 navigation attempts: a failed goto leaves the tab on about:blank, and
+    # waiting 45s for a composer that will never come just leaves about:blank on screen.
+    # Detect about:blank early (~4s) and RE-navigate instead of staring at it.
+    for attempt in range(3):
+        try:
+            pg.goto(url, wait_until="domcontentloaded", timeout=45000)
+        except Exception:
+            pass
+        for k in range(25):
+            pg.wait_for_timeout(1000)
+            if pg.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+                return pg
             try:
-                if looks_like_login(pg.url):
-                    surface()                 # auth needed -> bring the window forward
-                    surfaced = True
+                u = pg.url or ""
+                if not surfaced and looks_like_login(u):
+                    surface(); surfaced = True
+                elif u == "about:blank" and k >= 3:
+                    break                      # stuck on about:blank -> re-navigate
             except Exception:
                 pass
     return pg
