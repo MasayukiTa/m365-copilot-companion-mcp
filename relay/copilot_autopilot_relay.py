@@ -235,7 +235,11 @@ class CopilotWebDriver:
             self.page.keyboard.press("Control+a")   # clear via keyboard, not fill("")
             self.page.keyboard.press("Delete")       # -- fill("") leaves the editor
             self.page.wait_for_timeout(150)          #    in a state where Send won't arm
-            self.page.keyboard.type(one_line)        # CDP insert -> bypasses the OS IME
+            # insert_text = ONE atomic Input.insertText (paste-like). Unlike type(), it
+            # sends no per-key events, so the OS Japanese IME never intercepts it and a
+            # long Japanese goal lands intact -> the Send button arms reliably. type()
+            # was the cause of "Send button never submitted" on long JP goals.
+            self.page.keyboard.insert_text(one_line)
             if self._wait_send_armed(timeout_s=12.0):
                 try:
                     self._send_button().click(force=True, timeout=4000)
@@ -247,9 +251,14 @@ class CopilotWebDriver:
                     self.page.keyboard.press("Enter")
                 except Exception:
                     pass
-            self.page.wait_for_timeout(800)
-            if not self._composer_text():
-                return  # composer emptied => message was submitted
+            # The submit + composer-clear is async and can take >1s (esp. under load /
+            # right after a fresh page). POLL for the composer to empty instead of one
+            # fixed 800ms check -- the short check was the real cause of the false
+            # "Send button never submitted" failures (and the retry then double-typed).
+            for _ in range(24):                  # up to ~6s
+                self.page.wait_for_timeout(250)
+                if not self._composer_text():
+                    return  # composer emptied => message was submitted
         raise RuntimeError(
             "send failed: composer still holds text after 3 attempts "
             "(Send button never submitted the message)"
