@@ -45,14 +45,31 @@ except Exception:
 # A worker's status -> (pill label, design-language colour key). The cockpit maps the
 # key to a brush; we keep the vocabulary aligned with the WPF the sibling app palette.
 STATUS_PILL = {
-    "pending":  ("待機列", "muted"),    # queued -- no tab open yet (memory discipline)
-    "ready":    ("準備",   "muted"),
-    "waiting":  ("実行中", "good"),     # A_GOOD blue -- a turn is streaming server-side
-    "done":     ("完了",   "done"),     # finished cleanly
-    "stuck":    ("停滞",   "bad"),       # B_BAD red
-    "maxturns": ("上限",   "bad"),
-    "error":    ("エラー", "bad"),
+    "pending":   ("待機列", "muted"),    # queued -- no tab open yet (memory discipline)
+    "ready":     ("準備",   "muted"),
+    "waiting":   ("実行中", "good"),     # A_GOOD blue -- a turn is streaming server-side
+    "done":      ("完了",   "done"),     # finished cleanly
+    "stuck":     ("停滞",   "bad"),       # B_BAD red
+    "maxturns":  ("上限",   "bad"),
+    "error":     ("エラー", "bad"),
+    "cancelled": ("停止",   "muted"),    # user released it from the cockpit
 }
+
+DEFAULT_MAX_CONCURRENT = 3
+
+
+def settings_maxtabs(default=DEFAULT_MAX_CONCURRENT):
+    """Read the user's chosen max-concurrent-tabs from the shared settings.txt
+    (the cockpit writes `maxtabs=N`). Falls back to `default`."""
+    try:
+        p = os.path.join(os.environ.get("APPDATA", ""), "copilot-bridge", "settings.txt")
+        if os.path.isfile(p):
+            for ln in open(p, encoding="utf-8-sig").read().splitlines():
+                if ln.startswith("maxtabs="):
+                    return max(1, int(ln.split("=", 1)[1].strip()))
+    except Exception:
+        pass
+    return default
 
 
 def _repo_root():
@@ -93,6 +110,7 @@ def _snapshot(workers, started, total, max_concurrent=0):
             "max_turns": w.max_turns,
             "reason": w.reason,
             "closed": getattr(w, "closed", False),
+            "conv_url": getattr(w, "conv_url", ""),
             "last": (w.last_response or "")[:600],
         } for w in workers],
     }
@@ -123,9 +141,11 @@ def main():
                                             or os.environ.get("MCP_IMPL_AGENT_URL", "")))
     ap.add_argument("-g", "--goal", action="append", help="a goal (repeatable)")
     ap.add_argument("--goals-file", help="file with one goal per line (# comments ok)")
-    ap.add_argument("--max-turns", type=int, default=12)
-    ap.add_argument("--max-concurrent", type=int, default=0,
-                    help="max tabs open at once (0 = auto from free RAM)")
+    ap.add_argument("--max-turns", type=int, default=1000,
+                    help="hard cap on turns per goal (default 1000 ~ unlimited)")
+    ap.add_argument("--max-concurrent", type=int, default=-1,
+                    help="max tabs open at once. -1 = use the cockpit's setting "
+                         "(maxtabs, default 3); 0 = auto from free RAM; N = exactly N")
     ap.add_argument("--poll-s", type=float, default=1.0)
     ap.add_argument("--state-dir", default=os.path.join(_repo_root(), ".fleet"),
                     help="where to write the live status.json the cockpit reads")
@@ -141,7 +161,13 @@ def main():
     status_path = os.path.join(args.state_dir, "status.json")
     started = time.time()
 
-    max_conc = args.max_concurrent if args.max_concurrent > 0 else auto_concurrency(len(goals))
+    if args.max_concurrent > 0:
+        max_conc = args.max_concurrent
+    elif args.max_concurrent == 0:
+        max_conc = auto_concurrency(len(goals))           # 0 = auto from free RAM
+    else:
+        max_conc = min(settings_maxtabs(), len(goals))    # -1 = the cockpit's setting (default 3)
+    commands_path = os.path.join(args.state_dir, "commands.json")
 
     # write an initial 'launching' snapshot so the cockpit shows something at once
     _write_atomic(status_path, {"started": started, "updated": started,
@@ -157,10 +183,27 @@ def main():
 
     print("fleet: %d goal(s) -> %s" % (len(goals), args.agent_url))
     print("       live status: %s" % status_path)
-    print("       free RAM: %d MB  ->  max %d tab(s) open at once (close-on-done frees each)"
-          % (round(avail_phys_mb()), max_conc))
+    print("       max %d tab(s) open at once (close-on-done frees each); free RAM now %d MB"
+          % (max_conc, round(avail_phys_mb())))
+
+    def _drain_commands(workers):
+        # cockpit -> fleet control channel: {"close": ["w2", ...]}. Consume + delete.
+        try:
+            if not os.path.isfile(commands_path):
+                return
+            with open(commands_path, encoding="utf-8") as f:
+                cmd = json.load(f)
+            os.remove(commands_path)
+            by_name = {w.name: w for w in workers}
+            for nm in cmd.get("close", []):
+                w = by_name.get(nm)
+                if w is not None and w.status not in TERMINAL:
+                    w.cancel()
+        except Exception:
+            pass
 
     def on_tick(workers):
+        _drain_commands(workers)
         try:
             _write_atomic(status_path, _snapshot(workers, started, len(goals), max_conc))
         except Exception:
