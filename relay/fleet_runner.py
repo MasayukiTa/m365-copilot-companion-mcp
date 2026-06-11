@@ -186,8 +186,10 @@ def main():
     print("       max %d tab(s) open at once (close-on-done frees each); free RAM now %d MB"
           % (max_conc, round(avail_phys_mb())))
 
+    mc_box = [max_conc]                # live concurrency cap (cockpit can change it)
+
     def _drain_commands(workers):
-        # cockpit -> fleet control channel: {"close": ["w2", ...]}. Consume + delete.
+        # cockpit -> fleet control channel. {"close":["w2"], "set_maxtabs":5}. Consume.
         try:
             if not os.path.isfile(commands_path):
                 return
@@ -199,13 +201,18 @@ def main():
                 w = by_name.get(nm)
                 if w is not None and w.status not in TERMINAL:
                     w.cancel()
+            if "set_maxtabs" in cmd:
+                try:
+                    mc_box[0] = max(1, int(cmd["set_maxtabs"]))
+                except Exception:
+                    pass
         except Exception:
             pass
 
     def on_tick(workers):
         _drain_commands(workers)
         try:
-            _write_atomic(status_path, _snapshot(workers, started, len(goals), max_conc))
+            _write_atomic(status_path, _snapshot(workers, started, len(goals), mc_box[0]))
         except Exception:
             pass
         _print_table(workers, len(goals))
@@ -217,7 +224,7 @@ def main():
         results = run_relay_fleet(context, goals, args.agent_url,
                                   max_turns=args.max_turns, poll_s=args.poll_s,
                                   notify=default_notify, on_tick=on_tick,
-                                  max_concurrent=max_conc)
+                                  max_concurrent=max_conc, mc_box=mc_box)
 
     # final snapshot + summary
     elapsed = round(time.time() - started, 1)
