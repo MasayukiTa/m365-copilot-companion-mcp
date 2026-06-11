@@ -23,6 +23,8 @@ REFUTER_INSTRUCTION = (
     "具体的な理由を全力で探すことです（ゴールの読み違い、見落とされたエッジケース、症状だけ"
     "を隠す修正、要件を実際には検証していないテスト等）。必要ならツール"
     "(read_file / grep / run_python など)で実物のファイルやテストを今すぐ確認してください。\n"
+    "次の観点を順に当ててください: ①正しさ(ゴールの全要件を満たすか) "
+    "②境界値・エラー処理・例外ケース ③セキュリティ・安全性。\n"
     "重要: 『確認します』『調べます』等の前置きだけで終わらせないこと。**このターン内で確認まで"
     "済ませ、必ず回答の最後の行に判定を書く**こと。形式は次のどちらか:\n"
     "・本当に達成されていない具体的欠陥が一つでもあれば: REFUTED: <その欠陥を1〜2文で>\n"
@@ -38,15 +40,50 @@ REFUTER_NUDGE = (
 )
 
 
-def build_refuter_prompt(goal: str, final_response: str) -> str:
+# Review panel (operator B, perspective-diverse): N INDEPENDENT reviewers, each with a
+# distinct lens, aggregated by majority. Catches failure modes a single redundant pass
+# misses -- a quality mechanism Claude Code does not have built in.
+LENS_PROMPTS = {
+    "correctness": "このレビューでは特に『正しさ』に集中: ゴールの全要件を実際に満たしているか。",
+    "edge": "このレビューでは特に『境界値・エラー処理・例外・想定外入力』に集中。",
+    "security": "このレビューでは特に『セキュリティ・安全性』に集中: インジェクション、"
+                "権限、破壊的操作、機微情報の漏えい等。",
+}
+PANEL_LENSES = ("correctness", "edge", "security")
+
+
+def build_refuter_prompt(goal: str, final_response: str, lens: str = "") -> str:
     """Compose the adversarial reviewer prompt from the goal and the implementer's
-    claimed-done summary."""
+    claimed-done summary. `lens` (one of LENS_PROMPTS) focuses a panel reviewer."""
+    base = REFUTER_INSTRUCTION
+    if lens and lens in LENS_PROMPTS:
+        base = LENS_PROMPTS[lens] + "\n" + base
     return (
-        REFUTER_INSTRUCTION
+        base
         + "\n\n--- ゴール ---\n" + (goal or "").strip()
         + "\n\n--- 実装エージェントの最終報告 ---\n" + (final_response or "").strip()
         + "\n--- ここまで ---"
     )
+
+
+def aggregate_panel(results, min_refute=None):
+    """Aggregate a panel of (lens, kind, reason) verdicts into one (kind, reason).
+
+    REFUTED only when at least `min_refute` reviewers refute (default: strict majority),
+    so a lone over-eager reviewer can't block, but a real defect that several lenses see
+    does. The combined reason names which lenses objected. Anything short of the threshold
+    is UPHELD (we never trap the loop on a minority/ambiguous objection).
+    """
+    n = len(results)
+    if n == 0:
+        return ("UNCLEAR", "")
+    refuted = [(l, r) for (l, k, r) in results if k == "REFUTED"]
+    if min_refute is None:
+        min_refute = (n // 2) + 1
+    if len(refuted) >= min_refute:
+        reason = " / ".join("[%s] %s" % (l, r) for (l, r) in refuted)
+        return ("REFUTED", reason)
+    return ("UPHELD", "")
 
 
 def parse_verdict(text: str):
@@ -83,7 +120,7 @@ def agent_base_url(conversation_url: str) -> str:
 
 def run_refuter(context, conversation_url: str, goal: str, final_response: str,
                 notify=None, runlog=None, run_id: str = "relay", turn: int = 0,
-                timeout_s: int = 600, max_nudges: int = 2):
+                timeout_s: int = 600, max_nudges: int = 2, lens: str = ""):
     """Open an independent side-page Copilot chat and ask it to refute the claimed DONE.
     Returns (kind, reason). Never raises into the control loop -- any failure yields
     ("UNCLEAR", "") so the loop falls back to accepting the DONE. Mirrors the research/
@@ -105,7 +142,7 @@ def run_refuter(context, conversation_url: str, goal: str, final_response: str,
         if not appeared:
             return ("UNCLEAR", "")
         drv = CopilotWebDriver(page)
-        drv.send(build_refuter_prompt(goal, final_response))
+        drv.send(build_refuter_prompt(goal, final_response, lens=lens))
         ok = drv.wait_for_idle(timeout_s=timeout_s)
         verdict = parse_verdict(drv.read_last_response()) if ok else ("UNCLEAR", "")
         # the reviewer often answers a preamble first ("I'll check the files") -- nudge it

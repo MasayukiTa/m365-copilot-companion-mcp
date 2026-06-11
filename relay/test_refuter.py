@@ -41,7 +41,7 @@ class MockDriver:
         return self.responses[self.i] if self.i < len(self.responses) else "CONTINUE"
 
 
-def run(responses, verdicts, max_refute=2, max_turns=8):
+def run(responses, verdicts, max_refute=2, max_turns=8, review_lenses=None):
     """Drive run_relay with the refuter stubbed to return scripted verdicts in order."""
     seq = list(verdicts)
     calls = {"n": 0}
@@ -57,7 +57,7 @@ def run(responses, verdicts, max_refute=2, max_turns=8):
         drv = MockDriver(responses)
         outcome = run_relay(drv, goal="g", run_id="test_refuter", max_turns=max_turns,
                             notify=lambda *a: None, sleep_s=0, browser_context=object(),
-                            refuter=True, max_refute=max_refute)
+                            refuter=True, max_refute=max_refute, review_lenses=review_lenses)
         return outcome, drv, calls["n"]
     finally:
         refuter.run_refuter = orig
@@ -92,6 +92,26 @@ def main():
                           [("REFUTED", "a"), ("REFUTED", "b"), ("REFUTED", "c")],
                           max_refute=1)
     check("refute_budget_capped", outcome == "DONE" and n == 1)
+
+    # --- review panel (perspective-diverse, majority vote) ---
+    check("aggregate_majority_refute", refuter.aggregate_panel(
+        [("correctness", "REFUTED", "a"), ("edge", "REFUTED", "b"), ("security", "UPHELD", "")])
+        == ("REFUTED", "[correctness] a / [edge] b"))
+    check("aggregate_minority_upheld", refuter.aggregate_panel(
+        [("correctness", "REFUTED", "a"), ("edge", "UPHELD", ""), ("security", "UPHELD", "")])[0]
+        == "UPHELD")
+    check("aggregate_empty_unclear", refuter.aggregate_panel([])[0] == "UNCLEAR")
+    check("lens_in_prompt", "境界値" in refuter.build_refuter_prompt("g", "f", lens="edge"))
+
+    # panel integration: round1 = 2/3 refuted -> reinject; round2 = all upheld -> DONE
+    lenses = list(refuter.PANEL_LENSES)
+    outcome, drv, n = run(
+        ["claim DONE", "fixed DONE"],
+        [("REFUTED", "境界値"), ("REFUTED", "型不一致"), ("UPHELD", ""),
+         ("UPHELD", ""), ("UPHELD", ""), ("UPHELD", "")],
+        review_lenses=lenses)
+    panel_reinjected = any("境界値" in s and "型不一致" in s for s in drv.sent)
+    check("panel_majority_reinjects", outcome == "DONE" and panel_reinjected and n == 6)
 
     print("\n=== %d/%d refuter checks passed ===" % (sum(results), len(results)))
     return 0 if all(results) else 1
