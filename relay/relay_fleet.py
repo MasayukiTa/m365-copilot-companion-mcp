@@ -31,7 +31,7 @@ import time
 from .acceptance import Check, normalize_checks
 from .copilot_autopilot_relay import (
     CONTINUE_JOB, COPILOT_SELECTORS, CopilotWebDriver, FIX_JOB, PROTOCOL,
-    VERIFY_FIX_JOB, _is_processing, default_notify,
+    REFUTE_FIX_JOB, VERIFY_FIX_JOB, _is_processing, default_notify,
 )
 
 TERMINAL = ("done", "stuck", "maxturns", "error", "cancelled")
@@ -129,7 +129,8 @@ class RelayWorker:
     outcome VERIFY_FAILED). No checks -> DONE is accepted as before (back-compat)."""
 
     def __init__(self, goal, name, max_turns=1000, dwell_s=4.0,
-                 per_turn_timeout_s=240, max_no_progress=3, max_verify_attempts=3):
+                 per_turn_timeout_s=240, max_no_progress=3, max_verify_attempts=3,
+                 refuter=False, max_refute=2):
         self.page = None
         self.drv = None
         text, checks, cwd = goal_fields(goal)
@@ -142,6 +143,13 @@ class RelayWorker:
         self.last_verify_detail = ""
         self._pending_checks = []     # acceptance.Check specs left to run this gate
         self._active_check = None     # the Check currently running (non-blocking)
+        # operator B refuter (spec 4B): an independent reviewer on a candidate DONE.
+        self.refuter = refuter
+        self.max_refute = max_refute
+        self.refute_count = 0
+        self._refuter_session = None
+        self._context = None          # stored at attach() so we can open the side page
+        self._agent_url = ""          # bare agent URL -> a fresh independent chat
         self.name = name
         self.conv_url = ""         # filled once the conversation gets its /conversation/<id>
         self.steer_msgs = []       # user steering messages to inject on the next turn(s)
@@ -166,6 +174,8 @@ class RelayWorker:
 
     def attach(self, context, agent_url):
         """Open this worker's tab and make it ready to send. On failure -> error."""
+        self._context = context
+        self._agent_url = agent_url
         try:
             self.page = _open_fresh(context, agent_url)
             self.drv = CopilotWebDriver(self.page)
@@ -184,6 +194,11 @@ class RelayWorker:
         try:
             if self.page is not None:
                 self.page.close()
+        except Exception:
+            pass
+        try:
+            if self._refuter_session is not None:
+                self._refuter_session.close()     # don't leak the side-page tab
         except Exception:
             pass
         self.page = None
@@ -266,11 +281,12 @@ class RelayWorker:
         self.status = "ready"
 
     def _on_done_claimed(self):
-        """Copilot reported DONE. With no acceptance checks, trust it (back-compat).
-        With checks, enter the verification gate instead of finishing."""
+        """Copilot reported DONE. With no acceptance checks, go straight to the candidate-
+        done step (back-compat trust, unless a refuter is on). With checks, run the
+        verification gate first."""
         if not self.checks:
-            self.status, self.outcome = "done", "DONE"
             self.verified = False
+            self._candidate_done()
             return
         self._pending_checks = list(self.checks)
         self._active_check = None
@@ -278,13 +294,42 @@ class RelayWorker:
         self._advance_check()
 
     def _advance_check(self):
-        """Start the next pending check, or finish the gate if all have passed."""
+        """Start the next pending check, or go to the candidate-done step if all passed."""
         if not self._pending_checks:
-            self.status, self.outcome = "done", "DONE"
             self.verified = True
             self.reason = "acceptance verified (%d check(s))" % len(self.checks)
+            self._candidate_done()
             return
         self._active_check = Check(self._pending_checks[0], cwd=self.cwd).start()
+
+    def _candidate_done(self):
+        """Machine checks passed (or none) -> a CANDIDATE done. If the refuter is enabled
+        and within budget, open an independent reviewer (non-blocking) before accepting;
+        otherwise finish now."""
+        if (self.refuter and self._context is not None
+                and self.refute_count < self.max_refute):
+            from .refuter import RefuterSession
+            self.refute_count += 1
+            self._refuter_session = RefuterSession(
+                self._context, self._agent_url or "", self.goal, self.last_response).start()
+            self.status = "refuting"
+            return
+        self.status, self.outcome = "done", "DONE"
+
+    def _poll_refute(self):
+        """Drive the non-blocking refuter. REFUTED -> feed the reason back and keep
+        working; UPHELD/UNCLEAR -> accept the DONE."""
+        r = self._refuter_session.poll()
+        if r is None:
+            return False
+        kind, reason = r
+        self._refuter_session = None
+        if kind == "REFUTED":
+            self.job = REFUTE_FIX_JOB % (reason or "(no reason)")
+            self.status = "ready"
+            return False
+        self.status, self.outcome = "done", "DONE"
+        return True
 
     def _poll_verify(self):
         """Drive the running acceptance check non-blockingly. On pass, advance to the
@@ -324,6 +369,8 @@ class RelayWorker:
             return False                 # not attached yet; the fleet attaches it
         if self.status == "verifying":
             return self._poll_verify()
+        if self.status == "refuting":
+            return self._poll_refute()
         if self.status == "ready":
             self._begin_send()
             self._capture_url()
@@ -354,7 +401,7 @@ class RelayWorker:
 
 def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     notify=default_notify, on_tick=None, max_concurrent=None,
-                    mc_box=None, add_box=None):
+                    mc_box=None, add_box=None, refuter=False, max_refute=2):
     """Drive len(goals) autonomous relays in parallel to completion, but never with
     more than `max_concurrent` tabs open at once (defaults to what free RAM allows).
     A goal's tab is opened only when a slot frees and CLOSED the moment it finishes.
@@ -368,7 +415,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         max_concurrent = auto_concurrency(len(goals))
     if mc_box is None:
         mc_box = [max_concurrent]
-    workers = [RelayWorker(g, "w%d" % i, max_turns=max_turns)
+    workers = [RelayWorker(g, "w%d" % i, max_turns=max_turns,
+                           refuter=refuter, max_refute=max_refute)
                for i, g in enumerate(goals)]
     pending = list(workers)            # FIFO queue of not-yet-attached workers
 
@@ -399,7 +447,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             while add_box:
                 item = add_box.pop(0)
                 # item may carry checks/cwd too; goal_fields reads them (priority ignored)
-                nw = RelayWorker(item, "w%d" % len(workers), max_turns=max_turns)
+                nw = RelayWorker(item, "w%d" % len(workers), max_turns=max_turns,
+                                 refuter=refuter, max_refute=max_refute)
                 workers.append(nw)
                 if item.get("priority"):
                     pending.insert(0, nw)
@@ -411,7 +460,17 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             w = pending.pop(0)
             if w.status in TERMINAL:   # (shouldn't happen, but be safe)
                 continue
-            w.attach(context, agent_url)
+            ok = w.attach(context, agent_url)
+            if not ok:
+                # attach failed. If the WHOLE Edge/context died mid-open (e.g. the
+                # watchdog hard-reset it), don't burn this goal as a terminal ERROR --
+                # probe the context, and if it's truly dead bail so the runner reconnects
+                # and RESUMES every unfinished goal (this one included). A live context
+                # means a one-off open failure -> leave the worker ERROR as before.
+                try:
+                    context.cookies()
+                except Exception:
+                    raise FleetContextLost(_unfinished())
 
         for w in workers:
             if w.status in TERMINAL or w.status == PENDING:

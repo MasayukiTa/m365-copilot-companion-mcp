@@ -49,6 +49,7 @@ STATUS_PILL = {
     "ready":     ("準備",   "muted"),
     "waiting":   ("実行中", "good"),     # A_GOOD blue -- a turn is streaming server-side
     "verifying": ("検証中", "good"),     # spec 3-3: running the acceptance check locally
+    "refuting":  ("反証中", "good"),     # spec 4B: an independent reviewer is checking it
     "done":      ("完了",   "done"),     # finished cleanly
     "stuck":     ("停滞",   "bad"),       # B_BAD red
     "maxturns":  ("上限",   "bad"),
@@ -170,6 +171,12 @@ def main():
                     help="max auto-recovery reconnect attempts after a wedged Edge")
     ap.add_argument("--no-auto-recover", action="store_true",
                     help="disable auto-recovery (single connection, no reconnect)")
+    ap.add_argument("--refuter", action="store_true",
+                    help="operator B: after a candidate DONE, an INDEPENDENT reviewer "
+                         "(non-blocking side chat) tries to refute it before accepting. "
+                         "Off by default; doubles oracle cost.")
+    ap.add_argument("--max-refute", type=int, default=2,
+                    help="max refuter rounds per goal (default 2)")
     ap.add_argument("--state-dir", default=os.path.join(_repo_root(), ".fleet"),
                     help="where to write the live status.json the cockpit reads")
     args = ap.parse_args()
@@ -348,7 +355,8 @@ def main():
                 res = run_relay_fleet(context, pending, args.agent_url,
                                       max_turns=args.max_turns, poll_s=args.poll_s,
                                       notify=default_notify, on_tick=on_tick,
-                                      max_concurrent=max_conc, mc_box=mc_box, add_box=add_box)
+                                      max_concurrent=max_conc, mc_box=mc_box, add_box=add_box,
+                                      refuter=args.refuter, max_refute=args.max_refute)
             for r in res:
                 results_by_goal[r["goal"]] = r
             pending = []                                   # finished cleanly
