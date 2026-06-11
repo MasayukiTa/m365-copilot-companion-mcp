@@ -50,7 +50,10 @@ class CockpitWindow : Window
     int _maxtabs = 3;
     long _settingsMtime = 0;
 
-    readonly string _statusPath, _commandsPath;
+    readonly string _statusPath, _commandsPath, _historyPath, _openPath;
+    System.Collections.Generic.HashSet<string> _archivedKeys = new System.Collections.Generic.HashSet<string>();
+    List<object> _history = new List<object>();
+    int _openSeq = 0;
     static readonly string SettingsFile = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
         "copilot-bridge", "settings.txt");
@@ -71,8 +74,12 @@ class CockpitWindow : Window
     public CockpitWindow(string path)
     {
         _statusPath = ResolvePath(path);
-        _commandsPath = Path.Combine(Path.GetDirectoryName(_statusPath), "commands.json");
+        string dir = Path.GetDirectoryName(_statusPath);
+        _commandsPath = Path.Combine(dir, "commands.json");
+        _historyPath = Path.Combine(dir, "history.json");
+        _openPath = Path.Combine(dir, "open.json");
         LoadGlyphs();
+        LoadHistory();
         LoadSettings();
         ApplyThemeBrushes();
         Width = 1080; Height = 760;
@@ -283,6 +290,7 @@ class CockpitWindow : Window
         _headBar.Child = headRow;
         root.Children.Add(_headBar);
         root.Children.Add(BuildInputBar());
+        root.Children.Add(BuildMtBanner());
 
         _sv = new ScrollViewer();
         _sv.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
@@ -416,7 +424,59 @@ class CockpitWindow : Window
         _maxtabs = Math.Max(1, Math.Min(8, v));
         SaveKey("maxtabs", _maxtabs.ToString());
         if (_maxValue != null) _maxValue.Text = _maxtabs.ToString();
+        // if a run is live, offer to apply now vs next run
+        bool running = false;
+        try
+        {
+            var st = ReadStatus();
+            running = st != null && st.ContainsKey("running") && Convert.ToBoolean(st["running"])
+                      && !(st.ContainsKey("idle") && Convert.ToBoolean(st["idle"]));
+        }
+        catch (Exception) { }
+        if (running && _mtBanner != null)
+        {
+            _mtBannerLbl.Text = (_lang == 0 ? "最大タブを " : "Max tabs -> ") + _maxtabs
+                + (_lang == 0 ? " に変更しました。" : ".");
+            _mtBanner.Visibility = Visibility.Visible;
+        }
+        else if (_mtBanner != null) _mtBanner.Visibility = Visibility.Collapsed;
     }
+
+    Border _mtBanner;
+    TextBlock _mtBannerLbl;
+
+    // B: changing max-tabs during a live run -> apply now or next run.
+    UIElement BuildMtBanner()
+    {
+        _mtBanner = new Border();
+        _mtBanner.Visibility = Visibility.Collapsed;
+        _mtBanner.CornerRadius = new CornerRadius(10);
+        _mtBanner.BorderThickness = new Thickness(1);
+        _mtBanner.Padding = new Thickness(14, 9, 12, 9);
+        _mtBanner.Margin = new Thickness(26, 0, 18, 6);
+        DockPanel.SetDock(_mtBanner, Dock.Top);
+        var dp = new DockPanel();
+        var btns = new StackPanel(); btns.Orientation = Orientation.Horizontal;
+        btns.HorizontalAlignment = HorizontalAlignment.Right;
+        DockPanel.SetDock(btns, Dock.Right);
+        _mtApplyNow = new Button();
+        _mtApplyNow.Cursor = Cursors.Hand; _mtApplyNow.BorderThickness = new Thickness(0);
+        _mtApplyNow.Padding = new Thickness(12, 4, 12, 4); _mtApplyNow.FontWeight = FontWeights.SemiBold;
+        _mtApplyNow.Click += delegate { RequestSetMaxtabs(_maxtabs); _mtBanner.Visibility = Visibility.Collapsed; };
+        btns.Children.Add(_mtApplyNow);
+        _mtLater = new Button();
+        _mtLater.Cursor = Cursors.Hand; _mtLater.BorderThickness = new Thickness(1);
+        _mtLater.Padding = new Thickness(12, 4, 12, 4); _mtLater.Margin = new Thickness(8, 0, 0, 0);
+        _mtLater.Click += delegate { _mtBanner.Visibility = Visibility.Collapsed; };
+        btns.Children.Add(_mtLater);
+        dp.Children.Add(btns);
+        _mtBannerLbl = new TextBlock();
+        _mtBannerLbl.VerticalAlignment = VerticalAlignment.Center; _mtBannerLbl.FontSize = 13;
+        dp.Children.Add(_mtBannerLbl);
+        _mtBanner.Child = dp;
+        return _mtBanner;
+    }
+    Button _mtApplyNow, _mtLater;
 
     Button MiniButton(string txt)
     {
@@ -456,6 +516,14 @@ class CockpitWindow : Window
         }
         if (_startBtn != null) { _startBtn.Background = Accent; _startBtn.Foreground = White; }
         if (_startNote != null) _startNote.Foreground = Muted;
+        if (_mtBanner != null)
+        {
+            _mtBanner.Background = new SolidColorBrush(Mix(C("#ea580c"), CardColor(), 0.12));
+            _mtBanner.BorderBrush = Accent;
+            if (_mtBannerLbl != null) _mtBannerLbl.Foreground = Fg;
+        }
+        if (_mtApplyNow != null) { _mtApplyNow.Background = Accent; _mtApplyNow.Foreground = White; }
+        if (_mtLater != null) { _mtLater.Background = BtnBg; _mtLater.Foreground = Fg; _mtLater.BorderBrush = Border; }
         Relabel();
     }
 
@@ -466,6 +534,8 @@ class CockpitWindow : Window
         if (_startBtn != null) _startBtn.Content = T("start");
         if (_goalInput != null) _goalInput.ToolTip = T("goalhint");
         if (_startNote != null && string.IsNullOrEmpty(_startNote.Text)) _startNote.Text = T("goalhint");
+        if (_mtApplyNow != null) _mtApplyNow.Content = _lang == 0 ? "今すぐ反映" : "Apply now";
+        if (_mtLater != null) _mtLater.Content = _lang == 0 ? "次回起動から" : "Next run";
     }
 
     void ApplyTheme()
@@ -507,10 +577,12 @@ class CockpitWindow : Window
         {
             _header.Text = T("title");
             _sub.Text = T("idle");
-            if (_lastSig != "IDLE") { _cards.Children.Clear(); _lastSig = "IDLE"; }
+            string isig = "IDLE" + _history.Count + (_dark ? "D" : "L") + _lang;
+            if (_lastSig != isig) { _cards.Children.Clear(); AppendHistory(); _lastSig = isig; }
             return;
         }
         UpdateHeader(root);                 // live elapsed every tick
+        ArchiveTerminal(root);              // stack finished/released tasks into history
         string sig = Sig(root);
         if (sig == _lastSig) return;
         _lastSig = sig;
@@ -543,6 +615,7 @@ class CockpitWindow : Window
     {
         var sb = new StringBuilder();
         sb.Append(_dark ? "D" : "L").Append(_lang).Append('|');
+        sb.Append("h").Append(_history.Count).Append('|');
         sb.Append(S(root, "done_count")).Append('/').Append(S(root, "total")).Append('|');
         object wo;
         if (root.TryGetValue("workers", out wo) && wo is object[])
@@ -591,9 +664,75 @@ class CockpitWindow : Window
     {
         _cards.Children.Clear();
         object wo;
-        if (!root.TryGetValue("workers", out wo) || !(wo is object[])) return;
-        foreach (object o in (object[])wo)
-            _cards.Children.Add(Card((Dictionary<string, object>)o));
+        if (root.TryGetValue("workers", out wo) && wo is object[])
+            foreach (object o in (object[])wo)
+                _cards.Children.Add(Card((Dictionary<string, object>)o));
+        AppendHistory();
+    }
+
+    void AppendHistory()
+    {
+        if (_history.Count == 0) return;
+        var head = new DockPanel();
+        head.Margin = new Thickness(8, 18, 8, 4);
+        var clear = new Button();
+        clear.Content = (_lang == 0 ? "クリア (" : "Clear (") + _history.Count + ")";
+        clear.Cursor = Cursors.Hand; clear.BorderThickness = new Thickness(1);
+        clear.Background = BtnBg; clear.Foreground = Fg; clear.BorderBrush = Border;
+        clear.Padding = new Thickness(10, 2, 10, 2); clear.FontSize = 12;
+        clear.Click += delegate { ClearHistory(); };
+        DockPanel.SetDock(clear, Dock.Right);
+        head.Children.Add(clear);
+        var ht = new TextBlock();
+        ht.Text = (_lang == 0 ? "履歴 — クリアするまで蓄積（クリックで会話を表示）" : "History — stacks until cleared (click to open)");
+        ht.Foreground = Muted; ht.FontSize = 12.5; ht.VerticalAlignment = VerticalAlignment.Center;
+        head.Children.Add(ht);
+        _cards.Children.Add(head);
+
+        // newest first
+        for (int i = _history.Count - 1; i >= 0; i--)
+        {
+            var e = _history[i] as Dictionary<string, object>;
+            if (e == null) continue;
+            _cards.Children.Add(HistoryRow(e));
+        }
+    }
+
+    Border HistoryRow(Dictionary<string, object> e)
+    {
+        string status = S(e, "status");
+        string ck = ColorKey(status);
+        string conv = S(e, "conv_url");
+        var row = new Border();
+        row.BorderThickness = new Thickness(1);
+        row.BorderBrush = Border; row.Background = CardBg;
+        row.CornerRadius = new CornerRadius(9);
+        row.Padding = new Thickness(14, 8, 14, 8); row.Margin = new Thickness(8, 3, 8, 3);
+        var dp = new DockPanel();
+        var pill = Pill(StatusLabel(status), ck);
+        pill.Margin = new Thickness(0, 0, 10, 0);
+        DockPanel.SetDock(pill, Dock.Left);
+        dp.Children.Add(pill);
+        var turns = new TextBlock();
+        turns.Text = T("turn") + " " + I(e, "turn");
+        turns.Foreground = Muted; turns.FontSize = 11.5;
+        turns.VerticalAlignment = VerticalAlignment.Center;
+        turns.HorizontalAlignment = HorizontalAlignment.Right;
+        DockPanel.SetDock(turns, Dock.Right);
+        dp.Children.Add(turns);
+        var goal = new TextBlock();
+        goal.Text = S(e, "goal"); goal.Foreground = Fg; goal.FontSize = 13;
+        goal.VerticalAlignment = VerticalAlignment.Center;
+        goal.TextTrimming = TextTrimming.CharacterEllipsis;
+        dp.Children.Add(goal);
+        row.Child = dp;
+        if (!string.IsNullOrEmpty(conv))
+        {
+            row.Cursor = Cursors.Hand;
+            string url = conv;
+            row.MouseLeftButtonUp += delegate { OpenConv(url); };
+        }
+        return row;
     }
 
     Border Card(Dictionary<string, object> w)
@@ -603,6 +742,7 @@ class CockpitWindow : Window
         string status = S(w, "status");
         string reason = S(w, "reason");
         string last = S(w, "last");
+        string conv = S(w, "conv_url");
         int turn = I(w, "turn");
         bool closed = string.Equals(S(w, "closed"), "True", StringComparison.OrdinalIgnoreCase);
         bool terminal = status == "done" || status == "stuck" || status == "maxturns"
@@ -697,6 +837,13 @@ class CockpitWindow : Window
         }
 
         card.Child = col;
+        if (!string.IsNullOrEmpty(conv))
+        {
+            card.Cursor = Cursors.Hand;
+            string url = conv;
+            card.MouseLeftButtonUp += delegate { OpenConv(url); };
+            card.ToolTip = _lang == 0 ? "クリックでこの会話をメインに表示" : "Click to open this conversation in the chat";
+        }
         return card;
     }
 
@@ -763,5 +910,89 @@ class CockpitWindow : Window
             File.WriteAllText(_commandsPath, _js.Serialize(cmd), Encoding.UTF8);
         }
         catch (Exception) { }
+    }
+
+    void RequestSetMaxtabs(int n)
+    {
+        try
+        {
+            var cmd = new Dictionary<string, object>();
+            cmd["set_maxtabs"] = n;
+            File.WriteAllText(_commandsPath, _js.Serialize(cmd), Encoding.UTF8);
+        }
+        catch (Exception) { }
+    }
+
+    // ① groundwork: ask the chat to open this conversation (it polls open.json).
+    void OpenConv(string url)
+    {
+        if (string.IsNullOrEmpty(url)) return;
+        try
+        {
+            _openSeq++;
+            var o = new Dictionary<string, object>();
+            o["url"] = url; o["ts"] = _openSeq;
+            File.WriteAllText(_openPath, _js.Serialize(o), Encoding.UTF8);
+        }
+        catch (Exception) { }
+    }
+
+    // ── persistent history: finished/released tasks stack until cleared ───────────
+    void LoadHistory()
+    {
+        _history = new List<object>();
+        _archivedKeys = new System.Collections.Generic.HashSet<string>();
+        try
+        {
+            if (!File.Exists(_historyPath)) return;
+            var arr = _js.DeserializeObject(File.ReadAllText(_historyPath, Encoding.UTF8)) as object[];
+            if (arr == null) return;
+            foreach (object o in arr)
+            {
+                _history.Add(o);
+                var d = o as Dictionary<string, object>;
+                if (d != null && d.ContainsKey("key")) _archivedKeys.Add(S(d, "key"));
+            }
+        }
+        catch (Exception) { }
+    }
+    void SaveHistory()
+    {
+        try { File.WriteAllText(_historyPath, _js.Serialize(_history), Encoding.UTF8); }
+        catch (Exception) { }
+    }
+    void ClearHistory()
+    {
+        _history.Clear(); _archivedKeys.Clear();
+        try { if (File.Exists(_historyPath)) File.Delete(_historyPath); } catch (Exception) { }
+        ForceRender();
+    }
+    void ArchiveTerminal(Dictionary<string, object> root)
+    {
+        object wo;
+        if (!root.TryGetValue("workers", out wo) || !(wo is object[])) return;
+        string started = S(root, "started");
+        bool added = false;
+        foreach (object o in (object[])wo)
+        {
+            var w = (Dictionary<string, object>)o;
+            string status = S(w, "status");
+            bool terminal = status == "done" || status == "stuck" || status == "maxturns"
+                            || status == "error" || status == "cancelled";
+            if (!terminal) continue;
+            string conv = S(w, "conv_url");
+            // STABLE key per run+worker (conv_url is absent in the final snapshot, so
+            // keying on it would double-archive the same task).
+            string key = started + "#" + S(w, "name");
+            if (_archivedKeys.Contains(key)) continue;
+            _archivedKeys.Add(key);
+            var e = new Dictionary<string, object>();
+            e["key"] = key; e["goal"] = S(w, "goal"); e["status"] = status;
+            e["outcome"] = S(w, "outcome"); e["conv_url"] = conv;
+            e["turn"] = I(w, "turn"); e["seq"] = _history.Count;
+            _history.Add(e);
+            added = true;
+        }
+        if (added) SaveHistory();
     }
 }
