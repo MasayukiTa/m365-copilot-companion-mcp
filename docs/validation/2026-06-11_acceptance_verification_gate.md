@@ -84,6 +84,46 @@ Copilot 側からしか呼べず、枠（ループ）の受け入れゲートと
     --goal "..." --check "{\"type\":\"shell\",\"cmd\":\"python -m pytest -q\"}"
 ```
 
+## 追補 2026-06-12: ライブE2E実証 ＋ ツール使用の可観測性
+
+### (1) ライブE2E実証（実機の Copilot 相手にゲートが発火）
+ユニット/結合だけでなく、**実機の M365 Copilot impl エージェント**にゲート付きゴールを1本流して
+end-to-end を実証した。
+- ゴール: 「gate_live_demo/result.txt に 1〜20 の二乗和(=2870)だけを run_python で計算し
+  write_file で保存」。チェック: `file_contains result.txt "2870"`（枠がディスク上の実ファイルを
+  独立検証）。
+- 1回目は**環境要因で失敗**: アイドル放置の headless Edge が新規タブ生成でハング→内蔵
+  watchdog が 150s で hard-reset→タブクローズ→`TargetClosedError`→worker ERROR(turn 0)。
+  ゲートには未到達（=実装ではなく Edge 劣化）。空きRAM ~2.2GB と低かった。
+- hard-reset 後の Edge は健全化（新規タブ composer 描画 10.6s を実測で確認）。**再試行で成功**:
+  worker 進行 t1(実行中)→t2→**検証中(verifying)**→DONE、**89.2s / 2ターン**、`result.txt = 2870`。
+  チェック付きゴールで DONE に到達できるのは全チェック PASS 時のみ＝**ライブで地上検証が効いた証拠**。
+- 既知の小欠落を修正: 最終スナップショットが `verified`/`verify_attempts` を欠いていた
+  （`run_relay_fleet` の返却と fleet_runner 最終 snapshot に追加）。
+
+### (2) ツール使用の可観測性（Copilot の MCP 呼び出しを記録）
+relay が Copilot を駆動する際、エージェントの MCP ツール呼び出し(read_file/write_file/run_python…)は
+**チャットDOMに出ず**「何を編集/実行したか」が見えない（Claude Code は標準で見せる）。これを
+サーバ側で記録可能にした。
+- 新規 `tools/trace_ops.py`: `wrap_for_trace(fn)` が**シグネチャ・型注釈・名前・docstring を完全保存**
+  したラッパで各呼び出しを `.companion_runs/toolcalls_YYYY-MM-DD.jsonl` に追記(ts/name/ok/dur_ms/
+  args(束縛名付・truncate)/result/error)。`toolcalls_tail(n)` で読み出し（MCPツール化）。
+- **既定 OFF**: 環境変数 `MCP_TRACE_TOOLCALLS` 未設定なら `wrap_for_trace` は fn をそのまま返す
+  ＝挙動ゼロ変更。`register()` に配線済だが OFF では無影響。
+- **安全性の決定的検証**: `main.py` を **tracing OFF と ON 両方**でロード→FastMCP が **138 ツール
+  全部を公開**（`write_file` 等ラップ対象含む）。ラッパがスキーマ生成を壊さないことを実機ビルドで確認。
+  稼働中サーバは無傷（次回 restart で取り込み、フラグ ON にして初めて記録開始）。
+- テスト `tools/test_trace.py` **11/11**（OFF時は同一関数オブジェクト返却／ON時シグネチャ完全一致／
+  束縛名付き記録／例外も記録し再送出／長大引数 truncate）。
+
+合計テストは **58/58**（acceptance 18・fleet-verify 12・folder-verify 8・relay-loop 9・trace 11）。
+
+### 残課題（追補）
+- attach 中に Edge が hard-reset されると worker が**終端 ERROR**になりゴールが失われる（上記1回目）。
+  回復可能扱い（pending 戻し or FleetContextLost 化）にする堅牢化は別途。
+- tracing の**実ライブ記録**はサーバを `MCP_TRACE_TOOLCALLS=1` で再起動して初めて出る（本追補では
+  スキーマ無破壊までを実機確認、実記録はユニットで確認）。
+
 ## 限界・残（正直に）
 
 - ゲートはユーザ（オペレータ）がチェックを与えたゴールにだけ効く。チェック無しゴールは
