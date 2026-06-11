@@ -225,15 +225,21 @@ class RelayWorker:
 
 
 def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
-                    notify=default_notify, on_tick=None, max_concurrent=None):
+                    notify=default_notify, on_tick=None, max_concurrent=None,
+                    mc_box=None):
     """Drive len(goals) autonomous relays in parallel to completion, but never with
     more than `max_concurrent` tabs open at once (defaults to what free RAM allows).
     A goal's tab is opened only when a slot frees and CLOSED the moment it finishes.
+
+    `mc_box`, if given, is a 1-element list whose value is read EACH loop -- so the
+    cockpit can raise/lower the live concurrency cap mid-run (set_maxtabs command).
 
     Returns a list of {name, goal, outcome, turns, reason} in goal order. `on_tick`
     (workers) is called after each round-robin sweep -- use it to log live progress."""
     if max_concurrent is None:
         max_concurrent = auto_concurrency(len(goals))
+    if mc_box is None:
+        mc_box = [max_concurrent]
     workers = [RelayWorker(g, "w%d" % i, max_turns=max_turns)
                for i, g in enumerate(goals)]
     pending = list(workers)            # FIFO queue of not-yet-attached workers
@@ -243,8 +249,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                    if w.page is not None and w.status not in TERMINAL)
 
     while any(w.status not in TERMINAL for w in workers):
-        # fill free tab slots from the pending queue (memory-bounded)
-        while pending and _active_open() < max_concurrent:
+        # fill free tab slots from the pending queue (memory-bounded, live cap)
+        while pending and _active_open() < max(1, mc_box[0]):
             w = pending.pop(0)
             if w.status in TERMINAL:   # (shouldn't happen, but be safe)
                 continue
