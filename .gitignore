@@ -30,6 +30,14 @@ dist/
 .companion_runs/
 .companion_gates/
 
+# Resumable bootstrap (setup.bat -> scripts/bootstrap.py)
+.setup/
+# Generated connector helper embeds the real MCP_API_KEY -> never commit it.
+# The redacted template and the README are kept tracked (see ! lines).
+generated/*
+!generated/README.md
+!generated/copilot-connector.template.md
+
 # Demo artifacts that agents may emit into the server CWD via relative paths
 copilot_loop_demo/
 companion_loop_demo/
@@ -86,3 +94,5 @@ desktop.ini
 *.bak
 ~$*
 .cache/
+
+ui/*.exe
