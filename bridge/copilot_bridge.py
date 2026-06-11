@@ -155,61 +155,100 @@ def _wait_composer(timeout=40):
     return False
 
 
-def _try_delete_conversation(url):
-    """Delete the backing Copilot conversation for real, by id, via the GENERAL
-    /chat view (its history lists conversations from every agent as bare-UUID rows
-    and -- unlike the agent-scoped view -- exposes a working per-conversation delete).
-    Targets ONLY the exact conversation id; never touches another. Restores the
-    bridge to a fresh agent chat afterward. Returns (ok, reason)."""
-    if not url or "/conversation/" not in url:
-        return False, "no conversation id in url"
-    cid = url.split("/conversation/")[1].split("?")[0].split("#")[0]
+def _try_delete_conversation(url, title=""):
+    """Delete the backing Copilot conversation via the GENERAL /chat history rail.
+    The rail rows (captured live 2026-06) are a <div> holding a TITLE button
+    (aria-label = the conversation title) and a "More" button (aria-label="More",
+    aria-haspopup="menu") -- the rows carry NO id/href, so we match by EXACT title and
+    act ONLY when it is UNIQUE (so we never delete a different conversation). Returns
+    (ok, reason); on any miss the caller falls back to opening it for manual delete."""
+    title = (title or "").strip()
+    if not title:
+        return False, "no title to match (history rows carry no conversation id)"
     ok, reason = False, "not run"
+
+    def _count(t):
+        return PAGE.evaluate(
+            "(t)=>[].slice.call(document.querySelectorAll('button[aria-label]'))"
+            ".filter(function(b){return b.getAttribute('aria-label')===t;}).length", t)
+
     try:
-        PAGE.goto("https://m365.cloud.microsoft/chat", wait_until="domcontentloaded")
-        PAGE.wait_for_timeout(8000)             # let the history sidebar populate
-        try:
-            PAGE.keyboard.press("Escape")        # dismiss any stale grounding popup
-        except Exception:
-            pass
-        row = PAGE.locator('button[id="%s"]' % cid)
-        if row.count() == 0:                     # one reload in case the list was stale
-            PAGE.reload(wait_until="domcontentloaded")
-            PAGE.wait_for_timeout(6000)
-            row = PAGE.locator('button[id="%s"]' % cid)
-        if row.count() == 0:
-            ok, reason = False, "conversation row not found in /chat history"
+        PAGE.goto("https://m365.cloud.microsoft/chat", wait_until="commit", timeout=30000)
+        found = 0
+        for _ in range(20):                      # let the history rail populate
+            PAGE.wait_for_timeout(1000)
+            found = _count(title)
+            if found:
+                break
+        if found < 1:
+            ok, reason = False, "conversation '%s' not found in history" % title[:30]
         else:
-            row.first.scroll_into_view_if_needed()
-            row.first.hover()
-            PAGE.wait_for_timeout(800)
-            # element-dispatch click the row's "More" button -- a coordinate click
-            # lands on the agent-switcher/grounding menu instead (the old failure).
-            handle = PAGE.evaluate_handle(
-                """(cid) => { const b = document.getElementById(cid); if (!b) return null;
-                    const p = b.parentElement; if (!p) return null;
-                    return [].slice.call(p.querySelectorAll('button')).find(
-                        function (x) { return x !== b && x.getAttribute('aria-haspopup') === 'menu'; }) || null; }""",
-                cid)
-            el = handle.as_element()
-            if el is None:
-                ok, reason = False, "More button not found for row"
+            # open the FIRST matching rail row's More menu via element-dispatch (a
+            # coordinate click can miss; the same title may render more than once).
+            opened = PAGE.evaluate(
+                """(title) => {
+                    var tbs = [].slice.call(document.querySelectorAll('button[aria-label]'))
+                        .filter(function(b){return b.getAttribute('aria-label')===title;});
+                    for (var i=0;i<tbs.length;i++){
+                        var row = tbs[i].parentElement;
+                        while (row && row.querySelectorAll('button[aria-label="More"]').length===0 && row!==document.body) row = row.parentElement;
+                        var more = row ? row.querySelector('button[aria-label="More"]') : null;
+                        if (more){ more.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window})); return true; }
+                    }
+                    return false;
+                }""", title)
+            if not opened:
+                ok, reason = False, "More button not found for the row"
             else:
-                el.click()
-                PAGE.wait_for_timeout(700)
-                mi = PAGE.locator('[role="menuitem"][aria-label="削除"]')
+                PAGE.wait_for_timeout(900)
+                # the 削除 menuitem resolves via the accessibility tree (name), not a
+                # plain attribute selector; force-click (it fades in).
+                mi = PAGE.get_by_role("menuitem", name="削除", exact=True)
                 if mi.count() == 0:
-                    mi = PAGE.get_by_role("menuitem", name="削除", exact=True)
-                mi.first.click(timeout=3000)
-                PAGE.wait_for_timeout(700)
-                cb = PAGE.locator('[role="alertdialog"] button:has-text("削除する")')
-                if cb.count() == 0:
-                    cb = PAGE.get_by_role("button", name="削除する")
-                cb.first.click(timeout=3000)
-                PAGE.wait_for_timeout(1300)
-                gone = PAGE.evaluate("(cid) => !document.getElementById(cid)", cid)
-                ok = bool(gone)
-                reason = "deleted" if ok else "delete did not apply"
+                    mi = PAGE.locator('[role="menuitem"][aria-label="削除"]')
+                mi_ok = True
+                try:
+                    mi.first.click(timeout=4000, force=True)
+                except Exception:
+                    ok, reason, mi_ok = False, "delete menuitem click failed", False
+                if mi_ok:
+                    PAGE.wait_for_timeout(1200)
+                    # confirm "削除する": Playwright force-click first -- it sends a TRUSTED
+                    # event (a dispatched MouseEvent has isTrusted=false and React may ignore
+                    # it); force skips the stability wait on the fading-in dialog button.
+                    cf = False
+                    try:
+                        cb = PAGE.get_by_role("button", name="削除する")
+                        if cb.count() == 0:
+                            cb = PAGE.locator('[role="alertdialog"] button:has-text("削除する"), [role="dialog"] button:has-text("削除する"), button:has-text("削除する")')
+                        cb.first.click(timeout=5000, force=True)
+                        cf = True
+                    except Exception:
+                        cf = PAGE.evaluate(
+                            """() => { var scope = [].slice.call(document.querySelectorAll('[role="alertdialog"],[role="dialog"]'));
+                                if (!scope.length) scope=[document.body];
+                                for (var k=0;k<scope.length;k++){
+                                    var b=[].slice.call(scope[k].querySelectorAll('button')).find(function(x){
+                                        var t=((x.innerText||'')+' '+(x.getAttribute('aria-label')||''));
+                                        return t.indexOf('削除')>=0 && t.indexOf('キャンセル')<0; });
+                                    if(b){ b.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window})); return true; } }
+                                return false; }""")
+                    if not cf:
+                        ok, reason = False, "confirm button not found"
+                    else:
+                        # the live rail does NOT refresh after a delete -> reload /chat
+                        # and re-count to verify the row really went away.
+                        PAGE.wait_for_timeout(1500)
+                        try:
+                            PAGE.reload(wait_until="commit", timeout=20000)
+                        except Exception:
+                            pass
+                        for _ in range(16):
+                            PAGE.wait_for_timeout(700)
+                            if _count(title) < found:
+                                ok = True
+                                break
+                        reason = "deleted" if ok else "delete may not have applied"
     except Exception as e:
         try:
             PAGE.keyboard.press("Escape")
@@ -219,7 +258,7 @@ def _try_delete_conversation(url):
     # restore the bridge to a fresh agent chat so the next message goes to the agent
     try:
         if AGENT_URL:
-            PAGE.goto(AGENT_URL, wait_until="domcontentloaded")
+            PAGE.goto(AGENT_URL, wait_until="domcontentloaded", timeout=20000)
             _wait_composer()
     except Exception:
         pass
@@ -449,9 +488,11 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/delete":       # best-effort: delete the Copilot conversation
             if BUSY:
                 self._json({"ok": False, "error": "busy"}); return
-            url = (urllib.parse.parse_qs(parsed.query).get("url") or [""])[0]
+            q = urllib.parse.parse_qs(parsed.query)
+            url = (q.get("url") or [""])[0]
+            title = (q.get("title") or [""])[0]
             try:
-                ok, reason = _try_delete_conversation(url)
+                ok, reason = _try_delete_conversation(url, title)
             except Exception as e:
                 ok, reason = False, str(e)
             self._json({"ok": ok, "error": reason})

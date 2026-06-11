@@ -705,6 +705,7 @@ class ChatWindow : Window
     void ExecuteDelete(Conversation c, int mode)
     {
         var url = c.ConvUrl;
+        var title = c.Title ?? "";   // the /chat history rows carry no id -> match by title
         DeleteLocal(c);
         if (mode == 1) { Toast(T("t_local")); return; }
         if (mode == 2)
@@ -718,7 +719,7 @@ class ChatWindow : Window
         new Thread((ThreadStart)delegate
         {
             bool ok = false;
-            try { var j = HttpGet("/delete?url=" + Uri.EscapeDataString(url)); ok = j != null && j.Contains("\"ok\": true"); } catch { }
+            try { var j = HttpGet("/delete?url=" + Uri.EscapeDataString(url) + "&title=" + Uri.EscapeDataString(title)); ok = j != null && j.Contains("\"ok\": true"); } catch { }
             Dispatcher.BeginInvoke(new Action(delegate
             {
                 if (ok) Toast(T("t_auto_ok"));
