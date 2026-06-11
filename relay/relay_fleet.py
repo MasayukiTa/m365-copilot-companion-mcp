@@ -76,16 +76,26 @@ def auto_concurrency(n_goals, per_tab_mb=700, headroom_mb=2048, hard_cap=4):
 def _open_fresh(context, url):
     """Open a NEW tab on a fresh chat of the agent. Tolerant of slow navigation
     (a busy Edge can miss the 30s domcontentloaded) -- we proceed and wait for the
-    composer to render either way."""
+    composer to render either way. If a sign-in page appears, the background Edge is
+    surfaced once so the user can authenticate."""
+    from .edge_recover import surface, looks_like_login
     pg = context.new_page()
     try:
         pg.goto(url, wait_until="domcontentloaded", timeout=60000)
     except Exception:
         pass
+    surfaced = False
     for _ in range(45):
         pg.wait_for_timeout(1000)
         if pg.locator(COPILOT_SELECTORS["composer"]).count() > 0:
             return pg
+        if not surfaced:
+            try:
+                if looks_like_login(pg.url):
+                    surface()                 # auth needed -> bring the window forward
+                    surfaced = True
+            except Exception:
+                pass
     return pg
 
 
