@@ -275,16 +275,108 @@ class ChatWindow : Window
         catch { _openMtime = 0; }
         var openTimer = new DispatcherTimer();
         openTimer.Interval = TimeSpan.FromMilliseconds(800);
-        openTimer.Tick += delegate { CheckOpenRequest(); SyncRegistry(); };
+        openTimer.Tick += delegate { CheckOpenRequest(); SyncRegistry(); CheckFleetSnapshot(); };
         openTimer.Start();
         SyncRegistry();
     }
 
     string _openPath; long _openMtime;
     string _convsPath; long _convsMtime;
+    string _activeFleetUrl;              // conv URL of the fleet snapshot currently shown (null = none)
+    long _statusMtime;                   // last-seen mtime of status.json (for live re-render)
 
     static string SS(Dictionary<string, object> d, string k)
     { return (d.ContainsKey(k) && d[k] != null) ? d[k].ToString() : ""; }
+
+    // status.json lives next to conversations.json (.fleet/). Read the worker dict whose
+    // "conv_url" matches 'url' (the cockpit cards render exactly this live per-worker state).
+    // Returns null when status.json is missing/unreadable or no worker matches.
+    Dictionary<string, object> ReadFleetWorker(string url)
+    {
+        if (string.IsNullOrEmpty(url)) return null;
+        try
+        {
+            string statusPath = Path.Combine(Path.GetDirectoryName(_convsPath), "status.json");
+            if (!File.Exists(statusPath)) return null;
+            string txt;
+            using (var fsr = new FileStream(statusPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var sr = new StreamReader(fsr, Encoding.UTF8)) txt = sr.ReadToEnd();
+            var d = _cjs.DeserializeObject(txt) as Dictionary<string, object>;
+            if (d == null || !d.ContainsKey("workers") || !(d["workers"] is object[])) return null;
+            foreach (object o in (object[])d["workers"])
+            {
+                var w = o as Dictionary<string, object>;
+                if (w != null && SS(w, "conv_url") == url) return w;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    // Build a readable live snapshot from a status.json worker dict: goal/status/outcome,
+    // turn N/max, plan steps, latest response, verification state, and reason. Mirrors the
+    // cockpit card so the main chat shows progress when /history can't be scraped.
+    void RenderFleetSnapshot(Dictionary<string, object> w)
+    {
+        bool ja = _lang == 0;
+        AddUser(SS(w, "goal"));
+
+        var sb = new StringBuilder();
+        string status = SS(w, "status");
+        string outcome = SS(w, "outcome");
+        string head = string.IsNullOrEmpty(outcome) ? status : (status + " / " + outcome);
+        sb.Append(ja ? "状態: " : "Status: ").Append(string.IsNullOrEmpty(head) ? (ja ? "(不明)" : "(unknown)") : head);
+        string turn = SS(w, "turn"); string maxt = SS(w, "max_turns");
+        if (!string.IsNullOrEmpty(turn))
+        {
+            sb.Append(ja ? "　ターン " : "   Turn ").Append(turn);
+            if (!string.IsNullOrEmpty(maxt)) sb.Append("/").Append(maxt);
+        }
+        sb.Append('\n');
+
+        // plan steps
+        if (w.ContainsKey("plan") && w["plan"] is object[])
+        {
+            var steps = (object[])w["plan"];
+            if (steps.Length > 0)
+            {
+                sb.Append('\n').Append(ja ? "計画:" : "Plan:").Append('\n');
+                int n = 1;
+                foreach (object s in steps)
+                {
+                    if (s == null) continue;
+                    sb.Append("  ").Append(n).Append(". ").Append(s.ToString()).Append('\n');
+                    n++;
+                }
+            }
+        }
+
+        // latest scraped response
+        string last = SS(w, "last");
+        if (!string.IsNullOrEmpty(last))
+            sb.Append('\n').Append(ja ? "最新の応答:" : "Latest response:").Append('\n').Append(last).Append('\n');
+
+        // verification state
+        string verified = SS(w, "verified");
+        string vattempts = SS(w, "verify_attempts");
+        if (!string.IsNullOrEmpty(verified) || !string.IsNullOrEmpty(vattempts))
+        {
+            string vstr;
+            if (verified == "True") vstr = ja ? "検証OK" : "verified";
+            else if (verified == "False") vstr = ja ? "未検証" : "not verified";
+            else vstr = ja ? "検証中/未判定" : "pending";
+            sb.Append('\n').Append(ja ? "検証: " : "Verification: ").Append(vstr);
+            if (!string.IsNullOrEmpty(vattempts)) sb.Append(ja ? "（試行 " : " (attempts ").Append(vattempts).Append(ja ? "）" : ")");
+            sb.Append('\n');
+        }
+
+        // reason
+        string reason = SS(w, "reason");
+        if (!string.IsNullOrEmpty(reason))
+            sb.Append('\n').Append(ja ? "理由: " : "Reason: ").Append(reason).Append('\n');
+
+        AddAssistant(sb.ToString().TrimEnd('\n'));
+    }
 
     List<object> ReadConvsRegistry()
     {
@@ -426,14 +518,67 @@ class ChatWindow : Window
             _messages.Children.Add(note);
             foreach (var m in loaded) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
             if (loaded.Count == 0)
-                AddAssistant(_lang == 0
-                    ? "（この会話の本文を読み込めませんでした。別タブで進行中だと履歴が取れないことがあります。"
-                      + "進捗はコックピットのカード＝状態・計画・検証・結果でご確認ください。）"
-                    : "(Couldn't load this conversation's body -- history can be unavailable while it's "
-                      + "open in another tab. Watch progress on the cockpit card instead: status, plan, verification, outcome.)");
+            {
+                // /history is empty (in-progress / can't-scrape). Show the LIVE per-worker
+                // state from status.json instead of a misleading "couldn't load" fallback.
+                var w = ReadFleetWorker(url);
+                if (w != null)
+                {
+                    RenderFleetSnapshot(w);
+                    _activeFleetUrl = url;   // arm live re-render in the poll timer
+                    try { string sp = Path.Combine(Path.GetDirectoryName(_convsPath), "status.json"); _statusMtime = File.Exists(sp) ? File.GetLastWriteTimeUtc(sp).Ticks : 0; }
+                    catch { _statusMtime = 0; }
+                }
+                else
+                {
+                    _activeFleetUrl = null;
+                    AddAssistant(_lang == 0
+                        ? "（この会話の本文はまだ取得できません。進行中のため履歴が空の可能性があります。）"
+                        : "(This conversation's transcript isn't available yet -- it may be empty while the run is in progress.)");
+                }
+            }
+            else
+            {
+                _activeFleetUrl = null;   // full transcript shown; no snapshot to keep live
+            }
             RefreshConvList();
             _scroll.ScrollToEnd();
         }));
+    }
+
+    // Re-render the live fleet snapshot in place (called from the poll timer when
+    // status.json changes and a fleet snapshot is the active view). Cheap: only touches
+    // the message panel when the matching worker is still present.
+    void RefreshFleetSnapshot()
+    {
+        if (string.IsNullOrEmpty(_activeFleetUrl)) return;
+        if (_conv == null || _conv.ConvUrl != _activeFleetUrl) return;   // user navigated away
+        var w = ReadFleetWorker(_activeFleetUrl);
+        if (w == null) return;
+        _messages.Children.Clear();
+        var note = new TextBlock { Text = T("fleetview_note"), TextWrapping = TextWrapping.Wrap, FontSize = 12.5, Margin = new Thickness(2, 2, 2, 10) };
+        SetRef(note, TextBlock.ForegroundProperty, "Muted");
+        _messages.Children.Add(note);
+        RenderFleetSnapshot(w);
+        _scroll.ScrollToEnd();
+    }
+
+    // If a fleet snapshot is the active view, re-render it when status.json's mtime changes
+    // so the user sees progress update live in the main chat (mirrors the cockpit refresh).
+    void CheckFleetSnapshot()
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(_activeFleetUrl)) return;
+            if (_conv == null || _conv.ConvUrl != _activeFleetUrl) { _activeFleetUrl = null; return; }
+            string sp = Path.Combine(Path.GetDirectoryName(_convsPath), "status.json");
+            if (!File.Exists(sp)) return;
+            long m = File.GetLastWriteTimeUtc(sp).Ticks;
+            if (m == _statusMtime) return;
+            _statusMtime = m;
+            RefreshFleetSnapshot();
+        }
+        catch { }
     }
 
     // ── small helpers ───────────────────────────────────────────────────────────
