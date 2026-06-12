@@ -40,6 +40,17 @@ def main():
     check("extract_drops_marker", all("PLAN_READY" not in s for s in plan))
     check("extract_count", len(plan) == 4)
 
+    # unmarked paragraph plan (one step per line under a '...:' header) -- the REAL format
+    # the live agent used (no numbers). Steps after the header are kept; the agent-name
+    # preamble before it and the PLAN_READY line are dropped.
+    unmarked = ("takeuchifile操作\n実行計画:\n"
+                "fibo.py を replace_in_file で修正する。\n"
+                "shell_exec で pytest -q を実行して確認する。\n"
+                "失敗したら出力を分析して再修正する。\nPLAN_READY")
+    up = extract_plan(unmarked)
+    check("extract_unmarked", len(up) == 3 and "takeuchifile操作" not in " ".join(up)
+          and any("replace_in_file" in s for s in up))
+
     # --- worker plan flow ---
     w = RelayWorker("g", "w0", plan_mode=True)
     check("plan_initial_job", w.job.startswith(PLAN_PROMPT[:10]) and w.goal in w.job)
