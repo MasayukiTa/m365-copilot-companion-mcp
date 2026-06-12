@@ -113,6 +113,7 @@ class ChatWindow : Window
         if (k == "running_note") return ja ? "走行中：Copilot側の削除は停止します（ローカル一覧からのみ削除）。" : "A run is live: Copilot-side delete is disabled (local list only).";
         if (k == "select_all") return ja ? "全選択" : "Select all";
         if (k == "clear_all") return ja ? "全解除" : "Clear";
+        if (k == "fetch_copilot") return ja ? "Copilot側から一覧取得" : "Fetch from Copilot";
         if (k == "del_selected") return ja ? "選択した会話を削除" : "Delete selected";
         if (k == "close") return ja ? "閉じる" : "Close";
         if (k == "untitled") return ja ? "(無題)" : "(untitled)";
@@ -1037,6 +1038,9 @@ class ChatWindow : Window
         SetRef(selAll, BackgroundProperty, "PanelAlt"); SetRef(selAll, ForegroundProperty, "Fg"); SetRef(selAll, Control.BorderBrushProperty, "Border");
         var clrAll = new Button { Content = T("clear_all"), Cursor = Cursors.Hand, FontSize = 12, Padding = new Thickness(12, 5, 12, 6), Margin = new Thickness(0, 0, 10, 0), BorderThickness = new Thickness(1) };
         SetRef(clrAll, BackgroundProperty, "PanelAlt"); SetRef(clrAll, ForegroundProperty, "Fg"); SetRef(clrAll, Control.BorderBrushProperty, "Border");
+        var fetchBtn = new Button { Content = T("fetch_copilot"), Cursor = Cursors.Hand, FontSize = 12, Padding = new Thickness(12, 5, 12, 6), Margin = new Thickness(0, 0, 10, 0), BorderThickness = new Thickness(1) };
+        SetRef(fetchBtn, BackgroundProperty, "PanelAlt"); SetRef(fetchBtn, ForegroundProperty, "Fg"); SetRef(fetchBtn, Control.BorderBrushProperty, "Border");
+        if (localOnly) fetchBtn.IsEnabled = false;   // a run is live -> don't touch the page
         var countLbl = new TextBlock { Text = "", FontSize = 12.5, VerticalAlignment = VerticalAlignment.Center };
         SetRef(countLbl, TextBlock.ForegroundProperty, "Muted");
         var closeBtn = new Button { Content = T("close"), Cursor = Cursors.Hand, FontSize = 12.5, Padding = new Thickness(16, 6, 16, 7), Margin = new Thickness(8, 0, 0, 0), BorderThickness = new Thickness(1), FontWeight = FontWeights.SemiBold };
@@ -1050,6 +1054,7 @@ class ChatWindow : Window
         footer.Children.Add(delBtn);
         footer.Children.Add(selAll);
         footer.Children.Add(clrAll);
+        footer.Children.Add(fetchBtn);
         footer.Children.Add(countLbl);
         DockPanel.SetDock(footer, Dock.Bottom);
         dock.Children.Add(footer);
@@ -1066,6 +1071,8 @@ class ChatWindow : Window
         // parallel structure: each checkbox -> its conversation
         var boxes = new List<CheckBox>();
         var convOf = new Dictionary<CheckBox, Conversation>();
+        // orphans fetched from the Copilot side (agent rail) -- not in the local registry.
+        var fetched = new List<Conversation>();
 
         // count label updater (declared via array so inner delegates can call it)
         var updateCount = new Action[1];
@@ -1090,12 +1097,9 @@ class ChatWindow : Window
             if (pi == 1) cutoff = now - 24 * 3600;
             else if (pi == 2) cutoff = now - 7 * 24 * 3600;
             else if (pi == 3) cutoff = now - 30 * 24 * 3600;
-            foreach (var c in _all)
+            // build a row for one conversation; orphan rows (fetched) always show.
+            Action<Conversation, bool> addRow = delegate (Conversation cc, bool isOrphan)
             {
-                if (string.IsNullOrEmpty(c.ConvUrl)) continue;
-                if (!all && c.Source != "fleet") continue;
-                if (!(c.Ts == 0 || c.Ts >= cutoff)) continue;
-                var cc = c;
                 var row = new DockPanel { Margin = new Thickness(8, 5, 8, 5) };
                 var cb = new CheckBox { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 0) };
                 cb.Checked += delegate { updateCount[0](); };
@@ -1104,7 +1108,7 @@ class ChatWindow : Window
                 var raw = string.IsNullOrEmpty(cc.Title) ? T("untitled") : cc.Title;
                 if (raw.Length > 50) raw = raw.Substring(0, 50) + "…";
                 var meta = new TextBlock { FontSize = 11, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8, 0, 0, 0) };
-                SetRef(meta, TextBlock.ForegroundProperty, "Muted");
+                SetRef(meta, TextBlock.ForegroundProperty, isOrphan ? "Accent" : "Muted");
                 meta.Text = BulkDateStr(cc.Ts) + (string.IsNullOrEmpty(cc.Source) ? "" : ("  " + cc.Source));
                 DockPanel.SetDock(meta, Dock.Right);
                 var tt = new TextBlock { Text = raw, FontSize = 12.5, VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis };
@@ -1115,6 +1119,26 @@ class ChatWindow : Window
                 listPanel.Children.Add(row);
                 boxes.Add(cb);
                 convOf[cb] = cc;
+            };
+            var shownUrls = new System.Collections.Generic.HashSet<string>();
+            foreach (var c in _all)
+            {
+                if (string.IsNullOrEmpty(c.ConvUrl)) continue;
+                if (!all && c.Source != "fleet") continue;
+                if (!(c.Ts == 0 || c.Ts >= cutoff)) continue;
+                shownUrls.Add(c.ConvUrl);
+                addRow(c, false);
+            }
+            // append Copilot-side orphans not already shown above (always visible, ignoring
+            // the fleet/period filter -- the user explicitly asked Copilot for these).
+            foreach (var c in fetched)
+            {
+                if (string.IsNullOrEmpty(c.ConvUrl)) continue;
+                if (shownUrls.Contains(c.ConvUrl)) continue;
+                bool inAll = false;
+                foreach (var x in _all) if (x.ConvUrl == c.ConvUrl) { inAll = true; break; }
+                if (inAll) continue;
+                addRow(c, true);
             }
             updateCount[0]();
         };
@@ -1126,6 +1150,54 @@ class ChatWindow : Window
         clrAll.Click += delegate { foreach (var cb in boxes) cb.IsChecked = false; };
 
         var progressLbl = countLbl; // reuse the live label for progress during deletion
+
+        // "Copilot側から一覧取得": pull the agent's own conversation rail (incl. orphans not
+        // in the local registry) and show them as checkbox rows for selective deletion.
+        fetchBtn.Click += delegate
+        {
+            fetchBtn.IsEnabled = false;
+            progressLbl.Text = (_lang == 0) ? "Copilotから取得中…" : "Fetching from Copilot…";
+            new Thread((ThreadStart)delegate
+            {
+                string j = null; string err = null;
+                try { j = HttpGet("/agent_conversations", 120000); }
+                catch (Exception ex) { err = ex.GetType().Name; }
+                var orphans = new List<Conversation>();
+                int n = 0;
+                if (j != null)
+                {
+                    try
+                    {
+                        var root = _cjs.DeserializeObject(j) as Dictionary<string, object>;
+                        if (root != null && root.ContainsKey("conversations") && root["conversations"] is object[])
+                        {
+                            foreach (var o in (object[])root["conversations"])
+                            {
+                                var d = o as Dictionary<string, object>;
+                                if (d == null) continue;
+                                string url = SS(d, "url"); string title = SS(d, "title");
+                                if (string.IsNullOrEmpty(url)) continue;
+                                orphans.Add(new Conversation { ConvUrl = url, Title = title, Source = "copilot", Ts = 0 });
+                                n++;
+                            }
+                        }
+                        else if (root != null && root.ContainsKey("error")) err = SS(root, "error");
+                    }
+                    catch (Exception ex) { err = "parse: " + ex.GetType().Name; }
+                }
+                int dn = n; string derr = err;
+                Dispatcher.Invoke(new Action(delegate
+                {
+                    fetched.Clear();
+                    fetched.AddRange(orphans);
+                    rebuild[0]();
+                    progressLbl.Text = (derr != null)
+                        ? ((_lang == 0) ? ("取得失敗: " + derr) : ("Fetch failed: " + derr))
+                        : ((_lang == 0) ? ("Copilotから " + dn + "件取得（橙=ローカル未登録の孤児）") : (dn + " fetched from Copilot (orange = orphans)"));
+                    fetchBtn.IsEnabled = !BulkRunLive();
+                }));
+            }) { IsBackground = true }.Start();
+        };
 
         delBtn.Click += delegate
         {
@@ -1147,6 +1219,7 @@ class ChatWindow : Window
             {
                 int deleted = 0, copilotFail = 0;
                 var deletedUrls = new System.Collections.Generic.HashSet<string>();
+                var failReasons = new Dictionary<string, int>();  // reason bucket -> count
                 for (int i = 0; i < selected.Count; i++)
                 {
                     var c = selected[i];
@@ -1163,17 +1236,26 @@ class ChatWindow : Window
                     deleted++;
                     if (!localOnly && !string.IsNullOrEmpty(c.ConvUrl))
                     {
-                        bool ok = false;
+                        bool ok = false; string reason = null;
                         try
                         {
-                            var j = HttpGet("/delete?url=" + Uri.EscapeDataString(c.ConvUrl) + "&title=" + Uri.EscapeDataString(c.Title ?? ""));
+                            // a Copilot-side delete (goto + menu ops + GUID-disappearance verify) can take
+                            // ~40s; give it 120s so the HTTP call doesn't time out mid-delete.
+                            var j = HttpGet("/delete?url=" + Uri.EscapeDataString(c.ConvUrl) + "&title=" + Uri.EscapeDataString(c.Title ?? ""), 120000);
                             ok = j != null && j.Contains("\"ok\": true");
+                            if (!ok) reason = ExtractField(j, "reason") ?? ExtractField(j, "error");
                         }
-                        catch { }
-                        if (!ok) copilotFail++;
+                        catch (Exception ex) { reason = "timeout/http: " + ex.GetType().Name; }
+                        if (!ok)
+                        {
+                            copilotFail++;
+                            string bucket = DeleteFailBucket(reason);
+                            failReasons[bucket] = (failReasons.ContainsKey(bucket) ? failReasons[bucket] : 0) + 1;
+                        }
                     }
                 }
                 int dDeleted = deleted, dFail = copilotFail;
+                string failDetail = SummarizeFailReasons(failReasons);
                 Dispatcher.Invoke(new Action(delegate
                 {
                     UnregisterConvs(deletedUrls);
@@ -1181,8 +1263,8 @@ class ChatWindow : Window
                     RefreshConvList();
                     rebuild[0]();
                     string summary = (_lang == 0)
-                        ? (dDeleted + "件削除しました" + (dFail > 0 ? ("（Copilot側 " + dFail + "件失敗）") : ""))
-                        : ("Deleted " + dDeleted + (dFail > 0 ? (" (" + dFail + " Copilot-side failed)") : ""));
+                        ? (dDeleted + "件削除しました" + (dFail > 0 ? ("（Copilot側 " + dFail + "件失敗" + (failDetail.Length > 0 ? (": " + failDetail) : "") + "）") : ""))
+                        : ("Deleted " + dDeleted + (dFail > 0 ? (" (" + dFail + " Copilot-side failed" + (failDetail.Length > 0 ? (": " + failDetail) : "") + ")") : ""));
                     progressLbl.Text = summary;
                     delBtn.IsEnabled = true; selAll.IsEnabled = true; clrAll.IsEnabled = true;
                     showAll.IsEnabled = true; period.IsEnabled = true; closeBtn.IsEnabled = true;
@@ -1765,13 +1847,39 @@ class ChatWindow : Window
         RefreshConvList();
     }
 
-    string HttpGet(string path)
+    string HttpGet(string path) { return HttpGet(path, 60000); }
+
+    string HttpGet(string path, int timeoutMs)
     {
         var req = (HttpWebRequest)WebRequest.Create(_bridge + path);
-        req.Timeout = 60000;
+        req.Timeout = timeoutMs;
+        req.ReadWriteTimeout = timeoutMs;
         using (var resp = (HttpWebResponse)req.GetResponse())
         using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
             return sr.ReadToEnd();
+    }
+
+    // Map a raw bridge delete reason to a short, stable bucket key for the summary.
+    static string DeleteFailBucket(string reason)
+    {
+        if (string.IsNullOrEmpty(reason)) return "unknown";
+        string r = reason.ToLowerInvariant();
+        if (r.Contains("guid mismatch") || r.Contains("unreachable") || r.Contains("row absent")) return "guid mismatch";
+        if (r.Contains("timeout") || r.Contains("timed out")) return "timeout";
+        if (r.Contains("busy")) return "busy";
+        if (r.Contains("not found") || r.Contains("not found in history")) return "not found";
+        if (r.Contains("may not have applied") || r.Contains("still present")) return "unverified";
+        if (r.Contains("confirm button")) return "confirm failed";
+        if (r.Contains("menuitem")) return "menu failed";
+        return "other";
+    }
+
+    static string SummarizeFailReasons(Dictionary<string, int> buckets)
+    {
+        if (buckets == null || buckets.Count == 0) return "";
+        var parts = new List<string>();
+        foreach (var kv in buckets) parts.Add(kv.Key + " ×" + kv.Value);
+        return string.Join(", ", parts.ToArray());
     }
 
     static string ExtractField(string json, string field)
