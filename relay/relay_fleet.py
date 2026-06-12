@@ -355,7 +355,8 @@ class RelayWorker:
             self.steer_msgs.append(text)
 
     def _begin_send(self):
-        if self.turn >= self.max_turns:
+        # max_turns=0 (or falsy) means unlimited -- no turn-cap check at all.
+        if self.max_turns and self.turn >= self.max_turns:
             # before reporting MAXTURNS, see if the workspace ALREADY satisfies the goal's
             # acceptance checks -- if so the result is proven-done and we finish DONE+verified
             # rather than labeling an already-correct artifact MAXTURNS.

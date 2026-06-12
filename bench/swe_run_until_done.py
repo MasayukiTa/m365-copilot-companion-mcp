@@ -163,8 +163,9 @@ def run_round(insts):
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "ascii:replace"
     p = subprocess.Popen(
+        # ユーザー指示によりターン無制限 (2026-06-13): max-turns=0 = unlimited
         [VENVPY, "-m", "relay.fleet_runner", "--goals-file", GOALS,
-         "--max-concurrent", str(ARGS.max_concurrent), "--max-turns", "20",
+         "--max-concurrent", str(ARGS.max_concurrent), "--max-turns", "0",
          "--max-transient", "10"],
         cwd=REPO, env=env)
     log("launched fleet_runner pid %d on %d instance(s) (max-concurrent=%d)"
