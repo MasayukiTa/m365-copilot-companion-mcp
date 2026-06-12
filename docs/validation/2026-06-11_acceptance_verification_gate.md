@@ -262,6 +262,36 @@ test_fleet_refute に panel 2 ケース追加（過半REFUTED→差し戻し／�
 全体テスト **121/121**（acceptance20・fleet-verify12・folder-verify8・relay-loop9・code-task12・refuter15・
 fleet-refute12・trace11・repo-map9・planner14）、`main.py` ビルド成功。
 
+## 追補 2026-06-12 (7): 全項目実装＋プランのライブ実証＋差を開く
+
+ユーザー「1,2,3 すべて、承認なし・検証込みで継続」を受けて全部入れた。
+
+### #1 forge-in-the-loop（operator A, 差を開く）
+agent がタスク中に `FORGE: <名前>` ＋ ```python``` で再利用ツールを自作→`forge_core`(枠側・unlock不要・
+**実行せず compile 検証のみ**)で tools/auto/ に常設化。run_relay `--forge`(既定OFF・上限)。test_forge 9/9。
+
+### #2 プラン提示→承認→実行のライブ実証
+`code_task --plan` を実機投入→**status `awaiting`(承認待ち)で計画提示し一時停止**を確認→**承認を steering
+(commands.json)で送信**→**再開・実行→calc.py を a+b 修正→pytest PASS→DONE verified 2ターン**。
+Claude Code の plan ループを実機で実証。extract_plan は実機書式に合わせ寛容化(全角句読点/Step N/markdown)。
+パネルは単一relay/フリート両方 + 多視点プロンプトでユニット実証(ライブは2倍コストのため単発精査用)。
+
+### #3 Edge 自動リサイクル（信頼性）
+`companion_edge_mb`(専用プロファイルのみ計測=本体Edge隔離, 実測831MB)＋`should_recycle`(肥大>1.5GB/
+低RAM<1GB)。fleet_runner が **run 前に肥大/低RAM Edge を hard-reset** してクリーン起動(`--no-recycle`)。
+test_recycle 7/7。send 成功検知も「新回答ブロック出現=送信成功」を追加し低RAM下の誤失敗を解消。
+
+### 差を開く: 永続プロジェクトメモリ（Claude Code の手書き CLAUDE.md を超える）
+`project_memory.py`=完了タスク毎に(goal/outcome/要点)をフォルダ別 JSON に自動記録→次タスク冒頭に注入。
+**手間ゼロでコードベース理解を蓄積**。test_project_memory 9/9。
+
+### README 更新
+「自律コーディング・エージェント」章を JP/EN 追加（検証ゲート・自然言語・自動検証・リポマップ・プラン・
+パネル・forge・トレース・コスト、頭脳=Opus 4.8 で知能同等・UI 駆動が天井）。
+
+**全体テスト 147/147**（+forge9・recycle7・project-memory9）、`main.py` ビルド成功。コミット多数(facc663..fbc572f)。
+**重要訂正反映: 頭脳は Opus 4.8=Claude本体と同じ→知能の天井は無い。残る差はUI駆動の信頼性のみ。機構~80%/実用~65%、複数軸で本家超え。**
+
 ## 限界・残（正直に）
 
 - ゲートはユーザ（オペレータ）がチェックを与えたゴールにだけ効く。チェック無しゴールは
