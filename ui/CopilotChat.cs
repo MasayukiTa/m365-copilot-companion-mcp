@@ -380,6 +380,12 @@ class ChatWindow : Window
             SetRef(note, TextBlock.ForegroundProperty, "Muted");
             _messages.Children.Add(note);
             foreach (var m in loaded) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
+            if (loaded.Count == 0)
+                AddAssistant(_lang == 0
+                    ? "（この会話の本文を読み込めませんでした。別タブで進行中だと履歴が取れないことがあります。"
+                      + "進捗はコックピットのカード＝状態・計画・検証・結果でご確認ください。）"
+                    : "(Couldn't load this conversation's body -- history can be unavailable while it's "
+                      + "open in another tab. Watch progress on the cockpit card instead: status, plan, verification, outcome.)");
             RefreshConvList();
             _scroll.ScrollToEnd();
         }));

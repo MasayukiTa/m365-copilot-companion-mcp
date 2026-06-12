@@ -431,6 +431,16 @@ class CockpitWindow : Window
             string instr = PromptInstruction();
             if (string.IsNullOrEmpty(instr)) return;
 
+            // plan-first? Yes -> propose a numbered plan and pause as 承認待ち; you approve
+            // or edit it with a steer (the W card's steer box) to start execution.
+            var mb = System.Windows.MessageBox.Show(this,
+                _lang == 0 ? "先に実行計画を提示して承認を待ちますか？\n\nはい = 計画提示 → 承認待ち（カードに steer で承認/修正を送ると実行）\nいいえ = すぐ実行"
+                           : "Propose a plan first and wait for your approval?\n\nYes = plan -> 承認待ち (steer the card to approve/edit)\nNo = run now",
+                _lang == 0 ? "コーディング起動" : "Start coding",
+                System.Windows.MessageBoxButton.YesNoCancel, System.Windows.MessageBoxImage.Question);
+            if (mb == System.Windows.MessageBoxResult.Cancel) return;
+            bool plan = mb == System.Windows.MessageBoxResult.Yes;
+
             string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
             string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
             if (!File.Exists(py)) py = "python";
@@ -441,7 +451,8 @@ class CockpitWindow : Window
             var psi = new System.Diagnostics.ProcessStartInfo();
             psi.FileName = py;
             psi.Arguments = "-m relay.code_task -i \"" + instr.Replace("\"", "'")
-                + "\" -f \"" + folder + "\" --state-dir \"" + stateDir + "\"";
+                + "\" -f \"" + folder + "\" --state-dir \"" + stateDir + "\""
+                + (plan ? " --plan" : "");
             psi.WorkingDirectory = repo; psi.UseShellExecute = false; psi.CreateNoWindow = true;
             try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
 
@@ -449,8 +460,10 @@ class CockpitWindow : Window
             p.StartInfo = psi;
             p.Start();
             _startNote.Text = _lang == 0
-                ? "コーディングタスクを開始（検証方法は自動検出。テスト/コンパイルが通るまで完了しません）。"
-                : "Coding task started (verification auto-detected; not done until tests/compile pass).";
+                ? (plan ? "コーディング(計画モード)を開始。計画提示後「承認待ち」になります。カードに承認/修正を steer で送ってください。"
+                        : "コーディングタスクを開始（検証方法は自動検出。テスト/コンパイルが通るまで完了しません）。")
+                : (plan ? "Coding (plan mode) started -> it will pause at 承認待ち; steer the card to approve/edit."
+                        : "Coding task started (auto-verified; not done until tests/compile pass).");
         }
         catch (Exception ex)
         {
