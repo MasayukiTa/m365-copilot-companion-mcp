@@ -74,6 +74,20 @@ COPILOT_SELECTORS = {
     # (the text just sits in the composer) -- clicking this button does. aria-label
     # is locale-specific; cover JP + EN.
     "send_button": 'button[aria-label="送信"], button[aria-label="Send"]',
+    # Where the Copilot-generated conversation title renders. M365 surfaces the auto-
+    # generated chat name in a few places depending on layout; we try each in order and
+    # take the first non-empty, sane-looking string. Best-effort only -- every selector
+    # here is allowed to miss, and conversation_title() falls back to document.title and
+    # then to "" (the caller then falls back to the goal text). These are isolated here
+    # so a Microsoft DOM change is a one-line patch, like the other selectors.
+    "conv_title": (
+        '[data-testid="conversation-title"], '
+        '[data-testid="chat-title"], '
+        '[data-testid="copilot-chat-header-title"], '
+        'h1[class*="title"], '
+        'header h1, header h2, '
+        '[role="heading"][aria-level="1"]'
+    ),
 }
 
 PROTOCOL = (
@@ -437,6 +451,66 @@ class CopilotWebDriver:
         if len(lines) >= 2 and lines[0].strip() and lines[0].strip() == lines[1].strip():
             lines = lines[1:]
         return "\n".join(lines).strip()
+
+    def conversation_title(self) -> str:
+        """Best-effort scrape of the Copilot-generated conversation title.
+
+        M365 Copilot auto-names a chat a beat after the first turn (e.g. "FizzBuzz
+        スクリプトの作成"). The cockpit/chat use this as the card/conversation headline
+        when present (else they fall back to the goal text), so capturing it is a pure
+        readability win. This is COMPLETELY best-effort: any failure -> "" and the caller
+        keeps its existing goal-derived title. Never raises.
+
+        Order: a header/title DOM node (conv_title selector) first, then document.title
+        with the trailing app-name chrome stripped. We reject placeholders ("新しいチャット"
+        / "New chat" / "Copilot") and over-long blobs so we never overwrite a good goal
+        title with junk; the caller treats "" as 'no title captured'.
+        """
+        def _clean(s):
+            try:
+                s = " ".join((s or "").split())
+            except Exception:
+                return ""
+            if not s:
+                return ""
+            low = s.lower()
+            # placeholders / app chrome that are NOT a real conversation name
+            bad = ("新しいチャット", "新しい チャット", "new chat", "microsoft 365 copilot",
+                   "m365 copilot", "copilot")
+            if low in bad or s in ("Copilot", "Microsoft 365 Copilot"):
+                return ""
+            if len(s) > 120:                 # a runaway scrape (whole page text etc.)
+                return ""
+            return s
+
+        # 1) a dedicated title node in the conversation header
+        try:
+            loc = self.page.locator(COPILOT_SELECTORS["conv_title"])
+            n = min(loc.count(), 5)
+            for i in range(n):
+                try:
+                    t = _clean(loc.nth(i).inner_text())
+                except Exception:
+                    t = ""
+                if t:
+                    return t
+        except Exception:
+            pass
+
+        # 2) the browser tab title, minus the " - Microsoft 365 Copilot" style suffix
+        try:
+            dt = self.page.title() or ""
+            for sep in (" | ", " - ", " — ", " · "):
+                if sep in dt:
+                    dt = dt.split(sep, 1)[0]
+                    break
+            t = _clean(dt)
+            if t:
+                return t
+        except Exception:
+            pass
+
+        return ""
 
 
 def run_relay(
