@@ -63,12 +63,24 @@ function Write-Log($msg) {
 }
 
 function Test-ServerUp {
+    # A TCP-only connect check cannot detect the failure mode where the port stays
+    # LISTENING but the asyncio event loop is dead (every request times out, CLOSE_WAIT
+    # piles up) -- seen 2026-06-12. Issue a real HTTP GET instead: the server has no
+    # /health endpoint, but any HTTP status on /mcp (FastMCP answers GET with 4xx when
+    # headers don't qualify for a stream) proves the app layer is processing requests.
+    # Only a timeout / connect failure / no-response counts as down.
     try {
-        $client = New-Object System.Net.Sockets.TcpClient
-        $iar = $client.BeginConnect("127.0.0.1", $Port, $null, $null)
-        $ok = $iar.AsyncWaitHandle.WaitOne(2000, $false) -and $client.Connected
-        $client.Close()
-        return $ok
+        $req = [System.Net.WebRequest]::Create("http://127.0.0.1:$Port/mcp")
+        $req.Method = "GET"
+        $req.Timeout = 5000
+        $req.ReadWriteTimeout = 5000
+        $resp = $req.GetResponse()
+        $resp.Close()
+        return $true
+    } catch [System.Net.WebException] {
+        $r = $_.Exception.Response
+        if ($r) { $r.Close(); return $true }   # 4xx/5xx = app responded = alive
+        return $false                           # timeout, refused, reset = down
     } catch { return $false }
 }
 
