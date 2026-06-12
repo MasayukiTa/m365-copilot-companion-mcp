@@ -53,6 +53,30 @@ class _Job:
 _JOBS: dict[str, _Job] = {}
 _LOCK = threading.Lock()
 
+# Light, bounded cleanup so the in-memory job table can't grow without limit over a
+# long-lived server. Finished jobs older than _JOB_TTL_S are dropped; if the table is
+# still over _JOB_MAX after that, the oldest finished jobs are evicted. Running jobs are
+# never evicted. Caller must hold _LOCK.
+_JOB_TTL_S = 6 * 3600
+_JOB_MAX = 500
+
+
+def _prune_jobs_locked() -> None:
+    now = time.time()
+    for jid, j in list(_JOBS.items()):
+        j.refresh()
+        if j.finished_at is not None and (now - j.finished_at) > _JOB_TTL_S:
+            del _JOBS[jid]
+    if len(_JOBS) > _JOB_MAX:
+        finished = [
+            (j.finished_at, jid)
+            for jid, j in _JOBS.items()
+            if j.finished_at is not None
+        ]
+        finished.sort()
+        for _, jid in finished[: len(_JOBS) - _JOB_MAX]:
+            _JOBS.pop(jid, None)
+
 
 def _create_log_paths() -> tuple[str, str]:
     base = Path(tempfile.gettempdir()) / "m365-copilot-companion-mcp-jobs"
@@ -86,21 +110,27 @@ def run_in_background(
                 return f"[run_in_background error: not a directory: {p}]"
             cwd = str(p)
         out_path, err_path = _create_log_paths()
-        out_f = open(out_path, "w", encoding="utf-8")
-        err_f = open(err_path, "w", encoding="utf-8")
-        proc = subprocess.Popen(
-            command,
-            shell=True,
-            stdout=out_f,
-            stderr=err_f,
-            cwd=cwd,
-        )
+        # Close the parent's file handles right after Popen inherits them, or the
+        # server leaks two FDs per background job until process exit -> with the rest
+        # of the CLOSE_WAIT pile-up this contributes to FD exhaustion. The child keeps
+        # its own inherited copies; job_output reads the files back by path.
+        with open(out_path, "w", encoding="utf-8") as out_f, open(
+            err_path, "w", encoding="utf-8"
+        ) as err_f:
+            proc = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=out_f,
+                stderr=err_f,
+                cwd=cwd,
+            )
         job = _Job("shell", label or command[:60], command)
         job.process = proc
         job.stdout_path = out_path
         job.stderr_path = err_path
         with _LOCK:
             _JOBS[job.id] = job
+            _prune_jobs_locked()
         return f"job_id: {job.id}\nlabel: {job.label}\npid: {proc.pid}\nstarted_at: {job.started_at:.0f}"
     except Exception as e:
         return f"[run_in_background error: {type(e).__name__}: {e}]"
@@ -123,19 +153,23 @@ def run_python_in_background(code: str, label: str = "") -> str:
             f.write(code)
             script_path = f.name
         out_path, err_path = _create_log_paths()
-        out_f = open(out_path, "w", encoding="utf-8")
-        err_f = open(err_path, "w", encoding="utf-8")
-        proc = subprocess.Popen(
-            [sys.executable, script_path],
-            stdout=out_f,
-            stderr=err_f,
-        )
+        # Close parent FDs after Popen inherits them (see run_in_background) to avoid a
+        # two-FD-per-job leak.
+        with open(out_path, "w", encoding="utf-8") as out_f, open(
+            err_path, "w", encoding="utf-8"
+        ) as err_f:
+            proc = subprocess.Popen(
+                [sys.executable, script_path],
+                stdout=out_f,
+                stderr=err_f,
+            )
         job = _Job("python", label or "python script", script_path)
         job.process = proc
         job.stdout_path = out_path
         job.stderr_path = err_path
         with _LOCK:
             _JOBS[job.id] = job
+            _prune_jobs_locked()
         return f"job_id: {job.id}\nlabel: {job.label}\npid: {proc.pid}"
     except Exception as e:
         return f"[run_python_in_background error: {type(e).__name__}: {e}]"

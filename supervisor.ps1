@@ -30,11 +30,14 @@ param(
     # live tunnel host while "fixing" a tunnel that didn't exist. Keep this current.
     [string]$TunnelName = "companion-mcp",
     [int]$Port = 8000,
-    [int]$IntervalSeconds = 10,
+    [int]$IntervalSeconds = 15,
     # Consecutive failed checks required before acting. Debounce avoids killing a
     # healthy tunnel on a single transient "devtunnel show" glitch (false positive),
-    # which would itself cause an outage.
-    [int]$FailuresBeforeAction = 2
+    # which would itself cause an outage. Raised 2 -> 4 (2026-06-13): tool bodies now
+    # run off the event loop, so the loop should never stall, but a higher debounce is
+    # cheap insurance against a single slow /health response triggering a needless kill
+    # that would tear down a live Copilot MCP session.
+    [int]$FailuresBeforeAction = 4
 )
 
 $ErrorActionPreference = "SilentlyContinue"
@@ -68,12 +71,15 @@ function Write-Log($msg) {
 function Test-ServerUp {
     # A TCP-only connect check cannot detect the failure mode where the port stays
     # LISTENING but the asyncio event loop is dead (every request times out, CLOSE_WAIT
-    # piles up) -- seen 2026-06-12. Issue a real HTTP GET instead: the server has no
-    # /health endpoint, but any HTTP status on /mcp (FastMCP answers GET with 4xx when
-    # headers don't qualify for a stream) proves the app layer is processing requests.
-    # Only a timeout / connect failure / no-response counts as down.
+    # piles up) -- seen 2026-06-12. Issue a real HTTP GET against the dedicated /health
+    # route: it is an async handler that runs directly on the event loop and does no
+    # blocking work, so it answers fast even while heavy tools run (those now run in a
+    # worker-thread pool). A fast 200 from /health = the loop is alive and servicing
+    # requests; only a timeout / connect failure / no-response counts as down. (Older
+    # builds had no /health and probed /mcp, treating any 4xx as alive; /health is a
+    # cleaner liveness signal that does not depend on MCP stream-header quirks.)
     try {
-        $req = [System.Net.WebRequest]::Create("http://127.0.0.1:$Port/mcp")
+        $req = [System.Net.WebRequest]::Create("http://127.0.0.1:$Port/health")
         $req.Method = "GET"
         $req.Timeout = 5000
         $req.ReadWriteTimeout = 5000
@@ -82,7 +88,7 @@ function Test-ServerUp {
         return $true
     } catch [System.Net.WebException] {
         $r = $_.Exception.Response
-        if ($r) { $r.Close(); return $true }   # 4xx/5xx = app responded = alive
+        if ($r) { $r.Close(); return $true }   # any HTTP status = app responded = alive
         return $false                           # timeout, refused, reset = down
     } catch { return $false }
 }
