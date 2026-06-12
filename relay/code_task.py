@@ -35,7 +35,7 @@ except Exception:
 
 
 def build_goal(instruction, folder, extra_check=None, no_verify=False,
-               with_map=True, map_chars=4000):
+               with_map=True, map_chars=4000, with_memory=True, state_dir=".fleet"):
     """Turn a natural-language instruction + folder into one self-verifying goal dict.
     Verification is auto-detected unless no_verify; extra_check (a shell command string)
     is appended on top of whatever was detected. When with_map, a compact repo map is
@@ -49,14 +49,24 @@ def build_goal(instruction, folder, extra_check=None, no_verify=False,
         checks.append({"type": "shell", "cmd": extra_check, "cwd": folder})
         notes.append("extra check: %s" % extra_check)
     prefix = ""
+    if with_memory:
+        try:
+            from relay.project_memory import load_notes
+            mem = load_notes(folder, state_dir=state_dir)
+            if mem:
+                prefix += ("--- このリポジトリでの過去の作業メモ ---\n%s\n"
+                           "--- メモここまで ---\n\n" % mem)
+                notes.append("project memory primed")
+        except Exception:
+            pass
     if with_map:
         try:
             from relay.repo_map import build_map
             m = build_map(folder, max_chars=map_chars)
             if m:
-                prefix = ("まず下記のリポジトリ地図で全体構成を把握してから着手してください"
-                          "（詳細は read_file で確認）。\n--- リポジトリ地図 ---\n%s\n"
-                          "--- 地図ここまで ---\n\n" % m)
+                prefix += ("まず下記のリポジトリ地図で全体構成を把握してから着手してください"
+                           "（詳細は read_file で確認）。\n--- リポジトリ地図 ---\n%s\n"
+                           "--- 地図ここまで ---\n\n" % m)
                 notes.append("repo map primed (%d chars)" % len(m))
         except Exception:
             pass
@@ -99,6 +109,9 @@ def main():
     ap.add_argument("--no-map", action="store_true",
                     help="do not prepend a repo map to the goal (saves prompt size on a "
                          "huge tree; default is to prime the agent with the map)")
+    ap.add_argument("--no-memory", action="store_true",
+                    help="do not prime prior project notes / record this task "
+                         "(default: accumulate per-folder memory across tasks)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the detected verification + goal and exit (do not run)")
     ap.add_argument("--state-dir", default=None,
@@ -110,9 +123,14 @@ def main():
     if not args.agent_url and not args.dry_run:
         ap.error("no agent URL -- pass --agent-url or set MCP_FLEET_AGENT_URL in .env")
 
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    state_dir = args.state_dir or os.path.join(repo, ".fleet")
+    os.makedirs(state_dir, exist_ok=True)
+
     goal, notes = build_goal(args.instruction, args.folder,
                              extra_check=args.extra_check, no_verify=args.no_verify,
-                             with_map=not args.no_map)
+                             with_map=not args.no_map,
+                             with_memory=not args.no_memory, state_dir=state_dir)
 
     print("code_task: %s" % args.instruction)
     print("  folder: %s" % os.path.abspath(args.folder))
@@ -134,9 +152,6 @@ def main():
     except Exception:
         pass
 
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    state_dir = args.state_dir or os.path.join(repo, ".fleet")
-    os.makedirs(state_dir, exist_ok=True)
     goals_file = os.path.join(state_dir, "code_task.goals.jsonl")
     with open(goals_file, "w", encoding="utf-8", newline="\n") as f:
         f.write(json.dumps(goal, ensure_ascii=False) + "\n")
@@ -157,7 +172,21 @@ def main():
     if args.plan:
         cmd.append("--plan")
     print("  launching: fleet_runner (1 tab, auto-verified)\n")
-    return subprocess.call(cmd, cwd=repo)
+    rc = subprocess.call(cmd, cwd=repo)
+
+    # accumulate per-folder project memory: record what this task did so the NEXT task on
+    # this folder is primed with it (read the outcome from the run's final status.json).
+    if not args.no_memory:
+        try:
+            from relay.project_memory import record_task
+            d = json.load(open(os.path.join(state_dir, "status.json"), encoding="utf-8"))
+            w = (d.get("workers") or [{}])[0]
+            record_task(args.folder, args.instruction, w.get("outcome") or "",
+                        note=(w.get("reason") or w.get("last") or "")[:200],
+                        state_dir=state_dir)
+        except Exception:
+            pass
+    return rc
 
 
 if __name__ == "__main__":
