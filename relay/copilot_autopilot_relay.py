@@ -345,6 +345,114 @@ class CopilotWebDriver:
             self.page.wait_for_timeout(400)
         return False
 
+    def _snapshot_send_failure(self, attempt: int, phase: str) -> None:
+        """Best-effort diagnostic snapshot written to .fleet/send_failures.jsonl.
+
+        DIAGNOSTIC ONLY. This method is fully self-contained and TOTALLY wrapped in
+        try/except: any failure (DOM eval, JSON, file IO, import) is swallowed so it
+        can NEVER alter send()'s control flow, retry count, timing, or exception. Each
+        DOM probe is individually guarded so one failed probe still records the rest,
+        leaving "err:<type>" in place of the value that could not be read.
+        """
+        try:
+            import json as _json
+            import os as _os
+            from datetime import datetime as _dt
+
+            def _probe(fn):
+                # Run one DOM/page probe under its own guard; on any error return a
+                # short "err:<ExceptionType>" marker instead of failing the snapshot.
+                try:
+                    return fn()
+                except Exception as _e:  # noqa: BLE001 - diagnostic must never raise
+                    return "err:" + type(_e).__name__
+
+            def _send_btn_loc():
+                return self.page.locator(COPILOT_SELECTORS["send_button"])
+
+            def _send_count():
+                return _send_btn_loc().count()
+
+            def _send_disabled():
+                btn = _send_btn_loc().first
+                # is_enabled() inverted; explicit so a None/odd state is still legible
+                return not btn.is_enabled()
+
+            def _send_aria_disabled():
+                return _send_btn_loc().first.get_attribute("aria-disabled")
+
+            def _send_aria_label():
+                return _send_btn_loc().first.get_attribute("aria-label")
+
+            def _send_visible():
+                return _send_btn_loc().first.is_visible()
+
+            def _composer_raw():
+                return self.page.locator(COPILOT_SELECTORS["composer"]).first.inner_text() or ""
+
+            def _composer_len():
+                return len(_composer_raw())
+
+            def _composer_head():
+                return _composer_raw()[:80]
+
+            def _visibility_state():
+                return self.page.evaluate("() => document.visibilityState")
+
+            def _has_focus():
+                return self.page.evaluate("() => document.hasFocus()")
+
+            def _conv_guid():
+                # The conversation guid is the last path segment of the M365 chat URL.
+                url = self.page.url or ""
+                seg = url.rstrip("/").rsplit("/", 1)[-1]
+                return seg or None
+
+            def _is_processing_now():
+                # _is_processing() applied to the current last-answer text: was a Stop
+                # (generation-in-progress) indicator effectively showing?
+                return _is_processing(self.read_last_response())
+
+            def _page_url():
+                return self.page.url
+
+            record = {
+                "ts": _probe(lambda: _dt.now().astimezone().isoformat()),
+                "conv_guid": _probe(_conv_guid),
+                "attempt": attempt,
+                "phase": phase,
+                "send_button": {
+                    "match_count": _probe(_send_count),
+                    "disabled": _probe(_send_disabled),
+                    "aria_disabled": _probe(_send_aria_disabled),
+                    "aria_label": _probe(_send_aria_label),
+                    "visible": _probe(_send_visible),
+                },
+                "composer": {
+                    "text_len": _probe(_composer_len),
+                    "head80": _probe(_composer_head),
+                },
+                "tab": {
+                    "visibility_state": _probe(_visibility_state),
+                    "has_focus": _probe(_has_focus),
+                },
+                "is_processing": _probe(_is_processing_now),
+                "page_url": _probe(_page_url),
+            }
+
+            out_dir = _os.path.join(str(REPO), ".fleet")
+            try:
+                _os.makedirs(out_dir, exist_ok=True)
+            except Exception:
+                pass
+            out_path = _os.path.join(out_dir, "send_failures.jsonl")
+            with open(out_path, "a", encoding="utf-8") as fh:
+                fh.write(_json.dumps(record, ensure_ascii=False) + "\n")
+                fh.flush()
+        except Exception:
+            # Diagnostic logging must never affect send(); swallow everything.
+            pass
+
     def send(self, text: str) -> None:
         # CRITICAL: a newline in the Copilot composer SUBMITS the message. Collapse
         # all whitespace (incl. newlines) to single spaces so the whole job is sent
@@ -410,6 +518,12 @@ class CopilotWebDriver:
                             btn.click(force=True, timeout=2000)
                     except Exception:
                         pass
+            # This attempt did not submit (no return above). Record a diagnostic
+            # snapshot. Pure side effect, fully guarded -- does NOT change the loop.
+            self._snapshot_send_failure(attempt=attempt, phase="attempt_failed")
+        # All 3 attempts exhausted. One final snapshot just before the RuntimeError so
+        # the terminal state is captured. Pure side effect, fully guarded.
+        self._snapshot_send_failure(attempt=3, phase="final_before_raise")
         raise RuntimeError(
             "send failed: composer still holds text after 3 attempts "
             "(Send button never submitted the message)"
