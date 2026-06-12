@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -32,6 +33,29 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+
+DELETE_LOG = REPO / ".fleet" / "delete_log.jsonl"
+GUID_RE = re.compile(r"/conversation/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
+
+
+def _conv_guid(url):
+    """Extract the /conversation/<guid> id from an agent conversation URL, or ''."""
+    if not url:
+        return ""
+    m = GUID_RE.search(url)
+    return m.group(1) if m else ""
+
+
+def _log_delete(guid, title, ok, reason):
+    """Append one delete-attempt record to .fleet/delete_log.jsonl (exception-safe)."""
+    try:
+        DELETE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        rec = {"ts": round(time.time(), 3), "guid": guid or "", "title": (title or "")[:120],
+               "ok": bool(ok), "reason": reason or ""}
+        with open(DELETE_LOG, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 from dotenv import load_dotenv
 from relay.copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver, PROCESSING_MARKERS
@@ -155,15 +179,279 @@ def _wait_composer(timeout=40):
     return False
 
 
+# ── agent-rail (the agent's own conversation list) helpers ──────────────────────
+# Discovered live (2026-06) on the companion agent page: after expanding the side nav
+# (button aria-label="ナビゲーションの展開"/"Expand navigation"), the agent's conversations
+# render inside  #m365-copilot-chats-section  as
+#   button.fui-NavSubItem[id]   where  id == value == the conversation GUID  and
+#                                aria-label == the conversation title.
+# Each row sits in a .fui-SplitNavItem that also holds a More button
+# (button.fui-SplitNavItem__menuButton, aria-label="More", aria-haspopup="menu").
+# The More menu has menuitems 名前の変更 (rename) and 削除 (delete); 削除 opens a confirm
+# dialog ("チャットを削除しますか?") with buttons 削除する / キャンセル. These are isolated
+# here so a Microsoft DOM change is a localized patch, like COPILOT_SELECTORS.
+CHATS_SECTION = "#m365-copilot-chats-section"
+NAV_ROW_SEL = CHATS_SECTION + " button.fui-NavSubItem[id]"
+
+
+def _expand_nav():
+    """Best-effort: expand the collapsed side nav so the agent's chat rail renders.
+    Harmless if already expanded (the expand button is absent)."""
+    for nm in ("ナビゲーションの展開", "Expand navigation"):
+        try:
+            b = PAGE.get_by_role("button", name=nm)
+            if b.count() > 0:
+                b.first.click(timeout=3000, force=True)
+                PAGE.wait_for_timeout(1500)
+                return
+        except Exception:
+            pass
+
+
+_RAIL_SCRAPE_JS = r"""
+() => {
+  var sec = document.getElementById('m365-copilot-chats-section');
+  if (!sec) return {ready:false, rows:[]};
+  var rows = [].slice.call(sec.querySelectorAll('button.fui-NavSubItem[id]')).map(function(b){
+    return {guid: b.id || b.getAttribute('value') || '',
+            title: (b.getAttribute('aria-label') || '').replace(/^unread\s+/, '').trim()};
+  }).filter(function(r){ return r.guid; });
+  return {ready:true, rows:rows};
+}
+"""
+
+
+def _scrape_agent_rail(settle=20):
+    """On the agent page, expand the nav and scrape the agent's conversation rail.
+    Returns a list of {guid, title}. Read-only (deletes nothing)."""
+    _expand_nav()
+    rows = []
+    for _ in range(settle):
+        try:
+            res = PAGE.evaluate(_RAIL_SCRAPE_JS)
+        except Exception:
+            res = None
+        if res and res.get("ready") and res.get("rows"):
+            rows = res["rows"]
+            break
+        PAGE.wait_for_timeout(700)
+    return rows
+
+
+def _rail_has_guid(guid):
+    """True if the rail currently lists a row whose id/value == guid."""
+    try:
+        return PAGE.evaluate(
+            "(g)=>{var s=document.getElementById('m365-copilot-chats-section');"
+            "return !!(s && s.querySelector('button.fui-NavSubItem[id=\"'+g+'\"]'));}", guid)
+    except Exception:
+        return False
+
+
+def _delete_rail_row(guid):
+    """Open the More menu for the rail row with id==guid, click 削除, confirm 削除する.
+    Returns (clicked_ok, detail). Assumes the agent rail is already rendered/expanded."""
+    # mark the row's own More button (inside its .fui-SplitNavItem) so we can click the
+    # REAL element (a forced/synthetic click can open the wrong, global nav menu).
+    marked = PAGE.evaluate(
+        r"""(guid) => {
+            var btn = document.querySelector('button.fui-NavSubItem[id="'+guid+'"]');
+            if (!btn) return {ok:false, why:'row not found'};
+            try { btn.scrollIntoView({block:'center'}); } catch(e){}
+            var wrap = btn.closest('.fui-SplitNavItem') || btn.parentElement;
+            var more = wrap ? wrap.querySelector('button[aria-haspopup="menu"], button[aria-label="More"], button.fui-SplitNavItem__menuButton') : null;
+            if (!more){ var cur=btn,d=0; while(cur&&d<4&&!more){cur=cur.parentElement; if(cur) more=cur.querySelector('button[aria-haspopup="menu"], button[aria-label="More"]'); d++; } }
+            if (!more) return {ok:false, why:'row More button not found'};
+            document.querySelectorAll('[data-fleet-more],[data-fleet-row]').forEach(function(e){e.removeAttribute('data-fleet-more');e.removeAttribute('data-fleet-row');});
+            btn.setAttribute('data-fleet-row','1');
+            more.setAttribute('data-fleet-more','1');
+            return {ok:true};
+        }""", guid)
+    if not marked or not marked.get("ok"):
+        return False, (marked or {}).get("why", "row lookup failed")
+    # The row's More button is hidden until the ROW is hovered, and the reveal/menu-open
+    # is flaky under React. So: hover the row -> click More -> poll for the 削除 menuitem;
+    # if the row menu never surfaces, RETRY the whole hover+click a couple of times.
+    def _find_delete_mi():
+        cand = PAGE.get_by_role("menuitem", name="削除", exact=True)
+        if cand.count() == 0:
+            cand = PAGE.locator('[role="menuitem"][aria-label="削除"]')
+        return cand if cand.count() > 0 else None
+
+    mi = None
+    for attempt in range(3):
+        try:
+            row = PAGE.locator('button[data-fleet-row="1"]').first
+            try:
+                row.scroll_into_view_if_needed(timeout=2000)
+            except Exception:
+                pass
+            try:
+                row.hover(timeout=3000)
+                PAGE.wait_for_timeout(350)
+            except Exception:
+                pass
+            mb = PAGE.locator('button[data-fleet-more="1"]').first
+            # hover the now-revealed More, then click it (force=True as a fallback path
+            # if the actionability check blocks a freshly-revealed element)
+            try:
+                mb.hover(timeout=2500)
+                PAGE.wait_for_timeout(200)
+                mb.click(timeout=4000)
+            except Exception:
+                mb.click(timeout=4000, force=True)
+        except Exception as e:
+            if attempt == 2:
+                return False, "More click failed: %s" % type(e).__name__
+            PAGE.wait_for_timeout(600)
+            continue
+        # the row context menu (名前の変更 / 削除) fades in -- POLL for the 削除 menuitem
+        for _ in range(8):
+            PAGE.wait_for_timeout(350)
+            cand = _find_delete_mi()
+            if cand is not None:
+                mi = cand
+                break
+        if mi is not None:
+            break
+        # menu didn't surface (or wrong menu opened) -> dismiss and retry
+        try:
+            PAGE.keyboard.press("Escape")
+        except Exception:
+            pass
+        PAGE.wait_for_timeout(500)
+    if mi is None:
+        seen = ""
+        try:
+            seen = PAGE.evaluate(
+                r"""()=>[].slice.call(document.querySelectorAll('[role="menu"]'))
+                    .filter(function(m){var r=m.getBoundingClientRect();return r.width>0&&r.height>0;})
+                    .map(function(m){return [].slice.call(m.querySelectorAll('[role="menuitem"]'))
+                        .map(function(x){return (x.getAttribute('aria-label')||x.innerText||'').slice(0,12);}).join('/');})
+                    .join(' || ').slice(0,160)""")
+        except Exception:
+            pass
+        try:
+            PAGE.keyboard.press("Escape")
+        except Exception:
+            pass
+        return False, "delete menuitem not found in row menu" + ((" [open menu: %s]" % seen) if seen else "")
+    # click the 削除 menuitem (force skips the fade-in stability wait)
+    try:
+        mi.first.click(timeout=4000, force=True)
+    except Exception as e:
+        try:
+            PAGE.keyboard.press("Escape")
+        except Exception:
+            pass
+        return False, "delete menuitem click failed: %s" % type(e).__name__
+    PAGE.wait_for_timeout(1100)
+    # confirm "削除する" in the alertdialog (trusted force-click; fall back to JS dispatch)
+    try:
+        cb = PAGE.get_by_role("button", name="削除する")
+        if cb.count() == 0:
+            cb = PAGE.locator('[role="alertdialog"] button:has-text("削除する"), [role="dialog"] button:has-text("削除する"), button:has-text("削除する")')
+        cb.first.click(timeout=5000, force=True)
+        return True, "confirmed"
+    except Exception:
+        cf = PAGE.evaluate(
+            r"""() => { var scope=[].slice.call(document.querySelectorAll('[role="alertdialog"],[role="dialog"]'));
+                if(!scope.length) scope=[document.body];
+                for(var k=0;k<scope.length;k++){
+                    var b=[].slice.call(scope[k].querySelectorAll('button')).find(function(x){
+                        var t=((x.innerText||'')+' '+(x.getAttribute('aria-label')||''));
+                        return t.indexOf('削除')>=0 && t.indexOf('キャンセル')<0; });
+                    if(b){ b.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window})); return true; } }
+                return false; }""")
+        return (bool(cf), "confirmed (js)" if cf else "confirm button not found")
+
+
+def _delete_by_guid(url, guid, title=""):
+    """GUID-primary delete: navigate to the agent conversation, verify the loaded URL's
+    GUID matches the requested GUID (certain linkage), then delete the matching rail row
+    and verify the GUID disappeared. Deletes ONLY when the linkage is certain.
+    Returns (ok, reason)."""
+    # 1) open the conversation directly and confirm we really landed on it
+    try:
+        PAGE.goto(url, wait_until="domcontentloaded", timeout=25000)
+        _wait_composer()
+        PAGE.wait_for_timeout(800)
+    except Exception as e:
+        return False, "unreachable: %s: %s" % (type(e).__name__, e)
+    landed = _conv_guid(PAGE.url or "")
+    if landed != guid:
+        # opening it bounced us elsewhere (already gone / new chat) -> do NOT delete
+        return False, "guid mismatch/unreachable (landed=%s)" % (landed or "none")
+    # 2) the rail row for this guid must be present to act on
+    _expand_nav()
+    present = False
+    for _ in range(16):
+        if _rail_has_guid(guid):
+            present = True
+            break
+        PAGE.wait_for_timeout(600)
+    if not present:
+        return False, "guid mismatch/unreachable (row absent in rail)"
+    # 3) delete via the row's More -> 削除 -> 削除する
+    clicked, detail = _delete_rail_row(guid)
+    if not clicked:
+        return False, detail
+    # 4) verify by GUID DISAPPEARANCE (not title count): the row must leave the rail
+    PAGE.wait_for_timeout(1500)
+    ok = False
+    for _ in range(18):
+        if not _rail_has_guid(guid):
+            ok = True
+            break
+        PAGE.wait_for_timeout(600)
+    if not ok:
+        # rail can lag -> hard re-check by navigating to the URL: a deleted conversation
+        # redirects away (its GUID no longer in the URL)
+        try:
+            PAGE.goto(url, wait_until="domcontentloaded", timeout=20000)
+            _wait_composer()
+            PAGE.wait_for_timeout(800)
+            if _conv_guid(PAGE.url or "") != guid:
+                ok = True
+        except Exception:
+            pass
+    return (ok, "deleted" if ok else "delete may not have applied (guid still present)")
+
+
 def _try_delete_conversation(url, title=""):
-    """Delete the backing Copilot conversation via the GENERAL /chat history rail.
+    """Delete the backing Copilot conversation. PRIMARY path: if the URL carries a
+    /conversation/<guid>, delete by GUID (certain linkage) off the AGENT rail. Only
+    when there is no GUID do we fall back to the legacy title-match on the GENERAL
+    /chat history rail (preserved verbatim below).
     The rail rows (captured live 2026-06) are a <div> holding a TITLE button
     (aria-label = the conversation title) and a "More" button (aria-label="More",
     aria-haspopup="menu") -- the rows carry NO id/href, so we match by EXACT title and
     act ONLY when it is UNIQUE (so we never delete a different conversation). Returns
     (ok, reason); on any miss the caller falls back to opening it for manual delete."""
     title = (title or "").strip()
+    guid = _conv_guid(url)
+    if guid:
+        # PRIMARY: certain GUID linkage. Delete by GUID off the agent rail.
+        try:
+            ok, reason = _delete_by_guid(url, guid, title)
+        except Exception as e:
+            try:
+                PAGE.keyboard.press("Escape")
+            except Exception:
+                pass
+            ok, reason = False, "%s: %s" % (type(e).__name__, str(e))
+        _log_delete(guid, title, ok, reason)
+        # restore the bridge to a fresh agent chat for the next message
+        try:
+            if AGENT_URL:
+                PAGE.goto(AGENT_URL, wait_until="domcontentloaded", timeout=20000)
+                _wait_composer()
+        except Exception:
+            pass
+        return ok, reason
+    # FALLBACK (no GUID in URL): legacy title-match on the GENERAL /chat history rail.
     if not title:
+        _log_delete("", title, False, "no title to match (history rows carry no conversation id)")
         return False, "no title to match (history rows carry no conversation id)"
     ok, reason = False, "not run"
 
@@ -255,6 +543,7 @@ def _try_delete_conversation(url, title=""):
         except Exception:
             pass
         ok, reason = False, "%s: %s" % (type(e).__name__, str(e))
+    _log_delete("", title, ok, reason)
     # restore the bridge to a fresh agent chat so the next message goes to the agent
     try:
         if AGENT_URL:
@@ -506,7 +795,26 @@ class Handler(BaseHTTPRequestHandler):
                 ok, reason = _try_delete_conversation(url, title)
             except Exception as e:
                 ok, reason = False, str(e)
-            self._json({"ok": ok, "error": reason})
+            # expose the reason under BOTH keys so the UI can surface it (it was dropped before)
+            self._json({"ok": ok, "error": reason, "reason": reason, "guid": _conv_guid(url)})
+            return
+        if parsed.path == "/agent_conversations":
+            # READ-ONLY: scrape the agent's own conversation rail (guid + title). Lists
+            # orphans not in the local registry. Deletes nothing. Scope = current agent.
+            if BUSY:
+                self._json({"ok": False, "error": "busy"}); return
+            try:
+                if AGENT_URL:
+                    PAGE.goto(AGENT_URL, wait_until="domcontentloaded", timeout=25000)
+                    _wait_composer()
+                rows = _scrape_agent_rail()
+                base = AGENT_URL or ((PAGE.url or "").split("/conversation/")[0])
+                convs = [{"guid": r["guid"], "title": r.get("title", ""),
+                          "url": (base.rstrip("/") + "/conversation/" + r["guid"]) if base else ""}
+                         for r in rows]
+            except Exception as e:
+                self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}); return
+            self._json({"ok": True, "count": len(convs), "conversations": convs})
             return
         if parsed.path == "/upload":       # attach a local file/image to the composer
             path = (urllib.parse.parse_qs(parsed.query).get("path") or [""])[0]
