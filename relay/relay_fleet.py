@@ -31,7 +31,8 @@ import time
 from .acceptance import Check, normalize_checks
 from .copilot_autopilot_relay import (
     CONTINUE_JOB, COPILOT_SELECTORS, CopilotWebDriver, FIX_JOB, PROTOCOL,
-    REFUTE_FIX_JOB, VERIFY_FIX_JOB, _is_processing, default_notify, reported_stuck,
+    REFUTE_FIX_JOB, RETRY_JOB, VERIFY_FIX_JOB, _is_processing, default_notify,
+    reported_stuck,
 )
 from .planner import PLAN_PROMPT, extract_plan, plan_ready
 
@@ -131,7 +132,8 @@ class RelayWorker:
 
     def __init__(self, goal, name, max_turns=1000, dwell_s=4.0,
                  per_turn_timeout_s=240, max_no_progress=3, max_verify_attempts=3,
-                 refuter=False, max_refute=2, plan_mode=False, review_lenses=None):
+                 refuter=False, max_refute=2, plan_mode=False, review_lenses=None,
+                 max_transient=10):
         self.page = None
         self.drv = None
         text, checks, cwd = goal_fields(goal)
@@ -140,6 +142,11 @@ class RelayWorker:
         self.cwd = cwd
         self.max_verify_attempts = max_verify_attempts
         self.verify_attempts = 0
+        # transient-failure retries (network/tool/send hiccups) -- the relay analog of
+        # Claude Code retrying a failed request rather than giving up. Budget + backoff.
+        self.max_transient = max_transient
+        self.transient = 0
+        self._cooldown_until = 0.0
         self.verified = None          # None=not checked, True/False after a gate ran
         self.last_verify_detail = ""
         self._pending_checks = []     # acceptance.Check specs left to run this gate
@@ -252,17 +259,37 @@ class RelayWorker:
             self._last_was_steer = True
         else:
             self._last_was_steer = False
-        self.turn += 1
         try:
             self._count_before = self.drv._answers().count()
             self.drv._count_before = self._count_before
             self.drv.send(self.job)
         except Exception as e:
+            # a send failure is a transient (CDP/Edge/network) hiccup -- retry the turn
+            # rather than giving up, up to the budget. Don't consume a turn for a failed
+            # send (turn is only counted once the send actually goes through).
+            if self._retry_transient():
+                self.reason = "send retry %d/%d (%s)" % (self.transient, self.max_transient,
+                                                         type(e).__name__)
+                return
             self.status, self.outcome = "stuck", "STUCK"
-            self.reason = "send failed: " + type(e).__name__ + ": " + str(e)
+            self.reason = "send failed after %d retries: %s: %s" % (
+                self.transient, type(e).__name__, str(e))
             return
+        self.turn += 1
         self._last_text, self._stable_since, self._t_send = None, None, time.time()
         self.status = "waiting"
+
+    def _retry_transient(self):
+        """Schedule a retry for a TRANSIENT failure (send/timeout/likely-transient STUCK),
+        up to max_transient with linear backoff -- the relay analog of Claude Code retrying
+        a failed network request. Returns True if a retry was scheduled, else False (budget
+        exhausted -> the caller should go terminal)."""
+        if self.transient >= self.max_transient:
+            return False
+        self.transient += 1
+        self._cooldown_until = time.time() + min(2.0 * self.transient, 20.0)
+        self.status = "ready"
+        return True
 
     def _decide(self, resp):
         self.last_response = resp
@@ -272,8 +299,17 @@ class RelayWorker:
         up = resp.upper()
         last_line = (resp.strip().splitlines() or [""])[-1].upper()
         if reported_stuck(resp):
-            self.status, self.outcome, self.reason = "stuck", "STUCK", "agent reported STUCK"
+            # Under load, an agent STUCK is usually a downstream symptom of a transient
+            # tool/network failure (the agent couldn't write a file etc.). Retry the turn
+            # (re-prompt to try the tools again) before giving up, up to the budget.
+            if self._retry_transient():
+                self.job = RETRY_JOB
+                self.reason = "STUCK -> transient retry %d/%d" % (self.transient, self.max_transient)
+                return
+            self.status, self.outcome, self.reason = "stuck", "STUCK", \
+                "agent reported STUCK (after %d retries)" % self.transient
             return
+        self.transient = 0   # a real (non-stuck) response -> the transient issue cleared
         # plan phase (plan_mode): capture the proposed plan and PAUSE for approval; a steer
         # (approve as-is, or an edit) resumes into execution. Don't run DONE/CONTINUE yet.
         if self.plan_mode and not self._plan_approved:
@@ -429,13 +465,20 @@ class RelayWorker:
         if self.status == "refuting":
             return self._poll_refute()
         if self.status == "ready":
+            if time.time() < self._cooldown_until:
+                return False             # waiting out a transient-retry backoff
             self._begin_send()
             self._capture_url()
             return self.status in TERMINAL
         if self.status == "waiting":
             self._capture_url()
             if time.time() - self._t_send > self.per_turn_timeout_s:
-                self.status, self.outcome, self.reason = "stuck", "STUCK", "turn timeout"
+                # a turn that never finished is a transient stall -- retry before STUCK
+                if self._retry_transient():
+                    self.reason = "turn timeout -> retry %d/%d" % (self.transient, self.max_transient)
+                    return False
+                self.status, self.outcome, self.reason = "stuck", "STUCK", \
+                    "turn timeout (after %d retries)" % self.transient
                 return True
             try:
                 if self.drv._answers().count() <= self._count_before:
@@ -459,7 +502,7 @@ class RelayWorker:
 def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     notify=default_notify, on_tick=None, max_concurrent=None,
                     mc_box=None, add_box=None, refuter=False, max_refute=2,
-                    plan_mode=False, review_lenses=None):
+                    plan_mode=False, review_lenses=None, max_transient=10):
     """Drive len(goals) autonomous relays in parallel to completion, but never with
     more than `max_concurrent` tabs open at once (defaults to what free RAM allows).
     A goal's tab is opened only when a slot frees and CLOSED the moment it finishes.
@@ -475,7 +518,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         mc_box = [max_concurrent]
     workers = [RelayWorker(g, "w%d" % i, max_turns=max_turns,
                            refuter=refuter, max_refute=max_refute, plan_mode=plan_mode,
-                           review_lenses=review_lenses)
+                           review_lenses=review_lenses, max_transient=max_transient)
                for i, g in enumerate(goals)]
     pending = list(workers)            # FIFO queue of not-yet-attached workers
 
@@ -508,7 +551,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 # item may carry checks/cwd too; goal_fields reads them (priority ignored)
                 nw = RelayWorker(item, "w%d" % len(workers), max_turns=max_turns,
                                  refuter=refuter, max_refute=max_refute,
-                                 plan_mode=plan_mode, review_lenses=review_lenses)
+                                 plan_mode=plan_mode, review_lenses=review_lenses,
+                                 max_transient=max_transient)
                 workers.append(nw)
                 if item.get("priority"):
                     pending.insert(0, nw)
