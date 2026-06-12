@@ -1,0 +1,1 @@
+{"test": "\n\nMETADATA = {}\n\n\ndef check(candidate):\n    assert candidate(50) == 0\n    assert candidate(78) == 2\n    assert candidate(79) == 3\n    assert candidate(100) == 3\n    assert candidate(200) == 6\n    assert candidate(4000) == 192\n    assert candidate(10000) == 639\n    assert candidate(100000) == 8026\n\n", "entry_point": "fizz_buzz"}

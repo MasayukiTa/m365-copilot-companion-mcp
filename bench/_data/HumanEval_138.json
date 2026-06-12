@@ -1,0 +1,1 @@
+{"test": "def check(candidate):\n    assert candidate(4) == False\n    assert candidate(6) == False\n    assert candidate(8) == True\n    assert candidate(10) == True\n    assert candidate(11) == False\n    assert candidate(12) == True\n    assert candidate(13) == False\n    assert candidate(16) == True\n", "entry_point": "is_equal_to_sum_even"}

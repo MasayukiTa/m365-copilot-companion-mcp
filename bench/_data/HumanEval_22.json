@@ -1,0 +1,1 @@
+{"test": "\n\nMETADATA = {\n    'author': 'jt',\n    'dataset': 'test'\n}\n\n\ndef check(candidate):\n    assert candidate([]) == []\n    assert candidate([4, {}, [], 23.2, 9, 'adasd']) == [4, 9]\n    assert candidate([3, 'c', 3, 3, 'a', 'b']) == [3, 3, 3]\n", "entry_point": "filter_integers"}

@@ -11,6 +11,9 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from relay.relay_fleet import RelayWorker
+from relay.copilot_autopilot_relay import (
+    transient_backoff, RETRY_INITIAL_DELAY, RETRY_MAX_DELAY,
+)
 
 results = []
 
@@ -102,6 +105,34 @@ def main():
     w.status = "waiting"; w._t_send = time.time() - 100
     term = w.poll()
     check("timeout_terminal", w.status == "stuck" and w.outcome == "STUCK")
+
+    # 6. backoff schedule is Claude-Code/SDK-style exponential with jitter (widening intervals)
+    #    base (pre-jitter) = min(0.5 * 2**(n-1), 8). Jitter only ever SHORTENS (by <=25%), so
+    #    each draw stays within (0.75*base, base]. Check the envelope per n and monotonic medians.
+    def base(n):
+        return min(RETRY_INITIAL_DELAY * (2.0 ** (n - 1)), RETRY_MAX_DELAY)
+
+    env_ok = True
+    for n in range(1, 8):
+        b = base(n)
+        for _ in range(200):
+            d = transient_backoff(n)
+            if not (0.75 * b - 1e-9 <= d <= b + 1e-9):
+                env_ok = False
+    check("backoff_envelope_per_n", env_ok)
+
+    # widening: n=1 ~0.5s, n=2 ~1s, n=3 ~2s, n=4 ~4s, n>=5 capped ~8s. Medians strictly grow 1..5.
+    def med(n):
+        xs = sorted(transient_backoff(n) for _ in range(401))
+        return xs[200]
+    meds = [med(n) for n in range(1, 6)]
+    check("backoff_widens", all(meds[i] < meds[i + 1] for i in range(4)))
+    check("backoff_caps_at_8", base(5) == RETRY_MAX_DELAY and base(9) == RETRY_MAX_DELAY
+          and all(transient_backoff(9) <= RETRY_MAX_DELAY + 1e-9 for _ in range(200)))
+
+    # Retry-After header (if ever present) takes precedence, clamped to 60s
+    check("backoff_retry_after", transient_backoff(1, retry_after=3.0) == 3.0
+          and transient_backoff(9, retry_after=120) != 120)  # >60 ignored -> falls back to cap
 
     print("\n=== %d/%d transient-retry checks passed ===" % (sum(results), len(results)))
     return 0 if all(results) else 1

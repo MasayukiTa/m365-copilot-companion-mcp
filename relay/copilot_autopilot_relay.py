@@ -47,6 +47,7 @@ NOTES
 from __future__ import annotations
 
 import argparse
+import random
 import re
 import sys
 import time
@@ -135,6 +136,35 @@ RETRY_JOB = (
     "焦らず、同じ手順をもう一度実行してください（ファイルの読み書きやコマンドを再試行）。"
     "完了したら最後の行に DONE、本当に解決不能な場合のみ STUCK: と理由を書いてください。"
 )
+
+# Claude-Code / Anthropic-SDK-style exponential backoff with jitter for transient-failure
+# retries. The SDK's _calculate_retry_timeout uses: delay = min(initial * 2**attempt, cap),
+# then subtracts up to 25% jitter (delay * (1 - 0.25*rand)); initial=0.5s, cap=8s. We mirror
+# that exactly so the wait widens 0.5 -> 1 -> 2 -> 4 -> 8s (capped), instead of the old flat
+# linear schedule. (The SDK also honors a Retry-After header when the server sends one; our
+# failures are CDP/Edge/tool hiccups with no HTTP response, so there is no header to read --
+# pass retry_after when a real one is ever available and it takes precedence, clamped to 60s.)
+RETRY_INITIAL_DELAY = 0.5
+RETRY_MAX_DELAY = 8.0
+RETRY_MULTIPLIER = 2.0
+
+
+def transient_backoff(n, retry_after=None,
+                      initial=RETRY_INITIAL_DELAY, multiplier=RETRY_MULTIPLIER,
+                      cap=RETRY_MAX_DELAY):
+    """Seconds to wait before transient retry `n` (1-indexed). Exponential with -25% jitter,
+    matching the Anthropic SDK. If a server Retry-After (seconds) is supplied and sane, it wins
+    (clamped to 60s), as the SDK does."""
+    if retry_after is not None:
+        try:
+            ra = float(retry_after)
+            if 0 < ra <= 60:
+                return ra
+        except (TypeError, ValueError):
+            pass
+    attempt = max(0, int(n) - 1)
+    base = min(initial * (multiplier ** attempt), cap)
+    return base * (1.0 - 0.25 * random.random())
 
 
 # Placeholder text Copilot shows in the answer block WHILE it is still working.
@@ -491,7 +521,7 @@ def run_relay(
                 print(f"[relay turn {turn}] send failed -> transient retry "
                       f"{transient}/{max_transient}")
                 turn -= 1                              # a failed send didn't consume a turn
-                time.sleep(sleep_s + min(2.0 * transient, 20.0))
+                time.sleep(sleep_s + transient_backoff(transient))
                 continue
             outcome, reason = "STUCK", f"send failed after {transient} retries: {type(e).__name__}: {e}"
             break
@@ -677,7 +707,7 @@ def run_relay(
                 runlog_append(run_id, {"turn": turn, "event": "transient_retry",
                                        "kind": "stuck", "n": transient})
                 job = RETRY_JOB
-                time.sleep(sleep_s + min(2.0 * transient, 20.0))
+                time.sleep(sleep_s + transient_backoff(transient))
                 continue
             outcome, reason = "STUCK", f"agent reported STUCK (after {transient} retries)"
             break
