@@ -1136,9 +1136,18 @@ class CockpitWindow : Window
         try
         {
             var st = ReadStatus();
-            bool running = st != null && st.ContainsKey("running") && Convert.ToBoolean(st["running"])
-                           && !(st.ContainsKey("idle") && Convert.ToBoolean(st["idle"]));
-            if (!running)
+            bool runningFlag = st != null && st.ContainsKey("running") && Convert.ToBoolean(st["running"])
+                               && !(st.ContainsKey("idle") && Convert.ToBoolean(st["idle"]));
+            // A LIVE run updates status.json ~once/second. If "running" is true but the
+            // file is STALE (the run crashed / was killed without writing a final snapshot,
+            // e.g. a send failure), it is not actually live -- so allow clearing it.
+            // Otherwise a dead run's card sticks forever and Clear appears to do nothing.
+            double updated = 0;
+            try { if (st != null && st.ContainsKey("updated")) updated = Convert.ToDouble(st["updated"]); }
+            catch (Exception) { }
+            bool stale = updated > 0 && (NowUnix() - updated) > 15;
+            bool live = runningFlag && !stale;
+            if (!live)
                 File.WriteAllText(_statusPath,
                     "{\"total\":0,\"done_count\":0,\"running\":false,\"idle\":true,\"workers\":[]}",
                     Encoding.UTF8);
