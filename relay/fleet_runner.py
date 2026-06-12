@@ -176,6 +176,10 @@ def main():
                     help="disable auto-recovery (single connection, no reconnect)")
     ap.add_argument("--no-recycle", action="store_true",
                     help="disable the pre-run auto-recycle of a bloated/low-RAM Edge")
+    ap.add_argument("--max-transient", type=int, default=10,
+                    help="per-goal retries for TRANSIENT failures (send/timeout/likely-"
+                         "transient STUCK) before giving up, with backoff (default 10, "
+                         "like Claude Code retrying a failed network request)")
     ap.add_argument("--refuter", action="store_true",
                     help="operator B: after a candidate DONE, an INDEPENDENT reviewer "
                          "(non-blocking side chat) tries to refute it before accepting. "
@@ -384,7 +388,8 @@ def main():
                                       max_concurrent=max_conc, mc_box=mc_box, add_box=add_box,
                                       refuter=args.refuter or args.panel,
                                       max_refute=args.max_refute, plan_mode=args.plan,
-                                      review_lenses=(list(PANEL_LENSES) if args.panel else None))
+                                      review_lenses=(list(PANEL_LENSES) if args.panel else None),
+                                      max_transient=args.max_transient)
             for r in res:
                 results_by_goal[r["goal"]] = r
             pending = []                                   # finished cleanly

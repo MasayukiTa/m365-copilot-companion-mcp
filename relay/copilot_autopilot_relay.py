@@ -127,6 +127,14 @@ NUDGE_JOB = (
     "前のステップがまだ完了していないようです。今の状況を1行で報告し、"
     "可能なら次に進んでください。"
 )
+# Re-injected when the agent reported STUCK but it is likely a TRANSIENT failure (a tool
+# call / network hiccup), so we retry the turn -- the relay analog of Claude Code retrying
+# a failed network request rather than surfacing it.
+RETRY_JOB = (
+    "直前の操作が一時的な失敗（ネットワーク断やツール呼び出しの失敗）だった可能性があります。"
+    "焦らず、同じ手順をもう一度実行してください（ファイルの読み書きやコマンドを再試行）。"
+    "完了したら最後の行に DONE、本当に解決不能な場合のみ STUCK: と理由を書いてください。"
+)
 
 
 # Placeholder text Copilot shows in the answer block WHILE it is still working.
@@ -426,6 +434,7 @@ def run_relay(
     review_lenses=None,
     forge: bool = False,
     max_forge: int = 3,
+    max_transient: int = 10,
 ) -> str:
     """Run the autonomous loop unattended. Returns one of:
     DONE | STUCK | MAXTURNS | ABORTED. Notifies on every terminal outcome.
@@ -455,6 +464,7 @@ def run_relay(
     analyze_count = 0
     forge_count = 0
     verify_attempts = 0
+    transient = 0          # transient-failure retries (send/timeout/likely-transient STUCK)
     refute_count = 0
     checks_norm = normalize_checks(checks)      # spec 3-3 acceptance gate (empty -> trust DONE)
     backoff_s = 0.0          # adaptive throttle: extra cool-down added between turns
@@ -472,7 +482,18 @@ def run_relay(
         try:
             driver.send(job)
         except Exception as e:
-            outcome, reason = "STUCK", f"send failed: {type(e).__name__}: {e}"
+            # a send failure is a transient (CDP/Edge/network) hiccup -- retry with backoff
+            # rather than giving up (the relay analog of Claude Code retrying a request).
+            if transient < max_transient:
+                transient += 1
+                runlog_append(run_id, {"turn": turn, "event": "transient_retry",
+                                       "kind": "send", "n": transient})
+                print(f"[relay turn {turn}] send failed -> transient retry "
+                      f"{transient}/{max_transient}")
+                turn -= 1                              # a failed send didn't consume a turn
+                time.sleep(sleep_s + min(2.0 * transient, 20.0))
+                continue
+            outcome, reason = "STUCK", f"send failed after {transient} retries: {type(e).__name__}: {e}"
             break
 
         try:
@@ -649,8 +670,18 @@ def run_relay(
         last_line = (resp.strip().splitlines() or [""])[-1].upper()
 
         if reported_stuck(resp):
-            outcome, reason = "STUCK", "agent reported STUCK"
+            # under load an agent STUCK is usually a downstream symptom of a transient
+            # tool/network failure -- retry the turn before giving up, with backoff.
+            if transient < max_transient:
+                transient += 1
+                runlog_append(run_id, {"turn": turn, "event": "transient_retry",
+                                       "kind": "stuck", "n": transient})
+                job = RETRY_JOB
+                time.sleep(sleep_s + min(2.0 * transient, 20.0))
+                continue
+            outcome, reason = "STUCK", f"agent reported STUCK (after {transient} retries)"
             break
+        transient = 0          # a real (non-stuck) response -> the transient issue cleared
         if "DONE" in up and "FAIL" not in last_line:
             # spec 3-3 verification GATE: never trust a self-reported DONE when the goal
             # carries acceptance checks. Re-derive ground truth locally; on fail, hand the
