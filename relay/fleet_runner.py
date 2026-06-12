@@ -146,10 +146,14 @@ def _snapshot(workers, started, total, max_concurrent=0):
             "reason": w.reason,
             "closed": getattr(w, "closed", False),
             "conv_url": getattr(w, "conv_url", ""),
+            "conv_title": getattr(w, "conv_title", ""),
             "verified": getattr(w, "verified", None),
             "verify_attempts": getattr(w, "verify_attempts", 0),
             "plan": getattr(w, "plan_steps", []),     # surfaced so the cockpit can show/pick
             "last": (w.last_response or "")[:600],
+            # full-text transcript file (all turns, untruncated) for the chat viewer to
+            # render the whole conversation -- vs `last`, which is only the latest 600 chars.
+            "transcript": getattr(w, "transcript", "") or "",
             # carried so the cockpit can RETRY a stopped goal with its full acceptance gate
             # intact (re-queue via add_goal). Small per goal; safe to include for 100+ workers.
             "checks": getattr(w, "checks", []),
@@ -244,6 +248,14 @@ def main():
     os.makedirs(args.state_dir, exist_ok=True)
     status_path = os.path.join(args.state_dir, "status.json")
     started = time.time()
+    # full-text conversation transcripts (one jsonl per worker, all turns untruncated).
+    # The cockpit/chat viewer reads these to show whole conversations without disturbing
+    # the live companion Edge. Keyed per-run so reused worker names never interleave.
+    transcripts_dir = os.path.join(args.state_dir, "transcripts")
+    try:
+        os.makedirs(transcripts_dir, exist_ok=True)
+    except Exception:
+        pass
 
     if args.max_concurrent > 0:
         max_conc = args.max_concurrent
@@ -385,7 +397,10 @@ def main():
             for w in workers:
                 u = getattr(w, "conv_url", "")
                 if u and u not in urls:
-                    existing.append({"url": u, "title": (w.goal or "")[:60],
+                    # prefer Copilot's auto-generated chat title for the registry entry;
+                    # fall back to the goal text when it hasn't been captured yet.
+                    title = (getattr(w, "conv_title", "") or w.goal or "")[:60]
+                    existing.append({"url": u, "title": title,
                                      "source": "fleet", "ts": time.time()})
                     urls.add(u); changed = True
             if changed:
@@ -476,7 +491,9 @@ def main():
                                       autoscale=autoscale, autoscale_max=autoscale_max,
                                       asc_box=asc_box,
                                       autoscale_per_tab_mb=args.autoscale_per_tab_mb,
-                                      autoscale_headroom_mb=args.autoscale_headroom_mb)
+                                      autoscale_headroom_mb=args.autoscale_headroom_mb,
+                                      transcript_dir=transcripts_dir,
+                                      run_id="r%x_a%d" % (int(started), attempt))
             for r in res:
                 results_by_goal[r["goal"]] = r
             pending = []                                   # finished cleanly
@@ -520,7 +537,11 @@ def main():
                           "max_turns": args.max_turns, "reason": r["reason"],
                           "verified": r.get("verified"),
                           "verify_attempts": r.get("verify_attempts", 0),
-                          "conv_url": "", "closed": True, "last": ""} for r in results]}
+                          "conv_url": r.get("conv_url", ""),
+                          "conv_title": r.get("conv_title", ""),
+                          "transcript": r.get("transcript", ""),
+                          "cwd": r.get("cwd", ""),
+                          "closed": True, "last": ""} for r in results]}
     _write_atomic(status_path, final)
     print("\n\n=== fleet complete in %ss ===" % elapsed)
     for r in results:

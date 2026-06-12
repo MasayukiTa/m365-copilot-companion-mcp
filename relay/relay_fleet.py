@@ -26,6 +26,8 @@ state machine so the open ones interleave. No threads, no async.
 from __future__ import annotations
 
 import ctypes
+import json
+import os
 import time
 
 from .acceptance import Check, normalize_checks, run_all_blocking
@@ -47,6 +49,65 @@ class FleetContextLost(Exception):
     def __init__(self, unfinished):
         super().__init__("fleet CDP context lost")
         self.unfinished = unfinished
+
+
+class _Transcript:
+    """Append-only full-text log of one worker's conversation, one JSON object per line.
+
+    Each line is {"turn": n, "role": "user"|"assistant", "text": <full, untruncated>,
+    "ts": epoch}. A first "meta" line records the worker name / goal / conv guid so a
+    reader can match the file to a card even before any turn lands.
+
+    The unique key is the KEY of the file, not the worker name: worker names (w0/w1) are
+    reused across rounds/runs, so keying on the name alone would interleave two unrelated
+    conversations into one file. The key is `<run_id>_<name>` where run_id is unique per
+    run_relay_fleet() invocation (its start time, base36) -- so two runs that both have a
+    'w0' write to different files. When the conversation's guid (conv_url tail) becomes
+    known it is recorded in-line; we do NOT rename the open file (that races with appends).
+
+    Completely exception-safe: any I/O failure is swallowed so the fleet never stalls on a
+    logging hiccup. Each append is flushed so a crash leaves whole lines, not partial ones."""
+
+    def __init__(self, directory, key, name, goal):
+        self.dir = directory
+        self.key = key
+        self.path = os.path.join(directory, key + ".jsonl") if directory else None
+        self._guid_logged = False
+        if not self.path:
+            return
+        try:
+            os.makedirs(directory, exist_ok=True)
+            # fresh file for this run+worker; truncate any stale leftover with the same key
+            with open(self.path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"meta": True, "key": key, "name": name,
+                                    "goal": goal, "ts": time.time()},
+                                   ensure_ascii=False) + "\n")
+                f.flush()
+        except Exception:
+            self.path = None
+
+    def _append(self, obj):
+        if not self.path:
+            return
+        try:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                f.flush()
+        except Exception:
+            pass
+
+    def user(self, turn, text):
+        self._append({"turn": turn, "role": "user", "text": text or "", "ts": time.time()})
+
+    def assistant(self, turn, text):
+        self._append({"turn": turn, "role": "assistant", "text": text or "", "ts": time.time()})
+
+    def note_guid(self, guid):
+        """Record the conversation guid once it's known (idempotent)."""
+        if self._guid_logged or not guid:
+            return
+        self._guid_logged = True
+        self._append({"guid": guid, "ts": time.time()})
 
 
 class _MEMORYSTATUSEX(ctypes.Structure):
@@ -154,7 +215,7 @@ class RelayWorker:
     def __init__(self, goal, name, max_turns=1000, dwell_s=4.0,
                  per_turn_timeout_s=240, max_no_progress=3, max_verify_attempts=3,
                  refuter=False, max_refute=2, plan_mode=False, review_lenses=None,
-                 max_transient=10):
+                 max_transient=10, transcript_dir=None, run_id=""):
         self.page = None
         self.drv = None
         text, checks, cwd = goal_fields(goal)
@@ -186,6 +247,7 @@ class RelayWorker:
         self._agent_url = ""          # bare agent URL -> a fresh independent chat
         self.name = name
         self.conv_url = ""         # filled once the conversation gets its /conversation/<id>
+        self.conv_title = ""       # Copilot's auto-generated chat title (best-effort scrape)
         self.steer_msgs = []       # user steering messages to inject on the next turn(s)
         self._last_was_steer = False   # so the FOLLOWING continue bridges off the steer
         self.max_turns = max_turns
@@ -210,6 +272,13 @@ class RelayWorker:
         self._last_text = None
         self._stable_since = None
         self._t_send = 0.0
+        # full-text transcript (each turn's send + Copilot reply, untruncated). The KEY
+        # is run-unique (run_id includes the fleet start time) so reused worker names
+        # (w0/w1) across rounds never share a file. Path is exposed via .transcript so
+        # the snapshot can hand it to the UI. None when no dir was passed (back-compat).
+        self._tx_key = ((run_id + "_") if run_id else "") + name
+        self._tx = _Transcript(transcript_dir, self._tx_key, name, self.goal)
+        self.transcript = self._tx.path or ""
 
     def attach(self, context, agent_url):
         """Open this worker's tab and make it ready to send. On failure -> error."""
@@ -259,6 +328,19 @@ class RelayWorker:
                 u = self.page.url
                 if "/conversation/" in u:
                     self.conv_url = u
+                    self._tx.note_guid(u.rstrip("/").rsplit("/", 1)[-1])
+        except Exception:
+            pass
+        # Best-effort: scrape Copilot's auto-generated chat title once it exists. M365
+        # names a chat a beat after the first turn, so we keep trying (cheaply) until we
+        # have one, then stop. The cockpit/chat use conv_title as the card headline when
+        # present (else the goal text), so a miss is harmless. Fully isolated in try/except
+        # -- a scrape failure must never affect the relay loop.
+        try:
+            if not self.conv_title and self.drv is not None:
+                t = self.drv.conversation_title()
+                if t:
+                    self.conv_title = t
         except Exception:
             pass
 
@@ -304,6 +386,7 @@ class RelayWorker:
                 self.transient, type(e).__name__, str(e))
             return
         self.turn += 1
+        self._tx.user(self.turn, self.job)     # persist the full sent prompt for this turn
         self._last_text, self._stable_since, self._t_send = None, None, time.time()
         self.status = "waiting"
 
@@ -346,6 +429,7 @@ class RelayWorker:
 
     def _decide(self, resp):
         self.last_response = resp
+        self._tx.assistant(self.turn, resp)    # persist the full Copilot reply for this turn
         norm = " ".join(resp.lower().split())[:300]
         self.no_progress = self.no_progress + 1 if norm and norm == self.last_norm else 0
         self.last_norm = norm
@@ -565,7 +649,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     mc_box=None, add_box=None, refuter=False, max_refute=2,
                     plan_mode=False, review_lenses=None, max_transient=10,
                     autoscale=False, autoscale_max=None, asc_box=None,
-                    autoscale_per_tab_mb=700, autoscale_headroom_mb=1400):
+                    autoscale_per_tab_mb=700, autoscale_headroom_mb=1400,
+                    transcript_dir=None, run_id=""):
     """Drive len(goals) autonomous relays in parallel to completion, but never with
     more than `max_concurrent` tabs open at once (defaults to what free RAM allows).
     A goal's tab is opened only when a slot frees and CLOSED the moment it finishes.
@@ -583,9 +668,14 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     # (the user's configured maximum / fair-use bound). Defaults to the launch cap.
     if autoscale_max is None:
         autoscale_max = max(1, max_concurrent)
+    # run_id keys the transcript files for THIS invocation; if the caller didn't supply
+    # one, derive a run-unique id from the start time so resumes/rounds don't collide.
+    if not run_id:
+        run_id = "r%x" % int(time.time())
     workers = [RelayWorker(g, "w%d" % i, max_turns=max_turns,
                            refuter=refuter, max_refute=max_refute, plan_mode=plan_mode,
-                           review_lenses=review_lenses, max_transient=max_transient)
+                           review_lenses=review_lenses, max_transient=max_transient,
+                           transcript_dir=transcript_dir, run_id=run_id)
                for i, g in enumerate(goals)]
     pending = list(workers)            # FIFO queue of not-yet-attached workers
 
@@ -687,5 +777,16 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
            "%d ゴール: %s" % (len(workers), ", ".join(w.outcome or "?" for w in workers)))
     return [{"name": w.name, "goal": w.goal, "outcome": w.outcome,
              "turns": w.turn, "reason": w.reason,
-             "verified": w.verified, "verify_attempts": w.verify_attempts}
+             "verified": w.verified, "verify_attempts": w.verify_attempts,
+             # carry the captured conversation identity into the FINAL snapshot so the
+             # cockpit keeps the Copilot title/URL (and /history link) on finished cards
+             # instead of reverting to the bare goal text.
+             "conv_url": getattr(w, "conv_url", ""),
+             "conv_title": getattr(w, "conv_title", ""),
+             # full-text transcript path so finished cards can still show the WHOLE
+             # conversation from disk (not just the truncated `last`).
+             "transcript": getattr(w, "transcript", "") or "",
+             # working dir of the goal -- orchestrators (bench/swe_run_until_done.py)
+             # map workers back to instances via this in the FINAL snapshot.
+             "cwd": getattr(w, "cwd", "") or ""}
             for w in workers]
