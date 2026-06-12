@@ -28,11 +28,11 @@ from __future__ import annotations
 import ctypes
 import time
 
-from .acceptance import Check, normalize_checks
+from .acceptance import Check, normalize_checks, run_all_blocking
 from .copilot_autopilot_relay import (
     CONTINUE_JOB, COPILOT_SELECTORS, CopilotWebDriver, FIX_JOB, PROTOCOL,
     REFUTE_FIX_JOB, RETRY_JOB, VERIFY_FIX_JOB, _is_processing, default_notify,
-    reported_stuck,
+    reported_stuck, transient_backoff,
 )
 from .planner import PLAN_PROMPT, extract_plan, plan_ready
 
@@ -74,6 +74,27 @@ def auto_concurrency(n_goals, per_tab_mb=700, headroom_mb=2048, hard_cap=4):
     never exceed `hard_cap` (Microsoft per-user fair-use also wants N modest)."""
     fit = int((avail_phys_mb() - headroom_mb) / per_tab_mb)
     return max(1, min(n_goals, fit, hard_cap))
+
+
+def ram_target_cap(open_now, current_cap, ceiling,
+                   per_tab_mb=700, headroom_mb=1400, floor=1):
+    """RAM-aware live concurrency target (autoscale). Recomputed each loop: given how many
+    tabs are open right now (their RAM is already reflected in the free-RAM reading) and how
+    much headroom we want to keep for the user, how many tabs can we SUSTAIN?
+
+    Asymmetric on purpose, to never re-trigger the RAM-exhaustion crash:
+      * scale UP by at most ONE tab per call (gentle ramp -- re-evaluated every loop), and
+      * allow scale DOWN to the raw target immediately. A lower cap is SOFT: running tabs are
+        not killed, we just stop opening new ones until some finish (natural drain).
+    Clamped to [floor, ceiling] (ceiling = the user's configured maximum)."""
+    avail = avail_phys_mb()
+    # FLOOR division (not int(): truncates toward zero) so a RAM *deficit* yields a negative
+    # term and the target actually drops below open_now -> drains. e.g. (-400)//700 == -1.
+    raw = open_now + int((avail - headroom_mb) // per_tab_mb)
+    target = max(floor, min(raw, ceiling))
+    if target > current_cap:
+        target = min(current_cap + 1, ceiling)      # ramp up one tab at a time
+    return target
 
 
 def _open_fresh(context, url):
@@ -249,6 +270,11 @@ class RelayWorker:
 
     def _begin_send(self):
         if self.turn >= self.max_turns:
+            # before reporting MAXTURNS, see if the workspace ALREADY satisfies the goal's
+            # acceptance checks -- if so the result is proven-done and we finish DONE+verified
+            # rather than labeling an already-correct artifact MAXTURNS.
+            if self._salvage_via_checks():
+                return
             self.status, self.outcome, self.reason = "maxturns", "MAXTURNS", "reached max_turns"
             return
         # a queued steering message preempts the normal CONTINUE/FIX job for this turn
@@ -271,6 +297,8 @@ class RelayWorker:
                 self.reason = "send retry %d/%d (%s)" % (self.transient, self.max_transient,
                                                          type(e).__name__)
                 return
+            if self._salvage_via_checks():
+                return
             self.status, self.outcome = "stuck", "STUCK"
             self.reason = "send failed after %d retries: %s: %s" % (
                 self.transient, type(e).__name__, str(e))
@@ -281,14 +309,39 @@ class RelayWorker:
 
     def _retry_transient(self):
         """Schedule a retry for a TRANSIENT failure (send/timeout/likely-transient STUCK),
-        up to max_transient with linear backoff -- the relay analog of Claude Code retrying
-        a failed network request. Returns True if a retry was scheduled, else False (budget
-        exhausted -> the caller should go terminal)."""
+        up to max_transient with Claude-Code/Anthropic-SDK-style exponential backoff + jitter
+        (0.5 -> 1 -> 2 -> 4 -> 8s capped, -25% jitter) -- the relay analog of the SDK retrying
+        a failed network request with widening intervals. Returns True if a retry was scheduled,
+        else False (budget exhausted -> the caller should go terminal)."""
         if self.transient >= self.max_transient:
             return False
         self.transient += 1
-        self._cooldown_until = time.time() + min(2.0 * self.transient, 20.0)
+        self._cooldown_until = time.time() + transient_backoff(self.transient)
         self.status = "ready"
+        return True
+
+    def _salvage_via_checks(self):
+        """Last-chance acceptance salvage for the EXHAUSTION paths (spec 3-3 verify gate,
+        applied where the worker would otherwise go terminal NON-done). Before burning a
+        turn it doesn't have (at max_turns) or giving up on a timeout/stuck, run the SAME
+        acceptance checks the DONE gate uses against the current workspace. If they already
+        PASS, the artifact is proven-done regardless of whether Copilot ever emitted a clean
+        DONE -- so finish DONE+verified instead of MAXTURNS/STUCK. (Observed on HumanEval_56:
+        solution.py passed the canonical test but per-turn timeout-retries ate the 10-turn
+        budget before a clean DONE landed.) No checks -> nothing to prove against -> can't
+        salvage. Runs blocking like the single-relay DONE gate (run_all_blocking); this is a
+        once-per-worker terminal moment, not the hot round-robin path. Returns True iff
+        salvaged (status is now terminal DONE)."""
+        if not self.checks:
+            return False
+        passed, detail = run_all_blocking(self.checks, cwd=self.cwd)
+        self.last_verify_detail = detail
+        if not passed:
+            return False
+        self.verified = True
+        self.status, self.outcome = "done", "DONE"
+        self.reason = "checks already pass at exhaustion -> salvaged DONE (%s)" % (
+            (detail or "")[:160])
         return True
 
     def _decide(self, resp):
@@ -305,6 +358,8 @@ class RelayWorker:
             if self._retry_transient():
                 self.job = RETRY_JOB
                 self.reason = "STUCK -> transient retry %d/%d" % (self.transient, self.max_transient)
+                return
+            if self._salvage_via_checks():
                 return
             self.status, self.outcome, self.reason = "stuck", "STUCK", \
                 "agent reported STUCK (after %d retries)" % self.transient
@@ -326,6 +381,8 @@ class RelayWorker:
             self._on_done_claimed()
             return
         if self.no_progress >= self.max_no_progress:
+            if self._salvage_via_checks():
+                return
             self.status, self.outcome = "stuck", "STUCK"
             self.reason = "no progress for %d turns" % (self.no_progress + 1)
             return
@@ -477,6 +534,10 @@ class RelayWorker:
                 if self._retry_transient():
                     self.reason = "turn timeout -> retry %d/%d" % (self.transient, self.max_transient)
                     return False
+                # retries exhausted: don't give up on an already-correct artifact -- if the
+                # workspace already passes the acceptance checks, salvage it as DONE+verified.
+                if self._salvage_via_checks():
+                    return True
                 self.status, self.outcome, self.reason = "stuck", "STUCK", \
                     "turn timeout (after %d retries)" % self.transient
                 return True
@@ -502,7 +563,9 @@ class RelayWorker:
 def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     notify=default_notify, on_tick=None, max_concurrent=None,
                     mc_box=None, add_box=None, refuter=False, max_refute=2,
-                    plan_mode=False, review_lenses=None, max_transient=10):
+                    plan_mode=False, review_lenses=None, max_transient=10,
+                    autoscale=False, autoscale_max=None, asc_box=None,
+                    autoscale_per_tab_mb=700, autoscale_headroom_mb=1400):
     """Drive len(goals) autonomous relays in parallel to completion, but never with
     more than `max_concurrent` tabs open at once (defaults to what free RAM allows).
     A goal's tab is opened only when a slot frees and CLOSED the moment it finishes.
@@ -516,6 +579,10 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         max_concurrent = auto_concurrency(len(goals))
     if mc_box is None:
         mc_box = [max_concurrent]
+    # autoscale ceiling: never open more than this many tabs even if RAM is plentiful
+    # (the user's configured maximum / fair-use bound). Defaults to the launch cap.
+    if autoscale_max is None:
+        autoscale_max = max(1, max_concurrent)
     workers = [RelayWorker(g, "w%d" % i, max_turns=max_turns,
                            refuter=refuter, max_refute=max_refute, plan_mode=plan_mode,
                            review_lenses=review_lenses, max_transient=max_transient)
@@ -558,6 +625,22 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     pending.insert(0, nw)
                 else:
                     pending.append(nw)
+
+        # RAM-aware autoscale: recompute the live cap from free RAM each loop, ramping up
+        # gently and draining down softly (see ram_target_cap). When on, this drives mc_box.
+        # asc_box (if given) is the live [on, ceiling] control the cockpit can flip mid-run;
+        # otherwise the launch-time `autoscale`/`autoscale_max` apply. The START cap is
+        # whatever mc_box was initialized to (the user's DEFAULT) -- autoscale grows/shrinks
+        # from there toward the ceiling.
+        asc_on = autoscale
+        ceiling = autoscale_max
+        if asc_box:
+            asc_on = bool(asc_box[0])
+            ceiling = asc_box[1] or autoscale_max
+        if asc_on:
+            mc_box[0] = ram_target_cap(_active_open(), mc_box[0], max(1, ceiling),
+                                       per_tab_mb=autoscale_per_tab_mb,
+                                       headroom_mb=autoscale_headroom_mb)
 
         # fill free tab slots from the pending queue (memory-bounded, live cap)
         while pending and _active_open() < max(1, mc_box[0]):

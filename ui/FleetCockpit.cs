@@ -49,6 +49,8 @@ class CockpitWindow : Window
     bool _dark = true;
     int _lang = 0;          // 0 = Japanese, 1 = English
     int _maxtabs = 3;
+    bool _autoscale = false;   // RAM-aware autoscale on/off (NEW)
+    int _autoMax = 4;          // ceiling (上限) tabs may grow to under autoscale (NEW)
     long _settingsMtime = 0;
 
     readonly string _statusPath, _commandsPath, _historyPath, _openPath;
@@ -70,8 +72,29 @@ class CockpitWindow : Window
     string _lastSig = "";
     JavaScriptSerializer _js = new JavaScriptSerializer();
 
+    // Per-worker disclosure state (Claude-Code-style "> / v"). Collapsed is the default:
+    // a collapsed card renders only a lightweight summary line -- no progress quote, no steer
+    // TextBox -- so a fleet of 100+ tasks stays scrollable. Only an EXPANDED card builds the
+    // heavy detail and enables steering. Keyed by worker name; survives re-renders.
+    HashSet<string> _expanded = new HashSet<string>();
+    // last status snapshot rendered, kept so a chevron toggle can rebuild ONLY its one card
+    // in place (no full 164-card re-render) -- that's what makes expand/collapse feel instant.
+    Dictionary<string, object> _lastRoot;
+
     double _upm = 960;
     Dictionary<string, string> _glyphs = new Dictionary<string, string>();
+
+    // Feature B: terminal-task view filter. 0=all, 1=unfinished only (hide DONE), 2=done only.
+    int _cardFilter = 0;
+
+    // Opt-in, CAPPED auto-retry (default OFF). When on, a newly-stopped non-DONE goal is
+    // re-queued at most _autoRetryMax times -- bounded so a deterministically-failing task
+    // (e.g. the tool-denial ones) can NEVER loop forever. Counted by goal TEXT, so a re-queued
+    // copy (which gets a new worker name) shares the original goal's budget. Manual retry is
+    // unaffected -- this only governs the automatic re-queue.
+    bool _autoRetry = false;
+    int _autoRetryMax = 1;
+    Dictionary<string, int> _autoRetryCount = new Dictionary<string, int>();
 
     public CockpitWindow(string path)
     {
@@ -118,6 +141,11 @@ class CockpitWindow : Window
         if (k == "release") return ja ? "解放" : "release";
         if (k == "released") return ja ? "解放済" : "released";
         if (k == "maxtabs") return ja ? "最大タブ" : "Max tabs";
+        if (k == "autoscale") return ja ? "RAM自動調整" : "Auto (RAM)";
+        if (k == "auto_on") return ja ? "ON" : "ON";
+        if (k == "auto_off") return ja ? "OFF" : "OFF";
+        if (k == "def_tabs") return ja ? "開始(デフォルト)" : "Start";
+        if (k == "max_tabs2") return ja ? "上限" : "Max";
         if (k == "idle") return ja ? "未実行 — python -m relay.fleet_runner で並列実行を開始するとここに表示されます。"
                                    : "Not running — start with python -m relay.fleet_runner to see goals here.";
         if (k == "stale") return ja ? "更新が止まっています（フリート停止？）" : "no updates (fleet stopped?)";
@@ -125,6 +153,16 @@ class CockpitWindow : Window
         if (k == "start") return ja ? "並列実行を開始" : "Start parallel run";
         if (k == "goalhint") return ja ? "1行に1ゴール（複数可）・Ctrl+Enter で開始" : "One goal per line · Ctrl+Enter to start";
         if (k == "folder") return ja ? "自律コーディング (フォルダ)" : "Autonomous coding (folder)";
+        // Feature B: view-filter toolbar
+        if (k == "flt_all") return ja ? "すべて" : "All";
+        if (k == "flt_unfinished") return ja ? "未完了のみ" : "Unfinished only";
+        if (k == "flt_done") return ja ? "完了のみ" : "Done only";
+        // Feature C: retry
+        if (k == "retry") return ja ? "再試行" : "Retry";
+        if (k == "retry_all") return ja ? "停止を一括再試行" : "Retry all stopped";
+        if (k == "retry_note") return ja ? "再試行は走行中のみ反映されます" : "Retry only applies while a run is live";
+        if (k == "autoretry") return ja ? "自動再試行" : "Auto-retry";
+        if (k == "cap") return ja ? "上限" : "cap";
         return k;
     }
     string StatusLabel(string s)
@@ -186,6 +224,10 @@ class CockpitWindow : Window
                 if (ln.StartsWith("dark=")) _dark = ln.Substring(5).Trim() != "0";
                 else if (ln.StartsWith("lang=") && int.TryParse(ln.Substring(5).Trim(), out v)) _lang = v;
                 else if (ln.StartsWith("maxtabs=") && int.TryParse(ln.Substring(8).Trim(), out v)) _maxtabs = Math.Max(1, Math.Min(8, v));
+                else if (ln.StartsWith("autoscale_max=") && int.TryParse(ln.Substring(14).Trim(), out v)) _autoMax = Math.Max(1, Math.Min(8, v));
+                else if (ln.StartsWith("autoscale=")) _autoscale = ln.Substring(10).Trim() == "1";
+                else if (ln.StartsWith("autoretry_max=") && int.TryParse(ln.Substring(14).Trim(), out v)) _autoRetryMax = Math.Max(1, Math.Min(3, v));
+                else if (ln.StartsWith("autoretry=")) _autoRetry = ln.Substring(10).Trim() == "1";
             }
             _settingsMtime = File.GetLastWriteTimeUtc(SettingsFile).Ticks;
         }
@@ -267,7 +309,7 @@ class CockpitWindow : Window
         ctrls.VerticalAlignment = VerticalAlignment.Top;
         DockPanel.SetDock(ctrls, Dock.Right);
 
-        ctrls.Children.Add(MaxTabsStepper());
+        ctrls.Children.Add(AutoscaleControls());
         _langBtn = IconButton("translate", 18);
         _langBtn.ToolTip = "日本語 / English";
         _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveKey("lang", _lang.ToString()); Relabel(); ForceRender(); };
@@ -592,6 +634,62 @@ class CockpitWindow : Window
 
     ContentControl _iconHost;
     Button _maxMinus, _maxPlus;
+    Button _autoToggle;
+    Button _autoMinus, _autoPlus;
+    TextBlock _autoLbl, _autoValue;
+
+    // Autoscale control GROUP: [ RAM自動調整: ON/OFF ]  [開始(デフォルト) − N +]  [上限 − M +].
+    // Replaces the old single max-tabs stepper. The ceiling stepper greys out when autoscale
+    // is off (it only matters under autoscale). All three live-apply via SetMaxTabs/SetAutoMax/
+    // the toggle handler, which route to RequestSetAutoscale or RequestSetMaxtabs as appropriate.
+    UIElement AutoscaleControls()
+    {
+        var group = new StackPanel(); group.Orientation = Orientation.Horizontal;
+        group.VerticalAlignment = VerticalAlignment.Center; group.Margin = new Thickness(0, 0, 12, 0);
+
+        // a. autoscale ON/OFF toggle (simple themed button whose label flips)
+        _autoToggle = new Button();
+        _autoToggle.Cursor = Cursors.Hand; _autoToggle.BorderThickness = new Thickness(1);
+        _autoToggle.Padding = new Thickness(10, 3, 10, 3); _autoToggle.FontSize = 12;
+        _autoToggle.FontWeight = FontWeights.SemiBold;
+        _autoToggle.Margin = new Thickness(0, 0, 12, 0);
+        _autoToggle.VerticalAlignment = VerticalAlignment.Center;
+        _autoToggle.Click += delegate
+        {
+            _autoscale = !_autoscale;
+            SaveKey("autoscale", _autoscale ? "1" : "0");
+            PaintAutoToggle();
+            UpdateAutoEnabled();
+            // live-apply: reflect the new mode into a running fleet immediately.
+            if (_autoscale) RequestSetAutoscaleIfLive();
+            else RequestSetMaxtabsIfLive();
+        };
+        group.Children.Add(_autoToggle);
+
+        // b. the EXISTING max-tabs stepper, relabeled as the default/start.
+        group.Children.Add(MaxTabsStepper());
+
+        // c. NEW ceiling stepper (mirrors MaxTabsStepper's −/+ pattern).
+        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
+        wrap.VerticalAlignment = VerticalAlignment.Center;
+        _autoLbl = new TextBlock(); _autoLbl.VerticalAlignment = VerticalAlignment.Center;
+        _autoLbl.FontSize = 12; _autoLbl.Margin = new Thickness(0, 0, 8, 0);
+        wrap.Children.Add(_autoLbl);
+        _autoMinus = MiniButton("−");
+        _autoMinus.Click += delegate { SetAutoMax(_autoMax - 1); };
+        wrap.Children.Add(_autoMinus);
+        _autoValue = new TextBlock(); _autoValue.VerticalAlignment = VerticalAlignment.Center;
+        _autoValue.FontSize = 13; _autoValue.FontWeight = FontWeights.SemiBold;
+        _autoValue.Margin = new Thickness(8, 0, 8, 0); _autoValue.MinWidth = 14;
+        _autoValue.TextAlignment = TextAlignment.Center;
+        wrap.Children.Add(_autoValue);
+        _autoPlus = MiniButton("+");
+        _autoPlus.Click += delegate { SetAutoMax(_autoMax + 1); };
+        wrap.Children.Add(_autoPlus);
+        group.Children.Add(wrap);
+
+        return group;
+    }
 
     UIElement MaxTabsStepper()
     {
@@ -614,21 +712,73 @@ class CockpitWindow : Window
         return wrap;
     }
     TextBlock _maxValue;
+
+    // Toggle label/colour: ON => accent bg + white text (contrast rule for saturated bg),
+    // OFF => neutral themed button.
+    void PaintAutoToggle()
+    {
+        if (_autoToggle == null) return;
+        _autoToggle.Content = T("autoscale") + ": " + (_autoscale ? T("auto_on") : T("auto_off"));
+        if (_autoscale) { _autoToggle.Background = Accent; _autoToggle.Foreground = White; _autoToggle.BorderBrush = Accent; }
+        else { _autoToggle.Background = BtnBg; _autoToggle.Foreground = Fg; _autoToggle.BorderBrush = Border; }
+    }
+
+    // Ceiling stepper only matters under autoscale: grey/disable it when autoscale is off.
+    void UpdateAutoEnabled()
+    {
+        bool on = _autoscale;
+        if (_autoMinus != null) _autoMinus.IsEnabled = on;
+        if (_autoPlus != null) _autoPlus.IsEnabled = on;
+        double op = on ? 1.0 : 0.45;
+        if (_autoMinus != null) _autoMinus.Opacity = op;
+        if (_autoPlus != null) _autoPlus.Opacity = op;
+        if (_autoValue != null) _autoValue.Opacity = op;
+        if (_autoLbl != null) _autoLbl.Opacity = op;
+    }
+
+    void SetAutoMax(int v)
+    {
+        _autoMax = Math.Max(1, Math.Min(8, v));
+        SaveKey("autoscale_max", _autoMax.ToString());
+        if (_autoValue != null) _autoValue.Text = _autoMax.ToString();
+        // live-apply only while autoscale is on (ceiling is meaningless otherwise).
+        if (_autoscale) RequestSetAutoscaleIfLive();
+    }
+
+    // true iff a run is currently LIVE (running and not idle).
+    bool RunIsLive()
+    {
+        try
+        {
+            var st = ReadStatus();
+            return st != null && st.ContainsKey("running") && Convert.ToBoolean(st["running"])
+                   && !(st.ContainsKey("idle") && Convert.ToBoolean(st["idle"]));
+        }
+        catch (Exception) { return false; }
+    }
+    void RequestSetAutoscaleIfLive()
+    {
+        if (RunIsLive()) RequestSetAutoscale(true, Math.Min(_maxtabs, _autoMax), _autoMax);
+    }
+    void RequestSetMaxtabsIfLive()
+    {
+        if (RunIsLive()) RequestSetMaxtabs(_maxtabs);
+    }
     void SetMaxTabs(int v)
     {
         _maxtabs = Math.Max(1, Math.Min(8, v));
         SaveKey("maxtabs", _maxtabs.ToString());
         if (_maxValue != null) _maxValue.Text = _maxtabs.ToString();
         // if a run is live, offer to apply now vs next run
-        bool running = false;
-        try
+        bool running = RunIsLive();
+        if (running && _autoscale)
         {
-            var st = ReadStatus();
-            running = st != null && st.ContainsKey("running") && Convert.ToBoolean(st["running"])
-                      && !(st.ContainsKey("idle") && Convert.ToBoolean(st["idle"]));
+            // under autoscale, the default reseats the live cap immediately (push now,
+            // no banner -- the ceiling still governs growth).
+            RequestSetAutoscale(true, Math.Min(_maxtabs, _autoMax), _autoMax);
+            if (_mtBanner != null) _mtBanner.Visibility = Visibility.Collapsed;
         }
-        catch (Exception) { }
-        if (running && _mtBanner != null)
+        else if (running && _mtBanner != null)
         {
             _mtBannerLbl.Text = (_lang == 0 ? "最大タブを " : "Max tabs -> ") + _maxtabs
                 + (_lang == 0 ? " に変更しました。" : ".");
@@ -657,7 +807,12 @@ class CockpitWindow : Window
         _mtApplyNow = new Button();
         _mtApplyNow.Cursor = Cursors.Hand; _mtApplyNow.BorderThickness = new Thickness(0);
         _mtApplyNow.Padding = new Thickness(12, 4, 12, 4); _mtApplyNow.FontWeight = FontWeights.SemiBold;
-        _mtApplyNow.Click += delegate { RequestSetMaxtabs(_maxtabs); _mtBanner.Visibility = Visibility.Collapsed; };
+        _mtApplyNow.Click += delegate
+        {
+            if (_autoscale) RequestSetAutoscale(true, Math.Min(_maxtabs, _autoMax), _autoMax);
+            else RequestSetMaxtabs(_maxtabs);
+            _mtBanner.Visibility = Visibility.Collapsed;
+        };
         btns.Children.Add(_mtApplyNow);
         _mtLater = new Button();
         _mtLater.Cursor = Cursors.Hand; _mtLater.BorderThickness = new Thickness(1);
@@ -697,12 +852,16 @@ class CockpitWindow : Window
         if (_sv != null) _sv.Background = Bg;
         _iconHost.Content = MakeIcon("satellite_alt", 26, Accent);
         // restyle the header buttons for the theme
-        foreach (Button b in new Button[] { _themeBtn, _langBtn, _maxMinus, _maxPlus })
+        foreach (Button b in new Button[] { _themeBtn, _langBtn, _maxMinus, _maxPlus, _autoMinus, _autoPlus })
             if (b != null) { b.Background = BtnBg; b.Foreground = Fg; b.BorderBrush = Border; }
         _themeBtn.Content = MakeIcon(_dark ? "light_mode" : "dark_mode", 18, Fg);
         _langBtn.Content = MakeIcon("translate", 18, Fg);
         if (_maxLbl != null) _maxLbl.Foreground = Muted;
         if (_maxValue != null) _maxValue.Foreground = Fg;
+        if (_autoLbl != null) _autoLbl.Foreground = Muted;
+        if (_autoValue != null) _autoValue.Foreground = Fg;
+        PaintAutoToggle();
+        UpdateAutoEnabled();
         if (_inBar != null) _inBar.Background = Bg;
         if (_goalInput != null)
         {
@@ -725,8 +884,11 @@ class CockpitWindow : Window
 
     void Relabel()
     {
-        if (_maxLbl != null) _maxLbl.Text = T("maxtabs") + " (" + T("applies_next") + ")";
+        if (_maxLbl != null) _maxLbl.Text = T("def_tabs");
         if (_maxValue != null) _maxValue.Text = _maxtabs.ToString();
+        if (_autoLbl != null) _autoLbl.Text = T("max_tabs2");
+        if (_autoValue != null) _autoValue.Text = _autoMax.ToString();
+        PaintAutoToggle();
         if (_startBtn != null) _startBtn.Content = T("start");
         if (_folderBtn != null) _folderBtn.Content = T("folder");
         if (_goalInput != null) _goalInput.ToolTip = T("goalhint");
@@ -783,10 +945,37 @@ class CockpitWindow : Window
         // snapshot would re-add cleared tasks every tick (Clear would never stick).
         bool runningNow = !root.ContainsKey("running") || Convert.ToBoolean(root["running"]);
         if (runningNow) ArchiveTerminal(root);
+        // opt-in auto-retry runs every tick (before the sig short-circuit) so it catches a
+        // stopped goal even when nothing else changed. Bounded by _autoRetryMax per goal text.
+        if (runningNow && _autoRetry) AutoRetryScan(root);
         string sig = Sig(root);
         if (sig == _lastSig) return;
         _lastSig = sig;
         RenderCards(root);
+    }
+
+    // Opt-in, CAPPED auto-retry. For each STOPPED non-DONE goal, re-queue it at most
+    // _autoRetryMax times (counted by goal text). The cap is the safety rail: a goal that
+    // keeps failing stops being re-queued once it hits the budget -- never an infinite loop.
+    // Only acts while a run is live (add_goal is consumed by the running fleet).
+    void AutoRetryScan(Dictionary<string, object> root)
+    {
+        object wo;
+        if (!root.TryGetValue("workers", out wo) || !(wo is object[])) return;
+        foreach (object o in (object[])wo)
+        {
+            var w = o as Dictionary<string, object>;
+            if (w == null) continue;
+            if (!IsTerminalWorker(w)) continue;
+            if (S(w, "outcome") == "DONE") continue;
+            string goal = S(w, "goal");
+            if (string.IsNullOrEmpty(goal)) continue;
+            int n = 0;
+            if (_autoRetryCount.ContainsKey(goal)) n = _autoRetryCount[goal];
+            if (n >= _autoRetryMax) continue;          // budget spent -> never loop
+            _autoRetryCount[goal] = n + 1;             // count BEFORE re-queue (idempotent per tick)
+            RetryGoal(w);
+        }
     }
 
     Dictionary<string, object> ReadStatus()
@@ -822,8 +1011,13 @@ class CockpitWindow : Window
             foreach (object o in (object[])wo)
             {
                 var w = (Dictionary<string, object>)o;
-                sb.Append(S(w, "name")).Append(S(w, "status")).Append(S(w, "turn"))
-                  .Append('#').Append((S(w, "last")).Length).Append(';');
+                string nm = S(w, "name");
+                sb.Append(nm).Append(S(w, "status")).Append(S(w, "turn"));
+                // only an EXPANDED card shows live progress text, so only its `last`-length
+                // changes need to force a re-render. Collapsed cards stay put while their
+                // worker streams -- that's what keeps a 164-task fleet from thrashing.
+                if (_expanded.Contains(nm)) sb.Append('#').Append((S(w, "last")).Length);
+                sb.Append(';');
             }
         return sb.ToString();
     }
@@ -862,12 +1056,206 @@ class CockpitWindow : Window
 
     void RenderCards(Dictionary<string, object> root)
     {
+        _lastRoot = root;               // cache for in-place single-card toggles
+        // Preserve scroll position across the rebuild. Without this, every worker update
+        // (status/turn change) Clear()ed the list and snapped the view back to the TOP --
+        // which is exactly why scrolling "didn't work" while tasks were live: the user
+        // scrolled down, a tick fired, and they were yanked up again. Capture now, restore
+        // after the new content is laid out.
+        double off = (_sv != null) ? _sv.VerticalOffset : 0.0;
         _cards.Children.Clear();
+
+        // gather workers in natural order
+        var workers = new List<Dictionary<string, object>>();
         object wo;
         if (root.TryGetValue("workers", out wo) && wo is object[])
             foreach (object o in (object[])wo)
-                _cards.Children.Add(Card((Dictionary<string, object>)o));
+                workers.Add((Dictionary<string, object>)o);
+
+        // Feature B: apply the view filter. Outcome is null/"" while running, so only terminal
+        // workers ever have outcome=="DONE"; filter 1 hides DONE (keeps failures + running),
+        // filter 2 shows only DONE.
+        var shown = new List<Dictionary<string, object>>();
+        foreach (Dictionary<string, object> w in workers)
+        {
+            string oc = S(w, "outcome");
+            if (_cardFilter == 1 && oc == "DONE") continue;
+            if (_cardFilter == 2 && oc != "DONE") continue;
+            shown.Add(w);
+        }
+        // Feature B: under "unfinished only", group failures together by severity (stable).
+        if (_cardFilter == 1) shown = StableBySeverity(shown);
+
+        _cards.Children.Add(BuildCardToolbar(workers, shown));
+        foreach (Dictionary<string, object> w in shown)
+            _cards.Children.Add(Card(w));
         AppendHistory();
+        if (_sv != null && off > 0.0)
+        {
+            double target = off;
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                if (_sv != null) _sv.ScrollToVerticalOffset(target);
+            }), System.Windows.Threading.DispatcherPriority.Loaded);
+        }
+    }
+
+    // Stable sort by severity rank (C# 5: List.Sort is NOT stable, so do a manual stable sort
+    // by bucketing in rank order while preserving original index order within each rank).
+    static List<Dictionary<string, object>> StableBySeverity(List<Dictionary<string, object>> src)
+    {
+        var outp = new List<Dictionary<string, object>>();
+        for (int rank = 0; rank <= 3; rank++)
+            foreach (Dictionary<string, object> w in src)
+                if (SeverityRank(w) == rank) outp.Add(w);
+        return outp;
+    }
+
+    // Feature B/C toolbar: filter selector + outcome summary + bulk-retry. Rebuilt each
+    // RenderCards as the first row of _cards (no worker Tag, so ToggleExpand skips it).
+    UIElement BuildCardToolbar(List<Dictionary<string, object>> all,
+                               List<Dictionary<string, object>> shown)
+    {
+        int doneN = 0, maxN = 0, badN = 0;
+        foreach (Dictionary<string, object> w in all)
+        {
+            string oc = S(w, "outcome");
+            if (oc == "DONE") doneN++;
+            else if (oc == "MAXTURNS") maxN++;
+            else if (oc == "STUCK" || oc == "ERROR" || oc == "CANCELLED") badN++;
+        }
+
+        var bar = new Border();
+        bar.BorderThickness = new Thickness(1); bar.BorderBrush = Border;
+        bar.Background = CardBg; bar.CornerRadius = new CornerRadius(10);
+        bar.Padding = new Thickness(12, 8, 12, 8); bar.Margin = new Thickness(8, 2, 8, 8);
+        // clicks inside the toolbar must not bubble (it isn't a card, but stay safe)
+        bar.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; };
+
+        var dp = new DockPanel();
+
+        // right cluster: [auto-retry toggle (opt-in)] [cap −N+] [bulk retry]
+        var rightCl = new StackPanel(); rightCl.Orientation = Orientation.Horizontal;
+        rightCl.VerticalAlignment = VerticalAlignment.Center;
+
+        // opt-in, CAPPED auto-retry toggle. Default OFF. Never infinite (see _autoRetryMax).
+        _autoRetryBtn = new Button();
+        _autoRetryBtn.BorderThickness = new Thickness(1); _autoRetryBtn.Cursor = Cursors.Hand;
+        _autoRetryBtn.Padding = new Thickness(10, 4, 10, 4); _autoRetryBtn.FontSize = 12;
+        _autoRetryBtn.FontWeight = FontWeights.SemiBold; _autoRetryBtn.Margin = new Thickness(0, 0, 8, 0);
+        _autoRetryBtn.VerticalAlignment = VerticalAlignment.Center;
+        _autoRetryBtn.ToolTip = _lang == 0
+            ? "停止したゴールを自動で再投入（上限まで・既定OFF）。無限ループは起きません。"
+            : "Auto re-queue stopped goals (up to the cap; default OFF). Never loops forever.";
+        PaintAutoRetryBtn();
+        _autoRetryBtn.Click += delegate { _autoRetry = !_autoRetry; SaveKey("autoretry", _autoRetry ? "1" : "0"); PaintAutoRetryBtn(); };
+        rightCl.Children.Add(_autoRetryBtn);
+
+        // per-goal retry cap (1..3) -- the safety bound
+        var capLbl = new TextBlock(); capLbl.Text = T("cap"); capLbl.Foreground = Muted;
+        capLbl.FontSize = 11.5; capLbl.VerticalAlignment = VerticalAlignment.Center; capLbl.Margin = new Thickness(0, 0, 6, 0);
+        rightCl.Children.Add(capLbl);
+        var capMinus = MiniButton("−"); capMinus.Click += delegate { SetAutoRetryMax(_autoRetryMax - 1); };
+        rightCl.Children.Add(capMinus);
+        _autoRetryCapVal = new TextBlock(); _autoRetryCapVal.Text = _autoRetryMax.ToString();
+        _autoRetryCapVal.Foreground = Fg; _autoRetryCapVal.FontSize = 13; _autoRetryCapVal.FontWeight = FontWeights.SemiBold;
+        _autoRetryCapVal.Margin = new Thickness(6, 0, 6, 0); _autoRetryCapVal.MinWidth = 12;
+        _autoRetryCapVal.TextAlignment = TextAlignment.Center; _autoRetryCapVal.VerticalAlignment = VerticalAlignment.Center;
+        rightCl.Children.Add(_autoRetryCapVal);
+        var capPlus = MiniButton("+"); capPlus.Click += delegate { SetAutoRetryMax(_autoRetryMax + 1); };
+        rightCl.Children.Add(capPlus);
+
+        // bulk MANUAL retry button (one-shot, respects the active filter)
+        var retryAll = new Button();
+        retryAll.Content = T("retry_all");
+        retryAll.Background = Accent; retryAll.Foreground = White; retryAll.BorderThickness = new Thickness(0);
+        retryAll.Padding = new Thickness(12, 4, 12, 4); retryAll.Cursor = Cursors.Hand;
+        retryAll.FontSize = 12; retryAll.FontWeight = FontWeights.SemiBold;
+        retryAll.Margin = new Thickness(10, 0, 0, 0);
+        retryAll.VerticalAlignment = VerticalAlignment.Center;
+        List<Dictionary<string, object>> shownCap = shown;
+        retryAll.Click += delegate
+        {
+            RetryAllShown(shownCap);
+            if (_toolbarNote != null) _toolbarNote.Text = RunIsLive() ? "" : T("retry_note");
+        };
+        rightCl.Children.Add(retryAll);
+
+        DockPanel.SetDock(rightCl, Dock.Right);
+        dp.Children.Add(rightCl);
+
+        // left: segmented filter buttons + summary + (optional) live-only note
+        var left = new StackPanel(); left.Orientation = Orientation.Horizontal;
+        left.VerticalAlignment = VerticalAlignment.Center;
+        left.Children.Add(FilterButton(T("flt_all"), 0));
+        left.Children.Add(FilterButton(T("flt_unfinished"), 1));
+        left.Children.Add(FilterButton(T("flt_done"), 2));
+
+        var summary = new TextBlock();
+        summary.Text = (_lang == 0
+            ? ("完了 " + doneN + " ・ 上限 " + maxN + " ・ 停止/失敗 " + badN)
+            : ("Done " + doneN + " · MaxTurns " + maxN + " · Stuck/Err " + badN));
+        summary.Foreground = Muted; summary.FontSize = 12;
+        summary.VerticalAlignment = VerticalAlignment.Center;
+        summary.Margin = new Thickness(14, 0, 0, 0);
+        left.Children.Add(summary);
+
+        _toolbarNote = new TextBlock();
+        _toolbarNote.Foreground = Muted; _toolbarNote.FontSize = 11.5;
+        _toolbarNote.VerticalAlignment = VerticalAlignment.Center;
+        _toolbarNote.Margin = new Thickness(14, 0, 0, 0);
+        left.Children.Add(_toolbarNote);
+
+        dp.Children.Add(left);
+        bar.Child = dp;
+        return bar;
+    }
+    TextBlock _toolbarNote;
+    Button _autoRetryBtn;
+    TextBlock _autoRetryCapVal;
+
+    // ON => accent fill + white text (contrast); OFF => neutral. Rebuilt with the toolbar.
+    void PaintAutoRetryBtn()
+    {
+        if (_autoRetryBtn == null) return;
+        _autoRetryBtn.Content = T("autoretry") + ": " + (_autoRetry ? "ON" : "OFF");
+        if (_autoRetry)
+        {
+            _autoRetryBtn.Background = Accent; _autoRetryBtn.Foreground = White; _autoRetryBtn.BorderBrush = Border;
+        }
+        else
+        {
+            _autoRetryBtn.Background = BtnBg; _autoRetryBtn.Foreground = Fg; _autoRetryBtn.BorderBrush = Border;
+        }
+    }
+
+    void SetAutoRetryMax(int v)
+    {
+        _autoRetryMax = Math.Max(1, Math.Min(3, v));   // hard safety bound: 1..3, never unbounded
+        SaveKey("autoretry_max", _autoRetryMax.ToString());
+        if (_autoRetryCapVal != null) _autoRetryCapVal.Text = _autoRetryMax.ToString();
+    }
+
+    // One segmented filter button. The active one gets the accent fill (white text for
+    // contrast); inactive ones are neutral themed. Changing the filter forces a re-render.
+    Button FilterButton(string label, int val)
+    {
+        var b = new Button();
+        b.Content = label; b.Cursor = Cursors.Hand; b.FontSize = 12;
+        b.Padding = new Thickness(10, 3, 10, 3); b.Margin = new Thickness(0, 0, 6, 0);
+        b.BorderThickness = new Thickness(1);
+        if (_cardFilter == val)
+        { b.Background = Accent; b.Foreground = White; b.BorderBrush = Accent; b.FontWeight = FontWeights.SemiBold; }
+        else
+        { b.Background = BtnBg; b.Foreground = Fg; b.BorderBrush = Border; }
+        int v = val;
+        b.Click += delegate
+        {
+            if (_cardFilter == v) return;
+            _cardFilter = v;
+            _lastSig = ""; OnTick(null, null);
+        };
+        return b;
     }
 
     void AppendHistory()
@@ -952,6 +1340,7 @@ class CockpitWindow : Window
         Color sc = StatusColor(ck);
 
         var card = new Border();
+        card.Tag = name;                // lets a chevron toggle find & replace just this card
         card.BorderThickness = new Thickness(1.4);
         card.CornerRadius = new CornerRadius(12);
         card.Padding = new Thickness(18, 13, 16, 13);
@@ -1003,8 +1392,10 @@ class CockpitWindow : Window
         DockPanel.SetDock(right, Dock.Right);
         top.Children.Add(right);
 
-        // left cluster: name + pill (+ dots when running)
+        // left cluster: [chevron] name + pill (+ dots when running)
         var left = new StackPanel(); left.Orientation = Orientation.Horizontal;
+        bool isOpen = _expanded.Contains(name);
+        left.Children.Add(ChevronToggle(name, isOpen));
         var nm2 = new TextBlock();
         nm2.Text = name.ToUpper();
         nm2.Foreground = Accent; nm2.FontWeight = FontWeights.Bold; nm2.FontSize = 13;
@@ -1016,27 +1407,58 @@ class CockpitWindow : Window
 
         col.Children.Add(top);
 
-        var g = new TextBlock();
-        g.Text = goal;
-        g.Foreground = Fg; g.FontSize = 14; g.TextWrapping = TextWrapping.Wrap;
-        g.Margin = new Thickness(0, 10, 0, 8);
-        col.Children.Add(g);
-
-        string body = !string.IsNullOrEmpty(last) ? last : reason;
-        if (!string.IsNullOrEmpty(body))
+        if (isOpen)
         {
-            var quote = new Border();
-            quote.Background = QuoteBg; quote.CornerRadius = new CornerRadius(8);
-            quote.Padding = new Thickness(12, 10, 12, 10);
-            var bt = new TextBlock();
-            bt.Text = body; bt.Foreground = Muted; bt.FontSize = 12.5;
-            bt.TextWrapping = TextWrapping.Wrap; bt.MaxHeight = 120;
-            bt.TextTrimming = TextTrimming.CharacterEllipsis;
-            quote.Child = bt;
-            col.Children.Add(quote);
+            // expanded: full goal, wrapped -- selectable/copyable read-only TextBox (Feature A)
+            var g = new TextBox();
+            g.Text = goal;
+            g.Foreground = Fg; g.FontSize = 14;
+            g.IsReadOnly = true; g.BorderThickness = new Thickness(0);
+            g.Background = Brushes.Transparent; g.Padding = new Thickness(0);
+            g.IsTabStop = false; g.TextWrapping = TextWrapping.Wrap;
+            g.Margin = new Thickness(0, 10, 0, 8);
+            SwallowMouseUp(g);
+            col.Children.Add(g);
+        }
+        else
+        {
+            // collapsed: one-line, trimmed -- cheap TextBlock (no selection needed)
+            var g = new TextBlock();
+            g.Text = goal;
+            g.Foreground = Fg; g.FontSize = 14;
+            g.TextTrimming = TextTrimming.CharacterEllipsis;
+            g.Margin = new Thickness(0, 6, 0, 0);
+            col.Children.Add(g);
         }
 
-        if (!terminal) col.Children.Add(SteerRow(name));
+        // Heavy detail (live progress quote + steer TextBox) ONLY when expanded. This is the
+        // whole point: a collapsed fleet of 100+ tasks builds no quotes and no input controls,
+        // and -- via Sig() -- doesn't even re-render while a collapsed worker streams.
+        if (isOpen)
+        {
+            string body = !string.IsNullOrEmpty(last) ? last : reason;
+            if (!string.IsNullOrEmpty(body))
+            {
+                var quote = new Border();
+                quote.Background = QuoteBg; quote.CornerRadius = new CornerRadius(8);
+                quote.Padding = new Thickness(12, 10, 12, 10);
+                quote.Margin = new Thickness(0, 0, 0, 0);
+                // selectable/copyable read-only TextBox (Feature A)
+                var bt = new TextBox();
+                bt.Text = body; bt.Foreground = Muted; bt.FontSize = 12.5;
+                bt.IsReadOnly = true; bt.BorderThickness = new Thickness(0);
+                bt.Background = Brushes.Transparent; bt.Padding = new Thickness(0);
+                bt.IsTabStop = false; bt.TextWrapping = TextWrapping.Wrap; bt.MaxHeight = 120;
+                bt.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+                SwallowMouseUp(bt);
+                quote.Child = bt;
+                col.Children.Add(quote);
+            }
+
+            if (!terminal) col.Children.Add(SteerRow(name));
+            // Feature C: retry stopped tasks -- terminal & NOT DONE gets a Retry button.
+            else if (S(w, "outcome") != "DONE") col.Children.Add(RetryRow(w));
+        }
 
         card.Child = col;
         if (!string.IsNullOrEmpty(conv))
@@ -1090,6 +1512,112 @@ class CockpitWindow : Window
         return dp;
     }
 
+    // Feature A: a read-only TextBox inside a clickable card would still raise the card's
+    // MouseLeftButtonUp -> open-conversation, so dragging to select text would yank you into
+    // the chat. Swallow the mouse-up at the TextBox (handledEventsToo) so selection works and
+    // the card click never fires.
+    void SwallowMouseUp(TextBox tb)
+    {
+        tb.AddHandler(UIElement.MouseLeftButtonUpEvent,
+            new MouseButtonEventHandler(delegate(object s, MouseButtonEventArgs e) { e.Handled = true; }),
+            true);
+    }
+
+    // Feature C: per-card "Retry" on a terminal non-DONE worker. Re-queues this exact goal
+    // (with its acceptance checks + cwd) at priority via add_goal. Clicks must not bubble to
+    // the card's open-conversation handler.
+    UIElement RetryRow(Dictionary<string, object> w)
+    {
+        var dp = new DockPanel();
+        dp.Margin = new Thickness(0, 10, 0, 0);
+        dp.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; };
+        var note = new TextBlock();
+        note.FontSize = 11.5; note.Foreground = Muted;
+        note.VerticalAlignment = VerticalAlignment.Center;
+        note.TextWrapping = TextWrapping.Wrap;
+        dp.Children.Add(note);
+        var btn = new Button();
+        btn.Content = T("retry");
+        btn.Background = Accent; btn.Foreground = White; btn.BorderThickness = new Thickness(0);
+        btn.Padding = new Thickness(12, 4, 12, 4); btn.Cursor = Cursors.Hand; btn.FontSize = 12;
+        btn.FontWeight = FontWeights.SemiBold;
+        DockPanel.SetDock(btn, Dock.Right);
+        Dictionary<string, object> wkr = w;
+        btn.Click += delegate
+        {
+            RetryGoal(wkr);
+            note.Text = RunIsLive() ? "" : T("retry_note");
+        };
+        dp.Children.Add(btn);
+        return dp;
+    }
+
+    // Build one add_goal entry { text, checks, cwd, priority } for a worker dict. checks is
+    // passed through as-is from the worker (whatever the fleet stored -- a list).
+    Dictionary<string, object> RetryEntry(Dictionary<string, object> w)
+    {
+        var item = new Dictionary<string, object>();
+        item["text"] = S(w, "goal");
+        object checks = null;
+        if (w.ContainsKey("checks")) checks = w["checks"];
+        item["checks"] = checks;
+        item["cwd"] = S(w, "cwd");
+        item["priority"] = true;
+        return item;
+    }
+
+    // Append the worker's goal to commands.json's add_goal list (MERGE writer), re-running it
+    // WITH the acceptance gate. The live runner consumes add_goal; if no run is live the command
+    // is still written but won't take effect until a run starts (surfaced via retry_note).
+    void RetryGoal(Dictionary<string, object> w)
+    {
+        var cmd = ReadCommands();
+        var adds = new List<object>();
+        if (cmd.ContainsKey("add_goal") && cmd["add_goal"] is object[])
+            foreach (object o in (object[])cmd["add_goal"]) adds.Add(o);
+        adds.Add(RetryEntry(w));
+        cmd["add_goal"] = adds;
+        WriteCommands(cmd);
+    }
+
+    // Feature C bulk: re-queue EVERY currently-shown terminal non-DONE worker (respecting the
+    // active filter) in ONE add_goal list.
+    void RetryAllShown(List<Dictionary<string, object>> shown)
+    {
+        var cmd = ReadCommands();
+        var adds = new List<object>();
+        if (cmd.ContainsKey("add_goal") && cmd["add_goal"] is object[])
+            foreach (object o in (object[])cmd["add_goal"]) adds.Add(o);
+        int n = 0;
+        foreach (Dictionary<string, object> w in shown)
+        {
+            if (!IsTerminalWorker(w)) continue;
+            if (S(w, "outcome") == "DONE") continue;
+            adds.Add(RetryEntry(w)); n++;
+        }
+        if (n == 0) return;
+        cmd["add_goal"] = adds;
+        WriteCommands(cmd);
+    }
+
+    static bool IsTerminalWorker(Dictionary<string, object> w)
+    {
+        string status = S(w, "status");
+        return status == "done" || status == "stuck" || status == "maxturns"
+               || status == "error" || status == "cancelled";
+    }
+
+    // Severity rank for the "unfinished only" sort: failures first, then max-turns, then
+    // cancelled, then still-running/other (stable within a rank).
+    static int SeverityRank(Dictionary<string, object> w)
+    {
+        string oc = S(w, "outcome");
+        if (oc == "STUCK" || oc == "ERROR") return 0;
+        if (oc == "MAXTURNS") return 1;
+        if (oc == "CANCELLED") return 2;
+        return 3;   // still-running / other
+    }
+
     UIElement MakeReleaseContent()
     {
         var sp = new StackPanel(); sp.Orientation = Orientation.Horizontal;
@@ -1131,6 +1659,76 @@ class CockpitWindow : Window
         return sp;
     }
 
+    // Disclosure chevron: '>' collapsed, 'v' expanded -- drawn as vector geometry to match the
+    // Material-Symbols-as-paths aesthetic (the glyph subset has no chevron). Clicking toggles
+    // this worker's detail and re-renders immediately. e.Handled stops the click from bubbling
+    // to the card's open-conversation handler.
+    UIElement ChevronToggle(string name, bool expanded)
+    {
+        var hit = new Border();
+        hit.Background = Brushes.Transparent;            // whole padded area is the hit target
+        hit.Padding = new Thickness(2, 2, 8, 2);
+        hit.Cursor = Cursors.Hand;
+        hit.VerticalAlignment = VerticalAlignment.Center;
+        hit.ToolTip = _lang == 0
+            ? (expanded ? "詳細を閉じる" : "詳細を開く（最新の進捗・割り込み）")
+            : (expanded ? "Collapse details" : "Expand (latest progress + steer)");
+
+        var path = new System.Windows.Shapes.Path();
+        path.Data = Geometry.Parse("M 0,0 L 4,4 L 0,8");   // a '>' caret
+        path.Stroke = Muted; path.StrokeThickness = 1.6;
+        path.StrokeStartLineCap = PenLineCap.Round;
+        path.StrokeEndLineCap = PenLineCap.Round;
+        path.StrokeLineJoin = PenLineJoin.Round;
+        path.Width = 7; path.Height = 11; path.Stretch = Stretch.None;
+        path.VerticalAlignment = VerticalAlignment.Center;
+        path.HorizontalAlignment = HorizontalAlignment.Center;
+        if (expanded)
+        {
+            path.RenderTransformOrigin = new Point(0.5, 0.5);
+            path.RenderTransform = new RotateTransform(90);   // '>' -> 'v'
+        }
+        hit.Child = path;
+
+        string nm = name;
+        hit.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e)
+        {
+            e.Handled = true;
+            ToggleExpand(nm);
+        };
+        return hit;
+    }
+
+    // Flip one worker's detail and rebuild ONLY that card, in place. No 164-card re-render, so
+    // the toggle is instant. _lastSig is re-synced to the new expanded state so the next 700ms
+    // tick doesn't immediately trigger a full rebuild (it only rebuilds when the data changes).
+    void ToggleExpand(string name)
+    {
+        if (_expanded.Contains(name)) _expanded.Remove(name);
+        else _expanded.Add(name);
+        if (_lastRoot == null) { _lastSig = ""; OnTick(null, null); return; }
+
+        object wo;
+        if (_lastRoot.TryGetValue("workers", out wo) && wo is object[])
+            foreach (object o in (object[])wo)
+            {
+                var w = (Dictionary<string, object>)o;
+                if (S(w, "name") != name) continue;
+                for (int i = 0; i < _cards.Children.Count; i++)
+                {
+                    var b = _cards.Children[i] as Border;
+                    if (b != null && b.Tag is string && (string)b.Tag == name)
+                    {
+                        _cards.Children.RemoveAt(i);
+                        _cards.Children.Insert(i, Card(w));   // UIElementCollection has no index-set
+                        break;
+                    }
+                }
+                break;
+            }
+        _lastSig = Sig(_lastRoot);
+    }
+
     // ── cockpit -> fleet control channel ─────────────────────────────────────────
     // Merge into the pending command file so concurrent commands don't clobber each
     // other before the fleet (polling ~1s) consumes them.
@@ -1168,6 +1766,20 @@ class CockpitWindow : Window
     {
         var cmd = ReadCommands();
         cmd["set_maxtabs"] = n;
+        WriteCommands(cmd);
+    }
+
+    // Live autoscale control: {"set_autoscale":{"on":0|1,"default":N,"max":M}}. Merged into
+    // commands.json via the SAME writer RequestSetMaxtabs uses, so concurrent commands
+    // (close/steer/set_maxtabs) aren't clobbered before the fleet (polling ~1s) consumes them.
+    void RequestSetAutoscale(bool on, int def, int max)
+    {
+        var cmd = ReadCommands();
+        var sa = new Dictionary<string, object>();
+        sa["on"] = on ? 1 : 0;
+        sa["default"] = def;
+        sa["max"] = max;
+        cmd["set_autoscale"] = sa;
         WriteCommands(cmd);
     }
 
