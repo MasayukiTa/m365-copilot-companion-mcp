@@ -96,10 +96,23 @@ function Test-TunnelHosting {
 }
 
 function Start-Server {
+    # Kill the stale instance FIRST. A wedged main.py (dead event loop, CLOSE_WAIT
+    # pile-up -- seen twice on 2026-06-12/13) keeps $Port LISTENING, so a new instance
+    # can't bind and the supervisor restart-loops forever while the outage persists.
+    # Scope: the process(es) owning $Port + any main.py launched from this repo's venv.
+    try {
+        Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop |
+            Select-Object -ExpandProperty OwningProcess -Unique |
+            ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
+    } catch {}
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.CommandLine -match 'main\.py' -and $_.CommandLine -like "*$Root*"
+    } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 2
     Push-Location $Root
     Start-Process -FilePath $Py -ArgumentList "main.py" -WorkingDirectory $Root -WindowStyle Hidden
     Pop-Location
-    Write-Log "MCP server (re)started"
+    Write-Log "MCP server (re)started (stale instances cleared)"
 }
 
 function Start-TunnelHost {
