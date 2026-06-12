@@ -19,6 +19,7 @@ using System.IO;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
@@ -123,7 +124,7 @@ class CockpitWindow : Window
         if (k == "applies_next") return ja ? "次回起動から適用" : "applies next run";
         if (k == "start") return ja ? "並列実行を開始" : "Start parallel run";
         if (k == "goalhint") return ja ? "1行に1ゴール（複数可）・Ctrl+Enter で開始" : "One goal per line · Ctrl+Enter to start";
-        if (k == "folder") return ja ? "フォルダ → ゴール生成" : "Folder -> goals";
+        if (k == "folder") return ja ? "自律コーディング (フォルダ)" : "Autonomous coding (folder)";
         return k;
     }
     string StatusLabel(string s)
@@ -327,8 +328,18 @@ class CockpitWindow : Window
         _goalInput.FontSize = 13; _goalInput.Padding = new Thickness(10, 8, 10, 8);
         _goalInput.BorderThickness = new Thickness(1);
         _goalInput.VerticalContentAlignment = VerticalAlignment.Top;
+        BuildGoalCmdPopup();
+        _goalInput.TextChanged += delegate { UpdateGoalCmdPopup(); };
         _goalInput.PreviewKeyDown += delegate (object s, KeyEventArgs e)
         {
+            // slash-command autocomplete (like the main chat): navigate / accept / dismiss
+            if (_gcmdPopup != null && _gcmdPopup.IsOpen && _gcmdList.Items.Count > 0)
+            {
+                if (e.Key == Key.Down) { _gcmdList.SelectedIndex = Math.Min(_gcmdList.SelectedIndex + 1, _gcmdList.Items.Count - 1); _gcmdList.ScrollIntoView(_gcmdList.SelectedItem); e.Handled = true; return; }
+                if (e.Key == Key.Up) { _gcmdList.SelectedIndex = Math.Max(_gcmdList.SelectedIndex - 1, 0); _gcmdList.ScrollIntoView(_gcmdList.SelectedItem); e.Handled = true; return; }
+                if (e.Key == Key.Tab || e.Key == Key.Return) { AcceptGoalCommand(); e.Handled = true; return; }
+                if (e.Key == Key.Escape) { _gcmdPopup.IsOpen = false; e.Handled = true; return; }
+            }
             if (e.Key == Key.Return && (Keyboard.Modifiers & ModifierKeys.Control) != 0)
             { e.Handled = true; StartFleet(); }
         };
@@ -407,6 +418,77 @@ class CockpitWindow : Window
         {
             _startNote.Text = (_lang == 0 ? "起動失敗: " : "Failed: ") + ex.Message;
         }
+    }
+
+    // --- slash-command autocomplete for the goal box (parity with the main chat) ---
+    Popup _gcmdPopup; ListBox _gcmdList;
+    static readonly string[][] _goalCommands = {
+        new[]{"/code","<機能> を実装し、pytest テストも書いて通す"},
+        new[]{"/fix","<ファイル> の <不具合> を直し、テストを通す"},
+        new[]{"/test","<対象> の pytest テストを書く"},
+        new[]{"/refactor","<対象> を読みやすくリファクタする(挙動は変えない)"},
+        new[]{"/doc","<対象> の README/説明 を書く"},
+        new[]{"/review","<対象> をレビューして問題点を箇条書きで挙げる"},
+        new[]{"/research","<問い> を Claude で深掘り調査する"},
+    };
+    void BuildGoalCmdPopup()
+    {
+        _gcmdList = new ListBox { MaxHeight = 220, BorderThickness = new Thickness(0) };
+        _gcmdList.Background = BtnBg;
+        _gcmdList.PreviewMouseLeftButtonUp += delegate { AcceptGoalCommand(); };
+        var border = new Border { Child = _gcmdList, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(4) };
+        border.Background = BtnBg; border.BorderBrush = Accent;
+        _gcmdPopup = new Popup { PlacementTarget = _goalInput, Placement = PlacementMode.Top, StaysOpen = false, Width = 520 };
+        _gcmdPopup.Child = border;
+    }
+    ListBoxItem MakeGCmdItem(string name, string template)
+    {
+        var sp = new StackPanel { Orientation = Orientation.Horizontal };
+        var n = new TextBlock { Text = name, FontWeight = FontWeights.SemiBold, MinWidth = 90, Foreground = Accent };
+        var d = new TextBlock { Text = template, Margin = new Thickness(8, 0, 0, 0), Foreground = Muted, TextTrimming = TextTrimming.CharacterEllipsis };
+        sp.Children.Add(n); sp.Children.Add(d);
+        return new ListBoxItem { Content = sp, Tag = template, Padding = new Thickness(6, 4, 6, 4), Foreground = Fg };
+    }
+    void CurrentGoalLine(out int lineStart, out string line)
+    {
+        string txt = _goalInput.Text ?? ""; int caret = _goalInput.CaretIndex;
+        if (caret > txt.Length) caret = txt.Length;
+        lineStart = caret > 0 ? txt.LastIndexOf('\n', caret - 1) + 1 : 0;
+        line = txt.Substring(lineStart, caret - lineStart);
+    }
+    void UpdateGoalCmdPopup()
+    {
+        try
+        {
+            int ls; string line; CurrentGoalLine(out ls, out line);
+            if (line.Length >= 1 && line[0] == '/' && line.IndexOf(' ') < 0)
+            {
+                string pre = line.ToLower();
+                _gcmdList.Items.Clear();
+                foreach (var c in _goalCommands)
+                    if (c[0].StartsWith(pre)) _gcmdList.Items.Add(MakeGCmdItem(c[0], c[1]));
+                if (_gcmdList.Items.Count > 0) { _gcmdList.SelectedIndex = 0; _gcmdPopup.IsOpen = true; }
+                else _gcmdPopup.IsOpen = false;
+            }
+            else if (_gcmdPopup != null) _gcmdPopup.IsOpen = false;
+        }
+        catch (Exception) { }
+    }
+    void AcceptGoalCommand()
+    {
+        if (_gcmdList.SelectedItem == null && _gcmdList.Items.Count > 0) _gcmdList.SelectedIndex = 0;
+        var item = _gcmdList.SelectedItem as ListBoxItem;
+        if (item != null)
+        {
+            string template = item.Tag as string;
+            int ls; string line; CurrentGoalLine(out ls, out line);
+            string txt = _goalInput.Text ?? ""; int caret = _goalInput.CaretIndex;
+            if (caret > txt.Length) caret = txt.Length;
+            _goalInput.Text = txt.Substring(0, ls) + template + txt.Substring(caret);
+            _goalInput.CaretIndex = ls + template.Length;
+        }
+        if (_gcmdPopup != null) _gcmdPopup.IsOpen = false;
+        _goalInput.Focus();
     }
 
     // ③ Claude-Code-style: pick a folder + a plain-language instruction -> code_task runs
