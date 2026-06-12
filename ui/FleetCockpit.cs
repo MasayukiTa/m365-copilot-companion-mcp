@@ -24,6 +24,8 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Threading;
+using System.Windows.Data;
+using System.Globalization;
 using System.Web.Script.Serialization;
 
 class CockpitProgram
@@ -62,12 +64,15 @@ class CockpitWindow : Window
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
         "copilot-bridge", "settings.txt");
 
-    StackPanel _cards;
     TextBlock _header, _sub;
     Button _themeBtn, _langBtn;
     TextBlock _maxLbl;
     Border _headBar;
-    ScrollViewer _sv;
+    ListBox _list;                 // virtualizing host for the card/history rows
+    // The lists handed to BuildCardToolbar (all/shown) are stashed here so the
+    // ItemTemplate converter can rebuild the toolbar row on demand for a recycled container.
+    List<Dictionary<string, object>> _toolbarAll = new List<Dictionary<string, object>>();
+    List<Dictionary<string, object>> _toolbarShown = new List<Dictionary<string, object>>();
     DispatcherTimer _timer;
     string _lastSig = "";
     JavaScriptSerializer _js = new JavaScriptSerializer();
@@ -338,14 +343,63 @@ class CockpitWindow : Window
         root.Children.Add(BuildInputBar());
         root.Children.Add(BuildMtBanner());
 
-        _sv = new ScrollViewer();
-        _sv.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
-        _sv.Padding = new Thickness(18, 6, 18, 24);
-        _cards = new StackPanel();
-        _sv.Content = _cards;
-        root.Children.Add(_sv);
+        // Virtualizing card list. A ListBox brings its own ScrollViewer + VirtualizingStackPanel,
+        // so with 100-164 cards only the ~10-20 visible rows are realized -> scrolling and
+        // window maximize/restore stay fast. The container chrome is templated away so it reads
+        // as a plain scrolling list (no selection highlight / mouse-over / focus rect).
+        _list = new ListBox();
+        _list.BorderThickness = new Thickness(0);
+        _list.Background = Brushes.Transparent;
+        _list.Padding = new Thickness(18, 6, 18, 24);
+        ScrollViewer.SetVerticalScrollBarVisibility(_list, ScrollBarVisibility.Auto);
+        ScrollViewer.SetHorizontalScrollBarVisibility(_list, ScrollBarVisibility.Disabled);
+        ScrollViewer.SetCanContentScroll(_list, true);
+        VirtualizingPanel.SetIsVirtualizing(_list, true);
+        VirtualizingPanel.SetVirtualizationMode(_list, VirtualizationMode.Recycling);
+        VirtualizingPanel.SetScrollUnit(_list, ScrollUnit.Pixel);
+        _list.Focusable = false;
+        _list.IsTabStop = false;
+        KeyboardNavigation.SetDirectionalNavigation(_list, KeyboardNavigationMode.None);
+        _list.ItemContainerStyle = BuildItemContainerStyle();
+        _list.ItemTemplate = BuildRowTemplate();
+        root.Children.Add(_list);
         Content = root;
         PaintChrome();
+    }
+
+    // ItemContainerStyle: invisible chrome. The ControlTemplate is just a ContentPresenter, so
+    // there is NO selection highlight, NO mouse-over, NO focus rectangle -- it behaves like a
+    // plain scrolling row, not a selectable list item.
+    Style BuildItemContainerStyle()
+    {
+        var st = new Style(typeof(ListBoxItem));
+        st.Setters.Add(new Setter(Control.BackgroundProperty, Brushes.Transparent));
+        st.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(0)));
+        st.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(0)));
+        st.Setters.Add(new Setter(FrameworkElement.MarginProperty, new Thickness(0)));
+        st.Setters.Add(new Setter(Control.HorizontalContentAlignmentProperty, HorizontalAlignment.Stretch));
+        st.Setters.Add(new Setter(UIElement.FocusableProperty, false));
+        var tmpl = new ControlTemplate(typeof(ListBoxItem));
+        var cp = new FrameworkElementFactory(typeof(ContentPresenter));
+        cp.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Stretch);
+        tmpl.VisualTree = cp;
+        st.Setters.Add(new Setter(Control.TemplateProperty, tmpl));
+        return st;
+    }
+
+    // ItemTemplate: a ContentControl whose Content is the item itself, run through RowConverter,
+    // which calls the EXISTING builders by Row.Kind and returns the realized UIElement. Because
+    // containers recycle, Convert runs for visible items only.
+    DataTemplate BuildRowTemplate()
+    {
+        var dt = new DataTemplate();
+        var cc = new FrameworkElementFactory(typeof(ContentControl));
+        var b = new System.Windows.Data.Binding();
+        b.Converter = new RowConverter(this);
+        cc.SetBinding(ContentControl.ContentProperty, b);
+        cc.SetValue(UIElement.FocusableProperty, false);
+        dt.VisualTree = cc;
+        return dt;
     }
 
     TextBox _goalInput;
@@ -849,7 +903,7 @@ class CockpitWindow : Window
         _headBar.Background = Bg;
         _header.Foreground = Fg;
         _sub.Foreground = Muted;
-        if (_sv != null) _sv.Background = Bg;
+        if (_list != null) _list.Background = Bg;
         _iconHost.Content = MakeIcon("satellite_alt", 26, Accent);
         // restyle the header buttons for the theme
         foreach (Button b in new Button[] { _themeBtn, _langBtn, _maxMinus, _maxPlus, _autoMinus, _autoPlus })
@@ -937,7 +991,14 @@ class CockpitWindow : Window
             _header.Text = T("title");
             _sub.Text = T("idle");
             string isig = "IDLE" + _history.Count + (_dark ? "D" : "L") + _lang;
-            if (_lastSig != isig) { _cards.Children.Clear(); AppendHistory(); _lastSig = isig; }
+            if (_lastSig != isig)
+            {
+                _lastRoot = null;
+                var rows = new List<object>();
+                AppendHistoryRows(rows);   // history header + rows, if any
+                SetRows(rows);
+                _lastSig = isig;
+            }
             return;
         }
         UpdateHeader(root);                 // live elapsed every tick
@@ -1056,15 +1117,34 @@ class CockpitWindow : Window
 
     void RenderCards(Dictionary<string, object> root)
     {
-        _lastRoot = root;               // cache for in-place single-card toggles
+        _lastRoot = root;               // cache for single-card toggles
         // Preserve scroll position across the rebuild. Without this, every worker update
-        // (status/turn change) Clear()ed the list and snapped the view back to the TOP --
-        // which is exactly why scrolling "didn't work" while tasks were live: the user
-        // scrolled down, a tick fired, and they were yanked up again. Capture now, restore
-        // after the new content is laid out.
-        double off = (_sv != null) ? _sv.VerticalOffset : 0.0;
-        _cards.Children.Clear();
+        // (status/turn change) reset the list and snapped the view back to the TOP -- which is
+        // exactly why scrolling "didn't work" while tasks were live: the user scrolled down, a
+        // tick fired, and they were yanked up again. Capture now, restore after the new content
+        // is laid out (read the ListBox's internal ScrollViewer, which #ListScroller finds).
+        ScrollViewer sc = ListScroller();
+        double off = (sc != null) ? sc.VerticalOffset : 0.0;
 
+        SetRows(BuildRows(root));
+
+        if (off > 0.0)
+        {
+            double target = off;
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                ScrollViewer s2 = ListScroller();
+                if (s2 != null) s2.ScrollToVerticalOffset(target);
+            }), System.Windows.Threading.DispatcherPriority.Loaded);
+        }
+    }
+
+    // Build the lightweight row-model list for the virtualizing ListBox: a toolbar row, one card
+    // row per filtered/sorted worker, then (if history non-empty) a history-header row + one
+    // history row per entry. The heavy UIElements are NOT built here -- the ItemTemplate's
+    // converter builds them lazily for visible rows only.
+    List<object> BuildRows(Dictionary<string, object> root)
+    {
         // gather workers in natural order
         var workers = new List<Dictionary<string, object>>();
         object wo;
@@ -1086,18 +1166,90 @@ class CockpitWindow : Window
         // Feature B: under "unfinished only", group failures together by severity (stable).
         if (_cardFilter == 1) shown = StableBySeverity(shown);
 
-        _cards.Children.Add(BuildCardToolbar(workers, shown));
+        // stash for the converter (it rebuilds the toolbar row from these when a container recycles)
+        _toolbarAll = workers;
+        _toolbarShown = shown;
+
+        var rows = new List<object>();
+        rows.Add(new Row(0, null, null));               // toolbar
         foreach (Dictionary<string, object> w in shown)
-            _cards.Children.Add(Card(w));
-        AppendHistory();
-        if (_sv != null && off > 0.0)
+            rows.Add(new Row(1, w, null));              // one card per worker
+        AppendHistoryRows(rows);
+        return rows;
+    }
+
+    // Append a history-header row + one history row per entry (newest first) to the row model.
+    void AppendHistoryRows(List<object> rows)
+    {
+        if (_history.Count == 0) return;
+        rows.Add(new Row(2, null, null));               // history header
+        for (int i = _history.Count - 1; i >= 0; i--)
         {
-            double target = off;
-            Dispatcher.BeginInvoke(new Action(delegate
-            {
-                if (_sv != null) _sv.ScrollToVerticalOffset(target);
-            }), System.Windows.Threading.DispatcherPriority.Loaded);
+            var e = _history[i] as Dictionary<string, object>;
+            if (e == null) continue;
+            rows.Add(new Row(3, null, e));             // one history row per entry
         }
+    }
+
+    // Reassign the ListBox's ItemsSource. Cheap even at 164 rows because the models are tiny and
+    // only visible containers are realized/templated.
+    void SetRows(List<object> rows)
+    {
+        if (_list != null) _list.ItemsSource = rows;
+    }
+
+    // Walk the visual tree from _list to find its internal ScrollViewer (present once the
+    // template is applied). Used to capture/restore scroll offset across a re-render. Returns
+    // null before the first layout pass.
+    ScrollViewer ListScroller()
+    {
+        if (_list == null) return null;
+        return FindScrollViewer(_list);
+    }
+    static ScrollViewer FindScrollViewer(DependencyObject root)
+    {
+        if (root == null) return null;
+        int n = VisualTreeHelper.GetChildrenCount(root);
+        for (int i = 0; i < n; i++)
+        {
+            DependencyObject ch = VisualTreeHelper.GetChild(root, i);
+            ScrollViewer sv = ch as ScrollViewer;
+            if (sv != null) return sv;
+            ScrollViewer deep = FindScrollViewer(ch);
+            if (deep != null) return deep;
+        }
+        return null;
+    }
+
+    // Tiny per-row model. Kind: 0=toolbar, 1=card, 2=history-header, 3=history-row.
+    class Row
+    {
+        public int Kind;
+        public Dictionary<string, object> Worker;
+        public Dictionary<string, object> Hist;
+        public Row(int kind, Dictionary<string, object> worker, Dictionary<string, object> hist)
+        { Kind = kind; Worker = worker; Hist = hist; }
+    }
+
+    // Converts a Row model into its realized UIElement by dispatching on Row.Kind to the EXISTING
+    // builders. Holds a back-reference to the window (C# 5: no lambdas-as-closures over fields in
+    // a converter, so pass `this`). Called for visible rows only because containers recycle.
+    class RowConverter : IValueConverter
+    {
+        readonly CockpitWindow _w;
+        public RowConverter(CockpitWindow w) { _w = w; }
+        public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            var r = value as Row;
+            if (r == null) return null;
+            if (r.Kind == 0) return _w.BuildCardToolbar(_w._toolbarAll, _w._toolbarShown);
+            if (r.Kind == 1) return _w.Card(r.Worker);
+            if (r.Kind == 2) return _w.HistoryHeader();
+            if (r.Kind == 3) return _w.HistoryRow(r.Hist);
+            return null;
+        }
+        public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+        { return Binding.DoNothing; }
     }
 
     // Stable sort by severity rank (C# 5: List.Sort is NOT stable, so do a manual stable sort
@@ -1258,9 +1410,11 @@ class CockpitWindow : Window
         return b;
     }
 
-    void AppendHistory()
+    // The history SECTION HEADER (Clear button + caption). Factored out of the old AppendHistory
+    // so the virtualizing converter can build it for a Kind==2 row. The history ROWS are built
+    // separately by HistoryRow() per Kind==3 row.
+    UIElement HistoryHeader()
     {
-        if (_history.Count == 0) return;
         var head = new DockPanel();
         head.Margin = new Thickness(8, 18, 8, 4);
         var clear = new Button();
@@ -1275,15 +1429,7 @@ class CockpitWindow : Window
         ht.Text = (_lang == 0 ? "履歴 — クリアするまで蓄積（クリックで会話を表示）" : "History — stacks until cleared (click to open)");
         ht.Foreground = Muted; ht.FontSize = 12.5; ht.VerticalAlignment = VerticalAlignment.Center;
         head.Children.Add(ht);
-        _cards.Children.Add(head);
-
-        // newest first
-        for (int i = _history.Count - 1; i >= 0; i--)
-        {
-            var e = _history[i] as Dictionary<string, object>;
-            if (e == null) continue;
-            _cards.Children.Add(HistoryRow(e));
-        }
+        return head;
     }
 
     Border HistoryRow(Dictionary<string, object> e)
@@ -1699,33 +1845,29 @@ class CockpitWindow : Window
         return hit;
     }
 
-    // Flip one worker's detail and rebuild ONLY that card, in place. No 164-card re-render, so
-    // the toggle is instant. _lastSig is re-synced to the new expanded state so the next 700ms
-    // tick doesn't immediately trigger a full rebuild (it only rebuilds when the data changes).
+    // Flip one worker's detail and refresh the virtualizing list. With virtualization the old
+    // "find the card in _cards.Children" trick no longer applies (only ~10-20 cards are realized),
+    // so we rebuild the lightweight row models and reassign -- cheap, because only visible rows
+    // realize. Scroll offset is preserved via ListScroller(), and _lastSig is re-synced to the
+    // new expanded state so the next 700ms tick doesn't immediately trigger a redundant rebuild.
     void ToggleExpand(string name)
     {
         if (_expanded.Contains(name)) _expanded.Remove(name);
         else _expanded.Add(name);
         if (_lastRoot == null) { _lastSig = ""; OnTick(null, null); return; }
 
-        object wo;
-        if (_lastRoot.TryGetValue("workers", out wo) && wo is object[])
-            foreach (object o in (object[])wo)
+        ScrollViewer sc = ListScroller();
+        double off = (sc != null) ? sc.VerticalOffset : 0.0;
+        SetRows(BuildRows(_lastRoot));
+        if (off > 0.0)
+        {
+            double target = off;
+            Dispatcher.BeginInvoke(new Action(delegate
             {
-                var w = (Dictionary<string, object>)o;
-                if (S(w, "name") != name) continue;
-                for (int i = 0; i < _cards.Children.Count; i++)
-                {
-                    var b = _cards.Children[i] as Border;
-                    if (b != null && b.Tag is string && (string)b.Tag == name)
-                    {
-                        _cards.Children.RemoveAt(i);
-                        _cards.Children.Insert(i, Card(w));   // UIElementCollection has no index-set
-                        break;
-                    }
-                }
-                break;
-            }
+                ScrollViewer s2 = ListScroller();
+                if (s2 != null) s2.ScrollToVerticalOffset(target);
+            }), System.Windows.Threading.DispatcherPriority.Loaded);
+        }
         _lastSig = Sig(_lastRoot);
     }
 
