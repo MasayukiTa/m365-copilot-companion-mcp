@@ -52,10 +52,15 @@ def plan_ready(resp: str) -> bool:
 
 
 def extract_plan(resp: str):
-    """Parse the numbered/bulleted steps out of a plan reply. Returns a list of step
-    strings (the PLAN_READY marker and any prose around the list are dropped)."""
+    """Parse the steps out of a plan reply. Returns a list of step strings (the PLAN_READY
+    marker and surrounding prose dropped).
+
+    Agents vary: some number/bullet the steps, some write one plain line per step under a
+    header like '実行計画:'. So we first take any marked steps; if there are none, we fall
+    back to the substantial lines that follow a '...:' header (each line = one step)."""
+    lines = (resp or "").splitlines()
     steps = []
-    for line in (resp or "").splitlines():
+    for line in lines:
         if PLAN_READY.upper() in line.upper():
             continue
         m = _STEP_RE.match(line)
@@ -63,4 +68,22 @@ def extract_plan(resp: str):
             step = _clean_step(m.group(1))
             if step:
                 steps.append(step)
+    if steps:
+        return steps
+    # fallback: unmarked, one step per line. Collect substantial lines AFTER a header line
+    # that ends with ':' / '：' (e.g. '実行計画:'), which also skips an agent-name preamble.
+    collecting = False
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        if PLAN_READY.upper() in s.upper():
+            break
+        if s.endswith(":") or s.endswith("："):
+            collecting = True
+            continue
+        if collecting:
+            s2 = _clean_step(s)
+            if len(s2) >= 8:
+                steps.append(s2)
     return steps
