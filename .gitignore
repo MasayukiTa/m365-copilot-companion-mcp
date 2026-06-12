@@ -102,3 +102,4 @@ ui/*.exe
 
 # vendored VirtualDesktop tool (built from thirdparty/VirtualDesktop11.cs)
 thirdparty/*.exe
+ui/_buildcheck/

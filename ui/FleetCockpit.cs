@@ -56,8 +56,13 @@ class CockpitWindow : Window
     long _settingsMtime = 0;
 
     readonly string _statusPath, _commandsPath, _historyPath, _openPath;
-    string _convsPath;
+    string _convsPath, _hiddenPath;
     System.Collections.Generic.HashSet<string> _archivedKeys = new System.Collections.Generic.HashSet<string>();
+    // Persistent "cleared" set: keys of TERMINAL cards the user dismissed via Clear. Survives
+    // the runner regenerating status.json every second, so cleared cards stay gone mid-run.
+    // Key is run+worker (started#name) -- same scheme as the history archive -- so a NEW run
+    // (different `started`) never inherits an old hide, and a reused worker name can't collide.
+    System.Collections.Generic.HashSet<string> _hiddenKeys = new System.Collections.Generic.HashSet<string>();
     List<object> _history = new List<object>();
     int _openSeq = 0;
     static readonly string SettingsFile = Path.Combine(
@@ -109,8 +114,10 @@ class CockpitWindow : Window
         _historyPath = Path.Combine(dir, "history.json");
         _openPath = Path.Combine(dir, "open.json");
         _convsPath = Path.Combine(dir, "conversations.json");
+        _hiddenPath = Path.Combine(dir, "cockpit_hidden.json");
         LoadGlyphs();
         LoadHistory();
+        LoadHidden();
         LoadSettings();
         ApplyThemeBrushes();
         Width = 1080; Height = 760;
@@ -1155,9 +1162,15 @@ class CockpitWindow : Window
         // Feature B: apply the view filter. Outcome is null/"" while running, so only terminal
         // workers ever have outcome=="DONE"; filter 1 hides DONE (keeps failures + running),
         // filter 2 shows only DONE.
+        // Persistent hide: skip TERMINAL cards the user cleared during a live run (their key is
+        // in _hiddenKeys). Non-terminal workers are never hidden, and a fresh run gets new keys
+        // (started changes), so this only suppresses exactly the cards the user dismissed.
+        string startedRoot = S(root, "started");
         var shown = new List<Dictionary<string, object>>();
         foreach (Dictionary<string, object> w in workers)
         {
+            if (_hiddenKeys.Count > 0 && IsTerminalWorker(w) && _hiddenKeys.Contains(WorkerKey(startedRoot, w)))
+                continue;
             string oc = S(w, "outcome");
             if (_cardFilter == 1 && oc == "DONE") continue;
             if (_cardFilter == 2 && oc != "DONE") continue;
@@ -1477,6 +1490,7 @@ class CockpitWindow : Window
         string reason = S(w, "reason");
         string last = S(w, "last");
         string conv = S(w, "conv_url");
+        string convTitle = S(w, "conv_title");
         int turn = I(w, "turn");
         bool closed = string.Equals(S(w, "closed"), "True", StringComparison.OrdinalIgnoreCase);
         bool terminal = status == "done" || status == "stuck" || status == "maxturns"
@@ -1553,27 +1567,32 @@ class CockpitWindow : Window
 
         col.Children.Add(top);
 
+        // Concise headline title (Copilot conv_title if captured, else derived from the goal) --
+        // ALWAYS shown so the card stays readable. The long goal text only appears when expanded,
+        // so a wall of issue text never wrecks visibility (the reported problem).
+        string headline = CardTitle(convTitle, goal);
+        if (!string.IsNullOrEmpty(headline))
+        {
+            var ht = new TextBlock();
+            ht.Text = headline;
+            ht.Foreground = Fg; ht.FontSize = 14; ht.FontWeight = FontWeights.SemiBold;
+            ht.TextTrimming = TextTrimming.CharacterEllipsis;
+            ht.Margin = new Thickness(0, 6, 0, 0);
+            col.Children.Add(ht);
+        }
+
         if (isOpen)
         {
-            // expanded: full goal, wrapped -- selectable/copyable read-only TextBox (Feature A)
+            // expanded: full goal, wrapped, as secondary (muted) text -- selectable/copyable
+            // read-only TextBox (Feature A). The headline above is the primary label.
             var g = new TextBox();
             g.Text = goal;
-            g.Foreground = Fg; g.FontSize = 14;
+            g.Foreground = Muted; g.FontSize = 12.5;
             g.IsReadOnly = true; g.BorderThickness = new Thickness(0);
             g.Background = Brushes.Transparent; g.Padding = new Thickness(0);
             g.IsTabStop = false; g.TextWrapping = TextWrapping.Wrap;
-            g.Margin = new Thickness(0, 10, 0, 8);
+            g.Margin = new Thickness(0, 8, 0, 8);
             SwallowMouseUp(g);
-            col.Children.Add(g);
-        }
-        else
-        {
-            // collapsed: one-line, trimmed -- cheap TextBlock (no selection needed)
-            var g = new TextBlock();
-            g.Text = goal;
-            g.Foreground = Fg; g.FontSize = 14;
-            g.TextTrimming = TextTrimming.CharacterEllipsis;
-            g.Margin = new Thickness(0, 6, 0, 0);
             col.Children.Add(g);
         }
 
@@ -1607,13 +1626,14 @@ class CockpitWindow : Window
         }
 
         card.Child = col;
-        if (!string.IsNullOrEmpty(conv))
-        {
-            card.Cursor = Cursors.Hand;
-            string url = conv;
-            card.MouseLeftButtonUp += delegate { OpenConv(url); };
-            card.ToolTip = _lang == 0 ? "クリックでこの会話をメインに表示" : "Click to open this conversation in the chat";
-        }
+        // Always clickable: open this worker in the main chat BY NAME, so it works even when the
+        // Copilot conv_url was never captured (the main chat renders the live status.json snapshot
+        // for this worker). conv_url is passed too so /history can fill in the full transcript
+        // when it is available.
+        card.Cursor = Cursors.Hand;
+        string wname = name; string url = conv;
+        card.MouseLeftButtonUp += delegate { OpenWorker(wname, url); };
+        card.ToolTip = _lang == 0 ? "クリックでこの会話をメインに表示" : "Click to open this conversation in the chat";
         return card;
     }
 
@@ -1953,6 +1973,58 @@ class CockpitWindow : Window
         catch (Exception) { }
     }
 
+    // Open a worker in the main chat by NAME (robust click target). The chat polls open.json;
+    // it resolves the worker by name in status.json and shows its live snapshot, and uses url
+    // for /history when a real Copilot conv_url was captured.
+    void OpenWorker(string name, string url)
+    {
+        try
+        {
+            _openSeq++;
+            var o = new Dictionary<string, object>();
+            o["worker"] = name ?? ""; o["url"] = url ?? ""; o["ts"] = _openSeq;
+            File.WriteAllText(_openPath, _js.Serialize(o), Encoding.UTF8);
+        }
+        catch (Exception) { }
+    }
+
+    // A concise card/conversation title: the Copilot-generated conv_title when present, else the
+    // issue heading derived from the goal (the first real line after the "== ... issue ==" marker,
+    // else the first non-boilerplate line), trimmed so long goal text never wrecks readability.
+    string CardTitle(string convTitle, string goal)
+    {
+        if (!string.IsNullOrEmpty(convTitle)) return Trunc(convTitle, 90);
+        if (string.IsNullOrEmpty(goal)) return "";
+        string[] lines = goal.Replace("\r", "").Split('\n');
+        for (int i = 0; i < lines.Length; i++)
+        {
+            string ln = lines[i].Trim();
+            if (ln.StartsWith("==") && ln.IndexOf("issue", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                for (int j = i + 1; j < lines.Length; j++)
+                {
+                    string h = lines[j].Trim();
+                    if (h.Length > 0) return Trunc(h, 90);
+                }
+            }
+        }
+        foreach (string l in lines)
+        {
+            string t = l.Trim();
+            if (t.Length > 0 && !t.StartsWith("==") && !t.StartsWith("あなたは")
+                && !t.StartsWith("対象") && !t.StartsWith("この"))
+                return Trunc(t, 90);
+        }
+        foreach (string l in lines) { string t = l.Trim(); if (t.Length > 0) return Trunc(t, 90); }
+        return "";
+    }
+
+    string Trunc(string s, int n)
+    {
+        s = (s ?? "").Trim();
+        return s.Length <= n ? s : s.Substring(0, n - 1) + "…";
+    }
+
     // ── persistent history: finished/released tasks stack until cleared ───────────
     void LoadHistory()
     {
@@ -1977,11 +2049,40 @@ class CockpitWindow : Window
         try { File.WriteAllText(_historyPath, _js.Serialize(_history), Encoding.UTF8); }
         catch (Exception) { }
     }
+    // The STABLE per-run+worker key (run identity + worker name). `started` is absent from
+    // some per-worker dicts, so it's read from the root snapshot. Matches the archive scheme.
+    static string WorkerKey(string started, Dictionary<string, object> w)
+    { return (started ?? "") + "#" + S(w, "name"); }
+
+    void LoadHidden()
+    {
+        _hiddenKeys = new System.Collections.Generic.HashSet<string>();
+        try
+        {
+            if (!File.Exists(_hiddenPath)) return;
+            var arr = _js.DeserializeObject(File.ReadAllText(_hiddenPath, Encoding.UTF8)) as object[];
+            if (arr == null) return;
+            foreach (object o in arr)
+                if (o != null) _hiddenKeys.Add(o.ToString());
+        }
+        catch (Exception) { }
+    }
+
+    void SaveHidden()
+    {
+        try
+        {
+            var list = new List<object>();
+            foreach (string k in _hiddenKeys) list.Add(k);
+            File.WriteAllText(_hiddenPath, _js.Serialize(list), Encoding.UTF8);
+        }
+        catch (Exception) { }
+    }
+
     void ClearHistory()
     {
         _history.Clear(); _archivedKeys.Clear();
         try { if (File.Exists(_historyPath)) File.Delete(_historyPath); } catch (Exception) { }
-        // also dismiss a FINISHED run's result cards (W0..) -- but never wipe a LIVE run.
         try
         {
             var st = ReadStatus();
@@ -1996,10 +2097,35 @@ class CockpitWindow : Window
             catch (Exception) { }
             bool stale = updated > 0 && (NowUnix() - updated) > 15;
             bool live = runningFlag && !stale;
+
             if (!live)
+            {
+                // Run is finished/dead: a clean reset -- blank the snapshot AND forget hides.
                 File.WriteAllText(_statusPath,
                     "{\"total\":0,\"done_count\":0,\"running\":false,\"idle\":true,\"workers\":[]}",
                     Encoding.UTF8);
+                _hiddenKeys.Clear();
+                SaveHidden();
+            }
+            else
+            {
+                // Run is LIVE: the runner rewrites status.json each second, so we can't blank it
+                // (it would just reappear, and would clobber running workers). Instead HIDE the
+                // TERMINAL cards persistently -- the runner regenerating them won't un-hide them.
+                // Running (non-terminal) workers are NEVER hidden: a live task vanishing is a hazard.
+                object wo; string started = S(st, "started");
+                if (st != null && st.TryGetValue("workers", out wo) && wo is object[])
+                {
+                    bool any = false;
+                    foreach (object o in (object[])wo)
+                    {
+                        var w = o as Dictionary<string, object>;
+                        if (w == null || !IsTerminalWorker(w)) continue;
+                        if (_hiddenKeys.Add(WorkerKey(started, w))) any = true;
+                    }
+                    if (any) SaveHidden();
+                }
+            }
         }
         catch (Exception) { }
         ForceRender();
