@@ -61,6 +61,16 @@ from tools.gate_ops import stop_check                     # operator E: kill-swi
 from tools.memory_ops import memory_load, memory_save     # cross-session history
 from tools.runlog_ops import runlog_append, runlog_summarize  # operator D: audit
 
+class ConversationClosed(RuntimeError):
+    """Raised by send() when the target tab/composer is already gone (the
+    conversation ended) BEFORE we even try to submit. This is the TargetClosedError
+    race seen in 28/72 send_failures records: the agent turn finished, the page was
+    torn down, and the relay then tried to send into a dead target -- burning the full
+    3-attempt retry budget every time. run_relay treats this as TERMINAL (no transient
+    retry), since retrying a closed target can never succeed. Subclasses RuntimeError
+    so any caller that only catches RuntimeError still behaves safely."""
+
+
 # --- Selectors captured from the live M365 Copilot DOM (2026-06) ------------
 COPILOT_SELECTORS = {
     "composer": "#m365-chat-editor-target-element",          # contenteditable, role=textbox
@@ -71,9 +81,29 @@ COPILOT_SELECTORS = {
     "assistant_msg": ".fai-CopilotMessage",
     "assistant_msg_fallback": '[data-testid="copilot-message-reply-div"]',
     # The Send button. Pressing Enter in this rich editor does NOT reliably submit
-    # (the text just sits in the composer) -- clicking this button does. aria-label
-    # is locale-specific; cover JP + EN.
-    "send_button": 'button[aria-label="送信"], button[aria-label="Send"]',
+    # (the text just sits in the composer) -- clicking this button does.
+    #
+    # LIVE DOM (companion Edge, 2026-06-13, read-only CDP scrape + 72 send_failures
+    # records): when the composer holds text, the button renders as
+    #   <button aria-label="送信" ...>           (JP locale, visible, enabled)
+    # in the same 40x40 toolbar slot that holds the dictation / voice buttons when
+    # the composer is EMPTY (so the button simply does not exist until text is typed
+    # AND has armed -- this is the slow-arm race that produced match_count=0). This
+    # build exposes NO data-testid on the send button, so we anchor on the localized
+    # aria-label (JP + EN) first, then fall back to structural signals that survive a
+    # label/locale change: a submit-typed button, and the icon-bearing send glyph.
+    # Multi-candidate + comma-separated so a Microsoft DOM tweak degrades gracefully
+    # instead of going to match_count=0 again.
+    "send_button": (
+        'button[aria-label="送信"], '            # JP, observed live (14/72 snapshots)
+        'button[aria-label="Send"], '            # EN locale
+        'button[aria-label*="送信"], '           # JP, label with extra decoration
+        'button[aria-label*="Send" i], '         # EN, e.g. "Send message"
+        'button[data-testid="send-button"], '    # if MS ever adds a testid
+        'button[data-testid*="send" i], '
+        'button[name="send" i], '
+        'button[type="submit"]'                  # last-ditch structural fallback
+    ),
     # Where the Copilot-generated conversation title renders. M365 surfaces the auto-
     # generated chat name in a few places depending on layout; we try each in order and
     # take the first non-empty, sane-looking string. Best-effort only -- every selector
@@ -313,7 +343,37 @@ class CopilotWebDriver:
         return self.page.locator(COPILOT_SELECTORS["assistant_msg"])
 
     def _send_button(self):
+        # Prefer a VISIBLE match: the send-button selector is now multi-candidate and
+        # could, in principle, also match an off-screen/hidden node in some layout; the
+        # visible one is the live composer button. Falls back to the bare .first if the
+        # :visible variant matches nothing (older Playwright / odd state).
+        try:
+            vis = self.page.locator(COPILOT_SELECTORS["send_button"]).locator("visible=true")
+            if vis.count() > 0:
+                return vis.first
+        except Exception:
+            pass
         return self.page.locator(COPILOT_SELECTORS["send_button"]).first
+
+    def _page_alive(self) -> bool:
+        """Cheap liveness probe: is the tab still open AND the composer still present?
+
+        Used as an early dead-check before a send so a conversation that ended (the
+        page/composer was torn down -- the TargetClosedError race seen in
+        send_failures.jsonl, 28/72) is treated as terminal IMMEDIATELY instead of
+        burning the full 3-attempt x 12s retry budget against a dead target. Any
+        exception (incl. TargetClosedError from page.is_closed/evaluate) -> not alive.
+        Never raises."""
+        try:
+            if self.page.is_closed():
+                return False
+        except Exception:
+            return False
+        try:
+            # touch the page; a closed/navigated-away target raises here
+            return self.page.locator(COPILOT_SELECTORS["composer"]).count() > 0
+        except Exception:
+            return False
 
     def _composer_text(self) -> str:
         """Current composer text, minus zero-width junk."""
@@ -335,14 +395,23 @@ class CopilotWebDriver:
             judge by an element that only exists after completion).
         """
         deadline = time.time() + timeout_s
-        btn = self._send_button()
         while time.time() < deadline:
+            # If the tab/composer died mid-wait (conversation ended), stop waiting --
+            # there is nothing to arm. The caller's dead-check turns this terminal.
+            if not self._page_alive():
+                return False
+            # Re-resolve the locator each pass: it is lazy, so this re-queries the DOM
+            # and picks up the send button the instant it renders. count() does NOT
+            # auto-wait (that race was the root cause of match_count=0 in the failure
+            # log -- the button armed a beat AFTER the synchronous count() check), so we
+            # re-poll on a short cadence and also let is_visible/is_enabled settle.
             try:
-                if btn.count() > 0 and btn.is_enabled():
+                btn = self._send_button()
+                if btn.count() > 0 and btn.is_visible() and btn.is_enabled():
                     return True
             except Exception:
                 pass
-            self.page.wait_for_timeout(400)
+            self.page.wait_for_timeout(300)
         return False
 
     def _snapshot_send_failure(self, attempt: int, phase: str) -> None:
@@ -454,6 +523,15 @@ class CopilotWebDriver:
             pass
 
     def send(self, text: str) -> None:
+        # EARLY DEAD-CHECK: if the tab/composer is already gone (conversation ended),
+        # do NOT enter the type/arm/click retry loop -- it would just throw
+        # TargetClosedError on every probe and waste the full 3x12s budget (the
+        # TargetClosedError race, 28/72 of send_failures). Fail fast and terminally so
+        # run_relay records a STUCK instead of spinning. This is a pure read; never
+        # types or clicks.
+        if not self._page_alive():
+            raise ConversationClosed(
+                "send aborted: conversation tab/composer is closed (dead target)")
         # CRITICAL: a newline in the Copilot composer SUBMITS the message. Collapse
         # all whitespace (incl. newlines) to single spaces so the whole job is sent
         # as ONE message with a single trailing Enter.
@@ -723,6 +801,15 @@ def run_relay(
         t_send = time.time()
         try:
             driver.send(job)
+        except ConversationClosed as e:
+            # The target tab/composer is gone (conversation ended). Retrying a dead
+            # target can NEVER succeed, so this is terminal -- skip the transient-retry
+            # budget entirely and stop now (prevents the 10x retry waste seen against
+            # TargetClosed pages in send_failures.jsonl).
+            runlog_append(run_id, {"turn": turn, "event": "conversation_closed",
+                                   "detail": str(e)[:200]})
+            outcome, reason = "STUCK", f"conversation closed: {e}"
+            break
         except Exception as e:
             # a send failure is a transient (CDP/Edge/network) hiccup -- retry with backoff
             # rather than giving up (the relay analog of Claude Code retrying a request).
