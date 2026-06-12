@@ -32,10 +32,18 @@ APPROVE_JOB = (
     "各ターンの最後に CONTINUE / DONE / STUCK: 理由 のいずれかを書いてください。"
 )
 
-# a line that starts like a step: "1." / "1)" / "1、" / "- " / "* " / fullwidth "１." / "①"
+# a line that starts like a step. Tolerant of: "1." / "1)" / "1、" / "1：" / fullwidth
+# "１．" / "①" / "- " / "* " / "・" and an optional "Step N" / "ステップN" prefix; the
+# separator and the space after a circled/bullet marker are optional (agents vary).
 _STEP_RE = re.compile(
-    r"^\s*(?:[0-9]+[\.\)、]|[１-９]+[\.\)、]|[①-⑳]|[-*・])\s+(.+?)\s*$")
-_CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+    r"^\s*(?:(?:step|ステップ)\s*)?"
+    r"(?:[0-9]+[\.\)、：．:]|[０-９]+[\.\)、：．:]|[①-⑳]|[-*・])\s*(.+?)\s*$",
+    re.IGNORECASE)
+
+
+def _clean_step(s):
+    """Drop leading markdown emphasis / colons so '**calc.py を読む**:' -> 'calc.py を読む'."""
+    return s.strip().strip("*").strip().rstrip(":：").strip()
 
 
 def plan_ready(resp: str) -> bool:
@@ -52,7 +60,7 @@ def extract_plan(resp: str):
             continue
         m = _STEP_RE.match(line)
         if m:
-            step = m.group(1).strip()
+            step = _clean_step(m.group(1))
             if step:
                 steps.append(step)
     return steps
