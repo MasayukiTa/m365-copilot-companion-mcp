@@ -793,7 +793,8 @@ def run_relay(
     outcome: str | None = None
     reason = ""
 
-    while turn < max_turns:
+    # max_turns=0 (or falsy) means unlimited -- progress-based guards still apply.
+    while not max_turns or turn < max_turns:
         if stop_check().startswith("STOP"):
             outcome, reason = "ABORTED", "kill-switch"
             break
@@ -1078,6 +1079,7 @@ def run_relay(
         time.sleep(sleep_s + backoff_s)
 
     if outcome is None:
+        # Only reachable when max_turns > 0 (unlimited runs exit via DONE/STUCK/ABORTED).
         outcome, reason = "MAXTURNS", f"reached max_turns={max_turns} without DONE"
 
     memory_save(f"relay.{run_id}.context",

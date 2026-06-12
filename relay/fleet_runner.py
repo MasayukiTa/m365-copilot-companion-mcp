@@ -171,10 +171,12 @@ def _write_atomic(path, payload):
 
 def _print_table(workers, total):
     done = sum(1 for w in workers if w.status in TERMINAL)
-    line = "  ".join(
-        "%s[%s t%d/%d]" % (w.name, STATUS_PILL.get(w.status, (w.status,))[0],
-                           w.turn, w.max_turns)
-        for w in workers)
+    def _turn_str(w):
+        # max_turns=0 means unlimited; show "t10/∞" to avoid "t10/0" confusion.
+        cap = ("∞" if not w.max_turns else str(w.max_turns))
+        return "%s[%s t%d/%s]" % (w.name, STATUS_PILL.get(w.status, (w.status,))[0],
+                                   w.turn, cap)
+    line = "  ".join(_turn_str(w) for w in workers)
     sys.stdout.write("\r\033[K[fleet %d/%d] %s" % (done, total, line))
     sys.stdout.flush()
 
