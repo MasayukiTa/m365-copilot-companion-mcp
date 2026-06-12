@@ -1450,12 +1450,28 @@ class CockpitWindow : Window
         string status = S(e, "status");
         string ck = ColorKey(status);
         string conv = S(e, "conv_url");
+        // Default COLLAPSED, exactly like a live card: a terminal worker that scrolls down into
+        // History must NOT spring open. The disclosure key is the archive `key` (started#name),
+        // which never collides with a live worker name (those carry no '#'), so it can ride the
+        // same _expanded set / ToggleExpand path as live cards.
+        string hkey = S(e, "key");
+        bool isOpen = !string.IsNullOrEmpty(hkey) && _expanded.Contains(hkey);
+
         var row = new Border();
         row.BorderThickness = new Thickness(1);
         row.BorderBrush = Border; row.Background = CardBg;
         row.CornerRadius = new CornerRadius(9);
         row.Padding = new Thickness(14, 8, 14, 8); row.Margin = new Thickness(8, 3, 8, 3);
+
+        var col = new StackPanel();
         var dp = new DockPanel();
+        // chevron disclosure (only when there is a key to toggle)
+        if (!string.IsNullOrEmpty(hkey))
+        {
+            var chev = ChevronToggle(hkey, isOpen);
+            DockPanel.SetDock(chev, Dock.Left);
+            dp.Children.Add(chev);
+        }
         var pill = Pill(StatusLabel(status), ck);
         pill.Margin = new Thickness(0, 0, 10, 0);
         DockPanel.SetDock(pill, Dock.Left);
@@ -1467,12 +1483,32 @@ class CockpitWindow : Window
         turns.HorizontalAlignment = HorizontalAlignment.Right;
         DockPanel.SetDock(turns, Dock.Right);
         dp.Children.Add(turns);
-        var goal = new TextBlock();
-        goal.Text = S(e, "goal"); goal.Foreground = Fg; goal.FontSize = 13;
-        goal.VerticalAlignment = VerticalAlignment.Center;
-        goal.TextTrimming = TextTrimming.CharacterEllipsis;
-        dp.Children.Add(goal);
-        row.Child = dp;
+        // Collapsed: the concise headline (conv_title if captured, else derived) -- single line,
+        // ellipsis-trimmed -- so History matches the live collapsed card instead of dumping the
+        // full goal text. The long goal only appears when this row is explicitly expanded.
+        var head = new TextBlock();
+        head.Text = CardTitle(S(e, "conv_title"), S(e, "goal"));
+        head.Foreground = Fg; head.FontSize = 13;
+        head.VerticalAlignment = VerticalAlignment.Center;
+        head.TextTrimming = TextTrimming.CharacterEllipsis;
+        dp.Children.Add(head);
+        col.Children.Add(dp);
+
+        if (isOpen)
+        {
+            // expanded: full goal, wrapped, as muted selectable text (mirrors the live card)
+            var g = new TextBox();
+            g.Text = S(e, "goal");
+            g.Foreground = Muted; g.FontSize = 12.5;
+            g.IsReadOnly = true; g.BorderThickness = new Thickness(0);
+            g.Background = Brushes.Transparent; g.Padding = new Thickness(0);
+            g.IsTabStop = false; g.TextWrapping = TextWrapping.Wrap;
+            g.Margin = new Thickness(0, 6, 0, 2);
+            SwallowMouseUp(g);
+            col.Children.Add(g);
+        }
+
+        row.Child = col;
         if (!string.IsNullOrEmpty(conv))
         {
             row.Cursor = Cursors.Hand;
@@ -2151,6 +2187,7 @@ class CockpitWindow : Window
             _archivedKeys.Add(key);
             var e = new Dictionary<string, object>();
             e["key"] = key; e["goal"] = S(w, "goal"); e["status"] = status;
+            e["conv_title"] = S(w, "conv_title");
             e["outcome"] = S(w, "outcome"); e["conv_url"] = conv;
             e["turn"] = I(w, "turn"); e["seq"] = _history.Count;
             _history.Add(e);
