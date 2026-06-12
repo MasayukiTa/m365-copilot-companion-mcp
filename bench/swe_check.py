@@ -46,14 +46,21 @@ def main():
                     "model_name_or_path": "companion"}], f)
     predwsl = "/mnt/c/Users/USER/companion-mcp/.fleet/swe/preds/" + inst + ".json"
 
-    # 3. official eval in WSL Docker (cache_level env keeps the image for fast retries)
+    # 3. official eval in WSL Docker.
+    #    cache_level: 'env' (default) keeps the per-version environment image for fast retries
+    #    -- fine because docker lives on the WSL disk (/dev/sdd, ~935 GB free), NOT on the
+    #    constrained C: drive. If the WSL disk ever fills, set SWE_CACHE_LEVEL=none (the
+    #    bb6a806-validated low-footprint mode: rebuilds the env image each run but leaves no
+    #    cached images behind).
+    cache_level = os.environ.get("SWE_CACHE_LEVEL", "env")
     run_id = "agent_" + inst.replace("__", "_")
     script = (
         "pgrep dockerd >/dev/null 2>&1 || (nohup dockerd >/tmp/dockerd.log 2>&1 & sleep 8); "
         "export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt; cd /root/swe; "
         "/root/swe-venv/bin/python -m swebench.harness.run_evaluation "
         "--dataset_name /root/swe/lite_local.json --predictions_path " + predwsl + " "
-        "--instance_ids " + inst + " --run_id " + run_id + " --max_workers 1 --cache_level env"
+        "--instance_ids " + inst + " --run_id " + run_id +
+        " --max_workers 1 --cache_level " + cache_level
     )
     try:
         wsl(script, timeout=1200)

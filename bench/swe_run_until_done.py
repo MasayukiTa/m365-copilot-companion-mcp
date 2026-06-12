@@ -10,8 +10,17 @@ Robustness:
   * loop: reset worktrees -> build goals -> run one fleet -> check status -> repeat for the
     still-unresolved instances, with the improved swe_check feedback gate doing the verification.
 
-  python bench/swe_run_until_done.py [<instance_id> ...]   (default: the two pilot failures)
+  python bench/swe_run_until_done.py [<instance_id> ...]              (legacy pilot default)
+  python bench/swe_run_until_done.py --targets-file batch_12.txt \
+      --goals .fleet/swe/goals_batch12.jsonl --setup batch \
+      --max-rounds 6 --max-concurrent 2 --chunk 4
+
+Batching: with --chunk K (default = len(targets), i.e. one fleet pass over all goals), the
+orchestrator processes the remaining instances K at a time per fleet launch. Small chunks
+isolate one bad instance's blast radius and bound RAM (2 Edge tabs * K queued goals), at the
+cost of more fleet relaunches. Recommended for a 12-instance/2-tab run: --chunk 4.
 """
+import argparse
 import atexit
 import json
 import os
@@ -27,10 +36,44 @@ SWEDIR = os.path.join(REPO, ".fleet", "swe")
 LOG = os.path.join(SWEDIR, "run_until_done.log")
 LOCK = os.path.join(SWEDIR, "run_until_done.lock")
 STATUS = os.path.join(REPO, ".fleet", "status.json")
-GOALS = os.path.join(SWEDIR, "goals2.jsonl")
 
-TARGETS = sys.argv[1:] or ["astropy__astropy-14182", "astropy__astropy-14365"]
-MAX_ROUNDS = 6
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("targets", nargs="*", help="instance ids (legacy positional)")
+    ap.add_argument("--targets-file", help="file with one instance id per line")
+    ap.add_argument("--goals", default=os.path.join(SWEDIR, "goals2.jsonl"),
+                    help="goals JSONL the fleet runs")
+    ap.add_argument("--setup", choices=["rerun", "batch"], default="rerun",
+                    help="rerun=swe_rerun_setup.py (astropy pilot), batch=swe_batch_setup.py")
+    ap.add_argument("--spec", default=os.path.join(SWEDIR, "batch_12_spec.json"),
+                    help="batch spec (only used when --setup batch)")
+    ap.add_argument("--max-rounds", type=int, default=6)
+    ap.add_argument("--max-concurrent", type=int, default=2)
+    ap.add_argument("--chunk", type=int, default=0,
+                    help="instances per fleet launch (0 = all remaining at once)")
+    a = ap.parse_args()
+    tgt = list(a.targets)
+    if a.targets_file:
+        p = a.targets_file
+        if not os.path.isabs(p):
+            p = os.path.join(SWEDIR, p)
+        tgt += [ln.strip() for ln in open(p, encoding="utf-8") if ln.strip()]
+    if not tgt:
+        tgt = ["astropy__astropy-14182", "astropy__astropy-14365"]
+    # de-dup, preserve order
+    seen, ordered = set(), []
+    for t in tgt:
+        if t not in seen:
+            seen.add(t); ordered.append(t)
+    a.target_list = ordered
+    return a
+
+
+ARGS = parse_args()
+TARGETS = ARGS.target_list
+MAX_ROUNDS = ARGS.max_rounds
+GOALS = ARGS.goals
 
 
 def log(msg):
@@ -103,35 +146,59 @@ def resolved_set():
     return out
 
 
-def run_round(insts):
-    r = subprocess.run([VENVPY, os.path.join(REPO, "bench", "swe_rerun_setup.py")] + insts,
-                       capture_output=True, text=True, errors="replace")
+def setup_round(insts):
+    """(Re)build the goals file for exactly `insts` using the configured setup script."""
+    if ARGS.setup == "batch":
+        cmd = [VENVPY, os.path.join(REPO, "bench", "swe_batch_setup.py"),
+               "--spec", ARGS.spec, "--goals", GOALS, "--instances"] + insts
+    else:
+        cmd = [VENVPY, os.path.join(REPO, "bench", "swe_rerun_setup.py")] + insts
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     log("setup: " + (r.stdout or "").strip().replace("\n", " | "))
+
+
+def run_round(insts):
+    setup_round(insts)
     kill_all_fleet()
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "ascii:replace"
     p = subprocess.Popen(
         [VENVPY, "-m", "relay.fleet_runner", "--goals-file", GOALS,
-         "--max-concurrent", str(len(insts)), "--max-turns", "20", "--max-transient", "10"],
+         "--max-concurrent", str(ARGS.max_concurrent), "--max-turns", "20",
+         "--max-transient", "10"],
         cwd=REPO, env=env)
-    log("launched fleet_runner pid %d on %d instance(s)" % (p.pid, len(insts)))
+    log("launched fleet_runner pid %d on %d instance(s) (max-concurrent=%d)"
+        % (p.pid, len(insts), ARGS.max_concurrent))
     # fleet_runner legitimately runs as parent + a child '-m relay.fleet_runner' process; do NOT
     # kill the child. Just wait for our parent to finish; the child lives/dies with it.
     p.wait()
     log("fleet_runner exited rc=%s" % p.returncode)
 
 
+def chunks(seq, k):
+    if k <= 0 or k >= len(seq):
+        return [list(seq)]
+    return [list(seq[i:i + k]) for i in range(0, len(seq), k)]
+
+
 def main():
     acquire_lock()
-    log("=== run_until_done start targets=%s ===" % TARGETS)
+    log("=== run_until_done start targets=%d goals=%s chunk=%d max-concurrent=%d ==="
+        % (len(TARGETS), os.path.basename(GOALS), ARGS.chunk, ARGS.max_concurrent))
     remaining = list(TARGETS)
     for rnd in range(1, MAX_ROUNDS + 1):
-        log("--- round %d/%d remaining=%s ---" % (rnd, MAX_ROUNDS, remaining))
-        run_round(remaining)
-        done = resolved_set()
-        for i in [x for x in remaining if x in done]:
-            log("RESOLVED: %s" % i)
-        remaining = [i for i in remaining if i not in done]
+        log("--- round %d/%d remaining=%d ---" % (rnd, MAX_ROUNDS, len(remaining)))
+        # process the remaining instances chunk-by-chunk; status.json reflects only the
+        # most-recent fleet launch, so collect each chunk's resolved set right after it ends.
+        round_done = set()
+        for ci, chunk in enumerate(chunks(remaining, ARGS.chunk), 1):
+            log("  chunk %d: %s" % (ci, chunk))
+            run_round(chunk)
+            done = resolved_set()
+            for i in [x for x in chunk if x in done]:
+                log("RESOLVED: %s" % i)
+                round_done.add(i)
+        remaining = [i for i in remaining if i not in round_done]
         if not remaining:
             log("=== ALL TARGETS RESOLVED in %d round(s) ===" % rnd)
             return
