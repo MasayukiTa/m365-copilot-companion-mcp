@@ -3,6 +3,8 @@ import os
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse
 
 from tools.archive_ops import zip_create, zip_extract, zip_list
 from tools.clipboard_ops import clipboard_get, clipboard_set
@@ -146,6 +148,17 @@ mcp = FastMCP(
     ),
 )
 
+@mcp.custom_route("/health", methods=["GET"])
+async def health(_request: Request) -> PlainTextResponse:
+    """Liveness probe that NEVER touches a blocking tool.
+
+    This async handler runs directly on the event loop and returns immediately, so the
+    supervisor can distinguish "the loop is briefly busy running a heavy tool in a worker
+    thread" (this still answers fast, because tool bodies are now offloaded) from "the
+    loop is actually dead". It does no auth and no I/O on purpose."""
+    return PlainTextResponse("ok")
+
+
 TOOLS = (
     # code execution
     run_python, shell_exec,
@@ -241,5 +254,44 @@ except Exception:
     pass
 
 
+def _install_faulthandler() -> None:
+    """Dump every thread's stack to a file periodically so a wedged event loop leaves a
+    forensic trail. dump_traceback_later(repeat=True) re-arms itself; if the loop is
+    frozen the dump still fires because faulthandler uses a separate watchdog thread.
+    Best-effort: any failure here must not stop the server from starting."""
+    try:
+        import faulthandler
+        from pathlib import Path
+
+        dump_dir = Path(__file__).resolve().parent / ".fleet"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        dump_path = dump_dir / "faulthandler.log"
+        # Keep a handle open for the lifetime of the process (faulthandler writes to it).
+        _fh = open(dump_path, "a", encoding="utf-8", buffering=1)
+        faulthandler.enable(file=_fh)
+        # Every 5 min, dump all thread stacks. On a healthy server this is just a periodic
+        # heartbeat; when the loop is stuck the dump shows exactly which tool is blocking.
+        faulthandler.dump_traceback_later(
+            300, repeat=True, file=_fh, exit=False
+        )
+        # Keep a module-global ref so the file object isn't garbage-collected.
+        global _FAULTHANDLER_FILE
+        _FAULTHANDLER_FILE = _fh
+    except Exception:
+        pass
+
+
+_FAULTHANDLER_FILE = None
+
+
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http", port=8000, path="/mcp")
+    _install_faulthandler()
+    # timeout_graceful_shutdown gives in-flight requests up to 30s to finish on SIGTERM
+    # instead of an immediate hard kill (uvicorn default 0 = no grace). Passed through
+    # FastMCP.run_http_async -> uvicorn.Config(**uvicorn_config).
+    mcp.run(
+        transport="streamable-http",
+        port=8000,
+        path="/mcp",
+        uvicorn_config={"timeout_graceful_shutdown": 30},
+    )
