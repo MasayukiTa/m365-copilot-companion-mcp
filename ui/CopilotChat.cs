@@ -316,7 +316,7 @@ class ChatWindow : Window
                     var c = new Conversation();
                     c.ConvUrl = url;
                     c.Title = SS(d, "title");
-                    _all.Add(c);
+                    _all.Insert(0, c);   // newest on top (registry/fleet convs were appended below)
                     added = true;
                 }
             }

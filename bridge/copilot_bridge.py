@@ -481,6 +481,17 @@ class Handler(BaseHTTPRequestHandler):
                     PAGE.goto(url, wait_until="domcontentloaded")
                     _wait_composer()
                 messages = _scrape_history()
+                # A cold URL navigation sometimes lands on an un-hydrated conversation view
+                # (the SPA shows the composer but never renders the prior turns), so the
+                # first scrape comes back empty. Reload once and re-scrape before giving up.
+                if url and not messages:
+                    try:
+                        PAGE.reload(wait_until="domcontentloaded")
+                        _wait_composer()
+                        PAGE.wait_for_timeout(1500)
+                        messages = _scrape_history()
+                    except Exception:
+                        pass
             except Exception as e:
                 self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}); return
             self._json({"ok": True, "url": PAGE.url, "messages": messages})
