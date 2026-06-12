@@ -187,6 +187,30 @@ PROCESSING_MARKERS = ("処理中", "生成しています", "考えています"
                       "thinking", "...")
 
 
+# Phrases Copilot emits when it never actually received/registered the task and is asking what
+# to do -- a DELIVERY failure, not a real dead-end. Seen on round 5 where a worker burned 10
+# transient retries with the generic RETRY_JOB because the goal text never landed in the tab.
+# When STUCK co-occurs with one of these, the right fix is to RESEND THE GOAL ITSELF, not a
+# generic "try again" nudge.
+_GOAL_NOT_SEEN_MARKERS = (
+    "タスクが提示されていません", "タスクが提示されて", "タスクが見当たりません",
+    "指示が提示されていません", "指示がありません", "ゴールが提示されていません",
+    "課題が提示されていません", "依頼内容が確認できません", "何をすればよいか",
+    "具体的なタスク", "提示してください", "no task", "no task was", "task was not provided",
+    "wasn't provided a task", "haven't been given", "have not been given a task",
+    "no instructions", "please provide the task", "please provide a task",
+    "what would you like me to", "what task",
+)
+
+
+def goal_not_seen(resp: str) -> bool:
+    """True when the agent's reply indicates it never received the actual task (so it is asking
+    for one), as opposed to a genuine STUCK on the work. In that case the goal text should be
+    RE-SENT verbatim rather than a generic retry nudge."""
+    t = (resp or "").lower()
+    return any(m.lower() in t for m in _GOAL_NOT_SEEN_MARKERS)
+
+
 def reported_stuck(resp: str) -> bool:
     """True only when the agent really declared STUCK with the protocol marker
     ('STUCK:' / 'STUCK：'). A bare substring match on 'STUCK' false-fires when the agent
