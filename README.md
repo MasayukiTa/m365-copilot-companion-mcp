@@ -256,6 +256,63 @@
 
 ---
 
+## 🧑‍💻 自律コーディング・エージェント（Claude Code 相当 ＋ 本家に無い武器）
+
+relay の上に、**Claude Code のような自律コーディング体験**を載せました。`relay/code_task.py` に
+**自然言語で 1 行**投げるだけ——`goals` ファイルもフラグも書かない:
+
+```powershell
+# 「このフォルダのバグを直して」だけ。検証方法は自分で判断して、通るまで完了しない
+.\.venv\Scripts\python.exe -m relay.code_task -i "落ちてるテストを直して" -f C:\proj
+```
+
+**頭脳は M365 Copilot の中身＝Opus 4.8（Claude 本体と同じ）。** だから「生の知能」は Claude Code と
+同等。違いは UI 駆動の信頼性だけ——そこを詰めて、機構としては Claude Code の **~80%** まで来ています。
+
+**Claude Code と同じところ（catch-up 済み）:**
+
+- **自然言語フロントドア** (`code_task`) — 「何をするか」だけ言えば、エージェントが必要なファイルを
+  自分で探して編集。per-file の指示出しは不要。
+- **🛡 検証ゲート（核心）** — Copilot が「DONE」と言っても**鵜呑みにせず、枠がローカルでテスト/コンパイル
+  を実際に実行**。通らなければ**実際の失敗出力を突き返して**直させる。**テストが通るまで完了にしない**＝
+  Claude Code の信頼性の本体。`relay/acceptance.py`。
+- **🔎 検証の自動判定** — フォルダを見て **pytest があれば pytest、無ければ compile、Node なら npm test** を
+  自動採用（`--check-cmd` 不要）。`relay/project_introspect.py`。
+- **🗺 リポジトリ地図** — フォルダを AST 解析した「ツリー＋関数/クラスのシグネチャ＋docstring」を起点に
+  注入。盲目 grep でなく**地図を持って着手**（aider/Claude Code 流）。`relay/repo_map.py`。
+- **📝 プラン提示→承認→実行** — `--plan` で**まず番号付き計画を出して一時停止**（承認待ち）。あなたが
+  **承認 or 編集を割り込み(steer)で送る**と実行開始。`relay/planner.py`。
+
+**Claude Code に無い武器（差別化／ここで差を開く）:**
+
+- **🧑‍⚖️ 多視点レビューパネル**（operator B）— 完了候補に対し、**正しさ／境界値／セキュリティの独立
+  レビュアーを当てて多数決**。機械検証で捕まらない意味的欠陥を潰す。`--refuter`（単一）/`--panel`（3観点）。
+  Claude Code に組み込みの敵対的レビューは無い。
+- **🚀 N 本同時の並列フリート** — 複数ゴールを 1 スレッドで並走。Claude Code は基本 1 トラック。
+- **🛠 ツールの自己生成**（operator A / foundry）— タスク中に `FORGE: <名前>` ＋ ```python``` で**再利用
+  ツールを自作**。構文検証して `tools/auto/` に常設化。`--forge`。
+- **🧾 全ターン監査ログ＋kill-switch、ツール使用トレース**（`MCP_TRACE_TOOLCALLS=1` で「何を編集/実行したか」
+  を JSONL 記録）。
+- **💴 コストが M365 ライセンス内**（従量課金の deep research と違い定額）。
+
+**正直な天井**: UI（CDP/DOM/Edge）駆動なので、API 直叩きの Claude Code の堅牢性には **原理的に届かない**
+（低 RAM 下の送信揺れ等）。そこは送信成功検知の強化・Edge の自動リサイクル（肥大/低RAMで起動前に
+クリーン化）でかなり詰めました。**機構パリティ ~80%／実用 ~65%、いくつかの軸では本家超え**、が正直な現在地。
+
+> これらの制御ロジックは**ブラウザ無しで決定的にテスト**しています（acceptance / 検証ゲート / 反証パネル /
+> プラン承認 / forge / リサイクル等、**138 本超のユニットテスト**）。実機 Copilot 相手の end-to-end
+> （バグ修正→pytest 検証→反証 UPHELD→DONE、計画提示→承認→実行）もライブで実証済み。
+
+```powershell
+# よく使う形
+-m relay.code_task -i "バグ直して" -f C:\proj                    # 自然言語＋自動検証
+-m relay.code_task -i "リファクタして" -f C:\proj --plan         # 計画提示→承認→実行
+-m relay.code_task -i "堅牢化して"   -f C:\proj --panel          # 3観点レビューパネル
+-m relay.fleet_runner --goals-file goals.txt --max-concurrent 3  # N 本並列
+```
+
+---
+
 ## 💬 ネイティブチャット UI（Python + Edge だけ・Node 不要）
 
 Premium / Direct Line を使わず、Copilot エージェントを **手元のローカルアプリのように** 使える 2 つのフロントエンドを同梱しています。どちらも裏は同じ「ブリッジ → CDP → Copilot」経路で、別 PC の要件は **Python + Edge のみ**（Chrome も Node も不要）。
@@ -932,6 +989,61 @@ the Edge you are already signed into):
 
 > Selectors were captured from the live M365 Copilot DOM and isolated in
 > `COPILOT_SELECTORS` -- if Microsoft changes the DOM, patch just that block.
+
+---
+
+## 🧑‍💻 Autonomous coding agent (Claude-Code-grade, plus weapons it doesn't have)
+
+On top of the relay sits a **Claude-Code-style autonomous coding loop**. You give
+`relay/code_task.py` **one line of natural language** -- no goals file, no flags:
+
+```powershell
+# just "fix the failing tests". It decides how to verify and won't finish until they pass
+.\.venv\Scripts\python.exe -m relay.code_task -i "fix the failing tests" -f C:\proj
+```
+
+**The brain is what's inside M365 Copilot = Opus 4.8 (the same Claude).** So the raw
+intelligence equals Claude Code's; the only real difference is UI-driving reliability.
+We've pushed on that, and as a mechanism it's now at **~80%** of Claude Code.
+
+**Same as Claude Code (caught up):**
+
+- **Natural-language front door** (`code_task`) -- say *what*; the agent finds and edits
+  the files itself. No per-file dictation.
+- **🛡 Verification gate (the core)** -- a Copilot "DONE" is **not trusted**; the frame
+  **actually runs the tests/compile locally** and, on failure, **feeds the real output
+  back** to fix. **Not done until it's proven done** -- the heart of Claude Code's
+  reliability. `relay/acceptance.py`.
+- **🔎 Auto-detected verification** -- looks at the folder and picks **pytest if there's a
+  suite, else compile, else `npm test`** (no `--check-cmd`). `relay/project_introspect.py`.
+- **🗺 Repo map** -- an AST map (tree + each file's defs/classes with signatures + docstrings)
+  is primed into the task, so the agent starts **oriented** instead of grepping blind
+  (aider/Claude-Code style). `relay/repo_map.py`.
+- **📝 Plan -> approve -> execute** -- `--plan` proposes a numbered plan and **pauses**
+  (awaiting); you **approve or edit it via a steer** to start execution. `relay/planner.py`.
+
+**Weapons Claude Code doesn't have (where we pull ahead):**
+
+- **🧑‍⚖️ Perspective-diverse review panel** (operator B) -- a candidate DONE is checked by
+  **independent reviewers for correctness / edge-cases / security, majority vote**, catching
+  semantic defects no machine check sees. `--refuter` (single) / `--panel` (3 lenses).
+  Claude Code has no built-in adversarial review.
+- **🚀 N goals in parallel** (fleet) on one thread. Claude Code is one track.
+- **🛠 Self-forged tools** (operator A / foundry) -- mid-task `FORGE: <name>` + a ```python```
+  block writes a reusable, compile-checked tool into `tools/auto/`. `--forge`.
+- **🧾 Full audit log + kill-switch, and tool-call tracing** (`MCP_TRACE_TOOLCALLS=1` logs
+  exactly what it edited/ran).
+- **💴 Cost stays inside the M365 licence** (flat, vs metered deep research).
+
+**Honest ceiling**: being UI-driven (CDP/DOM/Edge), it **cannot reach** the robustness of
+API-native Claude Code (e.g. send flakiness under low RAM). We hardened that with a stronger
+send-success signal and pre-run Edge auto-recycle. Honest standing: **~80% mechanism parity /
+~65% practical, and ahead on several axes.**
+
+> The control logic is **tested deterministically without a browser** (acceptance gate,
+> review panel, plan-approval, forge, recycle... **138+ unit tests**), and proven live
+> end-to-end against the real Copilot (bug fix -> pytest verified -> refuter UPHELD -> DONE;
+> plan -> approve -> execute).
 
 ---
 
