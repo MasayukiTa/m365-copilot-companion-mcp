@@ -25,7 +25,10 @@
   Health-check interval.
 #>
 param(
-    [string]$TunnelName = "m365-copilot-companion",
+    # IMPORTANT: this default must match the real tunnel id (`devtunnel list`).
+    # 2026-06-12: a relaunch without -TunnelName used a stale default and KILLED the
+    # live tunnel host while "fixing" a tunnel that didn't exist. Keep this current.
+    [string]$TunnelName = "companion-mcp",
     [int]$Port = 8000,
     [int]$IntervalSeconds = 10,
     # Consecutive failed checks required before acting. Debounce avoids killing a
