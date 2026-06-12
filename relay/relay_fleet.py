@@ -32,9 +32,9 @@ import time
 
 from .acceptance import Check, normalize_checks, run_all_blocking
 from .copilot_autopilot_relay import (
-    CONTINUE_JOB, COPILOT_SELECTORS, CopilotWebDriver, FIX_JOB, PROTOCOL,
-    REFUTE_FIX_JOB, RETRY_JOB, VERIFY_FIX_JOB, _is_processing, default_notify,
-    goal_not_seen, reported_stuck, transient_backoff,
+    CONTINUE_JOB, COPILOT_SELECTORS, ConversationClosed, CopilotWebDriver, FIX_JOB,
+    PROTOCOL, REFUTE_FIX_JOB, RETRY_JOB, VERIFY_FIX_JOB, _is_processing,
+    default_notify, goal_not_seen, reported_stuck, transient_backoff,
 )
 from .planner import PLAN_PROMPT, extract_plan, plan_ready
 
@@ -375,6 +375,17 @@ class RelayWorker:
             self._count_before = self.drv._answers().count()
             self.drv._count_before = self._count_before
             self.drv.send(self.job)
+        except ConversationClosed as e:
+            # The target tab/composer is gone (conversation ended). Retrying a dead
+            # target can never succeed -- terminal, skip the transient budget entirely
+            # (prevents the 10x retry waste against TargetClosed pages seen in
+            # send_failures.jsonl). Still let an already-satisfied workspace salvage to
+            # DONE before declaring STUCK.
+            if self._salvage_via_checks():
+                return
+            self.status, self.outcome = "stuck", "STUCK"
+            self.reason = "conversation closed: %s" % (str(e),)
+            return
         except Exception as e:
             # a send failure is a transient (CDP/Edge/network) hiccup -- retry the turn
             # rather than giving up, up to the budget. Don't consume a turn for a failed
