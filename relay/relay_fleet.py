@@ -34,7 +34,7 @@ from .acceptance import Check, normalize_checks, run_all_blocking
 from .copilot_autopilot_relay import (
     CONTINUE_JOB, COPILOT_SELECTORS, CopilotWebDriver, FIX_JOB, PROTOCOL,
     REFUTE_FIX_JOB, RETRY_JOB, VERIFY_FIX_JOB, _is_processing, default_notify,
-    reported_stuck, transient_backoff,
+    goal_not_seen, reported_stuck, transient_backoff,
 )
 from .planner import PLAN_PROMPT, extract_plan, plan_ready
 
@@ -228,6 +228,10 @@ class RelayWorker:
         # Claude Code retrying a failed request rather than giving up. Budget + backoff.
         self.max_transient = max_transient
         self.transient = 0
+        # goal-delivery recovery: when the agent reports it never received the task, RE-SEND
+        # the goal verbatim instead of a generic retry nudge (bounded to avoid a resend loop).
+        self.max_goal_resends = 3
+        self._goal_resends = 0
         self._cooldown_until = 0.0
         self.verified = None          # None=not checked, True/False after a gate ran
         self.last_verify_detail = ""
@@ -435,6 +439,24 @@ class RelayWorker:
         self.last_norm = norm
         up = resp.upper()
         last_line = (resp.strip().splitlines() or [""])[-1].upper()
+        # GOAL-DELIVERY recovery (additive, exception-safe): if the agent says it never
+        # received the task -- whether or not it dressed that up as STUCK -- the goal text
+        # didn't land in the tab. Re-send the GOAL ITSELF (verbatim, via PROTOCOL) rather
+        # than a generic retry nudge, which on round 5 spun 10 empty retries. Bounded by
+        # max_goal_resends; only the plan-pending phase is exempted (it legitimately has no
+        # task body yet for the executor).
+        try:
+            _gns = goal_not_seen(resp)
+        except Exception:
+            _gns = False
+        if _gns and not (self.plan_mode and not self._plan_approved) \
+                and self._goal_resends < self.max_goal_resends:
+            self._goal_resends += 1
+            self.job = (PROTOCOL + self.goal)
+            self.status = "ready"
+            self.reason = "goal not received by agent -> resend goal %d/%d" % (
+                self._goal_resends, self.max_goal_resends)
+            return
         if reported_stuck(resp):
             # Under load, an agent STUCK is usually a downstream symptom of a transient
             # tool/network failure (the agent couldn't write a file etc.). Retry the turn
