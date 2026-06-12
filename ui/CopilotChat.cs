@@ -291,9 +291,13 @@ class ChatWindow : Window
     // status.json lives next to conversations.json (.fleet/). Read the worker dict whose
     // "conv_url" matches 'url' (the cockpit cards render exactly this live per-worker state).
     // Returns null when status.json is missing/unreadable or no worker matches.
-    Dictionary<string, object> ReadFleetWorker(string url)
+    Dictionary<string, object> ReadFleetWorker(string key)
     {
-        if (string.IsNullOrEmpty(url)) return null;
+        if (string.IsNullOrEmpty(key)) return null;
+        // key is either a real Copilot conv_url, or a synthetic "fleet:<worker-name>" used when the
+        // conv_url was never captured -- in that case resolve the worker by NAME so click-to-open
+        // always finds its live status.json snapshot regardless of URL scraping.
+        string wantName = key.StartsWith("fleet:") ? key.Substring(6) : null;
         try
         {
             string statusPath = Path.Combine(Path.GetDirectoryName(_convsPath), "status.json");
@@ -306,11 +310,68 @@ class ChatWindow : Window
             foreach (object o in (object[])d["workers"])
             {
                 var w = o as Dictionary<string, object>;
-                if (w != null && SS(w, "conv_url") == url) return w;
+                if (w == null) continue;
+                if (wantName != null) { if (SS(w, "name") == wantName) return w; }
+                else if (SS(w, "conv_url") == key) return w;
             }
         }
         catch { }
         return null;
+    }
+
+    // True while a fleet run is actively driving the companion Edge: status.json says
+    // running AND it was updated recently (the runner rewrites it ~1/s). When this holds we
+    // must NOT call /switch+/history -- doing so would PAGE.goto the shared companion Edge
+    // onto this conversation and clobber the live send. Stale/!running -> safe to scrape.
+    bool FleetRunningFresh()
+    {
+        try
+        {
+            string sp = Path.Combine(Path.GetDirectoryName(_convsPath), "status.json");
+            if (!File.Exists(sp)) return false;
+            string txt;
+            using (var fsr = new FileStream(sp, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var sr = new StreamReader(fsr, Encoding.UTF8)) txt = sr.ReadToEnd();
+            var d = _cjs.DeserializeObject(txt) as Dictionary<string, object>;
+            if (d == null) return false;
+            bool running = d.ContainsKey("running") && d["running"] != null && Convert.ToBoolean(d["running"]);
+            if (!running) return false;
+            double updated = (d.ContainsKey("updated") && d["updated"] != null) ? Convert.ToDouble(d["updated"]) : 0;
+            double now = (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds;
+            return (now - updated) <= 20.0;   // fresh within 20s -> the runner is live
+        }
+        catch { return false; }
+    }
+
+    // Read a worker's persisted full-text transcript (.fleet/transcripts/<key>.jsonl, one
+    // JSON object per line) into ordered messages. Untruncated. Returns an empty list if the
+    // path is empty/missing/unreadable (caller falls back to /history or the snapshot).
+    // Fully isolated: a parse hiccup on one line is skipped, never thrown.
+    List<Msg> ReadTranscript(string path)
+    {
+        var msgs = new List<Msg>();
+        if (string.IsNullOrEmpty(path) || !File.Exists(path)) return msgs;
+        try
+        {
+            string[] lines;
+            using (var fsr = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var sr = new StreamReader(fsr, Encoding.UTF8))
+                lines = sr.ReadToEnd().Replace("\r", "").Split('\n');
+            foreach (string ln in lines)
+            {
+                if (string.IsNullOrEmpty(ln)) continue;
+                Dictionary<string, object> o;
+                try { o = _cjs.DeserializeObject(ln) as Dictionary<string, object>; }
+                catch { continue; }
+                if (o == null) continue;
+                if (!o.ContainsKey("role")) continue;   // skip meta / guid marker lines
+                string role = o["role"] != null ? o["role"].ToString() : "assistant";
+                string text = (o.ContainsKey("text") && o["text"] != null) ? o["text"].ToString() : "";
+                msgs.Add(new Msg(role.StartsWith("user") ? "U" : "A", text));
+            }
+        }
+        catch { }
+        return msgs;
     }
 
     // Build a readable live snapshot from a status.json worker dict: goal/status/outcome,
@@ -318,9 +379,16 @@ class ChatWindow : Window
     // cockpit card so the main chat shows progress when /history can't be scraped.
     void RenderFleetSnapshot(Dictionary<string, object> w)
     {
-        bool ja = _lang == 0;
         AddUser(SS(w, "goal"));
+        AddAssistant(BuildFleetStatusTail(w, includeLast: true));
+    }
 
+    // The status/turn/plan/verify/reason block for a worker, as a string. When includeLast
+    // is false the "latest response" (the truncated `last`) is omitted -- used when the full
+    // transcript is already shown above, so we don't duplicate the last turn in truncated form.
+    string BuildFleetStatusTail(Dictionary<string, object> w, bool includeLast)
+    {
+        bool ja = _lang == 0;
         var sb = new StringBuilder();
         string status = SS(w, "status");
         string outcome = SS(w, "outcome");
@@ -351,9 +419,9 @@ class ChatWindow : Window
             }
         }
 
-        // latest scraped response
+        // latest scraped response (skipped when the full transcript is already rendered above)
         string last = SS(w, "last");
-        if (!string.IsNullOrEmpty(last))
+        if (includeLast && !string.IsNullOrEmpty(last))
             sb.Append('\n').Append(ja ? "最新の応答:" : "Latest response:").Append('\n').Append(last).Append('\n');
 
         // verification state
@@ -375,7 +443,7 @@ class ChatWindow : Window
         if (!string.IsNullOrEmpty(reason))
             sb.Append('\n').Append(ja ? "理由: " : "Reason: ").Append(reason).Append('\n');
 
-        AddAssistant(sb.ToString().TrimEnd('\n'));
+        return sb.ToString().TrimEnd('\n');
     }
 
     List<object> ReadConvsRegistry()
@@ -474,41 +542,68 @@ class ChatWindow : Window
             if (m == _openMtime) return;
             _openMtime = m;
             var d = _cjs.DeserializeObject(File.ReadAllText(_openPath, Encoding.UTF8)) as Dictionary<string, object>;
-            if (d == null || !d.ContainsKey("url") || d["url"] == null) return;
-            string url = d["url"].ToString();
-            if (string.IsNullOrEmpty(url)) return;
-            new Thread((ThreadStart)delegate { OpenFromFleet(url); }) { IsBackground = true }.Start();
+            if (d == null) return;
+            string url = (d.ContainsKey("url") && d["url"] != null) ? d["url"].ToString() : "";
+            string worker = (d.ContainsKey("worker") && d["worker"] != null) ? d["worker"].ToString() : "";
+            if (string.IsNullOrEmpty(url) && string.IsNullOrEmpty(worker)) return;
+            new Thread((ThreadStart)delegate { OpenFromFleet(url, worker); }) { IsBackground = true }.Start();
         }
         catch { }
     }
 
-    void OpenFromFleet(string url)
+    void OpenFromFleet(string url, string worker)
     {
-        try { HttpGet("/switch?url=" + Uri.EscapeDataString(url)); } catch { }
-        var msgs = new List<Msg>();
-        try
+        // Normalize a "fleet:<name>" url back into a worker key (no real Copilot URL was captured).
+        if (!string.IsNullOrEmpty(url) && url.StartsWith("fleet:"))
+        { if (string.IsNullOrEmpty(worker)) worker = url.Substring(6); url = ""; }
+        // Robust key: prefer the real conv_url (for /history); else a synthetic worker key that
+        // ReadFleetWorker resolves by NAME so the click always lands on the live snapshot.
+        string key = !string.IsNullOrEmpty(url) ? url : ("fleet:" + (worker ?? ""));
+
+        // Resolve the live worker dict (by conv_url when we have a real URL, else by name).
+        var wkr = ReadFleetWorker(key);
+        bool running = FleetRunningFresh();
+        string transcriptPath = wkr != null ? SS(wkr, "transcript") : "";
+
+        // SOURCE PRIORITY:
+        //  1. Persisted full-text transcript (jsonl) -- ALWAYS preferred when present. It is the
+        //     whole conversation, untruncated, and reading it touches only disk (never the live
+        //     companion Edge), so it is safe even mid-run.
+        //  2. /switch + /history DOM scrape -- ONLY when the fleet is NOT running-fresh. While a
+        //     run is live this would PAGE.goto the shared companion Edge and clobber the send, so
+        //     we never scrape during a live run (regression guard).
+        //  3. status.json snapshot fragment -- fallback for older workers with no transcript.
+        var msgs = ReadTranscript(transcriptPath);
+        bool fromTranscript = msgs.Count > 0;
+        if (!fromTranscript && !running && !string.IsNullOrEmpty(url))
         {
-            string hist = HttpGet("/history?url=" + Uri.EscapeDataString(url));
-            var root = _cjs.DeserializeObject(hist) as Dictionary<string, object>;
-            if (root != null && root.ContainsKey("messages") && root["messages"] is object[])
-                foreach (object o in (object[])root["messages"])
-                {
-                    var md = o as Dictionary<string, object>;
-                    if (md == null) continue;
-                    string role = md.ContainsKey("role") && md["role"] != null ? md["role"].ToString() : "assistant";
-                    string text = md.ContainsKey("text") && md["text"] != null ? md["text"].ToString() : "";
-                    msgs.Add(new Msg(role.StartsWith("user") ? "U" : "A", text));
-                }
+            try { HttpGet("/switch?url=" + Uri.EscapeDataString(url)); } catch { }
+            try
+            {
+                string hist = HttpGet("/history?url=" + Uri.EscapeDataString(url));
+                var root = _cjs.DeserializeObject(hist) as Dictionary<string, object>;
+                if (root != null && root.ContainsKey("messages") && root["messages"] is object[])
+                    foreach (object o in (object[])root["messages"])
+                    {
+                        var md = o as Dictionary<string, object>;
+                        if (md == null) continue;
+                        string role = md.ContainsKey("role") && md["role"] != null ? md["role"].ToString() : "assistant";
+                        string text = md.ContainsKey("text") && md["text"] != null ? md["text"].ToString() : "";
+                        msgs.Add(new Msg(role.StartsWith("user") ? "U" : "A", text));
+                    }
+            }
+            catch { }
         }
-        catch { }
         var loaded = msgs;
+        // Keep the live status tail (and arm live re-render) whenever the fleet is running and we
+        // have a worker dict -- so the user sees turn/verify/status update under the transcript.
+        bool keepLive = running && wkr != null;
         Dispatcher.BeginInvoke(new Action(delegate
         {
-            // reuse the existing sidebar entry for this conversation if present (dedup
-            // by URL) so a fleet/registry conversation isn't duplicated
+            // reuse the existing sidebar entry for this conversation if present (dedup by key)
             Conversation c = null;
-            foreach (var x in _all) { if (x.ConvUrl == url) { c = x; break; } }
-            if (c == null) { c = new Conversation(); c.ConvUrl = url; c.Title = T("fleetview"); _all.Insert(0, c); }
+            foreach (var x in _all) { if (x.ConvUrl == key) { c = x; break; } }
+            if (c == null) { c = new Conversation(); c.ConvUrl = key; c.Title = T("fleetview"); _all.Insert(0, c); }
             c.Messages.Clear();
             foreach (var m in loaded) c.Messages.Add(m);
             _conv = c;
@@ -516,34 +611,68 @@ class ChatWindow : Window
             var note = new TextBlock { Text = T("fleetview_note"), TextWrapping = TextWrapping.Wrap, FontSize = 12.5, Margin = new Thickness(2, 2, 2, 10) };
             SetRef(note, TextBlock.ForegroundProperty, "Muted");
             _messages.Children.Add(note);
+            if (wkr != null) { string t = FleetTitle(wkr); if (!string.IsNullOrEmpty(t)) c.Title = t; }
             foreach (var m in loaded) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
-            if (loaded.Count == 0)
+
+            if (loaded.Count > 0)
             {
-                // /history is empty (in-progress / can't-scrape). Show the LIVE per-worker
-                // state from status.json instead of a misleading "couldn't load" fallback.
-                var w = ReadFleetWorker(url);
-                if (w != null)
+                // Full conversation is shown. If running, append a live status block (without the
+                // truncated `last`, already in the transcript) and keep it refreshing.
+                if (keepLive)
                 {
-                    RenderFleetSnapshot(w);
-                    _activeFleetUrl = url;   // arm live re-render in the poll timer
+                    AddAssistant(BuildFleetStatusTail(wkr, includeLast: false));
+                    _activeFleetUrl = key;
                     try { string sp = Path.Combine(Path.GetDirectoryName(_convsPath), "status.json"); _statusMtime = File.Exists(sp) ? File.GetLastWriteTimeUtc(sp).Ticks : 0; }
                     catch { _statusMtime = 0; }
                 }
-                else
-                {
-                    _activeFleetUrl = null;
-                    AddAssistant(_lang == 0
-                        ? "（この会話の本文はまだ取得できません。進行中のため履歴が空の可能性があります。）"
-                        : "(This conversation's transcript isn't available yet -- it may be empty while the run is in progress.)");
-                }
+                else { _activeFleetUrl = null; }   // finished conversation; nothing to keep live
+            }
+            else if (wkr != null)
+            {
+                // No transcript and (running or scrape empty): show the LIVE per-worker snapshot
+                // fragment from status.json and keep it refreshing.
+                RenderFleetSnapshot(wkr);
+                _activeFleetUrl = key;
+                try { string sp = Path.Combine(Path.GetDirectoryName(_convsPath), "status.json"); _statusMtime = File.Exists(sp) ? File.GetLastWriteTimeUtc(sp).Ticks : 0; }
+                catch { _statusMtime = 0; }
             }
             else
             {
-                _activeFleetUrl = null;   // full transcript shown; no snapshot to keep live
+                _activeFleetUrl = null;
+                AddAssistant(_lang == 0
+                    ? "（この会話の本文はまだ取得できません。進行中のため履歴が空の可能性があります。）"
+                    : "(This conversation's transcript isn't available yet -- it may be empty while the run is in progress.)");
             }
             RefreshConvList();
             _scroll.ScrollToEnd();
         }));
+    }
+
+    // A concise title for a fleet worker snapshot: the Copilot-generated conv_title if present,
+    // else the issue heading derived from the goal (mirrors the cockpit's CardTitle).
+    string FleetTitle(Dictionary<string, object> w)
+    {
+        string ct = SS(w, "conv_title");
+        if (!string.IsNullOrEmpty(ct)) return ct.Length > 90 ? ct.Substring(0, 90) : ct;
+        string goal = SS(w, "goal");
+        if (string.IsNullOrEmpty(goal)) return "";
+        string[] lines = goal.Replace("\r", "").Split('\n');
+        for (int i = 0; i < lines.Length; i++)
+        {
+            string ln = lines[i].Trim();
+            if (ln.StartsWith("==") && ln.IndexOf("issue", StringComparison.OrdinalIgnoreCase) >= 0)
+                for (int j = i + 1; j < lines.Length; j++)
+                {
+                    string nx = lines[j].Trim();
+                    if (nx.Length > 0) return nx.Length > 90 ? nx.Substring(0, 90) : nx;
+                }
+        }
+        foreach (string l in lines)
+        {
+            string s = l.Trim();
+            if (s.Length > 0 && !s.StartsWith("==")) return s.Length > 90 ? s.Substring(0, 90) : s;
+        }
+        return "";
     }
 
     // Re-render the live fleet snapshot in place (called from the poll timer when
@@ -559,7 +688,19 @@ class ChatWindow : Window
         var note = new TextBlock { Text = T("fleetview_note"), TextWrapping = TextWrapping.Wrap, FontSize = 12.5, Margin = new Thickness(2, 2, 2, 10) };
         SetRef(note, TextBlock.ForegroundProperty, "Muted");
         _messages.Children.Add(note);
-        RenderFleetSnapshot(w);
+        // If this worker has a persisted transcript, re-render the WHOLE conversation from disk
+        // (untruncated) and append the live status tail -- otherwise fall back to the snapshot
+        // fragment. Reading the jsonl touches only disk, never the live companion Edge.
+        var tx = ReadTranscript(SS(w, "transcript"));
+        if (tx.Count > 0)
+        {
+            foreach (var m in tx) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
+            AddAssistant(BuildFleetStatusTail(w, includeLast: false));
+        }
+        else
+        {
+            RenderFleetSnapshot(w);
+        }
         _scroll.ScrollToEnd();
     }
 
@@ -809,7 +950,7 @@ class ChatWindow : Window
             _messages.Children.Add(note);
             RefreshConvList();
             string url = c.ConvUrl;
-            new Thread((ThreadStart)delegate { OpenFromFleet(url); }) { IsBackground = true }.Start();
+            new Thread((ThreadStart)delegate { OpenFromFleet(url, ""); }) { IsBackground = true }.Start();
             return;
         }
         foreach (var m in c.Messages) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
