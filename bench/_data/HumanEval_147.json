@@ -1,0 +1,1 @@
+{"test": "def check(candidate):\n\n    assert candidate(5) == 1\n    assert candidate(6) == 4\n    assert candidate(10) == 36\n    assert candidate(100) == 53361\n", "entry_point": "get_max_triples"}

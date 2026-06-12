@@ -10,6 +10,10 @@ local checks. Proves the spec 3-3 gate behaviour:
   * repeated failure     -> STUCK with outcome VERIFY_FAILED at max_verify_attempts
   * multi-check          -> stops at the first failing check, re-injects ITS detail
   * goal_fields          -> str and dict goal shapes normalize correctly
+  * exhaustion salvage   -> at max_turns / per-turn-timeout, if the checks ALREADY pass the
+                            worker ends DONE+verified instead of MAXTURNS/STUCK (HumanEval_56
+                            class); a failing check still goes MAXTURNS/STUCK (no false salvage)
+                            and a no-checks goal is unchanged (back-compat)
 
 Run:  .venv\\Scripts\\python.exe relay\\test_fleet_verify.py
 """
@@ -92,6 +96,49 @@ def main():
     check("gf_str", t == "hello" and c == [] and cwd is None)
     t, c, cwd = goal_fields({"goal": "g2", "check": {"type": "shell", "cmd": "x"}, "cwd": "C:/p"})
     check("gf_dict", t == "g2" and len(c) == 1 and cwd == "C:/p")
+
+    # --- acceptance SALVAGE at exhaustion (HumanEval_56 class: artifact already passes the
+    # canonical check, but the turn/transient budget is spent before a clean DONE lands) ----
+
+    # 8. at max_turns but checks ALREADY pass -> salvaged DONE+verified, not MAXTURNS
+    w = RelayWorker({"text": "g", "checks": [PASS_CHECK]}, "w6", max_turns=10)
+    w.turn, w.status = 10, "ready"        # next turn would exceed the cap
+    w._begin_send()
+    check("maxturns_salvaged_done", w.status == "done" and w.outcome == "DONE"
+          and w.verified is True)
+
+    # 9. at max_turns and checks FAIL -> still MAXTURNS (salvage never masks a real miss)
+    w = RelayWorker({"text": "g", "checks": [FAIL_CHECK]}, "w7", max_turns=5)
+    w.turn, w.status = 5, "ready"
+    w._begin_send()
+    check("maxturns_fail_stays_maxturns", w.status == "maxturns" and w.outcome == "MAXTURNS"
+          and w.verified is not True)
+
+    # 10. at max_turns with NO checks -> MAXTURNS unchanged (back-compat; nothing to prove)
+    w = RelayWorker("plain", "w8", max_turns=3)
+    w.turn, w.status = 3, "ready"
+    w._begin_send()
+    check("maxturns_nocheck_unchanged", w.status == "maxturns" and w.outcome == "MAXTURNS")
+
+    # 11. per-turn timeout, retries exhausted, checks already pass -> salvaged DONE not STUCK
+    w = RelayWorker({"text": "g", "checks": [PASS_CHECK]}, "w9",
+                    max_transient=0, per_turn_timeout_s=0)
+    w.status = "waiting"
+    w._t_send = time.time() - 100         # already past the (0s) per-turn timeout
+    w._count_before = 0
+    term = w.poll()
+    check("timeout_salvaged_done", term is True and w.status == "done"
+          and w.outcome == "DONE" and w.verified is True)
+
+    # 12. per-turn timeout, retries exhausted, checks FAIL -> STUCK (no false salvage)
+    w = RelayWorker({"text": "g", "checks": [FAIL_CHECK]}, "w10",
+                    max_transient=0, per_turn_timeout_s=0)
+    w.status = "waiting"
+    w._t_send = time.time() - 100
+    w._count_before = 0
+    term = w.poll()
+    check("timeout_fail_stays_stuck", term is True and w.status == "stuck"
+          and w.outcome == "STUCK")
 
     print("\n=== %d/%d fleet-verify checks passed ===" % (sum(results), len(results)))
     return 0 if all(results) else 1

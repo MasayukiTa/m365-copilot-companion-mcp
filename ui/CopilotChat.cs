@@ -34,6 +34,8 @@ class Conversation
     public string Id = Guid.NewGuid().ToString("N").Substring(0, 12);
     public string Title = "";        // empty = untitled (shows the localized default)
     public string ConvUrl = "";
+    public string Source = "";
+    public double Ts = 0;
     public List<Msg> Messages = new List<Msg>();
     public bool Untitled() { return string.IsNullOrEmpty(Title); }
 }
@@ -57,7 +59,7 @@ class ChatWindow : Window
     int _deleteMode = 1;                 // 1=local only, 2=open in Copilot, 3=auto (experimental)
     int _lang = 0;                       // 0=Japanese, 1=English
     Border _banner; StackPanel _bannerBody;
-    Button _newBtn, _themeBtn, _langBtn;
+    Button _newBtn, _themeBtn, _langBtn, _manageBtn;
     static readonly string SettingsFile = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "copilot-bridge", "settings.txt");
 
@@ -100,6 +102,20 @@ class ChatWindow : Window
         if (k == "t_nourl") return ja ? "Copilot 会話 URL 不明のため、ローカルのみ削除しました。" : "No Copilot URL; deleted locally only.";
         if (k == "t_auto_ok") return ja ? "Copilot 会話も自動削除しました。" : "Auto-deleted the Copilot conversation too.";
         if (k == "t_auto_fail") return ja ? "自動削除はできませんでした。Copilot で開きます（手動で削除してください）。" : "Auto-delete failed. Opening in Copilot (delete it manually).";
+        if (k == "manage_btn") return ja ? "会話を整理" : "Manage";
+        if (k == "manage_title") return ja ? "会話の一括削除" : "Bulk delete conversations";
+        if (k == "show_all") return ja ? "すべて表示（自分の会話も含む）" : "Show all (incl. your own)";
+        if (k == "period") return ja ? "期間" : "Period";
+        if (k == "period_all") return ja ? "全期間" : "All";
+        if (k == "period_24h") return ja ? "過去24時間" : "Last 24h";
+        if (k == "period_7d") return ja ? "過去7日" : "Last 7d";
+        if (k == "period_30d") return ja ? "過去30日" : "Last 30d";
+        if (k == "running_note") return ja ? "走行中：Copilot側の削除は停止します（ローカル一覧からのみ削除）。" : "A run is live: Copilot-side delete is disabled (local list only).";
+        if (k == "select_all") return ja ? "全選択" : "Select all";
+        if (k == "clear_all") return ja ? "全解除" : "Clear";
+        if (k == "del_selected") return ja ? "選択した会話を削除" : "Delete selected";
+        if (k == "close") return ja ? "閉じる" : "Close";
+        if (k == "untitled") return ja ? "(無題)" : "(untitled)";
         return k;
     }
 
@@ -132,10 +148,16 @@ class ChatWindow : Window
         side.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         SetRef(side, BackgroundProperty, "PanelAlt");
 
+        var headerStack = new StackPanel { Margin = new Thickness(12, 14, 12, 8) };
         _newBtn = Btn(T("newchat_btn"), "Panel", "Fg", true);
-        _newBtn.Height = 40; _newBtn.Margin = new Thickness(12, 14, 12, 8); _newBtn.FontWeight = FontWeights.SemiBold;
+        _newBtn.Height = 40; _newBtn.Margin = new Thickness(0, 0, 0, 6); _newBtn.FontWeight = FontWeights.SemiBold;
         _newBtn.Click += delegate { NewChat(); };
-        Grid.SetRow(_newBtn, 0); side.Children.Add(_newBtn);
+        headerStack.Children.Add(_newBtn);
+        _manageBtn = Btn(T("manage_btn"), "PanelAlt", "Muted", true);
+        _manageBtn.Height = 30; _manageBtn.FontSize = 12;
+        _manageBtn.Click += delegate { ShowManageConversations(); };
+        headerStack.Children.Add(_manageBtn);
+        Grid.SetRow(headerStack, 0); side.Children.Add(headerStack);
 
         _convList = new StackPanel { Margin = new Thickness(8, 4, 8, 4) };
         var convScroll = new ScrollViewer { Content = _convList, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
@@ -292,6 +314,26 @@ class ChatWindow : Window
         }
         catch { }
     }
+    // Remove entries whose url is in 'urls' from the shared registry and persist, so
+    // bulk-deleted conversations don't reappear via SyncRegistry.
+    void UnregisterConvs(System.Collections.Generic.HashSet<string> urls)
+    {
+        if (urls == null || urls.Count == 0) return;
+        try
+        {
+            var list = ReadConvsRegistry();
+            var keep = new List<object>();
+            foreach (var o in list)
+            {
+                var d = o as Dictionary<string, object>;
+                if (d != null && urls.Contains(SS(d, "url"))) continue;
+                keep.Add(o);
+            }
+            File.WriteAllText(_convsPath, _cjs.Serialize(keep), Encoding.UTF8);
+            _convsMtime = File.GetLastWriteTimeUtc(_convsPath).Ticks;
+        }
+        catch { }
+    }
     // Pull any conversations from the shared registry (e.g. fleet ones) into the sidebar
     // as lazy placeholders -- clicking loads their content via /history.
     void SyncRegistry()
@@ -316,6 +358,9 @@ class ChatWindow : Window
                     var c = new Conversation();
                     c.ConvUrl = url;
                     c.Title = SS(d, "title");
+                    c.Source = SS(d, "source");
+                    try { c.Ts = (d.ContainsKey("ts") && d["ts"] != null) ? Convert.ToDouble(d["ts"]) : 0; }
+                    catch { c.Ts = 0; }
                     _all.Insert(0, c);   // newest on top (registry/fleet convs were appended below)
                     added = true;
                 }
@@ -640,6 +685,230 @@ class ChatWindow : Window
         RefreshConvList();
     }
 
+    // ── bulk conversation manager (multi-select delete) ─────────────────────────
+    bool BulkRunLive()
+    {
+        try
+        {
+            string statusPath = Path.Combine(Path.GetDirectoryName(_convsPath), "status.json");
+            if (!File.Exists(statusPath)) return false;
+            var d = _cjs.DeserializeObject(File.ReadAllText(statusPath, Encoding.UTF8)) as Dictionary<string, object>;
+            if (d != null && d.ContainsKey("running") && d["running"] != null) return Convert.ToBoolean(d["running"]);
+        }
+        catch { }
+        return false;
+    }
+
+    static string BulkDateStr(double ts)
+    {
+        if (ts == 0) return "—";
+        try { return new DateTime(1970, 1, 1).AddSeconds(ts).ToLocalTime().ToString("MM/dd HH:mm"); }
+        catch { return "—"; }
+    }
+
+    void ShowManageConversations()
+    {
+        bool localOnly = BulkRunLive();
+
+        var win = new Window
+        {
+            Title = T("manage_title"), Owner = this, Width = 620, Height = 620,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner
+        };
+        win.Resources = this.Resources;
+        SetRef(win, BackgroundProperty, "Bg");
+
+        var dock = new DockPanel { Margin = new Thickness(16, 14, 16, 14) };
+
+        // FILTER ROW (top)
+        var filterRow = new StackPanel { Margin = new Thickness(0, 0, 0, 8) };
+        var showAll = new CheckBox { Content = T("show_all"), IsChecked = false, FontSize = 12.5, Margin = new Thickness(0, 0, 0, 6) };
+        SetRef(showAll, ForegroundProperty, "Fg");
+        var periodWrap = new StackPanel { Orientation = Orientation.Horizontal };
+        var periodLbl = new TextBlock { Text = T("period"), FontSize = 12.5, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 0) };
+        SetRef(periodLbl, TextBlock.ForegroundProperty, "Muted");
+        var period = new ComboBox { Width = 160, FontSize = 12.5 };
+        period.Items.Add(T("period_all"));
+        period.Items.Add(T("period_24h"));
+        period.Items.Add(T("period_7d"));
+        period.Items.Add(T("period_30d"));
+        period.SelectedIndex = 0;
+        periodWrap.Children.Add(periodLbl); periodWrap.Children.Add(period);
+        filterRow.Children.Add(showAll); filterRow.Children.Add(periodWrap);
+
+        if (localOnly)
+        {
+            var rn = new TextBlock { Text = T("running_note"), FontSize = 11.5, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 7, 0, 0) };
+            SetRef(rn, TextBlock.ForegroundProperty, "Accent");
+            filterRow.Children.Add(rn);
+        }
+        DockPanel.SetDock(filterRow, Dock.Top);
+        dock.Children.Add(filterRow);
+
+        // FOOTER (bottom) -- built before the list so its labels can be referenced
+        var footer = new DockPanel { Margin = new Thickness(0, 10, 0, 0) };
+        var selAll = new Button { Content = T("select_all"), Cursor = Cursors.Hand, FontSize = 12, Padding = new Thickness(12, 5, 12, 6), Margin = new Thickness(0, 0, 6, 0), BorderThickness = new Thickness(1) };
+        SetRef(selAll, BackgroundProperty, "PanelAlt"); SetRef(selAll, ForegroundProperty, "Fg"); SetRef(selAll, Control.BorderBrushProperty, "Border");
+        var clrAll = new Button { Content = T("clear_all"), Cursor = Cursors.Hand, FontSize = 12, Padding = new Thickness(12, 5, 12, 6), Margin = new Thickness(0, 0, 10, 0), BorderThickness = new Thickness(1) };
+        SetRef(clrAll, BackgroundProperty, "PanelAlt"); SetRef(clrAll, ForegroundProperty, "Fg"); SetRef(clrAll, Control.BorderBrushProperty, "Border");
+        var countLbl = new TextBlock { Text = "", FontSize = 12.5, VerticalAlignment = VerticalAlignment.Center };
+        SetRef(countLbl, TextBlock.ForegroundProperty, "Muted");
+        var closeBtn = new Button { Content = T("close"), Cursor = Cursors.Hand, FontSize = 12.5, Padding = new Thickness(16, 6, 16, 7), Margin = new Thickness(8, 0, 0, 0), BorderThickness = new Thickness(1), FontWeight = FontWeights.SemiBold };
+        SetRef(closeBtn, BackgroundProperty, "PanelAlt"); SetRef(closeBtn, ForegroundProperty, "Fg"); SetRef(closeBtn, Control.BorderBrushProperty, "Border");
+        closeBtn.Click += delegate { win.Close(); };
+        var delBtn = new Button { Content = T("del_selected"), Cursor = Cursors.Hand, FontSize = 12.5, Padding = new Thickness(16, 6, 16, 7), BorderThickness = new Thickness(0), FontWeight = FontWeights.SemiBold };
+        SetRef(delBtn, BackgroundProperty, "Accent"); SetRef(delBtn, ForegroundProperty, "AccentFg");
+        DockPanel.SetDock(closeBtn, Dock.Right);
+        DockPanel.SetDock(delBtn, Dock.Right);
+        footer.Children.Add(closeBtn);
+        footer.Children.Add(delBtn);
+        footer.Children.Add(selAll);
+        footer.Children.Add(clrAll);
+        footer.Children.Add(countLbl);
+        DockPanel.SetDock(footer, Dock.Bottom);
+        dock.Children.Add(footer);
+
+        // LIST (fills the middle)
+        var listPanel = new StackPanel { Margin = new Thickness(0, 2, 0, 2) };
+        var listScroll = new ScrollViewer { Content = listPanel, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+        SetRef(listScroll, Control.BorderBrushProperty, "Border");
+        listScroll.BorderThickness = new Thickness(1);
+        var listBorder = new Border { Child = listScroll, CornerRadius = new CornerRadius(8) };
+        SetRef(listBorder, Border.BorderBrushProperty, "Border"); listBorder.BorderThickness = new Thickness(1);
+        dock.Children.Add(listBorder);
+
+        // parallel structure: each checkbox -> its conversation
+        var boxes = new List<CheckBox>();
+        var convOf = new Dictionary<CheckBox, Conversation>();
+
+        // count label updater (declared via array so inner delegates can call it)
+        var updateCount = new Action[1];
+        updateCount[0] = delegate
+        {
+            int n = 0;
+            foreach (var cb in boxes) if (cb.IsChecked == true) n++;
+            countLbl.Text = (_lang == 0) ? (n + "件選択") : (n + " selected");
+        };
+
+        // (re)build the filtered list
+        var rebuild = new Action[1];
+        rebuild[0] = delegate
+        {
+            listPanel.Children.Clear();
+            boxes.Clear();
+            convOf.Clear();
+            bool all = showAll.IsChecked == true;
+            double now = (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds;
+            double cutoff = 0;
+            int pi = period.SelectedIndex;
+            if (pi == 1) cutoff = now - 24 * 3600;
+            else if (pi == 2) cutoff = now - 7 * 24 * 3600;
+            else if (pi == 3) cutoff = now - 30 * 24 * 3600;
+            foreach (var c in _all)
+            {
+                if (string.IsNullOrEmpty(c.ConvUrl)) continue;
+                if (!all && c.Source != "fleet") continue;
+                if (!(c.Ts == 0 || c.Ts >= cutoff)) continue;
+                var cc = c;
+                var row = new DockPanel { Margin = new Thickness(8, 5, 8, 5) };
+                var cb = new CheckBox { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 0) };
+                cb.Checked += delegate { updateCount[0](); };
+                cb.Unchecked += delegate { updateCount[0](); };
+                DockPanel.SetDock(cb, Dock.Left);
+                var raw = string.IsNullOrEmpty(cc.Title) ? T("untitled") : cc.Title;
+                if (raw.Length > 50) raw = raw.Substring(0, 50) + "…";
+                var meta = new TextBlock { FontSize = 11, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8, 0, 0, 0) };
+                SetRef(meta, TextBlock.ForegroundProperty, "Muted");
+                meta.Text = BulkDateStr(cc.Ts) + (string.IsNullOrEmpty(cc.Source) ? "" : ("  " + cc.Source));
+                DockPanel.SetDock(meta, Dock.Right);
+                var tt = new TextBlock { Text = raw, FontSize = 12.5, VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis };
+                SetRef(tt, TextBlock.ForegroundProperty, "Fg");
+                row.Children.Add(cb);
+                row.Children.Add(meta);
+                row.Children.Add(tt);
+                listPanel.Children.Add(row);
+                boxes.Add(cb);
+                convOf[cb] = cc;
+            }
+            updateCount[0]();
+        };
+
+        showAll.Checked += delegate { rebuild[0](); };
+        showAll.Unchecked += delegate { rebuild[0](); };
+        period.SelectionChanged += delegate { rebuild[0](); };
+        selAll.Click += delegate { foreach (var cb in boxes) cb.IsChecked = true; };
+        clrAll.Click += delegate { foreach (var cb in boxes) cb.IsChecked = false; };
+
+        var progressLbl = countLbl; // reuse the live label for progress during deletion
+
+        delBtn.Click += delegate
+        {
+            var selected = new List<Conversation>();
+            foreach (var cb in boxes) if (cb.IsChecked == true) selected.Add(convOf[cb]);
+            if (selected.Count == 0) return;
+            string confirm = (_lang == 0)
+                ? (selected.Count + "件の会話を削除します。よろしいですか？")
+                : ("Delete " + selected.Count + " conversation(s)?");
+            var res = MessageBox.Show(win, confirm, T("manage_title"), MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+            if (res != MessageBoxResult.OK) return;
+
+            // disable controls during the run
+            delBtn.IsEnabled = false; selAll.IsEnabled = false; clrAll.IsEnabled = false;
+            showAll.IsEnabled = false; period.IsEnabled = false; closeBtn.IsEnabled = false;
+
+            int total = selected.Count;
+            new Thread((ThreadStart)delegate
+            {
+                int deleted = 0, copilotFail = 0;
+                var deletedUrls = new System.Collections.Generic.HashSet<string>();
+                for (int i = 0; i < selected.Count; i++)
+                {
+                    var c = selected[i];
+                    int idx = i + 1;
+                    Dispatcher.Invoke(new Action(delegate
+                    {
+                        progressLbl.Text = (_lang == 0) ? ("削除中 " + idx + "/" + total) : ("Deleting " + idx + "/" + total);
+                        // local removal (mirror DeleteLocal's file delete + _all.Remove)
+                        try { var p = Path_(c.Id); if (File.Exists(p)) File.Delete(p); } catch { }
+                        _all.Remove(c);
+                        if (!string.IsNullOrEmpty(c.ConvUrl)) deletedUrls.Add(c.ConvUrl);
+                        if (_conv.Id == c.Id) { _conv = new Conversation(); _messages.Children.Clear(); }
+                    }));
+                    deleted++;
+                    if (!localOnly && !string.IsNullOrEmpty(c.ConvUrl))
+                    {
+                        bool ok = false;
+                        try
+                        {
+                            var j = HttpGet("/delete?url=" + Uri.EscapeDataString(c.ConvUrl) + "&title=" + Uri.EscapeDataString(c.Title ?? ""));
+                            ok = j != null && j.Contains("\"ok\": true");
+                        }
+                        catch { }
+                        if (!ok) copilotFail++;
+                    }
+                }
+                int dDeleted = deleted, dFail = copilotFail;
+                Dispatcher.Invoke(new Action(delegate
+                {
+                    UnregisterConvs(deletedUrls);
+                    if (_all.Count == 0) { _conv = new Conversation(); _all.Add(_conv); _messages.Children.Clear(); }
+                    RefreshConvList();
+                    rebuild[0]();
+                    string summary = (_lang == 0)
+                        ? (dDeleted + "件削除しました" + (dFail > 0 ? ("（Copilot側 " + dFail + "件失敗）") : ""))
+                        : ("Deleted " + dDeleted + (dFail > 0 ? (" (" + dFail + " Copilot-side failed)") : ""));
+                    progressLbl.Text = summary;
+                    delBtn.IsEnabled = true; selAll.IsEnabled = true; clrAll.IsEnabled = true;
+                    showAll.IsEnabled = true; period.IsEnabled = true; closeBtn.IsEnabled = true;
+                }));
+            }) { IsBackground = true }.Start();
+        };
+
+        rebuild[0]();
+        win.Content = dock;
+        win.ShowDialog();
+    }
+
     // ── delete-mode banner (3 choices, like Claude Code's modes) ────────────────
     void LoadSettings()
     {
@@ -666,6 +935,7 @@ class ChatWindow : Window
     void UpdateChrome()
     {
         _newBtn.Content = T("newchat_btn"); _themeBtn.Content = T("theme"); _langBtn.Content = T("lang"); _send.Content = T("send");
+        if (_manageBtn != null) _manageBtn.Content = T("manage_btn");
     }
     void HideBanner() { _banner.Visibility = Visibility.Collapsed; }
 

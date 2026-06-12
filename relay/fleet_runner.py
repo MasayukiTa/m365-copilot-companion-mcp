@@ -62,18 +62,36 @@ STATUS_PILL = {
 DEFAULT_MAX_CONCURRENT = 3
 
 
-def settings_maxtabs(default=DEFAULT_MAX_CONCURRENT):
-    """Read the user's chosen max-concurrent-tabs from the shared settings.txt
-    (the cockpit writes `maxtabs=N`). Falls back to `default`."""
+def _settings_path():
+    return os.path.join(os.environ.get("APPDATA", ""), "copilot-bridge", "settings.txt")
+
+
+def _settings_int(key, default):
+    """Read an int `key=N` from the shared settings.txt (cockpit-written). Falls back."""
     try:
-        p = os.path.join(os.environ.get("APPDATA", ""), "copilot-bridge", "settings.txt")
+        p = _settings_path()
         if os.path.isfile(p):
             for ln in open(p, encoding="utf-8-sig").read().splitlines():
-                if ln.startswith("maxtabs="):
-                    return max(1, int(ln.split("=", 1)[1].strip()))
+                if ln.startswith(key + "="):
+                    return int(ln.split("=", 1)[1].strip())
     except Exception:
         pass
     return default
+
+
+def settings_maxtabs(default=DEFAULT_MAX_CONCURRENT):
+    """The user's chosen concurrency from settings.txt (`maxtabs=N`). Under autoscale this is
+    the DEFAULT/start cap; with autoscale off it's the fixed cap. Falls back to `default`."""
+    return max(1, _settings_int("maxtabs", default))
+
+
+def settings_autoscale():
+    """Read the cockpit's autoscale config: (on, ceiling).
+      autoscale=1        -> RAM-aware dynamic concurrency enabled
+      autoscale_max=N    -> the ceiling tabs may grow to (defaults to maxtabs if unset)"""
+    on = _settings_int("autoscale", 0) == 1
+    ceiling = _settings_int("autoscale_max", 0)          # 0 = unset -> caller defaults it
+    return on, ceiling
 
 
 def _repo_root():
@@ -132,6 +150,10 @@ def _snapshot(workers, started, total, max_concurrent=0):
             "verify_attempts": getattr(w, "verify_attempts", 0),
             "plan": getattr(w, "plan_steps", []),     # surfaced so the cockpit can show/pick
             "last": (w.last_response or "")[:600],
+            # carried so the cockpit can RETRY a stopped goal with its full acceptance gate
+            # intact (re-queue via add_goal). Small per goal; safe to include for 100+ workers.
+            "checks": getattr(w, "checks", []),
+            "cwd": getattr(w, "cwd", None),
         } for w in workers],
     }
 
@@ -166,6 +188,17 @@ def main():
     ap.add_argument("--max-concurrent", type=int, default=-1,
                     help="max tabs open at once. -1 = use the cockpit's setting "
                          "(maxtabs, default 3); 0 = auto from free RAM; N = exactly N")
+    ap.add_argument("--autoscale", action="store_true",
+                    help="RAM-aware dynamic concurrency: grow tabs while free RAM allows, "
+                         "drain when it gets tight (ramps up 1 tab/loop, never past the cap)")
+    ap.add_argument("--autoscale-default", type=int, default=-1,
+                    help="autoscale START/default tabs. -1 = the cockpit's maxtabs setting")
+    ap.add_argument("--autoscale-max", type=int, default=-1,
+                    help="autoscale ceiling (上限, max tabs). -1 = cockpit's autoscale_max")
+    ap.add_argument("--autoscale-headroom-mb", type=int, default=1400,
+                    help="free RAM (MB) to keep for the user's other work while autoscaling")
+    ap.add_argument("--autoscale-per-tab-mb", type=int, default=700,
+                    help="RAM budget (MB) assumed per Copilot tab when autoscaling")
     ap.add_argument("--poll-s", type=float, default=1.0)
     ap.add_argument("--stall-s", type=int, default=150,
                     help="if status.json stops updating this long while running, the "
@@ -218,6 +251,26 @@ def main():
         max_conc = auto_concurrency(len(goals))           # 0 = auto from free RAM
     else:
         max_conc = min(settings_maxtabs(), len(goals))    # -1 = the cockpit's setting (default 3)
+
+    # ── autoscale: the user picks a DEFAULT (start) and a CEILING (上限). Start at the
+    # default, shrink when RAM is tight, grow toward the ceiling when RAM is free. Enabled
+    # by --autoscale or the cockpit's `autoscale=1`. Backward-compatible: `maxtabs` is the
+    # default/start (and, with autoscale off, the fixed cap as before).
+    set_on, set_ceiling = settings_autoscale()
+    autoscale = args.autoscale or set_on
+    asc_default = args.autoscale_default if args.autoscale_default > 0 else settings_maxtabs()
+    if args.autoscale_max > 0:
+        asc_ceiling = args.autoscale_max
+    elif set_ceiling > 0:
+        asc_ceiling = set_ceiling
+    else:
+        asc_ceiling = max(asc_default, settings_maxtabs())
+    asc_ceiling = max(1, min(asc_ceiling, len(goals)))
+    asc_default = max(1, min(asc_default, asc_ceiling))      # default never exceeds the ceiling
+    autoscale_max = asc_ceiling
+    if autoscale:
+        max_conc = asc_default                               # START at the user's default
+    asc_box = [1 if autoscale else 0, asc_ceiling]           # live [on, ceiling] for the cockpit
     commands_path = os.path.join(args.state_dir, "commands.json")
 
     # write an initial 'launching' snapshot so the cockpit shows something at once
@@ -235,8 +288,12 @@ def main():
     print("fleet: %d goal(s) (%d with acceptance check) -> %s"
           % (len(goals), nverify, args.agent_url))
     print("       live status: %s" % status_path)
-    print("       max %d tab(s) open at once (close-on-done frees each); free RAM now %d MB"
-          % (max_conc, round(avail_phys_mb())))
+    if autoscale:
+        print("       autoscale ON: start %d, RAM-adjust 1..%d tab(s); free RAM now %d MB"
+              % (asc_default, asc_ceiling, round(avail_phys_mb())))
+    else:
+        print("       max %d tab(s) open at once (close-on-done frees each); free RAM now %d MB"
+              % (max_conc, round(avail_phys_mb())))
 
     mc_box = [max_conc]                # live concurrency cap (cockpit can change it)
     add_box = []                       # goals queued mid-run (native chat / cockpit)
@@ -255,8 +312,27 @@ def main():
                 if w is not None and w.status not in TERMINAL:
                     w.cancel()
             if "set_maxtabs" in cmd:
+                # under autoscale this knob is the CEILING (上限); otherwise the fixed cap.
                 try:
-                    mc_box[0] = max(1, int(cmd["set_maxtabs"]))
+                    n = max(1, int(cmd["set_maxtabs"]))
+                    if asc_box[0]:
+                        asc_box[1] = n
+                    else:
+                        mc_box[0] = n
+                except Exception:
+                    pass
+            # live autoscale control from the cockpit: {"set_autoscale": {"on":1,"max":4,
+            # "default":2}}. on/max take effect each loop; default (if given) re-seats the
+            # live cap now so turning autoscale on starts from the user's default.
+            asc = cmd.get("set_autoscale")
+            if isinstance(asc, dict):
+                try:
+                    if "on" in asc:
+                        asc_box[0] = 1 if asc["on"] else 0
+                    if asc.get("max"):
+                        asc_box[1] = max(1, int(asc["max"]))
+                    if asc.get("default"):
+                        mc_box[0] = max(1, min(int(asc["default"]), asc_box[1] or 999))
                 except Exception:
                     pass
             # steering: {"steer": {"worker":"w0","text":"..."}} or a list of such
@@ -277,7 +353,14 @@ def main():
                 for it in items:
                     try:
                         if isinstance(it, dict) and it.get("text"):
-                            add_box.append({"text": it["text"], "priority": bool(it.get("priority"))})
+                            # carry checks/cwd through so a RETRY re-runs WITH its acceptance
+                            # gate (not just the bare prompt). goal_fields reads them downstream.
+                            g = {"text": it["text"], "priority": bool(it.get("priority"))}
+                            if it.get("checks"):
+                                g["checks"] = it["checks"]
+                            if it.get("cwd"):
+                                g["cwd"] = it["cwd"]
+                            add_box.append(g)
                         elif isinstance(it, str) and it:
                             add_box.append({"text": it, "priority": False})
                     except Exception:
@@ -389,7 +472,11 @@ def main():
                                       refuter=args.refuter or args.panel,
                                       max_refute=args.max_refute, plan_mode=args.plan,
                                       review_lenses=(list(PANEL_LENSES) if args.panel else None),
-                                      max_transient=args.max_transient)
+                                      max_transient=args.max_transient,
+                                      autoscale=autoscale, autoscale_max=autoscale_max,
+                                      asc_box=asc_box,
+                                      autoscale_per_tab_mb=args.autoscale_per_tab_mb,
+                                      autoscale_headroom_mb=args.autoscale_headroom_mb)
             for r in res:
                 results_by_goal[r["goal"]] = r
             pending = []                                   # finished cleanly
