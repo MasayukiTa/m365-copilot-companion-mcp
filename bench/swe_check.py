@@ -65,7 +65,15 @@ def main():
              "companion." + run_id + ".json " + run_id + ".*.json 2>/dev/null; ")
     script = (
         "pgrep dockerd >/dev/null 2>&1 || (nohup dockerd >/tmp/dockerd.log 2>&1 & sleep 8); "
-        "export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt; cd /root/swe; " + purge +
+        "export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt; "
+        # Activate the #19 false-negative shim: putting bench/swe_shim on PYTHONPATH makes
+        # Python auto-import its sitecustomize at interpreter startup, which monkeypatches
+        # make_eval_script_list to export PYTEST_ADDOPTS="-rA ..." in eval.sh. This survives
+        # the bare `git checkout {base}` reset (process env, not a tracked file) so sphinx's
+        # tox forwards -rA to pytest and parse_log_pytest_v2 sees PASSED lines. Additive
+        # (${PYTHONPATH:+...} preserves any existing value) and a no-op for non-pytest repos.
+        "export PYTHONPATH=/mnt/c/Users/USER/companion-mcp/bench/swe_shim${PYTHONPATH:+:$PYTHONPATH}; "
+        "cd /root/swe; " + purge +
         "/root/swe-venv/bin/python -m swebench.harness.run_evaluation "
         "--dataset_name /root/swe/lite_local.json --predictions_path " + predwsl + " "
         "--instance_ids " + inst + " --run_id " + run_id +
