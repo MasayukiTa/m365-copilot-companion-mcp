@@ -30,6 +30,18 @@ Status: ✅ fixed & verified · 🟡 mitigated/operational · ⛔ open
 | 18 | acceptance gate (the durable, non-SWE asset) gave only a raw output tail on failure | the structured multi-format failure extractor was swe_check-only | shared `relay/test_feedback.py::summarize_test_failure` (pytest/django/sympy) wired into `acceptance.Check` for pytest/python checks | ✅ ea4b123 |
 | 19 | eval FALSE-NEGATIVE on sphinx-8595: a correct (gold-superset) patch graded `resolved:false` though the test passes in-container (`1 passed, exit 0`) | swebench reset: a new-file-only test_patch → `get_modified_files()==[]` → reset degenerates to a **bare `git checkout base`** that reverts the setup commit injecting `-rA` into tox.ini → pytest dots → log-parser misses the PASSED line. Blast radius: 1/300 (only sphinx-8595 combines new-file-only test_patch + a parser-relevant pre_install) | **OPEN (must fix before the holdout)**: inject `-rA` via `PYTEST_ADDOPTS` (env survives the checkout) instead of the tracked tox.ini sed; apply when the fleet is idle, not on the live critical path | ⛔ open |
 
+## Gaps found by the adversarial completeness audit (queued for an idle-window pass)
+
+These are real but non-blocking; fix as one coordinated pass at a round boundary (live-path edits take effect on the next verify/round, never mid-eval).
+
+| # | Gap | Why it matters | Planned fix | Priority |
+|---|---|---|---|---|
+| 20 | timeout nesting leak: swe_check worst-case wall = wsl(1200) + cat(60) + cleanup(120) ≈ 1380s **>** the acceptance `Check.timeout=1300`, so the acceptance layer kills swe_check (python) before its own timeout+cleanup → the detached eval container leaks (re-opens #17 one layer up, on the heaviest sklearn/matplotlib/sympy pulls) | container/RAM/disk leak on the exact heavy instances that already strain C: | raise acceptance Check timeout to ≥1500 in `swe_batch_setup.py` (next round) so swe_check finishes + cleans up under it | medium |
+| 21 | gen-wait patience is **deferral-count**-bounded (60×~4s≈240s), not wall-clock; under CPU/sweep contention realized patience drifts from 240s → a legitimately-slow tail turn can false-STUCK (the #5 class at the tail) | discards a correct-but-slow django/sympy turn | bump `max_gen_waits`→~90 or make the bound wall-clock (`first_defer_ts+360s`) in relay | low-med |
+| 22 | failure parser misses **doctest** (`Failed example:`/`Expected:`/`Got:` — sympy/sphinx) and **import/collection errors** (`AppRegistryNotReady` with no `FAIL: test_x` header — django) → agent gets a file:line or error but **no test name / no expected-vs-got** | blind-ish retries on sympy/sphinx doctests + django import errors (partial regression of #16 for those subcases) | add doctest + import-error branches to `relay/test_feedback.py` (and dedup swe_check's copy into it) | low-med |
+
+Also confirmed acceptable/monitored (do NOT block the run): same-instance purge race (safe at concurrency=1), `eval_busy_until` leak after a crash-during-verify (bounded by the 1500s failsafe), `summarize_test_failure` not on the SWE path by design (swe_check uses its own copy — drift risk only), silent purge failure (add a stderr breadcrumb opportunistically).
+
 ## Observability that paid off
 - `.fleet/transcripts/<run_id>_<name>.jsonl` — full per-turn conversations (untruncated), keyed per run so reused worker names never interleave.
 - `.fleet/send_failures.jsonl` — one snapshot per failed send (button match/label/visible, composer len, tab visibility, is_processing). Pinned #3, #4, #5.
