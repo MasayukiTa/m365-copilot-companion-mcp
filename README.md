@@ -1081,6 +1081,115 @@ send-success signal and pre-run Edge auto-recycle. Honest standing: **~80% mecha
 
 ---
 
+## 🛰 Fleet mode — many Copilot conversations in parallel
+
+`relay/fleet_runner.py` drives **several M365 Copilot conversations at once**. Each goal
+gets its own conversation, pursued to DONE by its own relay loop; all workers are advanced
+from a single thread in a **non-blocking round-robin**, so their (slow) server-side turns
+overlap. The runner closes each conversation's tab the moment it reaches a terminal state
+(freeing its RAM) and opens the next queued goal into the free slot.
+
+```powershell
+# goals inline
+.\.venv\Scripts\python.exe -m relay.fleet_runner --agent-url <URL> -g "goal A" -g "goal B"
+# or one goal per line / one JSON object per line (a JSON line can carry acceptance checks)
+.\.venv\Scripts\python.exe -m relay.fleet_runner --agent-url <URL> --goals-file goals.txt
+```
+
+A goal that carries machine-checkable `checks` rides through the **same acceptance gate** as
+the single relay: a Copilot "DONE" moves the worker to a `verifying` state, the frame runs the
+checks locally, and only a pass accepts DONE (a fail re-injects the real output and keeps
+working). `--refuter` / `--panel` add the independent reviewer / 3-lens review panel
+(correctness / edge / security) on top.
+
+### RAM-aware autoscale
+
+M365 Copilot tabs are heavy SPAs (~0.3–0.6 GB each), so opening many at once on an ordinary
+laptop exhausts RAM. With `--autoscale` (or the cockpit's toggle) the runner recomputes its
+concurrency cap from **free physical memory** every loop (`relay_fleet.py` `ram_target_cap` /
+`auto_concurrency`): it **ramps up at most one tab per loop** while RAM is plentiful and
+**drains down softly** when memory gets tight — it never kills a running worker, it just stops
+opening new ones until some finish. `--autoscale-headroom-mb` / `--autoscale-per-tab-mb` /
+`--autoscale-max` tune the bounds. Without autoscale, `--max-concurrent` is a fixed cap (or
+`0` = auto from free RAM at launch).
+
+### Watchdog, recovery, and resume
+
+A separate watchdog thread tails `status.json`. If it stops advancing past `--stall-s` while a
+run is live, the dedicated Edge is treated as wedged and **hard-reset**; the run loop then
+detects the dead CDP context (`FleetContextLost`), reconnects to a fresh Edge, and **resumes
+the unfinished goals** (with their acceptance checks intact). The watchdog deliberately
+**does not reset while a worker is in a bounded acceptance eval** (a `verifying` status or an
+`eval_busy_until` deadline still in the future) — so a long, legitimate verification (e.g. a
+Docker test run) is never mistaken for a wedge and thrown away. There is also a **pre-run
+auto-recycle**: if the dedicated Edge has bloated or free RAM is low, it is hard-reset before
+the run for a clean start (`relay/edge_recover.py`).
+
+---
+
+## 🎛 FleetCockpit — a native control surface for a running fleet
+
+`ui/FleetCockpit.cs` is a **JS-free WPF app** (built with the `csc.exe` that ships with
+Windows) that **tails `.fleet/status.json`** and controls the running fleet by writing
+`.fleet/commands.json`. Build and launch it with `ui\build_cockpit.bat`. From the cockpit you
+can:
+
+- **monitor** each worker (status / turn / verify state / latest response) live,
+- **stop and release** a worker (frees its tab),
+- **change the max concurrent tabs** and **toggle RAM-aware autoscale** (with a ceiling),
+- **add a new goal** into an already-running fleet,
+- **steer** a worker — inject a redirection that becomes its next turn,
+- **retry** a stopped goal (one-shot, or an opt-in capped auto-retry),
+- **open a worker's conversation in the main chat** by name.
+
+The goal box also exposes coding-task slash commands (`/code`, `/fix`, `/test`, `/refactor`,
+`/doc`, `/review`, `/research`); the main chat exposes prompt-template ones (`/help`,
+`/summarize`, `/translate`, `/plan`, `/critique`, `/proofread`, `/rewrite`, `/brainstorm`,
+`/steps`, `/eli5`, `/proscons`, `/table`) plus `/research` and `/analyze` for side-agent
+delegation.
+
+### Conversation registry and transcript-first viewing
+
+Every fleet conversation is registered in `.fleet/conversations.json` (shared with the native
+chat, deduped by URL), and each worker's **full turn-by-turn transcript** is written to
+`.fleet/transcripts/` as it runs. When you open a fleet conversation, the chat UI **prefers
+the on-disk transcript over live DOM scraping** — so you can inspect a running or finished
+fleet task without disturbing the active companion Edge session.
+
+---
+
+## 🖥 Dedicated companion Edge — window modes
+
+`start_companion_edge.ps1` launches the isolated companion Edge (see the relay setup above for
+why a separate profile). It supports several window modes for the dedicated profile:
+
+- `-Foreground` — visible window; the **stable default**, and what you want for first sign-in
+  and troubleshooting.
+- `-Headless` — `--headless=new`: **no window at all** (nothing in the taskbar, no flash), yet
+  CDP, SSO, and sends all work — true background execution.
+- `-Background` — minimized / moved to a separate virtual desktop (kept out of the way by
+  `edge_keeper.ps1` / `move_companion_to_desktop.ps1`). Marked experimental: driving a
+  backgrounded CDP Edge can be flaky, so foreground/headless are preferred.
+- `-Surface` — bring the (already-running) companion Edge **back to the foreground**, used when
+  interactive sign-in is required (the chosen mode is remembered so recovery relaunches the
+  same way).
+- `-HardReset` — kill the companion Edge and **wipe its session-restore state** before
+  relaunching, so wedged tabs are not restored. This is the recovery path the watchdog invokes.
+
+---
+
+## 🧪 SWE-bench as a verification harness
+
+`bench/` wires the **official SWE-bench harness in as an acceptance gate**. For each instance,
+the agent's `git diff` in its worktree is turned into a prediction, evaluated in **WSL2/Docker
+with the official `swebench.harness.run_evaluation`**, and DONE is accepted **only when the
+instance is resolved** (`bench/swe_check.py`). A failed (or empty) evaluation is compressed
+into actionable feedback — failing test names / traceback tails — and re-injected so the loop
+keeps working. It is used as a verification stress test for the autonomous coding loop, not as
+a score claim.
+
+---
+
 ## 💬 Native chat UI (Python + Edge only, no Node)
 
 Two front-ends ship with this so you can use the Copilot agent **like a local
