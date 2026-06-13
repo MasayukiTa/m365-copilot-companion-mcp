@@ -33,8 +33,8 @@ import time
 from .acceptance import Check, normalize_checks, run_all_blocking
 from .copilot_autopilot_relay import (
     CONTINUE_JOB, COPILOT_SELECTORS, ConversationClosed, CopilotWebDriver, FIX_JOB,
-    PROTOCOL, REFUTE_FIX_JOB, RETRY_JOB, VERIFY_FIX_JOB, _is_processing,
-    default_notify, goal_not_seen, reported_stuck, transient_backoff,
+    GenerationInProgress, PROTOCOL, REFUTE_FIX_JOB, RETRY_JOB, VERIFY_FIX_JOB,
+    _is_processing, default_notify, goal_not_seen, reported_stuck, transient_backoff,
 )
 from .planner import PLAN_PROMPT, extract_plan, plan_ready
 
@@ -228,6 +228,15 @@ class RelayWorker:
         # Claude Code retrying a failed request rather than giving up. Budget + backoff.
         self.max_transient = max_transient
         self.transient = 0
+        # generation-wait reschedules: the PREVIOUS turn was still generating when we tried
+        # to send (a slow django/sympy turn). This is NOT a failure -- send() waited and
+        # then deferred -- so it does NOT consume the transient budget and does NOT count a
+        # turn. A separate, very generous cap only catches a turn that LITERALLY never stops
+        # generating (a wedged page); each wait is already ~minutes inside send(). This was
+        # the W0 django__django-14730 STUCK: send-into-generating burned the 10x transient
+        # budget into STUCK even though the turn was merely slow.
+        self.max_gen_waits = 30
+        self.gen_waits = 0
         # goal-delivery recovery: when the agent reports it never received the task, RE-SEND
         # the goal verbatim instead of a generic retry nudge (bounded to avoid a resend loop).
         self.max_goal_resends = 3
@@ -387,6 +396,23 @@ class RelayWorker:
             self.status, self.outcome = "stuck", "STUCK"
             self.reason = "conversation closed: %s" % (str(e),)
             return
+        except GenerationInProgress as e:
+            # The PREVIOUS turn was still generating when send() tried to submit (a slow
+            # django/sympy turn). send() already WAITED its generous window and then
+            # deferred -- this is NOT a failure. Reschedule the SAME job WITHOUT consuming
+            # a turn OR the transient budget (the W0 django__django-14730 fix: a slow turn
+            # must never be counted into STUCK). A separate, very generous cap only catches
+            # a turn that LITERALLY never stops generating.
+            if self._defer_generation():
+                self.reason = "previous turn still generating -> wait %d/%d (no budget)" % (
+                    self.gen_waits, self.max_gen_waits)
+                return
+            if self._salvage_via_checks():
+                return
+            self.status, self.outcome = "stuck", "STUCK"
+            self.reason = "previous turn never stopped generating (%d waits): %s" % (
+                self.gen_waits, str(e)[:120])
+            return
         except Exception as e:
             # a send failure is a transient (CDP/Edge/network) hiccup -- retry the turn
             # rather than giving up, up to the budget. Don't consume a turn for a failed
@@ -402,9 +428,26 @@ class RelayWorker:
                 self.transient, type(e).__name__, str(e))
             return
         self.turn += 1
+        self.gen_waits = 0     # a send actually went through -> reset the generation-wait count
         self._tx.user(self.turn, self.job)     # persist the full sent prompt for this turn
         self._last_text, self._stable_since, self._t_send = None, None, time.time()
         self.status = "waiting"
+
+    def _defer_generation(self):
+        """Schedule a non-failure RESCHEDULE because the previous turn is still generating.
+        Unlike _retry_transient this does NOT touch self.transient (the transient/STUCK
+        budget) -- waiting out a slow turn is not a failure. It re-arms the worker to 'ready'
+        with a short cooldown and re-sends the SAME job. Bounded by max_gen_waits only to
+        catch a turn that literally never stops generating. Returns True if rescheduled, else
+        False (the generous cap was hit -> the caller should go terminal)."""
+        if self.gen_waits >= self.max_gen_waits:
+            return False
+        self.gen_waits += 1
+        # short, fixed cooldown before re-checking (send() itself does the long minutes-wait
+        # for generation to finish; this is just a brief breather between deferrals).
+        self._cooldown_until = time.time() + 2.0
+        self.status = "ready"
+        return True
 
     def _retry_transient(self):
         """Schedule a retry for a TRANSIENT failure (send/timeout/likely-transient STUCK),

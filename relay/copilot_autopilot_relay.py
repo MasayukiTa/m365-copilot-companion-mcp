@@ -71,6 +71,22 @@ class ConversationClosed(RuntimeError):
     so any caller that only catches RuntimeError still behaves safely."""
 
 
+class GenerationInProgress(RuntimeError):
+    """Raised by send() when the PREVIOUS agent turn is STILL GENERATING (the Stop
+    button is showing / the composer + Send are not operable) and it did not finish
+    within send()'s generous internal wait. This is NOT a send failure: the composer was
+    never touched, nothing was typed, no click was attempted. It means "the agent is just
+    slow this turn" (e.g. a long django/sympy turn), which is exactly the W0
+    (django__django-14730) STUCK: the relay tried to send into a still-generating turn,
+    the click hung the default 30s, and 10 such retries burned the budget into STUCK.
+
+    Callers MUST treat this as a NON-budget-consuming reschedule: wait and try again
+    WITHOUT incrementing the transient-retry counter, so merely waiting out a slow turn
+    can never push a healthy run to STUCK. Only a real failed submit (RuntimeError /
+    ConversationClosed) consumes budget. Subclasses RuntimeError so a caller that only
+    catches RuntimeError still behaves safely (it just won't get the no-budget benefit)."""
+
+
 # --- Selectors captured from the live M365 Copilot DOM (2026-06) ------------
 COPILOT_SELECTORS = {
     "composer": "#m365-chat-editor-target-element",          # contenteditable, role=textbox
@@ -103,6 +119,22 @@ COPILOT_SELECTORS = {
         'button[data-testid*="send" i], '
         'button[name="send" i], '
         'button[type="submit"]'                  # last-ditch structural fallback
+    ),
+    # The STOP (square) button that REPLACES Send in the same toolbar slot while the
+    # agent turn is generating. Its PRESENCE is the reliable "previous turn is still
+    # running" signal (spec §7: judge by an element that only exists during generation).
+    # We use it to gate send() so we never type/click into a turn that is still producing
+    # output (the W0 django__django-14730 STUCK: send into a generating turn -> 30s click
+    # hang x10 -> STUCK). Localized aria-labels (JP + EN) first, then structural fallbacks
+    # that survive a label/locale change, so a Microsoft DOM tweak degrades gracefully.
+    "stop_button": (
+        'button[aria-label="停止"], '            # JP, stop-generating
+        'button[aria-label="Stop"], '            # EN
+        'button[aria-label*="停止"], '           # JP, label with extra decoration
+        'button[aria-label*="Stop generating" i], '
+        'button[aria-label*="応答を停止" i], '   # JP, "stop the response"
+        'button[aria-label*="stop respon" i], '  # EN, "stop responding/response"
+        'button[data-testid*="stop" i]'
     ),
     # Where the Copilot-generated conversation title renders. M365 surfaces the auto-
     # generated chat name in a few places depending on layout; we try each in order and
@@ -335,9 +367,24 @@ def default_notify(title: str, body: str) -> None:
 class CopilotWebDriver:
     """Drives one M365 Copilot conversation tab over CDP. No OS input is used."""
 
+    # Default per-action upper bound (ms) for EVERY Playwright locator action on this page
+    # (click / is_visible / is_enabled / get_attribute auto-waits). Playwright's own default
+    # is 30s -- that is what let one click hang 30s and, x10 retries, drove the W0
+    # django__django-14730 STUCK. 8s is comfortably above a healthy action's settle time but
+    # bounds a single stuck operation to seconds, not half a minute. Individual calls that
+    # need a different bound still pass timeout=... explicitly (those win over this default).
+    DEFAULT_ACTION_TIMEOUT_MS = 8000
+
     def __init__(self, page):
         self.page = page
         self._count_before = 0  # number of answer blocks before the current send
+        # Cap the default action timeout so no single locator op can hang the worker for
+        # Playwright's default 30s. Best-effort: a driver built on a mock/stub page (tests)
+        # has no such method, so guard it.
+        try:
+            self.page.set_default_timeout(self.DEFAULT_ACTION_TIMEOUT_MS)
+        except Exception:
+            pass
 
     def _answers(self):
         return self.page.locator(COPILOT_SELECTORS["assistant_msg"])
@@ -359,6 +406,11 @@ class CopilotWebDriver:
     )
     SEND_LABEL_BLACKLIST = ("展開", "折りたた", "expand", "collapse",
                             "ディクテーション", "dictation", "ボイス", "voice",
+                            # feedback-submit imposter: W0 (django__django-14730) STUCK
+                            # snapshot showed btn match 3 with `.first` =
+                            # aria_label='フィードバックを送信' (a feedback button), NOT the
+                            # message Send. Reject any feedback-submit so we never click it.
+                            "フィードバック", "feedback",
                             "メッセージを送信する]")  # the expand toggle's bracketed prefix
 
     def _send_button(self):
@@ -390,6 +442,75 @@ class CopilotWebDriver:
             except Exception:
                 continue
         return None
+
+    def _stop_button(self):
+        """The visible STOP (square) button if the agent turn is generating, else None.
+
+        Mirrors _send_button (priority-ordered, prefers visible matches) but for the
+        stop control. Its presence is the positive "previous turn is still producing
+        output" signal. Never raises -> None on any error (treated as 'not generating',
+        which is the safe default: at worst we proceed to the normal arm-wait, which is
+        itself guarded)."""
+        for cand in (COPILOT_SELECTORS["stop_button"]).split(", "):
+            cand = cand.strip()
+            if not cand:
+                continue
+            try:
+                loc = self.page.locator(cand)
+                try:
+                    vis = loc.locator("visible=true")
+                    if vis.count() > 0:
+                        loc = vis
+                except Exception:
+                    pass
+                for i in range(min(loc.count(), 5)):
+                    el = loc.nth(i)
+                    try:
+                        if el.is_visible():
+                            return el
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return None
+
+    def _is_generating(self) -> bool:
+        """True while the PREVIOUS agent turn is still generating (the Stop button is
+        showing). This is the `_is_processing`-equivalent for the SEND path: it does NOT
+        look at answer text (which lags), it looks at the live Stop control. Used to GATE
+        send() so we never type/click into a turn that is still producing output -- the W0
+        django__django-14730 STUCK was exactly send-into-generating (is_processing=True in
+        the failure snapshot). Never raises -> False (safe: 'not generating')."""
+        try:
+            return self._stop_button() is not None
+        except Exception:
+            return False
+
+    def _wait_generation_idle(self, timeout_s: float = 240.0,
+                              poll_ms: int = 500) -> bool:
+        """Wait until the previous agent turn has STOPPED generating (no Stop button),
+        up to `timeout_s`. Returns True once idle, False if still generating at the
+        deadline (or the tab died -- caller's dead-check turns that terminal).
+
+        This is the gate that keeps a slow django/sympy turn from being mistaken for a
+        send failure: while generation is in progress we simply WAIT (this wait is NOT a
+        retry and must not consume the transient budget -- send() raises
+        GenerationInProgress, not a send failure, if the wait is exhausted). Polls the
+        kill-switch so STOP aborts promptly, and bails if the page dies mid-wait."""
+        deadline = time.time() + max(0.0, timeout_s)
+        while time.time() < deadline:
+            if stop_check().startswith("STOP"):
+                return False
+            if not self._page_alive():
+                return False
+            if not self._is_generating():
+                return True
+            self.page.wait_for_timeout(poll_ms)
+        # one last check at the deadline (the turn may have finished on the final tick)
+        try:
+            return not self._is_generating()
+        except Exception:
+            return False
 
     def _page_alive(self) -> bool:
         """Cheap liveness probe: is the tab still open AND the composer still present?
@@ -558,7 +679,14 @@ class CopilotWebDriver:
             # Diagnostic logging must never affect send(); swallow everything.
             pass
 
-    def send(self, text: str) -> None:
+    # Default upper bound (seconds) send() will WAIT for a still-generating previous turn
+    # to finish before it gives up with GenerationInProgress. Generous on purpose: slow
+    # django/sympy turns legitimately run minutes, and this wait is NOT a failure (it does
+    # not consume the transient/Stuck budget), so a too-short value here is what caused the
+    # W0 STUCK (send into a generating turn). Per-call overridable via send(gen_wait_s=...).
+    GEN_WAIT_S = 240.0
+
+    def send(self, text: str, gen_wait_s: float | None = None) -> None:
         # EARLY DEAD-CHECK: if the tab/composer is already gone (conversation ended),
         # do NOT enter the type/arm/click retry loop -- it would just throw
         # TargetClosedError on every probe and waste the full 3x12s budget (the
@@ -568,6 +696,24 @@ class CopilotWebDriver:
         if not self._page_alive():
             raise ConversationClosed(
                 "send aborted: conversation tab/composer is closed (dead target)")
+        # GENERATION GATE: if the PREVIOUS turn is still generating (Stop button showing),
+        # do NOT type/click into it -- that was the W0 django__django-14730 STUCK
+        # (is_processing=True in the failure snapshot; the click then hung the default 30s).
+        # WAIT for the turn to finish (slow django/sympy turns are legitimate, not failures).
+        # If it is STILL generating after the generous window, raise GenerationInProgress so
+        # the caller RESCHEDULES WITHOUT consuming the transient budget -- merely waiting out
+        # a slow turn must never count toward STUCK. The composer is untouched here.
+        gw = self.GEN_WAIT_S if gen_wait_s is None else gen_wait_s
+        if self._is_generating():
+            self._snapshot_send_failure(attempt=0, phase="waiting_processing")
+            if not self._wait_generation_idle(timeout_s=gw):
+                if not self._page_alive():
+                    raise ConversationClosed(
+                        "send aborted: tab/composer closed while waiting for the "
+                        "previous turn to finish generating")
+                raise GenerationInProgress(
+                    "send deferred: previous turn still generating after "
+                    "%.0fs wait (not a send failure)" % gw)
         # CRITICAL: a newline in the Copilot composer SUBMITS the message. Collapse
         # all whitespace (incl. newlines) to single spaces so the whole job is sent
         # as ONE message with a single trailing Enter.
@@ -584,7 +730,16 @@ class CopilotWebDriver:
         # Retry a few times; if it never empties, RAISE so run_relay records a real
         # STUCK instead of pretending the turn was submitted.
         for attempt in range(3):
-            composer.click()
+            # EXPLICIT timeout on the composer click (was unbounded = Playwright's default
+            # 30s). The W0 STUCK had this hang the full 30s x10. A focus click should
+            # resolve in well under 5s on a live composer; if it can't, fall through to the
+            # arm-wait + Enter fallback rather than freezing the worker for 30s. force=True
+            # skips actionability waits (the composer is already known present from the
+            # dead-check) so this is essentially immediate.
+            try:
+                composer.click(force=True, timeout=5000)
+            except Exception:
+                pass
             self.page.keyboard.press("Control+a")   # clear via keyboard, not fill("")
             self.page.keyboard.press("Delete")       # -- fill("") leaves the editor
             self.page.wait_for_timeout(150)          #    in a state where Send won't arm
@@ -823,6 +978,13 @@ def run_relay(
     forge_count = 0
     verify_attempts = 0
     transient = 0          # transient-failure retries (send/timeout/likely-transient STUCK)
+    gen_waits = 0          # consecutive "previous turn still generating" reschedules.
+    # This is NOT the transient budget: waiting out a slow (django/sympy) turn is not a
+    # failure, so it must not count toward STUCK. A separate, generous cap only guards
+    # against a turn that LITERALLY never stops generating (a wedged page) -- each wait is
+    # already GEN_WAIT_S (~4min), so this many waits is a very long ceiling, after which we
+    # treat it as a genuine stall. Reset to 0 once a send actually goes through.
+    max_gen_waits = 30
     refute_count = 0
     checks_norm = normalize_checks(checks)      # spec 3-3 acceptance gate (empty -> trust DONE)
     backoff_s = 0.0          # adaptive throttle: extra cool-down added between turns
@@ -849,6 +1011,23 @@ def run_relay(
                                    "detail": str(e)[:200]})
             outcome, reason = "STUCK", f"conversation closed: {e}"
             break
+        except GenerationInProgress as e:
+            # The PREVIOUS turn was still generating after send()'s generous wait. This is
+            # NOT a failure -- the agent is just slow (django/sympy). Reschedule the SAME
+            # job WITHOUT consuming a turn or the transient budget, so a slow turn can never
+            # be counted into STUCK. A separate, very large cap only catches a page that
+            # literally never stops generating.
+            gen_waits += 1
+            runlog_append(run_id, {"turn": turn, "event": "waiting_processing",
+                                   "n": gen_waits, "detail": str(e)[:160]})
+            print(f"[relay turn {turn}] previous turn still generating -> wait "
+                  f"{gen_waits}/{max_gen_waits} (no budget consumed)")
+            turn -= 1                                  # a deferred send didn't consume a turn
+            if gen_waits >= max_gen_waits:
+                outcome, reason = "STUCK", f"previous turn never stopped generating ({gen_waits} waits)"
+                break
+            time.sleep(sleep_s + backoff_s)
+            continue
         except Exception as e:
             # a send failure is a transient (CDP/Edge/network) hiccup -- retry with backoff
             # rather than giving up (the relay analog of Claude Code retrying a request).
@@ -863,6 +1042,7 @@ def run_relay(
                 continue
             outcome, reason = "STUCK", f"send failed after {transient} retries: {type(e).__name__}: {e}"
             break
+        gen_waits = 0          # a send actually went through -> reset the generation-wait count
 
         try:
             ok = driver.wait_for_idle(timeout_s=per_turn_timeout_s)
