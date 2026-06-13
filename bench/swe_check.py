@@ -54,9 +54,18 @@ def main():
     #    cached images behind).
     cache_level = os.environ.get("SWE_CACHE_LEVEL", "env")
     run_id = "agent_" + inst.replace("__", "_")
+    # CRITICAL: swebench skips an instance whose report already exists for this run_id
+    # ("1 instances already run, skipping... No instances to run"), returning the STALE
+    # verdict from a prior attempt instead of evaluating the agent's NEW patch. run_id is
+    # constant per instance, so once an instance is evaluated once (even in an earlier
+    # killed run / prior round), every later verify would re-read the old result and the
+    # failure-feedback retry loop could never credit a corrected patch. Clear this
+    # instance's prior swebench state BEFORE each run so every verify re-evaluates fresh.
+    purge = ("rm -rf logs/run_evaluation/" + run_id + " "
+             "companion." + run_id + ".json " + run_id + ".*.json 2>/dev/null; ")
     script = (
         "pgrep dockerd >/dev/null 2>&1 || (nohup dockerd >/tmp/dockerd.log 2>&1 & sleep 8); "
-        "export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt; cd /root/swe; "
+        "export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt; cd /root/swe; " + purge +
         "/root/swe-venv/bin/python -m swebench.harness.run_evaluation "
         "--dataset_name /root/swe/lite_local.json --predictions_path " + predwsl + " "
         "--instance_ids " + inst + " --run_id " + run_id +
