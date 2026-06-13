@@ -137,33 +137,117 @@ def _cleanup_docker(inst, run_id):
         print(f"[swe_check] docker cleanup error (non-fatal): {exc}", file=sys.stderr)
 
 
+# a bare/raised exception line, e.g. "AssertionError", "ValueError: bad name",
+# "django.core.exceptions.ImproperlyConfigured: ...". Matches at column 0 (django/sympy
+# custom runners) or after a pytest "E " prefix (stripped before this is applied).
+_EXC_RE = re.compile(r"^[A-Za-z_][\w.]*(?:Error|Exception|Warning|Failure)(?::|$)")
+# pytest's source pointer printed under the traceback: "path/file.py:123: SomeError"
+_PYTEST_PTR_RE = re.compile(r"^.+\.py:\d+: \w*(?:Error|Exception|Warning|Failed)\b")
+# django unittest runner result header: "FAIL: test_x (module.Class)" / "ERROR: test_x (module.Class)"
+_DJANGO_RES_RE = re.compile(r"^(?:FAIL|ERROR): (\S+) \(([^)]+)\)")
+# sympy custom-runner failure banner: "____ sympy/.../test_foo.py:test_bar ____"
+_SYMPY_BANNER_RE = re.compile(r"^_+ (\S+\.py:\S+) _+$")
+# a traceback frame line: '  File ".../x.py", line 12, in test_foo'
+_TB_FRAME_RE = re.compile(r'^\s*File "([^"]+)", line (\d+), in (\S+)')
+
+
 def _failure_feedback(run_id, inst):
-    """Extract failing test names + the last assertion/traceback from the swebench test log."""
+    """Extract failing test names + the last assertion/traceback from the swebench test log.
+
+    Robust across the three test-runner output formats SWE-bench Lite repos use:
+      * pytest (pytest, pylint, sphinx, flask, requests, seaborn, scikit-learn, matplotlib,
+        astropy, xarray): "FAILED path::test - reason" + "E   <Error>: ..." blocks.
+      * django's unittest runner: "FAIL:/ERROR: test_x (module.Class)" headers followed by a
+        bare "Traceback (most recent call last):" and a column-0 "<Error>: ..." line.
+      * sympy's custom runner: "____ path.py:test_x ____" banners followed by a frame list and
+        a bare exception line.
+    Earlier versions only understood pytest, so django/sympy retries got NO failing test name
+    or assertion -- the agent retried blind. Parsing is wrapped so any error still yields a
+    useful log tail rather than breaking the verify flow.
+    """
     logp = "/root/swe/logs/run_evaluation/" + run_id + "/companion/" + inst + "/test_output.txt"
     r = wsl("cat " + logp + " 2>/dev/null", timeout=60, capture=True)
     log = r.stdout or ""
     if not log.strip():
         return "(no test log captured; re-read the failing test and trace each code path it exercises.)"
     log = re.sub(r"\x1b\[[0-9;]*m", "", log)  # strip ANSI color codes pytest emits
+    try:
+        return _parse_failure_log(log)
+    except Exception as exc:  # never let feedback parsing break the verify flow
+        tail = [ln for ln in log.splitlines() if ln.strip()][-25:]
+        return ("--- TEST FAILURE (raw tail; parser error: %s) ---\n%s" % (exc, "\n".join(tail)))
+
+
+def _parse_failure_log(log):
     lines = log.splitlines()
-    failed = [ln.strip() for ln in lines if ln.lstrip().startswith("FAILED ")]
-    # last assertion: lines that pytest marks with a leading 'E ' (the error), keep the tail few
-    err = [ln for ln in lines if ln.lstrip().startswith("E ")]
-    err_tail = err[-6:] if err else []
-    # the source line pytest points at: a '<path>:<n>: <Error>' just after the E-block
+    failed = []   # human-readable failing test identifiers
+    seen = set()
+
+    def _add_fail(name):
+        if name and name not in seen:
+            seen.add(name)
+            failed.append(name)
+
+    for raw in lines:
+        ln = raw.rstrip()
+        s = ln.lstrip()
+        if s.startswith("FAILED ") or (s.startswith("ERROR ") and "::" in s):  # pytest summary
+            name = s.split(" - ", 1)[0].strip()
+            if not name.startswith(("FAILED (", "ERROR (")):  # skip django's "FAILED (errors=1)" footer
+                _add_fail(name)
+            continue
+        m = _DJANGO_RES_RE.match(ln)  # django unittest runner
+        if m:
+            _add_fail("%s (%s)" % (m.group(1), m.group(2)))
+            continue
+        m = _SYMPY_BANNER_RE.match(ln)  # sympy custom runner
+        if m:
+            _add_fail(m.group(1))
+
+    # error/assertion lines: pytest prefixes them with 'E '; django/sympy print them at col 0.
+    # DeprecationWarning/etc. lines are noise (not the failure cause), so prefer real errors and
+    # only fall back to warnings if nothing else surfaced.
+    err, warn = [], []
+    for raw in lines:
+        s = raw.lstrip()
+        body = None
+        if s.startswith("E ") or s == "E":
+            body = s[2:].strip() or s.strip()
+        elif _EXC_RE.match(raw.strip()):
+            body = raw.strip()
+        if body:
+            (warn if "Warning" in body.split(":", 1)[0] else err).append(body)
+    err_tail = (err or warn)[-6:]
+
+    # source pointer: pytest prints "file.py:NN: Error"; django/sympy give traceback frames --
+    # use the LAST frames of each traceback (the deepest = where it was raised). Drop pointers
+    # that are Warning emissions (sympy/astroid import-time DeprecationWarnings flood these).
     ptr = [ln.strip() for ln in lines
-           if (".py:" in ln and ln.rstrip().endswith(("Error", "Exception"))
-               or ": ValueError" in ln or ": TypeError" in ln or ": KeyError" in ln)]
+           if _PYTEST_PTR_RE.match(ln.strip()) and "Warning" not in ln]
+    if not ptr:
+        frames = ["%s:%s in %s" % m.groups() for ln in lines
+                  for m in [_TB_FRAME_RE.match(ln)] if m and "Warning" not in ln]
+        # prefer frames in the project's own test/source files over library import frames
+        test_frames = [f for f in frames if "/tests/" in f or "/testbed/" in f]
+        ptr = (test_frames or frames)[-4:]
+
     parts = ["--- ACTUAL TEST FAILURE (use this to find the exact spot) ---"]
     if failed:
-        parts.append("Failing tests:")
-        parts.extend("  " + f for f in failed[:6])
+        parts.append("Failing tests (%d):" % len(failed))
+        parts.extend("  " + f for f in failed[:8])
+        if len(failed) > 8:
+            parts.append("  ... and %d more" % (len(failed) - 8))
     if err_tail:
         parts.append("Error:")
-        parts.extend("  " + e.strip() for e in err_tail)
+        parts.extend("  " + e for e in err_tail)
     if ptr:
         parts.append("Raised at:")
         parts.extend("  " + p for p in ptr[-4:])
+    if not failed and not err_tail and not ptr:
+        # unknown format -> give the agent the meaningful tail rather than nothing
+        tail = [ln for ln in lines if ln.strip()][-20:]
+        parts.append("Log tail:")
+        parts.extend("  " + t for t in tail)
     parts.append("Hint: the same bug pattern often appears in MORE than one place in the file; "
                  "search for every occurrence, not just the first.")
     return "\n".join(parts)
