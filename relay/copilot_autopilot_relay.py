@@ -289,6 +289,32 @@ def _is_processing(text: str) -> bool:
     return any(m.lower() in t for m in PROCESSING_MARKERS) and len(t) < 40
 
 
+# Protocol end-of-turn markers. The PROTOCOL/CONTINUE/etc. prompts REQUIRE the agent to
+# write exactly one of these on the LAST line of every complete turn (DONE / CONTINUE /
+# STUCK: / FAIL / RESEARCH: / ANALYZE: / PLAN_READY). Their presence on the tail line is a
+# strong positive signal that the turn FINISHED -- conversely, a "stable" answer whose tail
+# carries NO marker is a red flag that we may have locked onto a MID-STREAM pause (Copilot
+# streams the reply token-by-token; if a chunk lands and the next is >dwell_s away -- a tool
+# call, a model "thinking" gap, a network stall -- the partial text looks deceptively stable
+# and gets captured mid-word with no marker, e.g. transcript turn5 "...隠し", 102 chars).
+_END_MARKERS = ("DONE", "CONTINUE", "STUCK", "FAIL", "RESEARCH", "ANALYZE", "PLAN_READY")
+
+
+def has_end_marker(text: str) -> bool:
+    """True iff the LAST non-empty line of `text` carries a protocol end-of-turn marker
+    (DONE / CONTINUE / STUCK / FAIL / RESEARCH / ANALYZE / PLAN_READY), in EN or with the
+    JP full-width colon. Used by completion detection to distinguish a genuinely finished
+    turn from a partial capture of a still-streaming reply (a stable-but-marker-less tail is
+    treated as 'maybe still generating' and given extra settle time)."""
+    if not text:
+        return False
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    last = lines[-1].upper().replace("：", ":")
+    return any(m in last for m in _END_MARKERS)
+
+
 def extract_research(resp: str) -> str:
     """Pull the query out of a `RESEARCH: <...>` line if the agent asked for a
     deep-dive. Returns '' if no research was requested."""
@@ -802,10 +828,25 @@ class CopilotWebDriver:
 
     def wait_for_idle(self, timeout_s: int = 1800, dwell_s: float = 4.0,
                       appear_timeout_s: int = 180) -> bool:
-        """Completion = a NEW answer block appears, then its text stops changing
-        for `dwell_s`. We do NOT rely on the loading indicator: that element stays
-        present (and even 'visible') in the DOM while idle, so it is useless as a
-        signal. Polls the kill-switch so STOP aborts promptly."""
+        """Completion = a NEW answer block appears, the agent is NO LONGER GENERATING,
+        and the answer text is STABLE. We do NOT rely on the loading indicator (it stays
+        present/visible while idle, so it is useless). The completion signal is twofold:
+
+          (1) the agent is not generating  -- the live Stop (square) button is GONE
+              (`_is_generating()`); this is the authoritative "the turn finished"
+              signal, the same control the SEND gate uses. Reading while it is still
+              showing was the root cause of partial capture (transcript turn5: 102
+              chars, mid-word "...隠し", no marker) -- a streaming pause longer than
+              dwell_s made partial text look 'stable' and it was captured as final.
+          (2) the answer text has stopped changing for `dwell_s`.
+
+        BELT-AND-SUSPENDERS for the case where the Stop button briefly disappears between
+        streamed chunks: a stable answer whose TAIL has NO protocol marker
+        (DONE/CONTINUE/STUCK/FAIL/RESEARCH/ANALYZE/PLAN_READY) is treated as 'possibly
+        still streaming' and must stay stable for an EXTENDED window (2x dwell) before we
+        accept it. A marker-terminated tail is accepted at the normal dwell. Either way
+        the wait is bounded by `timeout_s`, so this can never hang. Polls the kill-switch
+        so STOP aborts promptly."""
         deadline = time.time() + timeout_s
         # 1) wait for a brand-new answer block to appear.
         appear_deadline = time.time() + min(appear_timeout_s, timeout_s)
@@ -822,18 +863,36 @@ class CopilotWebDriver:
             time.sleep(1.0)
         if not appeared:
             return False
-        # 2) wait for the last answer's REAL text to stabilize. While the block
-        # still shows a processing placeholder ("処理中です" etc.), keep waiting --
-        # otherwise we would lock onto the placeholder as the final answer.
+        # 2) wait for the last answer's REAL text to stabilize AND generation to stop.
+        # While the block still shows a processing placeholder ("処理中です" etc.) OR the
+        # agent is still generating (Stop button present), keep waiting -- otherwise we
+        # would lock onto a placeholder or a mid-stream partial as the final answer.
         last, stable_since = None, None
         while time.time() < deadline:
             if stop_check().startswith("STOP"):
                 return False
+            # PRIMARY gate: never read while the turn is still generating. _is_generating
+            # never raises (-> False), so a driver/page without a Stop control degrades to
+            # the pure text-stability behavior (back-compat).
+            try:
+                generating = self._is_generating()
+            except Exception:
+                generating = False
+            if generating:
+                last, stable_since = None, None
+                time.sleep(1.0)
+                continue
             t = self.read_last_response()
             if _is_processing(t):
                 last, stable_since = None, None
             elif t == last:
-                if stable_since and (time.time() - stable_since) >= dwell_s:
+                # require a longer settle when the tail carries no protocol marker, in
+                # case the Stop button flickered off between two streamed chunks.
+                need = dwell_s if has_end_marker(t) else dwell_s * 2.0
+                if stable_since and (time.time() - stable_since) >= need:
+                    if not has_end_marker(t):
+                        print("[relay] accepting marker-less but idle+stable response "
+                              "(%.0fs) -- no DONE/CONTINUE/STUCK tail" % need)
                     return True
             else:
                 last, stable_since = t, time.time()
