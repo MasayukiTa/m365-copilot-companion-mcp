@@ -1,0 +1,293 @@
+"""Tests for capacity-aware CONTINUOUS admission control (2026-06-14 fleet rewrite).
+
+No browser. We drive run_relay_fleet with a fake CDP context and a monkeypatched RelayWorker
+so attach/poll/close are deterministic, and mock the RAM / disk readings. Proves the four
+properties of the new design:
+
+  (a) disk floor gates admission  -- with C: free below the floor, NO new tab is admitted;
+                                     raise the free space and admission resumes.
+  (b) completion -> immediate next -- when a running job finishes and frees its slot, the next
+                                     queued goal is admitted on the NEXT sweep (no batch
+                                     barrier: more goals than the cap, all eventually run, and
+                                     at no point are more than `cap` tabs open at once).
+  (c) verify tab counts in the cap -- a worker in 'verifying' still HOLDS its slot, so a tab in
+                                     verify is counted by _active_open and a 1-cap fleet does
+                                     NOT open a second tab while one verifies.
+  (d) hysteresis damps thrash      -- with an up-margin dead-band, RAM jitter around the line no
+                                     longer oscillates the cap 1<->N; it HOLDS at the water level
+                                     (and still drains immediately on a real deficit).
+
+Run:  .venv\\Scripts\\python.exe relay\\test_admission.py
+"""
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+import relay.relay_fleet as rf
+from relay.relay_fleet import (
+    disk_admission_ok, ram_target_cap, run_relay_fleet, RelayWorker, TERMINAL,
+)
+
+results = []
+
+
+def check(name, cond):
+    results.append(bool(cond))
+    print("[%s] %s" % ("PASS" if cond else "FAIL", name))
+
+
+class FakeContext:
+    """Stand-in for a Playwright CDP context: cookies() must not raise (a raise means the
+    Edge died -> FleetContextLost), and new_page() is never reached because we monkeypatch
+    RelayWorker.attach. We still give it for completeness."""
+    def cookies(self):
+        return []
+
+
+# ── (a) disk-floor admission predicate ────────────────────────────────────────────────────
+def test_disk_floor_predicate():
+    # plenty of free space, default 6 GB floor -> OK
+    check("disk_ok_when_ample", disk_admission_ok(floor_gb=6, free_gb=50.0) is True)
+    # exactly at the floor -> OK (>=)
+    check("disk_ok_at_floor", disk_admission_ok(floor_gb=6, free_gb=6.0) is True)
+    # below the floor -> NOT OK
+    check("disk_blocks_below_floor", disk_admission_ok(floor_gb=6, free_gb=5.9) is False)
+    # eval look-ahead: 8 GB free, 6 floor, but the next eval might use 3 -> 8-3=5 < 6 -> blocked
+    check("disk_lookahead_blocks", disk_admission_ok(floor_gb=6, eval_gb=3, free_gb=8.0) is False)
+    check("disk_lookahead_ok", disk_admission_ok(floor_gb=6, eval_gb=1, free_gb=8.0) is True)
+    # floor <= 0 disables the gate entirely (normal, non-bench use)
+    check("disk_floor_zero_disables", disk_admission_ok(floor_gb=0, free_gb=0.1) is True)
+    check("disk_floor_neg_disables", disk_admission_ok(floor_gb=-1, free_gb=0.0) is True)
+
+
+# ── (d) anti-thrash hysteresis ─────────────────────────────────────────────────────────────
+def test_hysteresis_no_thrash():
+    cap = ram_target_cap
+    PER, HEAD = 700, 1400
+
+    # Simulate the thrash trigger: free RAM hovers just around the up/down line while the cap
+    # sits at 2 with 2 tabs open. WITHOUT a dead-band (legacy up_margin=0) a tiny surplus makes
+    # it ramp to 3; with a dead-band it HOLDS at 2.
+    #   raw = open_now + (avail - HEAD)//PER. open_now=2.
+    #   avail = HEAD + 100 (a small surplus, < PER): raw = 2 + 0 = 2 -> never ramps up anyway.
+    #   avail = HEAD + PER + 50 (just over one tab's worth): raw = 2 + 1 = 3 -> WOULD ramp up.
+    rf.avail_phys_mb = lambda: float(HEAD + PER + 50)      # 50 MB into the next tab's budget
+
+    # legacy (no margin): a 50 MB surplus over a full tab budget is enough -> ramps up to 3
+    check("legacy_ramps_on_tiny_surplus",
+          cap(2, 2, 4, per_tab_mb=PER, headroom_mb=HEAD, up_margin_mb=0) == 3)
+    # hysteresis: require 700 MB EXTRA headroom on top of the tab budget -> 50 MB is inside the
+    # dead-band -> HOLD at 2 (no thrash)
+    check("hysteresis_holds_in_deadband",
+          cap(2, 2, 4, per_tab_mb=PER, headroom_mb=HEAD, up_margin_mb=PER) == 2)
+
+    # a genuine, sustained surplus (well past the dead-band) DOES ramp up one step
+    rf.avail_phys_mb = lambda: float(HEAD + 2 * PER + 100)
+    check("hysteresis_ramps_on_real_surplus",
+          cap(2, 2, 4, per_tab_mb=PER, headroom_mb=HEAD, up_margin_mb=PER) == 3)
+
+    # the dead-band NEVER blocks a DOWN drain: a real RAM deficit still drops the cap at once,
+    # regardless of up_margin (down is immediate, only the up side has the dead-band).
+    rf.avail_phys_mb = lambda: float(HEAD - 2 * PER)       # deficit of two tabs
+    check("hysteresis_drain_still_immediate",
+          cap(3, 3, 8, per_tab_mb=PER, headroom_mb=HEAD, up_margin_mb=PER) == 1)
+
+    # Stability over a JITTERY sequence: feed an oscillating RAM reading and confirm the cap
+    # under hysteresis never grows past the settled level, while legacy does grow.
+    jitter = [HEAD + PER + 30, HEAD + PER - 30, HEAD + PER + 60, HEAD + PER - 10,
+              HEAD + PER + 40, HEAD + PER + 20]
+    # hysteresis run
+    capn = 2
+    grew_h = False
+    for j in jitter:
+        rf.avail_phys_mb = (lambda v: (lambda: float(v)))(j)
+        new = cap(2, capn, 4, per_tab_mb=PER, headroom_mb=HEAD, up_margin_mb=PER)
+        if new > capn:
+            grew_h = True
+        capn = new
+    check("hysteresis_no_growth_under_jitter", grew_h is False and capn == 2)
+    # legacy run on the SAME jitter -> it WOULD grow (proves the dead-band is what damps it)
+    capn = 2
+    grew_l = False
+    for j in jitter:
+        rf.avail_phys_mb = (lambda v: (lambda: float(v)))(j)
+        new = cap(2, capn, 4, per_tab_mb=PER, headroom_mb=HEAD, up_margin_mb=0)
+        if new > capn:
+            grew_l = True
+        capn = new
+    check("legacy_grows_under_jitter", grew_l is True)
+
+
+# ── shared harness for the loop-level tests (b) and (c) ─────────────────────────────────────
+def _install_fake_worker(monkey_state):
+    """Monkeypatch RelayWorker so attach/poll/close are deterministic and browser-free.
+
+    Each worker, when attached, gets a sentinel page and goes 'waiting'. Its poll() consults
+    a per-name control dict: 'verifying' keeps it busy (non-terminal, holds the tab); 'done'
+    flips it terminal. close() just drops the page (frees the slot)."""
+    orig = {"attach": RelayWorker.attach, "poll": RelayWorker.poll, "close": RelayWorker.close}
+
+    def fake_attach(self, context, agent_url):
+        self.page = object()              # sentinel: a non-None page = holds a tab
+        self.status = "waiting"
+        return True
+
+    def fake_poll(self):
+        if self.status in TERMINAL:
+            return True
+        cmd = monkey_state["control"].get(self.name, "waiting")
+        if cmd == "verifying":
+            self.status = "verifying"     # bounded eval in flight -- still HOLDS the tab
+            return False
+        if cmd == "done":
+            self.status, self.outcome = "done", "DONE"
+            self.verified = True
+            return True
+        self.status = "waiting"
+        return False
+
+    def fake_close(self):
+        self.closed = True
+        self.page = None
+        self.drv = None
+
+    RelayWorker.attach = fake_attach
+    RelayWorker.poll = fake_poll
+    RelayWorker.close = fake_close
+    return orig
+
+
+def _restore_worker(orig):
+    RelayWorker.attach = orig["attach"]
+    RelayWorker.poll = orig["poll"]
+    RelayWorker.close = orig["close"]
+
+
+# ── (b) continuous admission: completion frees a slot -> next admitted, no barrier ───────────
+def test_continuous_admission_no_barrier():
+    rf.avail_phys_mb = lambda: 64000.0       # RAM never the constraint here
+    rf.free_disk_gb = lambda path=None: 500.0  # disk never the constraint here
+    state = {"control": {}}
+    orig = _install_fake_worker(state)
+    try:
+        # 5 goals, cap of 2: the 2-tab budget must be respected at every instant, AND all 5
+        # must complete (continuous re-admission as slots free, not "batch of 2 barrier").
+        goals = ["g0", "g1", "g2", "g3", "g4"]
+        max_open_seen = {"v": 0}
+        sweeps = {"n": 0}
+
+        def on_tick(workers):
+            open_now = sum(1 for w in workers
+                           if getattr(w, "page", None) is not None and w.status not in TERMINAL)
+            max_open_seen["v"] = max(max_open_seen["v"], open_now)
+            sweeps["n"] += 1
+            # complete the OLDEST currently-open worker each sweep so a slot frees and the
+            # next queued goal must be admitted on the following sweep (the continuous flow).
+            for w in workers:
+                if getattr(w, "page", None) is not None and w.status == "waiting":
+                    state["control"][w.name] = "done"
+                    break
+
+        res = run_relay_fleet(FakeContext(), goals, "http://agent", max_concurrent=2,
+                              poll_s=0, on_tick=on_tick, notify=lambda *a, **k: None)
+        all_done = all(r["outcome"] == "DONE" for r in res)
+        check("continuous_all_complete", len(res) == 5 and all_done)
+        check("continuous_cap_never_exceeded", max_open_seen["v"] <= 2)
+        # if there were a "finish all then next batch" barrier with 5 goals / cap 2, we'd need
+        # far more idle sweeps; a continuous flow finishes in ~5-7 sweeps. Just assert progress.
+        check("continuous_made_progress", sweeps["n"] <= 12)
+    finally:
+        _restore_worker(orig)
+
+
+# ── (c) verify-in-flight counts toward the cap ─────────────────────────────────────────────
+def test_verifying_counts_in_cap():
+    rf.avail_phys_mb = lambda: 64000.0
+    rf.free_disk_gb = lambda path=None: 500.0
+    state = {"control": {}}
+    orig = _install_fake_worker(state)
+    try:
+        # cap of 1: the first worker goes into 'verifying' and STAYS there for several sweeps.
+        # A verifying tab still holds its slot, so the SECOND goal must NOT be admitted while
+        # w0 verifies. We let w0 verify for a few sweeps, then finish it; only then may w1 open.
+        goals = ["g0", "g1"]
+        observed = {"second_open_during_verify": False, "ticks": 0}
+
+        def on_tick(workers):
+            observed["ticks"] += 1
+            by = {w.name: w for w in workers}
+            w0, w1 = by.get("w0"), by.get("w1")
+            # drive w0 into verifying for the first few sweeps, then let it finish
+            if observed["ticks"] <= 3:
+                if w0 is not None and w0.page is not None:
+                    state["control"]["w0"] = "verifying"
+            else:
+                if w0 is not None and w0.page is not None:
+                    state["control"]["w0"] = "done"
+            # the violation we are testing for: w1 holding a tab while w0 is still verifying
+            if (w1 is not None and getattr(w1, "page", None) is not None
+                    and w0 is not None and w0.status == "verifying"):
+                observed["second_open_during_verify"] = True
+            # once w0 is terminal, let w1 finish too so the loop can exit (it was admitted only
+            # after w0 freed its slot -- exactly the behavior under test).
+            if w1 is not None and getattr(w1, "page", None) is not None and w1.status == "waiting":
+                state["control"]["w1"] = "done"
+
+        res = run_relay_fleet(FakeContext(), goals, "http://agent", max_concurrent=1,
+                              poll_s=0, on_tick=on_tick, notify=lambda *a, **k: None)
+        check("verify_blocks_second_admit",
+              observed["second_open_during_verify"] is False)
+        check("verify_both_eventually_done",
+              len(res) == 2 and all(r["outcome"] == "DONE" for r in res))
+    finally:
+        _restore_worker(orig)
+
+
+# ── (a-loop) disk floor blocks admission inside the live loop ───────────────────────────────
+def test_disk_floor_blocks_in_loop():
+    rf.avail_phys_mb = lambda: 64000.0       # RAM never the constraint
+    state = {"control": {}}
+    orig = _install_fake_worker(state)
+    try:
+        # Disk starts BELOW the floor -> the first goal must NOT be admitted. Then we raise the
+        # free space above the floor and the goal IS admitted and runs to DONE. Floor = 6 GB.
+        goals = ["g0"]
+        disk = {"free": 3.0}                  # below the 6 GB floor at first
+        rf.free_disk_gb = lambda path=None: disk["free"]
+        phase = {"ticks": 0, "opened_while_low": False}
+
+        def on_tick(workers):
+            phase["ticks"] += 1
+            w0 = workers[0]
+            if disk["free"] < 6.0 and getattr(w0, "page", None) is not None:
+                phase["opened_while_low"] = True     # VIOLATION: admitted under the floor
+            if phase["ticks"] == 3:
+                disk["free"] = 50.0                  # free up the disk -> admission may resume
+            # once admitted (page present), let it finish so the loop can exit
+            if getattr(w0, "page", None) is not None and w0.status == "waiting":
+                state["control"]["w0"] = "done"
+
+        res = run_relay_fleet(FakeContext(), goals, "http://agent", max_concurrent=1,
+                              poll_s=0, on_tick=on_tick, notify=lambda *a, **k: None,
+                              disk_floor_gb=6.0)
+        check("disk_floor_blocked_admit_while_low", phase["opened_while_low"] is False)
+        check("disk_floor_admits_after_freed",
+              len(res) == 1 and res[0]["outcome"] == "DONE")
+    finally:
+        _restore_worker(orig)
+
+
+def main():
+    test_disk_floor_predicate()
+    test_hysteresis_no_thrash()
+    test_continuous_admission_no_barrier()
+    test_verifying_counts_in_cap()
+    test_disk_floor_blocks_in_loop()
+    print("\n=== %d/%d admission checks passed ===" % (sum(results), len(results)))
+    return 0 if all(results) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
