@@ -246,13 +246,24 @@ class RelayWorker:
         # then deferred -- so it does NOT consume the transient budget and does NOT count a
         # turn. A separate, very generous cap only catches a turn that LITERALLY never stops
         # generating (a wedged page). In the fleet path each send() only waits ~2s before
-        # deferring (non-blocking), so the patience is realized ACROSS deferrals: ~60 waits
-        # x (2s check + ~2s cooldown) ~= 240s total, matching the single-relay 240s window
-        # while keeping the round-robin sweep responsive. This was the W0
-        # django__django-14730 STUCK: send-into-generating burned the 10x transient budget
-        # into STUCK even though the turn was merely slow.
-        self.max_gen_waits = 60
+        # deferring (non-blocking). This was the W0 django__django-14730 STUCK:
+        # send-into-generating burned the 10x transient budget into STUCK even though the turn
+        # was merely slow.
+        #
+        # Patience is now WALL-CLOCK, not a fixed deferral COUNT: under load each defer cycle
+        # can take well over the nominal ~4s (the round-robin sweep slows when many workers
+        # are busy), so a count of 60 drifts to far LESS than the intended ~240s of realized
+        # patience -- false-STUCKing a legitimately slow turn. We instead stamp the FIRST defer
+        # (first_defer_ts) and cut off only when `now - first_defer_ts` exceeds
+        # max_gen_wait_s, so the realized patience is the same wall-clock budget regardless of
+        # load/sweep speed. (max_gen_waits is kept as a generous secondary guard against a
+        # pathological tight-loop with no real elapsed time.) The single-relay path
+        # (copilot_autopilot_relay.run_relay, GEN_WAIT_S=240) is synchronous and already
+        # wall-clock equivalent, so it is unchanged.
+        self.max_gen_wait_s = 360.0
+        self.max_gen_waits = 90
         self.gen_waits = 0
+        self.first_defer_ts = 0.0
         # goal-delivery recovery: when the agent reports it never received the task, RE-SEND
         # the goal verbatim instead of a generic retry nudge (bounded to avoid a resend loop).
         self.max_goal_resends = 3
@@ -413,8 +424,9 @@ class RelayWorker:
             # concurrency>1, starves the OTHER workers). Pass a SHORT gen-wait so send()
             # just checks "is the turn still generating?", waits ~2s, and if so raises
             # GenerationInProgress immediately -> we defer and the sweep moves on. The
-            # generous total patience is realized across max_gen_waits deferrals, not one
-            # blocking call. (run_relay's single-conversation path keeps the full 240s.)
+            # generous total patience is realized across deferrals as a WALL-CLOCK budget
+            # (max_gen_wait_s), not one blocking call. (run_relay's single-conversation path
+            # keeps the full 240s.)
             self.drv.send(self.job, gen_wait_s=2.0)
         except ConversationClosed as e:
             # The target tab/composer is gone (conversation ended). Retrying a dead
@@ -435,14 +447,16 @@ class RelayWorker:
             # must never be counted into STUCK). A separate, very generous cap only catches
             # a turn that LITERALLY never stops generating.
             if self._defer_generation():
-                self.reason = "previous turn still generating -> wait %d/%d (no budget)" % (
-                    self.gen_waits, self.max_gen_waits)
+                elapsed = max(0.0, time.time() - self.first_defer_ts)
+                self.reason = "previous turn still generating -> wait %ds/%ds (no budget)" % (
+                    int(elapsed), int(self.max_gen_wait_s))
                 return
             if self._salvage_via_checks():
                 return
             self.status, self.outcome = "stuck", "STUCK"
-            self.reason = "previous turn never stopped generating (%d waits): %s" % (
-                self.gen_waits, str(e)[:120])
+            elapsed = max(0.0, time.time() - self.first_defer_ts) if self.first_defer_ts else 0.0
+            self.reason = "previous turn never stopped generating (%ds, %d waits): %s" % (
+                int(elapsed), self.gen_waits, str(e)[:120])
             return
         except Exception as e:
             # a send failure is a transient (CDP/Edge/network) hiccup -- retry the turn
@@ -459,7 +473,10 @@ class RelayWorker:
                 self.transient, type(e).__name__, str(e))
             return
         self.turn += 1
-        self.gen_waits = 0     # a send actually went through -> reset the generation-wait count
+        # a send actually went through -> reset BOTH the generation-wait count and the
+        # wall-clock streak stamp so the next slow turn gets a fresh full patience budget.
+        self.gen_waits = 0
+        self.first_defer_ts = 0.0
         self._tx.user(self.turn, self.job)     # persist the full sent prompt for this turn
         self._last_text, self._stable_since, self._t_send = None, None, time.time()
         self.status = "waiting"
@@ -468,15 +485,26 @@ class RelayWorker:
         """Schedule a non-failure RESCHEDULE because the previous turn is still generating.
         Unlike _retry_transient this does NOT touch self.transient (the transient/STUCK
         budget) -- waiting out a slow turn is not a failure. It re-arms the worker to 'ready'
-        with a short cooldown and re-sends the SAME job. Bounded by max_gen_waits only to
-        catch a turn that literally never stops generating. Returns True if rescheduled, else
-        False (the generous cap was hit -> the caller should go terminal)."""
+        with a short cooldown and re-sends the SAME job. Bounded primarily by a WALL-CLOCK
+        budget (max_gen_wait_s) so realized patience is load-independent, with max_gen_waits
+        as a secondary guard. Returns True if rescheduled, else False (the budget was hit ->
+        the caller should go terminal)."""
+        now = time.time()
+        # stamp the FIRST defer of this wait-streak; the streak's clock resets to 0 on a
+        # successful send (see _begin_send, where gen_waits is also reset).
+        if self.first_defer_ts <= 0.0:
+            self.first_defer_ts = now
+        # primary cutoff: total wall-clock spent deferring this turn exceeds the budget.
+        if (now - self.first_defer_ts) > self.max_gen_wait_s:
+            return False
+        # secondary guard: a pathological tight-loop racking up deferrals with ~no elapsed
+        # time (e.g. a clock that never advances) still terminates.
         if self.gen_waits >= self.max_gen_waits:
             return False
         self.gen_waits += 1
         # short, fixed cooldown before re-checking (send() itself does the long minutes-wait
         # for generation to finish; this is just a brief breather between deferrals).
-        self._cooldown_until = time.time() + 2.0
+        self._cooldown_until = now + 2.0
         self.status = "ready"
         return True
 
