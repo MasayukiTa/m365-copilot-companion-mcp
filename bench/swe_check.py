@@ -129,8 +129,18 @@ def _cleanup_docker(inst, run_id):
     swebench naming (from test_spec.py):
       container : sweb.eval.<instance_id.lower()>.<run_id>
       image     : sweb.eval.x86_64.<instance_id.lower()>:latest
+      ENV image : sweb.env.x86_64.<hash>:latest  (per repo+version; the expensive ~20min build)
 
-    Set env var SWE_KEEP_IMAGES=1 to skip (useful when debugging eval failures).
+    Set env var SWE_KEEP_IMAGES=1 to skip entirely (useful when debugging eval failures).
+
+    REPO-AFFINITY (SWE_KEEP_ENV=1): the prior full cleanup ran `docker image prune -f`, which
+    deletes the dangling/unreferenced `sweb.env.*` layers and forced a cold ENV rebuild on the
+    NEXT instance even of the SAME repo+version (~20min each, e.g. sympy). With SWE_KEEP_ENV=1
+    we remove ONLY the per-instance eval image (`sweb.eval.x86_64.*`) and the container, and we
+    SKIP `docker image prune` so the warm `sweb.env.*` image survives for the next same-repo
+    instance. The orchestrator sweeps the kept ENV images at each repo boundary (and applies a
+    C: disk-floor guard that disables SWE_KEEP_ENV when space is low). When SWE_KEEP_ENV is not
+    set, behavior is unchanged: rmi eval image + full prune.
     Never raises; all errors go to stderr only so callers are not affected.
     """
     if os.environ.get("SWE_KEEP_IMAGES") == "1":
@@ -140,11 +150,16 @@ def _cleanup_docker(inst, run_id):
     container = f"sweb.eval.{inst_lower}.{run_id}"
     image = f"sweb.eval.x86_64.{inst_lower}:latest"
 
+    keep_env = os.environ.get("SWE_KEEP_ENV") == "1"
     cmds = [
         f"docker rm -f {container} 2>/dev/null || true",
         f"docker rmi {image} 2>/dev/null || true",
-        "docker image prune -f 2>/dev/null || true",
     ]
+    if not keep_env:
+        # legacy full-prune path: reclaim ALL dangling layers including ENV images
+        cmds.append("docker image prune -f 2>/dev/null || true")
+    # keep_env: deliberately NO prune -> the per-version sweb.env.* image stays warm for the
+    # next same-repo instance; the orchestrator removes it at the repo boundary.
     script = "; ".join(cmds)
     try:
         wsl(script, timeout=120)
