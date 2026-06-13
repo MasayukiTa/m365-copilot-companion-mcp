@@ -148,6 +148,11 @@ def _cleanup_docker(inst, run_id):
 # "django.core.exceptions.ImproperlyConfigured: ...". Matches at column 0 (django/sympy
 # custom runners) or after a pytest "E " prefix (stripped before this is applied).
 _EXC_RE = re.compile(r"^[A-Za-z_][\w.]*(?:Error|Exception|Warning|Failure)(?::|$)")
+# BROADER raised-exception line for the collection/import-error fallback (see relay/test_feedback.py,
+# kept IN SYNC): "<dotted.Type>: <message>" with a capitalized final component. Catches django
+# app-loading failures whose type does NOT end in Error/Exception (AppRegistryNotReady,
+# ImproperlyConfigured) which abort collection with no "FAIL: test_x" header.
+_RAISED_EXC_RE = re.compile(r"^([A-Za-z_][\w.]*\.[A-Z]\w+|[A-Z]\w+): \S")
 # pytest's source pointer printed under the traceback: "path/file.py:123: SomeError"
 _PYTEST_PTR_RE = re.compile(r"^.+\.py:\d+: \w*(?:Error|Exception|Warning|Failed)\b")
 # django unittest runner result header: "FAIL: test_x (module.Class)" / "ERROR: test_x (module.Class)"
@@ -156,6 +161,79 @@ _DJANGO_RES_RE = re.compile(r"^(?:FAIL|ERROR): (\S+) \(([^)]+)\)")
 _SYMPY_BANNER_RE = re.compile(r"^_+ (\S+\.py:\S+) _+$")
 # a traceback frame line: '  File ".../x.py", line 12, in test_foo'
 _TB_FRAME_RE = re.compile(r'^\s*File "([^"]+)", line (\d+), in (\S+)')
+# doctest failure frame (sympy/sphinx run docstrings as tests): 'File "...", line N, in mod.func'
+# preceding a 'Failed example:' / 'Expected:' / 'Got:' block. Kept IN SYNC with test_feedback.py.
+_DOCTEST_FAIL_RE = re.compile(r"^\s*(?:\*+\s*)?File \"([^\"]+)\", line (\d+), in (\S+)\s*$")
+# col-0 markers that terminate a doctest Expected:/Got: body block.
+_DOCTEST_STOP = ("Expected:", "Got:", "Failed example:", "Expected nothing", "Got nothing")
+
+
+def _doctest_block_after(lines, start, header, max_lines=3):
+    """Indented body line(s) following a doctest 'header:' line at/after *start*. The Expected:/
+    Got: body is indented UNDER the header; the block ends at the next col-0 marker (another
+    header, a '****' separator, a File frame, an empty line, or any unindented line). One-line
+    collapsed summary. Kept IN SYNC with test_feedback._block_after."""
+    n = len(lines)
+    for k in range(start, min(n, start + 12)):
+        if lines[k].strip() == header.rstrip(":") + ":" or lines[k].strip() == header:
+            body = []
+            for m in range(k + 1, min(n, k + 1 + max_lines)):
+                raw = lines[m]
+                s = raw.strip()
+                if (not s or s.startswith("***") or _DOCTEST_FAIL_RE.match(raw)
+                        or s in _DOCTEST_STOP or not (raw.startswith(" ") or raw.startswith("\t"))):
+                    break
+                body.append(s)
+            return " ".join(body)[:120] if body else ""
+    return ""
+
+
+def _doctest_failures(lines):
+    """Summarize failing doctests (sympy/sphinx run docstring examples as tests). Returns short
+    'module.func @ file:line: expected <X> got <Y>' strings. Kept IN SYNC with
+    test_feedback._doctest_failures."""
+    out, seen = [], set()
+    n = len(lines)
+    i = 0
+    while i < n:
+        if lines[i].lstrip().startswith("Failed example:"):
+            where = ""
+            for j in range(i - 1, max(-1, i - 6), -1):
+                fm = _DOCTEST_FAIL_RE.match(lines[j])
+                if fm:
+                    where = "%s @ %s:%s" % (fm.group(3), fm.group(1), fm.group(2))
+                    break
+            exp = _doctest_block_after(lines, i, "Expected:")
+            got = _doctest_block_after(lines, i, "Got:")
+            desc = (where or "doctest")
+            if exp or got:
+                desc += ": expected %s got %s" % (exp or "<nothing>", got or "<nothing>")
+            if desc not in seen:
+                seen.add(desc)
+                out.append(desc)
+        i += 1
+    return out
+
+
+def _collection_error(err_tail, ptr, lines):
+    """Fallback for import/collection errors carrying NO test name (django app-loading failures:
+    AppRegistryNotReady / ImproperlyConfigured raised at import time). Compose
+    '<ErrorType>: <msg> at <file:line>' from the strongest error line + the deepest frame. Kept
+    IN SYNC with test_feedback._collection_error."""
+    err = (err_tail[-1] if err_tail else "")
+    if not err:
+        for raw in lines:
+            t = raw.strip()
+            if _EXC_RE.match(t) or _RAISED_EXC_RE.match(t):
+                err = t
+    if not err:
+        return ""
+    where = (ptr[-1] if ptr else "")
+    if not where:
+        frames = ["%s:%s in %s" % m.groups()
+                  for ln in lines for m in [_TB_FRAME_RE.match(ln)] if m]
+        where = frames[-1] if frames else ""
+    return (err + (" at " + where if where else ""))[:240]
 
 
 def _failure_feedback(run_id, inst):
@@ -238,19 +316,36 @@ def _parse_failure_log(log):
         test_frames = [f for f in frames if "/tests/" in f or "/testbed/" in f]
         ptr = (test_frames or frames)[-4:]
 
+    # doctest divergences (sympy/sphinx run docstring examples as tests): which example
+    # expected X but got Y. Kept IN SYNC with test_feedback.py.
+    doctests = _doctest_failures(lines)
+
     parts = ["--- ACTUAL TEST FAILURE (use this to find the exact spot) ---"]
     if failed:
         parts.append("Failing tests (%d):" % len(failed))
         parts.extend("  " + f for f in failed[:8])
         if len(failed) > 8:
             parts.append("  ... and %d more" % (len(failed) - 8))
+    if doctests:
+        parts.append("Failing doctests (%d):" % len(doctests))
+        parts.extend("  " + d for d in doctests[:8])
+        if len(doctests) > 8:
+            parts.append("  ... and %d more" % (len(doctests) - 8))
     if err_tail:
         parts.append("Error:")
         parts.extend("  " + e for e in err_tail)
     if ptr:
         parts.append("Raised at:")
         parts.extend("  " + p for p in ptr[-4:])
-    if not failed and not err_tail and not ptr:
+    if not failed and not doctests:
+        # No per-test header -> the django import/collection-error shape (AppRegistryNotReady /
+        # ImproperlyConfigured raised at import time, col 0, no "FAIL: test_x" banner). Still
+        # tell the agent WHAT broke and WHERE. Kept IN SYNC with test_feedback.py.
+        ce = _collection_error(err_tail, ptr, lines)
+        if ce:
+            parts.append("Collection/import error (no test name extracted):")
+            parts.append("  " + ce)
+    if not failed and not doctests and not err_tail and not ptr:
         # unknown format -> give the agent the meaningful tail rather than nothing
         tail = [ln for ln in lines if ln.strip()][-20:]
         parts.append("Log tail:")

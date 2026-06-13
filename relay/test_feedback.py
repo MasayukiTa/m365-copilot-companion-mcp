@@ -51,6 +51,12 @@ _MAX_POINTERS = 4
 # "django.core.exceptions.ImproperlyConfigured: ...". Matches django/sympy custom runners
 # (and the "E " body once that prefix is stripped).
 _EXC_RE = re.compile(r"^[A-Za-z_][\w.]*(?:Error|Exception|Warning|Failure)(?::|$)")
+# a BROADER raised-exception line at column 0 for the collection/import-error fallback:
+# "<dotted.Type>: <message>". Catches django app-loading failures whose type does NOT end in
+# Error/Exception (AppRegistryNotReady, ImproperlyConfigured) yet which abort collection with
+# no test header. Requires a ': ' message and a capitalized final component (a class name) to
+# avoid matching ordinary prose lines.
+_RAISED_EXC_RE = re.compile(r"^([A-Za-z_][\w.]*\.[A-Z]\w+|[A-Z]\w+): \S")
 # pytest's source pointer printed under the traceback: "path/file.py:123: SomeError"
 _PYTEST_PTR_RE = re.compile(r"^.+\.py:\d+: \w*(?:Error|Exception|Warning|Failed)\b")
 # unittest (django) runner result header: "FAIL: test_x (module.Class)" / "ERROR: ..."
@@ -59,6 +65,17 @@ _UNITTEST_RES_RE = re.compile(r"^(?:FAIL|ERROR): (\S+) \(([^)]+)\)")
 _SYMPY_BANNER_RE = re.compile(r"^_+ (\S+\.py:\S+) _+$")
 # a traceback frame line: '  File ".../x.py", line 12, in test_foo'
 _TB_FRAME_RE = re.compile(r'^\s*File "([^"]+)", line (\d+), in (\S+)')
+# doctest failure markers (sympy/sphinx run docstrings as tests): a failing doctest prints
+#   File ".../x.py", line N, in module.func
+#   Failed example:
+#       <expr>
+#   Expected:
+#       <expected>
+#   Got:
+#       <got>
+# We detect the "Failed example:" header (and its Expected/Got block) to report WHICH doctest
+# diverged. The preceding 'File "...", line N, in module.func' frame is picked up by _TB_FRAME_RE.
+_DOCTEST_FAIL_RE = re.compile(r"^\s*(?:\*+\s*)?File \"([^\"]+)\", line (\d+), in (\S+)\s*$")
 # ANSI color escapes pytest emits, stripped before parsing.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -100,6 +117,7 @@ def _parse(log):
     failed = _failing_tests(lines)
     err_tail = _error_lines(lines)
     ptr = _source_pointers(lines)
+    doctests = _doctest_failures(lines)
 
     parts = ["--- TEST FAILURE SUMMARY (use this to find the exact spot) ---"]
     if failed:
@@ -107,13 +125,28 @@ def _parse(log):
         parts.extend("  " + f for f in failed[:_MAX_TESTS])
         if len(failed) > _MAX_TESTS:
             parts.append("  ... and %d more" % (len(failed) - _MAX_TESTS))
+    if doctests:
+        # doctest divergences (sympy/sphinx): which docstring example expected X but got Y.
+        parts.append("Failing doctests (%d):" % len(doctests))
+        parts.extend("  " + d for d in doctests[:_MAX_TESTS])
+        if len(doctests) > _MAX_TESTS:
+            parts.append("  ... and %d more" % (len(doctests) - _MAX_TESTS))
     if err_tail:
         parts.append("Error:")
         parts.extend("  " + e for e in err_tail)
     if ptr:
         parts.append("Raised at:")
         parts.extend("  " + p for p in ptr)
-    if not failed and not err_tail and not ptr:
+    if not failed and not doctests:
+        # No per-test header was found. This is the django import/collection-error shape
+        # (AppRegistryNotReady / ImproperlyConfigured raised at import time, col 0, with no
+        # "FAIL: test_x" banner) -- the agent must still learn WHAT broke and WHERE, so emit
+        # an explicit collection/import-error fallback from the error + the deepest frame.
+        ce = _collection_error(err_tail, ptr, lines)
+        if ce:
+            parts.append("Collection/import error (no test name extracted):")
+            parts.append("  " + ce)
+    if not failed and not doctests and not err_tail and not ptr:
         # unknown format -> hand back the meaningful tail rather than nothing
         body = _raw_tail(log, _RAW_TAIL_LINES)
         if body:
@@ -121,6 +154,86 @@ def _parse(log):
         else:
             parts.append("(no recognizable failure detail.)")
     return "\n".join(parts)
+
+
+def _doctest_failures(lines):
+    """Summarize failing doctests (sympy/sphinx run docstring examples as tests). A failing
+    doctest prints a 'File "...", line N, in module.func' frame, then 'Failed example:',
+    'Expected:' and 'Got:' blocks. Returns short 'module.func @ file:line: expected <X> got <Y>'
+    strings so the agent sees exactly which example diverged. Bounded; empty if none."""
+    out, seen = [], set()
+    n = len(lines)
+    i = 0
+    while i < n:
+        if lines[i].lstrip().startswith("Failed example:"):
+            # the nearest preceding 'File "...", line N, in module.func' frame names the doctest
+            where = ""
+            for j in range(i - 1, max(-1, i - 6), -1):
+                fm = _DOCTEST_FAIL_RE.match(lines[j])
+                if fm:
+                    where = "%s @ %s:%s" % (fm.group(3), fm.group(1), fm.group(2))
+                    break
+            exp = _block_after(lines, i, "Expected:")
+            got = _block_after(lines, i, "Got:")
+            # "Expected nothing" appears when the example unexpectedly produced output
+            desc = (where or "doctest")
+            if exp or got:
+                desc += ": expected %s got %s" % (exp or "<nothing>", got or "<nothing>")
+            if desc not in seen:
+                seen.add(desc)
+                out.append(desc)
+        i += 1
+    return out
+
+
+# col-0 markers that terminate a doctest Expected:/Got: body block.
+_DOCTEST_STOP = ("Expected:", "Got:", "Failed example:", "Expected nothing", "Got nothing")
+
+
+def _block_after(lines, start, header, max_lines=3):
+    """Return the indented body line(s) following a doctest 'header:' line at/after *start*
+    (within a small window). A doctest Expected:/Got: body is indented UNDER the header; the
+    block ends at the next col-0 marker (another header, a '****' separator, a File frame, an
+    empty line, or any unindented line). One-line collapsed summary so the report stays terse."""
+    n = len(lines)
+    for k in range(start, min(n, start + 12)):
+        if lines[k].strip() == header.rstrip(":") + ":" or lines[k].strip() == header:
+            body = []
+            for m in range(k + 1, min(n, k + 1 + max_lines)):
+                raw = lines[m]
+                s = raw.strip()
+                # stop at the end of the indented body: blank line, a '****' separator, the
+                # next doctest header, a 'File "..."' frame, or any non-indented line.
+                if (not s or s.startswith("***") or _DOCTEST_FAIL_RE.match(raw)
+                        or s in _DOCTEST_STOP or not (raw.startswith(" ") or raw.startswith("\t"))):
+                    break
+                body.append(s)
+            return " ".join(body)[:120] if body else ""
+    return ""
+
+
+def _collection_error(err_tail, ptr, lines):
+    """Fallback for import/collection errors that carry NO test name (django app-loading
+    failures: AppRegistryNotReady / ImproperlyConfigured raised at import time). Compose
+    '<ErrorType>: <msg> at <file:line>' from the strongest error line + the deepest frame so
+    the agent still gets the type, message and location. Returns '' if nothing usable."""
+    # strongest error = the last real exception-shaped line (err_tail is already error-preferred)
+    err = (err_tail[-1] if err_tail else "")
+    if not err:
+        # scan for either the strict Error/Exception shape OR the broader raised-exception
+        # shape (django AppRegistryNotReady / ImproperlyConfigured, which _EXC_RE misses).
+        for raw in lines:
+            t = raw.strip()
+            if _EXC_RE.match(t) or _RAISED_EXC_RE.match(t):
+                err = t
+    if not err:
+        return ""
+    where = (ptr[-1] if ptr else "")
+    if not where:
+        frames = ["%s:%s in %s" % m.groups()
+                  for ln in lines for m in [_TB_FRAME_RE.match(ln)] if m]
+        where = frames[-1] if frames else ""
+    return (err + (" at " + where if where else ""))[:240]
 
 
 def _failing_tests(lines):

@@ -75,8 +75,14 @@ def main():
             print("reset %-42s diff_chars=%d" % (inst, len(d.stdout)))
         lib = s["repo"].split("/")[-1]
         check_cmd = '"%s" "%s" %s "%s"' % (VENVPY, CHECK, inst, wt)
+        # acceptance timeout must exceed swe_check's WORST-CASE wall time so the acceptance
+        # layer never kills swe_check (python) mid-eval -- that would leave the detached docker
+        # eval container running (a leak one layer above #17). swe_check worst case ~=
+        # wsl eval(1200) + cat report(60) + docker cleanup(120) = ~1380s; 1300 was BELOW that,
+        # so a slow-but-legitimate eval got pre-empted. 1500 sits above 1380 and matches the
+        # watchdog's EVAL_STALL_CEILING_S (relay_fleet.py), keeping the two ceilings consistent.
         goals.append({"text": goal_text(lib, wt, s["problem_statement"]), "cwd": wt,
-                      "checks": [{"type": "shell", "cmd": check_cmd, "timeout": 1300}]})
+                      "checks": [{"type": "shell", "cmd": check_cmd, "timeout": 1500}]})
 
     with open(args.goals, "w", encoding="utf-8", newline="\n") as f:
         for g in goals:
