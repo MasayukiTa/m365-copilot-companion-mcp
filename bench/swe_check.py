@@ -151,6 +151,22 @@ def _cleanup_docker(inst, run_id):
     image = f"sweb.eval.x86_64.{inst_lower}:latest"
 
     keep_env = os.environ.get("SWE_KEEP_ENV") == "1"
+    # PER-INSTANCE disk guard: the orchestrator's SWE_KEEP_ENV floor check only runs at each
+    # chunk launch, so within a chunk C: can still slide under the floor (observed: full-60
+    # chunk-1 dropped to ~3GB mid-django while KEEP_ENV held the ENV). Re-check the REAL C:
+    # free right here, before every cleanup: if it's tight, fall back to the full prune (drop
+    # the ENV too) regardless of SWE_KEEP_ENV, so a long same-repo run can never exhaust C:.
+    if keep_env:
+        try:
+            import shutil
+            free_gb = shutil.disk_usage(os.path.splitdrive(REPO)[0] + "\\").free / 1e9
+            floor = float(os.environ.get("SWE_KEEP_ENV_FLOOR_GB", "7"))
+            if free_gb < floor:
+                keep_env = False
+                print(f"[swe_check] C: {free_gb:.1f}GB < {floor}GB floor -> full prune "
+                      f"(drop ENV) despite SWE_KEEP_ENV", file=sys.stderr)
+        except Exception:
+            keep_env = False   # if we can't read disk, be safe: full prune
     cmds = [
         f"docker rm -f {container} 2>/dev/null || true",
         f"docker rmi {image} 2>/dev/null || true",
