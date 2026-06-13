@@ -85,6 +85,7 @@ def main():
 
     if resolved:
         print("RESOLVED: the hidden tests pass for %s." % inst)
+        _cleanup_docker(inst, run_id)
         return 0
 
     # 5. NOT resolved -> surface the REAL test failure to the agent (failing test names +
@@ -94,7 +95,37 @@ def main():
     print("NOT_RESOLVED: the hidden tests still fail with your current patch for %s. "
           "Find the real root cause in the SOURCE (do not edit tests) and fix it.\n%s"
           % (inst, feedback))
+    _cleanup_docker(inst, run_id)
     return 1
+
+
+def _cleanup_docker(inst, run_id):
+    """Remove the eval container and instance image for *inst* to reclaim C: space.
+
+    swebench naming (from test_spec.py):
+      container : sweb.eval.<instance_id.lower()>.<run_id>
+      image     : sweb.eval.x86_64.<instance_id.lower()>:latest
+
+    Set env var SWE_KEEP_IMAGES=1 to skip (useful when debugging eval failures).
+    Never raises; all errors go to stderr only so callers are not affected.
+    """
+    if os.environ.get("SWE_KEEP_IMAGES") == "1":
+        return
+
+    inst_lower = inst.lower()
+    container = f"sweb.eval.{inst_lower}.{run_id}"
+    image = f"sweb.eval.x86_64.{inst_lower}:latest"
+
+    cmds = [
+        f"docker rm -f {container} 2>/dev/null || true",
+        f"docker rmi {image} 2>/dev/null || true",
+        "docker image prune -f 2>/dev/null || true",
+    ]
+    script = "; ".join(cmds)
+    try:
+        wsl(script, timeout=120)
+    except Exception as exc:
+        print(f"[swe_check] docker cleanup error (non-fatal): {exc}", file=sys.stderr)
 
 
 def _failure_feedback(run_id, inst):
