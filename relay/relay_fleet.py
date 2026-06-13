@@ -34,7 +34,8 @@ from .acceptance import Check, normalize_checks, run_all_blocking
 from .copilot_autopilot_relay import (
     CONTINUE_JOB, COPILOT_SELECTORS, ConversationClosed, CopilotWebDriver, FIX_JOB,
     GenerationInProgress, PROTOCOL, REFUTE_FIX_JOB, RETRY_JOB, VERIFY_FIX_JOB,
-    _is_processing, default_notify, goal_not_seen, reported_stuck, transient_backoff,
+    _is_processing, default_notify, goal_not_seen, has_end_marker, reported_stuck,
+    transient_backoff,
 )
 from .planner import PLAN_PROMPT, extract_plan, plan_ready
 
@@ -805,12 +806,37 @@ class RelayWorker:
                     return False
             except Exception:
                 return False
+            # PRIMARY completion gate: never read/commit a turn while the agent is STILL
+            # GENERATING (the live Stop/square button is showing). Reading mid-stream was
+            # the root cause of partial capture (transcript turn5: 102 chars, mid-word
+            # "...隠し", no end marker) -- a streaming pause longer than dwell_s made the
+            # partial text look 'stable' and it was committed as the final answer, dropping
+            # the rest of the reply AND its DONE/CONTINUE/STUCK tail marker. This reuses the
+            # same Stop-button signal the SEND gate uses. Defensive getattr + guard so a
+            # mock/stub driver without _is_generating degrades to pure text-stability
+            # (back-compat with the test fakes). Reset the stability clock while generating
+            # so a pre-pause partial never carries its stale stable_since across the resume.
+            _isgen = getattr(self.drv, "_is_generating", None)
+            if callable(_isgen):
+                try:
+                    if _isgen():
+                        self._last_text, self._stable_since = None, None
+                        return False
+                except Exception:
+                    pass
             t = self.drv.read_last_response()
             if _is_processing(t):
                 self._last_text, self._stable_since = None, None
                 return False
             if t == self._last_text:
-                if self._stable_since and (time.time() - self._stable_since) >= self.dwell_s:
+                # A stable answer whose TAIL has no protocol marker may be a mid-stream
+                # pause that briefly hid the Stop button; require an EXTENDED settle (2x
+                # dwell) before committing it, vs the normal dwell for a marker-terminated
+                # (DONE/CONTINUE/STUCK/...) tail. Bounded by per_turn_timeout_s, so this
+                # cannot hang the round-robin -- a turn that genuinely never marks still
+                # commits once it stays byte-identical for the extended window.
+                need = self.dwell_s if has_end_marker(t) else self.dwell_s * 2.0
+                if self._stable_since and (time.time() - self._stable_since) >= need:
                     self._decide(t)
                     return self.status in TERMINAL
                 return False
