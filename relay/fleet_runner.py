@@ -32,7 +32,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from relay.relay_fleet import (  # noqa: E402
-    TERMINAL, auto_concurrency, avail_phys_mb, goal_fields, run_relay_fleet,
+    EVAL_STALL_CEILING_S, TERMINAL, VERIFY_STATUSES, auto_concurrency, avail_phys_mb,
+    goal_fields, run_relay_fleet,
 )
 from relay.copilot_autopilot_relay import default_notify  # noqa: E402
 from relay.refuter import PANEL_LENSES  # noqa: E402
@@ -149,6 +150,10 @@ def _snapshot(workers, started, total, max_concurrent=0):
             "conv_title": getattr(w, "conv_title", ""),
             "verified": getattr(w, "verified", None),
             "verify_attempts": getattr(w, "verify_attempts", 0),
+            # epoch by which an in-progress BLOCKING acceptance eval must finish (0 = idle).
+            # The watchdog reads this from a frozen status.json: a future value means the main
+            # thread is legitimately busy in a bounded eval, NOT a wedged Edge -> don't reset.
+            "eval_busy_until": getattr(w, "eval_busy_until", 0.0),
             "plan": getattr(w, "plan_steps", []),     # surfaced so the cockpit can show/pick
             "last": (w.last_response or "")[:600],
             # full-text transcript file (all turns, untruncated) for the chat viewer to
@@ -167,6 +172,59 @@ def _write_atomic(path, payload):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)
     os.replace(tmp, path)   # atomic on Windows + POSIX
+
+
+def _watchdog_should_reset(status, stalled_s, now=None):
+    """Pure decision: given a (possibly frozen) status.json dict and how long its `updated`
+    field has been unchanged, decide whether the dedicated Edge is genuinely WEDGED and must
+    be hard-reset -- vs. the main thread merely being busy in a bounded acceptance eval.
+
+    Returns (should_reset: bool, why: str). Keep this side-effect free so it can be unit-tested.
+
+    Rule:
+      * not running / idle / no stall yet      -> never reset (caller resets its stall clock)
+      * a worker is in a VERIFY status, or its eval_busy_until is still in the future
+        -> the main thread is legitimately blocked in a BOUNDED eval, NOT a wedged Edge.
+           Do NOT reset, UNLESS the freeze has run past EVAL_STALL_CEILING_S / the worker's
+           own eval deadline (failsafe: a real wedge that merely happened to be mid-verify is
+           still eventually recovered).
+      * otherwise (no verify in flight, purely no progress past stall_s) -> wedged -> reset.
+    """
+    now = time.time() if now is None else now
+    if not status or not status.get("running") or status.get("idle"):
+        return (False, "not running / idle")
+    if stalled_s <= 0:
+        return (False, "no stall")
+    workers = status.get("workers") or []
+    verifying = []          # names of workers legitimately busy in a bounded eval
+    deadline_in_future = False
+    for w in workers:
+        st = w.get("status")
+        try:
+            busy_until = float(w.get("eval_busy_until") or 0.0)
+        except (TypeError, ValueError):
+            busy_until = 0.0
+        if busy_until > now:
+            verifying.append(w.get("name"))
+            deadline_in_future = True
+        elif st in VERIFY_STATUSES:
+            # in a verify status but no recorded busy deadline (old snapshot, or the
+            # non-blocking gate which keeps status.json fresh anyway) -- still treat as a
+            # legitimate eval, bounded by the global ceiling from the freeze duration.
+            verifying.append(w.get("name"))
+    if verifying:
+        # A worker carrying a busy deadline that is still in the future is, by definition,
+        # within its declared eval budget -> WAIT (the deadline is the bound). Only when no
+        # such future deadline exists do we fall back to the global ceiling on freeze time,
+        # so a real wedge that merely happened to be mid-verify is still eventually recovered.
+        if deadline_in_future:
+            return (False, "verifying %s (within eval deadline)" % verifying)
+        if stalled_s <= EVAL_STALL_CEILING_S:
+            return (False, "verifying %s (within %ds eval ceiling)" % (
+                verifying, EVAL_STALL_CEILING_S))
+        return (True, "verifying %s but frozen %ds past %ds eval ceiling -> wedged" % (
+            verifying, stalled_s, EVAL_STALL_CEILING_S))
+    return (True, "stalled %ds with no eval in flight -> wedged" % stalled_s)
 
 
 def _print_table(workers, total):
@@ -448,10 +506,23 @@ def main():
                 u = d.get("updated")
                 if u != last_seen:
                     last_seen, last_change = u, time.time()
-                elif time.time() - last_change > args.stall_s:
-                    print("\n[watchdog] fleet stalled %ds -> hard-resetting the Edge" % args.stall_s)
+                    continue
+                stalled = time.time() - last_change
+                if stalled <= args.stall_s:
+                    continue
+                # status.json has been frozen past --stall-s. Distinguish a genuinely WEDGED
+                # Edge from the main thread being legitimately blocked in a BOUNDED acceptance
+                # eval (SWE-bench docker verify): in the latter case the frozen snapshot carries
+                # a worker in a verify status / with eval_busy_until in the future -- DON'T
+                # hard-reset that (it would discard the eval and resume every goal at attempt 1).
+                should, why = _watchdog_should_reset(d, stalled)
+                if should:
+                    print("\n[watchdog] fleet stalled %ds -> hard-resetting the Edge (%s)"
+                          % (args.stall_s, why))
                     hard_reset(port)
                     last_change = time.time()
+                # else: eval in flight -> wait. Re-checked every 5s; last_change is left intact
+                # so the failsafe ceiling keeps counting from the original freeze.
             except Exception:
                 pass
 

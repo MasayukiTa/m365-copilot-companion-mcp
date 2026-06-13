@@ -42,6 +42,19 @@ TERMINAL = ("done", "stuck", "maxturns", "error", "cancelled")
 # non-terminal but not yet occupying a tab; counts as "still running" for the loop.
 PENDING = "pending"
 
+# Statuses where the main thread is legitimately busy with a BOUNDED acceptance check
+# (eval/verification), NOT a wedged Edge. The watchdog must not hard-reset while a worker
+# is in one of these -- doing so throws away in-progress eval and resumes every goal at
+# attempt 1 (the sphinx-8595 t7->t1 regression). See fleet_runner._watchdog.
+VERIFY_STATUSES = ("verifying",)
+
+# Upper bound (seconds) the watchdog will tolerate a frozen status.json while a worker
+# claims to be in a blocking acceptance eval. The SWE-bench docker eval is capped at
+# ~1300s (swe_check timeout) inside swe_check.py; we add generous margin so a legitimately
+# slow eval is never killed, but a TRULY wedged Edge that merely happens to be mid-verify
+# is still eventually recovered. Beyond this, a non-advancing status is treated as wedged.
+EVAL_STALL_CEILING_S = 1500
+
 
 class FleetContextLost(Exception):
     """Raised when the underlying Edge/CDP context died mid-run (wedged or hard-reset).
@@ -215,7 +228,7 @@ class RelayWorker:
     def __init__(self, goal, name, max_turns=1000, dwell_s=4.0,
                  per_turn_timeout_s=240, max_no_progress=3, max_verify_attempts=3,
                  refuter=False, max_refute=2, plan_mode=False, review_lenses=None,
-                 max_transient=10, transcript_dir=None, run_id=""):
+                 max_transient=10, transcript_dir=None, run_id="", busy_writer=None):
         self.page = None
         self.drv = None
         text, checks, cwd = goal_fields(goal)
@@ -249,6 +262,13 @@ class RelayWorker:
         self.last_verify_detail = ""
         self._pending_checks = []     # acceptance.Check specs left to run this gate
         self._active_check = None     # the Check currently running (non-blocking)
+        # When a BLOCKING acceptance eval (run_all_blocking) is about to run, this is set to
+        # the time by which it must finish; surfaced into status.json so the watchdog can tell
+        # "main thread legitimately busy with a bounded eval" from "Edge wedged". 0 = idle.
+        # _busy_writer (if wired) flushes a status snapshot right BEFORE the blocking call so
+        # the marker reaches disk even though on_tick can't fire during the blocked sweep.
+        self.eval_busy_until = 0.0
+        self._busy_writer = busy_writer
         # operator B refuter (spec 4B): an independent reviewer on a candidate DONE.
         self.refuter = refuter
         self.max_refute = max_refute
@@ -473,6 +493,36 @@ class RelayWorker:
         self.status = "ready"
         return True
 
+    def _eval_ceiling_s(self):
+        """The longest a single blocking acceptance eval should take = the max per-check
+        timeout (the SWE-bench shell check carries timeout=1300), bounded by the global
+        EVAL_STALL_CEILING_S so a mis-set huge timeout can't disable the failsafe."""
+        try:
+            mx = max((float(c.get("timeout", 0) or 0) for c in (self.checks or [])),
+                     default=0.0)
+        except Exception:
+            mx = 0.0
+        # use the larger of the configured check timeout and the global ceiling, so the
+        # watchdog never kills an eval that is still within its own declared budget.
+        return max(EVAL_STALL_CEILING_S, mx)
+
+    def _mark_eval_busy(self):
+        """Enter a blocking acceptance eval: set status 'verifying' + a busy deadline and
+        flush a status snapshot so the watchdog sees the marker before the sweep freezes."""
+        self.eval_busy_until = time.time() + self._eval_ceiling_s()
+        # show 'verifying' on the card too (and so a status-only watchdog read also defers).
+        if self.status not in TERMINAL:
+            self.status = "verifying"
+        if self._busy_writer is not None:
+            try:
+                self._busy_writer()
+            except Exception:
+                pass
+
+    def _clear_eval_busy(self):
+        """Leave a blocking acceptance eval (always, even on failure/exception)."""
+        self.eval_busy_until = 0.0
+
     def _salvage_via_checks(self):
         """Last-chance acceptance salvage for the EXHAUSTION paths (spec 3-3 verify gate,
         applied where the worker would otherwise go terminal NON-done). Before burning a
@@ -487,7 +537,16 @@ class RelayWorker:
         salvaged (status is now terminal DONE)."""
         if not self.checks:
             return False
-        passed, detail = run_all_blocking(self.checks, cwd=self.cwd)
+        # run_all_blocking is SYNCHRONOUS and can take the full eval timeout (SWE-bench docker
+        # eval ~1300s). It freezes the single-thread round-robin -> status.json stops advancing.
+        # Mark this worker "verifying" with a deadline and flush a snapshot BEFORE blocking, so
+        # the watchdog sees a legitimate bounded eval (not a wedged Edge) and waits instead of
+        # hard-resetting. Cleared in finally so the marker never sticks past the eval.
+        self._mark_eval_busy()
+        try:
+            passed, detail = run_all_blocking(self.checks, cwd=self.cwd)
+        finally:
+            self._clear_eval_busy()
         self.last_verify_detail = detail
         if not passed:
             return False
@@ -738,7 +797,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     plan_mode=False, review_lenses=None, max_transient=10,
                     autoscale=False, autoscale_max=None, asc_box=None,
                     autoscale_per_tab_mb=700, autoscale_headroom_mb=1400,
-                    transcript_dir=None, run_id=""):
+                    transcript_dir=None, run_id="", busy_writer=None):
     """Drive len(goals) autonomous relays in parallel to completion, but never with
     more than `max_concurrent` tabs open at once (defaults to what free RAM allows).
     A goal's tab is opened only when a slot frees and CLOSED the moment it finishes.
@@ -760,10 +819,22 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     # one, derive a run-unique id from the start time so resumes/rounds don't collide.
     if not run_id:
         run_id = "r%x" % int(time.time())
+    # busy_writer: flush a status snapshot on demand. A worker calls this right before a
+    # BLOCKING acceptance eval freezes the sweep, so its 'verifying'/eval-busy marker reaches
+    # status.json BEFORE on_tick stops firing -- the watchdog then waits instead of resetting.
+    # Caller may inject one; otherwise default to on_tick (which writes the snapshot).
+    if busy_writer is None and on_tick is not None:
+        def busy_writer():
+            try:
+                on_tick(workers)
+            except Exception:
+                pass
+
     workers = [RelayWorker(g, "w%d" % i, max_turns=max_turns,
                            refuter=refuter, max_refute=max_refute, plan_mode=plan_mode,
                            review_lenses=review_lenses, max_transient=max_transient,
-                           transcript_dir=transcript_dir, run_id=run_id)
+                           transcript_dir=transcript_dir, run_id=run_id,
+                           busy_writer=busy_writer)
                for i, g in enumerate(goals)]
     pending = list(workers)            # FIFO queue of not-yet-attached workers
 
@@ -797,7 +868,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 nw = RelayWorker(item, "w%d" % len(workers), max_turns=max_turns,
                                  refuter=refuter, max_refute=max_refute,
                                  plan_mode=plan_mode, review_lenses=review_lenses,
-                                 max_transient=max_transient)
+                                 max_transient=max_transient, busy_writer=busy_writer)
                 workers.append(nw)
                 if item.get("priority"):
                     pending.insert(0, nw)
