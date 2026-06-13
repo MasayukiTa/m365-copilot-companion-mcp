@@ -74,8 +74,15 @@ def main():
     try:
         wsl(script, timeout=1200)
     except subprocess.TimeoutExpired:
+        # CRITICAL leak fix: the eval container is a DETACHED `docker run`, so killing the
+        # wsl.exe subprocess on timeout does NOT stop it -- it keeps running (observed:
+        # sympy-11870 container "Up 33 minutes" after its turn was long over), holding RAM
+        # and inflating the vhdx on C:. _cleanup_docker force-removes the (still-running)
+        # container + image, so the timeout path must call it too (the success/fail paths
+        # already do).
         print("EVAL_TIMEOUT: the evaluation took too long. Likely the image pull is slow; "
               "your patch may still be fine. Keep it and it will be re-checked.")
+        _cleanup_docker(inst, run_id)
         return 1
 
     # 4. read the report (swebench writes companion.<run_id>.json into /root/swe)
