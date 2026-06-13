@@ -37,6 +37,8 @@ import sys
 import tempfile
 import time
 
+from relay.test_feedback import summarize_test_failure
+
 # How much stdout/stderr to feed back to Copilot on failure. Enough to see the real
 # error (a traceback tail / a failing assertion) without flooding the next turn.
 MAX_DETAIL = 1500
@@ -45,6 +47,13 @@ MAX_DETAIL = 1500
 _PROC_TYPES = frozenset({"shell", "pytest", "python", "py_compile", "import_smoke"})
 _FILE_TYPES = frozenset({"file_exists", "file_contains"})
 VALID_TYPES = _PROC_TYPES | _FILE_TYPES
+
+# Check types whose failure output is a TEST-RUNNER log (pytest / unittest / sympy). For these
+# we distill the raw output into a structured summary (failing tests + error + file:line) via
+# summarize_test_failure, the same sharp feedback the SWE-bench gate gives. shell/file checks
+# emit arbitrary output, so they keep the raw tail. py_compile/import_smoke produce plain
+# tracebacks, not a test-runner summary, so they also keep the raw tail.
+_TEST_RUNNER_TYPES = frozenset({"pytest", "python"})
 
 
 def normalize_checks(spec):
@@ -227,7 +236,22 @@ class Check:
         if not stdout_ok:
             why.append("stdout missing %r" % str(expect_stdout)[:60])
         combined = (err + ("\n" + out if out else "")) if err else out
-        return (False, "[%s] FAIL (%s)\n%s" % (desc, "; ".join(why), _tail(combined)))
+        body = self._failure_detail(combined)
+        return (False, "[%s] FAIL (%s)\n%s" % (desc, "; ".join(why), body))
+
+    def _failure_detail(self, combined):
+        """Body of a FAIL detail. For test-runner checks (pytest/python) distill the output
+        into a structured summary (failing tests + error + file:line); for everything else,
+        and whenever the summary comes back empty, fall back to the raw output tail. The
+        summary itself is exception-safe, so this can never break the verify flow."""
+        if self.type in _TEST_RUNNER_TYPES:
+            try:
+                summary = summarize_test_failure(combined)
+            except Exception:
+                summary = ""
+            if summary and summary.strip():
+                return _tail(summary)
+        return _tail(combined)
 
     # -- instant filesystem checks -------------------------------------------
     def _abs(self, path):
