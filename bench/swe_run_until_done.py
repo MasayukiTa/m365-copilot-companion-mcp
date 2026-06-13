@@ -11,14 +11,23 @@ Robustness:
     still-unresolved instances, with the improved swe_check feedback gate doing the verification.
 
   python bench/swe_run_until_done.py [<instance_id> ...]              (legacy pilot default)
-  python bench/swe_run_until_done.py --targets-file batch_12.txt \
-      --goals .fleet/swe/goals_batch12.jsonl --setup batch \
-      --max-rounds 6 --max-concurrent 2 --chunk 4
+  python bench/swe_run_until_done.py --targets-file batch_30_remaining.txt \
+      --goals .fleet/swe/goals_batch30.jsonl --setup batch \
+      --max-rounds 6 --max-concurrent 2
 
-Batching: with --chunk K (default = len(targets), i.e. one fleet pass over all goals), the
-orchestrator processes the remaining instances K at a time per fleet launch. Small chunks
-isolate one bad instance's blast radius and bound RAM (2 Edge tabs * K queued goals), at the
-cost of more fleet relaunches. Recommended for a 12-instance/2-tab run: --chunk 4.
+CONTINUOUS CAPACITY-AWARE ADMISSION (2026-06-14): the DEFAULT is now NO batch barrier --
+all remaining instances of a round are handed to ONE fleet launch (--chunk 0, the default),
+and relay_fleet admits them continuously as capacity (disk+RAM) allows: when a job finishes
+it frees its tab (RAM) and its eval's disk (swe_check cleanup), and the next queued goal is
+admitted on the very next sweep. There is no "finish all K then start the next K" wait. The
+fleet's disk floor (env SWE_DISK_FLOOR_GB, default 6) keeps C: from being driven under a
+reserved level; --max-concurrent / autoscale bound RAM. A `round` here is only a RETRY pass
+over the still-unresolved instances, NOT an intra-batch barrier.
+
+--chunk K (opt-in, default 0 = all remaining at once) still exists to isolate one bad
+instance's blast radius / hard-bound RAM by processing K at a time, at the cost of reintroducing
+a per-chunk barrier and more fleet relaunches. Prefer the default (0) -- the disk+RAM admission
+gate already bounds resource use without a barrier.
 """
 import argparse
 import atexit
@@ -56,7 +65,9 @@ def parse_args():
     ap.add_argument("--max-rounds", type=int, default=6)
     ap.add_argument("--max-concurrent", type=int, default=2)
     ap.add_argument("--chunk", type=int, default=0,
-                    help="instances per fleet launch (0 = all remaining at once)")
+                    help="instances per fleet launch (0 = all remaining at once, the DEFAULT: "
+                         "continuous capacity-aware admission, NO batch barrier). K>0 reinstates "
+                         "a per-chunk barrier to isolate blast radius -- prefer 0.")
     a = ap.parse_args()
     tgt = list(a.targets)
     if a.targets_file:
@@ -223,6 +234,11 @@ def run_round(insts):
     kill_all_fleet()
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "ascii:replace"
+    # The fleet reads SWE_DISK_FLOOR_GB (reserved C: free) for its disk admission gate; it is
+    # inherited through `env` (dict(os.environ)). Surface it once so the run log shows the floor
+    # the continuous-admission gate is holding. Default mirrors relay_fleet.DEFAULT_DISK_FLOOR_GB.
+    log("fleet admission: continuous (no batch barrier); disk floor SWE_DISK_FLOOR_GB=%s GB, "
+        "C: free now %.1f GB" % (env.get("SWE_DISK_FLOOR_GB", "6"), free_gb()))
     # repo-affinity ENV-keep disk guard: swe_check honors SWE_KEEP_ENV=1 to preserve the warm
     # `sweb.env.*` image between same-repo instances (avoids the ~20min cold rebuild). But if C:
     # is running low we must NOT keep extra images -- force the legacy full-prune path by

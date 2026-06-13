@@ -151,8 +151,50 @@ def auto_concurrency(n_goals, per_tab_mb=700, headroom_mb=2048, hard_cap=4):
     return max(1, min(n_goals, fit, hard_cap))
 
 
+# ── Disk-floor admission (capacity-aware continuous admission, 2026-06-14) ────────────────
+# The fleet now admits jobs as fast as BOTH RAM and DISK allow, draining and re-admitting
+# continuously (no batch barrier). The disk constraint matters because each SWE-bench eval
+# pulls/builds Docker images and, on a timeout, can leave a detached container inflating the
+# C: vhdx. So before opening a new tab we make sure C: free will stay above a reserved floor
+# even after the new job's eval consumes its disk budget. The floor is USER-CONFIGURABLE
+# (env SWE_DISK_FLOOR_GB, default 6; the cockpit can write it later) because "always keep N GB
+# free" is a safety/usability win for normal use too, not just the bench.
+DEFAULT_DISK_FLOOR_GB = float(os.environ.get("SWE_DISK_FLOOR_GB", "6"))
+# Disk a single not-yet-started eval is assumed it MIGHT consume before its own per-instance
+# cleanup reclaims it (image layers etc.). Used to look ahead so we never open a tab that would
+# itself push C: under the floor. Env-tunable; conservative default. 0 disables look-ahead.
+DEFAULT_EVAL_DISK_GB = float(os.environ.get("SWE_EVAL_DISK_GB", "0"))
+
+
+def free_disk_gb(path=None):
+    """Free space (GB) on the drive holding `path` (default: this repo's drive, i.e. C:).
+    Best-effort; returns a large number on failure so a read error never WRONGLY blocks
+    admission (RAM gate + per-instance disk guard in swe_check still protect the floor)."""
+    try:
+        import shutil
+        if not path:
+            path = os.path.splitdrive(os.path.abspath(__file__))[0] + os.sep
+        return shutil.disk_usage(path).free / (1024.0 ** 3)
+    except Exception:
+        return 1e6
+
+
+def disk_admission_ok(floor_gb=None, eval_gb=None, free_gb=None):
+    """Pure predicate: may we open ANOTHER eval-bearing tab without risking the disk floor?
+
+    OK iff (current C: free) - (disk the new job's eval might use) >= floor. Splitting the
+    free-reading out (`free_gb`) keeps this unit-testable with a mocked disk. A non-positive
+    floor disables the gate (always OK) -- normal (non-bench) use may not want a disk reserve."""
+    floor = DEFAULT_DISK_FLOOR_GB if floor_gb is None else float(floor_gb)
+    if floor <= 0:
+        return True
+    eval_gb = DEFAULT_EVAL_DISK_GB if eval_gb is None else float(eval_gb)
+    free = free_disk_gb() if free_gb is None else float(free_gb)
+    return (free - eval_gb) >= floor
+
+
 def ram_target_cap(open_now, current_cap, ceiling,
-                   per_tab_mb=700, headroom_mb=1400, floor=1):
+                   per_tab_mb=700, headroom_mb=1400, floor=1, up_margin_mb=0):
     """RAM-aware live concurrency target (autoscale). Recomputed each loop: given how many
     tabs are open right now (their RAM is already reflected in the free-RAM reading) and how
     much headroom we want to keep for the user, how many tabs can we SUSTAIN?
@@ -161,6 +203,14 @@ def ram_target_cap(open_now, current_cap, ceiling,
       * scale UP by at most ONE tab per call (gentle ramp -- re-evaluated every loop), and
       * allow scale DOWN to the raw target immediately. A lower cap is SOFT: running tabs are
         not killed, we just stop opening new ones until some finish (natural drain).
+
+    ANTI-THRASH HYSTERESIS (`up_margin_mb`): with up_margin_mb=0 (default, back-compat) the up-
+    and down-thresholds coincide, so a fleet can oscillate 1<->3 every loop: open a tab -> RAM
+    tightens just under the line -> drain target -> tab closes -> RAM frees just over the line
+    -> ramp up -> repeat. A positive `up_margin_mb` makes the UP step require that much EXTRA
+    free RAM beyond what merely holding the new tab needs, so once the fleet settles at a water
+    level a small RAM jitter no longer pushes it back up -- it HOLDS. The DOWN side is unchanged
+    (drains immediately on a real deficit), so the dead-band only damps needless growth.
     Clamped to [floor, ceiling] (ceiling = the user's configured maximum)."""
     avail = avail_phys_mb()
     # FLOOR division (not int(): truncates toward zero) so a RAM *deficit* yields a negative
@@ -168,7 +218,12 @@ def ram_target_cap(open_now, current_cap, ceiling,
     raw = open_now + int((avail - headroom_mb) // per_tab_mb)
     target = max(floor, min(raw, ceiling))
     if target > current_cap:
-        target = min(current_cap + 1, ceiling)      # ramp up one tab at a time
+        # hysteresis: only ramp UP if there is up_margin_mb of headroom ON TOP of the per-tab
+        # budget the new tab needs (a dead-band so jitter around the line doesn't re-grow us).
+        if (avail - headroom_mb - up_margin_mb) >= per_tab_mb:
+            target = min(current_cap + 1, ceiling)   # ramp up one tab at a time
+        else:
+            target = current_cap                     # in the dead-band -> HOLD, don't grow
     return target
 
 
@@ -851,13 +906,28 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     plan_mode=False, review_lenses=None, max_transient=10,
                     autoscale=False, autoscale_max=None, asc_box=None,
                     autoscale_per_tab_mb=700, autoscale_headroom_mb=1400,
+                    autoscale_up_margin_mb=0,
+                    disk_floor_gb=None, eval_disk_gb=None, disk_box=None,
                     transcript_dir=None, run_id="", busy_writer=None):
     """Drive len(goals) autonomous relays in parallel to completion, but never with
     more than `max_concurrent` tabs open at once (defaults to what free RAM allows).
     A goal's tab is opened only when a slot frees and CLOSED the moment it finishes.
 
+    CONTINUOUS CAPACITY-AWARE ADMISSION (2026-06-14): this is a single continuous flow --
+    pass ALL goals at once and they are admitted as fast as capacity allows, NOT in batches.
+    A job that finishes frees its slot (tab RAM + the eval's disk via swe_check cleanup) and
+    the NEXT queued goal is admitted on the very next sweep -- there is no batch barrier (the
+    orchestrator no longer waits for a chunk of K to all finish before launching the next K).
+    Admission is gated on BOTH resources:
+      * RAM -- the live cap (mc_box / autoscale ram_target_cap), and
+      * DISK -- C: free must stay above a reserved floor (disk_floor_gb, user-configurable via
+        env SWE_DISK_FLOOR_GB or disk_box) even after the new job's eval consumes its budget.
+    Both must be satisfied to open a tab, so a job is never admitted in a way that would either
+    exhaust RAM (the Edge-crash failure mode) or push C: under the floor.
+
     `mc_box`, if given, is a 1-element list whose value is read EACH loop -- so the
     cockpit can raise/lower the live concurrency cap mid-run (set_maxtabs command).
+    `disk_box`, if given, is a 1-element list with the live disk floor in GB (cockpit-settable).
 
     Returns a list of {name, goal, outcome, turns, reason} in goal order. `on_tick`
     (workers) is called after each round-robin sweep -- use it to log live progress."""
@@ -884,6 +954,11 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             except Exception:
                 pass
 
+    # live disk floor (GB): cockpit can change it mid-run via disk_box; otherwise the launch
+    # value (env SWE_DISK_FLOOR_GB default) applies. <=0 disables the disk gate.
+    if disk_box is None:
+        disk_box = [DEFAULT_DISK_FLOOR_GB if disk_floor_gb is None else float(disk_floor_gb)]
+
     workers = [RelayWorker(g, "w%d" % i, max_turns=max_turns,
                            refuter=refuter, max_refute=max_refute, plan_mode=plan_mode,
                            review_lenses=review_lenses, max_transient=max_transient,
@@ -893,6 +968,12 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     pending = list(workers)            # FIFO queue of not-yet-attached workers
 
     def _active_open():
+        # Every worker that still HOLDS a tab counts toward the concurrency cap -- including
+        # ones in 'verifying'/'refuting' (a bounded eval / review still occupies its tab + the
+        # disk its eval used). Counting on `status not in TERMINAL` already includes those
+        # non-terminal statuses; the explicit list documents the intent and guards against a
+        # future status that should also count. So open_tabs and the cap never diverge: a
+        # verifying tab keeps its slot until it reaches a TERMINAL state and close() runs.
         return sum(1 for w in workers
                    if w.page is not None and w.status not in TERMINAL)
 
@@ -943,10 +1024,18 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         if asc_on:
             mc_box[0] = ram_target_cap(_active_open(), mc_box[0], max(1, ceiling),
                                        per_tab_mb=autoscale_per_tab_mb,
-                                       headroom_mb=autoscale_headroom_mb)
+                                       headroom_mb=autoscale_headroom_mb,
+                                       up_margin_mb=autoscale_up_margin_mb)
 
-        # fill free tab slots from the pending queue (memory-bounded, live cap)
+        # fill free tab slots from the pending queue. ADMISSION is gated on BOTH (a) the live
+        # RAM cap (mc_box / autoscale) and (b) the DISK floor: open a new eval-bearing tab only
+        # if C: free will stay above the reserved floor after this job's eval (disk_admission_ok
+        # looks ahead by eval_disk_gb). If disk is tight we STOP admitting this sweep and let
+        # running jobs finish + release their disk (swe_check cleanup), then re-admit -- the
+        # continuous-flow drain. A non-positive floor disables the disk gate (normal use).
         while pending and _active_open() < max(1, mc_box[0]):
+            if not disk_admission_ok(floor_gb=disk_box[0], eval_gb=eval_disk_gb):
+                break                  # disk floor would be breached -> defer admission
             w = pending.pop(0)
             if w.status in TERMINAL:   # (shouldn't happen, but be safe)
                 continue

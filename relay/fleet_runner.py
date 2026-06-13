@@ -95,6 +95,30 @@ def settings_autoscale():
     return on, ceiling
 
 
+def _settings_float(key, default):
+    """Read a float `key=N` from the shared settings.txt (cockpit-written). Falls back."""
+    try:
+        p = _settings_path()
+        if os.path.isfile(p):
+            for ln in open(p, encoding="utf-8-sig").read().splitlines():
+                if ln.startswith(key + "="):
+                    return float(ln.split("=", 1)[1].strip())
+    except Exception:
+        pass
+    return default
+
+
+def settings_disk_floor(default=None):
+    """The user's reserved C: free-space floor in GB (`disk_floor_gb=N` in settings.txt).
+    This is the 'always keep N GB free on C:' admission reserve -- a new eval-bearing tab is
+    not opened if it would push C: under this. Falls back to env SWE_DISK_FLOOR_GB (default 6)
+    via relay_fleet.DEFAULT_DISK_FLOOR_GB when unset, so the cockpit/env/CLI form one chain."""
+    if default is None:
+        from relay.relay_fleet import DEFAULT_DISK_FLOOR_GB
+        default = DEFAULT_DISK_FLOOR_GB
+    return _settings_float("disk_floor_gb", default)
+
+
 def _repo_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -122,9 +146,13 @@ def _read_goals(args):
     return goals
 
 
-def _snapshot(workers, started, total, max_concurrent=0):
+def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0):
+    from relay.relay_fleet import free_disk_gb
     total = len(workers)        # dynamic: goals can be added mid-run (native chat queue)
     done = sum(1 for w in workers if w.status in TERMINAL)
+    # open_tabs counts EVERY worker still holding a tab, including 'verifying'/'refuting' (their
+    # bounded eval/review still occupies the slot) -- so open_tabs and max_concurrent never
+    # diverge and the cockpit's N/M display is accurate.
     open_tabs = sum(1 for w in workers if getattr(w, "page", None) is not None)
     return {
         "started": started,
@@ -135,6 +163,9 @@ def _snapshot(workers, started, total, max_concurrent=0):
         "max_concurrent": max_concurrent,
         "open_tabs": open_tabs,
         "avail_mb": round(avail_phys_mb()),
+        # disk admission reserve + current C: free, so the cockpit can show the disk gate.
+        "disk_floor_gb": round(disk_floor_gb, 1),
+        "free_disk_gb": round(free_disk_gb(), 1),
         "workers": [{
             "name": w.name,
             "goal": w.goal,
@@ -251,10 +282,15 @@ def main():
                     help="hard cap on turns per goal (default 1000 ~ unlimited)")
     ap.add_argument("--max-concurrent", type=int, default=-1,
                     help="max tabs open at once. -1 = use the cockpit's setting "
-                         "(maxtabs, default 3); 0 = auto from free RAM; N = exactly N")
+                         "(maxtabs, default 3); 0 = auto from free RAM; N = exactly N. "
+                         "PRECEDENCE: an EXPLICIT --max-concurrent N (>=0) is the hard launch "
+                         "cap and DISABLES autoscale (CLI wins over settings.txt autoscale=1); "
+                         "use --autoscale to opt back in. With --max-concurrent left at -1, "
+                         "the cockpit's autoscale=1 / --autoscale governs the live cap.")
     ap.add_argument("--autoscale", action="store_true",
                     help="RAM-aware dynamic concurrency: grow tabs while free RAM allows, "
-                         "drain when it gets tight (ramps up 1 tab/loop, never past the cap)")
+                         "drain when it gets tight (ramps up 1 tab/loop, never past the cap). "
+                         "Re-enables autoscale even when --max-concurrent is given explicitly.")
     ap.add_argument("--autoscale-default", type=int, default=-1,
                     help="autoscale START/default tabs. -1 = the cockpit's maxtabs setting")
     ap.add_argument("--autoscale-max", type=int, default=-1,
@@ -263,6 +299,20 @@ def main():
                     help="free RAM (MB) to keep for the user's other work while autoscaling")
     ap.add_argument("--autoscale-per-tab-mb", type=int, default=700,
                     help="RAM budget (MB) assumed per Copilot tab when autoscaling")
+    ap.add_argument("--autoscale-up-margin-mb", type=int, default=700,
+                    help="anti-thrash dead-band (MB): extra free RAM required ON TOP of the "
+                         "per-tab budget before autoscale ramps UP one more tab. Stops the "
+                         "1<->3 oscillation -- once settled at a water level, small RAM jitter "
+                         "no longer re-grows the cap. 0 = legacy (no dead-band)")
+    ap.add_argument("--disk-floor-gb", type=float, default=-1.0,
+                    help="reserved C: free space (GB) to always keep: a new eval-bearing tab "
+                         "is admitted only if C: free stays >= this floor after the job's eval. "
+                         "-1 = use the cockpit's disk_floor_gb / env SWE_DISK_FLOOR_GB "
+                         "(default 6). 0 = disable the disk gate (normal, non-bench use).")
+    ap.add_argument("--eval-disk-gb", type=float, default=-1.0,
+                    help="disk (GB) a single not-yet-started eval is assumed it might consume; "
+                         "subtracted when looking ahead so a tab is never opened that would "
+                         "itself push C: under the floor. -1 = env SWE_EVAL_DISK_GB (default 0).")
     ap.add_argument("--poll-s", type=float, default=1.0)
     ap.add_argument("--stall-s", type=int, default=150,
                     help="if status.json stops updating this long while running, the "
@@ -317,6 +367,9 @@ def main():
     except Exception:
         pass
 
+    # an EXPLICIT --max-concurrent (>=0) was given on the CLI (not the -1 "ask the cockpit"
+    # sentinel). Used for the precedence rule below: CLI wins over settings.txt autoscale.
+    explicit_mc = args.max_concurrent >= 0
     if args.max_concurrent > 0:
         max_conc = args.max_concurrent
     elif args.max_concurrent == 0:
@@ -325,11 +378,16 @@ def main():
         max_conc = min(settings_maxtabs(), len(goals))    # -1 = the cockpit's setting (default 3)
 
     # ── autoscale: the user picks a DEFAULT (start) and a CEILING (上限). Start at the
-    # default, shrink when RAM is tight, grow toward the ceiling when RAM is free. Enabled
-    # by --autoscale or the cockpit's `autoscale=1`. Backward-compatible: `maxtabs` is the
+    # default, shrink when RAM is tight, grow toward the ceiling when RAM is free.
+    #
+    # PRECEDENCE (clarified 2026-06-14): an explicit --max-concurrent N is a HARD launch cap
+    # and the CLI wins -- it DISABLES settings.txt autoscale=1, so `--max-concurrent 2` always
+    # means exactly 2 even if the cockpit left autoscale on. Passing --autoscale re-enables it
+    # (explicit opt-in beats the disable). With --max-concurrent left at -1, the cockpit's
+    # autoscale=1 / --autoscale governs the live cap (backward-compatible). `maxtabs` is the
     # default/start (and, with autoscale off, the fixed cap as before).
     set_on, set_ceiling = settings_autoscale()
-    autoscale = args.autoscale or set_on
+    autoscale = args.autoscale or (set_on and not explicit_mc)
     asc_default = args.autoscale_default if args.autoscale_default > 0 else settings_maxtabs()
     if args.autoscale_max > 0:
         asc_ceiling = args.autoscale_max
@@ -343,6 +401,16 @@ def main():
     if autoscale:
         max_conc = asc_default                               # START at the user's default
     asc_box = [1 if autoscale else 0, asc_ceiling]           # live [on, ceiling] for the cockpit
+
+    # ── disk-floor admission reserve: keep this many GB free on C: at all times. Resolution
+    # chain (most explicit wins): CLI --disk-floor-gb >= 0 -> cockpit settings.txt
+    # disk_floor_gb -> env SWE_DISK_FLOOR_GB (default 6). A 0 floor disables the disk gate.
+    if args.disk_floor_gb >= 0:
+        disk_floor = args.disk_floor_gb
+    else:
+        disk_floor = settings_disk_floor()
+    disk_box = [disk_floor]                                   # live disk floor (cockpit-settable)
+    eval_disk = None if args.eval_disk_gb < 0 else args.eval_disk_gb
     commands_path = os.path.join(args.state_dir, "commands.json")
 
     # write an initial 'launching' snapshot so the cockpit shows something at once
@@ -366,6 +434,11 @@ def main():
     else:
         print("       max %d tab(s) open at once (close-on-done frees each); free RAM now %d MB"
               % (max_conc, round(avail_phys_mb())))
+    if disk_floor > 0:
+        from relay.relay_fleet import free_disk_gb
+        print("       disk floor: keep >= %.1f GB free on C: (free now %.1f GB); "
+              "admission gated on disk+RAM, continuous (no batch barrier)"
+              % (disk_floor, free_disk_gb()))
 
     mc_box = [max_conc]                # live concurrency cap (cockpit can change it)
     add_box = []                       # goals queued mid-run (native chat / cockpit)
@@ -391,6 +464,13 @@ def main():
                         asc_box[1] = n
                     else:
                         mc_box[0] = n
+                except Exception:
+                    pass
+            # live disk-floor control: {"set_disk_floor_gb": 8} -- the reserved C: free space
+            # the admission gate keeps. 0 disables the disk gate. Takes effect next sweep.
+            if "set_disk_floor_gb" in cmd:
+                try:
+                    disk_box[0] = max(0.0, float(cmd["set_disk_floor_gb"]))
                 except Exception:
                     pass
             # live autoscale control from the cockpit: {"set_autoscale": {"on":1,"max":4,
@@ -472,7 +552,8 @@ def main():
         _drain_commands(workers)
         _register_convs(workers)
         try:
-            _write_atomic(status_path, _snapshot(workers, started, len(goals), mc_box[0]))
+            _write_atomic(status_path, _snapshot(workers, started, len(goals), mc_box[0],
+                                                 disk_floor_gb=disk_box[0]))
         except Exception:
             pass
         _print_table(workers, len(goals))
@@ -565,6 +646,9 @@ def main():
                                       asc_box=asc_box,
                                       autoscale_per_tab_mb=args.autoscale_per_tab_mb,
                                       autoscale_headroom_mb=args.autoscale_headroom_mb,
+                                      autoscale_up_margin_mb=args.autoscale_up_margin_mb,
+                                      disk_floor_gb=disk_floor, eval_disk_gb=eval_disk,
+                                      disk_box=disk_box,
                                       transcript_dir=transcripts_dir,
                                       run_id="r%x_a%d" % (int(started), attempt))
             for r in res:
