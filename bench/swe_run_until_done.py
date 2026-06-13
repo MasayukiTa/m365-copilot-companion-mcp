@@ -22,6 +22,7 @@ cost of more fleet relaunches. Recommended for a 12-instance/2-tab run: --chunk 
 """
 import argparse
 import atexit
+import ctypes
 import json
 import os
 import re
@@ -36,6 +37,10 @@ SWEDIR = os.path.join(REPO, ".fleet", "swe")
 LOG = os.path.join(SWEDIR, "run_until_done.log")
 LOCK = os.path.join(SWEDIR, "run_until_done.lock")
 STATUS = os.path.join(REPO, ".fleet", "status.json")
+DISTRO = "MiasmaLab"
+# repo-affinity ENV-keep disk floor: if C: free drops below this, stop preserving ENV images
+# (the SWE_KEEP_ENV optimization) and fall back to full prune so the disk never starves.
+KEEP_ENV_FLOOR_GB = float(os.environ.get("SWE_KEEP_ENV_FLOOR_GB", "6"))
 
 
 def parse_args():
@@ -109,6 +114,62 @@ def kill_all_fleet():
         time.sleep(2)
 
 
+def free_gb(path="C:\\"):
+    free = ctypes.c_ulonglong(0)
+    ctypes.windll.kernel32.GetDiskFreeSpaceExW(
+        ctypes.c_wchar_p(path), None, None, ctypes.byref(free))
+    return free.value / (1024 ** 3)
+
+
+def repo_key(inst):
+    """Derive the SWE-bench repo owner+name from an instance id so we can group by repo.
+
+    instance ids are '<owner>__<name>-<number>', e.g. 'django__django-11999',
+    'scikit-learn__scikit-learn-13584', 'sphinx-doc__sphinx-8595'. The repo is the part
+    before the trailing '-<number>'. Used ONLY for scheduling (sort -> chunk) so same-repo
+    instances run back-to-back and reuse a warm ENV image; it never affects grading.
+    """
+    return inst.rsplit("-", 1)[0]
+
+
+def affinity_order(insts):
+    """Stable-sort instances so same-repo ids are contiguous (repo-affinity scheduling).
+
+    Stable on the original order within each repo, so behavior is deterministic and the only
+    effect is clustering repos together -- the 2nd+ instance of a repo in a chunk reuses the
+    warm `sweb.env.*` image instead of triggering a ~20min cold build.
+    """
+    return sorted(insts, key=repo_key)
+
+
+def cleanup_repo_env(repo_k):
+    """Remove that repo's cached SWE-bench ENV images (`sweb.env.*`) at a repo boundary.
+
+    With SWE_KEEP_ENV=1, swe_check keeps the per-version ENV image alive across instances of a
+    repo (so retries/next instance are warm). Once we move to the NEXT repo, the prior repo's
+    ENV images are dead weight on C:, so the orchestrator sweeps them here. Best-effort; never
+    raises. swebench ENV image naming: sweb.env.x86_64.<hash>:latest (not repo-tagged), so we
+    cannot target a single repo precisely -- instead we sweep ALL dangling/unused env images,
+    which is safe because the just-finished repo's env images are now unreferenced and a still-
+    needed image (none, since we're between repos) would simply be rebuilt on demand.
+    """
+    if os.environ.get("SWE_KEEP_ENV") != "1":
+        return  # nothing was kept; swe_check already pruned per-instance
+    script = (
+        "pgrep dockerd >/dev/null 2>&1 || (nohup dockerd >/tmp/dockerd.log 2>&1 & sleep 8); "
+        # remove env images then prune dangling layers; both no-ops if already gone
+        "docker images 'sweb.env.*' -q | sort -u | xargs -r docker rmi -f 2>/dev/null || true; "
+        "docker image prune -f 2>/dev/null || true")
+    try:
+        subprocess.run(["wsl.exe", "-d", DISTRO, "sh", "-c", script],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=180)
+        log("repo boundary: swept ENV images after repo '%s' (free C: %.1f GB)"
+            % (repo_k, free_gb()))
+    except Exception as exc:
+        log("repo boundary ENV sweep error (non-fatal): %s" % exc)
+
+
 def acquire_lock():
     if os.path.exists(LOCK):
         try:
@@ -162,6 +223,19 @@ def run_round(insts):
     kill_all_fleet()
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "ascii:replace"
+    # repo-affinity ENV-keep disk guard: swe_check honors SWE_KEEP_ENV=1 to preserve the warm
+    # `sweb.env.*` image between same-repo instances (avoids the ~20min cold rebuild). But if C:
+    # is running low we must NOT keep extra images -- force the legacy full-prune path by
+    # dropping SWE_KEEP_ENV for this fleet launch. The parent may have exported SWE_KEEP_ENV=1.
+    if env.get("SWE_KEEP_ENV") == "1":
+        fg = free_gb()
+        if fg < KEEP_ENV_FLOOR_GB:
+            env.pop("SWE_KEEP_ENV", None)
+            log("disk guard: C: %.1f GB < floor %.1f GB -> disabling SWE_KEEP_ENV "
+                "(full prune) for this chunk" % (fg, KEEP_ENV_FLOOR_GB))
+        else:
+            log("SWE_KEEP_ENV=1 active (C: %.1f GB >= floor %.1f GB): ENV image kept "
+                "across same-repo instances" % (fg, KEEP_ENV_FLOOR_GB))
     p = subprocess.Popen(
         # ユーザー指示によりターン無制限 (2026-06-13): max-turns=0 = unlimited
         [VENVPY, "-m", "relay.fleet_runner", "--goals-file", GOALS,
@@ -189,16 +263,32 @@ def main():
     remaining = list(TARGETS)
     for rnd in range(1, MAX_ROUNDS + 1):
         log("--- round %d/%d remaining=%d ---" % (rnd, MAX_ROUNDS, len(remaining)))
-        # process the remaining instances chunk-by-chunk; status.json reflects only the
-        # most-recent fleet launch, so collect each chunk's resolved set right after it ends.
+        # repo-affinity: order the remaining instances so same-repo ids are contiguous BEFORE
+        # chunking. With ENV-keep on, the 2nd+ same-repo instance in a chunk reuses the warm
+        # `sweb.env.*` image -> no ~20min cold rebuild. Pure scheduling; grading is unchanged.
+        ordered = affinity_order(remaining)
+        if ordered != remaining:
+            log("  repo-affinity order: %s" % ordered)
+        # process the instances chunk-by-chunk; status.json reflects only the most-recent fleet
+        # launch, so collect each chunk's resolved set right after it ends.
         round_done = set()
-        for ci, chunk in enumerate(chunks(remaining, ARGS.chunk), 1):
-            log("  chunk %d: %s" % (ci, chunk))
+        prev_repo = None
+        for ci, chunk in enumerate(chunks(ordered, ARGS.chunk), 1):
+            # repo boundary: if this chunk starts a NEW repo, sweep the previous repo's kept ENV
+            # images (only does work when SWE_KEEP_ENV=1; otherwise swe_check already pruned).
+            chunk_repo = repo_key(chunk[0]) if chunk else None
+            if prev_repo is not None and chunk_repo != prev_repo:
+                cleanup_repo_env(prev_repo)
+            log("  chunk %d (repo=%s): %s" % (ci, chunk_repo, chunk))
             run_round(chunk)
             done = resolved_set()
             for i in [x for x in chunk if x in done]:
                 log("RESOLVED: %s" % i)
                 round_done.add(i)
+            prev_repo = repo_key(chunk[-1]) if chunk else prev_repo
+        # end of round: sweep the final repo's ENV images so they do not persist between rounds.
+        if prev_repo is not None:
+            cleanup_repo_env(prev_repo)
         remaining = [i for i in remaining if i not in round_done]
         if not remaining:
             log("=== ALL TARGETS RESOLVED in %d round(s) ===" % rnd)
