@@ -313,13 +313,21 @@ class CockpitWindow : Window
         _headBar.Padding = new Thickness(26, 20, 18, 8);
         DockPanel.SetDock(_headBar, Dock.Top);
 
-        var headRow = new DockPanel();
+        // Header = a 2-column Grid, NOT a DockPanel. The old DockPanel let the (un-clipped)
+        // title StackPanel render its long subtitle PAST its arrange rect, sliding under the
+        // right-docked control band whose opaque themed backgrounds then painted over the text
+        // -> the subtitle "disappeared" exactly where it reached the RAM controls. A Grid gives
+        // the title column a HARD bounded width (star) next to the auto-width controls, so the
+        // two never overlap; the subtitle is then trimmed with an ellipsis instead of hidden.
+        var headRow = new Grid();
+        headRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        headRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
-        // right controls: max-tabs stepper, language, theme
+        // right controls: autoscale group, language, theme
         var ctrls = new StackPanel();
         ctrls.Orientation = Orientation.Horizontal;
         ctrls.VerticalAlignment = VerticalAlignment.Top;
-        DockPanel.SetDock(ctrls, Dock.Right);
+        ctrls.HorizontalAlignment = HorizontalAlignment.Right;
 
         ctrls.Children.Add(AutoscaleControls());
         _langBtn = IconButton("translate", 18);
@@ -330,19 +338,29 @@ class CockpitWindow : Window
         _themeBtn.ToolTip = "テーマ (ダーク/ライト)";
         _themeBtn.Click += delegate { _dark = !_dark; SaveKey("dark", _dark ? "1" : "0"); ApplyTheme(); };
         ctrls.Children.Add(_themeBtn);
+        Grid.SetColumn(ctrls, 1);
         headRow.Children.Add(ctrls);
 
-        // title block (icon + title + sub)
-        var titleRow = new StackPanel(); titleRow.Orientation = Orientation.Horizontal;
+        // title block (icon + title + sub) -- lives in the bounded star column (col 0).
+        var titleRow = new DockPanel { LastChildFill = true };
+        titleRow.VerticalAlignment = VerticalAlignment.Center;
+        // a 12px gutter keeps the title text from butting right up against the controls.
+        titleRow.Margin = new Thickness(0, 0, 12, 0);
         _iconHost = new ContentControl(); _iconHost.VerticalAlignment = VerticalAlignment.Center;
         _iconHost.Margin = new Thickness(0, 0, 10, 0);
+        DockPanel.SetDock(_iconHost, Dock.Left);
         titleRow.Children.Add(_iconHost);
         var titleCol = new StackPanel();
         _header = new TextBlock(); _header.FontSize = 22; _header.FontWeight = FontWeights.SemiBold;
+        _header.TextTrimming = TextTrimming.CharacterEllipsis; _header.TextWrapping = TextWrapping.NoWrap;
         titleCol.Children.Add(_header);
+        // The subtitle is the long one: trim with an ellipsis at the column edge so it stops
+        // CLEANLY before the controls instead of being overpainted by them.
         _sub = new TextBlock(); _sub.FontSize = 13; _sub.Margin = new Thickness(0, 4, 0, 0);
+        _sub.TextTrimming = TextTrimming.CharacterEllipsis; _sub.TextWrapping = TextWrapping.NoWrap;
         titleCol.Children.Add(_sub);
-        titleRow.Children.Add(titleCol);
+        titleRow.Children.Add(titleCol);   // fills remaining width of col 0 -> bounds the text
+        Grid.SetColumn(titleRow, 0);
         headRow.Children.Add(titleRow);
 
         _headBar.Child = headRow;
@@ -1112,6 +1130,8 @@ class CockpitWindow : Window
         if (running && updated > 0 && (NowUnix() - updated) > 8)
             state = T("running") + " — " + T("stale");
         _sub.Text = state + "    " + T("elapsed") + " " + Fmt(elapsed) + "    " + total + " " + T("goals") + mem;
+        // The subtitle is ellipsis-trimmed at the column edge; expose the full text on hover.
+        _sub.ToolTip = _sub.Text;
     }
 
     static string Fmt(double sec)
