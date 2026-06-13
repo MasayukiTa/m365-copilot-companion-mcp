@@ -232,10 +232,13 @@ class RelayWorker:
         # to send (a slow django/sympy turn). This is NOT a failure -- send() waited and
         # then deferred -- so it does NOT consume the transient budget and does NOT count a
         # turn. A separate, very generous cap only catches a turn that LITERALLY never stops
-        # generating (a wedged page); each wait is already ~minutes inside send(). This was
-        # the W0 django__django-14730 STUCK: send-into-generating burned the 10x transient
-        # budget into STUCK even though the turn was merely slow.
-        self.max_gen_waits = 30
+        # generating (a wedged page). In the fleet path each send() only waits ~2s before
+        # deferring (non-blocking), so the patience is realized ACROSS deferrals: ~60 waits
+        # x (2s check + ~2s cooldown) ~= 240s total, matching the single-relay 240s window
+        # while keeping the round-robin sweep responsive. This was the W0
+        # django__django-14730 STUCK: send-into-generating burned the 10x transient budget
+        # into STUCK even though the turn was merely slow.
+        self.max_gen_waits = 60
         self.gen_waits = 0
         # goal-delivery recovery: when the agent reports it never received the task, RE-SEND
         # the goal verbatim instead of a generic retry nudge (bounded to avoid a resend loop).
@@ -384,7 +387,15 @@ class RelayWorker:
         try:
             self._count_before = self.drv._answers().count()
             self.drv._count_before = self._count_before
-            self.drv.send(self.job)
+            # FLEET PATH MUST NOT BLOCK: the round-robin advances every worker from one
+            # thread, so send() may not sit in _wait_generation_idle for the full ~4min
+            # (it would freeze the sweep -> status.json goes stale "フリート停止?" and, at
+            # concurrency>1, starves the OTHER workers). Pass a SHORT gen-wait so send()
+            # just checks "is the turn still generating?", waits ~2s, and if so raises
+            # GenerationInProgress immediately -> we defer and the sweep moves on. The
+            # generous total patience is realized across max_gen_waits deferrals, not one
+            # blocking call. (run_relay's single-conversation path keeps the full 240s.)
+            self.drv.send(self.job, gen_wait_s=2.0)
         except ConversationClosed as e:
             # The target tab/composer is gone (conversation ended). Retrying a dead
             # target can never succeed -- terminal, skip the transient budget entirely
@@ -398,8 +409,8 @@ class RelayWorker:
             return
         except GenerationInProgress as e:
             # The PREVIOUS turn was still generating when send() tried to submit (a slow
-            # django/sympy turn). send() already WAITED its generous window and then
-            # deferred -- this is NOT a failure. Reschedule the SAME job WITHOUT consuming
+            # django/sympy turn). send() did a SHORT (~2s) non-blocking check and deferred
+            # -- this is NOT a failure. Reschedule the SAME job WITHOUT consuming
             # a turn OR the transient budget (the W0 django__django-14730 fix: a slow turn
             # must never be counted into STUCK). A separate, very generous cap only catches
             # a turn that LITERALLY never stops generating.

@@ -38,7 +38,9 @@ class FailSendDriver:
     def _answers(self):
         return _Loc()
 
-    def send(self, text):
+    def send(self, text, gen_wait_s=None):
+        # mirror the real CopilotWebDriver.send signature (the fleet path now passes a
+        # short gen_wait_s so generation-wait deferral stays non-blocking).
         self.calls += 1
         if self.calls <= self.fails:
             raise RuntimeError("send boom %d" % self.calls)
