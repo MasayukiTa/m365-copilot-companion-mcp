@@ -342,18 +342,54 @@ class CopilotWebDriver:
     def _answers(self):
         return self.page.locator(COPILOT_SELECTORS["assistant_msg"])
 
+    # Priority-ordered candidates: exact labels first, broad fallbacks LAST. The broad
+    # substring candidates can match imposters -- observed live 2026-06-13: the
+    # composer-expand toggle is labeled "[Copilot にメッセージを送信する] 入力ボックスを
+    # 展開します", which contains 送信 and got clicked instead of Send, so every send
+    # no-opped. _send_button() therefore (a) tries candidates in this order, not DOM
+    # order, and (b) rejects any node whose label matches the imposter blacklist.
+    SEND_BUTTON_CANDIDATES = (
+        'button[aria-label="送信"]',
+        'button[aria-label="Send"]',
+        'button[data-testid="send-button"]',
+        'button[name="send" i]',
+        'button[aria-label*="送信"]',
+        'button[aria-label*="Send" i]',
+        'button[type="submit"]',
+    )
+    SEND_LABEL_BLACKLIST = ("展開", "折りたた", "expand", "collapse",
+                            "ディクテーション", "dictation", "ボイス", "voice",
+                            "メッセージを送信する]")  # the expand toggle's bracketed prefix
+
     def _send_button(self):
-        # Prefer a VISIBLE match: the send-button selector is now multi-candidate and
-        # could, in principle, also match an off-screen/hidden node in some layout; the
-        # visible one is the live composer button. Falls back to the bare .first if the
-        # :visible variant matches nothing (older Playwright / odd state).
-        try:
-            vis = self.page.locator(COPILOT_SELECTORS["send_button"]).locator("visible=true")
-            if vis.count() > 0:
-                return vis.first
-        except Exception:
-            pass
-        return self.page.locator(COPILOT_SELECTORS["send_button"]).first
+        """First ACCEPTABLE send button by candidate priority, or None.
+
+        Iterates SEND_BUTTON_CANDIDATES in order (exact labels first); within a
+        candidate prefers visible matches; rejects imposters whose aria-label hits
+        SEND_LABEL_BLACKLIST. Returns None when nothing acceptable matches -- callers
+        treat that as 'not armed yet'."""
+        for cand in self.SEND_BUTTON_CANDIDATES:
+            try:
+                loc = self.page.locator(cand)
+                try:
+                    vis = loc.locator("visible=true")
+                    if vis.count() > 0:
+                        loc = vis
+                except Exception:
+                    pass
+                for i in range(min(loc.count(), 5)):
+                    el = loc.nth(i)
+                    try:
+                        label = (el.get_attribute("aria-label") or "")
+                    except Exception:
+                        label = ""
+                    low = label.lower()
+                    if any(b.lower() in low for b in self.SEND_LABEL_BLACKLIST):
+                        continue
+                    return el
+            except Exception:
+                continue
+        return None
 
     def _page_alive(self) -> bool:
         """Cheap liveness probe: is the tab still open AND the composer still present?
@@ -407,7 +443,7 @@ class CopilotWebDriver:
             # re-poll on a short cadence and also let is_visible/is_enabled settle.
             try:
                 btn = self._send_button()
-                if btn.count() > 0 and btn.is_visible() and btn.is_enabled():
+                if btn is not None and btn.is_visible() and btn.is_enabled():
                     return True
             except Exception:
                 pass
@@ -559,7 +595,9 @@ class CopilotWebDriver:
             self.page.keyboard.insert_text(one_line)
             if self._wait_send_armed(timeout_s=12.0):
                 try:
-                    self._send_button().click(force=True, timeout=4000)
+                    btn = self._send_button()
+                    if btn is not None:
+                        btn.click(force=True, timeout=4000)
                 except Exception:
                     pass
             else:
@@ -592,7 +630,7 @@ class CopilotWebDriver:
                 if i and i % 4 == 0:             # ~every 1s, nudge a re-armed Send button
                     try:
                         btn = self._send_button()
-                        if btn.count() > 0 and btn.is_enabled():
+                        if btn is not None and btn.is_enabled():
                             btn.click(force=True, timeout=2000)
                     except Exception:
                         pass
