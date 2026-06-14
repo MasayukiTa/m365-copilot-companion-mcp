@@ -179,7 +179,29 @@ def free_disk_gb(path=None):
         return 1e6
 
 
-def disk_admission_ok(floor_gb=None, eval_gb=None, free_gb=None, building=0):
+# Per-repo cold-build disk estimate (GB) -- the test's PER-UNIT WEIGHT in the disk gate. A 7GB
+# matplotlib/sklearn build must reserve far more than a 2GB requests one, so the gate can safely
+# PAIR light evals while keeping heavy ones solo, instead of one flat number that's wrong for both.
+# Heavy values are tuned to ~(typical C: free - floor) so exactly ONE admits and a 2nd is blocked.
+_REPO_EVAL_GB = {
+    "matplotlib__matplotlib": 6.0, "scikit-learn__scikit-learn": 6.0, "astropy__astropy": 6.0,
+    "django__django": 3.0, "sympy__sympy": 3.0, "sphinx-doc__sphinx": 3.0,
+    "pydata__xarray": 3.0, "pytest-dev__pytest": 2.5, "pylint-dev__pylint": 2.5,
+    "psf__requests": 2.0, "pallets__flask": 2.0,
+}
+DEFAULT_REPO_EVAL_GB = 5.0
+EVAL_DISK_PERREPO = os.environ.get("SWE_EVAL_DISK_PERREPO") == "1"
+
+
+def repo_eval_gb(inst):
+    """Per-instance cold-build disk estimate by repo (see _REPO_EVAL_GB). inst is '<owner>__<name>
+    -<n>' or a worktree path embedding it."""
+    inst = (inst or "").split("wt_")[-1]
+    repo = inst.rsplit("-", 1)[0]
+    return _REPO_EVAL_GB.get(repo, DEFAULT_REPO_EVAL_GB)
+
+
+def disk_admission_ok(floor_gb=None, eval_gb=None, free_gb=None, building=0, reserve_gb=None):
     """Pure predicate: may we open ANOTHER eval-bearing tab without risking the disk floor?
 
     OK iff (current C: free) - (disk this new eval AND every already-admitted eval still in
@@ -196,8 +218,11 @@ def disk_admission_ok(floor_gb=None, eval_gb=None, free_gb=None, building=0):
     floor = DEFAULT_DISK_FLOOR_GB if floor_gb is None else float(floor_gb)
     if floor <= 0:
         return True
-    eval_gb = DEFAULT_EVAL_DISK_GB if eval_gb is None else float(eval_gb)
     free = free_disk_gb() if free_gb is None else float(free_gb)
+    if reserve_gb is not None:
+        # caller computed an exact reserve (e.g. per-repo sum of in-flight + new build sizes)
+        return (free - float(reserve_gb)) >= floor
+    eval_gb = DEFAULT_EVAL_DISK_GB if eval_gb is None else float(eval_gb)
     reserve = eval_gb * (1 + max(0, int(building)))
     return (free - reserve) >= floor
 
@@ -1045,8 +1070,18 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         while pending and _active_open() < max(1, mc_box[0]):
             # reserve disk for THIS eval plus every already-open eval still in flight, so we never
             # admit N tabs that look fine individually but crash C: once their builds run at once.
-            if not disk_admission_ok(floor_gb=disk_box[0], eval_gb=eval_disk_gb,
-                                     building=_active_open()):
+            # PER-REPO mode sizes the reserve by each instance's actual build weight (matplotlib 6GB
+            # vs requests 2GB) so light evals pair while heavy ones stay solo; flat mode uses one
+            # eval_disk_gb for all. _active_open() counts just-attached tabs this sweep, so the
+            # reserve grows as we admit -> same-sweep over-admission is prevented either way.
+            if EVAL_DISK_PERREPO:
+                open_ws = [x for x in workers if x.page is not None and x.status not in TERMINAL]
+                reserve = sum(repo_eval_gb(x.cwd) for x in open_ws) + repo_eval_gb(pending[0].cwd)
+                admit_ok = disk_admission_ok(floor_gb=disk_box[0], reserve_gb=reserve)
+            else:
+                admit_ok = disk_admission_ok(floor_gb=disk_box[0], eval_gb=eval_disk_gb,
+                                             building=_active_open())
+            if not admit_ok:
                 break                  # disk floor would be breached -> defer admission
             w = pending.pop(0)
             if w.status in TERMINAL:   # (shouldn't happen, but be safe)
