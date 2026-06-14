@@ -184,13 +184,20 @@ def free_disk_gb(path=None):
 # PAIR light evals while keeping heavy ones solo, instead of one flat number that's wrong for both.
 # Heavy values are tuned to ~(typical C: free - floor) so exactly ONE admits and a 2nd is blocked.
 _REPO_EVAL_GB = {
-    "matplotlib__matplotlib": 6.0, "scikit-learn__scikit-learn": 6.0, "astropy__astropy": 6.0,
+    "matplotlib__matplotlib": 7.0, "scikit-learn__scikit-learn": 7.0, "astropy__astropy": 7.0,
     "django__django": 3.0, "sympy__sympy": 3.0, "sphinx-doc__sphinx": 3.0,
     "pydata__xarray": 3.0, "pytest-dev__pytest": 2.5, "pylint-dev__pylint": 2.5,
     "psf__requests": 2.0, "pallets__flask": 2.0,
 }
 DEFAULT_REPO_EVAL_GB = 5.0
 EVAL_DISK_PERREPO = os.environ.get("SWE_EVAL_DISK_PERREPO") == "1"
+# Crash-avoidance hard minimum for the per-repo gate (GB). A single heavy build (matplotlib ~7GB)
+# legitimately dips C: BELOW the 6GB soft floor and recovers -- conc1 relies on that. So the
+# per-repo gate reserves the SUM of all concurrent builds (in-flight + new) against this lower
+# hard minimum, not the soft floor: heavy admits solo (12-7=5 >= 3), heavy+heavy or heavy+medium
+# is blocked (would dip under 3GB, the level near which concurrent builds corrupted WSL), light
+# evals still pair. Env-tunable.
+PERREPO_HARD_MIN_GB = float(os.environ.get("SWE_EVAL_HARD_MIN_GB", "3"))
 
 
 def repo_eval_gb(inst):
@@ -1075,9 +1082,14 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             # eval_disk_gb for all. _active_open() counts just-attached tabs this sweep, so the
             # reserve grows as we admit -> same-sweep over-admission is prevented either way.
             if EVAL_DISK_PERREPO:
+                # Reserve the SUM of all concurrent builds (in-flight + the one we're about to open)
+                # against the crash-avoidance HARD MIN (not the soft floor): a lone heavy build may
+                # dip under the soft floor and recover (so it admits solo: 12-7=5 >= 3), but a 2nd
+                # heavy / heavy+medium that would drag C: under the hard min is deferred; light evals
+                # pair. _active_open() counts just-attached tabs, so reserve grows within the sweep.
                 open_ws = [x for x in workers if x.page is not None and x.status not in TERMINAL]
                 reserve = sum(repo_eval_gb(x.cwd) for x in open_ws) + repo_eval_gb(pending[0].cwd)
-                admit_ok = disk_admission_ok(floor_gb=disk_box[0], reserve_gb=reserve)
+                admit_ok = disk_admission_ok(floor_gb=PERREPO_HARD_MIN_GB, reserve_gb=reserve)
             else:
                 admit_ok = disk_admission_ok(floor_gb=disk_box[0], eval_gb=eval_disk_gb,
                                              building=_active_open())
