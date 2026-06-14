@@ -237,6 +237,58 @@ TOOLS = (
     unlock, list_unlocked,
 )
 
+# --- Tool-gateway mode (MCP_TOOL_MAP=1) --------------------------------------------------
+# Some clients cap an agent at a fixed number of tools (Copilot Studio = 70). With 138 tools
+# the tail -- including unlock/list_unlocked -- is silently dropped, so a connected agent can
+# neither self-unlock nor reach the long-tail tools. In map mode we register a high-value
+# subset FIRST (critical + SWE/coding + common), with `call_tool` and `unlock` at the very
+# front so they survive truncation, plus one `call_tool(name, arguments)` gateway that invokes
+# ANY of the full tool set by name. Discovery: call_tool(name="") lists every tool with its
+# signature + summary. Default (env unset) registers all tools unchanged -- no behavior change
+# for full-capability clients (e.g. Claude Code).
+import inspect as _inspect
+
+_ALL_TOOLS = {getattr(t, "__name__", repr(t)): t for t in TOOLS}
+
+if os.environ.get("MCP_TOOL_MAP") == "1":
+    def call_tool(name: str = "", arguments: dict = None):
+        """Gateway to EVERY tool on this server. This client caps the tool list, so rarely-used
+        tools are reached through this one. Call call_tool(name="") to LIST all tools (name,
+        signature, one-line summary); then call_tool(name="<tool>", arguments={...}) to invoke
+        one. The target tool's own auth/unlock still applies.
+
+        Args:
+            name: the tool's name (e.g. "odbc_query"). Empty or "?" lists every tool.
+            arguments: dict of the target tool's keyword arguments.
+        """
+        if not name or name in ("?", "list", "*"):
+            rows = []
+            for n in sorted(_ALL_TOOLS):
+                fn = _ALL_TOOLS[n]
+                try:
+                    sig = str(_inspect.signature(fn))
+                except Exception:
+                    sig = "(...)"
+                doc = (getattr(fn, "__doc__", "") or "").strip().splitlines()
+                rows.append("%s%s -- %s" % (n, sig, doc[0] if doc else ""))
+            return "ALL %d tools (call via call_tool(name=..., arguments={...})):\n%s" % (
+                len(rows), "\n".join(rows))
+        fn = _ALL_TOOLS.get(name)
+        if fn is None:
+            return "[call_tool: unknown tool '%s'. Use call_tool(name='') to list all.]" % name
+        try:
+            return fn(**(arguments or {}))
+        except Exception as _e:
+            return "[call_tool %s error: %s: %s]" % (name, type(_e).__name__, _e)
+
+    # critical tools FIRST (survive a front-biased truncation), then fill from the existing order
+    _PRIORITY = (unlock, list_unlocked, call_tool, list_my_tools, env_info)
+    _pn = {getattr(f, "__name__", "") for f in _PRIORITY}
+    _rest = [t for t in TOOLS if getattr(t, "__name__", "") not in _pn]
+    _MAX = 70  # the client's hard tool-count cap
+    TOOLS = tuple(list(_PRIORITY) + _rest[: _MAX - len(_PRIORITY)])
+# ----------------------------------------------------------------------------------------
+
 for tool in TOOLS:
     mcp.tool()(register(tool))
 
