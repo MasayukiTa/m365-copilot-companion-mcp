@@ -72,7 +72,20 @@ def _make_eval_script_list_with_addopts(
     import os as _os
     _hb = _os.environ.get("SWE_HTTPBIN_URL", "")
     if _hb:
+        # 1) point the HTTPBIN_URL suite at httpbin.org (NOT an ip:port -- the scheme test reuses
+        #    the netloc for https://, so it must have no explicit port);
+        # 2) map httpbin.org -> the local gateway so http:// and hardcoded https://httpbin.org both
+        #    hit the local server; 3) trust the local self-signed cert for the https side.
+        _gw = _os.environ.get("SWE_HTTPBIN_GW", "172.17.0.1")
         cmds.insert(1, 'export HTTPBIN_URL="%s"' % _hb)
+        cmds.insert(1, 'grep -q " httpbin.org" /etc/hosts 2>/dev/null || echo "%s httpbin.org" >> /etc/hosts' % _gw)
+        _cert = _os.environ.get("SWE_HTTPBIN_CERT", "")
+        if _cert and _os.path.isfile(_cert):
+            import base64 as _b64
+            _b = _b64.b64encode(open(_cert, "rb").read()).decode()
+            cmds.insert(1, 'export CURL_CA_BUNDLE=/tmp/hbcert.pem')
+            cmds.insert(1, 'export REQUESTS_CA_BUNDLE=/tmp/hbcert.pem')
+            cmds.insert(1, 'echo %s | base64 -d > /tmp/hbcert.pem' % _b)
     return cmds
 
 
