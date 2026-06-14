@@ -68,7 +68,12 @@ def main():
     # here) hit a fast, reliable local server instead. The shim injects it into eval.sh; harmless
     # for repos that don't read it. Off unless SWE_HTTPBIN_URL is set.
     hb = os.environ.get("SWE_HTTPBIN_URL", "")
-    hb_export = ("export SWE_HTTPBIN_URL='" + hb + "'; ") if hb else ""
+    hbc = os.environ.get("SWE_HTTPBIN_CERT", "")
+    hb_export = ""
+    if hb:
+        hb_export = "export SWE_HTTPBIN_URL='" + hb + "'; "
+        if hbc:
+            hb_export += "export SWE_HTTPBIN_CERT='" + hbc + "'; "
     script = (
         "pgrep dockerd >/dev/null 2>&1 || (nohup dockerd >/tmp/dockerd.log 2>&1 & sleep 8); "
         "export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt; " + hb_export +
