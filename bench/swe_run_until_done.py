@@ -278,26 +278,33 @@ INFRA_SIGNALS = (
 def classify_failure(inst):
     """'infra' (eval-host failure -> retry) vs 'genuine' (real test failure -> investigate).
 
-    Reads the instance's most recent eval test_output. ABSENCE of any output is itself treated as
-    infra: the eval never produced a result, i.e. the host (WSL/docker/disk) failed before tests
-    ran -- exactly the 2026-06-14 WSL-corruption case where 6 instances false-failed."""
-    low = inst.lower()
+    The eval runs in WSL and writes its test_output under WSL `/root/swe/logs/run_evaluation/<run_id>
+    /companion/<inst>/test_output.txt` -- NOT the Windows-side logs/ dir (which is empty). So we read
+    the latest WSL test_output. A pytest result summary (passed/failed) means the eval ran -> the
+    non-resolve is a GENUINE test failure to investigate. Infra signals (getpwuid/ENOSPC/docker/OOM)
+    or NO output at all mean the host (WSL/docker/disk) failed before tests ran -> retry-worthy."""
+    # DETERMINISTIC path -- no shell glob (the Windows->wsl->sh layering swallowed `*`/`$()`), and
+    # no Windows logs/ (empty; the eval writes only to WSL). run_id mirrors swe_check exactly.
+    run_id = "agent_" + inst.replace("__", "_")
+    logp = "/root/swe/logs/run_evaluation/" + run_id + "/companion/" + inst + "/test_output.txt"
     blob = ""
     try:
-        import glob
-        cands = glob.glob("logs/run_evaluation/**/*%s*/**/test_output.txt" % low, recursive=True)
-        cands = [p for p in cands if os.path.isfile(p)]
-        if cands:
-            newest = max(cands, key=os.path.getmtime)
-            blob = open(newest, encoding="utf-8", errors="replace").read()
+        r = subprocess.run(["wsl.exe", "-d", DISTRO, "--", "cat", logp],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=30)
+        blob = r.stdout or ""
     except Exception:
         pass
-    if not blob.strip():
-        return "infra"   # eval produced nothing -> host failed before tests ran
     low_blob = blob.lower()
     if any(sig in low_blob for sig in INFRA_SIGNALS):
         return "infra"
-    return "genuine"     # eval ran, output present, no infra signal -> a real test failure
+    if not blob.strip():
+        return "infra"   # eval produced nothing -> host failed before tests ran
+    # pytest ran and reported a result -> the patch genuinely failed (or partially passed)
+    if (" failed" in low_blob or "failed " in low_blob or " passed" in low_blob
+            or "no tests ran" in low_blob):
+        return "genuine"
+    return "infra"       # output present but no recognizable test result -> treat as infra (retry)
 
 
 def setup_round(insts):
