@@ -35,6 +35,7 @@ import ctypes
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -207,6 +208,41 @@ def acquire_lock():
     atexit.register(lambda: os.path.exists(LOCK) and os.remove(LOCK))
 
 
+def release_worktrees(insts):
+    """Free the on-disk git worktrees for `insts` once they are resolved and out of `remaining`.
+
+    Each instance's worktree is a light checkout (~20-75MB) of a shared per-repo object store
+    (WORK/<repo>-main); removing it frees the working tree but keeps the shared objects other
+    instances still need. We do this at a round boundary for instances that just RESOLVED -- they
+    are dropped from `remaining`, so setup_round() will never re-stage them, making release safe.
+
+    Gated by SWE_KEEP_RESOLVED_WT=1 (opt-out): immediate data release is the right default for a
+    disk-tight benchmark grind, but "normal use" may want completed data kept, so it is
+    configurable. Best-effort; never raises -- a failed release just leaves a light dir behind.
+    """
+    if os.environ.get("SWE_KEEP_RESOLVED_WT") == "1" or not insts:
+        return
+    freed = 0
+    for inst in insts:
+        wt = os.path.join(WORK, "wt_" + inst)
+        if not os.path.isdir(wt):
+            continue
+        main = os.path.join(WORK, repo_key(inst) + "-main")
+        try:
+            if os.path.isdir(os.path.join(main, ".git")):
+                # `git worktree remove` drops the checkout AND its registration in one step.
+                subprocess.run(["git", "-C", main, "worktree", "remove", wt, "--force"],
+                               capture_output=True, text=True)
+            if os.path.isdir(wt):  # fallback if not a registered worktree (or remove failed)
+                shutil.rmtree(wt, ignore_errors=True)
+            if not os.path.isdir(wt):
+                freed += 1
+        except Exception:
+            pass
+    if freed:
+        log("released %d resolved worktree(s) (disk freed; shared object stores kept)" % freed)
+
+
 def resolved_set():
     try:
         d = json.load(open(STATUS, encoding="utf-8"))
@@ -315,6 +351,10 @@ def main():
         if prev_repo is not None:
             cleanup_repo_env(prev_repo)
         remaining = [i for i in remaining if i not in round_done]
+        # per-unit disk accounting: a resolved instance is dropped from `remaining` and will never
+        # be re-staged, so free its worktree now instead of letting all attempted checkouts pile up
+        # on C: for the whole run (opt-out via SWE_KEEP_RESOLVED_WT=1).
+        release_worktrees(list(round_done))
         if not remaining:
             log("=== ALL TARGETS RESOLVED in %d round(s) ===" % rnd)
             return
