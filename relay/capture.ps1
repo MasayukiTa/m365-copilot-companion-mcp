@@ -25,6 +25,7 @@ public class WinCap {
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT r, int size);
   [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
   public delegate bool EnumProc(IntPtr h, IntPtr l);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc e, IntPtr l);
@@ -57,8 +58,12 @@ function Capture-Hwnd($hwnd, $label, $path) {
   [WinCap]::ShowWindow($hwnd, 9) | Out-Null      # SW_RESTORE (un-minimize)
   [WinCap]::SetForegroundWindow($hwnd) | Out-Null
   Start-Sleep -Milliseconds 350
+  # Prefer the DWM EXTENDED FRAME BOUNDS (the actually-visible window) over GetWindowRect, which
+  # includes the invisible resize border (~7px/side) -> that border captured the desktop behind it.
   $r = New-Object WinCap+RECT
-  [WinCap]::GetWindowRect($hwnd, [ref]$r) | Out-Null
+  $sz = [System.Runtime.InteropServices.Marshal]::SizeOf([type]([WinCap+RECT]))
+  $hr = [WinCap]::DwmGetWindowAttribute($hwnd, 9, [ref]$r, $sz)   # 9 = DWMWA_EXTENDED_FRAME_BOUNDS
+  if ($hr -ne 0 -or ($r.Right - $r.Left) -le 0) { [WinCap]::GetWindowRect($hwnd, [ref]$r) | Out-Null }
   Capture-Rect $r.Left $r.Top ($r.Right - $r.Left) ($r.Bottom - $r.Top) $path
   Write-Output ("{0} {1}x{2} -> {3}" -f $label, ($r.Right-$r.Left), ($r.Bottom-$r.Top), $path)
 }
