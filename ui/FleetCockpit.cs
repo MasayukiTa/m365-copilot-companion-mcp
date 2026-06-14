@@ -1142,12 +1142,25 @@ class CockpitWindow : Window
         _sub.ToolTip = _sub.Text;
     }
 
+    // Roll seconds up through y/d/h/m/s so a long run reads "1h39m27s" / "1d1h1m1s" instead of
+    // an unbounded "99m27s". Show every unit from the highest non-zero down to seconds (so
+    // ordering is unambiguous). Month is intentionally omitted: its token would clash with
+    // minutes ('m') and its length is variable; a 365-day year is a good-enough cap for run time.
     static string Fmt(double sec)
     {
         if (sec < 0) sec = 0;
-        int s = (int)sec;
-        if (s < 60) return s + "s";
-        return (s / 60) + "m " + (s % 60) + "s";
+        long s = (long)sec;
+        long y = s / 31536000; s -= y * 31536000;
+        long d = s / 86400;    s -= d * 86400;
+        long h = s / 3600;     s -= h * 3600;
+        long m = s / 60;       s -= m * 60;
+        var sb = new StringBuilder();
+        if (y > 0)                  sb.Append(y).Append('y');
+        if (sb.Length > 0 || d > 0) sb.Append(d).Append('d');
+        if (sb.Length > 0 || h > 0) sb.Append(h).Append('h');
+        if (sb.Length > 0 || m > 0) sb.Append(m).Append('m');
+        sb.Append(s).Append('s');
+        return sb.ToString();
     }
 
     void RenderCards(Dictionary<string, object> root)
