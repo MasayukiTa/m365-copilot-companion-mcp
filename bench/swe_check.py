@@ -129,7 +129,18 @@ def main():
     # 5. NOT resolved -> surface the REAL test failure to the agent (failing test names +
     #    the assertion/traceback tail) so it can locate the exact missed spot. This is the
     #    feedback an Anthropic-grade harness gives; a generic "tests fail" leaves the agent blind.
-    feedback = _failure_feedback(run_id, inst)
+    #    Also split the failing tests into REGRESSIONS (PASS_TO_PASS now failing = the patch broke
+    #    a previously-passing behavior) vs still-unfixed FAIL_TO_PASS targets, so the agent gets
+    #    failure-mode-specific guidance instead of one undifferentiated list. Domain-general:
+    #    uses swebench's own per-test categorization, no per-instance knowledge.
+    # A/B control switch: SWE_NO_REGRESSION_FEEDBACK=1 suppresses the regression-vs-unfixed split
+    # so a control arm sees the OLD flat failing-test feedback. Lets us measure the generalization's
+    # effect on a fresh (non-holdout) instance set without code surgery between arms.
+    if os.environ.get("SWE_NO_REGRESSION_FEEDBACK") == "1":
+        regressions, unfixed = [], []
+    else:
+        regressions, unfixed = _verdict_breakdown(run_id, inst)
+    feedback = _failure_feedback(run_id, inst, regressions=regressions, unfixed=unfixed)
     print("NOT_RESOLVED: the hidden tests still fail with your current patch for %s. "
           "Find the real root cause in the SOURCE (do not edit tests) and fix it.\n%s"
           % (inst, feedback))
@@ -289,7 +300,57 @@ def _collection_error(err_tail, ptr, lines):
     return (err + (" at " + where if where else ""))[:240]
 
 
-def _failure_feedback(run_id, inst):
+def _verdict_breakdown(run_id, inst):
+    """From the official report.json, split the failing tests into REGRESSIONS (PASS_TO_PASS
+    tests that NOW fail -- the patch broke a behavior that passed before) vs still-UNFIXED
+    FAIL_TO_PASS targets (the original bug isn't fully fixed yet).
+
+    These are two distinct failure modes that need opposite responses: a regression means
+    "your change was too broad -- gate it on the condition the broken test exercises"; an
+    unfixed target means "keep digging for the root cause". swebench's report already labels
+    every test, so this is a pure read of its categorization -- fully domain-general, no
+    per-instance hints. Returns (regressions, unfixed); ([], []) if the report can't be read.
+    """
+    repp = "/root/swe/logs/run_evaluation/" + run_id + "/companion/" + inst + "/report.json"
+    r = wsl("cat " + repp + " 2>/dev/null", timeout=60, capture=True)
+    try:
+        d = json.loads(r.stdout or "")
+        ts = (d.get(inst) or {}).get("tests_status", {}) or {}
+        p2p = ts.get("PASS_TO_PASS", {}) or {}
+        f2p = ts.get("FAIL_TO_PASS", {}) or {}
+        return list(p2p.get("failure", []) or []), list(f2p.get("failure", []) or [])
+    except Exception:
+        return [], []
+
+
+def _mode_banner(regressions, unfixed):
+    """Headline that names the FAILURE MODE before the raw assertion detail. A regression and an
+    unfixed target need opposite fixes, so spell out which is which and what to do. This is the
+    generalization for the 'fixes the symptom but drops a config/branch behavior' miss class:
+    the agent is told a previously-passing test broke and instructed to gate its change on the
+    same condition that test exercises, rather than retrying blind against a flat failing list."""
+    out = []
+    if regressions:
+        out.append("!!! REGRESSION -- your patch BROKE %d test(s) that PASSED before your change:"
+                   % len(regressions))
+        out.extend("  " + t for t in regressions[:8])
+        if len(regressions) > 8:
+            out.append("  ... and %d more" % (len(regressions) - 8))
+        out.append("These are NOT the bug you are fixing -- your change altered behavior they rely "
+                   "on. For EACH broken test, open its SOURCE and see what input / config flag / "
+                   "option / branch it sets up, then make your fix CONDITIONAL so BOTH the new "
+                   "behavior AND these tests' expectations hold. Do not simply remove or invert "
+                   "behavior -- gate it on the same condition the test exercises.")
+    if unfixed:
+        out.append("Still-unfixed target test(s) (%d) -- the original bug is not fully fixed yet:"
+                   % len(unfixed))
+        out.extend("  " + t for t in unfixed[:8])
+        if len(unfixed) > 8:
+            out.append("  ... and %d more" % (len(unfixed) - 8))
+    return "\n".join(out)
+
+
+def _failure_feedback(run_id, inst, regressions=None, unfixed=None):
     """Extract failing test names + the last assertion/traceback from the swebench test log.
 
     Robust across the three test-runner output formats SWE-bench Lite repos use:
@@ -303,17 +364,20 @@ def _failure_feedback(run_id, inst):
     or assertion -- the agent retried blind. Parsing is wrapped so any error still yields a
     useful log tail rather than breaking the verify flow.
     """
+    banner = _mode_banner(regressions or [], unfixed or [])
     logp = "/root/swe/logs/run_evaluation/" + run_id + "/companion/" + inst + "/test_output.txt"
     r = wsl("cat " + logp + " 2>/dev/null", timeout=60, capture=True)
     log = r.stdout or ""
     if not log.strip():
-        return "(no test log captured; re-read the failing test and trace each code path it exercises.)"
+        tail = "(no test log captured; re-read the failing test and trace each code path it exercises.)"
+        return (banner + "\n" + tail) if banner else tail
     log = re.sub(r"\x1b\[[0-9;]*m", "", log)  # strip ANSI color codes pytest emits
     try:
-        return _parse_failure_log(log)
+        detail = _parse_failure_log(log)
     except Exception as exc:  # never let feedback parsing break the verify flow
-        tail = [ln for ln in log.splitlines() if ln.strip()][-25:]
-        return ("--- TEST FAILURE (raw tail; parser error: %s) ---\n%s" % (exc, "\n".join(tail)))
+        t = [ln for ln in log.splitlines() if ln.strip()][-25:]
+        detail = "--- TEST FAILURE (raw tail; parser error: %s) ---\n%s" % (exc, "\n".join(t))
+    return (banner + "\n" + detail) if banner else detail
 
 
 def _parse_failure_log(log):
