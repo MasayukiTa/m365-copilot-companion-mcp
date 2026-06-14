@@ -1077,25 +1077,34 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         while pending and _active_open() < max(1, mc_box[0]):
             # reserve disk for THIS eval plus every already-open eval still in flight, so we never
             # admit N tabs that look fine individually but crash C: once their builds run at once.
-            # PER-REPO mode sizes the reserve by each instance's actual build weight (matplotlib 6GB
+            # PER-REPO mode sizes the reserve by each instance's actual build weight (matplotlib 7GB
             # vs requests 2GB) so light evals pair while heavy ones stay solo; flat mode uses one
             # eval_disk_gb for all. _active_open() counts just-attached tabs this sweep, so the
             # reserve grows as we admit -> same-sweep over-admission is prevented either way.
             if EVAL_DISK_PERREPO:
                 # Reserve the SUM of all concurrent builds (in-flight + the one we're about to open)
                 # against the crash-avoidance HARD MIN (not the soft floor): a lone heavy build may
-                # dip under the soft floor and recover (so it admits solo: 12-7=5 >= 3), but a 2nd
-                # heavy / heavy+medium that would drag C: under the hard min is deferred; light evals
-                # pair. _active_open() counts just-attached tabs, so reserve grows within the sweep.
+                # dip under the soft floor and recover (admits solo: 13-7=6 >= 3), but a 2nd heavy
+                # that would drag C: under the hard min is deferred; light evals pair.
+                # SKIP-AHEAD: scan the queue for the FIRST job that fits alongside the in-flight
+                # builds, instead of only testing the head -> a light eval (requests 2GB) behind a
+                # heavy queue-head (sklearn 7GB) can still pair rather than waiting for the head.
                 open_ws = [x for x in workers if x.page is not None and x.status not in TERMINAL]
-                reserve = sum(repo_eval_gb(x.cwd) for x in open_ws) + repo_eval_gb(pending[0].cwd)
-                admit_ok = disk_admission_ok(floor_gb=PERREPO_HARD_MIN_GB, reserve_gb=reserve)
+                base = sum(repo_eval_gb(x.cwd) for x in open_ws)
+                pick = -1
+                for i, p in enumerate(pending):
+                    if disk_admission_ok(floor_gb=PERREPO_HARD_MIN_GB,
+                                         reserve_gb=base + repo_eval_gb(p.cwd)):
+                        pick = i
+                        break
+                if pick < 0:
+                    break              # nothing in the queue fits the remaining disk this sweep
+                w = pending.pop(pick)
             else:
-                admit_ok = disk_admission_ok(floor_gb=disk_box[0], eval_gb=eval_disk_gb,
-                                             building=_active_open())
-            if not admit_ok:
-                break                  # disk floor would be breached -> defer admission
-            w = pending.pop(0)
+                if not disk_admission_ok(floor_gb=disk_box[0], eval_gb=eval_disk_gb,
+                                         building=_active_open()):
+                    break              # disk floor would be breached -> defer admission
+                w = pending.pop(0)
             if w.status in TERMINAL:   # (shouldn't happen, but be safe)
                 continue
             ok = w.attach(context, agent_url)
