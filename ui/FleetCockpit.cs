@@ -183,6 +183,8 @@ class CockpitWindow : Window
         if (k == "retry_note") return ja ? "再試行は走行中のみ反映されます" : "Retry only applies while a run is live";
         if (k == "autoretry") return ja ? "自動再試行" : "Auto-retry";
         if (k == "cap") return ja ? "上限" : "cap";
+        if (k == "to_history") return ja ? "履歴へ" : "To history";
+        if (k == "all_to_history") return ja ? "すべて履歴へ" : "All to history";
         if (k == "eta") return ja ? "完了予測" : "ETA";
         if (k == "eta_in") return ja ? "あと" : "in";
         if (k == "eta_calc") return ja ? "計測中…" : "estimating…";
@@ -1576,6 +1578,15 @@ class CockpitWindow : Window
                 if (IsTerminalWorker(w)) n++;
         var head = new DockPanel();
         head.Margin = new Thickness(8, 16, 8, 4);
+        var all = new Button();
+        all.Content = T("all_to_history");
+        all.Cursor = Cursors.Hand; all.BorderThickness = new Thickness(1);
+        all.Background = BtnBg; all.Foreground = Fg; all.BorderBrush = Border;
+        all.Padding = new Thickness(10, 2, 10, 2); all.FontSize = 12;
+        all.ToolTip = _lang == 0 ? "完了をすべて履歴へ移動" : "Move all completed to history";
+        all.Click += delegate { ArchiveAllTerminal(); };
+        DockPanel.SetDock(all, Dock.Right);
+        head.Children.Add(all);
         var t = new TextBlock();
         t.Text = (_lang == 0 ? "完了 — " : "Completed — ") + n + (_lang == 0 ? " 件（このラン）" : " (this run)");
         t.Foreground = Muted; t.FontSize = 12.5; t.VerticalAlignment = VerticalAlignment.Center;
@@ -1704,12 +1715,27 @@ class CockpitWindow : Window
         turns.VerticalAlignment = VerticalAlignment.Center;
         turns.Margin = new Thickness(0, 0, 10, 0);
         right.Children.Add(turns);
-        if (closed || terminal)
+        if (closed)
         {
             var rel = new TextBlock();
             rel.Text = T("released");
             rel.Foreground = Muted; rel.FontSize = 12; rel.VerticalAlignment = VerticalAlignment.Center;
             right.Children.Add(rel);
+        }
+        else if (terminal)
+        {
+            // finished card -> a working button that moves it to HISTORY client-side (the old
+            // "解放済" text was a dead end; this needs no live fleet).
+            var arch = new Button();
+            var al = new TextBlock { Text = "→ " + T("to_history"), Foreground = Fg, FontSize = 12 };
+            arch.Content = al;
+            arch.Cursor = Cursors.Hand; arch.BorderThickness = new Thickness(1);
+            arch.Background = BtnBg; arch.BorderBrush = Border; arch.Foreground = Fg;
+            arch.Padding = new Thickness(8, 2, 10, 2);
+            arch.ToolTip = _lang == 0 ? "このカードを履歴へ移動" : "Move this card to history";
+            var wt = w;
+            arch.Click += delegate { ArchiveAndHide(wt); };
+            right.Children.Add(arch);
         }
         else
         {
@@ -1718,9 +1744,18 @@ class CockpitWindow : Window
             relBtn.Cursor = Cursors.Hand; relBtn.BorderThickness = new Thickness(1);
             relBtn.Background = BtnBg; relBtn.BorderBrush = Border; relBtn.Foreground = Fg;
             relBtn.Padding = new Thickness(8, 2, 10, 2);
-            relBtn.ToolTip = _lang == 0 ? "このタスクを停止してタブを解放" : "Stop this task and release its tab";
-            string nm = name;
-            relBtn.Click += delegate { RequestClose(nm); };
+            relBtn.ToolTip = _lang == 0 ? "このタスクを停止してタブを解放（fleet 停止中ならカードを片付け）"
+                                        : "Stop this task and release its tab (clears the card if the fleet is stopped)";
+            string nm = name; var wt = w;
+            relBtn.Click += delegate {
+                RequestClose(nm);
+                // No live fleet to consume the close command (status went stale) -> clear it now so
+                // a frozen worker (e.g. a verifying tab left by a stopped run) doesn't stick forever.
+                if (_lastRoot != null
+                    && (!_lastRoot.ContainsKey("running") || Convert.ToBoolean(_lastRoot["running"]))
+                    && (NowUnix() - Dbl(_lastRoot, "updated")) > 8)
+                    ArchiveAndHide(wt);
+            };
             right.Children.Add(relBtn);
         }
         DockPanel.SetDock(right, Dock.Right);
@@ -2332,5 +2367,36 @@ class CockpitWindow : Window
             added = true;
         }
         if (added) SaveHistory();
+    }
+
+    // Client-side archive of ONE worker into the persisted history + hide its card. Unlike the
+    // per-worker 解放 (which writes commands.json and needs a LIVE fleet to consume it), this works
+    // with the fleet stopped -- so a finished or stale card can be moved to history any time.
+    void _archiveOne(Dictionary<string, object> w)
+    {
+        if (w == null) return;
+        string started = _lastRoot != null ? S(_lastRoot, "started") : "";
+        string key = started + "#" + S(w, "name");
+        if (!_archivedKeys.Contains(key))
+        {
+            _archivedKeys.Add(key);
+            var e = new Dictionary<string, object>();
+            e["key"] = key; e["goal"] = S(w, "goal"); e["status"] = S(w, "status");
+            e["conv_title"] = S(w, "conv_title"); e["outcome"] = S(w, "outcome");
+            e["conv_url"] = S(w, "conv_url"); e["turn"] = I(w, "turn"); e["seq"] = _history.Count;
+            _history.Add(e);
+        }
+        _hiddenKeys.Add(WorkerKey(started, w));
+    }
+
+    void ArchiveAndHide(Dictionary<string, object> w) { _archiveOne(w); SaveHistory(); SaveHidden(); ForceRender(); }
+
+    // Bulk: move every TERMINAL worker currently shown into history (the 完了-divider button).
+    void ArchiveAllTerminal()
+    {
+        if (_toolbarShown == null) return;
+        foreach (Dictionary<string, object> w in new List<Dictionary<string, object>>(_toolbarShown))
+            if (IsTerminalWorker(w)) _archiveOne(w);
+        SaveHistory(); SaveHidden(); ForceRender();
     }
 }
