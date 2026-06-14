@@ -63,9 +63,15 @@ def main():
     # instance's prior swebench state BEFORE each run so every verify re-evaluates fresh.
     purge = ("rm -rf logs/run_evaluation/" + run_id + " "
              "companion." + run_id + ".json " + run_id + ".*.json 2>/dev/null; ")
+    # Forward a local-httpbin URL into the eval so suites that read HTTPBIN_URL (requests'
+    # test_requests.py defaults to the public http://httpbin.org/, which is slow AND 503s from
+    # here) hit a fast, reliable local server instead. The shim injects it into eval.sh; harmless
+    # for repos that don't read it. Off unless SWE_HTTPBIN_URL is set.
+    hb = os.environ.get("SWE_HTTPBIN_URL", "")
+    hb_export = ("export SWE_HTTPBIN_URL='" + hb + "'; ") if hb else ""
     script = (
         "pgrep dockerd >/dev/null 2>&1 || (nohup dockerd >/tmp/dockerd.log 2>&1 & sleep 8); "
-        "export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt; "
+        "export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt; " + hb_export +
         # Activate the #19 false-negative shim: putting bench/swe_shim on PYTHONPATH makes
         # Python auto-import its sitecustomize at interpreter startup, which monkeypatches
         # make_eval_script_list to export PYTEST_ADDOPTS="-rA ..." in eval.sh. This survives
