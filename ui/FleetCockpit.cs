@@ -146,6 +146,28 @@ class CockpitWindow : Window
     }
 
     // ── i18n ────────────────────────────────────────────────────────────────────
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    // Open (or foreground if already running) the main chat window -- the reverse of
+    // CopilotChat.OpenCockpit, so you can return to the main screen FROM the fleet cockpit
+    // (previously only main -> fleet existed).
+    void OpenMain()
+    {
+        try
+        {
+            var existing = System.Diagnostics.Process.GetProcessesByName("CopilotChat");
+            if (existing.Length > 0)
+            {
+                try { if (existing[0].MainWindowHandle != IntPtr.Zero) SetForegroundWindow(existing[0].MainWindowHandle); } catch { }
+                return;
+            }
+            string exe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "CopilotChat.exe");
+            if (File.Exists(exe)) System.Diagnostics.Process.Start(exe);
+        }
+        catch { }
+    }
+
     string T(string k)
     {
         bool ja = _lang == 0;
@@ -351,6 +373,10 @@ class CockpitWindow : Window
         ctrls.HorizontalAlignment = HorizontalAlignment.Right;
 
         ctrls.Children.Add(AutoscaleControls());
+        var mainBtn = IconButton("chat", 18);
+        mainBtn.ToolTip = _lang == 0 ? "メイン (チャット) を開く" : "Open main chat";
+        mainBtn.Click += delegate { OpenMain(); };
+        ctrls.Children.Add(mainBtn);
         _langBtn = IconButton("translate", 18);
         _langBtn.ToolTip = "日本語 / English";
         _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveKey("lang", _lang.ToString()); Relabel(); ForceRender(); };
