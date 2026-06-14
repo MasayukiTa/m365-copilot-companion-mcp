@@ -147,6 +147,19 @@ if ($WithExternalTools) {
                 Write-Warn2 "Failed to install $($pkg.Id): $($_.Exception.Message)"
             }
         }
+        # Dev Tunnels needs a one-time interactive sign-in (Microsoft account) before a
+        # tunnel can be hosted; the token persists across reboots. Do it now while we have a
+        # real interactive console -- the supervisor runs HIDDEN and (by design since
+        # 2026-06-14) will NOT touch devtunnel until you are signed in, so skipping this
+        # leaves the tunnel permanently down on this machine. Critically, the supervisor no
+        # longer reaps an interactive `devtunnel login` (it used to, which made first-run
+        # sign-in impossible). See docs/STARTUP_devtunnel_login.md.
+        $dtLoggedIn = $false
+        try { $dtLoggedIn = ((& devtunnel user show 2>&1 | Out-String) -notmatch 'Not logged in|Login required') } catch {}
+        if (-not $dtLoggedIn) {
+            Write-Host "    Dev Tunnels: one-time sign-in required (a browser/device-code prompt appears)." -ForegroundColor Cyan
+            try { devtunnel login } catch { Write-Warn2 "devtunnel login failed: $($_.Exception.Message) -- run 'devtunnel login' manually BEFORE starting the supervisor." }
+        } else { Write-Ok "Dev Tunnels already signed in" }
         Write-Host "    Not installable via winget (install manually only if you need them):" -ForegroundColor Yellow
         Write-Host "      - Microsoft PowerPoint / Outlook  (for pptx_export_png / outlook_* tools)" -ForegroundColor Yellow
         Write-Host "      - ODBC Driver 18 for SQL Server   (for odbc_* tools)" -ForegroundColor Yellow
@@ -164,7 +177,8 @@ Write-Host ""
 Write-Host "Setup complete." -ForegroundColor Green
 Write-Host "Next steps:" -ForegroundColor Green
 Write-Host "  1. Start the MCP server:        .\start.ps1"
-Write-Host "  2. (Remote clients) host a tunnel and keep it alive:"
+Write-Host "  2. (Remote clients) sign in to Dev Tunnels ONCE, then host + keep alive:"
+Write-Host "       devtunnel login          # one-time interactive sign-in (persists across reboots) -- BEFORE the supervisor"
 Write-Host "       .\supervisor.ps1 -TunnelName <your-tunnel-name>"
 Write-Host "  3. Point your MCP client at http://localhost:8000/mcp with header"
 Write-Host "       Authorization: Bearer <MCP_API_KEY from .env>"

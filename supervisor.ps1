@@ -101,6 +101,19 @@ function Test-TunnelHosting {
     return $false
 }
 
+function Test-DevtunnelLoggedIn {
+    # Gate ALL tunnel management on an authenticated devtunnel CLI. When NOT logged in,
+    # `devtunnel host` cannot work AND -- critically -- the supervisor must not touch any
+    # devtunnel process: a user running an interactive `devtunnel login` to fix exactly
+    # this state would be reaped every cycle (the 2026-06-14 outage: login could never
+    # complete because the kill loop killed it before the token was written). Returns
+    # $true only on a clear logged-in signal; unknown/ambiguous -> $false (do nothing).
+    $out = & $DevTunnel user show 2>&1 | Out-String
+    if ($out -match 'Not logged in' -or $out -match 'Login required') { return $false }
+    if ($out -match 'Logged in') { return $true }
+    return $false
+}
+
 function Start-Server {
     # Kill the stale instance FIRST. A wedged main.py (dead event loop, CLOSE_WAIT
     # pile-up -- seen twice on 2026-06-12/13) keeps $Port LISTENING, so a new instance
@@ -122,7 +135,15 @@ function Start-Server {
 }
 
 function Start-TunnelHost {
-    Get-Process devtunnel -ErrorAction SilentlyContinue | Stop-Process -Force
+    # Stop only OUR stale host process(es) -- those whose command line is
+    # `devtunnel host <TunnelName>`. NEVER `Get-Process devtunnel | Stop-Process`: that
+    # reaps a user's interactive `devtunnel login` (the very command that authenticates
+    # this CLI) and any unrelated tunnel the user hosts. Killing a login mid-flow leaves
+    # an empty 0-byte token + an orphaned browser dialog -- the 2026-06-14 onboarding
+    # outage (see docs/STARTUP_devtunnel_login.md).
+    Get-CimInstance Win32_Process -Filter "Name='devtunnel.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match '\bhost\b' -and $_.CommandLine -match [regex]::Escape($TunnelName) } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 2
     Start-Process -FilePath $DevTunnel -ArgumentList "host $TunnelName" -WindowStyle Hidden
     Write-Log "devtunnel host starting for $TunnelName (bin=$DevTunnel) ..."
@@ -143,6 +164,7 @@ Write-Log "supervisor up (tunnel=$TunnelName port=$Port interval=${IntervalSecon
 
 $serverMiss = 0
 $tunnelMiss = 0
+$loggedIn = $null   # tri-state ($null unknown / $true / $false) -- log only on transition
 
 while ($true) {
     if (Test-ServerUp) {
@@ -157,15 +179,27 @@ while ($true) {
         }
     }
 
-    if (Test-TunnelHosting) {
+    if (-not (Test-DevtunnelLoggedIn)) {
+        # First-run / token-cleared: pause tunnel management and DO NOT touch devtunnel,
+        # so the user can run `devtunnel login` (interactive) without it being reaped.
+        if ($loggedIn -ne $false) {
+            Write-Log "devtunnel NOT logged in -> tunnel management PAUSED. Run 'devtunnel login' once (interactive); supervisor will not touch devtunnel until then."
+            $loggedIn = $false
+        }
         $tunnelMiss = 0
     } else {
-        $tunnelMiss++
-        Write-Log "tunnel host connections = 0 ($tunnelMiss/$FailuresBeforeAction)"
-        if ($tunnelMiss -ge $FailuresBeforeAction) {
-            Start-TunnelHost
+        if ($loggedIn -eq $false) { Write-Log "devtunnel now logged in -> resuming tunnel management" }
+        $loggedIn = $true
+        if (Test-TunnelHosting) {
             $tunnelMiss = 0
-            Start-Sleep -Seconds 8
+        } else {
+            $tunnelMiss++
+            Write-Log "tunnel host connections = 0 ($tunnelMiss/$FailuresBeforeAction)"
+            if ($tunnelMiss -ge $FailuresBeforeAction) {
+                Start-TunnelHost
+                $tunnelMiss = 0
+                Start-Sleep -Seconds 8
+            }
         }
     }
 
