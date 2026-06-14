@@ -30,9 +30,17 @@ using System.Web.Script.Serialization;
 
 class CockpitProgram
 {
+    // Per-Monitor V2 DPI: WPF would otherwise run System-DPI-aware (render once at the PRIMARY
+    // monitor's DPI, then Windows bitmap-stretches that onto a differently-scaled display like a
+    // 2560x1440 external monitor -> visibly grainy text/edges). PROCESS awareness is declared in
+    // app.manifest (embedded via /win32manifest; the OS loader reads it at process creation, so it
+    // cannot lose the startup race a programmatic SetProcessDpiAwarenessContext call would). The
+    // switch below is the WPF half: it turns on WPF's per-monitor RELAYOUT so the tree re-renders
+    // vector-crisp at each monitor's native DPI. Both are needed; must precede any WPF type use.
     [STAThread]
     static void Main(string[] args)
     {
+        try { AppContext.SetSwitch("Switch.System.Windows.DoNotScaleForDpiChanges", false); } catch { }
         string path = args.Length > 0 ? args[0] : null;
         new Application().Run(new CockpitWindow(path));
     }
