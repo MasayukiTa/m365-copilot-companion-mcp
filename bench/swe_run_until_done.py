@@ -263,6 +263,43 @@ def resolved_set():
     return out
 
 
+# Signals that a non-resolve was the EVAL HOST failing (not the model's patch): broken WSL,
+# docker daemon down, disk exhaustion, OOM-killed build, etc. These are retry-worthy -- the patch
+# may be fine; the eval just couldn't run. Anything else (eval ran and tests genuinely failed) is
+# a real miss to INVESTIGATE, not to churn retries against.
+INFRA_SIGNALS = (
+    "getpwuid", "no space left", "enospc", "cannot connect to the docker daemon",
+    "error during connect", "memoryerror", "oomkilled", "cannot allocate memory",
+    "i/o error", "failed to solve", "exit code 137", "killed", "no such image",
+    "client.timeout exceeded", "device or resource busy",
+)
+
+
+def classify_failure(inst):
+    """'infra' (eval-host failure -> retry) vs 'genuine' (real test failure -> investigate).
+
+    Reads the instance's most recent eval test_output. ABSENCE of any output is itself treated as
+    infra: the eval never produced a result, i.e. the host (WSL/docker/disk) failed before tests
+    ran -- exactly the 2026-06-14 WSL-corruption case where 6 instances false-failed."""
+    low = inst.lower()
+    blob = ""
+    try:
+        import glob
+        cands = glob.glob("logs/run_evaluation/**/*%s*/**/test_output.txt" % low, recursive=True)
+        cands = [p for p in cands if os.path.isfile(p)]
+        if cands:
+            newest = max(cands, key=os.path.getmtime)
+            blob = open(newest, encoding="utf-8", errors="replace").read()
+    except Exception:
+        pass
+    if not blob.strip():
+        return "infra"   # eval produced nothing -> host failed before tests ran
+    low_blob = blob.lower()
+    if any(sig in low_blob for sig in INFRA_SIGNALS):
+        return "infra"
+    return "genuine"     # eval ran, output present, no infra signal -> a real test failure
+
+
 def setup_round(insts):
     """(Re)build the goals file for exactly `insts` using the configured setup script."""
     if ARGS.setup == "batch":
@@ -358,6 +395,23 @@ def main():
         if not remaining:
             log("=== ALL TARGETS RESOLVED in %d round(s) ===" % rnd)
             return
+        # classify this round's non-resolves: infra (eval host broke -> retry) vs genuine (real
+        # test failure -> investigate, don't just churn retries). Retry infra; for genuine, flag
+        # prominently and (unless SWE_RETRY_GENUINE=1) drop them so retries aren't wasted on a
+        # real miss -- they're reported for root-cause instead.
+        infra = [i for i in remaining if classify_failure(i) == "infra"]
+        genuine = [i for i in remaining if i not in infra]
+        if infra:
+            log("INFRA-FAIL (eval host: WSL/docker/disk -> RETRY next round): %s" % infra)
+        if genuine:
+            log("GENUINE-FAIL (real test failure -> INVESTIGATE, not an infra retry): %s" % genuine)
+        if genuine and os.environ.get("SWE_RETRY_GENUINE") != "1":
+            log("dropping genuine failures from retry (set SWE_RETRY_GENUINE=1 to keep retrying): %s"
+                % genuine)
+            remaining = [i for i in remaining if i not in genuine]
+            if not remaining:
+                log("=== no INFRA retries left; %d genuine failure(s) to investigate ===" % len(genuine))
+                return
         log("still unresolved after round %d: %s" % (rnd, remaining))
     log("=== STOPPED after %d rounds, unresolved=%s ===" % (MAX_ROUNDS, remaining))
 
