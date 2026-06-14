@@ -183,6 +183,10 @@ class CockpitWindow : Window
         if (k == "retry_note") return ja ? "再試行は走行中のみ反映されます" : "Retry only applies while a run is live";
         if (k == "autoretry") return ja ? "自動再試行" : "Auto-retry";
         if (k == "cap") return ja ? "上限" : "cap";
+        if (k == "eta") return ja ? "完了予測" : "ETA";
+        if (k == "eta_in") return ja ? "あと" : "in";
+        if (k == "eta_calc") return ja ? "計測中…" : "estimating…";
+        if (k == "rate") return ja ? "件/時" : "/h";
         return k;
     }
     string StatusLabel(string s)
@@ -1137,7 +1141,27 @@ class CockpitWindow : Window
         string state = running ? T("running") : T("done");
         if (running && updated > 0 && (NowUnix() - updated) > 8)
             state = T("running") + " — " + T("stale");
-        _sub.Text = state + "    " + T("elapsed") + " " + Fmt(elapsed) + "    " + total + " " + T("goals") + mem;
+        // Live ETA: project remaining work from the throughput observed SO FAR (done/elapsed). This
+        // implicitly tracks concurrency -- when 2 run in parallel, done climbs faster -> rate up ->
+        // ETA drops. Recomputed every tick (and finish-clock uses DateTime.Now), so it's the
+        // "constantly-moving number". Needs >=1 done to have a rate; until then show 計測中.
+        string eta = "";
+        if (running && total > 0 && done < total)
+        {
+            if (done > 0 && elapsed > 1.0)
+            {
+                double etaS = (total - done) * (elapsed / done);   // remaining / (done/elapsed)
+                double perH = done / elapsed * 3600.0;
+                eta = "    " + T("eta") + " " + DateTime.Now.AddSeconds(etaS).ToString("HH:mm")
+                      + " (" + T("eta_in") + " " + Fmt(etaS) + " · "
+                      + perH.ToString("0.#") + " " + T("rate") + ")";
+            }
+            else
+            {
+                eta = "    " + T("eta") + " " + T("eta_calc");
+            }
+        }
+        _sub.Text = state + "    " + T("elapsed") + " " + Fmt(elapsed) + eta + "    " + total + " " + T("goals") + mem;
         // The subtitle is ellipsis-trimmed at the column edge; expose the full text on hover.
         _sub.ToolTip = _sub.Text;
     }
