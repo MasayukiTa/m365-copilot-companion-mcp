@@ -68,6 +68,19 @@ def test_disk_floor_predicate():
     check("disk_building2_blocks", disk_admission_ok(floor_gb=6, eval_gb=5, free_gb=20.0, building=2) is False)  # 20-15=5<6
     # eval_gb=0 keeps legacy floor-only behavior even with builds in flight (no look-ahead)
     check("disk_building_noop_when_evalgb0", disk_admission_ok(floor_gb=6, eval_gb=0, free_gb=7.0, building=4) is True)
+    # explicit reserve_gb (per-repo path): exact reserve wins over eval_gb/building
+    check("disk_reserve_ok", disk_admission_ok(floor_gb=6, free_gb=12.0, reserve_gb=6.0) is True)   # 12-6=6>=6
+    check("disk_reserve_blocks", disk_admission_ok(floor_gb=6, free_gb=12.0, reserve_gb=6.1) is False)  # 12-6.1<6
+    # per-repo weights: heavy reserves ~floor-headroom (solo), light reserves little (pairs)
+    check("repo_gb_matplotlib_heavy", rf.repo_eval_gb("matplotlib__matplotlib-23987") == 6.0)
+    check("repo_gb_requests_light", rf.repo_eval_gb("psf__requests-2148") == 2.0)
+    check("repo_gb_default", rf.repo_eval_gb("unknown__unknown-1") == rf.DEFAULT_REPO_EVAL_GB)
+    # at C:12/floor6: ONE matplotlib (6) admits, TWO (12) blocked -> heavy stays solo
+    check("two_matplotlib_blocked", disk_admission_ok(floor_gb=6, free_gb=12.0,
+          reserve_gb=rf.repo_eval_gb("matplotlib__matplotlib-1")*2) is False)
+    # two xarray (3+3=6) admit -> light pairs
+    check("two_xarray_pair", disk_admission_ok(floor_gb=6, free_gb=12.0,
+          reserve_gb=rf.repo_eval_gb("pydata__xarray-1")*2) is True)
 
 
 # ── (d) anti-thrash hysteresis ─────────────────────────────────────────────────────────────
