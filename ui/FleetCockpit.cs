@@ -331,11 +331,18 @@ class CockpitWindow : Window
         // -> the subtitle "disappeared" exactly where it reached the RAM controls. A Grid gives
         // the title column a HARD bounded width (star) next to the auto-width controls, so the
         // two never overlap; the subtitle is then trimmed with an ellipsis instead of hidden.
+        // Header = a 2-col x 2-row Grid. Row 0: title (col 0) + RAM/lang/theme controls (col 1).
+        // Row 1: the SUBTITLE, spanning BOTH columns (full width, also under the controls). The
+        // subtitle carries the long live line (elapsed + ETA + goals + concurrency); keeping it in
+        // col 0 only meant the RAM-controls column ate its right end and the ETA got clipped ("8...").
+        // Full-width row + wrapping = nothing is ever hidden.
         var headRow = new Grid();
         headRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         headRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        headRow.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // title + controls
+        headRow.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // subtitle (full width)
 
-        // right controls: autoscale group, language, theme
+        // right controls: autoscale group, language, theme  (row 0, col 1)
         var ctrls = new StackPanel();
         ctrls.Orientation = Orientation.Horizontal;
         ctrls.VerticalAlignment = VerticalAlignment.Top;
@@ -350,30 +357,30 @@ class CockpitWindow : Window
         _themeBtn.ToolTip = "テーマ (ダーク/ライト)";
         _themeBtn.Click += delegate { _dark = !_dark; SaveKey("dark", _dark ? "1" : "0"); ApplyTheme(); };
         ctrls.Children.Add(_themeBtn);
-        Grid.SetColumn(ctrls, 1);
+        Grid.SetColumn(ctrls, 1); Grid.SetRow(ctrls, 0);
         headRow.Children.Add(ctrls);
 
-        // title block (icon + title + sub) -- lives in the bounded star column (col 0).
+        // title (icon + title) -- row 0, col 0
         var titleRow = new DockPanel { LastChildFill = true };
         titleRow.VerticalAlignment = VerticalAlignment.Center;
-        // a 12px gutter keeps the title text from butting right up against the controls.
         titleRow.Margin = new Thickness(0, 0, 12, 0);
         _iconHost = new ContentControl(); _iconHost.VerticalAlignment = VerticalAlignment.Center;
         _iconHost.Margin = new Thickness(0, 0, 10, 0);
         DockPanel.SetDock(_iconHost, Dock.Left);
         titleRow.Children.Add(_iconHost);
-        var titleCol = new StackPanel();
         _header = new TextBlock(); _header.FontSize = 22; _header.FontWeight = FontWeights.SemiBold;
+        _header.VerticalAlignment = VerticalAlignment.Center;
         _header.TextTrimming = TextTrimming.CharacterEllipsis; _header.TextWrapping = TextWrapping.NoWrap;
-        titleCol.Children.Add(_header);
-        // The subtitle is the long one: trim with an ellipsis at the column edge so it stops
-        // CLEANLY before the controls instead of being overpainted by them.
-        _sub = new TextBlock(); _sub.FontSize = 13; _sub.Margin = new Thickness(0, 4, 0, 0);
-        _sub.TextTrimming = TextTrimming.CharacterEllipsis; _sub.TextWrapping = TextWrapping.NoWrap;
-        titleCol.Children.Add(_sub);
-        titleRow.Children.Add(titleCol);   // fills remaining width of col 0 -> bounds the text
-        Grid.SetColumn(titleRow, 0);
+        titleRow.Children.Add(_header);    // fills the rest of col 0
+        Grid.SetColumn(titleRow, 0); Grid.SetRow(titleRow, 0);
         headRow.Children.Add(titleRow);
+
+        // subtitle -- its OWN row spanning BOTH columns, so the long elapsed+ETA line uses the full
+        // width and is never clipped by the controls column. Wrap (not ellipsis) so it's never hidden.
+        _sub = new TextBlock(); _sub.FontSize = 13; _sub.Margin = new Thickness(38, 4, 18, 0);
+        _sub.TextWrapping = TextWrapping.Wrap;
+        Grid.SetColumn(_sub, 0); Grid.SetColumnSpan(_sub, 2); Grid.SetRow(_sub, 1);
+        headRow.Children.Add(_sub);
 
         _headBar.Child = headRow;
         root.Children.Add(_headBar);
