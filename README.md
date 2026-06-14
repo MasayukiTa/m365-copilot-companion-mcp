@@ -336,8 +336,11 @@ Premium / Direct Line を使わず、Copilot エージェントを **手元の�
 
 - **Python ブリッジ** (`bridge/copilot_bridge.py`): stdlib の `http.server` だけで自己完結の HTML チャットを配信し、Copilot の応答を **差分スクレイピングでトークン単位ストリーミング**。`python bridge\copilot_bridge.py` → ブラウザで `http://127.0.0.1:8765`。
 - **ネイティブ WPF アプリ** (`ui/CopilotChat.cs`): Windows 同梱の `csc.exe` だけでビルドする **完全 JS フリー** のデスクトップチャット。マークダウン/コードブロック整形・ダーク/ライト・日本語/英語切替・会話履歴サイドバー（リネーム・削除）。`ui\build_and_run.bat` でビルド＆起動。
+- **フリートコックピット** (`ui/FleetCockpit.cs`): 並列実行を 1 ライブカード/ゴールで可視化。RAM 自動調整（適応スロットル）・disk/RAM 容量アウェアな連続アドミッション（重い eval は単独・軽い eval は並走）・完了で即タブ＆容量解放・各ワーカーを途中でステア/解放。`ui\build_cockpit.bat` でビルド＆起動。
 
 ![ネイティブ WPF チャット UI](docs/chat-ui.png)
+
+![フリートコックピット — 並列実行（適応スロットルで N 本並走・実行中カードを最上段表示・完了で即解放）](docs/img/cockpit_window.png)
 
 ---
 
