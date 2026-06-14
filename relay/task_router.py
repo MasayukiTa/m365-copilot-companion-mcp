@@ -94,31 +94,33 @@ def _exec_python(payload):
     return ("ok" if r.returncode == 0 else "error"), {"rc": r.returncode, "output": out[:20000]}, None
 
 
+_CAPTURE_PS1 = os.path.join(REPO, "relay", "capture.ps1")
+
+
 def _exec_screenshot(payload):
-    """Capture the screen to a PNG via PowerShell + .NET (no MCP unlock needed). payload may set
-    'out' (path) and 'region' [l,t,w,h]; default full virtual screen to .fleet/tasks/shots/."""
-    out = payload.get("out") or _p("done", "shot_%s.png" % payload.get("id", "x"))
-    out = os.path.abspath(out)
+    """Capture to a PNG via relay/capture.ps1 (PowerShell + .NET, no MCP unlock needed). payload:
+      out      -- save path (default .fleet/tasks/done/shot_<id>.png)
+      proc     -- capture ONLY the window of this PROCESS (e.g. 'FleetCockpit') -- robust when the
+                  window has no title
+      window   -- capture ONLY the window whose TITLE contains this substring
+      region   -- [l,t,w,h] pixel region of the virtual screen
+      (none)   -- full virtual screen (all monitors)
+    Precedence proc > window > region. This is the clean window-targeted path so a README shot
+    needs no manual cropping."""
+    out = os.path.abspath(payload.get("out") or _p("done", "shot_%s.png" % payload.get("id", "x")))
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    region = payload.get("region")  # [left, top, width, height] or None
-    if region and len(region) == 4:
-        l, t, w, h = region
-        bounds = "New-Object Drawing.Rectangle(%d,%d,%d,%d)" % (l, t, w, h)
-    else:
-        bounds = ("[System.Windows.Forms.SystemInformation]::VirtualScreen")
-    ps = (
-        "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; "
-        "$b = %s; "
-        "$bmp = New-Object Drawing.Bitmap $b.Width, $b.Height; "
-        "$g = [Drawing.Graphics]::FromImage($bmp); "
-        "$g.CopyFromScreen($b.Left, $b.Top, 0, 0, $b.Size); "
-        "$bmp.Save('%s'); $g.Dispose(); $bmp.Dispose()" % (bounds, out.replace("\\", "\\\\"))
-    )
-    r = subprocess.run(["powershell.exe", "-NoProfile", "-Command", ps],
-                       capture_output=True, text=True, timeout=LOCAL_TIMEOUT_S)
+    cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+           "-File", _CAPTURE_PS1, "-Out", out]
+    if payload.get("proc"):
+        cmd += ["-Proc", str(payload["proc"])]
+    elif payload.get("window"):
+        cmd += ["-Window", str(payload["window"])]
+    elif payload.get("region") and len(payload["region"]) == 4:
+        cmd += ["-Region", ",".join(str(int(x)) for x in payload["region"])]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=LOCAL_TIMEOUT_S)
     if r.returncode == 0 and os.path.isfile(out):
-        return "ok", {"path": out}, None
-    return "error", None, (r.stderr or "screenshot failed")[:2000]
+        return "ok", {"path": out, "mode": (r.stdout or "").strip()[:80]}, None
+    return "error", None, ((r.stderr or r.stdout or "screenshot failed")[:2000])
 
 
 def _exec_file(payload):
