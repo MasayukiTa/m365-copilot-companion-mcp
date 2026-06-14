@@ -80,7 +80,10 @@ def main():
         " --max_workers 1 --cache_level " + cache_level
     )
     try:
-        wsl(script, timeout=1200)
+        # Env-tunable so a slow externally-dependent suite (e.g. requests' test_requests.py hits
+        # the real httpbin.org at ~25s/request when HTTPBIN_URL is unset) can run to completion
+        # instead of being cut off mid-run and graded a false NOT_RESOLVED. Default 1200s.
+        wsl(script, timeout=int(os.environ.get("SWE_EVAL_TIMEOUT_S", "1200")))
     except subprocess.TimeoutExpired:
         # CRITICAL leak fix: the eval container is a DETACHED `docker run`, so killing the
         # wsl.exe subprocess on timeout does NOT stop it -- it keeps running (observed:
