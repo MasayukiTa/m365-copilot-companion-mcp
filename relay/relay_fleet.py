@@ -179,18 +179,27 @@ def free_disk_gb(path=None):
         return 1e6
 
 
-def disk_admission_ok(floor_gb=None, eval_gb=None, free_gb=None):
+def disk_admission_ok(floor_gb=None, eval_gb=None, free_gb=None, building=0):
     """Pure predicate: may we open ANOTHER eval-bearing tab without risking the disk floor?
 
-    OK iff (current C: free) - (disk the new job's eval might use) >= floor. Splitting the
-    free-reading out (`free_gb`) keeps this unit-testable with a mocked disk. A non-positive
-    floor disables the gate (always OK) -- normal (non-bench) use may not want a disk reserve."""
+    OK iff (current C: free) - (disk this new eval AND every already-admitted eval still in
+    flight might use) >= floor. The `building` term is the count of eval-bearing tabs already
+    open whose Docker builds have NOT yet been reclaimed: each will consume up to eval_gb, so we
+    must reserve eval_gb*(building+1), not just eval_gb for the one we're about to open. Without
+    this, admission-time free-space looks fine for tab #1, #2, #3... (no build has consumed disk
+    YET), all get admitted, then their cold builds run CONCURRENTLY and blow past the floor --
+    which is exactly how 5 concurrent heavy builds crashed C: and corrupted WSL (2026-06-14).
+
+    Splitting the free-reading out (`free_gb`) keeps this unit-testable with a mocked disk. A
+    non-positive floor disables the gate (always OK) -- normal (non-bench) use may not want a
+    reserve. eval_gb=0 keeps legacy floor-only behavior (no per-build look-ahead)."""
     floor = DEFAULT_DISK_FLOOR_GB if floor_gb is None else float(floor_gb)
     if floor <= 0:
         return True
     eval_gb = DEFAULT_EVAL_DISK_GB if eval_gb is None else float(eval_gb)
     free = free_disk_gb() if free_gb is None else float(free_gb)
-    return (free - eval_gb) >= floor
+    reserve = eval_gb * (1 + max(0, int(building)))
+    return (free - reserve) >= floor
 
 
 def ram_target_cap(open_now, current_cap, ceiling,
@@ -1034,7 +1043,10 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # running jobs finish + release their disk (swe_check cleanup), then re-admit -- the
         # continuous-flow drain. A non-positive floor disables the disk gate (normal use).
         while pending and _active_open() < max(1, mc_box[0]):
-            if not disk_admission_ok(floor_gb=disk_box[0], eval_gb=eval_disk_gb):
+            # reserve disk for THIS eval plus every already-open eval still in flight, so we never
+            # admit N tabs that look fine individually but crash C: once their builds run at once.
+            if not disk_admission_ok(floor_gb=disk_box[0], eval_gb=eval_disk_gb,
+                                     building=_active_open()):
                 break                  # disk floor would be breached -> defer admission
             w = pending.pop(0)
             if w.status in TERMINAL:   # (shouldn't happen, but be safe)

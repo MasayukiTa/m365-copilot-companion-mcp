@@ -60,6 +60,14 @@ def test_disk_floor_predicate():
     # floor <= 0 disables the gate entirely (normal, non-bench use)
     check("disk_floor_zero_disables", disk_admission_ok(floor_gb=0, free_gb=0.1) is True)
     check("disk_floor_neg_disables", disk_admission_ok(floor_gb=-1, free_gb=0.0) is True)
+    # in-flight reservation: 20 GB free, 6 floor, eval 5 GB. With 0 building the new eval needs
+    # 20-5=15>=6 OK. But with 2 already building, reserve 5*(2+1)=15 -> 20-15=5 < 6 -> BLOCKED.
+    # This is the fix for the concurrent-cold-build crash: each open build is reserved, not just one.
+    check("disk_building0_ok", disk_admission_ok(floor_gb=6, eval_gb=5, free_gb=20.0, building=0) is True)
+    check("disk_building1_ok", disk_admission_ok(floor_gb=6, eval_gb=5, free_gb=20.0, building=1) is True)   # 20-10=10>=6
+    check("disk_building2_blocks", disk_admission_ok(floor_gb=6, eval_gb=5, free_gb=20.0, building=2) is False)  # 20-15=5<6
+    # eval_gb=0 keeps legacy floor-only behavior even with builds in flight (no look-ahead)
+    check("disk_building_noop_when_evalgb0", disk_admission_ok(floor_gb=6, eval_gb=0, free_gb=7.0, building=4) is True)
 
 
 # ── (d) anti-thrash hysteresis ─────────────────────────────────────────────────────────────
