@@ -1197,7 +1197,10 @@ class CockpitWindow : Window
             shown.Add(w);
         }
         // Feature B: under "unfinished only", group failures together by severity (stable).
+        // Otherwise use the default display order: active worker(s) at the top, queued in the
+        // middle, completed sinking to the bottom (the live work is what the user wants to see).
         if (_cardFilter == 1) shown = StableBySeverity(shown);
+        else shown = StableByDisplayRank(shown);
 
         // stash for the converter (it rebuilds the toolbar row from these when a container recycles)
         _toolbarAll = workers;
@@ -1294,6 +1297,29 @@ class CockpitWindow : Window
             foreach (Dictionary<string, object> w in src)
                 if (SeverityRank(w) == rank) outp.Add(w);
         return outp;
+    }
+
+    // Default-view order: what is HAPPENING now floats to the top, finished work sinks to the
+    // bottom. Active (running/verifying/sending/...) -> pending (queued) -> terminal (done/freed/
+    // failed). Stable within each bucket so a worker keeps its place (and its W-name identity)
+    // and cards do not jump around as unrelated workers tick. status.json lists workers in launch
+    // order, so without this the earliest-launched (now-completed) workers stay pinned at the top.
+    static List<Dictionary<string, object>> StableByDisplayRank(List<Dictionary<string, object>> src)
+    {
+        var outp = new List<Dictionary<string, object>>();
+        for (int rank = 0; rank <= 2; rank++)
+            foreach (Dictionary<string, object> w in src)
+                if (DisplayRank(w) == rank) outp.Add(w);
+        return outp;
+    }
+
+    // 0 = active (currently working), 1 = pending (queued, not yet started), 2 = terminal (done/
+    // freed/failed). Drives the default card order so the live worker is first and history sinks.
+    static int DisplayRank(Dictionary<string, object> w)
+    {
+        if (IsTerminalWorker(w) || S(w, "status") == "freed") return 2;
+        if (S(w, "status") == "pending") return 1;
+        return 0;
     }
 
     // Feature B/C toolbar: filter selector + outcome summary + bulk-retry. Rebuilt each
