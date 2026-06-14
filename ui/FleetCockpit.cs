@@ -1260,8 +1260,30 @@ class CockpitWindow : Window
 
         var rows = new List<object>();
         rows.Add(new Row(0, null, null));               // toolbar
-        foreach (Dictionary<string, object> w in shown)
-            rows.Add(new Row(1, w, null));              // one card per worker
+        // Default view: the live area shows only ACTIVE/queued work; terminal (done/failed) workers
+        // drop below a "完了 (this run)" divider so the top is just what's running -- they are not
+        // deleted (still inspectable below), only moved out of the active list. Filters 1/2 are
+        // explicit views, so they don't re-partition.
+        if (_cardFilter == 0)
+        {
+            var active = new List<Dictionary<string, object>>();
+            var done = new List<Dictionary<string, object>>();
+            foreach (Dictionary<string, object> w in shown)
+                (IsTerminalWorker(w) ? done : active).Add(w);
+            foreach (Dictionary<string, object> w in active)
+                rows.Add(new Row(1, w, null));
+            if (done.Count > 0)
+            {
+                rows.Add(new Row(4, null, null));       // "完了 (this run)" divider
+                foreach (Dictionary<string, object> w in done)
+                    rows.Add(new Row(1, w, null));
+            }
+        }
+        else
+        {
+            foreach (Dictionary<string, object> w in shown)
+                rows.Add(new Row(1, w, null));          // one card per worker
+        }
         AppendHistoryRows(rows);
         return rows;
     }
@@ -1309,7 +1331,7 @@ class CockpitWindow : Window
         return null;
     }
 
-    // Tiny per-row model. Kind: 0=toolbar, 1=card, 2=history-header, 3=history-row.
+    // Tiny per-row model. Kind: 0=toolbar, 1=card, 2=history-header, 3=history-row, 4=completed-divider.
     class Row
     {
         public int Kind;
@@ -1334,6 +1356,7 @@ class CockpitWindow : Window
             if (r.Kind == 1) return _w.Card(r.Worker);
             if (r.Kind == 2) return _w.HistoryHeader();
             if (r.Kind == 3) return _w.HistoryRow(r.Hist);
+            if (r.Kind == 4) return _w.CompletedDivider();
             return null;
         }
         public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
@@ -1540,6 +1563,23 @@ class CockpitWindow : Window
         ht.Text = (_lang == 0 ? "履歴 — クリアするまで蓄積（クリックで会話を表示）" : "History — stacks until cleared (click to open)");
         ht.Foreground = Muted; ht.FontSize = 12.5; ht.VerticalAlignment = VerticalAlignment.Center;
         head.Children.Add(ht);
+        return head;
+    }
+
+    // Divider that separates the live (active/queued) cards above from this run's TERMINAL workers
+    // below -- so the top of the list is only what's still running.
+    UIElement CompletedDivider()
+    {
+        int n = 0;
+        if (_toolbarShown != null)
+            foreach (Dictionary<string, object> w in _toolbarShown)
+                if (IsTerminalWorker(w)) n++;
+        var head = new DockPanel();
+        head.Margin = new Thickness(8, 16, 8, 4);
+        var t = new TextBlock();
+        t.Text = (_lang == 0 ? "完了 — " : "Completed — ") + n + (_lang == 0 ? " 件（このラン）" : " (this run)");
+        t.Foreground = Muted; t.FontSize = 12.5; t.VerticalAlignment = VerticalAlignment.Center;
+        head.Children.Add(t);
         return head;
     }
 
