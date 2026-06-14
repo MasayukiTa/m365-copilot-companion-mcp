@@ -1209,8 +1209,14 @@ app on your own machine** — no Premium, no Direct Line. Both ride the same
   code-block rendering, dark/light, JP/EN toggle, a conversation-history sidebar
   (rename, delete), copy/stop buttons. Build and launch it with
   `ui\build_and_run.bat`.
+- **Fleet cockpit** (`ui/FleetCockpit.cs`): visualizes parallel execution as one live
+  card per goal — adaptive RAM throttle, capacity-aware continuous admission (heavy
+  evals run solo, light ones in parallel), release-on-done, per-worker steer/release.
+  Build and launch it with `ui\build_cockpit.bat`.
 
 ![native WPF chat UI](docs/chat-ui.png)
+
+![Fleet cockpit — parallel execution (adaptive throttle runs N at once, running card on top, freed on finish)](docs/img/cockpit_window.png)
 
 ---
 
