@@ -65,6 +65,14 @@ def _make_eval_script_list_with_addopts(
         cmds.insert(1, export_line)
     else:
         cmds = [export_line]
+    # Point HTTPBIN-reading suites (requests' test_requests.py) at a fast/reliable local httpbin
+    # instead of the public httpbin.org (slow + 503s from here). Only when SWE_HTTPBIN_URL is set;
+    # a repo that doesn't read HTTPBIN_URL ignores it. Inserted before the reset checkout so the
+    # process-env export survives (same reasoning as PYTEST_ADDOPTS).
+    import os as _os
+    _hb = _os.environ.get("SWE_HTTPBIN_URL", "")
+    if _hb:
+        cmds.insert(1, 'export HTTPBIN_URL="%s"' % _hb)
     return cmds
 
 
