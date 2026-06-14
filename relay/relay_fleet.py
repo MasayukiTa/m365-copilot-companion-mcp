@@ -183,11 +183,16 @@ def free_disk_gb(path=None):
 # matplotlib/sklearn build must reserve far more than a 2GB requests one, so the gate can safely
 # PAIR light evals while keeping heavy ones solo, instead of one flat number that's wrong for both.
 # Heavy values are tuned to ~(typical C: free - floor) so exactly ONE admits and a 2nd is blocked.
+# Calibrated to MEASURED build footprints (2026-06-14), not guesses: matplotlib's cold build dips
+# C: ~10GB (12->1.6GB observed); scikit-learn ~4GB (C: 13.7->7.3 with sklearn+requests, minus the
+# 2.34GB requests image); requests image is 2.34GB. The earlier flat 7GB for sklearn was too high
+# and wrongly blocked TWO sklearn from pairing -- at ~4-5GB each, two fit (2*5=10 <= C:free - min).
 _REPO_EVAL_GB = {
-    "matplotlib__matplotlib": 7.0, "scikit-learn__scikit-learn": 7.0, "astropy__astropy": 7.0,
+    "matplotlib__matplotlib": 9.0, "astropy__astropy": 9.0,   # ~10GB build -> stays solo
+    "scikit-learn__scikit-learn": 5.0,                          # ~4GB measured -> two can pair
     "django__django": 3.0, "sympy__sympy": 3.0, "sphinx-doc__sphinx": 3.0,
     "pydata__xarray": 3.0, "pytest-dev__pytest": 2.5, "pylint-dev__pylint": 2.5,
-    "psf__requests": 2.0, "pallets__flask": 2.0,
+    "psf__requests": 2.5, "pallets__flask": 2.5,
 }
 DEFAULT_REPO_EVAL_GB = 5.0
 EVAL_DISK_PERREPO = os.environ.get("SWE_EVAL_DISK_PERREPO") == "1"

@@ -72,8 +72,12 @@ def test_disk_floor_predicate():
     check("disk_reserve_ok", disk_admission_ok(floor_gb=6, free_gb=12.0, reserve_gb=6.0) is True)   # 12-6=6>=6
     check("disk_reserve_blocks", disk_admission_ok(floor_gb=6, free_gb=12.0, reserve_gb=6.1) is False)  # 12-6.1<6
     # per-repo weights: heavy reserves ~floor-headroom (solo), light reserves little (pairs)
-    check("repo_gb_matplotlib_heavy", rf.repo_eval_gb("matplotlib__matplotlib-23987") == 7.0)
-    check("repo_gb_requests_light", rf.repo_eval_gb("psf__requests-2148") == 2.0)
+    check("repo_gb_matplotlib_heavy", rf.repo_eval_gb("matplotlib__matplotlib-23987") == 9.0)
+    check("repo_gb_requests_light", rf.repo_eval_gb("psf__requests-2148") == 2.5)
+    check("repo_gb_sklearn_calibrated", rf.repo_eval_gb("scikit-learn__scikit-learn-10508") == 5.0)
+    # two sklearn (5+5=10) fit at C:13.7/min3 -> pair (was blocked by the old 7GB overestimate)
+    check("two_sklearn_pair", disk_admission_ok(floor_gb=3, free_gb=13.7,
+          reserve_gb=rf.repo_eval_gb("scikit-learn__scikit-learn-1")*2) is True)
     check("repo_gb_default", rf.repo_eval_gb("unknown__unknown-1") == rf.DEFAULT_REPO_EVAL_GB)
     # at C:12/floor6: ONE matplotlib (6) admits, TWO (12) blocked -> heavy stays solo
     check("two_matplotlib_blocked", disk_admission_ok(floor_gb=6, free_gb=12.0,
