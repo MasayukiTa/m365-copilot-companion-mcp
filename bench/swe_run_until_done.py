@@ -149,7 +149,16 @@ def affinity_order(insts):
     Stable on the original order within each repo, so behavior is deterministic and the only
     effect is clustering repos together -- the 2nd+ instance of a repo in a chunk reuses the
     warm `sweb.env.*` image instead of triggering a ~20min cold build.
+
+    Repo-affinity ONLY pays off when SWE_KEEP_ENV=1 keeps the warm ENV image alive across
+    same-repo instances. With KEEP_ENV off (the default for disjoint-repo holdout slices, where
+    every instance cold-builds anyway), clustering buys nothing -- so we preserve the operator's
+    input order instead. That lets a resource-constrained host front-load cheap-to-eval repos
+    (derisk the disk/RAM-tight bulk first, isolate heavy cold builds last) by ordering the
+    targets file, without this scheduler silently re-sorting that intent away. (2026-06-14)
     """
+    if os.environ.get("SWE_KEEP_ENV") != "1":
+        return list(insts)  # honor operator order; no warm-reuse benefit to cluster for
     return sorted(insts, key=repo_key)
 
 
