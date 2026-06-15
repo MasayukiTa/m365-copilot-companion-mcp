@@ -113,12 +113,20 @@ if _os.environ.get("SWE_INSECURE_FETCH") == "1":
         _orig_req = _rq.Session.request
         def _req_noverify(self, *a, **k):
             k.setdefault("verify", False)
-            # fail FAST instead of hanging: this network's proxy doesn't only inject a cert, it
-            # sometimes WEDGES the TCP connection, so swebench's untimed requirements fetch hung
-            # ~25 min (until the outer eval timeout) producing nothing. A 30s cap turns that into
-            # a quick, retriable failure instead of a silent multi-minute stall.
+            # The real cause of the hung/failed requirements fetch is a NETWORK SWITCH dropping the
+            # connection mid-fetch (not a permanent wall): between switches the same fetch succeeds.
+            # So (1) cap each attempt at 30s so a dropped connection fails fast instead of hanging,
+            # and (2) RETRY with backoff to ride across the switch (a few seconds to ~a minute).
             k.setdefault("timeout", 30)
-            return _orig_req(self, *a, **k)
+            import time as _t
+            _last = None
+            for _i in range(8):
+                try:
+                    return _orig_req(self, *a, **k)
+                except Exception as _e:
+                    _last = _e
+                    _t.sleep(min(2 ** _i, 20))   # 1,2,4,8,16,20,20,20 -> ~90s of bridging
+            raise _last
         _rq.Session.request = _req_noverify
         try:
             import urllib3 as _u3
