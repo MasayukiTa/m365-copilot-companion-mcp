@@ -143,6 +143,16 @@ def avail_phys_mb() -> float:
         return 4096.0
 
 
+def ram_room_for_tab(floor_mb=2000.0) -> bool:
+    """True iff there is enough free physical RAM to open ANOTHER browser tab without crowding
+    the machine. Used to RAM-gate the SUB-AGENT side-pages (research / refuter) -- the fleet's
+    worker-tab autoscale doesn't count those, so on a low-RAM box even a single task's ultra
+    pipeline (main + research + refuter tabs) could overload the Edge until the sweep wedged and
+    the watchdog hard-reset it. Each side-page opens lazily once this returns True, so the live
+    tab count tracks free RAM at ALL granularities, not just at worker admission."""
+    return avail_phys_mb() >= floor_mb
+
+
 def auto_concurrency(n_goals, per_tab_mb=700, headroom_mb=2048, hard_cap=4):
     """How many heavy M365 tabs we can afford open at once, given free RAM right now.
     Keep `headroom_mb` for the user's other work; budget `per_tab_mb` per Copilot tab;

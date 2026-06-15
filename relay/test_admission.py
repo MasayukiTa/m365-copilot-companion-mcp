@@ -422,6 +422,30 @@ def test_fleet_research_nonblocking():
         ap.ResearchSession = orig_rs
 
 
+# ── (h) sub-agent side-page tabs are RAM-gated: open is deferred until there's free RAM ───────
+def test_research_session_ram_gated_open():
+    import relay.agent_profiles as ap
+    import relay.relay_fleet as rf2
+    rs = ap.ResearchSession(object(), "q")     # context non-None
+    rs.start()                                  # must DEFER the open (no page yet)
+    opened = {"n": 0}
+
+    def fake_open():
+        opened["n"] += 1
+        rs._pending_open = False               # simulate a successful open
+    rs._do_open = fake_open
+    orig = rf2.ram_room_for_tab
+    try:
+        rf2.ram_room_for_tab = lambda floor_mb=2000.0: False   # no RAM -> defer
+        r = rs.poll()
+        check("ram_gate_defers_when_low", r is None and rs._pending_open and opened["n"] == 0)
+        rf2.ram_room_for_tab = lambda floor_mb=2000.0: True    # RAM frees -> open now
+        rs.poll()
+        check("ram_gate_opens_when_free", opened["n"] == 1 and rs._pending_open is False)
+    finally:
+        rf2.ram_room_for_tab = orig
+
+
 def main():
     test_disk_floor_predicate()
     test_hysteresis_no_thrash()
@@ -431,6 +455,7 @@ def main():
     test_stop_cancels_running_fleet()
     test_pause_freezes_then_resumes()
     test_fleet_research_nonblocking()
+    test_research_session_ram_gated_open()
     print("\n=== %d/%d admission checks passed ===" % (sum(results), len(results)))
     return 0 if all(results) else 1
 

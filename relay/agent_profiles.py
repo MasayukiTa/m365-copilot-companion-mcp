@@ -304,32 +304,51 @@ class ResearchSession:
         self._last = None
         self._stable_since = None
         self._approved = False
+        self._pending_open = True  # side-page not opened yet -- deferred until there's free RAM
         self._done = None          # report string once finished ('' on failure)
 
     def start(self):
+        # Defer the side-page open until poll() sees enough free RAM (ram_room_for_tab). On a
+        # low-RAM box this stops a single task's ultra pipeline (main + research + refuter tabs)
+        # from opening a tab it can't afford -> the overload that wedged the sweep before.
+        self._pending_open = True
+        self._t_send = time.time()
+        return self
+
+    def _do_open(self):
         from .copilot_autopilot_relay import CopilotWebDriver
         try:
             if self.context is None:
-                self._finish(""); return self
+                self._finish(""); return
             self.page = self.context.new_page()
             if not open_agent(self.page, RESEARCHER):
-                self._finish(""); return self
+                self._finish(""); return
             if self.model_name and RESEARCHER.model_picker:
                 set_model(self.page, RESEARCHER, self.model_name)
             self.drv = CopilotWebDriver(self.page)
             self._count_before = self.drv._answers().count()
             self.drv._count_before = self._count_before
             self.drv.send(self.query)
-            self._t_send = time.time()
+            self._pending_open = False
+            self._t_send = time.time()   # reset the clock to when the query actually went out
         except Exception:
             self._finish("")
-        return self
 
     def poll(self):
         """None while the Researcher is still working; else the report string ('' on failure)."""
         from .copilot_autopilot_relay import _is_processing
         if self._done is not None:
             return self._done
+        # RAM-gated lazy open: hold off opening the side-page until there's room (bounded by the
+        # timeout). Returns quickly each sweep, so the fleet stays responsive while it waits.
+        if self._pending_open:
+            from .relay_fleet import ram_room_for_tab
+            if self._t_send and time.time() - self._t_send > self.timeout_s:
+                self._finish(""); return self._done
+            if not ram_room_for_tab():
+                return None
+            self._do_open()
+            return None
         if self.drv is None:
             return self._done
         try:
