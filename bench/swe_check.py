@@ -25,6 +25,34 @@ def wsl(script, timeout=1000, capture=False):
                           errors="replace", timeout=timeout)
 
 
+def _report_exists(run_id, inst):
+    """True iff swebench wrote the per-instance report.json -- the marker that the eval actually
+    RAN to a verdict (whether the tests passed OR failed). Its ABSENCE means the eval host itself
+    failed to produce any verdict (wedge), which must NOT be scored as a genuine miss."""
+    repp = "/root/swe/logs/run_evaluation/" + run_id + "/companion/" + inst + "/report.json"
+    try:
+        r = wsl("test -f " + repp + " && echo Y || echo N", timeout=30, capture=True)
+        return (r.stdout or "").strip().endswith("Y")
+    except Exception:
+        return False
+
+
+def _recover_wsl_docker():
+    """Recover the WSL/Docker eval host between eval-failure retries. The observed failure modes
+    are the 0x8007274c TCP wedge and a hung dockerd; `wsl --shutdown` clears both, after which
+    dockerd is restarted. Safe for the sequential grader (no concurrent eval to disturb); the
+    eval `script` re-purges its own per-instance state on the retry run."""
+    try:
+        subprocess.run(["wsl.exe", "--shutdown"], capture_output=True, timeout=60)
+    except Exception:
+        pass
+    try:
+        wsl("pgrep dockerd >/dev/null 2>&1 || (nohup dockerd >/tmp/dockerd.log 2>&1 & ); "
+            "sleep 8; docker info >/dev/null 2>&1 && echo OK", timeout=120, capture=True)
+    except Exception:
+        pass
+
+
 def main():
     # The failure feedback can contain U+FFFD (from decode-replace of non-UTF-8 test logs).
     # Printing it to a cp932 Windows console raised UnicodeEncodeError, which crashed swe_check
@@ -99,36 +127,68 @@ def main():
         "--instance_ids " + inst + " --run_id " + run_id +
         " --max_workers 1 --cache_level " + cache_level
     )
-    try:
-        # Env-tunable so a slow externally-dependent suite (e.g. requests' test_requests.py hits
-        # the real httpbin.org at ~25s/request when HTTPBIN_URL is unset) can run to completion
-        # instead of being cut off mid-run and graded a false NOT_RESOLVED. Default 1200s.
-        wsl(script, timeout=int(os.environ.get("SWE_EVAL_TIMEOUT_S", "1200")))
-    except subprocess.TimeoutExpired:
-        # CRITICAL leak fix: the eval container is a DETACHED `docker run`, so killing the
-        # wsl.exe subprocess on timeout does NOT stop it -- it keeps running (observed:
-        # sympy-11870 container "Up 33 minutes" after its turn was long over), holding RAM
-        # and inflating the vhdx on C:. _cleanup_docker force-removes the (still-running)
-        # container + image, so the timeout path must call it too (the success/fail paths
-        # already do).
-        print("EVAL_TIMEOUT: the evaluation took too long. Likely the image pull is slow; "
-              "your patch may still be fine. Keep it and it will be re-checked.")
-        _cleanup_docker(inst, run_id)
-        return 1
-
-    # 4. read the report (swebench writes companion.<run_id>.json into /root/swe)
-    r = wsl("cat /root/swe/companion." + run_id + ".json 2>/dev/null", timeout=60, capture=True)
-    out = r.stdout if r.stdout and r.stdout.strip() else ""
-    if not out:
-        r2 = wsl("ls /root/swe/*" + run_id + "*.json 2>/dev/null | head -1 | xargs cat 2>/dev/null",
-                 timeout=60, capture=True)
-        out = r2.stdout or ""
+    # 3-4. Run the official eval and read its verdict, WITH eval-failure RETRY. The eval host is
+    # the measurement's main confound source: a WSL/Docker wedge (dockerd down, image-pull abort,
+    # the 0x8007274c TCP wedge) produces NO report -- which is INDISTINGUISHABLE from a genuine
+    # test failure if you only look at `resolved == False`. Silently grading a no-report as a miss
+    # UNDERCOUNTS pass@1 (observed 2026-06-15: a whole research-ON arm graded 0/12 that was really
+    # ~3-4/12 on re-grade -- a pure eval artifact, not a code result). Discriminator: the
+    # per-instance report.json is written IFF the eval ran to completion (pass OR fail). Present =>
+    # trust resolved/not. Absent => the eval FAILED => recover the host and retry; if it never
+    # appears, return EVAL_ERROR (exit 2) -- a DISTINCT signal from a graded miss so the caller
+    # excludes it from pass@1 instead of counting it against the agent.
+    eval_timeout = int(os.environ.get("SWE_EVAL_TIMEOUT_S", "1200"))
+    retries = int(os.environ.get("SWE_EVAL_RETRIES", "2"))
+    report_found = False
     resolved = False
-    try:
-        d = json.loads(out)
-        resolved = inst in (d.get("resolved_ids") or [])
-    except Exception:
-        resolved = False
+    for attempt in range(retries + 1):
+        try:
+            # Env-tunable so a slow externally-dependent suite (e.g. requests' test_requests.py
+            # hits the real httpbin.org at ~25s/request when HTTPBIN_URL is unset) can run to
+            # completion instead of being cut off mid-run and graded a false NOT_RESOLVED.
+            wsl(script, timeout=eval_timeout)
+        except subprocess.TimeoutExpired:
+            # CRITICAL leak fix: the eval container is a DETACHED `docker run`, so killing the
+            # wsl.exe subprocess on timeout does NOT stop it -- it keeps running (observed:
+            # sympy-11870 container "Up 33 minutes" after its turn was long over), holding RAM
+            # and inflating the vhdx on C:. _cleanup_docker force-removes the (still-running)
+            # container + image, so the timeout path must call it too.
+            print("EVAL_TIMEOUT: the evaluation took too long. Likely the image pull is slow; "
+                  "your patch may still be fine. Keep it and it will be re-checked.")
+            _cleanup_docker(inst, run_id)
+            return 1
+
+        # read the run summary (swebench writes companion.<run_id>.json into /root/swe)
+        r = wsl("cat /root/swe/companion." + run_id + ".json 2>/dev/null", timeout=60, capture=True)
+        out = r.stdout if r.stdout and r.stdout.strip() else ""
+        if not out:
+            r2 = wsl("ls /root/swe/*" + run_id + "*.json 2>/dev/null | head -1 | xargs cat 2>/dev/null",
+                     timeout=60, capture=True)
+            out = r2.stdout or ""
+        try:
+            d = json.loads(out)
+            resolved = inst in (d.get("resolved_ids") or [])
+        except Exception:
+            resolved = False
+        # report.json present (or already resolved) == the eval actually RAN -> trust this verdict.
+        report_found = resolved or _report_exists(run_id, inst)
+        if report_found:
+            break
+        if attempt < retries:
+            print("[swe_check] no eval report for %s -> EVAL-FAILURE (WSL/Docker host wedge), "
+                  "NOT a genuine miss; recovering host and retrying (%d/%d)"
+                  % (inst, attempt + 1, retries), file=sys.stderr)
+            _recover_wsl_docker()
+
+    if not report_found:
+        # The eval never produced a verdict after recovery+retries. Distinct exit code 2 so the
+        # caller (swe_singleshot.grade / orchestrator) treats this as "host broke, re-run later",
+        # NOT as the agent failing the instance.
+        print("EVAL_ERROR: the evaluation could not produce a report for %s after %d attempt(s) "
+              "(WSL/Docker eval-host wedge, NOT a code failure). This is NOT a graded miss; "
+              "re-run when the eval host is healthy." % (inst, retries + 1))
+        _cleanup_docker(inst, run_id)
+        return 2
 
     if resolved:
         print("RESOLVED: the hidden tests pass for %s." % inst)
