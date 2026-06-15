@@ -26,6 +26,15 @@ def wsl(script, timeout=1000, capture=False):
 
 
 def main():
+    # The failure feedback can contain U+FFFD (from decode-replace of non-UTF-8 test logs).
+    # Printing it to a cp932 Windows console raised UnicodeEncodeError, which crashed swe_check
+    # (exit!=0) -- a caller reading the exit code then mis-recorded the verdict. Force the
+    # streams to UTF-8 with replacement so feedback never crashes the grade.
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     inst = sys.argv[1]
     wt = sys.argv[2] if len(sys.argv) > 2 else os.path.join(REPO, ".fleet", "swe", "work", "wt_" + inst)
 
