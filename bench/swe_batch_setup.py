@@ -28,7 +28,7 @@ WORK = os.path.join(REPO, ".fleet", "swe", "work")
 def goal_text(lib, wt, ps):
     if len(ps) > 6000:
         ps = ps[:6000] + "\n...(truncated)"
-    return (
+    _t = (
         "あなたは実在の Python ライブラリ **%s** のバグを修正します。\n"
         "対象リポジトリ（git チェックアウト済み・このPCのローカル）:\n"
         "  %s\n"
@@ -49,6 +49,18 @@ def goal_text(lib, wt, ps):
         "手掛かりに直して再度 DONE。安易に STUCK しないこと。\n"
         "解決不能と確信した場合のみ STUCK: と理由。"
     ) % (lib, wt, ps)
+    # Generalization-direction scaffold lift (SWE_STRONG_SELFTEST=1): the clean single-shot
+    # misses are "right file + right approach, but the exact patch is a step off". Have the agent
+    # self-verify against the REPO'S OWN tests (not the hidden grading tests) before DONE so it
+    # catches its own imprecision in one shot. This is general solving discipline, NOT
+    # test-specialization. A/B'd separately so it never confounds the research on/off axis.
+    if os.environ.get("SWE_STRONG_SELFTEST") == "1":
+        _t += ("\n\n【自己検証の強化】DONE の前に必ず、変更したコードを覆う**このリポジトリ自身のテスト**を "
+               "grep でテスト関数名/ファイルを特定し、run_python か shell_exec で実際に実行して"
+               "**通ることを確認**してから DONE。テストが見つからなければ issue の再現コードを自分で書いて"
+               "期待動作を確かめよ。隠しテストではなく自分で回せるテストで裏取りする"
+               "（特定テストへの最適化ではなく、一般的な自己検証の徹底）。")
+    return _t
 
 
 def main():
