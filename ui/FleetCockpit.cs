@@ -78,7 +78,7 @@ class CockpitWindow : Window
         "copilot-bridge", "settings.txt");
 
     TextBlock _header, _sub;
-    Button _themeBtn, _langBtn;
+    Button _themeBtn, _langBtn, _mainBtn;
     TextBlock _maxLbl;
     Border _headBar;
     ListBox _list;                 // virtualizing host for the card/history rows
@@ -373,10 +373,10 @@ class CockpitWindow : Window
         ctrls.HorizontalAlignment = HorizontalAlignment.Right;
 
         ctrls.Children.Add(AutoscaleControls());
-        var mainBtn = IconButton("chat", 18);
-        mainBtn.ToolTip = _lang == 0 ? "メイン (チャット) を開く" : "Open main chat";
-        mainBtn.Click += delegate { OpenMain(); };
-        ctrls.Children.Add(mainBtn);
+        _mainBtn = IconButton("chat", 18);
+        _mainBtn.ToolTip = _lang == 0 ? "メイン (チャット) を開く" : "Open main chat";
+        _mainBtn.Click += delegate { OpenMain(); };
+        ctrls.Children.Add(_mainBtn);
         _langBtn = IconButton("translate", 18);
         _langBtn.ToolTip = "日本語 / English";
         _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveKey("lang", _lang.ToString()); Relabel(); ForceRender(); };
@@ -978,7 +978,7 @@ class CockpitWindow : Window
         if (_list != null) _list.Background = Bg;
         _iconHost.Content = MakeIcon("satellite_alt", 26, Accent);
         // restyle the header buttons for the theme
-        foreach (Button b in new Button[] { _themeBtn, _langBtn, _maxMinus, _maxPlus, _autoMinus, _autoPlus })
+        foreach (Button b in new Button[] { _mainBtn, _themeBtn, _langBtn, _maxMinus, _maxPlus, _autoMinus, _autoPlus })
             if (b != null) { b.Background = BtnBg; b.Foreground = Fg; b.BorderBrush = Border; }
         _themeBtn.Content = MakeIcon(_dark ? "light_mode" : "dark_mode", 18, Fg);
         _langBtn.Content = MakeIcon("translate", 18, Fg);
