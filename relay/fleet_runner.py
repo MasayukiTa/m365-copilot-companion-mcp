@@ -343,9 +343,32 @@ def main():
                     help="plan-first: each goal proposes a numbered plan and pauses for "
                          "approval (status 'awaiting'); approve or edit it with a steer to "
                          "start execution. The plan is in status.json (workers[].plan).")
+    ap.add_argument("--max-research", type=int, default=3,
+                    help="max deep-research delegations a worker may make per goal (RESEARCH: "
+                         "-> Researcher side-agent). Default 3; 0 disables research.")
+    ap.add_argument("--accuracy", action="store_true",
+                    help="ULTRA ACCURACY mode: ignore time, maximise CLEAN correctness. Turns on "
+                         "the perspective-diverse review PANEL (correctness/edge/security, "
+                         "refute-until-clean), liberal deep-research, and the repo's-own-tests "
+                         "self-verification (SWE_STRONG_SELFTEST). Unattended-safe (no plan "
+                         "approval pause). The accuracy gain is clean -- adversarial review + "
+                         "self-test + research, never the hidden grading tests.")
     ap.add_argument("--state-dir", default=os.path.join(_repo_root(), ".fleet"),
                     help="where to write the live status.json the cockpit reads")
     args = ap.parse_args()
+
+    # ULTRA ACCURACY preset: maximise CLEAN correctness, ignore time. Wires the verified accuracy
+    # levers -- the session's failure analysis pinned the bottleneck on edit PRECISION (right file,
+    # wrong edit), not localization, so adversarial review + self-test target it directly. The gain
+    # is clean: review/self-test/research never touch the hidden grading tests. Unattended-safe
+    # (deliberately NOT --plan, which would pause for approval and stall a headless run).
+    if args.accuracy:
+        args.panel = True                               # perspective-diverse review (3 lenses)
+        args.max_refute = max(args.max_refute, 4)        # refute-until-clean rounds
+        args.max_research = max(args.max_research, 6)     # liberal deep-research (now non-blocking)
+        os.environ["SWE_STRONG_SELFTEST"] = "1"          # self-verify vs the repo's OWN tests
+        print("[accuracy] ULTRA mode ON: panel(correctness/edge/security) + refute<=%d + "
+              "research<=%d + repo-self-test; time ignored." % (args.max_refute, args.max_research))
 
     goals = _read_goals(args)
     if not goals:
@@ -653,6 +676,7 @@ def main():
                                       max_concurrent=max_conc, mc_box=mc_box, add_box=add_box,
                                       refuter=args.refuter or args.panel,
                                       max_refute=args.max_refute, plan_mode=args.plan,
+                                      max_research=args.max_research,
                                       review_lenses=(list(PANEL_LENSES) if args.panel else None),
                                       max_transient=args.max_transient,
                                       autoscale=autoscale, autoscale_max=autoscale_max,

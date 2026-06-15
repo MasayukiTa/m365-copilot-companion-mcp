@@ -1007,7 +1007,7 @@ class RelayWorker:
 def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     notify=default_notify, on_tick=None, max_concurrent=None,
                     mc_box=None, add_box=None, refuter=False, max_refute=2,
-                    plan_mode=False, review_lenses=None, max_transient=10,
+                    plan_mode=False, review_lenses=None, max_transient=10, max_research=3,
                     autoscale=False, autoscale_max=None, asc_box=None,
                     autoscale_per_tab_mb=700, autoscale_headroom_mb=1400,
                     autoscale_up_margin_mb=0,
@@ -1076,7 +1076,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                            refuter=refuter, max_refute=max_refute, plan_mode=plan_mode,
                            review_lenses=review_lenses, max_transient=max_transient,
                            transcript_dir=transcript_dir, run_id=run_id,
-                           busy_writer=busy_writer)
+                           busy_writer=busy_writer, max_research=max_research)
                for i, g in enumerate(goals)]
     pending = list(workers)            # FIFO queue of not-yet-attached workers
 
@@ -1138,7 +1138,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 nw = RelayWorker(item, "w%d" % len(workers), max_turns=max_turns,
                                  refuter=refuter, max_refute=max_refute,
                                  plan_mode=plan_mode, review_lenses=review_lenses,
-                                 max_transient=max_transient, busy_writer=busy_writer)
+                                 max_transient=max_transient, busy_writer=busy_writer,
+                                 max_research=max_research)
                 workers.append(nw)
                 if item.get("priority"):
                     pending.insert(0, nw)
