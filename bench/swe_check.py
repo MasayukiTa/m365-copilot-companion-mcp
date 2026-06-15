@@ -38,17 +38,20 @@ def _report_exists(run_id, inst):
 
 
 def _recover_wsl_docker():
-    """Recover the WSL/Docker eval host between eval-failure retries. The observed failure modes
-    are the 0x8007274c TCP wedge and a hung dockerd; `wsl --shutdown` clears both, after which
-    dockerd is restarted. Safe for the sequential grader (no concurrent eval to disturb); the
-    eval `script` re-purges its own per-instance state on the retry run."""
+    """Recover a hung/dead dockerd between eval-failure retries by restarting JUST the docker
+    daemon inside the RUNNING WSL distro -- and ONLY if `docker info` actually fails.
+
+    We deliberately do NOT `wsl --shutdown` here. An earlier version did, and it cascaded badly:
+    shutting down the whole WSL VM mid-grading left dockerd unable to come back, which hung the
+    NEXT eval's `wsl(...)` call -- a sequential batch stalled for ~3 h at 8/12 and several evals
+    were falsely flagged EVAL_ERROR by the very recovery meant to prevent false negatives. A
+    targeted dockerd restart fixes the common wedge (dead/hung daemon) without nuking the VM or
+    disturbing the user's other WSL work. If dockerd is already healthy we leave it untouched."""
     try:
-        subprocess.run(["wsl.exe", "--shutdown"], capture_output=True, timeout=60)
-    except Exception:
-        pass
-    try:
-        wsl("pgrep dockerd >/dev/null 2>&1 || (nohup dockerd >/tmp/dockerd.log 2>&1 & ); "
-            "sleep 8; docker info >/dev/null 2>&1 && echo OK", timeout=120, capture=True)
+        wsl("docker info >/dev/null 2>&1 && echo ALIVE || "
+            "(pkill -9 dockerd 2>/dev/null; sleep 2; rm -f /var/run/docker.pid 2>/dev/null; "
+            "setsid dockerd >/tmp/dockerd.log 2>&1 </dev/null & sleep 8; "
+            "docker info >/dev/null 2>&1 && echo RESTARTED)", timeout=90, capture=True)
     except Exception:
         pass
 
