@@ -195,8 +195,21 @@ def _wait_research_done(drv: CopilotWebDriver, profile: AgentProfile) -> bool:
             last, stable_since = None, None
         elif t == last:
             has_marker = any(m in t for m in DONE_MARKERS)
-            if stable_since and (time.time() - stable_since) >= (
-                    profile.dwell_s if has_marker else profile.dwell_s * 2):
+            # A short, stable status line ("リサーチ ツール web 上の...収集") is an INTERMEDIATE
+            # progress update, NOT the report -- the Researcher stalls on one for 30-60s while it
+            # works in the background (observed: an identical status held a full 60s). Only treat
+            # a stable block as DONE if it actually looks like the finished report: it carries a
+            # completion marker OR it is substantial (the real report streams to thousands of
+            # chars; intermediates stay <200). This kills the premature-capture-of-garbage bug
+            # where a status line was returned and fed back to the implementer as the "result".
+            substantial = has_marker or len(t) >= 1000
+            # NOTE: the completion marker ("推論が N ステップで完了しました") appears at the START
+            # of the report header and THEN the body streams for tens of seconds -- so a marker is
+            # NOT a "done" signal and must NOT shorten the dwell (that truncated the report at ~570
+            # of ~3300 chars when a brief streaming pause hit right after the header). Require the
+            # FULL dwell of stability regardless: only a block that has stopped growing for
+            # dwell*2 is the finished report.
+            if stable_since and substantial and (time.time() - stable_since) >= profile.dwell_s * 2:
                 return True
         else:
             last, stable_since = t, time.time()
@@ -240,15 +253,24 @@ def ask_agent(page, query: str, profile: AgentProfile = RESEARCHER,
                 "error": "no scoping reply"}
     first = drv.read_last_response()
 
-    # Stage 2: if it's a scoping step, approve it and wait out the real research.
+    # Stage 2: decide what `first` is and get to the real report.
     clarification = ""
     if _looks_like_clarification(first) and approval:
+        # a scoping step -> approve, then wait out the real research.
         clarification = first
         drv.send(approval)
         ok = _wait_research_done(drv, profile)
-    else:
-        # already a full answer (e.g. a trivial query that did not need scoping)
+    elif any(m in first for m in DONE_MARKERS) or len(first) >= 1000:
+        # already the finished report (rare: a query that needed no scoping).
         ok = True
+    else:
+        # `first` is an INTERMEDIATE status line ("リサーチ ツール 処理中です" / "...初期情報を収集"):
+        # NOT a clarification and NOT the report. The Researcher streams progress into the SAME
+        # block for minutes before the final report lands. Wait it out instead of returning the
+        # stub -- THIS was the garbage-research bug (a status line fed back as the result, so the
+        # implementer "coded from garbage"). _wait_research_done now ignores short stalled status
+        # lines and only returns on a marker/substantial block.
+        ok = _wait_research_done(drv, profile)
 
     return {
         "ok": ok,
