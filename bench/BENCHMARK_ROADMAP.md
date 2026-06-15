@@ -19,9 +19,15 @@ on top and are measured separately so the gain is attributable, not baked into t
   - First signal n=12 = **4/12 ≈ 33%** (correcting 1-2 harness no-report eval-failures upward).
   - 95% CI at n=12 is wide (~[14%, 61%]). **Scale to n≈300** to tighten; predicted barefoot range
     **~30-80%** (true value lands inside as N grows).
-- **Research ON** (`swe_singleshot.py --research`): same slice, research delegation enabled. The
-  research-axis CI bounds. Compare ON vs OFF on the SAME instances (paired). *Nobody has published
-  this axis cleanly.* — to run after the OFF bounds settle.
+- **Research ON** (`swe_singleshot.py --research`): same 12-instance slice, research delegation
+  enabled. **First run (n=12, 2026-06-15): ≈4/12 ≈ the OFF 4/12 — no measurable effect.** Two
+  findings: (1) the agent **did not actually delegate** any `RESEARCH:` query on these local-code
+  bugs (it solved directly in ~1 turn), so research-ON was effectively a *second OFF run* — the
+  per-instance ON/OFF flips (sympy, pytest) are the expected stochastic variance of two
+  independent draws. (2) The arm's *raw* grade was a misleading **0/12**, caused entirely by a
+  WSL eval-host wedge (false NOTs); healthy-WSL re-grade restored it to ~4/12. **Lesson: to
+  measure the research axis you need tasks where the agent *chooses* to delegate (not local repo
+  bugs), or a forced-research variant.** Paired ON/OFF on SWE local-bugs cannot separate the axis.
 - **Reference point**: SICA ~53% on SWE-bench. The barefoot single-shot already approaches/overlaps
   it; with research/scaffold the upper bound is promising.
 - **NOT comparable to leaderboard "95%"**: that was loop-inclusive (verify-retry against the grading
@@ -54,7 +60,14 @@ on top and are measured separately so the gain is attributable, not baked into t
 - **report CI + N**, not bare percentages; small-N numbers labelled as first signals.
 - **disclose** all scaffold structure used (and research on/off, and any harness-meta usage).
 - harness reliability matters: an eval that fails to produce a report (WSL/Docker wedge, timeout)
-  must be **re-run**, not silently graded as a miss — else the pass@1 is undercounted.
+  must be **re-run**, not silently graded as a miss — else the pass@1 is undercounted. **Now
+  enforced in code** (swe_check.py): the per-instance `report.json` is the eval-completion marker;
+  a no-report triggers host recovery (`wsl --shutdown` + dockerd restart) and retry, and a
+  persistent no-report returns **EVAL_ERROR (exit 2)** — a distinct signal that `swe_singleshot`
+  excludes from the pass@1 denominator instead of charging to the agent. *Why this matters:* the
+  first research-ON arm graded **0/12**, which on healthy-WSL re-grade was really **~4/12** — the
+  0/12 was a pure eval-host artifact (genuine passes falsely graded NOT). Without this fix the
+  measurement is not trustworthy.
 
 _2026-06-15. Tracks: bench/SCORECARD_holdout60.md (loop-inclusive, confounded), the clean
 single-shot results (_clean_ss_results.txt), [[perf-reporting-plan]] [[sica-paper]]._
