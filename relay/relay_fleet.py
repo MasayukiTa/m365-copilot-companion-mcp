@@ -34,8 +34,8 @@ from .acceptance import Check, normalize_checks, run_all_blocking
 from .copilot_autopilot_relay import (
     CONTINUE_JOB, COPILOT_SELECTORS, ConversationClosed, CopilotWebDriver, FIX_JOB,
     GenerationInProgress, PROTOCOL, REFUTE_FIX_JOB, RETRY_JOB, VERIFY_FIX_JOB,
-    _is_processing, default_notify, goal_not_seen, has_end_marker, reported_stuck,
-    transient_backoff,
+    _is_processing, default_notify, extract_research, goal_not_seen, has_end_marker,
+    reported_stuck, transient_backoff,
 )
 from .planner import PLAN_PROMPT, extract_plan, plan_ready
 
@@ -330,7 +330,8 @@ class RelayWorker:
     def __init__(self, goal, name, max_turns=1000, dwell_s=4.0,
                  per_turn_timeout_s=240, max_no_progress=3, max_verify_attempts=3,
                  refuter=False, max_refute=2, plan_mode=False, review_lenses=None,
-                 max_transient=10, transcript_dir=None, run_id="", busy_writer=None):
+                 max_transient=10, transcript_dir=None, run_id="", busy_writer=None,
+                 max_research=3):
         self.page = None
         self.drv = None
         text, checks, cwd = goal_fields(goal)
@@ -387,6 +388,13 @@ class RelayWorker:
         self.max_refute = max_refute
         self.refute_count = 0
         self._refuter_session = None
+        # deep-research delegation (ported from the single-agent relay): a fleet worker can emit
+        # `RESEARCH: <query>` and the relay spawns the Researcher sub-agent in a side page, feeds
+        # its report back, and the worker continues -- the accuracy lever the single-agent relay
+        # already has but the fleet previously lacked. ON by default, capped per worker.
+        self.research_count = 0
+        self.max_research = max_research
+        self.research_model = "Claude"
         # review panel (operator B, perspective-diverse): a list of lenses runs one
         # independent reviewer each, aggregated by majority. Empty = single reviewer.
         self.review_lenses = list(review_lenses) if review_lenses else []
@@ -653,6 +661,43 @@ class RelayWorker:
         """Leave a blocking acceptance eval (always, even on failure/exception)."""
         self.eval_busy_until = 0.0
 
+    def _run_research(self, query):
+        """Spawn the Researcher sub-agent in a side page (this worker's own browser context),
+        return its report (<=3500 chars) or '' on failure. Ported from the single-agent relay's
+        RESEARCH: delegation (copilot_autopilot_relay) so a FLEET worker can also delegate a
+        deep-dive and feed the result back -- the accuracy lever the fleet was missing.
+
+        v1 is BLOCKING (mirrors the acceptance-eval path): it freezes the round-robin for the
+        bounded duration of the deep-dive. We mark the worker eval-busy first so the watchdog
+        waits it out (status 'verifying' + deadline + snapshot flush) instead of hard-resetting.
+        A non-blocking ResearchSession (like RefuterSession) is the parallelism-preserving
+        follow-up; accuracy-first v1 keeps it simple and proven."""
+        self._mark_eval_busy()
+        self.reason = "🔎 外部調査中: " + (query or "")[:60]
+        rpage = None
+        report = ""
+        try:
+            from .agent_profiles import RESEARCHER, ask_agent
+            rpage = self._context.new_page()
+            rres = ask_agent(rpage, query, RESEARCHER, model_name=self.research_model)
+            if rres.get("ok"):
+                report = (rres.get("result") or "")[:3500]
+        except Exception:
+            report = ""
+        finally:
+            try:
+                if rpage is not None:
+                    rpage.close()
+            except Exception:
+                pass
+            try:
+                if self.page is not None:
+                    self.page.bring_to_front()    # return focus to the worker's own tab
+            except Exception:
+                pass
+            self._clear_eval_busy()
+        return report
+
     def _salvage_via_checks(self):
         """Last-chance acceptance salvage for the EXHAUSTION paths (spec 3-3 verify gate,
         applied where the worker would otherwise go terminal NON-done). Before burning a
@@ -726,6 +771,28 @@ class RelayWorker:
                 "agent reported STUCK (after %d retries)" % self.transient
             return
         self.transient = 0   # a real (non-stuck) response -> the transient issue cleared
+        # deep-research delegation: the agent wrote `RESEARCH: <query>` asking for an external
+        # deep-dive. Spawn the Researcher sub-agent (side page), feed its report back as the next
+        # turn, and continue. Capped per worker (max_research); past the cap, tell it to proceed.
+        rq = extract_research(resp)
+        if rq and self._context is not None and self.max_research > 0:
+            if self.research_count >= self.max_research:
+                self.job = ("これ以上は調査を依頼できません（上限到達）。今ある情報で進めるか、"
+                            "無理なら最後の行に STUCK: 理由 と書いてください。")
+                self.status = "ready"
+                return
+            self.research_count += 1
+            report = self._run_research(rq)
+            if report:
+                self.job = ("依頼された調査が完了しました。以下が結果です。これを踏まえて作業を続けて"
+                            "ください。\n--- 調査結果 ---\n" + report + "\n--- 調査結果ここまで ---\n"
+                            + CONTINUE_JOB)
+            else:
+                self.job = ("調査を試みましたが結果を取得できませんでした。調査結果なしで可能な範囲で"
+                            "進めるか、無理なら最後の行に STUCK: 理由 と書いてください。")
+            self.status = "ready"
+            self.reason = "research %d/%d -> 結果を反映して続行" % (self.research_count, self.max_research)
+            return
         # plan phase (plan_mode): capture the proposed plan and PAUSE for approval; a steer
         # (approve as-is, or an edit) resumes into execution. Don't run DONE/CONTINUE yet.
         if self.plan_mode and not self._plan_approved:
