@@ -374,35 +374,52 @@ def test_pause_freezes_then_resumes():
         _restore_worker(orig)
 
 
-# ── (g) fleet RESEARCH: delegation -- a worker spawns the Researcher, feeds the report back ───
-def test_fleet_research_delegation():
-    # _decide() must intercept a `RESEARCH:` response, call _run_research, inject its report and
-    # continue (status 'ready'), and honor the per-worker cap (no spawn past max_research).
+# ── (g) fleet RESEARCH: delegation -- NON-BLOCKING: worker enters 'researching', the sweep keeps
+#        moving, and the report is injected when the side-session yields it ─────────────────────
+def test_fleet_research_nonblocking():
+    import relay.agent_profiles as ap
+
+    class FakeRS:
+        """Stand-in for ResearchSession: poll() returns None (pending) once, then the report."""
+        def __init__(self, context, query, **kw):
+            self.query = query
+            self._n = 0
+        def start(self):
+            return self
+        def poll(self):
+            self._n += 1
+            return None if self._n < 2 else "REPORT: the answer is 42 (q=%s)" % self.query
+        def close(self):
+            pass
+
     w = RelayWorker("do the thing", "w0", max_research=2)
     w._context = object()                 # non-None -> the research path is enabled
-    calls = {"n": 0}
-
-    def fake_run_research(self, query):
-        calls["n"] += 1
-        return "REPORT: the answer is 42 (q=%s)" % query
-
-    orig_rr = RelayWorker._run_research
     orig_xr = rf.extract_research
-    RelayWorker._run_research = fake_run_research
+    orig_rs = ap.ResearchSession
     rf.extract_research = lambda resp: "what is the answer?" if "RESEARCH" in resp else ""
+    ap.ResearchSession = FakeRS
     try:
-        w._decide("Looking into it.\nRESEARCH: what is the answer?")
-        check("research_fired_once", calls["n"] == 1 and w.research_count == 1)
-        check("research_report_injected", "REPORT: the answer is 42" in w.job)
-        check("research_then_continues", w.status == "ready")
-        w._decide("RESEARCH: again please")     # 2nd -> count hits the cap (2)
-        before = calls["n"]
-        w._decide("RESEARCH: a third time")      # over cap -> refused, NO spawn
-        check("research_capped_no_spawn", calls["n"] == before and w.research_count == 2)
+        # _decide on RESEARCH: must NOT block -- it kicks off the session and enters 'researching'
+        w._decide("Looking.\nRESEARCH: what is the answer?")
+        check("research_enters_researching", w.status == "researching" and w.research_count == 1)
+        check("research_session_started", w._research_session is not None)
+        # poll() while researching returns quickly (False) -> the round-robin keeps stepping others
+        r1 = w.poll()
+        check("research_poll_nonblocking", r1 is False and w.status == "researching")
+        # next poll: the session yields the report -> inject it and continue
+        r2 = w.poll()
+        check("research_report_injected", "REPORT: the answer is 42" in w.job and w.status == "ready")
+        check("research_session_cleared", w._research_session is None)
+        # cap: a 2nd delegation hits the cap (2); a 3rd is refused without starting a session
+        w._decide("RESEARCH: again")          # 2nd -> count 2 (== max)
+        check("research_second_ok", w.research_count == 2 and w.status == "researching")
+        w._research_session = None
+        w._decide("RESEARCH: a third time")    # over cap -> refused, no session
+        check("research_capped", w.research_count == 2 and w._research_session is None)
         check("research_cap_message", "上限到達" in w.job)
     finally:
-        RelayWorker._run_research = orig_rr
         rf.extract_research = orig_xr
+        ap.ResearchSession = orig_rs
 
 
 def main():
@@ -413,7 +430,7 @@ def main():
     test_disk_floor_blocks_in_loop()
     test_stop_cancels_running_fleet()
     test_pause_freezes_then_resumes()
-    test_fleet_research_delegation()
+    test_fleet_research_nonblocking()
     print("\n=== %d/%d admission checks passed ===" % (sum(results), len(results)))
     return 0 if all(results) else 1
 
