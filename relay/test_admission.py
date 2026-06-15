@@ -374,6 +374,37 @@ def test_pause_freezes_then_resumes():
         _restore_worker(orig)
 
 
+# ── (g) fleet RESEARCH: delegation -- a worker spawns the Researcher, feeds the report back ───
+def test_fleet_research_delegation():
+    # _decide() must intercept a `RESEARCH:` response, call _run_research, inject its report and
+    # continue (status 'ready'), and honor the per-worker cap (no spawn past max_research).
+    w = RelayWorker("do the thing", "w0", max_research=2)
+    w._context = object()                 # non-None -> the research path is enabled
+    calls = {"n": 0}
+
+    def fake_run_research(self, query):
+        calls["n"] += 1
+        return "REPORT: the answer is 42 (q=%s)" % query
+
+    orig_rr = RelayWorker._run_research
+    orig_xr = rf.extract_research
+    RelayWorker._run_research = fake_run_research
+    rf.extract_research = lambda resp: "what is the answer?" if "RESEARCH" in resp else ""
+    try:
+        w._decide("Looking into it.\nRESEARCH: what is the answer?")
+        check("research_fired_once", calls["n"] == 1 and w.research_count == 1)
+        check("research_report_injected", "REPORT: the answer is 42" in w.job)
+        check("research_then_continues", w.status == "ready")
+        w._decide("RESEARCH: again please")     # 2nd -> count hits the cap (2)
+        before = calls["n"]
+        w._decide("RESEARCH: a third time")      # over cap -> refused, NO spawn
+        check("research_capped_no_spawn", calls["n"] == before and w.research_count == 2)
+        check("research_cap_message", "上限到達" in w.job)
+    finally:
+        RelayWorker._run_research = orig_rr
+        rf.extract_research = orig_xr
+
+
 def main():
     test_disk_floor_predicate()
     test_hysteresis_no_thrash()
@@ -382,6 +413,7 @@ def main():
     test_disk_floor_blocks_in_loop()
     test_stop_cancels_running_fleet()
     test_pause_freezes_then_resumes()
+    test_fleet_research_delegation()
     print("\n=== %d/%d admission checks passed ===" % (sum(results), len(results)))
     return 0 if all(results) else 1
 
