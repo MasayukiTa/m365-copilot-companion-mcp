@@ -53,6 +53,7 @@ STATUS_PILL = {
     "awaiting":  ("承認待ち", "muted"),  # plan proposed, paused for the user to approve/edit
     "verifying": ("検証中", "good"),     # spec 3-3: running the acceptance check locally
     "refuting":  ("反証中", "good"),     # spec 4B: an independent reviewer is checking it
+    "researching": ("外部調査中", "good"),  # non-blocking deep-research side-agent is running
     "done":      ("完了",   "done"),     # finished cleanly
     "stuck":     ("停滞",   "bad"),       # B_BAD red
     "maxturns":  ("上限",   "bad"),

@@ -281,6 +281,100 @@ def ask_agent(page, query: str, profile: AgentProfile = RESEARCHER,
     }
 
 
+class ResearchSession:
+    """NON-BLOCKING deep-research for the FLEET. A blocking ask_agent() would freeze every other
+    worker for the minutes the Researcher takes (it streams status lines for a long time before
+    the report lands). start() opens the side chat, switches to Claude and sends the query; poll()
+    then checks for the finished report WITHOUT blocking -- returning None while the Researcher is
+    still streaming status/report, or the report string ('' on failure/timeout) once it stabilises.
+    Mirrors refuter.RefuterSession's send/wait state machine. Never raises."""
+
+    def __init__(self, context, query, model_name="Claude", approval=DEFAULT_APPROVAL,
+                 dwell_s=4.0, timeout_s=600):
+        self.context = context
+        self.query = query
+        self.model_name = model_name
+        self.approval = approval
+        self.dwell_s = dwell_s
+        self.timeout_s = timeout_s
+        self.page = None
+        self.drv = None
+        self._count_before = 0
+        self._t_send = None
+        self._last = None
+        self._stable_since = None
+        self._approved = False
+        self._done = None          # report string once finished ('' on failure)
+
+    def start(self):
+        from .copilot_autopilot_relay import CopilotWebDriver
+        try:
+            if self.context is None:
+                self._finish(""); return self
+            self.page = self.context.new_page()
+            if not open_agent(self.page, RESEARCHER):
+                self._finish(""); return self
+            if self.model_name and RESEARCHER.model_picker:
+                set_model(self.page, RESEARCHER, self.model_name)
+            self.drv = CopilotWebDriver(self.page)
+            self._count_before = self.drv._answers().count()
+            self.drv._count_before = self._count_before
+            self.drv.send(self.query)
+            self._t_send = time.time()
+        except Exception:
+            self._finish("")
+        return self
+
+    def poll(self):
+        """None while the Researcher is still working; else the report string ('' on failure)."""
+        from .copilot_autopilot_relay import _is_processing
+        if self._done is not None:
+            return self._done
+        if self.drv is None:
+            return self._done
+        try:
+            if self._t_send and time.time() - self._t_send > self.timeout_s:
+                self._finish(""); return self._done
+            if self.drv._answers().count() <= self._count_before:
+                return None
+            t = self.drv.read_last_response()
+            if _is_processing(t):
+                self._last, self._stable_since = None, None
+                return None
+            # one-time scoping/clarification approval (the Researcher may ask before it researches)
+            if not self._approved and _looks_like_clarification(t) and self.approval:
+                self._approved = True
+                self.drv.send(self.approval)
+                self._last, self._stable_since = None, None
+                return None
+            # a stable, SUBSTANTIAL block (completion marker OR >=1000 chars) is the finished
+            # report; a short stalled status line is not (same gate as _wait_research_done). The
+            # marker appears at the report header then the body streams, so require the full dwell.
+            substantial = any(m in t for m in DONE_MARKERS) or len(t) >= 1000
+            if t == self._last:
+                if self._stable_since and substantial and (
+                        time.time() - self._stable_since) >= self.dwell_s * 2:
+                    self._finish(t[:3500]); return self._done
+                return None
+            self._last, self._stable_since = t, time.time()
+            return None
+        except Exception:
+            self._finish(""); return self._done
+
+    def _finish(self, report):
+        self._done = report or ""
+        self.close()
+
+    def close(self):
+        try:
+            if self.page is not None:
+                self.page.close()
+        except Exception:
+            pass
+        self.page = None
+        self.drv = None
+
+
 def upload_file(page, file_path: str, timeout_s: float = 30.0) -> bool:
     """Attach a local data file to the composer via the hidden <input type=file>
     (bypasses the OS file dialog). Returns True once set_input_files succeeds."""
