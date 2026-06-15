@@ -113,6 +113,11 @@ if _os.environ.get("SWE_INSECURE_FETCH") == "1":
         _orig_req = _rq.Session.request
         def _req_noverify(self, *a, **k):
             k.setdefault("verify", False)
+            # fail FAST instead of hanging: this network's proxy doesn't only inject a cert, it
+            # sometimes WEDGES the TCP connection, so swebench's untimed requirements fetch hung
+            # ~25 min (until the outer eval timeout) producing nothing. A 30s cap turns that into
+            # a quick, retriable failure instead of a silent multi-minute stall.
+            k.setdefault("timeout", 30)
             return _orig_req(self, *a, **k)
         _rq.Session.request = _req_noverify
         try:
