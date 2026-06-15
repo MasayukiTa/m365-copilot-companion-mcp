@@ -146,7 +146,7 @@ def _read_goals(args):
     return goals
 
 
-def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0):
+def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False):
     from relay.relay_fleet import free_disk_gb
     total = len(workers)        # dynamic: goals can be added mid-run (native chat queue)
     done = sum(1 for w in workers if w.status in TERMINAL)
@@ -160,6 +160,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0):
         "total": total,
         "done_count": done,
         "running": done < total,
+        "paused": bool(paused),        # fleet frozen by the cockpit (pause toggle)
         "max_concurrent": max_concurrent,
         "open_tabs": open_tabs,
         "avail_mb": round(avail_phys_mb()),
@@ -442,6 +443,9 @@ def main():
 
     mc_box = [max_conc]                # live concurrency cap (cockpit can change it)
     add_box = []                       # goals queued mid-run (native chat / cockpit)
+    pause_box = [False]                # cockpit pause toggle: freeze the fleet without losing
+                                       # state (e.g. across a network switch); resume to continue
+    stop_box = [False]                 # cockpit graceful-stop: cancel all workers and end the run
 
     def _drain_commands(workers):
         # cockpit -> fleet control channel. {"close":["w2"], "set_maxtabs":5}. Consume.
@@ -517,6 +521,14 @@ def main():
                             add_box.append({"text": it, "priority": False})
                     except Exception:
                         pass
+            # pause / resume the whole fleet: {"pause": true} freezes it in place (no new
+            # turns, no new tabs), {"pause": false} resumes. Handy right before a network
+            # switch so in-flight work isn't lost. Takes effect on the next sweep.
+            if "pause" in cmd:
+                pause_box[0] = bool(cmd["pause"])
+            # graceful stop: {"stop": true} cancels every worker and ends the run.
+            if cmd.get("stop"):
+                stop_box[0] = True
         except Exception:
             pass
 
@@ -553,7 +565,7 @@ def main():
         _register_convs(workers)
         try:
             _write_atomic(status_path, _snapshot(workers, started, len(goals), mc_box[0],
-                                                 disk_floor_gb=disk_box[0]))
+                                                 disk_floor_gb=disk_box[0], paused=pause_box[0]))
         except Exception:
             pass
         _print_table(workers, len(goals))
@@ -648,7 +660,7 @@ def main():
                                       autoscale_headroom_mb=args.autoscale_headroom_mb,
                                       autoscale_up_margin_mb=args.autoscale_up_margin_mb,
                                       disk_floor_gb=disk_floor, eval_disk_gb=eval_disk,
-                                      disk_box=disk_box,
+                                      disk_box=disk_box, pause_box=pause_box, stop_box=stop_box,
                                       transcript_dir=transcripts_dir,
                                       run_id="r%x_a%d" % (int(started), attempt))
             for r in res:
