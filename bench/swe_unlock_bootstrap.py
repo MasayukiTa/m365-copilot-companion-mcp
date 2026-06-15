@@ -30,8 +30,9 @@ goal = ('First call the tool `unlock` with password="%s" (this unlocks mutating 
 
 # Invoke the tested relay main() with a constructed argv (password stays in-process argv only).
 sys.argv = ["relay", "--cdp-url", cdp, "--conversation-url", agent,
-            "--goal", goal, "--run-id", "unlock_bootstrap", "--max-turns", "4",
+            "--goal", goal, "--run-id", "unlock_bootstrap", "--max-turns", "6",
             "--per-turn-timeout", "300", "--no-research"]
+# (--max-turns 6: unlock+list_unlocked = 2 calls, +margin for tool discovery on first turn)
 from relay.copilot_autopilot_relay import main
 main()
 print("\n[unlock_bootstrap] relay finished")
