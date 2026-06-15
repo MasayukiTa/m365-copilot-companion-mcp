@@ -124,6 +124,10 @@ def main():
         # tox forwards -rA to pytest and parse_log_pytest_v2 sees PASSED lines. Additive
         # (${PYTHONPATH:+...} preserves any existing value) and a no-op for non-pytest repos.
         "export PYTHONPATH=/mnt/c/Users/USER/companion-mcp/bench/swe_shim${PYTHONPATH:+:$PYTHONPATH}; "
+        # this corporate network INTERMITTENTLY MITM-inspects HTTPS, breaking swebench's
+        # requirements fetch from raw.githubusercontent.com (false EVAL_ERROR). The shim skips
+        # verification for those PUBLIC fetches when this is set (safe on a benchmark host).
+        "export SWE_INSECURE_FETCH=1; "
         "cd /root/swe; " + purge +
         "/root/swe-venv/bin/python -m swebench.harness.run_evaluation "
         "--dataset_name /root/swe/lite_local.json --predictions_path " + predwsl + " "

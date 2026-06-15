@@ -92,3 +92,33 @@ def _make_eval_script_list_with_addopts(
 # Patch the name actually referenced inside test_spec.make_test_spec (it imported
 # `make_eval_script_list` into its own module namespace).
 _ts_mod.make_eval_script_list = _make_eval_script_list_with_addopts
+
+
+# ── corporate-SSL workaround (opt-in: SWE_INSECURE_FETCH=1) ──────────────────────────────────
+# This eval host's network INTERMITTENTLY MITM-inspects HTTPS with a self-signed root CA, which
+# breaks swebench's requirements fetch from raw.githubusercontent.com
+# (requests SSLError: CERTIFICATE_VERIFY_FAILED -> the env image can't build -> the whole eval
+# produces no report -> a FALSE EVAL_ERROR even though the agent's patch is fine). Observed: a
+# whole arm graded 7/12 EVAL_ERROR during an inspection window; minutes later the same fetch
+# succeeded. For a benchmark host fetching PUBLIC files, skipping verification is safe and removes
+# this confound. Off unless SWE_INSECURE_FETCH=1.
+if _os.environ.get("SWE_INSECURE_FETCH") == "1":
+    try:
+        import ssl as _ssl
+        _ssl._create_default_https_context = _ssl._create_unverified_context
+    except Exception:
+        pass
+    try:
+        import requests as _rq
+        _orig_req = _rq.Session.request
+        def _req_noverify(self, *a, **k):
+            k.setdefault("verify", False)
+            return _orig_req(self, *a, **k)
+        _rq.Session.request = _req_noverify
+        try:
+            import urllib3 as _u3
+            _u3.disable_warnings()
+        except Exception:
+            pass
+    except Exception:
+        pass
