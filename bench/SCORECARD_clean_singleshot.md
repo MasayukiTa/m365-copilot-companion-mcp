@@ -46,12 +46,43 @@ in one shot), A/B'd separately.
 
 ## Caveats
 - **Single-shot pass@1 is stochastic** (the agent's solve is non-deterministic): the same instance
-  can pass on one run and miss on another. So per-instance ON-vs-OFF flips can be variance, not
-  signal. A clean research on/off comparison needs larger N or multiple runs per arm.
-- N=12 is a first signal; CIs are wide.
+  can pass on one run and miss on another. **Direct evidence here:** OFF and research-ON both score
+  4/12 but resolve *different* instances (OFF: sphinx-10451 + a sympy; ON: sphinx-10325 +
+  pytest-11143). Per-instance ON-vs-OFF flips are variance, not signal. A clean comparison of any
+  axis needs larger N or multiple runs per arm.
+- **The eval host is the dominant confound, not the model.** The first research-ON grade was 0/12
+  purely because the WSL/Docker host wedged and produced no report for 4 genuinely-passing patches.
+  Always suspect the eval host on extreme values (0/N, N/N) and re-grade before concluding. Now
+  enforced in swe_check (report.json marker + retry + EVAL_ERROR exit code).
+- N=12 is a first signal; CIs are wide (95% Wilson ≈ [14%, 61%]).
 
-## Research ON arm
-In progress (`swe_singleshot.py --research`, same 12 instances). Compares research-delegation effect
-vs the 4/12 OFF baseline. (Results: `.fleet/swe/_clean_ss_research_results.txt`.)
+## Research ON arm — result: 4/12 = 33% (identical to OFF; no measurable effect)
+
+**research-ON pass@1 = 4/12 = 33.3%**, the SAME count as OFF — but the resolved SET differs, which
+is stochastic single-shot variance, NOT a research effect:
+
+| repo | OFF resolves | research-ON resolves |
+|------|--------------|----------------------|
+| scikit-learn | 10297, 10949 | 10297, 10949 |
+| sphinx | 10451 | **10325** (different instance) |
+| sympy | one of 3 | none |
+| pytest | none | **11143** |
+| **total** | **4/12** | **4/12** |
+
+Two facts make this a non-result for the research axis, and both were only visible by LOOKING at
+the run-logs (not the aggregate):
+1. **The agent never actually delegated research.** The `RESEARCH:` strings in the run-logs are the
+   goal's *instruction text*, not a query the agent emitted — it solved each bug directly in ~1
+   turn. So research-ON was effectively a **second OFF run**; the per-instance flips are the
+   expected variance of two independent draws landing on the same count (4) with different members.
+2. **The raw research-ON grade was a misleading 0/12** — a pure WSL eval-host artifact (false
+   NOTs). Healthy-WSL re-grade restored it to 4/12. This is now prevented in code: swe_check uses
+   the per-instance `report.json` as the eval-completion marker → no-report triggers host recovery
+   + retry, and a persistent no-report returns EVAL_ERROR (exit 2), never a silent miss.
+
+**Conclusion: on SWE local-code bugs, research ON vs OFF is indistinguishable because the agent
+does not choose to delegate. Measuring the research axis needs tasks where delegation actually
+fires (not local repo bugs), or a forced-research variant.** (The earlier "research hurts" reading
+was wrong on both counts — eval artifact + research never fired.)
 
 _See bench/BENCHMARK_ROADMAP.md for the full axis plan. 2026-06-15._

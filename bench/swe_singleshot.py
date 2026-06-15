@@ -54,10 +54,16 @@ def solve(inst, wt, lib, ps, max_turns, research=False):
 
 
 def grade(inst, wt):
-    """Grade the single patch ONCE with the official swebench eval. exit 0 == resolved."""
+    """Grade the single patch ONCE with the official swebench eval.
+    Returns True=resolved (exit 0), False=genuine miss (exit 1), None=EVAL_ERROR (exit 2: the
+    WSL/Docker host wedged and produced no report -- NOT a miss, must be excluded from pass@1)."""
     r = subprocess.run([VENVPY, os.path.join(REPO, "bench", "swe_check.py"), inst, wt],
                        cwd=REPO, capture_output=True, text=True, errors="replace")
-    return r.returncode == 0
+    if r.returncode == 0:
+        return True
+    if r.returncode == 2:
+        return None
+    return False
 
 
 def main():
@@ -78,6 +84,8 @@ def main():
         ln = ln.strip()
         if " " in ln:
             v, i = ln.split(" ", 1)
+            if v == "EVALERR":
+                continue   # eval-host failure, not a final verdict -> re-attempt this instance
             done[i] = (v == "RESOLVED")
 
     res = dict(done)
@@ -95,15 +103,27 @@ def main():
         reset_wt(wt)
         solve(inst, wt, lib, s["problem_statement"], args.max_turns, research=args.research)
         ok = grade(inst, wt)
+        # EVAL_ERROR (None): swe_check already recovered the host -> re-grade the SAME patch a
+        # couple times before giving up; the worktree still holds the agent's edits.
+        ge = 0
+        while ok is None and ge < 2:
+            ge += 1
+            ok = grade(inst, wt)
         res[inst] = ok
+        tag = "RESOLVED" if ok is True else ("EVALERR" if ok is None else "not")
         with open(args.results, "a", encoding="utf-8") as f:
-            f.write(("RESOLVED " if ok else "not ") + inst + "\n")
-        npass = sum(1 for v in res.values() if v)
+            f.write(tag + " " + inst + "\n")
+        npass = sum(1 for v in res.values() if v is True)
+        ndone = sum(1 for v in res.values() if v is not None)   # EVAL_ERRORs excluded from denom
         print("[%d/%d] %s -> %s   (running pass@1 = %d/%d)" % (
-            n, len(spec), inst, "RESOLVED" if ok else "not", npass, len(res)))
+            n, len(spec), inst, tag, npass, ndone))
 
-    npass = sum(1 for v in res.values() if v)
-    print("\n=== CLEAN single-shot pass@1: %d/%d ===" % (npass, len(res)))
+    npass = sum(1 for v in res.values() if v is True)
+    ndone = sum(1 for v in res.values() if v is not None)
+    nerr = sum(1 for v in res.values() if v is None)
+    print("\n=== CLEAN single-shot pass@1: %d/%d ===" % (npass, ndone))
+    if nerr:
+        print("(%d instance(s) excluded as EVAL_ERROR -- host wedge, re-run when healthy)" % nerr)
     print("(no grader-iteration, no regression feedback, fresh non-holdout instances)")
     return 0
 
