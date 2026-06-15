@@ -395,6 +395,7 @@ class RelayWorker:
         self.research_count = 0
         self.max_research = max_research
         self.research_model = "Claude"
+        self._research_session = None   # non-blocking ResearchSession while status=='researching'
         # review panel (operator B, perspective-diverse): a list of lenses runs one
         # independent reviewer each, aggregated by majority. Empty = single reviewer.
         self.review_lenses = list(review_lenses) if review_lenses else []
@@ -464,6 +465,11 @@ class RelayWorker:
         try:
             if self._refuter_session is not None:
                 self._refuter_session.close()     # don't leak the side-page tab
+        except Exception:
+            pass
+        try:
+            if self._research_session is not None:
+                self._research_session.close()    # don't leak the research side-page tab
         except Exception:
             pass
         self.page = None
@@ -661,42 +667,26 @@ class RelayWorker:
         """Leave a blocking acceptance eval (always, even on failure/exception)."""
         self.eval_busy_until = 0.0
 
-    def _run_research(self, query):
-        """Spawn the Researcher sub-agent in a side page (this worker's own browser context),
-        return its report (<=3500 chars) or '' on failure. Ported from the single-agent relay's
-        RESEARCH: delegation (copilot_autopilot_relay) so a FLEET worker can also delegate a
-        deep-dive and feed the result back -- the accuracy lever the fleet was missing.
-
-        v1 is BLOCKING (mirrors the acceptance-eval path): it freezes the round-robin for the
-        bounded duration of the deep-dive. We mark the worker eval-busy first so the watchdog
-        waits it out (status 'verifying' + deadline + snapshot flush) instead of hard-resetting.
-        A non-blocking ResearchSession (like RefuterSession) is the parallelism-preserving
-        follow-up; accuracy-first v1 keeps it simple and proven."""
-        self._mark_eval_busy()
-        self.reason = "🔎 外部調査中: " + (query or "")[:60]
-        rpage = None
-        report = ""
-        try:
-            from .agent_profiles import RESEARCHER, ask_agent
-            rpage = self._context.new_page()
-            rres = ask_agent(rpage, query, RESEARCHER, model_name=self.research_model)
-            if rres.get("ok"):
-                report = (rres.get("result") or "")[:3500]
-        except Exception:
-            report = ""
-        finally:
-            try:
-                if rpage is not None:
-                    rpage.close()
-            except Exception:
-                pass
-            try:
-                if self.page is not None:
-                    self.page.bring_to_front()    # return focus to the worker's own tab
-            except Exception:
-                pass
-            self._clear_eval_busy()
-        return report
+    def _poll_research(self):
+        """Drive the NON-BLOCKING deep-research (status=='researching'). None -> still researching,
+        so the round-robin keeps stepping every OTHER worker; a report string -> inject it and
+        continue; '' (failure/timeout) -> continue without it. Mirrors _poll_refute, so a worker's
+        minutes-long deep-dive never freezes the fleet."""
+        report = self._research_session.poll()
+        if report is None:
+            return False                     # still researching; the sweep keeps moving
+        self._research_session = None
+        if report:
+            self.job = ("依頼された調査が完了しました。以下が結果です。これを踏まえて作業を続けて"
+                        "ください。\n--- 調査結果 ---\n" + report + "\n--- 調査結果ここまで ---\n"
+                        + CONTINUE_JOB)
+            self.reason = "research %d/%d 反映して続行" % (self.research_count, self.max_research)
+        else:
+            self.job = ("調査結果を取得できませんでした。調査なしで可能な範囲で進めるか、無理なら"
+                        "最後の行に STUCK: 理由 と書いてください。")
+            self.reason = "research %d/%d 結果なし" % (self.research_count, self.max_research)
+        self.status = "ready"
+        return False
 
     def _salvage_via_checks(self):
         """Last-chance acceptance salvage for the EXHAUSTION paths (spec 3-3 verify gate,
@@ -782,16 +772,15 @@ class RelayWorker:
                 self.status = "ready"
                 return
             self.research_count += 1
-            report = self._run_research(rq)
-            if report:
-                self.job = ("依頼された調査が完了しました。以下が結果です。これを踏まえて作業を続けて"
-                            "ください。\n--- 調査結果 ---\n" + report + "\n--- 調査結果ここまで ---\n"
-                            + CONTINUE_JOB)
-            else:
-                self.job = ("調査を試みましたが結果を取得できませんでした。調査結果なしで可能な範囲で"
-                            "進めるか、無理なら最後の行に STUCK: 理由 と書いてください。")
-            self.status = "ready"
-            self.reason = "research %d/%d -> 結果を反映して続行" % (self.research_count, self.max_research)
+            # NON-BLOCKING: kick off the Researcher in a side page and enter 'researching'. The
+            # round-robin keeps stepping every OTHER worker while this one's deep-dive runs (see
+            # _poll_research). A blocking wait here would freeze the whole fleet for minutes and
+            # cause false turn-timeouts on the siblings -- the reason v1 was unusably slow.
+            from .agent_profiles import ResearchSession
+            self._research_session = ResearchSession(
+                self._context, rq, model_name=self.research_model).start()
+            self.status = "researching"
+            self.reason = "🔎 外部調査中 (%d/%d): %s" % (self.research_count, self.max_research, rq[:48])
             return
         # plan phase (plan_mode): capture the proposed plan and PAUSE for approval; a steer
         # (approve as-is, or an edit) resumes into execution. Don't run DONE/CONTINUE yet.
@@ -947,6 +936,8 @@ class RelayWorker:
             return False
         if self.status == "verifying":
             return self._poll_verify()
+        if self.status == "researching":
+            return self._poll_research()
         if self.status == "refuting":
             return self._poll_refute()
         if self.status == "ready":
