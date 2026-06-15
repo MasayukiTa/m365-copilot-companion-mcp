@@ -196,15 +196,25 @@ class RefuterSession:
         self._last = None
         self._stable_since = None
         self._nudges_used = 0
+        self._pending_open = True  # side-page not opened yet -- deferred until there's free RAM
         self._done = None          # verdict tuple once finished
 
     def start(self):
+        # Defer the side-page open until poll() sees enough free RAM (ram_room_for_tab) -- the
+        # same RAM-gating ResearchSession uses, so the ultra pipeline's sub-agent tabs never crowd
+        # a low-RAM box into the sweep-wedge + watchdog hard-reset failure mode.
+        import time
+        self._pending_open = True
+        self._t_send = time.time()
+        return self
+
+    def _do_open(self):
         import time
         from .copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver
         try:
             if self.context is None or not self.base_url:
                 self._finish(("UNCLEAR", ""))
-                return self
+                return
             self.page = self.context.new_page()
             self.page.goto(self.base_url, wait_until="domcontentloaded", timeout=45000)
             appeared = False
@@ -215,15 +225,15 @@ class RefuterSession:
                     break
             if not appeared:
                 self._finish(("UNCLEAR", ""))
-                return self
+                return
             self.drv = CopilotWebDriver(self.page)
             self._count_before = self.drv._answers().count()
             self.drv._count_before = self._count_before
             self.drv.send(build_refuter_prompt(self.goal, self.final, lens=self.lens))
+            self._pending_open = False
             self._t_send = time.time()
         except Exception:
             self._finish(("UNCLEAR", ""))
-        return self
 
     def poll(self):
         """None while the reviewer is still answering; else (kind, reason)."""
@@ -231,6 +241,16 @@ class RefuterSession:
         from .copilot_autopilot_relay import _is_processing
         if self._done is not None:
             return self._done
+        # RAM-gated lazy open (bounded by timeout); returns quickly so the sweep stays responsive.
+        if self._pending_open:
+            from .relay_fleet import ram_room_for_tab
+            if self._t_send and time.time() - self._t_send > self.timeout_s:
+                self._finish(("UNCLEAR", ""))
+                return self._done
+            if not ram_room_for_tab():
+                return None
+            self._do_open()
+            return None
         if self.drv is None:
             return self._done
         try:
