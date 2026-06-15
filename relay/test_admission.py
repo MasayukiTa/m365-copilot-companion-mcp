@@ -304,12 +304,84 @@ def test_disk_floor_blocks_in_loop():
         _restore_worker(orig)
 
 
+# ── (e) stop_box: graceful abort cancels all workers and ends the run ─────────────────────────
+def test_stop_cancels_running_fleet():
+    rf.avail_phys_mb = lambda: 64000.0
+    rf.free_disk_gb = lambda path=None: 500.0
+    state = {"control": {}}
+    orig = _install_fake_worker(state)
+    try:
+        goals = ["g0", "g1", "g2"]
+        stop_box = [False]
+        sweeps = {"n": 0}
+
+        def on_tick(workers):
+            sweeps["n"] += 1
+            if sweeps["n"] == 2:        # workers attached + waiting -> request stop
+                stop_box[0] = True
+            if sweeps["n"] >= 8:        # safety net: a broken stop must not hang the test
+                for w in workers:
+                    state["control"][w.name] = "done"
+
+        res = run_relay_fleet(FakeContext(), goals, "http://agent", max_concurrent=2,
+                              poll_s=0, on_tick=on_tick, notify=lambda *a, **k: None,
+                              stop_box=stop_box)
+        # stop ended the run WITHOUT any goal completing as DONE (none were set ->done pre-stop)
+        check("stop_no_goal_done", all(r["outcome"] != "DONE" for r in res))
+        check("stop_workers_cancelled", any(r["outcome"] == "CANCELLED" for r in res))
+        check("stop_exits_promptly", sweeps["n"] <= 4)
+    finally:
+        _restore_worker(orig)
+
+
+# ── (f) pause_box: freeze in place (no tabs opened), then resume to completion ────────────────
+def test_pause_freezes_then_resumes():
+    rf.avail_phys_mb = lambda: 64000.0
+    rf.free_disk_gb = lambda path=None: 500.0
+    state = {"control": {}}
+    orig = _install_fake_worker(state)
+    try:
+        goals = ["g0", "g1"]
+        pause_box = [True]             # start frozen
+        sweeps = {"n": 0}
+        opened_while_paused = {"v": False}
+
+        def on_tick(workers):
+            sweeps["n"] += 1
+            if pause_box[0]:
+                # while frozen admission is skipped -> NO worker should hold a tab
+                if any(getattr(w, "page", None) is not None for w in workers):
+                    opened_while_paused["v"] = True
+                if sweeps["n"] >= 3:
+                    pause_box[0] = False     # resume after a few frozen sweeps
+            else:
+                for w in workers:            # after resume, drive each to completion
+                    if getattr(w, "page", None) is not None and w.status == "waiting":
+                        state["control"][w.name] = "done"
+            if sweeps["n"] >= 30:            # safety net against a broken resume
+                pause_box[0] = False
+                for w in workers:
+                    state["control"][w.name] = "done"
+
+        res = run_relay_fleet(FakeContext(), goals, "http://agent", max_concurrent=2,
+                              poll_s=0, on_tick=on_tick, notify=lambda *a, **k: None,
+                              pause_box=pause_box)
+        check("pause_no_tab_opened_while_frozen", opened_while_paused["v"] is False)
+        check("pause_resumes_to_completion",
+              len(res) == 2 and all(r["outcome"] == "DONE" for r in res))
+        check("pause_actually_held_some_sweeps", sweeps["n"] >= 3)
+    finally:
+        _restore_worker(orig)
+
+
 def main():
     test_disk_floor_predicate()
     test_hysteresis_no_thrash()
     test_continuous_admission_no_barrier()
     test_verifying_counts_in_cap()
     test_disk_floor_blocks_in_loop()
+    test_stop_cancels_running_fleet()
+    test_pause_freezes_then_resumes()
     print("\n=== %d/%d admission checks passed ===" % (sum(results), len(results)))
     return 0 if all(results) else 1
 

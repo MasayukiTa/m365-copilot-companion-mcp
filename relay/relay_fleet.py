@@ -954,7 +954,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     autoscale_per_tab_mb=700, autoscale_headroom_mb=1400,
                     autoscale_up_margin_mb=0,
                     disk_floor_gb=None, eval_disk_gb=None, disk_box=None,
-                    transcript_dir=None, run_id="", busy_writer=None):
+                    transcript_dir=None, run_id="", busy_writer=None,
+                    pause_box=None, stop_box=None):
     """Drive len(goals) autonomous relays in parallel to completion, but never with
     more than `max_concurrent` tabs open at once (defaults to what free RAM allows).
     A goal's tab is opened only when a slot frees and CLOSED the moment it finishes.
@@ -1004,6 +1005,14 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     # value (env SWE_DISK_FLOOR_GB default) applies. <=0 disables the disk gate.
     if disk_box is None:
         disk_box = [DEFAULT_DISK_FLOOR_GB if disk_floor_gb is None else float(disk_floor_gb)]
+    # pause/stop control (1-element lists read EACH loop, set by the cockpit via commands.json):
+    # pause_box[0] True  -> freeze the fleet in place (no new turns / no new tabs / no liveness
+    #                       probe) so a deliberate network switch doesn't trip FleetContextLost.
+    # stop_box[0]  True  -> graceful abort: cancel every running worker and end the run.
+    if pause_box is None:
+        pause_box = [False]
+    if stop_box is None:
+        stop_box = [False]
 
     workers = [RelayWorker(g, "w%d" % i, max_turns=max_turns,
                            refuter=refuter, max_refute=max_refute, plan_mode=plan_mode,
@@ -1030,6 +1039,28 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 for w in workers if w.outcome not in ("DONE", "CANCELLED")]
 
     while any(w.status not in TERMINAL for w in workers) or (add_box and len(add_box) > 0):
+        # --- stop / pause control (cockpit -> commands.json -> *_box, read every loop) ---
+        if stop_box[0]:
+            # graceful abort: cancel every still-running worker, then fall through to the
+            # cleanup below (which closes all tabs) and return the results normally.
+            for w in workers:
+                if w.status not in TERMINAL:
+                    w.cancel()
+            break
+        if pause_box[0]:
+            # freeze: take NO new turns, open NO tabs, and DON'T probe the context -- a
+            # deliberate network switch must not trip FleetContextLost. Keep firing on_tick
+            # so a later {"pause":false}/{"stop":true} is still drained and the cockpit shows
+            # the paused state. Any cloud turn already in flight settles on its own; resume
+            # picks up from the next poll. State is fully retained (nothing is lost).
+            if on_tick:
+                try:
+                    on_tick(workers)
+                except Exception:
+                    pass
+            time.sleep(poll_s)
+            continue
+
         # auto-recovery: if the Edge/CDP context has died (wedged, or hard-reset by the
         # watchdog) a LIVE probe raises -> bail out with the unfinished goals so the
         # runner can reconnect to a fresh Edge and resume them. NB: context.pages is a
