@@ -56,6 +56,20 @@ AGENT_DEAD_MARKERS = (
     "問題が解決しない場合", "if the problem persists",
 )
 
+# CONNECTION-CONSENT detector. The FIRST time the agent calls an MCP tool, Copilot can show a
+# connection-consent card ("この資格情報を 接続マネージャーを開く で検証してください ... 再試行")
+# instead of executing -- the MCP connector's per-user connection is not authorized yet. This is
+# NOT a dead agent and NOT a task failure: a HUMAN must authorize the connection IN THE DEDICATED
+# EDGE (the consent is bound to that browser session/profile, not the account, so authorizing
+# elsewhere does NOT count). The relay cannot click it (security gate). Detect it, SURFACE the
+# headless Edge to the foreground so the user can authorize, and STUCK with an actionable reason
+# rather than looping the card until MAXTURNS.
+CONSENT_MARKERS = (
+    "接続マネージャー", "この資格情報を", "接続の準備が整ったら",
+    "open connection manager", "connection manager", "verify this credential",
+    "verify your credential", "authorize the connection", "set up this connection",
+)
+
 # Statuses where the main thread is legitimately busy with a BOUNDED acceptance check
 # (eval/verification), NOT a wedged Edge. The watchdog must not hard-reset while a worker
 # is in one of these -- doing so throws away in-progress eval and resumes every goal at
@@ -420,6 +434,8 @@ class RelayWorker:
         self.research_model = "Claude"
         self._research_session = None   # non-blocking ResearchSession while status=='researching'
         self._copilot_err_streak = 0    # consecutive Copilot/tool 'SystemError' replies (path down)
+        self._consent_streak = 0        # consecutive MCP connection-consent cards (auth needed)
+        self._consent_surfaced = False  # surfaced the Edge once so the user can authorize
         # review panel (operator B, perspective-diverse): a list of lenses runs one
         # independent reviewer each, aggregated by majority. Empty = single reviewer.
         self.review_lenses = list(review_lenses) if review_lenses else []
@@ -757,6 +773,33 @@ class RelayWorker:
         # pattern, bail FAST after a few, and go STUCK so the goal can be re-submitted on a healthy
         # agent rather than wasting the whole turn budget on a dead endpoint.
         _low = resp.lower()
+        # CONNECTION-CONSENT (interactive auth) -- a FOREGROUND-required event. The agent's tool
+        # call returned the connector's consent card instead of a result. Surface the (headless)
+        # Edge to the foreground on the FIRST occurrence so the user can authorize the connection
+        # in that very Edge, then STUCK fast (do not loop the card to MAXTURNS).
+        if any(m in resp for m in CONSENT_MARKERS) or any(m in _low for m in CONSENT_MARKERS):
+            self._consent_streak += 1
+            if not self._consent_surfaced:
+                self._consent_surfaced = True
+                try:
+                    from .edge_recover import surface
+                    surface()
+                except Exception:
+                    pass
+                try:
+                    default_notify("⚠ 接続の承認が必要",
+                                   "専用Edgeを前面に出しました。MCP接続のconsentを承認してください (%s)" % self.name)
+                except Exception:
+                    pass
+            if self._consent_streak >= 2:
+                self.status, self.outcome = "stuck", "STUCK"
+                self.reason = ("⚠ MCPコネクタの**接続承認(consent)が未完**。エージェントはツールを呼ぶ度に"
+                               "「接続マネージャーを開く/資格情報を検証」カードを返している。これはタスク失敗"
+                               "ではなく**対話認証**。→ 前面に出した**専用Edge**で接続を承認(consentは当該"
+                               "ブラウザ専用・他で承認しても無効)してから再投入を。")
+                return
+            self.job = RETRY_JOB
+            return
         if any(m in _low for m in AGENT_DEAD_MARKERS):
             self._copilot_err_streak += 1
             if self._copilot_err_streak >= 3:
