@@ -446,6 +446,27 @@ def test_research_session_ram_gated_open():
         rf2.ram_room_for_tab = orig
 
 
+# ── (i) dead-agent / dead-path detector: repeated SystemError / admin-block -> STUCK fast ─────
+def test_dead_agent_detector():
+    err = ("申し訳ありません。予期しないエラーが発生しました。エラー コード: SystemError。時刻: ")
+    w = RelayWorker("do the thing", "w0")
+    w._decide(err + "t1")                 # streak 1 -> retry, not stuck
+    check("dead_streak_1_retry", w.status != "stuck" and w._copilot_err_streak == 1)
+    w._decide(err + "t2")                 # streak 2 -> retry
+    w._decide(err + "t3")                 # streak 3 -> STUCK
+    check("dead_stuck_after_3", w.status == "stuck" and w.outcome == "STUCK")
+    # the admin-block message triggers the same fast bail
+    w2 = RelayWorker("g", "w1")
+    msg = "ページをもう一度読み込んでみてください。管理者に問い合わせてください。セッション ID: "
+    w2._decide(msg + "1"); w2._decide(msg + "2"); w2._decide(msg + "3")
+    check("admin_block_stuck", w2.status == "stuck")
+    # a real (non-error) reply resets the streak so a one-off blip doesn't accumulate
+    w3 = RelayWorker("g", "w2")
+    w3._decide(err + "x")
+    w3._decide("ファイルを修正しました。続けます。CONTINUE")
+    check("err_streak_resets_on_real_reply", w3._copilot_err_streak == 0)
+
+
 def main():
     test_disk_floor_predicate()
     test_hysteresis_no_thrash()
@@ -456,6 +477,7 @@ def main():
     test_pause_freezes_then_resumes()
     test_fleet_research_nonblocking()
     test_research_session_ram_gated_open()
+    test_dead_agent_detector()
     print("\n=== %d/%d admission checks passed ===" % (sum(results), len(results)))
     return 0 if all(results) else 1
 
