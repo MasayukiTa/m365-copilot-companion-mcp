@@ -473,6 +473,36 @@ def test_dead_agent_detector():
     check("err_streak_resets_on_real_reply", w3._copilot_err_streak == 0)
 
 
+def test_consent_detector():
+    # The MCP connection-consent card is a FOREGROUND-required interactive-auth event: surface
+    # the Edge once so the user can authorize IN THAT EDGE, then STUCK fast (don't loop the card).
+    import relay.edge_recover as er
+    calls = {"n": 0}
+    orig = er.surface
+    er.surface = lambda *a, **k: calls.__setitem__("n", calls["n"] + 1)
+    try:
+        card = ("desktopfile操作\nまずは接続して、必要な情報を探します。この資格情報を 接続マネージャーを開く で"
+                "検証してください。接続の準備が整ったら、この要求をやり直してください。再試行 キャンセル")
+        w = RelayWorker("fix the bug", "w0")
+        w._decide(card)                       # 1st -> surface once + retry, NOT stuck
+        check("consent_surface_on_first", calls["n"] == 1 and w._consent_surfaced and w.status != "stuck")
+        w._decide(card)                       # 2nd -> STUCK (don't burn turns on the card)
+        check("consent_stuck_after_2", w.status == "stuck" and w.outcome == "STUCK")
+        check("consent_msg_dedicated_edge", "専用Edge" in (w.reason or ""))
+        check("consent_surface_once", calls["n"] == 1)   # not re-surfaced on the 2nd card
+        # an English consent card trips it too
+        w2 = RelayWorker("g", "w1")
+        en = "Please open connection manager and verify your credential, then retry."
+        w2._decide(en); w2._decide(en)
+        check("consent_detector_english", w2.status == "stuck")
+        # a real tool result (no card) does NOT trip it
+        w3 = RelayWorker("g", "w2")
+        w3._decide('{"platform":"win32","python_version":"3.11"} 完了。CONTINUE')
+        check("consent_no_false_positive", w3.status != "stuck" and w3._consent_streak == 0)
+    finally:
+        er.surface = orig
+
+
 def main():
     test_disk_floor_predicate()
     test_hysteresis_no_thrash()
@@ -484,6 +514,7 @@ def main():
     test_fleet_research_nonblocking()
     test_research_session_ram_gated_open()
     test_dead_agent_detector()
+    test_consent_detector()
     print("\n=== %d/%d admission checks passed ===" % (sum(results), len(results)))
     return 0 if all(results) else 1
 
