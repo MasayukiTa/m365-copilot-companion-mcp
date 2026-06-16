@@ -341,9 +341,28 @@ if __name__ == "__main__":
     # timeout_graceful_shutdown gives in-flight requests up to 30s to finish on SIGTERM
     # instead of an immediate hard kill (uvicorn default 0 = no grace). Passed through
     # FastMCP.run_http_async -> uvicorn.Config(**uvicorn_config).
-    mcp.run(
-        transport="streamable-http",
-        port=8000,
-        path="/mcp",
-        uvicorn_config={"timeout_graceful_shutdown": 30},
-    )
+    # Copilot Studio's MCP connector does NOT send the dual Accept header
+    # ("application/json, text/event-stream") that FastMCP 2.14's streamable-http strictly
+    # requires -> the server 406'd ("Client must accept both...") and the connector got no tools
+    # (surfaced as a malformed [{"jsonrpc":"2.0"}]). Two fixes, both safe for existing clients
+    # (the relay already accepts JSON): (1) json_response=True -> reply in plain JSON the connector
+    # parses directly instead of SSE; (2) an Accept-normalising ASGI middleware that forces both
+    # media types so the 406 can never fire regardless of what the client sends.
+    import uvicorn
+    from starlette.middleware import Middleware
+
+    class _AcceptBoth:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") == "http":
+                hdrs = [(k, v) for (k, v) in (scope.get("headers") or []) if k.lower() != b"accept"]
+                hdrs.append((b"accept", b"application/json, text/event-stream"))
+                scope = dict(scope)
+                scope["headers"] = hdrs
+            await self.app(scope, receive, send)
+
+    app = mcp.http_app(path="/mcp", transport="streamable-http",
+                       json_response=True, middleware=[Middleware(_AcceptBoth)])
+    uvicorn.run(app, host="127.0.0.1", port=8000, timeout_graceful_shutdown=30)
