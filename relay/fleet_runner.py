@@ -347,12 +347,17 @@ def main():
                     help="max deep-research delegations a worker may make per goal (RESEARCH: "
                          "-> Researcher side-agent). Default 3; 0 disables research.")
     ap.add_argument("--accuracy", action="store_true",
-                    help="ULTRA ACCURACY mode: ignore time, maximise CLEAN correctness. Turns on "
-                         "the perspective-diverse review PANEL (correctness/edge/security, "
-                         "refute-until-clean), liberal deep-research, and the repo's-own-tests "
-                         "self-verification (SWE_STRONG_SELFTEST). Unattended-safe (no plan "
-                         "approval pause). The accuracy gain is clean -- adversarial review + "
-                         "self-test + research, never the hidden grading tests.")
+                    help="alias for --effort ultra (kept for back-compat).")
+    ap.add_argument("--effort", choices=["min", "max", "ultra", "auto"], default="auto",
+                    help="how much effort the scaffold spends per task (default auto). "
+                         "min: single-shot, minimal-diff, no review/research. "
+                         "max: + on-demand research + one correctness refuter. "
+                         "ultra: full 3-lens panel + refute-until-clean + liberal research + "
+                         "self-test (ignore time). "
+                         "auto: RIGHT-SIZE per task -- solve minimally, then ONE minimality+"
+                         "correctness refuter; accept if upheld (cheap, no over-engineering), "
+                         "escalate to research+panel only when it refutes. Beats a uniform ultra "
+                         "by not over-engineering the easy tasks (ultra's observed failure mode).")
     ap.add_argument("--state-dir", default=os.path.join(_repo_root(), ".fleet"),
                     help="where to write the live status.json the cockpit reads")
     args = ap.parse_args()
@@ -363,12 +368,38 @@ def main():
     # is clean: review/self-test/research never touch the hidden grading tests. Unattended-safe
     # (deliberately NOT --plan, which would pause for approval and stall a headless run).
     if args.accuracy:
-        args.panel = True                               # perspective-diverse review (3 lenses)
-        args.max_refute = max(args.max_refute, 4)        # refute-until-clean rounds
-        args.max_research = max(args.max_research, 6)     # liberal deep-research (now non-blocking)
-        os.environ["SWE_STRONG_SELFTEST"] = "1"          # self-verify vs the repo's OWN tests
-        print("[accuracy] ULTRA mode ON: panel(correctness/edge/security) + refute<=%d + "
-              "research<=%d + repo-self-test; time ignored." % (args.max_refute, args.max_research))
+        args.effort = "ultra"
+    # Effort -> worker levers. A UNIFORM ultra over-engineers easy tasks (observed: 44-47 line
+    # diffs for 2-7 line gold fixes), so 'auto' right-sizes: solve minimally, gate on ONE
+    # minimality+correctness refuter, and escalate (research + the refute-fix loop) only when it
+    # refutes. _lenses is the refuter lens list (None = single general refuter; >1 = a panel).
+    _eff = args.effort
+    args._lenses = None
+    if _eff == "min":
+        args.refuter = False
+        args.max_refute = 0
+        args.max_research = 0
+    elif _eff == "max":
+        args.refuter = True
+        args.max_refute = max(args.max_refute, 1)
+        args.max_research = max(args.max_research, 3)
+    elif _eff == "ultra":
+        args.refuter = True
+        args._lenses = list(PANEL_LENSES)               # correctness / edge / security
+        args.max_refute = max(args.max_refute, 4)
+        args.max_research = max(args.max_research, 6)
+        os.environ["SWE_STRONG_SELFTEST"] = "1"
+    elif _eff == "auto":
+        args.refuter = True
+        args._lenses = ["minimality"]                   # the right-size gate: minimal + correct?
+        args.max_refute = max(args.max_refute, 3)
+        args.max_research = max(args.max_research, 3)
+        os.environ["SWE_STRONG_SELFTEST"] = "1"
+    if args.panel and args._lenses is None:             # explicit --panel still forces the 3 lenses
+        args._lenses = list(PANEL_LENSES)
+        args.refuter = True
+    print("[effort] %s  (refuter=%s lenses=%s refute<=%d research<=%d)"
+          % (_eff, args.refuter, args._lenses, args.max_refute, args.max_research))
 
     goals = _read_goals(args)
     if not goals:
@@ -674,10 +705,10 @@ def main():
                                       max_turns=args.max_turns, poll_s=args.poll_s,
                                       notify=default_notify, on_tick=on_tick,
                                       max_concurrent=max_conc, mc_box=mc_box, add_box=add_box,
-                                      refuter=args.refuter or args.panel,
+                                      refuter=args.refuter,
                                       max_refute=args.max_refute, plan_mode=args.plan,
                                       max_research=args.max_research,
-                                      review_lenses=(list(PANEL_LENSES) if args.panel else None),
+                                      review_lenses=args._lenses,
                                       max_transient=args.max_transient,
                                       autoscale=autoscale, autoscale_max=autoscale_max,
                                       asc_box=asc_box,
