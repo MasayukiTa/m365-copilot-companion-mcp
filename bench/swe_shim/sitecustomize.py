@@ -38,6 +38,8 @@ directory to PYTHONPATH in the WSL eval command). It is imported automatically
 at interpreter startup, before ``-m swebench.harness.run_evaluation`` runs, so
 the monkeypatch is in place before any TestSpec is built.
 """
+import os as _os    # module-level: also used by the SWE_INSECURE_FETCH block below (was only
+                    # imported inside a function -> NameError at module scope)
 import swebench.harness.test_spec.test_spec as _ts_mod
 from swebench.harness.test_spec.create_scripts import (
     make_eval_script_list as _orig_make_eval_script_list,
