@@ -61,6 +61,8 @@ class CockpitWindow : Window
     int _maxtabs = 3;
     bool _autoscale = false;   // RAM-aware autoscale on/off (NEW)
     int _autoMax = 4;          // ceiling (上限) tabs may grow to under autoscale (NEW)
+    string _effort = "auto";   // effort mode min|max|ultra|auto -> settings.txt effort= (NEW)
+    bool _paused = false;      // local fleet pause/resume toggle state (NEW)
     long _settingsMtime = 0;
 
     readonly string _statusPath, _commandsPath, _historyPath, _openPath;
@@ -211,6 +213,11 @@ class CockpitWindow : Window
         if (k == "eta_in") return ja ? "あと" : "in";
         if (k == "eta_calc") return ja ? "計測中…" : "estimating…";
         if (k == "rate") return ja ? "件/時" : "/h";
+        // Effort selector + fleet-wide pause/stop (NEW)
+        if (k == "effort") return ja ? "努力" : "Effort";
+        if (k == "pause") return ja ? "一時停止" : "Pause";
+        if (k == "resume") return ja ? "再開" : "Resume";
+        if (k == "stopall") return ja ? "全停止" : "Stop all";
         return k;
     }
     string StatusLabel(string s)
@@ -276,6 +283,11 @@ class CockpitWindow : Window
                 else if (ln.StartsWith("autoscale=")) _autoscale = ln.Substring(10).Trim() == "1";
                 else if (ln.StartsWith("autoretry_max=") && int.TryParse(ln.Substring(14).Trim(), out v)) _autoRetryMax = Math.Max(1, Math.Min(3, v));
                 else if (ln.StartsWith("autoretry=")) _autoRetry = ln.Substring(10).Trim() == "1";
+                else if (ln.StartsWith("effort="))
+                {
+                    string ef = ln.Substring(7).Trim();
+                    if (ef == "min" || ef == "max" || ef == "ultra" || ef == "auto") _effort = ef;
+                }
             }
             _settingsMtime = File.GetLastWriteTimeUtc(SettingsFile).Ticks;
         }
@@ -373,6 +385,8 @@ class CockpitWindow : Window
         ctrls.HorizontalAlignment = HorizontalAlignment.Right;
 
         ctrls.Children.Add(AutoscaleControls());
+        ctrls.Children.Add(EffortControl());
+        ctrls.Children.Add(FleetControls());
         _mainBtn = IconButton("chat", 18);
         _mainBtn.ToolTip = _lang == 0 ? "メイン (チャット) を開く" : "Open main chat";
         _mainBtn.Click += delegate { OpenMain(); };
@@ -571,7 +585,7 @@ class CockpitWindow : Window
 
             var psi = new System.Diagnostics.ProcessStartInfo();
             psi.FileName = py;
-            psi.Arguments = "-m relay.fleet_runner --goals-file \"" + goalsFile + "\"";
+            psi.Arguments = "-m relay.fleet_runner --goals-file \"" + goalsFile + "\" --effort " + _effort;
             psi.WorkingDirectory = repo;
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
@@ -760,6 +774,7 @@ class CockpitWindow : Window
 
     ContentControl _iconHost;
     Button _maxMinus, _maxPlus;
+    Button _effortBtn, _pauseBtn, _stopBtn;
     Button _autoToggle;
     Button _autoMinus, _autoPlus;
     TextBlock _autoLbl, _autoValue;
@@ -815,6 +830,85 @@ class CockpitWindow : Window
         group.Children.Add(wrap);
 
         return group;
+    }
+
+    // Effort selector: one themed button showing the current effort that CYCLES
+    // min -> max -> ultra -> auto on click, persisting effort= to settings.txt. The
+    // fleet runner reads it at launch (governs both fleet and single runs).
+    static readonly string[] _effortModes = { "min", "max", "ultra", "auto" };
+    UIElement EffortControl()
+    {
+        _effortBtn = new Button();
+        _effortBtn.Cursor = Cursors.Hand; _effortBtn.BorderThickness = new Thickness(1);
+        _effortBtn.Padding = new Thickness(10, 3, 10, 3); _effortBtn.FontSize = 12;
+        _effortBtn.FontWeight = FontWeights.SemiBold;
+        _effortBtn.Margin = new Thickness(0, 0, 12, 0);
+        _effortBtn.VerticalAlignment = VerticalAlignment.Center;
+        _effortBtn.Click += delegate
+        {
+            int i = Array.IndexOf(_effortModes, _effort);
+            _effort = _effortModes[(i + 1) % _effortModes.Length];
+            SaveKey("effort", _effort);
+            PaintEffort();
+        };
+        PaintEffort();
+        return _effortBtn;
+    }
+    void PaintEffort()
+    {
+        if (_effortBtn == null) return;
+        _effortBtn.Content = T("effort") + ": " + _effort;
+        _effortBtn.Background = BtnBg; _effortBtn.Foreground = Fg; _effortBtn.BorderBrush = Border;
+    }
+
+    // Fleet-wide controls: Pause/Resume toggle + Stop-all. Both write into commands.json
+    // via WriteCommands, merging with ReadCommands first so a queued close/steer/add isn't
+    // clobbered. fleet_runner._drain_commands consumes {"pause":bool}/{"stop":true} each sweep.
+    UIElement FleetControls()
+    {
+        var group = new StackPanel(); group.Orientation = Orientation.Horizontal;
+        group.VerticalAlignment = VerticalAlignment.Center; group.Margin = new Thickness(0, 0, 12, 0);
+
+        _pauseBtn = new Button();
+        _pauseBtn.Cursor = Cursors.Hand; _pauseBtn.BorderThickness = new Thickness(1);
+        _pauseBtn.Padding = new Thickness(10, 3, 10, 3); _pauseBtn.FontSize = 12;
+        _pauseBtn.FontWeight = FontWeights.SemiBold;
+        _pauseBtn.Margin = new Thickness(0, 0, 8, 0);
+        _pauseBtn.VerticalAlignment = VerticalAlignment.Center;
+        _pauseBtn.Click += delegate
+        {
+            _paused = !_paused;
+            var cmd = ReadCommands();
+            cmd["pause"] = _paused;
+            WriteCommands(cmd);
+            PaintPause();
+        };
+        group.Children.Add(_pauseBtn);
+
+        _stopBtn = new Button();
+        _stopBtn.Cursor = Cursors.Hand; _stopBtn.BorderThickness = new Thickness(1);
+        _stopBtn.Padding = new Thickness(10, 3, 10, 3); _stopBtn.FontSize = 12;
+        _stopBtn.FontWeight = FontWeights.SemiBold;
+        _stopBtn.VerticalAlignment = VerticalAlignment.Center;
+        _stopBtn.Content = T("stopall");
+        _stopBtn.Click += delegate
+        {
+            var cmd = ReadCommands();
+            cmd["stop"] = true;
+            WriteCommands(cmd);
+        };
+        group.Children.Add(_stopBtn);
+
+        PaintPause();
+        return group;
+    }
+    // Paused => accent bg + white text (contrast rule), label shows Resume; otherwise neutral, Pause.
+    void PaintPause()
+    {
+        if (_pauseBtn == null) return;
+        _pauseBtn.Content = _paused ? T("resume") : T("pause");
+        if (_paused) { _pauseBtn.Background = Accent; _pauseBtn.Foreground = White; _pauseBtn.BorderBrush = Accent; }
+        else { _pauseBtn.Background = BtnBg; _pauseBtn.Foreground = Fg; _pauseBtn.BorderBrush = Border; }
     }
 
     UIElement MaxTabsStepper()
@@ -988,6 +1082,9 @@ class CockpitWindow : Window
         if (_autoValue != null) _autoValue.Foreground = Fg;
         PaintAutoToggle();
         UpdateAutoEnabled();
+        PaintEffort();
+        PaintPause();
+        if (_stopBtn != null) { _stopBtn.Background = BtnBg; _stopBtn.Foreground = Fg; _stopBtn.BorderBrush = Border; }
         if (_inBar != null) _inBar.Background = Bg;
         if (_goalInput != null)
         {
@@ -1015,6 +1112,9 @@ class CockpitWindow : Window
         if (_autoLbl != null) _autoLbl.Text = T("max_tabs2");
         if (_autoValue != null) _autoValue.Text = _autoMax.ToString();
         PaintAutoToggle();
+        PaintEffort();
+        PaintPause();
+        if (_stopBtn != null) _stopBtn.Content = T("stopall");
         if (_startBtn != null) _startBtn.Content = T("start");
         if (_folderBtn != null) _folderBtn.Content = T("folder");
         if (_goalInput != null) _goalInput.ToolTip = T("goalhint");
