@@ -57,6 +57,21 @@ LENS_PROMPTS = {
                   "変えている**なら、それは過剰修正＝欠陥として REFUTED にせよ。正しい修正は"
                   "通常ごく小さい（数行）。逆に、変更が最小で根本原因に的確に当たっていれば "
                   "UPHELD。『動くが過剰』も REFUTED 扱い（最小の正しい差分に絞らせる）。",
+    # The 'auto' gate (2026-06-17, from the 3-miss analysis). The minimality lens alone is biased
+    # toward UNDER-fixing: it only hunts over-engineering, so it is structurally blind to the
+    # dominant real miss -- a diff that is too SMALL or off-target (1 of 2 hunks done; producer
+    # fixed but consumers not; wrong root cause). This single lens checks BOTH directions so auto
+    # accepts a fix only when it is minimal AND complete AND the symptom is actually gone.
+    "rootcause": "このレビューでは『根本原因への最小かつ完全な修正か』を反証せよ。次のどれか一つでも"
+                 "当たれば REFUTED:\n"
+                 "(1) 過剰: 差分が必要以上に大きい/余計なファイル・関数を触る/根本原因でない箇所を変える。\n"
+                 "(2) 過小・的外れ: 問題文の症状を再現する独立ケースを頭の中で（または可能なら実際に）"
+                 "走らせたとき**まだ症状が残る**。『既存テストが通った』は証拠にならない（バグ発生前から"
+                 "通っていたはず）。\n"
+                 "(3) 不完全（複数箇所）: 変更したデータ契約（キー名・戻り値・レコード形）を**書く側と"
+                 "読む側の両方**、または同じメソッド族（例 `_eval_rewrite_as_X` と対の `_Y`、producer と"
+                 "consumer）の**対になる箇所**のどれかが未修正のまま。1箇所だけ直して対を放置していないか。\n"
+                 "上のいずれも無く、独立再現ケースが通り、関連する全ての箇所が直っていれば UPHELD。",
 }
 PANEL_LENSES = ("correctness", "edge", "security")
 

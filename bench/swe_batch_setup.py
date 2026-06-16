@@ -49,25 +49,35 @@ def goal_text(lib, wt, ps):
         "手掛かりに直して再度 DONE。安易に STUCK しないこと。\n"
         "解決不能と確信した場合のみ STUCK: と理由。"
     ) % (lib, wt, ps)
-    # Generalization-direction scaffold lift (SWE_STRONG_SELFTEST=1): the clean single-shot
-    # misses are "right file + right approach, but the exact patch is a step off". Have the agent
-    # self-verify against the REPO'S OWN tests (not the hidden grading tests) before DONE so it
-    # catches its own imprecision in one shot. This is general solving discipline, NOT
-    # test-specialization. A/B'd separately so it never confounds the research on/off axis.
+    # Generalization-direction scaffold lift (SWE_STRONG_SELFTEST=1). The 3-miss analysis (2026-06-17)
+    # found the misses declared DONE off GREEN PRE-EXISTING tests that never covered the new case --
+    # "N passed" carried no signal. So self-test is now RED->GREEN: write a reproducer of the issue
+    # FIRST, watch it FAIL on the unpatched code, fix until it passes. This is universal TDD
+    # discipline (a pre-existing suite by definition didn't catch the bug), NOT test-specialization.
+    # Also lowers trust in RESEARCH (a wrong "fix unnecessary / later version" claim sank one miss).
     if os.environ.get("SWE_STRONG_SELFTEST") == "1":
-        _t += ("\n\n【自己検証の強化】DONE の前に必ず、変更したコードを覆う**このリポジトリ自身のテスト**を "
-               "grep でテスト関数名/ファイルを特定し、run_python か shell_exec で実際に実行して"
-               "**通ることを確認**してから DONE。テストが見つからなければ issue の再現コードを自分で書いて"
-               "期待動作を確かめよ。隠しテストではなく自分で回せるテストで裏取りする"
-               "（特定テストへの最適化ではなく、一般的な自己検証の徹底）。")
-    # Minimal-diff bias (SWE_MINIMALITY=1). The dominant miss is OVER-ENGINEERING: a 40+ line diff
-    # where the correct fix is 2-7 lines. Tell the agent to make the SMALLEST change that fixes the
-    # root cause -- general engineering discipline, not test-gaming.
+        _t += ("\n\n【自己検証＝red→green を徹底】まず**編集する前に**、問題文の症状を再現する小さな"
+               "スクリプト/テストを書き、未修正コードで run_python か shell_exec で実行して**実際に失敗する**"
+               "ことを確認せよ（既存の通過テストは証拠にならない＝バグ発生前から通っていたはず）。その同じ"
+               "再現が**通るまで**修正を続け、通ってから DONE。加えて変更箇所を覆うリポジトリ自身のテストも"
+               "実行し回帰が無いことを確認する。\n"
+               "【調査結果は鵜呑みにしない】RESEARCH の結論は手掛かりであって絶対ではない。特に『修正は不要』"
+               "『後のバージョンの話』という主張は、実際のチェックアウト済みコードと再現結果に照らして確かめ、"
+               "食い違えばコードと再現を信じよ。")
+    # Minimal-AND-COMPLETE diff (SWE_MINIMALITY=1). Over-engineering is one failure; the 3-miss
+    # analysis found the OPPOSITE dominates auto -- a diff too SMALL / off-target (1 of 2 hunks;
+    # producer fixed, consumers not; wrong root cause). So pair minimality with COMPLETENESS:
+    # producer<->consumer, method-family symmetry, every occurrence. General engineering discipline.
     if os.environ.get("SWE_MINIMALITY") == "1":
-        _t += ("\n\n【最小差分の原則】正しい修正は通常ごく小さい（多くは数行・1ファイル）。**根本原因に"
-               "的確に当たる最小の差分**だけを書け。動くからといって余計なリファクタ・防御的コード・"
-               "別ファイルの変更・無関係な整形を加えるな（過剰修正は回帰やテスト失敗の元）。"
-               "『この変更は本当に必要か？』を各行で自問し、不要なら削れ。")
+        _t += ("\n\n【最小かつ完全な差分】正しい修正は通常ごく小さい（多くは数行）。**根本原因に的確に当たる"
+               "最小の差分**だけを書け（余計なリファクタ・防御的コード・無関係な整形は過剰修正の元）。"
+               "ただし**小さすぎ・的外れも同じく欠陥**——最小性と引き換えに**完全性**を落とすな:\n"
+               "・データ契約（キー名・戻り値・レコード形）を変えたら**書く側と読む側の両方**を直す"
+               "（producer だけ直して consumer を放置しない）。\n"
+               "・あるメソッド/変換/分岐を足したら**対になる方向**（例 `X→Y` を足したら `Y→X` も）が"
+               "同じ変更を要しないか確認する。\n"
+               "・同じ不具合パターンがファイル内の複数箇所にあれば grep で全て直す。\n"
+               "『最小か？』と『症状は完全に消え、関連する全箇所を直したか？』の両方を自問せよ。")
     return _t
 
 
