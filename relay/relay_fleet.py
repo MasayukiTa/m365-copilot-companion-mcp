@@ -762,6 +762,31 @@ class RelayWorker:
             (detail or "")[:160])
         return True
 
+    def tab_load(self):
+        """RAM footprint of this worker in OPEN browser tabs right now: the main agent tab plus
+        any sub-agent side-pages currently open (research / refuter). The fleet's RAM admission
+        counts THIS (sum over workers), not just the worker count -- so an auto/ultra task that
+        fans out to 3 tabs is treated as ~3 tabs of RAM pressure, automatically, without a human
+        hand-capping concurrency. 0 while the worker holds no tab (pending / closed)."""
+        if self.page is None:
+            return 0
+        n = 1
+        rs = self._research_session
+        if rs is not None and getattr(rs, "page", None) is not None:
+            n += 1
+        fs = self._refuter_session
+        if fs is not None and getattr(fs, "page", None) is not None:
+            n += 1
+        return n
+
+    def tab_weight(self):
+        """PEAK tabs this worker may hold: 1 main + 1 if it can delegate research + 1 if it runs a
+        refuter. Admission RESERVES this many tab-slots, so N lean workers can't all be admitted at
+        1 tab each and THEN fan out together to 3 tabs each (the balloon that crashed the Edge). For
+        an auto/ultra task -- which nearly always researches AND refutes -- the peak IS the typical
+        load, so this is accurate, not merely conservative. min-effort = 1 (no side-pages)."""
+        return 1 + (1 if self.max_research > 0 else 0) + (1 if self.refuter else 0)
+
     def _auto_consent(self):
         """Click through the MCP connection-consent card AUTOMATICALLY. The card is NOT a
         credential entry -- the Bearer key is already configured on the connector; this is just a
@@ -1253,13 +1278,25 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     pending = list(workers)            # FIFO queue of not-yet-attached workers
 
     def _active_open():
-        # Every worker that still HOLDS a tab counts toward the concurrency cap -- including
-        # ones in 'verifying'/'refuting' (a bounded eval / review still occupies its tab + the
-        # disk its eval used). Counting on `status not in TERMINAL` already includes those
-        # non-terminal statuses; the explicit list documents the intent and guards against a
-        # future status that should also count. So open_tabs and the cap never diverge: a
-        # verifying tab keeps its slot until it reaches a TERMINAL state and close() runs.
+        # Worker (MAIN-tab) count -- the DISK accounting unit: only main agent tabs run the
+        # Docker eval, so the disk gate reserves per main tab, not per sub-agent side-page.
+        # Every worker that still HOLDS a tab counts -- including ones in 'verifying'/'refuting'
+        # (a bounded eval / review still occupies its tab + the disk its eval used).
         return sum(1 for w in workers
+                   if w.page is not None and w.status not in TERMINAL)
+
+    def _active_tabs():
+        # ACTUAL open browser tabs across the fleet = main tabs + every open sub-agent side-page
+        # (research / refuter). The RAM-pressure reading that drives the autoscale recompute and
+        # the cockpit display -- "maxtabs" means TABS, so an auto worker fanned out to 3 shows as 3.
+        return sum(w.tab_load() for w in workers)
+
+    def _projected_peak():
+        # WORST-CASE tabs if every active worker fans out fully (sum of tab_weight). Admission
+        # reserves against THIS so N lean workers can't be admitted at 1 tab each and then balloon
+        # to 3 tabs each at once (the overload that wedged the Edge). _active_tabs reacts AFTER a
+        # fan-out; _projected_peak prevents the over-admission that makes the fan-out unaffordable.
+        return sum(w.tab_weight() for w in workers
                    if w.page is not None and w.status not in TERMINAL)
 
     def _unfinished():
@@ -1330,7 +1367,9 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             asc_on = bool(asc_box[0])
             ceiling = asc_box[1] or autoscale_max
         if asc_on:
-            mc_box[0] = ram_target_cap(_active_open(), mc_box[0], max(1, ceiling),
+            # Drive the cap off ACTUAL tabs (main + sub-agent side-pages), so the cap is a TABS
+            # budget and an auto/ultra worker mid-fan-out (3 tabs) is felt as 3 tabs of pressure.
+            mc_box[0] = ram_target_cap(_active_tabs(), mc_box[0], max(1, ceiling),
                                        per_tab_mb=autoscale_per_tab_mb,
                                        headroom_mb=autoscale_headroom_mb,
                                        up_margin_mb=autoscale_up_margin_mb)
@@ -1341,7 +1380,16 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # looks ahead by eval_disk_gb). If disk is tight we STOP admitting this sweep and let
         # running jobs finish + release their disk (swe_check cleanup), then re-admit -- the
         # continuous-flow drain. A non-positive floor disables the disk gate (normal use).
-        while pending and _active_open() < max(1, mc_box[0]):
+        # ADMISSION gates on the TAB budget (mc_box[0] is in tabs), RESERVING each worker's PEAK
+        # fan-out (tab_weight) so the fleet's worst-case tab count never exceeds the budget -- "an
+        # auto task == ~3 tabs" is accounted for at admission, automatically, with no human cap.
+        # EXCEPTION: when the fleet is empty always admit ONE worker even if its peak exceeds the
+        # budget (a lone auto task needs 3 tabs while maxtabs=1) -- it runs solo and the per-tab
+        # ram_room gate defers its side-pages if RAM is genuinely tight, rather than deadlocking.
+        # Sub-agent tabs don't run evals, so the DISK gate below still counts main tabs only
+        # (_active_open). With no side-pages tab_weight==1, reducing EXACTLY to the old worker cap.
+        while pending and (_active_open() == 0
+                           or _projected_peak() + pending[0].tab_weight() <= max(1, mc_box[0])):
             # reserve disk for THIS eval plus every already-open eval still in flight, so we never
             # admit N tabs that look fine individually but crash C: once their builds run at once.
             # PER-REPO mode sizes the reserve by each instance's actual build weight (matplotlib 7GB
