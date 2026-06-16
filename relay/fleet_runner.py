@@ -151,10 +151,12 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     from relay.relay_fleet import free_disk_gb
     total = len(workers)        # dynamic: goals can be added mid-run (native chat queue)
     done = sum(1 for w in workers if w.status in TERMINAL)
-    # open_tabs counts EVERY worker still holding a tab, including 'verifying'/'refuting' (their
-    # bounded eval/review still occupies the slot) -- so open_tabs and max_concurrent never
-    # diverge and the cockpit's N/M display is accurate.
-    open_tabs = sum(1 for w in workers if getattr(w, "page", None) is not None)
+    # open_tabs = ACTUAL browser tabs across the fleet: main agent tabs PLUS open sub-agent
+    # side-pages (research / refuter). Counts real tabs (not just workers) so the cockpit's
+    # tab/RAM display matches what the tab-budget admission gates on -- an auto worker mid-fan-out
+    # shows as up to 3 tabs. Falls back to the main-tab count if tab_load isn't available.
+    open_tabs = sum((w.tab_load() if hasattr(w, "tab_load") else
+                     (1 if getattr(w, "page", None) is not None else 0)) for w in workers)
     return {
         "started": started,
         "updated": time.time(),

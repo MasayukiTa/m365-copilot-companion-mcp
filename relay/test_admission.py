@@ -511,8 +511,65 @@ def test_consent_detector():
         er.surface = orig
 
 
+def test_tab_load_accounting():
+    # tab_load = main tab + OPEN sub-agent side-pages (research/refuter). Pending (page=None)
+    # side-pages don't count; this is the RAM-accounting unit the tab-budget admission gates on.
+    w = RelayWorker("g", "w0")
+    check("tabload_zero_no_page", w.tab_load() == 0)
+    w.page = object()
+    check("tabload_main_only", w.tab_load() == 1)
+    class _Open:  page = object()
+    class _Pending: page = None
+    w._research_session = _Open()
+    check("tabload_plus_research", w.tab_load() == 2)
+    w._refuter_session = _Open()
+    check("tabload_plus_refuter", w.tab_load() == 3)
+    w._research_session = _Pending()      # a not-yet-opened side-page must NOT count
+    check("tabload_pending_uncounted", w.tab_load() == 2)
+
+
+def test_tab_budget_admission():
+    # A worker that fans out to 3 tabs consumes the whole 3-tab budget, so a 2nd worker waits --
+    # "3 open tabs == parallelism 3", reactive, no human cap. All goals still complete (continuous).
+    rf.avail_phys_mb = lambda: 64000.0
+    rf.free_disk_gb = lambda path=None: 500.0
+    state = {"control": {}}
+    orig = _install_fake_worker(state)
+    try:
+        goals = ["g0", "g1", "g2"]
+        max_tabs = {"v": 0}
+        max_mains = {"v": 0}
+        class _Open: page = object()
+
+        def on_tick(workers):
+            # fan the currently-open worker out to 3 tabs BEFORE completing it
+            cur = [w for w in workers if getattr(w, "page", None) is not None and w.status == "waiting"]
+            for w in cur:
+                if w.tab_load() < 3:
+                    w._research_session = _Open(); w._refuter_session = _Open()
+            max_tabs["v"] = max(max_tabs["v"], sum(w.tab_load() for w in workers))
+            mains = sum(1 for w in workers if getattr(w, "page", None) is not None and w.status not in TERMINAL)
+            max_mains["v"] = max(max_mains["v"], mains)
+            # once it is at full fan-out, complete it so the next can be admitted
+            for w in cur:
+                if w.tab_load() >= 3:
+                    w._research_session = None; w._refuter_session = None
+                    state["control"][w.name] = "done"
+                    break
+
+        res = run_relay_fleet(FakeContext(), goals, "http://agent", max_concurrent=3,
+                              poll_s=0, on_tick=on_tick, notify=lambda *a, **k: None)
+        check("tab_budget_all_complete", len(res) == 3 and all(r["outcome"] == "DONE" for r in res))
+        check("tab_budget_total_tabs_capped", max_tabs["v"] <= 3)     # 3-tab budget held
+        check("tab_budget_one_main_when_fanned", max_mains["v"] == 1)  # a 3-tab worker runs solo
+    finally:
+        _restore_worker(orig)
+
+
 def main():
     test_disk_floor_predicate()
+    test_tab_load_accounting()
+    test_tab_budget_admission()
     test_hysteresis_no_thrash()
     test_continuous_admission_no_barrier()
     test_verifying_counts_in_cap()
