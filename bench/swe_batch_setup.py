@@ -60,6 +60,14 @@ def goal_text(lib, wt, ps):
                "**通ることを確認**してから DONE。テストが見つからなければ issue の再現コードを自分で書いて"
                "期待動作を確かめよ。隠しテストではなく自分で回せるテストで裏取りする"
                "（特定テストへの最適化ではなく、一般的な自己検証の徹底）。")
+    # Minimal-diff bias (SWE_MINIMALITY=1). The dominant miss is OVER-ENGINEERING: a 40+ line diff
+    # where the correct fix is 2-7 lines. Tell the agent to make the SMALLEST change that fixes the
+    # root cause -- general engineering discipline, not test-gaming.
+    if os.environ.get("SWE_MINIMALITY") == "1":
+        _t += ("\n\n【最小差分の原則】正しい修正は通常ごく小さい（多くは数行・1ファイル）。**根本原因に"
+               "的確に当たる最小の差分**だけを書け。動くからといって余計なリファクタ・防御的コード・"
+               "別ファイルの変更・無関係な整形を加えるな（過剰修正は回帰やテスト失敗の元）。"
+               "『この変更は本当に必要か？』を各行で自問し、不要なら削れ。")
     return _t
 
 

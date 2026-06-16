@@ -48,6 +48,15 @@ LENS_PROMPTS = {
     "edge": "このレビューでは特に『境界値・エラー処理・例外・想定外入力』に集中。",
     "security": "このレビューでは特に『セキュリティ・安全性』に集中: インジェクション、"
                 "権限、破壊的操作、機微情報の漏えい等。",
+    # The 'auto' effort gate. The dominant observed failure is OVER-ENGINEERING -- a 40+ line
+    # diff (or an extra touched file) where the correct fix is 2-7 lines -- which the generic
+    # reviewers UPHELD. This lens makes the reviewer hunt for exactly that, and only that, so a
+    # cheap minimal solve is accepted but a bloated / wrong-target one is refuted (-> escalate).
+    "minimality": "このレビューでは『最小性と正しさ』だけに集中して反証せよ。差分が"
+                  "**必要以上に大きい/余計なファイルや関数を触っている/根本原因でない箇所を"
+                  "変えている**なら、それは過剰修正＝欠陥として REFUTED にせよ。正しい修正は"
+                  "通常ごく小さい（数行）。逆に、変更が最小で根本原因に的確に当たっていれば "
+                  "UPHELD。『動くが過剰』も REFUTED 扱い（最小の正しい差分に絞らせる）。",
 }
 PANEL_LENSES = ("correctness", "edge", "security")
 
