@@ -406,6 +406,7 @@ class RelayWorker:
         self.max_research = max_research
         self.research_model = "Claude"
         self._research_session = None   # non-blocking ResearchSession while status=='researching'
+        self._copilot_err_streak = 0    # consecutive Copilot/tool 'SystemError' replies (path down)
         # review panel (operator B, perspective-diverse): a list of lenses runs one
         # independent reviewer each, aggregated by majority. Empty = single reviewer.
         self.review_lenses = list(review_lenses) if review_lenses else []
@@ -734,6 +735,28 @@ class RelayWorker:
     def _decide(self, resp):
         self.last_response = resp
         self._tx.assistant(self.turn, resp)    # persist the full Copilot reply for this turn
+        # DEAD-AGENT / DEAD-PATH detector. The Copilot agent surfaces a generic failure instead of
+        # doing the task -- "予期しないエラー / SystemError" (e.g. the devtunnel to the MCP dropped on
+        # a network switch) or "ページをもう一度読み込んで... / 管理者に問い合わせて" (the agent is
+        # wedged, or has been ADMIN-BLOCKED -- observed when one agent was disabled while others kept
+        # working). Each reply carries a fresh timestamp/session-id, so the exact-text no-progress
+        # check never fires and the worker burns ALL its turns (50-turn MAXTURNS observed). Catch the
+        # pattern, bail FAST after a few, and go STUCK so the goal can be re-submitted on a healthy
+        # agent rather than wasting the whole turn budget on a dead endpoint.
+        _low = resp.lower()
+        if ("予期しないエラー" in resp or "SystemError" in resp or "unexpected error" in _low
+                or "管理者に問い合わせ" in resp or "ページをもう一度読み込" in resp
+                or ("contact" in _low and "administrator" in _low)):
+            self._copilot_err_streak += 1
+            if self._copilot_err_streak >= 3:
+                self.status, self.outcome = "stuck", "STUCK"
+                self.reason = ("Copilot agent/path failing (%dx: SystemError / 'reload・contact "
+                               "admin') -- a dropped devtunnel OR an ADMIN-BLOCKED agent. STUCK so "
+                               "the goal can be re-submitted on a healthy agent." % self._copilot_err_streak)
+                return
+            self.job = RETRY_JOB     # a couple of quick retries before declaring the path dead
+            return
+        self._copilot_err_streak = 0
         norm = " ".join(resp.lower().split())[:300]
         self.no_progress = self.no_progress + 1 if norm and norm == self.last_norm else 0
         self.last_norm = norm
