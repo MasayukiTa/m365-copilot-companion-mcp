@@ -56,6 +56,15 @@ AGENT_DEAD_MARKERS = (
     "問題が解決しない場合", "if the problem persists",
 )
 
+# NETWORK-OUTAGE RESILIENCE (2026-06-17). A flaky corporate network / devtunnel can drop the path
+# to the MCP backend for seconds-to-minutes. The retry budgets must be WALL-CLOCK windows, not tiny
+# counts: a 10-count transient retry exhausted in ~55s and a 3-strike dead-agent detector STUCK in
+# seconds, so a brief blip "ended everything". These windows let a worker RIDE OUT an outage (keep
+# retrying with backoff) and give up only if the failure PERSISTS past the window -- at which point
+# it really is a down/banned agent. Env-tunable.
+NET_RETRY_WINDOW_S = float(os.environ.get("MCP_NET_RETRY_S", "1800"))      # send/CDP/network: 30 min
+AGENT_ERR_WINDOW_S = float(os.environ.get("MCP_AGENT_ERR_S", "1200"))     # agent SystemError: 20 min
+
 # CONNECTION-CONSENT detector. The FIRST time the agent calls an MCP tool, Copilot can show a
 # connection-consent card ("この資格情報を 接続マネージャーを開く で検証してください ... 再試行")
 # instead of executing -- the MCP connector's per-user connection is not authorized yet. This is
@@ -381,6 +390,7 @@ class RelayWorker:
         # Claude Code retrying a failed request rather than giving up. Budget + backoff.
         self.max_transient = max_transient
         self.transient = 0
+        self.first_transient_ts = 0.0   # wall-clock start of the current transient/outage streak
         # generation-wait reschedules: the PREVIOUS turn was still generating when we tried
         # to send (a slow django/sympy turn). This is NOT a failure -- send() waited and
         # then deferred -- so it does NOT consume the transient budget and does NOT count a
@@ -434,6 +444,7 @@ class RelayWorker:
         self.research_model = "Claude"
         self._research_session = None   # non-blocking ResearchSession while status=='researching'
         self._copilot_err_streak = 0    # consecutive Copilot/tool 'SystemError' replies (path down)
+        self._agent_err_ts = 0.0        # wall-clock start of the current agent-error (outage) streak
         self._consent_streak = 0        # consecutive MCP connection-consent cards (auth needed)
         self._consent_auto_tried = False  # attempted the automatic click-through once
         self._consent_surfaced = False  # surfaced the Edge once (manual fallback)
@@ -666,15 +677,20 @@ class RelayWorker:
         return True
 
     def _retry_transient(self):
-        """Schedule a retry for a TRANSIENT failure (send/timeout/likely-transient STUCK),
-        up to max_transient with Claude-Code/Anthropic-SDK-style exponential backoff + jitter
-        (0.5 -> 1 -> 2 -> 4 -> 8s capped, -25% jitter) -- the relay analog of the SDK retrying
-        a failed network request with widening intervals. Returns True if a retry was scheduled,
-        else False (budget exhausted -> the caller should go terminal)."""
-        if self.transient >= self.max_transient:
+        """Schedule a retry for a TRANSIENT failure (send/timeout/likely-transient STUCK) with
+        SDK-style exponential backoff (0.5->1->2->4->8s capped, -25% jitter). The budget is a
+        WALL-CLOCK WINDOW (NET_RETRY_WINDOW_S), not a tiny count: a flaky network/devtunnel can be
+        down for minutes, and a 10-count budget exhausted in ~55s -> a brief blip 'ended everything'.
+        Now the worker keeps retrying (every ~8s) for up to the window, riding out a real outage, and
+        gives up only if it PERSISTS past the window. Returns True if a retry was scheduled, else
+        False (window exceeded -> caller goes terminal). first_transient_ts resets on a real reply."""
+        now = time.time()
+        if self.first_transient_ts <= 0.0:
+            self.first_transient_ts = now
+        if (now - self.first_transient_ts) > NET_RETRY_WINDOW_S:
             return False
         self.transient += 1
-        self._cooldown_until = time.time() + transient_backoff(self.transient)
+        self._cooldown_until = now + transient_backoff(self.transient)   # backoff caps at ~8s
         self.status = "ready"
         return True
 
@@ -902,25 +918,34 @@ class RelayWorker:
             self.job = RETRY_JOB
             return
         if any(m in _low for m in AGENT_DEAD_MARKERS):
+            now = time.time()
+            if self._agent_err_ts <= 0.0:
+                self._agent_err_ts = now
             self._copilot_err_streak += 1
-            if self._copilot_err_streak >= 3:
+            # WALL-CLOCK window, not a 3-strike count: a devtunnel SSL flap / brief Copilot blip
+            # surfaces as a SystemError too, and STUCKing after 3 quick errors (~seconds) meant a
+            # momentary outage killed the worker. Keep retrying WITH BACKOFF for AGENT_ERR_WINDOW_S
+            # so an outage is ridden out; only a failure that PERSISTS past the window is treated as
+            # a genuinely down/banned agent (then the actionable Copilot-Studio message applies).
+            if (now - self._agent_err_ts) > AGENT_ERR_WINDOW_S and self._copilot_err_streak >= 3:
                 self.status, self.outcome = "stuck", "STUCK"
-                # actionable: this is an AGENT-level failure, not a task failure -- tell the
-                # operator exactly where to look (Copilot Studio) before any re-submission.
-                self.reason = ("⚠ エージェント応答エラーが%d回連続。タスクの失敗ではなく**エージェント"
-                               "自体が応答していない**。→ Copilot Studio でこのエージェントが"
+                self.reason = ("⚠ エージェント応答エラーが%d分以上継続(%d回連続)。一時的な網断ではなく"
+                               "**エージェント自体が応答していない**。→ Copilot Studio でこのエージェントが"
                                "**停止/無効化(管理者ブロック)されていないか確認**してください"
                                "（他のエージェントが動くなら本エージェント固有の block の可能性大）。"
-                               "健全なエージェントに切り替えて再投入を。" % self._copilot_err_streak)
+                               "健全なエージェントに切り替えて再投入を。"
+                               % (int((now - self._agent_err_ts) / 60), self._copilot_err_streak))
                 try:
                     default_notify("⚠ エージェント停止の疑い",
                                    "Copilot Studio で停止/無効化されていないか確認を (%s)" % self.name)
                 except Exception:
                     pass
                 return
-            self.job = RETRY_JOB     # a couple of quick retries before declaring the path dead
+            self.job = RETRY_JOB
+            self._cooldown_until = now + transient_backoff(self._copilot_err_streak)  # back off, don't hammer
             return
         self._copilot_err_streak = 0
+        self._agent_err_ts = 0.0
         norm = " ".join(resp.lower().split())[:300]
         self.no_progress = self.no_progress + 1 if norm and norm == self.last_norm else 0
         self.last_norm = norm
@@ -958,6 +983,7 @@ class RelayWorker:
                 "agent reported STUCK (after %d retries)" % self.transient
             return
         self.transient = 0   # a real (non-stuck) response -> the transient issue cleared
+        self.first_transient_ts = 0.0   # reset the outage window on a healthy reply
         # deep-research delegation: the agent wrote `RESEARCH: <query>` asking for an external
         # deep-dive. Spawn the Researcher sub-agent (side page), feed its report back as the next
         # turn, and continue. Capped per worker (max_research); past the cap, tell it to proceed.

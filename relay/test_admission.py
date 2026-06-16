@@ -448,29 +448,47 @@ def test_research_session_ram_gated_open():
 
 # ── (i) dead-agent / dead-path detector: repeated SystemError / admin-block -> STUCK fast ─────
 def test_dead_agent_detector():
+    import time as _t
     err = ("申し訳ありません。予期しないエラーが発生しました。エラー コード: SystemError。時刻: ")
+    # NETWORK RESILIENCE: a brief outage (errors all WITHIN the window) keeps retrying, does NOT
+    # stuck -- a momentary blip must never end the worker.
     w = RelayWorker("do the thing", "w0")
-    w._decide(err + "t1")                 # streak 1 -> retry, not stuck
-    check("dead_streak_1_retry", w.status != "stuck" and w._copilot_err_streak == 1)
-    w._decide(err + "t2")                 # streak 2 -> retry
-    w._decide(err + "t3")                 # streak 3 -> STUCK
-    check("dead_stuck_after_3", w.status == "stuck" and w.outcome == "STUCK")
+    w._decide(err + "t1"); w._decide(err + "t2"); w._decide(err + "t3")
+    check("dead_within_window_retries", w.status != "stuck" and w._copilot_err_streak == 3)
+    # only once the failure PERSISTS past AGENT_ERR_WINDOW_S does it STUCK (a real down/banned agent).
+    w._agent_err_ts = _t.time() - rf.AGENT_ERR_WINDOW_S - 1
+    w._decide(err + "t4")
+    check("dead_stuck_after_window", w.status == "stuck" and w.outcome == "STUCK")
     check("dead_msg_points_to_copilot_studio", "Copilot Studio" in (w.reason or ""))
-    # an English failure reply trips it too (numbers vary, prose is stable)
+    # English failure trips it the same way (after the window)
     w_en = RelayWorker("g", "wen")
     en = "Sorry, an unexpected error occurred. If the problem persists, contact your administrator."
-    w_en._decide(en + "1"); w_en._decide(en + "2"); w_en._decide(en + "3")
+    w_en._decide(en + "1"); w_en._agent_err_ts = _t.time() - rf.AGENT_ERR_WINDOW_S - 1
+    w_en._decide(en + "2"); w_en._decide(en + "3")
     check("dead_detector_english", w_en.status == "stuck")
-    # the admin-block message triggers the same fast bail
+    # admin-block message, same path (after the window)
     w2 = RelayWorker("g", "w1")
     msg = "ページをもう一度読み込んでみてください。管理者に問い合わせてください。セッション ID: "
-    w2._decide(msg + "1"); w2._decide(msg + "2"); w2._decide(msg + "3")
+    w2._decide(msg + "1"); w2._agent_err_ts = _t.time() - rf.AGENT_ERR_WINDOW_S - 1
+    w2._decide(msg + "2"); w2._decide(msg + "3")
     check("admin_block_stuck", w2.status == "stuck")
-    # a real (non-error) reply resets the streak so a one-off blip doesn't accumulate
+    # a real (non-error) reply resets the streak AND the window so a one-off blip doesn't accumulate
     w3 = RelayWorker("g", "w2")
     w3._decide(err + "x")
     w3._decide("ファイルを修正しました。続けます。CONTINUE")
-    check("err_streak_resets_on_real_reply", w3._copilot_err_streak == 0)
+    check("err_streak_resets_on_real_reply", w3._copilot_err_streak == 0 and w3._agent_err_ts == 0.0)
+
+
+def test_transient_outage_window():
+    import time as _t
+    # The transient retry rides out an OUTAGE on a wall-clock window, not a 10-count budget that
+    # exhausted in ~55s. Many retries within the window all schedule.
+    w = RelayWorker("g", "w0")
+    oks = [w._retry_transient() for _ in range(15)]
+    check("transient_rides_out_blip", all(oks) and w.transient == 15)   # 15 > old max_transient=10
+    # past the window -> give up (caller goes terminal)
+    w.first_transient_ts = _t.time() - rf.NET_RETRY_WINDOW_S - 1
+    check("transient_gives_up_past_window", w._retry_transient() is False)
 
 
 def test_consent_detector():
@@ -579,6 +597,7 @@ def main():
     test_fleet_research_nonblocking()
     test_research_session_ram_gated_open()
     test_dead_agent_detector()
+    test_transient_outage_window()
     test_consent_detector()
     print("\n=== %d/%d admission checks passed ===" % (sum(results), len(results)))
     return 0 if all(results) else 1
