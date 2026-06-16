@@ -50,6 +50,7 @@ class ChatWindow : Window
     bool _dark = true;
     StackPanel _messages, _convList;
     ScrollViewer _scroll;
+    bool _stickBottom = true;   // auto-scroll follows new content ONLY while the user is at the bottom
     TextBox _input;
     Button _send;
     Border _statusDot;
@@ -201,6 +202,18 @@ class ChatWindow : Window
         _messages = new StackPanel { Margin = new Thickness(0, 8, 0, 8), MaxWidth = 760, HorizontalAlignment = HorizontalAlignment.Center };
         _scroll = new ScrollViewer { Content = _messages, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Padding = new Thickness(24, 4, 24, 4) };
         Grid.SetRow(_scroll, 1); main.Children.Add(_scroll);
+        // Auto-scroll, but yield to the user. ScrollChanged fires for BOTH user scrolls and content
+        // growth: when the extent didn't change it was the USER moving -> stick only if they're at
+        // the bottom; when content grew -> pin to the bottom ONLY if still sticking. So while a reply
+        // streams the view follows along, but the moment the user scrolls up to read back, following
+        // stops and stays put -- until they scroll back to the bottom, which re-arms it.
+        _scroll.ScrollChanged += (s, e) =>
+        {
+            if (e.ExtentHeightChange == 0)
+                _stickBottom = _scroll.VerticalOffset >= _scroll.ScrollableHeight - 2.0;
+            else if (_stickBottom)
+                _scroll.ScrollToVerticalOffset(_scroll.ScrollableHeight);
+        };
 
         var bar = new Grid { Margin = new Thickness(0, 10, 0, 16), MaxWidth = 760, HorizontalAlignment = HorizontalAlignment.Center };
         bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -322,6 +335,14 @@ class ChatWindow : Window
 
     // True while a fleet run is actively driving the companion Edge: status.json says
     // running AND it was updated recently (the runner rewrites it ~1/s). When this holds we
+    // Scroll to the latest ONLY while the user is following along (at the bottom). If they have
+    // scrolled up to read back, _stickBottom is false and we leave the viewport where they put it
+    // -- the ScrollChanged handler re-arms following when they return to the bottom.
+    void StickToEnd()
+    {
+        if (_stickBottom && _scroll != null) _scroll.ScrollToEnd();
+    }
+
     // must NOT call /switch+/history -- doing so would PAGE.goto the shared companion Edge
     // onto this conversation and clobber the live send. Stale/!running -> safe to scrape.
     bool FleetRunningFresh()
@@ -645,7 +666,7 @@ class ChatWindow : Window
                     : "(This conversation's transcript isn't available yet -- it may be empty while the run is in progress.)");
             }
             RefreshConvList();
-            _scroll.ScrollToEnd();
+            StickToEnd();
         }));
     }
 
@@ -702,7 +723,7 @@ class ChatWindow : Window
         {
             RenderFleetSnapshot(w);
         }
-        _scroll.ScrollToEnd();
+        StickToEnd();
     }
 
     // If a fleet snapshot is the active view, re-render it when status.json's mtime changes
@@ -1381,7 +1402,7 @@ class ChatWindow : Window
         var tb = new TextBlock { Text = text, FontSize = 12, TextAlignment = TextAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 10, 0, 4), TextWrapping = TextWrapping.Wrap };
         SetRef(tb, TextBlock.ForegroundProperty, "Muted");
         _messages.Children.Add(tb);
-        _scroll.ScrollToEnd();
+        StickToEnd();
     }
 
     // ── message rendering (Claude-like: user bubble, assistant plain) ───────────
@@ -1396,7 +1417,7 @@ class ChatWindow : Window
         var bubble = new Border { Child = tb, CornerRadius = new CornerRadius(14), Padding = new Thickness(14, 10, 14, 11), Margin = new Thickness(40, 10, 0, 10), HorizontalAlignment = HorizontalAlignment.Right, MaxWidth = 560 };
         SetRef(bubble, BackgroundProperty, "UserBg");
         _messages.Children.Add(bubble);
-        _scroll.ScrollToEnd();
+        StickToEnd();
     }
 
     // assistant: small "Copilot" label (+ hover copy button) + full-width plain text
@@ -1432,7 +1453,7 @@ class ChatWindow : Window
         block.MouseEnter += delegate { copyRef.Visibility = Visibility.Visible; };
         block.MouseLeave += delegate { copyRef.Visibility = Visibility.Hidden; };
         _messages.Children.Add(block);
-        _scroll.ScrollToEnd();
+        StickToEnd();
         outer = block;
         return content;
     }
@@ -1767,7 +1788,7 @@ class ChatWindow : Window
                             Dispatcher.BeginInvoke(new Action(delegate
                             {
                                 if (!_started) { _started = true; content.Children.Clear(); _pendingText = MakeText(""); content.Children.Add(_pendingText); }
-                                _pendingText.AppendText(d); _scroll.ScrollToEnd();
+                                _pendingText.AppendText(d); StickToEnd();
                             }));
                         }
                     }
@@ -1790,7 +1811,7 @@ class ChatWindow : Window
             SetRef(_statusDot, BackgroundProperty, "Border");
             // render whatever we got (full / partial / error); always clear the typing indicator
             content.Children.Clear();
-            if (answer.Length > 0) { RenderAssistantBody(content, outer, answer); _scroll.ScrollToEnd(); }
+            if (answer.Length > 0) { RenderAssistantBody(content, outer, answer); StickToEnd(); }
             else if (errFinal != null) { content.Children.Add(MakeText("[bridge error: " + errFinal + "]")); if (outer != null) outer.Tag = errFinal; }
             _conv.Messages.Add(new Msg("A", answer));
             SaveConversation(_conv);
