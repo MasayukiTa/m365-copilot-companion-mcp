@@ -96,6 +96,24 @@ def settings_autoscale():
     return on, ceiling
 
 
+def settings_effort(default="auto"):
+    """The cockpit's chosen effort mode (`effort=min|max|ultra|auto` in settings.txt). This is the
+    UI selector the user picks for BOTH fleet and single runs; the CLI --effort overrides it when
+    given explicitly. Invalid/unset -> `default` (auto)."""
+    try:
+        p = _settings_path()
+        if p and os.path.isfile(p):
+            for ln in open(p, encoding="utf-8"):
+                ln = ln.strip()
+                if ln.startswith("effort="):
+                    v = ln.split("=", 1)[1].strip()
+                    if v in ("min", "max", "ultra", "auto"):
+                        return v
+    except Exception:
+        pass
+    return default
+
+
 def _settings_float(key, default):
     """Read a float `key=N` from the shared settings.txt (cockpit-written). Falls back."""
     try:
@@ -350,8 +368,9 @@ def main():
                          "-> Researcher side-agent). Default 3; 0 disables research.")
     ap.add_argument("--accuracy", action="store_true",
                     help="alias for --effort ultra (kept for back-compat).")
-    ap.add_argument("--effort", choices=["min", "max", "ultra", "auto"], default="auto",
-                    help="how much effort the scaffold spends per task (default auto). "
+    ap.add_argument("--effort", choices=["min", "max", "ultra", "auto"], default=None,
+                    help="how much effort the scaffold spends per task (default: the cockpit's "
+                         "settings.txt effort=, else auto). "
                          "min: single-shot, minimal-diff, no review/research. "
                          "max: + on-demand research + one correctness refuter. "
                          "ultra: full 3-lens panel + refute-until-clean + liberal research + "
@@ -369,6 +388,8 @@ def main():
     # wrong edit), not localization, so adversarial review + self-test target it directly. The gain
     # is clean: review/self-test/research never touch the hidden grading tests. Unattended-safe
     # (deliberately NOT --plan, which would pause for approval and stall a headless run).
+    if args.effort is None:               # CLI not given -> follow the cockpit's settings.txt selector
+        args.effort = settings_effort()
     if args.accuracy:
         args.effort = "ultra"
     # Effort -> worker levers. A UNIFORM ultra over-engineers easy tasks (observed: 44-47 line
