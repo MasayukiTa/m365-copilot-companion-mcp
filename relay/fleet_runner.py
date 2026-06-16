@@ -414,7 +414,8 @@ def main():
         os.environ["SWE_STRONG_SELFTEST"] = "1"
     elif _eff == "auto":
         args.refuter = True
-        args._lenses = ["minimality"]                   # the right-size gate: minimal + correct?
+        args._lenses = ["rootcause"]                    # right-size gate: minimal AND complete AND
+                                                        # symptom-gone (not just "not over-engineered")
         args.max_refute = max(args.max_refute, 3)
         args.max_research = max(args.max_research, 3)
         os.environ["SWE_STRONG_SELFTEST"] = "1"
