@@ -97,6 +97,11 @@ def main():
                          '(on top of auto-detected verification), e.g. "ruff check ."')
     ap.add_argument("--no-verify", action="store_true",
                     help="skip auto-detected verification (accept a self-reported DONE)")
+    ap.add_argument("--effort", choices=["min", "max", "ultra", "auto"], default=None,
+                    help="scaffold effort for this single run (min/max/ultra/auto). Passed through "
+                         "to fleet_runner (a single run IS a 1-goal fleet), so it gets the SAME "
+                         "effort presets as a fleet -- incl. auto's minimality refuter. Omitted -> "
+                         "fleet_runner follows the cockpit's settings.txt effort= (default auto).")
     ap.add_argument("--refuter", action="store_true",
                     help="after a candidate DONE, an independent reviewer tries to refute "
                          "it before accepting (operator B; doubles oracle cost)")
@@ -165,6 +170,8 @@ def main():
     cmd = [sys.executable, "-m", "relay.fleet_runner", "--goals-file", goals_file,
            "--max-concurrent", "1", "--max-turns", str(args.max_turns),
            "--agent-url", args.agent_url, "--state-dir", state_dir]
+    if args.effort:
+        cmd += ["--effort", args.effort]
     if args.refuter:
         cmd.append("--refuter")
     if args.panel:
