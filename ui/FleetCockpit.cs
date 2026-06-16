@@ -173,7 +173,7 @@ class CockpitWindow : Window
     string T(string k)
     {
         bool ja = _lang == 0;
-        if (k == "title") return ja ? "並列実行" : "Parallel execution";
+        if (k == "title") return ja ? "並列" : "Parallel";
         if (k == "done") return ja ? "完了" : "done";
         if (k == "running") return ja ? "実行中" : "Running";
         if (k == "elapsed") return ja ? "経過" : "elapsed";
@@ -214,7 +214,7 @@ class CockpitWindow : Window
         if (k == "eta_calc") return ja ? "計測中…" : "estimating…";
         if (k == "rate") return ja ? "件/時" : "/h";
         // Effort selector + fleet-wide pause/stop (NEW)
-        if (k == "effort") return ja ? "努力" : "Effort";
+        if (k == "effort") return ja ? "推論" : "Reasoning";
         if (k == "pause") return ja ? "一時停止" : "Pause";
         if (k == "resume") return ja ? "再開" : "Resume";
         if (k == "stopall") return ja ? "全停止" : "Stop all";
@@ -774,7 +774,8 @@ class CockpitWindow : Window
 
     ContentControl _iconHost;
     Button _maxMinus, _maxPlus;
-    Button _effortBtn, _pauseBtn, _stopBtn;
+    ComboBox _effortBox;
+    Button _pauseBtn, _stopBtn;
     Button _autoToggle;
     Button _autoMinus, _autoPlus;
     TextBlock _autoLbl, _autoValue;
@@ -832,33 +833,47 @@ class CockpitWindow : Window
         return group;
     }
 
-    // Effort selector: one themed button showing the current effort that CYCLES
-    // min -> max -> ultra -> auto on click, persisting effort= to settings.txt. The
-    // fleet runner reads it at launch (governs both fleet and single runs).
+    // Effort selector: a [推論] label + a DROPDOWN (ComboBox) listing min/max/ultra/auto.
+    // Picking a mode persists effort= to settings.txt; the fleet runner reads it at launch
+    // (governs both fleet and single runs). The ComboBox is the single source of truth.
     static readonly string[] _effortModes = { "min", "max", "ultra", "auto" };
+    TextBlock _effortLbl;
     UIElement EffortControl()
     {
-        _effortBtn = new Button();
-        _effortBtn.Cursor = Cursors.Hand; _effortBtn.BorderThickness = new Thickness(1);
-        _effortBtn.Padding = new Thickness(10, 3, 10, 3); _effortBtn.FontSize = 12;
-        _effortBtn.FontWeight = FontWeights.SemiBold;
-        _effortBtn.Margin = new Thickness(0, 0, 12, 0);
-        _effortBtn.VerticalAlignment = VerticalAlignment.Center;
-        _effortBtn.Click += delegate
+        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
+        wrap.VerticalAlignment = VerticalAlignment.Center; wrap.Margin = new Thickness(0, 0, 12, 0);
+
+        _effortLbl = new TextBlock(); _effortLbl.VerticalAlignment = VerticalAlignment.Center;
+        _effortLbl.FontSize = 12; _effortLbl.Margin = new Thickness(0, 0, 8, 0);
+        wrap.Children.Add(_effortLbl);
+
+        _effortBox = new ComboBox();
+        _effortBox.Cursor = Cursors.Hand; _effortBox.FontSize = 12;
+        _effortBox.FontWeight = FontWeights.SemiBold; _effortBox.MinWidth = 78;
+        _effortBox.Padding = new Thickness(8, 2, 4, 2);
+        _effortBox.VerticalAlignment = VerticalAlignment.Center;
+        foreach (string m in _effortModes) _effortBox.Items.Add(m);
+        _effortBox.SelectedItem = _effort;
+        _effortBox.SelectionChanged += delegate
         {
-            int i = Array.IndexOf(_effortModes, _effort);
-            _effort = _effortModes[(i + 1) % _effortModes.Length];
+            string sel = _effortBox.SelectedItem as string;
+            if (string.IsNullOrEmpty(sel) || sel == _effort) return;
+            _effort = sel;
             SaveKey("effort", _effort);
-            PaintEffort();
         };
+        wrap.Children.Add(_effortBox);
+
         PaintEffort();
-        return _effortBtn;
+        return wrap;
     }
     void PaintEffort()
     {
-        if (_effortBtn == null) return;
-        _effortBtn.Content = T("effort") + ": " + _effort;
-        _effortBtn.Background = BtnBg; _effortBtn.Foreground = Fg; _effortBtn.BorderBrush = Border;
+        if (_effortLbl != null) { _effortLbl.Text = T("effort"); _effortLbl.Foreground = Muted; }
+        if (_effortBox == null) return;
+        // keep the dropdown in sync with _effort (e.g. settings.txt changed externally) without
+        // re-firing the persist handler -- assigning the same value is a no-op for SelectionChanged.
+        if (!Equals(_effortBox.SelectedItem, _effort)) _effortBox.SelectedItem = _effort;
+        _effortBox.Background = BtnBg; _effortBox.Foreground = Fg; _effortBox.BorderBrush = Border;
     }
 
     // Fleet-wide controls: Pause/Resume toggle + Stop-all. Both write into commands.json
