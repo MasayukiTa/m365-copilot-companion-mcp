@@ -333,6 +333,31 @@ class ChatWindow : Window
         return null;
     }
 
+    // Locate a worker's on-disk transcript by NAME, independent of the live status.json worker
+    // entry. Transcripts are named "<runid>_a<agent>_w<N>.jsonl" and OUTLIVE the live worker dict,
+    // so this lets click-to-open load the full conversation for a finished/restarted/history worker
+    // (when ReadFleetWorker returns null) instead of falling back to the "not available" placeholder.
+    // Returns the NEWEST matching file (the latest run for that worker), or "" if none.
+    string NewestTranscriptForWorker(string worker)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(worker)) return "";
+            string tdir = Path.Combine(Path.GetDirectoryName(_convsPath), "transcripts");
+            if (!Directory.Exists(tdir)) return "";
+            string suffix = "_" + worker + ".jsonl";   // exact suffix: "w1" must not match "w10"
+            string newest = null; DateTime best = DateTime.MinValue;
+            foreach (string f in Directory.GetFiles(tdir, "*" + suffix))
+            {
+                if (!Path.GetFileName(f).EndsWith(suffix, StringComparison.Ordinal)) continue;
+                DateTime t = File.GetLastWriteTimeUtc(f);
+                if (t > best) { best = t; newest = f; }
+            }
+            return newest ?? "";
+        }
+        catch { return ""; }
+    }
+
     // True while a fleet run is actively driving the companion Edge: status.json says
     // running AND it was updated recently (the runner rewrites it ~1/s). When this holds we
     // Scroll to the latest ONLY while the user is following along (at the bottom). If they have
@@ -586,6 +611,12 @@ class ChatWindow : Window
         var wkr = ReadFleetWorker(key);
         bool running = FleetRunningFresh();
         string transcriptPath = wkr != null ? SS(wkr, "transcript") : "";
+        // FALLBACK by worker name: if no live worker dict resolved (finished/restarted run, a
+        // history click, or a transient status.json read) the transcript field is unavailable even
+        // though the .jsonl is on disk -- so locate it by name. This is what was dropping users to
+        // the "transcript not available" placeholder so often; the full conversation was right there.
+        if (string.IsNullOrEmpty(transcriptPath) && !string.IsNullOrEmpty(worker))
+            transcriptPath = NewestTranscriptForWorker(worker);
 
         // SOURCE PRIORITY:
         //  1. Persisted full-text transcript (jsonl) -- ALWAYS preferred when present. It is the
