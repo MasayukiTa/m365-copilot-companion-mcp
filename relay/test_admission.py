@@ -455,6 +455,12 @@ def test_dead_agent_detector():
     w._decide(err + "t2")                 # streak 2 -> retry
     w._decide(err + "t3")                 # streak 3 -> STUCK
     check("dead_stuck_after_3", w.status == "stuck" and w.outcome == "STUCK")
+    check("dead_msg_points_to_copilot_studio", "Copilot Studio" in (w.reason or ""))
+    # an English failure reply trips it too (numbers vary, prose is stable)
+    w_en = RelayWorker("g", "wen")
+    en = "Sorry, an unexpected error occurred. If the problem persists, contact your administrator."
+    w_en._decide(en + "1"); w_en._decide(en + "2"); w_en._decide(en + "3")
+    check("dead_detector_english", w_en.status == "stuck")
     # the admin-block message triggers the same fast bail
     w2 = RelayWorker("g", "w1")
     msg = "ページをもう一度読み込んでみてください。管理者に問い合わせてください。セッション ID: "

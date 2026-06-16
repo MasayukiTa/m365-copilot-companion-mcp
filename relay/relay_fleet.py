@@ -43,6 +43,19 @@ TERMINAL = ("done", "stuck", "maxturns", "error", "cancelled")
 # non-terminal but not yet occupying a tab; counts as "still running" for the loop.
 PENDING = "pending"
 
+# Replies that mean the Copilot AGENT/PATH is down, NOT that the task failed. The error number /
+# session-id / timestamp vary, but the prose is stable in both EN and JP. If one of these repeats,
+# the agent is almost certainly wedged or STOPPED/DISABLED in Copilot Studio (a per-agent admin
+# block -- seen when one agent died while the user's others kept working). The fix is to check
+# Copilot Studio / switch agents, NOT to keep retrying. Stored lowercase; JP is unaffected by
+# .lower(), so a single `marker in resp.lower()` covers both languages.
+AGENT_DEAD_MARKERS = (
+    "予期しないエラー", "システムエラー", "systemerror", "unexpected error",
+    "something went wrong", "ページをもう一度読み込", "reload the page", "try reloading",
+    "管理者に問い合わせ", "contact your administrator", "contact the administrator",
+    "問題が解決しない場合", "if the problem persists",
+)
+
 # Statuses where the main thread is legitimately busy with a BOUNDED acceptance check
 # (eval/verification), NOT a wedged Edge. The watchdog must not hard-reset while a worker
 # is in one of these -- doing so throws away in-progress eval and resumes every goal at
@@ -744,15 +757,22 @@ class RelayWorker:
         # pattern, bail FAST after a few, and go STUCK so the goal can be re-submitted on a healthy
         # agent rather than wasting the whole turn budget on a dead endpoint.
         _low = resp.lower()
-        if ("予期しないエラー" in resp or "SystemError" in resp or "unexpected error" in _low
-                or "管理者に問い合わせ" in resp or "ページをもう一度読み込" in resp
-                or ("contact" in _low and "administrator" in _low)):
+        if any(m in _low for m in AGENT_DEAD_MARKERS):
             self._copilot_err_streak += 1
             if self._copilot_err_streak >= 3:
                 self.status, self.outcome = "stuck", "STUCK"
-                self.reason = ("Copilot agent/path failing (%dx: SystemError / 'reload・contact "
-                               "admin') -- a dropped devtunnel OR an ADMIN-BLOCKED agent. STUCK so "
-                               "the goal can be re-submitted on a healthy agent." % self._copilot_err_streak)
+                # actionable: this is an AGENT-level failure, not a task failure -- tell the
+                # operator exactly where to look (Copilot Studio) before any re-submission.
+                self.reason = ("⚠ エージェント応答エラーが%d回連続。タスクの失敗ではなく**エージェント"
+                               "自体が応答していない**。→ Copilot Studio でこのエージェントが"
+                               "**停止/無効化(管理者ブロック)されていないか確認**してください"
+                               "（他のエージェントが動くなら本エージェント固有の block の可能性大）。"
+                               "健全なエージェントに切り替えて再投入を。" % self._copilot_err_streak)
+                try:
+                    default_notify("⚠ エージェント停止の疑い",
+                                   "Copilot Studio で停止/無効化されていないか確認を (%s)" % self.name)
+                except Exception:
+                    pass
                 return
             self.job = RETRY_JOB     # a couple of quick retries before declaring the path dead
             return
