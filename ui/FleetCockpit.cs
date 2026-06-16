@@ -2183,9 +2183,11 @@ class CockpitWindow : Window
     {
         var hit = new Border();
         hit.Background = Brushes.Transparent;            // whole padded area is the hit target
-        hit.Padding = new Thickness(2, 2, 8, 2);
+        hit.Padding = new Thickness(8, 8, 12, 8);
+        hit.MinWidth = 28; hit.MinHeight = 28;           // ~28x28 px target -- far easier to click
         hit.Cursor = Cursors.Hand;
         hit.VerticalAlignment = VerticalAlignment.Center;
+        hit.HorizontalAlignment = HorizontalAlignment.Center;
         hit.ToolTip = _lang == 0
             ? (expanded ? "詳細を閉じる" : "詳細を開く（最新の進捗・割り込み）")
             : (expanded ? "Collapse details" : "Expand (latest progress + steer)");
@@ -2207,7 +2209,10 @@ class CockpitWindow : Window
         hit.Child = path;
 
         string nm = name;
-        hit.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e)
+        // Fire on button-DOWN so the chevron beats the ListBoxItem's selection handling, which
+        // captures the mouse on DOWN and would otherwise swallow our UP. PreviewMouseLeftButtonDown
+        // runs in the tunnel before the item sees it; e.Handled stops the open-conversation handler.
+        hit.PreviewMouseLeftButtonDown += delegate (object s, MouseButtonEventArgs e)
         {
             e.Handled = true;
             ToggleExpand(nm);
@@ -2232,11 +2237,20 @@ class CockpitWindow : Window
         if (off > 0.0)
         {
             double target = off;
+            // Restore the (pixel-based) offset AFTER the VirtualizingStackPanel has re-measured the
+            // full scroll extent. At Loaded priority the extent isn't final yet, so ScrollTo clamps
+            // to ~0 -> the big upward jump when expanding a low card. Run at Background (after
+            // layout), force a layout pass, then re-apply clamped to the scrollable range so the
+            // toggled card stays put and its detail appears in place.
             Dispatcher.BeginInvoke(new Action(delegate
             {
                 ScrollViewer s2 = ListScroller();
-                if (s2 != null) s2.ScrollToVerticalOffset(target);
-            }), System.Windows.Threading.DispatcherPriority.Loaded);
+                if (s2 == null) return;
+                if (_list != null) _list.UpdateLayout();
+                double max = s2.ScrollableHeight;
+                double t = (target < 0.0) ? 0.0 : (target > max ? max : target);
+                s2.ScrollToVerticalOffset(t);
+            }), System.Windows.Threading.DispatcherPriority.Background);
         }
         _lastSig = Sig(_lastRoot);
     }
