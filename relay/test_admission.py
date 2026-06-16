@@ -484,7 +484,8 @@ def test_consent_detector():
         card = ("desktopfile操作\nまずは接続して、必要な情報を探します。この資格情報を 接続マネージャーを開く で"
                 "検証してください。接続の準備が整ったら、この要求をやり直してください。再試行 キャンセル")
         w = RelayWorker("fix the bug", "w0")
-        w._decide(card)                       # 1st -> surface once + retry, NOT stuck
+        w._decide(card)                       # 1st -> auto tried (page=None -> fails) -> surface, NOT stuck
+        check("consent_auto_attempted_first", w._consent_auto_tried)
         check("consent_surface_on_first", calls["n"] == 1 and w._consent_surfaced and w.status != "stuck")
         w._decide(card)                       # 2nd -> STUCK (don't burn turns on the card)
         check("consent_stuck_after_2", w.status == "stuck" and w.outcome == "STUCK")
@@ -499,6 +500,13 @@ def test_consent_detector():
         w3 = RelayWorker("g", "w2")
         w3._decide('{"platform":"win32","python_version":"3.11"} 完了。CONTINUE')
         check("consent_no_false_positive", w3.status != "stuck" and w3._consent_streak == 0)
+        # AUTO-CONSENT SUCCESS: when the click-through completes, re-invoke (RETRY) -- no surface, no STUCK
+        wok = RelayWorker("g", "wok")
+        wok._auto_consent = lambda: True
+        calls["n"] = 0
+        wok._decide(card)
+        check("consent_auto_success_no_surface", calls["n"] == 0 and wok.status != "stuck"
+              and wok._consent_auto_tried)
     finally:
         er.surface = orig
 

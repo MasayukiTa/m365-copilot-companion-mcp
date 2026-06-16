@@ -435,7 +435,8 @@ class RelayWorker:
         self._research_session = None   # non-blocking ResearchSession while status=='researching'
         self._copilot_err_streak = 0    # consecutive Copilot/tool 'SystemError' replies (path down)
         self._consent_streak = 0        # consecutive MCP connection-consent cards (auth needed)
-        self._consent_surfaced = False  # surfaced the Edge once so the user can authorize
+        self._consent_auto_tried = False  # attempted the automatic click-through once
+        self._consent_surfaced = False  # surfaced the Edge once (manual fallback)
         # review panel (operator B, perspective-diverse): a list of lenses runs one
         # independent reviewer each, aggregated by majority. Empty = single reviewer.
         self.review_lenses = list(review_lenses) if review_lenses else []
@@ -761,6 +762,70 @@ class RelayWorker:
             (detail or "")[:160])
         return True
 
+    def _auto_consent(self):
+        """Click through the MCP connection-consent card AUTOMATICALLY. The card is NOT a
+        credential entry -- the Bearer key is already configured on the connector; this is just a
+        connection-SELECT confirm. Verified flow (2026-06-15): 接続マネージャーを開く opens the
+        Copilot Studio connection manager in a popup; a stale connection exposes a レビュー link ->
+        the 接続の作成または選択 dialog has the connection pre-selected -> 送信する commits it. Once
+        committed, ANY later tool call works, so we do NOT click 再試行 here -- the caller sends
+        RETRY_JOB and the agent re-invokes the tool on a now-valid connection.
+        Returns True if 送信する was clicked, False otherwise (caller falls back to manual surface)."""
+        pg = self.page
+        if pg is None:
+            return False
+        try:
+            ctx = pg.context
+            link = pg.locator('a:has-text("接続マネージャーを開く"), a:has-text("connection manager")')
+            if not link.count():
+                return False
+            try:
+                with ctx.expect_page(timeout=15000) as pinfo:
+                    link.first.click()
+                cs = pinfo.value
+            except Exception:
+                return False            # opened in-place / no popup -> hand to manual
+            try:
+                cs.wait_for_load_state("domcontentloaded", timeout=20000)
+            except Exception:
+                pass
+            for _ in range(15):         # let the CS /auth redirect settle
+                try:
+                    if "/auth" not in (cs.url or ""):
+                        break
+                except Exception:
+                    break
+                cs.wait_for_timeout(2000)
+            try:                         # stale connection -> レビュー opens the select dialog
+                rev = cs.locator('a:has-text("レビュー"), button:has-text("レビュー"), a:has-text("Review")')
+                if rev.count():
+                    rev.first.click()
+                    cs.wait_for_timeout(3000)
+            except Exception:
+                pass
+            submitted = False            # the connection is pre-selected -> just submit
+            for label in ("送信する", "送信", "Submit"):
+                try:
+                    btn = cs.locator('button:has-text("%s")' % label)
+                    if btn.count():
+                        btn.first.click()
+                        cs.wait_for_timeout(4000)
+                        submitted = True
+                        break
+                except Exception:
+                    continue
+            try:
+                cs.close()
+            except Exception:
+                pass
+            try:
+                pg.bring_to_front()
+            except Exception:
+                pass
+            return submitted
+        except Exception:
+            return False
+
     def _decide(self, resp):
         self.last_response = resp
         self._tx.assistant(self.turn, resp)    # persist the full Copilot reply for this turn
@@ -779,6 +844,17 @@ class RelayWorker:
         # in that very Edge, then STUCK fast (do not loop the card to MAXTURNS).
         if any(m in resp for m in CONSENT_MARKERS) or any(m in _low for m in CONSENT_MARKERS):
             self._consent_streak += 1
+            # AUTO-CONSENT first: the card is a connection-SELECT confirm, not a credential entry,
+            # so the relay clicks through it (接続マネージャー -> レビュー -> 送信する) and re-invokes
+            # the tool via RETRY_JOB. Manual surfacing is only a fallback when the click-through
+            # can't complete (DOM changed / popup blocked).
+            if not self._consent_auto_tried:
+                self._consent_auto_tried = True
+                if self._auto_consent():
+                    self.job = RETRY_JOB
+                    self.reason = "auto-consent: 接続を確定し再呼出"
+                    return
+            # fallback: surface the (headless) Edge ONCE so the user can authorize manually
             if not self._consent_surfaced:
                 self._consent_surfaced = True
                 try:
@@ -788,15 +864,15 @@ class RelayWorker:
                     pass
                 try:
                     default_notify("⚠ 接続の承認が必要",
-                                   "専用Edgeを前面に出しました。MCP接続のconsentを承認してください (%s)" % self.name)
+                                   "自動承認に失敗。専用Edgeを前面に出しました。MCP接続を承認してください (%s)" % self.name)
                 except Exception:
                     pass
             if self._consent_streak >= 2:
                 self.status, self.outcome = "stuck", "STUCK"
-                self.reason = ("⚠ MCPコネクタの**接続承認(consent)が未完**。エージェントはツールを呼ぶ度に"
-                               "「接続マネージャーを開く/資格情報を検証」カードを返している。これはタスク失敗"
-                               "ではなく**対話認証**。→ 前面に出した**専用Edge**で接続を承認(consentは当該"
-                               "ブラウザ専用・他で承認しても無効)してから再投入を。")
+                self.reason = ("⚠ MCPコネクタの**接続承認(consent)が未完**で自動承認も失敗。エージェントは"
+                               "ツールを呼ぶ度に「接続マネージャーを開く」カードを返している。タスク失敗ではなく"
+                               "**接続未確立**。→ 前面に出した**専用Edge**で接続を承認(consentは当該ブラウザ"
+                               "専用・他で承認しても無効)してから再投入を。")
                 return
             self.job = RETRY_JOB
             return
