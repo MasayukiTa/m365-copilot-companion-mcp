@@ -179,7 +179,9 @@ def main():
     if args.plan:
         cmd.append("--plan")
     print("  launching: fleet_runner (1 tab, auto-verified)\n")
-    rc = subprocess.call(cmd, cwd=repo)
+    env = dict(os.environ)
+    env["MCP_TASK_DOMAIN"] = "coding"        # code_task IS a coding task -> auto uses the code lens
+    rc = subprocess.call(cmd, cwd=repo, env=env)
 
     # accumulate per-folder project memory: record what this task did so the NEXT task on
     # this folder is primed with it (read the outcome from the run's final status.json).
