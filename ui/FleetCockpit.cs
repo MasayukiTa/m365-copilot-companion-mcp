@@ -306,7 +306,7 @@ class CockpitWindow : Window
                 }
             if (!found) lines.Add(key + "=" + val);
             Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile));
-            File.WriteAllText(SettingsFile, string.Join("\n", lines.ToArray()) + "\n", Encoding.UTF8);
+            File.WriteAllText(SettingsFile, string.Join("\n", lines.ToArray()) + "\n", new UTF8Encoding(false));
             _settingsMtime = File.GetLastWriteTimeUtc(SettingsFile).Ticks;
         }
         catch (Exception) { }
@@ -2273,7 +2273,7 @@ class CockpitWindow : Window
     }
     void WriteCommands(Dictionary<string, object> cmd)
     {
-        try { File.WriteAllText(_commandsPath, _js.Serialize(cmd), Encoding.UTF8); }
+        try { File.WriteAllText(_commandsPath, _js.Serialize(cmd), new UTF8Encoding(false)); }
         catch (Exception) { }
     }
 
@@ -2332,7 +2332,7 @@ class CockpitWindow : Window
             _openSeq++;
             var o = new Dictionary<string, object>();
             o["url"] = url; o["ts"] = _openSeq;
-            File.WriteAllText(_openPath, _js.Serialize(o), Encoding.UTF8);
+            File.WriteAllText(_openPath, _js.Serialize(o), new UTF8Encoding(false));
         }
         catch (Exception) { }
     }
@@ -2347,7 +2347,7 @@ class CockpitWindow : Window
             _openSeq++;
             var o = new Dictionary<string, object>();
             o["worker"] = name ?? ""; o["url"] = url ?? ""; o["ts"] = _openSeq;
-            File.WriteAllText(_openPath, _js.Serialize(o), Encoding.UTF8);
+            File.WriteAllText(_openPath, _js.Serialize(o), new UTF8Encoding(false));
         }
         catch (Exception) { }
     }
@@ -2410,7 +2410,7 @@ class CockpitWindow : Window
     }
     void SaveHistory()
     {
-        try { File.WriteAllText(_historyPath, _js.Serialize(_history), Encoding.UTF8); }
+        try { File.WriteAllText(_historyPath, _js.Serialize(_history), new UTF8Encoding(false)); }
         catch (Exception) { }
     }
     // The STABLE per-run+worker key (run identity + worker name). `started` is absent from
@@ -2438,7 +2438,7 @@ class CockpitWindow : Window
         {
             var list = new List<object>();
             foreach (string k in _hiddenKeys) list.Add(k);
-            File.WriteAllText(_hiddenPath, _js.Serialize(list), Encoding.UTF8);
+            File.WriteAllText(_hiddenPath, _js.Serialize(list), new UTF8Encoding(false));
         }
         catch (Exception) { }
     }
@@ -2467,7 +2467,7 @@ class CockpitWindow : Window
                 // Run is finished/dead: a clean reset -- blank the snapshot AND forget hides.
                 File.WriteAllText(_statusPath,
                     "{\"total\":0,\"done_count\":0,\"running\":false,\"idle\":true,\"workers\":[]}",
-                    Encoding.UTF8);
+                    new UTF8Encoding(false));
                 _hiddenKeys.Clear();
                 SaveHidden();
             }
