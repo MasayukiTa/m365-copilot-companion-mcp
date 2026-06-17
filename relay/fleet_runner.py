@@ -103,7 +103,7 @@ def settings_effort(default="auto"):
     try:
         p = _settings_path()
         if p and os.path.isfile(p):
-            for ln in open(p, encoding="utf-8"):
+            for ln in open(p, encoding="utf-8-sig"):   # tolerate a BOM (the C# cockpit may write one)
                 ln = ln.strip()
                 if ln.startswith("effort="):
                     v = ln.split("=", 1)[1].strip()
@@ -538,7 +538,7 @@ def main():
         try:
             if not os.path.isfile(commands_path):
                 return
-            with open(commands_path, encoding="utf-8") as f:
+            with open(commands_path, encoding="utf-8-sig") as f:   # tolerate a BOM from the C# cockpit
                 cmd = json.load(f)
             os.remove(commands_path)
             by_name = {w.name: w for w in workers}
