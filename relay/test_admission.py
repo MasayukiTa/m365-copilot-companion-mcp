@@ -479,6 +479,29 @@ def test_dead_agent_detector():
     check("err_streak_resets_on_real_reply", w3._copilot_err_streak == 0 and w3._agent_err_ts == 0.0)
 
 
+def test_tool_unreachable_infra():
+    import time as _t
+    # The agent's "my tools don't exist / 再試行では解消しません" self-lock is INFRA-FALSE (devtunnel
+    # blip), not a miss: re-send the goal to ride it out, and only INFRA_STUCK (not a coding miss)
+    # past the window.
+    msg = ("STUCK: 環境にローカルファイル操作・コード実行ツールが存在しないため、ソースの編集・検証は"
+           "不可能です。恒常的制約のため再試行では解消しません。完遂には当環境へのツール有効化、または"
+           "検証側での差分適用が必要です。")
+    w = RelayWorker("g", "w0")
+    w._decide(msg)
+    check("toolerr_within_window_resends_goal",
+          w.status == "ready" and w.goal in (w.job or "") and w.outcome != "STUCK")
+    # past the window -> INFRA_STUCK (a re-queueable infra stuck, NOT a coding miss)
+    w._toolerr_ts = _t.time() - rf.AGENT_ERR_WINDOW_S - 1
+    w._decide(msg)
+    check("toolerr_past_window_infra_stuck", w.status == "stuck" and w.outcome == "INFRA_STUCK")
+    check("toolerr_msg_says_infra", "インフラ" in (w.reason or ""))
+    # a normal coding reply does NOT trip it (no false positive)
+    w2 = RelayWorker("g", "w1")
+    w2._decide("ファイルを修正しました。テストも通りました。DONE")
+    check("toolerr_no_false_positive", w2.status != "stuck" and w2._toolerr_ts == 0.0)
+
+
 def test_transient_outage_window():
     import time as _t
     # The transient retry rides out an OUTAGE on a wall-clock window, not a 10-count budget that
@@ -597,6 +620,7 @@ def main():
     test_fleet_research_nonblocking()
     test_research_session_ram_gated_open()
     test_dead_agent_detector()
+    test_tool_unreachable_infra()
     test_transient_outage_window()
     test_consent_detector()
     print("\n=== %d/%d admission checks passed ===" % (sum(results), len(results)))
