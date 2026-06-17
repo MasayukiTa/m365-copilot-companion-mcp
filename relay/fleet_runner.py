@@ -414,11 +414,18 @@ def main():
         os.environ["SWE_STRONG_SELFTEST"] = "1"
     elif _eff == "auto":
         args.refuter = True
-        args._lenses = ["rootcause"]                    # right-size gate: minimal AND complete AND
-                                                        # symptom-gone (not just "not over-engineered")
+        # DOMAIN-AWARE gate: effort modes are general (orthogonal to task type), so the auto lens is
+        # domain-agnostic ('rootcause') for a general task (research/summarize/M365/...) and swaps to
+        # the code-specific 'rootcause_code' only for CODING tasks. Coding is signalled by SWE_MINIMALITY
+        # (set by the SWE goal builder) or MCP_TASK_DOMAIN=coding (set by code_task). A non-coding task
+        # is never reviewed with code criteria (reproduce-the-bug, producer/consumer, hunks).
+        _coding = bool(os.environ.get("SWE_MINIMALITY")) or \
+            os.environ.get("MCP_TASK_DOMAIN", "").lower() == "coding"
+        args._lenses = ["rootcause_code" if _coding else "rootcause"]
         args.max_refute = max(args.max_refute, 3)
         args.max_research = max(args.max_research, 3)
-        os.environ["SWE_STRONG_SELFTEST"] = "1"
+        if _coding:
+            os.environ["SWE_STRONG_SELFTEST"] = "1"     # red->green self-test is a coding discipline
     if args.panel and args._lenses is None:             # explicit --panel still forces the 3 lenses
         args._lenses = list(PANEL_LENSES)
         args.refuter = True

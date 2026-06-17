@@ -57,12 +57,23 @@ LENS_PROMPTS = {
                   "変えている**なら、それは過剰修正＝欠陥として REFUTED にせよ。正しい修正は"
                   "通常ごく小さい（数行）。逆に、変更が最小で根本原因に的確に当たっていれば "
                   "UPHELD。『動くが過剰』も REFUTED 扱い（最小の正しい差分に絞らせる）。",
-    # The 'auto' gate (2026-06-17, from the 3-miss analysis). The minimality lens alone is biased
-    # toward UNDER-fixing: it only hunts over-engineering, so it is structurally blind to the
-    # dominant real miss -- a diff that is too SMALL or off-target (1 of 2 hunks done; producer
-    # fixed but consumers not; wrong root cause). This single lens checks BOTH directions so auto
-    # accepts a fix only when it is minimal AND complete AND the symptom is actually gone.
-    "rootcause": "このレビューでは『根本原因への最小かつ完全な修正か』を反証せよ。次のどれか一つでも"
+    # The 'auto' gate -- GENERAL (domain-agnostic) form. Checks the answer is minimal AND complete
+    # AND actually satisfies the ORIGINAL request, for ANY task (research, summarization, M365, ...).
+    # Coding tasks swap in 'rootcause_code' (below) via the domain flag. Keeping this lens general is
+    # why effort modes (min/max/ultra/auto) stay orthogonal to task type -- a non-coding task must
+    # not be reviewed with code-specific criteria.
+    "rootcause": "このレビューでは『要求への最小かつ完全な回答か』を反証せよ。次のどれか一つでも"
+                 "当たれば REFUTED:\n"
+                 "(1) 過剰: 要求されていない事柄を足している/冗長/的外れな付加がある。\n"
+                 "(2) 過小・的外れ: **元の要求(指示)を読み直し**、求められた事項のどれかが**実際には"
+                 "満たされていない**。それらしく見えるだけで要件未達なら欠陥。\n"
+                 "(3) 不完全: 要求が複数の部分（全項目・両方向・対象すべて・各観点）を含むのに一部しか"
+                 "答えていない。\n"
+                 "最小で、かつ要求の全要件を実際に満たしていれば UPHELD。",
+    # The 'auto' gate -- CODING form (selected when the task domain is coding). From the 3-miss
+    # analysis: the minimality lens alone is blind to UNDER-fixing (1 of 2 hunks; producer fixed but
+    # consumers not; wrong root cause). Checks BOTH over- and under-fixing for code.
+    "rootcause_code": "このレビューでは『根本原因への最小かつ完全な修正か』を反証せよ。次のどれか一つでも"
                  "当たれば REFUTED:\n"
                  "(1) 過剰: 差分が必要以上に大きい/余計なファイル・関数を触る/根本原因でない箇所を変える。\n"
                  "(2) 過小・的外れ: 問題文の症状を再現する独立ケースを頭の中で（または可能なら実際に）"
