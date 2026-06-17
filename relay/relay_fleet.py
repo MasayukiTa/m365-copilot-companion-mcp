@@ -65,6 +65,19 @@ AGENT_DEAD_MARKERS = (
 NET_RETRY_WINDOW_S = float(os.environ.get("MCP_NET_RETRY_S", "1800"))      # send/CDP/network: 30 min
 AGENT_ERR_WINDOW_S = float(os.environ.get("MCP_AGENT_ERR_S", "1200"))     # agent SystemError: 20 min
 
+# TOOL-BACKEND-UNREACHABLE detector. When the MCP tool path (devtunnel) drops for even a moment, the
+# agent's tool calls fail and it WRONGLY concludes its tools don't exist / aren't assigned and self-
+# locks ("再試行では解消しません / won't respond without new input"). That is INFRA-FALSE (the tools
+# DO exist; the network blipped), NOT a genuine STUCK -- but the agent's own STUCK was being accepted
+# as a terminal miss. Detect it, RE-SEND THE GOAL (the "new input" it demands) to ride out the blip,
+# and only give up (as a re-queueable infra stuck, NOT a miss) after the wall-clock window.
+TOOL_UNREACHABLE_MARKERS = (
+    "ツールが存在しない", "ツールが割り当てられ", "ツールがこのセッションに割り当て",
+    "ツールが存在しないため", "再試行では解消", "再試行では解決しません",
+    "恒常的制約", "構造的制約のため", "当環境へのツール有効化", "ツール有効化、または",
+    "no tools are assigned", "tools are not available", "tool is not available to this session",
+)
+
 # CONNECTION-CONSENT detector. The FIRST time the agent calls an MCP tool, Copilot can show a
 # connection-consent card ("この資格情報を 接続マネージャーを開く で検証してください ... 再試行")
 # instead of executing -- the MCP connector's per-user connection is not authorized yet. This is
@@ -445,6 +458,7 @@ class RelayWorker:
         self._research_session = None   # non-blocking ResearchSession while status=='researching'
         self._copilot_err_streak = 0    # consecutive Copilot/tool 'SystemError' replies (path down)
         self._agent_err_ts = 0.0        # wall-clock start of the current agent-error (outage) streak
+        self._toolerr_ts = 0.0          # wall-clock start of the tool-unreachable (devtunnel down) streak
         self._consent_streak = 0        # consecutive MCP connection-consent cards (auth needed)
         self._consent_auto_tried = False  # attempted the automatic click-through once
         self._consent_surfaced = False  # surfaced the Edge once (manual fallback)
@@ -917,6 +931,25 @@ class RelayWorker:
                 return
             self.job = RETRY_JOB
             return
+        # TOOL-BACKEND-UNREACHABLE: the agent's tool calls failed (devtunnel/network blip) and it
+        # self-locked claiming its tools don't exist. INFRA-FALSE, not a miss. Re-send the GOAL (the
+        # "new input" it demands) to ride out the blip; give up only past the window, as a re-queueable
+        # infra stuck (NOT counted as a coding miss).
+        if any(m in resp for m in TOOL_UNREACHABLE_MARKERS) or any(m in _low for m in TOOL_UNREACHABLE_MARKERS):
+            now = time.time()
+            if self._toolerr_ts <= 0.0:
+                self._toolerr_ts = now
+            if (now - self._toolerr_ts) > AGENT_ERR_WINDOW_S:
+                self.status, self.outcome = "stuck", "INFRA_STUCK"
+                self.reason = ("⚠ ツール経路(devtunnel/網)が%d分以上不通でツール呼び出し不可。エージェントは"
+                               "『ツールが存在しない』と誤判定し自己ロックしている。**タスク失敗でなくインフラ起因**"
+                               "(網/トンネル復旧後に再投入＝reverify対象)。" % int((now - self._toolerr_ts) / 60))
+                return
+            self.job = PROTOCOL + self.goal          # re-send the goal as 'new input' to unlock it
+            self._cooldown_until = now + transient_backoff(2)
+            self.status = "ready"
+            self.reason = "tool path down (infra) -> re-send goal, riding out outage"
+            return
         if any(m in _low for m in AGENT_DEAD_MARKERS):
             now = time.time()
             if self._agent_err_ts <= 0.0:
@@ -984,6 +1017,7 @@ class RelayWorker:
             return
         self.transient = 0   # a real (non-stuck) response -> the transient issue cleared
         self.first_transient_ts = 0.0   # reset the outage window on a healthy reply
+        self._toolerr_ts = 0.0          # tool path is back -> clear the tool-unreachable window
         # deep-research delegation: the agent wrote `RESEARCH: <query>` asking for an external
         # deep-dive. Spawn the Researcher sub-agent (side page), feed its report back as the next
         # turn, and continue. Capped per worker (max_research); past the cap, tell it to proceed.
