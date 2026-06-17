@@ -22,6 +22,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -97,6 +98,10 @@ def main():
                          '(on top of auto-detected verification), e.g. "ruff check ."')
     ap.add_argument("--no-verify", action="store_true",
                     help="skip auto-detected verification (accept a self-reported DONE)")
+    ap.add_argument("--priority", action="store_true",
+                    help="if a fleet is already running, enqueue this task at the FRONT (preempt). "
+                         "Default OFF: the currently-running task stays highest priority and this "
+                         "runs AFTER it. Either way a competing second fleet is never spawned.")
     ap.add_argument("--effort", choices=["min", "max", "ultra", "auto"], default=None,
                     help="scaffold effort for this single run (min/max/ultra/auto). Passed through "
                          "to fleet_runner (a single run IS a 1-goal fleet), so it gets the SAME "
@@ -164,6 +169,45 @@ def main():
     if args.dry_run:
         print("  goal: %s" % goal["text"].replace("\n", " "))
         print("  (dry-run: not launching)")
+        return 0
+
+    # If a fleet is ALREADY running, do NOT spawn a competing one: two fleets share the single
+    # dedicated Edge and clobber each other's status.json (the new task showed up as a phantom W0
+    # behind the live run). Instead ENQUEUE this task into the running fleet via add_goal --
+    # priority=False by default so the CURRENT work stays highest-priority and this runs after it.
+    def _fleet_is_live(sd):
+        try:
+            sp = os.path.join(sd, "status.json")
+            if not os.path.isfile(sp) or (time.time() - os.path.getmtime(sp)) > 30:
+                return False
+            return bool(json.load(open(sp, encoding="utf-8-sig")).get("running"))
+        except Exception:
+            return False
+
+    if _fleet_is_live(state_dir):
+        cmds_path = os.path.join(state_dir, "commands.json")
+        cur = {}
+        if os.path.isfile(cmds_path):
+            try:
+                cur = json.load(open(cmds_path, encoding="utf-8-sig"))
+            except Exception:
+                cur = {}
+        adds = cur.get("add_goal") or []
+        if not isinstance(adds, list):
+            adds = [adds]
+        entry = {"text": goal["text"], "cwd": goal.get("cwd") or os.path.abspath(args.folder),
+                 "priority": bool(args.priority)}
+        if goal.get("checks"):
+            entry["checks"] = goal["checks"]
+        adds.append(entry)
+        cur["add_goal"] = adds
+        tmp = cmds_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="") as f:   # BOM-less (the fleet reads utf-8-sig too)
+            json.dump(cur, f, ensure_ascii=False)
+        os.replace(tmp, cmds_path)
+        print("  a fleet is already RUNNING -> queued this task into it (priority=%s); it will run "
+              "%s the current work. NOT spawning a competing fleet." %
+              (bool(args.priority), "before" if args.priority else "after"))
         return 0
 
     # one task, one tab: reuse the full fleet machinery (status.json, watchdog, recovery)
