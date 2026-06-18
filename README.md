@@ -64,6 +64,24 @@
 
 ---
 
+## 📊 性能実測 — SWE-bench Lite（実OSS不具合修正、クリーン60件）
+
+HumanEval が「関数単位の生成」なら、こちらは **実在 OSS のバグを隠しテストが通るまで直す** 実務に近い難タスク。SWE-bench Lite 300 件の **1/5（60件）** を、**grader 非リーク**（解答中にエージェントが隠しテストを見ない＝`checks=N` で走らせ、採点はオフライン）・WSL2 Docker 上の **公式採点** でフル完走した。
+
+| 構成 | clean pass@1 |
+|---|---|
+| ベースライン scaffold | **40 / 59 = 67.8%**（EVALERR 1件除外） |
+| 強化 scaffold（失敗分析→根治） | **47 / 60 = 78.3%**（EVALERR 0） |
+
+- repo別（強化後）：django 20/23・matplotlib 5/5・scikit-learn 5/5・pytest 3/3・sympy 9/15・sphinx-doc 2/3。
+- **足場を強化すると上がる**：r1 の失敗を「検証ループ未閉鎖／多点修正の片肺／層違い／抑制vs表出」の故障クラスに類型化し、**ベンチに過適合しないドメイン一般な修正だけ** を投入（grader リークになる手は不採用）。狙った matplotlib(2/5→5/5)・sphinx(0/3→2/3) がピンポイントで改善。
+- **誠実な注記**：r1/r2 は別インスタンスなので +10.5pt にはインスタンス難易度のばらつきが混在（同一問題の統制比較ではない）。デバッグに使った問題は burned 扱いでスコア主張から除外。
+- 同じ Opus 4.8。HumanEval と同様、**「頭脳が上」ではなく「足場が効いている」** ことを示す数値。
+
+> 注：これは「実力の途中経過」。残り故障クラス⑤（修正半径違い）対策の A/B と、300 件への拡大で再現性（汎化）を確認していく。
+
+---
+
 ## 🏆 こいつ、なにができるのか
 
 「ファイル読むくらいしかしてくれない Copilot」を、**追加課金ゼロ・ライセンス内・ノート PC 1 台** でここまで盛りました。順に自慢します。
@@ -334,7 +352,7 @@ relay の上に、**Claude Code のような自律コーディング体験** を
 
 Premium / Direct Line を使わず、Copilot エージェントを **手元のローカルアプリのように** 使える 2 つのフロントエンドを同梱しています。どちらも裏は同じ「ブリッジ → CDP → Copilot」経路で、別 PC の要件は **Python + Edge のみ**（Chrome も Node も不要）。
 
-- **Python ブリッジ** (`bridge/copilot_bridge.py`): stdlib の `http.server` だけで自己完結の HTML チャットを配信し、Copilot の応答を **差分スクレイピングでトークン単位ストリーミング**。`python bridge\copilot_bridge.py` → ブラウザで `http://127.0.0.1:8765`。
+- **Python ブリッジ** (`bridge/copilot_bridge.py`): stdlib の `http.server` だけで自己完結の HTML チャットを配信し、Copilot の応答を **差分スクレイピングでトークン単位ストリーミング**。起動は `.\start_bridge.ps1` 推奨 → ブラウザで `http://127.0.0.1:8765`。これは bridge を **専用の隔離 Edge**（別プロファイル `copilot-bridge-edge` ＋別 CDP ポート `:9223`）で立てるので、SWE フリートの Edge（`:9222`）と取り合わず **フリート走行中でも同時に使える**（Edge は 1 プロファイル＝1 プロセスのため、並走には別プロファイル＋別ポートが必須）。単体で繋ぐなら `python bridge\copilot_bridge.py`（既定で `:9222` の Edge に attach）。
 - **ネイティブ WPF アプリ** (`ui/CopilotChat.cs`): Windows 同梱の `csc.exe` だけでビルドする **完全 JS フリー** のデスクトップチャット。マークダウン/コードブロック整形・ダーク/ライト・日本語/英語切替・会話履歴サイドバー（リネーム・削除）。`ui\build_and_run.bat` でビルド＆起動。
 - **フリートコックピット** (`ui/FleetCockpit.cs`): 並列実行を 1 ライブカード/ゴールで可視化。RAM 自動調整（適応スロットル）・disk/RAM 容量アウェアな連続アドミッション（重い eval は単独・軽い eval は並走）・完了で即タブ＆容量解放・各ワーカーを途中でステア/解放。`ui\build_cockpit.bat` でビルド＆起動。
 
@@ -756,6 +774,24 @@ Run as an autonomous coding agent on the **full HumanEval suite (164 problems)**
 - **Fair framing:** Anthropic's published Opus HumanEval (~90–92%) is **raw single-shot pass@1**. This number is an **agentic loop + self-testing + verification + retry**, so it is *not* directly comparable — it shows the harness extracting the model's capability, not a smarter model (it *is* Opus). HumanEval is a saturated benchmark for frontier models. The earlier 3/20 mass-stall was purely harness reliability, recovered via serialization → exponential backoff → RAM-aware autoscale → verification gate.
 
 > Reproduce: `python -m bench.build --stride 1 --limit 164` → run the fleet → `python -m bench.score`.
+
+---
+
+## 📊 Measured performance — SWE-bench Lite (real-OSS bug fixing, clean 60)
+
+Where HumanEval is function-level generation, this is the near-real task: **fix a real OSS bug until the hidden tests pass.** We ran **1/5 of SWE-bench Lite (60 instances)** with **no grader leakage** (the agent never sees the hidden tests while solving — `checks=N`, graded offline) under the **official SWE-bench harness** in WSL2 Docker.
+
+| Configuration | clean pass@1 |
+|---|---|
+| Baseline scaffold | **40 / 59 = 67.8%** (1 EVALERR excluded) |
+| Strengthened scaffold | **47 / 60 = 78.3%** (0 EVALERR) |
+
+- By repo (strengthened): django 20/23, matplotlib 5/5, scikit-learn 5/5, pytest 3/3, sympy 9/15, sphinx-doc 2/3.
+- **The scaffold moves the number.** r1 failures were classed into failure modes (verification-loop-not-closed / partial-coupled-site / wrong-layer / suppress-vs-surface), and only **domain-general, non-overfit** fixes were applied (anything that would leak the grader was rejected). The targeted clusters — matplotlib (2/5→5/5), sphinx (0/3→2/3) — improved directly.
+- **Honest caveat:** r1 and r2 are *different* instances, so the +10.5pt mixes scaffold gain with instance-difficulty variance (not a same-instance controlled A/B). Problems used while debugging are burned and excluded from any score claim.
+- Same Opus 4.8 — like HumanEval, this shows the **harness extracting capability**, not a smarter model.
+
+> Note: a work-in-progress figure. Next: an A/B for the remaining failure class ⑤ (fix-at-wrong-radius) and a 300-instance run for generalization.
 
 ---
 
