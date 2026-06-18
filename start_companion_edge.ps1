@@ -19,6 +19,11 @@
 
 param(
     [int]$Port = $(if ($env:MCP_CDP_PORT) { [int]$env:MCP_CDP_PORT } else { 9222 }),
+    # Profile = the user-data-dir folder under %LOCALAPPDATA%. Default is the companion/
+    # fleet Edge. The interactive BRIDGE uses a SEPARATE profile (copilot-bridge-edge) on
+    # its OWN CDP port, so it can run concurrently with the fleet's :9222 Edge -- Edge locks
+    # a profile to a single process, so concurrent use REQUIRES distinct profiles + ports.
+    [string]$Profile = $(if ($env:MCP_EDGE_PROFILE) { $env:MCP_EDGE_PROFILE } else { "copilot-companion-edge" }),
     [string]$Url = "https://m365.cloud.microsoft/chat",
     # Recovery: kill the companion Edge and WIPE its session-restore state before
     # launching, so wedged tabs are NOT restored. Use this when the dedicated Edge has
@@ -45,10 +50,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$dataDir = Join-Path $env:LOCALAPPDATA "copilot-companion-edge"
+$dataDir = Join-Path $env:LOCALAPPDATA $Profile
 
 # Remember the chosen window mode so recovery (-HardReset) relaunches the same way.
-$modeFile = Join-Path $PSScriptRoot ".fleet\edge_mode"
+# Per-profile so the bridge Edge and the fleet Edge don't clobber each other's mode.
+$modeFile = Join-Path $PSScriptRoot ".fleet\edge_mode_$Profile"
 if ($Headless) { try { New-Item -ItemType Directory -Force (Split-Path $modeFile) | Out-Null; Set-Content -Path $modeFile -Value "headless" -Encoding ascii } catch {} }
 if ($Foreground) { try { New-Item -ItemType Directory -Force (Split-Path $modeFile) | Out-Null; Set-Content -Path $modeFile -Value "headed" -Encoding ascii } catch {} }
 $useHeadless = $Headless
@@ -90,7 +96,7 @@ public class Cw {
 "@
 function Get-CompanionWindow {
     $pids = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
-              Where-Object { $_.CommandLine -match 'copilot-companion-edge' } |
+              Where-Object { $_.CommandLine -match [regex]::Escape($Profile) } |
               ForEach-Object { [int]$_.ProcessId })
     if ($pids.Count -eq 0) { return [IntPtr]::Zero }
     return [Cw]::Find($pids)
@@ -112,7 +118,7 @@ if ($Surface) {
 if ($HardReset) {
     Write-Host "HardReset: killing companion Edge and clearing session-restore state ..."
     Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
-        Where-Object { $_.CommandLine -match 'copilot-companion-edge' } |
+        Where-Object { $_.CommandLine -match [regex]::Escape($Profile) } |
         ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {} }
     Start-Sleep -Seconds 2
     # Deleting these makes Edge come up clean instead of restoring the wedged tabs.
