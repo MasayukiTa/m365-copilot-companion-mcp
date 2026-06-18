@@ -36,6 +36,8 @@ import sys
 # allow running both as `python -m relay.folder_coder` and `python relay/folder_coder.py`
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from relay.coding_discipline import coding_discipline_text
+
 # Directory names that are never interesting to a coding task -- vendored deps,
 # build output, VCS internals, virtualenvs, and the fleet's own scratch dirs.
 # Matched against every path component, so a nested node_modules is skipped too.
@@ -166,6 +168,12 @@ def generate_goals(folder, instruction, mode="per-file", exts=None, max_files=20
     if mode == "single":
         text = _TPL_SINGLE.format(folder=folder_disp, instruction=instruction)
         checks = [{"type": "shell", "cmd": check_cmd}] if check_cmd else []
+        # The single mode IS a cross-cutting whole-repo task (same shape as code_task):
+        # when it carries a verification gate, give it the same strengthened red->green /
+        # minimal-and-complete discipline. Per-file and review modes are mechanical sweeps /
+        # read-only, so they do NOT get it.
+        if checks:
+            text += coding_discipline_text()
         return [_wrap(text, checks, folder_disp)]
 
     tpl = _TPL_PER_FILE if mode == "per-file" else _TPL_REVIEW
