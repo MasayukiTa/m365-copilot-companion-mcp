@@ -15,6 +15,7 @@ the same way the research/analyst delegation does.
 """
 from __future__ import annotations
 
+import os
 import re
 
 REFUTER_INSTRUCTION = (
@@ -88,10 +89,12 @@ LENS_PROMPTS = {
                  "通常 callee を直に叩くので、caller だけの修正は落ちる。\n"
                  "(5) 抑制 vs 表出: 要求が警告・メッセージ・戻り値の**表出**なのに、例外を握り潰す/黙って"
                  "抑制している（『続行しつつ正しい診断を出す』契約を満たさず、消すだけになっている）。\n"
-                 "(6) 修正半径違い: 上流の dispatch/routing/consumer/便宜API で症状を消しただけで、契約が"
+                 # class 5 lens clause, gated by SWE_FIX_RADIUS (default ON) so an A/B can isolate it
+                 + ("(6) 修正半径違い: 上流の dispatch/routing/consumer/便宜API で症状を消しただけで、契約が"
                  "定義された**最下層（プリミティブ/共有定義）が未修正**、または古い挙動をフォールバックで温存し、"
                  "退化・矛盾入力（空/ゼロ/負/None/未確定）での新しい契約を満たさない。\n"
-                 "上のいずれも無く、独立再現ケースが通り、関連する全ての箇所が直っていれば UPHELD。",
+                 if os.environ.get("SWE_FIX_RADIUS", "1") != "0" else "")
+                 + "上のいずれも無く、独立再現ケースが通り、関連する全ての箇所が直っていれば UPHELD。",
 }
 PANEL_LENSES = ("correctness", "edge", "security")
 
