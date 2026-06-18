@@ -364,6 +364,20 @@ Premium / Direct Line を使わず、Copilot エージェントを **手元の�
 
 ## 🚀 セットアップ（あなた個人の PC で）
 
+### 自動化される部分 ／ 手作業が残る部分（最初に読む）
+
+**`setup.ps1` / `start.ps1` / `start_companion_edge.ps1` / `start_bridge.ps1` が大半を自動化します** — venv 作成・依存インストール・`.env`（ランダム秘密）生成・サーバ起動・devtunnel host・専用 Edge 起動。一方、**Microsoft 側の UI 登録と認証だけは、仕様上どうしても人間が一度コピペ／クリックする**必要があります。下が「手作業で残る分」のチェックリストです（詳細は各 step 参照）:
+
+- [ ] **Microsoft / Dev Tunnel の初回サインイン＋MFA**（`devtunnel user login` → ブラウザで職場アカウント認証。SSO/MFA は人間のみ）
+- [ ] **Dev Tunnel の作成 / host、または既存 tunnel の確認**（`devtunnel create … --allow-anonymous` → `port create -p 8000` → `host`。既存があれば URL を確認）→ step 4
+- [ ] **Copilot Studio で MCP tool を追加**（エージェント → ツール → 「Model Context Protocol」）→ step 5
+- [ ] **Server URL を貼る**：`https://<your-tunnel>-8000.<region>.devtunnels.ms/mcp`
+- [ ] **認証ヘッダを貼る**：ヘッダ名 `Authorization` / 値 `Bearer <your MCP_API_KEY>`
+- [ ] **（必要なら）M365 純正コネクタを Studio 側で有効化**（メール・予定表・Teams・SharePoint 等）
+- [ ] **初回だけ専用 Edge / Copilot へサインイン**（`start_companion_edge.ps1` で開く窓、または `start_bridge.ps1` の bridge 専用窓。AAD 参加機なら SSO 自動のことも）
+
+> つまり「**クラウド側の UI 登録（Copilot Studio への MCP tool 登録）と各種サインイン／MFA**」だけが人間の手作業で、それ以外（ローカルのサーバ・トンネル・Edge 駆動・ツール実体）は全部スクリプトが回します。一度登録すれば以降は自動です。
+
 ### 0. 前提
 
 - **Windows 10 / 11**（PowerShell 5+）。macOS / Linux でも **動くと思います** が、**筆者は Mac を持っていないので未確認** です（正直に言います）。なお 🪟 タグのツール（PowerShell・プロセス・レジストリ・スケジューラ・通知・Outlook・スクリーン）は Windows 専用
@@ -1257,6 +1271,20 @@ app on your own machine** — no Premium, no Direct Line. Both ride the same
 ---
 
 ## 🚀 Setup
+
+### What's automated vs. what stays manual (read first)
+
+**`setup.ps1` / `start.ps1` / `start_companion_edge.ps1` / `start_bridge.ps1` automate most of it** — venv, deps, `.env` (with random secrets), server start, devtunnel host, dedicated Edge. The only parts that **inherently need a human to paste/click once** are the **Microsoft-side UI registration and the sign-ins** (no API can do an interactive SSO/MFA or a Copilot Studio tool registration for you). The manual residue:
+
+- [ ] **Microsoft / Dev Tunnel first sign-in + MFA** (`devtunnel user login` → authenticate your work account in the browser)
+- [ ] **Create / host the Dev Tunnel, or confirm an existing one** (`devtunnel create … --allow-anonymous` → `port create -p 8000` → `host`) → step 4
+- [ ] **Add the MCP tool in Copilot Studio** (agent → Tools → "Model Context Protocol") → step 5
+- [ ] **Paste the Server URL**: `https://<your-tunnel>-8000.<region>.devtunnels.ms/mcp`
+- [ ] **Paste the auth header**: name `Authorization`, value `Bearer <your MCP_API_KEY>`
+- [ ] **(If needed) enable M365 native connectors in Studio** (mail, calendar, Teams, SharePoint, …)
+- [ ] **First-time sign-in to the dedicated Edge / Copilot** (the window from `start_companion_edge.ps1`, or the bridge's own window from `start_bridge.ps1`; may auto-SSO on an AAD-joined PC)
+
+> In short: only the **cloud-side UI registration (the MCP tool in Copilot Studio) and the various sign-ins / MFA** are human work. Everything else — local server, tunnel, Edge driving, the tool implementations — is scripted. Register once and it's automatic afterward.
 
 ### 0. Prereqs
 
