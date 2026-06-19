@@ -200,16 +200,19 @@ def _looks_redirected(landed_url, target_url=""):
     return False
 
 
-def _goto_settled(url, timeout=25000, tries=3):
+def _goto_settled(url, timeout=25000, tries=3, compose_wait=40):
     """PAGE.goto(url) that recovers from SSO-redirect landings. Returns True once the page is on
     the requested surface (off any redirect/login wall); re-navigates up to `tries` times,
-    surfacing the hidden Edge once on a hard login wall so the user can sign in."""
+    surfacing the hidden Edge once on a hard login wall so the user can sign in. `compose_wait` is
+    how many seconds to wait for the composer each attempt -- keep it SHORT for interactive reads
+    (/history) so an unreachable conversation fails fast instead of hanging the single-threaded
+    bridge for minutes."""
     for _ in range(max(1, tries)):
         try:
             PAGE.goto(url, wait_until="domcontentloaded", timeout=timeout)
         except Exception:
             pass
-        _wait_composer()
+        _wait_composer(compose_wait)
         if not _looks_redirected(PAGE.url or "", url):
             return True
         try:
@@ -835,7 +838,9 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 _reap_orphan_tabs()
                 if url:
-                    _goto_settled(url)          # recover from SSO-redirect landings
+                    # bounded for an interactive READ: ~10s composer wait, 2 tries -> an unreachable
+                    # conversation returns empty in ~25s instead of hanging the bridge for minutes.
+                    _goto_settled(url, timeout=12000, tries=2, compose_wait=10)
                 messages = _scrape_history()
                 # A cold URL navigation sometimes lands on an un-hydrated conversation view
                 # (the SPA shows the composer but never renders the prior turns), so the
@@ -911,6 +916,13 @@ class Handler(BaseHTTPRequestHandler):
     def _sse(self, data: dict, event: str | None = None):
         chunk = (f"event: {event}\n" if event else "") + f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
         self.wfile.write(chunk.encode("utf-8"))
+        self.wfile.flush()
+
+    def _ping(self):
+        # SSE comment line -- EventSource IGNORES it on the client, but the write RAISES the moment
+        # the client hangs up (the user pressed Esc/Stop), so we detect the disconnect within one
+        # tick even while Copilot is silently "thinking" and no delta is flowing.
+        self.wfile.write(b": ping\n\n")
         self.wfile.flush()
 
     def _command(self, cmd):
@@ -1027,14 +1039,23 @@ class Handler(BaseHTTPRequestHandler):
                         else:
                             stable_text, stable_since = final, time.time()
                         time.sleep(0.3)
+                        self._ping()             # detect Esc/Stop disconnect promptly
                         final = _text(LASTMSG)
                         if _is_proc(final):
                             final = stable_text
                     self._sse({}, "done")
                     return
                 time.sleep(0.3)
+                self._ping()                     # detect Esc/Stop disconnect promptly
             self._sse({}, "done")
         except Exception as e:
+            # The client hung up (the user pressed Esc/Stop) OR a real error -- either way, click
+            # Copilot's OWN stop button so the SERVER-SIDE generation actually halts. Before this,
+            # Esc only closed our local stream while Copilot kept generating.
+            try:
+                PAGE.locator(COPILOT_SELECTORS["stop_button"]).first.click(timeout=3000)
+            except Exception:
+                pass
             try:
                 self._sse({"delta": f"\n[bridge error: {type(e).__name__}: {e}]"})
                 self._sse({}, "done")

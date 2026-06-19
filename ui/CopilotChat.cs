@@ -688,10 +688,13 @@ class ChatWindow : Window
         bool fromTranscript = msgs.Count > 0;
         if (!fromTranscript && !string.IsNullOrEmpty(url))   // scrape via the separate bridge Edge, mid-run safe
         {
-            try { HttpGet("/switch?url=" + Uri.EscapeDataString(url)); } catch { }
+            // No /switch -- /history navigates the bridge itself, so the extra call only doubled the
+            // wait. Bounded to ~25s so an UNREACHABLE conversation fails FAST to the clear note below
+            // instead of hanging for minutes (the old /switch(60s)+/history(60s) + bridge goto retries
+            // is what made clicking a past chat "load forever, then error").
             try
             {
-                string hist = HttpGet("/history?url=" + Uri.EscapeDataString(url));
+                string hist = HttpGet("/history?url=" + Uri.EscapeDataString(url), 25000);
                 var root = _cjs.DeserializeObject(hist) as Dictionary<string, object>;
                 if (root != null && root.ContainsKey("messages") && root["messages"] is object[])
                     foreach (object o in (object[])root["messages"])
