@@ -670,14 +670,14 @@ class ChatWindow : Window
         //  1. Persisted full-text transcript (jsonl) -- ALWAYS preferred when present. It is the
         //     whole conversation, untruncated, and reading it touches only disk (never the live
         //     companion Edge), so it is safe even mid-run.
-        //  2. /switch + /history DOM scrape -- ONLY when the fleet is NOT running-fresh. While a
-        //     run is live this would PAGE.goto the shared companion Edge and clobber the send, so
-        //     we never scrape during a live run (regression guard).
+        //  2. /switch + /history DOM scrape -- routed through the BRIDGE Edge (:9223), which is
+        //     fully separate from the fleet's :9222, so it is safe even mid-run (it no longer
+        //     PAGE.goto's the shared companion Edge). Only used when there is no disk transcript.
         //  3. status.json snapshot fragment -- fallback for older workers with no transcript.
         var msgs = ReadTranscript(transcriptPath);
         AppendSubAgentTranscripts(msgs, transcriptPath);   // show captured research sub-conversations
         bool fromTranscript = msgs.Count > 0;
-        if (!fromTranscript && !running && !string.IsNullOrEmpty(url))
+        if (!fromTranscript && !string.IsNullOrEmpty(url))   // scrape via the separate bridge Edge, mid-run safe
         {
             try { HttpGet("/switch?url=" + Uri.EscapeDataString(url)); } catch { }
             try
