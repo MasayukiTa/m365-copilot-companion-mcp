@@ -179,6 +179,72 @@ def _wait_composer(timeout=40):
     return False
 
 
+# ── SSO-redirect recovery ───────────────────────────────────────────────────────
+# The bridge Edge runs hidden, so an expired / re-challenged SSO cookie silently bounces a
+# PAGE.goto onto a landing like  .../chat/?redirfrom=CsrToSSR&auth=2  instead of the requested
+# conversation. The composer eventually renders there (it's a bare chat), so _wait_composer is
+# satisfied -- but every downstream op then runs against the WRONG surface and fails:
+# history scrape comes back empty ("この会話の本文はまだ取得できません") and delete-by-GUID can't
+# find the row ("自動削除はできませんでした"). These helpers detect the bounce and re-navigate.
+_REDIRECT_MARKERS = ("redirfrom", "csrtossr", "auth=2", "/login", "login.microsoftonline",
+                     "login.live", "/oauth")
+
+
+def _looks_redirected(landed_url, target_url=""):
+    u = (landed_url or "").lower()
+    if any(m in u for m in _REDIRECT_MARKERS):
+        return True
+    g = _conv_guid(target_url)            # asked for a specific conversation ...
+    if g and g.lower() not in u:          # ... but didn't land on it -> bounced
+        return True
+    return False
+
+
+def _goto_settled(url, timeout=25000, tries=3):
+    """PAGE.goto(url) that recovers from SSO-redirect landings. Returns True once the page is on
+    the requested surface (off any redirect/login wall); re-navigates up to `tries` times,
+    surfacing the hidden Edge once on a hard login wall so the user can sign in."""
+    for _ in range(max(1, tries)):
+        try:
+            PAGE.goto(url, wait_until="domcontentloaded", timeout=timeout)
+        except Exception:
+            pass
+        _wait_composer()
+        if not _looks_redirected(PAGE.url or "", url):
+            return True
+        try:
+            from relay.edge_recover import surface, looks_like_login
+            if looks_like_login(PAGE.url or ""):
+                surface()
+        except Exception:
+            pass
+        PAGE.wait_for_timeout(1500)
+    return not _looks_redirected(PAGE.url or "", url)
+
+
+def _reap_orphan_tabs():
+    """Close stray SSO-redirect / login landing tabs that accumulate in the bridge context (a
+    failed goto leaves one behind). Never touches the active PAGE or a real /conversation/<guid>
+    tab -- only bare redirect/login landings. Mirrors the fleet-side reaper so the hidden bridge
+    Edge does not pile up dead tabs over a long session."""
+    try:
+        ctx = PAGE.context
+    except Exception:
+        return
+    for pg in list(getattr(ctx, "pages", []) or []):
+        if pg is PAGE:
+            continue
+        try:
+            u = (pg.url or "").lower()
+        except Exception:
+            continue
+        if any(m in u for m in _REDIRECT_MARKERS) and "/conversation/" not in u:
+            try:
+                pg.close()
+            except Exception:
+                pass
+
+
 # ── agent-rail (the agent's own conversation list) helpers ──────────────────────
 # Discovered live (2026-06) on the companion agent page: after expanding the side nav
 # (button aria-label="ナビゲーションの展開"/"Expand navigation"), the agent's conversations
@@ -371,10 +437,11 @@ def _delete_by_guid(url, guid, title=""):
     GUID matches the requested GUID (certain linkage), then delete the matching rail row
     and verify the GUID disappeared. Deletes ONLY when the linkage is certain.
     Returns (ok, reason)."""
-    # 1) open the conversation directly and confirm we really landed on it
+    # 1) open the conversation directly and confirm we really landed on it. _goto_settled
+    #    recovers from an SSO-redirect landing first -- otherwise a hidden-Edge auth bounce reads
+    #    as "guid mismatch" and the delete is wrongly abandoned ("自動削除はできませんでした").
     try:
-        PAGE.goto(url, wait_until="domcontentloaded", timeout=25000)
-        _wait_composer()
+        _goto_settled(url)
         PAGE.wait_for_timeout(800)
     except Exception as e:
         return False, "unreachable: %s: %s" % (type(e).__name__, e)
@@ -754,9 +821,9 @@ class Handler(BaseHTTPRequestHandler):
             url = (urllib.parse.parse_qs(parsed.query).get("url") or [""])[0]
             ok = False
             try:
+                _reap_orphan_tabs()
                 if url:
-                    PAGE.goto(url, wait_until="domcontentloaded")
-                    ok = _wait_composer()
+                    ok = _goto_settled(url)     # recover from SSO-redirect landings
             except Exception as e:
                 self._json({"ok": False, "error": str(e)}); return
             self._json({"ok": ok, "url": PAGE.url})
@@ -766,9 +833,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "busy"}); return
             url = (urllib.parse.parse_qs(parsed.query).get("url") or [""])[0]
             try:
+                _reap_orphan_tabs()
                 if url:
-                    PAGE.goto(url, wait_until="domcontentloaded")
-                    _wait_composer()
+                    _goto_settled(url)          # recover from SSO-redirect landings
                 messages = _scrape_history()
                 # A cold URL navigation sometimes lands on an un-hydrated conversation view
                 # (the SPA shows the composer but never renders the prior turns), so the

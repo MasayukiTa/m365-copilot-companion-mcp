@@ -92,6 +92,58 @@ CONSENT_MARKERS = (
     "verify your credential", "authorize the connection", "set up this connection",
 )
 
+# STUCK-ON-REDIRECT detector (2026-06-18, W4 xarray-3364). A worker tab can land on the M365
+# SSO-redirect / landing page (e.g. https://m365.cloud.microsoft/chat/?redirfrom=CsrToSSR&auth=2)
+# instead of its agent conversation. That page has NO composer, so EVERY send fails with an empty
+# composer (text_len:1, is_processing:False, phase:waiting_processing). The existing login-wall
+# detector (edge_recover.looks_like_login) does NOT catch this -- it is a same-origin redirect, not
+# a login.microsoftonline sign-in form -- so the send-retry loop kept hammering the wrong page for
+# ~1h (~29/30 consecutive failures, 15:05-16:04) until the turn timed out -> STUCK. The fix: when a
+# worker's send keeps failing AND its tab is on such a redirect/landing page (not the agent surface),
+# RE-NAVIGATE the tab to the agent URL it was launched to drive (mirrors _open_fresh's about:blank
+# re-nav) instead of retrying send forever. Bounded per turn so a persistently-wrong page still
+# falls through to the existing terminal handling.
+REDIRECT_URL_MARKERS = ("redirfrom=", "csrtossr", "auth=")
+
+
+def looks_like_redirect_landing(url):
+    """True if `url` looks like an M365 SSO-redirect / landing page rather than an agent
+    conversation. Heuristic, deliberately conservative: it keys off the redirect query markers
+    that appear on the CsrToSSR landing URL (W4) and the absence of a real conversation path.
+    An agent conversation URL carries a `/conversation/<guid>` (or `/chat/<guid>`) segment; a
+    bare landing/redirect page does not. Never raises -> False on odd input (safe: 'not a
+    redirect', so the new re-nav branch simply does not fire and behaviour is unchanged)."""
+    try:
+        u = (url or "").lower()
+    except Exception:
+        return False
+    if not u:
+        return False
+    # explicit redirect/SSO query markers (the W4 CsrToSSR landing URL)
+    if any(m in u for m in REDIRECT_URL_MARKERS):
+        return True
+    return False
+
+
+def on_agent_surface(url):
+    """True if `url` looks like a real agent conversation surface (a non-empty
+    /conversation/<id> or /chat/<id> path segment), i.e. NOT a bare redirect/landing page
+    like '.../chat/?redirfrom=...'. Used as a CHEAP sanity check; the authoritative
+    confirmation after a re-navigation is composer-present (a DOM probe), since the URL
+    alone can lag. Strips the query string first so '/chat/?redirfrom=...' (empty id) does
+    NOT count as a surface. Never raises -> False on odd input (conservative)."""
+    try:
+        path = (url or "").lower().split("?", 1)[0].split("#", 1)[0]
+    except Exception:
+        return False
+    for marker in ("/conversation/", "/chat/"):
+        if marker in path:
+            tail = path.split(marker, 1)[1].strip("/")
+            if tail:                       # there is an actual id after /conversation//chat/
+                return True
+    return False
+
+
 # Statuses where the main thread is legitimately busy with a BOUNDED acceptance check
 # (eval/verification), NOT a wedged Edge. The watchdog must not hard-reset while a worker
 # is in one of these -- doing so throws away in-progress eval and resumes every goal at
@@ -467,8 +519,21 @@ class RelayWorker:
         self.review_lenses = list(review_lenses) if review_lenses else []
         self._panel_queue = []
         self._panel_results = []
+        # OPT-IN adaptive refuter (MCP_ADAPTIVE_REFUTER=1): set only when the adaptive hook
+        # fires; None/unset means the fixed-panel path runs unchanged (back-compat).
+        self._adaptive_features = None
+        self._adaptive_mem = None
         self._context = None          # stored at attach() so we can open the side page
         self._agent_url = ""          # bare agent URL -> a fresh independent chat
+        # STUCK-ON-REDIRECT recovery (W4 xarray-3364): count consecutive send failures, and once
+        # they pile up WHILE the tab is on an SSO-redirect/landing page (not the agent surface),
+        # RE-NAVIGATE to _agent_url instead of retrying send into a page that has no composer.
+        # Reset whenever a send goes through. Bounded re-navs per turn so a persistently-wrong
+        # page still falls through to the existing transient/terminal handling.
+        self._send_fail_streak = 0    # consecutive send() exceptions since the last good send
+        self.redirect_renav_threshold = 3   # send failures before we suspect a stuck redirect page
+        self.max_redirect_renavs = 3        # cap re-navs PER TURN so we never loop forever
+        self._redirect_renavs = 0           # re-navs spent on the CURRENT turn
         self.name = name
         self.conv_url = ""         # filled once the conversation gets its /conversation/<id>
         self.conv_title = ""       # Copilot's auto-generated chat title (best-effort scrape)
@@ -641,6 +706,17 @@ class RelayWorker:
                 int(elapsed), self.gen_waits, str(e)[:120])
             return
         except Exception as e:
+            # STUCK-ON-REDIRECT recovery (W4 xarray-3364): a tab parked on the M365 SSO-redirect
+            # / landing page has no composer, so EVERY send fails identically and retrying send
+            # there can never succeed. Detect "sends keep failing AND the tab is NOT on the agent
+            # surface" and RE-NAVIGATE to the agent URL (mirrors _open_fresh's about:blank re-nav)
+            # before spending the transient budget. Bounded per turn so a persistently-wrong page
+            # still falls through to the normal transient/terminal handling below.
+            self._send_fail_streak += 1
+            if self._maybe_renav_off_redirect():
+                self.reason = "stuck on redirect page -> re-navigated to agent (renav %d/%d)" % (
+                    self._redirect_renavs, self.max_redirect_renavs)
+                return
             # a send failure is a transient (CDP/Edge/network) hiccup -- retry the turn
             # rather than giving up, up to the budget. Don't consume a turn for a failed
             # send (turn is only counted once the send actually goes through).
@@ -659,9 +735,92 @@ class RelayWorker:
         # wall-clock streak stamp so the next slow turn gets a fresh full patience budget.
         self.gen_waits = 0
         self.first_defer_ts = 0.0
+        # a successful send proves the tab is on a live agent surface -> clear the
+        # stuck-on-redirect state (streak + per-turn re-nav budget) for the next turn.
+        self._send_fail_streak = 0
+        self._redirect_renavs = 0
         self._tx.user(self.turn, self.job)     # persist the full sent prompt for this turn
         self._last_text, self._stable_since, self._t_send = None, None, time.time()
         self.status = "waiting"
+
+    def _on_redirect_page(self):
+        """True if the tab is currently parked on a non-agent / SSO-redirect / landing page
+        (the W4 CsrToSSR symptom) rather than the agent conversation surface. Conservative and
+        fully guarded: reads the live URL and probes for the composer. Returns False on any
+        error or when there is no real page/agent URL to re-navigate to (so the new re-nav
+        branch simply never fires in tests / before attach -- behaviour unchanged there).
+
+        A page is judged 'on a redirect' when its URL carries the redirect markers, OR it is
+        NOT on the agent surface AND the composer is absent (a landing page that lost the agent
+        chat). The composer probe is the decisive signal -- the happy path (composer present)
+        can never satisfy this, so a working agent tab is never re-navigated."""
+        if self.page is None or not self._agent_url:
+            return False
+        try:
+            url = self.page.url or ""
+        except Exception:
+            return False
+        if looks_like_redirect_landing(url):
+            return True
+        # Not an explicit redirect URL: only treat as 'wrong page' if we are NOT on an agent
+        # surface AND the composer is missing (so a transient send glitch on a real agent tab,
+        # which still HAS a composer, is left to the normal transient retry).
+        if on_agent_surface(url):
+            return False
+        try:
+            has_composer = self.page.locator(COPILOT_SELECTORS["composer"]).count() > 0
+        except Exception:
+            has_composer = True            # unknown -> assume present (don't re-nav on a guess)
+        return not has_composer
+
+    def _maybe_renav_off_redirect(self):
+        """If sends keep failing because the tab is stuck on a redirect/landing page, RE-NAVIGATE
+        to the agent URL the worker was launched to drive (the same URL attach() opened) and reset
+        the send-failure streak -- instead of retrying send into a page that has no composer (W4
+        xarray-3364: ~29/30 consecutive empty-composer failures over ~1h until the turn timed out).
+
+        Fires only when ALL of: (a) the consecutive send-failure streak has reached the threshold,
+        (b) re-navs spent this turn are under the per-turn cap, and (c) the tab really is on a
+        redirect/non-agent page (see _on_redirect_page -- the happy path with a live composer can
+        never satisfy this). Re-arms the worker to 'ready' with a short cooldown so the next sweep
+        re-sends the SAME job on the freshly-navigated agent surface. Returns True if it re-navigated
+        (caller should return and let the loop continue), else False (caller falls through to the
+        normal transient/terminal handling, so a persistently-wrong page still ends up STUCK)."""
+        if self._send_fail_streak < self.redirect_renav_threshold:
+            return False
+        if self._redirect_renavs >= self.max_redirect_renavs:
+            return False
+        if not self._on_redirect_page():
+            return False
+        # Re-navigate this tab to the agent conversation URL (mirrors _open_fresh's about:blank
+        # re-nav: goto + wait briefly for the composer to render). Fully guarded -- a failed goto
+        # leaves the tab where it was and we just fall through to transient handling next time.
+        self._redirect_renavs += 1
+        landed = False
+        try:
+            try:
+                self.page.goto(self._agent_url, wait_until="domcontentloaded", timeout=45000)
+            except Exception:
+                pass
+            # wait up to ~10s for the composer to appear (the agent surface is back)
+            for _ in range(20):
+                try:
+                    if self.page.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+                        landed = True
+                        break
+                except Exception:
+                    pass
+                self.page.wait_for_timeout(500)
+        except Exception:
+            landed = False
+        # Reset the send-failure streak: we have moved the tab, so the previous failures no
+        # longer reflect the current page. Re-arm to 'ready' to re-send the SAME job. If the
+        # composer never appeared, the streak will simply re-accumulate and, once the per-turn
+        # re-nav cap is hit, fall through to the existing transient/terminal handling.
+        self._send_fail_streak = 0
+        self._cooldown_until = time.time() + 2.0
+        self.status = "ready"
+        return True
 
     def _defer_generation(self):
         """Schedule a non-failure RESCHEDULE because the previous turn is still generating.
@@ -1100,7 +1259,24 @@ class RelayWorker:
                 and self.refute_count < self.max_refute):
             self.refute_count += 1
             if self.review_lenses:
-                self._panel_queue = list(self.review_lenses)
+                lenses = list(self.review_lenses)
+                # OPT-IN adaptive lens selection (default OFF). When MCP_ADAPTIVE_REFUTER=1,
+                # learn from past per-lens refutation rates and throw only the top-k most
+                # likely-to-refute lenses for THIS candidate's features -- fewer oracle calls,
+                # adaptive over time. Env unset => this branch is skipped and the full fixed
+                # panel runs exactly as before (byte-for-byte the old behaviour).
+                self._adaptive_features = None
+                if os.environ.get("MCP_ADAPTIVE_REFUTER") == "1":
+                    from .refuter_memory import RefuterMemory, extract_features
+                    self._adaptive_mem = RefuterMemory()
+                    self._adaptive_features = extract_features(self.goal, self.last_response)
+                    try:
+                        k = int(os.environ.get("MCP_ADAPTIVE_REFUTER_K", "2"))
+                    except ValueError:
+                        k = 2
+                    lenses = self._adaptive_mem.select_lenses(
+                        self._adaptive_features, lenses, k)
+                self._panel_queue = lenses
                 self._panel_results = []
                 self._start_next_lens()
             else:
@@ -1128,8 +1304,18 @@ class RelayWorker:
             return False
         kind, reason = r
         if self.review_lenses:
-            self._panel_results.append((self._refuter_session.lens, kind, reason))
+            lens = self._refuter_session.lens
+            self._panel_results.append((lens, kind, reason))
             self._refuter_session = None
+            # OPT-IN adaptive memory: after each lens's verdict is known, record whether it
+            # refuted, keyed by this candidate's features. No-op unless the adaptive hook in
+            # _candidate_done was taken (MCP_ADAPTIVE_REFUTER=1 => _adaptive_features is set).
+            if getattr(self, "_adaptive_features", None) is not None:
+                try:
+                    self._adaptive_mem.record(
+                        self._adaptive_features, lens, refuted=(kind == "REFUTED"))
+                except Exception:
+                    pass
             if self._panel_queue:                  # consult the remaining lenses first
                 self._start_next_lens()
                 return False
