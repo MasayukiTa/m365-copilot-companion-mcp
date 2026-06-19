@@ -758,6 +758,7 @@ class ChatWindow : Window
                     : "(This conversation's transcript isn't available yet -- it may be empty while the run is in progress.)");
             }
             RefreshConvList();
+            RefreshSteerVisual();   // tint the input border if this is a live steerable worker
             StickToEnd();
         }));
     }
@@ -1010,13 +1011,21 @@ class ChatWindow : Window
             rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             var dt = cc.Untitled() ? T("newchat") : cc.Title;
+            // Two-line wrapping label instead of a hard 26-char cut: many SWE goals share the same
+            // prefix ("あなたは実在の Python ライブラリ ...") and a 1-line cut hid the distinguishing
+            // library name, making rows indistinguishable. (GAP 4)
+            var lbl = new TextBlock
+            {
+                Text = dt, TextWrapping = TextWrapping.Wrap, MaxHeight = 36,
+                TextTrimming = TextTrimming.CharacterEllipsis, FontSize = 13,
+                FontWeight = cc.Id == _conv.Id ? FontWeights.SemiBold : FontWeights.Normal
+            };
             var b = new Button
             {
-                Content = dt.Length > 26 ? dt.Substring(0, 26) + "…" : dt,
-                HorizontalContentAlignment = HorizontalAlignment.Left, Height = 36,
-                Padding = new Thickness(9, 0, 9, 0), BorderThickness = new Thickness(0), Cursor = Cursors.Hand,
-                Background = Brushes.Transparent, FontSize = 13,
-                FontWeight = cc.Id == _conv.Id ? FontWeights.SemiBold : FontWeights.Normal, ToolTip = dt
+                Content = lbl,
+                HorizontalContentAlignment = HorizontalAlignment.Left, MinHeight = 36,
+                Padding = new Thickness(9, 4, 9, 4), BorderThickness = new Thickness(0), Cursor = Cursors.Hand,
+                Background = Brushes.Transparent, ToolTip = dt
             };
             SetRef(b, ForegroundProperty, cc.Id == _conv.Id ? "Fg" : "Muted");
             b.Click += delegate { OpenConversation(cc); };
@@ -1053,12 +1062,24 @@ class ChatWindow : Window
         }
     }
 
+    // STEER-mode signal: when viewing a parallel-task conversation, anything you type interrupts
+    // that running worker -- a very different action from a normal chat. Make it unmistakable by
+    // tinting the input border Accent (orange) and thickening it, so the user is never surprised
+    // that their message went to a background agent. (GAP 8)
+    void RefreshSteerVisual()
+    {
+        bool steer = !string.IsNullOrEmpty(_activeFleetUrl);
+        SetRef(_input, Control.BorderBrushProperty, steer ? "Accent" : "Border");
+        _input.BorderThickness = new Thickness(steer ? 2 : 1);
+    }
+
     void NewChat()
     {
         new Thread((ThreadStart)delegate { try { HttpGet("/new"); } catch { } }) { IsBackground = true }.Start();
         _conv = new Conversation();
         _all.Insert(0, _conv);
         _messages.Children.Clear();
+        _activeFleetUrl = null; RefreshSteerVisual();
         RefreshConvList();
         _input.Focus();
     }
@@ -1095,6 +1116,7 @@ class ChatWindow : Window
             RefreshConvList();
             return;
         }
+        _activeFleetUrl = null; RefreshSteerVisual();   // a normal local conversation is NOT steer mode
         foreach (var m in c.Messages) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
         RefreshConvList();
         if (!string.IsNullOrEmpty(c.ConvUrl))
