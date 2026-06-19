@@ -134,32 +134,22 @@ if ($WithExternalTools) {
     if (-not $winget) {
         Write-Warn2 "winget not found. Skipping external tools."
     } else {
-        $packages = @(
-            @{ Id = "Microsoft.devtunnel";        Name = "Dev Tunnels CLI (remote access)" },
-            @{ Id = "UB-Mannheim.TesseractOCR";   Name = "Tesseract OCR (ocr_* tools)" }
-        )
-        foreach ($pkg in $packages) {
-            Write-Host "    Installing $($pkg.Name) [$($pkg.Id)]" -ForegroundColor Cyan
-            try {
-                winget install --id $pkg.Id --accept-source-agreements --accept-package-agreements --silent -e
-                Write-Ok "$($pkg.Name)"
-            } catch {
-                Write-Warn2 "Failed to install $($pkg.Id): $($_.Exception.Message)"
-            }
-        }
-        # Dev Tunnels needs a one-time interactive sign-in (Microsoft account) before a
-        # tunnel can be hosted; the token persists across reboots. Do it now while we have a
-        # real interactive console -- the supervisor runs HIDDEN and (by design since
-        # 2026-06-14) will NOT touch devtunnel until you are signed in, so skipping this
-        # leaves the tunnel permanently down on this machine. Critically, the supervisor no
-        # longer reaps an interactive `devtunnel login` (it used to, which made first-run
-        # sign-in impossible). See docs/STARTUP_devtunnel_login.md.
-        $dtLoggedIn = $false
-        try { $dtLoggedIn = ((& devtunnel user show 2>&1 | Out-String) -notmatch 'Not logged in|Login required') } catch {}
-        if (-not $dtLoggedIn) {
-            Write-Host "    Dev Tunnels: one-time sign-in required (a browser/device-code prompt appears)." -ForegroundColor Cyan
-            try { devtunnel login } catch { Write-Warn2 "devtunnel login failed: $($_.Exception.Message) -- run 'devtunnel login' manually BEFORE starting the supervisor." }
-        } else { Write-Ok "Dev Tunnels already signed in" }
+        # Tesseract (OCR) via winget -- best-effort.
+        Write-Host "    Installing Tesseract OCR (ocr_* tools) [UB-Mannheim.TesseractOCR]" -ForegroundColor Cyan
+        try {
+            winget install --id UB-Mannheim.TesseractOCR --accept-source-agreements --accept-package-agreements --silent -e
+            Write-Ok "Tesseract OCR"
+        } catch { Write-Warn2 "Failed to install Tesseract: $($_.Exception.Message)" }
+
+        # Dev Tunnels: delegated to the robust, idempotent setup_devtunnel.ps1, which (a) installs
+        # the CLI via winget OR a direct download if winget fails, (b) signs in via browser OR a
+        # device code if the browser does not open, and (c) CREATES the tunnel + port and prints the
+        # public URL to paste into Copilot Studio. This replaces the old fragile inline winget+login
+        # that left a fresh machine with no CLI, no sign-in, and no URL. See docs/STARTUP_devtunnel_login.md.
+        Write-Host "    Dev Tunnels: running setup_devtunnel.ps1 (install + sign-in + tunnel + URL)..." -ForegroundColor Cyan
+        try { & (Join-Path $PSScriptRoot "setup_devtunnel.ps1") }
+        catch { Write-Warn2 "setup_devtunnel.ps1 failed: $($_.Exception.Message) -- run '.\setup_devtunnel.ps1' manually." }
+
         Write-Host "    Not installable via winget (install manually only if you need them):" -ForegroundColor Yellow
         Write-Host "      - Microsoft PowerPoint / Outlook  (for pptx_export_png / outlook_* tools)" -ForegroundColor Yellow
         Write-Host "      - ODBC Driver 18 for SQL Server   (for odbc_* tools)" -ForegroundColor Yellow
