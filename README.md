@@ -487,6 +487,8 @@ git clone https://github.com/MasayukiTa/m365-copilot-companion-mcp.git
 
 **うまくいった目安:** スクリプト末尾に `Dev Tunnel READY. Public URL ...` と URL が表示される。以降の常時公開は `supervisor.ps1`（`start_all.bat`）が `devtunnel host` を自動管理します。
 
+> **トンネル名と URL は人ごとに違います。** `setup_devtunnel.ps1` は、フレッシュな PC では **`m365-copilot-companion`** という汎用名でトンネルを新規作成します（既にトンネルがあればそれを再利用、`-TunnelName foo` で任意名も可）。公開 URL の `https://<ランダム>-8000...` の**ランダム部分は devtunnel がトンネルごとに自動採番**するので、**あなた専用の URL** になります。名前と URL は**あなたの `.env`（git 管理外）**の `MCP_TUNNEL_NAME` / `MCP_TUNNEL_URL` に記録され、共有・コミットされません。`supervisor.ps1` は `.env` の `MCP_TUNNEL_NAME` を読んで自分のトンネルを host します（メンテナの `companion-mcp` 等が他人に出ることはありません）。
+
 > 旧来の手動コマンド（参考。`setup_devtunnel.ps1` が失敗した時のフォールバック）:
 > `winget install Microsoft.devtunnel` → `devtunnel user login -d` → `devtunnel create m365-copilot-companion --allow-anonymous` → `devtunnel port create m365-copilot-companion -p 8000 --protocol http` → `devtunnel host m365-copilot-companion`。**supervisor が動いている場合はサインイン前に止める**（devtunnel プロセス競合回避）。
 
@@ -498,7 +500,7 @@ $startup = [Environment]::GetFolderPath('Startup')
 $root    = (Get-Location).Path
 @"
 @echo off
-powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "$root\supervisor.ps1" -TunnelName m365-copilot-companion
+powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "$root\supervisor.ps1"
 "@ | Set-Content -Encoding ASCII (Join-Path $startup "start-companion-supervisor.cmd")
 ```
 
