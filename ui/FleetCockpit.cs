@@ -27,6 +27,8 @@ using System.Windows.Threading;
 using System.Windows.Data;
 using System.Globalization;
 using System.Web.Script.Serialization;
+using System.Collections.ObjectModel;
+using System.Runtime.CompilerServices;
 
 class CockpitProgram
 {
@@ -84,6 +86,13 @@ class CockpitWindow : Window
     TextBlock _maxLbl;
     Border _headBar;
     ListBox _list;                 // virtualizing host for the card/history rows
+    // Persistent row backing store. We bind this to _list.ItemsSource ONCE and only ever mutate
+    // it in place (SetRows reconciles item-by-item). Reassigning ItemsSource with a fresh List --
+    // the old behaviour -- made the VirtualizingStackPanel treat every update as a collection
+    // Reset: it discarded realized containers and snapped the scroll to the top, which is exactly
+    // the "expand jumps the view" / "scrolling fights the 700ms tick" complaint. In-place edits
+    // raise targeted Add/Remove/Replace notifications instead, so the pixel scroll offset stays.
+    readonly ObservableCollection<object> _rows = new ObservableCollection<object>();
     // The lists handed to BuildCardToolbar (all/shown) are stashed here so the
     // ItemTemplate converter can rebuild the toolbar row on demand for a recycled container.
     List<Dictionary<string, object>> _toolbarAll = new List<Dictionary<string, object>>();
@@ -204,7 +213,7 @@ class CockpitWindow : Window
         // Feature C: retry
         if (k == "retry") return ja ? "再試行" : "Retry";
         if (k == "retry_all") return ja ? "停止を一括再試行" : "Retry all stopped";
-        if (k == "retry_note") return ja ? "再試行は走行中のみ反映されます" : "Retry only applies while a run is live";
+        if (k == "retry_note") return ja ? "停止中のため、このゴール用にフリートを再起動しました" : "No run live — relaunched a fleet for this goal";
         if (k == "autoretry") return ja ? "自動再試行" : "Auto-retry";
         if (k == "cap") return ja ? "上限" : "cap";
         if (k == "to_history") return ja ? "履歴へ" : "To history";
@@ -448,6 +457,7 @@ class CockpitWindow : Window
         KeyboardNavigation.SetDirectionalNavigation(_list, KeyboardNavigationMode.None);
         _list.ItemContainerStyle = BuildItemContainerStyle();
         _list.ItemTemplate = BuildRowTemplate();
+        _list.ItemsSource = _rows;     // bound ONCE; SetRows mutates _rows in place (no Reset)
         root.Children.Add(_list);
         Content = root;
         PaintChrome();
@@ -576,21 +586,7 @@ class CockpitWindow : Window
                 return;
             }
 
-            string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
-            string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
-            if (!File.Exists(py)) py = "python";
-            // hand the goals to the fleet via a UTF-8 file (avoids any arg-encoding issues)
-            string goalsFile = Path.Combine(Path.GetDirectoryName(_statusPath), "goals_input.txt");
-            File.WriteAllText(goalsFile, string.Join("\n", goals.ToArray()) + "\n", new UTF8Encoding(false));
-
-            var psi = new System.Diagnostics.ProcessStartInfo();
-            psi.FileName = py;
-            psi.Arguments = "-m relay.fleet_runner --goals-file \"" + goalsFile + "\" --effort " + _effort;
-            psi.WorkingDirectory = repo;
-            psi.UseShellExecute = false;
-            psi.CreateNoWindow = true;
-            try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
-            System.Diagnostics.Process.Start(psi);
+            SpawnFleet(goals, "goals_input.txt");
             _goalInput.Text = "";
             _startNote.Text = (_lang == 0 ? "開始しました（" : "Started (") + goals.Count
                               + (_lang == 0 ? " 件）" : " goals)");
@@ -600,6 +596,35 @@ class CockpitWindow : Window
         {
             _startNote.Text = (_lang == 0 ? "起動失敗: " : "Failed: ") + ex.Message;
         }
+    }
+
+    // Spawn a fresh `python -m relay.fleet_runner` for the given goal texts. Factored out of
+    // StartFleet so RETRY can reuse it: when a run has FINISHED, the cockpit relaunches a fleet
+    // (instead of writing an add_goal that nothing alive would ever consume). The agent URL is
+    // NOT passed -- the runner resolves it from MCP_FLEET_AGENT_URL / .env, exactly as a manual
+    // Start does -- and --state-dir is the same .fleet dir this cockpit tails, so the relaunched
+    // run shows up live here. Goals are handed over via a UTF-8 file to dodge arg-encoding issues.
+    // Returns true if the process started. `goalsFileName` lets callers use a distinct file so a
+    // retry spawn never clobbers the manual Start input file (or vice-versa).
+    bool SpawnFleet(List<string> goals, string goalsFileName)
+    {
+        string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+        string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+        if (!File.Exists(py)) py = "python";
+        string stateDir = Path.GetDirectoryName(_statusPath);
+        string goalsFile = Path.Combine(stateDir, goalsFileName);
+        File.WriteAllText(goalsFile, string.Join("\n", goals.ToArray()) + "\n", new UTF8Encoding(false));
+
+        var psi = new System.Diagnostics.ProcessStartInfo();
+        psi.FileName = py;
+        psi.Arguments = "-m relay.fleet_runner --goals-file \"" + goalsFile + "\""
+                        + " --state-dir \"" + stateDir + "\" --effort " + _effort;
+        psi.WorkingDirectory = repo;
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+        System.Diagnostics.Process.Start(psi);
+        return true;
     }
 
     // --- slash-command autocomplete for the goal box (parity with the main chat) ---
@@ -1402,7 +1427,7 @@ class CockpitWindow : Window
         _toolbarShown = shown;
 
         var rows = new List<object>();
-        rows.Add(new Row(0, null, null));               // toolbar
+        rows.Add(MkRow(0, null, null));               // toolbar
         // Default view: the live area shows only ACTIVE/queued work; terminal (done/failed) workers
         // drop below a "完了 (this run)" divider so the top is just what's running -- they are not
         // deleted (still inspectable below), only moved out of the active list. Filters 1/2 are
@@ -1414,18 +1439,18 @@ class CockpitWindow : Window
             foreach (Dictionary<string, object> w in shown)
                 (IsTerminalWorker(w) ? done : active).Add(w);
             foreach (Dictionary<string, object> w in active)
-                rows.Add(new Row(1, w, null));
+                rows.Add(MkRow(1, w, null));
             if (done.Count > 0)
             {
-                rows.Add(new Row(4, null, null));       // "完了 (this run)" divider
+                rows.Add(MkRow(4, null, null));       // "完了 (this run)" divider
                 foreach (Dictionary<string, object> w in done)
-                    rows.Add(new Row(1, w, null));
+                    rows.Add(MkRow(1, w, null));
             }
         }
         else
         {
             foreach (Dictionary<string, object> w in shown)
-                rows.Add(new Row(1, w, null));          // one card per worker
+                rows.Add(MkRow(1, w, null));          // one card per worker
         }
         AppendHistoryRows(rows);
         return rows;
@@ -1435,20 +1460,70 @@ class CockpitWindow : Window
     void AppendHistoryRows(List<object> rows)
     {
         if (_history.Count == 0) return;
-        rows.Add(new Row(2, null, null));               // history header
+        rows.Add(MkRow(2, null, null));               // history header
         for (int i = _history.Count - 1; i >= 0; i--)
         {
             var e = _history[i] as Dictionary<string, object>;
             if (e == null) continue;
-            rows.Add(new Row(3, null, e));             // one history row per entry
+            rows.Add(MkRow(3, null, e));             // one history row per entry
         }
     }
 
-    // Reassign the ListBox's ItemsSource. Cheap even at 164 rows because the models are tiny and
-    // only visible containers are realized/templated.
+    // Build one row model and freeze its render signature (so SetRows can diff old-vs-new rows
+    // with a plain string compare). Replaces the old `new Row(...)` call sites.
+    Row MkRow(int kind, Dictionary<string, object> w, Dictionary<string, object> hist)
+    {
+        var r = new Row(kind, w, hist);
+        r.Sig = RowSig(kind, w, hist);
+        return r;
+    }
+
+    // Per-row render signature: captures every bit of state the row's builder reads, evaluated at
+    // build time. Equal Sig => identical UIElement => SetRows can leave that container untouched.
+    string RowSig(int kind, Dictionary<string, object> w, Dictionary<string, object> hist)
+    {
+        string g = (_dark ? "D" : "L") + _lang.ToString();   // theme/lang re-chrome every row
+        switch (kind)
+        {
+            case 0:  // toolbar: reflects global counts + the local control state it renders
+                return "T|" + g + "|" + _toolbarShown.Count + "/" + _toolbarAll.Count
+                       + "|ar" + (_autoRetry ? 1 : 0) + ":" + _autoRetryMax + "|f" + _cardFilter;
+            case 2: return "HH|" + g;                          // history header (static chrome)
+            case 4: return "DV|" + g;                          // "完了 (this run)" divider
+            case 3:                                            // history row: stable per entry
+                return "h|" + g + "|" + (hist != null ? RuntimeHelpers.GetHashCode(hist) : 0);
+            default:                                           // kind 1: worker card
+                string nm = S(w, "name");
+                var sb = new StringBuilder("c|");
+                sb.Append(g).Append('|').Append(nm)
+                  .Append(S(w, "status")).Append(S(w, "turn")).Append(S(w, "outcome"));
+                // only an EXPANDED card shows live progress text, so only then does `last` length
+                // matter; a collapsed card stays put while its worker streams (no thrash).
+                if (_expanded.Contains(nm)) sb.Append("#E").Append((S(w, "last")).Length);
+                else sb.Append("#x");
+                return sb.ToString();
+        }
+    }
+
+    // Reconcile the persistent _rows collection toward `rows` IN PLACE. Item-by-item Replace plus
+    // tail Add/Remove -- never Clear() and never a fresh ItemsSource -- so the VirtualizingStackPanel
+    // never sees a collection Reset and the pixel scroll offset is preserved. Only rows whose Sig
+    // changed are swapped, so unchanged cards keep their realized containers (no flicker, and a
+    // chevron toggle re-templates exactly the one card that changed).
     void SetRows(List<object> rows)
     {
-        if (_list != null) _list.ItemsSource = rows;
+        if (_list == null) return;
+        int n = rows.Count, m = _rows.Count;
+        int common = n < m ? n : m;
+        for (int i = 0; i < common; i++)
+        {
+            var nw = rows[i] as Row;
+            var od = _rows[i] as Row;
+            if (od == null || nw == null || od.Sig != nw.Sig)
+                _rows[i] = rows[i];        // targeted Replace -> only this container re-templates
+        }
+        if (n > m) { for (int i = m; i < n; i++) _rows.Add(rows[i]); }
+        else if (m > n) { for (int i = m - 1; i >= n; i--) _rows.RemoveAt(i); }
     }
 
     // Walk the visual tree from _list to find its internal ScrollViewer (present once the
@@ -1480,6 +1555,10 @@ class CockpitWindow : Window
         public int Kind;
         public Dictionary<string, object> Worker;
         public Dictionary<string, object> Hist;
+        // Render signature, computed at build time (MkRow). Two rows with equal Sig produce an
+        // identical UIElement, so SetRows skips re-templating them -- and a later compare of an
+        // old row vs a freshly-built one is just a string compare (the state is frozen in here).
+        public string Sig;
         public Row(int kind, Dictionary<string, object> worker, Dictionary<string, object> hist)
         { Kind = kind; Worker = worker; Hist = hist; }
     }
@@ -1799,11 +1878,16 @@ class CockpitWindow : Window
         }
 
         row.Child = col;
-        if (!string.IsNullOrEmpty(conv))
+        // A history row is openable when we have ANY way to reach its body: a real conv_url, the
+        // disk transcript path, or the worker name (the chat resolves the .jsonl by name). conv_url
+        // is empty in the final snapshot / for the new agent, so keying ONLY on it left completed
+        // conversations un-clickable -- the body was on disk the whole time. (friction #20)
+        string htx = S(e, "transcript"), hnm = S(e, "name");
+        if (!string.IsNullOrEmpty(conv) || !string.IsNullOrEmpty(htx) || !string.IsNullOrEmpty(hnm))
         {
             row.Cursor = Cursors.Hand;
-            string url = conv;
-            row.MouseLeftButtonUp += delegate { OpenConv(url); };
+            string url = conv, tx = htx, nm = hnm;
+            row.MouseLeftButtonUp += delegate { OpenHistory(nm, url, tx); };
         }
         return row;
     }
@@ -2082,38 +2166,61 @@ class CockpitWindow : Window
         return item;
     }
 
-    // Append the worker's goal to commands.json's add_goal list (MERGE writer), re-running it
-    // WITH the acceptance gate. The live runner consumes add_goal; if no run is live the command
-    // is still written but won't take effect until a run starts (surfaced via retry_note).
+    // Re-run the worker's goal. TWO honest paths, picked by whether a run is LIVE:
+    //  * LIVE  -> append to commands.json's add_goal list (MERGE writer); the running fleet
+    //            consumes it on its next sweep and re-runs it WITH its acceptance gate (checks+cwd).
+    //  * FINISHED/stale -> nothing alive would ever drain add_goal, so instead SPAWN a fresh fleet
+    //            for this goal text (SpawnFleet). The relaunched run picks it up and re-runs it.
+    // The auto-retry scanner only calls this while live, so its add_goal path is unchanged.
     void RetryGoal(Dictionary<string, object> w)
     {
-        var cmd = ReadCommands();
-        var adds = new List<object>();
-        if (cmd.ContainsKey("add_goal") && cmd["add_goal"] is object[])
-            foreach (object o in (object[])cmd["add_goal"]) adds.Add(o);
-        adds.Add(RetryEntry(w));
-        cmd["add_goal"] = adds;
-        WriteCommands(cmd);
+        if (RunIsLive())
+        {
+            var cmd = ReadCommands();
+            var adds = new List<object>();
+            if (cmd.ContainsKey("add_goal") && cmd["add_goal"] is object[])
+                foreach (object o in (object[])cmd["add_goal"]) adds.Add(o);
+            adds.Add(RetryEntry(w));
+            cmd["add_goal"] = adds;
+            WriteCommands(cmd);
+            return;
+        }
+        string goal = S(w, "goal");
+        if (string.IsNullOrEmpty(goal)) return;
+        try { SpawnFleet(new List<string> { goal }, "retry_input.txt"); _lastSig = ""; } catch (Exception) { }
     }
 
-    // Feature C bulk: re-queue EVERY currently-shown terminal non-DONE worker (respecting the
-    // active filter) in ONE add_goal list.
+    // Feature C bulk: re-run EVERY currently-shown terminal non-DONE worker (respecting the active
+    // filter). LIVE -> one merged add_goal list; FINISHED/stale -> ONE relaunched fleet carrying
+    // all the retried goal texts (mirrors RetryGoal's live/finished split).
     void RetryAllShown(List<Dictionary<string, object>> shown)
     {
+        bool live = RunIsLive();
         var cmd = ReadCommands();
         var adds = new List<object>();
         if (cmd.ContainsKey("add_goal") && cmd["add_goal"] is object[])
             foreach (object o in (object[])cmd["add_goal"]) adds.Add(o);
+        var goalTexts = new List<string>();
         int n = 0;
         foreach (Dictionary<string, object> w in shown)
         {
             if (!IsTerminalWorker(w)) continue;
             if (S(w, "outcome") == "DONE") continue;
-            adds.Add(RetryEntry(w)); n++;
+            adds.Add(RetryEntry(w));
+            string g = S(w, "goal");
+            if (!string.IsNullOrEmpty(g)) goalTexts.Add(g);
+            n++;
         }
         if (n == 0) return;
-        cmd["add_goal"] = adds;
-        WriteCommands(cmd);
+        if (live)
+        {
+            cmd["add_goal"] = adds;
+            WriteCommands(cmd);
+        }
+        else if (goalTexts.Count > 0)
+        {
+            try { SpawnFleet(goalTexts, "retry_input.txt"); _lastSig = ""; } catch (Exception) { }
+        }
     }
 
     static bool IsTerminalWorker(Dictionary<string, object> w)
@@ -2352,6 +2459,23 @@ class CockpitWindow : Window
         catch (Exception) { }
     }
 
+    // Open a HISTORY (archived) conversation. Carries the exact disk transcript path so the chat
+    // shows the full body straight from the .jsonl even when conv_url is empty -- plus the worker
+    // name as a fallback (the chat resolves the newest .jsonl by name). Fixes the completed-
+    // conversation "本文はまだ取得できません" dead-end.
+    void OpenHistory(string name, string url, string transcript)
+    {
+        try
+        {
+            _openSeq++;
+            var o = new Dictionary<string, object>();
+            o["worker"] = name ?? ""; o["url"] = url ?? "";
+            o["transcript"] = transcript ?? ""; o["ts"] = _openSeq;
+            File.WriteAllText(_openPath, _js.Serialize(o), new UTF8Encoding(false));
+        }
+        catch (Exception) { }
+    }
+
     // A concise card/conversation title: the Copilot-generated conv_title when present, else the
     // issue heading derived from the goal (the first real line after the "== ... issue ==" marker,
     // else the first non-boilerplate line), trimmed so long goal text never wrecks readability.
@@ -2517,6 +2641,11 @@ class CockpitWindow : Window
             e["key"] = key; e["goal"] = S(w, "goal"); e["status"] = status;
             e["conv_title"] = S(w, "conv_title");
             e["outcome"] = S(w, "outcome"); e["conv_url"] = conv;
+            // Carry the disk transcript path + worker name so a HISTORY row can still show the
+            // full body: conv_url is empty in the final snapshot (and for the new agent), so
+            // without these a completed conversation strands on "本文はまだ取得できません" even
+            // though the jsonl transcript exists on disk.
+            e["transcript"] = S(w, "transcript"); e["name"] = S(w, "name");
             e["turn"] = I(w, "turn"); e["seq"] = _history.Count;
             _history.Add(e);
             added = true;
@@ -2538,7 +2667,11 @@ class CockpitWindow : Window
             var e = new Dictionary<string, object>();
             e["key"] = key; e["goal"] = S(w, "goal"); e["status"] = S(w, "status");
             e["conv_title"] = S(w, "conv_title"); e["outcome"] = S(w, "outcome");
-            e["conv_url"] = S(w, "conv_url"); e["turn"] = I(w, "turn"); e["seq"] = _history.Count;
+            e["conv_url"] = S(w, "conv_url");
+            // see _archiveTerminal: carry transcript path + name so the history row can show the
+            // full disk transcript even when conv_url is empty.
+            e["transcript"] = S(w, "transcript"); e["name"] = S(w, "name");
+            e["turn"] = I(w, "turn"); e["seq"] = _history.Count;
             _history.Add(e);
         }
         _hiddenKeys.Add(WorkerKey(started, w));

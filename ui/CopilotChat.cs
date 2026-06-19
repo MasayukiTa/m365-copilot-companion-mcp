@@ -592,13 +592,16 @@ class ChatWindow : Window
             if (d == null) return;
             string url = (d.ContainsKey("url") && d["url"] != null) ? d["url"].ToString() : "";
             string worker = (d.ContainsKey("worker") && d["worker"] != null) ? d["worker"].ToString() : "";
-            if (string.IsNullOrEmpty(url) && string.IsNullOrEmpty(worker)) return;
-            new Thread((ThreadStart)delegate { OpenFromFleet(url, worker); }) { IsBackground = true }.Start();
+            string transcript = (d.ContainsKey("transcript") && d["transcript"] != null) ? d["transcript"].ToString() : "";
+            if (string.IsNullOrEmpty(url) && string.IsNullOrEmpty(worker) && string.IsNullOrEmpty(transcript)) return;
+            new Thread((ThreadStart)delegate { OpenFromFleet(url, worker, transcript); }) { IsBackground = true }.Start();
         }
         catch { }
     }
 
-    void OpenFromFleet(string url, string worker)
+    void OpenFromFleet(string url, string worker) { OpenFromFleet(url, worker, null); }
+
+    void OpenFromFleet(string url, string worker, string transcriptHint)
     {
         // Normalize a "fleet:<name>" url back into a worker key (no real Copilot URL was captured).
         if (!string.IsNullOrEmpty(url) && url.StartsWith("fleet:"))
@@ -611,6 +614,10 @@ class ChatWindow : Window
         var wkr = ReadFleetWorker(key);
         bool running = FleetRunningFresh();
         string transcriptPath = wkr != null ? SS(wkr, "transcript") : "";
+        // A history click carries the EXACT transcript path -- prefer it (correct even when several
+        // runs share a worker name, which the name-newest fallback below could otherwise confuse).
+        if (string.IsNullOrEmpty(transcriptPath) && !string.IsNullOrEmpty(transcriptHint))
+            transcriptPath = transcriptHint;
         // FALLBACK by worker name: if no live worker dict resolved (finished/restarted run, a
         // history click, or a transient status.json read) the transcript field is unavailable even
         // though the .jsonl is on disk -- so locate it by name. This is what was dropping users to
