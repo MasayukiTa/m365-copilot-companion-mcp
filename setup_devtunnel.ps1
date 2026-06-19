@@ -103,13 +103,31 @@ if (-not ($listed -match [regex]::Escape($target))) {
 }
 if (-not ((Dt port list $target) -match ("\b" + [string]$Port + "\b"))) {
     Write-Host "      adding port $Port..."
-    Dt port create $target -p $Port | Out-Null
+    Dt port create $target -p $Port --protocol http | Out-Null
 }
 
-# --- 4. surface the public URL ---------------------------------------------------------------
-$show = Dt show $target
-$url = ($show | Select-String -Pattern 'https://[A-Za-z0-9-]+\.[A-Za-z0-9-]+\.devtunnels\.ms\S*' -AllMatches |
-        ForEach-Object { $_.Matches } | ForEach-Object { $_.Value } | Select-Object -First 1)
+# --- 4. host the tunnel so the public URL is assigned, then surface it ------------------------
+# IMPORTANT: a freshly-created tunnel has NO port URL in `devtunnel show` until it is HOSTED at
+# least once (verified: Host connections must be >= 1 for the https://...devtunnels.ms URL to
+# appear). So if the URL isn't there yet, start a host in the background and poll until it shows up,
+# THEN write it. (This is the bug that left .env without a URL on a fresh PC.)
+function Tunnel-Url($name) {
+    $s = Dt show $name
+    return ($s | Select-String -Pattern 'https://[A-Za-z0-9-]+\.[A-Za-z0-9-]+\.devtunnels\.ms\S*' -AllMatches |
+            ForEach-Object { $_.Matches } | ForEach-Object { $_.Value } | Select-Object -First 1)
+}
+$url = Tunnel-Url $target
+if (-not $url) {
+    Write-Host "[4/4] hosting the tunnel to obtain its public URL (a few seconds)..."
+    Start-Process devtunnel -ArgumentList @("host", $target) -WindowStyle Hidden | Out-Null
+    for ($i = 0; $i -lt 20; $i++) {
+        Start-Sleep -Seconds 2
+        $url = Tunnel-Url $target
+        if ($url) { break }
+    }
+    # The host keeps running; the supervisor (start_all) detects the tunnel is already hosted and
+    # leaves it / keeps it alive. That is what actually serves Copilot Studio.
+}
 Write-Host ""
 Write-Host "==================================================================="
 if ($url) {
