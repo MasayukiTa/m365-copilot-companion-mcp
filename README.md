@@ -479,31 +479,28 @@ MCP_FLEET_AGENT_URL=https://m365.cloud.microsoft/chat/agent/T_YOUR-GUID.<id>
 
 > **ローカルの Claude Desktop だけに繋ぐ場合はこの STEP は不要です。** STEP 5-A の Claude Desktop 設定に進んでください。M365 Copilot Studio から繋ぐ場合のみ必要です。
 
-**クリックするファイル / コマンド:** PowerShell（管理者不要）
+**クリックするファイル / コマンド:** PowerShell で `.\setup_devtunnel.ps1`（管理者不要）
 
-**自動でやること:** `setup.ps1 -WithExternalTools` を使った場合は `devtunnel` CLI のインストールまで自動です。
-
-**人間がやること（1 回限り）:**
+**自動でやること（`setup_devtunnel.ps1` が冪等に全部やる）:**
+1. `devtunnel` CLI のインストール — **winget で入らなければ公式の直接ダウンロード**（`https://aka.ms/TunnelsCliDownload/win-x64`）に自動フォールバック（winget 不要）。
+2. サインイン — **ブラウザが開かなければ device-code 方式**（`https://microsoft.com/devicelogin` にコードを入力）に自動フォールバック。Entra ID（職場アカウント）対応。既ログインはそのまま再利用。
+3. Tunnel＋ポート 8000 の作成（anonymous・冪等。既存トンネルがあれば再利用）。
+4. **公開 URL を画面に表示し、`.env` に `MCP_TUNNEL_NAME` / `MCP_TUNNEL_URL` を記録**。
 
 ```powershell
-# devtunnel をまだ入れていない場合（-WithExternalTools を使わなかった場合）
-winget install Microsoft.devtunnel
-
-# ① 初回サインイン（ブラウザまたは device-code で職場 Microsoft アカウント認証）
-#    重要: supervisor が起動している場合は先に止める（supervisor が devtunnel プロセスを
-#    管理するため、ログイン中に kill される可能性がある）
-devtunnel login
-
-# ② Tunnel を 1 回だけ作成する（名前は何でもよい。以降は再実行不要）
-devtunnel create m365-copilot-companion --allow-anonymous
-devtunnel port create m365-copilot-companion -p 8000 --protocol http
-
-# ③ host（サーバーをインターネットに公開する）
-devtunnel host m365-copilot-companion
-# → https://<ランダム文字列>-8000.<リージョン>.devtunnels.ms  ← この URL をメモする
+.\setup_devtunnel.ps1
+# ブラウザが開かない / 開きたくない場合は device-code を強制:
+.\setup_devtunnel.ps1 -DeviceCode
+# 別名のトンネルにしたい場合:
+.\setup_devtunnel.ps1 -TunnelName my-tunnel
 ```
 
-**うまくいった目安:** `devtunnel host` の出力に `https://...-8000....devtunnels.ms` の URL が表示される。別ターミナルで `curl https://...-8000....devtunnels.ms/mcp` を叩くと `{"error": "..."}` または `401` が返る（サーバーに到達している証拠）。
+**人間がやること:** 表示されたサインイン画面で職場（Entra ID）アカウントで認証するだけ。最後に表示される `https://<ランダム>-8000.<リージョン>.devtunnels.ms/` の **公開 URL をメモ**（次の STEP 4 で Copilot Studio に貼ります。`.env` の `MCP_TUNNEL_URL` にも入っています）。
+
+**うまくいった目安:** スクリプト末尾に `Dev Tunnel READY. Public URL ...` と URL が表示される。以降の常時公開は `supervisor.ps1`（`start_all.bat`）が `devtunnel host` を自動管理します。
+
+> 旧来の手動コマンド（参考。`setup_devtunnel.ps1` が失敗した時のフォールバック）:
+> `winget install Microsoft.devtunnel` → `devtunnel user login -d` → `devtunnel create m365-copilot-companion --allow-anonymous` → `devtunnel port create m365-copilot-companion -p 8000 --protocol http` → `devtunnel host m365-copilot-companion`。**supervisor が動いている場合はサインイン前に止める**（devtunnel プロセス競合回避）。
 
 **2 回目以降の自動化（supervisor）:** `supervisor.ps1` がポート 8000 とトンネルを監視し、落ちていれば自動で復旧します。常時起動させるには:
 
