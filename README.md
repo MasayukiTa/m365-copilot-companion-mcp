@@ -506,7 +506,7 @@ git clone https://github.com/MasayukiTa/m365-copilot-companion-mcp.git
 
 **自動でやること（`setup_devtunnel.ps1` が冪等に全部やる）:**
 1. `devtunnel` CLI のインストール — **winget で入らなければ公式の直接ダウンロード**（`https://aka.ms/TunnelsCliDownload/win-x64`）に自動フォールバック（winget 不要）。
-2. サインイン — **ブラウザが開かなければ device-code 方式**（`https://microsoft.com/devicelogin` にコードを入力）に自動フォールバック。Entra ID（職場アカウント）対応。既ログインはそのまま再利用。
+2. サインイン — **ブラウザが開かなければ device-code 方式**（`https://microsoft.com/devicelogin` にコードを入力）に自動フォールバック。**職場の Entra ID だけでなく、個人の Microsoft アカウント(MSA)・GitHub アカウントでもログイン可**（既定の `-e/--entra` フローが個人アカウントも受け付ける。GitHub は `devtunnel user login -g`）。既ログインはそのまま再利用。
 3. Tunnel＋ポート 8000 の作成（anonymous・冪等。既存トンネルがあれば再利用）。
 4. **公開 URL を画面に表示し、`.env` に `MCP_TUNNEL_NAME` / `MCP_TUNNEL_URL` を記録**。
 
@@ -521,6 +521,10 @@ git clone https://github.com/MasayukiTa/m365-copilot-companion-mcp.git
 **人間がやること:** 表示されたサインイン画面で職場（Entra ID）アカウントで認証するだけ。最後に表示される `https://<ランダム>-8000.<リージョン>.devtunnels.ms/` の **公開 URL をメモ**（次の STEP 4 で Copilot Studio に貼ります。`.env` の `MCP_TUNNEL_URL` にも入っています）。
 
 **うまくいった目安:** スクリプト末尾に `Dev Tunnel READY. Public URL ...` と URL が表示される。以降の常時公開は `supervisor.ps1`（`start_all.bat`）が `devtunnel host` を自動管理します。
+
+> **個人ユーザー（法人テナントが無い人）への注意:** devtunnel のログイン自体は上記のとおり**個人 Microsoft アカウントや GitHub でも通ります**。ただし **この STEP（Dev Tunnel）と STEP 4-5（Copilot Studio）は、M365 Copilot Studio に繋ぐためのもの**で、Copilot Studio とその第一者エージェント（Researcher / Analyst）の利用には **M365 Copilot の法人ライセンス（職場/学校テナント）が必須**です。個人アカウントでは devtunnel は通っても Copilot Studio で行き止まりになります。
+>
+> **個人で使うなら → ローカル Claude Desktop 経路（STEP 5-A）。** こちらは **devtunnel も Entra ID も一切不要**（`localhost` で MCP 接続）で、Claude Desktop さえあれば誰でも使えます。この STEP 3 と STEP 4 は丸ごと飛ばしてください。
 
 > **トンネル名と URL は人ごとに違います。** `setup_devtunnel.ps1` は、フレッシュな PC では **`m365-copilot-companion`** という汎用名でトンネルを新規作成します（既にトンネルがあればそれを再利用、`-TunnelName foo` で任意名も可）。公開 URL の `https://<ランダム>-8000...` の**ランダム部分は devtunnel がトンネルごとに自動採番**するので、**あなた専用の URL** になります。名前と URL は**あなたの `.env`（git 管理外）**の `MCP_TUNNEL_NAME` / `MCP_TUNNEL_URL` に記録され、共有・コミットされません。`supervisor.ps1` は `.env` の `MCP_TUNNEL_NAME` を読んで自分のトンネルを host します（メンテナの `companion-mcp` 等が他人に出ることはありません）。
 
