@@ -1,0 +1,100 @@
+name: Bug report
+description: Report a problem with setup, the MCP server, a tool, the bridge chat, or the fleet.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug.
+
+        ⚠️ **Never paste secrets.** Scrub these before posting and replace with `<redacted>`:
+        `MCP_API_KEY`, `MCP_UNLOCK_PASSWORD`, full agent URLs (they embed your tenant GUID),
+        and any `devtunnel` token. Logs and `.env` snippets often contain them.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
+        - label: I am on the latest `main`.
+          required: true
+        - label: I removed all secrets (API key, unlock password, tenant GUIDs, tunnel tokens) from this report.
+          required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, including the actual vs. expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact steps. Name the file/command you ran (e.g. `quickstart.bat`, `start_all.bat`) and what you clicked.
+      placeholder: |
+        1. Ran `quickstart.bat`
+        2. At STEP 4 (Dev Tunnel) ...
+        3. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: path
+    attributes:
+      label: Which connection path?
+      options:
+        - Copilot Studio via Dev Tunnel (remote)
+        - Local Claude Desktop (no tunnel)
+        - Other MCP client
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where did it fail?
+      options:
+        - Setup — quickstart.bat / setup.bat (bootstrap)
+        - Setup — setup_devtunnel.ps1 (Dev Tunnel)
+        - Setup — configure_env (agent URL dialog)
+        - Startup — start_all.bat / supervisor
+        - Runtime — a tool call / the MCP server
+        - Bridge chat window (CopilotChat)
+        - Fleet cockpit (FleetCockpit)
+        - Other / not sure
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Windows version
+      description: Run `winver`. e.g. "Windows 11 23H2 (22631.xxxx)"
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: Output of `.venv\Scripts\python --version` (or `python --version`).
+  - type: input
+    id: client
+    attributes:
+      label: MCP client / app + version
+      description: e.g. "Copilot Studio (web)", "Claude Desktop 0.x"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs (secrets redacted)
+      description: |
+        Useful sources:
+        - Supervisor log: `%TEMP%\m365-companion-supervisor.log`
+        - The console window of `quickstart.bat` / `start_all.bat`
+        - Bridge output (if the chat window failed)
+      render: shell
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Screenshots, what you already tried, related issues, etc.
