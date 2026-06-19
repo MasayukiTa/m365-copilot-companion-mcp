@@ -1,0 +1,42 @@
+name: Feature request
+description: Suggest a new tool, a setup improvement, or an enhancement.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for the suggestion.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do, and what is missing or painful today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like to happen?
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - A tool (file / Excel / PDF / web / etc.)
+        - Setup / bootstrap / Dev Tunnel
+        - Bridge chat (CopilotChat)
+        - Fleet (parallel runner / cockpit)
+        - Relay / agent profiles (research / analyst)
+        - Docs / README
+        - Other
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
