@@ -28,6 +28,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import time
 
 from .acceptance import Check, normalize_checks, run_all_blocking
@@ -105,6 +106,12 @@ CONSENT_MARKERS = (
 # falls through to the existing terminal handling.
 REDIRECT_URL_MARKERS = ("redirfrom=", "csrtossr", "auth=")
 
+# A real conversation URL carries a UUID after /conversation/ OR /chat/ (the new agent uses the
+# /chat/<guid> form). Used to capture conv_url regardless of which path the agent uses, without
+# mistaking the agent BASE url (/chat/agent/T_xxx) for a conversation.
+_CONV_GUID_RE = re.compile(
+    r"/(?:conversation|chat)/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
+
 
 def looks_like_redirect_landing(url):
     """True if `url` looks like an M365 SSO-redirect / landing page rather than an agent
@@ -142,6 +149,29 @@ def on_agent_surface(url):
             if tail:                       # there is an actual id after /conversation//chat/
                 return True
     return False
+
+
+def _reap_orphan_redirect_tabs(context, workers):
+    """Close stray SSO-redirect / landing tabs that are NOT owned by any worker (a failed goto or
+    an auth bounce leaves one behind). Never touches a worker's live page or a real conversation
+    surface. Mirrors the bridge-side reaper -- keeps the fleet Edge from piling up dead tabs within
+    a long chunk (the per-chunk hard-reset only clears them between chunks). Never raises."""
+    try:
+        owned = set(id(w.page) for w in workers if getattr(w, "page", None) is not None)
+        for pg in list(getattr(context, "pages", []) or []):
+            if id(pg) in owned:
+                continue
+            try:
+                u = pg.url or ""
+            except Exception:
+                continue
+            if looks_like_redirect_landing(u) and not on_agent_surface(u):
+                try:
+                    pg.close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 # Statuses where the main thread is legitimately busy with a BOUNDED acceptance check
@@ -590,6 +620,8 @@ class RelayWorker:
         self.closed = True
         try:
             if self.page is not None:
+                if not self.conv_url:
+                    self._capture_url()      # last chance: a guid that landed late, before we close
                 self.page.close()
         except Exception:
             pass
@@ -620,9 +652,15 @@ class RelayWorker:
         try:
             if self.page is not None:
                 u = self.page.url
-                if "/conversation/" in u:
+                # Capture a real conversation guid (UUID) after EITHER /conversation/<guid> (the
+                # old agent) OR /chat/<guid> (the new agent T_02140b8c, which never had a
+                # /conversation/ segment -> conv_url stayed empty for every worker). The UUID gate
+                # means the agent BASE url (/chat/agent/T_xxx, not a UUID) is never mistaken for a
+                # conversation. Called every poll, so a guid that appears a beat late is still caught.
+                m = _CONV_GUID_RE.search(u.split("?", 1)[0])
+                if m:
                     self.conv_url = u
-                    self._tx.note_guid(u.rstrip("/").rsplit("/", 1)[-1])
+                    self._tx.note_guid(m.group(1))
         except Exception:
             pass
         # Best-effort: scrape Copilot's auto-generated chat title once it exists. M365
@@ -1553,6 +1591,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         return [{"text": w.goal, "checks": w.checks, "cwd": w.cwd}
                 for w in workers if w.outcome not in ("DONE", "CANCELLED")]
 
+    _reap_counter = 0
     while any(w.status not in TERMINAL for w in workers) or (add_box and len(add_box) > 0):
         # --- stop / pause control (cockpit -> commands.json -> *_box, read every loop) ---
         if stop_box[0]:
@@ -1584,6 +1623,12 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             context.cookies()
         except Exception:
             raise FleetContextLost(_unfinished())
+
+        # periodically reap orphan SSO-redirect tabs (every ~30 sweeps) so a long chunk does not
+        # accumulate dead landing tabs; cheap and never touches a worker's own page.
+        _reap_counter += 1
+        if _reap_counter % 30 == 0:
+            _reap_orphan_redirect_tabs(context, workers)
 
         # goals added mid-run (e.g. from the native chat while at capacity) join the
         # queue here -- priority items jump to the front, but still wait for a free slot
