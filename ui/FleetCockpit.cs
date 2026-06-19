@@ -824,9 +824,14 @@ class CockpitWindow : Window
     {
         var group = new StackPanel(); group.Orientation = Orientation.Horizontal;
         group.VerticalAlignment = VerticalAlignment.Center; group.Margin = new Thickness(0, 0, 12, 0);
+        // GAP5: explain this dense cluster -- the two −/+ steppers were indistinguishable.
+        group.ToolTip = _lang == 0
+            ? "並列タブ数の制御。RAM自動調整=ON なら空きRAMに応じて自動増減。\n「開始」=最初に開くタブ数、「上限」=自動調整時の最大タブ数。"
+            : "Parallel-tab controls. Autoscale ON adjusts to free RAM.\n'Start' = tabs opened initially, 'Ceiling' = max tabs under autoscale.";
 
         // a. autoscale ON/OFF toggle (simple themed button whose label flips)
         _autoToggle = new Button();
+        _autoToggle.ToolTip = _lang == 0 ? "RAM空きに応じて並列タブ数を自動調整 (ON/OFF)" : "Auto-adjust parallel tabs to free RAM (ON/OFF)";
         _autoToggle.Cursor = Cursors.Hand; _autoToggle.BorderThickness = new Thickness(1);
         _autoToggle.Padding = new Thickness(10, 3, 10, 3); _autoToggle.FontSize = 12;
         _autoToggle.FontWeight = FontWeights.SemiBold;
@@ -884,6 +889,7 @@ class CockpitWindow : Window
         wrap.Children.Add(_effortLbl);
 
         _effortBox = new ComboBox();
+        _effortBox.ToolTip = _lang == 0 ? "推論の深さ（各ワーカーの調査/反論の強度）" : "Reasoning effort (research/refute depth per worker)";
         _effortBox.Cursor = Cursors.Hand; _effortBox.FontSize = 12;
         _effortBox.FontWeight = FontWeights.SemiBold; _effortBox.MinWidth = 78;
         _effortBox.Padding = new Thickness(8, 2, 4, 2);
@@ -921,6 +927,7 @@ class CockpitWindow : Window
         group.VerticalAlignment = VerticalAlignment.Center; group.Margin = new Thickness(0, 0, 12, 0);
 
         _pauseBtn = new Button();
+        _pauseBtn.ToolTip = _lang == 0 ? "新規ターン/タブを止めて凍結（再開で続行・状態は保持）" : "Freeze: no new turns/tabs (resume continues; state kept)";
         _pauseBtn.Cursor = Cursors.Hand; _pauseBtn.BorderThickness = new Thickness(1);
         _pauseBtn.Padding = new Thickness(10, 3, 10, 3); _pauseBtn.FontSize = 12;
         _pauseBtn.FontWeight = FontWeights.SemiBold;
@@ -937,6 +944,7 @@ class CockpitWindow : Window
         group.Children.Add(_pauseBtn);
 
         _stopBtn = new Button();
+        _stopBtn.ToolTip = _lang == 0 ? "全ワーカーを停止して走行を終了" : "Cancel every worker and end the run";
         _stopBtn.Cursor = Cursors.Hand; _stopBtn.BorderThickness = new Thickness(1);
         _stopBtn.Padding = new Thickness(10, 3, 10, 3); _stopBtn.FontSize = 12;
         _stopBtn.FontWeight = FontWeights.SemiBold;
