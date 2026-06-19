@@ -1194,7 +1194,9 @@ class RelayWorker:
             # cause false turn-timeouts on the siblings -- the reason v1 was unusably slow.
             from .agent_profiles import ResearchSession
             self._research_session = ResearchSession(
-                self._context, rq, model_name=self.research_model).start()
+                self._context, rq, model_name=self.research_model,
+                tx_dir=getattr(self._tx, "dir", None), parent_key=self._tx_key,
+                parent_turn=self.turn, sub_index=self.research_count).start()
             self.status = "researching"
             self.reason = "🔎 外部調査中 (%d/%d): %s" % (self.research_count, self.max_research, rq[:48])
             return

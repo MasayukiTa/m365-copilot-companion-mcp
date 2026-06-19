@@ -290,7 +290,7 @@ class ResearchSession:
     Mirrors refuter.RefuterSession's send/wait state machine. Never raises."""
 
     def __init__(self, context, query, model_name="Claude", approval=DEFAULT_APPROVAL,
-                 dwell_s=4.0, timeout_s=600):
+                 dwell_s=4.0, timeout_s=600, tx_dir=None, parent_key="", parent_turn=0, sub_index=1):
         self.context = context
         self.query = query
         self.model_name = model_name
@@ -306,6 +306,13 @@ class ResearchSession:
         self._approved = False
         self._pending_open = True  # side-page not opened yet -- deferred until there's free RAM
         self._done = None          # report string once finished ('' on failure)
+        # Sub-conversation capture: where to persist this deep-dive (query + full report) so it is
+        # linked to the spawning worker and visible afterwards instead of vanishing on close().
+        self.tx_dir = tx_dir
+        self.parent_key = parent_key
+        self.parent_turn = parent_turn
+        self.sub_index = sub_index
+        self._report_full = ""     # untruncated report (the main convo only gets the [:3500] head)
 
     def start(self):
         # Defer the side-page open until poll() sees enough free RAM (ram_room_for_tab). On a
@@ -373,6 +380,7 @@ class ResearchSession:
             if t == self._last:
                 if self._stable_since and substantial and (
                         time.time() - self._stable_since) >= self.dwell_s * 2:
+                    self._report_full = t          # keep the WHOLE report for the sub-transcript
                     self._finish(t[:3500]); return self._done
                 return None
             self._last, self._stable_since = t, time.time()
@@ -382,7 +390,26 @@ class ResearchSession:
 
     def _finish(self, report):
         self._done = report or ""
+        self._persist()
         self.close()
+
+    def _persist(self):
+        """Save the research sub-conversation (query + full report) to a transcript file LINKED to
+        the spawning worker, so the cockpit/chat can show what the deep-dive actually did instead
+        of it vanishing when the side page closes. The key prefix `<parent_key>__sub_research_`
+        lets a reader glob the children of a parent conversation. Best-effort; never raises."""
+        if not self.tx_dir or not self.parent_key:
+            return
+        try:
+            from .relay_fleet import _Transcript
+            subkey = "%s__sub_research_t%s_%s" % (self.parent_key, self.parent_turn, self.sub_index)
+            tx = _Transcript(self.tx_dir, subkey, "research", self.query)
+            tx._append({"meta_link": True, "parent_key": self.parent_key,
+                        "parent_turn": self.parent_turn, "kind": "research", "ts": time.time()})
+            tx.user(1, self.query)
+            tx.assistant(1, self._report_full or self._done or "(no report captured)")
+        except Exception:
+            pass
 
     def close(self):
         try:

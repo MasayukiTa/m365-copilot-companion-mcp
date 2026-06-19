@@ -421,6 +421,32 @@ class ChatWindow : Window
         return msgs;
     }
 
+    // Append any captured sub-agent (research) conversations for this worker. Each deep-dive is
+    // persisted to "<key>__sub_research_t<turn>_<n>.jsonl" next to the parent transcript, so we
+    // glob the siblings and show them under a header -- this is what makes "research が見えない"
+    // visible (the side page used to close without a trace). Best-effort.
+    void AppendSubAgentTranscripts(List<Msg> msgs, string transcriptPath)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(transcriptPath)) return;
+            string dir = Path.GetDirectoryName(transcriptPath);
+            string stem = Path.GetFileNameWithoutExtension(transcriptPath);
+            if (string.IsNullOrEmpty(dir) || string.IsNullOrEmpty(stem) || !Directory.Exists(dir)) return;
+            var subs = Directory.GetFiles(dir, stem + "__sub_*.jsonl");
+            Array.Sort(subs);
+            foreach (string sf in subs)
+            {
+                var sm = ReadTranscript(sf);
+                if (sm.Count == 0) continue;
+                string kind = sf.Contains("__sub_research_") ? "🔎 research" : "🧪 sub-agent";
+                msgs.Add(new Msg("A", "──────── " + kind + "（サブエージェント） ────────"));
+                msgs.AddRange(sm);
+            }
+        }
+        catch { }
+    }
+
     // Build a readable live snapshot from a status.json worker dict: goal/status/outcome,
     // turn N/max, plan steps, latest response, verification state, and reason. Mirrors the
     // cockpit card so the main chat shows progress when /history can't be scraped.
@@ -634,6 +660,7 @@ class ChatWindow : Window
         //     we never scrape during a live run (regression guard).
         //  3. status.json snapshot fragment -- fallback for older workers with no transcript.
         var msgs = ReadTranscript(transcriptPath);
+        AppendSubAgentTranscripts(msgs, transcriptPath);   // show captured research sub-conversations
         bool fromTranscript = msgs.Count > 0;
         if (!fromTranscript && !running && !string.IsNullOrEmpty(url))
         {
