@@ -364,114 +364,332 @@ Premium / Direct Line を使わず、Copilot エージェントを **手元の�
 
 ## 🚀 セットアップ（あなた個人の PC で）
 
-### 自動化される部分 ／ 手作業が残る部分（最初に読む）
+### 全体像：自動でやること ／ 人間が必ず手でやること
 
-**`setup.ps1` / `start.ps1` / `start_companion_edge.ps1` / `start_bridge.ps1` が大半を自動化します** — venv 作成・依存インストール・`.env`（ランダム秘密）生成・サーバ起動・devtunnel host・専用 Edge 起動。一方、**Microsoft 側の UI 登録と認証だけは、仕様上どうしても人間が一度コピペ／クリックする**必要があります。下が「手作業で残る分」のチェックリストです（詳細は各 step 参照）:
+スクリプトが自動化するのは「ローカル側のすべて」です。人間が 1 回だけ手を動かす必要があるのは「Microsoft のクラウド側」だけです。
 
-- [ ] **Microsoft / Dev Tunnel の初回サインイン＋MFA**（`devtunnel user login` → ブラウザで職場アカウント認証。SSO/MFA は人間のみ）
-- [ ] **Dev Tunnel の作成 / host、または既存 tunnel の確認**（`devtunnel create … --allow-anonymous` → `port create -p 8000` → `host`。既存があれば URL を確認）→ step 4
-- [ ] **Copilot Studio で MCP tool を追加**（エージェント → ツール → 「Model Context Protocol」）→ step 5
-- [ ] **Server URL を貼る**：`https://<your-tunnel>-8000.<region>.devtunnels.ms/mcp`
-- [ ] **認証ヘッダを貼る**：ヘッダ名 `Authorization` / 値 `Bearer <your MCP_API_KEY>`
-- [ ] **（必要なら）M365 純正コネクタを Studio 側で有効化**（メール・予定表・Teams・SharePoint 等）
-- [ ] **初回だけ専用 Edge / Copilot へサインイン**（`start_companion_edge.ps1` で開く窓、または `start_bridge.ps1` の bridge 専用窓。AAD 参加機なら SSO 自動のことも）
+| 自動（スクリプトが回す） | 手作業（人間が 1 度だけ） |
+|---|---|
+| Python venv 作成・パッケージインストール | Microsoft アカウントへのサインイン＋MFA |
+| `.env` へのランダム秘密生成 | Dev Tunnel の作成と初回ログイン |
+| MCP サーバー起動（`start.ps1`） | Copilot Studio でのエージェント登録・MCP URL 貼り付け |
+| Dev Tunnel の常時監視・自動復旧（`supervisor.ps1`） | Copilot Studio のエージェント画面で「接続を追加」 |
+| 専用 Edge の起動・サインイン状態維持（`start_companion_edge.ps1`） | 専用 Edge プロファイルへの初回 M365 サインイン |
+| WPF UI のビルド＆起動（`ui\rebuild_ui.ps1`） | — |
 
-> つまり「**クラウド側の UI 登録（Copilot Studio への MCP tool 登録）と各種サインイン／MFA**」だけが人間の手作業で、それ以外（ローカルのサーバ・トンネル・Edge 駆動・ツール実体）は全部スクリプトが回します。一度登録すれば以降は自動です。
+> 一度登録すれば、2 回目以降は「`quickstart.bat` をダブルクリック → サーバー起動」だけです。
 
-### 0. 前提
+---
 
-- **Windows 10 / 11**（PowerShell 5+）。macOS / Linux でも **動くと思います** が、**筆者は Mac を持っていないので未確認** です（正直に言います）。なお 🪟 タグのツール（PowerShell・プロセス・レジストリ・スケジューラ・通知・Outlook・スクリーン）は Windows 専用
-- **Python 3.10 以降**（3.11 推奨）
-- **Git**
-- 任意（対応するツールを使うときだけ）:
-  - **Tesseract OCR** + 言語データ（`ocr_*` 用。日本語は `jpn.traineddata`、[UB-Mannheim ビルド](https://github.com/UB-Mannheim/tesseract/wiki)）
-  - **Poppler**（`ocr_pdf` 用、PATH に）
-  - **Microsoft PowerPoint 本体**（`pptx_export_png` の COM エクスポート用）
-  - **Microsoft Outlook 本体**（`outlook_*` 用）
-  - **ODBC Driver 18 for SQL Server**（`odbc_*` で社内 DB に繋ぐなら）
+### STEP 0 ─ 前提条件を確認する
 
-### 1. クローン & 仮想環境
+**確認すること**
+
+- **Windows 10 / 11**（PowerShell 5.1 以上）が必要です。macOS / Linux では 🪟 タグのツール（PowerShell・プロセス操作・スケジューラ・通知・Outlook 等）は動きません。
+- **Microsoft Edge** がインストールされていること（bridge / fleet の CDP 経路で使います）。
+- **M365 Copilot ライセンス**があること（エージェントを作成できるプラン。Copilot Studio にアクセスできれば OK）。
+- **Python 3.10 以降**がインストールされているか、winget で入れられる環境であること（`setup.bat` が自動取得も試みます）。
+- **Git**（クローン用。なければ ZIP でもセットアップは同じ手順で動きます）。
+- **.NET Framework 4.x** が OS に入っていること（WPF UI ビルド用。`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe` が存在すれば OK。Windows 10/11 ではほぼ標準で入っています）。
+
+任意（使いたいツールがある場合のみ）:
+- **Tesseract OCR** + 言語データ（`ocr_*` 用。日本語なら `jpn.traineddata`。[UB-Mannheim ビルド](https://github.com/UB-Mannheim/tesseract/wiki)）
+- **Poppler**（`ocr_pdf` 用、PATH に通す）
+- **Microsoft PowerPoint 本体**（`pptx_export_png` の COM エクスポート用）
+- **Microsoft Outlook 本体**（`outlook_*` 用）
+- **ODBC Driver 18 for SQL Server**（`odbc_*` で社内 DB に繋ぐなら）
+
+---
+
+### STEP 1 ─ クローンして `quickstart.bat` をダブルクリックする
+
+**クリックするファイル:** `quickstart.bat`（リポジトリ直下）
 
 ```powershell
 git clone https://github.com/MasayukiTa/m365-copilot-companion-mcp.git
-cd m365-copilot-companion-mcp
+# エクスプローラーで quickstart.bat をダブルクリック（または PowerShell から実行）
 ```
 
-**ワンクリック セットアップ（推奨）** — venv 作成・依存インストール・`.env`（ランダム秘密入り）自動生成までを一括:
+**`quickstart.bat` が自動でやること（4 ステップ）:**
 
-```powershell
-.\setup.ps1
-# 外部ツール(devtunnel + Tesseract OCR)も winget で入れるなら:
-.\setup.ps1 -WithExternalTools
+1. **`setup.bat` を呼び出し、Python 環境を再開可能にブートストラップする。**
+   Python が PATH にない場合は `uv`（Astral）を自動取得し、`.venv` を作り、`requirements.txt` をインストールします。管理者権限不要。途中で止まっても再実行すれば続きから再開します（`.setup/state.json` にチェックポイントを保存）。
+2. **Bearer トークンとアンロックパスワードをコンソールに表示する。**
+   `.env` がなければ自動生成します。既にあれば上書きしません。表示された 2 つの値をメモしてください（次の STEP で Copilot Studio に貼ります）。
+   ```
+   Bearer token  (MCP_API_KEY)        : abc123...（40文字のランダム hex）
+   Unlock password (MCP_UNLOCK_PASSWORD): def456...（16文字のランダム hex）
+   ```
+3. **git の更新を確認する**（`fetch` のみ。push はしない）。
+4. **MCP サーバーを起動する**（`python main.py`。`http://127.0.0.1:8000/mcp` で待受開始）。
+
+**人間がやること:** なし（コンソールの表示を読んでトークンを控えるだけ）。
+
+**うまくいった目安:** コンソールに `MCP server listening on http://0.0.0.0:8000` のような行が表示され、`http://localhost:8000/mcp` にブラウザでアクセスすると JSON が返る。
+
+**次:** STEP 2 へ（別ターミナルを開いて続きを進める。サーバーは起動したままにする）。
+
+> **`quickstart.bat` の代わりに PowerShell を好む場合** は `.\setup.ps1`（または `.\setup.ps1 -WithExternalTools` で devtunnel + Tesseract も一括インストール）→ `.\start.ps1` でも同じ結果になります。
+
+---
+
+### STEP 2 ─ `.env` を編集してエージェント URL を追記する
+
+**編集するファイル:** `.env`（リポジトリ直下。`quickstart.bat` が自動生成済み）
+
+`quickstart.bat` が生成した `.env` には 4 行のミニマル設定が入っています。Copilot エージェントを使う場合は **エージェント URL だけ追記** する必要があります。
+
+```
+# --- 必須（自動生成済み。変更不要） ---
+MCP_API_KEY=<40文字のランダムhex>
+MCP_UNLOCK_PASSWORD=<16文字のランダムhex>
+MCP_UNLOCK_TTL_DAYS=30
+MCP_ALLOWED_BASE=~
+
+# --- Copilot エージェント URL（あなたが追記する） ---
+# M365 Copilot でエージェントを開き、URL バーの URL をそのままコピーして貼る
+MCP_IMPL_AGENT_URL=https://m365.cloud.microsoft/chat/agent/T_YOUR-GUID.<id>
+
+# --- 並列実行（fleet）が使うエージェント URL。IMPL と同じで OK ---
+MCP_FLEET_AGENT_URL=https://m365.cloud.microsoft/chat/agent/T_YOUR-GUID.<id>
+
+# --- bridge の CDP ポート（既定値のままで OK） ---
+# MCP_CDP_URL=http://localhost:9222
+# MCP_BRIDGE_PORT=8765
 ```
 
-手動でやる場合:
+**エージェント URL の取り方:** ブラウザで M365 Copilot (`https://m365.cloud.microsoft/chat`) を開き、左サイドバーから「companion」エージェント（STEP 5 で作成するもの）を選んでチャットを開始したときの URL バーの URL が `MCP_IMPL_AGENT_URL` です。
+
+**各 env 変数の意味まとめ:**
+
+| 変数 | 意味 | 人間が設定 |
+|---|---|---|
+| `MCP_API_KEY` | MCP サーバーへの Bearer 認証キー（read-only 系ツールに必要） | 自動生成。Copilot Studio に貼る（STEP 5） |
+| `MCP_UNLOCK_PASSWORD` | 書込・実行系ツールの IP 単位ロック解除パスワード | 自動生成。エージェントから `unlock(password=...)` で使う |
+| `MCP_ALLOWED_BASE` | エージェントがアクセスできるフォルダの上限（`~` = ホーム全体） | 任意で絞る |
+| `MCP_IMPL_AGENT_URL` | bridge / fleet が駆動する Copilot エージェントの URL | 手動で貼る（STEP 5 後） |
+| `MCP_FLEET_AGENT_URL` | fleet 専用エージェント URL（未指定なら `MCP_IMPL_AGENT_URL` を使用） | 任意 |
+| `MCP_CDP_URL` | 専用 Edge の CDP エンドポイント（既定 `http://localhost:9222`） | 変更不要 |
+| `MCP_BRIDGE_PORT` | ブリッジ UI のポート（既定 `8765`） | 変更不要 |
+| `MCP_DB_<NAME>` | ODBC 接続文字列（社内 DB を使うなら追記） | 任意 |
+
+---
+
+### STEP 3 ─ Dev Tunnel を作成してサーバーをインターネットに公開する
+
+> **ローカルの Claude Desktop だけに繋ぐ場合はこの STEP は不要です。** STEP 5-A の Claude Desktop 設定に進んでください。M365 Copilot Studio から繋ぐ場合のみ必要です。
+
+**クリックするファイル / コマンド:** PowerShell（管理者不要）
+
+**自動でやること:** `setup.ps1 -WithExternalTools` を使った場合は `devtunnel` CLI のインストールまで自動です。
+
+**人間がやること（1 回限り）:**
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-### 2. `.env` を作る
-
-```powershell
-Copy-Item .env.example .env
-notepad .env
-```
-
-中身を **個人ごとに新規生成** して貼る（絶対に他人と共有しないこと）:
-
-```powershell
-python -c "import secrets; print('MCP_API_KEY=' + secrets.token_hex(20))"
-python -c "import secrets; print('MCP_UNLOCK_PASSWORD=' + secrets.token_hex(8))"
-```
-
-`MCP_ALLOWED_BASE` を `~/work` のようなサブフォルダに絞ると、より安全になります（デフォルトはホーム全体）。
-
-### 3. サーバー起動
-
-```powershell
-.\start.ps1
-```
-
-`http://127.0.0.1:8000/mcp` で待受開始（Streamable HTTP transport）。
-
-### 4. 外から見えるようにする（リモートクライアント用）
-
-ローカルの Claude Desktop だけなら、この step は不要です。
-
-Microsoft 365 Copilot Studio から繋ぐなら、`localhost:8000` を HTTPS で公開する必要があります。最も簡単な無料手段が
-[Microsoft Dev Tunnels](https://learn.microsoft.com/azure/developer/dev-tunnels/) です:
-
-```powershell
+# devtunnel をまだ入れていない場合（-WithExternalTools を使わなかった場合）
 winget install Microsoft.devtunnel
-devtunnel user login                                # 初回のみ
+
+# ① 初回サインイン（ブラウザまたは device-code で職場 Microsoft アカウント認証）
+#    重要: supervisor が起動している場合は先に止める（supervisor が devtunnel プロセスを
+#    管理するため、ログイン中に kill される可能性がある）
+devtunnel login
+
+# ② Tunnel を 1 回だけ作成する（名前は何でもよい。以降は再実行不要）
 devtunnel create m365-copilot-companion --allow-anonymous
 devtunnel port create m365-copilot-companion -p 8000 --protocol http
+
+# ③ host（サーバーをインターネットに公開する）
 devtunnel host m365-copilot-companion
-# → https://<random>-8000.<region>.devtunnels.ms
+# → https://<ランダム文字列>-8000.<リージョン>.devtunnels.ms  ← この URL をメモする
 ```
 
-`--allow-anonymous` でも安全な理由は、本サーバーが **Bearer API キー** と **IP 単位の unlock** を必須にしているから。URL を当てずっぽうで叩いてきた人間 / bot は即 401 で弾かれます。
+**うまくいった目安:** `devtunnel host` の出力に `https://...-8000....devtunnels.ms` の URL が表示される。別ターミナルで `curl https://...-8000....devtunnels.ms/mcp` を叩くと `{"error": "..."}` または `401` が返る（サーバーに到達している証拠）。
 
-### 5. MCP クライアントに登録
+**2 回目以降の自動化（supervisor）:** `supervisor.ps1` がポート 8000 とトンネルを監視し、落ちていれば自動で復旧します。常時起動させるには:
 
-**Microsoft 365 Copilot Studio:**
+```powershell
+# ログオン時に自動起動（スタートアップフォルダに登録）
+$startup = [Environment]::GetFolderPath('Startup')
+$root    = (Get-Location).Path
+@"
+@echo off
+powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "$root\supervisor.ps1" -TunnelName m365-copilot-companion
+"@ | Set-Content -Encoding ASCII (Join-Path $startup "start-companion-supervisor.cmd")
+```
 
-1. エージェントを作成または既存のを開く
-2. ツール → 「ツールを追加」 → 「Model Context Protocol」
-3. サーバー URL: `https://<your-tunnel>-8000.<region>.devtunnels.ms/mcp`
-4. 認証: 「API キー（手動）」、ヘッダ名 `Authorization`、ヘッダ値 `Bearer <your MCP_API_KEY>`
-5. 保存 → 「接続を追加」 → ツール一覧が読み込まれれば成功
+> `--allow-anonymous` でも安全な理由: サーバーが **Bearer API キー（`MCP_API_KEY`）** で認証しているため、URL を当てずっぽうで叩いた人・bot は即 401 になります。
 
-> このとき同時に、Copilot Studio の **純正コネクタ**（メール・予定表・Teams・SharePoint など）も
-> 必要に応じてオンにしておくと、クラウド側はそちら・ローカル側はこの companion、という
-> 本来の二枚重ねになります（→「🧱 設計思想」参照）。
+---
 
-**配布範囲は必ず「自分のみ」**。「組織全体」を選ぶ前に、エージェントが何を触れるか完全に把握してください。
+### STEP 4 ─ Copilot Studio でエージェントに MCP ツールを登録する（最重要の手作業）
 
-**Claude Desktop / Claude Code:**
+**アクセス先:** `https://copilotstudio.microsoft.com`
+
+これが「②出てきた env 関連を Copilot Studio に登録する」の本体です。
+
+**人間がやること（順番どおりにクリックする）:**
+
+1. Copilot Studio にサインインし、「**エージェント**」→「**新しいエージェント**」（または既存エージェントを開く）。
+2. エージェントの編集画面で「**ツール**」タブ（または「ツールを追加」ボタン）→「**ツールを追加**」をクリック。（要確認）メニューの名称は Copilot Studio のバージョンによって「アクション」→「新しいアクション」→「外部」と表示される場合があります。
+3. 一覧から「**Model Context Protocol**」（MCP）を選択。
+4. 以下の値を入力する:
+
+   | 項目 | 入力値 |
+   |---|---|
+   | **サーバー URL** | `https://<your-tunnel>-8000.<region>.devtunnels.ms/mcp` |
+   | **認証の種類** | 「API キー（手動）」または「ヘッダー」 |
+   | **ヘッダー名** | `Authorization` |
+   | **ヘッダー値** | `Bearer <MCP_API_KEY の値>` （STEP 1 でコンソールに表示された値） |
+
+5. 「**保存**」→「**接続を追加**」（または「テスト」）をクリック。ツール一覧がロードされれば成功。
+
+6. 「**公開**」→「**利用者を自分だけ**」に設定（必ず自分のみ。組織全体は絶対に選ばない）。
+
+**うまくいった目安:** ツール登録画面に `list_my_tools`, `read_file` などのツール名がずらっと表示される。
+
+**同時にやっておくと便利（任意）:** エージェントの「ツール」タブで、Copilot Studio の純正コネクタ（メール・予定表・Teams・SharePoint など）も有効化しておくと、クラウド側を純正コネクタ・ローカル側をこの companion、という本来の二枚重ねになります（→「🧱 設計思想」参照）。
+
+**エージェント URL を `.env` に貼る（STEP 2 の続き）:**
+登録が終わったらエージェントとチャットを開き、URL バーの URL を `MCP_IMPL_AGENT_URL` に貼って保存してください。MCP サーバーを再起動（`Ctrl+C` → `.\start.ps1`）すると反映されます。
+
+---
+
+### STEP 5 ─ 専用 Edge を起動して M365 に初回サインインする
+
+**クリックするファイル:** `start_companion_edge.ps1`（リポジトリ直下）
+
+```powershell
+# 初回：可視ウィンドウで起動（サインイン操作が必要なため）
+.\start_companion_edge.ps1
+
+# 初回サインイン後は headless（ウィンドウなし）が推奨
+.\start_companion_edge.ps1 -Headless
+```
+
+**スクリプトが自動でやること:**
+- `copilot-companion-edge` という専用プロファイル（`%LOCALAPPDATA%\copilot-companion-edge`）でEdge を起動する。CDP（リモートデバッグポート）を `:9222` でバインドする。
+- 普段使いの Edge とは完全に分離されるため、本体 Edge に M365 タブを何枚開いても RAM を奪い合わない。
+- すでに同じポートが listen 中なら何もしない（多重起動防止）。
+
+**人間がやること（初回 1 回のみ）:**
+- `start_companion_edge.ps1` を `-Headless` なし（デフォルト）で実行すると Edge の可視ウィンドウが開く。
+- そのウィンドウで `https://m365.cloud.microsoft/chat` が開くので、**職場 Microsoft アカウントでサインイン**する。
+- SSO が有効（Azure AD 参加机）なら自動的にサインインが完了することもある。
+- サインイン完了後、次回以降は `-Headless` で起動可（ウィンドウなし、タスクバーなし、完全バックグラウンド）。
+
+**うまくいった目安:** コンソールに `Ready: CDP endpoint is up on http://127.0.0.1:9222` と表示される。ブラウザで `http://127.0.0.1:9222/json/version` にアクセスすると Edge の情報が返る。
+
+**bridge 用の専用 Edge（bridge と fleet を同時に動かしたい場合）:**
+
+```powershell
+# bridge は別プロファイル (copilot-bridge-edge) + 別ポート (:9223) で起動する
+.\start_bridge.ps1
+
+# 初回サインインが必要なら
+.\start_bridge.ps1 -SignIn
+
+# bridge を常時稼働させたいなら（クラッシュ時も自動再起動）
+.\start_bridge.ps1 -Keepalive
+```
+
+`start_bridge.ps1` は bridge 専用 Edge（`:9223`）を立て、`bridge\copilot_bridge.py` を起動します。`http://127.0.0.1:8765` にブラウザでアクセスすると、Node も Premium も不要なネイティブチャット UI が開きます。fleet の Edge（`:9222`）とは完全に別プロファイルなので、fleet 走行中でも同時に使えます。
+
+---
+
+### STEP 6 ─ WPF UI（チャット＋フリートコックピット）をビルドして起動する
+
+**クリックするファイル:** `ui\rebuild_ui.ps1`（`ui` フォルダ内）
+
+```powershell
+# 止める・ビルドする・起動する、を一発で行う（推奨）
+.\ui\rebuild_ui.ps1
+
+# ビルドだけして起動しない場合
+.\ui\rebuild_ui.ps1 -NoLaunch
+```
+
+**スクリプトが自動でやること:**
+1. 起動中の `FleetCockpit.exe` と `CopilotChat.exe` を両方 Stop する（旧バイナリのロックを外すため）。
+2. Windows に標準で入っている `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`（.NET Framework 4.x の C# コンパイラ）で WPF アプリを 2 つビルドする:
+   - `ui\FleetCockpit.exe` ─ 並列フリートの監視・制御コックピット
+   - `ui\CopilotChat.exe` ─ マークダウン整形・ダーク/ライト・日本語/英語対応のチャット UI
+3. ビルド成功後、両方を起動する。
+
+**前提:** `.NET Framework 4.x` が必要（Windows 10/11 ではほぼ標準）。Visual Studio・.NET SDK・Node.js は不要。
+
+> **旧スクリプトとの関係:** `ui\build_and_run.bat`（チャットのみ）と `ui\build_cockpit.bat`（コックピットのみ）は個別ビルド用の旧スクリプトです。`rebuild_ui.ps1` はこれら 2 つを正しい順序でビルドして両方を起動する「上位互換」スクリプトです。通常は `rebuild_ui.ps1` だけ使えば OK です。
+
+**うまくいった目安:** `FleetCockpit.exe` と `CopilotChat.exe` の 2 つのウィンドウが開く。コンソールに `running FleetCockpit pid=... start=...` のような行が表示される。
+
+---
+
+### STEP 7 ─ 初回動作確認（接続テスト）
+
+以下の順序で確認してください。
+
+**① MCP サーバーが生きているか:**
+
+```powershell
+Test-NetConnection localhost -Port 8000
+# TcpTestSucceeded : True が出れば OK
+```
+
+**② エージェントから `list_my_tools` を叩く:**
+
+Copilot Studio のエージェント（または `CopilotChat.exe` UI）に次のように話しかける:
+
+> 「`list_my_tools` を呼んで。」
+
+ツール一覧が返れば配線 OK。🟢 のものはすぐ使えます。🪟 / 📦 のものは依存が揃っていない場合にエラーになりますが、サーバー全体は落ちません。
+
+**③ 書込・実行系ツールのアンロック（初回のみ）:**
+
+書込・実行系ツール（`write_file`, `run_python` 等）を初めて呼ぶと:
+
+```
+[locked client IP: '203.0.113.42'] Call unlock(password='...') first.
+```
+
+と言われます。エージェントに次を伝えてください:
+
+> 「`unlock(password="<MCP_UNLOCK_PASSWORD>")` を呼んで。」
+
+その IP が `MCP_UNLOCK_TTL_DAYS` 日間（既定 30 日）解錠されます。以降は同じ IP から呼ぶ限り再解錠不要です。
+
+**④ Dev Tunnel を通る接続（Copilot Studio 経由の場合）:**
+
+Copilot Studio のバックエンドから呼ぶと IP が毎回変わることがあります（`unlock` を再び要求される）。これは正常動作です。再度 `unlock` を呼べば OK です。
+
+---
+
+### STEP 8 ─ 2 回目以降の日常起動
+
+全部が初期設定済みなら、日常の起動は以下だけです:
+
+```powershell
+# ① MCP サーバー起動
+.\start.ps1
+
+# ② Dev Tunnel 起動（supervisor が自動管理している場合は不要）
+devtunnel host m365-copilot-companion
+
+# ③ 専用 Edge 起動（headless）
+.\start_companion_edge.ps1 -Headless
+
+# ④ UI 起動（使う場合）
+.\ui\rebuild_ui.ps1
+
+# ⑤ bridge 起動（ブラウザ UI を使う場合）
+.\start_bridge.ps1 -Keepalive
+```
+
+または `quickstart.bat` をダブルクリックすれば ①〜② が一発で済みます（③〜⑤ は別途必要）。
+
+---
+
+### STEP 5-A ─ Claude Desktop / Claude Code に繋ぐ場合（M365 なし）
+
+Dev Tunnel（STEP 3）は不要です。`start.ps1` でサーバーを起動したら:
 
 ```json
 {
@@ -479,23 +697,27 @@ devtunnel host m365-copilot-companion
     "companion": {
       "transport": "http",
       "url": "http://localhost:8000/mcp",
-      "headers": { "Authorization": "Bearer <your MCP_API_KEY>" }
+      "headers": { "Authorization": "Bearer <MCP_API_KEY の値>" }
     }
   }
 }
 ```
 
-### 6. 動作確認
+を `~/.claude/claude_desktop_config.json`（Claude Desktop）または `.claude/settings.json`（Claude Code）に追記してください。
 
-エージェントに:
+---
 
-> 「`list_my_tools` を呼んで。」
+### よくある初期設定のトラブル
 
-ツール一覧が返れば配線 OK。返ってきた中で 🟢 のものはすぐ使えます。🪟 / 📦 のものは、対応する OS / アプリ / ライブラリが揃っていないと、呼んだときに「その依存が無い」旨のエラーを返します（サーバー全体は落ちません）。読み取り系はそのまま、書込・実行系を初めて使うと:
-
-> `[locked client IP: '203.0.113.42'] Call unlock(password='...') first.`
-
-と言われます。指示通り `unlock(password="<your MCP_UNLOCK_PASSWORD>")` を呼ぶと、その IP が `MCP_UNLOCK_TTL_DAYS` 日（既定 30 日）解錠されます。
+| 症状 | 確認・対処 |
+|---|---|
+| `quickstart.bat` が Python が見つからないと止まる | `winget install Python.Python.3.12` → 再実行 |
+| `devtunnel login` が何度やっても "Not logged in" のまま | `supervisor.ps1` が動いていたら一度止める。フォアグラウンドの新しいターミナルで `devtunnel login` を実行し、ブラウザの「続行」を確実にクリックする（`docs/STARTUP_devtunnel_login.md` 参照） |
+| Copilot Studio のツール登録でツール一覧が出ない | Dev Tunnel が `host` 状態かを確認（`devtunnel show m365-copilot-companion | Select-String "Host connections"`。`0` ならトンネルが落ちている）、MCP サーバーが起動しているか確認 |
+| エージェントが「申し訳ございません。それに応答できませんでした。」と返す | MCP サーバーか Dev Tunnel が落ちている。`Test-NetConnection localhost -Port 8000` → `devtunnel show` → 手動で `.\start.ps1` → `devtunnel host` で復旧 |
+| `rebuild_ui.ps1` が `csc.exe not found` で失敗 | .NET Framework 4.x が入っていない。「Windowsの機能の有効化または無効化」→「.NET Framework 4.8」を有効化 |
+| `start_companion_edge.ps1` でサインインが要求され続ける | `-Foreground` でウィンドウを表示してサインインを完了させる → 次回から `-Headless` で起動 |
+| `unlock` を何度も要求される | Copilot Studio バックエンドの送信元 IP が変わった（VPN 切替など）。その都度 `unlock(password=...)` を呼ぶのが正常動作 |
 
 ---
 
