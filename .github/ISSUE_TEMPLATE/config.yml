@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Setup help (README)
+    url: https://github.com/MasayukiTa/m365-copilot-companion-mcp#readme
+    about: Most setup problems are answered in the step-by-step README (STEP 0-8). Please check it first.
+  - name: Security issue (report privately)
+    url: https://github.com/MasayukiTa/m365-copilot-companion-mcp/security
+    about: Please report security vulnerabilities privately via the Security tab, not as a public issue.

@@ -418,7 +418,11 @@ quickstart.bat（ダブルクリック）
 
 - **Windows 10 / 11**（PowerShell 5.1 以上）が必要です。macOS / Linux では 🪟 タグのツール（PowerShell・プロセス操作・スケジューラ・通知・Outlook 等）は動きません。
 - **Microsoft Edge** がインストールされていること（bridge / fleet の CDP 経路で使います）。
-- **M365 Copilot ライセンス**があること（エージェントを作成できるプラン。Copilot Studio にアクセスできれば OK）。
+- **M365 Copilot ライセンス**があること（Copilot Studio 経路を使う場合）。ライセンスだけでは不十分で、次の3点が揃って初めて Copilot Studio 経路が通ります:
+  1. **職場/学校アカウント**であること（Copilot Studio は法人テナント製品。個人の Microsoft アカウントや消費者向け「Copilot Pro」では不可）。
+  2. その職場アカウントに **full M365 Copilot ライセンス**が付いていること（Copilot Studio とエージェント内 MCP サーバー利用に必要。Copilot Studio はこのライセンスに含まれます）。
+  3. **テナント管理者がカスタム/MCP コネクタを許可**していること。Copilot Studio の MCP は Power Platform のコネクタ基盤を通り **DLP ポリシーの対象**なので、管理者が custom connector や `*.devtunnels.ms` エンドポイントをブロックしているとライセンスがあっても追加できません（**大企業の従業員ほど自社 IT に塞がれている**ことが多く、自分がテナント管理者の小規模環境の方が自由）。
+  - **個人で使う／会社にブロックされている場合は** → **ローカル Claude Desktop 経路（STEP 5-A）**。devtunnel も Copilot ライセンスも不要で、Claude Desktop さえあれば誰でも使えます。
 - **Python 3.10 以降**がインストールされているか、winget で入れられる環境であること（`setup.bat` が自動取得も試みます）。
 - **Git**（クローン用。なければ ZIP でもセットアップは同じ手順で動きます）。
 - **.NET Framework 4.x** が OS に入っていること（WPF UI ビルド用。`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe` が存在すれば OK。Windows 10/11 ではほぼ標準で入っています）。
@@ -455,7 +459,7 @@ git clone https://github.com/MasayukiTa/m365-copilot-companion-mcp.git
 
 **うまくいった目安:** 最後に CopilotChat／FleetCockpit のウィンドウが開き、サーバーが待受。以降の日常起動は `start_all.bat` のダブルクリックだけ（STEP 8）。
 
-> **クリーンな Windows / USB メモリの zip でも動くか:** 動きます。必要なのは**インターネット接続**と **M365 Copilot ライセンス**だけ。Python は `uv` が管理者不要で入れ、devtunnel は直接DLで入り、WPF UI は Windows 同梱の `csc.exe`（.NET Framework 4.x）でビルドするため、追加の手動インストールは不要です（`.git` が無い zip 配布でも STEP 3 の更新確認を飛ばして進みます）。
+> **クリーンな Windows / USB メモリの zip でも動くか:** 動きます。ローカル環境構築に必要なのは**インターネット接続**だけ（管理者権限も不要）。Python は `uv` が管理者不要で入れ、devtunnel は直接DLで入り、WPF UI は Windows 同梱の `csc.exe`（.NET Framework 4.x）でビルドするため、追加の手動インストールは不要です（`.git` が無い zip 配布でも STEP 3 の更新確認を飛ばして進みます）。ただし **Copilot Studio 経路を使うなら STEP 0 の前提**（職場アカウント＋full M365 Copilot ライセンス＋管理者がカスタム/MCP コネクタを許可）が必要です。**個人用途はローカル Claude Desktop 経路（STEP 5-A）**ならこれらすべて不要。
 > **PowerShell 派**は `.\setup.ps1 -WithExternalTools`（Python＋devtunnel＋Tesseract）→ `.\configure_env.ps1` → `.\start_all.ps1` でも同じです。
 
 ---
