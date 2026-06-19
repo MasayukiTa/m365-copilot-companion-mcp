@@ -16,7 +16,11 @@ echo.
 echo ===========================================================================
 echo  STEP 1/4  Install Python, venv and requirements (resumable bootstrap)
 echo ===========================================================================
+REM Tell setup.bat it is being CALLED (not double-clicked), so it does not add
+REM its own pause -- quickstart has its own pauses and a final one.
+set "FROM_QUICKSTART=1"
 call setup.bat
+set "FROM_QUICKSTART="
 if errorlevel 1 (
     echo.
     echo Bootstrap failed. Fix the error above and run quickstart.bat again.

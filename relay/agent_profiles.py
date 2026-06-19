@@ -19,6 +19,7 @@ Selectors / URLs captured from the live M365 Copilot DOM (2026-06):
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 from dataclasses import dataclass
 
@@ -29,18 +30,31 @@ from tools.gate_ops import stop_check
 
 load_dotenv()
 
-# Agent URLs embed tenant/agent GUIDs, so they are NOT hardcoded here (this file is
-# public). Set them in .env (gitignored):
-#   MCP_RESEARCHER_AGENT_URL=https://m365.cloud.microsoft/chat/agent/P_....dr_work
-#   MCP_ANALYST_AGENT_URL=https://m365.cloud.microsoft/chat/agent/P_....diceberry
-RESEARCHER_URL = os.environ.get("MCP_RESEARCHER_AGENT_URL", "")
-ANALYST_URL = os.environ.get("MCP_ANALYST_AGENT_URL", "")
+# Researcher (".dr_work") and Analyst (".diceberry") are Microsoft FIRST-PARTY M365
+# Copilot agents. Their deep-link id identifies the AGENT, not the tenant: under one
+# tenant the two agents carry DIFFERENT GUIDs (so the GUID is the agent's product id,
+# not a per-user id), and they are the same first-party agents for every M365 Copilot
+# user -- so these defaults work as-is on most tenants. They are NOT the same URL as
+# each other (different agent => different ".suffix" and GUID).
+#
+# A user can still override either in .env (MCP_RESEARCHER_AGENT_URL /
+# MCP_ANALYST_AGENT_URL). And if a default fails to load on some tenant, open_agent()
+# pops a dialog (prompt_for_agent_url) so the user pastes their own URL; that value is
+# saved to .env and wins from then on. So: default in, dialog fallback if it doesn't
+# connect.
+DEFAULT_RESEARCHER_URL = "https://m365.cloud.microsoft/chat/agent/P_552e6eda-fc18-7fb9-0ef6-1bf2de3393e4.dr_work"
+DEFAULT_ANALYST_URL = "https://m365.cloud.microsoft/chat/agent/P_8cfc4e6f-267e-db15-c6e7-3fc47a54f61e.diceberry"
+
+RESEARCHER_URL = os.environ.get("MCP_RESEARCHER_AGENT_URL", "").strip() or DEFAULT_RESEARCHER_URL
+ANALYST_URL = os.environ.get("MCP_ANALYST_AGENT_URL", "").strip() or DEFAULT_ANALYST_URL
 
 
 @dataclass
 class AgentProfile:
     name: str
     url: str
+    # .env key this profile's URL comes from (drives the dialog fallback below).
+    env_key: str = ""
     # CSS for the model dropdown button (None = agent has no model switcher).
     model_picker: str | None = None
     # Deep-research turns stream for minutes; tune completion detection long and
@@ -55,7 +69,8 @@ PLAIN = AgentProfile(name="plain", url="", model_picker=None,
 
 RESEARCHER = AgentProfile(
     name="researcher",
-    url=RESEARCHER_URL,   # from MCP_RESEARCHER_AGENT_URL (.env) -- not committed
+    url=RESEARCHER_URL,   # MCP_RESEARCHER_AGENT_URL (.env) or DEFAULT_RESEARCHER_URL
+    env_key="MCP_RESEARCHER_AGENT_URL",
     model_picker='button[data-testid="researcher-model-picker-button"]',
     end_timeout_s=1800, dwell_s=12.0, appear_timeout_s=300,
 )
@@ -68,7 +83,8 @@ RESEARCHER = AgentProfile(
 # §5 its numeric claims must be ground-verified with the local tools (operator ③).
 ANALYST = AgentProfile(
     name="analyst",
-    url=ANALYST_URL,      # from MCP_ANALYST_AGENT_URL (.env) -- not committed
+    url=ANALYST_URL,      # MCP_ANALYST_AGENT_URL (.env) or DEFAULT_ANALYST_URL
+    env_key="MCP_ANALYST_AGENT_URL",
     model_picker=None,
     end_timeout_s=900, dwell_s=8.0, appear_timeout_s=180,
 )
@@ -76,17 +92,73 @@ ANALYST = AgentProfile(
 PROFILES = {p.name: p for p in (PLAIN, RESEARCHER, ANALYST)}
 
 
-def open_agent(page, profile: AgentProfile) -> bool:
-    """Navigate to the agent's bare URL (= a fresh chat) and wait for the composer."""
+def prompt_for_agent_url(env_key: str, reason: str = "") -> str:
+    """Pop the configure_env dialog focused on ONE agent-URL field so the user can
+    paste the correct URL when the default/recorded one fails to load, then return the
+    saved value from .env. Returns "" if there is nothing to prompt with, the user
+    cancels, or GUI prompting is disabled (MCP_AGENT_URL_PROMPT=0 -- set it for
+    unattended/batch runs so a hidden dialog can't block them).
+
+    This is the "dialog fallback" half of: default URL in, dialog if it won't connect.
+    """
+    if not env_key or os.environ.get("MCP_AGENT_URL_PROMPT", "1") != "1":
+        return ""
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ps1 = os.path.join(repo, "configure_env.ps1")
+    if not os.path.isfile(ps1):
+        return ""
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
+             "-Only", env_key, "-Reason", (reason or "")],
+            timeout=600, check=False,
+        )
+    except Exception:
+        return ""
+    # Re-read .env so the freshly-saved value is visible to this process.
+    try:
+        load_dotenv(os.path.join(repo, ".env"), override=True)
+    except Exception:
+        pass
+    return os.environ.get(env_key, "").strip()
+
+
+def open_agent(page, profile: AgentProfile, allow_prompt: bool = True) -> bool:
+    """Navigate to the agent's bare URL (= a fresh chat) and wait for the composer.
+
+    Self-healing: if the composer never renders (the default or recorded URL did not
+    resolve to a usable agent) and this profile is bound to an .env key, pop a dialog
+    for the user to paste the correct URL, save it, and retry ONCE. So a wrong default
+    on some tenant degrades to a one-time prompt instead of a hard failure.
+    """
+    if not profile.url and allow_prompt and profile.env_key:
+        new = prompt_for_agent_url(profile.env_key, reason=f"{profile.name} agent URL is not set yet.")
+        if new:
+            profile.url = new
     if not profile.url:
         raise RuntimeError(
-            f"{profile.name} agent URL is empty -- set MCP_RESEARCHER_AGENT_URL in .env"
+            f"{profile.name} agent URL is empty -- set {profile.env_key or 'the agent URL'} in .env"
         )
-    page.goto(profile.url, wait_until="domcontentloaded")
-    for _ in range(40):
-        page.wait_for_timeout(1000)
-        if page.locator(COPILOT_SELECTORS["composer"]).count() > 0:
-            return True
+
+    def _go_and_wait() -> bool:
+        page.goto(profile.url, wait_until="domcontentloaded")
+        for _ in range(40):
+            page.wait_for_timeout(1000)
+            if page.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+                return True
+        return False
+
+    if _go_and_wait():
+        return True
+    # Composer never rendered -> the URL likely points at no usable agent on this tenant.
+    if allow_prompt and profile.env_key:
+        new = prompt_for_agent_url(
+            profile.env_key,
+            reason=(f"The {profile.name} agent did not load from:\n{profile.url}\n\n"
+                    f"Open the correct agent in M365 Copilot and paste its address-bar URL."))
+        if new and new != profile.url:
+            profile.url = new
+            return _go_and_wait()
     return False
 
 
