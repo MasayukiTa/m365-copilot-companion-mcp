@@ -25,10 +25,11 @@
   Health-check interval.
 #>
 param(
-    # IMPORTANT: this default must match the real tunnel id (`devtunnel list`).
-    # 2026-06-12: a relaunch without -TunnelName used a stale default and KILLED the
-    # live tunnel host while "fixing" a tunnel that didn't exist. Keep this current.
-    [string]$TunnelName = "companion-mcp",
+    # Empty -> resolved below from .env's MCP_TUNNEL_NAME (written by setup_devtunnel.ps1), falling
+    # back to the generic "m365-copilot-companion". DO NOT hardcode a machine-specific tunnel id here:
+    # a wrong default once KILLED a live tunnel host while "fixing" one that didn't exist (2026-06-12),
+    # and it also leaked one user's tunnel name as the default for everyone else's fresh install.
+    [string]$TunnelName = "",
     [int]$Port = 8000,
     [int]$IntervalSeconds = 15,
     # Consecutive failed checks required before acting. Debounce avoids killing a
@@ -42,6 +43,21 @@ param(
 
 $ErrorActionPreference = "SilentlyContinue"
 $Root = $PSScriptRoot
+
+# Resolve the tunnel name: explicit -TunnelName wins; else .env's MCP_TUNNEL_NAME (set by
+# setup_devtunnel.ps1 to this machine's actual tunnel); else the generic default. This keeps the
+# supervisor machine-agnostic -- every install hosts ITS OWN tunnel, not a hardcoded one.
+if (-not $TunnelName) {
+    try {
+        $envp = Join-Path $Root ".env"
+        if (Test-Path $envp) {
+            $m = (Get-Content $envp | Where-Object { $_ -match '^\s*MCP_TUNNEL_NAME\s*=' } | Select-Object -First 1)
+            if ($m) { $TunnelName = ($m -replace '^\s*MCP_TUNNEL_NAME\s*=\s*', '').Trim() }
+        }
+    } catch { }
+}
+if (-not $TunnelName) { $TunnelName = "m365-copilot-companion" }
+
 $Py = Join-Path $Root ".venv\Scripts\python.exe"
 if (-not (Test-Path $Py)) { $Py = "python" }
 $Log = Join-Path $env:TEMP "m365-companion-supervisor.log"
