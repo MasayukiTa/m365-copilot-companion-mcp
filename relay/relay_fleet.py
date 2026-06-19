@@ -682,6 +682,31 @@ class RelayWorker:
         if text:
             self.steer_msgs.append(text)
 
+    def _task_anchor(self, nudge):
+        """Prepend the worker's task identity to a GENERIC retry/continue/fix nudge so a
+        long or retrying conversation can't drift into a different role. A bare
+        'もう一度' / '次のステップを' carries no task identity; after many turns the agent can
+        forget WHICH task it is on. We re-state cwd + a one-line goal summary every time.
+        Uses only fields already on the worker (self.cwd, self.goal); never raises."""
+        try:
+            anchor = ""
+            one = ""
+            for ln in (self.goal or "").splitlines():
+                ln = ln.strip()
+                if ln:
+                    one = ln[:160]
+                    break
+            where = (self.cwd or "").strip()
+            if where and one:
+                anchor = "あなたは %s で「%s」を修正中です。その作業を続けてください。\n" % (where, one)
+            elif one:
+                anchor = "あなたは「%s」を修正中です。その作業を続けてください。\n" % one
+            elif where:
+                anchor = "あなたは %s での作業を続けてください。\n" % where
+            return anchor + nudge if anchor else nudge
+        except Exception:
+            return nudge
+
     def _begin_send(self):
         # max_turns=0 (or falsy) means unlimited -- no turn-cap check at all.
         if self.max_turns and self.turn >= self.max_turns:
@@ -1103,7 +1128,7 @@ class RelayWorker:
             if not self._consent_auto_tried:
                 self._consent_auto_tried = True
                 if self._auto_consent():
-                    self.job = RETRY_JOB
+                    self.job = self._task_anchor(RETRY_JOB)
                     self.reason = "auto-consent: 接続を確定し再呼出"
                     return
             # fallback: surface the (headless) Edge ONCE so the user can authorize manually
@@ -1126,7 +1151,7 @@ class RelayWorker:
                                "**接続未確立**。→ 前面に出した**専用Edge**で接続を承認(consentは当該ブラウザ"
                                "専用・他で承認しても無効)してから再投入を。")
                 return
-            self.job = RETRY_JOB
+            self.job = self._task_anchor(RETRY_JOB)
             return
         # TOOL-BACKEND-UNREACHABLE: the agent's tool calls failed (devtunnel/network blip) and it
         # self-locked claiming its tools don't exist. INFRA-FALSE, not a miss. Re-send the GOAL (the
@@ -1171,7 +1196,7 @@ class RelayWorker:
                 except Exception:
                     pass
                 return
-            self.job = RETRY_JOB
+            self.job = self._task_anchor(RETRY_JOB)
             self._cooldown_until = now + transient_backoff(self._copilot_err_streak)  # back off, don't hammer
             return
         self._copilot_err_streak = 0
@@ -1204,7 +1229,7 @@ class RelayWorker:
             # tool/network failure (the agent couldn't write a file etc.). Retry the turn
             # (re-prompt to try the tools again) before giving up, up to the budget.
             if self._retry_transient():
-                self.job = RETRY_JOB
+                self.job = self._task_anchor(RETRY_JOB)
                 self.reason = "STUCK -> transient retry %d/%d" % (self.transient, self.max_transient)
                 return
             if self._salvage_via_checks():
@@ -1260,13 +1285,13 @@ class RelayWorker:
             self.reason = "no progress for %d turns" % (self.no_progress + 1)
             return
         if "FAIL" in last_line:
-            self.job = FIX_JOB
+            self.job = self._task_anchor(FIX_JOB)
         elif self._last_was_steer:
             # bridge off the steer instead of a raw CONTINUE so the redirection sticks
             self.job = ("先ほどの追加指示を踏まえて作業を続行してください。"
                         "完了なら DONE、無理なら FAIL と理由を書いてください。")
         else:
-            self.job = CONTINUE_JOB
+            self.job = self._task_anchor(CONTINUE_JOB)
         self.status = "ready"
 
     def _on_done_claimed(self):

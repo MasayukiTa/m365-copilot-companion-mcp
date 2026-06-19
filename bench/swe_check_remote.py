@@ -20,6 +20,7 @@ Hard-won remote-exec rules (see project_the eval host_swe_eval_host memory):
   * The eval VM is kept alive by the SweDockerd scheduled task; dockerd persists.
 """
 import base64
+import hashlib
 import os
 import re
 import subprocess
@@ -96,17 +97,25 @@ def main():
         return 2
     inst, wt = sys.argv[1], sys.argv[2]
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", inst)        # for the diff filename
-    # run id doubles as the systemd unit name + swebench --run_id; keep it strictly
-    # alphanumeric -- '__' / '-' in a systemd-run --unit name silently fails to start.
-    runid = "g" + re.sub(r"[^A-Za-z0-9]", "", inst)
 
-    # 1) capture the candidate diff from the worktree
+    # 1) capture the candidate diff from the worktree (BEFORE building run_id, which hashes it)
     try:
         diff = subprocess.run(["git", "-C", wt, "diff"], capture_output=True, text=True,
                               timeout=60).stdout
     except Exception as e:
         print("REMOTE_GRADE diff failed: %s" % e, file=sys.stderr)
         return 2
+
+    # run id doubles as the systemd unit name + swebench --run_id; keep it strictly alphanumeric
+    # ('__' / '-' in a systemd-run --unit name silently fails to start). CRITICAL: it must be UNIQUE
+    # PER (instance, diff) so swebench creates a FRESH report dir and never reuses a stale verdict
+    # from a previous run or the other A/B arm. A constant-per-instance run_id is exactly what let a
+    # days-old report be scored as this run's result (the "ON arm graded in 46s" stale-report bug
+    # that made ⑤OFF and ⑤ON look identical). Hashing the diff guarantees a different diff -> a
+    # different run_id -> a real eval.
+    diff_hash = hashlib.md5((diff or "").encode("utf-8")).hexdigest()[:10]
+    runid = "g" + re.sub(r"[^A-Za-z0-9]", "", inst) + diff_hash
+
     tf = tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False, newline="\n",
                                      encoding="utf-8")
     tf.write(diff)

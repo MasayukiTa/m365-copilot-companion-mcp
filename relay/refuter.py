@@ -94,6 +94,14 @@ LENS_PROMPTS = {
                  "定義された**最下層（プリミティブ/共有定義）が未修正**、または古い挙動をフォールバックで温存し、"
                  "退化・矛盾入力（空/ゼロ/負/None/未確定）での新しい契約を満たさない。\n"
                  if os.environ.get("SWE_FIX_RADIUS", "1") != "0" else "")
+                 # class: producer fixed but a DOWNSTREAM consumer/re-emitter still carries the OLD shape.
+                 # If you change WHAT a producer emits, every downstream function that consumes or
+                 # RE-EMITS the old shape must be updated or be a no-op -- a producer fix that leaves a
+                 # stale downstream emitter is incomplete (creates duplicates/contradictions).
+                 + "(7) 下流取りこぼし: producer（生成側）が出す形を直したのに、その出力を**消費する/古い形のまま"
+                 "再出力する下流関数**がそのまま残っている。生成側の出力を変えたなら、その値を消費・再出力する"
+                 "下流関数を**すべて列挙**し、各々が更新済みか、もはや no-op になっているかを確認せよ。古い形を"
+                 "まだ吐く下流エミッタを放置した producer 修正は不完全（重複・矛盾を生む）。\n"
                  + "上のいずれも無く、独立再現ケースが通り、関連する全ての箇所が直っていれば UPHELD。",
 }
 PANEL_LENSES = ("correctness", "edge", "security")
