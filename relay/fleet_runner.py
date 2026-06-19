@@ -638,8 +638,13 @@ def main():
                     # prefer Copilot's auto-generated chat title for the registry entry;
                     # fall back to the goal text when it hasn't been captured yet.
                     title = (getattr(w, "conv_title", "") or w.goal or "")[:60]
-                    existing.append({"url": u, "title": title,
-                                     "source": "fleet", "ts": time.time()})
+                    existing.append({"url": u, "title": title, "source": "fleet",
+                                     # carry the disk transcript path + worker name so the chat
+                                     # opens this conversation straight from the .jsonl -- no live
+                                     # re-scrape (which fails for any conv whose agent the bridge
+                                     # is not currently connected to).
+                                     "transcript": getattr(w, "transcript", "") or "",
+                                     "name": getattr(w, "name", ""), "ts": time.time()})
                     urls.add(u); changed = True
             if changed:
                 _write_atomic(convs_path, existing)
