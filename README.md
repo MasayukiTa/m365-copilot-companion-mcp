@@ -377,7 +377,7 @@ Premium / Direct Line を使わず、Copilot エージェントを **手元の�
 | 専用 Edge の起動・サインイン状態維持（`start_companion_edge.ps1`） | 専用 Edge プロファイルへの初回 M365 サインイン |
 | WPF UI のビルド＆起動（`ui\rebuild_ui.ps1`） | — |
 
-> 一度登録すれば、2 回目以降は「`quickstart.bat` をダブルクリック → サーバー起動」だけです。
+> 一度登録すれば、2 回目以降は **`start_all.bat` をダブルクリック**するだけ（サーバー＋トンネル＋専用 Edge＋bridge＋UI を冪等に一括起動。STEP 8 参照）。
 
 ---
 
@@ -664,26 +664,19 @@ Copilot Studio のバックエンドから呼ぶと IP が毎回変わること�
 
 ### STEP 8 ─ 2 回目以降の日常起動
 
-全部が初期設定済みなら、日常の起動は以下だけです:
+**`start_all.bat` をダブルクリックするだけ**です。これ 1 つで下記スタック全部を一括起動します:
 
-```powershell
-# ① MCP サーバー起動
-.\start.ps1
+| | 起動するもの | 既に動いていたら |
+|---|---|---|
+| 1 | `supervisor.ps1`（MCP サーバー＋Dev Tunnel host） | スキップ。**動いているトンネルは絶対に止めません** |
+| 2 | 専用 Edge `:9222`（フリート／エージェント用・headless） | スキップ（ポートが応答していれば） |
+| 3 | `start_bridge.ps1 -Keepalive`（bridge `:9223`＋チャット） | スキップ |
+| 4 | `CopilotChat` / `FleetCockpit` ウィンドウ | スキップ |
 
-# ② Dev Tunnel 起動（supervisor が自動管理している場合は不要）
-devtunnel host m365-copilot-companion
+`start_all.bat` は**冪等**です。全部が既に起動済みでも、セッション途中でも、何度ダブルクリックしても安全（先行プロセスは触らず、足りないものだけ補います）。初回 M365 サインインが必要な時だけ可視 Edge が出るので、そこでサインインしてください。
 
-# ③ 専用 Edge 起動（headless）
-.\start_companion_edge.ps1 -Headless
-
-# ④ UI 起動（使う場合）
-.\ui\rebuild_ui.ps1
-
-# ⑤ bridge 起動（ブラウザ UI を使う場合）
-.\start_bridge.ps1 -Keepalive
-```
-
-または `quickstart.bat` をダブルクリックすれば ①〜② が一発で済みます（③〜⑤ は別途必要）。
+> 個別に起動したい場合は従来どおり: `.\supervisor.ps1`（サーバー＋トンネル）/ `.\start_companion_edge.ps1 -Headless`（`:9222`）/ `.\start_bridge.ps1 -Keepalive`（`:9223`）/ `.\ui\rebuild_ui.ps1`（UI をビルドし直して起動）。
+> 初回セットアップ（venv・依存・`.env`・シークレット表示）は `quickstart.bat` のままです。`start_all.bat` はあくまで 2 回目以降の軽量ランチャー。
 
 ---
 
