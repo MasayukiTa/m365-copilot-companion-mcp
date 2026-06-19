@@ -410,55 +410,43 @@ git clone https://github.com/MasayukiTa/m365-copilot-companion-mcp.git
 # エクスプローラーで quickstart.bat をダブルクリック（または PowerShell から実行）
 ```
 
-**`quickstart.bat` が自動でやること（4 ステップ）:**
+`quickstart.bat` は **最初の 1 回で全部をガイドする 7 ステップ**になっています。**Copilot Studio の設定（STEP 5）だけが手作業**で、それ以外はクリックとコピペだけで進みます。
 
-1. **`setup.bat` を呼び出し、Python 環境を再開可能にブートストラップする。**
-   Python が PATH にない場合は `uv`（Astral）を自動取得し、`.venv` を作り、`requirements.txt` をインストールします。管理者権限不要。途中で止まっても再実行すれば続きから再開します（`.setup/state.json` にチェックポイントを保存）。
-2. **Bearer トークンとアンロックパスワードをコンソールに表示する。**
-   `.env` がなければ自動生成します。既にあれば上書きしません。表示された 2 つの値をメモしてください（次の STEP で Copilot Studio に貼ります）。
-   ```
-   Bearer token  (MCP_API_KEY)        : abc123...（40文字のランダム hex）
-   Unlock password (MCP_UNLOCK_PASSWORD): def456...（16文字のランダム hex）
-   ```
-3. **git の更新を確認する**（`fetch` のみ。push はしない）。
-4. **MCP サーバーを起動する**（`python main.py`。`http://127.0.0.1:8000/mcp` で待受開始）。
+1. **`setup.bat` で Python 環境をブートストラップ。** Python が無ければ `uv`（Astral）を自動取得し `.venv` を作り `requirements.txt` を入れる。管理者不要・再開可能。
+2. **Bearer トークン／アンロックパスワードを表示**（`.env` 自動生成。既存は上書きしない）。Copilot Studio に貼るのでメモ。
+3. **git 更新確認**（`fetch` のみ。zip 配布で `.git` が無ければ自動スキップ）。
+4. **`setup_devtunnel.ps1` を実行**（devtunnel CLI を winget か直接DLで導入 → ブラウザ or device-code でサインイン → トンネル作成 → **公開 URL を表示**）。
+5. **Copilot Studio（唯一の手作業・ここで一時停止）**: 表示された公開 URL ＋ Bearer トークンで MCP コネクタを登録し、companion エージェントを作成（README STEP 4／STEP 5）。作成したら任意キーで再開。
+6. **エージェント URL ダイアログが自動で開く**（`configure_env.ps1`）。作ったエージェントの URL を貼って保存 → `.env` に反映。
+7. **`start_all.ps1` でスタック全部を起動**（サーバー＋トンネル＋専用 Edge＋bridge＋UI）。
 
-**人間がやること:** なし（コンソールの表示を読んでトークンを控えるだけ）。
+**人間がやること:** ② のメモ、④ のサインイン（Entra ID をポチポチ）、⑤ の Copilot Studio 手作業、⑥ の URL コピペ。**コマンド入力は不要**。
 
-**うまくいった目安:** コンソールに `MCP server listening on http://0.0.0.0:8000` のような行が表示され、`http://localhost:8000/mcp` にブラウザでアクセスすると JSON が返る。
+**うまくいった目安:** 最後に CopilotChat／FleetCockpit のウィンドウが開き、サーバーが待受。以降の日常起動は `start_all.bat` のダブルクリックだけ（STEP 8）。
 
-**次:** STEP 2 へ（別ターミナルを開いて続きを進める。サーバーは起動したままにする）。
-
-> **`quickstart.bat` の代わりに PowerShell を好む場合** は `.\setup.ps1`（または `.\setup.ps1 -WithExternalTools` で devtunnel + Tesseract も一括インストール）→ `.\start.ps1` でも同じ結果になります。
+> **クリーンな Windows / USB メモリの zip でも動くか:** 動きます。必要なのは**インターネット接続**と **M365 Copilot ライセンス**だけ。Python は `uv` が管理者不要で入れ、devtunnel は直接DLで入り、WPF UI は Windows 同梱の `csc.exe`（.NET Framework 4.x）でビルドするため、追加の手動インストールは不要です（`.git` が無い zip 配布でも STEP 3 の更新確認を飛ばして進みます）。
+> **PowerShell 派**は `.\setup.ps1 -WithExternalTools`（Python＋devtunnel＋Tesseract）→ `.\configure_env.ps1` → `.\start_all.ps1` でも同じです。
 
 ---
 
-### STEP 2 ─ `.env` を編集してエージェント URL を追記する
+### STEP 2 ─ エージェント URL を設定する（`configure_env.bat` のダイアログにコピペ）
 
-**編集するファイル:** `.env`（リポジトリ直下。`quickstart.bat` が自動生成済み）
+**クリックするファイル:** `configure_env.bat`（リポジトリ直下をダブルクリック）
 
-`quickstart.bat` が生成した `.env` には 4 行のミニマル設定が入っています。Copilot エージェントを使う場合は **エージェント URL だけ追記** する必要があります。
+`.env` を手で編集する必要はありません。`configure_env.bat` を**ダブルクリックするとダイアログが開く**ので、各エージェントの URL を貼り付けて [保存] を押すと `.env` に反映されます（既存値は自動で前入力されるので、後から追加・修正も可）。
 
-```
-# --- 必須（自動生成済み。変更不要） ---
-MCP_API_KEY=<40文字のランダムhex>
-MCP_UNLOCK_PASSWORD=<16文字のランダムhex>
-MCP_UNLOCK_TTL_DAYS=30
-MCP_ALLOWED_BASE=~
+ダイアログの 4 欄:
 
-# --- Copilot エージェント URL（あなたが追記する） ---
-# M365 Copilot でエージェントを開き、URL バーの URL をそのままコピーして貼る
-MCP_IMPL_AGENT_URL=https://m365.cloud.microsoft/chat/agent/T_YOUR-GUID.<id>
+| 欄 | env 変数 | 何の URL か |
+|---|---|---|
+| メイン エージェント **(必須)** | `MCP_IMPL_AGENT_URL` | チャット＆フリートが操作する主エージェント |
+| フリート用 (任意) | `MCP_FLEET_AGENT_URL` | 並列実行用。空ならメインと同じ |
+| リサーチ用 (任意) | `MCP_RESEARCHER_AGENT_URL` | `/research` が使う調査エージェント |
+| アナリスト用 (任意) | `MCP_ANALYST_AGENT_URL` | `/analyze` が使う分析エージェント |
 
-# --- 並列実行（fleet）が使うエージェント URL。IMPL と同じで OK ---
-MCP_FLEET_AGENT_URL=https://m365.cloud.microsoft/chat/agent/T_YOUR-GUID.<id>
+> `quickstart.bat`（STEP 1）の流れの中でも、Copilot Studio でエージェントを作った直後にこのダイアログが自動で開きます。まだ無い欄は空のままでよく、後から `configure_env.bat` で追加できます。
 
-# --- bridge の CDP ポート（既定値のままで OK） ---
-# MCP_CDP_URL=http://localhost:9222
-# MCP_BRIDGE_PORT=8765
-```
-
-**エージェント URL の取り方:** ブラウザで M365 Copilot (`https://m365.cloud.microsoft/chat`) を開き、左サイドバーから「companion」エージェント（STEP 5 で作成するもの）を選んでチャットを開始したときの URL バーの URL が `MCP_IMPL_AGENT_URL` です。
+**エージェント URL の取り方:** ブラウザで M365 Copilot (`https://m365.cloud.microsoft/chat`) を開き、左サイドバーから対象エージェント（STEP 5 で作成）を選んでチャットを開始したときの **URL バーの URL** をコピーして、上記ダイアログの該当欄に貼り付けるだけ。
 
 **各 env 変数の意味まとめ:**
 
