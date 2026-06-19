@@ -644,6 +644,14 @@ class ChatWindow : Window
             string worker = (d.ContainsKey("worker") && d["worker"] != null) ? d["worker"].ToString() : "";
             string transcript = (d.ContainsKey("transcript") && d["transcript"] != null) ? d["transcript"].ToString() : "";
             if (string.IsNullOrEmpty(url) && string.IsNullOrEmpty(worker) && string.IsNullOrEmpty(transcript)) return;
+            // Bring this chat window to the front so a cockpit "▶ 開く" click lands you here without
+            // an alt-tab -- the two-window round-trip was the biggest gap vs Claude Code's one pane.
+            try
+            {
+                if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+                Activate(); Topmost = true; Topmost = false; Focus();
+            }
+            catch { }
             new Thread((ThreadStart)delegate { OpenFromFleet(url, worker, transcript); }) { IsBackground = true }.Start();
         }
         catch { }
