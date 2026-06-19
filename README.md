@@ -379,6 +379,37 @@ Premium / Direct Line を使わず、Copilot エージェントを **手元の�
 
 > 一度登録すれば、2 回目以降は **`start_all.bat` をダブルクリック**するだけ（サーバー＋トンネル＋専用 Edge＋bridge＋UI を冪等に一括起動。STEP 8 参照）。
 
+#### クリックだけで進む流れ（初回）
+
+`quickstart.bat` をダブルクリックすると、以下を**順にガイド**します。コマンド入力は不要、**手作業は STEP 5 の Copilot Studio だけ**です。
+
+```
+quickstart.bat（ダブルクリック）
+  1. Python 環境を自動構築（uv で管理者不要・要ネット）
+  2. Bearer トークン / アンロックパスワードを表示（.env 自動生成）   ← メモする
+  3. git 更新確認（zip 配布で .git が無ければ自動スキップ）
+  4. setup_devtunnel.ps1：CLI 導入(winget→直接DL) → サインイン(ブラウザ→device-code)
+       → トンネル作成 → 公開 URL を表示                              ← サインインをポチポチ
+  5. ★ここで一時停止★ Copilot Studio で MCP コネクタ登録＋エージェント作成（唯一の手作業）
+  6. エージェント URL ダイアログが自動で開く → URL を貼って保存       ← コピペ
+  7. start_all.bat 相当で全部起動（サーバー＋トンネル＋Edge×2＋bridge＋UI）
+```
+
+途中で別 PC・別ターミナルが要ることはありません。**全部 1 つの黒い窓＋ダイアログ＋サインイン画面**で完結します。
+
+#### 何が・どこに保存されるか（重要）
+
+「設定値」は全部 `.env` に集約されますが、「サインイン状態」は性質上 `.env` に入れられません（盗まれると困る認証情報なので、入れないのが正しい）。**別 PC に移すときは、設定は `.env` ごとコピーで済みますが、サインインは各 PC で 1 回ずつやり直し**になります。
+
+| 保存先 | 中身 | 別 PC へ持ち運べる？ |
+|---|---|---|
+| **`.env`**（git 管理外） | `MCP_API_KEY` / `MCP_UNLOCK_PASSWORD`（秘密）、`MCP_*_AGENT_URL`（エージェント URL）、`MCP_TUNNEL_NAME` / `MCP_TUNNEL_URL`、ポート類 | ✅ ファイルをコピーすれば設定はそのまま |
+| **専用 Edge プロファイル** `copilot-companion-edge`(:9222) / `copilot-bridge-edge`(:9223) | M365 への**サインイン状態（Cookie）** | ❌ 各 PC で初回 1 回サインイン |
+| **devtunnel** のローカルトークン | Dev Tunnel への**ログイン状態** | ❌ 各 PC で 1 回 `setup_devtunnel.ps1`（サインイン） |
+| **Copilot Studio**（クラウド） | エージェント本体・MCP コネクタ登録 | ☁ クラウド側に 1 個作れば全 PC 共通。URL を `.env` に貼るだけ |
+
+> つまり **「設定は全部 env、サインインだけ各 PC で初回ポチポチ」**。クリーンインストールした Windows に USB の zip で入れても、**ネット接続と M365 Copilot ライセンスさえあれば**この手順でセットアップできます（Python は uv が管理者不要で入れ、devtunnel は直接 DL、WPF UI は Windows 同梱の `csc.exe` でビルド。`pip install -r requirements.txt` に必要パッケージは全部入っています）。
+
 ---
 
 ### STEP 0 ─ 前提条件を確認する
