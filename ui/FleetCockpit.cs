@@ -536,6 +536,17 @@ class CockpitWindow : Window
             { e.Handled = true; StartFleet(); }
         };
         Grid.SetColumn(_goalInput, 0); grid.Children.Add(_goalInput);
+        // Placeholder hint advertising slash commands + how to start (the goal box had no visible
+        // hint and its slash palette was invisible until you typed "/"). (friction #8)
+        var goalHint = new TextBlock
+        {
+            Text = T("goalhint") + (_lang == 0 ? "  ·「/」でコマンド" : "  · \"/\" for commands"),
+            IsHitTestVisible = false, FontSize = 12.5, Foreground = Muted,
+            Margin = new Thickness(13, 9, 12, 0), VerticalAlignment = VerticalAlignment.Top,
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+        Grid.SetColumn(goalHint, 0); grid.Children.Add(goalHint);
+        _goalInput.TextChanged += delegate { goalHint.Visibility = string.IsNullOrEmpty(_goalInput.Text) ? Visibility.Visible : Visibility.Collapsed; };
 
         var rightCol = new StackPanel();
         rightCol.Margin = new Thickness(10, 0, 0, 0);
