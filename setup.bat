@@ -79,7 +79,7 @@ if not exist "!UVEXE!" (
     echo       python-3.12.x-amd64.exe /passive InstallAllUsers=0 PrependPath=1
     echo   Then re-run setup.bat to continue from where it stopped.
     echo.
-    exit /b 1
+    set "RC=1" & goto :done
 )
 
 :use_uv
@@ -98,11 +98,23 @@ echo ACTION NEEDED: 'uv' was installed but creating .venv failed.
 echo   Run manually, then re-run setup.bat:
 echo       "!UVEXE!" venv .venv
 echo.
-exit /b 1
+set "RC=1" & goto :done
 
 :have_python
 REM Hand off to the real, resumable logic. %* forwards --status / --reset / --only.
 echo Using Python interpreter: !PYEXE!
 !PYEXE! scripts\bootstrap.py %*
 set "RC=%ERRORLEVEL%"
+goto :done
+
+:done
+REM When double-clicked standalone, hold the window open so the output is
+REM readable (a 2nd run finishes in <1s, which otherwise flashes shut). When
+REM CALLed from quickstart.bat (FROM_QUICKSTART=1), skip -- quickstart pauses.
+if not defined FROM_QUICKSTART (
+    echo.
+    echo Bootstrap finished ^(exit code %RC%^). This window stays open so you can
+    echo read the output above. Press any key to close.
+    pause >nul
+)
 endlocal & exit /b %RC%

@@ -468,12 +468,16 @@ git clone https://github.com/MasayukiTa/m365-copilot-companion-mcp.git
 
 ダイアログの 4 欄:
 
-| 欄 | env 変数 | 何の URL か |
-|---|---|---|
-| メイン エージェント **(必須)** | `MCP_IMPL_AGENT_URL` | チャット＆フリートが操作する主エージェント |
-| フリート用 (任意) | `MCP_FLEET_AGENT_URL` | 並列実行用。空ならメインと同じ |
-| リサーチ用 (任意) | `MCP_RESEARCHER_AGENT_URL` | `/research` が使う調査エージェント |
-| アナリスト用 (任意) | `MCP_ANALYST_AGENT_URL` | `/analyze` が使う分析エージェント |
+| 欄 | env 変数 | 何の URL か | 既定値 |
+|---|---|---|---|
+| メイン エージェント **(必須)** | `MCP_IMPL_AGENT_URL` | チャット＆フリートが操作する主エージェント（テナント固有 `T_…`） | なし。**必ず貼る** |
+| フリート用 (任意) | `MCP_FLEET_AGENT_URL` | 並列実行用。空ならメインと同じ | なし（=メイン） |
+| リサーチ用 (任意) | `MCP_RESEARCHER_AGENT_URL` | `/research` が使う調査エージェント（Researcher `…dr_work`） | **内蔵・通常は空でOK** |
+| アナリスト用 (任意) | `MCP_ANALYST_AGENT_URL` | `/analyze` が使う分析エージェント（Analyst `…diceberry`） | **内蔵・通常は空でOK** |
+
+> **実質「メイン エージェント」だけ貼れば動きます。** リサーチ用とアナリスト用は Microsoft 第一者エージェント（全ユーザー共通の Researcher / Analyst）なので、コード側に既定 URL を内蔵しており**通常は設定不要**です。リサーチとアナリストは互いに**別 URL**（別エージェント）で、同じにはなりません。
+>
+> もし自分のテナントで既定 URL のエージェントが開けなかった場合は、`/research` や `/analyze` 実行時に**「このエージェントが開けませんでした。正しい URL を貼り付けてください」というダイアログが自動で開く**ので、M365 Copilot のアドレスバーの URL を貼れば `.env` に保存され、次回からそれが使われます（＝**既定値で試し、つながらなければダイアログ**）。
 
 > `quickstart.bat`（STEP 1）の流れの中でも、Copilot Studio でエージェントを作った直後にこのダイアログが自動で開きます。まだ無い欄は空のままでよく、後から `configure_env.bat` で追加できます。
 

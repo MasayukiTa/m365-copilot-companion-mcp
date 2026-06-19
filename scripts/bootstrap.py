@@ -183,7 +183,7 @@ def step_gen_env() -> None:
     unlock_pw = secrets.token_hex(8)      # 16 hex chars
 
     if example.exists():
-        lines = example.read_text(encoding="utf-8").splitlines()
+        lines = example.read_text(encoding="utf-8-sig").splitlines()
     else:
         lines = [
             "MCP_API_KEY=replace",
@@ -323,7 +323,10 @@ def _read_env_value(key: str) -> str | None:
     env_path = ROOT / ".env"
     if not env_path.exists():
         return None
-    for line in env_path.read_text(encoding="utf-8").splitlines():
+    # utf-8-sig tolerates a leading BOM: a .env saved by PowerShell's `Set-Content
+    # -Encoding UTF8` (PS 5.1) starts with EF BB BF, which plain utf-8 would fold into
+    # the first key name ("﻿MCP_API_KEY") and make this reader miss it.
+    for line in env_path.read_text(encoding="utf-8-sig").splitlines():
         s = line.strip()
         if s.startswith(key + "="):
             return s.split("=", 1)[1].strip()
@@ -417,7 +420,10 @@ def step_verify() -> None:
 def _load_dotenv_into_env(env_path: Path) -> None:
     if not env_path.exists():
         return
-    for line in env_path.read_text(encoding="utf-8").splitlines():
+    # utf-8-sig tolerates a leading BOM: a .env saved by PowerShell's `Set-Content
+    # -Encoding UTF8` (PS 5.1) starts with EF BB BF, which plain utf-8 would fold into
+    # the first key name ("﻿MCP_API_KEY") and make this reader miss it.
+    for line in env_path.read_text(encoding="utf-8-sig").splitlines():
         s = line.strip()
         if not s or s.startswith("#") or "=" not in s:
             continue
