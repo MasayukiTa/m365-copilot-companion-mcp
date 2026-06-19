@@ -240,6 +240,10 @@ class ChatWindow : Window
             }
             if (e.Key == Key.V && (Keyboard.Modifiers & ModifierKeys.Control) != 0 && Clipboard.ContainsImage())
             { e.Handled = true; PasteImage(); return; }
+            // Esc interrupts a streaming reply, the way Claude-Code users expect (the Send button
+            // also doubles as Stop, but Esc is the muscle-memory gesture).
+            if (e.Key == Key.Escape && _generating)
+            { e.Handled = true; try { if (_activeReq != null) _activeReq.Abort(); } catch { } return; }
             if (e.Key == Key.Enter && (Keyboard.Modifiers & ModifierKeys.Shift) == 0) { e.Handled = true; DoSend(); }
         };
         _input.TextChanged += delegate { UpdateCmdPopup(); };
@@ -1668,7 +1672,7 @@ class ChatWindow : Window
         _pendingOuter = outer;
         _pendingContent.Children.Add(MakeTyping());   // <- the sibling app waiting indicator, shown immediately
         _pendingText = null; _started = false;
-        _generating = true; _send.Content = T("stop"); _send.IsEnabled = true;   // _send now acts as Stop
+        _generating = true; _send.Content = "■ " + T("stop"); _send.IsEnabled = true;   // distinct from Send; _send now acts as Stop (also Esc)
         SetRef(_statusDot, BackgroundProperty, "Accent");
         new Thread((ThreadStart)delegate { Stream(text); }) { IsBackground = true }.Start();
         ClearChips();   // the attached file(s) go with this message; reset the chip row
