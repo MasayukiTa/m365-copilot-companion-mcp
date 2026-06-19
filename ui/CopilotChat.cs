@@ -294,6 +294,15 @@ class ChatWindow : Window
 
         LoadConversations();
         Loaded += delegate { _input.Focus(); };
+        // Window-level Esc -> interrupt a streaming reply, REGARDLESS of focus. The input-level
+        // handler only fires when the box is focused, but mid-stream focus is usually elsewhere, so
+        // Esc was falling through to the sidebar (it navigated to "新しいチャット" instead of stopping).
+        // PreviewKeyDown tunnels from the window down, so this fires first and swallows the key.
+        PreviewKeyDown += delegate (object s, KeyEventArgs e)
+        {
+            if (e.Key == Key.Escape && _generating)
+            { e.Handled = true; try { if (_activeReq != null) _activeReq.Abort(); } catch { } }
+        };
 
         // ① watch for the cockpit asking to open a parallel-task conversation here, and
         // sync the session-shared conversation registry (fleet + chat conversations).
@@ -1024,7 +1033,12 @@ class ChatWindow : Window
             // Delete is now PERSISTENTLY visible (not hover-only) so it is discoverable; rename
             // rides a right-click menu on the same visible icon (and still on the row). An
             // empty/untitled new chat has nothing to act on, so it shows no actions. (friction #17)
-            bool actionable = cc.Messages.Count > 0 || !string.IsNullOrEmpty(cc.ConvUrl);
+            // A conversation is actionable (deletable/renamable) if it is a REAL saved conversation
+            // -- which includes registry/fleet convs that have a title but an empty conv_url (the new
+            // agent never captured one). Keying only on messages/conv_url hid the trash icon for the
+            // whole top section of the sidebar; a title is the reliable "this is a real chat" signal.
+            bool actionable = cc.Messages.Count > 0 || !string.IsNullOrEmpty(cc.ConvUrl)
+                              || !string.IsNullOrEmpty(cc.Title);
             trash.Visibility = actionable ? Visibility.Visible : Visibility.Collapsed;
             var trMenu = new ContextMenu();
             var trRename = new MenuItem { Header = T("rename") };
@@ -1058,7 +1072,24 @@ class ChatWindow : Window
             _messages.Children.Add(note);
             RefreshConvList();
             string url = c.ConvUrl;
-            new Thread((ThreadStart)delegate { OpenFromFleet(url, ""); }) { IsBackground = true }.Start();
+            new Thread((ThreadStart)delegate { OpenFromFleet(url, c.Title ?? ""); }) { IsBackground = true }.Start();
+            return;
+        }
+        // No local messages AND no conv_url -> there's nothing to fetch (a fleet conversation whose
+        // URL was never captured). Show a clear, actionable note instead of a blank pane: the full
+        // transcript IS reachable from the cockpit card (which resolves it by worker/transcript).
+        if (c.Messages.Count == 0)
+        {
+            var note = new TextBlock
+            {
+                Text = _lang == 0
+                    ? "この会話の本文はここからは取得できません。\n並列タスクの全文は、コックピットの該当カード（▶ 開く）から開くと表示されます。"
+                    : "This conversation's body isn't fetchable here.\nOpen it from its cockpit card (▶ Open) to see the full transcript.",
+                FontSize = 12.5, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(2, 2, 2, 10)
+            };
+            SetRef(note, TextBlock.ForegroundProperty, "Muted");
+            _messages.Children.Add(note);
+            RefreshConvList();
             return;
         }
         foreach (var m in c.Messages) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
