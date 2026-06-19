@@ -22,6 +22,17 @@ function Port-Up([int]$p) {
 function Http-Up([string]$url) {
     try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 $url | Out-Null; return $true } catch { return $false }
 }
+function Env-Value([string]$key) {
+    # read a value from .env (so the Dev Tunnel name from setup_devtunnel.ps1 propagates here)
+    try {
+        $p = Join-Path $root ".env"
+        if (Test-Path $p) {
+            $m = (Get-Content $p | Where-Object { $_ -match "^\s*$([regex]::Escape($key))\s*=" } | Select-Object -First 1)
+            if ($m) { return ($m -replace "^\s*$([regex]::Escape($key))\s*=\s*", "").Trim() }
+        }
+    } catch { }
+    return ""
+}
 
 Write-Host "=== Daily startup (idempotent -- already-running parts are left as-is) ==="
 
@@ -31,9 +42,13 @@ Write-Host "=== Daily startup (idempotent -- already-running parts are left as-i
 if (Proc-Running 'supervisor\.ps1') {
     Write-Host "[1/4] supervisor (MCP server + tunnel): already running -- left as-is"
 } else {
-    Write-Host "[1/4] supervisor (MCP server + tunnel): starting"
-    Start-Process powershell -WindowStyle Hidden -ArgumentList @(
-        "-NoProfile","-ExecutionPolicy","Bypass","-File","$root\supervisor.ps1")
+    # pass the tunnel name from .env (setup_devtunnel.ps1 writes MCP_TUNNEL_NAME) so a machine with
+    # its own tunnel name hosts the right one instead of the hardcoded default.
+    $tn = Env-Value "MCP_TUNNEL_NAME"
+    $supArgs = @("-NoProfile","-ExecutionPolicy","Bypass","-File","$root\supervisor.ps1")
+    if ($tn) { $supArgs += @("-TunnelName", $tn); Write-Host "[1/4] supervisor (MCP server + tunnel '$tn'): starting" }
+    else     { Write-Host "[1/4] supervisor (MCP server + tunnel): starting" }
+    Start-Process powershell -WindowStyle Hidden -ArgumentList $supArgs
 }
 
 # 2) Companion Edge :9222 (the fleet / agent Edge). Idempotent launcher; skip if the port answers.
