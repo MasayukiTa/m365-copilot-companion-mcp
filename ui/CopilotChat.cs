@@ -244,6 +244,17 @@ class ChatWindow : Window
         };
         _input.TextChanged += delegate { UpdateCmdPopup(); };
         Grid.SetColumn(_input, 0); bar.Children.Add(_input);
+        // Placeholder hint advertising slash commands (WPF TextBox has no native placeholder). The
+        // single most Claude-Code-defining feature was invisible until you happened to type "/".
+        var inputHint = new TextBlock
+        {
+            Text = _lang == 0 ? "メッセージを入力 …   「/」でコマンド" : "Type a message …   \"/\" for commands",
+            IsHitTestVisible = false, FontSize = 13.5, Margin = new Thickness(15, 0, 0, 0),
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        SetRef(inputHint, TextBlock.ForegroundProperty, "Muted");
+        Grid.SetColumn(inputHint, 0); bar.Children.Add(inputHint);
+        _input.TextChanged += delegate { inputHint.Visibility = string.IsNullOrEmpty(_input.Text) ? Visibility.Visible : Visibility.Collapsed; };
         BuildCmdPopup();
         _send = Btn(T("send"), "Accent", "AccentFg", false);
         _send.Width = 92; _send.Margin = new Thickness(8, 0, 0, 0); _send.FontWeight = FontWeights.SemiBold; _send.MinHeight = 50;
@@ -1002,15 +1013,21 @@ class ChatWindow : Window
             {
                 Content = "", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 13,
                 Width = 32, Height = 36, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
-                Cursor = Cursors.Hand, Visibility = Visibility.Hidden, ToolTip = T("delete")
+                Cursor = Cursors.Hand, ToolTip = T("delete")
             };
             SetRef(trash, ForegroundProperty, "Muted");
             trash.Click += delegate { ShowDeleteBanner(cc); };
+            // Delete is now PERSISTENTLY visible (not hover-only) so it is discoverable; rename
+            // rides a right-click menu on the same visible icon (and still on the row). An
+            // empty/untitled new chat has nothing to act on, so it shows no actions. (friction #17)
+            bool actionable = cc.Messages.Count > 0 || !string.IsNullOrEmpty(cc.ConvUrl);
+            trash.Visibility = actionable ? Visibility.Visible : Visibility.Collapsed;
+            var trMenu = new ContextMenu();
+            var trRename = new MenuItem { Header = T("rename") };
+            trRename.Click += delegate { _renamingId = cc.Id; RefreshConvList(); };
+            trMenu.Items.Add(trRename); trash.ContextMenu = trMenu;
             Grid.SetColumn(trash, 1); rowGrid.Children.Add(trash);
             rowBorder.Child = rowGrid;
-            // empty/untitled new chat is not a deletable target -> never reveal its trash
-            rowBorder.MouseEnter += delegate { if (cc.Messages.Count > 0 || !string.IsNullOrEmpty(cc.ConvUrl)) trash.Visibility = Visibility.Visible; };
-            rowBorder.MouseLeave += delegate { trash.Visibility = Visibility.Hidden; };
             _convList.Children.Add(rowBorder);
         }
     }
