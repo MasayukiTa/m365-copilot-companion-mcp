@@ -24,6 +24,32 @@ produced no report (a transient WSL/Docker wedge) were re-graded and are all gen
 (predicted barefoot range ~30-80%). Reference: SICA ~53% on SWE-bench — barefoot single-shot
 already overlaps it.
 
+## Scaling batch (n=8 fresh, reliable harness) + pooled barefoot
+
+Second fresh slice (NOT in holdout/burned/clean12), run with the hardened eval (report.json
+marker + EVAL_ERROR), 2026-06-15:
+
+| repo | pass@1 |
+|------|--------|
+| pytest | 2/2 |
+| astropy | 1/2 |
+| sphinx | 1/2 |
+| xarray | **EVAL_ERROR ×2 — excluded** (env fails to build on this WSL host; NOT a code miss) |
+| **gradeable total** | **4/6 = 67%** |
+
+**The hardened harness validated itself in production:** both xarray evals failed to produce a
+report (host/env wedge). The OLD code would have scored them 2 false NOTs (→ 4/8 = 50%, an
+undercount); the new code flagged them EVAL_ERROR and excluded them (→ true 4/6 = 67%). This is
+exactly the confound that produced the bogus research-ON 0/12. C: stayed healthy (6.9–7.1 GB)
+throughout — bounded swap held; no disk-exhaustion.
+
+**Pooled barefoot single-shot (clean12 OFF + this batch, all fresh non-overlapping, research-OFF):
+8/18 = 44%.** 95% Wilson CI ≈ [25%, 65%] — still wide (n=18), but centered in the predicted
+30–80% band and overlapping SICA's ~53%. Tightening to a publishable CI needs n≈50–100+, which is
+why the next step is the **parallel fleet path** (continuous disk-floor admission) rather than the
+sequential runner used here. Known gap: xarray is ungradeable on this host until its eval env is
+fixed.
+
 ## Contrast with the loop-inclusive number (the confound made explicit)
 
 | protocol | value |
