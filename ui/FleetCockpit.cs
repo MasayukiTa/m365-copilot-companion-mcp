@@ -2062,11 +2062,20 @@ class CockpitWindow : Window
             col.Children.Add(g);
         }
 
-        // Heavy detail (live progress quote + steer TextBox) ONLY when expanded. This is the
-        // whole point: a collapsed fleet of 100+ tasks builds no quotes and no input controls,
-        // and -- via Sig() -- doesn't even re-render while a collapsed worker streams.
+        // Heavy detail (mini-chat + live progress quote + steer TextBox) ONLY when expanded. This
+        // is the whole point: a collapsed fleet of 100+ tasks builds no quotes and no input
+        // controls, and -- via Sig() -- doesn't even re-render while a collapsed worker streams.
         if (isOpen)
         {
+            // #14 mini-chat: the last few turns from the worker's disk transcript, so you can read
+            // recent context AND steer from the cockpit card without switching to the chat window.
+            // Collapsed cards (the default) build none of this -- minimized by default, as asked.
+            string tpath = S(w, "transcript");
+            if (!string.IsNullOrEmpty(tpath))
+            {
+                var mini = MiniThread(tpath);
+                if (mini != null) col.Children.Add(mini);
+            }
             string body = !string.IsNullOrEmpty(last) ? last : reason;
             if (!string.IsNullOrEmpty(body))
             {
@@ -2101,6 +2110,66 @@ class CockpitWindow : Window
         card.MouseLeftButtonUp += delegate { OpenWorker(wname, url); };
         card.ToolTip = _lang == 0 ? "クリックでこの会話をメインに表示" : "Click to open this conversation in the chat";
         return card;
+    }
+
+    // #14 mini-chat: the last few turns of a worker's disk transcript, as a compact scrollable
+    // thread inside the EXPANDED card -- read recent context + steer from the cockpit without
+    // switching to the chat window. Null when the transcript is empty/missing. Only expanded cards
+    // call this, so the I/O is bounded to the one or two cards the user opened.
+    UIElement MiniThread(string transcriptPath)
+    {
+        var turns = ReadLastTurns(transcriptPath, 4);
+        if (turns.Count == 0) return null;
+        var panel = new StackPanel();
+        foreach (var t in turns)
+        {
+            bool user = t.Item1 == "U";
+            var b = new Border { Background = QuoteBg, CornerRadius = new CornerRadius(6),
+                                 Padding = new Thickness(10, 7, 10, 7), Margin = new Thickness(0, 0, 0, 5) };
+            var sp = new StackPanel();
+            var who = new TextBlock { Text = user ? "▶ 指示 / あなた" : "● エージェント", FontSize = 11,
+                                      FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 3) };
+            who.Foreground = user ? Accent : Muted;
+            sp.Children.Add(who);
+            var tb = new TextBox { Text = t.Item2, FontSize = 12, IsReadOnly = true,
+                                   BorderThickness = new Thickness(0), Background = Brushes.Transparent,
+                                   Padding = new Thickness(0), IsTabStop = false, TextWrapping = TextWrapping.Wrap,
+                                   MaxHeight = 90, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+            tb.Foreground = Fg;
+            SwallowMouseUp(tb);
+            sp.Children.Add(tb);
+            b.Child = sp;
+            panel.Children.Add(b);
+        }
+        return new ScrollViewer { MaxHeight = 240, VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                                  Content = panel, Margin = new Thickness(0, 6, 0, 6) };
+    }
+
+    // Last `n` (role, text) turns from a jsonl transcript (skips meta / guid marker lines).
+    List<Tuple<string, string>> ReadLastTurns(string path, int n)
+    {
+        var all = new List<Tuple<string, string>>();
+        try
+        {
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return all;
+            string[] lines;
+            using (var fsr = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var sr = new StreamReader(fsr, Encoding.UTF8))
+                lines = sr.ReadToEnd().Replace("\r", "").Split('\n');
+            foreach (var ln in lines)
+            {
+                if (string.IsNullOrEmpty(ln)) continue;
+                Dictionary<string, object> o;
+                try { o = _js.DeserializeObject(ln) as Dictionary<string, object>; } catch { continue; }
+                if (o == null || !o.ContainsKey("role")) continue;
+                string role = o["role"] != null ? o["role"].ToString() : "assistant";
+                string text = (o.ContainsKey("text") && o["text"] != null) ? o["text"].ToString() : "";
+                all.Add(Tuple.Create(role.StartsWith("user") ? "U" : "A", text));
+            }
+        }
+        catch { }
+        if (all.Count > n) all = all.GetRange(all.Count - n, n);
+        return all;
     }
 
     // ② steering: inject a mid-task instruction into this worker's conversation.
