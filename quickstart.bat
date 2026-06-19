@@ -77,8 +77,42 @@ if errorlevel 1 (
 
 echo.
 echo ===========================================================================
-echo  STEP 4/4  Starting the MCP server  (Ctrl+C to stop)
+echo  STEP 4/7  Dev Tunnel  (install + sign-in + tunnel + public URL)
+echo ===========================================================================
+echo   Installs the devtunnel CLI (winget or direct download), signs you in
+echo   (browser or device code), creates the tunnel, and prints the PUBLIC URL.
+echo.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup_devtunnel.ps1"
+
+echo.
+echo ===========================================================================
+echo  STEP 5/7  Copilot Studio  (the ONLY manual, by-hand step)
+echo ===========================================================================
+echo   In Copilot Studio: add an MCP connector using the PUBLIC URL printed
+echo   above + your Bearer token (MCP_API_KEY, shown in STEP 2), then create
+echo   your companion agent. See README STEP 4 and STEP 5.
+echo   Then open that agent in M365 Copilot and copy its address-bar URL --
+echo   you will paste it into a dialog in the next step.
+echo.
+echo   Press any key AFTER you have created the agent in Copilot Studio...
+pause >nul
+
+echo.
+echo ===========================================================================
+echo  STEP 6/7  Paste your agent URLs  (a dialog window opens)
+echo ===========================================================================
+echo   Paste the agent URL(s) into the dialog and click Save. Leave blank any
+echo   you do not have yet -- you can re-run configure_env.bat later to add them.
+echo.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0configure_env.ps1"
+
+echo.
+echo ===========================================================================
+echo  STEP 7/7  Launch the whole stack  (server + tunnel + Edge + bridge + UI)
 echo ===========================================================================
 echo.
-%PYEXE% main.py
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0start_all.ps1"
+echo.
+echo Done. From now on, daily startup is just a double-click of start_all.bat.
+pause
 endlocal
