@@ -36,6 +36,8 @@ class Conversation
     public string ConvUrl = "";
     public string Source = "";
     public double Ts = 0;
+    public string Transcript = "";   // disk jsonl path (fleet convs) -> open from disk, no scrape
+    public string Name = "";         // worker name (fallback to resolve the transcript by name)
     public List<Msg> Messages = new List<Msg>();
     public bool Untitled() { return string.IsNullOrEmpty(Title); }
 }
@@ -616,6 +618,8 @@ class ChatWindow : Window
                     c.ConvUrl = url;
                     c.Title = SS(d, "title");
                     c.Source = SS(d, "source");
+                    c.Transcript = SS(d, "transcript");   // disk jsonl -> open from disk, no scrape
+                    c.Name = SS(d, "name");
                     try { c.Ts = (d.ContainsKey("ts") && d["ts"] != null) ? Convert.ToDouble(d["ts"]) : 0; }
                     catch { c.Ts = 0; }
                     _all.Insert(0, c);   // newest on top (registry/fleet convs were appended below)
@@ -1096,6 +1100,22 @@ class ChatWindow : Window
     {
         _conv = c;
         _messages.Children.Clear();
+        // FIRST: the disk transcript. Reading the .jsonl is instant and works regardless of which
+        // agent the bridge is currently on -- this is what actually makes a past FLEET chat openable.
+        // The old path re-scraped live via the bridge, which times out for any conversation whose
+        // agent the bridge isn't connected to (every registered conv was from a previous agent), so
+        // NOT ONE past chat was retrievable. conv_url scrape is now only a last resort.
+        if (c.Messages.Count == 0)
+        {
+            string tp = !string.IsNullOrEmpty(c.Transcript) ? c.Transcript
+                        : (!string.IsNullOrEmpty(c.Name) ? NewestTranscriptForWorker(c.Name) : "");
+            if (!string.IsNullOrEmpty(tp))
+            {
+                var tm = ReadTranscript(tp);
+                AppendSubAgentTranscripts(tm, tp);
+                foreach (var mm in tm) c.Messages.Add(mm);
+            }
+        }
         // a registry/fleet conversation we haven't loaded yet -> pull it via /history
         if (c.Messages.Count == 0 && !string.IsNullOrEmpty(c.ConvUrl))
         {
