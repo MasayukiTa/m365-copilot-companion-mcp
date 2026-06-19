@@ -1945,6 +1945,19 @@ class CockpitWindow : Window
         // right cluster first (DockPanel right docks)
         var right = new StackPanel(); right.Orientation = Orientation.Horizontal;
         right.HorizontalAlignment = HorizontalAlignment.Right;
+        // Explicit, VISIBLE "open in chat" affordance. The whole card is clickable but that reads
+        // as plain text (the only hint was a tooltip), so opening the conversation was undiscoverable.
+        {
+            var openLink = new TextBlock();
+            openLink.Text = _lang == 0 ? "▶ 開く" : "▶ Open";
+            openLink.Foreground = Accent; openLink.FontSize = 12; openLink.FontWeight = FontWeights.SemiBold;
+            openLink.VerticalAlignment = VerticalAlignment.Center; openLink.Cursor = Cursors.Hand;
+            openLink.Margin = new Thickness(0, 0, 12, 0);
+            openLink.ToolTip = _lang == 0 ? "この会話をメインチャットで開く" : "Open this conversation in the chat";
+            string onm = name; string ourl = conv;
+            openLink.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; OpenWorker(onm, ourl); };
+            right.Children.Add(openLink);
+        }
         var turns = new TextBlock();
         turns.Text = T("turn") + " " + turn;
         turns.Foreground = Muted; turns.FontSize = 12;
@@ -2492,8 +2505,15 @@ class CockpitWindow : Window
     // else the first non-boilerplate line), trimmed so long goal text never wrecks readability.
     string CardTitle(string convTitle, string goal)
     {
-        if (!string.IsNullOrEmpty(convTitle)) return Trunc(convTitle, 90);
-        if (string.IsNullOrEmpty(goal)) return "";
+        // A generic Copilot auto-title ("会話" / "Chat" / "新しいチャット") carries no information,
+        // so prefer the goal-derived heading -- otherwise every SWE worker card just reads "会話"
+        // and w0..w7 are indistinguishable at a glance.
+        string ct = (convTitle ?? "").Trim();
+        bool genericCt = ct.Length <= 4 || ct == "会話" || ct == "新しいチャット"
+                         || ct.Equals("Chat", StringComparison.OrdinalIgnoreCase)
+                         || ct.Equals("New chat", StringComparison.OrdinalIgnoreCase);
+        if (!string.IsNullOrEmpty(ct) && !genericCt) return Trunc(ct, 90);
+        if (string.IsNullOrEmpty(goal)) return string.IsNullOrEmpty(ct) ? "" : Trunc(ct, 90);
         string[] lines = goal.Replace("\r", "").Split('\n');
         for (int i = 0; i < lines.Length; i++)
         {
