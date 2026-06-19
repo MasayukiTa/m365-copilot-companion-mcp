@@ -2033,9 +2033,56 @@ class ChatWindow : Window
             }
         }
         catch { }
+        DiscoverTranscripts();   // surface every fleet worker's disk transcript as a past chat
         if (_all.Count > 0) { _conv = _all[0]; foreach (var m in _conv.Messages) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); } }
         else { _conv = new Conversation(); _all.Add(_conv); }
         RefreshConvList();
+    }
+
+    // Surface every fleet worker's disk transcript as a sidebar conversation, so PAST chats are
+    // browsable straight from disk. The old path re-scraped live via the bridge, which fails for any
+    // conversation whose agent the bridge is not on -> not one past chat was retrievable. Newest
+    // first, capped so a huge dir doesn't flood the list; dedup by transcript path; sub-agent
+    // (research) child transcripts are skipped (they nest under their parent on open).
+    void DiscoverTranscripts()
+    {
+        try
+        {
+            string tdir = Path.Combine(Path.GetDirectoryName(_convsPath), "transcripts");
+            if (!Directory.Exists(tdir)) return;
+            var files = new List<string>(Directory.GetFiles(tdir, "*.jsonl"));
+            files.Sort(delegate (string a, string b) { return File.GetLastWriteTimeUtc(b).CompareTo(File.GetLastWriteTimeUtc(a)); });
+            int budget = 80;
+            foreach (var f in files)
+            {
+                if (budget-- <= 0) break;
+                if (f.IndexOf("__sub_", StringComparison.Ordinal) >= 0) continue;   // research children
+                bool exists = false;
+                foreach (var c in _all) if (c.Transcript == f) { exists = true; break; }
+                if (exists) continue;
+                string goal = "", name = "";
+                try
+                {
+                    using (var sr = new StreamReader(f, Encoding.UTF8))
+                    {
+                        string first = sr.ReadLine();
+                        if (!string.IsNullOrEmpty(first))
+                        {
+                            var meta = _cjs.DeserializeObject(first) as Dictionary<string, object>;
+                            if (meta != null) { goal = SS(meta, "goal"); name = SS(meta, "name"); }
+                        }
+                    }
+                }
+                catch { }
+                string title = goal.Length > 0 ? (goal.Length > 54 ? goal.Substring(0, 54) + "…" : goal)
+                                               : Path.GetFileNameWithoutExtension(f);
+                double ts = 0;
+                try { ts = (File.GetLastWriteTimeUtc(f) - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds; }
+                catch { }
+                _all.Add(new Conversation { Transcript = f, Name = name, Title = title, Source = "fleet", Ts = ts });
+            }
+        }
+        catch { }
     }
 
     string HttpGet(string path) { return HttpGet(path, 60000); }
