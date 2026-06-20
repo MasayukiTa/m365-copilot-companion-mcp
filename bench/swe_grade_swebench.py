@@ -41,6 +41,8 @@ def main():
     ap.add_argument("--max-wait-min", type=int, default=120,
                     help="batch grade ceiling. Full/repo-heavy runs can exceed 60min on first image builds")
     ap.add_argument("--run-id", default=None)
+    ap.add_argument("--dataset-name", default="princeton-nlp/SWE-bench_Lite",
+                    help="swebench dataset to grade against (e.g. princeton-nlp/SWE-bench_Verified)")
     a = ap.parse_args()
 
     want = None
@@ -87,6 +89,7 @@ def main():
     inner = ("systemctl reset-failed " + runid + " 2>/dev/null; rm -f /tmp/gb_" + runid + ".log; "
              "systemd-run --no-block --unit=" + runid + " bash -lc "
              "'python3 " + runner_wsl + " " + preds_wsl + " " + runid + " " + str(a.max_workers)
+             + " " + a.dataset_name
              + " > /tmp/gb_" + runid + ".log 2>&1'")
     launch = ("$j = Start-Job { (wsl.exe -d " + R.DISTRO + " -u root -- bash -lc \"" + inner + "\" 2>$null)"
               " -join '' }; if(Wait-Job $j -Timeout 30){ Receive-Job $j } else { 'TO' }; Remove-Job $j -Force")

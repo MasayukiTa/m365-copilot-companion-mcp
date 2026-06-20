@@ -4,7 +4,7 @@ native parallel evaluator (--max_workers), so each repo's env image is built ONC
 instances run concurrently inside one process -- no per-grade env-image build race. Writes a
 compact result + a .done marker to the Windows-shared verdicts dir for the caller to scp back.
 
-    python3 the eval host_batch_grade.py <predictions.json> <run_id> <max_workers>
+    python3 the eval host_batch_grade.py <predictions.json> <run_id> <max_workers> [dataset_name]
 """
 import glob
 import json
@@ -15,12 +15,13 @@ import sys
 preds_path = sys.argv[1]
 run_id = sys.argv[2]
 max_workers = sys.argv[3] if len(sys.argv) > 3 else "8"
+dataset_name = sys.argv[4] if len(sys.argv) > 4 else "princeton-nlp/SWE-bench_Lite"
 
 workdir = "/tmp/gb_" + run_id
 os.makedirs(workdir, exist_ok=True)
 
 cmd = [sys.executable, "-m", "swebench.harness.run_evaluation",
-       "--dataset_name", "princeton-nlp/SWE-bench_Lite",
+       "--dataset_name", dataset_name,
        "--predictions_path", preds_path,
        "--max_workers", str(max_workers),
        "--run_id", run_id,
