@@ -24,6 +24,11 @@ VENVPY = os.path.join(REPO, ".venv", "Scripts", "python.exe")
 CHECK = os.path.join(REPO, "bench", "swe_check.py")
 WORK = os.path.join(REPO, ".fleet", "swe", "work")
 
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+
+from relay.quality_cards import quality_cards_text
+
 
 def goal_text(lib, wt, ps):
     if len(ps) > 6000:
@@ -106,6 +111,11 @@ def goal_text(lib, wt, ps):
                "要求が警告・メッセージ・戻り値の**表出**なら、それを**出す**修正にせよ——契約が"
                "「ダウングレードして残す」診断を求めているのに黙って抑制すると落ちる。\n"
                "『最小か？』と『症状は完全に消え、関連する全箇所を直したか？』の両方を自問せよ。")
+    # MISS-85 lift (2026-06-20 full Lite run): use the same short adaptive quality
+    # cards as general coding tasks. Keep the old env name for A/B compatibility, but
+    # avoid another SWE-only wall of scaffold text.
+    if os.environ.get("SWE_MISS85_DISCIPLINE", "1") != "0":
+        _t += quality_cards_text(ps, domain="coding")
     return _t
 
 

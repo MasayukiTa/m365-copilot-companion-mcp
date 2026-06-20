@@ -84,7 +84,7 @@ def build_goal(instruction, folder, extra_check=None, no_verify=False,
     # -- the gate IS the project's own auto-detected tests (`checks`), so running the project's
     # failing/relevant tests is fully legitimate and is what we anchor red->green on.
     if checks:
-        text += coding_discipline_text()
+        text += coding_discipline_text(instruction)
     goal = {"text": text, "cwd": folder}
     if checks:
         goal["checks"] = checks

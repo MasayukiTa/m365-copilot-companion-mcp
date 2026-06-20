@@ -545,6 +545,13 @@ def _parse_failure_log(log):
         parts.extend("  " + t for t in tail)
     parts.append("Hint: the same bug pattern often appears in MORE than one place in the file; "
                  "search for every occurrence, not just the first.")
+    # MISS-ANALYSIS (2026-06-20): the largest miss cluster was WRONG-LAYER -- the agent fixed an
+    # adjacent mechanism the failing path never traverses. Additive feedback (decorates an
+    # already-failing verify, can never create a false green); domain-general; names no test.
+    parts.append("Wrong-layer check: confirm the file/function you edited is on the SAME code path "
+                 "as the traceback frame above. If you patched an adjacent mechanism the failing "
+                 "scenario never goes through, the failure persists -- trace symptom->source again "
+                 "and fix the shared callee, not a neighbouring caller.")
     return "\n".join(parts)
 
 

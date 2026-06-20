@@ -1,5 +1,17 @@
 # m365-copilot-companion-mcp
 
+## Current Benchmark Snapshot
+
+- **SWE-bench Lite 300 strong scaffold (2026-06-20): 215/300 = 71.7% pass@1**.
+  Wilson 95% CI: **[66.3%, 76.5%]**.
+- Protocol: solve locally with the general strong scaffold, then grade each produced patch once
+  with the official SWE-bench harness on kiyus. No hidden official-test feedback was fed back into
+  the solve loop.
+- The 85 misses were analyzed and folded back as adaptive, task-general quality cards shared by
+  normal verified coding tasks and SWE-bench goals, rather than as a SWE-only prompt expansion.
+- Recompute and details: `python bench/swe_lite300_scorecard.py` and
+  `bench/SCORECARD_swebench_lite300_strong.md`.
+
 > Microsoft 365 Copilot に **手** を生やすやつ。
 > あなたの貸与ノート PC の上で動く。**100+ ツール**（執筆時点で 117）、
 > 追加課金ゼロ、構築おおむね 1 人日。

@@ -300,6 +300,15 @@ class RefuterSession:
         if self._pending_open:
             from .relay_fleet import ram_room_for_tab
             if self._t_send and time.time() - self._t_send > self.timeout_s:
+                # RAM-STARVED SKIP: the side-page never got a tab within timeout_s, so this
+                # review did NOT run -- the candidate is accepted unreviewed (effective effort
+                # downgrade for THIS instance). Emit a distinct marker so a benchmark can COUNT
+                # how many instances were degraded by tab pressure (vs a genuine reviewer UNCLEAR)
+                # and re-run just those at a lower concurrency. Only fires after a full timeout_s
+                # (default 600s) of never clearing the ram_room floor -- i.e. RAM jammed for 10min.
+                import sys
+                sys.stderr.write("[refuter] RAM_SKIP: no tab within %ds, review SKIPPED (instance "
+                                 "solved without refutation)\n" % int(self.timeout_s))
                 self._finish(("UNCLEAR", ""))
                 return self._done
             if not ram_room_for_tab():
