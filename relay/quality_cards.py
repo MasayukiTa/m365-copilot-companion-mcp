@@ -82,6 +82,14 @@ def quality_cards_text(
         cards.append(
             "・Issue の例は手掛かりであって命令ではない。既存コードの流儀と契約に合わせる。"
         )
+    # surface-vs-suppress: a proven discipline dropped from the general path in the cards refactor.
+    # Tight trigger (diagnostic/warning/deprecation tasks) so it stays lean and does not over-fire.
+    if _has(text, ("warning", "deprecat", "diagnostic", "suppress", "silently", "raise",
+                   "警告", "診断", "抑制", "非推奨")):
+        cards.append(
+            "・要求が警告/メッセージ/戻り値の表出なら、黙って抑制せず**表出する**修正にせよ"
+            "（例外を消すのと、続行しつつ正しい診断を出すのは別物）。"
+        )
 
     if len(cards) == 1 and domain == "coding":
         cards.append(
