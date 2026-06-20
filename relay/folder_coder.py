@@ -173,7 +173,7 @@ def generate_goals(folder, instruction, mode="per-file", exts=None, max_files=20
         # minimal-and-complete discipline. Per-file and review modes are mechanical sweeps /
         # read-only, so they do NOT get it.
         if checks:
-            text += coding_discipline_text()
+            text += coding_discipline_text(instruction)
         return [_wrap(text, checks, folder_disp)]
 
     tpl = _TPL_PER_FILE if mode == "per-file" else _TPL_REVIEW
