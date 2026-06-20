@@ -13,6 +13,13 @@ on top and are measured separately so the gain is attributable, not baked into t
 
 ## Phase 1 — SWE-bench Lite, single-shot pass@1 (IN PROGRESS)
 
+- **Strong scaffold full Lite 300 (2026-06-20)**: decoupled solve locally, official one-shot
+  grading on the eval host. This is NOT the barefoot headline; it measures the current general scaffold
+  (`SWE_STRONG_SELFTEST`, `SWE_MINIMALITY`, `SWE_FIX_RADIUS`) without hidden official-test feedback
+  during solve.
+  - Final: **215/300 = 71.7%**, Wilson 95% CI **[66.3%, 76.5%]**.
+  - Source: `bench/SCORECARD_swebench_lite300_strong.md`; recompute with
+    `python bench/swe_lite300_scorecard.py`.
 - **Barefoot (research OFF)**: `bench/swe_singleshot.py` — agent sees the issue only, NO acceptance
   check during solving (`run_relay checks=None`) → one patch → graded ONCE. No grader-iteration,
   no regression feedback. Fresh slice from `bench/swe_clean_setup.py` (lite_local − holdout − burned).

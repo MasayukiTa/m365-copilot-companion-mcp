@@ -423,6 +423,12 @@ class ResearchSession:
         if self._pending_open:
             from .relay_fleet import ram_room_for_tab
             if self._t_send and time.time() - self._t_send > self.timeout_s:
+                # RAM-STARVED SKIP (see refuter.py): research never got a tab within timeout_s,
+                # so the worker proceeds WITHOUT the requested deep-dive. Distinct marker so a
+                # benchmark can count tab-pressure degradations and re-run those instances cooler.
+                import sys
+                sys.stderr.write("[research] RAM_SKIP: no tab within %ds, deep-dive SKIPPED "
+                                 "(instance solved without research)\n" % int(self.timeout_s))
                 self._finish(""); return self._done
             if not ram_room_for_tab():
                 return None

@@ -284,10 +284,13 @@ def ram_room_for_tab(floor_mb=2000.0) -> bool:
     return avail_phys_mb() >= floor_mb
 
 
-def auto_concurrency(n_goals, per_tab_mb=700, headroom_mb=2048, hard_cap=4):
+def auto_concurrency(n_goals, per_tab_mb=700, headroom_mb=2048, hard_cap=100):
     """How many heavy M365 tabs we can afford open at once, given free RAM right now.
-    Keep `headroom_mb` for the user's other work; budget `per_tab_mb` per Copilot tab;
-    never exceed `hard_cap` (Microsoft per-user fair-use also wants N modest)."""
+    Keep `headroom_mb` for the user's other work; budget `per_tab_mb` per Copilot tab.
+    `hard_cap` is a high upper RAIL (100), NOT a hardware bound: the RAM term (free//per_tab)
+    is the real limiter, so a 16 GB box self-limits to ~3 while a big-RAM machine scales up.
+    A modest run is still wise for M365 Copilot per-user fair-use, but that's a policy choice
+    the operator makes via settings, not a hardcoded ceiling baked in here."""
     fit = int((avail_phys_mb() - headroom_mb) / per_tab_mb)
     return max(1, min(n_goals, fit, hard_cap))
 
@@ -1036,7 +1039,17 @@ class RelayWorker:
         refuter. Admission RESERVES this many tab-slots, so N lean workers can't all be admitted at
         1 tab each and THEN fan out together to 3 tabs each (the balloon that crashed the Edge). For
         an auto/ultra task -- which nearly always researches AND refutes -- the peak IS the typical
-        load, so this is accurate, not merely conservative. min-effort = 1 (no side-pages)."""
+        load, so this is accurate, not merely conservative. min-effort = 1 (no side-pages).
+
+        SWE_SIDEPAGE_RESERVE=0 relaxes this to reserve ONLY the main tab, so auto/ultra tasks
+        PARALLELIZE on a RAM-tight box (a proper benchmark must run at the production effort, not be
+        downgraded to min for throughput). Safe because the side-page open is INDEPENDENTLY
+        ram_room-gated: RefuterSession/ResearchSession.start() defer their new_page() until
+        ram_room_for_tab() clears the ~2 GB floor (refuter.py / agent_profiles.py). So relaxing
+        this risks at worst a transient STALL (a worker waits in 'refuting'/'researching' for RAM),
+        never the balloon crash the peak-reservation was added to prevent."""
+        if os.environ.get("SWE_SIDEPAGE_RESERVE", "1") == "0":
+            return 1
         return 1 + (1 if self.max_research > 0 else 0) + (1 if self.refuter else 0)
 
     def _auto_consent(self):
@@ -1280,6 +1293,29 @@ class RelayWorker:
             return
         if self.no_progress >= self.max_no_progress:
             if self._salvage_via_checks():
+                return
+            # CARD/UI STALL (unrecognized consent / file-op confirm variant). A worker that keeps
+            # repeating a SHORT response and never produced real work is almost always blocked
+            # behind a Copilot UI card whose wording the CONSENT_MARKERS list didn't catch (e.g.
+            # "desktopfile操作 書き込む内容を教えてください" -- no 接続 markers at all). That is an
+            # INFRA block, NOT a coding miss: the agent never got to run a tool. Try auto-consent
+            # once more (some variants still click through), then mark INFRA_STUCK so the
+            # orchestrator RE-ATTEMPTS it rather than scoring it a miss (which would silently
+            # under-count pass@1). Domain-general: keyed on response shape, not instance text.
+            short_loop = len((resp or "").strip()) < 160
+            if short_loop and not self._consent_auto_tried:
+                self._consent_auto_tried = True
+                try:
+                    if self._auto_consent():
+                        self.job = self._task_anchor(RETRY_JOB)
+                        self.reason = "card-stall: auto-consent 再試行"
+                        return
+                except Exception:
+                    pass
+            if short_loop:
+                self.status, self.outcome = "stuck", "INFRA_STUCK"
+                self.reason = ("⚠ 短い同一応答の反復=UIカード(接続consent/ファイル操作確認)でツール呼び出しが"
+                               "阻まれている可能性大。タスク失敗でなく**接続/UI未確立(INFRA)**=再投入対象。")
                 return
             self.status, self.outcome = "stuck", "STUCK"
             self.reason = "no progress for %d turns" % (self.no_progress + 1)
