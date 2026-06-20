@@ -114,8 +114,13 @@ def goal_text(lib, wt, ps):
     # MISS-85 lift (2026-06-20 full Lite run): use the same short adaptive quality
     # cards as general coding tasks. Keep the old env name for A/B compatibility, but
     # avoid another SWE-only wall of scaffold text.
+    # De-dup like the general coding path (coding_discipline.py): the SWE_STRONG_SELFTEST /
+    # SWE_MINIMALITY blocks above ALREADY state exact-output and producer<->consumer, so
+    # suppress those two cards here -- otherwise the SWE prompt re-states the same discipline
+    # twice. Only the genuinely-additive cards (public-API regression guard, wrong-layer,
+    # issue-snippet-as-clue) are kept.
     if os.environ.get("SWE_MISS85_DISCIPLINE", "1") != "0":
-        _t += quality_cards_text(ps, domain="coding")
+        _t += quality_cards_text(ps, domain="coding", include_output=False, include_paired=False)
     return _t
 
 
