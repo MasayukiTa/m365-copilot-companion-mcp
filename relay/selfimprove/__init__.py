@@ -49,6 +49,12 @@ from .policy import (
     evaluate_tripwires,
     run_campaign,
 )
+from .calibration import (
+    calibration_report,
+    competence,
+    recommend_effort,
+    classify_instance,
+)
 from .dashboard import (
     dashboard_state,
     render_text,
@@ -100,4 +106,8 @@ __all__ = [
     "SCAFFOLD_ALLOWLIST",
     "dashboard_state",
     "render_text",
+    "calibration_report",
+    "competence",
+    "recommend_effort",
+    "classify_instance",
 ]
