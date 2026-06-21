@@ -1043,6 +1043,13 @@ class CockpitWindow : Window
             var cmd = ReadCommands();
             cmd["stop"] = true;
             WriteCommands(cmd);
+            // No live fleet to consume the stop (status went stale, e.g. a run was killed and its
+            // last status froze with workers still shown as "running") -> clear every card NOW so the
+            // button is never a no-op. Mirrors the per-card release stale path (search ArchiveAndHide).
+            if (_lastRoot != null
+                && (!_lastRoot.ContainsKey("running") || Convert.ToBoolean(_lastRoot["running"]))
+                && (NowUnix() - Dbl(_lastRoot, "updated")) > 8)
+                ArchiveAllStale();
         };
         group.Children.Add(_stopBtn);
 
@@ -2883,6 +2890,18 @@ class CockpitWindow : Window
         if (_toolbarShown == null) return;
         foreach (Dictionary<string, object> w in new List<Dictionary<string, object>>(_toolbarShown))
             if (IsTerminalWorker(w)) _archiveOne(w);
+        SaveHistory(); SaveHidden(); ForceRender();
+    }
+
+    // Bulk-clear EVERY shown worker -- used by Stop-all when the run has gone STALE (no live fleet to
+    // consume a stop command). Unlike ArchiveAllTerminal this clears non-terminal cards too, because a
+    // stale run's "running" workers are frozen leftovers, not actually executing. Makes Stop-all do
+    // something visible even with the driver dead, instead of silently writing an unread commands.json.
+    void ArchiveAllStale()
+    {
+        if (_toolbarShown == null) return;
+        foreach (Dictionary<string, object> w in new List<Dictionary<string, object>>(_toolbarShown))
+            _archiveOne(w);
         SaveHistory(); SaveHidden(); ForceRender();
     }
 }
