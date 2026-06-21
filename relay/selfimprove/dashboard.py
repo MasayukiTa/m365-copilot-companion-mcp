@@ -28,6 +28,11 @@ _DEFAULT_BURNED = os.path.join(_REPO_ROOT, "relay", "selfimprove", "burned.jsonl
 _DEFAULT_GRADE = os.path.join(_REPO_ROOT, ".fleet", "swe", "grade_results.jsonl")
 _DEFAULT_REPORTS_GLOB = os.path.join(_REPO_ROOT, ".fleet", "swe", "selfimprove_report_*.json")
 
+# Where write_json() drops the stable JSON feed the WPF view (ui/SelfImproveDashboard.cs) tails --
+# the self-improvement analogue of .fleet/status.json. Under the repo root so the cockpit's
+# .fleet-relative pathing finds it next to status.json.
+_DEFAULT_JSON_OUT = os.path.join(_REPO_ROOT, ".fleet", "selfimprove_dashboard.json")
+
 
 # --------------------------------------------------------------------------------------------------
 # Small defensive readers
@@ -240,6 +245,42 @@ def dashboard_state(*, archive_path=None, burned_path=None, grade_results_path=N
     }
 
 
+def write_json(path=None) -> str:
+    """Write ``dashboard_state()`` as pretty (indent=2) JSON to ``path`` and return the path.
+
+    This is the stable feed for the WPF self-improvement view (ui/SelfImproveDashboard.cs), the
+    self-improvement analogue of status.json. ``path`` defaults to ``.fleet/selfimprove_dashboard.json``
+    under the repo root. The parent directory is created if missing.
+
+    READ-ONLY on every ledger (it only WRITES the single output file); never raises. On any error the
+    output is best-effort -- a partially writable filesystem still gets a valid JSON skeleton.
+    """
+    out_path = _DEFAULT_JSON_OUT if path is None else path
+    try:
+        state = dashboard_state()
+    except Exception:
+        state = {"summary": {}, "ab_history": [], "pass1_trend": [],
+                 "burned_ledger": {"total": 0, "by_reason": {}, "recent": []},
+                 "archive": {"count": 0, "genomes": [], "qd_cells": 0}}
+    try:
+        parent = os.path.dirname(out_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        # Write atomically-ish: a temp file then replace, so a tailing reader never sees a half file.
+        tmp = out_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, out_path)
+    except Exception:
+        # Belt-and-suspenders: a write failure must not raise out of a read-only dashboard helper.
+        try:
+            with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(state, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+    return out_path
+
+
 def render_text(state) -> str:
     """Format a ``dashboard_state`` dict as a compact ASCII human scorecard (a few lines)."""
     if not isinstance(state, dict):
@@ -283,14 +324,31 @@ def render_text(state) -> str:
     return "\n".join(lines)
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    """CLI: bare -> the text scorecard; ``--json`` -> ``json.dumps(dashboard_state(), indent=2)``.
+
+    Both modes are defensive: missing data degrades to an empty state and NEVER tracebacks.
+    """
+    import sys
+    args = sys.argv[1:] if argv is None else argv
+    want_json = "--json" in args
+
     try:
         state = dashboard_state()
     except Exception:
         # Belt-and-suspenders: dashboard_state should never raise, but the CLI must never traceback.
-        print("SELF-IMPROVEMENT SCORECARD\n  no data yet")
+        if want_json:
+            print(json.dumps({"summary": {}, "ab_history": [], "pass1_trend": [],
+                              "burned_ledger": {"total": 0, "by_reason": {}, "recent": []},
+                              "archive": {"count": 0, "genomes": [], "qd_cells": 0}}, indent=2))
+        else:
+            print("SELF-IMPROVEMENT SCORECARD\n  no data yet")
         return 0
-    print(render_text(state))
+
+    if want_json:
+        print(json.dumps(state, indent=2, ensure_ascii=False))
+    else:
+        print(render_text(state))
     return 0
 
 

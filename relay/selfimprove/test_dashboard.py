@@ -196,10 +196,41 @@ def test_render_text_handles_garbage():
     print("ok test_render_text_handles_garbage")
 
 
+def test_write_json_writes_valid_feed():
+    # write_json must drop a valid, pretty JSON file carrying the 5 top-level keys, return its
+    # path, create the parent dir if missing, and never raise.
+    with tempfile.TemporaryDirectory() as d:
+        out = os.path.join(d, "sub", "selfimprove_dashboard.json")   # parent does not exist yet
+        ret = D.write_json(out)
+        assert ret == out
+        assert os.path.isfile(out)
+        with open(out, encoding="utf-8") as f:
+            obj = json.load(f)                                       # must be valid JSON
+        assert set(obj.keys()) == {"summary", "ab_history", "pass1_trend", "burned_ledger", "archive"}
+        # pretty-printed (indent=2) -> multi-line with leading spaces, not a single dense line
+        raw = open(out, encoding="utf-8").read()
+        assert "\n  " in raw
+        # idempotent re-write over an existing file also succeeds
+        ret2 = D.write_json(out)
+        assert ret2 == out and os.path.isfile(out)
+    print("ok test_write_json_writes_valid_feed")
+
+
+def test_cli_json_mode_importable_and_callable():
+    # The --json CLI path must be importable and callable, return 0, and never traceback.
+    rc = D.main(["--json"])
+    assert rc == 0
+    rc_text = D.main([])          # bare mode (text scorecard) still works
+    assert rc_text == 0
+    print("ok test_cli_json_mode_importable_and_callable")
+
+
 if __name__ == "__main__":
     test_aggregates_correctly()
     test_recent_capped_at_20()
     test_archive_genomes_capped_at_50()
     test_all_sections_degrade_to_empty()
     test_render_text_handles_garbage()
+    test_write_json_writes_valid_feed()
+    test_cli_json_mode_importable_and_callable()
     print("ALL DASHBOARD TESTS PASSED")
