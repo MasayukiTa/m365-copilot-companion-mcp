@@ -58,11 +58,18 @@ def select_fresh_slice(spec_path, n, burned, seed):
     return fresh
 
 
-def _solve_arm(spec_path, targets_file, preds_dir, tag, toggle, on, chunk, conc, turns, floor):
-    """Launch one detached solve arm; returns the pid. Reaper-proof via guards.launch_detached."""
+def _run_solve_arm(spec_path, targets_file, preds_dir, tag, toggle, on, chunk, conc, turns, floor):
+    """Run one solve arm to completion as a BLOCKING child of this driver.
+
+    loop.py is itself the durable, detached parent (launched via Start-Process / launch_detached),
+    so the solve orchestrator runs as a normal tracked child here -- the same parent/child shape that
+    survived for hours in the manual runs. (An earlier version launched the arm *detached from this
+    already-detached driver*; the double-detach orphaned it and it was reaped mid-run.) Returns
+    (rc, env_log); rc==0 and a fresh done marker mean the arm finished cleanly.
+    """
     env_log = os.path.join(SWEDIR, "solve_decoupled_%s.log" % tag)
-    lock = os.path.join(SWEDIR, "solve_decoupled_%s.lock" % tag)
-    for p in (lock, os.path.join(SWEDIR, "goals_solve_chunk.jsonl")):
+    for p in (os.path.join(SWEDIR, "solve_decoupled_%s.lock" % tag),
+              os.path.join(SWEDIR, "goals_solve_chunk.jsonl")):
         try:
             os.remove(p)
         except OSError:
@@ -75,36 +82,9 @@ def _solve_arm(spec_path, targets_file, preds_dir, tag, toggle, on, chunk, conc,
             "--preds-dir", preds_dir, "--tag", tag, "--chunk", str(chunk),
             "--max-concurrent", str(conc), "--max-turns", str(turns), "--effort", "auto",
             "--floor-gb", str(floor)]
-    # launch_detached uses the current env; set then restore so both arms get the right toggle
-    saved = {k: os.environ.get(k) for k in ("SWE_SIDEPAGE_RESERVE", toggle or "_")}
-    os.environ.update({k: v for k, v in env.items() if k in saved})
-    try:
-        pid = G.launch_detached(args, REPO,
-                                os.path.join(SWEDIR, "%s_stdout.log" % tag),
-                                os.path.join(SWEDIR, "%s_stderr.log" % tag))
-    finally:
-        for k, v in saved.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-    return pid, env_log
-
-
-def _wait_solve(env_log, tag, poll_s=120, max_h=36):
-    """Poll until the arm's CURRENT run prints its done marker (de-staled) or the process is gone."""
-    start_marker, done_marker = "decoupled solve start", "solve done/paused"
-    deadline = time.time() + max_h * 3600
-    while time.time() < deadline:
-        if G.done_after_last_start(env_log, start_marker, done_marker):
-            return True
-        if G.proc_alive("swe_solve_decoupled") == 0:
-            # gone without a fresh done marker -> let caller decide (could be a crash)
-            if G.done_after_last_start(env_log, start_marker, done_marker):
-                return True
-            return False
-        time.sleep(poll_s)
-    return False
+    r = subprocess.run(args, cwd=REPO, env=env)
+    done = G.done_after_last_start(env_log, "decoupled solve start", "solve done/paused")
+    return r.returncode, done
 
 
 def _grade_arm(preds_dir, targets_file, dataset, run_id, max_wait_min=200):
@@ -151,19 +131,19 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
     os.makedirs(on_dir, exist_ok=True)
     os.makedirs(off_dir, exist_ok=True)
 
-    # ON arm
+    # ON arm (blocking child; resumable so a transient blip just re-runs the uncaptured chunk)
     log("solve ON (%s=1) ..." % toggle)
-    _pid, on_log = _solve_arm(spec_path, targets_file, on_dir, "sion", toggle, True, chunk, conc, turns, floor)
-    if not _wait_solve(on_log, "sion"):
-        log("ON solve did not finish cleanly; aborting"); return None
+    rc, done = _run_solve_arm(spec_path, targets_file, on_dir, "sion", toggle, True, chunk, conc, turns, floor)
+    if not done:
+        log("ON solve did not reach its done marker (rc=%s); aborting" % rc); return None
     on_resolved = _grade_arm(on_dir, targets_file, dataset, "sion" + time.strftime("%m%d%H%M"))
     log("ON resolved: %d/%d" % (len(on_resolved), len(fresh)))
 
     # OFF arm
     log("solve OFF (%s=0) ..." % toggle)
-    _pid, off_log = _solve_arm(spec_path, targets_file, off_dir, "sioff", toggle, False, chunk, conc, turns, floor)
-    if not _wait_solve(off_log, "sioff"):
-        log("OFF solve did not finish cleanly; aborting"); return None
+    rc, done = _run_solve_arm(spec_path, targets_file, off_dir, "sioff", toggle, False, chunk, conc, turns, floor)
+    if not done:
+        log("OFF solve did not reach its done marker (rc=%s); aborting" % rc); return None
     off_resolved = _grade_arm(off_dir, targets_file, dataset, "sioff" + time.strftime("%m%d%H%M"))
     log("OFF resolved: %d/%d" % (len(off_resolved), len(fresh)))
 
