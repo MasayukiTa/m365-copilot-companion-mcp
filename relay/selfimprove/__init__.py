@@ -49,6 +49,13 @@ from .policy import (
     evaluate_tripwires,
     run_campaign,
 )
+from .apply import (
+    active_genome,
+    apply_genome,
+    revert,
+    safe_commit,
+    SCAFFOLD_ALLOWLIST,
+)
 
 __all__ = [
     "BurnedRegistry",
@@ -82,4 +89,9 @@ __all__ = [
     "plateaued",
     "evaluate_tripwires",
     "run_campaign",
+    "active_genome",
+    "apply_genome",
+    "revert",
+    "safe_commit",
+    "SCAFFOLD_ALLOWLIST",
 ]
