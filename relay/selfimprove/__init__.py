@@ -22,6 +22,17 @@ from .archive import (
     descriptors,
     cell_key,
 )
+from .frozen import (
+    frozen_intact,
+    snapshot_baseline,
+    compute_checksums,
+    burned_append_only,
+    FROZEN_MANIFEST,
+)
+from .sentinel import (
+    Sentinel,
+    sentinel_verdict,
+)
 
 __all__ = [
     "BurnedRegistry",
@@ -38,4 +49,11 @@ __all__ = [
     "genome_id",
     "descriptors",
     "cell_key",
+    "frozen_intact",
+    "snapshot_baseline",
+    "compute_checksums",
+    "burned_append_only",
+    "FROZEN_MANIFEST",
+    "Sentinel",
+    "sentinel_verdict",
 ]
