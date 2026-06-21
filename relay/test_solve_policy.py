@@ -1,5 +1,6 @@
 """Tests for the solve-policy router. Run: python -m relay.test_solve_policy"""
 from relay import solve_policy as P
+from relay.selfimprove.archive import genome_id
 
 
 def _report(weak_pass, weak_n, strong_pass, strong_n):
@@ -22,7 +23,7 @@ def test_weak_class_routes_to_best_of_n():
     assert plan["mode"] == "best-of-N"
     assert plan["n"] == 4 and len(plan["genomes"]) == 4
     assert plan["genomes"][0] == _BASE            # attempt 0 is the incumbent
-    ids = [P._div.genome_id(g) for g in plan["genomes"]]
+    ids = [genome_id(g) for g in plan["genomes"]]
     assert len(set(ids)) == 4                     # all distinct
     print("ok test_weak_class_routes_to_best_of_n")
 
