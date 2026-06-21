@@ -136,6 +136,16 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
     rc, done = _run_solve_arm(spec_path, targets_file, on_dir, "sion", toggle, True, chunk, conc, turns, floor)
     if not done:
         log("ON solve did not reach its done marker (rc=%s); aborting" % rc); return None
+    # INFRA-ABORT GUARD: the orchestrator writes "solve done/paused" even when it aborts a chunk on
+    # the disk floor or a wedge, so `done` is not enough. If nothing was captured, the solve never
+    # actually ran -- this is an INFRA fault, not a measurement. Do NOT grade, gate, or burn (burning
+    # a slice that was never solved would silently consume fresh instances; cf. the disk-floor
+    # incident that wrongly burned 200). Return an infra_abort status so the caller retries later.
+    on_cap = len([f for f in os.listdir(on_dir) if f.endswith(".json")]) if os.path.isdir(on_dir) else 0
+    if on_cap == 0:
+        log("ON solve captured 0 predictions -> INFRA ABORT (disk floor / wedge); NOT burning, NOT gating")
+        return {"status": "infra_abort", "arm": "ON", "reason": "ON solve produced no predictions (infra)",
+                "burned": False, "report": None}
     on_resolved = _grade_arm(on_dir, targets_file, dataset, "sion" + time.strftime("%m%d%H%M"))
     log("ON resolved: %d/%d" % (len(on_resolved), len(fresh)))
 
@@ -144,6 +154,11 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
     rc, done = _run_solve_arm(spec_path, targets_file, off_dir, "sioff", toggle, False, chunk, conc, turns, floor)
     if not done:
         log("OFF solve did not reach its done marker (rc=%s); aborting" % rc); return None
+    off_cap = len([f for f in os.listdir(off_dir) if f.endswith(".json")]) if os.path.isdir(off_dir) else 0
+    if off_cap == 0:
+        log("OFF solve captured 0 predictions -> INFRA ABORT; NOT burning, NOT gating")
+        return {"status": "infra_abort", "arm": "OFF", "reason": "OFF solve produced no predictions (infra)",
+                "burned": False, "report": None}
     off_resolved = _grade_arm(off_dir, targets_file, dataset, "sioff" + time.strftime("%m%d%H%M"))
     log("OFF resolved: %d/%d" % (len(off_resolved), len(fresh)))
 
