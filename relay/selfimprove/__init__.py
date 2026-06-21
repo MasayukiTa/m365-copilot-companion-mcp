@@ -33,6 +33,11 @@ from .sentinel import (
     Sentinel,
     sentinel_verdict,
 )
+from .propose import (
+    propose_candidates,
+    lint_candidate,
+    mutation_generator,
+)
 
 __all__ = [
     "BurnedRegistry",
@@ -56,4 +61,7 @@ __all__ = [
     "FROZEN_MANIFEST",
     "Sentinel",
     "sentinel_verdict",
+    "propose_candidates",
+    "lint_candidate",
+    "mutation_generator",
 ]
