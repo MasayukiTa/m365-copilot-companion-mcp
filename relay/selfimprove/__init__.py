@@ -16,6 +16,12 @@ from .guards import (
     launch_detached,
     done_after_last_start,
 )
+from .archive import (
+    Archive,
+    genome_id,
+    descriptors,
+    cell_key,
+)
 
 __all__ = [
     "BurnedRegistry",
@@ -28,4 +34,8 @@ __all__ = [
     "proc_alive",
     "launch_detached",
     "done_after_last_start",
+    "Archive",
+    "genome_id",
+    "descriptors",
+    "cell_key",
 ]
