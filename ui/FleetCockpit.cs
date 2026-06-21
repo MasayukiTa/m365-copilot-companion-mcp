@@ -68,6 +68,7 @@ class CockpitWindow : Window
                                // upper RAIL, not a hardware bound. Real limiters: free RAM + M365
                                // Copilot per-user fair-use/rate limits.
     string _effort = "auto";   // effort mode min|max|ultra|auto -> settings.txt effort= (NEW)
+    string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
     bool _paused = false;      // local fleet pause/resume toggle state (NEW)
     long _settingsMtime = 0;
 
@@ -228,6 +229,7 @@ class CockpitWindow : Window
         if (k == "rate") return ja ? "件/時" : "/h";
         // Effort selector + fleet-wide pause/stop (NEW)
         if (k == "effort") return ja ? "推論" : "Reasoning";
+        if (k == "approval") return ja ? "承認" : "Approval";
         if (k == "pause") return ja ? "一時停止" : "Pause";
         if (k == "resume") return ja ? "再開" : "Resume";
         if (k == "stopall") return ja ? "全停止" : "Stop all";
@@ -300,6 +302,11 @@ class CockpitWindow : Window
                 {
                     string ef = ln.Substring(7).Trim();
                     if (ef == "min" || ef == "max" || ef == "ultra" || ef == "auto") _effort = ef;
+                }
+                else if (ln.StartsWith("approval="))
+                {
+                    string ap = ln.Substring(9).Trim();
+                    if (ap == "run" || ap == "plan" || ap == "auto") _approval = ap;
                 }
             }
             _settingsMtime = File.GetLastWriteTimeUtc(SettingsFile).Ticks;
@@ -399,11 +406,16 @@ class CockpitWindow : Window
 
         ctrls.Children.Add(AutoscaleControls());
         ctrls.Children.Add(EffortControl());
+        ctrls.Children.Add(ApprovalControl());
         ctrls.Children.Add(FleetControls());
         _mainBtn = IconButton("chat", 18);
         _mainBtn.ToolTip = _lang == 0 ? "メイン (チャット) を開く" : "Open main chat";
         _mainBtn.Click += delegate { OpenMain(); };
         ctrls.Children.Add(_mainBtn);
+        var _siBtn = IconButton("account_tree", 18);
+        _siBtn.ToolTip = _lang == 0 ? "自己改善ダッシュボード" : "Self-improvement dashboard";
+        _siBtn.Click += delegate { new SelfImproveDashboardWindow().Show(); };
+        ctrls.Children.Add(_siBtn);
         _langBtn = IconButton("translate", 18);
         _langBtn.ToolTip = "日本語 / English";
         _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveKey("lang", _lang.ToString()); Relabel(); ForceRender(); };
@@ -600,11 +612,22 @@ class CockpitWindow : Window
                 _startNote.Text = _lang == 0 ? "ゴールを入力してください。" : "Enter goals (one per line).";
                 return;
             }
+            if (goals.Count == 1 && goals[0].Equals("/help", StringComparison.OrdinalIgnoreCase))
+            {
+                _goalInput.Text = GoalHelpText();
+                _goalInput.CaretIndex = _goalInput.Text.Length;
+                _startNote.Text = _lang == 0 ? "コマンド一覧を入力欄に表示しました。" : "Command help expanded in the goal box.";
+                return;
+            }
 
-            SpawnFleet(goals, "goals_input.txt");
+            bool planMode = _approval == "plan" || _approval == "auto";
+            SpawnFleet(goals, "goals_input.txt", planMode);
             _goalInput.Text = "";
             _startNote.Text = (_lang == 0 ? "開始しました（" : "Started (") + goals.Count
-                              + (_lang == 0 ? " 件）" : " goals)");
+                              + (_lang == 0 ? " 件）" : " goals)")
+                              + (planMode
+                                  ? (_lang == 0 ? "。承認待ちの計画を各カードに出します。" : ". Each card will wait at plan approval.")
+                                  : "");
             _lastSig = "";   // force a re-render once status.json starts updating
         }
         catch (Exception ex)
@@ -621,7 +644,7 @@ class CockpitWindow : Window
     // run shows up live here. Goals are handed over via a UTF-8 file to dodge arg-encoding issues.
     // Returns true if the process started. `goalsFileName` lets callers use a distinct file so a
     // retry spawn never clobbers the manual Start input file (or vice-versa).
-    bool SpawnFleet(List<string> goals, string goalsFileName)
+    bool SpawnFleet(List<string> goals, string goalsFileName, bool planMode = false)
     {
         string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
         string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
@@ -634,6 +657,7 @@ class CockpitWindow : Window
         psi.FileName = py;
         psi.Arguments = "-m relay.fleet_runner --goals-file \"" + goalsFile + "\""
                         + " --state-dir \"" + stateDir + "\" --effort " + _effort;
+        if (planMode) psi.Arguments += " --plan";
         psi.WorkingDirectory = repo;
         psi.UseShellExecute = false;
         psi.CreateNoWindow = true;
@@ -645,6 +669,7 @@ class CockpitWindow : Window
     // --- slash-command autocomplete for the goal box (parity with the main chat) ---
     Popup _gcmdPopup; ListBox _gcmdList;
     static readonly string[][] _goalCommands = {
+        new[]{"/help","コマンド一覧を表示"},
         new[]{"/code","<機能> を実装し、pytest テストも書いて通す"},
         new[]{"/fix","<ファイル> の <不具合> を直し、テストを通す"},
         new[]{"/test","<対象> の pytest テストを書く"},
@@ -703,6 +728,10 @@ class CockpitWindow : Window
         if (item != null)
         {
             string template = item.Tag as string;
+            var sp = item.Content as StackPanel;
+            if (sp != null && sp.Children.Count > 0 && sp.Children[0] is TextBlock
+                && ((TextBlock)sp.Children[0]).Text == "/help")
+                template = GoalHelpText();
             int ls; string line; CurrentGoalLine(out ls, out line);
             string txt = _goalInput.Text ?? ""; int caret = _goalInput.CaretIndex;
             if (caret > txt.Length) caret = txt.Length;
@@ -711,6 +740,20 @@ class CockpitWindow : Window
         }
         if (_gcmdPopup != null) _gcmdPopup.IsOpen = false;
         _goalInput.Focus();
+    }
+    string GoalHelpText()
+    {
+        return "フリート入力欄コマンド:\n"
+            + "/code <機能> - 実装と pytest テスト\n"
+            + "/fix <対象> - 不具合修正と検証\n"
+            + "/test <対象> - pytest テスト追加\n"
+            + "/refactor <対象> - 挙動を変えず整理\n"
+            + "/doc <対象> - README/説明を書く\n"
+            + "/review <対象> - 問題点レビュー\n"
+            + "/research <問い> - 深掘り調査\n"
+            + "\n上部設定:\n"
+            + "推論=min/max/ultra/auto\n"
+            + "承認=run/plan/auto（run=即実行、plan=計画承認待ち、auto=通常フリートは計画承認待ち、自律コーディング(フォルダ)はGO/ASK/STOPゲート）";
     }
 
     // ③ Claude-Code-style: pick a folder + a plain-language instruction -> code_task runs
@@ -735,16 +778,6 @@ class CockpitWindow : Window
             string instr = PromptInstruction();
             if (string.IsNullOrEmpty(instr)) return;
 
-            // plan-first? Yes -> propose a numbered plan and pause as 承認待ち; you approve
-            // or edit it with a steer (the W card's steer box) to start execution.
-            var mb = System.Windows.MessageBox.Show(this,
-                _lang == 0 ? "先に実行計画を提示して承認を待ちますか？\n\nはい = 計画提示 → 承認待ち（カードに steer で承認/修正を送ると実行）\nいいえ = すぐ実行"
-                           : "Propose a plan first and wait for your approval?\n\nYes = plan -> 承認待ち (steer the card to approve/edit)\nNo = run now",
-                _lang == 0 ? "コーディング起動" : "Start coding",
-                System.Windows.MessageBoxButton.YesNoCancel, System.Windows.MessageBoxImage.Question);
-            if (mb == System.Windows.MessageBoxResult.Cancel) return;
-            bool plan = mb == System.Windows.MessageBoxResult.Yes;
-
             string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
             string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
             if (!File.Exists(py)) py = "python";
@@ -754,9 +787,14 @@ class CockpitWindow : Window
             // same status.json this cockpit already tails, so the task shows up live.
             var psi = new System.Diagnostics.ProcessStartInfo();
             psi.FileName = py;
-            psi.Arguments = "-m relay.code_task -i \"" + instr.Replace("\"", "'")
-                + "\" -f \"" + folder + "\" --state-dir \"" + stateDir + "\""
-                + (plan ? " --plan" : "");
+            if (_approval == "auto")
+                psi.Arguments = "-m relay.overnight_task -i \"" + instr.Replace("\"", "'")
+                    + "\" -f \"" + folder + "\" --state-dir \"" + stateDir + "\""
+                    + " --hours 8 --auto-mode --effort " + _effort;
+            else
+                psi.Arguments = "-m relay.code_task -i \"" + instr.Replace("\"", "'")
+                    + "\" -f \"" + folder + "\" --state-dir \"" + stateDir + "\" --effort " + _effort
+                    + (_approval == "plan" ? " --plan" : "");
             psi.WorkingDirectory = repo; psi.UseShellExecute = false; psi.CreateNoWindow = true;
             try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
 
@@ -764,10 +802,12 @@ class CockpitWindow : Window
             p.StartInfo = psi;
             p.Start();
             _startNote.Text = _lang == 0
-                ? (plan ? "コーディング(計画モード)を開始。計画提示後「承認待ち」になります。カードに承認/修正を steer で送ってください。"
-                        : "コーディングタスクを開始（検証方法は自動検出。テスト/コンパイルが通るまで完了しません）。")
-                : (plan ? "Coding (plan mode) started -> it will pause at 承認待ち; steer the card to approve/edit."
-                        : "Coding task started (auto-verified; not done until tests/compile pass).");
+                ? (_approval == "auto" ? "自動承認ゲート付き長時間タスクを開始。ASK/STOPなら実行せずレポートします。"
+                   : _approval == "plan" ? "コーディング(計画モード)を開始。計画提示後「承認待ち」になります。カードに承認/修正を steer で送ってください。"
+                   : "コーディングタスクを開始（検証方法は自動検出。テスト/コンパイルが通るまで完了しません）。")
+                : (_approval == "auto" ? "Started long task with auto approval gate. ASK/STOP writes a report without launching."
+                   : _approval == "plan" ? "Coding (plan mode) started -> it will pause at 承認待ち; steer the card to approve/edit."
+                   : "Coding task started (auto-verified; not done until tests/compile pass).");
         }
         catch (Exception ex)
         {
@@ -815,6 +855,7 @@ class CockpitWindow : Window
     ContentControl _iconHost;
     Button _maxMinus, _maxPlus;
     ComboBox _effortBox;
+    ComboBox _approvalBox;
     Button _pauseBtn, _stopBtn;
     Button _autoToggle;
     Button _autoMinus, _autoPlus;
@@ -920,6 +961,49 @@ class CockpitWindow : Window
         // re-firing the persist handler -- assigning the same value is a no-op for SelectionChanged.
         if (!Equals(_effortBox.SelectedItem, _effort)) _effortBox.SelectedItem = _effort;
         _effortBox.Background = BtnBg; _effortBox.Foreground = Fg; _effortBox.BorderBrush = Border;
+    }
+
+    // Approval selector: compact run/plan/auto mode next to effort. This avoids adding another
+    // header button in the already-dense fleet toolbar.
+    static readonly string[] _approvalModes = { "run", "plan", "auto" };
+    TextBlock _approvalLbl;
+    UIElement ApprovalControl()
+    {
+        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
+        wrap.VerticalAlignment = VerticalAlignment.Center; wrap.Margin = new Thickness(0, 0, 12, 0);
+
+        _approvalLbl = new TextBlock(); _approvalLbl.VerticalAlignment = VerticalAlignment.Center;
+        _approvalLbl.FontSize = 12; _approvalLbl.Margin = new Thickness(0, 0, 8, 0);
+        wrap.Children.Add(_approvalLbl);
+
+        _approvalBox = new ComboBox();
+        _approvalBox.ToolTip = _lang == 0
+            ? "承認モード: run=すぐ実行、plan=計画承認待ち、auto=通常フリートは計画承認待ち/フォルダ自律はGO-ASK-STOP判定"
+            : "Approval mode: run=run now, plan=wait for approval, auto=plain fleet waits for plan approval; folder autonomy uses GO/ASK/STOP";
+        _approvalBox.Cursor = Cursors.Hand; _approvalBox.FontSize = 12;
+        _approvalBox.FontWeight = FontWeights.SemiBold; _approvalBox.MinWidth = 74;
+        _approvalBox.Padding = new Thickness(8, 2, 4, 2);
+        _approvalBox.VerticalAlignment = VerticalAlignment.Center;
+        foreach (string m in _approvalModes) _approvalBox.Items.Add(m);
+        _approvalBox.SelectedItem = _approval;
+        _approvalBox.SelectionChanged += delegate
+        {
+            string sel = _approvalBox.SelectedItem as string;
+            if (string.IsNullOrEmpty(sel) || sel == _approval) return;
+            _approval = sel;
+            SaveKey("approval", _approval);
+        };
+        wrap.Children.Add(_approvalBox);
+
+        PaintApproval();
+        return wrap;
+    }
+    void PaintApproval()
+    {
+        if (_approvalLbl != null) { _approvalLbl.Text = T("approval"); _approvalLbl.Foreground = Muted; }
+        if (_approvalBox == null) return;
+        if (!Equals(_approvalBox.SelectedItem, _approval)) _approvalBox.SelectedItem = _approval;
+        _approvalBox.Background = BtnBg; _approvalBox.Foreground = Fg; _approvalBox.BorderBrush = Border;
     }
 
     // Fleet-wide controls: Pause/Resume toggle + Stop-all. Both write into commands.json
@@ -1146,6 +1230,7 @@ class CockpitWindow : Window
         PaintAutoToggle();
         UpdateAutoEnabled();
         PaintEffort();
+        PaintApproval();
         PaintPause();
         if (_stopBtn != null) { _stopBtn.Background = BtnBg; _stopBtn.Foreground = Fg; _stopBtn.BorderBrush = Border; }
         if (_inBar != null) _inBar.Background = Bg;
@@ -1176,6 +1261,7 @@ class CockpitWindow : Window
         if (_autoValue != null) _autoValue.Text = _autoMax.ToString();
         PaintAutoToggle();
         PaintEffort();
+        PaintApproval();
         PaintPause();
         if (_stopBtn != null) _stopBtn.Content = T("stopall");
         if (_startBtn != null) _startBtn.Content = T("start");
