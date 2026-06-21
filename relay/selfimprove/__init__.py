@@ -49,6 +49,7 @@ from .policy import (
     evaluate_tripwires,
     run_campaign,
 )
+from .status import status_text
 from .targeting import (
     next_target,
     assemble_misses,
@@ -118,4 +119,5 @@ __all__ = [
     "next_target",
     "assemble_misses",
     "improvement_plan",
+    "status_text",
 ]
