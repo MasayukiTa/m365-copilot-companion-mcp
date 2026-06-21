@@ -38,6 +38,11 @@ from .propose import (
     lint_candidate,
     mutation_generator,
 )
+from .l2 import (
+    run_iteration,
+    SpendCeiling,
+    run_until,
+)
 
 __all__ = [
     "BurnedRegistry",
@@ -64,4 +69,7 @@ __all__ = [
     "propose_candidates",
     "lint_candidate",
     "mutation_generator",
+    "run_iteration",
+    "SpendCeiling",
+    "run_until",
 ]
