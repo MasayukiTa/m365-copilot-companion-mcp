@@ -8,9 +8,20 @@ Goal: take the controller from "a human kicks one gated iteration" (L1, done) to
 the loop — it is the discipline that keeps the loop *honest* as it runs for days. This doc is mostly
 about that.
 
-> Interpretation note: "openclaw" is read here as the class of continuously self-improving coding
-> agents (SICA arXiv:2504.15228; Darwin-Gödel-Machine-style archives; AlphaEvolve-style
-> propose/evaluate). If a specific system was meant, the mechanisms below still map onto it.
+> Prior art — OpenClaw (looked up 2026-06-21). OpenClaw is a real agent framework. Two relevant
+> pieces: (a) a `self-improving-agent` skill = a lesson-capture loop (task -> failure -> record
+> error+context -> root-cause -> lesson summary -> apply broadly), persisted across sessions/reboots/
+> machines, with monthly *manual* review/removal of bad lessons (`clawhub lessons ...`); and (b) a
+> code-self-modification loop under supervision whose one rule is **"the agent that writes the change
+> cannot approve it"** (writer != approver).
+>
+> Mapping to this design: (a) we already do — MEMORY.md + miss-analysis -> quality_cards + the burned
+> registry are the lesson store. (b) we already separate writer from approver — the PROPOSE step
+> never approves; the independent approver is the `significance_gate`. Where this design goes further
+> than OpenClaw's stated safety ("remove wrong lessons monthly by hand"): the approver is a *frozen,
+> statistical* judge (constitution + checksum + McNemar gate), plus cross-dataset sentinel, a
+> quality-diversity archive, and harness self-repair. The lineage is the same family as SICA
+> (arXiv:2504.15228) and Darwin-Gödel-Machine-style archives.
 
 ## 0. The one failure that dominates everything: reward hacking
 
