@@ -18,7 +18,10 @@ pick + how-confident the result is. The actual N-parallel solve is fleet-heavy a
 from __future__ import annotations
 
 from relay.selfimprove import calibration as _cal
-from relay.selfimprove import diversify as _div
+# NOTE: import the diversify FUNCTION by full path. The package __init__ exports a `diversify`
+# function which SHADOWS the `diversify` submodule, so `from relay.selfimprove import diversify`
+# yields the function, not the module -- using the full module path avoids that name collision.
+from relay.selfimprove.diversify import diversify as _diversify
 from relay.selfimprove import apply as _apply
 from relay import bestofn_run as _bn
 
@@ -50,7 +53,7 @@ def plan_solve(instance_id, report=None, *, n=4, base_genome=None,
         reason = rec.get("reason", "")
 
         if mode == "best-of-N":
-            genomes = _div.diversify(base, n)
+            genomes = _diversify(base, n)
             return {
                 "instance_id": instance_id,
                 "task_class": task_class,

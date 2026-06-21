@@ -49,7 +49,9 @@ from .policy import (
     evaluate_tripwires,
     run_campaign,
 )
-from .diversify import diversify, diversity_report
+# NOTE: diversify / diversity_report are intentionally NOT re-exported here. Exporting a `diversify`
+# function would SHADOW the `relay.selfimprove.diversify` submodule (a name collision that already
+# caused a real bug). Import them by full path: `from relay.selfimprove.diversify import diversify`.
 from .status import status_text
 from .targeting import (
     next_target,
@@ -121,6 +123,4 @@ __all__ = [
     "assemble_misses",
     "improvement_plan",
     "status_text",
-    "diversify",
-    "diversity_report",
 ]
