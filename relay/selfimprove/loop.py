@@ -88,12 +88,19 @@ def _run_solve_arm(spec_path, targets_file, preds_dir, tag, toggle, on, chunk, c
 
 
 def _grade_arm(preds_dir, targets_file, dataset, run_id, max_wait_min=200):
-    """Run the the eval host batch grade synchronously; return the set of resolved instance ids."""
+    """Run the the eval host batch grade synchronously.
+
+    Returns (resolved_ids, graded_count): the set of RESOLVED instance ids, and how many instances
+    got a REAL verdict (RESOLVED or 'not') for this run_id. graded_count == 0 means the grade never
+    actually ran -- the eval host unreachable, scp failed, EVALERR-everything -- i.e. an INFRA fault, NOT a
+    real 0%. The caller must distinguish that from a genuine low pass rate (which has 'not' verdicts).
+    """
     args = [VENVPY, GRADER, "--preds-dir", preds_dir, "--targets-file", targets_file,
             "--dataset-name", dataset, "--max-workers", "12", "--run-id", run_id,
             "--max-wait-min", str(max_wait_min)]
     subprocess.run(args, cwd=REPO)
     resolved = set()
+    graded = 0
     if os.path.isfile(GRADE_RESULTS):
         latest = {}
         for line in open(GRADE_RESULTS, encoding="utf-8"):
@@ -107,7 +114,9 @@ def _grade_arm(preds_dir, targets_file, dataset, run_id, max_wait_min=200):
             if r.get("runid") == run_id:
                 latest[r["instance_id"]] = r["verdict"]
         resolved = {i for i, v in latest.items() if v == "RESOLVED"}
-    return resolved
+        # a REAL verdict is RESOLVED or 'not'; EVALERR / missing = the grader did not actually judge it.
+        graded = sum(1 for v in latest.values() if v in ("RESOLVED", "not"))
+    return resolved, graded
 
 
 def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
@@ -146,8 +155,16 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
         log("ON solve captured 0 predictions -> INFRA ABORT (disk floor / wedge); NOT burning, NOT gating")
         return {"status": "infra_abort", "arm": "ON", "reason": "ON solve produced no predictions (infra)",
                 "burned": False, "report": None}
-    on_resolved = _grade_arm(on_dir, targets_file, dataset, "sion" + time.strftime("%m%d%H%M"))
-    log("ON resolved: %d/%d" % (len(on_resolved), len(fresh)))
+    on_resolved, on_graded = _grade_arm(on_dir, targets_file, dataset, "sion" + time.strftime("%m%d%H%M"))
+    log("ON resolved: %d/%d (graded %d)" % (len(on_resolved), len(fresh), on_graded))
+    # GRADE-INFRA GUARD: 0 real verdicts means the grade never ran (the eval host down / scp failed / EVALERR-
+    # everything) -- NOT a real 0%. Gating/burning on a failed grade would record a garbage A/B and burn
+    # the slice (the the eval host-down incident: ON solved 200 fine but the grade returned 0/200). Treat as infra.
+    if on_graded == 0:
+        log("ON grade produced 0 real verdicts -> INFRA ABORT (the eval host unreachable / scp failed); NOT gating, NOT burning")
+        return {"status": "infra_abort", "arm": "ON-grade",
+                "reason": "ON grade did not run (infra: the eval host unreachable / scp failed)",
+                "burned": False, "report": None}
 
     # OFF arm
     log("solve OFF (%s=0) ..." % toggle)
@@ -159,8 +176,13 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
         log("OFF solve captured 0 predictions -> INFRA ABORT; NOT burning, NOT gating")
         return {"status": "infra_abort", "arm": "OFF", "reason": "OFF solve produced no predictions (infra)",
                 "burned": False, "report": None}
-    off_resolved = _grade_arm(off_dir, targets_file, dataset, "sioff" + time.strftime("%m%d%H%M"))
-    log("OFF resolved: %d/%d" % (len(off_resolved), len(fresh)))
+    off_resolved, off_graded = _grade_arm(off_dir, targets_file, dataset, "sioff" + time.strftime("%m%d%H%M"))
+    log("OFF resolved: %d/%d (graded %d)" % (len(off_resolved), len(fresh), off_graded))
+    if off_graded == 0:
+        log("OFF grade produced 0 real verdicts -> INFRA ABORT (the eval host unreachable / scp failed); NOT gating, NOT burning")
+        return {"status": "infra_abort", "arm": "OFF-grade",
+                "reason": "OFF grade did not run (infra: the eval host unreachable / scp failed)",
+                "burned": False, "report": None}
 
     gate = G.significance_gate(on_resolved, off_resolved, fresh, alpha=alpha, min_n=min_n, min_pp=min_pp)
     burned.add(fresh, reason="selfimprove A/B %s" % toggle, ts=int(time.time()))
