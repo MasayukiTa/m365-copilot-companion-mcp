@@ -233,6 +233,7 @@ class CockpitWindow : Window
         if (k == "pause") return ja ? "一時停止" : "Pause";
         if (k == "resume") return ja ? "再開" : "Resume";
         if (k == "stopall") return ja ? "全停止" : "Stop all";
+        if (k == "steer_dead") return ja ? "走行が停止中のため割り込めません（再開後にどうぞ）" : "No run live — can't steer (resume the fleet first)";
         return k;
     }
     string StatusLabel(string s)
@@ -1023,6 +1024,10 @@ class CockpitWindow : Window
         _pauseBtn.VerticalAlignment = VerticalAlignment.Center;
         _pauseBtn.Click += delegate
         {
+            // Pause only means something to a LIVE fleet. With no live consumer the command would
+            // sit unread in commands.json while the label lied "Resume" -- so do nothing then (the
+            // button is also disabled per-tick by RefreshPauseEnabled, this is belt-and-suspenders).
+            if (!RunIsLive()) { if (_paused) { _paused = false; PaintPause(); } return; }
             _paused = !_paused;
             var cmd = ReadCommands();
             cmd["pause"] = _paused;
@@ -1063,6 +1068,16 @@ class CockpitWindow : Window
         _pauseBtn.Content = _paused ? T("resume") : T("pause");
         if (_paused) { _pauseBtn.Background = Accent; _pauseBtn.Foreground = White; _pauseBtn.BorderBrush = Accent; }
         else { _pauseBtn.Background = BtnBg; _pauseBtn.Foreground = Fg; _pauseBtn.BorderBrush = Border; }
+    }
+    // Per-tick: Pause is enabled only when a run is LIVE (something to pause). When no run is live we
+    // also drop a stale "paused" state so the label can never sit on "Resume" over a dead/absent run.
+    void RefreshPauseEnabled(Dictionary<string, object> root)
+    {
+        if (_pauseBtn == null) return;
+        bool live = Liveness(root) == 1;
+        _pauseBtn.IsEnabled = live;
+        _pauseBtn.Opacity = live ? 1.0 : 0.5;
+        if (!live && _paused) { _paused = false; PaintPause(); }
     }
 
     UIElement MaxTabsStepper()
@@ -1119,15 +1134,52 @@ class CockpitWindow : Window
         if (_autoscale) RequestSetAutoscaleIfLive();
     }
 
-    // true iff a run is currently LIVE (running and not idle).
+    // status.json freshness thresholds, mirrored from fleet_runner so the cockpit agrees with the
+    // fleet's OWN watchdog on what "the driver is gone" means. A LIVE fleet legitimately freezes
+    // status.json while a worker is blocked in a bounded acceptance eval -- up to EVAL_STALL_CEILING_S
+    // when a worker is "verifying", otherwise up to the plain stall window. Treating that as dead would
+    // be the WORSE bug (double-launch on Retry, dropped Steer), so we only call a run dead past these.
+    const double DEAD_STALL_SECS = 150.0;        // == fleet_runner --stall-s default
+    const double EVAL_STALL_CEILING_S = 1500.0;  // == relay_fleet.EVAL_STALL_CEILING_S
+
+    // 0 = idle / no run, 1 = LIVE (fresh, or legitimately frozen inside a bounded eval),
+    // 2 = DEAD (status claims running but has frozen past the stall window with no eval in flight,
+    //     i.e. the fleet_runner process is gone). Reads status.json ONCE. Pure given the file.
+    int Liveness(Dictionary<string, object> st)
+    {
+        if (st == null) return 0;
+        bool running = !st.ContainsKey("running") || Convert.ToBoolean(st["running"]);
+        bool idle = st.ContainsKey("idle") && Convert.ToBoolean(st["idle"]);
+        if (!running || idle) return 0;
+        double age = NowUnix() - Dbl(st, "updated");
+        if (age <= DEAD_STALL_SECS) return 1;             // fresh enough -> live
+        // frozen past the stall window: still LIVE iff a worker is in a bounded eval (mirrors
+        // fleet_runner._watchdog_should_reset), bounded by the eval ceiling as the failsafe.
+        bool evalInFlight = false;
+        if (st.ContainsKey("workers") && st["workers"] is object[])
+            foreach (object o in (object[])st["workers"])
+            {
+                var w = o as Dictionary<string, object>;
+                if (w == null) continue;
+                if (NowUnix() < Dbl(w, "eval_busy_until")) { evalInFlight = true; break; }
+                if (S(w, "status") == "verifying") { evalInFlight = true; break; }
+            }
+        if (evalInFlight) return age > EVAL_STALL_CEILING_S ? 2 : 1;
+        return 2;                                          // frozen, nothing in eval -> driver gone
+    }
+
+    // true iff a run is currently LIVE: running, not idle, AND its status is fresh enough that the
+    // fleet_runner is provably still consuming commands.json (so steer/retry/pause actually land).
     bool RunIsLive()
     {
-        try
-        {
-            var st = ReadStatus();
-            return st != null && st.ContainsKey("running") && Convert.ToBoolean(st["running"])
-                   && !(st.ContainsKey("idle") && Convert.ToBoolean(st["idle"]));
-        }
+        try { return Liveness(ReadStatus()) == 1; }
+        catch (Exception) { return false; }
+    }
+    // true iff a run claims to be running but its driver has died (frozen status). Used to switch
+    // controls to their honest local fallback instead of writing commands nobody will ever read.
+    bool RunIsDead()
+    {
+        try { return Liveness(ReadStatus()) == 2; }
         catch (Exception) { return false; }
     }
     void RequestSetAutoscaleIfLive()
@@ -1312,6 +1364,7 @@ class CockpitWindow : Window
         catch (Exception) { }
 
         Dictionary<string, object> root = ReadStatus();
+        RefreshPauseEnabled(root);          // Pause is only meaningful for a live run; grey it out otherwise
         bool idle = root == null || I(root, "total") == 0
                     || (root.ContainsKey("idle") && Convert.ToBoolean(root["idle"]));
         if (idle)
@@ -2285,6 +2338,14 @@ class CockpitWindow : Window
         DockPanel.SetDock(send, Dock.Right);
         dp.Children.Add(send);
 
+        // honest feedback when there is no live fleet to consume the steer -- shown INSTEAD of
+        // clearing the box, so the user never thinks an instruction was sent into the void.
+        var note = new TextBlock();
+        note.FontSize = 11.5; note.Foreground = Muted; note.TextWrapping = TextWrapping.Wrap;
+        note.VerticalAlignment = VerticalAlignment.Center; note.Margin = new Thickness(0, 0, 8, 0);
+        DockPanel.SetDock(note, Dock.Right);
+        dp.Children.Add(note);
+
         var tb = new TextBox();
         tb.FontSize = 12.5; tb.Padding = new Thickness(8, 5, 8, 5);
         tb.BorderThickness = new Thickness(1); tb.Background = BtnBg; tb.Foreground = Fg;
@@ -2292,20 +2353,21 @@ class CockpitWindow : Window
         tb.ToolTip = _lang == 0 ? "回答待ち中でも割り込み指示を送れます（次のターンに最優先で反映）"
                                 : "Inject a steering instruction (applied on the next turn)";
         string nm = name;
-        send.Click += delegate
+        // returns true iff the steer was actually sent; keeps the text + shows a note otherwise.
+        Func<bool> trySteer = delegate
         {
             string t = (tb.Text ?? "").Trim();
-            if (t.Length > 0) { RequestSteer(nm, t); tb.Text = ""; }
+            if (t.Length == 0) return false;
+            if (!RunIsLive()) { note.Text = T("steer_dead"); return false; }
+            RequestSteer(nm, t); tb.Text = ""; note.Text = "";
+            return true;
         };
+        send.Click += delegate { trySteer(); };
         tb.KeyDown += delegate (object s, KeyEventArgs e)
         {
-            if (e.Key == Key.Return)
-            {
-                string t = (tb.Text ?? "").Trim();
-                if (t.Length > 0) { RequestSteer(nm, t); tb.Text = ""; }
-                e.Handled = true;
-            }
+            if (e.Key == Key.Return) { trySteer(); e.Handled = true; }
         };
+        tb.TextChanged += delegate { if (note.Text.Length > 0) note.Text = ""; };
         dp.Children.Add(tb);
         return dp;
     }
