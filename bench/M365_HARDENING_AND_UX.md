@@ -48,18 +48,49 @@ the measurement completes. UI (`ui/*.cs`) is headless-measurement-safe and can p
    F1–F7 and asserts auto-recovery — turning today's firefights into regression tests. "Fixed" is
    only claimed once soak is green.
 
-## UI/UX roadmap (refined by the in-flight UX assessment of FleetCockpit/CopilotChat)
+## UI/UX roadmap (from the 2026-06-21 assessment of FleetCockpit.cs / CopilotChat.cs)
 
-Two buckets (the assessment fills specifics + plug-in points):
+Current state (better than expected — not starting from zero): WPF-native. **FleetCockpit** = live
+virtualized N-worker grid (goal/status/turn/verify/reason per worker), per-worker release/retry/steer,
+fleet pause/resume/stop, effort + approval modes, RAM-gated max-tabs, slash-command goal input, view
+filters; driven by `.fleet/status.json` (700 ms poll) + `.fleet/commands.json` (control writes).
+**CopilotChat** = SSE-streaming chat, conversation sidebar, fleet-snapshot view (transcript + live
+status tail, steerable), slash palette, attachments.
 
-- **Parity (achievable)**: real-time agent-output streaming; todo/task tracking with status; inline
-  diff/patch display; permission/confirm prompts; slash-command-style control; session/history
-  browsing; chapter/timeline; an unambiguous "what is it doing right now" state (kills the F8
-  confusion).
-- **Surpass (amplify)**: live visualization of N parallel fleet workers (turn/state/effort per
-  worker); a **self-improvement dashboard** (gate verdicts, archive genomes, burned ledger, pass@1
-  trend across iterations — data already in `relay/selfimprove/*.jsonl`, `grade_results.jsonl`,
-  `bench/VERIFIED_FRESH_AB.md`); enterprise-context surfacing (Graph/SharePoint/Teams).
+**Measurement-safety split (decides ORDER):**
+- Most **Tier-1 parity** items need the FLEET to write NEW `status.json` fields (streamed `last`
+  chunks, `latest_diff`, `completed_steps`, `current_action`, `approval_pending`) -> that edits
+  `fleet_runner.py` = measurement-active -> **defer the fleet-side writes to after the run**; the UI
+  renderers can be prepped against a documented schema.
+- The **self-improvement dashboard** reads `relay/selfimprove/*.jsonl` + `grade_results.jsonl` +
+  reports — data NOT produced by the live fleet -> **fully measurement-safe, build now**. It is also
+  the headline *surpass* feature. => **build the self-improve dashboard first.**
+
+### Tier 1 — Claude Code parity (high-ROI; fleet-write parts deferred)
+- real-time streaming of each worker's output into its card (currently only a truncated snapshot)
+- inline diff/patch viewer (capture git diff into status.json -> "Show diff" panel)
+- task/step checklist per worker (`completed_steps[]` -> collapsible checklist)
+- mid-run permission/approval prompts (`approval_pending`/`prompt_text` -> modal banner + commands.json)
+- "current action" subtitle (`current_action`) — kills the F8 "is it done or staging?" confusion
+- full error/logs pane; session/history tab in cockpit; chapter/timeline breadcrumb
+
+### Tier 2 — SURPASS (build first; measurement-safe)
+- **Self-improvement dashboard** (the differentiator Claude Code/Codex do not ship): pass@1 trend +
+  Wilson CI bands across iterations; A/B delta (cards on/off) + McNemar p vs the significance-gate
+  threshold (green/yellow/red); burned-instance ledger (sortable, click-to-inspect); proposal queue
+  (overfit-lint ✓/✗, keep/revert); genome archive + QD map; A/B pair viewer (discordant helped/hurt).
+  Data backbone first: a `dashboard_state()` aggregator over the selfimprove ledgers (the
+  "status.json for self-improvement") that both a CLI and the WPF view consume.
+- richer fleet viz (state-transition animation, dependency DAG); live goal queue with reorder.
+
+### Tier 3 — enterprise differentiation (pure win, optional MCP gate)
+- M365 Graph identity/ACLs; SharePoint/Teams approval workflows surfaced in-cockpit; M365 audit-log
+  of runs; read-only web share-link of a live fleet snapshot for team collaboration.
+
+### Known UX friction (from assessment)
+two-window cockpit↔chat (consider split-pane / inline fleet tab); status.json-only data source
+(consider per-worker `.fleet/detail/<w>.jsonl` or a WebSocket bridge vs 700 ms poll); steer latency
+(700 ms tick).
 
 ## Sequence
 
