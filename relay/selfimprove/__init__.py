@@ -43,6 +43,12 @@ from .l2 import (
     SpendCeiling,
     run_until,
 )
+from .policy import (
+    DatasetRotation,
+    plateaued,
+    evaluate_tripwires,
+    run_campaign,
+)
 
 __all__ = [
     "BurnedRegistry",
@@ -72,4 +78,8 @@ __all__ = [
     "run_iteration",
     "SpendCeiling",
     "run_until",
+    "DatasetRotation",
+    "plateaued",
+    "evaluate_tripwires",
+    "run_campaign",
 ]
