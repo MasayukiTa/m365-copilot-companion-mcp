@@ -49,6 +49,11 @@ from .policy import (
     evaluate_tripwires,
     run_campaign,
 )
+from .targeting import (
+    next_target,
+    assemble_misses,
+    improvement_plan,
+)
 from .calibration import (
     calibration_report,
     competence,
@@ -110,4 +115,7 @@ __all__ = [
     "competence",
     "recommend_effort",
     "classify_instance",
+    "next_target",
+    "assemble_misses",
+    "improvement_plan",
 ]
