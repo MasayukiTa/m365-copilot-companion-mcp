@@ -49,6 +49,10 @@ from .policy import (
     evaluate_tripwires,
     run_campaign,
 )
+from .dashboard import (
+    dashboard_state,
+    render_text,
+)
 from .apply import (
     active_genome,
     apply_genome,
@@ -94,4 +98,6 @@ __all__ = [
     "revert",
     "safe_commit",
     "SCAFFOLD_ALLOWLIST",
+    "dashboard_state",
+    "render_text",
 ]
