@@ -4,6 +4,12 @@
 
 - **SWE-bench Lite 300 strong scaffold (2026-06-20): 215/300 = 71.7% pass@1**.
   Wilson 95% CI: **[66.3%, 76.5%]**.
+- **SWE-bench Verified fresh slice (2026-06-24): 153/200 = 76.5% pass@1**.
+  Wilson 95% CI: **[70.2%, 81.8%]**. Fresh, non-burned instances (zero overlap with the 60 used
+  for the Lite failure analysis), so this is a clean generalization check of the same scaffold on
+  a different official set. The full 200-instance run is now graded: the final 38 completed on the
+  rebuilt eval host (32 resolved, 5 unresolved, 1 empty patch counted as unresolved, 0 harness
+  errors), so this is the complete run rather than a lower bound.
 - Protocol: solve locally with the general strong scaffold, then grade each produced patch once
   with the official SWE-bench harness on kiyus. No hidden official-test feedback was fed back into
   the solve loop.
