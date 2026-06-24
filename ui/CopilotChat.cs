@@ -928,6 +928,26 @@ class ChatWindow : Window
         _input.Focus();
     }
 
+    string CommandHelpText()
+    {
+        return "チャットコマンド:\n"
+            + "/help - この一覧\n"
+            + "/research - Claude researcher で深掘り調査\n"
+            + "/analyze - ファイル分析\n"
+            + "/summarize - 要約\n"
+            + "/translate <言語> <文> - 翻訳\n"
+            + "/plan - ステップ計画\n"
+            + "/critique - 批判的レビュー\n"
+            + "/proofread - 校正\n"
+            + "/rewrite - 文体変更\n"
+            + "/brainstorm - アイデア出し\n"
+            + "/steps - 手順化\n"
+            + "/eli5 - やさしく説明\n"
+            + "/proscons - 賛否表\n"
+            + "/table - 表作成\n"
+            + "\nフリート入力欄にも /help を追加済み。フリート側は /code /fix /test /refactor /doc /review /research を展開します。";
+    }
+
     [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
     // Launch (or focus) the parallel-execution cockpit -- so the user never has to close
     // everything and restart just to reach it.
@@ -998,6 +1018,18 @@ class ChatWindow : Window
     // ── sidebar list with rename / delete ───────────────────────────────────────
     void RefreshConvList()
     {
+        // Sort the sidebar by RECENCY (newest last-activity first) instead of the previous
+        // alphabetical-by-title order. Every Conversation carries a Ts (unix secs): .chat convs from
+        // their file mtime, fleet/registry convs from their transcript mtime, live convs bumped on
+        // save/new. Stable: equal-Ts entries keep their insertion order (index tiebreak), so a Ts==0
+        // conv (e.g. never-saved placeholder) preserves its position rather than jumping alphabetically.
+        var idx = new Dictionary<Conversation, int>();
+        for (int i = 0; i < _all.Count; i++) idx[_all[i]] = i;
+        _all.Sort(delegate (Conversation a, Conversation b)
+        {
+            int c = b.Ts.CompareTo(a.Ts);            // descending Ts (newest first)
+            return c != 0 ? c : idx[a].CompareTo(idx[b]);   // stable tiebreak on original index
+        });
         _convList.Children.Clear();
         foreach (var c in _all)
         {
@@ -1089,6 +1121,7 @@ class ChatWindow : Window
     {
         new Thread((ThreadStart)delegate { try { HttpGet("/new"); } catch { } }) { IsBackground = true }.Start();
         _conv = new Conversation();
+        _conv.Ts = (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
         _all.Insert(0, _conv);
         _messages.Children.Clear();
         _activeFleetUrl = null; RefreshSteerVisual();
@@ -1715,6 +1748,13 @@ class ChatWindow : Window
     {
         var text = _input.Text.Trim();
         if (text.Length == 0 || !_send.IsEnabled) return;
+        if (text.Equals("/help", StringComparison.OrdinalIgnoreCase))
+        {
+            _input.Clear();
+            AddUser(text);
+            AddAssistant(CommandHelpText());
+            return;
+        }
 
         // #3: while a fleet is at capacity, a native send would open a 4th heavy tab
         // and blow the memory budget -> route it into the fleet queue instead. Prefix
@@ -1998,6 +2038,8 @@ class ChatWindow : Window
     {
         try
         {
+            // bump last-activity so the recency-sorted sidebar floats this chat to the top on save
+            c.Ts = (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
             Directory.CreateDirectory(StoreDir);
             var sb = new StringBuilder();
             sb.Append("CONV\t").Append(c.ConvUrl == null ? "" : c.ConvUrl).Append('\n');
@@ -2020,6 +2062,10 @@ class ChatWindow : Window
                 foreach (var f in files)
                 {
                     var c = new Conversation { Id = Path.GetFileNameWithoutExtension(f), Messages = new List<Msg>() };
+                    // stamp last-activity from the file mtime so the sidebar can sort by RECENCY
+                    // (newest first) rather than alphabetically. Fleet/registry convs already carry Ts.
+                    try { c.Ts = (File.GetLastWriteTimeUtc(f) - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds; }
+                    catch { c.Ts = 0; }
                     foreach (var ln in File.ReadAllLines(f, Encoding.UTF8))
                     {
                         var tab = ln.IndexOf('\t'); if (tab < 0) continue;

@@ -67,6 +67,9 @@ class CockpitWindow : Window
                                // (~3 on a 16 GB box, far more on a big-RAM machine), so this is the
                                // upper RAIL, not a hardware bound. Real limiters: free RAM + M365
                                // Copilot per-user fair-use/rate limits.
+    double _diskFloor = 6.0;   // admission disk floor (GB) -> settings.txt disk_floor_gb=; user-editable
+                               // in the settings panel. Persisted via SaveKey AND pushed live to a
+                               // running fleet via {"set_disk_floor_gb":N} (fleet_runner.py ~L561).
     string _effort = "auto";   // effort mode min|max|ultra|auto -> settings.txt effort= (NEW)
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
     bool _paused = false;      // local fleet pause/resume toggle state (NEW)
@@ -87,8 +90,7 @@ class CockpitWindow : Window
         "copilot-bridge", "settings.txt");
 
     TextBlock _header, _sub;
-    Button _themeBtn, _langBtn, _mainBtn;
-    TextBlock _maxLbl;
+    Button _themeBtn, _langBtn, _mainBtn, _siBtn;
     Border _headBar;
     ListBox _list;                 // virtualizing host for the card/history rows
     // Persistent row backing store. We bind this to _list.ItemsSource ONCE and only ever mutate
@@ -234,6 +236,17 @@ class CockpitWindow : Window
         if (k == "resume") return ja ? "再開" : "Resume";
         if (k == "stopall") return ja ? "全停止" : "Stop all";
         if (k == "steer_dead") return ja ? "走行が停止中のため割り込めません（再開後にどうぞ）" : "No run live — can't steer (resume the fleet first)";
+        // Capacity-wait banner (admission gate) + force-start
+        // Settings panel (gear popup) -- consolidates the scattered toolbar controls
+        if (k == "settings") return ja ? "設定" : "Settings";
+        if (k == "set_tabs_section") return ja ? "並列タブ" : "Parallel tabs";
+        if (k == "set_retry_section") return ja ? "自動再試行" : "Auto-retry";
+        if (k == "set_capacity_section") return ja ? "容量ガード" : "Capacity guard";
+        if (k == "disk_floor") return ja ? "実行下限ディスク (GB)" : "Disk floor (GB)";
+        if (k == "disk_floor_hint") return ja ? "空きディスクがこの値を下回るとタブ開放を待機します。" : "Pauses opening tabs when free disk drops below this.";
+        if (k == "force_start") return ja ? "強制開始" : "Force start";
+        if (k == "floor_restore") return ja ? "床を戻す" : "Restore floor";
+        if (k == "floor_off") return ja ? "容量床 OFF（強制実行中）" : "Disk floor OFF (force-running)";
         return k;
     }
     string StatusLabel(string s)
@@ -299,6 +312,13 @@ class CockpitWindow : Window
                 else if (ln.StartsWith("autoscale=")) _autoscale = ln.Substring(10).Trim() == "1";
                 else if (ln.StartsWith("autoretry_max=") && int.TryParse(ln.Substring(14).Trim(), out v)) _autoRetryMax = Math.Max(1, Math.Min(3, v));
                 else if (ln.StartsWith("autoretry=")) _autoRetry = ln.Substring(10).Trim() == "1";
+                else if (ln.StartsWith("disk_floor_gb="))
+                {
+                    double df;
+                    if (double.TryParse(ln.Substring(14).Trim(), System.Globalization.NumberStyles.Float,
+                                        System.Globalization.CultureInfo.InvariantCulture, out df))
+                        _diskFloor = Math.Max(0.0, Math.Min(100.0, df));
+                }
                 else if (ln.StartsWith("effort="))
                 {
                     string ef = ln.Substring(7).Trim();
@@ -409,11 +429,13 @@ class CockpitWindow : Window
         ctrls.Children.Add(EffortControl());
         ctrls.Children.Add(ApprovalControl());
         ctrls.Children.Add(FleetControls());
+        // gear -> settings popup consolidating the scattered start/上限/retry/disk-floor controls.
+        ctrls.Children.Add(SettingsControl());
         _mainBtn = IconButton("chat", 18);
         _mainBtn.ToolTip = _lang == 0 ? "メイン (チャット) を開く" : "Open main chat";
         _mainBtn.Click += delegate { OpenMain(); };
         ctrls.Children.Add(_mainBtn);
-        var _siBtn = IconButton("account_tree", 18);
+        _siBtn = IconButton("account_tree", 18);
         _siBtn.ToolTip = _lang == 0 ? "自己改善ダッシュボード" : "Self-improvement dashboard";
         _siBtn.Click += delegate { new SelfImproveDashboardWindow().Show(); };
         ctrls.Children.Add(_siBtn);
@@ -428,14 +450,10 @@ class CockpitWindow : Window
         Grid.SetColumn(ctrls, 1); Grid.SetRow(ctrls, 0);
         headRow.Children.Add(ctrls);
 
-        // title (icon + title) -- row 0, col 0
+        // title -- row 0, col 0 (satellite icon removed per UX feedback; the title now sits flush left)
         var titleRow = new DockPanel { LastChildFill = true };
         titleRow.VerticalAlignment = VerticalAlignment.Center;
         titleRow.Margin = new Thickness(0, 0, 12, 0);
-        _iconHost = new ContentControl(); _iconHost.VerticalAlignment = VerticalAlignment.Center;
-        _iconHost.Margin = new Thickness(0, 0, 10, 0);
-        DockPanel.SetDock(_iconHost, Dock.Left);
-        titleRow.Children.Add(_iconHost);
         _header = new TextBlock(); _header.FontSize = 22; _header.FontWeight = FontWeights.SemiBold;
         _header.VerticalAlignment = VerticalAlignment.Center;
         _header.TextTrimming = TextTrimming.CharacterEllipsis; _header.TextWrapping = TextWrapping.NoWrap;
@@ -445,7 +463,7 @@ class CockpitWindow : Window
 
         // subtitle -- its OWN row spanning BOTH columns, so the long elapsed+ETA line uses the full
         // width and is never clipped by the controls column. Wrap (not ellipsis) so it's never hidden.
-        _sub = new TextBlock(); _sub.FontSize = 13; _sub.Margin = new Thickness(38, 4, 18, 0);
+        _sub = new TextBlock(); _sub.FontSize = 13; _sub.Margin = new Thickness(0, 4, 18, 0);
         _sub.TextWrapping = TextWrapping.Wrap;
         Grid.SetColumn(_sub, 0); Grid.SetColumnSpan(_sub, 2); Grid.SetRow(_sub, 1);
         headRow.Children.Add(_sub);
@@ -454,6 +472,7 @@ class CockpitWindow : Window
         root.Children.Add(_headBar);
         root.Children.Add(BuildInputBar());
         root.Children.Add(BuildMtBanner());
+        root.Children.Add(BuildCapBanner());
 
         // Virtualizing card list. A ListBox brings its own ScrollViewer + VirtualizingStackPanel,
         // so with 100-164 cards only the ~10-20 visible rows are realized -> scrolling and
@@ -853,7 +872,8 @@ class CockpitWindow : Window
         return (r == true) ? box[0] : null;
     }
 
-    ContentControl _iconHost;
+    System.Windows.Controls.Primitives.Popup _settingsPopup;
+    Button _gearBtn;
     Button _maxMinus, _maxPlus;
     ComboBox _effortBox;
     ComboBox _approvalBox;
@@ -862,18 +882,18 @@ class CockpitWindow : Window
     Button _autoMinus, _autoPlus;
     TextBlock _autoLbl, _autoValue;
 
-    // Autoscale control GROUP: [ RAM自動調整: ON/OFF ]  [開始(デフォルト) − N +]  [上限 − M +].
-    // Replaces the old single max-tabs stepper. The ceiling stepper greys out when autoscale
-    // is off (it only matters under autoscale). All three live-apply via SetMaxTabs/SetAutoMax/
-    // the toggle handler, which route to RequestSetAutoscale or RequestSetMaxtabs as appropriate.
+    // Autoscale control GROUP (header): just [ RAM自動調整: ON/OFF ]. The 開始(デフォルト) and 上限
+    // steppers were moved OUT of the header into the settings panel (gear popup); only the toggle
+    // remains here. The toggle live-applies via RequestSetAutoscale/RequestSetMaxtabs; the steppers
+    // in settings route through SetMaxTabs/SetAutoMax.
     UIElement AutoscaleControls()
     {
         var group = new StackPanel(); group.Orientation = Orientation.Horizontal;
         group.VerticalAlignment = VerticalAlignment.Center; group.Margin = new Thickness(0, 0, 12, 0);
         // GAP5: explain this dense cluster -- the two −/+ steppers were indistinguishable.
         group.ToolTip = _lang == 0
-            ? "並列タブ数の制御。RAM自動調整=ON なら空きRAMに応じて自動増減。\n「開始」=最初に開くタブ数、「上限」=自動調整時の最大タブ数。"
-            : "Parallel-tab controls. Autoscale ON adjusts to free RAM.\n'Start' = tabs opened initially, 'Ceiling' = max tabs under autoscale.";
+            ? "RAM自動調整=ON なら空きRAMに応じて並列タブ数を自動増減。開始タブ数・上限は設定（⚙）内。"
+            : "Autoscale ON auto-adjusts parallel tabs to free RAM. Start count & ceiling live in Settings (⚙).";
 
         // a. autoscale ON/OFF toggle (simple themed button whose label flips)
         _autoToggle = new Button();
@@ -895,10 +915,18 @@ class CockpitWindow : Window
         };
         group.Children.Add(_autoToggle);
 
-        // b. the EXISTING max-tabs stepper, relabeled as the default/start.
-        group.Children.Add(MaxTabsStepper());
+        // b+c. Both the start (開始/デフォルト) and ceiling (上限) steppers were RELOCATED into the
+        //    settings panel (gear popup) to declutter the header. BuildSettingsPanel builds both and
+        //    keeps the _max*/_auto* field refs, so PaintChrome/UpdateAutoEnabled/SetMaxTabs/SetAutoMax
+        //    keep driving them. Only the autoscale ON/OFF toggle remains in the header.
+        return group;
+    }
 
-        // c. NEW ceiling stepper (mirrors MaxTabsStepper's −/+ pattern).
+    // Ceiling (上限) stepper -- mirrors MaxTabsStepper's −/+ pattern. Lives in the settings panel.
+    // Reuses the _autoLbl/_autoMinus/_autoValue/_autoPlus fields so PaintChrome/UpdateAutoEnabled/
+    // SetAutoMax keep driving it unchanged.
+    UIElement CeilingStepper()
+    {
         var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
         wrap.VerticalAlignment = VerticalAlignment.Center;
         _autoLbl = new TextBlock(); _autoLbl.VerticalAlignment = VerticalAlignment.Center;
@@ -915,9 +943,144 @@ class CockpitWindow : Window
         _autoPlus = MiniButton("+");
         _autoPlus.Click += delegate { SetAutoMax(_autoMax + 1); };
         wrap.Children.Add(_autoPlus);
-        group.Children.Add(wrap);
+        return wrap;
+    }
 
-        return group;
+    // ── settings panel (gear popup) ──────────────────────────────────────────────
+    // A gear button that opens a Popup consolidating the formerly-scattered toolbar controls:
+    // start tabs, ceiling (上限) tabs, auto-retry on/off, retry cap, and the NEW user-editable
+    // disk floor (GB). Built fresh on every open so theme/lang are always current. Uses the same
+    // flat control templates (MiniButton/FlatButtonTemplate) the rest of the cockpit uses.
+    UIElement SettingsControl()
+    {
+        _gearBtn = IconButton("settings", 18);
+        _gearBtn.ToolTip = _lang == 0 ? "設定（タブ数・再試行・容量床）" : "Settings (tabs / retry / disk floor)";
+        _settingsPopup = new System.Windows.Controls.Primitives.Popup();
+        _settingsPopup.PlacementTarget = _gearBtn;
+        _settingsPopup.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom;
+        _settingsPopup.StaysOpen = false;          // click-away closes it
+        _settingsPopup.AllowsTransparency = true;
+        _gearBtn.Click += delegate
+        {
+            if (_settingsPopup.IsOpen) { _settingsPopup.IsOpen = false; return; }
+            _settingsPopup.Child = BuildSettingsPanel();   // rebuild so theme/lang/values are fresh
+            _settingsPopup.IsOpen = true;
+        };
+        return _gearBtn;
+    }
+
+    // One labeled −/+ stepper row for the settings panel. label on the left, [− value +] on the right.
+    UIElement SettingsStepperRow(string label, TextBlock valueBlock, Button minus, Button plus)
+    {
+        var row = new DockPanel(); row.Margin = new Thickness(0, 5, 0, 5); row.LastChildFill = false;
+        var lbl = new TextBlock(); lbl.Text = label; lbl.Foreground = Fg; lbl.FontSize = 12.5;
+        lbl.VerticalAlignment = VerticalAlignment.Center;
+        DockPanel.SetDock(lbl, Dock.Left); row.Children.Add(lbl);
+        var stp = new StackPanel(); stp.Orientation = Orientation.Horizontal;
+        stp.VerticalAlignment = VerticalAlignment.Center;
+        DockPanel.SetDock(stp, Dock.Right);
+        stp.Children.Add(minus);
+        valueBlock.Foreground = Fg; valueBlock.FontSize = 13; valueBlock.FontWeight = FontWeights.SemiBold;
+        valueBlock.Margin = new Thickness(10, 0, 10, 0); valueBlock.MinWidth = 28;
+        valueBlock.TextAlignment = TextAlignment.Center; valueBlock.VerticalAlignment = VerticalAlignment.Center;
+        stp.Children.Add(valueBlock);
+        stp.Children.Add(plus);
+        row.Children.Add(stp);
+        return row;
+    }
+
+    TextBlock _diskFloorVal;
+    TextBlock SectionHeader(string text)
+    {
+        var t = new TextBlock(); t.Text = text; t.Foreground = Muted; t.FontSize = 11;
+        t.FontWeight = FontWeights.SemiBold; t.Margin = new Thickness(0, 10, 0, 2);
+        return t;
+    }
+
+    UIElement BuildSettingsPanel()
+    {
+        var card = new Border();
+        card.Background = CardBg; card.BorderBrush = Border; card.BorderThickness = new Thickness(1);
+        card.CornerRadius = new CornerRadius(10); card.Padding = new Thickness(16, 12, 16, 14);
+        card.Margin = new Thickness(0, 6, 8, 6); card.MinWidth = 280;
+        // soft shadow so the floating panel reads as elevated
+        card.Effect = new System.Windows.Media.Effects.DropShadowEffect
+        { BlurRadius = 16, ShadowDepth = 2, Opacity = 0.28, Color = C("#000000") };
+
+        var col = new StackPanel(); col.Orientation = Orientation.Vertical;
+
+        var title = new TextBlock(); title.Text = T("settings"); title.Foreground = Fg;
+        title.FontSize = 14; title.FontWeight = FontWeights.SemiBold; title.Margin = new Thickness(0, 0, 0, 4);
+        col.Children.Add(title);
+
+        // ── Parallel tabs: start + ceiling (上限) steppers ──
+        col.Children.Add(SectionHeader(T("set_tabs_section")));
+        var startMinus = MiniButton("−"); startMinus.Click += delegate { SetMaxTabs(_maxtabs - 1); };
+        var startPlus = MiniButton("+"); startPlus.Click += delegate { SetMaxTabs(_maxtabs + 1); };
+        _maxMinus = startMinus; _maxPlus = startPlus;   // keep refs so PaintChrome re-themes them (mirrors ceiling)
+        _maxValue = new TextBlock(); _maxValue.Text = _maxtabs.ToString();
+        col.Children.Add(SettingsStepperRow(T("def_tabs"), _maxValue, startMinus, startPlus));
+        // ceiling stepper -- reuses _autoLbl/_autoMinus/_autoValue/_autoPlus via CeilingStepper fields
+        var ceilMinus = MiniButton("−"); ceilMinus.Click += delegate { SetAutoMax(_autoMax - 1); };
+        var ceilPlus = MiniButton("+"); ceilPlus.Click += delegate { SetAutoMax(_autoMax + 1); };
+        _autoValue = new TextBlock(); _autoValue.Text = _autoMax.ToString();
+        _autoMinus = ceilMinus; _autoPlus = ceilPlus;   // keep refs so UpdateAutoEnabled can grey them
+        col.Children.Add(SettingsStepperRow(T("max_tabs2"), _autoValue, ceilMinus, ceilPlus));
+
+        // ── Auto-retry: on/off toggle + cap ──
+        col.Children.Add(SectionHeader(T("set_retry_section")));
+        _autoRetryBtn = new Button();
+        _autoRetryBtn.BorderThickness = new Thickness(1); _autoRetryBtn.Cursor = Cursors.Hand;
+        _autoRetryBtn.Padding = new Thickness(10, 4, 10, 4); _autoRetryBtn.FontSize = 12;
+        _autoRetryBtn.FontWeight = FontWeights.SemiBold; _autoRetryBtn.HorizontalAlignment = HorizontalAlignment.Left;
+        _autoRetryBtn.Margin = new Thickness(0, 2, 0, 4);
+        _autoRetryBtn.Template = FlatButtonTemplate();
+        _autoRetryBtn.ToolTip = _lang == 0
+            ? "停止したゴールを自動で再投入（上限まで・既定OFF）。無限ループは起きません。"
+            : "Auto re-queue stopped goals (up to the cap; default OFF). Never loops forever.";
+        _autoRetryBtn.Click += delegate { _autoRetry = !_autoRetry; SaveKey("autoretry", _autoRetry ? "1" : "0"); PaintAutoRetryBtn(); };
+        PaintAutoRetryBtn();
+        col.Children.Add(_autoRetryBtn);
+        var capMinus = MiniButton("−"); capMinus.Click += delegate { SetAutoRetryMax(_autoRetryMax - 1); };
+        var capPlus = MiniButton("+"); capPlus.Click += delegate { SetAutoRetryMax(_autoRetryMax + 1); };
+        _autoRetryCapVal = new TextBlock(); _autoRetryCapVal.Text = _autoRetryMax.ToString();
+        col.Children.Add(SettingsStepperRow(T("cap"), _autoRetryCapVal, capMinus, capPlus));
+
+        // ── Capacity guard: NEW user-editable disk floor (GB) ──
+        col.Children.Add(SectionHeader(T("set_capacity_section")));
+        var dfMinus = MiniButton("−"); dfMinus.Click += delegate { SetDiskFloor(_diskFloor - 1.0); };
+        var dfPlus = MiniButton("+"); dfPlus.Click += delegate { SetDiskFloor(_diskFloor + 1.0); };
+        _diskFloorVal = new TextBlock(); _diskFloorVal.Text = FmtFloor(_diskFloor);
+        col.Children.Add(SettingsStepperRow(T("disk_floor"), _diskFloorVal, dfMinus, dfPlus));
+        var hint = new TextBlock(); hint.Text = T("disk_floor_hint"); hint.Foreground = Muted;
+        hint.FontSize = 10.5; hint.TextWrapping = TextWrapping.Wrap; hint.Margin = new Thickness(0, 0, 0, 2);
+        col.Children.Add(hint);
+
+        card.Child = col;
+        UpdateAutoEnabled();   // grey the ceiling stepper if autoscale is off
+        return card;
+    }
+
+    static string FmtFloor(double v)
+    {
+        return v.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    // Disk floor (GB) setter: clamp, persist via SaveKey, refresh the panel value, AND push the new
+    // floor LIVE to a running fleet via {"set_disk_floor_gb":N} through the SAME merge-with-existing
+    // ReadCommands->WriteCommands path Pause/ForceStart use, so the runner (fleet_runner.py ~L561)
+    // picks it up on its next ~1s poll. Mirrors how 強制開始 writes the floor live.
+    void SetDiskFloor(double v)
+    {
+        _diskFloor = Math.Max(0.0, Math.Min(100.0, Math.Round(v, 1)));
+        SaveKey("disk_floor_gb", FmtFloor(_diskFloor));
+        if (_diskFloorVal != null) _diskFloorVal.Text = FmtFloor(_diskFloor);
+        if (RunIsLive())
+        {
+            var cmd = ReadCommands();
+            cmd["set_disk_floor_gb"] = _diskFloor;
+            WriteCommands(cmd);
+        }
     }
 
     // Effort selector: a [推論] label + a DROPDOWN (ComboBox) listing min/max/ultra/auto.
@@ -962,6 +1125,126 @@ class CockpitWindow : Window
         // re-firing the persist handler -- assigning the same value is a no-op for SelectionChanged.
         if (!Equals(_effortBox.SelectedItem, _effort)) _effortBox.SelectedItem = _effort;
         _effortBox.Background = BtnBg; _effortBox.Foreground = Fg; _effortBox.BorderBrush = Border;
+        StyleFlatCombo(_effortBox);   // re-template each paint so a theme toggle retints resting + popup
+    }
+
+    // WPY ComboBox bug fix: the stock Aero ControlTemplate ignores Background/Foreground and
+    // paints a SYSTEM-themed toggle (a light/dark fill that does NOT track our slate theme -- in
+    // LIGHT mode it shows as a dark box). We replace the whole template with a flat one whose
+    // toggle border, the editable area, and the dropdown Popup/items are bound to OUR theme
+    // brushes, so resting + open states match the cockpit in both dark and light. Built entirely
+    // in code-behind (no XAML) via FrameworkElementFactory, and re-applied on every PaintEffort/
+    // PaintApproval so toggling the theme retints it. Reusable for both dropdowns.
+    void StyleFlatCombo(ComboBox cb)
+    {
+        if (cb == null) return;
+        var tmpl = new ControlTemplate(typeof(ComboBox));
+
+        // root grid: [content area *][toggle arrow auto], wrapped by a themed border
+        var border = new FrameworkElementFactory(typeof(System.Windows.Controls.Border), "Bd");
+        border.SetValue(System.Windows.Controls.Border.BackgroundProperty, BtnBg);
+        border.SetValue(System.Windows.Controls.Border.BorderBrushProperty, Border);
+        border.SetValue(System.Windows.Controls.Border.BorderThicknessProperty, new Thickness(1));
+        border.SetValue(System.Windows.Controls.Border.CornerRadiusProperty, new CornerRadius(4));
+
+        var grid = new FrameworkElementFactory(typeof(Grid));
+        var c0 = new FrameworkElementFactory(typeof(ColumnDefinition));
+        c0.SetValue(ColumnDefinition.WidthProperty, new GridLength(1, GridUnitType.Star));
+        var c1 = new FrameworkElementFactory(typeof(ColumnDefinition));
+        c1.SetValue(ColumnDefinition.WidthProperty, GridLength.Auto);
+        grid.AppendChild(c0); grid.AppendChild(c1);
+
+        // an invisible ToggleButton spanning both columns IS the click target that opens the popup.
+        // Its template is just a transparent border so it contributes no system chrome of its own.
+        var toggle = new FrameworkElementFactory(typeof(ToggleButton));
+        toggle.SetValue(Grid.ColumnSpanProperty, 2);
+        toggle.SetValue(ToggleButton.BackgroundProperty, Brushes.Transparent);
+        toggle.SetValue(ToggleButton.BorderThicknessProperty, new Thickness(0));
+        toggle.SetValue(ToggleButton.FocusableProperty, false);
+        toggle.SetValue(ToggleButton.IsTabStopProperty, false);
+        var togTmpl = new ControlTemplate(typeof(ToggleButton));
+        var togBd = new FrameworkElementFactory(typeof(System.Windows.Controls.Border));
+        togBd.SetValue(System.Windows.Controls.Border.BackgroundProperty, Brushes.Transparent);
+        togTmpl.VisualTree = togBd;
+        toggle.SetValue(ToggleButton.TemplateProperty, togTmpl);
+        var togBind = new System.Windows.Data.Binding("IsDropDownOpen");
+        togBind.RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent);
+        togBind.Mode = BindingMode.TwoWay;
+        toggle.SetBinding(ToggleButton.IsCheckedProperty, togBind);
+
+        // the selected-value text (column 0)
+        var cp = new FrameworkElementFactory(typeof(ContentPresenter));
+        cp.SetValue(Grid.ColumnProperty, 0);
+        var selBind = new System.Windows.Data.Binding("SelectionBoxItem");
+        selBind.RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent);
+        cp.SetBinding(ContentPresenter.ContentProperty, selBind);
+        cp.SetValue(ContentPresenter.MarginProperty, new Thickness(8, 2, 2, 2));
+        cp.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
+        cp.SetValue(System.Windows.Documents.TextElement.ForegroundProperty, Fg);
+        cp.SetValue(UIElement.IsHitTestVisibleProperty, false);
+
+        // a small themed arrow glyph (column 1)
+        var arrow = new FrameworkElementFactory(typeof(System.Windows.Shapes.Path));
+        arrow.SetValue(Grid.ColumnProperty, 1);
+        arrow.SetValue(System.Windows.Shapes.Path.DataProperty, Geometry.Parse("M 0 0 L 8 0 L 4 5 Z"));
+        arrow.SetValue(System.Windows.Shapes.Path.FillProperty, Muted);
+        arrow.SetValue(System.Windows.Shapes.Path.MarginProperty, new Thickness(4, 0, 8, 0));
+        arrow.SetValue(System.Windows.Shapes.Path.VerticalAlignmentProperty, VerticalAlignment.Center);
+        arrow.SetValue(UIElement.IsHitTestVisibleProperty, false);
+
+        // the dropdown popup: a themed border around the item host, so the OPEN list also matches.
+        var popup = new FrameworkElementFactory(typeof(Popup), "PART_Popup");
+        popup.SetValue(Popup.PlacementProperty, PlacementMode.Bottom);
+        popup.SetValue(Popup.AllowsTransparencyProperty, true);
+        popup.SetValue(Popup.FocusableProperty, false);
+        var popBind = new System.Windows.Data.Binding("IsDropDownOpen");
+        popBind.RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent);
+        popup.SetBinding(Popup.IsOpenProperty, popBind);
+        var popBd = new FrameworkElementFactory(typeof(System.Windows.Controls.Border));
+        popBd.SetValue(System.Windows.Controls.Border.BackgroundProperty, CardBg);
+        popBd.SetValue(System.Windows.Controls.Border.BorderBrushProperty, Border);
+        popBd.SetValue(System.Windows.Controls.Border.BorderThicknessProperty, new Thickness(1));
+        popBd.SetValue(System.Windows.Controls.Border.CornerRadiusProperty, new CornerRadius(4));
+        popBd.SetValue(System.Windows.Controls.Border.MarginProperty, new Thickness(0, 2, 0, 0));
+        popBd.SetValue(FrameworkElement.MinWidthProperty, 78.0);
+        var sv = new FrameworkElementFactory(typeof(ScrollViewer));
+        sv.SetValue(ScrollViewer.MaxHeightProperty, 220.0);
+        var ip = new FrameworkElementFactory(typeof(ItemsPresenter));
+        sv.AppendChild(ip); popBd.AppendChild(sv); popup.AppendChild(popBd);
+
+        grid.AppendChild(toggle); grid.AppendChild(cp); grid.AppendChild(arrow); grid.AppendChild(popup);
+        border.AppendChild(grid);
+        tmpl.VisualTree = border;
+        cb.Template = tmpl;
+
+        // per-item style: themed background + Fg text + Accent-mix hover/selected, so the OPEN
+        // list never falls back to the system (dark) item chrome.
+        cb.ItemContainerStyle = FlatComboItemStyle();
+        cb.ApplyTemplate();
+    }
+
+    Style FlatComboItemStyle()
+    {
+        var st = new Style(typeof(ComboBoxItem));
+        st.Setters.Add(new Setter(Control.BackgroundProperty, BtnBg));
+        st.Setters.Add(new Setter(Control.ForegroundProperty, Fg));
+        st.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(8, 4, 8, 4)));
+        st.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(0)));
+        var it = new ControlTemplate(typeof(ComboBoxItem));
+        var bd = new FrameworkElementFactory(typeof(System.Windows.Controls.Border), "Bd");
+        bd.SetValue(System.Windows.Controls.Border.BackgroundProperty, new TemplateBindingExtension(Control.BackgroundProperty));
+        bd.SetValue(System.Windows.Controls.Border.PaddingProperty, new TemplateBindingExtension(Control.PaddingProperty));
+        var icp = new FrameworkElementFactory(typeof(ContentPresenter));
+        bd.AppendChild(icp);
+        it.VisualTree = bd;
+        // hover + selected -> an accent-tinted fill (matches the cockpit's hover idiom), still readable.
+        var hover = new Trigger { Property = ComboBoxItem.IsHighlightedProperty, Value = true };
+        hover.Setters.Add(new Setter(Control.BackgroundProperty,
+            new SolidColorBrush(Mix(C("#ea580c"), CardColor(), 0.22)), "Bd"));
+        hover.Setters.Add(new Setter(Control.ForegroundProperty, Fg));
+        it.Triggers.Add(hover);
+        st.Setters.Add(new Setter(Control.TemplateProperty, it));
+        return st;
     }
 
     // Approval selector: compact run/plan/auto mode next to effort. This avoids adding another
@@ -1005,6 +1288,7 @@ class CockpitWindow : Window
         if (_approvalBox == null) return;
         if (!Equals(_approvalBox.SelectedItem, _approval)) _approvalBox.SelectedItem = _approval;
         _approvalBox.Background = BtnBg; _approvalBox.Foreground = Fg; _approvalBox.BorderBrush = Border;
+        StyleFlatCombo(_approvalBox);   // same flat-template fix so the open list matches the theme
     }
 
     // Fleet-wide controls: Pause/Resume toggle + Stop-all. Both write into commands.json
@@ -1080,26 +1364,8 @@ class CockpitWindow : Window
         if (!live && _paused) { _paused = false; PaintPause(); }
     }
 
-    UIElement MaxTabsStepper()
-    {
-        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
-        wrap.VerticalAlignment = VerticalAlignment.Center; wrap.Margin = new Thickness(0, 0, 12, 0);
-        _maxLbl = new TextBlock(); _maxLbl.VerticalAlignment = VerticalAlignment.Center;
-        _maxLbl.FontSize = 12; _maxLbl.Margin = new Thickness(0, 0, 8, 0);
-        wrap.Children.Add(_maxLbl);
-        _maxMinus = MiniButton("−");
-        _maxMinus.Click += delegate { SetMaxTabs(_maxtabs - 1); };
-        wrap.Children.Add(_maxMinus);
-        _maxValue = new TextBlock(); _maxValue.VerticalAlignment = VerticalAlignment.Center;
-        _maxValue.FontSize = 13; _maxValue.FontWeight = FontWeights.SemiBold;
-        _maxValue.Margin = new Thickness(8, 0, 8, 0); _maxValue.MinWidth = 14;
-        _maxValue.TextAlignment = TextAlignment.Center;
-        wrap.Children.Add(_maxValue);
-        _maxPlus = MiniButton("+");
-        _maxPlus.Click += delegate { SetMaxTabs(_maxtabs + 1); };
-        wrap.Children.Add(_maxPlus);
-        return wrap;
-    }
+    // MaxTabsStepper() removed: the 開始(デフォルト) stepper now lives only in the settings panel
+    // (BuildSettingsPanel builds it inline and assigns _maxMinus/_maxPlus/_maxValue).
     TextBlock _maxValue;
 
     // Toggle label/colour: ON => accent bg + white text (contrast rule for saturated bg),
@@ -1254,12 +1520,184 @@ class CockpitWindow : Window
     }
     Button _mtApplyNow, _mtLater;
 
+    // ── TASK 1+2: capacity-wait banner + 強制開始 (force-start) ──────────────────────
+    // The runner's admission gate holds new workers in status=="pending"/pill=="待機列" whenever
+    // C: free drops below the reserved disk floor (or free RAM is too tight) -- but nothing told the
+    // user WHY a task just sits queued. This banner surfaces that condition reactively each OnTick
+    // and offers 強制開始, which disables the disk gate live via {"set_disk_floor_gb":0.0}
+    // (consumed by fleet_runner._drain_commands, fleet_runner.py ~L561-563). It's reversible: we
+    // capture the floor we zeroed and offer 床を戻す to write it back.
+    Border _capBanner;
+    TextBlock _capBannerLbl;
+    Button _capForceBtn, _capRestoreBtn;
+    bool _diskFloorForced = false;      // true once the user hit 強制開始 (gate disabled live)
+    double _diskFloorPrev = 0.0;        // the floor we zeroed, so 床を戻す can restore it
+
+    // RAM admission headroom (mirrors relay_fleet.auto_concurrency headroom_mb=2048): when free
+    // physical RAM is around/under this the runner can't open another tab. We additionally surface
+    // RAM in the banner when avail_mb is conspicuously low, even if disk is fine.
+    const int RAM_FLOOR_MB = 2048;
+
+    UIElement BuildCapBanner()
+    {
+        _capBanner = new Border();
+        _capBanner.Visibility = Visibility.Collapsed;
+        _capBanner.CornerRadius = new CornerRadius(10);
+        _capBanner.BorderThickness = new Thickness(1);
+        _capBanner.Padding = new Thickness(14, 9, 12, 9);
+        _capBanner.Margin = new Thickness(26, 0, 18, 6);
+        DockPanel.SetDock(_capBanner, Dock.Top);
+        var dp = new DockPanel();
+        var btns = new StackPanel(); btns.Orientation = Orientation.Horizontal;
+        btns.HorizontalAlignment = HorizontalAlignment.Right;
+        DockPanel.SetDock(btns, Dock.Right);
+        _capForceBtn = new Button();
+        _capForceBtn.Cursor = Cursors.Hand; _capForceBtn.BorderThickness = new Thickness(0);
+        _capForceBtn.Padding = new Thickness(12, 4, 12, 4); _capForceBtn.FontWeight = FontWeights.SemiBold;
+        _capForceBtn.Template = FlatButtonTemplate();
+        _capForceBtn.Click += delegate { ForceStart(); };
+        btns.Children.Add(_capForceBtn);
+        _capRestoreBtn = new Button();
+        _capRestoreBtn.Cursor = Cursors.Hand; _capRestoreBtn.BorderThickness = new Thickness(1);
+        _capRestoreBtn.Padding = new Thickness(12, 4, 12, 4); _capRestoreBtn.Margin = new Thickness(8, 0, 0, 0);
+        _capRestoreBtn.Template = FlatButtonTemplate();
+        _capRestoreBtn.Visibility = Visibility.Collapsed;
+        _capRestoreBtn.Click += delegate { RestoreFloor(); };
+        btns.Children.Add(_capRestoreBtn);
+        dp.Children.Add(btns);
+        _capBannerLbl = new TextBlock();
+        _capBannerLbl.VerticalAlignment = VerticalAlignment.Center; _capBannerLbl.FontSize = 13;
+        _capBannerLbl.TextWrapping = TextWrapping.Wrap;
+        dp.Children.Add(_capBannerLbl);
+        _capBanner.Child = dp;
+        return _capBanner;
+    }
+
+    // Reactively show/hide the capacity-wait banner each tick. Condition: a LIVE run with at least
+    // one worker held at "pending"/"待機列" AND (disk below floor OR RAM conspicuously low). Once
+    // the gate clears (or the run ends) the banner hides itself -- it never sticks.
+    void UpdateCapBanner(Dictionary<string, object> root)
+    {
+        if (_capBanner == null) return;
+
+        // The 床OFF (force-running) indicator is independent of the queue: while the user has the
+        // gate disabled, keep showing it (with 床を戻す) so the override is never silent.
+        if (_diskFloorForced)
+        {
+            _capBanner.Visibility = Visibility.Visible;
+            _capBannerLbl.Text = "⚠ " + T("floor_off");
+            _capForceBtn.Visibility = Visibility.Collapsed;
+            _capRestoreBtn.Visibility = Visibility.Visible;
+            _capRestoreBtn.Content = T("floor_restore");
+            return;
+        }
+
+        bool running = root != null && (!root.ContainsKey("running") || Convert.ToBoolean(root["running"]));
+        bool pendingHeld = false;
+        if (running && root.ContainsKey("workers") && root["workers"] is object[])
+            foreach (object o in (object[])root["workers"])
+            {
+                var w = o as Dictionary<string, object>;
+                if (w != null && S(w, "status") == "pending") { pendingHeld = true; break; }
+            }
+
+        double freeDisk = Dbl(root ?? new Dictionary<string, object>(), "free_disk_gb");
+        double floor = Dbl(root ?? new Dictionary<string, object>(), "disk_floor_gb");
+        int availMb = I(root ?? new Dictionary<string, object>(), "avail_mb");
+        bool diskGated = floor > 0 && freeDisk > 0 && freeDisk < floor;
+        bool ramGated = availMb > 0 && availMb < RAM_FLOOR_MB;
+
+        if (running && pendingHeld && (diskGated || ramGated))
+        {
+            _capForceBtn.Visibility = Visibility.Visible;
+            _capForceBtn.Content = T("force_start");
+            _capRestoreBtn.Visibility = Visibility.Collapsed;
+            string msg;
+            if (diskGated)
+            {
+                int need = (int)Math.Ceiling(floor - freeDisk);
+                msg = _lang == 0
+                    ? "⚠ 容量待機中 — ディスク空き " + freeDisk + "GB が床 " + floor + "GB 未満。"
+                      + need + "GB 空けるか『強制開始』で起動します。"
+                    : "⚠ Capacity wait — C: free " + freeDisk + "GB is under the " + floor + "GB floor. "
+                      + "Free " + need + "GB or hit Force start to admit now.";
+                if (ramGated)
+                    msg += _lang == 0 ? "（空きRAMも " + availMb + "MB と逼迫）"
+                                      : " (free RAM also tight at " + availMb + "MB)";
+            }
+            else
+            {
+                msg = _lang == 0
+                    ? "⚠ 容量待機中 — 空きRAM " + availMb + "MB が逼迫しているためタブを開けません。"
+                      + "他アプリを閉じるか『強制開始』で起動します。"
+                    : "⚠ Capacity wait — free RAM " + availMb + "MB is too tight to open a tab. "
+                      + "Close apps or hit Force start to admit now.";
+            }
+            _capBannerLbl.Text = msg;
+            _capBanner.Visibility = Visibility.Visible;
+        }
+        else
+        {
+            _capBanner.Visibility = Visibility.Collapsed;
+        }
+    }
+
+    // 強制開始: disable the disk gate live. Capture the current floor first so 床を戻す can restore
+    // it. Writes {"set_disk_floor_gb":0.0} via the SAME merge-with-existing WriteCommands path Pause
+    // uses, so a queued close/steer/set_maxtabs isn't clobbered. Consumed by fleet_runner.py ~L561.
+    void ForceStart()
+    {
+        if (!RunIsLive()) return;     // nothing alive to consume the command
+        var root = ReadStatus();
+        _diskFloorPrev = Dbl(root ?? new Dictionary<string, object>(), "disk_floor_gb");
+        var cmd = ReadCommands();
+        cmd["set_disk_floor_gb"] = 0.0;
+        WriteCommands(cmd);
+        _diskFloorForced = true;
+        UpdateCapBanner(root);
+    }
+
+    // 床を戻す: write the previously-captured floor back, re-arming the disk gate.
+    void RestoreFloor()
+    {
+        var cmd = ReadCommands();
+        cmd["set_disk_floor_gb"] = _diskFloorPrev;
+        WriteCommands(cmd);
+        _diskFloorForced = false;
+        UpdateCapBanner(ReadStatus());
+    }
+
     Button MiniButton(string txt)
     {
         var b = new Button(); b.Content = txt; b.Width = 26; b.Height = 26;
         b.FontSize = 15; b.Cursor = Cursors.Hand; b.BorderThickness = new Thickness(1);
         b.Padding = new Thickness(0); b.VerticalContentAlignment = VerticalAlignment.Center;
+        // theme fill/text/border at creation. The flat template TemplateBinds to these; the
+        // settings-panel steppers are built in BuildSettingsPanel and never re-themed by PaintChrome,
+        // so without this they fell back to the Button system default = the "wrong colour" reported.
+        b.Background = BtnBg; b.Foreground = Fg; b.BorderBrush = Border;
+        b.Template = FlatButtonTemplate();   // honour Background in BOTH themes (see FlatButtonTemplate)
         return b;
+    }
+
+    // The stock Aero Button template paints a SYSTEM gradient over our Background and a light/dark
+    // system hover -> in LIGHT mode the −/+ steppers read as a dark/grey box that ignores BtnBg.
+    // This flat template binds the fill/stroke straight to the control's Background/BorderBrush, so
+    // the steppers track our theme exactly. Built in code-behind (no XAML), reused for all MiniButtons.
+    ControlTemplate FlatButtonTemplate()
+    {
+        var t = new ControlTemplate(typeof(Button));
+        var bd = new FrameworkElementFactory(typeof(System.Windows.Controls.Border), "Bd");
+        bd.SetValue(System.Windows.Controls.Border.BackgroundProperty, new TemplateBindingExtension(Control.BackgroundProperty));
+        bd.SetValue(System.Windows.Controls.Border.BorderBrushProperty, new TemplateBindingExtension(Control.BorderBrushProperty));
+        bd.SetValue(System.Windows.Controls.Border.BorderThicknessProperty, new TemplateBindingExtension(Control.BorderThicknessProperty));
+        bd.SetValue(System.Windows.Controls.Border.CornerRadiusProperty, new CornerRadius(4));
+        var cp = new FrameworkElementFactory(typeof(ContentPresenter));
+        cp.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+        cp.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
+        bd.AppendChild(cp);
+        t.VisualTree = bd;
+        return t;
     }
     Button IconButton(string glyph, double size)
     {
@@ -1276,13 +1714,13 @@ class CockpitWindow : Window
         _header.Foreground = Fg;
         _sub.Foreground = Muted;
         if (_list != null) _list.Background = Bg;
-        _iconHost.Content = MakeIcon("satellite_alt", 26, Accent);
+        // satellite icon removed per UX feedback -- nothing to paint at top-left of the title row.
         // restyle the header buttons for the theme
-        foreach (Button b in new Button[] { _mainBtn, _themeBtn, _langBtn, _maxMinus, _maxPlus, _autoMinus, _autoPlus })
+        foreach (Button b in new Button[] { _mainBtn, _siBtn, _themeBtn, _langBtn, _gearBtn, _maxMinus, _maxPlus, _autoMinus, _autoPlus })
             if (b != null) { b.Background = BtnBg; b.Foreground = Fg; b.BorderBrush = Border; }
+        if (_gearBtn != null) _gearBtn.Content = MakeIcon("settings", 18, Fg);
         _themeBtn.Content = MakeIcon(_dark ? "light_mode" : "dark_mode", 18, Fg);
         _langBtn.Content = MakeIcon("translate", 18, Fg);
-        if (_maxLbl != null) _maxLbl.Foreground = Muted;
         if (_maxValue != null) _maxValue.Foreground = Fg;
         if (_autoLbl != null) _autoLbl.Foreground = Muted;
         if (_autoValue != null) _autoValue.Foreground = Fg;
@@ -1309,12 +1747,19 @@ class CockpitWindow : Window
         }
         if (_mtApplyNow != null) { _mtApplyNow.Background = Accent; _mtApplyNow.Foreground = White; }
         if (_mtLater != null) { _mtLater.Background = BtnBg; _mtLater.Foreground = Fg; _mtLater.BorderBrush = Border; }
+        if (_capBanner != null)
+        {
+            _capBanner.Background = new SolidColorBrush(Mix(C("#ea580c"), CardColor(), 0.12));
+            _capBanner.BorderBrush = Accent;
+            if (_capBannerLbl != null) _capBannerLbl.Foreground = Fg;
+        }
+        if (_capForceBtn != null) { _capForceBtn.Background = Accent; _capForceBtn.Foreground = White; }
+        if (_capRestoreBtn != null) { _capRestoreBtn.Background = BtnBg; _capRestoreBtn.Foreground = Fg; _capRestoreBtn.BorderBrush = Border; }
         Relabel();
     }
 
     void Relabel()
     {
-        if (_maxLbl != null) _maxLbl.Text = T("def_tabs");
         if (_maxValue != null) _maxValue.Text = _maxtabs.ToString();
         if (_autoLbl != null) _autoLbl.Text = T("max_tabs2");
         if (_autoValue != null) _autoValue.Text = _autoMax.ToString();
@@ -1365,6 +1810,7 @@ class CockpitWindow : Window
 
         Dictionary<string, object> root = ReadStatus();
         RefreshPauseEnabled(root);          // Pause is only meaningful for a live run; grey it out otherwise
+        UpdateCapBanner(root);              // TASK 1: surface the admission-gate wait reactively each tick
         bool idle = root == null || I(root, "total") == 0
                     || (root.ContainsKey("idle") && Convert.ToBoolean(root["idle"]));
         if (idle)
@@ -1815,32 +2261,9 @@ class CockpitWindow : Window
         var rightCl = new StackPanel(); rightCl.Orientation = Orientation.Horizontal;
         rightCl.VerticalAlignment = VerticalAlignment.Center;
 
-        // opt-in, CAPPED auto-retry toggle. Default OFF. Never infinite (see _autoRetryMax).
-        _autoRetryBtn = new Button();
-        _autoRetryBtn.BorderThickness = new Thickness(1); _autoRetryBtn.Cursor = Cursors.Hand;
-        _autoRetryBtn.Padding = new Thickness(10, 4, 10, 4); _autoRetryBtn.FontSize = 12;
-        _autoRetryBtn.FontWeight = FontWeights.SemiBold; _autoRetryBtn.Margin = new Thickness(0, 0, 8, 0);
-        _autoRetryBtn.VerticalAlignment = VerticalAlignment.Center;
-        _autoRetryBtn.ToolTip = _lang == 0
-            ? "停止したゴールを自動で再投入（上限まで・既定OFF）。無限ループは起きません。"
-            : "Auto re-queue stopped goals (up to the cap; default OFF). Never loops forever.";
-        PaintAutoRetryBtn();
-        _autoRetryBtn.Click += delegate { _autoRetry = !_autoRetry; SaveKey("autoretry", _autoRetry ? "1" : "0"); PaintAutoRetryBtn(); };
-        rightCl.Children.Add(_autoRetryBtn);
-
-        // per-goal retry cap (1..3) -- the safety bound
-        var capLbl = new TextBlock(); capLbl.Text = T("cap"); capLbl.Foreground = Muted;
-        capLbl.FontSize = 11.5; capLbl.VerticalAlignment = VerticalAlignment.Center; capLbl.Margin = new Thickness(0, 0, 6, 0);
-        rightCl.Children.Add(capLbl);
-        var capMinus = MiniButton("−"); capMinus.Click += delegate { SetAutoRetryMax(_autoRetryMax - 1); };
-        rightCl.Children.Add(capMinus);
-        _autoRetryCapVal = new TextBlock(); _autoRetryCapVal.Text = _autoRetryMax.ToString();
-        _autoRetryCapVal.Foreground = Fg; _autoRetryCapVal.FontSize = 13; _autoRetryCapVal.FontWeight = FontWeights.SemiBold;
-        _autoRetryCapVal.Margin = new Thickness(6, 0, 6, 0); _autoRetryCapVal.MinWidth = 12;
-        _autoRetryCapVal.TextAlignment = TextAlignment.Center; _autoRetryCapVal.VerticalAlignment = VerticalAlignment.Center;
-        rightCl.Children.Add(_autoRetryCapVal);
-        var capPlus = MiniButton("+"); capPlus.Click += delegate { SetAutoRetryMax(_autoRetryMax + 1); };
-        rightCl.Children.Add(capPlus);
+        // The auto-retry ON/OFF toggle and the per-goal retry cap (上限) were RELOCATED into the
+        // settings panel (gear popup) to declutter this toolbar. Only the one-shot bulk MANUAL
+        // retry button remains here (it acts on the currently-shown filter, so it belongs inline).
 
         // bulk MANUAL retry button (one-shot, respects the active filter)
         var retryAll = new Button();
