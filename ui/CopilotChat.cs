@@ -175,7 +175,7 @@ class ChatWindow : Window
         bottom.Children.Add(_cockpitBtn);
         _langBtn = Btn(T("lang"), "Panel", "Muted", true);
         _langBtn.Height = 34; _langBtn.Margin = new Thickness(0, 0, 0, 6); _langBtn.FontSize = 12;
-        _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveSettings(); UpdateChrome(); RefreshConvList(); };
+        _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveSettings(); UpdateChrome(); RefreshConvList(); RerenderActiveConversation(); };
         _themeBtn = Btn(T("theme"), "Panel", "Muted", true);
         _themeBtn.Height = 34; _themeBtn.FontSize = 12;
         _themeBtn.Click += delegate { _dark = !_dark; ApplyTheme(); _themeBtn.Content = T("theme"); SaveSettings(); };
@@ -339,9 +339,17 @@ class ChatWindow : Window
             _settingsMtime = m;
             int l0 = _lang;
             LoadSettings();                              // re-reads lang/dark (+ApplyTheme for theme)
-            if (_lang != l0) { UpdateChrome(); RefreshConvList(); }
+            if (_lang != l0) { UpdateChrome(); RefreshConvList(); RerenderActiveConversation(); }
         }
         catch { }
+    }
+
+    // Re-render the open LOCAL conversation so per-message chrome (the copy-button tooltip) re-localizes
+    // on a language toggle. Skip fleet/steer views: re-rendering those could re-fetch or drop steer mode.
+    void RerenderActiveConversation()
+    {
+        if (_conv != null && _activeFleetUrl == null && _conv.Messages.Count > 0)
+            OpenConversation(_conv);
     }
     string _activeFleetUrl;              // conv URL of the fleet snapshot currently shown (null = none)
     long _statusMtime;                   // last-seen mtime of status.json (for live re-render)
