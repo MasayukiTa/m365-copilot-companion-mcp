@@ -14,7 +14,7 @@ cd /d "%~dp0"
 
 echo.
 echo ===========================================================================
-echo  STEP 1/4  Install Python, venv and requirements (resumable bootstrap)
+echo  STEP 1/7  Install Python, venv and requirements (resumable bootstrap)
 echo ===========================================================================
 REM Tell setup.bat it is being CALLED (not double-clicked), so it does not add
 REM its own pause -- quickstart has its own pauses and a final one.
@@ -39,7 +39,7 @@ if not exist ".venv\Scripts\python.exe" (
 
 echo.
 echo ===========================================================================
-echo  STEP 2/4  Your secrets - copy these into your MCP client
+echo  STEP 2/7  Your secrets - copy these into your MCP client
 echo ===========================================================================
 if exist ".env" (
     for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
@@ -56,7 +56,7 @@ if exist ".env" (
 
 echo.
 echo ===========================================================================
-echo  STEP 3/4  Check git for updates (fetch only - never pushes)
+echo  STEP 3/7  Check git for updates (fetch only - never pushes)
 echo ===========================================================================
 git rev-parse --is-inside-work-tree >nul 2>nul
 if errorlevel 1 (
@@ -92,11 +92,12 @@ echo.
 echo ===========================================================================
 echo  STEP 5/7  Copilot Studio  (the ONLY manual, by-hand step)
 echo ===========================================================================
-echo   In Copilot Studio: add an MCP connector using the PUBLIC URL printed
-echo   above + your Bearer token (MCP_API_KEY, shown in STEP 2), then create
-echo   your companion agent. See README STEP 4 and STEP 5.
-echo   Then open that agent in M365 Copilot and copy its address-bar URL --
-echo   you will paste it into a dialog in the next step.
+echo   Add an MCP connector in Copilot Studio, then create your companion agent.
+echo   The 3 EXACT values to paste are printed below (full guide: README STEP 4):
+echo.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0copilot_studio_values.ps1"
+echo   After creating the agent, open it in M365 Copilot and copy its address-bar
+echo   URL -- you will paste it into a dialog in the next step.
 echo.
 echo   Press any key AFTER you have created the agent in Copilot Studio...
 pause >nul
@@ -116,7 +117,27 @@ echo  STEP 7/7  Launch the whole stack  (server + tunnel + Edge + bridge + UI)
 echo ===========================================================================
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0start_all.ps1"
+
 echo.
-echo Done. From now on, daily startup is just a double-click of start_all.bat.
+echo ===========================================================================
+echo  Putting a one-click launcher on your Desktop...
+echo ===========================================================================
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0make_desktop_shortcut.ps1"
+
+echo.
+echo ===========================================================================
+echo  Health check  (is every link green?)
+echo ===========================================================================
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0doctor.ps1"
+
+echo.
+echo ===========================================================================
+echo  SETUP COMPLETE
+echo ===========================================================================
+echo   Daily startup : double-click  "M365 Companion"  on your Desktop
+echo   Check anytime : double-click  doctor.bat        (all green = fully wired)
+echo   Two windows opened: CopilotChat (talk to it) and FleetCockpit (watch runs)
+echo   Any RED above?  doctor printed the exact fix for each line.
+echo.
 pause
 endlocal
