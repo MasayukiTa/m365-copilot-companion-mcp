@@ -56,11 +56,14 @@ def main():
             log("batch %d: 0 goals staged -- skip" % bn)
             continue
 
-        # 2) launch the fleet on this batch (detached); agent URL resolves from .env
+        # 2) launch the fleet on this batch HIDDEN (no console window -- the cockpit's card UI is
+        #    the surface; raw fleet stdout goes to a log). agent URL resolves from .env.
         env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        flog = open(os.path.join(SW, "pro_fleet_batch.log"), "w", encoding="utf-8")
         subprocess.Popen([PY, "-m", "relay.fleet_runner", "--goals-file", bgoals,
                           "--state-dir", os.path.join(REPO, ".fleet"), "--effort", "auto"],
-                         cwd=REPO, env=env, creationflags=0x00000008)  # DETACHED_PROCESS
+                         cwd=REPO, env=env, stdout=flog, stderr=subprocess.STDOUT,
+                         creationflags=0x08000000)  # CREATE_NO_WINDOW
 
         # 3) wait for THIS batch fleet to finish (saw running True, then running False)
         t0 = time.time()
