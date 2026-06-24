@@ -24,13 +24,33 @@ ALPHA = 0.25  # EWMA recency weight (higher = more recent-biased; to be tuned)
 
 
 def edge_ws_mb():
-    tot = 0
-    for p in psutil.process_iter(["name", "memory_info"]):
+    """RAM of the FLEET Edge only (the :9222 copilot-companion-edge process tree) -- NOT the user's
+    other Edge windows, which would otherwise be wrongly attributed to the fleet's tabs. Find the
+    main browser process (carries --remote-debugging-port=9222 / the companion profile) and sum it
+    plus all its descendants (renderers/GPU/utility)."""
+    roots = []
+    for p in psutil.process_iter(["name", "cmdline"]):
         try:
             if (p.info["name"] or "").lower() == "msedge.exe":
-                tot += p.info["memory_info"].rss
+                cl = " ".join(p.info["cmdline"] or [])
+                if "9222" in cl or "copilot-companion-edge" in cl:
+                    roots.append(p)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
+    seen, tot = set(), 0
+    for r in roots:
+        try:
+            procs = [r] + r.children(recursive=True)
+        except psutil.NoSuchProcess:
+            procs = [r]
+        for p in procs:
+            try:
+                if p.pid in seen:
+                    continue
+                seen.add(p.pid)
+                tot += p.memory_info().rss
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
     return tot / 1024 / 1024
 
 
