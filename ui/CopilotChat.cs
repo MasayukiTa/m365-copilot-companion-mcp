@@ -1585,7 +1585,31 @@ class ChatWindow : Window
     // Shared with the cockpit -> preserve the 'dark' key and write all three.
     void SaveSettings()
     {
-        try { Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile)); File.WriteAllText(SettingsFile, "deletemode=" + _deleteMode + "\nlang=" + _lang + "\ndark=" + (_dark ? "1" : "0") + "\n", Encoding.UTF8); }
+        // settings.txt is SHARED with the cockpit, which stores many more keys (autoscale, maxtabs,
+        // disk/ram floor, effort, approval, autoscale_per_tab_mb, ...). A full overwrite here would
+        // wipe all of them -> every fleet setting resets on the next launch. So preserve every other
+        // line and update only our three. No BOM (a BOM breaks the python-side reader, cf. .env rule).
+        try
+        {
+            var want = new Dictionary<string, string> {
+                { "deletemode", _deleteMode.ToString() },
+                { "lang", _lang.ToString() },
+                { "dark", _dark ? "1" : "0" },
+            };
+            var lines = new List<string>();
+            var seen = new HashSet<string>();
+            if (File.Exists(SettingsFile))
+                foreach (string ln in File.ReadAllLines(SettingsFile))
+                {
+                    int eq = ln.IndexOf('=');
+                    string k = eq > 0 ? ln.Substring(0, eq) : null;
+                    if (k != null && want.ContainsKey(k)) { lines.Add(k + "=" + want[k]); seen.Add(k); }
+                    else lines.Add(ln);
+                }
+            foreach (var kv in want) if (!seen.Contains(kv.Key)) lines.Add(kv.Key + "=" + kv.Value);
+            Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile));
+            File.WriteAllText(SettingsFile, string.Join("\n", lines.ToArray()) + "\n", new UTF8Encoding(false));
+        }
         catch { }
     }
     void UpdateChrome()
