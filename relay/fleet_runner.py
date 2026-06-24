@@ -145,6 +145,15 @@ def settings_ram_floor(default=2048.0):
     return _settings_float("ram_floor_mb", default)
 
 
+def settings_per_tab(default=700.0):
+    """Calibrated free-RAM cost per Copilot tab in MB (`autoscale_per_tab_mb=N` in settings.txt),
+    measured live by bench/ram_calib.py on THIS machine and written back -- the per-user self-tuning
+    of concurrency. Replaces the flat 700 MB assumption with the observed value so the autoscale
+    packs accurately (the calibrator writes a deliberately CONSERVATIVE estimate, and backs off on
+    swap pressure)."""
+    return _settings_float("autoscale_per_tab_mb", default)
+
+
 def _repo_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -778,7 +787,12 @@ def main():
                                       max_transient=args.max_transient,
                                       autoscale=autoscale, autoscale_max=autoscale_max,
                                       asc_box=asc_box,
-                                      autoscale_per_tab_mb=args.autoscale_per_tab_mb,
+                                      # per-machine calibrated RAM/tab (bench/ram_calib.py writes
+                                      # autoscale_per_tab_mb to settings.txt); used only when the CLI
+                                      # arg is still the 700 default, so an explicit --flag still wins.
+                                      autoscale_per_tab_mb=(settings_per_tab(700.0)
+                                                            if args.autoscale_per_tab_mb == 700
+                                                            else args.autoscale_per_tab_mb),
                                       autoscale_headroom_mb=args.autoscale_headroom_mb,
                                       autoscale_up_margin_mb=args.autoscale_up_margin_mb,
                                       disk_floor_gb=disk_floor, eval_disk_gb=eval_disk,
