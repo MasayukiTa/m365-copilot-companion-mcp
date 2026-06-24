@@ -103,3 +103,14 @@ ui/*.exe
 # vendored VirtualDesktop tool (built from thirdparty/VirtualDesktop11.cs)
 thirdparty/*.exe
 ui/_buildcheck/
+
+# --- internal working docs / dev artifacts: keep in history, exclude going forward ---
+/docs/*.md
+!/docs/STARTUP_devtunnel_login.md
+!/docs/companion_setup.md
+/docs/validation/
+# scratch probes / b64 dumps / one-off data created during eval sessions
+/bench/_k*.py
+/bench/_pro_*.py
+/bench/_cdp_*.py
+/bench/_*_b64.txt
