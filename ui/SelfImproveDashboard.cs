@@ -122,6 +122,16 @@ class SelfImproveDashboardWindow : Window
         if (k == "none") return ja ? "なし" : "none";
         if (k == "keep") return ja ? "採用" : "keep";
         if (k == "total") return ja ? "合計" : "total";
+        // Live usage lens (general-user, no benchmark)
+        if (k == "usage_sec") return ja ? "実利用（あなたのタスク）" : "Live — your usage";
+        if (k == "usage_caption") return ja ? "実際の実行から算出。ベンチ不要 — これが普段の使い心地の指標です。"
+                                            : "From your real runs — no benchmark. This is how it performs day to day.";
+        if (k == "u_completion") return ja ? "完了率" : "Completion";
+        if (k == "u_recent") return ja ? "直近" : "Recently";
+        if (k == "u_turns") return ja ? "中央ターン" : "Median turns";
+        if (k == "u_tasks") return ja ? "タスク数" : "Tasks";
+        if (k == "u_trend") return ja ? "完了率の推移（古い→新しい）" : "Completion over time (old → new)";
+        if (k == "u_verify") return ja ? "自己検証通過" : "Self-verified";
         return k;
     }
 
@@ -448,11 +458,67 @@ class SelfImproveDashboardWindow : Window
     {
         _sub.Text = "";
         _body.Children.Clear();
+        _body.Children.Add(BuildUsage(state));        // (0) general-user lens first
         _body.Children.Add(BuildScorecard(state));
         _body.Children.Add(BuildAbHistory(state));
         _body.Children.Add(BuildBurnedLedger(state));
         _body.Children.Add(BuildPassTrend(state));
         _body.Children.Add(BuildArchive(state));
+    }
+
+    // (0) LIVE USAGE -- the general-user lens. Real-run completion / turns / trend from the persisted
+    // history + live snapshot, NO benchmark. This is what a normal user (who never runs a bench) sees.
+    UIElement BuildUsage(Dictionary<string, object> state)
+    {
+        var u = Obj(state, "usage");
+        var card = SectionCard(T("usage_sec"));
+        var col = (StackPanel)card.Child;
+        if (u == null || I(u, "n_tasks") == 0) { col.Children.Add(EmptyLine()); return card; }
+
+        var cap = new TextBlock { Text = T("usage_caption"), Foreground = Muted, FontSize = 11.5,
+                                  TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 3, 0, 0) };
+        col.Children.Add(cap);
+
+        var grid = new Grid(); grid.Margin = new Thickness(0, 12, 0, 0);
+        for (int i = 0; i < 4; i++) grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        var good = new SolidColorBrush(StatusColorFor("good", _dark));
+        grid.Children.Add(Metric(T("u_completion"), Pct(u, "completion_rate"), good, 0));
+        grid.Children.Add(Metric(T("u_recent"), Pct(u, "recent_completion_rate"), Fg, 1));
+        grid.Children.Add(Metric(T("u_turns"), Num(u.ContainsKey("median_turns") ? u["median_turns"] : null, "0.#"), Fg, 2));
+        grid.Children.Add(Metric(T("u_tasks"), I(u, "n_tasks").ToString(), Fg, 3));
+        col.Children.Add(grid);
+
+        var mix = Obj(u, "status_mix");
+        if (mix != null && mix.Count > 0)
+        {
+            var parts = new List<string>();
+            foreach (var kv in mix) parts.Add(kv.Key + " " + kv.Value);
+            col.Children.Add(new TextBlock { Text = string.Join("    ·    ", parts.ToArray()), Foreground = Muted,
+                                             FontSize = 12, Margin = new Thickness(0, 10, 0, 0), TextWrapping = TextWrapping.Wrap });
+        }
+
+        object[] tr = Arr(u, "trend");
+        if (tr != null && tr.Length > 1)
+        {
+            col.Children.Add(new TextBlock { Text = T("u_trend"), Foreground = Muted, FontSize = 11.5, Margin = new Thickness(0, 11, 0, 4) });
+            var sb = new StringBuilder();
+            for (int i = 0; i < tr.Length; i++)
+            {
+                double v = 0.0; try { if (tr[i] != null) v = Convert.ToDouble(tr[i]); } catch (Exception) { }
+                if (i > 0) sb.Append("  →  ");
+                sb.Append(((int)System.Math.Round(v * 100)).ToString() + "%");
+            }
+            col.Children.Add(new TextBlock { Text = sb.ToString(), Foreground = Fg, FontSize = 13,
+                                             FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 0) });
+        }
+        return card;
+    }
+
+    // percent string from a 0..1 fraction stored at d[k]; "—" when absent/null.
+    static string Pct(Dictionary<string, object> d, string k)
+    {
+        if (d == null || !d.ContainsKey(k) || d[k] == null) return "—";
+        try { return (Convert.ToDouble(d[k]) * 100.0).ToString("0.0") + "%"; } catch (Exception) { return "—"; }
     }
 
     // (1) SCORECARD header card: latest pass@1, latest A/B verdict (colored), burned_total, archive_count.

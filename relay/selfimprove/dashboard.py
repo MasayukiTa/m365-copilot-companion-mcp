@@ -236,8 +236,17 @@ def dashboard_state(*, archive_path=None, burned_path=None, grade_results_path=N
         "grade_results_count": len(grade_recs),
     }
 
+    # Live usage = the general-user lens (no bench needed): completion rate / turns / trend from real
+    # runs. Defensive: a failure here must never break the bench-side dashboard.
+    try:
+        from relay.selfimprove.usage import usage_section
+        usage = usage_section()
+    except Exception:
+        usage = {"n_tasks": 0, "completion_rate": None, "status_mix": {}, "trend": []}
+
     return {
         "summary": summary,
+        "usage": usage,
         "ab_history": ab_history,
         "pass1_trend": pass1_trend,
         "burned_ledger": burned_ledger,
