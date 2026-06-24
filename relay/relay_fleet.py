@@ -512,6 +512,10 @@ class RelayWorker:
         self.max_gen_waits = 90
         self.gen_waits = 0
         self.first_defer_ts = 0.0
+        # progress-aware gate baseline: a legitimately long agent turn (folder/file/DB work)
+        # keeps producing output, so we STUCK only on a turn FROZEN for the whole budget,
+        # never on one that is merely slow-but-advancing. -1 = no baseline captured yet.
+        self._defer_progress_sig = -1
         # goal-delivery recovery: when the agent reports it never received the task, RE-SEND
         # the goal verbatim instead of a generic retry nudge (bounded to avoid a resend loop).
         self.max_goal_resends = 3
@@ -901,19 +905,41 @@ class RelayWorker:
         # successful send (see _begin_send, where gen_waits is also reset).
         if self.first_defer_ts <= 0.0:
             self.first_defer_ts = now
-        # primary cutoff: total wall-clock spent deferring this turn exceeds the budget.
-        if (now - self.first_defer_ts) > self.max_gen_wait_s:
-            return False
-        # secondary guard: a pathological tight-loop racking up deferrals with ~no elapsed
-        # time (e.g. a clock that never advances) still terminates.
-        if self.gen_waits >= self.max_gen_waits:
-            return False
+            self._defer_progress_sig = self._gen_progress_sig()   # baseline output at wait start
+        budget_hit = (now - self.first_defer_ts) > self.max_gen_wait_s
+        count_hit = self.gen_waits >= self.max_gen_waits
+        # PROGRESS-AWARE cutoff. Hitting the budget/count is a real STUCK ONLY if the turn made
+        # no new output the whole time. A legitimately long agent turn (it kept streaming, or
+        # added a reply) is alive, not hung -> restart the budget from the latest progress and
+        # keep waiting. This is exactly the >max_gen_wait_s real turn (folder/file/DB work) that
+        # must NOT be a false STUCK. Only a turn FROZEN for the whole budget goes terminal.
+        if budget_hit or count_hit:
+            cur = self._gen_progress_sig()
+            if cur >= 0 and cur > self._defer_progress_sig:
+                self._defer_progress_sig = cur
+                self.first_defer_ts = now
+                self.gen_waits = 0
+            else:
+                return False
         self.gen_waits += 1
         # short, fixed cooldown before re-checking (send() itself does the long minutes-wait
         # for generation to finish; this is just a brief breather between deferrals).
         self._cooldown_until = now + 2.0
         self.status = "ready"
         return True
+
+    def _gen_progress_sig(self) -> int:
+        """Cheap signature of conversation OUTPUT progress: (#agent replies, last-reply length).
+        Rises while the agent is actively producing output (streaming text or a new reply), so a
+        legitimately long agent turn keeps advancing it; a wedged/frozen page leaves it flat.
+        _defer_generation uses it to tell 'slow but alive' from 'genuinely hung'. Never raises."""
+        try:
+            ans = self.drv._answers()
+            n = ans.count()
+            last_len = len((ans.last.inner_text() or "")) if n else 0
+            return n * 10_000_000 + last_len
+        except Exception:
+            return -1
 
     def _retry_transient(self):
         """Schedule a retry for a TRANSIENT failure (send/timeout/likely-transient STUCK) with

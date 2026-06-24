@@ -72,6 +72,7 @@ class SelfImproveDashboardWindow : Window
     TextBlock _header, _sub;
     Button _themeBtn, _langBtn;
     StackPanel _body;          // the scrolling content column we rebuild each change
+    ScrollViewer _sv;          // scroll host -- themed explicitly so its fill matches the toolbar
     Border _headBar;
 
     public SelfImproveDashboardWindow() : this(null) { }
@@ -287,13 +288,17 @@ class SelfImproveDashboardWindow : Window
         root.Children.Add(_headBar);
 
         // scrolling body
-        var sv = new ScrollViewer();
-        sv.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
-        sv.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
-        sv.Padding = new Thickness(18, 4, 18, 24);
+        _sv = new ScrollViewer();
+        _sv.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+        _sv.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
+        _sv.Padding = new Thickness(18, 4, 18, 24);
         _body = new StackPanel();
-        sv.Content = _body;
-        root.Children.Add(sv);
+        // Explicitly theme the scroll host + body. Without this the ScrollViewer/StackPanel inherit
+        // a system-default (non-theme) fill, which in LIGHT mode read as a dark panel that didn't
+        // match the toolbar -- the "dashboard background differs" complaint. Repainted on theme toggle.
+        _sv.Background = Bg; _body.Background = Bg;
+        _sv.Content = _body;
+        root.Children.Add(_sv);
 
         Content = root;
         PaintChrome();
@@ -311,10 +316,12 @@ class SelfImproveDashboardWindow : Window
     {
         Background = Bg;
         _headBar.Background = Bg;
+        if (_sv != null) _sv.Background = Bg;
+        if (_body != null) _body.Background = Bg;
         _header.Foreground = Fg;
         _header.Text = T("title");
         _sub.Foreground = Muted;
-        _iconHost.Content = MakeIcon("account_tree", 26, Accent);
+        _iconHost.Content = MakeIcon("account_tree", 26, Fg);   // match the other header icons (was Accent = the odd-one-out orange the user flagged)
         foreach (Button b in new Button[] { _themeBtn, _langBtn })
             if (b != null) { b.Background = BtnBg; b.Foreground = Fg; b.BorderBrush = Border; }
         if (_themeBtn != null) _themeBtn.Content = MakeIcon(_dark ? "light_mode" : "dark_mode", 18, Fg);
