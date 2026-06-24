@@ -452,7 +452,7 @@ class CockpitWindow : Window
         ctrls.Children.Add(_siBtn);
         _langBtn = IconButton("translate", 18);
         _langBtn.ToolTip = "日本語 / English";
-        _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveKey("lang", _lang.ToString()); Relabel(); ForceRender(); };
+        _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveKey("lang", _lang.ToString()); RebuildChrome(); };
         ctrls.Children.Add(_langBtn);
         _themeBtn = IconButton(_dark ? "light_mode" : "dark_mode", 18);
         _themeBtn.ToolTip = _lang == 0 ? "テーマ (ダーク/ライト)" : "Theme (dark/light)";
@@ -1890,6 +1890,20 @@ class CockpitWindow : Window
         if (_mtLater != null) _mtLater.Content = _lang == 0 ? "次回起動から" : "Next run";
     }
 
+    // Language toggle must re-evaluate EVERY localized string, not just the handful Relabel() touches.
+    // Strings set once at construction (the goal-box hint watermark, tooltips, the settings-panel
+    // labels, filter/retry buttons, ...) otherwise keep their build-time language -> the user sees a
+    // half-translated UI after toggling. Rebuilding the whole chrome re-runs every T()/_lang branch.
+    // _rows is bound once and survives, so cards persist; we preserve the typed goal text + scroll.
+    void RebuildChrome()
+    {
+        string goalText = _goalInput != null ? _goalInput.Text : null;
+        BuildChrome();
+        if (goalText != null && _goalInput != null) _goalInput.Text = goalText;
+        PaintChrome();
+        ForceRender();
+    }
+
     void ApplyTheme()
     {
         ApplyThemeBrushes();
@@ -1916,7 +1930,7 @@ class CockpitWindow : Window
                     bool d0 = _dark; int l0 = _lang;
                     LoadSettings();
                     if (d0 != _dark) { ApplyThemeBrushes(); PaintChrome(); _lastSig = ""; }
-                    else if (l0 != _lang) { Relabel(); _lastSig = ""; }
+                    else if (l0 != _lang) { RebuildChrome(); }
                 }
             }
         }

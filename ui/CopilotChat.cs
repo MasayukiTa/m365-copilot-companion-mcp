@@ -62,7 +62,8 @@ class ChatWindow : Window
     int _deleteMode = 1;                 // 1=local only, 2=open in Copilot, 3=auto (experimental)
     int _lang = 0;                       // 0=Japanese, 1=English
     Border _banner; StackPanel _bannerBody;
-    Button _newBtn, _themeBtn, _langBtn, _manageBtn;
+    Button _newBtn, _themeBtn, _langBtn, _manageBtn, _cockpitBtn, _attachBtn;
+    TextBlock _inputHint;                 // goal-box watermark; localized -> must update on lang toggle
     static readonly string SettingsFile = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "copilot-bridge", "settings.txt");
 
@@ -168,10 +169,10 @@ class ChatWindow : Window
         Grid.SetRow(convScroll, 1); side.Children.Add(convScroll);
 
         var bottom = new StackPanel { Margin = new Thickness(12, 8, 12, 12) };
-        var cockpitBtn = Btn(T("open_cockpit"), "Accent", "AccentFg", false);
-        cockpitBtn.Height = 36; cockpitBtn.Margin = new Thickness(0, 0, 0, 8); cockpitBtn.FontSize = 12.5; cockpitBtn.FontWeight = FontWeights.SemiBold;
-        cockpitBtn.Click += delegate { OpenCockpit(); };
-        bottom.Children.Add(cockpitBtn);
+        _cockpitBtn = Btn(T("open_cockpit"), "Accent", "AccentFg", false);
+        _cockpitBtn.Height = 36; _cockpitBtn.Margin = new Thickness(0, 0, 0, 8); _cockpitBtn.FontSize = 12.5; _cockpitBtn.FontWeight = FontWeights.SemiBold;
+        _cockpitBtn.Click += delegate { OpenCockpit(); };
+        bottom.Children.Add(_cockpitBtn);
         _langBtn = Btn(T("lang"), "Panel", "Muted", true);
         _langBtn.Height = 34; _langBtn.Margin = new Thickness(0, 0, 0, 6); _langBtn.FontSize = 12;
         _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveSettings(); UpdateChrome(); RefreshConvList(); };
@@ -252,15 +253,15 @@ class ChatWindow : Window
         Grid.SetColumn(_input, 0); bar.Children.Add(_input);
         // Placeholder hint advertising slash commands (WPF TextBox has no native placeholder). The
         // single most Claude-Code-defining feature was invisible until you happened to type "/".
-        var inputHint = new TextBlock
+        _inputHint = new TextBlock
         {
             Text = _lang == 0 ? "メッセージを入力 …   「/」でコマンド" : "Type a message …   \"/\" for commands",
             IsHitTestVisible = false, FontSize = 13.5, Margin = new Thickness(15, 0, 0, 0),
             VerticalAlignment = VerticalAlignment.Center
         };
-        SetRef(inputHint, TextBlock.ForegroundProperty, "Muted");
-        Grid.SetColumn(inputHint, 0); bar.Children.Add(inputHint);
-        _input.TextChanged += delegate { inputHint.Visibility = string.IsNullOrEmpty(_input.Text) ? Visibility.Visible : Visibility.Collapsed; };
+        SetRef(_inputHint, TextBlock.ForegroundProperty, "Muted");
+        Grid.SetColumn(_inputHint, 0); bar.Children.Add(_inputHint);
+        _input.TextChanged += delegate { _inputHint.Visibility = string.IsNullOrEmpty(_input.Text) ? Visibility.Visible : Visibility.Collapsed; };
         BuildCmdPopup();
         _send = Btn(T("send"), "Accent", "AccentFg", false);
         _send.Width = 92; _send.Margin = new Thickness(8, 0, 0, 0); _send.FontWeight = FontWeights.SemiBold; _send.MinHeight = 50;
@@ -313,15 +314,35 @@ class ChatWindow : Window
         _convsPath = Path.Combine(fleetDir, "conversations.json");
         try { _openMtime = File.Exists(_openPath) ? File.GetLastWriteTimeUtc(_openPath).Ticks : 0; }
         catch { _openMtime = 0; }
+        try { _settingsMtime = File.Exists(SettingsFile) ? File.GetLastWriteTimeUtc(SettingsFile).Ticks : 0; }
+        catch { _settingsMtime = 0; }
         var openTimer = new DispatcherTimer();
         openTimer.Interval = TimeSpan.FromMilliseconds(800);
-        openTimer.Tick += delegate { CheckOpenRequest(); SyncRegistry(); CheckFleetSnapshot(); };
+        openTimer.Tick += delegate { CheckOpenRequest(); SyncRegistry(); CheckFleetSnapshot(); CheckSettings(); };
         openTimer.Start();
         SyncRegistry();
     }
 
     string _openPath; long _openMtime;
+    long _settingsMtime;                 // follow external lang/theme edits (e.g. the cockpit toggled it)
     string _convsPath; long _convsMtime;
+
+    // Keep the chat in language/theme sync with the cockpit: both share settings.txt, so when the
+    // other window toggles, re-read and re-apply here too (lang -> re-label all chrome + conv list).
+    void CheckSettings()
+    {
+        try
+        {
+            if (!File.Exists(SettingsFile)) return;
+            long m = File.GetLastWriteTimeUtc(SettingsFile).Ticks;
+            if (m == _settingsMtime) return;
+            _settingsMtime = m;
+            int l0 = _lang;
+            LoadSettings();                              // re-reads lang/dark (+ApplyTheme for theme)
+            if (_lang != l0) { UpdateChrome(); RefreshConvList(); }
+        }
+        catch { }
+    }
     string _activeFleetUrl;              // conv URL of the fleet snapshot currently shown (null = none)
     long _statusMtime;                   // last-seen mtime of status.json (for live re-render)
 
@@ -1563,6 +1584,11 @@ class ChatWindow : Window
     {
         _newBtn.Content = T("newchat_btn"); _themeBtn.Content = T("theme"); _langBtn.Content = T("lang"); _send.Content = T("send");
         if (_manageBtn != null) _manageBtn.Content = T("manage_btn");
+        // Construction-time localized chrome the toggle would otherwise miss (the half-translated UI):
+        if (_cockpitBtn != null) _cockpitBtn.Content = T("open_cockpit");
+        if (_attachBtn != null) { _attachBtn.Content = T("attach_btn"); _attachBtn.ToolTip = T("attach"); }
+        if (_inputHint != null)
+            _inputHint.Text = _lang == 0 ? "メッセージを入力 …   「/」でコマンド" : "Type a message …   \"/\" for commands";
     }
     void HideBanner() { _banner.Visibility = Visibility.Collapsed; }
 
@@ -1935,15 +1961,15 @@ class ChatWindow : Window
     UIElement BuildAttachRow()
     {
         _attachChips = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 6) };
-        var attach = new Button
+        _attachBtn = new Button
         {
             Content = T("attach_btn"), FontSize = 12,
             Height = 30, Cursor = Cursors.Hand, BorderThickness = new Thickness(1),
             Padding = new Thickness(10, 0, 10, 0), ToolTip = T("attach")
         };
-        SetRef(attach, BackgroundProperty, "Panel"); SetRef(attach, ForegroundProperty, "Muted"); SetRef(attach, Control.BorderBrushProperty, "Border");
-        attach.Click += delegate { AttachFile(); };
-        _attachChips.Children.Add(attach);
+        SetRef(_attachBtn, BackgroundProperty, "Panel"); SetRef(_attachBtn, ForegroundProperty, "Muted"); SetRef(_attachBtn, Control.BorderBrushProperty, "Border");
+        _attachBtn.Click += delegate { AttachFile(); };
+        _attachChips.Children.Add(_attachBtn);
         return _attachChips;
     }
 
