@@ -235,7 +235,10 @@ class _RelayWorker:
                     if not got:
                         reply_box.put(("error", "timed out waiting for Copilot reply"))
                         continue
-                    reply = driver.read_last_response()
+                    # Prefer the chrome-free reply extractor (reply-div only); fall back to the
+                    # full-bubble reader on older drivers so this never breaks.
+                    reader = getattr(driver, "read_last_reply_clean", driver.read_last_response)
+                    reply = reader()
                     reply_box.put(("ok", reply))
                 except Exception as e:  # noqa: BLE001
                     reply_box.put(("error", f"{type(e).__name__}: {e}"))

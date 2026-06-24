@@ -924,6 +924,36 @@ class CopilotWebDriver:
             lines = lines[1:]
         return "\n".join(lines).strip()
 
+    def read_last_reply_clean(self) -> str:
+        """Agent reply TEXT only -- for callers (the OpenAI-compat adapter) where ANY stray prefix
+        corrupts a downstream harness's action parsing.
+
+        The DOM of one agent turn is:
+            <h6 accessibleHeading>"<NAME> said:"</h6>  <img avatar alt="<NAME>">  <reply text...>
+        so inner_text reads back  "<NAME> said:\n<NAME>\n<actual reply>"  -- the accessible heading
+        AND the avatar's alt-text (the agent name a second time) BEFORE the real answer (here <NAME>
+        was e.g. "desktopfile<emoji>"). read_last_response() only splits off the heading and leaves
+        the avatar name line. We extract <NAME> from the heading, then drop the heading and every
+        leading line that merely repeats <NAME>. Generic over any agent name and multi-line replies;
+        Playwright already returns proper UTF-8."""
+        loc = self._answers()
+        if loc.count() == 0:
+            loc = self.page.locator(COPILOT_SELECTORS["assistant_msg_fallback"])
+        if loc.count() == 0:
+            return ""
+        try:
+            txt = loc.last.inner_text() or ""
+        except Exception:
+            return self.read_last_response()
+        name = ""
+        if " said:" in txt:
+            name = txt.split(" said:", 1)[0].strip()
+            txt = txt.split(" said:", 1)[1]
+        lines = txt.splitlines()
+        while lines and (not lines[0].strip() or (name and lines[0].strip() == name)):
+            lines = lines[1:]
+        return "\n".join(lines).strip()
+
     def conversation_title(self) -> str:
         """Best-effort scrape of the Copilot-generated conversation title.
 
