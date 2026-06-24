@@ -466,7 +466,7 @@ class ChatWindow : Window
                 var sm = ReadTranscript(sf);
                 if (sm.Count == 0) continue;
                 string kind = sf.Contains("__sub_research_") ? "🔎 research" : "🧪 sub-agent";
-                msgs.Add(new Msg("A", "──────── " + kind + "（サブエージェント） ────────"));
+                msgs.Add(new Msg("A", "──────── " + kind + (_lang == 0 ? "（サブエージェント）" : " (sub-agent)") + " ────────"));
                 msgs.AddRange(sm);
             }
         }
@@ -861,7 +861,7 @@ class ChatWindow : Window
 
     // ── slash-command autocomplete (type "/" to see commands, like Claude Code) ──
     Popup _cmdPopup; ListBox _cmdList;
-    static readonly string[][] _commands = {
+    static readonly string[][] _commandsJa = {
         new[]{"/help","コマンド一覧を表示"},
         new[]{"/research","Claude researcher で深掘り調査"},
         new[]{"/analyze","アナリストでファイルを分析"},
@@ -877,6 +877,24 @@ class ChatWindow : Window
         new[]{"/proscons","賛否を表で"},
         new[]{"/table","表を作る"},
     };
+    static readonly string[][] _commandsEn = {
+        new[]{"/help","Show the command list"},
+        new[]{"/research","Deep research with the Claude researcher"},
+        new[]{"/analyze","Analyze a file with the analyst"},
+        new[]{"/summarize","Summarize"},
+        new[]{"/translate","Translate: /translate <lang> <text>"},
+        new[]{"/plan","Make a step-by-step plan"},
+        new[]{"/critique","Review critically"},
+        new[]{"/proofread","Proofread and return a corrected version"},
+        new[]{"/rewrite","Rewrite in a different style"},
+        new[]{"/brainstorm","Generate 10 ideas"},
+        new[]{"/steps","Break into steps"},
+        new[]{"/eli5","Explain simply"},
+        new[]{"/proscons","Pros and cons as a table"},
+        new[]{"/table","Make a table"},
+    };
+    // Display-only descriptions (insert uses Tag=name), localized at access time.
+    string[][] _commands { get { return _lang == 0 ? _commandsJa : _commandsEn; } }
     void BuildCmdPopup()
     {
         _cmdList = new ListBox { MaxHeight = 240, BorderThickness = new Thickness(0) };
@@ -930,6 +948,23 @@ class ChatWindow : Window
 
     string CommandHelpText()
     {
+        if (_lang != 0)
+            return "Chat commands:\n"
+                + "/help - this list\n"
+                + "/research - deep research with the Claude researcher\n"
+                + "/analyze - analyze a file\n"
+                + "/summarize - summarize\n"
+                + "/translate <lang> <text> - translate\n"
+                + "/plan - step-by-step plan\n"
+                + "/critique - critical review\n"
+                + "/proofread - proofread\n"
+                + "/rewrite - change the style\n"
+                + "/brainstorm - generate ideas\n"
+                + "/steps - break into steps\n"
+                + "/eli5 - explain simply\n"
+                + "/proscons - pros/cons table\n"
+                + "/table - make a table\n"
+                + "\nThe fleet goal box also has /help. The fleet side expands /code /fix /test /refactor /doc /review /research.";
         return "チャットコマンド:\n"
             + "/help - この一覧\n"
             + "/research - Claude researcher で深掘り調査\n"
@@ -1915,7 +1950,7 @@ class ChatWindow : Window
     void AttachFile()
     {
         var dlg = new Microsoft.Win32.OpenFileDialog();
-        dlg.Filter = "対応ファイル|*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.pdf;*.docx;*.xlsx;*.pptx;*.csv;*.txt;*.md;*.json;*.xml;*.py;*.js;*.ts;*.cs;*.html;*.eml|すべて (*.*)|*.*";
+        dlg.Filter = (_lang == 0 ? "対応ファイル" : "Supported files") + "|*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.pdf;*.docx;*.xlsx;*.pptx;*.csv;*.txt;*.md;*.json;*.xml;*.py;*.js;*.ts;*.cs;*.html;*.eml|" + (_lang == 0 ? "すべて (*.*)" : "All (*.*)") + "|*.*";
         if (dlg.ShowDialog() == true) UploadFile(dlg.FileName);
     }
 

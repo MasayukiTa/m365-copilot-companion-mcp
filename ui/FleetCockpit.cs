@@ -455,7 +455,7 @@ class CockpitWindow : Window
         _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveKey("lang", _lang.ToString()); Relabel(); ForceRender(); };
         ctrls.Children.Add(_langBtn);
         _themeBtn = IconButton(_dark ? "light_mode" : "dark_mode", 18);
-        _themeBtn.ToolTip = "テーマ (ダーク/ライト)";
+        _themeBtn.ToolTip = _lang == 0 ? "テーマ (ダーク/ライト)" : "Theme (dark/light)";
         _themeBtn.Click += delegate { _dark = !_dark; SaveKey("dark", _dark ? "1" : "0"); ApplyTheme(); };
         ctrls.Children.Add(_themeBtn);
         Grid.SetColumn(ctrls, 1); Grid.SetRow(ctrls, 0);
@@ -699,7 +699,7 @@ class CockpitWindow : Window
 
     // --- slash-command autocomplete for the goal box (parity with the main chat) ---
     Popup _gcmdPopup; ListBox _gcmdList;
-    static readonly string[][] _goalCommands = {
+    static readonly string[][] _goalCommandsJa = {
         new[]{"/help","コマンド一覧を表示"},
         new[]{"/code","<機能> を実装し、pytest テストも書いて通す"},
         new[]{"/fix","<ファイル> の <不具合> を直し、テストを通す"},
@@ -709,6 +709,18 @@ class CockpitWindow : Window
         new[]{"/review","<対象> をレビューして問題点を箇条書きで挙げる"},
         new[]{"/research","<問い> を Claude で深掘り調査する"},
     };
+    static readonly string[][] _goalCommandsEn = {
+        new[]{"/help","Show the command list"},
+        new[]{"/code","implement <feature> and write + pass pytest tests"},
+        new[]{"/fix","fix <bug> in <file> and make the tests pass"},
+        new[]{"/test","write pytest tests for <target>"},
+        new[]{"/refactor","refactor <target> for readability (no behavior change)"},
+        new[]{"/doc","write the README / docs for <target>"},
+        new[]{"/review","review <target> and list the issues as bullets"},
+        new[]{"/research","deep-research <question> with Claude"},
+    };
+    // Localized at access time so the slash palette (and the template it inserts) follows the UI language.
+    string[][] _goalCommands { get { return _lang == 0 ? _goalCommandsJa : _goalCommandsEn; } }
     void BuildGoalCmdPopup()
     {
         _gcmdList = new ListBox { MaxHeight = 220, BorderThickness = new Thickness(0) };
@@ -774,6 +786,18 @@ class CockpitWindow : Window
     }
     string GoalHelpText()
     {
+        if (_lang != 0)
+            return "Fleet goal-box commands:\n"
+                + "/code <feature> - implement + pytest tests\n"
+                + "/fix <target> - fix a bug + verify\n"
+                + "/test <target> - add pytest tests\n"
+                + "/refactor <target> - tidy up without changing behavior\n"
+                + "/doc <target> - write README / docs\n"
+                + "/review <target> - review and list issues\n"
+                + "/research <question> - deep research\n"
+                + "\nTop-bar settings:\n"
+                + "Reasoning = min/max/ultra/auto\n"
+                + "Approval = run/plan/auto (run=run now, plan=wait for plan approval, auto=plain fleet waits for plan approval; folder autonomy uses GO/ASK/STOP)";
         return "フリート入力欄コマンド:\n"
             + "/code <機能> - 実装と pytest テスト\n"
             + "/fix <対象> - 不具合修正と検証\n"
@@ -2790,7 +2814,7 @@ class CockpitWindow : Window
             var b = new Border { Background = QuoteBg, CornerRadius = new CornerRadius(6),
                                  Padding = new Thickness(10, 7, 10, 7), Margin = new Thickness(0, 0, 0, 5) };
             var sp = new StackPanel();
-            var who = new TextBlock { Text = user ? "▶ 指示 / あなた" : "● エージェント", FontSize = 11,
+            var who = new TextBlock { Text = user ? (_lang == 0 ? "▶ 指示 / あなた" : "▶ Instruction / You") : (_lang == 0 ? "● エージェント" : "● Agent"), FontSize = 11,
                                       FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 3) };
             who.Foreground = user ? Accent : Muted;
             sp.Children.Add(who);
