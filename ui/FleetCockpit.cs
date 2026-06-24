@@ -70,6 +70,9 @@ class CockpitWindow : Window
     double _diskFloor = 6.0;   // admission disk floor (GB) -> settings.txt disk_floor_gb=; user-editable
                                // in the settings panel. Persisted via SaveKey AND pushed live to a
                                // running fleet via {"set_disk_floor_gb":N} (fleet_runner.py ~L561).
+    double _ramFloor = 2048.0; // admission RAM floor (MB) -> settings.txt ram_floor_mb=; user-editable.
+                               // The free RAM the autoscale keeps for the user (RAM analog of the disk
+                               // floor). Persisted via SaveKey AND pushed live via {"set_ram_floor_mb":N}.
     string _effort = "auto";   // effort mode min|max|ultra|auto -> settings.txt effort= (NEW)
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
     bool _paused = false;      // local fleet pause/resume toggle state (NEW)
@@ -244,6 +247,7 @@ class CockpitWindow : Window
         if (k == "set_capacity_section") return ja ? "容量ガード" : "Capacity guard";
         if (k == "disk_floor") return ja ? "実行下限ディスク (GB)" : "Disk floor (GB)";
         if (k == "disk_floor_hint") return ja ? "空きディスクがこの値を下回るとタブ開放を待機します。" : "Pauses opening tabs when free disk drops below this.";
+        if (k == "ram_floor") return ja ? "確保する空きRAM (MB)" : "RAM floor (MB)";
         if (k == "force_start") return ja ? "強制開始" : "Force start";
         if (k == "floor_restore") return ja ? "床を戻す" : "Restore floor";
         if (k == "floor_off") return ja ? "容量床 OFF（強制実行中）" : "Disk floor OFF (force-running)";
@@ -318,6 +322,13 @@ class CockpitWindow : Window
                     if (double.TryParse(ln.Substring(14).Trim(), System.Globalization.NumberStyles.Float,
                                         System.Globalization.CultureInfo.InvariantCulture, out df))
                         _diskFloor = Math.Max(0.0, Math.Min(100.0, df));
+                }
+                else if (ln.StartsWith("ram_floor_mb="))
+                {
+                    double rf;
+                    if (double.TryParse(ln.Substring(13).Trim(), System.Globalization.NumberStyles.Float,
+                                        System.Globalization.CultureInfo.InvariantCulture, out rf))
+                        _ramFloor = Math.Max(0.0, Math.Min(65536.0, rf));
                 }
                 else if (ln.StartsWith("effort="))
                 {
@@ -1052,6 +1063,11 @@ class CockpitWindow : Window
         var dfPlus = MiniButton("+"); dfPlus.Click += delegate { SetDiskFloor(_diskFloor + 1.0); };
         _diskFloorVal = new TextBlock(); _diskFloorVal.Text = FmtFloor(_diskFloor);
         col.Children.Add(SettingsStepperRow(T("disk_floor"), _diskFloorVal, dfMinus, dfPlus));
+        // RAM floor (MB) -- the free-RAM reserve the autoscale keeps for the user (256 MB steps)
+        var rfMinus = MiniButton("−"); rfMinus.Click += delegate { SetRamFloor(_ramFloor - 256.0); };
+        var rfPlus = MiniButton("+"); rfPlus.Click += delegate { SetRamFloor(_ramFloor + 256.0); };
+        _ramFloorVal = new TextBlock(); _ramFloorVal.Text = ((int)_ramFloor).ToString();
+        col.Children.Add(SettingsStepperRow(T("ram_floor"), _ramFloorVal, rfMinus, rfPlus));
         var hint = new TextBlock(); hint.Text = T("disk_floor_hint"); hint.Foreground = Muted;
         hint.FontSize = 10.5; hint.TextWrapping = TextWrapping.Wrap; hint.Margin = new Thickness(0, 0, 0, 2);
         col.Children.Add(hint);
@@ -1079,6 +1095,23 @@ class CockpitWindow : Window
         {
             var cmd = ReadCommands();
             cmd["set_disk_floor_gb"] = _diskFloor;
+            WriteCommands(cmd);
+        }
+    }
+
+    // RAM floor (MB) setter -- exact mirror of SetDiskFloor: clamp, persist, refresh panel value,
+    // and push LIVE to a running fleet via {"set_ram_floor_mb":N} (fleet_runner consumes it next
+    // sweep -> ram_box[0] -> autoscale keeps that much RAM free). Stepped by 256 MB.
+    TextBlock _ramFloorVal;
+    void SetRamFloor(double v)
+    {
+        _ramFloor = Math.Max(0.0, Math.Min(65536.0, Math.Round(v)));
+        SaveKey("ram_floor_mb", ((int)_ramFloor).ToString(System.Globalization.CultureInfo.InvariantCulture));
+        if (_ramFloorVal != null) _ramFloorVal.Text = ((int)_ramFloor).ToString();
+        if (RunIsLive())
+        {
+            var cmd = ReadCommands();
+            cmd["set_ram_floor_mb"] = _ramFloor;
             WriteCommands(cmd);
         }
     }
@@ -1605,7 +1638,11 @@ class CockpitWindow : Window
         double floor = Dbl(root ?? new Dictionary<string, object>(), "disk_floor_gb");
         int availMb = I(root ?? new Dictionary<string, object>(), "avail_mb");
         bool diskGated = floor > 0 && freeDisk > 0 && freeDisk < floor;
-        bool ramGated = availMb > 0 && availMb < RAM_FLOOR_MB;
+        // gate on the live status' ram_floor_mb if present, else the cockpit's configurable _ramFloor
+        // (no longer the hardcoded RAM_FLOOR_MB const).
+        double ramFloorNow = Dbl(root ?? new Dictionary<string, object>(), "ram_floor_mb");
+        if (ramFloorNow <= 0) ramFloorNow = _ramFloor;
+        bool ramGated = availMb > 0 && ramFloorNow > 0 && availMb < ramFloorNow;
 
         if (running && pendingHeld && (diskGated || ramGated))
         {
@@ -3006,6 +3043,14 @@ class CockpitWindow : Window
         {
             e.Handled = true;
             ToggleExpand(nm);
+        };
+        // Also swallow the button-UP: the toggle drives on DOWN, but the card opens the conversation
+        // on MouseLeftButtonUp -- a DOWN-only Handled does NOT stop the separate UP event, so the UP
+        // would bubble to card.MouseLeftButtonUp -> OpenWorker and wrongly open main. Consume it here
+        // (same pattern as openLink / SwallowMouseUp elsewhere in this file).
+        hit.PreviewMouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e)
+        {
+            e.Handled = true;
         };
         return hit;
     }

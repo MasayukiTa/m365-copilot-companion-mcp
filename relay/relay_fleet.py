@@ -1550,6 +1550,17 @@ class RelayWorker:
                 try:
                     if _isgen():
                         self._last_text, self._stable_since = None, None
+                        # LIVE PREVIEW ONLY: surface the in-flight partial so the cockpit shows
+                        # mid-turn progress per worker (status.json "last" -> card body). This is
+                        # display-only: we do NOT call _decide() and do NOT append to the transcript,
+                        # so the authoritative answer is still taken from the stable-settle path below
+                        # (preserves the partial-capture-corruption guard this branch was added for).
+                        try:
+                            partial = self.drv.read_last_response()
+                            if partial and not _is_processing(partial):
+                                self.last_response = partial
+                        except Exception:
+                            pass
                         return False
                 except Exception:
                     pass
@@ -1582,6 +1593,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     autoscale_per_tab_mb=700, autoscale_headroom_mb=1400,
                     autoscale_up_margin_mb=0,
                     disk_floor_gb=None, eval_disk_gb=None, disk_box=None,
+                    ram_box=None,
                     transcript_dir=None, run_id="", busy_writer=None,
                     pause_box=None, stop_box=None):
     """Drive len(goals) autonomous relays in parallel to completion, but never with
@@ -1633,6 +1645,11 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     # value (env SWE_DISK_FLOOR_GB default) applies. <=0 disables the disk gate.
     if disk_box is None:
         disk_box = [DEFAULT_DISK_FLOOR_GB if disk_floor_gb is None else float(disk_floor_gb)]
+    # live RAM floor (MB): the free-RAM reserve kept for the user's other work. Mirrors disk_box --
+    # the cockpit can change it mid-run via ram_box; otherwise the launch headroom applies. The
+    # autoscale (ram_target_cap) keeps this much RAM free, so a higher floor shrinks concurrency.
+    if ram_box is None:
+        ram_box = [autoscale_headroom_mb]
     # pause/stop control (1-element lists read EACH loop, set by the cockpit via commands.json):
     # pause_box[0] True  -> freeze the fleet in place (no new turns / no new tabs / no liveness
     #                       probe) so a deliberate network switch doesn't trip FleetContextLost.
@@ -1751,7 +1768,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             # budget and an auto/ultra worker mid-fan-out (3 tabs) is felt as 3 tabs of pressure.
             mc_box[0] = ram_target_cap(_active_tabs(), mc_box[0], max(1, ceiling),
                                        per_tab_mb=autoscale_per_tab_mb,
-                                       headroom_mb=autoscale_headroom_mb,
+                                       headroom_mb=ram_box[0],   # live, cockpit-settable RAM floor
                                        up_margin_mb=autoscale_up_margin_mb)
 
         # fill free tab slots from the pending queue. ADMISSION is gated on BOTH (a) the live

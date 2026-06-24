@@ -138,6 +138,13 @@ def settings_disk_floor(default=None):
     return _settings_float("disk_floor_gb", default)
 
 
+def settings_ram_floor(default=2048.0):
+    """The user's reserved free-RAM floor in MB (`ram_floor_mb=N` in settings.txt). The RAM analog
+    of disk_floor: the autoscale keeps this much physical RAM free for the user's other work, so a
+    higher floor shrinks fleet concurrency. Cockpit-settable; default 2048 (2 GB)."""
+    return _settings_float("ram_floor_mb", default)
+
+
 def _repo_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -165,7 +172,8 @@ def _read_goals(args):
     return goals
 
 
-def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False):
+def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False,
+              ram_floor_mb=0.0):
     from relay.relay_fleet import free_disk_gb
     total = len(workers)        # dynamic: goals can be added mid-run (native chat queue)
     done = sum(1 for w in workers if w.status in TERMINAL)
@@ -188,6 +196,8 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # disk admission reserve + current C: free, so the cockpit can show the disk gate.
         "disk_floor_gb": round(disk_floor_gb, 1),
         "free_disk_gb": round(free_disk_gb(), 1),
+        # RAM admission reserve (free RAM kept for the user) so the cockpit can show the RAM gate.
+        "ram_floor_mb": round(ram_floor_mb),
         "workers": [{
             "name": w.name,
             "goal": w.goal,
@@ -335,6 +345,11 @@ def main():
                     help="disk (GB) a single not-yet-started eval is assumed it might consume; "
                          "subtracted when looking ahead so a tab is never opened that would "
                          "itself push C: under the floor. -1 = env SWE_EVAL_DISK_GB (default 0).")
+    ap.add_argument("--ram-floor-mb", type=float, default=-1.0,
+                    help="reserved free RAM (MB) to always keep for the user's other work (the RAM "
+                         "analog of --disk-floor-gb): the autoscale keeps this much physical RAM "
+                         "free, so a higher floor shrinks concurrency. -1 = use the cockpit's "
+                         "ram_floor_mb / else --autoscale-headroom-mb. Cockpit-settable live.")
     ap.add_argument("--poll-s", type=float, default=1.0)
     ap.add_argument("--stall-s", type=int, default=150,
                     help="if status.json stops updating this long while running, the "
@@ -497,6 +512,13 @@ def main():
     else:
         disk_floor = settings_disk_floor()
     disk_box = [disk_floor]                                   # live disk floor (cockpit-settable)
+    # ── RAM-floor admission reserve: keep this many MB free for the user. CLI --ram-floor-mb >= 0
+    # -> cockpit settings.txt ram_floor_mb -> --autoscale-headroom-mb (default 1400).
+    if args.ram_floor_mb >= 0:
+        ram_floor = args.ram_floor_mb
+    else:
+        ram_floor = settings_ram_floor(default=float(args.autoscale_headroom_mb))
+    ram_box = [ram_floor]                                     # live RAM floor (cockpit-settable)
     eval_disk = None if args.eval_disk_gb < 0 else args.eval_disk_gb
     commands_path = os.path.join(args.state_dir, "commands.json")
 
@@ -563,6 +585,13 @@ def main():
                     disk_box[0] = max(0.0, float(cmd["set_disk_floor_gb"]))
                 except Exception:
                     pass
+            # live RAM-floor control: {"set_ram_floor_mb": 3072} -- the reserved free RAM the
+            # autoscale keeps for the user. Higher floor -> fewer concurrent tabs. Next sweep.
+            if "set_ram_floor_mb" in cmd:
+                try:
+                    ram_box[0] = max(0.0, float(cmd["set_ram_floor_mb"]))
+                except Exception:
+                    pass
             # live autoscale control from the cockpit: {"set_autoscale": {"on":1,"max":4,
             # "default":2}}. on/max take effect each loop; default (if given) re-seats the
             # live cap now so turning autoscale on starts from the user's default.
@@ -627,7 +656,7 @@ def main():
             existing = []
             if os.path.isfile(convs_path):
                 try:
-                    existing = json.load(open(convs_path, encoding="utf-8"))
+                    existing = json.load(open(convs_path, encoding="utf-8-sig"))  # tolerate C# BOM
                 except Exception:
                     existing = []
             urls = set(e.get("url") for e in existing if isinstance(e, dict))
@@ -656,7 +685,8 @@ def main():
         _register_convs(workers)
         try:
             _write_atomic(status_path, _snapshot(workers, started, len(goals), mc_box[0],
-                                                 disk_floor_gb=disk_box[0], paused=pause_box[0]))
+                                                 disk_floor_gb=disk_box[0], paused=pause_box[0],
+                                                 ram_floor_mb=ram_box[0]))
         except Exception:
             pass
         _print_table(workers, len(goals))
@@ -752,7 +782,8 @@ def main():
                                       autoscale_headroom_mb=args.autoscale_headroom_mb,
                                       autoscale_up_margin_mb=args.autoscale_up_margin_mb,
                                       disk_floor_gb=disk_floor, eval_disk_gb=eval_disk,
-                                      disk_box=disk_box, pause_box=pause_box, stop_box=stop_box,
+                                      disk_box=disk_box, ram_box=ram_box,
+                                      pause_box=pause_box, stop_box=stop_box,
                                       transcript_dir=transcripts_dir,
                                       run_id="r%x_a%d" % (int(started), attempt))
             for r in res:

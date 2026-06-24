@@ -568,7 +568,7 @@ class ChatWindow : Window
             foreach (var o in list) { var d = o as Dictionary<string, object>; if (d != null && SS(d, "url") == url) return; }
             var e = new Dictionary<string, object>(); e["url"] = url; e["title"] = title ?? ""; e["source"] = source; e["ts"] = 0;
             list.Add(e);
-            File.WriteAllText(_convsPath, _cjs.Serialize(list), Encoding.UTF8);
+            File.WriteAllText(_convsPath, _cjs.Serialize(list), new System.Text.UTF8Encoding(false)); // no BOM (Python reads this)
             _convsMtime = File.GetLastWriteTimeUtc(_convsPath).Ticks;
         }
         catch { }
@@ -588,7 +588,7 @@ class ChatWindow : Window
                 if (d != null && urls.Contains(SS(d, "url"))) continue;
                 keep.Add(o);
             }
-            File.WriteAllText(_convsPath, _cjs.Serialize(keep), Encoding.UTF8);
+            File.WriteAllText(_convsPath, _cjs.Serialize(keep), new System.Text.UTF8Encoding(false)); // no BOM
             _convsMtime = File.GetLastWriteTimeUtc(_convsPath).Ticks;
         }
         catch { }
