@@ -95,10 +95,51 @@ def run_done():
         return False
 
 
+def settings_path():
+    return os.path.join(os.environ.get("APPDATA", ""), "copilot-bridge", "settings.txt")
+
+
+def write_setting(key, value):
+    """Update key=value in the shared settings.txt (the file fleet_runner reads), preserving every
+    other line. No BOM (fleet reads utf-8-sig but writes must stay BOM-free per the repo rule)."""
+    sp = settings_path()
+    try:
+        os.makedirs(os.path.dirname(sp), exist_ok=True)
+        lines, found = [], False
+        if os.path.exists(sp):
+            for ln in open(sp, encoding="utf-8-sig"):
+                if ln.strip().lower().startswith(key.lower() + "="):
+                    lines.append("%s=%s\n" % (key, value)); found = True
+                else:
+                    lines.append(ln if ln.endswith("\n") else ln + "\n")
+        if not found:
+            lines.append("%s=%s\n" % (key, value))
+        with open(sp, "w", encoding="utf-8", newline="") as f:
+            f.writelines(lines)
+        return True
+    except Exception:
+        return False
+
+
+def calibrate(ewma, recent_pertab, swap_pct):
+    """Turn observations into a SAFE per-tab estimate to write back. Use the recency-weighted EWMA
+    of the average per-tab (already conservative vs the regression marginal), clamped to [400,700].
+    SWAP TRIPWIRE: if the box is already swapping hard, do NOT lower the reserve -- back off to the
+    safe 700 so we never over-admit into a thrash."""
+    if swap_pct is not None and swap_pct >= 25:
+        return 700
+    if ewma is None:
+        return None
+    v = int(round(ewma))
+    return max(400, min(700, v))
+
+
 def main():
     open(OUT, "w").close()
     ewma = None
     pts = []
+    npt = 0           # how many samples actually had a per-tab reading (stability gate)
+    last_written = None
     end = time.time() + 4 * 3600
     while time.time() < end:
         vm = psutil.virtual_memory(); sw = psutil.swap_memory()
@@ -107,7 +148,7 @@ def main():
         per_tab = (ews / pg) if pg > 0 else None
         if per_tab:
             ewma = per_tab if ewma is None else ALPHA * per_tab + (1 - ALPHA) * ewma
-            pts.append((pg, ews)); pts = pts[-60:]
+            pts.append((pg, ews)); pts = pts[-60:]; npt += 1
         slope, base = regress(pts[-30:])
         row = dict(ts=round(time.time()), edge_mb=round(ews), pages=pg, active=active, cap=cap,
                    avail_mb=round(vm.available / 1024 / 1024), free_mb=round(vm.free / 1024 / 1024),
@@ -119,6 +160,17 @@ def main():
                    base_overhead_mb=round(base) if base else None)
         with open(OUT, "a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
+        # FEEDBACK: once the estimate is stable (>=20 per-tab samples), write the calibrated value
+        # to settings.txt so the fleet autoscale uses THIS machine's measured cost (vs the flat 700).
+        if npt >= 20:
+            cal = calibrate(ewma, None, row["swap_pct"])
+            if cal and cal != last_written:
+                if write_setting("autoscale_per_tab_mb", cal):
+                    with open(OUT, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({"ts": round(time.time()),
+                                            "note": "calibrated autoscale_per_tab_mb=%d (was %s)"
+                                                    % (cal, last_written)}) + "\n")
+                    last_written = cal
         if run_done():
             with open(OUT, "a", encoding="utf-8") as f:
                 f.write(json.dumps({"ts": round(time.time()), "note": "50-run DONE -- stopping"}) + "\n")
