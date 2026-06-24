@@ -1136,11 +1136,10 @@ class CockpitWindow : Window
         _effortBox.FontWeight = FontWeights.SemiBold; _effortBox.MinWidth = 78;
         _effortBox.Padding = new Thickness(8, 2, 4, 2);
         _effortBox.VerticalAlignment = VerticalAlignment.Center;
-        foreach (string m in _effortModes) _effortBox.Items.Add(m);
-        _effortBox.SelectedItem = _effort;
+        FillComboWithHelp(_effortBox, _effortModes, EffortHelp(), _effort);  // per-option hover help
         _effortBox.SelectionChanged += delegate
         {
-            string sel = _effortBox.SelectedItem as string;
+            string sel = ComboVal(_effortBox);
             if (string.IsNullOrEmpty(sel) || sel == _effort) return;
             _effort = sel;
             SaveKey("effort", _effort);
@@ -1156,7 +1155,7 @@ class CockpitWindow : Window
         if (_effortBox == null) return;
         // keep the dropdown in sync with _effort (e.g. settings.txt changed externally) without
         // re-firing the persist handler -- assigning the same value is a no-op for SelectionChanged.
-        if (!Equals(_effortBox.SelectedItem, _effort)) _effortBox.SelectedItem = _effort;
+        if (!Equals(ComboVal(_effortBox), _effort)) ComboSelectVal(_effortBox, _effort);
         _effortBox.Background = BtnBg; _effortBox.Foreground = Fg; _effortBox.BorderBrush = Border;
         StyleFlatCombo(_effortBox);   // re-template each paint so a theme toggle retints resting + popup
     }
@@ -1301,11 +1300,10 @@ class CockpitWindow : Window
         _approvalBox.FontWeight = FontWeights.SemiBold; _approvalBox.MinWidth = 74;
         _approvalBox.Padding = new Thickness(8, 2, 4, 2);
         _approvalBox.VerticalAlignment = VerticalAlignment.Center;
-        foreach (string m in _approvalModes) _approvalBox.Items.Add(m);
-        _approvalBox.SelectedItem = _approval;
+        FillComboWithHelp(_approvalBox, _approvalModes, ApprovalHelp(), _approval);  // per-option hover help
         _approvalBox.SelectionChanged += delegate
         {
-            string sel = _approvalBox.SelectedItem as string;
+            string sel = ComboVal(_approvalBox);
             if (string.IsNullOrEmpty(sel) || sel == _approval) return;
             _approval = sel;
             SaveKey("approval", _approval);
@@ -1319,9 +1317,64 @@ class CockpitWindow : Window
     {
         if (_approvalLbl != null) { _approvalLbl.Text = T("approval"); _approvalLbl.Foreground = Muted; }
         if (_approvalBox == null) return;
-        if (!Equals(_approvalBox.SelectedItem, _approval)) _approvalBox.SelectedItem = _approval;
+        if (!Equals(ComboVal(_approvalBox), _approval)) ComboSelectVal(_approvalBox, _approval);
         _approvalBox.Background = BtnBg; _approvalBox.Foreground = Fg; _approvalBox.BorderBrush = Border;
         StyleFlatCombo(_approvalBox);   // same flat-template fix so the open list matches the theme
+    }
+
+    // ── per-option hover help for the 推論 / 承認 dropdowns ──────────────────────────────────
+    // Other cockpit buttons carry a ToolTip; the effort/approval dropdown OPTIONS did not. We now
+    // add each option as a ComboBoxItem with its own ToolTip, so hovering an item in the open list
+    // explains what that mode does. ComboVal/ComboSelectVal keep the string-based selection logic.
+    Dictionary<string, string> EffortHelp()
+    {
+        return _lang == 0
+            ? new Dictionary<string, string> {
+                { "min", "最小: 速い・浅い。簡単なタスク向け（調査/反論を抑制）" },
+                { "max", "最大: 深い調査と自己反論。難タスク向け（遅いが高品質）" },
+                { "ultra", "ウルトラ: 最深。research＋self-test＋反論をフル動員（最重・最高品質）" },
+                { "auto", "自動: タスク難度に応じて min〜ultra を自動選択（推奨）" } }
+            : new Dictionary<string, string> {
+                { "min", "Min: fast, shallow. Easy tasks (research/refute suppressed)." },
+                { "max", "Max: deep research + self-refute. Hard tasks (slower, higher quality)." },
+                { "ultra", "Ultra: deepest. Full research + self-test + refutation (heaviest, best)." },
+                { "auto", "Auto: pick min..ultra by task difficulty (recommended)." } };
+    }
+    Dictionary<string, string> ApprovalHelp()
+    {
+        return _lang == 0
+            ? new Dictionary<string, string> {
+                { "run", "run: 承認を挟まず即実行。" },
+                { "plan", "plan: 計画を提示して「承認待ち」で停止。カードに承認/修正を steer。" },
+                { "auto", "auto: 通常フリートは計画承認待ち／フォルダ自律は GO-ASK-STOP ゲートで自走。" } }
+            : new Dictionary<string, string> {
+                { "run", "run: execute immediately, no approval step." },
+                { "plan", "plan: present a plan and pause at approval; steer the card to approve/edit." },
+                { "auto", "auto: plain fleet waits for plan approval; folder autonomy self-runs via GO-ASK-STOP." } };
+    }
+    void FillComboWithHelp(ComboBox cb, string[] opts, Dictionary<string, string> help, string current)
+    {
+        cb.Items.Clear();
+        foreach (string m in opts)
+        {
+            var it = new ComboBoxItem(); it.Content = m;
+            string h; if (help != null && help.TryGetValue(m, out h)) it.ToolTip = h;
+            cb.Items.Add(it);
+            if (m == current) cb.SelectedItem = it;
+        }
+    }
+    static string ComboVal(ComboBox cb)
+    {
+        var it = cb.SelectedItem as ComboBoxItem;
+        return it != null ? (it.Content as string) : (cb.SelectedItem as string);
+    }
+    static void ComboSelectVal(ComboBox cb, string val)
+    {
+        foreach (var o in cb.Items)
+        {
+            var it = o as ComboBoxItem;
+            if (it != null && (it.Content as string) == val) { cb.SelectedItem = it; return; }
+        }
     }
 
     // Fleet-wide controls: Pause/Resume toggle + Stop-all. Both write into commands.json
