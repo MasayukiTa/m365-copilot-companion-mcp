@@ -587,11 +587,12 @@ powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "$ro
 1. Copilot Studio にサインインし、「**エージェント**」→「**新しいエージェント**」（または既存エージェントを開く）。
 2. エージェントの編集画面で「**ツール**」タブ（または「ツールを追加」ボタン）→「**ツールを追加**」をクリック。（要確認）メニューの名称は Copilot Studio のバージョンによって「アクション」→「新しいアクション」→「外部」と表示される場合があります。
 3. 一覧から「**Model Context Protocol**」（MCP）を選択。
-4. 以下の値を入力する:
+4. 以下の値を入力する。
+   > 💡 **この3値は手で組み立てなくてOK。`copilot_studio_values.bat` をダブルクリック**すると、あなたの `.env` ＋ Dev Tunnel から**実際の値をそのまま表示**します（quickstart の STEP 5 でも自動表示）。コピペするだけ。
 
    | 項目 | 入力値 |
    |---|---|
-   | **サーバー URL** | `https://<your-tunnel>-8000.<region>.devtunnels.ms/mcp` |
+   | **サーバー URL** | `https://<your-tunnel>-8000.<region>.devtunnels.ms/mcp` （= `MCP_TUNNEL_URL` + `/mcp`） |
    | **認証の種類** | 「API キー（手動）」または「ヘッダー」 |
    | **ヘッダー名** | `Authorization` |
    | **ヘッダー値** | `Bearer <MCP_API_KEY の値>` （STEP 1 でコンソールに表示された値） |
@@ -601,6 +602,8 @@ powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "$ro
 6. 「**公開**」→「**利用者を自分だけ**」に設定（必ず自分のみ。組織全体は絶対に選ばない）。
 
 **うまくいった目安:** ツール登録画面に `list_my_tools`, `read_file` などのツール名がずらっと表示される。
+
+> ✅ **全部つながったか不安なら `doctor.bat` をダブルクリック。** サーバ→Dev Tunnel→専用 Edge→M365 サインイン→Bearer 認証まで**全リンクを緑/赤でチェック**し、赤には**その場で直し方**を表示します。「動いてる？」はこれ一発で解消できます。
 
 **同時にやっておくと便利（任意）:** エージェントの「ツール」タブで、Copilot Studio の純正コネクタ（メール・予定表・Teams・SharePoint など）も有効化しておくと、クラウド側を純正コネクタ・ローカル側をこの companion、という本来の二枚重ねになります（→「🧱 設計思想」参照）。
 
@@ -719,7 +722,7 @@ Copilot Studio のバックエンドから呼ぶと IP が毎回変わること�
 
 ### STEP 8 ─ 2 回目以降の日常起動
 
-**`start_all.bat` をダブルクリックするだけ**です。これ 1 つで下記スタック全部を一括起動します:
+**デスクトップの「M365 Companion」アイコンをダブルクリックするだけ**です（quickstart が初回に自動作成。中身は `start_all.bat`。リポジトリを探す必要なし）。これ 1 つで下記スタック全部を一括起動します:
 
 | | 起動するもの | 既に動いていたら |
 |---|---|---|
