@@ -58,7 +58,11 @@ def main():
 
         # 2) launch the fleet on this batch HIDDEN (no console window -- the cockpit's card UI is
         #    the surface; raw fleet stdout goes to a log). agent URL resolves from .env.
-        env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        # SWE_SIDEPAGE_RESERVE=0: admit by MAIN-tab count only (don't pre-reserve each worker's
+        # research+refuter peak), so auto-effort tasks PARALLELIZE on this RAM-tight box. Side-pages
+        # still open lazily under their own ram_room gate -> worst case a worker stalls, never the
+        # RAM-balloon crash. Lets the cap (e.g. 4) run 4 workers instead of one 3-tab worker.
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", SWE_SIDEPAGE_RESERVE="0")
         flog = open(os.path.join(SW, "pro_fleet_batch.log"), "w", encoding="utf-8")
         subprocess.Popen([PY, "-m", "relay.fleet_runner", "--goals-file", bgoals,
                           "--state-dir", os.path.join(REPO, ".fleet"), "--effort", "auto"],
