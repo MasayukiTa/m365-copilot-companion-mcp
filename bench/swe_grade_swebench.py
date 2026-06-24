@@ -80,9 +80,17 @@ def main():
     preds_wsl = "/mnt/c/wsl-setup/preds_%s.json" % runid
     runner_win = "%s/kiyus_batch_grade.py" % R.REMOTE_DIR
     runner_wsl = "/mnt/c/wsl-setup/kiyus_batch_grade.py"
-    if not R._scp(preds_local, preds_win):
+    def _scp_retry(local, remote, n=6):
+        # kiyus sshd has a very low MaxStartups; a single scp can be transiently rejected.
+        # retry a few times (waiting for the handshake window to clear) before giving up.
+        for _i in range(n):
+            if R._scp(local, remote):
+                return True
+            time.sleep(7)
+        return False
+    if not _scp_retry(preds_local, preds_win):
         log("scp predictions failed"); return
-    if not R._scp(RUNNER_LOCAL, runner_win):
+    if not _scp_retry(RUNNER_LOCAL, runner_win):
         log("scp runner failed"); return
 
     # 2) launch ONE swebench batch eval, detached (survives SSH drops; long build+run)
