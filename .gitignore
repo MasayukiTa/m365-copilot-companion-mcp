@@ -122,3 +122,6 @@ ui/_buildcheck/
 !/bench/SELF_GROWTH_L4_DESIGN.md
 !/bench/SYSTEM_MAP.md
 !/bench/SCORECARD_swebench_lite300_strong.md
+
+# HumanEval dataset -- not shipped in the repo; fetch it yourself if you want to run that bench
+/bench/_data/
