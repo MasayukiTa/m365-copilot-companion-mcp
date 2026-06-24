@@ -114,3 +114,11 @@ ui/_buildcheck/
 /bench/_pro_*.py
 /bench/_cdp_*.py
 /bench/_*_b64.txt
+
+# internal bench process docs / work logs: keep in history, exclude going forward
+# (architecture/system docs + the README-referenced scorecard stay tracked)
+/bench/*.md
+!/bench/SELF_IMPROVEMENT_CONTROLLER.md
+!/bench/SELF_GROWTH_L4_DESIGN.md
+!/bench/SYSTEM_MAP.md
+!/bench/SCORECARD_swebench_lite300_strong.md
