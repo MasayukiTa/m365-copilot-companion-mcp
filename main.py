@@ -365,4 +365,13 @@ if __name__ == "__main__":
 
     app = mcp.http_app(path="/mcp", transport="streamable-http",
                        json_response=True, middleware=[Middleware(_AcceptBoth)])
+
+    # OpenAI-compatible chat-completions surface (additive, FLAG-GATED).
+    # Mounts POST /v1/chat/completions + GET /v1/models on this SAME uvicorn app
+    # ONLY when OPENAI_COMPAT=1; otherwise it is a no-op and /mcp is unchanged.
+    # Lets any OpenAI-API harness use the Copilot-routed Opus 4.8 as its backend.
+    from relay.openai_adapter import register_openai_routes
+    if register_openai_routes(app):
+        print("[main] OpenAI-compat routes mounted: POST /v1/chat/completions, GET /v1/models")
+
     uvicorn.run(app, host="127.0.0.1", port=8000, timeout_graceful_shutdown=30)
