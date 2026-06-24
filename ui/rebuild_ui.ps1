@@ -36,7 +36,7 @@ function Build($name, $sources) {
     $f = Get-Item $out
     Write-Host ("BUILD OK: {0,-13} {1} bytes  {2}" -f $name, $f.Length, $f.LastWriteTime.ToString("HH:mm:ss"))
 }
-Build "FleetCockpit" @("FleetCockpit.cs")
+Build "FleetCockpit" @("FleetCockpit.cs","SelfImproveDashboard.cs")
 Build "CopilotChat"  @("CopilotChat.cs","Markdown.cs")
 
 # 3) Launch both fresh (cockpit first; it will not relaunch a stale chat because we launch the new one).
