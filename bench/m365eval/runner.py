@@ -289,6 +289,59 @@ def _parse_datetime_loose(text: str) -> datetime | None:
     return None
 
 
+def grade_workiq_email_draft(
+    read_reply: str,
+    marker: str,
+) -> tuple[bool, str]:
+    """Grade a Work IQ Drafts search reply for the email-draft task.
+
+    PASS iff:
+      - 'FOUND' is present in the reply, AND
+      - the exact marker subject is present in the reply, AND
+      - 'NOT_FOUND' is absent from the reply.
+
+    The agent's own 'DRAFTED' claim from the DO step is NOT used here.
+    Returns (passed: bool, evidence: str).
+    """
+    has_found = "FOUND" in read_reply
+    has_marker = marker in read_reply
+    has_not_found = "NOT_FOUND" in read_reply
+
+    if has_found and has_marker and not has_not_found:
+        # Extract the FOUND line for evidence
+        found_line = ""
+        for line in read_reply.splitlines():
+            if "FOUND" in line and marker in line:
+                found_line = line.strip()
+                break
+        if not found_line:
+            found_line = read_reply[:200]
+        return True, (
+            f"PASS: Draft found via INDEPENDENT Work IQ Drafts search.\n"
+            f"  Marker    : {marker}\n"
+            f"  Reply line: {found_line}"
+        )
+
+    if has_not_found:
+        return False, (
+            f"FAIL: 'NOT_FOUND' in Work IQ Drafts search reply — draft absent.\n"
+            f"  Marker     : {marker}\n"
+            f"  Raw reply  : {read_reply[:500]}"
+        )
+
+    if not has_found:
+        return False, (
+            f"FAIL: 'FOUND' not in Work IQ Drafts search reply.\n"
+            f"  Marker     : {marker}\n"
+            f"  Raw reply  : {read_reply[:500]}"
+        )
+
+    return False, (
+        f"FAIL: Marker '{marker}' not in reply (but 'FOUND' is present — wrong draft?).\n"
+        f"  Raw reply: {read_reply[:500]}"
+    )
+
+
 def grade_workiq_calendar(
     read_reply: str,
     marker: str,
@@ -606,11 +659,13 @@ def main() -> int:
     read_prompt = sub(task.get("read_prompt", ""))
     delete_prompt = sub(task.get("delete_prompt", ""))
     grade_params = task["grade_params"]
+    grade_type = task.get("grade_type", "calendar")  # "calendar" | "email_draft"
 
     print("=" * 60)
     print("M365EVAL - Work IQ grader")
     print("=" * 60)
     print(f"  Task       : {task['id']}")
+    print(f"  Grade type : {grade_type}")
     print(f"  RUNID      : {runid}")
     print(f"  Marker     : {marker}")
     print(f"  Surface    : {task['surface']}")
@@ -686,16 +741,24 @@ def main() -> int:
             return 5
         print(f"  Work IQ read reply: {grade_reply!r}")
         print()
-        passed, evidence = grade_workiq_calendar(
-            read_reply=grade_reply,
-            marker=marker,
-            expected_date=tomorrow,
-            expected_hour=grade_params["expected_hour"],
-            expected_minute=grade_params["expected_minute"],
-            start_tolerance_minutes=grade_params["start_tolerance_minutes"],
-            expected_duration_minutes=grade_params["expected_duration_minutes"],
-            duration_tolerance_minutes=grade_params["duration_tolerance_minutes"],
-        )
+
+        if grade_type == "email_draft":
+            passed, evidence = grade_workiq_email_draft(
+                read_reply=grade_reply,
+                marker=marker,
+            )
+        else:
+            # Default: calendar grader
+            passed, evidence = grade_workiq_calendar(
+                read_reply=grade_reply,
+                marker=marker,
+                expected_date=tomorrow,
+                expected_hour=grade_params["expected_hour"],
+                expected_minute=grade_params["expected_minute"],
+                start_tolerance_minutes=grade_params["start_tolerance_minutes"],
+                expected_duration_minutes=grade_params["expected_duration_minutes"],
+                duration_tolerance_minutes=grade_params["duration_tolerance_minutes"],
+            )
 
     else:
         print(f"[4/5] GRADE: Reading Outlook COM calendar for '{marker}'...")
@@ -742,18 +805,38 @@ def main() -> int:
                     print(f"  WARNING: Verify read failed: {exc}")
                     verify_reply = ""
 
-                # Check cleanup by parsing structured events — a bare substring match
-                # is NOT sufficient: the agent may mention the marker in a deletion-
-                # confirmation sentence (e.g. "X is no longer in the list").
-                verify_events = parse_workiq_calendar_lines(verify_reply)
-                marker_still_present = any(e["title"] == marker for e in verify_events)
-                if marker_still_present:
-                    print(f"  WARNING: Marker '{marker}' still found as a calendar event in re-read!")
-                    print(f"  MANUAL CLEANUP NEEDED: delete '{marker}' on {tomorrow_str}")
-                    cleanup_ok = False
+                # Check cleanup via grade_type-appropriate logic.
+                if grade_type == "email_draft":
+                    # For email drafts: PASS cleanup iff the independent re-search
+                    # returns NOT_FOUND or does NOT contain FOUND+marker together.
+                    # A bare mention of the marker in a "deleted X" sentence does NOT
+                    # count as the draft being still present.
+                    draft_gone_pass, _ = grade_workiq_email_draft(
+                        read_reply=verify_reply,
+                        marker=marker,
+                    )
+                    if draft_gone_pass:
+                        # Draft still found — cleanup failed
+                        print(f"  WARNING: Draft '{marker}' still found in Drafts after DELETE!")
+                        print(f"  MANUAL CLEANUP NEEDED: delete draft '{marker}'")
+                        cleanup_ok = False
+                    else:
+                        # grade_workiq_email_draft returned FAIL — meaning NOT_FOUND or
+                        # FOUND absent, which means the draft is gone. Good.
+                        print(f"  Cleanup confirmed: draft NOT found in independent re-search. OK.")
+                        cleanup_ok = True
                 else:
-                    print(f"  Cleanup confirmed: marker NOT present as an event in re-read. OK.")
-                    cleanup_ok = True
+                    # Calendar: parse structured events — a bare substring match
+                    # is NOT sufficient (agent may mention marker in deletion sentence).
+                    verify_events = parse_workiq_calendar_lines(verify_reply)
+                    marker_still_present = any(e["title"] == marker for e in verify_events)
+                    if marker_still_present:
+                        print(f"  WARNING: Marker '{marker}' still found as a calendar event in re-read!")
+                        print(f"  MANUAL CLEANUP NEEDED: delete '{marker}' on {tomorrow_str}")
+                        cleanup_ok = False
+                    else:
+                        print(f"  Cleanup confirmed: marker NOT present as an event in re-read. OK.")
+                        cleanup_ok = True
             else:
                 print(f"[5/5] CLEANUP: No delete_prompt defined for this task.")
                 print(f"  Manual cleanup needed: delete '{marker}' on {tomorrow_str}")
@@ -775,7 +858,10 @@ def main() -> int:
     print(f"  Grade evidence       : {evidence.splitlines()[0]}")
     if not cleanup_ok:
         print(f"  *** CLEANUP INCOMPLETE - manual action required ***")
-        print(f"  *** Delete '{marker}' on {tomorrow_str} ***")
+        if grade_type == "email_draft":
+            print(f"  *** Delete draft with subject '{marker}' from Drafts folder ***")
+        else:
+            print(f"  *** Delete '{marker}' on {tomorrow_str} ***")
     else:
         print(f"  Cleanup              : OK")
     print("=" * 60)
