@@ -217,6 +217,18 @@ RETRY_JOB = (
     "完了したら最後の行に DONE、本当に解決不能な場合のみ STUCK: と理由を書いてください。"
 )
 
+# Re-anchored as the FIRST message of a fresh conversation after the previous one hit the
+# Copilot model token limit (OpenAIModelTokenLimit). The new chat has NO memory of prior
+# turns, so the agent must re-derive progress from the actual artifacts on disk (the target
+# Excel, output files, etc.) rather than from conversation history. Prefixed to the goal.
+RECYCLE_PREFIX = (
+    "【会話リセット】前の会話がトークン上限に達したため、新しい会話に切り替えました。"
+    "この会話には以前のやり取りの記憶はありません。これまでの作業結果は対象ファイル"
+    "（出力先の Excel やファイル）に保存されています。まず現在の保存状態を実際に読み直して"
+    "「どこまで完了しているか」を確認し、未完了の続きから実行してください。\n\n"
+    "--- 元のゴール ---\n"
+)
+
 # Claude-Code / Anthropic-SDK-style exponential backoff with jitter for transient-failure
 # retries. The SDK's _calculate_retry_timeout uses: delay = min(initial * 2**attempt, cap),
 # then subtracts up to 25% jitter (delay * (1 - 0.25*rand)); initial=0.5s, cap=8s. We mirror
@@ -284,6 +296,41 @@ def reported_stuck(resp: str) -> bool:
     seen to abort a perfectly fine run."""
     up = (resp or "").upper()
     return "STUCK:" in up or "STUCK：" in up
+
+
+def conversation_exhausted(resp: str) -> bool:
+    """True when Copilot itself reports the conversation can no longer continue
+    because it ran out of model token budget. The hands-off relay otherwise
+    appends to ONE chat forever, so a long task (lots of OCR text / Excel rows)
+    eventually trips this and EVERY later turn returns the same error. Detecting
+    it lets run_relay recycle to a fresh conversation instead of dying.
+
+    Anchored on Copilot's own error code/text (JP + EN) -- kept conservative so a
+    normal answer that merely discusses tokens does not false-fire.
+    """
+    t = (resp or "")
+    low = t.lower()
+    if "openaimodeltokenlimit" in low:
+        return True
+    # Defensive variants Copilot has shown for the same condition.
+    if ("トークン" in t and ("上限" in t or "制限" in t or "超え" in t)):
+        return True
+    if "maximum context length" in low or "context length exceeded" in low:
+        return True
+    return False
+
+
+def bare_agent_url(url: str) -> str:
+    """Best-effort: turn a specific conversation URL into the agent's base URL,
+    which (per find_conversation_page) starts a NEW chat when loaded fresh.
+    Strips a trailing '/conversation/<id>' segment; leaves other forms as-is so
+    the caller's explicit agent_url (preferred) is what really drives recycling.
+    """
+    u = url or ""
+    marker = "/conversation/"
+    if marker in u:
+        return u.split(marker, 1)[0]
+    return u
 
 
 def _is_processing(text: str) -> bool:
@@ -1041,6 +1088,8 @@ def run_relay(
     forge: bool = False,
     max_forge: int = 3,
     max_transient: int = 10,
+    agent_url: str | None = None,
+    max_recycles: int = 8,
 ) -> str:
     """Run the autonomous loop unattended. Returns one of:
     DONE | STUCK | MAXTURNS | ABORTED. Notifies on every terminal outcome.
@@ -1083,6 +1132,7 @@ def run_relay(
     backoff_s = 0.0          # adaptive throttle: extra cool-down added between turns
     base_elapsed = None      # fastest healthy turn so far -> the "not throttled" baseline
     last_norm = None
+    recycles = 0           # fresh-conversation recycles after a token-limit exhaustion
     outcome: str | None = None
     reason = ""
 
@@ -1183,6 +1233,43 @@ def run_relay(
         memory_save(f"relay.{run_id}.turn{turn}", resp[:4000], scope="relay",
                     tags=["relay", run_id])
         print(f"[relay turn {turn}] {resp[:160].replace(chr(10), ' ')}")
+
+        # ---- conversation-token-limit recovery (recycle to a fresh chat) ----
+        # A hands-off run pumps ONE conversation; a long task eventually exhausts the
+        # model's token budget (OpenAIModelTokenLimit) and then EVERY later turn returns
+        # the same error. Detect it and start a NEW conversation on the SAME agent,
+        # re-anchoring the goal so the agent re-derives progress from disk (the Excel /
+        # output files). This does not consume a turn and is capped by max_recycles.
+        if conversation_exhausted(resp):
+            recycles += 1
+            runlog_append(run_id, {"turn": turn, "event": "token_limit_recycle",
+                                   "n": recycles, "detail": resp[:160]})
+            if recycles > max_recycles:
+                outcome, reason = "STUCK", (
+                    f"conversation token limit hit; exceeded max_recycles={max_recycles}")
+                break
+            target = (agent_url or "").strip() or bare_agent_url(
+                getattr(getattr(driver, "page", None), "url", "") or "")
+            print(f"[relay turn {turn}] token limit -> recycling to fresh conversation "
+                  f"({recycles}/{max_recycles}) at {target[:70]}")
+            try:
+                driver.page.goto(target, wait_until="domcontentloaded")
+                for _ in range(30):
+                    driver.page.wait_for_timeout(1000)
+                    if driver.page.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+                        break
+            except Exception as e:  # noqa: BLE001
+                outcome, reason = "STUCK", f"recycle navigation failed: {type(e).__name__}: {e}"
+                break
+            notify("♻ Relay 会話リサイクル",
+                   f"トークン上限 → 新会話で続行 ({recycles}/{max_recycles})")
+            # Re-anchor the goal as the first message of the fresh conversation.
+            job = PROTOCOL + RECYCLE_PREFIX + goal + context + (FORGE_HINT if forge else "")
+            no_progress = 0
+            last_norm = None
+            turn -= 1                       # the recycle itself is not a work turn
+            time.sleep(sleep_s + backoff_s)
+            continue
 
         norm = " ".join(resp.lower().split())[:300]
         no_progress = no_progress + 1 if norm and norm == last_norm else 0
