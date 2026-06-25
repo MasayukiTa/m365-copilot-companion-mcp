@@ -173,6 +173,16 @@ class RelayUnavailable(RuntimeError):
     """Raised when no live Copilot relay can be acquired (-> HTTP 503)."""
 
 
+# Recycle the conversation after this many successful jobs. Long-lived Copilot
+# conversations degrade -- after dozens of turns the composer eventually refuses
+# to submit ("Send button never submitted the message"), which, in a single
+# reused chat, poisons EVERY subsequent send (observed in the GAIA full run: one
+# stuck L3 generation wedged the composer and cascaded 62 errors). Recycling to a
+# fresh conversation bounds that risk. Override via RELAY_RESET_EVERY; 0 disables
+# proactive recycling (error-driven reset still applies).
+RESET_EVERY = int(os.environ.get("RELAY_RESET_EVERY", "25"))
+
+
 class _RelayWorker:
     """Owns the CDP browser + driver on a single private thread."""
 
@@ -224,30 +234,96 @@ class _RelayWorker:
             self._start_error = e
             self._ready.set()
             return
+        jobs_since_reset = 0
+        needs_reset = False
         try:
             while True:
                 prompt, timeout_s, reply_box = self._jobs.get()
                 if prompt is None:  # shutdown sentinel
                     break
-                try:
-                    driver.send(prompt)
-                    got = driver.wait_for_idle(timeout_s=timeout_s)
-                    if not got:
-                        reply_box.put(("error", "timed out waiting for Copilot reply"))
-                        continue
-                    # Prefer the chrome-free reply extractor (reply-div only); fall back to the
-                    # full-bubble reader on older drivers so this never breaks.
-                    reader = getattr(driver, "read_last_reply_clean", driver.read_last_response)
-                    reply = reader()
+
+                # Reset BEFORE the job so it runs in a clean conversation: either a
+                # forced recovery (previous job wedged/timed out) or a proactive
+                # recycle after RESET_EVERY successful jobs.
+                if driver is not None and (
+                    needs_reset or (RESET_EVERY and jobs_since_reset >= RESET_EVERY)
+                ):
+                    try:
+                        driver = self._reset_conversation(driver)
+                        print(f"[relay] conversation recycled "
+                              f"(since_reset={jobs_since_reset}, forced={needs_reset})",
+                              flush=True)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[relay] reset failed: {type(e).__name__}: {e}", flush=True)
+                    jobs_since_reset = 0
+                    needs_reset = False
+
+                reply = None
+                err = None
+                # One in-place recovery for a wedged composer: reset + retry SAME prompt.
+                for attempt in (1, 2):
+                    try:
+                        driver.send(prompt)
+                        got = driver.wait_for_idle(timeout_s=timeout_s)
+                        if not got:
+                            # Genuinely slow/stuck generation. Do NOT retry the same
+                            # prompt (it would just time out again) but force a fresh
+                            # conversation for the NEXT job so this cannot cascade.
+                            err = "timed out waiting for Copilot reply"
+                            needs_reset = True
+                            break
+                        reader = getattr(driver, "read_last_reply_clean",
+                                         driver.read_last_response)
+                        reply = reader()
+                        err = None
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        err = f"{type(e).__name__}: {e}"
+                        if attempt == 1:
+                            try:
+                                driver = self._reset_conversation(driver)
+                                jobs_since_reset = 0
+                                print(f"[relay] send error -> recycled, retry once: {err}",
+                                      flush=True)
+                                continue
+                            except Exception as e2:  # noqa: BLE001
+                                err = f"{err} | reset failed: {type(e2).__name__}: {e2}"
+                        needs_reset = True
+                        break
+
+                if err is None:
                     reply_box.put(("ok", reply))
-                except Exception as e:  # noqa: BLE001
-                    reply_box.put(("error", f"{type(e).__name__}: {e}"))
+                    jobs_since_reset += 1
+                else:
+                    reply_box.put(("error", err))
         finally:
             if playwright_cm is not None:
                 try:
                     playwright_cm.__exit__(None, None, None)
                 except Exception:
                     pass
+
+    def _reset_conversation(self, driver):
+        """Open a FRESH agent conversation page and bind a new driver, closing the
+        old (possibly wedged) page.
+
+        This is the core composer-wedge mitigation: rather than reusing one chat
+        for the whole run (where a single stuck generation poisons every later
+        send), we recycle to a brand-new conversation. `_find_agent_page` opens
+        MCP_IMPL_AGENT_URL in a new tab and waits for the composer; navigating to a
+        bare /chat/ URL starts a new conversation.
+        """
+        from relay.copilot_autopilot_relay import CopilotWebDriver
+
+        ctx = driver.page.context
+        old = driver.page
+        newpage = self._find_agent_page(ctx)
+        if old is not newpage:
+            try:
+                old.close()
+            except Exception:
+                pass
+        return CopilotWebDriver(newpage)
 
     def _build_driver(self):
         """Connect to the dedicated Edge over CDP and bind a CopilotWebDriver.
