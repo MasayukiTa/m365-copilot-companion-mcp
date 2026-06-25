@@ -7,16 +7,38 @@ from typing import Optional
 
 from .security import require_unlocked
 
-ALLOWED_BASE = Path(os.environ.get("MCP_ALLOWED_BASE", "~")).expanduser().resolve()
+def _parse_allowed_bases() -> list:
+    """Allowed file-tool roots. MCP_ALLOWED_BASE may list several roots separated
+    by the OS path separator (';' on Windows) so the agent can work on, e.g., the
+    home dir AND an external data drive (D:). Empty/unset -> home only."""
+    raw = os.environ.get("MCP_ALLOWED_BASE", "~")
+    bases = []
+    for part in raw.split(os.pathsep):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            bases.append(Path(part).expanduser().resolve())
+        except Exception:
+            continue
+    return bases or [Path("~").expanduser().resolve()]
+
+
+ALLOWED_BASES = _parse_allowed_bases()
+# First root stays the canonical ALLOWED_BASE: other modules (gate_ops, runlog_ops,
+# trace_ops) keep their state under it, so adding extra roots never relocates state.
+ALLOWED_BASE = ALLOWED_BASES[0]
 
 
 def _validate_path(path: str) -> Path:
     p = Path(path).expanduser().resolve()
-    try:
-        p.relative_to(ALLOWED_BASE)
-    except ValueError:
-        raise PermissionError(f"Path is outside the allowed base: {path}")
-    return p
+    for base in ALLOWED_BASES:
+        try:
+            p.relative_to(base)
+            return p
+        except ValueError:
+            continue
+    raise PermissionError(f"Path is outside the allowed base: {path}")
 
 
 def read_file(
