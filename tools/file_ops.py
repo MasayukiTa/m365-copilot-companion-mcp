@@ -7,31 +7,52 @@ from typing import Optional
 
 from .security import require_unlocked
 
-def _parse_allowed_bases() -> list:
-    """Allowed file-tool roots. MCP_ALLOWED_BASE may list several roots separated
-    by the OS path separator (';' on Windows) so the agent can work on, e.g., the
-    home dir AND an external data drive (D:). Empty/unset -> home only."""
-    raw = os.environ.get("MCP_ALLOWED_BASE", "~")
+def _parse_allowed_bases():
+    """Scope for the file tools, from MCP_ALLOWED_BASE.
+
+    Policy is DEFAULT-OPEN, OPT-OUT:
+      * unset / empty / '*'  -> None  == unrestricted (all drives/paths allowed).
+      * otherwise a list of allowed roots separated by the OS path separator
+        (';' on Windows). Roots may be whole drives ('C:' / 'D:' -> the drive
+        root) or specific folders ('~', 'D:/data'). A path is allowed if it sits
+        under ANY listed root.
+
+    Examples:
+      MCP_ALLOWED_BASE=            -> all drives (default)
+      MCP_ALLOWED_BASE=*           -> all drives
+      MCP_ALLOWED_BASE=C:/;D:/     -> only the C: and D: drives
+      MCP_ALLOWED_BASE=~;D:/data   -> home dir + one folder
+
+    Returns a list of resolved roots, or None for unrestricted.
+    """
+    raw = os.environ.get("MCP_ALLOWED_BASE", "").strip()
+    if not raw or raw == "*":
+        return None
     bases = []
     for part in raw.split(os.pathsep):
-        part = part.strip()
+        part = part.strip().strip('"')
         if not part:
             continue
+        # bare drive like "D:" -> the drive ROOT "D:/" (Path('D:') is drive-relative)
+        if len(part) == 2 and part[1] == ":":
+            part = part + "/"
         try:
             bases.append(Path(part).expanduser().resolve())
         except Exception:
             continue
-    return bases or [Path("~").expanduser().resolve()]
+    return bases or None
 
 
-ALLOWED_BASES = _parse_allowed_bases()
-# First root stays the canonical ALLOWED_BASE: other modules (gate_ops, runlog_ops,
-# trace_ops) keep their state under it, so adding extra roots never relocates state.
-ALLOWED_BASE = ALLOWED_BASES[0]
+ALLOWED_BASES = _parse_allowed_bases()  # None => unrestricted (all drives)
+# Canonical base for sibling modules' state (gate_ops, runlog_ops, trace_ops): the
+# first restricted root, else the home dir. State never lands on an external drive.
+ALLOWED_BASE = ALLOWED_BASES[0] if ALLOWED_BASES else Path("~").expanduser().resolve()
 
 
 def _validate_path(path: str) -> Path:
     p = Path(path).expanduser().resolve()
+    if ALLOWED_BASES is None:
+        return p  # unrestricted (default-open policy)
     for base in ALLOWED_BASES:
         try:
             p.relative_to(base)
