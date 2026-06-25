@@ -17,6 +17,11 @@
   normal verified coding tasks and SWE-bench goals, rather than as a SWE-only prompt expansion.
 - Recompute and details: `python bench/swe_lite300_scorecard.py` and
   `bench/SCORECARD_swebench_lite300_strong.md`.
+- **GAIA validation, text-only (2026-06-25): 66/126 = 52.4%** (official GAIA scorer; L1 61.9% /
+  L2 50.8% / L3 36.8%; Wilson 95% CI [43.7%, 60.9%]). General-assistant benchmark, executed by the
+  **M365 Copilot agent itself** (web-grounded default Copilot) — **not** the Anthropic API. 38 of the
+  165 validation items need a file attachment the endpoint cannot receive and are excluded; 1 item
+  was an unrecovered infra timeout (66/127 = 52.0% if counted as a miss). Details under "GAIA" below.
 
 > Microsoft 365 Copilot に **手** を生やすやつ。
 > あなたの貸与ノート PC の上で動く。**100+ ツール**（執筆時点で 117）、
@@ -104,6 +109,26 @@ HumanEval が「関数単位の生成」なら、こちらは **実在 OSS の�
 - **誠実な注記**：60件の r1/r2 は別インスタンスなので +10.5pt にはインスタンス難易度のばらつきが混在（同一問題の統制比較ではない）。デバッグに使った問題は burned 扱いでスコア主張から除外。**この60件スライス(78.3%)がフル300(71.7%)より高いのは難易度差と小Nの揺れによるもので、過適合でない不偏値はフル300の71.7%** が代表値。
 
 > 再現/詳細: `python bench/swe_lite300_scorecard.py`・`bench/SCORECARD_swebench_lite300_strong.md`。
+
+---
+
+## 📊 性能実測 — GAIA（一般アシスタント能力・公式採点）
+
+HumanEval / SWE-bench は「コーディング力」。こちらは **GAIA**（Meta/HF の一般 AI アシスタント・ベンチ。Web 探索・多段推論・常識を要する実問題）で、companion の **一般事務／調査アシスタントとしての地力** を測った。重要なのは **解いたのは M365 Copilot エージェント本体**（Web グラウンディング有の既定 Copilot）であって **Anthropic API ではない** という点。採点は GAIA 公式スコアラ（正規化＋完全一致）で、自作テストではない。
+
+| 指標 | 値 |
+|---|---|
+| **総合（text-only 126問）** | **66 / 126 = 52.4%**（Wilson 95% CI [43.7%, 60.9%]） |
+| Level 1 | 26 / 42 = 61.9% |
+| Level 2 | 33 / 65 = 50.8% |
+| Level 3 | 7 / 19 = 36.8% |
+
+- **誠実な但し書き**：GAIA validation 165 問のうち **ファイル添付が必須の 38 問は除外**（:8011 エンドポイントはファイルを受け取れない）＝ text-only 127 問が対象。さらに 1 問は復旧不能なインフラ・タイムアウトで未回収（誤答に算入すれば 66/127 = 52.0%）。
+- **測定面の注意**：companion の relay は通常、ファイル操作用のカスタム Copilot Studio エージェントに固定されている。そのカスタムエージェントは設計上 **一般質問を断る**（「capital of France」すら拒否）ため、GAIA は **素の既定 Copilot（`/chat/`・Web 有）** に向けて測る。コーディング系の scaffold とは別系統の数値。
+- **参考**：GAIA validation はトップ級エージェントでも text-only で概ね 40–65% 帯。52.4% は web-grounded Copilot として妥当かつ外部比較可能な値。
+- **この測定から生まれた恒久対策**：長寿命の単一会話だと Copilot の composer が数十ターンで送信不能（wedge）になり、1 問の生成固着が以降を連鎖エラーにする故障を確認。relay worker に **(1) 送信エラー時の会話リセット＋同一プロンプト1回再試行、(2) タイムアウト時は次問を強制リフレッシュ、(3) `RELAY_RESET_EVERY` 問ごとの予防的会話リサイクル** を実装（`relay/openai_adapter.py`）。インフラ起因のエラーは「誤答」に算入せず、チャンク毎に会話を作り直して回収する規律（`bench/gaia/retry_controller.py`）で正味スコアを確定した。
+
+> 再現: 既定 Copilot に向けた `:8011` を立て、`python bench/gaia/runner.py`（公式スコアラ `bench/gaia/scorer.py`）。エラー回収は `python bench/gaia/retry_controller.py`。
 
 ---
 
@@ -1086,6 +1111,26 @@ Before scaling to 300, we measured "baseline → failure analysis → strengthen
 - **Honest caveat:** r1 and r2 are *different* instances, so the +10.5pt mixes scaffold gain with instance-difficulty variance (not a same-instance controlled A/B). Problems used while debugging are burned and excluded from any score claim. **The 60-slice (78.3%) being higher than the full 300 (71.7%) reflects difficulty variance and small-N noise; the unbiased, non-overfit figure is the full-300 71.7%.**
 
 > Reproduce/details: `python bench/swe_lite300_scorecard.py`, `bench/SCORECARD_swebench_lite300_strong.md`.
+
+---
+
+## 📊 Measured performance — GAIA (general-assistant capability, official scoring)
+
+HumanEval / SWE-bench measure coding. **GAIA** (Meta/HF's general AI-assistant benchmark — real tasks needing web search, multi-step reasoning, common sense) measures the companion's chops as a **general office/research assistant**. The key point: the work was done by the **M365 Copilot agent itself** (web-grounded default Copilot), **not** the Anthropic API. Scored with the **official GAIA scorer** (normalize + exact match), not a home-grown test.
+
+| Metric | Value |
+|---|---|
+| **Overall (126 text-only)** | **66 / 126 = 52.4%** (Wilson 95% CI [43.7%, 60.9%]) |
+| Level 1 | 26 / 42 = 61.9% |
+| Level 2 | 33 / 65 = 50.8% |
+| Level 3 | 7 / 19 = 36.8% |
+
+- **Honest caveats:** of the 165 validation items, **38 require a file attachment the endpoint can't receive and are excluded** → 127 text-only are in scope; 1 more was an unrecovered infra timeout (66/127 = 52.0% if counted as a miss).
+- **What surface is measured:** the companion's relay is normally pinned inside a file-ops custom Copilot Studio agent, which by design **declines general questions** (even "capital of France"). GAIA is therefore run against the **bare default Copilot (`/chat/`, web-grounded)** — a different track from the coding scaffold.
+- **Reference:** GAIA validation lands roughly 40–65% text-only even for frontier agents; 52.4% is a credible, externally-comparable figure for a web-grounded Copilot.
+- **Hardening this run produced:** a single long-lived conversation wedges Copilot's composer after dozens of turns, so one stuck generation cascades into errors on every later question. The relay worker now does **(1) conversation reset + one same-prompt retry on a send error, (2) forced refresh of the *next* job after a timeout, (3) proactive conversation recycle every `RELAY_RESET_EVERY` jobs** (`relay/openai_adapter.py`). Infra errors are never counted as wrong answers; they're recovered by rebuilding the conversation per chunk (`bench/gaia/retry_controller.py`).
+
+> Reproduce: point `:8011` at the default Copilot and run `python bench/gaia/runner.py` (official scorer `bench/gaia/scorer.py`); recover infra errors with `python bench/gaia/retry_controller.py`.
 
 ---
 

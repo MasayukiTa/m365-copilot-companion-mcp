@@ -184,6 +184,22 @@ def load_gaia_dataset(split: str = "validation") -> list[dict]:
     Returns a list of dicts with keys:
         task_id, Question, Final answer, Level, file_name (and others).
     """
+    # Prefer a LOCAL cache (downloaded out-of-band on a network that allows HF data files;
+    # the corporate proxy here blocks huggingface.co/datasets/*/resolve/). No network needed.
+    import os.path as _op
+    local = _op.join(_op.dirname(_op.abspath(__file__)), "gaia_validation.json")
+    if _op.exists(local):
+        with open(local, encoding="utf-8") as _f:
+            items = json.load(_f)
+        # GAIA's Level comes back as a string ("1"/"2"/"3"); the runner compares to int levels.
+        for _it in items:
+            try:
+                _it["Level"] = int(_it.get("Level"))
+            except (TypeError, ValueError):
+                pass
+        print(f"Loaded {len(items)} GAIA {split} items from local cache (no network).")
+        return items
+
     hf_token = os.environ.get("HF_TOKEN", "")
     if not hf_token:
         raise RuntimeError("HF_TOKEN not set in environment / .env")
@@ -235,12 +251,17 @@ def run_evaluation(
     smoke: bool = False,
     levels: list[int] | None = None,
     limit: int | None = None,
+    only_ids: set | None = None,
 ) -> dict:
     """Run GAIA evaluation on a list of text-only items.
 
     Returns a results dict with per-question details and aggregate stats.
     Writes incremental JSON to result_path after each question.
     """
+    # Filter to a specific set of task_ids (retry mode)
+    if only_ids:
+        items = [it for it in items if it.get("task_id") in only_ids]
+
     # Filter by level if requested
     if levels:
         items = [it for it in items if it.get("Level") in levels]
@@ -432,7 +453,17 @@ def main() -> None:
         "--split", type=str, default="validation",
         help="Dataset split: 'validation' (has gold answers) or 'test'. Default: validation."
     )
+    parser.add_argument(
+        "--ids-file", type=str, default=None,
+        help="Path to a JSON list of task_ids; run ONLY those (retry mode)."
+    )
     args = parser.parse_args()
+
+    # Retry-subset: load task_ids to run
+    only_ids = None
+    if args.ids_file:
+        only_ids = set(json.loads(Path(args.ids_file).read_text(encoding="utf-8")))
+        print(f"Retry mode: restricting to {len(only_ids)} task_ids from {args.ids_file}")
 
     # Resolve output path
     if args.output:
@@ -491,6 +522,7 @@ def main() -> None:
         smoke=args.smoke,
         levels=levels,
         limit=args.limit,
+        only_ids=only_ids,
     )
 
 
