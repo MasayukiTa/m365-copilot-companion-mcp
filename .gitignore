@@ -125,3 +125,6 @@ ui/_buildcheck/
 
 # HumanEval dataset -- not shipped in the repo; fetch it yourself if you want to run that bench
 /bench/_data/
+bench/gaia/gaia_validation.json
+bench/gaia/logs/
+bench/gaia/_*.py
