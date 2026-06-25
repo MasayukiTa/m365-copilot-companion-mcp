@@ -36,7 +36,7 @@ from .copilot_autopilot_relay import (
     CONTINUE_JOB, COPILOT_SELECTORS, ConversationClosed, CopilotWebDriver, FIX_JOB,
     GenerationInProgress, PROTOCOL, REFUTE_FIX_JOB, RETRY_JOB, VERIFY_FIX_JOB,
     _is_processing, default_notify, extract_research, goal_not_seen, has_end_marker,
-    reported_stuck, transient_backoff,
+    reported_stuck, transient_backoff, conversation_exhausted, RECYCLE_PREFIX,
 )
 from .planner import PLAN_PROMPT, extract_plan, plan_ready
 
@@ -551,6 +551,11 @@ class RelayWorker:
         self._consent_streak = 0        # consecutive MCP connection-consent cards (auth needed)
         self._consent_auto_tried = False  # attempted the automatic click-through once
         self._consent_surfaced = False  # surfaced the Edge once (manual fallback)
+        self._recycles = 0              # fresh-conversation recycles after a token-limit exhaustion
+        try:
+            self._max_recycles = int(os.environ.get("MCP_MAX_RECYCLES", "8"))
+        except ValueError:
+            self._max_recycles = 8
         # review panel (operator B, perspective-diverse): a list of lenses runs one
         # independent reviewer each, aggregated by majority. Empty = single reviewer.
         self.review_lenses = list(review_lenses) if review_lenses else []
@@ -1145,6 +1150,42 @@ class RelayWorker:
     def _decide(self, resp):
         self.last_response = resp
         self._tx.assistant(self.turn, resp)    # persist the full Copilot reply for this turn
+
+        # CONVERSATION TOKEN-LIMIT RECYCLE. A hands-off worker pumps ONE chat; a long task
+        # (lots of OCR text / Excel rows) eventually exhausts the model token budget
+        # (OpenAIModelTokenLimit) and then EVERY later turn returns the same error until
+        # MAXTURNS. Detect it, open a FRESH conversation on the same agent surface, and
+        # re-anchor the goal so the agent re-derives progress from disk (the target Excel /
+        # output files) instead of from the lost conversation history.
+        if conversation_exhausted(resp):
+            self._recycles += 1
+            if self._recycles > self._max_recycles:
+                self.status, self.outcome = "stuck", "STUCK"
+                self.reason = (f"conversation token limit; exceeded "
+                               f"max_recycles={self._max_recycles}")
+                return
+            landed = False
+            try:
+                self.page.goto(self._agent_url, wait_until="domcontentloaded", timeout=45000)
+                for _ in range(30):
+                    self.page.wait_for_timeout(1000)
+                    if self.page.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+                        landed = True
+                        break
+            except Exception:
+                landed = False
+            if not landed:
+                # could not get a fresh composer -> fall through to normal transient handling
+                self.status, self.outcome = "stuck", "STUCK"
+                self.reason = "token-limit recycle: fresh conversation did not render"
+                return
+            self.job = PROTOCOL + RECYCLE_PREFIX + self.goal   # re-anchor in the fresh chat
+            self.reason = f"会話トークン上限 → 新会話で続行 ({self._recycles}/{self._max_recycles})"
+            try:
+                default_notify("♻ Fleet 会話リサイクル", self.reason)
+            except Exception:
+                pass
+            return
         # DEAD-AGENT / DEAD-PATH detector. The Copilot agent surfaces a generic failure instead of
         # doing the task -- "予期しないエラー / SystemError" (e.g. the devtunnel to the MCP dropped on
         # a network switch) or "ページをもう一度読み込んで... / 管理者に問い合わせて" (the agent is
