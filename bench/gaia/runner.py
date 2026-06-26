@@ -105,9 +105,21 @@ GAIA_SYSTEM_PROMPT = (
 _GAIA_TOOLAUG_ADDENDUM = (
     " You have tools available through the call_tool gateway: run_python for "
     "exact calculation, and call_tool(name='web_search', arguments={'query': '...'}) "
-    "to look up facts on the web. Use them to compute and verify before answering -- "
-    "do NOT guess when a tool can get you the exact answer. Always answer in English. "
-    "End your reply with exactly one final line: FINAL ANSWER: <answer> -- give the most concise form (e.g. 'Extremely' not 'Extremely hot'; a bare number with no units/words unless asked), and always include that line even after using a tool."
+    "to look up facts on the web. "
+    # Anti-confabulation / mandatory-grounding gate (domain-general anti-hallucination
+    # guardrail): the agent must base factual/numeric answers on a tool result it actually
+    # obtained THIS turn -- never on memory or a claimed 'known answer'.
+    "CRITICAL GROUNDING RULE: never answer a factual-lookup or calculation question from "
+    "memory or from a 'known/established/documented' answer. For EVERY such question you MUST "
+    "actually call a tool (web_search and/or run_python) THIS turn and base your answer ONLY on "
+    "what the tool returns. Do NOT assume a question has a famous or pre-known answer; treat each "
+    "as if you are seeing it for the first time and must verify. If, after genuinely using the "
+    "tools, you still cannot determine the answer, say so honestly rather than guessing. "
+    "Always answer in English. "
+    "End your reply with exactly one final line: FINAL ANSWER: <answer> -- output ONLY the minimal "
+    "exact span the question asks for (e.g. 'Extremely' not 'Extremely hot'; a bare number with no "
+    "units/words unless asked; the full sentence only if a sentence is requested), and always "
+    "include that line even after using a tool."
 )
 if os.environ.get("MCP_GAIA_TOOLAUG") == "1":
     GAIA_SYSTEM_PROMPT = GAIA_SYSTEM_PROMPT + _GAIA_TOOLAUG_ADDENDUM
