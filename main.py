@@ -262,20 +262,27 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
             arguments: dict of the target tool's keyword arguments.
         """
         if not name or name in ("?", "list", "*"):
+            # COMPACT catalog: name -- one-line summary only (no signatures), so an agent
+            # with a small context window can scan every tool without overflowing. Get one
+            # tool's full signature/usage with call_tool(name="<tool>") (no arguments).
             rows = []
             for n in sorted(_ALL_TOOLS):
-                fn = _ALL_TOOLS[n]
-                try:
-                    sig = str(_inspect.signature(fn))
-                except Exception:
-                    sig = "(...)"
-                doc = (getattr(fn, "__doc__", "") or "").strip().splitlines()
-                rows.append("%s%s -- %s" % (n, sig, doc[0] if doc else ""))
-            return "ALL %d tools (call via call_tool(name=..., arguments={...})):\n%s" % (
-                len(rows), "\n".join(rows))
+                doc = (getattr(_ALL_TOOLS[n], "__doc__", "") or "").strip().splitlines()
+                rows.append("%s -- %s" % (n, doc[0] if doc else ""))
+            return ("%d tools available. Pick what THIS task needs, then: "
+                    "call_tool(name='X') shows X's signature; "
+                    "call_tool(name='X', arguments={...}) runs X.\n%s" % (
+                        len(rows), "\n".join(rows)))
         fn = _ALL_TOOLS.get(name)
         if fn is None:
             return "[call_tool: unknown tool '%s'. Use call_tool(name='') to list all.]" % name
+        if arguments is None:
+            # HELP for ONE tool: signature + doc. To actually run a no-arg tool, pass arguments={}.
+            try:
+                sig = str(_inspect.signature(fn))
+            except Exception:
+                sig = "(...)"
+            return "%s%s\n%s" % (name, sig, (getattr(fn, "__doc__", "") or "").strip())
         try:
             return fn(**(arguments or {}))
         except Exception as _e:
@@ -283,10 +290,24 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
 
     # critical tools FIRST (survive a front-biased truncation), then fill from the existing order
     _PRIORITY = (unlock, list_unlocked, call_tool, list_my_tools, env_info)
+    # A SMALL registered set is not just about the 70 cap: each tool's schema costs input
+    # tokens, and a Copilot Studio agent's model has a limited budget -- with all ~70 schemas
+    # loaded, even a short task prompt overflows (OpenAIModelTokenLimit) before any work. So
+    # the registered count is configurable: MCP_TOOL_MAP_MAX (default 70). MCP_TOOL_MAP_INCLUDE
+    # is a comma-separated list of tool names pinned right after the priority set, so a focused
+    # agent can carry exactly the few tools its task needs (e.g. file + OCR + Excel) and reach
+    # everything else via the call_tool gateway.
+    try:
+        _MAX = int(os.environ.get("MCP_TOOL_MAP_MAX", "70"))
+    except ValueError:
+        _MAX = 70
     _pn = {getattr(f, "__name__", "") for f in _PRIORITY}
-    _rest = [t for t in TOOLS if getattr(t, "__name__", "") not in _pn]
-    _MAX = 70  # the client's hard tool-count cap
-    TOOLS = tuple(list(_PRIORITY) + _rest[: _MAX - len(_PRIORITY)])
+    _want = [n.strip() for n in os.environ.get("MCP_TOOL_MAP_INCLUDE", "").split(",") if n.strip()]
+    _pinned = [_ALL_TOOLS[n] for n in _want if n in _ALL_TOOLS and n not in _pn]
+    _pinned_n = _pn | {getattr(f, "__name__", "") for f in _pinned}
+    _rest = [t for t in TOOLS if getattr(t, "__name__", "") not in _pinned_n]
+    _head = list(_PRIORITY) + _pinned
+    TOOLS = tuple(_head + _rest[: max(0, _MAX - len(_head))])
 # ----------------------------------------------------------------------------------------
 
 for tool in TOOLS:

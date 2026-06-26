@@ -152,35 +152,22 @@ COPILOT_SELECTORS = {
     ),
 }
 
+# Kept deliberately SHORT: this agent's model has a small effective input budget
+# (the connected MCP tool schemas consume most of it), so a verbose framing alone
+# overflows it (OpenAIModelTokenLimit) before any work. Every clause here is load-
+# bearing; do not pad it back out.
 PROTOCOL = (
-    "あなたはこのゴールに向けて、ツールを使いながら自律的に作業します。"
-    "重いゴールは一発で終わらせようとせず、自分で小さなステップに分割し、"
-    "1ターンに1〜数ステップずつ着実に進めてください。"
-    "【最初のターン＝足場の確認】いきなり目的の絶対パスへ直行しないでください。"
-    "まず (1) 自分が今使えるツールを把握し（不明なら list_my_tools を呼ぶ）、"
-    "(2) 対象のフォルダやファイルが実際に存在して読めることを list_directory などで確認します"
-    "（パスは必ずスラッシュ「/」区切り。例 D:/folder/file。バックスラッシュは使わない＝"
-    "タブ等に化けてアクセス不能になる）。ツールと対象の存在を確かめてから本番処理に入ること。"
-    "初手のツール呼び出しが失敗したら、まずパスの区切り方（/）と対象の存在を見直してから進みます。"
-    "特にファイル・画像・データを大量に扱う作業では、1ターンで多くをまとめて読み込まず、"
-    "1件ずつ（画像1枚・行1件など）処理し、その結果を都度ディスク（Excel やファイル）に"
-    "保存してから次のターンに進んでください。多数画像のOCR結果やファイル全体など、"
-    "大きな出力を1ターンで一度に取得しようとすると、モデルの入力上限（コンテキスト窓）を"
-    "超えて OpenAIModelTokenLimit で失敗します。各ターンの冒頭で保存済みの状態を確認し、"
-    "未処理の次の1件から続けてください。"
-    "外部の深い調査が必要なときは、その行に `RESEARCH: <調べてほしいこと>` と書いて止まってください。"
-    "こちらが深い調査(Claude)を行い、結果を渡すので、それを使って続行できます。"
-    "ローカルのデータファイルを専用ツールで分析させたいときは、その行に "
-    "`ANALYZE: <ファイルの絶対パス> | <分析指示>` と書いてください"
-    "（ただし単純な集計は自分の run_python/read_excel の方が速く確実です）。"
-    "DONE と書く前に、可能な限り自分でテストやコマンドを実際に実行して結果を確かめてください"
-    "（出力やテストが通ることを確認してから DONE と書く。こちらでも同じ検証を自動で行い、"
-    "通らなければ実際の結果を返すので、その時は修正して再度 DONE と書いてください）。"
-    "各ターンの最後の行に必ず次のいずれかを書いてください: "
-    "まだ続きがある場合は CONTINUE、深い調査を依頼する場合は RESEARCH: と内容、"
-    "データ分析を依頼する場合は ANALYZE: と内容、"
-    "ゴール全体が完了し検証も通ったら DONE、行き詰まって人手が要る場合は STUCK: と理由。"
-    "まず全体を小ステップに分割し、最初のステップを実行してください。\nGoal: "
+    "ツールを使い自律的に進める。重い作業は小さく分割し1ターンに1〜数ステップ。"
+    "ツールは call_tool ゲートウェイ経由: まず call_tool(name='') で一覧(名前+要約)を見て"
+    "このタスクに必要なツールを見極め、call_tool(name='X') で使い方を確認、"
+    "call_tool(name='X', arguments={...}) で実行する。"
+    "初手はこの一覧確認＋対象フォルダ/ファイルの存在確認(call_tool で list_directory)から始め、"
+    "いきなり絶対パス直行しない。パスは必ず「/」区切り(例 C:/dir/file)、バックスラッシュ禁止(\\t等に化ける)。"
+    "ファイル/画像/データの大量処理は1ターンに1件だけ処理し、都度ディスク(Excel等)に保存して次へ"
+    "(まとめて読むと OpenAIModelTokenLimit で失敗)。各ターン冒頭で保存済み状態を見て未処理の続きから。"
+    "深い調査は行頭 `RESEARCH: 内容`、データ分析は `ANALYZE: 絶対パス | 指示`。"
+    "各ターン最終行に必ず: 続行=CONTINUE、完了(検証も通過)=DONE、行き詰まり=STUCK: 理由。"
+    "まず最初のステップを実行。\nGoal: "
 )
 
 CONTINUE_JOB = (
@@ -234,11 +221,8 @@ RETRY_JOB = (
 # turns, so the agent must re-derive progress from the actual artifacts on disk (the target
 # Excel, output files, etc.) rather than from conversation history. Prefixed to the goal.
 RECYCLE_PREFIX = (
-    "【会話リセット】前の会話がトークン上限に達したため、新しい会話に切り替えました。"
-    "この会話には以前のやり取りの記憶はありません。これまでの作業結果は対象ファイル"
-    "（出力先の Excel やファイル）に保存されています。まず現在の保存状態を実際に読み直して"
-    "「どこまで完了しているか」を確認し、未完了の続きから実行してください。\n\n"
-    "--- 元のゴール ---\n"
+    "【会話リセット】前会話がトークン上限のため新会話に切替。以前の記憶は無し。"
+    "結果は出力先ファイル(Excel等)に保存済み。まず保存状態を読み直し未完了の続きから。\n--- 元のゴール ---\n"
 )
 
 # Claude-Code / Anthropic-SDK-style exponential backoff with jitter for transient-failure
