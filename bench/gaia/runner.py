@@ -97,6 +97,20 @@ GAIA_SYSTEM_PROMPT = (
     "a string."
 )
 
+# Tool-augmented variant (MCP_GAIA_TOOLAUG=1): the agent runs on the
+# tool-bearing companion agent (map mode -> minimal core + call_tool gateway),
+# so it can compute and look things up instead of answering from memory. This
+# addendum is DOMAIN-GENERAL (use tools to verify/compute; answer in English to
+# match GAIA's gold language) -- it is NOT tuned to any specific question.
+_GAIA_TOOLAUG_ADDENDUM = (
+    " You have tools available through the call_tool gateway: run_python for "
+    "exact calculation, and call_tool(name='web_search', arguments={'query': '...'}) "
+    "to look up facts on the web. Use them to compute and verify before answering -- "
+    "do NOT guess when a tool can get you the exact answer. Always answer in English."
+)
+if os.environ.get("MCP_GAIA_TOOLAUG") == "1":
+    GAIA_SYSTEM_PROMPT = GAIA_SYSTEM_PROMPT + _GAIA_TOOLAUG_ADDENDUM
+
 # ---------------------------------------------------------------------------
 # Companion HTTP helpers (same pattern as m365eval/runner.py)
 # ---------------------------------------------------------------------------
