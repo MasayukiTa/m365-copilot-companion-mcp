@@ -15,7 +15,8 @@ REM  quickstart.bat; this is the lightweight daily launcher.
 REM ===========================================================================
 setlocal EnableExtensions
 cd /d "%~dp0"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0start_all.ps1"
-echo.
-echo (You can close this window. The stack keeps running in the background.)
-pause
+REM Launch the whole stack fully HIDDEN + DETACHED via the windowless VBS, then
+REM exit immediately. No console lingers (the old `pause` window was the "blank
+REM terminal" that, if closed mid-startup, left the stack half-up). start_all.ps1
+REM is idempotent, so this is safe to run any time.
+wscript.exe "%~dp0start_all_hidden.vbs"
