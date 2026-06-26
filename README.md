@@ -24,7 +24,7 @@
   was an unrecovered infra timeout (66/127 = 52.0% if counted as a miss). Details under "GAIA" below.
 
 > Microsoft 365 Copilot に **手** を生やすやつ。
-> あなたの貸与ノート PC の上で動く。**100+ ツール**（執筆時点で 117）、
+> あなたの貸与ノート PC の上で動く。**100+ ツール**（執筆時点で 138）、
 > 追加課金ゼロ、構築おおむね 1 人日。
 
 🇯🇵 **このページは日本語版です。English version follows below ↓**
@@ -59,8 +59,9 @@
                                                   ファイル · Python · DB · Office 生成
 ```
 
-> **ツール数について正直に**: `main.py` には 117 個のツールが登録されています。ただし
-> **クローン直後に全部が動くわけではありません**。Outlook 本体・PowerPoint・Tesseract・
+> **ツール数について正直に**: `main.py` には 138 個のツールが収録されています（既定の
+> map mode では最小コア＋`call_tool` ゲートウェイのみ MCP に登録し、残りはゲートウェイ
+> 経由で呼べます）。ただし **クローン直後に全部が動くわけではありません**。Outlook 本体・PowerPoint・Tesseract・
 > ODBC ドライバ・Windows 環境などを前提とするものが含まれます。**いま自分の環境で実際に
 > 有効なツールは `list_my_tools` を叩けば分かります**。前提条件は下のカタログにタグで明記しています。
 
@@ -136,7 +137,7 @@ HumanEval / SWE-bench は「コーディング力」。こちらは **GAIA**（M
 
 「ファイル読むくらいしかしてくれない Copilot」を、**追加課金ゼロ・ライセンス内・ノート PC 1 台** でここまで盛りました。順に自慢します。
 
-- **🧰 137 本の手足** — ファイル / Python / シェル / Excel / Word / PowerPoint / PDF / OCR / SQLite / 社内 DB(ODBC) / Outlook / スクショ / スケジューラ…。Copilot に「手」が無いなら生やせばいい、を地で行く。**しかも自分で新しいツールを書いて常設化できる**（tool foundry）。117 は床。
+- **🧰 138 本の手足** — ファイル / Python / シェル / Excel / Word / PowerPoint / PDF / OCR / SQLite / 社内 DB(ODBC) / Outlook / スクショ / スケジューラ…。Copilot に「手」が無いなら生やせばいい、を地で行く。**しかも自分で新しいツールを書いて常設化できる**（tool foundry）。138 が床。
 - **🤖 無人で回る中継器(relay)** — ゴールを 1 個渡すと、**あなたのキーボードを奪わずに** 裏で Copilot を完了まで自走させる（CDP 駆動）。停滞でも完了でも **デスクトップ通知**。Microsoft の自律エージェント（課金）を、ブラウザを行儀よく乗っ取って自前化した代物。
 - **🔬 リサーチは Claude に投げる** — M365 の「リサーチ ツール」を **Anthropic / Claude にモデル切替** して deep research させ、結果を実装ループに合流（`RESEARCH:` と書くだけ）。**データ分析はアナリストに委譲** し、数値は自前ツールで地上検証（信じない、確かめる）。
 - **🚀 小隊で並列** — 複数会話を 1 スレッドのラウンドロビンで並走（fleet）＋**絞られの兆候を検知して自動で速度を落とす適応スロットル**。干されない範囲で最大スループット。
@@ -272,7 +273,7 @@ HumanEval / SWE-bench は「コーディング力」。こちらは **GAIA**（M
 2. `write_file` で `tools/your_ops.py` を生成する
 3. `run_python` でロジックを動作確認する
 
-——ここまでをチャットの中で完結できる。あとは `main.py` の `TOOLS` に 1 行足して再起動すれば、**自分で書いたツールが次回から常設ツールになる**。「◯◯の API を叩くツールが欲しい」と頼めば、エージェントが雛形を書いて検証し、登録手順まで提示します。つまりこのサーバーは **使いながら自分で育つ**。117 は出発点にすぎません。
+——ここまでをチャットの中で完結できる。あとは `main.py` の `TOOLS` に 1 行足して再起動すれば、**自分で書いたツールが次回から常設ツールになる**。「◯◯の API を叩くツールが欲しい」と頼めば、エージェントが雛形を書いて検証し、登録手順まで提示します。つまりこのサーバーは **使いながら自分で育つ**。138 は出発点にすぎません。
 
 ---
 
@@ -1034,7 +1035,7 @@ PR や Issue 歓迎。お願い:
 
 A personal-use **Model Context Protocol (MCP) server** that turns one
 laptop into a fully-capable agent backend for **Microsoft 365 Copilot**,
-**Claude Desktop**, or any other MCP-aware client. **100+ tools** (117 at
+**Claude Desktop**, or any other MCP-aware client. **100+ tools** (138 at
 the time of writing). Zero external API keys. Built in roughly a day.
 
 > **If this README is long or you're not sure what runs on your machine**:
@@ -1060,7 +1061,9 @@ One user, one companion, one laptop. Nothing is centralised. Nothing
 leaves the box you wouldn't want it to. Costs **zero** beyond the M365
 Copilot licence you already have.
 
-> **Honest note on the tool count**: `main.py` registers 117 tools, but
+> **Honest note on the tool count**: `main.py` defines 138 tools (in the default
+> map mode only a minimal core + the `call_tool` gateway are registered with the
+> MCP client; the rest are reachable through the gateway), but
 > **not all of them run on a fresh clone**. Some require Outlook,
 > PowerPoint, Tesseract, an ODBC driver, or Windows. **Run `list_my_tools`
 > to see what's actually live in your environment.** Requirements are
@@ -1140,11 +1143,11 @@ The "Copilot that only reads files" gets dragged this far on **zero extra
 spend, inside the licence you already have, on one laptop.** Bragging, in
 order:
 
-- **🧰 137 hands and feet** — files / Python / shell / Excel / Word /
+- **🧰 138 hands and feet** — files / Python / shell / Excel / Word /
   PowerPoint / PDF / OCR / SQLite / corporate DB (ODBC) / Outlook /
   screenshots / scheduler… If Copilot has no hands, grow it some. **And you
   can write your own new tools and make them permanent** (the tool foundry).
-  117 is the floor.
+  138 is the floor.
 - **🤖 A relay that runs unattended** — hand it one goal and it drives your
   Copilot agent to completion in the background (over CDP) **without
   stealing your keyboard**. Desktop notification whether it finishes or
@@ -1340,7 +1343,7 @@ The powerful part: **the agent can author new tools on the fly.**
 `run_python` to test it — all inside the chat. Add one line to `TOOLS`,
 restart, and the tool it just wrote becomes permanent. Ask "I want a tool
 that calls X's API" and it'll scaffold, test, and hand you the
-registration step. The server **grows as you use it.** 117 is the floor.
+registration step. The server **grows as you use it.** 138 is the floor.
 
 ---
 
