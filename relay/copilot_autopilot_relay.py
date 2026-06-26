@@ -980,12 +980,31 @@ class CopilotWebDriver:
         leading line that merely repeats <NAME>. Generic over any agent name and multi-line replies;
         Playwright already returns proper UTF-8."""
         loc = self._answers()
-        if loc.count() == 0:
-            loc = self.page.locator(COPILOT_SELECTORS["assistant_msg_fallback"])
-        if loc.count() == 0:
-            return ""
+        # Prefer the FIRST block produced AFTER this send (index == _count_before)
+        # over .last: on a freshly-recycled conversation a leftover greeting/
+        # placeholder bubble can be the trailing block, and reading .last would
+        # return it instead of this turn's real answer. Only do this when a genuinely
+        # new block exists (count grew past _count_before); otherwise fall back to
+        # .last exactly as before so the non-recycle path is unchanged.
+        target = None
         try:
-            txt = loc.last.inner_text() or ""
+            cnt = loc.count()
+        except Exception:
+            cnt = 0
+        if cnt == 0:
+            loc = self.page.locator(COPILOT_SELECTORS["assistant_msg_fallback"])
+            try:
+                cnt = loc.count()
+            except Exception:
+                cnt = 0
+        if cnt == 0:
+            return ""
+        if 0 <= self._count_before < cnt:
+            target = loc.nth(self._count_before)
+        else:
+            target = loc.last
+        try:
+            txt = target.inner_text() or ""
         except Exception:
             return self.read_last_response()
         name = ""

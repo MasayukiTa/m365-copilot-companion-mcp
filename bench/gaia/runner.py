@@ -106,7 +106,8 @@ _GAIA_TOOLAUG_ADDENDUM = (
     " You have tools available through the call_tool gateway: run_python for "
     "exact calculation, and call_tool(name='web_search', arguments={'query': '...'}) "
     "to look up facts on the web. Use them to compute and verify before answering -- "
-    "do NOT guess when a tool can get you the exact answer. Always answer in English."
+    "do NOT guess when a tool can get you the exact answer. Always answer in English. "
+    "End your reply with exactly one final line: FINAL ANSWER: <answer> -- give the most concise form (e.g. 'Extremely' not 'Extremely hot'; a bare number with no units/words unless asked), and always include that line even after using a tool."
 )
 if os.environ.get("MCP_GAIA_TOOLAUG") == "1":
     GAIA_SYSTEM_PROMPT = GAIA_SYSTEM_PROMPT + _GAIA_TOOLAUG_ADDENDUM

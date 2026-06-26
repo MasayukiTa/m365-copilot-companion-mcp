@@ -176,11 +176,49 @@ class RelayUnavailable(RuntimeError):
 # Recycle the conversation after this many successful jobs. Long-lived Copilot
 # conversations degrade -- after dozens of turns the composer eventually refuses
 # to submit ("Send button never submitted the message"), which, in a single
-# reused chat, poisons EVERY subsequent send (observed in the GAIA full run: one
-# stuck L3 generation wedged the composer and cascaded 62 errors). Recycling to a
-# fresh conversation bounds that risk. Override via RELAY_RESET_EVERY; 0 disables
+# reused chat, poisons EVERY subsequent send (one stuck generation wedges the
+# composer and cascades errors into every later send). Recycling to a fresh
+# conversation bounds that risk. Override via RELAY_RESET_EVERY; 0 disables
 # proactive recycling (error-driven reset still applies).
+#
+# Keep this floor reasonably HIGH. Each recycle is a tab/navigation lifecycle op
+# against a single memory-pressured Edge; recycling very often (e.g. every few
+# jobs) multiplies that churn and was observed to (a) race a not-yet-interactive
+# fresh conversation into emitting an instant canned refusal and (b) eventually
+# tear down the whole BrowserContext. 25 bounds composer-wedge risk with far less
+# churn; lower it only deliberately via the env var.
 RESET_EVERY = int(os.environ.get("RELAY_RESET_EVERY", "25"))
+
+# Canned NON-ANSWER replies Copilot emits when it cannot/​will-not act on a turn
+# (most commonly when a prompt lands in a fresh conversation whose agent surface
+# is not yet interactive). These are NOT real answers: returning one corrupts any
+# downstream consumer. We detect them (substring match, locale-tolerant) so the
+# worker can recycle + retry the SAME prompt ONCE into a warmed conversation
+# before giving up. Domain-general -- nothing benchmark-specific here.
+CANNED_NONANSWER = (
+    "申し訳ございません。それに応答できませんでした",
+    "それに応答できませんでした",
+    "申し訳ございませんが、それに応答できません",
+    "I'm sorry, I couldn't respond to that",
+    "I'm sorry, but I can't respond to that",
+)
+
+
+def _is_nonanswer(reply: Optional[str]) -> bool:
+    """True if `reply` is empty/whitespace or matches a known canned non-answer.
+
+    Used to decide whether a read should be treated as a FAILED read (recycle +
+    one retry) rather than returned as the model's answer. Generic over any
+    consumer of the relay; never raises."""
+    if reply is None:
+        return True
+    t = reply.strip()
+    if not t:
+        return True
+    for marker in CANNED_NONANSWER:
+        if marker in t:
+            return True
+    return False
 
 
 class _RelayWorker:
@@ -192,6 +230,10 @@ class _RelayWorker:
         self._ready = threading.Event()
         self._start_error: Optional[BaseException] = None
         self._started = False
+        # Playwright teardown guard for the CURRENT browser connection. Held as an
+        # attribute (not a local) so a mid-run context rebuild can tear the old
+        # connection down before reconnecting. Owned solely by the worker thread.
+        self._playwright_cm = None
 
     # ---- public API (called from a threadpool thread, NOT the event loop) ----
     def ensure_started(self) -> None:
@@ -226,9 +268,8 @@ class _RelayWorker:
     # ---- private: runs entirely on the worker thread -------------------------
     def _run(self) -> None:
         driver = None
-        playwright_cm = None
         try:
-            driver, playwright_cm = self._build_driver()
+            driver, self._playwright_cm = self._build_driver()
             self._ready.set()
         except BaseException as e:  # noqa: BLE001 - surface any bringup failure
             self._start_error = e
@@ -249,7 +290,7 @@ class _RelayWorker:
                     needs_reset or (RESET_EVERY and jobs_since_reset >= RESET_EVERY)
                 ):
                     try:
-                        driver = self._reset_conversation(driver)
+                        driver = self._reset_resilient(driver)
                         print(f"[relay] conversation recycled "
                               f"(since_reset={jobs_since_reset}, forced={needs_reset})",
                               flush=True)
@@ -275,13 +316,31 @@ class _RelayWorker:
                         reader = getattr(driver, "read_last_reply_clean",
                                          driver.read_last_response)
                         reply = reader()
+                        # NON-ANSWER GUARD: an empty read or a canned refusal is NOT a
+                        # real answer. This is the classic fresh-conversation race --
+                        # the prompt landed before the agent surface was interactive and
+                        # Copilot emitted the instant "couldn't respond" canned reply. On
+                        # the FIRST attempt, recycle into a (now warmed) conversation and
+                        # re-send the SAME prompt once. Capped at one retry so a genuinely
+                        # refused prompt still returns its reply rather than looping.
+                        if attempt == 1 and _is_nonanswer(reply):
+                            try:
+                                driver = self._reset_resilient(driver)
+                                jobs_since_reset = 0
+                                print("[relay] non-answer read -> recycled, retry once",
+                                      flush=True)
+                                continue
+                            except Exception as e2:  # noqa: BLE001
+                                # Could not recycle; fall through and return what we have.
+                                print(f"[relay] non-answer recycle failed: "
+                                      f"{type(e2).__name__}: {e2}", flush=True)
                         err = None
                         break
                     except Exception as e:  # noqa: BLE001
                         err = f"{type(e).__name__}: {e}"
                         if attempt == 1:
                             try:
-                                driver = self._reset_conversation(driver)
+                                driver = self._reset_resilient(driver)
                                 jobs_since_reset = 0
                                 print(f"[relay] send error -> recycled, retry once: {err}",
                                       flush=True)
@@ -297,26 +356,92 @@ class _RelayWorker:
                 else:
                     reply_box.put(("error", err))
         finally:
-            if playwright_cm is not None:
+            if self._playwright_cm is not None:
                 try:
-                    playwright_cm.__exit__(None, None, None)
+                    self._playwright_cm.__exit__(None, None, None)
                 except Exception:
                     pass
 
+    @staticmethod
+    def _is_target_closed(exc: BaseException) -> bool:
+        """True if `exc` looks like a dead-target/closed-context Playwright error.
+
+        We match on the class/message text (rather than importing Playwright's
+        error type) so this stays dependency-light and tolerant of wrapped errors:
+        a closed BrowserContext surfaces as 'TargetClosedError' / 'has been closed'."""
+        s = f"{type(exc).__name__}: {exc}"
+        return ("TargetClosedError" in s
+                or "has been closed" in s
+                or "Target page, context or browser has been closed" in s)
+
+    def _reset_resilient(self, driver):
+        """Recycle the conversation, REBUILDING the browser/context if it has died.
+
+        Normal path: `_reset_conversation` opens a fresh conversation in the same
+        context (cheap). But if the whole BrowserContext has been torn down (the
+        recycle/memory-pressure failure mode), `new_page()` raises a closed-target
+        error and a plain conversation reset can never recover -- every later job
+        would 502. In that case we tear down the old Playwright runtime and
+        re-`connect_over_cdp` via `_build_driver`, with bounded retries + backoff
+        so a genuinely dead Edge still surfaces an error instead of spinning."""
+        try:
+            return self._reset_conversation(driver)
+        except Exception as e:  # noqa: BLE001
+            if not self._is_target_closed(e):
+                raise
+            print(f"[relay] context dead during reset ({type(e).__name__}); "
+                  f"rebuilding browser connection", flush=True)
+
+        last_err: Optional[BaseException] = None
+        for attempt in range(1, 4):  # bounded: 3 rebuild attempts
+            # Tear down the old Playwright runtime before reconnecting so we do not
+            # leak a dangling CDP session.
+            if self._playwright_cm is not None:
+                try:
+                    self._playwright_cm.__exit__(None, None, None)
+                except Exception:
+                    pass
+                self._playwright_cm = None
+            try:
+                new_driver, self._playwright_cm = self._build_driver()
+                print(f"[relay] browser connection rebuilt (attempt {attempt})",
+                      flush=True)
+                return new_driver
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                print(f"[relay] rebuild attempt {attempt} failed: "
+                      f"{type(e).__name__}: {e}", flush=True)
+                time.sleep(2.0 * attempt)  # small linear backoff
+        raise RelayUnavailable(
+            f"browser context died and could not be rebuilt: {last_err}")
+
     def _reset_conversation(self, driver):
-        """Open a FRESH agent conversation page and bind a new driver, closing the
-        old (possibly wedged) page.
+        """Recycle to a FRESH agent conversation and bind a new driver.
 
         This is the core composer-wedge mitigation: rather than reusing one chat
         for the whole run (where a single stuck generation poisons every later
-        send), we recycle to a brand-new conversation. `_find_agent_page` opens
-        MCP_IMPL_AGENT_URL in a new tab and waits for the composer; navigating to a
-        bare /chat/ URL starts a new conversation.
+        send), we recycle to a brand-new conversation.
+
+        PREFERRED path (when MCP_IMPL_AGENT_URL is set): navigate the EXISTING page
+        to the agent URL. Re-loading the agent URL starts a fresh conversation
+        without creating/destroying a tab each cycle -- that per-recycle tab churn
+        was a source of BrowserContext instability under memory pressure. We then
+        wait (via `_await_interactive`) for the conversation to be ready.
+
+        FALLBACK path (no URL configured): defer to `_find_agent_page`, which reuses
+        an already-open agent tab; close the old page if a different one was chosen.
         """
         from relay.copilot_autopilot_relay import CopilotWebDriver
 
         ctx = driver.page.context
         old = driver.page
+        url = os.environ.get("MCP_IMPL_AGENT_URL", "").strip()
+        if url:
+            # Reuse the SAME tab: navigate it to the agent URL -> fresh conversation.
+            old.goto(url, wait_until="domcontentloaded")
+            self._await_interactive(old)
+            return CopilotWebDriver(old)
+
         newpage = self._find_agent_page(ctx)
         if old is not newpage:
             try:
@@ -324,6 +449,53 @@ class _RelayWorker:
             except Exception:
                 pass
         return CopilotWebDriver(newpage)
+
+    @staticmethod
+    def _await_interactive(pg) -> None:
+        """Block until the agent conversation on `pg` is plausibly INTERACTIVE.
+
+        A freshly navigated /chat/agent page renders the contenteditable composer
+        WELL BEFORE its agent/tool surface is wired up. Sending into that window
+        makes Copilot emit an instant canned non-answer. So composer-exists is not
+        enough: we (1) wait for the composer to exist, (2) add a short fixed settle,
+        and (3) confirm no 'generating/Stop' control is currently showing (a fresh,
+        idle conversation shows none). Best-effort and fully bounded -- on any error
+        or timeout we simply return; send() will still surface a clear error if the
+        page is genuinely dead."""
+        from relay.copilot_autopilot_relay import COPILOT_SELECTORS
+
+        # (1) composer must exist
+        for _ in range(40):
+            try:
+                if pg.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+                    break
+            except Exception:
+                return
+            pg.wait_for_timeout(1000)
+        # (2) short fixed settle so the agent surface can finish wiring up
+        try:
+            pg.wait_for_timeout(2500)
+        except Exception:
+            return
+        # (3) confirm the conversation is idle (no Stop/generating control showing).
+        # Bounded: wait up to ~10s for any leftover generating indicator to clear.
+        stop_sel = COPILOT_SELECTORS.get("stop_button", "")
+        for _ in range(20):
+            try:
+                generating = False
+                for cand in stop_sel.split(", "):
+                    cand = cand.strip()
+                    if not cand:
+                        continue
+                    loc = pg.locator(cand)
+                    if loc.count() > 0 and loc.first.is_visible():
+                        generating = True
+                        break
+                if not generating:
+                    return
+            except Exception:
+                return
+            pg.wait_for_timeout(500)
 
     def _build_driver(self):
         """Connect to the dedicated Edge over CDP and bind a CopilotWebDriver.
@@ -384,11 +556,15 @@ class _RelayWorker:
             for _ in range(40):
                 pg.wait_for_timeout(1000)
                 if pg.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+                    # Composer exists, but the agent surface may not be interactive
+                    # yet -- wait for that before handing the page to send().
+                    _RelayWorker._await_interactive(pg)
                     return pg
             return pg  # return anyway; send() will surface a clear error if dead
         for pg in ctx.pages:
             if "/chat/agent/" in (pg.url or "") and \
                     pg.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+                _RelayWorker._await_interactive(pg)
                 return pg
         raise RelayUnavailable(
             "no Copilot agent page found: set MCP_IMPL_AGENT_URL in .env or open "
