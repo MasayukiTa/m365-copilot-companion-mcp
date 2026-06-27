@@ -64,6 +64,8 @@ class ChatWindow : Window
     Border _banner; StackPanel _bannerBody;
     Button _newBtn, _themeBtn, _langBtn, _manageBtn, _cockpitBtn, _attachBtn;
     TextBlock _inputHint;                 // goal-box watermark; localized -> must update on lang toggle
+    TextBlock _fleetChipLabel;            // "Fleet: N" chip in the main header; updated on timer tick
+    Border _fleetChip;                    // the chip border (collapsed when count == 0)
     static readonly string SettingsFile = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "copilot-bridge", "settings.txt");
 
@@ -194,12 +196,40 @@ class ChatWindow : Window
         main.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
         main.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
-        var headPanel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(22, 13, 22, 13) };
-        _statusDot = new Border { Width = 9, Height = 9, CornerRadius = new CornerRadius(5), Margin = new Thickness(0, 4, 9, 0) };
+        // Header: DockPanel so the right side can hold the Fleet chip + settings button.
+        var headPanel = new DockPanel { Margin = new Thickness(22, 0, 16, 0), MinHeight = 48 };
+        // Left: status dot + "Copilot" title
+        var headLeft = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+        _statusDot = new Border { Width = 9, Height = 9, CornerRadius = new CornerRadius(5), Margin = new Thickness(0, 1, 9, 0), VerticalAlignment = VerticalAlignment.Center };
         SetRef(_statusDot, BackgroundProperty, "Border");
-        var headText = new TextBlock { Text = "Copilot", FontWeight = FontWeights.SemiBold, FontSize = 14.5 };
+        var headText = new TextBlock { Text = "Copilot", FontWeight = FontWeights.SemiBold, FontSize = 14.5, VerticalAlignment = VerticalAlignment.Center };
         SetRef(headText, TextBlock.ForegroundProperty, "Fg");
-        headPanel.Children.Add(_statusDot); headPanel.Children.Add(headText);
+        headLeft.Children.Add(_statusDot); headLeft.Children.Add(headText);
+        DockPanel.SetDock(headLeft, Dock.Left);
+        headPanel.Children.Add(headLeft);
+        // Right: settings icon + Fleet chip (built right-to-left in DockPanel terms)
+        var headRight = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Right };
+        DockPanel.SetDock(headRight, Dock.Right);
+        // Settings button (opens cockpit)
+        var settingsBtn = Btn("⚙", "PanelAlt", "Muted", true);
+        settingsBtn.Padding = new Thickness(10, 3, 10, 3); settingsBtn.FontSize = 13;
+        settingsBtn.ToolTip = _lang == 0 ? "設定・コックピットを開く" : "Open settings / cockpit";
+        settingsBtn.Click += delegate { OpenCockpit(); };
+        headRight.Children.Add(settingsBtn);
+        // Fleet active chip ("Fleet: N") -- collapsed when no active workers or status.json absent
+        _fleetChipLabel = new TextBlock { FontSize = 12, VerticalAlignment = VerticalAlignment.Center };
+        SetRef(_fleetChipLabel, TextBlock.ForegroundProperty, "Muted");
+        _fleetChip = new Border
+        {
+            Child = _fleetChipLabel, BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(6), Padding = new Thickness(10, 3, 10, 3),
+            Margin = new Thickness(0, 0, 8, 0), Cursor = Cursors.Hand,
+            Visibility = Visibility.Collapsed
+        };
+        SetRef(_fleetChip, BackgroundProperty, "PanelAlt"); SetRef(_fleetChip, Border.BorderBrushProperty, "Border");
+        _fleetChip.MouseLeftButtonUp += delegate { OpenCockpit(); };
+        headRight.Children.Add(_fleetChip);
+        headPanel.Children.Add(headRight);
         var headBorder = new Border { Child = headPanel, BorderThickness = new Thickness(0, 0, 0, 1) };
         SetRef(headBorder, Border.BorderBrushProperty, "Border");
         Grid.SetRow(headBorder, 0); main.Children.Add(headBorder);
@@ -253,13 +283,13 @@ class ChatWindow : Window
             { e.Handled = true; try { if (_activeReq != null) _activeReq.Abort(); } catch { } return; }
             if (e.Key == Key.Enter && (Keyboard.Modifiers & ModifierKeys.Shift) == 0) { e.Handled = true; DoSend(); }
         };
-        _input.TextChanged += delegate { UpdateCmdPopup(); };
+        _input.TextChanged += delegate { UpdateCmdPopup(); PaintSend(); };
         Grid.SetColumn(_input, 0); bar.Children.Add(_input);
         // Placeholder hint advertising slash commands (WPF TextBox has no native placeholder). The
         // single most Claude-Code-defining feature was invisible until you happened to type "/".
         _inputHint = new TextBlock
         {
-            Text = _lang == 0 ? "メッセージを入力 …   「/」でコマンド" : "Type a message …   \"/\" for commands",
+            Text = _lang == 0 ? "メッセージを入力…" : "Type a message…",
             IsHitTestVisible = false, FontSize = 13.5, Margin = new Thickness(15, 0, 0, 0),
             VerticalAlignment = VerticalAlignment.Center
         };
@@ -275,6 +305,7 @@ class ChatWindow : Window
             else DoSend();
         };
         Grid.SetColumn(_send, 1); bar.Children.Add(_send);
+        PaintSend();   // initial state: input empty -> neutral
         var barStack = new StackPanel { MaxWidth = 760, HorizontalAlignment = HorizontalAlignment.Center };
         barStack.Children.Add(BuildRouterBar());
         barStack.Children.Add(BuildAttachRow());
@@ -322,7 +353,7 @@ class ChatWindow : Window
         catch { _settingsMtime = 0; }
         var openTimer = new DispatcherTimer();
         openTimer.Interval = TimeSpan.FromMilliseconds(800);
-        openTimer.Tick += delegate { CheckOpenRequest(); SyncRegistry(); CheckFleetSnapshot(); CheckSettings(); };
+        openTimer.Tick += delegate { CheckOpenRequest(); SyncRegistry(); CheckFleetSnapshot(); CheckSettings(); RefreshFleetChip(); };
         openTimer.Start();
         SyncRegistry();
     }
@@ -882,6 +913,57 @@ class ChatWindow : Window
         catch { }
     }
 
+    // Read status.json and count ACTIVE fleet workers (status not terminal / not "pending").
+    // Terminal statuses: "done", "resolved", "failed", "error", "cancelled", "stopped".
+    // "pending" means queued but not yet started. Anything else (e.g. "running", "verifying",
+    // "planning") is considered actively working. Returns 0 when status.json is absent.
+    int ReadActiveFleetWorkerCount()
+    {
+        try
+        {
+            string sp = Path.Combine(Path.GetDirectoryName(_convsPath), "status.json");
+            if (!File.Exists(sp)) return 0;
+            string txt;
+            using (var fsr = new FileStream(sp, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var sr = new StreamReader(fsr, Encoding.UTF8)) txt = sr.ReadToEnd();
+            var d = _cjs.DeserializeObject(txt) as Dictionary<string, object>;
+            if (d == null || !d.ContainsKey("workers") || !(d["workers"] is object[])) return 0;
+            int count = 0;
+            foreach (object o in (object[])d["workers"])
+            {
+                var w = o as Dictionary<string, object>;
+                if (w == null) continue;
+                string st = SS(w, "status").ToLowerInvariant();
+                if (st == "pending" || st == "done" || st == "resolved" || st == "failed"
+                    || st == "error" || st == "cancelled" || st == "stopped") continue;
+                count++;
+            }
+            return count;
+        }
+        catch { return 0; }
+    }
+
+    // Update the Fleet chip in the main header. Called on the 800ms poll timer.
+    // Shows "Fleet: N" (collapsed when N == 0). Clicking opens the cockpit.
+    void RefreshFleetChip()
+    {
+        if (_fleetChip == null || _fleetChipLabel == null) return;
+        try
+        {
+            int n = ReadActiveFleetWorkerCount();
+            if (n > 0)
+            {
+                _fleetChipLabel.Text = "Fleet: " + n;
+                _fleetChip.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                _fleetChip.Visibility = Visibility.Collapsed;
+            }
+        }
+        catch { }
+    }
+
     // ── small helpers ───────────────────────────────────────────────────────────
     Button Btn(string content, string bg, string fg, bool bordered)
     {
@@ -891,6 +973,25 @@ class ChatWindow : Window
         return b;
     }
     void SetRef(FrameworkElement el, DependencyProperty p, string key) { el.SetResourceReference(p, key); }
+
+    // Accent fill only when there is text to send OR while generating (Stop affordance).
+    // Otherwise the button shows a neutral/disabled-looking state so the empty-input state
+    // is visually distinct from the "ready to send" state.
+    void PaintSend()
+    {
+        if (_send == null) return;
+        bool active = _generating || (_input != null && _input.Text.Length > 0);
+        if (active)
+        {
+            SetRef(_send, BackgroundProperty, "Accent");
+            SetRef(_send, ForegroundProperty, "AccentFg");
+        }
+        else
+        {
+            SetRef(_send, BackgroundProperty, "PanelAlt");
+            SetRef(_send, ForegroundProperty, "Muted");
+        }
+    }
 
     // ── slash-command autocomplete (type "/" to see commands, like Claude Code) ──
     Popup _cmdPopup; ListBox _cmdList;
@@ -1221,13 +1322,13 @@ class ChatWindow : Window
         var menu = new ContextMenu(); menu.Items.Add(miR); b.ContextMenu = menu;
         Grid.SetColumn(b, 0); rowGrid.Children.Add(b);
 
-        // trash icon (Segoe MDL2 Assets) -- persistently visible when actionable.
-        // Delete is intentionally always-visible (not hover-only) for discoverability (friction #17).
+        // trash icon (Segoe MDL2 Assets) -- hidden by default, revealed on row hover.
+        // Opacity=0/IsHitTestVisible=false by default; row MouseEnter/Leave toggles it.
         var trash = new Button
         {
             Content = "", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 13,
             Width = 32, Height = 46, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
-            Cursor = Cursors.Hand, ToolTip = T("delete")
+            Cursor = Cursors.Hand, ToolTip = T("delete"), Opacity = 0, IsHitTestVisible = false
         };
         SetRef(trash, ForegroundProperty, "Muted");
         trash.Click += delegate { ShowDeleteBanner(cc); };
@@ -1240,6 +1341,10 @@ class ChatWindow : Window
         trRename.Click += delegate { _renamingId = cc.Id; RefreshConvList(); };
         trMenu.Items.Add(trRename); trash.ContextMenu = trMenu;
         Grid.SetColumn(trash, 1); rowGrid.Children.Add(trash);
+        // Reveal the trash icon on row hover; hide again when the pointer leaves.
+        var trashRef = trash;
+        rowBorder.MouseEnter += delegate { if (trashRef.Visibility == Visibility.Visible) { trashRef.Opacity = 1; trashRef.IsHitTestVisible = true; } };
+        rowBorder.MouseLeave += delegate { trashRef.Opacity = 0; trashRef.IsHitTestVisible = false; };
         rowBorder.Child = rowGrid;
         _convList.Children.Add(rowBorder);
     }
@@ -1694,7 +1799,7 @@ class ChatWindow : Window
         if (_cockpitBtn != null) _cockpitBtn.Content = T("open_cockpit");
         if (_attachBtn != null) { _attachBtn.Content = T("attach_btn"); _attachBtn.ToolTip = T("attach"); }
         if (_inputHint != null)
-            _inputHint.Text = _lang == 0 ? "メッセージを入力 …   「/」でコマンド" : "Type a message …   \"/\" for commands";
+            _inputHint.Text = _lang == 0 ? "メッセージを入力…" : "Type a message…";
     }
     void HideBanner() { _banner.Visibility = Visibility.Collapsed; }
 
@@ -1964,6 +2069,7 @@ class ChatWindow : Window
         _pendingContent.Children.Add(MakeTyping());   // <- ShuttleScope waiting indicator, shown immediately
         _pendingText = null; _started = false;
         _generating = true; _send.Content = "■ " + T("stop"); _send.IsEnabled = true;   // distinct from Send; _send now acts as Stop (also Esc)
+        PaintSend();   // stay accent while generating
         SetRef(_statusDot, BackgroundProperty, "Accent");
         new Thread((ThreadStart)delegate { Stream(text); }) { IsBackground = true }.Start();
         ClearChips();   // the attached file(s) go with this message; reset the chip row
@@ -2185,6 +2291,7 @@ class ChatWindow : Window
         Dispatcher.BeginInvoke(new Action(delegate
         {
             _generating = false; _send.Content = T("send"); _send.IsEnabled = true; _input.Focus();
+            PaintSend();   // revert to neutral (input was cleared before send)
             SetRef(_statusDot, BackgroundProperty, "Border");
             // render whatever we got (full / partial / error); always clear the typing indicator
             content.Children.Clear();
