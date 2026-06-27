@@ -16,7 +16,9 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from relay.code_task import build_goal
-from relay.project_introspect import detect_checks
+from relay.project_introspect import detect_checks, _pytest_available
+
+_HAVE_PYTEST = _pytest_available()
 
 results = []
 
@@ -31,22 +33,34 @@ def types(res):
 
 
 def main():
-    # 1. pytest.ini -> pytest check
+    # 1. pytest.ini -> pytest check (if pytest installed) or shell/compileall fallback
     d = tempfile.mkdtemp(prefix="pi_pytest_")
     open(os.path.join(d, "pytest.ini"), "w").write("[pytest]\n")
     open(os.path.join(d, "mod.py"), "w").write("x=1\n")
-    check("pytest_ini", "pytest" in types(detect_checks(d)))
+    res1 = detect_checks(d)
+    if _HAVE_PYTEST:
+        check("pytest_ini", "pytest" in types(res1))
+    else:
+        check("pytest_ini", "shell" in types(res1))
 
-    # 2. a test_*.py file -> pytest check
+    # 2. a test_*.py file -> pytest check (if pytest installed) or shell fallback
     d = tempfile.mkdtemp(prefix="pi_testfile_")
     open(os.path.join(d, "test_thing.py"), "w").write("def test_x():\n    assert 1\n")
-    check("test_file", "pytest" in types(detect_checks(d)))
+    res2 = detect_checks(d)
+    if _HAVE_PYTEST:
+        check("test_file", "pytest" in types(res2))
+    else:
+        check("test_file", "shell" in types(res2))
 
-    # 3. tests/ dir -> pytest check
+    # 3. tests/ dir -> pytest check (if pytest installed) or shell fallback
     d = tempfile.mkdtemp(prefix="pi_testsdir_")
     os.makedirs(os.path.join(d, "tests"))
     open(os.path.join(d, "app.py"), "w").write("x=1\n")
-    check("tests_dir", "pytest" in types(detect_checks(d)))
+    res3 = detect_checks(d)
+    if _HAVE_PYTEST:
+        check("tests_dir", "pytest" in types(res3))
+    else:
+        check("tests_dir", "shell" in types(res3))
 
     # 4. plain .py, no tests -> compileall (shell), NOT pytest
     d = tempfile.mkdtemp(prefix="pi_plainpy_")
@@ -75,8 +89,12 @@ def main():
     # 8. build_goal: auto-verify attaches detected checks, cwd + instruction present
     d = tempfile.mkdtemp(prefix="pi_goal_")
     open(os.path.join(d, "pytest.ini"), "w").write("[pytest]\n")
+    open(os.path.join(d, "mod.py"), "w").write("x=1\n")
     goal, notes = build_goal("落ちてるテストを直して", d)
-    check("goal_has_checks", goal.get("checks") and goal["checks"][0]["type"] == "pytest")
+    if _HAVE_PYTEST:
+        check("goal_has_checks", goal.get("checks") and goal["checks"][0]["type"] == "pytest")
+    else:
+        check("goal_has_checks", bool(goal.get("checks")))
     check("goal_cwd", goal["cwd"] == os.path.abspath(d))
     check("goal_text", "落ちてるテストを直して" in goal["text"] and os.path.abspath(d) in goal["text"])
 
