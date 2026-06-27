@@ -48,9 +48,9 @@ class SelfImproveDashboardWindow : Window
 {
     static Color C(string hex) { return (Color)ColorConverter.ConvertFromString(hex); }
 
-    // theme-dependent brushes (same palette as FleetCockpit)
+    // theme-dependent brushes (Theme.cs is the single source of truth)
     Brush Bg, CardBg, Border, Fg, Muted, QuoteBg, BtnBg;
-    static readonly Brush Accent = new SolidColorBrush(C("#ea580c"));
+    Brush Accent;   // primary-action color; theme-dependent, set in ApplyThemeBrushes
     static readonly Brush White = new SolidColorBrush(C("#ffffff"));
 
     bool _dark = true;
@@ -204,23 +204,17 @@ class SelfImproveDashboardWindow : Window
     // ── theme (identical palette to FleetCockpit) ─────────────────────────────────
     void ApplyThemeBrushes()
     {
-        if (_dark)
-        {
-            Bg = new SolidColorBrush(C("#0f172a")); CardBg = new SolidColorBrush(C("#1e293b"));
-            Border = new SolidColorBrush(C("#334155")); Fg = new SolidColorBrush(C("#f8fafc"));
-            Muted = new SolidColorBrush(C("#94a3b8")); QuoteBg = new SolidColorBrush(C("#0b1220"));
-            BtnBg = new SolidColorBrush(C("#1e293b"));
-        }
-        else
-        {
-            Bg = new SolidColorBrush(C("#ffffff")); CardBg = new SolidColorBrush(C("#f8fafc"));
-            Border = new SolidColorBrush(C("#e2e8f0")); Fg = new SolidColorBrush(C("#0f172a"));
-            Muted = new SolidColorBrush(C("#64748b")); QuoteBg = new SolidColorBrush(C("#f1f5f9"));
-            BtnBg = new SolidColorBrush(C("#f1f5f9"));
-        }
+        Bg = Theme.Br(Theme.Bg(_dark));
+        CardBg = Theme.Br(Theme.Surface(_dark));
+        Border = Theme.Br(Theme.Border(_dark));
+        Fg = Theme.Br(Theme.Text(_dark));
+        Muted = Theme.Br(Theme.Muted(_dark));
+        QuoteBg = Theme.Br(Theme.SurfaceSubtle(_dark));
+        BtnBg = Theme.Br(Theme.SurfaceSubtle(_dark));
+        Accent = Theme.Br(Theme.Accent(_dark));
     }
-    Color BgColor() { return _dark ? C("#0f172a") : C("#ffffff"); }
-    Color CardColor() { return _dark ? C("#1e293b") : C("#f8fafc"); }
+    Color BgColor() { return Theme.Col(Theme.Bg(_dark)); }
+    Color CardColor() { return Theme.Col(Theme.Surface(_dark)); }
     static Color Mix(Color a, Color b, double t)
     {
         return Color.FromRgb((byte)(a.R * t + b.R * (1 - t)),
@@ -232,10 +226,10 @@ class SelfImproveDashboardWindow : Window
     // RED otherwise. "good"/"warn"/"bad"/"muted" mirror FleetCockpit's status palette.
     static Color StatusColorFor(string ck, bool dark)
     {
-        if (ck == "good") return C("#16a34a");   // green  (keep)
-        if (ck == "warn") return C("#d97706");   // amber  (suggestive)
-        if (ck == "bad") return C("#b40426");    // red    (not kept)
-        return dark ? C("#64748b") : C("#94a3b8");
+        if (ck == "good") return Theme.Col(Theme.Success(dark));  // keep
+        if (ck == "warn") return Theme.Col(Theme.Warning(dark));  // suggestive
+        if (ck == "bad") return Theme.Col(Theme.Danger(dark));    // not kept
+        return Theme.Col(Theme.Muted(dark));
     }
     string VerdictKey(object keep, string verdict)
     {
