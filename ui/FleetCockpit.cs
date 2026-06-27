@@ -969,8 +969,10 @@ class CockpitWindow : Window
     System.Windows.Controls.Primitives.Popup _settingsPopup;
     Button _gearBtn;
     Button _maxMinus, _maxPlus;
-    Button _effortChip;
-    Button _approvalChip;
+    ComboBox _effortBox;
+    ComboBox _approvalBox;
+    TextBlock _effortLbl;
+    TextBlock _approvalLbl;
     Button _pauseBtn, _stopBtn;
     System.Windows.Shapes.Path _pauseIcon, _stopIcon;   // drawn geometry (no font glyph needed)
     Button _autoToggle;
@@ -1200,39 +1202,46 @@ class CockpitWindow : Window
         }
     }
 
-    // Effort selector: a click-cycle CHIP that advances through min->max->ultra->auto->min.
-    // Clicking persists effort= to settings.txt; the fleet runner reads it at launch.
+    // Effort selector: ComboBox dropdown for min/max/ultra/auto.
+    // Persists effort= to settings.txt; the fleet runner reads it at launch.
     static readonly string[] _effortModes = { "min", "max", "ultra", "auto" };
     UIElement EffortControl()
     {
-        _effortChip = new Button();
-        _effortChip.VerticalAlignment = VerticalAlignment.Center;
-        _effortChip.Cursor = Cursors.Hand;
-        _effortChip.FontSize = 12;
-        _effortChip.Padding = new Thickness(10, 3, 10, 3);
-        _effortChip.Margin = new Thickness(0, 0, 12, 0);
-        _effortChip.BorderThickness = new Thickness(1);
-        _effortChip.ToolTip = _lang == 0
-            ? "推論の深さ（クリックで切替: min→max→ultra→auto）\nmin: 速い・浅い / max: 深い調査 / ultra: 最深フル動員 / auto: 難度に応じて自動選択（推奨）"
-            : "Reasoning effort (click to cycle: min→max→ultra→auto)\nmin: fast/shallow  max: deep research  ultra: full depth  auto: pick by difficulty (recommended)";
-        _effortChip.Click += delegate
+        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
+        wrap.VerticalAlignment = VerticalAlignment.Center; wrap.Margin = new Thickness(0, 0, 12, 0);
+
+        _effortLbl = new TextBlock(); _effortLbl.VerticalAlignment = VerticalAlignment.Center;
+        _effortLbl.FontSize = 12; _effortLbl.Margin = new Thickness(0, 0, 8, 0);
+        wrap.Children.Add(_effortLbl);
+
+        _effortBox = new ComboBox();
+        _effortBox.ToolTip = _lang == 0 ? "推論の深さ（各ワーカーの調査/反論の強度）" : "Reasoning effort (research/refute depth per worker)";
+        _effortBox.Cursor = Cursors.Hand; _effortBox.FontSize = 12;
+        _effortBox.FontWeight = FontWeights.SemiBold; _effortBox.MinWidth = 78;
+        _effortBox.Padding = new Thickness(8, 2, 4, 2);
+        _effortBox.VerticalAlignment = VerticalAlignment.Center;
+        FillComboWithHelp(_effortBox, _effortModes, EffortHelp(), _effort);  // per-option hover help
+        _effortBox.SelectionChanged += delegate
         {
-            int idx = System.Array.IndexOf(_effortModes, _effort);
-            _effort = _effortModes[(idx + 1) % _effortModes.Length];
+            string sel = ComboVal(_effortBox);
+            if (string.IsNullOrEmpty(sel) || sel == _effort) return;
+            _effort = sel;
             SaveKey("effort", _effort);
-            PaintEffort();
         };
+        wrap.Children.Add(_effortBox);
+
         PaintEffort();
-        return _effortChip;
+        return wrap;
     }
     void PaintEffort()
     {
-        if (_effortChip == null) return;
-        string label = _lang == 0 ? "推論: " : "Reasoning: ";
-        _effortChip.Content = label + _effort;
-        _effortChip.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
-        _effortChip.Foreground = Theme.Br(Theme.Text(_dark));
-        _effortChip.BorderBrush = Theme.Br(Theme.BorderStrong(_dark));
+        if (_effortLbl != null) { _effortLbl.Text = T("effort"); _effortLbl.Foreground = Muted; }
+        if (_effortBox == null) return;
+        // keep the dropdown in sync with _effort (e.g. settings.txt changed externally) without
+        // re-firing the persist handler -- assigning the same value is a no-op for SelectionChanged.
+        if (!Equals(ComboVal(_effortBox), _effort)) ComboSelectVal(_effortBox, _effort);
+        _effortBox.Background = BtnBg; _effortBox.Foreground = Fg; _effortBox.BorderBrush = Border;
+        StyleFlatCombo(_effortBox);   // re-template each paint so a theme toggle retints resting + popup
     }
 
     // WPY ComboBox bug fix: the stock Aero ControlTemplate ignores Background/Foreground and
@@ -1354,38 +1363,46 @@ class CockpitWindow : Window
         return st;
     }
 
-    // Approval selector: click-cycle CHIP advancing run->plan->auto->run.
+    // Approval selector: compact run/plan/auto mode next to effort. This avoids adding another
+    // header button in the already-dense fleet toolbar.
     static readonly string[] _approvalModes = { "run", "plan", "auto" };
     UIElement ApprovalControl()
     {
-        _approvalChip = new Button();
-        _approvalChip.VerticalAlignment = VerticalAlignment.Center;
-        _approvalChip.Cursor = Cursors.Hand;
-        _approvalChip.FontSize = 12;
-        _approvalChip.Padding = new Thickness(10, 3, 10, 3);
-        _approvalChip.Margin = new Thickness(0, 0, 12, 0);
-        _approvalChip.BorderThickness = new Thickness(1);
-        _approvalChip.ToolTip = _lang == 0
-            ? "承認モード（クリックで切替: run→plan→auto）\nrun: 承認なし即実行 / plan: 計画承認待ちで停止 / auto: 通常フリートは計画承認待ち・フォルダ自律はGO-ASK-STOP判定"
-            : "Approval mode (click to cycle: run→plan→auto)\nrun: execute immediately  plan: pause for approval  auto: plain fleet waits; folder autonomy uses GO/ASK/STOP";
-        _approvalChip.Click += delegate
+        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
+        wrap.VerticalAlignment = VerticalAlignment.Center; wrap.Margin = new Thickness(0, 0, 12, 0);
+
+        _approvalLbl = new TextBlock(); _approvalLbl.VerticalAlignment = VerticalAlignment.Center;
+        _approvalLbl.FontSize = 12; _approvalLbl.Margin = new Thickness(0, 0, 8, 0);
+        wrap.Children.Add(_approvalLbl);
+
+        _approvalBox = new ComboBox();
+        _approvalBox.ToolTip = _lang == 0
+            ? "承認モード: run=すぐ実行、plan=計画承認待ち、auto=通常フリートは計画承認待ち/フォルダ自律はGO-ASK-STOP判定"
+            : "Approval mode: run=run now, plan=wait for approval, auto=plain fleet waits for plan approval; folder autonomy uses GO/ASK/STOP";
+        _approvalBox.Cursor = Cursors.Hand; _approvalBox.FontSize = 12;
+        _approvalBox.FontWeight = FontWeights.SemiBold; _approvalBox.MinWidth = 74;
+        _approvalBox.Padding = new Thickness(8, 2, 4, 2);
+        _approvalBox.VerticalAlignment = VerticalAlignment.Center;
+        FillComboWithHelp(_approvalBox, _approvalModes, ApprovalHelp(), _approval);  // per-option hover help
+        _approvalBox.SelectionChanged += delegate
         {
-            int idx = System.Array.IndexOf(_approvalModes, _approval);
-            _approval = _approvalModes[(idx + 1) % _approvalModes.Length];
+            string sel = ComboVal(_approvalBox);
+            if (string.IsNullOrEmpty(sel) || sel == _approval) return;
+            _approval = sel;
             SaveKey("approval", _approval);
-            PaintApproval();
         };
+        wrap.Children.Add(_approvalBox);
+
         PaintApproval();
-        return _approvalChip;
+        return wrap;
     }
     void PaintApproval()
     {
-        if (_approvalChip == null) return;
-        string label = _lang == 0 ? "承認: " : "Approval: ";
-        _approvalChip.Content = label + _approval;
-        _approvalChip.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
-        _approvalChip.Foreground = Theme.Br(Theme.Text(_dark));
-        _approvalChip.BorderBrush = Theme.Br(Theme.BorderStrong(_dark));
+        if (_approvalLbl != null) { _approvalLbl.Text = T("approval"); _approvalLbl.Foreground = Muted; }
+        if (_approvalBox == null) return;
+        if (!Equals(ComboVal(_approvalBox), _approval)) ComboSelectVal(_approvalBox, _approval);
+        _approvalBox.Background = BtnBg; _approvalBox.Foreground = Fg; _approvalBox.BorderBrush = Border;
+        StyleFlatCombo(_approvalBox);   // same flat-template fix so the open list matches the theme
     }
 
     // ── per-option hover help for the 推論 / 承認 dropdowns ──────────────────────────────────
@@ -1531,17 +1548,24 @@ class CockpitWindow : Window
     // (BuildSettingsPanel builds it inline and assigns _maxMinus/_maxPlus/_maxValue).
     TextBlock _maxValue;
 
-    // Toggle label/colour: ON => accent bg + white text (contrast rule for saturated bg),
-    // OFF => neutral themed button.
+    // Toggle label/colour: ON => accent border + accent soft bg (clearly colored),
+    // OFF => muted neutral. Task 2: ON state must be visually distinct with color.
     void PaintAutoToggle()
     {
         if (_autoToggle == null) return;
-        // Quiet chip (spec): "Auto" when on, "Auto · off" when off. No orange fill — the active
-        // state reads from a slightly stronger border + full-strength text, not a saturated block.
         _autoToggle.Content = _autoscale ? "Auto" : (_lang == 0 ? "Auto · 切" : "Auto · off");
-        _autoToggle.Background = BtnBg;
-        _autoToggle.Foreground = _autoscale ? Fg : Muted;
-        _autoToggle.BorderBrush = _autoscale ? Theme.Br(Theme.BorderStrong(_dark)) : Border;
+        if (_autoscale)
+        {
+            _autoToggle.Foreground = Theme.Br(Theme.Accent(_dark));
+            _autoToggle.BorderBrush = Theme.Br(Theme.Accent(_dark));
+            _autoToggle.Background = Theme.Br(Theme.AccentSoft(_dark));
+        }
+        else
+        {
+            _autoToggle.Foreground = Muted;
+            _autoToggle.BorderBrush = Border;
+            _autoToggle.Background = Brushes.Transparent;
+        }
     }
 
     // Ceiling stepper only matters under autoscale: grey/disable it when autoscale is off.
@@ -2598,14 +2622,18 @@ class CockpitWindow : Window
         string doneLabel = T("flt_done") + " " + cntDone;
         left.Children.Add(FilterButton(doneLabel, 3, false, 0));
 
-        var summary = new TextBlock();
-        summary.Text = (_lang == 0
-            ? ("完了 " + doneN + " ・ 上限 " + maxN + " ・ 停止/失敗 " + badN)
-            : ("Done " + doneN + " · MaxTurns " + maxN + " · Stuck/Err " + badN));
-        summary.Foreground = Muted; summary.FontSize = 12;
-        summary.VerticalAlignment = VerticalAlignment.Center;
-        summary.Margin = new Thickness(14, 0, 0, 0);
-        left.Children.Add(summary);
+        // Task 5: only show the summary when there are failures; hide when nothing notable.
+        int failTotal = badN + maxN;
+        if (failTotal > 0)
+        {
+            var summary = new TextBlock();
+            summary.Text = (_lang == 0 ? ("失敗 " + failTotal) : ("Failed " + failTotal));
+            summary.Foreground = Theme.Br(Theme.Danger(_dark)); summary.FontSize = 12;
+            summary.FontWeight = FontWeights.SemiBold;
+            summary.VerticalAlignment = VerticalAlignment.Center;
+            summary.Margin = new Thickness(14, 0, 0, 0);
+            left.Children.Add(summary);
+        }
 
         _toolbarNote = new TextBlock();
         _toolbarNote.Foreground = Muted; _toolbarNote.FontSize = 11.5;
@@ -2859,8 +2887,8 @@ class CockpitWindow : Window
         var right = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
         {
             var openLink = new TextBlock();
-            openLink.Text = _lang == 0 ? "▶ 開く" : "▶ Open";
-            openLink.Foreground = Accent; openLink.FontSize = 12; openLink.FontWeight = FontWeights.SemiBold;
+            openLink.Text = _lang == 0 ? "開く" : "Open";
+            openLink.Foreground = Muted; openLink.FontSize = 12;
             openLink.VerticalAlignment = VerticalAlignment.Center; openLink.Cursor = Cursors.Hand;
             openLink.Margin = new Thickness(0, 0, 10, 0);
             openLink.ToolTip = _lang == 0 ? "この会話をメインチャットで開く" : "Open this conversation in the chat";
@@ -2930,8 +2958,29 @@ class CockpitWindow : Window
         if (!string.IsNullOrEmpty(resultText))
         {
             string resultPrefix = _lang == 0 ? "結果: " : "Result: ";
+            // Task 3: clean the result for display; fall back to a neutral label if cleaning
+            // strips everything (e.g. result was only preamble tokens).
+            string cleanedResult = !string.IsNullOrEmpty(last) ? CleanAgentResultForUi(last) : "";
+            string displayLine;
+            if (!string.IsNullOrEmpty(last))
+            {
+                // result from agent: use first non-empty cleaned line, or fallback
+                string firstLine = "";
+                if (!string.IsNullOrEmpty(cleanedResult))
+                {
+                    int nl = cleanedResult.IndexOf('\n');
+                    firstLine = nl >= 0 ? cleanedResult.Substring(0, nl) : cleanedResult;
+                }
+                displayLine = !string.IsNullOrEmpty(firstLine)
+                    ? OneLine(firstLine)
+                    : (_lang == 0 ? "結果を受信しました" : "Result received");
+            }
+            else
+            {
+                displayLine = OneLine(resultText);
+            }
             var rl = new TextBlock {
-                Text = resultPrefix + OneLine(resultText), Foreground = Muted, FontSize = 12.5,
+                Text = resultPrefix + displayLine, Foreground = Muted, FontSize = 12.5,
                 TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.NoWrap,
                 Margin = new Thickness(24, 5, 0, 0)
             };
@@ -3075,8 +3124,21 @@ class CockpitWindow : Window
     {
         var sp = new StackPanel();
         sp.Children.Add(SectLabel(_lang == 0 ? "結果" : "Result"));
-        string result = !string.IsNullOrEmpty(last) ? last
-                        : (terminal ? OutcomeLabel(outcome) : (_lang == 0 ? "実行中…" : "Working…"));
+        // Task 3: clean agent result for display; if cleaning yields empty, show fallback label.
+        string resultRaw = !string.IsNullOrEmpty(last) ? last
+                           : (terminal ? OutcomeLabel(outcome) : (_lang == 0 ? "実行中…" : "Working…"));
+        string result;
+        if (!string.IsNullOrEmpty(last))
+        {
+            string cleaned = CleanAgentResultForUi(last);
+            result = !string.IsNullOrEmpty(cleaned)
+                ? cleaned
+                : (_lang == 0 ? "結果を受信しました" : "Result received");
+        }
+        else
+        {
+            result = resultRaw;
+        }
         sp.Children.Add(RoText(result, Fg, 13));
 
         var checks = new List<string>();
@@ -3354,35 +3416,64 @@ class CockpitWindow : Window
     }
 
     // ② steering: inject a mid-task instruction into this worker's conversation.
+    // Task 6: restyled as a small composer -- rounded surfaceSubtle border, placeholder watermark,
+    // neutral send button, post-send wording updated.
     UIElement SteerRow(string name)
     {
-        var dp = new DockPanel();
-        dp.Margin = new Thickness(0, 10, 0, 0);
+        var outer = new StackPanel();
+        outer.Margin = new Thickness(0, 10, 0, 0);
         // clicks inside this row must not bubble to the card's open-conversation handler
-        dp.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; };
+        outer.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; };
+
+        // mini-composer wrapper border (matches bottom composer look, smaller)
+        var composerBorder = new Border();
+        composerBorder.CornerRadius = new CornerRadius(8);
+        composerBorder.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+        composerBorder.BorderBrush = Border;
+        composerBorder.BorderThickness = new Thickness(1);
+        composerBorder.Padding = new Thickness(10, 8, 10, 8);
+
+        var dp = new DockPanel();
 
         var send = new Button();
-        send.Content = _lang == 0 ? "割り込み" : "Steer";
-        send.Background = Accent; send.Foreground = White; send.BorderThickness = new Thickness(0);
+        send.Content = _lang == 0 ? "送信" : "Send";
+        // Task 6: neutral by default (not accent)
+        send.Background = Brushes.Transparent; send.Foreground = Fg;
+        send.BorderThickness = new Thickness(1); send.BorderBrush = Border;
         send.Padding = new Thickness(12, 4, 12, 4); send.Cursor = Cursors.Hand; send.FontSize = 12;
         send.FontWeight = FontWeights.SemiBold;
         DockPanel.SetDock(send, Dock.Right);
         dp.Children.Add(send);
 
-        // honest feedback when there is no live fleet to consume the steer -- shown INSTEAD of
-        // clearing the box, so the user never thinks an instruction was sent into the void.
+        // honest feedback when there is no live fleet to consume the steer
         var note = new TextBlock();
         note.FontSize = 11.5; note.Foreground = Muted; note.TextWrapping = TextWrapping.Wrap;
         note.VerticalAlignment = VerticalAlignment.Center; note.Margin = new Thickness(0, 0, 8, 0);
         DockPanel.SetDock(note, Dock.Right);
         dp.Children.Add(note);
 
+        // input + placeholder watermark overlay
+        var inputGrid = new Grid();
         var tb = new TextBox();
-        tb.FontSize = 12.5; tb.Padding = new Thickness(8, 5, 8, 5);
-        tb.BorderThickness = new Thickness(1); tb.Background = BtnBg; tb.Foreground = Fg;
-        tb.BorderBrush = Border; tb.CaretBrush = Fg; tb.Margin = new Thickness(0, 0, 8, 0);
+        tb.FontSize = 12.5; tb.Padding = new Thickness(4, 3, 4, 3);
+        tb.BorderThickness = new Thickness(0); tb.Background = Brushes.Transparent; tb.Foreground = Fg;
+        tb.CaretBrush = Fg;
         tb.ToolTip = _lang == 0 ? "回答待ち中でも割り込み指示を送れます（次のターンに最優先で反映）"
                                 : "Inject a steering instruction (applied on the next turn)";
+        // placeholder watermark text (hides when text is present)
+        var placeholder = new TextBlock();
+        placeholder.Text = _lang == 0 ? "このタスクに追加指示..." : "Add instruction to this task...";
+        placeholder.Foreground = Muted; placeholder.FontSize = 12.5;
+        placeholder.Padding = new Thickness(4, 3, 4, 3);
+        placeholder.VerticalAlignment = VerticalAlignment.Center;
+        placeholder.IsHitTestVisible = false;
+        inputGrid.Children.Add(placeholder);
+        inputGrid.Children.Add(tb);
+        dp.Children.Add(inputGrid);
+
+        composerBorder.Child = dp;
+        outer.Children.Add(composerBorder);
+
         string nm = name;
         // returns true iff the steer was actually sent; keeps the text + shows a note otherwise.
         Func<bool> trySteer = delegate
@@ -3390,7 +3481,9 @@ class CockpitWindow : Window
             string t = (tb.Text ?? "").Trim();
             if (t.Length == 0) return false;
             if (!RunIsLive()) { note.Text = T("steer_dead"); return false; }
-            RequestSteer(nm, t); tb.Text = ""; note.Text = "";
+            RequestSteer(nm, t); tb.Text = "";
+            // Task 6: updated post-send wording
+            note.Text = _lang == 0 ? "次のターンに送信しました" : "Queued for the next turn";
             return true;
         };
         send.Click += delegate { trySteer(); };
@@ -3398,9 +3491,13 @@ class CockpitWindow : Window
         {
             if (e.Key == Key.Return) { trySteer(); e.Handled = true; }
         };
-        tb.TextChanged += delegate { if (note.Text.Length > 0) note.Text = ""; };
-        dp.Children.Add(tb);
-        return dp;
+        tb.TextChanged += delegate
+        {
+            bool hasText = tb.Text != null && tb.Text.Length > 0;
+            placeholder.Visibility = hasText ? Visibility.Collapsed : Visibility.Visible;
+            if (note.Text.Length > 0 && hasText) note.Text = "";
+        };
+        return outer;
     }
 
     // Feature A: a read-only TextBox inside a clickable card would still raise the card's
@@ -3574,6 +3671,57 @@ class CockpitWindow : Window
             sb.Append(ch);
         }
         return sb.ToString().Trim();
+    }
+
+    // Task 3: clean agent result text for display only (never touch logs/transcript).
+    // Normalizes line endings, trims lines, drops empty and preamble-only lines,
+    // removes adjacent duplicate lines, and trims a trailing lone "DONE" if redundant.
+    static readonly string[] _resultPreambleTokens = {
+        "desktopfile操作", "browser操作", "computeruse", "Copilot", "エージェント"
+    };
+    static string CleanAgentResultForUi(string raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return "";
+        // Normalize CRLF/CR to LF, split, trim each line, drop empty.
+        string normalized = raw.Replace("\r\n", "\n").Replace("\r", "\n");
+        string[] parts = normalized.Split('\n');
+        var lines = new List<string>();
+        foreach (string p in parts)
+        {
+            string t = p.Trim();
+            if (t.Length == 0) continue;
+            // drop lines that are only a known preamble token (case-insensitive exact match)
+            bool isPreamble = false;
+            foreach (string tok in _resultPreambleTokens)
+            {
+                if (string.Equals(t, tok, StringComparison.OrdinalIgnoreCase))
+                { isPreamble = true; break; }
+            }
+            if (isPreamble) continue;
+            lines.Add(t);
+        }
+        // Remove repeated identical adjacent lines.
+        var deduped = new List<string>();
+        for (int i = 0; i < lines.Count; i++)
+        {
+            if (deduped.Count == 0 || lines[i] != deduped[deduped.Count - 1])
+                deduped.Add(lines[i]);
+        }
+        // If the final line is exactly "DONE" and previous line already ends with "DONE", drop it.
+        if (deduped.Count >= 2
+            && deduped[deduped.Count - 1] == "DONE"
+            && deduped[deduped.Count - 2].EndsWith("DONE"))
+        {
+            deduped.RemoveAt(deduped.Count - 1);
+        }
+        if (deduped.Count == 0) return "";
+        var sb2 = new StringBuilder();
+        for (int i = 0; i < deduped.Count; i++)
+        {
+            if (i > 0) sb2.Append('\n');
+            sb2.Append(deduped[i]);
+        }
+        return sb2.ToString();
     }
 
     UIElement Dots()
