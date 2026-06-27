@@ -3320,6 +3320,30 @@ class CockpitWindow : Window
         return row;
     }
 
+    // Pass A2-1: true when a status is a terminal-but-unresolved attention lane (stuck/maxturns/error).
+    // These get the "recovery surface" treatment on their collapsed row (§6 spec).
+    static bool IsAttentionStatus(string status)
+    {
+        return status == "stuck" || status == "maxturns" || status == "error";
+    }
+
+    // Build a small outline button for the attention recovery row (§6: equal-weight neutral buttons).
+    Button AttentionBtn(string label)
+    {
+        var b = new Button();
+        b.Content = label;
+        b.Cursor = Cursors.Hand;
+        b.FontSize = 12;
+        b.Padding = new Thickness(10, 3, 10, 3);
+        b.Margin = new Thickness(0, 0, 6, 0);
+        b.BorderThickness = new Thickness(1);
+        b.Background = Brushes.Transparent;
+        b.BorderBrush = Border;
+        b.Foreground = Muted;
+        b.Template = FlatButtonTemplate();
+        return b;
+    }
+
     Border Card(Dictionary<string, object> w)
     {
         string name = S(w, "name");
@@ -3337,28 +3361,36 @@ class CockpitWindow : Window
         bool terminal = status == "done" || status == "stuck" || status == "maxturns"
                         || status == "error" || status == "cancelled";
         bool isOpen = _expanded.Contains(name);
+        // Attention lane: stuck/maxturns/error and NOT yet expanded -- gets recovery surface treatment.
+        bool isAttention = !closed && IsAttentionStatus(status);
 
         string railKind = closed ? "neutral" : Theme.StatusRail(status);
         Brush statusBrush = Theme.Br(Theme.RailColor(railKind, _dark));
 
-        // Outer card: a plain surface with a thin border and a 3px status RAIL on the left.
-        // No status fill / tint anywhere (spec): the rail + chip carry the meaning, so a successful
-        // card never looks like a green alert block.
+        // Pass A2-1 TASK 1: demote the collapsed row to a LEDGER ROW.
+        // - No rounded corners, no card background fill, no full border.
+        // - Flat row on the app surface: bottom divider only (Theme.Border).
+        // - 3px left status rail preserved at full row height.
+        // - Tighter vertical padding so rows are denser (~64-76px collapsed).
         var card = new Border();
         card.Tag = name;                // lets a chevron toggle find & replace just this card
-        card.BorderThickness = new Thickness(1);
-        card.CornerRadius = new CornerRadius(Theme.RadCard);
-        card.BorderBrush = Border; card.Background = CardBg;
-        card.Margin = new Thickness(8, Theme.CardGap / 2, 8, Theme.CardGap / 2);
+        // Ledger row: only a bottom hairline divider (no rounded card border).
+        card.BorderThickness = new Thickness(0, 0, 0, 1);
+        card.BorderBrush = Border;
+        // Transparent background (inherits the flat app surface).
+        card.Background = Brushes.Transparent;
+        // No margin between rows; the bottom border IS the separator.
+        card.Margin = new Thickness(0, 0, 0, 0);
 
         var shell = new Grid();
         shell.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });   // rail
         shell.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        var rail = new Border { Width = Theme.RailW, CornerRadius = new CornerRadius(2),
-                                Background = statusBrush, Margin = new Thickness(0, 2, 0, 2) };
+        // Rail spans full row height (no vertical margin) — the Margin(0,2,0,2) is gone.
+        var rail = new Border { Width = Theme.RailW, Background = statusBrush };
         Grid.SetColumn(rail, 0); shell.Children.Add(rail);
 
-        var col = new StackPanel { Margin = new Thickness(14, 11, 14, 11) };
+        // Tighter padding: 10px horizontal, 7px vertical top/bottom.
+        var col = new StackPanel { Margin = new Thickness(10, 7, 12, 7) };
         Grid.SetColumn(col, 1); shell.Children.Add(col);
 
         // ── line 1: [chevron] [chip] [title* ........] [Open] [primary action | kebab⋮] ──
@@ -3433,70 +3465,170 @@ class CockpitWindow : Window
         Grid.SetColumn(left, 0); top.Children.Add(left);
         col.Children.Add(top);
 
-        // ── line 2: latest human-readable progress (the clean `last`, NOT the refuter reason -- a
-        // DONE card must never surface "REFUTED" as its result). Hidden when there's nothing to say. ──
-        string resultText = !string.IsNullOrEmpty(last) ? last : (terminal || closed ? "" : (_lang == 0 ? "実行中…" : "Working…"));
-        if (!string.IsNullOrEmpty(resultText))
+        if (!isOpen)
         {
-            string resultPrefix = _lang == 0 ? "結果: " : "Result: ";
-            // Task 3: clean the result for display; fall back to a neutral label if cleaning
-            // strips everything (e.g. result was only preamble tokens).
-            string cleanedResult = !string.IsNullOrEmpty(last) ? CleanAgentResultForUi(last) : "";
-            string displayLine;
-            if (!string.IsNullOrEmpty(last))
+            // ── COLLAPSED ROW body (ledger row, not expanded drawer) ──────────────────────────
+            if (isAttention)
             {
-                // result from agent: use first non-empty cleaned line, or fallback
-                string firstLine = "";
-                if (!string.IsNullOrEmpty(cleanedResult))
+                // Pass A2-1 TASK 2: RECOVERY ROW for attention lanes (stuck/maxturns/error).
+                // §6: "Not an error card — a recovery surface."
+
+                // Line 2: human recovery sentence from the `reason` field [REAL].
+                // Calm lead-in + verbatim reason text. Omit when reason is empty.
+                if (!string.IsNullOrEmpty(reason))
                 {
-                    int nl = cleanedResult.IndexOf('\n');
-                    firstLine = nl >= 0 ? cleanedResult.Substring(0, nl) : cleanedResult;
+                    string leadIn = _lang == 0 ? "停止理由: " : "Stopped: ";
+                    var rl2 = new TextBlock
+                    {
+                        Text = leadIn + OneLine(reason),
+                        Foreground = Muted, FontSize = 12.5,
+                        TextTrimming = TextTrimming.CharacterEllipsis,
+                        TextWrapping = TextWrapping.NoWrap,
+                        Margin = new Thickness(24, 4, 0, 0)
+                    };
+                    col.Children.Add(rl2);
                 }
-                displayLine = !string.IsNullOrEmpty(firstLine)
-                    ? OneLine(firstLine)
-                    : (_lang == 0 ? "結果を受信しました" : "Result received");
+
+                // Line 3: freshness — "最終証拠 {N} 前" / "last evidence {N} ago" [COMPUTED].
+                // Best proxy: transcript meta ts (start of this worker); fallback to status updated.
+                {
+                    string transcriptPath2 = S(w, "transcript");
+                    double evidenceTs = ReadTranscriptStartTs(transcriptPath2);
+                    // If transcript ts unavailable, fall back to the status.json top-level updated field.
+                    if (evidenceTs <= 0 && _lastRoot != null)
+                        evidenceTs = Dbl(_lastRoot, "updated");
+                    string freshnessText;
+                    if (evidenceTs > 0)
+                    {
+                        double age = NowUnix() - evidenceTs;
+                        if (age < 0) age = 0;
+                        freshnessText = _lang == 0
+                            ? ("最終証拠 " + Fmt(age) + " 前")
+                            : ("last evidence " + Fmt(age) + " ago");
+                    }
+                    else
+                    {
+                        freshnessText = _lang == 0 ? "最終証拠: 不明" : "last evidence: unknown";
+                    }
+                    var ml3 = new TextBlock
+                    {
+                        Text = freshnessText,
+                        Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 12,
+                        Margin = new Thickness(24, 2, 0, 0)
+                    };
+                    col.Children.Add(ml3);
+                }
+
+                // Recovery actions (§6): [再開]/[Resume], [証拠]/[Open evidence], [停止]/[Stop].
+                // Equal-weight outline buttons; NO accent color.
+                var recov = new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    Margin = new Thickness(24, 6, 0, 2)
+                };
+                recov.MouseLeftButtonUp += delegate (object s2, MouseButtonEventArgs e2) { e2.Handled = true; };
+
+                // [再開]/[Resume]: fall back to RetryGoal (re-queues or re-spawns via existing path).
+                var resumeBtn = AttentionBtn(_lang == 0 ? "再開" : "Resume");
+                resumeBtn.ToolTip = _lang == 0
+                    ? "このタスクを再開・再試行します（実行中なら add_goal、停止済なら fleet を再起動）"
+                    : "Resume or retry this task (add_goal if fleet live, else respawn fleet)";
+                Dictionary<string, object> wResume = w;
+                resumeBtn.Click += delegate (object s2, RoutedEventArgs e2) { e2.Handled = true; RetryGoal(wResume); };
+                recov.Children.Add(resumeBtn);
+
+                // [証拠]/[Open evidence]: open the conversation/transcript in the main chat.
+                var evidBtn = AttentionBtn(_lang == 0 ? "証拠" : "Open evidence");
+                evidBtn.ToolTip = _lang == 0
+                    ? "この会話を開いて最後のやり取りを確認する"
+                    : "Open this conversation to review the last exchange";
+                string evidNm = name; string evidUrl = conv;
+                evidBtn.Click += delegate (object s2, RoutedEventArgs e2) { e2.Handled = true; OpenWorker(evidNm, evidUrl); };
+                recov.Children.Add(evidBtn);
+
+                // [停止]/[Stop]: release/archive this lane via existing mechanisms.
+                var stopBtn = AttentionBtn(_lang == 0 ? "停止" : "Stop");
+                stopBtn.ToolTip = _lang == 0
+                    ? "このレーンを停止して履歴へ移動する"
+                    : "Stop this lane and move to history";
+                string stopNm = name; Dictionary<string, object> wStop = w;
+                stopBtn.Click += delegate (object s2, RoutedEventArgs e2)
+                {
+                    e2.Handled = true;
+                    RequestClose(stopNm);
+                    if (_lastRoot != null
+                        && (!_lastRoot.ContainsKey("running") || Convert.ToBoolean(_lastRoot["running"]))
+                        && (NowUnix() - Dbl(_lastRoot, "updated")) > 8)
+                        ArchiveAndHide(wStop);
+                    else
+                        ArchiveAndHide(wStop);
+                };
+                recov.Children.Add(stopBtn);
+
+                col.Children.Add(recov);
             }
             else
             {
-                displayLine = OneLine(resultText);
-            }
-            var rl = new TextBlock {
-                Text = resultPrefix + displayLine, Foreground = Muted, FontSize = 12.5,
-                TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.NoWrap,
-                Margin = new Thickness(24, 5, 0, 0)
-            };
-            col.Children.Add(rl);
-        }
+                // ── Normal collapsed ledger row: line 2 + line 3 ────────────────────────────
+                // Line 2: latest human-readable progress (clean `last`). Hidden when empty.
+                string resultText = !string.IsNullOrEmpty(last) ? last : (terminal || closed ? "" : (_lang == 0 ? "実行中…" : "Working…"));
+                if (!string.IsNullOrEmpty(resultText))
+                {
+                    string cleanedResult = !string.IsNullOrEmpty(last) ? CleanAgentResultForUi(last) : "";
+                    string displayLine;
+                    if (!string.IsNullOrEmpty(last))
+                    {
+                        string firstLine = "";
+                        if (!string.IsNullOrEmpty(cleanedResult))
+                        {
+                            int nl = cleanedResult.IndexOf('\n');
+                            firstLine = nl >= 0 ? cleanedResult.Substring(0, nl) : cleanedResult;
+                        }
+                        displayLine = !string.IsNullOrEmpty(firstLine)
+                            ? OneLine(firstLine)
+                            : (_lang == 0 ? "結果を受信しました" : "Result received");
+                    }
+                    else
+                    {
+                        displayLine = OneLine(resultText);
+                    }
+                    var rl = new TextBlock
+                    {
+                        Text = displayLine, Foreground = Muted, FontSize = 12.5,
+                        TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.NoWrap,
+                        Margin = new Thickness(24, 4, 0, 0)
+                    };
+                    col.Children.Add(rl);
+                }
 
-        // ── line 3: meta -- [elapsed] · worker name · turn · reviews · verified ──
-        // Per-card elapsed: the transcript jsonl meta line carries "ts" (epoch) = file creation
-        // time (when the worker was queued). We compute elapsed from that to now.
-        var meta = new StringBuilder();
-        string transcriptPath = S(w, "transcript");
-        double startTs = ReadTranscriptStartTs(transcriptPath);
-        if (startTs > 0)
-        {
-            double cardElapsed = NowUnix() - startTs;
-            if (cardElapsed > 0)
-            {
-                meta.Append(Fmt(cardElapsed)).Append(" · ");
+                // Line 3: meta — worker name · turn N · alive {freshness} ago · ✓verified [COMPUTED].
+                var meta = new StringBuilder();
+                string transcriptPath = S(w, "transcript");
+                double startTs = ReadTranscriptStartTs(transcriptPath);
+                if (startTs > 0)
+                {
+                    double cardElapsed = NowUnix() - startTs;
+                    if (cardElapsed > 0)
+                        meta.Append(Fmt(cardElapsed)).Append(" · ");
+                }
+                meta.Append(name.ToUpper());
+                if (turn > 0) meta.Append(" · ").Append(T("turn")).Append(' ').Append(turn);
+                if (reviews > 0) meta.Append(" · ").Append(_lang == 0 ? ("確認 " + reviews + " 回") : ("reviewed " + reviews));
+                if (verifiedOk) meta.Append(" · ").Append(_lang == 0 ? "✓ 検証OK" : "✓ verified");
+                var ml = new TextBlock
+                {
+                    Text = meta.ToString(), Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 12,
+                    Margin = new Thickness(24, 3, 0, 0)
+                };
+                col.Children.Add(ml);
             }
         }
-        meta.Append(name.ToUpper());
-        if (turn > 0) meta.Append(" · ").Append(T("turn")).Append(' ').Append(turn);
-        if (reviews > 0) meta.Append(" · ").Append(_lang == 0 ? ("確認 " + reviews + " 回") : ("reviewed " + reviews));
-        if (verifiedOk) meta.Append(" · ").Append(_lang == 0 ? "✓ 検証OK" : "✓ verified");
-        var ml = new TextBlock {
-            Text = meta.ToString(), Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 12,
-            Margin = new Thickness(24, 4, 0, 0)
-        };
-        col.Children.Add(ml);
-
-        // Expanded detail is organized into tabs (spec): Overview (default) / Conversation /
-        // Review / Logs -- so raw transcript, refuter notes and internal fields no longer all
-        // dump onto the surface at once. Heavy content is built ONLY when expanded.
-        if (isOpen)
+        else
         {
+            // ── EXPANDED DRAWER ───────────────────────────────────────────────────────────────
+            // Expanded detail is organized into tabs (spec): Overview (default) / Conversation /
+            // Review / Logs -- so raw transcript, refuter notes and internal fields no longer all
+            // dump onto the surface at once. Heavy content is built ONLY when expanded.
             col.Children.Add(BuildCardTabs(w, name, goal, last, reason, terminal));
             // Actions live BELOW the tabs (not inside one) so steer/retry are always reachable.
             if (!terminal) col.Children.Add(SteerRow(name));
