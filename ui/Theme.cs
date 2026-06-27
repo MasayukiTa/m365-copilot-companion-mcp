@@ -22,21 +22,22 @@ static class Theme
 
     // ── color tokens (hex by mode) ─────────────────────────────────────────────────
     // d == true => dark mode. Values mirror the spec Design Tokens tables verbatim.
-    public static string Bg(bool d)            { return d ? "#111111" : "#FAFAF8"; }  // app background
+    public static string Bg(bool d)            { return d ? "#111111" : "#F7F6F2"; }  // app background
     public static string Surface(bool d)       { return d ? "#181818" : "#FFFFFF"; }  // main surface, cards
     public static string SurfaceSubtle(bool d) { return d ? "#202020" : "#F4F4F2"; }  // composer, selected row
-    public static string Border(bool d)        { return d ? "#2E2E2E" : "#E5E5E1"; }  // 1px borders
+    public static string Border(bool d)        { return d ? "#2E2E2E" : "#D8D6CF"; }  // 1px borders
     public static string BorderStrong(bool d)  { return d ? "#3A3A3A" : "#D4D4D0"; }  // active / hover border
     public static string Text(bool d)          { return d ? "#F4F4F5" : "#18181B"; }  // body
     public static string Muted(bool d)         { return d ? "#A1A1AA" : "#71717A"; }  // secondary text
     public static string Faint(bool d)         { return d ? "#71717A" : "#A1A1AA"; }  // meta text
-    public static string Accent(bool d)        { return d ? "#F97316" : "#EA580C"; }  // primary action ONLY
+    public static string Accent(bool d)        { return d ? "#F97316" : "#D9480F"; }  // primary action ONLY
     public static string AccentSoft(bool d)    { return d ? "#3A2416" : "#FFF1E8"; }  // primary hover / subtle badge
     public static string AccentFg(bool d)      { return "#FFFFFF"; }                  // text on accent fill
     public static string Success(bool d)       { return d ? "#22C55E" : "#16A34A"; }  // done chip / left rail
-    public static string Warning(bool d)       { return d ? "#F59E0B" : "#D97706"; }  // needs-attention
-    public static string Danger(bool d)        { return d ? "#EF4444" : "#DC2626"; }  // error
+    public static string Warning(bool d)       { return d ? "#F59E0B" : "#B45309"; }  // needs-attention
+    public static string Danger(bool d)        { return d ? "#EF4444" : "#B91C1C"; }  // error
     public static string Info(bool d)          { return d ? "#60A5FA" : "#2563EB"; }  // running / reviewing
+    public static string Secondary(bool d)    { return d ? "#A1A1AA" : "#3F3F46"; }  // secondary text (Ledger: Graphite)
 
     // Translucent hover/press overlays (white on dark, black on light).
     public static string Hover(bool d) { return d ? "#22FFFFFF" : "#14000000"; }
@@ -118,19 +119,19 @@ static class Theme
         bool jp = lang == 0;
         switch (canonical)
         {
-            case "pending":     return jp ? "空き待ち"   : "Queued";
-            case "ready":       return jp ? "実行中"     : "Running";
-            case "waiting":     return jp ? "実行中"     : "Running";
-            case "researching": return jp ? "調査中"     : "Researching";
-            case "refuting":    return jp ? "確認中"     : "Reviewing";
-            case "verifying":   return jp ? "テスト中"   : "Testing";
-            case "awaiting":    return jp ? "承認待ち"   : "Needs input";
-            case "done":        return jp ? "完了"       : "Done";
-            case "stuck":       return jp ? "要対応"     : "Attention";
-            case "maxturns":    return jp ? "要対応"     : "Attention";
-            case "error":       return jp ? "エラー"     : "Error";
-            case "cancelled":   return jp ? "停止済み"   : "Stopped";
-            case "freed":       return jp ? "解放済"     : "Released";
+            case "pending":     return jp ? "待機"           : "Queued";
+            case "ready":       return jp ? "開始中"         : "Starting";
+            case "waiting":     return jp ? "実行中"         : "Running";
+            case "researching": return jp ? "調査中"         : "Researching";
+            case "refuting":    return jp ? "レビュー中"     : "Reviewing";
+            case "verifying":   return jp ? "検証中"         : "Verifying";
+            case "awaiting":    return jp ? "承認待ち"       : "Needs input";
+            case "done":        return jp ? "完了"           : "Done";
+            case "stuck":       return jp ? "要対応"         : "Needs attention";
+            case "maxturns":    return jp ? "要対応"         : "Needs attention";
+            case "error":       return jp ? "停止(エラー)"   : "Stopped (error)";
+            case "cancelled":   return jp ? "停止"           : "Stopped";
+            case "freed":       return jp ? "解放済"         : "Released";
             default:            return canonical == null ? "" : canonical;
         }
     }

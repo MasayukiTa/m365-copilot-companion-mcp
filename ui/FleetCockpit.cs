@@ -115,6 +115,9 @@ class CockpitWindow : Window
     string _lastSig = "";
     JavaScriptSerializer _js = new JavaScriptSerializer();
 
+    // Cached meta string for the directive-band row Sig (avoids per-tick rebuild when nothing changed).
+    string _directiveBandMeta = "";
+
     // Per-worker disclosure state (Claude-Code-style "> / v"). Collapsed is the default:
     // a collapsed card renders only a lightweight summary line -- no progress quote, no steer
     // TextBox -- so a fleet of 100+ tasks stays scrollable. Only an EXPANDED card builds the
@@ -2376,9 +2379,47 @@ class CockpitWindow : Window
 
         // Sub: "N running · M queued · K done" triple + elapsed
         bool ja2 = _lang == 0;
-        string triple = ja2
-            ? (cntRunning + " 実行中 · " + cntQueued + " 待機 · " + cntDoneW + " 完了")
-            : (cntRunning + " running · " + cntQueued + " queued · " + cntDoneW + " done");
+
+        // TASK 5: run-ended state — when running==false AND every worker is terminal, show ended summary.
+        bool allTerminal = false;
+        int cntAttn = 0;
+        object wo3;
+        if (root.TryGetValue("workers", out wo3) && wo3 is object[])
+        {
+            var wArr = (object[])wo3;
+            if (wArr.Length > 0)
+            {
+                allTerminal = true;
+                foreach (object ow2 in wArr)
+                {
+                    var ww2 = ow2 as Dictionary<string, object>;
+                    if (ww2 == null) continue;
+                    if (!IsTerminalWorker(ww2)) { allTerminal = false; }
+                    string wst2 = S(ww2, "status");
+                    if (wst2 == "stuck" || wst2 == "maxturns" || wst2 == "error") cntAttn++;
+                }
+            }
+        }
+
+        string triple;
+        if (!running && allTerminal)
+        {
+            // Run-ended header: "{done} done · {attn} needs attention · run ended"
+            if (ja2)
+            {
+                triple = cntDoneW + " 完了 · " + cntAttn + " 要対応 · 終了";
+            }
+            else
+            {
+                triple = cntDoneW + " done · " + cntAttn + " needs attention · run ended";
+            }
+        }
+        else
+        {
+            triple = ja2
+                ? (cntRunning + " 実行中 · " + cntQueued + " 待機 · " + cntDoneW + " 完了")
+                : (cntRunning + " running · " + cntQueued + " queued · " + cntDoneW + " done");
+        }
 
         // Live ETA: project remaining work from the throughput observed SO FAR (done/elapsed).
         string eta = "";
@@ -2401,7 +2442,24 @@ class CockpitWindow : Window
         if (running && updated > 0 && (NowUnix() - updated) > 8)
             triple = triple + " — " + T("stale");
 
-        _sub.Text = triple + "    " + T("elapsed") + " " + Fmt(elapsed) + eta;
+        // TASK 4: evidence freshness — "· evidence {N}s/m ago" from top-level `updated` field [COMPUTED].
+        // Omit entirely if updated is missing (zero) — never show "unknown".
+        string freshness = "";
+        if (updated > 0)
+        {
+            double ageS = NowUnix() - updated;
+            if (ageS >= 0)
+            {
+                string ageFmt;
+                if (ageS < 60.0)
+                    ageFmt = ((int)ageS).ToString() + (ja2 ? "秒" : "s");
+                else
+                    ageFmt = ((int)(ageS / 60.0)).ToString() + (ja2 ? "分" : "m");
+                freshness = " · " + (ja2 ? "証拠 " : "evidence ") + ageFmt + (ja2 ? "前" : " ago");
+            }
+        }
+
+        _sub.Text = triple + freshness + "    " + T("elapsed") + " " + Fmt(elapsed) + eta;
         _sub.ToolTip = _sub.Text;
     }
 
@@ -2501,6 +2559,43 @@ class CockpitWindow : Window
             return rows;
         }
         rows.Add(MkRow(0, null, null));               // toolbar
+
+        // TASK 3: Directive band — emit only when there are workers (i.e. active or just-ended run).
+        // Compute _directiveBandMeta here so the Sig captures the live elapsed/lane counts.
+        if (workers.Count > 0)
+        {
+            // Compute meta: "started HH:MM · {elapsed} · {active}/{total} lanes active" [COMPUTED]
+            double dbStarted = Dbl(root, "started");
+            double dbNow = NowUnix();
+            bool dbRunning = !root.ContainsKey("running") || Convert.ToBoolean(root["running"]);
+            double dbElapsed = dbRunning
+                ? (dbStarted > 0 ? dbNow - dbStarted : 0)
+                : (root.ContainsKey("elapsed_s") ? Dbl(root, "elapsed_s")
+                   : (Dbl(root, "updated") > 0 && dbStarted > 0 ? Dbl(root, "updated") - dbStarted : 0));
+            int dbActive = 0;
+            foreach (Dictionary<string, object> dw in workers)
+                if (!IsTerminalWorker(dw) && S(dw, "status") != "pending") dbActive++;
+            bool dbJa = _lang == 0;
+            var dbMeta = new StringBuilder();
+            if (dbStarted > 0)
+            {
+                string startHM = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)
+                    .AddSeconds(dbStarted).ToLocalTime().ToString("HH:mm");
+                dbMeta.Append(dbJa ? "開始 " : "started ").Append(startHM);
+                dbMeta.Append(" · ").Append(Fmt(dbElapsed));
+            }
+            if (dbElapsed > 0 || dbStarted == 0)
+            {
+                if (dbMeta.Length > 0) dbMeta.Append(" · ");
+                dbMeta.Append(dbActive).Append("/").Append(workers.Count);
+                dbMeta.Append(dbJa ? " lane 稼働中" : " lanes active");
+            }
+            _directiveBandMeta = dbMeta.ToString();
+
+            // Pass the first worker so DirectiveBand can access its goal. [REAL goal]
+            Dictionary<string, object> firstW = workers.Count > 0 ? workers[0] : null;
+            rows.Add(MkRow(6, firstW, null));         // directive band
+        }
         // Tab 0 (All): partition active/queued vs terminal with a divider.
         // Tabs 1-3 are explicit single-criterion views -- no re-partition needed.
         if (_cardFilter == 0)
@@ -2562,6 +2657,9 @@ class CockpitWindow : Window
             case 2: return "HH|" + g;                          // history header (static chrome)
             case 4: return "DV|" + g;                          // "完了 (this run)" divider
             case 5: return "ES|" + g;                          // empty state (static chrome)
+            case 6:                                            // directive band: keyed on first-worker goal + started
+                return "DB|" + g + "|" + (w != null ? S(w, "goal") + "|" + S(w, "name") : "")
+                       + "|tc" + (_toolbarAll.Count) + "|" + _directiveBandMeta;
             case 3:                                            // history row: stable per entry
                 return "h|" + g + "|" + (hist != null ? RuntimeHelpers.GetHashCode(hist) : 0);
             default:                                           // kind 1: worker card
@@ -2653,6 +2751,7 @@ class CockpitWindow : Window
             if (r.Kind == 3) return _w.HistoryRow(r.Hist);
             if (r.Kind == 4) return _w.CompletedDivider();
             if (r.Kind == 5) return _w.EmptyState();
+            if (r.Kind == 6) return _w.DirectiveBand(r.Worker);
             return null;
         }
         public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
@@ -2741,6 +2840,92 @@ class CockpitWindow : Window
         outer.Child = block;
         return outer;
     }
+
+    // TASK 3: Directive band — shown only in the live/active branch, inserted above card list.
+    // Reads goal from the first/primary worker (passed as `firstWorker`).
+    // [REAL goal], [COMPUTED meta] — spec §5a. No fabrication; multi-goal case is honest.
+    UIElement DirectiveBand(Dictionary<string, object> firstWorker)
+    {
+        bool ja = _lang == 0;
+
+        // Gather goal texts from all workers to determine single vs multi-goal.
+        var goalTexts = new List<string>();
+        foreach (Dictionary<string, object> tw in _toolbarAll)
+        {
+            string g = S(tw, "goal");
+            if (!string.IsNullOrEmpty(g) && !goalTexts.Contains(g))
+                goalTexts.Add(g);
+        }
+
+        // Section label: "DIRECTIVE" / "指示" when a single goal; "Goals (N)" / "ゴール (N)" for multiple.
+        bool multiGoal = goalTexts.Count > 1;
+        string sectionLabel = multiGoal
+            ? (ja ? ("ゴール (" + goalTexts.Count + ")") : ("Goals (" + goalTexts.Count + ")"))
+            : (ja ? "指示" : "DIRECTIVE");
+
+        // Goal text: first goal + "(+N more lanes)" indicator for multi-goal.
+        string primaryGoal = goalTexts.Count > 0 ? goalTexts[0] : "";
+        string goalDisplay = primaryGoal;
+        if (multiGoal && goalTexts.Count > 1)
+        {
+            int extras = goalTexts.Count - 1;
+            goalDisplay = primaryGoal + (ja ? (" (他 " + extras + " lane)") : (" (+" + extras + " more lanes)"));
+        }
+
+        // Meta line: "started HH:MM · {elapsed} · {active}/{total} lanes active" [COMPUTED]
+        string metaLine = _directiveBandMeta;
+
+        var outer = new Border();
+        outer.Margin = new Thickness(18, 0, 18, 0);
+        outer.Padding = new Thickness(0, 8, 0, 0);
+        outer.BorderThickness = new Thickness(0, 0, 0, 1);
+        outer.BorderBrush = Theme.Br(Theme.Border(_dark));
+
+        var col = new StackPanel();
+
+        // Section label
+        var lbl = new TextBlock();
+        lbl.Text = sectionLabel;
+        lbl.Foreground = Theme.Br(Theme.Muted(_dark));
+        lbl.FontSize = Theme.FsMeta;
+        lbl.FontWeight = FontWeights.SemiBold;
+        lbl.Margin = new Thickness(0, 0, 0, 4);
+        col.Children.Add(lbl);
+
+        // Separator line
+        var sep = new Border();
+        sep.Height = 1;
+        sep.Background = Theme.Br(Theme.Border(_dark));
+        sep.Margin = new Thickness(0, 0, 0, 6);
+        col.Children.Add(sep);
+
+        // Goal text — show even if empty (no fallback fabrication; empty just shows nothing)
+        if (!string.IsNullOrEmpty(goalDisplay))
+        {
+            var goalTb = new TextBlock();
+            goalTb.Text = goalDisplay;
+            goalTb.Foreground = Theme.Br(Theme.Text(_dark));
+            goalTb.FontSize = Theme.FsBody;
+            goalTb.TextWrapping = TextWrapping.Wrap;
+            goalTb.Margin = new Thickness(0, 0, 0, 4);
+            col.Children.Add(goalTb);
+        }
+
+        // Meta line (started · elapsed · lanes)
+        if (!string.IsNullOrEmpty(metaLine))
+        {
+            var metaTb = new TextBlock();
+            metaTb.Text = metaLine;
+            metaTb.Foreground = Theme.Br(Theme.Muted(_dark));
+            metaTb.FontSize = Theme.FsMeta;
+            metaTb.Margin = new Thickness(0, 0, 0, 8);
+            col.Children.Add(metaTb);
+        }
+
+        outer.Child = col;
+        return outer;
+    }
+
 
     UIElement BuildCardToolbar(List<Dictionary<string, object>> all,
                                List<Dictionary<string, object>> shown)
@@ -3300,7 +3485,7 @@ class CockpitWindow : Window
         meta.Append(name.ToUpper());
         if (turn > 0) meta.Append(" · ").Append(T("turn")).Append(' ').Append(turn);
         if (reviews > 0) meta.Append(" · ").Append(_lang == 0 ? ("確認 " + reviews + " 回") : ("reviewed " + reviews));
-        if (verifiedOk) meta.Append(" · ").Append(_lang == 0 ? "検証OK" : "verified");
+        if (verifiedOk) meta.Append(" · ").Append(_lang == 0 ? "✓ 検証OK" : "✓ verified");
         var ml = new TextBlock {
             Text = meta.ToString(), Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 12,
             Margin = new Thickness(24, 4, 0, 0)
