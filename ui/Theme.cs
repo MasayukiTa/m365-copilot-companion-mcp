@@ -75,6 +75,7 @@ static class Theme
     static readonly Dictionary<string, string> _rail = new Dictionary<string, string>
     {
         { "pending",     "neutral" },
+        { "ready",       "info"    },
         { "waiting",     "info"    },
         { "researching", "info"    },
         { "refuting",    "info"    },
@@ -118,6 +119,7 @@ static class Theme
         switch (canonical)
         {
             case "pending":     return jp ? "空き待ち"   : "Queued";
+            case "ready":       return jp ? "実行中"     : "Running";
             case "waiting":     return jp ? "実行中"     : "Running";
             case "researching": return jp ? "調査中"     : "Researching";
             case "refuting":    return jp ? "確認中"     : "Reviewing";
