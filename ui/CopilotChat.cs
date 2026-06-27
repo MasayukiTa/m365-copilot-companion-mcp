@@ -1061,22 +1061,22 @@ class ChatWindow : Window
     void Set(string key, string hex) { Application.Current.Resources[key] = new SolidColorBrush(C(hex)); }
     void ApplyTheme()
     {
-        if (_dark)
-        {
-            Set("Bg", "#0f172a"); Set("Panel", "#1e293b"); Set("PanelAlt", "#0b1220");
-            Set("Border", "#334155"); Set("Fg", "#e2e8f0"); Set("Muted", "#94a3b8");
-            Set("UserBg", "#334155"); Set("Accent", "#ea580c"); Set("AccentFg", "#ffffff");
-            Set("Hover", "#26ffffff"); Set("Press", "#3dffffff");   // translucent white overlay
-            Set("CodeBg", "#0b1220");
-        }
-        else
-        {
-            Set("Bg", "#ffffff"); Set("Panel", "#f8fafc"); Set("PanelAlt", "#f1f5f9");
-            Set("Border", "#e2e8f0"); Set("Fg", "#0f172a"); Set("Muted", "#64748b");
-            Set("UserBg", "#eef2f7"); Set("Accent", "#ea580c"); Set("AccentFg", "#ffffff");
-            Set("Hover", "#18000000"); Set("Press", "#2b000000");   // translucent black overlay
-            Set("CodeBg", "#f1f5f9");
-        }
+        // Single source of truth: Theme.cs (calm warm-neutral palette, spec Design Tokens).
+        Set("Bg", Theme.Bg(_dark));
+        Set("Panel", Theme.Surface(_dark));
+        Set("PanelAlt", Theme.SurfaceSubtle(_dark));
+        Set("Border", Theme.Border(_dark));
+        Set("BorderStrong", Theme.BorderStrong(_dark));
+        Set("Fg", Theme.Text(_dark));
+        Set("Muted", Theme.Muted(_dark));
+        Set("Faint", Theme.Faint(_dark));
+        Set("UserBg", Theme.SurfaceSubtle(_dark));
+        Set("Accent", Theme.Accent(_dark));
+        Set("AccentSoft", Theme.AccentSoft(_dark));
+        Set("AccentFg", Theme.AccentFg(_dark));
+        Set("Hover", Theme.Hover(_dark));
+        Set("Press", Theme.Press(_dark));
+        Set("CodeBg", Theme.SurfaceSubtle(_dark));
     }
 
     // ── sidebar list with rename / delete ───────────────────────────────────────
