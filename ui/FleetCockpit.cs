@@ -480,15 +480,20 @@ class CockpitWindow : Window
         ctrls.Children.Add(FleetControls());
         // gear -> settings popup consolidating the scattered start/上限/retry/disk-floor controls.
         ctrls.Children.Add(SettingsControl());
-        // Keep these fields non-null (PaintChrome references them) but don't add to ctrls.
+        // Language and theme toggles: 1-click direct icon buttons in the header (frequently used).
+        _langBtn = IconButton("translate", 18);
+        _langBtn.ToolTip = _lang == 0 ? "English / 日本語 切替" : "Toggle language";
+        _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveKey("lang", _lang.ToString()); RebuildChrome(); };
+        ctrls.Children.Add(_langBtn);
+        _themeBtn = IconButton(_dark ? "light_mode" : "dark_mode", 18);
+        _themeBtn.ToolTip = _dark ? "Switch to light mode" : "Switch to dark mode";
+        _themeBtn.Click += delegate { _dark = !_dark; SaveKey("dark", _dark ? "1" : "0"); ApplyTheme(); };
+        ctrls.Children.Add(_themeBtn);
+        // Rare items (open main chat, self-improve) stay in the overflow. Keep fields non-null (PaintChrome references them).
         _mainBtn = IconButton("chat", 18);
         _mainBtn.Click += delegate { OpenMain(); };
         _siBtn = IconButton("account_tree", 18);
         _siBtn.Click += delegate { new SelfImproveDashboardWindow().Show(); };
-        _langBtn = IconButton("translate", 18);
-        _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveKey("lang", _lang.ToString()); RebuildChrome(); };
-        _themeBtn = IconButton(_dark ? "light_mode" : "dark_mode", 18);
-        _themeBtn.Click += delegate { _dark = !_dark; SaveKey("dark", _dark ? "1" : "0"); ApplyTheme(); };
         ctrls.Children.Add(OverflowControl());
         Grid.SetColumn(ctrls, 1); Grid.SetRow(ctrls, 0);
         headRow.Children.Add(ctrls);
@@ -659,14 +664,149 @@ class CockpitWindow : Window
         sectionLbl.Margin = new Thickness(0, 0, 0, 1);
         outer.Children.Add(sectionLbl);
 
+        // ── Check for real phase_events from the primary worker ────────────────────
+        // The primary worker is the first/earliest worker in the workers list.
+        // If phase_events is present and non-empty, render from those (REAL mode).
+        // Otherwise, fall through to the [COMPUTED] turn-timestamp fallback below.
+        bool usingRealEvents = false;
+        var realPhaseEvents = new List<Tuple<string, string, string>>();  // label, timeStr, colorHex
+        if (workers != null && workers.Count > 0)
+        {
+            Dictionary<string, object> primaryWorker = workers[0];
+            object peRaw;
+            if (primaryWorker.TryGetValue("phase_events", out peRaw) && peRaw is object[])
+            {
+                object[] peArr = (object[])peRaw;
+                if (peArr.Length > 0)
+                {
+                    usingRealEvents = true;
+                    foreach (object peObj in peArr)
+                    {
+                        var pe = peObj as Dictionary<string, object>;
+                        if (pe == null) continue;
+                        // ts: epoch double
+                        double peTs = 0;
+                        object peTsRaw;
+                        if (pe.TryGetValue("ts", out peTsRaw) && peTsRaw != null)
+                        {
+                            try { peTs = Convert.ToDouble(peTsRaw); } catch { }
+                        }
+                        // event: the status-key string
+                        string peEvent = "";
+                        object peEventRaw;
+                        if (pe.TryGetValue("event", out peEventRaw) && peEventRaw != null)
+                            peEvent = peEventRaw.ToString();
+                        // label: English fallback from the stored label field
+                        string peFallbackLabel = peEvent;
+                        object peLabelRaw;
+                        if (pe.TryGetValue("label", out peLabelRaw) && peLabelRaw != null)
+                            peFallbackLabel = peLabelRaw.ToString();
+                        // Localized label via Theme.StatusLabel; fall back to stored English label
+                        string localLabel = Theme.StatusLabel(peEvent, _lang);
+                        if (string.IsNullOrEmpty(localLabel) || localLabel == peEvent)
+                        {
+                            // Theme.StatusLabel returns the key itself when unrecognized; use stored fallback
+                            string knownKey = Theme.StatusLabel(peEvent, _lang);
+                            localLabel = (knownKey == peEvent && !string.IsNullOrEmpty(peFallbackLabel))
+                                ? peFallbackLabel : knownKey;
+                        }
+                        string railKind = Theme.StatusRail(peEvent);
+                        string colorHex = Theme.RailColor(railKind, _dark);
+                        string timeStr = "";
+                        if (peTs > 0)
+                        {
+                            try
+                            {
+                                timeStr = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)
+                                    .AddSeconds(peTs).ToLocalTime().ToString("HH:mm");
+                            }
+                            catch { }
+                        }
+                        realPhaseEvents.Add(new Tuple<string, string, string>(localLabel, timeStr, colorHex));
+                    }
+                }
+            }
+        }
+
+        // Sub-label changes based on mode (real vs computed)
         var subLbl = new TextBlock();
-        subLbl.Text = ja ? "(会話ターンから)" : "(from turns)";
+        subLbl.Text = usingRealEvents
+            ? (ja ? "(フェーズ遷移)" : "(phase transitions)")
+            : (ja ? "(会話ターンから)" : "(from turns)");
         subLbl.Foreground = Theme.Br(Theme.Faint(_dark));
         subLbl.FontSize = 9.5;
         subLbl.Margin = new Thickness(0, 0, 0, 8);
         outer.Children.Add(subLbl);
 
-        // ── Derive event timestamps ────────────────────────────────────────────────
+        // ── If real events mode: render from phase_events and skip [COMPUTED] path ─
+        if (usingRealEvents)
+        {
+            for (int i = 0; i < realPhaseEvents.Count; i++)
+            {
+                string evLabel = realPhaseEvents[i].Item1;
+                string evTime  = realPhaseEvents[i].Item2;
+                string evColor = realPhaseEvents[i].Item3;
+                bool isLast = (i == realPhaseEvents.Count - 1);
+                var row = new Grid();
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(18) });
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                var lineAndDot = new StackPanel();
+                lineAndDot.HorizontalAlignment = HorizontalAlignment.Center;
+                if (i > 0)
+                {
+                    var connector = new Border();
+                    connector.Width = 1.5; connector.Height = 8;
+                    connector.Background = Theme.Br(Theme.Border(_dark));
+                    connector.HorizontalAlignment = HorizontalAlignment.Center;
+                    lineAndDot.Children.Add(connector);
+                }
+                var dot = new System.Windows.Shapes.Ellipse();
+                dot.Width = 8; dot.Height = 8;
+                dot.Fill = Theme.Br(evColor);
+                dot.HorizontalAlignment = HorizontalAlignment.Center;
+                dot.Margin = new Thickness(0, i == 0 ? 4 : 0, 0, 0);
+                lineAndDot.Children.Add(dot);
+                if (!isLast)
+                {
+                    var tail = new Border();
+                    tail.Width = 1.5; tail.Height = 8;
+                    tail.Background = Theme.Br(Theme.Border(_dark));
+                    tail.HorizontalAlignment = HorizontalAlignment.Center;
+                    lineAndDot.Children.Add(tail);
+                }
+                Grid.SetColumn(lineAndDot, 0);
+                row.Children.Add(lineAndDot);
+                var labelBlock = new StackPanel();
+                labelBlock.VerticalAlignment = VerticalAlignment.Top;
+                labelBlock.Margin = new Thickness(4, i == 0 ? 2 : 0, 0, 4);
+                var labelTb = new TextBlock();
+                labelTb.Text = evLabel;
+                labelTb.Foreground = Theme.Br(evColor);
+                labelTb.FontSize = 11; labelTb.FontWeight = FontWeights.SemiBold;
+                labelTb.TextTrimming = TextTrimming.CharacterEllipsis;
+                labelBlock.Children.Add(labelTb);
+                if (!string.IsNullOrEmpty(evTime))
+                {
+                    var timeTb = new TextBlock();
+                    timeTb.Text = evTime;
+                    timeTb.Foreground = Theme.Br(Theme.Muted(_dark));
+                    timeTb.FontSize = 10;
+                    labelBlock.Children.Add(timeTb);
+                }
+                Grid.SetColumn(labelBlock, 1);
+                row.Children.Add(labelBlock);
+                outer.Children.Add(row);
+            }
+            var realTag = new TextBlock();
+            realTag.Text = "[REAL]";
+            realTag.Foreground = Theme.Br(Theme.Faint(_dark));
+            realTag.FontSize = 9;
+            realTag.Margin = new Thickness(0, 8, 0, 0);
+            outer.Children.Add(realTag);
+            return outer;
+        }
+
+        // ── [COMPUTED] fallback: derive timestamps from transcript ────────────────
         // Use the first worker in the workers list that has a transcript path.
         string transcriptPath = "";
         if (workers != null)
@@ -1670,12 +1810,19 @@ class CockpitWindow : Window
 
     UIElement BuildOverflowPanel()
     {
+        // Only rare items live here: main chat and self-improve.
+        // Lang/theme are now 1-click icon buttons directly in the header.
         var card = new Border();
-        card.Background = CardBg; card.BorderBrush = Border; card.BorderThickness = new Thickness(1);
-        card.CornerRadius = new CornerRadius(10); card.Padding = new Thickness(6, 6, 6, 6);
-        card.Margin = new Thickness(0, 6, 8, 6); card.MinWidth = 220;
+        card.Background = Theme.Br(Theme.Surface(_dark));
+        card.BorderBrush = Theme.Br(Theme.Border(_dark));
+        card.BorderThickness = new Thickness(1);
+        card.CornerRadius = new CornerRadius(8);
+        card.Padding = new Thickness(4, 4, 4, 4);
+        card.Margin = new Thickness(0, 4, 8, 4);
+        card.MinWidth = 200;
+        // Light, tasteful shadow (no heavy DropShadow; a thin border carries the panel)
         card.Effect = new System.Windows.Media.Effects.DropShadowEffect
-        { BlurRadius = 16, ShadowDepth = 2, Opacity = 0.28, Color = C("#000000") };
+        { BlurRadius = 8, ShadowDepth = 1, Opacity = 0.18, Color = C("#000000") };
 
         var col = new StackPanel();
 
@@ -1686,20 +1833,8 @@ class CockpitWindow : Window
 
         // Item 2: Self-improvement dashboard
         col.Children.Add(OverflowItem(
-            _lang == 0 ? "自己改善" : "Self-improvement",
+            _lang == 0 ? "自己改善ダッシュボード" : "Self-improvement",
             delegate { _overflowPopup.IsOpen = false; new SelfImproveDashboardWindow().Show(); }));
-
-        // Item 3: Theme toggle
-        col.Children.Add(OverflowItem(
-            _lang == 0
-                ? ("テーマ: " + (_dark ? "ダーク→ライト" : "ライト→ダーク"))
-                : ("Theme: " + (_dark ? "dark → light" : "light → dark")),
-            delegate { _overflowPopup.IsOpen = false; _dark = !_dark; SaveKey("dark", _dark ? "1" : "0"); ApplyTheme(); }));
-
-        // Item 4: Language toggle
-        col.Children.Add(OverflowItem(
-            _lang == 0 ? "言語: 日本語→EN" : "Language: EN → 日本語",
-            delegate { _overflowPopup.IsOpen = false; _lang = _lang == 0 ? 1 : 0; SaveKey("lang", _lang.ToString()); RebuildChrome(); }));
 
         card.Child = col;
         return card;
@@ -1708,12 +1843,16 @@ class CockpitWindow : Window
     Button OverflowItem(string label, Action action)
     {
         var b = new Button();
-        b.Content = label; b.Cursor = Cursors.Hand;
-        b.Background = Brushes.Transparent; b.Foreground = Fg;
+        b.Cursor = Cursors.Hand;
+        b.Background = Brushes.Transparent;
+        b.Foreground = Theme.Br(Theme.Muted(_dark));
         b.BorderThickness = new Thickness(0);
-        b.Padding = new Thickness(12, 7, 12, 7);
+        b.Padding = new Thickness(12, 6, 12, 6);
         b.HorizontalContentAlignment = HorizontalAlignment.Left;
-        b.FontSize = 13; b.Template = FlatButtonTemplate();
+        b.FontSize = 13;
+        b.Template = FlatButtonTemplate();
+        // Hover: swap to Text color so the item brightens on hover via FlatButtonTemplate trigger.
+        b.Content = label;
         Action a = action;
         b.Click += delegate { a(); };
         return b;
@@ -3604,8 +3743,10 @@ class CockpitWindow : Window
         return SegFilterButton(label, val, isNeeds, needsCount, false, false);
     }
 
-    // "⋮" kebab button for card secondary actions (terminal/closed). Opens a small Popup with
-    // the given labels/actions. Drawn as three vertical dots (no glyph needed).
+    // "⋮" kebab button for card secondary actions (terminal/closed). Uses a WPF ContextMenu
+    // (not a manual Popup) so it survives the VirtualizingStackPanel recycling its host row
+    // without causing layout/focus loops. A ContextMenu is hosted in its own popup root and
+    // is NOT tied to the visual tree of the virtualized element; it handles detach gracefully.
     UIElement CardKebabBtn(string[] labels, Action[] actions, Dictionary<string, object> w)
     {
         var btn = new Button();
@@ -3626,42 +3767,41 @@ class CockpitWindow : Window
         btn.ToolTip = _lang == 0 ? "その他の操作" : "More actions";
         btn.Template = FlatButtonTemplate();
 
-        var pop = new System.Windows.Controls.Primitives.Popup();
-        pop.PlacementTarget = btn;
-        pop.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom;
-        pop.StaysOpen = false;
-        pop.AllowsTransparency = true;
+        // Build a ContextMenu. Unlike a manual Popup, a ContextMenu lives in its own HwndSource
+        // and does not hold a reference that breaks when the virtualizing container is recycled.
+        var cm = new ContextMenu();
+        cm.Background = Theme.Br(Theme.Surface(_dark));
+        cm.BorderBrush = Theme.Br(Theme.Border(_dark));
+        cm.BorderThickness = new Thickness(1);
+        cm.Padding = new Thickness(2);
 
         string[] lbls = labels;
         Action[] acts = actions;
+        for (int i = 0; i < lbls.Length; i++)
+        {
+            int idx = i;
+            var mi = new MenuItem();
+            mi.Header = lbls[idx];
+            mi.Background = Brushes.Transparent;
+            mi.Foreground = Theme.Br(Theme.Text(_dark));
+            mi.BorderThickness = new Thickness(0);
+            mi.Padding = new Thickness(12, 6, 12, 6);
+            mi.FontSize = 12.5;
+            Action a = acts[idx];
+            mi.Click += delegate (object s2, RoutedEventArgs e2) { a(); };
+            cm.Items.Add(mi);
+        }
+        btn.ContextMenu = cm;
+
         btn.Click += delegate (object s, RoutedEventArgs e)
         {
             e.Handled = true;
-            if (pop.IsOpen) { pop.IsOpen = false; return; }
-            var card2 = new Border();
-            card2.Background = CardBg; card2.BorderBrush = Border; card2.BorderThickness = new Thickness(1);
-            card2.CornerRadius = new CornerRadius(8); card2.Padding = new Thickness(4, 4, 4, 4);
-            card2.Margin = new Thickness(0, 4, 0, 4);
-            card2.Effect = new System.Windows.Media.Effects.DropShadowEffect
-            { BlurRadius = 12, ShadowDepth = 1, Opacity = 0.22, Color = C("#000000") };
-            var col2 = new StackPanel();
-            for (int i = 0; i < lbls.Length; i++)
+            if (btn.ContextMenu != null)
             {
-                int idx = i;
-                var item = new Button();
-                item.Content = lbls[idx]; item.Cursor = Cursors.Hand;
-                item.Background = Brushes.Transparent; item.Foreground = Fg;
-                item.BorderThickness = new Thickness(0);
-                item.Padding = new Thickness(10, 5, 10, 5);
-                item.HorizontalContentAlignment = HorizontalAlignment.Left;
-                item.FontSize = 12.5; item.Template = FlatButtonTemplate();
-                Action a = acts[idx];
-                item.Click += delegate (object s2, RoutedEventArgs e2) { e2.Handled = true; pop.IsOpen = false; a(); };
-                col2.Children.Add(item);
+                btn.ContextMenu.PlacementTarget = btn;
+                btn.ContextMenu.Placement = PlacementMode.Bottom;
+                btn.ContextMenu.IsOpen = true;
             }
-            card2.Child = col2;
-            pop.Child = card2;
-            pop.IsOpen = true;
         };
         // Swallow mouse-up so the kebab click doesn't bubble to the card's open-conversation handler
         btn.PreviewMouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; };
