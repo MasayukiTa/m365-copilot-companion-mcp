@@ -1,9 +1,18 @@
+import os
 import re
 import subprocess
 from datetime import datetime
 from typing import Optional
 
 from .security import require_unlocked
+
+_GATE_ENV = "MCP_REQUIRE_GATE_FOR_SIDE_EFFECTS"
+_PERSISTENT_TRIGGERS = {"onlogon", "onstart"}
+
+
+def _side_effects_gated() -> bool:
+    """Return True when the HITL confirmation gate is active (default on)."""
+    return os.environ.get(_GATE_ENV, "1") == "1"
 
 PREFIX = "m365-copilot-companion-mcp-"
 DAYS = {"MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"}
@@ -74,6 +83,7 @@ def schedule_create(
     command: str,
     trigger: dict,
     description: Optional[str] = None,
+    confirm: bool = False,
 ) -> str:
     """Register a Windows Scheduled Task that runs a command on the given trigger.
 
@@ -92,9 +102,14 @@ def schedule_create(
             {"kind": "once", "datetime": "2026-06-01 14:00"}
             {"kind": "minutes", "every": 15}
             {"kind": "hourly", "every": 2}
-            {"kind": "onlogon"}
-            {"kind": "onstart"}
+            {"kind": "onlogon"}   <- requires confirm=True when gate is active
+            {"kind": "onstart"}   <- requires confirm=True when gate is active
         description: Optional human description (not used by schtasks, kept for self-docs).
+        confirm: Required to be True for onlogon/onstart triggers when
+            MCP_REQUIRE_GATE_FOR_SIDE_EFFECTS=1 (the default). These triggers
+            persist across reboots/logins and execute automatically, making them
+            a significant persistent side effect. Re-call with confirm=True after
+            reviewing the command and trigger. Not required for time-based triggers.
     """
     locked = require_unlocked()
     if locked:
@@ -106,6 +121,16 @@ def schedule_create(
         if "&" in command and ";" not in command:
             # schtasks /TR with shell metacharacters is fragile; warn rather than fail.
             pass
+        # HITL gate: onlogon/onstart tasks persist and run automatically at login/boot.
+        kind = (trigger.get("kind") or "").lower() if isinstance(trigger, dict) else ""
+        if kind in _PERSISTENT_TRIGGERS and _side_effects_gated() and not confirm:
+            return (
+                f"[confirmation required] This will register a persistent scheduled task "
+                f"{full!r} that runs automatically on every {kind}. "
+                f"Command: {command!r}. "
+                "This action persists across reboots. "
+                "Re-call with confirm=True to proceed."
+            )
         args = _build_args(full, command, trigger)
         rc, out, err = _run(args)
         body = (out or "").strip()
