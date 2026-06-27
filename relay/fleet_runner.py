@@ -182,7 +182,7 @@ def _read_goals(args):
 
 
 def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False,
-              ram_floor_mb=0.0):
+              ram_floor_mb=0.0, directive=""):
     from relay.relay_fleet import free_disk_gb
     total = len(workers)        # dynamic: goals can be added mid-run (native chat queue)
     done = sum(1 for w in workers if w.status in TERMINAL)
@@ -207,6 +207,11 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         "free_disk_gb": round(free_disk_gb(), 1),
         # RAM admission reserve (free RAM kept for the user) so the cockpit can show the RAM gate.
         "ram_floor_mb": round(ram_floor_mb),
+        # Fleet-level directive (Bucket B): the single authoritative goal text when this run
+        # was started from exactly one goal; "" when there are multiple independent goals (the
+        # UI already handles multi-goal honestly and should NOT fabricate a summary). Only
+        # populated when there is a genuinely single directive -- never fabricated for multi-goal.
+        "directive": directive,
         "workers": [{
             "name": w.name,
             "goal": w.goal,
@@ -235,6 +240,11 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
             # intact (re-queue via add_goal). Small per goal; safe to include for 100+ workers.
             "checks": getattr(w, "checks", []),
             "cwd": getattr(w, "cwd", None),
+            # Structured per-worker phase timeline (Bucket B): list of
+            # {"ts": <epoch float>, "event": "<status-key>", "label": "<short English label>"}
+            # appended on every status TRANSITION (never duplicated). The UI renders these as
+            # a real (non-fabricated) phase spine -- no agent cooperation or inference needed.
+            "phase_events": list(getattr(w, "phase_events", [])),
         } for w in workers],
     }
 
@@ -465,6 +475,11 @@ def main():
     # display/keying text for each, so dict goals don't break snapshots or result lookup.
     gtexts = [goal_fields(g)[0] for g in goals]
     nverify = sum(1 for g in goals if goal_fields(g)[1])
+    # Fleet-level directive (Bucket B): the single authoritative task description when this
+    # run was started from exactly ONE goal. With multiple independent goals there is no single
+    # directive, so we set it to "" -- the UI handles multi-goal runs honestly and we never
+    # fabricate a summary. Only one goal -> directive = that goal's text.
+    directive = gtexts[0] if len(gtexts) == 1 else ""
 
     os.makedirs(args.state_dir, exist_ok=True)
     status_path = os.path.join(args.state_dir, "status.json")
@@ -536,11 +551,18 @@ def main():
                                 "total": len(goals), "done_count": 0, "running": True,
                                 "max_concurrent": max_conc, "open_tabs": 0,
                                 "avail_mb": round(avail_phys_mb()),
+                                "directive": directive,
                                 "workers": [{"name": "w%d" % i, "goal": gtexts[i],
                                              "status": "pending", "pill": "待機列",
                                              "color": "muted", "outcome": None,
                                              "turn": 0, "max_turns": args.max_turns,
-                                             "reason": "", "closed": False, "last": ""}
+                                             "reason": "", "closed": False, "last": "",
+                                             # initial snapshot: worker is not yet a RelayWorker
+                                             # (no phase_events attribute), so we provide the
+                                             # synthetic "Queued" event manually here.
+                                             "phase_events": [{"ts": started,
+                                                               "event": "pending",
+                                                               "label": "Queued"}]}
                                             for i in range(len(goals))]})
 
     print("fleet: %d goal(s) (%d with acceptance check) -> %s"
@@ -695,7 +717,7 @@ def main():
         try:
             _write_atomic(status_path, _snapshot(workers, started, len(goals), mc_box[0],
                                                  disk_floor_gb=disk_box[0], paused=pause_box[0],
-                                                 ram_floor_mb=ram_box[0]))
+                                                 ram_floor_mb=ram_box[0], directive=directive))
         except Exception:
             pass
         _print_table(workers, len(goals))
@@ -837,6 +859,7 @@ def main():
     done_count = sum(1 for r in results if r["outcome"] == "DONE")
     final = {"started": started, "updated": time.time(), "total": len(goals),
              "done_count": done_count, "running": False, "elapsed_s": elapsed,
+             "directive": directive,
              "workers": [{"name": r["name"], "goal": r["goal"],
                           "status": _ostatus(r["outcome"]),
                           "outcome": r["outcome"], "turn": r["turns"],
@@ -847,7 +870,8 @@ def main():
                           "conv_title": r.get("conv_title", ""),
                           "transcript": r.get("transcript", ""),
                           "cwd": r.get("cwd", ""),
-                          "closed": True, "last": ""} for r in results]}
+                          "closed": True, "last": "",
+                          "phase_events": r.get("phase_events", [])} for r in results]}
     _write_atomic(status_path, final)
     print("\n\n=== fleet complete in %ss ===" % elapsed)
     for r in results:

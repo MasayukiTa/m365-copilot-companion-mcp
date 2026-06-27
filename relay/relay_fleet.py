@@ -461,6 +461,22 @@ def goal_fields(goal):
     return str(goal), [], None
 
 
+_PHASE_LABELS = {
+    "pending":     "Queued",
+    "ready":       "Starting",
+    "waiting":     "Running",
+    "researching": "Researching",
+    "refuting":    "Reviewing",
+    "verifying":   "Verifying",
+    "awaiting":    "Needs input",
+    "done":        "Done",
+    "stuck":       "Needs attention",
+    "maxturns":    "Needs attention",
+    "error":       "Stopped (error)",
+    "cancelled":   "Stopped",
+}
+
+
 class RelayWorker:
     """One conversation running one goal to completion, as a non-blocking machine.
     Starts WITHOUT a tab (status 'pending'); attach() opens one, close() frees it.
@@ -469,7 +485,36 @@ class RelayWorker:
     NOT end the worker -- it moves to the 'verifying' state, where the frame runs the
     checks LOCALLY (acceptance.Check). Pass -> real DONE; fail -> the actual failure is
     re-injected and the agent keeps working, up to max_verify_attempts (then STUCK with
-    outcome VERIFY_FAILED). No checks -> DONE is accepted as before (back-compat)."""
+    outcome VERIFY_FAILED). No checks -> DONE is accepted as before (back-compat).
+
+    Phase spine (Bucket B): every status TRANSITION is recorded in `phase_events` as a
+    structured dict {"ts": <epoch float>, "event": "<status-key>", "label": "<English>"},
+    appended ONLY on change so the list never duplicates. The UI can render a real (non-
+    fabricated) phase timeline from these events. Use the `status` property to set the
+    status field -- it intercepts assignments and auto-records the event."""
+
+    # ── Phase-spine property (Bucket B) ──────────────────────────────────────────
+    # `status` is exposed as a property so every assignment (self.status = "ready")
+    # is intercepted and a phase event is appended ONLY on an actual state CHANGE.
+    # The backing field is `_status`; existing code needs no changes.
+    @property
+    def status(self):
+        return self._status
+
+    @status.setter
+    def status(self, value):
+        prev = getattr(self, "_status", None)
+        self._status = value
+        if value != prev:
+            # phase_events may not exist yet during the very first assignment in __init__
+            # (before self.phase_events is set); guard with getattr so it's safe.
+            evts = getattr(self, "phase_events", None)
+            if evts is not None:
+                evts.append({
+                    "ts": time.time(),
+                    "event": value,
+                    "label": _PHASE_LABELS.get(value, value),
+                })
 
     def __init__(self, goal, name, max_turns=1000, dwell_s=4.0,
                  per_turn_timeout_s=240, max_no_progress=3, max_verify_attempts=3,
@@ -594,6 +639,9 @@ class RelayWorker:
         self.turn = 0
         self.no_progress = 0
         self.last_norm = None
+        # phase_events MUST be initialized before `self.status = PENDING` so the setter
+        # can append the initial "Queued" event immediately on construction.
+        self.phase_events = []
         self.status = PENDING      # pending | ready | waiting | done | stuck | maxturns | error
         self.outcome = None
         self.reason = ""
@@ -1911,5 +1959,9 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
              "transcript": getattr(w, "transcript", "") or "",
              # working dir of the goal -- orchestrators (bench/swe_run_until_done.py)
              # map workers back to instances via this in the FINAL snapshot.
-             "cwd": getattr(w, "cwd", "") or ""}
+             "cwd": getattr(w, "cwd", "") or "",
+             # structured phase timeline (Bucket B): all status transitions this worker went
+             # through, in order. Carried into the final snapshot so the UI can show the
+             # complete phase spine even after the run finishes.
+             "phase_events": list(getattr(w, "phase_events", []))}
             for w in workers]
