@@ -1,4 +1,4 @@
-// FleetCockpit.cs -- native Windows (WPF) LIVE cockpit for parallel execution.
+﻿// FleetCockpit.cs -- native Windows (WPF) LIVE cockpit for parallel execution.
 //
 // relay/fleet_runner.py drives N autonomous Copilot conversations at once and writes a
 // live snapshot to .fleet/status.json after every round-robin sweep. This window tails
@@ -117,6 +117,20 @@ class CockpitWindow : Window
 
     // Cached meta string for the directive-band row Sig (avoids per-tick rebuild when nothing changed).
     string _directiveBandMeta = "";
+
+    // ── A2-2: Evidence Spine (left panel) ────────────────────────────────────────
+    // A fixed-width ~220px left column that shows an [COMPUTED] execution timeline for
+    // the run derived from transcript turn timestamps. Labeled honestly: "実行タイムライン" /
+    // "Execution timeline". Only visible when a run exists (workers present).
+    Border _spinePanel;              // the left column Border; col0 is zeroed when idle
+    ColumnDefinition _spineCol;      // Grid col0 -- we zero its Width when idle
+    string _spineSig = "";           // last rendered state; rebuild only when changed
+
+    // ── A2-2: Composer mode ────────────────────────────────────────────────────────
+    // When a run is active the bottom composer adapts: placeholder, hint, and button
+    // shift from "add goals / Start" to "steer / Send". This bool tracks the last
+    // rendered state so PaintComposerMode is called only when it changes.
+    bool _composerRunActive = false;
 
     // Per-worker disclosure state (Claude-Code-style "> / v"). Collapsed is the default:
     // a collapsed card renders only a lightweight summary line -- no progress quote, no steer
@@ -525,9 +539,338 @@ class CockpitWindow : Window
         _list.ItemContainerStyle = BuildItemContainerStyle();
         _list.ItemTemplate = BuildRowTemplate();
         _list.ItemsSource = _rows;     // bound ONCE; SetRows mutates _rows in place (no Reset)
-        root.Children.Add(_list);
+
+        // A2-2: 2-column Grid: col0 = Evidence Spine (fixed ~220px, collapses to 0 when idle),
+        // col1 = _list (star, unchanged). The spine does NOT scroll with the list.
+        var lanesGrid = new Grid();
+        _spineCol = new ColumnDefinition();
+        _spineCol.Width = new GridLength(0);       // starts hidden (idle); RefreshSpine will open it
+        lanesGrid.ColumnDefinitions.Add(_spineCol);
+        lanesGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+        _spinePanel = new Border();
+        _spinePanel.BorderThickness = new Thickness(0, 0, 1, 0);
+        _spinePanel.Padding = new Thickness(0);
+        Grid.SetColumn(_spinePanel, 0);
+        lanesGrid.Children.Add(_spinePanel);
+
+        Grid.SetColumn(_list, 1);
+        lanesGrid.Children.Add(_list);
+
+        root.Children.Add(lanesGrid);
         Content = root;
         PaintChrome();
+    }
+
+    // A2-2: Refresh the Evidence Spine panel on each tick. Keyed off a signature so the
+    // heavy DOM rebuild (and col-width change) only happens when the run state changes.
+    // Called from OnTick after RenderCards (so _toolbarAll is already up to date).
+    void RefreshSpine(Dictionary<string, object> root, bool idle)
+    {
+        if (_spinePanel == null || _spineCol == null) return;
+
+        // Ensure _toolbarAll reflects current root (it may be empty on first tick before RenderCards).
+        // If _toolbarAll is empty but root has workers, use root's workers directly for the check.
+        bool hasWorkers = false;
+        if (!idle)
+        {
+            if (_toolbarAll != null && _toolbarAll.Count > 0)
+                hasWorkers = true;
+            else if (root != null)
+            {
+                object wo2x;
+                if (root.TryGetValue("workers", out wo2x) && wo2x is object[])
+                    hasWorkers = ((object[])wo2x).Length > 0;
+            }
+        }
+
+        // Build a lightweight signature: started + overall phase + worker count + theme/lang.
+        string overallPhase = "idle";
+        bool runEnded = false;
+        // Collect workers from _toolbarAll or directly from root as fallback.
+        var spineWorkers = new List<Dictionary<string, object>>();
+        if (_toolbarAll != null && _toolbarAll.Count > 0)
+            spineWorkers = _toolbarAll;
+        else if (root != null)
+        {
+            object wox2;
+            if (root.TryGetValue("workers", out wox2) && wox2 is object[])
+                foreach (object ow2 in (object[])wox2)
+                {
+                    var ww2 = ow2 as Dictionary<string, object>;
+                    if (ww2 != null) spineWorkers.Add(ww2);
+                }
+        }
+        if (root != null && hasWorkers)
+        {
+            bool running = !root.ContainsKey("running") || Convert.ToBoolean(root["running"]);
+            runEnded = !running;
+            bool anyAttn = false;
+            bool allDone = true;
+            foreach (Dictionary<string, object> tw in spineWorkers)
+            {
+                string st = S(tw, "status");
+                if (!IsTerminalWorker(tw)) { allDone = false; }
+                if (st == "stuck" || st == "maxturns" || st == "error") anyAttn = true;
+                if (st == "verifying") overallPhase = "verifying";
+                else if ((st == "researching" || st == "refuting" || st == "waiting" || st == "ready")
+                         && overallPhase == "idle") overallPhase = "running";
+            }
+            if (anyAttn) overallPhase = "attn";
+            if (runEnded || allDone) overallPhase = "ended";
+        }
+        string started = root != null ? S(root, "started") : "";
+        string spineSig = (hasWorkers ? "1" : "0") + "|" + started + "|" + overallPhase
+                          + "|" + (_toolbarAll != null ? _toolbarAll.Count : 0)
+                          + "|" + (_dark ? "D" : "L") + _lang;
+        if (spineSig == _spineSig) return;
+        _spineSig = spineSig;
+
+        if (!hasWorkers)
+        {
+            _spineCol.Width = new GridLength(0);
+            _spinePanel.Child = null;
+            return;
+        }
+
+        _spineCol.Width = new GridLength(220);
+        _spinePanel.BorderBrush = Theme.Br(Theme.Border(_dark));
+        _spinePanel.Background = Theme.Br(Theme.Bg(_dark));
+        _spinePanel.Child = BuildSpineContent(root, overallPhase, runEnded, spineWorkers);
+    }
+
+    // Build the spine panel content: section header + vertical [COMPUTED] execution timeline.
+    // Derives events honestly from available data: run started ts, transcript first-turn ts,
+    // current overall phase (polled), run ended state. No fabricated phase_events.
+    UIElement BuildSpineContent(Dictionary<string, object> root, string overallPhase, bool runEnded,
+                                List<Dictionary<string, object>> workers)
+    {
+        bool ja = _lang == 0;
+
+        var outer = new StackPanel();
+        outer.Margin = new Thickness(10, 12, 8, 12);
+
+        // ── Section label ──────────────────────────────────────────────────────────
+        var sectionLbl = new TextBlock();
+        sectionLbl.Text = ja ? "実行タイムライン" : "Execution timeline";
+        sectionLbl.Foreground = Theme.Br(Theme.Muted(_dark));
+        sectionLbl.FontSize = 10.5;
+        sectionLbl.FontWeight = FontWeights.SemiBold;
+        sectionLbl.Margin = new Thickness(0, 0, 0, 1);
+        outer.Children.Add(sectionLbl);
+
+        var subLbl = new TextBlock();
+        subLbl.Text = ja ? "(会話ターンから)" : "(from turns)";
+        subLbl.Foreground = Theme.Br(Theme.Faint(_dark));
+        subLbl.FontSize = 9.5;
+        subLbl.Margin = new Thickness(0, 0, 0, 8);
+        outer.Children.Add(subLbl);
+
+        // ── Derive event timestamps ────────────────────────────────────────────────
+        // Use the first worker in the workers list that has a transcript path.
+        string transcriptPath = "";
+        if (workers != null)
+        {
+            foreach (Dictionary<string, object> tw in workers)
+            {
+                string tp = S(tw, "transcript");
+                if (!string.IsNullOrEmpty(tp) && File.Exists(tp)) { transcriptPath = tp; break; }
+            }
+            if (string.IsNullOrEmpty(transcriptPath) && workers.Count > 0)
+                transcriptPath = S(workers[0], "transcript");
+        }
+
+        // Read meta ts (= "queued") and first turn ts (= "started") from transcript.
+        double metaTs = 0, firstTurnTs = 0;
+        try
+        {
+            if (!string.IsNullOrEmpty(transcriptPath) && File.Exists(transcriptPath))
+            {
+                string[] tlines;
+                using (var fsr = new FileStream(transcriptPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (var sr = new StreamReader(fsr, Encoding.UTF8))
+                    tlines = sr.ReadToEnd().Replace("\r", "").Split('\n');
+                foreach (var tln in tlines)
+                {
+                    if (string.IsNullOrEmpty(tln)) continue;
+                    Dictionary<string, object> obj;
+                    try { obj = _js.DeserializeObject(tln) as Dictionary<string, object>; } catch { continue; }
+                    if (obj == null) continue;
+                    if (obj.ContainsKey("meta") && Convert.ToBoolean(obj["meta"]))
+                    {
+                        if (obj.ContainsKey("ts") && obj["ts"] != null) metaTs = Convert.ToDouble(obj["ts"]);
+                        continue;
+                    }
+                    if (obj.ContainsKey("role") && obj.ContainsKey("ts") && obj["ts"] != null && firstTurnTs == 0)
+                        firstTurnTs = Convert.ToDouble(obj["ts"]);
+                    if (firstTurnTs > 0) break;
+                }
+            }
+        }
+        catch { }
+
+        // Fall back: if meta ts is absent, use root["started"] (epoch, top-level).
+        if (metaTs <= 0 && root != null) metaTs = Dbl(root, "started");
+
+        // ── Helper: format epoch as "HH:mm" ──────────────────────────────────────
+        // C# 5: use a local method-delegate pattern
+        Func<double, string> fmtHM = delegate(double ts)
+        {
+            if (ts <= 0) return "";
+            try
+            {
+                return new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)
+                    .AddSeconds(ts).ToLocalTime().ToString("HH:mm");
+            }
+            catch { return ""; }
+        };
+
+        // ── Build events list ──────────────────────────────────────────────────────
+        // [COMPUTED] Honest markers only: queued/received, started (first turn), now/phase, ended.
+        var events = new List<Tuple<string, string, string>>();
+        // Each tuple: (label, time-string, railColor-hex)
+        string graphite = Theme.Muted(_dark);
+        string live = Theme.Info(_dark);
+        string attn = Theme.Warning(_dark);
+        string ended = Theme.Success(_dark);
+        string danger = Theme.Danger(_dark);
+
+        // Marker 1: Queued / directive received
+        string qLabel = ja ? "投入" : "Queued";
+        string qTime = fmtHM(metaTs);
+        events.Add(new Tuple<string, string, string>(qLabel, qTime, graphite));
+
+        // Marker 2: Started (first turn in transcript)
+        if (firstTurnTs > 0)
+        {
+            string sLabel = ja ? "開始" : "Started";
+            string sTime = fmtHM(firstTurnTs);
+            events.Add(new Tuple<string, string, string>(sLabel, sTime, live));
+        }
+
+        // Marker 3: Current / overall phase (polled; [COMPUTED])
+        if (!runEnded)
+        {
+            string phLabel;
+            string phColor;
+            if (overallPhase == "attn")
+            {
+                phLabel = ja ? "要対応" : "Needs attention";
+                phColor = attn;
+            }
+            else if (overallPhase == "verifying")
+            {
+                phLabel = ja ? "検証中" : "Verifying";
+                phColor = attn;
+            }
+            else if (overallPhase == "running")
+            {
+                phLabel = ja ? "実行中" : "Running";
+                phColor = live;
+            }
+            else
+            {
+                phLabel = ja ? "実行中" : "Running";
+                phColor = live;
+            }
+            string nowTime = fmtHM(NowUnix());
+            events.Add(new Tuple<string, string, string>(phLabel, nowTime, phColor));
+        }
+        else
+        {
+            // Marker 3 (ended): use root["updated"] as the best proxy for end time.
+            double endedTs = root != null ? Dbl(root, "updated") : 0;
+            string eLabel = ja ? "終了" : "Ended";
+            string eTime = fmtHM(endedTs);
+            string eColor = (overallPhase == "attn") ? danger : ended;
+            events.Add(new Tuple<string, string, string>(eLabel, eTime, eColor));
+        }
+
+        // ── Render the vertical timeline ───────────────────────────────────────────
+        for (int i = 0; i < events.Count; i++)
+        {
+            string evLabel = events[i].Item1;
+            string evTime = events[i].Item2;
+            string evColor = events[i].Item3;
+            bool isLast = (i == events.Count - 1);
+
+            var row = new Grid();
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(18) });  // dot + line col
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }); // label col
+
+            // Vertical connector: a thin line above the dot (hidden for first item).
+            var lineAndDot = new StackPanel();
+            lineAndDot.HorizontalAlignment = HorizontalAlignment.Center;
+            if (i > 0)
+            {
+                var connector = new Border();
+                connector.Width = 1.5;
+                connector.Height = 8;
+                connector.Background = Theme.Br(Theme.Border(_dark));
+                connector.HorizontalAlignment = HorizontalAlignment.Center;
+                lineAndDot.Children.Add(connector);
+            }
+
+            // Dot
+            var dot = new System.Windows.Shapes.Ellipse();
+            dot.Width = 8;
+            dot.Height = 8;
+            dot.Fill = Theme.Br(evColor);
+            dot.HorizontalAlignment = HorizontalAlignment.Center;
+            dot.Margin = new Thickness(0, i == 0 ? 4 : 0, 0, 0);
+            lineAndDot.Children.Add(dot);
+
+            // Tail connector below dot (hidden for last item)
+            if (!isLast)
+            {
+                var tail = new Border();
+                tail.Width = 1.5;
+                tail.Height = 8;
+                tail.Background = Theme.Br(Theme.Border(_dark));
+                tail.HorizontalAlignment = HorizontalAlignment.Center;
+                lineAndDot.Children.Add(tail);
+            }
+
+            Grid.SetColumn(lineAndDot, 0);
+            row.Children.Add(lineAndDot);
+
+            // Label + time block
+            var labelBlock = new StackPanel();
+            labelBlock.VerticalAlignment = VerticalAlignment.Top;
+            labelBlock.Margin = new Thickness(4, i == 0 ? 2 : 0, 0, 4);
+
+            var labelTb = new TextBlock();
+            labelTb.Text = evLabel;
+            labelTb.Foreground = Theme.Br(evColor);
+            labelTb.FontSize = 11;
+            labelTb.FontWeight = FontWeights.SemiBold;
+            labelTb.TextTrimming = TextTrimming.CharacterEllipsis;
+            labelBlock.Children.Add(labelTb);
+
+            if (!string.IsNullOrEmpty(evTime))
+            {
+                var timeTb = new TextBlock();
+                timeTb.Text = evTime;
+                timeTb.Foreground = Theme.Br(Theme.Muted(_dark));
+                timeTb.FontSize = 10;
+                labelBlock.Children.Add(timeTb);
+            }
+
+            Grid.SetColumn(labelBlock, 1);
+            row.Children.Add(labelBlock);
+
+            outer.Children.Add(row);
+        }
+
+        // ── [COMPUTED] footer tag ─────────────────────────────────────────────────
+        var tag = new TextBlock();
+        tag.Text = "[COMPUTED]";
+        tag.Foreground = Theme.Br(Theme.Faint(_dark));
+        tag.FontSize = 9;
+        tag.Margin = new Thickness(0, 8, 0, 0);
+        outer.Children.Add(tag);
+
+        return outer;
     }
 
     // ItemContainerStyle: invisible chrome. The ControlTemplate is just a ContentPresenter, so
@@ -614,7 +957,12 @@ class CockpitWindow : Window
                 if (e.Key == Key.Escape) { _gcmdPopup.IsOpen = false; e.Handled = true; return; }
             }
             if (e.Key == Key.Return && (Keyboard.Modifiers & ModifierKeys.Control) != 0)
-            { e.Handled = true; StartFleet(); }
+            {
+                e.Handled = true;
+                // A2-2: Ctrl+Enter steers when a run is active; starts fleet otherwise.
+                if (_composerRunActive) TrySendSteer();
+                else StartFleet();
+            }
         };
         taGrid.Children.Add(_goalInput);
         // short placeholder (spec Fleet: "タスクを入力..."); the "one per line / slash" guidance
@@ -645,7 +993,12 @@ class CockpitWindow : Window
         _startBtn.Cursor = Cursors.Hand; _startBtn.BorderThickness = new Thickness(0);
         _startBtn.Height = Theme.BtnH; _startBtn.MinWidth = 132; _startBtn.FontWeight = FontWeights.SemiBold;
         _startBtn.Margin = new Thickness(8, 0, 0, 0); _startBtn.Padding = new Thickness(16, 0, 16, 0);
-        _startBtn.Click += delegate { StartFleet(); };
+        // A2-2: when a run is active, the button sends a steer instead of starting a fleet.
+        _startBtn.Click += delegate
+        {
+            if (_composerRunActive) TrySendSteer();
+            else StartFleet();
+        };
         btns.Children.Add(_startBtn);
         DockPanel.SetDock(btns, Dock.Right);
         footer.Children.Add(btns);
@@ -768,6 +1121,114 @@ class CockpitWindow : Window
         catch (Exception ex)
         {
             _startNote.Text = (_lang == 0 ? "起動失敗: " : "Failed: ") + ex.Message;
+        }
+    }
+
+    // A2-2: Send a steer from the bottom composer. Parses "W2: ..." prefix to target a specific
+    // worker; otherwise broadcasts to the first running worker (or ALL via broadcast if no live
+    // specific worker is found -- the relay picks the right one). Reuses RequestSteer() exactly
+    // as the per-card SteerRow does: writes {"steer":[{worker,text},...]} into commands.json.
+    void TrySendSteer()
+    {
+        string text = (_goalInput != null ? _goalInput.Text : "").Trim();
+        if (string.IsNullOrEmpty(text)) return;
+        if (!RunIsLive())
+        {
+            if (_startNote != null) _startNote.Text = T("steer_dead");
+            return;
+        }
+
+        // Parse optional "Wx: " / "W0: " / "W10: " prefix for targeted worker routing.
+        string targetWorker = "";
+        string steerText = text;
+        if (text.Length > 2 && (text[0] == 'W' || text[0] == 'w'))
+        {
+            int colonIdx = text.IndexOf(':');
+            if (colonIdx >= 2 && colonIdx <= 4)
+            {
+                string maybeWorker = text.Substring(0, colonIdx).Trim();
+                bool allDigits = true;
+                for (int ci = 1; ci < maybeWorker.Length; ci++)
+                    if (!char.IsDigit(maybeWorker[ci])) { allDigits = false; break; }
+                if (allDigits && maybeWorker.Length >= 2)
+                {
+                    targetWorker = maybeWorker;      // e.g. "W2"
+                    steerText = text.Substring(colonIdx + 1).Trim();
+                }
+            }
+        }
+
+        // If no explicit worker prefix, broadcast to the first non-terminal running worker.
+        if (string.IsNullOrEmpty(targetWorker))
+        {
+            var workers = _toolbarAll ?? new List<Dictionary<string, object>>();
+            foreach (Dictionary<string, object> tw in workers)
+            {
+                string st = S(tw, "status");
+                if (!IsTerminalWorker(tw) && st != "pending")
+                {
+                    targetWorker = S(tw, "name");
+                    break;
+                }
+            }
+            // Still empty: fall back to empty string (relay broadcasts to all workers).
+        }
+
+        RequestSteer(targetWorker, steerText);
+        if (_goalInput != null) _goalInput.Text = "";
+        if (_startNote != null)
+            _startNote.Text = _lang == 0 ? "次のターンに送信しました" : "Queued for the next turn";
+    }
+
+    // A2-2: Paint the composer into either "idle/add-goals" or "active-run/steer" mode.
+    // Only repaints when the mode actually changes (keyed off _composerRunActive).
+    void PaintComposerMode(bool runActive)
+    {
+        if (_composerRunActive == runActive) return;
+        _composerRunActive = runActive;
+
+        bool ja = _lang == 0;
+        if (runActive)
+        {
+            // Active-run mode: steer / intervene surface
+            if (_composerWatermark != null)
+                _composerWatermark.Text = ja
+                    ? "ステア・割り込み...（例: W2: 修正案を確認して）"
+                    : "Steer or intervene... (e.g. W2: check the fix)";
+            if (_composerHint != null)
+                _composerHint.Text = ja
+                    ? "アクティブな実行に送信 ·「/」でコマンド"
+                    : "sent to the active run · '/' for commands";
+            if (_startBtn != null)
+            {
+                _startBtn.Content = ja ? "送信" : "Send";
+                // Use accent color for primary action; same as the idle Start button.
+                _startBtn.Background = Accent;
+                _startBtn.Foreground = White;
+            }
+            if (_folderBtn != null)
+            {
+                // Folder button less prominent while steering
+                _folderBtn.Visibility = Visibility.Collapsed;
+            }
+        }
+        else
+        {
+            // Idle mode: add goals / start
+            if (_composerWatermark != null)
+                _composerWatermark.Text = ja ? "タスクを入力..." : "Add tasks...";
+            if (_composerHint != null)
+                _composerHint.Text = ja ? "1行に1ゴール（複数可） ·「/」でコマンド" : "One goal per line · \"/\" for commands";
+            if (_startBtn != null)
+            {
+                _startBtn.Content = T("start");
+                _startBtn.Background = Accent;
+                _startBtn.Foreground = White;
+            }
+            if (_folderBtn != null)
+            {
+                _folderBtn.Visibility = Visibility.Visible;
+            }
         }
     }
 
@@ -2197,8 +2658,13 @@ class CockpitWindow : Window
     void RebuildChrome()
     {
         string goalText = _goalInput != null ? _goalInput.Text : null;
+        bool prevRunActive = _composerRunActive;
         BuildChrome();
         if (goalText != null && _goalInput != null) _goalInput.Text = goalText;
+        // A2-2: reset spine+composer state after a full chrome rebuild so PaintComposerMode
+        // re-applies the current mode (BuildChrome created fresh controls with idle defaults).
+        _spineSig = "";
+        _composerRunActive = !prevRunActive; // force the guard in PaintComposerMode to fire
         PaintChrome();
         ForceRender();
     }
@@ -2245,6 +2711,9 @@ class CockpitWindow : Window
             _header.Text = "Fleet";
             _sub.Text = "";                // the empty-state block in the body carries the message now
             UpdateWorkerChip(0, false);    // show maxtabs while idle
+            // A2-2: collapse spine and idle composer when no run
+            RefreshSpine(root, true);
+            PaintComposerMode(false);
             string isig = "IDLE" + _history.Count + (_dark ? "D" : "L") + _lang;
             if (_lastSig != isig)
             {
@@ -2273,6 +2742,12 @@ class CockpitWindow : Window
         // opt-in auto-retry runs every tick (before the sig short-circuit) so it catches a
         // stopped goal even when nothing else changed. Bounded by _autoRetryMax per goal text.
         if (runningNow && _autoRetry) AutoRetryScan(root);
+        // A2-2: spine refresh runs every tick (keyed off its own sig, cheap when unchanged).
+        // _toolbarAll is populated by the last RenderCards/BuildRows; for the first tick it may
+        // be empty, but RefreshSpine re-reads workers from root directly so that's fine.
+        // PaintComposerMode: show "steer" surface while run is live.
+        RefreshSpine(root, false);
+        PaintComposerMode(runningNow);
         string sig = Sig(root);
         if (sig == _lastSig) return;
         _lastSig = sig;
