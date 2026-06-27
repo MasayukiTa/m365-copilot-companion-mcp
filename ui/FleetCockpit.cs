@@ -96,6 +96,8 @@ class CockpitWindow : Window
     TextBlock _workerChip;       // live "N workers" neutral chip in the header controls row
     Border _workerChipBorder;   // the Border wrapping _workerChip (for PaintChrome re-theming)
     Button _themeBtn, _langBtn, _mainBtn, _siBtn;
+    Button _overflowBtn;
+    System.Windows.Controls.Primitives.Popup _overflowPopup;
     Border _headBar;
     ListBox _list;                 // virtualizing host for the card/history rows
     // Persistent row backing store. We bind this to _list.ItemsSource ONCE and only ever mutate
@@ -461,22 +463,16 @@ class CockpitWindow : Window
         ctrls.Children.Add(FleetControls());
         // gear -> settings popup consolidating the scattered start/上限/retry/disk-floor controls.
         ctrls.Children.Add(SettingsControl());
+        // Keep these fields non-null (PaintChrome references them) but don't add to ctrls.
         _mainBtn = IconButton("chat", 18);
-        _mainBtn.ToolTip = _lang == 0 ? "メイン (チャット) を開く" : "Open main chat";
         _mainBtn.Click += delegate { OpenMain(); };
-        ctrls.Children.Add(_mainBtn);
         _siBtn = IconButton("account_tree", 18);
-        _siBtn.ToolTip = _lang == 0 ? "自己改善ダッシュボード" : "Self-improvement dashboard";
         _siBtn.Click += delegate { new SelfImproveDashboardWindow().Show(); };
-        ctrls.Children.Add(_siBtn);
         _langBtn = IconButton("translate", 18);
-        _langBtn.ToolTip = "日本語 / English";
         _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveKey("lang", _lang.ToString()); RebuildChrome(); };
-        ctrls.Children.Add(_langBtn);
         _themeBtn = IconButton(_dark ? "light_mode" : "dark_mode", 18);
-        _themeBtn.ToolTip = _lang == 0 ? "テーマ (ダーク/ライト)" : "Theme (dark/light)";
         _themeBtn.Click += delegate { _dark = !_dark; SaveKey("dark", _dark ? "1" : "0"); ApplyTheme(); };
-        ctrls.Children.Add(_themeBtn);
+        ctrls.Children.Add(OverflowControl());
         Grid.SetColumn(ctrls, 1); Grid.SetRow(ctrls, 0);
         headRow.Children.Add(ctrls);
 
@@ -651,6 +647,33 @@ class CockpitWindow : Window
         DockPanel.SetDock(btns, Dock.Right);
         footer.Children.Add(btns);
 
+        // "/" affordance button on the left of the footer hint
+        var slashBtn = new Button();
+        slashBtn.Content = "/"; slashBtn.FontSize = 13; slashBtn.FontWeight = FontWeights.SemiBold;
+        slashBtn.Cursor = Cursors.Hand;
+        slashBtn.BorderThickness = new Thickness(0); slashBtn.Background = Brushes.Transparent;
+        slashBtn.Padding = new Thickness(4, 0, 6, 0); slashBtn.VerticalAlignment = VerticalAlignment.Center;
+        slashBtn.ToolTip = _lang == 0 ? "スラッシュコマンドを入力" : "Type a slash command";
+        slashBtn.Template = FlatButtonTemplate();
+        slashBtn.Click += delegate
+        {
+            if (_goalInput == null) return;
+            // Insert "/" at current line start (or just append if line non-empty without "/")
+            string txt = _goalInput.Text ?? "";
+            int caret = _goalInput.CaretIndex;
+            if (caret > txt.Length) caret = txt.Length;
+            int ls = caret > 0 ? txt.LastIndexOf('\n', caret - 1) + 1 : 0;
+            string line = txt.Substring(ls, caret - ls);
+            if (line.Length == 0 || line[0] != '/')
+            {
+                _goalInput.Text = txt.Substring(0, ls) + "/" + txt.Substring(ls);
+                _goalInput.CaretIndex = ls + 1;
+            }
+            _goalInput.Focus();
+        };
+        DockPanel.SetDock(slashBtn, Dock.Left);
+        footer.Children.Add(slashBtn);
+
         _composerHint = new TextBlock
         {
             Text = _lang == 0 ? "1行に1ゴール（複数可） ·「/」でコマンド" : "One goal per line · \"/\" for commands",
@@ -708,6 +731,25 @@ class CockpitWindow : Window
                 _goalInput.CaretIndex = _goalInput.Text.Length;
                 _startNote.Text = _lang == 0 ? "コマンド一覧を入力欄に表示しました。" : "Command help expanded in the goal box.";
                 return;
+            }
+            // /effort <value> and /approval <value>: apply and clear (don't submit as a goal)
+            if (goals.Count == 1)
+            {
+                string g0 = goals[0];
+                bool handled = false;
+                if (g0.StartsWith("/effort ", StringComparison.OrdinalIgnoreCase))
+                {
+                    string v = g0.Substring(8).Trim().ToLower();
+                    if (v == "min" || v == "max" || v == "ultra" || v == "auto")
+                    { _effort = v; SaveKey("effort", _effort); PaintEffort(); _goalInput.Text = ""; _startNote.Text = (_lang == 0 ? "推論モード→ " : "Effort set to ") + _effort; handled = true; }
+                }
+                else if (g0.StartsWith("/approval ", StringComparison.OrdinalIgnoreCase))
+                {
+                    string v = g0.Substring(10).Trim().ToLower();
+                    if (v == "run" || v == "plan" || v == "auto")
+                    { _approval = v; SaveKey("approval", _approval); PaintApproval(); _goalInput.Text = ""; _startNote.Text = (_lang == 0 ? "承認モード→ " : "Approval set to ") + _approval; handled = true; }
+                }
+                if (handled) return;
             }
 
             bool planMode = _approval == "plan" || _approval == "auto";
@@ -767,6 +809,8 @@ class CockpitWindow : Window
         new[]{"/doc","<対象> の README/説明 を書く"},
         new[]{"/review","<対象> をレビューして問題点を箇条書きで挙げる"},
         new[]{"/research","<問い> を Claude で深掘り調査する"},
+        new[]{"/effort","推論モードを設定: min|max|ultra|auto"},
+        new[]{"/approval","承認モードを設定: run|plan|auto"},
     };
     static readonly string[][] _goalCommandsEn = {
         new[]{"/help","Show the command list"},
@@ -777,6 +821,8 @@ class CockpitWindow : Window
         new[]{"/doc","write the README / docs for <target>"},
         new[]{"/review","review <target> and list the issues as bullets"},
         new[]{"/research","deep-research <question> with Claude"},
+        new[]{"/effort","set reasoning mode: min|max|ultra|auto"},
+        new[]{"/approval","set approval mode: run|plan|auto"},
     };
     // Localized at access time so the slash palette (and the template it inserts) follows the UI language.
     string[][] _goalCommands { get { return _lang == 0 ? _goalCommandsJa : _goalCommandsEn; } }
@@ -831,9 +877,76 @@ class CockpitWindow : Window
         {
             string template = item.Tag as string;
             var sp = item.Content as StackPanel;
-            if (sp != null && sp.Children.Count > 0 && sp.Children[0] is TextBlock
-                && ((TextBlock)sp.Children[0]).Text == "/help")
+            string cmdName = (sp != null && sp.Children.Count > 0 && sp.Children[0] is TextBlock)
+                ? ((TextBlock)sp.Children[0]).Text : "";
+
+            // /help: expand help text inline
+            if (cmdName == "/help")
                 template = GoalHelpText();
+
+            // /effort and /approval: if the current line has an argument, apply it immediately
+            // and clear the line. If no arg, insert the template (prompts for value) instead.
+            if (cmdName == "/effort" || cmdName == "/approval")
+            {
+                int ls2; string line2; CurrentGoalLine(out ls2, out line2);
+                // line2 looks like "/effort" or "/effort max"
+                string[] parts = line2.Trim().Split(new char[]{' '}, 2, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length >= 2)
+                {
+                    string argVal = parts[1].Trim().ToLower();
+                    bool applied = false;
+                    if (cmdName == "/effort")
+                    {
+                        if (argVal == "min" || argVal == "max" || argVal == "ultra" || argVal == "auto")
+                        {
+                            _effort = argVal;
+                            SaveKey("effort", _effort);
+                            PaintEffort();
+                            applied = true;
+                            if (_startNote != null) _startNote.Text = (_lang == 0 ? "推論モード→ " : "Effort set to ") + _effort;
+                        }
+                    }
+                    else  // /approval
+                    {
+                        if (argVal == "run" || argVal == "plan" || argVal == "auto")
+                        {
+                            _approval = argVal;
+                            SaveKey("approval", _approval);
+                            PaintApproval();
+                            applied = true;
+                            if (_startNote != null) _startNote.Text = (_lang == 0 ? "承認モード→ " : "Approval set to ") + _approval;
+                        }
+                    }
+                    if (applied)
+                    {
+                        // Remove the slash-command line from the input
+                        string txt2 = _goalInput.Text ?? "";
+                        int caret2 = _goalInput.CaretIndex;
+                        if (caret2 > txt2.Length) caret2 = txt2.Length;
+                        // Find end of the line (up to next \n or end of string)
+                        int lineEnd = txt2.IndexOf('\n', ls2);
+                        if (lineEnd < 0) lineEnd = txt2.Length;
+                        _goalInput.Text = txt2.Substring(0, ls2) + txt2.Substring(lineEnd);
+                        _goalInput.CaretIndex = ls2;
+                        if (_gcmdPopup != null) _gcmdPopup.IsOpen = false;
+                        _goalInput.Focus();
+                        return;
+                    }
+                }
+                // No valid arg: insert template so user can type the value
+                // template is the description string — instead insert the command name + space
+                int ls3; string line3; CurrentGoalLine(out ls3, out line3);
+                string txt3 = _goalInput.Text ?? ""; int caret3 = _goalInput.CaretIndex;
+                if (caret3 > txt3.Length) caret3 = txt3.Length;
+                string insert = cmdName + " ";
+                _goalInput.Text = txt3.Substring(0, ls3) + insert + txt3.Substring(caret3);
+                _goalInput.CaretIndex = ls3 + insert.Length;
+                if (_gcmdPopup != null) _gcmdPopup.IsOpen = false;
+                _goalInput.Focus();
+                return;
+            }
+
+            // Default: replace current line with the template text
             int ls; string line; CurrentGoalLine(out ls, out line);
             string txt = _goalInput.Text ?? ""; int caret = _goalInput.CaretIndex;
             if (caret > txt.Length) caret = txt.Length;
@@ -1064,6 +1177,82 @@ class CockpitWindow : Window
             _settingsPopup.IsOpen = true;
         };
         return _gearBtn;
+    }
+
+    // Overflow "⋯" button: opens a compact popup listing the four low-frequency header actions.
+    // Built like _settingsPopup: StaysOpen=false, rebuilt fresh on each open.
+    UIElement OverflowControl()
+    {
+        _overflowBtn = new Button();
+        _overflowBtn.Width = 36; _overflowBtn.Height = 30; _overflowBtn.Cursor = Cursors.Hand;
+        _overflowBtn.BorderThickness = new Thickness(1); _overflowBtn.Margin = new Thickness(4, 0, 0, 0);
+        _overflowBtn.ToolTip = _lang == 0 ? "その他のメニュー" : "More options";
+        // Draw three dots as text (no glyph needed; plain text at this size is crisp)
+        _overflowBtn.Content = new TextBlock { Text = "⋯", FontSize = 14,
+            HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+        _overflowPopup = new System.Windows.Controls.Primitives.Popup();
+        _overflowPopup.PlacementTarget = _overflowBtn;
+        _overflowPopup.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom;
+        _overflowPopup.StaysOpen = false;
+        _overflowPopup.AllowsTransparency = true;
+        _overflowBtn.Click += delegate
+        {
+            if (_overflowPopup.IsOpen) { _overflowPopup.IsOpen = false; return; }
+            _overflowPopup.Child = BuildOverflowPanel();
+            _overflowPopup.IsOpen = true;
+        };
+        return _overflowBtn;
+    }
+
+    UIElement BuildOverflowPanel()
+    {
+        var card = new Border();
+        card.Background = CardBg; card.BorderBrush = Border; card.BorderThickness = new Thickness(1);
+        card.CornerRadius = new CornerRadius(10); card.Padding = new Thickness(6, 6, 6, 6);
+        card.Margin = new Thickness(0, 6, 8, 6); card.MinWidth = 220;
+        card.Effect = new System.Windows.Media.Effects.DropShadowEffect
+        { BlurRadius = 16, ShadowDepth = 2, Opacity = 0.28, Color = C("#000000") };
+
+        var col = new StackPanel();
+
+        // Item 1: Open main chat
+        col.Children.Add(OverflowItem(
+            _lang == 0 ? "メインチャットを開く" : "Open main chat",
+            delegate { _overflowPopup.IsOpen = false; OpenMain(); }));
+
+        // Item 2: Self-improvement dashboard
+        col.Children.Add(OverflowItem(
+            _lang == 0 ? "自己改善" : "Self-improvement",
+            delegate { _overflowPopup.IsOpen = false; new SelfImproveDashboardWindow().Show(); }));
+
+        // Item 3: Theme toggle
+        col.Children.Add(OverflowItem(
+            _lang == 0
+                ? ("テーマ: " + (_dark ? "ダーク→ライト" : "ライト→ダーク"))
+                : ("Theme: " + (_dark ? "dark → light" : "light → dark")),
+            delegate { _overflowPopup.IsOpen = false; _dark = !_dark; SaveKey("dark", _dark ? "1" : "0"); ApplyTheme(); }));
+
+        // Item 4: Language toggle
+        col.Children.Add(OverflowItem(
+            _lang == 0 ? "言語: 日本語→EN" : "Language: EN → 日本語",
+            delegate { _overflowPopup.IsOpen = false; _lang = _lang == 0 ? 1 : 0; SaveKey("lang", _lang.ToString()); RebuildChrome(); }));
+
+        card.Child = col;
+        return card;
+    }
+
+    Button OverflowItem(string label, Action action)
+    {
+        var b = new Button();
+        b.Content = label; b.Cursor = Cursors.Hand;
+        b.Background = Brushes.Transparent; b.Foreground = Fg;
+        b.BorderThickness = new Thickness(0);
+        b.Padding = new Thickness(12, 7, 12, 7);
+        b.HorizontalContentAlignment = HorizontalAlignment.Left;
+        b.FontSize = 13; b.Template = FlatButtonTemplate();
+        Action a = action;
+        b.Click += delegate { a(); };
+        return b;
     }
 
     // One labeled −/+ stepper row for the settings panel. label on the left, [− value +] on the right.
@@ -1928,9 +2117,10 @@ class CockpitWindow : Window
         // restyle the header buttons for the theme
         foreach (Button b in new Button[] { _mainBtn, _siBtn, _themeBtn, _langBtn, _gearBtn, _maxMinus, _maxPlus, _autoMinus, _autoPlus })
             if (b != null) { b.Background = BtnBg; b.Foreground = Fg; b.BorderBrush = Border; }
+        if (_overflowBtn != null) { _overflowBtn.Background = BtnBg; _overflowBtn.Foreground = Fg; _overflowBtn.BorderBrush = Border; }
         if (_gearBtn != null) _gearBtn.Content = MakeIcon("settings", 18, Fg);
-        _themeBtn.Content = MakeIcon(_dark ? "light_mode" : "dark_mode", 18, Fg);
-        _langBtn.Content = MakeIcon("translate", 18, Fg);
+        if (_themeBtn != null) _themeBtn.Content = MakeIcon(_dark ? "light_mode" : "dark_mode", 18, Fg);
+        if (_langBtn != null) _langBtn.Content = MakeIcon("translate", 18, Fg);
         if (_maxValue != null) _maxValue.Foreground = Fg;
         if (_autoLbl != null) _autoLbl.Foreground = Muted;
         if (_autoValue != null) _autoValue.Foreground = Fg;
@@ -2602,25 +2792,35 @@ class CockpitWindow : Window
         DockPanel.SetDock(rightCl, Dock.Right);
         dp.Children.Add(rightCl);
 
-        // left: 4 spec tabs (All / Active / Needs input / Done) with count badges
+        // left: 4 spec tabs as a single segmented control container
         var left = new StackPanel(); left.Orientation = Orientation.Horizontal;
         left.VerticalAlignment = VerticalAlignment.Center;
 
-        // Tab 0: All (show total, no badge required but include count)
+        // Segmented container: one rounded Border holding all four tabs side-by-side.
+        var seg = new Border();
+        seg.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+        seg.BorderBrush = Theme.Br(Theme.Border(_dark));
+        seg.BorderThickness = new Thickness(1);
+        seg.CornerRadius = new CornerRadius(6);
+        seg.VerticalAlignment = VerticalAlignment.Center;
+        var segRow = new StackPanel(); segRow.Orientation = Orientation.Horizontal;
+
+        // Build all four tabs; insert thin dividers between them.
         string allLabel = T("flt_all") + " " + cntAll;
-        left.Children.Add(FilterButton(allLabel, 0, false, 0));
-
-        // Tab 1: Active with count
         string activeLabel = T("flt_active") + " " + cntActive;
-        left.Children.Add(FilterButton(activeLabel, 1, false, 0));
-
-        // Tab 2: Needs input with count; warning treatment when selected AND count>0
         string needsLabel = T("flt_needs") + " " + cntNeeds;
-        left.Children.Add(FilterButton(needsLabel, 2, true, cntNeeds));
-
-        // Tab 3: Done with count
         string doneLabel = T("flt_done") + " " + cntDone;
-        left.Children.Add(FilterButton(doneLabel, 3, false, 0));
+
+        segRow.Children.Add(SegFilterButton(allLabel, 0, false, 0, true, false));
+        segRow.Children.Add(SegDivider());
+        segRow.Children.Add(SegFilterButton(activeLabel, 1, false, 0, false, false));
+        segRow.Children.Add(SegDivider());
+        segRow.Children.Add(SegFilterButton(needsLabel, 2, true, cntNeeds, false, false));
+        segRow.Children.Add(SegDivider());
+        segRow.Children.Add(SegFilterButton(doneLabel, 3, false, 0, false, true));
+
+        seg.Child = segRow;
+        left.Children.Add(seg);
 
         // Task 5: only show the summary when there are failures; hide when nothing notable.
         int failTotal = badN + maxN;
@@ -2671,38 +2871,62 @@ class CockpitWindow : Window
         if (_autoRetryCapVal != null) _autoRetryCapVal.Text = _autoRetryMax.ToString();
     }
 
-    // One segmented filter button. The active one gets the subtle-filled treatment; inactive ones
-    // are neutral. `isNeeds` = this is the "Needs input" tab; when it IS selected AND needsCount>0
-    // it uses an amber warning foreground/border instead of the normal active style.
-    Button FilterButton(string label, int val, bool isNeeds, int needsCount)
+    // Thin vertical divider between segmented filter tabs.
+    UIElement SegDivider()
+    {
+        var d = new Border { Width = 1, Background = Theme.Br(Theme.Border(_dark)),
+                             VerticalAlignment = VerticalAlignment.Stretch,
+                             Margin = new Thickness(0, 4, 0, 4) };
+        return d;
+    }
+
+    // One tab button inside the segmented filter container. Active tab gets a Surface-colored
+    // rounded background; inactive tabs are transparent. `isNeeds` + amber treatment preserved.
+    // `isFirst`/`isLast` clip corner radius so the active fill doesn't overflow the container border.
+    Button SegFilterButton(string label, int val, bool isNeeds, int needsCount, bool isFirst, bool isLast)
     {
         var b = new Button();
         b.Content = label; b.Cursor = Cursors.Hand; b.FontSize = 12;
-        b.Padding = new Thickness(10, 3, 10, 3); b.Margin = new Thickness(0, 0, 6, 0);
-        b.BorderThickness = new Thickness(1);
+        b.Padding = new Thickness(10, 5, 10, 5);
+        b.BorderThickness = new Thickness(0);   // no individual border -- container holds the border
         bool active = _cardFilter == val;
+        CornerRadius cr = new CornerRadius(
+            isFirst ? 5 : 0, isLast ? 5 : 0, isLast ? 5 : 0, isFirst ? 5 : 0);
         if (active)
         {
             if (isNeeds && needsCount > 0)
             {
                 // Warning amber: active "Needs input" with items
-                b.Background = BtnBg;
+                b.Background = Theme.Br(Theme.Surface(_dark));
                 b.Foreground = Theme.Br(Theme.Warning(_dark));
-                b.BorderBrush = Theme.Br(Theme.Warning(_dark));
                 b.FontWeight = FontWeights.SemiBold;
             }
             else
             {
-                // Normal active: subtle fill + stronger border
-                b.Background = BtnBg; b.Foreground = Fg;
-                b.BorderBrush = Theme.Br(Theme.BorderStrong(_dark));
+                // Normal active: Surface fill, Fg text, semibold
+                b.Background = Theme.Br(Theme.Surface(_dark));
+                b.Foreground = Fg;
                 b.FontWeight = FontWeights.SemiBold;
             }
         }
         else
         {
-            b.Background = Brushes.Transparent; b.Foreground = Muted; b.BorderBrush = Border;
+            b.Background = Brushes.Transparent;
+            b.Foreground = Muted;
+            b.FontWeight = FontWeights.Normal;
         }
+        // Use flat template so Background is respected (default Aero ignores it)
+        var tmpl = new ControlTemplate(typeof(Button));
+        var bd = new FrameworkElementFactory(typeof(System.Windows.Controls.Border), "Bd");
+        bd.SetValue(System.Windows.Controls.Border.BackgroundProperty, new TemplateBindingExtension(Control.BackgroundProperty));
+        bd.SetValue(System.Windows.Controls.Border.CornerRadiusProperty, cr);
+        var cp2 = new FrameworkElementFactory(typeof(ContentPresenter));
+        cp2.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+        cp2.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
+        cp2.SetValue(ContentPresenter.MarginProperty, new Thickness(0));
+        bd.AppendChild(cp2);
+        tmpl.VisualTree = bd;
+        b.Template = tmpl;
         int v = val;
         b.Click += delegate
         {
@@ -2711,6 +2935,77 @@ class CockpitWindow : Window
             _lastSig = ""; OnTick(null, null);
         };
         return b;
+    }
+
+    // Legacy FilterButton kept as private dead code to avoid breaking references elsewhere.
+    // All callers now use SegFilterButton.
+    Button FilterButton(string label, int val, bool isNeeds, int needsCount)
+    {
+        return SegFilterButton(label, val, isNeeds, needsCount, false, false);
+    }
+
+    // "⋮" kebab button for card secondary actions (terminal/closed). Opens a small Popup with
+    // the given labels/actions. Drawn as three vertical dots (no glyph needed).
+    UIElement CardKebabBtn(string[] labels, Action[] actions, Dictionary<string, object> w)
+    {
+        var btn = new Button();
+        // Draw three vertical dots as geometry
+        var dotsPanel = new StackPanel { Orientation = Orientation.Vertical,
+                                         VerticalAlignment = VerticalAlignment.Center,
+                                         HorizontalAlignment = HorizontalAlignment.Center };
+        for (int i = 0; i < 3; i++)
+        {
+            var dot = new System.Windows.Shapes.Ellipse { Width = 3, Height = 3, Fill = Muted };
+            if (i > 0) dot.Margin = new Thickness(0, 3, 0, 0);
+            dotsPanel.Children.Add(dot);
+        }
+        btn.Content = dotsPanel;
+        btn.Width = 28; btn.Height = 28; btn.Cursor = Cursors.Hand;
+        btn.BorderThickness = new Thickness(0); btn.Background = Brushes.Transparent;
+        btn.Padding = new Thickness(0);
+        btn.ToolTip = _lang == 0 ? "その他の操作" : "More actions";
+        btn.Template = FlatButtonTemplate();
+
+        var pop = new System.Windows.Controls.Primitives.Popup();
+        pop.PlacementTarget = btn;
+        pop.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom;
+        pop.StaysOpen = false;
+        pop.AllowsTransparency = true;
+
+        string[] lbls = labels;
+        Action[] acts = actions;
+        btn.Click += delegate (object s, RoutedEventArgs e)
+        {
+            e.Handled = true;
+            if (pop.IsOpen) { pop.IsOpen = false; return; }
+            var card2 = new Border();
+            card2.Background = CardBg; card2.BorderBrush = Border; card2.BorderThickness = new Thickness(1);
+            card2.CornerRadius = new CornerRadius(8); card2.Padding = new Thickness(4, 4, 4, 4);
+            card2.Margin = new Thickness(0, 4, 0, 4);
+            card2.Effect = new System.Windows.Media.Effects.DropShadowEffect
+            { BlurRadius = 12, ShadowDepth = 1, Opacity = 0.22, Color = C("#000000") };
+            var col2 = new StackPanel();
+            for (int i = 0; i < lbls.Length; i++)
+            {
+                int idx = i;
+                var item = new Button();
+                item.Content = lbls[idx]; item.Cursor = Cursors.Hand;
+                item.Background = Brushes.Transparent; item.Foreground = Fg;
+                item.BorderThickness = new Thickness(0);
+                item.Padding = new Thickness(10, 5, 10, 5);
+                item.HorizontalContentAlignment = HorizontalAlignment.Left;
+                item.FontSize = 12.5; item.Template = FlatButtonTemplate();
+                Action a = acts[idx];
+                item.Click += delegate (object s2, RoutedEventArgs e2) { e2.Handled = true; pop.IsOpen = false; a(); };
+                col2.Children.Add(item);
+            }
+            card2.Child = col2;
+            pop.Child = card2;
+            pop.IsOpen = true;
+        };
+        // Swallow mouse-up so the kebab click doesn't bubble to the card's open-conversation handler
+        btn.PreviewMouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; };
+        return btn;
     }
 
     // The history SECTION HEADER (Clear button + caption). Factored out of the old AppendHistory
@@ -2881,16 +3176,22 @@ class CockpitWindow : Window
         var col = new StackPanel { Margin = new Thickness(14, 11, 14, 11) };
         Grid.SetColumn(col, 1); shell.Children.Add(col);
 
-        // ── line 1: [chevron] [chip] [title .........] [Open] [release/archive] ──
-        var top = new DockPanel();
+        // ── line 1: [chevron] [chip] [title* ........] [Open] [primary action | kebab⋮] ──
+        // Fixed right-action width (~112px) so long titles never collide with actions.
+        var top = new Grid();
+        top.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });  // left: chevron+chip+title
+        top.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(112, GridUnitType.Pixel) }); // right: actions
 
-        var right = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
+        // Right action area (fixed 112px): Open + primary action or kebab.
+        var right = new StackPanel { Orientation = Orientation.Horizontal,
+                                     HorizontalAlignment = HorizontalAlignment.Right,
+                                     VerticalAlignment = VerticalAlignment.Center };
         {
             var openLink = new TextBlock();
             openLink.Text = _lang == 0 ? "開く" : "Open";
             openLink.Foreground = Muted; openLink.FontSize = 12;
             openLink.VerticalAlignment = VerticalAlignment.Center; openLink.Cursor = Cursors.Hand;
-            openLink.Margin = new Thickness(0, 0, 10, 0);
+            openLink.Margin = new Thickness(0, 0, 8, 0);
             openLink.ToolTip = _lang == 0 ? "この会話をメインチャットで開く" : "Open this conversation in the chat";
             string onm = name; string ourl = conv;
             openLink.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; OpenWorker(onm, ourl); };
@@ -2898,43 +3199,38 @@ class CockpitWindow : Window
         }
         if (closed)
         {
-            var rel = new TextBlock { Text = T("released"), Foreground = Muted, FontSize = 12, VerticalAlignment = VerticalAlignment.Center };
-            right.Children.Add(rel);
+            // closed: "解放済" in a tiny kebab (secondary only) — keep Open visible
+            right.Children.Add(CardKebabBtn(new string[] { T("released") }, new Action[] { delegate { } }, w));
         }
         else if (terminal)
         {
-            // finished card -> a working button that moves it to HISTORY client-side.
-            var arch = new Button();
-            arch.Content = new TextBlock { Text = "→ " + T("to_history"), Foreground = Fg, FontSize = 12 };
-            arch.Cursor = Cursors.Hand; arch.BorderThickness = new Thickness(1);
-            arch.Background = BtnBg; arch.BorderBrush = Border; arch.Foreground = Fg;
-            arch.Padding = new Thickness(8, 2, 10, 2);
-            arch.ToolTip = _lang == 0 ? "このカードを履歴へ移動" : "Move this card to history";
-            var wt = w;
-            arch.Click += delegate { ArchiveAndHide(wt); };
-            right.Children.Add(arch);
+            // terminal card: archive/to-history is secondary -> into kebab
+            var wt2 = w;
+            string[] klabels = new string[] { "→ " + T("to_history") };
+            Action[] kactions = new Action[] { delegate { ArchiveAndHide(wt2); } };
+            right.Children.Add(CardKebabBtn(klabels, kactions, w));
         }
         else
         {
+            // running (non-terminal) card: release stays VISIBLE (single-click, never hidden)
             var relBtn = new Button();
             relBtn.Content = MakeReleaseContent();
             relBtn.Cursor = Cursors.Hand; relBtn.BorderThickness = new Thickness(1);
             relBtn.Background = BtnBg; relBtn.BorderBrush = Border; relBtn.Foreground = Fg;
-            relBtn.Padding = new Thickness(8, 2, 10, 2);
+            relBtn.Padding = new Thickness(6, 2, 8, 2);
             relBtn.ToolTip = _lang == 0 ? "このタスクを停止してタブを解放（fleet 停止中ならカードを片付け）"
                                         : "Stop this task and release its tab (clears the card if the fleet is stopped)";
-            string nm = name; var wt = w;
+            string nm = name; var wt2 = w;
             relBtn.Click += delegate {
                 RequestClose(nm);
                 if (_lastRoot != null
                     && (!_lastRoot.ContainsKey("running") || Convert.ToBoolean(_lastRoot["running"]))
                     && (NowUnix() - Dbl(_lastRoot, "updated")) > 8)
-                    ArchiveAndHide(wt);
+                    ArchiveAndHide(wt2);
             };
             right.Children.Add(relBtn);
         }
-        DockPanel.SetDock(right, Dock.Right);
-        top.Children.Add(right);
+        Grid.SetColumn(right, 1); top.Children.Add(right);
 
         // left cluster: chevron + status chip, then the title fills the rest (1 line, ellipsis)
         var left = new DockPanel { LastChildFill = true };
@@ -2949,7 +3245,7 @@ class CockpitWindow : Window
             TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.NoWrap
         };
         left.Children.Add(ht);
-        top.Children.Add(left);
+        Grid.SetColumn(left, 0); top.Children.Add(left);
         col.Children.Add(top);
 
         // ── line 2: latest human-readable progress (the clean `last`, NOT the refuter reason -- a
