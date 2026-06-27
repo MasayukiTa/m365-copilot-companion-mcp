@@ -93,6 +93,8 @@ class CockpitWindow : Window
         "copilot-bridge", "settings.txt");
 
     TextBlock _header, _sub;
+    TextBlock _workerChip;       // live "N workers" neutral chip in the header controls row
+    Border _workerChipBorder;   // the Border wrapping _workerChip (for PaintChrome re-theming)
     Button _themeBtn, _langBtn, _mainBtn, _siBtn;
     Border _headBar;
     ListBox _list;                 // virtualizing host for the card/history rows
@@ -123,7 +125,7 @@ class CockpitWindow : Window
     double _upm = 960;
     Dictionary<string, string> _glyphs = new Dictionary<string, string>();
 
-    // Feature B: terminal-task view filter. 0=all, 1=unfinished only (hide DONE), 2=done only.
+    // 4-tab view filter: 0=All, 1=Active (non-terminal non-pending), 2=Needs input (awaiting), 3=Done.
     int _cardFilter = 0;
 
     // Opt-in, CAPPED auto-retry (default OFF). When on, a newly-stopped non-DONE goal is
@@ -217,10 +219,13 @@ class CockpitWindow : Window
         if (k == "start") return ja ? "並列実行を開始" : "Start parallel run";
         if (k == "goalhint") return ja ? "1行に1ゴール（複数可）・Ctrl+Enter で開始" : "One goal per line · Ctrl+Enter to start";
         if (k == "folder") return ja ? "自律コーディング (フォルダ)" : "Autonomous coding (folder)";
-        // Feature B: view-filter toolbar
+        // Feature B: view-filter toolbar (4-tab spec)
         if (k == "flt_all") return ja ? "すべて" : "All";
+        if (k == "flt_active") return ja ? "実行中" : "Active";
+        if (k == "flt_needs") return ja ? "承認待ち" : "Needs input";
+        if (k == "flt_done") return ja ? "完了" : "Done";
+        // legacy key kept for safety (no longer rendered)
         if (k == "flt_unfinished") return ja ? "未完了のみ" : "Unfinished only";
-        if (k == "flt_done") return ja ? "完了のみ" : "Done only";
         // Feature C: retry
         if (k == "retry") return ja ? "再試行" : "Retry";
         if (k == "retry_all") return ja ? "停止を一括再試行" : "Retry all stopped";
@@ -433,6 +438,22 @@ class CockpitWindow : Window
         ctrls.Orientation = Orientation.Horizontal;
         ctrls.VerticalAlignment = VerticalAlignment.Top;
         ctrls.HorizontalAlignment = HorizontalAlignment.Right;
+
+        // "N workers" neutral info chip (live count updated in OnTick; shows maxtabs until first tick)
+        _workerChip = new TextBlock();
+        _workerChip.FontSize = 12; _workerChip.VerticalAlignment = VerticalAlignment.Center;
+        _workerChip.Margin = new Thickness(0, 0, 12, 0);
+        _workerChip.Padding = new Thickness(10, 3, 10, 3);
+        UpdateWorkerChip(0, false);   // initial paint
+        _workerChipBorder = new Border();
+        _workerChipBorder.Child = _workerChip;
+        _workerChipBorder.BorderThickness = new Thickness(1);
+        _workerChipBorder.CornerRadius = new CornerRadius(Theme.RadSmall);
+        _workerChipBorder.Padding = new Thickness(0);
+        _workerChipBorder.VerticalAlignment = VerticalAlignment.Center;
+        _workerChipBorder.Margin = new Thickness(0, 0, 12, 0);
+        PaintWorkerChipBorder(_workerChipBorder);
+        ctrls.Children.Add(_workerChipBorder);
 
         ctrls.Children.Add(AutoscaleControls());
         ctrls.Children.Add(EffortControl());
@@ -1854,6 +1875,24 @@ class CockpitWindow : Window
         return b;
     }
 
+    // Update the "N workers" chip text.  liveCount = 0 when idle (falls back to maxtabs).
+    // isLive = true when status.json shows an active run (show actual worker count).
+    void UpdateWorkerChip(int liveCount, bool isLive)
+    {
+        if (_workerChip == null) return;
+        int n = isLive ? liveCount : _maxtabs;
+        string label = _lang == 0 ? (n + " タブ") : (n + " workers");
+        _workerChip.Text = label;
+        _workerChip.Foreground = Theme.Br(Theme.Muted(_dark));
+    }
+
+    void PaintWorkerChipBorder(Border b)
+    {
+        if (b == null) return;
+        b.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+        b.BorderBrush = Theme.Br(Theme.Border(_dark));
+    }
+
     void PaintChrome()
     {
         Background = Bg;
@@ -1871,6 +1910,8 @@ class CockpitWindow : Window
         if (_maxValue != null) _maxValue.Foreground = Fg;
         if (_autoLbl != null) _autoLbl.Foreground = Muted;
         if (_autoValue != null) _autoValue.Foreground = Fg;
+        if (_workerChip != null) UpdateWorkerChip(0, false);
+        PaintWorkerChipBorder(_workerChipBorder);
         PaintAutoToggle();
         UpdateAutoEnabled();
         PaintEffort();
@@ -1984,8 +2025,9 @@ class CockpitWindow : Window
                     || (root.ContainsKey("idle") && Convert.ToBoolean(root["idle"]));
         if (idle)
         {
-            _header.Text = T("title");
+            _header.Text = "Fleet";
             _sub.Text = "";                // the empty-state block in the body carries the message now
+            UpdateWorkerChip(0, false);    // show maxtabs while idle
             string isig = "IDLE" + _history.Count + (_dark ? "D" : "L") + _lang;
             if (_lastSig != isig)
             {
@@ -1999,6 +2041,14 @@ class CockpitWindow : Window
             return;
         }
         UpdateHeader(root);                 // live elapsed every tick
+        // Update the "N workers" chip with the actual total worker count each tick.
+        {
+            int wCount = 0;
+            object wo3;
+            if (root.TryGetValue("workers", out wo3) && wo3 is object[])
+                wCount = ((object[])wo3).Length;
+            UpdateWorkerChip(wCount, true);
+        }
         // only archive while the run is LIVE -- otherwise the finished run's final
         // snapshot would re-add cleared tasks every tick (Clear would never stick).
         bool runningNow = !root.ContainsKey("running") || Convert.ToBoolean(root["running"]);
@@ -2091,26 +2141,38 @@ class CockpitWindow : Window
                                  : (root.ContainsKey("elapsed_s") ? Dbl(root, "elapsed_s")
                                     : (updated > 0 && started > 0 ? updated - started : 0));
 
-        _header.Text = T("title") + " — " + done + " / " + total + " " + T("done");
+        // Spec: header is always "Fleet" (product surface name, both languages).
+        _header.Text = "Fleet";
 
-        int maxc = I(root, "max_concurrent");
-        int openTabs = I(root, "open_tabs");
-        int availMb = I(root, "avail_mb");
-        string mem = maxc > 0 ? ("    " + openTabs + "/" + maxc + " " + T("concurrent")
-                     + (availMb > 0 ? "（" + T("freeram") + " " + availMb + "MB・" + T("freed") + "）" : "")) : "";
-        string state = running ? T("running") : T("done");
-        if (running && updated > 0 && (NowUnix() - updated) > 8)
-            state = T("running") + " — " + T("stale");
-        // Live ETA: project remaining work from the throughput observed SO FAR (done/elapsed). This
-        // implicitly tracks concurrency -- when 2 run in parallel, done climbs faster -> rate up ->
-        // ETA drops. Recomputed every tick (and finish-clock uses DateTime.Now), so it's the
-        // "constantly-moving number". Needs >=1 done to have a rate; until then show 計測中.
+        // Compute running/queued/done counts from the workers array.
+        int cntRunning = 0, cntQueued = 0, cntDoneW = 0;
+        object wo2;
+        if (root.TryGetValue("workers", out wo2) && wo2 is object[])
+        {
+            foreach (object ow in (object[])wo2)
+            {
+                var ww = ow as Dictionary<string, object>;
+                if (ww == null) continue;
+                string wst = S(ww, "status");
+                if (IsTerminalWorker(ww)) cntDoneW++;
+                else if (wst == "pending") cntQueued++;
+                else cntRunning++;
+            }
+        }
+
+        // Sub: "N running · M queued · K done" triple + elapsed
+        bool ja2 = _lang == 0;
+        string triple = ja2
+            ? (cntRunning + " 実行中 · " + cntQueued + " 待機 · " + cntDoneW + " 完了")
+            : (cntRunning + " running · " + cntQueued + " queued · " + cntDoneW + " done");
+
+        // Live ETA: project remaining work from the throughput observed SO FAR (done/elapsed).
         string eta = "";
         if (running && total > 0 && done < total)
         {
             if (done > 0 && elapsed > 1.0)
             {
-                double etaS = (total - done) * (elapsed / done);   // remaining / (done/elapsed)
+                double etaS = (total - done) * (elapsed / done);
                 double perH = done / elapsed * 3600.0;
                 eta = "    " + T("eta") + " " + DateTime.Now.AddSeconds(etaS).ToString("HH:mm")
                       + " (" + T("eta_in") + " " + Fmt(etaS) + " · "
@@ -2121,8 +2183,11 @@ class CockpitWindow : Window
                 eta = "    " + T("eta") + " " + T("eta_calc");
             }
         }
-        _sub.Text = state + "    " + T("elapsed") + " " + Fmt(elapsed) + eta + "    " + total + " " + T("goals") + mem;
-        // The subtitle is ellipsis-trimmed at the column edge; expose the full text on hover.
+
+        if (running && updated > 0 && (NowUnix() - updated) > 8)
+            triple = triple + " — " + T("stale");
+
+        _sub.Text = triple + "    " + T("elapsed") + " " + Fmt(elapsed) + eta;
         _sub.ToolTip = _sub.Text;
     }
 
@@ -2197,15 +2262,17 @@ class CockpitWindow : Window
             if (_hiddenKeys.Count > 0 && IsTerminalWorker(w) && _hiddenKeys.Contains(WorkerKey(startedRoot, w)))
                 continue;
             string oc = S(w, "outcome");
-            if (_cardFilter == 1 && oc == "DONE") continue;
-            if (_cardFilter == 2 && oc != "DONE") continue;
+            string st = S(w, "status");
+            // Tab 1 = Active: non-terminal AND not pending (actively working statuses)
+            if (_cardFilter == 1 && (IsTerminalWorker(w) || st == "pending")) continue;
+            // Tab 2 = Needs input: awaiting only
+            if (_cardFilter == 2 && st != "awaiting") continue;
+            // Tab 3 = Done: outcome == DONE
+            if (_cardFilter == 3 && oc != "DONE") continue;
             shown.Add(w);
         }
-        // Feature B: under "unfinished only", group failures together by severity (stable).
-        // Otherwise use the default display order: active worker(s) at the top, queued in the
-        // middle, completed sinking to the bottom (the live work is what the user wants to see).
-        if (_cardFilter == 1) shown = StableBySeverity(shown);
-        else shown = StableByDisplayRank(shown);
+        // All tabs use display-rank order (active->pending->terminal). Tab 0 partitions below.
+        shown = StableByDisplayRank(shown);
 
         // stash for the converter (it rebuilds the toolbar row from these when a container recycles)
         _toolbarAll = workers;
@@ -2220,10 +2287,8 @@ class CockpitWindow : Window
             return rows;
         }
         rows.Add(MkRow(0, null, null));               // toolbar
-        // Default view: the live area shows only ACTIVE/queued work; terminal (done/failed) workers
-        // drop below a "完了 (this run)" divider so the top is just what's running -- they are not
-        // deleted (still inspectable below), only moved out of the active list. Filters 1/2 are
-        // explicit views, so they don't re-partition.
+        // Tab 0 (All): partition active/queued vs terminal with a divider.
+        // Tabs 1-3 are explicit single-criterion views -- no re-partition needed.
         if (_cardFilter == 0)
         {
             var active = new List<Dictionary<string, object>>();
@@ -2466,13 +2531,19 @@ class CockpitWindow : Window
     UIElement BuildCardToolbar(List<Dictionary<string, object>> all,
                                List<Dictionary<string, object>> shown)
     {
+        // Compute per-tab counts from the FULL worker list (not filtered shown).
+        int cntAll = 0, cntActive = 0, cntNeeds = 0, cntDone = 0;
         int doneN = 0, maxN = 0, badN = 0;
         foreach (Dictionary<string, object> w in all)
         {
+            cntAll++;
             string oc = S(w, "outcome");
-            if (oc == "DONE") doneN++;
+            string st = S(w, "status");
+            if (oc == "DONE") { doneN++; cntDone++; }
             else if (oc == "MAXTURNS") maxN++;
             else if (oc == "STUCK" || oc == "ERROR" || oc == "CANCELLED") badN++;
+            if (st == "awaiting") cntNeeds++;
+            if (!IsTerminalWorker(w) && st != "pending") cntActive++;
         }
 
         var bar = new Border();
@@ -2484,19 +2555,12 @@ class CockpitWindow : Window
 
         var dp = new DockPanel();
 
-        // right cluster: [auto-retry toggle (opt-in)] [cap −N+] [bulk retry]
+        // right cluster: bulk MANUAL retry button (one-shot, respects the active filter)
         var rightCl = new StackPanel(); rightCl.Orientation = Orientation.Horizontal;
         rightCl.VerticalAlignment = VerticalAlignment.Center;
 
-        // The auto-retry ON/OFF toggle and the per-goal retry cap (上限) were RELOCATED into the
-        // settings panel (gear popup) to declutter this toolbar. Only the one-shot bulk MANUAL
-        // retry button remains here (it acts on the currently-shown filter, so it belongs inline).
-
-        // bulk MANUAL retry button (one-shot, respects the active filter)
         var retryAll = new Button();
         retryAll.Content = T("retry_all");
-        // Secondary (outline), not a primary orange fill -- this is a recovery action, not the
-        // page's main CTA (that's Start, in the composer).
         retryAll.Background = Brushes.Transparent; retryAll.Foreground = Fg;
         retryAll.BorderThickness = new Thickness(1); retryAll.BorderBrush = Theme.Br(Theme.BorderStrong(_dark));
         retryAll.Padding = new Thickness(12, 4, 12, 4); retryAll.Cursor = Cursors.Hand;
@@ -2514,12 +2578,25 @@ class CockpitWindow : Window
         DockPanel.SetDock(rightCl, Dock.Right);
         dp.Children.Add(rightCl);
 
-        // left: segmented filter buttons + summary + (optional) live-only note
+        // left: 4 spec tabs (All / Active / Needs input / Done) with count badges
         var left = new StackPanel(); left.Orientation = Orientation.Horizontal;
         left.VerticalAlignment = VerticalAlignment.Center;
-        left.Children.Add(FilterButton(T("flt_all"), 0));
-        left.Children.Add(FilterButton(T("flt_unfinished"), 1));
-        left.Children.Add(FilterButton(T("flt_done"), 2));
+
+        // Tab 0: All (show total, no badge required but include count)
+        string allLabel = T("flt_all") + " " + cntAll;
+        left.Children.Add(FilterButton(allLabel, 0, false, 0));
+
+        // Tab 1: Active with count
+        string activeLabel = T("flt_active") + " " + cntActive;
+        left.Children.Add(FilterButton(activeLabel, 1, false, 0));
+
+        // Tab 2: Needs input with count; warning treatment when selected AND count>0
+        string needsLabel = T("flt_needs") + " " + cntNeeds;
+        left.Children.Add(FilterButton(needsLabel, 2, true, cntNeeds));
+
+        // Tab 3: Done with count
+        string doneLabel = T("flt_done") + " " + cntDone;
+        left.Children.Add(FilterButton(doneLabel, 3, false, 0));
 
         var summary = new TextBlock();
         summary.Text = (_lang == 0
@@ -2566,20 +2643,38 @@ class CockpitWindow : Window
         if (_autoRetryCapVal != null) _autoRetryCapVal.Text = _autoRetryMax.ToString();
     }
 
-    // One segmented filter button. The active one gets the accent fill (white text for
-    // contrast); inactive ones are neutral themed. Changing the filter forces a re-render.
-    Button FilterButton(string label, int val)
+    // One segmented filter button. The active one gets the subtle-filled treatment; inactive ones
+    // are neutral. `isNeeds` = this is the "Needs input" tab; when it IS selected AND needsCount>0
+    // it uses an amber warning foreground/border instead of the normal active style.
+    Button FilterButton(string label, int val, bool isNeeds, int needsCount)
     {
         var b = new Button();
         b.Content = label; b.Cursor = Cursors.Hand; b.FontSize = 12;
         b.Padding = new Thickness(10, 3, 10, 3); b.Margin = new Thickness(0, 0, 6, 0);
         b.BorderThickness = new Thickness(1);
-        // Active filter = a quiet subtle-filled tab (stronger border + full text), NOT an orange
-        // block (spec Fleet Status Tabs: no orange tab fill).
-        if (_cardFilter == val)
-        { b.Background = BtnBg; b.Foreground = Fg; b.BorderBrush = Theme.Br(Theme.BorderStrong(_dark)); b.FontWeight = FontWeights.SemiBold; }
+        bool active = _cardFilter == val;
+        if (active)
+        {
+            if (isNeeds && needsCount > 0)
+            {
+                // Warning amber: active "Needs input" with items
+                b.Background = BtnBg;
+                b.Foreground = Theme.Br(Theme.Warning(_dark));
+                b.BorderBrush = Theme.Br(Theme.Warning(_dark));
+                b.FontWeight = FontWeights.SemiBold;
+            }
+            else
+            {
+                // Normal active: subtle fill + stronger border
+                b.Background = BtnBg; b.Foreground = Fg;
+                b.BorderBrush = Theme.Br(Theme.BorderStrong(_dark));
+                b.FontWeight = FontWeights.SemiBold;
+            }
+        }
         else
-        { b.Background = Brushes.Transparent; b.Foreground = Muted; b.BorderBrush = Border; }
+        {
+            b.Background = Brushes.Transparent; b.Foreground = Muted; b.BorderBrush = Border;
+        }
         int v = val;
         b.Click += delegate
         {
@@ -2834,16 +2929,30 @@ class CockpitWindow : Window
         string resultText = !string.IsNullOrEmpty(last) ? last : (terminal || closed ? "" : (_lang == 0 ? "実行中…" : "Working…"));
         if (!string.IsNullOrEmpty(resultText))
         {
+            string resultPrefix = _lang == 0 ? "結果: " : "Result: ";
             var rl = new TextBlock {
-                Text = OneLine(resultText), Foreground = Muted, FontSize = 12.5,
+                Text = resultPrefix + OneLine(resultText), Foreground = Muted, FontSize = 12.5,
                 TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.NoWrap,
                 Margin = new Thickness(24, 5, 0, 0)
             };
             col.Children.Add(rl);
         }
 
-        // ── line 3: meta -- worker name · turn · reviews · verified ──
-        var meta = new StringBuilder(name.ToUpper());
+        // ── line 3: meta -- [elapsed] · worker name · turn · reviews · verified ──
+        // Per-card elapsed: the transcript jsonl meta line carries "ts" (epoch) = file creation
+        // time (when the worker was queued). We compute elapsed from that to now.
+        var meta = new StringBuilder();
+        string transcriptPath = S(w, "transcript");
+        double startTs = ReadTranscriptStartTs(transcriptPath);
+        if (startTs > 0)
+        {
+            double cardElapsed = NowUnix() - startTs;
+            if (cardElapsed > 0)
+            {
+                meta.Append(Fmt(cardElapsed)).Append(" · ");
+            }
+        }
+        meta.Append(name.ToUpper());
         if (turn > 0) meta.Append(" · ").Append(T("turn")).Append(' ').Append(turn);
         if (reviews > 0) meta.Append(" · ").Append(_lang == 0 ? ("確認 " + reviews + " 回") : ("reviewed " + reviews));
         if (verifiedOk) meta.Append(" · ").Append(_lang == 0 ? "検証OK" : "verified");
@@ -2883,7 +2992,8 @@ class CockpitWindow : Window
     // Expanded-card tab group (spec): Overview default; raw transcript/refuter/internal fields live
     // behind Conversation/Review/Logs instead of all dumping onto the surface. Clicking a tab flips
     // panel visibility in place (no re-render needed); the choice is remembered in _cardTab.
-    UIElement BuildCardTabs(Dictionary<string, object> w, string name, string goal, string last, string reason, bool terminal)
+    UIElement BuildCardTabs(Dictionary<string, object> w, string name, string goal, string last,
+                            string reason, bool terminal)
     {
         int sel = _cardTab.ContainsKey(name) ? _cardTab[name] : 0;
         string outcome = S(w, "outcome");
@@ -2895,7 +3005,7 @@ class CockpitWindow : Window
         var wrap = new StackPanel { Margin = new Thickness(24, 12, 0, 2) };
 
         var panels = new UIElement[] {
-            TabOverview(goal, last, outcome, terminal, reviews, verifiedOk),
+            TabOverview(goal, last, outcome, terminal, reviews, verifiedOk, tpath, w),
             TabConversation(tpath),
             TabReview(reason, done, terminal, reviews),
             TabLogs(w, reason)
@@ -2960,7 +3070,8 @@ class CockpitWindow : Window
         return t;
     }
 
-    UIElement TabOverview(string goal, string last, string outcome, bool terminal, int reviews, bool verifiedOk)
+    UIElement TabOverview(string goal, string last, string outcome, bool terminal, int reviews,
+                          bool verifiedOk, string tpath, Dictionary<string, object> w)
     {
         var sp = new StackPanel();
         sp.Children.Add(SectLabel(_lang == 0 ? "結果" : "Result"));
@@ -2980,9 +3091,137 @@ class CockpitWindow : Window
                 sp.Children.Add(new TextBlock { Text = "・" + c, Foreground = Muted, FontSize = 12.5, Margin = new Thickness(0, 1, 0, 1) });
         }
 
+        // ── Timeline section ──────────────────────────────────────────────────────
+        // Events are derived from available data; timestamps come from the transcript jsonl
+        // "ts" field (epoch float). Each line: {"meta":true,"ts":...} or {"role":..., "ts":...}.
+        sp.Children.Add(SectLabel(_lang == 0 ? "タイムライン" : "Timeline"));
+        var tsEvents = BuildTimelineEvents(tpath, outcome, terminal, reviews);
+        foreach (string ev in tsEvents)
+            sp.Children.Add(new TextBlock {
+                Text = "・" + ev, Foreground = Muted, FontSize = 12,
+                Margin = new Thickness(0, 1, 0, 1), TextWrapping = TextWrapping.Wrap });
+
         sp.Children.Add(SectLabel(_lang == 0 ? "指示" : "Goal"));
         sp.Children.Add(RoText(goal, Muted, 12.5));
         return sp;
+    }
+
+    // Build the ordered event list for the Timeline section. Reads the transcript jsonl to
+    // extract real "ts" (epoch) timestamps. Each entry already has "ts" on every line
+    // (meta line + every user/assistant turn). Returns a list of display strings.
+    List<string> BuildTimelineEvents(string tpath, string outcome, bool terminal, int reviews)
+    {
+        bool ja = _lang == 0;
+        // Try to read ts values from the transcript: meta ts = queued/started, first user turn ts.
+        double metaTs = 0, firstTurnTs = 0;
+        bool hasTs = false;
+        try
+        {
+            if (!string.IsNullOrEmpty(tpath) && File.Exists(tpath))
+            {
+                string[] lines;
+                using (var fsr = new FileStream(tpath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (var sr = new StreamReader(fsr, Encoding.UTF8))
+                    lines = sr.ReadToEnd().Replace("\r", "").Split('\n');
+                foreach (var ln in lines)
+                {
+                    if (string.IsNullOrEmpty(ln)) continue;
+                    Dictionary<string, object> obj;
+                    try { obj = _js.DeserializeObject(ln) as Dictionary<string, object>; } catch { continue; }
+                    if (obj == null) continue;
+                    // meta line
+                    if (obj.ContainsKey("meta") && Convert.ToBoolean(obj["meta"]))
+                    {
+                        if (obj.ContainsKey("ts") && obj["ts"] != null)
+                        { metaTs = Convert.ToDouble(obj["ts"]); hasTs = true; }
+                        continue;
+                    }
+                    // first turn line (role present, ts present)
+                    if (obj.ContainsKey("role") && obj.ContainsKey("ts") && obj["ts"] != null)
+                    {
+                        if (firstTurnTs == 0)
+                            firstTurnTs = Convert.ToDouble(obj["ts"]);
+                        // we only need the first turn ts; stop after finding it
+                        if (firstTurnTs > 0) break;
+                    }
+                }
+            }
+        }
+        catch { }
+
+        var evs = new List<string>();
+        // Helper: format a unix epoch as "HH:mm" if we have it.
+        // Returns "" when ts==0 (no timestamp available).
+        // C# 5: no local functions -> use a Func delegate
+        Func<double, string> fmtTs = delegate(double ts)
+        {
+            if (ts <= 0) return "";
+            try
+            {
+                var dt = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(ts).ToLocalTime();
+                return dt.ToString("HH:mm") + " ";
+            }
+            catch { return ""; }
+        };
+
+        // Event 1: Queued (meta ts = file creation = worker was queued)
+        string queuedTs = hasTs ? fmtTs(metaTs) : "";
+        evs.Add(queuedTs + (ja ? "投入" : "Queued"));
+
+        // Event 2: Started (first turn ts = actual first interaction)
+        string startTs = (firstTurnTs > 0) ? fmtTs(firstTurnTs) : "";
+        evs.Add(startTs + (ja ? "開始" : "Started"));
+
+        // Event 3: Reviewed (if verify_attempts > 0)
+        if (reviews > 0)
+            evs.Add(ja ? ("レビュー (" + reviews + "x)") : ("Reviewed (" + reviews + "x)"));
+
+        // Event 4: terminal outcome
+        if (terminal)
+        {
+            string outcomeEv;
+            switch (outcome)
+            {
+                case "DONE":      outcomeEv = ja ? "完了" : "Completed"; break;
+                case "MAXTURNS":  outcomeEv = ja ? "ターン上限" : "Max turns reached"; break;
+                case "STUCK":     outcomeEv = ja ? "停滞" : "Stuck"; break;
+                case "ERROR":     outcomeEv = ja ? "エラー" : "Error"; break;
+                case "CANCELLED": outcomeEv = ja ? "停止" : "Cancelled"; break;
+                default:          outcomeEv = string.IsNullOrEmpty(outcome) ? (ja ? "終了" : "Ended") : outcome; break;
+            }
+            evs.Add(outcomeEv);
+        }
+
+        return evs;
+    }
+
+    // Read the "ts" of the first turn in the transcript (meta or first role line) to compute
+    // per-card elapsed. Returns 0 if no transcript or no ts field found.
+    double ReadTranscriptStartTs(string tpath)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(tpath) || !File.Exists(tpath)) return 0;
+            string[] lines;
+            using (var fsr = new FileStream(tpath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var sr = new StreamReader(fsr, Encoding.UTF8))
+                lines = sr.ReadToEnd().Replace("\r", "").Split('\n');
+            foreach (var ln in lines)
+            {
+                if (string.IsNullOrEmpty(ln)) continue;
+                Dictionary<string, object> obj;
+                try { obj = _js.DeserializeObject(ln) as Dictionary<string, object>; } catch { continue; }
+                if (obj == null) continue;
+                // meta line has "ts" -- this is the best proxy for "worker was queued"
+                if (obj.ContainsKey("meta") && Convert.ToBoolean(obj["meta"]))
+                {
+                    if (obj.ContainsKey("ts") && obj["ts"] != null)
+                        return Convert.ToDouble(obj["ts"]);
+                }
+            }
+        }
+        catch { }
+        return 0;
     }
 
     UIElement TabConversation(string tpath)
