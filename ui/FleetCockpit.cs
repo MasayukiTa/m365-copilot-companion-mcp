@@ -2296,10 +2296,11 @@ class CockpitWindow : Window
                 var sb = new StringBuilder("c|");
                 sb.Append(g).Append('|').Append(nm)
                   .Append(S(w, "status")).Append(S(w, "turn")).Append(S(w, "outcome"));
-                // only an EXPANDED card shows live progress text, so only then does `last` length
-                // matter; a collapsed card stays put while its worker streams (no thrash).
-                if (_expanded.Contains(nm)) sb.Append("#E").Append((S(w, "last")).Length);
-                else sb.Append("#x");
+                // The collapsed card now shows a result line + meta (turn/reviews/verified), so its
+                // signature must track `last`/reviews/verified too -- otherwise the at-a-glance line
+                // would freeze while the worker streams. Length-only keeps it cheap.
+                sb.Append(_expanded.Contains(nm) ? "#E" : "#C")
+                  .Append((S(w, "last")).Length).Append(':').Append(S(w, "verify_attempts")).Append(S(w, "verified"));
                 return sb.ToString();
         }
     }
@@ -2452,7 +2453,10 @@ class CockpitWindow : Window
         // bulk MANUAL retry button (one-shot, respects the active filter)
         var retryAll = new Button();
         retryAll.Content = T("retry_all");
-        retryAll.Background = Accent; retryAll.Foreground = White; retryAll.BorderThickness = new Thickness(0);
+        // Secondary (outline), not a primary orange fill -- this is a recovery action, not the
+        // page's main CTA (that's Start, in the composer).
+        retryAll.Background = Brushes.Transparent; retryAll.Foreground = Fg;
+        retryAll.BorderThickness = new Thickness(1); retryAll.BorderBrush = Theme.Br(Theme.BorderStrong(_dark));
         retryAll.Padding = new Thickness(12, 4, 12, 4); retryAll.Cursor = Cursors.Hand;
         retryAll.FontSize = 12; retryAll.FontWeight = FontWeights.SemiBold;
         retryAll.Margin = new Thickness(10, 0, 0, 0);
@@ -2528,10 +2532,12 @@ class CockpitWindow : Window
         b.Content = label; b.Cursor = Cursors.Hand; b.FontSize = 12;
         b.Padding = new Thickness(10, 3, 10, 3); b.Margin = new Thickness(0, 0, 6, 0);
         b.BorderThickness = new Thickness(1);
+        // Active filter = a quiet subtle-filled tab (stronger border + full text), NOT an orange
+        // block (spec Fleet Status Tabs: no orange tab fill).
         if (_cardFilter == val)
-        { b.Background = Accent; b.Foreground = White; b.BorderBrush = Accent; b.FontWeight = FontWeights.SemiBold; }
+        { b.Background = BtnBg; b.Foreground = Fg; b.BorderBrush = Theme.Br(Theme.BorderStrong(_dark)); b.FontWeight = FontWeights.SemiBold; }
         else
-        { b.Background = BtnBg; b.Foreground = Fg; b.BorderBrush = Border; }
+        { b.Background = Brushes.Transparent; b.Foreground = Muted; b.BorderBrush = Border; }
         int v = val;
         b.Click += delegate
         {
@@ -2617,7 +2623,8 @@ class CockpitWindow : Window
             DockPanel.SetDock(chev, Dock.Left);
             dp.Children.Add(chev);
         }
-        var pill = Pill(StatusLabel(status), ck);
+        string hcanon = status == "ready" ? "waiting" : status;
+        var pill = Pill(Theme.StatusLabel(hcanon, _lang), Theme.StatusRail(hcanon));
         pill.Margin = new Thickness(0, 0, 10, 0);
         DockPanel.SetDock(pill, Dock.Left);
         dp.Children.Add(pill);
@@ -2672,77 +2679,68 @@ class CockpitWindow : Window
     {
         string name = S(w, "name");
         string goal = S(w, "goal");
-        string status = S(w, "status");
+        string rawStatus = S(w, "status");
+        string status = rawStatus == "ready" ? "waiting" : rawStatus;   // canonical (runner emits fine states)
         string reason = S(w, "reason");
         string last = S(w, "last");
         string conv = S(w, "conv_url");
         string convTitle = S(w, "conv_title");
         int turn = I(w, "turn");
+        int reviews = I(w, "verify_attempts");
+        bool verifiedOk = string.Equals(S(w, "verified"), "True", StringComparison.OrdinalIgnoreCase);
         bool closed = string.Equals(S(w, "closed"), "True", StringComparison.OrdinalIgnoreCase);
         bool terminal = status == "done" || status == "stuck" || status == "maxturns"
                         || status == "error" || status == "cancelled";
+        bool isOpen = _expanded.Contains(name);
 
-        string ck = ColorKey(status);
-        Color sc = StatusColor(ck);
+        string railKind = closed ? "neutral" : Theme.StatusRail(status);
+        Brush statusBrush = Theme.Br(Theme.RailColor(railKind, _dark));
 
+        // Outer card: a plain surface with a thin border and a 3px status RAIL on the left.
+        // No status fill / tint anywhere (spec): the rail + chip carry the meaning, so a successful
+        // card never looks like a green alert block.
         var card = new Border();
         card.Tag = name;                // lets a chevron toggle find & replace just this card
-        card.BorderThickness = new Thickness(1.4);
-        card.CornerRadius = new CornerRadius(12);
-        card.Padding = new Thickness(18, 13, 16, 13);
-        card.Margin = new Thickness(8, 7, 8, 7);
-        if (ck == "muted")
-        {
-            card.BorderBrush = Border; card.Background = CardBg;
-        }
-        else
-        {
-            // soft frame + faint tint -- never a harsh fill
-            card.BorderBrush = new SolidColorBrush(Mix(sc, BgColor(), 0.55));
-            card.Background = new SolidColorBrush(Mix(sc, CardColor(), 0.10));
-        }
+        card.BorderThickness = new Thickness(1);
+        card.CornerRadius = new CornerRadius(Theme.RadCard);
+        card.BorderBrush = Border; card.Background = CardBg;
+        card.Margin = new Thickness(8, Theme.CardGap / 2, 8, Theme.CardGap / 2);
 
-        var col = new StackPanel();
+        var shell = new Grid();
+        shell.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });   // rail
+        shell.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        var rail = new Border { Width = Theme.RailW, CornerRadius = new CornerRadius(2),
+                                Background = statusBrush, Margin = new Thickness(0, 2, 0, 2) };
+        Grid.SetColumn(rail, 0); shell.Children.Add(rail);
 
-        // top row: [name] [pill] [dots] ........... [turn] [release]
+        var col = new StackPanel { Margin = new Thickness(14, 11, 14, 11) };
+        Grid.SetColumn(col, 1); shell.Children.Add(col);
+
+        // ── line 1: [chevron] [chip] [title .........] [Open] [release/archive] ──
         var top = new DockPanel();
 
-        // right cluster first (DockPanel right docks)
-        var right = new StackPanel(); right.Orientation = Orientation.Horizontal;
-        right.HorizontalAlignment = HorizontalAlignment.Right;
-        // Explicit, VISIBLE "open in chat" affordance. The whole card is clickable but that reads
-        // as plain text (the only hint was a tooltip), so opening the conversation was undiscoverable.
+        var right = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
         {
             var openLink = new TextBlock();
             openLink.Text = _lang == 0 ? "▶ 開く" : "▶ Open";
             openLink.Foreground = Accent; openLink.FontSize = 12; openLink.FontWeight = FontWeights.SemiBold;
             openLink.VerticalAlignment = VerticalAlignment.Center; openLink.Cursor = Cursors.Hand;
-            openLink.Margin = new Thickness(0, 0, 12, 0);
+            openLink.Margin = new Thickness(0, 0, 10, 0);
             openLink.ToolTip = _lang == 0 ? "この会話をメインチャットで開く" : "Open this conversation in the chat";
             string onm = name; string ourl = conv;
             openLink.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; OpenWorker(onm, ourl); };
             right.Children.Add(openLink);
         }
-        var turns = new TextBlock();
-        turns.Text = T("turn") + " " + turn;
-        turns.Foreground = Muted; turns.FontSize = 12;
-        turns.VerticalAlignment = VerticalAlignment.Center;
-        turns.Margin = new Thickness(0, 0, 10, 0);
-        right.Children.Add(turns);
         if (closed)
         {
-            var rel = new TextBlock();
-            rel.Text = T("released");
-            rel.Foreground = Muted; rel.FontSize = 12; rel.VerticalAlignment = VerticalAlignment.Center;
+            var rel = new TextBlock { Text = T("released"), Foreground = Muted, FontSize = 12, VerticalAlignment = VerticalAlignment.Center };
             right.Children.Add(rel);
         }
         else if (terminal)
         {
-            // finished card -> a working button that moves it to HISTORY client-side (the old
-            // "解放済" text was a dead end; this needs no live fleet).
+            // finished card -> a working button that moves it to HISTORY client-side.
             var arch = new Button();
-            var al = new TextBlock { Text = "→ " + T("to_history"), Foreground = Fg, FontSize = 12 };
-            arch.Content = al;
+            arch.Content = new TextBlock { Text = "→ " + T("to_history"), Foreground = Fg, FontSize = 12 };
             arch.Cursor = Cursors.Hand; arch.BorderThickness = new Thickness(1);
             arch.Background = BtnBg; arch.BorderBrush = Border; arch.Foreground = Fg;
             arch.Padding = new Thickness(8, 2, 10, 2);
@@ -2763,8 +2761,6 @@ class CockpitWindow : Window
             string nm = name; var wt = w;
             relBtn.Click += delegate {
                 RequestClose(nm);
-                // No live fleet to consume the close command (status went stale) -> clear it now so
-                // a frozen worker (e.g. a verifying tab left by a stopped run) doesn't stick forever.
                 if (_lastRoot != null
                     && (!_lastRoot.ContainsKey("running") || Convert.ToBoolean(_lastRoot["running"]))
                     && (NowUnix() - Dbl(_lastRoot, "updated")) > 8)
@@ -2775,34 +2771,45 @@ class CockpitWindow : Window
         DockPanel.SetDock(right, Dock.Right);
         top.Children.Add(right);
 
-        // left cluster: [chevron] name + pill (+ dots when running)
-        var left = new StackPanel(); left.Orientation = Orientation.Horizontal;
-        bool isOpen = _expanded.Contains(name);
-        left.Children.Add(ChevronToggle(name, isOpen));
-        var nm2 = new TextBlock();
-        nm2.Text = name.ToUpper();
-        nm2.Foreground = Accent; nm2.FontWeight = FontWeights.Bold; nm2.FontSize = 13;
-        nm2.VerticalAlignment = VerticalAlignment.Center; nm2.Margin = new Thickness(0, 0, 10, 0);
-        left.Children.Add(nm2);
-        left.Children.Add(Pill(StatusLabel(status), ck));
-        if (status == "waiting") left.Children.Add(Dots());
+        // left cluster: chevron + status chip, then the title fills the rest (1 line, ellipsis)
+        var left = new DockPanel { LastChildFill = true };
+        var chev = ChevronToggle(name, isOpen); DockPanel.SetDock(chev, Dock.Left); left.Children.Add(chev);
+        var chip = Pill(Theme.StatusLabel(status, _lang), railKind);
+        chip.Margin = new Thickness(2, 0, 10, 0);
+        DockPanel.SetDock(chip, Dock.Left); left.Children.Add(chip);
+        string headline = CardTitle(convTitle, goal);
+        var ht = new TextBlock {
+            Text = headline, Foreground = Fg, FontSize = 13.5, FontWeight = FontWeights.SemiBold,
+            VerticalAlignment = VerticalAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.NoWrap
+        };
+        left.Children.Add(ht);
         top.Children.Add(left);
-
         col.Children.Add(top);
 
-        // Concise headline title (Copilot conv_title if captured, else derived from the goal) --
-        // ALWAYS shown so the card stays readable. The long goal text only appears when expanded,
-        // so a wall of issue text never wrecks visibility (the reported problem).
-        string headline = CardTitle(convTitle, goal);
-        if (!string.IsNullOrEmpty(headline))
+        // ── line 2: latest human-readable progress (the clean `last`, NOT the refuter reason -- a
+        // DONE card must never surface "REFUTED" as its result). Hidden when there's nothing to say. ──
+        string resultText = !string.IsNullOrEmpty(last) ? last : (terminal || closed ? "" : (_lang == 0 ? "実行中…" : "Working…"));
+        if (!string.IsNullOrEmpty(resultText))
         {
-            var ht = new TextBlock();
-            ht.Text = headline;
-            ht.Foreground = Fg; ht.FontSize = 14; ht.FontWeight = FontWeights.SemiBold;
-            ht.TextTrimming = TextTrimming.CharacterEllipsis;
-            ht.Margin = new Thickness(0, 6, 0, 0);
-            col.Children.Add(ht);
+            var rl = new TextBlock {
+                Text = OneLine(resultText), Foreground = Muted, FontSize = 12.5,
+                TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.NoWrap,
+                Margin = new Thickness(24, 5, 0, 0)
+            };
+            col.Children.Add(rl);
         }
+
+        // ── line 3: meta -- worker name · turn · reviews · verified ──
+        var meta = new StringBuilder(name.ToUpper());
+        if (turn > 0) meta.Append(" · ").Append(T("turn")).Append(' ').Append(turn);
+        if (reviews > 0) meta.Append(" · ").Append(_lang == 0 ? ("確認 " + reviews + " 回") : ("reviewed " + reviews));
+        if (verifiedOk) meta.Append(" · ").Append(_lang == 0 ? "検証OK" : "verified");
+        var ml = new TextBlock {
+            Text = meta.ToString(), Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 12,
+            Margin = new Thickness(24, 4, 0, 0)
+        };
+        col.Children.Add(ml);
 
         if (isOpen)
         {
@@ -2857,7 +2864,7 @@ class CockpitWindow : Window
             else if (S(w, "outcome") != "DONE") col.Children.Add(RetryRow(w));
         }
 
-        card.Child = col;
+        card.Child = shell;
         // Always clickable: open this worker in the main chat BY NAME, so it works even when the
         // Copilot conv_url was never captured (the main chat renders the live status.json snapshot
         // for this worker). conv_url is passed too so /history can fill in the full transcript
@@ -3118,18 +3125,38 @@ class CockpitWindow : Window
         return sp;
     }
 
-    Border Pill(string text, string ck)
+    // Status chip (spec): a small OUTLINED pill -- colored border + colored text on a transparent
+    // fill, never a saturated block. `railKind` is one of neutral/info/success/warning/danger.
+    Border Pill(string text, string railKind)
     {
+        var color = Theme.Br(Theme.RailColor(railKind, _dark));
         var b = new Border();
-        b.Background = new SolidColorBrush(StatusColor(ck));
+        b.Background = Brushes.Transparent;
+        b.BorderBrush = color; b.BorderThickness = new Thickness(1);
         b.CornerRadius = new CornerRadius(999);
-        b.Padding = new Thickness(11, 3, 11, 3);
+        b.Padding = new Thickness(9, 1.5, 9, 1.5);
         b.VerticalAlignment = VerticalAlignment.Center;
         var t = new TextBlock();
-        t.Text = text; t.Foreground = White;          // saturated bg -> white text
+        t.Text = text; t.Foreground = color;
         t.FontSize = 11.5; t.FontWeight = FontWeights.SemiBold;
         b.Child = t;
         return b;
+    }
+
+    // Collapse newlines/tabs/runs of whitespace into single spaces -- for the one-line card result.
+    static string OneLine(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        var sb = new StringBuilder(s.Length);
+        bool lastSpace = false;
+        foreach (char c in s)
+        {
+            char ch = (c == '\n' || c == '\r' || c == '\t') ? ' ' : c;
+            if (ch == ' ') { if (lastSpace) continue; lastSpace = true; }
+            else lastSpace = false;
+            sb.Append(ch);
+        }
+        return sb.ToString().Trim();
     }
 
     UIElement Dots()
