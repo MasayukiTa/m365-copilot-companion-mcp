@@ -102,7 +102,10 @@ def main():
 
     collected: dict[str, dict] = {}
     pending = list(retry)
-    rounds = [(15, 150), (6, 150), (3, 200)]  # (chunk_size, timeout) per round
+    # Smaller chunks for the tool-augmented run: tool-heavy turns accumulate
+    # context fast and a fresh :8011 per chunk is the real wedge cure, so keep
+    # each chunk <= the ~8-turn safe window with longer per-question timeouts.
+    rounds = [(8, 200), (4, 220), (2, 260)]  # (chunk_size, timeout) per round
 
     for rnd, (csize, tmo) in enumerate(rounds, 1):
         if not pending:
