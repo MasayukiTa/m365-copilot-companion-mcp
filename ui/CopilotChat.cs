@@ -64,6 +64,7 @@ class ChatWindow : Window
     Border _banner; StackPanel _bannerBody;
     Button _newBtn, _themeBtn, _langBtn, _manageBtn, _cockpitBtn, _attachBtn;
     TextBlock _inputHint;                 // goal-box watermark; localized -> must update on lang toggle
+    Border _composerBorder;              // outer integrated composer wrapper (Task 1)
     TextBlock _fleetChipLabel;            // "Fleet: N" chip in the main header; updated on timer tick
     Border _fleetChip;                    // the chip border (collapsed when count == 0)
     static readonly string SettingsFile = Path.Combine(
@@ -250,21 +251,18 @@ class ChatWindow : Window
                 _scroll.ScrollToVerticalOffset(_scroll.ScrollableHeight);
         };
 
-        var bar = new Grid { Margin = new Thickness(0, 10, 0, 16), MaxWidth = 760, HorizontalAlignment = HorizontalAlignment.Center };
-        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        // ── integrated composer (spec Task 1: one rounded surfaceSubtle border, text area on top,
+        //    footer row below with "/" affordance left and Send right — mirrors the Fleet composer).
         _input = new TextBox
         {
             MinHeight = 50, MaxHeight = 180, AcceptsReturn = true, TextWrapping = TextWrapping.Wrap,
-            VerticalScrollBarVisibility = ScrollBarVisibility.Auto, FontSize = 14, Padding = new Thickness(13, 12, 13, 12),
-            BorderThickness = new Thickness(1), VerticalContentAlignment = VerticalAlignment.Center, MinWidth = 560
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto, FontSize = 14,
+            Padding = new Thickness(4, 4, 4, 4),
+            BorderThickness = new Thickness(0), Background = Brushes.Transparent,
+            VerticalContentAlignment = VerticalAlignment.Top, MinWidth = 0
         };
-        // Composer surface matches the Fleet composer (surfaceSubtle), so Main and Fleet read as the
-        // same component (spec parity).
-        SetRef(_input, BackgroundProperty, "PanelAlt");
         SetRef(_input, ForegroundProperty, "Fg");
         SetRef(_input, TextBox.CaretBrushProperty, "Fg");
-        SetRef(_input, Control.BorderBrushProperty, "Border");
         _input.PreviewKeyDown += delegate (object s, KeyEventArgs e)
         {
             // slash-command autocomplete navigation (when the popup is open)
@@ -284,32 +282,75 @@ class ChatWindow : Window
             if (e.Key == Key.Enter && (Keyboard.Modifiers & ModifierKeys.Shift) == 0) { e.Handled = true; DoSend(); }
         };
         _input.TextChanged += delegate { UpdateCmdPopup(); PaintSend(); };
-        Grid.SetColumn(_input, 0); bar.Children.Add(_input);
         // Placeholder hint advertising slash commands (WPF TextBox has no native placeholder). The
         // single most Claude-Code-defining feature was invisible until you happened to type "/".
         _inputHint = new TextBlock
         {
             Text = _lang == 0 ? "メッセージを入力…" : "Type a message…",
-            IsHitTestVisible = false, FontSize = 13.5, Margin = new Thickness(15, 0, 0, 0),
-            VerticalAlignment = VerticalAlignment.Center
+            IsHitTestVisible = false, FontSize = 13.5, Margin = new Thickness(6, 4, 0, 0),
+            VerticalAlignment = VerticalAlignment.Top, HorizontalAlignment = HorizontalAlignment.Left
         };
         SetRef(_inputHint, TextBlock.ForegroundProperty, "Muted");
-        Grid.SetColumn(_inputHint, 0); bar.Children.Add(_inputHint);
         _input.TextChanged += delegate { _inputHint.Visibility = string.IsNullOrEmpty(_input.Text) ? Visibility.Visible : Visibility.Collapsed; };
+        // Overlay grid: input + hint share the same cell so the hint sits under the caret.
+        var inputOverlay = new Grid();
+        inputOverlay.Children.Add(_input);
+        inputOverlay.Children.Add(_inputHint);
         BuildCmdPopup();
+        // Footer row: left = "/" affordance, right = Send button.
         _send = Btn(T("send"), "Accent", "AccentFg", false);
-        _send.Width = 92; _send.Margin = new Thickness(8, 0, 0, 0); _send.FontWeight = FontWeights.SemiBold; _send.MinHeight = 50;
+        _send.Height = 32; _send.Padding = new Thickness(14, 0, 14, 0);
+        _send.FontWeight = FontWeights.SemiBold;
         _send.Click += delegate
         {
             if (_generating) { try { if (_activeReq != null) _activeReq.Abort(); } catch { } }
             else DoSend();
         };
-        Grid.SetColumn(_send, 1); bar.Children.Add(_send);
+        var slashBtn = new Button
+        {
+            Content = "/", FontSize = 13, FontWeight = FontWeights.SemiBold,
+            Height = 28, Width = 28, Cursor = Cursors.Hand,
+            BorderThickness = new Thickness(0), Background = Brushes.Transparent,
+            ToolTip = _lang == 0 ? "スラッシュコマンド" : "Slash commands"
+        };
+        SetRef(slashBtn, ForegroundProperty, "Faint");
+        slashBtn.Click += delegate
+        {
+            if (!_input.Text.StartsWith("/")) { _input.Text = "/"; _input.CaretIndex = 1; }
+            _input.Focus();
+        };
+        var footerRow = new DockPanel { Margin = new Thickness(0, 6, 0, 0) };
+        var footLeft = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+        footLeft.Children.Add(slashBtn);
+        DockPanel.SetDock(footLeft, Dock.Left);
+        DockPanel.SetDock(_send, Dock.Right);
+        footerRow.Children.Add(_send);
+        footerRow.Children.Add(footLeft);
+        // Integrated composer border (rounded surfaceSubtle surface, mirrors Fleet composer).
+        var composerInner = new StackPanel();
+        composerInner.Children.Add(inputOverlay);
+        composerInner.Children.Add(footerRow);
+        _composerBorder = new Border
+        {
+            Child = composerInner,
+            CornerRadius = new CornerRadius(10),
+            BorderThickness = new Thickness(1),
+            Padding = new Thickness(12, 10, 12, 10),
+            Margin = new Thickness(0, 10, 0, 16),
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+        SetRef(_composerBorder, BackgroundProperty, "PanelAlt");
+        SetRef(_composerBorder, Border.BorderBrushProperty, "Border");
+        // Clicking the border surface focuses the text input (nice-to-have).
+        _composerBorder.MouseLeftButtonDown += delegate { _input.Focus(); };
         PaintSend();   // initial state: input empty -> neutral
-        var barStack = new StackPanel { MaxWidth = 760, HorizontalAlignment = HorizontalAlignment.Center };
+        // Stretch (not Center) so the column actually fills the available width; MaxWidth=760 caps it
+        // and WPF auto-centers a Stretch element once its content is narrower than the cap. With Center
+        // the StackPanel would shrink to its content, yielding the narrow ~280px box regression.
+        var barStack = new StackPanel { MaxWidth = 760, HorizontalAlignment = HorizontalAlignment.Stretch };
         barStack.Children.Add(BuildRouterBar());
         barStack.Children.Add(BuildAttachRow());
-        barStack.Children.Add(bar);
+        barStack.Children.Add(_composerBorder);
         var barBorder = new Border { Child = barStack, BorderThickness = new Thickness(0, 1, 0, 0) };
         SetRef(barBorder, Border.BorderBrushProperty, "Border");
         Grid.SetRow(barBorder, 2); main.Children.Add(barBorder);
@@ -1248,8 +1289,8 @@ class ChatWindow : Window
         }
         if (olderList.Count > 0)
         {
-            _convList.Children.Add(MakeSectionHeader(ja ? "これまで" : "Earlier"));
-            foreach (var c in olderList) AddConvRow(c, false);
+            _convList.Children.Add(MakeSectionHeader(ja ? "アーカイブ" : "Archive"));
+            foreach (var c in olderList) AddConvRow(c, false, true);
         }
     }
 
@@ -1268,7 +1309,9 @@ class ChatWindow : Window
     // Builds and appends one conversation row (or an inline rename editor) into _convList.
     // isFleet: rows from the Fleet section use "Muted" foreground even when unselected --
     // they read as quieter navigation, no accent treatment.
-    void AddConvRow(Conversation cc, bool isFleet)
+    // archived: rows in the Archive section render the title in "Faint" so old eval/bench
+    // conversations visually recede vs Today/Fleet rows (spec Task 2).
+    void AddConvRow(Conversation cc, bool isFleet, bool archived = false)
     {
         if (_renamingId == cc.Id)
         {
@@ -1314,8 +1357,9 @@ class ChatWindow : Window
             Padding = new Thickness(9, 0, 9, 0), BorderThickness = new Thickness(0),
             Cursor = Cursors.Hand, Background = Brushes.Transparent, ToolTip = titleText
         };
-        // Active row: full Fg; all non-active rows (fleet and chat): Muted.
-        SetRef(b, ForegroundProperty, isActive ? "Fg" : "Muted");
+        // Active row: full Fg; archived non-active rows: Faint (de-emphasized); others: Muted.
+        string fgKey = isActive ? "Fg" : (archived ? "Faint" : "Muted");
+        SetRef(b, ForegroundProperty, fgKey);
         b.Click += delegate { OpenConversation(cc); };
         var miR = new MenuItem { Header = T("rename") };   // rename stays on right-click
         miR.Click += delegate { _renamingId = cc.Id; RefreshConvList(); };
@@ -1351,13 +1395,18 @@ class ChatWindow : Window
 
     // STEER-mode signal: when viewing a parallel-task conversation, anything you type interrupts
     // that running worker -- a very different action from a normal chat. Make it unmistakable by
-    // tinting the input border Accent (orange) and thickening it, so the user is never surprised
+    // tinting the composer border Accent (orange) and thickening it, so the user is never surprised
     // that their message went to a background agent. (GAP 8)
+    // Now operates on _composerBorder (the outer rounded wrapper) rather than the inner transparent
+    // TextBox, because Task 1 made the TextBox borderless.
     void RefreshSteerVisual()
     {
         bool steer = !string.IsNullOrEmpty(_activeFleetUrl);
-        SetRef(_input, Control.BorderBrushProperty, steer ? "Accent" : "Border");
-        _input.BorderThickness = new Thickness(steer ? 2 : 1);
+        if (_composerBorder != null)
+        {
+            SetRef(_composerBorder, Border.BorderBrushProperty, steer ? "Accent" : "Border");
+            _composerBorder.BorderThickness = new Thickness(steer ? 2 : 1);
+        }
     }
 
     void NewChat()
