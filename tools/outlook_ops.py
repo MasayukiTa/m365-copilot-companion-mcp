@@ -13,10 +13,18 @@ Important caveats:
   * All connections run in the user's identity. The agent has whatever
     mailbox / calendar access that user already has — nothing more.
 """
+import os
 from datetime import datetime, timedelta
 from typing import Optional
 
 from .security import require_unlocked
+
+_GATE_ENV = "MCP_REQUIRE_GATE_FOR_SIDE_EFFECTS"
+
+
+def _side_effects_gated() -> bool:
+    """Return True when the HITL confirmation gate is active (default on)."""
+    return os.environ.get(_GATE_ENV, "1") == "1"
 
 OL_FOLDER_INBOX = 6
 OL_FOLDER_CALENDAR = 9
@@ -90,6 +98,7 @@ def outlook_send_mail(
     bcc: Optional[str] = None,
     html: bool = False,
     send_immediately: bool = False,
+    confirm: bool = False,
 ) -> str:
     """Compose a mail in Outlook. Defaults to saving as a draft for human review.
 
@@ -102,6 +111,10 @@ def outlook_send_mail(
         html: If true, body is interpreted as HTML.
         send_immediately: If true, send right away. Default false: leave in
             Drafts so the user can review before sending.
+        confirm: Required to be True when send_immediately=True and
+            MCP_REQUIRE_GATE_FOR_SIDE_EFFECTS=1 (the default). This prevents
+            an autonomous agent from sending mail without explicit confirmation.
+            Re-call with confirm=True after reviewing the recipients and subject.
     """
     locked = require_unlocked()
     if locked:
@@ -109,6 +122,14 @@ def outlook_send_mail(
     try:
         if not to or not subject:
             return "[outlook_send_mail error: 'to' and 'subject' are required]"
+        # HITL gate: require explicit confirmation before actually sending.
+        if send_immediately and _side_effects_gated() and not confirm:
+            return (
+                f"[confirmation required] This will immediately send an email to {to!r} "
+                f"with subject {subject!r}. This action is irreversible. "
+                "Re-call with confirm=True to proceed, or omit send_immediately=True "
+                "to save as a draft instead."
+            )
         ol = _dispatch()
         try:
             mail = ol.CreateItem(0)  # 0 = MailItem
@@ -209,6 +230,7 @@ def outlook_create_event(
     attendees: Optional[str] = None,
     send_invite: bool = False,
     reminder_minutes: int = 10,
+    confirm: bool = False,
 ) -> str:
     """Create a calendar event. Defaults to saving locally without sending invites.
 
@@ -221,12 +243,24 @@ def outlook_create_event(
         attendees: Semicolon-separated attendee emails (required if send_invite=True).
         send_invite: If true, send meeting invites to attendees. Default false.
         reminder_minutes: Reminder pop-up minutes before start.
+        confirm: Required to be True when send_invite=True and
+            MCP_REQUIRE_GATE_FOR_SIDE_EFFECTS=1 (the default). Prevents an
+            autonomous agent from sending meeting invites without explicit
+            confirmation. Re-call with confirm=True after reviewing the event.
     """
     locked = require_unlocked()
     if locked:
         return locked
     try:
         start = datetime.fromisoformat(start_iso)
+        # HITL gate: require explicit confirmation before sending invites.
+        if send_invite and attendees and _side_effects_gated() and not confirm:
+            return (
+                f"[confirmation required] This will send meeting invites for {subject!r} "
+                f"at {start_iso} to {attendees!r}. This action is irreversible. "
+                "Re-call with confirm=True to proceed, or omit send_invite=True "
+                "to save the event locally without notifying attendees."
+            )
         ol = _dispatch()
         try:
             appt = ol.CreateItem(1)  # 1 = AppointmentItem
