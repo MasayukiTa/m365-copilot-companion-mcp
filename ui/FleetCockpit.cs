@@ -479,9 +479,11 @@ class CockpitWindow : Window
 
         _headBar.Child = headRow;
         root.Children.Add(_headBar);
-        root.Children.Add(BuildInputBar());
         root.Children.Add(BuildMtBanner());
         root.Children.Add(BuildCapBanner());
+        // The composer docks to the BOTTOM (spec: agent-workspace feel, not a form). It must be
+        // added before _list so the list — the LastChildFill element — fills the space above it.
+        root.Children.Add(BuildInputBar());
 
         // Virtualizing card list. A ListBox brings its own ScrollViewer + VirtualizingStackPanel,
         // so with 100-164 cards only the ~10-20 visible rows are realized -> scrolling and
@@ -546,27 +548,41 @@ class CockpitWindow : Window
     TextBox _goalInput;
     Button _startBtn, _folderBtn;
     TextBlock _startNote;
+    Border _composerBox;             // the rounded composer surface (themed in PaintChrome)
+    TextBlock _composerHint;         // footer "one goal per line · / for commands"
+    TextBlock _composerWatermark;    // placeholder shown when the textarea is empty
 
-    // ④ task-injection: type goals (one per line) and launch a fleet from here.
+    // ④ task-injection: a bottom-docked composer (spec: agent-workspace, not a form). Type goals
+    // (one per line) and launch a fleet. The big top textarea + right-side vertical button stack
+    // are gone; the box now sits at the bottom with an inline footer (folder=secondary, start=primary).
     UIElement BuildInputBar()
     {
         _inBar = new Border();
-        _inBar.Padding = new Thickness(26, 2, 18, 10);
-        DockPanel.SetDock(_inBar, Dock.Top);
+        _inBar.Padding = new Thickness(Theme.PadApp, 6, Theme.PadApp, Theme.PadApp);
+        DockPanel.SetDock(_inBar, Dock.Bottom);
 
-        var grid = new Grid();
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        _composerBox = new Border();
+        _composerBox.CornerRadius = new CornerRadius(Theme.RadComposer);
+        _composerBox.BorderThickness = new Thickness(1);
+        _composerBox.Padding = new Thickness(12, 10, 12, 10);
 
+        var col = new StackPanel();
+
+        // ── textarea + watermark overlay (a Grid so they stack in the same cell) ──
+        var taGrid = new Grid();
         _goalInput = new TextBox();
         _goalInput.AcceptsReturn = true; _goalInput.TextWrapping = TextWrapping.Wrap;
-        _goalInput.MinHeight = 40; _goalInput.MaxHeight = 120;
+        _goalInput.MinHeight = 64; _goalInput.MaxHeight = 180;   // spec: min 64, max 180 internal scroll
         _goalInput.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
-        _goalInput.FontSize = 13; _goalInput.Padding = new Thickness(10, 8, 10, 8);
-        _goalInput.BorderThickness = new Thickness(1);
+        _goalInput.FontSize = Theme.FsBody;
+        _goalInput.BorderThickness = new Thickness(0);            // the composer carries the border
+        _goalInput.Background = Brushes.Transparent;
+        _goalInput.Padding = new Thickness(2, 1, 2, 1);
         _goalInput.VerticalContentAlignment = VerticalAlignment.Top;
         BuildGoalCmdPopup();
         _goalInput.TextChanged += delegate { UpdateGoalCmdPopup(); };
+        _goalInput.GotKeyboardFocus += delegate { PaintComposerFocus(true); };
+        _goalInput.LostKeyboardFocus += delegate { PaintComposerFocus(false); };
         _goalInput.PreviewKeyDown += delegate (object s, KeyEventArgs e)
         {
             // slash-command autocomplete (like the main chat): navigate / accept / dismiss
@@ -580,43 +596,67 @@ class CockpitWindow : Window
             if (e.Key == Key.Return && (Keyboard.Modifiers & ModifierKeys.Control) != 0)
             { e.Handled = true; StartFleet(); }
         };
-        Grid.SetColumn(_goalInput, 0); grid.Children.Add(_goalInput);
-        // Placeholder hint advertising slash commands + how to start (the goal box had no visible
-        // hint and its slash palette was invisible until you typed "/"). (friction #8)
-        var goalHint = new TextBlock
+        taGrid.Children.Add(_goalInput);
+        // short placeholder (spec Fleet: "タスクを入力..."); the "one per line / slash" guidance
+        // moves to the footer hint so the box itself stays quiet.
+        _composerWatermark = new TextBlock
         {
-            Text = T("goalhint") + (_lang == 0 ? "  ·「/」でコマンド" : "  · \"/\" for commands"),
-            IsHitTestVisible = false, FontSize = 12.5, Foreground = Muted,
-            Margin = new Thickness(13, 9, 12, 0), VerticalAlignment = VerticalAlignment.Top,
+            Text = _lang == 0 ? "タスクを入力..." : "Add tasks...",
+            IsHitTestVisible = false, FontSize = Theme.FsBody,
+            Margin = new Thickness(4, 1, 4, 0), VerticalAlignment = VerticalAlignment.Top,
             TextTrimming = TextTrimming.CharacterEllipsis
         };
-        Grid.SetColumn(goalHint, 0); grid.Children.Add(goalHint);
-        _goalInput.TextChanged += delegate { goalHint.Visibility = string.IsNullOrEmpty(_goalInput.Text) ? Visibility.Visible : Visibility.Collapsed; };
+        taGrid.Children.Add(_composerWatermark);
+        _goalInput.TextChanged += delegate { _composerWatermark.Visibility = string.IsNullOrEmpty(_goalInput.Text) ? Visibility.Visible : Visibility.Collapsed; };
+        col.Children.Add(taGrid);
 
-        var rightCol = new StackPanel();
-        rightCol.Margin = new Thickness(10, 0, 0, 0);
-        _startBtn = new Button();
-        _startBtn.Cursor = Cursors.Hand; _startBtn.BorderThickness = new Thickness(0);
-        _startBtn.Height = 40; _startBtn.MinWidth = 150; _startBtn.FontWeight = FontWeights.SemiBold;
-        _startBtn.Padding = new Thickness(14, 0, 14, 0);
-        _startBtn.Click += delegate { StartFleet(); };
-        rightCol.Children.Add(_startBtn);
+        // ── footer: left hint, right button cluster (folder=secondary, start=primary) ──
+        var footer = new DockPanel { LastChildFill = false };
+        footer.Margin = new Thickness(0, 8, 0, 0);
+
+        var btns = new StackPanel { Orientation = Orientation.Horizontal };
         _folderBtn = new Button();
         _folderBtn.Cursor = Cursors.Hand; _folderBtn.BorderThickness = new Thickness(1);
-        _folderBtn.Height = 30; _folderBtn.MinWidth = 150; _folderBtn.FontSize = 12;
-        _folderBtn.Margin = new Thickness(0, 6, 0, 0); _folderBtn.Padding = new Thickness(10, 0, 10, 0);
+        _folderBtn.Height = Theme.BtnH; _folderBtn.FontSize = 12;
+        _folderBtn.Padding = new Thickness(12, 0, 12, 0);
         _folderBtn.Click += delegate { FolderToGoals(); };
-        rightCol.Children.Add(_folderBtn);
-        _startNote = new TextBlock();
-        _startNote.FontSize = 11; _startNote.Margin = new Thickness(2, 4, 0, 0);
-        _startNote.TextWrapping = TextWrapping.Wrap; _startNote.MaxWidth = 150;
-        rightCol.Children.Add(_startNote);
-        Grid.SetColumn(rightCol, 1); grid.Children.Add(rightCol);
+        btns.Children.Add(_folderBtn);
+        _startBtn = new Button();
+        _startBtn.Cursor = Cursors.Hand; _startBtn.BorderThickness = new Thickness(0);
+        _startBtn.Height = Theme.BtnH; _startBtn.MinWidth = 132; _startBtn.FontWeight = FontWeights.SemiBold;
+        _startBtn.Margin = new Thickness(8, 0, 0, 0); _startBtn.Padding = new Thickness(16, 0, 16, 0);
+        _startBtn.Click += delegate { StartFleet(); };
+        btns.Children.Add(_startBtn);
+        DockPanel.SetDock(btns, Dock.Right);
+        footer.Children.Add(btns);
 
-        _inBar.Child = grid;
+        _composerHint = new TextBlock
+        {
+            Text = _lang == 0 ? "1行に1ゴール（複数可） ·「/」でコマンド" : "One goal per line · \"/\" for commands",
+            FontSize = Theme.FsMeta, VerticalAlignment = VerticalAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+        footer.Children.Add(_composerHint);   // no Dock -> fills the left
+        col.Children.Add(footer);
+
+        // transient start feedback ("Started (N goals)" / errors), below the footer
+        _startNote = new TextBlock();
+        _startNote.FontSize = Theme.FsMeta; _startNote.Margin = new Thickness(2, 6, 0, 0);
+        _startNote.TextWrapping = TextWrapping.Wrap;
+        col.Children.Add(_startNote);
+
+        _composerBox.Child = col;
+        _inBar.Child = _composerBox;
         return _inBar;
     }
     Border _inBar;
+
+    // Focus ring: thicken/tint the composer border while the goal box has keyboard focus.
+    void PaintComposerFocus(bool focused)
+    {
+        if (_composerBox == null) return;
+        _composerBox.BorderBrush = focused ? Theme.Br(Theme.Accent(_dark)) : Border;
+    }
 
     void StartFleet()
     {
@@ -1843,13 +1883,16 @@ class CockpitWindow : Window
         PaintPause();
         if (_stopBtn != null) { _stopBtn.Background = BtnBg; _stopBtn.Foreground = Fg; _stopBtn.BorderBrush = Border; }
         if (_inBar != null) _inBar.Background = Bg;
+        if (_composerBox != null) { _composerBox.Background = BtnBg; _composerBox.BorderBrush = Border; }
         if (_goalInput != null)
         {
-            _goalInput.Background = BtnBg; _goalInput.Foreground = Fg;
-            _goalInput.BorderBrush = Border; _goalInput.CaretBrush = Fg;
+            _goalInput.Background = Brushes.Transparent; _goalInput.Foreground = Fg;
+            _goalInput.BorderBrush = Brushes.Transparent; _goalInput.CaretBrush = Fg;
         }
+        if (_composerWatermark != null) _composerWatermark.Foreground = Muted;
+        if (_composerHint != null) _composerHint.Foreground = Muted;
         if (_startBtn != null) { _startBtn.Background = Accent; _startBtn.Foreground = White; }
-        if (_folderBtn != null) { _folderBtn.Background = BtnBg; _folderBtn.Foreground = Fg; _folderBtn.BorderBrush = Border; }
+        if (_folderBtn != null) { _folderBtn.Background = Brushes.Transparent; _folderBtn.Foreground = Fg; _folderBtn.BorderBrush = Theme.Br(Theme.BorderStrong(_dark)); }
         if (_startNote != null) _startNote.Foreground = Muted;
         if (_mtBanner != null)
         {
@@ -1883,7 +1926,7 @@ class CockpitWindow : Window
         if (_startBtn != null) _startBtn.Content = T("start");
         if (_folderBtn != null) _folderBtn.Content = T("folder");
         if (_goalInput != null) _goalInput.ToolTip = T("goalhint");
-        if (_startNote != null && string.IsNullOrEmpty(_startNote.Text)) _startNote.Text = T("goalhint");
+        // _startNote is now transient feedback only; the persistent hint lives in the composer footer.
         if (_mtApplyNow != null) _mtApplyNow.Content = _lang == 0 ? "今すぐ反映" : "Apply now";
         if (_mtLater != null) _mtLater.Content = _lang == 0 ? "次回起動から" : "Next run";
     }
