@@ -55,7 +55,7 @@ class CockpitWindow : Window
 
     // theme-dependent brushes
     Brush Bg, CardBg, Border, Fg, Muted, QuoteBg, BtnBg;
-    static readonly Brush Accent = new SolidColorBrush(C("#ea580c"));
+    Brush Accent;   // primary-action color; theme-dependent (spec), set in ApplyThemeBrushes
     static readonly Brush White = new SolidColorBrush(C("#ffffff"));
 
     bool _dark = true;
@@ -149,6 +149,7 @@ class CockpitWindow : Window
         LoadHidden();
         LoadSettings();
         ApplyThemeBrushes();
+        Title = "Fleet Cockpit";   // also lets the taskbar / alt-tab / automation name this window
         Width = 1080; Height = 760;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         BuildChrome();
@@ -367,24 +368,19 @@ class CockpitWindow : Window
     // ── theme ─────────────────────────────────────────────────────────────────────
     void ApplyThemeBrushes()
     {
-        if (_dark)
-        {
-            Bg = new SolidColorBrush(C("#0f172a")); CardBg = new SolidColorBrush(C("#1e293b"));
-            Border = new SolidColorBrush(C("#334155")); Fg = new SolidColorBrush(C("#f8fafc"));
-            Muted = new SolidColorBrush(C("#94a3b8")); QuoteBg = new SolidColorBrush(C("#0b1220"));
-            BtnBg = new SolidColorBrush(C("#1e293b"));
-        }
-        else
-        {
-            Bg = new SolidColorBrush(C("#ffffff")); CardBg = new SolidColorBrush(C("#f8fafc"));
-            Border = new SolidColorBrush(C("#e2e8f0")); Fg = new SolidColorBrush(C("#0f172a"));
-            Muted = new SolidColorBrush(C("#64748b")); QuoteBg = new SolidColorBrush(C("#f1f5f9"));
-            BtnBg = new SolidColorBrush(C("#f1f5f9"));
-        }
+        // Single source of truth: Theme.cs (calm warm-neutral palette, spec Design Tokens).
+        Bg = Theme.Br(Theme.Bg(_dark));
+        CardBg = Theme.Br(Theme.Surface(_dark));
+        Border = Theme.Br(Theme.Border(_dark));
+        Fg = Theme.Br(Theme.Text(_dark));
+        Muted = Theme.Br(Theme.Muted(_dark));
+        QuoteBg = Theme.Br(Theme.SurfaceSubtle(_dark));
+        BtnBg = Theme.Br(Theme.SurfaceSubtle(_dark));
+        Accent = Theme.Br(Theme.Accent(_dark));
     }
 
-    Color BgColor() { return _dark ? C("#0f172a") : C("#ffffff"); }
-    Color CardColor() { return _dark ? C("#1e293b") : C("#f8fafc"); }
+    Color BgColor() { return Theme.Col(Theme.Bg(_dark)); }
+    Color CardColor() { return Theme.Col(Theme.Surface(_dark)); }
     static Color Mix(Color a, Color b, double t)
     {
         return Color.FromRgb((byte)(a.R * t + b.R * (1 - t)),
@@ -400,10 +396,12 @@ class CockpitWindow : Window
     }
     Color StatusColor(string ck)
     {
-        if (ck == "good") return C("#3b4cc0");
-        if (ck == "done") return C("#16a34a");
-        if (ck == "bad") return C("#b40426");
-        return _dark ? C("#64748b") : C("#94a3b8");
+        // Repointed to the new token palette. ColorKey()'s legacy good/done/bad keys map
+        // onto info/success/danger; Ph3 replaces this path with canonical status + rail.
+        if (ck == "good") return Theme.Col(Theme.Info(_dark));
+        if (ck == "done") return Theme.Col(Theme.Success(_dark));
+        if (ck == "bad") return Theme.Col(Theme.Danger(_dark));
+        return Theme.Col(Theme.Muted(_dark));
     }
 
     void BuildChrome()
