@@ -249,9 +249,9 @@ class CockpitWindow : Window
         if (k == "disk_floor") return ja ? "実行下限ディスク (GB)" : "Disk floor (GB)";
         if (k == "disk_floor_hint") return ja ? "空きディスクがこの値を下回るとタブ開放を待機します。" : "Pauses opening tabs when free disk drops below this.";
         if (k == "ram_floor") return ja ? "確保する空きRAM (MB)" : "RAM floor (MB)";
-        if (k == "force_start") return ja ? "強制開始" : "Force start";
-        if (k == "floor_restore") return ja ? "床を戻す" : "Restore floor";
-        if (k == "floor_off") return ja ? "容量床 OFF（強制実行中）" : "Disk floor OFF (force-running)";
+        if (k == "force_start") return ja ? "今すぐ開始" : "Start now";
+        if (k == "floor_restore") return ja ? "容量制限を戻す" : "Restore limit";
+        if (k == "floor_off") return ja ? "容量制限を一時解除しています" : "Capacity limit paused";
         return k;
     }
     string StatusLabel(string s)
@@ -1748,7 +1748,7 @@ class CockpitWindow : Window
         if (_diskFloorForced)
         {
             _capBanner.Visibility = Visibility.Visible;
-            _capBannerLbl.Text = "⚠ " + T("floor_off");
+            _capBannerLbl.Text = T("floor_off");
             _capForceBtn.Visibility = Visibility.Collapsed;
             _capRestoreBtn.Visibility = Visibility.Visible;
             _capRestoreBtn.Content = T("floor_restore");
@@ -1784,21 +1784,19 @@ class CockpitWindow : Window
             {
                 int need = (int)Math.Ceiling(floor - freeDisk);
                 msg = _lang == 0
-                    ? "⚠ 容量待機中 — ディスク空き " + freeDisk + "GB が床 " + floor + "GB 未満。"
-                      + need + "GB 空けるか『強制開始』で起動します。"
-                    : "⚠ Capacity wait — C: free " + freeDisk + "GB is under the " + floor + "GB floor. "
-                      + "Free " + need + "GB or hit Force start to admit now.";
+                    ? "ディスクの空きが少ないため、新しいタブを開かずに待機しています（空き " + freeDisk + "GB / 確保 " + floor + "GB）。"
+                      + need + "GB 空けると自動で再開します。"
+                    : "Disk space is low, so new tabs are paused (free " + freeDisk + "GB / floor " + floor + "GB). "
+                      + "Freeing " + need + "GB resumes automatically.";
                 if (ramGated)
-                    msg += _lang == 0 ? "（空きRAMも " + availMb + "MB と逼迫）"
-                                      : " (free RAM also tight at " + availMb + "MB)";
+                    msg += _lang == 0 ? "（空きRAMも " + availMb + "MB と少なめ）"
+                                      : " (free RAM is also low at " + availMb + "MB)";
             }
             else
             {
                 msg = _lang == 0
-                    ? "⚠ 容量待機中 — 空きRAM " + availMb + "MB が逼迫しているためタブを開けません。"
-                      + "他アプリを閉じるか『強制開始』で起動します。"
-                    : "⚠ Capacity wait — free RAM " + availMb + "MB is too tight to open a tab. "
-                      + "Close apps or hit Force start to admit now.";
+                    ? "RAMが少ないため、新しいタブを開かずに待機しています（空き " + availMb + "MB）。"
+                    : "RAM is low, so new tabs are paused (free " + availMb + "MB).";
             }
             _capBannerLbl.Text = msg;
             _capBanner.Visibility = Visibility.Visible;
@@ -1909,22 +1907,27 @@ class CockpitWindow : Window
         if (_startBtn != null) { _startBtn.Background = Accent; _startBtn.Foreground = White; }
         if (_folderBtn != null) { _folderBtn.Background = Brushes.Transparent; _folderBtn.Foreground = Fg; _folderBtn.BorderBrush = Theme.Br(Theme.BorderStrong(_dark)); }
         if (_startNote != null) _startNote.Foreground = Muted;
+        // Banners: a quiet surface card with a 3px warning LEFT rail (spec), not an orange fill.
+        // The action is a secondary warning button (outline), not a primary orange block.
+        var warn = Theme.Br(Theme.Warning(_dark));
         if (_mtBanner != null)
         {
-            _mtBanner.Background = new SolidColorBrush(Mix(C("#ea580c"), CardColor(), 0.12));
-            _mtBanner.BorderBrush = Accent;
+            _mtBanner.Background = CardBg;
+            _mtBanner.BorderThickness = new Thickness(3, 1, 1, 1);
+            _mtBanner.BorderBrush = warn;
             if (_mtBannerLbl != null) _mtBannerLbl.Foreground = Fg;
         }
-        if (_mtApplyNow != null) { _mtApplyNow.Background = Accent; _mtApplyNow.Foreground = White; }
-        if (_mtLater != null) { _mtLater.Background = BtnBg; _mtLater.Foreground = Fg; _mtLater.BorderBrush = Border; }
+        if (_mtApplyNow != null) { _mtApplyNow.Background = Brushes.Transparent; _mtApplyNow.Foreground = warn; _mtApplyNow.BorderBrush = warn; _mtApplyNow.BorderThickness = new Thickness(1); }
+        if (_mtLater != null) { _mtLater.Background = Brushes.Transparent; _mtLater.Foreground = Muted; _mtLater.BorderBrush = Border; }
         if (_capBanner != null)
         {
-            _capBanner.Background = new SolidColorBrush(Mix(C("#ea580c"), CardColor(), 0.12));
-            _capBanner.BorderBrush = Accent;
+            _capBanner.Background = CardBg;
+            _capBanner.BorderThickness = new Thickness(3, 1, 1, 1);
+            _capBanner.BorderBrush = warn;
             if (_capBannerLbl != null) _capBannerLbl.Foreground = Fg;
         }
-        if (_capForceBtn != null) { _capForceBtn.Background = Accent; _capForceBtn.Foreground = White; }
-        if (_capRestoreBtn != null) { _capRestoreBtn.Background = BtnBg; _capRestoreBtn.Foreground = Fg; _capRestoreBtn.BorderBrush = Border; }
+        if (_capForceBtn != null) { _capForceBtn.Background = Brushes.Transparent; _capForceBtn.Foreground = warn; _capForceBtn.BorderBrush = warn; }
+        if (_capRestoreBtn != null) { _capRestoreBtn.Background = Brushes.Transparent; _capRestoreBtn.Foreground = Fg; _capRestoreBtn.BorderBrush = Border; }
         Relabel();
     }
 
@@ -2000,13 +2003,14 @@ class CockpitWindow : Window
         if (idle)
         {
             _header.Text = T("title");
-            _sub.Text = T("idle");
+            _sub.Text = "";                // the empty-state block in the body carries the message now
             string isig = "IDLE" + _history.Count + (_dark ? "D" : "L") + _lang;
             if (_lastSig != isig)
             {
                 _lastRoot = null;
                 var rows = new List<object>();
                 AppendHistoryRows(rows);   // history header + rows, if any
+                if (rows.Count == 0) rows.Add(MkRow(5, null, null));   // empty state when nothing to show
                 SetRows(rows);
                 _lastSig = isig;
             }
@@ -2226,6 +2230,13 @@ class CockpitWindow : Window
         _toolbarShown = shown;
 
         var rows = new List<object>();
+        // Empty state (spec): no run yet and no history -> a calm centered suggestion block instead
+        // of a blank workspace (the big top textarea is already gone -- it's the bottom composer now).
+        if (workers.Count == 0 && _history.Count == 0)
+        {
+            rows.Add(MkRow(5, null, null));
+            return rows;
+        }
         rows.Add(MkRow(0, null, null));               // toolbar
         // Default view: the live area shows only ACTIVE/queued work; terminal (done/failed) workers
         // drop below a "完了 (this run)" divider so the top is just what's running -- they are not
@@ -2289,6 +2300,7 @@ class CockpitWindow : Window
                        + "|ar" + (_autoRetry ? 1 : 0) + ":" + _autoRetryMax + "|f" + _cardFilter;
             case 2: return "HH|" + g;                          // history header (static chrome)
             case 4: return "DV|" + g;                          // "完了 (this run)" divider
+            case 5: return "ES|" + g;                          // empty state (static chrome)
             case 3:                                            // history row: stable per entry
                 return "h|" + g + "|" + (hist != null ? RuntimeHelpers.GetHashCode(hist) : 0);
             default:                                           // kind 1: worker card
@@ -2379,6 +2391,7 @@ class CockpitWindow : Window
             if (r.Kind == 2) return _w.HistoryHeader();
             if (r.Kind == 3) return _w.HistoryRow(r.Hist);
             if (r.Kind == 4) return _w.CompletedDivider();
+            if (r.Kind == 5) return _w.EmptyState();
             return null;
         }
         public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
@@ -2421,6 +2434,53 @@ class CockpitWindow : Window
 
     // Feature B/C toolbar: filter selector + outcome summary + bulk-retry. Rebuilt each
     // RenderCards as the first row of _cards (no worker Tag, so ToggleExpand skips it).
+    // Empty state (spec): a centered narrow block with quiet suggestion chips, shown when there is
+    // no run and no history. Suggestions just pre-fill the bottom composer -- they don't launch.
+    UIElement EmptyState()
+    {
+        var outer = new Border { Margin = new Thickness(0, 80, 0, 0) };
+        var block = new StackPanel { MaxWidth = 520, HorizontalAlignment = HorizontalAlignment.Center };
+
+        block.Children.Add(new TextBlock {
+            Text = _lang == 0 ? "タスクはまだありません" : "No fleet tasks",
+            Foreground = Fg, FontSize = 15, FontWeight = FontWeights.SemiBold,
+            HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 0, 0, 6) });
+        block.Children.Add(new TextBlock {
+            Text = _lang == 0 ? "複数のタスクを並行で走らせ、ここで進捗を確認します。"
+                              : "Run several tasks in parallel, then monitor progress here.",
+            Foreground = Muted, FontSize = 12.5, TextWrapping = TextWrapping.Wrap,
+            TextAlignment = TextAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center,
+            Margin = new Thickness(0, 0, 0, 18) });
+
+        string[] suggestions = _lang == 0
+            ? new string[] { "失敗テストを修正", "UIの問題をレビュー", "READMEを更新", "フォルダのタスクを実行" }
+            : new string[] { "Fix failing tests", "Review UI issues", "Update README", "Run folder task" };
+        var wrap = new WrapPanel { HorizontalAlignment = HorizontalAlignment.Center };
+        foreach (string s in suggestions)
+        {
+            string text = s;
+            var chip = new Button {
+                Content = text, Cursor = Cursors.Hand, FontSize = 12,
+                Background = Brushes.Transparent, Foreground = Fg,
+                BorderBrush = Border, BorderThickness = new Thickness(1),
+                Padding = new Thickness(12, 5, 12, 5), Margin = new Thickness(4, 4, 4, 4)
+            };
+            chip.Click += delegate
+            {
+                if (_goalInput != null)
+                {
+                    _goalInput.Text = text;
+                    _goalInput.CaretIndex = text.Length;
+                    _goalInput.Focus();
+                }
+            };
+            wrap.Children.Add(chip);
+        }
+        block.Children.Add(wrap);
+        outer.Child = block;
+        return outer;
+    }
+
     UIElement BuildCardToolbar(List<Dictionary<string, object>> all,
                                List<Dictionary<string, object>> shown)
     {
