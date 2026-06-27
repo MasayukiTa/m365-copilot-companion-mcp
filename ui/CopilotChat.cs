@@ -67,6 +67,9 @@ class ChatWindow : Window
     Border _composerBorder;              // outer integrated composer wrapper (Task 1)
     TextBlock _fleetChipLabel;            // "Fleet: N" chip in the main header; updated on timer tick
     Border _fleetChip;                    // the chip border (collapsed when count == 0)
+    Border _fleetStrip;                   // "CURRENT DELEGATION" strip above the composer (Option B)
+    StackPanel _fleetStripBody;           // inner panel rebuilt on each refresh
+    string _fleetStripSig = null;         // last-rendered signature; skip rebuild when unchanged
     static readonly string SettingsFile = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "copilot-bridge", "settings.txt");
 
@@ -348,6 +351,7 @@ class ChatWindow : Window
         // and WPF auto-centers a Stretch element once its content is narrower than the cap. With Center
         // the StackPanel would shrink to its content, yielding the narrow ~280px box regression.
         var barStack = new StackPanel { MaxWidth = 760, HorizontalAlignment = HorizontalAlignment.Stretch };
+        barStack.Children.Add(BuildFleetStrip());
         barStack.Children.Add(BuildRouterBar());
         barStack.Children.Add(BuildAttachRow());
         barStack.Children.Add(_composerBorder);
@@ -394,7 +398,7 @@ class ChatWindow : Window
         catch { _settingsMtime = 0; }
         var openTimer = new DispatcherTimer();
         openTimer.Interval = TimeSpan.FromMilliseconds(800);
-        openTimer.Tick += delegate { CheckOpenRequest(); SyncRegistry(); CheckFleetSnapshot(); CheckSettings(); RefreshFleetChip(); };
+        openTimer.Tick += delegate { CheckOpenRequest(); SyncRegistry(); CheckFleetSnapshot(); CheckSettings(); RefreshFleetChip(); RefreshFleetStrip(); };
         openTimer.Start();
         SyncRegistry();
     }
@@ -1001,6 +1005,292 @@ class ChatWindow : Window
             {
                 _fleetChip.Visibility = Visibility.Collapsed;
             }
+        }
+        catch { }
+    }
+
+    // ── "CURRENT DELEGATION" Fleet strip (Main Option B) ──────────────────────
+    // A compact non-scrolling band between the message area and the composer that shows
+    // live fleet state inline. Collapses entirely when no workers exist.
+    UIElement BuildFleetStrip()
+    {
+        _fleetStripBody = new StackPanel { Margin = new Thickness(4, 4, 4, 4) };
+
+        _fleetStrip = new Border
+        {
+            Child = _fleetStripBody,
+            CornerRadius = new CornerRadius(8),
+            BorderThickness = new Thickness(1),
+            Padding = new Thickness(10, 8, 10, 8),
+            Margin = new Thickness(0, 0, 0, 8),
+            Visibility = Visibility.Collapsed
+        };
+        SetRef(_fleetStrip, BackgroundProperty, "PanelAlt");
+        SetRef(_fleetStrip, Border.BorderBrushProperty, "Border");
+        return _fleetStrip;
+    }
+
+    // Compute a lightweight signature from status.json so we only rebuild the strip's
+    // DOM when something actually changed (avoids per-tick flicker / GC pressure).
+    // Signature: "<running>|<updated>|<w0key:w0status>|<w1key:w1status>|..."
+    string FleetStripSignature(Dictionary<string, object> statusDoc)
+    {
+        if (statusDoc == null) return "";
+        var sb = new StringBuilder();
+        sb.Append(SS(statusDoc, "running")).Append('|');
+        sb.Append(SS(statusDoc, "updated")).Append('|');
+        if (statusDoc.ContainsKey("workers") && statusDoc["workers"] is object[])
+        {
+            foreach (object o in (object[])statusDoc["workers"])
+            {
+                var w = o as Dictionary<string, object>;
+                if (w == null) continue;
+                sb.Append(SS(w, "name")).Append(':').Append(SS(w, "status")).Append('|');
+            }
+        }
+        return sb.ToString();
+    }
+
+    // Refresh the fleet strip from status.json. Called on the 800ms timer tick.
+    // Rebuilds the inner DOM only when the signature (running/updated/worker statuses) changes.
+    void RefreshFleetStrip()
+    {
+        if (_fleetStrip == null || _fleetStripBody == null) return;
+        try
+        {
+            string sp = Path.Combine(Path.GetDirectoryName(_convsPath), "status.json");
+            if (!File.Exists(sp))
+            {
+                if (_fleetStrip.Visibility != Visibility.Collapsed)
+                {
+                    _fleetStrip.Visibility = Visibility.Collapsed;
+                    _fleetStripSig = null;
+                }
+                return;
+            }
+            string txt;
+            using (var fsr = new FileStream(sp, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var sr = new StreamReader(fsr, Encoding.UTF8)) txt = sr.ReadToEnd();
+            var doc = _cjs.DeserializeObject(txt) as Dictionary<string, object>;
+            if (doc == null)
+            {
+                if (_fleetStrip.Visibility != Visibility.Collapsed) { _fleetStrip.Visibility = Visibility.Collapsed; _fleetStripSig = null; }
+                return;
+            }
+
+            // Collect workers array
+            object[] workers = null;
+            if (doc.ContainsKey("workers") && doc["workers"] is object[])
+                workers = (object[])doc["workers"];
+
+            // No workers -> collapse and return
+            if (workers == null || workers.Length == 0)
+            {
+                if (_fleetStrip.Visibility != Visibility.Collapsed) { _fleetStrip.Visibility = Visibility.Collapsed; _fleetStripSig = null; }
+                return;
+            }
+
+            // Check signature -- skip rebuild if nothing changed
+            string sig = FleetStripSignature(doc);
+            if (sig == _fleetStripSig && _fleetStrip.Visibility == Visibility.Visible) return;
+            _fleetStripSig = sig;
+
+            // ── Compute summary values ──────────────────────────────────────────
+            bool running = doc.ContainsKey("running") && doc["running"] != null && Convert.ToBoolean(doc["running"]);
+            double updated = (doc.ContainsKey("updated") && doc["updated"] != null) ? Convert.ToDouble(doc["updated"]) : 0;
+            double nowEpoch = (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
+            double ageSec = (updated > 0) ? (nowEpoch - updated) : -1;
+
+            int laneCount = workers.Length;
+            int needsAttentionCount = 0;
+            foreach (object o in workers)
+            {
+                var w = o as Dictionary<string, object>;
+                if (w == null) continue;
+                string st = SS(w, "status").ToLowerInvariant();
+                if (st == "stuck" || st == "maxturns" || st == "error") needsAttentionCount++;
+            }
+
+            // ── Rebuild inner DOM ───────────────────────────────────────────────
+            _fleetStripBody.Children.Clear();
+
+            // Header row: "CURRENT DELEGATION" label + "→ Fleet" link
+            bool ja = _lang == 0;
+            var headRow = new DockPanel { Margin = new Thickness(0, 0, 0, 4) };
+
+            // "→ Fleet" link on the right
+            var fleetLink = new Button
+            {
+                Content = ja ? "→ フリート" : "→ Fleet",
+                BorderThickness = new Thickness(0),
+                Background = Brushes.Transparent,
+                Padding = new Thickness(0),
+                Cursor = Cursors.Hand,
+                FontSize = 11.5,
+                FontWeight = FontWeights.SemiBold
+            };
+            SetRef(fleetLink, ForegroundProperty, "Accent");
+            fleetLink.Click += delegate { OpenCockpit(); };
+            DockPanel.SetDock(fleetLink, Dock.Right);
+            headRow.Children.Add(fleetLink);
+
+            // Strip title
+            bool allDone = !running;
+            string headLabel = allDone
+                ? (ja ? "委任完了" : "DELEGATION COMPLETE")
+                : (ja ? "実行中の委任" : "CURRENT DELEGATION");
+            var headTb = new TextBlock
+            {
+                Text = headLabel,
+                FontSize = 10.5,
+                FontWeight = FontWeights.SemiBold,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            SetRef(headTb, TextBlock.ForegroundProperty, "Muted");
+            headRow.Children.Add(headTb);
+            _fleetStripBody.Children.Add(headRow);
+
+            // Summary line: "N lanes · M needs attention · evidence Xs ago"
+            var summaryParts = new StringBuilder();
+            if (allDone)
+            {
+                int doneCount = 0;
+                foreach (object o in workers)
+                {
+                    var w = o as Dictionary<string, object>;
+                    if (w == null) continue;
+                    string st = SS(w, "status").ToLowerInvariant();
+                    if (st == "done" || st == "resolved" || st == "cancelled" || st == "freed") doneCount++;
+                }
+                summaryParts.Append(doneCount).Append(ja ? " 件完了" : " done");
+                if (needsAttentionCount > 0)
+                    summaryParts.Append(ja ? " · " + needsAttentionCount + " 件要対応" : " · " + needsAttentionCount + " needs attention");
+                summaryParts.Append(ja ? " · 実行終了" : " · run ended");
+            }
+            else
+            {
+                summaryParts.Append(laneCount).Append(ja ? " レーン" : " lanes");
+                if (needsAttentionCount > 0)
+                    summaryParts.Append(ja ? " · " + needsAttentionCount + " 件要対応" : " · " + needsAttentionCount + " needs attention");
+                if (ageSec >= 0)
+                {
+                    string ageStr;
+                    if (ageSec < 60) ageStr = ((int)ageSec) + (ja ? "秒前" : "s ago");
+                    else if (ageSec < 3600) ageStr = ((int)(ageSec / 60)) + (ja ? "分前" : "m ago");
+                    else ageStr = ((int)(ageSec / 3600)) + (ja ? "時間前" : "h ago");
+                    summaryParts.Append(ja ? " · 証拠 " + ageStr : " · evidence " + ageStr);
+                }
+            }
+            var summaryTb = new TextBlock
+            {
+                Text = summaryParts.ToString(),
+                FontSize = 11.5,
+                Margin = new Thickness(0, 0, 0, 6),
+                TextWrapping = TextWrapping.NoWrap,
+                TextTrimming = TextTrimming.CharacterEllipsis
+            };
+            SetRef(summaryTb, TextBlock.ForegroundProperty, "Fg");
+            _fleetStripBody.Children.Add(summaryTb);
+
+            // Per-lane chips (cap at 6 workers; show "+K more" if overflow)
+            var chipsPanel = new WrapPanel { Orientation = Orientation.Horizontal };
+            const int MaxChips = 6;
+            int shown = 0;
+            foreach (object o in workers)
+            {
+                var w = o as Dictionary<string, object>;
+                if (w == null) continue;
+                if (shown >= MaxChips) break;
+                shown++;
+
+                string workerName = SS(w, "name");
+                string rawStatus = SS(w, "status").ToLowerInvariant();
+
+                // Phase label mapping (spec §2 Phase Vocabulary)
+                bool isAttention = rawStatus == "stuck" || rawStatus == "maxturns" || rawStatus == "error";
+                bool isDone = rawStatus == "done" || rawStatus == "resolved";
+                bool isQueued = rawStatus == "pending";
+                bool isVerifying = rawStatus == "verifying";
+
+                string phaseLabel;
+                if (isDone) phaseLabel = ja ? "✓ 完了" : "Done";
+                else if (isAttention) phaseLabel = ja ? "⚠ 要対応" : "⚠ Attention";
+                else if (isQueued) phaseLabel = ja ? "待機" : "Queued";
+                else if (isVerifying) phaseLabel = ja ? "検証中" : "Verifying";
+                else phaseLabel = ja ? "実行中" : "Running";
+
+                // Chip color: needs-attention = Warning, done = Success, verifying = Warning(amber), running = Info, queued = Muted
+                string chipColor;
+                if (isAttention) chipColor = Theme.Warning(_dark);
+                else if (isDone) chipColor = Theme.Success(_dark);
+                else if (isVerifying) chipColor = Theme.Warning(_dark);
+                else if (isQueued) chipColor = Theme.Muted(_dark);
+                else chipColor = Theme.Info(_dark);
+
+                // Short display name (strip "w0" prefix or use as-is)
+                string displayName = string.IsNullOrEmpty(workerName) ? ("W" + shown) : workerName;
+
+                var chipBorder = new Border
+                {
+                    CornerRadius = new CornerRadius(5),
+                    BorderThickness = new Thickness(1),
+                    Padding = new Thickness(7, 2, 7, 2),
+                    Margin = new Thickness(0, 0, 5, 4),
+                    Cursor = Cursors.Hand
+                };
+                chipBorder.BorderBrush = new SolidColorBrush(Theme.Col(chipColor));
+                SetRef(chipBorder, BackgroundProperty, "PanelAlt");
+                chipBorder.MouseLeftButtonUp += delegate { OpenCockpit(); };
+
+                var chipContent = new StackPanel { Orientation = Orientation.Horizontal };
+                var nameTb = new TextBlock
+                {
+                    Text = displayName,
+                    FontSize = 11,
+                    FontWeight = FontWeights.SemiBold,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                SetRef(nameTb, TextBlock.ForegroundProperty, "Fg");
+                var phaseTb = new TextBlock
+                {
+                    Text = " " + phaseLabel,
+                    FontSize = 11,
+                    VerticalAlignment = VerticalAlignment.Center,
+                    Foreground = new SolidColorBrush(Theme.Col(chipColor))
+                };
+                chipContent.Children.Add(nameTb);
+                chipContent.Children.Add(phaseTb);
+                chipBorder.Child = chipContent;
+                chipsPanel.Children.Add(chipBorder);
+            }
+
+            // "+K more" overflow chip
+            int overflow = workers.Length - shown;
+            if (overflow > 0)
+            {
+                var moreBorder = new Border
+                {
+                    CornerRadius = new CornerRadius(5),
+                    BorderThickness = new Thickness(1),
+                    Padding = new Thickness(7, 2, 7, 2),
+                    Margin = new Thickness(0, 0, 5, 4),
+                    Cursor = Cursors.Hand
+                };
+                SetRef(moreBorder, BackgroundProperty, "PanelAlt");
+                SetRef(moreBorder, Border.BorderBrushProperty, "Border");
+                moreBorder.MouseLeftButtonUp += delegate { OpenCockpit(); };
+                var moreTb = new TextBlock
+                {
+                    Text = "+" + overflow + (ja ? " 件" : " more"),
+                    FontSize = 11
+                };
+                SetRef(moreTb, TextBlock.ForegroundProperty, "Muted");
+                moreBorder.Child = moreTb;
+                chipsPanel.Children.Add(moreBorder);
+            }
+
+            _fleetStripBody.Children.Add(chipsPanel);
+            _fleetStrip.Visibility = Visibility.Visible;
         }
         catch { }
     }
