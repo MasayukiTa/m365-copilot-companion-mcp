@@ -951,6 +951,7 @@ class CockpitWindow : Window
     ComboBox _effortBox;
     ComboBox _approvalBox;
     Button _pauseBtn, _stopBtn;
+    System.Windows.Shapes.Path _pauseIcon, _stopIcon;   // drawn geometry (no font glyph needed)
     Button _autoToggle;
     Button _autoMinus, _autoPlus;
     TextBlock _autoLbl, _autoValue;
@@ -1450,10 +1451,11 @@ class CockpitWindow : Window
         _pauseBtn = new Button();
         _pauseBtn.ToolTip = _lang == 0 ? "新規ターン/タブを止めて凍結（再開で続行・状態は保持）" : "Freeze: no new turns/tabs (resume continues; state kept)";
         _pauseBtn.Cursor = Cursors.Hand; _pauseBtn.BorderThickness = new Thickness(1);
-        _pauseBtn.Padding = new Thickness(10, 3, 10, 3); _pauseBtn.FontSize = 12;
-        _pauseBtn.FontWeight = FontWeights.SemiBold;
+        _pauseBtn.Width = 32; _pauseBtn.Height = 32; _pauseBtn.Padding = new Thickness(0);
         _pauseBtn.Margin = new Thickness(0, 0, 8, 0);
         _pauseBtn.VerticalAlignment = VerticalAlignment.Center;
+        _pauseIcon = new System.Windows.Shapes.Path { Stretch = Stretch.None, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+        _pauseBtn.Content = _pauseIcon;
         _pauseBtn.Click += delegate
         {
             // Pause only means something to a LIVE fleet. With no live consumer the command would
@@ -1471,10 +1473,11 @@ class CockpitWindow : Window
         _stopBtn = new Button();
         _stopBtn.ToolTip = _lang == 0 ? "全ワーカーを停止して走行を終了" : "Cancel every worker and end the run";
         _stopBtn.Cursor = Cursors.Hand; _stopBtn.BorderThickness = new Thickness(1);
-        _stopBtn.Padding = new Thickness(10, 3, 10, 3); _stopBtn.FontSize = 12;
-        _stopBtn.FontWeight = FontWeights.SemiBold;
+        _stopBtn.Width = 32; _stopBtn.Height = 32; _stopBtn.Padding = new Thickness(0);
         _stopBtn.VerticalAlignment = VerticalAlignment.Center;
-        _stopBtn.Content = T("stopall");
+        _stopIcon = new System.Windows.Shapes.Path { Stretch = Stretch.None, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center,
+            Data = Geometry.Parse("M3,3 H13 V13 H3 Z") };   // a stop square
+        _stopBtn.Content = _stopIcon;
         _stopBtn.Click += delegate
         {
             var cmd = ReadCommands();
@@ -1493,13 +1496,22 @@ class CockpitWindow : Window
         PaintPause();
         return group;
     }
-    // Paused => accent bg + white text (contrast rule), label shows Resume; otherwise neutral, Pause.
+    // Icon buttons (spec): pause shows two bars; while paused it shows a play triangle (resume).
+    // Quiet neutral chrome — no orange fill. The intent is carried by the icon + tooltip, not color.
     void PaintPause()
     {
         if (_pauseBtn == null) return;
-        _pauseBtn.Content = _paused ? T("resume") : T("pause");
-        if (_paused) { _pauseBtn.Background = Accent; _pauseBtn.Foreground = White; _pauseBtn.BorderBrush = Accent; }
-        else { _pauseBtn.Background = BtnBg; _pauseBtn.Foreground = Fg; _pauseBtn.BorderBrush = Border; }
+        if (_pauseIcon != null)
+        {
+            _pauseIcon.Data = Geometry.Parse(_paused ? "M4,2 L13,8 L4,14 Z"          // play (resume)
+                                                      : "M3,2 H6 V14 H3 Z M10,2 H13 V14 H10 Z"); // pause bars
+            _pauseIcon.Fill = _paused ? Theme.Br(Theme.Accent(_dark)) : Fg;
+        }
+        _pauseBtn.ToolTip = _paused
+            ? (_lang == 0 ? "再開（凍結を解除して続行）" : "Resume (unfreeze and continue)")
+            : (_lang == 0 ? "新規ターン/タブを止めて凍結（再開で続行・状態は保持）" : "Freeze: no new turns/tabs (resume continues; state kept)");
+        _pauseBtn.Background = BtnBg; _pauseBtn.Foreground = Fg; _pauseBtn.BorderBrush = Border;
+        if (_stopIcon != null) _stopIcon.Fill = Fg;
     }
     // Per-tick: Pause is enabled only when a run is LIVE (something to pause). When no run is live we
     // also drop a stale "paused" state so the label can never sit on "Resume" over a dead/absent run.
@@ -1521,9 +1533,12 @@ class CockpitWindow : Window
     void PaintAutoToggle()
     {
         if (_autoToggle == null) return;
-        _autoToggle.Content = T("autoscale") + ": " + (_autoscale ? T("auto_on") : T("auto_off"));
-        if (_autoscale) { _autoToggle.Background = Accent; _autoToggle.Foreground = White; _autoToggle.BorderBrush = Accent; }
-        else { _autoToggle.Background = BtnBg; _autoToggle.Foreground = Fg; _autoToggle.BorderBrush = Border; }
+        // Quiet chip (spec): "Auto" when on, "Auto · off" when off. No orange fill — the active
+        // state reads from a slightly stronger border + full-strength text, not a saturated block.
+        _autoToggle.Content = _autoscale ? "Auto" : (_lang == 0 ? "Auto · 切" : "Auto · off");
+        _autoToggle.Background = BtnBg;
+        _autoToggle.Foreground = _autoscale ? Fg : Muted;
+        _autoToggle.BorderBrush = _autoscale ? Theme.Br(Theme.BorderStrong(_dark)) : Border;
     }
 
     // Ceiling stepper only matters under autoscale: grey/disable it when autoscale is off.
@@ -1922,7 +1937,7 @@ class CockpitWindow : Window
         PaintEffort();
         PaintApproval();
         PaintPause();
-        if (_stopBtn != null) _stopBtn.Content = T("stopall");
+        // _stopBtn / _pauseBtn now render drawn icons (PaintPause), not text labels.
         if (_startBtn != null) _startBtn.Content = T("start");
         if (_folderBtn != null) _folderBtn.Content = T("folder");
         if (_goalInput != null) _goalInput.ToolTip = T("goalhint");
