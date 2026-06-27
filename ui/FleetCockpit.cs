@@ -948,8 +948,8 @@ class CockpitWindow : Window
     System.Windows.Controls.Primitives.Popup _settingsPopup;
     Button _gearBtn;
     Button _maxMinus, _maxPlus;
-    ComboBox _effortBox;
-    ComboBox _approvalBox;
+    Button _effortChip;
+    Button _approvalChip;
     Button _pauseBtn, _stopBtn;
     System.Windows.Shapes.Path _pauseIcon, _stopIcon;   // drawn geometry (no font glyph needed)
     Button _autoToggle;
@@ -1179,48 +1179,39 @@ class CockpitWindow : Window
         }
     }
 
-    // Effort selector: a [推論] label + a DROPDOWN (ComboBox) listing min/max/ultra/auto.
-    // Picking a mode persists effort= to settings.txt; the fleet runner reads it at launch
-    // (governs both fleet and single runs). The ComboBox is the single source of truth.
+    // Effort selector: a click-cycle CHIP that advances through min->max->ultra->auto->min.
+    // Clicking persists effort= to settings.txt; the fleet runner reads it at launch.
     static readonly string[] _effortModes = { "min", "max", "ultra", "auto" };
-    TextBlock _effortLbl;
     UIElement EffortControl()
     {
-        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
-        wrap.VerticalAlignment = VerticalAlignment.Center; wrap.Margin = new Thickness(0, 0, 12, 0);
-
-        _effortLbl = new TextBlock(); _effortLbl.VerticalAlignment = VerticalAlignment.Center;
-        _effortLbl.FontSize = 12; _effortLbl.Margin = new Thickness(0, 0, 8, 0);
-        wrap.Children.Add(_effortLbl);
-
-        _effortBox = new ComboBox();
-        _effortBox.ToolTip = _lang == 0 ? "推論の深さ（各ワーカーの調査/反論の強度）" : "Reasoning effort (research/refute depth per worker)";
-        _effortBox.Cursor = Cursors.Hand; _effortBox.FontSize = 12;
-        _effortBox.FontWeight = FontWeights.SemiBold; _effortBox.MinWidth = 78;
-        _effortBox.Padding = new Thickness(8, 2, 4, 2);
-        _effortBox.VerticalAlignment = VerticalAlignment.Center;
-        FillComboWithHelp(_effortBox, _effortModes, EffortHelp(), _effort);  // per-option hover help
-        _effortBox.SelectionChanged += delegate
+        _effortChip = new Button();
+        _effortChip.VerticalAlignment = VerticalAlignment.Center;
+        _effortChip.Cursor = Cursors.Hand;
+        _effortChip.FontSize = 12;
+        _effortChip.Padding = new Thickness(10, 3, 10, 3);
+        _effortChip.Margin = new Thickness(0, 0, 12, 0);
+        _effortChip.BorderThickness = new Thickness(1);
+        _effortChip.ToolTip = _lang == 0
+            ? "推論の深さ（クリックで切替: min→max→ultra→auto）\nmin: 速い・浅い / max: 深い調査 / ultra: 最深フル動員 / auto: 難度に応じて自動選択（推奨）"
+            : "Reasoning effort (click to cycle: min→max→ultra→auto)\nmin: fast/shallow  max: deep research  ultra: full depth  auto: pick by difficulty (recommended)";
+        _effortChip.Click += delegate
         {
-            string sel = ComboVal(_effortBox);
-            if (string.IsNullOrEmpty(sel) || sel == _effort) return;
-            _effort = sel;
+            int idx = System.Array.IndexOf(_effortModes, _effort);
+            _effort = _effortModes[(idx + 1) % _effortModes.Length];
             SaveKey("effort", _effort);
+            PaintEffort();
         };
-        wrap.Children.Add(_effortBox);
-
         PaintEffort();
-        return wrap;
+        return _effortChip;
     }
     void PaintEffort()
     {
-        if (_effortLbl != null) { _effortLbl.Text = T("effort"); _effortLbl.Foreground = Muted; }
-        if (_effortBox == null) return;
-        // keep the dropdown in sync with _effort (e.g. settings.txt changed externally) without
-        // re-firing the persist handler -- assigning the same value is a no-op for SelectionChanged.
-        if (!Equals(ComboVal(_effortBox), _effort)) ComboSelectVal(_effortBox, _effort);
-        _effortBox.Background = BtnBg; _effortBox.Foreground = Fg; _effortBox.BorderBrush = Border;
-        StyleFlatCombo(_effortBox);   // re-template each paint so a theme toggle retints resting + popup
+        if (_effortChip == null) return;
+        string label = _lang == 0 ? "推論: " : "Reasoning: ";
+        _effortChip.Content = label + _effort;
+        _effortChip.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+        _effortChip.Foreground = Theme.Br(Theme.Text(_dark));
+        _effortChip.BorderBrush = Theme.Br(Theme.BorderStrong(_dark));
     }
 
     // WPY ComboBox bug fix: the stock Aero ControlTemplate ignores Background/Foreground and
@@ -1342,47 +1333,38 @@ class CockpitWindow : Window
         return st;
     }
 
-    // Approval selector: compact run/plan/auto mode next to effort. This avoids adding another
-    // header button in the already-dense fleet toolbar.
+    // Approval selector: click-cycle CHIP advancing run->plan->auto->run.
     static readonly string[] _approvalModes = { "run", "plan", "auto" };
-    TextBlock _approvalLbl;
     UIElement ApprovalControl()
     {
-        var wrap = new StackPanel(); wrap.Orientation = Orientation.Horizontal;
-        wrap.VerticalAlignment = VerticalAlignment.Center; wrap.Margin = new Thickness(0, 0, 12, 0);
-
-        _approvalLbl = new TextBlock(); _approvalLbl.VerticalAlignment = VerticalAlignment.Center;
-        _approvalLbl.FontSize = 12; _approvalLbl.Margin = new Thickness(0, 0, 8, 0);
-        wrap.Children.Add(_approvalLbl);
-
-        _approvalBox = new ComboBox();
-        _approvalBox.ToolTip = _lang == 0
-            ? "承認モード: run=すぐ実行、plan=計画承認待ち、auto=通常フリートは計画承認待ち/フォルダ自律はGO-ASK-STOP判定"
-            : "Approval mode: run=run now, plan=wait for approval, auto=plain fleet waits for plan approval; folder autonomy uses GO/ASK/STOP";
-        _approvalBox.Cursor = Cursors.Hand; _approvalBox.FontSize = 12;
-        _approvalBox.FontWeight = FontWeights.SemiBold; _approvalBox.MinWidth = 74;
-        _approvalBox.Padding = new Thickness(8, 2, 4, 2);
-        _approvalBox.VerticalAlignment = VerticalAlignment.Center;
-        FillComboWithHelp(_approvalBox, _approvalModes, ApprovalHelp(), _approval);  // per-option hover help
-        _approvalBox.SelectionChanged += delegate
+        _approvalChip = new Button();
+        _approvalChip.VerticalAlignment = VerticalAlignment.Center;
+        _approvalChip.Cursor = Cursors.Hand;
+        _approvalChip.FontSize = 12;
+        _approvalChip.Padding = new Thickness(10, 3, 10, 3);
+        _approvalChip.Margin = new Thickness(0, 0, 12, 0);
+        _approvalChip.BorderThickness = new Thickness(1);
+        _approvalChip.ToolTip = _lang == 0
+            ? "承認モード（クリックで切替: run→plan→auto）\nrun: 承認なし即実行 / plan: 計画承認待ちで停止 / auto: 通常フリートは計画承認待ち・フォルダ自律はGO-ASK-STOP判定"
+            : "Approval mode (click to cycle: run→plan→auto)\nrun: execute immediately  plan: pause for approval  auto: plain fleet waits; folder autonomy uses GO/ASK/STOP";
+        _approvalChip.Click += delegate
         {
-            string sel = ComboVal(_approvalBox);
-            if (string.IsNullOrEmpty(sel) || sel == _approval) return;
-            _approval = sel;
+            int idx = System.Array.IndexOf(_approvalModes, _approval);
+            _approval = _approvalModes[(idx + 1) % _approvalModes.Length];
             SaveKey("approval", _approval);
+            PaintApproval();
         };
-        wrap.Children.Add(_approvalBox);
-
         PaintApproval();
-        return wrap;
+        return _approvalChip;
     }
     void PaintApproval()
     {
-        if (_approvalLbl != null) { _approvalLbl.Text = T("approval"); _approvalLbl.Foreground = Muted; }
-        if (_approvalBox == null) return;
-        if (!Equals(ComboVal(_approvalBox), _approval)) ComboSelectVal(_approvalBox, _approval);
-        _approvalBox.Background = BtnBg; _approvalBox.Foreground = Fg; _approvalBox.BorderBrush = Border;
-        StyleFlatCombo(_approvalBox);   // same flat-template fix so the open list matches the theme
+        if (_approvalChip == null) return;
+        string label = _lang == 0 ? "承認: " : "Approval: ";
+        _approvalChip.Content = label + _approval;
+        _approvalChip.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+        _approvalChip.Foreground = Theme.Br(Theme.Text(_dark));
+        _approvalChip.BorderBrush = Theme.Br(Theme.BorderStrong(_dark));
     }
 
     // ── per-option hover help for the 推論 / 承認 dropdowns ──────────────────────────────────
