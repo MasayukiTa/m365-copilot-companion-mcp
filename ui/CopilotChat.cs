@@ -169,8 +169,10 @@ class ChatWindow : Window
         Grid.SetRow(convScroll, 1); side.Children.Add(convScroll);
 
         var bottom = new StackPanel { Margin = new Thickness(12, 8, 12, 12) };
-        _cockpitBtn = Btn(T("open_cockpit"), "Accent", "AccentFg", false);
-        _cockpitBtn.Height = 36; _cockpitBtn.Margin = new Thickness(0, 0, 0, 8); _cockpitBtn.FontSize = 12.5; _cockpitBtn.FontWeight = FontWeights.SemiBold;
+        // Fleet entry is a QUIET navigation item, not a large orange CTA (spec). Accent is reserved
+        // for the one primary action in the main column (Send).
+        _cockpitBtn = Btn(T("open_cockpit"), "PanelAlt", "Muted", true);
+        _cockpitBtn.Height = 36; _cockpitBtn.Margin = new Thickness(0, 0, 0, 8); _cockpitBtn.FontSize = 12.5;
         _cockpitBtn.Click += delegate { OpenCockpit(); };
         bottom.Children.Add(_cockpitBtn);
         _langBtn = Btn(T("lang"), "Panel", "Muted", true);
@@ -227,7 +229,9 @@ class ChatWindow : Window
             VerticalScrollBarVisibility = ScrollBarVisibility.Auto, FontSize = 14, Padding = new Thickness(13, 12, 13, 12),
             BorderThickness = new Thickness(1), VerticalContentAlignment = VerticalAlignment.Center, MinWidth = 560
         };
-        SetRef(_input, BackgroundProperty, "Panel");
+        // Composer surface matches the Fleet composer (surfaceSubtle), so Main and Fleet read as the
+        // same component (spec parity).
+        SetRef(_input, BackgroundProperty, "PanelAlt");
         SetRef(_input, ForegroundProperty, "Fg");
         SetRef(_input, TextBox.CaretBrushProperty, "Fg");
         SetRef(_input, Control.BorderBrushProperty, "Border");
