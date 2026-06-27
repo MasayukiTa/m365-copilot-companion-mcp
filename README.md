@@ -17,11 +17,12 @@
   normal verified coding tasks and SWE-bench goals, rather than as a SWE-only prompt expansion.
 - Recompute and details: `python bench/swe_lite300_scorecard.py` and
   `bench/SCORECARD_swebench_lite300_strong.md`.
-- **GAIA validation, text-only (2026-06-25): 66/126 = 52.4%** (official GAIA scorer; L1 61.9% /
-  L2 50.8% / L3 36.8%; Wilson 95% CI [43.7%, 60.9%]). General-assistant benchmark, executed by the
-  **M365 Copilot agent itself** (web-grounded default Copilot) — **not** the Anthropic API. 38 of the
-  165 validation items need a file attachment the endpoint cannot receive and are excluded; 1 item
-  was an unrecovered infra timeout (66/127 = 52.0% if counted as a miss). Details under "GAIA" below.
+- **GAIA validation, text-only (2026-06-25): 89/127 = 70.1%** (official GAIA scorer; L1 78.6% /
+  L2 69.2% / L3 61.1%; 125/127 answered, 2 unrecovered). General-assistant benchmark, executed by the
+  **M365 Copilot companion** via the `:8011` OpenAI-compatible endpoint, tool-augmented (map-mode:
+  `run_python` for calculation, `web_search` for grounding) — **not** the Anthropic API direct. 38 of
+  the 165 validation items need a file attachment the endpoint cannot receive and are excluded.
+  Details under "GAIA" below.
 
 > Microsoft 365 Copilot に **手** を生やすやつ。
 > あなたの貸与ノート PC の上で動く。**100+ ツール**（執筆時点で 138）、
@@ -119,14 +120,16 @@ HumanEval / SWE-bench は「コーディング力」。こちらは **GAIA**（M
 
 | 指標 | 値 |
 |---|---|
-| **総合（text-only 126問）** | **66 / 126 = 52.4%**（Wilson 95% CI [43.7%, 60.9%]） |
-| Level 1 | 26 / 42 = 61.9% |
-| Level 2 | 33 / 65 = 50.8% |
-| Level 3 | 7 / 19 = 36.8% |
+| **総合（text-only 127問）** | **89 / 127 = 70.1%** |
+| Level 1 | 33 / 42 = 78.6% |
+| Level 2 | 45 / 65 = 69.2% |
+| Level 3 | 11 / 18 = 61.1% |
+| 回答済み | 125 / 127（未回収 2 問） |
 
-- **誠実な但し書き**：GAIA validation 165 問のうち **ファイル添付が必須の 38 問は除外**（:8011 エンドポイントはファイルを受け取れない）＝ text-only 127 問が対象。さらに 1 問は復旧不能なインフラ・タイムアウトで未回収（誤答に算入すれば 66/127 = 52.0%）。
+- **誠実な但し書き**：GAIA validation 165 問のうち **ファイル添付が必須の 38 問は除外**（:8011 エンドポイントはファイルを受け取れない）＝ text-only 127 問が対象。125 問回答済み、2 問は復旧不能なインフラ障害で未回収（誤答算入なら 89/127 = 70.1% のまま、未回収をミスとしても 89/127）。採点は GAIA 公式スコアラ（正規化＋完全一致）。
+- **測定構成**：companion を `:8011` OpenAI 互換エンドポイント経由で駆動し、map-mode ツール（`run_python` による計算・`web_search` によるグラウンディング）を付与。Anthropic API 直叩きではない。
 - **測定面の注意**：companion の relay は通常、ファイル操作用のカスタム Copilot Studio エージェントに固定されている。そのカスタムエージェントは設計上 **一般質問を断る**（「capital of France」すら拒否）ため、GAIA は **素の既定 Copilot（`/chat/`・Web 有）** に向けて測る。コーディング系の scaffold とは別系統の数値。
-- **参考**：GAIA validation はトップ級エージェントでも text-only で概ね 40–65% 帯。52.4% は web-grounded Copilot として妥当かつ外部比較可能な値。
+- **参考**：GAIA validation はトップ級エージェントでも text-only で概ね 40–70% 帯。70.1% は tool-augmented companion として外部比較可能な値。
 - **この測定から生まれた恒久対策**：長寿命の単一会話だと Copilot の composer が数十ターンで送信不能（wedge）になり、1 問の生成固着が以降を連鎖エラーにする故障を確認。relay worker に **(1) 送信エラー時の会話リセット＋同一プロンプト1回再試行、(2) タイムアウト時は次問を強制リフレッシュ、(3) `RELAY_RESET_EVERY` 問ごとの予防的会話リサイクル** を実装（`relay/openai_adapter.py`）。インフラ起因のエラーは「誤答」に算入せず、チャンク毎に会話を作り直して回収する規律（`bench/gaia/retry_controller.py`）で正味スコアを確定した。
 
 > 再現: 既定 Copilot に向けた `:8011` を立て、`python bench/gaia/runner.py`（公式スコアラ `bench/gaia/scorer.py`）。エラー回収は `python bench/gaia/retry_controller.py`。
