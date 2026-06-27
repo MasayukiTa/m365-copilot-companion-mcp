@@ -1098,80 +1098,150 @@ class ChatWindow : Window
             int c = b.Ts.CompareTo(a.Ts);            // descending Ts (newest first)
             return c != 0 ? c : idx[a].CompareTo(idx[b]);   // stable tiebreak on original index
         });
-        _convList.Children.Clear();
+
+        // Partition into three sections (all derived from existing fields, no new persistent state):
+        //   fleet  -- Source == "fleet"
+        //   today  -- non-fleet, Ts falls within the current local calendar day
+        //   older  -- non-fleet, everything else (Ts==0 falls here too)
+        bool ja = _lang == 0;
+        var todayStart = DateTime.Today;              // local midnight of today
+        var epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var fleetList  = new List<Conversation>();
+        var todayList  = new List<Conversation>();
+        var olderList  = new List<Conversation>();
         foreach (var c in _all)
         {
-            var cc = c;
-            if (_renamingId == cc.Id)
+            if (c.Source == "fleet")
             {
-                var ed = new TextBox { Text = cc.Title, Margin = new Thickness(0, 2, 0, 2), Padding = new Thickness(7, 5, 7, 5), BorderThickness = new Thickness(1) };
-                SetRef(ed, BackgroundProperty, "Panel"); SetRef(ed, ForegroundProperty, "Fg"); SetRef(ed, Control.BorderBrushProperty, "Accent");
-                ed.Loaded += delegate { ed.Focus(); ed.SelectAll(); };
-                ed.KeyDown += delegate (object s, KeyEventArgs e)
-                {
-                    if (e.Key == Key.Enter) { cc.Title = ed.Text.Trim().Length > 0 ? ed.Text.Trim() : cc.Title; _renamingId = null; SaveConversation(cc); RefreshConvList(); }
-                    else if (e.Key == Key.Escape) { _renamingId = null; RefreshConvList(); }
-                };
-                ed.LostFocus += delegate { if (_renamingId == cc.Id) { cc.Title = ed.Text.Trim().Length > 0 ? ed.Text.Trim() : cc.Title; _renamingId = null; SaveConversation(cc); RefreshConvList(); } };
-                _convList.Children.Add(ed);
-                continue;
+                fleetList.Add(c);
             }
-            // row = background border (active/inactive) holding [ title | hover trash ]
-            var rowBorder = new Border { CornerRadius = new CornerRadius(7), Margin = new Thickness(0, 1, 0, 1) };
-            SetRef(rowBorder, BackgroundProperty, cc.Id == _conv.Id ? "Panel" : "PanelAlt");
-            var rowGrid = new Grid();
-            rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            var dt = cc.Untitled() ? T("newchat") : cc.Title;
-            // Two-line wrapping label instead of a hard 26-char cut: many SWE goals share the same
-            // prefix ("あなたは実在の Python ライブラリ ...") and a 1-line cut hid the distinguishing
-            // library name, making rows indistinguishable. (GAP 4)
-            var lbl = new TextBlock
+            else
             {
-                Text = dt, TextWrapping = TextWrapping.Wrap, MaxHeight = 36,
-                TextTrimming = TextTrimming.CharacterEllipsis, FontSize = 13,
-                FontWeight = cc.Id == _conv.Id ? FontWeights.SemiBold : FontWeights.Normal
-            };
-            var b = new Button
-            {
-                Content = lbl,
-                HorizontalContentAlignment = HorizontalAlignment.Left, MinHeight = 36,
-                Padding = new Thickness(9, 4, 9, 4), BorderThickness = new Thickness(0), Cursor = Cursors.Hand,
-                Background = Brushes.Transparent, ToolTip = dt
-            };
-            SetRef(b, ForegroundProperty, cc.Id == _conv.Id ? "Fg" : "Muted");
-            b.Click += delegate { OpenConversation(cc); };
-            var miR = new MenuItem { Header = T("rename") };   // rename stays on right-click
-            miR.Click += delegate { _renamingId = cc.Id; RefreshConvList(); };
-            var menu = new ContextMenu(); menu.Items.Add(miR); b.ContextMenu = menu;
-            Grid.SetColumn(b, 0); rowGrid.Children.Add(b);
-            // trash icon (Segoe MDL2 Assets), revealed on row hover
-            var trash = new Button
-            {
-                Content = "", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 13,
-                Width = 32, Height = 36, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
-                Cursor = Cursors.Hand, ToolTip = T("delete")
-            };
-            SetRef(trash, ForegroundProperty, "Muted");
-            trash.Click += delegate { ShowDeleteBanner(cc); };
-            // Delete is now PERSISTENTLY visible (not hover-only) so it is discoverable; rename
-            // rides a right-click menu on the same visible icon (and still on the row). An
-            // empty/untitled new chat has nothing to act on, so it shows no actions. (friction #17)
-            // A conversation is actionable (deletable/renamable) if it is a REAL saved conversation
-            // -- which includes registry/fleet convs that have a title but an empty conv_url (the new
-            // agent never captured one). Keying only on messages/conv_url hid the trash icon for the
-            // whole top section of the sidebar; a title is the reliable "this is a real chat" signal.
-            bool actionable = cc.Messages.Count > 0 || !string.IsNullOrEmpty(cc.ConvUrl)
-                              || !string.IsNullOrEmpty(cc.Title);
-            trash.Visibility = actionable ? Visibility.Visible : Visibility.Collapsed;
-            var trMenu = new ContextMenu();
-            var trRename = new MenuItem { Header = T("rename") };
-            trRename.Click += delegate { _renamingId = cc.Id; RefreshConvList(); };
-            trMenu.Items.Add(trRename); trash.ContextMenu = trMenu;
-            Grid.SetColumn(trash, 1); rowGrid.Children.Add(trash);
-            rowBorder.Child = rowGrid;
-            _convList.Children.Add(rowBorder);
+                if (c.Ts > 0)
+                {
+                    var dt = epoch.AddSeconds(c.Ts).ToLocalTime();
+                    if (dt >= todayStart)
+                        todayList.Add(c);
+                    else
+                        olderList.Add(c);
+                }
+                else
+                {
+                    olderList.Add(c);
+                }
+            }
         }
+
+        _convList.Children.Clear();
+
+        // Emit each non-empty section with a muted header then its rows.
+        if (fleetList.Count > 0)
+        {
+            _convList.Children.Add(MakeSectionHeader(ja ? "フリート" : "Fleet runs"));
+            foreach (var c in fleetList) AddConvRow(c, true);
+        }
+        if (todayList.Count > 0)
+        {
+            _convList.Children.Add(MakeSectionHeader(ja ? "今日" : "Today"));
+            foreach (var c in todayList) AddConvRow(c, false);
+        }
+        if (olderList.Count > 0)
+        {
+            _convList.Children.Add(MakeSectionHeader(ja ? "これまで" : "Earlier"));
+            foreach (var c in olderList) AddConvRow(c, false);
+        }
+    }
+
+    // Builds and returns a small muted section-header TextBlock.
+    TextBlock MakeSectionHeader(string label)
+    {
+        var hdr = new TextBlock
+        {
+            Text = label, FontSize = 11, FontWeight = FontWeights.SemiBold,
+            Margin = new Thickness(6, 12, 6, 4)
+        };
+        SetRef(hdr, TextBlock.ForegroundProperty, "Faint");
+        return hdr;
+    }
+
+    // Builds and appends one conversation row (or an inline rename editor) into _convList.
+    // isFleet: rows from the Fleet section use "Muted" foreground even when unselected --
+    // they read as quieter navigation, no accent treatment.
+    void AddConvRow(Conversation cc, bool isFleet)
+    {
+        if (_renamingId == cc.Id)
+        {
+            var ed = new TextBox { Text = cc.Title, Margin = new Thickness(0, 2, 0, 2), Padding = new Thickness(7, 5, 7, 5), BorderThickness = new Thickness(1) };
+            SetRef(ed, BackgroundProperty, "Panel"); SetRef(ed, ForegroundProperty, "Fg"); SetRef(ed, Control.BorderBrushProperty, "Accent");
+            ed.Loaded += delegate { ed.Focus(); ed.SelectAll(); };
+            ed.KeyDown += delegate (object s, KeyEventArgs e)
+            {
+                if (e.Key == Key.Enter) { cc.Title = ed.Text.Trim().Length > 0 ? ed.Text.Trim() : cc.Title; _renamingId = null; SaveConversation(cc); RefreshConvList(); }
+                else if (e.Key == Key.Escape) { _renamingId = null; RefreshConvList(); }
+            };
+            ed.LostFocus += delegate { if (_renamingId == cc.Id) { cc.Title = ed.Text.Trim().Length > 0 ? ed.Text.Trim() : cc.Title; _renamingId = null; SaveConversation(cc); RefreshConvList(); } };
+            _convList.Children.Add(ed);
+            return;
+        }
+
+        bool isActive = cc.Id == _conv.Id;
+        // row = background border: active gets PanelAlt (surfaceSubtle, quiet selected state);
+        // non-selected rows are transparent so only the active row is visually distinct.
+        var rowBorder = new Border { CornerRadius = new CornerRadius(7), Margin = new Thickness(0, 1, 0, 1) };
+        if (isActive)
+            SetRef(rowBorder, BackgroundProperty, "PanelAlt");
+        else
+            rowBorder.Background = Brushes.Transparent;
+
+        var rowGrid = new Grid { MinHeight = 46 };
+        rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        var titleText = cc.Untitled() ? T("newchat") : cc.Title;
+        // Single-line with ellipsis at ~46px row height.
+        var lbl = new TextBlock
+        {
+            Text = titleText, TextWrapping = TextWrapping.NoWrap,
+            TextTrimming = TextTrimming.CharacterEllipsis, FontSize = 13,
+            FontWeight = isActive ? FontWeights.SemiBold : FontWeights.Normal,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        var b = new Button
+        {
+            Content = lbl,
+            HorizontalContentAlignment = HorizontalAlignment.Left,
+            Padding = new Thickness(9, 0, 9, 0), BorderThickness = new Thickness(0),
+            Cursor = Cursors.Hand, Background = Brushes.Transparent, ToolTip = titleText
+        };
+        // Active row: full Fg; all non-active rows (fleet and chat): Muted.
+        SetRef(b, ForegroundProperty, isActive ? "Fg" : "Muted");
+        b.Click += delegate { OpenConversation(cc); };
+        var miR = new MenuItem { Header = T("rename") };   // rename stays on right-click
+        miR.Click += delegate { _renamingId = cc.Id; RefreshConvList(); };
+        var menu = new ContextMenu(); menu.Items.Add(miR); b.ContextMenu = menu;
+        Grid.SetColumn(b, 0); rowGrid.Children.Add(b);
+
+        // trash icon (Segoe MDL2 Assets) -- persistently visible when actionable.
+        // Delete is intentionally always-visible (not hover-only) for discoverability (friction #17).
+        var trash = new Button
+        {
+            Content = "", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 13,
+            Width = 32, Height = 46, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
+            Cursor = Cursors.Hand, ToolTip = T("delete")
+        };
+        SetRef(trash, ForegroundProperty, "Muted");
+        trash.Click += delegate { ShowDeleteBanner(cc); };
+        // A conversation is actionable (deletable/renamable) if it is a real saved conversation.
+        bool actionable = cc.Messages.Count > 0 || !string.IsNullOrEmpty(cc.ConvUrl)
+                          || !string.IsNullOrEmpty(cc.Title);
+        trash.Visibility = actionable ? Visibility.Visible : Visibility.Collapsed;
+        var trMenu = new ContextMenu();
+        var trRename = new MenuItem { Header = T("rename") };
+        trRename.Click += delegate { _renamingId = cc.Id; RefreshConvList(); };
+        trMenu.Items.Add(trRename); trash.ContextMenu = trMenu;
+        Grid.SetColumn(trash, 1); rowGrid.Children.Add(trash);
+        rowBorder.Child = rowGrid;
+        _convList.Children.Add(rowBorder);
     }
 
     // STEER-mode signal: when viewing a parallel-task conversation, anything you type interrupts
