@@ -2811,56 +2811,14 @@ class CockpitWindow : Window
         };
         col.Children.Add(ml);
 
+        // Expanded detail is organized into tabs (spec): Overview (default) / Conversation /
+        // Review / Logs -- so raw transcript, refuter notes and internal fields no longer all
+        // dump onto the surface at once. Heavy content is built ONLY when expanded.
         if (isOpen)
         {
-            // expanded: full goal, wrapped, as secondary (muted) text -- selectable/copyable
-            // read-only TextBox (Feature A). The headline above is the primary label.
-            var g = new TextBox();
-            g.Text = goal;
-            g.Foreground = Muted; g.FontSize = 12.5;
-            g.IsReadOnly = true; g.BorderThickness = new Thickness(0);
-            g.Background = Brushes.Transparent; g.Padding = new Thickness(0);
-            g.IsTabStop = false; g.TextWrapping = TextWrapping.Wrap;
-            g.Margin = new Thickness(0, 8, 0, 8);
-            SwallowMouseUp(g);
-            col.Children.Add(g);
-        }
-
-        // Heavy detail (mini-chat + live progress quote + steer TextBox) ONLY when expanded. This
-        // is the whole point: a collapsed fleet of 100+ tasks builds no quotes and no input
-        // controls, and -- via Sig() -- doesn't even re-render while a collapsed worker streams.
-        if (isOpen)
-        {
-            // #14 mini-chat: the last few turns from the worker's disk transcript, so you can read
-            // recent context AND steer from the cockpit card without switching to the chat window.
-            // Collapsed cards (the default) build none of this -- minimized by default, as asked.
-            string tpath = S(w, "transcript");
-            if (!string.IsNullOrEmpty(tpath))
-            {
-                var mini = MiniThread(tpath);
-                if (mini != null) col.Children.Add(mini);
-            }
-            string body = !string.IsNullOrEmpty(last) ? last : reason;
-            if (!string.IsNullOrEmpty(body))
-            {
-                var quote = new Border();
-                quote.Background = QuoteBg; quote.CornerRadius = new CornerRadius(8);
-                quote.Padding = new Thickness(12, 10, 12, 10);
-                quote.Margin = new Thickness(0, 0, 0, 0);
-                // selectable/copyable read-only TextBox (Feature A)
-                var bt = new TextBox();
-                bt.Text = body; bt.Foreground = Muted; bt.FontSize = 12.5;
-                bt.IsReadOnly = true; bt.BorderThickness = new Thickness(0);
-                bt.Background = Brushes.Transparent; bt.Padding = new Thickness(0);
-                bt.IsTabStop = false; bt.TextWrapping = TextWrapping.Wrap; bt.MaxHeight = 120;
-                bt.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
-                SwallowMouseUp(bt);
-                quote.Child = bt;
-                col.Children.Add(quote);
-            }
-
+            col.Children.Add(BuildCardTabs(w, name, goal, last, reason, terminal));
+            // Actions live BELOW the tabs (not inside one) so steer/retry are always reachable.
             if (!terminal) col.Children.Add(SteerRow(name));
-            // Feature C: retry stopped tasks -- terminal & NOT DONE gets a Retry button.
             else if (S(w, "outcome") != "DONE") col.Children.Add(RetryRow(w));
         }
 
@@ -2874,6 +2832,184 @@ class CockpitWindow : Window
         card.MouseLeftButtonUp += delegate { OpenWorker(wname, url); };
         card.ToolTip = _lang == 0 ? "クリックでこの会話をメインに表示" : "Click to open this conversation in the chat";
         return card;
+    }
+
+    // Per-card selected tab (0=Overview,1=Conversation,2=Review,3=Logs). Persisted so a streaming
+    // worker's open tab doesn't snap back to Overview on each status re-render.
+    Dictionary<string, int> _cardTab = new Dictionary<string, int>();
+
+    // Expanded-card tab group (spec): Overview default; raw transcript/refuter/internal fields live
+    // behind Conversation/Review/Logs instead of all dumping onto the surface. Clicking a tab flips
+    // panel visibility in place (no re-render needed); the choice is remembered in _cardTab.
+    UIElement BuildCardTabs(Dictionary<string, object> w, string name, string goal, string last, string reason, bool terminal)
+    {
+        int sel = _cardTab.ContainsKey(name) ? _cardTab[name] : 0;
+        string outcome = S(w, "outcome");
+        bool done = outcome == "DONE";
+        int reviews = I(w, "verify_attempts");
+        bool verifiedOk = string.Equals(S(w, "verified"), "True", StringComparison.OrdinalIgnoreCase);
+        string tpath = S(w, "transcript");
+
+        var wrap = new StackPanel { Margin = new Thickness(24, 12, 0, 2) };
+
+        var panels = new UIElement[] {
+            TabOverview(goal, last, outcome, terminal, reviews, verifiedOk),
+            TabConversation(tpath),
+            TabReview(reason, done, terminal, reviews),
+            TabLogs(w, reason)
+        };
+        string[] labels = _lang == 0 ? new string[] { "概要", "会話", "レビュー", "ログ" }
+                                      : new string[] { "Overview", "Conversation", "Review", "Logs" };
+
+        var strip = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 10) };
+        var txts = new TextBlock[4];
+        var unders = new Border[4];
+        for (int i = 0; i < 4; i++)
+        {
+            int idx = i;
+            var tcol = new StackPanel();
+            var tt = new TextBlock { Text = labels[i], FontSize = 12.5, Margin = new Thickness(0, 0, 0, 4) };
+            var un = new Border { Height = 2, CornerRadius = new CornerRadius(1) };
+            tcol.Children.Add(tt); tcol.Children.Add(un);
+            txts[i] = tt; unders[i] = un;
+            var box = new Border { Child = tcol, Cursor = Cursors.Hand, Background = Brushes.Transparent, Margin = new Thickness(0, 0, 16, 0) };
+            box.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                _cardTab[name] = idx;
+                for (int j = 0; j < 4; j++)
+                {
+                    panels[j].Visibility = j == idx ? Visibility.Visible : Visibility.Collapsed;
+                    PaintTab(txts[j], unders[j], j == idx);
+                }
+            };
+            strip.Children.Add(box);
+        }
+        wrap.Children.Add(strip);
+        for (int i = 0; i < 4; i++)
+        {
+            panels[i].Visibility = i == sel ? Visibility.Visible : Visibility.Collapsed;
+            PaintTab(txts[i], unders[i], i == sel);
+            wrap.Children.Add(panels[i]);
+        }
+        return wrap;
+    }
+
+    void PaintTab(TextBlock t, Border underline, bool active)
+    {
+        t.Foreground = active ? Fg : Muted;
+        t.FontWeight = active ? FontWeights.SemiBold : FontWeights.Normal;
+        underline.Background = active ? Theme.Br(Theme.Accent(_dark)) : Brushes.Transparent;
+    }
+
+    TextBlock SectLabel(string s)
+    {
+        return new TextBlock { Text = s, Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 11.5,
+                               FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 10, 0, 4) };
+    }
+
+    TextBox RoText(string s, Brush fg, double size)
+    {
+        var t = new TextBox { Text = s, Foreground = fg, FontSize = size, IsReadOnly = true,
+            BorderThickness = new Thickness(0), Background = Brushes.Transparent, Padding = new Thickness(0),
+            IsTabStop = false, TextWrapping = TextWrapping.Wrap, MaxHeight = 160,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+        SwallowMouseUp(t);
+        return t;
+    }
+
+    UIElement TabOverview(string goal, string last, string outcome, bool terminal, int reviews, bool verifiedOk)
+    {
+        var sp = new StackPanel();
+        sp.Children.Add(SectLabel(_lang == 0 ? "結果" : "Result"));
+        string result = !string.IsNullOrEmpty(last) ? last
+                        : (terminal ? OutcomeLabel(outcome) : (_lang == 0 ? "実行中…" : "Working…"));
+        sp.Children.Add(RoText(result, Fg, 13));
+
+        var checks = new List<string>();
+        if (!string.IsNullOrEmpty(last)) checks.Add(_lang == 0 ? "エージェント応答を取得" : "Agent response captured");
+        if (reviews > 0) checks.Add(_lang == 0 ? ("レビュー " + reviews + " 回実施") : ("Reviewed " + reviews + " time(s)"));
+        if (verifiedOk) checks.Add(_lang == 0 ? "検証OK" : "Verified");
+        if (terminal) checks.Add(OutcomeLabel(outcome));
+        if (checks.Count > 0)
+        {
+            sp.Children.Add(SectLabel(_lang == 0 ? "チェック" : "Checks"));
+            foreach (var c in checks)
+                sp.Children.Add(new TextBlock { Text = "・" + c, Foreground = Muted, FontSize = 12.5, Margin = new Thickness(0, 1, 0, 1) });
+        }
+
+        sp.Children.Add(SectLabel(_lang == 0 ? "指示" : "Goal"));
+        sp.Children.Add(RoText(goal, Muted, 12.5));
+        return sp;
+    }
+
+    UIElement TabConversation(string tpath)
+    {
+        if (!string.IsNullOrEmpty(tpath))
+        {
+            var mini = MiniThread(tpath);
+            if (mini != null) return mini;
+        }
+        return new TextBlock { Text = _lang == 0 ? "（会話の履歴はまだありません）" : "(No conversation yet)",
+                               Foreground = Muted, FontSize = 12.5 };
+    }
+
+    UIElement TabReview(string reason, bool done, bool terminal, int reviews)
+    {
+        var sp = new StackPanel();
+        if (done)
+        {
+            // DONE: never surface raw "REFUTED" -- frame review as the check that it was.
+            sp.Children.Add(new TextBlock {
+                Text = _lang == 0 ? "レビューで内容を確認し、最終回答を確定しました。"
+                                  : "Review checked the work and the final answer was confirmed.",
+                Foreground = Muted, FontSize = 12.5, TextWrapping = TextWrapping.Wrap });
+            if (reviews > 0)
+                sp.Children.Add(new TextBlock {
+                    Text = (_lang == 0 ? "確認回数: " : "Review passes: ") + reviews,
+                    Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 12, Margin = new Thickness(0, 4, 0, 0) });
+        }
+        else if (terminal && !string.IsNullOrEmpty(reason))
+        {
+            sp.Children.Add(SectLabel(_lang == 0 ? "レビュー指摘" : "Review note"));
+            sp.Children.Add(RoText(reason, Muted, 12.5));
+        }
+        else
+        {
+            sp.Children.Add(new TextBlock {
+                Text = _lang == 0 ? "（レビュー記録はまだありません）" : "(No review notes yet)",
+                Foreground = Muted, FontSize = 12.5 });
+        }
+        return sp;
+    }
+
+    UIElement TabLogs(Dictionary<string, object> w, string reason)
+    {
+        var sb = new StringBuilder();
+        sb.Append("status=").Append(S(w, "status")).Append("  outcome=").Append(S(w, "outcome"));
+        sb.Append("  turn=").Append(S(w, "turn")).Append("  verify_attempts=").Append(S(w, "verify_attempts"));
+        sb.Append("  verified=").Append(S(w, "verified")).Append('\n');
+        if (!string.IsNullOrEmpty(reason)) sb.Append("\nreason:\n").Append(reason).Append('\n');
+        var box = new Border { Background = QuoteBg, CornerRadius = new CornerRadius(8), Padding = new Thickness(12, 10, 12, 10) };
+        var t = RoText(sb.ToString(), Muted, 12);
+        t.FontFamily = new FontFamily(Theme.CodeFont);
+        t.MaxHeight = 220;
+        box.Child = t;
+        return box;
+    }
+
+    string OutcomeLabel(string outcome)
+    {
+        bool ja = _lang == 0;
+        switch (outcome)
+        {
+            case "DONE": return ja ? "完了" : "Done";
+            case "MAXTURNS": return ja ? "ターン上限に到達" : "Hit turn limit";
+            case "STUCK": return ja ? "停滞して終了" : "Stuck";
+            case "ERROR": return ja ? "エラーで終了" : "Error";
+            case "CANCELLED": return ja ? "停止されました" : "Cancelled";
+            default: return string.IsNullOrEmpty(outcome) ? "" : outcome;
+        }
     }
 
     // #14 mini-chat: the last few turns of a worker's disk transcript, as a compact scrollable
