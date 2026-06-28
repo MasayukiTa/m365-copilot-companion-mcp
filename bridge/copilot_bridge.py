@@ -633,12 +633,149 @@ def _is_proc(t: str) -> bool:
     return (not t) or (any(m in t for m in PROCESSING_MARKERS) and len(t) < 40)
 
 
+# Search/tool-status lines that appear in [data-testid="loading-message"] while Copilot
+# is running a web search.  We suppress them entirely (no length cap) so they are never
+# streamed as a prefix of the real answer.
+_SEARCH_STATUS_MARKERS = (
+    "を検索しています",
+    "を検索中",
+    "検索しています",
+    "Searching",
+    "調べています",
+    "情報を探しています",
+    "処理しています…",
+    "Working on",
+    "考えています",
+)
+
+
+def _is_search_status(t: str) -> bool:
+    """Return True when `t` is a loading/search-status line (no length cap)."""
+    t = (t or "").strip()
+    return bool(t) and any(m in t for m in _SEARCH_STATUS_MARKERS)
+
+
 def _text(sel: str) -> str:
     try:
         loc = PAGE.locator(sel)
         return (loc.last.inner_text() or "").strip() if loc.count() else ""
     except Exception:
         return ""
+
+
+# JS run in the page to extract the LAST assistant answer cleanly:
+#  - Selects the last [data-testid="markdown-reply"]; falls back to lastChatMessage.
+#  - Deep-clones the node and strips all chrome (citations, suggestions, feedback buttons).
+#  - Replaces each .monaco-editor with a fenced code block extracted from Monaco models
+#    or, as a best-effort fallback, from the visible .view-lines (Monaco virtualizes long
+#    blocks, so only visible lines may be returned for very long code).
+#  - Returns clone.innerText trimmed, or "" on any error (never throws into Python).
+_CLEAN_ANSWER_JS = r"""
+() => {
+  try {
+    // --- 1. Find the answer node ---
+    var answerNode = null;
+    var mrList = document.querySelectorAll('[data-testid="markdown-reply"]');
+    if (mrList.length > 0) {
+      answerNode = mrList[mrList.length - 1];
+    } else {
+      var lcList = document.querySelectorAll('[data-testid="lastChatMessage"]');
+      if (lcList.length > 0) answerNode = lcList[lcList.length - 1];
+    }
+    if (!answerNode) return "";
+
+    // --- 2. Extract Monaco code blocks from the ORIGINAL node (before cloning) ---
+    var monacoEditors = answerNode.querySelectorAll('.monaco-editor');
+    var monacoTexts = [];
+    for (var mi = 0; mi < monacoEditors.length; mi++) {
+      var code = "";
+      try {
+        if (window.monaco && window.monaco.editor && window.monaco.editor.getModels) {
+          var models = window.monaco.editor.getModels();
+          if (mi < models.length) {
+            try { code = models[mi].getValue() || ""; } catch(e2) { code = ""; }
+          }
+        }
+      } catch(e) {}
+      if (!code) {
+        // Fallback: read .view-lines (best-effort; only visible lines for long blocks)
+        try {
+          var vl = monacoEditors[mi].querySelectorAll('.view-line');
+          var lines = [];
+          for (var li = 0; li < vl.length; li++) {
+            lines.push(vl[li].textContent || "");
+          }
+          code = lines.join("\n");
+        } catch(e) { code = ""; }
+      }
+      monacoTexts.push(code || "[code]");
+    }
+
+    // --- 3. Deep-clone so we don't mutate the live page ---
+    var clone = answerNode.cloneNode(true);
+
+    // --- 4. Remove chrome from the clone ---
+    var removeSelectors = [
+      '[data-testid="foot-note-div"]',
+      '[data-testid="sources-button-testid"]',
+      '[data-testid="web-search-info-icon"]',
+      '[data-testid="messageAttributionIcon"]',
+      '[data-testid="chat-suggestion"]',
+      '[data-testid="chat-response-message-disclaimer"]',
+      '[data-testid="CopyButtonContainerTestId"]',
+      '[data-testid="feedback-button-testid"]',
+      '[data-testid="FeedbackContainerTestId"]',
+      '[data-testid="overflow-menu-button"]',
+      'sup',
+      'button'
+    ];
+    // Class-based selectors (case-insensitive substring matching via attribute selector)
+    var classRemoveSelectors = [
+      '[class*="citation"]',
+      '[class*="foot-note"]',
+      '[class*="reference"]'
+    ];
+    var allRemove = removeSelectors.concat(classRemoveSelectors);
+    for (var si = 0; si < allRemove.length; si++) {
+      try {
+        var toRemove = clone.querySelectorAll(allRemove[si]);
+        for (var ri = 0; ri < toRemove.length; ri++) {
+          try { toRemove[ri].parentNode.removeChild(toRemove[ri]); } catch(e) {}
+        }
+      } catch(e) {}
+    }
+
+    // --- 5. Replace .monaco-editor placeholders in the clone with fenced text nodes ---
+    var cloneMonacos = clone.querySelectorAll('.monaco-editor');
+    for (var ci = 0; ci < cloneMonacos.length; ci++) {
+      var codeText = (ci < monacoTexts.length) ? monacoTexts[ci] : "[code]";
+      var fenced = "\n```\n" + codeText + "\n```\n";
+      try {
+        var textNode = document.createTextNode(fenced);
+        cloneMonacos[ci].parentNode.replaceChild(textNode, cloneMonacos[ci]);
+      } catch(e) {}
+    }
+
+    // --- 6. Return trimmed innerText ---
+    return (clone.innerText || "").trim();
+  } catch(e) {
+    return "";
+  }
+}
+"""
+
+
+def _clean_answer_text() -> "str | None":
+    """Extract the last assistant answer with citations/chrome stripped and Monaco
+    code blocks inlined as fenced blocks.  Returns the cleaned string, or None if
+    extraction failed or yielded empty (caller falls back to _text(LASTMSG))."""
+    try:
+        result = PAGE.evaluate(_CLEAN_ANSWER_JS)
+        if result and isinstance(result, str) and result.strip():
+            return result.strip()
+        return None
+    except Exception:
+        return None
 
 
 # JS run inside the page to scrape every turn in DOM order with its author role.
@@ -1386,9 +1523,9 @@ class Handler(BaseHTTPRequestHandler):
             t0 = time.time()
             while time.time() - t0 < 600:
                 partial = _text(LOADING)
-                final = _text(LASTMSG)
-                # stream growing partial (skip the brief "処理中" placeholder)
-                if not _is_proc(partial) and len(partial) > sent:
+                _cleaned = _clean_answer_text(); final = _cleaned if _cleaned else _text(LASTMSG)
+                # stream growing partial (skip "処理中" AND search-status lines)
+                if not _is_proc(partial) and not _is_search_status(partial) and len(partial) > sent:
                     self._sse({"delta": partial[sent:]})
                     sent = len(partial)
                 # lastChatMessage populated -- but it can KEEP GROWING after it first
@@ -1419,7 +1556,7 @@ class Handler(BaseHTTPRequestHandler):
                             stable_text, stable_since = final, time.time()
                         time.sleep(0.3)
                         self._ping()             # detect Esc/Stop disconnect promptly
-                        final = _text(LASTMSG)
+                        _cleaned2 = _clean_answer_text(); final = _cleaned2 if _cleaned2 else _text(LASTMSG)
                         if _is_proc(final):
                             final = stable_text
                     self._sse({}, "done")
