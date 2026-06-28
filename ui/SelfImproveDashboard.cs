@@ -325,29 +325,21 @@ class SelfImproveDashboardWindow : Window
         headGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });  // subtitle row
         headGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });  // separator
 
-        // controls (top-right): refresh | lang | theme  (FIX 1b + FIX 2a: dividers between them)
+        // controls (top-right): refresh | lang | theme
         var ctrls = new StackPanel();
         ctrls.Orientation = Orientation.Horizontal;
         ctrls.VerticalAlignment = VerticalAlignment.Top;
 
-        // FIX 1b: Refresh button (no matching glyph in 8-glyph set; use Unicode ⟳ TextBlock)
+        // Refresh button (no matching glyph in 8-glyph set; use Unicode ⟳ TextBlock)
         _refreshBtn = RefreshButton();
         _refreshBtn.ToolTip = _lang == 0 ? "更新" : "Refresh";
         _refreshBtn.Click += delegate { RegenerateFeed(); };
         ctrls.Children.Add(_refreshBtn);
 
-        // FIX 2a: vertical divider between refresh and lang
-        _divider1 = MakeVDivider();
-        ctrls.Children.Add(_divider1);
-
         _langBtn = IconButton("translate", 18);
         _langBtn.ToolTip = "日本語 / English";
         _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveKey("lang", _lang.ToString()); PaintChrome(); ForceRender(); };
         ctrls.Children.Add(_langBtn);
-
-        // FIX 2a: vertical divider between lang and theme
-        _divider2 = MakeVDivider();
-        ctrls.Children.Add(_divider2);
 
         _themeBtn = IconButton(_dark ? "light_mode" : "dark_mode", 18);
         _themeBtn.ToolTip = "テーマ (ダーク/ライト)";
