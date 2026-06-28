@@ -238,22 +238,73 @@ def _pending_gates(started=0.0):
 def _clean_final_text(text, max_len=600):
     """Strip terminal markers and collapse whitespace from a worker's final assistant text.
 
-    Removes trailing lone tokens like "DONE", "<promptend>", and agent control preamble,
+    Removes trailing lone tokens like "DONE", "<promptend>", agent control preamble, and
+    agent control-word tokens (mirroring CleanAgentResultForUi's _resultPreambleTokens list),
     then collapses runs of whitespace and truncates to `max_len` chars.  Returns "" if
     `text` is falsy.
+
+    Agent control words mirrored from FleetCockpit.cs CleanAgentResultForUi()
+    (_resultPreambleTokens array, case-insensitive exact-match per line, and also stripped
+    as leading space-delimited prefixes once the text is on a single line):
+        desktopfile操作, browser操作, computeruse, Copilot, エージェント
     """
     import re
     if not text:
         return ""
+
+    # --- Agent control-word list (mirrors CleanAgentResultForUi._resultPreambleTokens) ---
+    _CTRL_TOKENS = [
+        "desktopfile操作",
+        "browser操作",
+        "computeruse",
+        "Copilot",
+        "エージェント",
+    ]
+
+    # Build a regex that matches any control token as a complete word/token.
+    # re.escape handles the Japanese characters safely.
+    _ctrl_pattern = re.compile(
+        r'(?:' + '|'.join(re.escape(tok) for tok in _CTRL_TOKENS) + r')',
+        re.IGNORECASE,
+    )
+
     t = text
-    # strip trailing terminal / control tokens (case-insensitive, allow surrounding whitespace)
+
+    # Phase 1 (multi-line): drop lines that consist solely of a control token.
+    # This matches the C# CleanAgentResultForUi per-line exact-match logic.
+    if '\n' in t or '\r' in t:
+        lines = re.split(r'\r\n|\r|\n', t)
+        kept = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped and _ctrl_pattern.fullmatch(stripped):
+                continue   # drop lines that are entirely a control token
+            kept.append(line)
+        t = '\n'.join(kept)
+
+    # Phase 2: strip trailing terminal / control tokens (case-insensitive, allow surrounding ws)
     t = re.sub(r'\s*<promptend>\s*$', '', t, flags=re.IGNORECASE)
     t = re.sub(r'\s*\bDONE\b\s*$', '', t)
-    # strip agent-control preambles that sometimes appear at the very start
+
+    # Phase 3: strip agent-control preambles at the very start (tool-call notation)
     t = re.sub(r'^\s*\[?(?:TOOL[_\-]CALL|FUNCTION[_\-]CALL|tool_call)[^\n]*\n?', '', t,
                flags=re.IGNORECASE)
-    # collapse interior whitespace and trim
+
+    # Phase 4: collapse interior whitespace to a single space and trim.
     t = re.sub(r'\s+', ' ', t).strip()
+
+    # Phase 5: strip leading control-word tokens (space-separated prefixes on the single
+    # collapsed line).  Handles the common pattern "desktopfile操作 Fleet review C DONE"
+    # -> "Fleet review C DONE".  Loop in case multiple tokens stack.
+    changed = True
+    while changed:
+        m = _ctrl_pattern.match(t)
+        if m and (len(t) == m.end() or t[m.end()] == ' '):
+            t = t[m.end():].lstrip()
+            changed = True
+        else:
+            changed = False
+
     return t[:max_len]
 
 
