@@ -3004,7 +3004,8 @@ class ChatWindow : Window
                     if (line.StartsWith("event: done")) done = true;
                     else if (line.StartsWith("data:"))
                     {
-                        var d = ExtractField(line.Substring(5).Trim(), "delta");
+                        var jsonData = line.Substring(5).Trim();
+                        var d = ExtractField(jsonData, "delta");
                         if (!string.IsNullOrEmpty(d))
                         {
                             full.Append(d);
@@ -3012,6 +3013,16 @@ class ChatWindow : Window
                             {
                                 if (!_started) { _started = true; content.Children.Clear(); _pendingText = MakeText(""); content.Children.Add(_pendingText); }
                                 _pendingText.AppendText(d); StickToEnd();
+                            }));
+                        }
+                        var rep = ExtractField(jsonData, "replace");
+                        if (!string.IsNullOrEmpty(rep))
+                        {
+                            full.Clear(); full.Append(rep);
+                            var repCopy = rep;
+                            Dispatcher.BeginInvoke(new Action(delegate
+                            {
+                                if (_pendingText != null) { _pendingText.Text = repCopy; StickToEnd(); }
                             }));
                         }
                     }
