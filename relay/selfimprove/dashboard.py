@@ -341,6 +341,19 @@ def main(argv=None) -> int:
     import sys
     args = sys.argv[1:] if argv is None else argv
     want_json = "--json" in args
+    want_write = "--write" in args
+
+    # --write: (re)generate the .fleet/selfimprove_dashboard.json feed and exit. This is what
+    # the WPF dashboard window shells out to on open / refresh so the tailed JSON is current
+    # rather than a stale snapshot. Defensive: never tracebacks, prints the path it wrote.
+    if want_write:
+        try:
+            out = write_json()
+            print(out)
+            return 0
+        except Exception as e:
+            print("write_json error: %s: %s" % (type(e).__name__, e))
+            return 1
 
     try:
         state = dashboard_state()

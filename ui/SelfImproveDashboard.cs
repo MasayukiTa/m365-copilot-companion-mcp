@@ -36,10 +36,12 @@
 // ============================================================================================
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
 using System.Web.Script.Serialization;
@@ -57,6 +59,9 @@ class SelfImproveDashboardWindow : Window
     int _lang = 0;             // 0 = Japanese, 1 = English
     long _settingsMtime = 0;
 
+    // FIX 1: regeneration throttle
+    DateTime _lastRegen = DateTime.MinValue;
+
     static readonly string SettingsFile = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
         "copilot-bridge", "settings.txt");
@@ -69,8 +74,9 @@ class SelfImproveDashboardWindow : Window
     Dictionary<string, string> _glyphs = new Dictionary<string, string>();
 
     ContentControl _iconHost;
-    TextBlock _header, _sub;
-    Button _themeBtn, _langBtn;
+    TextBlock _header, _sub, _freshnessLine;
+    Button _themeBtn, _langBtn, _refreshBtn;
+    Border _divider1, _divider2;   // vertical dividers between icon buttons
     StackPanel _body;
     ScrollViewer _sv;
     Border _headBar;
@@ -91,6 +97,8 @@ class SelfImproveDashboardWindow : Window
         _timer.Interval = TimeSpan.FromMilliseconds(1000);
         _timer.Tick += new EventHandler(OnTick);
         _timer.Start();
+        // FIX 1a: regenerate the feed on window open so data is never stale
+        RegenerateFeed();
         OnTick(null, null);
     }
 
@@ -99,6 +107,41 @@ class SelfImproveDashboardWindow : Window
         if (!string.IsNullOrEmpty(path)) return path;
         string exeDir = AppDomain.CurrentDomain.BaseDirectory;
         return Path.GetFullPath(Path.Combine(exeDir, "..", ".fleet", "selfimprove_dashboard.json"));
+    }
+
+    // FIX 1a: fire-and-forget feed regeneration via `python -m relay.selfimprove.dashboard --write`
+    // Resolves venv python from the repo root (exeDir is <repo>/ui/).
+    // Guard: ignores the call if a regen was started within the last 1500ms.
+    void RegenerateFeed()
+    {
+        try
+        {
+            if ((DateTime.Now - _lastRegen).TotalMilliseconds < 1500) return;
+            _lastRegen = DateTime.Now;
+
+            string exeDir   = AppDomain.CurrentDomain.BaseDirectory;
+            string repoRoot = Path.GetFullPath(Path.Combine(exeDir, ".."));
+            string venvPy   = Path.Combine(repoRoot, ".venv", "Scripts", "python.exe");
+            string pyExe    = File.Exists(venvPy) ? venvPy : "python";
+
+            var psi = new ProcessStartInfo();
+            psi.FileName               = pyExe;
+            psi.Arguments              = "-m relay.selfimprove.dashboard --write";
+            psi.WorkingDirectory       = repoRoot;
+            psi.UseShellExecute        = false;
+            psi.CreateNoWindow         = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError  = true;
+
+            var proc = new Process();
+            proc.StartInfo = psi;
+            proc.Start();
+            // drain output async so the process doesn't block on a full buffer
+            proc.BeginOutputReadLine();
+            proc.BeginErrorReadLine();
+            // do NOT WaitForExit -- fire-and-forget; the 1s tail timer picks up the new file
+        }
+        catch (Exception) { }
     }
 
     // ── i18n ────────────────────────────────────────────────────────────────────
@@ -282,18 +325,35 @@ class SelfImproveDashboardWindow : Window
         headGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });  // subtitle row
         headGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });  // separator
 
-        // controls (top-right): lang + theme
+        // controls (top-right): refresh | lang | theme  (FIX 1b + FIX 2a: dividers between them)
         var ctrls = new StackPanel();
         ctrls.Orientation = Orientation.Horizontal;
         ctrls.VerticalAlignment = VerticalAlignment.Top;
+
+        // FIX 1b: Refresh button (no matching glyph in 8-glyph set; use Unicode ⟳ TextBlock)
+        _refreshBtn = RefreshButton();
+        _refreshBtn.ToolTip = _lang == 0 ? "更新" : "Refresh";
+        _refreshBtn.Click += delegate { RegenerateFeed(); };
+        ctrls.Children.Add(_refreshBtn);
+
+        // FIX 2a: vertical divider between refresh and lang
+        _divider1 = MakeVDivider();
+        ctrls.Children.Add(_divider1);
+
         _langBtn = IconButton("translate", 18);
         _langBtn.ToolTip = "日本語 / English";
         _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveKey("lang", _lang.ToString()); PaintChrome(); ForceRender(); };
         ctrls.Children.Add(_langBtn);
+
+        // FIX 2a: vertical divider between lang and theme
+        _divider2 = MakeVDivider();
+        ctrls.Children.Add(_divider2);
+
         _themeBtn = IconButton(_dark ? "light_mode" : "dark_mode", 18);
         _themeBtn.ToolTip = "テーマ (ダーク/ライト)";
         _themeBtn.Click += delegate { _dark = !_dark; SaveKey("dark", _dark ? "1" : "0"); ApplyThemeBrushes(); PaintChrome(); ForceRender(); };
         ctrls.Children.Add(_themeBtn);
+
         Grid.SetColumn(ctrls, 1); Grid.SetRow(ctrls, 0);
         headGrid.Children.Add(ctrls);
 
@@ -324,6 +384,15 @@ class SelfImproveDashboardWindow : Window
         Grid.SetColumn(_sub, 0); Grid.SetColumnSpan(_sub, 2); Grid.SetRow(_sub, 1);
         headGrid.Children.Add(_sub);
 
+        // FIX 1c: freshness line (row 1 col 1, right-aligned, under the controls)
+        _freshnessLine = new TextBlock();
+        _freshnessLine.FontSize = 11;
+        _freshnessLine.Margin = new Thickness(0, 5, 0, 0);
+        _freshnessLine.TextAlignment = TextAlignment.Right;
+        _freshnessLine.VerticalAlignment = VerticalAlignment.Top;
+        Grid.SetColumn(_freshnessLine, 1); Grid.SetRow(_freshnessLine, 1);
+        headGrid.Children.Add(_freshnessLine);
+
         // separator line below the header
         var sep = new Border();
         sep.Height = 1;
@@ -353,12 +422,65 @@ class SelfImproveDashboardWindow : Window
     {
         var b = new Button();
         b.Width = 36; b.Height = 30;
-        b.Cursor = System.Windows.Input.Cursors.Hand;
+        b.Cursor = Cursors.Hand;
         b.BorderThickness = new Thickness(1);
-        b.Margin = new Thickness(4, 0, 0, 0);
+        b.Margin = new Thickness(2, 0, 2, 0);
+        b.Padding = new Thickness(5, 3, 5, 3);
         b.Content = MakeIcon(glyph, size, Fg);
         b.Tag = glyph;
+        // FIX 2b: hover affordance -- faint background tint on mouse enter/leave
+        b.MouseEnter += delegate(object s, MouseEventArgs e)
+        {
+            var btn = (Button)s;
+            btn.Background = Theme.Br(Theme.Hover(_dark));
+        };
+        b.MouseLeave += delegate(object s, MouseEventArgs e)
+        {
+            var btn = (Button)s;
+            btn.Background = BtnBg;
+        };
         return b;
+    }
+
+    // FIX 1b: Refresh button using Unicode ⟳ (no refresh/sync glyph in the 8-glyph set)
+    Button RefreshButton()
+    {
+        var b = new Button();
+        b.Width = 36; b.Height = 30;
+        b.Cursor = Cursors.Hand;
+        b.BorderThickness = new Thickness(1);
+        b.Margin = new Thickness(2, 0, 2, 0);
+        b.Padding = new Thickness(5, 3, 5, 3);
+        var t = new TextBlock();
+        t.Text = "⟳";   // ⟳  CLOCKWISE GAPPED CIRCLE ARROW
+        t.FontSize = 16;
+        t.VerticalAlignment = VerticalAlignment.Center;
+        t.HorizontalAlignment = HorizontalAlignment.Center;
+        b.Content = t;
+        b.Tag = "_refresh";
+        b.MouseEnter += delegate(object s, MouseEventArgs e)
+        {
+            var btn = (Button)s;
+            btn.Background = Theme.Br(Theme.Hover(_dark));
+        };
+        b.MouseLeave += delegate(object s, MouseEventArgs e)
+        {
+            var btn = (Button)s;
+            btn.Background = BtnBg;
+        };
+        return b;
+    }
+
+    // FIX 2a: thin vertical divider between icon buttons
+    Border MakeVDivider()
+    {
+        var d = new Border();
+        d.Width = 1;
+        d.Height = 17;
+        d.VerticalAlignment = VerticalAlignment.Center;
+        d.Margin = new Thickness(6, 0, 6, 0);
+        d.Background = Border;
+        return d;
     }
 
     void PaintChrome()
@@ -372,17 +494,32 @@ class SelfImproveDashboardWindow : Window
         _sub.Foreground = Muted;
         _sub.Text = T("win_sub");
         _iconHost.Content = MakeIcon("account_tree", 24, Fg);
-        foreach (Button b in new Button[] { _themeBtn, _langBtn })
+
+        // FIX 2c: repaint all icon buttons + dividers
+        foreach (Button b in new Button[] { _themeBtn, _langBtn, _refreshBtn })
         {
             if (b != null)
             {
-                b.Background = BtnBg;
-                b.Foreground = Fg;
+                b.Background  = BtnBg;
+                b.Foreground  = Fg;
                 b.BorderBrush = Border;
             }
         }
-        if (_themeBtn != null) _themeBtn.Content = MakeIcon(_dark ? "light_mode" : "dark_mode", 18, Fg);
-        if (_langBtn  != null) _langBtn.Content  = MakeIcon("translate", 18, Fg);
+        if (_themeBtn   != null) _themeBtn.Content  = MakeIcon(_dark ? "light_mode" : "dark_mode", 18, Fg);
+        if (_langBtn    != null) _langBtn.Content   = MakeIcon("translate", 18, Fg);
+        // _refreshBtn content is a TextBlock; repaint its Foreground
+        if (_refreshBtn != null)
+        {
+            _refreshBtn.ToolTip = _lang == 0 ? "更新" : "Refresh";
+            var tb = _refreshBtn.Content as TextBlock;
+            if (tb != null) tb.Foreground = Fg;
+        }
+        // repaint dividers with current border brush
+        if (_divider1 != null) _divider1.Background = Border;
+        if (_divider2 != null) _divider2.Background = Border;
+
+        // FIX 1c: freshness line is updated on each tick; just set colour here
+        if (_freshnessLine != null) _freshnessLine.Foreground = Muted;
     }
 
     void ForceRender() { _lastSig = ""; OnTick(null, null); }
@@ -406,6 +543,9 @@ class SelfImproveDashboardWindow : Window
         }
         catch (Exception) { }
 
+        // FIX 1c: update freshness line every tick regardless of state change
+        UpdateFreshnessLine();
+
         Dictionary<string, object> state = ReadState();
         if (state == null)
         {
@@ -421,6 +561,33 @@ class SelfImproveDashboardWindow : Window
         if (sig == _lastSig) return;
         _lastSig = sig;
         Render(state);
+    }
+
+    // FIX 1c: compute freshness from File.GetLastWriteTime(_jsonPath) and display as
+    // "更新: 10:48 (たった今 / N分前)"  /  "Updated 10:48 (just now / N min ago)"
+    void UpdateFreshnessLine()
+    {
+        if (_freshnessLine == null) return;
+        try
+        {
+            if (!File.Exists(_jsonPath)) { _freshnessLine.Text = ""; return; }
+            DateTime mtime = File.GetLastWriteTime(_jsonPath);
+            double mins = (DateTime.Now - mtime).TotalMinutes;
+            string timeStr = mtime.ToString("HH:mm");
+            string ago;
+            bool ja = _lang == 0;
+            if (mins < 1.0)
+                ago = ja ? "たった今" : "just now";
+            else if (mins < 60.0)
+                ago = ja ? ((int)mins).ToString() + "分前" : ((int)mins).ToString() + " min ago";
+            else
+            {
+                int h = (int)(mins / 60);
+                ago = ja ? h.ToString() + "時間前" : h.ToString() + " hr ago";
+            }
+            _freshnessLine.Text = (ja ? "更新: " : "Updated ") + timeStr + " (" + ago + ")";
+        }
+        catch (Exception) { _freshnessLine.Text = ""; }
     }
 
     Dictionary<string, object> ReadState()

@@ -181,12 +181,29 @@ class ChatWindow : Window
         Grid.SetRow(convScroll, 1); side.Children.Add(convScroll);
 
         var bottom = new StackPanel { Margin = new Thickness(12, 8, 12, 12) };
+        // Thin 1px horizontal rule separating the conversation list from the footer controls.
+        // Keyed to "Border" so dark/light toggle retints it automatically.
+        var sideTopDivider = new Border
+        {
+            Height = 1,
+            Margin = new Thickness(0, 0, 0, 8)
+        };
+        SetRef(sideTopDivider, BackgroundProperty, "Border");
+        bottom.Children.Add(sideTopDivider);
         // Fleet entry is a QUIET navigation item, not a large orange CTA (spec). Accent is reserved
         // for the one primary action in the main column (Send).
         _cockpitBtn = Btn(T("open_cockpit"), "PanelAlt", "Muted", true);
         _cockpitBtn.Height = 36; _cockpitBtn.Margin = new Thickness(0, 0, 0, 8); _cockpitBtn.FontSize = 12.5;
         _cockpitBtn.Click += delegate { OpenCockpit(); };
         bottom.Children.Add(_cockpitBtn);
+        // Thin 1px horizontal rule separating the Fleet/cockpit button from the lang/theme controls.
+        var sideMidDivider = new Border
+        {
+            Height = 1,
+            Margin = new Thickness(0, 0, 0, 6)
+        };
+        SetRef(sideMidDivider, BackgroundProperty, "Border");
+        bottom.Children.Add(sideMidDivider);
         _langBtn = Btn(T("lang"), "Panel", "Muted", true);
         _langBtn.Height = 34; _langBtn.Margin = new Thickness(0, 0, 0, 6); _langBtn.FontSize = 12;
         _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveSettings(); UpdateChrome(); RefreshConvList(); RerenderActiveConversation(); };
@@ -242,6 +259,16 @@ class ChatWindow : Window
         settingsBtn.ToolTip = _lang == 0 ? "設定・コックピットを開く" : "Open settings / cockpit";
         settingsBtn.Click += delegate { OpenCockpit(); };
         headRight.Children.Add(settingsBtn);
+        // Thin vertical divider between the settings button and the Fleet chip.
+        // Width=1 Border acts as a line; theme-keyed so dark/light toggle retints it.
+        var headDivider = new Border
+        {
+            Width = 1, Height = 16,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(6, 0, 6, 0)
+        };
+        SetRef(headDivider, BackgroundProperty, "Border");
+        headRight.Children.Add(headDivider);
         // Fleet active chip ("Fleet: N") -- collapsed when no active workers or status.json absent
         _fleetChipLabel = new TextBlock { FontSize = 12, VerticalAlignment = VerticalAlignment.Center };
         SetRef(_fleetChipLabel, TextBlock.ForegroundProperty, "Muted");
