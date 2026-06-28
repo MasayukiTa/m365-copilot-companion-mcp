@@ -70,6 +70,11 @@ class ChatWindow : Window
     Border _fleetStrip;                   // "CURRENT DELEGATION" strip above the composer (Option B)
     StackPanel _fleetStripBody;           // inner panel rebuilt on each refresh
     string _fleetStripSig = null;         // last-rendered signature; skip rebuild when unchanged
+    // ── sidebar collapse/expand (Codex/Claude-desktop style) ──
+    bool _sidebarCollapsed = false;
+    Border _sideBorderRef;               // the sidebar Border in root Grid col0
+    Grid _rootGrid;                      // root two-column Grid
+    Button _sideToggleBtn;              // hamburger toggle in main header far-left
     static readonly string SettingsFile = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "copilot-bridge", "settings.txt");
 
@@ -149,6 +154,7 @@ class ChatWindow : Window
         LoadSettings();
 
         var root = new Grid();
+        _rootGrid = root;
         root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(260) });
         root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
@@ -191,6 +197,7 @@ class ChatWindow : Window
         Grid.SetRow(bottom, 2); side.Children.Add(bottom);
 
         var sideBorder = new Border { Child = side, BorderThickness = new Thickness(0, 0, 1, 0) };
+        _sideBorderRef = sideBorder;
         SetRef(sideBorder, Border.BorderBrushProperty, "Border");
         Grid.SetColumn(sideBorder, 0); root.Children.Add(sideBorder);
 
@@ -201,9 +208,24 @@ class ChatWindow : Window
         main.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
         // Header: DockPanel so the right side can hold the Fleet chip + settings button.
-        var headPanel = new DockPanel { Margin = new Thickness(22, 0, 16, 0), MinHeight = 48 };
+        var headPanel = new DockPanel { Margin = new Thickness(10, 0, 16, 0), MinHeight = 48 };
+        // Far-left: sidebar toggle button (hamburger). Always visible even when sidebar is collapsed.
+        _sideToggleBtn = new Button
+        {
+            Content = "☰",   // ☰ trigram for heaven (hamburger glyph)
+            FontSize = 14,
+            Width = 36, Height = 36,
+            Cursor = Cursors.Hand,
+            BorderThickness = new Thickness(0),
+            Background = Brushes.Transparent,
+            ToolTip = (_lang == 0 ? "サイドバーを切り替える (Ctrl+B)" : "Toggle sidebar (Ctrl+B)")
+        };
+        SetRef(_sideToggleBtn, ForegroundProperty, "Muted");
+        _sideToggleBtn.Click += delegate { ToggleSidebar(); };
+        DockPanel.SetDock(_sideToggleBtn, Dock.Left);
+        headPanel.Children.Add(_sideToggleBtn);
         // Left: status dot + "Copilot" title
-        var headLeft = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+        var headLeft = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(4, 0, 0, 0) };
         _statusDot = new Border { Width = 9, Height = 9, CornerRadius = new CornerRadius(5), Margin = new Thickness(0, 1, 9, 0), VerticalAlignment = VerticalAlignment.Center };
         SetRef(_statusDot, BackgroundProperty, "Border");
         var headText = new TextBlock { Text = "Copilot", FontWeight = FontWeights.SemiBold, FontSize = 14.5, VerticalAlignment = VerticalAlignment.Center };
@@ -385,7 +407,13 @@ class ChatWindow : Window
         {
             if (e.Key == Key.Escape && _generating)
             { e.Handled = true; try { if (_activeReq != null) _activeReq.Abort(); } catch { } }
+            // Ctrl+B: toggle sidebar (Claude Code / Codex style). Fire regardless of focus;
+            // it does NOT interfere with composer Ctrl+V or Enter (different keys).
+            if (e.Key == Key.B && (Keyboard.Modifiers & ModifierKeys.Control) != 0)
+            { e.Handled = true; ToggleSidebar(); }
         };
+        // Apply persisted sidebar collapsed state AFTER the window is fully constructed.
+        if (_sidebarCollapsed) ApplySidebarState();
 
         // ① watch for the cockpit asking to open a parallel-task conversation here, and
         // sync the session-shared conversation registry (fleet + chat conversations).
@@ -1683,6 +1711,32 @@ class ChatWindow : Window
         _convList.Children.Add(rowBorder);
     }
 
+    // ── sidebar collapse / expand (Codex / Claude-desktop style) ──────────────────
+    void ToggleSidebar()
+    {
+        _sidebarCollapsed = !_sidebarCollapsed;
+        ApplySidebarState();
+        SaveSettings();
+    }
+
+    void ApplySidebarState()
+    {
+        if (_rootGrid == null || _sideBorderRef == null) return;
+        if (_sidebarCollapsed)
+        {
+            _rootGrid.ColumnDefinitions[0].Width = new GridLength(0);
+            _sideBorderRef.Visibility = Visibility.Collapsed;
+        }
+        else
+        {
+            _rootGrid.ColumnDefinitions[0].Width = new GridLength(260);
+            _sideBorderRef.Visibility = Visibility.Visible;
+        }
+        // Update the toggle button tooltip to reflect current state.
+        if (_sideToggleBtn != null)
+            _sideToggleBtn.ToolTip = (_lang == 0 ? "サイドバーを切り替える (Ctrl+B)" : "Toggle sidebar (Ctrl+B)");
+    }
+
     // STEER-mode signal: when viewing a parallel-task conversation, anything you type interrupts
     // that running worker -- a very different action from a normal chat. Make it unmistakable by
     // tinting the composer border Accent (orange) and thickening it, so the user is never surprised
@@ -2095,6 +2149,7 @@ class ChatWindow : Window
                 if (ln.StartsWith("deletemode=") && int.TryParse(ln.Substring(11).Trim(), out v)) _deleteMode = v;
                 else if (ln.StartsWith("lang=") && int.TryParse(ln.Substring(5).Trim(), out v)) _lang = v;
                 else if (ln.StartsWith("dark=")) _dark = ln.Substring(5).Trim() != "0";
+                else if (ln.StartsWith("sidebar_collapsed=")) _sidebarCollapsed = ln.Substring(18).Trim() == "1";
             }
             ApplyTheme();     // _dark may have changed -> re-apply (shared with the cockpit)
         }
@@ -2113,6 +2168,7 @@ class ChatWindow : Window
                 { "deletemode", _deleteMode.ToString() },
                 { "lang", _lang.ToString() },
                 { "dark", _dark ? "1" : "0" },
+                { "sidebar_collapsed", _sidebarCollapsed ? "1" : "0" },
             };
             var lines = new List<string>();
             var seen = new HashSet<string>();
