@@ -4662,7 +4662,7 @@ class CockpitWindow : Window
         }
         string hcanon = status == "ready" ? "waiting" : status;
         var pill = Pill(Theme.StatusLabel(hcanon, _lang), Theme.StatusRail(hcanon));
-        pill.Margin = new Thickness(0, 0, 10, 0);
+        pill.Margin = new Thickness(0, 0, 5, 0);
         DockPanel.SetDock(pill, Dock.Left);
         dp.Children.Add(pill);
         var turns = new TextBlock();
@@ -4845,7 +4845,7 @@ class CockpitWindow : Window
         var left = new DockPanel { LastChildFill = true };
         var chev = ChevronToggle(name, isOpen); DockPanel.SetDock(chev, Dock.Left); left.Children.Add(chev);
         var chip = Pill(Theme.StatusLabel(status, _lang), railKind);
-        chip.Margin = new Thickness(2, 0, 10, 0);
+        chip.Margin = new Thickness(2, 0, 5, 0);
         DockPanel.SetDock(chip, Dock.Left); left.Children.Add(chip);
         string headline = CardTitle(convTitle, goal);
         var ht = new TextBlock {
@@ -5853,8 +5853,8 @@ class CockpitWindow : Window
     {
         var hit = new Border();
         hit.Background = Brushes.Transparent;            // whole padded area is the hit target
-        hit.Padding = new Thickness(8, 8, 12, 8);
-        hit.MinWidth = 28; hit.MinHeight = 28;           // ~28x28 px target -- far easier to click
+        hit.Padding = new Thickness(8, 8, 6, 8);
+        hit.MinWidth = 24; hit.MinHeight = 28;           // ~24x28 px target -- tighter caret->chip, still easy to click
         hit.Cursor = Cursors.Hand;
         hit.VerticalAlignment = VerticalAlignment.Center;
         hit.HorizontalAlignment = HorizontalAlignment.Center;
