@@ -1272,7 +1272,9 @@ function ask(text){
   const out=add('Copilot','asst');out.classList.add('cursor');
   btn.disabled=true;
   const es=new EventSource('/stream?msg='+encodeURIComponent(text));
-  es.onmessage=e=>{const d=JSON.parse(e.data);if(d.delta){out.textContent+=d.delta;window.scrollTo(0,document.body.scrollHeight);}};
+  es.onmessage=e=>{const d=JSON.parse(e.data);
+    if(d.replace!==undefined){out.textContent=d.replace;window.scrollTo(0,document.body.scrollHeight);}
+    else if(d.delta){out.textContent+=d.delta;window.scrollTo(0,document.body.scrollHeight);}};
   es.addEventListener('done',()=>{out.classList.remove('cursor');es.close();btn.disabled=false;q.focus();});
   es.onerror=()=>{out.classList.remove('cursor');es.close();btn.disabled=false;};
 }
@@ -1572,10 +1574,20 @@ class Handler(BaseHTTPRequestHandler):
                         _cleaned2 = _clean_answer_text(); final = _cleaned2 if _cleaned2 else _text(LASTMSG)
                         if _is_proc(final):
                             final = stable_text
+                    # authoritative final: send the CLEAN body as a REPLACE so the
+                    # settled message is correct regardless of any streaming artifacts
+                    # (placeholder->answer cursor corruption, leaked loading lines).
+                    _finalclean = _clean_answer_text()
+                    if _finalclean:
+                        self._sse({"replace": _finalclean})
                     self._sse({}, "done")
                     return
                 time.sleep(0.3)
                 self._ping()                     # detect Esc/Stop disconnect promptly
+            # outer-loop timeout end: same authoritative final replace
+            _finalclean = _clean_answer_text()
+            if _finalclean:
+                self._sse({"replace": _finalclean})
             self._sse({}, "done")
         except Exception as e:
             # The client hung up (the user pressed Esc/Stop) OR a real error -- either way, click
