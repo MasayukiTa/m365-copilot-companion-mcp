@@ -5751,8 +5751,11 @@ class CockpitWindow : Window
         var b = new Border();
         b.Background = Brushes.Transparent;
         b.BorderBrush = color; b.BorderThickness = new Thickness(1);
-        b.CornerRadius = new CornerRadius(999);
-        b.Padding = new Thickness(9, 1.5, 9, 1.5);
+        // Tight rounded-rect tag (not a CornerRadius=999 stadium oval). The oval shape left
+        // empty space inside the frame on each side of a short label like "完了", which read as a
+        // floating "枠"/gap between the chip and the goal text. A small radius hugs the label.
+        b.CornerRadius = new CornerRadius(4);
+        b.Padding = new Thickness(6, 1, 6, 1);
         b.VerticalAlignment = VerticalAlignment.Center;
         var t = new TextBlock();
         t.Text = text; t.Foreground = color;
