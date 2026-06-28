@@ -181,6 +181,48 @@ def _read_goals(args):
     return goals
 
 
+def _pending_gates():
+    """Scan .companion_gates/ for unanswered HITL gates and return a list of dicts.
+
+    Each dict has: {"token", "question", "context", "ts", "path"}.
+    These are surfaced in status.json so the WPF cockpit can display them and write answers.
+
+    `path` is the ABSOLUTE path to this gate's JSON file (forward-slashed so it
+    JSON-serializes cleanly and the cockpit can open it directly WITHOUT having to
+    resolve MCP_ALLOWED_BASE itself).
+
+    Cockpit writes an answer by updating the gate file at `path`:
+      set:  {"answered": true, "answer": "approved"}   OR   {"answer": "denied"}
+    Write atomically (temp-then-rename) to avoid partial reads.
+    """
+    try:
+        import json as _json
+        from tools.file_ops import ALLOWED_BASE
+        gate_dir = ALLOWED_BASE / ".companion_gates"
+        if not gate_dir.is_dir():
+            return []
+        result = []
+        for p in gate_dir.glob("gate_*.json"):
+            try:
+                d = _json.loads(p.read_text(encoding="utf-8"))
+                if not d.get("answered"):
+                    result.append({
+                        "token": d.get("token", p.stem),
+                        "question": d.get("question", ""),
+                        "context": d.get("context", ""),
+                        "ts": d.get("asked_at", 0.0),
+                        # absolute path to THIS gate file, forward-slashed so the cockpit
+                        # can open it directly (no MCP_ALLOWED_BASE resolution needed).
+                        "path": p.resolve().as_posix(),
+                    })
+            except Exception:
+                continue
+        result.sort(key=lambda x: x["ts"])
+        return result
+    except Exception:
+        return []
+
+
 def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False,
               ram_floor_mb=0.0, directive=""):
     from relay.relay_fleet import free_disk_gb
@@ -245,7 +287,20 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
             # appended on every status TRANSITION (never duplicated). The UI renders these as
             # a real (non-fabricated) phase spine -- no agent cooperation or inference needed.
             "phase_events": list(getattr(w, "phase_events", [])),
+            # NEXT + CONFIDENCE turn markers (Bucket C, informational only -- no gate/pause):
+            # the agent MAY write "NEXT: <one-line>" and/or "CONFIDENCE: low|medium|high"
+            # before its terminal marker; the relay parses them and stores them here.
+            "next_step": getattr(w, "next_step", "") or "",
+            "self_confidence": getattr(w, "self_confidence", "") or "",
         } for w in workers],
+        # Pending HITL gates from the autonomy contract gate (contract_gate.py).
+        # Each entry: {"token": str, "question": str, "context": str, "ts": float, "path": str}
+        # `path` is the ABSOLUTE forward-slashed path to that gate's JSON file, so the
+        # cockpit can open it directly without resolving MCP_ALLOWED_BASE itself.
+        # Cockpit writes the answer by patching the file at `path`:
+        # Set {"answered": true, "answer": "approved"}  to approve
+        # Set {"answered": true, "answer": "denied"}    to deny
+        "pending_gates": _pending_gates(),
     }
 
 
@@ -844,6 +899,14 @@ def main():
             hard_reset(port)
 
     stop_wd.set()
+
+    # Deactivate the autonomy contract so the gate goes INERT after the run.
+    try:
+        from tools.contract_gate import deactivate_contract
+        deactivate_contract()
+    except Exception:
+        pass
+
     results = [results_by_goal[t] for t in gtexts if t in results_by_goal]
 
     # final snapshot + summary -- reflect the REAL outcome of each goal, not a blanket

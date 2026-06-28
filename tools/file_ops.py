@@ -183,6 +183,10 @@ def delete_path(path: str, recursive: bool = False) -> str:
     locked = require_unlocked()
     if locked:
         return locked
+    from . import contract_gate as _cg
+    _g = _cg.check_op("delete", path)
+    if _g is not None:
+        return _g
     try:
         p = _validate_path(path)
         if p == ALLOWED_BASE:
@@ -241,6 +245,10 @@ def trash_path(path: str) -> str:
     locked = require_unlocked()
     if locked:
         return locked
+    from . import contract_gate as _cg
+    _g = _cg.check_op("delete", path)
+    if _g is not None:
+        return _g
     try:
         from send2trash import send2trash
 

@@ -167,6 +167,7 @@ PROTOCOL = (
     "(まとめて読むと OpenAIModelTokenLimit で失敗)。各ターン冒頭で保存済み状態を見て未処理の続きから。"
     "深い調査は行頭 `RESEARCH: 内容`、データ分析は `ANALYZE: 絶対パス | 指示`。"
     "各ターン最終行に必ず: 続行=CONTINUE、完了(検証も通過)=DONE、行き詰まり=STUCK: 理由。"
+    "任意: 最終マーカーの直前に `NEXT: <次アクション1行>` と `CONFIDENCE: low|medium|high` を書いてよい。"
     "まず最初のステップを実行。\nGoal: "
 )
 
@@ -387,6 +388,26 @@ def extract_analyze(resp: str):
             if path:
                 return path, instr
     return None
+
+
+def extract_next(resp: str) -> str:
+    """Pull the content of a `NEXT: <...>` line if present (informational only).
+    Returns '' when not present."""
+    for line in (resp or "").splitlines():
+        m = re.match(r"\s*NEXT\s*[:：]\s*(.+)", line, re.IGNORECASE)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return ""
+
+
+def extract_confidence(resp: str) -> str:
+    """Pull the agent's self-assessment from `CONFIDENCE: low|medium|high` if present.
+    Returns '' when not present or unrecognised."""
+    for line in (resp or "").splitlines():
+        m = re.match(r"\s*CONFIDENCE\s*[:：]\s*(low|medium|high)\b", line, re.IGNORECASE)
+        if m:
+            return m.group(1).lower()
+    return ""
 
 
 def extract_forge(resp: str):
