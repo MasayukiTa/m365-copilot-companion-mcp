@@ -535,10 +535,14 @@ class CockpitWindow : Window
         _list = new ListBox();
         _list.BorderThickness = new Thickness(0);
         _list.Background = Brushes.Transparent;
-        _list.Padding = new Thickness(18, 6, 18, 24);
+        _list.Padding = new Thickness(18, 6, 18, 4);   // was bottom 24 — left a gap between the last row and the composer
         ScrollViewer.SetVerticalScrollBarVisibility(_list, ScrollBarVisibility.Auto);
         ScrollViewer.SetHorizontalScrollBarVisibility(_list, ScrollBarVisibility.Disabled);
-        ScrollViewer.SetCanContentScroll(_list, true);
+        // Pixel scroll (not item scroll) so the list can SIZE TO CONTENT inside an Auto row and
+        // therefore bottom-anchor: a short list hugs the composer (no dead gap), a long list is
+        // capped to the viewport (MaxHeight) and scrolls. Item-virtualization is traded away here;
+        // the fleet ledger row count is modest and rows are light.
+        ScrollViewer.SetCanContentScroll(_list, false);
         VirtualizingPanel.SetIsVirtualizing(_list, true);
         VirtualizingPanel.SetVirtualizationMode(_list, VirtualizationMode.Recycling);
         VirtualizingPanel.SetScrollUnit(_list, ScrollUnit.Pixel);
@@ -563,8 +567,21 @@ class CockpitWindow : Window
         Grid.SetColumn(_spinePanel, 0);
         lanesGrid.Children.Add(_spinePanel);
 
-        Grid.SetColumn(_list, 1);
-        lanesGrid.Children.Add(_list);
+        // Bottom-anchor wrapper (chat-style): a '*' spacer row absorbs the slack ABOVE the rows,
+        // so when the content is shorter than the viewport the rows sit just above the composer
+        // instead of leaving a dead void between the last row and the input. The list row is Auto
+        // (sizes to content) but the list's MaxHeight is bound to the wrapper height, so a long
+        // list is capped to the viewport and scrolls normally.
+        var listWrap = new Grid();
+        listWrap.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        listWrap.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        var maxBind = new System.Windows.Data.Binding("ActualHeight");
+        maxBind.Source = listWrap;
+        _list.SetBinding(FrameworkElement.MaxHeightProperty, maxBind);
+        Grid.SetRow(_list, 1);
+        listWrap.Children.Add(_list);
+        Grid.SetColumn(listWrap, 1);
+        lanesGrid.Children.Add(listWrap);
 
         root.Children.Add(lanesGrid);
         Content = root;
@@ -1065,7 +1082,7 @@ class CockpitWindow : Window
     UIElement BuildInputBar()
     {
         _inBar = new Border();
-        _inBar.Padding = new Thickness(Theme.PadApp, 4, Theme.PadApp, 8);
+        _inBar.Padding = new Thickness(Theme.PadApp, 0, Theme.PadApp, 8);   // was top 4 — remove the gap above the composer
         DockPanel.SetDock(_inBar, Dock.Bottom);
 
         _composerBox = new Border();
