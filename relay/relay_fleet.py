@@ -1996,5 +1996,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
              # structured phase timeline (Bucket B): all status transitions this worker went
              # through, in order. Carried into the final snapshot so the UI can show the
              # complete phase spine even after the run finishes.
-             "phase_events": list(getattr(w, "phase_events", []))}
+             "phase_events": list(getattr(w, "phase_events", [])),
+             # FIX 2 (P0): carry the worker's final assistant text so fleet_runner can
+             # populate display_result and keep `last` non-blank in the final snapshot.
+             "last_response": getattr(w, "last_response", "") or ""}
             for w in workers]
