@@ -302,7 +302,7 @@ class ChatWindow : Window
         //    footer row below with "/" affordance left and Send right — mirrors the Fleet composer).
         _input = new TextBox
         {
-            MinHeight = 50, MaxHeight = 180, AcceptsReturn = true, TextWrapping = TextWrapping.Wrap,
+            MinHeight = 40, MaxHeight = 180, AcceptsReturn = true, TextWrapping = TextWrapping.Wrap,
             VerticalScrollBarVisibility = ScrollBarVisibility.Auto, FontSize = 14,
             Padding = new Thickness(4, 4, 4, 4),
             BorderThickness = new Thickness(0), Background = Brushes.Transparent,
@@ -382,8 +382,8 @@ class ChatWindow : Window
             Child = composerInner,
             CornerRadius = new CornerRadius(10),
             BorderThickness = new Thickness(1),
-            Padding = new Thickness(12, 10, 12, 10),
-            Margin = new Thickness(0, 10, 0, 16),
+            Padding = new Thickness(12, 8, 12, 8),
+            Margin = new Thickness(0, 8, 0, 14),
             HorizontalAlignment = HorizontalAlignment.Stretch
         };
         SetRef(_composerBorder, BackgroundProperty, "PanelAlt");
@@ -1154,20 +1154,20 @@ class ChatWindow : Window
         catch { }
     }
 
-    // ── "CURRENT DELEGATION" Fleet strip (Main Option B) ──────────────────────
-    // A compact non-scrolling band between the message area and the composer that shows
-    // live fleet state inline. Collapses entirely when no workers exist.
+    // ── Fleet strip (compact one-liner above the composer) ────────────────────
+    // A single ~28px-tall band showing fleet state inline. Collapses when no
+    // workers exist or when the run completed more than 30 min ago.
     UIElement BuildFleetStrip()
     {
-        _fleetStripBody = new StackPanel { Margin = new Thickness(4, 4, 4, 4) };
+        _fleetStripBody = new StackPanel { Margin = new Thickness(0, 0, 0, 0) };
 
         _fleetStrip = new Border
         {
             Child = _fleetStripBody,
             CornerRadius = new CornerRadius(8),
             BorderThickness = new Thickness(1),
-            Padding = new Thickness(10, 8, 10, 8),
-            Margin = new Thickness(0, 0, 0, 8),
+            Padding = new Thickness(10, 4, 10, 4),
+            Margin = new Thickness(0, 0, 0, 6),
             Visibility = Visibility.Collapsed
         };
         SetRef(_fleetStrip, BackgroundProperty, "PanelAlt");
@@ -1237,16 +1237,28 @@ class ChatWindow : Window
                 return;
             }
 
-            // Check signature -- skip rebuild if nothing changed
-            string sig = FleetStripSignature(doc);
-            if (sig == _fleetStripSig && _fleetStrip.Visibility == Visibility.Visible) return;
-            _fleetStripSig = sig;
-
             // ── Compute summary values ──────────────────────────────────────────
             bool running = doc.ContainsKey("running") && doc["running"] != null && Convert.ToBoolean(doc["running"]);
             double updated = (doc.ContainsKey("updated") && doc["updated"] != null) ? Convert.ToDouble(doc["updated"]) : 0;
             double nowEpoch = (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
             double ageSec = (updated > 0) ? (nowEpoch - updated) : -1;
+
+            // Auto-hide stale completed runs — check BEFORE signature gate so it
+            // fires every tick even when status.json has not changed.
+            if (!running && ageSec > 1800)
+            {
+                if (_fleetStrip.Visibility != Visibility.Collapsed)
+                {
+                    _fleetStrip.Visibility = Visibility.Collapsed;
+                    _fleetStripSig = null;
+                }
+                return;
+            }
+
+            // Check signature -- skip rebuild if nothing changed
+            string sig = FleetStripSignature(doc);
+            if (sig == _fleetStripSig && _fleetStrip.Visibility == Visibility.Visible) return;
+            _fleetStripSig = sig;
 
             // run_label / goal_count from top-level fields (new schema)
             string runLabel = SS(doc, "run_label");
@@ -1297,205 +1309,152 @@ class ChatWindow : Window
                 freshStr = _lang == 0 ? ("最終更新 " + ageStr) : ("updated " + ageStr);
             }
 
-            // ── Rebuild inner DOM ───────────────────────────────────────────────
-            _fleetStripBody.Children.Clear();
-
+            // ── Rebuild inner DOM — single compact row ──────────────────────────
             bool allDone = !running;
             bool ja = _lang == 0;
 
-            // Header row: strip title label (left) + "フリートで開く / Open in Fleet" button (right)
-            var headRow = new DockPanel { Margin = new Thickness(0, 0, 0, 3) };
+            _fleetStripBody.Children.Clear();
 
-            // Action button docked right: real bordered button, not a bare text link
-            var openBtn = Btn(ja ? "フリートで開く" : "Open in Fleet", "PanelAlt", "Accent", true);
-            openBtn.FontSize = 11; openBtn.Height = 22;
-            openBtn.Padding = new Thickness(8, 1, 8, 1);
-            openBtn.FontWeight = FontWeights.SemiBold;
+            // Determine status dot color
+            string dotColor;
+            if (runningCount2 > 0)
+                dotColor = Theme.Info(_dark);
+            else if (attentionCount2 > 0)
+                dotColor = Theme.Warning(_dark);
+            else
+                dotColor = Theme.Success(_dark);
+
+            // Build status summary text
+            string summaryText;
+            if (runningCount2 > 0)
+                summaryText = ja ? ("実行中 " + runningCount2) : (runningCount2 + " running");
+            else
+                summaryText = ja ? (doneCount2 + "件完了") : (doneCount2 + " done");
+
+            // Build tooltip text (run_label + goal_count) — replaces the old label line
+            string tipText = runLabel;
+            if (!string.IsNullOrEmpty(tipText) && !string.IsNullOrEmpty(goalCountStr))
+                tipText = tipText + (ja ? " ・" : " ·") + goalCountStr + (ja ? "件" : " goals");
+
+            // ── Single DockPanel row ────────────────────────────────────────────
+            var row = new DockPanel { Height = 26, VerticalAlignment = VerticalAlignment.Center };
+            if (!string.IsNullOrEmpty(tipText)) row.ToolTip = tipText;
+
+            // RIGHT: compact open button
+            var openBtn = new Button
+            {
+                Content = ja ? "開く" : "Open",
+                FontSize = 11,
+                Height = 20,
+                Padding = new Thickness(8, 0, 8, 0),
+                Cursor = Cursors.Hand,
+                BorderThickness = new Thickness(1),
+                VerticalAlignment = VerticalAlignment.Center,
+                FontWeight = FontWeights.Normal
+            };
+            SetRef(openBtn, BackgroundProperty, "PanelAlt");
+            SetRef(openBtn, ForegroundProperty, "Accent");
+            SetRef(openBtn, Control.BorderBrushProperty, "Border");
             openBtn.Click += delegate { OpenCockpit(); };
             DockPanel.SetDock(openBtn, Dock.Right);
-            headRow.Children.Add(openBtn);
+            row.Children.Add(openBtn);
 
-            string headLabel = allDone
-                ? (ja ? "委任完了" : "DELEGATION COMPLETE")
-                : (ja ? "実行中の委任" : "CURRENT DELEGATION");
-            var headTb = new TextBlock
+            // LEFT: status dot + "フリート" label + summary + freshness
+            var leftStack = new StackPanel
             {
-                Text = headLabel,
-                FontSize = 10.5,
+                Orientation = Orientation.Horizontal,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+
+            // Status dot (8px circle)
+            var dot = new Border
+            {
+                Width = 8, Height = 8,
+                CornerRadius = new CornerRadius(4),
+                Margin = new Thickness(0, 0, 5, 0),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            dot.Background = new SolidColorBrush(Theme.Col(dotColor));
+            leftStack.Children.Add(dot);
+
+            // "フリート" prefix
+            var fleetLabel = new TextBlock
+            {
+                Text = "フリート",
+                FontSize = 11,
                 FontWeight = FontWeights.SemiBold,
                 VerticalAlignment = VerticalAlignment.Center
             };
-            SetRef(headTb, TextBlock.ForegroundProperty, "Muted");
-            headRow.Children.Add(headTb);
-            _fleetStripBody.Children.Add(headRow);
+            SetRef(fleetLabel, TextBlock.ForegroundProperty, "Muted");
+            leftStack.Children.Add(fleetLabel);
 
-            // ── LABEL line: run_label (or first worker goal), plus goal_count ──
-            if (!string.IsNullOrEmpty(runLabel))
+            // separator dot
+            var sep1 = new TextBlock
             {
-                string labelLine = runLabel;
-                if (!string.IsNullOrEmpty(goalCountStr))
-                    labelLine = labelLine + (ja ? " ・" : " ·") + goalCountStr + (ja ? "件" : " goals");
-                var labelTb = new TextBlock
-                {
-                    Text = labelLine,
-                    FontSize = 12,
-                    FontWeight = FontWeights.SemiBold,
-                    Margin = new Thickness(0, 2, 0, 2),
-                    TextWrapping = TextWrapping.NoWrap,
-                    TextTrimming = TextTrimming.CharacterEllipsis
-                };
-                SetRef(labelTb, TextBlock.ForegroundProperty, "Fg");
-                _fleetStripBody.Children.Add(labelTb);
-            }
+                Text = " · ",
+                FontSize = 11,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            SetRef(sep1, TextBlock.ForegroundProperty, "Faint");
+            leftStack.Children.Add(sep1);
 
-            // ── COUNTS line: done / attention / running ──
-            // Render as an inline StackPanel so attention count can be a distinct color when >0
-            var countsPanel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 1, 0, 2) };
+            // Status summary text
+            var summaryTb = new TextBlock
+            {
+                Text = summaryText,
+                FontSize = 11,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            SetRef(summaryTb, TextBlock.ForegroundProperty, "Muted");
+            leftStack.Children.Add(summaryTb);
 
-            string donePart = ja
-                ? (doneCount2 + "件完了")
-                : (doneCount2 + " done");
-            var doneTb = new TextBlock { Text = donePart, FontSize = 11.5 };
-            SetRef(doneTb, TextBlock.ForegroundProperty, "Fg");
-            countsPanel.Children.Add(doneTb);
-
-            // Attention: warning color only when >0
-            var sepTb1 = new TextBlock { Text = ja ? " · " : " · ", FontSize = 11.5 };
-            SetRef(sepTb1, TextBlock.ForegroundProperty, "Muted");
-            countsPanel.Children.Add(sepTb1);
-
-            string attPart = ja
-                ? ("要対応" + attentionCount2)
-                : (attentionCount2 + " attention");
-            var attTb = new TextBlock { Text = attPart, FontSize = 11.5 };
+            // Attention segment (Warning color when >0)
             if (attentionCount2 > 0)
-                attTb.Foreground = new SolidColorBrush(Theme.Col(Theme.Warning(_dark)));
-            else
-                SetRef(attTb, TextBlock.ForegroundProperty, "Muted");
-            countsPanel.Children.Add(attTb);
-
-            var sepTb2 = new TextBlock { Text = ja ? " · " : " · ", FontSize = 11.5 };
-            SetRef(sepTb2, TextBlock.ForegroundProperty, "Muted");
-            countsPanel.Children.Add(sepTb2);
-
-            string runPart = ja
-                ? ("実行中" + runningCount2)
-                : (runningCount2 + " running");
-            var runTb = new TextBlock { Text = runPart, FontSize = 11.5 };
-            SetRef(runTb, TextBlock.ForegroundProperty, allDone ? "Muted" : "Fg");
-            countsPanel.Children.Add(runTb);
-
-            // Freshness appended inline
-            if (!string.IsNullOrEmpty(freshStr))
             {
-                var sepTb3 = new TextBlock { Text = ja ? " · " : " · ", FontSize = 11.5 };
-                SetRef(sepTb3, TextBlock.ForegroundProperty, "Muted");
-                countsPanel.Children.Add(sepTb3);
-                var freshTb = new TextBlock { Text = freshStr, FontSize = 11.5 };
-                SetRef(freshTb, TextBlock.ForegroundProperty, "Muted");
-                countsPanel.Children.Add(freshTb);
-            }
-
-            _fleetStripBody.Children.Add(countsPanel);
-
-            // Per-lane chips (cap at 6 workers; show "+K more" if overflow)
-            var chipsPanel = new WrapPanel { Orientation = Orientation.Horizontal };
-            const int MaxChips = 6;
-            int shown = 0;
-            foreach (object o in workers)
-            {
-                var w = o as Dictionary<string, object>;
-                if (w == null) continue;
-                if (shown >= MaxChips) break;
-                shown++;
-
-                string workerName = SS(w, "name");
-                string rawStatus = SS(w, "status").ToLowerInvariant();
-
-                // Phase label mapping (spec §2 Phase Vocabulary)
-                bool isAttention = rawStatus == "stuck" || rawStatus == "maxturns" || rawStatus == "error";
-                bool isDone = rawStatus == "done" || rawStatus == "resolved";
-                bool isQueued = rawStatus == "pending";
-                bool isVerifying = rawStatus == "verifying";
-
-                string phaseLabel;
-                if (isDone) phaseLabel = ja ? "✓ 完了" : "Done";
-                else if (isAttention) phaseLabel = ja ? "⚠ 要対応" : "⚠ Attention";
-                else if (isQueued) phaseLabel = ja ? "待機" : "Queued";
-                else if (isVerifying) phaseLabel = ja ? "検証中" : "Verifying";
-                else phaseLabel = ja ? "実行中" : "Running";
-
-                // Chip color: needs-attention = Warning, done = Success, verifying = Warning(amber), running = Info, queued = Muted
-                string chipColor;
-                if (isAttention) chipColor = Theme.Warning(_dark);
-                else if (isDone) chipColor = Theme.Success(_dark);
-                else if (isVerifying) chipColor = Theme.Warning(_dark);
-                else if (isQueued) chipColor = Theme.Muted(_dark);
-                else chipColor = Theme.Info(_dark);
-
-                // Short display name (strip "w0" prefix or use as-is)
-                string displayName = string.IsNullOrEmpty(workerName) ? ("W" + shown) : workerName;
-
-                var chipBorder = new Border
+                var sep2 = new TextBlock
                 {
-                    CornerRadius = new CornerRadius(5),
-                    BorderThickness = new Thickness(1),
-                    Padding = new Thickness(7, 2, 7, 2),
-                    Margin = new Thickness(0, 0, 5, 4),
-                    Cursor = Cursors.Hand
-                };
-                chipBorder.BorderBrush = new SolidColorBrush(Theme.Col(chipColor));
-                SetRef(chipBorder, BackgroundProperty, "PanelAlt");
-                chipBorder.MouseLeftButtonUp += delegate { OpenCockpit(); };
-
-                var chipContent = new StackPanel { Orientation = Orientation.Horizontal };
-                var nameTb = new TextBlock
-                {
-                    Text = displayName,
+                    Text = " · ",
                     FontSize = 11,
-                    FontWeight = FontWeights.SemiBold,
                     VerticalAlignment = VerticalAlignment.Center
                 };
-                SetRef(nameTb, TextBlock.ForegroundProperty, "Fg");
-                var phaseTb = new TextBlock
+                SetRef(sep2, TextBlock.ForegroundProperty, "Faint");
+                leftStack.Children.Add(sep2);
+
+                string attText = ja ? ("要対応 " + attentionCount2) : (attentionCount2 + " attention");
+                var attTb = new TextBlock
                 {
-                    Text = " " + phaseLabel,
+                    Text = attText,
                     FontSize = 11,
                     VerticalAlignment = VerticalAlignment.Center,
-                    Foreground = new SolidColorBrush(Theme.Col(chipColor))
+                    Foreground = new SolidColorBrush(Theme.Col(Theme.Warning(_dark)))
                 };
-                chipContent.Children.Add(nameTb);
-                chipContent.Children.Add(phaseTb);
-                chipBorder.Child = chipContent;
-                chipsPanel.Children.Add(chipBorder);
+                leftStack.Children.Add(attTb);
             }
 
-            // "+K more" overflow chip
-            int overflow = workers.Length - shown;
-            if (overflow > 0)
+            // Freshness
+            if (!string.IsNullOrEmpty(freshStr))
             {
-                var moreBorder = new Border
+                var sep3 = new TextBlock
                 {
-                    CornerRadius = new CornerRadius(5),
-                    BorderThickness = new Thickness(1),
-                    Padding = new Thickness(7, 2, 7, 2),
-                    Margin = new Thickness(0, 0, 5, 4),
-                    Cursor = Cursors.Hand
+                    Text = " · ",
+                    FontSize = 11,
+                    VerticalAlignment = VerticalAlignment.Center
                 };
-                SetRef(moreBorder, BackgroundProperty, "PanelAlt");
-                SetRef(moreBorder, Border.BorderBrushProperty, "Border");
-                moreBorder.MouseLeftButtonUp += delegate { OpenCockpit(); };
-                var moreTb = new TextBlock
+                SetRef(sep3, TextBlock.ForegroundProperty, "Faint");
+                leftStack.Children.Add(sep3);
+
+                var freshTb = new TextBlock
                 {
-                    Text = "+" + overflow + (ja ? " 件" : " more"),
-                    FontSize = 11
+                    Text = freshStr,
+                    FontSize = 11,
+                    VerticalAlignment = VerticalAlignment.Center
                 };
-                SetRef(moreTb, TextBlock.ForegroundProperty, "Muted");
-                moreBorder.Child = moreTb;
-                chipsPanel.Children.Add(moreBorder);
+                SetRef(freshTb, TextBlock.ForegroundProperty, "Faint");
+                leftStack.Children.Add(freshTb);
             }
 
-            _fleetStripBody.Children.Add(chipsPanel);
+            row.Children.Add(leftStack);
+            _fleetStripBody.Children.Add(row);
             _fleetStrip.Visibility = Visibility.Visible;
         }
         catch { }
