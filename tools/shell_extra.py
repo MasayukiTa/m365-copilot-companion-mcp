@@ -62,6 +62,11 @@ def pwsh_exec(
     locked = require_unlocked()
     if locked:
         return locked
+    from . import contract_gate as _cg
+    if _cg.destructive_shell(script):
+        _g = _cg.check_op("shell_destructive", script[:200])
+        if _g is not None:
+            return _g
     try:
         shell = _resolve_shell(use_core)
         if not shell:

@@ -646,6 +646,8 @@ class RelayWorker:
         self.outcome = None
         self.reason = ""
         self.last_response = ""
+        self.next_step = ""        # last NEXT: marker (informational, not gated)
+        self.self_confidence = ""  # last CONFIDENCE: marker ("low"|"medium"|"high"|"")
         self.closed = False        # True once its tab has been released
         self._count_before = 0
         self._last_text = None
@@ -1198,6 +1200,10 @@ class RelayWorker:
     def _decide(self, resp):
         self.last_response = resp
         self._tx.assistant(self.turn, resp)    # persist the full Copilot reply for this turn
+        # Parse optional NEXT/CONFIDENCE turn markers (informational only, no gating).
+        from relay.copilot_autopilot_relay import extract_next, extract_confidence
+        self.next_step = extract_next(resp)
+        self.self_confidence = extract_confidence(resp)
 
         # CONVERSATION TOKEN-LIMIT RECYCLE. A hands-off worker pumps ONE chat; a long task
         # (lots of OCR text / Excel rows) eventually exhausts the model token budget
