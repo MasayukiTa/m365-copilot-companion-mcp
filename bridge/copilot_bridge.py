@@ -1400,10 +1400,22 @@ class Handler(BaseHTTPRequestHandler):
                         if len(final) > sent:
                             self._sse({"delta": final[sent:]})
                             sent = len(final)
-                        if final == stable_text:
+                        # Finish ONLY when generation has ACTUALLY stopped (Copilot's Stop button
+                        # is gone) AND the text has then settled. Text-stability alone is not
+                        # enough: Copilot pauses mid-generation (slow tokens / thinking) for >1.2s,
+                        # which the old check mistook for completion -> it truncated the tail ("…ま")
+                        # AND left Copilot generating server-side, so the NEXT send hit the 240s
+                        # generation gate and surfaced "[bridge error: GenerationInProgress …]".
+                        gen_active = False
+                        try:
+                            gen_active = DRIVER._is_generating()
+                        except Exception:
+                            gen_active = False
+                        if final == stable_text and not gen_active:
                             if time.time() - stable_since >= 1.2:
                                 break
                         else:
+                            # text still growing OR Copilot still generating -> reset settle window
                             stable_text, stable_since = final, time.time()
                         time.sleep(0.3)
                         self._ping()             # detect Esc/Stop disconnect promptly
