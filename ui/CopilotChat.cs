@@ -187,8 +187,8 @@ class ChatWindow : Window
         SetRef(side, BackgroundProperty, "PanelAlt");
 
         var headerStack = new StackPanel { Margin = new Thickness(12, 14, 12, 8) };
-        _newBtn = Btn(T("newchat_btn"), "Panel", "Fg", true);
-        _newBtn.Height = 40; _newBtn.Margin = new Thickness(0, 0, 0, 6); _newBtn.FontWeight = FontWeights.SemiBold;
+        _newBtn = Btn(T("newchat_btn"), "PanelAlt", "Muted", true);
+        _newBtn.Height = 40; _newBtn.Margin = new Thickness(0, 0, 0, 6); _newBtn.FontWeight = FontWeights.Normal;
         _newBtn.Click += delegate { NewChat(); };
         headerStack.Children.Add(_newBtn);
         _manageBtn = Btn(T("manage_btn"), "PanelAlt", "Muted", true);
@@ -230,7 +230,7 @@ class ChatWindow : Window
         main.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
         // Header: DockPanel so the right side can hold the Fleet chip + settings button.
-        var headPanel = new DockPanel { Margin = new Thickness(10, 0, 16, 0), MinHeight = 48 };
+        var headPanel = new DockPanel { Margin = new Thickness(6, 0, 16, 0), MinHeight = 48 };
         // Far-left: sidebar toggle button (hamburger). Always visible even when sidebar is collapsed.
         _sideToggleBtn = new Button
         {
@@ -249,7 +249,7 @@ class ChatWindow : Window
         // Left: status dot + "Copilot" title
         var headLeft = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(4, 0, 0, 0) };
         _statusDot = new Border { Width = 9, Height = 9, CornerRadius = new CornerRadius(5), Margin = new Thickness(0, 1, 9, 0), VerticalAlignment = VerticalAlignment.Center };
-        SetRef(_statusDot, BackgroundProperty, "Border");
+        SetRef(_statusDot, BackgroundProperty, "Faint");
         var headText = new TextBlock { Text = "Copilot", FontWeight = FontWeights.SemiBold, FontSize = 14.5, VerticalAlignment = VerticalAlignment.Center };
         SetRef(headText, TextBlock.ForegroundProperty, "Fg");
         headLeft.Children.Add(_statusDot); headLeft.Children.Add(headText);
@@ -283,7 +283,7 @@ class ChatWindow : Window
         Grid.SetRow(headBorder, 0); main.Children.Add(headBorder);
 
         _messages = new StackPanel { Margin = new Thickness(0, 8, 0, 8), MaxWidth = 760, HorizontalAlignment = HorizontalAlignment.Center };
-        _scroll = new ScrollViewer { Content = _messages, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Padding = new Thickness(24, 4, 24, 4) };
+        _scroll = new ScrollViewer { Content = _messages, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Padding = new Thickness(24, 16, 24, 16) };
         Grid.SetRow(_scroll, 1); main.Children.Add(_scroll);
         // Auto-scroll, but yield to the user. ScrollChanged fires for BOTH user scrolls and content
         // growth: when the extent didn't change it was the USER moving -> stick only if they're at
@@ -304,7 +304,7 @@ class ChatWindow : Window
         {
             MinHeight = 40, MaxHeight = 180, AcceptsReturn = true, TextWrapping = TextWrapping.Wrap,
             VerticalScrollBarVisibility = ScrollBarVisibility.Auto, FontSize = 14,
-            Padding = new Thickness(4, 4, 4, 4),
+            Padding = new Thickness(4, 6, 4, 4),
             BorderThickness = new Thickness(0), Background = Brushes.Transparent,
             VerticalContentAlignment = VerticalAlignment.Top, MinWidth = 0
         };
@@ -334,7 +334,7 @@ class ChatWindow : Window
         _inputHint = new TextBlock
         {
             Text = _lang == 0 ? "メッセージを入力…" : "Type a message…",
-            IsHitTestVisible = false, FontSize = 13.5, Margin = new Thickness(6, 4, 0, 0),
+            IsHitTestVisible = false, FontSize = 13.5, Margin = new Thickness(6, 6, 0, 0),
             VerticalAlignment = VerticalAlignment.Top, HorizontalAlignment = HorizontalAlignment.Left
         };
         SetRef(_inputHint, TextBlock.ForegroundProperty, "Muted");
@@ -355,8 +355,8 @@ class ChatWindow : Window
         };
         var slashBtn = new Button
         {
-            Content = "/", FontSize = 13, FontWeight = FontWeights.SemiBold,
-            Height = 28, Width = 28, Cursor = Cursors.Hand,
+            Content = "/", FontSize = 12, FontWeight = FontWeights.SemiBold,
+            Height = 30, Width = 30, Cursor = Cursors.Hand,
             BorderThickness = new Thickness(0), Background = Brushes.Transparent,
             ToolTip = _lang == 0 ? "スラッシュコマンド" : "Slash commands"
         };
@@ -380,10 +380,10 @@ class ChatWindow : Window
         _composerBorder = new Border
         {
             Child = composerInner,
-            CornerRadius = new CornerRadius(10),
+            CornerRadius = new CornerRadius(12),
             BorderThickness = new Thickness(1),
-            Padding = new Thickness(12, 8, 12, 8),
-            Margin = new Thickness(0, 8, 0, 14),
+            Padding = new Thickness(14, 10, 14, 10),
+            Margin = new Thickness(0, 10, 0, 16),
             HorizontalAlignment = HorizontalAlignment.Stretch
         };
         SetRef(_composerBorder, BackgroundProperty, "PanelAlt");
@@ -1791,9 +1791,10 @@ class ChatWindow : Window
         };
         SetRef(chevronBlock, TextBlock.ForegroundProperty, "Faint");
 
+        string displayLabel = _lang == 0 ? label : label.ToUpperInvariant();
         var labelBlock = new TextBlock
         {
-            Text = label, FontSize = 11, FontWeight = FontWeights.SemiBold,
+            Text = displayLabel, FontSize = _lang == 0 ? 11 : 10, FontWeight = FontWeights.SemiBold,
             VerticalAlignment = VerticalAlignment.Center
         };
         SetRef(labelBlock, TextBlock.ForegroundProperty, "Faint");
@@ -1867,7 +1868,7 @@ class ChatWindow : Window
         else
             rowBorder.Background = Brushes.Transparent;
 
-        var rowGrid = new Grid { MinHeight = 46 };
+        var rowGrid = new Grid { MinHeight = 38 };
         rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
@@ -1926,7 +1927,7 @@ class ChatWindow : Window
         var trash = new Button
         {
             Content = "\uE74D", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 13,
-            Width = 32, Height = 46, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
+            Width = 32, Height = 38, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
             Cursor = Cursors.Hand, ToolTip = T("delete"), Opacity = 0, IsHitTestVisible = false
         };
         SetRef(trash, ForegroundProperty, "Muted");
@@ -2541,10 +2542,10 @@ class ChatWindow : Window
         var tb = new TextBox
         {
             Text = text, IsReadOnly = true, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
-            TextWrapping = TextWrapping.Wrap, IsTabStop = false, FontFamily = new FontFamily("Segoe UI"), FontSize = 14
+            TextWrapping = TextWrapping.Wrap, IsTabStop = false, FontFamily = new FontFamily("Segoe UI Variable, Segoe UI"), FontSize = 14
         };
         SetRef(tb, ForegroundProperty, "Fg");
-        var bubble = new Border { Child = tb, CornerRadius = new CornerRadius(14), Padding = new Thickness(14, 10, 14, 11), Margin = new Thickness(40, 10, 0, 10), HorizontalAlignment = HorizontalAlignment.Right, MaxWidth = 560 };
+        var bubble = new Border { Child = tb, CornerRadius = new CornerRadius(14), Padding = new Thickness(14, 11, 14, 11), Margin = new Thickness(40, 6, 0, 24), HorizontalAlignment = HorizontalAlignment.Right, MaxWidth = 560 };
         SetRef(bubble, BackgroundProperty, "UserBg");
         _messages.Children.Add(bubble);
         StickToEnd();
@@ -2556,11 +2557,11 @@ class ChatWindow : Window
     // its .Tag for the copy button to read at click time.
     Panel AddAssistantContainer(out StackPanel outer)
     {
-        var block = new StackPanel { Margin = new Thickness(0, 8, 40, 14) };
+        var block = new StackPanel { Margin = new Thickness(0, 6, 40, 24) };
         // header row: "Copilot" label on the left, hover-revealed copy button on the right
-        var header = new DockPanel { Margin = new Thickness(0, 0, 0, 5) };
-        var lbl = new TextBlock { Text = "Copilot", FontSize = 12, Margin = new Thickness(2, 0, 0, 0), FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center };
-        SetRef(lbl, TextBlock.ForegroundProperty, "Muted");
+        var header = new DockPanel { Margin = new Thickness(0, 0, 0, 7) };
+        var lbl = new TextBlock { Text = "Copilot", FontSize = 11, Margin = new Thickness(2, 0, 0, 0), FontWeight = FontWeights.Normal, VerticalAlignment = VerticalAlignment.Center };
+        SetRef(lbl, TextBlock.ForegroundProperty, "Faint");
         var blockRef = block;
         var copy = new Button
         {
@@ -2577,7 +2578,7 @@ class ChatWindow : Window
         };
         DockPanel.SetDock(copy, Dock.Right);
         header.Children.Add(copy); header.Children.Add(lbl);
-        var content = new StackPanel();
+        var content = new StackPanel { Margin = new Thickness(2, 0, 0, 0) };
         block.Children.Add(header); block.Children.Add(content);
         var copyRef = copy;
         block.MouseEnter += delegate { copyRef.Visibility = Visibility.Visible; };
@@ -2608,7 +2609,8 @@ class ChatWindow : Window
         {
             Text = PlainText(text), IsReadOnly = true, IsTabStop = false,
             BorderThickness = new Thickness(0), Background = Brushes.Transparent,
-            TextWrapping = TextWrapping.Wrap, FontSize = 14, Padding = new Thickness(0),
+            TextWrapping = TextWrapping.Wrap, FontSize = 14, Padding = new Thickness(0, 0, 0, 2),
+            FontFamily = new FontFamily("Segoe UI Variable, Segoe UI"),
             VerticalScrollBarVisibility = ScrollBarVisibility.Disabled,
             HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
         };
@@ -2664,8 +2666,8 @@ class ChatWindow : Window
             tt.BeginAnimation(TranslateTransform.YProperty, anim);
             row.Children.Add(dot);
         }
-        var lbl = new TextBlock { Text = T("generating"), FontSize = 12.5, Margin = new Thickness(6, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center };
-        SetRef(lbl, TextBlock.ForegroundProperty, "Muted");
+        var lbl = new TextBlock { Text = T("generating"), FontSize = 11.5, Margin = new Thickness(6, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center };
+        SetRef(lbl, TextBlock.ForegroundProperty, "Faint");
         row.Children.Add(lbl);
         return row;
     }
@@ -2947,7 +2949,7 @@ class ChatWindow : Window
         {
             _generating = false; _send.Content = T("send"); _send.IsEnabled = true; _input.Focus();
             PaintSend();   // revert to neutral (input was cleared before send)
-            SetRef(_statusDot, BackgroundProperty, "Border");
+            SetRef(_statusDot, BackgroundProperty, "Faint");
             // render whatever we got (full / partial / error); always clear the typing indicator
             content.Children.Clear();
             if (answer.Length > 0) { RenderAssistantBody(content, outer, answer); StickToEnd(); }
