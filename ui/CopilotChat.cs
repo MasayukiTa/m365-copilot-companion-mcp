@@ -1178,7 +1178,7 @@ class ChatWindow : Window
                     if (ageSec < 60) ageStr = ((int)ageSec) + (ja ? "秒前" : "s ago");
                     else if (ageSec < 3600) ageStr = ((int)(ageSec / 60)) + (ja ? "分前" : "m ago");
                     else ageStr = ((int)(ageSec / 3600)) + (ja ? "時間前" : "h ago");
-                    summaryParts.Append(ja ? " · 証拠 " + ageStr : " · evidence " + ageStr);
+                    summaryParts.Append(ja ? " · 最終更新 " + ageStr : " · last update " + ageStr);
                 }
             }
             var summaryTb = new TextBlock

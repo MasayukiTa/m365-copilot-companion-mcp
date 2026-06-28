@@ -1858,8 +1858,8 @@ class CockpitWindow : Window
 
         // ── 7. Report [REAL] ─────────────────────────────────────────────────────
         body.Children.Add(makeSectionLabel(ja ? "報告 / Report" : "Report / 報告"));
-        body.Children.Add(makeValue(ja ? "完了時に要約と証拠 / summary + evidence on completion"
-                                      : "summary + evidence on completion"));
+        body.Children.Add(makeValue(ja ? "完了時に要約と最終更新 / summary + last update on completion"
+                                      : "summary + last update on completion"));
         var reportSub = new TextBlock();
         reportSub.Text = ja ? "(outcome + transcript末尾からカードに表示)"
                             : "(outcome + last transcript excerpt shown on card)";
@@ -2574,8 +2574,16 @@ class CockpitWindow : Window
         _pauseBtn.Width = 32; _pauseBtn.Height = 32; _pauseBtn.Padding = new Thickness(0);
         _pauseBtn.Margin = new Thickness(0, 0, 8, 0);
         _pauseBtn.VerticalAlignment = VerticalAlignment.Center;
-        _pauseIcon = new System.Windows.Shapes.Path { Stretch = Stretch.None, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
-        _pauseBtn.Content = _pauseIcon;
+        _pauseIcon = new System.Windows.Shapes.Path { Stretch = Stretch.Uniform };
+        {
+            var vb = new Viewbox();
+            vb.Width = 16; vb.Height = 16;
+            vb.Stretch = Stretch.Uniform;
+            vb.HorizontalAlignment = HorizontalAlignment.Center;
+            vb.VerticalAlignment = VerticalAlignment.Center;
+            vb.Child = _pauseIcon;
+            _pauseBtn.Content = vb;
+        }
         _pauseBtn.Click += delegate
         {
             // Pause only means something to a LIVE fleet. With no live consumer the command would
@@ -2595,9 +2603,17 @@ class CockpitWindow : Window
         _stopBtn.Cursor = Cursors.Hand; _stopBtn.BorderThickness = new Thickness(1);
         _stopBtn.Width = 32; _stopBtn.Height = 32; _stopBtn.Padding = new Thickness(0);
         _stopBtn.VerticalAlignment = VerticalAlignment.Center;
-        _stopIcon = new System.Windows.Shapes.Path { Stretch = Stretch.None, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center,
+        _stopIcon = new System.Windows.Shapes.Path { Stretch = Stretch.Uniform,
             Data = Geometry.Parse("M3,3 H13 V13 H3 Z") };   // a stop square
-        _stopBtn.Content = _stopIcon;
+        {
+            var vb2 = new Viewbox();
+            vb2.Width = 16; vb2.Height = 16;
+            vb2.Stretch = Stretch.Uniform;
+            vb2.HorizontalAlignment = HorizontalAlignment.Center;
+            vb2.VerticalAlignment = VerticalAlignment.Center;
+            vb2.Child = _stopIcon;
+            _stopBtn.Content = vb2;
+        }
         _stopBtn.Click += delegate
         {
             var cmd = ReadCommands();
@@ -3592,7 +3608,7 @@ class CockpitWindow : Window
                     ageFmt = ((int)ageS).ToString() + (ja2 ? "秒" : "s");
                 else
                     ageFmt = ((int)(ageS / 60.0)).ToString() + (ja2 ? "分" : "m");
-                freshness = " · " + (ja2 ? "証拠 " : "evidence ") + ageFmt + (ja2 ? "前" : " ago");
+                freshness = " · " + (ja2 ? "最終更新 " : "updated ") + ageFmt + (ja2 ? "前" : " ago");
             }
         }
 
@@ -3797,8 +3813,13 @@ class CockpitWindow : Window
             case 6:                                            // directive band: keyed on first-worker goal + started
                 return "DB|" + g + "|" + (w != null ? S(w, "goal") + "|" + S(w, "name") : "")
                        + "|tc" + (_toolbarAll.Count) + "|" + _directiveBandMeta;
-            case 3:                                            // history row: stable per entry
-                return "h|" + g + "|" + (hist != null ? RuntimeHelpers.GetHashCode(hist) : 0);
+            case 3:                                            // history row: stable per entry, but expand state changes the render
+            {
+                string hk3 = hist != null ? S(hist, "key") : "";
+                bool hOpen = !string.IsNullOrEmpty(hk3) && _expanded.Contains(hk3);
+                return "h|" + g + "|" + (hist != null ? RuntimeHelpers.GetHashCode(hist) : 0)
+                       + "|" + (hOpen ? "E" : "C");
+            }
             default:                                           // kind 1: worker card
                 string nm = S(w, "name");
                 var sb = new StringBuilder("c|");
@@ -4629,7 +4650,7 @@ class CockpitWindow : Window
                     col.Children.Add(rl2);
                 }
 
-                // Line 3: freshness — "最終証拠 {N} 前" / "last evidence {N} ago" [COMPUTED].
+                // Line 3: freshness — "最終更新 {N} 前" / "last update {N} ago" [COMPUTED].
                 // Best proxy: transcript meta ts (start of this worker); fallback to status updated.
                 {
                     string transcriptPath2 = S(w, "transcript");
@@ -4643,12 +4664,12 @@ class CockpitWindow : Window
                         double age = NowUnix() - evidenceTs;
                         if (age < 0) age = 0;
                         freshnessText = _lang == 0
-                            ? ("最終証拠 " + Fmt(age) + " 前")
-                            : ("last evidence " + Fmt(age) + " ago");
+                            ? ("最終更新 " + Fmt(age) + " 前")
+                            : ("last update " + Fmt(age) + " ago");
                     }
                     else
                     {
-                        freshnessText = _lang == 0 ? "最終証拠: 不明" : "last evidence: unknown";
+                        freshnessText = _lang == 0 ? "最終更新: 不明" : "last update: unknown";
                     }
                     var ml3 = new TextBlock
                     {
@@ -4659,7 +4680,7 @@ class CockpitWindow : Window
                     col.Children.Add(ml3);
                 }
 
-                // Recovery actions (§6): [再開]/[Resume], [証拠]/[Open evidence], [停止]/[Stop].
+                // Recovery actions (§6): [再開]/[Resume], [会話を開く]/[Open conversation], [停止]/[Stop].
                 // Equal-weight outline buttons; NO accent color.
                 var recov = new StackPanel
                 {
@@ -4677,8 +4698,8 @@ class CockpitWindow : Window
                 resumeBtn.Click += delegate (object s2, RoutedEventArgs e2) { e2.Handled = true; RetryGoal(wResume); };
                 recov.Children.Add(resumeBtn);
 
-                // [証拠]/[Open evidence]: open the conversation/transcript in the main chat.
-                var evidBtn = AttentionBtn(_lang == 0 ? "証拠" : "Open evidence");
+                // [会話を開く]/[Open conversation]: open the conversation/transcript in the main chat.
+                var evidBtn = AttentionBtn(_lang == 0 ? "会話を開く" : "Open conversation");
                 evidBtn.ToolTip = _lang == 0
                     ? "この会話を開いて最後のやり取りを確認する"
                     : "Open this conversation to review the last exchange";
