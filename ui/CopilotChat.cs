@@ -65,6 +65,7 @@ class ChatWindow : Window
     Border _banner; StackPanel _bannerBody;
     Button _newBtn, _themeBtn, _langBtn, _manageBtn, _cockpitBtn, _attachBtn;
     TextBlock _inputHint;                 // goal-box watermark; localized -> must update on lang toggle
+    TextBlock _steerHint;                 // composer footer "送信先: ..." indicator; visible only in steer mode
     Border _composerBorder;              // outer integrated composer wrapper (Task 1)
     TextBlock _fleetChipLabel;            // "Fleet: N" chip in the main header; updated on timer tick
     Border _fleetChip;                    // the chip border (collapsed when count == 0)
@@ -370,6 +371,17 @@ class ChatWindow : Window
         var footerRow = new DockPanel { Margin = new Thickness(0, 6, 0, 0) };
         var footLeft = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
         footLeft.Children.Add(slashBtn);
+        // Steer-mode destination indicator ("送信先: W1 / Fleet会話"). Collapsed unless steering;
+        // RefreshSteerVisual() sets the text and visibility.
+        _steerHint = new TextBlock
+        {
+            FontSize = 11,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(4, 0, 0, 0),
+            Visibility = Visibility.Collapsed
+        };
+        SetRef(_steerHint, TextBlock.ForegroundProperty, "Accent");
+        footLeft.Children.Add(_steerHint);
         DockPanel.SetDock(footLeft, Dock.Left);
         DockPanel.SetDock(_send, Dock.Right);
         footerRow.Children.Add(_send);
@@ -1102,7 +1114,7 @@ class ChatWindow : Window
         try
         {
             if (string.IsNullOrEmpty(_activeFleetUrl)) return;
-            if (_conv == null || _conv.ConvUrl != _activeFleetUrl) { _activeFleetUrl = null; return; }
+            if (_conv == null || _conv.ConvUrl != _activeFleetUrl) { _activeFleetUrl = null; RefreshSteerVisual(); return; }
             string sp = Path.Combine(Path.GetDirectoryName(_convsPath), "status.json");
             if (!File.Exists(sp)) return;
             long m = File.GetLastWriteTimeUtc(sp).Ticks;
@@ -1298,7 +1310,7 @@ class ChatWindow : Window
                 runLabel = runLabel.Substring(0, 50) + "…";
 
             // Worker counts
-            int doneCount2 = 0, attentionCount2 = 0, runningCount2 = 0;
+            int doneCount2 = 0, attentionCount2 = 0, runningCount2 = 0, pendingCount2 = 0;
             foreach (object o in workers)
             {
                 var w = o as Dictionary<string, object>;
@@ -1306,7 +1318,8 @@ class ChatWindow : Window
                 string st = SS(w, "status").ToLowerInvariant();
                 if (st == "done" || st == "resolved" || st == "cancelled" || st == "freed") doneCount2++;
                 else if (st == "stuck" || st == "maxturns" || st == "error" || st == "awaiting") attentionCount2++;
-                else if (st != "pending") runningCount2++;
+                else if (st == "pending") pendingCount2++;
+                else runningCount2++;
             }
             // Freshness string (shared by both branches)
             string freshStr = "";
@@ -1325,19 +1338,26 @@ class ChatWindow : Window
 
             _fleetStripBody.Children.Clear();
 
-            // Determine status dot color
+            // Determine status dot color. pending (queued / not yet started) must NOT read as
+            // Success green — that hides the most anxious state of a long delegation ("not started
+            // yet"). When nothing is running but work is queued, use Info (blue/neutral).
             string dotColor;
             if (runningCount2 > 0)
                 dotColor = Theme.Info(_dark);
             else if (attentionCount2 > 0)
                 dotColor = Theme.Warning(_dark);
+            else if (pendingCount2 > 0)
+                dotColor = Theme.Info(_dark);
             else
                 dotColor = Theme.Success(_dark);
 
-            // Build status summary text
+            // Build status summary text. Only show "done" (Success) once nothing is running AND
+            // nothing is pending; while queued show "待機中 N" / "Queued N".
             string summaryText;
             if (runningCount2 > 0)
                 summaryText = ja ? ("実行中 " + runningCount2) : (runningCount2 + " running");
+            else if (pendingCount2 > 0)
+                summaryText = ja ? ("待機中 " + pendingCount2) : ("Queued " + pendingCount2);
             else
                 summaryText = ja ? (doneCount2 + "件完了") : (doneCount2 + " done");
 
@@ -1398,8 +1418,11 @@ class ChatWindow : Window
             SetRef(fleetLabel, TextBlock.ForegroundProperty, "Muted");
             leftStack.Children.Add(fleetLabel);
 
-            // While RUNNING: show a short truncated run label inline for delegation context
-            if (running && !string.IsNullOrEmpty(runLabel))
+            // Show a short truncated run label inline for delegation context. Shown while RUNNING
+            // and for the completed window too: the strip itself auto-hides after 30 min of being
+            // not-running (see the ageSec > 1800 guard above), so any non-running strip that reaches
+            // here is within the completed-30-min window — no extra age check needed here.
+            if (!string.IsNullOrEmpty(runLabel))
             {
                 string shortLabel = runLabel.Length > 20 ? runLabel.Substring(0, 20) + "…" : runLabel;
                 var sepRL = new TextBlock
@@ -2038,6 +2061,35 @@ class ChatWindow : Window
             SetRef(_composerBorder, Border.BorderBrushProperty, "Accent");
             _composerBorder.BorderThickness = new Thickness(steer ? 2 : 0);
         }
+        // Placeholder + destination indicator follow the steer state. When the active fleet run
+        // finishes (OnSelect sets _activeFleetUrl = null) or the user opens a normal local chat
+        // (OpenConversation / NewChat null it out), this reconciles back to the normal placeholder
+        // and hides the indicator — every steer-exit path calls RefreshSteerVisual().
+        if (_inputHint != null)
+        {
+            if (steer)
+                _inputHint.Text = _lang == 0 ? "この会話への割り込みを送信…" : "Send an interrupt to this conversation…";
+            else
+                _inputHint.Text = _lang == 0 ? "メッセージを入力…" : "Type a message…";
+        }
+        if (_steerHint != null)
+        {
+            if (steer)
+            {
+                string target = (_conv != null && !string.IsNullOrEmpty(_conv.Name)) ? _conv.Name : "";
+                string dest;
+                if (_lang == 0)
+                    dest = string.IsNullOrEmpty(target) ? "送信先: Fleet会話" : ("送信先: " + target + " / Fleet会話");
+                else
+                    dest = string.IsNullOrEmpty(target) ? "To: Fleet" : ("To: " + target + " / Fleet");
+                _steerHint.Text = dest;
+                _steerHint.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                _steerHint.Visibility = Visibility.Collapsed;
+            }
+        }
     }
 
     void NewChat()
@@ -2489,8 +2541,10 @@ class ChatWindow : Window
         // Construction-time localized chrome the toggle would otherwise miss (the half-translated UI):
         if (_cockpitBtn != null) _cockpitBtn.Content = T("open_cockpit");
         if (_attachBtn != null) { _attachBtn.Content = T("attach_btn"); _attachBtn.ToolTip = T("attach"); }
-        if (_inputHint != null)
-            _inputHint.Text = _lang == 0 ? "メッセージを入力…" : "Type a message…";
+        // Re-derive composer placeholder + steer destination indicator in the current language.
+        // Routing through RefreshSteerVisual keeps the steer placeholder ("…割り込みを送信…")
+        // from being clobbered by the normal placeholder during a language toggle.
+        RefreshSteerVisual();
     }
     void HideBanner() { _banner.Visibility = Visibility.Collapsed; }
 
