@@ -1821,28 +1821,98 @@ class CockpitWindow : Window
         body.Children.Add(allowedTag);
         body.Children.Add(makeRule());
 
-        // ── 4. Ask before [FUTURE] ───────────────────────────────────────────────
+        // ── 4. Ask before [REAL — tool gate enforces these op-classes] ──────────
         body.Children.Add(makeSectionLabel(ja ? "確認してから / Ask before" : "Ask before / 確認してから"));
-        var askVal = makeValue(
-            ja ? "公開・ファイル削除・外部送信 / publishing, deleting files, external sends"
-               : "publishing · deleting files · external sends");
-        askVal.Foreground = Theme.Br(Theme.Muted(_dark));   // grayed to signal FUTURE
-        body.Children.Add(askVal);
-        body.Children.Add(makeFutureNote(
-            ja ? "⚠ 設定上の意図（実行時には未強制）— configured intent, not enforced at runtime yet"
-               : "⚠ Configured intent — not enforced at runtime yet [FUTURE]"));
+        var askNote = new TextBlock();
+        askNote.Text = ja ? "(ツールゲートが実行前に一時停止して確認します — tool gate pauses before each checked op)"
+                          : "(tool gate pauses for approval before each checked op — enforced at runtime)";
+        askNote.FontSize = 11;
+        askNote.Foreground = Theme.Br(Theme.Muted(_dark));
+        askNote.TextWrapping = TextWrapping.Wrap;
+        askNote.Margin = new Thickness(0, 0, 0, 6);
+        body.Children.Add(askNote);
+
+        // Three checkboxes — all checked by default
+        var cbDelete = new CheckBox();
+        cbDelete.Content = ja ? "ファイル削除 / Delete files" : "ファイル削除 / Delete files";
+        cbDelete.IsChecked = true;
+        cbDelete.Foreground = Theme.Br(Theme.Text(_dark));
+        cbDelete.FontSize = 13;
+        cbDelete.Margin = new Thickness(0, 2, 0, 2);
+        body.Children.Add(cbDelete);
+
+        var cbOutbound = new CheckBox();
+        cbOutbound.Content = ja ? "外部送信 / External sends" : "外部送信 / External sends";
+        cbOutbound.IsChecked = true;
+        cbOutbound.Foreground = Theme.Br(Theme.Text(_dark));
+        cbOutbound.FontSize = 13;
+        cbOutbound.Margin = new Thickness(0, 2, 0, 2);
+        body.Children.Add(cbOutbound);
+
+        var cbShell = new CheckBox();
+        cbShell.Content = ja ? "破壊的シェル / Destructive shell" : "破壊的シェル / Destructive shell";
+        cbShell.IsChecked = true;
+        cbShell.Foreground = Theme.Br(Theme.Text(_dark));
+        cbShell.FontSize = 13;
+        cbShell.Margin = new Thickness(0, 2, 0, 2);
+        body.Children.Add(cbShell);
+
+        var askTag = new TextBlock();
+        askTag.Text = "[REAL — enforced via tool gate]";
+        askTag.FontSize = 10;
+        askTag.Foreground = Theme.Br(Theme.Faint(_dark));
+        askTag.Margin = new Thickness(0, 3, 0, 0);
+        body.Children.Add(askTag);
         body.Children.Add(makeRule());
 
-        // ── 5. Stop when [FUTURE] ────────────────────────────────────────────────
+        // ── 5. Stop when: turn budget [REAL — relay enforces budget_turns] ────
         body.Children.Add(makeSectionLabel(ja ? "停止条件 / Stop when" : "Stop when / 停止条件"));
-        var stopVal = makeValue(
-            ja ? "テスト通過・予算超過・要承認時 / tests pass, budget exceeded, approval needed"
-               : "tests pass · budget exceeded · approval needed");
-        stopVal.Foreground = Theme.Br(Theme.Muted(_dark));  // grayed to signal FUTURE
-        body.Children.Add(stopVal);
-        body.Children.Add(makeFutureNote(
-            ja ? "⚠ 未強制 — fleet は done/stuck になるまで実行します（停止条件はランタイムで強制されていません）"
-               : "⚠ Not enforced — fleet runs until done/stuck [FUTURE]"));
+        var budgetNote = new TextBlock();
+        budgetNote.Text = ja ? "(ターン上限はrelayが強制します。0 = 上限なし — relay enforces budget; 0 = no budget)"
+                             : "(turn budget is enforced by the relay — 0 means no budget)";
+        budgetNote.FontSize = 11;
+        budgetNote.Foreground = Theme.Br(Theme.Muted(_dark));
+        budgetNote.TextWrapping = TextWrapping.Wrap;
+        budgetNote.Margin = new Thickness(0, 0, 0, 6);
+        body.Children.Add(budgetNote);
+
+        var budgetRow = new StackPanel();
+        budgetRow.Orientation = Orientation.Horizontal;
+        budgetRow.Margin = new Thickness(0, 0, 0, 2);
+        var budgetLbl = new TextBlock();
+        budgetLbl.Text = ja ? "ターン上限 / Turn budget: " : "ターン上限 / Turn budget: ";
+        budgetLbl.FontSize = 13;
+        budgetLbl.Foreground = Theme.Br(Theme.Text(_dark));
+        budgetLbl.VerticalAlignment = VerticalAlignment.Center;
+        budgetRow.Children.Add(budgetLbl);
+
+        var budgetBox = new TextBox();
+        budgetBox.Text = "200";
+        budgetBox.Width = 70;
+        budgetBox.FontSize = 13;
+        budgetBox.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+        budgetBox.Foreground = Theme.Br(Theme.Text(_dark));
+        budgetBox.BorderBrush = Theme.Br(Theme.Border(_dark));
+        budgetBox.BorderThickness = new Thickness(1);
+        budgetBox.Padding = new Thickness(6, 2, 6, 2);
+        budgetBox.VerticalAlignment = VerticalAlignment.Center;
+        budgetBox.ToolTip = ja ? "0 = 上限なし / 0 = no budget" : "0 = no budget";
+        budgetRow.Children.Add(budgetBox);
+
+        var budgetZeroLbl = new TextBlock();
+        budgetZeroLbl.Text = ja ? "  (0 = 上限なし)" : "  (0 = no budget)";
+        budgetZeroLbl.FontSize = 11;
+        budgetZeroLbl.Foreground = Theme.Br(Theme.Muted(_dark));
+        budgetZeroLbl.VerticalAlignment = VerticalAlignment.Center;
+        budgetRow.Children.Add(budgetZeroLbl);
+        body.Children.Add(budgetRow);
+
+        var budgetTag = new TextBlock();
+        budgetTag.Text = "[REAL — enforced by relay per-worker turn count]";
+        budgetTag.FontSize = 10;
+        budgetTag.Foreground = Theme.Br(Theme.Faint(_dark));
+        budgetTag.Margin = new Thickness(0, 1, 0, 0);
+        body.Children.Add(budgetTag);
         body.Children.Add(makeRule());
 
         // ── 6. Acceptance [REAL/partial] ─────────────────────────────────────────
@@ -1973,16 +2043,35 @@ class CockpitWindow : Window
         bool didDelegate = result == true && delegated[0];
         if (didDelegate)
         {
-            // TASK 1 (Bucket C): write active_contract.json so the tool gate picks it up.
+            // Write active_contract.json with user-chosen op-class gates + turn budget.
+            // ask_before = only the op-classes whose checkbox was checked (unchecked = not gated).
+            // stop_when = ["budget"] when budgetTurns > 0, else [].
+            // budget_turns = the integer value from the text box (0 = no budget).
             try
             {
                 string contractDir = Path.GetDirectoryName(_statusPath);
                 string contractPath = Path.Combine(contractDir, "active_contract.json");
                 long epochSec = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
                 string escapedFolder = folder.Replace("\\", "\\\\").Replace("\"", "\\\"");
+
+                // Build ask_before array from checkboxes
+                var askBefore = new System.Collections.Generic.List<string>();
+                if (cbDelete.IsChecked == true) askBefore.Add("\"delete\"");
+                if (cbOutbound.IsChecked == true) askBefore.Add("\"outbound\"");
+                if (cbShell.IsChecked == true) askBefore.Add("\"shell_destructive\"");
+                string askBeforeJson = "[" + string.Join(",", askBefore.ToArray()) + "]";
+
+                // Parse turn budget (default 0 on invalid input)
+                int budgetTurns = 0;
+                int parsedBudget;
+                if (int.TryParse(budgetBox.Text, out parsedBudget) && parsedBudget >= 0)
+                    budgetTurns = parsedBudget;
+                string stopWhenJson = budgetTurns > 0 ? "[\"budget\"]" : "[]";
+
                 string contractJson = "{\"active\":true,\"scope\":\"" + escapedFolder
-                    + "\",\"ask_before\":[\"delete\",\"outbound\",\"shell_destructive\"]"
-                    + ",\"stop_when\":[]"
+                    + "\",\"ask_before\":" + askBeforeJson
+                    + ",\"stop_when\":" + stopWhenJson
+                    + ",\"budget_turns\":" + budgetTurns
                     + ",\"started\":" + epochSec + "}";
                 File.WriteAllText(contractPath, contractJson, new UTF8Encoding(false));
             }
@@ -2574,6 +2663,9 @@ class CockpitWindow : Window
         _pauseBtn.Width = 32; _pauseBtn.Height = 32; _pauseBtn.Padding = new Thickness(0);
         _pauseBtn.Margin = new Thickness(0, 0, 8, 0);
         _pauseBtn.VerticalAlignment = VerticalAlignment.Center;
+        // FlatButtonTemplate makes Background=BtnBg actually render (the default Aero template
+        // paints its own light gradient, making a light-colored icon invisible in dark mode).
+        _pauseBtn.Template = FlatButtonTemplate();
         _pauseIcon = new System.Windows.Shapes.Path { Stretch = Stretch.Uniform };
         {
             var vb = new Viewbox();
@@ -2603,6 +2695,8 @@ class CockpitWindow : Window
         _stopBtn.Cursor = Cursors.Hand; _stopBtn.BorderThickness = new Thickness(1);
         _stopBtn.Width = 32; _stopBtn.Height = 32; _stopBtn.Padding = new Thickness(0);
         _stopBtn.VerticalAlignment = VerticalAlignment.Center;
+        // Same fix: FlatButtonTemplate so Background is honoured and the icon fill contrasts correctly.
+        _stopBtn.Template = FlatButtonTemplate();
         _stopIcon = new System.Windows.Shapes.Path { Stretch = Stretch.Uniform,
             Data = Geometry.Parse("M3,3 H13 V13 H3 Z") };   // a stop square
         {

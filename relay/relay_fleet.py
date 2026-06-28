@@ -520,7 +520,7 @@ class RelayWorker:
                  per_turn_timeout_s=240, max_no_progress=3, max_verify_attempts=3,
                  refuter=False, max_refute=2, plan_mode=False, review_lenses=None,
                  max_transient=10, transcript_dir=None, run_id="", busy_writer=None,
-                 max_research=3):
+                 max_research=3, contract_budget=None):
         self.page = None
         self.drv = None
         text, checks, cwd = goal_fields(goal)
@@ -627,6 +627,10 @@ class RelayWorker:
         self.steer_msgs = []       # user steering messages to inject on the next turn(s)
         self._last_was_steer = False   # so the FOLLOWING continue bridges off the steer
         self.max_turns = max_turns
+        # autonomy-contract turn budget (None = no contract budget, inert). When set to an
+        # int > 0, this was the effective cap applied from the active_contract.json at launch
+        # (budget_turns). Stored so _begin_send can emit a budget-specific stop reason.
+        self._contract_budget = contract_budget
         self.dwell_s = dwell_s
         self.per_turn_timeout_s = per_turn_timeout_s
         self.max_no_progress = max_no_progress
@@ -777,7 +781,11 @@ class RelayWorker:
             # rather than labeling an already-correct artifact MAXTURNS.
             if self._salvage_via_checks():
                 return
-            self.status, self.outcome, self.reason = "maxturns", "MAXTURNS", "reached max_turns"
+            if self._contract_budget and self.turn >= self._contract_budget:
+                self.status, self.outcome = "maxturns", "MAXTURNS"
+                self.reason = "autonomy contract: turn budget %d reached" % self._contract_budget
+            else:
+                self.status, self.outcome, self.reason = "maxturns", "MAXTURNS", "reached max_turns"
             return
         # a queued steering message preempts the normal CONTINUE/FIX job for this turn
         if self.steer_msgs:
@@ -1754,11 +1762,29 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     if stop_box is None:
         stop_box = [False]
 
-    workers = [RelayWorker(g, "w%d" % i, max_turns=max_turns,
+    # ── Autonomy-contract turn budget (additive, inert without a contract) ──────────────────
+    # Read the active contract once at fleet launch. If it is active and carries a budget_turns
+    # > 0, tighten each worker's turn cap to min(max_turns, budget_turns). When there is no
+    # active contract or budget_turns <= 0, effective_max_turns == max_turns (no change).
+    # contract_budget tracks the budget value so workers can emit a clear stop reason.
+    _contract_budget = None
+    try:
+        from tools.contract_gate import load_contract
+        _c = load_contract()
+        if _c is not None and _c.get("active") and isinstance(_c.get("budget_turns"), int) \
+                and _c["budget_turns"] > 0:
+            _contract_budget = _c["budget_turns"]
+    except Exception:
+        pass
+    effective_max_turns = (min(max_turns, _contract_budget)
+                           if _contract_budget is not None else max_turns)
+
+    workers = [RelayWorker(g, "w%d" % i, max_turns=effective_max_turns,
                            refuter=refuter, max_refute=max_refute, plan_mode=plan_mode,
                            review_lenses=review_lenses, max_transient=max_transient,
                            transcript_dir=transcript_dir, run_id=run_id,
-                           busy_writer=busy_writer, max_research=max_research)
+                           busy_writer=busy_writer, max_research=max_research,
+                           contract_budget=_contract_budget)
                for i, g in enumerate(goals)]
     pending = list(workers)            # FIFO queue of not-yet-attached workers
 
@@ -1836,11 +1862,12 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             while add_box:
                 item = add_box.pop(0)
                 # item may carry checks/cwd too; goal_fields reads them (priority ignored)
-                nw = RelayWorker(item, "w%d" % len(workers), max_turns=max_turns,
+                nw = RelayWorker(item, "w%d" % len(workers), max_turns=effective_max_turns,
                                  refuter=refuter, max_refute=max_refute,
                                  plan_mode=plan_mode, review_lenses=review_lenses,
                                  max_transient=max_transient, busy_writer=busy_writer,
-                                 max_research=max_research)
+                                 max_research=max_research,
+                                 contract_budget=_contract_budget)
                 workers.append(nw)
                 if item.get("priority"):
                     pending.insert(0, nw)
