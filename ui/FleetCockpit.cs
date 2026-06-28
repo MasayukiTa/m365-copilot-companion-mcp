@@ -1258,9 +1258,9 @@ class CockpitWindow : Window
             }
             if (goals.Count == 1 && goals[0].Equals("/help", StringComparison.OrdinalIgnoreCase))
             {
-                _goalInput.Text = GoalHelpText();
-                _goalInput.CaretIndex = _goalInput.Text.Length;
-                _startNote.Text = _lang == 0 ? "コマンド一覧を入力欄に表示しました。" : "Command help expanded in the goal box.";
+                _goalInput.Text = "";
+                ShowGoalHelp();
+                _startNote.Text = _lang == 0 ? "コマンド一覧を表示しました。" : "Command help shown.";
                 return;
             }
             // /effort <value> and /approval <value>: apply and clear (don't submit as a goal)
@@ -1439,6 +1439,7 @@ class CockpitWindow : Window
 
     // --- slash-command autocomplete for the goal box (parity with the main chat) ---
     Popup _gcmdPopup; ListBox _gcmdList;
+    Popup _helpPopup;   // /help text shown HERE (a compact popup) instead of dumped into the goal box
     static readonly string[][] _goalCommandsJa = {
         new[]{"/help","コマンド一覧を表示"},
         new[]{"/code","<機能> を実装し、pytest テストも書いて通す"},
@@ -1519,9 +1520,20 @@ class CockpitWindow : Window
             string cmdName = (sp != null && sp.Children.Count > 0 && sp.Children[0] is TextBlock)
                 ? ((TextBlock)sp.Children[0]).Text : "";
 
-            // /help: expand help text inline
+            // /help: show in a compact popup, NOT dumped into the goal box (which would
+            // bury the card list). Remove the typed "/help" line and surface the popup.
             if (cmdName == "/help")
-                template = GoalHelpText();
+            {
+                int lsh; string lineh; CurrentGoalLine(out lsh, out lineh);
+                string txth = _goalInput.Text ?? "";
+                int lineEndH = txth.IndexOf('\n', lsh);
+                if (lineEndH < 0) lineEndH = txth.Length;
+                _goalInput.Text = txth.Substring(0, lsh) + txth.Substring(lineEndH);
+                _goalInput.CaretIndex = lsh;
+                if (_gcmdPopup != null) _gcmdPopup.IsOpen = false;
+                ShowGoalHelp();
+                return;
+            }
 
             // /effort and /approval: if the current line has an argument, apply it immediately
             // and clear the line. If no arg, insert the template (prompts for value) instead.
@@ -1620,6 +1632,44 @@ class CockpitWindow : Window
             + "\n上部設定:\n"
             + "推論=min/max/ultra/auto\n"
             + "承認=run/plan/auto（run=即実行、plan=計画承認待ち、auto=通常フリートは計画承認待ち、自律コーディング(フォルダ)はGO/ASK/STOPゲート）";
+    }
+
+    // /help must NOT be dumped into the goal box (it turns the input into a giant scroll
+    // region that covers the card list). Show it in a compact, dismissable popup anchored
+    // to the goal input instead. Reuses the same popup styling as the slash palette.
+    void ShowGoalHelp()
+    {
+        try
+        {
+            if (_goalInput == null) return;
+            if (_gcmdPopup != null) _gcmdPopup.IsOpen = false;
+
+            var txt = new TextBlock();
+            txt.Text = GoalHelpText();
+            txt.TextWrapping = TextWrapping.Wrap;
+            txt.Foreground = Fg;
+            txt.FontSize = 12;
+            txt.LineHeight = 18;
+
+            var sv = new ScrollViewer();
+            sv.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+            sv.MaxHeight = 260;
+            sv.Content = txt;
+
+            var border = new Border();
+            border.Child = sv;
+            border.BorderThickness = new Thickness(1);
+            border.CornerRadius = new CornerRadius(8);
+            border.Padding = new Thickness(12, 10, 12, 10);
+            border.Background = BtnBg;
+            border.BorderBrush = Accent;
+
+            if (_helpPopup == null)
+                _helpPopup = new Popup { PlacementTarget = _goalInput, Placement = PlacementMode.Top, StaysOpen = false, Width = 520 };
+            _helpPopup.Child = border;
+            _helpPopup.IsOpen = true;
+        }
+        catch (Exception) { }
     }
 
     // ③ Claude-Code-style: pick a folder + a plain-language instruction -> code_task runs
@@ -1858,8 +1908,8 @@ class CockpitWindow : Window
         // ── 4. Ask before [REAL — tool gate enforces these op-classes] ──────────
         body.Children.Add(makeSectionLabel(ja ? "確認してから / Ask before" : "Ask before / 確認してから"));
         var askNote = new TextBlock();
-        askNote.Text = ja ? "(ツールゲートが実行前に一時停止して確認します — tool gate pauses before each checked op)"
-                          : "(tool gate pauses for approval before each checked op — enforced at runtime)";
+        askNote.Text = ja ? "(対応ツール経由の操作だけ、ツールゲートが実行前に一時停止して確認します — only ops routed through supported tools are checked)"
+                          : "(tool gate pauses for approval only on ops routed through supported tools — not a blanket guard)";
         askNote.FontSize = 11;
         askNote.Foreground = Theme.Br(Theme.Muted(_dark));
         askNote.TextWrapping = TextWrapping.Wrap;
@@ -1868,7 +1918,8 @@ class CockpitWindow : Window
 
         // Three checkboxes — all checked by default
         var cbDelete = new CheckBox();
-        cbDelete.Content = ja ? "ファイル削除 / Delete files" : "ファイル削除 / Delete files";
+        cbDelete.Content = ja ? "対応ツール経由のファイル削除 / Delete files (via supported tools)"
+                              : "Delete files via supported tools / 対応ツール経由のファイル削除";
         cbDelete.IsChecked = true;
         cbDelete.Foreground = Theme.Br(Theme.Text(_dark));
         cbDelete.FontSize = 13;
@@ -1876,7 +1927,8 @@ class CockpitWindow : Window
         body.Children.Add(cbDelete);
 
         var cbOutbound = new CheckBox();
-        cbOutbound.Content = ja ? "外部送信 / External sends" : "外部送信 / External sends";
+        cbOutbound.Content = ja ? "対応ツール経由のOutlook送信 / Outlook sends (via supported tools)"
+                                : "Outlook sends via supported tools / 対応ツール経由のOutlook送信";
         cbOutbound.IsChecked = true;
         cbOutbound.Foreground = Theme.Br(Theme.Text(_dark));
         cbOutbound.FontSize = 13;
@@ -1884,7 +1936,8 @@ class CockpitWindow : Window
         body.Children.Add(cbOutbound);
 
         var cbShell = new CheckBox();
-        cbShell.Content = ja ? "破壊的シェル / Destructive shell" : "破壊的シェル / Destructive shell";
+        cbShell.Content = ja ? "対応ツール経由の破壊的shell / Destructive shell (via supported tools)"
+                             : "Destructive shell via supported tools / 対応ツール経由の破壊的shell";
         cbShell.IsChecked = true;
         cbShell.Foreground = Theme.Br(Theme.Text(_dark));
         cbShell.FontSize = 13;
@@ -1892,7 +1945,7 @@ class CockpitWindow : Window
         body.Children.Add(cbShell);
 
         var askTag = new TextBlock();
-        askTag.Text = "[REAL — enforced via tool gate]";
+        askTag.Text = "[REAL — enforced via tool gate, supported tools only]";
         askTag.FontSize = 10;
         askTag.Foreground = Theme.Br(Theme.Faint(_dark));
         askTag.Margin = new Thickness(0, 3, 0, 0);
@@ -2469,6 +2522,7 @@ class CockpitWindow : Window
         _effortBox.FontWeight = FontWeights.SemiBold; _effortBox.MinWidth = 78;
         _effortBox.Padding = new Thickness(8, 2, 4, 2);
         _effortBox.VerticalAlignment = VerticalAlignment.Center;
+        System.Windows.Automation.AutomationProperties.SetName(_effortBox, _lang == 0 ? "推論" : "Reasoning");
         FillComboWithHelp(_effortBox, _effortModes, EffortHelp(), _effort);  // per-option hover help
         _effortBox.DropDownOpened += delegate { CloseHeaderPopups("effort"); };
         _effortBox.SelectionChanged += delegate
@@ -2491,6 +2545,7 @@ class CockpitWindow : Window
         // re-firing the persist handler -- assigning the same value is a no-op for SelectionChanged.
         if (!Equals(ComboVal(_effortBox), _effort)) ComboSelectVal(_effortBox, _effort);
         _effortBox.Background = BtnBg; _effortBox.Foreground = Fg; _effortBox.BorderBrush = Border;
+        System.Windows.Automation.AutomationProperties.SetName(_effortBox, _lang == 0 ? "推論" : "Reasoning");
         StyleFlatCombo(_effortBox);   // re-template each paint so a theme toggle retints resting + popup
     }
 
@@ -2633,6 +2688,7 @@ class CockpitWindow : Window
         _approvalBox.FontWeight = FontWeights.SemiBold; _approvalBox.MinWidth = 74;
         _approvalBox.Padding = new Thickness(8, 2, 4, 2);
         _approvalBox.VerticalAlignment = VerticalAlignment.Center;
+        System.Windows.Automation.AutomationProperties.SetName(_approvalBox, _lang == 0 ? "承認" : "Approval");
         FillComboWithHelp(_approvalBox, _approvalModes, ApprovalHelp(), _approval);  // per-option hover help
         _approvalBox.DropDownOpened += delegate { CloseHeaderPopups("approval"); };
         _approvalBox.SelectionChanged += delegate
@@ -2653,6 +2709,7 @@ class CockpitWindow : Window
         if (_approvalBox == null) return;
         if (!Equals(ComboVal(_approvalBox), _approval)) ComboSelectVal(_approvalBox, _approval);
         _approvalBox.Background = BtnBg; _approvalBox.Foreground = Fg; _approvalBox.BorderBrush = Border;
+        System.Windows.Automation.AutomationProperties.SetName(_approvalBox, _lang == 0 ? "承認" : "Approval");
         StyleFlatCombo(_approvalBox);   // same flat-template fix so the open list matches the theme
     }
 
@@ -4360,21 +4417,34 @@ class CockpitWindow : Window
         var rightCl = new StackPanel(); rightCl.Orientation = Orientation.Horizontal;
         rightCl.VerticalAlignment = VerticalAlignment.Center;
 
-        var retryAll = new Button();
-        retryAll.Content = T("retry_all");
-        retryAll.Background = Brushes.Transparent; retryAll.Foreground = Fg;
-        retryAll.BorderThickness = new Thickness(1); retryAll.BorderBrush = Theme.Br(Theme.BorderStrong(_dark));
-        retryAll.Padding = new Thickness(12, 4, 12, 4); retryAll.Cursor = Cursors.Hand;
-        retryAll.FontSize = 12; retryAll.FontWeight = FontWeights.SemiBold;
-        retryAll.Margin = new Thickness(10, 0, 0, 0);
-        retryAll.VerticalAlignment = VerticalAlignment.Center;
-        List<Dictionary<string, object>> shownCap = shown;
-        retryAll.Click += delegate
+        // Only surface the bulk-retry button when there is at least one retry target
+        // in `shown` (terminal AND outcome != DONE). Mirror RetryAllShown's selection
+        // so the button never appears for an all-DONE run (nothing to retry).
+        int retryTargets = 0;
+        foreach (Dictionary<string, object> rw in shown)
         {
-            RetryAllShown(shownCap);
-            if (_toolbarNote != null) _toolbarNote.Text = RunIsLive() ? "" : T("retry_note");
-        };
-        rightCl.Children.Add(retryAll);
+            if (!IsTerminalWorker(rw)) continue;
+            if (S(rw, "outcome") == "DONE") continue;
+            retryTargets++;
+        }
+        if (retryTargets > 0)
+        {
+            var retryAll = new Button();
+            retryAll.Content = T("retry_all");
+            retryAll.Background = Brushes.Transparent; retryAll.Foreground = Fg;
+            retryAll.BorderThickness = new Thickness(1); retryAll.BorderBrush = Theme.Br(Theme.BorderStrong(_dark));
+            retryAll.Padding = new Thickness(12, 4, 12, 4); retryAll.Cursor = Cursors.Hand;
+            retryAll.FontSize = 12; retryAll.FontWeight = FontWeights.SemiBold;
+            retryAll.Margin = new Thickness(10, 0, 0, 0);
+            retryAll.VerticalAlignment = VerticalAlignment.Center;
+            List<Dictionary<string, object>> shownCap = shown;
+            retryAll.Click += delegate
+            {
+                RetryAllShown(shownCap);
+                if (_toolbarNote != null) _toolbarNote.Text = RunIsLive() ? "" : T("retry_note");
+            };
+            rightCl.Children.Add(retryAll);
+        }
 
         DockPanel.SetDock(rightCl, Dock.Right);
         dp.Children.Add(rightCl);
@@ -4560,6 +4630,14 @@ class CockpitWindow : Window
         btn.Padding = new Thickness(0);
         btn.ToolTip = _lang == 0 ? "その他の操作" : "More actions";
         btn.Template = FlatButtonTemplate();
+        // Screen-reader name: include the worker name so each card's kebab is distinguishable.
+        string kebabWorker = S(w, "name");
+        string kebabName;
+        if (!string.IsNullOrEmpty(kebabWorker))
+            kebabName = _lang == 0 ? (kebabWorker + " その他の操作") : (kebabWorker + " more actions");
+        else
+            kebabName = _lang == 0 ? "その他の操作" : "More actions";
+        System.Windows.Automation.AutomationProperties.SetName(btn, kebabName);
 
         // Build a ContextMenu. Unlike a manual Popup, a ContextMenu lives in its own HwndSource
         // and does not hold a reference that breaks when the virtualizing container is recycled.
@@ -4986,8 +5064,12 @@ class CockpitWindow : Window
                     resultText = collapsedDisplayResult;
                 else if (!string.IsNullOrEmpty(last))
                     resultText = last;
+                else if (terminal || closed)
+                    resultText = "";
+                else if (status == "pending")
+                    resultText = (_lang == 0 ? "待機中…" : "Queued…");
                 else
-                    resultText = (terminal || closed ? "" : (_lang == 0 ? "実行中…" : "Working…"));
+                    resultText = (_lang == 0 ? "実行中…" : "Working…");
 
                 if (!string.IsNullOrEmpty(resultText))
                 {
