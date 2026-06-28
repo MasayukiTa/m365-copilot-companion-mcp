@@ -1739,10 +1739,9 @@ class ChatWindow : Window
             {
                 pinnedList.Add(c);
             }
-            else if (c.Id == _conv.Id)
-            {
-                todayList.Add(c);   // the currently-open conversation is always visible
-            }
+            // NOTE: the open conversation is NOT force-classified here -- it is classified by the
+            // normal rules below (so it CAN be pinned/archived), and RenderSection always renders
+            // the active conv even when its section is collapsed, so it is never hidden.
             else if (_archived.Contains(c.Id))
             {
                 archivedList.Add(c);
@@ -1937,7 +1936,7 @@ class ChatWindow : Window
             if (_archived.Contains(cc.Id) || (!_forcedToday.Contains(cc.Id) && IsAutoArchive(cc)))
             { _archived.Remove(cc.Id); _forcedToday.Add(cc.Id); }
             else
-            { _archived.Add(cc.Id); _forcedToday.Remove(cc.Id); }
+            { _archived.Add(cc.Id); _forcedToday.Remove(cc.Id); if (_sectionCollapsed.ContainsKey("archived")) _sectionCollapsed["archived"] = false; }
             SaveSidebarState(); RefreshConvList();
         };
         menu.Items.Add(miArchive);
@@ -1970,7 +1969,7 @@ class ChatWindow : Window
             if (_archived.Contains(cc.Id) || (!_forcedToday.Contains(cc.Id) && IsAutoArchive(cc)))
             { _archived.Remove(cc.Id); _forcedToday.Add(cc.Id); }
             else
-            { _archived.Add(cc.Id); _forcedToday.Remove(cc.Id); }
+            { _archived.Add(cc.Id); _forcedToday.Remove(cc.Id); if (_sectionCollapsed.ContainsKey("archived")) _sectionCollapsed["archived"] = false; }
             SaveSidebarState(); RefreshConvList();
         };
         trMenu.Items.Add(trArchive);
