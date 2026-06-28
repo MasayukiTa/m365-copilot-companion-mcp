@@ -47,6 +47,7 @@ NOTES
 from __future__ import annotations
 
 import argparse
+import os
 import random
 import re
 import sys
@@ -161,7 +162,18 @@ COPILOT_SELECTORS = {
 # "advisor/lecturer/ego" persona. Defined ONCE here; referenced from each prompt constant.
 # The clamp is on UNSOLICITED advice and persona — not on doing the actual task (code,
 # lists, explanations explicitly requested by the goal are still produced as normal).
-OUTPUT_DISCIPLINE = (
+#
+# The DEFAULT text below is the shipped clamp and MUST NOT be changed. The self-improvement
+# quality loop (relay/selfimprove/quality_loop.py) A/B-tests *candidate* discipline texts by
+# overriding it at process start through two env hooks, with the default left fully intact when
+# neither is set (so production behaviour is byte-identical unless a variant is explicitly opted in):
+#   SI_DISCIPLINE_OVERRIDE  -- inline text; if non-empty it IS the discipline for this process.
+#   SI_DISCIPLINE_VARIANT   -- path to a utf-8 file whose stripped contents become the discipline.
+# Precedence: OVERRIDE > VARIANT > _DEFAULT_DISCIPLINE. Any read/decode failure is swallowed and we
+# fall back to _DEFAULT_DISCIPLINE -- a bad variant can never break a live relay. Resolved ONCE at
+# import time because every downstream prompt constant (PROTOCOL/CONTINUE_JOB/...) just references
+# OUTPUT_DISCIPLINE, so binding it here is sufficient.
+_DEFAULT_DISCIPLINE = (
     "【出力規律・厳守】あなたはタスク実行者であり、助言者・解説者ではない。"
     "求められた成果物・回答・操作結果のみを出す。"
     "禁止: 頼まれていない助言/一般論/感想/評価/価値判断、"
@@ -171,6 +183,31 @@ OUTPUT_DISCIPLINE = (
     "質問には直接かつ簡潔に答えて止まる。淡々と事実とタスク結果のみを書く。"
     "（タスクが明示的にコード・箇条書き・説明を要求している場合のみ、それを過不足なく出す。）"
 )
+
+
+def _load_discipline():
+    """Resolve the active OUTPUT_DISCIPLINE, honouring the SI_* override env hooks.
+
+    SI_DISCIPLINE_OVERRIDE (inline, non-empty) wins; else SI_DISCIPLINE_VARIANT (a file path,
+    read utf-8 + stripped if it exists and is non-empty); else the shipped default. Every failure
+    path degrades to _DEFAULT_DISCIPLINE so a malformed env never disrupts a running relay.
+    """
+    try:
+        override = os.environ.get("SI_DISCIPLINE_OVERRIDE")
+        if override:
+            return override
+        variant_path = os.environ.get("SI_DISCIPLINE_VARIANT")
+        if variant_path and os.path.isfile(variant_path):
+            with open(variant_path, encoding="utf-8") as f:
+                text = f.read().strip()
+            if text:
+                return text
+    except Exception:
+        return _DEFAULT_DISCIPLINE
+    return _DEFAULT_DISCIPLINE
+
+
+OUTPUT_DISCIPLINE = _load_discipline()
 
 PROTOCOL = (
     OUTPUT_DISCIPLINE + " "
