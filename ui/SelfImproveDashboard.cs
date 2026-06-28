@@ -479,7 +479,7 @@ class SelfImproveDashboardWindow : Window
         d.Height = 17;
         d.VerticalAlignment = VerticalAlignment.Center;
         d.Margin = new Thickness(6, 0, 6, 0);
-        d.Background = Border;
+        d.Background = Muted;   // visible divider (user: make the line darker, not the faint Border)
         return d;
     }
 
@@ -515,8 +515,8 @@ class SelfImproveDashboardWindow : Window
             if (tb != null) tb.Foreground = Fg;
         }
         // repaint dividers with current border brush
-        if (_divider1 != null) _divider1.Background = Border;
-        if (_divider2 != null) _divider2.Background = Border;
+        if (_divider1 != null) _divider1.Background = Muted;
+        if (_divider2 != null) _divider2.Background = Muted;
 
         // FIX 1c: freshness line is updated on each tick; just set colour here
         if (_freshnessLine != null) _freshnessLine.Foreground = Muted;
