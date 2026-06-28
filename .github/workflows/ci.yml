@@ -43,10 +43,12 @@ jobs:
       # python-dotenv is a direct fastmcp dep AND is imported by relay/agent_profiles.py
       # at module level (test_admission.py imports it inside a test function).
       # playwright is imported lazily (inside main()) so NOT needed at import time.
+      # psutil is used by guards.proc_alive(); without it the function falls back to
+      # PowerShell CIM which does not exist on Linux, causing test_proc_alive to fail.
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install "fastmcp>=2.0,<3.0" "python-dotenv" "pytest>=7.0"
+          pip install "fastmcp>=2.0,<3.0" "python-dotenv" "pytest>=7.0" "psutil>=5.9"
 
       # Run only the hermetic test paths. Explicit file list is the safest guard
       # against accidentally picking up non-hermetic tests when new files are added.
