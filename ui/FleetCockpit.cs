@@ -484,18 +484,18 @@ class CockpitWindow : Window
         // gear -> settings popup consolidating the scattered start/上限/retry/disk-floor controls.
         ctrls.Children.Add(SettingsControl());
         // Language and theme toggles: 1-click direct icon buttons in the header (frequently used).
-        _langBtn = IconButton("translate", 18);
+        _langBtn = IconButton("translate", 18, _lang == 0 ? "言語切替" : "Toggle language");
         _langBtn.ToolTip = _lang == 0 ? "English / 日本語 切替" : "Toggle language";
         _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveKey("lang", _lang.ToString()); RebuildChrome(); };
         ctrls.Children.Add(_langBtn);
-        _themeBtn = IconButton(_dark ? "light_mode" : "dark_mode", 18);
+        _themeBtn = IconButton(_dark ? "light_mode" : "dark_mode", 18, _dark ? "Switch to light mode" : "Switch to dark mode");
         _themeBtn.ToolTip = _dark ? "Switch to light mode" : "Switch to dark mode";
         _themeBtn.Click += delegate { _dark = !_dark; SaveKey("dark", _dark ? "1" : "0"); ApplyTheme(); };
         ctrls.Children.Add(_themeBtn);
         // Rare items (open main chat, self-improve) stay in the overflow. Keep fields non-null (PaintChrome references them).
-        _mainBtn = IconButton("chat", 18);
+        _mainBtn = IconButton("chat", 18, _lang == 0 ? "メインチャットを開く" : "Open main chat");
         _mainBtn.Click += delegate { OpenMain(); };
-        _siBtn = IconButton("account_tree", 18);
+        _siBtn = IconButton("account_tree", 18, _lang == 0 ? "自己改善ダッシュボード" : "Self-improvement");
         _siBtn.Click += delegate { new SelfImproveDashboardWindow().Show(); };
         ctrls.Children.Add(OverflowControl());
         Grid.SetColumn(ctrls, 1); Grid.SetRow(ctrls, 0);
@@ -2167,7 +2167,7 @@ class CockpitWindow : Window
     // flat control templates (MiniButton/FlatButtonTemplate) the rest of the cockpit uses.
     UIElement SettingsControl()
     {
-        _gearBtn = IconButton("settings", 18);
+        _gearBtn = IconButton("settings", 18, _lang == 0 ? "設定" : "Settings");
         _gearBtn.ToolTip = _lang == 0 ? "設定（タブ数・再試行・容量床）" : "Settings (tabs / retry / disk floor)";
         _settingsPopup = new System.Windows.Controls.Primitives.Popup();
         _settingsPopup.PlacementTarget = _gearBtn;
@@ -2180,6 +2180,7 @@ class CockpitWindow : Window
         _gearBtn.Click += delegate
         {
             if (_settingsPopup.IsOpen) { _settingsPopup.IsOpen = false; return; }
+            CloseHeaderPopups("settings");
             _settingsPopup.Child = BuildSettingsPanel();   // rebuild so theme/lang/values are fresh
             _settingsPopup.IsOpen = true;
         };
@@ -2194,6 +2195,7 @@ class CockpitWindow : Window
         _overflowBtn.Width = 36; _overflowBtn.Height = 30; _overflowBtn.Cursor = Cursors.Hand;
         _overflowBtn.BorderThickness = new Thickness(1); _overflowBtn.Margin = new Thickness(4, 0, 0, 0);
         _overflowBtn.ToolTip = _lang == 0 ? "その他のメニュー" : "More options";
+        System.Windows.Automation.AutomationProperties.SetName(_overflowBtn, _lang == 0 ? "その他のメニュー" : "More options");
         // Draw three dots as text (no glyph needed; plain text at this size is crisp)
         _overflowBtn.Content = new TextBlock { Text = "⋯", FontSize = 14,
             HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
@@ -2208,6 +2210,7 @@ class CockpitWindow : Window
         _overflowBtn.Click += delegate
         {
             if (_overflowPopup.IsOpen) { _overflowPopup.IsOpen = false; return; }
+            CloseHeaderPopups("overflow");
             _overflowPopup.Child = BuildOverflowPanel();
             _overflowPopup.IsOpen = true;
         };
@@ -2436,6 +2439,7 @@ class CockpitWindow : Window
         _effortBox.Padding = new Thickness(8, 2, 4, 2);
         _effortBox.VerticalAlignment = VerticalAlignment.Center;
         FillComboWithHelp(_effortBox, _effortModes, EffortHelp(), _effort);  // per-option hover help
+        _effortBox.DropDownOpened += delegate { CloseHeaderPopups("effort"); };
         _effortBox.SelectionChanged += delegate
         {
             string sel = ComboVal(_effortBox);
@@ -2599,6 +2603,7 @@ class CockpitWindow : Window
         _approvalBox.Padding = new Thickness(8, 2, 4, 2);
         _approvalBox.VerticalAlignment = VerticalAlignment.Center;
         FillComboWithHelp(_approvalBox, _approvalModes, ApprovalHelp(), _approval);  // per-option hover help
+        _approvalBox.DropDownOpened += delegate { CloseHeaderPopups("approval"); };
         _approvalBox.SelectionChanged += delegate
         {
             string sel = ComboVal(_approvalBox);
@@ -2685,6 +2690,7 @@ class CockpitWindow : Window
 
         _pauseBtn = new Button();
         _pauseBtn.ToolTip = _lang == 0 ? "新規ターン/タブを止めて凍結（再開で続行・状態は保持）" : "Freeze: no new turns/tabs (resume continues; state kept)";
+        System.Windows.Automation.AutomationProperties.SetName(_pauseBtn, _lang == 0 ? "一時停止" : "Pause");
         _pauseBtn.Cursor = Cursors.Hand; _pauseBtn.BorderThickness = new Thickness(1);
         _pauseBtn.Width = 32; _pauseBtn.Height = 32; _pauseBtn.Padding = new Thickness(0);
         _pauseBtn.Margin = new Thickness(0, 0, 8, 0);
@@ -2718,6 +2724,7 @@ class CockpitWindow : Window
 
         _stopBtn = new Button();
         _stopBtn.ToolTip = _lang == 0 ? "全ワーカーを停止して走行を終了" : "Cancel every worker and end the run";
+        System.Windows.Automation.AutomationProperties.SetName(_stopBtn, _lang == 0 ? "停止" : "Stop");
         _stopBtn.Cursor = Cursors.Hand; _stopBtn.BorderThickness = new Thickness(1);
         _stopBtn.Width = 32; _stopBtn.Height = 32; _stopBtn.Padding = new Thickness(0);
         _stopBtn.VerticalAlignment = VerticalAlignment.Center;
@@ -3338,10 +3345,26 @@ class CockpitWindow : Window
     }
     Button IconButton(string glyph, double size)
     {
+        return IconButton(glyph, size, "");
+    }
+    Button IconButton(string glyph, double size, string autoName)
+    {
         var b = new Button(); b.Width = 36; b.Height = 30; b.Cursor = Cursors.Hand;
         b.BorderThickness = new Thickness(1); b.Margin = new Thickness(4, 0, 0, 0);
         b.Content = MakeIcon(glyph, size, Fg); b.Tag = glyph;
+        if (!string.IsNullOrEmpty(autoName))
+            System.Windows.Automation.AutomationProperties.SetName(b, autoName);
         return b;
+    }
+
+    // Close all header popups/dropdowns except the one named by `except`.
+    // except: "settings" | "overflow" | "effort" | "approval" | null (close all)
+    void CloseHeaderPopups(string except)
+    {
+        if (except != "settings" && _settingsPopup != null) _settingsPopup.IsOpen = false;
+        if (except != "overflow" && _overflowPopup != null) _overflowPopup.IsOpen = false;
+        if (except != "effort" && _effortBox != null) _effortBox.IsDropDownOpen = false;
+        if (except != "approval" && _approvalBox != null) _approvalBox.IsDropDownOpen = false;
     }
 
     // Update the "N workers" chip text.  liveCount = 0 when idle (falls back to maxtabs).
@@ -3897,8 +3920,20 @@ class CockpitWindow : Window
             if (dbElapsed > 0 || dbStarted == 0)
             {
                 if (dbMeta.Length > 0) dbMeta.Append(" · ");
-                dbMeta.Append(dbActive).Append("/").Append(onBoard.Count);
-                dbMeta.Append(dbJa ? " lane 稼働中" : " lanes active");
+                if (!dbRunning && dbActive == 0)
+                {
+                    // Run is done: show completed count instead of active/total lane status
+                    int dbDone = 0;
+                    foreach (Dictionary<string, object> dw2 in onBoard)
+                        if (S(dw2, "outcome") == "DONE") dbDone++;
+                    dbMeta.Append(dbDone);
+                    dbMeta.Append(dbJa ? "件完了" : " done");
+                }
+                else
+                {
+                    dbMeta.Append(dbActive).Append("/").Append(onBoard.Count);
+                    dbMeta.Append(dbJa ? " lane 稼働中" : " lanes active");
+                }
             }
             _directiveBandMeta = dbMeta.ToString();
 
@@ -4364,18 +4399,24 @@ class CockpitWindow : Window
     Button _autoRetryBtn;
     TextBlock _autoRetryCapVal;
 
-    // ON => accent fill + white text (contrast); OFF => neutral. Rebuilt with the toolbar.
+    // ON => calm success-tinted chip (AccentSoft bg with Success border + text); OFF => neutral muted.
+    // Accent fill is reserved exclusively for the primary Start action; this is a status toggle chip.
     void PaintAutoRetryBtn()
     {
         if (_autoRetryBtn == null) return;
         _autoRetryBtn.Content = T("autoretry") + ": " + (_autoRetry ? "ON" : "OFF");
         if (_autoRetry)
         {
-            _autoRetryBtn.Background = Accent; _autoRetryBtn.Foreground = White; _autoRetryBtn.BorderBrush = Border;
+            // Subtle success treatment: light chip background, success-colored border, dark/fg text
+            // In dark mode: AccentSoft bg is very dark (#3A2416) -- use SurfaceSubtle instead for
+            // better readability as a success chip; pair with Success border and Success-tinted text.
+            _autoRetryBtn.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+            _autoRetryBtn.Foreground = Theme.Br(Theme.Success(_dark));
+            _autoRetryBtn.BorderBrush = Theme.Br(Theme.Success(_dark));
         }
         else
         {
-            _autoRetryBtn.Background = BtnBg; _autoRetryBtn.Foreground = Fg; _autoRetryBtn.BorderBrush = Border;
+            _autoRetryBtn.Background = BtnBg; _autoRetryBtn.Foreground = Muted; _autoRetryBtn.BorderBrush = Border;
         }
     }
 
