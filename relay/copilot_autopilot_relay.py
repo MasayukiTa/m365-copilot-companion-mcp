@@ -156,7 +156,24 @@ COPILOT_SELECTORS = {
 # (the connected MCP tool schemas consume most of it), so a verbose framing alone
 # overflows it (OpenAIModelTokenLimit) before any work. Every clause here is load-
 # bearing; do not pad it back out.
+
+# Output-discipline clause injected into every prompt turn to suppress the agent's
+# "advisor/lecturer/ego" persona. Defined ONCE here; referenced from each prompt constant.
+# The clamp is on UNSOLICITED advice and persona — not on doing the actual task (code,
+# lists, explanations explicitly requested by the goal are still produced as normal).
+OUTPUT_DISCIPLINE = (
+    "【出力規律・厳守】あなたはタスク実行者であり、助言者・解説者ではない。"
+    "求められた成果物・回答・操作結果のみを出す。"
+    "禁止: 頼まれていない助言/一般論/感想/評価/価値判断、"
+    "『まずは〜しろ』『〜を完璧に固めろ』式の命令調コーチング、"
+    "『今の理解レベルだと』『初心者の9割は』等の上から目線・決めつけ、"
+    "自我・人格・キャラ付け、頼まれていない箇条書きの講釈や前置きの長文。"
+    "質問には直接かつ簡潔に答えて止まる。淡々と事実とタスク結果のみを書く。"
+    "（タスクが明示的にコード・箇条書き・説明を要求している場合のみ、それを過不足なく出す。）"
+)
+
 PROTOCOL = (
+    OUTPUT_DISCIPLINE + " "
     "ツールを使い自律的に進める。重い作業は小さく分割し1ターンに1〜数ステップ。"
     "ツールは call_tool ゲートウェイ経由: まず call_tool(name='') で一覧(名前+要約)を見て"
     "このタスクに必要なツールを見極め、call_tool(name='X') で使い方を確認、"
@@ -174,10 +191,12 @@ PROTOCOL = (
 CONTINUE_JOB = (
     "次のステップを実行してください。ゴール全体が完了したら最後の行に DONE、"
     "まだ続きがあれば CONTINUE、行き詰まったら STUCK: 理由 と書いてください。"
+    " " + OUTPUT_DISCIPLINE
 )
 FIX_JOB = (
     "直前の失敗の原因を分析し、ツールで修正してから続けてください。"
     "どうしても無理なら最後の行に STUCK: 理由 と書いてください。"
+    " " + OUTPUT_DISCIPLINE
 )
 # Sent back to the agent when it reported DONE but the frame's OWN acceptance check
 # (spec 3-3 verification loop) failed. We hand it the GROUND TRUTH -- the real command
@@ -190,6 +209,7 @@ VERIFY_FIX_JOB = (
     "修正後は可能なら自分でも同じ検証を実行して通ることを確かめ、"
     "通る状態になったら最後の行に再度 DONE と書いてください。"
     "どうしても無理なら最後の行に STUCK: 理由 と書いてください。"
+    " 【規律】修正と結果のみ。解説・評価・助言は不要。"
 )
 # Sent back when an INDEPENDENT reviewer (operator B refuter) found a concrete defect in
 # a claimed-done result. %s = the reviewer's concrete reason.
@@ -203,10 +223,12 @@ REFUTE_FIX_JOB = (
     "『最初からやり直せ』ではなく**詰めるべき箇所の指し示し**です。"
     "対応後、ゴールが満たせていれば最後の行に再度 "
     "DONE、無理なら STUCK: 理由 と書いてください。"
+    " 【規律】修正結果のみ報告。解説・評価・助言は不要。"
 )
 NUDGE_JOB = (
     "前のステップがまだ完了していないようです。今の状況を1行で報告し、"
     "可能なら次に進んでください。"
+    " " + OUTPUT_DISCIPLINE
 )
 # Re-injected when the agent reported STUCK but it is likely a TRANSIENT failure (a tool
 # call / network hiccup), so we retry the turn -- the relay analog of Claude Code retrying
@@ -215,6 +237,7 @@ RETRY_JOB = (
     "直前の操作が一時的な失敗（ネットワーク断やツール呼び出しの失敗）だった可能性があります。"
     "焦らず、同じ手順をもう一度実行してください（ファイルの読み書きやコマンドを再試行）。"
     "完了したら最後の行に DONE、本当に解決不能な場合のみ STUCK: と理由を書いてください。"
+    " " + OUTPUT_DISCIPLINE
 )
 
 # Re-anchored as the FIRST message of a fresh conversation after the previous one hit the

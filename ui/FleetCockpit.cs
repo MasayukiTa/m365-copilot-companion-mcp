@@ -1065,13 +1065,16 @@ class CockpitWindow : Window
     UIElement BuildInputBar()
     {
         _inBar = new Border();
-        _inBar.Padding = new Thickness(Theme.PadApp, 6, Theme.PadApp, Theme.PadApp);
+        _inBar.Padding = new Thickness(Theme.PadApp, 4, Theme.PadApp, 8);
         DockPanel.SetDock(_inBar, Dock.Bottom);
 
         _composerBox = new Border();
         _composerBox.CornerRadius = new CornerRadius(Theme.RadComposer);
         _composerBox.BorderThickness = new Thickness(1);
-        _composerBox.Padding = new Thickness(12, 10, 12, 10);
+        _composerBox.Padding = new Thickness(12, 8, 12, 8);
+        // Floating Codex/Claude-Code style: soft shadow, no heavy frame.
+        _composerBox.Effect = new System.Windows.Media.Effects.DropShadowEffect
+        { BlurRadius = 12, ShadowDepth = 1, Opacity = 0.12, Color = System.Windows.Media.Color.FromRgb(0, 0, 0) };
 
         var col = new StackPanel();
 
@@ -1079,7 +1082,7 @@ class CockpitWindow : Window
         var taGrid = new Grid();
         _goalInput = new TextBox();
         _goalInput.AcceptsReturn = true; _goalInput.TextWrapping = TextWrapping.Wrap;
-        _goalInput.MinHeight = 64; _goalInput.MaxHeight = 180;   // spec: min 64, max 180 internal scroll
+        _goalInput.MinHeight = 38; _goalInput.MaxHeight = 180;   // compact: ~38 (was 64), max 180 internal scroll
         _goalInput.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
         _goalInput.FontSize = Theme.FsBody;
         _goalInput.BorderThickness = new Thickness(0);            // the composer carries the border
@@ -3412,7 +3415,13 @@ class CockpitWindow : Window
         PaintPause();
         if (_stopBtn != null) { _stopBtn.Background = BtnBg; _stopBtn.Foreground = Fg; _stopBtn.BorderBrush = Border; }
         if (_inBar != null) _inBar.Background = Bg;
-        if (_composerBox != null) { _composerBox.Background = BtnBg; _composerBox.BorderBrush = Border; }
+        // Floating composer: SurfaceSubtle bg (quieter than BtnBg); faint border for low-contrast frame.
+        if (_composerBox != null)
+        {
+            _composerBox.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+            _composerBox.BorderBrush = Theme.Br(Theme.Border(_dark));
+            _composerBox.Opacity = 1.0;
+        }
         if (_goalInput != null)
         {
             _goalInput.Background = Brushes.Transparent; _goalInput.Foreground = Fg;
