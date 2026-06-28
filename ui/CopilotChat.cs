@@ -146,7 +146,7 @@ class ChatWindow : Window
         if (k == "untitled") return ja ? "(無題)" : "(untitled)";
         // ── sidebar section / action labels ──────────────────────────────────────
         if (k == "sec_pinned")   return ja ? "ピン留め"   : "Pinned";
-        if (k == "sec_today")    return ja ? "今日"        : "Today";
+        if (k == "sec_today")    return ja ? "最近"        : "Recent";
         if (k == "sec_fleet")    return ja ? "フリート"    : "Fleet runs";
         if (k == "sec_archived") return ja ? "アーカイブ"  : "Archived";
         if (k == "pin")          return ja ? "ピン留め"    : "Pin";
@@ -858,10 +858,13 @@ class ChatWindow : Window
     }
 
     // Auto-archive heuristic: collapses the big historical pile (old eval/bench/SWE threads,
-    // stale undated placeholders, anything older than 3 days) into the collapsed Archived
-    // section. Applied ONLY after _pinned / active-conv / _archived / _forcedToday checks in
-    // RefreshConvList -- those always take precedence, so the open conv and manually-kept
-    // convs are never hidden. Returns true to archive.
+    // anything older than 3 days) into the collapsed Archived section. Applied ONLY after
+    // _pinned / active-conv / _archived / _forcedToday checks in RefreshConvList -- those
+    // always take precedence, so the open conv and manually-kept convs are never hidden.
+    // Undated convs (Ts==0) are NOT force-archived here: a fleet registry entry whose ts
+    // wasn't written yet would wrongly vanish. They fall through the classification ladder
+    // (undated fleet -> Fleet runs; undated non-fleet -> the final else -> Archived). Returns
+    // true to archive.
     bool IsAutoArchive(Conversation cc)
     {
         string title = (cc.Title ?? "").ToLowerInvariant();
@@ -879,10 +882,6 @@ class ChatWindow : Window
             var epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
             var dt = epoch.AddSeconds(cc.Ts).ToLocalTime();
             if ((DateTime.Now - dt).TotalDays > 3) return true;   // older than 3 days -> archive
-        }
-        else
-        {
-            return true;   // undated (Ts==0) stale placeholder -> archive (active conv protected by rule b)
         }
         return false;
     }
@@ -1736,19 +1735,19 @@ class ChatWindow : Window
 
         // 4-section partition with explicit precedence (per conv, top wins):
         //   a. _pinned                       -> Pinned
-        //   b. ACTIVE conv (open one)        -> Today        (never hide the open conversation)
+        //   b. ACTIVE conv (open one)        -> Recent       (never hide the open conversation)
         //   c. _archived (manual)            -> Archived     (manual archive always wins)
-        //   d. _forcedToday (manual unarchive) -> Fleet runs if fleet else Today (force visible)
-        //   e. IsAutoArchive                 -> Archived     (now applies to fleet too -> old runs collapse)
+        //   d. _forcedToday (manual unarchive) -> Fleet runs if fleet else Recent (force visible)
+        //   e. IsAutoArchive                 -> Archived     (applies to fleet too -> old runs collapse)
         //   f. Source == "fleet"             -> Fleet runs   (only recent fleet runs reach here)
-        //   g. Ts>0 AND within last 2 local days -> Today
+        //   g. Ts>0 AND within last 3 local days -> Recent   (aligned with the >3-day auto-archive cutoff)
         //   h. else                          -> Archived
         var epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
-        var yesterdayStart = DateTime.Today.AddDays(-1);
+        var recentStart = DateTime.Today.AddDays(-3);   // "Recent" = last 3 days; older -> Archived
 
         var pinnedList   = new List<Conversation>();
         var fleetList    = new List<Conversation>();
-        var todayList    = new List<Conversation>();
+        var todayList    = new List<Conversation>();   // "Recent" section
         var archivedList = new List<Conversation>();
 
         foreach (var c in _all)
@@ -1777,7 +1776,7 @@ class ChatWindow : Window
             {
                 fleetList.Add(c);
             }
-            else if (c.Ts > 0 && epoch.AddSeconds(c.Ts).ToLocalTime() >= yesterdayStart)
+            else if (c.Ts > 0 && epoch.AddSeconds(c.Ts).ToLocalTime() >= recentStart)
             {
                 todayList.Add(c);
             }
@@ -1789,31 +1788,32 @@ class ChatWindow : Window
 
         _convList.Children.Clear();
 
-        // Render sections in order: Pinned, Today, Fleet, Archived.
-        // Always show header when section is non-empty (allows expanding a collapsed section).
-        if (pinnedList.Count > 0)
+        // Render sections in order: Pinned, Recent, Fleet, Archived.
+        // Header always shows when the section is non-empty (so a collapsed section can be expanded).
+        // When a section is COLLAPSED, its rows are hidden EXCEPT the active conversation's row, which
+        // always renders beneath the header -- otherwise the user couldn't click back to the open conv.
+        RenderSection(pinnedList,   "sec_pinned",   "pinned",   false, false, true);
+        RenderSection(todayList,    "sec_today",    "today",    false, false, false);
+        RenderSection(fleetList,    "sec_fleet",    "fleet",    true,  false, false);
+        RenderSection(archivedList, "sec_archived", "archived", false, true,  false);
+    }
+
+    // Emits one section: header (if non-empty) + its rows. When collapsed, rows are skipped
+    // EXCEPT the active conversation (cc.Id == _conv.Id), which always renders so the open
+    // conversation is never unreachable behind a collapsed header.
+    void RenderSection(List<Conversation> list, string labelKey, string collapseKey, bool isFleet, bool archived, bool isPinned)
+    {
+        if (list.Count == 0) return;
+        _convList.Children.Add(MakeSectionHeader(T(labelKey), collapseKey, list.Count));
+        bool collapsed = _sectionCollapsed.ContainsKey(collapseKey) && _sectionCollapsed[collapseKey];
+        if (!collapsed)
         {
-            _convList.Children.Add(MakeSectionHeader(T("sec_pinned"), "pinned", pinnedList.Count));
-            if (!_sectionCollapsed["pinned"])
-                foreach (var c in pinnedList) AddConvRow(c, false, false, true);
+            foreach (var c in list) AddConvRow(c, isFleet, archived, isPinned);
         }
-        if (todayList.Count > 0)
+        else
         {
-            _convList.Children.Add(MakeSectionHeader(T("sec_today"), "today", todayList.Count));
-            if (!_sectionCollapsed["today"])
-                foreach (var c in todayList) AddConvRow(c, false, false, false);
-        }
-        if (fleetList.Count > 0)
-        {
-            _convList.Children.Add(MakeSectionHeader(T("sec_fleet"), "fleet", fleetList.Count));
-            if (!_sectionCollapsed["fleet"])
-                foreach (var c in fleetList) AddConvRow(c, true, false, false);
-        }
-        if (archivedList.Count > 0)
-        {
-            _convList.Children.Add(MakeSectionHeader(T("sec_archived"), "archived", archivedList.Count));
-            if (!_sectionCollapsed["archived"])
-                foreach (var c in archivedList) AddConvRow(c, false, true, false);
+            foreach (var c in list)
+                if (c.Id == _conv.Id) AddConvRow(c, isFleet, archived, isPinned);   // keep the open conv reachable
         }
     }
 
@@ -2118,6 +2118,7 @@ class ChatWindow : Window
         // Clean up sidebar state for the deleted conversation.
         bool _sc = _pinned.Remove(c.Id) | _archived.Remove(c.Id) | _forcedToday.Remove(c.Id);
         if (_sc) SaveSidebarState();
+        if (_renamingId == c.Id) _renamingId = null;   // clear any in-flight rename of the deleted conv
         _all.Remove(c);
         if (_conv.Id == c.Id)
         {
@@ -2375,6 +2376,7 @@ class ChatWindow : Window
                 int deleted = 0, copilotFail = 0;
                 var deletedUrls = new System.Collections.Generic.HashSet<string>();
                 var failReasons = new Dictionary<string, int>();  // reason bucket -> count
+                bool[] sidebarChanged = new bool[] { false };     // mutable closure cell (purge sidebar state once)
                 for (int i = 0; i < selected.Count; i++)
                 {
                     var c = selected[i];
@@ -2382,8 +2384,11 @@ class ChatWindow : Window
                     Dispatcher.Invoke(new Action(delegate
                     {
                         progressLbl.Text = (_lang == 0) ? ("削除中 " + idx + "/" + total) : ("Deleting " + idx + "/" + total);
-                        // local removal (mirror DeleteLocal's file delete + _all.Remove)
+                        // local removal (mirror DeleteLocal's file delete + _all.Remove + sidebar-state purge)
                         try { var p = Path_(c.Id); if (File.Exists(p)) File.Delete(p); } catch { }
+                        bool changed = _pinned.Remove(c.Id) | _archived.Remove(c.Id) | _forcedToday.Remove(c.Id);
+                        if (changed) sidebarChanged[0] = true;
+                        if (_renamingId == c.Id) _renamingId = null;
                         _all.Remove(c);
                         if (!string.IsNullOrEmpty(c.ConvUrl)) deletedUrls.Add(c.ConvUrl);
                         if (_conv.Id == c.Id) { _conv = new Conversation(); _messages.Children.Clear(); }
@@ -2414,6 +2419,7 @@ class ChatWindow : Window
                 Dispatcher.Invoke(new Action(delegate
                 {
                     UnregisterConvs(deletedUrls);
+                    if (sidebarChanged[0]) SaveSidebarState();   // persist pinned/archived/forcedToday purge once
                     if (_all.Count == 0) { _conv = new Conversation(); _all.Add(_conv); _messages.Children.Clear(); }
                     RefreshConvList();
                     rebuild[0]();
