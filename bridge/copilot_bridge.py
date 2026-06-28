@@ -646,6 +646,15 @@ _SEARCH_STATUS_MARKERS = (
     "処理しています…",
     "Working on",
     "考えています",
+    # generic loading / "please wait" placeholders
+    "しばらくお待ちください",
+    "お待ちください",
+    "少々お待ち",
+    "Please wait",
+    "Just a moment",
+    "One moment",
+    "Generating",
+    "Loading",
 )
 
 
@@ -1522,7 +1531,11 @@ class Handler(BaseHTTPRequestHandler):
             sent = 0
             t0 = time.time()
             while time.time() - t0 < 600:
-                partial = _text(LOADING)
+                # PARTIAL comes from the CLEAN body (markdown-reply) so loading
+                # placeholders / citations can never be the prefix. When the clean
+                # body doesn't exist yet, fall back to LOADING -- which the guard
+                # below filters if it's a status/placeholder line.
+                _pc = _clean_answer_text(); partial = _pc if _pc else _text(LOADING)
                 _cleaned = _clean_answer_text(); final = _cleaned if _cleaned else _text(LASTMSG)
                 # stream growing partial (skip "処理中" AND search-status lines)
                 if not _is_proc(partial) and not _is_search_status(partial) and len(partial) > sent:
