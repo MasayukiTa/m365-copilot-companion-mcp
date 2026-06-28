@@ -159,6 +159,28 @@ def _test_fix2_clean_final_text():
     r = _clean_final_text("DONE")
     check("fix2_only_done_becomes_empty", r == "")
 
+    # --- control-word stripping (mirrored from CleanAgentResultForUi._resultPreambleTokens) ---
+    # (j) leading "desktopfile操作" prefix is stripped, rest preserved
+    r = _clean_final_text("desktopfile操作 Fleet review C DONE")
+    check("fix2_ctrl_desktopfile_prefix_stripped",
+          r == "Fleet review C" and "desktopfile操作" not in r)
+
+    # (k) leading "browser操作" prefix is stripped
+    r = _clean_final_text("browser操作 X")
+    check("fix2_ctrl_browser_prefix_stripped", r == "X" and "browser操作" not in r)
+
+    # (l) string with NO control word passes through unchanged (modulo trailing DONE / ws)
+    r = _clean_final_text("All tests passed successfully.")
+    check("fix2_no_ctrl_word_unchanged", r == "All tests passed successfully.")
+
+    # (m) line-only control token is dropped (multi-line case — mirrors C# per-line logic)
+    r = _clean_final_text("computeruse\nActual result here")
+    check("fix2_ctrl_line_only_dropped", "computeruse" not in r.lower() and "Actual result" in r)
+
+    # (n) "Copilot" as sole token stripped as prefix
+    r = _clean_final_text("Copilot Some summary text")
+    check("fix2_ctrl_copilot_prefix_stripped", r == "Some summary text")
+
 
 # ---------------------------------------------------------------------------
 # FIX 3: run_label / goal_count derivation (inline logic, same as main())

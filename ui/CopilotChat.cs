@@ -84,7 +84,7 @@ class ChatWindow : Window
     {
         { "pinned",   false },
         { "today",    false },
-        { "fleet",    false },
+        { "fleet",    true  },   // default collapsed (many items; user can expand)
         { "archived", true  },   // default collapsed to hide old eval/bench clutter
     };
     string _sidebarStatePath;   // set after _convsPath is known (ctor / timer init)
@@ -1388,6 +1388,29 @@ class ChatWindow : Window
             };
             SetRef(fleetLabel, TextBlock.ForegroundProperty, "Muted");
             leftStack.Children.Add(fleetLabel);
+
+            // While RUNNING: show a short truncated run label inline for delegation context
+            if (running && !string.IsNullOrEmpty(runLabel))
+            {
+                string shortLabel = runLabel.Length > 20 ? runLabel.Substring(0, 20) + "…" : runLabel;
+                var sepRL = new TextBlock
+                {
+                    Text = " · ",
+                    FontSize = 11,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                SetRef(sepRL, TextBlock.ForegroundProperty, "Faint");
+                leftStack.Children.Add(sepRL);
+
+                var runLabelTb = new TextBlock
+                {
+                    Text = shortLabel,
+                    FontSize = 11,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                SetRef(runLabelTb, TextBlock.ForegroundProperty, "Muted");
+                leftStack.Children.Add(runLabelTb);
+            }
 
             // separator dot
             var sep1 = new TextBlock
