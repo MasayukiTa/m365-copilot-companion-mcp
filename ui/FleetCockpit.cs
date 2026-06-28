@@ -519,6 +519,7 @@ class CockpitWindow : Window
         _headBar.Child = headRow;
         root.Children.Add(_headBar);
         root.Children.Add(BuildMtBanner());
+        root.Children.Add(BuildGateBanner());
         root.Children.Add(BuildCapBanner());
         // The composer docks to the BOTTOM (spec: agent-workspace feel, not a form). It must be
         // added before _list so the list — the LastChildFill element — fills the space above it.
@@ -1969,7 +1970,25 @@ class CockpitWindow : Window
         w.Content = scroll;
 
         bool? result = w.ShowDialog();
-        return result == true && delegated[0];
+        bool didDelegate = result == true && delegated[0];
+        if (didDelegate)
+        {
+            // TASK 1 (Bucket C): write active_contract.json so the tool gate picks it up.
+            try
+            {
+                string contractDir = Path.GetDirectoryName(_statusPath);
+                string contractPath = Path.Combine(contractDir, "active_contract.json");
+                long epochSec = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
+                string escapedFolder = folder.Replace("\\", "\\\\").Replace("\"", "\\\"");
+                string contractJson = "{\"active\":true,\"scope\":\"" + escapedFolder
+                    + "\",\"ask_before\":[\"delete\",\"outbound\",\"shell_destructive\"]"
+                    + ",\"stop_when\":[]"
+                    + ",\"started\":" + epochSec + "}";
+                File.WriteAllText(contractPath, contractJson, new UTF8Encoding(false));
+            }
+            catch (Exception) { }
+        }
+        return didDelegate;
     }
 
     System.Windows.Controls.Primitives.Popup _settingsPopup;
@@ -2804,6 +2823,13 @@ class CockpitWindow : Window
     bool _diskFloorForced = false;      // true once the user hit 強制開始 (gate disabled live)
     double _diskFloorPrev = 0.0;        // the floor we zeroed, so 床を戻す can restore it
 
+    // ── TASK 2 (Bucket C): pending-gate approval banner ──────────────────────────────────
+    // When status.json has a non-empty `pending_gates` array, a worker is blocked waiting for
+    // human approval. This banner surfaces the gate prominently so it cannot be missed.
+    Border _gateBanner;
+    StackPanel _gateCardsPanel;         // holds one card per pending gate (or first gate + count)
+    string _gateSig = "";               // last rendered gate set (by token); rebuild only on change
+
     // RAM admission headroom (mirrors relay_fleet.auto_concurrency headroom_mb=2048): when free
     // physical RAM is around/under this the runner can't open another tab. We additionally surface
     // RAM in the banner when avail_mb is conspicuously low, even if disk is fine.
@@ -2940,6 +2966,205 @@ class CockpitWindow : Window
         UpdateCapBanner(ReadStatus());
     }
 
+    // ── TASK 2 (Bucket C): gate approval banner build + update ───────────────────────────
+    // Builds the outer gate banner container (always Collapsed until a gate appears).
+    UIElement BuildGateBanner()
+    {
+        _gateBanner = new Border();
+        _gateBanner.Visibility = Visibility.Collapsed;
+        _gateBanner.CornerRadius = new CornerRadius(10);
+        _gateBanner.BorderThickness = new Thickness(3, 1, 1, 1);
+        _gateBanner.Padding = new Thickness(14, 10, 12, 10);
+        _gateBanner.Margin = new Thickness(26, 0, 18, 6);
+        DockPanel.SetDock(_gateBanner, Dock.Top);
+        _gateCardsPanel = new StackPanel();
+        _gateBanner.Child = _gateCardsPanel;
+        return _gateBanner;
+    }
+
+    // Called each OnTick. Rebuilds the gate banner cards ONLY when the pending token set changes
+    // (sig check), so the buttons don't flicker every 700ms while a gate is active.
+    void UpdateGateBanner(Dictionary<string, object> root)
+    {
+        if (_gateBanner == null || _gateCardsPanel == null) return;
+
+        // Extract pending_gates array from root.
+        List<Dictionary<string, object>> gates = new List<Dictionary<string, object>>();
+        if (root != null)
+        {
+            object pgObj;
+            if (root.TryGetValue("pending_gates", out pgObj) && pgObj is object[])
+            {
+                foreach (object o in (object[])pgObj)
+                {
+                    var g = o as Dictionary<string, object>;
+                    if (g != null) gates.Add(g);
+                }
+            }
+        }
+
+        // Build a signature from the current token set (order-insensitive for stability).
+        var sb2 = new StringBuilder();
+        foreach (var g in gates) sb2.Append(S(g, "token")).Append(';');
+        string newSig = sb2.ToString();
+        if (newSig == _gateSig) return;   // nothing changed; skip rebuild to avoid flicker
+        _gateSig = newSig;
+
+        _gateCardsPanel.Children.Clear();
+
+        if (gates.Count == 0)
+        {
+            _gateBanner.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        // Heading row: "承認が必要です / Approval needed"  (amber/warning, not red/error)
+        bool ja3 = _lang == 0;
+        var headTb = new TextBlock();
+        headTb.Text = ja3
+            ? "承認が必要です / Approval needed"
+            : "Approval needed / 承認が必要です";
+        headTb.FontSize = 13;
+        headTb.FontWeight = FontWeights.SemiBold;
+        headTb.Foreground = Theme.Br(Theme.Warning(_dark));
+        headTb.Margin = new Thickness(0, 0, 0, 8);
+        _gateCardsPanel.Children.Add(headTb);
+
+        // Show first gate (or all). If more than 1, show a count note below.
+        int showCount = gates.Count > 3 ? 3 : gates.Count;
+        for (int gi = 0; gi < showCount; gi++)
+        {
+            var g2 = gates[gi];
+            string question = S(g2, "question");
+            string context2 = S(g2, "context");
+            string gatePath = S(g2, "path");
+            string token2 = S(g2, "token");
+
+            // Question card.
+            var gCard = new Border();
+            gCard.BorderBrush = Theme.Br(Theme.Warning(_dark));
+            gCard.BorderThickness = new Thickness(1);
+            gCard.CornerRadius = new CornerRadius(6);
+            gCard.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+            gCard.Padding = new Thickness(10, 8, 10, 8);
+            gCard.Margin = new Thickness(0, 0, 0, gi < showCount - 1 ? 8 : 0);
+
+            var gInner = new StackPanel();
+
+            var qTb = new TextBlock();
+            qTb.Text = question;
+            qTb.FontSize = 13;
+            qTb.Foreground = Theme.Br(Theme.Text(_dark));
+            qTb.TextWrapping = TextWrapping.Wrap;
+            gInner.Children.Add(qTb);
+
+            if (!string.IsNullOrEmpty(context2))
+            {
+                var ctxTb = new TextBlock();
+                ctxTb.Text = context2;
+                ctxTb.FontSize = 11;
+                ctxTb.Foreground = Theme.Br(Theme.Muted(_dark));
+                ctxTb.TextWrapping = TextWrapping.Wrap;
+                ctxTb.Margin = new Thickness(0, 3, 0, 0);
+                gInner.Children.Add(ctxTb);
+            }
+
+            // Approve / Deny buttons.
+            var btnRow = new StackPanel();
+            btnRow.Orientation = Orientation.Horizontal;
+            btnRow.Margin = new Thickness(0, 8, 0, 0);
+
+            var approveBtn = new Button();
+            approveBtn.Cursor = Cursors.Hand;
+            approveBtn.BorderThickness = new Thickness(0);
+            approveBtn.Padding = new Thickness(14, 4, 14, 4);
+            approveBtn.FontWeight = FontWeights.SemiBold;
+            approveBtn.FontSize = 12;
+            approveBtn.Background = Theme.Br(Theme.Accent(_dark));
+            approveBtn.Foreground = White;
+            approveBtn.Content = ja3 ? "承認 / Approve" : "Approve / 承認";
+            string gPath2 = gatePath; string gToken2 = token2;
+            approveBtn.Click += delegate (object s2, RoutedEventArgs e2)
+            {
+                e2.Handled = true;
+                AnswerGate(gPath2, "approved");
+            };
+            btnRow.Children.Add(approveBtn);
+
+            var denyBtn = new Button();
+            denyBtn.Cursor = Cursors.Hand;
+            denyBtn.BorderThickness = new Thickness(1);
+            denyBtn.Padding = new Thickness(14, 4, 14, 4);
+            denyBtn.FontSize = 12;
+            denyBtn.Margin = new Thickness(8, 0, 0, 0);
+            denyBtn.Background = Brushes.Transparent;
+            denyBtn.Foreground = Theme.Br(Theme.Danger(_dark));
+            denyBtn.BorderBrush = Theme.Br(Theme.Danger(_dark));
+            denyBtn.Content = ja3 ? "拒否 / Deny" : "Deny / 拒否";
+            string gPath3 = gatePath;
+            denyBtn.Click += delegate (object s2, RoutedEventArgs e2)
+            {
+                e2.Handled = true;
+                AnswerGate(gPath3, "denied");
+            };
+            btnRow.Children.Add(denyBtn);
+
+            gInner.Children.Add(btnRow);
+            gCard.Child = gInner;
+            _gateCardsPanel.Children.Add(gCard);
+        }
+
+        if (gates.Count > showCount)
+        {
+            var moreTb = new TextBlock();
+            moreTb.Text = (ja3
+                ? ("+ さらに " + (gates.Count - showCount) + " 件の承認待ち")
+                : ("+ " + (gates.Count - showCount) + " more gate(s) pending"));
+            moreTb.FontSize = 11;
+            moreTb.Foreground = Theme.Br(Theme.Muted(_dark));
+            moreTb.Margin = new Thickness(0, 6, 0, 0);
+            _gateCardsPanel.Children.Add(moreTb);
+        }
+
+        _gateBanner.Visibility = Visibility.Visible;
+    }
+
+    // Atomic gate answer: read the file at `path`, set answered=true + answer=<verdict>, write back.
+    // Uses temp-file + rename for atomicity (consistent with the relay's reader expectation).
+    void AnswerGate(string path, string verdict)
+    {
+        if (string.IsNullOrEmpty(path)) return;
+        try
+        {
+            // Normalize: forward slashes may be in the path from status.json.
+            string localPath = path.Replace('/', Path.DirectorySeparatorChar);
+            if (!File.Exists(localPath)) return;
+
+            string text;
+            using (var fs2 = new FileStream(localPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var sr2 = new System.IO.StreamReader(fs2, Encoding.UTF8))
+                text = sr2.ReadToEnd();
+
+            var gd = _js.DeserializeObject(text) as Dictionary<string, object>;
+            if (gd == null) gd = new Dictionary<string, object>();
+            gd["answered"] = true;
+            gd["answer"] = verdict;
+
+            string updated = _js.Serialize(gd);
+            // Atomic: write to a temp file in the same directory, then rename.
+            string dir2 = Path.GetDirectoryName(localPath);
+            string tmp = Path.Combine(dir2, Path.GetFileName(localPath) + ".tmp");
+            File.WriteAllText(tmp, updated, new UTF8Encoding(false));
+            File.Copy(tmp, localPath, true);
+            try { File.Delete(tmp); } catch (Exception) { }
+
+            // Force a sig reset so the banner refreshes on the next tick (the relay
+            // will drop this gate from pending_gates once it sees answered=true).
+            _gateSig = "";
+        }
+        catch (Exception) { }
+    }
+
     Button MiniButton(string txt)
     {
         var b = new Button(); b.Content = txt; b.Width = 26; b.Height = 26;
@@ -3048,6 +3273,14 @@ class CockpitWindow : Window
         }
         if (_mtApplyNow != null) { _mtApplyNow.Background = Brushes.Transparent; _mtApplyNow.Foreground = warn; _mtApplyNow.BorderBrush = warn; _mtApplyNow.BorderThickness = new Thickness(1); }
         if (_mtLater != null) { _mtLater.Background = Brushes.Transparent; _mtLater.Foreground = Muted; _mtLater.BorderBrush = Border; }
+        if (_gateBanner != null)
+        {
+            _gateBanner.Background = CardBg;
+            _gateBanner.BorderThickness = new Thickness(3, 1, 1, 1);
+            _gateBanner.BorderBrush = warn;
+            // Force a full rebuild on theme change so buttons repaint correctly.
+            _gateSig = "";
+        }
         if (_capBanner != null)
         {
             _capBanner.Background = CardBg;
@@ -3131,6 +3364,7 @@ class CockpitWindow : Window
 
         Dictionary<string, object> root = ReadStatus();
         RefreshPauseEnabled(root);          // Pause is only meaningful for a live run; grey it out otherwise
+        UpdateGateBanner(root);             // Bucket C TASK 2: show pending approval gates (blocks worker until answered)
         UpdateCapBanner(root);              // TASK 1: surface the admission-gate wait reactively each tick
         bool idle = root == null || I(root, "total") == 0
                     || (root.ContainsKey("idle") && Convert.ToBoolean(root["idle"]));
@@ -3575,6 +3809,8 @@ class CockpitWindow : Window
                 // would freeze while the worker streams. Length-only keeps it cheap.
                 sb.Append(_expanded.Contains(nm) ? "#E" : "#C")
                   .Append((S(w, "last")).Length).Append(':').Append(S(w, "verify_attempts")).Append(S(w, "verified"));
+                // TASK 3 (Bucket C): track next_step + self_confidence so the collapsed row re-renders.
+                sb.Append('|').Append(S(w, "next_step").Length).Append(':').Append(S(w, "self_confidence"));
                 return sb.ToString();
         }
     }
@@ -4525,6 +4761,53 @@ class CockpitWindow : Window
                     Margin = new Thickness(24, 3, 0, 0)
                 };
                 col.Children.Add(ml);
+
+                // TASK 3 (Bucket C): next_step + self_confidence [REAL — agent-emitted, shown as-is].
+                string nextStep = S(w, "next_step");
+                string selfConf = S(w, "self_confidence");
+
+                // "→ 次: {next_step}" / "→ next: {next_step}"  — muted, 1 line ellipsis.
+                if (!string.IsNullOrEmpty(nextStep))
+                {
+                    string nextPrefix = _lang == 0 ? "→ 次: " : "→ next: ";
+                    var nextTb = new TextBlock
+                    {
+                        Text = nextPrefix + nextStep,
+                        Foreground = Theme.Br(Theme.Muted(_dark)),
+                        FontSize = 12,
+                        TextTrimming = TextTrimming.CharacterEllipsis,
+                        TextWrapping = TextWrapping.NoWrap,
+                        Margin = new Thickness(24, 2, 0, 0)
+                    };
+                    col.Children.Add(nextTb);
+                }
+
+                // Self-confidence chip — clearly labeled "自己申告" (self-reported, not verified).
+                // Neutral/muted styling; do NOT use a trust-signal color. Subtle level tint only.
+                if (!string.IsNullOrEmpty(selfConf))
+                {
+                    string confLabel = _lang == 0
+                        ? ("自己申告: " + selfConf)
+                        : ("self-reported: " + selfConf);
+                    // Subtle background tint by level (very muted — not a trust signal).
+                    string tintHex;
+                    if (selfConf == "high")        tintHex = _dark ? "#1a2a1a" : "#e8f5e8";
+                    else if (selfConf == "medium")  tintHex = _dark ? "#2a2a1a" : "#f5f5e8";
+                    else                            tintHex = _dark ? "#2a1a1a" : "#f5e8e8";  // low / unknown
+
+                    var confChip = new Border();
+                    confChip.CornerRadius = new CornerRadius(4);
+                    confChip.Background = Theme.Br(tintHex);
+                    confChip.Padding = new Thickness(6, 1, 6, 1);
+                    confChip.Margin = new Thickness(24, 3, 0, 0);
+                    confChip.HorizontalAlignment = HorizontalAlignment.Left;
+                    var confTb = new TextBlock();
+                    confTb.Text = confLabel;
+                    confTb.FontSize = 11;
+                    confTb.Foreground = Theme.Br(Theme.Muted(_dark));
+                    confChip.Child = confTb;
+                    col.Children.Add(confChip);
+                }
             }
         }
         else
