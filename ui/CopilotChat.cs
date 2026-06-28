@@ -75,6 +75,18 @@ class ChatWindow : Window
     Border _sideBorderRef;               // the sidebar Border in root Grid col0
     Grid _rootGrid;                      // root two-column Grid
     Button _sideToggleBtn;              // hamburger toggle in main header far-left
+    // ── sidebar section state (pinned / archived / collapsed) ────────────────────
+    HashSet<string> _pinned    = new HashSet<string>();   // convId -> pinned section
+    HashSet<string> _archived  = new HashSet<string>();   // convId -> manually archived
+    HashSet<string> _forcedToday = new HashSet<string>(); // convId -> user explicitly unarchived; skip auto-archive
+    Dictionary<string, bool> _sectionCollapsed = new Dictionary<string, bool>
+    {
+        { "pinned",   false },
+        { "today",    false },
+        { "fleet",    false },
+        { "archived", true  },   // default collapsed to hide old eval/bench clutter
+    };
+    string _sidebarStatePath;   // set after _convsPath is known (ctor / timer init)
     static readonly string SettingsFile = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "copilot-bridge", "settings.txt");
 
@@ -132,6 +144,15 @@ class ChatWindow : Window
         if (k == "del_selected") return ja ? "選択した会話を削除" : "Delete selected";
         if (k == "close") return ja ? "閉じる" : "Close";
         if (k == "untitled") return ja ? "(無題)" : "(untitled)";
+        // ── sidebar section / action labels ──────────────────────────────────────
+        if (k == "sec_pinned")   return ja ? "ピン留め"   : "Pinned";
+        if (k == "sec_today")    return ja ? "今日"        : "Today";
+        if (k == "sec_fleet")    return ja ? "フリート"    : "Fleet runs";
+        if (k == "sec_archived") return ja ? "アーカイブ"  : "Archived";
+        if (k == "pin")          return ja ? "ピン留め"    : "Pin";
+        if (k == "unpin")        return ja ? "ピン解除"    : "Unpin";
+        if (k == "archive")      return ja ? "アーカイブ"  : "Archive";
+        if (k == "unarchive")    return ja ? "アーカイブ解除" : "Unarchive";
         return k;
     }
 
@@ -398,6 +419,13 @@ class ChatWindow : Window
         Grid.SetColumn(main, 1); root.Children.Add(main);
         Content = root;
 
+        // Set _convsPath BEFORE LoadConversations so DiscoverTranscripts and LoadSidebarState work.
+        string fleetDir = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet"));
+        _openPath = Path.Combine(fleetDir, "open.json");
+        _convsPath = Path.Combine(fleetDir, "conversations.json");
+        _sidebarStatePath = Path.Combine(fleetDir, "sidebar_state.json");
+        LoadSidebarState();    // load pinned/archived/collapsed before first RefreshConvList()
+
         LoadConversations();
         Loaded += delegate { _input.Focus(); };
         // Window-level Esc -> interrupt a streaming reply, REGARDLESS of focus. The input-level
@@ -418,9 +446,6 @@ class ChatWindow : Window
 
         // ① watch for the cockpit asking to open a parallel-task conversation here, and
         // sync the session-shared conversation registry (fleet + chat conversations).
-        string fleetDir = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet"));
-        _openPath = Path.Combine(fleetDir, "open.json");
-        _convsPath = Path.Combine(fleetDir, "conversations.json");
         try { _openMtime = File.Exists(_openPath) ? File.GetLastWriteTimeUtc(_openPath).Ticks : 0; }
         catch { _openMtime = 0; }
         try { _settingsMtime = File.Exists(SettingsFile) ? File.GetLastWriteTimeUtc(SettingsFile).Ticks : 0; }
@@ -769,6 +794,98 @@ class ChatWindow : Window
         catch { }
     }
     readonly JavaScriptSerializer _cjs = new JavaScriptSerializer();
+
+    // ── sidebar state persistence (pinned / archived / collapsed) ────────────────
+    // Schema: {"pinned":["id",...], "archived":["id",...], "forced_today":["id",...],
+    //          "collapsed":{"pinned":false,"today":false,"fleet":false,"archived":true}}
+    void LoadSidebarState()
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(_sidebarStatePath) || !File.Exists(_sidebarStatePath)) return;
+            string txt = File.ReadAllText(_sidebarStatePath, Encoding.UTF8);
+            var d = _cjs.DeserializeObject(txt) as Dictionary<string, object>;
+            if (d == null) return;
+
+            if (d.ContainsKey("pinned") && d["pinned"] is object[])
+                foreach (object o in (object[])d["pinned"])
+                    if (o != null) _pinned.Add(o.ToString());
+
+            if (d.ContainsKey("archived") && d["archived"] is object[])
+                foreach (object o in (object[])d["archived"])
+                    if (o != null) _archived.Add(o.ToString());
+
+            if (d.ContainsKey("forced_today") && d["forced_today"] is object[])
+                foreach (object o in (object[])d["forced_today"])
+                    if (o != null) _forcedToday.Add(o.ToString());
+
+            if (d.ContainsKey("collapsed") && d["collapsed"] is Dictionary<string, object>)
+            {
+                var col = (Dictionary<string, object>)d["collapsed"];
+                bool v;
+                foreach (string key in new string[] { "pinned", "today", "fleet", "archived" })
+                {
+                    if (col.ContainsKey(key) && col[key] != null && bool.TryParse(col[key].ToString(), out v))
+                        _sectionCollapsed[key] = v;
+                }
+            }
+        }
+        catch { }
+    }
+
+    void SaveSidebarState()
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(_sidebarStatePath)) return;
+            Directory.CreateDirectory(Path.GetDirectoryName(_sidebarStatePath));
+            var pinnedArr = new List<object>(_pinned.Count);
+            foreach (string s in _pinned) pinnedArr.Add(s);
+            var archivedArr = new List<object>(_archived.Count);
+            foreach (string s in _archived) archivedArr.Add(s);
+            var forcedArr = new List<object>(_forcedToday.Count);
+            foreach (string s in _forcedToday) forcedArr.Add(s);
+            var col = new Dictionary<string, object>();
+            foreach (var kv in _sectionCollapsed) col[kv.Key] = kv.Value;
+            var state = new Dictionary<string, object>();
+            state["pinned"]      = pinnedArr.ToArray();
+            state["archived"]    = archivedArr.ToArray();
+            state["forced_today"] = forcedArr.ToArray();
+            state["collapsed"]   = col;
+            File.WriteAllText(_sidebarStatePath, _cjs.Serialize(state), new UTF8Encoding(false));
+        }
+        catch { }
+    }
+
+    // Auto-archive heuristic: collapses the big historical pile (old eval/bench/SWE threads,
+    // stale undated placeholders, anything older than 3 days) into the collapsed Archived
+    // section. Applied ONLY after _pinned / active-conv / _archived / _forcedToday checks in
+    // RefreshConvList -- those always take precedence, so the open conv and manually-kept
+    // convs are never hidden. Returns true to archive.
+    bool IsAutoArchive(Conversation cc)
+    {
+        string title = (cc.Title ?? "").ToLowerInvariant();
+        string[] keywords = new string[]
+        {
+            "eval", "bench", "swe", "matplotlib", "sphinx", "django",
+            "instance_", "pass@", "対象リポジトリ", "git チェックアウト",
+            "あなたは実在の", "solve", "grade"
+        };
+        foreach (string kw in keywords)
+            if (title.IndexOf(kw, StringComparison.Ordinal) >= 0) return true;
+
+        if (cc.Ts > 0)
+        {
+            var epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            var dt = epoch.AddSeconds(cc.Ts).ToLocalTime();
+            if ((DateTime.Now - dt).TotalDays > 3) return true;   // older than 3 days -> archive
+        }
+        else
+        {
+            return true;   // undated (Ts==0) stale placeholder -> archive (active conv protected by rule b)
+        }
+        return false;
+    }
 
     // Poll .fleet/open.json (written by the cockpit when a card is clicked) and, when it
     // changes, load that conversation into the main chat (view + steerable via /switch).
@@ -1608,90 +1725,164 @@ class ChatWindow : Window
     // ── sidebar list with rename / delete ───────────────────────────────────────
     void RefreshConvList()
     {
-        // Sort the sidebar by RECENCY (newest last-activity first) instead of the previous
-        // alphabetical-by-title order. Every Conversation carries a Ts (unix secs): .chat convs from
-        // their file mtime, fleet/registry convs from their transcript mtime, live convs bumped on
-        // save/new. Stable: equal-Ts entries keep their insertion order (index tiebreak), so a Ts==0
-        // conv (e.g. never-saved placeholder) preserves its position rather than jumping alphabetically.
+        // Sort the sidebar by RECENCY (newest last-activity first). Stable on equal Ts.
         var idx = new Dictionary<Conversation, int>();
         for (int i = 0; i < _all.Count; i++) idx[_all[i]] = i;
         _all.Sort(delegate (Conversation a, Conversation b)
         {
-            int c = b.Ts.CompareTo(a.Ts);            // descending Ts (newest first)
-            return c != 0 ? c : idx[a].CompareTo(idx[b]);   // stable tiebreak on original index
+            int c = b.Ts.CompareTo(a.Ts);
+            return c != 0 ? c : idx[a].CompareTo(idx[b]);
         });
 
-        // Partition into three sections (all derived from existing fields, no new persistent state):
-        //   fleet  -- Source == "fleet"
-        //   today  -- non-fleet, Ts falls within the current local calendar day
-        //   older  -- non-fleet, everything else (Ts==0 falls here too)
-        bool ja = _lang == 0;
-        var todayStart = DateTime.Today;              // local midnight of today
+        // 4-section partition with explicit precedence (per conv, top wins):
+        //   a. _pinned                       -> Pinned
+        //   b. ACTIVE conv (open one)        -> Today        (never hide the open conversation)
+        //   c. _archived (manual)            -> Archived     (manual archive always wins)
+        //   d. _forcedToday (manual unarchive) -> Fleet runs if fleet else Today (force visible)
+        //   e. IsAutoArchive                 -> Archived     (now applies to fleet too -> old runs collapse)
+        //   f. Source == "fleet"             -> Fleet runs   (only recent fleet runs reach here)
+        //   g. Ts>0 AND within last 2 local days -> Today
+        //   h. else                          -> Archived
         var epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
-        var fleetList  = new List<Conversation>();
-        var todayList  = new List<Conversation>();
-        var olderList  = new List<Conversation>();
+        var yesterdayStart = DateTime.Today.AddDays(-1);
+
+        var pinnedList   = new List<Conversation>();
+        var fleetList    = new List<Conversation>();
+        var todayList    = new List<Conversation>();
+        var archivedList = new List<Conversation>();
+
         foreach (var c in _all)
         {
-            if (c.Source == "fleet")
+            if (_pinned.Contains(c.Id))
+            {
+                pinnedList.Add(c);
+            }
+            else if (c.Id == _conv.Id)
+            {
+                todayList.Add(c);   // the currently-open conversation is always visible
+            }
+            else if (_archived.Contains(c.Id))
+            {
+                archivedList.Add(c);
+            }
+            else if (_forcedToday.Contains(c.Id))
+            {
+                if (c.Source == "fleet") fleetList.Add(c); else todayList.Add(c);
+            }
+            else if (IsAutoArchive(c))
+            {
+                archivedList.Add(c);
+            }
+            else if (c.Source == "fleet")
             {
                 fleetList.Add(c);
             }
+            else if (c.Ts > 0 && epoch.AddSeconds(c.Ts).ToLocalTime() >= yesterdayStart)
+            {
+                todayList.Add(c);
+            }
             else
             {
-                if (c.Ts > 0)
-                {
-                    var dt = epoch.AddSeconds(c.Ts).ToLocalTime();
-                    if (dt >= todayStart)
-                        todayList.Add(c);
-                    else
-                        olderList.Add(c);
-                }
-                else
-                {
-                    olderList.Add(c);
-                }
+                archivedList.Add(c);
             }
         }
 
         _convList.Children.Clear();
 
-        // Emit each non-empty section with a muted header then its rows.
-        if (fleetList.Count > 0)
+        // Render sections in order: Pinned, Today, Fleet, Archived.
+        // Always show header when section is non-empty (allows expanding a collapsed section).
+        if (pinnedList.Count > 0)
         {
-            _convList.Children.Add(MakeSectionHeader(ja ? "フリート" : "Fleet runs"));
-            foreach (var c in fleetList) AddConvRow(c, true);
+            _convList.Children.Add(MakeSectionHeader(T("sec_pinned"), "pinned", pinnedList.Count));
+            if (!_sectionCollapsed["pinned"])
+                foreach (var c in pinnedList) AddConvRow(c, false, false, true);
         }
         if (todayList.Count > 0)
         {
-            _convList.Children.Add(MakeSectionHeader(ja ? "今日" : "Today"));
-            foreach (var c in todayList) AddConvRow(c, false);
+            _convList.Children.Add(MakeSectionHeader(T("sec_today"), "today", todayList.Count));
+            if (!_sectionCollapsed["today"])
+                foreach (var c in todayList) AddConvRow(c, false, false, false);
         }
-        if (olderList.Count > 0)
+        if (fleetList.Count > 0)
         {
-            _convList.Children.Add(MakeSectionHeader(ja ? "アーカイブ" : "Archive"));
-            foreach (var c in olderList) AddConvRow(c, false, true);
+            _convList.Children.Add(MakeSectionHeader(T("sec_fleet"), "fleet", fleetList.Count));
+            if (!_sectionCollapsed["fleet"])
+                foreach (var c in fleetList) AddConvRow(c, true, false, false);
+        }
+        if (archivedList.Count > 0)
+        {
+            _convList.Children.Add(MakeSectionHeader(T("sec_archived"), "archived", archivedList.Count));
+            if (!_sectionCollapsed["archived"])
+                foreach (var c in archivedList) AddConvRow(c, false, true, false);
         }
     }
 
-    // Builds and returns a small muted section-header TextBlock.
-    TextBlock MakeSectionHeader(string label)
+    // Builds a clickable collapsible section-header row: chevron + label + count.
+    // Clicking toggles _sectionCollapsed[key], saves state, and re-renders the list.
+    UIElement MakeSectionHeader(string label, string key, int count)
     {
-        var hdr = new TextBlock
+        bool collapsed = _sectionCollapsed.ContainsKey(key) && _sectionCollapsed[key];
+        string chevron = collapsed ? "▸" : "▾";
+
+        var chevronBlock = new TextBlock
+        {
+            Text = chevron, FontSize = 10,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 5, 0)
+        };
+        SetRef(chevronBlock, TextBlock.ForegroundProperty, "Faint");
+
+        var labelBlock = new TextBlock
         {
             Text = label, FontSize = 11, FontWeight = FontWeights.SemiBold,
-            Margin = new Thickness(6, 12, 6, 4)
+            VerticalAlignment = VerticalAlignment.Center
         };
-        SetRef(hdr, TextBlock.ForegroundProperty, "Faint");
-        return hdr;
+        SetRef(labelBlock, TextBlock.ForegroundProperty, "Faint");
+
+        var countBlock = new TextBlock
+        {
+            Text = "(" + count + ")", FontSize = 10,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(5, 0, 0, 0)
+        };
+        SetRef(countBlock, TextBlock.ForegroundProperty, "Faint");
+
+        var row = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        row.Children.Add(chevronBlock);
+        row.Children.Add(labelBlock);
+        row.Children.Add(countBlock);
+
+        var btn = new Button
+        {
+            Content = row,
+            HorizontalContentAlignment = HorizontalAlignment.Left,
+            Padding = new Thickness(6, 5, 6, 5),
+            Margin = new Thickness(0, 8, 0, 2),
+            BorderThickness = new Thickness(0),
+            Background = Brushes.Transparent,
+            Cursor = Cursors.Hand
+        };
+        // capture key for the lambda (C# 5 closure)
+        string capturedKey = key;
+        btn.Click += delegate
+        {
+            bool cur = _sectionCollapsed.ContainsKey(capturedKey) && _sectionCollapsed[capturedKey];
+            _sectionCollapsed[capturedKey] = !cur;
+            SaveSidebarState();
+            RefreshConvList();
+        };
+        return btn;
     }
 
     // Builds and appends one conversation row (or an inline rename editor) into _convList.
-    // isFleet: rows from the Fleet section use "Muted" foreground even when unselected --
-    // they read as quieter navigation, no accent treatment.
-    // archived: rows in the Archive section render the title in "Faint" so old eval/bench
-    // conversations visually recede vs Today/Fleet rows (spec Task 2).
-    void AddConvRow(Conversation cc, bool isFleet, bool archived = false)
+    // isFleet:  rows in the Fleet section (quieter nav, no accent).
+    // archived: rows in Archived section render in "Faint" (de-emphasized).
+    // isPinned: rows in Pinned section get a subtle leading pin glyph.
+    void AddConvRow(Conversation cc, bool isFleet, bool archived = false, bool isPinned = false)
     {
         if (_renamingId == cc.Id)
         {
@@ -1722,7 +1913,14 @@ class ChatWindow : Window
         rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
         var titleText = cc.Untitled() ? T("newchat") : cc.Title;
-        // Single-line with ellipsis at ~46px row height.
+
+        // Inner content: optional pin glyph + title label.
+        var contentRow = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+        if (isPinned)
+        {
+            var pinMark = new TextBlock { Text = "", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 11, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 5, 0) };            SetRef(pinMark, TextBlock.ForegroundProperty, "Muted");
+            contentRow.Children.Add(pinMark);
+        }
         var lbl = new TextBlock
         {
             Text = titleText, TextWrapping = TextWrapping.NoWrap,
@@ -1730,40 +1928,72 @@ class ChatWindow : Window
             FontWeight = isActive ? FontWeights.SemiBold : FontWeights.Normal,
             VerticalAlignment = VerticalAlignment.Center
         };
+        contentRow.Children.Add(lbl);
         var b = new Button
         {
-            Content = lbl,
+            Content = contentRow,
             HorizontalContentAlignment = HorizontalAlignment.Left,
             Padding = new Thickness(9, 0, 9, 0), BorderThickness = new Thickness(0),
             Cursor = Cursors.Hand, Background = Brushes.Transparent, ToolTip = titleText
         };
-        // Active row: full Fg; archived non-active rows: Faint (de-emphasized); others: Muted.
+        // Active row: full Fg; archived non-active: Faint (de-emphasized); others: Muted.
         string fgKey = isActive ? "Fg" : (archived ? "Faint" : "Muted");
         SetRef(b, ForegroundProperty, fgKey);
         b.Click += delegate { OpenConversation(cc); };
-        var miR = new MenuItem { Header = T("rename") };   // rename stays on right-click
+        // right-click context menu: Pin/Unpin, Archive/Unarchive, Rename
+        bool curPinned   = _pinned.Contains(cc.Id);
+        bool curArchived = _archived.Contains(cc.Id) || (!_forcedToday.Contains(cc.Id) && IsAutoArchive(cc));
+        var menu = new ContextMenu();
+        var miPin = new MenuItem { Header = curPinned ? T("unpin") : T("pin") };
+        miPin.Click += delegate { if (_pinned.Contains(cc.Id)) _pinned.Remove(cc.Id); else _pinned.Add(cc.Id); SaveSidebarState(); RefreshConvList(); };
+        menu.Items.Add(miPin);
+        var miArchive = new MenuItem { Header = curArchived ? T("unarchive") : T("archive") };
+        miArchive.Click += delegate
+        {
+            if (_archived.Contains(cc.Id) || (!_forcedToday.Contains(cc.Id) && IsAutoArchive(cc)))
+            { _archived.Remove(cc.Id); _forcedToday.Add(cc.Id); }
+            else
+            { _archived.Add(cc.Id); _forcedToday.Remove(cc.Id); }
+            SaveSidebarState(); RefreshConvList();
+        };
+        menu.Items.Add(miArchive);
+        var miR = new MenuItem { Header = T("rename") };
         miR.Click += delegate { _renamingId = cc.Id; RefreshConvList(); };
-        var menu = new ContextMenu(); menu.Items.Add(miR); b.ContextMenu = menu;
+        menu.Items.Add(miR);
+        b.ContextMenu = menu;
         Grid.SetColumn(b, 0); rowGrid.Children.Add(b);
 
         // trash icon (Segoe MDL2 Assets) -- hidden by default, revealed on row hover.
-        // Opacity=0/IsHitTestVisible=false by default; row MouseEnter/Leave toggles it.
         var trash = new Button
         {
-            Content = "", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 13,
+            Content = "", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 13,
             Width = 32, Height = 46, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
             Cursor = Cursors.Hand, ToolTip = T("delete"), Opacity = 0, IsHitTestVisible = false
         };
         SetRef(trash, ForegroundProperty, "Muted");
         trash.Click += delegate { ShowDeleteBanner(cc); };
-        // A conversation is actionable (deletable/renamable) if it is a real saved conversation.
         bool actionable = cc.Messages.Count > 0 || !string.IsNullOrEmpty(cc.ConvUrl)
                           || !string.IsNullOrEmpty(cc.Title);
         trash.Visibility = actionable ? Visibility.Visible : Visibility.Collapsed;
+        // Trash right-click: same pin/archive/rename actions as title button.
         var trMenu = new ContextMenu();
+        var trPin = new MenuItem { Header = curPinned ? T("unpin") : T("pin") };
+        trPin.Click += delegate { if (_pinned.Contains(cc.Id)) _pinned.Remove(cc.Id); else _pinned.Add(cc.Id); SaveSidebarState(); RefreshConvList(); };
+        trMenu.Items.Add(trPin);
+        var trArchive = new MenuItem { Header = curArchived ? T("unarchive") : T("archive") };
+        trArchive.Click += delegate
+        {
+            if (_archived.Contains(cc.Id) || (!_forcedToday.Contains(cc.Id) && IsAutoArchive(cc)))
+            { _archived.Remove(cc.Id); _forcedToday.Add(cc.Id); }
+            else
+            { _archived.Add(cc.Id); _forcedToday.Remove(cc.Id); }
+            SaveSidebarState(); RefreshConvList();
+        };
+        trMenu.Items.Add(trArchive);
         var trRename = new MenuItem { Header = T("rename") };
         trRename.Click += delegate { _renamingId = cc.Id; RefreshConvList(); };
-        trMenu.Items.Add(trRename); trash.ContextMenu = trMenu;
+        trMenu.Items.Add(trRename);
+        trash.ContextMenu = trMenu;
         Grid.SetColumn(trash, 1); rowGrid.Children.Add(trash);
         // Reveal the trash icon on row hover; hide again when the pointer leaves.
         var trashRef = trash;
@@ -1885,6 +2115,9 @@ class ChatWindow : Window
     void DeleteLocal(Conversation c)
     {
         try { var p = Path_(c.Id); if (File.Exists(p)) File.Delete(p); } catch { }
+        // Clean up sidebar state for the deleted conversation.
+        bool _sc = _pinned.Remove(c.Id) | _archived.Remove(c.Id) | _forcedToday.Remove(c.Id);
+        if (_sc) SaveSidebarState();
         _all.Remove(c);
         if (_conv.Id == c.Id)
         {
