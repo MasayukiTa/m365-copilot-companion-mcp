@@ -117,6 +117,8 @@ class CockpitWindow : Window
 
     // Cached meta string for the directive-band row Sig (avoids per-tick rebuild when nothing changed).
     string _directiveBandMeta = "";
+    // The on-board (non-History) workers the directive band aggregates its goals/lane counts from.
+    List<Dictionary<string, object>> _directiveBandWorkers = new List<Dictionary<string, object>>();
 
     // ── A2-2: Evidence Spine (left panel) ────────────────────────────────────────
     // A fixed-width ~220px left column that shows an [COMPUTED] execution timeline for
@@ -3827,9 +3829,19 @@ class CockpitWindow : Window
         }
         rows.Add(MkRow(0, null, null));               // toolbar
 
-        // TASK 3: Directive band — emit only when there are workers (i.e. active or just-ended run).
+        // TASK 3: Directive band — show only while there is at least one ON-BOARD worker (i.e. not
+        // every card has been sent to History). Once the whole run is cleared to History the band
+        // disappears (user request 2026-06-28). On-board = workers minus _hiddenKeys (History);
+        // NOT filtered by the active tab, so the band is independent of which tab is selected.
+        var onBoard = new List<Dictionary<string, object>>();
+        foreach (Dictionary<string, object> ow in workers)
+        {
+            if (_hiddenKeys.Count > 0 && IsTerminalWorker(ow) && _hiddenKeys.Contains(WorkerKey(startedRoot, ow)))
+                continue;   // in History -> not on the board
+            onBoard.Add(ow);
+        }
         // Compute _directiveBandMeta here so the Sig captures the live elapsed/lane counts.
-        if (workers.Count > 0)
+        if (onBoard.Count > 0)
         {
             // Compute meta: "started HH:MM · {elapsed} · {active}/{total} lanes active" [COMPUTED]
             double dbStarted = Dbl(root, "started");
@@ -3840,7 +3852,7 @@ class CockpitWindow : Window
                 : (root.ContainsKey("elapsed_s") ? Dbl(root, "elapsed_s")
                    : (Dbl(root, "updated") > 0 && dbStarted > 0 ? Dbl(root, "updated") - dbStarted : 0));
             int dbActive = 0;
-            foreach (Dictionary<string, object> dw in workers)
+            foreach (Dictionary<string, object> dw in onBoard)
                 if (!IsTerminalWorker(dw) && S(dw, "status") != "pending") dbActive++;
             bool dbJa = _lang == 0;
             var dbMeta = new StringBuilder();
@@ -3854,14 +3866,15 @@ class CockpitWindow : Window
             if (dbElapsed > 0 || dbStarted == 0)
             {
                 if (dbMeta.Length > 0) dbMeta.Append(" · ");
-                dbMeta.Append(dbActive).Append("/").Append(workers.Count);
+                dbMeta.Append(dbActive).Append("/").Append(onBoard.Count);
                 dbMeta.Append(dbJa ? " lane 稼働中" : " lanes active");
             }
             _directiveBandMeta = dbMeta.ToString();
 
-            // Pass the first worker so DirectiveBand can access its goal. [REAL goal]
-            Dictionary<string, object> firstW = workers.Count > 0 ? workers[0] : null;
-            rows.Add(MkRow(6, firstW, null));         // directive band
+            // DirectiveBand aggregates goals from the on-board set (so lanes moved to History also
+            // drop out of the "Goals (N)" count), not the full _toolbarAll.
+            _directiveBandWorkers = onBoard;
+            rows.Add(MkRow(6, onBoard[0], null));      // directive band: first on-board worker's goal [REAL]
         }
         // Tab 0 (All): partition active/queued vs terminal with a divider.
         // Tabs 1-3 are explicit single-criterion views -- no re-partition needed.
@@ -4122,9 +4135,11 @@ class CockpitWindow : Window
     {
         bool ja = _lang == 0;
 
-        // Gather goal texts from all workers to determine single vs multi-goal.
+        // Gather goal texts from the ON-BOARD workers (History-cleared lanes excluded, set in
+        // BuildRows) to determine single vs multi-goal.
         var goalTexts = new List<string>();
-        foreach (Dictionary<string, object> tw in _toolbarAll)
+        var dbSrc = _directiveBandWorkers != null && _directiveBandWorkers.Count > 0 ? _directiveBandWorkers : _toolbarAll;
+        foreach (Dictionary<string, object> tw in dbSrc)
         {
             string g = S(tw, "goal");
             if (!string.IsNullOrEmpty(g) && !goalTexts.Contains(g))
