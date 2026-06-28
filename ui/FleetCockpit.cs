@@ -236,6 +236,7 @@ class CockpitWindow : Window
         if (k == "idle") return ja ? "未実行 — python -m relay.fleet_runner で並列実行を開始するとここに表示されます。"
                                    : "Not running — start with python -m relay.fleet_runner to see goals here.";
         if (k == "stale") return ja ? "更新が止まっています（フリート停止？）" : "no updates (fleet stopped?)";
+        if (k == "stale_wait") return ja ? "更新待ち" : "Waiting for update";
         if (k == "applies_next") return ja ? "次回起動から適用" : "applies next run";
         if (k == "start") return ja ? "並列実行を開始" : "Start parallel run";
         if (k == "goalhint") return ja ? "1行に1ゴール（複数可）・Ctrl+Enter で開始" : "One goal per line · Ctrl+Enter to start";
@@ -2173,6 +2174,9 @@ class CockpitWindow : Window
         _settingsPopup.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom;
         _settingsPopup.StaysOpen = false;          // click-away closes it
         _settingsPopup.AllowsTransparency = true;
+        // Right-align: offset so the panel's right edge lines up with the gear button's right edge
+        // (grows leftward, avoids right-window-edge clipping). MinWidth=280, button~30px -> -(280-30).
+        _settingsPopup.HorizontalOffset = -250;
         _gearBtn.Click += delegate
         {
             if (_settingsPopup.IsOpen) { _settingsPopup.IsOpen = false; return; }
@@ -2198,6 +2202,9 @@ class CockpitWindow : Window
         _overflowPopup.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom;
         _overflowPopup.StaysOpen = false;
         _overflowPopup.AllowsTransparency = true;
+        // Right-align: offset so the panel's right edge lines up with the overflow button's right edge
+        // (grows leftward, avoids right-window-edge clipping). MinWidth=200, button~36px -> -(200-36).
+        _overflowPopup.HorizontalOffset = -164;
         _overflowBtn.Click += delegate
         {
             if (_overflowPopup.IsOpen) { _overflowPopup.IsOpen = false; return; }
@@ -3589,6 +3596,21 @@ class CockpitWindow : Window
 
     static string S(Dictionary<string, object> d, string k)
     { if (d.ContainsKey(k) && d[k] != null) return d[k].ToString(); return ""; }
+
+    // Cheap deterministic FNV-1a 32-bit hash over a string. Used for RowSig so two strings
+    // of the same length but different content produce different signatures, forcing a re-render.
+    static int StableShortHash(string s)
+    {
+        if (s == null || s.Length == 0) return 0;
+        unchecked
+        {
+            int hash = (int)2166136261u;
+            for (int i = 0; i < s.Length; i++)
+                hash = (hash ^ (int)s[i]) * 16777619;
+            return hash;
+        }
+    }
+
     static int I(Dictionary<string, object> d, string k)
     { try { if (d.ContainsKey(k) && d[k] != null) return Convert.ToInt32(d[k]); } catch (Exception) { } return 0; }
     static double Dbl(Dictionary<string, object> d, string k)
@@ -3607,10 +3629,10 @@ class CockpitWindow : Window
                 var w = (Dictionary<string, object>)o;
                 string nm = S(w, "name");
                 sb.Append(nm).Append(S(w, "status")).Append(S(w, "turn"));
-                // only an EXPANDED card shows live progress text, so only its `last`-length
+                // only an EXPANDED card shows live progress text, so only its `last` hash
                 // changes need to force a re-render. Collapsed cards stay put while their
                 // worker streams -- that's what keeps a 164-task fleet from thrashing.
-                if (_expanded.Contains(nm)) sb.Append('#').Append((S(w, "last")).Length);
+                if (_expanded.Contains(nm)) sb.Append('#').Append(StableShortHash(S(w, "last")));
                 sb.Append(';');
             }
         return sb.ToString();
@@ -3708,8 +3730,17 @@ class CockpitWindow : Window
             }
         }
 
-        if (running && updated > 0 && (NowUnix() - updated) > 8)
-            triple = triple + " — " + T("stale");
+        // Two-stage stale indicator: soft (45 s) shows a calm wait hint; hard (90 s) shows a stop warning.
+        const double STALE_SOFT = 45.0;
+        const double STALE_HARD = 90.0;
+        if (running && updated > 0)
+        {
+            double staleAge = NowUnix() - updated;
+            if (staleAge > STALE_HARD)
+                triple = triple + " — " + T("stale");
+            else if (staleAge > STALE_SOFT)
+                triple = triple + " — " + T("stale_wait");
+        }
 
         // TASK 4: evidence freshness — "· evidence {N}s/m ago" from top-level `updated` field [COMPUTED].
         // Omit entirely if updated is missing (zero) — never show "unknown".
@@ -3954,9 +3985,12 @@ class CockpitWindow : Window
                   .Append(S(w, "status")).Append(S(w, "turn")).Append(S(w, "outcome"));
                 // The collapsed card now shows a result line + meta (turn/reviews/verified), so its
                 // signature must track `last`/reviews/verified too -- otherwise the at-a-glance line
-                // would freeze while the worker streams. Length-only keeps it cheap.
+                // would freeze while the worker streams. Hash (not length) catches same-length content changes.
+                string lastVal = S(w, "last");
+                string drVal = S(w, "display_result");
                 sb.Append(_expanded.Contains(nm) ? "#E" : "#C")
-                  .Append((S(w, "last")).Length).Append(':').Append(S(w, "verify_attempts")).Append(S(w, "verified"));
+                  .Append(StableShortHash(lastVal)).Append(':').Append(StableShortHash(drVal))
+                  .Append(':').Append(S(w, "verify_attempts")).Append(S(w, "verified"));
                 // TASK 3 (Bucket C): track next_step + self_confidence so the collapsed row re-renders.
                 sb.Append('|').Append(S(w, "next_step").Length).Append(':').Append(S(w, "self_confidence"));
                 return sb.ToString();
@@ -4867,14 +4901,29 @@ class CockpitWindow : Window
             else
             {
                 // ── Normal collapsed ledger row: line 2 + line 3 ────────────────────────────
-                // Line 2: latest human-readable progress (clean `last`). Hidden when empty.
-                string resultText = !string.IsNullOrEmpty(last) ? last : (terminal || closed ? "" : (_lang == 0 ? "実行中…" : "Working…"));
+                // Line 2: latest human-readable progress. Precedence: display_result > last > fallback.
+                string collapsedDisplayResult = S(w, "display_result");
+                string resultText;
+                if (!string.IsNullOrEmpty(collapsedDisplayResult))
+                    resultText = collapsedDisplayResult;
+                else if (!string.IsNullOrEmpty(last))
+                    resultText = last;
+                else
+                    resultText = (terminal || closed ? "" : (_lang == 0 ? "実行中…" : "Working…"));
+
                 if (!string.IsNullOrEmpty(resultText))
                 {
-                    string cleanedResult = !string.IsNullOrEmpty(last) ? CleanAgentResultForUi(last) : "";
                     string displayLine;
-                    if (!string.IsNullOrEmpty(last))
+                    if (!string.IsNullOrEmpty(collapsedDisplayResult))
                     {
+                        // display_result is already clean; just take the first line for the collapsed view
+                        int nl2 = collapsedDisplayResult.IndexOf('\n');
+                        string fl2 = nl2 >= 0 ? collapsedDisplayResult.Substring(0, nl2) : collapsedDisplayResult;
+                        displayLine = OneLine(!string.IsNullOrEmpty(fl2) ? fl2 : collapsedDisplayResult);
+                    }
+                    else if (!string.IsNullOrEmpty(last))
+                    {
+                        string cleanedResult = CleanAgentResultForUi(last);
                         string firstLine = "";
                         if (!string.IsNullOrEmpty(cleanedResult))
                         {
@@ -5081,11 +5130,14 @@ class CockpitWindow : Window
     {
         var sp = new StackPanel();
         sp.Children.Add(SectLabel(_lang == 0 ? "結果" : "Result"));
-        // Task 3: clean agent result for display; if cleaning yields empty, show fallback label.
-        string resultRaw = !string.IsNullOrEmpty(last) ? last
-                           : (terminal ? OutcomeLabel(outcome) : (_lang == 0 ? "実行中…" : "Working…"));
+        // Precedence: display_result (cleaned final answer from runner) > last > OutcomeLabel fallback.
+        string displayResult = (w != null) ? S(w, "display_result") : "";
         string result;
-        if (!string.IsNullOrEmpty(last))
+        if (!string.IsNullOrEmpty(displayResult))
+        {
+            result = displayResult;
+        }
+        else if (!string.IsNullOrEmpty(last))
         {
             string cleaned = CleanAgentResultForUi(last);
             result = !string.IsNullOrEmpty(cleaned)
@@ -5094,15 +5146,23 @@ class CockpitWindow : Window
         }
         else
         {
-            result = resultRaw;
+            result = terminal ? OutcomeLabel(outcome) : (_lang == 0 ? "実行中…" : "Working…");
         }
         sp.Children.Add(RoText(result, Fg, 13));
 
         var checks = new List<string>();
-        if (!string.IsNullOrEmpty(last)) checks.Add(_lang == 0 ? "エージェント応答を取得" : "Agent response captured");
-        if (reviews > 0) checks.Add(_lang == 0 ? ("レビュー " + reviews + " 回実施") : ("Reviewed " + reviews + " time(s)"));
-        if (verifiedOk) checks.Add(_lang == 0 ? "検証OK" : "Verified");
-        if (terminal) checks.Add(OutcomeLabel(outcome));
+        // Prefer display_result evidence, then last, for the "final answer obtained" check.
+        bool hasFinalAnswer = !string.IsNullOrEmpty(displayResult) || !string.IsNullOrEmpty(last);
+        if (hasFinalAnswer)
+            checks.Add(_lang == 0 ? "最終応答を取得" : "Final response obtained");
+        int verifyAttempts = (w != null) ? I(w, "verify_attempts") : reviews;
+        if (verifyAttempts > 0)
+            checks.Add(_lang == 0 ? ("レビュー " + verifyAttempts + " 回実施") : ("Reviewed " + verifyAttempts + " time(s)"));
+        if (verifiedOk)
+            checks.Add(_lang == 0 ? "レビューで最終応答を確認 / Verified by review" : "Verified by review");
+        // If terminal and no other evidence at all, fall back to the outcome label (e.g. CANCELLED).
+        if (terminal && checks.Count == 0)
+            checks.Add(OutcomeLabel(outcome));
         if (checks.Count > 0)
         {
             sp.Children.Add(SectLabel(_lang == 0 ? "チェック" : "Checks"));
@@ -5111,10 +5171,9 @@ class CockpitWindow : Window
         }
 
         // ── Timeline section ──────────────────────────────────────────────────────
-        // Events are derived from available data; timestamps come from the transcript jsonl
-        // "ts" field (epoch float). Each line: {"meta":true,"ts":...} or {"role":..., "ts":...}.
+        // Prefer phase_events (same source as Evidence Spine) when available; fall back to transcript.
         sp.Children.Add(SectLabel(_lang == 0 ? "タイムライン" : "Timeline"));
-        var tsEvents = BuildTimelineEvents(tpath, outcome, terminal, reviews);
+        var tsEvents = BuildTimelineEvents(tpath, outcome, terminal, reviews, w);
         foreach (string ev in tsEvents)
             sp.Children.Add(new TextBlock {
                 Text = "・" + ev, Foreground = Muted, FontSize = 12,
@@ -5125,13 +5184,65 @@ class CockpitWindow : Window
         return sp;
     }
 
-    // Build the ordered event list for the Timeline section. Reads the transcript jsonl to
-    // extract real "ts" (epoch) timestamps. Each entry already has "ts" on every line
-    // (meta line + every user/assistant turn). Returns a list of display strings.
-    List<string> BuildTimelineEvents(string tpath, string outcome, bool terminal, int reviews)
+    // Build the ordered event list for the Timeline section.
+    // Prefers phase_events from the worker dict (same source as Evidence Spine) when present.
+    // Falls back to transcript-derived timestamps when phase_events is absent.
+    List<string> BuildTimelineEvents(string tpath, string outcome, bool terminal, int reviews,
+                                     Dictionary<string, object> w)
     {
         bool ja = _lang == 0;
-        // Try to read ts values from the transcript: meta ts = queued/started, first user turn ts.
+        Func<double, string> fmtTs = delegate(double ts)
+        {
+            if (ts <= 0) return "";
+            try
+            {
+                var dt = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(ts).ToLocalTime();
+                return dt.ToString("HH:mm") + " ";
+            }
+            catch { return ""; }
+        };
+
+        // ── REAL mode: phase_events present on this worker ─────────────────────────
+        if (w != null)
+        {
+            object peRaw;
+            if (w.TryGetValue("phase_events", out peRaw) && peRaw is object[])
+            {
+                object[] peArr = (object[])peRaw;
+                if (peArr.Length > 0)
+                {
+                    var evs2 = new List<string>();
+                    foreach (object peObj in peArr)
+                    {
+                        var pe = peObj as Dictionary<string, object>;
+                        if (pe == null) continue;
+                        double peTs = 0;
+                        object peTsRaw;
+                        if (pe.TryGetValue("ts", out peTsRaw) && peTsRaw != null)
+                        { try { peTs = Convert.ToDouble(peTsRaw); } catch { } }
+                        string peEvent = "";
+                        object peEvRaw;
+                        if (pe.TryGetValue("event", out peEvRaw) && peEvRaw != null)
+                            peEvent = peEvRaw.ToString();
+                        // Use same label vocab as the Spine (Theme.StatusLabel)
+                        string localLabel = Theme.StatusLabel(peEvent, _lang);
+                        if (string.IsNullOrEmpty(localLabel) || localLabel == peEvent)
+                        {
+                            object peLblRaw;
+                            if (pe.TryGetValue("label", out peLblRaw) && peLblRaw != null
+                                && !string.IsNullOrEmpty(peLblRaw.ToString()))
+                                localLabel = peLblRaw.ToString();
+                        }
+                        if (string.IsNullOrEmpty(localLabel)) localLabel = peEvent;
+                        string timePrefix = peTs > 0 ? fmtTs(peTs) : "";
+                        evs2.Add(timePrefix + localLabel);
+                    }
+                    if (evs2.Count > 0) return evs2;
+                }
+            }
+        }
+
+        // ── COMPUTED fallback: derive timestamps from transcript ──────────────────
         double metaTs = 0, firstTurnTs = 0;
         bool hasTs = false;
         try
@@ -5148,19 +5259,16 @@ class CockpitWindow : Window
                     Dictionary<string, object> obj;
                     try { obj = _js.DeserializeObject(ln) as Dictionary<string, object>; } catch { continue; }
                     if (obj == null) continue;
-                    // meta line
                     if (obj.ContainsKey("meta") && Convert.ToBoolean(obj["meta"]))
                     {
                         if (obj.ContainsKey("ts") && obj["ts"] != null)
                         { metaTs = Convert.ToDouble(obj["ts"]); hasTs = true; }
                         continue;
                     }
-                    // first turn line (role present, ts present)
                     if (obj.ContainsKey("role") && obj.ContainsKey("ts") && obj["ts"] != null)
                     {
                         if (firstTurnTs == 0)
                             firstTurnTs = Convert.ToDouble(obj["ts"]);
-                        // we only need the first turn ts; stop after finding it
                         if (firstTurnTs > 0) break;
                     }
                 }
@@ -5169,33 +5277,12 @@ class CockpitWindow : Window
         catch { }
 
         var evs = new List<string>();
-        // Helper: format a unix epoch as "HH:mm" if we have it.
-        // Returns "" when ts==0 (no timestamp available).
-        // C# 5: no local functions -> use a Func delegate
-        Func<double, string> fmtTs = delegate(double ts)
-        {
-            if (ts <= 0) return "";
-            try
-            {
-                var dt = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(ts).ToLocalTime();
-                return dt.ToString("HH:mm") + " ";
-            }
-            catch { return ""; }
-        };
-
-        // Event 1: Queued (meta ts = file creation = worker was queued)
         string queuedTs = hasTs ? fmtTs(metaTs) : "";
         evs.Add(queuedTs + (ja ? "投入" : "Queued"));
-
-        // Event 2: Started (first turn ts = actual first interaction)
         string startTs = (firstTurnTs > 0) ? fmtTs(firstTurnTs) : "";
         evs.Add(startTs + (ja ? "開始" : "Started"));
-
-        // Event 3: Reviewed (if verify_attempts > 0)
         if (reviews > 0)
             evs.Add(ja ? ("レビュー (" + reviews + "x)") : ("Reviewed (" + reviews + "x)"));
-
-        // Event 4: terminal outcome
         if (terminal)
         {
             string outcomeEv;
@@ -5210,7 +5297,6 @@ class CockpitWindow : Window
             }
             evs.Add(outcomeEv);
         }
-
         return evs;
     }
 

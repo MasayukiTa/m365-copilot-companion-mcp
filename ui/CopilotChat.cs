@@ -240,7 +240,7 @@ class ChatWindow : Window
         // Settings button (opens cockpit)
         var settingsBtn = Btn("⚙", "PanelAlt", "Muted", true);
         settingsBtn.Padding = new Thickness(10, 3, 10, 3); settingsBtn.FontSize = 13;
-        settingsBtn.ToolTip = _lang == 0 ? "設定・コックピットを開く" : "Open settings / cockpit";
+        settingsBtn.ToolTip = _lang == 0 ? "Fleet / コックピットを開く" : "Open Fleet / Cockpit";
         settingsBtn.Click += delegate { OpenCockpit(); };
         headRight.Children.Add(settingsBtn);
         // Fleet active chip ("Fleet: N") -- collapsed when no active workers or status.json absent
@@ -1061,13 +1061,15 @@ class ChatWindow : Window
 
     // Compute a lightweight signature from status.json so we only rebuild the strip's
     // DOM when something actually changed (avoids per-tick flicker / GC pressure).
-    // Signature: "<running>|<updated>|<w0key:w0status>|<w1key:w1status>|..."
+    // Signature: "<running>|<updated>|<run_label>|<goal_count>|<w0key:w0status>|..."
     string FleetStripSignature(Dictionary<string, object> statusDoc)
     {
         if (statusDoc == null) return "";
         var sb = new StringBuilder();
         sb.Append(SS(statusDoc, "running")).Append('|');
         sb.Append(SS(statusDoc, "updated")).Append('|');
+        sb.Append(SS(statusDoc, "run_label")).Append('|');
+        sb.Append(SS(statusDoc, "goal_count")).Append('|');
         if (statusDoc.ContainsKey("workers") && statusDoc["workers"] is object[])
         {
             foreach (object o in (object[])statusDoc["workers"])
@@ -1130,41 +1132,73 @@ class ChatWindow : Window
             double nowEpoch = (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
             double ageSec = (updated > 0) ? (nowEpoch - updated) : -1;
 
-            int laneCount = workers.Length;
-            int needsAttentionCount = 0;
+            // run_label / goal_count from top-level fields (new schema)
+            string runLabel = SS(doc, "run_label");
+            string goalCountStr = SS(doc, "goal_count");
+
+            // Fallback label: first worker's goal, truncated
+            if (string.IsNullOrEmpty(runLabel) && workers.Length > 0)
+            {
+                var fw = workers[0] as Dictionary<string, object>;
+                if (fw != null)
+                {
+                    string fg = SS(fw, "goal");
+                    if (!string.IsNullOrEmpty(fg))
+                    {
+                        // use first non-empty line
+                        string[] fgLines = fg.Replace("\r", "").Split('\n');
+                        foreach (string fgl in fgLines)
+                        {
+                            string trimmed = fgl.Trim();
+                            if (trimmed.Length > 0) { runLabel = trimmed; break; }
+                        }
+                    }
+                }
+            }
+            // Truncate to ~50 chars
+            if (!string.IsNullOrEmpty(runLabel) && runLabel.Length > 50)
+                runLabel = runLabel.Substring(0, 50) + "…";
+
+            // Worker counts
+            int doneCount2 = 0, attentionCount2 = 0, runningCount2 = 0;
             foreach (object o in workers)
             {
                 var w = o as Dictionary<string, object>;
                 if (w == null) continue;
                 string st = SS(w, "status").ToLowerInvariant();
-                if (st == "stuck" || st == "maxturns" || st == "error") needsAttentionCount++;
+                if (st == "done" || st == "resolved" || st == "cancelled" || st == "freed") doneCount2++;
+                else if (st == "stuck" || st == "maxturns" || st == "error" || st == "awaiting") attentionCount2++;
+                else if (st != "pending") runningCount2++;
+            }
+            // Freshness string (shared by both branches)
+            string freshStr = "";
+            if (ageSec >= 0)
+            {
+                string ageStr;
+                if (ageSec < 60) ageStr = ((int)ageSec) + (_lang == 0 ? "秒前" : "s ago");
+                else if (ageSec < 3600) ageStr = ((int)(ageSec / 60)) + (_lang == 0 ? "分前" : "m ago");
+                else ageStr = ((int)(ageSec / 3600)) + (_lang == 0 ? "時間前" : "h ago");
+                freshStr = _lang == 0 ? ("最終更新 " + ageStr) : ("updated " + ageStr);
             }
 
             // ── Rebuild inner DOM ───────────────────────────────────────────────
             _fleetStripBody.Children.Clear();
 
-            // Header row: "CURRENT DELEGATION" label + "→ Fleet" link
-            bool ja = _lang == 0;
-            var headRow = new DockPanel { Margin = new Thickness(0, 0, 0, 4) };
-
-            // "→ Fleet" link on the right
-            var fleetLink = new Button
-            {
-                Content = ja ? "→ フリート" : "→ Fleet",
-                BorderThickness = new Thickness(0),
-                Background = Brushes.Transparent,
-                Padding = new Thickness(0),
-                Cursor = Cursors.Hand,
-                FontSize = 11.5,
-                FontWeight = FontWeights.SemiBold
-            };
-            SetRef(fleetLink, ForegroundProperty, "Accent");
-            fleetLink.Click += delegate { OpenCockpit(); };
-            DockPanel.SetDock(fleetLink, Dock.Right);
-            headRow.Children.Add(fleetLink);
-
-            // Strip title
             bool allDone = !running;
+            bool ja = _lang == 0;
+
+            // Header row: strip title label (left) + "証跡を開く / Open in Fleet" button (right)
+            var headRow = new DockPanel { Margin = new Thickness(0, 0, 0, 3) };
+
+            // Action button docked right: real bordered button, not a bare text link
+            var openBtn = Btn(ja ? "証跡を開く" : "Open in Fleet", "PanelAlt", "Accent", true);
+            openBtn.FontSize = 11; openBtn.Height = 22;
+            openBtn.Padding = new Thickness(8, 1, 8, 1);
+            openBtn.FontWeight = FontWeights.SemiBold;
+            openBtn.Click += delegate { OpenCockpit(); };
+            DockPanel.SetDock(openBtn, Dock.Right);
+            headRow.Children.Add(openBtn);
+
             string headLabel = allDone
                 ? (ja ? "委任完了" : "DELEGATION COMPLETE")
                 : (ja ? "実行中の委任" : "CURRENT DELEGATION");
@@ -1179,47 +1213,74 @@ class ChatWindow : Window
             headRow.Children.Add(headTb);
             _fleetStripBody.Children.Add(headRow);
 
-            // Summary line: "N lanes · M needs attention · evidence Xs ago"
-            var summaryParts = new StringBuilder();
-            if (allDone)
+            // ── LABEL line: run_label (or first worker goal), plus goal_count ──
+            if (!string.IsNullOrEmpty(runLabel))
             {
-                int doneCount = 0;
-                foreach (object o in workers)
+                string labelLine = runLabel;
+                if (!string.IsNullOrEmpty(goalCountStr))
+                    labelLine = labelLine + (ja ? " ・" : " ·") + goalCountStr + (ja ? "件" : " goals");
+                var labelTb = new TextBlock
                 {
-                    var w = o as Dictionary<string, object>;
-                    if (w == null) continue;
-                    string st = SS(w, "status").ToLowerInvariant();
-                    if (st == "done" || st == "resolved" || st == "cancelled" || st == "freed") doneCount++;
-                }
-                summaryParts.Append(doneCount).Append(ja ? " 件完了" : " done");
-                if (needsAttentionCount > 0)
-                    summaryParts.Append(ja ? " · " + needsAttentionCount + " 件要対応" : " · " + needsAttentionCount + " needs attention");
-                summaryParts.Append(ja ? " · 実行終了" : " · run ended");
+                    Text = labelLine,
+                    FontSize = 12,
+                    FontWeight = FontWeights.SemiBold,
+                    Margin = new Thickness(0, 2, 0, 2),
+                    TextWrapping = TextWrapping.NoWrap,
+                    TextTrimming = TextTrimming.CharacterEllipsis
+                };
+                SetRef(labelTb, TextBlock.ForegroundProperty, "Fg");
+                _fleetStripBody.Children.Add(labelTb);
             }
+
+            // ── COUNTS line: done / attention / running ──
+            // Render as an inline StackPanel so attention count can be a distinct color when >0
+            var countsPanel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 1, 0, 2) };
+
+            string donePart = ja
+                ? (doneCount2 + "件完了")
+                : (doneCount2 + " done");
+            var doneTb = new TextBlock { Text = donePart, FontSize = 11.5 };
+            SetRef(doneTb, TextBlock.ForegroundProperty, "Fg");
+            countsPanel.Children.Add(doneTb);
+
+            // Attention: warning color only when >0
+            var sepTb1 = new TextBlock { Text = ja ? " · " : " · ", FontSize = 11.5 };
+            SetRef(sepTb1, TextBlock.ForegroundProperty, "Muted");
+            countsPanel.Children.Add(sepTb1);
+
+            string attPart = ja
+                ? ("要対応" + attentionCount2)
+                : (attentionCount2 + " attention");
+            var attTb = new TextBlock { Text = attPart, FontSize = 11.5 };
+            if (attentionCount2 > 0)
+                attTb.Foreground = new SolidColorBrush(Theme.Col(Theme.Warning(_dark)));
             else
+                SetRef(attTb, TextBlock.ForegroundProperty, "Muted");
+            countsPanel.Children.Add(attTb);
+
+            var sepTb2 = new TextBlock { Text = ja ? " · " : " · ", FontSize = 11.5 };
+            SetRef(sepTb2, TextBlock.ForegroundProperty, "Muted");
+            countsPanel.Children.Add(sepTb2);
+
+            string runPart = ja
+                ? ("実行中" + runningCount2)
+                : (runningCount2 + " running");
+            var runTb = new TextBlock { Text = runPart, FontSize = 11.5 };
+            SetRef(runTb, TextBlock.ForegroundProperty, allDone ? "Muted" : "Fg");
+            countsPanel.Children.Add(runTb);
+
+            // Freshness appended inline
+            if (!string.IsNullOrEmpty(freshStr))
             {
-                summaryParts.Append(laneCount).Append(ja ? " レーン" : " lanes");
-                if (needsAttentionCount > 0)
-                    summaryParts.Append(ja ? " · " + needsAttentionCount + " 件要対応" : " · " + needsAttentionCount + " needs attention");
-                if (ageSec >= 0)
-                {
-                    string ageStr;
-                    if (ageSec < 60) ageStr = ((int)ageSec) + (ja ? "秒前" : "s ago");
-                    else if (ageSec < 3600) ageStr = ((int)(ageSec / 60)) + (ja ? "分前" : "m ago");
-                    else ageStr = ((int)(ageSec / 3600)) + (ja ? "時間前" : "h ago");
-                    summaryParts.Append(ja ? " · 最終更新 " + ageStr : " · last update " + ageStr);
-                }
+                var sepTb3 = new TextBlock { Text = ja ? " · " : " · ", FontSize = 11.5 };
+                SetRef(sepTb3, TextBlock.ForegroundProperty, "Muted");
+                countsPanel.Children.Add(sepTb3);
+                var freshTb = new TextBlock { Text = freshStr, FontSize = 11.5 };
+                SetRef(freshTb, TextBlock.ForegroundProperty, "Muted");
+                countsPanel.Children.Add(freshTb);
             }
-            var summaryTb = new TextBlock
-            {
-                Text = summaryParts.ToString(),
-                FontSize = 11.5,
-                Margin = new Thickness(0, 0, 0, 6),
-                TextWrapping = TextWrapping.NoWrap,
-                TextTrimming = TextTrimming.CharacterEllipsis
-            };
-            SetRef(summaryTb, TextBlock.ForegroundProperty, "Fg");
-            _fleetStripBody.Children.Add(summaryTb);
+
+            _fleetStripBody.Children.Add(countsPanel);
 
             // Per-lane chips (cap at 6 workers; show "+K more" if overflow)
             var chipsPanel = new WrapPanel { Orientation = Orientation.Horizontal };

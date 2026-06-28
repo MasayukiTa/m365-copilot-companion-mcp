@@ -181,7 +181,7 @@ def _read_goals(args):
     return goals
 
 
-def _pending_gates():
+def _pending_gates(started=0.0):
     """Scan .companion_gates/ for unanswered HITL gates and return a list of dicts.
 
     Each dict has: {"token", "question", "context", "ts", "path"}.
@@ -194,6 +194,11 @@ def _pending_gates():
     Cockpit writes an answer by updating the gate file at `path`:
       set:  {"answered": true, "answer": "approved"}   OR   {"answer": "denied"}
     Write atomically (temp-then-rename) to avoid partial reads.
+
+    `started` is the epoch timestamp when the current Fleet run started.  Only gates
+    with asked_at >= started are included so stale gates from a previous run (or leftover
+    test gates) never bleed into a new run's pending-gates list.  Gates that lack an
+    asked_at field (malformed) are silently skipped rather than crashing the snapshot.
     """
     try:
         import json as _json
@@ -206,11 +211,18 @@ def _pending_gates():
             try:
                 d = _json.loads(p.read_text(encoding="utf-8"))
                 if not d.get("answered"):
+                    # FIX 1 (P0): scope to the CURRENT run.  Gates without a valid asked_at
+                    # (malformed or pre-dating this contract) are excluded defensively.
+                    asked_at = d.get("asked_at")
+                    if not isinstance(asked_at, (int, float)):
+                        continue          # malformed gate -- skip rather than crash
+                    if asked_at < started:
+                        continue          # stale gate from a previous run -- ignore
                     result.append({
                         "token": d.get("token", p.stem),
                         "question": d.get("question", ""),
                         "context": d.get("context", ""),
-                        "ts": d.get("asked_at", 0.0),
+                        "ts": asked_at,
                         # absolute path to THIS gate file, forward-slashed so the cockpit
                         # can open it directly (no MCP_ALLOWED_BASE resolution needed).
                         "path": p.resolve().as_posix(),
@@ -223,8 +235,30 @@ def _pending_gates():
         return []
 
 
+def _clean_final_text(text, max_len=600):
+    """Strip terminal markers and collapse whitespace from a worker's final assistant text.
+
+    Removes trailing lone tokens like "DONE", "<promptend>", and agent control preamble,
+    then collapses runs of whitespace and truncates to `max_len` chars.  Returns "" if
+    `text` is falsy.
+    """
+    import re
+    if not text:
+        return ""
+    t = text
+    # strip trailing terminal / control tokens (case-insensitive, allow surrounding whitespace)
+    t = re.sub(r'\s*<promptend>\s*$', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'\s*\bDONE\b\s*$', '', t)
+    # strip agent-control preambles that sometimes appear at the very start
+    t = re.sub(r'^\s*\[?(?:TOOL[_\-]CALL|FUNCTION[_\-]CALL|tool_call)[^\n]*\n?', '', t,
+               flags=re.IGNORECASE)
+    # collapse interior whitespace and trim
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t[:max_len]
+
+
 def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False,
-              ram_floor_mb=0.0, directive=""):
+              ram_floor_mb=0.0, directive="", run_label="", goal_count=0):
     from relay.relay_fleet import free_disk_gb
     total = len(workers)        # dynamic: goals can be added mid-run (native chat queue)
     done = sum(1 for w in workers if w.status in TERMINAL)
@@ -254,6 +288,10 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # UI already handles multi-goal honestly and should NOT fabricate a summary). Only
         # populated when there is a genuinely single directive -- never fabricated for multi-goal.
         "directive": directive,
+        # FIX 3 (P2): human-readable run label (verbatim first line of first goal, <=60 chars)
+        # and total goal count for the UI header.  run_label is NEVER synthesised -- verbatim only.
+        "run_label": run_label,
+        "goal_count": goal_count,
         "workers": [{
             "name": w.name,
             "goal": w.goal,
@@ -300,7 +338,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # Cockpit writes the answer by patching the file at `path`:
         # Set {"answered": true, "answer": "approved"}  to approve
         # Set {"answered": true, "answer": "denied"}    to deny
-        "pending_gates": _pending_gates(),
+        "pending_gates": _pending_gates(started=started),
     }
 
 
@@ -535,6 +573,14 @@ def main():
     # directive, so we set it to "" -- the UI handles multi-goal runs honestly and we never
     # fabricate a summary. Only one goal -> directive = that goal's text.
     directive = gtexts[0] if len(gtexts) == 1 else ""
+    # FIX 3 (P2): run_label = verbatim first line of the first goal, truncated to 60 chars,
+    # with leading list markers / whitespace stripped.  NEVER synthesised.
+    import re as _re
+    _first_goal_text = gtexts[0] if gtexts else ""
+    _first_line = _first_goal_text.splitlines()[0] if _first_goal_text else ""
+    _first_line = _re.sub(r'^[\s\-*#\d.>]+', '', _first_line).strip()
+    run_label = _first_line[:60]
+    goal_count = len(gtexts)
 
     os.makedirs(args.state_dir, exist_ok=True)
     status_path = os.path.join(args.state_dir, "status.json")
@@ -607,6 +653,7 @@ def main():
                                 "max_concurrent": max_conc, "open_tabs": 0,
                                 "avail_mb": round(avail_phys_mb()),
                                 "directive": directive,
+                                "run_label": run_label, "goal_count": goal_count,
                                 "workers": [{"name": "w%d" % i, "goal": gtexts[i],
                                              "status": "pending", "pill": "待機列",
                                              "color": "muted", "outcome": None,
@@ -772,7 +819,8 @@ def main():
         try:
             _write_atomic(status_path, _snapshot(workers, started, len(goals), mc_box[0],
                                                  disk_floor_gb=disk_box[0], paused=pause_box[0],
-                                                 ram_floor_mb=ram_box[0], directive=directive))
+                                                 ram_floor_mb=ram_box[0], directive=directive,
+                                                 run_label=run_label, goal_count=goal_count))
         except Exception:
             pass
         _print_table(workers, len(goals))
@@ -918,23 +966,41 @@ def main():
         if o in ("STUCK", "VERIFY_FAILED"): return "stuck"
         return "error"
 
+    def _final_worker_entry(r, max_turns):
+        # FIX 2 (P0): recover the cleaned final assistant text and write it to BOTH
+        # display_result (new contract field) and last (stop blanking it).
+        # If no text is available, last keeps "" rather than being forcibly overwritten.
+        raw_last = r.get("last_response", "") or ""
+        cleaned = _clean_final_text(raw_last)
+        return {
+            "name": r["name"], "goal": r["goal"],
+            "status": _ostatus(r["outcome"]),
+            "outcome": r["outcome"], "turn": r["turns"],
+            "max_turns": max_turns, "reason": r["reason"],
+            "verified": r.get("verified"),
+            "verify_attempts": r.get("verify_attempts", 0),
+            "conv_url": r.get("conv_url", ""),
+            "conv_title": r.get("conv_title", ""),
+            "transcript": r.get("transcript", ""),
+            "cwd": r.get("cwd", ""),
+            "closed": True,
+            # FIX 2: last is the cleaned final text, not "".  Readers expecting a non-blank
+            # last after completion now see the real answer instead of a bare 完了 label.
+            "last": cleaned,
+            # New contract field: the same cleaned final text, explicitly named so the UI
+            # can distinguish "display result" from the mid-run live tail.
+            "display_result": cleaned,
+            "phase_events": r.get("phase_events", []),
+        }
+
     elapsed = round(time.time() - started, 1)
     done_count = sum(1 for r in results if r["outcome"] == "DONE")
     final = {"started": started, "updated": time.time(), "total": len(goals),
              "done_count": done_count, "running": False, "elapsed_s": elapsed,
              "directive": directive,
-             "workers": [{"name": r["name"], "goal": r["goal"],
-                          "status": _ostatus(r["outcome"]),
-                          "outcome": r["outcome"], "turn": r["turns"],
-                          "max_turns": args.max_turns, "reason": r["reason"],
-                          "verified": r.get("verified"),
-                          "verify_attempts": r.get("verify_attempts", 0),
-                          "conv_url": r.get("conv_url", ""),
-                          "conv_title": r.get("conv_title", ""),
-                          "transcript": r.get("transcript", ""),
-                          "cwd": r.get("cwd", ""),
-                          "closed": True, "last": "",
-                          "phase_events": r.get("phase_events", [])} for r in results]}
+             # FIX 3 (P2): also carry run_label / goal_count into the final snapshot.
+             "run_label": run_label, "goal_count": goal_count,
+             "workers": [_final_worker_entry(r, args.max_turns) for r in results]}
     _write_atomic(status_path, final)
     print("\n\n=== fleet complete in %ss ===" % elapsed)
     for r in results:
