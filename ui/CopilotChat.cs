@@ -20,6 +20,7 @@ using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Documents;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
@@ -2599,25 +2600,107 @@ class ChatWindow : Window
         RenderAssistantBody(content, outer, text);
     }
 
-    // Render the answer as a SELECTABLE read-only TextBox (TextBlocks can't be selected,
-    // so the markdown render could not be copied). Light markdown cleanup for readability;
-    // the copy button still copies the full text via outer.Tag.
+    // Render the settled assistant answer as a SELECTABLE read-only RichTextBox.
+    // TextBlock is not selectable; plain TextBox does not support LineHeight/paragraph spacing.
+    // RichTextBox + FlowDocument solves both: text is selectable and line-height is honored.
+    // Streaming still uses a plain TextBox (MakeText / _pendingText); on stream completion
+    // RenderAssistantBody is called to replace it with the richer layout — no flicker during
+    // streaming, rich rendering for the settled message.
+    // The copy button still copies the full original markdown via outer.Tag.
     void RenderAssistantBody(Panel content, StackPanel outer, string text)
     {
         content.Children.Clear();
-        var tb = new TextBox
-        {
-            Text = PlainText(text), IsReadOnly = true, IsTabStop = false,
-            BorderThickness = new Thickness(0), Background = Brushes.Transparent,
-            TextWrapping = TextWrapping.Wrap, FontSize = 14, Padding = new Thickness(0, 0, 0, 2),
-            FontFamily = new FontFamily("Segoe UI Variable, Segoe UI"),
-            VerticalScrollBarVisibility = ScrollBarVisibility.Disabled,
-            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
-        };
-        SetRef(tb, ForegroundProperty, "Fg");
-        SetRef(tb, TextBox.SelectionBrushProperty, "Accent");
-        content.Children.Add(tb);
         if (outer != null) outer.Tag = text;
+
+        var rtb = new RichTextBox();
+        rtb.IsReadOnly = true;
+        rtb.IsTabStop = false;
+        rtb.IsDocumentEnabled = false;
+        rtb.BorderThickness = new Thickness(0);
+        rtb.Background = Brushes.Transparent;
+        rtb.Padding = new Thickness(0);
+        rtb.Focusable = true;   // required for text selection to work
+        rtb.HorizontalAlignment = HorizontalAlignment.Stretch;
+        rtb.FontFamily = new FontFamily("Segoe UI Variable, Segoe UI");
+        rtb.FontSize = 14;
+        // Disable scrollbars so the RichTextBox auto-sizes to its content height
+        // instead of clipping to a fixed viewport.
+        ScrollViewer.SetVerticalScrollBarVisibility(rtb, ScrollBarVisibility.Disabled);
+        ScrollViewer.SetHorizontalScrollBarVisibility(rtb, ScrollBarVisibility.Disabled);
+        rtb.VerticalScrollBarVisibility = ScrollBarVisibility.Disabled;
+        rtb.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
+        SetRef(rtb, ForegroundProperty, "Fg");
+        SetRef(rtb, TextBoxBase.SelectionBrushProperty, "Accent");
+
+        // Build a FlowDocument from the plain text.
+        // Paragraphs are separated by one-or-more blank lines; within a paragraph,
+        // single newlines become soft line breaks (LineBreak inlines).
+        var doc = new FlowDocument();
+        doc.PagePadding = new Thickness(0);
+        doc.FontFamily = rtb.FontFamily;
+        doc.FontSize = 14;
+        // Ensure the document foreground picks up the theme color.
+        // FlowDocument is DependencyObject but not FrameworkElement, so call
+        // SetResourceReference directly rather than through the SetRef helper.
+        doc.SetResourceReference(FlowDocument.ForegroundProperty, "Fg");
+
+        string plain = PlainText(text);
+
+        // Split on runs of 2+ newlines to identify paragraph boundaries.
+        // We do this manually without Regex (C# 5 compatible, no extra imports).
+        var paragraphBlocks = new List<string>();
+        var lines = plain.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n');
+        var blockLines = new List<string>();
+        for (int i = 0; i < lines.Length; i++)
+        {
+            if (lines[i].Length == 0)
+            {
+                // blank line: flush current block if non-empty
+                if (blockLines.Count > 0)
+                {
+                    paragraphBlocks.Add(string.Join("\n", blockLines.ToArray()));
+                    blockLines.Clear();
+                }
+            }
+            else
+            {
+                blockLines.Add(lines[i]);
+            }
+        }
+        // flush any trailing block
+        if (blockLines.Count > 0)
+            paragraphBlocks.Add(string.Join("\n", blockLines.ToArray()));
+
+        if (paragraphBlocks.Count == 0)
+        {
+            // Empty text: add a single empty paragraph to avoid an empty-document edge case.
+            doc.Blocks.Add(new Paragraph());
+        }
+        else
+        {
+            for (int pi = 0; pi < paragraphBlocks.Count; pi++)
+            {
+                bool isLast = (pi == paragraphBlocks.Count - 1);
+                var para = new Paragraph();
+                para.LineHeight = 22;
+                para.LineStackingStrategy = LineStackingStrategy.BlockLineHeight;
+                // Paragraph bottom margin: small on last to avoid excess trailing space.
+                para.Margin = isLast ? new Thickness(0, 0, 0, 2) : new Thickness(0, 0, 0, 10);
+
+                // Within a block, split on "\n" for soft line breaks.
+                string[] segments = paragraphBlocks[pi].Split('\n');
+                for (int si = 0; si < segments.Length; si++)
+                {
+                    para.Inlines.Add(new Run(segments[si]));
+                    if (si < segments.Length - 1)
+                        para.Inlines.Add(new LineBreak());
+                }
+                doc.Blocks.Add(para);
+            }
+        }
+
+        rtb.Document = doc;
+        content.Children.Add(rtb);
     }
 
     static string PlainText(string md)
