@@ -1609,6 +1609,9 @@ class CockpitWindow : Window
             string instr = PromptInstruction();
             if (string.IsNullOrEmpty(instr)) return;
 
+            // Autonomy Contract pre-flight (folder path only — quick Start is unchanged).
+            if (!ShowAutonomyContract(folder, instr)) return;
+
             string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
             string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
             if (!File.Exists(py)) py = "python";
@@ -1681,6 +1684,292 @@ class CockpitWindow : Window
         w.Content = sp;
         bool? r = w.ShowDialog();
         return (r == true) ? box[0] : null;
+    }
+
+    // ── Autonomy Contract pre-flight dialog (folder autonomous path only) ─────────
+    // Shows a modal summary of what the agent will and will not do before the run
+    // launches. Returns true if the user clicks Delegate, false if they Cancel.
+    // REAL fields are shown plainly; FUTURE/unimplemented items are labeled with ⚠.
+    bool ShowAutonomyContract(string folder, string instruction)
+    {
+        bool ja = _lang == 0;
+
+        var w = new Window();
+        w.Title = ja ? "自律委任 — 確認" : "Autonomy Contract";
+        w.Width = 540;
+        w.SizeToContent = SizeToContent.Height;
+        w.WindowStartupLocation = WindowStartupLocation.CenterOwner;
+        w.Owner = this;
+        w.Background = Theme.Br(Theme.Surface(_dark));
+        w.ResizeMode = ResizeMode.NoResize;
+
+        var outer = new StackPanel();
+        outer.Margin = new Thickness(0);
+
+        // ── Title bar band ────────────────────────────────────────────────────────
+        var titleBand = new Border();
+        titleBand.Background = Theme.Br(Theme.Bg(_dark));
+        titleBand.BorderBrush = Theme.Br(Theme.Border(_dark));
+        titleBand.BorderThickness = new Thickness(0, 0, 0, 1);
+        titleBand.Padding = new Thickness(24, 16, 24, 16);
+        var titleTb = new TextBlock();
+        titleTb.Text = ja ? "AUTONOMY CONTRACT / 自律委任" : "AUTONOMY CONTRACT / 自律委任";
+        titleTb.FontSize = 11;
+        titleTb.FontWeight = FontWeights.SemiBold;
+        titleTb.Foreground = Theme.Br(Theme.Muted(_dark));
+        titleBand.Child = titleTb;
+        outer.Children.Add(titleBand);
+
+        // ── Body ──────────────────────────────────────────────────────────────────
+        var body = new StackPanel();
+        body.Margin = new Thickness(24, 20, 24, 8);
+
+        // Helper: section label (small-caps style via all-upper + Muted + small font)
+        // C#5: no local methods, use a Func<> delegate
+        Func<string, TextBlock> makeSectionLabel = delegate(string txt)
+        {
+            var tb2 = new TextBlock();
+            tb2.Text = txt.ToUpperInvariant();
+            tb2.FontSize = 10;
+            tb2.FontWeight = FontWeights.SemiBold;
+            tb2.Foreground = Theme.Br(Theme.Muted(_dark));
+            tb2.Margin = new Thickness(0, 0, 0, 3);
+            return tb2;
+        };
+
+        // Helper: value text (body size, Text color)
+        Func<string, TextBlock> makeValue = delegate(string txt)
+        {
+            var tb2 = new TextBlock();
+            tb2.Text = txt;
+            tb2.FontSize = 13;
+            tb2.Foreground = Theme.Br(Theme.Text(_dark));
+            tb2.TextWrapping = TextWrapping.Wrap;
+            return tb2;
+        };
+
+        // Helper: a [FUTURE] caveat row with ⚠ prefix (Warning color, smaller)
+        Func<string, TextBlock> makeFutureNote = delegate(string txt)
+        {
+            var tb2 = new TextBlock();
+            tb2.Text = txt;
+            tb2.FontSize = 11;
+            tb2.Foreground = Theme.Br(Theme.Warning(_dark));
+            tb2.TextWrapping = TextWrapping.Wrap;
+            tb2.Margin = new Thickness(0, 2, 0, 0);
+            return tb2;
+        };
+
+        // Helper: thin rule between sections
+        Func<Border> makeRule = delegate()
+        {
+            var sep = new Border();
+            sep.Height = 1;
+            sep.Background = Theme.Br(Theme.Border(_dark));
+            sep.Margin = new Thickness(0, 14, 0, 14);
+            return sep;
+        };
+
+        // ── 1. Directive [REAL] ───────────────────────────────────────────────────
+        body.Children.Add(makeSectionLabel(ja ? "指示 / Directive" : "Directive / 指示"));
+        var directiveBorder = new Border();
+        directiveBorder.BorderBrush = Theme.Br(Theme.Border(_dark));
+        directiveBorder.BorderThickness = new Thickness(1);
+        directiveBorder.CornerRadius = new CornerRadius(6);
+        directiveBorder.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+        directiveBorder.Padding = new Thickness(10, 8, 10, 8);
+        directiveBorder.Margin = new Thickness(0, 0, 0, 0);
+        var directiveTb = new TextBlock();
+        directiveTb.Text = instruction;
+        directiveTb.FontSize = 13;
+        directiveTb.Foreground = Theme.Br(Theme.Text(_dark));
+        directiveTb.TextWrapping = TextWrapping.Wrap;
+        directiveBorder.Child = directiveTb;
+        body.Children.Add(directiveBorder);
+        body.Children.Add(makeRule());
+
+        // ── 2. Scope [REAL] ───────────────────────────────────────────────────────
+        body.Children.Add(makeSectionLabel(ja ? "範囲 / Scope" : "Scope / 範囲"));
+        body.Children.Add(makeValue(folder));
+        var scopeTag = new TextBlock();
+        scopeTag.Text = "[REAL]";
+        scopeTag.FontSize = 10;
+        scopeTag.Foreground = Theme.Br(Theme.Faint(_dark));
+        scopeTag.Margin = new Thickness(0, 1, 0, 0);
+        body.Children.Add(scopeTag);
+        body.Children.Add(makeRule());
+
+        // ── 3. Allowed [REAL] ─────────────────────────────────────────────────────
+        body.Children.Add(makeSectionLabel(ja ? "許可 / Allowed" : "Allowed / 許可"));
+        body.Children.Add(makeValue(
+            ja ? "ファイルの編集・コマンド実行・テスト実行 / edit files, run commands, run tests"
+               : "edit files · run commands · run tests"));
+        var allowedSub = new TextBlock();
+        allowedSub.Text = ja ? "(relayのデフォルト実行権限 — from relay permission policy)"
+                             : "(relay default capability — from relay permission policy)";
+        allowedSub.FontSize = 11;
+        allowedSub.Foreground = Theme.Br(Theme.Muted(_dark));
+        allowedSub.TextWrapping = TextWrapping.Wrap;
+        allowedSub.Margin = new Thickness(0, 2, 0, 0);
+        body.Children.Add(allowedSub);
+        var allowedTag = new TextBlock();
+        allowedTag.Text = "[REAL]";
+        allowedTag.FontSize = 10;
+        allowedTag.Foreground = Theme.Br(Theme.Faint(_dark));
+        allowedTag.Margin = new Thickness(0, 1, 0, 0);
+        body.Children.Add(allowedTag);
+        body.Children.Add(makeRule());
+
+        // ── 4. Ask before [FUTURE] ───────────────────────────────────────────────
+        body.Children.Add(makeSectionLabel(ja ? "確認してから / Ask before" : "Ask before / 確認してから"));
+        var askVal = makeValue(
+            ja ? "公開・ファイル削除・外部送信 / publishing, deleting files, external sends"
+               : "publishing · deleting files · external sends");
+        askVal.Foreground = Theme.Br(Theme.Muted(_dark));   // grayed to signal FUTURE
+        body.Children.Add(askVal);
+        body.Children.Add(makeFutureNote(
+            ja ? "⚠ 設定上の意図（実行時には未強制）— configured intent, not enforced at runtime yet"
+               : "⚠ Configured intent — not enforced at runtime yet [FUTURE]"));
+        body.Children.Add(makeRule());
+
+        // ── 5. Stop when [FUTURE] ────────────────────────────────────────────────
+        body.Children.Add(makeSectionLabel(ja ? "停止条件 / Stop when" : "Stop when / 停止条件"));
+        var stopVal = makeValue(
+            ja ? "テスト通過・予算超過・要承認時 / tests pass, budget exceeded, approval needed"
+               : "tests pass · budget exceeded · approval needed");
+        stopVal.Foreground = Theme.Br(Theme.Muted(_dark));  // grayed to signal FUTURE
+        body.Children.Add(stopVal);
+        body.Children.Add(makeFutureNote(
+            ja ? "⚠ 未強制 — fleet は done/stuck になるまで実行します（停止条件はランタイムで強制されていません）"
+               : "⚠ Not enforced — fleet runs until done/stuck [FUTURE]"));
+        body.Children.Add(makeRule());
+
+        // ── 6. Acceptance [REAL/partial] ─────────────────────────────────────────
+        body.Children.Add(makeSectionLabel(ja ? "受入条件 / Acceptance" : "Acceptance / 受入条件"));
+        body.Children.Add(makeValue(ja ? "指定なし / none specified" : "none specified (no checks[] provided)"));
+        var acceptTag = new TextBlock();
+        acceptTag.Text = "[REAL/partial — checks[] from goal, if any]";
+        acceptTag.FontSize = 10;
+        acceptTag.Foreground = Theme.Br(Theme.Faint(_dark));
+        acceptTag.Margin = new Thickness(0, 1, 0, 0);
+        body.Children.Add(acceptTag);
+        body.Children.Add(makeRule());
+
+        // ── 7. Report [REAL] ─────────────────────────────────────────────────────
+        body.Children.Add(makeSectionLabel(ja ? "報告 / Report" : "Report / 報告"));
+        body.Children.Add(makeValue(ja ? "完了時に要約と証拠 / summary + evidence on completion"
+                                      : "summary + evidence on completion"));
+        var reportSub = new TextBlock();
+        reportSub.Text = ja ? "(outcome + transcript末尾からカードに表示)"
+                            : "(outcome + last transcript excerpt shown on card)";
+        reportSub.FontSize = 11;
+        reportSub.Foreground = Theme.Br(Theme.Muted(_dark));
+        reportSub.TextWrapping = TextWrapping.Wrap;
+        reportSub.Margin = new Thickness(0, 2, 0, 0);
+        body.Children.Add(reportSub);
+        var reportTag = new TextBlock();
+        reportTag.Text = "[REAL]";
+        reportTag.FontSize = 10;
+        reportTag.Foreground = Theme.Br(Theme.Faint(_dark));
+        reportTag.Margin = new Thickness(0, 1, 0, 0);
+        body.Children.Add(reportTag);
+        body.Children.Add(makeRule());
+
+        // ── 8. Effort / Approval (read-only display, header dropdowns are authoritative) ──
+        var effortRow = new StackPanel();
+        effortRow.Orientation = Orientation.Horizontal;
+        effortRow.Margin = new Thickness(0, 0, 0, 4);
+        var effortLbl = new TextBlock();
+        effortLbl.Text = (ja ? "推論 / Effort: " : "Effort: ");
+        effortLbl.FontSize = 12;
+        effortLbl.Foreground = Theme.Br(Theme.Muted(_dark));
+        effortLbl.VerticalAlignment = VerticalAlignment.Center;
+        effortRow.Children.Add(effortLbl);
+        var effortVal = new TextBlock();
+        effortVal.Text = _effort;
+        effortVal.FontSize = 12;
+        effortVal.FontWeight = FontWeights.SemiBold;
+        effortVal.Foreground = Theme.Br(Theme.Text(_dark));
+        effortVal.VerticalAlignment = VerticalAlignment.Center;
+        effortVal.Margin = new Thickness(4, 0, 24, 0);
+        effortRow.Children.Add(effortVal);
+        var approvalLbl = new TextBlock();
+        approvalLbl.Text = (ja ? "承認 / Approval: " : "Approval: ");
+        approvalLbl.FontSize = 12;
+        approvalLbl.Foreground = Theme.Br(Theme.Muted(_dark));
+        approvalLbl.VerticalAlignment = VerticalAlignment.Center;
+        effortRow.Children.Add(approvalLbl);
+        var approvalVal = new TextBlock();
+        approvalVal.Text = _approval;
+        approvalVal.FontSize = 12;
+        approvalVal.FontWeight = FontWeights.SemiBold;
+        approvalVal.Foreground = Theme.Br(Theme.Text(_dark));
+        approvalVal.VerticalAlignment = VerticalAlignment.Center;
+        approvalVal.Margin = new Thickness(4, 0, 0, 0);
+        effortRow.Children.Add(approvalVal);
+        body.Children.Add(effortRow);
+        var effortNote = new TextBlock();
+        effortNote.Text = ja ? "(ヘッダーのドロップダウンが主設定 / header dropdowns are authoritative)"
+                             : "(header dropdowns are authoritative — shown here for reference)";
+        effortNote.FontSize = 10;
+        effortNote.Foreground = Theme.Br(Theme.Faint(_dark));
+        effortNote.Margin = new Thickness(0, 1, 0, 0);
+        body.Children.Add(effortNote);
+
+        outer.Children.Add(body);
+
+        // ── Footer: Cancel + Delegate buttons ────────────────────────────────────
+        var footerBand = new Border();
+        footerBand.BorderBrush = Theme.Br(Theme.Border(_dark));
+        footerBand.BorderThickness = new Thickness(0, 1, 0, 0);
+        footerBand.Background = Theme.Br(Theme.Bg(_dark));
+        footerBand.Padding = new Thickness(24, 14, 24, 14);
+
+        var footerRow = new StackPanel();
+        footerRow.Orientation = Orientation.Horizontal;
+        footerRow.HorizontalAlignment = HorizontalAlignment.Right;
+
+        bool[] delegated = new bool[1];
+        delegated[0] = false;
+
+        var cancelBtn = new Button();
+        cancelBtn.Content = ja ? "キャンセル / Cancel" : "Cancel";
+        cancelBtn.IsCancel = true;
+        cancelBtn.Height = Theme.BtnH;
+        cancelBtn.Padding = new Thickness(16, 0, 16, 0);
+        cancelBtn.Background = Brushes.Transparent;
+        cancelBtn.Foreground = Theme.Br(Theme.Text(_dark));
+        cancelBtn.BorderBrush = Theme.Br(Theme.Border(_dark));
+        cancelBtn.BorderThickness = new Thickness(1);
+        cancelBtn.Cursor = Cursors.Hand;
+        cancelBtn.Margin = new Thickness(0, 0, 10, 0);
+        cancelBtn.Click += delegate { w.DialogResult = false; };
+        footerRow.Children.Add(cancelBtn);
+
+        var delegateBtn = new Button();
+        delegateBtn.Content = ja ? "委任する →" : "Delegate →";
+        delegateBtn.IsDefault = true;
+        delegateBtn.Height = Theme.BtnH;
+        delegateBtn.Padding = new Thickness(20, 0, 20, 0);
+        delegateBtn.Background = Theme.Br(Theme.Accent(_dark));
+        delegateBtn.Foreground = new SolidColorBrush(C("#FFFFFF"));
+        delegateBtn.BorderThickness = new Thickness(0);
+        delegateBtn.FontWeight = FontWeights.SemiBold;
+        delegateBtn.Cursor = Cursors.Hand;
+        delegateBtn.Click += delegate { delegated[0] = true; w.DialogResult = true; };
+        footerRow.Children.Add(delegateBtn);
+
+        footerBand.Child = footerRow;
+        outer.Children.Add(footerBand);
+
+        var scroll = new ScrollViewer();
+        scroll.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+        scroll.MaxHeight = 680;
+        scroll.Content = outer;
+        w.Content = scroll;
+
+        bool? result = w.ShowDialog();
+        return result == true && delegated[0];
     }
 
     System.Windows.Controls.Primitives.Popup _settingsPopup;
