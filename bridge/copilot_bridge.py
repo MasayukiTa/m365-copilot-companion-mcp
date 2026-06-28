@@ -22,7 +22,9 @@ Setup (once):
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import re
 import sys
@@ -30,6 +32,8 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -690,6 +694,314 @@ _SCRAPE_JS = r"""
 """
 
 
+# ── Scroll-and-accumulate: full transcript even for virtualized long conversations ──────────
+#
+# Microsoft Copilot's chat is a React SPA that VIRTUALIZES message rendering: for long
+# conversations only the messages near the current scroll position are in the DOM; messages
+# scrolled out of view are unmounted. A single querySelectorAll snapshot (the old _SCRAPE_JS
+# path) therefore misses the bulk of a long transcript. scrape_full_transcript() scrolls the
+# conversation container from top to bottom, collecting messages at each position into a
+# deduplicating accumulator, until convergence or a safety bound is hit.
+#
+# Stable-key strategy: each turn block carries a position index in the DOM's rendered order.
+# We use a SHA-1 of (role + first-80-chars of text) as the stable de-dup key -- this is a
+# best-effort heuristic since M365 Copilot's chat DOM exposes NO per-message GUID or
+# data-id attribute on turn containers (confirmed from live DOM, 2026-06). The hash is
+# computed in Python on the text returned from the page, so the pure accumulate() function
+# below is fully testable without a browser.
+
+# JS that returns ONE scroll step's worth of info: the scroll container's geometry and
+# all turn blocks currently visible in the DOM. The scroll position is set BY THE CALLER
+# (Python-side, via a separate evaluate call) so the JS itself stays pure/stateless.
+_SCROLL_STEP_JS = r"""
+() => {
+  // --- find the scroll container ---
+  // Strategy: look for the first ancestor of a turn block whose scrollHeight > clientHeight.
+  // Fall back to the body if nothing found.
+  var TURN_SEL = '[data-testid="m365-chat-llm-web-ui-chat-message"]';
+  var container = null;
+  var firstTurn = document.querySelector(TURN_SEL);
+  if (firstTurn) {
+    var el = firstTurn.parentElement;
+    while (el && el !== document.body) {
+      if (el.scrollHeight > el.clientHeight + 2) { container = el; break; }
+      el = el.parentElement;
+    }
+  }
+  if (!container) container = document.body;
+
+  // --- geometry ---
+  var scrollTop = container.scrollTop || 0;
+  var scrollHeight = container.scrollHeight || 0;
+  var clientHeight = container.clientHeight || 0;
+
+  // --- helper text cleaners (mirrors _SCRAPE_JS) ---
+  function clean(s){ return (s||'').replace(/​/g,'').replace(/‌/g,'').trim(); }
+  function stripPrefix(s){
+    s = clean(s);
+    var idx = s.indexOf(' said:');
+    var author = '';
+    if (idx !== -1 && idx < 80){ author = s.slice(0, idx).trim(); s = s.slice(idx + 6); }
+    var lines = s.split('\n');
+    while (lines.length && !lines[0].trim()) lines.shift();
+    if (lines.length && author && lines[0].trim() === author) lines.shift();
+    else if (lines.length >= 2 && lines[0].trim() && lines[0].trim() === lines[1].trim()) lines.shift();
+    return lines.join('\n').trim();
+  }
+  function stripUser(s){
+    s = clean(s);
+    var idx = s.indexOf(' said:');
+    if (idx !== -1 && idx < 80) s = s.slice(idx + 6);
+    return clean(s);
+  }
+
+  // --- collect all turns currently in the DOM ---
+  var msgs = [];
+  var turns = document.querySelectorAll(TURN_SEL);
+  turns.forEach(function(turn, idx){
+    var q = turn.querySelector('[data-testid="chatQuestion"]');
+    if (q){ var ut = stripUser(q.innerText); if (ut) msgs.push({role:'user', text:ut, dom_idx:idx*2}); }
+    var a = turn.querySelector('.fai-CopilotMessage')
+         || turn.querySelector('[data-testid="copilot-message-reply-div"]')
+         || turn.querySelector('[data-testid="copilot-message-div"]');
+    if (a){ var at = stripPrefix(a.innerText); if (at) msgs.push({role:'assistant', text:at, dom_idx:idx*2+1}); }
+  });
+  // assistant-only fallback (matches _SCRAPE_JS)
+  if (msgs.length === 0) {
+    document.querySelectorAll('.fai-CopilotMessage').forEach(function(a, idx){
+      var at = stripPrefix(a.innerText);
+      if (at) msgs.push({role:'assistant', text:at, dom_idx:idx});
+    });
+  }
+
+  return {
+    scrollTop: scrollTop,
+    scrollHeight: scrollHeight,
+    clientHeight: clientHeight,
+    atBottom: (scrollTop + clientHeight + 4) >= scrollHeight,
+    msgs: msgs
+  };
+}
+"""
+
+# JS that scrolls the container to a given scrollTop (0 = very top).
+_SCROLL_TO_JS = r"""
+(scrollTop) => {
+  var TURN_SEL = '[data-testid="m365-chat-llm-web-ui-chat-message"]';
+  var container = null;
+  var firstTurn = document.querySelector(TURN_SEL);
+  if (firstTurn) {
+    var el = firstTurn.parentElement;
+    while (el && el !== document.body) {
+      if (el.scrollHeight > el.clientHeight + 2) { container = el; break; }
+      el = el.parentElement;
+    }
+  }
+  if (!container) container = document.body;
+  container.scrollTop = scrollTop;
+  return container.scrollTop;
+}
+"""
+
+# ── Pure accumulate/converge logic (no browser dependency -- fully unit-testable) ──────────
+
+def _msg_key(role: str, text: str) -> str:
+    """Stable dedup key: SHA-1 of role + first 80 chars of message text.
+
+    We use the first 80 chars rather than the full text so a message that was captured
+    mid-stream (truncated) and then re-captured complete still deduplicates correctly
+    (the first 80 chars are almost always settled before the rest of the text renders).
+    Role is included so a user and assistant message with the same opening line are not
+    collapsed."""
+    snippet = (role + ":" + (text or "")[:80]).encode("utf-8")
+    return hashlib.sha1(snippet).hexdigest()
+
+
+def accumulate_messages(
+    pages: "list[list[dict]]",
+    max_steps: int = 400,
+    no_progress_limit: int = 5,
+) -> "tuple[list[dict], bool]":
+    """Pure accumulate-and-dedupe logic for scroll-collected message windows.
+
+    This function is the heart of the virtualisation-aware scraper; it contains NO
+    browser calls and is fully unit-testable.
+
+    Args:
+        pages: A list of "windows" -- each window is the list of message dicts
+            ({role, text, dom_idx}) visible at one scroll position. The caller
+            feeds windows in scroll order (top -> bottom).
+        max_steps: Safety bound on the number of pages processed (NOT scroll steps;
+            the caller controls how many scroll steps map to how many page samples).
+        no_progress_limit: Stop early if this many consecutive pages yield zero new keys.
+
+    Returns:
+        (messages, truncated)
+        - messages: de-duplicated list in first-seen order (approximates top-to-bottom
+          order because pages arrive from top to bottom; within a page dom_idx breaks ties).
+        - truncated: True iff a bound (max_steps or no_progress_limit) was reached before
+          the caller signalled convergence. The caller also sets this True on wall-clock
+          timeout. A truncated transcript is NOT silently claimed as complete.
+    """
+    # acc maps stable_key -> (first_seen_page_index, dom_idx_at_first_seen, msg_dict)
+    acc: "dict[str, tuple[int, int, dict]]" = {}
+    no_progress = 0
+    truncated = False
+
+    for step_idx, window in enumerate(pages):
+        if step_idx >= max_steps:
+            truncated = True
+            break
+        new_this_step = 0
+        for msg in (window or []):
+            role = (msg.get("role") or "assistant").strip()
+            text = (msg.get("text") or "").strip()
+            if not text:
+                continue
+            key = _msg_key(role, text)
+            if key not in acc:
+                dom_idx = int(msg.get("dom_idx", 0))
+                acc[key] = (step_idx, dom_idx, {"role": role, "text": text})
+                new_this_step += 1
+        if new_this_step == 0:
+            no_progress += 1
+            if no_progress >= no_progress_limit:
+                break   # converged (or stuck) -- stop early
+        else:
+            no_progress = 0
+
+    # Reconstruct order: sort by (first_seen_page_index, dom_idx_at_first_seen).
+    # For a top-to-bottom scroll pass this restores reading order reliably; messages
+    # that were visible at multiple positions keep their FIRST-SEEN position.
+    ordered = sorted(acc.values(), key=lambda t: (t[0], t[1]))
+    messages = [entry[2] for entry in ordered]
+    return messages, truncated
+
+
+# ── CDP-driving scroll wrapper (browser-dependent; falls back gracefully) ───────────────────
+
+# Bounds for the scroll pass
+_SCROLL_MAX_STEPS = 400          # hard cap on scroll increments
+_SCROLL_WALL_TIMEOUT_S = 45.0   # overall wall-clock limit for the whole scroll pass
+_SCROLL_NO_PROGRESS = 5         # consecutive steps with 0 new msgs -> converged
+_SCROLL_SETTLE_MS = 300          # ms to wait after each scroll for React to unmount/mount
+
+
+def scrape_full_transcript(page) -> "tuple[list[dict], bool]":
+    """Scrape ALL messages from the current conversation by scrolling top-to-bottom.
+
+    Works around Microsoft Copilot's virtualised message rendering: only messages near
+    the viewport are in the DOM, so a single querySelectorAll snapshot misses everything
+    outside the current view. This function scrolls from the very top to the very bottom
+    in increments, collecting messages at each position and deduplicating by a stable key.
+
+    Args:
+        page: A Playwright page object (or compatible mock with .evaluate()).
+
+    Returns:
+        (messages, truncated) where `messages` is a list of {role, text} dicts in
+        reading order and `truncated` is True if a bound was hit before full convergence.
+        On any unrecoverable error returns ([], False) -- caller falls back to the old
+        single-snapshot path.
+
+    The caller (_scrape_history) uses the result if it's non-empty; if it IS empty it
+    falls back to the old single-snapshot _SCRAPE_JS path, so this function can never
+    make things worse than the current state.
+    """
+    t0 = time.time()
+    pages: "list[list[dict]]" = []
+    truncated = False
+
+    try:
+        # 1. Scroll to the very top first so we start from message 0.
+        try:
+            page.evaluate(_SCROLL_TO_JS, 0)
+            page.wait_for_timeout(_SCROLL_SETTLE_MS)
+        except Exception as e:
+            logger.debug("scrape_full_transcript: scroll-to-top failed: %s", e)
+            return [], False
+
+        # 2. Grab an initial reading to learn scrollHeight and clientHeight.
+        try:
+            info = page.evaluate(_SCROLL_STEP_JS)
+        except Exception as e:
+            logger.debug("scrape_full_transcript: initial evaluate failed: %s", e)
+            return [], False
+
+        if not isinstance(info, dict):
+            return [], False
+
+        scroll_height = int(info.get("scrollHeight") or 0)
+        client_height = int(info.get("clientHeight") or 1)
+        pages.append(info.get("msgs") or [])
+
+        if scroll_height <= client_height + 4:
+            # Short conversation -- everything already in view; no scrolling needed.
+            msgs, trunc = accumulate_messages(pages,
+                                             max_steps=_SCROLL_MAX_STEPS,
+                                             no_progress_limit=_SCROLL_NO_PROGRESS)
+            return msgs, trunc
+
+        # 3. Scroll down in increments of 80% of the client height.
+        step = max(1, int(client_height * 0.8))
+        current_top = 0
+        no_progress_steps = 0
+        prev_key_count = 0
+
+        for _ in range(_SCROLL_MAX_STEPS):
+            # Wall-clock safety valve
+            if time.time() - t0 > _SCROLL_WALL_TIMEOUT_S:
+                truncated = True
+                logger.info("scrape_full_transcript: wall-clock timeout after %.1fs, "
+                            "captured %d windows so far", time.time() - t0, len(pages))
+                break
+
+            current_top = min(current_top + step, scroll_height - client_height)
+            try:
+                page.evaluate(_SCROLL_TO_JS, current_top)
+                page.wait_for_timeout(_SCROLL_SETTLE_MS)
+                info = page.evaluate(_SCROLL_STEP_JS)
+            except Exception as e:
+                logger.debug("scrape_full_transcript: scroll step failed: %s", e)
+                truncated = True
+                break
+
+            if not isinstance(info, dict):
+                truncated = True
+                break
+
+            pages.append(info.get("msgs") or [])
+
+            # Count unique keys so far for no-progress detection
+            # (accumulate_messages handles this internally, but we need an early-out check)
+            current_key_count = sum(len(w) for w in pages)
+            if current_key_count == prev_key_count:
+                no_progress_steps += 1
+                if no_progress_steps >= _SCROLL_NO_PROGRESS:
+                    break  # converged early
+            else:
+                no_progress_steps = 0
+            prev_key_count = current_key_count
+
+            if info.get("atBottom"):
+                break  # reached the end of the scroll container
+
+        # Scroll back to the bottom so the user sees the latest message on return.
+        try:
+            page.evaluate(_SCROLL_TO_JS, scroll_height)
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.warning("scrape_full_transcript: unexpected error: %s", e)
+        return [], False
+
+    msgs, acc_trunc = accumulate_messages(pages,
+                                          max_steps=_SCROLL_MAX_STEPS,
+                                          no_progress_limit=_SCROLL_NO_PROGRESS)
+    return msgs, (truncated or acc_trunc)
+
+
 TURN_SEL = '[data-testid="m365-chat-llm-web-ui-chat-message"]'
 
 
@@ -718,8 +1030,49 @@ def _wait_turns(timeout=30):
 
 def _scrape_history():
     """Scrape all messages of the currently loaded conversation, in order.
-    Returns a list of {"role": "...", "text": "..."}. Raises on a page error."""
+
+    PRIMARY path: scroll-and-accumulate (scrape_full_transcript) which handles
+    Microsoft Copilot's virtualised message rendering by scrolling the conversation
+    container from top to bottom, collecting messages at each position, and
+    deduplicating by a stable key.  If the primary path returns nothing (e.g. the
+    scroll container selector failed to find the container, or a very short
+    conversation was already in view), we fall back to the old single-snapshot
+    _SCRAPE_JS path so this function never regresses for short conversations.
+
+    A `truncated=True` result is surfaced in the return value's metadata key so
+    the /history endpoint can report it to the caller -- we never silently claim
+    full capture when we hit a bound.
+
+    Returns a list of {"role": "...", "text": "..."}, optionally with a final
+    sentinel {"role": "__meta__", "truncated": True, "captured": N} appended when
+    the scroll pass hit a safety bound before full convergence."""
     _wait_turns()
+
+    # PRIMARY: scroll-and-accumulate
+    try:
+        full_msgs, truncated = scrape_full_transcript(PAGE)
+    except Exception as e:
+        logger.warning("_scrape_history: scrape_full_transcript raised: %s", e)
+        full_msgs, truncated = [], False
+
+    if full_msgs:
+        out = []
+        for m in full_msgs:
+            try:
+                role = (m.get("role") or "").strip() or "assistant"
+                text = (m.get("text") or "").strip()
+            except Exception:
+                continue
+            if text and role != "__meta__":
+                out.append({"role": role, "text": text})
+        if out:
+            if truncated:
+                logger.info("_scrape_history: truncated=True, captured %d messages", len(out))
+                out.append({"role": "__meta__", "truncated": True, "captured": len(out)})
+            return out
+
+    # FALLBACK: single-snapshot (no scrolling; the old behaviour)
+    logger.debug("_scrape_history: falling back to single-snapshot path")
     res = PAGE.evaluate(_SCRAPE_JS)
     if isinstance(res, dict) and res.get("__error"):
         raise RuntimeError("scrape failed: " + str(res.get("__error")))
@@ -855,7 +1208,21 @@ class Handler(BaseHTTPRequestHandler):
                         pass
             except Exception as e:
                 self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}); return
-            self._json({"ok": True, "url": PAGE.url, "messages": messages})
+            # Surface the truncation sentinel as a top-level field so callers can act on it
+            # without having to scan the message list. The sentinel record itself is stripped
+            # from the messages array (it is a meta record, not a real message).
+            truncated_meta = None
+            clean_messages = []
+            for m in (messages or []):
+                if m.get("role") == "__meta__":
+                    truncated_meta = m
+                else:
+                    clean_messages.append(m)
+            resp = {"ok": True, "url": PAGE.url, "messages": clean_messages}
+            if truncated_meta:
+                resp["truncated"] = True
+                resp["captured"] = truncated_meta.get("captured", len(clean_messages))
+            self._json(resp)
             return
         if parsed.path == "/delete":       # best-effort: delete the Copilot conversation
             if BUSY:
