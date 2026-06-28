@@ -735,14 +735,28 @@ _CLEAN_ANSWER_JS = r"""
       '[data-testid="feedback-button-testid"]',
       '[data-testid="FeedbackContainerTestId"]',
       '[data-testid="overflow-menu-button"]',
+      '[data-testid*="citation" i]',
+      '[data-testid*="reference" i]',
+      '[data-testid*="source" i]',
+      '[data-testid*="attribution" i]',
       'sup',
-      'button'
+      'cite',
+      'button',
+      '[role="button"]'
     ];
-    // Class-based selectors (case-insensitive substring matching via attribute selector)
+    // Class-based selectors (case-insensitive substring matching via attribute selector).
+    // These target citation/source/footnote chrome ONLY -- code is rendered in Monaco or in
+    // "scriptor-textRun" spans, neither of which match these, so code is never removed.
     var classRemoveSelectors = [
-      '[class*="citation"]',
-      '[class*="foot-note"]',
-      '[class*="reference"]'
+      '[class*="citation" i]',
+      '[class*="cite-" i]',
+      '[class*="foot-note" i]',
+      '[class*="footnote" i]',
+      '[class*="reference" i]',
+      '[class*="source" i]',
+      '[aria-label*="citation" i]',
+      '[aria-label*="reference" i]',
+      '[aria-label*="source" i]'
     ];
     var allRemove = removeSelectors.concat(classRemoveSelectors);
     for (var si = 0; si < allRemove.length; si++) {
