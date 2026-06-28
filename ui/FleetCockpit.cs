@@ -1070,11 +1070,11 @@ class CockpitWindow : Window
 
         _composerBox = new Border();
         _composerBox.CornerRadius = new CornerRadius(Theme.RadComposer);
-        _composerBox.BorderThickness = new Thickness(1);
-        _composerBox.Padding = new Thickness(12, 8, 12, 8);
-        // Floating Codex/Claude-Code style: soft shadow, no heavy frame.
+        _composerBox.BorderThickness = new Thickness(0);   // frameless at rest; focus adds 1px accent
+        _composerBox.Padding = new Thickness(12, 6, 12, 6); // was (12,8,12,8) — tighter to hug content
+        // Floating Codex/Claude-Code style: soft shadow carries the separation, no hard frame.
         _composerBox.Effect = new System.Windows.Media.Effects.DropShadowEffect
-        { BlurRadius = 12, ShadowDepth = 1, Opacity = 0.12, Color = System.Windows.Media.Color.FromRgb(0, 0, 0) };
+        { BlurRadius = 14, ShadowDepth = 2, Opacity = 0.16, Color = System.Windows.Media.Color.FromRgb(0, 0, 0) };
 
         var col = new StackPanel();
 
@@ -1082,7 +1082,7 @@ class CockpitWindow : Window
         var taGrid = new Grid();
         _goalInput = new TextBox();
         _goalInput.AcceptsReturn = true; _goalInput.TextWrapping = TextWrapping.Wrap;
-        _goalInput.MinHeight = 38; _goalInput.MaxHeight = 180;   // compact: ~38 (was 64), max 180 internal scroll
+        _goalInput.MinHeight = 30; _goalInput.MaxHeight = 180;   // compact: ~30 (was 38), max 180 internal scroll
         _goalInput.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
         _goalInput.FontSize = Theme.FsBody;
         _goalInput.BorderThickness = new Thickness(0);            // the composer carries the border
@@ -1127,7 +1127,7 @@ class CockpitWindow : Window
 
         // ── footer: left hint, right button cluster (folder=secondary, start=primary) ──
         var footer = new DockPanel { LastChildFill = false };
-        footer.Margin = new Thickness(0, 8, 0, 0);
+        footer.Margin = new Thickness(0, 6, 0, 0);  // was 8 -- tighter footer gap
 
         var btns = new StackPanel { Orientation = Orientation.Horizontal };
         _folderBtn = new Button();
@@ -1198,12 +1198,23 @@ class CockpitWindow : Window
     }
     Border _inBar;
 
-    // Focus ring: thicken/tint the composer border while the goal box has keyboard focus.
+    // Focus ring: composer is frameless at rest (BorderThickness=0). On focus, add a 1px
+    // accent outline so keyboard users get a clear indicator without re-introducing the boxy look.
     void PaintComposerFocus(bool focused)
     {
         if (_composerBox == null) return;
-        _composerBox.BorderBrush = focused ? Theme.Br(Theme.Accent(_dark)) : Border;
+        if (focused)
+        {
+            _composerBox.BorderThickness = new Thickness(1);
+            _composerBox.BorderBrush = Theme.Br(Theme.Accent(_dark));
+        }
+        else
+        {
+            _composerBox.BorderThickness = new Thickness(0);
+            _composerBox.BorderBrush = System.Windows.Media.Brushes.Transparent;
+        }
     }
+
 
     void StartFleet()
     {
