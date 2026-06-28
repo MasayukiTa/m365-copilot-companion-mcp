@@ -194,6 +194,13 @@ class SelfImproveDashboardWindow : Window
         if (k == "u_turns")       return ja ? "中央ターン数" : "Median turns";
         if (k == "u_tasks")       return ja ? "タスク数" : "Tasks";
         if (k == "u_trend")       return ja ? "完了率の推移（古い→新しい）" : "Completion trend (old → new)";
+        if (k == "u_persona")     return ja ? "自我/助言の混入率（一般利用）" : "Persona/advice leak rate (live usage)";
+        if (k == "u_persona_exp") return ja
+            ? "ベンチ不要・実際の利用から自動計測。出力に上から目線の助言/講釈/自我が混じった割合（低いほど良い）。"
+            : "No benchmark — measured automatically from real usage. Share of outputs leaking coaching/lecturing/ego (lower is better).";
+        if (k == "u_persona_pre") return ja ? "計測前" : "Not yet measured";
+        if (k == "u_persona_n")   return ja ? "件採点" : "scored";
+        if (k == "u_persona_eg")  return ja ? "検出例" : "Flagged examples";
         if (k == "latest_pass")   return ja ? "最新 pass@1" : "Latest pass@1";
         if (k == "latest_ab")     return ja ? "最新 A/B" : "Latest A/B";
         if (k == "burned_total")  return ja ? "Burned 合計" : "Burned total";
@@ -777,7 +784,113 @@ class SelfImproveDashboardWindow : Window
             col.Children.Add(trendLine);
         }
 
+        // persona / advice leak rate — quality metric measured from real usage (no benchmark).
+        BuildPersonaLeak(u, col);
+
         return card;
+    }
+
+    // persona_leak_rate : float|null (share of outputs leaking coaching/lecture/ego),
+    // quality_scored : int (how many runs could be scored),
+    // persona_flagged : [{key, signals[], excerpt}, ...] (leak examples, may be empty).
+    // null leak rate => show "計測前" (no fabricated number). Flagged shown only when non-empty.
+    void BuildPersonaLeak(Dictionary<string, object> u, StackPanel col)
+    {
+        // divider above the quality block to set it apart from the benchmark-free usage counts
+        col.Children.Add(HRule());
+
+        // label row: metric name + value (value coloured by whether any leak)
+        var labelRow = new StackPanel();
+        labelRow.Orientation = Orientation.Horizontal;
+        labelRow.Margin = new Thickness(0, 8, 0, 0);
+
+        var nameTb = new TextBlock();
+        nameTb.Text = T("u_persona") + ": ";
+        nameTb.Foreground = Muted; nameTb.FontSize = 12.5;
+        nameTb.VerticalAlignment = VerticalAlignment.Center;
+        labelRow.Children.Add(nameTb);
+
+        object rateObj = u.ContainsKey("persona_leak_rate") ? u["persona_leak_rate"] : null;
+        int scored = I(u, "quality_scored");
+
+        var valTb = new TextBlock();
+        valTb.FontSize = 15; valTb.FontWeight = FontWeights.SemiBold;
+        valTb.VerticalAlignment = VerticalAlignment.Center;
+
+        if (rateObj == null)
+        {
+            // null => not yet measured; do NOT invent a number
+            valTb.Text = T("u_persona_pre");
+            valTb.Foreground = Muted;
+        }
+        else
+        {
+            double rate = 0.0;
+            bool ok = true;
+            try { rate = Convert.ToDouble(rateObj); } catch (Exception) { ok = false; }
+            if (!ok)
+            {
+                valTb.Text = T("u_persona_pre");
+                valTb.Foreground = Muted;
+            }
+            else
+            {
+                valTb.Text = (rate * 100.0).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + "%";
+                // green when clean (0%), warning otherwise
+                valTb.Foreground = new SolidColorBrush(StatusColorFor(rate <= 0.0 ? "good" : "warn", _dark));
+            }
+        }
+        labelRow.Children.Add(valTb);
+
+        if (scored > 0)
+        {
+            var nTb = new TextBlock();
+            nTb.Text = "  (" + scored.ToString() + T("u_persona_n") + ")";
+            nTb.Foreground = Muted; nTb.FontSize = 12;
+            nTb.VerticalAlignment = VerticalAlignment.Center;
+            labelRow.Children.Add(nTb);
+        }
+        col.Children.Add(labelRow);
+
+        // helper line: stresses this number is from real usage, not a benchmark
+        col.Children.Add(SectionExplanation(T("u_persona_exp")));
+
+        // flagged excerpts (real leak examples) — only when non-empty
+        object[] flagged = Arr(u, "persona_flagged");
+        if (flagged != null && flagged.Length > 0)
+        {
+            var egLbl = new TextBlock();
+            egLbl.Text = T("u_persona_eg");
+            egLbl.Foreground = Muted; egLbl.FontSize = 11;
+            egLbl.FontWeight = FontWeights.SemiBold;
+            egLbl.Margin = new Thickness(0, 8, 0, 3);
+            col.Children.Add(egLbl);
+
+            int shown = 0;
+            for (int i = 0; i < flagged.Length && shown < 3; i++)
+            {
+                var fr = flagged[i] as Dictionary<string, object>;
+                if (fr == null) continue;
+                string excerpt = S(fr, "excerpt");
+                if (string.IsNullOrEmpty(excerpt)) continue;
+
+                var quote = new Border();
+                quote.Background      = QuoteBg;
+                quote.CornerRadius    = new CornerRadius(6);
+                quote.BorderThickness = new Thickness(3, 0, 0, 0);
+                quote.BorderBrush     = new SolidColorBrush(StatusColorFor("warn", _dark));
+                quote.Padding         = new Thickness(9, 5, 9, 5);
+                quote.Margin          = new Thickness(0, 3, 0, 0);
+
+                var qt = new TextBlock();
+                qt.Text = excerpt;
+                qt.Foreground = Muted; qt.FontSize = 11.5;
+                qt.TextWrapping = TextWrapping.Wrap;
+                quote.Child = qt;
+                col.Children.Add(quote);
+                shown++;
+            }
+        }
     }
 
     // ── (1) SCORECARD ────────────────────────────────────────────────────────────

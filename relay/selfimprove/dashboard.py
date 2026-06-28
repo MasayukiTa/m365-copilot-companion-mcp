@@ -228,21 +228,25 @@ def dashboard_state(*, archive_path=None, burned_path=None, grade_results_path=N
             "keep": last.get("keep"),
         }
 
+    # Live usage = the general-user lens (no bench needed): completion rate / turns / trend from real
+    # runs, plus the persona-leak quality rate. Defensive: a failure here must never break the
+    # bench-side dashboard (the default dict carries the persona keys so summary mirroring is safe).
+    try:
+        from relay.selfimprove.usage import usage_section
+        usage = usage_section()
+    except Exception:
+        usage = {"n_tasks": 0, "completion_rate": None, "status_mix": {}, "trend": [],
+                 "persona_leak_rate": None, "quality_scored": 0, "persona_flagged": []}
+
     summary = {
         "latest_pass_at_1": latest_pass,
         "latest_ab": latest_ab,
         "burned_total": burned_ledger["total"],
         "archive_count": archive_section["count"],
         "grade_results_count": len(grade_recs),
+        # mirror the general-user quality headline up to the summary for one-glance reading
+        "persona_leak_rate": usage.get("persona_leak_rate"),
     }
-
-    # Live usage = the general-user lens (no bench needed): completion rate / turns / trend from real
-    # runs. Defensive: a failure here must never break the bench-side dashboard.
-    try:
-        from relay.selfimprove.usage import usage_section
-        usage = usage_section()
-    except Exception:
-        usage = {"n_tasks": 0, "completion_rate": None, "status_mix": {}, "trend": []}
 
     return {
         "summary": summary,
@@ -316,6 +320,10 @@ def render_text(state) -> str:
 
     lines.append("burned total  : %d" % int(summary.get("burned_total") or 0))
     lines.append("archive count : %d" % int(summary.get("archive_count") or 0))
+
+    # general-user QUALITY headline: persona-leak rate (None -> n/a, else NN.N%). ASCII-only.
+    plr = summary.get("persona_leak_rate")
+    lines.append("persona leak  : %s" % ("n/a" if plr is None else ("%.1f%%" % (plr * 100))))
 
     if ab_history:
         lines.append("A/B history (last %d):" % min(3, len(ab_history)))
