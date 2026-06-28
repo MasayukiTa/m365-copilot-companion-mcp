@@ -2247,8 +2247,8 @@ class CockpitWindow : Window
         b.Background = Brushes.Transparent;
         b.BorderThickness = new Thickness(0);
         b.Padding = new Thickness(10, 9, 16, 9);
-        b.HorizontalContentAlignment = HorizontalAlignment.Stretch;
-        b.Template = FlatButtonTemplate();
+        b.HorizontalContentAlignment = HorizontalAlignment.Left;
+        b.Template = FlatButtonTemplate(true);   // left-align so the two rows' icons line up
 
         var row = new StackPanel();
         row.Orientation = Orientation.Horizontal;
@@ -3309,7 +3309,10 @@ class CockpitWindow : Window
     // system hover -> in LIGHT mode the −/+ steppers read as a dark/grey box that ignores BtnBg.
     // This flat template binds the fill/stroke straight to the control's Background/BorderBrush, so
     // the steppers track our theme exactly. Built in code-behind (no XAML), reused for all MiniButtons.
-    ControlTemplate FlatButtonTemplate()
+    ControlTemplate FlatButtonTemplate() { return FlatButtonTemplate(false); }
+    // leftAlign=true => content hugs the left edge (list/menu rows, so icons line up across rows);
+    // default false keeps the centered content the icon/pause/stop/stepper buttons rely on.
+    ControlTemplate FlatButtonTemplate(bool leftAlign)
     {
         var t = new ControlTemplate(typeof(Button));
         var bd = new FrameworkElementFactory(typeof(System.Windows.Controls.Border), "Bd");
@@ -3318,7 +3321,7 @@ class CockpitWindow : Window
         bd.SetValue(System.Windows.Controls.Border.BorderThicknessProperty, new TemplateBindingExtension(Control.BorderThicknessProperty));
         bd.SetValue(System.Windows.Controls.Border.CornerRadiusProperty, new CornerRadius(4));
         var cp = new FrameworkElementFactory(typeof(ContentPresenter));
-        cp.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+        cp.SetValue(ContentPresenter.HorizontalAlignmentProperty, leftAlign ? HorizontalAlignment.Left : HorizontalAlignment.Center);
         cp.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
         bd.AppendChild(cp);
         t.VisualTree = bd;
