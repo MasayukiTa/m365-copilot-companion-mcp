@@ -188,7 +188,7 @@ class ChatWindow : Window
             Height = 1,
             Margin = new Thickness(0, 0, 0, 8)
         };
-        SetRef(sideTopDivider, BackgroundProperty, "Border");
+        SetRef(sideTopDivider, BackgroundProperty, "Muted");   // darker divider (user: lines too faint to read)
         bottom.Children.Add(sideTopDivider);
         // Fleet entry is a QUIET navigation item, not a large orange CTA (spec). Accent is reserved
         // for the one primary action in the main column (Send).
@@ -202,7 +202,7 @@ class ChatWindow : Window
             Height = 1,
             Margin = new Thickness(0, 0, 0, 6)
         };
-        SetRef(sideMidDivider, BackgroundProperty, "Border");
+        SetRef(sideMidDivider, BackgroundProperty, "Muted");   // darker divider (user: lines too faint to read)
         bottom.Children.Add(sideMidDivider);
         _langBtn = Btn(T("lang"), "Panel", "Muted", true);
         _langBtn.Height = 34; _langBtn.Margin = new Thickness(0, 0, 0, 6); _langBtn.FontSize = 12;
@@ -267,7 +267,7 @@ class ChatWindow : Window
             VerticalAlignment = VerticalAlignment.Center,
             Margin = new Thickness(6, 0, 6, 0)
         };
-        SetRef(headDivider, BackgroundProperty, "Border");
+        SetRef(headDivider, BackgroundProperty, "Muted");   // darker divider (user: lines too faint to read)
         headRight.Children.Add(headDivider);
         // Fleet active chip ("Fleet: N") -- collapsed when no active workers or status.json absent
         _fleetChipLabel = new TextBlock { FontSize = 12, VerticalAlignment = VerticalAlignment.Center };
