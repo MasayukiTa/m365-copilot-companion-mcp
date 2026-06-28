@@ -1303,11 +1303,11 @@ class ChatWindow : Window
             bool allDone = !running;
             bool ja = _lang == 0;
 
-            // Header row: strip title label (left) + "証跡を開く / Open in Fleet" button (right)
+            // Header row: strip title label (left) + "フリートで開く / Open in Fleet" button (right)
             var headRow = new DockPanel { Margin = new Thickness(0, 0, 0, 3) };
 
             // Action button docked right: real bordered button, not a bare text link
-            var openBtn = Btn(ja ? "証跡を開く" : "Open in Fleet", "PanelAlt", "Accent", true);
+            var openBtn = Btn(ja ? "フリートで開く" : "Open in Fleet", "PanelAlt", "Accent", true);
             openBtn.FontSize = 11; openBtn.Height = 22;
             openBtn.Padding = new Thickness(8, 1, 8, 1);
             openBtn.FontWeight = FontWeights.SemiBold;
@@ -1918,7 +1918,7 @@ class ChatWindow : Window
         var contentRow = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
         if (isPinned)
         {
-            var pinMark = new TextBlock { Text = "", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 11, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 5, 0) };            SetRef(pinMark, TextBlock.ForegroundProperty, "Muted");
+            var pinMark = new TextBlock { Text = "\uE718", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 11, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 5, 0) };            SetRef(pinMark, TextBlock.ForegroundProperty, "Muted");
             contentRow.Children.Add(pinMark);
         }
         var lbl = new TextBlock
@@ -1966,7 +1966,7 @@ class ChatWindow : Window
         // trash icon (Segoe MDL2 Assets) -- hidden by default, revealed on row hover.
         var trash = new Button
         {
-            Content = "", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 13,
+            Content = "\uE74D", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 13,
             Width = 32, Height = 46, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
             Cursor = Cursors.Hand, ToolTip = T("delete"), Opacity = 0, IsHitTestVisible = false
         };
@@ -2605,7 +2605,7 @@ class ChatWindow : Window
         var blockRef = block;
         var copy = new Button
         {
-            Content = "", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 12,
+            Content = "\uE8C8", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 12,
             Width = 26, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
             Cursor = Cursors.Hand, Visibility = Visibility.Hidden, ToolTip = T("copy")
         };
