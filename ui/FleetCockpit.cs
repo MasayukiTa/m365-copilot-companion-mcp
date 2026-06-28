@@ -2223,13 +2223,13 @@ class CockpitWindow : Window
 
         var col = new StackPanel();
 
-        // Item 1: Open main chat
-        col.Children.Add(OverflowItem(
+        // Item 1: Open main chat -- icon row (settings-list style), not a flush text button.
+        col.Children.Add(OverflowItem("chat",
             _lang == 0 ? "メインチャットを開く" : "Open main chat",
             delegate { _overflowPopup.IsOpen = false; OpenMain(); }));
 
         // Item 2: Self-improvement dashboard
-        col.Children.Add(OverflowItem(
+        col.Children.Add(OverflowItem("account_tree",
             _lang == 0 ? "自己改善ダッシュボード" : "Self-improvement",
             delegate { _overflowPopup.IsOpen = false; new SelfImproveDashboardWindow().Show(); }));
 
@@ -2237,19 +2237,36 @@ class CockpitWindow : Window
         return card;
     }
 
-    Button OverflowItem(string label, Action action)
+    // A menu row in the overflow popup: [icon]  label, full-width hover highlight -- so the two
+    // entries read as distinct, tappable rows (settings-list style) instead of flush text that
+    // needs a divider to tell apart.
+    Button OverflowItem(string glyph, string label, Action action)
     {
         var b = new Button();
         b.Cursor = Cursors.Hand;
         b.Background = Brushes.Transparent;
-        b.Foreground = Theme.Br(Theme.Muted(_dark));
         b.BorderThickness = new Thickness(0);
-        b.Padding = new Thickness(12, 6, 12, 6);
-        b.HorizontalContentAlignment = HorizontalAlignment.Left;
-        b.FontSize = 13;
+        b.Padding = new Thickness(10, 9, 16, 9);
+        b.HorizontalContentAlignment = HorizontalAlignment.Stretch;
         b.Template = FlatButtonTemplate();
-        // Hover: swap to Text color so the item brightens on hover via FlatButtonTemplate trigger.
-        b.Content = label;
+
+        var row = new StackPanel();
+        row.Orientation = Orientation.Horizontal;
+        var icHost = new ContentControl();
+        icHost.Content = MakeIcon(glyph, 16, Theme.Br(Theme.Muted(_dark)));
+        icHost.Width = 22; icHost.VerticalAlignment = VerticalAlignment.Center;
+        row.Children.Add(icHost);
+        var tb = new TextBlock();
+        tb.Text = label; tb.Foreground = Fg; tb.FontSize = 13;
+        tb.VerticalAlignment = VerticalAlignment.Center;
+        row.Children.Add(tb);
+        b.Content = row;
+
+        // FlatButtonTemplate has no IsMouseOver trigger, so drive the row highlight manually.
+        Brush hov = Theme.Br(Theme.SurfaceSubtle(_dark));
+        b.MouseEnter += delegate { b.Background = hov; };
+        b.MouseLeave += delegate { b.Background = Brushes.Transparent; };
+
         Action a = action;
         b.Click += delegate { a(); };
         return b;
