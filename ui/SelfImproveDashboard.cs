@@ -50,7 +50,7 @@ class SelfImproveDashboardWindow : Window
 
     // theme-dependent brushes (Theme.cs is the single source of truth)
     Brush Bg, CardBg, Border, Fg, Muted, QuoteBg, BtnBg;
-    Brush Accent;   // primary-action color; theme-dependent, set in ApplyThemeBrushes
+    Brush Accent;
     static readonly Brush White = new SolidColorBrush(C("#ffffff"));
 
     bool _dark = true;
@@ -71,8 +71,8 @@ class SelfImproveDashboardWindow : Window
     ContentControl _iconHost;
     TextBlock _header, _sub;
     Button _themeBtn, _langBtn;
-    StackPanel _body;          // the scrolling content column we rebuild each change
-    ScrollViewer _sv;          // scroll host -- themed explicitly so its fill matches the toolbar
+    StackPanel _body;
+    ScrollViewer _sv;
     Border _headBar;
 
     public SelfImproveDashboardWindow() : this(null) { }
@@ -84,11 +84,11 @@ class SelfImproveDashboardWindow : Window
         LoadSettings();
         ApplyThemeBrushes();
         Title = "Self-Improvement";
-        Width = 920; Height = 720;
+        Width = 920; Height = 740;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         BuildChrome();
         _timer = new DispatcherTimer();
-        _timer.Interval = TimeSpan.FromMilliseconds(1000);     // ~1s tail, per spec
+        _timer.Interval = TimeSpan.FromMilliseconds(1000);
         _timer.Tick += new EventHandler(OnTick);
         _timer.Start();
         OnTick(null, null);
@@ -97,7 +97,7 @@ class SelfImproveDashboardWindow : Window
     static string ResolvePath(string path)
     {
         if (!string.IsNullOrEmpty(path)) return path;
-        string exeDir = AppDomain.CurrentDomain.BaseDirectory;          // ...\ui\
+        string exeDir = AppDomain.CurrentDomain.BaseDirectory;
         return Path.GetFullPath(Path.Combine(exeDir, "..", ".fleet", "selfimprove_dashboard.json"));
     }
 
@@ -105,37 +105,66 @@ class SelfImproveDashboardWindow : Window
     string T(string k)
     {
         bool ja = _lang == 0;
-        if (k == "title") return ja ? "自己改善" : "Self-Improvement";
-        if (k == "nodata") return ja ? "自己改善データはまだありません — python -m relay.selfimprove.dashboard で生成されます。"
-                                     : "No self-improvement data yet — produced by python -m relay.selfimprove.dashboard.";
-        if (k == "scorecard") return ja ? "スコアカード" : "Scorecard";
-        if (k == "latest_pass") return ja ? "最新 pass@1" : "Latest pass@1";
-        if (k == "latest_ab") return ja ? "最新 A/B" : "Latest A/B";
-        if (k == "burned") return ja ? "burned 合計" : "burned total";
-        if (k == "archive") return ja ? "アーカイブ" : "archive";
-        if (k == "ab_history") return ja ? "A/B 履歴" : "A/B history";
-        if (k == "burned_ledger") return ja ? "burned 台帳" : "Burned ledger";
-        if (k == "pass_trend") return ja ? "pass@1 推移" : "pass@1 trend";
-        if (k == "archive_sec") return ja ? "アーカイブ概要" : "Archive";
-        if (k == "qd_cells") return ja ? "QDセル" : "QD cells";
-        if (k == "genomes") return ja ? "ゲノム" : "genomes";
-        if (k == "none") return ja ? "なし" : "none";
-        if (k == "keep") return ja ? "採用" : "keep";
-        if (k == "total") return ja ? "合計" : "total";
-        // Live usage lens (general-user, no benchmark)
-        if (k == "usage_sec") return ja ? "実利用（あなたのタスク）" : "Live — your usage";
-        if (k == "usage_caption") return ja ? "実際の実行から算出。ベンチ不要 — これが普段の使い心地の指標です。"
-                                            : "From your real runs — no benchmark. This is how it performs day to day.";
-        if (k == "u_completion") return ja ? "完了率" : "Completion";
-        if (k == "u_recent") return ja ? "直近" : "Recently";
-        if (k == "u_turns") return ja ? "中央ターン" : "Median turns";
-        if (k == "u_tasks") return ja ? "タスク数" : "Tasks";
-        if (k == "u_trend") return ja ? "完了率の推移（古い→新しい）" : "Completion over time (old → new)";
-        if (k == "u_verify") return ja ? "自己検証通過" : "Self-verified";
+        // window header
+        if (k == "win_title")  return ja ? "自己改善 / Self-Improvement" : "Self-Improvement / 自己改善";
+        if (k == "win_sub")    return ja
+            ? "エージェントが自分の解決スキャフォルドをどう改善しているか（実タスクの完了率・A/Bテスト・採用履歴）"
+            : "How the agent is improving its own solving scaffold — real-task completion, A/B tests, and what it kept.";
+
+        // no-data friendly message
+        if (k == "nodata_title") return ja ? "まだデータがありません" : "No data yet";
+        if (k == "nodata_body")  return ja
+            ? "自己改善ループが走ると、ここに指標が表示されます。\n\npython -m relay.selfimprove.dashboard を実行するとデータが生成されます。"
+            : "Metrics will appear here once the self-improvement loop runs.\n\nRun: python -m relay.selfimprove.dashboard";
+
+        // section labels (shown in caps)
+        if (k == "usage_sec")     return ja ? "実利用" : "Live usage";
+        if (k == "scorecard_sec") return ja ? "スコアカード" : "Scorecard";
+        if (k == "ab_sec")        return ja ? "A/B 履歴" : "A/B history";
+        if (k == "burned_sec")    return ja ? "Burned 台帳" : "Burned ledger";
+        if (k == "trend_sec")     return ja ? "Pass@1 推移" : "Pass@1 trend";
+        if (k == "archive_sec")   return ja ? "アーカイブ" : "Archive";
+
+        // section explanations (one-liner below the label)
+        if (k == "usage_exp")  return ja
+            ? "あなたの実際のタスクから算出。ベンチマーク不要 — 普段の完了率と傾向を示します。"
+            : "From your real runs, no benchmark — shows day-to-day completion rate and trend.";
+        if (k == "scorecard_exp") return ja
+            ? "最新世代の解決性能のスナップショット。A/B テストの結果と採用されたスキャフォルドの数。"
+            : "Snapshot of the latest generation's solving performance, the latest A/B result, and how many scaffolds have been adopted.";
+        if (k == "ab_exp")     return ja
+            ? "新しいスキャフォルド案を旧版と比較した結果（新しい順）。採用=緑、示唆的=黄、却下=赤。"
+            : "Results of testing a new scaffold idea against the current one, newest first. Keep=green, suggestive=yellow, rejected=red.";
+        if (k == "burned_exp") return ja
+            ? "評価に使われたため再利用できない問題の台帳。理由別の内訳。"
+            : "Problems that can no longer be reused for evaluation because they were consumed during testing — broken down by reason.";
+        if (k == "trend_exp")  return ja
+            ? "各改善サイクル後の pass@1 の推移（新しい順・最大24件）。"
+            : "Pass@1 after each improvement cycle, newest first — up to 24 points shown.";
+        if (k == "archive_exp") return ja
+            ? "採用されたゲノム（解決スクリプトの変種）の多様性アーカイブ。QDセルは問題タイプごとのスロット数。"
+            : "Diversity archive of adopted genomes (scaffold variants). QD cells = slots by problem type.";
+
+        // metric labels
+        if (k == "u_completion")  return ja ? "完了率" : "Completion";
+        if (k == "u_recent")      return ja ? "直近完了率" : "Recent";
+        if (k == "u_turns")       return ja ? "中央ターン数" : "Median turns";
+        if (k == "u_tasks")       return ja ? "タスク数" : "Tasks";
+        if (k == "u_trend")       return ja ? "完了率の推移（古い→新しい）" : "Completion trend (old → new)";
+        if (k == "latest_pass")   return ja ? "最新 pass@1" : "Latest pass@1";
+        if (k == "latest_ab")     return ja ? "最新 A/B" : "Latest A/B";
+        if (k == "burned_total")  return ja ? "Burned 合計" : "Burned total";
+        if (k == "archive_count") return ja ? "採用ゲノム数" : "Archive count";
+        if (k == "qd_cells")      return ja ? "QD セル" : "QD cells";
+        if (k == "genomes")       return ja ? "ゲノム" : "Genomes";
+        if (k == "keep")          return ja ? "採用" : "Keep";
+        if (k == "none")          return ja ? "なし" : "none";
+        if (k == "total")         return ja ? "合計" : "Total";
+        if (k == "by_reason")     return ja ? "理由別内訳" : "By reason";
         return k;
     }
 
-    // ── Material Symbols glyphs (vector, no emoji) -- mirrors FleetCockpit ────────
+    // ── Material Symbols glyphs (vector, no emoji) ───────────────────────────────
     void LoadGlyphs()
     {
         try
@@ -158,7 +187,7 @@ class SelfImproveDashboardWindow : Window
         var path = new System.Windows.Shapes.Path();
         Geometry geo = Geometry.Parse(_glyphs[name]).Clone();
         double s = size / _upm;
-        geo.Transform = new MatrixTransform(s, 0, 0, -s, 0, s * _upm);  // font y-up -> WPF y-down
+        geo.Transform = new MatrixTransform(s, 0, 0, -s, 0, s * _upm);
         path.Data = geo; path.Fill = fill; path.Stretch = Stretch.None;
         path.Width = size; path.Height = size;
         path.HorizontalAlignment = HorizontalAlignment.Center;
@@ -201,19 +230,19 @@ class SelfImproveDashboardWindow : Window
         catch (Exception) { }
     }
 
-    // ── theme (identical palette to FleetCockpit) ─────────────────────────────────
+    // ── theme ────────────────────────────────────────────────────────────────────
     void ApplyThemeBrushes()
     {
-        Bg = Theme.Br(Theme.Bg(_dark));
-        CardBg = Theme.Br(Theme.Surface(_dark));
-        Border = Theme.Br(Theme.Border(_dark));
-        Fg = Theme.Br(Theme.Text(_dark));
-        Muted = Theme.Br(Theme.Muted(_dark));
+        Bg      = Theme.Br(Theme.Bg(_dark));
+        CardBg  = Theme.Br(Theme.Surface(_dark));
+        Border  = Theme.Br(Theme.Border(_dark));
+        Fg      = Theme.Br(Theme.Text(_dark));
+        Muted   = Theme.Br(Theme.Muted(_dark));
         QuoteBg = Theme.Br(Theme.SurfaceSubtle(_dark));
-        BtnBg = Theme.Br(Theme.SurfaceSubtle(_dark));
-        Accent = Theme.Br(Theme.Accent(_dark));
+        BtnBg   = Theme.Br(Theme.SurfaceSubtle(_dark));
+        Accent  = Theme.Br(Theme.Accent(_dark));
     }
-    Color BgColor() { return Theme.Col(Theme.Bg(_dark)); }
+    Color BgColor()   { return Theme.Col(Theme.Bg(_dark)); }
     Color CardColor() { return Theme.Col(Theme.Surface(_dark)); }
     static Color Mix(Color a, Color b, double t)
     {
@@ -222,13 +251,11 @@ class SelfImproveDashboardWindow : Window
                              (byte)(a.B * t + b.B * (1 - t)));
     }
 
-    // Verdict -> color key. Spec: GREEN when keep==true, YELLOW when verdict=="suggestive",
-    // RED otherwise. "good"/"warn"/"bad"/"muted" mirror FleetCockpit's status palette.
     static Color StatusColorFor(string ck, bool dark)
     {
-        if (ck == "good") return Theme.Col(Theme.Success(dark));  // keep
-        if (ck == "warn") return Theme.Col(Theme.Warning(dark));  // suggestive
-        if (ck == "bad") return Theme.Col(Theme.Danger(dark));    // not kept
+        if (ck == "good") return Theme.Col(Theme.Success(dark));
+        if (ck == "warn") return Theme.Col(Theme.Warning(dark));
+        if (ck == "bad")  return Theme.Col(Theme.Danger(dark));
         return Theme.Col(Theme.Muted(dark));
     }
     string VerdictKey(object keep, string verdict)
@@ -238,25 +265,27 @@ class SelfImproveDashboardWindow : Window
         return "bad";
     }
 
+    // ── chrome ───────────────────────────────────────────────────────────────────
     void BuildChrome()
     {
         var root = new DockPanel();
 
+        // ---- header bar ----
         _headBar = new Border();
-        _headBar.Padding = new Thickness(26, 20, 18, 12);
+        _headBar.Padding = new Thickness(26, 18, 18, 14);
         DockPanel.SetDock(_headBar, Dock.Top);
 
-        var headRow = new Grid();
-        headRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        headRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        headRow.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        headRow.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        var headGrid = new Grid();
+        headGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        headGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        headGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });  // title row
+        headGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });  // subtitle row
+        headGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });  // separator
 
-        // right controls: language, theme (read-only view -> no write controls)
+        // controls (top-right): lang + theme
         var ctrls = new StackPanel();
         ctrls.Orientation = Orientation.Horizontal;
         ctrls.VerticalAlignment = VerticalAlignment.Top;
-        ctrls.HorizontalAlignment = HorizontalAlignment.Right;
         _langBtn = IconButton("translate", 18);
         _langBtn.ToolTip = "日本語 / English";
         _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveKey("lang", _lang.ToString()); PaintChrome(); ForceRender(); };
@@ -266,40 +295,52 @@ class SelfImproveDashboardWindow : Window
         _themeBtn.Click += delegate { _dark = !_dark; SaveKey("dark", _dark ? "1" : "0"); ApplyThemeBrushes(); PaintChrome(); ForceRender(); };
         ctrls.Children.Add(_themeBtn);
         Grid.SetColumn(ctrls, 1); Grid.SetRow(ctrls, 0);
-        headRow.Children.Add(ctrls);
+        headGrid.Children.Add(ctrls);
 
-        // title (icon + title) -- row 0, col 0
+        // title row: icon + text
         var titleRow = new DockPanel { LastChildFill = true };
         titleRow.VerticalAlignment = VerticalAlignment.Center;
         titleRow.Margin = new Thickness(0, 0, 12, 0);
-        _iconHost = new ContentControl(); _iconHost.VerticalAlignment = VerticalAlignment.Center;
+        _iconHost = new ContentControl();
+        _iconHost.VerticalAlignment = VerticalAlignment.Center;
         _iconHost.Margin = new Thickness(0, 0, 10, 0);
         DockPanel.SetDock(_iconHost, Dock.Left);
         titleRow.Children.Add(_iconHost);
-        _header = new TextBlock(); _header.FontSize = 22; _header.FontWeight = FontWeights.SemiBold;
+        _header = new TextBlock();
+        _header.FontSize = 20;
+        _header.FontWeight = FontWeights.SemiBold;
         _header.VerticalAlignment = VerticalAlignment.Center;
-        _header.TextTrimming = TextTrimming.CharacterEllipsis; _header.TextWrapping = TextWrapping.NoWrap;
+        _header.TextTrimming = TextTrimming.CharacterEllipsis;
+        _header.TextWrapping = TextWrapping.NoWrap;
         titleRow.Children.Add(_header);
         Grid.SetColumn(titleRow, 0); Grid.SetRow(titleRow, 0);
-        headRow.Children.Add(titleRow);
+        headGrid.Children.Add(titleRow);
 
-        _sub = new TextBlock(); _sub.FontSize = 13; _sub.Margin = new Thickness(38, 4, 18, 0);
+        // subtitle (one-line explanation of what this window IS)
+        _sub = new TextBlock();
+        _sub.FontSize = 12.5;
+        _sub.Margin = new Thickness(36, 5, 12, 0);
         _sub.TextWrapping = TextWrapping.Wrap;
         Grid.SetColumn(_sub, 0); Grid.SetColumnSpan(_sub, 2); Grid.SetRow(_sub, 1);
-        headRow.Children.Add(_sub);
+        headGrid.Children.Add(_sub);
 
-        _headBar.Child = headRow;
+        // separator line below the header
+        var sep = new Border();
+        sep.Height = 1;
+        sep.Margin = new Thickness(0, 12, 0, 0);
+        sep.BorderThickness = new Thickness(0);
+        Grid.SetColumn(sep, 0); Grid.SetColumnSpan(sep, 2); Grid.SetRow(sep, 2);
+        headGrid.Children.Add(sep);
+
+        _headBar.Child = headGrid;
         root.Children.Add(_headBar);
 
-        // scrolling body
+        // ---- scrolling body ----
         _sv = new ScrollViewer();
         _sv.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
         _sv.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
-        _sv.Padding = new Thickness(18, 4, 18, 24);
+        _sv.Padding = new Thickness(20, 12, 20, 28);
         _body = new StackPanel();
-        // Explicitly theme the scroll host + body. Without this the ScrollViewer/StackPanel inherit
-        // a system-default (non-theme) fill, which in LIGHT mode read as a dark panel that didn't
-        // match the toolbar -- the "dashboard background differs" complaint. Repainted on theme toggle.
         _sv.Background = Bg; _body.Background = Bg;
         _sv.Content = _body;
         root.Children.Add(_sv);
@@ -310,9 +351,13 @@ class SelfImproveDashboardWindow : Window
 
     Button IconButton(string glyph, double size)
     {
-        var b = new Button(); b.Width = 36; b.Height = 30; b.Cursor = System.Windows.Input.Cursors.Hand;
-        b.BorderThickness = new Thickness(1); b.Margin = new Thickness(4, 0, 0, 0);
-        b.Content = MakeIcon(glyph, size, Fg); b.Tag = glyph;
+        var b = new Button();
+        b.Width = 36; b.Height = 30;
+        b.Cursor = System.Windows.Input.Cursors.Hand;
+        b.BorderThickness = new Thickness(1);
+        b.Margin = new Thickness(4, 0, 0, 0);
+        b.Content = MakeIcon(glyph, size, Fg);
+        b.Tag = glyph;
         return b;
     }
 
@@ -320,16 +365,24 @@ class SelfImproveDashboardWindow : Window
     {
         Background = Bg;
         _headBar.Background = Bg;
-        if (_sv != null) _sv.Background = Bg;
+        if (_sv != null)   _sv.Background   = Bg;
         if (_body != null) _body.Background = Bg;
         _header.Foreground = Fg;
-        _header.Text = T("title");
+        _header.Text = T("win_title");
         _sub.Foreground = Muted;
-        _iconHost.Content = MakeIcon("account_tree", 26, Fg);   // match the other header icons (was Accent = the odd-one-out orange the user flagged)
+        _sub.Text = T("win_sub");
+        _iconHost.Content = MakeIcon("account_tree", 24, Fg);
         foreach (Button b in new Button[] { _themeBtn, _langBtn })
-            if (b != null) { b.Background = BtnBg; b.Foreground = Fg; b.BorderBrush = Border; }
+        {
+            if (b != null)
+            {
+                b.Background = BtnBg;
+                b.Foreground = Fg;
+                b.BorderBrush = Border;
+            }
+        }
         if (_themeBtn != null) _themeBtn.Content = MakeIcon(_dark ? "light_mode" : "dark_mode", 18, Fg);
-        if (_langBtn != null) _langBtn.Content = MakeIcon("translate", 18, Fg);
+        if (_langBtn  != null) _langBtn.Content  = MakeIcon("translate", 18, Fg);
     }
 
     void ForceRender() { _lastSig = ""; OnTick(null, null); }
@@ -337,7 +390,6 @@ class SelfImproveDashboardWindow : Window
     // ── poll loop ─────────────────────────────────────────────────────────────────
     void OnTick(object sender, EventArgs e)
     {
-        // follow external theme/lang edits (e.g. the chat toggled the theme)
         try
         {
             if (File.Exists(SettingsFile))
@@ -386,7 +438,7 @@ class SelfImproveDashboardWindow : Window
         catch (Exception) { return null; }
     }
 
-    // ── JSON-safe accessors (mirror FleetCockpit's S/I/Dbl, plus dict/array/bool) ──
+    // ── JSON-safe accessors ────────────────────────────────────────────────────────
     static string S(Dictionary<string, object> d, string k)
     { if (d != null && d.ContainsKey(k) && d[k] != null) return d[k].ToString(); return ""; }
     static int I(Dictionary<string, object> d, string k)
@@ -398,21 +450,24 @@ class SelfImproveDashboardWindow : Window
     static bool AsBool(object o)
     { try { return o != null && Convert.ToBoolean(o); } catch (Exception) { return false; } }
 
-    // number -> string, "n/a" when the value is absent/null
     static string Num(object o, string fmt)
     {
         if (o == null) return "n/a";
         try { return Convert.ToDouble(o).ToString(fmt, System.Globalization.CultureInfo.InvariantCulture); }
         catch (Exception) { return "n/a"; }
     }
-    static string Pp(object o)   // signed percentage points, e.g. +8.8pp
+    static string Pp(object o)
     {
         if (o == null) return "n/a";
         try { return Convert.ToDouble(o).ToString("+0.0;-0.0", System.Globalization.CultureInfo.InvariantCulture) + "pp"; }
         catch (Exception) { return "n/a"; }
     }
+    static string Pct(Dictionary<string, object> d, string k)
+    {
+        if (d == null || !d.ContainsKey(k) || d[k] == null) return "—";
+        try { return (Convert.ToDouble(d[k]) * 100.0).ToString("0.0") + "%"; } catch (Exception) { return "—"; }
+    }
 
-    // Render signature: change-detect so we don't rebuild the tree every second when nothing moved.
     string Sig(Dictionary<string, object> state)
     {
         var sb = new StringBuilder();
@@ -433,26 +488,60 @@ class SelfImproveDashboardWindow : Window
     }
 
     // ── rendering ─────────────────────────────────────────────────────────────────
+
+    // Empty / no-data state: friendly message in a single centered card, not a broken panel.
     void RenderNoData()
     {
         Background = Bg; _headBar.Background = Bg;
-        _header.Text = T("title");
-        _sub.Text = "";
         _body.Children.Clear();
-        var card = SectionCard(T("title"));
-        var t = new TextBlock();
-        t.Text = T("nodata");
-        t.Foreground = Muted; t.FontSize = 13.5; t.TextWrapping = TextWrapping.Wrap;
-        t.Margin = new Thickness(0, 6, 0, 0);
-        ((StackPanel)card.Child).Children.Add(t);
+
+        // a calm, centred placeholder card
+        var card = new Border();
+        card.BorderThickness = new Thickness(1);
+        card.CornerRadius    = new CornerRadius(10);
+        card.Padding         = new Thickness(32, 28, 32, 28);
+        card.Margin          = new Thickness(0, 24, 0, 0);
+        card.BorderBrush     = Border;
+        card.Background      = CardBg;
+        card.HorizontalAlignment = HorizontalAlignment.Center;
+        card.MaxWidth        = 560;
+
+        var col = new StackPanel();
+        col.HorizontalAlignment = HorizontalAlignment.Center;
+
+        // icon  (use a neutral "info" look)
+        var iconWrap = new ContentControl();
+        iconWrap.Content = MakeIcon("auto_awesome", 36, Muted);
+        iconWrap.HorizontalAlignment = HorizontalAlignment.Center;
+        iconWrap.Margin = new Thickness(0, 0, 0, 14);
+        col.Children.Add(iconWrap);
+
+        var heading = new TextBlock();
+        heading.Text = T("nodata_title");
+        heading.Foreground = Fg;
+        heading.FontSize = 15;
+        heading.FontWeight = FontWeights.SemiBold;
+        heading.TextAlignment = TextAlignment.Center;
+        heading.Margin = new Thickness(0, 0, 0, 8);
+        col.Children.Add(heading);
+
+        var body = new TextBlock();
+        body.Text = T("nodata_body");
+        body.Foreground = Muted;
+        body.FontSize = 12.5;
+        body.TextWrapping = TextWrapping.Wrap;
+        body.TextAlignment = TextAlignment.Center;
+        body.LineHeight = 20;
+        col.Children.Add(body);
+
+        card.Child = col;
         _body.Children.Add(card);
     }
 
     void Render(Dictionary<string, object> state)
     {
-        _sub.Text = "";
         _body.Children.Clear();
-        _body.Children.Add(BuildUsage(state));        // (0) general-user lens first
+        _body.Children.Add(BuildUsage(state));
         _body.Children.Add(BuildScorecard(state));
         _body.Children.Add(BuildAbHistory(state));
         _body.Children.Add(BuildBurnedLedger(state));
@@ -460,195 +549,265 @@ class SelfImproveDashboardWindow : Window
         _body.Children.Add(BuildArchive(state));
     }
 
-    // (0) LIVE USAGE -- the general-user lens. Real-run completion / turns / trend from the persisted
-    // history + live snapshot, NO benchmark. This is what a normal user (who never runs a bench) sees.
+    // ── (0) LIVE USAGE — general-user lens ───────────────────────────────────────
+    // Real-run completion / turns / trend, no benchmark.
     UIElement BuildUsage(Dictionary<string, object> state)
     {
-        var u = Obj(state, "usage");
-        var card = SectionCard(T("usage_sec"));
-        var col = (StackPanel)card.Child;
-        if (u == null || I(u, "n_tasks") == 0) { col.Children.Add(EmptyLine()); return card; }
+        var u    = Obj(state, "usage");
+        var card = SectionCard("usage_sec", "usage_exp");
+        var col  = (StackPanel)card.Child;
 
-        var cap = new TextBlock { Text = T("usage_caption"), Foreground = Muted, FontSize = 11.5,
-                                  TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 3, 0, 0) };
-        col.Children.Add(cap);
+        if (u == null || I(u, "n_tasks") == 0)
+        {
+            col.Children.Add(MuteRow(T("none")));
+            return card;
+        }
 
-        var grid = new Grid(); grid.Margin = new Thickness(0, 12, 0, 0);
-        for (int i = 0; i < 4; i++) grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        var good = new SolidColorBrush(StatusColorFor("good", _dark));
-        grid.Children.Add(Metric(T("u_completion"), Pct(u, "completion_rate"), good, 0));
-        grid.Children.Add(Metric(T("u_recent"), Pct(u, "recent_completion_rate"), Fg, 1));
-        grid.Children.Add(Metric(T("u_turns"), Num(u.ContainsKey("median_turns") ? u["median_turns"] : null, "0.#"), Fg, 2));
-        grid.Children.Add(Metric(T("u_tasks"), I(u, "n_tasks").ToString(), Fg, 3));
+        // metrics row
+        var grid = new Grid(); grid.Margin = new Thickness(0, 10, 0, 0);
+        for (int i = 0; i < 4; i++)
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        var goodBrush = new SolidColorBrush(StatusColorFor("good", _dark));
+        grid.Children.Add(MetricCell(T("u_completion"), Pct(u, "completion_rate"),  goodBrush, 0));
+        grid.Children.Add(MetricCell(T("u_recent"),     Pct(u, "recent_completion_rate"), Fg, 1));
+        grid.Children.Add(MetricCell(T("u_turns"),
+            Num(u.ContainsKey("median_turns") ? u["median_turns"] : null, "0.#"), Fg, 2));
+        grid.Children.Add(MetricCell(T("u_tasks"), I(u, "n_tasks").ToString(), Fg, 3));
         col.Children.Add(grid);
 
+        // status mix (counts by outcome)
         var mix = Obj(u, "status_mix");
         if (mix != null && mix.Count > 0)
         {
             var parts = new List<string>();
-            foreach (var kv in mix) parts.Add(kv.Key + " " + kv.Value);
-            col.Children.Add(new TextBlock { Text = string.Join("    ·    ", parts.ToArray()), Foreground = Muted,
-                                             FontSize = 12, Margin = new Thickness(0, 10, 0, 0), TextWrapping = TextWrapping.Wrap });
+            foreach (KeyValuePair<string, object> kv in mix)
+                parts.Add(kv.Key + ": " + kv.Value);
+            var mixLine = new TextBlock();
+            mixLine.Text = string.Join("    ·    ", parts.ToArray());
+            mixLine.Foreground = Muted;
+            mixLine.FontSize = 12;
+            mixLine.Margin = new Thickness(0, 10, 0, 0);
+            mixLine.TextWrapping = TextWrapping.Wrap;
+            col.Children.Add(mixLine);
         }
 
+        // completion trend
         object[] tr = Arr(u, "trend");
         if (tr != null && tr.Length > 1)
         {
-            col.Children.Add(new TextBlock { Text = T("u_trend"), Foreground = Muted, FontSize = 11.5, Margin = new Thickness(0, 11, 0, 4) });
+            var label = new TextBlock();
+            label.Text = T("u_trend");
+            label.Foreground = Muted;
+            label.FontSize = 11;
+            label.Margin = new Thickness(0, 12, 0, 3);
+            col.Children.Add(label);
+
             var sb = new StringBuilder();
             for (int i = 0; i < tr.Length; i++)
             {
-                double v = 0.0; try { if (tr[i] != null) v = Convert.ToDouble(tr[i]); } catch (Exception) { }
+                double v = 0.0;
+                try { if (tr[i] != null) v = Convert.ToDouble(tr[i]); } catch (Exception) { }
                 if (i > 0) sb.Append("  →  ");
                 sb.Append(((int)System.Math.Round(v * 100)).ToString() + "%");
             }
-            col.Children.Add(new TextBlock { Text = sb.ToString(), Foreground = Fg, FontSize = 13,
-                                             FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 0) });
+            var trendLine = new TextBlock();
+            trendLine.Text = sb.ToString();
+            trendLine.Foreground = Fg;
+            trendLine.FontSize = 13;
+            trendLine.FontWeight = FontWeights.SemiBold;
+            col.Children.Add(trendLine);
         }
+
         return card;
     }
 
-    // percent string from a 0..1 fraction stored at d[k]; "—" when absent/null.
-    static string Pct(Dictionary<string, object> d, string k)
-    {
-        if (d == null || !d.ContainsKey(k) || d[k] == null) return "—";
-        try { return (Convert.ToDouble(d[k]) * 100.0).ToString("0.0") + "%"; } catch (Exception) { return "—"; }
-    }
-
-    // (1) SCORECARD header card: latest pass@1, latest A/B verdict (colored), burned_total, archive_count.
+    // ── (1) SCORECARD ────────────────────────────────────────────────────────────
+    // Latest pass@1, latest A/B verdict, burned count, archive count.
     UIElement BuildScorecard(Dictionary<string, object> state)
     {
         var sum = Obj(state, "summary");
-        var ab = sum != null ? Obj(sum, "latest_ab") : null;
+        var ab  = sum != null ? Obj(sum, "latest_ab") : null;
 
-        string verdictKey = ab != null ? VerdictKey(ab["keep"], S(ab, "verdict")) : "muted";
-        Color sc = StatusColorFor(verdictKey, _dark);
+        string vk = ab != null ? VerdictKey(ab.ContainsKey("keep") ? ab["keep"] : null, S(ab, "verdict")) : "muted";
+        Color  sc = StatusColorFor(vk, _dark);
 
+        // scorecard uses a subtle tinted border to convey the latest verdict at a glance
         var card = new Border();
         card.BorderThickness = new Thickness(1.4);
-        card.CornerRadius = new CornerRadius(12);
-        card.Padding = new Thickness(18, 14, 16, 14);
-        card.Margin = new Thickness(8, 7, 8, 7);
-        card.BorderBrush = new SolidColorBrush(Mix(sc, BgColor(), 0.55));
-        card.Background = new SolidColorBrush(Mix(sc, CardColor(), 0.10));
+        card.CornerRadius    = new CornerRadius(10);
+        card.Padding         = new Thickness(18, 14, 16, 16);
+        card.Margin          = new Thickness(0, 8, 0, 8);
+        card.BorderBrush     = new SolidColorBrush(Mix(sc, BgColor(), 0.45));
+        card.Background      = new SolidColorBrush(Mix(sc, CardColor(), 0.07));
 
         var col = new StackPanel();
 
-        var top = new StackPanel(); top.Orientation = Orientation.Horizontal;
-        var title = new TextBlock();
-        title.Text = T("scorecard").ToUpper();
-        title.Foreground = Accent; title.FontWeight = FontWeights.Bold; title.FontSize = 13;
-        title.VerticalAlignment = VerticalAlignment.Center; title.Margin = new Thickness(0, 0, 10, 0);
-        top.Children.Add(title);
-        if (ab != null) top.Children.Add(Pill(S(ab, "verdict"), verdictKey));
-        col.Children.Add(top);
+        // section label + verdict chip on one row
+        var topRow = new DockPanel { LastChildFill = false };
+        topRow.Margin = new Thickness(0, 0, 0, 2);
 
-        // big metric line
-        var grid = new Grid(); grid.Margin = new Thickness(0, 12, 0, 0);
-        for (int i = 0; i < 4; i++) grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        var sLabel = SectionLabel(T("scorecard_sec"));
+        DockPanel.SetDock(sLabel, Dock.Left);
+        topRow.Children.Add(sLabel);
 
-        grid.Children.Add(Metric(T("latest_pass"), sum != null ? Num(sum.ContainsKey("latest_pass_at_1") ? sum["latest_pass_at_1"] : null, "0.000") : "n/a", Fg, 0));
-        string abVal = "n/a";
         if (ab != null)
-            abVal = (string.IsNullOrEmpty(S(ab, "verdict")) ? "n/a" : S(ab, "verdict"))
-                  + "  " + Pp(ab.ContainsKey("net_pp") ? ab["net_pp"] : null)
-                  + "  p=" + Num(ab.ContainsKey("p") ? ab["p"] : null, "0.000");
-        grid.Children.Add(Metric(T("latest_ab"), abVal, new SolidColorBrush(sc), 1));
-        grid.Children.Add(Metric(T("burned"), I(sum, "burned_total").ToString(), Fg, 2));
-        grid.Children.Add(Metric(T("archive"), I(sum, "archive_count").ToString(), Fg, 3));
+        {
+            string vtext = string.IsNullOrEmpty(S(ab, "verdict")) ? "?" : S(ab, "verdict");
+            var chip = Pill(vtext, vk);
+            chip.Margin = new Thickness(10, 0, 0, 0);
+            DockPanel.SetDock(chip, Dock.Left);
+            topRow.Children.Add(chip);
+        }
+        col.Children.Add(topRow);
+
+        // explanation
+        col.Children.Add(SectionExplanation(T("scorecard_exp")));
+
+        // metrics row
+        var grid = new Grid(); grid.Margin = new Thickness(0, 12, 0, 0);
+        for (int i = 0; i < 4; i++)
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+        string pass1 = sum != null ? Num(sum.ContainsKey("latest_pass_at_1") ? sum["latest_pass_at_1"] : null, "0.000") : "n/a";
+        grid.Children.Add(MetricCell(T("latest_pass"), pass1, Fg, 0));
+
+        string abVal;
+        if (ab != null)
+        {
+            string verdict = string.IsNullOrEmpty(S(ab, "verdict")) ? "n/a" : S(ab, "verdict");
+            abVal = verdict + "  " + Pp(ab.ContainsKey("net_pp") ? ab["net_pp"] : null)
+                            + "  p=" + Num(ab.ContainsKey("p") ? ab["p"] : null, "0.000");
+        }
+        else
+        {
+            abVal = "n/a";
+        }
+        grid.Children.Add(MetricCell(T("latest_ab"), abVal, new SolidColorBrush(sc), 1));
+        grid.Children.Add(MetricCell(T("burned_total"),  I(sum, "burned_total").ToString(),  Fg, 2));
+        grid.Children.Add(MetricCell(T("archive_count"), I(sum, "archive_count").ToString(), Fg, 3));
         col.Children.Add(grid);
 
         card.Child = col;
         return card;
     }
 
-    UIElement Metric(string label, string value, Brush valueBrush, int colIdx)
-    {
-        var sp = new StackPanel(); sp.Margin = new Thickness(0, 0, 12, 0);
-        var l = new TextBlock();
-        l.Text = label; l.Foreground = Muted; l.FontSize = 11.5;
-        l.TextTrimming = TextTrimming.CharacterEllipsis;
-        sp.Children.Add(l);
-        var v = new TextBlock();
-        v.Text = value; v.Foreground = valueBrush; v.FontSize = 15; v.FontWeight = FontWeights.SemiBold;
-        v.TextWrapping = TextWrapping.Wrap; v.Margin = new Thickness(0, 3, 0, 0);
-        sp.Children.Add(v);
-        Grid.SetColumn(sp, colIdx);
-        return sp;
-    }
-
-    // (2) A/B HISTORY list (newest-first): toggle, n, net_pp, p, verdict, keep.
+    // ── (2) A/B HISTORY ──────────────────────────────────────────────────────────
+    // Newest-first list: toggle name, sample size, net pp, p-value, verdict chip.
     UIElement BuildAbHistory(Dictionary<string, object> state)
     {
-        var card = SectionCard(T("ab_history"));
-        var col = (StackPanel)card.Child;
+        var card = SectionCard("ab_sec", "ab_exp");
+        var col  = (StackPanel)card.Child;
         object[] hist = Arr(state, "ab_history");
+
         if (hist == null || hist.Length == 0)
         {
-            col.Children.Add(EmptyLine());
+            col.Children.Add(MuteRow(T("none")));
             return card;
         }
-        // newest-first: ab_history is oldest->newest, so iterate in reverse.
+
+        // column header labels
+        var hdr = new Grid(); hdr.Margin = new Thickness(0, 8, 0, 2);
+        hdr.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(3, GridUnitType.Star) });
+        hdr.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        hdr.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        hdr.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        hdr.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(80) });
+        hdr.Children.Add(ColHeader(_lang == 0 ? "トグル" : "Toggle",        0));
+        hdr.Children.Add(ColHeader("n",                                      1));
+        hdr.Children.Add(ColHeader(_lang == 0 ? "差分" : "Net",             2));
+        hdr.Children.Add(ColHeader("p-value",                                3));
+        hdr.Children.Add(ColHeader(_lang == 0 ? "採否" : "Verdict",         4));
+        col.Children.Add(hdr);
+        col.Children.Add(HRule());
+
+        // newest-first
         for (int i = hist.Length - 1; i >= 0; i--)
         {
             var r = hist[i] as Dictionary<string, object>;
             if (r == null) continue;
             string vk = VerdictKey(r.ContainsKey("keep") ? r["keep"] : null, S(r, "verdict"));
-            Color sc = StatusColorFor(vk, _dark);
+            Color  sc = StatusColorFor(vk, _dark);
 
-            var row = new DockPanel(); row.Margin = new Thickness(0, 5, 0, 5);
+            // left accent strip = verdict color
+            var strip = new Border();
+            strip.BorderThickness = new Thickness(3, 0, 0, 0);
+            strip.BorderBrush     = new SolidColorBrush(sc);
+            strip.Padding         = new Thickness(10, 4, 0, 4);
 
-            // pill on the right
-            var pill = Pill(string.IsNullOrEmpty(S(r, "verdict")) ? "?" : S(r, "verdict"), vk);
-            pill.HorizontalAlignment = HorizontalAlignment.Right;
-            DockPanel.SetDock(pill, Dock.Right);
-            row.Children.Add(pill);
+            var row = new Grid();
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(3, GridUnitType.Star) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(80) });
 
-            var line = new TextBlock();
-            line.Foreground = Fg; line.FontSize = 13; line.VerticalAlignment = VerticalAlignment.Center;
-            line.TextTrimming = TextTrimming.CharacterEllipsis;
             string toggle = string.IsNullOrEmpty(S(r, "toggle")) ? "?" : S(r, "toggle");
-            line.Text = toggle
-                + "    n=" + (r.ContainsKey("n") && r["n"] != null ? r["n"].ToString() : "?")
-                + "    net=" + Pp(r.ContainsKey("net_pp") ? r["net_pp"] : null)
-                + "    p=" + Num(r.ContainsKey("p") ? r["p"] : null, "0.000")
-                + "    " + T("keep") + "=" + (AsBool(r.ContainsKey("keep") ? r["keep"] : null) ? "true" : "false");
-            row.Children.Add(line);
+            string nVal   = r.ContainsKey("n") && r["n"] != null ? r["n"].ToString() : "?";
+            string netVal = Pp(r.ContainsKey("net_pp") ? r["net_pp"] : null);
+            string pVal   = Num(r.ContainsKey("p") ? r["p"] : null, "0.000");
+            string vtext  = string.IsNullOrEmpty(S(r, "verdict")) ? "?" : S(r, "verdict");
 
-            // colored left accent strip via a bordered wrapper
-            var wrap = new Border();
-            wrap.BorderThickness = new Thickness(3, 0, 0, 0);
-            wrap.BorderBrush = new SolidColorBrush(sc);
-            wrap.Padding = new Thickness(10, 0, 0, 0);
-            wrap.Child = row;
-            col.Children.Add(wrap);
+            row.Children.Add(RowCell(toggle, Fg,   false, 0));
+            row.Children.Add(RowCell(nVal,   Muted, false, 1));
+            row.Children.Add(RowCell(netVal, new SolidColorBrush(sc), true, 2));
+            row.Children.Add(RowCell(pVal,   Muted, false, 3));
+
+            // verdict chip
+            var chip = Pill(vtext, vk);
+            chip.VerticalAlignment = VerticalAlignment.Center;
+            chip.Margin = new Thickness(4, 0, 0, 0);
+            Grid.SetColumn(chip, 4);
+            row.Children.Add(chip);
+
+            strip.Child = row;
+            col.Children.Add(strip);
         }
         return card;
     }
 
-    // (3) BURNED LEDGER: total + by_reason breakdown.
+    // ── (3) BURNED LEDGER ────────────────────────────────────────────────────────
+    // Total count of burned problems + breakdown by reason (bar chart).
     UIElement BuildBurnedLedger(Dictionary<string, object> state)
     {
-        var card = SectionCard(T("burned_ledger"));
-        var col = (StackPanel)card.Child;
-        var bl = Obj(state, "burned_ledger");
+        var card = SectionCard("burned_sec", "burned_exp");
+        var col  = (StackPanel)card.Child;
+        var bl   = Obj(state, "burned_ledger");
         int total = I(bl, "total");
 
-        var tot = new TextBlock();
-        tot.Text = T("total") + ": " + total;
-        tot.Foreground = Fg; tot.FontSize = 14; tot.FontWeight = FontWeights.SemiBold;
-        tot.Margin = new Thickness(0, 6, 0, 6);
-        col.Children.Add(tot);
+        // total count as a prominent metric
+        var totalRow = new StackPanel(); totalRow.Orientation = Orientation.Horizontal;
+        totalRow.Margin = new Thickness(0, 8, 0, 10);
+        var tLabel = new TextBlock();
+        tLabel.Text = T("burned_total") + ": ";
+        tLabel.Foreground = Muted; tLabel.FontSize = 13;
+        tLabel.VerticalAlignment = VerticalAlignment.Center;
+        totalRow.Children.Add(tLabel);
+        var tValue = new TextBlock();
+        tValue.Text = total.ToString();
+        tValue.Foreground = Fg; tValue.FontSize = 16; tValue.FontWeight = FontWeights.SemiBold;
+        tValue.VerticalAlignment = VerticalAlignment.Center;
+        totalRow.Children.Add(tValue);
+        col.Children.Add(totalRow);
 
         var byReason = bl != null ? Obj(bl, "by_reason") : null;
         if (byReason == null || byReason.Count == 0)
         {
-            col.Children.Add(EmptyLine());
+            col.Children.Add(MuteRow(T("none")));
             return card;
         }
-        // find max for a tiny inline bar
+
+        // sub-label
+        var subLbl = new TextBlock();
+        subLbl.Text = T("by_reason");
+        subLbl.Foreground = Muted; subLbl.FontSize = 11;
+        subLbl.FontWeight = FontWeights.SemiBold;
+        subLbl.Margin = new Thickness(0, 0, 0, 4);
+        col.Children.Add(subLbl);
+
         int max = 1;
-        foreach (KeyValuePair<string, object> kv in byReason) { int v = 0; try { v = Convert.ToInt32(kv.Value); } catch (Exception) { } if (v > max) max = v; }
+        foreach (KeyValuePair<string, object> kv in byReason)
+        { int v = 0; try { v = Convert.ToInt32(kv.Value); } catch (Exception) { } if (v > max) max = v; }
+
         foreach (KeyValuePair<string, object> kv in byReason)
         {
             int v = 0; try { v = Convert.ToInt32(kv.Value); } catch (Exception) { }
@@ -657,132 +816,225 @@ class SelfImproveDashboardWindow : Window
         return card;
     }
 
-    // (4) PASS@1 TREND mini-list (ts, pass_at_1) -- simple textual/bar list, no charting library.
+    // ── (4) PASS@1 TREND ─────────────────────────────────────────────────────────
+    // Timestamped bar list, newest at top, capped at 24 entries.
     UIElement BuildPassTrend(Dictionary<string, object> state)
     {
-        var card = SectionCard(T("pass_trend"));
-        var col = (StackPanel)card.Child;
+        var card = SectionCard("trend_sec", "trend_exp");
+        var col  = (StackPanel)card.Child;
         object[] pt = Arr(state, "pass1_trend");
+
         if (pt == null || pt.Length == 0)
         {
-            col.Children.Add(EmptyLine());
+            col.Children.Add(MuteRow(T("none")));
             return card;
         }
-        // newest at the top, capped to the last 24 points so a long run stays readable.
+
         int shown = 0;
         for (int i = pt.Length - 1; i >= 0 && shown < 24; i--, shown++)
         {
-            var e = pt[i] as Dictionary<string, object>;
-            if (e == null) continue;
+            var entry = pt[i] as Dictionary<string, object>;
+            if (entry == null) continue;
             double pass = 0.0;
-            try { if (e.ContainsKey("pass_at_1") && e["pass_at_1"] != null) pass = Convert.ToDouble(e["pass_at_1"]); } catch (Exception) { }
-            if (pass < 0) pass = 0; if (pass > 1) pass = 1;
-            string ts = e.ContainsKey("ts") && e["ts"] != null ? e["ts"].ToString() : "?";
-            col.Children.Add(BarRow(ts, -1, -1, pass, Num(e.ContainsKey("pass_at_1") ? e["pass_at_1"] : null, "0.000")));
+            try
+            {
+                if (entry.ContainsKey("pass_at_1") && entry["pass_at_1"] != null)
+                    pass = Convert.ToDouble(entry["pass_at_1"]);
+            }
+            catch (Exception) { }
+            if (pass < 0) pass = 0;
+            if (pass > 1) pass = 1;
+            string ts = entry.ContainsKey("ts") && entry["ts"] != null ? entry["ts"].ToString() : "?";
+            col.Children.Add(BarRow(ts, -1, -1, pass,
+                Num(entry.ContainsKey("pass_at_1") ? entry["pass_at_1"] : null, "0.000")));
         }
         return card;
     }
 
-    // (5) ARCHIVE summary: count, qd_cells.
+    // ── (5) ARCHIVE ──────────────────────────────────────────────────────────────
+    // Genome count + QD cells.
     UIElement BuildArchive(Dictionary<string, object> state)
     {
-        var card = SectionCard(T("archive_sec"));
-        var col = (StackPanel)card.Child;
-        var arc = Obj(state, "archive");
+        var card = SectionCard("archive_sec", "archive_exp");
+        var col  = (StackPanel)card.Child;
+        var arc  = Obj(state, "archive");
 
-        var grid = new Grid(); grid.Margin = new Thickness(0, 6, 0, 0);
+        var grid = new Grid(); grid.Margin = new Thickness(0, 10, 0, 0);
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        grid.Children.Add(Metric(T("genomes"), I(arc, "count").ToString(), Fg, 0));
-        grid.Children.Add(Metric(T("qd_cells"), I(arc, "qd_cells").ToString(), Fg, 1));
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(2, GridUnitType.Star) });
+        grid.Children.Add(MetricCell(T("genomes"),  I(arc, "count").ToString(),    Fg, 0));
+        grid.Children.Add(MetricCell(T("qd_cells"), I(arc, "qd_cells").ToString(), Fg, 1));
         col.Children.Add(grid);
         return card;
     }
 
-    // A labelled bar row used by the burned ledger (count bar) and the pass@1 trend (ratio bar).
-    // When `valueText` is null the count `v` is shown; otherwise `valueText` is shown verbatim.
+    // ── widget helpers ────────────────────────────────────────────────────────────
+
+    // Section card: returns a themed Border whose .Child is a StackPanel with the
+    // section label + one-line explanation already prepended; callers append content rows.
+    // titleKey and expKey are T() keys (not raw strings) so the card re-renders on lang toggle.
+    Border SectionCard(string titleKey, string expKey)
+    {
+        var card = new Border();
+        card.BorderThickness = new Thickness(1);
+        card.CornerRadius    = new CornerRadius(10);
+        card.Padding         = new Thickness(18, 14, 16, 16);
+        card.Margin          = new Thickness(0, 0, 0, 12);
+        card.BorderBrush     = Border;
+        card.Background      = CardBg;
+
+        var col = new StackPanel();
+
+        // section label (small, semibold, caps)
+        col.Children.Add(SectionLabel(T(titleKey)));
+
+        // one-line explanation (muted, wraps)
+        col.Children.Add(SectionExplanation(T(expKey)));
+
+        card.Child = col;
+        return card;
+    }
+
+    TextBlock SectionLabel(string text)
+    {
+        var t = new TextBlock();
+        t.Text = text.ToUpper();
+        t.Foreground  = Accent;
+        t.FontSize    = 11;
+        t.FontWeight  = FontWeights.SemiBold;
+        t.Margin      = new Thickness(0, 0, 0, 0);
+        return t;
+    }
+
+    TextBlock SectionExplanation(string text)
+    {
+        var t = new TextBlock();
+        t.Text = text;
+        t.Foreground   = Muted;
+        t.FontSize     = 11.5;
+        t.TextWrapping = TextWrapping.Wrap;
+        t.Margin       = new Thickness(0, 3, 0, 0);
+        return t;
+    }
+
+    // Metric cell: label above, value below, placed in a Grid column.
+    UIElement MetricCell(string label, string value, Brush valueBrush, int colIdx)
+    {
+        var sp = new StackPanel();
+        sp.Margin = new Thickness(0, 0, 12, 0);
+        var l = new TextBlock();
+        l.Text = label; l.Foreground = Muted; l.FontSize = 11;
+        l.TextTrimming = TextTrimming.CharacterEllipsis;
+        sp.Children.Add(l);
+        var v = new TextBlock();
+        v.Text = value; v.Foreground = valueBrush; v.FontSize = 15;
+        v.FontWeight = FontWeights.SemiBold;
+        v.TextWrapping = TextWrapping.Wrap;
+        v.Margin = new Thickness(0, 3, 0, 0);
+        sp.Children.Add(v);
+        Grid.SetColumn(sp, colIdx);
+        return sp;
+    }
+
+    // Plain muted row used for "none" placeholders.
+    TextBlock MuteRow(string text)
+    {
+        var t = new TextBlock();
+        t.Text = text; t.Foreground = Muted; t.FontSize = 12.5;
+        t.Margin = new Thickness(0, 8, 0, 0);
+        return t;
+    }
+
+    // Table column header (small, muted, semibold).
+    UIElement ColHeader(string text, int col)
+    {
+        var t = new TextBlock();
+        t.Text = text; t.Foreground = Muted; t.FontSize = 11;
+        t.FontWeight = FontWeights.SemiBold;
+        t.VerticalAlignment = VerticalAlignment.Center;
+        t.Margin = new Thickness(col == 0 ? 0 : 4, 0, 0, 0);
+        Grid.SetColumn(t, col);
+        return t;
+    }
+
+    // Table data cell.
+    UIElement RowCell(string text, Brush brush, bool semibold, int col)
+    {
+        var t = new TextBlock();
+        t.Text = text; t.Foreground = brush; t.FontSize = 12.5;
+        if (semibold) t.FontWeight = FontWeights.SemiBold;
+        t.VerticalAlignment = VerticalAlignment.Center;
+        t.TextTrimming = TextTrimming.CharacterEllipsis;
+        t.Margin = new Thickness(col == 0 ? 0 : 4, 0, 0, 0);
+        Grid.SetColumn(t, col);
+        return t;
+    }
+
+    // Thin horizontal rule divider.
+    UIElement HRule()
+    {
+        var b = new Border();
+        b.Height = 1; b.Background = Border;
+        b.Margin = new Thickness(0, 2, 0, 4);
+        return b;
+    }
+
+    // Bar row: label | proportional bar | value. Used for burned ledger (counts) and pass@1 trend (ratio).
     UIElement BarRow(string label, int v, int max, double frac) { return BarRow(label, v, max, frac, null); }
     UIElement BarRow(string label, int v, int max, double frac, string valueText)
     {
-        if (frac < 0) frac = 0; if (frac > 1) frac = 1;
+        if (frac < 0) frac = 0;
+        if (frac > 1) frac = 1;
+
         var grid = new Grid(); grid.Margin = new Thickness(0, 3, 0, 3);
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(150) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(160) });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(64) });
 
-        var l = new TextBlock();
-        l.Text = label; l.Foreground = Muted; l.FontSize = 12.5;
-        l.VerticalAlignment = VerticalAlignment.Center;
-        l.TextTrimming = TextTrimming.CharacterEllipsis;
-        Grid.SetColumn(l, 0); grid.Children.Add(l);
+        var lbl = new TextBlock();
+        lbl.Text = label; lbl.Foreground = Muted; lbl.FontSize = 12;
+        lbl.VerticalAlignment = VerticalAlignment.Center;
+        lbl.TextTrimming = TextTrimming.CharacterEllipsis;
+        Grid.SetColumn(lbl, 0); grid.Children.Add(lbl);
 
-        // bar track + fill
+        // bar: a two-star Grid inside a pill-shaped track
         var track = new Border();
-        track.Height = 10; track.CornerRadius = new CornerRadius(999);
-        track.Background = QuoteBg; track.VerticalAlignment = VerticalAlignment.Center;
+        track.Height = 8; track.CornerRadius = new CornerRadius(999);
+        track.Background = QuoteBg;
+        track.VerticalAlignment = VerticalAlignment.Center;
         track.Margin = new Thickness(0, 0, 10, 0);
-        var inner = new Grid();
-        inner.HorizontalAlignment = HorizontalAlignment.Left;
-        var fill = new Border();
-        fill.Height = 10; fill.CornerRadius = new CornerRadius(999);
-        fill.Background = Accent;
-        // width is set via a viewbox-free proportional trick: a Grid with two star columns
         var bargrid = new Grid();
-        bargrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(frac, GridUnitType.Star) });
-        bargrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1 - frac, GridUnitType.Star) });
+        bargrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(frac,       GridUnitType.Star) });
+        bargrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.0 - frac, GridUnitType.Star) });
+        var fill = new Border();
+        fill.Height = 8; fill.CornerRadius = new CornerRadius(999); fill.Background = Accent;
         Grid.SetColumn(fill, 0); bargrid.Children.Add(fill);
         track.Child = bargrid;
         Grid.SetColumn(track, 1); grid.Children.Add(track);
 
         var val = new TextBlock();
         val.Text = valueText != null ? valueText : v.ToString();
-        val.Foreground = Fg; val.FontSize = 12.5; val.FontWeight = FontWeights.SemiBold;
-        val.VerticalAlignment = VerticalAlignment.Center; val.TextAlignment = TextAlignment.Right;
+        val.Foreground = Fg; val.FontSize = 12; val.FontWeight = FontWeights.SemiBold;
+        val.VerticalAlignment = VerticalAlignment.Center;
+        val.TextAlignment = TextAlignment.Right;
         Grid.SetColumn(val, 2); grid.Children.Add(val);
 
         return grid;
     }
 
-    // A section card shell: titled, soft-bordered, themed -- returns a Border whose Child is the
-    // content StackPanel (with the title already added), so callers append their rows to it.
-    Border SectionCard(string titleText)
-    {
-        var card = new Border();
-        card.BorderThickness = new Thickness(1.4);
-        card.CornerRadius = new CornerRadius(12);
-        card.Padding = new Thickness(18, 13, 16, 13);
-        card.Margin = new Thickness(8, 7, 8, 7);
-        card.BorderBrush = Border; card.Background = CardBg;
-
-        var col = new StackPanel();
-        var title = new TextBlock();
-        title.Text = titleText.ToUpper();
-        title.Foreground = Accent; title.FontWeight = FontWeights.Bold; title.FontSize = 13;
-        col.Children.Add(title);
-        card.Child = col;
-        return card;
-    }
-
-    TextBlock EmptyLine()
-    {
-        var t = new TextBlock();
-        t.Text = T("none"); t.Foreground = Muted; t.FontSize = 13;
-        t.Margin = new Thickness(0, 6, 0, 0);
-        return t;
-    }
-
-    // Pill badge -- identical to FleetCockpit's: saturated bg + white text.
+    // Pill badge (saturated bg, white text).
     Border Pill(string text, string ck)
     {
         var b = new Border();
-        b.Background = new SolidColorBrush(StatusColorFor(ck, _dark));
+        b.Background   = new SolidColorBrush(StatusColorFor(ck, _dark));
         b.CornerRadius = new CornerRadius(999);
-        b.Padding = new Thickness(11, 3, 11, 3);
+        b.Padding      = new Thickness(9, 2, 9, 2);
         b.VerticalAlignment = VerticalAlignment.Center;
         var t = new TextBlock();
         t.Text = string.IsNullOrEmpty(text) ? "?" : text;
-        t.Foreground = White;                 // saturated bg -> white text
-        t.FontSize = 11.5; t.FontWeight = FontWeights.SemiBold;
+        t.Foreground = White;
+        t.FontSize = 11; t.FontWeight = FontWeights.SemiBold;
         b.Child = t;
         return b;
     }

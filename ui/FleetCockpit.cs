@@ -4184,11 +4184,18 @@ class CockpitWindow : Window
     UIElement BuildCardToolbar(List<Dictionary<string, object>> all,
                                List<Dictionary<string, object>> shown)
     {
-        // Compute per-tab counts from the FULL worker list (not filtered shown).
+        // Per-tab counts from the ON-BOARD worker list = the full list MINUS the terminal cards
+        // the user moved to History (_hiddenKeys). We don't use `shown` because that is also
+        // narrowed by the active filter; we want totals-per-category independent of the filter,
+        // but a card moved to History must not be counted (else "all 1 / done 1" persists after
+        // everything was sent to history). Mirror BuildRows' exact hide rule.
         int cntAll = 0, cntActive = 0, cntNeeds = 0, cntDone = 0;
         int doneN = 0, maxN = 0, badN = 0;
+        string startedRootTb = _lastRoot != null ? S(_lastRoot, "started") : "";
         foreach (Dictionary<string, object> w in all)
         {
+            if (_hiddenKeys.Count > 0 && IsTerminalWorker(w) && _hiddenKeys.Contains(WorkerKey(startedRootTb, w)))
+                continue;   // moved to History -- not on the board, don't count
             cntAll++;
             string oc = S(w, "outcome");
             string st = S(w, "status");
