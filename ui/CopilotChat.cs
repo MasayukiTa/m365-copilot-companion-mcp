@@ -382,13 +382,22 @@ class ChatWindow : Window
         {
             Child = composerInner,
             CornerRadius = new CornerRadius(12),
-            BorderThickness = new Thickness(1),
-            Padding = new Thickness(14, 10, 14, 10),
+            BorderThickness = new Thickness(0),   // frameless at rest; shadow carries separation
+            Padding = new Thickness(12, 6, 12, 6),
             Margin = new Thickness(0, 10, 0, 16),
-            HorizontalAlignment = HorizontalAlignment.Stretch
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            Effect = new System.Windows.Media.Effects.DropShadowEffect
+            {
+                Color = Colors.Black, BlurRadius = 14, ShadowDepth = 2,
+                Opacity = 0.16, Direction = 270, RenderingBias = System.Windows.Media.Effects.RenderingBias.Performance
+            }
         };
         SetRef(_composerBorder, BackgroundProperty, "PanelAlt");
-        SetRef(_composerBorder, Border.BorderBrushProperty, "Border");
+        SetRef(_composerBorder, Border.BorderBrushProperty, "Accent");   // pre-wired to Accent; shown only on focus
+        // Focus ring: subtle 1px Accent border while focused, 0 at rest.
+        // Steer mode overrides both (2px Accent), reconciled in RefreshSteerVisual().
+        _input.GotKeyboardFocus += delegate { if (string.IsNullOrEmpty(_activeFleetUrl)) _composerBorder.BorderThickness = new Thickness(1); };
+        _input.LostKeyboardFocus += delegate { if (string.IsNullOrEmpty(_activeFleetUrl)) _composerBorder.BorderThickness = new Thickness(0); };
         // Clicking the border surface focuses the text input (nice-to-have).
         _composerBorder.MouseLeftButtonDown += delegate { _input.Focus(); };
         PaintSend();   // initial state: input empty -> neutral
@@ -2023,8 +2032,11 @@ class ChatWindow : Window
         bool steer = !string.IsNullOrEmpty(_activeFleetUrl);
         if (_composerBorder != null)
         {
-            SetRef(_composerBorder, Border.BorderBrushProperty, steer ? "Accent" : "Border");
-            _composerBorder.BorderThickness = new Thickness(steer ? 2 : 1);
+            // Steer mode: 2px Accent border (unmistakable orange; overrides focus/rest states).
+            // Normal mode: 0 at rest; GotKeyboardFocus/LostKeyboardFocus set 1px Accent on focus.
+            // BorderBrush is always "Accent" (wired in ctor); thickness carries the state.
+            SetRef(_composerBorder, Border.BorderBrushProperty, "Accent");
+            _composerBorder.BorderThickness = new Thickness(steer ? 2 : 0);
         }
     }
 
