@@ -35,6 +35,10 @@ _SUITES = [
     "relay.selfimprove.test_status",
     "relay.selfimprove.test_diversify",
     "relay.selfimprove.test_l2_cron",
+    # general-use quality gate + closed loop (#1/#2)
+    "relay.selfimprove.test_quality",
+    "relay.selfimprove.test_usage",
+    "relay.selfimprove.test_quality_loop",
     # strengths (relay)
     "relay.test_bestofn",
     "relay.test_confidence",

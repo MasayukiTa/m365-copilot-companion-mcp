@@ -82,8 +82,8 @@ def test_aggregates_correctly():
         st = D.dashboard_state(archive_path=arc_path, burned_path=burned,
                                grade_results_path=grade, reports_glob=reports_glob)
 
-        # top-level shape
-        assert set(st.keys()) == {"summary", "ab_history", "pass1_trend", "burned_ledger", "archive"}
+        # top-level shape (now includes the general-user `usage` lens)
+        assert set(st.keys()) == {"summary", "usage", "ab_history", "pass1_trend", "burned_ledger", "archive"}
 
         # summary
         s = st["summary"]
@@ -92,6 +92,15 @@ def test_aggregates_correctly():
         assert abs(s["latest_pass_at_1"] - 0.60) < 1e-9     # newest archive entry by insertion order
         assert s["latest_ab"] == {"net_pp": 8.75, "p": 0.001, "verdict": "keep", "keep": True}
         assert s["grade_results_count"] == 2
+        # summary mirrors the general-user persona-leak rate (here no history -> None)
+        assert "persona_leak_rate" in s
+        assert s["persona_leak_rate"] == st["usage"].get("persona_leak_rate")
+
+        # usage section is a dict carrying the persona-leak quality key
+        u = st["usage"]
+        assert isinstance(u, dict)
+        assert "persona_leak_rate" in u
+        assert "quality_scored" in u and "persona_flagged" in u
 
         # ab_history: oldest -> newest, by mtime
         ab = st["ab_history"]
@@ -125,6 +134,7 @@ def test_aggregates_correctly():
         assert isinstance(text, str) and text.isascii()
         assert "burned total  : 5" in text
         assert "archive count : 3" in text
+        assert "persona leak  : " in text                    # quality headline line is present (ASCII)
 
     print("ok test_aggregates_correctly")
 
@@ -182,10 +192,17 @@ def test_all_sections_degrade_to_empty():
     assert st["pass1_trend"] == []
     assert st["burned_ledger"] == {"total": 0, "by_reason": {}, "recent": []}
     assert st["archive"] == {"count": 0, "genomes": [], "qd_cells": 0}
+    # usage section degrades to a valid dict (never raises) and still carries the persona keys.
+    assert isinstance(st["usage"], dict)
+    assert "persona_leak_rate" in st["usage"]
+    # with these synthetic empty ledgers the usage lens reads the REAL repo history; whether that is
+    # populated or not, the summary must mirror usage exactly and never raise.
+    assert st["summary"]["persona_leak_rate"] == st["usage"].get("persona_leak_rate")
     # render_text must still produce a clean ASCII scorecard, not crash
     text = D.render_text(st)
     assert text.isascii() and "no data" not in text.lower()  # empty state still renders a scorecard
     assert "latest pass@1 : n/a" in text
+    assert "persona leak  : " in text                        # quality headline line present and ASCII
     print("ok test_all_sections_degrade_to_empty")
 
 
@@ -197,7 +214,7 @@ def test_render_text_handles_garbage():
 
 
 def test_write_json_writes_valid_feed():
-    # write_json must drop a valid, pretty JSON file carrying the 5 top-level keys, return its
+    # write_json must drop a valid, pretty JSON file carrying the 6 top-level keys, return its
     # path, create the parent dir if missing, and never raise.
     with tempfile.TemporaryDirectory() as d:
         out = os.path.join(d, "sub", "selfimprove_dashboard.json")   # parent does not exist yet
@@ -206,7 +223,7 @@ def test_write_json_writes_valid_feed():
         assert os.path.isfile(out)
         with open(out, encoding="utf-8") as f:
             obj = json.load(f)                                       # must be valid JSON
-        assert set(obj.keys()) == {"summary", "ab_history", "pass1_trend", "burned_ledger", "archive"}
+        assert set(obj.keys()) == {"summary", "usage", "ab_history", "pass1_trend", "burned_ledger", "archive"}
         # pretty-printed (indent=2) -> multi-line with leading spaces, not a single dense line
         raw = open(out, encoding="utf-8").read()
         assert "\n  " in raw

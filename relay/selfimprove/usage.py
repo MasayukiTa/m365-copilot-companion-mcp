@@ -114,6 +114,32 @@ def usage_section(history_path=None, status_path=None, segments=6):
     recent = items[-win:] if win else []
     recent_rate = round(sum(1 for h in recent if (h.get("status") or "") == _DONE) / len(recent), 4) if recent else None
 
+    # Persona-leak lens (the QUALITY half of the general-user lens): of the runs whose body we can
+    # resolve, how many leaked an unsolicited advisor/lecture/ego persona. Reuses the SAME time-ordered
+    # `items` list (each carries a transcript path, so score_history can resolve the real body).
+    # DEFENSIVE: the quality scorer is a soft dependency -- if its import OR its call fails for any
+    # reason we degrade to (None, 0, []) and leave EVERY existing metric above untouched.
+    persona_leak_rate = None
+    quality_scored = 0
+    persona_flagged = []
+    try:
+        from relay.selfimprove import quality
+        r = quality.score_history(items)  # offline heuristic only (judge_fn=None)
+        persona_leak_rate = r.get("leak_rate")
+        quality_scored = r.get("n_scored") or 0
+        # thin each flagged row down to the display-only fields (key/signals/excerpt), top <=10
+        for f in (r.get("flagged") or [])[:10]:
+            if isinstance(f, dict):
+                persona_flagged.append({
+                    "key": f.get("key"),
+                    "signals": f.get("signals", []),
+                    "excerpt": f.get("excerpt"),
+                })
+    except Exception:
+        persona_leak_rate = None
+        quality_scored = 0
+        persona_flagged = []
+
     return {
         "n_tasks": n,
         "completion_rate": completion_rate,
@@ -123,6 +149,9 @@ def usage_section(history_path=None, status_path=None, segments=6):
         "verify_rate": verify_rate,
         "status_mix": status_mix,
         "trend": trend,
+        "persona_leak_rate": persona_leak_rate,
+        "quality_scored": quality_scored,
+        "persona_flagged": persona_flagged,
     }
 
 
