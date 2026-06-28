@@ -119,6 +119,11 @@ def outlook_send_mail(
     locked = require_unlocked()
     if locked:
         return locked
+    if send_immediately:
+        from . import contract_gate as _cg
+        _g = _cg.check_op("outbound", f"email send to={to!r} subject={subject!r}")
+        if _g is not None:
+            return _g
     try:
         if not to or not subject:
             return "[outlook_send_mail error: 'to' and 'subject' are required]"
@@ -251,6 +256,11 @@ def outlook_create_event(
     locked = require_unlocked()
     if locked:
         return locked
+    if send_invite and attendees:
+        from . import contract_gate as _cg
+        _g = _cg.check_op("outbound", f"calendar invite subject={subject!r} to={attendees!r}")
+        if _g is not None:
+            return _g
     try:
         start = datetime.fromisoformat(start_iso)
         # HITL gate: require explicit confirmation before sending invites.

@@ -32,6 +32,11 @@ def run_python(
     locked = require_unlocked()
     if locked:
         return locked
+    from . import contract_gate as _cg
+    if _cg.destructive_shell(code):
+        _g = _cg.check_op("shell_destructive", code[:200])
+        if _g is not None:
+            return _g
     tmp_path: Optional[str] = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -83,6 +88,11 @@ def shell_exec(
     locked = require_unlocked()
     if locked:
         return locked
+    from . import contract_gate as _cg
+    if _cg.destructive_shell(command):
+        _g = _cg.check_op("shell_destructive", command[:200])
+        if _g is not None:
+            return _g
     try:
         result = subprocess.run(
             command,
