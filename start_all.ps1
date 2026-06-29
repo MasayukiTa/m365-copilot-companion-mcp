@@ -97,10 +97,7 @@ function Start-Splash {
         $bar.Size = New-Object System.Drawing.Size(396, 18)
         $bar.Location = New-Object System.Drawing.Point(24, 92)
         $f.Controls.Add($bar)
-        $f.Show()
-        $f.Activate()
-        $f.BringToFront()
-        [System.Windows.Forms.Application]::DoEvents()
+        $f.Add_Shown({ try { $f.Activate(); $f.BringToFront() } catch { } })
         return @{ Form = $f; Status = $status; Start = (Get-Date) }
     } catch { return $null }
 }
@@ -115,22 +112,8 @@ function Set-SplashStatus($splash, [string]$text) {
 function Pump-Splash($splash) {
     try { if ($splash -and $splash.Form) { [System.Windows.Forms.Application]::DoEvents() } } catch { }
 }
-function Stop-Splash($splash) {
-    try {
-        if ($splash -and $splash.Form) {
-            # Keep it on screen a minimum ~2.5s so a fast (already-running) startup is still seen.
-            $remain = 2500 - ((Get-Date) - $splash.Start).TotalMilliseconds
-            while ($remain -gt 0) {
-                [System.Windows.Forms.Application]::DoEvents()
-                Start-Sleep -Milliseconds 80
-                $remain -= 80
-            }
-            $splash.Form.Close()
-            $splash.Form.Dispose()
-            [System.Windows.Forms.Application]::DoEvents()
-        }
-    } catch { }
-}
+# (Stop-Splash removed: the splash is shown MODALLY via ShowDialog and closed by the one-shot
+#  timer that drives Invoke-Startup; the minimum on-screen time is enforced inside Invoke-Startup.)
 
 function Check-ForUpdates {
     # Non-fatal pre-flight: if the local checkout is behind the remote, offer to update.
@@ -212,79 +195,104 @@ function Check-ForUpdates {
     }
 }
 
-# Show the cold-start splash (best-effort) so the few-second wait has feedback, then run the
-# update check with its status reflected on the splash.
-$splash = Start-Splash
+# Everything that brings the stack up, as ONE function so it can run either INSIDE the splash's
+# message loop (a one-shot timer, so the modal splash stays visible while this runs) OR directly
+# as a fallback if the splash cannot be shown. Status updates target $script:splash (no-op if null).
+function Invoke-Startup {
+    # Pre-flight update check (best-effort, non-blocking). Runs once before any service starts.
+    Set-SplashStatus $script:splash "Checking for updates..."
+    Check-ForUpdates
 
-# Pre-flight update check (best-effort, non-blocking). Runs once before any service starts.
-Set-SplashStatus $splash "Checking for updates..."
-Check-ForUpdates
+    Write-Host "=== Daily startup (idempotent -- already-running parts are left as-is) ==="
 
-Write-Host "=== Daily startup (idempotent -- already-running parts are left as-is) ==="
-
-# 1) Supervisor = MCP server + Dev Tunnel host. Its own global mutex makes a second instance exit
-#    quietly, and it never touches a live `devtunnel host` -- so if a tunnel is already up, we keep
-#    it. We still gate on the process so we don't spawn a doomed hidden window each run.
-Set-SplashStatus $splash "Starting the MCP server and Dev Tunnel..."
-if (Proc-Running 'supervisor\.ps1') {
-    Write-Host "[1/4] supervisor (MCP server + tunnel): already running -- left as-is"
-} else {
-    # pass the tunnel name from .env (setup_devtunnel.ps1 writes MCP_TUNNEL_NAME) so a machine with
-    # its own tunnel name hosts the right one instead of the hardcoded default.
-    $tn = Env-Value "MCP_TUNNEL_NAME"
-    $supArgs = @("-NoProfile","-ExecutionPolicy","Bypass","-File","$root\supervisor.ps1")
-    if ($tn) { $supArgs += @("-TunnelName", $tn); Write-Host "[1/4] supervisor (MCP server + tunnel '$tn'): starting" }
-    else     { Write-Host "[1/4] supervisor (MCP server + tunnel): starting" }
-    Start-Process powershell -WindowStyle Hidden -ArgumentList $supArgs
-}
-
-# 2) Companion Edge :9222 (the fleet / agent Edge). Idempotent launcher; skip if the port answers.
-Set-SplashStatus $splash "Starting the agent browser..."
-if (Port-Up 9222) {
-    Write-Host "[2/4] companion Edge :9222: already up"
-} else {
-    Write-Host "[2/4] companion Edge :9222: starting (headless)"
-    try { & "$root\start_companion_edge.ps1" -Headless | Out-Null } catch { Write-Host "      (companion Edge launch returned: $_)" }
-}
-
-# 3) Bridge :9223 + chat backend (start_bridge -Keepalive). Skip if the keepalive supervisor is up.
-Set-SplashStatus $splash "Starting the chat bridge..."
-if (Proc-Running 'start_bridge\.ps1') {
-    Write-Host "[3/4] bridge keepalive: already running"
-} elseif (Http-Up "http://127.0.0.1:8765/conv") {
-    Write-Host "[3/4] bridge :8765: already serving (no keepalive supervisor, but up)"
-} else {
-    Write-Host "[3/4] bridge: starting (headless keepalive)"
-    Start-Process powershell -WindowStyle Hidden -ArgumentList @(
-        "-NoProfile","-ExecutionPolicy","Bypass","-File","$root\start_bridge.ps1","-Keepalive")
-}
-
-# 4) WPF apps. Launch only if not already running; build them first if the exe is missing.
-Set-SplashStatus $splash "Opening the chat and cockpit windows..."
-foreach ($app in @("CopilotChat","FleetCockpit")) {
-    if (Get-Process $app -ErrorAction SilentlyContinue) {
-        Write-Host "[4/4] ${app}: already running"
-    } elseif (Test-Path "$root\ui\$app.exe") {
-        Write-Host "[4/4] ${app}: launching"
-        Start-Process "$root\ui\$app.exe"
+    # 1) Supervisor = MCP server + Dev Tunnel host. Its own global mutex makes a second instance
+    #    exit quietly, and it never touches a live `devtunnel host` -- so a live tunnel is kept.
+    Set-SplashStatus $script:splash "Starting the MCP server and Dev Tunnel..."
+    if (Proc-Running 'supervisor\.ps1') {
+        Write-Host "[1/4] supervisor (MCP server + tunnel): already running -- left as-is"
     } else {
-        Write-Host "[4/4] $app.exe not built yet -- run  ui\rebuild_ui.ps1  once, then re-run this."
+        $tn = Env-Value "MCP_TUNNEL_NAME"
+        $supArgs = @("-NoProfile","-ExecutionPolicy","Bypass","-File","$root\supervisor.ps1")
+        if ($tn) { $supArgs += @("-TunnelName", $tn); Write-Host "[1/4] supervisor (MCP server + tunnel '$tn'): starting" }
+        else     { Write-Host "[1/4] supervisor (MCP server + tunnel): starting" }
+        Start-Process powershell -WindowStyle Hidden -ArgumentList $supArgs
     }
-}
 
-Write-Host ""
-Write-Host "Done. Chat UI: http://127.0.0.1:8765 (or the CopilotChat window). Fleet cockpit window is up."
-Write-Host "If a one-time M365 sign-in is needed, a visible Edge window will appear -- sign in there."
+    # 2) Companion Edge :9222 (the fleet / agent Edge). Idempotent; skip if the port answers.
+    Set-SplashStatus $script:splash "Starting the agent browser..."
+    if (Port-Up 9222) {
+        Write-Host "[2/4] companion Edge :9222: already up"
+    } else {
+        Write-Host "[2/4] companion Edge :9222: starting (headless)"
+        try { & "$root\start_companion_edge.ps1" -Headless | Out-Null } catch { Write-Host "      (companion Edge launch returned: $_)" }
+    }
 
-# Bridge the rest of the cold-start gap: keep the splash up (BOUNDED) until a chat/cockpit
-# window actually appears, so it closes when the UI is really ready -- not the instant the
-# launchers fire. Capped at ~20s so it can never hang (e.g. exes not built yet).
-Set-SplashStatus $splash "Almost ready..."
-for ($i = 0; $i -lt 40; $i++) {
-    if (Get-Process CopilotChat, FleetCockpit -ErrorAction SilentlyContinue) { break }
-    Pump-Splash $splash
+    # 3) Bridge :9223 + chat backend (start_bridge -Keepalive). Skip if already up.
+    Set-SplashStatus $script:splash "Starting the chat bridge..."
+    if (Proc-Running 'start_bridge\.ps1') {
+        Write-Host "[3/4] bridge keepalive: already running"
+    } elseif (Http-Up "http://127.0.0.1:8765/conv") {
+        Write-Host "[3/4] bridge :8765: already serving (no keepalive supervisor, but up)"
+    } else {
+        Write-Host "[3/4] bridge: starting (headless keepalive)"
+        Start-Process powershell -WindowStyle Hidden -ArgumentList @(
+            "-NoProfile","-ExecutionPolicy","Bypass","-File","$root\start_bridge.ps1","-Keepalive")
+    }
+
+    # 4) WPF apps. Launch only if not already running; build them first if the exe is missing.
+    Set-SplashStatus $script:splash "Opening the chat and cockpit windows..."
+    foreach ($app in @("CopilotChat","FleetCockpit")) {
+        if (Get-Process $app -ErrorAction SilentlyContinue) {
+            Write-Host "[4/4] ${app}: already running"
+        } elseif (Test-Path "$root\ui\$app.exe") {
+            Write-Host "[4/4] ${app}: launching"
+            Start-Process "$root\ui\$app.exe"
+        } else {
+            Write-Host "[4/4] $app.exe not built yet -- run  ui\rebuild_ui.ps1  once, then re-run this."
+        }
+    }
+
+    Write-Host ""
+    Write-Host "Done. Chat UI: http://127.0.0.1:8765 (or the CopilotChat window). Fleet cockpit window is up."
+    Write-Host "If a one-time M365 sign-in is needed, a visible Edge window will appear -- sign in there."
+
+    # Keep the splash up (BOUNDED ~20s) until a chat/cockpit window actually appears, then enforce
+    # a minimum on-screen time so a fast (already-running) start is still seen, then let it close.
+    Set-SplashStatus $script:splash "Almost ready..."
+    for ($i = 0; $i -lt 40; $i++) {
+        if (Get-Process CopilotChat, FleetCockpit -ErrorAction SilentlyContinue) { break }
+        Pump-Splash $script:splash
+        Start-Sleep -Milliseconds 500
+    }
+    if ($script:splash) {
+        $rem = 2500 - ((Get-Date) - $script:splash.Start).TotalMilliseconds
+        while ($rem -gt 0) { Pump-Splash $script:splash; Start-Sleep -Milliseconds 80; $rem -= 80 }
+    }
+    Set-SplashStatus $script:splash "Ready."
     Start-Sleep -Milliseconds 500
 }
-Set-SplashStatus $splash "Ready."
-Start-Sleep -Milliseconds 800
-Stop-Splash $splash
+
+# Drive startup. Prefer a MODAL splash (reliable display -- the SAME mechanism as the update
+# dialog the user already sees) and run Invoke-Startup from a one-shot timer on its message loop,
+# so the window stays visible the whole time. If the splash can't be built/shown, run startup
+# directly so it is NEVER blocked.
+$script:splash = $null
+$ranViaSplash = $false
+try {
+    $script:splash = Start-Splash
+    if ($script:splash -and $script:splash.Form) {
+        $script:splash.Start = (Get-Date)
+        $timer = New-Object System.Windows.Forms.Timer
+        $timer.Interval = 80
+        $timer.Add_Tick({
+            $timer.Stop()
+            try { Invoke-Startup } catch { }
+            try { $script:splash.Form.Close() } catch { }
+        })
+        $timer.Start()
+        [void]$script:splash.Form.ShowDialog()
+        try { $script:splash.Form.Dispose() } catch { }
+        $ranViaSplash = $true
+    }
+} catch { $ranViaSplash = $false }
+if (-not $ranViaSplash) { $script:splash = $null; Invoke-Startup }
