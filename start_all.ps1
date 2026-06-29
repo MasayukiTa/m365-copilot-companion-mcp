@@ -93,20 +93,20 @@ function Check-ForUpdates {
         if (-not [int]::TryParse(($behindRaw | Select-Object -First 1), [ref]$behind)) { return }
         if ($behind -le 0) { return }   # already up to date -> no dialog
 
-        # 5) A short preview of the incoming commits.
-        $incoming = (& git -C $root log --oneline "HEAD..@{u}" 2>$null | Select-Object -First 8) -join "`n"
-        if ([string]::IsNullOrWhiteSpace($incoming)) { $incoming = "(commit list unavailable)" }
-
-        # 6) Ask the user (visible even though the host process is hidden).
+        # 5) Ask the user (visible even though the host process is hidden). Phrase the count as
+        #    "version(s)", NOT "commit(s)" -- commit jargon does not communicate to a general user.
         $title = "M365 Companion - Update available"
-        $body  = "Your copy is {0} commit(s) behind the latest.`n`nUpdate to the latest now?`n`nIncoming:`n{1}" -f $behind, $incoming
+        $verWord = "versions"
+        if ($behind -eq 1) { $verWord = "version" }
+        $body  = "Your copy is {0} {1} behind the latest.`n`nUpdate to the latest now?" -f $behind, $verWord
         $answer = Show-OwnedDialog $body $title "YesNo" "Information"
         if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
 
-        # 7) Pull fast-forward only.
-        $pullOut = (& git -C $root pull --ff-only 2>&1 | Out-String).Trim()
+        # 6) Pull fast-forward only. Keep the dialog jargon-free: no raw git output (it can carry
+        #    non-ASCII commit text and only confuses a general user).
+        & git -C $root pull --ff-only 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) {
-            Show-OwnedDialog ("Update failed (kept current version):`n{0}" -f $pullOut) $title "OK" "Warning" | Out-Null
+            Show-OwnedDialog "Update could not complete. Your current version is kept." $title "OK" "Warning" | Out-Null
             return
         }
 
@@ -125,7 +125,7 @@ function Check-ForUpdates {
             }
         } catch { $rebuildNote = "`n`nUI rebuild skipped (error)." }
 
-        Show-OwnedDialog ("Updated.`n{0}{1}" -f $pullOut, $rebuildNote) $title "OK" "Information" | Out-Null
+        Show-OwnedDialog ("Updated to the latest version.{0}" -f $rebuildNote) $title "OK" "Information" | Out-Null
     } catch {
         # Update check is best-effort only; never block startup.
         return
