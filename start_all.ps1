@@ -59,80 +59,75 @@ function Show-OwnedDialog([string]$body, [string]$title, [string]$buttons, [stri
 
 # ---------------------------------------------------------------------------
 # Startup splash -- a small "M365 Companion is starting..." window shown DURING the
-# few-second cold start so the wait has feedback instead of nothing. It runs on its OWN
-# STA runspace with its own message loop, so the marquee keeps animating even while this
-# script blocks (git fetch, port checks). Fully best-effort: any failure leaves $splash
-# = $null and every helper no-ops, so startup is NEVER blocked or broken. It has no X and
-# auto-closes (Stop-Splash, or a ~90s safety cap), so it can never hang or be closed by a
-# user onto a half-started stack.
+# few-second cold start so the wait has feedback. Rendered on THIS (main) thread with
+# .Show() + DoEvents -- the SAME path as the update dialog (which is known to display), so it
+# reliably appears (an earlier runspace version created the window but it never became
+# visible). Best-effort: any failure leaves $splash = $null and every helper no-ops, so
+# startup is NEVER blocked. No X (can't be closed onto a half-started stack), and a minimum
+# on-screen time so a fast (already-running) startup does not just flash by unseen.
 # ---------------------------------------------------------------------------
 function Start-Splash {
     try {
-        $sync = [hashtable]::Synchronized(@{ Status = "Starting M365 Companion..."; Close = $false })
-        $rs = [runspacefactory]::CreateRunspace()
-        $rs.ApartmentState = "STA"
-        $rs.ThreadOptions  = "ReuseThread"
-        $rs.Open()
-        $rs.SessionStateProxy.SetVariable("sync", $sync)
-        $ps = [powershell]::Create()
-        $ps.Runspace = $rs
-        [void]$ps.AddScript({
-            Add-Type -AssemblyName System.Windows.Forms | Out-Null
-            Add-Type -AssemblyName System.Drawing | Out-Null
-            $f = New-Object System.Windows.Forms.Form
-            $f.Text = "M365 Companion"
-            $f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
-            $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-            $f.ClientSize = New-Object System.Drawing.Size(440, 140)
-            $f.TopMost = $true
-            $f.ControlBox = $false
-            $f.MaximizeBox = $false
-            $f.MinimizeBox = $false
-            $title = New-Object System.Windows.Forms.Label
-            $title.Text = "M365 Companion"
-            $title.Font = New-Object System.Drawing.Font("Segoe UI", 13, [System.Drawing.FontStyle]::Bold)
-            $title.AutoSize = $true
-            $title.Location = New-Object System.Drawing.Point(22, 20)
-            $f.Controls.Add($title)
-            $status = New-Object System.Windows.Forms.Label
-            $status.Text = $sync.Status
-            $status.AutoSize = $false
-            $status.Size = New-Object System.Drawing.Size(396, 22)
-            $status.Location = New-Object System.Drawing.Point(24, 58)
-            $f.Controls.Add($status)
-            $bar = New-Object System.Windows.Forms.ProgressBar
-            $bar.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
-            $bar.MarqueeAnimationSpeed = 30
-            $bar.Size = New-Object System.Drawing.Size(396, 18)
-            $bar.Location = New-Object System.Drawing.Point(24, 92)
-            $f.Controls.Add($bar)
-            $script:ticks = 0
-            $timer = New-Object System.Windows.Forms.Timer
-            $timer.Interval = 200
-            $timer.Add_Tick({
-                $script:ticks++
-                $status.Text = $sync.Status
-                if ($sync.Close -or $script:ticks -gt 450) { $timer.Stop(); $f.Close() }
-            })
-            $timer.Start()
-            $f.Add_Shown({ $f.Activate() })
-            [System.Windows.Forms.Application]::Run($f)
-        })
-        $handle = $ps.BeginInvoke()
-        return @{ Sync = $sync; PS = $ps; RS = $rs; Handle = $handle }
+        Add-Type -AssemblyName System.Windows.Forms | Out-Null
+        Add-Type -AssemblyName System.Drawing | Out-Null
+        $f = New-Object System.Windows.Forms.Form
+        $f.Text = "M365 Companion"
+        $f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+        $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+        $f.ClientSize = New-Object System.Drawing.Size(440, 140)
+        $f.TopMost = $true
+        $f.ControlBox = $false
+        $f.MaximizeBox = $false
+        $f.MinimizeBox = $false
+        $title = New-Object System.Windows.Forms.Label
+        $title.Text = "M365 Companion"
+        $title.Font = New-Object System.Drawing.Font("Segoe UI", 13, [System.Drawing.FontStyle]::Bold)
+        $title.AutoSize = $true
+        $title.Location = New-Object System.Drawing.Point(22, 20)
+        $f.Controls.Add($title)
+        $status = New-Object System.Windows.Forms.Label
+        $status.Text = "Starting M365 Companion..."
+        $status.AutoSize = $false
+        $status.Size = New-Object System.Drawing.Size(396, 22)
+        $status.Location = New-Object System.Drawing.Point(24, 58)
+        $f.Controls.Add($status)
+        $bar = New-Object System.Windows.Forms.ProgressBar
+        $bar.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
+        $bar.MarqueeAnimationSpeed = 30
+        $bar.Size = New-Object System.Drawing.Size(396, 18)
+        $bar.Location = New-Object System.Drawing.Point(24, 92)
+        $f.Controls.Add($bar)
+        $f.Show()
+        $f.Activate()
+        $f.BringToFront()
+        [System.Windows.Forms.Application]::DoEvents()
+        return @{ Form = $f; Status = $status; Start = (Get-Date) }
     } catch { return $null }
 }
 function Set-SplashStatus($splash, [string]$text) {
-    try { if ($splash -and $splash.Sync) { $splash.Sync.Status = $text } } catch { }
+    try {
+        if ($splash -and $splash.Status) {
+            $splash.Status.Text = $text
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+    } catch { }
+}
+function Pump-Splash($splash) {
+    try { if ($splash -and $splash.Form) { [System.Windows.Forms.Application]::DoEvents() } } catch { }
 }
 function Stop-Splash($splash) {
     try {
-        if ($splash -and $splash.Sync) { $splash.Sync.Close = $true }
-        Start-Sleep -Milliseconds 450
-        if ($splash) {
-            try { $splash.PS.EndInvoke($splash.Handle) } catch { }
-            try { $splash.PS.Dispose() } catch { }
-            try { $splash.RS.Close(); $splash.RS.Dispose() } catch { }
+        if ($splash -and $splash.Form) {
+            # Keep it on screen a minimum ~2.5s so a fast (already-running) startup is still seen.
+            $remain = 2500 - ((Get-Date) - $splash.Start).TotalMilliseconds
+            while ($remain -gt 0) {
+                [System.Windows.Forms.Application]::DoEvents()
+                Start-Sleep -Milliseconds 80
+                $remain -= 80
+            }
+            $splash.Form.Close()
+            $splash.Form.Dispose()
+            [System.Windows.Forms.Application]::DoEvents()
         }
     } catch { }
 }
@@ -156,8 +151,13 @@ function Check-ForUpdates {
             & git -C $r fetch --quiet 2>$null
             $LASTEXITCODE
         } -ArgumentList $root
-        $done = Wait-Job $job -Timeout 15
-        if (-not $done) {
+        # Poll (not Wait-Job) so the splash stays painted/animated during the fetch.
+        $deadline = (Get-Date).AddSeconds(15)
+        while ($job.State -eq 'Running' -and (Get-Date) -lt $deadline) {
+            Pump-Splash $script:splash
+            Start-Sleep -Milliseconds 120
+        }
+        if ($job.State -eq 'Running') {
             try { Stop-Job $job -ErrorAction SilentlyContinue } catch { }
             try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch { }
             return
@@ -282,6 +282,7 @@ Write-Host "If a one-time M365 sign-in is needed, a visible Edge window will app
 Set-SplashStatus $splash "Almost ready..."
 for ($i = 0; $i -lt 40; $i++) {
     if (Get-Process CopilotChat, FleetCockpit -ErrorAction SilentlyContinue) { break }
+    Pump-Splash $splash
     Start-Sleep -Milliseconds 500
 }
 Set-SplashStatus $splash "Ready."
