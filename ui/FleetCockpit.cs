@@ -1170,6 +1170,7 @@ class CockpitWindow : Window
         // "/" affordance button on the left of the footer hint
         var slashBtn = new Button();
         slashBtn.Content = "/"; slashBtn.FontSize = 13; slashBtn.FontWeight = FontWeights.SemiBold;
+        slashBtn.Foreground = Muted;   // match the footer hint's muted tone (was defaulting to dark Fg)
         slashBtn.Cursor = Cursors.Hand;
         slashBtn.BorderThickness = new Thickness(0); slashBtn.Background = Brushes.Transparent;
         slashBtn.Padding = new Thickness(4, 0, 6, 0); slashBtn.VerticalAlignment = VerticalAlignment.Center;
@@ -1609,19 +1610,29 @@ class CockpitWindow : Window
     }
     string GoalHelpText()
     {
+        // Structured (short lines, each wraps cleanly) instead of one long paragraph whose tail
+        // was clipped at the popup's right edge. Commands, reasoning and approval are split out so
+        // no single line runs long enough to need the old fixed 520px width.
         if (_lang != 0)
-            return "Fleet goal-box commands:\n"
+            return "Commands\n"
                 + "/code <feature> - implement + pytest tests\n"
                 + "/fix <target> - fix a bug + verify\n"
                 + "/test <target> - add pytest tests\n"
-                + "/refactor <target> - tidy up without changing behavior\n"
+                + "/refactor <target> - tidy without changing behavior\n"
                 + "/doc <target> - write README / docs\n"
                 + "/review <target> - review and list issues\n"
                 + "/research <question> - deep research\n"
-                + "\nTop-bar settings:\n"
-                + "Reasoning = min/max/ultra/auto\n"
-                + "Approval = run/plan/auto (run=run now, plan=wait for plan approval, auto=plain fleet waits for plan approval; folder autonomy uses GO/ASK/STOP)";
-        return "フリート入力欄コマンド:\n"
+                + "\nReasoning (top bar)\n"
+                + "min - fastest, least reasoning\n"
+                + "max - deepest reasoning\n"
+                + "ultra - max + extra checks\n"
+                + "auto - pick per task\n"
+                + "\nApproval (top bar)\n"
+                + "run - run now\n"
+                + "plan - wait for plan approval\n"
+                + "auto - plain fleet waits for plan approval\n"
+                + "(folder autonomy uses GO / ASK / STOP)";
+        return "コマンド\n"
             + "/code <機能> - 実装と pytest テスト\n"
             + "/fix <対象> - 不具合修正と検証\n"
             + "/test <対象> - pytest テスト追加\n"
@@ -1629,9 +1640,16 @@ class CockpitWindow : Window
             + "/doc <対象> - README/説明を書く\n"
             + "/review <対象> - 問題点レビュー\n"
             + "/research <問い> - 深掘り調査\n"
-            + "\n上部設定:\n"
-            + "推論=min/max/ultra/auto\n"
-            + "承認=run/plan/auto（run=即実行、plan=計画承認待ち、auto=通常フリートは計画承認待ち、自律コーディング(フォルダ)はGO/ASK/STOPゲート）";
+            + "\n推論（上部設定）\n"
+            + "min - 最速・推論最小\n"
+            + "max - 最も深い推論\n"
+            + "ultra - max + 追加チェック\n"
+            + "auto - タスクに応じ自動\n"
+            + "\n承認（上部設定）\n"
+            + "run - 即実行\n"
+            + "plan - 計画承認待ち\n"
+            + "auto - 通常フリートは計画承認待ち\n"
+            + "（自律コーディング(フォルダ)は GO / ASK / STOP）";
     }
 
     // /help must NOT be dumped into the goal box (it turns the input into a giant scroll
@@ -1642,7 +1660,9 @@ class CockpitWindow : Window
         try
         {
             if (_goalInput == null) return;
-            if (_gcmdPopup != null) _gcmdPopup.IsOpen = false;
+            // Close every other floating popup/dropdown first (header settings/overflow/effort/
+            // approval + the slash palette) so help is the only one showing; keep help itself open.
+            CloseHeaderPopups("help");
 
             var txt = new TextBlock();
             txt.Text = GoalHelpText();
@@ -1664,8 +1684,12 @@ class CockpitWindow : Window
             border.Background = BtnBg;
             border.BorderBrush = Accent;
 
+            // No fixed Width (the old 520 clipped the long approval line at the right edge). Let the
+            // border size to content within a min/max band; each line wraps (txt.TextWrapping=Wrap).
+            border.MinWidth = 360;
+            border.MaxWidth = 560;
             if (_helpPopup == null)
-                _helpPopup = new Popup { PlacementTarget = _goalInput, Placement = PlacementMode.Top, StaysOpen = false, Width = 520 };
+                _helpPopup = new Popup { PlacementTarget = _goalInput, Placement = PlacementMode.Top, StaysOpen = false };
             _helpPopup.Child = border;
             _helpPopup.IsOpen = true;
         }
@@ -1873,13 +1897,19 @@ class CockpitWindow : Window
         body.Children.Add(directiveBorder);
         body.Children.Add(makeRule());
 
-        // ── 2. Scope [REAL] ───────────────────────────────────────────────────────
-        body.Children.Add(makeSectionLabel(ja ? "範囲 / Scope" : "Scope / 範囲"));
+        // ── 2. Scope [参考 / not enforced] ────────────────────────────────────────
+        // The folder Scope is INFORMATIONAL only. tools/contract_gate.py keeps it on the contract
+        // for context, but check_op() inspects op_class alone -- it never tests whether a path is
+        // inside this folder -- so the folder boundary is NOT enforced. Label it honestly so the
+        // dialog doesn't imply a guard that doesn't exist (op-class gate below stays [REAL]).
+        body.Children.Add(makeSectionLabel(ja ? "作業対象 / Target" : "Target / 作業対象"));
         body.Children.Add(makeValue(folder));
         var scopeTag = new TextBlock();
-        scopeTag.Text = "[REAL]";
+        scopeTag.Text = ja ? "[参考表示 — フォルダ境界は強制されません / not enforced]"
+                           : "[reference only — folder boundary not enforced / 参考]";
         scopeTag.FontSize = 10;
         scopeTag.Foreground = Theme.Br(Theme.Faint(_dark));
+        scopeTag.TextWrapping = TextWrapping.Wrap;
         scopeTag.Margin = new Thickness(0, 1, 0, 0);
         body.Children.Add(scopeTag);
         body.Children.Add(makeRule());
@@ -2868,11 +2898,21 @@ class CockpitWindow : Window
     // also drop a stale "paused" state so the label can never sit on "Resume" over a dead/absent run.
     void RefreshPauseEnabled(Dictionary<string, object> root)
     {
-        if (_pauseBtn == null) return;
         bool live = Liveness(root) == 1;
-        _pauseBtn.IsEnabled = live;
-        _pauseBtn.Opacity = live ? 1.0 : 0.5;
-        if (!live && _paused) { _paused = false; PaintPause(); }
+        if (_pauseBtn != null)
+        {
+            _pauseBtn.IsEnabled = live;
+            _pauseBtn.Opacity = live ? 1.0 : 0.5;
+            if (!live && _paused) { _paused = false; PaintPause(); }
+        }
+        // Codex P2 ④: Stop is a strong action; when no run is live it should read as inert, not
+        // "still need to stop something?". Disable + dim it (re-enabled the moment a run goes live).
+        if (_stopBtn != null)
+        {
+            _stopBtn.IsEnabled = live;
+            _stopBtn.Opacity = live ? 1.0 : 0.5;
+            _stopBtn.Cursor = live ? Cursors.Hand : Cursors.Arrow;
+        }
     }
 
     // MaxTabsStepper() removed: the 開始(デフォルト) stepper now lives only in the settings panel
@@ -3453,6 +3493,11 @@ class CockpitWindow : Window
         if (except != "overflow" && _overflowPopup != null) _overflowPopup.IsOpen = false;
         if (except != "effort" && _effortBox != null) _effortBox.IsDropDownOpen = false;
         if (except != "approval" && _approvalBox != null) _approvalBox.IsDropDownOpen = false;
+        // The /help popup is a separate HWND that used to linger when a header popup opened. Fold it
+        // into the same one-at-a-time close path (plus the slash-command palette) so opening
+        // settings/overflow/effort/approval also dismisses help, and vice versa.
+        if (except != "help" && _helpPopup != null) _helpPopup.IsOpen = false;
+        if (except != "slash" && _gcmdPopup != null) _gcmdPopup.IsOpen = false;
     }
 
     // Update the "N workers" chip text.  liveCount = 0 when idle (falls back to maxtabs).
@@ -3637,7 +3682,7 @@ class CockpitWindow : Window
             {
                 _lastRoot = null;
                 var rows = new List<object>();
-                AppendHistoryRows(rows);   // history header + rows, if any
+                AppendHistoryRows(rows, null);   // idle: no live run on board -> show all history
                 if (rows.Count == 0) rows.Add(MkRow(5, null, null));   // empty state when nothing to show
                 SetRows(rows);
                 _lastSig = isig;
@@ -4058,21 +4103,38 @@ class CockpitWindow : Window
             foreach (Dictionary<string, object> w in shown)
                 rows.Add(MkRow(1, w, null));          // one card per worker
         }
-        AppendHistoryRows(rows);
+        // ③ Dedup: a terminal worker is archived into history the moment it finishes, but its card
+        // also stays ON-BOARD (in `完了`) until the user moves it to History. During that window the
+        // same started#name shows in BOTH places. Compute the on-board key set and skip history rows
+        // that match it -- so a finished task appears once (on board) and only drops into History
+        // once it actually leaves the board (すべて履歴へ / →履歴).
+        var onBoardKeys = new System.Collections.Generic.HashSet<string>();
+        foreach (Dictionary<string, object> bw in onBoard)
+            onBoardKeys.Add(WorkerKey(startedRoot, bw));
+        AppendHistoryRows(rows, onBoardKeys);
         return rows;
     }
 
     // Append a history-header row + one history row per entry (newest first) to the row model.
-    void AppendHistoryRows(List<object> rows)
+    void AppendHistoryRows(List<object> rows, System.Collections.Generic.HashSet<string> onBoardKeys)
     {
         if (_history.Count == 0) return;
-        rows.Add(MkRow(2, null, null));               // history header
+        // ③ Build the visible (deduped) entry list first: skip any history entry whose key
+        // (started#name) is still ON-BOARD, so the same finished task is not shown twice.
+        var visible = new List<Dictionary<string, object>>();
         for (int i = _history.Count - 1; i >= 0; i--)
         {
             var e = _history[i] as Dictionary<string, object>;
             if (e == null) continue;
-            rows.Add(MkRow(3, null, e));             // one history row per entry
+            string ek = S(e, "key");
+            if (onBoardKeys != null && !string.IsNullOrEmpty(ek) && onBoardKeys.Contains(ek))
+                continue;   // still on the board -> don't duplicate it in History
+            visible.Add(e);
         }
+        if (visible.Count == 0) return;               // everything is still on-board -> no History section yet
+        rows.Add(MkRow(2, null, null));               // history header
+        foreach (Dictionary<string, object> e in visible)
+            rows.Add(MkRow(3, null, e));             // one history row per visible entry
     }
 
     // Build one row model and freeze its render signature (so SetRows can diff old-vs-new rows
@@ -4091,8 +4153,12 @@ class CockpitWindow : Window
         string g = (_dark ? "D" : "L") + _lang.ToString();   // theme/lang re-chrome every row
         switch (kind)
         {
-            case 0:  // toolbar: reflects global counts + the local control state it renders
+            case 0:  // toolbar: reflects per-category counts (same helper the toolbar renders from,
+                     // so a status-only reclassification like pending->done flips the signature)
+                int[] tc0 = ToolbarCounts(_toolbarAll);
                 return "T|" + g + "|" + _toolbarShown.Count + "/" + _toolbarAll.Count
+                       + "|all" + tc0[0] + ":act" + tc0[1] + ":need" + tc0[2] + ":done" + tc0[3]
+                       + ":max" + tc0[5] + ":bad" + tc0[6] + ":hid" + tc0[7]
                        + "|ar" + (_autoRetry ? 1 : 0) + ":" + _autoRetryMax + "|f" + _cardFilter;
             case 2: return "HH|" + g;                          // history header (static chrome)
             case 4: return "DV|" + g;                          // "完了 (this run)" divider
@@ -4111,7 +4177,8 @@ class CockpitWindow : Window
                 string nm = S(w, "name");
                 var sb = new StringBuilder("c|");
                 sb.Append(g).Append('|').Append(nm)
-                  .Append(S(w, "status")).Append(S(w, "turn")).Append(S(w, "outcome"));
+                  .Append(S(w, "status")).Append(S(w, "turn")).Append(S(w, "outcome"))
+                  .Append(S(w, "closed"));   // closed flips the left rail to neutral -> must re-render
                 // The collapsed card now shows a result line + meta (turn/reviews/verified), so its
                 // signature must track `last`/reviews/verified too -- otherwise the at-a-glance line
                 // would freeze while the worker streams. Hash (not length) catches same-length content changes.
@@ -4379,6 +4446,40 @@ class CockpitWindow : Window
     }
 
 
+    // Single source of truth for the toolbar's per-category counts. Returns an int[] so both the
+    // toolbar render (BuildCardToolbar) and the row signature (RowSig) use IDENTICAL arithmetic --
+    // otherwise a status-only change (pending->done) that keeps cntAll constant would not flip the
+    // signature and the toolbar would render stale counts until the next forced re-render.
+    // Index map: [0]=cntAll [1]=cntActive [2]=cntNeeds [3]=cntDone [4]=doneN [5]=maxN [6]=badN
+    //            [7]=hiddenTerminal (terminal cards moved to History, excluded above -- folding this
+    //            into the signature makes "send to history" also re-render the toolbar).
+    int[] ToolbarCounts(List<Dictionary<string, object>> all)
+    {
+        int cntAll = 0, cntActive = 0, cntNeeds = 0, cntDone = 0;
+        int doneN = 0, maxN = 0, badN = 0, hiddenTerminal = 0;
+        string startedRootTb = _lastRoot != null ? S(_lastRoot, "started") : "";
+        if (all != null)
+        {
+            foreach (Dictionary<string, object> w in all)
+            {
+                if (_hiddenKeys.Count > 0 && IsTerminalWorker(w) && _hiddenKeys.Contains(WorkerKey(startedRootTb, w)))
+                {
+                    hiddenTerminal++;
+                    continue;   // moved to History -- not on the board, don't count
+                }
+                cntAll++;
+                string oc = S(w, "outcome");
+                string st = S(w, "status");
+                if (oc == "DONE") { doneN++; cntDone++; }
+                else if (oc == "MAXTURNS") maxN++;
+                else if (oc == "STUCK" || oc == "ERROR" || oc == "CANCELLED") badN++;
+                if (st == "awaiting") cntNeeds++;
+                if (!IsTerminalWorker(w) && st != "pending") cntActive++;
+            }
+        }
+        return new int[] { cntAll, cntActive, cntNeeds, cntDone, doneN, maxN, badN, hiddenTerminal };
+    }
+
     UIElement BuildCardToolbar(List<Dictionary<string, object>> all,
                                List<Dictionary<string, object>> shown)
     {
@@ -4386,23 +4487,11 @@ class CockpitWindow : Window
         // the user moved to History (_hiddenKeys). We don't use `shown` because that is also
         // narrowed by the active filter; we want totals-per-category independent of the filter,
         // but a card moved to History must not be counted (else "all 1 / done 1" persists after
-        // everything was sent to history). Mirror BuildRows' exact hide rule.
-        int cntAll = 0, cntActive = 0, cntNeeds = 0, cntDone = 0;
-        int doneN = 0, maxN = 0, badN = 0;
-        string startedRootTb = _lastRoot != null ? S(_lastRoot, "started") : "";
-        foreach (Dictionary<string, object> w in all)
-        {
-            if (_hiddenKeys.Count > 0 && IsTerminalWorker(w) && _hiddenKeys.Contains(WorkerKey(startedRootTb, w)))
-                continue;   // moved to History -- not on the board, don't count
-            cntAll++;
-            string oc = S(w, "outcome");
-            string st = S(w, "status");
-            if (oc == "DONE") { doneN++; cntDone++; }
-            else if (oc == "MAXTURNS") maxN++;
-            else if (oc == "STUCK" || oc == "ERROR" || oc == "CANCELLED") badN++;
-            if (st == "awaiting") cntNeeds++;
-            if (!IsTerminalWorker(w) && st != "pending") cntActive++;
-        }
+        // everything was sent to history). Counts come from the shared ToolbarCounts() helper so
+        // the render and RowSig can never diverge.
+        int[] tc = ToolbarCounts(all);
+        int cntAll = tc[0], cntActive = tc[1], cntNeeds = tc[2], cntDone = tc[3];
+        int doneN = tc[4], maxN = tc[5], badN = tc[6];
 
         var bar = new Border();
         bar.BorderThickness = new Thickness(1); bar.BorderBrush = Border;
@@ -4790,6 +4879,23 @@ class CockpitWindow : Window
             g.Margin = new Thickness(0, 6, 0, 2);
             SwallowMouseUp(g);
             col.Children.Add(g);
+
+            // ④ Per-worker timeline on a PAST task too. The archive entry carries no phase_events,
+            // so BuildTimelineEvents falls back to the on-disk transcript (started#name jsonl) the
+            // same way a live card's Overview timeline does -- giving completed/history rows their
+            // own compact vertical timeline when expanded, not just the currently-running ones.
+            string htpath = S(e, "transcript");
+            string houtcome = S(e, "outcome");
+            int hreviews = I(e, "verify_attempts");   // absent on archive entry -> 0 (review line omitted)
+            var hEvents = BuildTimelineEvents(htpath, houtcome, true, hreviews, e);
+            if (hEvents != null && hEvents.Count > 0)
+            {
+                col.Children.Add(SectLabel(_lang == 0 ? "タイムライン" : "Timeline"));
+                foreach (string ev in hEvents)
+                    col.Children.Add(new TextBlock {
+                        Text = "・" + ev, Foreground = Muted, FontSize = 12,
+                        Margin = new Thickness(0, 1, 0, 1), TextWrapping = TextWrapping.Wrap });
+            }
         }
 
         row.Child = col;
@@ -4853,6 +4959,13 @@ class CockpitWindow : Window
 
         string railKind = closed ? "neutral" : Theme.StatusRail(status);
         Brush statusBrush = Theme.Br(Theme.RailColor(railKind, _dark));
+        // Chip color is computed SEPARATELY from the left rail. A completed worker that has been
+        // released (closed) keeps status=="done"/outcome=="DONE", but `railKind` above forces neutral
+        // (grey) for the rail. The chip, however, must match the History row's done chip
+        // (Theme.StatusRail("done")=="success", green) so "完了" is the same green in both places.
+        // We therefore base chipKind on the status (with an explicit DONE override), not on `closed`.
+        bool isDone = status == "done" || string.Equals(S(w, "outcome"), "DONE", StringComparison.OrdinalIgnoreCase);
+        string chipKind = isDone ? "success" : Theme.StatusRail(status);
 
         // Pass A2-1 TASK 1: demote the collapsed row to a LEDGER ROW.
         // - No rounded corners, no card background fill, no full border.
@@ -4939,7 +5052,7 @@ class CockpitWindow : Window
         // left cluster: chevron + status chip, then the title fills the rest (1 line, ellipsis)
         var left = new DockPanel { LastChildFill = true };
         var chev = ChevronToggle(name, isOpen); DockPanel.SetDock(chev, Dock.Left); left.Children.Add(chev);
-        var chip = Pill(Theme.StatusLabel(status, _lang), railKind);
+        var chip = Pill(Theme.StatusLabel(status, _lang), chipKind);
         chip.Margin = new Thickness(2, 0, 5, 0);
         DockPanel.SetDock(chip, Dock.Left); left.Children.Add(chip);
         string headline = CardTitle(convTitle, goal);

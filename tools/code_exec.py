@@ -24,6 +24,13 @@ def run_python(
 ) -> str:
     """Run Python code in a temporary file and return stdout, stderr, and return code.
 
+    NOT a sandbox. Under an active autonomy contract, destructive file ops in the
+    source (os.remove/unlink/rmdir, shutil.rmtree/move, pathlib unlink/rmdir,
+    truncating open(...,'w'), and os.system/subprocess escape hatches) are routed
+    through the contract gate (op_class 'shell_destructive') for approval — this is
+    detection-based, so it can miss obfuscated code. Treat run_python as not fully
+    sandboxed when granting long-running autonomy.
+
     Args:
         code: Python source code to execute.
         timeout: Maximum execution time in seconds.
@@ -33,7 +40,10 @@ def run_python(
     if locked:
         return locked
     from . import contract_gate as _cg
-    if _cg.destructive_shell(code):
+    # Gate destructive ops whether expressed as shell text OR as Python source. Both are
+    # routed through the existing 'shell_destructive' op_class so any contract that already
+    # asks-before destructive shell also covers destructive Python (no schema change needed).
+    if _cg.destructive_shell(code) or _cg.destructive_python(code):
         _g = _cg.check_op("shell_destructive", code[:200])
         if _g is not None:
             return _g
