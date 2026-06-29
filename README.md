@@ -596,9 +596,9 @@ git clone https://github.com/MasayukiTa/m365-copilot-companion-mcp.git
 $startup = [Environment]::GetFolderPath('Startup')
 $root    = (Get-Location).Path
 @"
-@echo off
-powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "$root\supervisor.ps1"
-"@ | Set-Content -Encoding ASCII (Join-Path $startup "start-companion-supervisor.cmd")
+Set sh = CreateObject("WScript.Shell")
+sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$root\supervisor.ps1""", 0, False
+"@ | Set-Content -Encoding ASCII (Join-Path $startup "start-companion-supervisor.vbs")
 ```
 
 > `--allow-anonymous` でも安全な理由: サーバーが **Bearer API キー（`MCP_API_KEY`）** で認証しているため、URL を当てずっぽうで叩いた人・bot は即 401 になります。
@@ -964,9 +964,9 @@ powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass `
 $startup = [Environment]::GetFolderPath('Startup')
 $root = (Get-Location).Path
 @"
-@echo off
-powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "$root\supervisor.ps1" -TunnelName <あなたのトンネル名>
-"@ | Set-Content -Encoding ASCII (Join-Path $startup "start-companion-supervisor.cmd")
+Set sh = CreateObject("WScript.Shell")
+sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$root\supervisor.ps1"" -TunnelName <あなたのトンネル名>", 0, False
+"@ | Set-Content -Encoding ASCII (Join-Path $startup "start-companion-supervisor.vbs")
 ```
 
 これで再起動・スリープ復帰後もログオン時に supervisor が立ち上がり、サーバー＋トンネルを
@@ -1826,9 +1826,9 @@ folder**:
 $startup = [Environment]::GetFolderPath('Startup')
 $root = (Get-Location).Path
 @"
-@echo off
-powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "$root\supervisor.ps1" -TunnelName <your-tunnel-name>
-"@ | Set-Content -Encoding ASCII (Join-Path $startup "start-companion-supervisor.cmd")
+Set sh = CreateObject("WScript.Shell")
+sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$root\supervisor.ps1"" -TunnelName <your-tunnel-name>", 0, False
+"@ | Set-Content -Encoding ASCII (Join-Path $startup "start-companion-supervisor.vbs")
 ```
 
 It then comes back after reboot / sleep-wake at logon and revives the
