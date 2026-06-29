@@ -120,9 +120,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0start_all.ps1"
 
 echo.
 echo ===========================================================================
-echo  Putting a one-click launcher on your Desktop...
+echo  Desktop launcher  (optional, recommended)
 echo ===========================================================================
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0make_desktop_shortcut.ps1"
+set /p MKLNK="   Create a one-click 'M365 Companion' launcher on your Desktop? [Y/n] "
+if /i "!MKLNK!"=="n" (
+    echo   Skipped. You can create it later by running make_desktop_shortcut.ps1
+) else (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0make_desktop_shortcut.ps1"
+)
 
 echo.
 echo ===========================================================================

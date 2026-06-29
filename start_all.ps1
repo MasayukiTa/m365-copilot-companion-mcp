@@ -34,6 +34,107 @@ function Env-Value([string]$key) {
     return ""
 }
 
+function Show-OwnedDialog([string]$body, [string]$title, [string]$buttons, [string]$icon) {
+    # Show a MessageBox that is guaranteed to appear in front, even when this script
+    # runs hidden (window=0 from the vbs launcher). We parent the box on a TopMost owner
+    # form so it is not lost behind other windows. Returns the DialogResult.
+    Add-Type -AssemblyName System.Windows.Forms | Out-Null
+    Add-Type -AssemblyName System.Drawing | Out-Null
+    $owner = New-Object System.Windows.Forms.Form
+    $owner.TopMost = $true
+    $owner.ShowInTaskbar = $false
+    $owner.StartPosition = "CenterScreen"
+    $owner.Width = 1; $owner.Height = 1
+    $owner.Opacity = 0
+    try {
+        $owner.Show()
+        $owner.Activate()
+        $btn = [System.Windows.Forms.MessageBoxButtons]::$buttons
+        $ico = [System.Windows.Forms.MessageBoxIcon]::$icon
+        return [System.Windows.Forms.MessageBox]::Show($owner, $body, $title, $btn, $ico)
+    } finally {
+        try { $owner.Close(); $owner.Dispose() } catch { }
+    }
+}
+
+function Check-ForUpdates {
+    # Non-fatal pre-flight: if the local checkout is behind the remote, offer to update.
+    # Any failure (no git, no upstream, offline, auth needed, fetch timeout, pull fail)
+    # is swallowed so daily startup is NEVER blocked. Runs once, before services start.
+    try {
+        # 1) Must be a git work tree.
+        & git -C $root rev-parse --is-inside-work-tree 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { return }
+
+        # 2) Never let git prompt for credentials (would hang the hidden process).
+        $env:GIT_TERMINAL_PROMPT = '0'
+
+        # 3) Fetch with a hard timeout via a background job. Offline/auth/slow -> give up quietly.
+        $job = Start-Job -ScriptBlock {
+            param($r)
+            $env:GIT_TERMINAL_PROMPT = '0'
+            & git -C $r fetch --quiet 2>$null
+            $LASTEXITCODE
+        } -ArgumentList $root
+        $done = Wait-Job $job -Timeout 15
+        if (-not $done) {
+            try { Stop-Job $job -ErrorAction SilentlyContinue } catch { }
+            try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch { }
+            return
+        }
+        $fetchExit = Receive-Job $job
+        try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch { }
+        if ($fetchExit -ne 0) { return }
+
+        # 4) How many commits behind upstream? Upstream unset -> fails -> return.
+        $behindRaw = & git -C $root rev-list --count "HEAD..@{u}" 2>$null
+        if ($LASTEXITCODE -ne 0) { return }
+        $behind = 0
+        if (-not [int]::TryParse(($behindRaw | Select-Object -First 1), [ref]$behind)) { return }
+        if ($behind -le 0) { return }   # already up to date -> no dialog
+
+        # 5) A short preview of the incoming commits.
+        $incoming = (& git -C $root log --oneline "HEAD..@{u}" 2>$null | Select-Object -First 8) -join "`n"
+        if ([string]::IsNullOrWhiteSpace($incoming)) { $incoming = "(commit list unavailable)" }
+
+        # 6) Ask the user (visible even though the host process is hidden).
+        $title = "M365 Companion - Update available"
+        $body  = "Your copy is {0} commit(s) behind the latest.`n`nUpdate to the latest now?`n`nIncoming:`n{1}" -f $behind, $incoming
+        $answer = Show-OwnedDialog $body $title "YesNo" "Information"
+        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+        # 7) Pull fast-forward only.
+        $pullOut = (& git -C $root pull --ff-only 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0) {
+            Show-OwnedDialog ("Update failed (kept current version):`n{0}" -f $pullOut) $title "OK" "Warning" | Out-Null
+            return
+        }
+
+        # 7b) If the pull changed any ui/*.cs, rebuild the UI exes (non-fatal if it fails).
+        $rebuildNote = ""
+        try {
+            $changed = & git -C $root diff --name-only "HEAD@{1}" HEAD 2>$null
+            $uiTouched = $changed | Where-Object { $_ -match '^ui/.*\.cs$' }
+            if ($uiTouched) {
+                $rebuildScript = Join-Path $root "ui\rebuild_ui.ps1"
+                if (Test-Path $rebuildScript) {
+                    & $rebuildScript | Out-Null
+                    if ($LASTEXITCODE -eq 0) { $rebuildNote = "`n`nUI rebuilt." }
+                    else { $rebuildNote = "`n`nUI rebuild reported an error (will use existing exe)." }
+                }
+            }
+        } catch { $rebuildNote = "`n`nUI rebuild skipped (error)." }
+
+        Show-OwnedDialog ("Updated.`n{0}{1}" -f $pullOut, $rebuildNote) $title "OK" "Information" | Out-Null
+    } catch {
+        # Update check is best-effort only; never block startup.
+        return
+    }
+}
+
+# Pre-flight update check (best-effort, non-blocking). Runs once before any service starts.
+Check-ForUpdates
+
 Write-Host "=== Daily startup (idempotent -- already-running parts are left as-is) ==="
 
 # 1) Supervisor = MCP server + Dev Tunnel host. Its own global mutex makes a second instance exit
