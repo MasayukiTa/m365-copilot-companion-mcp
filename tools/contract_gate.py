@@ -143,6 +143,56 @@ def destructive_shell(cmd_text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Destructive Python-source matcher
+# ---------------------------------------------------------------------------
+
+# run_python() executes ARBITRARY Python, so a destructive_shell() regex over the
+# source text misses the Python-native ways to wreck files: os.remove/unlink/rmdir,
+# shutil.rmtree/move, pathlib Path.unlink/rmdir, os.truncate, truncating/appending
+# open(...,'w'|'a'|'x'|...), and the escape hatches os.system / subprocess.* which can
+# run any destructive command and so bypass BOTH this and the shell gate.
+#
+# IMPORTANT: this is DETECTION-BASED, not a sandbox. It errs toward asking (safety),
+# while letting plainly read-only code through (open(...,'r'), prints, pure compute).
+_PY_DESTRUCTIVE_PATTERNS = [
+    re.compile(r"\bos\.remove\s*\("),
+    re.compile(r"\bos\.unlink\s*\("),
+    re.compile(r"\bos\.rmdir\s*\("),
+    re.compile(r"\bos\.removedirs\s*\("),
+    re.compile(r"\bos\.truncate\s*\("),
+    re.compile(r"\bos\.rename\s*\("),
+    re.compile(r"\bos\.replace\s*\("),
+    re.compile(r"\bshutil\.rmtree\s*\("),
+    re.compile(r"\bshutil\.move\s*\("),
+    re.compile(r"\.unlink\s*\("),                 # pathlib Path.unlink()
+    re.compile(r"\.rmdir\s*\("),                  # pathlib Path.rmdir()
+    re.compile(r"\.write_text\s*\("),             # pathlib Path.write_text()
+    re.compile(r"\.write_bytes\s*\("),            # pathlib Path.write_bytes()
+    # open(path, <mode containing w/a/x/+>) -- the MODE is the 2nd arg, so a filename
+    # like open('write.txt') (1 arg, default 'r') does NOT match.
+    re.compile(r"open\s*\([^,)]+,\s*(?:mode\s*=\s*)?['\"][rbt]*[wax+][rbtwax+]*['\"]"),
+    # escape hatches: can run arbitrary (incl. destructive) commands, bypassing detection
+    re.compile(r"\bos\.system\s*\("),
+    re.compile(r"\bsubprocess\.(?:run|call|Popen|check_call|check_output)\s*\("),
+]
+
+
+def destructive_python(code_text: str) -> bool:
+    """Return True for Python source that performs (or can perform) destructive file ops.
+
+    Detection-based, NOT a sandbox. Catches os/shutil/pathlib deletes + truncating writes
+    + os.system/subprocess escape hatches; lets read-only code (open(...,'r'), print,
+    compute) pass. Used by run_python() to route such code through the contract gate.
+    """
+    if not code_text:
+        return False
+    for pat in _PY_DESTRUCTIVE_PATTERNS:
+        if pat.search(code_text):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Stable token derivation
 # ---------------------------------------------------------------------------
 
