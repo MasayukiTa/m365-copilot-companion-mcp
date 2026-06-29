@@ -70,6 +70,15 @@ function Start-Splash {
     try {
         Add-Type -AssemblyName System.Windows.Forms | Out-Null
         Add-Type -AssemblyName System.Drawing | Out-Null
+        # A WinForms Form created in a wscript-launched / -WindowStyle Hidden (SW_HIDE) powershell
+        # inherits the hidden show-state and never becomes visible -- a native MessageBox does NOT
+        # (that's why the update dialog shows but this form would not). Force it visible from Add_Shown.
+        try {
+            Add-Type -Namespace M365 -Name SplashWin -MemberDefinition @"
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+"@
+        } catch { }
         $f = New-Object System.Windows.Forms.Form
         $f.Text = "M365 Companion"
         $f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
@@ -97,7 +106,13 @@ function Start-Splash {
         $bar.Size = New-Object System.Drawing.Size(396, 18)
         $bar.Location = New-Object System.Drawing.Point(24, 92)
         $f.Controls.Add($bar)
-        $f.Add_Shown({ try { $f.Activate(); $f.BringToFront() } catch { } })
+        # Use $this (the event's form), NOT $f: Start-Splash is a function, so its local $f is gone
+        # by the time Add_Shown fires from ShowDialog() in the driver -- $this is the live form.
+        $f.Add_Shown({
+            try { [M365.SplashWin]::ShowWindow($this.Handle, 5) | Out-Null } catch { }   # SW_SHOW
+            try { [M365.SplashWin]::SetForegroundWindow($this.Handle) | Out-Null } catch { }
+            try { $this.Activate(); $this.BringToFront() } catch { }
+        })
         return @{ Form = $f; Status = $status; Start = (Get-Date) }
     } catch { return $null }
 }
