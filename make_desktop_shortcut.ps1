@@ -8,9 +8,13 @@ $ErrorActionPreference = "Stop"
 $repo = $PSScriptRoot
 if (-not $repo) { $repo = Split-Path -Parent $MyInvocation.MyCommand.Path }
 
-$target = Join-Path $repo "start_all.bat"
+# Point at the WINDOWLESS launcher (start_all_hidden.vbs, run via wscript) so a double-click
+# shows NO cmd/console window -- there is nothing for a user to accidentally close. Fall back to
+# start_all.bat only if the .vbs is missing (older checkout).
+$target = Join-Path $repo "start_all_hidden.vbs"
+if (-not (Test-Path $target)) { $target = Join-Path $repo "start_all.bat" }
 if (-not (Test-Path $target)) {
-    Write-Host "start_all.bat not found next to this script -- nothing to link." -ForegroundColor Yellow
+    Write-Host "No launcher (start_all_hidden.vbs / start_all.bat) found -- nothing to link." -ForegroundColor Yellow
     return
 }
 
@@ -19,7 +23,15 @@ $lnk = Join-Path $desktop "M365 Companion.lnk"
 try {
     $ws = New-Object -ComObject WScript.Shell
     $sc = $ws.CreateShortcut($lnk)
-    $sc.TargetPath = $target
+    # A .vbs target must launch via wscript.exe (windowless): set TargetPath=wscript and pass the
+    # .vbs as the argument, so a double-click never shows a console and never prompts "how do you
+    # want to open this". A .bat fallback is launched directly.
+    if ($target.ToLower().EndsWith(".vbs")) {
+        $sc.TargetPath = (Join-Path $env:SystemRoot "System32\wscript.exe")
+        $sc.Arguments  = '"' + $target + '"'
+    } else {
+        $sc.TargetPath = $target
+    }
     $sc.WorkingDirectory = $repo
     $sc.IconLocation = "$env:SystemRoot\System32\shell32.dll,13"
     $sc.Description = "Start the M365 Copilot companion (server + Dev Tunnel + Edge + chat/cockpit)"
