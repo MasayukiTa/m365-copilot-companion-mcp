@@ -57,6 +57,86 @@ function Show-OwnedDialog([string]$body, [string]$title, [string]$buttons, [stri
     }
 }
 
+# ---------------------------------------------------------------------------
+# Startup splash -- a small "M365 Companion is starting..." window shown DURING the
+# few-second cold start so the wait has feedback instead of nothing. It runs on its OWN
+# STA runspace with its own message loop, so the marquee keeps animating even while this
+# script blocks (git fetch, port checks). Fully best-effort: any failure leaves $splash
+# = $null and every helper no-ops, so startup is NEVER blocked or broken. It has no X and
+# auto-closes (Stop-Splash, or a ~90s safety cap), so it can never hang or be closed by a
+# user onto a half-started stack.
+# ---------------------------------------------------------------------------
+function Start-Splash {
+    try {
+        $sync = [hashtable]::Synchronized(@{ Status = "Starting M365 Companion..."; Close = $false })
+        $rs = [runspacefactory]::CreateRunspace()
+        $rs.ApartmentState = "STA"
+        $rs.ThreadOptions  = "ReuseThread"
+        $rs.Open()
+        $rs.SessionStateProxy.SetVariable("sync", $sync)
+        $ps = [powershell]::Create()
+        $ps.Runspace = $rs
+        [void]$ps.AddScript({
+            Add-Type -AssemblyName System.Windows.Forms | Out-Null
+            Add-Type -AssemblyName System.Drawing | Out-Null
+            $f = New-Object System.Windows.Forms.Form
+            $f.Text = "M365 Companion"
+            $f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+            $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+            $f.ClientSize = New-Object System.Drawing.Size(440, 140)
+            $f.TopMost = $true
+            $f.ControlBox = $false
+            $f.MaximizeBox = $false
+            $f.MinimizeBox = $false
+            $title = New-Object System.Windows.Forms.Label
+            $title.Text = "M365 Companion"
+            $title.Font = New-Object System.Drawing.Font("Segoe UI", 13, [System.Drawing.FontStyle]::Bold)
+            $title.AutoSize = $true
+            $title.Location = New-Object System.Drawing.Point(22, 20)
+            $f.Controls.Add($title)
+            $status = New-Object System.Windows.Forms.Label
+            $status.Text = $sync.Status
+            $status.AutoSize = $false
+            $status.Size = New-Object System.Drawing.Size(396, 22)
+            $status.Location = New-Object System.Drawing.Point(24, 58)
+            $f.Controls.Add($status)
+            $bar = New-Object System.Windows.Forms.ProgressBar
+            $bar.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
+            $bar.MarqueeAnimationSpeed = 30
+            $bar.Size = New-Object System.Drawing.Size(396, 18)
+            $bar.Location = New-Object System.Drawing.Point(24, 92)
+            $f.Controls.Add($bar)
+            $script:ticks = 0
+            $timer = New-Object System.Windows.Forms.Timer
+            $timer.Interval = 200
+            $timer.Add_Tick({
+                $script:ticks++
+                $status.Text = $sync.Status
+                if ($sync.Close -or $script:ticks -gt 450) { $timer.Stop(); $f.Close() }
+            })
+            $timer.Start()
+            $f.Add_Shown({ $f.Activate() })
+            [System.Windows.Forms.Application]::Run($f)
+        })
+        $handle = $ps.BeginInvoke()
+        return @{ Sync = $sync; PS = $ps; RS = $rs; Handle = $handle }
+    } catch { return $null }
+}
+function Set-SplashStatus($splash, [string]$text) {
+    try { if ($splash -and $splash.Sync) { $splash.Sync.Status = $text } } catch { }
+}
+function Stop-Splash($splash) {
+    try {
+        if ($splash -and $splash.Sync) { $splash.Sync.Close = $true }
+        Start-Sleep -Milliseconds 450
+        if ($splash) {
+            try { $splash.PS.EndInvoke($splash.Handle) } catch { }
+            try { $splash.PS.Dispose() } catch { }
+            try { $splash.RS.Close(); $splash.RS.Dispose() } catch { }
+        }
+    } catch { }
+}
+
 function Check-ForUpdates {
     # Non-fatal pre-flight: if the local checkout is behind the remote, offer to update.
     # Any failure (no git, no upstream, offline, auth needed, fetch timeout, pull fail)
@@ -132,7 +212,12 @@ function Check-ForUpdates {
     }
 }
 
+# Show the cold-start splash (best-effort) so the few-second wait has feedback, then run the
+# update check with its status reflected on the splash.
+$splash = Start-Splash
+
 # Pre-flight update check (best-effort, non-blocking). Runs once before any service starts.
+Set-SplashStatus $splash "Checking for updates..."
 Check-ForUpdates
 
 Write-Host "=== Daily startup (idempotent -- already-running parts are left as-is) ==="
@@ -140,6 +225,7 @@ Write-Host "=== Daily startup (idempotent -- already-running parts are left as-i
 # 1) Supervisor = MCP server + Dev Tunnel host. Its own global mutex makes a second instance exit
 #    quietly, and it never touches a live `devtunnel host` -- so if a tunnel is already up, we keep
 #    it. We still gate on the process so we don't spawn a doomed hidden window each run.
+Set-SplashStatus $splash "Starting the MCP server and Dev Tunnel..."
 if (Proc-Running 'supervisor\.ps1') {
     Write-Host "[1/4] supervisor (MCP server + tunnel): already running -- left as-is"
 } else {
@@ -153,6 +239,7 @@ if (Proc-Running 'supervisor\.ps1') {
 }
 
 # 2) Companion Edge :9222 (the fleet / agent Edge). Idempotent launcher; skip if the port answers.
+Set-SplashStatus $splash "Starting the agent browser..."
 if (Port-Up 9222) {
     Write-Host "[2/4] companion Edge :9222: already up"
 } else {
@@ -161,6 +248,7 @@ if (Port-Up 9222) {
 }
 
 # 3) Bridge :9223 + chat backend (start_bridge -Keepalive). Skip if the keepalive supervisor is up.
+Set-SplashStatus $splash "Starting the chat bridge..."
 if (Proc-Running 'start_bridge\.ps1') {
     Write-Host "[3/4] bridge keepalive: already running"
 } elseif (Http-Up "http://127.0.0.1:8765/conv") {
@@ -172,6 +260,7 @@ if (Proc-Running 'start_bridge\.ps1') {
 }
 
 # 4) WPF apps. Launch only if not already running; build them first if the exe is missing.
+Set-SplashStatus $splash "Opening the chat and cockpit windows..."
 foreach ($app in @("CopilotChat","FleetCockpit")) {
     if (Get-Process $app -ErrorAction SilentlyContinue) {
         Write-Host "[4/4] ${app}: already running"
@@ -186,3 +275,15 @@ foreach ($app in @("CopilotChat","FleetCockpit")) {
 Write-Host ""
 Write-Host "Done. Chat UI: http://127.0.0.1:8765 (or the CopilotChat window). Fleet cockpit window is up."
 Write-Host "If a one-time M365 sign-in is needed, a visible Edge window will appear -- sign in there."
+
+# Bridge the rest of the cold-start gap: keep the splash up (BOUNDED) until a chat/cockpit
+# window actually appears, so it closes when the UI is really ready -- not the instant the
+# launchers fire. Capped at ~20s so it can never hang (e.g. exes not built yet).
+Set-SplashStatus $splash "Almost ready..."
+for ($i = 0; $i -lt 40; $i++) {
+    if (Get-Process CopilotChat, FleetCockpit -ErrorAction SilentlyContinue) { break }
+    Start-Sleep -Milliseconds 500
+}
+Set-SplashStatus $splash "Ready."
+Start-Sleep -Milliseconds 800
+Stop-Splash $splash
