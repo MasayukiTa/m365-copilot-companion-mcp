@@ -4879,23 +4879,6 @@ class CockpitWindow : Window
             g.Margin = new Thickness(0, 6, 0, 2);
             SwallowMouseUp(g);
             col.Children.Add(g);
-
-            // ④ Per-worker timeline on a PAST task too. The archive entry carries no phase_events,
-            // so BuildTimelineEvents falls back to the on-disk transcript (started#name jsonl) the
-            // same way a live card's Overview timeline does -- giving completed/history rows their
-            // own compact vertical timeline when expanded, not just the currently-running ones.
-            string htpath = S(e, "transcript");
-            string houtcome = S(e, "outcome");
-            int hreviews = I(e, "verify_attempts");   // absent on archive entry -> 0 (review line omitted)
-            var hEvents = BuildTimelineEvents(htpath, houtcome, true, hreviews, e);
-            if (hEvents != null && hEvents.Count > 0)
-            {
-                col.Children.Add(SectLabel(_lang == 0 ? "タイムライン" : "Timeline"));
-                foreach (string ev in hEvents)
-                    col.Children.Add(new TextBlock {
-                        Text = "・" + ev, Foreground = Muted, FontSize = 12,
-                        Margin = new Thickness(0, 1, 0, 1), TextWrapping = TextWrapping.Wrap });
-            }
         }
 
         row.Child = col;
