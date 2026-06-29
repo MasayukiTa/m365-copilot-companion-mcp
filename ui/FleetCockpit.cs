@@ -595,6 +595,53 @@ class CockpitWindow : Window
     {
         if (_spinePanel == null || _spineCol == null) return;
 
+        // NOT-RUNNING: the left "実行タイムライン" follows an EXPANDED past/history task, so inspecting
+        // a finished task shows ITS timeline on the left (works after a run ends too, not only when
+        // fully idle). A RUNNING fleet always owns the spine (the live run is never hidden), so this
+        // past-task focus is suppressed while running. (user choice: 走行中は現在優先)
+        bool spineRunning = root != null && (!root.ContainsKey("running") || Convert.ToBoolean(root["running"]));
+        if (!spineRunning && root != null && _history != null && _expanded != null && _expanded.Count > 0)
+        {
+            Dictionary<string, object> focusEntry = null;
+            for (int hi = _history.Count - 1; hi >= 0; hi--)
+            {
+                var he = _history[hi] as Dictionary<string, object>;
+                if (he == null) continue;
+                string hk = S(he, "key");
+                if (!string.IsNullOrEmpty(hk) && _expanded.Contains(hk)) { focusEntry = he; break; }
+            }
+            if (focusEntry != null)
+            {
+                string fkey = S(focusEntry, "key");
+                string fsig = "PAST|" + fkey + "|" + (_dark ? "D" : "L") + _lang;
+                if (fsig == _spineSig) return;
+                _spineSig = fsig;
+                _spineCol.Width = new GridLength(220);
+                _spinePanel.BorderBrush = Theme.Br(Theme.Border(_dark));
+                _spinePanel.Background = Theme.Br(Theme.Bg(_dark));
+                var pastList = new List<Dictionary<string, object>>();
+                pastList.Add(focusEntry);
+                bool jaP = _lang == 0;
+                var wrap = new StackPanel();
+                wrap.Margin = new Thickness(10, 10, 8, 0);
+                var pastTag = new TextBlock();
+                pastTag.Text = jaP ? "過去のタスク" : "Past task";
+                pastTag.Foreground = Theme.Br(Theme.Accent(_dark));
+                pastTag.FontSize = 10; pastTag.FontWeight = FontWeights.SemiBold;
+                pastTag.Margin = new Thickness(0, 0, 0, 2);
+                wrap.Children.Add(pastTag);
+                var titleTag = new TextBlock();
+                titleTag.Text = CardTitle(S(focusEntry, "conv_title"), S(focusEntry, "goal"));
+                titleTag.Foreground = Theme.Br(Theme.Muted(_dark)); titleTag.FontSize = 10;
+                titleTag.TextTrimming = TextTrimming.CharacterEllipsis;
+                titleTag.Margin = new Thickness(0, 0, 0, 2);
+                wrap.Children.Add(titleTag);
+                wrap.Children.Add(BuildSpineContent(root, "ended", true, pastList));
+                _spinePanel.Child = wrap;
+                return;
+            }
+        }
+
         // Ensure _toolbarAll reflects current root (it may be empty on first tick before RenderCards).
         // If _toolbarAll is empty but root has workers, use root's workers directly for the check.
         bool hasWorkers = false;
