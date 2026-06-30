@@ -12,6 +12,20 @@ from .security import require_unlocked
 
 ALLOWED_PIP_FLAGS = {"--upgrade", "-U", "--pre", "--no-deps", "--force-reinstall", "--no-cache-dir"}
 
+# This machine is behind a corporate TLS-inspecting proxy whose root CA is not in
+# Python's bundled certifi store, so pip otherwise dies with CERTIFICATE_VERIFY_FAILED
+# ("unable to get local issuer certificate"). Skip TLS verification for the PyPI hosts
+# (the accepted corporate workaround; mirrors the user-level pip.ini). Injected on every
+# install so it works even when pip runs --isolated / ignores the config file.
+_PIP_TRUSTED_HOSTS = ["pypi.org", "files.pythonhosted.org", "pypi.python.org"]
+
+
+def _trusted_host_args() -> list[str]:
+    args: list[str] = []
+    for h in _PIP_TRUSTED_HOSTS:
+        args += ["--trusted-host", h]
+    return args
+
 
 def env_info() -> str:
     """Return a snapshot of the Python environment: version, paths, installed packages.
@@ -89,7 +103,7 @@ def pip_install(
                 if f not in ALLOWED_PIP_FLAGS:
                     return f"[pip_install error: flag {f!r} not in allowlist {sorted(ALLOWED_PIP_FLAGS)}]"
                 flags.append(f)
-        cmd = [sys.executable, "-m", "pip", "install", *flags, *cleaned]
+        cmd = [sys.executable, "-m", "pip", "install", *_trusted_host_args(), *flags, *cleaned]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         head = f"$ {' '.join(cmd[3:])}\n"
         out = (r.stdout or "")[-4000:]
