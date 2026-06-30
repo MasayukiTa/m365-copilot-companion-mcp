@@ -1842,6 +1842,65 @@ class CockpitWindow : Window
         return (r == true) ? box[0] : null;
     }
 
+    // Small modal text-input dialog for the "続ける" (Continue) follow-up instruction on a
+    // finished history row. Modeled on PromptInstruction(): same Window pattern, Owner=this,
+    // theme brushes, OK+Cancel. Returns the typed string, or null on empty/cancel.
+    string PromptFollowup()
+    {
+        var w = new Window();
+        w.Title = _lang == 0 ? "続けて指示する" : "Continue this task";
+        w.Width = 480; w.Height = 230; w.Background = Bg;
+        w.WindowStartupLocation = WindowStartupLocation.CenterOwner; w.Owner = this;
+        var sp = new StackPanel(); sp.Margin = new Thickness(16);
+        var lbl = new TextBlock();
+        lbl.Text = _lang == 0 ? "前回の成果物を踏まえて追加で何をさせますか？"
+                              : "Follow-up instruction (uses the prior task's saved outputs):";
+        lbl.Foreground = Fg; lbl.TextWrapping = TextWrapping.Wrap; lbl.Margin = new Thickness(0, 0, 0, 8);
+        sp.Children.Add(lbl);
+        var tb = new TextBox();
+        tb.MinHeight = 64; tb.AcceptsReturn = true; tb.TextWrapping = TextWrapping.Wrap;
+        tb.Background = BtnBg; tb.Foreground = Fg; tb.BorderBrush = Border;
+        tb.BorderThickness = new Thickness(1); tb.Padding = new Thickness(8); tb.CaretBrush = Fg;
+        sp.Children.Add(tb);
+        var btns = new StackPanel(); btns.Orientation = Orientation.Horizontal;
+        btns.HorizontalAlignment = HorizontalAlignment.Right; btns.Margin = new Thickness(0, 12, 0, 0);
+        string[] box = new string[1];
+        var ok = new Button();
+        ok.Content = _lang == 0 ? "続ける" : "Continue"; ok.IsDefault = true;
+        ok.Background = Accent; ok.Foreground = White; ok.BorderThickness = new Thickness(0);
+        ok.Padding = new Thickness(14, 4, 14, 4); ok.Cursor = Cursors.Hand; ok.FontWeight = FontWeights.SemiBold;
+        ok.Click += delegate { box[0] = tb.Text; w.DialogResult = true; };
+        var cancel = new Button();
+        cancel.Content = _lang == 0 ? "取消" : "Cancel"; cancel.IsCancel = true;
+        cancel.Margin = new Thickness(8, 0, 0, 0); cancel.Padding = new Thickness(14, 4, 14, 4);
+        cancel.Cursor = Cursors.Hand; cancel.Background = BtnBg; cancel.Foreground = Fg;
+        cancel.BorderBrush = Border; cancel.BorderThickness = new Thickness(1);
+        btns.Children.Add(ok); btns.Children.Add(cancel);
+        sp.Children.Add(btns);
+        w.Content = sp;
+        bool? r = w.ShowDialog();
+        if (r != true) return null;
+        string txt = box[0];
+        if (txt == null || txt.Trim().Length == 0) return null;
+        return txt;
+    }
+
+    // Build the FRESH goal text for a "Continue" run. There is NO stable reopenable URL for this
+    // agent, so we do NOT reopen the old conversation: instead we PREPEND the prior task's context
+    // and tell the agent to re-read its on-disk outputs before doing the new instruction.
+    string BuildContinueGoal(string priorGoal, string followup)
+    {
+        if (_lang == 0)
+        {
+            return "【前回タスクの続き】\n前回のゴール: " + priorGoal
+                + "\n前回の成果物はディスク上に保存済み（このタスクで作成・更新したファイル/フォルダ）。まず関連するファイル/フォルダを list_directory / read_file で読み直して前回の文脈と成果物を把握してから、次の追加指示を実行して。完了したら最後の行に DONE。\n追加指示: "
+                + followup;
+        }
+        return "[Continuation of a prior task]\nPrior goal: " + priorGoal
+            + "\nThe prior task's outputs are saved on disk (files/folders this task created or updated). First re-read the relevant files/folders with list_directory / read_file to recover the prior context and outputs, then carry out the follow-up instruction below. When finished, put DONE on the last line.\nFollow-up: "
+            + followup;
+    }
+
     // ── Autonomy Contract pre-flight dialog (folder autonomous path only) ─────────
     // Shows a modal summary of what the agent will and will not do before the run
     // launches. Returns true if the user clicks Delegate, false if they Cancel.
@@ -4926,6 +4985,49 @@ class CockpitWindow : Window
             g.Margin = new Thickness(0, 6, 0, 2);
             SwallowMouseUp(g);
             col.Children.Add(g);
+
+            // "続ける" (Continue): send a FOLLOW-UP instruction to this finished task, carrying its
+            // prior context. Launches a FRESH fleet run whose goal PREPENDS the prior goal + a note
+            // to re-read the on-disk outputs (no reopenable URL for this agent). Capture e's values
+            // into locals BEFORE the delegate for closure-safety (same pattern as the row handler).
+            string contPrior = S(e, "goal");
+            string contConv = S(e, "conv_url");
+            var contBtn = new Button();
+            contBtn.Content = _lang == 0 ? "続ける" : "Continue";
+            contBtn.Cursor = Cursors.Hand;
+            contBtn.FontSize = 12;
+            contBtn.Padding = new Thickness(10, 3, 10, 3);
+            contBtn.Margin = new Thickness(0, 6, 0, 0);
+            contBtn.HorizontalAlignment = HorizontalAlignment.Right;
+            contBtn.BorderThickness = new Thickness(1);
+            contBtn.Background = BtnBg;
+            contBtn.BorderBrush = Border;
+            contBtn.Foreground = Fg;
+            contBtn.Template = FlatButtonTemplate();
+            contBtn.Click += delegate
+            {
+                string fu = PromptFollowup();
+                if (string.IsNullOrEmpty(fu)) return;
+                string goalText = BuildContinueGoal(contPrior, fu);
+                // The continuation goal is MULTI-LINE; SpawnFleet writes one goal per line and
+                // fleet_runner reads one goal PER LINE, so a plain multi-line string would be split
+                // into several broken goals. ALWAYS serialize as a SINGLE JSON object line (parsed
+                // back into one dict goal). resume_conv is added only when a conv URL exists.
+                var gd = new Dictionary<string, object>();
+                gd["text"] = goalText;
+                if (!string.IsNullOrEmpty(contConv)) gd["resume_conv"] = contConv;
+                string line = _js.Serialize(gd);
+                var glist = new List<string>();
+                glist.Add(line);
+                SpawnFleet(glist, "continue_input.txt");
+                if (_startNote != null)
+                {
+                    _startNote.Text = _lang == 0
+                        ? "前回タスクの続きを開始しました（成果物を読み直してから追加指示を実行します）。"
+                        : "Started a continuation of the prior task (it re-reads the saved outputs, then runs the follow-up).";
+                }
+            };
+            col.Children.Add(contBtn);
         }
 
         row.Child = col;
