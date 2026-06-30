@@ -147,10 +147,21 @@ def step_install_deps() -> None:
     if not req.exists():
         raise StepError("requirements.txt not found at repo root.")
 
-    # Best-effort pip upgrade; never fatal.
-    subprocess.call([py, "-m", "pip", "install", "--upgrade", "pip", "--quiet"])
+    # Corporate TLS-inspecting proxy: its root CA is not in pip's bundled certifi store,
+    # so pip otherwise dies with SSL CERTIFICATE_VERIFY_FAILED ("unable to get local issuer
+    # certificate") on pypi.org / files.pythonhosted.org. Pass --trusted-host ON THE COMMAND
+    # LINE so the bypass applies regardless of whether a user/system pip.ini is read (the
+    # venv may be a uv-provisioned CPython that does not pick up %APPDATA%\pip\pip.ini).
+    trusted = [
+        "--trusted-host", "pypi.org",
+        "--trusted-host", "files.pythonhosted.org",
+        "--trusted-host", "pypi.python.org",
+    ]
 
-    rc = subprocess.call([py, "-m", "pip", "install", "-r", str(req)])
+    # Best-effort pip upgrade; never fatal.
+    subprocess.call([py, "-m", "pip", "install", *trusted, "--upgrade", "pip", "--quiet"])
+
+    rc = subprocess.call([py, "-m", "pip", "install", *trusted, "-r", str(req)])
     if rc != 0:
         raise StepError(
             "pip install -r requirements.txt failed (network or a wheel build). "
