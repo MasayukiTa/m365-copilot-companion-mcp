@@ -93,6 +93,39 @@ CONSENT_MARKERS = (
     "verify your credential", "authorize the connection", "set up this connection",
 )
 
+# UNLOCK-REQUIRED detector. Write/exec MCP tools require unlock(password) per client IP
+# (tools/security.py::require_unlocked). When the agent calls a write/exec tool before the
+# (rotating M365 backend) IP is unlocked, the server returns
+#   "[locked client IP: 'x.x.x.x'] Call unlock(password='...') first."
+# which the agent echoes. We AUTO-INJECT the unlock: re-anchor the turn to first call the
+# 'unlock' tool with MCP_UNLOCK_PASSWORD read LOCALLY from .env -- deliberately NOT baked into
+# the agent's Copilot Studio instructions (that would expose the password permanently). The
+# password appears only in this transient turn. Bounded: the backend IP can rotate and re-lock,
+# so a few auto-unlocks are normal; past the cap we STUCK with an actionable reason.
+LOCKED_MARKERS = ("locked client ip", "call unlock(password", "unlock(password=")
+MAX_UNLOCK_ATTEMPTS = int(os.environ.get("MCP_FLEET_MAX_UNLOCK", "4"))
+UNLOCK_PREFIX = (
+    "【要解錠】書込/実行ツールは接続のIP単位ロック解除が必要です。まず最初に call_tool で "
+    "'unlock' ツールを引数 {\"password\": \"%s\"} で1回だけ実行し、解錠に成功したら（以後その"
+    "接続で書込/実行ツールが使えるので）当初のゴールをそのまま続行してください。解錠後は "
+    "password を二度と出力しないこと。\n--- 元のゴール ---\n"
+)
+
+
+def _unlock_password():
+    """The unlock password, read LOCALLY (process env or .env) -- never stored in the agent
+    config. Returns '' if unset."""
+    pw = (os.environ.get("MCP_UNLOCK_PASSWORD") or "").strip()
+    if not pw:
+        try:
+            from dotenv import load_dotenv
+            repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            load_dotenv(os.path.join(repo, ".env"))
+            pw = (os.environ.get("MCP_UNLOCK_PASSWORD") or "").strip()
+        except Exception:
+            pass
+    return pw
+
 # STUCK-ON-REDIRECT detector (2026-06-18, W4 xarray-3364). A worker tab can land on the M365
 # SSO-redirect / landing page (e.g. https://m365.cloud.microsoft/chat/?redirfrom=CsrToSSR&auth=2)
 # instead of its agent conversation. That page has NO composer, so EVERY send fails with an empty
@@ -596,6 +629,7 @@ class RelayWorker:
         self._consent_streak = 0        # consecutive MCP connection-consent cards (auth needed)
         self._consent_auto_tried = False  # attempted the automatic click-through once
         self._consent_surfaced = False  # surfaced the Edge once (manual fallback)
+        self._unlock_attempts = 0       # auto-injected unlock(password) turns (write/exec gate)
         self._recycles = 0              # fresh-conversation recycles after a token-limit exhaustion
         try:
             self._max_recycles = int(os.environ.get("MCP_MAX_RECYCLES", "8"))
@@ -1294,6 +1328,28 @@ class RelayWorker:
                                "専用・他で承認しても無効)してから再投入を。")
                 return
             self.job = self._task_anchor(RETRY_JOB)
+            return
+        # UNLOCK-REQUIRED: a write/exec tool hit a locked client IP. Auto-inject unlock(password)
+        # with the LOCAL .env password (NOT the agent's persistent instructions), then resume the
+        # goal. Bounded -- the M365 backend IP can rotate and re-lock, so a few auto-unlocks are
+        # normal; past the cap STUCK with an actionable reason.
+        if any(m in _low for m in LOCKED_MARKERS):
+            pw = _unlock_password()
+            if not pw:
+                self.status, self.outcome = "stuck", "STUCK"
+                self.reason = ("⚠ 書込/実行に unlock が必要だが MCP_UNLOCK_PASSWORD が未設定。"
+                               ".env に設定して再投入してください。")
+                return
+            if self._unlock_attempts < MAX_UNLOCK_ATTEMPTS:
+                self._unlock_attempts += 1
+                self.job = PROTOCOL + (UNLOCK_PREFIX % pw) + self.goal
+                self.reason = "コネクタ未解錠 → unlock 自動投入 (%d/%d)" % (
+                    self._unlock_attempts, MAX_UNLOCK_ATTEMPTS)
+                return
+            self.status, self.outcome = "stuck", "STUCK"
+            self.reason = ("⚠ unlock を %d 回投入したが解錠が続かない。M365バックエンドの送信元IPが"
+                           "毎回変わる(unlockはIP単位)か、MCP_UNLOCK_PASSWORD不一致の可能性。"
+                           % self._unlock_attempts)
             return
         # TOOL-BACKEND-UNREACHABLE: the agent's tool calls failed (devtunnel/network blip) and it
         # self-locked claiming its tools don't exist. INFRA-FALSE, not a miss. Re-send the GOAL (the
