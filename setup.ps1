@@ -84,8 +84,18 @@ if (-not (Test-Path $venvPython)) {
 # 3. Python dependencies
 # ---------------------------------------------------------------------------
 Write-Step "Installing Python dependencies"
-& $venvPython -m pip install --upgrade pip --quiet
-& $venvPython -m pip install -r requirements.txt
+# Corporate TLS-inspecting proxy: its root CA is not in pip's bundled certifi store, so
+# pip otherwise dies with SSL CERTIFICATE_VERIFY_FAILED ("unable to get local issuer
+# certificate") on pypi.org / files.pythonhosted.org. Pass --trusted-host ON THE COMMAND
+# LINE so it works regardless of whether the user/system pip.ini is read (the venv here is
+# a uv-provisioned CPython, which may not pick up %APPDATA%\pip\pip.ini).
+$pipTrusted = @(
+    "--trusted-host", "pypi.org",
+    "--trusted-host", "files.pythonhosted.org",
+    "--trusted-host", "pypi.python.org"
+)
+& $venvPython -m pip install @pipTrusted --upgrade pip --quiet
+& $venvPython -m pip install @pipTrusted -r requirements.txt
 Write-Ok "Dependencies installed"
 
 # ---------------------------------------------------------------------------
