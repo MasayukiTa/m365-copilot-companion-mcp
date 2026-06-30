@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -308,6 +309,152 @@ def step_dev_tunnel() -> None:
             "above, and re-run setup.bat. This login cannot be automated."
         )
     log("    OK: devtunnel reports a signed-in user.")
+
+    # Now that we have a signed-in user we CAN finish the rest unattended:
+    # create the tunnel + port + access (idempotent), briefly host it to obtain
+    # the public URL, then record MCP_TUNNEL_NAME/MCP_TUNNEL_URL in .env. Any
+    # failure here degrades to ActionNeeded (run the printed sequence by hand) so
+    # the bootstrap is never worse than before this automation existed.
+    try:
+        _provision_dev_tunnel(dt, tunnel)
+    except ActionNeeded:
+        raise
+    except Exception as e:  # noqa: BLE001 - never crash bootstrap on a tunnel hiccup
+        raise ActionNeeded(
+            "could not auto-provision the dev tunnel (%s). Run the "
+            "create/port/access/host sequence printed above by hand, then "
+            "re-run setup.bat" % e
+        )
+
+
+def _provision_dev_tunnel(dt: str, tunnel: str) -> None:
+    """Ensure the tunnel exists, host it briefly to learn its public URL, and
+    write MCP_TUNNEL_NAME/MCP_TUNNEL_URL into .env. Mirrors setup_devtunnel.ps1
+    (host-then-read-then-write). Assumes the user is already signed in."""
+    port = 8000
+
+    # 1. Ensure the tunnel exists (idempotent). 'devtunnel show' succeeds only if
+    #    the tunnel is already there; on failure/missing we create it + the port
+    #    + anonymous access (so a remote Copilot Studio client can reach it).
+    if _dt_run(dt, "show", tunnel).returncode == 0:
+        log("    OK: tunnel '%s' already exists (skipping create)." % tunnel)
+    else:
+        log("    Creating tunnel '%s' (anonymous-reachable)..." % tunnel)
+        rc1 = _dt_run(dt, "create", tunnel, "--allow-anonymous").returncode
+        rc2 = _dt_run(dt, "port", "create", tunnel, "-p", str(port), "--protocol", "http").returncode
+        rc3 = _dt_run(dt, "access", "create", tunnel, "-p", str(port), "--anonymous").returncode
+        if rc1 != 0:
+            # If create itself failed the tunnel won't be usable; bubble up so the
+            # caller turns it into an ActionNeeded with the manual sequence.
+            raise StepError("'devtunnel create %s' failed (rc=%d)." % (tunnel, rc1))
+        if rc2 != 0 or rc3 != 0:
+            log("    WARN: port/access create returned non-zero "
+                "(rc2=%d rc3=%d); continuing -- they may already exist." % (rc2, rc3))
+
+    # 2. Obtain the public URL. A freshly-created tunnel has NO port URL in
+    #    'devtunnel show' until it has been HOSTED at least once (Host
+    #    connections must be >= 1). So if the URL is not there yet, start a host
+    #    in the BACKGROUND, poll 'devtunnel show' for up to ~30s, then stop it.
+    url = _dt_tunnel_url(dt, tunnel)
+    if not url:
+        log("    Hosting the tunnel briefly to obtain its public URL (a few seconds)...")
+        host_proc = None
+        try:
+            host_proc = subprocess.Popen(
+                [dt, "host", tunnel],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            for _ in range(15):  # 15 * 2s = ~30s
+                try:
+                    host_proc.wait(timeout=2)
+                    # Host exited early (e.g. it could not bind); stop polling.
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                url = _dt_tunnel_url(dt, tunnel)
+                if url:
+                    break
+        finally:
+            # Stop the temporary host process; the supervisor (start_all) hosts
+            # the tunnel for real later. We only needed it to mint the URL.
+            if host_proc is not None and host_proc.poll() is None:
+                host_proc.terminate()
+                try:
+                    host_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    host_proc.kill()
+
+    # 3. Record name + URL in .env (preserving every other key/secret).
+    _write_tunnel_to_env(tunnel, url)
+
+    if url:
+        log("    OK: dev tunnel public URL: " + url)
+        log("    Recorded MCP_TUNNEL_NAME and MCP_TUNNEL_URL in .env.")
+    else:
+        # We could not parse a URL (host did not come up in time). The tunnel and
+        # name are written; tell the user how to read the URL by hand. Still not
+        # fatal -- everything else in .env is intact.
+        log("    WARN: tunnel '%s' is set up but no port URL was parsed." % tunnel)
+        log("          Run 'devtunnel show %s' and copy the "
+            "https://...devtunnels.ms URL into MCP_TUNNEL_URL in .env." % tunnel)
+        log("    Recorded MCP_TUNNEL_NAME in .env (MCP_TUNNEL_URL left blank).")
+
+
+def _dt_run(dt: str, *args: str) -> subprocess.CompletedProcess:
+    """Run a devtunnel subcommand, capturing output, never raising. Returns the
+    CompletedProcess (rc 124-style sentinel on timeout/spawn failure)."""
+    try:
+        return subprocess.run(
+            [dt, *args],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return subprocess.CompletedProcess(args=[dt, *args], returncode=124, stdout="", stderr="")
+
+
+_TUNNEL_URL_RE = re.compile(
+    r"https://[A-Za-z0-9-]+\.[A-Za-z0-9-]+\.devtunnels\.ms\S*"
+)
+
+
+def _dt_tunnel_url(dt: str, tunnel: str) -> str | None:
+    """Parse the public https://...-8000.<region>.devtunnels.ms/ URL out of
+    'devtunnel show'. Returns None if no URL is present yet."""
+    res = _dt_run(dt, "show", tunnel)
+    text = (res.stdout or "") + "\n" + (res.stderr or "")
+    m = _TUNNEL_URL_RE.search(text)
+    return m.group(0) if m else None
+
+
+def _write_tunnel_to_env(tunnel: str, url: str | None) -> None:
+    """Write MCP_TUNNEL_NAME (and MCP_TUNNEL_URL if known) into .env, preserving
+    every other line. Strips any prior '# devtunnel (auto)' / MCP_TUNNEL_* lines
+    first. Writes UTF-8 WITHOUT BOM and CRLF endings -- a BOM here previously
+    broke the .env parser (PowerShell Set-Content -Encoding UTF8 writes EF BB BF
+    which folds into the first key name)."""
+    env_path = ROOT / ".env"
+    if not env_path.exists():
+        log("    WARN: .env not found; skipping MCP_TUNNEL_* write.")
+        return
+    # utf-8-sig tolerates a possible pre-existing BOM on read.
+    existing = env_path.read_text(encoding="utf-8-sig").splitlines()
+    kept = [
+        ln for ln in existing
+        if not (
+            ln.startswith("# devtunnel (auto)")
+            or ln.startswith("MCP_TUNNEL_NAME=")
+            or ln.startswith("MCP_TUNNEL_URL=")
+        )
+    ]
+    kept.append(
+        "# devtunnel (auto) -- the public URL to register in Copilot Studio; "
+        "supervisor hosts MCP_TUNNEL_NAME"
+    )
+    kept.append("MCP_TUNNEL_NAME=" + tunnel)
+    if url:
+        kept.append("MCP_TUNNEL_URL=" + url)
+    # CRLF endings, UTF-8 WITHOUT BOM (encoding='utf-8' never emits a BOM).
+    env_path.write_text("\r\n".join(kept) + "\r\n", encoding="utf-8", newline="")
 
 
 def _devtunnel_logged_in(dt: str) -> bool:
