@@ -1,5 +1,13 @@
 # m365-copilot-companion-mcp
 
+## Getting started — まずこれだけ実行
+
+- **初回（新しいPC）**: **`quickstart.bat`** をダブルクリック。Python+venv+依存の導入、`.env`(秘密の自動生成)、Dev Tunnel の設定、サーバ起動までワンクリックで通る。
+- **毎日の起動**: **`start_all.bat`**（または quickstart が作るデスクトップアイコン）。冪等で、サーバ＋トンネル＋専用Edge＋bridge＋UI を一括起動。
+- **健康診断**: **`doctor.bat`** ／ **エージェントURLの設定・変更**: **`configure_env.bat`** ／ **秘密の再発行（`.env` を漏らした時）**: **`rotate_secrets.bat`**。
+
+ルートにある他の `.ps1`（`start_companion_edge.ps1`・`supervisor.ps1` 等）は、これらが内部的に呼ぶヘルパーです。**直接実行する必要はありません**。内部専用の小物は `scripts/win/` に隔離してあります。
+
 ## Current Benchmark Snapshot
 
 - **SWE-bench Lite 300 strong scaffold (2026-06-20): 215/300 = 71.7% pass@1**.
