@@ -20,12 +20,18 @@ REM Tell setup.bat it is being CALLED (not double-clicked), so it does not add
 REM its own pause -- quickstart has its own pauses and a final one.
 set "FROM_QUICKSTART=1"
 call setup.bat
+REM Capture the bootstrap exit code BEFORE any other command: the following
+REM `set` succeeds and would otherwise RESET errorlevel to 0, so `if errorlevel 1`
+REM never fired and a failed/paused bootstrap (e.g. devtunnel sign-in needed,
+REM rc=2) was silently ignored and the run continued on a half-set-up env.
+set "BOOT_RC=%ERRORLEVEL%"
 set "FROM_QUICKSTART="
-if errorlevel 1 (
+if not "%BOOT_RC%"=="0" (
     echo.
-    echo Bootstrap failed. Fix the error above and run quickstart.bat again.
+    echo Bootstrap stopped with exit code %BOOT_RC%. Read the message above for
+    echo the exact action needed, then run quickstart.bat again to resume.
     pause
-    exit /b 1
+    exit /b %BOOT_RC%
 )
 
 REM --- Pick the interpreter the bootstrap produced --------------------------
