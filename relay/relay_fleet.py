@@ -560,6 +560,10 @@ class RelayWorker:
         self.goal = text
         self.checks = checks
         self.cwd = cwd
+        # resume_conv: when a goal dict carries it, this worker RESUMES that existing Copilot
+        # conversation URL instead of opening a fresh chat -- so a FINISHED fleet task can take a
+        # CONTEXT-CARRYING follow-up (the prior turns stay in the conversation the agent reads).
+        self.resume_conv = (goal.get("resume_conv") if isinstance(goal, dict) else None) or None
         self.max_verify_attempts = max_verify_attempts
         self.verify_attempts = 0
         # transient-failure retries (network/tool/send hiccups) -- the relay analog of
@@ -700,11 +704,14 @@ class RelayWorker:
         self.transcript = self._tx.path or ""
 
     def attach(self, context, agent_url):
-        """Open this worker's tab and make it ready to send. On failure -> error."""
+        """Open this worker's tab and make it ready to send. On failure -> error.
+        A resume_conv worker opens its EXISTING conversation URL (carrying prior context)
+        instead of a fresh agent chat; re-navs then return to that conversation too."""
         self._context = context
-        self._agent_url = agent_url
+        open_url = self.resume_conv or agent_url
+        self._agent_url = open_url
         try:
-            self.page = _open_fresh(context, agent_url)
+            self.page = _open_fresh(context, open_url)
             self.drv = CopilotWebDriver(self.page)
             self.status = "ready"
             return True
