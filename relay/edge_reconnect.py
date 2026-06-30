@@ -109,6 +109,78 @@ def click_through_consent(page) -> bool:
         return False
 
 
+def reconnect_via_connection_manager(cdp_url: str, conn_url: str, want: str = "260616test",
+                                     max_rounds: int = 6) -> dict:
+    """Re-establish stale ("古い") connector connections directly on the Copilot Studio
+    user-connections page -- NO credential entry (the Bearer key is already on the
+    connector; this only re-selects + commits the connection). Proven flow (2026-06-30):
+    navigate to the .../conversations/<id>/user-connections page (already signed in in the
+    companion Edge profile) -> for each `want` row showing レビュー, click レビュー -> the
+    接続の作成または選択 dialog opens with the connection pre-selected (green check) -> click
+    送信する. Repeat until no `want` row is stale. Returns a summary dict."""
+    from playwright.sync_api import sync_playwright
+    out = {"ok": False, "rounds": 0, "submitted": 0, "any_stale_left": True, "url": ""}
+    with sync_playwright() as p:
+        b = p.chromium.connect_over_cdp(cdp_url)
+        ctx = b.contexts[0] if b.contexts else b.new_context()
+        page = ctx.new_page()
+        try:
+            page.goto(conn_url, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(8000)
+            out["url"] = page.url
+            for _ in range(max_rounds):
+                # a レビュー control whose row text contains `want`
+                rev = page.locator(
+                    'xpath=//*[self::a or self::button or @role="button"][normalize-space()="レビュー"'
+                    ' or normalize-space()="Review"]')
+                target = None
+                for i in range(rev.count()):
+                    el = rev.nth(i)
+                    try:
+                        row = el.locator('xpath=ancestor::*[contains(., "%s")][1]' % want)
+                        if row.count():
+                            target = el
+                            break
+                    except Exception:
+                        continue
+                if target is None:
+                    break                          # no stale `want` row left
+                out["rounds"] += 1
+                try:
+                    target.scroll_into_view_if_needed()
+                    target.click()
+                    page.wait_for_timeout(4000)
+                except Exception:
+                    break
+                submit = page.locator(
+                    'xpath=//button[normalize-space()="送信する" or normalize-space()="送信"'
+                    ' or normalize-space()="Submit"]')
+                if submit.count():
+                    try:
+                        submit.first.click()
+                        out["submitted"] += 1
+                        page.wait_for_timeout(6000)
+                    except Exception:
+                        pass
+            page.reload()
+            page.wait_for_timeout(8000)
+            body = (page.locator("body").inner_text() or "")
+            # any `want` row still 古い?
+            stale = False
+            for line in body.splitlines():
+                if want in line and ("古い" in line or "期限切れ" in line or "未接続" in line):
+                    stale = True
+                    break
+            out["any_stale_left"] = stale
+            out["ok"] = (out["submitted"] > 0) and not stale
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+    return out
+
+
 def reconnect(cdp_url: str, agent_url: str, probe: str, turn_timeout_s: int = 180) -> dict:
     from playwright.sync_api import sync_playwright
     out = {"ok": False, "agent_loaded": False, "had_card": False, "clicked": False,
@@ -161,7 +233,20 @@ def main(argv=None):
     ap.add_argument("--agent-url", default="")
     ap.add_argument("--probe", default=DEFAULT_PROBE)
     ap.add_argument("--turn-timeout", type=int, default=180)
+    ap.add_argument("--reconnect-url", default="",
+                    help="Copilot Studio .../user-connections page URL. When set, drive that "
+                         "page (レビュー -> 送信する) to re-establish stale connections, no chat probe.")
+    ap.add_argument("--want", default="260616test",
+                    help="connector row name to reconnect on the user-connections page")
     args = ap.parse_args(argv)
+    if args.reconnect_url:
+        res = reconnect_via_connection_manager(args.cdp_url, args.reconnect_url, args.want)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        if res.get("ok"):
+            print("\nRECONNECT OK: all '%s' connections are no longer stale." % args.want)
+            return 0
+        print("\nReconnect incomplete -- see summary (any_stale_left).")
+        return 1
     agent_url = args.agent_url or _load_agent_url()
     if not agent_url:
         print("ERROR: no agent URL (set MCP_FLEET_AGENT_URL in .env or pass --agent-url)")
