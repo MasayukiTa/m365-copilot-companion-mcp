@@ -107,6 +107,24 @@ $form.Controls.Add($cancel); $form.CancelButton = $cancel
 # Size the window to the content (so -Only shows a compact one-field dialog).
 $form.ClientSize = New-Object System.Drawing.Size(712, ($y + 50))
 
+# A WinForms Form created in a WINDOWLESS-launched powershell (configure_env_hidden.vbs
+# runs `wscript ... Run(...,0)`) INHERITS the parent's SW_HIDE show-state and never
+# appears on screen -- ShowDialog() then blocks on an invisible window and the user sees
+# the .bat flash and "do nothing". Force it visible from Add_Shown with Win32 ShowWindow
+# (SW_SHOW=5, SW_RESTORE=9) + SetForegroundWindow, exactly like the startup splash fix.
+# (Note: $this = the firing form; do NOT use $form -- that mirrors the splash bug.)
+Add-Type -Namespace M365 -Name CfgWin -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr h, int n);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr h);
+'@
+$form.Add_Shown({
+    try { [M365.CfgWin]::ShowWindow($this.Handle, 5) | Out-Null } catch {}
+    try { [M365.CfgWin]::ShowWindow($this.Handle, 9) | Out-Null } catch {}
+    try { [M365.CfgWin]::SetForegroundWindow($this.Handle) | Out-Null } catch {}
+    try { $this.Activate(); $this.BringToFront() } catch {}
+})
+$form.TopMost = $true
+
 $result = $form.ShowDialog()
 if ($result -ne "OK") { Write-Host "cancelled - .env not changed"; exit 0 }
 
