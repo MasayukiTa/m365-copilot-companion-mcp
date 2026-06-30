@@ -5431,6 +5431,7 @@ class CockpitWindow : Window
             // Actions live BELOW the tabs (not inside one) so steer/retry are always reachable.
             if (!terminal) col.Children.Add(SteerRow(name));
             else if (S(w, "outcome") != "DONE") col.Children.Add(RetryRow(w));
+            else col.Children.Add(ContinueRow(name, goal, S(w, "conv_url")));
         }
 
         card.Child = shell;
@@ -5938,6 +5939,92 @@ class CockpitWindow : Window
         tb.KeyDown += delegate (object s, KeyEventArgs e)
         {
             if (e.Key == Key.Return) { trySteer(); e.Handled = true; }
+        };
+        tb.TextChanged += delegate
+        {
+            bool hasText = tb.Text != null && tb.Text.Length > 0;
+            placeholder.Visibility = hasText ? Visibility.Collapsed : Visibility.Visible;
+            if (note.Text.Length > 0 && hasText) note.Text = "";
+        };
+        return outer;
+    }
+
+    // "続ける" (Continue) inline composer for a FINISHED (done) card -- the SAME mini-composer UI as
+    // SteerRow (割り込み). A done worker is terminal and can't take a steer, so instead of injecting
+    // into a live worker this launches a FRESH continuation: BuildContinueGoal prepends the prior
+    // goal + "re-read your on-disk outputs" so the agent recovers context, then runs the follow-up.
+    // Serialized as ONE JSON line (the prefix is multi-line; fleet_runner reads one goal per line).
+    // No RunIsLive gate -- a continuation starts its own run.
+    UIElement ContinueRow(string name, string goal, string conv)
+    {
+        var outer = new StackPanel();
+        outer.Margin = new Thickness(0, 10, 0, 0);
+        outer.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; };
+
+        var composerBorder = new Border();
+        composerBorder.CornerRadius = new CornerRadius(8);
+        composerBorder.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+        composerBorder.BorderBrush = Border;
+        composerBorder.BorderThickness = new Thickness(1);
+        composerBorder.Padding = new Thickness(10, 8, 10, 8);
+
+        var dp = new DockPanel();
+
+        var send = new Button();
+        send.Content = _lang == 0 ? "続ける" : "Continue";
+        send.Background = Brushes.Transparent; send.Foreground = Fg;
+        send.BorderThickness = new Thickness(1); send.BorderBrush = Border;
+        send.Padding = new Thickness(12, 4, 12, 4); send.Cursor = Cursors.Hand; send.FontSize = 12;
+        send.FontWeight = FontWeights.SemiBold;
+        DockPanel.SetDock(send, Dock.Right);
+        dp.Children.Add(send);
+
+        var note = new TextBlock();
+        note.FontSize = 11.5; note.Foreground = Muted; note.TextWrapping = TextWrapping.Wrap;
+        note.VerticalAlignment = VerticalAlignment.Center; note.Margin = new Thickness(0, 0, 8, 0);
+        DockPanel.SetDock(note, Dock.Right);
+        dp.Children.Add(note);
+
+        var inputGrid = new Grid();
+        var tb = new TextBox();
+        tb.FontSize = 12.5; tb.Padding = new Thickness(4, 3, 4, 3);
+        tb.BorderThickness = new Thickness(0); tb.Background = Brushes.Transparent; tb.Foreground = Fg;
+        tb.CaretBrush = Fg;
+        tb.ToolTip = _lang == 0 ? "この完了タスクに追加指示（前回の成果物を読み直してから実行）"
+                                : "Follow-up to this finished task (re-reads its saved outputs first)";
+        var placeholder = new TextBlock();
+        placeholder.Text = _lang == 0 ? "完了タスクに続けて指示..." : "Continue this finished task...";
+        placeholder.Foreground = Muted; placeholder.FontSize = 12.5;
+        placeholder.Padding = new Thickness(4, 3, 4, 3);
+        placeholder.VerticalAlignment = VerticalAlignment.Center;
+        placeholder.IsHitTestVisible = false;
+        inputGrid.Children.Add(placeholder);
+        inputGrid.Children.Add(tb);
+        dp.Children.Add(inputGrid);
+
+        composerBorder.Child = dp;
+        outer.Children.Add(composerBorder);
+
+        string g = goal, c = conv;
+        Func<bool> tryContinue = delegate
+        {
+            string t = (tb.Text ?? "").Trim();
+            if (t.Length == 0) return false;
+            string goalText = BuildContinueGoal(g, t);
+            var gd = new Dictionary<string, object>();
+            gd["text"] = goalText;
+            if (!string.IsNullOrEmpty(c)) gd["resume_conv"] = c;
+            var glist = new List<string>();
+            glist.Add(_js.Serialize(gd));
+            SpawnFleet(glist, "continue_input.txt");
+            tb.Text = "";
+            note.Text = _lang == 0 ? "続きを開始しました" : "Continuation started";
+            return true;
+        };
+        send.Click += delegate { tryContinue(); };
+        tb.KeyDown += delegate (object s, KeyEventArgs e)
+        {
+            if (e.Key == Key.Return) { tryContinue(); e.Handled = true; }
         };
         tb.TextChanged += delegate
         {
