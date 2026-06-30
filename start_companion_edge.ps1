@@ -238,7 +238,7 @@ if ($ready) {
         # CDP is desktop-independent, so the tab keeps running and the send path works
         # while the window simply is not on the user's current desktop. This avoids the
         # SW_HIDE-discards-renderer failure and is cleaner than perpetual minimizing.
-        $mover = Join-Path $PSScriptRoot "move_companion_to_desktop.ps1"
+        $mover = Join-Path $PSScriptRoot "scripts\win\move_companion_to_desktop.ps1"
         if (Test-Path $mover) {
             try {
                 & $mover
@@ -255,7 +255,7 @@ if ($ready) {
         Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
             Where-Object { $_.CommandLine -match 'edge_keeper.ps1' } |
             ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {} }
-        $keeper = Join-Path $PSScriptRoot "edge_keeper.ps1"
+        $keeper = Join-Path $PSScriptRoot "scripts\win\edge_keeper.ps1"
         Start-Process powershell -WindowStyle Hidden -ArgumentList @(
             "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $keeper, "-Port", "$Port") | Out-Null
         Write-Host "Running in the background on a separate virtual desktop. If sends start"
