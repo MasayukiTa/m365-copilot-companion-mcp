@@ -62,11 +62,26 @@ def _log_delete(guid, title, ok, reason):
         pass
 
 from dotenv import load_dotenv
-from relay.copilot_autopilot_relay import (
-    COPILOT_SELECTORS, CopilotWebDriver, PROCESSING_MARKERS, OUTPUT_DISCIPLINE,
-)
+from relay.copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver, PROCESSING_MARKERS
 
 load_dotenv()
+
+# Main-chat prompt clamp. Kept in TWO separate parts on purpose:
+#   * STYLE  -- kill the impl agent's advisor/lecturer/ego persona (what the user hated).
+#   * EXECUTION -- but do NOT let "be concise" become "do the minimum and stop". The full fleet
+#     OUTPUT_DISCIPLINE contains "質問には直接かつ簡潔に答えて止まる / 求められたもののみ", which on a
+#     SINGLE-TURN main-chat task made the agent HALT after the first tool result (e.g. it returned
+#     the email body and stopped instead of continuing the task). So here we explicitly tell it to
+#     keep going to completion. (The fleet doesn't need this clause because its PROTOCOL already
+#     adds the autonomous CONTINUE/DONE loop on top of the discipline; the bridge has no such loop.)
+BRIDGE_DISCIPLINE = (
+    "【スタイル規律】自我・人格・キャラ付け、助言者ぶった上から目線や決めつけ"
+    "（『今の理解レベルだと』『初心者の9割は』式）、頼まれていない講釈・長い前置き・"
+    "命令調コーチング（『まずは〜しろ』『〜を完璧に固めろ』式）は出さない。淡々と実務的に。\n"
+    "【実行規律】依頼されたタスクは途中の一手（例: メール取得）で止めず、必要なツールを"
+    "連続して使い、最後まで自律的に実行・完了させること。簡潔さのために作業を省略しない。"
+    "成果物・操作結果を出し、続けるべき作業が残っていれば自分で続行する。\n\n"
+)
 
 LOADING = '[data-testid="loading-message"]'   # holds the GROWING partial answer
 LASTMSG = '[data-testid="lastChatMessage"]'    # populates when the turn is DONE
@@ -1531,13 +1546,12 @@ class Handler(BaseHTTPRequestHandler):
         if msg.strip().startswith("/"):     # slash commands (/research, /analyze, /help)
             self._command(msg.strip())
             return
-        # PLAIN main-chat message: prepend the same OUTPUT_DISCIPLINE clamp the fleet injects
-        # every turn. Without it the bridge sent the user's text RAW, so the impl agent fell
-        # back into its "advisor/lecturer/ego" persona on main-chat turns (esp. follow-ups).
-        # The clamp only suppresses UNSOLICITED advice/persona -- explicitly requested
-        # explanations/code/lists are still produced -- so normal Q&A is unaffected. (Slash /
-        # prompt-template commands keep their own framing and are NOT wrapped.)
-        self._stream_text(OUTPUT_DISCIPLINE + "\n\n" + msg)
+        # PLAIN main-chat message: prepend BRIDGE_DISCIPLINE -- it suppresses the impl agent's
+        # advisor/lecturer/ego persona (the leak the user hit on main-chat turns) WITHOUT the
+        # full discipline's "answer concisely and stop" clause, which was halting autonomous
+        # multi-step tasks after the first tool result. Slash / prompt-template commands keep
+        # their own framing and are NOT wrapped.
+        self._stream_text(BRIDGE_DISCIPLINE + msg)
 
     def _stream_text(self, msg: str):
         """Send `msg` to the agent and stream the answer back over the ALREADY-open
