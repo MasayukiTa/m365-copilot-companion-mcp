@@ -161,6 +161,14 @@ if ($useHeadless) {
     # true background: no window at all. (verified: CDP + SSO + sends all work headless)
     $arguments += "--headless=new"
 }
+# CRITICAL (verified 2026-06-30): headless=new has no real window, so WITHOUT an explicit
+# viewport the M365 Copilot SPA renders at a tiny/zero size and FAILS to resolve a
+# `?titleId=` custom agent -- it silently falls back to the DEFAULT Copilot (the custom
+# agent like desktopfile操作 never loads, so its MCP connector tools are absent and every
+# local task lands in plain Copilot). A real window-size makes headless behave IDENTICALLY
+# to headed: with --window-size the desktopfile agent loads and list_directory executes in
+# headless. Always pass it (harmless in headed mode, where a real window already exists).
+$arguments += "--window-size=1400,1000"
 $arguments += @(
     "--user-data-dir=$dataDir",
     "--remote-debugging-port=$Port",
