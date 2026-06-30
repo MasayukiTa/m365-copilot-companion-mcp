@@ -62,7 +62,9 @@ def _log_delete(guid, title, ok, reason):
         pass
 
 from dotenv import load_dotenv
-from relay.copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver, PROCESSING_MARKERS
+from relay.copilot_autopilot_relay import (
+    COPILOT_SELECTORS, CopilotWebDriver, PROCESSING_MARKERS, OUTPUT_DISCIPLINE,
+)
 
 load_dotenv()
 
@@ -1529,7 +1531,13 @@ class Handler(BaseHTTPRequestHandler):
         if msg.strip().startswith("/"):     # slash commands (/research, /analyze, /help)
             self._command(msg.strip())
             return
-        self._stream_text(msg)
+        # PLAIN main-chat message: prepend the same OUTPUT_DISCIPLINE clamp the fleet injects
+        # every turn. Without it the bridge sent the user's text RAW, so the impl agent fell
+        # back into its "advisor/lecturer/ego" persona on main-chat turns (esp. follow-ups).
+        # The clamp only suppresses UNSOLICITED advice/persona -- explicitly requested
+        # explanations/code/lists are still produced -- so normal Q&A is unaffected. (Slash /
+        # prompt-template commands keep their own framing and are NOT wrapped.)
+        self._stream_text(OUTPUT_DISCIPLINE + "\n\n" + msg)
 
     def _stream_text(self, msg: str):
         """Send `msg` to the agent and stream the answer back over the ALREADY-open
