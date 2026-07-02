@@ -1,4 +1,4 @@
-"""Capture + cleanup half of the disk-safe batched Pro 50-run (USER has ~8GB free, so we
+"""Capture + cleanup half of the disk-safe batched Pro 50-run (the dev box has ~8GB free, so we
 never stage all 50 at once). After a fleet batch finishes:
   1) git diff each worktree in pro_wt_map.json -> append {instance_id, patch, prefix} to a preds file
   2) DELETE those worktrees so the next batch has room (shallow repos are regenerable via pro_stage_goals)
@@ -7,7 +7,7 @@ never stage all 50 at once). After a fleet batch finishes:
 """
 import argparse, json, os, shutil, subprocess
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SW = os.path.join(REPO, ".fleet", "swe")
 WTMAP = os.path.join(SW, "pro_wt_map.json")
 

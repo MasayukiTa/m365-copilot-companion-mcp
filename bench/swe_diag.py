@@ -3,7 +3,7 @@ the predictions file, and the latest swebench eval report from WSL (resolved/unr
 test log tail). Read-only."""
 import subprocess, os, json
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DISTRO = "MiasmaLab"
 
 def wsl(script, timeout=120):

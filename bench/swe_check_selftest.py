@@ -7,7 +7,7 @@ import os
 import subprocess
 import sys
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 inst = sys.argv[1] if len(sys.argv) > 1 else "astropy__astropy-12907"
 wt = os.path.join(REPO, ".fleet", "swe", "work", "wt_" + inst)
 

@@ -1,9 +1,10 @@
 #!/bin/sh
 # Build the authoritative holdout-60 verdict table from official swebench report.json artifacts.
-HL=/mnt/c/Users/USER/companion-mcp/.fleet/swe/holdout_dev.txt
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+HL="$REPO_ROOT/.fleet/swe/holdout_dev.txt"
 LD=/root/swe/logs/run_evaluation
 res=0; nores=0; noreport=0
-OUT=/mnt/c/Users/USER/companion-mcp/.fleet/swe/_verdict_table.txt
+OUT="$REPO_ROOT/.fleet/swe/_verdict_table.txt"
 : > "$OUT"
 while IFS= read -r raw; do
   inst=$(printf '%s' "$raw" | tr -d '\r' | tr -d ' ')

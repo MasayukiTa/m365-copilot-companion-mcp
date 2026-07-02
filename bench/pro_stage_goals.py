@@ -11,7 +11,7 @@ on kiyus. Shallow fetch of the exact base_commit keeps each worktree small (one 
 """
 import argparse, json, os, subprocess, shutil
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SW = os.path.join(REPO, ".fleet", "swe")
 WORK = os.path.join(SW, "work")
 FULL = json.load(open(os.path.join(SW, "pro_slice50_full.json"), encoding="utf-8"))

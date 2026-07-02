@@ -13,8 +13,19 @@ import re
 import subprocess
 import sys
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DISTRO = "MiasmaLab"
+
+
+def _to_wsl(win_path):
+    """Convert a Windows path (C:\\...) to its /mnt/<drive>/... WSL form, so the paths we hand
+    to wsl.exe/docker point at THIS checkout regardless of the folder it was cloned into."""
+    p = os.path.abspath(win_path)
+    drive, rest = os.path.splitdrive(p)
+    return "/mnt/" + drive[0].lower() + rest.replace("\\", "/")
+
+
+REPO_WSL = _to_wsl(REPO)
 
 
 def wsl(script, timeout=1000, capture=False):
@@ -84,7 +95,7 @@ def main():
     with open(predpath, "w", encoding="utf-8", newline="\n") as f:
         json.dump([{"instance_id": inst, "model_patch": diff,
                     "model_name_or_path": "companion"}], f)
-    predwsl = "/mnt/c/Users/USER/companion-mcp/.fleet/swe/preds/" + inst + ".json"
+    predwsl = REPO_WSL + "/.fleet/swe/preds/" + inst + ".json"
 
     # 3. official eval in WSL Docker.
     #    cache_level: 'env' (default) keeps the per-version environment image for fast retries
@@ -123,7 +134,7 @@ def main():
         # the bare `git checkout {base}` reset (process env, not a tracked file) so sphinx's
         # tox forwards -rA to pytest and parse_log_pytest_v2 sees PASSED lines. Additive
         # (${PYTHONPATH:+...} preserves any existing value) and a no-op for non-pytest repos.
-        "export PYTHONPATH=/mnt/c/Users/USER/companion-mcp/bench/swe_shim${PYTHONPATH:+:$PYTHONPATH}; "
+        "export PYTHONPATH=" + REPO_WSL + "/bench/swe_shim${PYTHONPATH:+:$PYTHONPATH}; "
         # this corporate network INTERMITTENTLY MITM-inspects HTTPS, breaking swebench's
         # requirements fetch from raw.githubusercontent.com (false EVAL_ERROR). The shim skips
         # verification for those PUBLIC fetches when this is set (safe on a benchmark host).

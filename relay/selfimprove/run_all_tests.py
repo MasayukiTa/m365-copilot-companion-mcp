@@ -17,7 +17,7 @@ import os
 import subprocess
 import sys
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 _SUITES = [
     # controller core (relay.selfimprove)

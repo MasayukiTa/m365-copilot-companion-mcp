@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import swe_check_remote as R
 
 
-REPO = Path(r"C:\Users\USER\companion-mcp")
+REPO = Path(__file__).resolve().parents[1]
 SWEDIR = REPO / ".fleet" / "swe"
 GRADE_DIR = SWEDIR / "_grade_batch"
 PREDS = SWEDIR / "preds_solve"

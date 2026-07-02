@@ -22,7 +22,7 @@ import os
 import random
 import sys
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUTDIR = os.path.join(REPO, ".fleet", "swe")
 PARQUET = os.path.join(OUTDIR, "SWE-bench_Lite_test.parquet")
 POOL_FILE = os.path.join(OUTDIR, "train_pool.txt")

@@ -3,7 +3,7 @@
 the improved feedback gate. Pass instance ids as argv, or default to the two that failed."""
 import json, os, subprocess, sys
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VENVPY = os.path.join(REPO, ".venv", "Scripts", "python.exe")
 CHECK = os.path.join(REPO, "bench", "swe_check.py")
 

@@ -14,7 +14,7 @@ the 50-run logs DONE or after 4h.
 import json, os, time, urllib.request
 import psutil
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SW = os.path.join(REPO, ".fleet", "swe")
 OUT = os.path.join(SW, "ram_calib.jsonl")
 STATUS = os.path.join(REPO, ".fleet", "status.json")

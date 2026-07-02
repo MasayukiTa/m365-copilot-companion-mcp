@@ -7,8 +7,9 @@ import sys
 
 import pyarrow.parquet as pq
 
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PARQUET = sys.argv[1] if len(sys.argv) > 1 else \
-    "/mnt/c/Users/USER/companion-mcp/.fleet/swe/SWE-bench_Lite_test.parquet"
+    os.path.join(_REPO, ".fleet", "swe", "SWE-bench_Lite_test.parquet")
 
 df = pq.read_table(PARQUET).to_pandas()
 print("rows:", len(df))

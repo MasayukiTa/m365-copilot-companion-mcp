@@ -13,7 +13,14 @@ param([int]$Port = 9222)
 
 $ErrorActionPreference = "SilentlyContinue"
 
-$fleet = Join-Path $PSScriptRoot ".fleet"
+# The pause file lives at <repo-root>\.fleet\edge_keep_pause, written by
+# edge_recover.surface()/touch_pause(). This script is at <repo-root>\scripts\win,
+# so resolve the repo root by walking TWO directories up from $PSScriptRoot.
+# (A plain "$PSScriptRoot\.fleet" would look in scripts\win\.fleet, which never
+# exists, so the pause would never take effect and this loop would fight the user
+# mid-login.)
+$repoRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+$fleet = Join-Path $repoRoot ".fleet"
 $pauseFile = Join-Path $fleet "edge_keep_pause"
 
 Add-Type @"

@@ -18,7 +18,7 @@ import json
 import os
 import sys
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE = os.path.join(REPO, ".fleet")
 CMDS = os.path.join(STATE, "commands.json")
 STATUS = os.path.join(STATE, "status.json")

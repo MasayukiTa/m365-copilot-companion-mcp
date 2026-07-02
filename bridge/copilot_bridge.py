@@ -186,17 +186,28 @@ def _wait_composer(timeout=40):
     for _ in range(timeout):
         PAGE.wait_for_timeout(1000)
         if PAGE.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+            # If we surfaced the hidden Edge for sign-in, auth is now done (the
+            # composer rendered) -> drop the window back to the background at once.
+            if surfaced:
+                try:
+                    from relay.edge_recover import rehide
+                    rehide()
+                except Exception:
+                    pass
             return True
         # the dedicated Edge runs hidden in the background -- if a sign-in page shows up,
-        # bring it to the foreground once so the user can authenticate.
-        if not surfaced:
-            try:
-                from relay.edge_recover import surface, looks_like_login
-                if looks_like_login(PAGE.url):
+        # bring it to the foreground once so the user can authenticate. While the login
+        # page is still up, refresh the keeper's pause file every ~1s so a slow MFA login
+        # is not re-minimized out from under the user (the 180s backoff would else expire).
+        try:
+            from relay.edge_recover import surface, looks_like_login, touch_pause
+            if looks_like_login(PAGE.url):
+                if not surfaced:
                     surface()
                     surfaced = True
-            except Exception:
-                pass
+                touch_pause()
+        except Exception:
+            pass
     return False
 
 
@@ -228,6 +239,7 @@ def _goto_settled(url, timeout=25000, tries=3, compose_wait=40):
     how many seconds to wait for the composer each attempt -- keep it SHORT for interactive reads
     (/history) so an unreachable conversation fails fast instead of hanging the single-threaded
     bridge for minutes."""
+    surfaced = False
     for _ in range(max(1, tries)):
         try:
             PAGE.goto(url, wait_until="domcontentloaded", timeout=timeout)
@@ -235,15 +247,37 @@ def _goto_settled(url, timeout=25000, tries=3, compose_wait=40):
             pass
         _wait_composer(compose_wait)
         if not _looks_redirected(PAGE.url or "", url):
+            # Landed on the requested surface. If we had surfaced the hidden Edge for a
+            # sign-in wall, auth has completed -> return it to the background at once.
+            if surfaced:
+                try:
+                    from relay.edge_recover import rehide
+                    rehide()
+                except Exception:
+                    pass
             return True
         try:
-            from relay.edge_recover import surface, looks_like_login
+            from relay.edge_recover import surface, looks_like_login, touch_pause
             if looks_like_login(PAGE.url or ""):
-                surface()
+                # Surface once so the user can sign in; keep the keeper backed off while the
+                # login page is still showing so a slow MFA login is not re-minimized.
+                if not surfaced:
+                    surface()
+                    surfaced = True
+                touch_pause()
         except Exception:
             pass
         PAGE.wait_for_timeout(1500)
-    return not _looks_redirected(PAGE.url or "", url)
+    settled = not _looks_redirected(PAGE.url or "", url)
+    # If we surfaced but the wall never cleared, still rehide so a failed/abandoned
+    # sign-in does not leave the companion Edge stuck in the foreground.
+    if surfaced:
+        try:
+            from relay.edge_recover import rehide
+            rehide()
+        except Exception:
+            pass
+    return settled
 
 
 def _reap_orphan_tabs():

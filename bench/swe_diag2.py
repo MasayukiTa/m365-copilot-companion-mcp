@@ -2,7 +2,7 @@
 can see the real assertion/traceback that the agent never received as feedback."""
 import subprocess, os
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DISTRO = "MiasmaLab"
 
 def wsl(script, timeout=120):

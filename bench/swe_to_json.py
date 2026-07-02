@@ -2,12 +2,14 @@
 a local --dataset_name (so evaluation never touches the corp-blocked HF). Run with WSL venv.
 """
 import json
+import os
 import sys
 
 import pyarrow.parquet as pq
 
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PARQUET = sys.argv[1] if len(sys.argv) > 1 else \
-    "/mnt/c/Users/USER/companion-mcp/.fleet/swe/SWE-bench_Lite_test.parquet"
+    os.path.join(_REPO, ".fleet", "swe", "SWE-bench_Lite_test.parquet")
 OUT = sys.argv[2] if len(sys.argv) > 2 else "/root/swe/lite_local.json"
 
 df = pq.read_table(PARQUET).to_pandas()

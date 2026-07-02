@@ -3,7 +3,7 @@ files can be overwritten), rebuild both to their real paths via the existing bui
 (which also relaunch them), and confirm both came back up."""
 import os, subprocess, time
 
-UI = r"C:\Users\USER\companion-mcp\ui"
+UI = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ui")
 
 for img in ["CopilotChat.exe", "FleetCockpit.exe"]:
     r = subprocess.run(["taskkill", "/F", "/IM", img], capture_output=True, text=True, errors="replace")

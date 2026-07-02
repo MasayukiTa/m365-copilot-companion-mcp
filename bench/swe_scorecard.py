@@ -66,7 +66,7 @@ import os
 import re
 import sys
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SWEDIR = os.path.join(REPO, ".fleet", "swe")
 STATUS = os.path.join(REPO, ".fleet", "status.json")
 TRANSCRIPTS = os.path.join(REPO, ".fleet", "transcripts")
