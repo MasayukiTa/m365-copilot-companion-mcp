@@ -1,4 +1,4 @@
-# CI for companion-mcp — runs the hermetic Python unit tests.
+# CI for m365-copilot-companion-mcp — runs the hermetic Python unit tests.
 #
 # "Hermetic" here means: no Edge/Playwright browser, no M365/Copilot login,
 # no :8000/:8011 server, no GPU, no pywin32 (Linux-only exclusion), no network

@@ -102,6 +102,99 @@ def surface(port=9222):
         return False
 
 
+def touch_pause():
+    """Create/refresh the <repo>\\.fleet\\edge_keep_pause mtime so the background
+    keeper (edge_keeper.ps1) keeps backing off. surface() writes this file ONCE at
+    the start of sign-in, but the keeper's age check expires after 180s -- a slow
+    MFA login would then get re-minimized mid-typing. Callers driving a login wait
+    loop call this every iteration (~1s) to keep the pause fresh for as long as the
+    login page is showing. Thread-safe (pure filesystem, no Playwright); swallows
+    errors so a wait loop never dies on a transient FS hiccup."""
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    fleet = os.path.join(repo, ".fleet")
+    try:
+        os.makedirs(fleet, exist_ok=True)
+        with open(os.path.join(fleet, "edge_keep_pause"), "w") as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
+
+
+# PowerShell snippet that finds the DEDICATED companion Edge's top-level window
+# (msedge process whose command line contains 'copilot-companion-edge', its
+# Chrome_WidgetWin_1 window) and MINIMIZES it right away (ShowWindow SW_MINIMIZE=6).
+# Mirrors the Find()/ShowWindow technique in scripts\win\edge_keeper.ps1. ASCII only.
+_REHIDE_PS = r'''
+$ErrorActionPreference = "SilentlyContinue"
+Add-Type @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+public class RK {
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] static extern int GetClassName(IntPtr h, StringBuilder s, int max);
+  [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr h);
+  delegate bool EnumProc(IntPtr h, IntPtr p);
+  public static IntPtr Find(int[] pids) {
+    IntPtr found = IntPtr.Zero;
+    HashSet<int> set = new HashSet<int>(pids);
+    EnumWindows(delegate(IntPtr h, IntPtr p) {
+      uint pid; GetWindowThreadProcessId(h, out pid);
+      if (set.Contains((int)pid)) {
+        StringBuilder sb = new StringBuilder(64); GetClassName(h, sb, 64);
+        if (sb.ToString() == "Chrome_WidgetWin_1" && GetWindowTextLength(h) > 0) { found = h; return false; }
+      }
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
+}
+"@
+$pids = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
+          Where-Object { $_.CommandLine -match 'copilot-companion-edge' } |
+          ForEach-Object { [int]$_.ProcessId })
+if ($pids.Count -gt 0) {
+  $h = [RK]::Find($pids)
+  if ($h -ne [IntPtr]::Zero -and -not [RK]::IsIconic($h)) {
+    [RK]::ShowWindow($h, 6) | Out-Null
+  }
+}
+'''
+
+
+def rehide():
+    """Return the companion Edge to the background IMMEDIATELY once auth completes:
+    delete the keeper's pause file (so it resumes its 2s re-minimize duty) and
+    directly minimize the window RIGHT NOW rather than waiting up to 2s for the
+    keeper's next tick. Shells out to a PowerShell snippet that finds the dedicated
+    Edge (command line contains 'copilot-companion-edge') and calls ShowWindow(6)
+    on its Chrome_WidgetWin_1 window -- mirrors edge_keeper.ps1. Thread-safe like
+    surface() (no Playwright) and swallows all errors."""
+    import subprocess
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    fleet = os.path.join(repo, ".fleet")
+    # Remove the pause first so the keeper is free to re-minimize on its own tick too.
+    try:
+        pf = os.path.join(fleet, "edge_keep_pause")
+        if os.path.isfile(pf):
+            os.remove(pf)
+    except Exception:
+        pass
+    # Minimize immediately so the window drops to the background without a 2s lag.
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", _REHIDE_PS],
+            cwd=repo, timeout=20,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+
 def companion_edge_mb(profile_marker="copilot-companion-edge"):
     """Total resident memory (MB) of the DEDICATED companion Edge -- isolated from the
     user's main Edge by matching `profile_marker` (its user-data-dir) in the command line.

@@ -2,7 +2,8 @@
 # Prepare 3 astropy working copies (git worktrees) at the pilot base_commits, so each fleet
 # job edits its own checkout. Blobless clone keeps it light; worktrees share the object store.
 set -e
-WORK="/c/Users/USER/companion-mcp/.fleet/swe/work"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+WORK="$REPO_ROOT/.fleet/swe/work"
 mkdir -p "$WORK"
 cd "$WORK"
 if [ ! -d astropy-main/.git ]; then

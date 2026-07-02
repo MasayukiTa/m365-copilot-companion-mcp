@@ -2,7 +2,7 @@
 ## Quiet Operations Ledger — Fleet & Main Screen Redesign
 
 **Created:** 2026-06-28  
-**Source direction:** `Desktop/companion_agent_visual_direction.md`  
+**Source direction:** `Desktop/agent_visual_direction.md`  
 **Scope:** Three canonical states × two windows (Fleet Option A + Main Option B). No .cs edits. No commit.
 
 ---
@@ -136,7 +136,7 @@ Used as a pre-flight confirmation before a long-running delegation (e.g., overni
 ║  └──────────────────────────────────────────────┘   ║
 ║                                                      ║
 ║  Scope                                               ║
-║  repo: companion-mcp  (from --folder arg)  [REAL]      ║
+║  repo: m365-companion  (from --folder arg)  [REAL]   ║
 ║                                                      ║
 ║  Allowed                                             ║
 ║  edit files · run tests · read docs      [REAL]      ║
@@ -300,7 +300,7 @@ Example: 4 lanes, mixed phases, W2 needs attention.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│ companion Agent                                    [Fleet] [⚙] [◑]   │
+│ M365 Companion Agent                             [Fleet] [⚙] [◑]   │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                      │
 │  (conversation / latest answer)                                      │
@@ -488,7 +488,7 @@ Example: run finished or partially failed. W0, W1, W3 done; W2 stopped (maxturns
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│ companion Agent                                    [Fleet] [⚙] [◑]   │
+│ M365 Companion Agent                             [Fleet] [⚙] [◑]   │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                      │
 │  ┌─────────────────────────────────────────────────────────────┐    │
@@ -583,7 +583,7 @@ When a lane row is expanded (click or chevron), a detail drawer opens below it. 
 │                                                                     │
 │  verify_attempts: 2 → verified: true                  [REAL]        │
 │  eval_busy_until: —                                   [REAL]        │
-│  cwd: /companion-mcp                                    [REAL]        │
+│  cwd: /m365-companion                                 [REAL]        │
 │  conv_url: https://...                                [REAL]        │
 └────────────────────────────────────────────────────────────────────┘
 ```

@@ -20,7 +20,7 @@ import os
 import subprocess
 import sys
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SW = os.path.join(REPO, ".fleet", "swe")
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "bench"))

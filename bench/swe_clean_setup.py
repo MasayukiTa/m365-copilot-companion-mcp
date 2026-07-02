@@ -10,7 +10,7 @@ import os
 import subprocess
 from collections import defaultdict
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SW = os.path.join(REPO, ".fleet", "swe")
 HOLD = set(l.strip() for l in open(os.path.join(SW, "holdout_dev.txt"), encoding="utf-8") if l.strip())
 BURNED = {"psf__requests-2148", "psf__requests-2317", "sphinx-doc__sphinx-7738",

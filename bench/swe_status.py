@@ -2,7 +2,7 @@
 and WSL docker activity (running containers + any swebench eval process)."""
 import json, os, subprocess
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DISTRO = "MiasmaLab"
 
 def run(cmd):

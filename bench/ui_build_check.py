@@ -5,7 +5,7 @@ import os, subprocess
 FW = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319"
 CSC = os.path.join(FW, "csc.exe")
 WPF = os.path.join(FW, "WPF")
-UI = r"C:\Users\USER\companion-mcp\ui"
+UI = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ui")
 OUT = os.path.join(UI, "_buildcheck")
 os.makedirs(OUT, exist_ok=True)
 

@@ -10,7 +10,7 @@ import re
 import shutil
 import time
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SWE = os.path.join(REPO, ".fleet", "swe")
 STATUS = os.path.join(REPO, ".fleet", "status.json")
 LOG = os.path.join(SWE, "run_until_done.log")

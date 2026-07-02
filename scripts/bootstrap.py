@@ -362,7 +362,12 @@ def step_dev_tunnel() -> None:
         if cand.exists():
             dt = str(cand)
 
-    tunnel = "m365-copilot-companion"
+    # Prefer the user's chosen tunnel name (MCP_TUNNEL_NAME in .env) when set, else
+    # the default. Without this, provisioning a renamed setup that happens to be
+    # missing MCP_TUNNEL_URL would target the DEFAULT tunnel, and _write_tunnel_to_env
+    # would then overwrite MCP_TUNNEL_NAME -- silently flipping a renamed setup back to
+    # the default. Mirrors setup_devtunnel.ps1, which reads MCP_TUNNEL_NAME from .env.
+    tunnel = _read_env_value("MCP_TUNNEL_NAME") or "m365-copilot-companion"
 
     # This step must NEVER wall a clean-PC novice. The script that actually
     # installs devtunnel (without winget) and walks the interactive Microsoft

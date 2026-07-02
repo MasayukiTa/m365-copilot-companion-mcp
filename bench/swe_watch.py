@@ -3,7 +3,8 @@ heartbeat, and a final summary; exit 0 when the run is no longer running. Covers
 states (done/stuck/verify_failed) so silence never masks a crash."""
 import json, os, time, sys
 
-STATUS = r"C:\Users\USER\companion-mcp\.fleet\status.json"
+STATUS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                      ".fleet", "status.json")
 prev = {}
 hb = 0
 while True:

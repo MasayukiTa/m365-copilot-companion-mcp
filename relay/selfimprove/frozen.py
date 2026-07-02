@@ -24,7 +24,7 @@ import os
 import sys
 from typing import Iterable
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Repo-relative paths that form the frozen judge / constitution. Missing files at runtime are not an
 # error here (they map to "MISSING"); `frozen_intact` treats a baseline-present-now-MISSING file as a

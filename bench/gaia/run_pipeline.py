@@ -26,7 +26,7 @@ from urllib.error import URLError
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent  # companion-mcp/
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent  # repo root
 VENV_PY = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
 FLEET_GAIA = REPO_ROOT / ".fleet" / "gaia"
 FLEET_BENCH = REPO_ROOT / ".fleet" / "bench"

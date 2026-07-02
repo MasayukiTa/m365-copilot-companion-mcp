@@ -51,7 +51,7 @@ Prerequisites
 
 How to run
 ----------
-From the repo root (C:\Users\USER\companion-mcp):
+From the repo root:
 
   .venv\Scripts\python.exe bench\m365eval\runner.py --runid TEST20260625
 

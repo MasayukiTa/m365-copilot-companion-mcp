@@ -6,7 +6,7 @@
 # `while read ... done < file` lets that child consume the rest of the file and the loop
 # exits after one iteration. Fix: read on FD 3, and give the child `</dev/null`.
 # Resumable: an instance already present in the results file is skipped.
-cd /c/Users/USER/companion-mcp
+cd "$(dirname "$0")/.."
 RES=.fleet/swe/_remeasure_results.txt
 touch "$RES"
 export SWE_HTTPBIN_URL="http://httpbin.org/"
