@@ -45,6 +45,116 @@ DEFAULT_PROBE = (
 CONSENT_MARKERS = ("接続マネージャーを開く", "connection manager")
 NO_CONNECTOR_MARKERS = ("実行不可", "コネクタ無し", "コネクタがありません", "ツールが使用できません")
 
+# Commit buttons for the connection-select / consent dialog. 送信する = the older
+# 接続の作成または選択 dialog; 許可 = the newer 接続して続行する dialog. First one present wins.
+COMMIT_LABELS = ("送信する", "送信", "Submit", "許可", "Allow")
+# Text that means at least one connection is still not usable, used to derive stale_left.
+STALE_MARKERS = ("古い", "期限切れ", "未接続")
+
+
+def _repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+# Where the connection-manager (接続の管理 / user-connections) URL is cached so the relay can
+# DIRECT-HIT it next time instead of re-driving the 接続マネージャーを開く popup. The URL is
+# per-conversation but the /auth landing page reliably lists all connections, so a cached URL is
+# reusable across runs until it 404s/redirects to login.
+CONN_URL_CACHE = os.path.join(_repo_root(), ".fleet", "conn_manager_url.txt")
+
+
+def save_conn_url(url: str) -> None:
+    """Persist the connection-manager URL for later DIRECT-HIT. Best-effort; never raises."""
+    try:
+        if not url:
+            return
+        os.makedirs(os.path.dirname(CONN_URL_CACHE), exist_ok=True)
+        with open(CONN_URL_CACHE, "w", encoding="utf-8") as fh:
+            fh.write(url.strip())
+    except Exception:
+        pass
+
+
+def load_conn_url() -> str:
+    """Return the cached connection-manager URL, or '' if none. Never raises."""
+    try:
+        with open(CONN_URL_CACHE, "r", encoding="utf-8") as fh:
+            return (fh.read() or "").strip()
+    except Exception:
+        return ""
+
+
+def _stale_left(page) -> bool:
+    """True if any レビュー control remains OR the body text still mentions a stale connection."""
+    try:
+        rev = page.locator(
+            'xpath=//*[self::a or self::button or @role="button"][normalize-space()="レビュー"'
+            ' or normalize-space()="Review"]')
+        if rev.count():
+            return True
+    except Exception:
+        pass
+    try:
+        body = (page.locator("body").inner_text() or "")
+        return any(m in body for m in STALE_MARKERS)
+    except Exception:
+        return False
+
+
+def fix_all_stale_connections(page, max_rounds: int = 12) -> dict:
+    """Given a Playwright page ALREADY on the connection-manager (接続の管理 / user-connections)
+    page, re-establish EVERY stale ("古い") connection -- NO credential entry (the Bearer key is
+    already on the connector; this only re-selects + commits the connection).
+
+    For each round: find every 「レビュー」/「Review」 control (regardless of row name), click the
+    first one, and in the resulting dialog click whichever commit button exists (送信する/送信/
+    Submit/許可/Allow). Wait for the dialog to close, then re-scan. Reload between rounds so the
+    freshly-committed row drops out of the レビュー set. Loop until no レビュー control remains or
+    max_rounds is reached. Returns {"submitted": N, "stale_left": bool}."""
+    submitted = 0
+    for _ in range(max_rounds):
+        try:
+            rev = page.locator(
+                'xpath=//*[self::a or self::button or @role="button"][normalize-space()="レビュー"'
+                ' or normalize-space()="Review"]')
+            n = rev.count()
+        except Exception:
+            n = 0
+        if not n:
+            break                                   # no stale row left
+        try:
+            el = rev.first
+            el.scroll_into_view_if_needed()
+            el.click()
+            page.wait_for_timeout(3000)             # let the select/consent dialog render
+        except Exception:
+            break
+        # commit whichever button the dialog offers (pre-selected connection -> just confirm)
+        did_commit = False
+        for label in COMMIT_LABELS:
+            try:
+                btn = page.locator('button:has-text("%s")' % label)
+                if btn.count():
+                    btn.first.click()
+                    submitted += 1
+                    did_commit = True
+                    page.wait_for_timeout(4000)     # wait for the dialog to close / commit
+                    break
+            except Exception:
+                continue
+        # reload so the committed row leaves the レビュー set; if nothing committed, reload anyway
+        # to recover from a dialog that opened without a recognized button (avoids an infinite loop
+        # clicking the same レビュー).
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(6000)
+        except Exception:
+            pass
+        if not did_commit:
+            # couldn't commit this レビュー -> stop rather than spin; report stale_left honestly
+            break
+    return {"submitted": submitted, "stale_left": _stale_left(page)}
+
 
 def _load_agent_url() -> str:
     try:
@@ -58,10 +168,24 @@ def _load_agent_url() -> str:
 
 
 def click_through_consent(page) -> bool:
-    """Click the MCP connection-consent card through to a committed connection.
-    Mirrors RelayWorker._auto_consent: 接続マネージャーを開く (popup) -> レビュー ->
-    送信する. NOT a credential entry. Returns True iff 送信する was clicked."""
+    """Click the MCP connection-consent card through to a committed connection. NOT a credential
+    entry. Handles two variants:
+      (a) the chat card itself has a 許可/Allow button (接続して続行する) -> one click completes it;
+      (b) the card has a 接続マネージャーを開く link -> open the popup, cache its URL, then
+          fix ALL stale rows via fix_all_stale_connections.
+    Returns True iff a commit happened."""
     try:
+        # variant (a): 許可/Allow directly on the chat card -> single click completes consent.
+        for label in ("許可", "Allow"):
+            try:
+                btn = page.locator('button:has-text("%s")' % label)
+                if btn.count():
+                    btn.first.click()
+                    page.wait_for_timeout(4000)
+                    return True
+            except Exception:
+                continue
+        # variant (b): 接続マネージャーを開く opens the connection-manager popup.
         ctx = page.context
         link = page.locator('a:has-text("接続マネージャーを開く"), a:has-text("connection manager")')
         if not link.count():
@@ -83,24 +207,11 @@ def click_through_consent(page) -> bool:
             except Exception:
                 break
             cs.wait_for_timeout(2000)
-        try:                             # stale connection -> レビュー opens the select dialog
-            rev = cs.locator('a:has-text("レビュー"), button:has-text("レビュー"), a:has-text("Review")')
-            if rev.count():
-                rev.first.click()
-                cs.wait_for_timeout(3000)
+        try:
+            save_conn_url(cs.url)         # cache the settled URL for later DIRECT-HIT
         except Exception:
             pass
-        submitted = False                # the connection is pre-selected -> just submit
-        for label in ("送信する", "送信", "Submit"):
-            try:
-                btn = cs.locator('button:has-text("%s")' % label)
-                if btn.count():
-                    btn.first.click()
-                    cs.wait_for_timeout(4000)
-                    submitted = True
-                    break
-            except Exception:
-                continue
+        res = fix_all_stale_connections(cs)   # fix ALL stale rows, not just the first
         try:
             cs.close()
         except Exception:
@@ -109,20 +220,23 @@ def click_through_consent(page) -> bool:
             page.bring_to_front()
         except Exception:
             pass
-        return submitted
+        return res.get("submitted", 0) > 0
     except Exception:
         return False
 
 
-def reconnect_via_connection_manager(cdp_url: str, conn_url: str, want: str = "260616test",
-                                     max_rounds: int = 6) -> dict:
+def reconnect_via_connection_manager(cdp_url: str, conn_url: str, want: str = "",
+                                     max_rounds: int = 12) -> dict:
     """Re-establish stale ("古い") connector connections directly on the Copilot Studio
-    user-connections page -- NO credential entry (the Bearer key is already on the
-    connector; this only re-selects + commits the connection). Proven flow (2026-06-30):
-    navigate to the .../conversations/<id>/user-connections page (already signed in in the
-    companion Edge profile) -> for each `want` row showing レビュー, click レビュー -> the
-    接続の作成または選択 dialog opens with the connection pre-selected (green check) -> click
-    送信する. Repeat until no `want` row is stale. Returns a summary dict."""
+    user-connections page -- NO credential entry (the Bearer key is already on the connector;
+    this only re-selects + commits the connection). Proven flow (2026-06-30): navigate to the
+    .../conversations/<id>/user-connections page (already signed in in the companion Edge
+    profile) -> for each row showing レビュー, click レビュー -> the 接続の作成または選択 dialog
+    opens with the connection pre-selected -> click 送信する (or 許可 in the newer dialog).
+
+    `want`="" (default) fixes ALL stale rows via fix_all_stale_connections. When `want` is a
+    non-empty name, only レビュー controls whose row text contains that name are clicked (the
+    original CLI behavior). Returns a summary dict."""
     from playwright.sync_api import sync_playwright
     out = {"ok": False, "rounds": 0, "submitted": 0, "any_stale_left": True, "url": ""}
     with sync_playwright() as p:
@@ -133,8 +247,19 @@ def reconnect_via_connection_manager(cdp_url: str, conn_url: str, want: str = "2
             page.goto(conn_url, wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(8000)
             out["url"] = page.url
+            save_conn_url(page.url)          # cache for later DIRECT-HIT
+
+            if not want:
+                # ALL rows -> shared helper drives every レビュー regardless of name.
+                res = fix_all_stale_connections(page, max_rounds=max_rounds)
+                out["submitted"] = res["submitted"]
+                out["rounds"] = res["submitted"]
+                out["any_stale_left"] = res["stale_left"]
+                out["ok"] = (res["submitted"] > 0) and not res["stale_left"]
+                return out
+
+            # name-filtered path (preserve the --want CLI flag).
             for _ in range(max_rounds):
-                # a レビュー control whose row text contains `want`
                 rev = page.locator(
                     'xpath=//*[self::a or self::button or @role="button"][normalize-space()="レビュー"'
                     ' or normalize-space()="Review"]')
@@ -159,7 +284,8 @@ def reconnect_via_connection_manager(cdp_url: str, conn_url: str, want: str = "2
                     break
                 submit = page.locator(
                     'xpath=//button[normalize-space()="送信する" or normalize-space()="送信"'
-                    ' or normalize-space()="Submit"]')
+                    ' or normalize-space()="Submit" or normalize-space()="許可"'
+                    ' or normalize-space()="Allow"]')
                 if submit.count():
                     try:
                         submit.first.click()
@@ -170,10 +296,9 @@ def reconnect_via_connection_manager(cdp_url: str, conn_url: str, want: str = "2
             page.reload()
             page.wait_for_timeout(8000)
             body = (page.locator("body").inner_text() or "")
-            # any `want` row still 古い?
             stale = False
             for line in body.splitlines():
-                if want in line and ("古い" in line or "期限切れ" in line or "未接続" in line):
+                if want in line and any(m in line for m in STALE_MARKERS):
                     stale = True
                     break
             out["any_stale_left"] = stale
@@ -241,14 +366,16 @@ def main(argv=None):
     ap.add_argument("--reconnect-url", default="",
                     help="Copilot Studio .../user-connections page URL. When set, drive that "
                          "page (レビュー -> 送信する) to re-establish stale connections, no chat probe.")
-    ap.add_argument("--want", default="260616test",
-                    help="connector row name to reconnect on the user-connections page")
+    ap.add_argument("--want", default="",
+                    help="connector row name to reconnect on the user-connections page; "
+                         "empty (default) = fix ALL stale rows regardless of name")
     args = ap.parse_args(argv)
     if args.reconnect_url:
         res = reconnect_via_connection_manager(args.cdp_url, args.reconnect_url, args.want)
         print(json.dumps(res, ensure_ascii=False, indent=2))
         if res.get("ok"):
-            print("\nRECONNECT OK: all '%s' connections are no longer stale." % args.want)
+            scope = ("'%s'" % args.want) if args.want else "all"
+            print("\nRECONNECT OK: %s connections are no longer stale." % scope)
             return 0
         print("\nReconnect incomplete -- see summary (any_stale_left).")
         return 1
