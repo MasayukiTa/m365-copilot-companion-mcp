@@ -507,6 +507,10 @@ git clone https://github.com/MasayukiTa/m365-copilot-companion-mcp.git
 # エクスプローラーで quickstart.bat をダブルクリック（または PowerShell から実行）
 ```
 
+> **git を使わない人（ZIP でダウンロードする）:** GitHub のページを開き → 緑色の「**Code**」ボタン → 「**Download ZIP**」→ ダウンロードした zip を**解凍**（右クリック →「**すべて展開**」）→ 展開したフォルダ内の `quickstart.bat` を**ダブルクリック**。以降は git 版と全く同じです（`.git` が無いので STEP 3 の更新確認は自動でスキップされます）。
+
+> **quickstart 実行中に英語の質問が出たら、基本はそのまま `Enter` を押せば安全な既定が選ばれます。** 迷ったら Enter で問題ありません。
+
 `quickstart.bat` は **最初の 1 回で全部をガイドする 7 ステップ**になっています。**Copilot Studio の設定（STEP 5）だけが手作業**で、それ以外はクリックとコピペだけで進みます。
 
 1. **`setup.bat` で Python 環境をブートストラップ。** Python が無ければ `uv`（Astral）を自動取得し `.venv` を作り `requirements.txt` を入れる。管理者不要・再開可能。
@@ -561,6 +565,8 @@ git clone https://github.com/MasayukiTa/m365-copilot-companion-mcp.git
 | `MCP_CDP_URL` | 専用 Edge の CDP エンドポイント（既定 `http://localhost:9222`） | 変更不要 |
 | `MCP_BRIDGE_PORT` | ブリッジ UI のポート（既定 `8765`） | 変更不要 |
 | `MCP_DB_<NAME>` | ODBC 接続文字列（社内 DB を使うなら追記） | 任意 |
+
+> **`.env` に自動で書き込まれるキー（あなたは触らなくてよい）:** セットアップは `MCP_API_KEY`・`MCP_UNLOCK_PASSWORD`（`quickstart`/`setup` が乱数生成）、`MCP_UNLOCK_TTL_DAYS`・`MCP_ALLOWED_BASE`・`MCP_TOOL_MAP` 系（`MCP_TOOL_MAP`／`MCP_TOOL_MAP_MAX`。テンプレートからそのままコピー）を書き込みます。続いて Dev Tunnel ステップ（`setup_devtunnel.ps1`）が `MCP_TUNNEL_NAME`・`MCP_TUNNEL_URL` を、エージェント URL ダイアログ（`configure_env`）が `MCP_IMPL_AGENT_URL` などの各エージェント URL を追記します。**これら以外（bridge / relay / ODBC などの任意項目）は、あなたが自分で有効化するまで `.env` 内でコメントアウトされたまま**です。
 
 ---
 
@@ -621,20 +627,26 @@ sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File 
 
 **人間がやること（順番どおりにクリックする）:**
 
-1. Copilot Studio にサインインし、「**エージェント**」→「**新しいエージェント**」（または既存エージェントを開く）。
-2. エージェントの編集画面で「**ツール**」タブ（または「ツールを追加」ボタン）→「**ツールを追加**」をクリック。（要確認）メニューの名称は Copilot Studio のバージョンによって「アクション」→「新しいアクション」→「外部」と表示される場合があります。
-3. 一覧から「**Model Context Protocol**」（MCP）を選択。
-4. 以下の値を入力する。
-   > 💡 **この3値は手で組み立てなくてOK。`copilot_studio_values.bat` をダブルクリック**すると、あなたの `.env` ＋ Dev Tunnel から**実際の値をそのまま表示**します（quickstart の STEP 5 でも自動表示）。コピペするだけ。
+1. Copilot Studio にサインインし、対象の**エージェント**を開く（無ければ「**新しいエージェント**」で作成）。
+2. エージェントの編集画面で「**ツール**」→「**ツールを追加**」（または「**新しいツール**」）をクリック。
+3. タイルの選択画面（**プロンプト** / **エージェント フロー** / **コンピューターの使用** / **モデル コンテキスト プロトコル** / **カスタム コネクタ** / **REST API**）が出るので、「**モデル コンテキスト プロトコル**」を選ぶ。
+4. ダイアログに以下を入力する（**サーバー名** / **サーバーの記述** / **サーバー URL** / **認証** の順に欄がある）。
+   > 💡 **この値は手で組み立てなくてOK。`copilot_studio_values.bat` をダブルクリック**すると、あなたの `.env` ＋ Dev Tunnel から**実際の値をそのまま表示**します（quickstart の STEP 5 でも自動表示）。コピペするだけ。
 
    | 項目 | 入力値 |
    |---|---|
+   | **サーバー名** | 任意（例: `companion`） |
+   | **サーバーの記述** | 任意（空でも可） |
    | **サーバー URL** | `https://<your-tunnel>-8000.<region>.devtunnels.ms/mcp` （= `MCP_TUNNEL_URL` + `/mcp`） |
-   | **認証の種類** | 「API キー（手動）」または「ヘッダー」 |
+   | **認証** | 「**API キー**」を選ぶ（他に「なし」「OAuth 2.0」がある） |
+   | **タイプ** | 「**ヘッダー**」を選ぶ（「クエリ」ではない。認証で「API キー」を選ぶと現れる） |
    | **ヘッダー名** | `Authorization` |
-   | **ヘッダー値** | `Bearer <MCP_API_KEY の値>` （STEP 1 でコンソールに表示された値） |
+   | **API キーの値** | `Bearer <MCP_API_KEY の値>` （STEP 1 でコンソールに表示された値） |
 
-5. 「**保存**」→「**接続を追加**」（または「テスト」）をクリック。ツール一覧がロードされれば成功。
+   > ⚠️ **「API キーの値」欄には `Bearer ` という単語と半角スペースを含めて丸ごと貼ってください**（例: `Bearer 4baf1c2e...`）。UI のラベルが「API キー」なので生のキーだけを貼りがちですが、それだと 401 になります。`copilot_studio_values.bat` の出力はこの `Bearer ` 込みの行なので、その行をそのまま貼れば確実です。
+   > （なお本サーバーは救済策として、`Bearer ` を付け忘れて生のキーだけを貼った場合でも認証が通るように内部で補正します。ただし迷ったら上記どおり `Bearer ` 込みで貼るのが正です。）
+
+5. 「**作成**」をクリック → 接続がテストされ、ツール一覧がロードされれば成功。
 
 6. 「**公開**」→「**利用者を自分だけ**」に設定（必ず自分のみ。組織全体は絶対に選ばない）。
 
