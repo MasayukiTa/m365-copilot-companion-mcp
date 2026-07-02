@@ -384,6 +384,45 @@ if __name__ == "__main__":
                 scope["headers"] = hdrs
             await self.app(scope, receive, send)
 
+    class _BearerPrefix:
+        """Tolerate an Authorization header that is the RAW API key (no scheme).
+
+        Copilot Studio's MCP connector labels the credential field "API key" (auth
+        type = API key, header name = Authorization), so a novice pastes the raw
+        MCP_API_KEY with NO "Bearer " prefix. StaticTokenVerifier then never sees a
+        valid bearer token and returns 401 with no clue. This middleware normalises
+        the header to "Bearer <value>" when the value does not already start
+        (case-insensitively) with "bearer " -- so both the correct "Bearer <key>"
+        form and the raw "<key>" form authenticate. Safe because this server only
+        uses static tokens: the rewrite just supplies the scheme the verifier wants
+        and the wrong key still fails downstream (401).
+
+        This MUST wrap the finished app as the OUTERMOST ASGI layer: FastMCP inserts
+        the auth (RequireAuth) middleware BEFORE anything passed via http_app(middleware=),
+        so a header rewrite handed to that param would run too late (after auth already
+        401'd). Wrapping the returned app puts the rewrite ahead of auth."""
+
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") == "http":
+                new_hdrs = []
+                changed = False
+                for (k, v) in (scope.get("headers") or []):
+                    if k.lower() == b"authorization":
+                        val = v.strip()
+                        # Only rewrite when a value is present and it doesn't already
+                        # carry a bearer scheme (any casing: "Bearer", "bearer", ...).
+                        if val and not val.lower().startswith(b"bearer "):
+                            v = b"Bearer " + val
+                            changed = True
+                    new_hdrs.append((k, v))
+                if changed:
+                    scope = dict(scope)
+                    scope["headers"] = new_hdrs
+            await self.app(scope, receive, send)
+
     app = mcp.http_app(path="/mcp", transport="streamable-http",
                        json_response=True, middleware=[Middleware(_AcceptBoth)])
 
@@ -391,8 +430,15 @@ if __name__ == "__main__":
     # Mounts POST /v1/chat/completions + GET /v1/models on this SAME uvicorn app
     # ONLY when OPENAI_COMPAT=1; otherwise it is a no-op and /mcp is unchanged.
     # Lets any OpenAI-API harness use the Copilot-routed Opus 4.8 as its backend.
+    # NOTE: must run on the raw Starlette `app` (needs app.router.routes) BEFORE the
+    # _BearerPrefix wrap below turns `app` into a bare ASGI callable.
     from relay.openai_adapter import register_openai_routes
     if register_openai_routes(app):
         print("[main] OpenAI-compat routes mounted: POST /v1/chat/completions, GET /v1/models")
+
+    # Wrap OUTERMOST so the raw-key -> "Bearer <key>" rewrite happens before FastMCP's
+    # auth middleware sees the request (see _BearerPrefix docstring). Lifespan events pass
+    # straight through, so the inner Starlette startup/shutdown still runs under uvicorn.
+    app = _BearerPrefix(app)
 
     uvicorn.run(app, host="127.0.0.1", port=8000, timeout_graceful_shutdown=30)

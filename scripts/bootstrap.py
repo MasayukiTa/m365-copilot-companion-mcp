@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import re
@@ -97,6 +98,24 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def _call_step(fn, state: dict, state_file: Path) -> None:
+    """Invoke a step function. Most steps take no arguments, but a few need the
+    live state to clear a downstream checkpoint (e.g. ensure_venv must reset
+    install_deps when it recreates the venv). We pass state/state_file ONLY to
+    steps whose signature declares them, so the simple 0-arg steps (and the
+    mocked steps in the tests) keep working unchanged."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        params = {}
+    kwargs = {}
+    if "state" in params:
+        kwargs["state"] = state
+    if "state_file" in params:
+        kwargs["state_file"] = state_file
+    fn(**kwargs)
+
+
 def step_header(msg: str) -> None:
     print("==> " + msg, flush=True)
 
@@ -120,11 +139,53 @@ def find_executable(*names: str) -> str | None:
 # --------------------------------------------------------------------------- #
 # STEP: ensure_venv
 # --------------------------------------------------------------------------- #
-def step_ensure_venv() -> None:
+def _venv_is_healthy() -> bool:
+    """Probe the venv with a REAL command instead of trusting that python.exe
+    merely exists on disk. A venv whose python cannot even run 'pip --version'
+    (half-created, wrong Python moved/deleted, corrupt) would otherwise pass a
+    bare file-existence check and then 'install_deps' silently no-ops against
+    it. Returns True only if the probe command exits 0 within a short timeout."""
+    if not VENV_PYTHON.exists():
+        return False
+    try:
+        res = subprocess.run(
+            [str(VENV_PYTHON), "-m", "pip", "--version"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return res.returncode == 0
+
+
+def step_ensure_venv(state: dict | None = None, state_file: Path = STATE_FILE) -> None:
     step_header("Ensuring virtual environment (.venv)")
-    if VENV_PYTHON.exists():
-        log("    OK: .venv already present (skipping)")
+
+    # Probe with a real command (pip --version), NOT just file existence: a
+    # python.exe can exist while the venv is broken, which produced the observed
+    # "venv recreated but deps skipped" failure on resume.
+    if _venv_is_healthy():
+        log("    OK: .venv already present and working (skipping)")
         return
+
+    if VENV_PYTHON.exists():
+        log("    WARN: .venv exists but its python failed a 'pip --version' probe; "
+            "recreating it.")
+        # A recreated venv is EMPTY, so deps must be reinstalled. Clear the
+        # install_deps done-flag so the next step actually runs pip again.
+        if state is not None:
+            if state.get("done", {}).pop("install_deps", None):
+                log("    (cleared install_deps checkpoint so dependencies reinstall)")
+                save_state(state, state_file)
+        # Remove the broken tree so 'python -m venv' can rebuild cleanly.
+        try:
+            shutil.rmtree(ROOT / ".venv")
+        except OSError as e:
+            raise ActionNeeded(
+                "The existing .venv is broken and could not be removed "
+                "automatically (%s). Delete the .venv folder in the repo root by "
+                "hand, then re-run quickstart.bat (or setup.bat)." % e
+            )
+
     # setup.bat normally creates the venv (via uv or python -m venv) before we
     # get here. If it does not exist we try once with the running interpreter.
     log("    .venv missing; creating with 'python -m venv .venv'")
@@ -166,7 +227,29 @@ def step_install_deps() -> None:
     if rc != 0:
         raise StepError(
             "pip install -r requirements.txt failed (network or a wheel build). "
-            "Re-running setup.bat retries this step."
+            "Re-running quickstart.bat (or setup.bat) retries this step."
+        )
+
+    # pip returning 0 is NECESSARY but not SUFFICIENT: a partial download, a
+    # broken wheel, or an install against the wrong interpreter can leave core
+    # deps unimportable while pip still exits 0. Verify by actually importing a
+    # couple of CORE sentinel packages in the venv (fastmcp -- the MCP framework
+    # main.py needs; httpx -- imported directly by our tools). If either fails to
+    # import, the environment is not usable; raise a novice-readable StepError.
+    sentinels = ["fastmcp", "httpx"]
+    check = subprocess.run(
+        [py, "-c", "import " + ", ".join(sentinels)],
+        capture_output=True, text=True,
+    )
+    if check.returncode != 0:
+        detail = (check.stderr or check.stdout or "").strip().splitlines()
+        last = detail[-1] if detail else "(no error text)"
+        raise StepError(
+            "Dependencies did not import after install: could not 'import %s' in "
+            ".venv. This usually means the download was incomplete or a package "
+            "failed to build. Check your internet connection, then re-run "
+            "quickstart.bat (or setup.bat) to retry. Technical detail: %s"
+            % (", ".join(sentinels), last)
         )
 
     # IMPORTANT: 'playwright' is pulled in (for the optional relay/bridge), but
@@ -175,7 +258,7 @@ def step_install_deps() -> None:
     # existing Edge/Chrome -- it never drives a Playwright-managed browser. A
     # 'playwright install' would download ~400MB of browser binaries for nothing
     # and can require extra permissions. So: no browser download here, on purpose.
-    log("    OK: dependencies installed (no Playwright browser download -- CDP attach only)")
+    log("    OK: dependencies installed and import-verified (fastmcp, httpx)")
 
 
 # --------------------------------------------------------------------------- #
@@ -279,16 +362,22 @@ def step_dev_tunnel() -> None:
         if cand.exists():
             dt = str(cand)
 
+    tunnel = "m365-copilot-companion"
+
+    # This step must NEVER wall a clean-PC novice. The script that actually
+    # installs devtunnel (without winget) and walks the interactive Microsoft
+    # sign-in is setup_devtunnel.ps1, which runs LATER at quickstart STEP 4 --
+    # unreachable if we abort here with ActionNeeded. So when devtunnel is not
+    # ready yet we only WARN and return normally (this step is marked done); the
+    # real install/login happens at STEP 4.
     if not dt:
-        raise ActionNeeded(
-            "Dev Tunnels CLI (devtunnel) is not installed. Install it per-user "
-            "(no admin):  winget install Microsoft.devtunnel  -- then re-run "
-            "setup.bat. (devtunnel is only required if a REMOTE client such as "
-            "Copilot Studio must reach this server; skip it for local-only use.)"
-        )
+        log("    WARN: devtunnel not ready yet -- quickstart STEP 4 "
+            "(setup_devtunnel.ps1) will install and sign you in; nothing to do now.")
+        log("          (devtunnel is only required if a REMOTE client such as "
+            "Copilot Studio must reach this server; skip it for local-only use.)")
+        return
 
     log("    OK: devtunnel found at " + dt)
-    tunnel = "m365-copilot-companion"
     log("    To expose the server to Copilot Studio, run this sequence:")
     log("      devtunnel user login                                 # opens Microsoft login (MFA)")
     log("      devtunnel create %s --allow-anonymous" % tunnel)
@@ -299,32 +388,36 @@ def step_dev_tunnel() -> None:
     # Whether the tunnel has actually been created/logged-in is something we
     # cannot complete unattended: 'devtunnel user login' needs an interactive
     # Microsoft sign-in (and usually MFA). If the user has not logged in yet,
-    # pause here so the next run can re-verify.
+    # WARN and return normally -- setup_devtunnel.ps1 at STEP 4 does the login.
     logged_in = _devtunnel_logged_in(dt)
     if not logged_in:
-        raise ActionNeeded(
-            "devtunnel is installed but you are not signed in. Run "
-            "'devtunnel user login' (this opens a Microsoft sign-in, usually "
-            "with MFA), then run the create/port/access/host sequence printed "
-            "above, and re-run setup.bat. This login cannot be automated."
-        )
+        log("    WARN: devtunnel not ready yet -- quickstart STEP 4 "
+            "(setup_devtunnel.ps1) will install and sign you in; nothing to do now.")
+        log("          (devtunnel is installed but not signed in yet; the STEP 4 "
+            "script runs 'devtunnel user login' interactively.)")
+        return
     log("    OK: devtunnel reports a signed-in user.")
 
-    # Now that we have a signed-in user we CAN finish the rest unattended:
-    # create the tunnel + port + access (idempotent), briefly host it to obtain
-    # the public URL, then record MCP_TUNNEL_NAME/MCP_TUNNEL_URL in .env. Any
-    # failure here degrades to ActionNeeded (run the printed sequence by hand) so
-    # the bootstrap is never worse than before this automation existed.
+    # Short-circuit: if .env already has a non-empty MCP_TUNNEL_URL, the tunnel
+    # was already provisioned on a previous run. Do NOT re-host (each host costs
+    # ~30s) on every resume -- just report it and move on.
+    existing_url = _read_env_value("MCP_TUNNEL_URL")
+    if existing_url:
+        log("    OK: MCP_TUNNEL_URL already set in .env (%s); skipping re-host."
+            % existing_url)
+        return
+
+    # Signed in and no URL recorded yet: finish the rest unattended -- create the
+    # tunnel + port + access (idempotent), briefly host it to obtain the public
+    # URL, then record MCP_TUNNEL_NAME/MCP_TUNNEL_URL in .env. Any failure here
+    # only WARNs and returns normally (STEP 4's setup_devtunnel.ps1 is the real
+    # provisioner) -- and it must NEVER blank an existing MCP_TUNNEL_URL.
     try:
         _provision_dev_tunnel(dt, tunnel)
-    except ActionNeeded:
-        raise
-    except Exception as e:  # noqa: BLE001 - never crash bootstrap on a tunnel hiccup
-        raise ActionNeeded(
-            "could not auto-provision the dev tunnel (%s). Run the "
-            "create/port/access/host sequence printed above by hand, then "
-            "re-run setup.bat" % e
-        )
+    except Exception as e:  # noqa: BLE001 - never crash/wall bootstrap on a tunnel hiccup
+        log("    WARN: could not auto-provision the dev tunnel (%s). quickstart "
+            "STEP 4 (setup_devtunnel.ps1) will provision it; nothing to do now." % e)
+        return
 
 
 def _provision_dev_tunnel(dt: str, tunnel: str) -> None:
@@ -393,11 +486,13 @@ def _provision_dev_tunnel(dt: str, tunnel: str) -> None:
     else:
         # We could not parse a URL (host did not come up in time). The tunnel and
         # name are written; tell the user how to read the URL by hand. Still not
-        # fatal -- everything else in .env is intact.
-        log("    WARN: tunnel '%s' is set up but no port URL was parsed." % tunnel)
-        log("          Run 'devtunnel show %s' and copy the "
-            "https://...devtunnels.ms URL into MCP_TUNNEL_URL in .env." % tunnel)
-        log("    Recorded MCP_TUNNEL_NAME in .env (MCP_TUNNEL_URL left blank).")
+        # fatal -- everything else in .env is intact, and any PRE-EXISTING
+        # MCP_TUNNEL_URL is preserved by _write_tunnel_to_env (never blanked).
+        log("    WARN: tunnel '%s' is set up but no NEW port URL was parsed." % tunnel)
+        log("          quickstart STEP 4 (setup_devtunnel.ps1) will provision the "
+            "URL, or run 'devtunnel show %s' and copy the" % tunnel)
+        log("          https://...devtunnels.ms URL into MCP_TUNNEL_URL in .env.")
+        log("    Recorded MCP_TUNNEL_NAME in .env (any existing MCP_TUNNEL_URL kept).")
 
 
 def _dt_run(dt: str, *args: str) -> subprocess.CompletedProcess:
@@ -431,13 +526,28 @@ def _write_tunnel_to_env(tunnel: str, url: str | None) -> None:
     every other line. Strips any prior '# devtunnel (auto)' / MCP_TUNNEL_* lines
     first. Writes UTF-8 WITHOUT BOM and CRLF endings -- a BOM here previously
     broke the .env parser (PowerShell Set-Content -Encoding UTF8 writes EF BB BF
-    which folds into the first key name)."""
+    which folds into the first key name).
+
+    IMPORTANT: never DESTROY an existing MCP_TUNNEL_URL on a transient failure.
+    If 'url' is None (we could not mint a URL this run) but .env already carries
+    a non-empty MCP_TUNNEL_URL, we keep the existing value instead of dropping
+    it -- a hosting hiccup must not silently un-configure a working tunnel."""
     env_path = ROOT / ".env"
     if not env_path.exists():
         log("    WARN: .env not found; skipping MCP_TUNNEL_* write.")
         return
     # utf-8-sig tolerates a possible pre-existing BOM on read.
     existing = env_path.read_text(encoding="utf-8-sig").splitlines()
+
+    # Preserve a prior non-empty MCP_TUNNEL_URL if we did not obtain one now.
+    if not url:
+        for ln in existing:
+            if ln.startswith("MCP_TUNNEL_URL="):
+                prev = ln.split("=", 1)[1].strip()
+                if prev:
+                    url = prev
+                break
+
     kept = [
         ln for ln in existing
         if not (
@@ -559,7 +669,7 @@ def step_verify() -> None:
     if missing:
         raise StepError(
             ".env is missing or has placeholder values for: " + ", ".join(missing)
-            + ". Re-run setup.bat (the gen_env step fills these)."
+            + ". Re-run quickstart.bat (or setup.bat) (the gen_env step fills these)."
         )
     log("    OK: .env has required keys (" + ", ".join(required) + ")")
 
@@ -570,7 +680,7 @@ def step_verify() -> None:
     if count is None:
         raise StepError(
             "Could not import main.py to count tools. Check that dependencies "
-            "installed correctly, then re-run setup.bat."
+            "installed correctly, then re-run quickstart.bat (or setup.bat)."
         )
     log("    OK: main.py imported; registered tool count = %d" % count)
 
@@ -586,7 +696,12 @@ def _load_dotenv_into_env(env_path: Path) -> None:
         if not s or s.startswith("#") or "=" not in s:
             continue
         k, v = s.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip())
+        # OVERRIDE any pre-set environment variable with the .env value. The
+        # verification must reflect what the SERVER will read from .env at
+        # runtime; a stale exported MCP_* var in the parent shell would otherwise
+        # shadow .env (os.environ.setdefault keeps the pre-set value) and make us
+        # verify against the wrong secret. .env is the source of truth here.
+        os.environ[k.strip()] = v.strip()
 
 
 def _count_tools_via_subprocess() -> int | None:
@@ -612,6 +727,12 @@ def _count_tools_via_subprocess() -> int | None:
     except (OSError, subprocess.SubprocessError):
         return None
     if res.returncode != 0:
+        # Explain the wall of traceback to a novice BEFORE dumping it, so they
+        # know the stack trace below is the reason main.py would not load (not
+        # some unrelated crash of the bootstrap itself).
+        sys.stderr.write(
+            "The server code (main.py) failed to load; the technical error follows:\n"
+        )
         sys.stderr.write(res.stderr)
         return None
     try:
@@ -650,19 +771,19 @@ def run_all(steps=STEPS, state=None, state_file=STATE_FILE) -> int:
             log("--- %-14s already done (skipping)" % name)
             continue
         try:
-            fn()
+            _call_step(fn, state, state_file)
             mark_done(state, name, state_file)
         except ActionNeeded as e:
             save_state(state, state_file)
             log("")
-            log("ACTION NEEDED: %s; then re-run setup.bat" % str(e))
+            log("ACTION NEEDED: %s; then re-run quickstart.bat (or setup.bat)" % str(e))
             log("(Progress saved. Completed steps will be skipped on the next run.)")
             return 2
         except StepError as e:
             save_state(state, state_file)
             log("")
             log("FAILED at step '%s': %s" % (name, str(e)))
-            log("(Progress saved. Re-run setup.bat to retry this step.)")
+            log("(Progress saved. Re-run quickstart.bat (or setup.bat) to retry this step.)")
             return 1
     log("")
     log("All steps complete. Environment is ready.")
@@ -679,11 +800,11 @@ def run_only(step_name: str, steps=STEPS, state=None, state_file=STATE_FILE) -> 
         log("Known steps: " + ", ".join(n for n, _ in steps))
         return 1
     try:
-        table[step_name]()
+        _call_step(table[step_name], state, state_file)
         mark_done(state, step_name, state_file)
     except ActionNeeded as e:
         save_state(state, state_file)
-        log("ACTION NEEDED: %s; then re-run setup.bat" % str(e))
+        log("ACTION NEEDED: %s; then re-run quickstart.bat (or setup.bat)" % str(e))
         return 2
     except StepError as e:
         save_state(state, state_file)

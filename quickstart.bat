@@ -93,6 +93,28 @@ echo   Installs the devtunnel CLI (winget or direct download), signs you in
 echo   (browser or device code), creates the tunnel, and prints the PUBLIC URL.
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup_devtunnel.ps1"
+REM Capture the Dev Tunnel setup exit code BEFORE any other command: a plain
+REM `set` succeeds and would RESET errorlevel to 0, so we must grab it first.
+set "DT_RC=%ERRORLEVEL%"
+if not "%DT_RC%"=="0" (
+    echo.
+    echo Dev Tunnel setup did not finish. Read the message above, fix it, then
+    echo run quickstart.bat again.
+    pause
+    exit /b %DT_RC%
+)
+REM STEP 5 (Copilot Studio) needs the PUBLIC tunnel URL, so confirm STEP 4
+REM actually recorded a non-empty MCP_TUNNEL_URL in .env before continuing.
+REM `..*` requires at least one character after the `=`, so a blank
+REM `MCP_TUNNEL_URL=` line does NOT count as ready.
+findstr /b /r "MCP_TUNNEL_URL=..*" ".env" >nul 2>nul
+if errorlevel 1 (
+    echo.
+    echo Dev Tunnel URL is not ready -- STEP 5 needs it. Re-run quickstart.bat
+    echo after fixing STEP 4.
+    pause
+    exit /b 1
+)
 
 echo.
 echo ===========================================================================

@@ -23,12 +23,12 @@ if ($envv['MCP_API_KEY']) { $bearer = 'Bearer ' + $envv['MCP_API_KEY'] }
 else { $bearer = '<no Bearer yet -- run quickstart.bat first>' }
 
 Write-Host ""
-Write-Host "Copilot Studio  ->  your agent  ->  Tools  ->  Add a tool  ->  Model Context Protocol" -ForegroundColor Cyan
-Write-Host "Paste these 3 values (everything else: defaults):" -ForegroundColor Cyan
+Write-Host "Copilot Studio  ->  your agent  ->  Tools -> Add a tool -> New tool -> Model Context Protocol" -ForegroundColor Cyan
+Write-Host "Auth = API key,  Type = Header.  Paste these 3 values (everything else: defaults):" -ForegroundColor Cyan
 Write-Host "==================================================================================="
-Write-Host "  1) Server URL    :  " -NoNewline; Write-Host $serverUrl -ForegroundColor Green
-Write-Host "  2) Auth header   :  " -NoNewline; Write-Host "Authorization" -ForegroundColor Green
-Write-Host "  3) Header value  :  " -NoNewline; Write-Host $bearer -ForegroundColor Green
+Write-Host "  1) Server URL     :  " -NoNewline; Write-Host $serverUrl -ForegroundColor Green
+Write-Host "  2) Header name    :  " -NoNewline; Write-Host "Authorization" -ForegroundColor Green
+Write-Host "  3) API key value  :  " -NoNewline; Write-Host $bearer -ForegroundColor Green -NoNewline; Write-Host "   (paste the WHOLE line incl. the word Bearer)"
 Write-Host "==================================================================================="
 Write-Host "Then:  Save  ->  Add connection / Test  (the tool list should load:"
 Write-Host "       list_my_tools, read_file, ...)  ->  Publish: visibility = JUST ME."
