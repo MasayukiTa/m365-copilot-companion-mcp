@@ -16,7 +16,9 @@ LITE = os.environ.get("SWE_LITE", "/root/swe/lite_local.json")
 # (swe_run_until_done.py, swe_batch_setup.py) runs under Windows python. When this script runs
 # under WSL, write through the /mnt/c mount.
 OUTDIR = os.environ.get(
-    "SWE_OUTDIR", "/mnt/c/Users/USER/companion-mcp/.fleet/swe")
+    "SWE_OUTDIR",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 ".fleet", "swe"))
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 12
 
 # Diversity-first repo order. astropy excluded (already piloted: 12907/14182/14365).

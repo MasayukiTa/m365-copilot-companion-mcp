@@ -27,7 +27,7 @@ import subprocess
 import sys
 import time
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VENVPY = os.path.join(REPO, ".venv", "Scripts", "python.exe")
 SWEDIR = os.path.join(REPO, ".fleet", "swe")
 WORK = os.path.join(SWEDIR, "work")

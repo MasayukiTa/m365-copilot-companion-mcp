@@ -3,7 +3,7 @@ companion Edge, with NO user credential entry.
 
 WHY this exists:
   The connector's connection is per-browser-PROFILE. The fleet runs in the headless
-  :9222 Edge; its connection to the companion-mcp connector goes stale ("古い") -- then the
+  :9222 Edge; its connection to the MCP connector goes stale ("古い") -- then the
   agent can no longer call list_directory / run_python / create_file and just reports
   "ローカル操作は実行不可", looping to MAXTURNS. Reconnecting is NOT a credential sign-in:
   the Bearer key is already configured on the connector. It is only the connection-SELECT
@@ -33,9 +33,14 @@ from relay.copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver
 
 # A probe that REQUIRES the connector (list_directory) and asks for a one-line answer, so
 # a working connector returns "N個" while a connector-less default Copilot says 実行不可.
+# The probe target is the current user's Desktop, resolved at runtime so it works for any user.
+_DESKTOP_PROBE_PATH = (
+    os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Desktop")
+    .replace("\\", "/")
+)
 DEFAULT_PROBE = (
     "接続確認。call_tool 経由で list_directory を使い "
-    "C:/Users/USER/Desktop 直下の項目数だけを『N個』の形で1行で答えて。"
+    + _DESKTOP_PROBE_PATH + " 直下の項目数だけを『N個』の形で1行で答えて。"
 )
 CONSENT_MARKERS = ("接続マネージャーを開く", "connection manager")
 NO_CONNECTOR_MARKERS = ("実行不可", "コネクタ無し", "コネクタがありません", "ツールが使用できません")

@@ -5,7 +5,7 @@ pass). Writes .fleet/swe/goals3.jsonl for `python -m relay.fleet_runner --goals-
 import json
 import os
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VENVPY = os.path.join(REPO, ".venv", "Scripts", "python.exe")
 CHECK = os.path.join(REPO, "bench", "swe_check.py")
 

@@ -26,7 +26,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 import swe_check_remote as R   # reuse the proven SSH/scp/wsl plumbing
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SWEDIR = os.path.join(REPO, ".fleet", "swe")
 PREDS = os.path.join(SWEDIR, "preds_solve")
 RESULTS = os.path.join(SWEDIR, "grade_results.jsonl")

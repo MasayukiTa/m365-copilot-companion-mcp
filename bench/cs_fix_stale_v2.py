@@ -8,7 +8,7 @@ Screens + button dumps at each step. Reusable; run against the 1 stale connectio
 import os
 import sys
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 from dotenv import load_dotenv
 load_dotenv(os.path.join(REPO, ".env"))

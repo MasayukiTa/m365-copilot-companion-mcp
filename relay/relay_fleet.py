@@ -455,13 +455,22 @@ def _open_fresh(context, url):
     (a busy Edge can miss the 30s domcontentloaded) -- we proceed and wait for the
     composer to render either way. If a sign-in page appears, the background Edge is
     surfaced once so the user can authenticate."""
-    from .edge_recover import surface, looks_like_login
+    from .edge_recover import surface, looks_like_login, touch_pause, rehide
     pg = context.new_page()
     surfaced = False
     # Up to 3 navigation attempts: a failed goto leaves the tab on about:blank, and
     # waiting 45s for a composer that will never come just leaves about:blank on screen.
     # Detect about:blank early (~4s) and RE-navigate instead of staring at it.
-    for attempt in range(3):
+    #
+    # When a sign-in page appears we surface() the hidden Edge ONCE. From then on the
+    # user may be mid-MFA, so: (a) touch_pause() every ~1s while the login page is up so
+    # the keeper's 180s backoff never expires and re-minimizes the window under them, and
+    # (b) allow a much longer total wait (up to ~300s) for the composer -- the default
+    # 3x25s aborts a slow login. As soon as the composer renders after we surfaced,
+    # rehide() drops the window back to the background immediately.
+    attempt = 0
+    while True:
+        attempt += 1
         try:
             pg.goto(url, wait_until="domcontentloaded", timeout=45000)
         except Exception:
@@ -469,15 +478,27 @@ def _open_fresh(context, url):
         for k in range(25):
             pg.wait_for_timeout(1000)
             if pg.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+                if surfaced:
+                    rehide()               # auth done -> back to background at once
                 return pg
             try:
                 u = pg.url or ""
-                if not surfaced and looks_like_login(u):
-                    surface(); surfaced = True
+                if looks_like_login(u):
+                    if not surfaced:
+                        surface(); surfaced = True
+                    touch_pause()          # keep the keeper backed off through a long login
                 elif u == "about:blank" and k >= 3:
-                    break                      # stuck on about:blank -> re-navigate
+                    break                  # stuck on about:blank -> re-navigate
             except Exception:
                 pass
+        # Non-surfaced path unchanged: give up after 3 navigation attempts (~75s).
+        # Surfaced path: keep polling for the composer up to ~300s total before giving
+        # up, so a slow interactive/MFA sign-in is not aborted out from under the user.
+        if surfaced:
+            if attempt * 25 >= 300:
+                break
+        elif attempt >= 3:
+            break
     return pg
 
 

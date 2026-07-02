@@ -218,6 +218,29 @@ class DevTunnelNeverBlocksTests(unittest.TestCase):
         self.assertFalse(called["provision"],
                          "provisioning ran even though MCP_TUNNEL_URL was already set")
 
+    def test_provision_targets_renamed_tunnel_from_env(self):
+        # FIX 3: if the user renamed the tunnel (MCP_TUNNEL_NAME in .env) and
+        # MCP_TUNNEL_URL is absent, provisioning must target the RENAMED tunnel --
+        # not the default 'm365-copilot-companion' (which _write_tunnel_to_env would
+        # then persist, flipping the renamed setup back to default).
+        seen = {"tunnel": None}
+
+        def _capture(dt, tunnel):
+            seen["tunnel"] = tunnel
+
+        def _env(key):
+            if key == "MCP_TUNNEL_NAME":
+                return "custom-name"
+            return None  # MCP_TUNNEL_URL absent -> provisioning proceeds
+
+        with mock.patch.object(bootstrap, "find_executable", return_value="devtunnel"), \
+             mock.patch.object(bootstrap, "_devtunnel_logged_in", return_value=True), \
+             mock.patch.object(bootstrap, "_read_env_value", side_effect=_env), \
+             mock.patch.object(bootstrap, "_provision_dev_tunnel", _capture):
+            bootstrap.step_dev_tunnel()
+        self.assertEqual(seen["tunnel"], "custom-name",
+                         "provisioning did not target the renamed MCP_TUNNEL_NAME")
+
 
 class WriteTunnelPreservesUrlTests(unittest.TestCase):
     """FIX 1: a transient failure (url=None) must NEVER blank an existing

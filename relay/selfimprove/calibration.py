@@ -23,7 +23,7 @@ import math
 import os
 
 # Default location of the grade ledger, under the repo root.
-_REPO_ROOT = r"C:\Users\USER\companion-mcp"
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _DEFAULT_GRADE_PATH = os.path.join(_REPO_ROOT, ".fleet", "swe", "grade_results.jsonl")
 
 

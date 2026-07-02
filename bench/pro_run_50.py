@@ -1,13 +1,13 @@
 """Disk-safe batched SWE-bench Pro 50-run orchestrator.
 
 Loop: stage a batch (shallow, STRENGTHENED interface-first goals) -> run the fleet on it ->
-capture git diffs + DELETE the worktrees -> next batch. USER has ~8GB free, so only ~BATCH
+capture git diffs + DELETE the worktrees -> next batch. The dev box has ~8GB free, so only ~BATCH
 shallow worktrees ever exist at once. Progress -> .fleet/swe/pro_run_50.log; predictions
 accumulate in .fleet/swe/pro_preds_50.json (fed to the the eval host Pro grader afterwards).
 """
 import json, os, subprocess, time
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SW = os.path.join(REPO, ".fleet", "swe")
 PY = os.path.join(REPO, ".venv", "Scripts", "python.exe")
 STATUS = os.path.join(REPO, ".fleet", "status.json")

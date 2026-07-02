@@ -55,7 +55,7 @@ from typing import Optional
 
 # ── Locate the .fleet directory the same way fleet_runner does (repo root) ──
 _THIS = Path(__file__).resolve()          # tools/contract_gate.py
-_REPO = _THIS.parent.parent              # companion-mcp/
+_REPO = _THIS.parent.parent              # repo root
 _FLEET_DIR = _REPO / ".fleet"
 _CONTRACT_FILE = _FLEET_DIR / "active_contract.json"
 

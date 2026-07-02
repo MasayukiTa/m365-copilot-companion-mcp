@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import swe_check_remote as R
 import pandas as pd
 
-REPO = r"C:\Users\USER\companion-mcp"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SWEDIR = os.path.join(REPO, ".fleet", "swe")
 PREDS = os.path.join(SWEDIR, "preds_solve")
 OUT = os.path.join(SWEDIR, "_miss")
