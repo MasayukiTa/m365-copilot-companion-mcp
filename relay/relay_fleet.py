@@ -88,7 +88,7 @@ TOOL_UNREACHABLE_MARKERS = (
 # headless Edge to the foreground so the user can authorize, and STUCK with an actionable reason
 # rather than looping the card until MAXTURNS.
 CONSENT_MARKERS = (
-    "接続マネージャー", "この資格情報を", "接続の準備が整ったら",
+    "接続マネージャー", "この資格情報を", "接続の準備が整ったら", "接続して続行する",
     "open connection manager", "connection manager", "verify this credential",
     "verify your credential", "authorize the connection", "set up this connection",
 )
@@ -1204,66 +1204,64 @@ class RelayWorker:
         return 1 + (1 if self.max_research > 0 else 0) + (1 if self.refuter else 0)
 
     def _auto_consent(self):
-        """Click through the MCP connection-consent card AUTOMATICALLY. The card is NOT a
-        credential entry -- the Bearer key is already configured on the connector; this is just a
-        connection-SELECT confirm. Verified flow (2026-06-15): 接続マネージャーを開く opens the
-        Copilot Studio connection manager in a popup; a stale connection exposes a レビュー link ->
-        the 接続の作成または選択 dialog has the connection pre-selected -> 送信する commits it. Once
-        committed, ANY later tool call works, so we do NOT click 再試行 here -- the caller sends
-        RETRY_JOB and the agent re-invokes the tool on a now-valid connection.
-        Returns True if 送信する was clicked, False otherwise (caller falls back to manual surface)."""
+        """Re-establish the MCP connection AUTOMATICALLY. NOT a credential entry -- the Bearer key
+        is already on the connector; this only re-selects + commits the connection. Tiered so the
+        cheapest path that works wins; the manual-surface fallback in _decide fires only if ALL
+        tiers fail. Returns True iff a commit happened (caller then sends RETRY_JOB).
+
+        Tier 0 -- variant (a): a 許可/Allow button in the consent card on self.page -> one click.
+        Tier 1 -- DIRECT-HIT: a cached connection-manager URL -> open a new page in the same
+                  context, go there, and fix ALL stale rows (skip if it redirects to a login page;
+                  do NOT delete the cache on failure -- the popup flow refreshes it).
+        Tier 2 -- popup flow: edge_reconnect.click_through_consent(self.page), which now caches the
+                  URL and fixes ALL rows (handles both variant (a) and the 接続マネージャー popup)."""
         pg = self.page
         if pg is None:
             return False
+        from .edge_reconnect import (
+            click_through_consent, fix_all_stale_connections, load_conn_url,
+        )
+        # Tier 0: variant (a) -- 許可/Allow directly on the card.
         try:
-            ctx = pg.context
-            link = pg.locator('a:has-text("接続マネージャーを開く"), a:has-text("connection manager")')
-            if not link.count():
-                return False
-            try:
-                with ctx.expect_page(timeout=15000) as pinfo:
-                    link.first.click()
-                cs = pinfo.value
-            except Exception:
-                return False            # opened in-place / no popup -> hand to manual
-            try:
-                cs.wait_for_load_state("domcontentloaded", timeout=20000)
-            except Exception:
-                pass
-            for _ in range(15):         # let the CS /auth redirect settle
+            for label in ("許可", "Allow"):
+                btn = pg.locator('button:has-text("%s")' % label)
+                if btn.count():
+                    btn.first.click()
+                    pg.wait_for_timeout(4000)
+                    return True
+        except Exception:
+            pass
+        # Tier 1: DIRECT-HIT a cached connection-manager URL.
+        try:
+            url = load_conn_url()
+            if url:
+                from .edge_recover import looks_like_login
+                np = None
                 try:
-                    if "/auth" not in (cs.url or ""):
-                        break
-                except Exception:
-                    break
-                cs.wait_for_timeout(2000)
-            try:                         # stale connection -> レビュー opens the select dialog
-                rev = cs.locator('a:has-text("レビュー"), button:has-text("レビュー"), a:has-text("Review")')
-                if rev.count():
-                    rev.first.click()
-                    cs.wait_for_timeout(3000)
-            except Exception:
-                pass
-            submitted = False            # the connection is pre-selected -> just submit
-            for label in ("送信する", "送信", "Submit"):
-                try:
-                    btn = cs.locator('button:has-text("%s")' % label)
-                    if btn.count():
-                        btn.first.click()
-                        cs.wait_for_timeout(4000)
-                        submitted = True
-                        break
-                except Exception:
-                    continue
-            try:
-                cs.close()
-            except Exception:
-                pass
-            try:
-                pg.bring_to_front()
-            except Exception:
-                pass
-            return submitted
+                    np = pg.context.new_page()
+                    np.goto(url, wait_until="domcontentloaded", timeout=45000)
+                    np.wait_for_timeout(6000)
+                    if not looks_like_login(np.url or ""):
+                        res = fix_all_stale_connections(np)
+                        if res.get("submitted", 0) > 0 or not res.get("stale_left", True):
+                            try:
+                                pg.bring_to_front()
+                            except Exception:
+                                pass
+                            return True
+                    # cached URL 404'd / redirected to login -> fall through to Tier 2 (which
+                    # refreshes the cache). Deliberately do NOT clear the cache here.
+                finally:
+                    if np is not None:
+                        try:
+                            np.close()
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        # Tier 2: popup flow (also (re)caches the URL and fixes ALL rows).
+        try:
+            return bool(click_through_consent(pg))
         except Exception:
             return False
 
