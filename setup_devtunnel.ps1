@@ -43,15 +43,96 @@ if (-not (Get-Command devtunnel -ErrorAction SilentlyContinue)) {
         $dir = Join-Path $env:LOCALAPPDATA "devtunnel"
         New-Item -ItemType Directory -Force $dir | Out-Null
         $exe = Join-Path $dir "devtunnel.exe"
+        $dlUri = "https://aka.ms/TunnelsCliDownload/win-x64"
+        $payload = Join-Path $dir "devtunnel.download"
+
+        # Download to a temporary payload file; we validate the bytes before trusting it as the exe.
+        # Some corporate networks do TLS interception which breaks certificate trust; on such an error
+        # we retry once through the system default proxy with the user's default credentials.
+        $downloaded = $false
         try {
-            Invoke-WebRequest -UseBasicParsing -Uri "https://aka.ms/TunnelsCliDownload/win-x64" -OutFile $exe -TimeoutSec 120
-            $env:Path = "$dir;$env:Path"
-            $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-            if ($userPath -notlike "*$dir*") { [Environment]::SetEnvironmentVariable("Path", "$dir;$userPath", "User") }
-            Write-Host "      installed devtunnel.exe -> $dir  (added to your PATH; new terminals pick it up)"
+            Invoke-WebRequest -UseBasicParsing -Uri $dlUri -OutFile $payload -TimeoutSec 120
+            $downloaded = $true
         } catch {
-            Write-Host "      ERROR: direct download failed: $($_.Exception.Message)"
-            Write-Host "      Download it by hand from https://aka.ms/TunnelsCliDownload/win-x64 and put devtunnel.exe on PATH."
+            $msg = "$($_.Exception.Message) $($_.Exception.InnerException.Message)"
+            if ($msg -match 'certificate|trust relationship|SSL|TLS') {
+                Write-Host "      first download attempt hit a certificate/TLS error -> retrying via the system proxy..."
+                try {
+                    $proxyUri = [System.Net.WebRequest]::DefaultWebProxy.GetProxy([Uri]$dlUri)
+                    if ($proxyUri -and ($proxyUri.AbsoluteUri -ne ([Uri]$dlUri).AbsoluteUri)) {
+                        Invoke-WebRequest -UseBasicParsing -Uri $dlUri -OutFile $payload -TimeoutSec 120 -Proxy $proxyUri.AbsoluteUri -ProxyUseDefaultCredentials
+                    } else {
+                        Invoke-WebRequest -UseBasicParsing -Uri $dlUri -OutFile $payload -TimeoutSec 120 -ProxyUseDefaultCredentials
+                    }
+                    $downloaded = $true
+                } catch {
+                    $downloaded = $false
+                }
+            }
+        }
+        if (-not $downloaded) {
+            Write-Host "      ERROR: could not download devtunnel."
+            Write-Host "      Your company network blocked this download. Ask IT (or use another PC) to download"
+            Write-Host "      devtunnel for Windows x64, save it as %LOCALAPPDATA%\devtunnel\devtunnel.exe, then run quickstart.bat again."
+            exit 1
+        }
+
+        # aka.ms/TunnelsCliDownload may serve a ZIP rather than a bare .exe. Inspect the first bytes:
+        # a ZIP begins with the signature PK\x03\x04 (0x50 0x4B 0x03 0x04).
+        $isZip = $false
+        try {
+            $fs = [System.IO.File]::OpenRead($payload)
+            try {
+                $sig = New-Object byte[] 4
+                $n = $fs.Read($sig, 0, 4)
+            } finally { $fs.Close() }
+            if ($n -ge 4 -and $sig[0] -eq 0x50 -and $sig[1] -eq 0x4B -and $sig[2] -eq 0x03 -and $sig[3] -eq 0x04) { $isZip = $true }
+        } catch { }
+
+        if ($isZip) {
+            Write-Host "      download is a .zip -> extracting devtunnel.exe..."
+            $zip = Join-Path $dir "devtunnel.zip"
+            if (Test-Path $zip) { Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue }
+            Rename-Item -LiteralPath $payload -NewName "devtunnel.zip" -Force
+            try {
+                Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+            } catch {
+                Write-Host "      ERROR: could not extract the downloaded archive: $($_.Exception.Message)"
+                Write-Host "      Ask IT (or use another PC) to download devtunnel for Windows x64, save it as"
+                Write-Host "      %LOCALAPPDATA%\devtunnel\devtunnel.exe, then run quickstart.bat again."
+                exit 1
+            }
+            if (-not (Test-Path $exe)) {
+                $found = Get-ChildItem -LiteralPath $dir -Filter "devtunnel.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($found) { Copy-Item -LiteralPath $found.FullName -Destination $exe -Force }
+            }
+        } else {
+            if (Test-Path $exe) { Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue }
+            Rename-Item -LiteralPath $payload -NewName "devtunnel.exe" -Force
+        }
+
+        if (-not (Test-Path $exe)) {
+            Write-Host "      ERROR: devtunnel.exe was not found after download."
+            Write-Host "      Ask IT (or use another PC) to download devtunnel for Windows x64, save it as"
+            Write-Host "      %LOCALAPPDATA%\devtunnel\devtunnel.exe, then run quickstart.bat again."
+            exit 1
+        }
+
+        $env:Path = "$dir;$env:Path"
+        $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+        if ($userPath -notlike "*$dir*") { [Environment]::SetEnvironmentVariable("Path", "$dir;$userPath", "User") }
+        Write-Host "      installed devtunnel.exe -> $dir  (added to your PATH; new terminals pick it up)"
+
+        # Verify the binary actually runs before we go anywhere near sign-in.
+        $verOk = $false
+        try {
+            $ver = (& $exe --version 2>&1 | Out-String).Trim()
+            if ($LASTEXITCODE -eq 0 -and $ver) { $verOk = $true }
+        } catch { $verOk = $false }
+        if (-not $verOk) {
+            Write-Host "      ERROR: the downloaded devtunnel.exe did not run ('$exe --version' failed)."
+            Write-Host "      Delete %LOCALAPPDATA%\devtunnel\devtunnel.exe and run quickstart.bat again; if it still fails,"
+            Write-Host "      ask IT (or use another PC) to download devtunnel for Windows x64 to that same path."
             exit 1
         }
     }
@@ -67,12 +148,24 @@ if ($who -match 'Logged in as') {
 } else {
     Write-Host "[2/4] sign-in required. A browser (or a device code) will appear -- complete the Entra ID / Microsoft sign-in."
     if ($DeviceCode) {
+        # User forced device-code directly: this prints the URL + code and blocks until done.
         devtunnel user login -d
     } else {
-        try { devtunnel user login } catch { }
-        Start-Sleep -Seconds 2
-        if (((Dt user show) -join " ") -notmatch 'Logged in as') {
-            Write-Host "      browser sign-in did not complete -> DEVICE CODE. Open https://microsoft.com/devicelogin and enter the code shown:"
+        # Launch the browser login WITHOUT blocking, then poll for up to 120s so a legitimate MFA
+        # browser sign-in has time to complete. We never start the device-code flow while this one
+        # may still be running -- only after this window closes without success.
+        Start-Process devtunnel -ArgumentList @("user", "login") -WindowStyle Hidden | Out-Null
+        $signedIn = $false
+        for ($i = 0; $i -lt 24; $i++) {
+            if (((Dt user show) -join " ") -match 'Logged in as') { $signedIn = $true; break }
+            $remaining = 120 - ($i * 5)
+            Write-Host "      Waiting for you to finish the Microsoft sign-in in the browser... ${remaining}s"
+            Start-Sleep -Seconds 5
+        }
+        if (-not $signedIn -and ((Dt user show) -join " ") -match 'Logged in as') { $signedIn = $true }
+        if (-not $signedIn) {
+            Write-Host "      The browser sign-in did not complete in time -> DEVICE CODE."
+            Write-Host "      A URL and a short code will be shown below. Open https://microsoft.com/devicelogin and enter the code:"
             devtunnel user login -d
         }
     }
@@ -86,25 +179,56 @@ if ($who -match 'Logged in as') {
 
 # --- 3. ensure the tunnel + port exist (idempotent; reuse an existing tunnel) -----------------
 $listed = Dt list
-$existingId = ($listed | Select-String -Pattern '^\s*([a-z0-9][a-z0-9-]+\.[a-z0-9]+)\s' | ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1)
+# All tunnel IDs found in the listing, as "name.cluster".
+$existingIds = @($listed | Select-String -Pattern '^\s*([a-z0-9][a-z0-9-]+\.[a-z0-9]+)\s' -AllMatches |
+    ForEach-Object { $_.Matches } | ForEach-Object { $_.Groups[1].Value })
+# Bare tunnel names (strip the .cluster suffix).
+$existingNames = @($existingIds | ForEach-Object { ($_ -split '\.')[0] })
+
+# A previous run (or the supervisor) may have recorded the tunnel name in .env.
+# That name MUST win over $DEFAULT_NAME: creating a differently-named tunnel here
+# would rewrite .env and silently break an already-configured Copilot Studio
+# connector pointing at the old URL.
+if (-not $TunnelName) {
+    $envPath0 = Join-Path $PSScriptRoot ".env"
+    if (Test-Path $envPath0) {
+        foreach ($ln in Get-Content $envPath0) {
+            if ($ln -match '^MCP_TUNNEL_NAME=(.+)$') { $TunnelName = $matches[1].Trim(); break }
+        }
+    }
+}
+
+$reuse = $false
 if ($TunnelName) {
     $target = $TunnelName
-} elseif ($existingId) {
-    $target = ($existingId -split '\.')[0]   # strip the .cluster suffix -> the tunnel name
-    Write-Host "[3/4] reusing existing tunnel: $existingId"
+    if ($existingNames -contains $TunnelName) { $reuse = $true }
+} elseif ($existingNames -contains $DEFAULT_NAME) {
+    # Prefer the tunnel matching our default name; never adopt an arbitrary first tunnel.
+    $target = $DEFAULT_NAME
+    $reuse = $true
 } else {
     $target = $DEFAULT_NAME
 }
-if (-not ($listed -match [regex]::Escape($target))) {
+
+if ($reuse) {
+    Write-Host "[3/4] reusing existing tunnel: $target"
+} elseif (-not ($existingNames -contains $target)) {
     Write-Host "[3/4] creating tunnel '$target' (anonymous-reachable, so Copilot Studio can connect)..."
     Dt create $target --allow-anonymous | Out-Null
 } else {
     Write-Host "[3/4] tunnel '$target' exists"
 }
+
 if (-not ((Dt port list $target) -match ("\b" + [string]$Port + "\b"))) {
     Write-Host "      adding port $Port..."
     Dt port create $target -p $Port --protocol http | Out-Null
 }
+
+# Idempotently re-assert anonymous access so a half-configured tunnel from an aborted earlier run
+# (created but access never applied, or port added without access) gets repaired on re-run. These
+# are no-ops if the access already exists.
+Dt access create $target --anonymous | Out-Null
+Dt access create $target -p $Port --anonymous | Out-Null
 
 # --- 4. host the tunnel so the public URL is assigned, then surface it ------------------------
 # IMPORTANT: a freshly-created tunnel has NO port URL in `devtunnel show` until it is HOSTED at
@@ -138,8 +262,22 @@ if ($url) {
     Write-Host " Paste this URL (plus your MCP endpoint path) into the Copilot"
     Write-Host " Studio MCP connector. The tunnel name is: $target"
 } else {
-    Write-Host " Tunnel '$target' is set up but no port URL was parsed."
-    Write-Host " Run:  devtunnel show $target   and copy the https://...devtunnels.ms URL."
+    Write-Host " Tunnel '$target' is set up but no public URL appeared after hosting."
+    Write-Host "==================================================================="
+    Write-Host " Run quickstart.bat again; if it still fails, run:  devtunnel host $target"
+    Write-Host " in a separate window and look for the https://...devtunnels.ms URL."
+    # Still record the tunnel name so a re-run can reuse it, but fail so quickstart.bat knows
+    # the tunnel is NOT ready.
+    try {
+        $envPath = Join-Path $root ".env"
+        if (Test-Path $envPath) {
+            $lines = @(Get-Content $envPath | Where-Object { $_ -notmatch '^# devtunnel \(auto\)|^MCP_TUNNEL_NAME=|^MCP_TUNNEL_URL=' })
+            $lines += "# devtunnel (auto) -- the public URL to register in Copilot Studio; supervisor hosts MCP_TUNNEL_NAME"
+            $lines += "MCP_TUNNEL_NAME=$target"
+            Set-Content -Path $envPath -Value $lines -Encoding ASCII
+        }
+    } catch { }
+    exit 1
 }
 Write-Host "==================================================================="
 
@@ -150,8 +288,15 @@ try {
         $lines = @(Get-Content $envPath | Where-Object { $_ -notmatch '^# devtunnel \(auto\)|^MCP_TUNNEL_NAME=|^MCP_TUNNEL_URL=' })
         $lines += "# devtunnel (auto) -- the public URL to register in Copilot Studio; supervisor hosts MCP_TUNNEL_NAME"
         $lines += "MCP_TUNNEL_NAME=$target"
-        if ($url) { $lines += "MCP_TUNNEL_URL=$url" }
+        $lines += "MCP_TUNNEL_URL=$url"
         Set-Content -Path $envPath -Value $lines -Encoding ASCII
-        Write-Host "Recorded MCP_TUNNEL_NAME (and URL) in .env."
+        Write-Host "Recorded MCP_TUNNEL_NAME and MCP_TUNNEL_URL in .env."
+    } else {
+        Write-Host "ERROR: .env not found at $envPath -- cannot record MCP_TUNNEL_URL."
+        exit 1
     }
-} catch { }
+} catch {
+    Write-Host "ERROR: failed to record MCP_TUNNEL_URL in .env: $($_.Exception.Message)"
+    exit 1
+}
+exit 0
