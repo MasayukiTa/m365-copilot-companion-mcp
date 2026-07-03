@@ -16,7 +16,9 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Net;
 using System.Text;
+using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
@@ -165,6 +167,28 @@ class CockpitWindow : Window
     int _autoRetryMax = 1;
     Dictionary<string, int> _autoRetryCount = new Dictionary<string, int>();
 
+    // ── P0 HEALTH STRIP ─────────────────────────────────────────────────────────────
+    // Five infra dots (Server/Tunnel/Edge/Sign-in/Agent) in the header, always visible,
+    // polled every ~15s on a background thread and marshaled to the UI via Dispatcher.
+    // Colors: "green"|"red"|"yellow"|"gray". The motivating incident: the companion Edge
+    // session died -> login wall -> agent fell back to default Copilot; the cockpit only
+    // showed failing tasks. These dots make the infra cause glanceable and one-click fixable.
+    enum HealthState { Gray = 0, Green = 1, Yellow = 2, Red = 3 }
+    class DotState { public HealthState State = HealthState.Gray; public string Detail = ""; public DateTime Checked = DateTime.MinValue; }
+    // Index map: 0=server 1=tunnel 2=edge 3=signin 4=agent.
+    readonly DotState[] _health = { new DotState(), new DotState(), new DotState(), new DotState(), new DotState() };
+    readonly object _healthLock = new object();
+    Border[] _healthDot;           // the 5 colored dots (re-tinted by ApplyHealthToUi)
+    TextBlock[] _healthLbl;        // the 5 labels (re-textable on language toggle)
+    Border[] _healthDotWrap;       // per-dot wrapper (tooltip host)
+    Button _fixBtn;                // the 「直す」/Fix button (shown only when a dot is red/yellow)
+    TextBlock _fixNote;            // inline progress/toast text in the strip
+    Border _healthStrip;           // the whole fixed-width strip container
+    Thread _healthThread;
+    volatile bool _healthStop = false;
+    volatile bool _fixRunning = false;   // guard: never run two fixes at once
+    string _agentMarkerId = "";    // T_.../P_... id extracted from the configured agent URL (.env)
+
     public CockpitWindow(string path)
     {
         _statusPath = ResolvePath(path);
@@ -188,6 +212,14 @@ class CockpitWindow : Window
         _timer.Tick += new EventHandler(OnTick);
         _timer.Start();
         OnTick(null, null);
+    }
+
+    // Stop the background health poll on close (the thread is IsBackground so it would die with the
+    // app anyway, but this makes shutdown deterministic and stops the ~15s sleep slices promptly).
+    protected override void OnClosed(EventArgs e)
+    {
+        _healthStop = true;
+        base.OnClosed(e);
     }
 
     static string ResolvePath(string path)
@@ -274,6 +306,44 @@ class CockpitWindow : Window
         if (k == "resume") return ja ? "再開" : "Resume";
         if (k == "stopall") return ja ? "全停止" : "Stop all";
         if (k == "steer_dead") return ja ? "走行が停止中のため割り込めません（再開後にどうぞ）" : "No run live — can't steer (resume the fleet first)";
+        // ── P0 Health strip (infra state) + Fix button + INFRA_STUCK / agent badge ──────
+        if (k == "hs_server") return ja ? "サーバ" : "Server";
+        if (k == "hs_tunnel") return ja ? "トンネル" : "Tunnel";
+        if (k == "hs_edge") return ja ? "Edge" : "Edge";
+        if (k == "hs_signin") return ja ? "サインイン" : "Sign-in";
+        if (k == "hs_agent") return ja ? "エージェント" : "Agent";
+        if (k == "hs_fix") return ja ? "直す" : "Fix";
+        if (k == "hs_ok") return ja ? "正常" : "OK";
+        if (k == "hs_down") return ja ? "応答なし" : "down";
+        if (k == "hs_unknown") return ja ? "未設定/不明" : "unknown";
+        if (k == "hs_checking") return ja ? "確認中…" : "checking…";
+        if (k == "hs_lastcheck") return ja ? "最終確認: " : "last check: ";
+        if (k == "hs_never") return ja ? "未確認" : "not checked yet";
+        if (k == "hs_srv_detail_ok") return ja ? "ローカルサーバは応答しています (127.0.0.1:8000)" : "Local server responding (127.0.0.1:8000)";
+        if (k == "hs_srv_detail_bad") return ja ? "ローカルサーバが応答しません。start_all.bat を実行してください。" : "Local server not responding. Run start_all.bat.";
+        if (k == "hs_tun_detail_ok") return ja ? "トンネル経由でサーバに到達できます" : "Server reachable through the tunnel";
+        if (k == "hs_tun_detail_bad") return ja ? "トンネルからサーバに到達できません" : "Server not reachable through the tunnel";
+        if (k == "hs_tun_detail_none") return ja ? "MCP_TUNNEL_URL が .env に未設定です" : "MCP_TUNNEL_URL is not set in .env";
+        if (k == "hs_edge_detail_ok") return ja ? "コンパニオン Edge が稼働中 (:9222)" : "Companion Edge running (:9222)";
+        if (k == "hs_edge_detail_bad") return ja ? "コンパニオン Edge に接続できません (:9222)" : "Companion Edge not reachable (:9222)";
+        if (k == "hs_signin_ok") return ja ? "M365 にサインイン済み（ログイン画面なし）" : "Signed in to M365 (no login wall)";
+        if (k == "hs_signin_bad") return ja ? "サインインが必要です（ログイン画面を検出）" : "Sign-in required (login wall detected)";
+        if (k == "hs_agent_ok") return ja ? "専用エージェントに接続中" : "Bound to the configured agent";
+        if (k == "hs_agent_warn") return ja ? "既定Copilotに落ちている可能性（エージェント未検出）" : "Possible default-Copilot fallback (agent tab not found)";
+        if (k == "hs_agent_gray") return ja ? "Edge 停止中のため判定不可" : "Edge down — cannot tell";
+        if (k == "hs_fixing") return ja ? "修復中… " : "Fixing… ";
+        if (k == "hs_fix_signin") return ja ? "サインイン用に Edge を開いています…" : "Opening Edge for sign-in…";
+        if (k == "hs_fix_signin_toast") return ja ? "開いたEdgeでサインインしてください。完了すると自動で緑になります。" : "Sign in on the Edge that opened; it turns green automatically when done.";
+        if (k == "hs_fix_edge") return ja ? "Edge を再起動しています…" : "Relaunching Edge…";
+        if (k == "hs_fix_agent") return ja ? "コネクタを再接続しています…" : "Reconnecting the connector…";
+        if (k == "hs_fix_agent_ok") return ja ? "再接続に成功しました" : "Reconnect succeeded";
+        if (k == "hs_fix_agent_fail") return ja ? "再接続に失敗（手動確認が必要）" : "Reconnect failed (needs manual check)";
+        if (k == "hs_fix_server") return ja ? "start_all.bat を実行してください" : "Please run start_all.bat";
+        if (k == "hs_fix_done") return ja ? "完了" : "done";
+        if (k == "hs_fix_err") return ja ? "修復でエラー" : "fix error";
+        if (k == "infra_wait") return ja ? "インフラ待ち" : "Infra wait";
+        if (k == "infra_retry") return ja ? "再投入" : "Re-queue";
+        if (k == "badge_default_copilot") return ja ? "既定Copilot" : "default Copilot";
         // Capacity-wait banner (admission gate) + force-start
         // Settings panel (gear popup) -- consolidates the scattered toolbar controls
         if (k == "settings") return ja ? "設定" : "Settings";
@@ -468,6 +538,9 @@ class CockpitWindow : Window
         ctrls.VerticalAlignment = VerticalAlignment.Top;
         ctrls.HorizontalAlignment = HorizontalAlignment.Right;
 
+        // P0 HEALTH STRIP: five infra dots + Fix button, fixed-width, leftmost of the right cluster.
+        ctrls.Children.Add(BuildHealthStrip());
+
         // "N workers" neutral info chip (live count updated in OnTick; shows maxtabs until first tick)
         _workerChip = new TextBlock();
         _workerChip.FontSize = 12; _workerChip.VerticalAlignment = VerticalAlignment.Center;
@@ -606,6 +679,531 @@ class CockpitWindow : Window
         root.Children.Add(lanesGrid);
         Content = root;
         PaintChrome();
+        StartHealthPoll();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════
+    //  P0 HEALTH STRIP  —  infra state, glanceable + one-click fixable
+    // ══════════════════════════════════════════════════════════════════════════════════
+    // Repo root is resolved the same way SpawnFleet does (exe is in ...\ui, repo is one up).
+    string RepoRoot() { return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..")); }
+
+    // Build the fixed-width strip: 5 dots with labels + a Fix button + an inline note.
+    // FIXED width so the Fix button / note appearing or disappearing never shifts the header.
+    UIElement BuildHealthStrip()
+    {
+        _healthDot = new Border[5];
+        _healthLbl = new TextBlock[5];
+        _healthDotWrap = new Border[5];
+
+        _healthStrip = new Border();
+        _healthStrip.Width = 330;                 // FIXED reserved width -> no layout shift
+        _healthStrip.VerticalAlignment = VerticalAlignment.Center;
+        _healthStrip.Margin = new Thickness(0, 0, 12, 0);
+
+        var col = new StackPanel { Orientation = Orientation.Vertical };
+
+        // Row A: the five dots+labels laid out horizontally.
+        var row = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
+        string[] keys = { "hs_server", "hs_tunnel", "hs_edge", "hs_signin", "hs_agent" };
+        for (int i = 0; i < 5; i++)
+        {
+            var wrap = new Border();
+            wrap.Margin = new Thickness(i == 0 ? 0 : 8, 0, 0, 0);
+            wrap.Padding = new Thickness(0);
+            wrap.VerticalAlignment = VerticalAlignment.Center;
+            var dr = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            var dot = new Border { Width = 8, Height = 8, CornerRadius = new CornerRadius(4),
+                                   VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 4, 0) };
+            var lbl = new TextBlock { FontSize = 11, VerticalAlignment = VerticalAlignment.Center, Text = T(keys[i]) };
+            dr.Children.Add(dot);
+            dr.Children.Add(lbl);
+            wrap.Child = dr;
+            _healthDot[i] = dot;
+            _healthLbl[i] = lbl;
+            _healthDotWrap[i] = wrap;
+            row.Children.Add(wrap);
+        }
+        col.Children.Add(row);
+
+        // Row B: Fix button (hidden unless red/yellow) + inline progress/toast note.
+        var row2 = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right,
+                                    Margin = new Thickness(0, 3, 0, 0) };
+        _fixBtn = new Button();
+        _fixBtn.Content = T("hs_fix");
+        _fixBtn.FontSize = 11; _fixBtn.FontWeight = FontWeights.SemiBold;
+        _fixBtn.Padding = new Thickness(10, 1, 10, 1);
+        _fixBtn.Cursor = Cursors.Hand;
+        _fixBtn.BorderThickness = new Thickness(1);
+        _fixBtn.Visibility = Visibility.Collapsed;
+        _fixBtn.Click += delegate { RunFix(); };
+        row2.Children.Add(_fixBtn);
+
+        _fixNote = new TextBlock { FontSize = 11, VerticalAlignment = VerticalAlignment.Center,
+                                   Margin = new Thickness(8, 0, 0, 0), Text = "",
+                                   TextTrimming = TextTrimming.CharacterEllipsis, MaxWidth = 250 };
+        row2.Children.Add(_fixNote);
+        col.Children.Add(row2);
+
+        _healthStrip.Child = col;
+        PaintHealthChrome();
+        ApplyHealthToUi();     // paint current cached states (Gray until first poll completes)
+        return _healthStrip;
+    }
+
+    // Re-tint the strip chrome (labels, Fix button) for the current theme. Called from PaintChrome.
+    void PaintHealthChrome()
+    {
+        if (_healthLbl != null)
+            for (int i = 0; i < _healthLbl.Length; i++)
+                if (_healthLbl[i] != null) _healthLbl[i].Foreground = Muted;
+        if (_fixBtn != null)
+        {
+            // Warning-outline (needs-attention), NOT the reserved accent fill.
+            _fixBtn.Background = Brushes.Transparent;
+            _fixBtn.Foreground = Theme.Br(Theme.Warning(_dark));
+            _fixBtn.BorderBrush = Theme.Br(Theme.Warning(_dark));
+        }
+        if (_fixNote != null) _fixNote.Foreground = Muted;
+    }
+
+    // Map a HealthState to its Theme dot color for the current mode.
+    Brush HealthBrush(HealthState s)
+    {
+        if (s == HealthState.Green) return Theme.Br(Theme.Success(_dark));
+        if (s == HealthState.Red) return Theme.Br(Theme.Danger(_dark));
+        if (s == HealthState.Yellow) return Theme.Br(Theme.Warning(_dark));
+        return Theme.Br(Theme.Muted(_dark));   // gray / unknown
+    }
+
+    // Apply the cached _health snapshot onto the dots + tooltips + Fix button visibility.
+    // MUST run on the UI thread (called from BuildHealthStrip and from the Dispatcher marshal).
+    void ApplyHealthToUi()
+    {
+        if (_healthDot == null) return;
+        bool anyBad = false;
+        DotState[] snap = new DotState[5];
+        lock (_healthLock)
+            for (int i = 0; i < 5; i++)
+                snap[i] = new DotState { State = _health[i].State, Detail = _health[i].Detail, Checked = _health[i].Checked };
+        for (int i = 0; i < 5; i++)
+        {
+            if (_healthDot[i] != null) _healthDot[i].Background = HealthBrush(snap[i].State);
+            if (snap[i].State == HealthState.Red || snap[i].State == HealthState.Yellow) anyBad = true;
+            if (_healthDotWrap[i] != null)
+            {
+                string when = snap[i].Checked == DateTime.MinValue
+                    ? T("hs_never")
+                    : snap[i].Checked.ToLocalTime().ToString("HH:mm:ss");
+                string detail = string.IsNullOrEmpty(snap[i].Detail) ? T("hs_checking") : snap[i].Detail;
+                _healthDotWrap[i].ToolTip = T(_healthKeys[i]) + ": " + detail + "\n" + T("hs_lastcheck") + when;
+            }
+        }
+        if (_fixBtn != null)
+        {
+            // Never hide the button mid-fix (it is disabled while running so it can't re-enter).
+            _fixBtn.Visibility = (anyBad || _fixRunning) ? Visibility.Visible : Visibility.Collapsed;
+            _fixBtn.IsEnabled = !_fixRunning;
+        }
+    }
+    static readonly string[] _healthKeys = { "hs_server", "hs_tunnel", "hs_edge", "hs_signin", "hs_agent" };
+
+    // Start (once) the background poll thread. Re-entrant-safe: only spawns if not already alive.
+    // BuildChrome (and RebuildChrome) call this; a language flip rebuilds chrome but the thread keeps
+    // running, so we don't restart it — we just refresh the UI from the still-updating cache.
+    void StartHealthPoll()
+    {
+        _agentMarkerId = ExtractAgentMarker();
+        if (_healthThread != null && _healthThread.IsAlive) { ApplyHealthToUi(); return; }
+        _healthStop = false;
+        _healthThread = new Thread(new ThreadStart(HealthLoop));
+        _healthThread.IsBackground = true;   // dies with the app; never blocks shutdown
+        _healthThread.Start();
+    }
+
+    // Background poll loop. ~15s cadence; each probe uses a short (3-4s) timeout so a dead
+    // endpoint can't stall the sweep. NEVER touches WPF objects directly — it writes the cache
+    // and marshals ApplyHealthToUi onto the Dispatcher.
+    void HealthLoop()
+    {
+        while (!_healthStop)
+        {
+            try { PollHealthOnce(); } catch (Exception) { }
+            try
+            {
+                if (!Dispatcher.HasShutdownStarted)
+                    Dispatcher.BeginInvoke(new Action(delegate { try { ApplyHealthToUi(); } catch (Exception) { } }));
+            }
+            catch (Exception) { }
+            // Sleep in short slices so a Stop/close is responsive (~15s total).
+            for (int i = 0; i < 30 && !_healthStop; i++) Thread.Sleep(500);
+        }
+    }
+
+    // One full infra sweep. Writes results into _health under _healthLock.
+    void PollHealthOnce()
+    {
+        DateTime now = DateTime.UtcNow;
+
+        // 0) Server: GET http://127.0.0.1:8000/health == 200
+        bool srvOk = HttpOk("http://127.0.0.1:8000/health", 3500);
+        SetDot(0, srvOk ? HealthState.Green : HealthState.Red,
+               T(srvOk ? "hs_srv_detail_ok" : "hs_srv_detail_bad"), now);
+
+        // 1) Tunnel: read MCP_TUNNEL_URL from ..\.env; GET <url>/health == 200. Gray if none.
+        string tunnel = EnvValue("MCP_TUNNEL_URL");
+        if (string.IsNullOrEmpty(tunnel))
+            SetDot(1, HealthState.Gray, T("hs_tun_detail_none"), now);
+        else
+        {
+            string turl = tunnel.TrimEnd('/') + "/health";
+            bool tunOk = HttpOk(turl, 4000);
+            SetDot(1, tunOk ? HealthState.Green : HealthState.Red,
+                   T(tunOk ? "hs_tun_detail_ok" : "hs_tun_detail_bad"), now);
+        }
+
+        // 2) Edge: GET http://127.0.0.1:9222/json/version succeeds
+        string edgeVersion = HttpGetBody("http://127.0.0.1:9222/json/version", 3500);
+        bool edgeOk = edgeVersion != null;
+        SetDot(2, edgeOk ? HealthState.Green : HealthState.Red,
+               T(edgeOk ? "hs_edge_detail_ok" : "hs_edge_detail_bad"), now);
+
+        // 3+4) Sign-in + Agent both derive from the tab list (:9222/json). If Edge is down,
+        //      sign-in is unknown (gray) and agent is gray.
+        if (!edgeOk)
+        {
+            SetDot(3, HealthState.Gray, T("hs_edge_detail_bad"), now);
+            SetDot(4, HealthState.Gray, T("hs_agent_gray"), now);
+            return;
+        }
+        string tabsJson = HttpGetBody("http://127.0.0.1:9222/json", 3500);
+        List<string> urls = ExtractTabUrls(tabsJson);
+
+        // 3) Sign-in: RED if ANY tab url matches the login-wall regex (mirrors doctor.ps1).
+        bool onLoginWall = false;
+        foreach (string u in urls) if (LooksLikeLoginWall(u)) { onLoginWall = true; break; }
+        SetDot(3, onLoginWall ? HealthState.Red : HealthState.Green,
+               T(onLoginWall ? "hs_signin_bad" : "hs_signin_ok"), now);
+
+        // 4) Agent: GREEN if any tab url carries the configured agent marker id;
+        //    YELLOW if only plain m365 chat tabs (possible default-Copilot fallback).
+        bool agentBound = false, anyChat = false;
+        foreach (string u in urls)
+        {
+            string lo = u.ToLowerInvariant();
+            if (!string.IsNullOrEmpty(_agentMarkerId) && lo.Contains(_agentMarkerId.ToLowerInvariant())) agentBound = true;
+            if (lo.Contains("m365") || lo.Contains("copilot")) anyChat = true;
+        }
+        if (agentBound)
+            SetDot(4, HealthState.Green, T("hs_agent_ok"), now);
+        else if (anyChat)
+            SetDot(4, HealthState.Yellow, T("hs_agent_warn"), now);
+        else
+            SetDot(4, HealthState.Gray, T("hs_agent_gray"), now);
+    }
+
+    void SetDot(int i, HealthState s, string detail, DateTime whenUtc)
+    {
+        lock (_healthLock) { _health[i].State = s; _health[i].Detail = detail; _health[i].Checked = whenUtc; }
+    }
+
+    // Extract the T_.../P_... agent id from the configured agent URL in .env. The URL may be
+    // '.../chat/?titleId=T_xxx' (deep link) OR '.../chat/agent/T_xxx' — both carry the same id.
+    // Matched later (case-insensitively) inside any tab url, including /chat/agent/<id> conversation
+    // forms. Returns "" if no agent URL is configured.
+    string ExtractAgentMarker()
+    {
+        string url = EnvValue("MCP_FLEET_AGENT_URL");
+        if (string.IsNullOrEmpty(url)) url = EnvValue("MCP_IMPL_AGENT_URL");
+        return AgentIdFromUrl(url);
+    }
+    static string AgentIdFromUrl(string url)
+    {
+        if (string.IsNullOrEmpty(url) || url == null) return "";
+        // titleId=<id>
+        int ti = url.IndexOf("titleId=", StringComparison.OrdinalIgnoreCase);
+        if (ti >= 0)
+        {
+            string tail = url.Substring(ti + 8);
+            return TrimId(tail);
+        }
+        // /agent/<id>
+        int ai = url.IndexOf("/agent/", StringComparison.OrdinalIgnoreCase);
+        if (ai >= 0)
+        {
+            string tail = url.Substring(ai + 7);
+            return TrimId(tail);
+        }
+        return "";
+    }
+    // Cut an id token at the first url separator (&, ?, /, #, whitespace). Keeps '.', '-', '_'
+    // (agent ids like 'P_552e6eda-...-....dr_work' and 'T_02140b8c-f551-...' contain those).
+    static string TrimId(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        var sb = new StringBuilder();
+        foreach (char c in s)
+        {
+            if (c == '&' || c == '?' || c == '/' || c == '#' || char.IsWhiteSpace(c)) break;
+            sb.Append(c);
+        }
+        return sb.ToString();
+    }
+
+    // login-wall regex from doctor.ps1 (just-fixed): login.microsoftonline / login.live.com /
+    // /adfs/ / adfs. / /oauth2/authorize / /signin / login_hint= . Implemented as substring checks.
+    static bool LooksLikeLoginWall(string url)
+    {
+        if (string.IsNullOrEmpty(url)) return false;
+        string u = url.ToLowerInvariant();
+        return u.Contains("login.microsoftonline") || u.Contains("login.live.com")
+            || u.Contains("/adfs/") || u.Contains("adfs.")
+            || u.Contains("/oauth2/authorize") || u.Contains("/signin")
+            || u.Contains("login_hint=");
+    }
+
+    // Pull every "url":"..." value out of the raw :9222/json tab-list body. Uses the shared
+    // JavaScriptSerializer when the body parses as an array; falls back to a cheap scan otherwise.
+    List<string> ExtractTabUrls(string json)
+    {
+        var urls = new List<string>();
+        if (string.IsNullOrEmpty(json)) return urls;
+        try
+        {
+            object parsed = _js.DeserializeObject(json);
+            if (parsed is object[])
+            {
+                foreach (object o in (object[])parsed)
+                {
+                    var d = o as Dictionary<string, object>;
+                    if (d != null && d.ContainsKey("url") && d["url"] != null) urls.Add(d["url"].ToString());
+                }
+                return urls;
+            }
+        }
+        catch (Exception) { }
+        // Fallback: substring scan for "url":"..."
+        int idx = 0;
+        while (true)
+        {
+            int k = json.IndexOf("\"url\"", idx, StringComparison.OrdinalIgnoreCase);
+            if (k < 0) break;
+            int c = json.IndexOf(':', k); if (c < 0) break;
+            int q1 = json.IndexOf('"', c + 1); if (q1 < 0) break;
+            int q2 = json.IndexOf('"', q1 + 1); if (q2 < 0) break;
+            urls.Add(json.Substring(q1 + 1, q2 - q1 - 1));
+            idx = q2 + 1;
+        }
+        return urls;
+    }
+
+    // ── .env reader (utf-8, tolerate BOM) ───────────────────────────────────────────
+    // The .env lives at the REPO ROOT (one level up from ...\ui), same file doctor.ps1 reads.
+    // Cached by mtime so a poll every 15s doesn't re-read from disk each time.
+    Dictionary<string, string> _envCache;
+    long _envMtime = -1;
+    string EnvValue(string key)
+    {
+        try
+        {
+            string envPath = Path.Combine(RepoRoot(), ".env");
+            if (!File.Exists(envPath)) { _envCache = null; return ""; }
+            long m = File.GetLastWriteTimeUtc(envPath).Ticks;
+            if (_envCache == null || m != _envMtime)
+            {
+                var map = new Dictionary<string, string>();
+                // UTF8 with BOM tolerated (new UTF8Encoding detects+strips a leading BOM).
+                foreach (string raw in File.ReadAllLines(envPath, new UTF8Encoding(false)))
+                {
+                    string ln = raw;
+                    if (ln.Length > 0 && ln[0] == '﻿') ln = ln.Substring(1);   // stray BOM guard
+                    ln = ln.Trim();
+                    if (ln.Length == 0 || ln[0] == '#') continue;
+                    int eq = ln.IndexOf('=');
+                    if (eq <= 0) continue;
+                    string k = ln.Substring(0, eq).Trim();
+                    string v = ln.Substring(eq + 1).Trim();
+                    if (k.Length > 0) map[k] = v;
+                }
+                _envCache = map;
+                _envMtime = m;
+            }
+            string val;
+            if (_envCache != null && _envCache.TryGetValue(key, out val)) return val;
+        }
+        catch (Exception) { }
+        return "";
+    }
+
+    // GET a URL; true iff it returns HTTP 200. Short timeout, fully guarded.
+    static bool HttpOk(string url, int timeoutMs)
+    {
+        try
+        {
+            var req = (HttpWebRequest)WebRequest.Create(url);
+            req.Method = "GET";
+            req.Timeout = timeoutMs;
+            req.ReadWriteTimeout = timeoutMs;
+            req.AllowAutoRedirect = true;
+            using (var resp = (HttpWebResponse)req.GetResponse())
+                return resp.StatusCode == HttpStatusCode.OK;
+        }
+        catch (Exception) { return false; }
+    }
+
+    // GET a URL; return the body string, or null on any failure (unreachable / non-200 / timeout).
+    static string HttpGetBody(string url, int timeoutMs)
+    {
+        try
+        {
+            var req = (HttpWebRequest)WebRequest.Create(url);
+            req.Method = "GET";
+            req.Timeout = timeoutMs;
+            req.ReadWriteTimeout = timeoutMs;
+            using (var resp = (HttpWebResponse)req.GetResponse())
+            {
+                if (resp.StatusCode != HttpStatusCode.OK) return null;
+                using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                    return sr.ReadToEnd();
+            }
+        }
+        catch (Exception) { return null; }
+    }
+
+    // ── Fix button: run the remedy for the WORST current problem ─────────────────────
+    // Priority (worst first): sign-in RED -> Edge RED -> agent YELLOW -> server RED.
+    // Each remedy is a short-lived, windowless, async shell; never blocks the UI; guarded.
+    // Never two at once (button disabled while running).
+    void RunFix()
+    {
+        if (_fixRunning) return;
+        // Decide the worst problem from the current cache (UI thread).
+        HealthState signin, edge, agent, server;
+        lock (_healthLock)
+        {
+            server = _health[0].State; edge = _health[2].State;
+            signin = _health[3].State; agent = _health[4].State;
+        }
+        _fixRunning = true;
+        ApplyHealthToUi();   // disable + keep the button visible
+
+        string repo = RepoRoot();
+        Action<string> note = delegate (string s)
+        {
+            try { if (!Dispatcher.HasShutdownStarted) Dispatcher.BeginInvoke(new Action(delegate { if (_fixNote != null) _fixNote.Text = s; })); }
+            catch (Exception) { }
+        };
+        Action done = delegate { _fixRunning = false; try { if (!Dispatcher.HasShutdownStarted) Dispatcher.BeginInvoke(new Action(delegate { ApplyHealthToUi(); })); } catch (Exception) { } };
+
+        // Priority 1: Sign-in RED -> relaunch companion Edge HEADED for the user to sign in.
+        if (signin == HealthState.Red)
+        {
+            note(T("hs_fix_signin"));
+            var t = new Thread(new ThreadStart(delegate
+            {
+                try
+                {
+                    RunPowershellScript(Path.Combine(repo, "scripts", "start_companion_edge.ps1"),
+                                        "-Foreground -Port 9222");
+                    note(T("hs_fix_signin_toast"));
+                }
+                catch (Exception ex) { note(T("hs_fix_err") + ": " + ex.Message); }
+                finally { done(); }
+            })) { IsBackground = true };
+            t.Start();
+            return;
+        }
+
+        // Priority 2: Edge RED -> hard-reset relaunch (preserves remembered headless/headed mode).
+        if (edge == HealthState.Red)
+        {
+            note(T("hs_fix_edge"));
+            var t = new Thread(new ThreadStart(delegate
+            {
+                try
+                {
+                    RunPowershellScript(Path.Combine(repo, "scripts", "start_companion_edge.ps1"),
+                                        "-HardReset -Port 9222");
+                    note(T("hs_fix_done"));
+                }
+                catch (Exception ex) { note(T("hs_fix_err") + ": " + ex.Message); }
+                finally { done(); }
+            })) { IsBackground = true };
+            t.Start();
+            return;
+        }
+
+        // Priority 3: Agent YELLOW (default-Copilot fallback / stale connector) -> edge_reconnect.
+        if (agent == HealthState.Yellow)
+        {
+            note(T("hs_fix_agent"));
+            var t = new Thread(new ThreadStart(delegate
+            {
+                try
+                {
+                    int code = RunReconnect(repo);
+                    note(code == 0 ? T("hs_fix_agent_ok") : T("hs_fix_agent_fail"));
+                }
+                catch (Exception ex) { note(T("hs_fix_err") + ": " + ex.Message); }
+                finally { done(); }
+            })) { IsBackground = true };
+            t.Start();
+            return;
+        }
+
+        // Priority 4: Server RED -> instruction only (don't auto-launch the whole stack).
+        if (server == HealthState.Red)
+        {
+            note(T("hs_fix_server"));
+            done();
+            return;
+        }
+
+        // Nothing actionable (all green/gray) -> clear the running flag.
+        done();
+    }
+
+    // Launch a PowerShell script windowless + async; wait for exit inside the caller's worker thread.
+    void RunPowershellScript(string scriptPath, string extraArgs)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo();
+        psi.FileName = "powershell";
+        psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" + scriptPath + "\" " + extraArgs;
+        psi.WorkingDirectory = RepoRoot();
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError = true;
+        using (var p = System.Diagnostics.Process.Start(psi))
+        {
+            // Drain streams so the child can't block on a full pipe; bounded wait.
+            try { p.StandardOutput.ReadToEnd(); } catch (Exception) { }
+            try { p.StandardError.ReadToEnd(); } catch (Exception) { }
+            try { p.WaitForExit(120000); } catch (Exception) { }
+        }
+    }
+
+    // Run  <repo>\.venv\Scripts\python.exe -m relay.edge_reconnect  and capture the exit code.
+    int RunReconnect(string repo)
+    {
+        string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+        if (!File.Exists(py)) py = "python";
+        var psi = new System.Diagnostics.ProcessStartInfo();
+        psi.FileName = py;
+        psi.Arguments = "-m relay.edge_reconnect";
+        psi.WorkingDirectory = repo;
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError = true;
+        try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+        using (var p = System.Diagnostics.Process.Start(psi))
+        {
+            try { p.StandardOutput.ReadToEnd(); } catch (Exception) { }
+            try { p.StandardError.ReadToEnd(); } catch (Exception) { }
+            try { if (!p.WaitForExit(600000)) return -1; } catch (Exception) { return -1; }
+            try { return p.ExitCode; } catch (Exception) { return -1; }
+        }
     }
 
     // A2-2: Refresh the Evidence Spine panel on each tick. Keyed off a signature so the
@@ -3664,6 +4262,9 @@ class CockpitWindow : Window
         if (_autoValue != null) _autoValue.Foreground = Fg;
         if (_workerChip != null) UpdateWorkerChip(0, false);
         PaintWorkerChipBorder(_workerChipBorder);
+        PaintHealthChrome();
+        ApplyHealthToUi();     // re-tint the dots for the new theme
+        _agentMarkerId = ExtractAgentMarker();
         PaintAutoToggle();
         UpdateAutoEnabled();
         PaintEffort();
@@ -4354,6 +4955,10 @@ class CockpitWindow : Window
                 sb.Append(_expanded.Contains(nm) ? "#E" : "#C")
                   .Append(StableShortHash(lastVal)).Append(':').Append(StableShortHash(drVal))
                   .Append(':').Append(S(w, "verify_attempts")).Append(S(w, "verified"));
+                // P0: conv_url drives the agent badge (agent-bound vs 既定Copilot); reason drives the
+                // INFRA_STUCK row text — track both so those cards re-render when they change.
+                sb.Append(':').Append(StableShortHash(S(w, "conv_url")))
+                  .Append(':').Append(StableShortHash(S(w, "reason")));
                 // TASK 3 (Bucket C): track next_step + self_confidence so the collapsed row re-renders.
                 sb.Append('|').Append(S(w, "next_step").Length).Append(':').Append(S(w, "self_confidence"));
                 return sb.ToString();
@@ -5113,6 +5718,14 @@ class CockpitWindow : Window
         return status == "stuck" || status == "maxturns" || status == "error";
     }
 
+    // P0: an INFRA_STUCK worker is NOT a task failure — the engine parked it because the infra
+    // (Edge session / sign-in / connector) broke. It gets a distinct ORANGE インフラ待ち pill,
+    // is excluded from failure/miss counts, and its `reason` (actionable) is shown as-is.
+    static bool IsInfraStuck(Dictionary<string, object> w)
+    {
+        return string.Equals(S(w, "outcome"), "INFRA_STUCK", StringComparison.OrdinalIgnoreCase);
+    }
+
     // Build a small outline button for the attention recovery row (§6: equal-weight neutral buttons).
     Button AttentionBtn(string label)
     {
@@ -5147,10 +5760,15 @@ class CockpitWindow : Window
         bool terminal = status == "done" || status == "stuck" || status == "maxturns"
                         || status == "error" || status == "cancelled";
         bool isOpen = _expanded.Contains(name);
+        // P0: INFRA_STUCK is an infra pause (Edge/sign-in/connector broke), NOT a task failure. It
+        // gets the distinct ORANGE インフラ待ち treatment: a warning rail/pill, its actionable reason
+        // shown as-is, and a 再投入 re-queue action — NOT the red stuck/error recovery surface.
+        bool isInfra = !closed && IsInfraStuck(w);
         // Attention lane: stuck/maxturns/error and NOT yet expanded -- gets recovery surface treatment.
-        bool isAttention = !closed && IsAttentionStatus(status);
+        // INFRA_STUCK is carved out of the red attention lane (handled by its own infra branch).
+        bool isAttention = !closed && !isInfra && IsAttentionStatus(status);
 
-        string railKind = closed ? "neutral" : Theme.StatusRail(status);
+        string railKind = closed ? "neutral" : (isInfra ? "warning" : Theme.StatusRail(status));
         Brush statusBrush = Theme.Br(Theme.RailColor(railKind, _dark));
         // Chip color is computed SEPARATELY from the left rail. A completed worker that has been
         // released (closed) keeps status=="done"/outcome=="DONE", but `railKind` above forces neutral
@@ -5158,7 +5776,7 @@ class CockpitWindow : Window
         // (Theme.StatusRail("done")=="success", green) so "完了" is the same green in both places.
         // We therefore base chipKind on the status (with an explicit DONE override), not on `closed`.
         bool isDone = status == "done" || string.Equals(S(w, "outcome"), "DONE", StringComparison.OrdinalIgnoreCase);
-        string chipKind = isDone ? "success" : Theme.StatusRail(status);
+        string chipKind = isDone ? "success" : (isInfra ? "warning" : Theme.StatusRail(status));
 
         // Pass A2-1 TASK 1: demote the collapsed row to a LEDGER ROW.
         // - No rounded corners, no card background fill, no full border.
@@ -5245,9 +5863,14 @@ class CockpitWindow : Window
         // left cluster: chevron + status chip, then the title fills the rest (1 line, ellipsis)
         var left = new DockPanel { LastChildFill = true };
         var chev = ChevronToggle(name, isOpen); DockPanel.SetDock(chev, Dock.Left); left.Children.Add(chev);
-        var chip = Pill(Theme.StatusLabel(status, _lang), chipKind);
+        // INFRA_STUCK -> distinct ORANGE インフラ待ち pill; otherwise the normal status label.
+        var chip = Pill(isInfra ? T("infra_wait") : Theme.StatusLabel(status, _lang), chipKind);
         chip.Margin = new Thickness(2, 0, 5, 0);
         DockPanel.SetDock(chip, Dock.Left); left.Children.Add(chip);
+        // AGENT BADGE (P0 feature 4): which agent this conversation is bound to. Green subtle badge
+        // for the configured agent, WARNING-colored 既定Copilot badge for a plain /chat/ (default) url.
+        var agentBadge = BuildAgentBadge(conv, convTitle);
+        if (agentBadge != null) { DockPanel.SetDock(agentBadge, Dock.Left); left.Children.Add(agentBadge); }
         string headline = CardTitle(convTitle, goal);
         var ht = new TextBlock {
             Text = headline, Foreground = Fg, FontSize = 13.5, FontWeight = FontWeights.SemiBold,
@@ -5261,7 +5884,42 @@ class CockpitWindow : Window
         if (!isOpen)
         {
             // ── COLLAPSED ROW body (ledger row, not expanded drawer) ──────────────────────────
-            if (isAttention)
+            if (isInfra)
+            {
+                // P0 INFRA_STUCK collapsed row: the reason text is actionable (e.g. "sign-in
+                // required" / "default-Copilot fallback"), so render it verbatim, then offer a
+                // 再投入 action reusing the existing retry path. NOT a red error surface.
+                if (!string.IsNullOrEmpty(reason))
+                {
+                    var ir = new TextBlock
+                    {
+                        Text = OneLine(reason),
+                        Foreground = Muted, FontSize = 12.5,
+                        TextTrimming = TextTrimming.CharacterEllipsis,
+                        TextWrapping = TextWrapping.NoWrap,
+                        Margin = new Thickness(24, 4, 0, 0)
+                    };
+                    col.Children.Add(ir);
+                }
+                var infraRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(24, 6, 0, 2) };
+                infraRow.MouseLeftButtonUp += delegate (object s2, MouseButtonEventArgs e2) { e2.Handled = true; };
+                // 再投入 (Re-queue): reuse RetryGoal (add_goal if live, else respawn) — the same
+                // affordance stopped goals already use, per spec ("reuse the existing retry path").
+                var requeueBtn = AttentionBtn(T("infra_retry"));
+                requeueBtn.ToolTip = _lang == 0
+                    ? "インフラ復旧後にこのゴールを再投入します（実行中なら add_goal、停止済なら fleet を再起動）"
+                    : "Re-queue this goal after the infra recovers (add_goal if live, else respawn fleet)";
+                Dictionary<string, object> wInfra = w;
+                requeueBtn.Click += delegate (object s2, RoutedEventArgs e2) { e2.Handled = true; RetryGoal(wInfra); };
+                infraRow.Children.Add(requeueBtn);
+                // Open-conversation shortcut so the user can inspect the parked lane.
+                var infraOpen = AttentionBtn(_lang == 0 ? "会話を開く" : "Open conversation");
+                string infraNm = name; string infraUrl = conv;
+                infraOpen.Click += delegate (object s2, RoutedEventArgs e2) { e2.Handled = true; OpenWorker(infraNm, infraUrl); };
+                infraRow.Children.Add(infraOpen);
+                col.Children.Add(infraRow);
+            }
+            else if (isAttention)
             {
                 // Pass A2-1 TASK 2: RECOVERY ROW for attention lanes (stuck/maxturns/error).
                 // §6: "Not an error card — a recovery surface."
@@ -6237,6 +6895,62 @@ class CockpitWindow : Window
 
     // Status chip (spec): a small OUTLINED pill -- colored border + colored text on a transparent
     // fill, never a saturated block. `railKind` is one of neutral/info/success/warning/danger.
+    // P0 AGENT BADGE (feature 4): show which agent a worker's conversation is bound to, read
+    // from its conv_url in status.json.
+    //   • conv_url carries "/agent/<id>" AND <id> matches the configured agent -> subtle Muted
+    //     badge with the agent's short name (12-char title, else "agent").
+    //   • conv_url carries "/agent/<otherid>" -> subtle badge (still an agent, just not ours).
+    //   • conv_url is a plain "/chat/" url with NO "/agent/" segment -> WARNING 既定Copilot badge
+    //     (a default-Copilot conversation has no MCP connector — the incident case).
+    //   • no conv_url yet (worker just started) -> null (no badge; don't accuse prematurely).
+    Border BuildAgentBadge(string convUrl, string convTitle)
+    {
+        if (string.IsNullOrEmpty(convUrl)) return null;
+        string lo = convUrl.ToLowerInvariant();
+        bool hasAgentSeg = lo.Contains("/agent/");
+        if (hasAgentSeg)
+        {
+            // Agent-bound conversation. Prefer a short name from the title; fall back to "agent".
+            string shortName = "agent";
+            if (!string.IsNullOrEmpty(convTitle))
+            {
+                string tt = OneLine(convTitle);
+                shortName = tt.Length > 12 ? tt.Substring(0, 12) : tt;
+            }
+            bool mine = !string.IsNullOrEmpty(_agentMarkerId)
+                        && lo.Contains(_agentMarkerId.ToLowerInvariant());
+            // Subtle (Muted) badge either way; the configured-agent case is the expected/quiet state.
+            return AgentBadge(shortName, mine ? "neutral" : "neutral");
+        }
+        // A conversation URL that is a plain /chat/ (no /agent/ segment) — default Copilot.
+        if (lo.Contains("/chat/") || lo.Contains("/conversation/"))
+            return AgentBadge(T("badge_default_copilot"), "warning");
+        return null;
+    }
+
+    // Small outlined badge. kind: "neutral" (subtle) | "warning" (default-Copilot alert).
+    Border AgentBadge(string text, string kind)
+    {
+        Brush color = kind == "warning" ? Theme.Br(Theme.Warning(_dark)) : Theme.Br(Theme.Muted(_dark));
+        var b = new Border();
+        b.Background = Brushes.Transparent;
+        b.BorderBrush = color; b.BorderThickness = new Thickness(1);
+        b.CornerRadius = new CornerRadius(4);
+        b.Padding = new Thickness(5, 0, 5, 0);
+        b.Margin = new Thickness(0, 0, 5, 0);
+        b.VerticalAlignment = VerticalAlignment.Center;
+        var t = new TextBlock();
+        t.Text = text; t.Foreground = color;
+        t.FontSize = 10.5; t.FontWeight = FontWeights.SemiBold;
+        t.VerticalAlignment = VerticalAlignment.Center;
+        b.Child = t;
+        b.ToolTip = kind == "warning"
+            ? (_lang == 0 ? "既定Copilotの会話（MCPコネクタ無し）。エージェントに接続し直してください。"
+                          : "Default-Copilot conversation (no MCP connector). Reconnect to the agent.")
+            : (_lang == 0 ? "この会話はエージェントに接続されています" : "This conversation is bound to the agent");
+        return b;
+    }
+
     Border Pill(string text, string railKind)
     {
         var color = Theme.Br(Theme.RailColor(railKind, _dark));
