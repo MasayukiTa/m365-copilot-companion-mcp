@@ -44,7 +44,21 @@ from tools.file_ops import (
     write_file,
 )
 from tools.image_ops import image_info, read_image
-from tools.memory_ops import memory_delete, memory_list, memory_load, memory_save
+from tools.memory_ops import (
+    memory_delete,
+    memory_list,
+    memory_load,
+    memory_save,
+    semantic_memory_delete,
+    semantic_memory_list,
+    semantic_memory_load,
+    semantic_memory_save,
+)
+from tools.procedural_memory import (
+    procedural_memory_delete,
+    procedural_memory_save,
+    procedural_memory_search,
+)
 from tools.notify_ops import notify_desktop
 from tools.outlook_ops import (
     outlook_calendar,
@@ -195,8 +209,12 @@ TOOLS = (
     # diagrams / math
     render_diagram, render_mermaid_png,
     render_math,
-    # memory (cross-session)
+    # memory (cross-session) -- semantic (facts/preferences; book SS17/SS28.16 taxonomy)
     memory_save, memory_load, memory_list, memory_delete,
+    # memory: semantic_* back-compat aliases (same store as memory_* above)
+    semantic_memory_save, semantic_memory_load, semantic_memory_list, semantic_memory_delete,
+    # memory: procedural (reusable how-to success snippets; distinct store)
+    procedural_memory_save, procedural_memory_search, procedural_memory_delete,
     # notifications
     notify_desktop,
     # scheduling (Windows Task Scheduler)

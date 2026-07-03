@@ -1,3 +1,10 @@
+# Taxonomy note (book SS17 / SS28.16): this module IS the "semantic memory" store
+# (facts/preferences, keyed lookup) -- semantic_* below are thin backward-compat
+# aliases over the same memory_* functions/state file, added so both vocabularies
+# work without renaming anything callers already depend on. Procedural memory
+# (reusable how-to snippets) lives in tools/procedural_memory.py, its own state
+# file. Episodic memory (ordered event history of a run) is already served by
+# tools/runlog_ops.py -- no new episodic store is built here.
 import json
 import time
 from pathlib import Path
@@ -143,6 +150,50 @@ def memory_delete(key: str, scope: str = "global") -> str:
         return f"deleted [{scope}/{key}]"
     except Exception as e:
         return f"[memory_delete error: {type(e).__name__}: {e}]"
+
+
+def semantic_memory_save(
+    key: str,
+    value: str,
+    scope: str = "global",
+    tags: Optional[list[str]] = None,
+) -> str:
+    """Alias for memory_save (book taxonomy name for this store: "semantic memory").
+    Same state file, same behavior -- see memory_save for full docs."""
+    # NOTE: this require_unlocked() call is redundant with the one inside memory_save
+    # (harmless -- same IP/gate check twice) but deliberate: tool_annotations.py derives
+    # readOnlyHint by textually grepping a function's OWN source for "require_unlocked(",
+    # so a pure passthrough wrapper would be mis-derived as read-only. Keeping the literal
+    # call here keeps the mechanical derivation correct for this alias too.
+    locked = require_unlocked()
+    if locked:
+        return locked
+    return memory_save(key, value, scope=scope, tags=tags)
+
+
+def semantic_memory_load(key: str, scope: str = "global") -> str:
+    """Alias for memory_load. See memory_load for full docs."""
+    return memory_load(key, scope=scope)
+
+
+def semantic_memory_list(
+    scope: Optional[str] = None,
+    tag: Optional[str] = None,
+    contains: Optional[str] = None,
+) -> str:
+    """Alias for memory_list. See memory_list for full docs."""
+    return memory_list(scope=scope, tag=tag, contains=contains)
+
+
+def semantic_memory_delete(key: str, scope: str = "global") -> str:
+    """Alias for memory_delete. See memory_delete for full docs."""
+    # See the comment in semantic_memory_save: this literal require_unlocked() call
+    # keeps tool_annotations.py's mechanical readOnlyHint derivation correct for
+    # this alias (it greps THIS function's own source, not memory_delete's).
+    locked = require_unlocked()
+    if locked:
+        return locked
+    return memory_delete(key, scope=scope)
 
 
 def _human_age(seconds: float) -> str:
