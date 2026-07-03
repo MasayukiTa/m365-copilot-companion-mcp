@@ -877,7 +877,9 @@ class CockpitWindow : Window
         else
         {
             string turl = tunnel.TrimEnd('/') + "/health";
-            bool tunOk = HttpOk(turl, 4000);
+            // 6s, not the local 4s budget: this is a remote round-trip (devtunnels region)
+            // that on a corporate machine also traverses the system proxy -- 4s false-reds it.
+            bool tunOk = HttpOk(turl, 6000);
             SetDot(1, tunOk ? HealthState.Green : HealthState.Red,
                    T(tunOk ? "hs_tun_detail_ok" : "hs_tun_detail_bad"), now);
         }
@@ -905,21 +907,77 @@ class CockpitWindow : Window
         SetDot(3, onLoginWall ? HealthState.Red : HealthState.Green,
                T(onLoginWall ? "hs_signin_bad" : "hs_signin_ok"), now);
 
-        // 4) Agent: GREEN if any tab url carries the configured agent marker id;
-        //    YELLOW if only plain m365 chat tabs (possible default-Copilot fallback).
-        bool agentBound = false, anyChat = false;
-        foreach (string u in urls)
-        {
-            string lo = u.ToLowerInvariant();
-            if (!string.IsNullOrEmpty(_agentMarkerId) && lo.Contains(_agentMarkerId.ToLowerInvariant())) agentBound = true;
-            if (lo.Contains("m365") || lo.Contains("copilot")) anyChat = true;
-        }
-        if (agentBound)
-            SetDot(4, HealthState.Green, T("hs_agent_ok"), now);
-        else if (anyChat)
-            SetDot(4, HealthState.Yellow, T("hs_agent_warn"), now);
-        else
+        // 4) Agent: the tab URL is NOT a reliable signal -- the M365 SPA keeps the loaded
+        //    custom agent while the URL normalizes to '/chat/?redirfrom=CsrToSSR' (verified:
+        //    a working agent that returned real tool results showed exactly that URL). So we
+        //    judge from the GROUND TRUTH instead: the newest transcript's last assistant turn.
+        //    The custom agent prefixes its replies with its display name; a default-Copilot
+        //    fallback returns the canned non-answer. GREEN when answering, YELLOW on the canned
+        //    non-answer (the real fallback), GRAY when idle / nothing to judge yet.
+        if (!RunIsLive())
             SetDot(4, HealthState.Gray, T("hs_agent_gray"), now);
+        else
+        {
+            string lastAssistant = NewestAssistantText();
+            if (lastAssistant == null)
+                SetDot(4, HealthState.Gray, T("hs_agent_gray"), now);          // run live, no reply yet
+            else if (LooksLikeCannedNonAnswer(lastAssistant))
+                SetDot(4, HealthState.Yellow, T("hs_agent_warn"), now);        // default-Copilot fallback
+            else
+                SetDot(4, HealthState.Green, T("hs_agent_ok"), now);           // agent answering
+        }
+    }
+
+    static readonly string[] _cannedNonAnswer = {
+        "それに応答できませんでした", "I couldn't respond to that", "I can't respond to that",
+    };
+    static bool LooksLikeCannedNonAnswer(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return false;
+        foreach (string m in _cannedNonAnswer) if (s.IndexOf(m, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+        return false;
+    }
+
+    // Read the newest .fleet\transcripts\*.jsonl and return the text of its last assistant turn,
+    // or null if none. Fully guarded, cheap (reads one file, scans lines). Runs on the poll thread.
+    string NewestAssistantText()
+    {
+        try
+        {
+            string dir = Path.GetFullPath(Path.Combine(
+                AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet", "transcripts"));
+            if (!Directory.Exists(dir)) return null;
+            string newest = null; DateTime best = DateTime.MinValue;
+            foreach (string f in Directory.GetFiles(dir, "*.jsonl"))
+            {
+                DateTime wt = File.GetLastWriteTimeUtc(f);
+                if (wt > best) { best = wt; newest = f; }
+            }
+            if (newest == null) return null;
+            string last = null;
+            foreach (string line in File.ReadLines(newest))
+            {
+                if (line.IndexOf("\"role\"", StringComparison.Ordinal) < 0) continue;
+                if (line.IndexOf("\"assistant\"", StringComparison.Ordinal) < 0) continue;
+                last = line;   // keep the last assistant line
+            }
+            if (last == null) return null;
+            // extract the "text" field value (simple, tolerant): find "text":" ... unescaped close
+            int ti = last.IndexOf("\"text\"", StringComparison.Ordinal);
+            if (ti < 0) return "";
+            int c = last.IndexOf(':', ti); if (c < 0) return "";
+            int q = last.IndexOf('"', c + 1); if (q < 0) return "";
+            var sb = new StringBuilder();
+            for (int i = q + 1; i < last.Length; i++)
+            {
+                char ch = last[i];
+                if (ch == '\\' && i + 1 < last.Length) { i++; char n = last[i]; sb.Append(n == 'n' ? '\n' : n); continue; }
+                if (ch == '"') break;
+                sb.Append(ch);
+            }
+            return sb.ToString();
+        }
+        catch (Exception) { return null; }
     }
 
     void SetDot(int i, HealthState s, string detail, DateTime whenUtc)
@@ -1055,16 +1113,32 @@ class CockpitWindow : Window
         return "";
     }
 
+    // Enable TLS 1.2 process-wide: the tunnel is HTTPS and .NET Framework's default
+    // protocol set can omit TLS 1.2, so the devtunnels handshake fails (false-red tunnel
+    // dot) while plain-HTTP localhost is fine. Called once from the HTTP helpers.
+    static bool _tlsReady = false;
+    static void EnsureTls()
+    {
+        if (_tlsReady) return;
+        try { ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072; } catch (Exception) { }
+        _tlsReady = true;
+    }
+
     // GET a URL; true iff it returns HTTP 200. Short timeout, fully guarded.
+    // Loopback URLs bypass the system proxy: on corporate machines the PAC/proxy can
+    // swallow 127.0.0.1 requests, turning a healthy local server into a false-red dot.
     static bool HttpOk(string url, int timeoutMs)
     {
         try
         {
+            EnsureTls();
             var req = (HttpWebRequest)WebRequest.Create(url);
             req.Method = "GET";
             req.Timeout = timeoutMs;
             req.ReadWriteTimeout = timeoutMs;
             req.AllowAutoRedirect = true;
+            if (url.Contains("127.0.0.1") || url.Contains("localhost")) req.Proxy = null;
+            else if (req.Proxy != null) req.Proxy.Credentials = CredentialCache.DefaultCredentials;
             using (var resp = (HttpWebResponse)req.GetResponse())
                 return resp.StatusCode == HttpStatusCode.OK;
         }
@@ -1076,10 +1150,12 @@ class CockpitWindow : Window
     {
         try
         {
+            EnsureTls();
             var req = (HttpWebRequest)WebRequest.Create(url);
             req.Method = "GET";
             req.Timeout = timeoutMs;
             req.ReadWriteTimeout = timeoutMs;
+            if (url.Contains("127.0.0.1") || url.Contains("localhost")) req.Proxy = null;
             using (var resp = (HttpWebResponse)req.GetResponse())
             {
                 if (resp.StatusCode != HttpStatusCode.OK) return null;
