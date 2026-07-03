@@ -63,6 +63,12 @@ class ChatWindow : Window
     int _deleteMode = 1;                 // 1=local only, 2=open in Copilot, 3=auto (experimental)
     int _lang = 0;                       // 0=Japanese, 1=English
     Border _banner; StackPanel _bannerBody;
+    FrameworkElement _emptyState;        // centered quiet empty-state block (fresh window / after New chat)
+    string _dotState = "idle";           // status-dot state: "idle" | "busy" | "offline" | "signin"
+    volatile bool _bridgeReachable = true; // updated by the low-cadence background reachability probe
+    int _reachTick = 0;                  // counter on the 800ms timer -> probe at a low cadence
+    volatile bool _reachProbing = false; // guard so overlapping probes don't stack
+    bool _signinBannerShown = false;     // true only while the sign-in banner (not the delete banner) is up
     Button _newBtn, _themeBtn, _langBtn, _manageBtn, _cockpitBtn, _attachBtn;
     TextBlock _inputHint;                 // goal-box watermark; localized -> must update on lang toggle
     TextBlock _steerHint;                 // composer footer "送信先: ..." indicator; visible only in steer mode
@@ -146,6 +152,19 @@ class ChatWindow : Window
         if (k == "del_selected") return ja ? "選択した会話を削除" : "Delete selected";
         if (k == "close") return ja ? "閉じる" : "Close";
         if (k == "untitled") return ja ? "(無題)" : "(untitled)";
+        // ── empty state (fresh window / after New chat) ──────────────────────────
+        if (k == "empty_title") return ja ? "何でも頼んでください — ローカルPCも操作できます" : "Ask me anything — I can operate this PC too";
+        if (k == "empty_slash") return ja ? "「/」でコマンド一覧" : "Type \"/\" for the command list";
+        if (k == "empty_s1") return ja ? "デスクトップのファイルを整理する計画を立てて" : "Plan how to organize the files on my Desktop";
+        if (k == "empty_s2") return ja ? "このPCの空き容量を調べて大きいフォルダを一覧して" : "Check this PC's free space and list the largest folders";
+        if (k == "empty_s3") return ja ? "Excelファイルを読んで要約して" : "Read an Excel file and summarize it";
+        // ── status dot state labels (tooltip) ────────────────────────────────────
+        if (k == "dot_idle")     return ja ? "接続済み・待機中" : "Connected · idle";
+        if (k == "dot_busy")     return ja ? "生成中"           : "Generating";
+        if (k == "dot_offline")  return ja ? "ブリッジ未接続"   : "Bridge unreachable";
+        if (k == "dot_signin")   return ja ? "サインイン切れの可能性" : "Possible sign-in / refusal";
+        if (k == "signin_banner") return ja ? "Copilotが応答を拒否しています。サインイン切れ/接続切れの可能性 — Fleet Cockpitの健康表示を確認してください" : "Copilot is refusing to respond. Sign-in or connection may have expired — check the health view in Fleet Cockpit.";
+        if (k == "signin_open")   return ja ? "Fleet Cockpit を開く" : "Open Fleet Cockpit";
         // ── sidebar section / action labels ──────────────────────────────────────
         if (k == "sec_pinned")   return ja ? "ピン留め"   : "Pinned";
         if (k == "sec_today")    return ja ? "最近"        : "Recent";
@@ -213,7 +232,7 @@ class ChatWindow : Window
         bottom.Children.Add(_cockpitBtn);
         _langBtn = Btn(T("lang"), "Panel", "Muted", true);
         _langBtn.Height = 34; _langBtn.Margin = new Thickness(0, 0, 0, 6); _langBtn.FontSize = 12;
-        _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveSettings(); UpdateChrome(); RefreshConvList(); RerenderActiveConversation(); };
+        _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveSettings(); UpdateChrome(); RefreshConvList(); RerenderActiveConversation(); if (_emptyState != null) { RemoveEmptyState(); ShowEmptyState(); } };
         _themeBtn = Btn(T("theme"), "Panel", "Muted", true);
         _themeBtn.Height = 34; _themeBtn.FontSize = 12;
         _themeBtn.Click += delegate { _dark = !_dark; ApplyTheme(); _themeBtn.Content = T("theme"); SaveSettings(); };
@@ -394,7 +413,11 @@ class ChatWindow : Window
         {
             Child = composerInner,
             CornerRadius = new CornerRadius(12),
-            BorderThickness = new Thickness(0),   // frameless at rest; shadow carries separation
+            // Constant 1px at rest (Border token) — gives a stable boundary (fixes the weak
+            // light-theme edge) and, crucially, a constant footprint. The 1px rest/1px focus/
+            // 2px steer progression only ever changes thickness by 1 (steer), which SetComposerRing
+            // compensates with a matching -1 padding so ActualHeight never moves.
+            BorderThickness = new Thickness(1),
             Padding = new Thickness(12, 6, 12, 6),
             Margin = new Thickness(0, 10, 0, 16),
             HorizontalAlignment = HorizontalAlignment.Stretch,
@@ -405,11 +428,11 @@ class ChatWindow : Window
             }
         };
         SetRef(_composerBorder, BackgroundProperty, "PanelAlt");
-        SetRef(_composerBorder, Border.BorderBrushProperty, "Accent");   // pre-wired to Accent; shown only on focus
-        // Focus ring: subtle 1px Accent border while focused, 0 at rest.
-        // Steer mode overrides both (2px Accent), reconciled in RefreshSteerVisual().
-        _input.GotKeyboardFocus += delegate { if (string.IsNullOrEmpty(_activeFleetUrl)) _composerBorder.BorderThickness = new Thickness(1); };
-        _input.LostKeyboardFocus += delegate { if (string.IsNullOrEmpty(_activeFleetUrl)) _composerBorder.BorderThickness = new Thickness(0); };
+        SetComposerRing("rest");   // 1px Border token, full padding
+        // Focus ring: 1px Accent while focused, 1px Border at rest, 2px Accent in steer mode.
+        // Thickness never grows total size (SetComposerRing swaps padding to compensate).
+        _input.GotKeyboardFocus += delegate { if (string.IsNullOrEmpty(_activeFleetUrl)) SetComposerRing("focus"); };
+        _input.LostKeyboardFocus += delegate { if (string.IsNullOrEmpty(_activeFleetUrl)) SetComposerRing("rest"); };
         // Clicking the border surface focuses the text input (nice-to-have).
         _composerBorder.MouseLeftButtonDown += delegate { _input.Focus(); };
         PaintSend();   // initial state: input empty -> neutral
@@ -474,8 +497,16 @@ class ChatWindow : Window
         catch { _settingsMtime = 0; }
         var openTimer = new DispatcherTimer();
         openTimer.Interval = TimeSpan.FromMilliseconds(800);
-        openTimer.Tick += delegate { CheckOpenRequest(); SyncRegistry(); CheckFleetSnapshot(); CheckSettings(); RefreshFleetChip(); RefreshFleetStrip(); };
+        openTimer.Tick += delegate
+        {
+            CheckOpenRequest(); SyncRegistry(); CheckFleetSnapshot(); CheckSettings(); RefreshFleetChip(); RefreshFleetStrip();
+            // Bridge reachability at a LOW cadence (~15s), not every 800ms: probe on the first
+            // tick, then every ~19 ticks. The probe runs off-thread; RefreshIdleDot updates the dot.
+            if (_reachTick == 0 || _reachTick % 19 == 0) ProbeBridge();
+            _reachTick++;
+        };
         openTimer.Start();
+        SetDot("idle");   // optimistic idle at launch; the first ProbeBridge tick confirms/corrects
         SyncRegistry();
     }
 
@@ -1526,13 +1557,142 @@ class ChatWindow : Window
     }
     void SetRef(FrameworkElement el, DependencyProperty p, string key) { el.SetResourceReference(p, key); }
 
+    // ── status dot: 4 states (Theme tokens) + tooltip ───────────────────────────
+    //   "idle"    Success  — bridge reachable, nothing streaming
+    //   "busy"    Accent   — a reply is streaming
+    //   "offline" Danger   — bridge unreachable / last stream errored
+    //   "signin"  Warning  — last answer looked like a sign-in / canned refusal
+    // Precedence while idle: signin > offline > idle. "busy" always wins while generating.
+    // MUST be called on the UI thread (background probe marshals via Dispatcher).
+    void SetDot(string state)
+    {
+        _dotState = state;
+        if (_statusDot == null) return;
+        string token, tip;
+        if (state == "busy")         { token = "Accent";  tip = T("dot_busy"); }
+        else if (state == "offline") { token = "Danger";  tip = T("dot_offline"); }
+        else if (state == "signin")  { token = "Warning"; tip = T("dot_signin"); }
+        else                         { token = "Success"; tip = T("dot_idle"); }
+        SetRef(_statusDot, BackgroundProperty, token);
+        _statusDot.ToolTip = tip;
+    }
+
+    // Re-derive the IDLE dot color from the latest signals (reachability + last-answer verdict).
+    // Never called while generating (busy owns the dot then). 'signinLatch' persists a sign-in
+    // warning until the next clean answer clears it.
+    bool _signinLatch = false;
+    void RefreshIdleDot()
+    {
+        if (_generating) return;
+        if (_signinLatch) { SetDot("signin"); return; }
+        SetDot(_bridgeReachable ? "idle" : "offline");
+    }
+
+    // Heuristic: did this answer look like a Copilot sign-in prompt / canned refusal?
+    static bool LooksLikeRefusal(string ans)
+    {
+        if (string.IsNullOrEmpty(ans)) return false;
+        if (ans.Contains("それに応答できませんでした")) return true;
+        if (ans.IndexOf("I couldn't respond to that", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+        if (ans.Contains("サインイン") && ans.Contains("必要")) return true;
+        return false;
+    }
+
+    // Low-cadence bridge reachability probe (piggybacked on the 800ms timer at a ~15s cadence).
+    // Runs the actual GET on a background thread so a hung bridge never freezes the UI; the
+    // result is marshalled back to update the dot. Proxy=null so loopback isn't routed through a
+    // corporate proxy (which would make a local bridge look unreachable).
+    void ProbeBridge()
+    {
+        if (_reachProbing) return;
+        _reachProbing = true;
+        new Thread((ThreadStart)delegate
+        {
+            bool ok = false;
+            try
+            {
+                var req = (HttpWebRequest)WebRequest.Create(_bridge + "/conv");
+                req.Timeout = 2500; req.ReadWriteTimeout = 2500; req.Proxy = null;
+                using (var resp = (HttpWebResponse)req.GetResponse())
+                    ok = (int)resp.StatusCode < 500;
+            }
+            catch (WebException wex)
+            {
+                // A protocol response (even 4xx) still proves the bridge is up and answering.
+                ok = wex.Response != null;
+            }
+            catch { ok = false; }
+            _bridgeReachable = ok;
+            _reachProbing = false;
+            try { Dispatcher.BeginInvoke(new Action(delegate { RefreshIdleDot(); })); } catch { }
+        }) { IsBackground = true }.Start();
+    }
+
+    // Show the sign-in / refusal banner with an actionable "Open Fleet Cockpit" link.
+    void ShowSigninBanner()
+    {
+        if (_banner == null || _bannerBody == null) return;
+        _bannerBody.Children.Clear();
+        var head = new TextBlock
+        {
+            Text = T("signin_banner"), FontWeight = FontWeights.SemiBold, FontSize = 13,
+            TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 10)
+        };
+        SetRef(head, TextBlock.ForegroundProperty, "Fg");
+        _bannerBody.Children.Add(head);
+        var open = Btn(T("signin_open"), "Accent", "AccentFg", false);
+        open.Height = 30; open.Padding = new Thickness(14, 0, 14, 0); open.FontWeight = FontWeights.SemiBold;
+        open.HorizontalAlignment = HorizontalAlignment.Left;
+        open.Click += delegate { HideBanner(); OpenCockpit(); };
+        _bannerBody.Children.Add(open);
+        SetRef(_banner, Border.BorderBrushProperty, "Warning");
+        _banner.Visibility = Visibility.Visible;
+        _signinBannerShown = true;
+    }
+
+    // Composer focus ring WITHOUT a layout jump. Three states:
+    //   "rest"  -> 1px Border token + full padding (12,6,12,6)
+    //   "focus" -> 1px Accent       + full padding (12,6,12,6)
+    //   "steer" -> 2px Accent       + padding-1    (11,5,11,5)   (compensates the +1 border)
+    // Border+padding sums are identical in every state (13 horiz, 7 vert), so the composer's
+    // ActualHeight/width never move as focus/steer change. BorderBrush swaps between the Border
+    // and Accent tokens so both palette modes track the theme.
+    void SetComposerRing(string state)
+    {
+        if (_composerBorder == null) return;
+        if (state == "steer")
+        {
+            SetRef(_composerBorder, Border.BorderBrushProperty, "Accent");
+            _composerBorder.BorderThickness = new Thickness(2);
+            _composerBorder.Padding = new Thickness(11, 5, 11, 5);
+        }
+        else if (state == "focus")
+        {
+            SetRef(_composerBorder, Border.BorderBrushProperty, "Accent");
+            _composerBorder.BorderThickness = new Thickness(1);
+            _composerBorder.Padding = new Thickness(12, 6, 12, 6);
+        }
+        else // "rest"
+        {
+            SetRef(_composerBorder, Border.BorderBrushProperty, "Border");
+            _composerBorder.BorderThickness = new Thickness(1);
+            _composerBorder.Padding = new Thickness(12, 6, 12, 6);
+        }
+    }
+
     // Accent fill only when there is text to send OR while generating (Stop affordance).
     // Otherwise the button shows a neutral/disabled-looking state so the empty-input state
-    // is visually distinct from the "ready to send" state.
+    // is visually distinct from the "ready to send" state. Also drives real enable/disable:
+    // the button is disabled ONLY when idle with an empty input (nothing to send). While
+    // generating it stays enabled because it doubles as the Stop control (see SendText/DoSend).
     void PaintSend()
     {
         if (_send == null) return;
-        bool active = _generating || (_input != null && _input.Text.Length > 0);
+        bool hasText = _input != null && _input.Text.Trim().Length > 0;
+        bool active = _generating || hasText;
+        // Enabled: generating (acts as Stop) OR there is text to send. Disabled: idle & empty.
+        _send.IsEnabled = _generating || hasText;
+        _send.Cursor = _send.IsEnabled ? Cursors.Hand : Cursors.Arrow;
         if (active)
         {
             SetRef(_send, BackgroundProperty, "Accent");
@@ -1541,7 +1701,7 @@ class ChatWindow : Window
         else
         {
             SetRef(_send, BackgroundProperty, "PanelAlt");
-            SetRef(_send, ForegroundProperty, "Muted");
+            SetRef(_send, ForegroundProperty, "Faint");   // disabled: faint foreground
         }
     }
 
@@ -1731,6 +1891,9 @@ class ChatWindow : Window
         Set("Accent", Theme.Accent(_dark));
         Set("AccentSoft", Theme.AccentSoft(_dark));
         Set("AccentFg", Theme.AccentFg(_dark));
+        Set("Success", Theme.Success(_dark));   // status dot: idle & bridge reachable
+        Set("Warning", Theme.Warning(_dark));   // status dot: sign-in / canned refusal
+        Set("Danger", Theme.Danger(_dark));     // status dot: bridge unreachable / stream error
         Set("Hover", Theme.Hover(_dark));
         Set("Press", Theme.Press(_dark));
         Set("CodeBg", Theme.SurfaceSubtle(_dark));
@@ -2055,11 +2218,11 @@ class ChatWindow : Window
         bool steer = !string.IsNullOrEmpty(_activeFleetUrl);
         if (_composerBorder != null)
         {
-            // Steer mode: 2px Accent border (unmistakable orange; overrides focus/rest states).
-            // Normal mode: 0 at rest; GotKeyboardFocus/LostKeyboardFocus set 1px Accent on focus.
-            // BorderBrush is always "Accent" (wired in ctor); thickness carries the state.
-            SetRef(_composerBorder, Border.BorderBrushProperty, "Accent");
-            _composerBorder.BorderThickness = new Thickness(steer ? 2 : 0);
+            // Steer mode: 2px Accent (unmistakable orange; overrides focus/rest states).
+            // Normal mode: 1px Border at rest, 1px Accent when the input has focus.
+            // SetComposerRing keeps the footprint constant across all three (padding compensates).
+            if (steer) SetComposerRing("steer");
+            else SetComposerRing(_input != null && _input.IsKeyboardFocused ? "focus" : "rest");
         }
         // Placeholder + destination indicator follow the steer state. When the active fleet run
         // finishes (OnSelect sets _activeFleetUrl = null) or the user opens a normal local chat
@@ -2092,6 +2255,83 @@ class ChatWindow : Window
         }
     }
 
+    // ── empty state (fresh window / after New chat) ──────────────────────────────
+    // A quiet, centered block: muted one-line title, three suggestion chips (click ->
+    // fill the composer + focus), and a "/ for commands" hint. Removed the instant the
+    // first real message renders (RemoveEmptyState, called from AddUser/AddAssistantContainer),
+    // re-shown by NewChat(). Built fresh each time so it always tracks the current language.
+    FrameworkElement BuildEmptyState()
+    {
+        var stack = new StackPanel
+        {
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+            MaxWidth = 520, Margin = new Thickness(24, 80, 24, 24)
+        };
+        var title = new TextBlock
+        {
+            Text = T("empty_title"),
+            FontSize = 15, TextAlignment = TextAlignment.Center, TextWrapping = TextWrapping.Wrap,
+            HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 0, 0, 20)
+        };
+        SetRef(title, TextBlock.ForegroundProperty, "Muted");
+        stack.Children.Add(title);
+
+        var chips = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center };
+        chips.Children.Add(MakeSuggestChip(T("empty_s1")));
+        chips.Children.Add(MakeSuggestChip(T("empty_s2")));
+        chips.Children.Add(MakeSuggestChip(T("empty_s3")));
+        stack.Children.Add(chips);
+
+        var slash = new TextBlock
+        {
+            Text = T("empty_slash"),
+            FontSize = 12, TextAlignment = TextAlignment.Center,
+            HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 16, 0, 0)
+        };
+        SetRef(slash, TextBlock.ForegroundProperty, "Faint");
+        stack.Children.Add(slash);
+        return stack;
+    }
+
+    // One suggestion chip: SurfaceSubtle bg + 1px Border, small radius, translucent Hover overlay
+    // on mouseover; clicking drops its text into the composer and focuses it.
+    Border MakeSuggestChip(string text)
+    {
+        var tb = new TextBlock { Text = text, FontSize = 12.5, TextWrapping = TextWrapping.Wrap };
+        SetRef(tb, TextBlock.ForegroundProperty, "Fg");
+        var chip = new Border
+        {
+            Child = tb, CornerRadius = new CornerRadius(6), BorderThickness = new Thickness(1),
+            Padding = new Thickness(14, 9, 14, 9), Margin = new Thickness(0, 4, 0, 4),
+            Cursor = Cursors.Hand, HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+        SetRef(chip, BackgroundProperty, "PanelAlt");   // SurfaceSubtle
+        SetRef(chip, Border.BorderBrushProperty, "Border");
+        chip.MouseEnter += delegate { SetRef(chip, BackgroundProperty, "Hover"); };
+        chip.MouseLeave += delegate { SetRef(chip, BackgroundProperty, "PanelAlt"); };
+        string t = text;
+        chip.MouseLeftButtonUp += delegate { _input.Text = t; _input.CaretIndex = _input.Text.Length; _input.Focus(); };
+        return chip;
+    }
+
+    // Render the empty state IFF there are no message children (safe to call redundantly).
+    void ShowEmptyState()
+    {
+        if (_messages == null) return;
+        if (_messages.Children.Count > 0) return;   // real content present -> never overlay it
+        _emptyState = BuildEmptyState();
+        _messages.Children.Add(_emptyState);
+    }
+
+    // Drop the empty state the moment real content arrives (single-append hook).
+    void RemoveEmptyState()
+    {
+        if (_emptyState == null) return;
+        _messages.Children.Remove(_emptyState);
+        _emptyState = null;
+    }
+
     void NewChat()
     {
         new Thread((ThreadStart)delegate { try { HttpGet("/new"); } catch { } }) { IsBackground = true }.Start();
@@ -2099,6 +2339,8 @@ class ChatWindow : Window
         _conv.Ts = (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
         _all.Insert(0, _conv);
         _messages.Children.Clear();
+        _emptyState = null;             // cleared with the children above; rebuild fresh below
+        ShowEmptyState();               // fresh chat -> show the empty state again
         _activeFleetUrl = null; RefreshSteerVisual();
         RefreshConvList();
         _input.Focus();
@@ -2546,10 +2788,11 @@ class ChatWindow : Window
         // from being clobbered by the normal placeholder during a language toggle.
         RefreshSteerVisual();
     }
-    void HideBanner() { _banner.Visibility = Visibility.Collapsed; }
+    void HideBanner() { _banner.Visibility = Visibility.Collapsed; _signinBannerShown = false; }
 
     void ShowDeleteBanner(Conversation c)
     {
+        _signinBannerShown = false;   // this is the delete banner, not the sign-in banner
         _bannerBody.Children.Clear();
         var raw = c.Untitled() ? T("newchat") : c.Title;
         var title = raw.Length > 24 ? raw.Substring(0, 24) + "…" : raw;
@@ -2628,6 +2871,7 @@ class ChatWindow : Window
     // ── message rendering (Claude-like: user bubble, assistant plain) ───────────
     void AddUser(string text)
     {
+        RemoveEmptyState();   // first real message -> the empty state must go
         var tb = new TextBox
         {
             Text = text, IsReadOnly = true, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
@@ -2646,6 +2890,7 @@ class ChatWindow : Window
     // its .Tag for the copy button to read at click time.
     Panel AddAssistantContainer(out StackPanel outer)
     {
+        RemoveEmptyState();   // an assistant turn is real content -> clear the empty state
         var block = new StackPanel { Margin = new Thickness(0, 6, 40, 24) };
         // header row: "Copilot" label on the left, hover-revealed copy button on the right
         var header = new DockPanel { Margin = new Thickness(0, 0, 0, 7) };
@@ -2898,7 +3143,7 @@ class ChatWindow : Window
         _pendingText = null; _started = false;
         _generating = true; _send.Content = "■ " + T("stop"); _send.IsEnabled = true;   // distinct from Send; _send now acts as Stop (also Esc)
         PaintSend();   // stay accent while generating
-        SetRef(_statusDot, BackgroundProperty, "Accent");
+        SetDot("busy");
         new Thread((ThreadStart)delegate { Stream(text); }) { IsBackground = true }.Start();
         ClearChips();   // the attached file(s) go with this message; reset the chip row
     }
@@ -3129,15 +3374,37 @@ class ChatWindow : Window
         var errFinal = errMsg;
         Dispatcher.BeginInvoke(new Action(delegate
         {
-            _generating = false; _send.Content = T("send"); _send.IsEnabled = true; _input.Focus();
-            PaintSend();   // revert to neutral (input was cleared before send)
-            SetRef(_statusDot, BackgroundProperty, "Faint");
+            _generating = false; _send.Content = T("send"); _input.Focus();
+            PaintSend();   // revert to neutral (input was cleared before send); also re-enables/disables
             // render whatever we got (full / partial / error); always clear the typing indicator
             content.Children.Clear();
             if (answer.Length > 0) { RenderAssistantBody(content, outer, answer); StickToEnd(); }
             else if (errFinal != null) { content.Children.Add(MakeText("[bridge error: " + errFinal + "]")); if (outer != null) outer.Tag = errFinal; }
             _conv.Messages.Add(new Msg("A", answer));
             SaveConversation(_conv);
+            // ── status dot outcome ──────────────────────────────────────────────
+            if (errFinal != null)
+            {
+                // A stream error means the bridge (or its Copilot tab) is not answering.
+                _bridgeReachable = false;
+                SetDot("offline");
+            }
+            else if (LooksLikeRefusal(answer))
+            {
+                // Copilot answered but with a sign-in / canned refusal -> Warning + actionable banner.
+                _signinLatch = true;
+                SetDot("signin");
+                ShowSigninBanner();
+            }
+            else
+            {
+                // Clean answer clears any latched sign-in warning and the sign-in banner
+                // (but never a delete banner the user may have opened).
+                _signinLatch = false;
+                if (_signinBannerShown) HideBanner();
+                _bridgeReachable = true;
+                RefreshIdleDot();
+            }
         }));
         try { var j = HttpGet("/conv"); var u = ExtractField(j, "url"); if (!string.IsNullOrEmpty(u)) { _conv.ConvUrl = u; Dispatcher.BeginInvoke(new Action(delegate { SaveConversation(_conv); RegisterConv(u, _conv.Title, "chat"); })); } } catch { }
     }
@@ -3195,6 +3462,7 @@ class ChatWindow : Window
         DiscoverTranscripts();   // surface every fleet worker's disk transcript as a past chat
         if (_all.Count > 0) { _conv = _all[0]; foreach (var m in _conv.Messages) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); } }
         else { _conv = new Conversation(); _all.Add(_conv); }
+        ShowEmptyState();        // no-op if the active conversation rendered any real message
         RefreshConvList();
     }
 
