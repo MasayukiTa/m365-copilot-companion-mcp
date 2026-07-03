@@ -365,6 +365,9 @@ def job_list() -> str:
 
 def job_kill(job_id: str) -> str:
     """Terminate a running background job."""
+    locked = require_unlocked()
+    if locked:
+        return locked
     job = _JOBS.get(job_id)
     if job is None:
         return f"[job_kill error: unknown job_id {job_id!r}]"
