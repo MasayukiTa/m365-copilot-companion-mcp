@@ -8,8 +8,25 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from ._subproc import sanitized_child_env
 from .file_ops import _validate_path
 from .security import require_unlocked
+
+# ---------------------------------------------------------------------------
+# Background-job watchdog cap (MCP spec §21.6 fix B.2)
+#
+# run_in_background / run_python_in_background are fire-and-return (Popen,
+# return job_id immediately) so they can't rely on subprocess.run's timeout=.
+# Instead each job gets a daemon threading.Timer that terminate()s then
+# kill()s it if it's still running once the cap elapses. Overridable via
+# MCP_JOB_MAX_RUNTIME_S for tests / special cases.
+# ---------------------------------------------------------------------------
+_JOB_MAX_RUNTIME_S = float(os.environ.get("MCP_JOB_MAX_RUNTIME_S", "3600"))
+
+# Sentinel returncode recorded when the watchdog had to kill a job, so
+# job_status / job_output can explain why it ended instead of just showing a
+# bare returncode.
+_WATCHDOG_KILL_RC = -9999
 
 
 class _Job:
@@ -24,6 +41,8 @@ class _Job:
         "returncode",
         "stdout_path",
         "stderr_path",
+        "watchdog",
+        "killed_by_watchdog",
     )
 
     def __init__(self, kind: str, label: str, command: str):
@@ -37,6 +56,8 @@ class _Job:
         self.returncode: Optional[int] = None
         self.stdout_path: Optional[str] = None
         self.stderr_path: Optional[str] = None
+        self.watchdog: Optional[threading.Timer] = None
+        self.killed_by_watchdog: bool = False
 
     def is_running(self) -> bool:
         return self.process is not None and self.process.poll() is None
@@ -48,6 +69,57 @@ class _Job:
         if rc is not None:
             self.returncode = rc
             self.finished_at = time.time()
+            _cancel_watchdog(self)
+
+    def cancel_watchdog(self) -> None:
+        _cancel_watchdog(self)
+
+
+def _cancel_watchdog(job: "_Job") -> None:
+    """Cancel and drop the job's watchdog timer so it never leaks a thread."""
+    t = job.watchdog
+    if t is not None:
+        job.watchdog = None
+        try:
+            t.cancel()
+        except Exception:
+            pass
+
+
+def _watchdog_fire(job: "_Job") -> None:
+    """Timer callback: if the job is still running past the cap, kill it."""
+    job.watchdog = None  # this timer has fired; nothing left to cancel
+    proc = job.process
+    if proc is None or proc.poll() is not None:
+        return  # already finished naturally
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    except Exception:
+        pass
+    finally:
+        job.killed_by_watchdog = True
+        job.refresh()
+        # refresh() only sets returncode/finished_at if the process actually
+        # reports a code; make sure both are set even if poll() lagged.
+        if job.finished_at is None:
+            job.finished_at = time.time()
+        if job.returncode is None:
+            job.returncode = proc.poll() if proc is not None else _WATCHDOG_KILL_RC
+
+
+def _start_watchdog(job: "_Job", cap_s: Optional[float] = None) -> None:
+    """Arm a daemon timer that kills `job` if it outlives cap_s seconds."""
+    cap = _JOB_MAX_RUNTIME_S if cap_s is None else cap_s
+    if cap <= 0:
+        return
+    t = threading.Timer(cap, _watchdog_fire, args=(job,))
+    t.daemon = True
+    job.watchdog = t
+    t.start()
 
 
 _JOBS: dict[str, _Job] = {}
@@ -102,6 +174,15 @@ def run_in_background(
     locked = require_unlocked()
     if locked:
         return locked
+    from . import contract_gate as _cg
+    # Same gate code_exec.shell_exec applies to its foreground command — closes the
+    # gate-bypass where a destructive command routed through run_in_background instead
+    # of shell_exec skipped HITL approval entirely. Reuses destructive_shell/check_op
+    # verbatim; no detection logic duplicated here.
+    if _cg.destructive_shell(command):
+        _g = _cg.check_op("shell_destructive", command[:200])
+        if _g is not None:
+            return _g
     try:
         cwd = os.getcwd()
         if working_dir:
@@ -123,6 +204,7 @@ def run_in_background(
                 stdout=out_f,
                 stderr=err_f,
                 cwd=cwd,
+                env=sanitized_child_env(),
             )
         job = _Job("shell", label or command[:60], command)
         job.process = proc
@@ -131,6 +213,7 @@ def run_in_background(
         with _LOCK:
             _JOBS[job.id] = job
             _prune_jobs_locked()
+        _start_watchdog(job)
         return f"job_id: {job.id}\nlabel: {job.label}\npid: {proc.pid}\nstarted_at: {job.started_at:.0f}"
     except Exception as e:
         return f"[run_in_background error: {type(e).__name__}: {e}]"
@@ -146,6 +229,16 @@ def run_python_in_background(code: str, label: str = "") -> str:
     locked = require_unlocked()
     if locked:
         return locked
+    from . import contract_gate as _cg
+    # Same gate code_exec.run_python applies to its foreground code — destructive
+    # ops expressed as shell text OR Python source both route through the existing
+    # 'shell_destructive' op_class, exactly mirroring run_python. Reuses
+    # destructive_shell/destructive_python/check_op verbatim; no detection logic
+    # duplicated here.
+    if _cg.destructive_shell(code) or _cg.destructive_python(code):
+        _g = _cg.check_op("shell_destructive", code[:200])
+        if _g is not None:
+            return _g
     try:
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".py", delete=False, encoding="utf-8"
@@ -162,6 +255,7 @@ def run_python_in_background(code: str, label: str = "") -> str:
                 [sys.executable, script_path],
                 stdout=out_f,
                 stderr=err_f,
+                env=sanitized_child_env(),
             )
         job = _Job("python", label or "python script", script_path)
         job.process = proc
@@ -170,6 +264,7 @@ def run_python_in_background(code: str, label: str = "") -> str:
         with _LOCK:
             _JOBS[job.id] = job
             _prune_jobs_locked()
+        _start_watchdog(job)
         return f"job_id: {job.id}\nlabel: {job.label}\npid: {proc.pid}"
     except Exception as e:
         return f"[run_python_in_background error: {type(e).__name__}: {e}]"
@@ -186,6 +281,11 @@ def job_status(job_id: str) -> str:
     if job.finished_at is not None:
         parts.append(f"returncode: {job.returncode}")
         parts.append(f"duration_s: {job.finished_at - job.started_at:.2f}")
+        if job.killed_by_watchdog:
+            parts.append(
+                f"killed: exceeded max runtime ({_JOB_MAX_RUNTIME_S:.0f}s cap, "
+                f"MCP_JOB_MAX_RUNTIME_S)"
+            )
     else:
         parts.append(f"runtime_s: {time.time() - job.started_at:.2f}")
     return "\n".join(parts)
@@ -271,6 +371,9 @@ def job_kill(job_id: str) -> str:
     if job.process is None or not job.is_running():
         return f"[job_kill: job {job_id} is not running]"
     try:
+        # Cancel the watchdog first so it doesn't race this explicit kill and
+        # mislabel a human-requested kill as "exceeded max runtime".
+        job.cancel_watchdog()
         job.process.terminate()
         try:
             job.process.wait(timeout=5)

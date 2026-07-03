@@ -1,6 +1,7 @@
 from typing import Optional
 
 from .file_ops import _validate_path
+from ._untrusted import wrap_untrusted
 
 
 def pdf_info(path: str) -> str:
@@ -61,7 +62,9 @@ def read_pdf(
         out = "\n\n".join(chunks)
         if len(out) > max_chars:
             out = out[:max_chars] + f"\n... truncated at {max_chars:,} characters"
-        return out if out else "(no extractable text — PDF may be scanned)"
+        if not out:
+            return "(no extractable text — PDF may be scanned)"
+        return wrap_untrusted(out, source="pdf", origin=str(p))
     except Exception as e:
         return f"[read_pdf error: {type(e).__name__}: {e}]"
 
