@@ -16,6 +16,16 @@ compact live table to stdout. The WPF cockpit (ui/FleetCockpit.exe) tails that J
   python -m relay.fleet_runner --agent-url <URL> -g "ゴールA" -g "ゴールB"
   # goals from a file (one per line, blank lines and # comments ignored)
   python -m relay.fleet_runner --agent-url <URL> --goals-file goals.txt
+  # RESUME the unfinished portion of the last run after a crash / reboot / kill
+  # (re-queues only goals that did NOT finish DONE, from the durable ledger):
+  python -m relay.fleet_runner --agent-url <URL> --resume
+  # --resume may be combined with -g/--goals-file: the resume set PLUS the new goals
+  python -m relay.fleet_runner --agent-url <URL> --resume -g "追加ゴール"
+
+Every run writes a durable goals ledger next to status.json so --resume can relaunch
+just the unfinished goals:
+  <state_dir>/last_run_goals.json  -- {started, goals:[{text,checks,cwd,priority,key}]}
+  <state_dir>/last_run_done.json   -- {goal_key: outcome} for goals that reached DONE
 
 The agent URL embeds a tenant GUID, so it is NOT hardcoded: pass --agent-url or set
 MCP_IMPL_AGENT_URL / MCP_FLEET_AGENT_URL in .env (gitignored).
@@ -400,6 +410,144 @@ def _write_atomic(path, payload):
     os.replace(tmp, path)   # atomic on Windows + POSIX
 
 
+# ── RUN-RESUME ledger ──────────────────────────────────────────────────────────
+# When a fleet run dies midway (process killed, PC reboot, crash), the unfinished
+# goals would be lost from the runner's perspective. We persist two small sidecar
+# files next to status.json so `--resume` can relaunch just the unfinished portion:
+#
+#   last_run_goals.json  -- the DURABLE goals ledger for the last run, written ONCE
+#     at run start:
+#       {"started": <epoch float>,
+#        "goals": [{"text": str, "checks": list, "cwd": str|None,
+#                   "priority": bool, "key": "<stable hash of text>"}, ...]}
+#
+#   last_run_done.json   -- a parallel completion map, updated on each snapshot:
+#       {"<goal_key>": "<outcome>", ...}   # only for goals that reached a
+#                                          # successful terminal outcome (DONE)
+#
+# goal_key = a stable hash of the NORMALIZED goal text (same text -> same key across
+# process restarts), so the done-map can be joined back onto the ledger after a crash.
+# Both are written atomically (tmp+replace) and read tolerantly (utf-8-sig, missing/
+# corrupt -> empty). A ledger write failure is logged once to stderr but NEVER crashes
+# the run (spec: skip nothing silently, but never take the run down for a sidecar).
+LAST_RUN_GOALS = "last_run_goals.json"
+LAST_RUN_DONE = "last_run_done.json"
+# outcome strings that count as a goal being genuinely finished (don't re-queue on resume)
+_RESUME_SUCCESS_OUTCOMES = ("DONE",)
+
+
+def _goal_key(text):
+    """Stable key for a goal from its NORMALIZED text. Same text -> same key across
+    process restarts (unlike Python's per-process hash()). Used to join the done-map
+    onto the goals ledger when resuming."""
+    import hashlib
+    return hashlib.sha1((text or "").strip().encode("utf-8")).hexdigest()[:16]
+
+
+def _normalize_goal_for_ledger(goal):
+    """A goal (plain string OR dict) -> the normalized ledger dict form, reusing
+    goal_fields so the ledger carries the SAME text/checks/cwd the run used, plus the
+    priority flag (goal_fields drops it) and the stable key."""
+    text, checks, cwd = goal_fields(goal)
+    priority = bool(goal.get("priority")) if isinstance(goal, dict) else False
+    return {"text": text, "checks": checks, "cwd": cwd,
+            "priority": priority, "key": _goal_key(text)}
+
+
+def _ledger_to_goal(entry):
+    """Turn a ledger entry back into the goal form the normal pipeline expects: a dict
+    with text/checks/cwd/priority (checks/cwd only when present so a plain goal stays
+    minimal). goal_fields reads text/checks/cwd downstream; priority is honoured by the
+    add-goal queue if the goal is later re-queued."""
+    g = {"text": entry.get("text", "")}
+    if entry.get("checks"):
+        g["checks"] = entry["checks"]
+    if entry.get("cwd"):
+        g["cwd"] = entry["cwd"]
+    if entry.get("priority"):
+        g["priority"] = True
+    return g
+
+
+def _write_goals_ledger(state_dir, goals, started):
+    """Write the durable goals ledger ONCE at run start. Best-effort: on any failure,
+    log once to stderr and return -- never raise (a sidecar must not take down the run)."""
+    try:
+        payload = {"started": started,
+                   "goals": [_normalize_goal_for_ledger(g) for g in goals]}
+        _write_atomic(os.path.join(state_dir, LAST_RUN_GOALS), payload)
+    except Exception as e:
+        sys.stderr.write("[resume] WARN: could not write goals ledger: %s\n" % e)
+
+
+def _read_goals_ledger(state_dir):
+    """Read last_run_goals.json tolerantly. Returns (started, [ledger_entry,...]).
+    Missing/corrupt/malformed -> (None, []) with no crash (utf-8-sig tolerates a BOM)."""
+    path = os.path.join(state_dir, LAST_RUN_GOALS)
+    try:
+        if not os.path.isfile(path):
+            return None, []
+        with open(path, encoding="utf-8-sig") as f:
+            d = json.load(f)
+        goals = d.get("goals")
+        if not isinstance(goals, list):
+            return None, []
+        clean = [e for e in goals if isinstance(e, dict) and e.get("text")]
+        return d.get("started"), clean
+    except Exception:
+        return None, []
+
+
+def _read_done_map(state_dir):
+    """Read last_run_done.json tolerantly: {goal_key: outcome}. Missing/corrupt -> {}."""
+    path = os.path.join(state_dir, LAST_RUN_DONE)
+    try:
+        if not os.path.isfile(path):
+            return {}
+        with open(path, encoding="utf-8-sig") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _update_done_map(state_dir, workers):
+    """Rewrite last_run_done.json from the live workers: map goal_key -> outcome for
+    every worker that reached a successful terminal outcome (DONE). Best-effort: a
+    failure logs once to stderr and is swallowed (never crashes the snapshot hook).
+
+    Cheap: called on the snapshot tick, iterates the in-memory workers, atomic write."""
+    try:
+        done = {}
+        for w in workers:
+            outcome = getattr(w, "outcome", None)
+            if outcome in _RESUME_SUCCESS_OUTCOMES:
+                done[_goal_key(getattr(w, "goal", "") or "")] = outcome
+        _write_atomic(os.path.join(state_dir, LAST_RUN_DONE), done)
+    except Exception as e:
+        # log ONCE per process (not once per tick) to avoid stderr spam every sweep.
+        if not getattr(_update_done_map, "_warned", False):
+            sys.stderr.write("[resume] WARN: could not write done map: %s\n" % e)
+            _update_done_map._warned = True
+
+
+def _resume_goals(state_dir):
+    """Build the resume goal set from the sidecar ledger + done-map. Returns
+    (remainder_goals, n_unfinished, m_total). A corrupt/absent ledger yields ([], 0, 0)
+    -- the caller prints a clear 'nothing to resume' message rather than crashing."""
+    _started, ledger = _read_goals_ledger(state_dir)
+    if not ledger:
+        return [], 0, 0
+    done_map = _read_done_map(state_dir)
+    remainder = []
+    for entry in ledger:
+        key = entry.get("key") or _goal_key(entry.get("text", ""))
+        if done_map.get(key) in _RESUME_SUCCESS_OUTCOMES:
+            continue                       # already finished successfully -- skip
+        remainder.append(_ledger_to_goal(entry))
+    return remainder, len(remainder), len(ledger)
+
+
 def _watchdog_should_reset(status, stalled_s, now=None):
     """Pure decision: given a (possibly frozen) status.json dict and how long its `updated`
     field has been unchanged, decide whether the dedicated Edge is genuinely WEDGED and must
@@ -473,6 +621,15 @@ def main():
                                             or os.environ.get("MCP_IMPL_AGENT_URL", "")))
     ap.add_argument("-g", "--goal", action="append", help="a goal (repeatable)")
     ap.add_argument("--goals-file", help="file with one goal per line (# comments ok)")
+    ap.add_argument("--resume", action="store_true",
+                    help="relaunch the UNFINISHED portion of the last run. Loads the "
+                         "durable goals ledger (.fleet/last_run_goals.json) written at the "
+                         "last run's start, drops goals that reached a successful terminal "
+                         "outcome (DONE, per .fleet/last_run_done.json), and re-queues the "
+                         "rest through the normal pipeline. Use after a crash / reboot / "
+                         "kill so unfinished goals aren't lost. Combined with -g/--goals-file "
+                         "the resume set is ADDED to the new goals. If everything finished (or "
+                         "there is no ledger), prints a one-line summary and exits 0.")
     ap.add_argument("--max-turns", type=int, default=1000,
                     help="hard cap on turns per goal (default 1000 ~ unlimited)")
     ap.add_argument("--max-concurrent", type=int, default=-1,
@@ -611,8 +768,25 @@ def main():
           % (_eff, args.refuter, args._lenses, args.max_refute, args.max_research))
 
     goals = _read_goals(args)
+    # RUN-RESUME: prepend the unfinished portion of the last run (from the durable
+    # ledger) when --resume is passed. --resume + -g/--goals-file = resume set PLUS the
+    # new goals; --resume alone with an empty/all-done ledger prints a summary and exits 0.
+    if args.resume:
+        resume_goals, n_unfinished, m_total = _resume_goals(args.state_dir)
+        if m_total == 0:
+            print("RESUME: 0 of 0 goals unfinished -- requeueing. "
+                  "(no last-run ledger found -- nothing to resume)")
+        else:
+            print("RESUME: %d of %d goals unfinished -- requeueing." % (n_unfinished, m_total))
+        # resume set goes first so it keeps its original order ahead of any new goals.
+        goals = resume_goals + goals
+        if not goals:
+            # everything finished (and no new -g/--goals-file goals) -> nothing to launch.
+            sys.exit(0)
     if not goals:
-        ap.error("no goals -- pass -g/--goal (repeatable) or --goals-file")
+        if args.resume:
+            ap.error("no goals -- --resume found an empty ledger and no -g/--goals-file given")
+        ap.error("no goals -- pass -g/--goal (repeatable), --goals-file, or --resume")
     if not args.agent_url:
         ap.error("no agent URL -- pass --agent-url or set MCP_FLEET_AGENT_URL in .env")
     # a goal may be a plain string or a dict carrying acceptance checks; gtexts is the
@@ -644,6 +818,15 @@ def main():
         os.makedirs(transcripts_dir, exist_ok=True)
     except Exception:
         pass
+
+    # RUN-RESUME: write the durable goals ledger ONCE, now, so a crash mid-run leaves a
+    # record `--resume` can relaunch from. Reset the done-map to empty for this run so a
+    # previous run's completions never mask this run's goals. Best-effort (never crashes).
+    _write_goals_ledger(args.state_dir, goals, started)
+    try:
+        _write_atomic(os.path.join(args.state_dir, LAST_RUN_DONE), {})
+    except Exception as e:
+        sys.stderr.write("[resume] WARN: could not reset done map: %s\n" % e)
 
     # an EXPLICIT --max-concurrent (>=0) was given on the CLI (not the -1 "ask the cockpit"
     # sentinel). Used for the precedence rule below: CLI wins over settings.txt autoscale.
@@ -867,6 +1050,9 @@ def main():
     def on_tick(workers):
         _drain_commands(workers)
         _register_convs(workers)
+        # RUN-RESUME: refresh the completion map so a crash after this sweep can resume
+        # only the still-unfinished goals. Cheap (in-memory scan + one atomic write).
+        _update_done_map(args.state_dir, workers)
         try:
             _write_atomic(status_path, _snapshot(workers, started, len(goals), mc_box[0],
                                                  disk_floor_gb=disk_box[0], paused=pause_box[0],
@@ -1053,6 +1239,15 @@ def main():
              "run_label": run_label, "goal_count": goal_count,
              "workers": [_final_worker_entry(r, args.max_turns) for r in results]}
     _write_atomic(status_path, final)
+    # RUN-RESUME: write the FINAL completion map from the true per-goal outcomes (the
+    # on_tick map may miss a worker that reached DONE on the very last sweep). A later
+    # --resume then re-queues exactly the goals that did NOT finish successfully.
+    try:
+        final_done = {_goal_key(r["goal"]): r["outcome"]
+                      for r in results if r["outcome"] in _RESUME_SUCCESS_OUTCOMES}
+        _write_atomic(os.path.join(args.state_dir, LAST_RUN_DONE), final_done)
+    except Exception as e:
+        sys.stderr.write("[resume] WARN: could not write final done map: %s\n" % e)
     print("\n\n=== fleet complete in %ss ===" % elapsed)
     for r in results:
         print("  %-4s %-8s turns=%d  %s" % (r["name"], r["outcome"], r["turns"],

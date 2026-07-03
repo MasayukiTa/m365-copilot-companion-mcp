@@ -13,6 +13,11 @@ setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
 echo.
+echo   SAFE TO RE-RUN: this script resumes where it left off.
+echo   Completed steps are skipped or fast -- so re-running after an interruption
+echo   (a failed sign-in, a closed window, a reboot) just picks up from there.
+
+echo.
 echo ===========================================================================
 echo  STEP 1/7  Install Python, venv and requirements (resumable bootstrap)
 echo ===========================================================================
@@ -116,31 +121,54 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo.
-echo ===========================================================================
-echo  STEP 5/7  Copilot Studio  (the ONLY manual, by-hand step)
-echo ===========================================================================
-echo   Add an MCP connector in Copilot Studio, then create your companion agent.
-echo   The 3 EXACT values to paste are printed below (full guide: README STEP 4):
-echo.
-echo   Opening Copilot Studio (https://copilotstudio.microsoft.com/) in your browser...
-start "" "https://copilotstudio.microsoft.com/"
-echo.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\copilot_studio_values.ps1"
-echo   After creating the agent, open it in M365 Copilot and copy its address-bar
-echo   URL -- you will paste it into a dialog in the next step.
-echo.
-echo   Press any key AFTER you have created the agent in Copilot Studio...
-pause >nul
+REM STEP 5 (Copilot Studio) and STEP 6 (paste agent URLs) are the manual leg. If
+REM .env already carries a non-empty agent URL, that leg was done on a previous
+REM run -- offer to skip straight to STEP 7 (launch). `..*` requires at least one
+REM character after `=`, so a blank `MCP_IMPL_AGENT_URL=` line does NOT count as
+REM configured (same pattern style as the MCP_TUNNEL_URL gate in STEP 4).
+set "SKIP56="
+findstr /b /r "MCP_IMPL_AGENT_URL=..* MCP_FLEET_AGENT_URL=..*" ".env" >nul 2>nul
+if not errorlevel 1 (
+    echo.
+    echo   An agent URL is already configured -- Copilot Studio step appears DONE.
+    choice /C SR /N /M "   Press S to skip to STEP 7 (launch), or R to redo STEP 5/6: "
+    REM Capture errorlevel IMMEDIATELY: choice sets it (S=1, R=2) and any command
+    REM in between would reset it. We are inside a parenthesized block with delayed
+    REM expansion ON, so read !ERRORLEVEL! (runtime value) -- %ERRORLEVEL% would be
+    REM the parse-time value captured before choice ran (the classic block pitfall).
+    if "!ERRORLEVEL!"=="1" set "SKIP56=1"
+)
 
-echo.
-echo ===========================================================================
-echo  STEP 6/7  Paste your agent URLs  (a dialog window opens)
-echo ===========================================================================
-echo   Paste the agent URL(s) into the dialog and click Save. Leave blank any
-echo   you do not have yet -- you can re-run configure_env.bat later to add them.
-echo.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\configure_env.ps1"
+if not defined SKIP56 (
+    echo.
+    echo ===========================================================================
+    echo  STEP 5/7  Copilot Studio  (the ONLY manual, by-hand step)
+    echo ===========================================================================
+    echo   Add an MCP connector in Copilot Studio, then create your companion agent.
+    echo   The 3 EXACT values to paste are printed below (full guide: README STEP 4):
+    echo.
+    echo   Opening Copilot Studio (https://copilotstudio.microsoft.com/) in your browser...
+    start "" "https://copilotstudio.microsoft.com/"
+    echo.
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\copilot_studio_values.ps1"
+    echo   After creating the agent, open it in M365 Copilot and copy its address-bar
+    echo   URL -- you will paste it into a dialog in the next step.
+    echo.
+    echo   Press any key AFTER you have created the agent in Copilot Studio...
+    pause >nul
+
+    echo.
+    echo ===========================================================================
+    echo  STEP 6/7  Paste your agent URLs  (a dialog window opens)
+    echo ===========================================================================
+    echo   Paste the agent URL(s) into the dialog and click Save. Leave blank any
+    echo   you do not have yet -- you can re-run configure_env.bat later to add them.
+    echo.
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\configure_env.ps1"
+) else (
+    echo.
+    echo   Skipping STEP 5/6 (agent already configured). Jumping to STEP 7 launch.
+)
 
 echo.
 echo ===========================================================================
