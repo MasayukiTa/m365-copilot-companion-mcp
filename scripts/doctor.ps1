@@ -65,8 +65,19 @@ Check "Companion Edge running (:9222 fleet/agent)" `
     "launch it: powershell -File scripts\start_companion_edge.ps1   (then sign into M365 once)"
 
 Check "M365 signed in on the companion Edge (no login page)" `
-    { $tabs = Get-Json 'http://127.0.0.1:9222/json'; $m = $tabs | Where-Object { ($_.url -match 'm365|copilot') }; ($m) -and -not (($m | ForEach-Object { $_.url }) -match 'login|signin|/oauth') } `
-    "open the companion Edge window and sign into M365 (Entra ID) once -- it persists across restarts"
+    {
+        $tabs = Get-Json 'http://127.0.0.1:9222/json'
+        # A login WALL on ANY tab means sign-in is still required -- even if a separate
+        # chat tab is also open. A corporate ADFS/Entra tab can sit on the login page
+        # while another tab shows chat; that must read RED, not green. Broadened pattern:
+        # login.microsoftonline / login.live.com / /adfs/ / adfs. / /oauth2/authorize /
+        # /signin / login_hint= (mirrors relay/edge_recover.looks_like_login's spirit).
+        $loginRe = 'login\.microsoftonline|login\.live\.com|/adfs/|adfs\.|/oauth2/authorize|/signin|login_hint='
+        $onLoginWall = @($tabs | Where-Object { $_.url -match $loginRe }).Count -gt 0
+        $m = $tabs | Where-Object { $_.url -match 'm365|copilot' }
+        ($m) -and -not $onLoginWall
+    } `
+    "sign-in needed: run  powershell -File scripts\start_companion_edge.ps1 -Foreground  (or python -m relay.edge_recover then surface()) to bring the companion Edge window forward, then complete M365 (Entra ID) sign-in -- it persists across restarts"
 
 # 5. Bridge Edge (:9223) -- optional, only for conversation history/scrape
 Check "Bridge Edge running (:9223 history/scrape) [optional]" `

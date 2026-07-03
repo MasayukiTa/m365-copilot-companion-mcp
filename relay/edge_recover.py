@@ -68,10 +68,56 @@ def hard_reset(port=9222, wait=True):
         return False
 
 
+def _profile_for_port(port):
+    """Map a CDP port to the Edge user-data-dir profile the launcher uses.
+      :9223 -> copilot-bridge-edge (the interactive bridge)
+      anything else -> the companion/fleet default (env MCP_EDGE_PROFILE or
+                        'copilot-companion-edge').
+    This mirrors scripts/start_companion_edge.ps1's -Profile default so we read the
+    right PER-PROFILE mode file (.fleet\\edge_mode_<profile>)."""
+    try:
+        if int(port) == 9223:
+            return "copilot-bridge-edge"
+    except Exception:
+        pass
+    return os.environ.get("MCP_EDGE_PROFILE") or "copilot-companion-edge"
+
+
+def _read_mode(fleet_dir, port):
+    """Read the launcher's remembered window mode ('headless'/'headed'/'') for the
+    Edge on `port`. Prefers the PER-PROFILE file .fleet\\edge_mode_<profile> that the
+    launcher actually writes; falls back to the plain .fleet\\edge_mode only if the
+    per-profile file is missing (it may be a stale/different artifact). Never raises."""
+    profile = _profile_for_port(port)
+    for name in ("edge_mode_" + profile, "edge_mode"):
+        try:
+            mf = os.path.join(fleet_dir, name)
+            if os.path.isfile(mf):
+                return open(mf).read().strip()
+        except Exception:
+            pass
+    return ""
+
+
+def _surface_flag(port, fleet_dir):
+    """Pure decision helper (no side effects, no shelling out): which launcher flag
+    surface() should invoke for the Edge on `port`.
+      headless  -> '-Foreground'  (no window exists; the launcher now kills the
+                   headless instance and relaunches HEADED so the user can sign in)
+      otherwise -> '-Surface'     (a real window exists; just bring it to the front)
+    Exposed separately so the decision can be unit-tested without launching Edge."""
+    return "-Foreground" if _read_mode(fleet_dir, port) == "headless" else "-Surface"
+
+
 def surface(port=9222):
-    """Bring the (minimized, background) companion Edge to the foreground -- used when
-    sign-in is required so the user can complete it. Shells out to the launcher's
-    -Surface mode (Win32 restore + foreground); no Playwright, thread-safe."""
+    """Bring the (minimized/background/headless) companion Edge to the foreground --
+    used when sign-in is required so the user can complete it. Shells out to the
+    launcher; no Playwright, thread-safe (swallows errors). Returns True/False.
+
+    If the running instance is HEADLESS there is no window to raise, so we invoke the
+    launcher with -Foreground: it now kills the headless instance and relaunches HEADED
+    (see start_companion_edge.ps1). Otherwise -Surface just restores/foregrounds the
+    existing window."""
     import subprocess
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ps1 = os.path.join(repo, "scripts", "start_companion_edge.ps1")
@@ -82,15 +128,7 @@ def surface(port=9222):
         open(os.path.join(fleet, "edge_keep_pause"), "w").write(str(time.time()))
     except Exception:
         pass
-    mode = ""
-    try:
-        mf = os.path.join(fleet, "edge_mode")
-        if os.path.isfile(mf):
-            mode = open(mf).read().strip()
-    except Exception:
-        pass
-    # headless has no window to bring forward -> relaunch HEADED so the user can sign in
-    flag = "-Foreground" if mode == "headless" else "-Surface"
+    flag = _surface_flag(port, fleet)
     try:
         subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,

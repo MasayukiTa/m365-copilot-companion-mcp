@@ -106,6 +106,36 @@ function Get-CompanionWindow {
     return [Cw]::Find($pids)
 }
 
+# True iff a msedge process for THIS profile is currently running with --headless.
+# Used to decide, on a -Foreground request, whether the running instance is a headless
+# one that must be killed + relaunched headed (a headless Edge holds the CDP port, so a
+# plain -Foreground would hit the "already reachable -> nothing to do" early-exit and do
+# nothing -- there is no window to raise).
+function Test-CompanionHeadless {
+    $procs = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
+               Where-Object { $_.CommandLine -match [regex]::Escape($Profile) })
+    foreach ($p in $procs) {
+        if ($p.CommandLine -match '--headless') { return $true }
+    }
+    return $false
+}
+
+# Kill every msedge for THIS profile and wipe its session-restore state (shared by
+# -HardReset and the headless->headed -Foreground swap), so the relaunch comes up clean.
+function Reset-CompanionSession {
+    Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
+        Where-Object { $_.CommandLine -match [regex]::Escape($Profile) } |
+        ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {} }
+    Start-Sleep -Seconds 2
+    $def = Join-Path $dataDir "Default"
+    foreach ($n in @("Current Session", "Current Tabs", "Last Session", "Last Tabs")) {
+        $f = Join-Path $def $n
+        if (Test-Path $f) { Remove-Item $f -Force -ErrorAction SilentlyContinue }
+    }
+    $sess = Join-Path $def "Sessions"
+    if (Test-Path $sess) { Remove-Item $sess -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 if ($Surface) {
     $h = Get-CompanionWindow
     if ($h -ne [IntPtr]::Zero) {
@@ -121,18 +151,7 @@ if ($Surface) {
 
 if ($HardReset) {
     Write-Host "HardReset: killing companion Edge and clearing session-restore state ..."
-    Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
-        Where-Object { $_.CommandLine -match [regex]::Escape($Profile) } |
-        ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {} }
-    Start-Sleep -Seconds 2
-    # Deleting these makes Edge come up clean instead of restoring the wedged tabs.
-    $def = Join-Path $dataDir "Default"
-    foreach ($n in @("Current Session", "Current Tabs", "Last Session", "Last Tabs")) {
-        $f = Join-Path $def $n
-        if (Test-Path $f) { Remove-Item $f -Force -ErrorAction SilentlyContinue }
-    }
-    $sess = Join-Path $def "Sessions"
-    if (Test-Path $sess) { Remove-Item $sess -Recurse -Force -ErrorAction SilentlyContinue }
+    Reset-CompanionSession
     Write-Host "HardReset: session state cleared."
 }
 
@@ -143,8 +162,34 @@ try {
     $listening = [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
 } catch { }
 if ($listening) {
-    Write-Host "Companion Edge already reachable on port $Port (http://127.0.0.1:$Port). Nothing to do."
-    exit 0
+    # SPECIAL CASE (headless -> headed sign-in swap): -Foreground is a request to make a
+    # window visible for interactive sign-in. A HEADLESS Edge holds the port but has NO
+    # window, so the plain "already reachable -> nothing to do" exit would silently do
+    # nothing. When the running instance is headless, kill it + wipe session state, then
+    # fall through to a clean HEADED relaunch. (An already-HEADED instance needs no
+    # relaunch -- raise it to the front via -Surface and exit.)
+    if ($Foreground -and (Test-CompanionHeadless)) {
+        Write-Host "Companion Edge on port $Port is HEADLESS; -Foreground requested for sign-in."
+        Write-Host "Killing the headless instance and relaunching HEADED ..."
+        Reset-CompanionSession
+        # fall through to the launch path below (headed, since $Foreground keeps $useHeadless=$false)
+    } else {
+        if ($Foreground) {
+            # Already headed and reachable: just bring the existing window to the front.
+            $h = Get-CompanionWindow
+            if ($h -ne [IntPtr]::Zero) {
+                [Cw]::ShowWindow($h, 5) | Out-Null    # SW_SHOW
+                [Cw]::ShowWindow($h, 9) | Out-Null    # SW_RESTORE
+                [Cw]::SetForegroundWindow($h) | Out-Null
+                Write-Host "Companion Edge already headed on port $Port; brought to the foreground."
+            } else {
+                Write-Host "Companion Edge already reachable on port $Port; no window found to raise."
+            }
+        } else {
+            Write-Host "Companion Edge already reachable on port $Port (http://127.0.0.1:$Port). Nothing to do."
+        }
+        exit 0
+    }
 }
 
 # Locate msedge.exe (standard install paths, then PATH).
