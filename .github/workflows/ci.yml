@@ -2,7 +2,7 @@
 #
 # "Hermetic" here means: no Edge/Playwright browser, no M365/Copilot login,
 # no :8000/:8011 server, no GPU, no pywin32 (Linux-only exclusion), no network
-# calls inside the test logic. All 175 tests in this set pass on the standard
+# calls inside the test logic. All 201 tests in this set pass on the standard
 # ubuntu-latest runner with only pip deps.
 #
 # EXCLUDED (and why):
@@ -56,6 +56,8 @@ jobs:
         run: |
           pytest -q \
             tests/test_security_xff.py \
+            tools/test_python_gate.py \
+            tools/test_layer1_security.py \
             relay/test_acceptance.py \
             relay/test_admission.py \
             relay/test_autoscale.py \
