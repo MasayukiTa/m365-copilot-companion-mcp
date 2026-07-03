@@ -515,23 +515,25 @@ def test_transient_outage_window():
 
 
 def test_consent_detector():
-    # The MCP connection-consent card is a FOREGROUND-required interactive-auth event: surface
-    # the Edge once so the user can authorize IN THAT EDGE, then STUCK fast (don't loop the card).
+    # REGULATION: MCP connection-consent is a connection-SELECT confirm, NOT credential entry, so it
+    # must be resolved FULLY AUTOMATICALLY -- it must NEVER surface the Edge. surface() is reserved
+    # for genuine sign-in only. So: auto-consent is attempted; on failure the worker RETRIES (not
+    # stuck) and NEVER surfaces; a second consecutive failure goes STUCK with an edge_reconnect hint.
     import relay.edge_recover as er
     calls = {"n": 0}
     orig = er.surface
-    er.surface = lambda *a, **k: calls.__setitem__("n", calls["n"] + 1)
+    er.surface = lambda *a, **k: calls.__setitem__("n", calls["n"] + 1)  # tripwire: must stay 0 for consent
     try:
         card = ("desktopfile操作\nまずは接続して、必要な情報を探します。この資格情報を 接続マネージャーを開く で"
                 "検証してください。接続の準備が整ったら、この要求をやり直してください。再試行 キャンセル")
         w = RelayWorker("fix the bug", "w0")
-        w._decide(card)                       # 1st -> auto tried (page=None -> fails) -> surface, NOT stuck
+        w._decide(card)                       # 1st -> auto tried (page=None -> fails) -> RETRY, NOT surface, NOT stuck
         check("consent_auto_attempted_first", w._consent_auto_tried)
-        check("consent_surface_on_first", calls["n"] == 1 and w._consent_surfaced and w.status != "stuck")
+        check("consent_no_surface_on_first", calls["n"] == 0 and w.status != "stuck")
         w._decide(card)                       # 2nd -> STUCK (don't burn turns on the card)
         check("consent_stuck_after_2", w.status == "stuck" and w.outcome == "STUCK")
-        check("consent_msg_dedicated_edge", "専用Edge" in (w.reason or ""))
-        check("consent_surface_once", calls["n"] == 1)   # not re-surfaced on the 2nd card
+        check("consent_msg_reconnect_hint", "edge_reconnect" in (w.reason or ""))
+        check("consent_never_surfaced", calls["n"] == 0)   # consent must never surface
         # an English consent card trips it too
         w2 = RelayWorker("g", "w1")
         en = "Please open connection manager and verify your credential, then retry."
