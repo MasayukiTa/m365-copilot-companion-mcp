@@ -96,8 +96,19 @@ class CockpitWindow : Window
     // composer), so everything scales AND reflows together. Persisted as ui_scale= in the
     // SHARED settings.txt with identical semantics to the chat app, so both apps zoom in
     // lock-step (an external edit is picked up on the next mtime-triggered LoadSettings).
-    double _uiScale = 1.0;            // current zoom (clamped 0.8–2.0)
+    double _uiScale = 1.0;            // current EFFECTIVE zoom (clamped 0.8–2.0) -> pushed to _rootScale
     bool _uiScaleLoaded = false;      // true once a ui_scale= line was read from settings.txt
+    // AUTO mode: ui_scale= may hold the literal "auto" instead of a number. In auto mode the
+    // effective LayoutTransform scale is derived per-monitor so the PHYSICAL size stays constant:
+    //   effective = clamp(_scaleTarget / currentMonitorScale, 0.8, 2.0)
+    // where currentMonitorScale = this window's DPI/96. Net physical = monitorScale × effective ≈
+    // _scaleTarget on EVERY monitor (the divide-by-monitorScale exactly counteracts WPF's own DPI
+    // relayout, so we never double-apply). Manual mode ignores _scaleTarget and uses a fixed number.
+    bool _uiAuto = true;              // true = auto mode (default for new users / ui_scale=auto)
+    double _scaleTarget = 1.5;        // desired constant physical scale (persisted as ui_scale_target)
+    bool _scaleTargetLoaded = false;  // true once ui_scale_target was read (else seed from primary DPI)
+    Button _uiAutoBtn;                // gear-popup "自動"/"Auto" toggle (rebuilt each open)
+    Button _uiScaleMinus, _uiScalePlus;  // gear-popup steppers (disabled while auto is on)
     ScaleTransform _rootScale;        // the LayoutTransform applied on BuildChrome's root
     // Self-fading "125%" overlay shown briefly on each change (reuses no other affordance
     // because the composer note is not visible from every context, e.g. gear popup / shortcut).
@@ -399,7 +410,10 @@ class CockpitWindow : Window
         if (k == "ram_floor") return ja ? "確保する空きRAM (MB)" : "RAM floor (MB)";
         if (k == "ui_scale_section") return ja ? "表示サイズ" : "UI scale";
         if (k == "ui_scale") return ja ? "表示サイズ" : "UI scale";
-        if (k == "ui_scale_hint") return ja ? "Ctrl+ホイールや Ctrl +/− でも変更できます（Ctrl+0 で100%）。" : "Also change with Ctrl+wheel or Ctrl +/− (Ctrl+0 resets to 100%).";
+        if (k == "ui_scale_hint") return ja ? "Ctrl+ホイールや Ctrl +/− でも変更できます（Ctrl+0 で自動）。" : "Also change with Ctrl+wheel or Ctrl +/− (Ctrl+0 = auto).";
+        if (k == "ui_auto") return ja ? "自動" : "Auto";
+        if (k == "ui_auto_on") return ja ? "自動: オン" : "Auto: on";
+        if (k == "ui_auto_off") return ja ? "自動: オフ" : "Auto: off";
         if (k == "force_start") return ja ? "今すぐ開始" : "Start now";
         if (k == "floor_restore") return ja ? "容量制限を戻す" : "Restore limit";
         if (k == "floor_off") return ja ? "容量制限を一時解除しています" : "Capacity limit paused";
@@ -485,10 +499,23 @@ class CockpitWindow : Window
                 }
                 else if (ln.StartsWith("ui_scale="))
                 {
-                    double us;
-                    if (double.TryParse(ln.Substring(9).Trim(), System.Globalization.NumberStyles.Float,
-                                        System.Globalization.CultureInfo.InvariantCulture, out us))
-                    { _uiScale = Math.Max(0.8, Math.Min(2.0, us)); _uiScaleLoaded = true; }
+                    string sv = ln.Substring(9).Trim();
+                    if (sv.Equals("auto", StringComparison.OrdinalIgnoreCase))
+                    { _uiAuto = true; _uiScaleLoaded = true; }
+                    else
+                    {
+                        double us;
+                        if (double.TryParse(sv, System.Globalization.NumberStyles.Float,
+                                            System.Globalization.CultureInfo.InvariantCulture, out us))
+                        { _uiAuto = false; _uiScale = Math.Max(0.8, Math.Min(2.0, us)); _uiScaleLoaded = true; }
+                    }
+                }
+                else if (ln.StartsWith("ui_scale_target="))
+                {
+                    double ut;
+                    if (double.TryParse(ln.Substring(16).Trim(), System.Globalization.NumberStyles.Float,
+                                        System.Globalization.CultureInfo.InvariantCulture, out ut))
+                    { _scaleTarget = Math.Max(0.8, Math.Min(3.0, ut)); _scaleTargetLoaded = true; }
                 }
                 else if (ln.StartsWith("effort="))
                 {
@@ -779,10 +806,14 @@ class CockpitWindow : Window
         return _scaleToast;
     }
 
-    void ShowScaleToast()
+    void ShowScaleToast() { ShowScaleToast(null); }
+    // overrideText != null shows that literal (e.g. "自動" when entering auto mode); otherwise the %.
+    void ShowScaleToast(string overrideText)
     {
         if (_scaleToast == null || _scaleToastText == null) return;
-        _scaleToastText.Text = T("ui_scale") + "  " + ((int)Math.Round(_uiScale * 100)) + "%";
+        _scaleToastText.Text = overrideText != null
+            ? overrideText
+            : T("ui_scale") + "  " + ((int)Math.Round(_uiScale * 100)) + "%";
         _scaleToast.BeginAnimation(UIElement.OpacityProperty, null);
         _scaleToast.Opacity = 1.0;
         _scaleToast.Visibility = Visibility.Visible;
@@ -803,20 +834,90 @@ class CockpitWindow : Window
         _scaleToastTimer.Start();
     }
 
-    // Apply a new UI scale: clamp 0.8–2.0, push to the live LayoutTransform, persist, update the
-    // gear-popup value label, and flash the % overlay. Called by shortcuts, wheel, and gear steppers.
+    // Current monitor scale = this window's device pixels per DIP (DPI/96). 1.0 at 100%, 1.5 at 150%.
+    // Read from the live PresentationSource; falls back to 1.0 before the window is sourced.
+    double CurrentMonitorScale()
+    {
+        try
+        {
+            var src = System.Windows.PresentationSource.FromVisual(this);
+            if (src != null && src.CompositionTarget != null)
+            {
+                double m11 = src.CompositionTarget.TransformToDevice.M11;
+                if (m11 > 0.01) return m11;
+            }
+        }
+        catch (Exception) { }
+        return 1.0;
+    }
+
+    // AUTO effective scale for a given monitor scale: target physical size / monitor's own DPI scale,
+    // clamped to the LayoutTransform range. monitorScale (WPF DPI) × effective ≈ _scaleTarget, i.e. the
+    // physical size is constant across monitors. Clamp can cap it on extreme monitors (see numeric proof).
+    double EffectiveAutoScale(double monitorScale)
+    {
+        if (monitorScale < 0.01) monitorScale = 1.0;
+        return Math.Max(0.8, Math.Min(2.0, _scaleTarget / monitorScale));
+    }
+
+    // Push the current _uiScale onto the live LayoutTransform + gear label. Pure apply (no persist).
+    void PushScaleToTransform()
+    {
+        if (_rootScale != null) { _rootScale.ScaleX = _uiScale; _rootScale.ScaleY = _uiScale; }
+        if (_uiScaleVal != null) _uiScaleVal.Text = AutoLabelText();
+    }
+
+    // Recompute + apply the AUTO effective scale for THIS window's current monitor. Silent by default
+    // (DPI-change recompute must not toast). Does NOT persist ui_scale (auto marker already persisted).
+    void ApplyAutoScale(bool toast)
+    {
+        _uiScale = EffectiveAutoScale(CurrentMonitorScale());
+        PushScaleToTransform();
+        if (toast) ShowScaleToast(T("ui_auto"));
+    }
+
+    // Gear value-label text: "自動 (130%)" in auto, plain "130%" in manual.
+    string AutoLabelText()
+    {
+        int pct = (int)Math.Round(_uiScale * 100);
+        return _uiAuto ? (T("ui_auto") + " (" + pct + "%)") : (pct + "%");
+    }
+
+    // MANUAL apply: clamp 0.8–2.0, leave/enter manual mode, push to transform, persist ui_scale=number.
     void ApplyUiScale(double v, bool persist) { ApplyUiScale(v, persist, true); }
     void ApplyUiScale(double v, bool persist, bool toast)
     {
+        _uiAuto = false;
         _uiScale = Math.Max(0.8, Math.Min(2.0, Math.Round(v, 2)));
-        if (_rootScale != null) { _rootScale.ScaleX = _uiScale; _rootScale.ScaleY = _uiScale; }
-        if (_uiScaleVal != null) _uiScaleVal.Text = ((int)Math.Round(_uiScale * 100)) + "%";
+        PushScaleToTransform();
+        RefreshUiScaleControls();
         if (persist) { SaveKey("ui_scale", _uiScale.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)); _uiScaleLoaded = true; }
         if (toast) ShowScaleToast();
     }
 
+    // Switch to AUTO: persist ui_scale=auto, recompute for the current monitor, and (optionally) toast.
+    void EnableAutoScale(bool toast)
+    {
+        _uiAuto = true;
+        SaveKey("ui_scale", "auto");
+        _uiScaleLoaded = true;
+        ApplyAutoScale(toast);
+        RefreshUiScaleControls();
+    }
+
+    // Keep the gear-popup toggle/label/steppers in sync with the current mode (called on mode changes).
+    void RefreshUiScaleControls()
+    {
+        if (_uiScaleVal != null) _uiScaleVal.Text = AutoLabelText();
+        if (_uiAutoBtn != null) _uiAutoBtn.Content = _uiAuto ? T("ui_auto_on") : T("ui_auto_off");
+        // In auto mode the manual steppers are meaningless (value is monitor-derived) -> disable them.
+        if (_uiScaleMinus != null) _uiScaleMinus.IsEnabled = !_uiAuto;
+        if (_uiScalePlus != null) _uiScalePlus.IsEnabled = !_uiAuto;
+    }
+
     // Window-level Ctrl+Plus / Ctrl+Minus / Ctrl+0 zoom. Handles both the main-row and NumPad keys.
     // OemPlus/OemMinus are the US-layout '=' and '-' keys; Add/Subtract are the numeric-keypad ones.
+    // +/- while in auto -> switch to MANUAL at the resulting number; Ctrl+0 -> back to AUTO.
     void OnScaleKeyDown(object sender, KeyEventArgs e)
     {
         if ((Keyboard.Modifiers & ModifierKeys.Control) == 0) return;
@@ -825,11 +926,11 @@ class CockpitWindow : Window
         else if (e.Key == Key.OemMinus || e.Key == Key.Subtract)
         { ApplyUiScale(_uiScale - 0.1, true); e.Handled = true; }
         else if (e.Key == Key.D0 || e.Key == Key.NumPad0)
-        { ApplyUiScale(1.0, true); e.Handled = true; }
+        { EnableAutoScale(true); e.Handled = true; }   // Ctrl+0 = "back to automatic"
     }
 
-    // Ctrl+MouseWheel = ±0.1 per notch. Swallowed only when Ctrl is held so normal list scroll
-    // (no modifier) is untouched.
+    // Ctrl+MouseWheel = ±0.1 per notch (-> MANUAL). Swallowed only when Ctrl is held so normal list
+    // scroll (no modifier) is untouched.
     void OnScaleMouseWheel(object sender, MouseWheelEventArgs e)
     {
         if ((Keyboard.Modifiers & ModifierKeys.Control) == 0) return;
@@ -837,15 +938,54 @@ class CockpitWindow : Window
         e.Handled = true;
     }
 
-    // First-run default: on a 4K-class display with NO per-monitor DPI scaling applied (M11 == 1.0,
-    // i.e. Windows is at 100% so native pixels ARE tiny), bump to 125% once and persist. Guarded by
-    // _uiScaleLoaded so a user who already chose a scale (in either app) is never overridden.
+    // PMv2 fires this when the window is dragged onto a differently-scaled monitor. In AUTO mode we
+    // recompute the effective scale from the NEW monitor's DPI (neu.DpiScaleX = DPI/96) so the physical
+    // size stays constant -- SILENTLY (an automatic recompute must not flash the % toast). Manual mode
+    // is untouched: WPF has already relaid out at the new DPI and the fixed number still holds. Never
+    // throw from here.
+    protected override void OnDpiChanged(DpiScale oldDpi, DpiScale newDpi)
+    {
+        try { base.OnDpiChanged(oldDpi, newDpi); } catch (Exception) { }
+        try
+        {
+            if (_uiAuto)
+            {
+                double ms = (newDpi.DpiScaleX > 0.01) ? newDpi.DpiScaleX : CurrentMonitorScale();
+                _uiScale = EffectiveAutoScale(ms);
+                PushScaleToTransform();   // silent: no toast on automatic DPI-change recompute
+            }
+        }
+        catch (Exception) { }
+    }
+
+    // First run / startup apply. AUTO is the default for NEW users: seed _scaleTarget from the PRIMARY
+    // monitor's scale (the "comfortable size" the user is used to) and compute the per-monitor effective
+    // scale now. If a scale was already persisted (manual OR auto, from either app) honor it and just
+    // reflect it on the live transform. Guarded by _uiScaleLoaded so a chosen scale is never overridden.
     protected override void OnSourceInitialized(EventArgs e)
     {
         base.OnSourceInitialized(e);
         try
         {
+            double monitorScale = CurrentMonitorScale();
+            // Seed the target from the primary monitor's scale on first run (default 1.5 fallback).
+            if (!_scaleTargetLoaded)
+            {
+                _scaleTarget = Math.Max(0.8, Math.Min(3.0, monitorScale));
+                if (_scaleTarget < 0.81) _scaleTarget = 1.5;   // 100% primary -> still target a comfy 1.5
+                SaveKey("ui_scale_target", _scaleTarget.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture));
+                _scaleTargetLoaded = true;
+            }
             if (!_uiScaleLoaded)
+            {
+                // NEW user default = AUTO. Persist the marker and compute for this monitor (silent).
+                EnableAutoScale(false);
+            }
+            else if (_uiAuto)
+            {
+                ApplyAutoScale(false);   // reflect auto for THIS monitor silently
+            }
+            else
             {
                 double m11 = 1.0;
                 var src = System.Windows.PresentationSource.FromVisual(this);
@@ -855,10 +995,6 @@ class CockpitWindow : Window
                     ApplyUiScale(1.25, true, true);    // announce the one-time 4K bump
                 else
                     ApplyUiScale(1.0, true, false);    // silent explicit default so it never re-triggers
-            }
-            else
-            {
-                ApplyUiScale(_uiScale, false, false);  // silently reflect the loaded value on the live transform
             }
         }
         catch (Exception) { }
@@ -3591,15 +3727,30 @@ class CockpitWindow : Window
         hint.FontSize = 10.5; hint.TextWrapping = TextWrapping.Wrap; hint.Margin = new Thickness(0, 0, 0, 2);
         col.Children.Add(hint);
 
-        // ── 表示サイズ / UI scale: [−] [100%] [+] (step 0.1, live-apply + persist) ──
+        // ── 表示サイズ / UI scale: [自動 ▸] then [−] [自動 (130%)] [+] (step 0.1, live-apply + persist) ──
+        // Auto toggle keeps a CONSTANT physical size across monitors (target/monitorScale). When Auto is
+        // on the value shows "自動 (NNN%)" (the current effective %) and the −/+ steppers are disabled;
+        // clicking −/+ (or toggling Auto off) drops to manual at the current number.
         col.Children.Add(SectionHeader(T("ui_scale_section")));
-        var usMinus = MiniButton("−"); usMinus.Click += delegate { ApplyUiScale(_uiScale - 0.1, true); };
-        var usPlus = MiniButton("+"); usPlus.Click += delegate { ApplyUiScale(_uiScale + 0.1, true); };
-        _uiScaleVal = new TextBlock(); _uiScaleVal.Text = ((int)Math.Round(_uiScale * 100)) + "%";
-        col.Children.Add(SettingsStepperRow(T("ui_scale"), _uiScaleVal, usMinus, usPlus));
+        _uiAutoBtn = MiniButton(_uiAuto ? T("ui_auto_on") : T("ui_auto_off"));
+        _uiAutoBtn.Width = double.NaN; _uiAutoBtn.MinWidth = 78; _uiAutoBtn.Padding = new Thickness(8, 0, 8, 0);
+        _uiAutoBtn.Click += delegate
+        {
+            if (_uiAuto) ApplyUiScale(_uiScale, true);   // Auto -> manual at the current effective number
+            else EnableAutoScale(true);                  // manual -> Auto (recompute for this monitor)
+        };
+        var autoRow = new DockPanel(); autoRow.Margin = new Thickness(0, 5, 0, 0); autoRow.LastChildFill = false;
+        DockPanel.SetDock(_uiAutoBtn, Dock.Right); autoRow.Children.Add(_uiAutoBtn);
+        col.Children.Add(autoRow);
+        _uiScaleMinus = MiniButton("−"); _uiScaleMinus.Click += delegate { ApplyUiScale(_uiScale - 0.1, true); };
+        _uiScalePlus = MiniButton("+"); _uiScalePlus.Click += delegate { ApplyUiScale(_uiScale + 0.1, true); };
+        _uiScaleVal = new TextBlock(); _uiScaleVal.Text = AutoLabelText();
+        _uiScaleVal.MinWidth = 84;   // wider: holds "自動 (130%)"
+        col.Children.Add(SettingsStepperRow(T("ui_scale"), _uiScaleVal, _uiScaleMinus, _uiScalePlus));
         var usHint = new TextBlock(); usHint.Text = T("ui_scale_hint"); usHint.Foreground = Muted;
         usHint.FontSize = 10.5; usHint.TextWrapping = TextWrapping.Wrap; usHint.Margin = new Thickness(0, 0, 0, 2);
         col.Children.Add(usHint);
+        RefreshUiScaleControls();   // set label/toggle/stepper-enabled to match the current mode
 
         card.Child = col;
         UpdateAutoEnabled();   // grey the ceiling stepper if autoscale is off
@@ -4769,13 +4920,28 @@ class CockpitWindow : Window
                 if (m != _settingsMtime)
                 {
                     bool d0 = _dark; int l0 = _lang; double s0 = _uiScale;
+                    bool a0 = _uiAuto; double t0 = _scaleTarget;
                     LoadSettings();
                     if (d0 != _dark) { ApplyThemeBrushes(); PaintChrome(); _lastSig = ""; }
                     else if (l0 != _lang) { RebuildChrome(); }
-                    // External ui_scale edit (e.g. the chat app zoomed): apply it live so both apps
-                    // stay in lock-step. RebuildChrome above already re-anchored the transform on the
-                    // new root, so ApplyUiScale just needs to push the value onto whichever is current.
-                    if (Math.Abs(s0 - _uiScale) > 0.001) ApplyUiScale(_uiScale, false, true);
+                    // External ui_scale edit (e.g. the chat app zoomed / switched to auto): apply it live
+                    // so both apps stay in lock-step. In AUTO the effective scale is per-monitor, so we
+                    // recompute for THIS window's monitor (not the other app's) — silently. In MANUAL we
+                    // push the shared number and flash the %. RebuildChrome above (if lang changed) already
+                    // re-anchored the transform on the new root.
+                    if (_uiAuto)
+                    {
+                        // Recompute if we just entered auto, or the target changed, so the transform tracks.
+                        if (!a0 || Math.Abs(t0 - _scaleTarget) > 0.001 || Math.Abs(s0 - EffectiveAutoScale(CurrentMonitorScale())) > 0.001)
+                            ApplyAutoScale(false);
+                        RefreshUiScaleControls();
+                    }
+                    else if (a0 || Math.Abs(s0 - _uiScale) > 0.001)
+                    {
+                        // Other app set a manual number (or switched auto->manual): reflect + toast.
+                        _uiScale = Math.Max(0.8, Math.Min(2.0, _uiScale));
+                        PushScaleToTransform(); RefreshUiScaleControls(); ShowScaleToast();
+                    }
                 }
             }
         }
