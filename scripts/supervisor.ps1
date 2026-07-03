@@ -42,7 +42,9 @@ param(
 )
 
 $ErrorActionPreference = "SilentlyContinue"
-$Root = $PSScriptRoot
+# This script lives in <repo>\scripts. $Root is the REPO ROOT: .env, .venv and main.py
+# (which this hosts) all live there.
+$Root = Split-Path -Parent $PSScriptRoot
 
 # Resolve the tunnel name: explicit -TunnelName wins; else .env's MCP_TUNNEL_NAME (set by
 # setup_devtunnel.ps1 to this machine's actual tunnel); else the generic default. This keeps the

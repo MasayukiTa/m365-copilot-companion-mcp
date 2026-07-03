@@ -16,7 +16,9 @@ param(
     [string]$Reason  = ""    # optional banner explaining why this dialog popped
 )
 $ErrorActionPreference = "Stop"
-$root = $PSScriptRoot
+# This script lives in <repo>\scripts, so $PSScriptRoot is the scripts dir. The .env it
+# edits is at the REPO ROOT (one level up).
+$root = Split-Path -Parent $PSScriptRoot
 if (-not $EnvPath) { $EnvPath = Join-Path $root ".env" }
 
 # Known-good defaults for the FIRST-PARTY agents (Researcher / Analyst). These are the same

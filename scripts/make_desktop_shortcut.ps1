@@ -5,13 +5,16 @@
 #  can run it by hand any time. ASCII / ENGLISH ONLY.
 # =============================================================================
 $ErrorActionPreference = "Stop"
-$repo = $PSScriptRoot
-if (-not $repo) { $repo = Split-Path -Parent $MyInvocation.MyCommand.Path }
+# This script lives in <repo>\scripts. $repo is the REPO ROOT (one level up); $scriptDir is
+# the scripts dir where the windowless .vbs launcher now lives.
+$scriptDir = $PSScriptRoot
+if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
+$repo = Split-Path -Parent $scriptDir
 
-# Point at the WINDOWLESS launcher (start_all_hidden.vbs, run via wscript) so a double-click
-# shows NO cmd/console window -- there is nothing for a user to accidentally close. Fall back to
-# start_all.bat only if the .vbs is missing (older checkout).
-$target = Join-Path $repo "start_all_hidden.vbs"
+# Point at the WINDOWLESS launcher (scripts\start_all_hidden.vbs, run via wscript) so a
+# double-click shows NO cmd/console window -- there is nothing for a user to accidentally
+# close. Fall back to start_all.bat (repo root) only if the .vbs is missing (older checkout).
+$target = Join-Path $scriptDir "start_all_hidden.vbs"
 if (-not (Test-Path $target)) { $target = Join-Path $repo "start_all.bat" }
 if (-not (Test-Path $target)) {
     Write-Host "No launcher (start_all_hidden.vbs / start_all.bat) found -- nothing to link." -ForegroundColor Yellow

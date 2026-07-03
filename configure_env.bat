@@ -6,4 +6,4 @@ REM  research, analyst). Routes through a windowless VBS so no console appears -
 REM  just the URL-entry dialog. ASCII / ENGLISH ONLY.
 REM ===========================================================================
 cd /d "%~dp0"
-wscript.exe "%~dp0configure_env_hidden.vbs"
+wscript.exe "%~dp0scripts\configure_env_hidden.vbs"

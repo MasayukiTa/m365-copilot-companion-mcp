@@ -6,8 +6,10 @@
 #  ASCII / ENGLISH ONLY (cmd/console safe).
 # =============================================================================
 $ErrorActionPreference = "SilentlyContinue"
-$repo = $PSScriptRoot
-if (-not $repo) { $repo = Split-Path -Parent $MyInvocation.MyCommand.Path }
+# This script lives in <repo>\scripts; the .env it reads is at the REPO ROOT (one level up).
+$scriptDir = $PSScriptRoot
+if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
+$repo = Split-Path -Parent $scriptDir
 
 # --- load .env into a hashtable -------------------------------------------------
 $envv = @{}
@@ -49,18 +51,18 @@ Check "Agent URL configured (Copilot Studio agent pasted)" `
 # 2. local MCP server
 Check "MCP server up (http://127.0.0.1:8000/health)" `
     { (Invoke-WebRequest -Uri 'http://127.0.0.1:8000/health' -TimeoutSec 4 -UseBasicParsing).StatusCode -eq 200 } `
-    "start the stack: double-click start_all.bat   (or run .\start.ps1)"
+    "start the stack: double-click start_all.bat   (or run .\scripts\start.ps1)"
 
 # 3. Dev Tunnel (public reachability of the server through the tunnel)
 $turl = $envv['MCP_TUNNEL_URL']
 Check "Dev Tunnel reachable (public URL -> server)" `
     { if (-not $turl) { return $false }; (Invoke-WebRequest -Uri (($turl.TrimEnd('/')) + '/health') -TimeoutSec 7 -UseBasicParsing).StatusCode -eq 200 } `
-    "the tunnel host is not serving: run start_all.bat (supervisor hosts it). To (re)create the tunnel: powershell -File setup_devtunnel.ps1"
+    "the tunnel host is not serving: run start_all.bat (supervisor hosts it). To (re)create the tunnel: powershell -File scripts\setup_devtunnel.ps1"
 
 # 4. Companion Edge (:9222) for the fleet/agent
 Check "Companion Edge running (:9222 fleet/agent)" `
     { Get-Json 'http://127.0.0.1:9222/json/version' | Out-Null; $true } `
-    "launch it: powershell -File start_companion_edge.ps1   (then sign into M365 once)"
+    "launch it: powershell -File scripts\start_companion_edge.ps1   (then sign into M365 once)"
 
 Check "M365 signed in on the companion Edge (no login page)" `
     { $tabs = Get-Json 'http://127.0.0.1:9222/json'; $m = $tabs | Where-Object { ($_.url -match 'm365|copilot') }; ($m) -and -not (($m | ForEach-Object { $_.url }) -match 'login|signin|/oauth') } `
@@ -69,7 +71,7 @@ Check "M365 signed in on the companion Edge (no login page)" `
 # 5. Bridge Edge (:9223) -- optional, only for conversation history/scrape
 Check "Bridge Edge running (:9223 history/scrape) [optional]" `
     { Get-Json 'http://127.0.0.1:9223/json/version' | Out-Null; $true } `
-    "optional: powershell -File start_bridge.ps1 -Keepalive   (only needed for past-conversation history)"
+    "optional: powershell -File scripts\start_bridge.ps1 -Keepalive   (only needed for past-conversation history)"
 
 # 6. auth end-to-end: the server ACCEPTS the Bearer on /mcp. The MCP streamable-HTTP
 #    endpoint needs an initialize/session, so a bare POST returns 400/406 even when auth

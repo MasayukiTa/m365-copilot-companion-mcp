@@ -1,9 +1,11 @@
 $ErrorActionPreference = "Stop"
-Set-Location -Path $PSScriptRoot
+# This script lives in <repo>\scripts; .venv and main.py are at the REPO ROOT (one level up).
+$repoRoot = Split-Path -Parent $PSScriptRoot
+Set-Location -Path $repoRoot
 
 if (-not $env:PYTHONIOENCODING) { $env:PYTHONIOENCODING = "utf-8" }
 
-$venvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+$venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
 
 function Test-Python($pythonCommand) {
     try {

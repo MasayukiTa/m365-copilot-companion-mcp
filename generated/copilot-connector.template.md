@@ -6,7 +6,7 @@ sign-in. The bootstrap does NOT automate the Studio UI.
 
 ## What you need
 
-- The server running locally:  `http://127.0.0.1:8000/mcp`  (start with `.\start.ps1`)
+- The server running locally:  `http://127.0.0.1:8000/mcp`  (start with `.\scripts\start.ps1`)
 - A public HTTPS URL via Dev Tunnels:
   `https://<your-tunnel>-8000.<region>.devtunnels.ms/mcp`
 - Your Bearer key (from `.env`, `MCP_API_KEY`):
