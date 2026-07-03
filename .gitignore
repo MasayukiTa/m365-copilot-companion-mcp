@@ -128,3 +128,6 @@ ui/_buildcheck/
 bench/gaia/gaia_validation.json
 bench/gaia/logs/
 bench/gaia/_*.py
+
+# local attic for stray session files (never committed)
+_attic/

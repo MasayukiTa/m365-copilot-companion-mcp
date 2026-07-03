@@ -56,7 +56,7 @@ def hard_reset(port=9222, wait=True):
     it shells out to PowerShell and touches NO Playwright. Returns True on success."""
     import subprocess
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ps1 = os.path.join(repo, "start_companion_edge.ps1")
+    ps1 = os.path.join(repo, "scripts", "start_companion_edge.ps1")
     try:
         subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
@@ -74,7 +74,7 @@ def surface(port=9222):
     -Surface mode (Win32 restore + foreground); no Playwright, thread-safe."""
     import subprocess
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ps1 = os.path.join(repo, "start_companion_edge.ps1")
+    ps1 = os.path.join(repo, "scripts", "start_companion_edge.ps1")
     fleet = os.path.join(repo, ".fleet")
     # tell the background keeper to stop re-hiding the window while the user signs in
     try:
@@ -253,7 +253,7 @@ def close_all_tabs(cdp_url="http://localhost:9222", connect_timeout_ms=8000,
         except Exception as e:
             return {"ok": False, "error": "cdp unreachable: " + type(e).__name__ + ": " + str(e),
                     "hint": "Edge is unresponsive (CDP dead) -- run a hard reset: "
-                            ".\\start_companion_edge.ps1 -HardReset  (kills it, wipes "
+                            ".\\scripts\\start_companion_edge.ps1 -HardReset  (kills it, wipes "
                             "session-restore so wedged tabs are NOT restored, relaunches)"}
         ctx = browser.contexts[0] if browser.contexts else None
         if ctx is None:

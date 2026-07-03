@@ -6,7 +6,7 @@
 - **毎日の起動**: **`start_all.bat`**（または quickstart が作るデスクトップアイコン）。冪等で、サーバ＋トンネル＋専用Edge＋bridge＋UI を一括起動。
 - **健康診断**: **`doctor.bat`** ／ **エージェントURLの設定・変更**: **`configure_env.bat`** ／ **秘密の再発行（`.env` を漏らした時）**: **`rotate_secrets.bat`**。
 
-ルートにある他の `.ps1`（`start_companion_edge.ps1`・`supervisor.ps1` 等）は、これらが内部的に呼ぶヘルパーです。**直接実行する必要はありません**。内部専用の小物は `scripts/win/` に隔離してあります。
+`scripts/` にある `.ps1`（`start_companion_edge.ps1`・`supervisor.ps1` 等）は、これらが内部的に呼ぶヘルパーです。**直接実行する必要はありません**。内部専用の小物は `scripts/win/` に隔離してあります。
 
 ## Current Benchmark Snapshot
 
@@ -336,7 +336,7 @@ HumanEval / SWE-bench は「コーディング力」。こちらは **GAIA**（M
 #   会話 URL をコピー
 #
 # 【推奨】普段使いの Edge とは別の「専用・隔離 Edge」を使う:
-#   .\start_companion_edge.ps1
+#   .\scripts\start_companion_edge.ps1
 # 別プロファイル(別 user-data-dir)＋固定ポートで起動するので、(1) debug ポートが
 # 確実に bind し、(2) 本体 Edge に M365 タブを何枚開いても RAM を奪い合わず、本体の
 # クラッシュに巻き込まれない。重い M365 タブ多数 → メモリ枯渇 → Edge 落ち →
@@ -414,7 +414,7 @@ relay の上に、**Claude Code のような自律コーディング体験** を
 
 Premium / Direct Line を使わず、Copilot エージェントを **手元のローカルアプリのように** 使える 2 つのフロントエンドを同梱しています。どちらも裏は同じ「ブリッジ → CDP → Copilot」経路で、別 PC の要件は **Python + Edge のみ**（Chrome も Node も不要）。
 
-- **Python ブリッジ** (`bridge/copilot_bridge.py`): stdlib の `http.server` だけで自己完結の HTML チャットを配信し、Copilot の応答を **差分スクレイピングでトークン単位ストリーミング**。起動は `.\start_bridge.ps1` 推奨 → ブラウザで `http://127.0.0.1:8765`。これは bridge を **専用の隔離 Edge**（別プロファイル `copilot-bridge-edge` ＋別 CDP ポート `:9223`）で立てるので、SWE フリートの Edge（`:9222`）と取り合わず **フリート走行中でも同時に使える**（Edge は 1 プロファイル＝1 プロセスのため、並走には別プロファイル＋別ポートが必須）。単体で繋ぐなら `python bridge\copilot_bridge.py`（既定で `:9222` の Edge に attach）。
+- **Python ブリッジ** (`bridge/copilot_bridge.py`): stdlib の `http.server` だけで自己完結の HTML チャットを配信し、Copilot の応答を **差分スクレイピングでトークン単位ストリーミング**。起動は `.\scripts\start_bridge.ps1` 推奨 → ブラウザで `http://127.0.0.1:8765`。これは bridge を **専用の隔離 Edge**（別プロファイル `copilot-bridge-edge` ＋別 CDP ポート `:9223`）で立てるので、SWE フリートの Edge（`:9222`）と取り合わず **フリート走行中でも同時に使える**（Edge は 1 プロファイル＝1 プロセスのため、並走には別プロファイル＋別ポートが必須）。単体で繋ぐなら `python bridge\copilot_bridge.py`（既定で `:9222` の Edge に attach）。
 - **ネイティブ WPF アプリ** (`ui/CopilotChat.cs`): Windows 同梱の `csc.exe` だけでビルドする **完全 JS フリー** のデスクトップチャット。マークダウン/コードブロック整形・ダーク/ライト・日本語/英語切替・会話履歴サイドバー（リネーム・削除）。`ui\build_and_run.bat` でビルド＆起動。
 - **フリートコックピット** (`ui/FleetCockpit.cs`): 並列実行を 1 ライブカード/ゴールで可視化。RAM 自動調整（適応スロットル）・disk/RAM 容量アウェアな連続アドミッション（重い eval は単独・軽い eval は並走）・完了で即タブ＆容量解放・各ワーカーを途中でステア/解放。`ui\build_cockpit.bat` でビルド＆起動。
 
@@ -526,7 +526,7 @@ git clone https://github.com/MasayukiTa/m365-copilot-companion-mcp.git
 **うまくいった目安:** 最後に CopilotChat／FleetCockpit のウィンドウが開き、サーバーが待受。以降の日常起動は `start_all.bat` のダブルクリックだけ（STEP 8）。
 
 > **クリーンな Windows / USB メモリの zip でも動くか:** 動きます。ローカル環境構築に必要なのは**インターネット接続**だけ（管理者権限も不要）。Python は `uv` が管理者不要で入れ、devtunnel は直接DLで入り、WPF UI は Windows 同梱の `csc.exe`（.NET Framework 4.x）でビルドするため、追加の手動インストールは不要です（`.git` が無い zip 配布でも STEP 3 の更新確認を飛ばして進みます）。ただし **Copilot Studio 経路を使うなら STEP 0 の前提**（職場アカウント＋full M365 Copilot ライセンス＋管理者がカスタム/MCP コネクタを許可）が必要です。**個人用途はローカル Claude Desktop 経路（STEP 5-A）**ならこれらすべて不要。
-> **PowerShell 派**は `.\setup.ps1 -WithExternalTools`（Python＋devtunnel＋Tesseract）→ `.\configure_env.ps1` → `.\start_all.ps1` でも同じです。
+> **PowerShell 派**は `.\scripts\setup.ps1 -WithExternalTools`（Python＋devtunnel＋Tesseract）→ `.\scripts\configure_env.ps1` → `.\scripts\start_all.ps1` でも同じです。
 
 ---
 
@@ -574,7 +574,7 @@ git clone https://github.com/MasayukiTa/m365-copilot-companion-mcp.git
 
 > **ローカルの Claude Desktop だけに繋ぐ場合はこの STEP は不要です。** STEP 5-A の Claude Desktop 設定に進んでください。M365 Copilot Studio から繋ぐ場合のみ必要です。
 
-**クリックするファイル / コマンド:** PowerShell で `.\setup_devtunnel.ps1`（管理者不要）
+**クリックするファイル / コマンド:** PowerShell で `.\scripts\setup_devtunnel.ps1`（管理者不要）
 
 **自動でやること（`setup_devtunnel.ps1` が冪等に全部やる）:**
 1. `devtunnel` CLI のインストール — **winget で入らなければ公式の直接ダウンロード**（`https://aka.ms/TunnelsCliDownload/win-x64`）に自動フォールバック（winget 不要）。
@@ -583,11 +583,11 @@ git clone https://github.com/MasayukiTa/m365-copilot-companion-mcp.git
 4. **公開 URL を画面に表示し、`.env` に `MCP_TUNNEL_NAME` / `MCP_TUNNEL_URL` を記録**。
 
 ```powershell
-.\setup_devtunnel.ps1
+.\scripts\setup_devtunnel.ps1
 # ブラウザが開かない / 開きたくない場合は device-code を強制:
-.\setup_devtunnel.ps1 -DeviceCode
+.\scripts\setup_devtunnel.ps1 -DeviceCode
 # 別名のトンネルにしたい場合:
-.\setup_devtunnel.ps1 -TunnelName my-tunnel
+.\scripts\setup_devtunnel.ps1 -TunnelName my-tunnel
 ```
 
 **人間がやること:** 表示されたサインイン画面で職場（Entra ID）アカウントで認証するだけ。最後に表示される `https://<ランダム>-8000.<リージョン>.devtunnels.ms/` の **公開 URL をメモ**（次の STEP 4 で Copilot Studio に貼ります。`.env` の `MCP_TUNNEL_URL` にも入っています）。
@@ -611,7 +611,7 @@ $startup = [Environment]::GetFolderPath('Startup')
 $root    = (Get-Location).Path
 @"
 Set sh = CreateObject("WScript.Shell")
-sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$root\supervisor.ps1""", 0, False
+sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$root\scripts\supervisor.ps1""", 0, False
 "@ | Set-Content -Encoding ASCII (Join-Path $startup "start-companion-supervisor.vbs")
 ```
 
@@ -625,12 +625,45 @@ sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File 
 
 これが「②出てきた env 関連を Copilot Studio に登録する」の本体です。
 
-**人間がやること（順番どおりにクリックする）:**
+**人間がやること（順番どおりにクリックする）:** 初めての方向けに、実際の画面つきで最初から順を追います。
 
-1. Copilot Studio にサインインし、対象の**エージェント**を開く（無ければ「**新しいエージェント**」で作成）。
-2. エージェントの編集画面で「**ツール**」→「**ツールを追加**」（または「**新しいツール**」）をクリック。
-3. タイルの選択画面（**プロンプト** / **エージェント フロー** / **コンピューターの使用** / **モデル コンテキスト プロトコル** / **カスタム コネクタ** / **REST API**）が出るので、「**モデル コンテキスト プロトコル**」を選ぶ。
-4. ダイアログに以下を入力する（**サーバー名** / **サーバーの記述** / **サーバー URL** / **認証** の順に欄がある）。
+**0. Copilot Studio を開いてサインイン**
+quickstart を使っていれば、STEP 5 で自動的にブラウザに `https://copilotstudio.microsoft.com/` が開きます（開かなければ手動でアクセス）。職場 Microsoft アカウントでサインインしてください。
+
+**1. ホームの「ゼロから構築を開始する」→「エージェント」タイルをクリック**
+Copilot Studio のホーム画面で、「ゼロから構築を開始する」欄の「**エージェント**」タイルを選びます。
+
+![ホームの「ゼロから構築を開始する」→「エージェント」タイル](docs/images/cs_01_home_agent_tile.png)
+
+**2. エージェントに名前を入力 →「作成」**
+「エージェントに名前をつける」ダイアログで名前（例: `companion`）を入力し、「**作成**」をクリックします。
+
+![「エージェントに名前をつける」ダイアログで名前を入れて「作成」](docs/images/cs_02_name_agent.png)
+
+**3. エージェント編集画面の「ツール」セクション →「+ ツールを追加する」**
+作成されたエージェントの編集画面で「**ツール**」セクションを開き、「**+ ツールを追加する**」をクリックします。
+
+![エージェント編集画面の「ツール」セクションの「+ ツールを追加する」](docs/images/cs_03_tools_section.png)
+
+**4. 「ツールを追加する」ダイアログで「新規追加 MCP」タイルを選ぶ**
+「ツールを追加する」ダイアログが開きます。「**新規追加**」の「**MCP**」タイルを選んでください（見当たらなければダイアログ下部の「**表示を増やす**」を押すと出ます）。
+
+![「ツールを追加する」ダイアログの「新規追加 MCP」タイル](docs/images/cs_04_add_tool_mcp_tile.png)
+
+<details>
+<summary>UI バージョンが違う場合（「新しいツール」6タイル画面）</summary>
+
+お使いの UI のバージョンによっては、代わりに「**新しいツール**」画面（**プロンプト** / **エージェント フロー** / **コンピューターの使用** / **モデル コンテキスト プロトコル** / **カスタム コネクタ** / **REST API** の6タイル）が出ることがあります。その場合はタイル名が「**モデル コンテキスト プロトコル**」になっているので、それを選んでください。
+
+![「新しいツール」6タイル画面の「モデル コンテキスト プロトコル」タイル](docs/images/cs_05_new_tool_tiles_variant.png)
+
+</details>
+
+**5. サーバー情報ダイアログに値を入力する**
+サーバー情報のダイアログが開くので、以下を入力します（**サーバー名** / **サーバーの記述** / **サーバー URL** / **認証** の順に欄があります）。下の画像は入力済みの例です（URL はマスクしてあります）。
+
+![サーバー情報ダイアログに値を入力（URL はマスク済み）](docs/images/cs_06_mcp_dialog_filled.png)
+
    > 💡 **この値は手で組み立てなくてOK。`copilot_studio_values.bat` をダブルクリック**すると、あなたの `.env` ＋ Dev Tunnel から**実際の値をそのまま表示**します（quickstart の STEP 5 でも自動表示）。コピペするだけ。
 
    | 項目 | 入力値 |
@@ -646,9 +679,11 @@ sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File 
    > ⚠️ **「API キーの値」欄には `Bearer ` という単語と半角スペースを含めて丸ごと貼ってください**（例: `Bearer 4baf1c2e...`）。UI のラベルが「API キー」なので生のキーだけを貼りがちですが、それだと 401 になります。`copilot_studio_values.bat` の出力はこの `Bearer ` 込みの行なので、その行をそのまま貼れば確実です。
    > （なお本サーバーは救済策として、`Bearer ` を付け忘れて生のキーだけを貼った場合でも認証が通るように内部で補正します。ただし迷ったら上記どおり `Bearer ` 込みで貼るのが正です。）
 
-5. 「**作成**」をクリック → 接続がテストされ、ツール一覧がロードされれば成功。
+**6. 「作成」をクリック**
+接続がテストされ、ツール一覧がロードされれば成功です。
 
-6. 「**公開**」→「**利用者を自分だけ**」に設定（必ず自分のみ。組織全体は絶対に選ばない）。
+**7. 「公開」→「利用者を自分だけ」に設定**
+必ず自分のみ。組織全体は絶対に選ばないでください。
 
 **うまくいった目安:** ツール登録画面に `list_my_tools`, `read_file` などのツール名がずらっと表示される。
 
@@ -657,20 +692,20 @@ sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File 
 **同時にやっておくと便利（任意）:** エージェントの「ツール」タブで、Copilot Studio の純正コネクタ（メール・予定表・Teams・SharePoint など）も有効化しておくと、クラウド側を純正コネクタ・ローカル側をこの companion、という本来の二枚重ねになります（→「🧱 設計思想」参照）。
 
 **エージェント URL を `.env` に貼る（STEP 2 の続き）:**
-登録が終わったらエージェントとチャットを開き、URL バーの URL を `MCP_IMPL_AGENT_URL` に貼って保存してください。MCP サーバーを再起動（`Ctrl+C` → `.\start.ps1`）すると反映されます。
+登録が終わったらエージェントとチャットを開き、URL バーの URL を `MCP_IMPL_AGENT_URL` に貼って保存してください。MCP サーバーを再起動（`Ctrl+C` → `.\scripts\start.ps1`）すると反映されます。
 
 ---
 
 ### STEP 5 ─ 専用 Edge を起動して M365 に初回サインインする
 
-**クリックするファイル:** `start_companion_edge.ps1`（リポジトリ直下）
+**クリックするファイル:** `scripts\start_companion_edge.ps1`
 
 ```powershell
 # 初回：可視ウィンドウで起動（サインイン操作が必要なため）
-.\start_companion_edge.ps1
+.\scripts\start_companion_edge.ps1
 
 # 初回サインイン後は headless（ウィンドウなし）が推奨
-.\start_companion_edge.ps1 -Headless
+.\scripts\start_companion_edge.ps1 -Headless
 ```
 
 **スクリプトが自動でやること:**
@@ -690,13 +725,13 @@ sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File 
 
 ```powershell
 # bridge は別プロファイル (copilot-bridge-edge) + 別ポート (:9223) で起動する
-.\start_bridge.ps1
+.\scripts\start_bridge.ps1
 
 # 初回サインインが必要なら
-.\start_bridge.ps1 -SignIn
+.\scripts\start_bridge.ps1 -SignIn
 
 # bridge を常時稼働させたいなら（クラッシュ時も自動再起動）
-.\start_bridge.ps1 -Keepalive
+.\scripts\start_bridge.ps1 -Keepalive
 ```
 
 `start_bridge.ps1` は bridge 専用 Edge（`:9223`）を立て、`bridge\copilot_bridge.py` を起動します。`http://127.0.0.1:8765` にブラウザでアクセスすると、Node も Premium も不要なネイティブチャット UI が開きます。fleet の Edge（`:9222`）とは完全に別プロファイルなので、fleet 走行中でも同時に使えます。
@@ -782,7 +817,7 @@ Copilot Studio のバックエンドから呼ぶと IP が毎回変わること�
 
 `start_all.bat` は**冪等**です。全部が既に起動済みでも、セッション途中でも、何度ダブルクリックしても安全（先行プロセスは触らず、足りないものだけ補います）。初回 M365 サインインが必要な時だけ可視 Edge が出るので、そこでサインインしてください。
 
-> 個別に起動したい場合は従来どおり: `.\supervisor.ps1`（サーバー＋トンネル）/ `.\start_companion_edge.ps1 -Headless`（`:9222`）/ `.\start_bridge.ps1 -Keepalive`（`:9223`）/ `.\ui\rebuild_ui.ps1`（UI をビルドし直して起動）。
+> 個別に起動したい場合は従来どおり: `.\scripts\supervisor.ps1`（サーバー＋トンネル）/ `.\scripts\start_companion_edge.ps1 -Headless`（`:9222`）/ `.\scripts\start_bridge.ps1 -Keepalive`（`:9223`）/ `.\ui\rebuild_ui.ps1`（UI をビルドし直して起動）。
 > 初回セットアップ（venv・依存・`.env`・シークレット表示）は `quickstart.bat` のままです。`start_all.bat` はあくまで 2 回目以降の軽量ランチャー。
 
 ---
@@ -814,7 +849,7 @@ Dev Tunnel（STEP 3）は不要です。`start.ps1` でサーバーを起動し�
 | `quickstart.bat` が Python が見つからないと止まる | `winget install Python.Python.3.12` → 再実行 |
 | `devtunnel login` が何度やっても "Not logged in" のまま | `supervisor.ps1` が動いていたら一度止める。フォアグラウンドの新しいターミナルで `devtunnel login` を実行し、ブラウザの「続行」を確実にクリックする（`docs/STARTUP_devtunnel_login.md` 参照） |
 | Copilot Studio のツール登録でツール一覧が出ない | Dev Tunnel が `host` 状態かを確認（`devtunnel show m365-copilot-companion | Select-String "Host connections"`。`0` ならトンネルが落ちている）、MCP サーバーが起動しているか確認 |
-| エージェントが「申し訳ございません。それに応答できませんでした。」と返す | MCP サーバーか Dev Tunnel が落ちている。`Test-NetConnection localhost -Port 8000` → `devtunnel show` → 手動で `.\start.ps1` → `devtunnel host` で復旧 |
+| エージェントが「申し訳ございません。それに応答できませんでした。」と返す | MCP サーバーか Dev Tunnel が落ちている。`Test-NetConnection localhost -Port 8000` → `devtunnel show` → 手動で `.\scripts\start.ps1` → `devtunnel host` で復旧 |
 | `rebuild_ui.ps1` が `csc.exe not found` で失敗 | .NET Framework 4.x が入っていない。「Windowsの機能の有効化または無効化」→「.NET Framework 4.8」を有効化 |
 | `start_companion_edge.ps1` でサインインが要求され続ける | `-Foreground` でウィンドウを表示してサインインを完了させる → 次回から `-Headless` で起動 |
 | `unlock` を何度も要求される | Copilot Studio バックエンドの送信元 IP が変わった（VPN 切替など）。その都度 `unlock(password=...)` を呼ぶのが正常動作 |
@@ -874,11 +909,21 @@ system prompt にこの順序を 1 行入れておけば「画像なし pptx を
 ```
 m365-copilot-companion-mcp/
 ├── main.py                  # FastMCP のエントリポイント、ツール登録
-├── start.ps1                # 起動スクリプト（.venv 自動検出）
+├── quickstart.bat           # 初回セットアップ（ダブルクリック）
+├── start_all.bat            # 毎日の起動（ダブルクリック）
+├── doctor.bat               # 健康診断 / configure_env.bat / copilot_studio_values.bat / rotate_secrets.bat
 ├── requirements.txt
 ├── .env.example             # コピーして .env を作る
 ├── .gitignore               # 秘密・ランタイム状態・業務データを除外
 ├── LICENSE                  # MIT
+│
+├── scripts/                 # 実装スクリプト（.bat から呼ばれるヘルパー）
+│   ├── start.ps1            # 起動スクリプト（.venv 自動検出）
+│   ├── start_all.ps1        # スタック一括起動 / supervisor.ps1 / setup_devtunnel.ps1 等
+│   ├── start_companion_edge.ps1 / start_bridge.ps1   # 専用 Edge 起動
+│   ├── configure_env.ps1 / copilot_studio_values.ps1 / doctor.ps1
+│   ├── bootstrap.py         # 再開可能なブートストラップ本体
+│   └── win/                 # 内部専用の小物（edge_keeper.ps1 等）
 │
 ├── tools/
 │   ├── code_exec.py         # run_python, shell_exec
@@ -974,7 +1019,7 @@ Dev Tunnel の host 接続は、**プロセスが生きていても relay 接続
 
 ```powershell
 powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass `
-  -File .\supervisor.ps1 -TunnelName <あなたのトンネル名>
+  -File .\scripts\supervisor.ps1 -TunnelName <あなたのトンネル名>
 ```
 
 **ログオンのたびに自動起動** させたい場合（管理者権限不要。Task Scheduler が組織ポリシーで
@@ -985,7 +1030,7 @@ $startup = [Environment]::GetFolderPath('Startup')
 $root = (Get-Location).Path
 @"
 Set sh = CreateObject("WScript.Shell")
-sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$root\supervisor.ps1"" -TunnelName <あなたのトンネル名>", 0, False
+sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$root\scripts\supervisor.ps1"" -TunnelName <あなたのトンネル名>", 0, False
 "@ | Set-Content -Encoding ASCII (Join-Path $startup "start-companion-supervisor.vbs")
 ```
 
@@ -1663,9 +1708,9 @@ cd m365-copilot-companion-mcp
 and generates a `.env` with fresh random secrets:
 
 ```powershell
-.\setup.ps1
+.\scripts\setup.ps1
 # Also install external tools (devtunnel + Tesseract OCR) via winget:
-.\setup.ps1 -WithExternalTools
+.\scripts\setup.ps1 -WithExternalTools
 ```
 
 Or do it by hand:
@@ -1693,7 +1738,7 @@ python -c "import secrets; print('MCP_UNLOCK_PASSWORD=' + secrets.token_hex(8))"
 ### 3. Start the server
 
 ```powershell
-.\start.ps1
+.\scripts\start.ps1
 ```
 
 Listens on `http://127.0.0.1:8000/mcp` (Streamable HTTP).
@@ -1835,7 +1880,7 @@ Run it manually:
 
 ```powershell
 powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass `
-  -File .\supervisor.ps1 -TunnelName <your-tunnel-name>
+  -File .\scripts\supervisor.ps1 -TunnelName <your-tunnel-name>
 ```
 
 To **auto-start at every logon** (no admin needed — works even where Task
@@ -1847,7 +1892,7 @@ $startup = [Environment]::GetFolderPath('Startup')
 $root = (Get-Location).Path
 @"
 Set sh = CreateObject("WScript.Shell")
-sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$root\supervisor.ps1"" -TunnelName <your-tunnel-name>", 0, False
+sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$root\scripts\supervisor.ps1"" -TunnelName <your-tunnel-name>", 0, False
 "@ | Set-Content -Encoding ASCII (Join-Path $startup "start-companion-supervisor.vbs")
 ```
 

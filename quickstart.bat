@@ -92,7 +92,7 @@ echo ===========================================================================
 echo   Installs the devtunnel CLI (winget or direct download), signs you in
 echo   (browser or device code), creates the tunnel, and prints the PUBLIC URL.
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup_devtunnel.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\setup_devtunnel.ps1"
 REM Capture the Dev Tunnel setup exit code BEFORE any other command: a plain
 REM `set` succeeds and would RESET errorlevel to 0, so we must grab it first.
 set "DT_RC=%ERRORLEVEL%"
@@ -123,7 +123,10 @@ echo ===========================================================================
 echo   Add an MCP connector in Copilot Studio, then create your companion agent.
 echo   The 3 EXACT values to paste are printed below (full guide: README STEP 4):
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0copilot_studio_values.ps1"
+echo   Opening Copilot Studio (https://copilotstudio.microsoft.com/) in your browser...
+start "" "https://copilotstudio.microsoft.com/"
+echo.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\copilot_studio_values.ps1"
 echo   After creating the agent, open it in M365 Copilot and copy its address-bar
 echo   URL -- you will paste it into a dialog in the next step.
 echo.
@@ -137,14 +140,14 @@ echo ===========================================================================
 echo   Paste the agent URL(s) into the dialog and click Save. Leave blank any
 echo   you do not have yet -- you can re-run configure_env.bat later to add them.
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0configure_env.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\configure_env.ps1"
 
 echo.
 echo ===========================================================================
 echo  STEP 7/7  Launch the whole stack  (server + tunnel + Edge + bridge + UI)
 echo ===========================================================================
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0start_all.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start_all.ps1"
 
 echo.
 echo ===========================================================================
@@ -152,16 +155,16 @@ echo  Desktop launcher  (optional, recommended)
 echo ===========================================================================
 set /p MKLNK="   Create a one-click 'M365 Companion' launcher on your Desktop? [Y/n] "
 if /i "!MKLNK!"=="n" (
-    echo   Skipped. You can create it later by running make_desktop_shortcut.ps1
+    echo   Skipped. You can create it later by running scripts\make_desktop_shortcut.ps1
 ) else (
-    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0make_desktop_shortcut.ps1"
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\make_desktop_shortcut.ps1"
 )
 
 echo.
 echo ===========================================================================
 echo  Health check  (is every link green?)
 echo ===========================================================================
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0doctor.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\doctor.ps1"
 
 echo.
 echo ===========================================================================

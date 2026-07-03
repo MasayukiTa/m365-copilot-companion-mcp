@@ -17,7 +17,9 @@ param(
     [switch]$DeviceCode
 )
 $ErrorActionPreference = "Continue"
-$root = $PSScriptRoot
+# This script lives in <repo>\scripts; the .env it records the tunnel name/URL into is at the
+# REPO ROOT (one level up).
+$root = Split-Path -Parent $PSScriptRoot
 $DEFAULT_NAME = "m365-copilot-companion"
 
 # Run devtunnel and return stdout lines with the welcome/banner/upgrade noise stripped.
@@ -190,7 +192,7 @@ $existingNames = @($existingIds | ForEach-Object { ($_ -split '\.')[0] })
 # would rewrite .env and silently break an already-configured Copilot Studio
 # connector pointing at the old URL.
 if (-not $TunnelName) {
-    $envPath0 = Join-Path $PSScriptRoot ".env"
+    $envPath0 = Join-Path $root ".env"
     if (Test-Path $envPath0) {
         foreach ($ln in Get-Content $envPath0) {
             if ($ln -match '^MCP_TUNNEL_NAME=(.+)$') { $TunnelName = $matches[1].Trim(); break }
