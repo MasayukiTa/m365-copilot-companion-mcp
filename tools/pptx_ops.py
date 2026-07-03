@@ -40,6 +40,10 @@ def create_pptx(path: str, slides: list[dict], title: Optional[str] = None) -> s
         path: Output .pptx path under the allowed base.
         slides: Ordered list of slide spec dicts. Must contain at least one slide.
         title: Optional deck title used for file metadata.
+
+    Self-verify before reporting done: call pptx_export_png on the output, then
+    read_image on a slide or two to confirm layout/content rendered as intended.
+    Regenerate if it looks wrong.
     """
     locked = require_unlocked()
     if locked:
@@ -83,6 +87,10 @@ def pptx_from_markdown(path: str, markdown: str, title: Optional[str] = None) ->
         path: Output .pptx path under the allowed base.
         markdown: Markdown source text.
         title: Optional deck title used for file metadata.
+
+    Self-verify before reporting done: call pptx_export_png on the output, then
+    read_image on a slide or two to confirm layout/content rendered as intended.
+    Regenerate if it looks wrong.
     """
     slides = _markdown_to_slide_specs(markdown)
     if not slides:
