@@ -63,6 +63,10 @@ def _log_delete(guid, title, ok, reason):
 
 from dotenv import load_dotenv
 from relay.copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver, PROCESSING_MARKERS
+# CONSENT_MARKERS is the SAME substring list relay_fleet.RelayWorker uses to detect an MCP
+# connection-consent card in a reply -- imported (not re-listed) so the bridge and fleet never
+# drift apart on what counts as a consent card. See relay_fleet.py CONSENT_MARKERS (~line 90).
+from relay.relay_fleet import CONSENT_MARKERS
 
 load_dotenv()
 
@@ -206,8 +210,10 @@ def _wait_composer(timeout=40):
                     # surface() now returns a TRUTHFUL bool (a headed process was actually
                     # verified) -- there is no notify/toast mechanism in this file to gate,
                     # but log the real outcome so a failed auto-surface is visible in logs
-                    # rather than silently assumed to have worked.
-                    if not surface():
+                    # rather than silently assumed to have worked. Pass AGENT_URL (the bare
+                    # agent URL this bridge drives) so a headed relaunch lands on the agent
+                    # conversation instead of the launcher's default generic top page.
+                    if not surface(open_url=AGENT_URL):
                         logger.warning("_wait_composer: surface() could not confirm a headed "
                                        "companion Edge; sign-in prompt may still be hidden. "
                                        "Manual: powershell -NoProfile -ExecutionPolicy Bypass "
@@ -272,8 +278,10 @@ def _goto_settled(url, timeout=25000, tries=3, compose_wait=40):
                 if not surfaced:
                     # surface() now returns a TRUTHFUL bool (verified headed process) -- no
                     # notify/toast mechanism exists in this file, but log a real failure so
-                    # it is visible rather than silently assumed to have worked.
-                    if not surface():
+                    # it is visible rather than silently assumed to have worked. Pass the
+                    # actual target `url` so a headed relaunch lands on the conversation this
+                    # call was trying to reach, instead of the launcher's default top page.
+                    if not surface(open_url=url):
                         logger.warning("_goto_settled: surface() could not confirm a headed "
                                        "companion Edge; sign-in prompt may still be hidden. "
                                        "Manual: powershell -NoProfile -ExecutionPolicy Bypass "
@@ -692,6 +700,79 @@ def _try_delete_conversation(url, title=""):
     except Exception:
         pass
     return ok, reason
+
+
+def _looks_like_consent(text: str) -> bool:
+    """True if `text` (a Copilot reply) is an MCP connection-consent card -- the connector's
+    connection-SELECT confirm (接続マネージャーを開く / 許可 / レビュー→送信する), NOT a
+    credential sign-in. Uses the SAME markers as relay_fleet.RelayWorker (imported, not
+    re-listed) so the bridge and fleet never drift on what counts as a consent card."""
+    t = text or ""
+    tl = t.lower()
+    return any(m in t for m in CONSENT_MARKERS) or any(m in tl for m in CONSENT_MARKERS)
+
+
+def _bridge_auto_consent() -> bool:
+    """Auto-approve an MCP connection-consent card on the bridge's PAGE, mirroring
+    RelayWorker._auto_consent's three tiers -- this is a connection-SELECT confirm, NOT a
+    credential entry, so it is safe to click through with NO surface()/foreground prompt.
+    REUSES relay.edge_reconnect's shared, already-proven helpers; no click logic is
+    reimplemented here. Returns True iff a commit happened. Fully exception-guarded --
+    never raises (a failure here must not break the chat turn)."""
+    try:
+        from relay.edge_reconnect import (
+            click_through_consent, fix_all_stale_connections, load_conn_url,
+        )
+    except Exception:
+        logger.warning("_bridge_auto_consent: could not import relay.edge_reconnect helpers")
+        return False
+    pg = PAGE
+    if pg is None:
+        return False
+    # Tier 0: an Allow (許可/Allow) button directly on the current page/card -> one click.
+    try:
+        for label in ("許可", "Allow"):
+            btn = pg.locator('button:has-text("%s")' % label)
+            if btn.count():
+                btn.first.click()
+                pg.wait_for_timeout(4000)
+                return True
+    except Exception:
+        pass
+    # Tier 1: DIRECT-HIT a cached connection-manager URL (skip if it now redirects to login --
+    # that would be a genuine sign-in event, which this path must never surface for).
+    try:
+        url = load_conn_url()
+        if url:
+            from relay.edge_recover import looks_like_login
+            np = None
+            try:
+                np = pg.context.new_page()
+                np.goto(url, wait_until="domcontentloaded", timeout=45000)
+                np.wait_for_timeout(6000)
+                if not looks_like_login(np.url or ""):
+                    res = fix_all_stale_connections(np)
+                    if res.get("submitted", 0) > 0 or not res.get("stale_left", True):
+                        try:
+                            pg.bring_to_front()
+                        except Exception:
+                            pass
+                        return True
+                # cached URL 404'd / redirected to login -> fall through to Tier 2, which
+                # refreshes the cache. Deliberately do NOT clear the cache here.
+            finally:
+                if np is not None:
+                    try:
+                        np.close()
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    # Tier 2: popup flow (also (re)caches the URL and fixes ALL stale rows).
+    try:
+        return bool(click_through_consent(pg))
+    except Exception:
+        return False
 
 
 def _is_proc(t: str) -> bool:
@@ -1602,11 +1683,79 @@ class Handler(BaseHTTPRequestHandler):
         # their own framing and are NOT wrapped.
         self._stream_text(BRIDGE_DISCIPLINE + msg)
 
+    def _send_and_stream_once(self, msg: str, stream_out: bool = True) -> "str | None":
+        """Send `msg`, stream the growing/settled answer over SSE (unless stream_out=False,
+        used for the SILENT re-send after auto-consent so the consent card's own text is
+        never shown to the user), and return the final cleaned answer text (or None on the
+        outer-loop timeout / empty-body path). Raises on a driver/page error -- the caller
+        (_stream_text) owns the Esc/Stop-button and error-SSE handling, exactly as before
+        this was split out of _stream_text's inline loop."""
+        DRIVER.send(msg)
+        sent = 0
+        t0 = time.time()
+        while time.time() - t0 < 600:
+            # PARTIAL comes from the CLEAN body (markdown-reply) so loading
+            # placeholders / citations can never be the prefix. When the clean
+            # body doesn't exist yet, fall back to LOADING -- which the guard
+            # below filters if it's a status/placeholder line.
+            _pc = _clean_answer_text(); partial = _pc if _pc else _text(LOADING)
+            _cleaned = _clean_answer_text(); final = _cleaned if _cleaned else _text(LASTMSG)
+            # stream growing partial (skip "処理中" AND search-status lines)
+            if stream_out and not _is_proc(partial) and not _is_search_status(partial) and len(partial) > sent:
+                self._sse({"delta": partial[sent:]})
+                sent = len(partial)
+            # lastChatMessage populated -- but it can KEEP GROWING after it first
+            # appears, so finishing immediately truncates the tail. Stream its growth
+            # and only finish once it has been STABLE for ~1.2s.
+            if final and not _is_proc(final):
+                stable_text, stable_since = final, time.time()
+                while time.time() - t0 < 600:
+                    if stream_out and len(final) > sent:
+                        self._sse({"delta": final[sent:]})
+                        sent = len(final)
+                    # Finish ONLY when generation has ACTUALLY stopped (Copilot's Stop button
+                    # is gone) AND the text has then settled. Text-stability alone is not
+                    # enough: Copilot pauses mid-generation (slow tokens / thinking) for >1.2s,
+                    # which the old check mistook for completion -> it truncated the tail ("…ま")
+                    # AND left Copilot generating server-side, so the NEXT send hit the 240s
+                    # generation gate and surfaced "[bridge error: GenerationInProgress …]".
+                    gen_active = False
+                    try:
+                        gen_active = DRIVER._is_generating()
+                    except Exception:
+                        gen_active = False
+                    if final == stable_text and not gen_active:
+                        if time.time() - stable_since >= 1.2:
+                            break
+                    else:
+                        # text still growing OR Copilot still generating -> reset settle window
+                        stable_text, stable_since = final, time.time()
+                    time.sleep(0.3)
+                    self._ping()             # detect Esc/Stop disconnect promptly
+                    _cleaned2 = _clean_answer_text(); final = _cleaned2 if _cleaned2 else _text(LASTMSG)
+                    if _is_proc(final):
+                        final = stable_text
+                # authoritative final: the CLEAN body, regardless of any streaming artifacts
+                # (placeholder->answer cursor corruption, leaked loading lines).
+                return _clean_answer_text() or final
+            time.sleep(0.3)
+            self._ping()                     # detect Esc/Stop disconnect promptly
+        # outer-loop timeout end: same authoritative-final read
+        return _clean_answer_text()
+
     def _stream_text(self, msg: str):
         """Send `msg` to the agent and stream the answer back over the ALREADY-open
         SSE response (the normal send/stream path). Used both for plain messages and
         for prompt-template slash commands so templated answers stream like a normal
-        turn. Respects the BUSY guard; always emits a terminating `done` event."""
+        turn. Respects the BUSY guard; always emits a terminating `done` event.
+
+        MCP CONNECTION-CONSENT auto-approval (regulation: consent must be resolved FULLY
+        AUTOMATICALLY, never surfaced to the user -- only a genuine credential sign-in may
+        be surfaced). If the reply is a consent card, this SILENTLY runs the same
+        three-tier auto-consent as RelayWorker._auto_consent (reusing relay.edge_reconnect's
+        shared click-through helpers -- no click logic is reimplemented here), then RE-SENDS
+        the SAME user message once so the real answer comes back on the now-valid
+        connection. This path never calls surface(): consent is auto, not manual."""
         global BUSY
         if BUSY:
             self._sse({"delta": "[busy: 直前の応答を生成中です]"})
@@ -1614,65 +1763,36 @@ class Handler(BaseHTTPRequestHandler):
             return
         BUSY = True
         try:
-            DRIVER.send(msg)
-            sent = 0
-            t0 = time.time()
-            while time.time() - t0 < 600:
-                # PARTIAL comes from the CLEAN body (markdown-reply) so loading
-                # placeholders / citations can never be the prefix. When the clean
-                # body doesn't exist yet, fall back to LOADING -- which the guard
-                # below filters if it's a status/placeholder line.
-                _pc = _clean_answer_text(); partial = _pc if _pc else _text(LOADING)
-                _cleaned = _clean_answer_text(); final = _cleaned if _cleaned else _text(LASTMSG)
-                # stream growing partial (skip "処理中" AND search-status lines)
-                if not _is_proc(partial) and not _is_search_status(partial) and len(partial) > sent:
-                    self._sse({"delta": partial[sent:]})
-                    sent = len(partial)
-                # lastChatMessage populated -- but it can KEEP GROWING after it first
-                # appears, so finishing immediately truncates the tail. Stream its growth
-                # and only finish once it has been STABLE for ~1.2s.
-                if final and not _is_proc(final):
-                    stable_text, stable_since = final, time.time()
-                    while time.time() - t0 < 600:
-                        if len(final) > sent:
-                            self._sse({"delta": final[sent:]})
-                            sent = len(final)
-                        # Finish ONLY when generation has ACTUALLY stopped (Copilot's Stop button
-                        # is gone) AND the text has then settled. Text-stability alone is not
-                        # enough: Copilot pauses mid-generation (slow tokens / thinking) for >1.2s,
-                        # which the old check mistook for completion -> it truncated the tail ("…ま")
-                        # AND left Copilot generating server-side, so the NEXT send hit the 240s
-                        # generation gate and surfaced "[bridge error: GenerationInProgress …]".
-                        gen_active = False
-                        try:
-                            gen_active = DRIVER._is_generating()
-                        except Exception:
-                            gen_active = False
-                        if final == stable_text and not gen_active:
-                            if time.time() - stable_since >= 1.2:
-                                break
-                        else:
-                            # text still growing OR Copilot still generating -> reset settle window
-                            stable_text, stable_since = final, time.time()
-                        time.sleep(0.3)
-                        self._ping()             # detect Esc/Stop disconnect promptly
-                        _cleaned2 = _clean_answer_text(); final = _cleaned2 if _cleaned2 else _text(LASTMSG)
-                        if _is_proc(final):
-                            final = stable_text
-                    # authoritative final: send the CLEAN body as a REPLACE so the
-                    # settled message is correct regardless of any streaming artifacts
-                    # (placeholder->answer cursor corruption, leaked loading lines).
-                    _finalclean = _clean_answer_text()
-                    if _finalclean:
-                        self._sse({"replace": _finalclean})
+            final = self._send_and_stream_once(msg)
+            if final is not None and _looks_like_consent(final):
+                # Consent card, not a real answer -- do NOT show it to the user; auto-approve
+                # and retry SILENTLY (no surface(), no manual-action prompt: this is a
+                # connection-SELECT confirm, not a credential event).
+                consented = False
+                try:
+                    consented = _bridge_auto_consent()
+                except Exception:
+                    logger.warning("_bridge_auto_consent raised; treating as failed", exc_info=True)
+                    consented = False
+                if consented:
+                    try:
+                        final = self._send_and_stream_once(msg)
+                    except Exception:
+                        final = None
+                    if final is not None and _looks_like_consent(final):
+                        # still a consent card after one auto-approved retry -> give up
+                        # honestly; still no surface() (consent stays automatic-only).
+                        logger.warning("consent card persisted after auto-consent retry")
+                        self._sse({"replace": "接続の自動承認に失敗しました。再試行してください。"})
+                        self._sse({}, "done")
+                        return
+                else:
+                    logger.warning("_bridge_auto_consent: all tiers failed for a consent card")
+                    self._sse({"replace": "接続の自動承認に失敗しました。再試行してください。"})
                     self._sse({}, "done")
                     return
-                time.sleep(0.3)
-                self._ping()                     # detect Esc/Stop disconnect promptly
-            # outer-loop timeout end: same authoritative final replace
-            _finalclean = _clean_answer_text()
-            if _finalclean:
-                self._sse({"replace": _finalclean})
+            if final:
+                self._sse({"replace": final})
             self._sse({}, "done")
         except Exception as e:
             # The client hung up (the user pressed Esc/Stop) OR a real error -- either way, click

@@ -170,7 +170,22 @@ def _headed_process_present(profile_marker, cmdlines):
     return False
 
 
-def surface(port=9222, poll_timeout_s=8.0, poll_interval_s=0.5):
+def _surface_launcher_argv(ps1, flag, port, open_url=""):
+    """PURE helper (no I/O) building the powershell argv surface() shells out to -- split out
+    so the -Url plumbing is unit-testable without launching Edge. `open_url` is threaded
+    through as -Url ONLY when both it is non-empty AND flag=='-Foreground': that is the one
+    path that can actually (re)launch the browser (headless->headed kill+relaunch, or a fresh
+    launch), so it is the only path where a target URL means anything. -Surface merely raises
+    an already-headed window -- it never navigates -- so -Url would be a no-op there and is
+    deliberately omitted to match the launcher's own -Surface behavior."""
+    argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
+            flag, "-Port", str(port)]
+    if open_url and flag == "-Foreground":
+        argv += ["-Url", open_url]
+    return argv
+
+
+def surface(port=9222, poll_timeout_s=8.0, poll_interval_s=0.5, open_url=""):
     """Bring the (minimized/background/headless) companion Edge to the foreground --
     used when sign-in is required so the user can complete it. Shells out to the
     launcher; no Playwright, thread-safe (swallows errors, never raises).
@@ -189,7 +204,14 @@ def surface(port=9222, poll_timeout_s=8.0, poll_interval_s=0.5):
     If the running instance is already HEADED, we invoke -Surface (raise the existing
     window) and treat "a headed process for this profile exists" as success -- the
     launcher's own window-find can fail silently (e.g. race, no top-level window yet),
-    so we verify independently via the process list rather than trusting its exit code."""
+    so we verify independently via the process list rather than trusting its exit code.
+
+    `open_url` (optional): when a HEADED RELAUNCH actually happens (the headless->headed
+    swap, or Edge was not running at all), pass this through as the launcher's -Url so the
+    window lands on the caller's target conversation (e.g. the agent URL being driven for
+    a genuine sign-in) instead of the launcher's default generic top page. Default ""
+    preserves the old behavior exactly (launcher's own default $Url). Ignored on the plain
+    -Surface path (raising an already-headed window never navigates it)."""
     import subprocess
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ps1 = os.path.join(repo, "scripts", "start_companion_edge.ps1")
@@ -204,8 +226,7 @@ def surface(port=9222, poll_timeout_s=8.0, poll_interval_s=0.5):
     profile = _profile_for_port(port)
     try:
         subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
-             flag, "-Port", str(port)],
+            _surface_launcher_argv(ps1, flag, port, open_url),
             cwd=repo, timeout=60 if flag == "-Foreground" else 15,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:

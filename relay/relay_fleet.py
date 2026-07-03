@@ -140,13 +140,17 @@ def edge_recover_looks_like_login(url):
         return False
 
 
-def edge_recover_surface(port=None):
+def edge_recover_surface(port=None, open_url=""):
     """Surface (foreground / headed-relaunch) the companion Edge. Passes `port` through only
     when given, so surface()'s own default (9222) still applies when we don't need a specific
-    port. Returns True/False; never raises."""
+    port. `open_url` (optional) is forwarded to surface()'s open_url -- on a genuine sign-in
+    surface, callers should pass the agent URL they were driving so a headed relaunch lands on
+    that conversation instead of the launcher's default top page. "" preserves old behavior.
+    Returns True/False; never raises."""
     try:
         from .edge_recover import surface
-        return bool(surface(port) if port is not None else surface())
+        kwargs = {"open_url": open_url} if open_url else {}
+        return bool(surface(port, **kwargs) if port is not None else surface(**kwargs))
     except Exception:
         return False
 
@@ -543,7 +547,10 @@ def _open_fresh(context, url):
                 u = pg.url or ""
                 if looks_like_login(u):
                     if not surfaced:
-                        surface(); surfaced = True
+                        # thread the target agent URL through so a headed relaunch (if the
+                        # companion Edge is headless) lands on this conversation, not the
+                        # launcher's default generic top page.
+                        surface(open_url=url); surfaced = True
                     touch_pause()          # keep the keeper backed off through a long login
                 elif u == "about:blank" and k >= 3:
                     break                  # stuck on about:blank -> re-navigate
@@ -1384,58 +1391,38 @@ class RelayWorker:
         # pattern, bail FAST after a few, and go STUCK so the goal can be re-submitted on a healthy
         # agent rather than wasting the whole turn budget on a dead endpoint.
         _low = resp.lower()
-        # CONNECTION-CONSENT (interactive auth) -- a FOREGROUND-required event. The agent's tool
-        # call returned the connector's consent card instead of a result. Surface the (headless)
-        # Edge to the foreground on the FIRST occurrence so the user can authorize the connection
-        # in that very Edge, then STUCK fast (do not loop the card to MAXTURNS).
+        # CONNECTION-CONSENT -- NOT a credential/sign-in event (regulation: MCP connection-
+        # consent must be resolved FULLY AUTOMATICALLY; only genuine sign-in may surface the
+        # Edge). The agent's tool call returned the connector's connection-SELECT confirm card
+        # instead of a result. AUTO-CONSENT: the relay clicks it through (接続マネージャー ->
+        # レビュー -> 送信する / 許可) via the same three-tier _auto_consent() and re-invokes the
+        # tool via RETRY_JOB. If auto-consent fails, this NEVER calls surface() and NEVER emits
+        # a "前面に出しました" notification -- consent is automatic-only, never manual. On
+        # persistent failure the worker goes STUCK with an actionable (non-surface) reason so
+        # the goal can be re-queued once the connection is fixed out-of-band (edge_reconnect).
         if any(m in resp for m in CONSENT_MARKERS) or any(m in _low for m in CONSENT_MARKERS):
             self._consent_streak += 1
-            # AUTO-CONSENT first: the card is a connection-SELECT confirm, not a credential entry,
-            # so the relay clicks through it (接続マネージャー -> レビュー -> 送信する) and re-invokes
-            # the tool via RETRY_JOB. Manual surfacing is only a fallback when the click-through
-            # can't complete (DOM changed / popup blocked).
             if not self._consent_auto_tried:
                 self._consent_auto_tried = True
                 if self._auto_consent():
                     self.job = self._task_anchor(RETRY_JOB)
                     self.reason = "auto-consent: 接続を確定し再呼出"
                     return
-            # fallback: surface the (headless) Edge ONCE so the user can authorize manually
-            if not self._consent_surfaced:
-                self._consent_surfaced = True
-                surfaced_ok = False
-                try:
-                    from .edge_recover import surface
-                    surfaced_ok = surface()
-                except Exception:
-                    surfaced_ok = False
-                self._consent_surfaced_ok = surfaced_ok
-                try:
-                    if surfaced_ok:
-                        default_notify("⚠ 接続の承認が必要",
-                                       "自動承認に失敗。専用Edgeを前面に出しました。MCP接続を承認してください (%s)" % self.name)
-                    else:
-                        default_notify("⚠ 接続の承認が必要 (自動表示も失敗)",
-                                       "自動承認に失敗し、専用Edgeを自動で前面に出すことも失敗しました。"
-                                       "手動で次を実行してください: powershell -NoProfile -ExecutionPolicy Bypass "
-                                       "-File scripts\\start_companion_edge.ps1 -Foreground (%s)" % self.name)
-                except Exception:
-                    pass
             if self._consent_streak >= 2:
                 self.status, self.outcome = "stuck", "STUCK"
-                if getattr(self, "_consent_surfaced_ok", False):
-                    self.reason = ("⚠ MCPコネクタの**接続承認(consent)が未完**で自動承認も失敗。エージェントは"
-                                   "ツールを呼ぶ度に「接続マネージャーを開く」カードを返している。タスク失敗ではなく"
-                                   "**接続未確立**。→ 前面に出した**専用Edge**で接続を承認(consentは当該ブラウザ"
-                                   "専用・他で承認しても無効)してから再投入を。")
-                else:
-                    self.reason = ("⚠ MCPコネクタの**接続承認(consent)が未完**で自動承認も失敗。さらに専用Edgeを"
-                                   "自動で前面に出すことにも失敗した(ヘッドレス→ヘッドフル切替が確認できず)。"
-                                   "→ 手動で `powershell -NoProfile -ExecutionPolicy Bypass -File "
-                                   "scripts\\start_companion_edge.ps1 -Foreground` を実行してEdgeで接続を承認"
-                                   "してから再投入を。")
+                self.reason = ("⚠ MCP接続の自動承認に失敗。edge_reconnect を再実行するか接続を確認: "
+                               "python -m relay.edge_reconnect (または --reconnect-url で該当の "
+                               "user-connections ページを直接指定)。エージェントはツールを呼ぶ度に"
+                               "「接続マネージャーを開く」カードを返している。タスク失敗ではなく"
+                               "**接続未確立**。接続を修復後、このゴールを再投入してください。")
+                try:
+                    default_notify("⚠ MCP接続の自動承認に失敗",
+                                   "edge_reconnect を再実行するか接続を確認してください (%s)" % self.name)
+                except Exception:
+                    pass
                 return
             self.job = self._task_anchor(RETRY_JOB)
+            self.reason = "auto-consent 失敗 -> 再試行 (%d)" % self._consent_streak
             return
         # UNLOCK-REQUIRED: a write/exec tool hit a locked client IP. Auto-inject unlock(password)
         # with the LOCAL .env password (NOT the agent's persistent instructions), then resume the
@@ -1505,7 +1492,10 @@ class RelayWorker:
                         self._signin_surfaced = True
                         surfaced_ok = False
                         try:
-                            surfaced_ok = edge_recover_surface()
+                            # pass the agent URL this worker is driving so the headed
+                            # relaunch (if one happens) lands on the real conversation,
+                            # not the launcher's default generic top page.
+                            surfaced_ok = edge_recover_surface(open_url=self._agent_url)
                         except Exception:
                             surfaced_ok = False
                         self._signin_surfaced_ok = surfaced_ok
@@ -1567,7 +1557,10 @@ class RelayWorker:
                     self._headed_recovery_done = True
                     surfaced_ok = False
                     try:
-                        surfaced_ok = edge_recover_surface(port=_companion_cdp_port())
+                        # pass the agent URL so the forced headed relaunch lands on the real
+                        # conversation instead of the launcher's default generic top page.
+                        surfaced_ok = edge_recover_surface(port=_companion_cdp_port(),
+                                                           open_url=self._agent_url)
                     except Exception:
                         surfaced_ok = False
                     try:
