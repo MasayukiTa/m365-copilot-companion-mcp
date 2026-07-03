@@ -203,7 +203,15 @@ def _wait_composer(timeout=40):
             from relay.edge_recover import surface, looks_like_login, touch_pause
             if looks_like_login(PAGE.url):
                 if not surfaced:
-                    surface()
+                    # surface() now returns a TRUTHFUL bool (a headed process was actually
+                    # verified) -- there is no notify/toast mechanism in this file to gate,
+                    # but log the real outcome so a failed auto-surface is visible in logs
+                    # rather than silently assumed to have worked.
+                    if not surface():
+                        logger.warning("_wait_composer: surface() could not confirm a headed "
+                                       "companion Edge; sign-in prompt may still be hidden. "
+                                       "Manual: powershell -NoProfile -ExecutionPolicy Bypass "
+                                       "-File scripts\\start_companion_edge.ps1 -Foreground")
                     surfaced = True
                 touch_pause()
         except Exception:
@@ -262,7 +270,14 @@ def _goto_settled(url, timeout=25000, tries=3, compose_wait=40):
                 # Surface once so the user can sign in; keep the keeper backed off while the
                 # login page is still showing so a slow MFA login is not re-minimized.
                 if not surfaced:
-                    surface()
+                    # surface() now returns a TRUTHFUL bool (verified headed process) -- no
+                    # notify/toast mechanism exists in this file, but log a real failure so
+                    # it is visible rather than silently assumed to have worked.
+                    if not surface():
+                        logger.warning("_goto_settled: surface() could not confirm a headed "
+                                       "companion Edge; sign-in prompt may still be hidden. "
+                                       "Manual: powershell -NoProfile -ExecutionPolicy Bypass "
+                                       "-File scripts\\start_companion_edge.ps1 -Foreground")
                     surfaced = True
                 touch_pause()
         except Exception:

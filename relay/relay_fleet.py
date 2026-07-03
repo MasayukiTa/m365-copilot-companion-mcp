@@ -712,12 +712,14 @@ class RelayWorker:
         self._consent_streak = 0        # consecutive MCP connection-consent cards (auth needed)
         self._consent_auto_tried = False  # attempted the automatic click-through once
         self._consent_surfaced = False  # surfaced the Edge once (manual fallback)
+        self._consent_surfaced_ok = False  # TRUTHFUL result of that surface() call (see edge_recover.surface)
         # CANNED-NONANSWER recovery (headless->default-Copilot fallback). Consecutive canned
         # non-answers, plus one-shot flags for the two escalations (surface-for-signin, and the
         # fleet-wide headed relaunch). See _decide's canned-non-answer handler.
         self._canned_streak = 0         # consecutive canned "couldn't respond" replies
         self._canned_ts = 0.0           # wall-clock start of the current canned-non-answer streak
         self._signin_surfaced = False   # surfaced the Edge once for interactive sign-in
+        self._signin_surfaced_ok = False  # TRUTHFUL result of that surface() call (see edge_recover.surface)
         self._headed_recovery_done = False  # forced a HEADED companion relaunch once (last resort)
         self._unlock_attempts = 0       # auto-injected unlock(password) turns (write/exec gate)
         self._recycles = 0              # fresh-conversation recycles after a token-limit exhaustion
@@ -1401,22 +1403,37 @@ class RelayWorker:
             # fallback: surface the (headless) Edge ONCE so the user can authorize manually
             if not self._consent_surfaced:
                 self._consent_surfaced = True
+                surfaced_ok = False
                 try:
                     from .edge_recover import surface
-                    surface()
+                    surfaced_ok = surface()
                 except Exception:
-                    pass
+                    surfaced_ok = False
+                self._consent_surfaced_ok = surfaced_ok
                 try:
-                    default_notify("⚠ 接続の承認が必要",
-                                   "自動承認に失敗。専用Edgeを前面に出しました。MCP接続を承認してください (%s)" % self.name)
+                    if surfaced_ok:
+                        default_notify("⚠ 接続の承認が必要",
+                                       "自動承認に失敗。専用Edgeを前面に出しました。MCP接続を承認してください (%s)" % self.name)
+                    else:
+                        default_notify("⚠ 接続の承認が必要 (自動表示も失敗)",
+                                       "自動承認に失敗し、専用Edgeを自動で前面に出すことも失敗しました。"
+                                       "手動で次を実行してください: powershell -NoProfile -ExecutionPolicy Bypass "
+                                       "-File scripts\\start_companion_edge.ps1 -Foreground (%s)" % self.name)
                 except Exception:
                     pass
             if self._consent_streak >= 2:
                 self.status, self.outcome = "stuck", "STUCK"
-                self.reason = ("⚠ MCPコネクタの**接続承認(consent)が未完**で自動承認も失敗。エージェントは"
-                               "ツールを呼ぶ度に「接続マネージャーを開く」カードを返している。タスク失敗ではなく"
-                               "**接続未確立**。→ 前面に出した**専用Edge**で接続を承認(consentは当該ブラウザ"
-                               "専用・他で承認しても無効)してから再投入を。")
+                if getattr(self, "_consent_surfaced_ok", False):
+                    self.reason = ("⚠ MCPコネクタの**接続承認(consent)が未完**で自動承認も失敗。エージェントは"
+                                   "ツールを呼ぶ度に「接続マネージャーを開く」カードを返している。タスク失敗ではなく"
+                                   "**接続未確立**。→ 前面に出した**専用Edge**で接続を承認(consentは当該ブラウザ"
+                                   "専用・他で承認しても無効)してから再投入を。")
+                else:
+                    self.reason = ("⚠ MCPコネクタの**接続承認(consent)が未完**で自動承認も失敗。さらに専用Edgeを"
+                                   "自動で前面に出すことにも失敗した(ヘッドレス→ヘッドフル切替が確認できず)。"
+                                   "→ 手動で `powershell -NoProfile -ExecutionPolicy Bypass -File "
+                                   "scripts\\start_companion_edge.ps1 -Foreground` を実行してEdgeで接続を承認"
+                                   "してから再投入を。")
                 return
             self.job = self._task_anchor(RETRY_JOB)
             return
@@ -1486,27 +1503,47 @@ class RelayWorker:
                 if on_login:
                     if not self._signin_surfaced:
                         self._signin_surfaced = True
+                        surfaced_ok = False
                         try:
-                            edge_recover_surface()
+                            surfaced_ok = edge_recover_surface()
                         except Exception:
-                            pass
+                            surfaced_ok = False
+                        self._signin_surfaced_ok = surfaced_ok
                         try:
-                            default_notify("⚠ サインインが必要",
-                                           "専用Edgeを前面に出しました。サインインしてください (%s)" % self.name)
+                            if surfaced_ok:
+                                default_notify("⚠ サインインが必要",
+                                               "専用Edgeを前面に出しました。サインインしてください (%s)" % self.name)
+                            else:
+                                default_notify("⚠ サインインが必要 (自動表示も失敗)",
+                                               "専用Edgeを自動で前面に出すことに失敗しました。手動で次を実行して"
+                                               "サインインしてください: powershell -NoProfile -ExecutionPolicy "
+                                               "Bypass -File scripts\\start_companion_edge.ps1 -Foreground (%s)"
+                                               % self.name)
                         except Exception:
                             pass
                     if (now - self._canned_ts) > CANNED_LOGIN_WINDOW_S \
                             or self._canned_streak >= CANNED_LOGIN_MAX:
                         self.status, self.outcome = "stuck", "INFRA_STUCK"
-                        self.reason = ("⚠ 定型の無回答が継続し、セッションはサインイン待ち。前面に出した"
-                                       "**専用Edgeでサインイン**してから再投入してください。**タスク失敗でなく"
-                                       "サインイン未完(INFRA)**=再投入対象。")
+                        if getattr(self, "_signin_surfaced_ok", False):
+                            self.reason = ("⚠ 定型の無回答が継続し、セッションはサインイン待ち。前面に出した"
+                                           "**専用Edgeでサインイン**してから再投入してください。**タスク失敗でなく"
+                                           "サインイン未完(INFRA)**=再投入対象。")
+                        else:
+                            self.reason = ("⚠ 定型の無回答が継続し、セッションはサインイン待ち。さらに専用Edgeを"
+                                           "自動で前面に出すことにも失敗した。→ 手動で `powershell -NoProfile "
+                                           "-ExecutionPolicy Bypass -File scripts\\start_companion_edge.ps1 "
+                                           "-Foreground` を実行してサインインしてから再投入してください。"
+                                           "**タスク失敗でなくサインイン未完(INFRA)**=再投入対象。")
                         return
                     self.job = self._task_anchor(RETRY_JOB)
                     self._cooldown_until = now + transient_backoff(2)
                     self.status = "ready"
-                    self.reason = ("サインイン待ち(定型無回答) -> 専用Edgeでサインイン後に自動再試行 "
-                                   "(%d回)" % self._canned_streak)
+                    if getattr(self, "_signin_surfaced_ok", False) or not self._signin_surfaced:
+                        self.reason = ("サインイン待ち(定型無回答) -> 専用Edgeでサインイン後に自動再試行 "
+                                       "(%d回)" % self._canned_streak)
+                    else:
+                        self.reason = ("サインイン待ち(定型無回答)、専用Edgeの自動表示は失敗 -> 手動でEdgeを"
+                                       "前面に出してサインイン後に自動再試行 (%d回)" % self._canned_streak)
                     return
                 # (b) NOT a login wall = the headless->default-Copilot fallback. PREFER the cheap,
                 # per-tab redirect recovery: re-navigate the tab back to the agent URL. If it
@@ -1528,20 +1565,34 @@ class RelayWorker:
                 if self._redirect_renavs >= self.max_redirect_renavs \
                         and not self._headed_recovery_done:
                     self._headed_recovery_done = True
+                    surfaced_ok = False
                     try:
-                        edge_recover_surface(port=_companion_cdp_port())
+                        surfaced_ok = edge_recover_surface(port=_companion_cdp_port())
                     except Exception:
-                        pass
+                        surfaced_ok = False
                     try:
-                        default_notify("🖥 ヘッドフル復旧",
-                                       "定型無回答が解消せず、専用Edgeをヘッドフルで再起動しました (%s)" % self.name)
+                        if surfaced_ok:
+                            default_notify("🖥 ヘッドフル復旧",
+                                           "定型無回答が解消せず、専用Edgeをヘッドフルで再起動しました (%s)" % self.name)
+                        else:
+                            default_notify("⚠ ヘッドフル復旧に失敗",
+                                           "定型無回答が解消せず自動でヘッドフル再起動を試みましたが失敗しました。"
+                                           "手動で次を実行してください: powershell -NoProfile -ExecutionPolicy "
+                                           "Bypass -File scripts\\start_companion_edge.ps1 -Foreground -Port %d (%s)"
+                                           % (_companion_cdp_port(), self.name))
                     except Exception:
                         pass
                     self.job = self._task_anchor(RETRY_JOB)
                     self._cooldown_until = now + transient_backoff(3)
                     self.status = "ready"
-                    self.reason = ("定型無回答が再ナビでも解消せず -> **専用Edgeをヘッドフル再起動**して"
-                                   "再投入(最終手段・1回のみ)")
+                    if surfaced_ok:
+                        self.reason = ("定型無回答が再ナビでも解消せず -> **専用Edgeをヘッドフル再起動**して"
+                                       "再投入(最終手段・1回のみ)")
+                    else:
+                        self.reason = ("定型無回答が再ナビでも解消せず、**専用Edgeのヘッドフル再起動も失敗**"
+                                       "(ヘッドレス→ヘッドフル切替を確認できず)。→ 手動で `powershell -NoProfile "
+                                       "-ExecutionPolicy Bypass -File scripts\\start_companion_edge.ps1 "
+                                       "-Foreground` を実行してから再投入してください。")
                     return
                 # nothing left to try: infra-classified STUCK (re-queueable, NOT a coding miss)
                 self.status, self.outcome = "stuck", "INFRA_STUCK"

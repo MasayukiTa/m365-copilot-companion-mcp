@@ -11,6 +11,15 @@ WHY one-by-one (and not just X-ing the window or killing the process):
   stalls because the dedicated Edge stops responding: close every tab here, then the
   fleet / bridge can proceed on a fresh tab.
 
+NOTE on surface() truthfulness (fixed 2026-07-04): surface() now reflects REAL success --
+  it verifies (via the live msedge process list, see _headed_process_present()) that a
+  headed companion-Edge process actually exists after the launcher call, and returns
+  False if not, instead of returning True whenever subprocess.run merely didn't throw.
+  Callers MUST gate any "surfaced!" notification on this return value. One inherent
+  limitation remains: a caller process that is already running with the OLD surface()
+  loaded in memory keeps the old (always-True) behavior until it is restarted -- fixing
+  the source file does not retroactively patch a live process's imported bytecode.
+
 Usage:
   python -m relay.edge_recover               # close all tabs, leave one blank tab
   python -m relay.edge_recover --to-agent    # ... and open a fresh agent chat instead
@@ -109,15 +118,78 @@ def _surface_flag(port, fleet_dir):
     return "-Foreground" if _read_mode(fleet_dir, port) == "headless" else "-Surface"
 
 
-def surface(port=9222):
+def _msedge_cmdlines():
+    """Snapshot of ' '.join(cmdline) for every currently-running msedge.exe process.
+    Returns [] (never raises) if psutil is unavailable or enumeration fails -- callers
+    must treat that the same as "no matching process found", not as an error."""
+    try:
+        import psutil
+    except Exception:
+        return []
+    out = []
+    try:
+        for p in psutil.process_iter(["name", "cmdline"]):
+            try:
+                nm = (p.info.get("name") or "").lower()
+                if "msedge" not in nm:
+                    continue
+                out.append(" ".join(p.info.get("cmdline") or []))
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return out
+
+
+def _headed_process_present(profile_marker, cmdlines):
+    """PURE decision helper (no I/O, no psutil call of its own) -- unit-testable with a
+    synthetic cmdlines list. Given the msedge cmdlines currently running (as produced by
+    _msedge_cmdlines()) and the profile marker for a port (_profile_for_port(port)),
+    decide whether a HEADED companion-Edge MAIN BROWSER process for that profile exists.
+
+    True  <-> some MAIN BROWSER process cmdline mentions `profile_marker` AND does NOT
+              contain '--headless'.
+    False <-> no matching main-browser process at all, or every matching one is headless.
+
+    CRITICAL: only the main browser process's cmdline carries (or omits) '--headless=new'.
+    Its child processes (--type=renderer / gpu-process / utility / crashpad-handler / ...)
+    inherit --user-data-dir (so they DO contain profile_marker) but do NOT repeat
+    '--headless' even when the browser is running fully headless -- verified directly
+    against a live 'Get-CimInstance Win32_Process -Filter "Name=\\'msedge.exe\\'"' listing.
+    A helper that scanned every child process would misclassify a headless instance as
+    headed just because one of its non-main subprocesses lacks the flag. We therefore
+    restrict the scan to processes WITHOUT a '--type=' argument, which is exactly the
+    main browser process (its child processes always carry --type=)."""
+    for cmd in cmdlines:
+        if profile_marker not in cmd:
+            continue
+        if "--type=" in cmd:
+            continue  # a child process (renderer/gpu/utility/crashpad/...), not the main browser
+        if "--headless" not in cmd:
+            return True
+    return False
+
+
+def surface(port=9222, poll_timeout_s=8.0, poll_interval_s=0.5):
     """Bring the (minimized/background/headless) companion Edge to the foreground --
     used when sign-in is required so the user can complete it. Shells out to the
-    launcher; no Playwright, thread-safe (swallows errors). Returns True/False.
+    launcher; no Playwright, thread-safe (swallows errors, never raises).
+
+    Returns a TRUTHFUL bool: whether a headed (foreground-able) companion Edge process
+    for this port's profile actually exists after the attempt -- NOT merely whether the
+    subprocess call didn't throw. Callers MUST gate their "surfaced!" notification on
+    this return value; a stale caller that ignores it and always claims success is
+    exactly the bug this function used to have.
 
     If the running instance is HEADLESS there is no window to raise, so we invoke the
     launcher with -Foreground: it now kills the headless instance and relaunches HEADED
-    (see start_companion_edge.ps1). Otherwise -Surface just restores/foregrounds the
-    existing window."""
+    (see start_companion_edge.ps1). Relaunching takes a moment, so we poll briefly
+    (up to `poll_timeout_s`) for a headed process for this profile to appear.
+
+    If the running instance is already HEADED, we invoke -Surface (raise the existing
+    window) and treat "a headed process for this profile exists" as success -- the
+    launcher's own window-find can fail silently (e.g. race, no top-level window yet),
+    so we verify independently via the process list rather than trusting its exit code."""
     import subprocess
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ps1 = os.path.join(repo, "scripts", "start_companion_edge.ps1")
@@ -129,15 +201,26 @@ def surface(port=9222):
     except Exception:
         pass
     flag = _surface_flag(port, fleet)
+    profile = _profile_for_port(port)
     try:
         subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
              flag, "-Port", str(port)],
             cwd=repo, timeout=60 if flag == "-Foreground" else 15,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
     except Exception:
         return False
+    # Verify the REAL outcome rather than trusting subprocess.run's exit code. A -Foreground
+    # headless->headed swap needs a moment to kill+relaunch, so poll briefly; -Surface on an
+    # already-headed process should be near-instant but a short poll costs little and covers
+    # any race between the launcher's SetForegroundWindow and our check.
+    deadline = time.time() + max(0.0, poll_timeout_s)
+    while True:
+        if _headed_process_present(profile, _msedge_cmdlines()):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(max(0.05, poll_interval_s))
 
 
 def touch_pause():
