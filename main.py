@@ -326,6 +326,36 @@ try:
 except Exception:
     pass
 
+# --- Resource pilot (MCP spec 21.3.2 / Quick Reference 28.17) ---------------------------
+# ADDITIVE ONLY: model side-effect-free READ data as MCP Resources, a primitive distinct
+# from Tools (separate manager/cap -- see tools/resource_ops.py docstring). This does not
+# remove, wrap, or alter any existing tool; it only adds a few read-only URIs alongside
+# them. Each registration is individually best-effort so a failure here can never stop the
+# server (mirrors the forged-tools try/except above).
+try:
+    from tools.resource_ops import file_resource, jobs_resource, server_info_resource
+
+    try:
+        mcp.resource("companion://server/info")(server_info_resource)
+    except Exception:
+        pass
+    try:
+        # Templated resource: companion://file/{path*} -- the RFC 6570 wildcard form
+        # ({path*}, not {path}) is required because a plain {path} segment cannot
+        # contain "/", and a real filesystem path needs multiple segments. Same
+        # _validate_path guardrail as the read_file tool (see
+        # tools/resource_ops.file_resource docstring).
+        mcp.resource("companion://file/{path*}")(file_resource)
+    except Exception:
+        pass
+    try:
+        mcp.resource("companion://jobs/list")(jobs_resource)
+    except Exception:
+        pass
+except Exception:
+    pass
+# ----------------------------------------------------------------------------------------
+
 
 def _install_faulthandler() -> None:
     """Dump every thread's stack to a file periodically so a wedged event loop leaves a
