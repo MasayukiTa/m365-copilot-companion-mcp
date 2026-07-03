@@ -310,8 +310,37 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
     TOOLS = tuple(_head + _rest[: max(0, _MAX - len(_head))])
 # ----------------------------------------------------------------------------------------
 
+# --- Tool annotations (MCP spec §21.5.3 / §21.6.2) --------------------------------------
+# readOnlyHint / destructiveHint / idempotentHint / openWorldHint let a connected HOST
+# drive its consent UI (e.g. auto-approve read-only tools) instead of prompting uniformly
+# for every tool. See tools/tool_annotations.py for the derivation: readOnlyHint is
+# derived mechanically from static source inspection (no require_unlocked() call = read
+# only); the other three hints come from a small, hand-curated override table. Best-effort
+# per-tool: a failure computing or attaching annotations for one tool must never stop the
+# others from registering.
+try:
+    from tools.tool_annotations import build_annotations
+
+    # Compute annotations over the FULL tool set (_ALL_TOOLS), not the possibly-
+    # truncated TOOLS: in MCP_TOOL_MAP gateway mode TOOLS is a small subset, and the
+    # override-table consistency check (every destructiveHint tool must be gated) would
+    # otherwise see mutating tools as "absent" and fail -> crash the server on startup.
+    # Annotations are keyed by name and applied to whichever subset registers below.
+    _TOOL_ANNOTATIONS = build_annotations(list(_ALL_TOOLS.values()))
+except Exception:
+    _TOOL_ANNOTATIONS = {}
+
 for tool in TOOLS:
-    mcp.tool()(register(tool))
+    _name = getattr(tool, "__name__", "")
+    _ann = _TOOL_ANNOTATIONS.get(_name)
+    try:
+        if _ann:
+            mcp.tool(annotations=_ann)(register(tool))
+        else:
+            mcp.tool()(register(tool))
+    except Exception:
+        # Never let one tool's annotation attachment block the rest of registration.
+        mcp.tool()(register(tool))
 
 # Auto-register forged tools (operator A). Safe when tools/auto is empty:
 # load_auto_tools() returns [] and any failing forged module is skipped.
