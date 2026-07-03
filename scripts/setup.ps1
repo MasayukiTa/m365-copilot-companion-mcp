@@ -34,7 +34,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-Set-Location -Path $PSScriptRoot
+# This script lives in <repo>\scripts. All the artifacts it manages (.venv, requirements.txt,
+# .env, .env.example) are at the REPO ROOT, so cd there and resolve repo-root paths against it.
+# Sibling scripts (setup_devtunnel.ps1) are still referenced via $PSScriptRoot.
+$repoRoot = Split-Path -Parent $PSScriptRoot
+Set-Location -Path $repoRoot
 
 function Write-Step($msg)  { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)    { Write-Host "    OK: $msg" -ForegroundColor Green }
@@ -67,7 +71,7 @@ Write-Ok "Using '$pythonCmd' ($ver)"
 # 2. Virtual environment
 # ---------------------------------------------------------------------------
 Write-Step "Creating virtual environment (.venv)"
-$venvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+$venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
 if ($Force -and (Test-Path ".venv")) {
     Write-Warn2 "Removing existing .venv (-Force)"
     Remove-Item -Recurse -Force ".venv"
@@ -158,7 +162,7 @@ if ($WithExternalTools) {
         # that left a fresh machine with no CLI, no sign-in, and no URL. See docs/STARTUP_devtunnel_login.md.
         Write-Host "    Dev Tunnels: running setup_devtunnel.ps1 (install + sign-in + tunnel + URL)..." -ForegroundColor Cyan
         try { & (Join-Path $PSScriptRoot "setup_devtunnel.ps1") }
-        catch { Write-Warn2 "setup_devtunnel.ps1 failed: $($_.Exception.Message) -- run '.\setup_devtunnel.ps1' manually." }
+        catch { Write-Warn2 "setup_devtunnel.ps1 failed: $($_.Exception.Message) -- run '.\scripts\setup_devtunnel.ps1' manually." }
 
         Write-Host "    Not installable via winget (install manually only if you need them):" -ForegroundColor Yellow
         Write-Host "      - Microsoft PowerPoint / Outlook  (for pptx_export_png / outlook_* tools)" -ForegroundColor Yellow
@@ -176,9 +180,9 @@ if ($WithExternalTools) {
 Write-Host ""
 Write-Host "Setup complete." -ForegroundColor Green
 Write-Host "Next steps:" -ForegroundColor Green
-Write-Host "  1. Start the MCP server:        .\start.ps1"
+Write-Host "  1. Start the MCP server:        .\scripts\start.ps1"
 Write-Host "  2. (Remote clients) sign in to Dev Tunnels ONCE, then host + keep alive:"
 Write-Host "       devtunnel login          # one-time interactive sign-in (persists across reboots) -- BEFORE the supervisor"
-Write-Host "       .\supervisor.ps1 -TunnelName <your-tunnel-name>"
+Write-Host "       .\scripts\supervisor.ps1 -TunnelName <your-tunnel-name>"
 Write-Host "  3. Point your MCP client at http://localhost:8000/mcp with header"
 Write-Host "       Authorization: Bearer <MCP_API_KEY from .env>"

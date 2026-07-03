@@ -4,8 +4,10 @@
 #  is copy-the-3-lines instead of guessing URLs/headers. ASCII / ENGLISH ONLY.
 # =============================================================================
 $ErrorActionPreference = "SilentlyContinue"
-$repo = $PSScriptRoot
-if (-not $repo) { $repo = Split-Path -Parent $MyInvocation.MyCommand.Path }
+# This script lives in <repo>\scripts; the .env it reads is at the REPO ROOT (one level up).
+$scriptDir = $PSScriptRoot
+if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
+$repo = Split-Path -Parent $scriptDir
 
 $envv = @{}
 $p = Join-Path $repo ".env"

@@ -6,6 +6,6 @@ REM  exact fix for each red line. ASCII / ENGLISH ONLY.
 REM ===========================================================================
 setlocal
 cd /d "%~dp0"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0doctor.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\doctor.ps1"
 echo.
 pause

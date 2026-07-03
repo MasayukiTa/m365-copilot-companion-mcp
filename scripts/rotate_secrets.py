@@ -217,7 +217,7 @@ def main(argv=None) -> int:
     print("            Where-Object { $_.CommandLine -like '*main.py*' } |")
     print("            ForEach-Object { Stop-Process -Id $_.ProcessId -Force }")
     print("        (supervisor.ps1 detects the dead instance and starts a fresh one), OR")
-    print("     b) Re-run  .\\start_all.ps1  from the repo root.")
+    print("     b) Re-run  start_all.bat  (or .\\scripts\\start_all.ps1) from the repo root.")
 
     print("=" * 70)
     print("If anything looks wrong, the previous .env is saved as .env.bak")

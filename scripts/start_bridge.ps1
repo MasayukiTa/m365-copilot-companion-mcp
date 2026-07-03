@@ -34,7 +34,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$root = $PSScriptRoot
+# This script lives in <repo>\scripts. $root is the REPO ROOT (.venv, bridge\ live there);
+# the sibling start_companion_edge.ps1 is referenced via $PSScriptRoot below.
+$root = Split-Path -Parent $PSScriptRoot
 
 # Bring up the dedicated bridge Edge (separate profile + port). HEADLESS by default -- no window,
 # no taskbar flash, zero foreground interference; the profile's SSO persists so it just connects.
@@ -48,7 +50,7 @@ function Ensure-Edge([switch]$Hard, [switch]$Visible) {
     $p = @{ Port = $CdpPort; Profile = $Profile }
     if ($Visible) { $p["Foreground"] = $true } else { $p["Headless"] = $true }
     if ($Hard)    { $p["HardReset"]  = $true }
-    & (Join-Path $root "start_companion_edge.ps1") @p
+    & (Join-Path $PSScriptRoot "start_companion_edge.ps1") @p
     return ($LASTEXITCODE -eq 0)
 }
 

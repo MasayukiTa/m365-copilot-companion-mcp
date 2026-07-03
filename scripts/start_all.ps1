@@ -7,7 +7,11 @@
 #   4. the two WPF apps (CopilotChat, FleetCockpit)     -- launched only if not already running.
 # Nothing is ever stopped/killed; this only fills in what is missing. Safe to run any number of times.
 $ErrorActionPreference = "Continue"
-$root = $PSScriptRoot
+# This script lives in <repo>\scripts. $root is the REPO ROOT (.env, .git, ui\ live there);
+# $scriptDir is the scripts dir where the sibling launchers (supervisor.ps1,
+# start_companion_edge.ps1, start_bridge.ps1) now live.
+$scriptDir = $PSScriptRoot
+$root = Split-Path -Parent $scriptDir
 
 function Proc-Running([string]$pattern) {
     try {
@@ -227,7 +231,7 @@ function Invoke-Startup {
         Write-Host "[1/4] supervisor (MCP server + tunnel): already running -- left as-is"
     } else {
         $tn = Env-Value "MCP_TUNNEL_NAME"
-        $supArgs = @("-NoProfile","-ExecutionPolicy","Bypass","-File","$root\supervisor.ps1")
+        $supArgs = @("-NoProfile","-ExecutionPolicy","Bypass","-File","$scriptDir\supervisor.ps1")
         if ($tn) { $supArgs += @("-TunnelName", $tn); Write-Host "[1/4] supervisor (MCP server + tunnel '$tn'): starting" }
         else     { Write-Host "[1/4] supervisor (MCP server + tunnel): starting" }
         Start-Process powershell -WindowStyle Hidden -ArgumentList $supArgs
@@ -239,7 +243,7 @@ function Invoke-Startup {
         Write-Host "[2/4] companion Edge :9222: already up"
     } else {
         Write-Host "[2/4] companion Edge :9222: starting (headless)"
-        try { & "$root\start_companion_edge.ps1" -Headless | Out-Null } catch { Write-Host "      (companion Edge launch returned: $_)" }
+        try { & "$scriptDir\start_companion_edge.ps1" -Headless | Out-Null } catch { Write-Host "      (companion Edge launch returned: $_)" }
     }
 
     # 3) Bridge :9223 + chat backend (start_bridge -Keepalive). Skip if already up.
@@ -251,7 +255,7 @@ function Invoke-Startup {
     } else {
         Write-Host "[3/4] bridge: starting (headless keepalive)"
         Start-Process powershell -WindowStyle Hidden -ArgumentList @(
-            "-NoProfile","-ExecutionPolicy","Bypass","-File","$root\start_bridge.ps1","-Keepalive")
+            "-NoProfile","-ExecutionPolicy","Bypass","-File","$scriptDir\start_bridge.ps1","-Keepalive")
     }
 
     # 4) WPF apps. Launch only if not already running; build them first if the exe is missing.

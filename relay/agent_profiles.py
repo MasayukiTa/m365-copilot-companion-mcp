@@ -104,7 +104,7 @@ def prompt_for_agent_url(env_key: str, reason: str = "") -> str:
     if not env_key or os.environ.get("MCP_AGENT_URL_PROMPT", "1") != "1":
         return ""
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ps1 = os.path.join(repo, "configure_env.ps1")
+    ps1 = os.path.join(repo, "scripts", "configure_env.ps1")
     if not os.path.isfile(ps1):
         return ""
     try:
