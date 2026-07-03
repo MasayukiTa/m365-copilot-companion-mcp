@@ -771,6 +771,16 @@ def run_all(steps=STEPS, state=None, state_file=STATE_FILE) -> int:
     if state is None:
         state = load_state(state_file)
 
+    # First-line resume banner: when at least one step is already done, tell the
+    # user up front how far along we are and which step we resume from, so an
+    # interrupted install reads as "continuing" rather than "starting over".
+    done_count = sum(1 for name, _ in steps if is_done(state, name))
+    total = len(steps)
+    if 0 < done_count < total:
+        next_pending = next(name for name, _ in steps if not is_done(state, name))
+        log("RESUMING: %d/%d steps already done -- continuing from '%s'"
+            % (done_count, total, next_pending))
+
     for name, fn in steps:
         if is_done(state, name):
             log("--- %-14s already done (skipping)" % name)

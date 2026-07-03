@@ -71,6 +71,15 @@ git を使わないなら: GitHub ページの緑色の「**Code**」ボタン �
 
 全部 1 つの黒い窓＋ダイアログ＋サインイン画面で完結します。別 PC・別ターミナルは要りません。
 
+> ※ STEP 5 の手作業が既に済んでいる（`.env` にエージェント URL がある）状態で再実行すると、`quickstart.bat` は「`S` を押せば STEP 7（起動）まで飛ばせます」と聞いてきます。やり直したいときだけ `R` を押してください。
+
+### 途中で止めてしまったら（再開）
+
+- `quickstart.bat` は**いつ何度実行しても安全**です。中断（サインイン失敗・窓を閉じた・再起動）しても、続きから再開します。
+- **完了済みのステップは自動でスキップ**されます（Python 構築などは一瞬で通過）。やり直しにはなりません。
+- **STEP 5（Copilot Studio）まで済んでいれば、再実行時に `S` を押すだけで STEP 7 の起動まで一気に飛べます。**
+- 何かおかしくなったら、まず **`doctor.bat` をダブルクリック**。全リンクを緑/赤で診断し、赤い行にその場で直し方を出します。
+
 ---
 
 ### STEP 5 の手作業 — Copilot Studio に MCP を登録する
@@ -286,6 +295,12 @@ Double-click **`quickstart.bat`** in the root of the extracted folder. Then just
 | 7 | The whole stack starts (server + tunnel + Edge + UI) | Wait |
 
 Everything happens in one black console window plus a dialog and a sign-in screen. No second PC or terminal needed.
+
+> Footnote on STEP 5: if you re-run after the Copilot Studio step is already done (`.env` has an agent URL), quickstart offers to press **`S`** to skip to STEP 7 (launch); press **`R`** only if you want to redo STEP 5/6.
+
+#### Interrupted? Just re-run
+
+`quickstart.bat` is safe to run any number of times — it resumes where it left off, auto-skips completed steps, and (once STEP 5 is done) lets you press `S` to jump straight to launch. If anything looks wrong, double-click `doctor.bat` for a green/red diagnosis with fixes.
 
 ### The one manual step — registering the MCP tool in Copilot Studio
 

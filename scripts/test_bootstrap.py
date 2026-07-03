@@ -154,6 +154,31 @@ class StateMachineTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(rec.calls, [])
 
+    # 6b. Resume banner appears only when some (not all, not none) steps done --
+    def test_resume_banner_shows_when_resuming_and_not_when_fresh(self):
+        # Fresh run (no state yet): the RESUMING banner must NOT appear.
+        rec_fresh = RecordingSteps(["a", "b", "c"])
+        with mock.patch.object(bootstrap, "log") as mlog:
+            bootstrap.run_all(steps=rec_fresh.steps, state_file=self.state_file)
+        fresh_out = "\n".join(str(c.args[0]) for c in mlog.call_args_list if c.args)
+        self.assertNotIn("RESUMING", fresh_out,
+                         "RESUMING banner appeared on a fresh (0-done) run")
+
+        # Now simulate an interrupted install: 'a' is already done, resume.
+        bootstrap.reset_state(state_file=self.state_file)
+        state = {"done": {"a": True}}
+        bootstrap.save_state(state, self.state_file)
+        rec_resume = RecordingSteps(["a", "b", "c"])
+        with mock.patch.object(bootstrap, "log") as mlog:
+            bootstrap.run_all(steps=rec_resume.steps, state_file=self.state_file)
+        resume_out = "\n".join(str(c.args[0]) for c in mlog.call_args_list if c.args)
+        self.assertIn("RESUMING", resume_out,
+                      "RESUMING banner missing when a step was already done")
+        # Banner must report the correct progress and the next pending step name.
+        self.assertIn("1/3", resume_out)
+        self.assertIn("continuing from 'b'", resume_out)
+        self.assertEqual(rec_resume.calls, ["b", "c"])  # 'a' skipped
+
     # 7. Corrupt state file does not wedge the machine -----------------------
     def test_corrupt_state_file_starts_clean(self):
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
