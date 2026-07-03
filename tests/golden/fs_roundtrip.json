@@ -1,0 +1,25 @@
+{
+  "description": "write_file a known string under the tmp allowed base, read it back, and confirm list_directory shows it. Exercises the write->read->list contract of the core file tools.",
+  "steps": [
+    {
+      "tool": "write_file",
+      "kwargs": {"path": "{base}/greeting.txt", "content": "hello golden trajectory"},
+      "expect": {"returns_contains": "Wrote"}
+    },
+    {
+      "tool": "read_file",
+      "kwargs": {"path": "{base}/greeting.txt"},
+      "expect": {"returns_contains": "hello golden trajectory"}
+    },
+    {
+      "tool": "list_directory",
+      "kwargs": {"path": "{base}"},
+      "expect": {"returns_contains": "greeting.txt"}
+    },
+    {
+      "tool": "list_directory",
+      "kwargs": {"path": "{base}"},
+      "expect": {"file_content_equals": ["{base}/greeting.txt", "hello golden trajectory"]}
+    }
+  ]
+}
