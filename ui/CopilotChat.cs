@@ -64,8 +64,17 @@ class ChatWindow : Window
     string _renamingId = null;
     int _deleteMode = 1;                 // 1=local only, 2=open in Copilot, 3=auto (experimental)
     int _lang = 0;                       // 0=Japanese, 1=English
-    double _uiScale = 1.0;               // whole-UI zoom (ScaleTransform on the root); persisted as ui_scale
+    double _uiScale = 1.0;               // whole-UI EFFECTIVE zoom (ScaleTransform on the root)
     bool _uiScaleLoaded = false;         // true once ui_scale was found in settings.txt (skip first-run default)
+    // AUTO mode (shared semantics with the cockpit; see settings.txt ui_scale=auto). In auto mode the
+    // effective LayoutTransform scale is per-monitor so PHYSICAL size stays constant across displays:
+    //   effective = clamp(_scaleTarget / currentMonitorScale, 0.8, 2.0)
+    // monitorScale (WPF DPI = DPI/96) × effective ≈ _scaleTarget on every monitor. The divide-by-
+    // monitorScale exactly counteracts WPF's own per-monitor DPI relayout -> no double-apply. This app
+    // has no gear popup, so the only controls are the keyboard ones (Ctrl+±/wheel = manual, Ctrl+0 = auto).
+    bool _uiAuto = true;                 // true = auto mode (default for new users / ui_scale=auto)
+    double _scaleTarget = 1.5;           // desired constant physical scale (persisted as ui_scale_target)
+    bool _scaleTargetLoaded = false;     // true once ui_scale_target was read (else seed from primary DPI)
     ScaleTransform _rootScale;           // LayoutTransform on the root content -> everything scales+reflows
     Border _scaleToast;                  // small fading "NNN%" overlay shown on a zoom change
     TextBlock _scaleToastText;
@@ -121,6 +130,7 @@ class ChatWindow : Window
         if (k == "cancel") return ja ? "キャンセル" : "Cancel";
         if (k == "copy") return ja ? "コピー" : "Copy";
         if (k == "stop") return ja ? "停止" : "Stop";
+        if (k == "ui_auto") return ja ? "自動" : "Auto";
         if (k == "fleet_queued") return ja ? "並列実行が満杯のため待機列に追加しました（空き枠で実行）。先頭に ! を付けると強制優先。" : "Fleet is full — queued (runs when a slot frees). Prefix ! to force priority.";
         if (k == "fleet_forced") return ja ? "強制優先で待機列の先頭に追加しました。" : "Forced to the front of the queue.";
         if (k == "router_q") return ja ? "これは調査向きの依頼です。researcher で深掘りしますか？" : "This looks like research. Run it on the researcher?";
@@ -524,29 +534,27 @@ class ChatWindow : Window
         Loaded += delegate
         {
             _input.Focus();
-            // UI-scale first run: if no ui_scale was persisted AND this is a 4K-class screen at
-            // 1.0 OS DPI (so text really is tiny), default to 1.25; else 1.0. Then persist the choice
-            // so it never re-evaluates. Runs in Loaded because PresentationSource/DPI is available now.
+            // UI-scale first run. AUTO is the default for NEW users: seed _scaleTarget from the PRIMARY
+            // monitor's scale (the size the user is used to) and compute the per-monitor effective scale.
+            // If a scale was already persisted (auto OR manual, from either app) honor it and just reflect
+            // it on the live transform. Runs in Loaded because PresentationSource/DPI is available now.
+            double monitorScale = CurrentMonitorScale();
+            if (!_scaleTargetLoaded)
+            {
+                _scaleTarget = System.Math.Max(0.8, System.Math.Min(3.0, monitorScale));
+                if (_scaleTarget < 0.81) _scaleTarget = 1.5;   // 100% primary -> still target a comfy 1.5
+                _scaleTargetLoaded = true;
+                SaveSettings();   // persist ui_scale_target
+            }
             if (!_uiScaleLoaded)
             {
-                double def = 1.0;
-                try
-                {
-                    double pxW = SystemParameters.PrimaryScreenWidth;   // device-independent; multiply by DPI for pixels
-                    double m11 = 1.0;
-                    var src = PresentationSource.FromVisual(this);
-                    if (src != null && src.CompositionTarget != null)
-                        m11 = src.CompositionTarget.TransformToDevice.M11;
-                    double pixelW = pxW * m11;
-                    if (pixelW >= 2560 && System.Math.Abs(m11 - 1.0) < 0.001) def = 1.25;
-                }
-                catch { }
-                _uiScale = ClampScale(def);
+                _uiAuto = true;               // new-user default = AUTO
                 _uiScaleLoaded = true;
-                ApplyScale(false);     // silent apply (no toast at launch)
-                SaveSettings();        // persist whatever was chosen
+                ApplyAutoScale(false);        // silent apply for this monitor
+                SaveSettings();               // persist ui_scale=auto (+ target)
             }
-            else ApplyScale(false);    // apply the persisted zoom silently
+            else if (_uiAuto) ApplyAutoScale(false);   // reflect auto for THIS monitor silently
+            else ApplyScale(false);                    // apply the persisted manual zoom silently
         };
         // Window-level Esc -> interrupt a streaming reply, REGARDLESS of focus. The input-level
         // handler only fires when the box is focused, but mid-stream focus is usually elsewhere, so
@@ -620,9 +628,18 @@ class ChatWindow : Window
             _settingsMtime = m;
             int l0 = _lang;
             double s0 = _uiScale;
-            LoadSettings();                              // re-reads lang/dark/ui_scale (+ApplyTheme for theme)
+            bool a0 = _uiAuto; double t0 = _scaleTarget;
+            LoadSettings();                              // re-reads lang/dark/ui_scale/target (+ApplyTheme)
             if (_lang != l0) { UpdateChrome(); RefreshConvList(); RerenderActiveConversation(); }
-            if (_uiScale != s0) ApplyScale(false);       // cockpit changed the shared zoom -> mirror it (silent)
+            // Cockpit changed the shared zoom -> mirror it silently. In AUTO recompute for THIS monitor
+            // (the per-monitor effective scale, not the other window's); in MANUAL push the shared number.
+            if (_uiAuto)
+            {
+                if (!a0 || System.Math.Abs(t0 - _scaleTarget) > 0.001
+                        || System.Math.Abs(s0 - EffectiveAutoScale(CurrentMonitorScale())) > 0.001)
+                    ApplyAutoScale(false);
+            }
+            else if (a0 || _uiScale != s0) ApplyScale(false);
         }
         catch { }
     }
@@ -2464,8 +2481,34 @@ class ChatWindow : Window
         return s;
     }
 
+    // Current monitor scale = this window's device pixels per DIP (DPI/96). 1.0 at 100%, 1.5 at 150%.
+    // Read from the live PresentationSource; falls back to 1.0 before the window is sourced.
+    double CurrentMonitorScale()
+    {
+        try
+        {
+            var src = PresentationSource.FromVisual(this);
+            if (src != null && src.CompositionTarget != null)
+            {
+                double m11 = src.CompositionTarget.TransformToDevice.M11;
+                if (m11 > 0.01) return m11;
+            }
+        }
+        catch { }
+        return 1.0;
+    }
+
+    // AUTO effective scale for a monitor: target physical size / that monitor's own DPI scale, clamped.
+    // monitorScale (WPF DPI) × effective ≈ _scaleTarget -> constant physical size across monitors. The
+    // clamp can cap it on extreme monitors (see numeric proof in the report).
+    double EffectiveAutoScale(double monitorScale)
+    {
+        if (monitorScale < 0.01) monitorScale = 1.0;
+        return ClampScale(_scaleTarget / monitorScale);
+    }
+
     // Apply _uiScale to the root LayoutTransform. showToast=true flashes the "NNN%" overlay
-    // (interactive changes); false is silent (initial apply / external cockpit mirror).
+    // (interactive changes); false is silent (initial apply / external cockpit mirror / DPI recompute).
     void ApplyScale(bool showToast)
     {
         _uiScale = ClampScale(_uiScale);
@@ -2479,30 +2522,61 @@ class ChatWindow : Window
         if (showToast) ShowScaleToast();
     }
 
-    // Nudge the zoom by delta (±0.1 typical), clamp, apply, persist, and flash the overlay.
+    // Recompute + apply the AUTO effective scale for THIS window's current monitor. Silent by default.
+    void ApplyAutoScale(bool toast)
+    {
+        _uiScale = EffectiveAutoScale(CurrentMonitorScale());
+        ApplyScale(false);
+        if (toast) ShowScaleToastText(T("ui_auto"));
+    }
+
+    // Nudge the zoom by delta (±0.1 typical) -> MANUAL mode. Clamp, apply, persist, flash the overlay.
     void BumpScale(double delta)
     {
         double next = ClampScale(_uiScale + delta);
         // Snap to a clean 0.05 grid so repeated notches don't drift (0.7999999…).
         next = System.Math.Round(next * 20.0) / 20.0;
-        if (System.Math.Abs(next - _uiScale) < 0.0001) { ShowScaleToast(); return; }  // at a clamp edge -> still show %
+        // If we were in auto, a +/- always transitions to manual even at a clamp edge.
+        if (!_uiAuto && System.Math.Abs(next - _uiScale) < 0.0001) { ShowScaleToast(); return; }
+        _uiAuto = false;
         _uiScale = next;
         ApplyScale(true);
         SaveSettings();
     }
 
+    // Ctrl+0 = "back to automatic" (NOT 1.0): re-enter auto, recompute for this monitor, brief 自動 toast.
     void ResetScale()
     {
-        _uiScale = 1.0;
-        ApplyScale(true);
-        SaveSettings();
+        _uiAuto = true;
+        SaveSettings();          // persist ui_scale=auto
+        ApplyAutoScale(true);    // recompute for the current monitor + "自動" toast
+    }
+
+    // PMv2 fires this when the window is dragged onto a differently-scaled monitor. In AUTO mode we
+    // recompute the effective scale from the NEW monitor's DPI (newDpi.DpiScaleX = DPI/96) so physical
+    // size stays constant -- SILENTLY (an automatic recompute must not flash the toast). Manual mode is
+    // untouched. Never throw from here.
+    protected override void OnDpiChanged(DpiScale oldDpi, DpiScale newDpi)
+    {
+        try { base.OnDpiChanged(oldDpi, newDpi); } catch { }
+        try
+        {
+            if (_uiAuto)
+            {
+                double ms = (newDpi.DpiScaleX > 0.01) ? newDpi.DpiScaleX : CurrentMonitorScale();
+                _uiScale = EffectiveAutoScale(ms);
+                ApplyScale(false);   // silent: no toast on automatic DPI-change recompute
+            }
+        }
+        catch { }
     }
 
     // Small fading "NNN%" overlay, anchored top-center over the content. Reuses one Border/timer.
-    void ShowScaleToast()
+    void ShowScaleToast() { ShowScaleToastText(null); }
+    // txt != null shows that literal (e.g. "自動" when entering auto); null shows the current %.
+    void ShowScaleToastText(string txt)
     {
-        int pct = (int)System.Math.Round(_uiScale * 100.0);
-        string txt = pct + "%";
+        if (txt == null) txt = ((int)System.Math.Round(_uiScale * 100.0)) + "%";
         if (_scaleToast == null)
         {
             _scaleToastText = new TextBlock
@@ -3085,10 +3159,23 @@ class ChatWindow : Window
                 else if (ln.StartsWith("sidebar_collapsed=")) _sidebarCollapsed = ln.Substring(18).Trim() == "1";
                 else if (ln.StartsWith("ui_scale="))
                 {
-                    double d;
-                    if (double.TryParse(ln.Substring(9).Trim(), System.Globalization.NumberStyles.Float,
-                                        System.Globalization.CultureInfo.InvariantCulture, out d))
-                    { _uiScale = ClampScale(d); _uiScaleLoaded = true; }
+                    string sv = ln.Substring(9).Trim();
+                    if (sv.Equals("auto", StringComparison.OrdinalIgnoreCase))
+                    { _uiAuto = true; _uiScaleLoaded = true; }
+                    else
+                    {
+                        double d;
+                        if (double.TryParse(sv, System.Globalization.NumberStyles.Float,
+                                            System.Globalization.CultureInfo.InvariantCulture, out d))
+                        { _uiAuto = false; _uiScale = ClampScale(d); _uiScaleLoaded = true; }
+                    }
+                }
+                else if (ln.StartsWith("ui_scale_target="))
+                {
+                    double ut;
+                    if (double.TryParse(ln.Substring(16).Trim(), System.Globalization.NumberStyles.Float,
+                                        System.Globalization.CultureInfo.InvariantCulture, out ut))
+                    { _scaleTarget = System.Math.Max(0.8, System.Math.Min(3.0, ut)); _scaleTargetLoaded = true; }
                 }
             }
             ApplyTheme();     // _dark may have changed -> re-apply (shared with the cockpit)
@@ -3109,7 +3196,9 @@ class ChatWindow : Window
                 { "lang", _lang.ToString() },
                 { "dark", _dark ? "1" : "0" },
                 { "sidebar_collapsed", _sidebarCollapsed ? "1" : "0" },
-                { "ui_scale", _uiScale.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) },
+                // ui_scale holds the literal "auto" in auto mode, else the fixed number (manual).
+                { "ui_scale", _uiAuto ? "auto" : _uiScale.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) },
+                { "ui_scale_target", _scaleTarget.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture) },
             };
             var lines = new List<string>();
             var seen = new HashSet<string>();
