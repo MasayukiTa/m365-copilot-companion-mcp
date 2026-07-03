@@ -64,6 +64,12 @@ class ChatWindow : Window
     string _renamingId = null;
     int _deleteMode = 1;                 // 1=local only, 2=open in Copilot, 3=auto (experimental)
     int _lang = 0;                       // 0=Japanese, 1=English
+    double _uiScale = 1.0;               // whole-UI zoom (ScaleTransform on the root); persisted as ui_scale
+    bool _uiScaleLoaded = false;         // true once ui_scale was found in settings.txt (skip first-run default)
+    ScaleTransform _rootScale;           // LayoutTransform on the root content -> everything scales+reflows
+    Border _scaleToast;                  // small fading "NNN%" overlay shown on a zoom change
+    TextBlock _scaleToastText;
+    DispatcherTimer _scaleToastTimer;
     Border _banner; StackPanel _bannerBody;
     FrameworkElement _emptyState;        // centered quiet empty-state block (fresh window / after New chat)
     string _dotState = "idle";           // status-dot state: "idle" | "busy" | "offline" | "signin"
@@ -236,11 +242,12 @@ class ChatWindow : Window
         // Compact icon-button row (Wave 2): cockpit / language / theme as Material-Symbols icons,
         // replacing the three full-width emoji text buttons. Each carries a localized tooltip with the
         // old label text. Accent stays reserved for the one primary action (Send).
-        //   • cockpit  = satellite_alt (account_tree is FleetCockpit's self-improve glyph — avoid collision)
+        //   • cockpit  = grid_view (4 tiles = parallel execution; account_tree is FleetCockpit's
+        //                self-improve glyph — avoid collision)
         //   • language = translate
         //   • theme    = light_mode/dark_mode, swapped by state (shows the mode you'd switch TO)
         var bottom = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(8, 8, 8, 10) };
-        _cockpitBtn = IconButton("satellite_alt", 18, T("tip_cockpit"));
+        _cockpitBtn = IconButton("grid_view", 18, T("tip_cockpit"));
         _cockpitBtn.Click += delegate { OpenCockpit(); };
         _langBtn = IconButton("translate", 18, T("tip_lang"));
         _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveSettings(); UpdateChrome(); RefreshConvList(); RerenderActiveConversation(); if (_emptyState != null) { RemoveEmptyState(); ShowEmptyState(); } };
@@ -514,7 +521,33 @@ class ChatWindow : Window
         LoadSidebarState();    // load pinned/archived/collapsed before first RefreshConvList()
 
         LoadConversations();
-        Loaded += delegate { _input.Focus(); };
+        Loaded += delegate
+        {
+            _input.Focus();
+            // UI-scale first run: if no ui_scale was persisted AND this is a 4K-class screen at
+            // 1.0 OS DPI (so text really is tiny), default to 1.25; else 1.0. Then persist the choice
+            // so it never re-evaluates. Runs in Loaded because PresentationSource/DPI is available now.
+            if (!_uiScaleLoaded)
+            {
+                double def = 1.0;
+                try
+                {
+                    double pxW = SystemParameters.PrimaryScreenWidth;   // device-independent; multiply by DPI for pixels
+                    double m11 = 1.0;
+                    var src = PresentationSource.FromVisual(this);
+                    if (src != null && src.CompositionTarget != null)
+                        m11 = src.CompositionTarget.TransformToDevice.M11;
+                    double pixelW = pxW * m11;
+                    if (pixelW >= 2560 && System.Math.Abs(m11 - 1.0) < 0.001) def = 1.25;
+                }
+                catch { }
+                _uiScale = ClampScale(def);
+                _uiScaleLoaded = true;
+                ApplyScale(false);     // silent apply (no toast at launch)
+                SaveSettings();        // persist whatever was chosen
+            }
+            else ApplyScale(false);    // apply the persisted zoom silently
+        };
         // Window-level Esc -> interrupt a streaming reply, REGARDLESS of focus. The input-level
         // handler only fires when the box is focused, but mid-stream focus is usually elsewhere, so
         // Esc was falling through to the sidebar (it navigated to "新しいチャット" instead of stopping).
@@ -526,7 +559,26 @@ class ChatWindow : Window
             // Ctrl+B: toggle sidebar (Claude Code / Codex style). Fire regardless of focus;
             // it does NOT interfere with composer Ctrl+V or Enter (different keys).
             if (e.Key == Key.B && (Keyboard.Modifiers & ModifierKeys.Control) != 0)
-            { e.Handled = true; ToggleSidebar(); }
+            { e.Handled = true; ToggleSidebar(); return; }
+            // Whole-UI zoom shortcuts (Ctrl+±/0). Attached at window level so focus location doesn't
+            // matter. These keys don't collide with the composer (Enter/Shift+Enter/Ctrl+V/Esc).
+            if ((Keyboard.Modifiers & ModifierKeys.Control) != 0)
+            {
+                // '+' sits on OemPlus (and Add on the numpad); Plus is the abstract key on some layouts.
+                if (e.Key == Key.OemPlus || e.Key == Key.Add)
+                { e.Handled = true; BumpScale(+0.1); return; }
+                if (e.Key == Key.OemMinus || e.Key == Key.Subtract)
+                { e.Handled = true; BumpScale(-0.1); return; }
+                if (e.Key == Key.D0 || e.Key == Key.NumPad0)
+                { e.Handled = true; ResetScale(); return; }
+            }
+        };
+        // Ctrl+MouseWheel -> ±0.1 per notch. PreviewMouseWheel at window level so it fires wherever
+        // the pointer is; only acts when Ctrl is held so normal scrolling is untouched.
+        PreviewMouseWheel += delegate (object s, MouseWheelEventArgs e)
+        {
+            if ((Keyboard.Modifiers & ModifierKeys.Control) != 0 && e.Delta != 0)
+            { e.Handled = true; BumpScale(e.Delta > 0 ? +0.1 : -0.1); }
         };
         // Apply persisted sidebar collapsed state AFTER the window is fully constructed.
         if (_sidebarCollapsed) ApplySidebarState();
@@ -567,8 +619,10 @@ class ChatWindow : Window
             if (m == _settingsMtime) return;
             _settingsMtime = m;
             int l0 = _lang;
-            LoadSettings();                              // re-reads lang/dark (+ApplyTheme for theme)
+            double s0 = _uiScale;
+            LoadSettings();                              // re-reads lang/dark/ui_scale (+ApplyTheme for theme)
             if (_lang != l0) { UpdateChrome(); RefreshConvList(); RerenderActiveConversation(); }
+            if (_uiScale != s0) ApplyScale(false);       // cockpit changed the shared zoom -> mirror it (silent)
         }
         catch { }
     }
@@ -1992,6 +2046,7 @@ class ChatWindow : Window
         Set("Bg", Theme.Bg(_dark));
         Set("Panel", Theme.Surface(_dark));
         Set("PanelAlt", Theme.SurfaceSubtle(_dark));
+        Set("Selected", Theme.Selected(_dark));   // active sidebar row card fill (no rail/colored border)
         Set("Border", Theme.Border(_dark));
         Set("BorderStrong", Theme.BorderStrong(_dark));
         Set("Fg", Theme.Text(_dark));
@@ -2235,15 +2290,13 @@ class ChatWindow : Window
         }
 
         bool isActive = cc.Id == _conv.Id;
-        // row = background border: active gets PanelAlt (surfaceSubtle, quiet selected state) PLUS a
-        // 3px Accent left rail (ITEM 3b) so the selected conversation is unmistakable; non-selected
-        // rows are transparent with no rail.
+        // row = background border: the ACTIVE row reads as a quietly darker card (Selected token) filling
+        // the full rounded rect at the same corner radius as every row — NO colored left rail, NO colored
+        // border (the orange rail was rejected as bad design). Non-selected rows are transparent.
         var rowBorder = new Border { CornerRadius = new CornerRadius(Theme.RadSmall), Margin = new Thickness(0, 1, 0, 1) };
         if (isActive)
         {
-            SetRef(rowBorder, BackgroundProperty, "PanelAlt");
-            rowBorder.BorderThickness = new Thickness(3, 0, 0, 0);
-            SetRef(rowBorder, Border.BorderBrushProperty, "Accent");
+            SetRef(rowBorder, BackgroundProperty, "Selected");
         }
         else
         {
@@ -2277,8 +2330,8 @@ class ChatWindow : Window
         {
             Content = contentRow,
             HorizontalContentAlignment = HorizontalAlignment.Left,
-            // Active rows carry a 3px left rail; drop 3px of left padding so the title stays aligned.
-            Padding = new Thickness(isActive ? 6 : 9, 0, 9, 0), BorderThickness = new Thickness(0),
+            // No left rail anymore -> uniform left padding so active/inactive titles align identically.
+            Padding = new Thickness(9, 0, 9, 0), BorderThickness = new Thickness(0),
             Cursor = Cursors.Hand, Background = Brushes.Transparent, ToolTip = titleText
         };
         // Active row: full Fg; archived non-active: Faint (de-emphasized); others: Muted.
@@ -2397,6 +2450,104 @@ class ChatWindow : Window
         // Update the toggle button tooltip to reflect current state.
         if (_sideToggleBtn != null)
             _sideToggleBtn.ToolTip = (_lang == 0 ? "サイドバーを切り替える (Ctrl+B)" : "Toggle sidebar (Ctrl+B)");
+    }
+
+    // ── whole-UI zoom (4K readability) ───────────────────────────────────────────
+    // A single ScaleTransform applied as the root content's LayoutTransform scales EVERYTHING
+    // (text, icons, paddings) AND reflows layout (LayoutTransform participates in measure, unlike
+    // RenderTransform). Persisted as ui_scale in the shared settings.txt (the cockpit honors the
+    // same key). Clamp 0.8–2.0.
+    static double ClampScale(double s)
+    {
+        if (s < 0.8) return 0.8;
+        if (s > 2.0) return 2.0;
+        return s;
+    }
+
+    // Apply _uiScale to the root LayoutTransform. showToast=true flashes the "NNN%" overlay
+    // (interactive changes); false is silent (initial apply / external cockpit mirror).
+    void ApplyScale(bool showToast)
+    {
+        _uiScale = ClampScale(_uiScale);
+        if (_rootScale == null) _rootScale = new ScaleTransform(1.0, 1.0);
+        _rootScale.ScaleX = _uiScale; _rootScale.ScaleY = _uiScale;
+        if (Content is FrameworkElement)
+        {
+            var fe = (FrameworkElement)Content;
+            if (!ReferenceEquals(fe.LayoutTransform, _rootScale)) fe.LayoutTransform = _rootScale;
+        }
+        if (showToast) ShowScaleToast();
+    }
+
+    // Nudge the zoom by delta (±0.1 typical), clamp, apply, persist, and flash the overlay.
+    void BumpScale(double delta)
+    {
+        double next = ClampScale(_uiScale + delta);
+        // Snap to a clean 0.05 grid so repeated notches don't drift (0.7999999…).
+        next = System.Math.Round(next * 20.0) / 20.0;
+        if (System.Math.Abs(next - _uiScale) < 0.0001) { ShowScaleToast(); return; }  // at a clamp edge -> still show %
+        _uiScale = next;
+        ApplyScale(true);
+        SaveSettings();
+    }
+
+    void ResetScale()
+    {
+        _uiScale = 1.0;
+        ApplyScale(true);
+        SaveSettings();
+    }
+
+    // Small fading "NNN%" overlay, anchored top-center over the content. Reuses one Border/timer.
+    void ShowScaleToast()
+    {
+        int pct = (int)System.Math.Round(_uiScale * 100.0);
+        string txt = pct + "%";
+        if (_scaleToast == null)
+        {
+            _scaleToastText = new TextBlock
+            {
+                Text = txt, FontSize = 13, FontWeight = FontWeights.SemiBold,
+                HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center
+            };
+            SetRef(_scaleToastText, TextBlock.ForegroundProperty, "Fg");
+            _scaleToast = new Border
+            {
+                Child = _scaleToastText, CornerRadius = new CornerRadius(Theme.RadCard),
+                Padding = new Thickness(14, 7, 14, 7), BorderThickness = new Thickness(1),
+                HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Top,
+                Margin = new Thickness(0, 14, 0, 0), IsHitTestVisible = false,
+                Visibility = Visibility.Collapsed
+            };
+            SetRef(_scaleToast, BackgroundProperty, "Panel");
+            SetRef(_scaleToast, Border.BorderBrushProperty, "Border");
+            Panel.SetZIndex(_scaleToast, 200);
+            // Anchor inside the scaled root Grid so it lives above the columns (and scales with the UI,
+            // which is fine — it reads as part of the same zoomed surface).
+            if (_rootGrid != null)
+            {
+                Grid.SetColumn(_scaleToast, 0);
+                Grid.SetColumnSpan(_scaleToast, System.Math.Max(1, _rootGrid.ColumnDefinitions.Count));
+                _rootGrid.Children.Add(_scaleToast);
+            }
+        }
+        _scaleToastText.Text = txt;
+        _scaleToast.Visibility = Visibility.Visible;
+        _scaleToast.Opacity = 1.0;
+        if (_scaleToastTimer == null)
+        {
+            _scaleToastTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(900) };
+            _scaleToastTimer.Tick += delegate
+            {
+                _scaleToastTimer.Stop();
+                var fade = new DoubleAnimation(1.0, 0.0, new Duration(TimeSpan.FromMilliseconds(280)));
+                fade.Completed += delegate { if (_scaleToast != null) _scaleToast.Visibility = Visibility.Collapsed; };
+                if (_scaleToast != null) _scaleToast.BeginAnimation(UIElement.OpacityProperty, fade);
+            };
+        }
+        _scaleToast.BeginAnimation(UIElement.OpacityProperty, null);   // cancel any in-flight fade
+        _scaleToast.Opacity = 1.0;
+        _scaleToastTimer.Stop(); _scaleToastTimer.Start();
     }
 
     // STEER-mode signal: when viewing a parallel-task conversation, anything you type interrupts
@@ -2932,6 +3083,13 @@ class ChatWindow : Window
                 else if (ln.StartsWith("lang=") && int.TryParse(ln.Substring(5).Trim(), out v)) _lang = v;
                 else if (ln.StartsWith("dark=")) _dark = ln.Substring(5).Trim() != "0";
                 else if (ln.StartsWith("sidebar_collapsed=")) _sidebarCollapsed = ln.Substring(18).Trim() == "1";
+                else if (ln.StartsWith("ui_scale="))
+                {
+                    double d;
+                    if (double.TryParse(ln.Substring(9).Trim(), System.Globalization.NumberStyles.Float,
+                                        System.Globalization.CultureInfo.InvariantCulture, out d))
+                    { _uiScale = ClampScale(d); _uiScaleLoaded = true; }
+                }
             }
             ApplyTheme();     // _dark may have changed -> re-apply (shared with the cockpit)
         }
@@ -2951,6 +3109,7 @@ class ChatWindow : Window
                 { "lang", _lang.ToString() },
                 { "dark", _dark ? "1" : "0" },
                 { "sidebar_collapsed", _sidebarCollapsed ? "1" : "0" },
+                { "ui_scale", _uiScale.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) },
             };
             var lines = new List<string>();
             var seen = new HashSet<string>();

@@ -90,6 +90,23 @@ class CockpitWindow : Window
     DispatcherTimer _histSearchTimer;
     long _settingsMtime = 0;
 
+    // ── UI SCALE (4K readability) ────────────────────────────────────────────────
+    // A window-level zoom: a ScaleTransform is set as the LayoutTransform on the SINGLE
+    // root element that hosts ALL chrome (header + pinned toolbar + health strip + list +
+    // composer), so everything scales AND reflows together. Persisted as ui_scale= in the
+    // SHARED settings.txt with identical semantics to the chat app, so both apps zoom in
+    // lock-step (an external edit is picked up on the next mtime-triggered LoadSettings).
+    double _uiScale = 1.0;            // current zoom (clamped 0.8–2.0)
+    bool _uiScaleLoaded = false;      // true once a ui_scale= line was read from settings.txt
+    ScaleTransform _rootScale;        // the LayoutTransform applied on BuildChrome's root
+    // Self-fading "125%" overlay shown briefly on each change (reuses no other affordance
+    // because the composer note is not visible from every context, e.g. gear popup / shortcut).
+    Border _scaleToast;
+    TextBlock _scaleToastText;
+    DispatcherTimer _scaleToastTimer;
+    // gear-popup live value label + stepper refs (re-themed nowhere else; rebuilt each open)
+    TextBlock _uiScaleVal;
+
     readonly string _statusPath, _commandsPath, _historyPath, _openPath;
     string _convsPath, _hiddenPath;
     System.Collections.Generic.HashSet<string> _archivedKeys = new System.Collections.Generic.HashSet<string>();
@@ -217,6 +234,13 @@ class CockpitWindow : Window
         Width = 1080; Height = 760;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         BuildChrome();
+        // ── UI-scale shortcuts (window level) ────────────────────────────────────
+        // Ctrl+Plus/Minus/0 and Ctrl+MouseWheel zoom the whole window. Registered at the
+        // window so they fire from anywhere; the composer's own PreviewKeyDown only handles
+        // Return/arrow/Tab/Esc, so these never collide with typing (a digit/OemPlus with Ctrl
+        // held is not text input). We only act when Ctrl is down and swallow the event then.
+        this.PreviewKeyDown += OnScaleKeyDown;
+        this.PreviewMouseWheel += OnScaleMouseWheel;
         _timer = new DispatcherTimer();
         _timer.Interval = TimeSpan.FromMilliseconds(700);
         _timer.Tick += new EventHandler(OnTick);
@@ -373,6 +397,9 @@ class CockpitWindow : Window
         if (k == "disk_floor") return ja ? "実行下限ディスク (GB)" : "Disk floor (GB)";
         if (k == "disk_floor_hint") return ja ? "空きディスクがこの値を下回るとタブ開放を待機します。" : "Pauses opening tabs when free disk drops below this.";
         if (k == "ram_floor") return ja ? "確保する空きRAM (MB)" : "RAM floor (MB)";
+        if (k == "ui_scale_section") return ja ? "表示サイズ" : "UI scale";
+        if (k == "ui_scale") return ja ? "表示サイズ" : "UI scale";
+        if (k == "ui_scale_hint") return ja ? "Ctrl+ホイールや Ctrl +/− でも変更できます（Ctrl+0 で100%）。" : "Also change with Ctrl+wheel or Ctrl +/− (Ctrl+0 resets to 100%).";
         if (k == "force_start") return ja ? "今すぐ開始" : "Start now";
         if (k == "floor_restore") return ja ? "容量制限を戻す" : "Restore limit";
         if (k == "floor_off") return ja ? "容量制限を一時解除しています" : "Capacity limit paused";
@@ -455,6 +482,13 @@ class CockpitWindow : Window
                     if (double.TryParse(ln.Substring(13).Trim(), System.Globalization.NumberStyles.Float,
                                         System.Globalization.CultureInfo.InvariantCulture, out rf))
                         _ramFloor = Math.Max(0.0, Math.Min(65536.0, rf));
+                }
+                else if (ln.StartsWith("ui_scale="))
+                {
+                    double us;
+                    if (double.TryParse(ln.Substring(9).Trim(), System.Globalization.NumberStyles.Float,
+                                        System.Globalization.CultureInfo.InvariantCulture, out us))
+                    { _uiScale = Math.Max(0.8, Math.Min(2.0, us)); _uiScaleLoaded = true; }
                 }
                 else if (ln.StartsWith("effort="))
                 {
@@ -703,9 +737,131 @@ class CockpitWindow : Window
         lanesGrid.Children.Add(col1);
 
         root.Children.Add(lanesGrid);
-        Content = root;
+
+        // UI SCALE: anchor the ScaleTransform as the LayoutTransform on THIS root DockPanel — the
+        // single element that contains ALL chrome (header + pinned toolbar host + health strip +
+        // card list + composer). LayoutTransform (not RenderTransform) so children re-measure and
+        // reflow at the zoomed size instead of being bitmap-stretched. RebuildChrome() calls
+        // BuildChrome() afresh, so a NEW root gets the transform re-applied here every rebuild.
+        _rootScale = new ScaleTransform(_uiScale, _uiScale);
+        root.LayoutTransform = _rootScale;
+        // Overlay toast lives OUTSIDE the scaled root (added to a Grid wrapper) so its size is
+        // constant regardless of zoom; it self-fades on each scale change.
+        var appRoot = new Grid();
+        appRoot.Children.Add(root);
+        appRoot.Children.Add(BuildScaleToast());
+        Content = appRoot;
         PaintChrome();
         StartHealthPoll();
+    }
+
+    // A small centered self-fading overlay showing the current zoom % (e.g. "125%"). Built once per
+    // BuildChrome; ShowScaleToast() sets the text, makes it visible, and restarts the fade timer.
+    UIElement BuildScaleToast()
+    {
+        _scaleToast = new Border();
+        _scaleToast.HorizontalAlignment = HorizontalAlignment.Center;
+        _scaleToast.VerticalAlignment = VerticalAlignment.Top;
+        _scaleToast.Margin = new Thickness(0, 18, 0, 0);
+        _scaleToast.Padding = new Thickness(14, 7, 14, 7);
+        _scaleToast.CornerRadius = new CornerRadius(8);
+        _scaleToast.Background = Theme.Br(Theme.Surface(_dark));
+        _scaleToast.BorderBrush = Border;
+        _scaleToast.BorderThickness = new Thickness(1);
+        _scaleToast.IsHitTestVisible = false;
+        _scaleToast.Visibility = Visibility.Collapsed;
+        _scaleToast.Effect = new System.Windows.Media.Effects.DropShadowEffect
+        { BlurRadius = 14, ShadowDepth = 2, Opacity = 0.22, Color = C("#000000") };
+        _scaleToastText = new TextBlock();
+        _scaleToastText.Foreground = Fg; _scaleToastText.FontSize = 15;
+        _scaleToastText.FontWeight = FontWeights.SemiBold;
+        _scaleToast.Child = _scaleToastText;
+        return _scaleToast;
+    }
+
+    void ShowScaleToast()
+    {
+        if (_scaleToast == null || _scaleToastText == null) return;
+        _scaleToastText.Text = T("ui_scale") + "  " + ((int)Math.Round(_uiScale * 100)) + "%";
+        _scaleToast.BeginAnimation(UIElement.OpacityProperty, null);
+        _scaleToast.Opacity = 1.0;
+        _scaleToast.Visibility = Visibility.Visible;
+        if (_scaleToastTimer == null)
+        {
+            _scaleToastTimer = new DispatcherTimer();
+            _scaleToastTimer.Interval = TimeSpan.FromMilliseconds(900);
+            _scaleToastTimer.Tick += delegate
+            {
+                _scaleToastTimer.Stop();
+                if (_scaleToast == null) return;
+                var fade = new DoubleAnimation(1.0, 0.0, new Duration(TimeSpan.FromMilliseconds(450)));
+                fade.Completed += delegate { if (_scaleToast != null) _scaleToast.Visibility = Visibility.Collapsed; };
+                _scaleToast.BeginAnimation(UIElement.OpacityProperty, fade);
+            };
+        }
+        _scaleToastTimer.Stop();
+        _scaleToastTimer.Start();
+    }
+
+    // Apply a new UI scale: clamp 0.8–2.0, push to the live LayoutTransform, persist, update the
+    // gear-popup value label, and flash the % overlay. Called by shortcuts, wheel, and gear steppers.
+    void ApplyUiScale(double v, bool persist) { ApplyUiScale(v, persist, true); }
+    void ApplyUiScale(double v, bool persist, bool toast)
+    {
+        _uiScale = Math.Max(0.8, Math.Min(2.0, Math.Round(v, 2)));
+        if (_rootScale != null) { _rootScale.ScaleX = _uiScale; _rootScale.ScaleY = _uiScale; }
+        if (_uiScaleVal != null) _uiScaleVal.Text = ((int)Math.Round(_uiScale * 100)) + "%";
+        if (persist) { SaveKey("ui_scale", _uiScale.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)); _uiScaleLoaded = true; }
+        if (toast) ShowScaleToast();
+    }
+
+    // Window-level Ctrl+Plus / Ctrl+Minus / Ctrl+0 zoom. Handles both the main-row and NumPad keys.
+    // OemPlus/OemMinus are the US-layout '=' and '-' keys; Add/Subtract are the numeric-keypad ones.
+    void OnScaleKeyDown(object sender, KeyEventArgs e)
+    {
+        if ((Keyboard.Modifiers & ModifierKeys.Control) == 0) return;
+        if (e.Key == Key.OemPlus || e.Key == Key.Add)
+        { ApplyUiScale(_uiScale + 0.1, true); e.Handled = true; }
+        else if (e.Key == Key.OemMinus || e.Key == Key.Subtract)
+        { ApplyUiScale(_uiScale - 0.1, true); e.Handled = true; }
+        else if (e.Key == Key.D0 || e.Key == Key.NumPad0)
+        { ApplyUiScale(1.0, true); e.Handled = true; }
+    }
+
+    // Ctrl+MouseWheel = ±0.1 per notch. Swallowed only when Ctrl is held so normal list scroll
+    // (no modifier) is untouched.
+    void OnScaleMouseWheel(object sender, MouseWheelEventArgs e)
+    {
+        if ((Keyboard.Modifiers & ModifierKeys.Control) == 0) return;
+        ApplyUiScale(_uiScale + (e.Delta > 0 ? 0.1 : -0.1), true);
+        e.Handled = true;
+    }
+
+    // First-run default: on a 4K-class display with NO per-monitor DPI scaling applied (M11 == 1.0,
+    // i.e. Windows is at 100% so native pixels ARE tiny), bump to 125% once and persist. Guarded by
+    // _uiScaleLoaded so a user who already chose a scale (in either app) is never overridden.
+    protected override void OnSourceInitialized(EventArgs e)
+    {
+        base.OnSourceInitialized(e);
+        try
+        {
+            if (!_uiScaleLoaded)
+            {
+                double m11 = 1.0;
+                var src = System.Windows.PresentationSource.FromVisual(this);
+                if (src != null && src.CompositionTarget != null) m11 = src.CompositionTarget.TransformToDevice.M11;
+                double pxWidth = SystemParameters.PrimaryScreenWidth * m11;   // DIPs -> physical pixels
+                if (pxWidth >= 2560 && Math.Abs(m11 - 1.0) < 0.001)
+                    ApplyUiScale(1.25, true, true);    // announce the one-time 4K bump
+                else
+                    ApplyUiScale(1.0, true, false);    // silent explicit default so it never re-triggers
+            }
+            else
+            {
+                ApplyUiScale(_uiScale, false, false);  // silently reflect the loaded value on the live transform
+            }
+        }
+        catch (Exception) { }
     }
 
     // ══════════════════════════════════════════════════════════════════════════════════
@@ -3435,6 +3591,16 @@ class CockpitWindow : Window
         hint.FontSize = 10.5; hint.TextWrapping = TextWrapping.Wrap; hint.Margin = new Thickness(0, 0, 0, 2);
         col.Children.Add(hint);
 
+        // ── 表示サイズ / UI scale: [−] [100%] [+] (step 0.1, live-apply + persist) ──
+        col.Children.Add(SectionHeader(T("ui_scale_section")));
+        var usMinus = MiniButton("−"); usMinus.Click += delegate { ApplyUiScale(_uiScale - 0.1, true); };
+        var usPlus = MiniButton("+"); usPlus.Click += delegate { ApplyUiScale(_uiScale + 0.1, true); };
+        _uiScaleVal = new TextBlock(); _uiScaleVal.Text = ((int)Math.Round(_uiScale * 100)) + "%";
+        col.Children.Add(SettingsStepperRow(T("ui_scale"), _uiScaleVal, usMinus, usPlus));
+        var usHint = new TextBlock(); usHint.Text = T("ui_scale_hint"); usHint.Foreground = Muted;
+        usHint.FontSize = 10.5; usHint.TextWrapping = TextWrapping.Wrap; usHint.Margin = new Thickness(0, 0, 0, 2);
+        col.Children.Add(usHint);
+
         card.Child = col;
         UpdateAutoEnabled();   // grey the ceiling stepper if autoscale is off
         return card;
@@ -4602,10 +4768,14 @@ class CockpitWindow : Window
                 long m = File.GetLastWriteTimeUtc(SettingsFile).Ticks;
                 if (m != _settingsMtime)
                 {
-                    bool d0 = _dark; int l0 = _lang;
+                    bool d0 = _dark; int l0 = _lang; double s0 = _uiScale;
                     LoadSettings();
                     if (d0 != _dark) { ApplyThemeBrushes(); PaintChrome(); _lastSig = ""; }
                     else if (l0 != _lang) { RebuildChrome(); }
+                    // External ui_scale edit (e.g. the chat app zoomed): apply it live so both apps
+                    // stay in lock-step. RebuildChrome above already re-anchored the transform on the
+                    // new root, so ApplyUiScale just needs to push the value onto whichever is current.
+                    if (Math.Abs(s0 - _uiScale) > 0.001) ApplyUiScale(_uiScale, false, true);
                 }
             }
         }

@@ -25,6 +25,12 @@ static class Theme
     public static string Bg(bool d)            { return d ? "#111111" : "#F7F6F2"; }  // app background
     public static string Surface(bool d)       { return d ? "#181818" : "#FFFFFF"; }  // main surface, cards
     public static string SurfaceSubtle(bool d) { return d ? "#202020" : "#F4F4F2"; }  // composer, selected row
+    // Selected/active card fill: a quiet step OFF the surrounding surface (no colored border/rail).
+    // Light: one step darker than SurfaceSubtle/PanelAlt (#F4F4F2) toward Border (#D8D6CF) in the same
+    // warm-neutral family -> #E7E5DE (clearly-but-quietly darker, still lighter than the 1px border so
+    // an inner card never out-values its own edge). Dark: one step LIGHTER than the surface (#202020),
+    // below BorderStrong (#3A3A3A) so the selected fill stays under the hover/active border value.
+    public static string Selected(bool d)      { return d ? "#2C2C2C" : "#E7E5DE"; }  // active/selected row card
     public static string Border(bool d)        { return d ? "#2E2E2E" : "#D8D6CF"; }  // 1px borders
     public static string BorderStrong(bool d)  { return d ? "#3A3A3A" : "#D4D4D0"; }  // active / hover border
     public static string Text(bool d)          { return d ? "#F4F4F5" : "#18181B"; }  // body
