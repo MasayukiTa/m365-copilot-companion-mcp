@@ -1,0 +1,10 @@
+{
+  "description": "read_file on a path that does not exist must return this repo's '[read_file error: ...]' convention, not raise and not crash the caller.",
+  "steps": [
+    {
+      "tool": "read_file",
+      "kwargs": {"path": "{base}/does_not_exist_at_all.txt"},
+      "expect": {"raises_or_error": true}
+    }
+  ]
+}

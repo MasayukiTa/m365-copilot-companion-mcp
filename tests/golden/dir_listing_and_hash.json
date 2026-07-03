@@ -1,0 +1,30 @@
+{
+  "description": "write two files, hash one with hash_file, and confirm list_directory enumerates both -- exercises write_file + hash_file + list_directory together (pure-read tools besides the initial writes).",
+  "steps": [
+    {
+      "tool": "write_file",
+      "kwargs": {"path": "{base}/a.txt", "content": "alpha"},
+      "expect": {"returns_contains": "Wrote"}
+    },
+    {
+      "tool": "write_file",
+      "kwargs": {"path": "{base}/b.txt", "content": "beta"},
+      "expect": {"returns_contains": "Wrote"}
+    },
+    {
+      "tool": "list_directory",
+      "kwargs": {"path": "{base}"},
+      "expect": {"returns_contains": "a.txt"}
+    },
+    {
+      "tool": "hash_file",
+      "kwargs": {"path": "{base}/a.txt", "algorithm": "sha256"},
+      "expect": {"returns_contains": "sha256: "}
+    },
+    {
+      "tool": "hash_file",
+      "kwargs": {"path": "{base}/b.txt", "algorithm": "sha256"},
+      "expect": {"file_contains": ["{base}/b.txt", "beta"]}
+    }
+  ]
+}
