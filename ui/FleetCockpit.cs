@@ -100,6 +100,13 @@ class CockpitWindow : Window
     System.Windows.Controls.Primitives.Popup _overflowPopup;
     Border _headBar;
     ListBox _list;                 // virtualizing host for the card/history rows
+    // PINNED FILTER BAR: the すべて/実行中/承認待ち/完了 segmented control used to be row 0 INSIDE
+    // _list, so it scrolled with the content and — because the list is bottom-anchored to the
+    // composer via a '*' spacer — its Y position drifted as tasks accumulated (user complaint:
+    // "動きまくって結構うっとうしい"). It now lives in a fixed host docked ABOVE _list (never
+    // inside the scroll), so it is stationary regardless of card count / scroll offset.
+    Border _pinnedToolbarHost;
+    string _pinnedToolbarSig = "";
     // Persistent row backing store. We bind this to _list.ItemsSource ONCE and only ever mutate
     // it in place (SetRows reconciles item-by-item). Reassigning ItemsSource with a fresh List --
     // the old behaviour -- made the VirtualizingStackPanel treat every update as a collection
@@ -580,8 +587,21 @@ class CockpitWindow : Window
         _list.SetBinding(FrameworkElement.MaxHeightProperty, maxBind);
         Grid.SetRow(_list, 1);
         listWrap.Children.Add(_list);
-        Grid.SetColumn(listWrap, 1);
-        lanesGrid.Children.Add(listWrap);
+
+        // Col1 is now a DockPanel: the pinned filter bar sits at the TOP (fixed), the bottom-anchored
+        // listWrap fills the rest. Because the toolbar host is OUTSIDE the ListBox's ScrollViewer, it
+        // never scrolls and never moves as cards/history grow — it is anchored to the top of the run
+        // area directly under the header. The left padding matches the list's inner padding (18) so
+        // the bar and the cards under it share the same left edge.
+        var col1 = new DockPanel { LastChildFill = true };
+        _pinnedToolbarHost = new Border();
+        _pinnedToolbarHost.Padding = new Thickness(18, 6, 18, 0);
+        _pinnedToolbarHost.Visibility = Visibility.Collapsed;   // shown once there is a run/history to filter
+        DockPanel.SetDock(_pinnedToolbarHost, Dock.Top);
+        col1.Children.Add(_pinnedToolbarHost);
+        col1.Children.Add(listWrap);   // LastChildFill -> fills below the pinned bar
+        Grid.SetColumn(col1, 1);
+        lanesGrid.Children.Add(col1);
 
         root.Children.Add(lanesGrid);
         Content = root;
@@ -3783,6 +3803,14 @@ class CockpitWindow : Window
             // A2-2: collapse spine and idle composer when no run
             RefreshSpine(root, true);
             PaintComposerMode(false);
+            // Idle: only history (or the empty state) is shown — no live board to filter, so the
+            // pinned filter bar is hidden here just as the toolbar row was never emitted when idle.
+            if (_pinnedToolbarHost != null)
+            {
+                _pinnedToolbarHost.Visibility = Visibility.Collapsed;
+                _pinnedToolbarHost.Child = null;
+                _pinnedToolbarSig = "";
+            }
             string isig = "IDLE" + _history.Count + (_dark ? "D" : "L") + _lang;
             if (_lastSig != isig)
             {
@@ -4064,6 +4092,7 @@ class CockpitWindow : Window
         double off = (sc != null) ? sc.VerticalOffset : 0.0;
 
         SetRows(BuildRows(root));
+        RefreshPinnedToolbar();     // rebuild the pinned filter bar (only when its signature changed)
 
         if (off > 0.0)
         {
@@ -4074,6 +4103,36 @@ class CockpitWindow : Window
                 if (s2 != null) s2.ScrollToVerticalOffset(target);
             }), System.Windows.Threading.DispatcherPriority.Loaded);
         }
+    }
+
+    // Rebuild the PINNED filter bar into its fixed host above the list. Called after BuildRows (so
+    // _toolbarAll/_toolbarShown are current). Uses the same signature the toolbar row used (case 0
+    // in RowSig) so the heavy Border is only re-created when a count/filter/theme actually changes —
+    // otherwise we leave the existing element in place (no flicker, no needless layout). The bar is
+    // hidden in the empty state (no workers AND no history), matching the old behavior where the
+    // toolbar row was simply not emitted.
+    void RefreshPinnedToolbar()
+    {
+        if (_pinnedToolbarHost == null) return;
+        bool empty = (_toolbarAll == null || _toolbarAll.Count == 0) && (_history == null || _history.Count == 0);
+        if (empty)
+        {
+            _pinnedToolbarHost.Visibility = Visibility.Collapsed;
+            _pinnedToolbarHost.Child = null;
+            _pinnedToolbarSig = "";
+            return;
+        }
+        // Signature identical to RowSig(case 0) so we rebuild on exactly the same triggers.
+        int[] tc = ToolbarCounts(_toolbarAll);
+        string g = (_dark ? "D" : "L") + _lang.ToString();
+        string sig = "T|" + g + "|" + _toolbarShown.Count + "/" + _toolbarAll.Count
+                     + "|all" + tc[0] + ":act" + tc[1] + ":need" + tc[2] + ":done" + tc[3]
+                     + ":max" + tc[5] + ":bad" + tc[6] + ":hid" + tc[7]
+                     + "|ar" + (_autoRetry ? 1 : 0) + ":" + _autoRetryMax + "|f" + _cardFilter;
+        _pinnedToolbarHost.Visibility = Visibility.Visible;
+        if (sig == _pinnedToolbarSig && _pinnedToolbarHost.Child != null) return;   // unchanged -> keep as-is
+        _pinnedToolbarSig = sig;
+        _pinnedToolbarHost.Child = BuildCardToolbar(_toolbarAll, _toolbarShown);
     }
 
     // Build the lightweight row-model list for the virtualizing ListBox: a toolbar row, one card
@@ -4126,7 +4185,9 @@ class CockpitWindow : Window
             rows.Add(MkRow(5, null, null));
             return rows;
         }
-        rows.Add(MkRow(0, null, null));               // toolbar
+        // NOTE: the toolbar (すべて/実行中/承認待ち/完了 filter) is NO LONGER a scrolling row. It is
+        // pinned in _pinnedToolbarHost above the list (see RefreshPinnedToolbar, called from
+        // RenderCards). Row kind 0 is retained in the converter for safety but never emitted here.
 
         // TASK 3: Directive band — show only while there is at least one ON-BOARD worker (i.e. not
         // every card has been sent to History). Once the whole run is cleared to History the band
