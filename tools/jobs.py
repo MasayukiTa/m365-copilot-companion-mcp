@@ -92,6 +92,11 @@ def _watchdog_fire(job: "_Job") -> None:
     proc = job.process
     if proc is None or proc.poll() is not None:
         return  # already finished naturally
+    # Mark the decision to kill BEFORE terminate(): terminate() (SIGTERM on POSIX)
+    # can make the child exit almost instantly, so a concurrent job_status poll could
+    # otherwise observe "finished" via poll() before the finally-block set the flag,
+    # and miss the "killed: exceeded max runtime" note. Setting it here closes that race.
+    job.killed_by_watchdog = True
     try:
         proc.terminate()
         try:
