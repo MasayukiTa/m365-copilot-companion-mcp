@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from .security import require_unlocked
+from ._untrusted import wrap_untrusted
 
 _GATE_ENV = "MCP_REQUIRE_GATE_FOR_SIDE_EFFECTS"
 
@@ -83,7 +84,8 @@ def outlook_inbox(limit: int = 20, unread_only: bool = False) -> str:
                     break
             if not rows:
                 return "(no matching mail items)"
-            return "\n".join(rows)
+            payload = "\n".join(rows)
+            return wrap_untrusted(payload, source="outlook", origin="inbox")
         finally:
             _release()
     except Exception as e:
@@ -219,7 +221,8 @@ def outlook_calendar(
                     break
             if not rows:
                 return "(no events in that window)"
-            return "\n\n".join(rows)
+            payload = "\n\n".join(rows)
+            return wrap_untrusted(payload, source="outlook", origin="calendar")
         finally:
             _release()
     except Exception as e:

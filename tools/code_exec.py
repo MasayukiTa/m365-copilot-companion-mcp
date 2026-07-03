@@ -4,6 +4,7 @@ import sys
 import tempfile
 from typing import Optional
 
+from ._subproc import sanitized_child_env
 from .file_ops import _validate_path
 from .security import require_unlocked
 
@@ -62,6 +63,7 @@ def run_python(
             timeout=timeout,
             cwd=_working_dir(working_dir),
             shell=False,
+            env=sanitized_child_env(),
         )
         output = ""
         if result.stdout:
@@ -111,6 +113,7 @@ def shell_exec(
             text=True,
             timeout=timeout,
             cwd=_working_dir(working_dir),
+            env=sanitized_child_env(),
         )
         output = ""
         if result.stdout:

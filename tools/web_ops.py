@@ -4,6 +4,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from ._untrusted import wrap_untrusted
+
 USER_AGENT = "m365-copilot-companion-mcp/0.1 (+local agent)"
 MAX_CHARS = 60_000
 
@@ -50,7 +52,8 @@ def web_fetch(
             body = _html_to_text(body)
         if len(body) > max_chars:
             body = body[:max_chars] + f"\n... truncated at {max_chars:,} characters"
-        return "\n".join(header_lines) + "\n" + body
+        wrapped_body = wrap_untrusted(body, source="web_fetch", origin=str(r.url))
+        return "\n".join(header_lines) + "\n" + wrapped_body
     except httpx.HTTPError as e:
         return f"[web_fetch HTTP error: {type(e).__name__}: {e}]"
     except Exception as e:
