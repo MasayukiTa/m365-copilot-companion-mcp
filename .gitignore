@@ -108,6 +108,12 @@ ui/_buildcheck/
 /docs/*.md
 !/docs/STARTUP_devtunnel_login.md
 !/docs/companion_setup.md
+# public reference docs linked from the README
+!/docs/ARCHITECTURE.md
+!/docs/CONFIG.md
+!/docs/SECURITY.md
+!/docs/TROUBLESHOOTING.md
+!/docs/ADVANCED.md
 /docs/validation/
 # scratch probes / b64 dumps / one-off data created during eval sessions
 /bench/_k*.py
