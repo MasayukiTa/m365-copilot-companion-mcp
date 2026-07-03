@@ -18,10 +18,12 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
@@ -78,6 +80,14 @@ class CockpitWindow : Window
     string _effort = "auto";   // effort mode min|max|ultra|auto -> settings.txt effort= (NEW)
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
     bool _paused = false;      // local fleet pause/resume toggle state (NEW)
+    bool _autoArchive = false;  // P2: when ON, move this run's completed cards to History as soon
+                                // as the RUN reaches its finished state -> settings.txt autoarchive=
+    Button _autoArchiveBtn;     // gear-popup toggle for _autoArchive
+    string _archivedRunStarted = "";   // `started` of the run already auto-archived (fire once/run)
+    // P2 history search: live case-insensitive substring filter over title+result, debounced.
+    TextBox _histSearchBox;
+    string _histQuery = "";
+    DispatcherTimer _histSearchTimer;
     long _settingsMtime = 0;
 
     readonly string _statusPath, _commandsPath, _historyPath, _openPath;
@@ -344,6 +354,15 @@ class CockpitWindow : Window
         if (k == "infra_wait") return ja ? "インフラ待ち" : "Infra wait";
         if (k == "infra_retry") return ja ? "再投入" : "Re-queue";
         if (k == "badge_default_copilot") return ja ? "既定Copilot" : "default Copilot";
+        // ── P1/P2 UX: artifacts, history groups/search/auto-archive, resume ──────────
+        if (k == "artifacts") return ja ? "成果物" : "Artifacts";
+        if (k == "path_missing") return ja ? "見つかりません" : "Not found";
+        if (k == "hist_today") return ja ? "今日" : "Today";
+        if (k == "hist_yesterday") return ja ? "昨日" : "Yesterday";
+        if (k == "hist_earlier") return ja ? "その他" : "Earlier";
+        if (k == "hist_search") return ja ? "履歴を検索…" : "Search history…";
+        if (k == "autoarchive") return ja ? "完了を自動で履歴へ" : "Auto-archive on finish";
+        if (k == "set_archive_section") return ja ? "自動アーカイブ" : "Auto-archive";
         // Capacity-wait banner (admission gate) + force-start
         // Settings panel (gear popup) -- consolidates the scattered toolbar controls
         if (k == "settings") return ja ? "設定" : "Settings";
@@ -421,6 +440,7 @@ class CockpitWindow : Window
                 else if (ln.StartsWith("autoscale=")) _autoscale = ln.Substring(10).Trim() == "1";
                 else if (ln.StartsWith("autoretry_max=") && int.TryParse(ln.Substring(14).Trim(), out v)) _autoRetryMax = Math.Max(1, Math.Min(3, v));
                 else if (ln.StartsWith("autoretry=")) _autoRetry = ln.Substring(10).Trim() == "1";
+                else if (ln.StartsWith("autoarchive=")) _autoArchive = ln.Substring(12).Trim() == "1";
                 else if (ln.StartsWith("disk_floor_gb="))
                 {
                     double df;
@@ -2103,6 +2123,88 @@ class CockpitWindow : Window
         return true;
     }
 
+    // P2 RESUME: spawn a fresh fleet with --resume (re-queues the unfinished goals from the durable
+    // ledger, per fleet_runner.py). Mirrors SpawnFleet's launch construction but passes --resume
+    // INSTEAD of a goals file (the runner reads .fleet/last_run_goals.json / last_run_done.json).
+    bool SpawnFleetResume()
+    {
+        string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+        string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+        if (!File.Exists(py)) py = "python";
+        string stateDir = Path.GetDirectoryName(_statusPath);
+
+        var psi = new System.Diagnostics.ProcessStartInfo();
+        psi.FileName = py;
+        psi.Arguments = "-m relay.fleet_runner --resume"
+                        + " --state-dir \"" + stateDir + "\" --effort " + _effort;
+        psi.WorkingDirectory = repo;
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+        System.Diagnostics.Process.Start(psi);
+        return true;
+    }
+
+    // Reimplements fleet_runner._goal_key EXACTLY: sha1 of the goal's UTF-8 bytes AFTER .strip(),
+    // hex, first 16 chars. Must match byte-for-byte so the C# unfinished-count joins onto the
+    // Python-written done-map. (Python str.strip() removes leading/trailing Unicode whitespace;
+    // .NET String.Trim() does the same, so Trim() is the correct analog.)
+    static string GoalKey(string text)
+    {
+        string norm = (text ?? "").Trim();
+        byte[] bytes = new UTF8Encoding(false).GetBytes(norm);
+        using (var sha = System.Security.Cryptography.SHA1.Create())
+        {
+            byte[] h = sha.ComputeHash(bytes);
+            var sb = new StringBuilder(h.Length * 2);
+            foreach (byte b in h) sb.Append(b.ToString("x2"));
+            return sb.ToString().Substring(0, 16);
+        }
+    }
+
+    // Count of goals in the last run's durable ledger that did NOT finish successfully (i.e. whose
+    // key is absent from last_run_done.json with a DONE outcome). 0 when there is no ledger. Mirrors
+    // fleet_runner's resume semantics: a goal is "done" only when its done-map outcome is DONE.
+    int UnfinishedResumeCount()
+    {
+        try
+        {
+            string stateDir = Path.GetDirectoryName(_statusPath);
+            string goalsPath = Path.Combine(stateDir, "last_run_goals.json");
+            if (!File.Exists(goalsPath)) return 0;
+            var ledger = _js.DeserializeObject(File.ReadAllText(goalsPath, Encoding.UTF8)) as Dictionary<string, object>;
+            if (ledger == null) return 0;
+            object goalsObj;
+            if (!ledger.TryGetValue("goals", out goalsObj) || !(goalsObj is object[])) return 0;
+
+            // done-map: {goal_key: outcome}; a goal counts finished only when outcome == "DONE".
+            var doneKeys = new HashSet<string>();
+            string donePath = Path.Combine(stateDir, "last_run_done.json");
+            if (File.Exists(donePath))
+            {
+                var dm = _js.DeserializeObject(File.ReadAllText(donePath, Encoding.UTF8)) as Dictionary<string, object>;
+                if (dm != null)
+                    foreach (var kv in dm)
+                        if (kv.Value != null && kv.Value.ToString() == "DONE") doneKeys.Add(kv.Key);
+            }
+
+            int n = 0;
+            foreach (object o in (object[])goalsObj)
+            {
+                var e = o as Dictionary<string, object>;
+                if (e == null) continue;
+                string text = S(e, "text");
+                if (string.IsNullOrEmpty(text)) continue;
+                // prefer the ledger's own key (written by Python), fall back to recomputing it
+                string key = S(e, "key");
+                if (string.IsNullOrEmpty(key)) key = GoalKey(text);
+                if (!doneKeys.Contains(key)) n++;
+            }
+            return n;
+        }
+        catch (Exception) { return 0; }
+    }
+
     // --- slash-command autocomplete for the goal box (parity with the main chat) ---
     Popup _gcmdPopup; ListBox _gcmdList;
     Popup _helpPopup;   // /help text shown HERE (a compact popup) instead of dumped into the goal box
@@ -3198,6 +3300,21 @@ class CockpitWindow : Window
         var capPlus = MiniButton("+"); capPlus.Click += delegate { SetAutoRetryMax(_autoRetryMax + 1); };
         _autoRetryCapVal = new TextBlock(); _autoRetryCapVal.Text = _autoRetryMax.ToString();
         col.Children.Add(SettingsStepperRow(T("cap"), _autoRetryCapVal, capMinus, capPlus));
+
+        // ── P2 (c): Auto-archive on finish (default OFF) ──
+        col.Children.Add(SectionHeader(T("set_archive_section")));
+        _autoArchiveBtn = new Button();
+        _autoArchiveBtn.BorderThickness = new Thickness(1); _autoArchiveBtn.Cursor = Cursors.Hand;
+        _autoArchiveBtn.Padding = new Thickness(10, 4, 10, 4); _autoArchiveBtn.FontSize = 12;
+        _autoArchiveBtn.FontWeight = FontWeights.SemiBold; _autoArchiveBtn.HorizontalAlignment = HorizontalAlignment.Left;
+        _autoArchiveBtn.Margin = new Thickness(0, 2, 0, 4);
+        _autoArchiveBtn.Template = FlatButtonTemplate();
+        _autoArchiveBtn.ToolTip = _lang == 0
+            ? "ラン終了時に完了カードを自動で履歴へ移動（既定OFF）。"
+            : "Move completed cards to History automatically when the run finishes (default OFF).";
+        _autoArchiveBtn.Click += delegate { _autoArchive = !_autoArchive; SaveKey("autoarchive", _autoArchive ? "1" : "0"); PaintAutoArchiveBtn(); };
+        PaintAutoArchiveBtn();
+        col.Children.Add(_autoArchiveBtn);
 
         // ── Capacity guard: NEW user-editable disk floor (GB) ──
         col.Children.Add(SectionHeader(T("set_capacity_section")));
@@ -4412,11 +4529,21 @@ class CockpitWindow : Window
                 _pinnedToolbarHost.Child = null;
                 _pinnedToolbarSig = "";
             }
-            string isig = "IDLE" + _history.Count + (_dark ? "D" : "L") + _lang;
+            // P2 RESUME affordance: only meaningful when NO run is live (this idle branch). Compute the
+            // unfinished count from the last run's durable ledger; hide when 0.
+            int resumeN = UnfinishedResumeCount();
+            string isig = "IDLE" + _history.Count + (_dark ? "D" : "L") + _lang + "|q" + (_histQuery ?? "")
+                          + "|r" + resumeN;
             if (_lastSig != isig)
             {
                 _lastRoot = null;
                 var rows = new List<object>();
+                if (resumeN > 0)
+                {
+                    var rd = new Dictionary<string, object>();
+                    rd["n"] = resumeN;
+                    rows.Add(MkRow(8, null, rd));   // resume affordance (idle + N>0 only)
+                }
                 AppendHistoryRows(rows, null);   // idle: no live run on board -> show all history
                 if (rows.Count == 0) rows.Add(MkRow(5, null, null));   // empty state when nothing to show
                 SetRows(rows);
@@ -4440,6 +4567,10 @@ class CockpitWindow : Window
         // opt-in auto-retry runs every tick (before the sig short-circuit) so it catches a
         // stopped goal even when nothing else changed. Bounded by _autoRetryMax per goal text.
         if (runningNow && _autoRetry) AutoRetryScan(root);
+        // P2 (c) AUTO-ARCHIVE: when the RUN has finished (not running AND every worker terminal),
+        // move its completed cards to History -- reusing the exact "すべて履歴へ" code path
+        // (ArchiveAllTerminal). Fires ONCE per run, keyed on `started`, and only when enabled.
+        if (_autoArchive && !runningNow) MaybeAutoArchive(root);
         // A2-2: spine refresh runs every tick (keyed off its own sig, cheap when unchanged).
         // _toolbarAll is populated by the last RenderCards/BuildRows; for the first tick it may
         // be empty, but RefreshSpine re-reads workers from root directly so that's fine.
@@ -4450,6 +4581,35 @@ class CockpitWindow : Window
         if (sig == _lastSig) return;
         _lastSig = sig;
         RenderCards(root);
+    }
+
+    // P2 (c): if the run has finished and every on-board worker is terminal, archive them ALL to
+    // History via the same path the "すべて履歴へ" button uses. Guarded to fire once per run by
+    // the run's `started` identity (a new run resets it) so a finished snapshot re-read each tick
+    // doesn't re-archive (and Clear can still stick).
+    void MaybeAutoArchive(Dictionary<string, object> root)
+    {
+        if (root == null) return;
+        string started = S(root, "started");
+        if (string.IsNullOrEmpty(started)) return;
+        if (_archivedRunStarted == started) return;            // already handled this run
+
+        object wo;
+        if (!root.TryGetValue("workers", out wo) || !(wo is object[])) return;
+        var wArr = (object[])wo;
+        if (wArr.Length == 0) return;
+        foreach (object o in wArr)
+        {
+            var w = o as Dictionary<string, object>;
+            if (w == null) continue;
+            if (!IsTerminalWorker(w)) return;                  // not fully finished yet -> wait
+        }
+        // _toolbarShown is populated by the last RenderCards; on the finished tick it holds this
+        // run's terminal workers. If it hasn't been built yet (empty), defer to a later tick rather
+        // than marking the run handled with nothing archived.
+        if (_toolbarShown == null || _toolbarShown.Count == 0) return;
+        _archivedRunStarted = started;                         // mark BEFORE archiving (idempotent)
+        ArchiveAllTerminal();                                   // reuse the exact bulk-archive path
     }
 
     // Opt-in, CAPPED auto-retry. For each STOPPED non-DONE goal, re-queue it at most
@@ -4900,9 +5060,64 @@ class CockpitWindow : Window
             visible.Add(e);
         }
         if (visible.Count == 0) return;               // everything is still on-board -> no History section yet
-        rows.Add(MkRow(2, null, null));               // history header
-        foreach (Dictionary<string, object> e in visible)
+        rows.Add(MkRow(2, null, null));               // history header (carries the search box)
+
+        // P2 (b) SEARCH: case-insensitive substring filter over title + result/goal text.
+        string q = (_histQuery ?? "").Trim();
+        List<Dictionary<string, object>> filtered = visible;
+        if (q.Length > 0)
+        {
+            string ql = q.ToLowerInvariant();
+            filtered = new List<Dictionary<string, object>>();
+            foreach (Dictionary<string, object> e in visible)
+            {
+                string hay = (CardTitle(S(e, "conv_title"), S(e, "goal")) + " "
+                              + S(e, "goal") + " " + S(e, "display_result") + " "
+                              + S(e, "last") + " " + S(e, "outcome")).ToLowerInvariant();
+                if (hay.IndexOf(ql, StringComparison.Ordinal) >= 0) filtered.Add(e);
+            }
+        }
+        if (filtered.Count == 0) return;              // header still shown so the search box stays reachable
+
+        // P2 (a) DATE GROUPS: emit a subheader (今日 / 昨日 / YYYY-MM-DD / その他) whenever the day
+        // bucket changes. `visible` is already newest-first, so groups come out most-recent-first.
+        string lastGroup = null;
+        foreach (Dictionary<string, object> e in filtered)
+        {
+            string grp = HistoryGroupLabel(e);
+            if (grp != lastGroup)
+            {
+                var gd = new Dictionary<string, object>();
+                gd["label"] = grp;
+                rows.Add(MkRow(7, null, gd));         // date-group subheader
+                lastGroup = grp;
+            }
             rows.Add(MkRow(3, null, e));             // one history row per visible entry
+        }
+    }
+
+    // The date-group bucket label for a history entry, derived from its `ts` (archived-at unix
+    // seconds). Entries archived before `ts` existed (old history) have no timestamp -> その他 /
+    // Earlier. Today / Yesterday are relative to local midnight; older days show YYYY-MM-DD.
+    string HistoryGroupLabel(Dictionary<string, object> e)
+    {
+        double ts = Dbl(e, "ts");
+        if (ts <= 0) return T("hist_earlier");
+        DateTime day;
+        try { day = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(ts).ToLocalTime().Date; }
+        catch (Exception) { return T("hist_earlier"); }
+        DateTime today = DateTime.Now.Date;
+        if (day == today) return T("hist_today");
+        if (day == today.AddDays(-1)) return T("hist_yesterday");
+        return day.ToString("yyyy-MM-dd");
+    }
+
+    // The date-group subheader UIElement (Kind==7). Small muted caption, matching the History chrome.
+    UIElement HistoryGroupHeader(string label)
+    {
+        return new TextBlock {
+            Text = label, Foreground = Muted, FontSize = 11.5, FontWeight = FontWeights.SemiBold,
+            Margin = new Thickness(12, 10, 8, 2) };
     }
 
     // Build one row model and freeze its render signature (so SetRows can diff old-vs-new rows
@@ -4928,7 +5143,11 @@ class CockpitWindow : Window
                        + "|all" + tc0[0] + ":act" + tc0[1] + ":need" + tc0[2] + ":done" + tc0[3]
                        + ":max" + tc0[5] + ":bad" + tc0[6] + ":hid" + tc0[7]
                        + "|ar" + (_autoRetry ? 1 : 0) + ":" + _autoRetryMax + "|f" + _cardFilter;
-            case 2: return "HH|" + g;                          // history header (static chrome)
+            case 2: return "HH|" + g;                          // history header (static chrome; search box preserved across renders)
+            case 7:                                            // date-group subheader: keyed on its label
+                return "HG|" + g + "|" + (hist != null ? S(hist, "label") : "");
+            case 8:                                            // resume affordance: keyed on N
+                return "RA|" + g + "|" + (hist != null ? I(hist, "n") : 0);
             case 4: return "DV|" + g;                          // "完了 (this run)" divider
             case 5: return "ES|" + g;                          // empty state (static chrome)
             case 6:                                            // directive band: keyed on first-worker goal + started
@@ -4958,7 +5177,9 @@ class CockpitWindow : Window
                 // P0: conv_url drives the agent badge (agent-bound vs 既定Copilot); reason drives the
                 // INFRA_STUCK row text — track both so those cards re-render when they change.
                 sb.Append(':').Append(StableShortHash(S(w, "conv_url")))
-                  .Append(':').Append(StableShortHash(S(w, "reason")));
+                  .Append(':').Append(StableShortHash(S(w, "reason")))
+                  // P1: the card headline prefers conv_title (Copilot auto-title) -> re-render when it arrives
+                  .Append(':').Append(StableShortHash(S(w, "conv_title")));
                 // TASK 3 (Bucket C): track next_step + self_confidence so the collapsed row re-renders.
                 sb.Append('|').Append(S(w, "next_step").Length).Append(':').Append(S(w, "self_confidence"));
                 return sb.ToString();
@@ -5041,6 +5262,8 @@ class CockpitWindow : Window
             if (r.Kind == 4) return _w.CompletedDivider();
             if (r.Kind == 5) return _w.EmptyState();
             if (r.Kind == 6) return _w.DirectiveBand(r.Worker);
+            if (r.Kind == 7) return _w.HistoryGroupHeader(r.Hist != null ? S(r.Hist, "label") : "");
+            if (r.Kind == 8) return _w.ResumeAffordance(r.Hist != null ? I(r.Hist, "n") : 0);
             return null;
         }
         public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
@@ -5128,6 +5351,51 @@ class CockpitWindow : Window
         block.Children.Add(wrap);
         outer.Child = block;
         return outer;
+    }
+
+    // P2 RESUME: inline banner shown (idle only, N>0) offering to relaunch the fleet with --resume,
+    // which re-queues the unfinished goals from the last run's durable ledger. Hidden while a run is
+    // live or when N==0 (the row is simply not emitted in those cases).
+    UIElement ResumeAffordance(int n)
+    {
+        var row = new Border {
+            BorderThickness = new Thickness(1), BorderBrush = Border, Background = BtnBg,
+            CornerRadius = new CornerRadius(Theme.RadCard),
+            Padding = new Thickness(14, 8, 14, 8), Margin = new Thickness(8, 8, 8, 4) };
+        var dp = new DockPanel { LastChildFill = true };
+
+        var btn = new Button {
+            Content = _lang == 0 ? "再開" : "Resume", Cursor = Cursors.Hand, FontSize = 12,
+            FontWeight = FontWeights.SemiBold, Padding = new Thickness(12, 4, 12, 4),
+            BorderThickness = new Thickness(1) };
+        btn.Background = BtnBg; btn.Foreground = Fg; btn.BorderBrush = Border;
+        btn.Template = FlatButtonTemplate();
+        btn.Click += delegate
+        {
+            try
+            {
+                SpawnFleetResume();
+                _lastSig = "";
+                if (_startNote != null)
+                    _startNote.Text = _lang == 0 ? "前回のランを再開しました。" : "Resumed the last run.";
+            }
+            catch (Exception ex)
+            {
+                if (_startNote != null) _startNote.Text = (_lang == 0 ? "再開に失敗: " : "Resume failed: ") + ex.Message;
+            }
+        };
+        DockPanel.SetDock(btn, Dock.Right);
+        dp.Children.Add(btn);
+
+        var msg = new TextBlock {
+            Text = _lang == 0 ? ("前回のランに未完了が " + n + " 件")
+                              : ("Last run left " + n + " unfinished"),
+            Foreground = Fg, FontSize = 12.5, VerticalAlignment = VerticalAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis };
+        dp.Children.Add(msg);
+
+        row.Child = dp;
+        return row;
     }
 
     // TASK 3: Directive band — shown only in the live/active branch, inserted above card list.
@@ -5388,6 +5656,23 @@ class CockpitWindow : Window
         }
     }
 
+    // P2 (c): auto-archive toggle chip -- same calm success/neutral treatment as PaintAutoRetryBtn.
+    void PaintAutoArchiveBtn()
+    {
+        if (_autoArchiveBtn == null) return;
+        _autoArchiveBtn.Content = T("autoarchive") + ": " + (_autoArchive ? "ON" : "OFF");
+        if (_autoArchive)
+        {
+            _autoArchiveBtn.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+            _autoArchiveBtn.Foreground = Theme.Br(Theme.Success(_dark));
+            _autoArchiveBtn.BorderBrush = Theme.Br(Theme.Success(_dark));
+        }
+        else
+        {
+            _autoArchiveBtn.Background = BtnBg; _autoArchiveBtn.Foreground = Muted; _autoArchiveBtn.BorderBrush = Border;
+        }
+    }
+
     void SetAutoRetryMax(int v)
     {
         _autoRetryMax = Math.Max(1, Math.Min(3, v));   // hard safety bound: 1..3, never unbounded
@@ -5556,11 +5841,47 @@ class CockpitWindow : Window
         clear.Click += delegate { ClearHistory(); };
         DockPanel.SetDock(clear, Dock.Right);
         head.Children.Add(clear);
+
+        // P2 (b): live search box. Docked right of the caption; typing filters the rows below with a
+        // ~300ms debounce (so it doesn't rebuild on every keystroke). Built ONCE and preserved across
+        // renders (the header row's signature is static), so focus + caret survive a re-filter.
+        if (_histSearchBox == null)
+        {
+            _histSearchBox = new TextBox();
+            _histSearchBox.Text = _histQuery ?? "";
+            _histSearchBox.Width = 160; _histSearchBox.FontSize = 12;
+            _histSearchBox.Padding = new Thickness(6, 2, 6, 2);
+            _histSearchBox.VerticalContentAlignment = VerticalAlignment.Center;
+            _histSearchBox.BorderThickness = new Thickness(1);
+            _histSearchBox.ToolTip = T("hist_search");
+            _histSearchBox.TextChanged += delegate { OnHistSearchChanged(); };
+        }
+        _histSearchBox.Background = BtnBg; _histSearchBox.Foreground = Fg; _histSearchBox.BorderBrush = Border;
+        var searchWrap = new Border { Child = _histSearchBox, Margin = new Thickness(8, 0, 8, 0) };
+        DockPanel.SetDock(searchWrap, Dock.Right);
+        head.Children.Add(searchWrap);
+
         var ht = new TextBlock();
         ht.Text = (_lang == 0 ? "履歴 — クリアするまで蓄積（クリックで会話を表示）" : "History — stacks until cleared (click to open)");
         ht.Foreground = Muted; ht.FontSize = 12.5; ht.VerticalAlignment = VerticalAlignment.Center;
         head.Children.Add(ht);
         return head;
+    }
+
+    // Debounced history-search handler: stash the query, then (re)arm a ~300ms one-shot timer that
+    // triggers a single re-render. Prevents a rebuild-per-keystroke thrash while staying live.
+    void OnHistSearchChanged()
+    {
+        if (_histSearchBox == null) return;
+        _histQuery = _histSearchBox.Text ?? "";
+        if (_histSearchTimer == null)
+        {
+            _histSearchTimer = new DispatcherTimer();
+            _histSearchTimer.Interval = TimeSpan.FromMilliseconds(300);
+            _histSearchTimer.Tick += delegate { _histSearchTimer.Stop(); ForceRender(); };
+        }
+        _histSearchTimer.Stop();
+        _histSearchTimer.Start();
     }
 
     // Divider that separates the live (active/queued) cards above from this run's TERMINAL workers
@@ -6240,6 +6561,182 @@ class CockpitWindow : Window
                                FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 10, 0, 4) };
     }
 
+    // ── P1 ARTIFACT LINKS ───────────────────────────────────────────────────────
+    // Detect Windows file/folder paths inside agent result text and make them clickable.
+    // Matches: a drive-letter path (C:\... or C:/...) OR a UNC path (\\host\share\...),
+    // with either separator, allowing Japanese and other non-space/non-quote characters in
+    // segments, stopping at whitespace, quotes, or bracket delimiters. Trailing punctuation
+    // (Japanese 。、 and ASCII . , ) ] ; :) is stripped by CleanPathTail after the match so a
+    // path at the end of a sentence doesn't swallow the period. Parsing is capped by the caller
+    // to the first ~4000 chars so a huge blob can't stall the UI thread.
+    static readonly Regex _pathRe = new Regex(
+        @"(?:[A-Za-z]:[\\/]|\\\\[^\\/\s""'<>|]+[\\/])[^\s""'<>|(){}\[\]]+",
+        RegexOptions.Compiled);
+    const int PathScanCap = 4000;
+
+    // Strip trailing sentence punctuation the regex may have greedily included.
+    static string CleanPathTail(string p)
+    {
+        if (string.IsNullOrEmpty(p)) return p;
+        int end = p.Length;
+        while (end > 0)
+        {
+            char c = p[end - 1];
+            if (c == '。' || c == '、' || c == '.' || c == ',' || c == ')' || c == ']'
+                || c == ';' || c == ':' || c == '!' || c == '?' || c == '"' || c == '\'')
+                end--;
+            else break;
+        }
+        return p.Substring(0, end);
+    }
+
+    // Reveal a detected path: file -> explorer /select (highlight in its folder); directory ->
+    // open the folder; neither exists -> no-op (the run is rendered non-interactive with a tooltip).
+    static void RevealPath(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+                System.Diagnostics.Process.Start("explorer.exe", "/select,\"" + path + "\"");
+            else if (Directory.Exists(path))
+                System.Diagnostics.Process.Start("explorer.exe", "\"" + path + "\"");
+        }
+        catch (Exception) { }
+    }
+
+    // Distinct EXISTING paths (file or folder) found in `text`, in first-seen order, capped scan.
+    List<string> DetectExistingPaths(string text)
+    {
+        var outp = new List<string>();
+        if (string.IsNullOrEmpty(text)) return outp;
+        string scan = text.Length > PathScanCap ? text.Substring(0, PathScanCap) : text;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (Match m in _pathRe.Matches(scan))
+        {
+            string p = CleanPathTail(m.Value);
+            if (p.Length < 4) continue;
+            bool exists;
+            try { exists = File.Exists(p) || Directory.Exists(p); } catch (Exception) { exists = false; }
+            if (!exists) continue;
+            if (seen.Add(p)) outp.Add(p);
+        }
+        return outp;
+    }
+
+    // A hyperlink-styled run for one path. Clickable when the path exists (reveal in folder / open
+    // folder); disabled + "見つかりません" tooltip when it does not.
+    Inline MakePathRun(string rawPath)
+    {
+        string path = CleanPathTail(rawPath);
+        bool exists;
+        try { exists = File.Exists(path) || Directory.Exists(path); } catch (Exception) { exists = false; }
+        if (!exists)
+        {
+            var dead = new Run(rawPath);
+            dead.Foreground = Muted;
+            dead.ToolTip = T("path_missing");
+            return dead;
+        }
+        var link = new Hyperlink(new Run(rawPath));
+        link.Foreground = Theme.Br(Theme.Info(_dark));   // link color from tokens
+        link.Cursor = Cursors.Hand;
+        link.ToolTip = path;
+        string captured = path;
+        link.Click += delegate { RevealPath(captured); };
+        return link;
+    }
+
+    // Result text as an inline-capable, wrapping, selectable block with any detected file/folder
+    // paths rendered as clickable links. Falls back to the plain RoText TextBox when the text has
+    // no detectable path, so wrapping / em-height stay identical to the old rendering. Uses the
+    // SAME MaxHeight / scroll affordance so tall results still scroll rather than push the card.
+    UIElement ResultText(string s, Brush fg, double size)
+    {
+        var paths = DetectPathSpans(s);
+        if (paths.Count == 0) return RoText(s, fg, size);
+
+        var rtb = new RichTextBox {
+            IsReadOnly = true, IsDocumentEnabled = true, BorderThickness = new Thickness(0),
+            Background = Brushes.Transparent, Padding = new Thickness(0), Foreground = fg,
+            FontSize = size, IsTabStop = false, MaxHeight = 160,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+        var para = new Paragraph { Margin = new Thickness(0), LineHeight = size * 1.35, Foreground = fg };
+        int cur = 0;
+        foreach (var span in paths)
+        {
+            if (span.Key > cur) para.Inlines.Add(new Run(s.Substring(cur, span.Key - cur)));
+            string raw = s.Substring(span.Key, span.Value - span.Key);
+            para.Inlines.Add(MakePathRun(raw));
+            cur = span.Value;
+        }
+        if (cur < s.Length) para.Inlines.Add(new Run(s.Substring(cur)));
+        rtb.Document = new FlowDocument(para) { PagePadding = new Thickness(0), Foreground = fg };
+        // Same as SwallowMouseUp (which is TextBox-typed): stop the card's row click from firing when
+        // the user selects text or clicks inside the result body.
+        rtb.AddHandler(UIElement.MouseLeftButtonUpEvent,
+            new MouseButtonEventHandler(delegate (object snd, MouseButtonEventArgs ev) { ev.Handled = true; }), true);
+        return rtb;
+    }
+
+    // Character spans (start,end) of raw path substrings in the FULL text (only within the scan cap
+    // so cost is bounded). Returns raw match spans (trailing punctuation NOT trimmed here so the
+    // surrounding plain text keeps that punctuation); MakePathRun trims it for the click target.
+    List<KeyValuePair<int, int>> DetectPathSpans(string text)
+    {
+        var outp = new List<KeyValuePair<int, int>>();
+        if (string.IsNullOrEmpty(text)) return outp;
+        int cap = Math.Min(text.Length, PathScanCap);
+        foreach (Match m in _pathRe.Matches(text.Substring(0, cap)))
+        {
+            string cleaned = CleanPathTail(m.Value);
+            if (cleaned.Length < 4) continue;
+            // span covers only the cleaned path so trailing "。" etc. stays in the plain run
+            outp.Add(new KeyValuePair<int, int>(m.Index, m.Index + cleaned.Length));
+        }
+        return outp;
+    }
+
+    // The compact 成果物 row on a COMPLETED card: up to 3 distinct existing files, each clickable
+    // (reveal in folder), with "+N" when more were detected. No element when none found.
+    UIElement ArtifactsRow(string resultText)
+    {
+        var files = new List<string>();
+        foreach (string p in DetectExistingPaths(resultText))
+        {
+            bool isFile;
+            try { isFile = File.Exists(p); } catch (Exception) { isFile = false; }
+            if (isFile) files.Add(p);
+        }
+        if (files.Count == 0) return null;
+
+        var sp = new StackPanel();
+        sp.Children.Add(SectLabel(T("artifacts")));
+        var wrap = new WrapPanel();
+        int shown = Math.Min(3, files.Count);
+        for (int i = 0; i < shown; i++)
+        {
+            string full = files[i];
+            var chip = new Border {
+                BorderThickness = new Thickness(1), BorderBrush = Border, Background = BtnBg,
+                CornerRadius = new CornerRadius(6), Padding = new Thickness(8, 2, 8, 2),
+                Margin = new Thickness(0, 0, 6, 4), Cursor = Cursors.Hand };
+            var tb = new TextBlock {
+                Text = Path.GetFileName(full), Foreground = Theme.Br(Theme.Info(_dark)),
+                FontSize = 12, TextTrimming = TextTrimming.CharacterEllipsis, MaxWidth = 240 };
+            tb.ToolTip = full;
+            chip.Child = tb;
+            string captured = full;
+            chip.MouseLeftButtonUp += delegate (object o, MouseButtonEventArgs ev) { ev.Handled = true; RevealPath(captured); };
+            wrap.Children.Add(chip);
+        }
+        if (files.Count > shown)
+            wrap.Children.Add(new TextBlock {
+                Text = "+" + (files.Count - shown), Foreground = Muted, FontSize = 12,
+                VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 0, 4) });
+        sp.Children.Add(wrap);
+        return sp;
+    }
+
     TextBox RoText(string s, Brush fg, double size)
     {
         var t = new TextBox { Text = s, Foreground = fg, FontSize = size, IsReadOnly = true,
@@ -6273,7 +6770,15 @@ class CockpitWindow : Window
         {
             result = terminal ? OutcomeLabel(outcome) : (_lang == 0 ? "実行中…" : "Working…");
         }
-        sp.Children.Add(RoText(result, Fg, 13));
+        // P1: render the result with clickable file/folder paths (falls back to plain text when none).
+        sp.Children.Add(ResultText(result, Fg, 13));
+
+        // P1: compact 成果物 row on COMPLETED cards, listing the distinct existing files detected.
+        if (terminal)
+        {
+            UIElement artRow = ArtifactsRow(result);
+            if (artRow != null) sp.Children.Add(artRow);
+        }
 
         var checks = new List<string>();
         // Prefer display_result evidence, then last, for the "final answer obtained" check.
@@ -7434,6 +7939,7 @@ class CockpitWindow : Window
             // though the jsonl transcript exists on disk.
             e["transcript"] = S(w, "transcript"); e["name"] = S(w, "name");
             e["turn"] = I(w, "turn"); e["seq"] = _history.Count;
+            e["ts"] = NowUnix();   // P2: archived-at timestamp -> date-group subheaders in History
             _history.Add(e);
             added = true;
         }
@@ -7459,6 +7965,7 @@ class CockpitWindow : Window
             // full disk transcript even when conv_url is empty.
             e["transcript"] = S(w, "transcript"); e["name"] = S(w, "name");
             e["turn"] = I(w, "turn"); e["seq"] = _history.Count;
+            e["ts"] = NowUnix();   // P2: archived-at timestamp -> date-group subheaders in History
             _history.Add(e);
         }
         _hiddenKeys.Add(WorkerKey(started, w));
