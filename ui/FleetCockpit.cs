@@ -323,6 +323,7 @@ class CockpitWindow : Window
         if (k == "hs_signin") return ja ? "サインイン" : "Sign-in";
         if (k == "hs_agent") return ja ? "エージェント" : "Agent";
         if (k == "hs_fix") return ja ? "直す" : "Fix";
+        if (k == "hs_fix_hint") return ja ? "検出された不具合を直す" : "Fix the detected problem";
         if (k == "hs_ok") return ja ? "正常" : "OK";
         if (k == "hs_down") return ja ? "応答なし" : "down";
         if (k == "hs_unknown") return ja ? "未設定/不明" : "unknown";
@@ -552,14 +553,14 @@ class CockpitWindow : Window
         headRow.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // title + controls
         headRow.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // subtitle (full width)
 
-        // right controls: autoscale group, language, theme  (row 0, col 1)
+        // right controls: autoscale group, language, theme  (row 0, col 1).
+        // Vertically CENTERED so the control cluster shares one horizontal center line with the
+        // left-edge health strip (redesign: single clean header band, dots flush-left / controls
+        // flush-right, all centered on one line — no big in-content title above).
         var ctrls = new StackPanel();
         ctrls.Orientation = Orientation.Horizontal;
-        ctrls.VerticalAlignment = VerticalAlignment.Top;
+        ctrls.VerticalAlignment = VerticalAlignment.Center;
         ctrls.HorizontalAlignment = HorizontalAlignment.Right;
-
-        // P0 HEALTH STRIP: five infra dots + Fix button, fixed-width, leftmost of the right cluster.
-        ctrls.Children.Add(BuildHealthStrip());
 
         // "N workers" neutral info chip (live count updated in OnTick; shows maxtabs until first tick)
         _workerChip = new TextBlock();
@@ -601,16 +602,21 @@ class CockpitWindow : Window
         Grid.SetColumn(ctrls, 1); Grid.SetRow(ctrls, 0);
         headRow.Children.Add(ctrls);
 
-        // title -- row 0, col 0 (satellite icon removed per UX feedback; the title now sits flush left)
-        var titleRow = new DockPanel { LastChildFill = true };
-        titleRow.VerticalAlignment = VerticalAlignment.Center;
-        titleRow.Margin = new Thickness(0, 0, 12, 0);
+        // Redesign: the big in-content title was REMOVED (it duplicated the OS window title
+        // "Fleet Cockpit" and truncated to "Fl…", wasting the top-left). _header is kept as a
+        // live, non-null TextBlock so the existing PaintChrome/OnTick references (which set its
+        // .Text/.Foreground) never NRE — it is simply NOT added to the visual tree.
         _header = new TextBlock(); _header.FontSize = 22; _header.FontWeight = FontWeights.SemiBold;
         _header.VerticalAlignment = VerticalAlignment.Center;
         _header.TextTrimming = TextTrimming.CharacterEllipsis; _header.TextWrapping = TextWrapping.NoWrap;
-        titleRow.Children.Add(_header);    // fills the rest of col 0
-        Grid.SetColumn(titleRow, 0); Grid.SetRow(titleRow, 0);
-        headRow.Children.Add(titleRow);
+        _header.Visibility = Visibility.Collapsed;   // defensive: never rendered even if re-parented
+
+        // P0 HEALTH STRIP now occupies col 0 (where the title was): five infra dots + inline Fix
+        // pill, left-aligned and vertically centered so the dots サーバ→エージェント sit on the same
+        // center line as the right-side control cluster. One clean horizontal band.
+        var healthHost = BuildHealthStrip();
+        Grid.SetColumn((UIElement)healthHost, 0); Grid.SetRow((UIElement)healthHost, 0);
+        headRow.Children.Add((UIElement)healthHost);
 
         // subtitle -- its OWN row spanning BOTH columns, so the long elapsed+ETA line uses the full
         // width and is never clipped by the controls column. Wrap (not ellipsis) so it's never hidden.
@@ -708,8 +714,13 @@ class CockpitWindow : Window
     // Repo root is resolved the same way SpawnFleet does (exe is in ...\ui, repo is one up).
     string RepoRoot() { return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..")); }
 
-    // Build the fixed-width strip: 5 dots with labels + a Fix button + an inline note.
-    // FIXED width so the Fix button / note appearing or disappearing never shifts the header.
+    // Build the health strip: 5 dots with labels + an INLINE Fix pill + an inline note, all on ONE
+    // horizontal row. Redesign: left-aligned & vertically centered (it sits at the left edge of the
+    // header where the title used to be). The Fix pill appears immediately to the RIGHT of the 5th
+    // dot (エージェント) only when something is red/yellow; the note trails inline after it. No fixed
+    // width and no second (stacked) row — the appearing/disappearing Fix affordance can only push the
+    // note (both are the row's trailing items) and never shifts the right-side controls, which live in
+    // a SEPARATE grid column (col 1).
     UIElement BuildHealthStrip()
     {
         _healthDot = new Border[5];
@@ -717,14 +728,14 @@ class CockpitWindow : Window
         _healthDotWrap = new Border[5];
 
         _healthStrip = new Border();
-        _healthStrip.Width = 330;                 // FIXED reserved width -> no layout shift
+        _healthStrip.HorizontalAlignment = HorizontalAlignment.Left;   // flush to the header's left edge
         _healthStrip.VerticalAlignment = VerticalAlignment.Center;
         _healthStrip.Margin = new Thickness(0, 0, 12, 0);
 
-        var col = new StackPanel { Orientation = Orientation.Vertical };
-
-        // Row A: the five dots+labels laid out horizontally.
-        var row = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
+        // Single horizontal row: [dot label] x5, then the inline Fix pill, then the inline note.
+        var row = new StackPanel { Orientation = Orientation.Horizontal,
+                                   HorizontalAlignment = HorizontalAlignment.Left,
+                                   VerticalAlignment = VerticalAlignment.Center };
         string[] keys = { "hs_server", "hs_tunnel", "hs_edge", "hs_signin", "hs_agent" };
         for (int i = 0; i < 5; i++)
         {
@@ -744,31 +755,48 @@ class CockpitWindow : Window
             _healthDotWrap[i] = wrap;
             row.Children.Add(wrap);
         }
-        col.Children.Add(row);
 
-        // Row B: Fix button (hidden unless red/yellow) + inline progress/toast note.
-        var row2 = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right,
-                                    Margin = new Thickness(0, 3, 0, 0) };
+        // INLINE Fix pill (hidden unless red/yellow): refined warning-outlined pill (transparent fill,
+        // Warning outline + text) with a small Material Symbol + the label. Sits right after the 5th dot.
         _fixBtn = new Button();
-        _fixBtn.Content = T("hs_fix");
+        _fixBtn.Content = BuildFixPillContent();
         _fixBtn.FontSize = 11; _fixBtn.FontWeight = FontWeights.SemiBold;
-        _fixBtn.Padding = new Thickness(10, 1, 10, 1);
+        _fixBtn.Padding = new Thickness(8, 1, 9, 1);
+        _fixBtn.Margin = new Thickness(10, 0, 0, 0);      // gap after エージェント dot
         _fixBtn.Cursor = Cursors.Hand;
         _fixBtn.BorderThickness = new Thickness(1);
+        _fixBtn.Template = FlatButtonTemplate();          // rounded (CornerRadius 4) pill chrome
+        _fixBtn.VerticalAlignment = VerticalAlignment.Center;
         _fixBtn.Visibility = Visibility.Collapsed;
+        _fixBtn.ToolTip = T("hs_fix_hint");
+        System.Windows.Automation.AutomationProperties.SetName(_fixBtn, T("hs_fix"));
         _fixBtn.Click += delegate { RunFix(); };
-        row2.Children.Add(_fixBtn);
+        row.Children.Add(_fixBtn);
 
         _fixNote = new TextBlock { FontSize = 11, VerticalAlignment = VerticalAlignment.Center,
                                    Margin = new Thickness(8, 0, 0, 0), Text = "",
                                    TextTrimming = TextTrimming.CharacterEllipsis, MaxWidth = 250 };
-        row2.Children.Add(_fixNote);
-        col.Children.Add(row2);
+        row.Children.Add(_fixNote);
 
-        _healthStrip.Child = col;
+        _healthStrip.Child = row;
         PaintHealthChrome();
         ApplyHealthToUi();     // paint current cached states (Gray until first poll completes)
         return _healthStrip;
+    }
+
+    // The inline Fix pill's content: a small Material Symbol (settings/cog — the closest repair glyph
+    // in the subset) at 14px + the localized "Fix" label, tinted with the Warning token to match the
+    // pill's outline. Rebuilt on theme/lang flips via RebuildChrome (whole chrome is reconstructed).
+    UIElement BuildFixPillContent()
+    {
+        var sp = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+        var ic = MakeIcon("settings", 14, Theme.Br(Theme.Warning(_dark)));
+        ((FrameworkElement)ic).Margin = new Thickness(0, 0, 4, 0);
+        ((FrameworkElement)ic).VerticalAlignment = VerticalAlignment.Center;
+        sp.Children.Add(ic);
+        sp.Children.Add(new TextBlock { Text = T("hs_fix"), FontSize = 11, FontWeight = FontWeights.SemiBold,
+                                        VerticalAlignment = VerticalAlignment.Center });
+        return sp;
     }
 
     // Re-tint the strip chrome (labels, Fix button) for the current theme. Called from PaintChrome.
