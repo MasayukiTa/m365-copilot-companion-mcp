@@ -36,6 +36,9 @@ def run_python(
         code: Python source code to execute.
         timeout: Maximum execution time in seconds.
         working_dir: Optional working directory under the allowed base.
+
+    If the script produces an artifact, verify it before declaring success: read_image
+    for a saved plot/image, or verify_python / verify_file_contains for a computed result.
     """
     locked = require_unlocked()
     if locked:

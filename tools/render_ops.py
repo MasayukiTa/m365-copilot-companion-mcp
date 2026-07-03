@@ -30,6 +30,9 @@ def render_math(
         fontsize: Base font size.
         dpi: Image resolution.
         transparent: Save with transparent background.
+
+    Self-verify before reporting done: call read_image on output_path to confirm
+    the formula rendered correctly (no cut-off glyphs or mathtext errors).
     """
     locked = require_unlocked()
     if locked:
