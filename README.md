@@ -4,7 +4,7 @@ M365 Copilot を、**あなたの PC を操作できる自律エージェント*
 API 契約は不要。会社アカウントのまま。管理者権限も不要。
 ファイルを読むだけだった Copilot に「手」を生やして、実際に作業させます。
 
-> **English TL;DR** — This turns Microsoft 365 Copilot into an autonomous agent that operates your own PC — files, Excel, OCR, Python, local/corporate databases — with no API contract, on your normal work account, without admin rights. A small Python MCP server on your laptop exposes the tools; the relay drives the Copilot web UI unattended. **To install: double-click `quickstart.bat` and follow the prompts.** The one manual step (registering the MCP tool in Copilot Studio) is walked through with screenshots below.
+> **English TL;DR** — This turns Microsoft 365 Copilot into an autonomous agent that operates your own PC — files, Excel, OCR, Python, local/corporate databases — with no API contract, on your normal work account, without admin rights. A small Python MCP server on your laptop exposes the tools; the relay drives the Copilot web UI unattended. **To install: double-click `quickstart.bat` and follow the prompts.** The one manual step (registering the MCP tool in Copilot Studio) is walked through with screenshots below. Full English guide: see the [English guide](#english-guide) section at the bottom.
 
 ---
 
@@ -225,3 +225,153 @@ A. `quickstart.bat` も `start_all.bat` も冪等です。**いつ何度実行�
 ## ライセンス
 
 [MIT](./LICENSE)。無保証・無責任・自己責任でどうぞ。
+
+---
+
+## English guide
+
+### What this is
+
+- M365 Copilot is smart inside, but out of the box it can only read text you paste into chat.
+- This tool connects a small server running on your own laptop to Copilot, giving it "hands": **file operations, Python execution, Excel, OCR, and internal databases**.
+- Zero extra cost. It runs entirely inside the M365 Copilot license you already have.
+
+**What it can do:**
+
+- **Read, write, and organize files**, and find duplicates
+- Aggregate **Excel / CSV / JSON**, and create/read **Word / PowerPoint / PDF**
+- **OCR** images and scanned PDFs into text
+- Run **Python** on the spot to draw charts
+- Read **internal SQL (ODBC)** with Windows auth, read-only
+- Run multiple jobs **unattended and in parallel** (fleet)
+- Talk to it through a **chat UI** like a local app
+- **Self-check** images it produced by looking at them again
+
+### Requirements
+
+1. **Windows 10 / 11**
+2. **An M365 Copilot license** (work account)
+3. **Access to Copilot Studio** (`https://copilotstudio.microsoft.com`)
+
+### Setup
+
+#### 1. Get it
+
+With git:
+
+```powershell
+git clone https://github.com/MasayukiTa/m365-copilot-companion-mcp.git
+```
+
+Without git: click the green **Code** button on the GitHub page → **Download ZIP** → extract the downloaded zip.
+
+#### 2. Double-click `quickstart.bat`
+
+Double-click **`quickstart.bat`** in the root of the extracted folder. Then just follow the on-screen prompts.
+
+> **If an English `[Y/n]` prompt appears, pressing Enter picks the safe default.** When in doubt, Enter is fine.
+
+#### 3. Follow the on-screen steps
+
+`quickstart.bat` walks you through 7 steps. **The only manual step is STEP 5 (Copilot Studio)** — everything else is clicking and pasting.
+
+| STEP | What happens | What you do |
+|---|---|---|
+| 1 | Python environment is set up automatically (no admin needed) | Wait |
+| 2 | Bearer token / unlock password are shown (`.env` generated automatically) | **Write it down** |
+| 3 | Git update check (auto-skipped for ZIP installs) | Wait |
+| 4 | devtunnel is installed, signed in, created, and the public URL is shown | Click through sign-in |
+| 5 | **Pauses** → register the MCP tool in Copilot Studio (the one manual step) | See walkthrough below |
+| 6 | The agent URL dialog opens automatically | Paste the URL |
+| 7 | The whole stack starts (server + tunnel + Edge + UI) | Wait |
+
+Everything happens in one black console window plus a dialog and a sign-in screen. No second PC or terminal needed.
+
+### The one manual step — registering the MCP tool in Copilot Studio
+
+This is the only manual step. Go to `https://copilotstudio.microsoft.com` and follow these clicks (see the [Japanese STEP 5 walkthrough above](#step-5-の手作業--copilot-studio-に-mcp-を登録する) for all six screenshots):
+
+1. On the home page, click **"Start from scratch"** → the **"Agent"** tile.
+2. Type a name for the agent (e.g. `companion`) → click **"Create"**.
+3. In the agent editor, go to the **"Tools"** section → **"+ Add a tool"**.
+4. In the **"Add a tool"** dialog, choose the **"New tool: MCP"** tile (click "Show more" at the bottom of the dialog if you don't see it). If your UI version instead shows a 6-tile "New tool" screen (Prompt / Agent flow / Computer use / Model Context Protocol / Custom connector / REST API), pick the **"Model Context Protocol"** tile — see cs_05 in the Japanese section above.
+
+   ![Add tool dialog — MCP tile](docs/images/cs_04_add_tool_mcp_tile.png)
+
+5. Fill in the server info dialog with the values below.
+
+   ![Server info dialog filled in (URL masked)](docs/images/cs_06_mcp_dialog_filled.png)
+
+   | Field | Value |
+   |---|---|
+   | **Server name** | anything (e.g. `companion`) |
+   | **Server description** | anything (can be blank) |
+   | **Server URL** | `https://<your-tunnel>-8000.<region>.devtunnels.ms/mcp` (= `MCP_TUNNEL_URL` + `/mcp`) |
+   | **Auth** | choose **"API key"** |
+   | **Type** | choose **"Header"** (not "Query") |
+   | **Header name** | `Authorization` |
+   | **API key value** | `Bearer <your MCP_API_KEY>` (the value shown in STEP 2) |
+
+   > **Critical:** paste the whole `Bearer <key>` line into the "API key value" field, including the word `Bearer` and the space (e.g. `Bearer 4baf1c2e...`). The field is labeled "API key," which tempts people to paste the raw key alone — that gets a 401. The server does accept a raw key as a fallback, but the Bearer-prefixed form is canonical and is exactly what `copilot_studio_values.bat` prints, so just paste that line as-is.
+
+6. Click **"Create"**. If the connection succeeds, the tools list loads (`list_my_tools`, `read_file`, and so on).
+7. Click **"Publish"** → set visibility to **"Just me" only**. Never select organization-wide.
+
+Once registered, open the agent's chat and paste the URL from the browser's address bar into the STEP 6 dialog.
+
+> **Not sure everything is connected?** Double-click `doctor.bat`. It checks every link — server, Dev Tunnel, dedicated Edge, M365 sign-in, Bearer auth — as green/red, and prints the fix for any red line on the spot.
+
+### Daily use
+
+- **Launch**: double-click the **"M365 Companion"** desktop icon (created by quickstart on first run). It starts the server, tunnel, Edge, and UI together. Safe to click any number of times (idempotent).
+- **Two windows**:
+  - **CopilotChat** — the window you talk to. Converse with Copilot like a local app.
+  - **FleetCockpit** — the window you watch. Monitor and control parallel jobs live.
+- **First write/execute request**: you'll be asked for `unlock(password=...)`. Give the agent the **unlock password** from STEP 2 once, and that machine stays unlocked for 30 days.
+- **Health check**: if something feels off, double-click `doctor.bat`. It checks every link as green/red.
+
+### Troubleshooting
+
+Run **`doctor.bat`** first. **Each red line prints its own fix.** If that doesn't resolve it, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+
+### How it works
+
+```
+[ M365 Copilot ] ──▶ [ Copilot Studio agent ] ──▶ [ devtunnel ]
+                                                              ↓
+                          [ MCP server on your PC ]
+                                                              ↓
+                       files · Python · DB · Office docs · OCR …
+```
+
+- A small Python server (the MCP server) runs on your PC, providing "hands" such as file operations and Python execution.
+- devtunnel exposes your localhost server through a secure URL, and the Copilot Studio agent connects to it.
+- Separately, relay/fleet drives the Copilot web UI in Edge behind the scenes to run jobs unattended (it never takes over your mouse or keyboard).
+- The intended shape is two layers: Copilot Studio's native connectors handle the cloud side (mail, calendar, SharePoint), while this companion handles the local-PC side.
+
+Full internal design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+### Benchmarks
+
+Measured as an autonomous agent on official benchmarks (details and reproduction steps in [docs/ADVANCED.md](docs/ADVANCED.md)).
+
+| Benchmark | Result | Notes |
+|---|---|---|
+| **HumanEval (164 problems)** | first-pass **98.2%** (161/164) / final **100%** | graded against ground truth (hidden tests re-run) |
+| **SWE-bench Lite (300 instances)** | **71.7%** (215/300) | full official grading run, non-leaked grader |
+| **SWE-bench Verified (200 instances)** | **76.5%** (153/200) | generalization check on a separate set (non-burned) |
+| **GAIA (text-only, 127 questions)** | **70.1%** (89/127) | official GAIA scorer, answered by stock Copilot |
+
+The brain is Opus 4.8 inside M365 Copilot. These numbers reflect the scaffold, not a smarter model. Scorecards live under `bench/` (e.g. `bench/SCORECARD_swebench_lite300_strong.md`).
+
+### Security
+
+- **Bearer auth** — no request gets past 401 without the fixed API key (`MCP_API_KEY`). Random bots are rejected.
+- **Unlock password + per-IP TTL** — write/execute tools require unlocking per IP (30 days by default). Read and write use separate keys, so leaking one alone can't unlock the other.
+- **`MCP_ALLOWED_BASE` file scoping** — sets the ceiling on which folders the agent can touch; everything outside it is blocked.
+
+Details and caveats (tunnel anonymous access, data flow, cleanup when someone leaves): [docs/SECURITY.md](docs/SECURITY.md).
+
+### License
+
+MIT — see [LICENSE](./LICENSE).
