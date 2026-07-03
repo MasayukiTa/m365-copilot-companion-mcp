@@ -93,6 +93,64 @@ CONSENT_MARKERS = (
     "verify your credential", "authorize the connection", "set up this connection",
 )
 
+# CANNED-NONANSWER detector (headless->default-Copilot fallback, 2026-07-03). When the companion
+# Edge runs --headless and its window-size/state wedges, the M365 SPA fails to resolve the
+# ?titleId= custom agent and SILENTLY falls back to DEFAULT Copilot (which has NO MCP connector),
+# so every tool call fails and the agent replies with a fixed non-answer -- "申し訳ございません。
+# それに応答できませんでした" / "I couldn't respond to that". This matches NEITHER a consent card
+# NOR a tool-unreachable message, so it fell through every recovery and looped forever. Detected
+# here so we can (a) surface for sign-in if it is a login wall, (b) re-nav off the default-Copilot
+# fallback, or (c) as a last resort force a HEADED relaunch of the companion Edge. Mirrors
+# openai_adapter.CANNED_NONANSWER; substring / locale-tolerant.
+CANNED_NONANSWER_MARKERS = (
+    "それに応答できませんでした",
+    "I couldn't respond to that",
+    "I can't respond to that",
+)
+# How long (wall clock) to keep riding out a login-wall canned-non-answer streak before giving up
+# as INFRA_STUCK (sign-in required). Mirrors the AGENT_ERR_WINDOW_S style of bounded-but-generous
+# infra windows. Env-tunable.
+CANNED_LOGIN_WINDOW_S = float(os.environ.get("MCP_CANNED_LOGIN_S", "600"))
+# Consecutive canned-non-answers (login-wall case) tolerated before INFRA_STUCK, as a secondary
+# guard against a pathological tight loop with little elapsed time.
+CANNED_LOGIN_MAX = int(os.environ.get("MCP_CANNED_LOGIN_MAX", "6"))
+
+
+def _companion_cdp_port():
+    """CDP port of the dedicated companion Edge, derived from the SAME config the fleet's
+    attach path uses (MCP_CDP_URL, default http://localhost:9222) -- never a new hardcoded
+    literal. Used only for the last-resort headed relaunch (edge_recover.surface(port=...)).
+    Never raises -> falls back to 9222 on any parse error."""
+    try:
+        url = os.environ.get("MCP_CDP_URL", "http://localhost:9222")
+        return int(url.rsplit(":", 1)[-1].split("/")[0])
+    except Exception:
+        return 9222
+
+
+# Thin, fully-guarded wrappers around edge_recover.{looks_like_login,surface}. Imported LAZILY
+# (the rest of this file imports edge_recover inside functions, and edge_recover only pulls
+# playwright inside its own tab-closing helpers -- so these are cheap) and never raise, so the
+# canned-non-answer handler in _decide stays exception-safe.
+def edge_recover_looks_like_login(url):
+    try:
+        from .edge_recover import looks_like_login
+        return looks_like_login(url)
+    except Exception:
+        return False
+
+
+def edge_recover_surface(port=None):
+    """Surface (foreground / headed-relaunch) the companion Edge. Passes `port` through only
+    when given, so surface()'s own default (9222) still applies when we don't need a specific
+    port. Returns True/False; never raises."""
+    try:
+        from .edge_recover import surface
+        return bool(surface(port) if port is not None else surface())
+    except Exception:
+        return False
+
+
 # UNLOCK-REQUIRED detector. Write/exec MCP tools require unlock(password) per client IP
 # (tools/security.py::require_unlocked). When the agent calls a write/exec tool before the
 # (rotating M365 backend) IP is unlocked, the server returns
@@ -654,6 +712,13 @@ class RelayWorker:
         self._consent_streak = 0        # consecutive MCP connection-consent cards (auth needed)
         self._consent_auto_tried = False  # attempted the automatic click-through once
         self._consent_surfaced = False  # surfaced the Edge once (manual fallback)
+        # CANNED-NONANSWER recovery (headless->default-Copilot fallback). Consecutive canned
+        # non-answers, plus one-shot flags for the two escalations (surface-for-signin, and the
+        # fleet-wide headed relaunch). See _decide's canned-non-answer handler.
+        self._canned_streak = 0         # consecutive canned "couldn't respond" replies
+        self._canned_ts = 0.0           # wall-clock start of the current canned-non-answer streak
+        self._signin_surfaced = False   # surfaced the Edge once for interactive sign-in
+        self._headed_recovery_done = False  # forced a HEADED companion relaunch once (last resort)
         self._unlock_attempts = 0       # auto-injected unlock(password) turns (write/exec gate)
         self._recycles = 0              # fresh-conversation recycles after a token-limit exhaustion
         try:
@@ -1396,6 +1461,99 @@ class RelayWorker:
             self.status = "ready"
             self.reason = "tool path down (infra) -> re-send goal, riding out outage"
             return
+        # CANNED-NONANSWER: the headless->default-Copilot fallback. Placed AFTER the consent and
+        # tool-unreachable handlers so a genuine consent card / explicit tool-missing message still
+        # take priority. This fires when the ?titleId= custom agent failed to resolve (headless
+        # window wedge) and the tab silently dropped to DEFAULT Copilot (no MCP connector) -- every
+        # tool call fails and the agent returns a fixed non-answer that matches neither of those.
+        # It is INFRA (not a coding miss): re-queueable, and mirrors TOOL_UNREACHABLE's
+        # INFRA_STUCK classification, never a solved/failed task. Fully exception-guarded so this
+        # new branch can never raise out of _decide and break the live sweep.
+        if any(m in resp for m in CANNED_NONANSWER_MARKERS) or \
+                any(m in _low for m in CANNED_NONANSWER_MARKERS):
+            try:
+                now = time.time()
+                self._canned_streak += 1
+                if self._canned_ts <= 0.0:
+                    self._canned_ts = now
+                # (a) LOGIN WALL: the session needs interactive sign-in. Surface the Edge ONCE so
+                # the user can sign in, RE-QUEUE the same job (RETRY_JOB, not a miss), and give up
+                # only after a bounded window/count as INFRA_STUCK (sign-in required).
+                try:
+                    on_login = edge_recover_looks_like_login(self.page.url if self.page else "")
+                except Exception:
+                    on_login = False
+                if on_login:
+                    if not self._signin_surfaced:
+                        self._signin_surfaced = True
+                        try:
+                            edge_recover_surface()
+                        except Exception:
+                            pass
+                        try:
+                            default_notify("⚠ サインインが必要",
+                                           "専用Edgeを前面に出しました。サインインしてください (%s)" % self.name)
+                        except Exception:
+                            pass
+                    if (now - self._canned_ts) > CANNED_LOGIN_WINDOW_S \
+                            or self._canned_streak >= CANNED_LOGIN_MAX:
+                        self.status, self.outcome = "stuck", "INFRA_STUCK"
+                        self.reason = ("⚠ 定型の無回答が継続し、セッションはサインイン待ち。前面に出した"
+                                       "**専用Edgeでサインイン**してから再投入してください。**タスク失敗でなく"
+                                       "サインイン未完(INFRA)**=再投入対象。")
+                        return
+                    self.job = self._task_anchor(RETRY_JOB)
+                    self._cooldown_until = now + transient_backoff(2)
+                    self.status = "ready"
+                    self.reason = ("サインイン待ち(定型無回答) -> 専用Edgeでサインイン後に自動再試行 "
+                                   "(%d回)" % self._canned_streak)
+                    return
+                # (b) NOT a login wall = the headless->default-Copilot fallback. PREFER the cheap,
+                # per-tab redirect recovery: re-navigate the tab back to the agent URL. If it
+                # re-navigated, the next sweep re-sends on the agent surface.
+                # _maybe_renav_off_redirect fires only when its own preconditions hold; nudge the
+                # send-fail streak so it is eligible on this infra signal.
+                if self._send_fail_streak < self.redirect_renav_threshold:
+                    self._send_fail_streak = self.redirect_renav_threshold
+                if self._maybe_renav_off_redirect():
+                    self.reason = ("定型無回答(既定Copilotフォールバック) -> エージェントURLへ再ナビ "
+                                   "(renav %d/%d)" % (self._redirect_renavs, self.max_redirect_renavs))
+                    return
+                # (c) ESCALATION -- last resort, one-shot per worker, fleet-wide disruptive.
+                # Only after re-nav has already been exhausted this worker AND the canned
+                # non-answer persists AND we have not escalated yet. A headless companion Edge
+                # cannot resolve the ?titleId= wedge by re-nav within the SAME process, so force
+                # a HEADED relaunch via surface(port=<companion CDP port>). This KILLS the shared
+                # Edge (disrupts ALL workers), hence the strong guards. Then RE-QUEUE (not a miss).
+                if self._redirect_renavs >= self.max_redirect_renavs \
+                        and not self._headed_recovery_done:
+                    self._headed_recovery_done = True
+                    try:
+                        edge_recover_surface(port=_companion_cdp_port())
+                    except Exception:
+                        pass
+                    try:
+                        default_notify("🖥 ヘッドフル復旧",
+                                       "定型無回答が解消せず、専用Edgeをヘッドフルで再起動しました (%s)" % self.name)
+                    except Exception:
+                        pass
+                    self.job = self._task_anchor(RETRY_JOB)
+                    self._cooldown_until = now + transient_backoff(3)
+                    self.status = "ready"
+                    self.reason = ("定型無回答が再ナビでも解消せず -> **専用Edgeをヘッドフル再起動**して"
+                                   "再投入(最終手段・1回のみ)")
+                    return
+                # nothing left to try: infra-classified STUCK (re-queueable, NOT a coding miss)
+                self.status, self.outcome = "stuck", "INFRA_STUCK"
+                self.reason = ("⚠ 定型の無回答が継続。headless の ?titleId= 解決失敗で既定Copilot"
+                               "(MCPコネクタ無し)にフォールバックしている疑い。再ナビ/ヘッドフル復旧でも"
+                               "解消せず。**タスク失敗でなくインフラ(接続/エージェント未確立)**=再投入対象。")
+                return
+            except Exception:
+                # NEVER raise out of _decide: on any unexpected error, fall through to the normal
+                # handling below (the reply may still hit AGENT_DEAD / no-progress paths) rather
+                # than breaking the live sweep.
+                pass
         if any(m in _low for m in AGENT_DEAD_MARKERS):
             now = time.time()
             if self._agent_err_ts <= 0.0:
