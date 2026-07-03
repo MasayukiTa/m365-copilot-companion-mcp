@@ -57,6 +57,8 @@ class ChatWindow : Window
     TextBox _input;
     Button _send;
     Border _statusDot;
+    TextBlock _headTitle;                 // header conversation-title label (Wave 2); tracks the active conv
+    Border _dotHit;                       // header status-dot hit target (Wave 2); tooltip re-localized on lang toggle
     Conversation _conv = new Conversation();
     List<Conversation> _all = new List<Conversation>();
     string _renamingId = null;
@@ -104,8 +106,9 @@ class ChatWindow : Window
         if (k == "newchat") return ja ? "新しいチャット" : "New chat";
         if (k == "newchat_btn") return ja ? "＋   新しいチャット" : "＋   New chat";
         if (k == "send") return ja ? "送信" : "Send";
-        if (k == "theme") return (_dark ? "☀" : "☾") + (ja ? "   テーマ (ダーク/ライト)" : "   Theme (dark/light)");
-        if (k == "lang") return ja ? "🌐   English へ" : "🌐   日本語へ";
+        // (theme/lang: iconized in Wave 2 — kept without emoji as tooltips live under tip_theme/tip_lang)
+        if (k == "theme") return ja ? "テーマ (ダーク/ライト)" : "Theme (dark/light)";
+        if (k == "lang") return ja ? "English へ" : "日本語へ";
         if (k == "rename") return ja ? "名前を変更" : "Rename";
         if (k == "delete") return ja ? "削除" : "Delete";
         if (k == "generating") return ja ? "生成中" : "Generating";
@@ -174,6 +177,13 @@ class ChatWindow : Window
         if (k == "unpin")        return ja ? "ピン解除"    : "Unpin";
         if (k == "archive")      return ja ? "アーカイブ"  : "Archive";
         if (k == "unarchive")    return ja ? "アーカイブ解除" : "Unarchive";
+        // ── Wave 2: header dot tooltip, iconized footer tooltips, list scannability ──
+        if (k == "dot_click_tip") return ja ? "状態の詳細は Fleet Cockpit へ" : "Open Fleet Cockpit for connection details";
+        if (k == "tip_cockpit")   return ja ? "並列実行を開く" : "Open parallel execution";
+        if (k == "tip_lang")      return ja ? "English へ切り替え" : "Switch to Japanese";
+        if (k == "tip_theme")     return _dark ? (ja ? "ライトテーマへ" : "Switch to light theme") : (ja ? "ダークテーマへ" : "Switch to dark theme");
+        if (k == "rename_link")   return ja ? "名前変更" : "Rename";
+        if (k == "show_more")     return ja ? ("+" + "{0}" + " 件を表示") : ("+{0} more");
         return k;
     }
 
@@ -194,6 +204,7 @@ class ChatWindow : Window
         ApplyTheme();
         AddButtonStyle();
         LoadSettings();
+        LoadGlyphs();   // Wave 2: Material Symbols subset for the iconized sidebar footer
 
         var root = new Grid();
         _rootGrid = root;
@@ -222,21 +233,20 @@ class ChatWindow : Window
         var convScroll = new ScrollViewer { Content = _convList, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
         Grid.SetRow(convScroll, 1); side.Children.Add(convScroll);
 
-        var bottom = new StackPanel { Margin = new Thickness(12, 8, 12, 12) };
-        // Thin 1px horizontal rule separating the conversation list from the footer controls.
-        // Fleet entry is a QUIET navigation item, not a large orange CTA (spec). Accent is reserved
-        // for the one primary action in the main column (Send).
-        _cockpitBtn = Btn(T("open_cockpit"), "PanelAlt", "Muted", true);
-        _cockpitBtn.Height = 36; _cockpitBtn.Margin = new Thickness(0, 0, 0, 8); _cockpitBtn.FontSize = 12.5;
+        // Compact icon-button row (Wave 2): cockpit / language / theme as Material-Symbols icons,
+        // replacing the three full-width emoji text buttons. Each carries a localized tooltip with the
+        // old label text. Accent stays reserved for the one primary action (Send).
+        //   • cockpit  = satellite_alt (account_tree is FleetCockpit's self-improve glyph — avoid collision)
+        //   • language = translate
+        //   • theme    = light_mode/dark_mode, swapped by state (shows the mode you'd switch TO)
+        var bottom = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(8, 8, 8, 10) };
+        _cockpitBtn = IconButton("satellite_alt", 18, T("tip_cockpit"));
         _cockpitBtn.Click += delegate { OpenCockpit(); };
-        bottom.Children.Add(_cockpitBtn);
-        _langBtn = Btn(T("lang"), "Panel", "Muted", true);
-        _langBtn.Height = 34; _langBtn.Margin = new Thickness(0, 0, 0, 6); _langBtn.FontSize = 12;
+        _langBtn = IconButton("translate", 18, T("tip_lang"));
         _langBtn.Click += delegate { _lang = _lang == 0 ? 1 : 0; SaveSettings(); UpdateChrome(); RefreshConvList(); RerenderActiveConversation(); if (_emptyState != null) { RemoveEmptyState(); ShowEmptyState(); } };
-        _themeBtn = Btn(T("theme"), "Panel", "Muted", true);
-        _themeBtn.Height = 34; _themeBtn.FontSize = 12;
-        _themeBtn.Click += delegate { _dark = !_dark; ApplyTheme(); _themeBtn.Content = T("theme"); SaveSettings(); };
-        bottom.Children.Add(_langBtn); bottom.Children.Add(_themeBtn);
+        _themeBtn = IconButton(_dark ? "light_mode" : "dark_mode", 18, T("tip_theme"));
+        _themeBtn.Click += delegate { _dark = !_dark; ApplyTheme(); _themeBtn.Content = MakeIcon(_dark ? "light_mode" : "dark_mode", 18); _themeBtn.ToolTip = T("tip_theme"); SaveSettings(); };
+        bottom.Children.Add(_cockpitBtn); bottom.Children.Add(_langBtn); bottom.Children.Add(_themeBtn);
         Grid.SetRow(bottom, 2); side.Children.Add(bottom);
 
         var sideBorder = new Border { Child = side, BorderThickness = new Thickness(0, 0, 1, 0) };
@@ -267,13 +277,31 @@ class ChatWindow : Window
         _sideToggleBtn.Click += delegate { ToggleSidebar(); };
         DockPanel.SetDock(_sideToggleBtn, Dock.Left);
         headPanel.Children.Add(_sideToggleBtn);
-        // Left: status dot + "Copilot" title
-        var headLeft = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(4, 0, 0, 0) };
-        _statusDot = new Border { Width = 9, Height = 9, CornerRadius = new CornerRadius(5), Margin = new Thickness(0, 1, 9, 0), VerticalAlignment = VerticalAlignment.Center };
+        // Left: clickable status dot (connection state -> click opens Cockpit) + CURRENT CONVERSATION
+        // TITLE (Wave 2). The window chrome already says "Copilot", so the header now carries the live
+        // conversation title (Muted-strong, ellipsis-trimmed) instead of a redundant "Copilot" label.
+        var headLeft = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(4, 0, 0, 0), MaxWidth = 420 };
+        // The dot itself is small; wrap it in a slightly larger transparent hit target so it is easy
+        // to click. The click opens the Fleet Cockpit health view (single dot + click-through design).
+        _statusDot = new Border { Width = 9, Height = 9, CornerRadius = new CornerRadius(5), VerticalAlignment = VerticalAlignment.Center };
         SetRef(_statusDot, BackgroundProperty, "Faint");
-        var headText = new TextBlock { Text = "Copilot", FontWeight = FontWeights.SemiBold, FontSize = 14.5, VerticalAlignment = VerticalAlignment.Center };
-        SetRef(headText, TextBlock.ForegroundProperty, "Fg");
-        headLeft.Children.Add(_statusDot); headLeft.Children.Add(headText);
+        var dotHit = new Border
+        {
+            Child = _statusDot, Background = Brushes.Transparent,
+            Padding = new Thickness(0, 3, 9, 3), Margin = new Thickness(0, 1, 0, 0),
+            Cursor = Cursors.Hand, VerticalAlignment = VerticalAlignment.Center,
+            ToolTip = T("dot_click_tip")
+        };
+        dotHit.MouseLeftButtonUp += delegate { OpenCockpit(); };
+        _dotHit = dotHit;   // re-localized on language toggle (UpdateChrome)
+        _headTitle = new TextBlock
+        {
+            Text = T("newchat"), FontWeight = FontWeights.SemiBold, FontSize = 14.5,
+            VerticalAlignment = VerticalAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.NoWrap
+        };
+        SetRef(_headTitle, TextBlock.ForegroundProperty, "Muted");
+        headLeft.Children.Add(dotHit); headLeft.Children.Add(_headTitle);
         DockPanel.SetDock(headLeft, Dock.Left);
         headPanel.Children.Add(headLeft);
         // Right: settings icon + Fleet chip (built right-to-left in DockPanel terms)
@@ -387,9 +415,23 @@ class ChatWindow : Window
             if (!_input.Text.StartsWith("/")) { _input.Text = "/"; _input.CaretIndex = 1; }
             _input.Focus();
         };
+        // ITEM 4: attach button lives INSIDE the composer footer (left, next to the slash button),
+        // quiet Faint styling — replacing the standalone row above the composer. Same AttachFile()
+        // handler; the paste-image (Ctrl+V) and any drag-drop paths are unchanged (they call
+        // UploadFile directly and don't depend on this button's location).
+        _attachBtn = new Button
+        {
+            Content = "+", FontSize = 15, FontWeight = FontWeights.SemiBold,
+            Height = 30, Width = 30, Cursor = Cursors.Hand,
+            BorderThickness = new Thickness(0), Background = Brushes.Transparent,
+            ToolTip = T("attach")
+        };
+        SetRef(_attachBtn, ForegroundProperty, "Faint");
+        _attachBtn.Click += delegate { AttachFile(); };
         var footerRow = new DockPanel { Margin = new Thickness(0, 6, 0, 0) };
         var footLeft = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
         footLeft.Children.Add(slashBtn);
+        footLeft.Children.Add(_attachBtn);
         // Steer-mode destination indicator ("送信先: W1 / Fleet会話"). Collapsed unless steering;
         // RefreshSteerVisual() sets the text and visibility.
         _steerHint = new TextBlock
@@ -1557,6 +1599,74 @@ class ChatWindow : Window
     }
     void SetRef(FrameworkElement el, DependencyProperty p, string key) { el.SetResourceReference(p, key); }
 
+    // ── Material Symbols glyphs (vector paths, NO emoji) — mirrors FleetCockpit's loader so the
+    //    sidebar footer icons match the cockpit exactly. Reads the shared 8-glyph subset font
+    //    (ui/assets/material_glyphs.json). Best-effort: a missing/unreadable file just yields
+    //    empty placeholders (the tooltip still carries the label).
+    Dictionary<string, string> _glyphs = new Dictionary<string, string>();
+    double _upm = 960;
+    void LoadGlyphs()
+    {
+        try
+        {
+            string p = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "assets", "material_glyphs.json");
+            if (!File.Exists(p)) return;
+            var o = _cjs.DeserializeObject(File.ReadAllText(p, Encoding.UTF8)) as Dictionary<string, object>;
+            if (o == null) return;
+            if (o.ContainsKey("unitsPerEm")) _upm = Convert.ToDouble(o["unitsPerEm"]);
+            var g = o["glyphs"] as Dictionary<string, object>;
+            if (g == null) return;
+            foreach (KeyValuePair<string, object> kv in g) _glyphs[kv.Key] = kv.Value.ToString();
+        }
+        catch { }
+    }
+    UIElement MakeIcon(string name, double size)
+    {
+        if (!_glyphs.ContainsKey(name)) { var ph = new Border(); ph.Width = size; ph.Height = size; return ph; }
+        var path = new System.Windows.Shapes.Path();
+        Geometry geo = Geometry.Parse(_glyphs[name]).Clone();   // Geometry.Parse returns FROZEN -> Clone before Transform
+        double s = size / _upm;
+        geo.Transform = new MatrixTransform(s, 0, 0, -s, 0, s * _upm);   // font y-up -> WPF y-down
+        path.Data = geo; path.Stretch = Stretch.None;
+        path.Width = size; path.Height = size;
+        path.HorizontalAlignment = HorizontalAlignment.Center;
+        path.VerticalAlignment = VerticalAlignment.Center;
+        SetRef(path, System.Windows.Shapes.Shape.FillProperty, "Muted");
+        return path;
+    }
+    // Compact icon button matching FleetCockpit's IconButton look (quiet, hover surface via the
+    // shared Button template). glyph names come from the 8-glyph subset.
+    Button IconButton(string glyph, double size, string tip)
+    {
+        var b = new Button
+        {
+            Content = MakeIcon(glyph, size),
+            Width = 36, Height = 32, Cursor = Cursors.Hand,
+            BorderThickness = new Thickness(0), Background = Brushes.Transparent,
+            ToolTip = tip, Tag = glyph
+        };
+        return b;
+    }
+
+    // First line only, ellipsis-trimmed to `max` chars. Shared by SendText (stored title) and the
+    // sidebar/header DISPLAY of long saved titles so a whole first message never fills a row.
+    static string TrimTitle(string s, int max)
+    {
+        if (string.IsNullOrEmpty(s)) return s;
+        int nl = s.IndexOfAny(new[] { '\r', '\n' });
+        if (nl >= 0) s = s.Substring(0, nl);
+        s = s.Trim();
+        if (s.Length > max) s = s.Substring(0, max) + "…";
+        return s;
+    }
+
+    // Header title tracks the active conversation (Wave 2). Untitled -> localized "New chat".
+    void RefreshHeadTitle()
+    {
+        if (_headTitle == null) return;
+        _headTitle.Text = (_conv == null || _conv.Untitled()) ? T("newchat") : TrimTitle(_conv.Title, 60);
+    }
+
     // ── status dot: 4 states (Theme tokens) + tooltip ───────────────────────────
     //   "idle"    Success  — bridge reachable, nothing streaming
     //   "busy"    Accent   — a reply is streaming
@@ -1973,7 +2083,16 @@ class ChatWindow : Window
         RenderSection(todayList,    "sec_today",    "today",    false, false, false);
         RenderSection(fleetList,    "sec_fleet",    "fleet",    true,  false, false);
         RenderSection(archivedList, "sec_archived", "archived", false, true,  false);
+
+        RefreshHeadTitle();   // keep the header title in sync with the active conversation (Wave 2)
     }
+
+    // ITEM 3c: per-section "show all" override for the session. When a section holds >8 items we
+    // render the first 8 + a muted "+N more" row; clicking it flips the section here (for the session)
+    // so the full list renders. COLLAPSING the section (chevron) resets the override — MakeSectionHeader
+    // clears the entry so re-expanding starts capped again.
+    HashSet<string> _sectionExpanded = new HashSet<string>();
+    const int SectionCap = 8;
 
     // Emits one section: header (if non-empty) + its rows. When collapsed, rows are skipped
     // EXCEPT the active conversation (cc.Id == _conv.Id), which always renders so the open
@@ -1985,13 +2104,50 @@ class ChatWindow : Window
         bool collapsed = _sectionCollapsed.ContainsKey(collapseKey) && _sectionCollapsed[collapseKey];
         if (!collapsed)
         {
-            foreach (var c in list) AddConvRow(c, isFleet, archived, isPinned);
+            // ITEM 3c: cap long sections (>8) to the first 8 + a "+N more" row that expands the full
+            // list for the session. The active conversation is always rendered even if it falls past
+            // the cap, so it is never hidden.
+            bool expanded = _sectionExpanded.Contains(collapseKey);
+            if (list.Count > SectionCap && !expanded)
+            {
+                int shown = 0;
+                foreach (var c in list)
+                {
+                    if (shown < SectionCap) { AddConvRow(c, isFleet, archived, isPinned); shown++; }
+                    else if (c.Id == _conv.Id) AddConvRow(c, isFleet, archived, isPinned);   // active conv always reachable
+                }
+                _convList.Children.Add(MakeShowMoreRow(collapseKey, list.Count - SectionCap));
+            }
+            else
+            {
+                foreach (var c in list) AddConvRow(c, isFleet, archived, isPinned);
+            }
         }
         else
         {
             foreach (var c in list)
                 if (c.Id == _conv.Id) AddConvRow(c, isFleet, archived, isPinned);   // keep the open conv reachable
         }
+    }
+
+    // Muted "+N more" row (ITEM 3c). Clicking expands the section for the session (RefreshConvList).
+    UIElement MakeShowMoreRow(string collapseKey, int hidden)
+    {
+        var tb = new TextBlock
+        {
+            Text = T("show_more").Replace("{0}", hidden.ToString()),
+            FontSize = 11.5, VerticalAlignment = VerticalAlignment.Center
+        };
+        SetRef(tb, TextBlock.ForegroundProperty, "Faint");
+        var btn = new Button
+        {
+            Content = tb, HorizontalContentAlignment = HorizontalAlignment.Left,
+            Padding = new Thickness(15, 5, 6, 6), Margin = new Thickness(0, 2, 0, 2),
+            BorderThickness = new Thickness(0), Background = Brushes.Transparent, Cursor = Cursors.Hand
+        };
+        string key = collapseKey;
+        btn.Click += delegate { _sectionExpanded.Add(key); RefreshConvList(); };
+        return btn;
     }
 
     // Builds a clickable collapsible section-header row: chevron + label + count.
@@ -2050,6 +2206,7 @@ class ChatWindow : Window
         {
             bool cur = _sectionCollapsed.ContainsKey(capturedKey) && _sectionCollapsed[capturedKey];
             _sectionCollapsed[capturedKey] = !cur;
+            if (!cur) _sectionExpanded.Remove(capturedKey);   // collapsing resets the "show all" override (ITEM 3c)
             SaveSidebarState();
             RefreshConvList();
         };
@@ -2078,19 +2235,28 @@ class ChatWindow : Window
         }
 
         bool isActive = cc.Id == _conv.Id;
-        // row = background border: active gets PanelAlt (surfaceSubtle, quiet selected state);
-        // non-selected rows are transparent so only the active row is visually distinct.
-        var rowBorder = new Border { CornerRadius = new CornerRadius(7), Margin = new Thickness(0, 1, 0, 1) };
+        // row = background border: active gets PanelAlt (surfaceSubtle, quiet selected state) PLUS a
+        // 3px Accent left rail (ITEM 3b) so the selected conversation is unmistakable; non-selected
+        // rows are transparent with no rail.
+        var rowBorder = new Border { CornerRadius = new CornerRadius(Theme.RadSmall), Margin = new Thickness(0, 1, 0, 1) };
         if (isActive)
+        {
             SetRef(rowBorder, BackgroundProperty, "PanelAlt");
+            rowBorder.BorderThickness = new Thickness(3, 0, 0, 0);
+            SetRef(rowBorder, Border.BorderBrushProperty, "Accent");
+        }
         else
+        {
             rowBorder.Background = Brushes.Transparent;
+        }
 
         var rowGrid = new Grid { MinHeight = 38 };
         rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });   // rename link (hover)
+        rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });   // trash (hover)
 
-        var titleText = cc.Untitled() ? T("newchat") : cc.Title;
+        // ITEM 3a: DISPLAY-trim long saved titles (first line, max 40) without rewriting stored data.
+        var titleText = cc.Untitled() ? T("newchat") : TrimTitle(cc.Title, 40);
 
         // Inner content: optional pin glyph + title label.
         var contentRow = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
@@ -2111,7 +2277,8 @@ class ChatWindow : Window
         {
             Content = contentRow,
             HorizontalContentAlignment = HorizontalAlignment.Left,
-            Padding = new Thickness(9, 0, 9, 0), BorderThickness = new Thickness(0),
+            // Active rows carry a 3px left rail; drop 3px of left padding so the title stays aligned.
+            Padding = new Thickness(isActive ? 6 : 9, 0, 9, 0), BorderThickness = new Thickness(0),
             Cursor = Cursors.Hand, Background = Brushes.Transparent, ToolTip = titleText
         };
         // Active row: full Fg; archived non-active: Faint (de-emphasized); others: Muted.
@@ -2140,6 +2307,22 @@ class ChatWindow : Window
         menu.Items.Add(miR);
         b.ContextMenu = menu;
         Grid.SetColumn(b, 0); rowGrid.Children.Add(b);
+
+        // ITEM 3d: hover "Rename" text link (no pencil glyph exists in the 8-glyph subset; a small
+        // Muted 11px link is the discoverable affordance). Triggers the SAME rename flow as the
+        // context-menu Rename. Hidden by default, revealed with the trash on row hover.
+        var renameLink = new Button
+        {
+            Content = T("rename_link"), FontSize = 11,
+            Height = 38, Padding = new Thickness(6, 0, 4, 0),
+            BorderThickness = new Thickness(0), Background = Brushes.Transparent,
+            Cursor = Cursors.Hand, ToolTip = T("rename"), Opacity = 0, IsHitTestVisible = false,
+            VerticalContentAlignment = VerticalAlignment.Center
+        };
+        SetRef(renameLink, ForegroundProperty, "Muted");
+        renameLink.Click += delegate { _renamingId = cc.Id; RefreshConvList(); };
+        renameLink.Visibility = (cc.Messages.Count > 0 || !string.IsNullOrEmpty(cc.Title)) ? Visibility.Visible : Visibility.Collapsed;
+        Grid.SetColumn(renameLink, 1); rowGrid.Children.Add(renameLink);
 
         // trash icon (Segoe MDL2 Assets) -- hidden by default, revealed on row hover.
         var trash = new Button
@@ -2172,11 +2355,20 @@ class ChatWindow : Window
         trRename.Click += delegate { _renamingId = cc.Id; RefreshConvList(); };
         trMenu.Items.Add(trRename);
         trash.ContextMenu = trMenu;
-        Grid.SetColumn(trash, 1); rowGrid.Children.Add(trash);
-        // Reveal the trash icon on row hover; hide again when the pointer leaves.
+        Grid.SetColumn(trash, 2); rowGrid.Children.Add(trash);
+        // Reveal the trash icon AND the rename link on row hover; hide both when the pointer leaves.
         var trashRef = trash;
-        rowBorder.MouseEnter += delegate { if (trashRef.Visibility == Visibility.Visible) { trashRef.Opacity = 1; trashRef.IsHitTestVisible = true; } };
-        rowBorder.MouseLeave += delegate { trashRef.Opacity = 0; trashRef.IsHitTestVisible = false; };
+        var renameRef = renameLink;
+        rowBorder.MouseEnter += delegate
+        {
+            if (trashRef.Visibility == Visibility.Visible) { trashRef.Opacity = 1; trashRef.IsHitTestVisible = true; }
+            if (renameRef.Visibility == Visibility.Visible) { renameRef.Opacity = 1; renameRef.IsHitTestVisible = true; }
+        };
+        rowBorder.MouseLeave += delegate
+        {
+            trashRef.Opacity = 0; trashRef.IsHitTestVisible = false;
+            renameRef.Opacity = 0; renameRef.IsHitTestVisible = false;
+        };
         rowBorder.Child = rowGrid;
         _convList.Children.Add(rowBorder);
     }
@@ -2778,11 +2970,15 @@ class ChatWindow : Window
     }
     void UpdateChrome()
     {
-        _newBtn.Content = T("newchat_btn"); _themeBtn.Content = T("theme"); _langBtn.Content = T("lang"); _send.Content = T("send");
+        _newBtn.Content = T("newchat_btn"); _send.Content = T("send");
         if (_manageBtn != null) _manageBtn.Content = T("manage_btn");
-        // Construction-time localized chrome the toggle would otherwise miss (the half-translated UI):
-        if (_cockpitBtn != null) _cockpitBtn.Content = T("open_cockpit");
-        if (_attachBtn != null) { _attachBtn.Content = T("attach_btn"); _attachBtn.ToolTip = T("attach"); }
+        // Iconized footer (Wave 2): icons don't hold text, so re-localize their TOOLTIPS and refresh
+        // the theme glyph on a language toggle (the glyph itself is state- not language-driven).
+        if (_themeBtn != null) { _themeBtn.Content = MakeIcon(_dark ? "light_mode" : "dark_mode", 18); _themeBtn.ToolTip = T("tip_theme"); }
+        if (_langBtn != null) _langBtn.ToolTip = T("tip_lang");
+        if (_cockpitBtn != null) _cockpitBtn.ToolTip = T("tip_cockpit");
+        if (_dotHit != null) _dotHit.ToolTip = T("dot_click_tip");   // header dot tooltip follows the language
+        if (_attachBtn != null) _attachBtn.ToolTip = T("attach");   // "+" glyph is language-agnostic; re-localize tooltip only
         // Re-derive composer placeholder + steer destination indicator in the current language.
         // Routing through RefreshSteerVisual keeps the steer placeholder ("…割り込みを送信…")
         // from being clobbered by the normal placeholder during a language toggle.
@@ -3132,7 +3328,7 @@ class ChatWindow : Window
     void SendText(string text)
     {
         _conv.Messages.Add(new Msg("U", text));
-        if (_conv.Untitled()) { _conv.Title = text; }
+        if (_conv.Untitled()) { _conv.Title = TrimTitle(text, 40); }   // ITEM 3a: first line, max 40 + ellipsis
         if (!_all.Contains(_conv)) { _all.Insert(0, _conv); }
         RefreshConvList();
         AddUser(text);
@@ -3243,18 +3439,11 @@ class ChatWindow : Window
 
     // ── attachments: file picker + image paste -> upload to the composer ─────────
     StackPanel _attachChips;
+    // The attached-file CHIP strip only. The attach BUTTON itself now lives in the composer footer
+    // (ITEM 4); this panel holds the file chips added by AddChip and is otherwise empty.
     UIElement BuildAttachRow()
     {
         _attachChips = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 6) };
-        _attachBtn = new Button
-        {
-            Content = T("attach_btn"), FontSize = 12,
-            Height = 30, Cursor = Cursors.Hand, BorderThickness = new Thickness(1),
-            Padding = new Thickness(10, 0, 10, 0), ToolTip = T("attach")
-        };
-        SetRef(_attachBtn, BackgroundProperty, "Panel"); SetRef(_attachBtn, ForegroundProperty, "Muted"); SetRef(_attachBtn, Control.BorderBrushProperty, "Border");
-        _attachBtn.Click += delegate { AttachFile(); };
-        _attachChips.Children.Add(_attachBtn);
         return _attachChips;
     }
 
@@ -3313,7 +3502,9 @@ class ChatWindow : Window
     void ClearChips()
     {
         if (_attachChips == null) return;
-        while (_attachChips.Children.Count > 1) _attachChips.Children.RemoveAt(_attachChips.Children.Count - 1);
+        // The attach button no longer sits in this panel (ITEM 4) — it holds only file chips now,
+        // so clear ALL of them (previously index 0 was the button and was preserved).
+        _attachChips.Children.Clear();
     }
 
     void Stream(string msg)
