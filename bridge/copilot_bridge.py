@@ -183,6 +183,7 @@ PAGE = None      # set at startup
 DRIVER = None
 BUSY = False     # single conversation -> serialize requests
 AGENT_URL = ""   # bare agent URL (a fresh chat); set at startup
+_CONSENT_SURFACED = False  # last-resort surface() for consent fired at most once per session
 
 
 def _wait_composer(timeout=40):
@@ -213,11 +214,13 @@ def _wait_composer(timeout=40):
                     # rather than silently assumed to have worked. Pass AGENT_URL (the bare
                     # agent URL this bridge drives) so a headed relaunch lands on the agent
                     # conversation instead of the launcher's default generic top page.
-                    if not surface(open_url=AGENT_URL):
+                    # port 9223: the bridge drives its OWN Edge (copilot-bridge-edge), NOT the
+                    # fleet's :9222 -- omitting port would surface the wrong browser.
+                    if not surface(port=int(os.environ.get("MCP_BRIDGE_CDP_PORT", "9223")), open_url=AGENT_URL):
                         logger.warning("_wait_composer: surface() could not confirm a headed "
-                                       "companion Edge; sign-in prompt may still be hidden. "
+                                       "bridge Edge; sign-in prompt may still be hidden. "
                                        "Manual: powershell -NoProfile -ExecutionPolicy Bypass "
-                                       "-File scripts\\start_companion_edge.ps1 -Foreground")
+                                       "-File scripts\\start_companion_edge.ps1 -Foreground -Port 9223")
                     surfaced = True
                 touch_pause()
         except Exception:
@@ -281,9 +284,10 @@ def _goto_settled(url, timeout=25000, tries=3, compose_wait=40):
                     # it is visible rather than silently assumed to have worked. Pass the
                     # actual target `url` so a headed relaunch lands on the conversation this
                     # call was trying to reach, instead of the launcher's default top page.
-                    if not surface(open_url=url):
+                    # port 9223: surface the bridge's own Edge, not the fleet's :9222.
+                    if not surface(port=int(os.environ.get("MCP_BRIDGE_CDP_PORT", "9223")), open_url=url):
                         logger.warning("_goto_settled: surface() could not confirm a headed "
-                                       "companion Edge; sign-in prompt may still be hidden. "
+                                       "bridge Edge; sign-in prompt may still be hidden. "
                                        "Manual: powershell -NoProfile -ExecutionPolicy Bypass "
                                        "-File scripts\\start_companion_edge.ps1 -Foreground")
                     surfaced = True
@@ -1743,6 +1747,48 @@ class Handler(BaseHTTPRequestHandler):
         # outer-loop timeout end: same authoritative-final read
         return _clean_answer_text()
 
+    def _consent_last_resort_surface(self) -> bool:
+        """LAST RESORT for MCP connection-consent, fired only after every automatic tier
+        (_bridge_auto_consent's three click-through tiers, tried once, plus one silent
+        auto-approved retry) has genuinely failed. Surfaces the BRIDGE's own dedicated Edge
+        (port 9223, profile copilot-bridge-edge -- NOT the fleet's :9222) pointed at the
+        conversation this bridge is actually driving, so the user can approve by hand on the
+        right chat rather than the launcher's default top page. One-shot per process
+        (_CONSENT_SURFACED) so a stuck session doesn't repeatedly yank the window to the
+        front. Returns True iff a headed window was truthfully confirmed up (gates the SSE
+        message: only ever claims "surfaced" when surface() actually returned True) --
+        the caller falls back to the honest chat error when this returns False. Never
+        raises into the turn."""
+        global _CONSENT_SURFACED
+        if _CONSENT_SURFACED:
+            # already surfaced once this session -- don't yank the window again; let the
+            # caller emit the honest "please retry" error instead of re-surfacing forever.
+            return False
+        _CONSENT_SURFACED = True
+        ok = False
+        try:
+            from relay.edge_recover import surface
+            port = int(os.environ.get("MCP_BRIDGE_CDP_PORT", "9223"))
+            target = AGENT_URL or ((PAGE.url or "") if PAGE is not None else "")
+            ok = bool(surface(port=port, open_url=target))
+        except Exception:
+            logger.warning("_consent_last_resort_surface: surface() raised", exc_info=True)
+            ok = False
+        try:
+            if ok:
+                self._sse({"replace": "接続の自動承認に失敗しました。専用Edge (:9223) を前面に出しました。"
+                                       "表示された画面で接続を許可してから、もう一度お試しください。"})
+            else:
+                self._sse({"replace": "接続の自動承認・自動表示に失敗しました。手動で PowerShell から: "
+                                       "powershell -NoProfile -ExecutionPolicy Bypass -File "
+                                       "scripts\\start_companion_edge.ps1 -Foreground -Port 9223 "
+                                       "を実行し、専用Edge(:9223)で接続を許可してから、もう一度お試し"
+                                       "ください。"})
+            self._sse({}, "done")
+        except Exception:
+            pass
+        return ok
+
     def _stream_text(self, msg: str):
         """Send `msg` to the agent and stream the answer back over the ALREADY-open
         SSE response (the normal send/stream path). Used both for plain messages and
@@ -1750,12 +1796,15 @@ class Handler(BaseHTTPRequestHandler):
         turn. Respects the BUSY guard; always emits a terminating `done` event.
 
         MCP CONNECTION-CONSENT auto-approval (regulation: consent must be resolved FULLY
-        AUTOMATICALLY, never surfaced to the user -- only a genuine credential sign-in may
-        be surfaced). If the reply is a consent card, this SILENTLY runs the same
-        three-tier auto-consent as RelayWorker._auto_consent (reusing relay.edge_reconnect's
-        shared click-through helpers -- no click logic is reimplemented here), then RE-SENDS
-        the SAME user message once so the real answer comes back on the now-valid
-        connection. This path never calls surface(): consent is auto, not manual."""
+        AUTOMATICALLY; surfacing the Edge is the LAST RESORT, firing ONLY once every
+        automatic tier has genuinely failed). If the reply is a consent card, this SILENTLY
+        runs the same three-tier auto-consent as RelayWorker._auto_consent (reusing
+        relay.edge_reconnect's shared click-through helpers -- no click logic is reimplemented
+        here), then RE-SENDS the SAME user message once so the real answer comes back on the
+        now-valid connection. Only if that also fails does this call surface() ONCE per
+        session (bridge Edge, port 9223) so the user can approve by hand on the real chat;
+        only if surface() itself cannot bring a window up does this return the honest chat
+        error."""
         global BUSY
         if BUSY:
             self._sse({"delta": "[busy: 直前の応答を生成中です]"})
@@ -1766,8 +1815,8 @@ class Handler(BaseHTTPRequestHandler):
             final = self._send_and_stream_once(msg)
             if final is not None and _looks_like_consent(final):
                 # Consent card, not a real answer -- do NOT show it to the user; auto-approve
-                # and retry SILENTLY (no surface(), no manual-action prompt: this is a
-                # connection-SELECT confirm, not a credential event).
+                # and retry SILENTLY first (this is a connection-SELECT confirm, not a
+                # credential event, so the fully-automatic tiers are tried before any surface).
                 consented = False
                 try:
                     consented = _bridge_auto_consent()
@@ -1780,16 +1829,18 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         final = None
                     if final is not None and _looks_like_consent(final):
-                        # still a consent card after one auto-approved retry -> give up
-                        # honestly; still no surface() (consent stays automatic-only).
+                        # still a consent card after one auto-approved retry -> automation is
+                        # genuinely exhausted; fall through to the last-resort surface() below.
                         logger.warning("consent card persisted after auto-consent retry")
-                        self._sse({"replace": "接続の自動承認に失敗しました。再試行してください。"})
-                        self._sse({}, "done")
+                        if not self._consent_last_resort_surface():
+                            self._sse({"replace": "接続の自動承認に失敗しました。再試行してください。"})
+                            self._sse({}, "done")
                         return
                 else:
                     logger.warning("_bridge_auto_consent: all tiers failed for a consent card")
-                    self._sse({"replace": "接続の自動承認に失敗しました。再試行してください。"})
-                    self._sse({}, "done")
+                    if not self._consent_last_resort_surface():
+                        self._sse({"replace": "接続の自動承認に失敗しました。再試行してください。"})
+                        self._sse({}, "done")
                     return
             if final:
                 self._sse({"replace": final})
