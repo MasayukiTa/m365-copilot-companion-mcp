@@ -511,6 +511,20 @@ def _adjust_backoff(ok, turn_elapsed, backoff_s, base_elapsed,
 
 def default_notify(title: str, body: str) -> None:
     """Best-effort Windows toast; never raises into the control loop."""
+    # DIAGNOSTIC (2026-07 notification-source hunt): record who fired every toast --
+    # timestamp, pid, process argv, and the caller stack -- so a freshly-spawned fleet
+    # self-identifies as the emitter instead of us guessing from process trees.
+    try:
+        import os as _os, sys as _sys, time as _t, traceback as _tb
+        _line = "%s pid=%s argv=%r title=%r\n%s" % (
+            _t.strftime("%H:%M:%S"), _os.getpid(), _sys.argv[:4], title,
+            "".join(_tb.format_stack(limit=8)))
+        _p = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                           ".fleet", "_notify_source.log")
+        with open(_p, "a", encoding="utf-8") as _f:
+            _f.write(_line + "-" * 60 + "\n")
+    except Exception:
+        pass
     try:
         from tools.notify_ops import notify_desktop
         notify_desktop(title, body[:240])
