@@ -82,16 +82,20 @@ TOOL_UNREACHABLE_MARKERS = (
 # CONNECTION-CONSENT detector. The FIRST time the agent calls an MCP tool, Copilot can show a
 # connection-consent card ("この資格情報を 接続マネージャーを開く で検証してください ... 再試行")
 # instead of executing -- the MCP connector's per-user connection is not authorized yet. This is
-# NOT a dead agent and NOT a task failure: a HUMAN must authorize the connection IN THE DEDICATED
-# EDGE (the consent is bound to that browser session/profile, not the account, so authorizing
-# elsewhere does NOT count). The relay cannot click it (security gate). Detect it, SURFACE the
-# headless Edge to the foreground so the user can authorize, and STUCK with an actionable reason
-# rather than looping the card until MAXTURNS.
+# NOT a dead agent and NOT a task failure. Regulation: consent must be resolved FULLY
+# AUTOMATICALLY (Allow-button tier0 -> re-nav -> popup click-through); surfacing the dedicated
+# Edge is the LAST RESORT, firing ONLY once every automatic tier has genuinely failed, and then
+# it must land on the correct agent conversation (not the top page) and the notify must be
+# truthful (gated on surface()'s real return value).
 CONSENT_MARKERS = (
     "接続マネージャー", "この資格情報を", "接続の準備が整ったら", "接続して続行する",
     "open connection manager", "connection manager", "verify this credential",
     "verify your credential", "authorize the connection", "set up this connection",
 )
+# After the last-resort surface() succeeds, how many extra consent-card sightings we tolerate
+# (retrying each time) before concluding the user hasn't approved yet and giving up for good --
+# bounded so a successful surface can never turn into an infinite retry loop.
+CONSENT_SURFACE_RETRY_MAX = int(os.environ.get("MCP_CONSENT_SURFACE_RETRY_MAX", "3"))
 
 # CANNED-NONANSWER detector (headless->default-Copilot fallback, 2026-07-03). When the companion
 # Edge runs --headless and its window-size/state wedges, the M365 SPA fails to resolve the
@@ -1042,6 +1046,47 @@ class RelayWorker:
             has_composer = True            # unknown -> assume present (don't re-nav on a guess)
         return not has_composer
 
+    def _renav_to_agent_surface(self):
+        """Low-level mechanics shared by every re-nav-first recovery path: goto self._agent_url on
+        the CURRENT tab and wait briefly for the composer to render (mirrors _open_fresh's
+        about:blank re-nav). Spends one unit of the per-turn re-nav budget and fully guards the
+        goto/wait so a failure just leaves the tab where it was. Returns True iff the composer
+        was observed after the goto (the agent surface is back), else False.
+
+        This does NOT touch status/job/cooldown/streaks -- callers decide what a successful or
+        failed re-nav means for them (retry-same-job vs. fall through)."""
+        self._redirect_renavs += 1
+        landed = False
+        try:
+            try:
+                self.page.goto(self._agent_url, wait_until="domcontentloaded", timeout=45000)
+            except Exception:
+                pass
+            # wait up to ~10s for the composer to appear (the agent surface is back)
+            for _ in range(20):
+                try:
+                    if self.page.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+                        landed = True
+                        break
+                except Exception:
+                    pass
+                self.page.wait_for_timeout(500)
+        except Exception:
+            landed = False
+        return landed
+
+    def _renav_budget_ok(self):
+        """True iff we still have re-nav budget left this turn AND a real page/agent_url to
+        re-nav to. Guards every re-nav-first call site so a permanently-broken agent still
+        exhausts the budget and falls through to its existing (genuine) STUCK path rather than
+        re-navving forever. Never raises."""
+        try:
+            if self.page is None or not self._agent_url:
+                return False
+            return self._redirect_renavs < self.max_redirect_renavs
+        except Exception:
+            return False
+
     def _maybe_renav_off_redirect(self):
         """If sends keep failing because the tab is stuck on a redirect/landing page, RE-NAVIGATE
         to the agent URL the worker was launched to drive (the same URL attach() opened) and reset
@@ -1064,24 +1109,7 @@ class RelayWorker:
         # Re-navigate this tab to the agent conversation URL (mirrors _open_fresh's about:blank
         # re-nav: goto + wait briefly for the composer to render). Fully guarded -- a failed goto
         # leaves the tab where it was and we just fall through to transient handling next time.
-        self._redirect_renavs += 1
-        landed = False
-        try:
-            try:
-                self.page.goto(self._agent_url, wait_until="domcontentloaded", timeout=45000)
-            except Exception:
-                pass
-            # wait up to ~10s for the composer to appear (the agent surface is back)
-            for _ in range(20):
-                try:
-                    if self.page.locator(COPILOT_SELECTORS["composer"]).count() > 0:
-                        landed = True
-                        break
-                except Exception:
-                    pass
-                self.page.wait_for_timeout(500)
-        except Exception:
-            landed = False
+        self._renav_to_agent_surface()
         # Reset the send-failure streak: we have moved the tab, so the previous failures no
         # longer reflect the current page. Re-arm to 'ready' to re-send the SAME job. If the
         # composer never appeared, the streak will simply re-accumulate and, once the per-turn
@@ -1090,6 +1118,40 @@ class RelayWorker:
         self._cooldown_until = time.time() + 2.0
         self.status = "ready"
         return True
+
+    def _maybe_renav_before_signal(self):
+        """RE-NAV-FIRST recovery for the CONSENT and AGENT-DEAD signals (2026-07 fix): both symptoms
+        are usually NOT a genuine consent-needed / dead-agent state but a DRIFTED tab -- the SPA
+        normalizes the URL to the CsrToSSR/auth=2 landing while silently dropping the loaded custom
+        agent (default Copilot / bare /chat/conversation/<id>, no MCP connector). Every tool call
+        there fails identically and returns either a connection-consent card or a canned error, which
+        used to go straight into the fragile popup click-through or straight toward STUCK. A standalone
+        `python -m relay.edge_reconnect` reliably recovers from exactly this by RE-NAVIGATING a fresh
+        page to the agent titleId URL -- so try that FIRST, in-loop, before spending the consent-popup
+        or dead-agent wall-clock budget.
+
+        Fires only when the tab really looks drifted (_on_redirect_page) AND we still have per-turn
+        re-nav budget (_renav_budget_ok -- shared with _maybe_renav_off_redirect, so the two paths
+        can never together exceed max_redirect_renavs re-navs on one turn). On a successful re-nav
+        (composer back), re-arms the worker to RETRY the same job and returns True. On budget
+        exhaustion, no page, or a failed re-nav, returns False so the caller falls through to its
+        existing (genuine) consent/dead-agent handling -- a truly consent-gated or truly dead agent
+        still ends up STUCK within the normal window, never loops forever. Never raises."""
+        try:
+            if not self._renav_budget_ok():
+                return False
+            if not self._on_redirect_page():
+                return False
+            if not self._renav_to_agent_surface():
+                return False
+            self.job = self._task_anchor(RETRY_JOB)
+            self._cooldown_until = time.time() + 2.0
+            self.status = "ready"
+            self.reason = "drifted off agent surface -> re-navigated to agent (renav %d/%d), retry" % (
+                self._redirect_renavs, self.max_redirect_renavs)
+            return True
+        except Exception:
+            return False
 
     def _defer_generation(self):
         """Schedule a non-failure RESCHEDULE because the previous turn is still generating.
@@ -1277,13 +1339,35 @@ class RelayWorker:
             return 1
         return 1 + (1 if self.max_research > 0 else 0) + (1 if self.refuter else 0)
 
-    def _auto_consent(self):
+    def _consent_tier0_allow(self):
+        """Tier 0 of _auto_consent, factored out so _decide can try it BEFORE the re-nav-first
+        recovery: if there is literally a 許可/Allow button on the CURRENT page, clicking it is
+        the cheapest and most correct move (nothing to do with a drifted tab). Returns True iff a
+        button was found and clicked. Never raises."""
+        pg = self.page
+        if pg is None:
+            return False
+        try:
+            for label in ("許可", "Allow"):
+                btn = pg.locator('button:has-text("%s")' % label)
+                if btn.count():
+                    btn.first.click()
+                    pg.wait_for_timeout(4000)
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _auto_consent(self, skip_tier0=False):
         """Re-establish the MCP connection AUTOMATICALLY. NOT a credential entry -- the Bearer key
         is already on the connector; this only re-selects + commits the connection. Tiered so the
         cheapest path that works wins; the manual-surface fallback in _decide fires only if ALL
         tiers fail. Returns True iff a commit happened (caller then sends RETRY_JOB).
 
         Tier 0 -- variant (a): a 許可/Allow button in the consent card on self.page -> one click.
+                  Skipped when skip_tier0=True (the caller already tried it itself, e.g. _decide's
+                  re-nav-first ordering tries Tier 0 first, then re-nav, and only then falls back
+                  to here for Tier 1/2 -- so we don't re-probe the same button twice).
         Tier 1 -- DIRECT-HIT: a cached connection-manager URL -> open a new page in the same
                   context, go there, and fix ALL stale rows (skip if it redirects to a login page;
                   do NOT delete the cache on failure -- the popup flow refreshes it).
@@ -1296,15 +1380,8 @@ class RelayWorker:
             click_through_consent, fix_all_stale_connections, load_conn_url,
         )
         # Tier 0: variant (a) -- 許可/Allow directly on the card.
-        try:
-            for label in ("許可", "Allow"):
-                btn = pg.locator('button:has-text("%s")' % label)
-                if btn.count():
-                    btn.first.click()
-                    pg.wait_for_timeout(4000)
-                    return True
-        except Exception:
-            pass
+        if not skip_tier0 and self._consent_tier0_allow():
+            return True
         # Tier 1: DIRECT-HIT a cached connection-manager URL.
         try:
             url = load_conn_url()
@@ -1391,35 +1468,92 @@ class RelayWorker:
         # pattern, bail FAST after a few, and go STUCK so the goal can be re-submitted on a healthy
         # agent rather than wasting the whole turn budget on a dead endpoint.
         _low = resp.lower()
-        # CONNECTION-CONSENT -- NOT a credential/sign-in event (regulation: MCP connection-
-        # consent must be resolved FULLY AUTOMATICALLY; only genuine sign-in may surface the
-        # Edge). The agent's tool call returned the connector's connection-SELECT confirm card
+        # CONNECTION-CONSENT -- NOT a credential/sign-in event, but the regulation is NOT
+        # "never surface" either: consent must be resolved FULLY AUTOMATICALLY, and surfacing
+        # the Edge is the LAST RESORT that fires ONLY once every automatic tier has genuinely
+        # failed. The agent's tool call returned the connector's connection-SELECT confirm card
         # instead of a result. AUTO-CONSENT: the relay clicks it through (接続マネージャー ->
         # レビュー -> 送信する / 許可) via the same three-tier _auto_consent() and re-invokes the
-        # tool via RETRY_JOB. If auto-consent fails, this NEVER calls surface() and NEVER emits
-        # a "前面に出しました" notification -- consent is automatic-only, never manual. On
-        # persistent failure the worker goes STUCK with an actionable (non-surface) reason so
-        # the goal can be re-queued once the connection is fixed out-of-band (edge_reconnect).
+        # tool via RETRY_JOB -- this fully-automatic ladder is unchanged. Only once that ladder
+        # is EXHAUSTED (streak >= 2) does this call surface() once (truthful: gated on its real
+        # return value, never a blind "surfaced!" claim) so the user can approve in the actual
+        # agent chat; if surface() cannot even bring a window up, THEN it goes STUCK with an
+        # honest manual-recovery reason (see the exhaustion branch below).
+        #
+        # RE-NAV-FIRST (2026-07 fix): the consent card is frequently a SYMPTOM of a drifted tab
+        # (the SPA normalized the URL but silently dropped the loaded custom agent), not a genuine
+        # consent-needed state -- and the connection-manager popup flow is fragile precisely
+        # because that cached URL is often not populated. So: try a real Allow button on the
+        # CURRENT page first (cheapest, and correct if this really is consent), then RE-NAV to the
+        # agent surface (reloading the agent tends to make tools work again with no consent dance
+        # at all), and only once re-nav budget is exhausted do we fall to the existing (fragile)
+        # connection-manager/popup tiers -- and, past those, to the last-resort surface() below.
         if any(m in resp for m in CONSENT_MARKERS) or any(m in _low for m in CONSENT_MARKERS):
             self._consent_streak += 1
             if not self._consent_auto_tried:
                 self._consent_auto_tried = True
-                if self._auto_consent():
+                if self._consent_tier0_allow():
+                    self.job = self._task_anchor(RETRY_JOB)
+                    self.reason = "auto-consent: Allowボタンをクリックし再呼出"
+                    return
+                if self._maybe_renav_before_signal():
+                    return
+                if self._auto_consent(skip_tier0=True):
                     self.job = self._task_anchor(RETRY_JOB)
                     self.reason = "auto-consent: 接続を確定し再呼出"
                     return
             if self._consent_streak >= 2:
+                # All automatic tiers are exhausted. LAST RESORT (not a repeat of the old
+                # always-STUCK behavior): surface the dedicated Edge, pointed at THIS worker's
+                # agent conversation (not the top page), so the user can approve by hand. Fire
+                # this at most once per worker (guarded by _consent_surfaced); the TRUTHFUL
+                # result gates both the notify text and whether we retry or give up.
+                if not self._consent_surfaced:
+                    self._consent_surfaced = True
+                    ok = False
+                    try:
+                        from .edge_recover import surface
+                        ok = bool(surface(open_url=self._agent_url))
+                    except Exception:
+                        ok = False
+                    self._consent_surfaced_ok = ok
+                    if ok:
+                        self.job = self._task_anchor(RETRY_JOB)
+                        self.reason = ("⚠ MCP接続の自動承認に失敗 → 専用Edgeを前面に出しました。"
+                                       "表示された画面で接続を許可してください。承認後に自動で再試行します "
+                                       "(%s)" % self.name)
+                        try:
+                            default_notify("⚠ MCP接続の承認が必要",
+                                           "専用Edgeを前面に出しました。表示された画面で接続を許可してください "
+                                           "(%s)" % self.name)
+                        except Exception:
+                            pass
+                        return
+                    self.status, self.outcome = "stuck", "STUCK"
+                    self.reason = ("⚠ 自動承認も自動フォアグラウンド化も失敗。手動で PowerShell から: "
+                                   "powershell -NoProfile -ExecutionPolicy Bypass -File "
+                                   "scripts\\start_companion_edge.ps1 -Foreground を実行し、専用Edgeで"
+                                   "接続を許可してください。承認後、このゴールを再投入してください。")
+                    try:
+                        default_notify("⚠ MCP接続の自動承認・自動表示に失敗",
+                                       "手動で PowerShell から scripts\\start_companion_edge.ps1 -Foreground "
+                                       "を実行し、専用Edgeで接続を許可してください (%s)" % self.name)
+                    except Exception:
+                        pass
+                    return
+                # Already surfaced once this worker. If that surface() genuinely worked, give the
+                # user a bounded number of extra retries to notice the foregrounded Edge and
+                # approve before giving up for good (never loop forever on an unattended card).
+                if self._consent_surfaced_ok and self._consent_streak < (2 + CONSENT_SURFACE_RETRY_MAX):
+                    self.job = self._task_anchor(RETRY_JOB)
+                    self.reason = ("専用Edge表示済み、承認待ち -> 自動再試行 (%d)" % self._consent_streak)
+                    return
                 self.status, self.outcome = "stuck", "STUCK"
-                self.reason = ("⚠ MCP接続の自動承認に失敗。edge_reconnect を再実行するか接続を確認: "
-                               "python -m relay.edge_reconnect (または --reconnect-url で該当の "
-                               "user-connections ページを直接指定)。エージェントはツールを呼ぶ度に"
-                               "「接続マネージャーを開く」カードを返している。タスク失敗ではなく"
-                               "**接続未確立**。接続を修復後、このゴールを再投入してください。")
-                try:
-                    default_notify("⚠ MCP接続の自動承認に失敗",
-                                   "edge_reconnect を再実行するか接続を確認してください (%s)" % self.name)
-                except Exception:
-                    pass
+                self.reason = ("⚠ MCP接続の自動承認に失敗。専用Edgeを前面に出しましたが、承認がまだ"
+                               "完了していません。表示されたEdgeで接続を許可してから、このゴールを"
+                               "再投入してください。（自動表示に失敗していた場合は手動で: powershell "
+                               "-NoProfile -ExecutionPolicy Bypass -File scripts\\start_companion_edge.ps1 "
+                               "-Foreground）")
                 return
             self.job = self._task_anchor(RETRY_JOB)
             self.reason = "auto-consent 失敗 -> 再試行 (%d)" % self._consent_streak
@@ -1603,6 +1737,18 @@ class RelayWorker:
             if self._agent_err_ts <= 0.0:
                 self._agent_err_ts = now
             self._copilot_err_streak += 1
+            # RE-NAV-FIRST (2026-07 fix): "agent dead" is very often just "tab drifted off the
+            # agent surface" -- the SystemError/admin-block text is a generic canned reply that a
+            # drifted tab returns for EVERY tool call, indistinguishable from a genuinely dead/
+            # banned agent by text alone. Before letting this count toward the wall-clock STUCK
+            # window, check whether the tab is actually parked on a redirect/non-agent page and,
+            # if so and re-nav budget remains, RE-NAVIGATE and RETRY once -- reloading the agent
+            # tends to make tools work again, exactly like standalone edge_reconnect. This does
+            # NOT weaken the genuine-outage handling below: a real outage/dead agent has no
+            # composer-less redirect page to fix, so _maybe_renav_before_signal simply returns
+            # False (or budget runs out) and the existing wall-clock STUCK still fires on schedule.
+            if self._maybe_renav_before_signal():
+                return
             # WALL-CLOCK window, not a 3-strike count: a devtunnel SSL flap / brief Copilot blip
             # surfaces as a SystemError too, and STUCKing after 3 quick errors (~seconds) meant a
             # momentary outage killed the worker. Keep retrying WITH BACKOFF for AGENT_ERR_WINDOW_S
@@ -1616,11 +1762,11 @@ class RelayWorker:
                                "（他のエージェントが動くなら本エージェント固有の block の可能性大）。"
                                "健全なエージェントに切り替えて再投入を。"
                                % (int((now - self._agent_err_ts) / 60), self._copilot_err_streak))
-                try:
-                    default_notify("⚠ エージェント停止の疑い",
-                                   "Copilot Studio で停止/無効化されていないか確認を (%s)" % self.name)
-                except Exception:
-                    pass
+                # NO desktop notify here (2026-07 fix): AGENT_DEAD_MARKERS are GENERIC Copilot
+                # error strings ("予期しないエラー"/"システムエラー") that also fire on ordinary
+                # transient blips, so the "エージェント停止/無効化" toast was a false alarm the
+                # user could not act on by clicking. The diagnosis stays in self.reason for the
+                # cockpit's STUCK view; it must never become a desktop toast.
                 return
             self.job = self._task_anchor(RETRY_JOB)
             self._cooldown_until = now + transient_backoff(self._copilot_err_streak)  # back off, don't hammer

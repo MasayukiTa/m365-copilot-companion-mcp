@@ -456,10 +456,20 @@ def test_dead_agent_detector():
     w._decide(err + "t1"); w._decide(err + "t2"); w._decide(err + "t3")
     check("dead_within_window_retries", w.status != "stuck" and w._copilot_err_streak == 3)
     # only once the failure PERSISTS past AGENT_ERR_WINDOW_S does it STUCK (a real down/banned agent).
-    w._agent_err_ts = _t.time() - rf.AGENT_ERR_WINDOW_S - 1
-    w._decide(err + "t4")
-    check("dead_stuck_after_window", w.status == "stuck" and w.outcome == "STUCK")
-    check("dead_msg_points_to_copilot_studio", "Copilot Studio" in (w.reason or ""))
+    # FIX 2 (2026-07): AGENT_DEAD_MARKERS are GENERIC Copilot error strings that also fire on
+    # ordinary transient blips, so the desktop toast here was a false alarm the user could not
+    # act on -- it must be GONE. The cockpit diagnosis stays in self.reason; only the toast goes.
+    notify_calls = []
+    orig_notify = rf.default_notify
+    rf.default_notify = lambda *a, **k: notify_calls.append((a, k))
+    try:
+        w._agent_err_ts = _t.time() - rf.AGENT_ERR_WINDOW_S - 1
+        w._decide(err + "t4")
+        check("dead_stuck_after_window", w.status == "stuck" and w.outcome == "STUCK")
+        check("dead_msg_points_to_copilot_studio", "Copilot Studio" in (w.reason or ""))
+        check("dead_no_desktop_notify", len(notify_calls) == 0)
+    finally:
+        rf.default_notify = orig_notify
     # English failure trips it the same way (after the window)
     w_en = RelayWorker("g", "wen")
     en = "Sorry, an unexpected error occurred. If the problem persists, contact your administrator."
@@ -515,40 +525,94 @@ def test_transient_outage_window():
 
 
 def test_consent_detector():
-    # REGULATION: MCP connection-consent is a connection-SELECT confirm, NOT credential entry, so it
-    # must be resolved FULLY AUTOMATICALLY -- it must NEVER surface the Edge. surface() is reserved
-    # for genuine sign-in only. So: auto-consent is attempted; on failure the worker RETRIES (not
-    # stuck) and NEVER surfaces; a second consecutive failure goes STUCK with an edge_reconnect hint.
+    # REGULATION (2026-07 fix): MCP connection-consent must be resolved FULLY AUTOMATICALLY --
+    # the automatic tiers (Tier0 Allow / re-nav / _auto_consent) are tried first and NEVER
+    # surface. Surfacing the Edge is the LAST RESORT: only once those tiers are genuinely
+    # exhausted (streak >= 2) does the worker call surface() ONCE with open_url=the agent's own
+    # URL. If that surface() call succeeds (True), the worker does NOT hard-STUCK -- it retries
+    # the goal so the re-invoke succeeds once the user approves. If surface() fails (False), the
+    # worker STUCKs with an HONEST manual-recovery reason (never a false "surfaced!" claim).
     import relay.edge_recover as er
-    calls = {"n": 0}
+    card = ("desktopfile操作\nまずは接続して、必要な情報を探します。この資格情報を 接続マネージャーを開く で"
+            "検証してください。接続の準備が整ったら、この要求をやり直してください。再試行 キャンセル")
+
+    # ---- (1) surface() succeeds at exhaustion -> not called during the automatic tiers, called
+    # exactly once at exhaustion with open_url=the worker's _agent_url, worker does NOT hard-STUCK.
+    calls = []
     orig = er.surface
-    er.surface = lambda *a, **k: calls.__setitem__("n", calls["n"] + 1)  # tripwire: must stay 0 for consent
+    er.surface = lambda *a, **k: (calls.append((a, k)), True)[1]
+    notify_calls = []
+    orig_notify = rf.default_notify
+    rf.default_notify = lambda *a, **k: notify_calls.append((a, k))
     try:
-        card = ("desktopfile操作\nまずは接続して、必要な情報を探します。この資格情報を 接続マネージャーを開く で"
-                "検証してください。接続の準備が整ったら、この要求をやり直してください。再試行 キャンセル")
         w = RelayWorker("fix the bug", "w0")
-        w._decide(card)                       # 1st -> auto tried (page=None -> fails) -> RETRY, NOT surface, NOT stuck
+        w._agent_url = "https://copilot.example/chat/agent/T_abc?titleId=xyz"
+        w._decide(card)                       # 1st -> auto tried (page=None -> fails) -> RETRY
         check("consent_auto_attempted_first", w._consent_auto_tried)
-        check("consent_no_surface_on_first", calls["n"] == 0 and w.status != "stuck")
-        w._decide(card)                       # 2nd -> STUCK (don't burn turns on the card)
-        check("consent_stuck_after_2", w.status == "stuck" and w.outcome == "STUCK")
-        check("consent_msg_reconnect_hint", "edge_reconnect" in (w.reason or ""))
-        check("consent_never_surfaced", calls["n"] == 0)   # consent must never surface
-        # an English consent card trips it too
+        check("consent_no_surface_on_first", len(calls) == 0 and w.status != "stuck")
+        w._decide(card)                       # 2nd -> automatic tiers exhausted -> last-resort surface()
+        check("consent_surface_called_once_at_exhaustion", len(calls) == 1)
+        _, kwargs = calls[0]
+        check("consent_surface_open_url_is_agent_url", kwargs.get("open_url") == w._agent_url)
+        check("consent_not_hard_stuck_when_surfaced_ok", w.status != "stuck")
+        check("consent_retried_after_surface", w.status != "stuck" and (w.job or "") != "")
+        check("consent_notify_truthful_surfaced",
+              any("前面に出しました" in (a[1] if len(a) > 1 else "") for a, k in notify_calls))
+        # a further sighting (still no approval yet) keeps retrying, bounded -- does not surface again
+        w._decide(card)
+        check("consent_surface_still_only_once", len(calls) == 1)
+    finally:
+        er.surface = orig
+        rf.default_notify = orig_notify
+
+    # ---- (2) surface() fails at exhaustion -> worker STUCKs with the HONEST manual-recovery
+    # reason (the -Foreground PowerShell hint), and the notify is that honest message, NOT a
+    # "surfaced!" claim.
+    calls2 = []
+    er.surface = lambda *a, **k: (calls2.append((a, k)), False)[1]
+    notify_calls2 = []
+    rf.default_notify = lambda *a, **k: notify_calls2.append((a, k))
+    try:
+        wfail = RelayWorker("fix the bug", "wfail")
+        wfail._agent_url = "https://copilot.example/chat/agent/T_abc?titleId=xyz"
+        wfail._decide(card)
+        wfail._decide(card)                   # exhaustion -> surface() called, returns False
+        check("consent_surface_fail_called_once", len(calls2) == 1)
+        check("consent_surface_fail_hard_stuck", wfail.status == "stuck" and wfail.outcome == "STUCK")
+        check("consent_surface_fail_honest_reason",
+              "-Foreground" in (wfail.reason or "") and "start_companion_edge.ps1" in (wfail.reason or ""))
+        check("consent_surface_fail_notify_honest",
+              len(notify_calls2) == 1
+              and "前面に出しました" not in (notify_calls2[0][0][1] if len(notify_calls2[0][0]) > 1 else "")
+              and "-Foreground" in (notify_calls2[0][0][1] if len(notify_calls2[0][0]) > 1 else ""))
+    finally:
+        er.surface = orig
+        rf.default_notify = orig_notify
+
+    # an English consent card trips the automatic ladder the same way (bounded consent streak,
+    # not asserting on surface behavior here -- that's covered above).
+    er.surface = lambda *a, **k: True
+    try:
         w2 = RelayWorker("g", "w1")
         en = "Please open connection manager and verify your credential, then retry."
         w2._decide(en); w2._decide(en)
-        check("consent_detector_english", w2.status == "stuck")
-        # a real tool result (no card) does NOT trip it
-        w3 = RelayWorker("g", "w2")
-        w3._decide('{"platform":"win32","python_version":"3.11"} 完了。CONTINUE')
-        check("consent_no_false_positive", w3.status != "stuck" and w3._consent_streak == 0)
-        # AUTO-CONSENT SUCCESS: when the click-through completes, re-invoke (RETRY) -- no surface, no STUCK
+        check("consent_detector_english", w2._consent_streak >= 2)
+    finally:
+        er.surface = orig
+    # a real tool result (no card) does NOT trip it
+    w3 = RelayWorker("g", "w2")
+    w3._decide('{"platform":"win32","python_version":"3.11"} 完了。CONTINUE')
+    check("consent_no_false_positive", w3.status != "stuck" and w3._consent_streak == 0)
+    # AUTO-CONSENT SUCCESS: when the click-through completes, re-invoke (RETRY) -- no surface, no STUCK.
+    # _decide now tries Tier 0 / re-nav-first before falling back to _auto_consent(skip_tier0=True)
+    # (2026-07 re-nav-first fix), so the stub must accept that kwarg like the real method does.
+    calls3 = []
+    er.surface = lambda *a, **k: calls3.append((a, k))
+    try:
         wok = RelayWorker("g", "wok")
-        wok._auto_consent = lambda: True
-        calls["n"] = 0
+        wok._auto_consent = lambda skip_tier0=False: True
         wok._decide(card)
-        check("consent_auto_success_no_surface", calls["n"] == 0 and wok.status != "stuck"
+        check("consent_auto_success_no_surface", len(calls3) == 0 and wok.status != "stuck"
               and wok._consent_auto_tried)
     finally:
         er.surface = orig
@@ -609,6 +673,92 @@ def test_tab_budget_admission():
         _restore_worker(orig)
 
 
+def test_renav_first_on_consent_and_dead_agent():
+    # 2026-07 fix: the consent card / "agent dead" reply is frequently a SYMPTOM of a drifted tab
+    # (SPA normalized the URL but silently dropped the loaded custom agent), not genuine consent-
+    # needed or genuine dead-agent. _decide must try RE-NAV to the agent surface FIRST -- before
+    # the fragile popup click-through tiers (consent) and before counting toward the wall-clock
+    # STUCK window (agent-dead). Hermetic: no real browser, no page -- we monkeypatch the redirect
+    # detector and the low-level re-nav mechanics so we can observe call order without Playwright.
+    import relay.edge_recover as er
+
+    class _FakePage:
+        """Just enough of a Playwright Page for _agent_url/_renav_budget_ok gating to treat this
+        worker as having a real page (so re-nav-first's precondition checks don't short-circuit
+        on page is None, exactly as they would with a real browser)."""
+        url = "https://copilot.example/chat/?redirfrom=CsrToSSR&auth=2"
+
+    # ---- CONSENT branch: no Allow button, tab looks drifted, budget available -> re-nav fires
+    # BEFORE the fragile _auto_consent popup tiers (which we tripwire to prove they're unreached).
+    w = RelayWorker("fix the bug", "wconsent")
+    w.page = _FakePage()
+    w._agent_url = "https://copilot.example/chat/?titleId=abc"
+    w._consent_tier0_allow = lambda: False          # no real Allow button on this drifted page
+    w._on_redirect_page = lambda: True              # drifted-tab signal
+    def _fake_renav_ok():                           # re-nav succeeds, composer back (spends budget,
+        w._redirect_renavs += 1                     # like the real _renav_to_agent_surface does)
+        return True
+    w._renav_to_agent_surface = _fake_renav_ok
+    auto_consent_calls = {"n": 0}
+    w._auto_consent = lambda *a, **k: auto_consent_calls.__setitem__("n", auto_consent_calls["n"] + 1) or False
+    card = ("desktopfile操作\nまずは接続して、必要な情報を探します。この資格情報を 接続マネージャーを開く で"
+            "検証してください。接続の準備が整ったら、この要求をやり直してください。再試行 キャンセル")
+    surface_calls = {"n": 0}
+    orig_surface = er.surface
+    er.surface = lambda *a, **k: surface_calls.__setitem__("n", surface_calls["n"] + 1)
+    try:
+        w._decide(card)
+        check("consent_renav_first_not_stuck", w.status != "stuck")
+        check("consent_renav_first_skips_auto_consent_tiers", auto_consent_calls["n"] == 0)
+        check("consent_renav_first_never_surfaces", surface_calls["n"] == 0)
+        check("consent_renav_first_spent_budget", w._redirect_renavs == 1)
+        check("consent_renav_first_retries_job", "renav" in (w.reason or "").lower() or "再ナビ" in (w.reason or ""))
+    finally:
+        er.surface = orig_surface
+
+    # ---- CONSENT branch, budget exhausted -> falls through to the existing _auto_consent tiers
+    # (proves re-nav-first is BOUNDED, not an infinite loop / permanent bypass of the old path).
+    w2 = RelayWorker("fix the bug", "wconsent2")
+    w2.page = _FakePage()
+    w2._agent_url = "https://copilot.example/chat/?titleId=abc"
+    w2._redirect_renavs = w2.max_redirect_renavs     # budget already spent
+    w2._consent_tier0_allow = lambda: False
+    w2._on_redirect_page = lambda: True
+    fallback_calls = {"n": 0}
+    w2._auto_consent = lambda *a, **k: fallback_calls.__setitem__("n", fallback_calls["n"] + 1) or False
+    w2._decide(card)
+    check("consent_budget_exhausted_falls_back", fallback_calls["n"] == 1)
+
+    # ---- AGENT_DEAD branch: drifted tab + budget available -> re-nav+RETRY instead of
+    # immediately accumulating toward the wall-clock STUCK window.
+    w3 = RelayWorker("do the thing", "wdead")
+    w3.page = _FakePage()
+    w3._agent_url = "https://copilot.example/chat/?titleId=abc"
+    w3._on_redirect_page = lambda: True
+    def _fake_renav_ok3():
+        w3._redirect_renavs += 1
+        return True
+    w3._renav_to_agent_surface = _fake_renav_ok3
+    err = "申し訳ありません。予期しないエラーが発生しました。エラー コード: SystemError。時刻: "
+    w3._decide(err + "t1")
+    check("dead_renav_first_not_stuck", w3.status != "stuck")
+    check("dead_renav_first_retries", w3.status == "ready")
+    check("dead_renav_first_spent_budget", w3._redirect_renavs == 1)
+
+    # ---- AGENT_DEAD branch, no redirect signal (genuine outage) -> re-nav-first is a no-op and
+    # the existing wall-clock window logic is UNCHANGED (still rides out the outage, still STUCKs
+    # only after the window -- the genuine-outage handling is not weakened).
+    w4 = RelayWorker("do the thing", "wdead2")
+    w4._on_redirect_page = lambda: False   # not on a redirect page: real agent, real outage
+    w4._decide(err + "t1"); w4._decide(err + "t2"); w4._decide(err + "t3")
+    check("dead_genuine_outage_still_rides_out",
+          w4.status != "stuck" and w4._copilot_err_streak == 3)
+    w4._agent_err_ts = __import__("time").time() - rf.AGENT_ERR_WINDOW_S - 1
+    w4._decide(err + "t4")
+    check("dead_genuine_outage_still_stucks_past_window",
+          w4.status == "stuck" and w4.outcome == "STUCK")
+
+
 def main():
     test_disk_floor_predicate()
     test_tab_load_accounting()
@@ -625,6 +775,7 @@ def main():
     test_tool_unreachable_infra()
     test_transient_outage_window()
     test_consent_detector()
+    test_renav_first_on_consent_and_dead_agent()
     print("\n=== %d/%d admission checks passed ===" % (sum(results), len(results)))
     return 0 if all(results) else 1
 
