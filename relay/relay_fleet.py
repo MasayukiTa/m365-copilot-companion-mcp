@@ -45,17 +45,33 @@ TERMINAL = ("done", "stuck", "maxturns", "error", "cancelled")
 PENDING = "pending"
 
 # Replies that mean the Copilot AGENT/PATH is down, NOT that the task failed. The error number /
-# session-id / timestamp vary, but the prose is stable in both EN and JP. If one of these repeats,
-# the agent is almost certainly wedged or STOPPED/DISABLED in Copilot Studio (a per-agent admin
-# block -- seen when one agent died while the user's others kept working). The fix is to check
-# Copilot Studio / switch agents, NOT to keep retrying. Stored lowercase; JP is unaffected by
-# .lower(), so a single `marker in resp.lower()` covers both languages.
-AGENT_DEAD_MARKERS = (
+# session-id / timestamp vary, but the prose is stable in both EN and JP. Stored lowercase; JP is
+# unaffected by .lower(), so a single `marker in resp.lower()` covers both languages.
+#
+# SPLIT (2026-07 fix #2): these used to be ONE list (AGENT_DEAD_MARKERS) whose past-window branch
+# both rode out AND, once past the window, declared "agent stopped/disabled" for either kind of
+# match. That conflated two very different situations:
+#   * TRANSIENT_ERROR_MARKERS -- GENERIC "something broke, try again" boilerplate that Copilot
+#     also emits for an ordinary network/tunnel blip or a drifted tab. It says nothing about
+#     WHICH agent or whether it's disabled -- it is the same string a healthy agent shows during
+#     a passing outage. Declaring "stopped/disabled" off this alone was the FALSE POSITIVE (the
+#     desktop toast a previous change wrongly deleted instead of fixing).
+#   * ADMIN_BLOCK_MARKERS -- the narrower "an administrator needs to look at THIS" family. This is
+#     the actual signal for a per-agent admin block (stopped/disabled in Copilot Studio) -- but
+#     only trustworthy when our own path to the tools is confirmed healthy (see _infra_healthy),
+#     since a network outage can make even this text appear as a generic-looking error page.
+# AGENT_DEAD_MARKERS is kept as the union so the existing branch-entry condition
+# (`any(m in _low for m in AGENT_DEAD_MARKERS)`) is unchanged; the branch body below now looks at
+# WHICH sub-list actually matched to decide whether the desktop "disabled" toast may fire.
+TRANSIENT_ERROR_MARKERS = (
     "予期しないエラー", "システムエラー", "systemerror", "unexpected error",
     "something went wrong", "ページをもう一度読み込", "reload the page", "try reloading",
-    "管理者に問い合わせ", "contact your administrator", "contact the administrator",
     "問題が解決しない場合", "if the problem persists",
 )
+ADMIN_BLOCK_MARKERS = (
+    "管理者に問い合わせ", "contact your administrator", "contact the administrator",
+)
+AGENT_DEAD_MARKERS = TRANSIENT_ERROR_MARKERS + ADMIN_BLOCK_MARKERS
 
 # NETWORK-OUTAGE RESILIENCE (2026-06-17). A flaky corporate network / devtunnel can drop the path
 # to the MCP backend for seconds-to-minutes. The retry budgets must be WALL-CLOCK windows, not tiny
@@ -191,6 +207,65 @@ def _unlock_password():
         except Exception:
             pass
     return pw
+
+
+def _mcp_tunnel_url():
+    """MCP_TUNNEL_URL, read LOCALLY (process env or .env) the same way _unlock_password reads
+    MCP_UNLOCK_PASSWORD. '' if unset (no tunnel configured / everything is local)."""
+    url = (os.environ.get("MCP_TUNNEL_URL") or "").strip()
+    if not url:
+        try:
+            from dotenv import load_dotenv
+            repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            load_dotenv(os.path.join(repo, ".env"))
+            url = (os.environ.get("MCP_TUNNEL_URL") or "").strip()
+        except Exception:
+            pass
+    return url
+
+
+def _url_ok(url, timeout_s=3.0):
+    """GET `url`, True iff the response status is 200. Bypasses any corporate/system HTTP(S)
+    proxy for this one request -- a proxy can swallow or mis-route 127.0.0.1/loopback traffic
+    (and may also not have a route to a devtunnel host), so we build a ProxyHandler(proxies={})
+    opener rather than relying on urllib's environment-derived default. Never raises -> False on
+    ANY error (timeout, connection refused, DNS, TLS, etc.)."""
+    try:
+        import urllib.request
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(url, timeout=timeout_s) as resp:
+            return int(getattr(resp, "status", getattr(resp, "code", 0)) or 0) == 200
+    except Exception:
+        return False
+
+
+def _infra_healthy(timeout_s=3.0) -> bool:
+    """True iff OUR path to the MCP tools looks healthy right now: the LOCAL server answers
+    http://127.0.0.1:8000/health AND (no tunnel is configured OR the tunnel's /health also
+    answers). Used to gate the AGENT_DEAD branch's "agent is stopped/disabled" conclusion: an
+    ADMIN_BLOCK-worded reply is only trustworthy as a real per-agent block when we can prove the
+    problem is NOT on our own network/tunnel side.
+
+    Deliberately a plain module-level function (not a method) so tests can monkeypatch
+    `relay.relay_fleet._infra_healthy` directly, and deliberately conservative: any failure to
+    confirm health (local server down, tunnel down, DNS hiccup, whatever) returns False, i.e.
+    "infra looks NOT healthy" -- which, in the caller, SUPPRESSES the disabled-agent claim rather
+    than asserting it. That is the safe direction for a false-positive-sensitive detector: we'd
+    rather under-claim "agent disabled" (fall back to a re-queueable infra/network stuck) than
+    wrongly tell the user to go disable-hunt in Copilot Studio for what was actually our own
+    network blip. Never raises."""
+    try:
+        if not _url_ok("http://127.0.0.1:8000/health", timeout_s=timeout_s):
+            return False
+        tunnel = _mcp_tunnel_url()
+        if tunnel:
+            base = tunnel.rstrip("/")
+            if not _url_ok(base + "/health", timeout_s=timeout_s):
+                return False
+        return True
+    except Exception:
+        return False
+
 
 # STUCK-ON-REDIRECT detector (2026-06-18, W4 xarray-3364). A worker tab can land on the M365
 # SSO-redirect / landing page (e.g. https://m365.cloud.microsoft/chat/?redirfrom=CsrToSSR&auth=2)
@@ -1755,18 +1830,50 @@ class RelayWorker:
             # so an outage is ridden out; only a failure that PERSISTS past the window is treated as
             # a genuinely down/banned agent (then the actionable Copilot-Studio message applies).
             if (now - self._agent_err_ts) > AGENT_ERR_WINDOW_S and self._copilot_err_streak >= 3:
-                self.status, self.outcome = "stuck", "STUCK"
-                self.reason = ("⚠ エージェント応答エラーが%d分以上継続(%d回連続)。一時的な網断ではなく"
-                               "**エージェント自体が応答していない**。→ Copilot Studio でこのエージェントが"
-                               "**停止/無効化(管理者ブロック)されていないか確認**してください"
-                               "（他のエージェントが動くなら本エージェント固有の block の可能性大）。"
-                               "健全なエージェントに切り替えて再投入を。"
+                # SPLIT (2026-07 fix #2): a previous change just DELETED the desktop notify here
+                # because it fired on every generic transient error too (a false positive) -- that
+                # hid the symptom instead of fixing it. The real fix is to only claim "agent
+                # stopped/disabled" when (a) an ADMIN_BLOCK-worded reply actually matched (not just
+                # the generic transient boilerplate) AND (b) our own path to the tools is confirmed
+                # healthy right now (_infra_healthy) -- so we can be sure the failure is on the
+                # agent/Copilot-Studio side, not a network/tunnel outage wearing the same words.
+                admin_block_matched = any(m in _low for m in ADMIN_BLOCK_MARKERS)
+                infra_ok = False
+                if admin_block_matched:
+                    try:
+                        infra_ok = _infra_healthy()
+                    except Exception:
+                        infra_ok = False
+                if admin_block_matched and infra_ok:
+                    # TRUE POSITIVE path: admin-block wording + our own infra is fine -> the
+                    # failure really does look like this specific agent being stopped/disabled.
+                    self.status, self.outcome = "stuck", "STUCK"
+                    self.reason = ("⚠ エージェント応答エラーが%d分以上継続(%d回連続)。MCP接続は正常"
+                                   "(自ホスト/トンネルとも応答あり)なので網の問題ではなく"
+                                   "**エージェント自体が応答していない**。→ Copilot Studio でこのエージェントが"
+                                   "**停止/無効化(管理者ブロック)されていないか確認**してください"
+                                   "（他のエージェントが動くなら本エージェント固有の block の可能性大）。"
+                                   "健全なエージェントに切り替えて再投入を。"
+                                   % (int((now - self._agent_err_ts) / 60), self._copilot_err_streak))
+                    try:
+                        default_notify(
+                            "⚠ エージェントが停止/無効化されている可能性",
+                            "Copilot Studio でこのエージェントの停止/無効化を確認してください (%s)" % self.name)
+                    except Exception:
+                        pass
+                    return
+                # Otherwise: only GENERIC transient wording matched, OR infra looks unhealthy right
+                # now -- either way this is a network/tunnel outage wearing agent-error clothing,
+                # NOT proof this agent is disabled. Classify as INFRA_STUCK (re-queueable, mirrors
+                # TOOL_UNREACHABLE's convention) and do NOT fire the disabled-agent toast: the user
+                # cannot fix an agent-disable in Copilot Studio when the real problem is the network,
+                # and a wrong toast just sends them chasing the wrong knob.
+                self.status, self.outcome = "stuck", "INFRA_STUCK"
+                self.reason = ("⚠ MCP接続/ネットワークが%d分以上不通(%d回連続)。**エージェント停止ではなく"
+                               "接続断の可能性が高い**(管理者ブロックの文言でも自ホスト/トンネルの"
+                               "healthチェックが失敗している場合を含む)。ネットワーク/トンネルを確認し、"
+                               "復旧後に再投入してください(タスク失敗ではなくインフラ起因=reverify対象)。"
                                % (int((now - self._agent_err_ts) / 60), self._copilot_err_streak))
-                # NO desktop notify here (2026-07 fix): AGENT_DEAD_MARKERS are GENERIC Copilot
-                # error strings ("予期しないエラー"/"システムエラー") that also fire on ordinary
-                # transient blips, so the "エージェント停止/無効化" toast was a false alarm the
-                # user could not act on by clicking. The diagnosis stays in self.reason for the
-                # cockpit's STUCK view; it must never become a desktop toast.
                 return
             self.job = self._task_anchor(RETRY_JOB)
             self._cooldown_until = now + transient_backoff(self._copilot_err_streak)  # back off, don't hammer
