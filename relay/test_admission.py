@@ -455,33 +455,131 @@ def test_dead_agent_detector():
     w = RelayWorker("do the thing", "w0")
     w._decide(err + "t1"); w._decide(err + "t2"); w._decide(err + "t3")
     check("dead_within_window_retries", w.status != "stuck" and w._copilot_err_streak == 3)
-    # only once the failure PERSISTS past AGENT_ERR_WINDOW_S does it STUCK (a real down/banned agent).
-    # FIX 2 (2026-07): AGENT_DEAD_MARKERS are GENERIC Copilot error strings that also fire on
-    # ordinary transient blips, so the desktop toast here was a false alarm the user could not
-    # act on -- it must be GONE. The cockpit diagnosis stays in self.reason; only the toast goes.
+
+    # FIX #2 (2026-07): the wall-clock STUCK point now SPLITS on which marker family matched and
+    # whether our own infra is confirmed healthy, instead of treating every AGENT_DEAD_MARKERS hit
+    # the same. Case (a): a GENERIC transient-error string persisting past the window, with infra
+    # reported healthy -- this must NEVER be blamed on the agent (that was the false positive a
+    # previous change tried to fix by just deleting the notify). It must land as a re-queueable
+    # INFRA_STUCK, with NO "disabled" desktop toast, and a reason about network/connection.
     notify_calls = []
     orig_notify = rf.default_notify
     rf.default_notify = lambda *a, **k: notify_calls.append((a, k))
+    orig_infra_fn = rf._infra_healthy
+    rf._infra_healthy = lambda *a, **k: True
     try:
         w._agent_err_ts = _t.time() - rf.AGENT_ERR_WINDOW_S - 1
         w._decide(err + "t4")
-        check("dead_stuck_after_window", w.status == "stuck" and w.outcome == "STUCK")
-        check("dead_msg_points_to_copilot_studio", "Copilot Studio" in (w.reason or ""))
-        check("dead_no_desktop_notify", len(notify_calls) == 0)
+        check("transient_infra_ok_stuck_is_infra", w.status == "stuck" and w.outcome == "INFRA_STUCK")
+        check("transient_infra_ok_reason_says_network",
+              ("接続" in (w.reason or "")) or ("ネットワーク" in (w.reason or "")))
+        check("transient_infra_ok_reason_not_disabled", "無効化" not in (w.reason or ""))
+        check("transient_infra_ok_no_desktop_notify", len(notify_calls) == 0)
     finally:
         rf.default_notify = orig_notify
-    # English failure trips it the same way (after the window)
-    w_en = RelayWorker("g", "wen")
-    en = "Sorry, an unexpected error occurred. If the problem persists, contact your administrator."
-    w_en._decide(en + "1"); w_en._agent_err_ts = _t.time() - rf.AGENT_ERR_WINDOW_S - 1
-    w_en._decide(en + "2"); w_en._decide(en + "3")
-    check("dead_detector_english", w_en.status == "stuck")
-    # admin-block message, same path (after the window)
-    w2 = RelayWorker("g", "w1")
-    msg = "ページをもう一度読み込んでみてください。管理者に問い合わせてください。セッション ID: "
-    w2._decide(msg + "1"); w2._agent_err_ts = _t.time() - rf.AGENT_ERR_WINDOW_S - 1
-    w2._decide(msg + "2"); w2._decide(msg + "3")
-    check("admin_block_stuck", w2.status == "stuck")
+        rf._infra_healthy = orig_infra_fn
+
+    # Case (b): same GENERIC transient error past the window, but infra is reported UNHEALTHY too
+    # (a real outage) -- still must NOT fire the disabled-agent toast (transient wording never
+    # qualifies for the true-positive path regardless of infra state).
+    notify_calls_b = []
+    rf.default_notify = lambda *a, **k: notify_calls_b.append((a, k))
+    rf._infra_healthy = lambda *a, **k: False
+    try:
+        w_b = RelayWorker("do the thing", "wb")
+        w_b._decide(err + "t1")
+        w_b._agent_err_ts = _t.time() - rf.AGENT_ERR_WINDOW_S - 1
+        w_b._decide(err + "t2"); w_b._decide(err + "t3")
+        check("transient_infra_down_stuck_is_infra", w_b.status == "stuck" and w_b.outcome == "INFRA_STUCK")
+        check("transient_infra_down_no_desktop_notify", len(notify_calls_b) == 0)
+    finally:
+        rf.default_notify = orig_notify
+        rf._infra_healthy = orig_infra_fn
+
+    # Case (c): TRUE POSITIVE restored -- an ADMIN_BLOCK-worded reply (only "contact the
+    # administrator" family, no generic transient text) persisting past the window, WITH infra
+    # confirmed healthy (our own MCP path is fine) -> this really does look like the agent itself
+    # being stopped/disabled. Desktop notify MUST fire exactly once with the "停止/無効化" wording.
+    notify_calls_c = []
+    rf.default_notify = lambda *a, **k: notify_calls_c.append((a, k))
+    rf._infra_healthy = lambda *a, **k: True
+    try:
+        admin_msg = "管理者に問い合わせてください。セッション ID: "
+        w_c = RelayWorker("g", "wc")
+        w_c._on_redirect_page = lambda: False   # no drift signal -> re-nav-first is a no-op
+        w_c._decide(admin_msg + "1")
+        w_c._agent_err_ts = _t.time() - rf.AGENT_ERR_WINDOW_S - 1
+        w_c._decide(admin_msg + "2"); w_c._decide(admin_msg + "3")
+        check("admin_block_infra_ok_stuck", w_c.status == "stuck" and w_c.outcome == "STUCK")
+        check("admin_block_msg_points_to_copilot_studio", "Copilot Studio" in (w_c.reason or ""))
+        check("admin_block_msg_says_disabled", "停止/無効化" in (w_c.reason or ""))
+        check("admin_block_notify_called_once", len(notify_calls_c) == 1)
+        check("admin_block_notify_wording",
+              "停止/無効化" in (notify_calls_c[0][0][0] if notify_calls_c and notify_calls_c[0][0] else ""))
+    finally:
+        rf.default_notify = orig_notify
+        rf._infra_healthy = orig_infra_fn
+
+    # Case (d): ADMIN_BLOCK wording past the window, but infra reported UNHEALTHY -- a network
+    # problem must NOT be blamed on the agent. No desktop notify; classified as INFRA_STUCK.
+    notify_calls_d = []
+    rf.default_notify = lambda *a, **k: notify_calls_d.append((a, k))
+    rf._infra_healthy = lambda *a, **k: False
+    try:
+        admin_msg = "管理者に問い合わせてください。セッション ID: "
+        w_d = RelayWorker("g", "wd")
+        w_d._on_redirect_page = lambda: False
+        w_d._decide(admin_msg + "1")
+        w_d._agent_err_ts = _t.time() - rf.AGENT_ERR_WINDOW_S - 1
+        w_d._decide(admin_msg + "2"); w_d._decide(admin_msg + "3")
+        check("admin_block_infra_down_is_infra_stuck", w_d.status == "stuck" and w_d.outcome == "INFRA_STUCK")
+        check("admin_block_infra_down_no_notify", len(notify_calls_d) == 0)
+    finally:
+        rf.default_notify = orig_notify
+        rf._infra_healthy = orig_infra_fn
+
+    # Case (e): drift case -- re-nav-first recovers the tab (_maybe_renav_before_signal -> True via
+    # the underlying _on_redirect_page/_renav_to_agent_surface monkeypatch), so _decide returns
+    # BEFORE even reaching the wall-clock STUCK point. Neither STUCK nor a notify; it just retries.
+    notify_calls_e = []
+    rf.default_notify = lambda *a, **k: notify_calls_e.append((a, k))
+    try:
+        class _FakePageE:
+            url = "https://copilot.example/chat/?redirfrom=CsrToSSR&auth=2"
+        w_e = RelayWorker("do the thing", "we")
+        w_e.page = _FakePageE()
+        w_e._agent_url = "https://copilot.example/chat/?titleId=abc"
+        w_e._on_redirect_page = lambda: True
+        def _fake_renav_ok_e():
+            w_e._redirect_renavs += 1
+            return True
+        w_e._renav_to_agent_surface = _fake_renav_ok_e
+        w_e._agent_err_ts = _t.time() - rf.AGENT_ERR_WINDOW_S - 1
+        w_e._copilot_err_streak = 5
+        w_e._decide(err + "t1")
+        check("drift_recovers_not_stuck", w_e.status != "stuck")
+        check("drift_recovers_retries", w_e.status == "ready")
+        check("drift_recovers_no_notify", len(notify_calls_e) == 0)
+    finally:
+        rf.default_notify = orig_notify
+
+    # English failure trips the TRANSIENT (infra-side) path the same way (after the window),
+    # confirming the split is language-agnostic, not just JP.
+    rf._infra_healthy = lambda *a, **k: True
+    try:
+        w_en = RelayWorker("g", "wen")
+        w_en._on_redirect_page = lambda: False
+        en = "Sorry, an unexpected error occurred. If the problem persists, contact your administrator."
+        w_en._decide(en + "1"); w_en._agent_err_ts = _t.time() - rf.AGENT_ERR_WINDOW_S - 1
+        w_en._decide(en + "2"); w_en._decide(en + "3")
+        check("dead_detector_english", w_en.status == "stuck")
+        # this EN string carries BOTH a generic phrase ("unexpected error") AND the admin-block
+        # phrase ("contact your administrator") -- admin-block wins (any ADMIN_BLOCK_MARKERS hit
+        # is enough) and infra is healthy here, so it's the TRUE POSITIVE path.
+        check("dead_detector_english_is_true_positive", w_en.outcome == "STUCK")
+    finally:
+        rf._infra_healthy = orig_infra_fn
+
     # a real (non-error) reply resets the streak AND the window so a one-off blip doesn't accumulate
     w3 = RelayWorker("g", "w2")
     w3._decide(err + "x")
@@ -747,7 +845,10 @@ def test_renav_first_on_consent_and_dead_agent():
 
     # ---- AGENT_DEAD branch, no redirect signal (genuine outage) -> re-nav-first is a no-op and
     # the existing wall-clock window logic is UNCHANGED (still rides out the outage, still STUCKs
-    # only after the window -- the genuine-outage handling is not weakened).
+    # only after the window -- the genuine-outage handling is not weakened). `err` here is the
+    # GENERIC transient-error wording (no ADMIN_BLOCK phrase), so per the false-positive fix its
+    # past-window terminal state is INFRA_STUCK (network/connection), never the "agent
+    # disabled" STUCK -- that classification is reserved for admin-block wording + healthy infra.
     w4 = RelayWorker("do the thing", "wdead2")
     w4._on_redirect_page = lambda: False   # not on a redirect page: real agent, real outage
     w4._decide(err + "t1"); w4._decide(err + "t2"); w4._decide(err + "t3")
@@ -756,7 +857,7 @@ def test_renav_first_on_consent_and_dead_agent():
     w4._agent_err_ts = __import__("time").time() - rf.AGENT_ERR_WINDOW_S - 1
     w4._decide(err + "t4")
     check("dead_genuine_outage_still_stucks_past_window",
-          w4.status == "stuck" and w4.outcome == "STUCK")
+          w4.status == "stuck" and w4.outcome == "INFRA_STUCK")
 
 
 def main():
