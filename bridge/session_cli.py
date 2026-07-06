@@ -16,8 +16,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -29,9 +31,12 @@ Commands:
   /sessions          list known sessions
   /resume <n|sid>    switch active session
   /new [title]       start a new session
+  /goal <text>       work mode: autonomous multi-turn loop. Type while it
+                     runs to steer (injected at the next turn boundary);
+                     Ctrl+C asks it to stop after the current turn.
   /help              show this help
   /quit              exit
-Anything else is sent to Copilot as a message.
+Anything else is sent to Copilot as a single message.
 """
 
 
@@ -157,6 +162,19 @@ def apply_stream_event(current_text: str, ev: "SSEEvent"):
     return current_text, False
 
 
+def goal_summary(data: dict) -> str:
+    """Render the goal_done payload as the final summary line."""
+    outcome = data.get("outcome", "?")
+    turns = data.get("turns", 0)
+    if outcome == "done":
+        return f"goal done ({turns} turns)"
+    if outcome == "stopped":
+        return f"stopped after {turns} turns"
+    if outcome == "max_turns":
+        return f"max turns reached ({turns} turns)"
+    return f"goal ended: {outcome} after {turns} turns"
+
+
 # HTTP layer (thin; mocked/stubbed in tests)
 
 class BridgeClient:
@@ -191,13 +209,26 @@ class BridgeClient:
         body = self._get("/new", {"title": title} if title else None)
         return json.loads(body.decode("utf-8"))
 
-    def stream(self, msg: str):
-        """Yield raw decoded text lines from the /stream SSE response."""
-        url = self.base_url + "/stream?" + urllib.parse.urlencode({"msg": msg})
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=None) as resp:
+    def _sse_lines(self, path: str, params: dict):
+        """Yield raw decoded text lines from an SSE endpoint."""
+        url = self.base_url + path + "?" + urllib.parse.urlencode(params)
+        with urllib.request.urlopen(urllib.request.Request(url), timeout=None) as resp:
             for raw in resp:
                 yield raw.decode("utf-8", errors="replace")
+
+    def stream(self, msg: str):
+        return self._sse_lines("/stream", {"msg": msg})
+
+    def goal(self, text: str):
+        return self._sse_lines("/goal", {"text": text})
+
+    def send(self, sid: str, msg: str) -> dict:
+        body = self._get("/send", {"sid": sid, "msg": msg})
+        return json.loads(body.decode("utf-8"))
+
+    def stop(self) -> dict:
+        body = self._get("/stop")
+        return json.loads(body.decode("utf-8"))
 
 
 # Bridge autostart
@@ -285,6 +316,126 @@ def _print_stream(client: BridgeClient, msg: str) -> None:
     print()
 
 
+def run_goal(client, text: str, kbd_q, out=None, stop_grace: float = 60.0) -> None:
+    """Work mode: stream /goal, multiplexing SSE chunks with keyboard lines.
+
+    kbd_q is a queue of lines typed while streaming; each is sent immediately
+    via /send (steering, injected server-side at the next turn boundary).
+    First Ctrl+C -> /stop and keep consuming until goal_done (or grace runs
+    out); second Ctrl+C -> hard-return to the prompt.
+    """
+    out = out or sys.stdout
+    sid = ""
+    try:
+        sessions = client.list_sessions()
+        if sessions:
+            sid = sessions[0].get("sid", "")
+    except Exception:
+        pass
+    sse_q: queue.Queue = queue.Queue()
+
+    def _pump():
+        try:
+            for ln in client.goal(text):
+                sse_q.put(ln)
+        except Exception as e:
+            sse_q.put('data: {"delta": "[goal stream error: %s]"}\n' % str(e).replace('"', "'"))
+        sse_q.put(None)                     # end-of-stream sentinel
+
+    threading.Thread(target=_pump, daemon=True).start()
+    acc, printed = "", 0
+    stop_deadline = None
+    while True:
+        try:
+            while True:                     # drain keyboard lines first
+                try:
+                    k = kbd_q.get_nowait()
+                except queue.Empty:
+                    break
+                if k is None:               # stdin EOF: hand it back to the REPL
+                    kbd_q.put(None)
+                    break
+                k = k.strip()
+                if not k:
+                    continue
+                try:
+                    client.send(sid, k)
+                    out.write("[queued for next turn]\n")
+                except Exception as e:
+                    out.write(f"[send failed: {e}]\n")
+                out.flush()
+            try:
+                line = sse_q.get(timeout=0.2)
+            except queue.Empty:
+                if stop_deadline is not None and time.time() > stop_deadline:
+                    out.write("[gave up waiting for the goal to stop]\n")
+                    return
+                continue
+            if line is None:
+                return
+            for ev in parse_sse_lines([line]):
+                data = ev.data or {}
+                if ev.event == "done":
+                    return
+                if "turn_done" in data:
+                    out.write(f"\n--- turn {data['turn_done']} ---\n")
+                    acc, printed = "", 0
+                elif "steered" in data:
+                    out.write(f"[steered: {data['steered']}]\n")
+                elif "goal_done" in data:
+                    out.write(goal_summary(data) + "\n")
+                elif "replace" in data or "delta" in data:
+                    acc, _ = apply_stream_event(acc, ev)
+                    if len(acc) > printed:
+                        out.write(acc[printed:])
+                    elif len(acc) < printed:
+                        out.write("\n" + acc)
+                    printed = len(acc)
+                out.flush()
+        except KeyboardInterrupt:
+            if stop_deadline is not None:
+                out.write("\n[returning to prompt]\n")
+                return
+            try:
+                client.stop()
+            except Exception:
+                pass
+            out.write("\n[stop requested; finishing current turn]\n")
+            out.flush()
+            stop_deadline = time.time() + stop_grace
+
+
+class StdinReader:
+    """Single daemon thread reading stdin into a queue.
+
+    The REPL reads prompt lines from the same queue, so lines typed during
+    /goal streaming are steered instead of being swallowed by a blocked
+    input() call. The poll loop keeps Ctrl+C deliverable to the main thread.
+    """
+
+    def __init__(self):
+        self.q: queue.Queue = queue.Queue()
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        for line in sys.stdin:
+            self.q.put(line.rstrip("\r\n"))
+        self.q.put(None)                    # EOF sentinel
+
+    def readline(self, prompt: str = "") -> str:
+        if prompt:
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+        while True:
+            try:
+                item = self.q.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            if item is None:
+                raise EOFError
+            return item
+
+
 def _do_sessions(client: BridgeClient) -> list:
     try:
         sessions = client.list_sessions()
@@ -325,12 +476,13 @@ def _do_new(client: BridgeClient, title: str) -> None:
         print(f"[new session failed: {result.get('error', 'unknown error')}]")
 
 
-def repl(client: BridgeClient) -> None:
+def repl(client: BridgeClient, reader: StdinReader | None = None) -> None:
+    reader = reader or StdinReader()
     print(HELP_TEXT)
     empty_ctrl_c = False
     while True:
         try:
-            line = input("> ")
+            line = reader.readline("> ")
         except EOFError:
             print()
             return
@@ -359,6 +511,11 @@ def repl(client: BridgeClient) -> None:
                 _do_resume(client, arg, [])
             elif cmd == "new":
                 _do_new(client, arg)
+            elif cmd == "goal":
+                if not arg:
+                    print("usage: /goal <text>")
+                else:
+                    run_goal(client, arg, reader.q)
             else:
                 print(f"[unknown command /{cmd}. Type /help for a list.]")
             continue

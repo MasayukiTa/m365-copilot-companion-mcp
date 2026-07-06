@@ -2,10 +2,11 @@
 
 Covers: SSE/stream-format parsing against canned server bytes (copied from
 bridge/copilot_bridge.py's Handler._sse/_stream), picker rendering, the
-relative-time formatter, and --continue/--resume arg behavior with a stubbed
-HTTP client.
+relative-time formatter, --continue/--resume arg behavior, and the /goal
+work-mode multiplex loop -- all against a stubbed HTTP client.
 """
-import argparse
+import io
+import queue
 import time
 
 import pytest
@@ -221,11 +222,14 @@ def test_help_exits_zero(capsys):
 class FakeClient:
     """Stand-in for BridgeClient; records calls, returns canned data."""
 
-    def __init__(self, sessions=None, resume_ok=True):
+    def __init__(self, sessions=None, resume_ok=True, goal_lines=None):
         self._sessions = sessions if sessions is not None else []
         self.resume_calls = []
         self.new_calls = []
+        self.send_calls = []
+        self.stop_calls = 0
         self._resume_ok = resume_ok
+        self._goal_lines = goal_lines or []
 
     def is_up(self):
         return True
@@ -239,6 +243,18 @@ class FakeClient:
 
     def new_session(self, title=""):
         self.new_calls.append(title)
+        return {"ok": True}
+
+    def goal(self, text):
+        for line in self._goal_lines:
+            yield line
+
+    def send(self, sid, msg):
+        self.send_calls.append((sid, msg))
+        return {"ok": True}
+
+    def stop(self):
+        self.stop_calls += 1
         return {"ok": True}
 
 
@@ -299,3 +315,91 @@ def test_do_sessions_renders_picker(capsys):
     assert result == sessions
     out = capsys.readouterr().out
     assert "alpha" in out
+
+
+# --------------------------------------------------------------------------
+# /goal work mode -- canned SSE per the frozen contract:
+# {"turn_done": n, "text": ...}, {"steered": ...},
+# {"goal_done": true, "outcome": ..., "turns": n}, then event: done
+# --------------------------------------------------------------------------
+
+GOAL_LINES = [
+    'data: {"delta": "Investigating"}\n',
+    '\n',
+    'data: {"delta": " the failure."}\n',
+    '\n',
+    'data: {"turn_done": 1, "text": "Investigating the failure."}\n',
+    '\n',
+    'data: {"steered": "focus on the parser"}\n',
+    '\n',
+    'data: {"delta": "Fixed."}\n',
+    '\n',
+    'data: {"turn_done": 2, "text": "Fixed."}\n',
+    '\n',
+    'data: {"goal_done": true, "outcome": "done", "turns": 2}\n',
+    '\n',
+    'event: done\n',
+    'data: {}\n',
+    '\n',
+]
+
+
+def _run_goal(client, kbd_items=()):
+    kbd_q = queue.Queue()
+    for item in kbd_items:
+        kbd_q.put(item)
+    out = io.StringIO()
+    cli.run_goal(client, "fix it", kbd_q, out=out, stop_grace=1.0)
+    return out.getvalue()
+
+
+def test_run_goal_renders_turns_steering_and_summary():
+    client = FakeClient(sessions=[_mk_session("s1")], goal_lines=GOAL_LINES)
+    out = _run_goal(client)
+    assert "Investigating the failure." in out
+    assert "--- turn 1 ---" in out
+    assert "[steered: focus on the parser]" in out
+    assert "Fixed." in out
+    assert "--- turn 2 ---" in out
+    assert "goal done (2 turns)" in out
+
+
+def test_run_goal_keyboard_line_sends_steering():
+    client = FakeClient(sessions=[_mk_session("s7")], goal_lines=GOAL_LINES)
+    out = _run_goal(client, kbd_items=["also check the tests"])
+    assert client.send_calls == [("s7", "also check the tests")]
+    assert "[queued for next turn]" in out
+
+
+def test_run_goal_blank_keyboard_lines_not_sent():
+    client = FakeClient(sessions=[_mk_session("s7")], goal_lines=GOAL_LINES)
+    _run_goal(client, kbd_items=["", "   "])
+    assert client.send_calls == []
+
+
+def test_run_goal_no_sessions_still_streams():
+    client = FakeClient(sessions=[], goal_lines=GOAL_LINES)
+    out = _run_goal(client)
+    assert "goal done (2 turns)" in out
+
+
+def test_goal_summary_outcomes():
+    assert cli.goal_summary({"outcome": "done", "turns": 5}) == "goal done (5 turns)"
+    assert cli.goal_summary({"outcome": "stopped", "turns": 3}) == "stopped after 3 turns"
+    assert cli.goal_summary({"outcome": "max_turns", "turns": 8}) == "max turns reached (8 turns)"
+    assert "error" in cli.goal_summary({"outcome": "error", "turns": 1})
+
+
+def test_run_goal_stopped_outcome_summary():
+    lines = [
+        'data: {"delta": "partial"}\n', '\n',
+        'data: {"goal_done": true, "outcome": "stopped", "turns": 3}\n', '\n',
+        'event: done\n', 'data: {}\n', '\n',
+    ]
+    client = FakeClient(sessions=[_mk_session("s1")], goal_lines=lines)
+    out = _run_goal(client)
+    assert "stopped after 3 turns" in out
+
+
+def test_help_text_mentions_goal():
+    assert "/goal" in cli.HELP_TEXT
