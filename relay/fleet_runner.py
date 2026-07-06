@@ -614,6 +614,13 @@ def _print_table(workers, total):
 
 
 def main():
+    # cp932 console: goal/reason text can contain chars the legacy codepage cannot
+    # encode (a worker once died printing U+26A0); degrade to '?' instead of crashing.
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(errors="replace")
+        except Exception:
+            pass
     ap = argparse.ArgumentParser(
         description="Launch N autonomous Copilot relays in parallel with live status.")
     ap.add_argument("--cdp-url", default=os.environ.get("MCP_CDP_URL", "http://localhost:9222"))
