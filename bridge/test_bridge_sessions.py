@@ -234,6 +234,80 @@ def test_single_bind_server_disables_reuse():
     assert B._SingleBindHTTPServer.allow_reuse_address is False
 
 
+def test_page_executor_runs_job_on_owner_thread():
+    """PageExecutor.submit() must run the job on the ONE dedicated owner thread (not the
+    calling thread) and return its result to the caller -- this is the Playwright sync-API
+    thread-affinity fix: PAGE/DRIVER must always be touched from the same thread that
+    created them. Pure plumbing test (no real Playwright/PAGE involved)."""
+    import threading as _threading
+
+    ex = B.PageExecutor()
+    ex.start(ex.run_forever)
+    try:
+        owner_thread_id = ex.submit(_threading.get_ident)
+        assert owner_thread_id == ex._thread.ident
+        assert owner_thread_id != _threading.get_ident()
+    finally:
+        pass  # daemon thread; no explicit shutdown needed for a short-lived test
+
+
+def test_page_executor_propagates_exceptions_to_caller():
+    ex = B.PageExecutor()
+    ex.start(ex.run_forever)
+
+    def _boom():
+        raise ValueError("boom")
+
+    try:
+        raised = False
+        try:
+            ex.submit(_boom)
+        except ValueError as e:
+            raised = True
+            assert "boom" in str(e)
+        assert raised
+    finally:
+        pass
+
+
+def test_page_executor_serializes_concurrent_submits():
+    """Two threads calling submit() concurrently must never have their jobs run
+    simultaneously -- PageExecutor is a single-worker queue, so this is true by
+    construction; verify observably via a shared counter with no lock needed inside the job."""
+    import threading as _threading
+    import time as _time
+
+    ex = B.PageExecutor()
+    ex.start(ex.run_forever)
+    overlap_detected = []
+    in_job = {"count": 0}
+
+    def job(n):
+        in_job["count"] += 1
+        if in_job["count"] > 1:
+            overlap_detected.append(True)
+        _time.sleep(0.05)
+        in_job["count"] -= 1
+        return n
+
+    threads = [_threading.Thread(target=lambda i=i: ex.submit(job, i)) for i in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+    assert overlap_detected == []
+
+
+def test_single_bind_server_is_threading():
+    """The server must dispatch each request on its own thread (ThreadingMixIn) so a
+    long-running /goal turn cannot block /send (steering) or /stop -- see PAGE_LOCK's
+    docstring. daemon_threads=True so a stuck request thread never blocks process exit."""
+    import socketserver
+
+    assert issubclass(B._SingleBindHTTPServer, socketserver.ThreadingMixIn)
+    assert B._SingleBindHTTPServer.daemon_threads is True
+
+
 def test_port_already_served_detects_listener():
     """Loopback-only socket check (hermetic: no external network). A live local listener
     must be detected; after it closes the same port must read as free."""
@@ -248,6 +322,167 @@ def test_port_already_served_detects_listener():
     finally:
         srv.close()
     assert B._port_already_served(port) is False
+
+
+# ── WORK MODE: detect_done ───────────────────────────────────────────────────────────────────
+
+def test_detect_done_marker_on_own_line():
+    text = "手順1を実行しました。\n手順2を実行しました。\n===DONE==="
+    done, stripped = B.detect_done(text)
+    assert done is True
+    assert stripped == "手順1を実行しました。\n手順2を実行しました。"
+
+
+def test_detect_done_marker_with_trailing_whitespace_tolerated():
+    text = "作業完了。\n  ===DONE===  \n"
+    done, stripped = B.detect_done(text)
+    assert done is True
+    assert stripped == "作業完了。"
+
+
+def test_detect_done_not_done_without_marker():
+    text = "まだ続きがあります。次のステップに進みます。"
+    done, stripped = B.detect_done(text)
+    assert done is False
+    assert stripped == text
+
+
+def test_detect_done_marker_mentioned_in_prose_is_not_done():
+    """The marker must appear as its OWN line -- a turn that merely *mentions* the sentinel
+    in passing (e.g. explaining the protocol back) must not be mistaken for completion."""
+    text = "完了したら ===DONE=== と書く約束です。まだ完了していません。"
+    done, stripped = B.detect_done(text)
+    assert done is False
+    assert stripped == text
+
+
+def test_detect_done_empty_text():
+    done, stripped = B.detect_done("")
+    assert done is False
+    assert stripped == ""
+
+
+def test_detect_done_none_text():
+    done, stripped = B.detect_done(None)
+    assert done is False
+    assert stripped == ""
+
+
+def test_detect_done_marker_alone():
+    done, stripped = B.detect_done("===DONE===")
+    assert done is True
+    assert stripped == ""
+
+
+# ── WORK MODE: wrap_goal_text ────────────────────────────────────────────────────────────────
+
+def test_wrap_goal_text_contains_goal_and_marker_contract():
+    wrapped = B.wrap_goal_text("日本の県名を1つずつ挙げよ")
+    assert "日本の県名を1つずつ挙げよ" in wrapped
+    assert B.WORK_MODE_DONE_MARKER in wrapped
+
+
+def test_wrap_goal_text_empty_goal():
+    wrapped = B.wrap_goal_text("")
+    assert B.WORK_MODE_DONE_MARKER in wrapped
+
+
+# ── WORK MODE: select_next_message ───────────────────────────────────────────────────────────
+
+def test_select_next_message_no_queue_returns_continue_nudge():
+    msg, steered = B.select_next_message([])
+    assert msg == B.WORK_MODE_CONTINUE_NUDGE
+    assert steered == []
+
+
+def test_select_next_message_single_queued_input():
+    msg, steered = B.select_next_message(["やっぱり残りは英語で"])
+    assert msg == "やっぱり残りは英語で"
+    assert steered == ["やっぱり残りは英語で"]
+
+
+def test_select_next_message_multiple_queued_inputs_joined():
+    msg, steered = B.select_next_message(["最初の指示", "続けての指示"])
+    assert msg == "最初の指示\n続けての指示"
+    assert steered == ["最初の指示", "続けての指示"]
+
+
+def test_select_next_message_custom_nudge():
+    msg, steered = B.select_next_message([], continue_nudge="custom nudge")
+    assert msg == "custom nudge"
+    assert steered == []
+
+
+# ── WORK MODE: decide_outcome ─────────────────────────────────────────────────────────────────
+
+def test_decide_outcome_done_wins_over_everything():
+    assert B.decide_outcome(True, True, 100, 5, 5) == "done"
+
+
+def test_decide_outcome_consecutive_errors():
+    assert B.decide_outcome(False, False, 2, 30, 2) == "error"
+
+
+def test_decide_outcome_errors_beat_stop_and_maxturns():
+    # done takes priority over error; but error must be checked before stop/max_turns
+    assert B.decide_outcome(False, True, 30, 30, 2) == "error"
+
+
+def test_decide_outcome_stop_requested():
+    assert B.decide_outcome(False, True, 3, 30, 0) == "stopped"
+
+
+def test_decide_outcome_max_turns_reached():
+    assert B.decide_outcome(False, False, 30, 30, 0) == "max_turns"
+
+
+def test_decide_outcome_max_turns_zero_means_unlimited():
+    assert B.decide_outcome(False, False, 999, 0, 0) is None
+
+
+def test_decide_outcome_keep_looping():
+    assert B.decide_outcome(False, False, 3, 30, 0) is None
+
+
+def test_decide_outcome_custom_error_threshold():
+    assert B.decide_outcome(False, False, 1, 30, 3, max_consecutive_errors=4) is None
+    assert B.decide_outcome(False, False, 1, 30, 4, max_consecutive_errors=4) == "error"
+
+
+# ── WORK MODE: resume_eligibility ────────────────────────────────────────────────────────────
+
+def test_resume_eligibility_no_session():
+    ok, reason = B.resume_eligibility(None)
+    assert ok is False
+    assert "no session" in reason
+
+
+def test_resume_eligibility_wrong_mode():
+    ok, reason = B.resume_eligibility({"mode": "idle", "goal": "something"})
+    assert ok is False
+    assert "interrupted" in reason
+
+
+def test_resume_eligibility_missing_goal():
+    ok, reason = B.resume_eligibility({"mode": "interrupted", "goal": ""})
+    assert ok is False
+    assert "no stored goal" in reason
+
+
+def test_resume_eligibility_happy_path():
+    ok, goal_text = B.resume_eligibility({"mode": "interrupted", "goal": "県名を挙げる"})
+    assert ok is True
+    assert goal_text == "県名を挙げる"
+
+
+# ── WORK MODE: default constants sanity ──────────────────────────────────────────────────────
+
+def test_default_max_turns_constant():
+    assert B.DEFAULT_MAX_TURNS == 30
+
+
+def test_work_mode_done_marker_constant():
+    assert B.WORK_MODE_DONE_MARKER == "===DONE==="
 
 
 # ── module-level sanity (import-safety / constants) ─────────────────────────────────────────

@@ -26,13 +26,16 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import re
 import socket
 import sys
+import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from socketserver import ThreadingMixIn
 
 logger = logging.getLogger(__name__)
 
@@ -251,9 +254,105 @@ PROMPT_TEMPLATES = {
 
 PAGE = None      # set at startup
 DRIVER = None
-BUSY = False     # single conversation -> serialize requests
 AGENT_URL = ""   # bare agent URL (a fresh chat); set at startup
 _CONSENT_SURFACED = False  # last-resort surface() for consent fired at most once per session
+
+# ── concurrency (work mode) ──────────────────────────────────────────────────────────────────
+# The server used to be a plain (single-threaded) HTTPServer -- fine while every request was
+# short, but a /goal run can occupy the page for many turns over minutes, and during that time
+# /send (steering) and /stop MUST still get through immediately. So the server is now a
+# ThreadingHTTPServer variant (see _SingleBindHTTPServer below).
+#
+# THREAD AFFINITY (the reason a plain "just add threads" change is NOT enough): Playwright's
+# SYNC API is bound to the OS thread that created it (sync_playwright()'s greenlet-based
+# dispatch loop lives on that one thread) -- calling PAGE/DRIVER methods from a DIFFERENT
+# thread raises "Cannot switch to a different thread" (confirmed live while building this: a
+# /new request handled on a second request-thread hit exactly that error against a PAGE
+# created in main()'s thread). So it is not enough to lock around PAGE calls; those calls must
+# physically RUN on the one thread that owns PAGE. PageExecutor is that thread: main() creates
+# PAGE/DRIVER INSIDE PageExecutor.run() (so page creation and every later page call share the
+# same thread), and every request thread that needs the page calls run_on_page_thread(fn),
+# which enqueues fn and blocks the CALLING thread until PageExecutor has run it on the owner
+# thread and posted back the result/exception. Store-only endpoints (/send, /stop, /sessions,
+# /) never call run_on_page_thread, so they stay responsive even while a long /goal turn is
+# mid-flight on the page thread.
+#
+# PAGE_LOCK is a SEPARATE, higher-level concern: logical exclusivity between REQUESTS (so two
+# /goal calls, or a /goal and a /history, never interleave their multi-step operations against
+# each other's CAPTURE_BASELINE/ACTIVE_SID state), not raw thread-safety (PageExecutor already
+# guarantees that by construction -- only one fn runs on the page thread at a time). /goal,
+# /stream, /new, /resume, /switch, /history try-acquire it (non-blocking) and return
+# {"ok":false,"error":"busy"} immediately if another PAGE-touching request already holds it.
+PAGE_LOCK = threading.Lock()
+# Guards S.queue_input/S.pop_input call sites in THIS process (session_store.py itself is
+# untouched/unlocked -- its atomic os.replace() writes are safe across processes, but within one
+# process a bridge worker thread draining the queue and a /send thread enqueuing into it could
+# otherwise interleave read-modify-write in a way that drops an entry).
+INPUT_LOCK = threading.Lock()
+# Cooperative stop flag for the running /goal loop: /stop sets it; the loop checks it at each
+# turn boundary and, once seen, finishes the CURRENT turn and reports outcome="stopped". Reset
+# to False at the start of every new /goal run.
+STOP_REQUESTED = False
+
+
+class PageExecutor:
+    """Runs every Playwright-touching callable on ONE dedicated OS thread (the thread that
+    also CREATES PAGE/DRIVER -- see run()), so request-handler threads (which may be any of
+    the ThreadingMixIn pool) never call into Playwright's sync API directly. submit(fn) may be
+    called from any thread; it blocks the CALLER until fn has run on the owner thread and
+    returns fn's result (or re-raises fn's exception in the caller's thread/traceback context).
+
+    No PAGE/browser access in THIS class itself (only generic queue/thread plumbing), so its
+    queueing behavior is exercised by a hermetic unit test using a plain callable instead of a
+    real page."""
+
+    def __init__(self):
+        self._q: "queue.Queue" = queue.Queue()
+        self._thread = None
+
+    def start(self, target):
+        """Start the owner thread running `target()` (main()'s page-setup-then-serve
+        function). `target` is responsible for calling drain_once()/run_forever() itself once
+        PAGE/DRIVER are ready, so page CREATION and every later page CALL share one thread."""
+        self._thread = threading.Thread(target=target, daemon=True, name="page-executor")
+        self._thread.start()
+
+    def submit(self, fn, *args, **kwargs):
+        """Enqueue fn(*args, **kwargs) for the owner thread and block until it completes.
+        Re-raises fn's exception in the calling thread if it raised. Must not be called FROM
+        the owner thread itself (that would deadlock waiting on its own queue item)."""
+        done = threading.Event()
+        box = {}
+
+        def _job():
+            try:
+                box["result"] = fn(*args, **kwargs)
+            except BaseException as e:  # noqa: BLE001 -- must propagate ANY exception to the caller
+                box["error"] = e
+            finally:
+                done.set()
+
+        self._q.put(_job)
+        done.wait()
+        if "error" in box:
+            raise box["error"]
+        return box["result"]
+
+    def run_forever(self):
+        """Owner-thread loop: pull and run jobs until the process exits. Call this from
+        INSIDE `target` (see start()) after PAGE/DRIVER are constructed on this same thread."""
+        while True:
+            job = self._q.get()
+            job()
+
+
+PAGE_EXECUTOR = PageExecutor()
+
+
+def run_on_page_thread(fn, *args, **kwargs):
+    """Thin wrapper so call sites read as an ordinary function call. See PageExecutor's
+    docstring for why this indirection exists (Playwright sync-API thread affinity)."""
+    return PAGE_EXECUTOR.submit(fn, *args, **kwargs)
 
 # ── session lifecycle (durable, resumable) ──────────────────────────────────────────────────
 # ONE active session at a time, matching the bridge's single-PAGE design (no multi-session
@@ -267,21 +366,141 @@ ACTIVE_SID = None
 CAPTURE_BASELINE = None
 
 
+# ── WORK MODE (autonomous multi-turn /goal loop) ─────────────────────────────────────────────
+# Pure logic only in this section -- no PAGE/browser access -- so it is fully hermetically
+# unit-testable. Wording mirrors relay/relay_fleet.py's proven CONTINUE_JOB/_task_anchor style
+# (concise instruction + explicit terminal-marker contract + OUTPUT_DISCIPLINE-flavored brevity
+# clause) rather than inventing a divergent convention; the one deliberate deviation from the
+# fleet's tail-line "DONE"/"CONTINUE"/"STUCK: reason" word convention is the literal
+# "===DONE===" sentinel line, which is what the FROZEN HTTP contract (session_cli.py's /goal
+# consumer) and this mission spec require.
+WORK_MODE_DONE_MARKER = "===DONE==="
+
+# Turn-1 wrapper: states the goal, the autonomous/stepwise expectation (mirrors PROTOCOL's
+# "ツールを使い自律的に進める" framing), and the exact terminal-marker contract.
+WORK_MODE_GOAL_PREFIX = (
+    "次のゴールを、必要なツールを使いながら自律的に一歩ずつ進めてください。"
+    "ゴール全体が完了するまで、こちらから促さなくても続けてください。"
+    "ゴールが完全に完了したら、最後の行に厳密に次の一行だけを出力してください（他の文字を続けない）: "
+    + WORK_MODE_DONE_MARKER + "\n\n--- ゴール ---\n"
+)
+
+# Continue nudge (no queued steering input): mirrors CONTINUE_JOB's "次のステップを実行して
+# ください" wording, restating the terminal-marker contract every turn (same rationale as
+# _task_anchor -- a long-running loop must not forget the contract).
+WORK_MODE_CONTINUE_NUDGE = (
+    "続けてください。ゴール全体が完了したら最後の行に厳密に "
+    + WORK_MODE_DONE_MARKER + " のみを出力してください。"
+)
+
+# Resume-from-interruption nudge (used as turn 1's message for /goal?resume=1 instead of the
+# original goal text -- the goal itself is already known to the conversation from before the
+# crash/restart; this just re-anchors the agent on continuing it).
+WORK_MODE_RESUME_NUDGE = (
+    "直前の作業が中断されました。中断前のゴールに関する作業を続けてください。"
+    "ゴール全体が完了したら最後の行に厳密に " + WORK_MODE_DONE_MARKER + " のみを出力してください。"
+)
+
+DEFAULT_MAX_TURNS = 30
+MAX_CONSECUTIVE_TURN_ERRORS = 2
+
+
+def wrap_goal_text(goal_text: str) -> str:
+    """Build turn 1's message for a fresh /goal run: the goal text wrapped with the work-mode
+    instruction + terminal-marker contract. Pure string logic."""
+    return WORK_MODE_GOAL_PREFIX + (goal_text or "")
+
+
+def detect_done(text: str):
+    """Pure DONE-marker detector/stripper. Returns (is_done, stripped_text).
+
+    A turn is DONE iff WORK_MODE_DONE_MARKER appears as its OWN line (surrounding whitespace
+    tolerated) -- not merely as a substring somewhere in prose, so a turn that merely
+    *mentions* the marker in passing is not mistaken for completion. When done, the marker
+    line (and anything after it -- the spec says nothing should follow it, but a wayward
+    trailing newline/space from the model is tolerated) is stripped from the returned text so
+    neither the emitted SSE nor the persisted transcript carries the sentinel."""
+    t = text or ""
+    lines = t.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == WORK_MODE_DONE_MARKER:
+            stripped = "\n".join(lines[:i]).rstrip()
+            return True, stripped
+    return False, t
+
+
+def select_next_message(queued, continue_nudge=WORK_MODE_CONTINUE_NUDGE):
+    """Pure next-message selector for the loop's turn N+1 (N not done).
+
+    `queued` is the list of inputs popped from S.pop_input this turn boundary (oldest-first,
+    already drained by the caller -- this function does no popping itself). Returns
+    (next_message, steered_texts):
+      - queued non-empty -> the inputs joined with newlines is the next message; steered_texts
+        is the same list (caller emits one {"steered": ...} SSE event per entry).
+      - queued empty -> the continue nudge is the next message; steered_texts is [].
+    """
+    if queued:
+        return "\n".join(queued), list(queued)
+    return continue_nudge, []
+
+
+def decide_outcome(done, stop_requested, turn, max_turns, consecutive_errors,
+                    max_consecutive_errors=MAX_CONSECUTIVE_TURN_ERRORS):
+    """Pure outcome decision for the loop's end-of-turn check. Priority order (matches the
+    mission spec's stop-conditions list): DONE > too many consecutive errors > stop flag >
+    max_turns reached > None (keep looping). Returns one of
+    "done" | "error" | "stopped" | "max_turns" | None."""
+    if done:
+        return "done"
+    if consecutive_errors >= max_consecutive_errors:
+        return "error"
+    if stop_requested:
+        return "stopped"
+    if max_turns and turn >= max_turns:
+        return "max_turns"
+    return None
+
+
+def resume_eligibility(sess):
+    """Pure eligibility check for GET /goal?resume=1: the session must exist, carry
+    mode=="interrupted" (set by startup auto-resume when a crash was detected -- see main()),
+    and have a stored goal text to resume. Returns (ok, reason_or_goal_text) where the second
+    element is the error reason on failure or the goal text to resume on success."""
+    if not sess:
+        return False, "no session"
+    if sess.get("mode") != "interrupted":
+        return False, "session is not in an interrupted goal (mode=%s)" % sess.get("mode")
+    goal_text = sess.get("goal") or ""
+    if not goal_text:
+        return False, "no stored goal to resume"
+    return True, goal_text
+
+
 def _next_pending(sid):
     """Thin wrapper around S.pop_input so callers/tests can substitute a fake pop function
-    without importing session_store's file I/O. Returns None if sid is falsy."""
+    without importing session_store's file I/O. Returns None if sid is falsy. Locked with
+    INPUT_LOCK so a drain (this) and an enqueue (_queue_input_locked, from /send) in this
+    process can never interleave a read-modify-write on the same session's pending list."""
     if not sid:
         return None
-    return S.pop_input(sid)
+    with INPUT_LOCK:
+        return S.pop_input(sid)
+
+
+def _queue_input_locked(sid, text):
+    """Thin, lock-guarded wrapper around S.queue_input -- the /send endpoint's enqueue side of
+    the same INPUT_LOCK that guards _next_pending's pop side."""
+    with INPUT_LOCK:
+        S.queue_input(sid, text)
 
 
 def drain_pending_once(sid, pop_fn=None, max_n=50):
-    """Pop up to `max_n` queued inputs for `sid` via `pop_fn` (defaults to S.pop_input) and
-    return them as a list, oldest-first. Pure w.r.t. control flow -- `pop_fn` is injected so
-    this is unit-testable with a fake FIFO (no real session_store file I/O needed in tests).
-    Stops early once pop_fn returns None (queue empty) or max_n is reached (safety bound
-    against a runaway queue)."""
-    pop_fn = pop_fn or (lambda s: S.pop_input(s))
+    """Pop up to `max_n` queued inputs for `sid` via `pop_fn` (defaults to _next_pending, which
+    is INPUT_LOCK-guarded) and return them as a list, oldest-first. Pure w.r.t. control flow --
+    `pop_fn` is injected so this is unit-testable with a fake FIFO (no real session_store file
+    I/O needed in tests). Stops early once pop_fn returns None (queue empty) or max_n is
+    reached (safety bound against a runaway queue)."""
+    pop_fn = pop_fn or _next_pending
     out = []
     if not sid:
         return out
@@ -1880,7 +2099,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        global BUSY, ACTIVE_SID
+        global ACTIVE_SID
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/":
             body = PAGE_HTML.encode("utf-8")
@@ -1891,45 +2110,64 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if parsed.path == "/stream":
-            qs = urllib.parse.parse_qs(parsed.query)
-            msg = (qs.get("msg") or [""])[0]
-            self._stream(msg)
+            if not PAGE_LOCK.acquire(blocking=False):
+                self._json({"ok": False, "error": "busy"}); return
+            try:
+                qs = urllib.parse.parse_qs(parsed.query)
+                msg = (qs.get("msg") or [""])[0]
+                # PAGE-touching: _stream ends up calling _send_and_stream_once, which polls
+                # PAGE/DRIVER AND writes SSE chunks to self.wfile in the same loop -- so the
+                # whole call runs on the page-owner thread (see PageExecutor's docstring for
+                # why: Playwright's sync API is thread-bound). self.wfile.write is a plain
+                # socket call, safe to run from that thread too.
+                run_on_page_thread(self._stream, msg)
+            finally:
+                PAGE_LOCK.release()
+            return
+        if parsed.path == "/goal":         # WORK MODE: autonomous multi-turn loop (SSE)
+            if not PAGE_LOCK.acquire(blocking=False):
+                self._json({"ok": False, "error": "busy"}); return
+            try:
+                qs = urllib.parse.parse_qs(parsed.query)
+                resume_flag = (qs.get("resume") or [""])[0] in ("1", "true", "True")
+                text = (qs.get("text") or [""])[0]
+                max_turns_raw = (qs.get("max_turns") or [""])[0]
+                try:
+                    max_turns = int(max_turns_raw) if max_turns_raw else DEFAULT_MAX_TURNS
+                except ValueError:
+                    max_turns = DEFAULT_MAX_TURNS
+                run_on_page_thread(self._goal, text, max_turns, resume_flag)
+            finally:
+                PAGE_LOCK.release()
+            return
+        if parsed.path == "/stop":         # cooperative stop for the running /goal loop
+            global STOP_REQUESTED
+            STOP_REQUESTED = True
+            self._json({"ok": True})
             return
         if parsed.path == "/new":          # start a fresh Copilot conversation
-            if BUSY:
+            if not PAGE_LOCK.acquire(blocking=False):
                 self._json({"ok": False, "error": "busy"}); return
-            title = (urllib.parse.parse_qs(parsed.query).get("title") or [""])[0]
-            ok = False
             try:
-                if AGENT_URL:
-                    PAGE.goto(AGENT_URL, wait_until="domcontentloaded")
-                    ok = _wait_composer()
-            except Exception as e:
-                self._json({"ok": False, "error": str(e)}); return
-            # Change-based capture baseline: the pane is now on the bare agent page, but
-            # aria-current can STILL mark the previously-open conversation's row (observed
-            # live) -- that stale marker plus all currently-known guids IS the baseline the
-            # post-send capture diffs against. Refreshed again right before the send.
-            _record_capture_baseline()
-            sess = S.new_session(title=title)
-            ACTIVE_SID = sess["sid"]
-            self._json({"ok": ok, "url": PAGE.url, "sid": ACTIVE_SID})
+                run_on_page_thread(self._do_new, parsed)
+            finally:
+                PAGE_LOCK.release()
             return
         if parsed.path == "/conv":         # current conversation URL (for saving)
-            self._json({"url": PAGE.url})
+            if not PAGE_LOCK.acquire(blocking=False):
+                self._json({"ok": False, "error": "busy"}); return
+            try:
+                run_on_page_thread(lambda: self._json({"url": PAGE.url}))
+            finally:
+                PAGE_LOCK.release()
             return
         if parsed.path == "/switch":       # continue a saved conversation
-            if BUSY:
+            if not PAGE_LOCK.acquire(blocking=False):
                 self._json({"ok": False, "error": "busy"}); return
-            url = (urllib.parse.parse_qs(parsed.query).get("url") or [""])[0]
-            ok = False
             try:
-                _reap_orphan_tabs()
-                if url:
-                    ok = _goto_settled(url)     # recover from SSO-redirect landings
-            except Exception as e:
-                self._json({"ok": False, "error": str(e)}); return
-            self._json({"ok": ok, "url": PAGE.url})
+                run_on_page_thread(self._do_switch, parsed)
+            finally:
+                PAGE_LOCK.release()
             return
         if parsed.path == "/sessions":     # list known sessions (newest-first, capped)
             try:
@@ -1939,35 +2177,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"sessions": sessions})
             return
         if parsed.path == "/resume":       # reattach to a known session by sid
-            if BUSY:
+            if not PAGE_LOCK.acquire(blocking=False):
                 self._json({"ok": False, "error": "busy"}); return
-            sid = (urllib.parse.parse_qs(parsed.query).get("sid") or [""])[0]
-            if not sid:
-                self._json({"ok": False, "error": "missing sid"}); return
-            sess = S.load(sid)
-            if sess is None:
-                self._json({"ok": False, "error": "unknown sid"}); return
-            ref = sess.get("conv_url") or ""
-            kind = classify_conv_ref(ref)
             try:
-                _reap_orphan_tabs()
-                if kind == "sessref":
-                    ok, reason = _resume_to_ref(ref)
-                elif kind == "conv_url":
-                    ok = _goto_settled(ref)
-                    reason = "ok" if ok else "navigation did not settle on the conversation"
-                else:
-                    ok, reason = False, "session has no reattachable conv_url"
-            except Exception as e:
-                self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}); return
-            if ok:
-                ACTIVE_SID = sid
-                S.touch(sid, status="active")
-                self._json({"ok": True, "sid": sid})
-            else:
-                self._json({"ok": False, "error": reason})
+                run_on_page_thread(self._do_resume, parsed)
+            finally:
+                PAGE_LOCK.release()
             return
-        if parsed.path == "/send":         # fire-and-forget: queue if busy, else send now
+        if parsed.path == "/send":         # STORE-ONLY: always queues, never touches PAGE
             sid = (urllib.parse.parse_qs(parsed.query).get("sid") or [""])[0]
             msg = (urllib.parse.parse_qs(parsed.query).get("msg") or [""])[0]
             if not msg.strip():
@@ -1976,121 +2193,197 @@ class Handler(BaseHTTPRequestHandler):
             if not sid:
                 sid = S.new_session()["sid"]
                 ACTIVE_SID = sid
-            if BUSY:
-                try:
-                    S.queue_input(sid, msg)
-                except Exception as e:
-                    self._json({"ok": False, "error": str(e)}); return
-                self._json({"ok": True, "queued": True, "sid": sid})
-                return
-            # not busy: send it now (no SSE consumer -- fire-and-forget), same persistence
-            # path as a normal turn, then drain anything that queued up while we were busy.
-            BUSY = True
-            _prepare_capture_baseline(sid)
+            # /send is a STORE-ONLY endpoint (per the concurrency contract: /send, /stop,
+            # /sessions, / never touch PAGE and run lock-free) -- it must stay responsive
+            # while a long /goal run (or any other PAGE-touching request) holds PAGE_LOCK.
+            # It ALWAYS queues via session_store and returns immediately; a running /goal
+            # loop drains the queue at its next turn boundary (steering), and a plain
+            # /stream turn drains it via _drain_pending_queue right after that turn
+            # completes -- both existing drain paths are unchanged. No run_on_page_thread
+            # here: this endpoint never touches PAGE/DRIVER.
             try:
-                final = self._send_and_stream_once(msg, stream_out=False)
-                if final is not None and _looks_like_consent(final):
-                    if _bridge_auto_consent():
-                        try:
-                            final = self._send_and_stream_once(msg, stream_out=False)
-                        except Exception:
-                            final = None
-                if final:
-                    _persist_exchange(sid, msg, final)
+                _queue_input_locked(sid, msg)
             except Exception as e:
-                self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}); return
-            finally:
-                BUSY = False
-            self._drain_pending_queue(sid)
-            self._json({"ok": True, "queued": False, "sid": sid})
+                self._json({"ok": False, "error": str(e)}); return
+            self._json({"ok": True, "queued": True, "sid": sid})
             return
         if parsed.path == "/history":      # scrape ALL turns of a conversation in order
-            if BUSY:
+            if not PAGE_LOCK.acquire(blocking=False):
                 self._json({"ok": False, "error": "busy"}); return
-            url = (urllib.parse.parse_qs(parsed.query).get("url") or [""])[0]
             try:
-                _reap_orphan_tabs()
-                if url:
-                    # bounded for an interactive READ: ~10s composer wait, 2 tries -> an unreachable
-                    # conversation returns empty in ~25s instead of hanging the bridge for minutes.
-                    _goto_settled(url, timeout=12000, tries=2, compose_wait=10)
-                messages = _scrape_history()
-                # A cold URL navigation sometimes lands on an un-hydrated conversation view
-                # (the SPA shows the composer but never renders the prior turns), so the
-                # first scrape comes back empty. Reload once and re-scrape before giving up.
-                if url and not messages:
-                    try:
-                        PAGE.reload(wait_until="domcontentloaded")
-                        _wait_composer()
-                        PAGE.wait_for_timeout(1500)
-                        messages = _scrape_history()
-                    except Exception:
-                        pass
-            except Exception as e:
-                self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}); return
-            # Surface the truncation sentinel as a top-level field so callers can act on it
-            # without having to scan the message list. The sentinel record itself is stripped
-            # from the messages array (it is a meta record, not a real message).
-            truncated_meta = None
-            clean_messages = []
-            for m in (messages or []):
-                if m.get("role") == "__meta__":
-                    truncated_meta = m
-                else:
-                    clean_messages.append(m)
-            resp = {"ok": True, "url": PAGE.url, "messages": clean_messages}
-            if truncated_meta:
-                resp["truncated"] = True
-                resp["captured"] = truncated_meta.get("captured", len(clean_messages))
-            self._json(resp)
+                run_on_page_thread(self._do_history, parsed)
+            finally:
+                PAGE_LOCK.release()
             return
         if parsed.path == "/delete":       # best-effort: delete the Copilot conversation
-            if BUSY:
+            if not PAGE_LOCK.acquire(blocking=False):
                 self._json({"ok": False, "error": "busy"}); return
-            q = urllib.parse.parse_qs(parsed.query)
-            url = (q.get("url") or [""])[0]
-            title = (q.get("title") or [""])[0]
             try:
-                ok, reason = _try_delete_conversation(url, title)
-            except Exception as e:
-                ok, reason = False, str(e)
-            # expose the reason under BOTH keys so the UI can surface it (it was dropped before)
-            self._json({"ok": ok, "error": reason, "reason": reason, "guid": _conv_guid(url)})
+                run_on_page_thread(self._do_delete, parsed)
+            finally:
+                PAGE_LOCK.release()
             return
         if parsed.path == "/agent_conversations":
             # READ-ONLY: scrape the agent's own conversation rail (guid + title). Lists
             # orphans not in the local registry. Deletes nothing. Scope = current agent.
-            if BUSY:
+            if not PAGE_LOCK.acquire(blocking=False):
                 self._json({"ok": False, "error": "busy"}); return
             try:
-                if AGENT_URL:
-                    PAGE.goto(AGENT_URL, wait_until="domcontentloaded", timeout=25000)
-                    _wait_composer()
-                rows = _scrape_agent_rail()
-                base = AGENT_URL or ((PAGE.url or "").split("/conversation/")[0])
-                convs = [{"guid": r["guid"], "title": r.get("title", ""),
-                          "url": (base.rstrip("/") + "/conversation/" + r["guid"]) if base else ""}
-                         for r in rows]
-            except Exception as e:
-                self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}); return
-            self._json({"ok": True, "count": len(convs), "conversations": convs})
+                run_on_page_thread(self._do_agent_conversations)
+            finally:
+                PAGE_LOCK.release()
             return
         if parsed.path == "/upload":       # attach a local file/image to the composer
-            path = (urllib.parse.parse_qs(parsed.query).get("path") or [""])[0]
+            if not PAGE_LOCK.acquire(blocking=False):
+                self._json({"ok": False, "error": "busy"}); return
             try:
-                if not path or not os.path.isfile(path):
-                    self._json({"ok": False, "error": "file not found"}); return
-                inp = PAGE.locator('input[type="file"][accept*="csv"]').first
-                if inp.count() == 0:
-                    inp = PAGE.locator('input[type="file"]').first
-                inp.set_input_files(path)
-                PAGE.wait_for_timeout(2200)     # let the attachment chip register
-                self._json({"ok": True, "name": os.path.basename(path)})
-            except Exception as e:
-                self._json({"ok": False, "error": str(e)})
+                run_on_page_thread(self._do_upload, parsed)
+            finally:
+                PAGE_LOCK.release()
             return
         self.send_response(404)
         self.end_headers()
+
+    # ── PAGE-touching branch bodies, each run on the page-owner thread via
+    # run_on_page_thread (see PageExecutor's docstring). Split out of do_GET one-per-endpoint
+    # purely to keep do_GET's dispatch table readable; behavior is unchanged from the inline
+    # bodies this replaced.
+
+    def _do_new(self, parsed):
+        global ACTIVE_SID
+        title = (urllib.parse.parse_qs(parsed.query).get("title") or [""])[0]
+        ok = False
+        try:
+            if AGENT_URL:
+                PAGE.goto(AGENT_URL, wait_until="domcontentloaded")
+                ok = _wait_composer()
+        except Exception as e:
+            self._json({"ok": False, "error": str(e)}); return
+        # Change-based capture baseline: the pane is now on the bare agent page, but
+        # aria-current can STILL mark the previously-open conversation's row (observed
+        # live) -- that stale marker plus all currently-known guids IS the baseline the
+        # post-send capture diffs against. Refreshed again right before the send.
+        _record_capture_baseline()
+        sess = S.new_session(title=title)
+        ACTIVE_SID = sess["sid"]
+        self._json({"ok": ok, "url": PAGE.url, "sid": ACTIVE_SID})
+
+    def _do_switch(self, parsed):
+        url = (urllib.parse.parse_qs(parsed.query).get("url") or [""])[0]
+        ok = False
+        try:
+            _reap_orphan_tabs()
+            if url:
+                ok = _goto_settled(url)     # recover from SSO-redirect landings
+        except Exception as e:
+            self._json({"ok": False, "error": str(e)}); return
+        self._json({"ok": ok, "url": PAGE.url})
+
+    def _do_resume(self, parsed):
+        global ACTIVE_SID
+        sid = (urllib.parse.parse_qs(parsed.query).get("sid") or [""])[0]
+        if not sid:
+            self._json({"ok": False, "error": "missing sid"}); return
+        sess = S.load(sid)
+        if sess is None:
+            self._json({"ok": False, "error": "unknown sid"}); return
+        ref = sess.get("conv_url") or ""
+        kind = classify_conv_ref(ref)
+        try:
+            _reap_orphan_tabs()
+            if kind == "sessref":
+                ok, reason = _resume_to_ref(ref)
+            elif kind == "conv_url":
+                ok = _goto_settled(ref)
+                reason = "ok" if ok else "navigation did not settle on the conversation"
+            else:
+                ok, reason = False, "session has no reattachable conv_url"
+        except Exception as e:
+            self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}); return
+        if ok:
+            ACTIVE_SID = sid
+            S.touch(sid, status="active")
+            self._json({"ok": True, "sid": sid})
+        else:
+            self._json({"ok": False, "error": reason})
+
+    def _do_history(self, parsed):
+        url = (urllib.parse.parse_qs(parsed.query).get("url") or [""])[0]
+        try:
+            _reap_orphan_tabs()
+            if url:
+                # bounded for an interactive READ: ~10s composer wait, 2 tries -> an
+                # unreachable conversation returns empty in ~25s instead of hanging
+                # the bridge for minutes.
+                _goto_settled(url, timeout=12000, tries=2, compose_wait=10)
+            messages = _scrape_history()
+            # A cold URL navigation sometimes lands on an un-hydrated conversation view
+            # (the SPA shows the composer but never renders the prior turns), so the
+            # first scrape comes back empty. Reload once and re-scrape before giving up.
+            if url and not messages:
+                try:
+                    PAGE.reload(wait_until="domcontentloaded")
+                    _wait_composer()
+                    PAGE.wait_for_timeout(1500)
+                    messages = _scrape_history()
+                except Exception:
+                    pass
+        except Exception as e:
+            self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}); return
+        # Surface the truncation sentinel as a top-level field so callers can act on
+        # it without having to scan the message list. The sentinel record itself is
+        # stripped from the messages array (it is a meta record, not a real message).
+        truncated_meta = None
+        clean_messages = []
+        for m in (messages or []):
+            if m.get("role") == "__meta__":
+                truncated_meta = m
+            else:
+                clean_messages.append(m)
+        resp = {"ok": True, "url": PAGE.url, "messages": clean_messages}
+        if truncated_meta:
+            resp["truncated"] = True
+            resp["captured"] = truncated_meta.get("captured", len(clean_messages))
+        self._json(resp)
+
+    def _do_delete(self, parsed):
+        q = urllib.parse.parse_qs(parsed.query)
+        url = (q.get("url") or [""])[0]
+        title = (q.get("title") or [""])[0]
+        try:
+            ok, reason = _try_delete_conversation(url, title)
+        except Exception as e:
+            ok, reason = False, str(e)
+        # expose the reason under BOTH keys so the UI can surface it (it was dropped before)
+        self._json({"ok": ok, "error": reason, "reason": reason, "guid": _conv_guid(url)})
+
+    def _do_agent_conversations(self):
+        try:
+            if AGENT_URL:
+                PAGE.goto(AGENT_URL, wait_until="domcontentloaded", timeout=25000)
+                _wait_composer()
+            rows = _scrape_agent_rail()
+            base = AGENT_URL or ((PAGE.url or "").split("/conversation/")[0])
+            convs = [{"guid": r["guid"], "title": r.get("title", ""),
+                      "url": (base.rstrip("/") + "/conversation/" + r["guid"]) if base else ""}
+                     for r in rows]
+        except Exception as e:
+            self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}); return
+        self._json({"ok": True, "count": len(convs), "conversations": convs})
+
+    def _do_upload(self, parsed):
+        path = (urllib.parse.parse_qs(parsed.query).get("path") or [""])[0]
+        try:
+            if not path or not os.path.isfile(path):
+                self._json({"ok": False, "error": "file not found"}); return
+            inp = PAGE.locator('input[type="file"][accept*="csv"]').first
+            if inp.count() == 0:
+                inp = PAGE.locator('input[type="file"]').first
+            inp.set_input_files(path)
+            PAGE.wait_for_timeout(2200)     # let the attachment chip register
+            self._json({"ok": True, "name": os.path.basename(path)})
+        except Exception as e:
+            self._json({"ok": False, "error": str(e)})
 
     def _json(self, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -2134,14 +2427,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _delegate(self, kind, arg):
         """Run a /research or /analyze command by delegating to the Researcher
-        (Claude) or Analyst agent on a side page; stream the report back."""
-        global BUSY
+        (Claude) or Analyst agent on a side page; stream the report back.
+
+        No BUSY re-entrancy guard needed here: the caller chain (do_GET's /stream and /goal
+        handlers) already holds PAGE_LOCK for the whole request, so a second concurrent call
+        into this method can never happen -- PAGE_LOCK IS the serialization point now."""
         if not arg:
             usage = "/research <調べたいこと>" if kind == "researcher" else "/analyze <絶対パス> | <分析指示>"
             self._sse({"delta": "使い方: " + usage}); self._sse({}, "done"); return
-        if BUSY:
-            self._sse({"delta": "[busy: 直前の処理を実行中です]"}); self._sse({}, "done"); return
-        BUSY = True
         page = None
         try:
             from relay.agent_profiles import ANALYST, RESEARCHER, analyze, ask_agent
@@ -2173,7 +2466,6 @@ class Handler(BaseHTTPRequestHandler):
                     page.close()
             except Exception:
                 pass
-            BUSY = False
 
     def _stream(self, msg: str):
         self.send_response(200)
@@ -2296,66 +2588,74 @@ class Handler(BaseHTTPRequestHandler):
             pass
         return ok
 
+    def _run_one_turn(self, sid, msg, stream_out=True):
+        """Send `msg`, stream the growing/settled answer over the already-open SSE response
+        (unless stream_out=False), and return the final answer text -- or a sentinel dict
+        {"consent_failed": True} if an MCP connection-consent card could not be auto-approved
+        (caller decides how to surface that; WORK MODE routes it into an error-turn instead of
+        an SSE 'done' + honest chat error / surface(), which is /stream's own UI-facing
+        behavior and would be wrong to run mid-goal-loop).
+
+        This is the shared completion-machinery helper _stream_text and the work-mode loop
+        both call: send + stream + the exact same three-tier consent auto-approval as before
+        (reusing relay.edge_reconnect's shared click-through helpers, no click logic
+        reimplemented). It does NOT persist the exchange and does NOT emit the SSE 'done'
+        event -- those differ between a single /stream turn and a /goal turn, so callers own
+        both. Raises on a driver/page error, exactly as _send_and_stream_once did before this
+        was split out of _stream_text -- callers own the Esc/Stop-button + error-SSE handling.
+        """
+        _prepare_capture_baseline(sid)
+        final = self._send_and_stream_once(msg, stream_out=stream_out)
+        if final is not None and _looks_like_consent(final):
+            # Consent card, not a real answer -- do NOT show it to the user; auto-approve and
+            # retry SILENTLY first (this is a connection-SELECT confirm, not a credential
+            # event, so the fully-automatic tiers are tried before any surface()).
+            consented = False
+            try:
+                consented = _bridge_auto_consent()
+            except Exception:
+                logger.warning("_bridge_auto_consent raised; treating as failed", exc_info=True)
+                consented = False
+            if consented:
+                try:
+                    final = self._send_and_stream_once(msg, stream_out=stream_out)
+                except Exception:
+                    final = None
+                if final is not None and _looks_like_consent(final):
+                    logger.warning("consent card persisted after auto-consent retry")
+                    return {"consent_failed": True}
+            else:
+                logger.warning("_bridge_auto_consent: all tiers failed for a consent card")
+                return {"consent_failed": True}
+        return final
+
     def _stream_text(self, msg: str):
         """Send `msg` to the agent and stream the answer back over the ALREADY-open
         SSE response (the normal send/stream path). Used both for plain messages and
         for prompt-template slash commands so templated answers stream like a normal
-        turn. Respects the BUSY guard; always emits a terminating `done` event.
+        turn. Always emits a terminating `done` event.
 
-        MCP CONNECTION-CONSENT auto-approval (regulation: consent must be resolved FULLY
-        AUTOMATICALLY; surfacing the Edge is the LAST RESORT, firing ONLY once every
-        automatic tier has genuinely failed). If the reply is a consent card, this SILENTLY
-        runs the same three-tier auto-consent as RelayWorker._auto_consent (reusing
-        relay.edge_reconnect's shared click-through helpers -- no click logic is reimplemented
-        here), then RE-SENDS the SAME user message once so the real answer comes back on the
-        now-valid connection. Only if that also fails does this call surface() ONCE per
-        session (bridge Edge, port 9223) so the user can approve by hand on the real chat;
-        only if surface() itself cannot bring a window up does this return the honest chat
-        error."""
-        global BUSY, ACTIVE_SID
-        if BUSY:
-            self._sse({"delta": "[busy: 直前の応答を生成中です]"})
-            self._sse({}, "done")
-            return
-        BUSY = True
+        No BUSY re-entrancy guard needed here: the caller chain (do_GET's /stream handler)
+        already holds PAGE_LOCK for the whole request, so a second concurrent call into this
+        method can never happen -- PAGE_LOCK IS the serialization point now.
+
+        MCP CONNECTION-CONSENT: send/stream/auto-consent-retry is delegated to _run_one_turn
+        (the machinery shared with the work-mode /goal loop). If _run_one_turn reports the
+        consent card could not be auto-approved, this is the ONE caller that still surfaces
+        the dedicated Edge as a last resort (a /goal turn instead reports it as an error-turn
+        and keeps looping -- see _goal_run_turn)."""
+        global ACTIVE_SID
         if not ACTIVE_SID:
             ACTIVE_SID = S.new_session()["sid"]
             logger.info("no active session -- created %s", ACTIVE_SID)
         sid = ACTIVE_SID
-        # Change-based capture: snapshot the baseline BEFORE the send that may create the
-        # conversation (only refreshes when the session has no conv_url yet).
-        _prepare_capture_baseline(sid)
         try:
-            final = self._send_and_stream_once(msg)
-            if final is not None and _looks_like_consent(final):
-                # Consent card, not a real answer -- do NOT show it to the user; auto-approve
-                # and retry SILENTLY first (this is a connection-SELECT confirm, not a
-                # credential event, so the fully-automatic tiers are tried before any surface).
-                consented = False
-                try:
-                    consented = _bridge_auto_consent()
-                except Exception:
-                    logger.warning("_bridge_auto_consent raised; treating as failed", exc_info=True)
-                    consented = False
-                if consented:
-                    try:
-                        final = self._send_and_stream_once(msg)
-                    except Exception:
-                        final = None
-                    if final is not None and _looks_like_consent(final):
-                        # still a consent card after one auto-approved retry -> automation is
-                        # genuinely exhausted; fall through to the last-resort surface() below.
-                        logger.warning("consent card persisted after auto-consent retry")
-                        if not self._consent_last_resort_surface():
-                            self._sse({"replace": "接続の自動承認に失敗しました。再試行してください。"})
-                            self._sse({}, "done")
-                        return
-                else:
-                    logger.warning("_bridge_auto_consent: all tiers failed for a consent card")
-                    if not self._consent_last_resort_surface():
-                        self._sse({"replace": "接続の自動承認に失敗しました。再試行してください。"})
-                        self._sse({}, "done")
-                    return
+            final = self._run_one_turn(sid, msg)
+            if isinstance(final, dict) and final.get("consent_failed"):
+                if not self._consent_last_resort_surface():
+                    self._sse({"replace": "接続の自動承認に失敗しました。再試行してください。"})
+                    self._sse({}, "done")
+                return
             if final:
                 self._sse({"replace": final})
                 # SESSION LIFECYCLE: only a genuine (non-consent-card) answer is worth
@@ -2377,22 +2677,114 @@ class Handler(BaseHTTPRequestHandler):
                 self._sse({}, "done")
             except Exception:
                 pass
+
+    def _goal(self, text, max_turns, resume_flag):
+        """WORK MODE: GET /goal -- an autonomous multi-turn loop on the ACTIVE session
+        (creating one if none), per the frozen HTTP contract. SSE stream:
+          * ordinary {"delta"}/{"replace"} events interleave while a turn streams (via
+            _run_one_turn -> _send_and_stream_once, same as a normal /stream turn);
+          * after each completed turn: {"turn_done": <int>, "text": "<final turn text>"};
+          * when a queued steering input is injected for the next turn: one
+            {"steered": "<text>"} event per input;
+          * at the end: {"goal_done": true, "outcome": ..., "turns": <int>} then event: done.
+
+        resume_flag selects GET /goal?resume=1: continues a stored interrupted goal (mode==
+        "interrupted" + a stored goal text -- see resume_eligibility), whose turn-1 message is
+        the resume nudge instead of the original goal text (the goal itself is already in the
+        live conversation from before the crash)."""
+        global ACTIVE_SID, STOP_REQUESTED
+        STOP_REQUESTED = False
+        sid = ACTIVE_SID
+        if resume_flag:
+            sess = S.load(sid) if sid else None
+            ok, goal_or_reason = resume_eligibility(sess)
+            if not ok:
+                self._json({"ok": False, "error": goal_or_reason}); return
+            goal_text = goal_or_reason
+            first_msg = WORK_MODE_RESUME_NUDGE
+        else:
+            goal_text = text or ""
+            if not sid:
+                ACTIVE_SID = S.new_session()["sid"]
+                sid = ACTIVE_SID
+                logger.info("no active session -- created %s for /goal", sid)
+            first_msg = wrap_goal_text(goal_text)
+
+        # SSE headers -- same shape as /stream (this endpoint IS an SSE stream; only the
+        # PAGE_LOCK-busy short-circuit in do_GET returns plain JSON before headers are sent).
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        S.touch(sid, mode="working", goal=goal_text)
+        turn = 0
+        consecutive_errors = 0
+        msg = first_msg
+        outcome = None
+        try:
+            while True:
+                turn += 1
+                try:
+                    final = self._run_one_turn(sid, msg)
+                except Exception as e:
+                    try:
+                        PAGE.locator(COPILOT_SELECTORS["stop_button"]).first.click(timeout=3000)
+                    except Exception:
+                        pass
+                    logger.warning("goal loop: turn %d raised: %s: %s", turn, type(e).__name__, e,
+                                   exc_info=True)
+                    consecutive_errors += 1
+                    self._sse({"delta": "\n[turn error: %s: %s]" % (type(e).__name__, e)})
+                    outcome = decide_outcome(False, STOP_REQUESTED, turn, max_turns,
+                                             consecutive_errors)
+                    if outcome:
+                        break
+                    msg = WORK_MODE_CONTINUE_NUDGE
+                    continue
+                if isinstance(final, dict) and final.get("consent_failed"):
+                    # Work mode never surfaces the Edge mid-loop (that is /stream's own
+                    # UI-facing last resort) -- treat it as a turn error and keep looping
+                    # within the normal consecutive-error budget.
+                    consecutive_errors += 1
+                    self._sse({"delta": "\n[turn error: MCP connection-consent could not be "
+                                         "auto-approved]"})
+                    outcome = decide_outcome(False, STOP_REQUESTED, turn, max_turns,
+                                             consecutive_errors)
+                    if outcome:
+                        break
+                    msg = WORK_MODE_CONTINUE_NUDGE
+                    continue
+                consecutive_errors = 0
+                final = final or ""
+                done, turn_text = detect_done(final)
+                if turn_text:
+                    _persist_exchange(sid, msg, turn_text)
+                self._sse({"turn_done": turn, "text": turn_text})
+                outcome = decide_outcome(done, STOP_REQUESTED, turn, max_turns,
+                                         consecutive_errors)
+                if outcome:
+                    break
+                queued = drain_pending_once(sid)
+                msg, steered = select_next_message(queued, WORK_MODE_CONTINUE_NUDGE)
+                for s_text in steered:
+                    self._sse({"steered": s_text})
+            self._sse({"goal_done": True, "outcome": outcome, "turns": turn})
+            self._sse({}, "done")
         finally:
-            BUSY = False
+            S.touch(sid, mode="idle")
 
     def _drain_pending_queue(self, sid):
-        """After a completed exchange, run any inputs that were queued (via /send) while
-        this session was BUSY. PENDING QUEUE DESIGN NOTE: bridge/copilot_bridge.py's
-        HTTPServer is a plain (non-threading) http.server.HTTPServer -- confirmed at
-        main() -- so requests are fully serialized; a second /stream can never race the
-        first at the OS level, it simply waits for this handler to return. That means true
-        queueing is only needed for the FIRE-AND-FORGET /send endpoint (no client is blocked
-        waiting on its SSE reply), which is why S.queue_input/S.pop_input is wired ONLY
-        there, not into /stream. Drains via the pure drain_pending_once() so the popping/
-        looping logic itself is unit-testable without a browser. Each drained input is sent
-        with NO SSE consumer (stream_out=False) but still persisted via S.append_turn/
-        S.touch, same as a normal turn, so /history and the session transcript stay
-        complete. Exception-guarded per item -- one bad queued input must not abandon the
+        """After a completed exchange, run any inputs that were queued (via /send) while a
+        PAGE-touching request held PAGE_LOCK. PENDING QUEUE DESIGN NOTE: /send is now always
+        store-only (it queues unconditionally -- see do_GET's /send handler), so anything
+        queued while THIS request was running (or before it started) needs a drain pass right
+        after the request that had the page finishes. Drains via the pure drain_pending_once()
+        so the popping/looping logic itself is unit-testable without a browser. Each drained
+        input is sent with NO SSE consumer (stream_out=False) but still persisted via
+        S.append_turn/S.touch, same as a normal turn, so /history and the session transcript
+        stay complete. Exception-guarded per item -- one bad queued input must not abandon the
         rest of the queue or crash the server loop."""
         for item in drain_pending_once(sid):
             try:
@@ -2426,14 +2818,25 @@ def _find_or_open_agent(ctx):
     raise SystemExit("No agent page. Set MCP_IMPL_AGENT_URL in .env or open an agent tab in Edge.")
 
 
-class _SingleBindHTTPServer(HTTPServer):
-    """HTTPServer that REFUSES to double-bind. The inherited allow_reuse_address=1 maps to
-    SO_REUSEADDR, which on Windows lets a SECOND process silently bind the same port -- two
-    live bridges then each drive their OWN Edge page while sharing the same session ledger,
-    and request dispatch between them is effectively random (resume lands on one, the next
-    send on the other). Windows does not need SO_REUSEADDR for a quick listener restart, so
-    it is disabled outright: a second bind now raises instead of silently succeeding."""
+class _SingleBindHTTPServer(ThreadingMixIn, HTTPServer):
+    """ThreadingHTTPServer (via ThreadingMixIn) that REFUSES to double-bind, combining BOTH
+    concurrency requirements this bridge needs:
+
+    (1) THREADED: a long-running /goal turn must not block /send (steering) or /stop from
+        getting through -- see the module-level PAGE_LOCK docstring. ThreadingMixIn dispatches
+        each request on its own thread (daemon_threads=True below so a stuck request thread
+        never blocks process exit); PAGE_LOCK is the single serialization point ensuring only
+        one thread ever touches the Playwright PAGE/DRIVER objects at a time (they are not
+        thread-safe).
+
+    (2) SINGLE-INSTANCE: the inherited allow_reuse_address=1 maps to SO_REUSEADDR, which on
+        Windows lets a SECOND process silently bind the same port -- two live bridges then
+        each drive their OWN Edge page while sharing the same session ledger, and request
+        dispatch between them is effectively random (resume lands on one, the next send on
+        the other). Windows does not need SO_REUSEADDR for a quick listener restart, so it is
+        disabled outright: a second bind now raises instead of silently succeeding."""
     allow_reuse_address = False
+    daemon_threads = True
 
 
 def _port_already_served(port, timeout=2.0):
@@ -2447,18 +2850,13 @@ def _port_already_served(port, timeout=2.0):
         return False
 
 
-def main():
+def _page_main(cdp, fresh):
+    """Runs ENTIRELY on PAGE_EXECUTOR's dedicated owner thread (see start() below): creates
+    PAGE/DRIVER, runs startup auto-resume, then services PAGE_EXECUTOR's work queue forever.
+    Every later PAGE/DRIVER call (from any HTTP request thread) is routed here via
+    run_on_page_thread -- see PageExecutor's docstring for why page creation and every later
+    page call must share this one thread (Playwright sync-API thread affinity)."""
     global PAGE, DRIVER, AGENT_URL, ACTIVE_SID
-    fresh = "--fresh" in sys.argv[1:]
-    cdp = os.environ.get("MCP_CDP_URL", "http://localhost:9222")
-    port = int(os.environ.get("MCP_BRIDGE_PORT", "8765"))
-    # SINGLE-INSTANCE GUARD: if another bridge is already serving the port, exit at once
-    # (before touching CDP / creating a page). Belt: this connect probe gives a clean exit
-    # + log line. Suspenders: _SingleBindHTTPServer makes a double-bind raise even if two
-    # instances race past this check simultaneously.
-    if _port_already_served(port):
-        print("bridge already serving port %d; exiting (single-instance guard)" % port, flush=True)
-        return
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         br = p.chromium.connect_over_cdp(cdp)
@@ -2498,6 +2896,15 @@ def main():
                     ACTIVE_SID = latest["sid"]
                     S.touch(ACTIVE_SID, status="active")
                     print("resumed session %s" % ACTIVE_SID, flush=True)
+                    # CRASH-RESUME (work mode): the resumed session was left mode=="working"
+                    # by a /goal loop that never reached its own loop-end S.touch(mode="idle")
+                    # -- i.e. the bridge process died mid-goal (crash, or the -Keepalive
+                    # supervisor restarting it). Mark it "interrupted" and log the recovery
+                    # path, but do NOT auto-continue unattended: the operator must explicitly
+                    # hit GET /goal?resume=1 to pick the loop back up.
+                    if latest.get("mode") == "working":
+                        S.touch(ACTIVE_SID, mode="interrupted")
+                        print("interrupted goal found; continue with /goal?resume=1", flush=True)
                 else:
                     print("startup auto-resume failed (%s); falling back to fresh" % reason,
                           flush=True)
@@ -2513,11 +2920,41 @@ def main():
             # attributed correctly. Refreshed again right before each capture-needing send.
             _record_capture_baseline()
 
-        # single-threaded ON PURPOSE: Playwright sync objects are not thread-safe,
-        # so every request must run in the same thread that owns the page.
-        srv = _SingleBindHTTPServer(("127.0.0.1", port), Handler)
-        print("copilot bridge: http://127.0.0.1:%d  (driving %s)" % (port, PAGE.url[-40:]), flush=True)
-        srv.serve_forever()
+        print("copilot bridge: driving %s" % PAGE.url[-40:], flush=True)
+        # Service PAGE_EXECUTOR's work queue forever ON THIS THREAD -- every later
+        # run_on_page_thread(...) call from any HTTP request thread executes here, inside the
+        # SAME `with sync_playwright()` context that created PAGE/DRIVER above. This call
+        # blocks for the lifetime of the process (mirrors the old srv.serve_forever()).
+        PAGE_EXECUTOR.run_forever()
+
+
+def main():
+    fresh = "--fresh" in sys.argv[1:]
+    cdp = os.environ.get("MCP_CDP_URL", "http://localhost:9222")
+    port = int(os.environ.get("MCP_BRIDGE_PORT", "8765"))
+    # SINGLE-INSTANCE GUARD: if another bridge is already serving the port, exit at once
+    # (before touching CDP / creating a page). Belt: this connect probe gives a clean exit
+    # + log line. Suspenders: _SingleBindHTTPServer makes a double-bind raise even if two
+    # instances race past this check simultaneously.
+    if _port_already_served(port):
+        print("bridge already serving port %d; exiting (single-instance guard)" % port, flush=True)
+        return
+    # Start the page-owner thread FIRST and let it finish PAGE/DRIVER setup (including
+    # startup auto-resume) before the HTTP server starts accepting connections -- a request
+    # arriving before PAGE exists would otherwise submit a job to an executor with nothing
+    # to run it against. PAGE_EXECUTOR.submit() blocks the calling (request) thread until the
+    # job runs, so simply starting the HTTP server after this call is enough serialization;
+    # no separate "ready" event is needed because do_GET's first PAGE access is always via
+    # run_on_page_thread, which is a no-op-until-queued blocking call.
+    PAGE_EXECUTOR.start(lambda: _page_main(cdp, fresh))
+    # THREADED (via ThreadingMixIn in _SingleBindHTTPServer) so a long /goal run cannot
+    # block /send (steering) or /stop from getting through. Playwright sync objects are
+    # still not thread-safe -- PageExecutor (module-level PAGE_EXECUTOR) is the single
+    # serialization point ensuring only the page-owner thread ever touches PAGE/DRIVER; see
+    # its docstring near the top of this file.
+    srv = _SingleBindHTTPServer(("127.0.0.1", port), Handler)
+    print("copilot bridge: http://127.0.0.1:%d" % port, flush=True)
+    srv.serve_forever()
 
 
 if __name__ == "__main__":
