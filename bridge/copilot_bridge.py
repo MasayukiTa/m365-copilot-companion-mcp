@@ -261,6 +261,10 @@ _CONSENT_SURFACED = False  # last-resort surface() for consent fired at most onc
 # server-side, so a "session" here is just a local label + conv_url + transcript around
 # whichever ONE Copilot conversation this bridge currently drives).
 ACTIVE_SID = None
+# Change-based capture baseline: {"cur": <aria-current guid or "">, "known": set(<guids>)}
+# snapshotted BEFORE a conversation-creating send (see _record_capture_baseline). None until
+# first recorded.
+CAPTURE_BASELINE = None
 
 
 def _next_pending(sid):
@@ -562,36 +566,169 @@ def _current_row_guid():
     return guid if BARE_GUID_RE.match(guid) else ""
 
 
-def _capture_conv_ref():
-    """Best-effort capture of a durable reference to the conversation just driven, for
-    persistence via S.touch(sid, conv_url=...). Returns a "sess:<guid>" string, or "" if no
-    identifier could be found (caller must tolerate this -- a turn must still complete).
+# ── change-based conversation capture ──────────────────────────────────────────────────────
+# WHY change-based: right after /new + first send, the NEW conversation often has no sidebar
+# row yet, and aria-current="page" REMAINS on the PREVIOUSLY-open row (observed live: after
+# resume-to-A then /new + teach-in-B, aria-current still pointed at A and the old capture
+# misattributed B's session to A's guid). Likewise the localStorage cache lags fresh
+# conversations by seconds. So capture must be CHANGE-based: snapshot what exists BEFORE the
+# conversation-creating send (the baseline), then accept only a guid that demonstrably
+# CHANGED/appeared relative to that baseline. Ambiguity = empty: a wrong resume is strictly
+# worse than no resume, so no "most recent entry" or stale-marker fallback is allowed.
 
-    PRIMARY: the sidebar row currently marked aria-current="page" -- a direct DOM read of
-    the OPEN conversation, no list-ordering assumption. FALLBACK: the M365 Copilot SPA's
-    own localStorage history cache (the data backing the sidebar), most-recently-updated
-    entry first. Right after a send/reply exchange that entry is normally the conversation
-    this bridge just drove, but the cache can LAG a fresh conversation by seconds (observed
-    live: stale preview fields right after a completed turn), which is why it is only the
-    fallback."""
-    guid = _current_row_guid()
-    if guid:
-        return make_sessref(guid)
+# All GUID-shaped sidebar row ids currently in the DOM (any state, not just aria-current).
+_ALL_ROW_GUIDS_JS = r"""
+() => {
+  var out = [];
+  var rows = document.querySelectorAll('button[id]');
+  for (var i = 0; i < rows.length; i++) {
+    var id = rows[i].id || '';
+    if (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(id)) {
+      out.push(id);
+    }
+  }
+  return out;
+}
+"""
+
+
+def _known_conv_guids():
+    """The set of ALL conversation GUIDs currently known to the page: sidebar row ids plus
+    the SPA's localStorage history cache. Used for the capture baseline and for detecting a
+    newly appeared conversation. Never raises; partial results on error."""
+    guids = set()
     try:
-        items = PAGE.evaluate(_INSIGHTS_JS)
-    except Exception:
-        return ""
-    if not items:
-        return ""
-    try:
-        items = sorted(items, key=lambda it: it.get("updateTimeUtc", 0), reverse=True)
+        for g in (PAGE.evaluate(_ALL_ROW_GUIDS_JS) or []):
+            if BARE_GUID_RE.match(g or ""):
+                guids.add(g)
     except Exception:
         pass
-    top = items[0] if items else {}
-    guid = (top.get("conversationId") or "").strip()
-    if not BARE_GUID_RE.match(guid):
-        return ""
-    return make_sessref(guid)
+    try:
+        for it in (PAGE.evaluate(_INSIGHTS_JS) or []):
+            g = (it.get("conversationId") or "").strip()
+            if BARE_GUID_RE.match(g):
+                guids.add(g)
+    except Exception:
+        pass
+    return guids
+
+
+def select_changed_conv_guid(baseline_cur, baseline_known, now_cur, now_known):
+    """PURE change-based capture selection (no browser access -- fully unit-testable).
+
+    Given the pre-send baseline (the aria-current guid at that moment, possibly '', and the
+    set of ALL conversation guids known at that moment) and the current observation, return
+    the guid of the conversation that was newly created since the baseline, or '' when it
+    cannot be determined unambiguously.
+
+    Accept rules (in priority order):
+      (a) the pane's aria-current guid moved to a row that did NOT exist at baseline;
+      (b) exactly ONE brand-new guid appeared since the baseline.
+    A stale aria-current (same as baseline) is never accepted; multiple new guids are
+    ambiguous -> ''. Ambiguity = empty on purpose: a wrong resume is strictly worse than no
+    resume."""
+    known = set(baseline_known or ())
+    if baseline_cur:
+        known.add(baseline_cur)
+    if now_cur and now_cur != (baseline_cur or "") and now_cur not in known:
+        return now_cur
+    fresh = []
+    seen = set()
+    for g in (now_known or ()):
+        if g and g not in known and g not in seen:
+            seen.add(g)
+            fresh.append(g)
+    if len(fresh) == 1:
+        return fresh[0]
+    return ""
+
+
+def _record_capture_baseline():
+    """Snapshot the change-based capture baseline off the live page: the current
+    aria-current guid (may be '' on a truly bare pane, or a STALE previous conversation --
+    that is exactly why it is recorded) and all currently-known conversation guids. Stored
+    module-level (CAPTURE_BASELINE, next to ACTIVE_SID). Called when /new or startup-fresh
+    puts the pane on the bare agent page, and refreshed immediately before any send for a
+    session that has no conv_url yet. Never raises."""
+    global CAPTURE_BASELINE
+    try:
+        CAPTURE_BASELINE = {"cur": _current_row_guid(), "known": _known_conv_guids()}
+    except Exception:
+        CAPTURE_BASELINE = {"cur": "", "known": set()}
+
+
+def _capture_changed_conv_ref(poll_s=20):
+    """Post-exchange capture: poll up to `poll_s` seconds for a guid that CHANGED/appeared
+    relative to CAPTURE_BASELINE (see select_changed_conv_guid). Returns "sess:<guid>" or
+    "" when no unambiguous new conversation could be determined (caller leaves conv_url
+    empty and logs -- never guesses). Never raises."""
+    base = CAPTURE_BASELINE or {"cur": "", "known": set()}
+    deadline = time.time() + max(1, poll_s)
+    while time.time() < deadline:
+        try:
+            guid = select_changed_conv_guid(
+                base.get("cur", ""), base.get("known") or set(),
+                _current_row_guid(), _known_conv_guids())
+        except Exception:
+            guid = ""
+        if guid:
+            return make_sessref(guid)
+        try:
+            PAGE.wait_for_timeout(1000)
+        except Exception:
+            break
+    return ""
+
+
+def _prepare_capture_baseline(sid):
+    """Refresh the change-based capture baseline IMMEDIATELY before a send, but only for a
+    session that has no conv_url yet (an already-captured session never re-captures, see
+    _persist_exchange). Recording right before the conversation-creating send makes the
+    baseline immune to anything that moved the pane since /new (a /history or /switch call,
+    a prior session's exchange, ...). Never raises."""
+    try:
+        sess = S.load(sid) or {}
+        if not (sess.get("conv_url") or ""):
+            _record_capture_baseline()
+    except Exception:
+        logger.warning("prepare_capture_baseline failed for sid=%s", sid, exc_info=True)
+
+
+def _persist_exchange(sid, user_msg, final_text):
+    """Persist one completed exchange to the session ledger, maintaining conv_url via
+    CHANGE-BASED capture. Rules (all ASCII logs):
+      * session has NO conv_url: capture only a guid that changed/appeared vs the pre-send
+        baseline; if ambiguous, leave conv_url EMPTY and warn (a wrong resume is strictly
+        worse than no resume -- no stale-marker or most-recent-entry fallback).
+      * session HAS conv_url: never overwrite. Verify the pane's aria-current still matches
+        and warn on mismatch.
+    Exception-guarded: a persistence hiccup must never break the chat turn."""
+    try:
+        S.append_turn(sid, "user", user_msg)
+        S.append_turn(sid, "assistant", final_text)
+        sess = S.load(sid) or {}
+        existing = sess.get("conv_url") or ""
+        if existing:
+            expected = sessref_guid(existing)
+            if expected:
+                cur = _current_row_guid()
+                if cur and cur != expected:
+                    logger.warning(
+                        "pane guid %s.. does not match session conv_url guid %s.. "
+                        "(sid=%s); keeping stored conv_url", cur[:5], expected[:5], sid)
+            S.touch(sid, status="active")
+        else:
+            ref = _capture_changed_conv_ref()
+            fields = {"status": "active"}
+            if ref:
+                fields["conv_url"] = ref
+            else:
+                logger.warning(
+                    "conversation capture ambiguous for sid=%s; conv_url left empty "
+                    "(no changed/new guid vs baseline)", sid)
+            S.touch(sid, **fields)
+    except Exception:
+        logger.warning("session persistence failed for sid=%s", sid, exc_info=True)
 
 
 def _verify_pane_on_guid(guid, cur_wait=10, turns_wait=20):
@@ -1769,6 +1906,11 @@ class Handler(BaseHTTPRequestHandler):
                     ok = _wait_composer()
             except Exception as e:
                 self._json({"ok": False, "error": str(e)}); return
+            # Change-based capture baseline: the pane is now on the bare agent page, but
+            # aria-current can STILL mark the previously-open conversation's row (observed
+            # live) -- that stale marker plus all currently-known guids IS the baseline the
+            # post-send capture diffs against. Refreshed again right before the send.
+            _record_capture_baseline()
             sess = S.new_session(title=title)
             ACTIVE_SID = sess["sid"]
             self._json({"ok": ok, "url": PAGE.url, "sid": ACTIVE_SID})
@@ -1844,6 +1986,7 @@ class Handler(BaseHTTPRequestHandler):
             # not busy: send it now (no SSE consumer -- fire-and-forget), same persistence
             # path as a normal turn, then drain anything that queued up while we were busy.
             BUSY = True
+            _prepare_capture_baseline(sid)
             try:
                 final = self._send_and_stream_once(msg, stream_out=False)
                 if final is not None and _looks_like_consent(final):
@@ -1853,13 +1996,7 @@ class Handler(BaseHTTPRequestHandler):
                         except Exception:
                             final = None
                 if final:
-                    S.append_turn(sid, "user", msg)
-                    S.append_turn(sid, "assistant", final)
-                    ref = _capture_conv_ref()
-                    fields = {"status": "active"}
-                    if ref:
-                        fields["conv_url"] = ref
-                    S.touch(sid, **fields)
+                    _persist_exchange(sid, msg, final)
             except Exception as e:
                 self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}); return
             finally:
@@ -2185,6 +2322,9 @@ class Handler(BaseHTTPRequestHandler):
             ACTIVE_SID = S.new_session()["sid"]
             logger.info("no active session -- created %s", ACTIVE_SID)
         sid = ACTIVE_SID
+        # Change-based capture: snapshot the baseline BEFORE the send that may create the
+        # conversation (only refreshes when the session has no conv_url yet).
+        _prepare_capture_baseline(sid)
         try:
             final = self._send_and_stream_once(msg)
             if final is not None and _looks_like_consent(final):
@@ -2219,18 +2359,9 @@ class Handler(BaseHTTPRequestHandler):
             if final:
                 self._sse({"replace": final})
                 # SESSION LIFECYCLE: only a genuine (non-consent-card) answer is worth
-                # persisting. Exception-guarded -- a session_store hiccup must never break
-                # the chat turn the user is actually waiting on.
-                try:
-                    S.append_turn(sid, "user", msg)
-                    S.append_turn(sid, "assistant", final)
-                    ref = _capture_conv_ref()
-                    fields = {"status": "active"}
-                    if ref:
-                        fields["conv_url"] = ref
-                    S.touch(sid, **fields)
-                except Exception:
-                    logger.warning("session persistence failed for sid=%s", sid, exc_info=True)
+                # persisting. Change-based capture / verify / warn all live in
+                # _persist_exchange (exception-guarded there).
+                _persist_exchange(sid, msg, final)
             self._sse({}, "done")
             self._drain_pending_queue(sid)
         except Exception as e:
@@ -2265,6 +2396,7 @@ class Handler(BaseHTTPRequestHandler):
         rest of the queue or crash the server loop."""
         for item in drain_pending_once(sid):
             try:
+                _prepare_capture_baseline(sid)
                 final = self._send_and_stream_once(item, stream_out=False)
                 if final is not None and _looks_like_consent(final):
                     if _bridge_auto_consent():
@@ -2273,13 +2405,7 @@ class Handler(BaseHTTPRequestHandler):
                         except Exception:
                             final = None
                 if final:
-                    S.append_turn(sid, "user", item)
-                    S.append_turn(sid, "assistant", final)
-                    ref = _capture_conv_ref()
-                    fields = {"status": "active"}
-                    if ref:
-                        fields["conv_url"] = ref
-                    S.touch(sid, **fields)
+                    _persist_exchange(sid, item, final)
             except Exception:
                 logger.warning("drain_pending_queue: queued send failed for sid=%s", sid, exc_info=True)
 
@@ -2380,6 +2506,12 @@ def main():
                 print("startup auto-resume failed: %s: %s" % (type(e).__name__, e), flush=True)
         else:
             print("startup auto-resume: %s" % why, flush=True)
+        if ACTIVE_SID is None:
+            # STARTUP-FRESH: no session was resumed, so the pane is on the bare agent page
+            # (or wherever the failed resume left it) -- record the change-based capture
+            # baseline now so the first exchange of a lazily-created session can be
+            # attributed correctly. Refreshed again right before each capture-needing send.
+            _record_capture_baseline()
 
         # single-threaded ON PURPOSE: Playwright sync objects are not thread-safe,
         # so every request must run in the same thread that owns the page.
