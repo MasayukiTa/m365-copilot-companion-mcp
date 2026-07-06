@@ -60,6 +60,7 @@ jobs:
             tools/test_python_gate.py \
             tools/test_layer1_security.py \
             tools/test_procedural_memory.py \
+            tools/test_auth_stats.py \
             relay/test_acceptance.py \
             relay/test_admission.py \
             relay/test_autoscale.py \
