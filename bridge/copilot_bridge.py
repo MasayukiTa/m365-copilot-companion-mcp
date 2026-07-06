@@ -40,6 +40,29 @@ sys.path.insert(0, str(REPO))
 
 DELETE_LOG = REPO / ".fleet" / "delete_log.jsonl"
 GUID_RE = re.compile(r"/conversation/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
+# A bare GUID (not URL-embedded) -- e.g. a sidebar row's id/conversationId, as found live on
+# the ?titleId=... general-chat page shape (see SESSREF_PREFIX below for why this matters).
+BARE_GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+# EMPIRICAL FINDING (live probe, 2026-07-06, bridge Edge :9223, MCP_IMPL_AGENT_URL shaped
+# "https://m365.cloud.microsoft/chat/?titleId=T_..."): page.url NEVER carries a conversation
+# identifier on this page shape -- it stays "https://m365.cloud.microsoft/chat/?redirfrom=
+# CsrToSSR&auth=2" (or the bare titleId URL) before AND after a full send/reply exchange, and
+# even a manual sidebar-row click that visibly switches the main pane's messages does not
+# change page.url. So mechanism (a) (page.url after reply) is NOT usable here -- confirmed
+# by direct observation, not assumption.
+#
+# What IS durable: each conversation has a stable conversationId GUID that appears as the
+# `id` attribute on its sidebar row button (button[id=<guid>][aria-label=<title>], with a
+# sibling "More"/"その他のオプション" button -- the same row shape _delete_by_guid already
+# expects on the agent-rail page shape) AND is mirrored in
+# localStorage["<...>-insights"].state.unpinnedHistoryItemsList[].sessionChat.conversationId.
+# The most-recently-updated conversation sorts first in that list, so right after a send it
+# is reliably OUR conversation. Since there is no real navigable URL for it, we store a
+# SYNTHETIC reference "sess:<guid>" in the session's conv_url field; resume means: load
+# AGENT_URL (so the sidebar renders), then click button[id=<guid>] to switch the main pane
+# to that conversation -- NOT page.goto(), which this page shape has no use for.
+SESSREF_PREFIX = "sess:"
 
 
 def _conv_guid(url):
@@ -48,6 +71,51 @@ def _conv_guid(url):
         return ""
     m = GUID_RE.search(url)
     return m.group(1) if m else ""
+
+
+def make_sessref(guid):
+    """Build the synthetic conv_url value we persist for a bare conversationId GUID."""
+    guid = (guid or "").strip()
+    return (SESSREF_PREFIX + guid) if guid else ""
+
+
+def sessref_guid(ref):
+    """Extract the GUID back out of a 'sess:<guid>' reference, or '' if not that shape."""
+    ref = (ref or "").strip()
+    if ref.startswith(SESSREF_PREFIX):
+        return ref[len(SESSREF_PREFIX):]
+    return ""
+
+
+def classify_conv_ref(ref):
+    """Pure classifier for a stored conv_url/reference string. Returns one of:
+      "sessref"   -- our synthetic "sess:<guid>" scheme (resume = click sidebar row)
+      "conv_url"  -- a real navigable URL carrying /conversation/<guid> (resume = page.goto)
+      "bare_url"  -- some other non-empty URL/string (not reliably reattachable)
+      "empty"     -- nothing stored
+    No browser access -- pure string logic, so this is fully unit-testable."""
+    ref = (ref or "").strip()
+    if not ref:
+        return "empty"
+    if sessref_guid(ref):
+        return "sessref"
+    if _conv_guid(ref):
+        return "conv_url"
+    return "bare_url"
+
+
+def should_autoresume(sess, fresh_flag=False):
+    """Pure decision function for startup auto-resume: given a session dict (or None) and
+    the --fresh CLI flag, decide whether main() should attempt to reattach. No browser
+    access -- fully unit-testable. Returns (should, reason)."""
+    if fresh_flag:
+        return False, "fresh flag set"
+    if not sess:
+        return False, "no prior session"
+    ref = sess.get("conv_url") or ""
+    if classify_conv_ref(ref) == "empty":
+        return False, "session has no conv_url"
+    return True, "resumable session found"
 
 
 def _log_delete(guid, title, ok, reason):
@@ -67,6 +135,7 @@ from relay.copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver, P
 # connection-consent card in a reply -- imported (not re-listed) so the bridge and fleet never
 # drift apart on what counts as a consent card. See relay_fleet.py CONSENT_MARKERS (~line 90).
 from relay.relay_fleet import CONSENT_MARKERS
+from bridge import session_store as S
 
 load_dotenv()
 
@@ -184,6 +253,39 @@ DRIVER = None
 BUSY = False     # single conversation -> serialize requests
 AGENT_URL = ""   # bare agent URL (a fresh chat); set at startup
 _CONSENT_SURFACED = False  # last-resort surface() for consent fired at most once per session
+
+# ── session lifecycle (durable, resumable) ──────────────────────────────────────────────────
+# ONE active session at a time, matching the bridge's single-PAGE design (no multi-session
+# concurrency -- see session_store.py's docstring: M365 Copilot keeps conversation context
+# server-side, so a "session" here is just a local label + conv_url + transcript around
+# whichever ONE Copilot conversation this bridge currently drives).
+ACTIVE_SID = None
+
+
+def _next_pending(sid):
+    """Thin wrapper around S.pop_input so callers/tests can substitute a fake pop function
+    without importing session_store's file I/O. Returns None if sid is falsy."""
+    if not sid:
+        return None
+    return S.pop_input(sid)
+
+
+def drain_pending_once(sid, pop_fn=None, max_n=50):
+    """Pop up to `max_n` queued inputs for `sid` via `pop_fn` (defaults to S.pop_input) and
+    return them as a list, oldest-first. Pure w.r.t. control flow -- `pop_fn` is injected so
+    this is unit-testable with a fake FIFO (no real session_store file I/O needed in tests).
+    Stops early once pop_fn returns None (queue empty) or max_n is reached (safety bound
+    against a runaway queue)."""
+    pop_fn = pop_fn or (lambda s: S.pop_input(s))
+    out = []
+    if not sid:
+        return out
+    for _ in range(max(0, max_n)):
+        item = pop_fn(sid)
+        if item is None:
+            break
+        out.append(item)
+    return out
 
 
 def _wait_composer(timeout=40):
@@ -397,6 +499,99 @@ def _rail_has_guid(guid):
             "return !!(s && s.querySelector('button.fui-NavSubItem[id=\"'+g+'\"]'));}", guid)
     except Exception:
         return False
+
+
+# ── conversation-identity capture + resume (durable session support) ───────────────────────
+# EMPIRICAL (see SESSREF_PREFIX comment near the top): on the ?titleId=... general-chat page
+# shape this bridge actually drives (MCP_IMPL_AGENT_URL in .env), page.url never carries a
+# conversation id -- so capture reads the conversationId out of the SAME localStorage
+# "insights" blob the M365 Copilot SPA itself uses to render the history sidebar, and resume
+# clicks that conversation's sidebar row by id (a plain button[id=<guid>], NOT scoped to
+# #m365-copilot-chats-section -- that section only exists on the /chat/agent/<id> page shape,
+# which is NOT what this bridge's .env points at). Both paths are best-effort and exception-
+# guarded: a failure here must never break a chat turn.
+_INSIGHTS_JS = r"""
+() => {
+  for (var i = 0; i < localStorage.length; i++) {
+    var k = localStorage.key(i);
+    if (k.indexOf('insights') === -1) continue;
+    try {
+      var parsed = JSON.parse(localStorage.getItem(k));
+      var items = (parsed && parsed.state && parsed.state.unpinnedHistoryItemsList) || [];
+      return items.map(function(it) {
+        var sc = (it && it.sessionChat) || {};
+        return {conversationId: sc.conversationId || '', updateTimeUtc: sc.updateTimeUtc || 0,
+                preview: (sc.preview || '').slice(0, 80)};
+      });
+    } catch (e) {
+      return [];
+    }
+  }
+  return [];
+}
+"""
+
+
+def _capture_conv_ref():
+    """Best-effort capture of a durable reference to the conversation just driven, for
+    persistence via S.touch(sid, conv_url=...). Returns a "sess:<guid>" string, or "" if no
+    identifier could be found (caller must tolerate this -- a turn must still complete).
+
+    Reads the M365 Copilot SPA's own localStorage history cache (the same data backing the
+    sidebar) and takes the MOST RECENTLY UPDATED entry's conversationId -- right after a send/
+    reply exchange that is reliably the conversation this bridge just used (confirmed live:
+    a fresh send's conversationId sorts first, and it stays first as long as no OTHER
+    conversation is touched in between)."""
+    try:
+        items = PAGE.evaluate(_INSIGHTS_JS)
+    except Exception:
+        return ""
+    if not items:
+        return ""
+    try:
+        items = sorted(items, key=lambda it: it.get("updateTimeUtc", 0), reverse=True)
+    except Exception:
+        pass
+    top = items[0] if items else {}
+    guid = (top.get("conversationId") or "").strip()
+    if not BARE_GUID_RE.match(guid):
+        return ""
+    return make_sessref(guid)
+
+
+def _resume_to_ref(ref, settle=20):
+    """Reattach PAGE to the conversation named by `ref` (a "sess:<guid>" reference from
+    S.load()/S.latest_active()). Loads AGENT_URL first (so the sidebar with history rows
+    renders), then clicks the sidebar row whose id == guid -- the same click mechanism
+    confirmed live to switch the main pane without changing page.url. Returns (ok, reason);
+    never raises."""
+    guid = sessref_guid(ref)
+    if not guid:
+        return False, "not a sess: reference"
+    try:
+        if AGENT_URL:
+            PAGE.goto(AGENT_URL, wait_until="domcontentloaded", timeout=25000)
+        _wait_composer()
+    except Exception as e:
+        return False, "agent page load failed: %s: %s" % (type(e).__name__, e)
+    row = None
+    for _ in range(max(1, settle)):
+        try:
+            loc = PAGE.locator('button[id="%s"]' % guid)
+            if loc.count() > 0:
+                row = loc.first
+                break
+        except Exception:
+            pass
+        PAGE.wait_for_timeout(500)
+    if row is None:
+        return False, "conversation row not found in sidebar (guid=%s)" % guid
+    try:
+        row.click(timeout=4000, force=True)
+    except Exception as e:
+        return False, "row click failed: %s: %s" % (type(e).__name__, e)
+    PAGE.wait_for_timeout(1500)
+    return True, "resumed"
 
 
 def _delete_rail_row(guid):
@@ -1453,7 +1648,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        global BUSY
+        global BUSY, ACTIVE_SID
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/":
             body = PAGE_HTML.encode("utf-8")
@@ -1469,9 +1664,9 @@ class Handler(BaseHTTPRequestHandler):
             self._stream(msg)
             return
         if parsed.path == "/new":          # start a fresh Copilot conversation
-            global BUSY
             if BUSY:
                 self._json({"ok": False, "error": "busy"}); return
+            title = (urllib.parse.parse_qs(parsed.query).get("title") or [""])[0]
             ok = False
             try:
                 if AGENT_URL:
@@ -1479,7 +1674,9 @@ class Handler(BaseHTTPRequestHandler):
                     ok = _wait_composer()
             except Exception as e:
                 self._json({"ok": False, "error": str(e)}); return
-            self._json({"ok": ok, "url": PAGE.url})
+            sess = S.new_session(title=title)
+            ACTIVE_SID = sess["sid"]
+            self._json({"ok": ok, "url": PAGE.url, "sid": ACTIVE_SID})
             return
         if parsed.path == "/conv":         # current conversation URL (for saving)
             self._json({"url": PAGE.url})
@@ -1496,6 +1693,84 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json({"ok": False, "error": str(e)}); return
             self._json({"ok": ok, "url": PAGE.url})
+            return
+        if parsed.path == "/sessions":     # list known sessions (newest-first, capped)
+            try:
+                sessions = S.list_sessions()[:50]
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)}); return
+            self._json({"sessions": sessions})
+            return
+        if parsed.path == "/resume":       # reattach to a known session by sid
+            if BUSY:
+                self._json({"ok": False, "error": "busy"}); return
+            sid = (urllib.parse.parse_qs(parsed.query).get("sid") or [""])[0]
+            if not sid:
+                self._json({"ok": False, "error": "missing sid"}); return
+            sess = S.load(sid)
+            if sess is None:
+                self._json({"ok": False, "error": "unknown sid"}); return
+            ref = sess.get("conv_url") or ""
+            kind = classify_conv_ref(ref)
+            try:
+                _reap_orphan_tabs()
+                if kind == "sessref":
+                    ok, reason = _resume_to_ref(ref)
+                elif kind == "conv_url":
+                    ok = _goto_settled(ref)
+                    reason = "ok" if ok else "navigation did not settle on the conversation"
+                else:
+                    ok, reason = False, "session has no reattachable conv_url"
+            except Exception as e:
+                self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}); return
+            if ok:
+                ACTIVE_SID = sid
+                S.touch(sid, status="active")
+                self._json({"ok": True, "sid": sid})
+            else:
+                self._json({"ok": False, "error": reason})
+            return
+        if parsed.path == "/send":         # fire-and-forget: queue if busy, else send now
+            sid = (urllib.parse.parse_qs(parsed.query).get("sid") or [""])[0]
+            msg = (urllib.parse.parse_qs(parsed.query).get("msg") or [""])[0]
+            if not msg.strip():
+                self._json({"ok": False, "error": "empty msg"}); return
+            sid = sid or ACTIVE_SID
+            if not sid:
+                sid = S.new_session()["sid"]
+                ACTIVE_SID = sid
+            if BUSY:
+                try:
+                    S.queue_input(sid, msg)
+                except Exception as e:
+                    self._json({"ok": False, "error": str(e)}); return
+                self._json({"ok": True, "queued": True, "sid": sid})
+                return
+            # not busy: send it now (no SSE consumer -- fire-and-forget), same persistence
+            # path as a normal turn, then drain anything that queued up while we were busy.
+            BUSY = True
+            try:
+                final = self._send_and_stream_once(msg, stream_out=False)
+                if final is not None and _looks_like_consent(final):
+                    if _bridge_auto_consent():
+                        try:
+                            final = self._send_and_stream_once(msg, stream_out=False)
+                        except Exception:
+                            final = None
+                if final:
+                    S.append_turn(sid, "user", msg)
+                    S.append_turn(sid, "assistant", final)
+                    ref = _capture_conv_ref()
+                    fields = {"status": "active"}
+                    if ref:
+                        fields["conv_url"] = ref
+                    S.touch(sid, **fields)
+            except Exception as e:
+                self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}); BUSY = False; return
+            finally:
+                BUSY = False
+            self._drain_pending_queue(sid)
+            self._json({"ok": True, "queued": False, "sid": sid})
             return
         if parsed.path == "/history":      # scrape ALL turns of a conversation in order
             if BUSY:
@@ -1805,12 +2080,16 @@ class Handler(BaseHTTPRequestHandler):
         session (bridge Edge, port 9223) so the user can approve by hand on the real chat;
         only if surface() itself cannot bring a window up does this return the honest chat
         error."""
-        global BUSY
+        global BUSY, ACTIVE_SID
         if BUSY:
             self._sse({"delta": "[busy: 直前の応答を生成中です]"})
             self._sse({}, "done")
             return
         BUSY = True
+        if not ACTIVE_SID:
+            ACTIVE_SID = S.new_session()["sid"]
+            logger.info("no active session -- created %s", ACTIVE_SID)
+        sid = ACTIVE_SID
         try:
             final = self._send_and_stream_once(msg)
             if final is not None and _looks_like_consent(final):
@@ -1844,7 +2123,21 @@ class Handler(BaseHTTPRequestHandler):
                     return
             if final:
                 self._sse({"replace": final})
+                # SESSION LIFECYCLE: only a genuine (non-consent-card) answer is worth
+                # persisting. Exception-guarded -- a session_store hiccup must never break
+                # the chat turn the user is actually waiting on.
+                try:
+                    S.append_turn(sid, "user", msg)
+                    S.append_turn(sid, "assistant", final)
+                    ref = _capture_conv_ref()
+                    fields = {"status": "active"}
+                    if ref:
+                        fields["conv_url"] = ref
+                    S.touch(sid, **fields)
+                except Exception:
+                    logger.warning("session persistence failed for sid=%s", sid, exc_info=True)
             self._sse({}, "done")
+            self._drain_pending_queue(sid)
         except Exception as e:
             # The client hung up (the user pressed Esc/Stop) OR a real error -- either way, click
             # Copilot's OWN stop button so the SERVER-SIDE generation actually halts. Before this,
@@ -1860,6 +2153,40 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         finally:
             BUSY = False
+
+    def _drain_pending_queue(self, sid):
+        """After a completed exchange, run any inputs that were queued (via /send) while
+        this session was BUSY. PENDING QUEUE DESIGN NOTE: bridge/copilot_bridge.py's
+        HTTPServer is a plain (non-threading) http.server.HTTPServer -- confirmed at
+        main() -- so requests are fully serialized; a second /stream can never race the
+        first at the OS level, it simply waits for this handler to return. That means true
+        queueing is only needed for the FIRE-AND-FORGET /send endpoint (no client is blocked
+        waiting on its SSE reply), which is why S.queue_input/S.pop_input is wired ONLY
+        there, not into /stream. Drains via the pure drain_pending_once() so the popping/
+        looping logic itself is unit-testable without a browser. Each drained input is sent
+        with NO SSE consumer (stream_out=False) but still persisted via S.append_turn/
+        S.touch, same as a normal turn, so /history and the session transcript stay
+        complete. Exception-guarded per item -- one bad queued input must not abandon the
+        rest of the queue or crash the server loop."""
+        for item in drain_pending_once(sid):
+            try:
+                final = self._send_and_stream_once(item, stream_out=False)
+                if final is not None and _looks_like_consent(final):
+                    if _bridge_auto_consent():
+                        try:
+                            final = self._send_and_stream_once(item, stream_out=False)
+                        except Exception:
+                            final = None
+                if final:
+                    S.append_turn(sid, "user", item)
+                    S.append_turn(sid, "assistant", final)
+                    ref = _capture_conv_ref()
+                    fields = {"status": "active"}
+                    if ref:
+                        fields["conv_url"] = ref
+                    S.touch(sid, **fields)
+            except Exception:
+                logger.warning("drain_pending_queue: queued send failed for sid=%s", sid, exc_info=True)
 
 
 def _find_or_open_agent(ctx):
@@ -1879,7 +2206,8 @@ def _find_or_open_agent(ctx):
 
 
 def main():
-    global PAGE, DRIVER, AGENT_URL
+    global PAGE, DRIVER, AGENT_URL, ACTIVE_SID
+    fresh = "--fresh" in sys.argv[1:]
     cdp = os.environ.get("MCP_CDP_URL", "http://localhost:9222")
     port = int(os.environ.get("MCP_BRIDGE_PORT", "8765"))
     from playwright.sync_api import sync_playwright
@@ -1892,10 +2220,45 @@ def main():
         AGENT_URL = os.environ.get("MCP_IMPL_AGENT_URL", "").strip()
         if not AGENT_URL and "/chat/agent/" in (PAGE.url or ""):
             AGENT_URL = (PAGE.url or "").split("/conversation/")[0]
+
+        # STARTUP AUTO-RESUME: reattach to the most recently active session that has a
+        # reattachable conv_url, so a bridge restart (including the -Keepalive restart
+        # path in scripts/start_bridge.ps1) does not silently forget the running
+        # conversation. --fresh on the command line skips this and starts clean (a
+        # session is still lazily created on first /stream, same as before this change).
+        latest = None
+        try:
+            latest = S.latest_active()
+        except Exception:
+            logger.warning("startup auto-resume: S.latest_active() failed", exc_info=True)
+        do_resume, why = should_autoresume(latest, fresh_flag=fresh)
+        if do_resume:
+            try:
+                ref = latest.get("conv_url") or ""
+                kind = classify_conv_ref(ref)
+                if kind == "sessref":
+                    ok, reason = _resume_to_ref(ref)
+                elif kind == "conv_url":
+                    ok = _goto_settled(ref)
+                    reason = "ok" if ok else "navigation did not settle"
+                else:
+                    ok, reason = False, "unresumable conv_url shape"
+                if ok:
+                    ACTIVE_SID = latest["sid"]
+                    S.touch(ACTIVE_SID, status="active")
+                    print("resumed session %s" % ACTIVE_SID, flush=True)
+                else:
+                    print("startup auto-resume skipped: %s" % reason, flush=True)
+            except Exception as e:
+                logger.warning("startup auto-resume failed", exc_info=True)
+                print("startup auto-resume failed: %s: %s" % (type(e).__name__, e), flush=True)
+        else:
+            print("startup auto-resume: %s" % why, flush=True)
+
         # single-threaded ON PURPOSE: Playwright sync objects are not thread-safe,
         # so every request must run in the same thread that owns the page.
         srv = HTTPServer(("127.0.0.1", port), Handler)
-        print(f"copilot bridge: http://127.0.0.1:{port}  (driving {PAGE.url[-40:]})", flush=True)
+        print("copilot bridge: http://127.0.0.1:%d  (driving %s)" % (port, PAGE.url[-40:]), flush=True)
         srv.serve_forever()
 
 
