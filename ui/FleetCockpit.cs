@@ -226,6 +226,9 @@ class CockpitWindow : Window
     volatile bool _healthStop = false;
     volatile bool _fixRunning = false;   // guard: never run two fixes at once
     string _agentMarkerId = "";    // T_.../P_... id extracted from the configured agent URL (.env)
+    volatile bool _startAllLaunched = false;   // reentry guard for RunStartAll (per-cooldown, not per-app-run only)
+    double _startAllLastUnix = 0.0;            // NowUnix() at last RunStartAll launch; 120s cooldown
+    bool _startupHealCheckDone = false;        // set after the first PollHealthOnce's auto-heal decision runs once
 
     public CockpitWindow(string path)
     {
@@ -385,6 +388,7 @@ class CockpitWindow : Window
         if (k == "hs_fix_agent_ok") return ja ? "再接続に成功しました" : "Reconnect succeeded";
         if (k == "hs_fix_agent_fail") return ja ? "再接続に失敗（手動確認が必要）" : "Reconnect failed (needs manual check)";
         if (k == "hs_fix_server") return ja ? "start_all.bat を実行してください" : "Please run start_all.bat";
+        if (k == "hs_fix_stack") return ja ? "サーバ/トンネルを起動しています(最大2分)" : "Starting server/tunnel (up to ~2 min)";
         if (k == "hs_fix_done") return ja ? "完了" : "done";
         if (k == "hs_fix_err") return ja ? "修復でエラー" : "fix error";
         if (k == "infra_wait") return ja ? "インフラ待ち" : "Infra wait";
@@ -1145,6 +1149,13 @@ class CockpitWindow : Window
             _fixBtn.Visibility = (anyBad || _fixRunning) ? Visibility.Visible : Visibility.Collapsed;
             _fixBtn.IsEnabled = !_fixRunning;
         }
+        // Clear the stale hint text once everything the strip knows about is healthy again (not
+        // mid-fix): RunFix's note() writes _fixNote.Text once and nothing else used to clear it,
+        // so "run start_all.bat"-style residue could persist forever after the stack recovered.
+        // This runs on the UI thread already (ApplyHealthToUi's documented contract), so no
+        // Dispatcher marshal is needed here (mirrors the rest of this method).
+        if (!anyBad && !_fixRunning && _fixNote != null && _fixNote.Text.Length > 0)
+            _fixNote.Text = "";
     }
     static readonly string[] _healthKeys = { "hs_server", "hs_tunnel", "hs_edge", "hs_signin", "hs_agent" };
 
@@ -1169,6 +1180,29 @@ class CockpitWindow : Window
         while (!_healthStop)
         {
             try { PollHealthOnce(); } catch (Exception) { }
+
+            // Startup auto-heal: once per app run, right after the FIRST sweep completes, check
+            // whether the stack needs bringing up and do it ourselves -- this is what makes
+            // launching FleetCockpit.exe directly (not via the desktop icon) self-healing too.
+            // Guarded by _startupHealCheckDone (runs once) and RunStartAll's own 120s cooldown.
+            if (!_startupHealCheckDone)
+            {
+                _startupHealCheckDone = true;
+                HealthState srv0, tun0;
+                lock (_healthLock) { srv0 = _health[0].State; tun0 = _health[1].State; }
+                System.Diagnostics.Debug.WriteLine("[FleetCockpit] HealthLoop: startup auto-heal check server=" + srv0 + " tunnel=" + tun0);
+                if (srv0 == HealthState.Red || tun0 == HealthState.Red)
+                {
+                    try
+                    {
+                        if (!Dispatcher.HasShutdownStarted)
+                            Dispatcher.BeginInvoke(new Action(delegate { if (_fixNote != null) _fixNote.Text = T("hs_fix_stack"); }));
+                    }
+                    catch (Exception) { }
+                    RunStartAll();
+                }
+            }
+
             try
             {
                 if (!Dispatcher.HasShutdownStarted)
@@ -1494,10 +1528,10 @@ class CockpitWindow : Window
     {
         if (_fixRunning) return;
         // Decide the worst problem from the current cache (UI thread).
-        HealthState signin, edge, agent, server;
+        HealthState signin, edge, agent, server, tunnel;
         lock (_healthLock)
         {
-            server = _health[0].State; edge = _health[2].State;
+            server = _health[0].State; tunnel = _health[1].State; edge = _health[2].State;
             signin = _health[3].State; agent = _health[4].State;
         }
         _fixRunning = true;
@@ -1567,10 +1601,12 @@ class CockpitWindow : Window
             return;
         }
 
-        // Priority 4: Server RED -> instruction only (don't auto-launch the whole stack).
-        if (server == HealthState.Red)
+        // Priority 4: Server RED or Tunnel RED -> actually launch the stack bring-up (the same
+        // path the desktop icon uses), instead of just telling the user to run start_all.bat.
+        if (server == HealthState.Red || tunnel == HealthState.Red)
         {
-            note(T("hs_fix_server"));
+            note(T("hs_fix_stack"));
+            RunStartAll();
             done();
             return;
         }
@@ -1619,6 +1655,42 @@ class CockpitWindow : Window
             try { p.StandardError.ReadToEnd(); } catch (Exception) { }
             try { if (!p.WaitForExit(600000)) return -1; } catch (Exception) { return -1; }
             try { return p.ExitCode; } catch (Exception) { return -1; }
+        }
+    }
+
+    // Fire the full stack bring-up EXACTLY the way the desktop icon does: wscript.exe running
+    // start_all_hidden.vbs, which in turn drives scripts\start_all.ps1 (Invoke-Startup starts
+    // supervisor.ps1 [MCP server + devtunnel], companion Edge, bridge, UIs). start_all.ps1 is
+    // idempotent -- it skips components already running -- so calling this when the stack is
+    // already healthy is a safe no-op. Fire-and-forget: we do not wait for it to finish (up to
+    // ~2 min), we just launch it and let it self-log. Guarded by a 120s cooldown so repeated
+    // Fix clicks or health-poll ticks cannot stack multiple launches.
+    void RunStartAll()
+    {
+        double nowU = NowUnix();
+        if (_startAllLaunched && (nowU - _startAllLastUnix) < 120.0) return;
+        _startAllLaunched = true;
+        _startAllLastUnix = nowU;
+        try
+        {
+            string vbs = Path.Combine(RepoRoot(), "scripts", "start_all_hidden.vbs");
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = "wscript.exe";
+            psi.Arguments = "\"" + vbs + "\"";
+            psi.WorkingDirectory = RepoRoot();
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            System.Diagnostics.Process.Start(psi);
+            System.Diagnostics.Debug.WriteLine("[FleetCockpit] RunStartAll: launched " + vbs);
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                if (!Dispatcher.HasShutdownStarted)
+                    Dispatcher.BeginInvoke(new Action(delegate { if (_fixNote != null) _fixNote.Text = T("hs_fix_err") + ": " + ex.Message; }));
+            }
+            catch (Exception) { }
         }
     }
 
