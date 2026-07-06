@@ -43,6 +43,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 DELETE_LOG = REPO / ".fleet" / "delete_log.jsonl"
+FLEET_CONVS_PATH = REPO / ".fleet" / "conversations.json"
 GUID_RE = re.compile(r"/conversation/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
 # A bare GUID (not URL-embedded) -- e.g. a sidebar row's id/conversationId, as found live on
 # the ?titleId=... general-chat page shape (see SESSREF_PREFIX below for why this matters).
@@ -132,6 +133,142 @@ def _log_delete(guid, title, ok, reason):
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+# ── unify-the-view: register bridge sessions into .fleet/conversations.json ────────────────
+# relay/fleet_runner.py's _register_convs (~line 1026) is the ONE existing writer of this file
+# today (fleet workers only, source="fleet"); FleetCockpit's (C#) history viewer reads it as-is.
+# We add ourselves as a SECOND, concurrent writer (source="chat") in fleet_runner's exact entry
+# shape, so the cockpit shows bridge/chat sessions too with zero C# change. fleet_runner
+# rewrites the whole file at run end, so every write here must be atomic (tmp+os.replace) and
+# merge-dedup against whatever is on disk AT WRITE TIME (read-modify-write, not blind append),
+# and must tolerate the file being briefly absent, non-list, or corrupt mid-rewrite by the other
+# writer -- never raise out of a chat turn over this.
+
+def merge_fleet_conversations(existing, new_entries):
+    """PURE merge/dedup function: list-in/list-out, no file I/O (fully unit-testable).
+
+    `existing` -- whatever was just read from .fleet/conversations.json (should be a list of
+    dicts, but may be anything if the file is corrupt/foreign-shaped -- non-dict/malformed
+    items are dropped rather than raising).
+    `new_entries` -- the entries we want present, in fleet_runner's exact shape:
+        {"url": str, "title": str, "source": "chat", "transcript": str, "name": str, "ts": float}
+
+    Dedup mirrors fleet_runner._register_convs: keyed by "url" when non-empty. Entries whose
+    url is "" (a sess:<guid> session has no real navigable URL) cannot be deduped by url, so
+    they are instead deduped by ("source", "name") -- our own sid is unique per session, so this
+    never collides with a real fleet worker entry (fleet entries always carry a name like "w0"
+    but source=="fleet", never "chat"). An existing entry for the same key is UPDATED in place
+    (so re-registering after a later conv_url capture refreshes the row) rather than duplicated.
+    Returns the merged list (existing entries not touched by new_entries are preserved
+    untouched, including foreign/other-source shapes)."""
+    clean = [e for e in (existing or []) if isinstance(e, dict)]
+    by_url = {}
+    by_source_name = {}
+    for idx, e in enumerate(clean):
+        u = e.get("url") or ""
+        if u:
+            by_url[u] = idx
+        else:
+            key = (e.get("source"), e.get("name"))
+            by_source_name[key] = idx
+    for entry in (new_entries or []):
+        if not isinstance(entry, dict):
+            continue
+        u = entry.get("url") or ""
+        if u and u in by_url:
+            clean[by_url[u]] = entry
+            continue
+        if not u:
+            key = (entry.get("source"), entry.get("name"))
+            if key in by_source_name:
+                clean[by_source_name[key]] = entry
+                continue
+            by_source_name[key] = len(clean)
+            clean.append(entry)
+            continue
+        by_url[u] = len(clean)
+        clean.append(entry)
+    return clean
+
+
+def _read_fleet_conversations_raw():
+    """Best-effort read of .fleet/conversations.json -> list, or [] on any problem (missing
+    file, non-list JSON, corrupt JSON). Never raises. BOM-tolerant (fleet_runner's own C#-side
+    consumer note: 'tolerate C# BOM')."""
+    try:
+        if not FLEET_CONVS_PATH.is_file():
+            return []
+        with open(FLEET_CONVS_PATH, "r", encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, list) else []
+    except Exception:
+        logger.warning("fleet conversations.json unreadable/corrupt; skipping merge", exc_info=True)
+        return []
+
+
+def _write_fleet_conversations_atomic(entries):
+    """Atomic tmp+os.replace write of the FULL entries list. Never raises (a registration
+    hiccup must never crash a chat turn)."""
+    try:
+        FLEET_CONVS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = str(FLEET_CONVS_PATH) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(entries, fh, ensure_ascii=False)
+        os.replace(tmp, str(FLEET_CONVS_PATH))
+    except Exception:
+        logger.warning("fleet conversations.json write failed; skipping registration", exc_info=True)
+
+
+def register_bridge_session_in_fleet_convs(sid, title, conv_url, transcript_rel):
+    """Register/refresh ONE bridge session as a "chat" entry in .fleet/conversations.json,
+    in fleet_runner._register_convs's exact shape. Called from _persist_exchange whenever a
+    session first gains (or refreshes) a non-empty conv_url. url is the raw conversation URL
+    when known, else "" for a sess:<guid> reference (NOT a url -- cockpit tolerates empty urls
+    today, see .fleet/status.json precedent). Read-merge-write is used (not blind append) so a
+    concurrent fleet_runner rewrite between our read and write only risks losing OUR OWN entry
+    to a benign re-registration next turn, never corrupting the file or the other writer's rows.
+    Exception-guarded end-to-end; logs are ASCII-only."""
+    try:
+        kind = classify_conv_ref(conv_url)
+        url_field = conv_url if kind == "conv_url" else ""
+        entry = {
+            "url": url_field,
+            "title": (title or sid)[:60],
+            "source": "chat",
+            "transcript": transcript_rel or "",
+            "name": sid,
+            "ts": time.time(),
+        }
+        existing = _read_fleet_conversations_raw()
+        merged = merge_fleet_conversations(existing, [entry])
+        _write_fleet_conversations_atomic(merged)
+    except Exception:
+        logger.warning("register_bridge_session_in_fleet_convs failed for sid=%s", sid, exc_info=True)
+
+
+def _load_fleet_sessions_view():
+    """Read .fleet/conversations.json and map entries whose source != "chat" (i.e. genuine
+    fleet-registered conversations, not our own chat rows already covered by S.list_sessions())
+    into the /sessions?all=1 shape: {"sid":"", "title":..., "conv_url":..., "last_active_ts":...,
+    "turns": None, "source": "fleet"}. Pure w.r.t. the filesystem read (no PAGE access) -- read-
+    only, best-effort, never raises; returns [] on any problem."""
+    out = []
+    for e in _read_fleet_conversations_raw():
+        if not isinstance(e, dict):
+            continue
+        if e.get("source") == "chat":
+            continue
+        out.append({
+            "sid": "",
+            "title": e.get("title") or e.get("name") or "",
+            "conv_url": e.get("url") or "",
+            "last_active_ts": e.get("ts") or 0,
+            "turns": None,
+            "source": "fleet",
+        })
+    return out
+
 
 from dotenv import load_dotenv
 from relay.copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver, PROCESSING_MARKERS
@@ -945,7 +1082,14 @@ def _persist_exchange(sid, user_msg, final_text):
                 logger.warning(
                     "conversation capture ambiguous for sid=%s; conv_url left empty "
                     "(no changed/new guid vs baseline)", sid)
-            S.touch(sid, **fields)
+            new_sess = S.touch(sid, **fields)
+            if ref:
+                # This session just gained a non-empty conv_url for the first time --
+                # register/refresh it in .fleet/conversations.json so FleetCockpit's
+                # existing history viewer shows it too (source="chat"), with zero C#
+                # change. Best-effort/exception-guarded inside the helper itself.
+                register_bridge_session_in_fleet_convs(
+                    sid, new_sess.get("title") or "", ref, new_sess.get("transcript") or "")
     except Exception:
         logger.warning("session persistence failed for sid=%s", sid, exc_info=True)
 
@@ -2170,11 +2314,27 @@ class Handler(BaseHTTPRequestHandler):
                 PAGE_LOCK.release()
             return
         if parsed.path == "/sessions":     # list known sessions (newest-first, capped)
+            qs = urllib.parse.parse_qs(parsed.query)
+            want_all = (qs.get("all") or [""])[0] in ("1", "true", "True")
             try:
                 sessions = S.list_sessions()[:50]
+                for s in sessions:
+                    s.setdefault("source", "chat")
+                if want_all:
+                    sessions = sessions + _load_fleet_sessions_view()
+                    sessions.sort(key=lambda s: s.get("last_active_ts", 0), reverse=True)
+                    sessions = sessions[:50]
             except Exception as e:
                 self._json({"ok": False, "error": str(e)}); return
             self._json({"sessions": sessions})
+            return
+        if parsed.path == "/adopt":        # adopt an external (typically fleet) conversation
+            if not PAGE_LOCK.acquire(blocking=False):
+                self._json({"ok": False, "error": "busy"}); return
+            try:
+                run_on_page_thread(self._do_adopt, parsed)
+            finally:
+                PAGE_LOCK.release()
             return
         if parsed.path == "/resume":       # reattach to a known session by sid
             if not PAGE_LOCK.acquire(blocking=False):
@@ -2278,6 +2438,51 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json({"ok": False, "error": str(e)}); return
         self._json({"ok": ok, "url": PAGE.url})
+
+    def _do_adopt(self, parsed):
+        """GET /adopt?url=<urlencoded>&title=<t> -- adopt an EXTERNAL conversation
+        (typically a fleet one, from .fleet/conversations.json) into a brand-new
+        interactive session. Navigates via the existing _goto_settled machinery (the
+        same recovery path /switch and /resume's conv_url branch already use -- no new
+        navigation logic), then tries to capture the sidebar's aria-current guid so
+        future resumes use the fast/verified sess:<guid> path; falls back to the raw
+        URL (still resumable via _do_resume's kind=="conv_url" branch -> _goto_settled)
+        if no guid can be confirmed. Returns {"ok":true,"sid":...,"ref_kind":"guid"|"url"}
+        or {"ok":false,"error":...}."""
+        global ACTIVE_SID
+        qs = urllib.parse.parse_qs(parsed.query)
+        url = (qs.get("url") or [""])[0]
+        title = (qs.get("title") or [""])[0]
+        if not url:
+            self._json({"ok": False, "error": "missing url"}); return
+        try:
+            _reap_orphan_tabs()
+            ok = _goto_settled(url)
+        except Exception as e:
+            self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}); return
+        if not ok:
+            self._json({"ok": False, "error": "navigation did not settle on the conversation"})
+            return
+        # A URL-opened conversation should mark its sidebar row aria-current="page" --
+        # reuse the existing capture helper (no new DOM logic). Best-effort: absence of
+        # a guid is not a failure, just a less-durable stored reference.
+        guid = ""
+        try:
+            guid = _current_row_guid()
+        except Exception:
+            guid = ""
+        ref_kind = "guid" if guid else "url"
+        conv_ref = make_sessref(guid) if guid else url
+        sess = S.new_session(title=title or "")
+        sid = sess["sid"]
+        new_sess = S.touch(sid, conv_url=conv_ref, status="active", source="chat")
+        ACTIVE_SID = sid
+        # This session gained a non-empty conv_url immediately (not via the normal
+        # exchange path) -- register it into .fleet/conversations.json the same way
+        # _persist_exchange does, so it shows up in FleetCockpit's history viewer too.
+        register_bridge_session_in_fleet_convs(
+            sid, new_sess.get("title") or "", conv_ref, new_sess.get("transcript") or "")
+        self._json({"ok": True, "sid": sid, "ref_kind": ref_kind})
 
     def _do_resume(self, parsed):
         global ACTIVE_SID

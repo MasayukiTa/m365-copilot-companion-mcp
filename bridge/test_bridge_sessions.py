@@ -496,3 +496,315 @@ def test_active_sid_starts_none_at_import():
 
 def test_sessref_prefix_constant():
     assert B.SESSREF_PREFIX == "sess:"
+
+
+# ── unify-the-view: merge_fleet_conversations (pure merge/dedup) ────────────────────────────
+# Mirrors relay/fleet_runner.py's _register_convs dedup semantics (keyed by "url") plus the
+# bridge's own extension for empty-url ("sess:<guid>") entries, keyed by (source, name) instead.
+
+def test_merge_into_empty_existing():
+    entry = {"url": "https://x/conversation/abc", "title": "t", "source": "chat",
+              "transcript": "sessions/s1.jsonl", "name": "s1", "ts": 1.0}
+    merged = B.merge_fleet_conversations([], [entry])
+    assert merged == [entry]
+
+
+def test_merge_dedup_by_url_updates_in_place():
+    old = {"url": "https://x/conversation/abc", "title": "old", "source": "chat",
+           "transcript": "sessions/s1.jsonl", "name": "s1", "ts": 1.0}
+    new = {"url": "https://x/conversation/abc", "title": "new", "source": "chat",
+           "transcript": "sessions/s1.jsonl", "name": "s1", "ts": 2.0}
+    merged = B.merge_fleet_conversations([old], [new])
+    assert merged == [new]
+    assert len(merged) == 1
+
+
+def test_merge_preserves_untouched_existing_entries():
+    fleet_entry = {"url": "https://x/conversation/fleet1", "title": "fleet", "source": "fleet",
+                   "transcript": "", "name": "w0", "ts": 1.0}
+    chat_entry = {"url": "https://x/conversation/chat1", "title": "chat", "source": "chat",
+                  "transcript": "sessions/s1.jsonl", "name": "s1", "ts": 2.0}
+    merged = B.merge_fleet_conversations([fleet_entry], [chat_entry])
+    assert fleet_entry in merged
+    assert chat_entry in merged
+    assert len(merged) == 2
+
+
+def test_merge_empty_url_entries_dedup_by_source_and_name_not_url():
+    """A sess:<guid> session has NO real url (url==""), so it can't be deduped by url --
+    it must be keyed by (source, name) instead, and never collide with a real fleet row
+    (fleet entries carry source=="fleet", never "chat")."""
+    old = {"url": "", "title": "old title", "source": "chat", "transcript": "sessions/s1.jsonl",
+           "name": "s1", "ts": 1.0}
+    new = {"url": "", "title": "new title", "source": "chat", "transcript": "sessions/s1.jsonl",
+           "name": "s1", "ts": 2.0}
+    merged = B.merge_fleet_conversations([old], [new])
+    assert merged == [new]
+    assert len(merged) == 1
+
+
+def test_merge_two_different_empty_url_entries_both_kept():
+    e1 = {"url": "", "title": "a", "source": "chat", "transcript": "", "name": "s1", "ts": 1.0}
+    e2 = {"url": "", "title": "b", "source": "chat", "transcript": "", "name": "s2", "ts": 2.0}
+    merged = B.merge_fleet_conversations([e1], [e2])
+    assert e1 in merged
+    assert e2 in merged
+    assert len(merged) == 2
+
+
+def test_merge_drops_non_dict_existing_items():
+    """Corrupt/foreign-shaped items in the existing list (e.g. from a shape mismatch) are
+    dropped rather than raising."""
+    merged = B.merge_fleet_conversations(["not-a-dict", None, 42], [])
+    assert merged == []
+
+
+def test_merge_skips_non_dict_new_entries():
+    good = {"url": "https://x/1", "title": "t", "source": "chat", "transcript": "",
+            "name": "s1", "ts": 1.0}
+    merged = B.merge_fleet_conversations([], [good, "garbage", None])
+    assert merged == [good]
+
+
+def test_merge_new_entries_empty_list_returns_existing_unchanged():
+    existing = [{"url": "https://x/1", "title": "t", "source": "fleet", "transcript": "",
+                 "name": "w0", "ts": 1.0}]
+    merged = B.merge_fleet_conversations(existing, [])
+    assert merged == existing
+
+
+def test_merge_both_empty():
+    assert B.merge_fleet_conversations([], []) == []
+
+
+def test_merge_none_args_tolerated():
+    assert B.merge_fleet_conversations(None, None) == []
+
+
+# ── unify-the-view: file I/O helpers (hermetic via monkeypatched FLEET_CONVS_PATH) ──────────
+
+def test_read_fleet_conversations_missing_file_returns_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(B, "FLEET_CONVS_PATH", tmp_path / "conversations.json")
+    assert B._read_fleet_conversations_raw() == []
+
+
+def test_read_fleet_conversations_corrupt_json_returns_empty(tmp_path, monkeypatch):
+    p = tmp_path / "conversations.json"
+    p.write_text("{not valid json", encoding="utf-8")
+    monkeypatch.setattr(B, "FLEET_CONVS_PATH", p)
+    assert B._read_fleet_conversations_raw() == []
+
+
+def test_read_fleet_conversations_non_list_json_returns_empty(tmp_path, monkeypatch):
+    p = tmp_path / "conversations.json"
+    p.write_text('{"not": "a list"}', encoding="utf-8")
+    monkeypatch.setattr(B, "FLEET_CONVS_PATH", p)
+    assert B._read_fleet_conversations_raw() == []
+
+
+def test_read_fleet_conversations_tolerates_bom(tmp_path, monkeypatch):
+    """fleet_runner's own comment notes 'tolerate C# BOM' -- verify the bridge reader does too."""
+    import json as _json
+    p = tmp_path / "conversations.json"
+    entries = [{"url": "https://x/1", "title": "t", "source": "fleet", "transcript": "",
+                "name": "w0", "ts": 1.0}]
+    p.write_bytes(b"\xef\xbb\xbf" + _json.dumps(entries).encode("utf-8"))
+    monkeypatch.setattr(B, "FLEET_CONVS_PATH", p)
+    assert B._read_fleet_conversations_raw() == entries
+
+
+def test_write_then_read_roundtrip(tmp_path, monkeypatch):
+    p = tmp_path / "sub" / "conversations.json"   # parent dir does not exist yet
+    monkeypatch.setattr(B, "FLEET_CONVS_PATH", p)
+    entries = [{"url": "https://x/1", "title": "t", "source": "chat", "transcript": "",
+                "name": "s1", "ts": 1.0}]
+    B._write_fleet_conversations_atomic(entries)
+    assert B._read_fleet_conversations_raw() == entries
+
+
+def test_write_atomic_leaves_no_tmp_file_behind(tmp_path, monkeypatch):
+    p = tmp_path / "conversations.json"
+    monkeypatch.setattr(B, "FLEET_CONVS_PATH", p)
+    B._write_fleet_conversations_atomic([{"url": "", "title": "", "source": "chat",
+                                            "transcript": "", "name": "s1", "ts": 1.0}])
+    assert not (tmp_path / "conversations.json.tmp").exists()
+
+
+def test_write_atomic_never_raises_on_bad_target(monkeypatch):
+    """Point at an unwritable path (a directory, not a file) -- the helper must swallow the
+    error rather than propagate it (a registration hiccup must never crash a chat turn)."""
+    import pathlib
+    monkeypatch.setattr(B, "FLEET_CONVS_PATH", pathlib.Path("Z:\\definitely\\not\\a\\real\\drive\\conversations.json"))
+    B._write_fleet_conversations_atomic([{"url": "x"}])  # must not raise
+
+
+# ── unify-the-view: register_bridge_session_in_fleet_convs (ref-kind routing + end-to-end) ──
+
+def test_register_bridge_session_sessref_stores_empty_url(tmp_path, monkeypatch):
+    """A sess:<guid> conv_url is NOT a real url -- the registered entry's url field must be
+    "" (cockpit tolerates empty urls per .fleet/status.json precedent), never the sess: string
+    itself (that would look like a navigable url to a naive consumer)."""
+    p = tmp_path / "conversations.json"
+    monkeypatch.setattr(B, "FLEET_CONVS_PATH", p)
+    ref = B.make_sessref("9374821f-6bff-4050-b6fd-8a4338013664")
+    B.register_bridge_session_in_fleet_convs("s1", "My Title", ref, "sessions/s1.jsonl")
+    rows = B._read_fleet_conversations_raw()
+    assert len(rows) == 1
+    assert rows[0]["url"] == ""
+    assert rows[0]["source"] == "chat"
+    assert rows[0]["name"] == "s1"
+    assert rows[0]["transcript"] == "sessions/s1.jsonl"
+    assert rows[0]["title"] == "My Title"
+
+
+def test_register_bridge_session_conv_url_stores_real_url(tmp_path, monkeypatch):
+    """A real /conversation/<guid> URL IS stored verbatim in the url field (durable,
+    directly navigable by _goto_settled)."""
+    p = tmp_path / "conversations.json"
+    monkeypatch.setattr(B, "FLEET_CONVS_PATH", p)
+    url = "https://m365.cloud.microsoft/chat/agent/T_x/conversation/9374821f-6bff-4050-b6fd-8a4338013664"
+    B.register_bridge_session_in_fleet_convs("s1", "t", url, "sessions/s1.jsonl")
+    rows = B._read_fleet_conversations_raw()
+    assert rows[0]["url"] == url
+
+
+def test_register_bridge_session_bare_url_stores_empty_url(tmp_path, monkeypatch):
+    """A bare_url (real URL but no /conversation/<guid>, e.g. an SSO-bounce landing) is not
+    reliably reattachable by URL either -- treated the same as sessref: url field empty."""
+    p = tmp_path / "conversations.json"
+    monkeypatch.setattr(B, "FLEET_CONVS_PATH", p)
+    B.register_bridge_session_in_fleet_convs(
+        "s1", "t", "https://m365.cloud.microsoft/chat/?redirfrom=CsrToSSR&auth=2", "sessions/s1.jsonl")
+    rows = B._read_fleet_conversations_raw()
+    assert rows[0]["url"] == ""
+
+
+def test_register_bridge_session_title_truncated_to_60_chars(tmp_path, monkeypatch):
+    p = tmp_path / "conversations.json"
+    monkeypatch.setattr(B, "FLEET_CONVS_PATH", p)
+    long_title = "x" * 200
+    B.register_bridge_session_in_fleet_convs("s1", long_title, "", "")
+    rows = B._read_fleet_conversations_raw()
+    assert len(rows[0]["title"]) == 60
+
+
+def test_register_bridge_session_falls_back_to_sid_when_title_empty(tmp_path, monkeypatch):
+    p = tmp_path / "conversations.json"
+    monkeypatch.setattr(B, "FLEET_CONVS_PATH", p)
+    B.register_bridge_session_in_fleet_convs("s1", "", B.make_sessref("9374821f-6bff-4050-b6fd-8a4338013664"), "")
+    rows = B._read_fleet_conversations_raw()
+    assert rows[0]["title"] == "s1"
+
+
+def test_register_bridge_session_re_registration_updates_not_duplicates(tmp_path, monkeypatch):
+    """Calling register twice for the SAME sid (e.g. re-registered on a later turn) must
+    refresh the one row, not append a second one."""
+    p = tmp_path / "conversations.json"
+    monkeypatch.setattr(B, "FLEET_CONVS_PATH", p)
+    ref = B.make_sessref("9374821f-6bff-4050-b6fd-8a4338013664")
+    B.register_bridge_session_in_fleet_convs("s1", "first", ref, "sessions/s1.jsonl")
+    B.register_bridge_session_in_fleet_convs("s1", "second", ref, "sessions/s1.jsonl")
+    rows = B._read_fleet_conversations_raw()
+    assert len(rows) == 1
+    assert rows[0]["title"] == "second"
+
+
+def test_register_bridge_session_preserves_existing_fleet_entries(tmp_path, monkeypatch):
+    """Registering a chat session must not disturb a pre-existing fleet-source entry --
+    the two writers (fleet_runner.py and this bridge) must coexist in the same file."""
+    p = tmp_path / "conversations.json"
+    fleet_entry = {"url": "https://x/conversation/fleet1", "title": "fleet job",
+                   "source": "fleet", "transcript": "", "name": "w0", "ts": 1.0}
+    import json as _json
+    p.write_text(_json.dumps([fleet_entry]), encoding="utf-8")
+    monkeypatch.setattr(B, "FLEET_CONVS_PATH", p)
+    B.register_bridge_session_in_fleet_convs("s1", "chat title", "", "sessions/s1.jsonl")
+    rows = B._read_fleet_conversations_raw()
+    assert fleet_entry in rows
+    assert any(r.get("source") == "chat" and r.get("name") == "s1" for r in rows)
+
+
+def test_register_bridge_session_never_raises_on_write_failure(monkeypatch):
+    import pathlib
+    monkeypatch.setattr(B, "FLEET_CONVS_PATH",
+                         pathlib.Path("Z:\\definitely\\not\\a\\real\\drive\\conversations.json"))
+    B.register_bridge_session_in_fleet_convs("s1", "t", "", "")  # must not raise
+
+
+# ── unify-the-view: _load_fleet_sessions_view (pure /sessions?all=1 mapping) ────────────────
+
+def test_load_fleet_sessions_view_maps_fleet_entries(tmp_path, monkeypatch):
+    p = tmp_path / "conversations.json"
+    entry = {"url": "https://x/conversation/abc", "title": "fleet job", "source": "fleet",
+              "transcript": "", "name": "w0", "ts": 123.0}
+    import json as _json
+    p.write_text(_json.dumps([entry]), encoding="utf-8")
+    monkeypatch.setattr(B, "FLEET_CONVS_PATH", p)
+    view = B._load_fleet_sessions_view()
+    assert view == [{"sid": "", "title": "fleet job", "conv_url": "https://x/conversation/abc",
+                      "last_active_ts": 123.0, "turns": None, "source": "fleet"}]
+
+
+def test_load_fleet_sessions_view_excludes_chat_entries():
+    """source=="chat" entries are the bridge's OWN sessions -- already covered by
+    S.list_sessions(), so /sessions?all=1 must not double-list them via this path."""
+    pass  # covered end-to-end below via monkeypatched file content
+
+
+def test_load_fleet_sessions_view_excludes_chat_source(tmp_path, monkeypatch):
+    p = tmp_path / "conversations.json"
+    chat_entry = {"url": "", "title": "chat sess", "source": "chat", "transcript": "",
+                  "name": "s1", "ts": 1.0}
+    fleet_entry = {"url": "https://x/1", "title": "fleet job", "source": "fleet",
+                   "transcript": "", "name": "w0", "ts": 2.0}
+    import json as _json
+    p.write_text(_json.dumps([chat_entry, fleet_entry]), encoding="utf-8")
+    monkeypatch.setattr(B, "FLEET_CONVS_PATH", p)
+    view = B._load_fleet_sessions_view()
+    assert len(view) == 1
+    assert view[0]["title"] == "fleet job"
+
+
+def test_load_fleet_sessions_view_falls_back_to_name_when_no_title(tmp_path, monkeypatch):
+    p = tmp_path / "conversations.json"
+    entry = {"url": "https://x/1", "title": "", "source": "fleet", "transcript": "",
+             "name": "w3", "ts": 1.0}
+    import json as _json
+    p.write_text(_json.dumps([entry]), encoding="utf-8")
+    monkeypatch.setattr(B, "FLEET_CONVS_PATH", p)
+    view = B._load_fleet_sessions_view()
+    assert view[0]["title"] == "w3"
+
+
+def test_load_fleet_sessions_view_empty_when_file_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(B, "FLEET_CONVS_PATH", tmp_path / "conversations.json")
+    assert B._load_fleet_sessions_view() == []
+
+
+def test_load_fleet_sessions_view_drops_non_dict_items(tmp_path, monkeypatch):
+    p = tmp_path / "conversations.json"
+    import json as _json
+    p.write_text(_json.dumps(["garbage", None, 42]), encoding="utf-8")
+    monkeypatch.setattr(B, "FLEET_CONVS_PATH", p)
+    assert B._load_fleet_sessions_view() == []
+
+
+# ── unify-the-view: classify_conv_ref-based ref-kind routing decision (used by /adopt and
+# by register_bridge_session_in_fleet_convs's url_field choice) ─────────────────────────────
+
+def test_ref_kind_routing_sessref_is_not_url_field():
+    ref = B.make_sessref("9374821f-6bff-4050-b6fd-8a4338013664")
+    assert B.classify_conv_ref(ref) == "sessref"
+
+
+def test_ref_kind_routing_conv_url_is_url_field():
+    url = "https://m365.cloud.microsoft/chat/agent/T_x/conversation/9374821f-6bff-4050-b6fd-8a4338013664"
+    assert B.classify_conv_ref(url) == "conv_url"
+
+
+def test_ref_kind_routing_bare_url_is_not_conv_url():
+    """A bare_url (real URL, no /conversation/<guid>) must NOT be routed the same as a real
+    conv_url -- it is not reliably re-navigable to the SAME conversation."""
+    url = "https://m365.cloud.microsoft/chat/?redirfrom=CsrToSSR&auth=2"
+    assert B.classify_conv_ref(url) == "bare_url"
+    assert B.classify_conv_ref(url) != "conv_url"
