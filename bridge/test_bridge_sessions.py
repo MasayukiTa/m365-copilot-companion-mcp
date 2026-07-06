@@ -157,6 +157,31 @@ def test_drain_pending_once_default_pop_fn_uses_session_store(monkeypatch):
     assert calls == ["sid-xyz"]
 
 
+# ── single-instance guard ───────────────────────────────────────────────────────────────────
+
+def test_single_bind_server_disables_reuse():
+    """allow_reuse_address must be False: the inherited default (1 -> SO_REUSEADDR) lets a
+    SECOND bridge silently bind the same port on Windows (two live bridges then get random
+    request dispatch: resume lands on one, the next send on the other)."""
+    assert B._SingleBindHTTPServer.allow_reuse_address is False
+
+
+def test_port_already_served_detects_listener():
+    """Loopback-only socket check (hermetic: no external network). A live local listener
+    must be detected; after it closes the same port must read as free."""
+    import socket as _socket
+
+    srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    try:
+        assert B._port_already_served(port) is True
+    finally:
+        srv.close()
+    assert B._port_already_served(port) is False
+
+
 # ── module-level sanity (import-safety / constants) ─────────────────────────────────────────
 
 def test_active_sid_starts_none_at_import():
