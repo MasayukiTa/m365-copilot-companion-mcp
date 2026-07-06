@@ -65,6 +65,13 @@ def _mk_session(sid, title="", last_active_ts=0, turns=0, status="active"):
     }
 
 
+def _mk_fleet(conv_url="", title="", last_active_ts=0, turns=None, status="active"):
+    return {
+        "sid": "", "source": "fleet", "conv_url": conv_url, "title": title,
+        "last_active_ts": last_active_ts, "turns": turns, "status": status,
+    }
+
+
 def test_render_picker_empty():
     assert "no sessions" in cli.render_picker([]).lower()
 
@@ -108,6 +115,45 @@ def test_resolve_picker_choice_out_of_range():
     assert cli.resolve_picker_choice("5", sessions) is None
     assert cli.resolve_picker_choice("nope", sessions) is None
     assert cli.resolve_picker_choice("", sessions) is None
+
+
+# --------------------------------------------------------------------------
+# unified (chat + fleet) picker rendering
+# --------------------------------------------------------------------------
+
+def test_is_adoptable_chat_session_always_true():
+    assert cli.is_adoptable(_mk_session("s1")) is True
+
+
+def test_is_adoptable_fleet_with_url_true():
+    assert cli.is_adoptable(_mk_fleet(conv_url="https://example/conv/1")) is True
+
+
+def test_is_adoptable_fleet_without_url_false():
+    assert cli.is_adoptable(_mk_fleet(conv_url="")) is False
+
+
+def test_render_picker_tags_source_and_flags_not_adoptable():
+    now = 10000.0
+    sessions = [
+        _mk_session("s1", title="chat one", last_active_ts=now - 60, turns=3),
+        _mk_fleet(conv_url="https://x/conv/9", title="fleet one", last_active_ts=now - 120, turns=None),
+        _mk_fleet(conv_url="", title="fleet no url", last_active_ts=now - 200),
+    ]
+    out = cli.render_picker(sessions, now=now)
+    lines = out.splitlines()
+    assert len(lines) == 3
+    assert "[chat]" not in lines[0]  # chat rows are untagged (source may be absent)
+    assert "chat one" in lines[0]
+    assert lines[1].strip().startswith("2.")
+    assert "[fleet]" in lines[1]
+    assert "fleet one" in lines[1]
+    assert "? turns" in lines[1]   # turns may be null for fleet rows
+    assert "not adoptable" not in lines[1]
+    assert lines[2].strip().startswith("3.")
+    assert "[fleet]" in lines[2]
+    assert "fleet no url" in lines[2]
+    assert "(not adoptable)" in lines[2]
 
 
 # --------------------------------------------------------------------------
@@ -206,6 +252,19 @@ def test_arg_parser_continue_and_resume_mutually_exclusive():
         p.parse_args(["-c", "-r"])
 
 
+def test_arg_parser_chat_only_default_false_and_flag():
+    p = cli.build_arg_parser()
+    assert p.parse_args([]).chat_only is False
+    assert p.parse_args(["--chat-only"]).chat_only is True
+
+
+def test_arg_parser_chat_only_combines_with_resume():
+    p = cli.build_arg_parser()
+    args = p.parse_args(["--resume", "--chat-only"])
+    assert args.resume is True
+    assert args.chat_only is True
+
+
 def test_help_exits_zero(capsys):
     p = cli.build_arg_parser()
     with pytest.raises(SystemExit) as exc:
@@ -222,14 +281,20 @@ def test_help_exits_zero(capsys):
 class FakeClient:
     """Stand-in for BridgeClient; records calls, returns canned data."""
 
-    def __init__(self, sessions=None, resume_ok=True, goal_lines=None):
+    def __init__(self, sessions=None, resume_ok=True, goal_lines=None,
+                 all_sessions=None, adopt_result=None):
         self._sessions = sessions if sessions is not None else []
+        # unified (chat+fleet) listing for list_sessions_all(); defaults to
+        # the plain chat sessions if the test doesn't care about fleet rows.
+        self._all_sessions = all_sessions if all_sessions is not None else list(self._sessions)
         self.resume_calls = []
         self.new_calls = []
         self.send_calls = []
+        self.adopt_calls = []
         self.stop_calls = 0
         self._resume_ok = resume_ok
         self._goal_lines = goal_lines or []
+        self._adopt_result = adopt_result if adopt_result is not None else {"ok": True, "sid": "adopted-sid", "ref_kind": "guid"}
 
     def is_up(self):
         return True
@@ -237,9 +302,16 @@ class FakeClient:
     def list_sessions(self):
         return list(self._sessions)
 
+    def list_sessions_all(self):
+        return list(self._all_sessions)
+
     def resume(self, sid):
         self.resume_calls.append(sid)
         return {"ok": self._resume_ok, "sid": sid}
+
+    def adopt(self, url, title=""):
+        self.adopt_calls.append((url, title))
+        return dict(self._adopt_result)
 
     def new_session(self, title=""):
         self.new_calls.append(title)
@@ -315,6 +387,92 @@ def test_do_sessions_renders_picker(capsys):
     assert result == sessions
     out = capsys.readouterr().out
     assert "alpha" in out
+
+
+# --------------------------------------------------------------------------
+# unified picker: /sessions and /resume against list_sessions_all(), adopt
+# flow for [fleet] rows, --chat-only fallback to plain list_sessions()
+# --------------------------------------------------------------------------
+
+def test_do_sessions_default_uses_unified_listing(capsys):
+    chat = [_mk_session("s1", title="chat one")]
+    unified = chat + [_mk_fleet(conv_url="https://x/1", title="fleet one")]
+    client = FakeClient(sessions=chat, all_sessions=unified)
+    result = cli._do_sessions(client)
+    assert result == unified
+    out = capsys.readouterr().out
+    assert "fleet one" in out
+    assert "[fleet]" in out
+
+
+def test_do_sessions_chat_only_uses_plain_listing(capsys):
+    chat = [_mk_session("s1", title="chat one")]
+    unified = chat + [_mk_fleet(conv_url="https://x/1", title="fleet one")]
+    client = FakeClient(sessions=chat, all_sessions=unified)
+    result = cli._do_sessions(client, chat_only=True)
+    assert result == chat
+    out = capsys.readouterr().out
+    assert "fleet one" not in out
+
+
+def test_do_resume_fleet_row_calls_adopt_not_resume(capsys):
+    sessions = [_mk_fleet(conv_url="https://x/conv/42", title="fleet convo")]
+    client = FakeClient(sessions=sessions)
+    cli._do_resume(client, "1", sessions)
+    assert client.resume_calls == []
+    assert client.adopt_calls == [("https://x/conv/42", "fleet convo")]
+    out = capsys.readouterr().out
+    assert "adopted fleet convo" in out.lower()
+
+
+def test_do_resume_fleet_row_not_adoptable_reprompts_with_reason(capsys):
+    sessions = [_mk_fleet(conv_url="", title="no url yet")]
+    client = FakeClient(sessions=sessions)
+    cli._do_resume(client, "1", sessions)
+    assert client.resume_calls == []
+    assert client.adopt_calls == []
+    out = capsys.readouterr().out.lower()
+    assert "not adoptable" in out
+    assert "no url yet" in out
+
+
+def test_do_resume_adopt_failure_reports_error(capsys):
+    sessions = [_mk_fleet(conv_url="https://x/conv/1", title="fleet convo")]
+    client = FakeClient(sessions=sessions, adopt_result={"ok": False, "error": "boom"})
+    cli._do_resume(client, "1", sessions)
+    out = capsys.readouterr().out.lower()
+    assert "adopt failed" in out
+    assert "boom" in out
+
+
+def test_do_resume_chat_row_still_uses_resume(capsys):
+    sessions = [_mk_session("s1", title="alpha")]
+    client = FakeClient(sessions=sessions)
+    cli._do_resume(client, "1", sessions)
+    assert client.resume_calls == ["s1"]
+    assert client.adopt_calls == []
+    out = capsys.readouterr().out.lower()
+    assert "resumed alpha" in out
+
+
+def test_do_resume_empty_cache_populates_from_unified_listing():
+    chat = []
+    unified = [_mk_fleet(conv_url="https://x/1", title="fleet one")]
+    client = FakeClient(sessions=chat, all_sessions=unified)
+    cache = []
+    cli._do_resume(client, "1", cache)
+    assert cache == unified
+    assert client.adopt_calls == [("https://x/1", "fleet one")]
+
+
+def test_do_resume_empty_cache_chat_only_populates_from_plain_listing():
+    chat = [_mk_session("s1", title="alpha")]
+    unified = chat + [_mk_fleet(conv_url="https://x/1", title="fleet one")]
+    client = FakeClient(sessions=chat, all_sessions=unified)
+    cache = []
+    cli._do_resume(client, "1", cache, chat_only=True)
+    assert cache == chat
+    assert client.resume_calls == ["s1"]
 
 
 # --------------------------------------------------------------------------
