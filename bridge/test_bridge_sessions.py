@@ -157,6 +157,74 @@ def test_drain_pending_once_default_pop_fn_uses_session_store(monkeypatch):
     assert calls == ["sid-xyz"]
 
 
+# ── select_changed_conv_guid (change-based capture selection) ───────────────────────────────
+# Real failure this logic exists for: after resume-to-A then /new + teach-in-B, the sidebar's
+# aria-current="page" marker REMAINED on A's row (the new conversation had no row yet), so a
+# stale-marker capture misattributed B's session to A's guid. Change-based selection accepts
+# only a guid that demonstrably changed/appeared vs the pre-send baseline.
+
+G_A = "decf9c53-2f18-4fc2-89b2-0c1eb69ba629"   # previously-open conversation (baseline cur)
+G_B = "aaaa1111-2222-3333-4444-555566667777"   # the newly created conversation
+G_C = "bbbb1111-2222-3333-4444-555566667777"   # another pre-existing conversation
+
+
+def test_select_stale_aria_current_rejected():
+    """The EXACT reproduced failure: aria-current still on the old conversation, new row not
+    yet present anywhere -> must return '' (ambiguous), NOT the stale guid."""
+    got = B.select_changed_conv_guid(G_A, {G_A, G_C}, G_A, {G_A, G_C})
+    assert got == ""
+
+
+def test_select_aria_current_moved_to_new_guid():
+    """Pane's aria-current moved to a row that did not exist at baseline -> accepted."""
+    got = B.select_changed_conv_guid(G_A, {G_A, G_C}, G_B, {G_A, G_B, G_C})
+    assert got == G_B
+
+
+def test_select_new_guid_appears_while_aria_current_stale():
+    """aria-current still stale on the old row, but exactly one brand-new guid appeared in
+    the known set (sidebar row / localStorage registered the new conversation) -> accepted."""
+    got = B.select_changed_conv_guid(G_A, {G_A, G_C}, G_A, {G_A, G_B, G_C})
+    assert got == G_B
+
+
+def test_select_multiple_new_guids_ambiguous():
+    g_d = "cccc1111-2222-3333-4444-555566667777"
+    got = B.select_changed_conv_guid(G_A, {G_A}, G_A, {G_A, G_B, g_d})
+    assert got == ""
+
+
+def test_select_aria_current_moved_to_known_old_guid_rejected():
+    """aria-current moved to a DIFFERENT but pre-existing conversation (not something this
+    send created) and no new guid appeared -> '' (never claim an old conversation)."""
+    got = B.select_changed_conv_guid(G_A, {G_A, G_C}, G_C, {G_A, G_C})
+    assert got == ""
+
+
+def test_select_empty_baseline_cur_new_conversation():
+    """Baseline from a truly bare pane (no aria-current guid): the first-ever conversation
+    appears and gets marked current -> accepted."""
+    got = B.select_changed_conv_guid("", {G_C}, G_B, {G_B, G_C})
+    assert got == G_B
+
+
+def test_select_no_change_at_all():
+    got = B.select_changed_conv_guid("", set(), "", set())
+    assert got == ""
+
+
+def test_select_baseline_cur_counts_as_known():
+    """baseline_cur is treated as known even if the caller forgot it in baseline_known."""
+    got = B.select_changed_conv_guid(G_A, set(), G_A, {G_A})
+    assert got == ""
+
+
+def test_select_dedupes_now_known():
+    """Duplicate observations of the same new guid (row + localStorage) are ONE candidate."""
+    got = B.select_changed_conv_guid(G_A, {G_A}, G_A, [G_B, G_B, G_A])
+    assert got == G_B
+
+
 # ── single-instance guard ───────────────────────────────────────────────────────────────────
 
 def test_single_bind_server_disables_reuse():
