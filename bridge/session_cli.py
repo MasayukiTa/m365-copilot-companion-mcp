@@ -28,8 +28,8 @@ import urllib.request
 DEFAULT_PORT = 8765
 HELP_TEXT = """\
 Commands:
-  /sessions          list known sessions
-  /resume <n|sid>    switch active session
+  /sessions          list known sessions (chat + fleet, unless --chat-only)
+  /resume <n|sid>    switch active session; picking a [fleet] row adopts it
   /new [title]       start a new session
   /goal <text>       work mode: autonomous multi-turn loop. Type while it
                      runs to steer (injected at the next turn boundary);
@@ -74,11 +74,19 @@ def session_label(sess: dict) -> str:
     return sess.get("sid", "?")
 
 
+def is_adoptable(sess: dict) -> bool:
+    """A [fleet] row needs a non-empty conv_url before it can be adopted."""
+    if sess.get("source") != "fleet":
+        return True
+    return bool(sess.get("conv_url"))
+
+
 def render_picker(sessions: list, now: float | None = None) -> str:
     """Render the numbered picker text for --resume / /sessions.
 
-    One line per session: index, label, relative time, turn count, status.
-    Index is 1-based to match what a user types back.
+    One line per session: index, source tag (when present), label, relative
+    time, turn count, status. Fleet rows without a conv_url are flagged as
+    not adoptable. Index is 1-based to match what a user types back.
     """
     if not sessions:
         return "(no sessions yet)"
@@ -86,9 +94,13 @@ def render_picker(sessions: list, now: float | None = None) -> str:
     for i, sess in enumerate(sessions, start=1):
         label = session_label(sess)
         rel = format_relative_time(sess.get("last_active_ts", 0), now)
-        turns = sess.get("turns", 0)
+        turns = sess.get("turns")
+        turns_str = f"{turns} turns" if turns is not None else "? turns"
         status = sess.get("status", "?")
-        lines.append(f"  {i}. {label}  ({rel}, {turns} turns, {status})")
+        source = sess.get("source")
+        tag = f"[{source}] " if source else ""
+        suffix = "" if is_adoptable(sess) else "  (not adoptable)"
+        lines.append(f"  {i}. {tag}{label}  ({rel}, {turns_str}, {status}){suffix}")
     return "\n".join(lines)
 
 
@@ -201,8 +213,18 @@ class BridgeClient:
         obj = json.loads(body.decode("utf-8"))
         return obj.get("sessions", [])
 
+    def list_sessions_all(self) -> list:
+        """Unified chat+fleet listing (GET /sessions?all=1)."""
+        body = self._get("/sessions", {"all": "1"})
+        obj = json.loads(body.decode("utf-8"))
+        return obj.get("sessions", [])
+
     def resume(self, sid: str) -> dict:
         body = self._get("/resume", {"sid": sid})
+        return json.loads(body.decode("utf-8"))
+
+    def adopt(self, url: str, title: str = "") -> dict:
+        body = self._get("/adopt", {"url": url, "title": title})
         return json.loads(body.decode("utf-8"))
 
     def new_session(self, title: str = "") -> dict:
@@ -271,6 +293,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                       help="auto-resume the most recent session immediately")
     grp.add_argument("--resume", "-r", dest="resume", action="store_true",
                       help="show a numbered picker of sessions to resume")
+    p.add_argument("--chat-only", dest="chat_only", action="store_true",
+                    help="restore the old bridge-only listing (plain /sessions, no fleet rows)")
     return p
 
 
@@ -436,9 +460,15 @@ class StdinReader:
             return item
 
 
-def _do_sessions(client: BridgeClient) -> list:
+def _list_sessions_for(client: BridgeClient, chat_only: bool) -> list:
+    if chat_only:
+        return client.list_sessions()
+    return client.list_sessions_all()
+
+
+def _do_sessions(client: BridgeClient, chat_only: bool = False) -> list:
     try:
-        sessions = client.list_sessions()
+        sessions = _list_sessions_for(client, chat_only)
     except Exception as e:
         print(f"[error listing sessions: {e}]")
         return []
@@ -446,12 +476,26 @@ def _do_sessions(client: BridgeClient) -> list:
     return sessions
 
 
-def _do_resume(client: BridgeClient, token: str, sessions_cache: list) -> None:
+def _do_resume(client: BridgeClient, token: str, sessions_cache: list, chat_only: bool = False) -> None:
     if not sessions_cache:
-        sessions_cache[:] = client.list_sessions()
+        sessions_cache[:] = _list_sessions_for(client, chat_only)
     chosen = resolve_picker_choice(token, sessions_cache)
     if chosen is None:
         print(f"[no such session: {token}]")
+        return
+    if not is_adoptable(chosen):
+        print(f"[{session_label(chosen)} has no conversation url yet; not adoptable]")
+        return
+    if chosen.get("source") == "fleet":
+        try:
+            result = client.adopt(chosen.get("conv_url", ""), session_label(chosen))
+        except Exception as e:
+            print(f"[error adopting: {e}]")
+            return
+        if result.get("ok"):
+            print(f"[adopted {session_label(chosen)}]")
+        else:
+            print(f"[adopt failed: {result.get('error', 'unknown error')}]")
         return
     try:
         result = client.resume(chosen["sid"])
@@ -476,7 +520,7 @@ def _do_new(client: BridgeClient, title: str) -> None:
         print(f"[new session failed: {result.get('error', 'unknown error')}]")
 
 
-def repl(client: BridgeClient, reader: StdinReader | None = None) -> None:
+def repl(client: BridgeClient, reader: StdinReader | None = None, chat_only: bool = False) -> None:
     reader = reader or StdinReader()
     print(HELP_TEXT)
     empty_ctrl_c = False
@@ -506,9 +550,9 @@ def repl(client: BridgeClient, reader: StdinReader | None = None) -> None:
             if cmd == "help":
                 print(HELP_TEXT)
             elif cmd == "sessions":
-                _do_sessions(client)
+                _do_sessions(client, chat_only=chat_only)
             elif cmd == "resume":
-                _do_resume(client, arg, [])
+                _do_resume(client, arg, [], chat_only=chat_only)
             elif cmd == "new":
                 _do_new(client, arg)
             elif cmd == "goal":
@@ -550,19 +594,21 @@ def main(argv=None) -> int:
         print("[could not reach bridge; giving up]")
         return 1
 
+    chat_only = args.chat_only
+
     if args.resume:
-        sessions = client.list_sessions()
+        sessions = _list_sessions_for(client, chat_only)
         print(render_picker(sessions))
         if sessions:
             token = input("resume which? (number, blank to cancel): ").strip()
             if token:
-                _do_resume(client, token, sessions)
+                _do_resume(client, token, sessions, chat_only=chat_only)
     elif args.cont:
         _print_banner_and_maybe_resume(client, auto_continue=True)
     else:
         _print_banner_and_maybe_resume(client, auto_continue=False)
 
-    repl(client)
+    repl(client, chat_only=chat_only)
     return 0
 
 
