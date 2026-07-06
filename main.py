@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse
+from starlette.responses import JSONResponse, PlainTextResponse
 
 from tools.archive_ops import zip_create, zip_extract, zip_list
 from tools.clipboard_ops import clipboard_get, clipboard_set
@@ -109,6 +109,7 @@ from tools.schedule_ops import (
 from tools.search_web import web_search, web_search_news
 from tools.sql_ops import sqlite_query, sqlite_schema, sqlite_tables, sqlite_to_excel
 from tools.watcher_ops import watcher_events, watcher_start, watcher_stop
+from tools.auth_stats import get_summary as _auth_stats_summary
 from tools.jobs import (
     job_kill,
     job_list,
@@ -163,14 +164,23 @@ mcp = FastMCP(
 )
 
 @mcp.custom_route("/health", methods=["GET"])
-async def health(_request: Request) -> PlainTextResponse:
+async def health(_request: Request) -> JSONResponse:
     """Liveness probe that NEVER touches a blocking tool.
 
     This async handler runs directly on the event loop and returns immediately, so the
     supervisor can distinguish "the loop is briefly busy running a heavy tool in a worker
     thread" (this still answers fast, because tool bodies are now offloaded) from "the
-    loop is actually dead". It does no auth and no I/O on purpose."""
-    return PlainTextResponse("ok")
+    loop is actually dead". It does no auth and does no blocking I/O on purpose (the
+    auth-failure summary below is an in-memory read of tools.auth_stats' module
+    singleton, not a file read).
+
+    Also surfaces auth_fail_10m / auth_fail_last_ts (see tools/auth_stats.py) so a
+    burst of 401s -- e.g. Copilot Studio's stored key desyncing from MCP_API_KEY --
+    is visible to the supervisor/cockpit without grepping logs. get_summary() never
+    raises, so this can't turn a healthy-loop probe into a 500."""
+    payload = {"status": "ok"}
+    payload.update(_auth_stats_summary())
+    return JSONResponse(payload)
 
 
 TOOLS = (
@@ -477,12 +487,22 @@ if __name__ == "__main__":
         This MUST wrap the finished app as the OUTERMOST ASGI layer: FastMCP inserts
         the auth (RequireAuth) middleware BEFORE anything passed via http_app(middleware=),
         so a header rewrite handed to that param would run too late (after auth already
-        401'd). Wrapping the returned app puts the rewrite ahead of auth."""
+        401'd). Wrapping the returned app puts the rewrite ahead of auth.
+
+        Being the outermost layer also makes this the one place that sees BOTH the
+        request (already normalised) and the final response status for /mcp -- so it
+        doubles as the observation point for tools.auth_stats: today's incident was
+        Copilot Studio's stored key desyncing from MCP_API_KEY, causing every /mcp
+        call to 401 with zero surfaced signal. record_response_start() below inspects
+        the outgoing "http.response.start" ASGI event for status 401 on the /mcp path
+        and calls tools.auth_stats.record_auth_failure(); everything is wrapped in
+        try/except so a bookkeeping bug can never break the real request/response."""
 
         def __init__(self, app):
             self.app = app
 
         async def __call__(self, scope, receive, send):
+            is_mcp_path = False
             if scope.get("type") == "http":
                 new_hdrs = []
                 changed = False
@@ -498,7 +518,25 @@ if __name__ == "__main__":
                 if changed:
                     scope = dict(scope)
                     scope["headers"] = new_hdrs
-            await self.app(scope, receive, send)
+                is_mcp_path = (scope.get("path") or "").startswith("/mcp")
+
+            if not is_mcp_path:
+                await self.app(scope, receive, send)
+                return
+
+            async def _send_and_observe(message):
+                # Observe the response status BEFORE forwarding it -- never delay or
+                # alter the real response. Any bookkeeping failure here must not
+                # prevent `send` from being called.
+                try:
+                    if message.get("type") == "http.response.start" and message.get("status") == 401:
+                        from tools.auth_stats import record_auth_failure
+                        record_auth_failure()
+                except Exception:
+                    pass
+                await send(message)
+
+            await self.app(scope, receive, _send_and_observe)
 
     app = mcp.http_app(path="/mcp", transport="streamable-http",
                        json_response=True, middleware=[Middleware(_AcceptBoth)])
