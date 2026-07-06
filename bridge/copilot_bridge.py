@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import re
+import socket
 import sys
 import time
 import urllib.parse
@@ -532,16 +533,50 @@ _INSIGHTS_JS = r"""
 """
 
 
+# The OPEN conversation's sidebar row carries aria-current="page" (confirmed live: after a
+# row-click swap, the target row reports aria-current="page"; chrome nav rows like "new
+# chat" also use aria-current but their id is not a GUID, so filtering to GUID-shaped ids
+# isolates the conversation row). This is the direct DOM signal for "which conversation is
+# the main pane actually showing".
+_CURRENT_ROW_JS = r"""
+() => {
+  var rows = document.querySelectorAll('button[id][aria-current="page"]');
+  for (var i = 0; i < rows.length; i++) {
+    var id = rows[i].id || '';
+    if (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(id)) {
+      return id;
+    }
+  }
+  return '';
+}
+"""
+
+
+def _current_row_guid():
+    """The GUID of the sidebar row marked aria-current="page" (the OPEN conversation),
+    or "" if none. Never raises."""
+    try:
+        guid = PAGE.evaluate(_CURRENT_ROW_JS) or ""
+    except Exception:
+        return ""
+    return guid if BARE_GUID_RE.match(guid) else ""
+
+
 def _capture_conv_ref():
     """Best-effort capture of a durable reference to the conversation just driven, for
     persistence via S.touch(sid, conv_url=...). Returns a "sess:<guid>" string, or "" if no
     identifier could be found (caller must tolerate this -- a turn must still complete).
 
-    Reads the M365 Copilot SPA's own localStorage history cache (the same data backing the
-    sidebar) and takes the MOST RECENTLY UPDATED entry's conversationId -- right after a send/
-    reply exchange that is reliably the conversation this bridge just used (confirmed live:
-    a fresh send's conversationId sorts first, and it stays first as long as no OTHER
-    conversation is touched in between)."""
+    PRIMARY: the sidebar row currently marked aria-current="page" -- a direct DOM read of
+    the OPEN conversation, no list-ordering assumption. FALLBACK: the M365 Copilot SPA's
+    own localStorage history cache (the data backing the sidebar), most-recently-updated
+    entry first. Right after a send/reply exchange that entry is normally the conversation
+    this bridge just drove, but the cache can LAG a fresh conversation by seconds (observed
+    live: stale preview fields right after a completed turn), which is why it is only the
+    fallback."""
+    guid = _current_row_guid()
+    if guid:
+        return make_sessref(guid)
     try:
         items = PAGE.evaluate(_INSIGHTS_JS)
     except Exception:
@@ -559,39 +594,99 @@ def _capture_conv_ref():
     return make_sessref(guid)
 
 
+def _verify_pane_on_guid(guid, cur_wait=10, turns_wait=20):
+    """True once the main pane VERIFIABLY shows conversation `guid`: its sidebar row
+    reports aria-current="page" AND the conversation's turn blocks have rendered
+    (_wait_turns, which also lets the last assistant bubble settle). Click-then-hope is not
+    enough: a force-click on a still-hydrating sidebar lands but silently no-ops (observed
+    live: startup resume 'succeeded', yet the next send went to a brand-new conversation
+    because the pane never actually swapped). Never raises."""
+    ok = False
+    for _ in range(max(1, cur_wait)):
+        if _current_row_guid() == guid:
+            ok = True
+            break
+        try:
+            PAGE.wait_for_timeout(500)
+        except Exception:
+            return False
+    if not ok:
+        return False
+    try:
+        return bool(_wait_turns(timeout=turns_wait))
+    except Exception:
+        return False
+
+
 def _resume_to_ref(ref, settle=20):
     """Reattach PAGE to the conversation named by `ref` (a "sess:<guid>" reference from
     S.load()/S.latest_active()). Loads AGENT_URL first (so the sidebar with history rows
     renders), then clicks the sidebar row whose id == guid -- the same click mechanism
     confirmed live to switch the main pane without changing page.url. Returns (ok, reason);
-    never raises."""
+    never raises.
+
+    VERIFIED RESUME: returns ok=True only once _verify_pane_on_guid confirms the pane
+    actually swapped (row aria-current="page" + turn blocks rendered). The row click is
+    retried up to 3x (on a freshly loaded page the row can render BEFORE its React handler
+    attaches, so an early force-click lands but does nothing -- the root cause of the
+    silent startup-resume failure), and the whole navigate+find+click+verify cycle is
+    retried once more on top. The turn-block wait doubles as the SEND-READINESS gate: by
+    the time this returns True the conversation view is hydrated, so the composer's editor
+    model is attached and the proven DRIVER.send() type/arm-wait/force-click discipline
+    works. Sending into a still-hydrating view left text in the contenteditable that the
+    editor model never registered -- the Send button then never truly armed and the send
+    failed with 'composer still holds text after 3 attempts'."""
     guid = sessref_guid(ref)
     if not guid:
         return False, "not a sess: reference"
-    try:
-        if AGENT_URL:
-            PAGE.goto(AGENT_URL, wait_until="domcontentloaded", timeout=25000)
-        _wait_composer()
-    except Exception as e:
-        return False, "agent page load failed: %s: %s" % (type(e).__name__, e)
-    row = None
-    for _ in range(max(1, settle)):
+    last = "unknown"
+    for _nav_attempt in range(2):
         try:
-            loc = PAGE.locator('button[id="%s"]' % guid)
-            if loc.count() > 0:
-                row = loc.first
-                break
-        except Exception:
-            pass
-        PAGE.wait_for_timeout(500)
-    if row is None:
-        return False, "conversation row not found in sidebar (guid=%s)" % guid
-    try:
-        row.click(timeout=4000, force=True)
-    except Exception as e:
-        return False, "row click failed: %s: %s" % (type(e).__name__, e)
-    PAGE.wait_for_timeout(1500)
-    return True, "resumed"
+            if AGENT_URL:
+                PAGE.goto(AGENT_URL, wait_until="domcontentloaded", timeout=25000)
+            _wait_composer()
+        except Exception as e:
+            last = "agent page load failed: %s: %s" % (type(e).__name__, e)
+            continue
+        row = None
+        for _ in range(max(1, settle)):
+            try:
+                loc = PAGE.locator('button[id="%s"]' % guid)
+                if loc.count() > 0:
+                    row = loc.first
+                    break
+            except Exception:
+                pass
+            PAGE.wait_for_timeout(500)
+        if row is None:
+            last = "conversation row not found in sidebar (guid=%s)" % guid
+            continue
+        click_err = None
+        for _click_attempt in range(3):
+            try:
+                row.click(timeout=4000, force=True)
+            except Exception as e:
+                click_err = "%s: %s" % (type(e).__name__, e)
+                try:
+                    PAGE.wait_for_timeout(800)
+                except Exception:
+                    pass
+                continue
+            if _verify_pane_on_guid(guid):
+                try:
+                    _wait_composer(10)   # composer present post-swap before we return
+                except Exception:
+                    pass
+                return True, "resumed"
+            try:
+                PAGE.wait_for_timeout(1000)
+            except Exception:
+                pass
+        if click_err is not None:
+            last = "row click failed: %s" % click_err
+        else:
+            last = "row clicked but pane did not swap to guid=%s" % guid
+    return False, last
 
 
 def _delete_rail_row(guid):
@@ -1766,7 +1861,7 @@ class Handler(BaseHTTPRequestHandler):
                         fields["conv_url"] = ref
                     S.touch(sid, **fields)
             except Exception as e:
-                self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}); BUSY = False; return
+                self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}); return
             finally:
                 BUSY = False
             self._drain_pending_queue(sid)
@@ -2205,11 +2300,39 @@ def _find_or_open_agent(ctx):
     raise SystemExit("No agent page. Set MCP_IMPL_AGENT_URL in .env or open an agent tab in Edge.")
 
 
+class _SingleBindHTTPServer(HTTPServer):
+    """HTTPServer that REFUSES to double-bind. The inherited allow_reuse_address=1 maps to
+    SO_REUSEADDR, which on Windows lets a SECOND process silently bind the same port -- two
+    live bridges then each drive their OWN Edge page while sharing the same session ledger,
+    and request dispatch between them is effectively random (resume lands on one, the next
+    send on the other). Windows does not need SO_REUSEADDR for a quick listener restart, so
+    it is disabled outright: a second bind now raises instead of silently succeeding."""
+    allow_reuse_address = False
+
+
+def _port_already_served(port, timeout=2.0):
+    """True if something is already accepting connections on 127.0.0.1:<port> (an existing
+    bridge instance). A plain TCP connect probe -- no request is sent. Never raises."""
+    try:
+        probe = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        probe.close()
+        return True
+    except OSError:
+        return False
+
+
 def main():
     global PAGE, DRIVER, AGENT_URL, ACTIVE_SID
     fresh = "--fresh" in sys.argv[1:]
     cdp = os.environ.get("MCP_CDP_URL", "http://localhost:9222")
     port = int(os.environ.get("MCP_BRIDGE_PORT", "8765"))
+    # SINGLE-INSTANCE GUARD: if another bridge is already serving the port, exit at once
+    # (before touching CDP / creating a page). Belt: this connect probe gives a clean exit
+    # + log line. Suspenders: _SingleBindHTTPServer makes a double-bind raise even if two
+    # instances race past this check simultaneously.
+    if _port_already_served(port):
+        print("bridge already serving port %d; exiting (single-instance guard)" % port, flush=True)
+        return
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         br = p.chromium.connect_over_cdp(cdp)
@@ -2244,11 +2367,14 @@ def main():
                 else:
                     ok, reason = False, "unresumable conv_url shape"
                 if ok:
+                    # ok=True is now a VERIFIED claim (_resume_to_ref only returns True
+                    # once the pane demonstrably shows the target conversation).
                     ACTIVE_SID = latest["sid"]
                     S.touch(ACTIVE_SID, status="active")
                     print("resumed session %s" % ACTIVE_SID, flush=True)
                 else:
-                    print("startup auto-resume skipped: %s" % reason, flush=True)
+                    print("startup auto-resume failed (%s); falling back to fresh" % reason,
+                          flush=True)
             except Exception as e:
                 logger.warning("startup auto-resume failed", exc_info=True)
                 print("startup auto-resume failed: %s: %s" % (type(e).__name__, e), flush=True)
@@ -2257,7 +2383,7 @@ def main():
 
         # single-threaded ON PURPOSE: Playwright sync objects are not thread-safe,
         # so every request must run in the same thread that owns the page.
-        srv = HTTPServer(("127.0.0.1", port), Handler)
+        srv = _SingleBindHTTPServer(("127.0.0.1", port), Handler)
         print("copilot bridge: http://127.0.0.1:%d  (driving %s)" % (port, PAGE.url[-40:]), flush=True)
         srv.serve_forever()
 
