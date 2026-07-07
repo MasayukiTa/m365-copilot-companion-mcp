@@ -60,6 +60,7 @@ class ChatWindow : Window
     TextBlock _headTitle;                 // header conversation-title label (Wave 2); tracks the active conv
     Border _dotHit;                       // header status-dot hit target (Wave 2); tooltip re-localized on lang toggle
     Conversation _conv = new Conversation();
+    Conversation _pageConv = null;       // the conversation the bridge PAGE is believed to be showing right now
     List<Conversation> _all = new List<Conversation>();
     string _renamingId = null;
     int _deleteMode = 1;                 // 1=local only, 2=open in Copilot, 3=auto (experimental)
@@ -184,6 +185,10 @@ class ChatWindow : Window
         if (k == "dot_signin")   return ja ? "サインイン切れの可能性" : "Possible sign-in / refusal";
         if (k == "signin_banner") return ja ? "Copilotが応答を拒否しています。サインイン切れ/接続切れの可能性 — Fleet Cockpitの健康表示を確認してください" : "Copilot is refusing to respond. Sign-in or connection may have expired — check the health view in Fleet Cockpit.";
         if (k == "signin_open")   return ja ? "Fleet Cockpit を開く" : "Open Fleet Cockpit";
+        // ── send-target pinning / reachability fallback errors (nothing was sent) ────
+        if (k == "send_wrong_page")  return ja ? "送信先の会話に接続できませんでした — 送信は行われていません" : "Could not connect to the target conversation — nothing was sent.";
+        if (k == "send_unknown_conv") return ja ? "この会話の送信先を特定できません。会話を開き直してください。" : "Can't identify where to send this — please reopen the conversation.";
+        if (k == "send_offline") return ja ? "ブリッジに接続できません。送信していません。" : "Can't reach the bridge. Nothing was sent.";
         // ── sidebar section / action labels ──────────────────────────────────────
         if (k == "sec_pinned")   return ja ? "ピン留め"   : "Pinned";
         if (k == "sec_today")    return ja ? "最近"        : "Recent";
@@ -209,6 +214,7 @@ class ChatWindow : Window
     volatile bool _started;
     StackPanel _pendingOuter;            // the assistant block for the in-flight turn (Tag holds final text)
     bool _generating;                    // true while a reply is streaming; _send acts as Stop
+    volatile bool _sendInFlight = false; // true from the moment a send is committed until Stream completes
     System.Net.HttpWebRequest _activeReq;// the in-flight stream request (Abort to stop)
 
     public ChatWindow()
@@ -1118,6 +1124,7 @@ class ChatWindow : Window
         var msgs = ReadTranscript(transcriptPath);
         AppendSubAgentTranscripts(msgs, transcriptPath);   // show captured research sub-conversations
         bool fromTranscript = msgs.Count > 0;
+        bool historyScraped = false;   // true only when the /history call below actually ran and succeeded
         if (!fromTranscript && !string.IsNullOrEmpty(url))   // scrape via the separate bridge Edge, mid-run safe
         {
             // No /switch -- /history navigates the bridge itself, so the extra call only doubled the
@@ -1137,6 +1144,7 @@ class ChatWindow : Window
                         string text = md.ContainsKey("text") && md["text"] != null ? md["text"].ToString() : "";
                         msgs.Add(new Msg(role.StartsWith("user") ? "U" : "A", text));
                     }
+                historyScraped = true;   // the bridge page now actually shows this conversation
             }
             catch { }
         }
@@ -1146,6 +1154,10 @@ class ChatWindow : Window
         bool keepLive = running && wkr != null;
         Dispatcher.BeginInvoke(new Action(delegate
         {
+            // Guard: do not steal the view while a send is in flight or the composer has unsent
+            // text -- a fleet-card open landing here mid-send is exactly the wrong-conversation
+            // bug this pinning scheme exists to prevent. No-op the reassignment entirely.
+            if (_sendInFlight || (_input != null && _input.Text.Trim().Length > 0)) return;
             // reuse the existing sidebar entry for this conversation if present (dedup by key)
             Conversation c = null;
             foreach (var x in _all) { if (x.ConvUrl == key) { c = x; break; } }
@@ -1153,6 +1165,7 @@ class ChatWindow : Window
             c.Messages.Clear();
             foreach (var m in loaded) c.Messages.Add(m);
             _conv = c;
+            if (historyScraped) _pageConv = c;   // bridge page was navigated here by /history; else leave _pageConv as-is
             _messages.Children.Clear();
             var note = new TextBlock { Text = T("fleetview_note"), TextWrapping = TextWrapping.Wrap, FontSize = 12.5, Margin = new Thickness(2, 2, 2, 10) };
             SetRef(note, TextBlock.ForegroundProperty, "Muted");
@@ -2751,8 +2764,12 @@ class ChatWindow : Window
 
     void NewChat()
     {
-        new Thread((ThreadStart)delegate { try { HttpGet("/new"); } catch { } }) { IsBackground = true }.Start();
-        _conv = new Conversation();
+        var newConv = new Conversation();
+        new Thread((ThreadStart)delegate
+        {
+            try { HttpGet("/new"); _pageConv = newConv; } catch { }
+        }) { IsBackground = true }.Start();
+        _conv = newConv;
         _conv.Ts = (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
         _all.Insert(0, _conv);
         _messages.Children.Clear();
@@ -2815,7 +2832,10 @@ class ChatWindow : Window
         foreach (var m in c.Messages) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
         RefreshConvList();
         if (!string.IsNullOrEmpty(c.ConvUrl))
-            new Thread((ThreadStart)delegate { try { HttpGet("/switch?url=" + Uri.EscapeDataString(c.ConvUrl)); } catch { } }) { IsBackground = true }.Start();
+            new Thread((ThreadStart)delegate
+            {
+                try { HttpGet("/switch?url=" + Uri.EscapeDataString(c.ConvUrl)); _pageConv = c; } catch { }
+            }) { IsBackground = true }.Start();
     }
 
     void DeleteLocal(Conversation c)
@@ -3545,6 +3565,28 @@ class ChatWindow : Window
             return;
         }
 
+        // #4: new-chat fallback -- nothing to send into yet, so start a fresh conversation first
+        // (also seeds _pageConv once /new succeeds).
+        if (_conv == null) NewChat();
+
+        // #4: bridge-reachability fallback -- re-probe once synchronously before refusing the send,
+        // since _bridgeReachable is only updated by the low-cadence background probe and may be stale.
+        if (!_bridgeReachable)
+        {
+            bool ok;
+            try { HttpGet("/conv", 5000); ok = true; } catch { ok = false; }
+            _bridgeReachable = ok;
+            if (!ok)
+            {
+                SetDot("offline");
+                AddAssistant(T("send_offline"));
+                _input.Text = text;   // put the trimmed text back so it isn't lost
+                _input.CaretIndex = _input.Text.Length;
+                return;
+            }
+            RefreshIdleDot();
+        }
+
         // #3: while a fleet is at capacity, a native send would open a 4th heavy tab
         // and blow the memory budget -> route it into the fleet queue instead. Prefix
         // "!" forces priority (jumps the queue). Slash-commands are never rerouted.
@@ -3575,9 +3617,35 @@ class ChatWindow : Window
 
     void SendText(string text)
     {
-        _conv.Messages.Add(new Msg("U", text));
-        if (_conv.Untitled()) { _conv.Title = TrimTitle(text, 40); }   // ITEM 3a: first line, max 40 + ellipsis
-        if (!_all.Contains(_conv)) { _all.Insert(0, _conv); }
+        // Snapshot the conversation this send targets ONCE, up front. Everything below (and
+        // everything in Stream) must operate on `target`, never re-read the shared `_conv` field --
+        // a fleet-card open landing mid-send must not be able to redirect this reply elsewhere.
+        Conversation target = _conv;
+
+        // ── page pinning: make sure the bridge page actually shows `target` before we send ──
+        if (!ReferenceEquals(target, _pageConv))
+        {
+            if (!string.IsNullOrEmpty(target.ConvUrl))
+            {
+                try { HttpGet("/switch?url=" + Uri.EscapeDataString(target.ConvUrl), 15000); _pageConv = target; }
+                catch { AddAssistant(T("send_wrong_page")); return; }
+            }
+            else if (target.Messages.Count == 0)
+            {
+                try { HttpGet("/new", 15000); _pageConv = target; }
+                catch { AddAssistant(T("send_wrong_page")); return; }
+            }
+            else
+            {
+                AddAssistant(T("send_unknown_conv"));
+                return;
+            }
+        }
+
+        _sendInFlight = true;
+        target.Messages.Add(new Msg("U", text));
+        if (target.Untitled()) { target.Title = TrimTitle(text, 40); }   // ITEM 3a: first line, max 40 + ellipsis
+        if (!_all.Contains(target)) { _all.Insert(0, target); }
         RefreshConvList();
         AddUser(text);
         StackPanel outer;
@@ -3588,7 +3656,7 @@ class ChatWindow : Window
         _generating = true; _send.Content = "■ " + T("stop"); _send.IsEnabled = true;   // distinct from Send; _send now acts as Stop (also Esc)
         PaintSend();   // stay accent while generating
         SetDot("busy");
-        new Thread((ThreadStart)delegate { Stream(text); }) { IsBackground = true }.Start();
+        new Thread((ThreadStart)delegate { Stream(text, target); }) { IsBackground = true }.Start();
         ClearChips();   // the attached file(s) go with this message; reset the chip row
     }
 
@@ -3755,7 +3823,7 @@ class ChatWindow : Window
         _attachChips.Children.Clear();
     }
 
-    void Stream(string msg)
+    void Stream(string msg, Conversation target)
     {
         var full = new StringBuilder();
         var content = _pendingContent;
@@ -3783,6 +3851,11 @@ class ChatWindow : Window
                             full.Append(d);
                             Dispatcher.BeginInvoke(new Action(delegate
                             {
+                                // Only touch the visible pending bubble while `target` is still the
+                                // conversation on screen -- if the user has switched away, the reply
+                                // is still being accumulated into `full` and will land in `target`'s
+                                // saved messages at completion, just not painted here.
+                                if (!ReferenceEquals(_conv, target)) return;
                                 if (!_started) { _started = true; content.Children.Clear(); _pendingText = MakeText(""); content.Children.Add(_pendingText); }
                                 _pendingText.AppendText(d); StickToEnd();
                             }));
@@ -3794,6 +3867,7 @@ class ChatWindow : Window
                             var repCopy = rep;
                             Dispatcher.BeginInvoke(new Action(delegate
                             {
+                                if (!ReferenceEquals(_conv, target)) return;
                                 if (_pendingText != null) { _pendingText.Text = repCopy; StickToEnd(); }
                             }));
                         }
@@ -3813,15 +3887,23 @@ class ChatWindow : Window
         var errFinal = errMsg;
         Dispatcher.BeginInvoke(new Action(delegate
         {
-            _generating = false; _send.Content = T("send"); _input.Focus();
-            PaintSend();   // revert to neutral (input was cleared before send); also re-enables/disables
-            // render whatever we got (full / partial / error); always clear the typing indicator
-            content.Children.Clear();
-            if (answer.Length > 0) { RenderAssistantBody(content, outer, answer); StickToEnd(); }
-            else if (errFinal != null) { content.Children.Add(MakeText("[bridge error: " + errFinal + "]")); if (outer != null) outer.Tag = errFinal; }
-            _conv.Messages.Add(new Msg("A", answer));
-            SaveConversation(_conv);
-            // ── status dot outcome ──────────────────────────────────────────────
+            _sendInFlight = false;   // unconditionally, for both success and error paths -- never leave this wedged true
+            bool visible = ReferenceEquals(_conv, target);
+            if (visible)
+            {
+                _generating = false; _send.Content = T("send"); _input.Focus();
+                PaintSend();   // revert to neutral (input was cleared before send); also re-enables/disables
+                // render whatever we got (full / partial / error); always clear the typing indicator
+                content.Children.Clear();
+                if (answer.Length > 0) { RenderAssistantBody(content, outer, answer); StickToEnd(); }
+                else if (errFinal != null) { content.Children.Add(MakeText("[bridge error: " + errFinal + "]")); if (outer != null) outer.Tag = errFinal; }
+            }
+            // Data must land in the right conversation's saved file even when it is not the one
+            // currently shown -- these run unconditionally, keyed on `target`, never on `_conv`.
+            target.Messages.Add(new Msg("A", answer));
+            SaveConversation(target);
+            // ── status dot outcome (reflects the VISIBLE conversation only) ──────────────
+            if (!visible) return;
             if (errFinal != null)
             {
                 // A stream error means the bridge (or its Copilot tab) is not answering.
@@ -3845,7 +3927,17 @@ class ChatWindow : Window
                 RefreshIdleDot();
             }
         }));
-        try { var j = HttpGet("/conv"); var u = ExtractField(j, "url"); if (!string.IsNullOrEmpty(u)) { _conv.ConvUrl = u; Dispatcher.BeginInvoke(new Action(delegate { SaveConversation(_conv); RegisterConv(u, _conv.Title, "chat"); })); } } catch { }
+        try
+        {
+            var j = HttpGet("/conv");
+            var u = ExtractField(j, "url");
+            if (!string.IsNullOrEmpty(u))
+            {
+                target.ConvUrl = u;
+                Dispatcher.BeginInvoke(new Action(delegate { SaveConversation(target); RegisterConv(u, target.Title, "chat"); }));
+            }
+        }
+        catch { }
     }
 
     // ── persistence (manual base64 store) ───────────────────────────────────────
