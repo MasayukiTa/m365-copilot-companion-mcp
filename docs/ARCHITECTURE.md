@@ -78,7 +78,7 @@ Premium / Direct Line を使わず、stdlib の `http.server` だけで自己完
 
 ### supervisor（常時公開・`scripts/supervisor.ps1`）
 
-devtunnel の host 接続は、プロセスが生きていても relay 接続だけが静かに落ちることがあります。supervisor はポート 8000 とトンネルの `Host connections` を定期監視し、落ちていれば自動で張り直します（デバウンス＋接続確立待ち付き）。ログオン時自動起動の登録方法は [ADVANCED.md](ADVANCED.md)。
+devtunnel の host 接続は、プロセスが生きていても relay 接続だけが静かに落ちることがあります。supervisor はポート 8000 とトンネルの `Host connections` を定期監視し、落ちていれば自動で張り直します（デバウンス＋接続確立待ち付き）。ログオン時自動起動の登録方法は [scripts/AUTOSTART.md](../scripts/AUTOSTART.md)（実体は `scripts\register-supervisor.ps1`）。
 
 ### 専用 companion Edge（`scripts/start_companion_edge.ps1`）
 

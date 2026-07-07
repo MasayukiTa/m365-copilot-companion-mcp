@@ -80,6 +80,19 @@ system prompt にこの順序を 1 行入れておけば「画像なし pptx を
 
 ---
 
+## 自動起動（ログオン時にスタック全体を起動）
+
+`scripts\register-supervisor.ps1` を 1 回実行すると、次回ログオンから `start_all_hidden.vbs`（＝サーバー・トンネル・bridge・全 UI）が管理者権限不要で自動起動します。仕組みは per-user Startup フォルダのショートカット（Task Scheduler が組織ポリシーで弾かれる環境でも通る）。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\register-supervisor.ps1   # 登録
+powershell -ExecutionPolicy Bypass -File scripts\unregister-supervisor.ps1 # 解除
+```
+
+詳細（動作原理・確認方法・自己修復動作）は [scripts/AUTOSTART.md](../scripts/AUTOSTART.md)。
+
+---
+
 ## relay を直接叩く（一回だけのセットアップ）
 
 再ログイン不要・Playwright のブラウザ DL も不要（既にログイン済みの Edge に attach するだけ）:

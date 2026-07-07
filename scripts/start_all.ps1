@@ -259,15 +259,46 @@ function Invoke-Startup {
     }
 
     # 4) WPF apps. Launch only if not already running; build them first if the exe is missing.
+    #    rebuild_ui.ps1 builds AND relaunches BOTH apps itself, so if either exe is missing we
+    #    invoke it exactly once for the whole loop ($rebuilt flag) rather than once per app.
     Set-SplashStatus $script:splash "Opening the chat and cockpit windows..."
+    $rebuilt = $false
     foreach ($app in @("CopilotChat","FleetCockpit")) {
         if (Get-Process $app -ErrorAction SilentlyContinue) {
             Write-Host "[4/4] ${app}: already running"
         } elseif (Test-Path "$root\ui\$app.exe") {
             Write-Host "[4/4] ${app}: launching"
             Start-Process "$root\ui\$app.exe"
+        } elseif ($rebuilt) {
+            # Already tried a rebuild this loop (below) -- re-check post-rebuild state without
+            # rebuilding again.
+            if (Get-Process $app -ErrorAction SilentlyContinue) {
+                Write-Host "[4/4] ${app}: launched by rebuild"
+            } else {
+                Write-Host "[4/4] ${app}: still not running after rebuild -- see docs\TROUBLESHOOTING.md"
+            }
         } else {
-            Write-Host "[4/4] $app.exe not built yet -- run  ui\rebuild_ui.ps1  once, then re-run this."
+            $rebuildScript = Join-Path $root "ui\rebuild_ui.ps1"
+            if (Test-Path $rebuildScript) {
+                Write-Host "[4/4] $app.exe not built yet -- building both UI apps (first run, ~30s)..."
+                Set-SplashStatus $script:splash "Building the chat and cockpit apps (first run, ~30s)..."
+                $rebuilt = $true
+                try {
+                    & $rebuildScript | Out-Null
+                    if (Get-Process $app -ErrorAction SilentlyContinue) {
+                        Write-Host "[4/4] ${app}: built and launched"
+                    } elseif (Test-Path "$root\ui\$app.exe") {
+                        Write-Host "[4/4] ${app}: built -- launching"
+                        Start-Process "$root\ui\$app.exe"
+                    } else {
+                        Write-Host "[4/4] ${app}: rebuild ran but exe still missing -- see docs\TROUBLESHOOTING.md ('csc.exe not found' row)"
+                    }
+                } catch {
+                    Write-Host "[4/4] ${app}: rebuild failed ($_) -- see docs\TROUBLESHOOTING.md ('csc.exe not found' row)"
+                }
+            } else {
+                Write-Host "[4/4] $app.exe not built yet, and ui\rebuild_ui.ps1 is missing -- see docs\TROUBLESHOOTING.md"
+            }
         }
     }
 
