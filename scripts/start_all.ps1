@@ -269,6 +269,69 @@ function Invoke-FirstTimeSetupGate {
     }
 }
 
+# ---------------------------------------------------------------------------
+# One-time convenience provisioning: a person who downloads the repo, manually finishes
+# devtunnel + agent-URL setup, then runs start_all expects it to also finish the two other
+# one-time setup steps -- the Desktop icon (make_desktop_shortcut.ps1) and the logon autostart
+# registration (register-supervisor.ps1). Neither happens today via this path (the shortcut
+# script is only invoked from quickstart.bat behind a Y/N prompt; autostart registration is a
+# purely manual step), so provision both here, but ONLY ONCE EVER: gated on a marker file so
+# that if the user later deletes the icon or unregisters autostart, start_all does not fight
+# them by silently recreating it on the next run. Runs AFTER the services/UIs are brought up so
+# a failure here can never block or delay the actual startup.
+# ---------------------------------------------------------------------------
+function Ensure-ConvenienceProvisioning {
+    try {
+        $setupDir = Join-Path $root ".setup"
+        $markerPath = Join-Path $setupDir "convenience_provisioned"
+        if (Test-Path $markerPath) {
+            # Already provisioned once -- never touch it again, even if the user removed
+            # the icon or the autostart shortcut since.
+            return
+        }
+        if (-not (Test-Path $setupDir)) {
+            New-Item -ItemType Directory -Path $setupDir -Force | Out-Null
+        }
+
+        # a) Desktop shortcut. make_desktop_shortcut.ps1 is idempotent (overwrites), so running
+        #    it here is harmless even on a machine where it was already created by hand/quickstart.
+        $shortcutScript = Join-Path $scriptDir "make_desktop_shortcut.ps1"
+        if (Test-Path $shortcutScript) {
+            try {
+                Start-Process powershell -WindowStyle Hidden -Wait -ArgumentList @(
+                    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $shortcutScript
+                ) -WorkingDirectory $root
+                Write-Host "[provision] desktop shortcut created"
+            } catch {
+                Write-Host "[provision] desktop shortcut skipped: $_"
+            }
+        }
+
+        # b) Logon autostart. register-supervisor.ps1 is idempotent (re-creates the same Startup-
+        #    folder shortcut), so running it here is harmless even on an already-registered machine.
+        $autostartScript = Join-Path $scriptDir "register-supervisor.ps1"
+        if (Test-Path $autostartScript) {
+            try {
+                Start-Process powershell -WindowStyle Hidden -Wait -ArgumentList @(
+                    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $autostartScript
+                ) -WorkingDirectory $root
+                Write-Host "[provision] logon autostart registered"
+            } catch {
+                Write-Host "[provision] autostart registration skipped: $_"
+            }
+        }
+
+        # Write the marker AFTER attempting both, regardless of whether either one succeeded --
+        # this is a single best-effort attempt, not a retry-every-startup nag. No personal path or
+        # username is recorded, just a generic tag.
+        try {
+            "provisioned" | Out-File -FilePath $markerPath -Encoding ascii -Force
+        } catch { }
+    } catch {
+        # Convenience provisioning is best-effort only; it must never affect startup.
+    }
+}
+
 # Everything that brings the stack up, as ONE function so it can run either INSIDE the splash's
 # message loop (a one-shot timer, so the modal splash stays visible while this runs) OR directly
 # as a fallback if the splash cannot be shown. Status updates target $script:splash (no-op if null).
@@ -364,6 +427,10 @@ function Invoke-Startup {
     Write-Host ""
     Write-Host "Done. Chat UI: http://127.0.0.1:8765 (or the CopilotChat window). Fleet cockpit window is up."
     Write-Host "If a one-time M365 sign-in is needed, a visible Edge window will appear -- sign in there."
+
+    # 5) One-time convenience provisioning (Desktop icon + logon autostart). Runs last, after every
+    #    service/UI above is already launched, so any failure here can never block real startup.
+    Ensure-ConvenienceProvisioning
 
     # Keep the splash up (BOUNDED ~20s) until a chat/cockpit window actually appears, then enforce
     # a minimum on-screen time so a fast (already-running) start is still seen, then let it close.
