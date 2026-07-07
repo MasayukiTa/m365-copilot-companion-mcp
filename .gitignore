@@ -27,6 +27,7 @@ dist/
 .unlock_state.json
 .todo_state.json
 .memory_state.json
+.procedural_memory.json
 .companion_runs/
 .companion_gates/
 

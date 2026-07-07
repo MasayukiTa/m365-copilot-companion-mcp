@@ -248,3 +248,91 @@ def test_search_does_not_call_require_unlocked_gate(monkeypatch):
     monkeypatch.setattr(pm, "require_unlocked", lambda: "[locked] no.")
     result = pm.procedural_memory_search("anything")
     assert result == "(no matches)"  # ran normally, not blocked
+
+
+# ===========================================================================
+# import_markdown (bulk import, gateway-only tool)
+# ===========================================================================
+
+_FAKE_MARKDOWN = """# Fake DB Notes
+
+Some intro text before any ## heading, mentioning demo_db in passing.
+
+## First Section Heading
+
+Some prose about the FAKE_TABLE_A table and how to query it.
+
+```sql
+SELECT * FROM FAKE_TABLE_A WHERE id = 1;
+```
+
+注意: this join is slow on large date ranges, keep the filter narrow.
+
+## Second Section Heading
+
+Plain body text with no code block, just notes on the workflow, repeated a
+few times to make sure the first ~800 chars fallback path has something to
+grab: this line has no cue words and no fenced blocks, just prose that
+describes what to do next when the first section's approach does not work
+and a fallback strategy is needed instead.
+"""
+
+
+def test_import_markdown_chunks_and_indexes(tmp_path):
+    md_file = tmp_path / "fake_notes.md"
+    md_file.write_text(_FAKE_MARKDOWN, encoding="utf-8")
+
+    result = pm.procedural_memory_import_markdown(str(md_file), tags="demo")
+    assert "imported 3 chunks from fake_notes.md" in result
+    assert "skipped 0 empty" in result
+
+    # findable by a heading word
+    found = pm.procedural_memory_search("First Section Heading")
+    assert "no matches" not in found.lower()
+    assert "first_section_heading" in found
+
+    # tags carry src:<basename>, caller tag, and the table-ish token, lowercased
+    state = pm._load()
+    entry = state["procedures"]["first_section_heading"]
+    assert "demo" in entry["tags"]
+    assert "import" in entry["tags"]
+    assert "src:fake_notes.md" in entry["tags"]
+    assert "table:fake_table_a" in entry["tags"]
+
+    # the fenced SQL block became the snippet (code blocks take priority over prose)
+    assert "SELECT * FROM FAKE_TABLE_A" in entry["snippet"]
+
+    # the 注意 line was captured into context
+    assert "注意" in entry["context"]
+
+    # preamble chunk exists too, seeded from the H1 title
+    preamble = state["procedures"].get("fake_db_notes")
+    assert preamble is not None
+    assert "demo_db" in preamble["snippet"]
+
+
+def test_import_markdown_missing_file_returns_not_found():
+    result = pm.procedural_memory_import_markdown("no/such/file/anywhere.md")
+    assert "not found" in result.lower()
+
+
+def test_import_markdown_is_gated_by_require_unlocked(monkeypatch):
+    monkeypatch.setattr(pm, "require_unlocked", lambda: "[locked] no.")
+    result = pm.procedural_memory_import_markdown("whatever.md")
+    assert result == "[locked] no."
+
+
+def test_import_markdown_empty_file_imports_zero(tmp_path):
+    md_file = tmp_path / "empty.md"
+    md_file.write_text("", encoding="utf-8")
+    result = pm.procedural_memory_import_markdown(str(md_file))
+    assert "imported 0 chunks" in result
+
+
+def test_import_markdown_tolerates_bom(tmp_path):
+    md_file = tmp_path / "bom.md"
+    md_file.write_bytes(b"\xef\xbb\xbf" + "## Heading With BOM\n\nbody text here.\n".encode("utf-8"))
+    result = pm.procedural_memory_import_markdown(str(md_file))
+    assert "imported 1 chunks from bom.md" in result
+    found = pm.procedural_memory_search("Heading With BOM")
+    assert "no matches" not in found.lower()
