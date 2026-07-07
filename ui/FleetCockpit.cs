@@ -1799,9 +1799,26 @@ class CockpitWindow : Window
             if (runEnded || allDone) overallPhase = "ended";
         }
         string started = root != null ? S(root, "started") : "";
+        // Re-key on the PRIMARY worker's own status + phase-event count so this panel repaints
+        // when workers[0] itself progresses, even while sibling workers keep overallPhase pinned
+        // to "running" (a repaint-gating bug, not a BuildSpineContent rendering bug -- that method
+        // already reads workers[0].phase_events correctly, it just wasn't being re-invoked).
+        string primaryStatus = "";
+        int primaryPhaseCount = 0;
+        if (spineWorkers != null && spineWorkers.Count > 0)
+        {
+            Dictionary<string, object> primaryW = spineWorkers[0];
+            if (primaryW != null)
+            {
+                primaryStatus = S(primaryW, "status");
+                object pe;
+                if (primaryW.TryGetValue("phase_events", out pe) && pe is object[]) primaryPhaseCount = ((object[])pe).Length;
+            }
+        }
         string spineSig = (hasWorkers ? "1" : "0") + "|" + started + "|" + overallPhase
                           + "|" + (_toolbarAll != null ? _toolbarAll.Count : 0)
-                          + "|" + (_dark ? "D" : "L") + _lang;
+                          + "|" + (_dark ? "D" : "L") + _lang
+                          + "|" + primaryStatus + "|" + primaryPhaseCount;
         if (spineSig == _spineSig) return;
         _spineSig = spineSig;
 
