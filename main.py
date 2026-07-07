@@ -160,7 +160,12 @@ mcp = FastMCP(
         "long-running background jobs; verify your own outputs via read_image and "
         "pptx_export_png; and install Python dependencies when needed. Read-only tools "
         "are available after token authentication; mutating or execution tools require "
-        "unlock(password) per IP. Call list_my_tools to see the full catalog."
+        "unlock(password) per IP. Call list_my_tools to see the full catalog. "
+        "Relative user-folder names (Desktop, Documents, Downloads, ...) resolve to the "
+        "user's home profile, not the server's working directory. If a file or folder "
+        "seems missing, use find_files (recursive name search) before concluding it is "
+        "absent, and never claim a path is outside the allowed base unless a tool call "
+        "actually returned that error."
     ),
 )
 
