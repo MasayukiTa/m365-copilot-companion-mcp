@@ -61,6 +61,7 @@ from tools.procedural_memory import (
     procedural_memory_search,
 )
 from tools.data_discovery import find_db_objects
+from tools.data_memory_hook import data_memory_status
 from tools.notify_ops import notify_desktop
 from tools.outlook_ops import (
     outlook_calendar,
@@ -239,6 +240,10 @@ TOOLS = (
     # DB discovery: NL entry point over procedural memory + live ODBC fallback
     # (gateway-only, same reasoning as procedural_memory_import_markdown above).
     find_db_objects,
+    # data-memory hook status (read-only, no unlock needed; gateway-only, same
+    # reasoning as find_db_objects above -- reachable only via
+    # call_tool("data_memory_status", {})).
+    data_memory_status,
     # notifications
     notify_desktop,
     # scheduling (Windows Task Scheduler)
