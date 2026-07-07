@@ -128,3 +128,73 @@ def test_never_raises_on_unexpected_memory_error(monkeypatch):
     monkeypatch.setattr(pm, "procedural_memory_search", _boom)
     out = dd.find_db_objects("anything")
     assert out.startswith("[find_db_objects error")
+
+
+# ===========================================================================
+# extract_keywords -- unsegmented Japanese question fix (defect A)
+# ===========================================================================
+
+
+def test_extract_keywords_unsegmented_japanese_yields_multiple_keywords():
+    kws = dd.extract_keywords("PAPの材料トレースで見るべきテーブルは？")
+    assert len(kws) >= 2
+    assert "PAP" in kws
+    # at least one kanji/katakana content run must have been carved out
+    assert any(("材料" in k or "トレース" in k or "テーブル" in k) for k in kws)
+
+
+def test_extract_keywords_spaced_query_unchanged():
+    kws = dd.extract_keywords("PAP 材料トレース")
+    assert kws == ["PAP", "材料トレース"]
+
+
+def test_extract_keywords_empty_or_blank_returns_empty_list():
+    assert dd.extract_keywords("") == []
+    assert dd.extract_keywords("   ") == []
+
+
+def test_extract_keywords_never_raises_on_non_string():
+    assert dd.extract_keywords(None) == []
+    assert dd.extract_keywords(123) == []
+
+
+def test_find_db_objects_uses_extracted_keywords_for_unsegmented_question(monkeypatch):
+    """The live-verified defect: an unsegmented Japanese question must still reach
+    procedural_memory_search with usable (space-joined) keywords, not the raw blob."""
+    captured = {}
+
+    def _fake_search(query, limit=10):
+        captured["query"] = query
+        return CANNED_MEMORY_HIT
+
+    monkeypatch.setattr(pm, "procedural_memory_search", _fake_search)
+    monkeypatch.setattr(odbc_ops, "odbc_tables", _raise_if_called)
+
+    dd.find_db_objects("PAPの材料トレースで見るべきテーブルは？")
+
+    assert "PAP" in captured["query"]
+    assert " " in captured["query"]  # segmented into multiple space-joined tokens
+    assert captured["query"] != "PAPの材料トレースで見るべきテーブルは？"
+
+
+# ===========================================================================
+# SQL-stopword display filter (defect B, display-side)
+# ===========================================================================
+
+
+def test_sql_stopword_tags_are_filtered_from_candidates(monkeypatch):
+    noisy_hit = (
+        "1 match(es) for 'x':\n"
+        "- [noisy] score=2 "
+        "tags=[table:group,table:having,table:fake_table_a,table:dateadd] "
+        "intent='noisy import'\n"
+        "    body"
+    )
+    monkeypatch.setattr(pm, "procedural_memory_search", lambda query, limit=10: noisy_hit)
+
+    out = dd.find_db_objects("anything", connection="demo_db")
+
+    assert "  - fake_table_a" in out
+    assert "  - group" not in out
+    assert "  - having" not in out
+    assert "  - dateadd" not in out
