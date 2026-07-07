@@ -3383,17 +3383,20 @@ def _agent_tab_matches(pg, base_url):
         u = pg.url or ""
     except Exception:
         return False
-    if "/chat/agent/" not in u:
+    # The M365 SPA normalizes agent URLs: a tab opened at .../chat/agent/<id> or
+    # .../chat/?titleId=T_<id> is rewritten in-place to the bare .../chat surface
+    # (often .../chat/?redirfrom=CsrToSSR&auth=2), so matching on "/chat/agent/" alone
+    # never recognizes a live, settled agent tab. Recognize the whole M365 chat surface
+    # instead; the composer-present check below is what actually confirms it is a usable
+    # agent tab rather than a blank/redirect page.
+    if "m365.cloud.microsoft/chat" not in u and "/chat/agent/" not in u:
         return False
     try:
         if pg.locator(COPILOT_SELECTORS["composer"]).count() <= 0:
             return False
     except Exception:
         return False
-    if not base_url:
-        return True
-    base = base_url.split("/conversation/")[0]
-    return u.startswith(base) or base in u
+    return True
 
 
 def _close_duplicate_agent_tabs(ctx, keep_pg, base_url):
