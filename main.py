@@ -60,6 +60,7 @@ from tools.procedural_memory import (
     procedural_memory_save,
     procedural_memory_search,
 )
+from tools.data_discovery import find_db_objects
 from tools.notify_ops import notify_desktop
 from tools.outlook_ops import (
     outlook_calendar,
@@ -235,6 +236,9 @@ TOOLS = (
     # sets are fixed above, so MCP_TOOL_MAP truncation never registers it directly --
     # reachable only via call_tool("procedural_memory_import_markdown", {...})).
     procedural_memory_import_markdown,
+    # DB discovery: NL entry point over procedural memory + live ODBC fallback
+    # (gateway-only, same reasoning as procedural_memory_import_markdown above).
+    find_db_objects,
     # notifications
     notify_desktop,
     # scheduling (Windows Task Scheduler)
