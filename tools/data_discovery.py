@@ -10,6 +10,91 @@ a write, never require_unlocked.
 """
 import re
 
+# --- keyword extraction (extract_keywords) ------------------------------------------
+# Natural Japanese questions arrive unsegmented ("PAPの材料トレースで見るべきテーブルは？"
+# -- no spaces), while procedural_memory_search scores by whitespace-split tokens. Left
+# alone, an unsegmented question becomes ONE giant token and matches nothing even when
+# the same content phrased with spaces ("PAP 材料トレース") would hit. This is a cheap
+# heuristic segmenter, not a linguistics project -- it biases toward recall (more
+# candidate keywords is fine; the search scorer below just counts token hits).
+_ASCII_TOKEN_RE = re.compile(r"[A-Za-z0-9_]{2,}")
+# Punctuation/whitespace treated as hard segment boundaries before particle-splitting.
+_PUNCT_RE = re.compile(
+    r"[?？。、!！,，.．:：;；()（）\[\]【】「」『』\"'\s]+"
+)
+# Japanese particles/verb-ish suffixes that separate content words in a natural question.
+# Sorted longest-first below so multi-char particles split before their single-char
+# substrings would (e.g. "ください" before "は" -- not that they overlap, but this keeps
+# the iterative splitting order well-defined and avoids over-fragmenting).
+_JP_PARTICLES = sorted(
+    [
+        "は", "が", "を", "に", "で", "の", "と", "へ", "から", "まで", "より",
+        "や", "か", "も", "ね", "よ", "です", "ます", "ください", "べき",
+        "する", "見る", "教え",
+    ],
+    key=len,
+    reverse=True,
+)
+# A kept segment must consist only of these character classes (hiragana+katakana
+# U+3040-30FF, kanji U+3400-9FFF, half-width katakana U+FF66-FF9F, ascii word chars) --
+# rules out stray leftover punctuation making it through.
+_JP_SEGMENT_RE = re.compile(r"^[぀-ヿ㐀-鿿ｦ-ﾟA-Za-z0-9_]+$")
+# A kept segment must contain at least one kanji/katakana char (U+30A0-30FF katakana,
+# U+3400-9FFF kanji) UNLESS it's pure ASCII -- plain hiragana-only leftovers (e.g. a
+# stray verb stem) are function-word noise, not content.
+_HAS_KANJI_KATAKANA_RE = re.compile(r"[゠-ヿ㐀-鿿]")
+
+
+def extract_keywords(question: str, max_keywords: int = 8) -> list[str]:
+    """Segment a free-text (possibly unsegmented Japanese) question into search keywords.
+
+    ASCII word tokens are pulled out as-is. The Japanese remainder is split on
+    punctuation/whitespace and then, per whitespace-delimited word, iteratively on a
+    small particle list (は/が/を/に/で/の/と/へ/から/まで/より/... ) so that e.g.
+    "材料トレースで見るべきテーブルは" yields ["材料トレース", "テーブル"] instead of one
+    unmatchable blob. Order-preserving dedup, capped at `max_keywords`. Never raises;
+    an empty/whitespace-only (or non-string) question returns [].
+    """
+    try:
+        if not question or not isinstance(question, str):
+            return []
+        q = question.strip()
+        if not q:
+            return []
+
+        ascii_tokens = _ASCII_TOKEN_RE.findall(q)
+
+        stripped = _PUNCT_RE.sub(" ", q).strip()
+        jp_keywords: list[str] = []
+        for word in stripped.split():
+            segments = [word]
+            for particle in _JP_PARTICLES:
+                next_segments: list[str] = []
+                for seg in segments:
+                    next_segments.extend(seg.split(particle))
+                segments = next_segments
+            for seg in segments:
+                seg = seg.strip()
+                if len(seg) < 2:
+                    continue
+                if not _JP_SEGMENT_RE.match(seg):
+                    continue
+                if seg.isascii() or _HAS_KANJI_KATAKANA_RE.search(seg):
+                    jp_keywords.append(seg)
+
+        out: list[str] = []
+        seen: set[str] = set()
+        for tok in ascii_tokens + jp_keywords:
+            if tok not in seen:
+                seen.add(tok)
+                out.append(tok)
+            if len(out) >= max_keywords:
+                break
+        return out
+    except Exception:
+        return []
+
+
 _TAG_RE_CACHE: dict[str, re.Pattern] = {}
 
 
@@ -124,9 +209,16 @@ def find_db_objects(question: str, connection: str = "", limit: int = 8) -> str:
         if not question or not isinstance(question, str):
             return "[find_db_objects error: question must be a non-empty string]"
 
-        query = f"{question} connection:{connection}" if connection else question
+        # Segment the (possibly unsegmented Japanese) question into search keywords --
+        # procedural_memory_search scores by whitespace-split tokens, so a raw
+        # unsegmented question would collapse into one giant unmatchable token. Falls
+        # back to the raw question if extraction yields nothing (e.g. pure ASCII with
+        # no word-ish tokens, or an edge case the heuristic doesn't cover).
+        keywords = extract_keywords(question)
+        base_query = " ".join(keywords) if keywords else question
+        query = f"{base_query} connection:{connection}" if connection else base_query
         try:
-            from .procedural_memory import procedural_memory_search
+            from .procedural_memory import procedural_memory_search, SQL_STOPWORDS
         except Exception as e:
             return f"[find_db_objects error: {type(e).__name__}: {e}]"
         result = procedural_memory_search(query, limit)
@@ -136,7 +228,13 @@ def find_db_objects(question: str, connection: str = "", limit: int = 8) -> str:
         intents: list[tuple[str, str]] = []
         srcs: list[str] = []
         if has_memory:
-            tables = _extract_tagged_tokens(result, "table")
+            # Display-side stopword filter: also cleans candidates for entries that
+            # were imported BEFORE the importer-side SQL_STOPWORDS fix, since the store
+            # may still hold old noisy table:group / table:having / ... tags.
+            tables = [
+                t for t in _extract_tagged_tokens(result, "table")
+                if t.upper() not in SQL_STOPWORDS
+            ]
             srcs = _extract_tagged_tokens(result, "src")
             intents = [_intent_and_snippet_from_block(b) for b in _extract_match_blocks(result)]
 

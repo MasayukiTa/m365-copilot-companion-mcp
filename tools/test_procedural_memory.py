@@ -336,3 +336,43 @@ def test_import_markdown_tolerates_bom(tmp_path):
     assert "imported 1 chunks from bom.md" in result
     found = pm.procedural_memory_search("Heading With BOM")
     assert "no matches" not in found.lower()
+
+
+# ===========================================================================
+# SQL-stopword filtering in table: tag extraction (defect B)
+# ===========================================================================
+
+_SQL_NOISE_MARKDOWN = """## SQL Snippet Section
+
+Notes on the fake query below.
+
+```sql
+SELECT X FROM FAKE_TABLE_A GROUP BY Y HAVING COUNT(*)>1 ORDER BY DATEADD(day, -1, Y);
+```
+"""
+
+
+def test_import_markdown_drops_sql_stopwords_from_table_tags(tmp_path):
+    md_file = tmp_path / "sql_noise.md"
+    md_file.write_text(_SQL_NOISE_MARKDOWN, encoding="utf-8")
+
+    pm.procedural_memory_import_markdown(str(md_file))
+
+    state = pm._load()
+    entry = state["procedures"]["sql_snippet_section"]
+    assert "table:fake_table_a" in entry["tags"]
+    for noisy in ("table:select", "table:from", "table:group", "table:having",
+                  "table:order", "table:dateadd"):
+        assert noisy not in entry["tags"]
+
+
+def test_extract_table_tags_filters_sql_stopwords_directly():
+    body = "SELECT X FROM FAKE_TABLE_A GROUP BY Y HAVING COUNT(*)>1 ORDER BY DATEADD(day, -1, Y)"
+    tags = pm._extract_table_tags(body)
+    assert tags == ["table:fake_table_a"]
+
+
+def test_sql_stopwords_is_a_frozenset_covering_known_noise_words():
+    assert isinstance(pm.SQL_STOPWORDS, frozenset)
+    for w in ("SELECT", "GROUP", "HAVING", "EXISTS", "DATEADD", "EOMONTH"):
+        assert w in pm.SQL_STOPWORDS
