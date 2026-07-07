@@ -84,6 +84,28 @@ Check "Bridge Edge running (:9223 history/scrape) [optional]" `
     { Get-Json 'http://127.0.0.1:9223/json/version' | Out-Null; $true } `
     "optional: powershell -File scripts\start_bridge.ps1 -Keepalive   (only needed for past-conversation history)"
 
+# 5b. UI apps (CopilotChat.exe / FleetCockpit.exe) -- gitignored, so a fresh clone has neither
+#     until the first build. Checked individually so the fix line names the missing one.
+$copilotChatExe = Join-Path $repo "ui\CopilotChat.exe"
+$fleetCockpitExe = Join-Path $repo "ui\FleetCockpit.exe"
+Check "CopilotChat.exe built (ui\CopilotChat.exe)" `
+    { Test-Path $copilotChatExe } `
+    "run ui\rebuild_ui.ps1 (first build; needs .NET Framework 4.8 csc.exe, preinstalled on stock Windows 10/11)"
+
+Check "FleetCockpit.exe built (ui\FleetCockpit.exe)" `
+    { Test-Path $fleetCockpitExe } `
+    "run ui\rebuild_ui.ps1 (first build; needs .NET Framework 4.8 csc.exe, preinstalled on stock Windows 10/11)"
+
+# Bonus sub-check, only relevant when at least one UI exe is missing: is the .NET Framework 4.8
+# csc.exe actually present? This tells the user which situation they are in -- a normal first
+# build (csc.exe present, just hasn't been run yet) vs. a genuinely missing .NET Framework 4.8.
+if (-not (Test-Path $copilotChatExe) -or -not (Test-Path $fleetCockpitExe)) {
+    $cscPath = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+    Check "  (info) .NET Framework 4.8 csc.exe present ($cscPath)" `
+        { Test-Path $cscPath } `
+        "csc.exe not found -- enable 'Windows Features' > '.NET Framework 4.8 Advanced Services', then run ui\rebuild_ui.ps1. See docs\TROUBLESHOOTING.md ('csc.exe not found' row)"
+}
+
 # 6. auth end-to-end: the server ACCEPTS the Bearer on /mcp. The MCP streamable-HTTP
 #    endpoint needs an initialize/session, so a bare POST returns 400/406 even when auth
 #    is fine -- the right signal is "with the Bearer we are NOT rejected with 401/403"

@@ -71,6 +71,8 @@ git を使わないなら: GitHub ページの緑色の「**Code**」ボタン �
 
 全部 1 つの黒い窓＋ダイアログ＋サインイン画面で完結します。別 PC・別ターミナルは要りません。
 
+> 初回起動時のみ、チャット窓とコックピット窓をソースから自動コンパイルします（約 30 秒・.NET Framework 4.8 が必要ですが、Windows 10/11 標準搭載なので通常は何もインストール不要）。`csc.exe not found` と出た場合は [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) を参照。
+
 > ※ STEP 5 の手作業が既に済んでいる（`.env` にエージェント URL がある）状態で再実行すると、`quickstart.bat` は「`S` を押せば STEP 7（起動）まで飛ばせます」と聞いてきます。やり直したいときだけ `R` を押してください。
 
 ### 途中で止めてしまったら（再開）
@@ -229,6 +231,7 @@ A. `quickstart.bat` も `start_all.bat` も冪等です。**いつ何度実行�
 - [docs/SECURITY.md](docs/SECURITY.md) — 認証・認可モデルと運用上の注意
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — 症状別の直し方・doctor 各行の意味
 - [docs/ADVANCED.md](docs/ADVANCED.md) — 全ツールカタログ・relay/fleet の詳細・ODBC・OpenAI 互換エンドポイント・ベンチ再現手順
+- [scripts/AUTOSTART.md](scripts/AUTOSTART.md) — ログオン時自動起動の設定・解除方法
 
 ---
 
