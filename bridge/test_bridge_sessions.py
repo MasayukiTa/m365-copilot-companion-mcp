@@ -475,6 +475,202 @@ def test_resume_eligibility_happy_path():
     assert goal_text == "県名を挙げる"
 
 
+# ── VERIFIED LOOP: build_rubric_prompt ──────────────────────────────────────────────────────
+
+def test_build_rubric_prompt_contains_ac_and_deliverable_verbatim():
+    ac = "[AC-1] ちょうど5つの都道府県名が箇条書きされている"
+    deliverable = "1. 東京都\n2. 大阪府"
+    prompt = B.build_rubric_prompt(ac, deliverable)
+    assert ac in prompt
+    assert deliverable in prompt
+
+
+def test_build_rubric_prompt_demands_json_only():
+    prompt = B.build_rubric_prompt("AC", "deliverable")
+    assert "JSON" in prompt
+    assert '"pass"' in prompt
+    assert '"failed_ac"' in prompt
+    assert '"reasons"' in prompt
+
+
+def test_build_rubric_prompt_forbids_improvement_suggestions():
+    """spec SS5.3: critics must not offer free-form improvement suggestions -- the fixed
+    rubric text itself must say so, not just rely on convention."""
+    prompt = B.build_rubric_prompt("AC", "deliverable")
+    assert "改善案" in prompt or "提案" in prompt
+
+
+def test_build_rubric_prompt_handles_none_args():
+    prompt = B.build_rubric_prompt(None, None)
+    assert "JSON" in prompt
+
+
+# ── VERIFIED LOOP: parse_verdict ─────────────────────────────────────────────────────────────
+
+def test_parse_verdict_strict_json_pass():
+    text = '{"pass": true, "failed_ac": [], "reasons": []}'
+    v = B.parse_verdict(text)
+    assert v["ok"] is True
+    assert v["pass"] is True
+    assert v["failed_ac"] == []
+    assert v["reasons"] == []
+    assert v["needs_retry"] is False
+
+
+def test_parse_verdict_strict_json_fail():
+    text = '{"pass": false, "failed_ac": ["AC-1"], "reasons": ["only 3 listed, need 5"]}'
+    v = B.parse_verdict(text)
+    assert v["ok"] is True
+    assert v["pass"] is False
+    assert v["failed_ac"] == ["AC-1"]
+    assert v["reasons"] == ["only 3 listed, need 5"]
+
+
+def test_parse_verdict_embedded_json_in_prose():
+    text = ('承知しました、判定します。\n'
+            '{"pass": false, "failed_ac": ["AC-1"], "reasons": ["not enough items"]}\n'
+            '以上です。')
+    v = B.parse_verdict(text)
+    assert v["ok"] is True
+    assert v["pass"] is False
+    assert v["failed_ac"] == ["AC-1"]
+
+
+def test_parse_verdict_nested_braces_in_reasons_not_truncated():
+    text = '{"pass": false, "failed_ac": ["AC-1"], "reasons": ["missing {curly} example"]}'
+    v = B.parse_verdict(text)
+    assert v["ok"] is True
+    assert v["reasons"] == ["missing {curly} example"]
+
+
+def test_parse_verdict_garbage_needs_retry():
+    v = B.parse_verdict("そうですね、良い出来だと思います。")
+    assert v["ok"] is False
+    assert v["needs_retry"] is True
+    assert v["pass"] is False
+
+
+def test_parse_verdict_empty_text_needs_retry():
+    v = B.parse_verdict("")
+    assert v["ok"] is False
+    assert v["needs_retry"] is True
+
+
+def test_parse_verdict_none_text_needs_retry():
+    v = B.parse_verdict(None)
+    assert v["ok"] is False
+    assert v["needs_retry"] is True
+
+
+def test_parse_verdict_malformed_json_needs_retry():
+    v = B.parse_verdict('{"pass": true, "failed_ac": [oops]}')
+    assert v["ok"] is False
+    assert v["needs_retry"] is True
+
+
+def test_parse_verdict_missing_pass_key_needs_retry():
+    v = B.parse_verdict('{"failed_ac": [], "reasons": []}')
+    assert v["ok"] is False
+    assert v["needs_retry"] is True
+
+
+def test_parse_verdict_non_dict_json_needs_retry():
+    v = B.parse_verdict('[1, 2, 3]')
+    assert v["ok"] is False
+    assert v["needs_retry"] is True
+
+
+def test_parse_verdict_wrong_typed_failed_ac_defaults_empty():
+    v = B.parse_verdict('{"pass": false, "failed_ac": "AC-1", "reasons": "not a list"}')
+    assert v["ok"] is True
+    assert v["failed_ac"] == []
+    assert v["reasons"] == []
+
+
+def test_parse_verdict_pass_truthy_coercion():
+    v = B.parse_verdict('{"pass": 1}')
+    assert v["pass"] is True
+    v2 = B.parse_verdict('{"pass": 0}')
+    assert v2["pass"] is False
+
+
+# ── VERIFIED LOOP: build_continuation_message ────────────────────────────────────────────────
+
+def test_build_continuation_message_contains_failed_ac_and_reasons():
+    msg = B.build_continuation_message(["AC-1"], ["only 3 listed, need 5"])
+    assert "AC-1" in msg
+    assert "only 3 listed, need 5" in msg
+    assert B.WORK_MODE_DONE_MARKER in msg
+
+
+def test_build_continuation_message_multiple_items():
+    msg = B.build_continuation_message(["AC-1", "AC-2"], ["reason1", "reason2"])
+    assert "AC-1" in msg and "AC-2" in msg
+    assert "reason1" in msg and "reason2" in msg
+
+
+def test_build_continuation_message_empty_lists_still_valid():
+    msg = B.build_continuation_message([], [])
+    assert B.WORK_MODE_DONE_MARKER in msg
+
+
+# ── VERIFIED LOOP: is_oscillating ─────────────────────────────────────────────────────────────
+
+def test_is_oscillating_identical_sets():
+    assert B.is_oscillating(["AC-1", "AC-2"], ["AC-2", "AC-1"]) is True
+
+
+def test_is_oscillating_different_sets():
+    assert B.is_oscillating(["AC-1"], ["AC-2"]) is False
+
+
+def test_is_oscillating_progress_subset():
+    assert B.is_oscillating(["AC-1", "AC-2"], ["AC-1"]) is False
+
+
+def test_is_oscillating_first_verdict_never_oscillates():
+    assert B.is_oscillating(None, ["AC-1"]) is False
+    assert B.is_oscillating([], ["AC-1"]) is False
+
+
+def test_is_oscillating_both_empty_is_false():
+    assert B.is_oscillating([], []) is False
+
+
+# ── VERIFIED LOOP: decide_verify_outcome ─────────────────────────────────────────────────────
+
+def test_decide_verify_outcome_pass_wins():
+    assert B.decide_verify_outcome(True, 1, 3, False) == "done_verified"
+    assert B.decide_verify_outcome(True, 3, 3, True) == "done_verified"
+
+
+def test_decide_verify_outcome_oscillation_before_budget():
+    """An oscillating fail on the LAST allowed loop is still reported as oscillation, not a
+    plain budget exhaustion -- the operator should know the failures were IDENTICAL."""
+    assert B.decide_verify_outcome(False, 3, 3, True) == "escalate_oscillation"
+
+
+def test_decide_verify_outcome_budget_exhausted():
+    assert B.decide_verify_outcome(False, 3, 3, False) == "verify_failed"
+
+
+def test_decide_verify_outcome_keep_looping():
+    assert B.decide_verify_outcome(False, 1, 3, False) is None
+
+
+def test_decide_verify_outcome_zero_max_loops_never_exhausts_on_count():
+    # max_loops=0 is falsy -> the budget check is skipped (mirrors decide_outcome's
+    # max_turns==0 "unlimited" convention); oscillation can still fire independently.
+    assert B.decide_verify_outcome(False, 999, 0, False) is None
+    assert B.decide_verify_outcome(False, 999, 0, True) == "escalate_oscillation"
+
+
+# ── VERIFIED LOOP: default constants sanity ──────────────────────────────────────────────────
+
+def test_default_max_loops_constant():
+    assert B.DEFAULT_MAX_LOOPS == 3
+
+
 # ── WORK MODE: default constants sanity ──────────────────────────────────────────────────────
 
 def test_default_max_turns_constant():
