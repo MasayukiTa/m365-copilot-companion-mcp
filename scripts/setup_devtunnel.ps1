@@ -29,6 +29,28 @@ function Dt {
         $_ -and ($_ -notmatch 'Welcome to dev tunnels|License Terms|Privacy Statement|Report issues on|devtunnel --help|older version|upgrade to the latest|using one of|Direct download:|Package manager|^\s*$') })
 }
 
+# Derive a short, stable-per-machine suffix so a tunnel-id collision (devtunnel ids live in the
+# GLOBAL devtunnels.ms namespace, so two different users' clones of this repo both trying to
+# create the same default name WILL collide) can be resolved with a name that is unique per
+# machine/user yet stable across re-runs on that same machine (the URL must not keep changing --
+# Copilot Studio is registered against it). Lowercase alnum only, valid for a devtunnel id.
+function Get-MachineSuffix {
+    $seed = "$env:COMPUTERNAME|$env:USERNAME"
+    $sha1 = [System.Security.Cryptography.SHA1]::Create()
+    try {
+        $bytes = $sha1.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($seed))
+    } finally {
+        $sha1.Dispose()
+    }
+    $hex = -join ($bytes | ForEach-Object { $_.ToString("x2") })
+    return $hex.Substring(0, 6)
+}
+
+# Non-fatal notes collected from tolerated (idempotent "already exists") non-zero devtunnel exits,
+# surfaced later only if the tunnel ultimately fails to come up -- so the real CLI text is visible
+# instead of silently swallowed.
+$script:DtWarnings = @()
+
 # --- 1. ensure the CLI is installed ----------------------------------------------------------
 if (-not (Get-Command devtunnel -ErrorAction SilentlyContinue)) {
     Write-Host "[1/4] devtunnel CLI not found."
@@ -216,21 +238,90 @@ if ($reuse) {
     Write-Host "[3/4] reusing existing tunnel: $target"
 } elseif (-not ($existingNames -contains $target)) {
     Write-Host "[3/4] creating tunnel '$target' (anonymous-reachable, so Copilot Studio can connect)..."
-    Dt create $target --allow-anonymous | Out-Null
+    $createOut = Dt create $target --allow-anonymous
+    $createExit = $LASTEXITCODE
+    if ($createExit -ne 0) {
+        $createMsg = ($createOut -join "`n")
+        Write-Host "      devtunnel create failed (exit ${createExit}):"
+        Write-Host "      $createMsg"
+        if ($createMsg -match 'already exists|already in use|conflict|taken|forbidden|permission') {
+            $suffix = Get-MachineSuffix
+            $newTarget = "$target-$suffix"
+            Write-Host "      name collision in the global devtunnels.ms namespace -> retrying ONCE with a machine-unique name: $newTarget"
+            $createOut2 = Dt create $newTarget --allow-anonymous
+            $createExit2 = $LASTEXITCODE
+            if ($createExit2 -ne 0) {
+                $createMsg2 = ($createOut2 -join "`n")
+                Write-Host "      ERROR: devtunnel create failed again (exit ${createExit2}):"
+                Write-Host "      $createMsg2"
+                Write-Host "      devtunnel could not create/host the tunnel; the error above is from the devtunnel CLI."
+                Write-Host "      If it says the name is taken, this is now auto-suffixed per machine; re-run once."
+                Write-Host "      If login/permission, run: devtunnel user login"
+                exit 1
+            }
+            # Success on the suffixed retry -- this becomes the name we host/record from now on,
+            # and it will be picked up as MCP_TUNNEL_NAME on future re-runs so the URL stays stable.
+            $target = $newTarget
+        } else {
+            Write-Host "      devtunnel could not create/host the tunnel; the error above is from the devtunnel CLI."
+            Write-Host "      If login/permission, run: devtunnel user login"
+            exit 1
+        }
+    }
 } else {
     Write-Host "[3/4] tunnel '$target' exists"
 }
 
 if (-not ((Dt port list $target) -match ("\b" + [string]$Port + "\b"))) {
     Write-Host "      adding port $Port..."
-    Dt port create $target -p $Port --protocol http | Out-Null
+    $portOut = Dt port create $target -p $Port --protocol http
+    $portExit = $LASTEXITCODE
+    if ($portExit -ne 0) {
+        $portMsg = ($portOut -join "`n")
+        if ($portMsg -match 'already exists|already in use|conflict') {
+            $script:DtWarnings += "port create ($target, port $Port): $portMsg"
+        } else {
+            Write-Host "      ERROR: devtunnel port create failed (exit ${portExit}):"
+            Write-Host "      $portMsg"
+            Write-Host "      devtunnel could not create/host the tunnel; the error above is from the devtunnel CLI."
+            Write-Host "      If login/permission, run: devtunnel user login"
+            exit 1
+        }
+    }
 }
 
 # Idempotently re-assert anonymous access so a half-configured tunnel from an aborted earlier run
-# (created but access never applied, or port added without access) gets repaired on re-run. These
-# are no-ops if the access already exists.
-Dt access create $target --anonymous | Out-Null
-Dt access create $target -p $Port --anonymous | Out-Null
+# (created but access never applied, or port added without access) gets repaired on re-run. An
+# "already exists"/"conflict" result is treated as success (idempotent); anything else is a real
+# error and is surfaced instead of silently swallowed.
+$accessOut1 = Dt access create $target --anonymous
+$accessExit1 = $LASTEXITCODE
+if ($accessExit1 -ne 0) {
+    $accessMsg1 = ($accessOut1 -join "`n")
+    if ($accessMsg1 -match 'already exists|already in use|conflict') {
+        $script:DtWarnings += "access create ($target, tunnel): $accessMsg1"
+    } else {
+        Write-Host "      ERROR: devtunnel access create (tunnel-level) failed (exit ${accessExit1}):"
+        Write-Host "      $accessMsg1"
+        Write-Host "      devtunnel could not create/host the tunnel; the error above is from the devtunnel CLI."
+        Write-Host "      If login/permission, run: devtunnel user login"
+        exit 1
+    }
+}
+$accessOut2 = Dt access create $target -p $Port --anonymous
+$accessExit2 = $LASTEXITCODE
+if ($accessExit2 -ne 0) {
+    $accessMsg2 = ($accessOut2 -join "`n")
+    if ($accessMsg2 -match 'already exists|already in use|conflict') {
+        $script:DtWarnings += "access create ($target, port $Port): $accessMsg2"
+    } else {
+        Write-Host "      ERROR: devtunnel access create (port-level) failed (exit ${accessExit2}):"
+        Write-Host "      $accessMsg2"
+        Write-Host "      devtunnel could not create/host the tunnel; the error above is from the devtunnel CLI."
+        Write-Host "      If login/permission, run: devtunnel user login"
+        exit 1
+    }
+}
 
 # --- 4. host the tunnel so the public URL is assigned, then surface it ------------------------
 # IMPORTANT: a freshly-created tunnel has NO port URL in `devtunnel show` until it is HOSTED at
@@ -264,10 +355,18 @@ if ($url) {
     Write-Host " Paste this URL (plus your MCP endpoint path) into the Copilot"
     Write-Host " Studio MCP connector. The tunnel name is: $target"
 } else {
+    if ($script:DtWarnings.Count -gt 0) {
+        Write-Host " devtunnel CLI messages captured along the way (may explain the failure):"
+        foreach ($w in $script:DtWarnings) { Write-Host "   $w" }
+        Write-Host ""
+    }
     Write-Host " Tunnel '$target' is set up but no public URL appeared after hosting."
     Write-Host "==================================================================="
-    Write-Host " Run quickstart.bat again; if it still fails, run:  devtunnel host $target"
-    Write-Host " in a separate window and look for the https://...devtunnels.ms URL."
+    Write-Host " devtunnel could not create/host the tunnel; any error text above is from the devtunnel CLI."
+    Write-Host " If it said the name is taken, this script now auto-suffixes the name per machine -- re-run once."
+    Write-Host " If login/permission related, run: devtunnel user login"
+    Write-Host " Otherwise run  devtunnel host $target  in a separate window and look for the"
+    Write-Host " https://...devtunnels.ms URL."
     # Still record the tunnel name so a re-run can reuse it, but fail so quickstart.bat knows
     # the tunnel is NOT ready.
     try {
