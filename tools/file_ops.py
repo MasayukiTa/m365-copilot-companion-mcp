@@ -49,8 +49,31 @@ ALLOWED_BASES = _parse_allowed_bases()  # None => unrestricted (all drives)
 ALLOWED_BASE = ALLOWED_BASES[0] if ALLOWED_BASES else Path("~").expanduser().resolve()
 
 
+# Well-known Windows user-profile folder names. When a caller passes a bare
+# relative name like "Desktop" it almost always means "my Desktop", not
+# "whatever happens to be in the server process's cwd". Anchoring these to
+# the home dir avoids a decoy-shadow: a repo checkout can itself contain a
+# same-named folder (e.g. a leftover demo "Desktop/" dir at the repo root),
+# which would otherwise silently shadow the real user folder and make an
+# agent wrongly conclude the real folder/files are missing.
+_USER_PROFILE_FOLDER_NAMES = {
+    "desktop", "documents", "downloads", "pictures", "music", "videos",
+    "favorites", "links", "contacts", "saved games", "searches", "onedrive",
+}
+
+
 def _validate_path(path: str) -> Path:
-    p = Path(path).expanduser().resolve()
+    p = None
+    try:
+        pp = Path(path)
+        if not pp.is_absolute() and not str(path).startswith("~"):
+            parts = pp.parts
+            if parts and parts[0].lower() in _USER_PROFILE_FOLDER_NAMES:
+                p = (Path("~").expanduser() / path).resolve()
+    except Exception:
+        p = None
+    if p is None:
+        p = Path(path).expanduser().resolve()
     if ALLOWED_BASES is None:
         return p  # unrestricted (default-open policy)
     for base in ALLOWED_BASES:
@@ -78,6 +101,12 @@ def read_file(
     """
     try:
         p = _validate_path(path)
+        if not p.exists():
+            return (
+                f"[read_file error: not found: {p}]\n"
+                "Hint: to locate a file by name anywhere under a root, use "
+                "find_files(name_contains=..., path=...)."
+            )
         lines = p.read_text(encoding=encoding).splitlines()
         start = max(start_line - 1, 0)
         end = None if max_lines is None else start + max_lines
@@ -126,6 +155,12 @@ def list_directory(path: str = ".", recursive: bool = False, max_entries: int = 
     """
     try:
         p = _validate_path(path)
+        if not p.exists():
+            return (
+                f"[list_directory error: not found: {p}]\n"
+                "Hint: to locate a file/folder by name anywhere under a root, use "
+                "find_files(name_contains=..., path=...)."
+            )
         if not p.is_dir():
             return f"[list_directory error: not a directory: {p}]"
         entries = p.rglob("*") if recursive else p.iterdir()
@@ -396,7 +431,11 @@ def file_metadata(path: str) -> str:
     try:
         p = _validate_path(path)
         if not p.exists():
-            return f"[file_metadata error: not found: {p}]"
+            return (
+                f"[file_metadata error: not found: {p}]\n"
+                "Hint: to locate a file/folder by name anywhere under a root, use "
+                "find_files(name_contains=..., path=...)."
+            )
         st = p.stat()
         lines = [
             f"path: {p}",
