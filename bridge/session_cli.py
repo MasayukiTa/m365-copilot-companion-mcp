@@ -34,6 +34,10 @@ Commands:
   /goal <text>       work mode: autonomous multi-turn loop. Type while it
                      runs to steer (injected at the next turn boundary);
                      Ctrl+C asks it to stop after the current turn.
+  /goal <text> :: <acceptance criteria>
+                     same, but adds a verification phase: after the work
+                     loop finishes, a critic checks the AC and can send it
+                     back for fixes (up to max_loops, default 3).
   /help              show this help
   /quit              exit
 Anything else is sent to Copilot as a single message.
@@ -184,7 +188,47 @@ def goal_summary(data: dict) -> str:
         return f"stopped after {turns} turns"
     if outcome == "max_turns":
         return f"max turns reached ({turns} turns)"
+    if outcome == "done_verified":
+        return f"goal done + verified ({turns} turns)"
+    if outcome == "verify_failed":
+        return f"verification FAILED after max loops ({turns} turns)"
+    if outcome == "escalate_oscillation":
+        return f"escalated: same ACs failing repeatedly - human review needed ({turns} turns)"
     return f"goal ended: {outcome} after {turns} turns"
+
+
+def split_goal_arg(arg: str):
+    """Split a /goal argument on the first literal ' :: ' separator.
+
+    Returns (text, ac) where ac is "" when no separator is present. Only the
+    first occurrence splits; the AC side keeps any further " :: " verbatim.
+    Both sides are stripped of surrounding whitespace.
+    """
+    sep = " :: "
+    idx = arg.find(sep)
+    if idx == -1:
+        return arg.strip(), ""
+    text = arg[:idx].strip()
+    ac = arg[idx + len(sep):].strip()
+    return text, ac
+
+
+def render_verify_start(loop_n) -> str:
+    return f"--- verify (loop {loop_n}) ---"
+
+
+def render_verdict(verdict: dict) -> str:
+    """Render a {"verdict": {...}} payload as a one-line status."""
+    passed = verdict.get("pass")
+    if passed:
+        return "verdict: PASS"
+    failed_ac = verdict.get("failed_ac") or []
+    reasons = verdict.get("reasons") or []
+    reason_str = "; ".join(reasons)
+    if len(reason_str) > 120:
+        reason_str = reason_str[:120]
+    ac_str = ", ".join(failed_ac)
+    return f"verdict: FAIL [{ac_str}] {reason_str}".rstrip()
 
 
 # HTTP layer (thin; mocked/stubbed in tests)
@@ -241,8 +285,12 @@ class BridgeClient:
     def stream(self, msg: str):
         return self._sse_lines("/stream", {"msg": msg})
 
-    def goal(self, text: str):
-        return self._sse_lines("/goal", {"text": text})
+    def goal(self, text: str, ac: str = "", max_loops: int | None = None):
+        params = {"text": text}
+        if ac:
+            params["ac"] = ac
+            params["max_loops"] = max_loops if max_loops is not None else 3
+        return self._sse_lines("/goal", params)
 
     def send(self, sid: str, msg: str) -> dict:
         body = self._get("/send", {"sid": sid, "msg": msg})
@@ -340,13 +388,18 @@ def _print_stream(client: BridgeClient, msg: str) -> None:
     print()
 
 
-def run_goal(client, text: str, kbd_q, out=None, stop_grace: float = 60.0) -> None:
+def run_goal(client, text: str, kbd_q, out=None, stop_grace: float = 60.0,
+             ac: str = "", max_loops: int | None = None) -> None:
     """Work mode: stream /goal, multiplexing SSE chunks with keyboard lines.
 
     kbd_q is a queue of lines typed while streaming; each is sent immediately
     via /send (steering, injected server-side at the next turn boundary).
     First Ctrl+C -> /stop and keep consuming until goal_done (or grace runs
     out); second Ctrl+C -> hard-return to the prompt.
+
+    When ac is non-empty, the server runs a VERIFICATION phase after the work
+    loop reaches DONE: {"verify_start": n} and {"verdict": {...}} payloads are
+    interleaved in the stream and rendered as render-only events.
     """
     out = out or sys.stdout
     sid = ""
@@ -360,7 +413,7 @@ def run_goal(client, text: str, kbd_q, out=None, stop_grace: float = 60.0) -> No
 
     def _pump():
         try:
-            for ln in client.goal(text):
+            for ln in client.goal(text, ac=ac, max_loops=max_loops):
                 sse_q.put(ln)
         except Exception as e:
             sse_q.put('data: {"delta": "[goal stream error: %s]"}\n' % str(e).replace('"', "'"))
@@ -406,6 +459,11 @@ def run_goal(client, text: str, kbd_q, out=None, stop_grace: float = 60.0) -> No
                     acc, printed = "", 0
                 elif "steered" in data:
                     out.write(f"[steered: {data['steered']}]\n")
+                elif "verify_start" in data:
+                    out.write(f"\n{render_verify_start(data['verify_start'])}\n")
+                    acc, printed = "", 0
+                elif "verdict" in data:
+                    out.write(render_verdict(data["verdict"]) + "\n")
                 elif "goal_done" in data:
                     out.write(goal_summary(data) + "\n")
                 elif "replace" in data or "delta" in data:
@@ -557,9 +615,15 @@ def repl(client: BridgeClient, reader: StdinReader | None = None, chat_only: boo
                 _do_new(client, arg)
             elif cmd == "goal":
                 if not arg:
-                    print("usage: /goal <text>")
+                    print("usage: /goal <text> [:: acceptance criteria]")
                 else:
-                    run_goal(client, arg, reader.q)
+                    goal_text, ac = split_goal_arg(arg)
+                    if not goal_text:
+                        print("usage: /goal <text> [:: acceptance criteria]")
+                    elif ac:
+                        run_goal(client, goal_text, reader.q, ac=ac, max_loops=3)
+                    else:
+                        run_goal(client, goal_text, reader.q)
             else:
                 print(f"[unknown command /{cmd}. Type /help for a list.]")
             continue
