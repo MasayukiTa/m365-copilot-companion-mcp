@@ -291,6 +291,7 @@ class FakeClient:
         self.new_calls = []
         self.send_calls = []
         self.adopt_calls = []
+        self.goal_calls = []
         self.stop_calls = 0
         self._resume_ok = resume_ok
         self._goal_lines = goal_lines or []
@@ -317,7 +318,8 @@ class FakeClient:
         self.new_calls.append(title)
         return {"ok": True}
 
-    def goal(self, text):
+    def goal(self, text, ac="", max_loops=None):
+        self.goal_calls.append((text, ac, max_loops))
         for line in self._goal_lines:
             yield line
 
@@ -561,3 +563,181 @@ def test_run_goal_stopped_outcome_summary():
 
 def test_help_text_mentions_goal():
     assert "/goal" in cli.HELP_TEXT
+
+
+# --------------------------------------------------------------------------
+# VERIFICATION phase -- {"verify_start": n} / {"verdict": {...}} payloads,
+# and the three new goal_done outcomes: done_verified / verify_failed /
+# escalate_oscillation.
+# --------------------------------------------------------------------------
+
+VERIFIED_FLOW_LINES = [
+    'data: {"delta": "Implementing the fix."}\n', '\n',
+    'data: {"turn_done": 1, "text": "Implementing the fix."}\n', '\n',
+    'data: {"verify_start": 1}\n', '\n',
+    'data: {"verdict": {"pass": true, "failed_ac": [], "reasons": [], "loop": 1}}\n', '\n',
+    'data: {"goal_done": true, "outcome": "done_verified", "turns": 1}\n', '\n',
+    'event: done\n', 'data: {}\n', '\n',
+]
+
+
+def test_run_goal_renders_full_verified_flow():
+    client = FakeClient(sessions=[_mk_session("s1")], goal_lines=VERIFIED_FLOW_LINES)
+    out = _run_goal(client)
+    assert "Implementing the fix." in out
+    assert "--- turn 1 ---" in out
+    assert "--- verify (loop 1) ---" in out
+    assert "verdict: PASS" in out
+    assert "goal done + verified (1 turns)" in out
+
+
+FAIL_THEN_PASS_LINES = [
+    'data: {"delta": "First attempt."}\n', '\n',
+    'data: {"turn_done": 1, "text": "First attempt."}\n', '\n',
+    'data: {"verify_start": 1}\n', '\n',
+    'data: {"verdict": {"pass": false, "failed_ac": ["AC-1", "AC-2"], "reasons": ["missing edge case", "off by one"], "loop": 1}}\n', '\n',
+    'data: {"delta": "Second attempt."}\n', '\n',
+    'data: {"turn_done": 2, "text": "Second attempt."}\n', '\n',
+    'data: {"verify_start": 2}\n', '\n',
+    'data: {"verdict": {"pass": true, "failed_ac": [], "reasons": [], "loop": 2}}\n', '\n',
+    'data: {"goal_done": true, "outcome": "done_verified", "turns": 2}\n', '\n',
+    'event: done\n', 'data: {}\n', '\n',
+]
+
+
+def test_run_goal_renders_fail_then_continuation_then_pass():
+    client = FakeClient(sessions=[_mk_session("s1")], goal_lines=FAIL_THEN_PASS_LINES)
+    out = _run_goal(client)
+    assert "--- verify (loop 1) ---" in out
+    assert "verdict: FAIL [AC-1, AC-2] missing edge case; off by one" in out
+    assert "Second attempt." in out
+    assert "--- turn 2 ---" in out
+    assert "--- verify (loop 2) ---" in out
+    assert "verdict: PASS" in out
+    assert "goal done + verified (2 turns)" in out
+    # PASS should come after the FAIL in the rendered order
+    assert out.index("verdict: FAIL") < out.index("verdict: PASS")
+
+
+def test_render_verdict_truncates_long_reasons():
+    verdict = {
+        "pass": False,
+        "failed_ac": ["AC-1"],
+        "reasons": ["x" * 200],
+        "loop": 1,
+    }
+    rendered = cli.render_verdict(verdict)
+    assert rendered.startswith("verdict: FAIL [AC-1] ")
+    # reason portion truncated to ~120 chars
+    reason_part = rendered.split("] ", 1)[1]
+    assert len(reason_part) <= 120
+
+
+def test_render_verdict_pass_ignores_failed_ac_and_reasons():
+    assert cli.render_verdict({"pass": True}) == "verdict: PASS"
+
+
+def test_goal_summary_new_verification_outcomes():
+    assert cli.goal_summary({"outcome": "done_verified", "turns": 4}) == "goal done + verified (4 turns)"
+    assert cli.goal_summary({"outcome": "verify_failed", "turns": 6}) == (
+        "verification FAILED after max loops (6 turns)"
+    )
+    assert cli.goal_summary({"outcome": "escalate_oscillation", "turns": 9}) == (
+        "escalated: same ACs failing repeatedly - human review needed (9 turns)"
+    )
+
+
+def test_run_goal_verify_failed_outcome_summary():
+    lines = [
+        'data: {"delta": "partial"}\n', '\n',
+        'data: {"verify_start": 3}\n', '\n',
+        'data: {"verdict": {"pass": false, "failed_ac": ["AC-1"], "reasons": ["still broken"], "loop": 3}}\n', '\n',
+        'data: {"goal_done": true, "outcome": "verify_failed", "turns": 6}\n', '\n',
+        'event: done\n', 'data: {}\n', '\n',
+    ]
+    client = FakeClient(sessions=[_mk_session("s1")], goal_lines=lines)
+    out = _run_goal(client)
+    assert "verification FAILED after max loops (6 turns)" in out
+
+
+def test_run_goal_escalate_oscillation_outcome_summary():
+    lines = [
+        'data: {"verdict": {"pass": false, "failed_ac": ["AC-1"], "reasons": ["same failure"], "loop": 2}}\n', '\n',
+        'data: {"goal_done": true, "outcome": "escalate_oscillation", "turns": 9}\n', '\n',
+        'event: done\n', 'data: {}\n', '\n',
+    ]
+    client = FakeClient(sessions=[_mk_session("s1")], goal_lines=lines)
+    out = _run_goal(client)
+    assert "escalated: same ACs failing repeatedly - human review needed (9 turns)" in out
+
+
+def test_run_goal_passes_ac_and_max_loops_to_client():
+    client = FakeClient(sessions=[_mk_session("s1")], goal_lines=GOAL_LINES)
+    kbd_q = queue.Queue()
+    out = io.StringIO()
+    cli.run_goal(client, "fix it", kbd_q, out=out, stop_grace=1.0, ac="tests pass", max_loops=5)
+    assert client.goal_calls == [("fix it", "tests pass", 5)]
+
+
+def test_run_goal_without_ac_passes_empty_defaults():
+    client = FakeClient(sessions=[_mk_session("s1")], goal_lines=GOAL_LINES)
+    _run_goal(client)
+    assert client.goal_calls == [("fix it", "", None)]
+
+
+def test_run_goal_verify_events_do_not_break_parser():
+    # verify_start / verdict payloads interleaved with plain deltas must not
+    # raise or corrupt the running text accumulator.
+    lines = [
+        'data: {"delta": "before"}\n', '\n',
+        'data: {"verify_start": 1}\n', '\n',
+        'data: {"verdict": {"pass": true, "failed_ac": [], "reasons": [], "loop": 1}}\n', '\n',
+        'data: {"delta": "after"}\n', '\n',
+        'data: {"goal_done": true, "outcome": "done_verified", "turns": 1}\n', '\n',
+        'event: done\n', 'data: {}\n', '\n',
+    ]
+    client = FakeClient(sessions=[_mk_session("s1")], goal_lines=lines)
+    out = _run_goal(client)
+    assert "before" in out
+    assert "after" in out
+    assert "goal done + verified (1 turns)" in out
+
+
+# --------------------------------------------------------------------------
+# /goal <text> :: <acceptance criteria> arg splitting
+# --------------------------------------------------------------------------
+
+def test_split_goal_arg_no_separator_returns_empty_ac():
+    text, ac = cli.split_goal_arg("fix the parser bug")
+    assert text == "fix the parser bug"
+    assert ac == ""
+
+
+def test_split_goal_arg_splits_on_double_colon():
+    text, ac = cli.split_goal_arg("fix the parser bug :: pytest -q is green")
+    assert text == "fix the parser bug"
+    assert ac == "pytest -q is green"
+
+
+def test_split_goal_arg_trailing_separator_empty_ac():
+    text, ac = cli.split_goal_arg("fix the parser bug :: ")
+    assert text == "fix the parser bug"
+    assert ac == ""
+
+
+def test_split_goal_arg_only_separator_both_empty():
+    text, ac = cli.split_goal_arg(" :: ")
+    assert text == ""
+    assert ac == ""
+
+
+def test_split_goal_arg_further_double_colons_kept_in_ac():
+    text, ac = cli.split_goal_arg("do the thing :: AC-1 done :: AC-2 done")
+    assert text == "do the thing"
+    assert ac == "AC-1 done :: AC-2 done"
+
+
+def test_split_goal_arg_strips_whitespace_both_sides():
+    text, ac = cli.split_goal_arg("  fix it   ::   tests pass  ")
+    assert text == "fix it"
+    assert ac == "tests pass"
