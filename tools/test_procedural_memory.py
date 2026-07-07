@@ -376,3 +376,86 @@ def test_sql_stopwords_is_a_frozenset_covering_known_noise_words():
     assert isinstance(pm.SQL_STOPWORDS, frozenset)
     for w in ("SELECT", "GROUP", "HAVING", "EXISTS", "DATEADD", "EOMONTH"):
         assert w in pm.SQL_STOPWORDS
+
+
+# ===========================================================================
+# _slugify collision fix (defect P1: non-ASCII headings all collapsed to the
+# same "untitled" key, so a markdown import silently lost data)
+# ===========================================================================
+
+
+def test_slugify_two_different_nonascii_strings_get_different_slugs():
+    slug_a = pm._slugify("材料トレース")
+    slug_b = pm._slugify("銅箔の保証期限")
+    assert slug_a != slug_b
+    assert slug_a and slug_a != "untitled"
+    assert slug_b and slug_b != "untitled"
+
+
+def test_slugify_same_nonascii_string_is_deterministic():
+    assert pm._slugify("材料トレース") == pm._slugify("材料トレース")
+
+
+def test_slugify_ascii_heading_unchanged_from_old_behavior():
+    # Headings that already produce a meaningful, non-empty ascii slug must
+    # keep exactly the same key as before this fix (backward compat with
+    # existing stored English procedures).
+    assert pm._slugify("restart prod backend") == "restart_prod_backend"
+    assert pm._slugify("Another Temp Task") == "another_temp_task"
+
+
+_FAKE_JP_MARKDOWN = """## 材料トレース
+
+Some fake body about material traceability. FAKE_TABLE_A mentioned here.
+
+## 銅箔の保証期限
+
+Some other fake body about a warranty period.
+
+## English Heading
+
+Plain ascii body text here.
+"""
+
+
+def test_import_markdown_distinct_japanese_headings_get_distinct_keys(tmp_path):
+    """Reproduces the P1 data-loss bug directly: 2 distinct Japanese headings
+    + 1 ascii heading must yield 3 DISTINCT stored keys, not 1-2."""
+    md_file = tmp_path / "fake_jp_notes.md"
+    md_file.write_text(_FAKE_JP_MARKDOWN, encoding="utf-8")
+
+    result = pm.procedural_memory_import_markdown(str(md_file))
+    assert "imported 3 chunks from fake_jp_notes.md" in result
+
+    state = pm._load()
+    assert len(state["procedures"]) == 3
+
+    # the ascii heading's slug is unchanged from the old behavior
+    assert "english_heading" in state["procedures"]
+
+    # both japanese headings are present as DISTINCT, non-"untitled" keys
+    jp_keys = [k for k in state["procedures"] if k != "english_heading"]
+    assert len(jp_keys) == 2
+    assert "untitled" not in jp_keys
+    assert jp_keys[0] != jp_keys[1]
+
+
+def test_import_markdown_same_japanese_doc_reimport_is_idempotent(tmp_path):
+    """Re-importing the SAME markdown must keep the key count at 3 (in-place
+    revision bump), not grow via new hash collisions or drift."""
+    md_file = tmp_path / "fake_jp_notes.md"
+    md_file.write_text(_FAKE_JP_MARKDOWN, encoding="utf-8")
+
+    pm.procedural_memory_import_markdown(str(md_file))
+    state_after_first = pm._load()
+    assert len(state_after_first["procedures"]) == 3
+
+    pm.procedural_memory_import_markdown(str(md_file))
+    state_after_second = pm._load()
+    assert len(state_after_second["procedures"]) == 3
+    assert set(state_after_first["procedures"]) == set(state_after_second["procedures"])
+
+    # revision count bumped on the re-import, confirming it was an in-place
+    # overwrite (not a fresh duplicate landing on a new slug)
+    for entry in state_after_second["procedures"].values():
+        assert entry["history_count"] == 2

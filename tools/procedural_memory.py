@@ -14,6 +14,7 @@ is a keyword/substring index over a JSON dict, which is the right scale for a
 single-operator repeat-task environment (same judgment call memory_ops already
 made).
 """
+import hashlib
 import json
 import re
 import time
@@ -146,9 +147,35 @@ def _save(state: dict) -> None:
 
 
 def _slugify(intent: str) -> str:
-    """Turn an intent string into a stable dict key: lowercase, non-alnum -> '_'."""
-    slug = re.sub(r"[^a-z0-9]+", "_", intent.strip().lower()).strip("_")
-    return slug or "untitled"
+    """Turn an intent string into a stable, collision-free dict key.
+
+    ASCII fast path (unchanged from the original behavior, so every existing
+    stored English-heading procedure keeps its existing key): lowercase,
+    non-alnum -> '_'.
+
+    Bug (fixed here): that ASCII-only rule strips every non-ASCII character,
+    so any two DIFFERENT Japanese (or other non-ASCII) headings -- e.g.
+    "材料トレース" and "銅箔の保証期限" -- both collapse to the same empty
+    string and land on the same bare fallback "untitled" key. A markdown
+    import of N such headings then silently overwrites down to ~1-2 stored
+    entries via procedural_memory_save's overwrite-by-slug semantics, even
+    though the import still reports "imported N chunks".
+
+    Fix: when the ASCII-only slug would be empty or exactly the bare
+    fallback "untitled", derive the slug from the FULL original intent text
+    instead: the (possibly empty) ascii part, plus a short deterministic
+    suffix -- an 8-hex-char sha1 digest of the intent (utf-8). Because the
+    digest is a pure function of the intent string, two distinct non-ASCII
+    headings get two distinct slugs, while re-importing the exact SAME
+    heading text still lands on the exact SAME slug (idempotent in-place
+    refresh/revision-bump, not a growing pile of duplicates).
+    """
+    ascii_slug = re.sub(r"[^a-z0-9]+", "_", intent.strip().lower()).strip("_")
+    if ascii_slug and ascii_slug != "untitled":
+        return ascii_slug
+    digest = hashlib.sha1(intent.strip().encode("utf-8")).hexdigest()[:8]
+    prefix = ascii_slug or "jp"
+    return f"{prefix}-{digest}"[:80]
 
 
 def procedural_memory_save(

@@ -18,8 +18,12 @@ Env contract (ASCII only):
         of a SQL statement into tags for record_query.
 
 Import safety: this module never imports pyodbc or pandas, so importing it
-can never fail for lack of a DB driver. procedural_memory is imported lazily
-inside _save() for the same reason odbc_ops.py imports pyodbc lazily.
+can never fail for lack of a DB driver. procedural_memory.py has the same
+property (json/re/time/pathlib + .security only), so its SQL_STOPWORDS
+constant is imported at module level here (single source of truth for
+SQL-syntax-word filtering, shared with procedural_memory's own table-tag
+extraction) -- but procedural_memory_save itself is still imported lazily
+inside _save(), same reasoning as odbc_ops.py importing pyodbc lazily.
 
 Failure safety: every public function (record_query / record_tables /
 record_columns) is wrapped in its own try/except and NEVER raises and NEVER
@@ -33,18 +37,38 @@ odbc_columns read tools are intentionally UNGATED (openWorldHint, no
 require_unlocked call) so a not-yet-unlocked remote client can call them.
 When that happens, procedural_memory_save returns a "[locked ...]" string
 instead of writing; this module treats that (and any other bracketed
-response) as "skipped" and swallows it quietly -- it never surfaces the
-locked state as an error and never raises. Only the SQL text, table/column
-NAMES, and a short count summary are ever stored -- never full result rows.
+response) as "skipped" and swallows it quietly to the CALLER -- it never
+surfaces the locked state as an error and never raises. It IS tracked,
+though: _save() increments module-level counters (_stats) so the failure is
+no longer invisible, and data_memory_status() (an ungated, read-only tool)
+reports them plus whether MCP_DATA_MEMORY_AUTO is on. Only the SQL text,
+table/column NAMES, and a short count summary are ever stored -- never full
+result rows.
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 from typing import Optional
 
+from .procedural_memory import SQL_STOPWORDS
+
+_logger = logging.getLogger(__name__)
+
 _TABLE_TOKEN_RE = re.compile(r"\b[A-Z][A-Z0-9_]{4,}\b")
 _WS_RE = re.compile(r"\s+")
+
+# Process-lifetime counters for data_memory_status() -- visibility into the P2
+# defect: odbc_query/odbc_tables/odbc_columns are intentionally UNGATED (see
+# module docstring), but the auto-memory write behind them goes through
+# procedural_memory_save, which IS require_unlocked()-gated. Before this fix a
+# locked remote caller's DB exploration worked while every auto-memory write
+# failed silently forever, with nothing to grep for. These counters (plus the
+# data_memory_status() tool below) make that visible instead of a bare
+# "memory never updates" with no signal why.
+_stats = {"saved": 0, "skipped_locked": 0, "skipped_error": 0}
+_locked_logged = False
 
 # Fixed column offsets mirroring the exact formatting in tools/odbc_ops.py
 # (odbc_tables / odbc_columns). These are best-effort extraction helpers --
@@ -78,11 +102,20 @@ def _looks_like_error_or_empty(result_text: str) -> bool:
 
 
 def _extract_table_tags(text: str, max_tokens: Optional[int] = None) -> list[str]:
-    """Up to `max_tokens` distinct SCREAMING_SNAKE_CASE-ish tokens as "table:<lower>" tags."""
+    """Up to `max_tokens` distinct SCREAMING_SNAKE_CASE-ish tokens as "table:<lower>" tags.
+
+    Tokens that are pure SQL syntax (SELECT, GROUP, HAVING, DATEADD, ...) or too
+    short (< 4 chars) to plausibly be a real table/column name are dropped before
+    being tagged, same filtering procedural_memory.py's own _extract_table_tags
+    applies to markdown-import chunks -- SQL_STOPWORDS is the single source of
+    truth for the stopword list (imported from procedural_memory, not duplicated).
+    """
     cap = max_tokens if max_tokens is not None else _table_tokens_max()
     seen: list[str] = []
     for m in _TABLE_TOKEN_RE.finditer(text or ""):
         tok = m.group(0)
+        if tok.upper() in SQL_STOPWORDS or len(tok) < 4:
+            continue
         if tok not in seen:
             seen.append(tok)
         if len(seen) >= cap:
@@ -123,18 +156,68 @@ def _extract_column_names_from_listing(result_text: str) -> list[str]:
 
 
 def _save(intent: str, snippet: str, tags: str, context: str) -> None:
-    """Call procedural_memory_save and swallow any deny/error response.
+    """Call procedural_memory_save, track the outcome in _stats, and swallow
+    any deny/error response so callers never see it and never raise.
 
     procedural_memory_save is require_unlocked()-gated; when the caller isn't
     unlocked (or any other error occurs) it returns a bracketed string like
     "[locked ...]" or "[procedural_memory_save error: ...]" instead of
-    raising. Either way we treat it as "skipped" here -- never surface it,
-    never raise.
+    raising. Either way the CALLER (record_query/record_tables/record_columns)
+    still never sees it and never raises -- but the outcome is no longer
+    invisible: _stats (and data_memory_status()) now make it visible, and the
+    first locked-skip logs one ASCII line so it shows up in server logs too.
     """
+    global _locked_logged
     from .procedural_memory import procedural_memory_save
 
-    procedural_memory_save(intent=intent, snippet=snippet, tags=tags, context=context)
+    result = procedural_memory_save(intent=intent, snippet=snippet, tags=tags, context=context)
+    if isinstance(result, str) and result.startswith("[locked"):
+        _stats["skipped_locked"] += 1
+        if not _locked_logged:
+            _locked_logged = True
+            _logger.warning(
+                "data_memory_hook: auto-memory save skipped (client locked); "
+                "saves will resume after unlock"
+            )
+    elif isinstance(result, str) and result.startswith("[") and " error:" in result:
+        _stats["skipped_error"] += 1
+    else:
+        _stats["saved"] += 1
     return None
+
+
+def data_memory_status() -> str:
+    """Read-only status of the DB-exploration auto-memory hook (no unlock needed).
+
+    Reports whether MCP_DATA_MEMORY_AUTO is on and this PROCESS's save/skip
+    counters, so a silent failure mode becomes visible: odbc_query / odbc_tables /
+    odbc_columns are intentionally ungated, so a not-yet-unlocked remote client's
+    DB exploration works fine -- but the auto-memory write behind it goes through
+    procedural_memory_save, which IS require_unlocked()-gated, so every such
+    write was previously failing silently forever ("memory never updates" with
+    no visible cause). This tool itself stays ungated (read-only, same reasoning
+    as the odbc_* read tools) so it's reachable even while locked -- that's the
+    point: you can check status before/without ever unlocking.
+    """
+    auto_on = _auto_enabled()
+    saved = _stats["saved"]
+    skipped_locked = _stats["skipped_locked"]
+    skipped_error = _stats["skipped_error"]
+    lines = [
+        "auto: %s (MCP_DATA_MEMORY_AUTO=%s)"
+        % ("ON" if auto_on else "OFF", os.environ.get("MCP_DATA_MEMORY_AUTO", "0")),
+        "saved=%d skipped_locked=%d skipped_error=%d (this process, since start)"
+        % (saved, skipped_locked, skipped_error),
+    ]
+    if skipped_locked > 0:
+        lines.append(
+            "hint: skipped_locked > 0 means auto-memory writes are being silently "
+            "denied by procedural_memory_save's unlock gate -- call "
+            "unlock(password='<password>') on this client to resume them."
+        )
+    elif not auto_on:
+        lines.append("hint: set MCP_DATA_MEMORY_AUTO=1 to turn auto-recording on.")
+    return "\n".join(lines)
 
 
 def record_query(connection: str, sql: str, result_text: str) -> None:
