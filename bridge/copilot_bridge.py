@@ -613,6 +613,148 @@ def resume_eligibility(sess):
     return True, goal_text
 
 
+# ── VERIFIED LOOP (docs/loop-engineering.md sec5.3 producer/critic split) ───────────────────
+# Pure logic only in this section -- no PAGE/browser access -- so it is fully hermetically
+# unit-testable, same discipline as the WORK MODE section above. The critic runs in an
+# UNCONTAMINATED conversation (a brand-new /new page that never touches ACTIVE_SID/session
+# bookkeeping -- see _run_critic_pass near the Handler methods for the browser-touching half).
+DEFAULT_MAX_LOOPS = 3
+
+# Fixed rubric wording (spec SS5.1.3 / SS5.3): the critic gets ONLY the AC and the deliverable,
+# is required to answer in STRICT JSON, and is explicitly forbidden from free-form improvement
+# suggestions (SS5.3: "critics that offer free-form improvements breed overcorrection"). The
+# shape and wording are a module-level constant on purpose -- a fixed rubric is what makes the
+# critic's pass/fail a repeatable external signal rather than an ad hoc, rephrased-every-time
+# judgment call.
+# NOTE: built by CONCATENATION (not str.format) in build_rubric_prompt below -- the JSON
+# example embeds literal { } braces that would collide with .format()'s placeholder syntax.
+RUBRIC_PROMPT_HEADER = (
+    "あなたはこれから提示する成果物を、以下の受け入れ基準(Acceptance Criteria)だけを根拠に判定する"
+    "検証者です。あなたはこの作業の実装には関与していません。改善案・提案・アドバイスは一切書かないで"
+    "ください。出力は次の形の厳密な JSON オブジェクト一つだけにしてください。前後に説明文・"
+    "コードフェンス・その他の文字を一切付けないでください:\n"
+    '{"pass": true または false, "failed_ac": ["未達のAC-idの配列（全て満たしていれば空配列）"], '
+    '"reasons": ["各未達AC-idについての短い理由（全て満たしていれば空配列）"]}\n\n'
+)
+
+# Nudge sent (in the SAME critic conversation) when the first reply could not be parsed as the
+# required JSON -- retried ONCE per the mission spec ("retry ONCE with a 'JSON only' nudge").
+RUBRIC_JSON_ONLY_NUDGE = (
+    "JSON のみを出力してください。説明文もコードフェンスも不要です。次の形だけを出力してください: "
+    '{"pass": true または false, "failed_ac": [...], "reasons": [...]}'
+)
+
+# Continuation message sent back into the WORKING conversation after a fail verdict that is
+# neither exhausted nor oscillating (spec step 4's "else" branch): only the failed_ac + reasons,
+# nothing else -- the working agent already has its own context, it just needs to know what the
+# critic flagged.
+VERIFY_CONTINUATION_TEMPLATE = (
+    "検証で以下が未達: {items}\n修正して、完了したら " + WORK_MODE_DONE_MARKER + " を最後の行に出力してください。"
+)
+
+
+def build_rubric_prompt(ac: str, deliverable: str) -> str:
+    """Pure prompt builder: AC + deliverable -> the fixed rubric prompt string. Concatenation
+    (not str.format) because RUBRIC_PROMPT_HEADER embeds literal JSON braces. Both sections are
+    included VERBATIM -- verified directly by tests, not just by convention."""
+    return (RUBRIC_PROMPT_HEADER
+            + "--- 受け入れ基準 (Acceptance Criteria) ---\n" + (ac or "") + "\n\n"
+            + "--- 成果物 (Deliverable) ---\n" + (deliverable or "") + "\n")
+
+
+def build_continuation_message(failed_ac, reasons) -> str:
+    """Pure builder for the fail-but-keep-looping continuation message sent back into the
+    WORKING conversation. `failed_ac` and `reasons` are parallel-ish lists (not required to be
+    the same length -- zipped defensively); renders as a compact bulleted block."""
+    failed_ac = list(failed_ac or [])
+    reasons = list(reasons or [])
+    items = []
+    for i, ac_id in enumerate(failed_ac):
+        reason = reasons[i] if i < len(reasons) else ""
+        items.append(f"{ac_id}: {reason}" if reason else str(ac_id))
+    if not items:
+        items = reasons or ["(理由不明)"]
+    return VERIFY_CONTINUATION_TEMPLATE.format(items="; ".join(items))
+
+
+def _extract_first_json_object(text: str):
+    """Find the first balanced {...} block in `text` and return it as a raw substring, or None
+    if no balanced brace block exists. Brace-counting (not regex) so nested objects (e.g. a
+    "reasons" array containing braces some model hallucinated) do not truncate early. Pure
+    string logic -- tolerates prose before/after the JSON, exactly the "embedded JSON in prose"
+    case the mission spec calls out."""
+    t = text or ""
+    start = t.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(t)):
+        ch = t[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return t[start:i + 1]
+    return None
+
+
+def parse_verdict(text: str):
+    """Pure, tolerant verdict parser. Returns a dict:
+      {"ok": bool, "pass": bool, "failed_ac": [...], "reasons": [...], "needs_retry": bool}
+
+    "ok" is True iff a JSON object with at least a boolean "pass" key was found (embedded in
+    prose or standalone -- both accepted). "needs_retry" is True when nothing parseable was
+    found at all (the caller retries once with the JSON-only nudge); when ok is False AND
+    needs_retry is False that means a SECOND parse attempt already failed (final, non-retryable
+    -- caller treats it as a fail verdict with reason 'critic output unparseable', per spec
+    step 3). failed_ac/reasons default to [] when absent or wrong-typed so a malformed-but-
+    present JSON object never raises downstream."""
+    blob = _extract_first_json_object(text)
+    if blob is None:
+        return {"ok": False, "pass": False, "failed_ac": [], "reasons": [], "needs_retry": True}
+    try:
+        obj = json.loads(blob)
+    except Exception:
+        return {"ok": False, "pass": False, "failed_ac": [], "reasons": [], "needs_retry": True}
+    if not isinstance(obj, dict) or "pass" not in obj:
+        return {"ok": False, "pass": False, "failed_ac": [], "reasons": [], "needs_retry": True}
+    passed = bool(obj.get("pass"))
+    failed_ac = obj.get("failed_ac")
+    failed_ac = list(failed_ac) if isinstance(failed_ac, list) else []
+    reasons = obj.get("reasons")
+    reasons = list(reasons) if isinstance(reasons, list) else []
+    return {"ok": True, "pass": passed, "failed_ac": failed_ac, "reasons": reasons,
+            "needs_retry": False}
+
+
+def is_oscillating(prev_failed_ac, cur_failed_ac) -> bool:
+    """Pure oscillation detector (spec outcome "escalate_oscillation"): True iff both are
+    non-empty AND the SET of failed AC ids is identical between the previous and current
+    verdict (order-independent -- a model that lists the same failures in a different order
+    is still oscillating, not making progress). A first verdict (prev is None/empty) is never
+    oscillating -- there is nothing to compare against yet."""
+    if not prev_failed_ac or not cur_failed_ac:
+        return False
+    return set(prev_failed_ac) == set(cur_failed_ac)
+
+
+def decide_verify_outcome(verdict_pass: bool, loop_n: int, max_loops: int, oscillating: bool):
+    """Pure outcome decision table for one verify loop iteration (spec step 4). Priority order:
+    pass wins outright; else oscillation is checked BEFORE the loop-budget check (an
+    oscillating fail on the very last allowed loop is still an oscillation -- the operator
+    should know the failures were IDENTICAL, not merely that the budget ran out); else budget
+    exhaustion; else None (keep looping: reattach to the working conversation and continue).
+    Returns "done_verified" | "escalate_oscillation" | "verify_failed" | None."""
+    if verdict_pass:
+        return "done_verified"
+    if oscillating:
+        return "escalate_oscillation"
+    if max_loops and loop_n >= max_loops:
+        return "verify_failed"
+    return None
+
+
 def _next_pending(sid):
     """Thin wrapper around S.pop_input so callers/tests can substitute a fake pop function
     without importing session_store's file I/O. Returns None if sid is falsy. Locked with
@@ -2280,7 +2422,16 @@ class Handler(BaseHTTPRequestHandler):
                     max_turns = int(max_turns_raw) if max_turns_raw else DEFAULT_MAX_TURNS
                 except ValueError:
                     max_turns = DEFAULT_MAX_TURNS
-                run_on_page_thread(self._goal, text, max_turns, resume_flag)
+                # FROZEN CONTRACT ADDITIONS: &ac=<urlencoded acceptance criteria> and
+                # &max_loops=<int, default 3>. Verification runs only when ac is non-empty
+                # (see _goal's docstring) -- an absent/empty ac is fully backward compatible.
+                ac = (qs.get("ac") or [""])[0]
+                max_loops_raw = (qs.get("max_loops") or [""])[0]
+                try:
+                    max_loops = int(max_loops_raw) if max_loops_raw else DEFAULT_MAX_LOOPS
+                except ValueError:
+                    max_loops = DEFAULT_MAX_LOOPS
+                run_on_page_thread(self._goal, text, max_turns, resume_flag, ac, max_loops)
             finally:
                 PAGE_LOCK.release()
             return
@@ -2883,7 +3034,130 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    def _goal(self, text, max_turns, resume_flag):
+    def _run_work_phase(self, sid, msg, max_turns, turn_start=0):
+        """WORK MODE inner loop, factored out of _goal so the verified-loop can re-enter it
+        (with a continuation message) after a fail verdict WITHOUT resetting the turn counter
+        -- the mission spec requires "turn budget continues from where it was; max_turns still
+        applies globally" across a work -> verify -> work re-entry. `turn_start` is the number
+        of turns already consumed by earlier phases of THIS /goal call (0 on the first call).
+
+        Returns (outcome, turn, last_turn_text): `outcome` is one of decide_outcome's values
+        ("done"/"error"/"stopped"/"max_turns") -- note "done" here means a DONE-marker turn was
+        produced, NOT that verification (if any) has run; the caller (_goal) decides what to do
+        next. `last_turn_text` is the stripped text of the turn that ended the phase (the
+        DELIVERABLE, when outcome=="done"), or "" if the phase ended some other way.
+
+        Behavior for turn error / consent_failed / normal turns is UNCHANGED from the original
+        inline loop this replaced -- only the turn-counter seeding and the return shape differ."""
+        global STOP_REQUESTED
+        turn = turn_start
+        consecutive_errors = 0
+        outcome = None
+        last_turn_text = ""
+        while True:
+            turn += 1
+            try:
+                final = self._run_one_turn(sid, msg)
+            except Exception as e:
+                try:
+                    PAGE.locator(COPILOT_SELECTORS["stop_button"]).first.click(timeout=3000)
+                except Exception:
+                    pass
+                logger.warning("goal loop: turn %d raised: %s: %s", turn, type(e).__name__, e,
+                               exc_info=True)
+                consecutive_errors += 1
+                self._sse({"delta": "\n[turn error: %s: %s]" % (type(e).__name__, e)})
+                outcome = decide_outcome(False, STOP_REQUESTED, turn, max_turns,
+                                         consecutive_errors)
+                if outcome:
+                    break
+                msg = WORK_MODE_CONTINUE_NUDGE
+                continue
+            if isinstance(final, dict) and final.get("consent_failed"):
+                # Work mode never surfaces the Edge mid-loop (that is /stream's own
+                # UI-facing last resort) -- treat it as a turn error and keep looping
+                # within the normal consecutive-error budget.
+                consecutive_errors += 1
+                self._sse({"delta": "\n[turn error: MCP connection-consent could not be "
+                                     "auto-approved]"})
+                outcome = decide_outcome(False, STOP_REQUESTED, turn, max_turns,
+                                         consecutive_errors)
+                if outcome:
+                    break
+                msg = WORK_MODE_CONTINUE_NUDGE
+                continue
+            consecutive_errors = 0
+            final = final or ""
+            done, turn_text = detect_done(final)
+            if turn_text:
+                _persist_exchange(sid, msg, turn_text)
+            last_turn_text = turn_text
+            self._sse({"turn_done": turn, "text": turn_text})
+            outcome = decide_outcome(done, STOP_REQUESTED, turn, max_turns, consecutive_errors)
+            if outcome:
+                break
+            queued = drain_pending_once(sid)
+            msg, steered = select_next_message(queued, WORK_MODE_CONTINUE_NUDGE)
+            for s_text in steered:
+                self._sse({"steered": s_text})
+        return outcome, turn, last_turn_text
+
+    def _run_critic_pass(self, ac, deliverable):
+        """UNCONTAMINATED critic pass (spec step 3): navigate the ONE shared PAGE to a brand
+        new conversation (reusing the SAME /new machinery _do_new drives -- AGENT_URL + a fresh
+        composer), send the fixed rubric prompt, and parse the verdict. Deliberately does NOT:
+          * touch ACTIVE_SID or any S.* session bookkeeping (so the critic exchange is never
+            appended to the working session's transcript -- this is what makes it
+            "uncontaminated": the critic sees ONLY the rubric prompt, never the working
+            conversation's history, and the working conversation never sees the rubric text
+            either);
+          * call _persist_exchange or _record_capture_baseline's session-linked callers.
+        Uses _send_and_stream_once(..., stream_out=False) directly -- the shared
+        send/stream/settle machinery -- with no SSE passthrough (the rubric prompt and the raw
+        critic JSON reply are never shown to the /goal caller as delta/replace events; only the
+        parsed verdict is surfaced, via the {"verdict": ...} SSE event _goal emits itself).
+
+        Returns a verdict dict per parse_verdict's shape, plus "nav_ok": bool. On a navigation
+        failure, or if BOTH the first attempt and the JSON-only retry come back unparseable,
+        returns pass=False with a reason noting why (spec step 3: unparseable -> treat as fail
+        with reason "critic output unparseable")."""
+        try:
+            if AGENT_URL:
+                PAGE.goto(AGENT_URL, wait_until="domcontentloaded")
+            if not _wait_composer():
+                return {"ok": False, "pass": False, "failed_ac": [], "reasons": [
+                    "critic navigation failed: composer did not render"], "needs_retry": False,
+                    "nav_ok": False}
+        except Exception as e:
+            return {"ok": False, "pass": False, "failed_ac": [], "reasons": [
+                "critic navigation failed: %s: %s" % (type(e).__name__, e)],
+                "needs_retry": False, "nav_ok": False}
+        prompt = build_rubric_prompt(ac, deliverable)
+        try:
+            reply = self._send_and_stream_once(prompt, stream_out=False) or ""
+        except Exception as e:
+            return {"ok": False, "pass": False, "failed_ac": [], "reasons": [
+                "critic send failed: %s: %s" % (type(e).__name__, e)],
+                "needs_retry": False, "nav_ok": True}
+        verdict = parse_verdict(reply)
+        if verdict["ok"] or not verdict["needs_retry"]:
+            verdict["nav_ok"] = True
+            return verdict
+        # ONE retry in the SAME critic conversation with a "JSON only" nudge (spec step 3).
+        try:
+            reply2 = self._send_and_stream_once(RUBRIC_JSON_ONLY_NUDGE, stream_out=False) or ""
+        except Exception as e:
+            return {"ok": False, "pass": False, "failed_ac": [], "reasons": [
+                "critic output unparseable (retry send failed: %s: %s)" % (type(e).__name__, e)],
+                "needs_retry": False, "nav_ok": True}
+        verdict2 = parse_verdict(reply2)
+        if verdict2["ok"]:
+            verdict2["nav_ok"] = True
+            return verdict2
+        return {"ok": False, "pass": False, "failed_ac": [], "reasons": [
+            "critic output unparseable"], "needs_retry": False, "nav_ok": True}
+
+    def _goal(self, text, max_turns, resume_flag, ac="", max_loops=DEFAULT_MAX_LOOPS):
         """WORK MODE: GET /goal -- an autonomous multi-turn loop on the ACTIVE session
         (creating one if none), per the frozen HTTP contract. SSE stream:
           * ordinary {"delta"}/{"replace"} events interleave while a turn streams (via
@@ -2891,12 +3165,23 @@ class Handler(BaseHTTPRequestHandler):
           * after each completed turn: {"turn_done": <int>, "text": "<final turn text>"};
           * when a queued steering input is injected for the next turn: one
             {"steered": "<text>"} event per input;
+          * when `ac` is non-empty and a work phase reaches a genuine DONE: {"verify_start": n}
+            then, once the critic responds, {"verdict": {"pass":..., "failed_ac":[...],
+            "reasons":[...], "loop": n}};
           * at the end: {"goal_done": true, "outcome": ..., "turns": <int>} then event: done.
 
         resume_flag selects GET /goal?resume=1: continues a stored interrupted goal (mode==
         "interrupted" + a stored goal text -- see resume_eligibility), whose turn-1 message is
         the resume nudge instead of the original goal text (the goal itself is already in the
-        live conversation from before the crash)."""
+        live conversation from before the crash).
+
+        VERIFICATION (only when `ac` is non-empty -- empty ac is 100% backward compatible with
+        the pre-verification behavior, including all of decide_outcome's original outcomes):
+        on a work-phase "done" outcome, run the producer/critic split from
+        docs/loop-engineering.md SS5.3: capture the working conversation's ref (so we can
+        reattach after the critic runs elsewhere), run _run_critic_pass in a FRESH,
+        uncontaminated conversation, and act on decide_verify_outcome. See _run_critic_pass and
+        decide_verify_outcome for the full per-branch behavior."""
         global ACTIVE_SID, STOP_REQUESTED
         STOP_REQUESTED = False
         sid = ACTIVE_SID
@@ -2924,57 +3209,78 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
         S.touch(sid, mode="working", goal=goal_text)
+        ac = (ac or "").strip()
+        try:
+            max_loops = int(max_loops)
+        except (TypeError, ValueError):
+            max_loops = DEFAULT_MAX_LOOPS
         turn = 0
-        consecutive_errors = 0
         msg = first_msg
         outcome = None
+        prev_failed_ac = None
+        verify_loop_n = 0
         try:
             while True:
-                turn += 1
-                try:
-                    final = self._run_one_turn(sid, msg)
-                except Exception as e:
-                    try:
-                        PAGE.locator(COPILOT_SELECTORS["stop_button"]).first.click(timeout=3000)
-                    except Exception:
-                        pass
-                    logger.warning("goal loop: turn %d raised: %s: %s", turn, type(e).__name__, e,
-                                   exc_info=True)
-                    consecutive_errors += 1
-                    self._sse({"delta": "\n[turn error: %s: %s]" % (type(e).__name__, e)})
-                    outcome = decide_outcome(False, STOP_REQUESTED, turn, max_turns,
-                                             consecutive_errors)
-                    if outcome:
-                        break
-                    msg = WORK_MODE_CONTINUE_NUDGE
-                    continue
-                if isinstance(final, dict) and final.get("consent_failed"):
-                    # Work mode never surfaces the Edge mid-loop (that is /stream's own
-                    # UI-facing last resort) -- treat it as a turn error and keep looping
-                    # within the normal consecutive-error budget.
-                    consecutive_errors += 1
-                    self._sse({"delta": "\n[turn error: MCP connection-consent could not be "
-                                         "auto-approved]"})
-                    outcome = decide_outcome(False, STOP_REQUESTED, turn, max_turns,
-                                             consecutive_errors)
-                    if outcome:
-                        break
-                    msg = WORK_MODE_CONTINUE_NUDGE
-                    continue
-                consecutive_errors = 0
-                final = final or ""
-                done, turn_text = detect_done(final)
-                if turn_text:
-                    _persist_exchange(sid, msg, turn_text)
-                self._sse({"turn_done": turn, "text": turn_text})
-                outcome = decide_outcome(done, STOP_REQUESTED, turn, max_turns,
-                                         consecutive_errors)
-                if outcome:
+                outcome, turn, deliverable = self._run_work_phase(sid, msg, max_turns,
+                                                                   turn_start=turn)
+                if outcome != "done" or not ac:
+                    # No verification requested, or the phase ended for a reason OTHER than a
+                    # genuine DONE (error/stopped/max_turns) -- those keep their EXISTING
+                    # outcome values unchanged (full backward compatibility).
                     break
-                queued = drain_pending_once(sid)
-                msg, steered = select_next_message(queued, WORK_MODE_CONTINUE_NUDGE)
-                for s_text in steered:
-                    self._sse({"steered": s_text})
+                working_ref = ""
+                try:
+                    sess_now = S.load(sid) or {}
+                    working_ref = sess_now.get("conv_url") or ""
+                except Exception:
+                    working_ref = ""
+                if not working_ref:
+                    # Cannot verify without a way back to the working conversation -- finish
+                    # with the existing "done" outcome per the mission spec (ASCII warning).
+                    self._sse({"delta": "\n[verify skipped: no conv_url captured for this "
+                                         "session -- cannot reattach after the critic runs]"})
+                    break
+                verify_loop_n += 1
+                self._sse({"verify_start": verify_loop_n})
+                verdict = self._run_critic_pass(ac, deliverable)
+                failed_ac = verdict.get("failed_ac") or []
+                reasons = verdict.get("reasons") or []
+                self._sse({"verdict": {"pass": bool(verdict.get("pass")),
+                                        "failed_ac": failed_ac, "reasons": reasons,
+                                        "loop": verify_loop_n}})
+                oscillating = is_oscillating(prev_failed_ac, failed_ac) if not verdict.get(
+                    "pass") else False
+                verify_outcome = decide_verify_outcome(bool(verdict.get("pass")), verify_loop_n,
+                                                        max_loops, oscillating)
+                # Best-effort reattach in EVERY branch that continues talking to the working
+                # conversation (pass -> resume before finishing; fail-continue -> resume before
+                # sending the continuation). Failure is only logged, never fatal (spec step 4).
+                if verify_outcome == "done_verified":
+                    try:
+                        ok_r, reason_r = _resume_to_ref(working_ref)
+                        if not ok_r:
+                            logger.warning("post-verify reattach failed for sid=%s: %s",
+                                           sid, reason_r)
+                    except Exception:
+                        logger.warning("post-verify reattach raised for sid=%s", sid,
+                                       exc_info=True)
+                    outcome = "done_verified"
+                    break
+                if verify_outcome:   # "verify_failed" or "escalate_oscillation" -> stop here
+                    outcome = verify_outcome
+                    break
+                # else: fail, not exhausted, not oscillating -> reattach to the WORKING
+                # conversation and send a continuation message, then resume the work phase
+                # (turn budget continues from `turn`, per the mission spec).
+                prev_failed_ac = failed_ac
+                try:
+                    ok_r, reason_r = _resume_to_ref(working_ref)
+                    if not ok_r:
+                        logger.warning("reattach-to-working failed for sid=%s: %s",
+                                       sid, reason_r)
+                except Exception:
+                    logger.warning("reattach-to-working raised for sid=%s", sid, exc_info=True)
+                msg = build_continuation_message(failed_ac, reasons)
             self._sse({"goal_done": True, "outcome": outcome, "turns": turn})
             self._sse({}, "done")
         finally:
