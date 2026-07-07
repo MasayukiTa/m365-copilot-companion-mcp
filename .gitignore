@@ -107,6 +107,7 @@ ui/_buildcheck/
 # --- internal working docs / dev artifacts: keep in history, exclude going forward ---
 /docs/*.md
 !/docs/STARTUP_devtunnel_login.md
+!/docs/loop-engineering.md
 !/docs/companion_setup.md
 # public reference docs linked from the README
 !/docs/ARCHITECTURE.md
