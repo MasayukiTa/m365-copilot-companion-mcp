@@ -132,7 +132,13 @@ def odbc_query(
             rows = cur.fetchmany(max_rows)
         finally:
             con.close()
-        return _format_table(columns, rows, max_rows)
+        result = _format_table(columns, rows, max_rows)
+        try:
+            from .data_memory_hook import record_query
+            record_query(connection, query, result)
+        except Exception:
+            pass
+        return result
     except Exception as e:
         return f"[odbc_query error: {type(e).__name__}: {e}]"
 
@@ -165,7 +171,13 @@ def odbc_tables(
                 f"{(r.table_name or ''):<30}  {r.table_type or ''}"
             )
         lines.append(f"--- {len(rows)} object(s)")
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        try:
+            from .data_memory_hook import record_tables
+            record_tables(connection, result)
+        except Exception:
+            pass
+        return result
     except Exception as e:
         return f"[odbc_tables error: {type(e).__name__}: {e}]"
 
@@ -193,7 +205,13 @@ def odbc_columns(
                 f"{r.column_size or '':<6}  {'YES' if r.nullable else 'NO'}"
             )
         lines.append(f"--- {len(rows)} column(s)")
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        try:
+            from .data_memory_hook import record_columns
+            record_columns(connection, table, result)
+        except Exception:
+            pass
+        return result
     except Exception as e:
         return f"[odbc_columns error: {type(e).__name__}: {e}]"
 
