@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 
@@ -45,8 +46,46 @@ load_dotenv()
 DEFAULT_RESEARCHER_URL = "https://m365.cloud.microsoft/chat/agent/P_552e6eda-fc18-7fb9-0ef6-1bf2de3393e4.dr_work"
 DEFAULT_ANALYST_URL = "https://m365.cloud.microsoft/chat/agent/P_8cfc4e6f-267e-db15-c6e7-3fc47a54f61e.diceberry"
 
-RESEARCHER_URL = os.environ.get("MCP_RESEARCHER_AGENT_URL", "").strip() or DEFAULT_RESEARCHER_URL
-ANALYST_URL = os.environ.get("MCP_ANALYST_AGENT_URL", "").strip() or DEFAULT_ANALYST_URL
+def _env_agent_url(key: str, default: str) -> tuple[str, bool]:
+    """Read an agent URL from .env, returning (url, used_default).
+
+    Previously RESEARCHER_URL/ANALYST_URL were coalesced to their DEFAULT_* silently
+    at import time (`os.environ.get(key, "") or DEFAULT`), which meant profile.url was
+    NEVER empty for these two profiles even when the user had not set the .env key --
+    masking the "not configured" state from the `if not profile.url and allow_prompt`
+    self-heal in open_agent() (that path only ever fired for IMPL/FLEET, which have no
+    default and hard-fail instead; that hard-fail behaviour is unchanged here).
+
+    Fully unmasking (leaving .url empty until a dialog fills it) was judged too risky
+    for the working default case -- every user who has never touched these two keys
+    would suddenly hit a prompt/hard-fail on next run. So the minimal, regression-safe
+    fix keeps the default fallback applied here (profile.url is still populated, so
+    existing callers and runtime behaviour are unaffected), but now ALSO returns
+    whether the value is the built-in default or a real user override. That distinction
+    is exposed on AgentProfile.url_is_default so a future configure_env/start_all gate
+    can tell "unset -> running on default" apart from "user already configured this"
+    -- without this module changing what happens at runtime today.
+    """
+    raw = os.environ.get(key, "").strip()
+    if raw:
+        return raw, False
+    return default, True
+
+
+RESEARCHER_URL, RESEARCHER_URL_IS_DEFAULT = _env_agent_url(
+    "MCP_RESEARCHER_AGENT_URL", DEFAULT_RESEARCHER_URL)
+ANALYST_URL, ANALYST_URL_IS_DEFAULT = _env_agent_url(
+    "MCP_ANALYST_AGENT_URL", DEFAULT_ANALYST_URL)
+
+# One-time (per process, since module-level code runs once) notice instead of silent
+# masking -- so it is at least visible in logs which agents are running on the
+# built-in default vs. an explicit .env override.
+if RESEARCHER_URL_IS_DEFAULT:
+    print("[agent_profiles] using built-in default for RESEARCHER agent; "
+          "set MCP_RESEARCHER_AGENT_URL in .env to override", file=sys.stderr)
+if ANALYST_URL_IS_DEFAULT:
+    print("[agent_profiles] using built-in default for ANALYST agent; "
+          "set MCP_ANALYST_AGENT_URL in .env to override", file=sys.stderr)
 
 
 @dataclass
@@ -62,6 +101,12 @@ class AgentProfile:
     end_timeout_s: int = 1800      # 30 min hard cap on one research turn
     dwell_s: float = 12.0          # text must be unchanged this long to count done
     appear_timeout_s: int = 300    # wait up to 5 min for the answer block to appear
+    # True when .url came from DEFAULT_*_URL (the .env key is unset/blank), False when
+    # it is a real user override. Lets external gates (configure_env/start_all) tell
+    # "not configured yet" apart from "configured" even though .url is never empty for
+    # RESEARCHER/ANALYST (see _env_agent_url above). Not consumed at runtime by
+    # open_agent()/ask_agent() themselves -- purely informational metadata.
+    url_is_default: bool = False
 
 
 PLAIN = AgentProfile(name="plain", url="", model_picker=None,
@@ -73,6 +118,7 @@ RESEARCHER = AgentProfile(
     env_key="MCP_RESEARCHER_AGENT_URL",
     model_picker='button[data-testid="researcher-model-picker-button"]',
     end_timeout_s=1800, dwell_s=12.0, appear_timeout_s=300,
+    url_is_default=RESEARCHER_URL_IS_DEFAULT,
 )
 
 # Analyst ("アナリスト") analyses an UPLOADED data file. Unlike the Researcher it has
@@ -87,6 +133,7 @@ ANALYST = AgentProfile(
     env_key="MCP_ANALYST_AGENT_URL",
     model_picker=None,
     end_timeout_s=900, dwell_s=8.0, appear_timeout_s=180,
+    url_is_default=ANALYST_URL_IS_DEFAULT,
 )
 
 PROFILES = {p.name: p for p in (PLAIN, RESEARCHER, ANALYST)}
