@@ -1,4 +1,4 @@
-# start_bridge.ps1
+﻿# start_bridge.ps1
 # Launch the interactive Copilot BRIDGE on its OWN dedicated Edge, fully isolated from the
 # SWE fleet's Edge. This lets the bridge and a running fleet COEXIST:
 #   * the fleet owns :9222 / profile copilot-companion-edge  (and hard-resets it per chunk)
