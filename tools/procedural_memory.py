@@ -25,6 +25,83 @@ from .security import require_unlocked
 STATE_FILE = Path(__file__).resolve().parent.parent / ".procedural_memory.json"
 MAX_SNIPPET_CHARS = 16_000
 
+# --- markdown bulk-import helpers (procedural_memory_import_markdown) ---------------------
+# Heading split: level-2 or level-3 ("## " / "### ") only -- level-1 is reserved for the
+# doc title (used as the preamble chunk's intent) and level-4+ is treated as body text,
+# not a chunk boundary.
+_HEADING_RE = re.compile(r"^(#{2,3})[ \t]+(.+?)[ \t]*$", re.MULTILINE)
+_H1_RE = re.compile(r"^#[ \t]+(.+?)[ \t]*$", re.MULTILINE)
+_CODE_BLOCK_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+# Cue words that flag a line as worth carrying into `context` (gotchas / stale info /
+# conclusions). Deliberately case-sensitive substring match: "NG" as-cased avoids
+# false-positiving on ordinary English words containing "ng".
+_CUE_WORDS = ("注意", "NG", "古い", "使わない", "高速化", "結論", "落とし穴", "gotcha")
+# "Table-ish" tokens: SCREAMING_SNAKE_CASE identifiers that look like DB table/column
+# names in prose (e.g. internal DB docs). Purely mechanical -- no allowlist of real names.
+_TABLE_TOKEN_RE = re.compile(r"\b[A-Z][A-Z0-9_]{4,}\b")
+
+
+def _split_markdown_chunks(text: str, basename: str) -> list[tuple[str, str]]:
+    """Split markdown text into (intent_seed, body) pairs on ## / ### headings.
+
+    Content before the first heading becomes its own preamble chunk, with intent
+    seeded from the document's H1 title if present, else the file's basename."""
+    headings = list(_HEADING_RE.finditer(text))
+    chunks: list[tuple[str, str]] = []
+
+    first_start = headings[0].start() if headings else len(text)
+    preamble = text[:first_start]
+    if preamble.strip():
+        h1_match = _H1_RE.search(preamble)
+        preamble_intent = h1_match.group(1).strip() if h1_match else Path(basename).stem
+        chunks.append((preamble_intent, preamble))
+
+    for i, m in enumerate(headings):
+        heading_text = m.group(2).strip()
+        body_start = m.end()
+        body_end = headings[i + 1].start() if i + 1 < len(headings) else len(text)
+        chunks.append((heading_text, text[body_start:body_end]))
+
+    return chunks
+
+
+def _extract_snippet(body: str, limit: int = 800) -> str:
+    """Fenced code blocks (joined) if any, else the first `limit` chars of the body."""
+    blocks = _CODE_BLOCK_RE.findall(body)
+    if blocks:
+        joined = "\n\n".join(b.strip("\n") for b in blocks)
+        return joined[:MAX_SNIPPET_CHARS]
+    return body[:limit]
+
+
+def _extract_context(body: str, limit: int = 800) -> str:
+    """Lines containing any cue word, joined, capped at `limit` chars. May be empty."""
+    hits = [ln.strip() for ln in body.splitlines() if any(w in ln for w in _CUE_WORDS)]
+    context = "\n".join(hits)
+    return context[:limit]
+
+
+def _extract_table_tags(body: str, max_tokens: int = 8) -> list[str]:
+    """Up to `max_tokens` distinct SCREAMING_SNAKE_CASE-ish tokens, as "table:<lower>" tags."""
+    seen: list[str] = []
+    for m in _TABLE_TOKEN_RE.finditer(body):
+        tok = m.group(0)
+        if tok not in seen:
+            seen.append(tok)
+        if len(seen) >= max_tokens:
+            break
+    return [f"table:{t.lower()}" for t in seen]
+
+
+def _dedup_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for it in items:
+        if it not in seen:
+            seen.add(it)
+            out.append(it)
+    return out
+
 
 def _load() -> dict:
     if STATE_FILE.exists():
@@ -185,3 +262,65 @@ def procedural_memory_delete(intent_slug: str) -> str:
         return f"deleted procedure [{key}]"
     except Exception as e:
         return f"[procedural_memory_delete error: {type(e).__name__}: {e}]"
+
+
+def procedural_memory_import_markdown(path: str, tags: str = "") -> str:
+    """Bulk-import a markdown doc into procedural memory, one procedure per ## / ###
+    heading section (e.g. DB-exploration notes, a runbook, a design doc's "gotchas").
+
+    Splits `path` on level-2/3 headings (content before the first heading becomes its
+    own preamble chunk, seeded from the H1 title or the filename). Per chunk: intent
+    comes from the heading text; snippet is the chunk's fenced code blocks if any, else
+    its first ~800 chars; context pulls out lines containing cue words (注意/NG/古い/
+    使わない/高速化/結論/落とし穴/gotcha); tags get `tags` + "import" + "src:<basename>"
+    plus up to 8 SCREAMING_SNAKE_CASE-ish tokens found in the chunk (as "table:<name>",
+    lowercased) -- a mechanical guess at DB table/column names mentioned in prose.
+    Reuses procedural_memory_save for the actual writes (same slug/rev semantics).
+
+    Args:
+        path: Path to a local markdown (.md) file to import.
+        tags: Comma-separated tags applied to every chunk saved from this file.
+    """
+    locked = require_unlocked()
+    if locked:
+        return locked
+    try:
+        if not path or not isinstance(path, str):
+            return "[procedural_memory_import_markdown error: path must be a non-empty string]"
+        p = Path(path)
+        if not p.exists() or not p.is_file():
+            return f"[procedural_memory_import_markdown: file not found: {path}]"
+        try:
+            text = p.read_text(encoding="utf-8-sig")
+        except Exception as e:
+            return (
+                f"[procedural_memory_import_markdown error: could not read file: "
+                f"{type(e).__name__}: {e}]"
+            )
+
+        caller_tags = [t.strip() for t in (tags or "").split(",") if t.strip()]
+        basename = p.name
+
+        imported = 0
+        skipped = 0
+        for chunk_intent, body in _split_markdown_chunks(text, basename):
+            body_stripped = body.strip()
+            if not body_stripped:
+                skipped += 1
+                continue
+            intent = chunk_intent.strip()[:120] or basename
+            snippet = _extract_snippet(body_stripped)
+            context = _extract_context(body_stripped)
+            chunk_tags = _dedup_preserve_order(
+                caller_tags + ["import", f"src:{basename}"] + _extract_table_tags(body_stripped)
+            )
+            procedural_memory_save(
+                intent=intent,
+                snippet=snippet,
+                tags=",".join(chunk_tags),
+                context=context,
+            )
+            imported += 1
+        return f"imported {imported} chunks from {basename} (skipped {skipped} empty)"
+    except Exception as e:
+        return f"[procedural_memory_import_markdown error: {type(e).__name__}: {e}]"
