@@ -214,10 +214,69 @@ function Check-ForUpdates {
     }
 }
 
+# ---------------------------------------------------------------------------
+# BUG 3a fix: start_all.ps1 is what the desktop icon / Startup-folder shortcut / task
+# scheduler all actually launch (directly or via start_all_hidden.vbs) -- NONE of those
+# paths ever run configure_env.ps1, so on a machine where it was never run by hand the
+# agent URL(s) can simply never get configured. Gate on ENV STATE: if the one key with
+# no built-in default (MCP_IMPL_AGENT_URL -- see agent_profiles.py, which hard-fails
+# without it) is missing/blank, launch configure_env.ps1 and BLOCK until it returns,
+# the same way quickstart.bat STEP 6 (line ~167) does synchronously. On an already-
+# configured machine Env-Value finds a value and this is a total no-op -- it does NOT
+# prompt on every startup.
+# ---------------------------------------------------------------------------
+function Invoke-FirstTimeSetupGate {
+    $implUrl = Env-Value "MCP_IMPL_AGENT_URL"
+    if ($implUrl) {
+        Write-Host "[setup] MCP_IMPL_AGENT_URL is configured -- first-time setup skipped"
+        return
+    }
+    $cfgScript = Join-Path $scriptDir "configure_env.ps1"
+    if (-not (Test-Path $cfgScript)) {
+        Write-Host "[setup] MCP_IMPL_AGENT_URL is not set, and scripts\configure_env.ps1 is missing -- cannot prompt for it"
+        return
+    }
+    Write-Host "[setup] MCP_IMPL_AGENT_URL is not configured -- launching first-time setup (configure_env.ps1)"
+    Set-SplashStatus $script:splash "First-time setup: enter your Copilot agent URL..."
+    # Context trap this avoids: start_all can be launched HIDDEN (start_all_hidden.vbs, used by
+    # the desktop icon / Startup-folder shortcut, runs `wscript ... Run(...,0)`). A WinForms
+    # dialog built inside a windowless-launched powershell inherits that hidden show-state and
+    # never becomes visible -- configure_env.ps1 already has an Add_Shown ShowWindow/
+    # SetForegroundWindow hack to force itself onscreen for exactly this reason (see its own
+    # comment), but that hack still needs a NORMAL child process to run in. So THIS ONE call is
+    # intentionally NOT started hidden: Start-Process without -WindowStyle Hidden gets its own
+    # fresh (normal) show-state, breaking the hidden-parent inheritance, so the setup dialog can
+    # actually be seen even though start_all itself is running invisibly. -Wait blocks this
+    # (interactive, first-run-only) setup step before any service starts, mirroring quickstart.bat.
+    try {
+        Start-Process powershell -ArgumentList @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $cfgScript
+        ) -WorkingDirectory $root -Wait
+    } catch {
+        Write-Host "[setup] configure_env.ps1 failed to launch: $_"
+    }
+    $implUrl = Env-Value "MCP_IMPL_AGENT_URL"
+    if (-not $implUrl) {
+        Write-Host ""
+        Write-Host "=========================================================================="
+        Write-Host " WARNING: MCP_IMPL_AGENT_URL is still not set."
+        Write-Host " Chat and Fleet will NOT work until it is configured (re-run configure_env.ps1,"
+        Write-Host " or paste the URL into .env by hand). The MCP server itself will still start."
+        Write-Host "=========================================================================="
+        Write-Host ""
+    } else {
+        Write-Host "[setup] MCP_IMPL_AGENT_URL saved -- continuing startup"
+    }
+}
+
 # Everything that brings the stack up, as ONE function so it can run either INSIDE the splash's
 # message loop (a one-shot timer, so the modal splash stays visible while this runs) OR directly
 # as a fallback if the splash cannot be shown. Status updates target $script:splash (no-op if null).
 function Invoke-Startup {
+    # First-time setup gate (BUG 3a): must run before anything is started, and before the
+    # update-check/splash sequence below so its status text is not overwritten mid-prompt.
+    Invoke-FirstTimeSetupGate
+
     # Pre-flight update check (best-effort, non-blocking). Runs once before any service starts.
     Set-SplashStatus $script:splash "Checking for updates..."
     Check-ForUpdates
