@@ -1,4 +1,4 @@
-# start_companion_edge.ps1
+﻿# start_companion_edge.ps1
 # Launch a DEDICATED, ISOLATED Edge instance for the companion (bridge + fleet).
 #
 # Why a separate instance (not your everyday Edge):
