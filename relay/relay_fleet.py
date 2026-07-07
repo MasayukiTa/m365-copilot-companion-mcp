@@ -29,6 +29,7 @@ import ctypes
 import json
 import os
 import re
+import threading
 import time
 
 from .acceptance import Check, normalize_checks, run_all_blocking
@@ -112,6 +113,45 @@ CONSENT_MARKERS = (
 # (retrying each time) before concluding the user hasn't approved yet and giving up for good --
 # bounded so a successful surface can never turn into an infinite retry loop.
 CONSENT_SURFACE_RETRY_MAX = int(os.environ.get("MCP_CONSENT_SURFACE_RETRY_MAX", "3"))
+
+# BUG 4b fix: bounded safety net so a surface()'d dedicated Edge can NEVER stay foreground
+# forever, even when the normal rehide()-on-resolution pairing is missed. threading.Timer is
+# one-shot (not a persistent daemon loop) -- started right after every surface() call and
+# cancelled if a real rehide() fires first. Env-tunable like this file's other windows.
+CONSENT_SURFACE_FORCE_REHIDE_SEC = float(os.environ.get("MCP_FORCE_REHIDE_SEC", "90"))
+
+
+def _schedule_force_rehide(timeout=None):
+    """Start a one-shot background timer that force-rehides the dedicated Edge after `timeout`
+    seconds (default CONSENT_SURFACE_FORCE_REHIDE_SEC). Safety net for BUG 4a/4b: covers every
+    surface() call site in this file (the consent-exhaustion last resort AND the sign-in
+    surfaces, as defense-in-depth) so the window can never stay foreground indefinitely even if
+    a caller's own rehide() is skipped. Exception-guarded; the Timer thread is daemon=True so it
+    never blocks process exit. Returns the Timer so the caller can _cancel_force_rehide() it
+    once a normal rehide() has already happened. ASCII-only print (this module has no logger)."""
+    t = CONSENT_SURFACE_FORCE_REHIDE_SEC if timeout is None else timeout
+
+    def _safe_rehide():
+        try:
+            from .edge_recover import rehide
+            rehide()
+            print("[relay_fleet] force-rehide safety net fired after %.0fs" % t)
+        except Exception:
+            print("[relay_fleet] force-rehide safety net: rehide() raised")
+
+    timer = threading.Timer(max(0.0, t), _safe_rehide)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+def _cancel_force_rehide(timer):
+    """Best-effort cancel of a pending force-rehide timer (no-op if None or already fired)."""
+    if timer is not None:
+        try:
+            timer.cancel()
+        except Exception:
+            pass
 
 # CANNED-NONANSWER detector (headless->default-Copilot fallback, 2026-07-03). When the companion
 # Edge runs --headless and its window-size/state wedges, the M365 SPA fails to resolve the
@@ -599,6 +639,7 @@ def _open_fresh(context, url):
     from .edge_recover import surface, looks_like_login, touch_pause, rehide
     pg = context.new_page()
     surfaced = False
+    force_timer = None
     # Up to 3 navigation attempts: a failed goto leaves the tab on about:blank, and
     # waiting 45s for a composer that will never come just leaves about:blank on screen.
     # Detect about:blank early (~4s) and RE-navigate instead of staring at it.
@@ -620,6 +661,7 @@ def _open_fresh(context, url):
             pg.wait_for_timeout(1000)
             if pg.locator(COPILOT_SELECTORS["composer"]).count() > 0:
                 if surfaced:
+                    _cancel_force_rehide(force_timer)  # real rehide now; drop the safety net
                     rehide()               # auth done -> back to background at once
                 return pg
             try:
@@ -630,6 +672,10 @@ def _open_fresh(context, url):
                         # companion Edge is headless) lands on this conversation, not the
                         # launcher's default generic top page.
                         surface(open_url=url); surfaced = True
+                        # BUG 4b safety net, defense-in-depth: if we give up below (or exit
+                        # some other way) without ever calling rehide(), this bounded timer
+                        # still forces the window back down on its own.
+                        force_timer = _schedule_force_rehide()
                     touch_pause()          # keep the keeper backed off through a long login
                 elif u == "about:blank" and k >= 3:
                     break                  # stuck on about:blank -> re-navigate
@@ -643,6 +689,15 @@ def _open_fresh(context, url):
                 break
         elif attempt >= 3:
             break
+    if surfaced:
+        # Giving up without ever seeing the composer -- rehide right now instead of relying
+        # solely on the bounded timer (BUG 4a: a failed/abandoned sign-in must not leave the
+        # window stuck in the foreground either).
+        _cancel_force_rehide(force_timer)
+        try:
+            rehide()
+        except Exception:
+            pass
     return pg
 
 
@@ -888,6 +943,20 @@ class RelayWorker:
             self.page = _open_fresh(context, open_url)
             self.drv = CopilotWebDriver(self.page)
             self.status = "ready"
+            # BUG 4d fix: proactively run the EXISTING auto-consent click-through once, right
+            # after the composer has rendered (_open_fresh only returns once it has), instead
+            # of ONLY reactively from _decide after a real reply already contained consent
+            # markers. This makes a connection-manager card that appears immediately after
+            # first open get auto-clicked instead of being left for the (much more disruptive)
+            # last-resort surface() in _decide. Reuses self._auto_consent's existing three
+            # tiers unchanged -- no click logic reimplemented here; each tier no-ops safely
+            # when there is nothing to click, so this is safe to call unconditionally.
+            # Best-effort: never let a consent-probe failure fail the attach.
+            try:
+                if self._auto_consent():
+                    print("[relay_fleet] %s: startup proactive auto-consent succeeded" % self.name)
+            except Exception:
+                pass
             return True
         except Exception as e:
             self.status, self.outcome = "error", "ERROR"
@@ -1589,6 +1658,16 @@ class RelayWorker:
                     try:
                         from .edge_recover import surface
                         ok = bool(surface(open_url=self._agent_url))
+                        if ok:
+                            # BUG 4a/4b fix: this surface() had no paired rehide() at all --
+                            # fire-and-forget, so the window stayed foreground until the whole
+                            # fleet process exited. Precisely detecting "consent resolved" here
+                            # is hard (the next sweep of THIS worker is what would notice, and
+                            # by then other workers may also be relying on the same shared
+                            # Edge), so schedule the bounded safety net instead: force the
+                            # window back down on its own after CONSENT_SURFACE_FORCE_REHIDE_SEC
+                            # regardless of what the user does.
+                            _schedule_force_rehide()
                     except Exception:
                         ok = False
                     self._consent_surfaced_ok = ok
@@ -1705,6 +1784,12 @@ class RelayWorker:
                             # relaunch (if one happens) lands on the real conversation,
                             # not the launcher's default generic top page.
                             surfaced_ok = edge_recover_surface(open_url=self._agent_url)
+                            if surfaced_ok:
+                                # BUG 4b defense-in-depth: this sign-in surface is never paired
+                                # with a rehide() anywhere in this file (only _open_fresh's own
+                                # surface() is) -- schedule the bounded safety net so the window
+                                # comes back down on its own even if the user never signs in.
+                                _schedule_force_rehide()
                         except Exception:
                             surfaced_ok = False
                         self._signin_surfaced_ok = surfaced_ok
@@ -1770,6 +1855,11 @@ class RelayWorker:
                         # conversation instead of the launcher's default generic top page.
                         surfaced_ok = edge_recover_surface(port=_companion_cdp_port(),
                                                            open_url=self._agent_url)
+                        if surfaced_ok:
+                            # BUG 4b defense-in-depth -- see the sign-in branch's identical
+                            # comment above; this headed-relaunch surface is likewise never
+                            # paired with a rehide() anywhere in this file.
+                            _schedule_force_rehide()
                     except Exception:
                         surfaced_ok = False
                     try:

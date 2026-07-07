@@ -394,6 +394,46 @@ DRIVER = None
 AGENT_URL = ""   # bare agent URL (a fresh chat); set at startup
 _CONSENT_SURFACED = False  # last-resort surface() for consent fired at most once per session
 
+# BUG 4b fix: bounded safety net so a surface()'d dedicated Edge can NEVER stay foreground
+# forever, even when the normal rehide()-on-resolution pairing is missed. threading.Timer is
+# one-shot (not a persistent daemon loop) -- started right after every surface() call and
+# cancelled if a real rehide() fires first. Env-tunable like the file's other windows.
+CONSENT_SURFACE_FORCE_REHIDE_SEC = float(os.environ.get("MCP_FORCE_REHIDE_SEC", "90"))
+
+
+def _schedule_force_rehide(timeout=None):
+    """Start a one-shot background timer that force-rehides the dedicated Edge after
+    `timeout` seconds (default CONSENT_SURFACE_FORCE_REHIDE_SEC). Safety net for BUG 4a/4b:
+    covers every surface() call site (consent last-resort AND the sign-in surfaces, as
+    defense-in-depth) so the window can never stay foreground indefinitely even if the
+    caller's own rehide() is skipped by an unexpected code path. Exception-guarded; the
+    Timer thread is daemon=True so it never blocks process exit. Returns the Timer so the
+    caller can _cancel_force_rehide() it once a normal rehide() has already happened."""
+    t = CONSENT_SURFACE_FORCE_REHIDE_SEC if timeout is None else timeout
+
+    def _safe_rehide():
+        try:
+            from relay.edge_recover import rehide
+            rehide()
+            logger.info("force-rehide safety net fired after %.0fs", t)
+        except Exception:
+            logger.warning("force-rehide safety net: rehide() raised", exc_info=True)
+
+    timer = threading.Timer(max(0.0, t), _safe_rehide)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+def _cancel_force_rehide(timer):
+    """Best-effort cancel of a pending force-rehide timer (no-op if None or already fired)."""
+    if timer is not None:
+        try:
+            timer.cancel()
+        except Exception:
+            pass
+
+
 # ── concurrency (work mode) ──────────────────────────────────────────────────────────────────
 # The server used to be a plain (single-threaded) HTTPServer -- fine while every request was
 # short, but a /goal run can occupy the page for many turns over minutes, and during that time
@@ -793,12 +833,14 @@ def drain_pending_once(sid, pop_fn=None, max_n=50):
 
 def _wait_composer(timeout=40):
     surfaced = False
+    force_timer = None
     for _ in range(timeout):
         PAGE.wait_for_timeout(1000)
         if PAGE.locator(COPILOT_SELECTORS["composer"]).count() > 0:
             # If we surfaced the hidden Edge for sign-in, auth is now done (the
             # composer rendered) -> drop the window back to the background at once.
             if surfaced:
+                _cancel_force_rehide(force_timer)  # real rehide is happening now; drop the net
                 try:
                     from relay.edge_recover import rehide
                     rehide()
@@ -827,6 +869,10 @@ def _wait_composer(timeout=40):
                                        "Manual: powershell -NoProfile -ExecutionPolicy Bypass "
                                        "-File scripts\\start_companion_edge.ps1 -Foreground -Port 9223")
                     surfaced = True
+                    # BUG 4b safety net: this function can return False (composer never
+                    # rendered within `timeout`) with NO rehide() of its own -- schedule the
+                    # bounded force-rehide so the window still comes back down eventually.
+                    force_timer = _schedule_force_rehide()
                 touch_pause()
         except Exception:
             pass
@@ -862,6 +908,7 @@ def _goto_settled(url, timeout=25000, tries=3, compose_wait=40):
     (/history) so an unreachable conversation fails fast instead of hanging the single-threaded
     bridge for minutes."""
     surfaced = False
+    force_timer = None
     for _ in range(max(1, tries)):
         try:
             PAGE.goto(url, wait_until="domcontentloaded", timeout=timeout)
@@ -872,6 +919,7 @@ def _goto_settled(url, timeout=25000, tries=3, compose_wait=40):
             # Landed on the requested surface. If we had surfaced the hidden Edge for a
             # sign-in wall, auth has completed -> return it to the background at once.
             if surfaced:
+                _cancel_force_rehide(force_timer)  # real rehide is happening now; drop the net
                 try:
                     from relay.edge_recover import rehide
                     rehide()
@@ -896,6 +944,8 @@ def _goto_settled(url, timeout=25000, tries=3, compose_wait=40):
                                        "Manual: powershell -NoProfile -ExecutionPolicy Bypass "
                                        "-File scripts\\start_companion_edge.ps1 -Foreground")
                     surfaced = True
+                    # BUG 4b safety net -- see _wait_composer's identical comment.
+                    force_timer = _schedule_force_rehide()
                 touch_pause()
         except Exception:
             pass
@@ -904,6 +954,7 @@ def _goto_settled(url, timeout=25000, tries=3, compose_wait=40):
     # If we surfaced but the wall never cleared, still rehide so a failed/abandoned
     # sign-in does not leave the companion Edge stuck in the foreground.
     if surfaced:
+        _cancel_force_rehide(force_timer)
         try:
             from relay.edge_recover import rehide
             rehide()
@@ -2926,6 +2977,14 @@ class Handler(BaseHTTPRequestHandler):
             port = int(os.environ.get("MCP_BRIDGE_CDP_PORT", "9223"))
             target = AGENT_URL or ((PAGE.url or "") if PAGE is not None else "")
             ok = bool(surface(port=port, open_url=target))
+            if ok:
+                # BUG 4a/4b fix: this surface() had no paired rehide() at all -- fire-and-
+                # forget, so the window stayed foreground until the process died. Precisely
+                # detecting "consent resolved" here is hard (this function only surfaces and
+                # returns; the caller decides success on the NEXT turn, elsewhere), so instead
+                # schedule the bounded safety net: force the window back down on its own after
+                # CONSENT_SURFACE_FORCE_REHIDE_SEC regardless of what the user does.
+                _schedule_force_rehide()
         except Exception:
             logger.warning("_consent_last_resort_surface: surface() raised", exc_info=True)
             ok = False
@@ -3313,18 +3372,87 @@ class Handler(BaseHTTPRequestHandler):
                 logger.warning("drain_pending_queue: queued send failed for sid=%s", sid, exc_info=True)
 
 
+def _agent_tab_matches(pg, base_url):
+    """BUG 4c helper: True if `pg` is already parked on the agent surface `base_url` drives
+    (or, when base_url is empty, on ANY agent surface -- mirroring the old empty-URL fallback's
+    own check). Used both to find a reusable tab and to identify duplicates left over from a
+    prior bridge restart (start_bridge.ps1 -Keepalive used to open a fresh tab every restart,
+    accumulating one authenticated tab per restart -- see _find_or_open_agent). Never raises:
+    a closed/mid-navigation page can throw on .url or .locator()."""
+    try:
+        u = pg.url or ""
+    except Exception:
+        return False
+    if "/chat/agent/" not in u:
+        return False
+    try:
+        if pg.locator(COPILOT_SELECTORS["composer"]).count() <= 0:
+            return False
+    except Exception:
+        return False
+    if not base_url:
+        return True
+    base = base_url.split("/conversation/")[0]
+    return u.startswith(base) or base in u
+
+
+def _close_duplicate_agent_tabs(ctx, keep_pg, base_url):
+    """BUG 4c self-healing: close every OTHER tab already on this same agent surface, keeping
+    only `keep_pg`. Guards against closing non-agent tabs (only closes pages that
+    _agent_tab_matches recognizes) and never closes keep_pg itself. Exception-guarded per tab;
+    never raises -- a failure here must not break startup. ASCII-only log."""
+    try:
+        pages = list(ctx.pages)
+    except Exception:
+        return
+    closed = 0
+    for pg in pages:
+        if pg is keep_pg:
+            continue
+        try:
+            if _agent_tab_matches(pg, base_url):
+                pg.close()
+                closed += 1
+        except Exception:
+            continue
+    if closed:
+        logger.info("_find_or_open_agent: closed %d duplicate agent tab(s) left over from "
+                    "prior restart(s)", closed)
+
+
 def _find_or_open_agent(ctx):
     url = os.environ.get("MCP_IMPL_AGENT_URL", "").strip()
     if url:
-        pg = ctx.new_page()
-        pg.goto(url, wait_until="domcontentloaded")
+        # BUG 4c fix: reuse an existing tab already on this agent surface (e.g. left over from
+        # a prior bridge restart via start_bridge.ps1 -Keepalive) instead of ALWAYS opening a
+        # new one -- every restart used to open another authenticated tab, and they accumulated
+        # forever. Only open a new tab when no reusable one exists.
+        reused = None
+        for pg in ctx.pages:
+            if _agent_tab_matches(pg, url):
+                reused = pg
+                break
+        if reused is not None:
+            pg = reused
+            try:
+                if (pg.url or "") != url:
+                    pg.goto(url, wait_until="domcontentloaded")
+            except Exception:
+                pass
+            logger.info("_find_or_open_agent: reused existing agent tab instead of opening a new one")
+        else:
+            pg = ctx.new_page()
+            pg.goto(url, wait_until="domcontentloaded")
+            logger.info("_find_or_open_agent: no reusable agent tab found -- opened a new one")
         for _ in range(40):
             pg.wait_for_timeout(1000)
             if pg.locator(COPILOT_SELECTORS["composer"]).count() > 0:
                 break
+        _close_duplicate_agent_tabs(ctx, pg, url)   # self-heal any tabs left over from before
         return pg
     for pg in ctx.pages:                       # fall back to any open agent tab
         if "/chat/agent/" in (pg.url or "") and pg.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+            _close_duplicate_agent_tabs(ctx, pg, url)
             return pg
     raise SystemExit("No agent page. Set MCP_IMPL_AGENT_URL in .env or open an agent tab in Edge.")
 
@@ -3378,6 +3506,24 @@ def _page_main(cdp, fresh):
         AGENT_URL = os.environ.get("MCP_IMPL_AGENT_URL", "").strip()
         if not AGENT_URL and "/chat/agent/" in (PAGE.url or ""):
             AGENT_URL = (PAGE.url or "").split("/conversation/")[0]
+
+        # BUG 4d fix: proactively run the EXISTING auto-consent click-through once, right after
+        # the composer is confirmed ready (post sign-in/tab-reuse), instead of ONLY reactively
+        # from inside a turn after a real reply already contained consent markers. This makes a
+        # connection-manager card that appears immediately after first sign-in get auto-clicked
+        # instead of being left for the (much more disruptive) surface() last resort. Reuses
+        # _bridge_auto_consent's existing three tiers unchanged -- no click logic reimplemented
+        # here; Tier 0/2 themselves no-op safely when no consent card/link is actually present,
+        # so this is safe to call unconditionally. Best-effort: PAGE/DRIVER are already live at
+        # this point, so failures are logged and swallowed rather than blocking startup.
+        try:
+            if _bridge_auto_consent():
+                logger.info("startup proactive auto-consent: click-through succeeded")
+            else:
+                logger.info("startup proactive auto-consent: no consent card handled "
+                            "(none present, or all tiers found nothing to click)")
+        except Exception:
+            logger.warning("startup proactive auto-consent raised", exc_info=True)
 
         # STARTUP AUTO-RESUME: reattach to the most recently active session that has a
         # reattachable conv_url, so a bridge restart (including the -Keepalive restart
