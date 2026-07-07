@@ -39,6 +39,23 @@ _CUE_WORDS = ("注意", "NG", "古い", "使わない", "高速化", "結論", "
 # "Table-ish" tokens: SCREAMING_SNAKE_CASE identifiers that look like DB table/column
 # names in prose (e.g. internal DB docs). Purely mechanical -- no allowlist of real names.
 _TABLE_TOKEN_RE = re.compile(r"\b[A-Z][A-Z0-9_]{4,}\b")
+# SQL syntax words that also happen to look like SCREAMING_SNAKE_CASE identifiers and
+# get swept up by _TABLE_TOKEN_RE when prose includes a fenced SQL snippet (e.g.
+# "GROUP BY", "HAVING COUNT(*)>1", "DATEADD(...)"). These are noise, not table/column
+# names, so they're excluded from table: tags. Uppercase, matched via tok.upper() so
+# the check is case-insensitive at the call site. Includes some short (3-4 letter)
+# keywords too even though _TABLE_TOKEN_RE itself requires 5+ chars -- cheap safety
+# net if the regex or a caller's own extraction ever gets more permissive.
+SQL_STOPWORDS = frozenset({
+    "SELECT", "FROM", "WHERE", "GROUP", "ORDER", "HAVING", "UNION", "EXISTS",
+    "INSERT", "UPDATE", "DELETE", "INNER", "OUTER", "RIGHT", "CROSS", "APPLY",
+    "DISTINCT", "BETWEEN", "VALUES", "CREATE", "TABLE", "INDEX", "USING",
+    "LIMIT", "OFFSET", "COUNT", "DATEADD", "DATEDIFF", "EOMONTH", "GETDATE",
+    "CONVERT", "ISNULL", "COALESCE", "NULLIF", "ROUND", "SUBSTRING",
+    "CHARINDEX", "DECLARE", "WITH", "CASE", "WHEN", "THEN", "ELSE", "CAST",
+    "JOIN", "LEFT", "NOLOCK", "TOP", "ASC", "DESC", "LIKE", "AND", "NOT",
+    "NULL", "INTO", "SET",
+})
 
 
 def _split_markdown_chunks(text: str, basename: str) -> list[tuple[str, str]]:
@@ -82,10 +99,17 @@ def _extract_context(body: str, limit: int = 800) -> str:
 
 
 def _extract_table_tags(body: str, max_tokens: int = 8) -> list[str]:
-    """Up to `max_tokens` distinct SCREAMING_SNAKE_CASE-ish tokens, as "table:<lower>" tags."""
+    """Up to `max_tokens` distinct SCREAMING_SNAKE_CASE-ish tokens, as "table:<lower>" tags.
+
+    Tokens that are pure SQL syntax (SELECT, GROUP, HAVING, DATEADD, ...) are dropped
+    via SQL_STOPWORDS -- they show up whenever the prose includes a fenced SQL snippet
+    and are noise, not table/column names.
+    """
     seen: list[str] = []
     for m in _TABLE_TOKEN_RE.finditer(body):
         tok = m.group(0)
+        if tok.upper() in SQL_STOPWORDS:
+            continue
         if tok not in seen:
             seen.append(tok)
         if len(seen) >= max_tokens:
