@@ -31,18 +31,15 @@ powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass `
   -File .\scripts\supervisor.ps1 -TunnelName <あなたのトンネル名>
 ```
 
-**ログオンのたびに自動起動**させたい場合（管理者権限不要。Task Scheduler が組織ポリシーで弾かれる環境でも通る）— スタートアップフォルダにランチャを置く:
+**ログオンのたびに自動起動**させたい場合（管理者権限不要。Task Scheduler が組織ポリシーで弾かれる環境でも通る）— スタートアップフォルダに登録用スクリプトを 1 回実行するだけです:
 
 ```powershell
-$startup = [Environment]::GetFolderPath('Startup')
-$root = (Get-Location).Path
-@"
-Set sh = CreateObject("WScript.Shell")
-sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$root\scripts\supervisor.ps1"" -TunnelName <あなたのトンネル名>", 0, False
-"@ | Set-Content -Encoding ASCII (Join-Path $startup "start-companion-supervisor.vbs")
+powershell -ExecutionPolicy Bypass -File scripts\register-supervisor.ps1
 ```
 
-これで再起動・スリープ復帰後もログオン時に supervisor が立ち上がり、サーバー＋トンネルを復活させます（多重起動は内部の mutex で防止）。
+削除する場合は `scripts\unregister-supervisor.ps1` を実行してください。詳細（動作の仕組み・確認方法・自己修復）は [scripts/AUTOSTART.md](../scripts/AUTOSTART.md)。
+
+これで再起動・スリープ復帰後もログオン時にスタック全体が立ち上がり、サーバー＋トンネルを復活させます（多重起動は内部の mutex で防止）。
 
 ---
 
