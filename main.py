@@ -56,6 +56,7 @@ from tools.memory_ops import (
 )
 from tools.procedural_memory import (
     procedural_memory_delete,
+    procedural_memory_import_markdown,
     procedural_memory_save,
     procedural_memory_search,
 )
@@ -225,6 +226,10 @@ TOOLS = (
     semantic_memory_save, semantic_memory_load, semantic_memory_list, semantic_memory_delete,
     # memory: procedural (reusable how-to success snippets; distinct store)
     procedural_memory_save, procedural_memory_search, procedural_memory_delete,
+    # memory: procedural bulk-import (gateway-only: appended after the priority/include
+    # sets are fixed above, so MCP_TOOL_MAP truncation never registers it directly --
+    # reachable only via call_tool("procedural_memory_import_markdown", {...})).
+    procedural_memory_import_markdown,
     # notifications
     notify_desktop,
     # scheduling (Windows Task Scheduler)
