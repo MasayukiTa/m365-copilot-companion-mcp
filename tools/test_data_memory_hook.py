@@ -39,8 +39,12 @@ def _fake_save(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _auto_off_by_default(monkeypatch):
-    """Default env to OFF for every test; individual tests opt in explicitly."""
+def _reset_auto_env(monkeypatch):
+    """Clear MCP_DATA_MEMORY_AUTO before every test so no test leaks its own
+    setting into the next one. NOTE: auto-recording is opt-out (ON by
+    default, including when unset -- see tools/data_memory_hook.py's
+    _auto_enabled()), so an UNSET env var here means ON, not OFF. Tests that
+    need the OFF path set it explicitly (e.g. monkeypatch.setenv(...,"0"))."""
     monkeypatch.delenv("MCP_DATA_MEMORY_AUTO", raising=False)
 
 
@@ -53,16 +57,18 @@ def _reset_stats(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# (a) auto OFF -> no save calls for any of the 3 hooks
+# (a) auto explicitly OFF (opt-out) -> no save calls for any of the 3 hooks
 # ---------------------------------------------------------------------------
 
 
-def test_auto_off_record_query_does_not_save(_fake_save):
+def test_auto_off_record_query_does_not_save(monkeypatch, _fake_save):
+    monkeypatch.setenv("MCP_DATA_MEMORY_AUTO", "0")
     hook.record_query("demo_db", "SELECT * FROM FAKE_TABLE_A", "col\n---\na\n--- 1 row(s)")
     assert _fake_save == []
 
 
-def test_auto_off_record_tables_does_not_save(_fake_save):
+def test_auto_off_record_tables_does_not_save(monkeypatch, _fake_save):
+    monkeypatch.setenv("MCP_DATA_MEMORY_AUTO", "0")
     listing = (
         f"{'catalog':<14}  {'schema':<14}  {'name':<30}  type\n"
         f"{'demo_db':<14}  {'dbo':<14}  {'FAKE_TABLE_A':<30}  TABLE\n"
@@ -72,7 +78,8 @@ def test_auto_off_record_tables_does_not_save(_fake_save):
     assert _fake_save == []
 
 
-def test_auto_off_record_columns_does_not_save(_fake_save):
+def test_auto_off_record_columns_does_not_save(monkeypatch, _fake_save):
+    monkeypatch.setenv("MCP_DATA_MEMORY_AUTO", "0")
     listing = (
         f"{'column':<30}  {'type':<18}  size   nullable\n"
         f"{'ID':<30}  {'INT':<18}  {'10':<6}  NO\n"
@@ -80,6 +87,36 @@ def test_auto_off_record_columns_does_not_save(_fake_save):
     )
     hook.record_columns("demo_db", "FAKE_TABLE_A", listing)
     assert _fake_save == []
+
+
+# ---------------------------------------------------------------------------
+# (a2) opt-out defect surface: UNSET (and non-"0" spellings) -> ON by default;
+# only 0/false/no/off (case-insensitive) turn it off
+# ---------------------------------------------------------------------------
+
+
+def test_auto_unset_defaults_on_record_query_saves(_fake_save):
+    """No monkeypatch.setenv at all -- MCP_DATA_MEMORY_AUTO is unset (cleared
+    by the autouse _reset_auto_env fixture) and recording still happens,
+    because the default is now ON (opt-out), not OFF."""
+    hook.record_query("demo_db", "SELECT * FROM FAKE_TABLE_A", "col\n---\na\n--- 1 row(s)")
+    assert len(_fake_save) == 1
+
+
+@pytest.mark.parametrize("off_value", ["0", "false", "FALSE", "No", "OFF", "  0  "])
+def test_auto_enabled_false_for_every_off_spelling(monkeypatch, off_value):
+    monkeypatch.setenv("MCP_DATA_MEMORY_AUTO", off_value)
+    assert hook._auto_enabled() is False
+
+
+@pytest.mark.parametrize("on_value", ["1", "true", "yes", "anything-else"])
+def test_auto_enabled_true_for_non_off_spellings(monkeypatch, on_value):
+    monkeypatch.setenv("MCP_DATA_MEMORY_AUTO", on_value)
+    assert hook._auto_enabled() is True
+
+
+def test_auto_enabled_true_when_unset():
+    assert hook._auto_enabled() is True
 
 
 # ---------------------------------------------------------------------------
@@ -296,9 +333,10 @@ def test_save_success_increments_saved(_fake_save):
     assert hook._stats["skipped_error"] == 0
 
 
-def test_data_memory_status_reflects_auto_flag_off_by_default():
+def test_data_memory_status_reflects_auto_on_by_default_when_unset():
     status = hook.data_memory_status()
-    assert "auto: OFF" in status
+    assert "auto: ON" in status
+    assert "unset, default ON" in status
     assert "saved=0 skipped_locked=0 skipped_error=0" in status
 
 
@@ -306,6 +344,13 @@ def test_data_memory_status_reflects_auto_flag_on(monkeypatch):
     monkeypatch.setenv("MCP_DATA_MEMORY_AUTO", "1")
     status = hook.data_memory_status()
     assert "auto: ON" in status
+
+
+def test_data_memory_status_reflects_auto_flag_off_when_opted_out(monkeypatch):
+    monkeypatch.setenv("MCP_DATA_MEMORY_AUTO", "0")
+    status = hook.data_memory_status()
+    assert "auto: OFF" in status
+    assert "opted out" in status.lower() or "opt" in status.lower()
 
 
 def test_data_memory_status_reflects_counters_after_locked_skip(monkeypatch):

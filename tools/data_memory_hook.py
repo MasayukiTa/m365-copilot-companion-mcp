@@ -8,11 +8,13 @@ from scratch. This module is not itself a tool -- it is called from inside
 tools/odbc_ops.py, right before each read tool returns.
 
 Env contract (ASCII only):
-    MCP_DATA_MEMORY_AUTO=1
-        Turn auto-recording on. Any other value (including unset) is OFF,
-        which means zero behavior change for odbc_ops callers -- this whole
-        module becomes a no-op. Read from os.environ at call time (not at
-        import time), so tests and callers can flip it per-call.
+    MCP_DATA_MEMORY_AUTO
+        OPT-OUT: auto-recording is ON by default (including when the var is
+        unset entirely), so DB exploration self-accumulates into procedural
+        memory with zero configuration. Set it to "0", "false", "no", or
+        "off" (case-insensitive) to disable it -- any other value keeps it
+        ON. Read from os.environ at call time (not at import time), so tests
+        and callers can flip it per-call.
     MCP_DATA_MEMORY_TABLE_TOKENS_MAX (optional, default 8)
         Cap on how many SCREAMING_SNAKE_CASE "table-ish" tokens get pulled out
         of a SQL statement into tags for record_query.
@@ -79,7 +81,11 @@ _COLUMNS_NAME_SLICE = slice(0, 30)   # f"{column_name:<30}  {type_name:<18}  ...
 
 
 def _auto_enabled() -> bool:
-    return os.environ.get("MCP_DATA_MEMORY_AUTO", "0") == "1"
+    """OPT-OUT: ON by default (unset counts as ON). Only an explicit
+    "0"/"false"/"no"/"off" (case-insensitive) turns it off."""
+    return os.environ.get("MCP_DATA_MEMORY_AUTO", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
 
 
 def _table_tokens_max() -> int:
@@ -189,23 +195,25 @@ def _save(intent: str, snippet: str, tags: str, context: str) -> None:
 def data_memory_status() -> str:
     """Read-only status of the DB-exploration auto-memory hook (no unlock needed).
 
-    Reports whether MCP_DATA_MEMORY_AUTO is on and this PROCESS's save/skip
-    counters, so a silent failure mode becomes visible: odbc_query / odbc_tables /
-    odbc_columns are intentionally ungated, so a not-yet-unlocked remote client's
-    DB exploration works fine -- but the auto-memory write behind it goes through
-    procedural_memory_save, which IS require_unlocked()-gated, so every such
-    write was previously failing silently forever ("memory never updates" with
-    no visible cause). This tool itself stays ungated (read-only, same reasoning
-    as the odbc_* read tools) so it's reachable even while locked -- that's the
-    point: you can check status before/without ever unlocking.
+    Auto-recording defaults ON (opt-out): reports whether MCP_DATA_MEMORY_AUTO
+    is on and this PROCESS's save/skip counters, so a silent failure mode
+    becomes visible: odbc_query / odbc_tables / odbc_columns are intentionally
+    ungated, so a not-yet-unlocked remote client's DB exploration works fine --
+    but the auto-memory write behind it goes through procedural_memory_save,
+    which IS require_unlocked()-gated, so every such write was previously
+    failing silently forever ("memory never updates" with no visible cause).
+    This tool itself stays ungated (read-only, same reasoning as the odbc_*
+    read tools) so it's reachable even while locked -- that's the point: you
+    can check status before/without ever unlocking.
     """
     auto_on = _auto_enabled()
     saved = _stats["saved"]
     skipped_locked = _stats["skipped_locked"]
     skipped_error = _stats["skipped_error"]
+    raw_env = os.environ.get("MCP_DATA_MEMORY_AUTO")
+    raw_display = raw_env if raw_env is not None else "(unset, default ON)"
     lines = [
-        "auto: %s (MCP_DATA_MEMORY_AUTO=%s)"
-        % ("ON" if auto_on else "OFF", os.environ.get("MCP_DATA_MEMORY_AUTO", "0")),
+        "auto: %s (MCP_DATA_MEMORY_AUTO=%s)" % ("ON" if auto_on else "OFF", raw_display),
         "saved=%d skipped_locked=%d skipped_error=%d (this process, since start)"
         % (saved, skipped_locked, skipped_error),
     ]
@@ -216,15 +224,20 @@ def data_memory_status() -> str:
             "unlock(password='<password>') on this client to resume them."
         )
     elif not auto_on:
-        lines.append("hint: set MCP_DATA_MEMORY_AUTO=1 to turn auto-recording on.")
+        lines.append(
+            "hint: auto-recording is OFF (opted out). It defaults ON -- unset "
+            "MCP_DATA_MEMORY_AUTO, or set it to anything other than "
+            "0/false/no/off, to turn it back on."
+        )
     return "\n".join(lines)
 
 
 def record_query(connection: str, sql: str, result_text: str) -> None:
     """Best-effort: after a successful odbc_query, remember the SQL for reuse.
 
-    No-op unless MCP_DATA_MEMORY_AUTO=1 and result_text looks like a real
-    success payload. Never raises.
+    No-op only when auto-recording is explicitly disabled (MCP_DATA_MEMORY_AUTO
+    set to 0/false/no/off) or result_text doesn't look like a real success
+    payload. ON by default. Never raises.
     """
     try:
         if not _auto_enabled():
@@ -246,8 +259,9 @@ def record_query(connection: str, sql: str, result_text: str) -> None:
 def record_tables(connection: str, result_text: str) -> None:
     """Best-effort: after a successful odbc_tables, remember the object list.
 
-    No-op unless MCP_DATA_MEMORY_AUTO=1 and result_text looks like a real
-    success payload. Never raises.
+    No-op only when auto-recording is explicitly disabled (MCP_DATA_MEMORY_AUTO
+    set to 0/false/no/off) or result_text doesn't look like a real success
+    payload. ON by default. Never raises.
     """
     try:
         if not _auto_enabled():
@@ -268,8 +282,9 @@ def record_tables(connection: str, result_text: str) -> None:
 def record_columns(connection: str, table: str, result_text: str) -> None:
     """Best-effort: after a successful odbc_columns, remember the column list.
 
-    No-op unless MCP_DATA_MEMORY_AUTO=1 and result_text looks like a real
-    success payload. Never raises.
+    No-op only when auto-recording is explicitly disabled (MCP_DATA_MEMORY_AUTO
+    set to 0/false/no/off) or result_text doesn't look like a real success
+    payload. ON by default. Never raises.
     """
     try:
         if not _auto_enabled():
