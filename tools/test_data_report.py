@@ -466,6 +466,9 @@ class _FakeCursor:
     def fetchmany(self, n):
         return self._rows[:n]
 
+    def fetchall(self):
+        return self._rows
+
 
 class _FakeConnection:
     def __init__(self, cursor):
@@ -512,6 +515,42 @@ def test_odbc_helper_single_execution_and_preview_and_xlsx(monkeypatch):
     # preview only shows the first preview_rows=2 of the 3 fetched rows
     assert "fake_col_a" in result["preview"]
     assert "--- 2 row(s)" in result["preview"]
+
+
+def test_odbc_helper_xlsx_is_not_truncated_at_old_200_cap(monkeypatch):
+    """Regression test: the xlsx write must include the FULL result set (like
+    odbc_to_excel), not be silently capped at the old max_rows=200 default
+    that used to be shared with the text-preview cap.
+    """
+    monkeypatch.setattr(odbc_ops, "require_unlocked", lambda: None)
+    columns = ["fake_col_a", "fake_col_b"]
+    rows = [(f"fake_{i}", i) for i in range(500)]
+    cursor = _FakeCursor(columns, rows)
+    fake_con = _FakeConnection(cursor)
+
+    monkeypatch.setattr(odbc_ops, "_connect", lambda connection, timeout=30: fake_con)
+
+    write_calls = []
+    monkeypatch.setattr(
+        odbc_ops, "_write_dataframe_to_excel",
+        lambda df, out_path: write_calls.append((df, out_path)),
+    )
+
+    result = odbc_ops.odbc_query_to_excel_and_preview(
+        "demo_db", "SELECT fake_col_a, fake_col_b FROM FAKE_TABLE_A", "C:/fake/out.xlsx",
+        preview_rows=15,
+    )
+
+    assert result["ok"] is True
+    assert result["rows"] == 500
+    # single DB round-trip
+    assert len(cursor.execute_calls) == 1
+    # xlsx writer must receive all 500 rows, not capped at 200
+    assert len(write_calls) == 1
+    written_df, written_path = write_calls[0]
+    assert len(written_df) == 500
+    # preview still only renders preview_rows=15 of the 500 fetched rows
+    assert "--- 15 row(s)" in result["preview"]
 
 
 def test_odbc_helper_rejects_non_read_only(monkeypatch):
