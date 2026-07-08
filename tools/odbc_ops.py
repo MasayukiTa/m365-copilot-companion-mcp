@@ -273,7 +273,6 @@ def odbc_query_to_excel_and_preview(
     sql: str,
     xlsx_path: str,
     preview_rows: int = 15,
-    max_rows: int = 200,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> dict:
     """Execute `sql` ONCE and produce both a preview text table and a .xlsx file
@@ -288,6 +287,10 @@ def odbc_query_to_excel_and_preview(
     Not a registered MCP tool -- data_report.py imports this lazily, exactly
     like it lazy-imports odbc_query / odbc_to_excel today.
 
+    Fetches the full result set (like odbc_to_excel -- no row cap on the xlsx
+    output); preview_rows only affects how many of those rows are rendered in
+    the returned text preview, not the xlsx row count.
+
     Args:
         connection: Named connection (from .env MCP_DB_<NAME>=...) or a full
             ODBC connection string.
@@ -295,8 +298,6 @@ def odbc_query_to_excel_and_preview(
         xlsx_path: .xlsx output path under the allowed base.
         preview_rows: How many of the fetched rows to render in the preview
             text table (does not affect how many rows are fetched/written).
-        max_rows: Cap on how many rows are fetched from the cursor and written
-            to xlsx (same semantics/default as odbc_query's max_rows cap).
         timeout: Connection / login timeout in seconds.
 
     Returns:
@@ -332,7 +333,7 @@ def odbc_query_to_excel_and_preview(
                     "error": "[odbc_query_to_excel_and_preview error: statement returned no result set]",
                 }
             columns = [d[0] for d in cur.description]
-            rows = cur.fetchmany(max_rows)
+            rows = cur.fetchall()
         finally:
             con.close()
 
