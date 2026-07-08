@@ -216,6 +216,18 @@ def odbc_columns(
         return f"[odbc_columns error: {type(e).__name__}: {e}]"
 
 
+def _write_dataframe_to_excel(df, out_path) -> None:
+    """Write a pandas DataFrame to .xlsx, creating parent dirs as needed.
+
+    Extracted so odbc_to_excel and odbc_query_to_excel_and_preview share the
+    exact same xlsx-writing body (do not reimplement the excel logic twice),
+    and so tests can monkeypatch this one seam instead of touching real disk
+    / requiring pandas to be importable in every test environment.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_excel(out_path, index=False)
+
+
 def odbc_to_excel(
     connection: str,
     query: str,
@@ -250,11 +262,90 @@ def odbc_to_excel(
             df = pd.read_sql_query(query, con, params=params or None)
         finally:
             con.close()
-        out.parent.mkdir(parents=True, exist_ok=True)
-        df.to_excel(out, index=False)
+        _write_dataframe_to_excel(df, out)
         return f"Wrote {out} ({len(df)} rows, {len(df.columns)} cols)"
     except Exception as e:
         return f"[odbc_to_excel error: {type(e).__name__}: {e}]"
+
+
+def odbc_query_to_excel_and_preview(
+    connection: str,
+    sql: str,
+    xlsx_path: str,
+    preview_rows: int = 15,
+    max_rows: int = 200,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> dict:
+    """Execute `sql` ONCE and produce both a preview text table and a .xlsx file
+    from the SAME fetched result set.
+
+    This exists to fix a double-execution bug: data_report_run used to call
+    odbc_query() for the report.md preview and then, separately, odbc_to_excel()
+    for the .xlsx -- two round-trips against a possibly live-updating DB, which
+    can make the preview and the xlsx disagree (and doubles DB load). This
+    helper fetches once and derives both artifacts from that single fetch.
+
+    Not a registered MCP tool -- data_report.py imports this lazily, exactly
+    like it lazy-imports odbc_query / odbc_to_excel today.
+
+    Args:
+        connection: Named connection (from .env MCP_DB_<NAME>=...) or a full
+            ODBC connection string.
+        sql: SELECT/WITH/EXEC/SHOW/DESCRIBE statement (read-only enforced).
+        xlsx_path: .xlsx output path under the allowed base.
+        preview_rows: How many of the fetched rows to render in the preview
+            text table (does not affect how many rows are fetched/written).
+        max_rows: Cap on how many rows are fetched from the cursor and written
+            to xlsx (same semantics/default as odbc_query's max_rows cap).
+        timeout: Connection / login timeout in seconds.
+
+    Returns:
+        {"ok": True, "preview": <text table>, "rows": <int fetched>,
+         "xlsx": xlsx_path} on success, or
+        {"ok": False, "error": "<same '[odbc_... error: ...]' string shape
+         odbc_query/odbc_to_excel use>"} on any failure. Never raises.
+    """
+    locked = require_unlocked()
+    if locked:
+        return {"ok": False, "error": locked}
+    try:
+        import pandas as pd
+
+        if not _is_read_only(sql):
+            return {
+                "ok": False,
+                "error": "[odbc_query_to_excel_and_preview error: only SELECT/WITH/EXEC/SHOW/DESCRIBE allowed]",
+            }
+        out = _validate_path(xlsx_path)
+        if out.suffix.lower() != ".xlsx":
+            return {
+                "ok": False,
+                "error": "[odbc_query_to_excel_and_preview error: xlsx_path must end with .xlsx]",
+            }
+        con = _connect(connection, timeout=timeout)
+        try:
+            cur = con.cursor()
+            cur.execute(sql)
+            if cur.description is None:
+                return {
+                    "ok": False,
+                    "error": "[odbc_query_to_excel_and_preview error: statement returned no result set]",
+                }
+            columns = [d[0] for d in cur.description]
+            rows = cur.fetchmany(max_rows)
+        finally:
+            con.close()
+
+        df = pd.DataFrame.from_records(list(rows), columns=columns)
+        _write_dataframe_to_excel(df, out)
+
+        preview = _format_table(columns, rows[:preview_rows], preview_rows)
+        return {"ok": True, "preview": preview, "rows": len(rows), "xlsx": str(out)}
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"[odbc_query_to_excel_and_preview error: {type(e).__name__}: {e}]",
+        }
 
 
 def _format_table(columns: list[str], rows: list, max_rows: int) -> str:

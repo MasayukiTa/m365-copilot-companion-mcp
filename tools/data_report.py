@@ -614,6 +614,33 @@ def data_report_run(plan: Any, output_dir: str) -> str:
                 step_previews.append({"purpose": purpose, "sql": "", "preview": "(SQL未指定のためスキップ)"})
                 continue
 
+            if kind in ("aggregate", "detail") and "xlsx" in outputs:
+                # SINGLE DB round-trip for this step: one execution produces
+                # BOTH the report.md preview and the xlsx, from the same
+                # fetched result set (fixes the old double-execution bug where
+                # odbc_query() and odbc_to_excel() each ran the same SQL
+                # separately, which could disagree on a live-updating DB).
+                xlsx_path = out_dir / f"{_slug(purpose)}.xlsx"
+                try:
+                    from .odbc_ops import odbc_query_to_excel_and_preview
+                    combined = odbc_query_to_excel_and_preview(connection, sql, str(xlsx_path))
+                except Exception as e:
+                    combined = {"ok": False, "error": f"[odbc_query_to_excel_and_preview error: {type(e).__name__}: {e}]"}
+
+                if not isinstance(combined, dict) or not combined.get("ok"):
+                    err = combined.get("error") if isinstance(combined, dict) else str(combined)
+                    run_warnings.append(f"{purpose}: {err}")
+                    queries_manifest.append({"purpose": purpose, "sql": sql, "rows": None, "output": None})
+                    step_previews.append({"purpose": purpose, "sql": sql, "preview": str(err)})
+                    continue
+
+                queries_manifest.append({
+                    "purpose": purpose, "sql": sql,
+                    "rows": combined.get("rows"), "output": combined.get("xlsx"),
+                })
+                step_previews.append({"purpose": purpose, "sql": sql, "preview": combined.get("preview") or ""})
+                continue
+
             try:
                 from .odbc_ops import odbc_query
                 result_text = odbc_query(connection, sql)
@@ -627,20 +654,7 @@ def data_report_run(plan: Any, output_dir: str) -> str:
                 continue
 
             rows = _count_rows(result_text)
-            output_path = None
-            if kind in ("aggregate", "detail") and "xlsx" in outputs:
-                xlsx_path = out_dir / f"{_slug(purpose)}.xlsx"
-                try:
-                    from .odbc_ops import odbc_to_excel
-                    xlsx_result = odbc_to_excel(connection, sql, str(xlsx_path))
-                except Exception as e:
-                    xlsx_result = f"[odbc_to_excel error: {type(e).__name__}: {e}]"
-                if isinstance(xlsx_result, str) and not xlsx_result.startswith("["):
-                    output_path = str(xlsx_path)
-                else:
-                    run_warnings.append(f"{purpose}: {xlsx_result}")
-
-            queries_manifest.append({"purpose": purpose, "sql": sql, "rows": rows, "output": output_path})
+            queries_manifest.append({"purpose": purpose, "sql": sql, "rows": rows, "output": None})
             preview = "\n".join(result_text.splitlines()[:15])
             step_previews.append({"purpose": purpose, "sql": sql, "preview": preview})
 
@@ -698,16 +712,20 @@ def data_report_run(plan: Any, output_dir: str) -> str:
             except Exception as e:
                 run_warnings.append(f"report.pptx error: {type(e).__name__}: {e}")
 
+        # The manifest self-lists ALL generated artifacts, including its own
+        # path -- so build the complete list (report.md, any xlsx/docx/pptx,
+        # AND report_manifest.json) BEFORE composing the manifest, then write
+        # it. The run's return summary below uses this same complete list.
+        manifest_path = out_dir / "report_manifest.json"
+        generated_files.append(str(manifest_path))
+
         manifest = _compose_manifest(
             question=question, connection=connection, memory_hits=memory_hits,
             tables=tables, queries=queries_manifest, generated_files=list(generated_files),
             warnings=run_warnings,
         )
-        manifest_path = out_dir / "report_manifest.json"
         manifest_write = write_file(str(manifest_path), json.dumps(manifest, ensure_ascii=False, indent=2))
-        if isinstance(manifest_write, str) and not manifest_write.startswith("["):
-            generated_files.append(str(manifest_path))
-        else:
+        if not (isinstance(manifest_write, str) and not manifest_write.startswith("[")):
             run_warnings.append(f"report_manifest.json: {manifest_write}")
 
         lines = ["data_report_run: report generated", "", "生成ファイル (generated files):"]
