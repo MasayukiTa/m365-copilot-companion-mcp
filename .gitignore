@@ -28,6 +28,7 @@ dist/
 .todo_state.json
 .memory_state.json
 .procedural_memory.json
+.procedural_memory_aliases.json
 .companion_runs/
 .companion_gates/
 

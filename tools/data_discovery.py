@@ -155,6 +155,33 @@ def _intent_and_snippet_from_block(block: str) -> tuple[str, str]:
     return intent, snippet
 
 
+_ALIAS_EXPAND_CAP = 16
+
+
+def _expand_keywords_with_aliases(keywords: list[str]) -> tuple[list[str], int]:
+    """Widen `keywords` via tools/data_aliases.expand_terms, capped so the
+    search query can't blow up. Returns (expanded_keywords, added_count).
+
+    Lazy import (so tests can monkeypatch tools.data_aliases.expand_terms
+    without needing data_discovery to import it eagerly) and fully
+    exception-safe: any failure in the alias store falls back to the
+    unexpanded keyword list with added_count=0 -- alias expansion is a nice-
+    to-have, never a search-breaking dependency.
+    """
+    if not keywords:
+        return keywords, 0
+    try:
+        from .data_aliases import expand_terms
+        widened = expand_terms(keywords)
+        if not isinstance(widened, list) or not widened:
+            return keywords, 0
+        capped = widened[:_ALIAS_EXPAND_CAP]
+        added = max(0, len(capped) - len(keywords))
+        return capped, added
+    except Exception:
+        return keywords, 0
+
+
 def _compose_answer(
     question: str,
     connection: str,
@@ -163,6 +190,7 @@ def _compose_answer(
     srcs: list[str],
     live_fallback: str | None = None,
     empty_reason: str | None = None,
+    alias_added: int = 0,
 ) -> str:
     """Assemble the final answer string from already-parsed pieces. Kept separate
     from find_db_objects so it (and the parsers above) are unit-testable without
@@ -191,6 +219,8 @@ def _compose_answer(
         lines.append(live_fallback)
     if empty_reason:
         lines.append(empty_reason)
+    if alias_added > 0:
+        lines.append(f"(同義語展開: {alias_added}語)")
     return "\n".join(lines)
 
 
@@ -215,7 +245,13 @@ def find_db_objects(question: str, connection: str = "", limit: int = 8) -> str:
         # back to the raw question if extraction yields nothing (e.g. pure ASCII with
         # no word-ish tokens, or an edge case the heuristic doesn't cover).
         keywords = extract_keywords(question)
-        base_query = " ".join(keywords) if keywords else question
+        # Widen keywords with any known dept-local synonyms/abbreviations (see
+        # tools/data_aliases.py) before building the search query -- e.g. one
+        # team's "原料" and another's "投入" both reaching the same memory.
+        # Best-effort: a failure here never breaks search, it just falls back
+        # to the unexpanded keyword list.
+        expanded_keywords, alias_added = _expand_keywords_with_aliases(keywords)
+        base_query = " ".join(expanded_keywords) if expanded_keywords else question
         query = f"{base_query} connection:{connection}" if connection else base_query
         try:
             from .procedural_memory import procedural_memory_search, SQL_STOPWORDS
@@ -239,7 +275,7 @@ def find_db_objects(question: str, connection: str = "", limit: int = 8) -> str:
             intents = [_intent_and_snippet_from_block(b) for b in _extract_match_blocks(result)]
 
         if tables or intents:
-            return _compose_answer(question, connection, tables, intents, srcs)
+            return _compose_answer(question, connection, tables, intents, srcs, alias_added=alias_added)
 
         # Memory had nothing usable.
         if connection:
@@ -252,15 +288,21 @@ def find_db_objects(question: str, connection: str = "", limit: int = 8) -> str:
                 return _compose_answer(
                     question, connection, [], [], [],
                     empty_reason=f"memoryに該当なし。ライブ探索も失敗しました: {live}",
+                    alias_added=alias_added,
                 )
             live_capped = "\n".join(live.splitlines()[:30])
-            return _compose_answer(question, connection, [], [], [], live_fallback=live_capped)
+            return _compose_answer(
+                question, connection, [], [], [], live_fallback=live_capped, alias_added=alias_added,
+            )
 
         guidance = (
             "memoryに該当なし (connection未指定のためライブ探索は行いません)。"
             " procedural_memory_import_markdown でDBメモを取り込むか、"
-            " MCP_DATA_MEMORY_AUTO を有効にしてください。"
+            " odbc_query 等でDB探索を行ってください"
+            " (MCP_DATA_MEMORY_AUTO は既定でONのため自動的に記録されます)。"
         )
-        return _compose_answer(question, connection, [], [], [], empty_reason=guidance)
+        return _compose_answer(
+            question, connection, [], [], [], empty_reason=guidance, alias_added=alias_added,
+        )
     except Exception as e:
         return f"[find_db_objects error: {type(e).__name__}: {e}]"

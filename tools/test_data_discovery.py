@@ -15,6 +15,7 @@ import pytest
 from tools import data_discovery as dd
 from tools import procedural_memory as pm
 from tools import odbc_ops
+from tools import data_aliases
 
 
 CANNED_MEMORY_HIT = (
@@ -198,3 +199,99 @@ def test_sql_stopword_tags_are_filtered_from_candidates(monkeypatch):
     assert "  - group" not in out
     assert "  - having" not in out
     assert "  - dateadd" not in out
+
+
+# ===========================================================================
+# alias expansion wiring (tools/data_aliases.py plugged into find_db_objects)
+# ===========================================================================
+
+
+def test_alias_expansion_widens_query_and_notes_it_in_output(monkeypatch):
+    monkeypatch.setattr(
+        data_aliases, "expand_terms",
+        lambda terms: list(terms) + ["synonym_term"],
+    )
+    captured = {}
+
+    def _fake_search(query, limit=10):
+        captured["query"] = query
+        return CANNED_MEMORY_HIT
+
+    monkeypatch.setattr(pm, "procedural_memory_search", _fake_search)
+    monkeypatch.setattr(odbc_ops, "odbc_tables", _raise_if_called)
+
+    out = dd.find_db_objects("customers", connection="demo_db")
+
+    assert "synonym_term" in captured["query"]
+    assert "同義語展開: 1語" in out
+
+
+def test_alias_expansion_absent_adds_no_note(monkeypatch):
+    monkeypatch.setattr(data_aliases, "expand_terms", lambda terms: list(terms))
+    monkeypatch.setattr(pm, "procedural_memory_search", lambda query, limit=10: CANNED_MEMORY_HIT)
+    monkeypatch.setattr(odbc_ops, "odbc_tables", _raise_if_called)
+
+    out = dd.find_db_objects("customers", connection="demo_db")
+
+    assert "同義語展開" not in out
+
+
+def test_alias_expansion_is_capped(monkeypatch):
+    many_synonyms = [f"syn{i}" for i in range(50)]
+    monkeypatch.setattr(
+        data_aliases, "expand_terms",
+        lambda terms: list(terms) + many_synonyms,
+    )
+    captured = {}
+
+    def _fake_search(query, limit=10):
+        captured["query"] = query
+        return CANNED_MEMORY_HIT
+
+    monkeypatch.setattr(pm, "procedural_memory_search", _fake_search)
+    monkeypatch.setattr(odbc_ops, "odbc_tables", _raise_if_called)
+
+    dd.find_db_objects("customers", connection="demo_db")
+
+    # capped at 16 total keywords -- query token count stays bounded
+    assert len(captured["query"].split()) <= 17  # +1 for "connection:demo_db"
+
+
+def test_alias_expansion_failure_falls_back_to_unexpanded_keywords(monkeypatch):
+    def _boom(terms):
+        raise RuntimeError("alias store exploded")
+
+    monkeypatch.setattr(data_aliases, "expand_terms", _boom)
+    captured = {}
+
+    def _fake_search(query, limit=10):
+        captured["query"] = query
+        return CANNED_MEMORY_HIT
+
+    monkeypatch.setattr(pm, "procedural_memory_search", _fake_search)
+    monkeypatch.setattr(odbc_ops, "odbc_tables", _raise_if_called)
+
+    out = dd.find_db_objects("where are customers", connection="demo_db")
+
+    # still works: search still ran with the unexpanded query, no crash
+    assert "fake_table_a" in out
+    assert "customers" in captured["query"] or "顧客" in captured["query"] or captured["query"]
+    assert "同義語展開" not in out
+
+
+def test_alias_expansion_not_attempted_when_no_keywords_extracted(monkeypatch):
+    """extract_keywords("") never gets here (rejected earlier), but a question
+    that extracts to [] should skip aliasing rather than expand []."""
+    called = {"n": 0}
+
+    def _track(terms):
+        called["n"] += 1
+        return terms
+
+    monkeypatch.setattr(data_aliases, "expand_terms", _track)
+    monkeypatch.setattr(pm, "procedural_memory_search", lambda query, limit=10: "(no matches)")
+    monkeypatch.setattr(odbc_ops, "odbc_tables", _raise_if_called)
+
+    dd.find_db_objects("...")  # punctuation-only -> extract_keywords yields []
+
+    assert called["n"] == 0
