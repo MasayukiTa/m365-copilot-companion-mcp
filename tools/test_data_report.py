@@ -284,7 +284,12 @@ def test_run_rejects_invalid_json_string_plan(tmp_path):
 def test_run_accepts_plan_as_json_string(monkeypatch, tmp_path):
     canned_result = "col1  col2\n----  ----\na     1\n--- 1 row(s)"
     monkeypatch.setattr(odbc_ops, "odbc_query", lambda connection, sql, **kw: canned_result)
-    monkeypatch.setattr(odbc_ops, "odbc_to_excel", lambda connection, sql, output_path, **kw: f"Wrote {output_path} (1 rows, 2 cols)")
+    monkeypatch.setattr(
+        odbc_ops, "odbc_query_to_excel_and_preview",
+        lambda connection, sql, xlsx_path, **kw: {
+            "ok": True, "preview": canned_result, "rows": 1, "xlsx": xlsx_path,
+        },
+    )
 
     written = []
 
@@ -310,12 +315,17 @@ def test_run_good_step_writes_report_and_manifest_and_calls_excel(monkeypatch, t
     canned_result = "col1  col2\n----  ----\na     1\n--- 1 row(s)"
     excel_calls = []
 
-    def _fake_odbc_to_excel(connection, sql, output_path, **kw):
-        excel_calls.append((connection, sql, output_path))
-        return f"Wrote {output_path} (1 rows, 2 cols)"
+    def _fake_combined(connection, sql, xlsx_path, **kw):
+        excel_calls.append((connection, sql, xlsx_path))
+        return {"ok": True, "preview": canned_result, "rows": 1, "xlsx": xlsx_path}
 
-    monkeypatch.setattr(odbc_ops, "odbc_query", lambda connection, sql, **kw: canned_result)
-    monkeypatch.setattr(odbc_ops, "odbc_to_excel", _fake_odbc_to_excel)
+    # odbc_query must NOT be called for an xlsx-producing step -- the single-
+    # execution fix means only odbc_query_to_excel_and_preview runs the SQL.
+    def _fail_if_called(connection, sql, **kw):
+        raise AssertionError("odbc_query must not be called when xlsx output is requested (double-execution bug)")
+
+    monkeypatch.setattr(odbc_ops, "odbc_query", _fail_if_called)
+    monkeypatch.setattr(odbc_ops, "odbc_query_to_excel_and_preview", _fake_combined)
 
     written = []
 
@@ -362,13 +372,12 @@ def test_run_good_step_writes_report_and_manifest_and_calls_excel(monkeypatch, t
 
 
 def test_run_tolerates_one_bad_step_and_continues(monkeypatch, tmp_path):
-    def _fake_odbc_query(connection, sql, **kw):
+    def _fake_combined(connection, sql, xlsx_path, **kw):
         if "BAD" in sql:
-            return "[odbc_query error: pyodbc.Error: table not found]"
-        return "col1\n----\na\n--- 1 row(s)"
+            return {"ok": False, "error": "[odbc_query_to_excel_and_preview error: pyodbc.Error: table not found]"}
+        return {"ok": True, "preview": "col1\n----\na\n--- 1 row(s)", "rows": 1, "xlsx": xlsx_path}
 
-    monkeypatch.setattr(odbc_ops, "odbc_query", _fake_odbc_query)
-    monkeypatch.setattr(odbc_ops, "odbc_to_excel", lambda connection, sql, output_path, **kw: f"Wrote {output_path} (1 rows, 1 cols)")
+    monkeypatch.setattr(odbc_ops, "odbc_query_to_excel_and_preview", _fake_combined)
 
     written = []
     monkeypatch.setattr(
@@ -397,6 +406,140 @@ def test_run_tolerates_one_bad_step_and_continues(monkeypatch, tmp_path):
     assert rows_by_purpose["good step"] == 1
     assert rows_by_purpose["bad step"] is None
     assert any("bad step" in w for w in manifest["warnings"])
+
+
+def test_run_manifest_self_lists_its_own_path_in_generated_files(monkeypatch, tmp_path):
+    """Defect 2: report_manifest.json must list itself inside generated_files,
+    not just report.md / xlsx / docx / pptx -- previously the manifest path
+    was only appended to a local var AFTER the manifest content was composed
+    and written, so the manifest never mentioned itself."""
+    monkeypatch.setattr(
+        odbc_ops, "odbc_query_to_excel_and_preview",
+        lambda connection, sql, xlsx_path, **kw: {
+            "ok": True, "preview": "col1\n----\na\n--- 1 row(s)", "rows": 1, "xlsx": xlsx_path,
+        },
+    )
+
+    written = []
+    monkeypatch.setattr(
+        file_ops, "write_file",
+        lambda path, content, encoding="utf-8": (written.append((path, content)), f"Wrote {path}")[1],
+    )
+
+    plan = {
+        "question": "q", "connection": "demo_db", "tables": [], "memory_hits": [],
+        "steps": [{"purpose": "step one", "sql": "SELECT 1 FROM FAKE_TABLE_A", "kind": "aggregate"}],
+        "outputs": ["markdown", "xlsx"], "warnings": [],
+    }
+    out = dr.data_report_run(plan, str(tmp_path))
+
+    manifest_path, manifest_content = written[-1]
+    assert manifest_path.endswith("report_manifest.json")
+    manifest = json.loads(manifest_content)
+
+    assert any(f.endswith("report_manifest.json") for f in manifest["generated_files"])
+    assert any(f.endswith("report.md") for f in manifest["generated_files"])
+    assert any(f.endswith(".xlsx") for f in manifest["generated_files"])
+
+    # The return summary's generated-files listing must reflect the same
+    # complete list, including the manifest's own path.
+    assert "report_manifest.json" in out
+
+
+# ===========================================================================
+# odbc_ops.odbc_query_to_excel_and_preview -- single-execution fix (Defect 1)
+# ===========================================================================
+
+
+class _FakeCursor:
+    """Fake pyodbc cursor: canned columns/rows, counts execute() calls."""
+
+    def __init__(self, columns, rows):
+        self._columns = columns
+        self._rows = rows
+        self.execute_calls = []
+        self.description = [(c,) for c in columns]
+
+    def execute(self, sql, *params):
+        self.execute_calls.append(sql)
+
+    def fetchmany(self, n):
+        return self._rows[:n]
+
+
+class _FakeConnection:
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.closed = False
+
+    def cursor(self):
+        return self._cursor
+
+    def close(self):
+        self.closed = True
+
+
+def test_odbc_helper_single_execution_and_preview_and_xlsx(monkeypatch):
+    monkeypatch.setattr(odbc_ops, "require_unlocked", lambda: None)
+    columns = ["fake_col_a", "fake_col_b"]
+    rows = [("a", 1), ("b", 2), ("c", 3)]
+    cursor = _FakeCursor(columns, rows)
+    fake_con = _FakeConnection(cursor)
+
+    monkeypatch.setattr(odbc_ops, "_connect", lambda connection, timeout=30: fake_con)
+
+    write_calls = []
+    monkeypatch.setattr(
+        odbc_ops, "_write_dataframe_to_excel",
+        lambda df, out_path: write_calls.append((df, out_path)),
+    )
+
+    result = odbc_ops.odbc_query_to_excel_and_preview(
+        "demo_db", "SELECT fake_col_a, fake_col_b FROM FAKE_TABLE_A", "C:/fake/out.xlsx",
+        preview_rows=2,
+    )
+
+    assert result["ok"] is True
+    assert result["rows"] == 3
+    assert result["xlsx"].endswith("out.xlsx")
+    # single DB round-trip: exactly one execute() call for both preview + xlsx
+    assert len(cursor.execute_calls) == 1
+    assert fake_con.closed is True
+    # xlsx writer called exactly once, with ALL fetched rows (not just preview)
+    assert len(write_calls) == 1
+    written_df, written_path = write_calls[0]
+    assert len(written_df) == 3
+    # preview only shows the first preview_rows=2 of the 3 fetched rows
+    assert "fake_col_a" in result["preview"]
+    assert "--- 2 row(s)" in result["preview"]
+
+
+def test_odbc_helper_rejects_non_read_only(monkeypatch):
+    monkeypatch.setattr(odbc_ops, "require_unlocked", lambda: None)
+    monkeypatch.setattr(odbc_ops, "_connect", lambda connection, timeout=30: (_ for _ in ()).throw(AssertionError("must not connect")))
+    result = odbc_ops.odbc_query_to_excel_and_preview("demo_db", "DELETE FROM FAKE_TABLE_A", "C:/fake/out.xlsx")
+    assert result["ok"] is False
+    assert "only SELECT" in result["error"]
+
+
+def test_odbc_helper_error_path_never_raises(monkeypatch):
+    monkeypatch.setattr(odbc_ops, "require_unlocked", lambda: None)
+
+    def _boom(connection, timeout=30):
+        raise RuntimeError("no driver")
+
+    monkeypatch.setattr(odbc_ops, "_connect", _boom)
+    result = odbc_ops.odbc_query_to_excel_and_preview("demo_db", "SELECT 1 FROM FAKE_TABLE_A", "C:/fake/out.xlsx")
+    assert result["ok"] is False
+    assert "RuntimeError" in result["error"]
+    assert result["error"].startswith("[odbc_query_to_excel_and_preview error")
+
+
+def test_odbc_helper_requires_unlock(monkeypatch):
+    monkeypatch.setattr(odbc_ops, "require_unlocked", lambda: "[locked: no HTTP request context]")
+    result = odbc_ops.odbc_query_to_excel_and_preview("demo_db", "SELECT 1 FROM FAKE_TABLE_A", "C:/fake/out.xlsx")
+    assert result["ok"] is False
+    assert "locked" in result["error"]
 
 
 # ===========================================================================
