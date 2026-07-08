@@ -62,6 +62,8 @@ from tools.procedural_memory import (
 )
 from tools.data_discovery import find_db_objects
 from tools.data_memory_hook import data_memory_status
+from tools.data_aliases import data_aliases_add, data_aliases_list
+from tools.data_report import data_report_plan, data_report_run, data_report_explain
 from tools.notify_ops import notify_desktop
 from tools.outlook_ops import (
     outlook_calendar,
@@ -244,6 +246,13 @@ TOOLS = (
     # reasoning as find_db_objects above -- reachable only via
     # call_tool("data_memory_status", {})).
     data_memory_status,
+    # DB aliases: synonym/abbreviation store widening find_db_objects queries
+    # (gateway-only; add is unlock-gated, list is read-only).
+    data_aliases_add, data_aliases_list,
+    # NL report pipeline: plan (memory-first, pre-fills SQL) -> run (deterministic
+    # execute + provenance + report_manifest.json) -> explain (always-present
+    # provenance block). Gateway-only, reachable only via call_tool.
+    data_report_plan, data_report_run, data_report_explain,
     # notifications
     notify_desktop,
     # scheduling (Windows Task Scheduler)
