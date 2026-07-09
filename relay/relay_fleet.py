@@ -933,6 +933,11 @@ class RelayWorker:
         self._tx = _Transcript(transcript_dir, self._tx_key, name, self.goal)
         self.transcript = self._tx.path or ""
 
+    def _reset_agent_error_window(self):
+        """Forget stale agent-disabled evidence after a different recoverable state wins."""
+        self._copilot_err_streak = 0
+        self._agent_err_ts = 0.0
+
     def attach(self, context, agent_url):
         """Open this worker's tab and make it ready to send. On failure -> error.
         A resume_conv worker opens its EXISTING conversation URL (carrying prior context)
@@ -1634,6 +1639,10 @@ class RelayWorker:
         # at all), and only once re-nav budget is exhausted do we fall to the existing (fragile)
         # connection-manager/popup tiers -- and, past those, to the last-resort surface() below.
         if any(m in resp for m in CONSENT_MARKERS) or any(m in _low for m in CONSENT_MARKERS):
+            # Consent is a separate, recoverable state. Do not let an older SystemError/admin-block
+            # window survive into the manual-approval path and immediately raise a misleading
+            # "agent stopped/disabled" toast after the Edge is surfaced for consent.
+            self._reset_agent_error_window()
             self._consent_streak += 1
             if not self._consent_auto_tried:
                 self._consent_auto_tried = True
@@ -1969,8 +1978,7 @@ class RelayWorker:
             self.job = self._task_anchor(RETRY_JOB)
             self._cooldown_until = now + transient_backoff(self._copilot_err_streak)  # back off, don't hammer
             return
-        self._copilot_err_streak = 0
-        self._agent_err_ts = 0.0
+        self._reset_agent_error_window()
         norm = " ".join(resp.lower().split())[:300]
         self.no_progress = self.no_progress + 1 if norm and norm == self.last_norm else 0
         self.last_norm = norm
