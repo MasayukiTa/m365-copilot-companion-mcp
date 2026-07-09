@@ -237,13 +237,14 @@ UNLOCK_PREFIX = (
 def _unlock_password():
     """The unlock password, read LOCALLY (process env or .env) -- never stored in the agent
     config. Returns '' if unset."""
-    pw = (os.environ.get("MCP_UNLOCK_PASSWORD") or "").strip()
+    from tools.secret_store import unlock_password_from_env
+    pw = unlock_password_from_env()
     if not pw:
         try:
             from dotenv import load_dotenv
             repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             load_dotenv(os.path.join(repo, ".env"))
-            pw = (os.environ.get("MCP_UNLOCK_PASSWORD") or "").strip()
+            pw = unlock_password_from_env()
         except Exception:
             pass
     return pw

@@ -38,6 +38,10 @@ from pathlib import Path
 # Repo root = parent of this scripts/ dir. Everything is resolved against it so
 # the bootstrap behaves identically regardless of the caller's working dir.
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from tools.secret_store import UNLOCK_PASSWORD_PROTECTED_VAR, protect_secret
+
 STATE_DIR = ROOT / ".setup"
 STATE_FILE = STATE_DIR / "state.json"
 VENV_PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"  # Windows layout
@@ -276,6 +280,7 @@ def step_gen_env() -> None:
 
     api_key = secrets.token_hex(20)       # 40 hex chars
     unlock_code = secrets.token_hex(8)    # 16 hex chars
+    protected_unlock_code = protect_secret(unlock_code)
 
     if example.exists():
         lines = example.read_text(encoding="utf-8-sig").splitlines()
@@ -293,7 +298,7 @@ def step_gen_env() -> None:
         if stripped.startswith("MCP_API_KEY="):
             out_lines.append("MCP_API_KEY=" + api_key)
         elif stripped.startswith("MCP_UNLOCK_PASSWORD="):
-            out_lines.append("MCP_UNLOCK_PASSWORD=" + unlock_code)
+            out_lines.append(UNLOCK_PASSWORD_PROTECTED_VAR + "=" + protected_unlock_code)
         else:
             # Keep MCP_ALLOWED_BASE=~ and leave the agent-URL vars commented as-is.
             out_lines.append(line)
@@ -664,18 +669,22 @@ def step_verify() -> None:
     step_header("Verifying environment")
 
     # 1. Required .env keys must be present and non-placeholder.
-    required = ["MCP_API_KEY", "MCP_UNLOCK_PASSWORD"]
+    required = ["MCP_API_KEY"]
     missing = []
     for k in required:
         v = _read_env_value(k)
         if not v or v.startswith("replace"):
             missing.append(k)
+    unlock_plain = _read_env_value("MCP_UNLOCK_PASSWORD")
+    unlock_protected = _read_env_value(UNLOCK_PASSWORD_PROTECTED_VAR)
+    if not unlock_plain and not unlock_protected:
+        missing.append("MCP_UNLOCK_PASSWORD or " + UNLOCK_PASSWORD_PROTECTED_VAR)
     if missing:
         raise StepError(
             ".env is missing or has placeholder values for: " + ", ".join(missing)
             + ". Re-run quickstart.bat (or setup.bat) (the gen_env step fills these)."
         )
-    log("    OK: .env has required keys (" + ", ".join(required) + ")")
+    log("    OK: .env has required keys (MCP_API_KEY and unlock password)")
 
     # 2. Import main.py and report the tool count. main.py reads MCP_API_KEY from
     #    the environment at import, so load .env into os.environ first.
