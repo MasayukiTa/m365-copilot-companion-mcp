@@ -1,0 +1,14 @@
+name: M365 Companion CodeQL config
+
+queries:
+  - uses: security-extended
+
+paths-ignore:
+  - bench/**
+  - .benchmarks/**
+  - Desktop/**
+  - PR13974_*/**
+  - "**/test_*.py"
+  - "**/*_test.py"
+  - "**/tests/**"
+  - "**/__pycache__/**"
