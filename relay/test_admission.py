@@ -630,6 +630,7 @@ def test_consent_detector():
     # URL. If that surface() call succeeds (True), the worker does NOT hard-STUCK -- it retries
     # the goal so the re-invoke succeeds once the user approves. If surface() fails (False), the
     # worker STUCKs with an HONEST manual-recovery reason (never a false "surfaced!" claim).
+    import time as _t
     import relay.edge_recover as er
     card = ("desktopfile操作\nまずは接続して、必要な情報を探します。この資格情報を 接続マネージャーを開く で"
             "検証してください。接続の準備が整ったら、この要求をやり直してください。再試行 キャンセル")
@@ -701,6 +702,41 @@ def test_consent_detector():
     w3 = RelayWorker("g", "w2")
     w3._decide('{"platform":"win32","python_version":"3.11"} 完了。CONTINUE')
     check("consent_no_false_positive", w3.status != "stuck" and w3._consent_streak == 0)
+    # A consent card is a recoverable auth state, not evidence that the agent is disabled.
+    # If an older admin/SystemError window is left over, consent surfacing must clear it so
+    # the next post-consent retry does not immediately raise a false disabled-agent toast.
+    notify_calls_stale = []
+    orig_notify_stale = rf.default_notify
+    orig_infra_stale = rf._infra_healthy
+    rf.default_notify = lambda *a, **k: notify_calls_stale.append((a, k))
+    rf._infra_healthy = lambda *a, **k: True
+    er.surface = lambda *a, **k: True
+    try:
+        w_stale = RelayWorker("g", "w_stale")
+        w_stale._agent_url = "https://copilot.example/chat/agent/T_abc?titleId=xyz"
+        w_stale._agent_err_ts = _t.time() - rf.AGENT_ERR_WINDOW_S - 1
+        w_stale._copilot_err_streak = 5
+        w_stale._consent_tier0_allow = lambda: False
+        w_stale._maybe_renav_before_signal = lambda: False
+        w_stale._auto_consent = lambda skip_tier0=False: False
+        en_consent = "Please open connection manager and verify your credential, then retry."
+        w_stale._decide(en_consent)
+        check("consent_resets_stale_agent_error_first",
+              w_stale._agent_err_ts == 0.0 and w_stale._copilot_err_streak == 0)
+        w_stale._decide(en_consent)
+        check("consent_surface_keeps_agent_error_reset",
+              w_stale._agent_err_ts == 0.0 and w_stale._copilot_err_streak == 0
+              and len(notify_calls_stale) == 1)
+        w_stale._on_redirect_page = lambda: False
+        admin_msg = "If the problem persists, contact your administrator."
+        w_stale._decide(admin_msg)
+        check("post_consent_admin_block_waits_full_window",
+              w_stale.status != "stuck" and w_stale._copilot_err_streak == 1
+              and len(notify_calls_stale) == 1)
+    finally:
+        rf.default_notify = orig_notify_stale
+        rf._infra_healthy = orig_infra_stale
+        er.surface = orig
     # AUTO-CONSENT SUCCESS: when the click-through completes, re-invoke (RETRY) -- no surface, no STUCK.
     # _decide now tries Tier 0 / re-nav-first before falling back to _auto_consent(skip_tier0=True)
     # (2026-07 re-nav-first fix), so the stub must accept that kwarg like the real method does.
