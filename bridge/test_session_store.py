@@ -23,7 +23,7 @@ def test_create_load_roundtrip():
     assert sess["status"] == "active"
     assert sess["turns"] == 0
     assert sess["pending"] == []
-    assert sess["transcript"] == "sessions/" + sess["sid"] + ".jsonl"
+    assert sess["transcript"] == "sessions/" + ss._sid_filename(sess["sid"], ".jsonl")
     assert sess["sid"].startswith("s")
 
     loaded = ss.load(sess["sid"])
@@ -74,7 +74,7 @@ def test_transcript_meta_and_turn_numbering(temp_sess_dir):
     ss.append_turn(sid, "user", "first message")
     ss.append_turn(sid, "assistant", "first reply")
 
-    path = os.path.join(temp_sess_dir, sid + ".jsonl")
+    path = ss._transcript_path(sid)
     with open(path, "r", encoding="utf-8") as fh:
         lines = [json.loads(line) for line in fh.read().splitlines() if line.strip()]
 
@@ -118,6 +118,20 @@ def test_fifo_queue_and_pop_including_empty():
 
     reloaded = ss.load(sid)
     assert reloaded["pending"] == []
+
+
+def test_invalid_sid_rejected_before_file_access(temp_sess_dir):
+    assert ss.load("../outside") is None
+    assert ss.pop_input("../outside") is None
+
+    with pytest.raises(ValueError):
+        ss.touch("../outside")
+    with pytest.raises(ValueError):
+        ss.queue_input("../outside", "nope")
+    with pytest.raises(ValueError):
+        ss.append_turn("../outside", "user", "nope")
+
+    assert not os.path.exists(os.path.join(temp_sess_dir, "..", "outside.json"))
 
 
 def test_latest_active_skips_empty_conv_url():
