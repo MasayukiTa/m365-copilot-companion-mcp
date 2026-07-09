@@ -26,6 +26,10 @@ dist/
 !.env.example
 .unlock_state.json
 .todo_state.json
+.release_info.json
+.release_manifest.json
+.update_backups/
+.update_conflicts/
 .memory_state.json
 .procedural_memory.json
 .procedural_memory_aliases.json
