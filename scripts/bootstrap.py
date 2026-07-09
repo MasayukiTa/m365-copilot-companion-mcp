@@ -609,9 +609,8 @@ def _read_env_value(key: str) -> str | None:
 def step_gen_connector() -> None:
     step_header("Generating Copilot Studio connector helper (generated/copilot-connector.md)")
     GENERATED_DIR.mkdir(parents=True, exist_ok=True)
-    api_key = _read_env_value("MCP_API_KEY") or "<your MCP_API_KEY from .env>"
     out = GENERATED_DIR / "copilot-connector.md"
-    out.write_text(_connector_markdown(api_key), encoding="utf-8")
+    out.write_text(_connector_markdown("<your MCP_API_KEY from .env>"), encoding="utf-8")
     log("    OK: wrote " + str(out))
 
 
