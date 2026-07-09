@@ -56,6 +56,7 @@ if exist ".env" (
     for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
         if /i "%%A"=="MCP_API_KEY" echo   Bearer token  (MCP_API_KEY)        : %%B
         if /i "%%A"=="MCP_UNLOCK_PASSWORD" echo   Unlock password ^(MCP_UNLOCK_PASSWORD^): %%B
+        if /i "%%A"=="MCP_UNLOCK_PASSWORD_PROTECTED" echo   Unlock password                  : ^<protected in .env; shown by setup when generated^>
     )
     echo.
     echo   The Bearer token authorizes read-only tools. The unlock password is
