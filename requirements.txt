@@ -3,7 +3,7 @@ fastmcp>=2.0,<3.0
 # tools/registry.py). They are also transitive deps of fastmcp/mcp today, but we declare
 # them explicitly so a future framework change that drops them cannot break a fresh install.
 httpx>=0.24
-anyio>=4.0
+anyio>=4.14.1
 pandas
 openpyxl
 python-pptx>=1.0,<2.0
