@@ -11,7 +11,7 @@ API 契約は不要。会社アカウントのまま。管理者権限も不要�
 ## これは何
 
 - M365 Copilot は中身が賢いのに、チャットに貼った文章を読むくらいしかしてくれません。
-- このツールは、あなたのノート PC で動く小さなサーバーを Copilot に繋ぎ、**ファイル操作・Python 実行・Excel・OCR・社内 DB といった「手」**を与えます。
+- このツールは、あなたのノート PC で動く小さなサーバーを Copilot に繋ぎ、**ファイル操作・Python 実行・Excel・OCR・社内 DB といった"手"**を与えます。
 - 追加課金ゼロ。いま持っている M365 Copilot ライセンスの中だけで完結します。
 
 ---
@@ -270,13 +270,22 @@ A. `quickstart.bat` も `start_all.bat` も冪等です。**いつ何度実行�
 
 #### 1. Get it
 
-With git:
+Recommended for a simple install: download the attached **`M365-Companion-*.zip`**
+from [Releases](https://github.com/MasayukiTa/m365-copilot-companion-mcp/releases/latest),
+extract it, then double-click `quickstart.bat`.
+
+Use git if you want `quickstart.bat` to pull later changes with `git pull --ff-only`:
 
 ```powershell
 git clone https://github.com/MasayukiTa/m365-copilot-companion-mcp.git
 ```
 
-Without git: click the green **Code** button on the GitHub page → **Download ZIP** → extract the downloaded zip.
+ZIP installs do not need git. They can be updated with `update.bat`, which downloads
+the latest release ZIP and refreshes the app files while preserving `.env`, `.venv`,
+memory files, generated tools under `tools/auto`, logs, and local runtime state.
+
+Avoid GitHub's automatic **Source code (zip)** asset unless you specifically want the
+raw source tree. Use the attached **`M365-Companion-*.zip`** asset for installation.
 
 #### 2. Double-click `quickstart.bat`
 
