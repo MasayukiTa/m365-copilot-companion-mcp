@@ -80,6 +80,11 @@ class CockpitWindow : Window
     string _effort = "auto";   // effort mode min|max|ultra|auto -> settings.txt effort= (NEW)
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
     bool _paused = false;      // local fleet pause/resume toggle state (NEW)
+    // FIX B: optimistic "stopping" state set the instant Stop is clicked (dims non-terminal cards +
+    // flips the Stop button's tooltip/icon) so the click never feels dead for the ~700ms sweep.
+    // Cleared once the sweep confirms the run is no longer live, or a different run has started.
+    bool _stopping = false;
+    string _stopStartedMarker = "";   // `started` marker captured at Stop-click time (detects a NEW run)
     bool _autoArchive = false;  // P2: when ON, move this run's completed cards to History as soon
                                 // as the RUN reaches its finished state -> settings.txt autoarchive=
     Button _autoArchiveBtn;     // gear-popup toggle for _autoArchive
@@ -421,6 +426,13 @@ class CockpitWindow : Window
         if (k == "force_start") return ja ? "今すぐ開始" : "Start now";
         if (k == "floor_restore") return ja ? "容量制限を戻す" : "Restore limit";
         if (k == "floor_off") return ja ? "容量制限を一時解除しています" : "Capacity limit paused";
+        // FIX B: Stop button's optimistic "stopping" state (distinct from the steady-state tooltip).
+        if (k == "stop_stopping") return ja ? "停止中…" : "Stopping…";
+        // FIX C: explicit verb -- distinct from the archive ("履歴へ"/"to_history") and per-card
+        // release ("解放"/"release") dismiss verbs, so the three no longer read as ambiguous synonyms.
+        if (k == "clear_history") return ja ? "履歴を空にする" : "Clear history";
+        // FIX D: same lightweight toast wording for both the autoscale-ON and autoscale-OFF apply paths.
+        if (k == "maxtabs_toast_prefix") return ja ? "最大タブ →" : "Max tabs ->";
         return k;
     }
     string StatusLabel(string s)
@@ -4218,6 +4230,14 @@ class CockpitWindow : Window
             var cmd = ReadCommands();
             cmd["stop"] = true;
             WriteCommands(cmd);
+            // FIX B: immediate optimistic feedback -- don't wait for the ~700ms sweep to show
+            // anything changed. Flip the button into its "stopping" state and dim every
+            // non-terminal card NOW; RefreshStoppingState (called each OnTick) clears this the
+            // moment the sweep confirms the run actually stopped (or a different run starts).
+            _stopping = true;
+            _stopStartedMarker = _lastRoot != null ? S(_lastRoot, "started") : "";
+            PaintStop();
+            ForceRender();
             // No live fleet to consume the stop (status went stale, e.g. a run was killed and its
             // last status froze with workers still shown as "running") -> clear every card NOW so the
             // button is never a no-op. Mirrors the per-card release stale path (search ArchiveAndHide).
@@ -4229,6 +4249,7 @@ class CockpitWindow : Window
         group.Children.Add(_stopBtn);
 
         PaintPause();
+        PaintStop();
         return group;
     }
     // Icon buttons (spec): pause shows two bars; while paused it shows a play triangle (resume).
@@ -4246,7 +4267,20 @@ class CockpitWindow : Window
             ? (_lang == 0 ? "再開（凍結を解除して続行）" : "Resume (unfreeze and continue)")
             : (_lang == 0 ? "新規ターン/タブを止めて凍結（再開で続行・状態は保持）" : "Freeze: no new turns/tabs (resume continues; state kept)");
         _pauseBtn.Background = BtnBg; _pauseBtn.Foreground = Fg; _pauseBtn.BorderBrush = Border;
-        if (_stopIcon != null) _stopIcon.Fill = Fg;
+        if (_stopIcon != null && !_stopping) _stopIcon.Fill = Fg;
+    }
+    // FIX B: paints the Stop button's optimistic "stopping" state (accent-colored icon + tooltip/
+    // automation-name swap), mirroring PaintPause's icon-swap pattern for Pause/Resume. Called from
+    // the same spots PaintPause is (theme/lang refresh + the click handler) so it never goes stale.
+    void PaintStop()
+    {
+        if (_stopBtn == null) return;
+        if (_stopIcon != null) _stopIcon.Fill = _stopping ? Theme.Br(Theme.Accent(_dark)) : Fg;
+        _stopBtn.ToolTip = _stopping
+            ? T("stop_stopping")
+            : (_lang == 0 ? "全ワーカーを停止して走行を終了" : "Cancel every worker and end the run");
+        System.Windows.Automation.AutomationProperties.SetName(_stopBtn,
+            _stopping ? T("stop_stopping") : (_lang == 0 ? "停止" : "Stop"));
     }
     // Per-tick: Pause is enabled only when a run is LIVE (something to pause). When no run is live we
     // also drop a stale "paused" state so the label can never sit on "Resume" over a dead/absent run.
@@ -4266,6 +4300,24 @@ class CockpitWindow : Window
             _stopBtn.IsEnabled = live;
             _stopBtn.Opacity = live ? 1.0 : 0.5;
             _stopBtn.Cursor = live ? Cursors.Hand : Cursors.Arrow;
+        }
+    }
+
+    // FIX B: resolve the optimistic "stopping" state set by the Stop click handler. Cleared (and a
+    // re-render forced via the Sig() dependency below) once the sweep confirms the run is no longer
+    // LIVE -- i.e. actually stopped -- OR a different run has since started (a new `started` marker),
+    // so the dimmed cards/button never stay stuck once the real signal arrives.
+    void RefreshStoppingState(Dictionary<string, object> root)
+    {
+        if (!_stopping) return;
+        bool live = Liveness(root) == 1;
+        string startedNow = root != null ? S(root, "started") : "";
+        bool newRun = !string.IsNullOrEmpty(_stopStartedMarker) && !string.IsNullOrEmpty(startedNow)
+                      && startedNow != _stopStartedMarker;
+        if (!live || newRun)
+        {
+            _stopping = false;
+            PaintStop();
         }
     }
 
@@ -4376,20 +4428,19 @@ class CockpitWindow : Window
         _maxtabs = Math.Max(1, Math.Min(100, v));
         SaveKey("maxtabs", _maxtabs.ToString());
         if (_maxValue != null) _maxValue.Text = _maxtabs.ToString();
-        // if a run is live, offer to apply now vs next run
+        // FIX D: the same stepper gesture must behave the same whether autoscale is ON or OFF.
+        // RequestSetMaxtabs writes into commands.json via the SAME live-apply mechanism
+        // RequestSetAutoscale (and the old "Apply now" banner button) already used -- there is no
+        // technical reason the non-autoscale path needs a separate negotiation banner, so both
+        // paths now apply immediately and show the identical lightweight auto-dismissing toast
+        // (ShowScaleToast -- the same self-fading overlay already used for UI-zoom feedback).
         bool running = RunIsLive();
-        if (running && _autoscale)
+        if (running)
         {
-            // under autoscale, the default reseats the live cap immediately (push now,
-            // no banner -- the ceiling still governs growth).
-            RequestSetAutoscale(true, Math.Min(_maxtabs, _autoMax), _autoMax);
+            if (_autoscale) RequestSetAutoscale(true, Math.Min(_maxtabs, _autoMax), _autoMax);
+            else RequestSetMaxtabs(_maxtabs);
             if (_mtBanner != null) _mtBanner.Visibility = Visibility.Collapsed;
-        }
-        else if (running && _mtBanner != null)
-        {
-            _mtBannerLbl.Text = (_lang == 0 ? "最大タブを " : "Max tabs -> ") + _maxtabs
-                + (_lang == 0 ? " に変更しました。" : ".");
-            _mtBanner.Visibility = Visibility.Visible;
+            ShowScaleToast(T("maxtabs_toast_prefix") + " " + _maxtabs);
         }
         else if (_mtBanner != null) _mtBanner.Visibility = Visibility.Collapsed;
     }
@@ -4900,6 +4951,7 @@ class CockpitWindow : Window
         PaintEffort();
         PaintApproval();
         PaintPause();
+        PaintStop();
         if (_stopBtn != null) { _stopBtn.Background = BtnBg; _stopBtn.Foreground = Fg; _stopBtn.BorderBrush = Border; }
         if (_inBar != null) _inBar.Background = Bg;
         // Floating composer: SurfaceSubtle bg (quieter than BtnBg); faint border for low-contrast frame.
@@ -4960,7 +5012,8 @@ class CockpitWindow : Window
         PaintEffort();
         PaintApproval();
         PaintPause();
-        // _stopBtn / _pauseBtn now render drawn icons (PaintPause), not text labels.
+        PaintStop();
+        // _stopBtn / _pauseBtn now render drawn icons (PaintPause/PaintStop), not text labels.
         if (_startBtn != null) _startBtn.Content = T("start");
         if (_folderBtn != null) _folderBtn.Content = T("folder");
         if (_goalInput != null) _goalInput.ToolTip = T("goalhint");
@@ -5041,6 +5094,7 @@ class CockpitWindow : Window
 
         Dictionary<string, object> root = ReadStatus();
         RefreshPauseEnabled(root);          // Pause is only meaningful for a live run; grey it out otherwise
+        RefreshStoppingState(root);         // FIX B: resolve the optimistic "stopping" state once the sweep confirms it
         UpdateGateBanner(root);             // Bucket C TASK 2: show pending approval gates (blocks worker until answered)
         UpdateCapBanner(root);              // TASK 1: surface the admission-gate wait reactively each tick
         bool idle = root == null || I(root, "total") == 0
@@ -5209,6 +5263,7 @@ class CockpitWindow : Window
     {
         var sb = new StringBuilder();
         sb.Append(_dark ? "D" : "L").Append(_lang).Append('|');
+        sb.Append(_stopping ? "st1" : "st0").Append('|');   // FIX B: force a re-render when Stop toggles the dim
         sb.Append("h").Append(_history.Count).Append('|');
         sb.Append(S(root, "done_count")).Append('/').Append(S(root, "total")).Append('|');
         object wo;
@@ -5714,6 +5769,9 @@ class CockpitWindow : Window
                   .Append(':').Append(StableShortHash(S(w, "conv_title")));
                 // TASK 3 (Bucket C): track next_step + self_confidence so the collapsed row re-renders.
                 sb.Append('|').Append(S(w, "next_step").Length).Append(':').Append(S(w, "self_confidence"));
+                // FIX B: _stopping dims non-terminal cards -- track it so a Stop click (or its
+                // resolution) re-templates this card instead of reusing the old realized element.
+                sb.Append('|').Append(_stopping ? "1" : "0");
                 return sb.ToString();
         }
     }
@@ -6366,7 +6424,7 @@ class CockpitWindow : Window
         var head = new DockPanel();
         head.Margin = new Thickness(8, 18, 8, 4);
         var clear = new Button();
-        clear.Content = (_lang == 0 ? "クリア (" : "Clear (") + _history.Count + ")";
+        clear.Content = T("clear_history") + " (" + _history.Count + ")";
         clear.Cursor = Cursors.Hand; clear.BorderThickness = new Thickness(1);
         clear.Background = BtnBg; clear.Foreground = Fg; clear.BorderBrush = Border;
         clear.Padding = new Thickness(10, 2, 10, 2); clear.FontSize = 12;
@@ -6559,7 +6617,7 @@ class CockpitWindow : Window
         {
             row.Cursor = Cursors.Hand;
             string url = conv, tx = htx, nm = hnm;
-            row.MouseLeftButtonUp += delegate { OpenHistory(nm, url, tx); };
+            row.MouseLeftButtonUp += delegate { FlashOpen(row); OpenHistory(nm, url, tx); };
         }
         return row;
     }
@@ -6675,7 +6733,7 @@ class CockpitWindow : Window
             openLink.Margin = new Thickness(0, 0, 8, 0);
             openLink.ToolTip = _lang == 0 ? "この会話をメインチャットで開く" : "Open this conversation in the chat";
             string onm = name; string ourl = conv;
-            openLink.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; OpenWorker(onm, ourl); };
+            openLink.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; FlashOpen(card); OpenWorker(onm, ourl); };
             right.Children.Add(openLink);
         }
         if (closed)
@@ -6768,7 +6826,7 @@ class CockpitWindow : Window
                 // Open-conversation shortcut so the user can inspect the parked lane.
                 var infraOpen = AttentionBtn(_lang == 0 ? "会話を開く" : "Open conversation");
                 string infraNm = name; string infraUrl = conv;
-                infraOpen.Click += delegate (object s2, RoutedEventArgs e2) { e2.Handled = true; OpenWorker(infraNm, infraUrl); };
+                infraOpen.Click += delegate (object s2, RoutedEventArgs e2) { e2.Handled = true; FlashOpen(card); OpenWorker(infraNm, infraUrl); };
                 infraRow.Children.Add(infraOpen);
                 col.Children.Add(infraRow);
             }
@@ -6847,7 +6905,7 @@ class CockpitWindow : Window
                     ? "この会話を開いて最後のやり取りを確認する"
                     : "Open this conversation to review the last exchange";
                 string evidNm = name; string evidUrl = conv;
-                evidBtn.Click += delegate (object s2, RoutedEventArgs e2) { e2.Handled = true; OpenWorker(evidNm, evidUrl); };
+                evidBtn.Click += delegate (object s2, RoutedEventArgs e2) { e2.Handled = true; FlashOpen(card); OpenWorker(evidNm, evidUrl); };
                 recov.Children.Add(evidBtn);
 
                 // [停止]/[Stop]: release/archive this lane via existing mechanisms.
@@ -7007,13 +7065,17 @@ class CockpitWindow : Window
         }
 
         card.Child = shell;
+        // FIX B: while a Stop is in flight (optimistic, not yet confirmed by the sweep), dim every
+        // non-terminal card so the click reads as "taking effect" immediately. terminal cards
+        // (already done/stuck/etc.) are left alone -- Stop doesn't touch them.
+        card.Opacity = (_stopping && !terminal) ? 0.45 : 1.0;
         // Always clickable: open this worker in the main chat BY NAME, so it works even when the
         // Copilot conv_url was never captured (the main chat renders the live status.json snapshot
         // for this worker). conv_url is passed too so /history can fill in the full transcript
         // when it is available.
         card.Cursor = Cursors.Hand;
         string wname = name; string url = conv;
-        card.MouseLeftButtonUp += delegate { OpenWorker(wname, url); };
+        card.MouseLeftButtonUp += delegate { FlashOpen(card); OpenWorker(wname, url); };
         card.ToolTip = _lang == 0 ? "クリックでこの会話をメインに表示" : "Click to open this conversation in the chat";
         return card;
     }
@@ -8245,6 +8307,38 @@ class CockpitWindow : Window
         steers.Add(item);
         cmd["steer"] = steers;
         WriteCommands(cmd);
+    }
+
+    // FIX A: immediate LOCAL feedback on an open-conversation click. The main chat only notices
+    // open.json on its own ~800ms poll, so without this the click reads as dead for up to 0.8s.
+    // Briefly flips the clicked card's border/background to the accent colour and back; a
+    // DispatcherTimer one-shot reverts it (mirrors the PaintPause optimistic-feedback pattern, and
+    // the ShowScaleToast fade-timer style already used elsewhere in this file). Does NOT touch the
+    // .fleet/open.json file-signal protocol -- purely a local visual cue.
+    // Safe if `card` is later disposed/rebuilt mid-flash: it's just a property set on a UIElement
+    // that may no longer be in the visual tree, which WPF tolerates, and the null check covers the
+    // case where no card reference exists at all (e.g. a future caller passes null).
+    void FlashOpen(Border card)
+    {
+        if (card == null) return;
+        try
+        {
+            Brush origBorder = card.BorderBrush;
+            Brush origBg = card.Background;
+            card.BorderBrush = Theme.Br(Theme.Accent(_dark));
+            card.Background = Theme.Br(Theme.AccentSoft(_dark));
+            var t = new DispatcherTimer();
+            t.Interval = TimeSpan.FromMilliseconds(350);
+            t.Tick += delegate
+            {
+                t.Stop();
+                if (card == null) return;
+                card.BorderBrush = origBorder;
+                card.Background = origBg;
+            };
+            t.Start();
+        }
+        catch (Exception) { }
     }
 
     // ① groundwork: ask the chat to open this conversation (it polls open.json).
