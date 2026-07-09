@@ -25,10 +25,12 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import posixpath
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = int(os.environ.get("BRAIN_PROXY_PORT", "8012"))
@@ -43,6 +45,9 @@ _DROP_HEADERS = {
     "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade",
     "content-length",
 }
+
+_CHAT_COMPLETIONS_TARGET = "/v1/chat/completions"
+_MODELS_TARGET = "/v1/models"
 
 
 def _load_api_key() -> str:
@@ -88,6 +93,43 @@ class BrainProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _validated_target(self) -> str | None:
+        """Return a safe origin-form request target or None.
+
+        This proxy injects MCP_API_KEY, so it must not be a general-purpose
+        authenticated forward proxy. Only the local OpenAI-compatible endpoint
+        surface is allowed.
+        """
+        raw = self.path or ""
+        if "\r" in raw or "\n" in raw:
+            return None
+        parsed = urlsplit(raw)
+        if parsed.scheme or parsed.netloc:
+            return None
+        normalized = posixpath.normpath(parsed.path or "/")
+        if not normalized.startswith("/"):
+            normalized = "/" + normalized
+        if normalized != parsed.path:
+            return None
+        if parsed.query:
+            return None
+        if self.command == "POST" and normalized == _CHAT_COMPLETIONS_TARGET:
+            return _CHAT_COMPLETIONS_TARGET
+        if self.command == "GET" and normalized == _MODELS_TARGET:
+            return _MODELS_TARGET
+        return None
+
+    @staticmethod
+    def _safe_content_type(value: str | None) -> str:
+        ctype = (value or "application/json").split(";", 1)[0].strip().lower()
+        if "\r" in (value or "") or "\n" in (value or ""):
+            return "application/octet-stream"
+        if ctype == "application/json":
+            return "application/json"
+        if ctype == "text/event-stream":
+            return "text/event-stream"
+        return "application/octet-stream"
+
     def _proxy(self) -> None:
         started = time.monotonic()
         if not API_KEY:
@@ -100,6 +142,12 @@ class BrainProxyHandler(BaseHTTPRequestHandler):
                 "message": "chunked request bodies are not supported; send Content-Length",
                 "type": "invalid_request_error"}})
             return
+        target = self._validated_target()
+        if target is None:
+            self._send_json(404, {"error": {
+                "message": "unsupported brain proxy endpoint",
+                "type": "not_found"}})
+            return
 
         body = self._read_body()
         fwd_headers = {k: v for k, v in self.headers.items()
@@ -111,11 +159,11 @@ class BrainProxyHandler(BaseHTTPRequestHandler):
         conn = http.client.HTTPConnection(
             UPSTREAM_HOST, UPSTREAM_PORT, timeout=UPSTREAM_TIMEOUT_S)
         try:
-            conn.request(self.command, self.path, body=body, headers=fwd_headers)
+            conn.request(self.command, target, body=body, headers=fwd_headers)
             resp = conn.getresponse()
             resp_body = resp.read()
             self.send_response(resp.status)
-            ctype = resp.getheader("Content-Type") or "application/json"
+            ctype = self._safe_content_type(resp.getheader("Content-Type"))
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(resp_body)))
             self.end_headers()
@@ -133,7 +181,7 @@ class BrainProxyHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
         print("[brain-proxy] %s %s -> %d (%.1fs)"
-              % (self.command, self.path, status, time.monotonic() - started),
+              % (self.command, target or "<blocked>", status, time.monotonic() - started),
               flush=True)
 
     # -- verb dispatch ----------------------------------------------------- #
