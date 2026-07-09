@@ -138,6 +138,7 @@ class CockpitWindow : Window
         "copilot-bridge", "settings.txt");
 
     TextBlock _header, _sub;
+    WrapPanel _subChips;   // Feature 2: discrete Pill() chips replacing _sub's single concatenated sentence
     TextBlock _workerChip;       // live "N workers" neutral chip in the header controls row
     Border _workerChipBorder;   // the Border wrapping _workerChip (for PaintChrome re-theming)
     Button _themeBtn, _langBtn, _mainBtn, _siBtn;
@@ -717,10 +718,19 @@ class CockpitWindow : Window
 
         // subtitle -- its OWN row spanning BOTH columns, so the long elapsed+ETA line uses the full
         // width and is never clipped by the controls column. Wrap (not ellipsis) so it's never hidden.
+        // Feature 2: _sub itself is no longer shown -- UpdateHeader still builds its sentence (kept
+        // as a plain-text fallback / ToolTip source) but the VISIBLE row 1 content is now _subChips,
+        // a WrapPanel of discrete Pill() chips occupying the identical grid cell.
         _sub = new TextBlock(); _sub.FontSize = 13; _sub.Margin = new Thickness(0, 4, 18, 0);
         _sub.TextWrapping = TextWrapping.Wrap;
         Grid.SetColumn(_sub, 0); Grid.SetColumnSpan(_sub, 2); Grid.SetRow(_sub, 1);
+        _sub.Visibility = Visibility.Collapsed;
         headRow.Children.Add(_sub);
+
+        _subChips = new WrapPanel();
+        _subChips.Margin = new Thickness(0, 4, 18, 0);
+        Grid.SetColumn(_subChips, 0); Grid.SetColumnSpan(_subChips, 2); Grid.SetRow(_subChips, 1);
+        headRow.Children.Add(_subChips);
 
         _headBar.Child = headRow;
         root.Children.Add(_headBar);
@@ -5123,6 +5133,7 @@ class CockpitWindow : Window
         {
             _header.Text = "Fleet";
             _sub.Text = "";                // the empty-state block in the body carries the message now
+            if (_subChips != null) _subChips.Children.Clear();   // Feature 2: no chips while idle either
             UpdateWorkerChip(0, false);    // show maxtabs while idle
             // A2-2: collapse spine and idle composer when no run
             RefreshSpine(root, true);
@@ -5424,7 +5435,45 @@ class CockpitWindow : Window
         }
 
         _sub.Text = triple + freshness + "    " + T("elapsed") + " " + Fmt(elapsed) + eta;
-        _sub.ToolTip = _sub.Text;
+        _sub.ToolTip = _sub.Text;   // _sub itself is Collapsed (see BuildChrome) -- kept alive purely
+                                    // as the plain-text fallback for any future consumer of its Text/
+                                    // ToolTip; nothing else in this file reads them today (audited).
+
+        // Feature 2: the single concatenated sentence above is what actually got read as a
+        // fallback; what's actually DISPLAYED is a WrapPanel of discrete Pill() chips (same helper
+        // HistoryRow etc. already use), one per fact, rebuilt from the SAME source variables (not
+        // parsed back out of the sentence) so wording/pluralization can't drift between the two.
+        if (_subChips != null)
+        {
+            _subChips.Children.Clear();
+            if (!running && allTerminal)
+            {
+                _subChips.Children.Add(ChipMargin(Pill(cntDoneW + " " + (ja2 ? "完了" : "done"), "success")));
+                _subChips.Children.Add(ChipMargin(Pill(cntAttn + " " + (ja2 ? "要対応" : "needs attention"),
+                    cntAttn > 0 ? "warning" : "neutral")));
+                _subChips.Children.Add(ChipMargin(Pill(ja2 ? "終了" : "run ended", "neutral")));
+            }
+            else
+            {
+                _subChips.Children.Add(ChipMargin(Pill(cntRunning + " " + (ja2 ? "実行中" : "running"), "info")));
+                _subChips.Children.Add(ChipMargin(Pill(cntQueued + " " + (ja2 ? "待機" : "queued"), "neutral")));
+                _subChips.Children.Add(ChipMargin(Pill(cntDoneW + " " + (ja2 ? "完了" : "done"), "success")));
+            }
+            if (running && updated > 0)
+            {
+                double staleAge2 = NowUnix() - updated;
+                if (staleAge2 > STALE_HARD)
+                    _subChips.Children.Add(ChipMargin(Pill(T("stale"), "danger")));
+                else if (staleAge2 > STALE_SOFT)
+                    _subChips.Children.Add(ChipMargin(Pill(T("stale_wait"), "warning")));
+            }
+            if (!string.IsNullOrEmpty(freshness))
+                _subChips.Children.Add(ChipMargin(Pill(freshness.TrimStart(' ', '·'), "neutral")));
+            _subChips.Children.Add(ChipMargin(Pill(T("elapsed") + " " + Fmt(elapsed), "neutral")));
+            if (!string.IsNullOrEmpty(eta))
+                _subChips.Children.Add(ChipMargin(Pill(eta.Trim(), "neutral")));
+            _subChips.ToolTip = _sub.Text;   // same fallback sentence, shown on hover over the chip row
+        }
     }
 
     // Roll seconds up through y/d/h/m/s so a long run reads "1h39m27s" / "1d1h1m1s" instead of
@@ -8235,6 +8284,15 @@ class CockpitWindow : Window
         t.FontSize = 11.5; t.FontWeight = FontWeights.SemiBold;
         b.Child = t;
         return b;
+    }
+
+    // Feature 2: Pill() itself carries no external spacing (callers position it inside a DockPanel/
+    // StackPanel that already spaces siblings). A WrapPanel does not, so give each header chip a
+    // small right/bottom margin -- small helper instead of repeating the Thickness at every call site.
+    Border ChipMargin(Border pill)
+    {
+        pill.Margin = new Thickness(0, 0, 6, 4);
+        return pill;
     }
 
     // Collapse newlines/tabs/runs of whitespace into single spaces -- for the one-line card result.
