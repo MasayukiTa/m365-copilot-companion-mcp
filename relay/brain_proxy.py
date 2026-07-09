@@ -46,14 +46,8 @@ _DROP_HEADERS = {
     "content-length",
 }
 
-_ALLOWED_TARGETS = {
-    ("POST", "/v1/chat/completions"),
-    ("GET", "/v1/models"),
-}
-_SAFE_RESPONSE_HEADERS = {
-    "application/json",
-    "text/event-stream",
-}
+_CHAT_COMPLETIONS_TARGET = "/v1/chat/completions"
+_MODELS_TARGET = "/v1/models"
 
 
 def _load_api_key() -> str:
@@ -117,19 +111,23 @@ class BrainProxyHandler(BaseHTTPRequestHandler):
             normalized = "/" + normalized
         if normalized != parsed.path:
             return None
-        if (self.command, normalized) not in _ALLOWED_TARGETS:
-            return None
         if parsed.query:
             return None
-        return normalized
+        if self.command == "POST" and normalized == _CHAT_COMPLETIONS_TARGET:
+            return _CHAT_COMPLETIONS_TARGET
+        if self.command == "GET" and normalized == _MODELS_TARGET:
+            return _MODELS_TARGET
+        return None
 
     @staticmethod
     def _safe_content_type(value: str | None) -> str:
         ctype = (value or "application/json").split(";", 1)[0].strip().lower()
         if "\r" in (value or "") or "\n" in (value or ""):
             return "application/octet-stream"
-        if ctype in _SAFE_RESPONSE_HEADERS:
-            return value or ctype
+        if ctype == "application/json":
+            return "application/json"
+        if ctype == "text/event-stream":
+            return "text/event-stream"
         return "application/octet-stream"
 
     def _proxy(self) -> None:
