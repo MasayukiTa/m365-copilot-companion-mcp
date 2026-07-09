@@ -16,6 +16,7 @@ fleet transcripts (.fleet/transcripts/*.jsonl):
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -43,14 +44,23 @@ def _valid_sid(sid):
     return isinstance(sid, str) and bool(SID_RE.fullmatch(sid))
 
 
-def _session_file(sid, suffix):
+def _sid_filename(sid, suffix):
     if not _valid_sid(sid):
         raise ValueError("invalid session id")
+    safe = hashlib.sha256(sid.encode("ascii")).hexdigest()
+    return safe + suffix
+
+
+def _session_file(sid, suffix):
     base = Path(_base_dir()).resolve()
-    path = (base / (sid + suffix)).resolve()
+    path = (base / _sid_filename(sid, suffix)).resolve()
     if path.parent != base:
         raise ValueError("session path escaped base directory")
     return str(path)
+
+
+def _transcript_ref(sid):
+    return "sessions/" + _sid_filename(sid, ".jsonl")
 
 
 def _sess_path(sid):
@@ -90,7 +100,7 @@ def new_session(title=""):
         "last_active_ts": now,
         "status": "active",
         "turns": 0,
-        "transcript": "sessions/" + sid + ".jsonl",
+        "transcript": _transcript_ref(sid),
         "pending": [],
     }
     _atomic_write_json(_sess_path(sid), sess)
@@ -147,7 +157,7 @@ def touch(sid, **fields):
             "last_active_ts": time.time(),
             "status": "active",
             "turns": 0,
-            "transcript": "sessions/" + sid + ".jsonl",
+            "transcript": _transcript_ref(sid),
             "pending": [],
         }
     sess.update(fields)

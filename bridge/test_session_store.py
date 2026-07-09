@@ -23,7 +23,7 @@ def test_create_load_roundtrip():
     assert sess["status"] == "active"
     assert sess["turns"] == 0
     assert sess["pending"] == []
-    assert sess["transcript"] == "sessions/" + sess["sid"] + ".jsonl"
+    assert sess["transcript"] == "sessions/" + ss._sid_filename(sess["sid"], ".jsonl")
     assert sess["sid"].startswith("s")
 
     loaded = ss.load(sess["sid"])
@@ -74,7 +74,7 @@ def test_transcript_meta_and_turn_numbering(temp_sess_dir):
     ss.append_turn(sid, "user", "first message")
     ss.append_turn(sid, "assistant", "first reply")
 
-    path = os.path.join(temp_sess_dir, sid + ".jsonl")
+    path = ss._transcript_path(sid)
     with open(path, "r", encoding="utf-8") as fh:
         lines = [json.loads(line) for line in fh.read().splitlines() if line.strip()]
 
