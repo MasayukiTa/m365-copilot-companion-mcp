@@ -189,6 +189,8 @@ class ChatWindow : Window
         if (k == "send_wrong_page")  return ja ? "送信先の会話に接続できませんでした — 送信は行われていません" : "Could not connect to the target conversation — nothing was sent.";
         if (k == "send_unknown_conv") return ja ? "この会話の送信先を特定できません。会話を開き直してください。" : "Can't identify where to send this — please reopen the conversation.";
         if (k == "send_offline") return ja ? "ブリッジに接続できません。送信していません。" : "Can't reach the bridge. Nothing was sent.";
+        if (k == "retry_start_stack") return ja ? "スタックを起動して再試行" : "Start the stack and retry";
+        if (k == "reload_transcript") return ja ? "🔄 再読み込み" : "🔄 Reload";
         // ── sidebar section / action labels ──────────────────────────────────────
         if (k == "sec_pinned")   return ja ? "ピン留め"   : "Pinned";
         if (k == "sec_today")    return ja ? "最近"        : "Recent";
@@ -1198,9 +1200,19 @@ class ChatWindow : Window
             else
             {
                 _activeFleetUrl = null;
-                AddAssistant(_lang == 0
+                StackPanel noTxOuter;
+                var noTxContent = AddAssistantContainer(out noTxOuter);
+                RenderAssistantBody(noTxContent, noTxOuter, _lang == 0
                     ? "（この会話の本文はまだ取得できません。進行中のため履歴が空の可能性があります。）"
                     : "(This conversation's transcript isn't available yet -- it may be empty while the run is in progress.)");
+                // OpenFromFleet is idempotent -- offer a reload instead of leaving this a dead end.
+                // url/worker/transcriptHint are this method's own parameters (already normalized
+                // above), so no extra fields are needed to replay the same call.
+                var reload = Btn(T("reload_transcript"), "PanelAlt", "Muted", true);
+                reload.HorizontalAlignment = HorizontalAlignment.Left;
+                reload.Margin = new Thickness(0, 8, 0, 0);
+                reload.Click += delegate { new Thread((ThreadStart)delegate { OpenFromFleet(url, worker, transcriptHint); }) { IsBackground = true }.Start(); };
+                noTxContent.Children.Add(reload);
             }
             RefreshConvList();
             RefreshSteerVisual();   // tint the input border if this is a live steerable worker
@@ -1822,25 +1834,33 @@ class ChatWindow : Window
         }) { IsBackground = true }.Start();
     }
 
-    // Show the sign-in / refusal banner with an actionable "Open Fleet Cockpit" link.
-    void ShowSigninBanner()
+    // Generic inline recovery banner: a message + a single action button. Reused by the
+    // sign-in/refusal banner (ShowSigninBanner) and the bridge-offline recovery banner
+    // (send path in DoSend) -- both are "something is wrong, here is the one-click fix" UI.
+    void ShowRecoveryBanner(string message, string buttonLabel, Action onClick)
     {
         if (_banner == null || _bannerBody == null) return;
         _bannerBody.Children.Clear();
         var head = new TextBlock
         {
-            Text = T("signin_banner"), FontWeight = FontWeights.SemiBold, FontSize = 13,
+            Text = message, FontWeight = FontWeights.SemiBold, FontSize = 13,
             TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 10)
         };
         SetRef(head, TextBlock.ForegroundProperty, "Fg");
         _bannerBody.Children.Add(head);
-        var open = Btn(T("signin_open"), "Accent", "AccentFg", false);
+        var open = Btn(buttonLabel, "Accent", "AccentFg", false);
         open.Height = 30; open.Padding = new Thickness(14, 0, 14, 0); open.FontWeight = FontWeights.SemiBold;
         open.HorizontalAlignment = HorizontalAlignment.Left;
-        open.Click += delegate { HideBanner(); OpenCockpit(); };
+        open.Click += delegate { onClick(); };
         _bannerBody.Children.Add(open);
         SetRef(_banner, Border.BorderBrushProperty, "Warning");
         _banner.Visibility = Visibility.Visible;
+    }
+
+    // Show the sign-in / refusal banner with an actionable "Open Fleet Cockpit" link.
+    void ShowSigninBanner()
+    {
+        ShowRecoveryBanner(T("signin_banner"), T("signin_open"), delegate { HideBanner(); OpenCockpit(); });
         _signinBannerShown = true;
     }
 
@@ -2022,6 +2042,10 @@ class ChatWindow : Window
             + "/table - 表作成\n"
             + "\nフリート入力欄にも /help を追加済み。フリート側は /code /fix /test /refactor /doc /review /research を展開します。";
     }
+
+    // Repo root: this exe runs from <repo>\ui, so one level up is <repo> -- same convention
+    // already used for .fleet\status.json / .fleet\commands.json below.
+    string RepoRoot() { return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..")); }
 
     [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
     // Launch (or focus) the parallel-execution cockpit -- so the user never has to close
@@ -2302,6 +2326,10 @@ class ChatWindow : Window
     // isFleet:  rows in the Fleet section (quieter nav, no accent).
     // archived: rows in Archived section render in "Faint" (de-emphasized).
     // isPinned: rows in Pinned section get a subtle leading pin glyph.
+    // Muted-but-visible resting opacity for the rename/delete row actions (Fix 3) -- discoverable
+    // at rest, full strength on hover. Was 0 (fully invisible until hover).
+    const double RowActionRestOpacity = 0.35;
+
     void AddConvRow(Conversation cc, bool isFleet, bool archived = false, bool isPinned = false)
     {
         if (_renamingId == cc.Id)
@@ -2399,7 +2427,7 @@ class ChatWindow : Window
             Content = T("rename_link"), FontSize = 11,
             Height = 38, Padding = new Thickness(6, 0, 4, 0),
             BorderThickness = new Thickness(0), Background = Brushes.Transparent,
-            Cursor = Cursors.Hand, ToolTip = T("rename"), Opacity = 0, IsHitTestVisible = false,
+            Cursor = Cursors.Hand, ToolTip = T("rename"), Opacity = RowActionRestOpacity, IsHitTestVisible = true,
             VerticalContentAlignment = VerticalAlignment.Center
         };
         SetRef(renameLink, ForegroundProperty, "Muted");
@@ -2412,10 +2440,19 @@ class ChatWindow : Window
         {
             Content = "\uE74D", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 13,
             Width = 32, Height = 38, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
-            Cursor = Cursors.Hand, ToolTip = T("delete"), Opacity = 0, IsHitTestVisible = false
+            Cursor = Cursors.Hand, ToolTip = T("delete"), Opacity = RowActionRestOpacity, IsHitTestVisible = true
         };
         SetRef(trash, ForegroundProperty, "Muted");
-        trash.Click += delegate { ShowDeleteBanner(cc); };
+        // Fast path: a plain click deletes the LOCAL record only (mode 1 -- per ShowDeleteBanner's
+        // own m1s label this is "the safest" choice; it never touches the Copilot-side conversation)
+        // with the existing inline toast, instead of forcing the 3-mode banner every time. Shift+click
+        // (the modifier this file already uses for the Enter-vs-newline distinction, ~line 401) still
+        // opens the full banner for the less-common modes 2/3.
+        trash.Click += delegate
+        {
+            if ((Keyboard.Modifiers & ModifierKeys.Shift) != 0) ShowDeleteBanner(cc);
+            else ExecuteDelete(cc, 1);
+        };
         bool actionable = cc.Messages.Count > 0 || !string.IsNullOrEmpty(cc.ConvUrl)
                           || !string.IsNullOrEmpty(cc.Title);
         trash.Visibility = actionable ? Visibility.Visible : Visibility.Collapsed;
@@ -2449,8 +2486,8 @@ class ChatWindow : Window
         };
         rowBorder.MouseLeave += delegate
         {
-            trashRef.Opacity = 0; trashRef.IsHitTestVisible = false;
-            renameRef.Opacity = 0; renameRef.IsHitTestVisible = false;
+            trashRef.Opacity = RowActionRestOpacity; trashRef.IsHitTestVisible = true;
+            renameRef.Opacity = RowActionRestOpacity; renameRef.IsHitTestVisible = true;
         };
         rowBorder.Child = rowGrid;
         _convList.Children.Add(rowBorder);
@@ -3582,6 +3619,15 @@ class ChatWindow : Window
                 AddAssistant(T("send_offline"));
                 _input.Text = text;   // put the trimmed text back so it isn't lost
                 _input.CaretIndex = _input.Text.Length;
+                // One-click recovery: bring the whole stack (bridge + relay) back up instead of
+                // leaving the user to go find a terminal. Idempotent -- safe even if some of the
+                // stack is already running.
+                ShowRecoveryBanner(T("send_offline"), T("retry_start_stack"), delegate
+                {
+                    HideBanner();
+                    try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Path.Combine(RepoRoot(), "start_all.bat")) { UseShellExecute = true }); }
+                    catch { }
+                });
                 return;
             }
             RefreshIdleDot();
