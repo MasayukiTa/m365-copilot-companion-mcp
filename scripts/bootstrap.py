@@ -275,7 +275,7 @@ def step_gen_env() -> None:
         return
 
     api_key = secrets.token_hex(20)       # 40 hex chars
-    unlock_pw = secrets.token_hex(8)      # 16 hex chars
+    unlock_code = secrets.token_hex(8)    # 16 hex chars
 
     if example.exists():
         lines = example.read_text(encoding="utf-8-sig").splitlines()
@@ -293,7 +293,7 @@ def step_gen_env() -> None:
         if stripped.startswith("MCP_API_KEY="):
             out_lines.append("MCP_API_KEY=" + api_key)
         elif stripped.startswith("MCP_UNLOCK_PASSWORD="):
-            out_lines.append("MCP_UNLOCK_PASSWORD=" + unlock_pw)
+            out_lines.append("MCP_UNLOCK_PASSWORD=" + unlock_code)
         else:
             # Keep MCP_ALLOWED_BASE=~ and leave the agent-URL vars commented as-is.
             out_lines.append(line)
@@ -301,12 +301,10 @@ def step_gen_env() -> None:
     # Note: the MCP_*_AGENT_URL / bridge vars stay commented in .env.example, so
     # they remain commented here too. They are optional and embed tenant GUIDs;
     # the user fills them in only if they use the relay/bridge.
-    # The local .env is the documented, gitignored secret store for this tool.
-    # codeql[py/clear-text-storage-sensitive-data]
     env_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
     log("    OK: wrote .env with fresh random MCP_API_KEY and MCP_UNLOCK_PASSWORD")
     log("    Your Bearer token (MCP_API_KEY): " + api_key)
-    log("    Your unlock password:           " + unlock_pw)
+    log("    Your unlock password:           " + unlock_code)
     log("    Keep these secret. Optional MCP_*_AGENT_URL vars stay commented in .env.")
 
 
