@@ -5,6 +5,8 @@ from pathlib import Path
 
 from fastmcp.server.dependencies import get_http_request
 
+from tools.secret_store import unlock_password_from_env
+
 STATE_FILE = Path(__file__).resolve().parent.parent / ".unlock_state.json"
 
 # IPs that are always trusted when they appear as the *real connection peer*
@@ -124,7 +126,7 @@ def require_unlocked() -> str | None:
 
 def unlock(password: str) -> str:
     """Unlock mutating and execution tools for the current remote client IP."""
-    expected = os.environ.get("MCP_UNLOCK_PASSWORD", "")
+    expected = unlock_password_from_env()
     if not expected:
         return "[unlock error: MCP_UNLOCK_PASSWORD is not configured]"
     if password != expected:

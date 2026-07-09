@@ -16,14 +16,17 @@ fleet transcripts (.fleet/transcripts/*.jsonl):
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
+import re
 import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SESS_DIR = os.path.join(str(REPO), ".fleet", "sessions")
+SID_RE = re.compile(r"^s\d{10}[0-9a-f]{4}$")
 
 
 def _base_dir():
@@ -37,12 +40,35 @@ def _ensure_dir():
     return d
 
 
+def _valid_sid(sid):
+    return isinstance(sid, str) and bool(SID_RE.fullmatch(sid))
+
+
+def _sid_filename(sid, suffix):
+    if not _valid_sid(sid):
+        raise ValueError("invalid session id")
+    safe = hashlib.sha256(sid.encode("ascii")).hexdigest()
+    return safe + suffix
+
+
+def _session_file(sid, suffix):
+    base = Path(_base_dir()).resolve()
+    path = (base / _sid_filename(sid, suffix)).resolve()
+    if path.parent != base:
+        raise ValueError("session path escaped base directory")
+    return str(path)
+
+
+def _transcript_ref(sid):
+    return "sessions/" + _sid_filename(sid, ".jsonl")
+
+
 def _sess_path(sid):
-    return os.path.join(_base_dir(), sid + ".json")
+    return _session_file(sid, ".json")
 
 
 def _transcript_path(sid):
-    return os.path.join(_base_dir(), sid + ".jsonl")
+    return _session_file(sid, ".jsonl")
 
 
 def _atomic_write_text(path, text):
@@ -74,7 +100,7 @@ def new_session(title=""):
         "last_active_ts": now,
         "status": "active",
         "turns": 0,
-        "transcript": "sessions/" + sid + ".jsonl",
+        "transcript": _transcript_ref(sid),
         "pending": [],
     }
     _atomic_write_json(_sess_path(sid), sess)
@@ -83,6 +109,8 @@ def new_session(title=""):
 
 def load(sid):
     """Load a session dict by sid, or None if missing/corrupt."""
+    if not _valid_sid(sid):
+        return None
     path = _sess_path(sid)
     if not os.path.isfile(path):
         return None
@@ -108,6 +136,8 @@ def list_sessions():
             continue
         if not isinstance(sess, dict) or "sid" not in sess:
             continue
+        if not _valid_sid(sess.get("sid")):
+            continue
         sessions.append(sess)
     sessions.sort(key=lambda s: s.get("last_active_ts", 0), reverse=True)
     return sessions
@@ -115,6 +145,8 @@ def list_sessions():
 
 def touch(sid, **fields):
     """Merge fields into the session, bump last_active_ts, atomic rewrite."""
+    if not _valid_sid(sid):
+        raise ValueError("invalid session id")
     sess = load(sid)
     if sess is None:
         sess = {
@@ -125,7 +157,7 @@ def touch(sid, **fields):
             "last_active_ts": time.time(),
             "status": "active",
             "turns": 0,
-            "transcript": "sessions/" + sid + ".jsonl",
+            "transcript": _transcript_ref(sid),
             "pending": [],
         }
     sess.update(fields)
@@ -137,6 +169,8 @@ def touch(sid, **fields):
 
 def append_turn(sid, role, text):
     """Append one turn line to <sid>.jsonl, emitting the meta header on first use."""
+    if not _valid_sid(sid):
+        raise ValueError("invalid session id")
     _ensure_dir()
     path = _transcript_path(sid)
     is_new = not os.path.isfile(path)
@@ -160,6 +194,8 @@ def append_turn(sid, role, text):
 
 def queue_input(sid, text):
     """Append text to the session's pending list (atomic read-modify-write)."""
+    if not _valid_sid(sid):
+        raise ValueError("invalid session id")
     sess = load(sid)
     if sess is None:
         sess = touch(sid)
@@ -170,6 +206,8 @@ def queue_input(sid, text):
 
 def pop_input(sid):
     """Pop the first pending entry (FIFO). Returns None if empty."""
+    if not _valid_sid(sid):
+        return None
     sess = load(sid)
     if sess is None:
         return None

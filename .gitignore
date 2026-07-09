@@ -102,6 +102,7 @@ desktop.ini
 .cache/
 
 ui/*.exe
+.codeql-build/
 
 # parallel fleet live status (runtime)
 .fleet/
