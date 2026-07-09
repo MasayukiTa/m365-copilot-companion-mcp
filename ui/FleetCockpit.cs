@@ -2262,6 +2262,9 @@ class CockpitWindow : Window
         // Floating Codex/Claude-Code style: soft shadow carries the separation, no hard frame.
         _composerBox.Effect = new System.Windows.Media.Effects.DropShadowEffect
         { BlurRadius = 14, ShadowDepth = 2, Opacity = 0.16, Color = System.Windows.Media.Color.FromRgb(0, 0, 0) };
+        // Match the main chat composer: clicking the composer surface (including lower padding /
+        // footer hint area) should focus the textarea. Do not mark handled so buttons still click.
+        _composerBox.MouseLeftButtonDown += delegate { if (_goalInput != null) _goalInput.Focus(); };
 
         var col = new StackPanel();
 
