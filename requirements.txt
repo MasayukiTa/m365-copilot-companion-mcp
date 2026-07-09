@@ -21,7 +21,7 @@ pytest>=7.0
 # Browser automation for the bridge + SWE fleet. Used via connect_over_cdp (attaches to the
 # already-running Edge), so NO `playwright install` browser download is needed -- the pip package
 # alone is enough. (Was missing here, which broke a fresh install of the bridge/fleet.)
-playwright>=1.40
+playwright>=1.61.0
 pillow>=10.0
 # Office / COM + OCR helper tools (Windows). Optional: only the outlook_*/pptx_export/ocr_pdf tools
 # need these; pdf2image also needs the Poppler binary on PATH.
