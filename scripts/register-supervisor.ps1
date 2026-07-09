@@ -9,10 +9,10 @@
 # afterwards as an opportunistic bonus, but its failure never fails this script.
 
 $repo = Split-Path $PSScriptRoot -Parent
-$vbs  = Join-Path $repo 'scripts\start_all_hidden.vbs'
+$vbs  = Join-Path $repo 'scripts\start_background_hidden.vbs'
 
 if (-not (Test-Path $vbs)) {
-    Write-Host "ERROR: start_all_hidden.vbs not found at $vbs"
+    Write-Host "ERROR: start_background_hidden.vbs not found at $vbs"
     exit 1
 }
 
@@ -26,7 +26,7 @@ try {
     $sc.Arguments  = '"{0}"' -f $vbs
     $sc.WorkingDirectory = $repo
     $sc.WindowStyle = 7
-    $sc.Description = 'M365 Companion auto-start (server, tunnel, bridge, UI)'
+    $sc.Description = 'M365 Companion auto-start (server, tunnel, bridge; no UI)'
     $sc.Save()
 }
 catch {
@@ -41,7 +41,8 @@ if (-not (Test-Path $lnk)) {
 
 Write-Host "Installed autostart shortcut: $lnk"
 Write-Host "It launches at every logon (per-user, no admin)."
-Write-Host "Start the stack now:  wscript.exe `"$vbs`""
+Write-Host "Start the background stack now:  wscript.exe `"$vbs`""
+Write-Host "Start the full UI stack now:     wscript.exe `"$repo\scripts\start_all_hidden.vbs`""
 Write-Host "Remove:  scripts\unregister-supervisor.ps1"
 
 # Opportunistic secondary: Task Scheduler, only where corporate policy allows it.
