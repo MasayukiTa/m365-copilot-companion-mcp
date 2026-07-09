@@ -1,16 +1,12 @@
-# CI for m365-copilot-companion-mcp — runs the hermetic Python unit tests.
+# CI for m365-copilot-companion-mcp - runs the hermetic Python unit tests.
 #
 # "Hermetic" here means: no Edge/Playwright browser, no M365/Copilot login,
 # no :8000/:8011 server, no GPU, no pywin32 (Linux-only exclusion), no network
-# calls inside the test logic. All 228 tests in this set pass on the standard
+# calls inside the test logic. The explicit suite below passes on the standard
 # ubuntu-latest runner with only pip deps.
 #
 # EXCLUDED (and why):
-#   relay/selfimprove/test_dashboard.py  — 2 tests assert an exact key set in
-#       the dashboard JSON output that has drifted from the live module; exclude
-#       until the module and test are re-synced. The other 5 tests in that file
-#       pass, but the whole file is dropped to keep CI green.
-#   tools/test_trace.py  — contains no test_* functions (only a main()); pytest
+#   tools/test_trace.py - contains no test_* functions (only a main()); pytest
 #       collects 0 items from it, which is harmless, but it is omitted for clarity.
 #
 # NOTE ON LINUX PORTABILITY:
@@ -56,11 +52,18 @@ jobs:
         run: |
           pytest -q \
             tests/test_security_xff.py \
+            tests/test_scroll_transcript.py \
             tests/test_golden.py \
             tools/test_python_gate.py \
             tools/test_layer1_security.py \
+            tools/test_file_ops.py \
+            tools/test_data_report.py \
+            tools/test_data_memory_hook.py \
+            tools/test_data_discovery.py \
+            tools/test_data_aliases.py \
             tools/test_procedural_memory.py \
             tools/test_auth_stats.py \
+            scripts/test_bootstrap.py \
             relay/test_acceptance.py \
             relay/test_admission.py \
             relay/test_autoscale.py \
@@ -70,7 +73,9 @@ jobs:
             relay/test_confidence.py \
             relay/test_edge_auth.py \
             relay/test_feedback.py \
+            relay/test_fleet_runner_fixes.py \
             relay/test_fleet_refute.py \
+            relay/test_fleet_resume.py \
             relay/test_fleet_verify.py \
             relay/test_folder_verify.py \
             relay/test_forge.py \
@@ -86,10 +91,12 @@ jobs:
             relay/test_solve_policy.py \
             relay/test_task_router.py \
             relay/test_transient.py \
+            relay/test_unlock_inject.py \
             relay/test_watchdog.py \
             relay/selfimprove/test_apply.py \
             relay/selfimprove/test_archive.py \
             relay/selfimprove/test_calibration.py \
+            relay/selfimprove/test_dashboard.py \
             relay/selfimprove/test_diversify.py \
             relay/selfimprove/test_frozen.py \
             relay/selfimprove/test_guards.py \
@@ -97,6 +104,9 @@ jobs:
             relay/selfimprove/test_l2_cron.py \
             relay/selfimprove/test_policy.py \
             relay/selfimprove/test_propose.py \
+            relay/selfimprove/test_quality.py \
+            relay/selfimprove/test_quality_loop.py \
             relay/selfimprove/test_sentinel.py \
             relay/selfimprove/test_status.py \
-            relay/selfimprove/test_targeting.py
+            relay/selfimprove/test_targeting.py \
+            relay/selfimprove/test_usage.py
