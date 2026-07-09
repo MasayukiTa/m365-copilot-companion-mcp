@@ -5,7 +5,13 @@
 #   2. the companion Edge :9222 (for the fleet / agent) -- skipped if its CDP port already answers.
 #   3. start_bridge.ps1 -Keepalive (bridge :9223 + chat UI backend) -- skipped if already running.
 #   4. the two WPF apps (CopilotChat, FleetCockpit)     -- launched only if not already running.
+#      Use -NoUi for logon/background startup where the services should come up quietly.
 # Nothing is ever stopped/killed; this only fills in what is missing. Safe to run any number of times.
+param(
+    [switch]$NoUi,
+    [switch]$NoSplash
+)
+
 $ErrorActionPreference = "Continue"
 # This script lives in <repo>\scripts. $root is the REPO ROOT (.env, .git, ui\ live there);
 # $scriptDir is the scripts dir where the sibling launchers (supervisor.ps1,
@@ -332,17 +338,95 @@ function Ensure-ConvenienceProvisioning {
     }
 }
 
+function Start-BackgroundSecurityUiCloser {
+    # Some corporate Windows images surface a blank "Windows Security" UWP frame during
+    # unattended M365/Edge startup. Closing this UI frame does not stop Defender/SecurityHealth
+    # services, the tray process, Edge, bridge, tunnel, or the MCP server.
+    if (-not $NoUi) { return }
+    $script = @'
+$ErrorActionPreference = "SilentlyContinue"
+$code = @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public class BgSecurityUiCloser {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lp);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+  [DllImport("user32.dll")] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
+  public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+}
+"@
+try { Add-Type $code } catch {}
+
+function Close-WindowsSecurityFrame {
+    [BgSecurityUiCloser]::EnumWindows({
+        param($h, $l)
+        if (-not [BgSecurityUiCloser]::IsWindowVisible($h)) { return $true }
+        $title = New-Object System.Text.StringBuilder 256
+        $cls = New-Object System.Text.StringBuilder 128
+        [void][BgSecurityUiCloser]::GetWindowText($h, $title, $title.Capacity)
+        [void][BgSecurityUiCloser]::GetClassName($h, $cls, $cls.Capacity)
+        if ($title.ToString() -ne "Windows セキュリティ" -and $title.ToString() -ne "Windows Security") { return $true }
+        if ($cls.ToString() -ne "ApplicationFrameWindow") { return $true }
+        $rect = New-Object BgSecurityUiCloser+RECT
+        [void][BgSecurityUiCloser]::GetWindowRect($h, [ref]$rect)
+        $w = $rect.Right - $rect.Left
+        $ht = $rect.Bottom - $rect.Top
+        if ($w -lt 300 -or $ht -lt 250) { return $true }
+        [void][BgSecurityUiCloser]::PostMessage($h, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+        return $true
+    }, [IntPtr]::Zero) | Out-Null
+
+    Start-Sleep -Milliseconds 300
+    # Last resort: close only the Windows Security UI app. Do not touch SecurityHealthService,
+    # SecurityHealthSystray, ApplicationFrameHost, Edge, bridge, tunnel, or the MCP server.
+    Get-Process SecHealthUI | Stop-Process -Force
+}
+
+$deadline = (Get-Date).AddSeconds(60)
+while ((Get-Date) -lt $deadline) {
+    Close-WindowsSecurityFrame
+    Start-Sleep -Milliseconds 750
+}
+'@
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+    try {
+        Start-Process powershell -WindowStyle Hidden -ArgumentList @(
+            "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encoded
+        ) | Out-Null
+        Write-Host "[ui] Windows Security blank-frame closer armed for background startup"
+    } catch {
+        Write-Host "[ui] Windows Security blank-frame closer could not start: $_"
+    }
+}
+
 # Everything that brings the stack up, as ONE function so it can run either INSIDE the splash's
 # message loop (a one-shot timer, so the modal splash stays visible while this runs) OR directly
 # as a fallback if the splash cannot be shown. Status updates target $script:splash (no-op if null).
 function Invoke-Startup {
+    Start-BackgroundSecurityUiCloser
+
     # First-time setup gate (BUG 3a): must run before anything is started, and before the
     # update-check/splash sequence below so its status text is not overwritten mid-prompt.
-    Invoke-FirstTimeSetupGate
+    # Background logon startup must never show interactive setup; a manual launch still does.
+    if ($NoUi) {
+        Write-Host "[setup] first-time interactive setup skipped (-NoUi)"
+    } else {
+        Invoke-FirstTimeSetupGate
+    }
 
     # Pre-flight update check (best-effort, non-blocking). Runs once before any service starts.
-    Set-SplashStatus $script:splash "Checking for updates..."
-    Check-ForUpdates
+    # In background logon startup this is skipped because update prompts are visible dialogs.
+    if ($NoUi) {
+        Write-Host "[update] update check skipped (-NoUi)"
+    } else {
+        Set-SplashStatus $script:splash "Checking for updates..."
+        Check-ForUpdates
+    }
 
     Write-Host "=== Daily startup (idempotent -- already-running parts are left as-is) ==="
 
@@ -381,68 +465,82 @@ function Invoke-Startup {
     }
 
     # 4) WPF apps. Launch only if not already running; build them first if the exe is missing.
-    #    rebuild_ui.ps1 builds AND relaunches BOTH apps itself, so if either exe is missing we
-    #    invoke it exactly once for the whole loop ($rebuilt flag) rather than once per app.
-    Set-SplashStatus $script:splash "Opening the chat and cockpit windows..."
-    $rebuilt = $false
-    foreach ($app in @("CopilotChat","FleetCockpit")) {
-        if (Get-Process $app -ErrorAction SilentlyContinue) {
-            Write-Host "[4/4] ${app}: already running"
-        } elseif (Test-Path "$root\ui\$app.exe") {
-            Write-Host "[4/4] ${app}: launching"
-            Start-Process "$root\ui\$app.exe"
-        } elseif ($rebuilt) {
-            # Already tried a rebuild this loop (below) -- re-check post-rebuild state without
-            # rebuilding again.
+    #    In -NoUi mode (used by logon autostart), keep the backend stack alive but leave the
+    #    desktop untouched. Manual launchers still use the default behavior and open the apps.
+    if ($NoUi) {
+        Set-SplashStatus $script:splash "UI launch skipped for background startup..."
+        Write-Host "[4/4] UI windows: skipped (-NoUi)"
+    } else {
+        # rebuild_ui.ps1 builds AND relaunches BOTH apps itself, so if either exe is missing we
+        # invoke it exactly once for the whole loop ($rebuilt flag) rather than once per app.
+        Set-SplashStatus $script:splash "Opening the chat and cockpit windows..."
+        $rebuilt = $false
+        foreach ($app in @("CopilotChat","FleetCockpit")) {
             if (Get-Process $app -ErrorAction SilentlyContinue) {
-                Write-Host "[4/4] ${app}: launched by rebuild"
-            } else {
-                Write-Host "[4/4] ${app}: still not running after rebuild -- see docs\TROUBLESHOOTING.md"
-            }
-        } else {
-            $rebuildScript = Join-Path $root "ui\rebuild_ui.ps1"
-            if (Test-Path $rebuildScript) {
-                Write-Host "[4/4] $app.exe not built yet -- building both UI apps (first run, ~30s)..."
-                Set-SplashStatus $script:splash "Building the chat and cockpit apps (first run, ~30s)..."
-                $rebuilt = $true
-                try {
-                    & $rebuildScript | Out-Null
-                    if (Get-Process $app -ErrorAction SilentlyContinue) {
-                        Write-Host "[4/4] ${app}: built and launched"
-                    } elseif (Test-Path "$root\ui\$app.exe") {
-                        Write-Host "[4/4] ${app}: built -- launching"
-                        Start-Process "$root\ui\$app.exe"
-                    } else {
-                        Write-Host "[4/4] ${app}: rebuild ran but exe still missing -- see docs\TROUBLESHOOTING.md ('csc.exe not found' row)"
-                    }
-                } catch {
-                    Write-Host "[4/4] ${app}: rebuild failed ($_) -- see docs\TROUBLESHOOTING.md ('csc.exe not found' row)"
+                Write-Host "[4/4] ${app}: already running"
+            } elseif (Test-Path "$root\ui\$app.exe") {
+                Write-Host "[4/4] ${app}: launching"
+                Start-Process "$root\ui\$app.exe"
+            } elseif ($rebuilt) {
+                # Already tried a rebuild this loop (below) -- re-check post-rebuild state without
+                # rebuilding again.
+                if (Get-Process $app -ErrorAction SilentlyContinue) {
+                    Write-Host "[4/4] ${app}: launched by rebuild"
+                } else {
+                    Write-Host "[4/4] ${app}: still not running after rebuild -- see docs\TROUBLESHOOTING.md"
                 }
             } else {
-                Write-Host "[4/4] $app.exe not built yet, and ui\rebuild_ui.ps1 is missing -- see docs\TROUBLESHOOTING.md"
+                $rebuildScript = Join-Path $root "ui\rebuild_ui.ps1"
+                if (Test-Path $rebuildScript) {
+                    Write-Host "[4/4] $app.exe not built yet -- building both UI apps (first run, ~30s)..."
+                    Set-SplashStatus $script:splash "Building the chat and cockpit apps (first run, ~30s)..."
+                    $rebuilt = $true
+                    try {
+                        & $rebuildScript | Out-Null
+                        if (Get-Process $app -ErrorAction SilentlyContinue) {
+                            Write-Host "[4/4] ${app}: built and launched"
+                        } elseif (Test-Path "$root\ui\$app.exe") {
+                            Write-Host "[4/4] ${app}: built -- launching"
+                            Start-Process "$root\ui\$app.exe"
+                        } else {
+                            Write-Host "[4/4] ${app}: rebuild ran but exe still missing -- see docs\TROUBLESHOOTING.md ('csc.exe not found' row)"
+                        }
+                    } catch {
+                        Write-Host "[4/4] ${app}: rebuild failed ($_) -- see docs\TROUBLESHOOTING.md ('csc.exe not found' row)"
+                    }
+                } else {
+                    Write-Host "[4/4] $app.exe not built yet, and ui\rebuild_ui.ps1 is missing -- see docs\TROUBLESHOOTING.md"
+                }
             }
         }
     }
 
     Write-Host ""
-    Write-Host "Done. Chat UI: http://127.0.0.1:8765 (or the CopilotChat window). Fleet cockpit window is up."
-    Write-Host "If a one-time M365 sign-in is needed, a visible Edge window will appear -- sign in there."
+    if ($NoUi) {
+        Write-Host "Done. Background stack is up. Chat bridge: http://127.0.0.1:8765"
+        Write-Host "Open the full UI manually with: wscript.exe `"$root\scripts\start_all_hidden.vbs`""
+    } else {
+        Write-Host "Done. Chat UI: http://127.0.0.1:8765 (or the CopilotChat window). Fleet cockpit window is up."
+        Write-Host "If a one-time M365 sign-in is needed, a visible Edge window will appear -- sign in there."
+    }
 
     # 5) One-time convenience provisioning (Desktop icon + logon autostart). Runs last, after every
     #    service/UI above is already launched, so any failure here can never block real startup.
     Ensure-ConvenienceProvisioning
 
-    # Keep the splash up (BOUNDED ~20s) until a chat/cockpit window actually appears, then enforce
-    # a minimum on-screen time so a fast (already-running) start is still seen, then let it close.
-    Set-SplashStatus $script:splash "Almost ready..."
-    for ($i = 0; $i -lt 40; $i++) {
-        if (Get-Process CopilotChat, FleetCockpit -ErrorAction SilentlyContinue) { break }
-        Pump-Splash $script:splash
-        Start-Sleep -Milliseconds 500
-    }
-    if ($script:splash) {
-        $rem = 2500 - ((Get-Date) - $script:splash.Start).TotalMilliseconds
-        while ($rem -gt 0) { Pump-Splash $script:splash; Start-Sleep -Milliseconds 80; $rem -= 80 }
+    if (-not $NoUi) {
+        # Keep the splash up (BOUNDED ~20s) until a chat/cockpit window actually appears, then enforce
+        # a minimum on-screen time so a fast (already-running) start is still seen, then let it close.
+        Set-SplashStatus $script:splash "Almost ready..."
+        for ($i = 0; $i -lt 40; $i++) {
+            if (Get-Process CopilotChat, FleetCockpit -ErrorAction SilentlyContinue) { break }
+            Pump-Splash $script:splash
+            Start-Sleep -Milliseconds 500
+        }
+        if ($script:splash) {
+            $rem = 2500 - ((Get-Date) - $script:splash.Start).TotalMilliseconds
+            while ($rem -gt 0) { Pump-Splash $script:splash; Start-Sleep -Milliseconds 80; $rem -= 80 }
+        }
     }
     Set-SplashStatus $script:splash "Ready."
     Start-Sleep -Milliseconds 500
@@ -455,8 +553,8 @@ function Invoke-Startup {
 $script:splash = $null
 $ranViaSplash = $false
 try {
-    $script:splash = Start-Splash
-    if ($script:splash -and $script:splash.Form) {
+    if (-not $NoSplash) { $script:splash = Start-Splash }
+    if ((-not $NoSplash) -and $script:splash -and $script:splash.Form) {
         $script:splash.Start = (Get-Date)
         $timer = New-Object System.Windows.Forms.Timer
         $timer.Interval = 80

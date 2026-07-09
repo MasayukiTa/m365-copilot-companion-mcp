@@ -78,6 +78,7 @@ using System.Text;
 public class Cw {
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
   [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] static extern int GetClassName(IntPtr h, StringBuilder s, int max);
@@ -96,14 +97,48 @@ public class Cw {
     }, IntPtr.Zero);
     return found;
   }
+  public static IntPtr[] FindChromeWidgets(int[] pids) {
+    List<IntPtr> found = new List<IntPtr>();
+    HashSet<int> set = new HashSet<int>(pids);
+    EnumWindows(delegate(IntPtr h, IntPtr p) {
+      uint pid; GetWindowThreadProcessId(h, out pid);
+      if (set.Contains((int)pid)) {
+        StringBuilder sb = new StringBuilder(64); GetClassName(h, sb, 64);
+        string cls = sb.ToString();
+        if (cls == "Chrome_WidgetWin_1" || cls == "Chrome_WidgetWin_0") { found.Add(h); }
+      }
+      return true;
+    }, IntPtr.Zero);
+    return found.ToArray();
+  }
 }
 "@
+function Get-CompanionPids {
+    return @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
+             Where-Object { $_.CommandLine -match [regex]::Escape($Profile) } |
+             ForEach-Object { [int]$_.ProcessId })
+}
+
 function Get-CompanionWindow {
-    $pids = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
-              Where-Object { $_.CommandLine -match [regex]::Escape($Profile) } |
-              ForEach-Object { [int]$_.ProcessId })
+    $pids = @(Get-CompanionPids)
     if ($pids.Count -eq 0) { return [IntPtr]::Zero }
     return [Cw]::Find($pids)
+}
+
+function Park-CompanionWindowsOffscreen {
+    $pids = @(Get-CompanionPids)
+    if ($pids.Count -eq 0) { return 0 }
+    $handles = @([Cw]::FindChromeWidgets($pids))
+    $count = 0
+    foreach ($h in $handles) {
+        if ($h -eq [IntPtr]::Zero) { continue }
+        # Headless Edge can still leave a non-interactive DWM surface. Move only this
+        # dedicated profile's Chrome widgets far off-screen; do not kill Edge, hide the
+        # renderer window, or touch the user's normal browser/background services.
+        [Cw]::SetWindowPos($h, [IntPtr]::Zero, -32000, -32000, 0, 0, 0x0001 -bor 0x0004 -bor 0x0010) | Out-Null
+        $count++
+    }
+    return $count
 }
 
 # True iff a msedge process for THIS profile is currently running with --headless.
@@ -186,6 +221,13 @@ if ($listening) {
                 Write-Host "Companion Edge already reachable on port $Port; no window found to raise."
             }
         } else {
+            if ($useHeadless -or (Test-CompanionHeadless)) {
+                $parked = Park-CompanionWindowsOffscreen
+                if ($parked -gt 0) {
+                    Write-Host "Companion Edge already reachable on port $Port; parked $parked headless window surface(s) off-screen."
+                    exit 0
+                }
+            }
             Write-Host "Companion Edge already reachable on port $Port (http://127.0.0.1:$Port). Nothing to do."
         }
         exit 0
@@ -209,6 +251,7 @@ $arguments = @()
 if ($useHeadless) {
     # true background: no window at all. (verified: CDP + SSO + sends all work headless)
     $arguments += "--headless=new"
+    $arguments += "--window-position=-32000,-32000"
 }
 # CRITICAL (verified 2026-06-30): headless=new has no real window, so WITHOUT an explicit
 # viewport the M365 Copilot SPA renders at a tiny/zero size and FAILS to resolve a
@@ -264,6 +307,7 @@ function Hide-Companion {
 $deadline = (Get-Date).AddSeconds(30)
 $ready = $false
 while ((Get-Date) -lt $deadline) {
+    if ($useHeadless) { Park-CompanionWindowsOffscreen | Out-Null }
     Hide-Companion
     try { $ready = [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) } catch { }
     if ($ready) { break }
@@ -273,6 +317,10 @@ while ((Get-Date) -lt $deadline) {
 if ($Background) {
     $extra = (Get-Date).AddSeconds(5)
     while ((Get-Date) -lt $extra) { Hide-Companion; Start-Sleep -Milliseconds 250 }
+}
+if ($useHeadless) {
+    $extra = (Get-Date).AddSeconds(5)
+    while ((Get-Date) -lt $extra) { Park-CompanionWindowsOffscreen | Out-Null; Start-Sleep -Milliseconds 250 }
 }
 
 if ($ready) {

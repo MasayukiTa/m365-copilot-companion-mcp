@@ -2,9 +2,10 @@
 
 ## What This Does
 
-The autostart mechanism automatically launches the M365 Companion stack (`start_all_hidden.vbs`) at every logon.
-The full application stack — server, tunnel, bridge, and all UIs — comes up automatically in the background
-without any manual intervention.
+The autostart mechanism automatically launches the M365 Companion background stack
+(`start_background_hidden.vbs`) at every logon. The server, tunnel, companion Edge, and bridge come up
+without any visible splash or WPF UI windows. Manual launchers can still use `start_all_hidden.vbs` to open
+the full application stack including the normal update check plus the chat and cockpit windows.
 
 ## Requirements
 
@@ -35,7 +36,8 @@ On success you will see:
 ```
 Installed autostart shortcut: C:\Users\<you>\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\M365 Companion.lnk
 It launches at every logon (per-user, no admin).
-Start the stack now:  wscript.exe "<repo>\scripts\start_all_hidden.vbs"
+Start the background stack now:  wscript.exe "<repo>\scripts\start_background_hidden.vbs"
+Start the full UI stack now:     wscript.exe "<repo>\scripts\start_all_hidden.vbs"
 Remove:  scripts\unregister-supervisor.ps1
 ```
 
@@ -56,6 +58,12 @@ Test-Path (Join-Path ([Environment]::GetFolderPath('Startup')) 'M365 Companion.l
 ### Start Immediately (Without Waiting for Logon)
 
 ```cmd
+wscript.exe "scripts\start_background_hidden.vbs"
+```
+
+To start the full UI stack manually:
+
+```cmd
 wscript.exe "scripts\start_all_hidden.vbs"
 ```
 
@@ -70,7 +78,7 @@ powershell -ExecutionPolicy Bypass -File scripts\unregister-supervisor.ps1
 ## Self-Healing Behavior
 
 The autostart mechanism is **idempotent** and **self-healing**:
-- If a process dies, `supervisor.ps1` (launched by `start_all_hidden.vbs`) automatically restarts it
+- If a backend process dies, `supervisor.ps1` automatically restarts it
 - If you reboot, the Startup shortcut re-launches the entire stack automatically
 - Most failures are automatically recovered
 
