@@ -120,6 +120,20 @@ def test_fifo_queue_and_pop_including_empty():
     assert reloaded["pending"] == []
 
 
+def test_invalid_sid_rejected_before_file_access(temp_sess_dir):
+    assert ss.load("../outside") is None
+    assert ss.pop_input("../outside") is None
+
+    with pytest.raises(ValueError):
+        ss.touch("../outside")
+    with pytest.raises(ValueError):
+        ss.queue_input("../outside", "nope")
+    with pytest.raises(ValueError):
+        ss.append_turn("../outside", "user", "nope")
+
+    assert not os.path.exists(os.path.join(temp_sess_dir, "..", "outside.json"))
+
+
 def test_latest_active_skips_empty_conv_url():
     s1 = ss.new_session(title="no-url")
     _set_last_active(s1["sid"], 300.0)  # newest but no conv_url
