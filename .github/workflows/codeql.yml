@@ -25,7 +25,7 @@ jobs:
           - language: python
             build-mode: none
           - language: csharp
-            build-mode: none
+            build-mode: manual
 
     steps:
       - name: Checkout repository
@@ -37,6 +37,11 @@ jobs:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
           config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Build C# for CodeQL
+        if: matrix.language == 'csharp'
+        shell: pwsh
+        run: ./.github/scripts/build-csharp-codeql.ps1
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
