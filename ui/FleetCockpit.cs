@@ -187,10 +187,27 @@ class CockpitWindow : Window
     bool _composerRunActive = false;
 
     // Per-worker disclosure state (Claude-Code-style "> / v"). Collapsed is the default:
-    // a collapsed card renders only a lightweight summary line -- no progress quote, no steer
-    // TextBox -- so a fleet of 100+ tasks stays scrollable. Only an EXPANDED card builds the
-    // heavy detail and enables steering. Keyed by worker name; survives re-renders.
+    // a collapsed card renders only a lightweight summary line and (Feature 1) a slim always-on
+    // steer affordance for non-terminal workers -- the heavy tabs/logs/review detail still only
+    // builds when EXPANDED. Keyed by worker name; survives re-renders.
     HashSet<string> _expanded = new HashSet<string>();
+
+    // ── Feature 1: collapsed-card steer affordance -- keystroke-safety state ───────────────────
+    // Cards are rebuilt wholesale (Card(w) called again) whenever RowSig for that worker changes,
+    // which happens routinely for a LIVE worker (its `last`/`turn`/etc. stream every sweep) --
+    // completely independent of whether the user is mid-type in its steer box. So a naive TextBox
+    // would lose its text (rebuilt empty) and/or its focus (a brand new control instance) on the
+    // very next ~700ms sweep. Three fields defend against that:
+    //   _steerDraft     -- per-worker in-progress text, read back into the TextBox's Text on every
+    //                      (re)build, so a torn-down-and-rebuilt box never loses what was typed.
+    //   _steerFocusWorker -- which worker's steer box currently holds keyboard focus, so a rebuild
+    //                      knows it needs to re-Focus() the replacement box afterward.
+    //   _steerBoxRef    -- the CURRENTLY realized TextBox per worker, updated every time Card(w)
+    //                      (re)builds one, so the post-render restore pass (see RenderCards) always
+    //                      focuses the box that is actually still in the visual tree.
+    Dictionary<string, string> _steerDraft = new Dictionary<string, string>();
+    string _steerFocusWorker = null;
+    Dictionary<string, TextBox> _steerBoxRef = new Dictionary<string, TextBox>();
     // last status snapshot rendered, kept so a chevron toggle can rebuild ONLY its one card
     // in place (no full 164-card re-render) -- that's what makes expand/collapse feel instant.
     Dictionary<string, object> _lastRoot;
@@ -359,6 +376,9 @@ class CockpitWindow : Window
         if (k == "resume") return ja ? "再開" : "Resume";
         if (k == "stopall") return ja ? "全停止" : "Stop all";
         if (k == "steer_dead") return ja ? "走行が停止中のため割り込めません（再開後にどうぞ）" : "No run live — can't steer (resume the fleet first)";
+        // Feature 1: collapsed-card steer affordance (placeholder watermark + send ack toast).
+        if (k == "steer_collapsed_placeholder") return ja ? "割り込み指示…" : "Steer…";
+        if (k == "steer_collapsed_ack") return ja ? "↳ 送信" : "↳ Sent";
         // ── P0 Health strip (infra state) + Fix button + INFRA_STUCK / agent badge ──────
         if (k == "hs_server") return ja ? "サーバ" : "Server";
         if (k == "hs_tunnel") return ja ? "トンネル" : "Tunnel";
@@ -5451,6 +5471,30 @@ class CockpitWindow : Window
                 if (s2 != null) s2.ScrollToVerticalOffset(target);
             }), System.Windows.Threading.DispatcherPriority.Loaded);
         }
+
+        // Feature 1 keystroke-safety: mirrors the scroll-restore pass just above, same Loaded
+        // priority (i.e. runs after this sweep's layout has realized whatever containers SetRows
+        // just replaced). If the user was mid-type in some worker's steer box, its card may have
+        // just been rebuilt (RowSig changed for reasons unrelated to steering -- a LIVE worker's
+        // `last`/`turn` streams every sweep) into a BRAND NEW TextBox instance. The new instance
+        // already has the right text (CollapsedSteerRow/SteerRow seed it from _steerDraft on every
+        // build) -- what it does NOT have yet is focus, so re-apply it here and seat the caret at
+        // the end. Runs unconditionally (not gated on scroll offset) since a steer rebuild can
+        // happen with zero scroll.
+        string focusWorker = _steerFocusWorker;
+        if (!string.IsNullOrEmpty(focusWorker))
+        {
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                if (_steerFocusWorker != focusWorker) return;   // focus moved on before this ran
+                TextBox tb2;
+                if (_steerBoxRef.TryGetValue(focusWorker, out tb2) && tb2 != null)
+                {
+                    try { tb2.Focus(); tb2.CaretIndex = tb2.Text != null ? tb2.Text.Length : 0; }
+                    catch (Exception) { }
+                }
+            }), System.Windows.Threading.DispatcherPriority.Loaded);
+        }
     }
 
     // Rebuild the PINNED filter bar into its fixed host above the list. Called after BuildRows (so
@@ -5772,6 +5816,19 @@ class CockpitWindow : Window
                 // FIX B: _stopping dims non-terminal cards -- track it so a Stop click (or its
                 // resolution) re-templates this card instead of reusing the old realized element.
                 sb.Append('|').Append(_stopping ? "1" : "0");
+                // Feature 1: fold whether THIS card's collapsed steer box currently has a non-empty
+                // draft and/or keyboard focus into the signature. This does not, by itself, protect
+                // the draft/focus (that's _steerDraft + _steerBoxRef + the RenderCards restore pass,
+                // which work regardless of Sig) -- it exists so that starting/ending a steer draft
+                // or focus on this specific card is itself a tracked, deterministic state transition
+                // rather than invisible to the diff, matching how every other read field here is
+                // captured. Booleans only (not the draft text itself) -- empty-to-non-empty and
+                // unfocused-to-focused are each a single transition, so this does NOT force a
+                // rebuild on every keystroke the way hashing the live draft text would.
+                string draftSt;
+                bool hasDraft = _steerDraft.TryGetValue(nm, out draftSt) && !string.IsNullOrEmpty(draftSt);
+                bool hasFocus = _steerFocusWorker == nm;
+                sb.Append('|').Append(hasDraft ? "d1" : "d0").Append(hasFocus ? "f1" : "f0");
                 return sb.ToString();
         }
     }
@@ -7050,6 +7107,11 @@ class CockpitWindow : Window
                     col.Children.Add(confChip);
                 }
             }
+
+            // Feature 1: always-visible steer affordance -- reachable WITHOUT expanding the card.
+            // Same terminal gate the expanded drawer's SteerRow/RetryRow/ContinueRow switch uses
+            // (below): a terminal card (done/stuck/maxturns/error/cancelled) gets nothing here.
+            if (!terminal) col.Children.Add(CollapsedSteerRow(name));
         }
         else
         {
@@ -7682,6 +7744,108 @@ class CockpitWindow : Window
         return all;
     }
 
+    // Feature 1: slim always-visible steer affordance on a COLLAPSED non-terminal card -- mid-run
+    // steering used to require expanding the card first. One line: a borderless underline TextBox
+    // + a small "↳" send glyph. Reuses TrySteerSend (see above) for the actual command write.
+    //
+    // Keystroke-safety (the reason this is more than a two-line TextBox): a LIVE worker's `last`/
+    // `turn`/etc. stream every ~700ms sweep, which changes this card's RowSig and makes Card(w)
+    // rebuild the WHOLE card -- including this box -- independent of whether the user is mid-type.
+    // Three things make that survivable:
+    //   1. Text is seeded from _steerDraft[name] on every build, and TextChanged writes back to
+    //      it -- so a torn-down-and-rebuilt box never starts empty.
+    //   2. _steerBoxRef[name] is updated to the newest TextBox instance on every build, and
+    //      RenderCards' post-SetRows Dispatcher pass (Loaded priority, mirroring the existing
+    //      scroll-restore pass right above it) re-Focus()es + re-seats the caret on whichever
+    //      instance is current, so a rebuild mid-type does not drop focus either.
+    //   3. GotFocus/LostFocus maintain _steerFocusWorker so that pass knows there IS a focus to
+    //      restore, and to WHICH worker. LostFocus defers its "did focus really leave" check to
+    //      ContextIdle -- strictly after the Loaded-priority restore -- so a teardown-triggered
+    //      LostFocus on the OLD box (which fires before the new box is focused) can't race ahead
+    //      and clear the tracked worker before the restore runs.
+    UIElement CollapsedSteerRow(string name)
+    {
+        var outer = new DockPanel();
+        outer.Margin = new Thickness(24, 5, 0, 0);
+        // must not bubble to the card's whole-row open-conversation click handler
+        outer.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; };
+
+        var send = new Button();
+        send.Content = "↳";   // "↳" -- icon-only so the row stays one line
+        send.ToolTip = _lang == 0 ? "送信" : "Send";
+        send.Background = Brushes.Transparent; send.Foreground = Muted;
+        send.BorderThickness = new Thickness(0); send.Cursor = Cursors.Hand; send.FontSize = 13;
+        send.Padding = new Thickness(6, 0, 2, 0);
+        DockPanel.SetDock(send, Dock.Right);
+        outer.Children.Add(send);
+
+        string nm = name;
+        // input + placeholder watermark overlay (same idea as SteerRow's, compacted into one line)
+        var inputGrid = new Grid();
+        var tb = new TextBox();
+        SwallowMouseUp(tb);   // selecting/typing must not trigger the card's open-conversation click
+        tb.FontSize = 12; tb.Padding = new Thickness(4, 2, 4, 2);
+        tb.BorderThickness = new Thickness(0, 0, 0, 1); tb.BorderBrush = Border;
+        tb.Background = Brushes.Transparent; tb.Foreground = Fg; tb.CaretBrush = Fg;
+        tb.ToolTip = _lang == 0 ? "回答待ち中でも割り込み指示を送れます（次のターンに最優先で反映）"
+                                : "Inject a steering instruction (applied on the next turn)";
+        string draft;
+        tb.Text = _steerDraft.TryGetValue(nm, out draft) ? draft : "";
+        _steerBoxRef[nm] = tb;   // newest realized instance for this worker (used by the focus-restore pass)
+
+        var placeholder = new TextBlock();
+        placeholder.Text = T("steer_collapsed_placeholder");
+        placeholder.Foreground = Muted; placeholder.FontSize = 12;
+        placeholder.Padding = new Thickness(4, 2, 4, 2);
+        placeholder.IsHitTestVisible = false;
+        placeholder.Visibility = string.IsNullOrEmpty(tb.Text) ? Visibility.Visible : Visibility.Collapsed;
+        inputGrid.Children.Add(placeholder);
+        inputGrid.Children.Add(tb);
+
+        Func<bool> trySend = delegate
+        {
+            string failReason;
+            if (!TrySteerSend(nm, tb.Text, out failReason))
+            {
+                if (failReason != null) ShowScaleToast(failReason);
+                return false;
+            }
+            tb.Text = "";
+            _steerDraft.Remove(nm);
+            ShowScaleToast(T("steer_collapsed_ack"));
+            return true;
+        };
+        send.Click += delegate { trySend(); };
+        tb.KeyDown += delegate (object s2, KeyEventArgs e2)
+        {
+            if (e2.Key == Key.Return) { trySend(); e2.Handled = true; }
+        };
+        tb.TextChanged += delegate
+        {
+            _steerDraft[nm] = tb.Text;
+            placeholder.Visibility = string.IsNullOrEmpty(tb.Text) ? Visibility.Visible : Visibility.Collapsed;
+        };
+        tb.GotFocus += delegate { _steerFocusWorker = nm; };
+        tb.LostFocus += delegate
+        {
+            // Defer the "did focus really move away" check to ContextIdle -- strictly lower
+            // priority than the Loaded-priority restore pass in RenderCards, so if this LostFocus
+            // fired only because the container was rebuilt out from under the user (not because
+            // they clicked elsewhere), the restore pass has already re-focused the NEW box by the
+            // time this runs, and stillOnSteer below comes back true (no-op).
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                if (_steerFocusWorker != nm) return;
+                TextBox cur = Keyboard.FocusedElement as TextBox;
+                TextBox tracked;
+                bool stillOnSteer = cur != null && _steerBoxRef.TryGetValue(nm, out tracked) && cur == tracked;
+                if (!stillOnSteer) _steerFocusWorker = null;
+            }), System.Windows.Threading.DispatcherPriority.ContextIdle);
+        };
+        outer.Children.Add(inputGrid);   // last child + LastChildFill -> fills remaining width
+        return outer;
+    }
+
     // ② steering: inject a mid-task instruction into this worker's conversation.
     // Task 6: restyled as a small composer -- rounded surfaceSubtle border, placeholder watermark,
     // neutral send button, post-send wording updated.
@@ -7743,12 +7907,16 @@ class CockpitWindow : Window
 
         string nm = name;
         // returns true iff the steer was actually sent; keeps the text + shows a note otherwise.
+        // Reuses TrySteerSend (the ONE steer-send code path, shared with CollapsedSteerRow).
         Func<bool> trySteer = delegate
         {
-            string t = (tb.Text ?? "").Trim();
-            if (t.Length == 0) return false;
-            if (!RunIsLive()) { note.Text = T("steer_dead"); return false; }
-            RequestSteer(nm, t); tb.Text = "";
+            string failReason;
+            if (!TrySteerSend(nm, tb.Text, out failReason))
+            {
+                if (failReason != null) note.Text = failReason;
+                return false;
+            }
+            tb.Text = "";
             // Task 6: updated post-send wording
             note.Text = _lang == 0 ? "次のターンに送信しました" : "Queued for the next turn";
             return true;
@@ -8307,6 +8475,21 @@ class CockpitWindow : Window
         steers.Add(item);
         cmd["steer"] = steers;
         WriteCommands(cmd);
+    }
+
+    // Feature 1: the ONE steer-send code path, shared by SteerRow (expanded drawer) and
+    // CollapsedSteerRow (always-visible mini box on a collapsed non-terminal card). Neither
+    // caller re-implements the RequestSteer/commands.json write -- both funnel through here.
+    // Returns true iff the steer was actually queued; otherwise failReason carries the reason
+    // text (steer_dead) so the caller can surface it however fits its layout (inline note vs toast).
+    bool TrySteerSend(string name, string text, out string failReason)
+    {
+        failReason = null;
+        string t = (text ?? "").Trim();
+        if (t.Length == 0) return false;
+        if (!RunIsLive()) { failReason = T("steer_dead"); return false; }
+        RequestSteer(name, t);
+        return true;
     }
 
     // FIX A: immediate LOCAL feedback on an open-conversation click. The main chat only notices
