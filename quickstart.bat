@@ -71,7 +71,10 @@ echo  STEP 3/7  Check git for updates (fetch only - never pushes)
 echo ===========================================================================
 git rev-parse --is-inside-work-tree >nul 2>nul
 if errorlevel 1 (
-    echo   Not a git checkout - skipping update check.
+    echo   Not a git checkout - skipping git update check.
+    if exist "update.bat" (
+        echo   ZIP install detected. To update without git, run: update.bat
+    )
 ) else (
     echo   Fetching...
     git fetch --quiet
