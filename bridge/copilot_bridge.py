@@ -396,7 +396,31 @@ PROMPT_TEMPLATES = {
 PAGE = None      # set at startup
 DRIVER = None
 AGENT_URL = ""   # bare agent URL (a fresh chat); set at startup
-_CONSENT_SURFACED = False  # last-resort surface() for consent fired at most once per session
+
+# BUG 2 fix: bounded, per-episode retry state for the foreground last-resort surface(), mirroring
+# relay/relay_fleet.py's RelayWorker consent-surface bookkeeping (_consent_surfaced /
+# _consent_surfaced_ok / CONSENT_SURFACE_RETRY_MAX) as closely as this file's single-PAGE (not
+# per-worker) model allows. WAS: a single module-global _CONSENT_SURFACED bool latched True
+# UNCONDITIONALLY before surface() was even attempted, so ANY transient failure on that one
+# lifetime attempt (slow headless->headed relaunch, a psutil-unavailable moment making
+# edge_recover._headed_process_present always return False, a CDP race) permanently disabled
+# surfacing for the rest of the process's -- possibly multi-day -- uptime.
+#   - _CONSENT_SURFACE_OK latches True ONLY after a surface() call TRUTHFULLY succeeds (set
+#     from the real `ok` result, never before the attempt) -- a failed attempt stays retryable.
+#   - _CONSENT_SURFACE_ATTEMPTS bounds surface() work (both failed attempts and post-success
+#     "still waiting for the user" checks) to CONSENT_SURFACE_RETRY_MAX within one episode, so a
+#     run of failures still terminates with an honest message instead of retrying forever.
+#   - _CONSENT_SURFACE_TERMINAL_SENT guards the one-time TERMINAL HONESTY announcement (see
+#     _record_consent_unrecoverable) so it fires once per exhausted episode, not on every
+#     subsequent call while still exhausted.
+#   - An episode ENDS (state resets, see _reset_consent_surface_episode) the moment consent is
+#     confirmed resolved -- auto-consent succeeds, or a turn answers normally again -- so a
+#     LATER, genuinely new consent card gets its own full retry budget instead of inheriting an
+#     exhausted one.
+_CONSENT_SURFACE_OK = False
+_CONSENT_SURFACE_ATTEMPTS = 0
+_CONSENT_SURFACE_TERMINAL_SENT = False
+CONSENT_SURFACE_RETRY_MAX = int(os.environ.get("MCP_CONSENT_SURFACE_RETRY_MAX", "3"))
 
 # BUG 4b fix: bounded safety net so a surface()'d dedicated Edge can NEVER stay foreground
 # forever, even when the normal rehide()-on-resolution pairing is missed. threading.Timer is
@@ -436,6 +460,84 @@ def _cancel_force_rehide(timer):
             timer.cancel()
         except Exception:
             pass
+
+
+def _reset_consent_surface_episode():
+    """Call whenever consent is confirmed resolved -- auto-consent succeeded, or a turn
+    answered normally again -- so a LATER, genuinely new consent card starts its own full
+    CONSENT_SURFACE_RETRY_MAX budget instead of inheriting an already-exhausted one. Never
+    raises (pure in-process state reset)."""
+    global _CONSENT_SURFACE_OK, _CONSENT_SURFACE_ATTEMPTS, _CONSENT_SURFACE_TERMINAL_SENT
+    _CONSENT_SURFACE_OK = False
+    _CONSENT_SURFACE_ATTEMPTS = 0
+    _CONSENT_SURFACE_TERMINAL_SENT = False
+
+
+def _record_consent_unrecoverable(detail: str = ""):
+    """TERMINAL HONESTY: both auto-consent and the bounded surface() retries have genuinely
+    failed for this episode. Makes that state unmissable without new infra: persists
+    kind="consent_unrecoverable" to tools.tool_probe's EXISTING .fleet/tool_probe.json sidecar
+    (extends its documented `kind` field only -- no schema change) so the cockpit's Tool health
+    dot goes red with an actionable state, and logs the exact manual recovery command. Fires at
+    most once per exhausted episode (guarded by _CONSENT_SURFACE_TERMINAL_SENT). Best-effort;
+    never raises (tool_probe.record_probe already swallows all I/O errors itself)."""
+    global _CONSENT_SURFACE_TERMINAL_SENT
+    if _CONSENT_SURFACE_TERMINAL_SENT:
+        return
+    _CONSENT_SURFACE_TERMINAL_SENT = True
+    try:
+        tool_probe.record_probe(False, "consent_unrecoverable", detail=(detail or "")[:200])
+    except Exception:
+        pass
+    logger.warning(
+        "consent unrecoverable: auto-consent and surface() both exhausted (%s). Manual "
+        "recovery: python -m relay.edge_reconnect --cdp-url http://127.0.0.1:9223", detail)
+
+
+def _consent_surface_attempt(detail: str = "") -> bool:
+    """Core bounded-retry, success-only-latching surface() attempt (BUG 2 fix). Shared by BOTH
+    an interactive turn (Handler._consent_last_resort_surface wraps this with the user-facing
+    SSE message) and the idle tool-probe's consent recovery (_run_tool_probe, which has no live
+    SSE consumer to write to) -- see the module docstring above _CONSENT_SURFACE_OK for the
+    full design. Returns True iff the dedicated Edge is truthfully up (freshly surfaced this
+    call, OR already surfaced earlier this episode and still within CONSENT_SURFACE_RETRY_MAX).
+    Never raises into the caller."""
+    global _CONSENT_SURFACE_OK, _CONSENT_SURFACE_ATTEMPTS
+    if _CONSENT_SURFACE_ATTEMPTS >= CONSENT_SURFACE_RETRY_MAX:
+        # Bounded retry budget for this episode is exhausted -- stop yanking/re-checking, and
+        # make sure the terminal state was announced (idempotent past the first call).
+        _record_consent_unrecoverable(detail)
+        return False
+    _CONSENT_SURFACE_ATTEMPTS += 1
+    if _CONSENT_SURFACE_OK:
+        # Already truthfully surfaced this episode -- the window should still be up (or was
+        # force-rehidden after CONSENT_SURFACE_FORCE_REHIDE_SEC); don't yank it again. Report
+        # "surfaced" so the caller keeps waiting quietly, within the bounded budget above.
+        return True
+    ok = False
+    try:
+        from relay.edge_recover import surface
+        port = int(os.environ.get("MCP_BRIDGE_CDP_PORT", "9223"))
+        target = AGENT_URL or ((PAGE.url or "") if PAGE is not None else "")
+        ok = bool(surface(port=port, open_url=target))
+        if ok:
+            # BUG 4a/4b fix: this surface() had no paired rehide() at all -- fire-and-forget,
+            # so the window stayed foreground until the process died. Precisely detecting
+            # "consent resolved" here is hard (the caller decides success on the NEXT turn),
+            # so instead schedule the bounded safety net: force the window back down on its
+            # own after CONSENT_SURFACE_FORCE_REHIDE_SEC regardless of what the user does.
+            _schedule_force_rehide()
+    except Exception:
+        logger.warning("_consent_surface_attempt: surface() raised", exc_info=True)
+        ok = False
+    if ok:
+        _CONSENT_SURFACE_OK = True   # SUCCESS-ONLY LATCH -- was latched True unconditionally
+                                      # BEFORE the attempt; a failure now leaves this False so
+                                      # the next call (bounded above) retries instead of being
+                                      # permanently disabled.
+    elif _CONSENT_SURFACE_ATTEMPTS >= CONSENT_SURFACE_RETRY_MAX:
+        _record_consent_unrecoverable(detail)
+    return ok
 
 
 # ── concurrency (work mode) ──────────────────────────────────────────────────────────────────
@@ -2970,45 +3072,33 @@ class Handler(BaseHTTPRequestHandler):
         auto-approved retry) has genuinely failed. Surfaces the BRIDGE's own dedicated Edge
         (port 9223, profile copilot-bridge-edge -- NOT the fleet's :9222) pointed at the
         conversation this bridge is actually driving, so the user can approve by hand on the
-        right chat rather than the launcher's default top page. One-shot per process
-        (_CONSENT_SURFACED) so a stuck session doesn't repeatedly yank the window to the
-        front. Returns True iff a headed window was truthfully confirmed up (gates the SSE
-        message: only ever claims "surfaced" when surface() actually returned True) --
-        the caller falls back to the honest chat error when this returns False. Never
-        raises into the turn."""
-        global _CONSENT_SURFACED
-        if _CONSENT_SURFACED:
-            # already surfaced once this session -- don't yank the window again; let the
-            # caller emit the honest "please retry" error instead of re-surfacing forever.
-            return False
-        _CONSENT_SURFACED = True
-        ok = False
-        try:
-            from relay.edge_recover import surface
-            port = int(os.environ.get("MCP_BRIDGE_CDP_PORT", "9223"))
-            target = AGENT_URL or ((PAGE.url or "") if PAGE is not None else "")
-            ok = bool(surface(port=port, open_url=target))
-            if ok:
-                # BUG 4a/4b fix: this surface() had no paired rehide() at all -- fire-and-
-                # forget, so the window stayed foreground until the process died. Precisely
-                # detecting "consent resolved" here is hard (this function only surfaces and
-                # returns; the caller decides success on the NEXT turn, elsewhere), so instead
-                # schedule the bounded safety net: force the window back down on its own after
-                # CONSENT_SURFACE_FORCE_REHIDE_SEC regardless of what the user does.
-                _schedule_force_rehide()
-        except Exception:
-            logger.warning("_consent_last_resort_surface: surface() raised", exc_info=True)
-            ok = False
+        right chat rather than the launcher's default top page.
+
+        BUG 2 fix: this used to be one-shot per PROCESS (a module bool latched True before the
+        attempt even ran), so a single transient failure permanently disabled surfacing for the
+        rest of the process's -- possibly multi-day -- uptime. It now delegates the actual
+        attempt to _consent_surface_attempt(), which latches "already surfaced" ONLY on a
+        TRUTHFUL success and bounds retries to CONSENT_SURFACE_RETRY_MAX per consent episode
+        (see that function's docstring). This method's own job is just the user-facing SSE
+        messaging around that shared core. Returns True iff a headed window was truthfully
+        confirmed up (gates the SSE message: only ever claims "surfaced" when surface() actually
+        returned True, or a prior call this episode already did) -- the caller falls back to its
+        own honest chat error when this returns False. Never raises into the turn."""
+        ok = _consent_surface_attempt("interactive /stream turn")
         try:
             if ok:
                 self._sse({"replace": "接続の自動承認に失敗しました。専用Edge (:9223) を前面に出しました。"
                                        "表示された画面で接続を許可してから、もう一度お試しください。"})
             else:
-                self._sse({"replace": "接続の自動承認・自動表示に失敗しました。手動で PowerShell から: "
-                                       "powershell -NoProfile -ExecutionPolicy Bypass -File "
-                                       "scripts\\start_companion_edge.ps1 -Foreground -Port 9223 "
-                                       "を実行し、専用Edge(:9223)で接続を許可してから、もう一度お試し"
-                                       "ください。"})
+                # TERMINAL HONESTY: exact manual recovery command, unmissable in the chat line
+                # (also recorded to .fleet/tool_probe.json kind="consent_unrecoverable" once
+                # the retry budget is truly exhausted -- see _record_consent_unrecoverable).
+                self._sse({"replace": "接続の自動承認・自動表示に失敗しました。手動で次のコマンドを"
+                                       "実行してください: python -m relay.edge_reconnect --cdp-url "
+                                       "http://127.0.0.1:9223 （または PowerShell から scripts\\"
+                                       "start_companion_edge.ps1 -Foreground -Port 9223 を実行して"
+                                       "専用Edge(:9223)で接続を許可してください）。その後、もう一度"
+                                       "お試しください。"})
             self._sse({}, "done")
         except Exception:
             pass
@@ -3052,9 +3142,16 @@ class Handler(BaseHTTPRequestHandler):
                 if final is not None and _looks_like_consent(final):
                     logger.warning("consent card persisted after auto-consent retry")
                     return {"consent_failed": True}
+                # BUG 2 support: consent is genuinely resolved now (auto-consent worked and the
+                # retry did not hit another card) -- end the surface-retry episode so a LATER
+                # consent card starts with its own full retry budget, not an exhausted one.
+                _reset_consent_surface_episode()
             else:
                 logger.warning("_bridge_auto_consent: all tiers failed for a consent card")
                 return {"consent_failed": True}
+        elif final is not None:
+            # Normal answer, no consent issue at all -- also a clean episode boundary.
+            _reset_consent_surface_episode()
         return final
 
     def _stream_text(self, msg: str):
@@ -3548,7 +3645,16 @@ def _run_tool_probe():
     EXACT SAME PAGE_LOCK try-acquire guard /stream and /goal already use (see PAGE_LOCK's
     module docstring), so this can never collide with a real user message. Exception-guarded
     end to end: a probe failure must never crash the bridge or stop future probes from being
-    scheduled (see _schedule_tool_probe's finally-based re-arm)."""
+    scheduled (see _schedule_tool_probe's finally-based re-arm).
+
+    BUG 1 fix: a consent_card classification is no longer just RECORDED -- it now DRIVES the
+    same recovery a live user turn gets (_bridge_auto_consent's tiers, then the bounded/
+    retryable _consent_surface_attempt last resort), because on a fresh device the stale
+    connector's consent card only ever renders as the RESULT of an actual tool call (see
+    relay/edge_reconnect.py's module docstring); the startup proactive auto-consent in
+    _page_main has nothing to click without one. Every PAGE-touching step below still runs on
+    the page-owner thread (run_on_page_thread) and inside the SAME PAGE_LOCK this function
+    already holds, so recovery can never race a real user turn."""
     try:
         if MCP_TOOL_PROBE_SEC <= 0:
             return  # opt-out
@@ -3568,13 +3674,43 @@ def _run_tool_probe():
             return
         try:
             agent_loaded, reply, timed_out = run_on_page_thread(_do_tool_probe_turn)
+            if timed_out:
+                ok, kind = False, "timeout"
+            else:
+                ok, kind = tool_probe.classify_probe_reply(reply, agent_loaded)
+                if kind == "consent_card":
+                    logger.info("tool probe: consent_card sighted -- driving recovery")
+                    consented = False
+                    try:
+                        consented = run_on_page_thread(_bridge_auto_consent)
+                    except Exception:
+                        logger.warning("tool probe: _bridge_auto_consent raised", exc_info=True)
+                    if consented:
+                        # consent resolved without needing surface() -- fresh episode for later.
+                        _reset_consent_surface_episode()
+                        try:
+                            agent_loaded, reply, timed_out = run_on_page_thread(_do_tool_probe_turn)
+                            if timed_out:
+                                ok, kind = False, "timeout"
+                            else:
+                                ok, kind = tool_probe.classify_probe_reply(reply, agent_loaded)
+                        except Exception:
+                            logger.warning("tool probe: re-probe after auto-consent raised",
+                                           exc_info=True)
+                    else:
+                        logger.warning("tool probe: auto-consent failed for a consent card")
         finally:
             PAGE_LOCK.release()
-        if timed_out:
-            tool_probe.record_probe(False, "timeout", detail=(reply or "")[:200])
-            logger.info("tool probe: timeout")
-            return
-        ok, kind = tool_probe.classify_probe_reply(reply, agent_loaded)
+        if kind == "consent_card":
+            # auto-consent could not resolve it (failed outright, or the re-probe above still
+            # saw a card) -- fall through to the bounded/retryable last-resort surface(), the
+            # same recovery ladder an interactive turn gets. No live SSE consumer here, so
+            # _consent_surface_attempt logs/records instead of streaming to a client.
+            surfaced = _consent_surface_attempt("idle tool probe: consent card unresolved")
+            logger.info("tool probe: last-resort surface attempt -> %s", surfaced)
+        # Final record reflects whatever the LAST classification actually established (a
+        # successful auto-consent's re-probe result if one ran, else the original outcome) --
+        # this is the authoritative snapshot /health reads.
         tool_probe.record_probe(ok, kind, detail=(reply or "")[:200])
         logger.info("tool probe: ok=%s kind=%s", ok, kind)
     except Exception:
@@ -3585,17 +3721,34 @@ def _run_tool_probe():
             pass
 
 
-def _schedule_tool_probe():
+# BUG 1 fix: how long to wait before the FIRST probe after startup (short), vs. the normal idle
+# cadence for every probe after that (MCP_TOOL_PROBE_SEC). On a fresh device the stale
+# connector's consent card only ever renders as the RESULT of an actual tool call (see
+# relay/edge_reconnect.py's module docstring) -- the startup proactive auto-consent in
+# _page_main only inspects the DOM, so it is a structural no-op with nothing to click yet.
+# Without an early probe the bridge would otherwise wait up to the full MCP_TOOL_PROBE_SEC
+# (600s default) before ever forcing that card to render. Env-tunable; 0 falls back to the
+# normal MCP_TOOL_PROBE_SEC for the first run too (no special-casing).
+MCP_TOOL_PROBE_STARTUP_DELAY_SEC = float(os.environ.get("MCP_TOOL_PROBE_STARTUP_DELAY_SEC", "30"))
+
+
+def _schedule_tool_probe(delay=None):
     """Self-re-arming threading.Timer: run _run_tool_probe(), then -- regardless of outcome --
     schedule the NEXT run MCP_TOOL_PROBE_SEC later, for as long as the process is alive. A
     one-shot Timer chained via its own callback (not a persistent daemon loop thread), matching
     _schedule_force_rehide's pattern elsewhere in this file. daemon=True so it never blocks
     process exit. Disabled entirely (never even arms once) when MCP_TOOL_PROBE_SEC<=0, so
-    setting it to 0 truly opts out -- no timer, no probe turn, ever."""
+    setting it to 0 truly opts out -- no timer, no probe turn, ever.
+
+    `delay` overrides the wait before THIS arm's probe fires; only main() passes it (as
+    MCP_TOOL_PROBE_STARTUP_DELAY_SEC, for the very first run right after startup -- see BUG 1
+    fix above). Every self-re-arm from _tick() below omits it, so all SUBSEQUENT runs use the
+    normal MCP_TOOL_PROBE_SEC idle cadence unchanged."""
     global _TOOL_PROBE_TIMER
     if MCP_TOOL_PROBE_SEC <= 0:
         logger.info("tool probe: disabled (MCP_TOOL_PROBE_SEC<=0)")
         return
+    wait = MCP_TOOL_PROBE_SEC if delay is None else max(0.0, delay)
 
     def _tick():
         try:
@@ -3605,7 +3758,7 @@ def _schedule_tool_probe():
         finally:
             _schedule_tool_probe()   # re-arm regardless of outcome -- keeps probing forever
 
-    _TOOL_PROBE_TIMER = threading.Timer(MCP_TOOL_PROBE_SEC, _tick)
+    _TOOL_PROBE_TIMER = threading.Timer(wait, _tick)
     _TOOL_PROBE_TIMER.daemon = True
     _TOOL_PROBE_TIMER.start()
 
@@ -3758,10 +3911,15 @@ def main():
     # run_on_page_thread, which is a no-op-until-queued blocking call.
     PAGE_EXECUTOR.start(lambda: _page_main(cdp, fresh))
     # Arm the idle tool-call self-probe AFTER the page-owner thread has been started (so PAGE
-    # exists, or is about to, by the time the first tick fires MCP_TOOL_PROBE_SEC from now --
-    # see "tool-call self-probe" section above _SingleBindHTTPServer). No-ops entirely when
-    # MCP_TOOL_PROBE_SEC<=0 (opt-out).
-    _schedule_tool_probe()
+    # exists, or is about to, by the time the first tick fires -- see "tool-call self-probe"
+    # section above _SingleBindHTTPServer). No-ops entirely when MCP_TOOL_PROBE_SEC<=0 (opt-out).
+    # BUG 1 fix: the FIRST tick fires after the short MCP_TOOL_PROBE_STARTUP_DELAY_SEC, not the
+    # full MCP_TOOL_PROBE_SEC -- a fresh device needs an early real tool call to force a stale
+    # connector's consent card to render at all (see MCP_TOOL_PROBE_STARTUP_DELAY_SEC's
+    # docstring above _schedule_tool_probe). If PAGE is not ready yet by then, _run_tool_probe
+    # simply records agent_unreachable and the normal MCP_TOOL_PROBE_SEC cadence takes over from
+    # the next re-arm.
+    _schedule_tool_probe(delay=MCP_TOOL_PROBE_STARTUP_DELAY_SEC)
     # THREADED (via ThreadingMixIn in _SingleBindHTTPServer) so a long /goal run cannot
     # block /send (steering) or /stop from getting through. Playwright sync objects are
     # still not thread-safe -- PageExecutor (module-level PAGE_EXECUTOR) is the single
