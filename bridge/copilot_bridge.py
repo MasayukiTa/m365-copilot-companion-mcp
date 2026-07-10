@@ -277,6 +277,10 @@ from relay.copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver, P
 # drift apart on what counts as a consent card. See relay_fleet.py CONSENT_MARKERS (~line 90).
 from relay.relay_fleet import CONSENT_MARKERS
 from bridge import session_store as S
+# tool_probe is stdlib-only (see its module docstring) -- cheap to import here regardless of
+# the heavy relay chain already loaded above. Used by the idle tool-call self-probe, see the
+# "tool-call self-probe" section near the bottom of this file.
+from tools import tool_probe
 
 load_dotenv()
 
@@ -470,6 +474,13 @@ INPUT_LOCK = threading.Lock()
 # turn boundary and, once seen, finishes the CURRENT turn and reports outcome="stopped". Reset
 # to False at the start of every new /goal run.
 STOP_REQUESTED = False
+# Wallclock of the most recent REAL user/goal turn, stamped by _run_one_turn (the single choke
+# point both _stream_text and _run_work_phase call through). The tool-call self-probe (see
+# "tool-call self-probe" section near the bottom of this file) reads this to skip itself while
+# the user is actively working, so a probe can never compete with -- or be mistaken for -- live
+# use, and never burns the user's agent context mid-task. 0.0 (epoch) at startup so a probe is
+# allowed to run before the very first real turn.
+_LAST_USER_TURN_TS = 0.0
 
 
 class PageExecutor:
@@ -3019,6 +3030,8 @@ class Handler(BaseHTTPRequestHandler):
         both. Raises on a driver/page error, exactly as _send_and_stream_once did before this
         was split out of _stream_text -- callers own the Esc/Stop-button + error-SSE handling.
         """
+        global _LAST_USER_TURN_TS
+        _LAST_USER_TURN_TS = time.time()   # see its module-level docstring: the tool probe reads this
         _prepare_capture_baseline(sid)
         final = self._send_and_stream_once(msg, stream_out=stream_out)
         if final is not None and _looks_like_consent(final):
@@ -3460,6 +3473,143 @@ def _find_or_open_agent(ctx):
     raise SystemExit("No agent page. Set MCP_IMPL_AGENT_URL in .env or open an agent tab in Edge.")
 
 
+# ── tool-call self-probe (idle-only, opt-out) ───────────────────────────────────────────────
+# See tools/tool_probe.py's module docstring for the full incident: FleetCockpit's health strip
+# probes :9222 (the FLEET Edge) and :8000/tunnel but NEVER verifies that THIS bridge's agent
+# (Edge profile copilot-bridge-edge, CDP :9223) can actually CALL an MCP tool end-to-end -- so a
+# stale connector consent or dead CDP session here silently kills tool calls while every cockpit
+# dot stays green. This sends a tiny synthetic probe turn through DRIVER.send/wait_for_idle/
+# read_last_response -- the SAME CopilotWebDriver instance (module-global DRIVER) and SAME
+# send/read primitives _send_and_stream_once ultimately drives, so no new page or CDP connection
+# is opened, and no click/consent logic is reimplemented. Runs ONLY when idle (see PAGE_LOCK
+# try-acquire and _LAST_USER_TURN_TS check below), never inside a real user turn.
+
+# 0 disables the probe entirely (opt-out); default 600s (10 min) matches the module docstring.
+MCP_TOOL_PROBE_SEC = float(os.environ.get("MCP_TOOL_PROBE_SEC", "600"))
+# Never fire within this many seconds of a real user/goal turn (_LAST_USER_TURN_TS, stamped by
+# _run_one_turn) -- a probe must not compete with, or be mistaken for, live work, and must not
+# burn the user's agent context while they are actively using the bridge.
+TOOL_PROBE_MIN_IDLE_SEC = 30.0
+# How long to wait for the probe turn to settle before treating it as a "timeout" outcome --
+# short on purpose (this is a tiny list_directory call, not a real task) so a wedged probe can
+# never hold PAGE_LOCK for long.
+TOOL_PROBE_TIMEOUT_SEC = 180
+
+# Desktop path resolved at runtime (same construction relay/edge_reconnect.py's DEFAULT_PROBE
+# uses) so the probe instruction works for any user, not just the one who wrote this file.
+_TOOL_PROBE_DESKTOP_DIR = os.path.join(
+    os.environ.get("USERPROFILE", os.path.expanduser("~")), "Desktop").replace("\\", "/")
+# The probe instruction: forces a real call_tool(list_directory) round-trip and asks the agent
+# to emit tool_probe.PROBE_OK_TOKEN as the LAST line ONLY on success, so a canned/no-connector
+# reply or a consent card (neither of which would emit the token) is distinguishable from a
+# genuine tool-backed answer by tools.tool_probe.classify_probe_reply.
+TOOL_PROBE_INSTRUCTION = (
+    "システム自己診断です。call_tool 経由で list_directory を使い "
+    + _TOOL_PROBE_DESKTOP_DIR + " 直下の項目数を数えてください。\n"
+    "list_directory の呼び出しに成功した場合のみ、回答の最後の行に次のトークンだけを"
+    "正確に出力してください: " + tool_probe.PROBE_OK_TOKEN + "\n"
+    "ツールが呼び出せない、接続確認が必要、エラーが起きた等、成功以外の場合はこの"
+    "トークンを絶対に出力しないでください。"
+)
+
+_TOOL_PROBE_TIMER = None  # the pending threading.Timer, so _schedule_tool_probe can re-arm it
+
+
+def _do_tool_probe_turn():
+    """Runs ON the page-owner thread (via run_on_page_thread -- see PageExecutor's docstring
+    for why Playwright calls must run there). Sends TOOL_PROBE_INSTRUCTION through the SAME
+    module-global DRIVER a real turn uses and reads back the reply. Returns
+    (agent_loaded, reply_text, timed_out). Never raises: a driver/page exception mid-probe is
+    folded into (True, "", False) -- agent_loaded stays True because the composer check above
+    it already passed, so classify_probe_reply naturally resolves this to kind="error" rather
+    than the misleading "agent_unreachable" (which is reserved for the composer never having
+    rendered at all)."""
+    agent_loaded = False
+    try:
+        agent_loaded = PAGE is not None and PAGE.locator(COPILOT_SELECTORS["composer"]).count() > 0
+    except Exception:
+        agent_loaded = False
+    if not agent_loaded:
+        return False, "", False
+    try:
+        DRIVER.send(TOOL_PROBE_INSTRUCTION)
+        idle_ok = DRIVER.wait_for_idle(timeout_s=TOOL_PROBE_TIMEOUT_SEC)
+        reply = DRIVER.read_last_response() or ""
+        return True, reply, (not idle_ok)
+    except Exception:
+        logger.warning("tool probe: turn raised on the page thread", exc_info=True)
+        return True, "", False
+
+
+def _run_tool_probe():
+    """Idle-only self-probe entry point, called from the self-re-arming timer in
+    _schedule_tool_probe(). Skips silently (no page touch, no record) if disabled, if a real
+    user/goal turn happened recently, or if PAGE_LOCK is currently held by one -- reusing the
+    EXACT SAME PAGE_LOCK try-acquire guard /stream and /goal already use (see PAGE_LOCK's
+    module docstring), so this can never collide with a real user message. Exception-guarded
+    end to end: a probe failure must never crash the bridge or stop future probes from being
+    scheduled (see _schedule_tool_probe's finally-based re-arm)."""
+    try:
+        if MCP_TOOL_PROBE_SEC <= 0:
+            return  # opt-out
+        since_user = time.time() - _LAST_USER_TURN_TS
+        if since_user < TOOL_PROBE_MIN_IDLE_SEC:
+            logger.debug("tool probe: skipped (user turn %.0fs ago)", since_user)
+            return
+        if PAGE is None:
+            # Startup not finished yet (or _page_main never got there) -- report this directly
+            # instead of calling run_on_page_thread, which would block this timer thread
+            # forever if the page-owner thread never reaches PAGE_EXECUTOR.run_forever().
+            tool_probe.record_probe(False, "agent_unreachable", detail="PAGE not initialized")
+            logger.info("tool probe: agent_unreachable (PAGE not initialized)")
+            return
+        if not PAGE_LOCK.acquire(blocking=False):
+            logger.debug("tool probe: skipped (page busy)")
+            return
+        try:
+            agent_loaded, reply, timed_out = run_on_page_thread(_do_tool_probe_turn)
+        finally:
+            PAGE_LOCK.release()
+        if timed_out:
+            tool_probe.record_probe(False, "timeout", detail=(reply or "")[:200])
+            logger.info("tool probe: timeout")
+            return
+        ok, kind = tool_probe.classify_probe_reply(reply, agent_loaded)
+        tool_probe.record_probe(ok, kind, detail=(reply or "")[:200])
+        logger.info("tool probe: ok=%s kind=%s", ok, kind)
+    except Exception:
+        logger.warning("tool probe: _run_tool_probe raised", exc_info=True)
+        try:
+            tool_probe.record_probe(False, "error", detail="probe driver raised")
+        except Exception:
+            pass
+
+
+def _schedule_tool_probe():
+    """Self-re-arming threading.Timer: run _run_tool_probe(), then -- regardless of outcome --
+    schedule the NEXT run MCP_TOOL_PROBE_SEC later, for as long as the process is alive. A
+    one-shot Timer chained via its own callback (not a persistent daemon loop thread), matching
+    _schedule_force_rehide's pattern elsewhere in this file. daemon=True so it never blocks
+    process exit. Disabled entirely (never even arms once) when MCP_TOOL_PROBE_SEC<=0, so
+    setting it to 0 truly opts out -- no timer, no probe turn, ever."""
+    global _TOOL_PROBE_TIMER
+    if MCP_TOOL_PROBE_SEC <= 0:
+        logger.info("tool probe: disabled (MCP_TOOL_PROBE_SEC<=0)")
+        return
+
+    def _tick():
+        try:
+            _run_tool_probe()
+        except Exception:
+            logger.warning("tool probe: _tick raised", exc_info=True)
+        finally:
+            _schedule_tool_probe()   # re-arm regardless of outcome -- keeps probing forever
+
+    _TOOL_PROBE_TIMER = threading.Timer(MCP_TOOL_PROBE_SEC, _tick)
+    _TOOL_PROBE_TIMER.daemon = True
+    _TOOL_PROBE_TIMER.start()
+
+
 class _SingleBindHTTPServer(ThreadingMixIn, HTTPServer):
     """ThreadingHTTPServer (via ThreadingMixIn) that REFUSES to double-bind, combining BOTH
     concurrency requirements this bridge needs:
@@ -3607,6 +3757,11 @@ def main():
     # no separate "ready" event is needed because do_GET's first PAGE access is always via
     # run_on_page_thread, which is a no-op-until-queued blocking call.
     PAGE_EXECUTOR.start(lambda: _page_main(cdp, fresh))
+    # Arm the idle tool-call self-probe AFTER the page-owner thread has been started (so PAGE
+    # exists, or is about to, by the time the first tick fires MCP_TOOL_PROBE_SEC from now --
+    # see "tool-call self-probe" section above _SingleBindHTTPServer). No-ops entirely when
+    # MCP_TOOL_PROBE_SEC<=0 (opt-out).
+    _schedule_tool_probe()
     # THREADED (via ThreadingMixIn in _SingleBindHTTPServer) so a long /goal run cannot
     # block /send (steering) or /stop from getting through. Playwright sync objects are
     # still not thread-safe -- PageExecutor (module-level PAGE_EXECUTOR) is the single
