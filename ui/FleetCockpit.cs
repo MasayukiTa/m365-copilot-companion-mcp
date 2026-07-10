@@ -229,18 +229,24 @@ class CockpitWindow : Window
     Dictionary<string, int> _autoRetryCount = new Dictionary<string, int>();
 
     // ── P0 HEALTH STRIP ─────────────────────────────────────────────────────────────
-    // Five infra dots (Server/Tunnel/Edge/Sign-in/Agent) in the header, always visible,
+    // Six infra dots (Server/Tunnel/Edge/Sign-in/Agent/Tool) in the header, always visible,
     // polled every ~15s on a background thread and marshaled to the UI via Dispatcher.
     // Colors: "green"|"red"|"yellow"|"gray". The motivating incident: the companion Edge
     // session died -> login wall -> agent fell back to default Copilot; the cockpit only
     // showed failing tasks. These dots make the infra cause glanceable and one-click fixable.
+    // The 6th dot (Tool) is a DIFFERENT axis from the first 5: dots 0-4 all probe the FLEET
+    // Edge (:9222) / server / tunnel, none of which tell you whether the INTERACTIVE bridge
+    // chat (Edge profile copilot-bridge-edge, CDP :9223) can actually call an MCP tool. Tool
+    // reads .fleet\tool_probe.json, written by the bridge's own idle self-probe (a separate
+    // component -- bridge/copilot_bridge.py + tools/tool_probe.py -- this file only reads it).
     enum HealthState { Gray = 0, Green = 1, Yellow = 2, Red = 3 }
     class DotState { public HealthState State = HealthState.Gray; public string Detail = ""; public DateTime Checked = DateTime.MinValue; }
-    // Index map: 0=server 1=tunnel 2=edge 3=signin 4=agent.
-    readonly DotState[] _health = { new DotState(), new DotState(), new DotState(), new DotState(), new DotState() };
+    // Index map: 0=server 1=tunnel 2=edge 3=signin 4=agent 5=tool(bridge probe).
+    readonly DotState[] _health = { new DotState(), new DotState(), new DotState(), new DotState(), new DotState(), new DotState() };
     readonly object _healthLock = new object();
-    Border[] _healthDot;           // the 5 colored dots (re-tinted by ApplyHealthToUi)
-    TextBlock[] _healthLbl;        // the 5 labels (re-textable on language toggle)
+    const int HEALTH_DOT_COUNT = 6;
+    Border[] _healthDot;           // the 6 colored dots (re-tinted by ApplyHealthToUi)
+    TextBlock[] _healthLbl;        // the 6 labels (re-textable on language toggle)
     Border[] _healthDotWrap;       // per-dot wrapper (tooltip host)
     Button _fixBtn;                // the 「直す」/Fix button (shown only when a dot is red/yellow)
     TextBlock _fixNote;            // inline progress/toast text in the strip
@@ -248,6 +254,7 @@ class CockpitWindow : Window
     Thread _healthThread;
     volatile bool _healthStop = false;
     volatile bool _fixRunning = false;   // guard: never run two fixes at once
+    volatile bool _bridgeReconnectRunning = false;   // guard: manual "Reconnect chat" button, never two at once
     string _agentMarkerId = "";    // T_.../P_... id extracted from the configured agent URL (.env)
     volatile bool _startAllLaunched = false;   // reentry guard for RunStartAll (per-cooldown, not per-app-run only)
     double _startAllLastUnix = 0.0;            // NowUnix() at last RunStartAll launch; 120s cooldown
@@ -454,6 +461,27 @@ class CockpitWindow : Window
         if (k == "clear_history") return ja ? "履歴を空にする" : "Clear history";
         // FIX D: same lightweight toast wording for both the autoscale-ON and autoscale-OFF apply paths.
         if (k == "maxtabs_toast_prefix") return ja ? "最大タブ →" : "Max tabs ->";
+        // ── 6th health dot "Tool": bridge self-probe (.fleet/tool_probe.json), see the class-field
+        // comment near HEALTH_DOT_COUNT for what this axis covers and why it's separate from Agent.
+        if (k == "hs_tool") return ja ? "ツール" : "Tool";
+        if (k == "hs_tool_detail_ok") return ja ? "ツール呼び出し確認 OK" : "tool call confirmed OK";
+        if (k == "hs_tool_detail_consent") return ja ? "consent待ち（再接続で解消可）" : "consent pending (reconnect can clear this)";
+        if (k == "hs_tool_detail_down") return ja ? "応答なし(再接続が必要)" : "no response (reconnect needed)";
+        if (k == "hs_tool_detail_stale") return ja ? "自己診断が実行されていません" : "self-probe hasn't run recently";
+        if (k == "hs_tool_detail_none") return ja ? "自己診断は未設定(機能無効)" : "self-probe not configured (feature off)";
+        // Bridge-targeted Fix tier (RunFix priority 5) + the always-available manual button.
+        if (k == "hs_fix_bridge") return ja ? "チャットのブリッジを再接続しています…" : "Reconnecting the chat bridge…";
+        if (k == "hs_fix_bridge_ok") return ja ? "ブリッジの再接続に成功しました" : "Bridge reconnect succeeded";
+        if (k == "hs_fix_bridge_fail") return ja ? "ブリッジの再接続に失敗（手動確認が必要）" : "Bridge reconnect failed (needs manual check)";
+        if (k == "set_chat_section") return ja ? "チャット" : "Chat";
+        if (k == "reconnect_chat") return ja ? "チャット再接続" : "Reconnect chat";
+        if (k == "reconnect_chat_hint") return ja ? "対話チャット(ブリッジ :9223)のMCP接続を再接続します" : "Reconnect the interactive chat bridge's MCP connection (:9223)";
+        if (k == "reconnect_chat_toast_start") return ja ? "チャット再接続中…" : "Reconnecting chat…";
+        if (k == "reconnect_chat_toast_ok") return ja ? "チャット再接続に成功しました" : "Chat reconnect succeeded";
+        if (k == "reconnect_chat_toast_fail") return ja ? "チャット再接続に失敗しました（手動確認が必要）" : "Chat reconnect failed (needs manual check)";
+        if (k == "reconnect_chat_toast_dead") return ja
+            ? "エージェントが読み込まれませんでした。次を実行してください: powershell -File scripts\\start_bridge.ps1 -HardReset -Keepalive"
+            : "Agent did not load. Run: powershell -File scripts\\start_bridge.ps1 -HardReset -Keepalive";
         return k;
     }
     string StatusLabel(string s)
@@ -1061,21 +1089,21 @@ class CockpitWindow : Window
     // a SEPARATE grid column (col 1).
     UIElement BuildHealthStrip()
     {
-        _healthDot = new Border[5];
-        _healthLbl = new TextBlock[5];
-        _healthDotWrap = new Border[5];
+        _healthDot = new Border[HEALTH_DOT_COUNT];
+        _healthLbl = new TextBlock[HEALTH_DOT_COUNT];
+        _healthDotWrap = new Border[HEALTH_DOT_COUNT];
 
         _healthStrip = new Border();
         _healthStrip.HorizontalAlignment = HorizontalAlignment.Left;   // flush to the header's left edge
         _healthStrip.VerticalAlignment = VerticalAlignment.Center;
         _healthStrip.Margin = new Thickness(0, 0, 12, 0);
 
-        // Single horizontal row: [dot label] x5, then the inline Fix pill, then the inline note.
+        // Single horizontal row: [dot label] x6, then the inline Fix pill, then the inline note.
         var row = new StackPanel { Orientation = Orientation.Horizontal,
                                    HorizontalAlignment = HorizontalAlignment.Left,
                                    VerticalAlignment = VerticalAlignment.Center };
-        string[] keys = { "hs_server", "hs_tunnel", "hs_edge", "hs_signin", "hs_agent" };
-        for (int i = 0; i < 5; i++)
+        string[] keys = { "hs_server", "hs_tunnel", "hs_edge", "hs_signin", "hs_agent", "hs_tool" };
+        for (int i = 0; i < HEALTH_DOT_COUNT; i++)
         {
             var wrap = new Border();
             wrap.Margin = new Thickness(i == 0 ? 0 : 8, 0, 0, 0);
@@ -1168,11 +1196,11 @@ class CockpitWindow : Window
     {
         if (_healthDot == null) return;
         bool anyBad = false;
-        DotState[] snap = new DotState[5];
+        DotState[] snap = new DotState[HEALTH_DOT_COUNT];
         lock (_healthLock)
-            for (int i = 0; i < 5; i++)
+            for (int i = 0; i < HEALTH_DOT_COUNT; i++)
                 snap[i] = new DotState { State = _health[i].State, Detail = _health[i].Detail, Checked = _health[i].Checked };
-        for (int i = 0; i < 5; i++)
+        for (int i = 0; i < HEALTH_DOT_COUNT; i++)
         {
             if (_healthDot[i] != null) _healthDot[i].Background = HealthBrush(snap[i].State);
             if (snap[i].State == HealthState.Red || snap[i].State == HealthState.Yellow) anyBad = true;
@@ -1199,7 +1227,7 @@ class CockpitWindow : Window
         if (!anyBad && !_fixRunning && _fixNote != null && _fixNote.Text.Length > 0)
             _fixNote.Text = "";
     }
-    static readonly string[] _healthKeys = { "hs_server", "hs_tunnel", "hs_edge", "hs_signin", "hs_agent" };
+    static readonly string[] _healthKeys = { "hs_server", "hs_tunnel", "hs_edge", "hs_signin", "hs_agent", "hs_tool" };
 
     // Start (once) the background poll thread. Re-entrant-safe: only spawns if not already alive.
     // BuildChrome (and RebuildChrome) call this; a language flip rebuilds chrome but the thread keeps
@@ -1286,6 +1314,11 @@ class CockpitWindow : Window
         SetDot(2, edgeOk ? HealthState.Green : HealthState.Red,
                T(edgeOk ? "hs_edge_detail_ok" : "hs_edge_detail_bad"), now);
 
+        // 5) Tool: independent of the fleet Edge (:9222) probed above -- this reads the BRIDGE's
+        //    own idle self-probe result (.fleet/tool_probe.json). Runs unconditionally (not gated
+        //    on edgeOk) because it reflects a completely separate Edge profile/CDP port (:9223).
+        PollToolProbeOnce(now);
+
         // 3+4) Sign-in + Agent both derive from the tab list (:9222/json). If Edge is down,
         //      sign-in is unknown (gray) and agent is gray.
         if (!edgeOk)
@@ -1332,6 +1365,55 @@ class CockpitWindow : Window
         if (string.IsNullOrEmpty(s)) return false;
         foreach (string m in _cannedNonAnswer) if (s.IndexOf(m, StringComparison.OrdinalIgnoreCase) >= 0) return true;
         return false;
+    }
+
+    // 5) Tool: read the bridge's self-probe result, written independently by another component
+    // (bridge/copilot_bridge.py + tools/tool_probe.py) roughly every ~10 min. This file only READS
+    // it -- never writes .fleet/tool_probe.json. Shape: {"ts":<epoch float>,"ok":<bool>,
+    // "kind":"answer"|"consent_card"|"canned_fallback"|"timeout"|"agent_unreachable"|"error",
+    // "detail":<str>}.
+    //   GRAY  -- file has never existed (probe disabled / MCP_TOOL_PROBE_SEC=0 on this machine).
+    //            Deliberately NOT red: a new/unconfigured feature must never read as an outage.
+    //   RED   -- file missing after having looked (can't happen here since we check Exists first,
+    //            kept as a safety fallback) OR stale (>20 min since ts -- the probe itself isn't
+    //            running) OR kind is timeout/agent_unreachable/error (probe ran and failed).
+    //   GREEN -- ok==true AND fresh (<20 min old).
+    //   YELLOW-- kind is consent_card/canned_fallback -- actionable, "Reconnect chat" can fix it.
+    void PollToolProbeOnce(DateTime now)
+    {
+        string path = Path.Combine(RepoRoot(), ".fleet", "tool_probe.json");
+        if (!File.Exists(path)) { SetDot(5, HealthState.Gray, T("hs_tool_detail_none"), now); return; }
+        try
+        {
+            var o = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
+            double ts = (o != null && o.ContainsKey("ts")) ? Convert.ToDouble(o["ts"]) : 0.0;
+            bool ok = (o != null && o.ContainsKey("ok")) && Convert.ToBoolean(o["ok"]);
+            string kind = (o != null && o.ContainsKey("kind")) ? Convert.ToString(o["kind"]) : "";
+            double ageMin = ts > 0 ? (NowUnix() - ts) / 60.0 : double.MaxValue;
+            string ageTxt = ts > 0 ? AgeMinutesText(ageMin) : T("hs_never");
+            if (ageMin >= 20.0)
+                SetDot(5, HealthState.Red, ageTxt + " " + T("hs_tool_detail_stale"), now);
+            else if (ok)
+                SetDot(5, HealthState.Green, ageTxt + " " + T("hs_tool_detail_ok"), now);
+            else if (kind == "consent_card" || kind == "canned_fallback")
+                SetDot(5, HealthState.Yellow, ageTxt + " " + T("hs_tool_detail_consent"), now);
+            else   // timeout | agent_unreachable | error | unrecognized kind
+                SetDot(5, HealthState.Red, ageTxt + " " + T("hs_tool_detail_down"), now);
+        }
+        catch (Exception)
+        {
+            // Malformed/partial JSON (e.g. read mid-write by the bridge) -- treat as down, not gray,
+            // since the file DOES exist (the feature is active, just unreadable right now).
+            SetDot(5, HealthState.Red, T("hs_tool_detail_down"), now);
+        }
+    }
+
+    // "N分前" / "N min ago" -- small formatter local to the Tool dot's tooltip; not routed through
+    // T() because it embeds a number (T() keys are static lookups, no interpolation).
+    string AgeMinutesText(double ageMin)
+    {
+        int m = (int)Math.Max(0, Math.Round(ageMin));
+        return (_lang == 0) ? (m + "分前") : (m + " min ago");
     }
 
     // Read the newest .fleet\transcripts\*.jsonl and return the text of its last assistant turn,
@@ -1570,11 +1652,11 @@ class CockpitWindow : Window
     {
         if (_fixRunning) return;
         // Decide the worst problem from the current cache (UI thread).
-        HealthState signin, edge, agent, server, tunnel;
+        HealthState signin, edge, agent, server, tunnel, tool;
         lock (_healthLock)
         {
             server = _health[0].State; tunnel = _health[1].State; edge = _health[2].State;
-            signin = _health[3].State; agent = _health[4].State;
+            signin = _health[3].State; agent = _health[4].State; tool = _health[5].State;
         }
         _fixRunning = true;
         ApplyHealthToUi();   // disable + keep the button visible
@@ -1653,8 +1735,78 @@ class CockpitWindow : Window
             return;
         }
 
+        // Priority 5: Tool RED/YELLOW (bridge-side problem -- the interactive chat's own MCP
+        // connector, NOT the fleet Edge above) -> reconnect the BRIDGE specifically, i.e. target
+        // :9223 (copilot-bridge-edge) instead of the :9222 fleet Edge Priority 3 above already
+        // handles. This is a SEPARATE remedy path (:9222 reconnect above is untouched/still runs
+        // for its own condition) because a healthy fleet Edge tells you nothing about the bridge.
+        if (tool == HealthState.Red || tool == HealthState.Yellow)
+        {
+            note(T("hs_fix_bridge"));
+            var t = new Thread(new ThreadStart(delegate
+            {
+                try
+                {
+                    string stdoutText;
+                    int code = RunReconnect(repo, "http://127.0.0.1:9223", out stdoutText);
+                    if (code == 0) note(T("hs_fix_bridge_ok"));
+                    else if (AgentDidNotLoad(stdoutText)) note(T("reconnect_chat_toast_dead"));
+                    else note(T("hs_fix_bridge_fail"));
+                }
+                catch (Exception ex) { note(T("hs_fix_err") + ": " + ex.Message); }
+                finally { done(); }
+            })) { IsBackground = true };
+            t.Start();
+            return;
+        }
+
         // Nothing actionable (all green/gray) -> clear the running flag.
         done();
+    }
+
+    // ── Manual "チャット再接続"/"Reconnect chat" button (settings panel) ──────────────────
+    // ALWAYS available, independent of the Tool dot's state (which may be GRAY on a machine
+    // where the bridge self-probe feature isn't active yet, or the user may just want to force
+    // it). Fires the same bridge-targeted (:9223) reconnect as RunFix's Priority 5 tier, but on
+    // demand. Exception-guarded throughout; every UI touch is Dispatcher-marshaled so nothing can
+    // throw into the UI thread. Reuses ShowScaleToast -- the cockpit's existing lightweight toast
+    // -- for the optimistic "reconnecting…" message and the outcome (mirrors the steer-ack toast
+    // pattern at "steer_collapsed_ack").
+    void RunBridgeReconnectManual()
+    {
+        if (_bridgeReconnectRunning) return;
+        _bridgeReconnectRunning = true;
+        if (_reconnectChatBtn != null) _reconnectChatBtn.IsEnabled = false;
+        try { ShowScaleToast(T("reconnect_chat_toast_start")); } catch (Exception) { }
+
+        string repo = RepoRoot();
+        var t = new Thread(new ThreadStart(delegate
+        {
+            string outcome;
+            try
+            {
+                string stdoutText;
+                int code = RunReconnect(repo, "http://127.0.0.1:9223", out stdoutText);
+                outcome = code == 0 ? T("reconnect_chat_toast_ok")
+                        : AgentDidNotLoad(stdoutText) ? T("reconnect_chat_toast_dead")
+                        : T("reconnect_chat_toast_fail");
+            }
+            catch (Exception) { outcome = T("reconnect_chat_toast_fail"); }
+            try
+            {
+                if (!Dispatcher.HasShutdownStarted)
+                    Dispatcher.BeginInvoke(new Action(delegate
+                    {
+                        _bridgeReconnectRunning = false;
+                        if (_reconnectChatBtn != null) _reconnectChatBtn.IsEnabled = true;
+                        try { ShowScaleToast(outcome); } catch (Exception) { }
+                    }));
+                else
+                    _bridgeReconnectRunning = false;
+            }
+            catch (Exception) { _bridgeReconnectRunning = false; }
+        })) { IsBackground = true };
+        t.Start();
     }
 
     // Launch a PowerShell script windowless + async; wait for exit inside the caller's worker thread.
@@ -1677,23 +1829,47 @@ class CockpitWindow : Window
         }
     }
 
+    // edge_reconnect.py prints this exact marker (main(), the "not res.get('agent_loaded')" branch)
+    // when the deep-link fell back to default Copilot -- a heavier remedy (start_bridge.ps1
+    // -HardReset) is needed, a plain reconnect can't fix it. Checked against captured stdout.
+    static bool AgentDidNotLoad(string stdoutText)
+    {
+        return !string.IsNullOrEmpty(stdoutText)
+            && stdoutText.IndexOf("AGENT DID NOT LOAD", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
     // Run  <repo>\.venv\Scripts\python.exe -m relay.edge_reconnect  and capture the exit code.
+    // Original (fleet Edge :9222, default inside edge_reconnect.py) call shape -- unchanged, still
+    // used by RunFix's Priority 3 (Agent YELLOW) tier above.
     int RunReconnect(string repo)
+    {
+        string dump;
+        return RunReconnect(repo, null, out dump);
+    }
+
+    // Same as above but targets a SPECIFIC CDP endpoint (--cdp-url) instead of edge_reconnect.py's
+    // :9222 default, and returns the captured stdout so callers can look for edge_reconnect.py's
+    // "AGENT DID NOT LOAD" marker (printed when the deep-link fell back to default Copilot --
+    // the case where a lighter reconnect can't help and start_bridge.ps1 -HardReset is needed).
+    // cdpUrl == null keeps edge_reconnect.py's own default (:9222); pass "http://127.0.0.1:9223"
+    // to target the interactive BRIDGE profile instead.
+    int RunReconnect(string repo, string cdpUrl, out string stdoutText)
     {
         string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
         if (!File.Exists(py)) py = "python";
         var psi = new System.Diagnostics.ProcessStartInfo();
         psi.FileName = py;
-        psi.Arguments = "-m relay.edge_reconnect";
+        psi.Arguments = "-m relay.edge_reconnect" + (string.IsNullOrEmpty(cdpUrl) ? "" : " --cdp-url " + cdpUrl);
         psi.WorkingDirectory = repo;
         psi.UseShellExecute = false;
         psi.CreateNoWindow = true;
         psi.RedirectStandardOutput = true;
         psi.RedirectStandardError = true;
         try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+        stdoutText = "";
         using (var p = System.Diagnostics.Process.Start(psi))
         {
-            try { p.StandardOutput.ReadToEnd(); } catch (Exception) { }
+            try { stdoutText = p.StandardOutput.ReadToEnd(); } catch (Exception) { }
             try { p.StandardError.ReadToEnd(); } catch (Exception) { }
             try { if (!p.WaitForExit(600000)) return -1; } catch (Exception) { return -1; }
             try { return p.ExitCode; } catch (Exception) { return -1; }
@@ -3860,6 +4036,28 @@ class CockpitWindow : Window
         var hint = new TextBlock(); hint.Text = T("disk_floor_hint"); hint.Foreground = Muted;
         hint.FontSize = 10.5; hint.TextWrapping = TextWrapping.Wrap; hint.Margin = new Thickness(0, 0, 0, 2);
         col.Children.Add(hint);
+
+        // ── Chat: always-available manual bridge reconnect. Unlike the Fix button (only shown
+        // when a dot is red/yellow), this fires on demand regardless of the Tool dot's state --
+        // it may be GRAY (self-probe feature not yet active on this machine) or the user may just
+        // want to force a reconnect without waiting for the next probe cycle. Warning-outline pill,
+        // matching the visual language the inline Fix pill already uses for repair actions.
+        col.Children.Add(SectionHeader(T("set_chat_section")));
+        _reconnectChatBtn = new Button();
+        _reconnectChatBtn.Content = T("reconnect_chat");
+        _reconnectChatBtn.FontSize = 12; _reconnectChatBtn.FontWeight = FontWeights.SemiBold;
+        _reconnectChatBtn.Cursor = Cursors.Hand; _reconnectChatBtn.BorderThickness = new Thickness(1);
+        _reconnectChatBtn.Padding = new Thickness(10, 4, 10, 4);
+        _reconnectChatBtn.HorizontalAlignment = HorizontalAlignment.Left;
+        _reconnectChatBtn.Margin = new Thickness(0, 2, 0, 4);
+        _reconnectChatBtn.Template = FlatButtonTemplate();
+        _reconnectChatBtn.Background = Brushes.Transparent;
+        _reconnectChatBtn.Foreground = Theme.Br(Theme.Warning(_dark));
+        _reconnectChatBtn.BorderBrush = Theme.Br(Theme.Warning(_dark));
+        _reconnectChatBtn.ToolTip = T("reconnect_chat_hint");
+        System.Windows.Automation.AutomationProperties.SetName(_reconnectChatBtn, T("reconnect_chat"));
+        _reconnectChatBtn.Click += delegate { RunBridgeReconnectManual(); };
+        col.Children.Add(_reconnectChatBtn);
 
         // ── 表示サイズ / UI scale: [自動 ▸] then [−] [自動 (130%)] [+] (step 0.1, live-apply + persist) ──
         // Auto toggle keeps a CONSTANT physical size across monitors (target/monitorScale). When Auto is
@@ -6330,6 +6528,8 @@ class CockpitWindow : Window
     TextBlock _toolbarNote;
     Button _autoRetryBtn;
     TextBlock _autoRetryCapVal;
+    Button _reconnectChatBtn;   // settings-panel "チャット再接続"/"Reconnect chat" -- always available,
+                                 // regardless of the Tool dot's state (see RunBridgeReconnectManual).
 
     // ON => calm success-tinted chip (AccentSoft bg with Success border + text); OFF => neutral muted.
     // Accent fill is reserved exclusively for the primary Start action; this is a status toggle chip.
