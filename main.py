@@ -115,6 +115,7 @@ from tools.search_web import web_search, web_search_news
 from tools.sql_ops import sqlite_query, sqlite_schema, sqlite_tables, sqlite_to_excel
 from tools.watcher_ops import watcher_events, watcher_start, watcher_stop
 from tools.auth_stats import get_summary as _auth_stats_summary
+from tools.tool_probe import get_summary as _tool_probe_summary
 from tools.jobs import (
     job_kill,
     job_list,
@@ -190,6 +191,7 @@ async def health(_request: Request) -> JSONResponse:
     raises, so this can't turn a healthy-loop probe into a 500."""
     payload = {"status": "ok"}
     payload.update(_auth_stats_summary())
+    payload.update(_tool_probe_summary())
     return JSONResponse(payload)
 
 
