@@ -29,6 +29,7 @@ import os
 import queue
 import re
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -277,6 +278,7 @@ from relay.copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver, P
 # drift apart on what counts as a consent card. See relay_fleet.py CONSENT_MARKERS (~line 90).
 from relay.relay_fleet import CONSENT_MARKERS
 from bridge import session_store as S
+from bridge import review_command
 # tool_probe is stdlib-only (see its module docstring) -- cheap to import here regardless of
 # the heavy relay chain already loaded above. Used by the idle tool-call self-probe, see the
 # "tool-call self-probe" section near the bottom of this file.
@@ -308,7 +310,9 @@ HELP_TEXT = (
     "## 使えるスラッシュコマンド\n\n"
     "### 委譲コマンド（別エージェントへ委譲・数分）\n"
     "- `/research <調べたいこと>` — M365 リサーチ ツールを **Claude (Anthropic)** に切替えて deep research（確認→承認→本実行、数分）。`/deepresearch` `/dr` も同じ。\n"
-    "- `/analyze <ファイルの絶対パス> | <分析指示>` — アナリストにデータファイルを渡して分析（数値は鵜呑みにせず自分でも確かめて）。`/an` も同じ。\n\n"
+    "- `/analyze <ファイルの絶対パス> | <分析指示>` — アナリストにデータファイルを渡して分析（数値は鵜呑みにせず自分でも確かめて）。`/an` も同じ。\n"
+    "- `/review [diff|<path>]` — 無料フリートで全ファイル（または diff／指定パス）をレビューし要約を返す（数分〜）。\n"
+    "- `/security-review [diff|<path>]` — 同上、セキュリティ観点のレビュー。\n\n"
     "### プロンプトテンプレート（このエージェントが即応答・通常ストリーム）\n"
     "- `/summarize <文章/トピック>` — 要点を箇条書きで簡潔に要約。\n"
     "- `/translate <言語> <文章>` — 指定言語へ翻訳。\n"
@@ -2560,11 +2564,24 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if parsed.path == "/stream":
+            qs = urllib.parse.parse_qs(parsed.query)
+            msg = (qs.get("msg") or [""])[0]
+            # DELIBERATE PAGE_LOCK BYPASS: /review and /security-review shell out to
+            # bench/review_run.py, which fans its work out over the FREE M365 fleet on the
+            # SEPARATE :9222 Edge (relay.fleet_runner) -- it never touches this bridge's own
+            # PAGE/DRIVER (:9223). Routing a multi-minute review through
+            # run_on_page_thread + PAGE_LOCK would needlessly freeze every other /stream,
+            # /goal, and /history request behind it for the whole run, for no reason (there
+            # is no shared page state to protect). Handle it directly on this request
+            # thread instead, before the PAGE_LOCK acquire below.
+            _peek = msg.strip().lower()
+            if (_peek.startswith("/review") or _peek.startswith("/security-review")
+                    or _peek.startswith("/securityreview")):
+                self._review_stream(msg)
+                return
             if not PAGE_LOCK.acquire(blocking=False):
                 self._json({"ok": False, "error": "busy"}); return
             try:
-                qs = urllib.parse.parse_qs(parsed.query)
-                msg = (qs.get("msg") or [""])[0]
                 # PAGE-touching: _stream ends up calling _send_and_stream_once, which polls
                 # PAGE/DRIVER AND writes SSE chunks to self.wfile in the same loop -- so the
                 # whole call runs on the page-owner thread (see PageExecutor's docstring for
@@ -2936,6 +2953,14 @@ class Handler(BaseHTTPRequestHandler):
             self._delegate("researcher", arg); return
         if token in ("analyze", "an"):
             self._delegate("analyst", arg); return
+        if token in ("review", "security-review", "securityreview"):
+            # Defensive fallback only: the normal entry point is do_GET's /stream peek,
+            # which calls _review_stream directly (bypassing PAGE_LOCK) before ever reaching
+            # _command. This branch only fires if some other caller routes a review command
+            # through _command/_stream instead -- it must not double-dispatch with the
+            # do_GET peek, which always returns before falling through to _stream/_command.
+            self._review_stream(cmd if cmd.startswith("/") else "/" + cmd)
+            return
         if token in PROMPT_TEMPLATES:           # prompt-template -> normal streaming path
             usage, build = PROMPT_TEMPLATES[token]
             if not arg.strip():
@@ -3005,6 +3030,103 @@ class Handler(BaseHTTPRequestHandler):
         # multi-step tasks after the first tool result. Slash / prompt-template commands keep
         # their own framing and are NOT wrapped.
         self._stream_text(BRIDGE_DISCIPLINE + msg)
+
+    def _review_stream(self, msg: str):
+        """Handle /review and /security-review: shell out to bench/review_run.py, which
+        fans the work out over the FREE M365 fleet on the separate :9222 Edge, and stream a
+        compact summary back into the chat once it finishes.
+
+        Called DIRECTLY from do_GET's /stream peek, on the request thread -- NOT via
+        run_on_page_thread, and NOT under PAGE_LOCK (see the bypass comment at that call
+        site). This method never touches PAGE/DRIVER; it only launches and reads a
+        subprocess, so it is safe to run concurrently with ordinary /stream, /goal, and
+        /history requests. Writes the SAME SSE preamble as _stream so the client side is
+        indistinguishable. Exception-guarded end-to-end: nothing here is allowed to raise
+        into the request thread.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        try:
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            venvpy = os.path.join(repo_root, ".venv", "Scripts", "python.exe")
+
+            if not os.path.exists(venvpy):
+                self._sse({"delta": ".venv python が見つかりません。quickstart.bat を実行してください。"})
+                self._sse({}, "done")
+                return
+
+            parsed = review_command.parse_review_command(msg)
+            argv = review_command.build_review_argv(parsed, repo_root, venvpy)
+
+            self._sse({"delta": "無料フリートでレビューを開始します（数分〜）...\n"})
+
+            proc = subprocess.Popen(
+                argv, cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace",
+            )
+
+            # Read the subprocess's stdout on a background thread so this thread can keep
+            # pinging the SSE connection (to detect an Esc/Stop disconnect promptly, exactly
+            # like _send_and_stream_once) even while review_run.py is silently working
+            # between print()s for minutes at a time.
+            line_q: "queue.Queue[str | None]" = queue.Queue()
+
+            def _reader():
+                try:
+                    for line in proc.stdout:
+                        line_q.put(line)
+                except Exception:
+                    pass
+                finally:
+                    line_q.put(None)   # sentinel: stdout closed / reader done
+
+            reader_thread = threading.Thread(target=_reader, daemon=True)
+            reader_thread.start()
+
+            forward_prefixes = ("fleet:", "launching", "goals:", "report:", "summary:")
+            full_lines = []
+            while True:
+                try:
+                    line = line_q.get(timeout=5.0)
+                except queue.Empty:
+                    self._ping()             # detect Esc/Stop disconnect promptly
+                    continue
+                if line is None:
+                    break
+                full_lines.append(line)
+                stripped = line.strip()
+                if stripped.lower().startswith(forward_prefixes):
+                    self._sse({"delta": stripped + "\n"})
+
+            proc.wait()
+            full_stdout = "".join(full_lines)
+
+            info = review_command.parse_run_output(full_stdout)
+            report_md = info.get("report_md")
+            agg_json = None
+            if report_md:
+                try:
+                    json_path = report_md[:-3] + ".json" if report_md.endswith(".md") \
+                        else report_md + ".json"
+                    with open(json_path, encoding="utf-8") as f:
+                        agg_json = json.load(f)
+                except Exception:
+                    agg_json = None
+
+            summary_text = review_command.format_review_summary(
+                parsed.get("kind", "review"), info.get("counts") or {}, agg_json, report_md,
+            )
+            self._sse({"delta": summary_text})
+            self._sse({}, "done")
+        except Exception as e:
+            try:
+                self._sse({"delta": "レビュー実行中にエラー: " + type(e).__name__})
+                self._sse({}, "done")
+            except Exception:
+                pass
 
     def _send_and_stream_once(self, msg: str, stream_out: bool = True) -> "str | None":
         """Send `msg`, stream the growing/settled answer over SSE (unless stream_out=False,
