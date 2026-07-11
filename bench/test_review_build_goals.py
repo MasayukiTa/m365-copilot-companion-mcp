@@ -1,0 +1,305 @@
+"""Hermetic unit tests for bench/review_build_goals.py.
+
+Drives enumerate_files against a REAL tmp `git init` repo fixture (no network, no shared
+state) -- that is the one required impurity the module has, per its own docstring.
+
+  .venv\\Scripts\\python.exe -m pytest bench/test_review_build_goals.py -q
+"""
+import json
+import os
+import subprocess
+
+import pytest
+
+from bench.review_build_goals import (
+    BINARY_EXTS,
+    FINDINGS_BEGIN,
+    FINDINGS_END,
+    REVIEW_RUBRIC,
+    SECURITY_RUBRIC,
+    build_review_goal,
+    enumerate_files,
+    group_files,
+    main,
+    write_goals_jsonl,
+)
+
+
+def _run(cmd, cwd):
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, "cmd %r failed: %s\n%s" % (cmd, r.stdout, r.stderr)
+    return r
+
+
+def _init_repo(root):
+    _run(["git", "init"], root)
+    _run(["git", "config", "user.email", "fake@example.invalid"], root)
+    _run(["git", "config", "user.name", "Fake Tester"], root)
+
+
+def _write(root, rel, content="hello\n"):
+    full = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(full), exist_ok=True) if os.path.dirname(rel) else None
+    with open(full, "w", encoding="utf-8") as f:
+        f.write(content)
+    return full
+
+
+def _commit_all(root, msg="init"):
+    _run(["git", "add", "-A"], root)
+    _run(["git", "commit", "-m", msg], root)
+
+
+@pytest.fixture
+def repo(tmp_path):
+    root = str(tmp_path / "fakerepo")
+    os.makedirs(root, exist_ok=True)
+    _init_repo(root)
+    return root
+
+
+# --- enumerate_files: mode="all" ----------------------------------------------------------
+
+def test_enumerate_all_basic(repo):
+    _write(repo, "a.py", "print(1)\n")
+    _write(repo, "sub/b.py", "print(2)\n")
+    _commit_all(repo)
+
+    files = enumerate_files("all", repo)
+    assert files == sorted(["a.py", "sub/b.py"])
+
+
+def test_enumerate_all_excludes_binary_ext(repo):
+    _write(repo, "keep.py", "print(1)\n")
+    _write(repo, "asset.png", "not really png bytes but has the ext\n")
+    assert ".png" in BINARY_EXTS
+    _commit_all(repo)
+
+    files = enumerate_files("all", repo)
+    assert files == ["keep.py"]
+
+
+def test_enumerate_all_excludes_oversize(repo):
+    _write(repo, "small.py", "x = 1\n")
+    _write(repo, "big.py", "x = 1\n" * 100000)  # well over 200_000 bytes
+    _commit_all(repo)
+
+    files = enumerate_files("all", repo, max_bytes=200_000)
+    assert files == ["small.py"]
+
+    # a caller-supplied larger cap lets it back in
+    files2 = enumerate_files("all", repo, max_bytes=10_000_000)
+    assert files2 == sorted(["small.py", "big.py"])
+
+
+def test_enumerate_all_skips_deleted_file(repo):
+    """git ls-files only lists what's tracked at HEAD, so 'deleted' here means: tracked,
+    then removed from disk without `git rm` (mirrors a worktree with an in-flight delete
+    that hasn't been staged) -- enumerate_files must skip it instead of raising."""
+    _write(repo, "gone.py", "x = 1\n")
+    _write(repo, "stays.py", "x = 2\n")
+    _commit_all(repo)
+    os.remove(os.path.join(repo, "gone.py"))
+
+    files = enumerate_files("all", repo)
+    assert files == ["stays.py"]
+
+
+def test_enumerate_all_dedupes_and_sorts(repo):
+    _write(repo, "z.py")
+    _write(repo, "a.py")
+    _write(repo, "m.py")
+    _commit_all(repo)
+    files = enumerate_files("all", repo)
+    assert files == sorted(files)
+    assert len(files) == len(set(files))
+
+
+# --- enumerate_files: mode="diff" ---------------------------------------------------------
+
+def test_enumerate_diff_unstaged(repo):
+    _write(repo, "a.py", "one\n")
+    _write(repo, "b.py", "one\n")
+    _commit_all(repo)
+
+    _write(repo, "a.py", "one\ntwo\n")  # modify, unstaged
+
+    files = enumerate_files("diff", repo)
+    assert files == ["a.py"]
+
+
+def test_enumerate_diff_cached(repo):
+    _write(repo, "a.py", "one\n")
+    _commit_all(repo)
+
+    _write(repo, "a.py", "one\ntwo\n")
+    _run(["git", "add", "a.py"], repo)
+
+    # unstaged diff sees nothing (change is staged)
+    assert enumerate_files("diff", repo, cached=False) == []
+    # --cached sees the staged change
+    assert enumerate_files("diff", repo, cached=True) == ["a.py"]
+
+
+def test_enumerate_diff_base_ref(repo):
+    _write(repo, "a.py", "one\n")
+    _commit_all(repo, "c1")
+    _write(repo, "a.py", "one\ntwo\n")
+    _commit_all(repo, "c2")
+    _write(repo, "b.py", "new\n")
+    _commit_all(repo, "c3")
+
+    files = enumerate_files("diff", repo, base_ref="HEAD~2")
+    assert files == sorted(["a.py", "b.py"])
+
+
+def test_enumerate_diff_skips_deleted_file(repo):
+    _write(repo, "gone.py", "x = 1\n")
+    _write(repo, "stays.py", "x = 2\n")
+    _commit_all(repo)
+    os.remove(os.path.join(repo, "gone.py"))
+    _write(repo, "stays.py", "x = 2\nmore\n")
+
+    files = enumerate_files("diff", repo)
+    assert files == ["stays.py"]
+
+
+def test_enumerate_diff_excludes_binary_and_oversize(repo):
+    _write(repo, "a.py", "one\n")
+    _write(repo, "asset.png", "x\n")
+    _write(repo, "big.py", "x = 1\n" * 100000)
+    _commit_all(repo, "c1")
+
+    _write(repo, "a.py", "one\ntwo\n")
+    _write(repo, "asset.png", "y\n")
+    _write(repo, "big.py", "x = 1\n" * 100001)
+
+    files = enumerate_files("diff", repo)
+    assert files == ["a.py"]
+
+
+def test_enumerate_tolerates_git_failure(tmp_path):
+    """Not a git repo at all -> git ls-files/diff fails; must return [] without raising."""
+    not_a_repo = str(tmp_path / "not_a_repo")
+    os.makedirs(not_a_repo, exist_ok=True)
+    assert enumerate_files("all", not_a_repo) == []
+    assert enumerate_files("diff", not_a_repo) == []
+
+
+def test_enumerate_bad_mode_raises(repo):
+    with pytest.raises(ValueError):
+        enumerate_files("bogus", repo)
+
+
+# --- group_files ---------------------------------------------------------------------------
+
+def test_group_files_boundaries():
+    assert group_files([], 3) == []
+    assert group_files(["a"], 5) == [["a"]]
+    assert group_files(["a", "b", "c", "d", "e"], 2) == [["a", "b"], ["c", "d"], ["e"]]
+    assert group_files(["a", "b", "c"], 1) == [["a"], ["b"], ["c"]]
+    assert group_files(["a", "b", "c"], 3) == [["a", "b", "c"]]
+
+
+def test_group_files_never_drops_or_duplicates():
+    files = ["f%d.py" % i for i in range(37)]
+    groups = group_files(files, 5)
+    flattened = [f for g in groups for f in g]
+    assert flattened == files
+    assert all(len(g) <= 5 for g in groups)
+    assert len(groups[-1]) == 2  # 37 = 7*5 + 2
+
+
+def test_group_files_size_below_one_treated_as_one():
+    assert group_files(["a", "b"], 0) == [["a"], ["b"]]
+    assert group_files(["a", "b"], -1) == [["a"], ["b"]]
+
+
+# --- build_review_goal -----------------------------------------------------------------------
+
+@pytest.mark.parametrize("kind, rubric", [("review", REVIEW_RUBRIC), ("security", SECURITY_RUBRIC)])
+def test_build_review_goal_shape(kind, rubric):
+    group = ["pkg/mod.py", "pkg/other_mod.py"]
+    goal = build_review_goal(group, "C:/fakerepo", kind)
+
+    assert set(goal.keys()) == {"text", "cwd"}
+    assert goal["cwd"] == "C:/fakerepo"
+    assert "checks" not in goal
+    for f in group:
+        assert f in goal["text"]
+    assert FINDINGS_BEGIN in goal["text"]
+    assert FINDINGS_END in goal["text"]
+    assert "DONE" in goal["text"]
+
+
+def test_build_review_goal_bad_kind_raises():
+    with pytest.raises(ValueError):
+        build_review_goal(["a.py"], "C:/fakerepo", "bogus")
+
+
+def test_review_and_security_rubrics_differ():
+    assert REVIEW_RUBRIC != SECURITY_RUBRIC
+    assert "セキュリティ" in SECURITY_RUBRIC
+    assert "重複" in REVIEW_RUBRIC or "簡潔化" in REVIEW_RUBRIC
+
+
+# --- write_goals_jsonl: round-trip matching fleet_runner's line format -----------------------
+
+def test_write_goals_jsonl_round_trip(tmp_path):
+    goals = [
+        {"text": "review these files: 日本語テキスト", "cwd": "C:/fakerepo"},
+        {"text": "second goal", "cwd": "C:/fakerepo"},
+    ]
+    out = str(tmp_path / "nested" / "goals.jsonl")
+    n = write_goals_jsonl(goals, out)
+    assert n == 2
+    assert os.path.isfile(out)
+
+    with open(out, encoding="utf-8") as f:
+        lines = [l for l in f.read().split("\n") if l]
+
+    assert len(lines) == 2
+    for line, original in zip(lines, goals):
+        # mirrors relay/fleet_runner.py:_read_goals -- a line starting "{" is JSON-parsed
+        assert line.startswith("{")
+        assert json.loads(line) == original
+        # ensure_ascii=False: Japanese text is literal, not \uXXXX-escaped
+    assert "日本語テキスト" in lines[0]
+
+
+def test_write_goals_jsonl_empty_list(tmp_path):
+    out = str(tmp_path / "goals.jsonl")
+    n = write_goals_jsonl([], out)
+    assert n == 0
+    assert os.path.isfile(out)
+    assert open(out, encoding="utf-8").read() == ""
+
+
+# --- main() end-to-end (still hermetic: fixture repo, no network) ---------------------------
+
+def test_main_end_to_end(repo, tmp_path):
+    _write(repo, "a.py", "one\n")
+    _write(repo, "b.py", "two\n")
+    _write(repo, "asset.png", "x\n")
+    _commit_all(repo)
+
+    out = str(tmp_path / "out" / "goals.jsonl")
+    rc = main(["--repo-root", repo, "--mode", "all", "--kind", "security",
+               "--group-size", "1", "--out", out])
+    assert rc == 0
+    assert os.path.isfile(out)
+
+    with open(out, encoding="utf-8") as f:
+        lines = [json.loads(l) for l in f if l.strip()]
+    assert len(lines) == 2  # a.py, b.py each in their own group (group-size 1); png excluded
+    all_text = " ".join(g["text"] for g in lines)
+    assert "a.py" in all_text and "b.py" in all_text
+    assert "asset.png" not in all_text
+    for g in lines:
+        assert g["cwd"] == os.path.abspath(repo)
+        assert "checks" not in g
+
+
+if __name__ == "__main__":
+    import sys
+    raise SystemExit(pytest.main([__file__, "-q"] + sys.argv[1:]))
