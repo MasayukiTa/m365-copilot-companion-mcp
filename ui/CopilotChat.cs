@@ -1924,8 +1924,8 @@ class ChatWindow : Window
     static readonly string[][] _commandsJa = {
         new[]{"/help","コマンド一覧を表示"},
         new[]{"/research","Claude researcher で深掘り調査"},
-        new[]{"/review","無料フリートで全ファイル/diff/指定パスをレビューし要約"},
-        new[]{"/security-review","無料フリートでセキュリティ観点のレビュー"},
+        new[]{"/review","全ファイル/diff/指定パスをレビューし要約"},
+        new[]{"/security-review","セキュリティ観点でレビュー"},
         new[]{"/analyze","アナリストでファイルを分析"},
         new[]{"/summarize","要約する"},
         new[]{"/translate","翻訳: /translate <言語> <文>"},
@@ -1942,8 +1942,8 @@ class ChatWindow : Window
     static readonly string[][] _commandsEn = {
         new[]{"/help","Show the command list"},
         new[]{"/research","Deep research with the Claude researcher"},
-        new[]{"/review","Review all files / diff / a path with the free fleet"},
-        new[]{"/security-review","Security-focused review with the free fleet"},
+        new[]{"/review","Review all files / diff / a path"},
+        new[]{"/security-review","Security-focused review"},
         new[]{"/analyze","Analyze a file with the analyst"},
         new[]{"/summarize","Summarize"},
         new[]{"/translate","Translate: /translate <lang> <text>"},
@@ -2016,8 +2016,8 @@ class ChatWindow : Window
             return "Chat commands:\n"
                 + "/help - this list\n"
                 + "/research - deep research with the Claude researcher\n"
-                + "/review [diff|<path>] - review with the free fleet\n"
-                + "/security-review [diff|<path>] - security review with the free fleet\n"
+                + "/review [diff|<path>] - review and summarize\n"
+                + "/security-review [diff|<path>] - security-focused review\n"
                 + "/analyze - analyze a file\n"
                 + "/summarize - summarize\n"
                 + "/translate <lang> <text> - translate\n"
@@ -2034,7 +2034,7 @@ class ChatWindow : Window
         return "チャットコマンド:\n"
             + "/help - この一覧\n"
             + "/research - Claude researcher で深掘り調査\n"
-            + "/review [diff|<パス>] - 無料フリートでレビュー\n"
+            + "/review [diff|<パス>] - レビューして要約\n"
             + "/security-review [diff|<パス>] - セキュリティレビュー\n"
             + "/analyze - ファイル分析\n"
             + "/summarize - 要約\n"
