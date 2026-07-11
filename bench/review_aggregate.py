@@ -2,9 +2,10 @@
 
 The refuter's verdict never lands in a worker's transcript -- it only appears in the final
 status.json snapshot as workers[].reason == "refuter#N: UPHELD|REFUTED|...". So a worker's
-actual FINDINGS come from its own final assistant text (display_result/last, falling back to
-its transcript file), and the refuter reason is attached alongside each finding as extra
-context, not as the source of the finding itself.
+actual FINDINGS come from its own final assistant text (its full transcript file, falling
+back to the status.json snapshot's display_result/last only if the transcript is missing --
+see worker_final_text for why the transcript must win), and the refuter reason is attached
+alongside each finding as extra context, not as the source of the finding itself.
 
 This module is pure I/O-in-pure-out aside from reading the two input files given by the
 caller; nothing here calls a network, subprocess, or wall clock on its own (see `now=` on
@@ -29,26 +30,93 @@ _FINDINGS_RE = re.compile(
 _SEVERITIES = ("high", "medium", "low")
 
 
+def _sanitize_findings(data):
+    """Drop any non-dict entries from a parsed findings array (real agent output
+    occasionally mixes in stray scalars)."""
+    return [item for item in data if isinstance(item, dict)]
+
+
+def _looks_like_findings(data):
+    """Heuristic used only by the last-resort recovery layer (no delimiters at all):
+    accept a bare JSON array only if it is a non-empty list of dicts and at least one
+    dict has a "file" or "title" key -- otherwise it's probably an unrelated array that
+    happens to appear in the agent's prose, not a findings block."""
+    if not isinstance(data, list) or not data:
+        return False
+    if not all(isinstance(item, dict) for item in data):
+        return False
+    return any(("file" in item or "title" in item) for item in data)
+
+
+def _extract_last_json_array(text, before_index=None):
+    """Scan backward for the last top-level JSON array in text[:before_index] (or the
+    whole text if before_index is None) and return its parsed value, or None if no
+    substring ending at a ']' parses as a JSON list.
+
+    Bounded, pure, never raises: tries candidates starting at each '[' before the last
+    ']' in the region, nearest first (smallest span first, growing backward), capped at
+    a few hundred attempts so pathological input can't make this O(n^2)-blow-up in
+    practice on real transcript sizes."""
+    region = text if before_index is None else text[:before_index]
+    close = region.rfind("]")
+    if close == -1:
+        return None
+    starts = [i for i, ch in enumerate(region[: close + 1]) if ch == "["]
+    if not starts:
+        return None
+    for start in reversed(starts[-300:]):
+        candidate = region[start : close + 1]
+        try:
+            data = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(data, list):
+            return data
+    return None
+
+
 def parse_findings_block(text):
     """Extract the FINDINGS JSON array from a worker's final text.
 
-    Returns (findings: list[dict], parse_error: bool). Never raises: a missing delimiter
-    pair, malformed JSON inside it, or a JSON value that isn't a list all count as
-    parse_error=True with findings=[]. Text after FINDINGS_END (e.g. trailing "DONE" or
-    stray prose) does not affect parsing -- the regex is non-greedy and only cares about
-    the first well-formed <<<FINDINGS>>>...<<<END_FINDINGS>>> span."""
+    Real M365 Copilot workers reliably emit the closing <<<END_FINDINGS>>> marker (and
+    the JSON array right before it), but frequently drop or mangle the opening
+    <<<FINDINGS>>> marker. So this uses layered recovery, in order, and the first layer
+    that yields a valid JSON array wins:
+
+      (a) PREFERRED: text between FINDINGS_BEGIN and FINDINGS_END (original behavior).
+      (b) FALLBACK: FINDINGS_END is present but (a) didn't yield a list -- scan backward
+          from FINDINGS_END for the nearest balanced JSON array immediately preceding it.
+      (c) LAST RESORT: no FINDINGS_END anywhere -- scan the whole text for the last JSON
+          array and accept it only if it looks like a findings list (see
+          _looks_like_findings).
+
+    Returns (findings: list[dict], parse_error: bool). Never raises: if every layer
+    fails to recover a findings array, that's parse_error=True with findings=[]. Any
+    recovered array has its non-dict entries dropped (see _sanitize_findings)."""
     if not text:
         return [], True
+
     m = _FINDINGS_RE.search(text)
-    if not m:
+    if m:
+        try:
+            data = json.loads(m.group(1))
+        except Exception:
+            data = None
+        if isinstance(data, list):
+            return _sanitize_findings(data), False
+
+    end_idx = text.rfind(FINDINGS_END)
+    if end_idx != -1:
+        data = _extract_last_json_array(text, before_index=end_idx)
+        if data is not None:
+            return _sanitize_findings(data), False
         return [], True
-    try:
-        data = json.loads(m.group(1))
-    except Exception:
-        return [], True
-    if not isinstance(data, list):
-        return [], True
-    return data, False
+
+    data = _extract_last_json_array(text, before_index=None)
+    if data is not None and _looks_like_findings(data):
+        return _sanitize_findings(data), False
+
+    return [], True
 
 
 def _resolve_transcript_path(transcript_field, transcripts_dir):
@@ -85,15 +153,27 @@ def load_transcript_final_answer(path):
 
 
 def worker_final_text(worker, transcripts_dir):
-    """Best-effort recovery of a worker's final assistant text: prefer the status.json
-    snapshot's own display_result/last (cheap, already in memory); fall back to reading
-    its transcript file only if both are empty. Never raises."""
+    """Best-effort recovery of a worker's final assistant text.
+
+    Prefer the FULL transcript file (load_transcript_final_answer's untruncated last
+    assistant turn) over the status.json snapshot's own display_result/last fields.
+    Those status fields are truncated snapshots (~600 chars in practice) taken while the
+    worker was still running; the FINDINGS block sits at the very end of the worker's
+    real answer, so truncation routinely cuts it off. The transcript file has the
+    complete answer, so it must win whenever it resolves to something non-empty. Only
+    fall back to display_result/last when the transcript is missing, unreadable, or has
+    no assistant turn at all. Never raises.
+
+    worker["transcript"] may be a path relative to transcripts_dir, or (as real
+    status.json snapshots store it) an absolute path -- _resolve_transcript_path handles
+    both."""
     try:
-        text = worker.get("display_result") or worker.get("last") or ""
-        if text:
-            return text
         path = _resolve_transcript_path(worker.get("transcript", ""), transcripts_dir)
-        return load_transcript_final_answer(path)
+        if path:
+            text = load_transcript_final_answer(path)
+            if text:
+                return text
+        return worker.get("display_result") or worker.get("last") or ""
     except Exception:
         return ""
 

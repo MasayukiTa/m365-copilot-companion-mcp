@@ -84,6 +84,68 @@ def test_parse_findings_block_never_raises_on_garbage():
         assert isinstance(err, bool)
 
 
+# --- parse_findings_block: real-world recovery (BEGIN dropped/mangled by real workers) --------
+# Verified against live transcript r6a5232d8_a0_w0: the worker reliably emits
+# <<<END_FINDINGS>>> and a valid JSON array right before it, but drops <<<FINDINGS>>>.
+
+def test_parse_findings_block_end_present_begin_missing_recovers():
+    """THE KEY NEW CASE: no opening delimiter at all, but a valid array sits right
+    before FINDINGS_END -- must be recovered instead of counted as a parse error."""
+    items = [{"file": "a.py", "line": 12, "severity": "high", "title": "t", "detail": "d"}]
+    text = ("あなたはレビューを行いました。\n"
+             + json.dumps(items, ensure_ascii=False) + "\n" + FINDINGS_END + "\nDONE")
+    assert FINDINGS_BEGIN not in text
+    found, err = parse_findings_block(text)
+    assert err is False
+    assert found == items
+
+
+def test_parse_findings_block_neither_delimiter_trailing_array_recovers():
+    items = [{"file": "b.py", "line": 3, "severity": "medium", "title": "t2", "detail": ""}]
+    text = "Here is what I found, no markers at all.\n" + json.dumps(items, ensure_ascii=False)
+    found, err = parse_findings_block(text)
+    assert err is False
+    assert found == items
+
+
+def test_parse_findings_block_end_present_no_array_before_it_is_parse_error():
+    text = "I reviewed everything and found nothing worth reporting.\n" + FINDINGS_END + "\nDONE"
+    found, err = parse_findings_block(text)
+    assert found == []
+    assert err is True
+
+
+def test_parse_findings_block_bare_empty_array_before_end_is_not_an_error():
+    text = "no issues found\n[]\n" + FINDINGS_END + "\nDONE"
+    found, err = parse_findings_block(text)
+    assert found == []
+    assert err is False
+
+
+def test_parse_findings_block_malformed_json_before_end_no_begin_is_parse_error():
+    text = "results:\n[{not valid json at all}]\n" + FINDINGS_END + "\nDONE"
+    found, err = parse_findings_block(text)
+    assert found == []
+    assert err is True
+
+
+def test_parse_findings_block_last_resort_rejects_non_findings_array():
+    """Neither delimiter present, and the last array in the text is just a list of ints
+    -- must NOT be mistaken for a findings block."""
+    text = "unrelated numbers mentioned in prose: [1, 2, 3, 4]"
+    found, err = parse_findings_block(text)
+    assert found == []
+    assert err is True
+
+
+def test_parse_findings_block_recovered_items_drop_non_dict_entries():
+    items = [{"file": "a.py", "line": 1, "severity": "high", "title": "t", "detail": ""}, "stray"]
+    text = json.dumps(items, ensure_ascii=False) + "\n" + FINDINGS_END + "\nDONE"
+    found, err = parse_findings_block(text)
+    assert err is False
+    assert found == [items[0]]
+
+
 # --- load_transcript_final_answer --------------------------------------------------------
 
 def _write_transcript(path, name="w0", goal="review goal", turns=None):
@@ -164,6 +226,41 @@ def test_worker_final_text_relative_transcript_resolved_under_dir(tmp_path):
 def test_worker_final_text_never_raises_on_garbage():
     assert worker_final_text({}, "/does/not/exist") == ""
     assert worker_final_text({"transcript": None}, None) == ""
+
+
+# --- worker_final_text: full transcript must win over truncated status.json fields ------------
+# Verified against live status.json: worker "last" field is a ~600-char truncated snapshot
+# that cuts off before the FINDINGS block; the full transcript's last assistant turn (2095
+# chars in the real case) has the complete answer including the closing marker.
+
+def test_worker_final_text_prefers_full_transcript_over_truncated_last(tmp_path):
+    tpath = tmp_path / "transcripts" / "run_w5.jsonl"
+    full_text = ("some preamble that goes on for a while... " * 20) + FINDINGS_END + " DONE"
+    truncated_last = full_text[:600]  # what a truncated status.json snapshot would have
+    assert FINDINGS_END not in truncated_last  # confirm the truncation actually lost the marker
+    _write_transcript(str(tpath), turns=[{"turn": 1, "role": "assistant", "text": full_text}])
+    w = {"display_result": "", "last": truncated_last, "transcript": str(tpath)}
+    result = worker_final_text(w, str(tmp_path / "transcripts"))
+    assert result == full_text
+    assert FINDINGS_END in result
+
+
+def test_worker_final_text_absolute_transcript_path_resolves(tmp_path):
+    tpath = tmp_path / "somewhere_else" / "run_w6.jsonl"
+    _write_transcript(str(tpath), turns=[{"turn": 1, "role": "assistant", "text": "abs answer"}])
+    w = {"display_result": "", "last": "stale", "transcript": str(tpath)}
+    # transcripts_dir deliberately points elsewhere -- the absolute path must still resolve.
+    assert worker_final_text(w, str(tmp_path / "unrelated_dir")) == "abs answer"
+
+
+def test_worker_final_text_missing_transcript_falls_back(tmp_path):
+    w = {"display_result": "", "last": "fallback text", "transcript": "does_not_exist.jsonl"}
+    assert worker_final_text(w, str(tmp_path)) == "fallback text"
+
+
+def test_worker_final_text_both_missing_returns_empty(tmp_path):
+    w = {"display_result": "", "last": "", "transcript": ""}
+    assert worker_final_text(w, str(tmp_path)) == ""
 
 
 # --- aggregate ------------------------------------------------------------------------------
@@ -258,6 +355,49 @@ def test_aggregate_empty_workers(tmp_path):
     assert agg["workers_total"] == 0
     assert agg["parse_errors"] == 0
     assert agg["findings"] == []
+
+
+def test_aggregate_recovers_findings_from_real_world_end_no_begin_transcripts(tmp_path):
+    """End-to-end proof on a realistic final-snapshot status.json: every worker's
+    transcript has FINDINGS_END but no FINDINGS_BEGIN (the real failure mode), and the
+    status.json "last" field is a truncated stub that lost the findings block entirely.
+    aggregate() must still recover the genuine findings with parse_errors == 0."""
+    status_path = tmp_path / "status.json"
+    transcripts_dir = tmp_path / "transcripts"
+
+    def _worker(name, sev, file_):
+        items = [{"file": file_, "line": 7, "severity": sev, "title": "issue in " + file_,
+                  "detail": "found via live-shaped transcript"}]
+        full_text = ("worker %s reviewed the assigned files and here is the result.\n" % name
+                     + json.dumps(items, ensure_ascii=False) + "\n" + FINDINGS_END + "\nDONE")
+        tpath = transcripts_dir / (name + ".jsonl")
+        _write_transcript(str(tpath), name=name, turns=[
+            {"turn": 1, "role": "assistant", "text": full_text[:600]},  # mid-run stub
+            {"turn": 2, "role": "assistant", "text": full_text},         # final untruncated turn
+        ])
+        return {
+            "name": name, "goal": "review group " + name, "outcome": "DONE",
+            "reason": "refuter#1: UPHELD", "verified": True,
+            "display_result": "", "last": full_text[:600],  # truncated, matches live status.json
+            "transcript": str(tpath),
+        }, items
+
+    w0, items0 = _worker("w0", "high", "a.py")
+    w1, items1 = _worker("w1", "medium", "b.py")
+    w2, items2 = _worker("w2", "low", "c.py")
+    workers = [w0, w1, w2]
+
+    status_path.write_text(json.dumps(_status_with_workers(workers), ensure_ascii=False),
+                            encoding="utf-8")
+
+    agg = aggregate(str(status_path), str(transcripts_dir), now=999.0)
+
+    assert agg["parse_errors"] == 0
+    assert len(agg["findings"]) == 3
+    assert len(agg["by_severity"]["high"]) == 1
+    assert len(agg["by_severity"]["medium"]) == 1
+    assert len(agg["by_severity"]["low"]) == 1
+    assert agg["by_severity"]["high"][0]["file"] == "a.py"
 
 
 def test_aggregate_unexpected_severity_bucketed_as_low(tmp_path):
