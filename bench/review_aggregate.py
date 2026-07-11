@@ -152,6 +152,71 @@ def load_transcript_final_answer(path):
     return last
 
 
+def load_transcript_all_assistant(path):
+    """Return the text of EVERY role=="assistant" turn in a fleet worker transcript
+    jsonl, concatenated in order and joined by "\\n". Returns "" on any error (missing
+    file, bad json lines, no assistant turn at all) -- never raises.
+
+    Unlike load_transcript_final_answer (which keeps only the LAST assistant turn),
+    this recovers workers whose FINDINGS block was emitted in an EARLIER assistant turn
+    and who then continued with wrap-up prose in later turns -- the last-turn-only read
+    silently drops that block."""
+    if not path:
+        return ""
+    turns = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(d, dict) and d.get("role") == "assistant":
+                    turns.append(d.get("text", "") or "")
+    except Exception:
+        return ""
+    return "\n".join(turns)
+
+
+def _worker_findings(worker, transcripts_dir):
+    """Layered per-worker findings extraction: first attempt that yields a non-error,
+    non-empty findings list wins.
+
+      (a) fast path: parse_findings_block(worker_final_text(...)) -- the current
+          last-turn/status text. Keeps existing behavior for workers whose block is in
+          their last assistant turn (or in the status.json snapshot text).
+      (b) recovery: if (a) is a parse_error or empty AND the worker has a transcript,
+          parse_findings_block(load_transcript_all_assistant(transcript)) -- the FULL
+          concatenation of all assistant turns. This recovers workers whose block sits
+          in an earlier turn, with only wrap-up prose in the last turn.
+
+    Returns (findings: list[dict], parse_error: bool). Extracts ONE findings list per
+    worker (the best single parse), never one per turn -- if multiple turns each
+    contain a findings-shaped array, parse_findings_block's own last-resort rule
+    already picks one; this function doesn't merge or double-count across layers."""
+    text = worker_final_text(worker, transcripts_dir)
+    findings, perr = parse_findings_block(text)
+    if findings and not perr:
+        return findings, perr
+
+    transcript_field = worker.get("transcript", "") if isinstance(worker, dict) else ""
+    path = _resolve_transcript_path(transcript_field, transcripts_dir)
+    if not path:
+        return findings, perr
+
+    full_text = load_transcript_all_assistant(path)
+    if not full_text:
+        return findings, perr
+
+    full_findings, full_perr = parse_findings_block(full_text)
+    if full_findings and not full_perr:
+        return full_findings, full_perr
+    return findings, perr
+
+
 def worker_final_text(worker, transcripts_dir):
     """Best-effort recovery of a worker's final assistant text.
 
@@ -217,8 +282,7 @@ def aggregate(status_path, transcripts_dir, now=None):
         if not isinstance(w, dict):
             continue
         try:
-            text = worker_final_text(w, transcripts_dir)
-            findings, perr = parse_findings_block(text)
+            findings, perr = _worker_findings(w, transcripts_dir)
         except Exception:
             findings, perr = [], True
         if perr:
