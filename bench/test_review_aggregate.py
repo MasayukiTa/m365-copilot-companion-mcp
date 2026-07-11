@@ -14,6 +14,7 @@ import pytest
 from bench.review_build_goals import FINDINGS_BEGIN, FINDINGS_END
 from bench.review_aggregate import (
     aggregate,
+    load_transcript_all_assistant,
     load_transcript_final_answer,
     parse_findings_block,
     render_json,
@@ -192,6 +193,51 @@ def test_load_transcript_final_answer_corrupt_lines(tmp_path):
 def test_load_transcript_final_answer_empty_path():
     assert load_transcript_final_answer("") == ""
     assert load_transcript_final_answer(None) == ""
+
+
+# --- load_transcript_all_assistant --------------------------------------------------------
+# Real live-fleet failure mode: 9 of 17 workers emitted their FINDINGS block in an EARLIER
+# assistant turn, then continued with wrap-up prose in later turns. load_transcript_final_answer
+# only sees the LAST turn and misses the block entirely; this function must see all of them.
+
+def test_load_transcript_all_assistant_concatenates_all_turns(tmp_path):
+    path = str(tmp_path / "transcripts" / "run_w7.jsonl")
+    _write_transcript(path, turns=[
+        {"turn": 1, "role": "user", "text": "please review", "ts": 2.0},
+        {"turn": 1, "role": "assistant", "text": "turn one findings here", "ts": 3.0},
+        {"turn": 2, "role": "user", "text": "continue", "ts": 4.0},
+        {"turn": 2, "role": "assistant", "text": "turn two prose", "ts": 5.0},
+        {"turn": 3, "role": "user", "text": "wrap up", "ts": 6.0},
+        {"turn": 3, "role": "assistant", "text": "turn three wrap-up", "ts": 7.0},
+    ])
+    result = load_transcript_all_assistant(path)
+    assert result == "turn one findings here\nturn two prose\nturn three wrap-up"
+
+
+def test_load_transcript_all_assistant_missing_file(tmp_path):
+    assert load_transcript_all_assistant(str(tmp_path / "nope.jsonl")) == ""
+
+
+def test_load_transcript_all_assistant_corrupt_lines(tmp_path):
+    path = str(tmp_path / "transcripts" / "run_w8.jsonl")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("{not json at all\n")
+        f.write(json.dumps({"turn": 1, "role": "assistant", "text": "first"}) + "\n")
+        f.write("garbage garbage\n")
+        f.write(json.dumps({"turn": 2, "role": "assistant", "text": "second"}) + "\n")
+    assert load_transcript_all_assistant(path) == "first\nsecond"
+
+
+def test_load_transcript_all_assistant_empty_path():
+    assert load_transcript_all_assistant("") == ""
+    assert load_transcript_all_assistant(None) == ""
+
+
+def test_load_transcript_all_assistant_no_assistant_turn(tmp_path):
+    path = str(tmp_path / "transcripts" / "run_w9.jsonl")
+    _write_transcript(path, turns=[{"turn": 1, "role": "user", "text": "hi", "ts": 2.0}])
+    assert load_transcript_all_assistant(path) == ""
 
 
 # --- worker_final_text -------------------------------------------------------------------
@@ -398,6 +444,102 @@ def test_aggregate_recovers_findings_from_real_world_end_no_begin_transcripts(tm
     assert len(agg["by_severity"]["medium"]) == 1
     assert len(agg["by_severity"]["low"]) == 1
     assert agg["by_severity"]["high"][0]["file"] == "a.py"
+
+
+def test_aggregate_recovers_findings_block_from_earlier_assistant_turn(tmp_path):
+    """THE KEY NEW CASE (the live 9-worker gap): a worker's transcript has the FINDINGS
+    block in an EARLIER assistant turn, and only unrelated wrap-up prose in the LAST
+    turn. worker_final_text/load_transcript_final_answer alone would see only the last
+    turn and miss the block entirely (parse_error). aggregate() must now recover it by
+    falling back to load_transcript_all_assistant."""
+    status_path = tmp_path / "status.json"
+    transcripts_dir = tmp_path / "transcripts"
+
+    items = [{"file": "early.py", "line": 42, "severity": "high",
+              "title": "found in an earlier turn", "detail": "recovered via full scan"}]
+    tpath = transcripts_dir / "w_early.jsonl"
+    _write_transcript(str(tpath), name="w_early", turns=[
+        {"turn": 1, "role": "user", "text": "please review", "ts": 1.0},
+        {"turn": 1, "role": "assistant", "text": _findings_block(items), "ts": 2.0},
+        {"turn": 2, "role": "user", "text": "anything else?", "ts": 3.0},
+        {"turn": 2, "role": "assistant",
+         "text": "That's everything, thanks for reviewing with me today.", "ts": 4.0},
+    ])
+    workers = [{
+        "name": "w_early", "goal": "review group early", "outcome": "DONE",
+        "reason": "refuter#1: UPHELD", "verified": True,
+        "display_result": "", "last": "That's everything, thanks for reviewing with me today.",
+        "transcript": str(tpath),
+    }]
+    status_path.write_text(json.dumps(_status_with_workers(workers), ensure_ascii=False),
+                            encoding="utf-8")
+
+    agg = aggregate(str(status_path), str(transcripts_dir), now=1.0)
+
+    assert agg["parse_errors"] == 0
+    assert len(agg["findings"]) > 0
+    assert agg["findings"][0]["file"] == "early.py"
+    assert agg["findings"][0]["worker"] == "w_early"
+    assert agg["by_severity"]["high"][0]["title"] == "found in an earlier turn"
+
+
+def test_aggregate_fast_path_last_turn_block_still_works_no_full_scan_needed(tmp_path):
+    """No regression: a worker whose block IS in the last assistant turn must still be
+    parsed via the fast path (worker_final_text), without needing the full-transcript
+    fallback. Covers the 4 workers that already worked before this fix."""
+    status_path = tmp_path / "status.json"
+    transcripts_dir = tmp_path / "transcripts"
+
+    items = [{"file": "last.py", "line": 5, "severity": "medium",
+              "title": "found in last turn", "detail": ""}]
+    tpath = transcripts_dir / "w_last.jsonl"
+    _write_transcript(str(tpath), name="w_last", turns=[
+        {"turn": 1, "role": "assistant", "text": "still working on it", "ts": 1.0},
+        {"turn": 2, "role": "assistant", "text": _findings_block(items), "ts": 2.0},
+    ])
+    workers = [{
+        "name": "w_last", "goal": "review group last", "outcome": "DONE",
+        "reason": "", "verified": True,
+        "display_result": "", "last": "",
+        "transcript": str(tpath),
+    }]
+    status_path.write_text(json.dumps(_status_with_workers(workers), ensure_ascii=False),
+                            encoding="utf-8")
+
+    agg = aggregate(str(status_path), str(transcripts_dir), now=1.0)
+
+    assert agg["parse_errors"] == 0
+    assert len(agg["findings"]) == 1
+    assert agg["findings"][0]["file"] == "last.py"
+    assert agg["findings"][0]["worker"] == "w_last"
+
+
+def test_aggregate_no_findings_in_any_turn_is_still_parse_error(tmp_path):
+    """A worker with no findings-shaped array anywhere in ANY assistant turn (it
+    genuinely found nothing) must remain a parse_error -- the full-transcript fallback
+    must not manufacture a false recovery."""
+    status_path = tmp_path / "status.json"
+    transcripts_dir = tmp_path / "transcripts"
+
+    tpath = transcripts_dir / "w_none.jsonl"
+    _write_transcript(str(tpath), name="w_none", turns=[
+        {"turn": 1, "role": "assistant", "text": "looking at the files now", "ts": 1.0},
+        {"turn": 2, "role": "assistant",
+         "text": "I reviewed everything and found nothing worth reporting.", "ts": 2.0},
+    ])
+    workers = [{
+        "name": "w_none", "goal": "review group none", "outcome": "DONE",
+        "reason": "", "verified": None,
+        "display_result": "", "last": "",
+        "transcript": str(tpath),
+    }]
+    status_path.write_text(json.dumps(_status_with_workers(workers), ensure_ascii=False),
+                            encoding="utf-8")
+
+    agg = aggregate(str(status_path), str(transcripts_dir), now=1.0)
+
+    assert agg["parse_errors"] == 1
+    assert agg["findings"] == []
 
 
 def test_aggregate_unexpected_severity_bucketed_as_low(tmp_path):
