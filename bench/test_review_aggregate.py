@@ -20,6 +20,7 @@ from bench.review_aggregate import (
     render_json,
     render_markdown,
     worker_final_text,
+    _loads_tolerant,
 )
 
 
@@ -145,6 +146,95 @@ def test_parse_findings_block_recovered_items_drop_non_dict_entries():
     found, err = parse_findings_block(text)
     assert err is False
     assert found == [items[0]]
+
+
+# --- _loads_tolerant ----------------------------------------------------------------------
+# Verified against live transcript r6a5232d8_a0_w1: the worker's findings array contains
+# ".fleet\\gaia\\pipeline_task.log" with single, unescaped backslashes -- invalid JSON
+# (json.loads raises "Invalid \\escape" on \\g and \\p). This is universal on this Windows
+# product: every review will have Windows paths and regex snippets (\\d, \\g) in "detail"
+# strings, so parse_findings_block must repair this instead of giving up.
+
+def test_loads_tolerant_valid_json_unchanged():
+    s = '[{"file": "a.py", "line": 1, "title": "t", "detail": "d"}]'
+    assert _loads_tolerant(s) == [{"file": "a.py", "line": 1, "title": "t", "detail": "d"}]
+
+
+def test_loads_tolerant_repairs_windows_path_single_backslashes():
+    # Built explicitly with single backslashes in the Python source (via chr(92) concat
+    # is unnecessary -- a raw string with one backslash per separator is itself invalid
+    # JSON, which is exactly the live failure mode).
+    bad = '[{"file": "C:\\Users\\x\\a.py", "title": "t"}]'
+    # Sanity: confirm this really is invalid JSON before exercising the repair.
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(bad)
+    result = _loads_tolerant(bad)
+    assert result == [{"file": "C:\\Users\\x\\a.py", "title": "t"}]
+
+
+def test_loads_tolerant_repairs_regex_snippet_invalid_escape():
+    bad = '[{"file": "a.py", "title": "t", "detail": "matches \\g and \\d here"}]'
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(bad)
+    result = _loads_tolerant(bad)
+    assert result == [{"file": "a.py", "title": "t", "detail": "matches \\g and \\d here"}]
+
+
+def test_loads_tolerant_fleet_gaia_path_from_live_transcript():
+    """The exact live w1 substring: a Windows path with two backslash segments inside a
+    JSON string value."""
+    bad = '[{"file": "bench/x.py", "title": "t", "detail": "redirects to .fleet\\gaia\\pipeline_task.log"}]'
+    result = _loads_tolerant(bad)
+    assert result is not None
+    assert result[0]["detail"] == "redirects to .fleet\\gaia\\pipeline_task.log"
+
+
+def test_loads_tolerant_genuinely_broken_returns_none():
+    assert _loads_tolerant('[{"file": "a.py", "title": "t"') is None  # unbalanced brackets
+    assert _loads_tolerant("not json at all") is None
+    assert _loads_tolerant("") is None
+
+
+def test_loads_tolerant_preserves_valid_escapes_newline_unicode_quote():
+    # Force the repair path to run (invalid \\g elsewhere in the same string) and confirm
+    # legitimate \\n, \\uXXXX, and \\" escapes still decode correctly rather than being
+    # corrupted into literal backslashes by the repair.
+    s = '[{"file": "a.py", "title": "t", "detail": "line1\\nline2 \\u00e9 he said \\"hi\\" \\g bad"}]'
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(s)
+    result = _loads_tolerant(s)
+    assert result is not None
+    detail = result[0]["detail"]
+    assert "line1\nline2" in detail
+    assert "é" in detail
+    assert 'he said "hi"' in detail
+    assert "\\g" in detail  # the invalid escape survives as a literal backslash + g
+
+
+# --- parse_findings_block: Windows-path invalid JSON end-to-end --------------------------
+
+def test_parse_findings_block_recovers_windows_path_invalid_json():
+    """End-to-end: a findings array between the delimiters contains an unescaped Windows
+    path (invalid JSON per json.loads) -- must now recover instead of parse_error."""
+    text = (FINDINGS_BEGIN
+            + '\n[{"file": "C:\\Work\\some_project\\module\\example.py", "line": 1, '
+              '"severity": "high", "title": "t", "detail": "d"}]\n'
+            + FINDINGS_END)
+    found, err = parse_findings_block(text)
+    assert err is False
+    assert len(found) == 1
+    assert found[0]["file"] == "C:\\Work\\some_project\\module\\example.py"
+
+
+def test_parse_findings_block_recovers_windows_path_when_begin_missing():
+    """Same Windows-path repair, but through the (b) FALLBACK layer (FINDINGS_END present,
+    FINDINGS_BEGIN dropped -- the other real-world recovery layer)."""
+    items_text = '[{"file": "a.py", "title": "t", "detail": "log at .fleet\\gaia\\out.log"}]'
+    text = "here is what I found\n" + items_text + "\n" + FINDINGS_END + "\nDONE"
+    found, err = parse_findings_block(text)
+    assert err is False
+    assert len(found) == 1
+    assert found[0]["detail"] == "log at .fleet\\gaia\\out.log"
 
 
 # --- load_transcript_final_answer --------------------------------------------------------
