@@ -311,7 +311,7 @@ HELP_TEXT = (
     "### 委譲コマンド（別エージェントへ委譲・数分）\n"
     "- `/research <調べたいこと>` — M365 リサーチ ツールを **Claude (Anthropic)** に切替えて deep research（確認→承認→本実行、数分）。`/deepresearch` `/dr` も同じ。\n"
     "- `/analyze <ファイルの絶対パス> | <分析指示>` — アナリストにデータファイルを渡して分析（数値は鵜呑みにせず自分でも確かめて）。`/an` も同じ。\n"
-    "- `/review [diff|<path>]` — 無料フリートで全ファイル（または diff／指定パス）をレビューし要約を返す（数分〜）。\n"
+    "- `/review [diff|<path>]` — 全ファイル（または diff／指定パス）をレビューし要約を返す（数分〜）。\n"
     "- `/security-review [diff|<path>]` — 同上、セキュリティ観点のレビュー。\n\n"
     "### プロンプトテンプレート（このエージェントが即応答・通常ストリーム）\n"
     "- `/summarize <文章/トピック>` — 要点を箇条書きで簡潔に要約。\n"
@@ -3061,7 +3061,7 @@ class Handler(BaseHTTPRequestHandler):
             parsed = review_command.parse_review_command(msg)
             argv = review_command.build_review_argv(parsed, repo_root, venvpy)
 
-            self._sse({"delta": "無料フリートでレビューを開始します（数分〜）...\n"})
+            self._sse({"delta": "レビューを開始します（数分〜）...\n"})
 
             proc = subprocess.Popen(
                 argv, cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
