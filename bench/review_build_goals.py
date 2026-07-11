@@ -166,6 +166,84 @@ def build_review_goal(file_group, repo_root, kind):
     return {"text": text, "cwd": repo_root}
 
 
+# --- FIX goal builder ---------------------------------------------------------------------
+# Takes findings already produced by a review run (bench/review_aggregate.aggregate) and asks
+# a fresh fleet worker to FIX them -- edit-with-file-tools, mirroring bench/swe_build_goals.py's
+# tool guidance (grep / glob / read_file / replace_in_file / write_file), but scoped to exactly
+# the listed findings instead of an open-ended issue. Reuses FINDINGS_BEGIN/FINDINGS_END so the
+# "what I changed" block is parsed by the SAME bench.review_aggregate.parse_findings_block --
+# no second parser (see bench/review_fix.py, which reuses it verbatim).
+FIX_RUBRIC = (
+    "あなたはこのリポジトリのコードレビュー指摘を修正します。\n"
+    "対象リポジトリ（このPCのローカル、git チェックアウト済み）:\n"
+    "  {FILE_LIST_CWD}\n\n"
+    "以下のファイルを、ファイルツール（read_file / grep / replace_in_file / write_file）で"
+    "実際に開いて読み、下記の指摘事項を修正してください。\n\n"
+    "{FINDINGS_TEXT}\n\n"
+    "厳守事項（違反しないこと）:\n"
+    "1) 上記の指摘一覧に無いファイル・箇所は一切変更しないこと。無関係なリファクタや"
+    "再フォーマットは禁止。\n"
+    "2) 修正は指摘を解決するのに必要な最小限の差分にすること。\n"
+    "3) 既存のテストを壊さないこと。\n"
+    "4) 指摘の内容が誤り、あるいは対応不要と判断した場合は、無理に修正を加えないこと。"
+    "その場合は理由を記録すること。\n\n"
+    "作業の最後に、次の形式で「各指摘に対して何をしたか」をJSON配列として出力してください"
+    "（この行より前にも後にも文章を書いて構いませんが、必ず以下の2行のデリミタで囲んでください）:\n\n"
+    + FINDINGS_BEGIN + "\n"
+    "[\n"
+    '  {"file": "path/to/file.py", "line": 123, "title": "...", '
+    '"applied": true, "summary": "..."}\n'
+    "]\n"
+    + FINDINGS_END + "\n\n"
+    "applied は実際に修正を適用したなら true、指摘が誤りだった等の理由で修正しなかったなら "
+    "false（summary にその理由を書くこと）。\n"
+    "このブロックを出力した後、最後に DONE と書いて終了してください。"
+)
+
+
+def build_fix_goal(finding_group, repo_root):
+    """Build one fleet goal dict {"text": str, "cwd": repo_root} (no "checks" key) that asks
+    the agent to fix exactly the findings in `finding_group` (a list of finding dicts as
+    produced by bench.review_aggregate.aggregate()["findings"]) and end with a FINDINGS-shaped
+    "what I changed" block.
+
+    Every finding's "file" AND "title" is guaranteed to appear verbatim in the resulting text
+    (mirrors build_review_goal's own verbatim-filename assert)."""
+    files = []
+    for f in finding_group:
+        fp = f.get("file", "")
+        if fp and fp not in files:
+            files.append(fp)
+    file_list_text = "\n".join("- " + f for f in files)
+
+    detail_lines = []
+    for i, f in enumerate(finding_group):
+        file_ = f.get("file", "?")
+        line = f.get("line")
+        line_s = str(line) if line is not None else "?"
+        sev = f.get("severity", "?")
+        title = f.get("title", "")
+        detail = f.get("detail", "")
+        detail_lines.append(
+            "%d. %s:%s [%s] %s\n   detail: %s" % (i + 1, file_, line_s, sev, title, detail)
+        )
+
+    findings_text = (
+        "対象ファイル:\n" + file_list_text + "\n\n指摘一覧:\n" + "\n".join(detail_lines)
+    )
+
+    text = FIX_RUBRIC.replace("{FILE_LIST_CWD}", repo_root).replace(
+        "{FINDINGS_TEXT}", findings_text)
+
+    for f in finding_group:
+        file_ = f.get("file", "")
+        title_ = f.get("title", "")
+        assert file_ in text, "finding file %r missing verbatim from goal text" % (file_,)
+        assert title_ in text, "finding title %r missing verbatim from goal text" % (title_,)
+
+    return {"text": text, "cwd": repo_root}
+
+
 def write_goals_jsonl(goals, out_path):
     """Write `goals` (list of dicts) as one JSON object per line (fleet_runner's
     goals-file format). Creates the parent directory if needed. Returns the count written."""
