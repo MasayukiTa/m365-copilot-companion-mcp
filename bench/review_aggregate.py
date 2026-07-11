@@ -29,6 +29,40 @@ _FINDINGS_RE = re.compile(
 
 _SEVERITIES = ("high", "medium", "low")
 
+# Matches a backslash that is NOT the start of a valid JSON escape sequence
+# (\" \\ \/ \b \f \n \r \t \uXXXX). Used to repair the single most common cause of
+# unparsable findings blocks in practice: M365 Copilot agents on Windows emit raw
+# Windows paths (C:\Users\..., .fleet\gaia\...) and regex snippets (\d, \g) inside
+# JSON string values without escaping the backslash, which is invalid JSON.
+_BAD_ESCAPE_RE = re.compile(r'\\(?!["\\/bfnrtu])')
+
+
+def _loads_tolerant(s):
+    """json.loads with one safe repair-and-retry fallback for invalid backslash
+    escapes. Never raises: returns the parsed object, or None if parsing fails even
+    after the repair.
+
+    Fast path: try json.loads(s) unchanged first -- already-valid JSON (the common
+    case) never touches the repair, so this cannot regress correct input.
+
+    Repair (only on JSONDecodeError): double every backslash that is not already
+    starting a valid JSON escape (see _BAD_ESCAPE_RE). This is the standard fix for
+    "Windows path pasted into a JSON string" -- `C:\\Users\\x` (invalid, \\U and \\x
+    are not JSON escapes) becomes `C:\\\\Users\\\\x` (valid, decodes back to a single
+    backslash each). Legitimate escapes like \\n, \\", \\uXXXX are left untouched by
+    the negative lookahead, so they still decode to newline/quote/unicode char, not a
+    literal backslash. Retried exactly once; if it still fails, give up and return
+    None (caller treats that the same as a JSONDecodeError today)."""
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    try:
+        repaired = _BAD_ESCAPE_RE.sub(r"\\\\", s)
+        return json.loads(repaired)
+    except Exception:
+        return None
+
 
 def _sanitize_findings(data):
     """Drop any non-dict entries from a parsed findings array (real agent output
@@ -66,10 +100,7 @@ def _extract_last_json_array(text, before_index=None):
         return None
     for start in reversed(starts[-300:]):
         candidate = region[start : close + 1]
-        try:
-            data = json.loads(candidate)
-        except Exception:
-            continue
+        data = _loads_tolerant(candidate)
         if isinstance(data, list):
             return data
     return None
@@ -98,10 +129,7 @@ def parse_findings_block(text):
 
     m = _FINDINGS_RE.search(text)
     if m:
-        try:
-            data = json.loads(m.group(1))
-        except Exception:
-            data = None
+        data = _loads_tolerant(m.group(1))
         if isinstance(data, list):
             return _sanitize_findings(data), False
 
