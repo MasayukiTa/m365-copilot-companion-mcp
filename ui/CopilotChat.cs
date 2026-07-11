@@ -1926,6 +1926,7 @@ class ChatWindow : Window
         new[]{"/research","Claude researcher で深掘り調査"},
         new[]{"/review","全ファイル/diff/指定パスをレビューし要約"},
         new[]{"/security-review","セキュリティ観点でレビュー"},
+        new[]{"/review-fix","レビューの指摘を修正（確認あり・自動バックアップ）"},
         new[]{"/analyze","アナリストでファイルを分析"},
         new[]{"/summarize","要約する"},
         new[]{"/translate","翻訳: /translate <言語> <文>"},
@@ -1944,6 +1945,7 @@ class ChatWindow : Window
         new[]{"/research","Deep research with the Claude researcher"},
         new[]{"/review","Review all files / diff / a path"},
         new[]{"/security-review","Security-focused review"},
+        new[]{"/review-fix","Fix review findings (confirm step, auto-backup)"},
         new[]{"/analyze","Analyze a file with the analyst"},
         new[]{"/summarize","Summarize"},
         new[]{"/translate","Translate: /translate <lang> <text>"},
@@ -2018,6 +2020,7 @@ class ChatWindow : Window
                 + "/research - deep research with the Claude researcher\n"
                 + "/review [diff|<path>] - review and summarize\n"
                 + "/security-review [diff|<path>] - security-focused review\n"
+                + "/review-fix [high|verified] - fix review findings (2-step confirm, auto-backup + undo)\n"
                 + "/analyze - analyze a file\n"
                 + "/summarize - summarize\n"
                 + "/translate <lang> <text> - translate\n"
@@ -2036,6 +2039,7 @@ class ChatWindow : Window
             + "/research - Claude researcher で深掘り調査\n"
             + "/review [diff|<パス>] - レビューして要約\n"
             + "/security-review [diff|<パス>] - セキュリティレビュー\n"
+            + "/review-fix [high|verified] - 指摘を修正（2段階確認・自動バックアップ＆undo）\n"
             + "/analyze - ファイル分析\n"
             + "/summarize - 要約\n"
             + "/translate <言語> <文> - 翻訳\n"
