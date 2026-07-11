@@ -3,8 +3,12 @@ from __future__ import annotations
 
 from bridge.review_command import (
     build_review_argv,
+    build_review_fix_argv,
+    format_fix_summary,
     format_review_summary,
+    parse_fix_run_output,
     parse_review_command,
+    parse_review_fix_command,
     parse_run_output,
 )
 
@@ -264,3 +268,218 @@ def test_format_summary_missing_finding_keys_tolerated():
 def test_format_summary_never_raises_on_garbage_agg_json():
     out = format_review_summary("review", {"high": 1}, {"by_severity": "not-a-dict"}, None)
     assert out.startswith("レビュー完了 (review)")
+
+
+# ---------------------------------------------------------------------------
+# parse_review_fix_command
+# ---------------------------------------------------------------------------
+
+def test_parse_review_fix_bare():
+    assert parse_review_fix_command("/review-fix") == {
+        "confirm": False, "min_severity": "medium", "verified_only": False,
+    }
+
+
+def test_parse_review_fix_confirm():
+    assert parse_review_fix_command("/review-fix confirm") == {
+        "confirm": True, "min_severity": "medium", "verified_only": False,
+    }
+
+
+def test_parse_review_fix_confirm_case_insensitive():
+    assert parse_review_fix_command("/review-fix CONFIRM") == {
+        "confirm": True, "min_severity": "medium", "verified_only": False,
+    }
+
+
+def test_parse_review_fix_high():
+    assert parse_review_fix_command("/review-fix high") == {
+        "confirm": False, "min_severity": "high", "verified_only": False,
+    }
+
+
+def test_parse_review_fix_verified():
+    assert parse_review_fix_command("/review-fix verified") == {
+        "confirm": False, "min_severity": "medium", "verified_only": True,
+    }
+
+
+def test_parse_review_fix_confirm_high_verified_combo():
+    assert parse_review_fix_command("/review-fix confirm high verified") == {
+        "confirm": True, "min_severity": "high", "verified_only": True,
+    }
+
+
+def test_parse_review_fix_no_slash():
+    assert parse_review_fix_command("review-fix confirm") == {
+        "confirm": True, "min_severity": "medium", "verified_only": False,
+    }
+
+
+def test_parse_review_fix_junk_token_ignored():
+    assert parse_review_fix_command("/review-fix nonsense") == {
+        "confirm": False, "min_severity": "medium", "verified_only": False,
+    }
+
+
+def test_parse_review_fix_confirm_only_as_first_token():
+    # "confirm" appearing AFTER other junk (not as the first remaining token) does not arm it.
+    assert parse_review_fix_command("/review-fix high confirm") == {
+        "confirm": False, "min_severity": "high", "verified_only": False,
+    }
+
+
+def test_parse_review_fix_empty_string():
+    assert parse_review_fix_command("") == {
+        "confirm": False, "min_severity": "medium", "verified_only": False,
+    }
+
+
+def test_parse_review_fix_whitespace_only():
+    assert parse_review_fix_command("   ") == {
+        "confirm": False, "min_severity": "medium", "verified_only": False,
+    }
+
+
+def test_parse_review_fix_none_input_never_raises():
+    assert parse_review_fix_command(None) == {
+        "confirm": False, "min_severity": "medium", "verified_only": False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# build_review_fix_argv
+# ---------------------------------------------------------------------------
+
+def test_build_fix_argv_dry_run_default_severity():
+    parsed = {"confirm": False, "min_severity": "medium", "verified_only": False}
+    argv = build_review_fix_argv(parsed, r"C:\repo", r"C:\repo\.venv\Scripts\python.exe",
+                                  dry_run=True)
+    assert argv[0] == r"C:\repo\.venv\Scripts\python.exe"
+    assert argv[1].endswith("review_fix.py")
+    assert "bench" in argv[1]
+    assert "--dry-run" in argv
+    assert argv[argv.index("--min-severity") + 1] == "medium"
+    assert "--verified-only" not in argv
+
+
+def test_build_fix_argv_no_dry_run_omits_flag():
+    parsed = {"confirm": True, "min_severity": "medium", "verified_only": False}
+    argv = build_review_fix_argv(parsed, r"C:\repo", r"C:\repo\.venv\Scripts\python.exe",
+                                  dry_run=False)
+    assert "--dry-run" not in argv
+
+
+def test_build_fix_argv_high_severity():
+    parsed = {"confirm": False, "min_severity": "high", "verified_only": False}
+    argv = build_review_fix_argv(parsed, r"C:\repo", r"C:\repo\.venv\Scripts\python.exe",
+                                  dry_run=True)
+    assert argv[argv.index("--min-severity") + 1] == "high"
+
+
+def test_build_fix_argv_verified_only():
+    parsed = {"confirm": False, "min_severity": "medium", "verified_only": True}
+    argv = build_review_fix_argv(parsed, r"C:\repo", r"C:\repo\.venv\Scripts\python.exe",
+                                  dry_run=True)
+    assert "--verified-only" in argv
+
+
+def test_build_fix_argv_defaults_on_missing_keys():
+    argv = build_review_fix_argv({}, r"C:\repo", r"C:\repo\.venv\Scripts\python.exe",
+                                  dry_run=True)
+    assert argv[argv.index("--min-severity") + 1] == "medium"
+    assert "--verified-only" not in argv
+
+
+# ---------------------------------------------------------------------------
+# parse_fix_run_output
+# ---------------------------------------------------------------------------
+
+def test_parse_fix_run_output_full():
+    stdout = (
+        "backed up 2 file(s) to C:\\repo\\.fleet\\review_fix\\backup_20260101_000000\n"
+        "launching 1 fix goal(s) on the free M365 fleet...\n"
+        "fix report: C:\\repo\\.fleet\\review_fix\\fix_report_20260101_000000.md\n"
+        "applied=3 skipped=1 test_gate=PASSED\n"
+        "backup: C:\\repo\\.fleet\\review_fix\\backup_20260101_000000\n"
+        "undo: C:\\repo\\.fleet\\review_fix\\undo_20260101_000000.bat "
+        "(or `C:\\repo\\.venv\\Scripts\\python.exe C:\\repo\\bench\\review_fix.py "
+        "--undo 20260101_000000`)\n"
+        "branch: review-fix-20260101_000000\n"
+    )
+    info = parse_fix_run_output(stdout)
+    assert info["fix_report_md"] == \
+        "C:\\repo\\.fleet\\review_fix\\fix_report_20260101_000000.md"
+    assert info["applied"] == 3
+    assert info["skipped"] == 1
+    assert info["test_gate"] == "PASSED"
+    assert info["backup_dir"] == "C:\\repo\\.fleet\\review_fix\\backup_20260101_000000"
+    assert info["undo_line"].startswith("C:\\repo\\.fleet\\review_fix\\undo_20260101_000000.bat")
+    assert info["branch"] == "review-fix-20260101_000000"
+    assert info["test_gate_failed"] is False
+
+
+def test_parse_fix_run_output_test_gate_failed():
+    stdout = (
+        "applied=1 skipped=0 test_gate=FAILED\n"
+        "TEST GATE FAILED -- NOT reverted. Inspect manually; undo available above.\n"
+    )
+    info = parse_fix_run_output(stdout)
+    assert info["test_gate"] == "FAILED"
+    assert info["test_gate_failed"] is True
+
+
+def test_parse_fix_run_output_empty_string():
+    info = parse_fix_run_output("")
+    assert info["fix_report_md"] is None
+    assert info["applied"] is None
+    assert info["test_gate_failed"] is False
+
+
+def test_parse_fix_run_output_none_input_never_raises():
+    info = parse_fix_run_output(None)
+    assert info["applied"] is None
+
+
+def test_parse_fix_run_output_no_branch_line_stays_none():
+    info = parse_fix_run_output("applied=0 skipped=0 test_gate=PASSED\n")
+    assert info["branch"] is None
+
+
+# ---------------------------------------------------------------------------
+# format_fix_summary
+# ---------------------------------------------------------------------------
+
+def test_format_fix_summary_full():
+    info = {
+        "fix_report_md": "C:\\repo\\fix_report.md",
+        "applied": 3, "skipped": 1, "test_gate": "PASSED",
+        "backup_dir": "C:\\repo\\backup_x", "undo_line": "undo_x.bat (or `cmd`)",
+        "branch": "review-fix-x", "test_gate_failed": False,
+    }
+    out = format_fix_summary(info)
+    assert out.startswith("修正完了")
+    assert "applied=3 skipped=1 test_gate=PASSED" in out
+    assert "バックアップ: C:\\repo\\backup_x" in out
+    assert "元に戻すには: undo_x.bat (or `cmd`)" in out
+    assert "git ブランチ: review-fix-x" in out
+    assert "詳細レポート: C:\\repo\\fix_report.md" in out
+    assert "テストゲート失敗" not in out
+
+
+def test_format_fix_summary_test_gate_failed_warns():
+    info = {"applied": 1, "skipped": 0, "test_gate": "FAILED", "test_gate_failed": True}
+    out = format_fix_summary(info)
+    assert "テストゲート失敗" in out
+
+
+def test_format_fix_summary_missing_fields_defaults():
+    out = format_fix_summary({})
+    assert "applied=0 skipped=0 test_gate=unknown" in out
+    assert "バックアップ" not in out
+    assert "詳細レポート" not in out
+
+
+def test_format_fix_summary_none_input_never_raises():
+    out = format_fix_summary(None)
+    assert out.startswith("修正完了")
