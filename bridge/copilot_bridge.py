@@ -312,7 +312,9 @@ HELP_TEXT = (
     "- `/research <調べたいこと>` — M365 リサーチ ツールを **Claude (Anthropic)** に切替えて deep research（確認→承認→本実行、数分）。`/deepresearch` `/dr` も同じ。\n"
     "- `/analyze <ファイルの絶対パス> | <分析指示>` — アナリストにデータファイルを渡して分析（数値は鵜呑みにせず自分でも確かめて）。`/an` も同じ。\n"
     "- `/review [diff|<path>]` — 全ファイル（または diff／指定パス）をレビューし要約を返す（数分〜）。\n"
-    "- `/security-review [diff|<path>]` — 同上、セキュリティ観点のレビュー。\n\n"
+    "- `/security-review [diff|<path>]` — 同上、セキュリティ観点のレビュー。\n"
+    "- `/review-fix [high|verified]` — レビューの指摘を修正（2段階: まず計画表示→ /review-fix confirm で実行。"
+    "ファイル編集あり・自動バックアップ＆ワンクリックundo付き）。\n\n"
     "### プロンプトテンプレート（このエージェントが即応答・通常ストリーム）\n"
     "- `/summarize <文章/トピック>` — 要点を箇条書きで簡潔に要約。\n"
     "- `/translate <言語> <文章>` — 指定言語へ翻訳。\n"
@@ -587,6 +589,19 @@ STOP_REQUESTED = False
 # use, and never burns the user's agent context mid-task. 0.0 (epoch) at startup so a probe is
 # allowed to run before the very first real turn.
 _LAST_USER_TURN_TS = 0.0
+# /review-fix is DESTRUCTIVE (it edits the user's own files), unlike /review and
+# /security-review which only ever read. It is therefore a MANDATORY two-step confirm:
+#   step 1: "/review-fix [high|verified]" runs bench/review_fix.py --dry-run (no files
+#           touched) and shows the plan, then ARMS _REVIEW_FIX_PENDING with the parsed
+#           filters and the current wallclock time.
+#   step 2: "/review-fix confirm" only actually runs the fix if it lands within
+#           REVIEW_FIX_CONFIRM_WINDOW_SEC seconds of that arm -- otherwise the user is told
+#           to re-run "/review-fix" first to see a fresh plan. A successful confirm clears
+#           the pending state immediately (single-use: one plan arms at most one execute).
+# Module-level (not per-session) is deliberate and matches STOP_REQUESTED/ACTIVE_SID above --
+# this bridge serves one interactive user at a time from one browser tab.
+_REVIEW_FIX_PENDING = {"ts": 0.0, "parsed": None}
+REVIEW_FIX_CONFIRM_WINDOW_SEC = 120
 
 
 class PageExecutor:
@@ -2575,6 +2590,12 @@ class Handler(BaseHTTPRequestHandler):
             # is no shared page state to protect). Handle it directly on this request
             # thread instead, before the PAGE_LOCK acquire below.
             _peek = msg.strip().lower()
+            # ORDER MATTERS: "/review-fix".startswith("/review") is True, so the more-specific
+            # /review-fix (and /reviewfix) prefix MUST be checked before the plain /review
+            # prefix below, or a naive /review check would swallow every /review-fix call.
+            if _peek.startswith("/review-fix") or _peek.startswith("/reviewfix"):
+                self._review_fix_stream(msg)
+                return
             if (_peek.startswith("/review") or _peek.startswith("/security-review")
                     or _peek.startswith("/securityreview")):
                 self._review_stream(msg)
@@ -2953,6 +2974,12 @@ class Handler(BaseHTTPRequestHandler):
             self._delegate("researcher", arg); return
         if token in ("analyze", "an"):
             self._delegate("analyst", arg); return
+        if token in ("review-fix", "reviewfix"):
+            # Defensive fallback only -- see the review/security-review branch below for why:
+            # the normal entry point is do_GET's /stream peek (checked BEFORE the plain
+            # /review peek there), which calls _review_fix_stream directly.
+            self._review_fix_stream(cmd if cmd.startswith("/") else "/" + cmd)
+            return
         if token in ("review", "security-review", "securityreview"):
             # Defensive fallback only: the normal entry point is do_GET's /stream peek,
             # which calls _review_stream directly (bypassing PAGE_LOCK) before ever reaching
@@ -3124,6 +3151,162 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             try:
                 self._sse({"delta": "レビュー実行中にエラー: " + type(e).__name__})
+                self._sse({}, "done")
+            except Exception:
+                pass
+
+    def _run_fix_subprocess(self, argv, repo_root, forward_prefixes):
+        """Launch `argv` (a bench/review_fix.py invocation) as a subprocess, forward stdout
+        lines whose lowercased/stripped text starts with any of forward_prefixes as SSE
+        deltas, and return the FULL captured stdout (every line, forwarded or not) as one
+        string once the process exits.
+
+        Mirrors _review_stream's reader-thread/ping loop (read the subprocess's stdout on a
+        background thread so this thread can keep pinging the SSE connection every 5s --
+        detecting an Esc/Stop disconnect promptly -- even while review_fix.py is silently
+        working between print()s for minutes at a time). Factored out here (rather than
+        duplicated inline) because /review-fix needs to run a subprocess TWICE per full
+        cycle (the --dry-run plan, then later the real fix) and both need identical
+        streaming behavior, just different forward_prefixes.
+        """
+        proc = subprocess.Popen(
+            argv, cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        line_q: "queue.Queue[str | None]" = queue.Queue()
+
+        def _reader():
+            try:
+                for line in proc.stdout:
+                    line_q.put(line)
+            except Exception:
+                pass
+            finally:
+                line_q.put(None)   # sentinel: stdout closed / reader done
+
+        reader_thread = threading.Thread(target=_reader, daemon=True)
+        reader_thread.start()
+
+        full_lines = []
+        while True:
+            try:
+                line = line_q.get(timeout=5.0)
+            except queue.Empty:
+                self._ping()             # detect Esc/Stop disconnect promptly
+                continue
+            if line is None:
+                break
+            full_lines.append(line)
+            stripped = line.strip()
+            if stripped.lower().startswith(forward_prefixes):
+                self._sse({"delta": stripped + "\n"})
+
+        proc.wait()
+        return "".join(full_lines)
+
+    def _review_fix_stream(self, msg: str):
+        """Handle /review-fix: a two-step-confirm wrapper around bench/review_fix.py, which
+        (unlike /review and /security-review) actually EDITS the user's files -- so it is
+        NEVER allowed to run on the first message.
+
+        Called DIRECTLY from do_GET's /stream peek (checked BEFORE the plain /review peek
+        there -- see the ordering comment at that call site, since
+        "/review-fix".startswith("/review") is true), on the request thread -- NOT via
+        run_on_page_thread, and NOT under PAGE_LOCK, for the same reason /review bypasses
+        it: review_fix.py shells out to the FREE M365 fleet on the separate :9222 Edge and
+        never touches this bridge's own PAGE/DRIVER (:9223). Writes the SAME SSE preamble as
+        _stream/_review_stream so the client side is indistinguishable.
+
+        Two-step confirm (see _REVIEW_FIX_PENDING's module-level docstring for the state
+        shape):
+          - parsed["confirm"] is False (STEP 1, plan): runs bench/review_fix.py --dry-run,
+            which review_fix.py's own --dry-run branch guarantees is read-only (plan only,
+            no backup, no git, fleet NOT launched -- see its "DRY RUN -- plan only..." print).
+            Streams the plan, then ARMS _REVIEW_FIX_PENDING = {"ts": now, "parsed": parsed}
+            and appends the confirm instruction. NO file edits happen on this path, ever.
+          - parsed["confirm"] is True (STEP 2, execute): only proceeds if
+            _REVIEW_FIX_PENDING was armed within REVIEW_FIX_CONFIRM_WINDOW_SEC seconds of
+            now; otherwise tells the user to re-run /review-fix first (no fix runs). If
+            still within the window, clears _REVIEW_FIX_PENDING FIRST -- before launching
+            the subprocess -- so a duplicate/concurrent "/review-fix confirm" can never
+            double-launch a second real fix off the same armed plan (single-use arm).
+            Then runs the REAL (non-dry-run) fix and posts the final structured summary
+            (files changed, backup path, exact undo instruction) built from its stdout.
+
+        Exception-guarded end-to-end: nothing here is allowed to raise into the request
+        thread.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        try:
+            global _REVIEW_FIX_PENDING
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            venvpy = os.path.join(repo_root, ".venv", "Scripts", "python.exe")
+
+            if not os.path.exists(venvpy):
+                self._sse({"delta": ".venv python が見つかりません。quickstart.bat を実行してください。"})
+                self._sse({}, "done")
+                return
+
+            parsed = review_command.parse_review_fix_command(msg)
+
+            if not parsed["confirm"]:
+                # STEP 1: plan only, via --dry-run. review_fix.py's --dry-run branch never
+                # writes a backup, never touches git, and never launches the fleet -- so
+                # this whole branch is guaranteed read-only regardless of what its stdout
+                # says.
+                argv = review_command.build_review_fix_argv(
+                    parsed, repo_root, venvpy, dry_run=True)
+                self._sse({"delta": "修正プランを作成します（--dry-run、ファイルは変更されません）...\n"})
+                full_stdout = self._run_fix_subprocess(argv, repo_root, (
+                    "dry run", "report:", "findings", "goals", "fleet cmd:", "git bonus",
+                ))
+                if not full_stdout.strip():
+                    self._sse({"delta": "(出力なし。まず /review でレポートを作成してください。)\n"})
+
+                self._sse({"delta": (
+                    "\nバックアップ先: .fleet/review_fix/backup_<timestamp>/ "
+                    "(実行時に自動作成、undo_<timestamp>.bat をダブルクリックで元に戻せます)\n"
+                )})
+
+                _REVIEW_FIX_PENDING = {"ts": time.time(), "parsed": parsed}
+                self._sse({"delta": (
+                    "⚠ これはファイルを編集します。実行するには %d 秒以内に "
+                    "`/review-fix confirm` と入力してください。"
+                ) % REVIEW_FIX_CONFIRM_WINDOW_SEC})
+                self._sse({}, "done")
+                return
+
+            # STEP 2: execute for real -- but only within the confirm window of an armed plan.
+            pending = _REVIEW_FIX_PENDING
+            now = time.time()
+            if not pending.get("parsed") or \
+                    (now - pending.get("ts", 0.0)) > REVIEW_FIX_CONFIRM_WINDOW_SEC:
+                self._sse({"delta": "先に `/review-fix` を実行して内容を確認してください。"})
+                self._sse({}, "done")
+                return
+
+            fix_parsed = pending["parsed"]
+            _REVIEW_FIX_PENDING = {"ts": 0.0, "parsed": None}   # single-use: clear before running
+
+            argv = review_command.build_review_fix_argv(
+                fix_parsed, repo_root, venvpy, dry_run=False)
+            self._sse({"delta": "修正を実行します（ファイルを編集します。数分〜）...\n"})
+            full_stdout = self._run_fix_subprocess(argv, repo_root, (
+                "fleet:", "launching", "goals:", "backup", "backed", "undo", "report",
+                "fix report", "warning", "summary", "変更", "バックアップ",
+            ))
+
+            info = review_command.parse_fix_run_output(full_stdout)
+            summary_text = review_command.format_fix_summary(info)
+            self._sse({"delta": summary_text})
+            self._sse({}, "done")
+        except Exception as e:
+            try:
+                self._sse({"delta": "修正実行中にエラー: " + type(e).__name__})
                 self._sse({}, "done")
             except Exception:
                 pass
