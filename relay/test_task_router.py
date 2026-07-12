@@ -9,13 +9,12 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import relay.task_router as tr
 
-_fails = []
-
-
 def check(name, cond):
-    if not cond:
-        _fails.append(name)
+    """Print a PASS/FAIL line (handy for the standalone `python relay/test_task_router.py`
+    run) and raise a real AssertionError on failure so pytest sees it as a normal failing
+    test rather than a silently-swallowed bookkeeping entry."""
     print(("PASS " if cond else "FAIL ") + name)
+    assert cond, name
 
 
 def _use_tmp_tasks():
@@ -272,7 +271,14 @@ def test_dispatch_awaiting_gate_flow():
           os.path.isfile(os.path.join(d, "done", "gate2.json")))
 
 
-if __name__ == "__main__" or True:
+if __name__ == "__main__":
+    # Manual/standalone iteration path only -- pytest never executes this block, because
+    # pytest imports the module (running only top-level code, not this __main__ guard) and
+    # then calls each test_* function itself, independently, during its own run phase. That
+    # eager-on-import hazard (this used to read `if __name__ == "__main__" or True:`) is
+    # exactly what turned a normal failing check into a pytest INTERNALERROR during
+    # collection -- the `or True` ran the whole suite as a side effect of importing the
+    # module, and a failing check()'s sys.exit(1) killed the collector mid-import.
     test_destination_routing()
     test_local_shell_and_python()
     test_file_roundtrip()
@@ -283,6 +289,4 @@ if __name__ == "__main__" or True:
     test_job_gate_modes()
     test_h3_file_path_floor()
     test_dispatch_awaiting_gate_flow()
-    print("\n%s" % ("ALL PASS" if not _fails else "FAILURES: " + ", ".join(_fails)))
-    if _fails:
-        sys.exit(1)
+    print("\nALL PASS")
