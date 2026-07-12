@@ -15,6 +15,7 @@ writes the result back. Three destinations:
 Queue layout (all under .fleet/tasks/):
   pending/<id>.json   incoming jobs           {id, type, payload, created}
   running/<id>.json   claimed (in progress)
+  awaiting/<id>.json  LOCAL job held for human approval (see approval gate below)
   done/<id>.json      finished                {..., status, result, error, ts_done}
   for_fleet/<id>.txt  FLEET handoff (a goal the relay fleet consumes)
   for_claude/<id>.json CLAUDE handoff (escalation the agent picks up)
@@ -26,16 +27,23 @@ Design notes:
     {status:"error"} result, so one bad job can't wedge the loop.
   * FLEET/CLAUDE jobs are not executed here; they're written as a handoff artifact and marked
     {status:"dispatched"} -- the fleet runner / Claude agent completes them and writes done/.
+  * LOCAL jobs pass through a 3-mode approval gate (TASK_JOB_APPROVAL_MODE, see job_gate()
+    below) before they execute -- a CONFIRM decision moves the job to awaiting/ and raises a
+    desktop-notification HITL gate instead of running it or blocking the dispatch loop.
 """
+import hashlib
 import json
 import os
 import subprocess
 import sys
+import time
+from pathlib import Path
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TASKS = os.path.join(REPO, ".fleet", "tasks")
-SUBDIRS = ("pending", "running", "done", "for_fleet", "for_claude")
+SUBDIRS = ("pending", "running", "done", "awaiting", "for_fleet", "for_claude")
 VENVPY = os.path.join(REPO, ".venv", "Scripts", "python.exe")
+APPROVED_JOBS_FILE = os.path.join(REPO, ".fleet", "approved_jobs.json")
 
 # type -> destination. Unknown types default to CLAUDE (the most capable fallback).
 DESTINATION = {
@@ -51,6 +59,64 @@ DEFAULT_DESTINATION = "claude"
 
 # A job may force its destination with payload {"escalate": true} -> CLAUDE, regardless of type.
 LOCAL_TIMEOUT_S = int(os.environ.get("TASK_LOCAL_TIMEOUT_S", "120"))
+
+# ── Job-approval gate (Claude-Code-style 3-mode) ───────────────────────────────────────────────
+# A job dropped into .fleet/tasks/pending gives LOCAL shell/python/file execution. Without this
+# gate that is unconditional arbitrary execution for anyone who can write a job file. Modes:
+#   default -- first time a job CLASS is seen it always confirms (desktop-notification gate,
+#              job held in awaiting/); once a human approves that class, later same-class jobs
+#              auto-run -- UNLESS the specific payload is itself flagged destructive (see
+#              job_gate() below: an approved class never bypasses a fresh destructive check).
+#   auto    -- purely STATIC risk check (never executes the payload to test it): clean -> run,
+#              a STOP-pattern -> deny, an ASK-pattern -> fall back to a confirm gate.
+#   bypass  -- current (pre-gate) behavior: run anything. The H3 path floor (see _exec_file /
+#              _resolve_file_path) still applies in this mode -- it is not part of the 3-mode
+#              gate, it is an always-on hard floor.
+# SHIPPED DEFAULT = "default" so a fresh install is protected out of the box.
+TASK_JOB_APPROVAL_MODE = os.environ.get("TASK_JOB_APPROVAL_MODE", "default").strip().lower()
+if TASK_JOB_APPROVAL_MODE not in ("default", "auto", "bypass"):
+    TASK_JOB_APPROVAL_MODE = "default"
+
+# REPO is already computed above; make sure it's importable as a package root so the
+# absolute imports below (tools.*, relay.*) resolve regardless of how this module was
+# launched (`python relay/task_router.py` puts relay/ on sys.path[0], not REPO).
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+
+# These helpers are reused, not reimplemented (see module docstring / design notes below).
+# Imports are defensive: the router must stay importable even if tools/relay siblings are
+# absent from a stripped-down deployment -- job_gate() then degrades to "never flags risk",
+# which only matters in "auto" mode; "default" mode still gates on first-seen-class alone.
+try:
+    from tools.contract_gate import destructive_shell as _destructive_shell
+    from tools.contract_gate import destructive_python as _destructive_python
+except Exception:
+    def _destructive_shell(_text):
+        return False
+
+    def _destructive_python(_text):
+        return False
+
+try:
+    from relay.autonomy_gate import _STOP_PATTERNS, _ASK_PATTERNS, _matches as _autonomy_matches
+except Exception:
+    _STOP_PATTERNS = ()
+    _ASK_PATTERNS = ()
+
+    def _autonomy_matches(_text, _patterns):
+        return []
+
+try:
+    from tools.file_ops import _validate_path, ALLOWED_BASE
+except Exception:
+    _validate_path = None
+    ALLOWED_BASE = None
+
+try:
+    from tools.notify_ops import notify_desktop
+except Exception:
+    def notify_desktop(_title, _body):
+        return None
 
 
 def destination_for(job):
@@ -123,12 +189,55 @@ def _exec_screenshot(payload):
     return "error", None, ((r.stderr or r.stdout or "screenshot failed")[:2000])
 
 
+def _resolve_file_path(path, allow_outside):
+    """Resolve `path` and enforce the H3 hard floor. ALWAYS ON, mode-independent -- this
+    is NOT part of the 3-mode approval gate above; it applies in every mode, including
+    "bypass". Threat model: anyone who can write a job file into .fleet/tasks/pending gets
+    this code path, independent of whatever MCP_ALLOWED_BASE happens to be (which may be
+    default-open / unrestricted -- see tools/file_ops.py's default-open policy). So on top
+    of tools.file_ops._validate_path() (which honors MCP_ALLOWED_BASE when it IS restricted),
+    a file job must resolve under REPO (or an explicit TASK_FILE_ALLOWED_BASE env root)
+    unless the payload sets an explicit allow_outside=true.
+
+    Returns (resolved_path_str, None) on success, or (None, error_message) on rejection.
+    """
+    try:
+        if _validate_path is not None:
+            resolved = str(_validate_path(path))
+        else:
+            resolved = str(Path(path).expanduser().resolve())
+    except PermissionError as e:
+        return None, "path rejected: %s" % e
+    except Exception as e:
+        return None, "path validation failed: %s: %s" % (type(e).__name__, e)
+    if not allow_outside:
+        allowed_root = os.environ.get("TASK_FILE_ALLOWED_BASE", "").strip() or REPO
+        try:
+            allowed_root_r = os.path.realpath(allowed_root)
+            resolved_r = os.path.realpath(resolved)
+            if os.path.commonpath([allowed_root_r, resolved_r]) != allowed_root_r:
+                return None, ("file path %r is outside the allowed root %r "
+                              "(set payload.allow_outside=true to override)" % (resolved, allowed_root_r))
+        except ValueError:
+            # commonpath raises on e.g. mixed Windows drive letters -- definitely outside
+            return None, ("file path %r is outside the allowed root %r "
+                          "(different drive)" % (resolved, allowed_root))
+    return resolved, None
+
+
 def _exec_file(payload):
-    """Read or write a file. payload {op:'read'|'write', path, content?}."""
+    """Read or write a file. payload {op:'read'|'write', path, content?, allow_outside?}."""
     op = payload.get("op")
     path = payload.get("path")
     if not path:
         return "error", None, "file job missing 'path'"
+    try:
+        resolved, err = _resolve_file_path(path, payload.get("allow_outside"))
+    except Exception as e:
+        return "error", None, "path validation failed: %s: %s" % (type(e).__name__, e)
+    if err:
+        return "error", None, err
+    path = resolved
     if op == "read":
         with open(path, encoding="utf-8", errors="replace") as f:
             return "ok", {"content": f.read()[:50000]}, None
@@ -145,6 +254,191 @@ LOCAL_EXECUTORS = {
 }
 
 
+# ── Job-approval gate: class key, allowlist store, static risk, decision ──────────────────────
+
+def _job_class_key(job_type, payload):
+    """Pure fn: map (job_type, payload) -> a stable class-key string for the approval
+    allowlist. Deliberately granular: "git status" and "git push --force" are DISTINCT
+    classes -- collapsing to just the program name (e.g. "git") would let one approval of
+    a benign invocation silently cover a destructive one later. shell/python key on the
+    first two whitespace-normalized tokens of the command/code; file keys on
+    (op, resolved parent dir). Hermetically testable: no I/O besides path resolution."""
+    payload = payload or {}
+    if job_type == "shell":
+        cmd = (payload.get("cmd") or payload.get("command") or "").split()
+        return "shell::%s" % " ".join(cmd[:2])
+    if job_type == "python":
+        code = (payload.get("code") or "").split()
+        return "python::%s" % " ".join(code[:2])
+    if job_type == "file":
+        op = payload.get("op") or ""
+        path = payload.get("path") or ""
+        try:
+            parent = os.path.dirname(os.path.abspath(os.path.expanduser(str(path))))
+        except Exception:
+            parent = ""
+        return "file::%s::%s" % (op, parent)
+    return "%s::" % job_type
+
+
+def _load_approved_jobs():
+    """Return {"classes": {key: {approved_at, example}}}. Tolerates a missing or corrupt
+    store file -- always returns a well-formed dict, never raises."""
+    try:
+        with open(APPROVED_JOBS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("classes"), dict):
+            return data
+    except Exception:
+        pass
+    return {"classes": {}}
+
+
+def _save_approved_jobs(data):
+    """Atomic write (tmp + os.replace) so a crash mid-write can't corrupt the store."""
+    try:
+        os.makedirs(os.path.dirname(APPROVED_JOBS_FILE) or ".", exist_ok=True)
+        tmp = APPROVED_JOBS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, APPROVED_JOBS_FILE)
+    except Exception:
+        pass
+
+
+def _is_class_approved(key):
+    return key in (_load_approved_jobs().get("classes") or {})
+
+
+def _approve_class(key, example=""):
+    data = _load_approved_jobs()
+    classes = data.setdefault("classes", {})
+    classes[key] = {"approved_at": time.time(), "example": str(example)[:200]}
+    _save_approved_jobs(data)
+
+
+def _static_risk(job_type, payload):
+    """Static risk check -- NEVER executes the payload. Returns (level, reason) with
+    level in {"clean", "ask", "stop"}. Reuses tools.contract_gate's deterministic regex
+    classifiers (tuned not to false-positive on pytest / git status / git add / commit /
+    builds) plus relay.autonomy_gate's broader push/deploy/secrets/PII vocabulary."""
+    payload = payload or {}
+    if job_type == "shell":
+        cmd = payload.get("cmd") or payload.get("command") or ""
+        if _destructive_shell(cmd):
+            return "stop", "matched destructive-shell pattern"
+        if _autonomy_matches(cmd, _STOP_PATTERNS):
+            return "stop", "matched autonomy STOP pattern"
+        if _autonomy_matches(cmd, _ASK_PATTERNS):
+            return "ask", "matched autonomy ASK pattern"
+        return "clean", ""
+    if job_type == "python":
+        code = payload.get("code") or ""
+        if _destructive_python(code):
+            return "stop", "matched destructive-python pattern"
+        if _autonomy_matches(code, _STOP_PATTERNS):
+            return "stop", "matched autonomy STOP pattern"
+        if _autonomy_matches(code, _ASK_PATTERNS):
+            return "ask", "matched autonomy ASK pattern"
+        return "clean", ""
+    if job_type == "file":
+        path = payload.get("path") or ""
+        try:
+            _resolved, err = _resolve_file_path(path, payload.get("allow_outside"))
+        except Exception as e:
+            return "ask", "path validation failed: %s: %s" % (type(e).__name__, e)
+        if err:
+            return "ask", err
+        return "clean", ""
+    return "clean", ""
+
+
+def job_gate(job_type, payload, mode):
+    """Decide ALLOW / CONFIRM / DENY for a LOCAL job before it runs. NEVER executes the
+    payload to test it -- purely static analysis + the approved-class allowlist. Returns
+    (decision, reason)."""
+    payload = payload or {}
+    if mode == "bypass":
+        return "ALLOW", "bypass"
+
+    level, why = _static_risk(job_type, payload)
+
+    if mode == "auto":
+        if level == "stop":
+            return "DENY", why or "matched STOP pattern"
+        if level == "ask":
+            return "CONFIRM", why or "matched ASK pattern"
+        return "ALLOW", "static check clean"
+
+    # mode == "default"
+    key = _job_class_key(job_type, payload)
+    if _is_class_approved(key):
+        # CRITICAL SAFETY MITIGATION: an approved class only auto-ALLOWs when THIS
+        # payload ALSO passes the static risk check right now -- never silently
+        # auto-run a destructive command just because its class was approved once.
+        if level == "clean":
+            return "ALLOW", "class previously approved (%s) and payload clean" % key
+        return "CONFIRM", "class approved but this payload is risky (%s): %s" % (level, why)
+    return "CONFIRM", "first-seen class (%s) requires approval" % key
+
+
+def _gate_token_for_class(key):
+    """Derive a stable gate token from the job CLASS key (not the job id), so one human
+    approval unblocks every queued same-class job sitting in awaiting/, mirroring
+    tools/contract_gate.py's _stable_token(op_class, detail) pattern."""
+    h = hashlib.sha256(("task_router_job_class::%s" % key).encode("utf-8")).hexdigest()[:16]
+    return "gate_%s" % h
+
+
+def _write_job_gate(token, question, context):
+    """Write a HITL gate file DIRECTLY -- same shape and directory as
+    tools/contract_gate.py's _create_gate() / tools/gate_ops.py's GATE_DIR
+    (ALLOWED_BASE/.companion_gates/<token>.json with fields {token, question, context,
+    asked_at, answered, answer}) -- so relay/fleet_runner.py:_pending_gates() (which scans
+    that directory) and the cockpit's Approve/Deny UI pick it up automatically. No cockpit
+    changes needed.
+
+    Deliberately does NOT call tools/gate_ops.gate_ask(): that function calls
+    require_unlocked(), which DENIES outside an HTTP request context, and task_router runs
+    as a standalone process (no HTTP request in flight)."""
+    if ALLOWED_BASE is None:
+        return
+    try:
+        gate_dir = ALLOWED_BASE / ".companion_gates"
+        gate_dir.mkdir(parents=True, exist_ok=True)
+        gate_file = gate_dir / ("%s.json" % token)
+        if gate_file.is_file():
+            return  # already posted -- don't clobber a gate that may already be answered
+        payload = {
+            "token": token,
+            "question": question,
+            "context": context,
+            "asked_at": time.time(),
+            "answered": False,
+            "answer": None,
+        }
+        gate_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            notify_desktop("ジョブ承認が必要です / Job approval needed", question[:180])
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _read_job_gate(token):
+    """Read a gate file written by _write_job_gate(). Returns dict or None (missing/bad)."""
+    if ALLOWED_BASE is None:
+        return None
+    try:
+        gate_file = ALLOWED_BASE / ".companion_gates" / ("%s.json" % token)
+        if not gate_file.is_file():
+            return None
+        return json.loads(gate_file.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
 def run_job(job, now_ts=None):
     """Execute (LOCAL) or hand off (FLEET/CLAUDE) a single job. Returns the done-record dict.
     Never raises -- any failure is captured as status 'error'."""
@@ -154,12 +448,31 @@ def run_job(job, now_ts=None):
            "ts_done": now_ts, "status": None, "result": None, "error": None}
     try:
         if dest == "local":
-            fn = LOCAL_EXECUTORS.get(job.get("type"))
+            job_type = job.get("type")
+            fn = LOCAL_EXECUTORS.get(job_type)
             if not fn:
-                rec["status"], rec["error"] = "error", "no local executor for type %r" % job.get("type")
+                rec["status"], rec["error"] = "error", "no local executor for type %r" % job_type
             else:
                 payload = dict(job.get("payload") or {}, id=jid)
-                rec["status"], rec["result"], rec["error"] = fn(payload)
+                # ── approval gate chokepoint: this is where TASK_JOB_APPROVAL_MODE bites,
+                # immediately before fn(payload) would otherwise run unconditionally ──
+                decision, reason = job_gate(job_type, payload, TASK_JOB_APPROVAL_MODE)
+                if decision == "ALLOW":
+                    rec["status"], rec["result"], rec["error"] = fn(payload)
+                elif decision == "DENY":
+                    rec["status"], rec["error"] = "denied", reason
+                else:  # CONFIRM -- hold the job, raise a desktop gate, do NOT block the loop
+                    key = _job_class_key(job_type, payload)
+                    token = _gate_token_for_class(key)
+                    detail = (payload.get("cmd") or payload.get("command") or
+                              payload.get("code") or payload.get("path") or "")
+                    question = ("ジョブ承認: %s %s ? "
+                                "(このクラスを許可すると次回以降自動実行) / "
+                                "Approve job class %r ?" % (job_type, str(detail)[:160], key))
+                    _write_job_gate(token, question, "task_router job class: %s" % key)
+                    rec["status"] = "awaiting_approval"
+                    rec["result"] = {"gate_token": token, "class_key": key}
+                    rec["error"] = reason
         elif dest == "fleet":
             # write a goal the relay fleet consumes (one goal per line / file)
             goal = (job.get("payload") or {}).get("goal") or (job.get("payload") or {}).get("text", "")
@@ -178,7 +491,10 @@ def run_job(job, now_ts=None):
 
 
 def dispatch_once(now_ts=None):
-    """Claim and process every pending job. Returns the list of done-records produced."""
+    """Claim and process every pending job, then re-check jobs already held in awaiting/
+    for a gate answer. Returns the list of done/awaiting-records produced. Non-blocking:
+    a CONFIRM decision moves the job to awaiting/ instead of sleeping for a human click,
+    so this call always returns promptly regardless of approval-gate state."""
     ensure_dirs()
     out = []
     for name in sorted(os.listdir(_p("pending", ""))):
@@ -196,9 +512,79 @@ def dispatch_once(now_ts=None):
         except Exception as e:
             job = {"id": name[:-5], "type": None, "payload": {}, "_parse_error": str(e)}
         rec = run_job(job, now_ts=now_ts)
-        with open(_p("done", name), "w", encoding="utf-8") as f:
-            json.dump(rec, f, ensure_ascii=False, indent=2)
-        os.remove(claimed)
+        if rec.get("status") == "awaiting_approval":
+            # non-blocking: move the claimed job (unchanged) into awaiting/ so a later
+            # poll can pick it back up once the human answers the gate. No done/ write,
+            # no sleep -- the loop keeps servicing the rest of the pending queue.
+            try:
+                os.replace(claimed, _p("awaiting", name))
+            except OSError:
+                pass  # best-effort; job stays claimed in running/ rather than being lost
+        else:
+            with open(_p("done", name), "w", encoding="utf-8") as f:
+                json.dump(rec, f, ensure_ascii=False, indent=2)
+            os.remove(claimed)
+        out.append(rec)
+    out.extend(_recheck_awaiting(now_ts=now_ts))
+    return out
+
+
+def _recheck_awaiting(now_ts=None):
+    """Re-scan awaiting/ for jobs whose gate has since been answered by a human (the
+    cockpit, or anything writing the same gate-file shape). Never sleeps/blocks --
+    unanswered gates are simply left in place for the next tick.
+
+    approved  -> record the class in the approved_jobs.json allowlist, actually run the
+                 job (this is the ONLY place a CONFIRM-ed job executes), move to done/.
+    denied    -> write done/ with status="denied" (never executed).
+    unanswered -> leave the job in awaiting/ untouched.
+    """
+    out = []
+    ensure_dirs()
+    try:
+        names = sorted(os.listdir(_p("awaiting", "")))
+    except OSError:
+        return out
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = _p("awaiting", name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                job = json.load(f)
+        except Exception:
+            continue  # unreadable -- leave it for manual inspection rather than losing it
+        jid = job.get("id", name[:-5] if name.endswith(".json") else name)
+        job_type = job.get("type")
+        payload = dict(job.get("payload") or {}, id=jid)
+        key = _job_class_key(job_type, payload)
+        token = _gate_token_for_class(key)
+        gate = _read_job_gate(token)
+        if gate is None or not gate.get("answered"):
+            continue  # still waiting -- no sleep, just move on to the next tick
+        answer = str(gate.get("answer") or "").lower().strip()
+        rec = {"id": jid, "type": job_type, "destination": "local",
+               "ts_done": now_ts, "status": None, "result": None, "error": None}
+        try:
+            if answer == "approved":
+                _approve_class(key, example=json.dumps(payload, ensure_ascii=False)[:200])
+                fn = LOCAL_EXECUTORS.get(job_type)
+                if not fn:
+                    rec["status"], rec["error"] = "error", "no local executor for type %r" % job_type
+                else:
+                    rec["status"], rec["result"], rec["error"] = fn(payload)
+            else:
+                rec["status"], rec["error"] = "denied", "gate answered: %r" % answer
+        except subprocess.TimeoutExpired:
+            rec["status"], rec["error"] = "error", "timeout after %ds" % LOCAL_TIMEOUT_S
+        except Exception as e:
+            rec["status"], rec["error"] = "error", "%s: %s" % (type(e).__name__, e)
+        try:
+            with open(_p("done", name), "w", encoding="utf-8") as f:
+                json.dump(rec, f, ensure_ascii=False, indent=2)
+            os.remove(path)
+        except OSError:
+            pass
         out.append(rec)
     return out
 
@@ -214,7 +600,6 @@ def main():
         recs = dispatch_once()
         print(json.dumps(recs, ensure_ascii=False))
         return
-    import time
     print("task_router: polling %s every %ss" % (_p("pending", ""), args.poll_s))
     while True:
         for rec in dispatch_once():
