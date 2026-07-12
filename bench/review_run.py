@@ -1,4 +1,4 @@
-"""Orchestrate a full code/security review run on the free M365 Copilot fleet.
+"""Orchestrate a full code/security review run on the M365 Copilot fleet.
 
 Ties together the pure goal-builder (bench/review_build_goals.py) and the pure aggregator
 (bench/review_aggregate.py) with the one impure step in between: launching
@@ -115,7 +115,7 @@ def fleet_cmd(goals_path, max_concurrent, effort):
 def run_fleet(goals_path, max_concurrent, effort):
     """The ONE function that touches the fleet subprocess -- isolated so tests can
     monkeypatch it out entirely without a real Popen. Blocks until the fleet run exits
-    (fleet_runner drives the free M365 Copilot fleet on companion Edge :9222); returns its
+    (fleet_runner drives the M365 Copilot fleet on companion Edge :9222); returns its
     return code. Writes .fleet/status.json and .fleet/transcripts/* as a side effect."""
     cmd = fleet_cmd(goals_path, max_concurrent, effort)
     print("fleet: " + " ".join(cmd[1:]))
@@ -256,7 +256,7 @@ def main(argv=None):
               (args.mode, args.target_path or "(none)"))
         return 0
 
-    print("launching %d review goal(s) on the free M365 fleet..." % len(goals))
+    print("launching %d review goal(s)..." % len(goals))
     run_fleet(goals_path, args.max_concurrent, args.effort)
 
     status_path = os.path.join(repo_root, ".fleet", "status.json")
