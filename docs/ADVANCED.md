@@ -1,6 +1,6 @@
 # 上級者向け機能
 
-relay / fleet の細かい制御、bridge UI、ODBC 接続、ツール自己生成、OpenAI 互換エンドポイント、性能ベンチの詳細など、本文に載せない話をまとめます。全体像は [README](../README.md)、内部構造は [ARCHITECTURE.md](ARCHITECTURE.md) を先に読んでください。
+relay / fleet の細かい制御、bridge UI、ODBC 接続、ツール自己生成、性能ベンチの詳細など、本文に載せない話をまとめます。全体像は [README](../README.md)、内部構造は [ARCHITECTURE.md](ARCHITECTURE.md) を先に読んでください。
 
 ---
 
@@ -230,12 +230,6 @@ Dev Tunnel は不要です。`.\scripts\start.ps1` でサーバーを起動し�
 ```
 
 この経路は devtunnel も Entra ID も Copilot ライセンスも不要で、Claude Desktop さえあれば誰でも使えます。
-
----
-
-## OpenAI 互換エンドポイント（`:8011`）
-
-companion を `:8011` の OpenAI 互換エンドポイント経由で駆動できます。map-mode ツール（`run_python` による計算・`web_search` によるグラウンディング）を付与でき、GAIA ベンチはこの経路で実行しています。長寿命の単一会話は Copilot の composer が数十ターンで送信不能（wedge）になるため、relay worker が (1) 送信エラー時の会話リセット＋同一プロンプト 1 回再試行、(2) タイムアウト時は次問を強制リフレッシュ、(3) `RELAY_RESET_EVERY` 問ごとの予防的会話リサイクルを行います（`relay/openai_adapter.py`）。
 
 ---
 

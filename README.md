@@ -230,7 +230,7 @@ A. `quickstart.bat` も `start_all.bat` も冪等です。**いつ何度実行�
 - [docs/CONFIG.md](docs/CONFIG.md) — `.env` 全キーのリファレンス
 - [docs/SECURITY.md](docs/SECURITY.md) — 認証・認可モデルと運用上の注意
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — 症状別の直し方・doctor 各行の意味
-- [docs/ADVANCED.md](docs/ADVANCED.md) — 全ツールカタログ・relay/fleet の詳細・ODBC・OpenAI 互換エンドポイント・ベンチ再現手順
+- [docs/ADVANCED.md](docs/ADVANCED.md) — 全ツールカタログ・relay/fleet の詳細・ODBC・ベンチ再現手順
 - [scripts/AUTOSTART.md](scripts/AUTOSTART.md) — ログオン時自動起動の設定・解除方法
 
 ---

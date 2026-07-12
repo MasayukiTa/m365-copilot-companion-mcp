@@ -144,3 +144,18 @@ bench/gaia/_*.py
 
 # local attic for stray session files (never committed)
 _attic/
+
+# ======================================================================
+# Purpose-outside path removed from the tree (security review 2026-07-13):
+# Minecraft-bot / brain-proxy scripts that turned the corporate Copilot into
+# an SSH-tunneled OpenAI-compat backend. Explicit paths (not a broad glob) so
+# they cannot be re-added by accident; everything else in scripts/ and
+# relay/ stays tracked normally.
+# ======================================================================
+/scripts/start_brain_tunnel.ps1
+/scripts/start_brain_path.ps1
+/scripts/brain_lane_scaler.ps1
+/relay/brain_proxy.py
+/relay/openai_endpoint_server.py
+/relay/openai_adapter.py
+/relay/test_openai_adapter.py
