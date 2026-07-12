@@ -1,4 +1,4 @@
-"""Take an existing `/review` findings report and have the free M365 fleet FIX the findings --
+"""Take an existing `/review` findings report and have the M365 fleet FIX the findings --
 safely, for a NON-git-savvy user.
 
 Ties together the pure fix-goal builder (bench/review_build_goals.py:build_fix_goal), the
@@ -511,7 +511,7 @@ def main(argv=None):
         print("git bonus precheck failed (git missing / not a repo / dirty tree) -- "
               "proceeding without a branch; backup/undo is the safety net")
 
-    print("launching %d fix goal(s) on the free M365 fleet..." % len(goals))
+    print("launching %d fix goal(s)..." % len(goals))
     run_fix_fleet(goals_path, args.max_concurrent, args.effort)
 
     status_path = os.path.join(repo_root, ".fleet", "status.json")

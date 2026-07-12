@@ -151,7 +151,7 @@ def test_build_argv_defaults_on_missing_keys():
 
 def test_parse_run_output_both_lines():
     stdout = (
-        "launching 3 review goal(s) on the free M365 fleet...\n"
+        "launching 3 review goal(s)...\n"
         "fleet: -m relay.fleet_runner --goals-file x\n"
         "report: C:\\repo\\.fleet\\review\\review_report_20260101_000000.md\n"
         "summary: high=2 medium=1 low=3 parse_errors=0\n"
@@ -398,7 +398,7 @@ def test_build_fix_argv_defaults_on_missing_keys():
 def test_parse_fix_run_output_full():
     stdout = (
         "backed up 2 file(s) to C:\\repo\\.fleet\\review_fix\\backup_20260101_000000\n"
-        "launching 1 fix goal(s) on the free M365 fleet...\n"
+        "launching 1 fix goal(s)...\n"
         "fix report: C:\\repo\\.fleet\\review_fix\\fix_report_20260101_000000.md\n"
         "applied=3 skipped=1 test_gate=PASSED\n"
         "backup: C:\\repo\\.fleet\\review_fix\\backup_20260101_000000\n"
