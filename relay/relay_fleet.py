@@ -715,6 +715,33 @@ def goal_fields(goal):
     return str(goal), [], None
 
 
+# Escalating/varying CONTINUE nudge (fixes the "identical nudge re-injected every turn"
+# degradation: a worker that never emits DONE used to get the byte-for-byte-identical
+# CONTINUE_JOB constant every single turn, up to max_turns -- observed to degrade the
+# M365 Copilot model into refusing to answer after ~5 repeats in one live conversation).
+# Pure and hermetically testable: given only the consecutive-continue COUNT, return the
+# nudge TEXT (pre-anchor; the caller still wraps it with _task_anchor). Kept as a plain
+# function (not a method) so tests can assert on it without constructing a RelayWorker.
+_CONTINUE_ESCALATION_PHRASES = (
+    "ここまでの作業を踏まえ、残りは簡潔に進めてください。",
+    "同じ作業の繰り返しは不要です。残タスクを絞って手短に進めてください。",
+    "ここまでの内容を土台に、まだ終わっていない部分だけ手早く仕上げてください。",
+)
+
+
+def _continue_nudge(count):
+    """Return the CONTINUE-branch nudge text for the count-th consecutive continue (1-based).
+    counts 1-2: the original gentle CONTINUE_JOB, unchanged (back-compat for the common
+    quick case where the agent finishes in a turn or two).
+    counts 3+: a STRONGER, wrap-up-leaning nudge that also embeds the count, so no two
+    turns -- however close together -- ever see byte-identical text."""
+    if count <= 2:
+        return CONTINUE_JOB
+    phrase = _CONTINUE_ESCALATION_PHRASES[(count - 3) % len(_CONTINUE_ESCALATION_PHRASES)]
+    return ("%s（継続%d回目）完了したら最後の行に必ず DONE、まだなら FAIL と理由を"
+            "書いてください（同じ作業の繰り返しは不要です）。" % (phrase, count))
+
+
 _PHASE_LABELS = {
     "pending":     "Queued",
     "ready":       "Starting",
@@ -774,7 +801,7 @@ class RelayWorker:
                  per_turn_timeout_s=240, max_no_progress=3, max_verify_attempts=3,
                  refuter=False, max_refute=2, plan_mode=False, review_lenses=None,
                  max_transient=10, transcript_dir=None, run_id="", busy_writer=None,
-                 max_research=3, contract_budget=None):
+                 max_research=3, contract_budget=None, max_continue=6):
         self.page = None
         self.drv = None
         text, checks, cwd = goal_fields(goal)
@@ -902,6 +929,13 @@ class RelayWorker:
         self.dwell_s = dwell_s
         self.per_turn_timeout_s = per_turn_timeout_s
         self.max_no_progress = max_no_progress
+        # CONTINUE-nudge escalation/cap (fixes the identical-nudge-forever degradation --
+        # see _continue_nudge above). Counts CONSECUTIVE turns that fell into the plain
+        # CONTINUE branch (no DONE, no FAIL, no steer); reset whenever real progress/other
+        # branch is taken. Independent of no_progress (which only fires on a VERBATIM-
+        # identical agent reply -- a slowly-drifting non-converging reply never trips it).
+        self.max_continue = max_continue
+        self._continue_count = 0
         # plan-first: turn 1 proposes a plan and pauses for approval (a steer) before
         # executing. plan_steps is surfaced so the cockpit can show / let the user pick.
         self.plan_mode = plan_mode
@@ -2087,18 +2121,34 @@ class RelayWorker:
             return
         if "FAIL" in last_line:
             self.job = self._task_anchor(FIX_JOB)
+            self._continue_count = 0   # real progress signal -> the continue streak resets
         elif self._last_was_steer:
             # bridge off the steer instead of a raw CONTINUE so the redirection sticks
             self.job = ("先ほどの追加指示を踏まえて作業を続行してください。"
                         "完了なら DONE、無理なら FAIL と理由を書いてください。")
+            self._continue_count = 0   # a steer is real progress -> the continue streak resets
         else:
-            self.job = self._task_anchor(CONTINUE_JOB)
+            # HARD CAP, independent of no_progress (which only trips on a VERBATIM-identical
+            # reply): a task that keeps producing slightly-different prose but never DONE
+            # would otherwise ride the plain CONTINUE branch all the way to max_turns while
+            # WE re-send byte-identical nudge text every turn -- the confirmed degradation
+            # mechanism. Cap consecutive continues and terminate gracefully instead.
+            self._continue_count += 1
+            if self._continue_count >= self.max_continue:
+                if self._salvage_via_checks():
+                    return
+                self.status, self.outcome = "stuck", "STUCK"
+                self.reason = ("no DONE after %d continue nudges (stopped to avoid degrading "
+                               "the model)" % self._continue_count)
+                return
+            self.job = self._task_anchor(_continue_nudge(self._continue_count))
         self.status = "ready"
 
     def _on_done_claimed(self):
         """Copilot reported DONE. With no acceptance checks, go straight to the candidate-
         done step (back-compat trust, unless a refuter is on). With checks, run the
         verification gate first."""
+        self._continue_count = 0   # a DONE claim is real progress -> the continue streak resets
         if not self.checks:
             self.verified = False
             self._candidate_done()
