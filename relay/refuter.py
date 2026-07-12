@@ -40,6 +40,26 @@ REFUTER_NUDGE = (
     "REFUTED: <理由> もしくは UPHELD の形式で必ず1行で書いてください。"
 )
 
+# Both retry loops below (run_refuter's blocking while-loop, RefuterSession._nudge's
+# non-blocking equivalent) are ALREADY bounded by max_nudges (default 2) -- but they used
+# to re-send this REFUTER_NUDGE constant byte-for-byte on every retry, into the SAME
+# refuter conversation. That is the identical-nudge-repetition disease (confirmed on the
+# implementer's own CONTINUE loop in relay_fleet.py) applied to the refuter's side chat.
+# Vary the text across attempts so no two nudges in one refuter conversation are ever
+# identical; the first variant is the original REFUTER_NUDGE for back-compat.
+_REFUTER_NUDGE_VARIANTS = (
+    REFUTER_NUDGE,
+    "まだ判定が書かれていません。前置きや再確認は不要です。今すぐ最後の行に "
+    "REFUTED: <理由> か UPHELD のどちらか一言だけを書いてください。",
+)
+
+
+def _next_refuter_nudge(count):
+    """Pure, testable nudge-text selector for the refuter's UNCLEAR-verdict retry (1-based
+    `count` = which nudge attempt this is). Rotates through _REFUTER_NUDGE_VARIANTS so
+    consecutive nudges in the same refuter conversation are never byte-identical."""
+    return _REFUTER_NUDGE_VARIANTS[(count - 1) % len(_REFUTER_NUDGE_VARIANTS)]
+
 
 # Review panel (operator B, perspective-diverse): N INDEPENDENT reviewers, each with a
 # distinct lens, aggregated by majority. Catches failure modes a single redundant pass
@@ -205,7 +225,7 @@ def run_refuter(context, conversation_url: str, goal: str, final_response: str,
         nudges = 0
         while verdict[0] == "UNCLEAR" and nudges < max_nudges:
             nudges += 1
-            drv.send(REFUTER_NUDGE)
+            drv.send(_next_refuter_nudge(nudges))
             if not drv.wait_for_idle(timeout_s=timeout_s):
                 break
             verdict = parse_verdict(drv.read_last_response())
@@ -349,7 +369,7 @@ class RefuterSession:
         try:
             self._count_before = self.drv._answers().count()
             self.drv._count_before = self._count_before
-            self.drv.send(REFUTER_NUDGE)
+            self.drv.send(_next_refuter_nudge(self._nudges_used))
             self._t_send = time.time()
             self._last, self._stable_since = None, None
         except Exception:
