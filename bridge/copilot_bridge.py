@@ -2582,7 +2582,7 @@ class Handler(BaseHTTPRequestHandler):
             qs = urllib.parse.parse_qs(parsed.query)
             msg = (qs.get("msg") or [""])[0]
             # DELIBERATE PAGE_LOCK BYPASS: /review and /security-review shell out to
-            # bench/review_run.py, which fans its work out over the FREE M365 fleet on the
+            # bench/review_run.py, which fans its work out over the M365 fleet on the
             # SEPARATE :9222 Edge (relay.fleet_runner) -- it never touches this bridge's own
             # PAGE/DRIVER (:9223). Routing a multi-minute review through
             # run_on_page_thread + PAGE_LOCK would needlessly freeze every other /stream,
@@ -3060,7 +3060,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _review_stream(self, msg: str):
         """Handle /review and /security-review: shell out to bench/review_run.py, which
-        fans the work out over the FREE M365 fleet on the separate :9222 Edge, and stream a
+        fans the work out over the M365 fleet on the separate :9222 Edge, and stream a
         compact summary back into the chat once it finishes.
 
         Called DIRECTLY from do_GET's /stream peek, on the request thread -- NOT via
@@ -3213,7 +3213,7 @@ class Handler(BaseHTTPRequestHandler):
         there -- see the ordering comment at that call site, since
         "/review-fix".startswith("/review") is true), on the request thread -- NOT via
         run_on_page_thread, and NOT under PAGE_LOCK, for the same reason /review bypasses
-        it: review_fix.py shells out to the FREE M365 fleet on the separate :9222 Edge and
+        it: review_fix.py shells out to the M365 fleet on the separate :9222 Edge and
         never touches this bridge's own PAGE/DRIVER (:9223). Writes the SAME SSE preamble as
         _stream/_review_stream so the client side is indistinguishable.
 
