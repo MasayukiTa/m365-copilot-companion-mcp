@@ -571,16 +571,6 @@ if __name__ == "__main__":
     app = mcp.http_app(path="/mcp", transport="streamable-http",
                        json_response=True, middleware=[Middleware(_AcceptBoth)])
 
-    # OpenAI-compatible chat-completions surface (additive, FLAG-GATED).
-    # Mounts POST /v1/chat/completions + GET /v1/models on this SAME uvicorn app
-    # ONLY when OPENAI_COMPAT=1; otherwise it is a no-op and /mcp is unchanged.
-    # Lets any OpenAI-API harness use the Copilot-routed Opus 4.8 as its backend.
-    # NOTE: must run on the raw Starlette `app` (needs app.router.routes) BEFORE the
-    # _BearerPrefix wrap below turns `app` into a bare ASGI callable.
-    from relay.openai_adapter import register_openai_routes
-    if register_openai_routes(app):
-        print("[main] OpenAI-compat routes mounted: POST /v1/chat/completions, GET /v1/models")
-
     # Wrap OUTERMOST so the raw-key -> "Bearer <key>" rewrite happens before FastMCP's
     # auth middleware sees the request (see _BearerPrefix docstring). Lifespan events pass
     # straight through, so the inner Starlette startup/shutdown still runs under uvicorn.
