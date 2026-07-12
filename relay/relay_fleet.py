@@ -160,8 +160,8 @@ def _cancel_force_rehide(timer):
 # それに応答できませんでした" / "I couldn't respond to that". This matches NEITHER a consent card
 # NOR a tool-unreachable message, so it fell through every recovery and looped forever. Detected
 # here so we can (a) surface for sign-in if it is a login wall, (b) re-nav off the default-Copilot
-# fallback, or (c) as a last resort force a HEADED relaunch of the companion Edge. Mirrors
-# openai_adapter.CANNED_NONANSWER; substring / locale-tolerant.
+# fallback, or (c) as a last resort force a HEADED relaunch of the companion Edge.
+# Substring / locale-tolerant match.
 CANNED_NONANSWER_MARKERS = (
     "それに応答できませんでした",
     "I couldn't respond to that",

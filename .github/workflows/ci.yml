@@ -81,7 +81,6 @@ jobs:
             relay/test_fleet_verify.py \
             relay/test_folder_verify.py \
             relay/test_forge.py \
-            relay/test_openai_adapter.py \
             relay/test_planner.py \
             relay/test_project_memory.py \
             relay/test_recycle.py \
