@@ -388,12 +388,26 @@ def step_dev_tunnel() -> None:
         return
 
     log("    OK: devtunnel found at " + dt)
+    anon = _anon_opt_in()
     log("    To expose the server to Copilot Studio, run this sequence:")
     log("      devtunnel user login                                 # opens Microsoft login (MFA)")
-    log("      devtunnel create %s --allow-anonymous" % tunnel)
+    if anon:
+        log("      devtunnel create %s --allow-anonymous" % tunnel)
+    else:
+        log("      devtunnel create %s" % tunnel)
     log("      devtunnel port create %s -p 8000 --protocol http" % tunnel)
-    log("      devtunnel access create %s -p 8000 --anonymous" % tunnel)
+    if anon:
+        log("      devtunnel access create %s -p 8000 --anonymous" % tunnel)
+    else:
+        log("      devtunnel access create %s -p 8000 --tenant <your-tenant-id>   # Entra-scoped (hardened)" % tunnel)
     log("      devtunnel host %s" % tunnel)
+    if not anon:
+        log("    NOTE: MCP_TUNNEL_ALLOW_ANONYMOUS is not set to 1, so anonymous access is NOT")
+        log("          granted above. A remote client (e.g. Copilot Studio) will NOT be able to")
+        log("          reach this tunnel until you either (a) set MCP_TUNNEL_ALLOW_ANONYMOUS=1 and")
+        log("          re-run (accepts exposing the server to the anonymous internet, gated only")
+        log("          by the MCP_API_KEY app-layer key), or (b) use Entra/tenant-scoped access")
+        log("          instead (devtunnel access create <name> --tenant <your-tenant-id>).")
 
     # Whether the tunnel has actually been created/logged-in is something we
     # cannot complete unattended: 'devtunnel user login' needs an interactive
@@ -430,29 +444,62 @@ def step_dev_tunnel() -> None:
         return
 
 
+def _anon_opt_in() -> bool:
+    """MCP_TUNNEL_ALLOW_ANONYMOUS opt-in gate for anonymous tunnel access.
+    Default OFF: granting --allow-anonymous / --anonymous makes this server
+    (which has file/shell tools) reachable by ANYONE on the internet, gated only
+    by the app-layer MCP_API_KEY -- that must be a deliberate choice, not a
+    silent default. Checked as a real environment variable first (so a value
+    exported in the shell wins), falling back to the value recorded in .env
+    (this step runs BEFORE .env is loaded into os.environ at step_verify).
+    Accepts "1"/"true"/"yes" case-insensitively; anything else -- including
+    unset -- is OFF."""
+    v = os.environ.get("MCP_TUNNEL_ALLOW_ANONYMOUS")
+    if v is None:
+        v = _read_env_value("MCP_TUNNEL_ALLOW_ANONYMOUS")
+    return (v or "").strip().lower() in ("1", "true", "yes")
+
+
 def _provision_dev_tunnel(dt: str, tunnel: str) -> None:
     """Ensure the tunnel exists, host it briefly to learn its public URL, and
     write MCP_TUNNEL_NAME/MCP_TUNNEL_URL into .env. Mirrors setup_devtunnel.ps1
     (host-then-read-then-write). Assumes the user is already signed in."""
     port = 8000
+    anon = _anon_opt_in()
 
     # 1. Ensure the tunnel exists (idempotent). 'devtunnel show' succeeds only if
     #    the tunnel is already there; on failure/missing we create it + the port
-    #    + anonymous access (so a remote Copilot Studio client can reach it).
+    #    + (ONLY if opted in via MCP_TUNNEL_ALLOW_ANONYMOUS) anonymous access.
     if _dt_run(dt, "show", tunnel).returncode == 0:
         log("    OK: tunnel '%s' already exists (skipping create)." % tunnel)
     else:
-        log("    Creating tunnel '%s' (anonymous-reachable)..." % tunnel)
-        rc1 = _dt_run(dt, "create", tunnel, "--allow-anonymous").returncode
+        if anon:
+            log("    Creating tunnel '%s' (anonymous-reachable; MCP_TUNNEL_ALLOW_ANONYMOUS=1)..." % tunnel)
+            rc1 = _dt_run(dt, "create", tunnel, "--allow-anonymous").returncode
+        else:
+            log("    Creating tunnel '%s' (NOT anonymous-reachable)..." % tunnel)
+            rc1 = _dt_run(dt, "create", tunnel).returncode
         rc2 = _dt_run(dt, "port", "create", tunnel, "-p", str(port), "--protocol", "http").returncode
-        rc3 = _dt_run(dt, "access", "create", tunnel, "-p", str(port), "--anonymous").returncode
+        if anon:
+            rc3 = _dt_run(dt, "access", "create", tunnel, "-p", str(port), "--anonymous").returncode
+        else:
+            rc3 = 0
         if rc1 != 0:
             # If create itself failed the tunnel won't be usable; bubble up so the
             # caller turns it into an ActionNeeded with the manual sequence.
             raise StepError("'devtunnel create %s' failed (rc=%d)." % (tunnel, rc1))
-        if rc2 != 0 or rc3 != 0:
+        if rc2 != 0 or (anon and rc3 != 0):
             log("    WARN: port/access create returned non-zero "
                 "(rc2=%d rc3=%d); continuing -- they may already exist." % (rc2, rc3))
+        if not anon:
+            log("    NOTE: tunnel created WITHOUT anonymous access (MCP_TUNNEL_ALLOW_ANONYMOUS")
+            log("          is not set to 1). A remote client (e.g. Copilot Studio) will NOT be")
+            log("          able to connect until you either:")
+            log("            (a) set MCP_TUNNEL_ALLOW_ANONYMOUS=1 and re-run this step (accepts")
+            log("                exposing the server to the anonymous internet, gated only by the")
+            log("                MCP_API_KEY app-layer key), or")
+            log("            (b) grant Entra/tenant-scoped access instead, e.g.:")
+            log("                devtunnel access create %s --tenant <your-tenant-id>" % tunnel)
 
     # 2. Obtain the public URL. A freshly-created tunnel has NO port URL in
     #    'devtunnel show' until it has been HOSTED at least once (Host
@@ -653,8 +700,12 @@ sign-in. The bootstrap does NOT automate the Studio UI.
 
 ## Notes
 
-- `--allow-anonymous` on the tunnel is safe: this server still enforces the
-  Bearer key above plus a per-IP `unlock(password)` for mutating tools.
+- `--allow-anonymous` on the tunnel is now an EXPLICIT opt-in (env var
+  `MCP_TUNNEL_ALLOW_ANONYMOUS=1`; default OFF). When granted, the app-layer
+  Bearer key above plus a per-IP `unlock(password)` for mutating tools still
+  apply -- but the tunnel itself is then reachable by anyone on the internet,
+  so only opt in if you accept that. The hardened alternative is Entra/tenant-
+  scoped access (`devtunnel access create <name> --tenant <your-tenant-id>`).
 - If Microsoft changes the Studio UI, the field names may differ slightly but
   the three inputs are always: server URL, header name, header value.
 - Keep the Bearer key secret. Rotate it by editing `MCP_API_KEY` in `.env` and

@@ -22,6 +22,27 @@ $ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $PSScriptRoot
 $DEFAULT_NAME = "m365-copilot-companion"
 
+# Anonymous tunnel access is an EXPLICIT opt-in (MCP_TUNNEL_ALLOW_ANONYMOUS), default OFF.
+# Granting --allow-anonymous / --anonymous makes this server (file/shell tools on the tunnel's
+# port) reachable by ANYONE on the internet, gated only by the app-layer MCP_API_KEY -- that must
+# be a deliberate choice by the operator, not a silent default. Checked as a real environment
+# variable first, falling back to the value recorded in .env. Accepts "1"/"true"/"yes"
+# case-insensitively; anything else -- including unset -- is OFF.
+function Get-AllowAnonymous {
+    $v = $env:MCP_TUNNEL_ALLOW_ANONYMOUS
+    if (-not $v) {
+        $envPath0 = Join-Path $root ".env"
+        if (Test-Path $envPath0) {
+            foreach ($ln in Get-Content $envPath0) {
+                if ($ln -match '^MCP_TUNNEL_ALLOW_ANONYMOUS=(.*)$') { $v = $matches[1]; break }
+            }
+        }
+    }
+    if (-not $v) { return $false }
+    return ($v.Trim().ToLowerInvariant() -in @("1", "true", "yes"))
+}
+$AllowAnonymous = Get-AllowAnonymous
+
 # Run devtunnel and return stdout lines with the welcome/banner/upgrade noise stripped.
 function Dt {
     $out = & devtunnel @args 2>&1 | Out-String
@@ -237,8 +258,13 @@ if ($TunnelName) {
 if ($reuse) {
     Write-Host "[3/4] reusing existing tunnel: $target"
 } elseif (-not ($existingNames -contains $target)) {
-    Write-Host "[3/4] creating tunnel '$target' (anonymous-reachable, so Copilot Studio can connect)..."
-    $createOut = Dt create $target --allow-anonymous
+    if ($AllowAnonymous) {
+        Write-Host "[3/4] creating tunnel '$target' (anonymous-reachable, so Copilot Studio can connect)..."
+        $createOut = Dt create $target --allow-anonymous
+    } else {
+        Write-Host "[3/4] creating tunnel '$target' (NOT anonymous-reachable; MCP_TUNNEL_ALLOW_ANONYMOUS is not set to 1)..."
+        $createOut = Dt create $target
+    }
     $createExit = $LASTEXITCODE
     if ($createExit -ne 0) {
         $createMsg = ($createOut -join "`n")
@@ -248,7 +274,11 @@ if ($reuse) {
             $suffix = Get-MachineSuffix
             $newTarget = "$target-$suffix"
             Write-Host "      name collision in the global devtunnels.ms namespace -> retrying ONCE with a machine-unique name: $newTarget"
-            $createOut2 = Dt create $newTarget --allow-anonymous
+            if ($AllowAnonymous) {
+                $createOut2 = Dt create $newTarget --allow-anonymous
+            } else {
+                $createOut2 = Dt create $newTarget
+            }
             $createExit2 = $LASTEXITCODE
             if ($createExit2 -ne 0) {
                 $createMsg2 = ($createOut2 -join "`n")
@@ -293,34 +323,46 @@ if (-not ((Dt port list $target) -match ("\b" + [string]$Port + "\b"))) {
 # Idempotently re-assert anonymous access so a half-configured tunnel from an aborted earlier run
 # (created but access never applied, or port added without access) gets repaired on re-run. An
 # "already exists"/"conflict" result is treated as success (idempotent); anything else is a real
-# error and is surfaced instead of silently swallowed.
-$accessOut1 = Dt access create $target --anonymous
-$accessExit1 = $LASTEXITCODE
-if ($accessExit1 -ne 0) {
-    $accessMsg1 = ($accessOut1 -join "`n")
-    if ($accessMsg1 -match 'already exists|already in use|conflict') {
-        $script:DtWarnings += "access create ($target, tunnel): $accessMsg1"
-    } else {
-        Write-Host "      ERROR: devtunnel access create (tunnel-level) failed (exit ${accessExit1}):"
-        Write-Host "      $accessMsg1"
-        Write-Host "      devtunnel could not create/host the tunnel; the error above is from the devtunnel CLI."
-        Write-Host "      If login/permission, run: devtunnel user login"
-        exit 1
+# error and is surfaced instead of silently swallowed. ONLY done if MCP_TUNNEL_ALLOW_ANONYMOUS
+# opted in -- otherwise this tunnel stays closed to the anonymous internet, by design.
+if ($AllowAnonymous) {
+    $accessOut1 = Dt access create $target --anonymous
+    $accessExit1 = $LASTEXITCODE
+    if ($accessExit1 -ne 0) {
+        $accessMsg1 = ($accessOut1 -join "`n")
+        if ($accessMsg1 -match 'already exists|already in use|conflict') {
+            $script:DtWarnings += "access create ($target, tunnel): $accessMsg1"
+        } else {
+            Write-Host "      ERROR: devtunnel access create (tunnel-level) failed (exit ${accessExit1}):"
+            Write-Host "      $accessMsg1"
+            Write-Host "      devtunnel could not create/host the tunnel; the error above is from the devtunnel CLI."
+            Write-Host "      If login/permission, run: devtunnel user login"
+            exit 1
+        }
     }
-}
-$accessOut2 = Dt access create $target -p $Port --anonymous
-$accessExit2 = $LASTEXITCODE
-if ($accessExit2 -ne 0) {
-    $accessMsg2 = ($accessOut2 -join "`n")
-    if ($accessMsg2 -match 'already exists|already in use|conflict') {
-        $script:DtWarnings += "access create ($target, port $Port): $accessMsg2"
-    } else {
-        Write-Host "      ERROR: devtunnel access create (port-level) failed (exit ${accessExit2}):"
-        Write-Host "      $accessMsg2"
-        Write-Host "      devtunnel could not create/host the tunnel; the error above is from the devtunnel CLI."
-        Write-Host "      If login/permission, run: devtunnel user login"
-        exit 1
+    $accessOut2 = Dt access create $target -p $Port --anonymous
+    $accessExit2 = $LASTEXITCODE
+    if ($accessExit2 -ne 0) {
+        $accessMsg2 = ($accessOut2 -join "`n")
+        if ($accessMsg2 -match 'already exists|already in use|conflict') {
+            $script:DtWarnings += "access create ($target, port $Port): $accessMsg2"
+        } else {
+            Write-Host "      ERROR: devtunnel access create (port-level) failed (exit ${accessExit2}):"
+            Write-Host "      $accessMsg2"
+            Write-Host "      devtunnel could not create/host the tunnel; the error above is from the devtunnel CLI."
+            Write-Host "      If login/permission, run: devtunnel user login"
+            exit 1
+        }
     }
+} else {
+    Write-Host "      MCP_TUNNEL_ALLOW_ANONYMOUS is not set to 1 -- skipping anonymous access grant."
+    Write-Host "      This tunnel is NOT anonymously reachable. A remote client (e.g. Copilot Studio)"
+    Write-Host "      will NOT be able to connect until you either:"
+    Write-Host "        (a) set MCP_TUNNEL_ALLOW_ANONYMOUS=1 and re-run this script (accepts exposing"
+    Write-Host "            the server to the anonymous internet, gated only by the MCP_API_KEY"
+    Write-Host "            app-layer key), or"
+    Write-Host "        (b) grant Entra/tenant-scoped access instead, e.g.:"
+    Write-Host "            devtunnel access create $target --tenant <your-tenant-id>"
 }
 
 # --- 4. host the tunnel so the public URL is assigned, then surface it ------------------------
