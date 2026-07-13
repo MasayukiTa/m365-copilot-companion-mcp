@@ -54,6 +54,74 @@ try:
 except Exception:
     pass
 
+
+# ── COORDINATOR OUTPUT CAPTURE (TEE) ────────────────────────────────────────────
+# The coordinator's own stdout/stderr were never captured by any launcher (bench/
+# review_run.py's bare subprocess.Popen, the WPF cockpit's SpawnFleet, or a manual
+# `python -m relay.fleet_runner` run all just inherit the console) -- so an overnight
+# crash/reboot left NO record of what the coordinator was doing or how it was invoked.
+# Fixed once here, at the fleet_runner side, so it covers every launcher: duplicate
+# stdout+stderr writes to a timestamped log under <state_dir>/ in addition to the real
+# console. Best-effort -- a log-setup failure (unwritable .fleet/, permissions, full
+# disk) is swallowed and the console behaves exactly as before.
+class _Tee:
+    """A minimal stream wrapper that writes to the REAL stream first (so console output
+    is never lost, reordered, or delayed by the log) and then best-effort mirrors the
+    same bytes to a log file. Any attribute this class doesn't define (isatty, encoding,
+    errors, fileno, reconfigure, ...) is delegated to the real stream via __getattr__."""
+
+    def __init__(self, real, logfile):
+        self._real = real
+        self._log = logfile
+
+    def write(self, s):
+        n = 0
+        try:
+            n = self._real.write(s)
+        except Exception:
+            pass
+        try:
+            self._log.write(s)
+            self._log.flush()
+        except Exception:
+            pass
+        return n if n else len(s)
+
+    def flush(self):
+        try:
+            self._real.flush()
+        except Exception:
+            pass
+        try:
+            self._log.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _setup_coordinator_log(state_dir):
+    """TEE sys.stdout/sys.stderr to a timestamped log under state_dir so a future
+    incident (crash, reboot, kill) leaves a record of the coordinator's own output,
+    regardless of which launcher started it. Call once, early in main() (after argparse,
+    before the run loop). Best-effort: never raises -- on any failure the console is left
+    completely untouched and this returns None. Returns the log path on success."""
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(state_dir, "coordinator_%s_p%d.log" % (ts, os.getpid()))
+        f = open(log_path, "a", encoding="utf-8", errors="replace")
+        f.write("=== fleet_runner started %s  pid=%d  argv=%r ===\n"
+                % (time.strftime("%Y-%m-%d %H:%M:%S"), os.getpid(), sys.argv))
+        f.flush()
+        sys.stdout = _Tee(sys.stdout, f)
+        sys.stderr = _Tee(sys.stderr, f)
+        return log_path
+    except Exception:
+        return None
+
+
 # A worker's status -> (pill label, design-language colour key). The cockpit maps the
 # key to a brush; we keep the vocabulary aligned with the WPF ShuttleScope palette.
 STATUS_PILL = {
@@ -668,6 +736,101 @@ def _resume_goals(state_dir):
     return remainder, len(remainder), len(ledger)
 
 
+# ── RUN-ACTIVE marker ───────────────────────────────────────────────────────────
+# A run that dies from a PC reboot / kill / crash leaves no trace that it was ever
+# interrupted -- nothing relaunches it. ACTIVE_MARKER is a small sidecar written ONCE at
+# run start and REMOVED on clean completion or an explicit user stop (KeyboardInterrupt,
+# or the graceful `stop` command via commands.json, both of which reach the same normal
+# end-of-main() completion path). Its PRESENCE with a DEAD pid is therefore the signal a
+# boot-time supervisor (scripts/supervisor.ps1) uses to detect an interrupted run and
+# relaunch it with --resume. Best-effort throughout: a marker read/write/remove failure
+# is logged (write) or silently tolerated (read/clear) and never takes down the run.
+ACTIVE_MARKER = "fleet_run_active.json"
+
+
+def _resume_argv(argv):
+    """Strip goal-specifying flags (-g/--goal VALUE, --goals-file VALUE) and any existing
+    --resume from an argv list, returning the remainder suitable for relaunching with a
+    single --resume appended. --resume alone reconstructs the goal set from the durable
+    ledger (last_run_goals.json); replaying the ORIGINAL -g/--goals-file on top would
+    duplicate goals (both the already-finished and the unfinished ones get re-added
+    alongside the resume set -- see _resume_goals). Pure function, no I/O -- easy to
+    unit test in isolation."""
+    out = []
+    skip_next = False
+    for a in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if a in ("-g", "--goal", "--goals-file"):
+            skip_next = True
+            continue
+        if a.startswith("--goal=") or a.startswith("--goals-file="):
+            continue
+        if a == "--resume":
+            continue
+        out.append(a)
+    return out
+
+
+def _write_active_marker(state_dir, argv=None, pid=None, start_ts=None):
+    """Best-effort: record this run as ACTIVE (pid, start_ts, argv, and a precomputed
+    resume_argv) so a supervisor can detect an interrupted run later. Never raises -- a
+    marker failure is logged once to stderr and the run continues untouched."""
+    try:
+        raw_argv = list(argv if argv is not None else sys.argv[1:])
+        payload = {"pid": int(pid if pid is not None else os.getpid()),
+                   "start_ts": float(start_ts if start_ts is not None else time.time()),
+                   "argv": raw_argv,
+                   "resume_argv": _resume_argv(raw_argv)}
+        _write_atomic(os.path.join(state_dir, ACTIVE_MARKER), payload)
+    except Exception as e:
+        sys.stderr.write("[resume] WARN: could not write active-run marker: %s\n" % e)
+
+
+def _read_active_marker(state_dir):
+    """Read fleet_run_active.json tolerantly. Missing/corrupt -> None (utf-8-sig
+    tolerates a BOM, matching the other sidecar readers in this module)."""
+    path = os.path.join(state_dir, ACTIVE_MARKER)
+    try:
+        if not os.path.isfile(path):
+            return None
+        with open(path, encoding="utf-8-sig") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def _clear_active_marker(state_dir):
+    """Best-effort removal of the ACTIVE marker on clean completion / explicit user stop.
+    A missing file is fine (nothing to clear); never raises."""
+    try:
+        p = os.path.join(state_dir, ACTIVE_MARKER)
+        if os.path.isfile(p):
+            os.remove(p)
+    except Exception:
+        pass
+
+
+def should_auto_resume(marker_exists, pid_alive, user_stopped=False):
+    """PURE decision: should a boot-time supervisor relaunch an interrupted fleet run?
+
+    marker_exists  -- ACTIVE_MARKER is present (a run believes itself to still be live)
+    pid_alive      -- the pid recorded in the marker is still a running process
+    user_stopped   -- a persistent signal (if any) that the user explicitly asked to stop
+                       this run (kept as a parameter for completeness / future-proofing;
+                       today an explicit stop -- Ctrl+C or the `stop` command -- already
+                       reaches the normal completion path and clears the marker itself,
+                       so in practice marker_exists and user_stopped=True do not co-occur)
+
+    Resume iff: the marker is present, its pid is DEAD, and the user did not explicitly
+    stop the run. Any of (marker absent / pid alive / user-stopped) -> do nothing. Kept
+    side-effect free so it is trivially unit-testable and so scripts/supervisor.ps1's
+    PowerShell mirror of this same boolean rule is easy to keep in sync."""
+    return bool(marker_exists) and not pid_alive and not user_stopped
+
+
 def _watchdog_should_reset(status, stalled_s, now=None):
     """Pure decision: given a (possibly frozen) status.json dict and how long its `updated`
     field has been unchanged, decide whether the dedicated Edge is genuinely WEDGED and must
@@ -731,6 +894,12 @@ def _print_table(workers, total):
     line = "  ".join(_turn_str(w) for w in workers)
     sys.stdout.write("\r\033[K[fleet %d/%d] %s" % (done, total, line))
     sys.stdout.flush()
+
+
+# Set by main() right after argparse so the KeyboardInterrupt handler at the bottom of
+# this file (outside main()'s local scope) knows which state_dir's ACTIVE marker to
+# clear on an explicit Ctrl+C. None until a run actually starts.
+_ACTIVE_STATE_DIR = None
 
 
 def main():
@@ -845,6 +1014,15 @@ def main():
                     help="where to write the live status.json the cockpit reads")
     args = ap.parse_args()
 
+    # Capture the coordinator's own stdout/stderr to a durable log under state_dir, from
+    # here (right after argparse) so it covers argparse-error exits too, regardless of
+    # which launcher started this process. Best-effort -- never crashes on failure.
+    _setup_coordinator_log(args.state_dir)
+    # let the KeyboardInterrupt handler at the bottom of this file clear the ACTIVE
+    # marker even though it runs outside main()'s local scope.
+    global _ACTIVE_STATE_DIR
+    _ACTIVE_STATE_DIR = args.state_dir
+
     # ULTRA ACCURACY preset: maximise CLEAN correctness, ignore time. Wires the verified accuracy
     # levers -- the session's failure analysis pinned the bottleneck on edit PRECISION (right file,
     # wrong edit), not localization, so adversarial review + self-test target it directly. The gain
@@ -954,6 +1132,12 @@ def main():
         _write_atomic(os.path.join(args.state_dir, LAST_RUN_DONE), {})
     except Exception as e:
         sys.stderr.write("[resume] WARN: could not reset done map: %s\n" % e)
+
+    # RUN-ACTIVE marker: written now that we know goals are actually going to run (the
+    # early --resume-with-nothing-to-do exit above already returned). Removed on clean
+    # completion / explicit stop below; its survival past this process's death is exactly
+    # what tells a boot-time supervisor the run was interrupted (see should_auto_resume()).
+    _write_active_marker(args.state_dir, start_ts=started)
 
     # an EXPLICIT --max-concurrent (>=0) was given on the CLI (not the -1 "ask the cockpit"
     # sentinel). Used for the precedence rule below: CLI wins over settings.txt autoscale.
@@ -1382,6 +1566,22 @@ def main():
         if r["reason"]:
             print("       reason: %s" % r["reason"])
 
+    # CLEAN COMPLETION: this point is reached whenever the run ends on its own -- goals
+    # ran to a terminal outcome, OR a graceful `stop` command (bench/fleet_ctl.py stop /
+    # the cockpit) cancelled everything and the loop above still exited normally. Either
+    # way nothing is "interrupted" -- clear the ACTIVE marker so a supervisor never
+    # mistakes a normal finish for a crash.
+    _clear_active_marker(args.state_dir)
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Explicit user stop (Ctrl+C). Clear the ACTIVE marker (if a run had started and
+        # recorded one) so a supervisor never treats a deliberate interrupt as a crash to
+        # auto-resume, then exit with the conventional SIGINT status.
+        if _ACTIVE_STATE_DIR:
+            _clear_active_marker(_ACTIVE_STATE_DIR)
+        print("\n[fleet] interrupted by user -- ACTIVE marker cleared, not auto-resumable.")
+        sys.exit(130)
