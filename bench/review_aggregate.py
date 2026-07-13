@@ -340,19 +340,57 @@ def aggregate(status_path, transcripts_dir, now=None):
     return base
 
 
+# --- P1b: refuter-based verify_verdict rendering ------------------------------------------
+# merge_verdicts (bench/review_run.py) tags each finding with verify_verdict in
+# {"confirmed", "false_positive", "unclear"} after the adversarial refuter pass runs (None if
+# that pass never ran, or never covered a given finding). "false_positive" (REFUTED by the
+# independent skeptic) findings are demoted out of the normal severity sections below into
+# their own "Refuted / dropped" section -- visible for transparency, but not counted in the
+# headline totals; bench/review_fix.py:filter_findings already drops them from any fix run.
+_VERIFY_RANK = {"confirmed": 0, "unclear": 2}  # anything else (None / missing) ranks 1
+
+
+def _verify_counts(findings):
+    """Count findings by verify_verdict. Returns {} (falsy) if NO finding carries a
+    "verify_verdict" key at all -- lets callers distinguish "the refuter pass never ran" from
+    "it ran and every finding happened to be confirmed" without a separate flag."""
+    if not any(isinstance(f, dict) and "verify_verdict" in f for f in findings):
+        return {}
+    counts = {"confirmed": 0, "false_positive": 0, "unclear": 0}
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        vv = f.get("verify_verdict")
+        if vv in counts:
+            counts[vv] += 1
+    return counts
+
+
 def render_markdown(agg):
     """Render an aggregate() dict as a readable Markdown report, high -> medium -> low,
-    with a header of counts and a parse-error note."""
+    with a header of counts and a parse-error note.
+
+    If the refuter pass (bench/review_run.py:refute_findings + merge_verdicts) has annotated
+    findings with verify_verdict: REFUTED ("false_positive") findings are excluded from the
+    severity sections and counts, and listed instead in a separate "Refuted / dropped" section
+    at the end (with the skeptic's reason) so nothing disappears silently. Within each severity
+    section, CONFIRMED findings are sorted first (unclear/no-verdict findings stay in their
+    original relative order after)."""
     lines = []
     lines.append("# Review findings report")
     lines.append("")
     if agg.get("error"):
         lines.append("**ERROR:** %s" % agg["error"])
         lines.append("")
+    findings_all = agg.get("findings", [])
     lines.append("- workers total: %d" % agg.get("workers_total", 0))
-    lines.append("- findings total: %d" % len(agg.get("findings", [])))
+    lines.append("- findings total: %d" % len(findings_all))
     lines.append("- parse errors (worker text missing/malformed FINDINGS block): %d" %
                  agg.get("parse_errors", 0))
+    counts = _verify_counts(findings_all)
+    if counts:
+        lines.append("- refuter verdicts: confirmed=%d refuted/dropped=%d unclear=%d" %
+                     (counts["confirmed"], counts["false_positive"], counts["unclear"]))
     dims_covered = agg.get("dimensions_covered")
     if dims_covered:
         lines.append("- dimensions covered: %s" % ", ".join(dims_covered))
@@ -360,7 +398,9 @@ def render_markdown(agg):
 
     by_severity = agg.get("by_severity", {})
     for sev in _SEVERITIES:
-        items = by_severity.get(sev, [])
+        raw_items = by_severity.get(sev, [])
+        items = [it for it in raw_items if it.get("verify_verdict") != "false_positive"]
+        items = sorted(items, key=lambda it: _VERIFY_RANK.get(it.get("verify_verdict"), 1))
         lines.append("## %s (%d)" % (sev, len(items)))
         lines.append("")
         if not items:
@@ -383,19 +423,51 @@ def render_markdown(agg):
                 meta_bits.append("not verified")
             if reason:
                 meta_bits.append(reason)
+            verify_verdict = it.get("verify_verdict")
+            if verify_verdict == "confirmed":
+                meta_bits.append("CONFIRMED")
+            elif verify_verdict == "unclear":
+                meta_bits.append("refute: unclear")
             meta = ", ".join(meta_bits)
             lines.append("- [%s] %s:%s — %s (%s)" % (sev, file_, ln_s, title, meta))
             if detail:
                 lines.append("  %s" % detail)
         lines.append("")
+
+    refuted = [f for f in findings_all if f.get("verify_verdict") == "false_positive"]
+    if refuted:
+        lines.append("## Refuted / dropped by adversarial refuter (%d)" % len(refuted))
+        lines.append("")
+        lines.append("_These findings were REFUTED by an independent skeptic reviewer "
+                      "(relay/refuter.py) -- excluded from the counts above, and "
+                      "bench/review_fix.py's filter_findings drops them automatically._")
+        lines.append("")
+        for it in refuted:
+            file_ = it.get("file", "?")
+            ln = it.get("line")
+            ln_s = str(ln) if ln is not None else "?"
+            sev = it.get("severity", "?")
+            title = it.get("title", "")
+            reason = it.get("verify_reason", "")
+            lines.append("- [%s] %s:%s — %s" % (sev, file_, ln_s, title))
+            if reason:
+                lines.append("  refuter: %s" % reason)
+        lines.append("")
     return "\n".join(lines)
 
 
 def render_json(agg):
-    """Return agg as a plain JSON-serializable dict (a shallow copy). Any timestamp
+    """Return agg as a plain JSON-serializable dict (a shallow copy), plus a "verify_summary"
+    counts dict (see _verify_counts) IF at least one finding carries a verify_verdict --
+    otherwise the output is an exact shallow copy of agg (no key added), matching the old
+    "plain dict copy" contract for reports built without the refuter pass. Any timestamp
     stamping is the caller's responsibility (agg["generated_at"] is already set by
     aggregate()'s `now` argument if the caller passed one)."""
-    return dict(agg)
+    out = dict(agg)
+    counts = _verify_counts(out.get("findings", []))
+    if counts:
+        out["verify_summary"] = counts
+    return out
 
 
 def main(argv=None):

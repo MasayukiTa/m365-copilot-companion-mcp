@@ -19,6 +19,8 @@ import json
 import os
 import subprocess
 
+from relay.refuter import build_refuter_prompt
+
 # --- extensions we never ask the agent to open (binary/asset noise, not reviewable text) ---
 BINARY_EXTS = frozenset({
     ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".webp", ".tiff", ".tif",
@@ -435,6 +437,80 @@ def build_dimension_goal(dimension, file_group, repo_root):
         assert f in text, "filename %r missing verbatim from goal text" % (f,)
 
     return {"text": text, "cwd": repo_root}
+
+
+# --- REFUTE goal builder (P1b) -------------------------------------------------------------
+# Reuses the EXISTING adversarial refuter (relay/refuter.py) instead of a bespoke second-pass
+# verifier: each review/security finding is handed to an independent skeptic that must find a
+# concrete reason the finding is NOT a real defect, or uphold it. relay.refuter.parse_verdict
+# reads the reply -- a completely different contract from the <<<FINDINGS>>> block above, so
+# the refuter goal text below is emitted AS-IS (no FINDINGS delimiters).
+
+# Which relay.refuter.LENS_PROMPTS lens to use for a finding, keyed by its "dimension" tag (see
+# REVIEW_DIMENSIONS above). Dimensions not listed here fall back to REFUTE_KIND_TO_LENS.
+REFUTE_DIMENSION_TO_LENS = {
+    "correctness": "correctness",
+    "security": "security",
+    "runtime_behavior": "edge",
+    "adversarial_input": "edge",
+    "deployment_operational": "correctness",
+    "false_green_ci": "correctness",
+    "missing_wiring": "correctness",
+    "test_hygiene": "correctness",
+    "cross_file_interaction": "correctness",
+}
+
+# Fallback lens when a finding carries no "dimension" tag (e.g. legacy build_review_goal
+# output) or an unrecognized one -- keyed by the overall review run kind.
+REFUTE_KIND_TO_LENS = {
+    "review": "correctness",
+    "security": "security",
+}
+
+_DEFAULT_REFUTE_LENS = "correctness"
+
+
+def _lens_for_finding(finding, kind):
+    """Pick the relay.refuter.LENS_PROMPTS key for one finding: its own "dimension" tag wins
+    if recognized, else fall back to the overall run kind, else "correctness"."""
+    dim = finding.get("dimension") if isinstance(finding, dict) else None
+    if dim and dim in REFUTE_DIMENSION_TO_LENS:
+        return REFUTE_DIMENSION_TO_LENS[dim]
+    return REFUTE_KIND_TO_LENS.get(kind, _DEFAULT_REFUTE_LENS)
+
+
+def build_refute_goal(finding, kind, lens=None):
+    """Build the refuter goal TEXT (a plain str, NOT a {"text","cwd"} goal dict) for one
+    review/security finding, via relay.refuter.build_refuter_prompt -- the SAME independent-
+    skeptic verdict contract (last line "REFUTED: <reason>" or "UPHELD", read by
+    relay.refuter.parse_verdict) already used to refute an implementer's claimed DONE.
+
+    `goal` (in build_refuter_prompt terms) is the finding's file/line plus a one-line "a
+    reviewer claimed <title>"; `final_response` (the claim to attack) is the finding's title +
+    detail. `kind` ("review" or "security") picks the lens fallback via REFUTE_KIND_TO_LENS
+    when the finding has no usable "dimension" tag. `lens` overrides the picked lens entirely
+    (used by the 3-lens panel mode in bench.review_run.refute_findings, which drives every
+    relay.refuter.PANEL_LENSES lens per finding regardless of the finding's own dimension).
+
+    Callers wrap the returned string into the plain fleet-goal dict themselves
+    (this function does not know about cwd/repo_root, unlike build_dimension_goal)."""
+    finding = finding if isinstance(finding, dict) else {}
+    if lens is None:
+        lens = _lens_for_finding(finding, kind)
+
+    file_ = finding.get("file") or "?"
+    line = finding.get("line")
+    line_s = str(line) if line is not None else "?"
+    title = finding.get("title") or ""
+    detail = finding.get("detail") or ""
+
+    goal_text = (
+        "対象ファイル: %s (行 %s)\n"
+        "別のレビュアーが次の指摘（claim）をしました: %s" % (file_, line_s, title)
+    )
+    claim_text = title + ("\n" + detail if detail else "")
+
+    return build_refuter_prompt(goal_text, claim_text, lens=lens)
 
 
 # --- FIX goal builder ---------------------------------------------------------------------

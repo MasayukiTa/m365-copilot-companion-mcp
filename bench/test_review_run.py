@@ -16,8 +16,9 @@ import pytest
 
 import bench.review_run as review_run
 from bench.review_build_goals import REVIEW_DIMENSIONS, dimensions_for_kind
-from bench.review_run import fleet_cmd, main, merge_verdicts, plan_goals, verify_goals_from_findings
+from bench.review_run import fleet_cmd, main, merge_verdicts, plan_goals, refute_findings
 from relay.fleet_runner import _read_goals_file
+from relay.refuter import PANEL_LENSES
 
 REVIEW_DIM_COUNT = len(dimensions_for_kind("review"))
 SECURITY_DIM_COUNT = len(dimensions_for_kind("security"))
@@ -127,38 +128,6 @@ def test_fleet_cmd_shape():
     ]
 
 
-# --- verify_goals_from_findings: pure, no fleet ---------------------------------------------
-
-def test_verify_goals_from_findings_contains_file_and_title_and_verdict_instruction():
-    findings = [
-        {"file": "pkg/a.py", "line": 10, "severity": "high", "title": "SQL injection",
-         "detail": "unescaped input"},
-        {"file": "pkg/b.py", "line": None, "severity": "low", "title": "unused import",
-         "detail": ""},
-    ]
-    goals = verify_goals_from_findings(findings, "C:/fakerepo", batch_size=10)
-    assert len(goals) == 1
-    text = goals[0]["text"]
-    assert goals[0]["cwd"] == "C:/fakerepo"
-    for f in findings:
-        assert f["file"] in text
-        assert f["title"] in text
-    assert review_run.FINDINGS_BEGIN in text
-    assert review_run.FINDINGS_END in text
-    assert "verdict" in text
-    assert "DONE" in text
-
-
-def test_verify_goals_from_findings_batches():
-    findings = [{"file": "f%d.py" % i, "line": i, "severity": "low", "title": "t%d" % i,
-                 "detail": ""} for i in range(23)]
-    goals = verify_goals_from_findings(findings, "C:/fakerepo", batch_size=10)
-    assert len(goals) == 3  # 10 + 10 + 3
-    all_text = " ".join(g["text"] for g in goals)
-    for f in findings:
-        assert f["file"] in all_text
-
-
 # --- merge_verdicts: pure --------------------------------------------------------------------
 
 def test_merge_verdicts_matches_by_file_line_title():
@@ -178,10 +147,14 @@ def test_merge_verdicts_matches_by_file_line_title():
 # --- non-dry-run: run_fleet monkeypatched to a stub that writes a fixture status.json -------
 
 def _fake_run_fleet_factory(repo_root, status_payload):
-    """Returns a run_fleet stub that writes status_payload as .fleet/status.json under
-    repo_root, mimicking what a real relay.fleet_runner run leaves behind."""
-    def _fake_run_fleet(goals_path, max_concurrent, effort):
-        fleet_dir = os.path.join(repo_root, ".fleet")
+    """Returns a run_fleet stub that writes status_payload as status.json under repo_root's
+    .fleet dir (or under state_dir, if the caller -- e.g. refute_findings -- passes one),
+    mimicking what a real relay.fleet_runner run leaves behind. Since main() now launches the
+    refuter pass BY DEFAULT after the review pass (both routed through the same monkeypatched
+    review_run.run_fleet), this must accept the optional state_dir kwarg refute_findings
+    passes, not just the review pass's own 3-positional-arg call."""
+    def _fake_run_fleet(goals_path, max_concurrent, effort, state_dir=None):
+        fleet_dir = state_dir if state_dir else os.path.join(repo_root, ".fleet")
         os.makedirs(fleet_dir, exist_ok=True)
         with open(os.path.join(fleet_dir, "status.json"), "w", encoding="utf-8") as f:
             json.dump(status_payload, f)
@@ -209,7 +182,9 @@ def test_non_dry_run_produces_report_matching_fixture(repo, monkeypatch, capsys)
     monkeypatch.setattr(review_run, "run_fleet",
                          _fake_run_fleet_factory(repo, status_payload))
 
-    rc = main(["--kind", "review", "--group-size", "10"])
+    # --no-refute: this test is about the review -> aggregation -> report pipeline, not the
+    # refuter pass (covered separately below by the refute_findings() tests).
+    rc = main(["--kind", "review", "--group-size", "10", "--no-refute"])
     assert rc == 0
 
     out = capsys.readouterr().out
@@ -228,6 +203,139 @@ def test_non_dry_run_produces_report_matching_fixture(repo, monkeypatch, capsys)
     assert report["parse_errors"] == 0
     assert len(report["by_severity"]["high"]) == 1
     assert len(report["by_severity"]["low"]) == 1
+
+
+# --- refute_findings(): P1b, reuses relay/refuter.py as its own fleet pass ------------------
+
+def _fake_refute_fleet_factory(status_payload):
+    """A run_fleet stub for refute_findings' own state_dir'd call -- writes status_payload
+    into state_dir/status.json (NOT the shared .fleet dir the review pass uses), mirroring
+    what refute_findings expects a real fleet run to leave behind."""
+    def _fake(goals_path, max_concurrent, effort, state_dir=None):
+        assert state_dir, "refute_findings must launch its own state_dir'd fleet run"
+        os.makedirs(state_dir, exist_ok=True)
+        with open(os.path.join(state_dir, "status.json"), "w", encoding="utf-8") as f:
+            json.dump(status_payload, f)
+        return 0
+    return _fake
+
+
+def test_refute_findings_single_lens_maps_verdicts_by_goal_order(tmp_path, monkeypatch):
+    findings = [
+        {"file": "a.py", "line": 1, "title": "T1", "detail": "d1", "severity": "high"},
+        {"file": "b.py", "line": 2, "title": "T2", "detail": "d2", "severity": "medium"},
+        {"file": "c.py", "line": 3, "title": "T3", "detail": "d3", "severity": "low"},
+    ]
+    # w0/w1/w2 -> finding index 0/1/2 (single-lens: one goal per finding, in order).
+    status_payload = {"workers": [
+        {"name": "w0", "display_result": "確認しました。\nREFUTED: 実際には問題ない", "transcript": ""},
+        {"name": "w1", "display_result": "確認済み\nUPHELD", "transcript": ""},
+        {"name": "w2", "display_result": "よくわからない出力です garbage", "transcript": ""},
+    ]}
+    monkeypatch.setattr(review_run, "run_fleet", _fake_refute_fleet_factory(status_payload))
+
+    out_dir = str(tmp_path / "out")
+    verdicts = review_run.refute_findings(findings, "review", out_dir, now=0.0, panel=False,
+                                          repo_root=str(tmp_path), stamp="STAMP1")
+
+    by_title = {v["title"]: v for v in verdicts}
+    assert by_title["T1"]["verdict"] == "false_positive"
+    assert "実際には問題ない" in by_title["T1"]["reason"]
+    assert by_title["T2"]["verdict"] == "confirmed"
+    assert by_title["T3"]["verdict"] == "unclear"
+
+    # single-lens mode writes exactly one goal per finding
+    goals_path = os.path.join(out_dir, "refute_goals_STAMP1.jsonl")
+    with open(goals_path, encoding="utf-8") as f:
+        lines = [l for l in f if l.strip()]
+    assert len(lines) == len(findings)
+
+    # end-to-end: merge_verdicts -> review_fix.filter_findings must actually DROP the
+    # REFUTED finding, keep the confirmed/unclear ones. This is the whole point of P1b.
+    from bench.review_fix import filter_findings
+    agg = {"findings": [dict(f) for f in findings]}
+    merge_verdicts(agg, verdicts)
+    kept_titles = {f["title"] for f in filter_findings(agg["findings"], min_severity="low")}
+    assert "T1" not in kept_titles       # REFUTED -> dropped
+    assert "T2" in kept_titles           # UPHELD -> confirmed, kept
+    assert "T3" in kept_titles           # UNCLEAR is not dropped, only false_positive is
+
+
+def test_refute_findings_panel_mode_majority_vote(tmp_path, monkeypatch):
+    findings = [{"file": "x.py", "line": 9, "title": "Panel finding", "detail": "d",
+                 "severity": "high"}]
+    # panel mode: 3 goals for this 1 finding (PANEL_LENSES order) -> w0/w1/w2.
+    status_payload = {"workers": [
+        {"name": "w0", "display_result": "REFUTED: correctness lens reason", "transcript": ""},
+        {"name": "w1", "display_result": "REFUTED: edge lens reason", "transcript": ""},
+        {"name": "w2", "display_result": "UPHELD", "transcript": ""},
+    ]}
+    monkeypatch.setattr(review_run, "run_fleet", _fake_refute_fleet_factory(status_payload))
+
+    out_dir = str(tmp_path / "out2")
+    verdicts = review_run.refute_findings(findings, "review", out_dir, now=0.0, panel=True,
+                                          repo_root=str(tmp_path), stamp="STAMP2")
+    assert len(verdicts) == 1
+    assert verdicts[0]["verdict"] == "false_positive"  # 2/3 REFUTED -> majority via aggregate_panel
+
+    goals_path = os.path.join(out_dir, "refute_goals_STAMP2.jsonl")
+    with open(goals_path, encoding="utf-8") as f:
+        lines = [l for l in f if l.strip()]
+    assert len(lines) == len(PANEL_LENSES)
+
+
+def test_refute_findings_no_status_json_degrades_to_empty(tmp_path, monkeypatch):
+    findings = [{"file": "a.py", "line": 1, "title": "T", "detail": "", "severity": "low"}]
+
+    def _fake(goals_path, max_concurrent, effort, state_dir=None):
+        return 0  # simulate a fleet that never wrote a status.json
+
+    monkeypatch.setattr(review_run, "run_fleet", _fake)
+    verdicts = review_run.refute_findings(findings, "review", str(tmp_path / "out3"), now=0.0,
+                                          repo_root=str(tmp_path), stamp="STAMP3")
+    assert verdicts == []
+
+
+def test_refute_findings_empty_findings_never_launches_fleet(tmp_path, monkeypatch):
+    _no_fleet_guard(monkeypatch)
+    verdicts = review_run.refute_findings([], "review", str(tmp_path / "out4"), now=0.0,
+                                          repo_root=str(tmp_path))
+    assert verdicts == []
+
+
+def test_cli_no_refute_skips_the_refuter_pass(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    findings_json = json.dumps(
+        [{"file": "a.py", "line": 1, "severity": "high", "title": "bad", "detail": "d"}],
+        ensure_ascii=False)
+    worker_text = (review_run.FINDINGS_BEGIN + "\n" + findings_json + "\n" +
+                   review_run.FINDINGS_END + "\nDONE")
+    status_payload = {"workers": [
+        {"name": "w0", "display_result": worker_text, "transcript": ""},
+    ]}
+
+    calls = []
+
+    def _fake(goals_path, max_concurrent, effort, state_dir=None):
+        calls.append(state_dir)
+        fleet_dir = state_dir or os.path.join(repo, ".fleet")
+        os.makedirs(fleet_dir, exist_ok=True)
+        with open(os.path.join(fleet_dir, "status.json"), "w", encoding="utf-8") as f:
+            json.dump(status_payload, f)
+        return 0
+
+    monkeypatch.setattr(review_run, "run_fleet", _fake)
+
+    rc = main(["--kind", "review", "--group-size", "10", "--no-refute"])
+    assert rc == 0
+    # only the ONE main review-pass run_fleet call (state_dir=None) -- no second, state_dir'd
+    # refuter pass call.
+    assert calls == [None]
+
+    out = capsys.readouterr().out
+    assert "refuter:" not in out
 
 
 # --- degradation paths: must not crash -------------------------------------------------------
