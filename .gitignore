@@ -159,3 +159,35 @@ _attic/
 /relay/openai_endpoint_server.py
 /relay/openai_adapter.py
 /relay/test_openai_adapter.py
+
+# ----------------------------------------------------------------------
+# Local scratch, dumps, and generated artifacts (never committed).
+# ----------------------------------------------------------------------
+/_*.txt
+/_*.json
+/_*.pkl
+/_*.b64
+/bench/_*.py
+/bench/_*.json
+/bench/_*.sh
+/bench/FINDINGS.json
+/relay/CODE_REVIEW_*.md
+/HANDOFF.md
+/Desktop/
+/compact_miasma_vhdx.ps1
+
+# Local security-review output artifacts (run logs / findings dumps)
+/security_review/
+
+# External benchmark checkouts / datasets (fetch separately; too large to track)
+/bench/ext/
+
+# Local PR investigation scratch (diffs, notes, verification output)
+/PR13974_*/
+
+# ----------------------------------------------------------------------
+# Ensemble / brain-lane deployment scripts -- same family as the
+# brain-proxy scripts removed above (a corporate-Copilot-as-backend path).
+# Kept out of the tree for the same reason; do not commit.
+# ----------------------------------------------------------------------
+/deploy/
