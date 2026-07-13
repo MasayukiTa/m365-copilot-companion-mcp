@@ -782,6 +782,89 @@ def test_render_json_no_behavioral_summary_when_absent():
     assert "behavioral_summary" not in out
 
 
+# --- P3 piece C: loop_meta / completeness_gaps rendering (purely additive) ------------------
+
+def _base_agg(**over):
+    agg = {"generated_at": 1.0, "workers_total": 0, "parse_errors": 0, "findings": [],
+           "by_severity": {"high": [], "medium": [], "low": []}}
+    agg.update(over)
+    return agg
+
+
+def test_render_markdown_no_p3_keys_renders_identically_to_before():
+    """The core Piece C contract: an agg dict with NEITHER "loop_meta" nor
+    "completeness_gaps" must render byte-identically to the pre-P3 shape."""
+    agg = _base_agg()
+    md = render_markdown(agg)
+    assert "loop" not in md.lower()
+    assert "completeness" not in md.lower()
+
+
+def test_render_json_no_p3_keys_is_unchanged_shallow_copy():
+    agg = _base_agg()
+    out = render_json(agg)
+    assert out == agg
+    assert "loop_meta" not in out
+    assert "completeness_gaps" not in out
+
+
+def test_render_markdown_loop_meta_dry_stop():
+    agg = _base_agg(loop_meta={"rounds_run": 2, "max_rounds": 5, "stopped_reason": "dry",
+                                "dry_rounds_target": 2, "unique_findings": 3})
+    md = render_markdown(agg)
+    assert "loop: 2/5 round(s) run, stopped: dry" in md
+    assert "3 unique finding(s)" in md
+    assert "NOTE: stopped because the max-rounds cap" not in md
+
+
+def test_render_markdown_loop_meta_max_rounds_stop_prints_no_silent_cap_note():
+    agg = _base_agg(loop_meta={"rounds_run": 3, "max_rounds": 3, "stopped_reason": "max_rounds",
+                                "dry_rounds_target": 2, "unique_findings": 5})
+    md = render_markdown(agg)
+    assert "loop: 3/3 round(s) run, stopped: max_rounds" in md
+    assert "NOTE: stopped because the max-rounds cap was reached" in md
+
+
+def test_render_markdown_completeness_gaps_all_present():
+    agg = _base_agg(completeness_gaps={
+        "missing_dimensions": ["test_hygiene"],
+        "missing_files": ["c.py"],
+        "unverified_claims": ["claim about a.py was never actually checked"],
+    })
+    md = render_markdown(agg)
+    assert "completeness critic:" in md
+    assert "test_hygiene" in md
+    assert "c.py" in md
+    assert "claim about a.py was never actually checked" in md
+
+
+def test_render_markdown_completeness_gaps_all_empty_says_no_gaps():
+    agg = _base_agg(completeness_gaps={
+        "missing_dimensions": [], "missing_files": [], "unverified_claims": []})
+    md = render_markdown(agg)
+    assert "completeness critic: no gaps identified" in md
+
+
+def test_render_markdown_no_completeness_gaps_key_omits_section():
+    agg = _base_agg()
+    md = render_markdown(agg)
+    assert "completeness critic" not in md
+
+
+def test_render_json_carries_loop_meta_and_completeness_gaps_verbatim():
+    """render_json needs NO extra code for this -- it's already a shallow dict copy, so any
+    key present on `agg` (including the new P3 ones) is carried over automatically."""
+    agg = _base_agg(
+        loop_meta={"rounds_run": 2, "max_rounds": 3, "stopped_reason": "dry",
+                    "dry_rounds_target": 2, "unique_findings": 1},
+        completeness_gaps={"missing_dimensions": ["security"], "missing_files": [],
+                            "unverified_claims": []})
+    out = render_json(agg)
+    assert out["loop_meta"] == agg["loop_meta"]
+    assert out["completeness_gaps"] == agg["completeness_gaps"]
+    json.dumps(out)  # still JSON-serializable
+
+
 if __name__ == "__main__":
     import sys
     raise SystemExit(pytest.main([__file__, "-q"] + sys.argv[1:]))

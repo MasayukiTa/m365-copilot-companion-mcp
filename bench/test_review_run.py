@@ -15,15 +15,18 @@ import sys
 import pytest
 
 import bench.review_run as review_run
-from bench.review_build_goals import REVIEW_DIMENSIONS, dimensions_for_kind
+from bench.review_build_goals import GAPS_BEGIN, GAPS_END, REVIEW_DIMENSIONS, dimensions_for_kind
 from bench.review_run import (
     behavioral_verify,
     fleet_cmd,
     main,
     merge_verdicts,
     parse_behavior_verdict,
+    parse_completeness_gaps,
     plan_goals,
     refute_findings,
+    run_completeness_critic,
+    run_review_loop,
 )
 from relay.fleet_runner import _read_goals_file
 from relay.refuter import PANEL_LENSES
@@ -853,6 +856,466 @@ def test_cli_behavioral_severity_filters(repo, monkeypatch, capsys):
     assert len(behavioral_calls[0]) == 1
     assert "high one" in behavioral_calls[0][0]["text"]
     assert "low one" not in behavioral_calls[0][0]["text"]
+
+
+# --- parse_completeness_gaps: the one place the GAPS_BEGIN/GAPS_END contract is parsed -----
+
+def _gaps_block(missing_dimensions=None, missing_files=None, unverified_claims=None):
+    payload = {
+        "missing_dimensions": missing_dimensions or [],
+        "missing_files": missing_files or [],
+        "unverified_claims": unverified_claims or [],
+    }
+    return GAPS_BEGIN + "\n" + json.dumps(payload, ensure_ascii=False) + "\n" + GAPS_END
+
+
+def test_parse_completeness_gaps_valid():
+    text = "確認しました。\n" + _gaps_block(
+        missing_dimensions=["test_hygiene"], missing_files=["c.py"],
+        unverified_claims=["claim X was never actually checked"]) + "\nDONE"
+    gaps = parse_completeness_gaps(text)
+    assert gaps == {
+        "missing_dimensions": ["test_hygiene"],
+        "missing_files": ["c.py"],
+        "unverified_claims": ["claim X was never actually checked"],
+    }
+
+
+def test_parse_completeness_gaps_all_empty():
+    text = _gaps_block() + "\nDONE"
+    gaps = parse_completeness_gaps(text)
+    assert gaps == {"missing_dimensions": [], "missing_files": [], "unverified_claims": []}
+
+
+def test_parse_completeness_gaps_missing_block_returns_empty():
+    gaps = parse_completeness_gaps("no gaps block here at all, just prose. DONE")
+    assert gaps == {"missing_dimensions": [], "missing_files": [], "unverified_claims": []}
+
+
+def test_parse_completeness_gaps_malformed_json_returns_empty():
+    text = GAPS_BEGIN + "\n{not valid json}\n" + GAPS_END
+    gaps = parse_completeness_gaps(text)
+    assert gaps == {"missing_dimensions": [], "missing_files": [], "unverified_claims": []}
+
+
+def test_parse_completeness_gaps_not_an_object_returns_empty():
+    text = GAPS_BEGIN + "\n[1, 2, 3]\n" + GAPS_END
+    gaps = parse_completeness_gaps(text)
+    assert gaps == {"missing_dimensions": [], "missing_files": [], "unverified_claims": []}
+
+
+def test_parse_completeness_gaps_partial_fields_default_to_empty():
+    text = GAPS_BEGIN + '\n{"missing_dimensions": ["security"]}\n' + GAPS_END
+    gaps = parse_completeness_gaps(text)
+    assert gaps == {"missing_dimensions": ["security"], "missing_files": [],
+                     "unverified_claims": []}
+
+
+def test_parse_completeness_gaps_never_raises_on_none_or_empty():
+    assert parse_completeness_gaps(None) == {
+        "missing_dimensions": [], "missing_files": [], "unverified_claims": []}
+    assert parse_completeness_gaps("") == {
+        "missing_dimensions": [], "missing_files": [], "unverified_claims": []}
+
+
+# --- run_completeness_critic: P3 piece B, own state_dir'd single-goal fleet pass -----------
+
+def _fake_completeness_fleet_factory(status_payload):
+    def _fake(goals_path, max_concurrent, effort, state_dir=None):
+        assert state_dir, "run_completeness_critic must launch its own state_dir'd fleet run"
+        os.makedirs(state_dir, exist_ok=True)
+        with open(os.path.join(state_dir, "status.json"), "w", encoding="utf-8") as f:
+            json.dump(status_payload, f)
+        return 0
+    return _fake
+
+
+def test_run_completeness_critic_parses_gaps_from_worker(tmp_path, monkeypatch):
+    status_payload = {"workers": [
+        {"name": "w0", "display_result": "見てきました。\n" + _gaps_block(
+            missing_dimensions=["test_hygiene"], missing_files=["untouched.py"]) + "\nDONE",
+         "transcript": ""},
+    ]}
+    monkeypatch.setattr(review_run, "run_fleet", _fake_completeness_fleet_factory(status_payload))
+
+    gaps = run_completeness_critic(["correctness"], ["a.py"], [], str(tmp_path / "out"),
+                                    str(tmp_path), stamp="CSTAMP1")
+    assert gaps["missing_dimensions"] == ["test_hygiene"]
+    assert gaps["missing_files"] == ["untouched.py"]
+
+    goals_path = os.path.join(str(tmp_path / "out"), "completeness_goals_CSTAMP1.jsonl")
+    with open(goals_path, encoding="utf-8") as f:
+        lines = [l for l in f if l.strip()]
+    assert len(lines) == 1  # exactly one goal, per the spec ("spawn ONE critic goal")
+
+
+def test_run_completeness_critic_no_status_json_degrades_to_empty(tmp_path, monkeypatch):
+    def _fake(goals_path, max_concurrent, effort, state_dir=None):
+        return 0  # simulate a fleet that never wrote a status.json
+    monkeypatch.setattr(review_run, "run_fleet", _fake)
+
+    gaps = run_completeness_critic([], [], [], str(tmp_path / "out2"), str(tmp_path),
+                                    stamp="CSTAMP2")
+    assert gaps == {"missing_dimensions": [], "missing_files": [], "unverified_claims": []}
+
+
+def test_run_completeness_critic_no_workers_degrades_to_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_run, "run_fleet",
+                         _fake_completeness_fleet_factory({"workers": []}))
+    gaps = run_completeness_critic([], [], [], str(tmp_path / "out3"), str(tmp_path),
+                                    stamp="CSTAMP3")
+    assert gaps == {"missing_dimensions": [], "missing_files": [], "unverified_claims": []}
+
+
+# --- plan_goals(): extra_files restricts to a given subset (additive, P3 support) -----------
+
+def test_plan_goals_extra_files_restricts_to_given_files(repo):
+    files, groups, goals, goal_meta = plan_goals(
+        "review", "all", repo, group_size=20, dimension_keys=["correctness"],
+        extra_files=["a.py"])
+    assert files == ["a.py"]
+    assert all(m["files"] == ["a.py"] for m in goal_meta)
+
+
+def test_plan_goals_extra_files_falsy_is_a_no_op(repo):
+    files_a, _, _, _ = plan_goals("review", "all", repo, dimension_keys=["correctness"],
+                                   extra_files=None)
+    files_b, _, _, _ = plan_goals("review", "all", repo, dimension_keys=["correctness"],
+                                   extra_files=[])
+    files_c, _, _, _ = plan_goals("review", "all", repo, dimension_keys=["correctness"])
+    assert files_a == files_b == files_c == sorted(["a.py", "sub/b.py"])
+
+
+# --- run_review_loop(): P3 piece A, loop-until-dry --------------------------------------------
+
+def _findings_worker_text(items):
+    findings_json = json.dumps(items, ensure_ascii=False)
+    return (review_run.FINDINGS_BEGIN + "\n" + findings_json + "\n" + review_run.FINDINGS_END +
+            "\nDONE")
+
+
+def test_loop_stops_after_k_dry_rounds(repo, monkeypatch):
+    """Every round's mock review pass returns the SAME finding -> after round 1 it is "new",
+    every later round it is deduped ("not new") -> dry_rounds=2 consecutive dry rounds must
+    stop the loop before max_rounds is reached."""
+    monkeypatch.setattr(review_run, "REPO", repo)
+    same_finding = [{"file": "a.py", "line": 1, "severity": "high", "title": "same bug",
+                      "detail": "d"}]
+    worker_text = _findings_worker_text(same_finding)
+    review_status = {"workers": [{"name": "w0", "display_result": worker_text, "transcript": ""}]}
+
+    def _fake(goals_path, max_concurrent, effort, state_dir=None):
+        fleet_dir = state_dir or os.path.join(repo, ".fleet")
+        os.makedirs(fleet_dir, exist_ok=True)
+        with open(os.path.join(fleet_dir, "status.json"), "w", encoding="utf-8") as f:
+            json.dump(review_status, f)
+        return 0
+
+    monkeypatch.setattr(review_run, "run_fleet", _fake)
+
+    out_dir = os.path.join(repo, ".fleet", "review")
+    agg, loop_meta = run_review_loop(
+        "review", "all", repo, out_dir, "BASESTAMP", group_size=20,
+        dimension_keys=["correctness"], run_refute=False, max_rounds=5, dry_rounds=2)
+
+    # round1: 1 new (consecutive_dry=0); round2: 0 new (consecutive_dry=1);
+    # round3: 0 new (consecutive_dry=2) -> stop.
+    assert loop_meta["rounds_run"] == 3
+    assert loop_meta["stopped_reason"] == "dry"
+    assert loop_meta["unique_findings"] == 1
+    assert len(agg["findings"]) == 1
+
+
+def test_loop_stops_at_max_rounds_when_every_round_yields_new_findings(repo, monkeypatch):
+    """Every round's mock review pass returns a FRESH, distinct finding (different title each
+    time) -> dedup never kicks in -> the loop must run every round up to max_rounds and stop
+    there (stopped_reason="max_rounds"), not because it went dry."""
+    monkeypatch.setattr(review_run, "REPO", repo)
+    counter = {"n": 0}
+
+    def _fake(goals_path, max_concurrent, effort, state_dir=None):
+        counter["n"] += 1
+        items = [{"file": "a.py", "line": 1, "severity": "high",
+                  "title": "distinct bug #%d" % counter["n"], "detail": "d"}]
+        payload = {"workers": [
+            {"name": "w0", "display_result": _findings_worker_text(items), "transcript": ""}]}
+        fleet_dir = state_dir or os.path.join(repo, ".fleet")
+        os.makedirs(fleet_dir, exist_ok=True)
+        with open(os.path.join(fleet_dir, "status.json"), "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        return 0
+
+    monkeypatch.setattr(review_run, "run_fleet", _fake)
+
+    out_dir = os.path.join(repo, ".fleet", "review")
+    agg, loop_meta = run_review_loop(
+        "review", "all", repo, out_dir, "BASESTAMP2", group_size=20,
+        dimension_keys=["correctness"], run_refute=False, max_rounds=3, dry_rounds=2)
+
+    assert loop_meta["rounds_run"] == 3
+    assert loop_meta["stopped_reason"] == "max_rounds"
+    assert loop_meta["unique_findings"] == 3
+    assert len(agg["findings"]) == 3
+
+
+def test_loop_dedup_refuted_finding_does_not_reappear(repo, monkeypatch):
+    """A finding REFUTED (false_positive) in round 1 must not reappear in round 2's "new"
+    set even though the mock review pass reports the identical finding again -- dedup keys on
+    (file, line, title), independent of verify_verdict."""
+    monkeypatch.setattr(review_run, "REPO", repo)
+    same_finding = [{"file": "a.py", "line": 1, "severity": "high", "title": "flaky claim",
+                      "detail": "d"}]
+    worker_text = _findings_worker_text(same_finding)
+    review_status = {"workers": [{"name": "w0", "display_result": worker_text, "transcript": ""}]}
+    refute_status = {"workers": [
+        {"name": "w0", "display_result": "REFUTED: not actually a bug", "transcript": ""}]}
+
+    def _fake(goals_path, max_concurrent, effort, state_dir=None):
+        payload = refute_status if (state_dir and "refute_state" in state_dir) else review_status
+        fleet_dir = state_dir or os.path.join(repo, ".fleet")
+        os.makedirs(fleet_dir, exist_ok=True)
+        with open(os.path.join(fleet_dir, "status.json"), "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        return 0
+
+    monkeypatch.setattr(review_run, "run_fleet", _fake)
+
+    out_dir = os.path.join(repo, ".fleet", "review")
+    agg, loop_meta = run_review_loop(
+        "review", "all", repo, out_dir, "BASESTAMP3", group_size=20,
+        dimension_keys=["correctness"], run_refute=True, max_rounds=5, dry_rounds=2)
+
+    # round1: 1 new (refuted); round2: 0 new (deduped, even though refuted last round);
+    # round3: 0 new -> dry_rounds=2 reached -> stop at round 3.
+    assert loop_meta["rounds_run"] == 3
+    assert loop_meta["stopped_reason"] == "dry"
+    assert loop_meta["unique_findings"] == 1
+    assert len(agg["findings"]) == 1
+    assert agg["findings"][0]["verify_verdict"] == "false_positive"
+
+
+def test_loop_no_files_stops_immediately(tmp_path, monkeypatch):
+    root = str(tmp_path / "emptyrepo")
+    os.makedirs(root, exist_ok=True)
+    _init_repo(root)  # nothing committed -> enumerate_files returns []
+    monkeypatch.setattr(review_run, "REPO", root)
+
+    def _boom(*a, **kw):
+        raise AssertionError("run_fleet must not be called when there are no files")
+    monkeypatch.setattr(review_run, "run_fleet", _boom)
+
+    agg, loop_meta = run_review_loop("review", "all", root, str(tmp_path / "out"), "STAMP",
+                                      dimension_keys=["correctness"], max_rounds=3)
+    assert loop_meta["stopped_reason"] == "no_files"
+    assert loop_meta["rounds_run"] == 1
+    assert agg["findings"] == []
+
+
+def test_loop_fleet_failure_stops_early(repo, monkeypatch):
+    monkeypatch.setattr(review_run, "REPO", repo)
+
+    def _fake_no_status(goals_path, max_concurrent, effort, state_dir=None):
+        return 0  # never writes status.json
+
+    monkeypatch.setattr(review_run, "run_fleet", _fake_no_status)
+    out_dir = os.path.join(repo, ".fleet", "review")
+    agg, loop_meta = run_review_loop("review", "all", repo, out_dir, "STAMP2", group_size=20,
+                                      dimension_keys=["correctness"], max_rounds=3)
+    assert loop_meta["stopped_reason"] == "fleet_failure"
+    assert loop_meta["rounds_run"] == 1
+
+
+def test_loop_completeness_seeds_next_round_dimensions(repo, monkeypatch):
+    """completeness=True: the critic's "missing_dimensions" (validated against
+    dimensions_for_kind) get unioned into the NEXT round's plan_goals dimension_keys."""
+    monkeypatch.setattr(review_run, "REPO", repo)
+    round_dims_seen = []
+
+    def _fake(goals_path, max_concurrent, effort, state_dir=None):
+        if state_dir and "completeness_state" in state_dir:
+            payload = {"workers": [
+                {"name": "w0", "display_result": "\n" + _gaps_block(
+                    missing_dimensions=["test_hygiene"]) + "\nDONE", "transcript": ""}]}
+        else:
+            with open(goals_path, encoding="utf-8") as f:
+                goal_lines = [json.loads(l) for l in f if l.strip()]
+            dims_this_round = set()
+            for g in goal_lines:
+                if "test_hygiene" in g["text"]:
+                    dims_this_round.add("test_hygiene")
+                if "correctness" in g["text"]:
+                    dims_this_round.add("correctness")
+            round_dims_seen.append(dims_this_round)
+            payload = {"workers": []}  # no findings -> round goes dry immediately
+        fleet_dir = state_dir or os.path.join(repo, ".fleet")
+        os.makedirs(fleet_dir, exist_ok=True)
+        with open(os.path.join(fleet_dir, "status.json"), "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        return 0
+
+    monkeypatch.setattr(review_run, "run_fleet", _fake)
+
+    out_dir = os.path.join(repo, ".fleet", "review")
+    agg, loop_meta = run_review_loop(
+        "review", "all", repo, out_dir, "STAMP3", group_size=20,
+        dimension_keys=["correctness"], run_refute=False, completeness=True,
+        max_rounds=3, dry_rounds=2)
+
+    # round 1 was scoped to just "correctness" (no test_hygiene yet).
+    assert "test_hygiene" not in round_dims_seen[0]
+    assert "correctness" in round_dims_seen[0]
+    # round 2 must have been seeded with the critic's suggested "test_hygiene" dimension too.
+    assert len(round_dims_seen) >= 2
+    assert "test_hygiene" in round_dims_seen[1]
+    assert agg.get("completeness_gaps") is not None
+
+
+# --- CLI: --loop / --completeness wiring in main() ------------------------------------------
+
+def test_cli_loop_flag_writes_loop_meta_into_report(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    same_finding = [{"file": "a.py", "line": 1, "severity": "high", "title": "loop finding",
+                      "detail": "d"}]
+    worker_text = _findings_worker_text(same_finding)
+    review_status = {"workers": [{"name": "w0", "display_result": worker_text, "transcript": ""}]}
+
+    def _fake(goals_path, max_concurrent, effort, state_dir=None):
+        fleet_dir = state_dir or os.path.join(repo, ".fleet")
+        os.makedirs(fleet_dir, exist_ok=True)
+        with open(os.path.join(fleet_dir, "status.json"), "w", encoding="utf-8") as f:
+            json.dump(review_status, f)
+        return 0
+
+    monkeypatch.setattr(review_run, "run_fleet", _fake)
+
+    rc = main(["--kind", "review", "--group-size", "10", "--no-refute", "--loop",
+               "--max-rounds", "5", "--dry-rounds", "1"])
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "launching review LOOP" in out
+    assert "loop: rounds_run=2/5 stopped_reason=dry unique_findings=1" in out
+
+    out_dir = os.path.join(repo, ".fleet", "review")
+    json_files = [f for f in os.listdir(out_dir)
+                  if f.startswith("review_report_") and f.endswith(".json")]
+    assert len(json_files) == 1
+    with open(os.path.join(out_dir, json_files[0]), encoding="utf-8") as f:
+        report = json.load(f)
+    assert report["loop_meta"]["rounds_run"] == 2
+    assert report["loop_meta"]["stopped_reason"] == "dry"
+    assert len(report["findings"]) == 1
+
+    md_files = [f for f in os.listdir(out_dir)
+                if f.startswith("review_report_") and f.endswith(".md")]
+    with open(os.path.join(out_dir, md_files[0]), encoding="utf-8") as f:
+        md = f.read()
+    assert "loop: 2/5 round(s) run, stopped: dry" in md
+
+
+def test_cli_without_loop_or_completeness_report_has_no_p3_keys(repo, monkeypatch, capsys):
+    """Regression guard for Piece C: when neither --loop nor --completeness is passed, the
+    rendered report must carry none of the new P3 keys/lines at all."""
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    findings_json = json.dumps(
+        [{"file": "a.py", "line": 1, "severity": "high", "title": "bad", "detail": "d"}],
+        ensure_ascii=False)
+    worker_text = (review_run.FINDINGS_BEGIN + "\n" + findings_json + "\n" +
+                   review_run.FINDINGS_END + "\nDONE")
+    status_payload = {"workers": [{"name": "w0", "display_result": worker_text, "transcript": ""}]}
+    monkeypatch.setattr(review_run, "run_fleet",
+                         _fake_run_fleet_factory(repo, status_payload))
+
+    rc = main(["--kind", "review", "--group-size", "10", "--no-refute"])
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "loop:" not in out
+    assert "completeness" not in out
+
+    out_dir = os.path.join(repo, ".fleet", "review")
+    json_files = [f for f in os.listdir(out_dir)
+                  if f.startswith("review_report_") and f.endswith(".json")]
+    with open(os.path.join(out_dir, json_files[0]), encoding="utf-8") as f:
+        report = json.load(f)
+    assert "loop_meta" not in report
+    assert "completeness_gaps" not in report
+
+    md_files = [f for f in os.listdir(out_dir)
+                if f.startswith("review_report_") and f.endswith(".md")]
+    with open(os.path.join(out_dir, md_files[0]), encoding="utf-8") as f:
+        md = f.read()
+    assert "loop" not in md.lower()
+    assert "completeness" not in md.lower()
+
+
+def test_cli_completeness_flag_without_loop_runs_one_critic_pass(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    findings_json = json.dumps(
+        [{"file": "a.py", "line": 1, "severity": "high", "title": "bad", "detail": "d"}],
+        ensure_ascii=False)
+    worker_text = (review_run.FINDINGS_BEGIN + "\n" + findings_json + "\n" +
+                   review_run.FINDINGS_END + "\nDONE")
+    review_status = {"workers": [{"name": "w0", "display_result": worker_text, "transcript": ""}]}
+    completeness_status = {"workers": [
+        {"name": "w0", "display_result": "\n" + _gaps_block(
+            missing_dimensions=["test_hygiene"], missing_files=["untouched.py"],
+            unverified_claims=["bad finding on a.py:1 was never actually checked"]) + "\nDONE",
+         "transcript": ""},
+    ]}
+
+    def _fake(goals_path, max_concurrent, effort, state_dir=None):
+        if state_dir and "completeness_state" in state_dir:
+            payload = completeness_status
+        else:
+            payload = review_status
+        fleet_dir = state_dir or os.path.join(repo, ".fleet")
+        os.makedirs(fleet_dir, exist_ok=True)
+        with open(os.path.join(fleet_dir, "status.json"), "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        return 0
+
+    monkeypatch.setattr(review_run, "run_fleet", _fake)
+
+    rc = main(["--kind", "review", "--group-size", "10", "--no-refute", "--completeness"])
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "completeness critic reported gaps" in out
+
+    out_dir = os.path.join(repo, ".fleet", "review")
+    json_files = [f for f in os.listdir(out_dir)
+                  if f.startswith("review_report_") and f.endswith(".json")]
+    with open(os.path.join(out_dir, json_files[0]), encoding="utf-8") as f:
+        report = json.load(f)
+    assert report["completeness_gaps"]["missing_dimensions"] == ["test_hygiene"]
+    assert "loop_meta" not in report  # --completeness alone must not fabricate loop_meta
+
+    md_files = [f for f in os.listdir(out_dir)
+                if f.startswith("review_report_") and f.endswith(".md")]
+    with open(os.path.join(out_dir, md_files[0]), encoding="utf-8") as f:
+        md = f.read()
+    assert "completeness critic:" in md
+    assert "test_hygiene" in md
+    assert "untouched.py" in md
+
+
+def test_cli_dry_run_ignores_loop_and_completeness(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    _no_fleet_guard(monkeypatch)
+
+    rc = main(["--kind", "review", "--dry-run", "--group-size", "20", "--loop",
+               "--completeness"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "DRY RUN" in out
+    assert "ignored under --dry-run" in out
 
 
 if __name__ == "__main__":

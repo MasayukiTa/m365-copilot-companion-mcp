@@ -11,6 +11,9 @@ relay.fleet_runner and waiting for it to finish.
   python bench/review_run.py --kind review --refute-panel      # 3-lens refuter panel/finding
   python bench/review_run.py --kind review --behavioral        # + behavioral-verify CONFIRMED
   python bench/review_run.py --kind review --behavioral --behavioral-severity high
+  python bench/review_run.py --kind review --loop              # repeat rounds until dry
+  python bench/review_run.py --kind review --loop --max-rounds 5 --dry-rounds 1
+  python bench/review_run.py --kind review --completeness      # + one completeness-critic pass
 
 FLOW:
   1. enumerate_files -> optional --target-path filter -> group_files -> fan out one
@@ -40,6 +43,19 @@ FLOW:
      rendered as DEMONSTRATED and ranked first in the report (bench/review_aggregate.py);
      "not_reproduced" CONFIRMED findings are flagged reasoned-but-not-reproduced.
      --behavioral-severity restricts this pass to the given severity(ies) to bound cost.
+  6. P3, OPT-IN via --loop (default OFF; run_review_loop()): repeats steps 1/3/4/5 across
+     multiple rounds, accumulating UNIQUE findings (deduped by (normpath(file), line,
+     lowercased title) so a REFUTED finding reappearing in a later round never counts as
+     "new") until --dry-rounds (default 2) consecutive rounds add zero new findings, or
+     --max-rounds (default 3) is hit -- hitting the cap is always printed, never silent.
+     Without --loop, behavior is byte-for-byte identical to before P3.
+  7. P3, OPT-IN via --completeness (default OFF; build_completeness_goal() +
+     run_completeness_critic()): spawns one extra goal that audits COVERAGE instead of
+     hunting new findings -- which REVIEW_DIMENSIONS ran, which files were examined, and
+     which current findings are asserted-but-unverified -- and reports it via its own
+     GAPS_BEGIN/GAPS_END block (parse_completeness_gaps). Works standalone (one pass after
+     the single review run) or, combined with --loop, its "missing_dimensions"/
+     "missing_files" seed the next round's plan_goals.
 
 Everything that actually launches a subprocess lives in run_fleet() -- the only function
 tests must monkeypatch to stay hermetic. Every other step (planning, refute-goal building,
@@ -72,7 +88,10 @@ from bench.review_build_goals import (
     BEHAVIOR_VERDICTS,
     FINDINGS_BEGIN,
     FINDINGS_END,
+    GAPS_BEGIN,
+    GAPS_END,
     build_behavioral_verify_goal,
+    build_completeness_goal,
     build_dimension_goal,
     build_refute_goal,
     dimensions_for_kind,
@@ -127,9 +146,10 @@ def _filter_target_path(files, target_path):
 
 
 def plan_goals(kind, mode, repo_root, base_ref=None, cached=False, target_path=None,
-               group_size=None, dimension_keys=None):
+               group_size=None, dimension_keys=None, extra_files=None):
     """Pure planning step (aside from enumerate_files' own git subprocess calls): enumerate
-    -> filter by target_path -> group -> fan out one goal per (dimension, file-group).
+    -> filter by target_path -> optionally restrict to extra_files -> group -> fan out one
+    goal per (dimension, file-group).
 
     Replaces the old "one all-in-one rubric per file-group" scheme: for --kind review, one
     goal per review-applicable REVIEW_DIMENSIONS entry x file-group; for --kind security,
@@ -137,6 +157,13 @@ def plan_goals(kind, mode, repo_root, base_ref=None, cached=False, target_path=N
     dimensions_for_kind). dimension_keys optionally restricts to a subset of the kind's
     applicable dimensions (raises ValueError if a requested key is unknown or not
     applicable to `kind`); default None = every dimension applicable to `kind`.
+
+    extra_files (P3 piece A: additive, default None -- no behavior change for any existing
+    caller) optionally restricts the enumerated+target_path-filtered file list to only paths
+    also present in extra_files -- used by run_review_loop to scope a later round to the
+    file/area names a completeness-critic goal (build_completeness_goal) flagged as
+    unexamined, without needing a second file-listing code path. A falsy extra_files is a
+    complete no-op.
 
     Returns (files, groups, goals, goal_meta). group_size=None picks a mode-appropriate
     default: DEFAULT_ALL_GROUP_SIZE for "all", or every changed file in ONE goal for "diff"
@@ -147,6 +174,9 @@ def plan_goals(kind, mode, repo_root, base_ref=None, cached=False, target_path=N
     {"text","cwd"} dicts in `goals`)."""
     files = enumerate_files(mode, repo_root, base_ref=base_ref, cached=cached)
     files = _filter_target_path(files, target_path)
+    if extra_files:
+        wanted = set(extra_files)
+        files = [f for f in files if f in wanted]
 
     if group_size is None:
         group_size = len(files) if mode == "diff" else DEFAULT_ALL_GROUP_SIZE
@@ -469,6 +499,281 @@ def behavioral_verify(findings, out_dir, now, max_concurrent=None, effort="auto"
     return attached
 
 
+# --- P3 piece B: completeness critic ---------------------------------------------------------
+
+_GAPS_RE = re.compile(re.escape(GAPS_BEGIN) + r"\s*(.*?)\s*" + re.escape(GAPS_END), re.DOTALL)
+
+_EMPTY_GAPS = {"missing_dimensions": [], "missing_files": [], "unverified_claims": []}
+
+
+def parse_completeness_gaps(text):
+    """Parse a completeness-critic worker's final reply (bench.review_build_goals.
+    build_completeness_goal's GAPS_BEGIN/GAPS_END contract) into a dict with exactly the keys
+    "missing_dimensions", "missing_files", "unverified_claims" (each a list of str).
+
+    The ONE place this delimiter pair is parsed (mirrors parse_behavior_verdict being the one
+    place BEHAVIOR_VERDICT/BEHAVIOR_EVIDENCE are parsed). Never raises: missing text, a missing
+    GAPS_BEGIN/GAPS_END pair, invalid JSON inside it, or a JSON value that isn't an object all
+    degrade to a fresh copy of _EMPTY_GAPS (all-empty lists) -- same graceful-degradation
+    contract as parse_behavior_verdict/refute_findings/behavioral_verify. Non-list values for a
+    recognized key, and non-str/int/float items inside a list, are dropped rather than raising."""
+    if not text:
+        return dict(_EMPTY_GAPS)
+    m = _GAPS_RE.search(text)
+    if not m:
+        return dict(_EMPTY_GAPS)
+    try:
+        data = json.loads(m.group(1))
+    except Exception:
+        return dict(_EMPTY_GAPS)
+    if not isinstance(data, dict):
+        return dict(_EMPTY_GAPS)
+    out = dict(_EMPTY_GAPS)
+    for key in out:
+        val = data.get(key)
+        if isinstance(val, list):
+            out[key] = [str(v) for v in val if isinstance(v, (str, int, float))]
+    return out
+
+
+def run_completeness_critic(dimensions_run, files_covered, findings_so_far, out_dir, repo_root,
+                             effort="auto", stamp=None):
+    """P3 piece B: spawn ONE completeness-critic goal (build_completeness_goal) as its own
+    single-goal, own-state-dir'd fleet pass (mirrors refute_findings'/behavioral_verify's own
+    state_dir isolation, so this run's status.json/transcripts never collide with the review
+    pass's or any other P1/P2 pass's), then parse its GAPS block (parse_completeness_gaps) and
+    return the resulting gaps dict.
+
+    Never raises: a missing goals dir write, a fleet run that produces no status.json, no
+    workers in that status.json, or an unparseable reply all degrade to a fresh copy of
+    _EMPTY_GAPS (all-empty lists) -- same graceful-degradation contract as refute_findings /
+    behavioral_verify. Shared by both bench.review_run.main()'s standalone --completeness pass
+    and run_review_loop's per-round seeding, so the wiring exists in exactly one place."""
+    stamp = stamp or _stamp()
+    goal = build_completeness_goal(dimensions_run, files_covered, findings_so_far, repo_root)
+    goals_path = os.path.join(out_dir, "completeness_goals_%s.jsonl" % stamp)
+    write_goals_jsonl([goal], goals_path)
+
+    state_dir = os.path.join(out_dir, "completeness_state_%s" % stamp)
+    status_path = os.path.join(state_dir, "status.json")
+    transcripts_dir = os.path.join(state_dir, "transcripts")
+
+    run_fleet(goals_path, _clamp_max_concurrent(1), effort, state_dir=state_dir)
+
+    if not os.path.isfile(status_path):
+        print("WARNING: completeness-critic pass produced no status.json at %s; skipping "
+              "(no gaps reported)" % status_path)
+        return dict(_EMPTY_GAPS)
+    try:
+        with open(status_path, encoding="utf-8") as f:
+            status = json.load(f)
+    except Exception as e:
+        print("WARNING: could not read completeness-critic status.json: %s" % e)
+        return dict(_EMPTY_GAPS)
+    workers = status.get("workers", []) if isinstance(status, dict) else []
+    if not isinstance(workers, list) or not workers:
+        return dict(_EMPTY_GAPS)
+
+    text = worker_final_text(workers[0], transcripts_dir)
+    return parse_completeness_gaps(text)
+
+
+# --- P3 piece A: loop-until-dry orchestration -------------------------------------------------
+
+def _dedupe_key(finding):
+    """Stable dedupe key for one finding, per the P3 spec: (normpath(file), line,
+    title.strip().lower()). Used by run_review_loop to recognize "the same finding reported
+    again" across rounds regardless of a later round's verify_verdict -- so a finding the
+    refuter REFUTED in an earlier round still counts as "already seen" and never re-triggers
+    a "new finding this round" count (which would otherwise stall the loop at dry_rounds=0
+    forever, since a refuted finding can keep reappearing every round)."""
+    file_ = os.path.normpath(str(finding.get("file", "") or ""))
+    line = finding.get("line")
+    title = str(finding.get("title", "") or "").strip().lower()
+    return (file_, line, title)
+
+
+def run_review_loop(kind, mode, repo_root, out_dir, base_stamp, base_ref=None, cached=False,
+                     target_path=None, group_size=None, dimension_keys=None,
+                     max_concurrent=DEFAULT_MAX_CONCURRENT, effort="auto", run_refute=True,
+                     panel=False, run_behavioral=False, behavioral_severity=None,
+                     completeness=False, max_rounds=3, dry_rounds=2):
+    """P3 piece A: repeat the existing single-round pipeline (plan_goals -> run_fleet ->
+    aggregate -> optional refute_findings -> optional behavioral_verify) across multiple
+    rounds, accumulating UNIQUE findings via _dedupe_key, until the run goes dry.
+
+    Stops when EITHER:
+      - `dry_rounds` CONSECUTIVE rounds each add zero new (unseen-by-_dedupe_key) findings
+        (stopped_reason="dry"), or
+      - `max_rounds` rounds have run without going dry (stopped_reason="max_rounds" -- NO
+        SILENT CAP: this is reported both via a printed line and via the returned loop_meta,
+        never silently truncated), or
+      - a round's plan_goals yields no goals at all (stopped_reason="no_files"), or
+      - a round's fleet run produces no status.json (stopped_reason="fleet_failure").
+
+    Every finding ever seen (regardless of round or later verify_verdict) is added to a
+    persistent `seen` set BEFORE the next round's dedupe check runs, so a finding REFUTED in
+    round N does not reappear as "new" in round N+1 (a refuted finding recurring every round
+    would otherwise keep the loop "wet" forever instead of going dry).
+
+    completeness=True (P3 piece B) additionally spawns run_completeness_critic after each
+    round that didn't just stop the loop, and feeds its "missing_dimensions" (validated
+    against dimensions_for_kind(kind), unknown/inapplicable keys silently ignored -- a critic
+    reply is untrusted free-form model output, never allowed to raise) and "missing_files"
+    into the NEXT round's plan_goals (dimension_keys union, extra_files scope). completeness
+    is independent of dimension_keys/target_path being narrowed by the CLI -- a run with no
+    --dimensions restriction already covers every dimension, so the critic's suggestions are
+    then a no-op union (nothing new to add), which is intentional, not a bug.
+
+    Returns (agg, loop_meta):
+      agg     -- same shape as bench.review_aggregate.aggregate()'s return (so callers can
+                 pass it straight to render_markdown/render_json unchanged): "generated_at",
+                 "workers_total" (always 0 here -- this is an accumulation across N worker
+                 pools, not one pool), "parse_errors" (always 0 -- per-round parse errors are
+                 already folded into whether a finding made it into `findings` at all),
+                 "findings" (deduped, accumulated across every round), "by_severity". Also
+                 carries "completeness_gaps" (the LAST round's gaps dict) iff completeness=True
+                 and at least one critic round actually ran.
+      loop_meta -- {"rounds_run": int, "stopped_reason": str, "max_rounds": int,
+                    "dry_rounds_target": int, "unique_findings": int}.
+    """
+    seen = set()
+    all_findings = []
+    consecutive_dry = 0
+    rounds_run = 0
+    stopped_reason = None
+    extra_dimension_keys = None
+    extra_target_files = None
+    last_gaps = None
+    any_critic_ran = False
+
+    kind_dims = {d["key"] for d in dimensions_for_kind(kind)}
+
+    for round_idx in range(1, max_rounds + 1):
+        rounds_run = round_idx
+        round_stamp = "%s_r%d" % (base_stamp, round_idx)
+
+        this_dims = dimension_keys
+        if extra_dimension_keys:
+            base = set(dimension_keys) if dimension_keys else set(kind_dims)
+            this_dims = sorted(base | set(extra_dimension_keys))
+
+        files, groups, goals, goal_meta = plan_goals(
+            kind, mode, repo_root, base_ref=base_ref, cached=cached, target_path=target_path,
+            group_size=group_size, dimension_keys=this_dims, extra_files=extra_target_files)
+        dims_used = sorted({m["dimension"] for m in goal_meta})
+
+        goals_path = os.path.join(out_dir, "goals_%s.jsonl" % round_stamp)
+        write_goals_jsonl(goals, goals_path)
+
+        if not goals:
+            print("loop round %d/%d: no files matched -- stopping loop" % (round_idx, max_rounds))
+            stopped_reason = "no_files"
+            break
+
+        print("loop round %d/%d: launching %d goal(s) across dimensions: %s..." %
+              (round_idx, max_rounds, len(goals), ", ".join(dims_used)))
+        run_fleet(goals_path, max_concurrent, effort)
+
+        status_path = os.path.join(repo_root, ".fleet", "status.json")
+        transcripts_dir = os.path.join(repo_root, ".fleet", "transcripts")
+        if not os.path.isfile(status_path):
+            print("WARNING: loop round %d produced no status.json -- stopping loop early "
+                  "(rounds may remain unrun)" % round_idx)
+            stopped_reason = "fleet_failure"
+            break
+
+        agg_round = aggregate(status_path, transcripts_dir, now=time.time())
+        round_findings = agg_round.get("findings", [])
+
+        if run_refute and round_findings:
+            verdicts = refute_findings(round_findings, kind, out_dir, time.time(), panel=panel,
+                                        max_concurrent=max_concurrent, effort=effort,
+                                        repo_root=repo_root, stamp=round_stamp)
+            merge_verdicts(agg_round, verdicts)
+
+        if run_behavioral and round_findings:
+            confirmed = [f for f in round_findings if f.get("verify_verdict") == "confirmed"]
+            if behavioral_severity:
+                confirmed = [f for f in confirmed
+                             if str(f.get("severity", "")).lower() in behavioral_severity]
+            if confirmed:
+                behavioral_verify(round_findings, out_dir, time.time(),
+                                   max_concurrent=max_concurrent, effort=effort,
+                                   repo_root=repo_root, stamp=round_stamp,
+                                   severity_filter=behavioral_severity)
+
+        new_count = 0
+        for f in round_findings:
+            if not isinstance(f, dict):
+                continue
+            key = _dedupe_key(f)
+            if key in seen:
+                continue
+            seen.add(key)
+            all_findings.append(f)
+            new_count += 1
+
+        print("loop round %d/%d: %d finding(s) this round, %d new (unseen)" %
+              (round_idx, max_rounds, len(round_findings), new_count))
+
+        consecutive_dry = consecutive_dry + 1 if new_count == 0 else 0
+        if consecutive_dry >= dry_rounds:
+            stopped_reason = "dry"
+            break
+
+        if completeness:
+            files_covered = sorted({f for g in groups for f in g})
+            gaps = run_completeness_critic(dims_used, files_covered, all_findings, out_dir,
+                                            repo_root, effort=effort, stamp=round_stamp)
+            any_critic_ran = True
+            last_gaps = gaps
+            extra_dimension_keys = [d for d in gaps.get("missing_dimensions", [])
+                                     if d in kind_dims] or None
+            extra_target_files = gaps.get("missing_files") or None
+            if any(gaps.get(k) for k in _EMPTY_GAPS):
+                print("loop round %d/%d: completeness critic reported gaps: "
+                      "missing_dimensions=%s missing_files=%s unverified_claims=%d" %
+                      (round_idx, max_rounds, gaps.get("missing_dimensions"),
+                       gaps.get("missing_files"), len(gaps.get("unverified_claims") or [])))
+    else:
+        # for/else: the loop ran every round in range() without ever `break`-ing (never went
+        # dry, never hit a no-files/fleet-failure early stop) -- it was the max_rounds cap
+        # itself that ended things, not dryness. NO SILENT CAPS: report this explicitly.
+        stopped_reason = "max_rounds"
+
+    if stopped_reason == "max_rounds":
+        print("NO SILENT CAP: loop stopped because max-rounds=%d was reached, NOT because "
+              "findings went dry -- rounds may remain; re-run with a higher --max-rounds to "
+              "keep looking." % max_rounds)
+
+    by_severity = {"high": [], "medium": [], "low": []}
+    for f in all_findings:
+        sev = str(f.get("severity", "low")).lower()
+        if sev not in by_severity:
+            sev = "low"
+        by_severity[sev].append(f)
+
+    agg = {
+        "generated_at": time.time(),
+        "workers_total": 0,
+        "parse_errors": 0,
+        "findings": all_findings,
+        "by_severity": by_severity,
+    }
+    if any_critic_ran:
+        agg["completeness_gaps"] = last_gaps
+
+    loop_meta = {
+        "rounds_run": rounds_run,
+        "stopped_reason": stopped_reason,
+        "max_rounds": max_rounds,
+        "dry_rounds_target": dry_rounds,
+        "unique_findings": len(all_findings),
+    }
+    return agg, loop_meta
+
+
 def _finding_key(f):
     return (str(f.get("file", "")), str(f.get("line", "")), str(f.get("title", "")))
 
@@ -538,6 +843,29 @@ def build_arg_parser():
     ap.add_argument("--dry-run", action="store_true",
                      help="build goals and print the plan without launching the fleet")
     ap.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
+    ap.add_argument("--loop", action="store_true",
+                     help="P3 OPT-IN (default OFF): repeat plan_goals -> run_fleet -> "
+                          "(refute) -> (behavioral) across multiple rounds, accumulating "
+                          "UNIQUE findings (deduped by normalized file+line+lowercased title, "
+                          "so a REFUTED finding never re-triggers a loop-must-continue signal "
+                          "by reappearing), until --dry-rounds consecutive rounds add zero new "
+                          "findings or --max-rounds is hit (see run_review_loop). Without "
+                          "--loop, behavior is IDENTICAL to today's single pass")
+    ap.add_argument("--max-rounds", type=int, default=3,
+                     help="--loop only: stop after this many rounds even if never dry "
+                          "(default 3) -- hitting this cap is always reported, never silent")
+    ap.add_argument("--dry-rounds", type=int, default=2,
+                     help="--loop only: consecutive rounds with zero new (unseen) findings "
+                          "before stopping (default 2)")
+    ap.add_argument("--completeness", action="store_true",
+                     help="P3 OPT-IN (default OFF): spawn a completeness-critic goal "
+                          "(build_completeness_goal) that reports (1) any REVIEW_DIMENSIONS "
+                          "key not yet run, (2) any file/area not yet examined, (3) any "
+                          "current finding whose claim is asserted but not verified. Runs "
+                          "once after a normal single pass; under --loop it also runs after "
+                          "each round and seeds the next round's plan_goals with its "
+                          "suggested extra dimensions/files. Independent of --loop -- works "
+                          "on its own")
     return ap
 
 
@@ -584,6 +912,9 @@ def main(argv=None):
         print("goals file: %s" % goals_path)
         print("fleet cmd: %s" % cmd)
         print("report would be written under: %s" % out_dir)
+        if args.loop or args.completeness:
+            print("note: --loop/--completeness are ignored under --dry-run -- the plan shown "
+                  "above is for a single round only")
         return 0
 
     if not os.path.isfile(VENVPY):
@@ -595,60 +926,101 @@ def main(argv=None):
               (args.mode, args.target_path or "(none)"))
         return 0
 
-    print("launching %d review goal(s) across dimensions: %s..." %
-          (len(goals), ", ".join(dims_used)))
-    run_fleet(goals_path, max_concurrent, args.effort)
-
-    status_path = os.path.join(repo_root, ".fleet", "status.json")
-    transcripts_dir = os.path.join(repo_root, ".fleet", "transcripts")
-    if not os.path.isfile(status_path):
-        print("ERROR: fleet run finished but %s was not found -- the fleet run likely "
-              "failed to start or was killed before writing a snapshot; check the .fleet "
-              "logs." % status_path)
-        return 1
-
-    agg = aggregate(status_path, transcripts_dir, now=time.time())
-    agg["dimensions_covered"] = dims_used
-
     if args.verify:
         print("--verify is deprecated; routing to the refuter-based pass (which already runs "
               "by default) in panel mode")
     run_refute = not args.no_refute
     panel = args.refute_panel or args.verify
+    behavioral_severity_set = None
+    if args.behavioral_severity:
+        behavioral_severity_set = {s.strip().lower() for s in args.behavioral_severity.split(",")
+                                    if s.strip()}
 
-    if run_refute:
-        findings = agg.get("findings", [])
-        if not findings:
-            print("no findings to refute; skipping refuter pass")
-        else:
-            print("launching refuter pass: %d finding(s)%s..." %
-                  (len(findings), " (panel)" if panel else ""))
-            verdicts = refute_findings(findings, args.kind, out_dir, time.time(),
-                                        panel=panel, max_concurrent=max_concurrent,
-                                        effort=args.effort, repo_root=repo_root, stamp=stamp)
-            merge_verdicts(agg, verdicts)
+    loop_meta = None
+    if args.loop:
+        # P3 piece A: loop-until-dry. Everything below this branch (plan_goals/run_fleet for
+        # a single pass, and the single-pass refute/behavioral/completeness wiring in the
+        # `else` branch) is UNCHANGED from before P3 -- --loop opts into a completely
+        # separate code path instead of threading loop state through the old one, so the
+        # default (no --loop) behavior can never regress.
+        #
+        # NOTE: the top-level plan_goals()/goals_path/goals_<stamp>.jsonl computed above (used
+        # for the --dry-run preview and the "no files matched" pre-check) is NOT reused here --
+        # run_review_loop plans and writes its OWN goals_<stamp>_r<N>.jsonl per round (round 1
+        # may add completeness-suggested dimensions/files from a later round's critic, so it
+        # cannot just replay the single plan computed before we knew --loop was even set).
+        print("launching review LOOP (max_rounds=%d dry_rounds=%d completeness=%s)..." %
+              (args.max_rounds, args.dry_rounds, args.completeness))
+        agg, loop_meta = run_review_loop(
+            args.kind, args.mode, repo_root, out_dir, stamp, base_ref=args.base_ref,
+            cached=args.cached, target_path=args.target_path, group_size=args.group_size,
+            dimension_keys=dimension_keys, max_concurrent=max_concurrent, effort=args.effort,
+            run_refute=run_refute, panel=panel, run_behavioral=args.behavioral,
+            behavioral_severity=behavioral_severity_set, completeness=args.completeness,
+            max_rounds=args.max_rounds, dry_rounds=args.dry_rounds)
+        agg["dimensions_covered"] = dims_used
+        agg["loop_meta"] = loop_meta
+    else:
+        print("launching %d review goal(s) across dimensions: %s..." %
+              (len(goals), ", ".join(dims_used)))
+        run_fleet(goals_path, max_concurrent, args.effort)
 
-    # P2 piece A: OPT-IN behavioral-verify pass (executes real code, so unlike the refuter
-    # above it never runs unless --behavioral was explicitly passed).
-    if args.behavioral:
-        confirmed_findings = [f for f in agg.get("findings", [])
-                               if f.get("verify_verdict") == "confirmed"]
-        severity_filter = None
-        if args.behavioral_severity:
-            severity_filter = {s.strip().lower() for s in args.behavioral_severity.split(",")
-                                if s.strip()}
-            confirmed_findings = [f for f in confirmed_findings
-                                   if str(f.get("severity", "")).lower() in severity_filter]
-        if not confirmed_findings:
-            print("no CONFIRMED findings to behaviorally verify; skipping --behavioral pass")
-        else:
-            print("launching behavioral-verify pass: %d confirmed finding(s)%s..." %
-                  (len(confirmed_findings),
-                   " (severity=%s)" % ",".join(sorted(severity_filter)) if severity_filter
-                   else ""))
-            behavioral_verify(agg.get("findings", []), out_dir, time.time(),
-                               max_concurrent=max_concurrent, effort=args.effort,
-                               repo_root=repo_root, stamp=stamp, severity_filter=severity_filter)
+        status_path = os.path.join(repo_root, ".fleet", "status.json")
+        transcripts_dir = os.path.join(repo_root, ".fleet", "transcripts")
+        if not os.path.isfile(status_path):
+            print("ERROR: fleet run finished but %s was not found -- the fleet run likely "
+                  "failed to start or was killed before writing a snapshot; check the .fleet "
+                  "logs." % status_path)
+            return 1
+
+        agg = aggregate(status_path, transcripts_dir, now=time.time())
+        agg["dimensions_covered"] = dims_used
+
+        if run_refute:
+            findings = agg.get("findings", [])
+            if not findings:
+                print("no findings to refute; skipping refuter pass")
+            else:
+                print("launching refuter pass: %d finding(s)%s..." %
+                      (len(findings), " (panel)" if panel else ""))
+                verdicts = refute_findings(findings, args.kind, out_dir, time.time(),
+                                            panel=panel, max_concurrent=max_concurrent,
+                                            effort=args.effort, repo_root=repo_root, stamp=stamp)
+                merge_verdicts(agg, verdicts)
+
+        # P2 piece A: OPT-IN behavioral-verify pass (executes real code, so unlike the refuter
+        # above it never runs unless --behavioral was explicitly passed).
+        if args.behavioral:
+            confirmed_findings = [f for f in agg.get("findings", [])
+                                   if f.get("verify_verdict") == "confirmed"]
+            severity_filter = behavioral_severity_set
+            if severity_filter:
+                confirmed_findings = [f for f in confirmed_findings
+                                       if str(f.get("severity", "")).lower() in severity_filter]
+            if not confirmed_findings:
+                print("no CONFIRMED findings to behaviorally verify; skipping --behavioral pass")
+            else:
+                print("launching behavioral-verify pass: %d confirmed finding(s)%s..." %
+                      (len(confirmed_findings),
+                       " (severity=%s)" % ",".join(sorted(severity_filter)) if severity_filter
+                       else ""))
+                behavioral_verify(agg.get("findings", []), out_dir, time.time(),
+                                   max_concurrent=max_concurrent, effort=args.effort,
+                                   repo_root=repo_root, stamp=stamp, severity_filter=severity_filter)
+
+        # P3 piece B: OPT-IN completeness critic, independent of --loop -- works standalone
+        # too (a single extra goal after the single pass above).
+        if args.completeness:
+            gaps = run_completeness_critic(dims_used, files, agg.get("findings", []), out_dir,
+                                            repo_root, effort=args.effort, stamp=stamp)
+            agg["completeness_gaps"] = gaps
+            if any(gaps.get(k) for k in _EMPTY_GAPS):
+                print("completeness critic reported gaps: missing_dimensions=%s "
+                      "missing_files=%s unverified_claims=%d" %
+                      (gaps.get("missing_dimensions"), gaps.get("missing_files"),
+                       len(gaps.get("unverified_claims") or [])))
+            else:
+                print("completeness critic: no gaps identified")
 
     os.makedirs(out_dir, exist_ok=True)
     md_path = os.path.join(out_dir, "review_report_%s.md" % stamp)
@@ -676,6 +1048,10 @@ def main(argv=None):
         inconclusive = sum(1 for f in all_findings if f.get("behavioral_verdict") == "inconclusive")
         print("behavioral: reproduced=%d not_reproduced=%d inconclusive=%d" %
               (reproduced, not_repro, inconclusive))
+    if loop_meta is not None:
+        print("loop: rounds_run=%d/%d stopped_reason=%s unique_findings=%d" %
+              (loop_meta["rounds_run"], loop_meta["max_rounds"], loop_meta["stopped_reason"],
+               loop_meta["unique_findings"]))
     return 0
 
 
