@@ -19,6 +19,27 @@ $ErrorActionPreference = "Continue"
 $scriptDir = $PSScriptRoot
 $root = Split-Path -Parent $scriptDir
 
+function Ensure-EnvDefaults {
+    # Release upgrades must not overwrite a user's .env, but existing installations need new
+    # safe defaults. Append MCP_REVIEW_P2C=0 only when the key is absent; an explicit 1 is kept.
+    try {
+        $path = Join-Path $root ".env"
+        if (-not (Test-Path $path)) { return }
+        $text = [System.IO.File]::ReadAllText($path)
+        if ($text -match '(?m)^\s*MCP_REVIEW_P2C\s*=') { return }
+        if ($text.Length -gt 0 -and -not ($text.EndsWith("`n") -or $text.EndsWith("`r"))) {
+            $text += "`r`n"
+        }
+        $text += "MCP_REVIEW_P2C=0`r`n"
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($path, $text, $utf8NoBom)
+    } catch {
+        # A default-backfill failure must never prevent daily startup.
+    }
+}
+
+Ensure-EnvDefaults
+
 function Proc-Running([string]$pattern) {
     try {
         return [bool](Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |

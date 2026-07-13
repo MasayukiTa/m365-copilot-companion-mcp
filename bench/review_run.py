@@ -64,6 +64,7 @@ aggregation wiring) is reachable and tested without the fleet.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -98,8 +99,18 @@ from bench.review_build_goals import (
     enumerate_files,
     group_files,
     write_goals_jsonl,
+    CLEAR_FRAMING_PREAMBLE,
 )
+from bench.review_adjudicate import adjudicate_findings
+from bench.review_decompose import (
+    MAX_CHILDREN_PER_PARENT, MAX_DECOMPOSITION_DEPTH, MAX_TOTAL_RECOVERY_GOALS,
+    build_child_envelopes, build_decomposer_goal, parse_subtasks, validate_subtasks,
+)
+from bench.review_state import derive_finding_state
 from relay.refuter import PANEL_LENSES, aggregate_panel, parse_verdict
+from relay.review_resilience import (
+    TaskEnvelope, goal_dict_from_envelope, task_envelope_from_goal,
+)
 
 DEFAULT_OUT_DIR = ".fleet/review"
 DEFAULT_ALL_GROUP_SIZE = 20
@@ -203,7 +214,8 @@ def plan_goals(kind, mode, repo_root, base_ref=None, cached=False, target_path=N
     return files, groups, goals, goal_meta
 
 
-def fleet_cmd(goals_path, max_concurrent, effort, state_dir=None):
+def fleet_cmd(goals_path, max_concurrent, effort, state_dir=None,
+              resilience_profile=None, max_turns=None):
     """The exact, verified relay.fleet_runner launch contract. Do not add, rename, or drop
     the core flags here -- other bench orchestrators (bench/swe_solve_decoupled.py) rely on
     this same shape and it has been confirmed live against relay/fleet_runner.py's argparse.
@@ -214,25 +226,241 @@ def fleet_cmd(goals_path, max_concurrent, effort, state_dir=None):
     cmd = [VENVPY, "-m", "relay.fleet_runner",
            "--goals-file", goals_path,
            "--max-concurrent", str(max_concurrent),
-           "--max-turns", FLEET_MAX_TURNS,
+           "--max-turns", str(max_turns if max_turns is not None else FLEET_MAX_TURNS),
            "--disk-floor-gb", "0",
            "--effort", effort]
     if state_dir:
         cmd += ["--state-dir", state_dir]
+    if resilience_profile and resilience_profile != "off":
+        cmd += ["--resilience-profile", resilience_profile, "--max-fresh-replays", "1"]
     return cmd
 
 
-def run_fleet(goals_path, max_concurrent, effort, state_dir=None):
+def run_fleet(goals_path, max_concurrent, effort, state_dir=None,
+              resilience_profile=None, max_turns=None):
     """The ONE function that touches the fleet subprocess -- isolated so tests can
     monkeypatch it out entirely without a real Popen. Blocks until the fleet run exits
     (fleet_runner drives the M365 Copilot fleet on companion Edge :9222); returns its
     return code. Writes <state_dir or .fleet>/status.json and .../transcripts/* as a side
     effect."""
-    cmd = fleet_cmd(goals_path, max_concurrent, effort, state_dir=state_dir)
+    cmd = fleet_cmd(goals_path, max_concurrent, effort, state_dir=state_dir,
+                    resilience_profile=resilience_profile, max_turns=max_turns)
     print("fleet: " + " ".join(cmd[1:]))
     proc = subprocess.Popen(cmd, cwd=REPO, env=dict(os.environ))
     proc.wait()
     return proc.returncode
+
+
+_P2C_PROHIBITED_ACTIONS = (
+    "do not remove or weaken the authorization preamble",
+    "do not expand the parent file scope",
+    "do not add external-system access or credentials",
+    "do not output secret values",
+    "do not edit source files during review",
+)
+
+
+def _prepare_resilience_goals(goals, goal_meta, kind, stamp):
+    """Add immutable Task Envelope metadata without changing any goal text/cwd."""
+    campaign_id = "%s-%s" % (kind, stamp)
+    prepared = []
+    envelopes = {}
+    for i, (goal, meta) in enumerate(zip(goals, goal_meta), 1):
+        task_id = "%s-%s-%04d" % (kind, meta.get("dimension", "review"), i)
+        metadata = {
+            "scope": list(meta.get("files") or []),
+            "files": list(meta.get("files") or []),
+            "dimension": meta.get("dimension", ""),
+            "output_contract": "FINDINGS",
+            "authorization_preamble": CLEAR_FRAMING_PREAMBLE,
+            "prohibited_actions": list(_P2C_PROHIBITED_ACTIONS),
+            "resilience_profile": kind,
+        }
+        envelope = TaskEnvelope(
+            task_id=task_id,
+            parent_task_id=None,
+            campaign_id=campaign_id,
+            role="producer",
+            goal_text=goal.get("text", ""),
+            cwd=goal.get("cwd", ""),
+            depth=0,
+            metadata=metadata,
+        )
+        goal_dict = goal_dict_from_envelope(envelope)
+        # Preserve any acceptance/check fields a future goal builder may add.
+        for key in ("check", "checks"):
+            if key in goal:
+                goal_dict[key] = goal[key]
+        prepared.append(goal_dict)
+        envelopes[task_id] = envelope
+    return prepared, envelopes
+
+
+def _load_status(state_dir):
+    try:
+        with open(os.path.join(state_dir, "status.json"), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _resilience_finding_key(finding):
+    detail = " ".join(str(finding.get("detail", "") or "").lower().split())
+    detail_hash = hashlib.sha256(detail.encode("utf-8")).hexdigest()[:16]
+    return (
+        os.path.normcase(os.path.normpath(str(finding.get("file", "") or ""))),
+        finding.get("line"),
+        str(finding.get("title", "") or "").strip().lower(),
+        detail_hash,
+    )
+
+
+def _merge_recovery_aggregate(target, child):
+    seen = {_resilience_finding_key(f) for f in target.get("findings", [])
+            if isinstance(f, dict)}
+    for finding in child.get("findings", []):
+        if not isinstance(finding, dict):
+            continue
+        key = _resilience_finding_key(finding)
+        if key in seen:
+            continue
+        seen.add(key)
+        target.setdefault("findings", []).append(finding)
+    target["workers_total"] = target.get("workers_total", 0) + child.get("workers_total", 0)
+    target["parse_errors"] = target.get("parse_errors", 0) + child.get("parse_errors", 0)
+    by_severity = {"high": [], "medium": [], "low": []}
+    for finding in target.get("findings", []):
+        sev = str(finding.get("severity", "low")).lower()
+        by_severity[sev if sev in by_severity else "low"].append(finding)
+    target["by_severity"] = by_severity
+
+
+def recover_content_refusals(agg, initial_state_dir, envelopes, kind, out_dir, stamp,
+                             max_concurrent, effort, repo_root):
+    """Decompose only twice-refused workers, bounded by depth/children/total budgets."""
+    initial_status = _load_status(initial_state_dir)
+    initial_workers = initial_status.get("workers", []) or []
+    pending = []
+    for worker in initial_workers:
+        if not isinstance(worker, dict):
+            continue
+        if worker.get("status") != "content_refused" and worker.get("outcome") != "CONTENT_REFUSED":
+            continue
+        envelope = envelopes.get(worker.get("task_id"))
+        if envelope is not None:
+            pending.append((envelope, worker))
+
+    metrics = {
+        "enabled": True,
+        "profile": kind,
+        "fresh_replays": sum(int(w.get("fresh_replay_count", 0) or 0)
+                             for w in initial_workers if isinstance(w, dict)),
+        "content_refusals": len(pending),
+        "decomposed_parents": 0,
+        "child_goals": 0,
+        "unresolved_refusals": 0,
+        "validation_errors": [],
+        "budget_truncated_children": 0,
+        "events": [],
+    }
+    # A refusal is an expected P2c state, not a malformed FINDINGS response.
+    if pending:
+        agg["parse_errors"] = max(0, agg.get("parse_errors", 0) - len(pending))
+
+    recovery_budget = min(MAX_TOTAL_RECOVERY_GOALS, max(1, len(envelopes) * 4))
+    recovery_goals_used = 0
+    depth = 0
+    while pending and depth < MAX_DECOMPOSITION_DEPTH and recovery_goals_used < recovery_budget:
+        depth += 1
+        decomposable = [(env, w) for env, w in pending if env.depth < MAX_DECOMPOSITION_DEPTH]
+        metrics["unresolved_refusals"] += len(pending) - len(decomposable)
+        if not decomposable:
+            break
+
+        room = recovery_budget - recovery_goals_used
+        decomposable = decomposable[:room]
+        decomp_goals = []
+        for env, worker in decomposable:
+            summaries = [str(x.get("response", ""))[:800]
+                         for x in (worker.get("refusal_history") or []) if isinstance(x, dict)]
+            decomp_goals.append(build_decomposer_goal(env, summaries))
+        recovery_goals_used += len(decomp_goals)
+        decomp_path = os.path.join(out_dir, "recovery_decomposer_goals_%s_d%d.jsonl" % (stamp, depth))
+        decomp_state = os.path.join(out_dir, "recovery_decomposer_state_%s_d%d" % (stamp, depth))
+        write_goals_jsonl(decomp_goals, decomp_path)
+        run_fleet(decomp_path, min(max_concurrent, max(1, len(decomp_goals))), effort,
+                  state_dir=decomp_state, resilience_profile=kind, max_turns=4)
+        decomp_workers = _load_status(decomp_state).get("workers", []) or []
+
+        child_envelopes = []
+        for index, (parent, _worker) in enumerate(decomposable):
+            dw = decomp_workers[index] if index < len(decomp_workers) \
+                and isinstance(decomp_workers[index], dict) else {}
+            text = worker_final_text(dw, os.path.join(decomp_state, "transcripts"))
+            subtasks, parse_errors = parse_subtasks(text)
+            valid, errors = validate_subtasks(parent, subtasks, MAX_CHILDREN_PER_PARENT)
+            if parse_errors:
+                errors.append("%s: decomposer output was not parseable" % parent.task_id)
+            if errors:
+                metrics["validation_errors"].extend(errors)
+            if not valid:
+                metrics["unresolved_refusals"] += 1
+                metrics["events"].append({"task_id": parent.task_id,
+                                          "result": "decomposition_failed", "depth": parent.depth})
+                continue
+            built = build_child_envelopes(parent, valid)
+            remaining = recovery_budget - recovery_goals_used - len(child_envelopes)
+            admitted = built[:max(0, remaining)]
+            child_envelopes.extend(admitted)
+            metrics["budget_truncated_children"] += max(0, len(built) - len(admitted))
+            metrics["decomposed_parents"] += 1
+            metrics["events"].append({"task_id": parent.task_id,
+                                      "result": "decomposed", "children": len(admitted),
+                                      "children_requested": len(built),
+                                      "depth": parent.depth})
+
+        if not child_envelopes:
+            pending = []
+            break
+        child_goals = [goal_dict_from_envelope(env) for env in child_envelopes]
+        recovery_goals_used += len(child_goals)
+        metrics["child_goals"] += len(child_goals)
+        child_path = os.path.join(out_dir, "recovery_children_goals_%s_d%d.jsonl" % (stamp, depth))
+        child_state = os.path.join(out_dir, "recovery_children_d%d_state_%s" % (depth, stamp))
+        write_goals_jsonl(child_goals, child_path)
+        run_fleet(child_path, min(max_concurrent, max(1, len(child_goals))), effort,
+                  state_dir=child_state, resilience_profile=kind, max_turns=12)
+        child_status = _load_status(child_state)
+        child_workers = child_status.get("workers", []) or []
+        metrics["fresh_replays"] += sum(int(w.get("fresh_replay_count", 0) or 0)
+                                        for w in child_workers if isinstance(w, dict))
+        metrics["content_refusals"] += sum(
+            1 for w in child_workers if isinstance(w, dict)
+            and (w.get("status") == "content_refused" or w.get("outcome") == "CONTENT_REFUSED"))
+        child_agg = aggregate(os.path.join(child_state, "status.json"),
+                              os.path.join(child_state, "transcripts"), now=time.time())
+        refused_count = sum(1 for w in child_workers if isinstance(w, dict)
+                            and (w.get("status") == "content_refused"
+                                 or w.get("outcome") == "CONTENT_REFUSED"))
+        child_agg["parse_errors"] = max(0, child_agg.get("parse_errors", 0) - refused_count)
+        _merge_recovery_aggregate(agg, child_agg)
+
+        by_id = {env.task_id: env for env in child_envelopes}
+        pending = []
+        for worker in child_workers:
+            if not isinstance(worker, dict):
+                continue
+            if worker.get("status") == "content_refused" or worker.get("outcome") == "CONTENT_REFUSED":
+                env = by_id.get(worker.get("task_id"))
+                if env is not None:
+                    pending.append((env, worker))
+
+    metrics["unresolved_refusals"] += len(pending)
+    metrics["recovery_goals_used"] = recovery_goals_used
+    metrics["recovery_goal_budget"] = recovery_budget
+    agg["resilience"] = metrics
+    return metrics
 
 
 _WORKER_NAME_RE = re.compile(r"w(\d+)$")
@@ -294,7 +522,7 @@ def parse_behavior_verdict(text):
 
 
 def refute_findings(findings, kind, out_dir, now, panel=False, max_concurrent=None,
-                     effort="auto", repo_root=None, stamp=None):
+                     effort="auto", repo_root=None, stamp=None, resilience_profile=None):
     """Run EACH finding through the existing adversarial refuter (relay/refuter.py) as its own
     fleet pass, and return a verdicts list shaped for merge_verdicts(findings, verdicts).
 
@@ -337,7 +565,11 @@ def refute_findings(findings, kind, out_dir, now, panel=False, max_concurrent=No
     refute_status_path = os.path.join(refute_state_dir, "status.json")
     refute_transcripts_dir = os.path.join(refute_state_dir, "transcripts")
 
-    run_fleet(goals_path, max_concurrent, effort, state_dir=refute_state_dir)
+    if resilience_profile and resilience_profile != "off":
+        run_fleet(goals_path, max_concurrent, effort, state_dir=refute_state_dir,
+                  resilience_profile=resilience_profile, max_turns=6)
+    else:
+        run_fleet(goals_path, max_concurrent, effort, state_dir=refute_state_dir)
 
     if not os.path.isfile(refute_status_path):
         print("WARNING: refuter pass produced no status.json at %s; skipping (findings keep "
@@ -388,12 +620,14 @@ def refute_findings(findings, kind, out_dir, now, panel=False, max_concurrent=No
             "title": finding.get("title", ""),
             "verdict": vv,
             "reason": vreason,
+            "refuter_verdict": vkind,
         })
     return verdicts
 
 
 def behavioral_verify(findings, out_dir, now, max_concurrent=None, effort="auto",
-                       repo_root=None, stamp=None, severity_filter=None, max_findings=None):
+                       repo_root=None, stamp=None, severity_filter=None, max_findings=None,
+                       resilience_profile=None):
     """P2 piece A: run each CONFIRMED finding (verify_verdict == "confirmed", set by
     refute_findings + merge_verdicts) through a BEHAVIORAL-VERIFY fleet pass -- a fresh worker
     tries to actually REPRODUCE the finding with a minimal, READ-ONLY run_python/shell_exec
@@ -462,7 +696,11 @@ def behavioral_verify(findings, out_dir, now, max_concurrent=None, effort="auto"
     behavioral_status_path = os.path.join(behavioral_state_dir, "status.json")
     behavioral_transcripts_dir = os.path.join(behavioral_state_dir, "transcripts")
 
-    run_fleet(goals_path, max_concurrent, effort, state_dir=behavioral_state_dir)
+    if resilience_profile and resilience_profile != "off":
+        run_fleet(goals_path, max_concurrent, effort, state_dir=behavioral_state_dir,
+                  resilience_profile=resilience_profile, max_turns=10)
+    else:
+        run_fleet(goals_path, max_concurrent, effort, state_dir=behavioral_state_dir)
 
     if not os.path.isfile(behavioral_status_path):
         print("WARNING: behavioral-verify pass produced no status.json at %s; skipping "
@@ -792,7 +1030,29 @@ def merge_verdicts(agg, verdicts):
         v = by_key.get(_finding_key(finding))
         finding["verify_verdict"] = v.get("verdict") if v else None
         finding["verify_reason"] = (v.get("reason", "") if v else "")
+        finding["refuter_verdict"] = v.get("refuter_verdict") if v else None
     return agg
+
+
+def derive_and_attach_finding_states(findings):
+    """Attach the P2c state while retaining verify_verdict for older report/fix readers."""
+    for finding in findings or []:
+        if not isinstance(finding, dict):
+            continue
+        state = derive_finding_state(
+            True,
+            finding.get("refuter_verdict"),
+            finding.get("adjudicator_verdict"),
+            finding.get("behavioral_verdict"),
+        )
+        finding["finding_state"] = state.value
+        if state.value in ("confirmed", "reproduced"):
+            finding["verify_verdict"] = "confirmed"
+        elif state.value == "disproved":
+            finding["verify_verdict"] = "false_positive"
+        elif state.value == "contested":
+            finding["verify_verdict"] = "unclear"
+    return findings
 
 
 def _resolve_out_dir(out_dir, repo_root):
@@ -803,6 +1063,9 @@ def build_arg_parser():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--kind", choices=["review", "security"], required=True)
+    ap.add_argument("--resilience-profile", choices=["off", "review", "security"],
+                    default="off", help=argparse.SUPPRESS)
+    ap.add_argument("--no-auto-behavioral-high", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--mode", choices=["all", "diff"], default="all")
     ap.add_argument("--base-ref", default=None)
     ap.add_argument("--cached", action="store_true")
@@ -872,6 +1135,15 @@ def build_arg_parser():
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
 
+    resilience_profile = args.resilience_profile
+    if resilience_profile != "off" and resilience_profile != args.kind:
+        print("ERROR: --resilience-profile must be off or match --kind")
+        return 2
+    if resilience_profile != "off" and args.loop:
+        print("ERROR: P2c resilience currently runs as a bounded single campaign; --loop is not "
+              "combined with --resilience-profile (use /review-2 or /security-review-2 without --loop).")
+        return 2
+
     repo_root = REPO
     out_dir = _resolve_out_dir(args.out_dir, repo_root)
     stamp = _stamp()
@@ -889,9 +1161,16 @@ def main(argv=None):
     )
     dims_used = sorted({m["dimension"] for m in goal_meta})
 
+    envelopes = {}
+    if resilience_profile != "off":
+        goals, envelopes = _prepare_resilience_goals(
+            goals, goal_meta, resilience_profile, stamp)
+
     goals_path = os.path.join(out_dir, "goals_%s.jsonl" % stamp)
     write_goals_jsonl(goals, goals_path)
-    cmd = fleet_cmd(goals_path, max_concurrent, args.effort)
+    cmd = fleet_cmd(goals_path, max_concurrent, args.effort,
+                    resilience_profile=(resilience_profile if resilience_profile != "off" else None),
+                    max_turns=(12 if resilience_profile != "off" else None))
 
     if args.dry_run:
         print("DRY RUN -- plan only, fleet NOT launched")
@@ -936,6 +1215,12 @@ def main(argv=None):
         behavioral_severity_set = {s.strip().lower() for s in args.behavioral_severity.split(",")
                                     if s.strip()}
 
+    run_behavioral = args.behavioral or (
+        resilience_profile == "security" and not args.no_auto_behavioral_high)
+    if resilience_profile == "security" and not args.behavioral \
+            and not args.no_auto_behavioral_high:
+        behavioral_severity_set = {"high"}
+
     loop_meta = None
     if args.loop:
         # P3 piece A: loop-until-dry. Everything below this branch (plan_goals/run_fleet for
@@ -955,7 +1240,7 @@ def main(argv=None):
             args.kind, args.mode, repo_root, out_dir, stamp, base_ref=args.base_ref,
             cached=args.cached, target_path=args.target_path, group_size=args.group_size,
             dimension_keys=dimension_keys, max_concurrent=max_concurrent, effort=args.effort,
-            run_refute=run_refute, panel=panel, run_behavioral=args.behavioral,
+             run_refute=run_refute, panel=panel, run_behavioral=run_behavioral,
             behavioral_severity=behavioral_severity_set, completeness=args.completeness,
             max_rounds=args.max_rounds, dry_rounds=args.dry_rounds)
         agg["dimensions_covered"] = dims_used
@@ -963,10 +1248,17 @@ def main(argv=None):
     else:
         print("launching %d review goal(s) across dimensions: %s..." %
               (len(goals), ", ".join(dims_used)))
-        run_fleet(goals_path, max_concurrent, args.effort)
+        primary_state_dir = (os.path.join(out_dir, "primary_state_%s" % stamp)
+                             if resilience_profile != "off"
+                             else os.path.join(repo_root, ".fleet"))
+        if resilience_profile != "off":
+            run_fleet(goals_path, max_concurrent, args.effort, state_dir=primary_state_dir,
+                      resilience_profile=resilience_profile, max_turns=12)
+        else:
+            run_fleet(goals_path, max_concurrent, args.effort)
 
-        status_path = os.path.join(repo_root, ".fleet", "status.json")
-        transcripts_dir = os.path.join(repo_root, ".fleet", "transcripts")
+        status_path = os.path.join(primary_state_dir, "status.json")
+        transcripts_dir = os.path.join(primary_state_dir, "transcripts")
         if not os.path.isfile(status_path):
             print("ERROR: fleet run finished but %s was not found -- the fleet run likely "
                   "failed to start or was killed before writing a snapshot; check the .fleet "
@@ -975,6 +1267,11 @@ def main(argv=None):
 
         agg = aggregate(status_path, transcripts_dir, now=time.time())
         agg["dimensions_covered"] = dims_used
+
+        if resilience_profile != "off":
+            recover_content_refusals(
+                agg, primary_state_dir, envelopes, resilience_profile, out_dir, stamp,
+                max_concurrent, args.effort, repo_root)
 
         if run_refute:
             findings = agg.get("findings", [])
@@ -985,12 +1282,22 @@ def main(argv=None):
                       (len(findings), " (panel)" if panel else ""))
                 verdicts = refute_findings(findings, args.kind, out_dir, time.time(),
                                             panel=panel, max_concurrent=max_concurrent,
-                                            effort=args.effort, repo_root=repo_root, stamp=stamp)
+                                            effort=args.effort, repo_root=repo_root, stamp=stamp,
+                                            resilience_profile=(resilience_profile
+                                                                if resilience_profile != "off"
+                                                                else None))
                 merge_verdicts(agg, verdicts)
+
+                if resilience_profile != "off":
+                    adjudicate_findings(
+                        agg.get("findings", []), args.kind, out_dir, max_concurrent,
+                        args.effort, repo_root, stamp, run_fleet)
+                    # Make adjudicator-confirmed findings eligible for the behavioral pass.
+                    derive_and_attach_finding_states(agg.get("findings", []))
 
         # P2 piece A: OPT-IN behavioral-verify pass (executes real code, so unlike the refuter
         # above it never runs unless --behavioral was explicitly passed).
-        if args.behavioral:
+        if run_behavioral:
             confirmed_findings = [f for f in agg.get("findings", [])
                                    if f.get("verify_verdict") == "confirmed"]
             severity_filter = behavioral_severity_set
@@ -1006,7 +1313,12 @@ def main(argv=None):
                        else ""))
                 behavioral_verify(agg.get("findings", []), out_dir, time.time(),
                                    max_concurrent=max_concurrent, effort=args.effort,
-                                   repo_root=repo_root, stamp=stamp, severity_filter=severity_filter)
+                                   repo_root=repo_root, stamp=stamp, severity_filter=severity_filter,
+                                   resilience_profile=(resilience_profile
+                                                       if resilience_profile != "off" else None))
+
+        if resilience_profile != "off":
+            derive_and_attach_finding_states(agg.get("findings", []))
 
         # P3 piece B: OPT-IN completeness critic, independent of --loop -- works standalone
         # too (a single extra goal after the single pass above).
@@ -1041,7 +1353,7 @@ def main(argv=None):
         refuted = sum(1 for f in agg.get("findings", []) if f.get("verify_verdict") == "false_positive")
         unclear = sum(1 for f in agg.get("findings", []) if f.get("verify_verdict") == "unclear")
         print("refuter: confirmed=%d refuted/dropped=%d unclear=%d" % (confirmed, refuted, unclear))
-    if args.behavioral:
+    if run_behavioral:
         all_findings = agg.get("findings", [])
         reproduced = sum(1 for f in all_findings if f.get("behavioral_verdict") == "reproduced")
         not_repro = sum(1 for f in all_findings if f.get("behavioral_verdict") == "not_reproduced")

@@ -40,8 +40,15 @@ from .copilot_autopilot_relay import (
     reported_stuck, transient_backoff, conversation_exhausted, RECYCLE_PREFIX,
 )
 from .planner import PLAN_PROMPT, extract_plan, plan_ready
+from .review_resilience import (
+    freeze_goal_dict, looks_like_policy_refusal, same_task_envelope,
+    task_envelope_from_goal,
+)
 
-TERMINAL = ("done", "stuck", "maxturns", "error", "cancelled")
+TERMINAL = (
+    "done", "stuck", "maxturns", "error", "cancelled",
+    "content_refused", "unresolved_refusal",
+)
 # non-terminal but not yet occupying a tab; counts as "still running" for the loop.
 PENDING = "pending"
 
@@ -808,6 +815,9 @@ _PHASE_LABELS = {
     "maxturns":    "Needs attention",
     "error":       "Stopped (error)",
     "cancelled":   "Stopped",
+    "fresh_replay": "Fresh replay",
+    "content_refused": "Content refused",
+    "unresolved_refusal": "Unresolved refusal",
 }
 
 
@@ -854,13 +864,27 @@ class RelayWorker:
                  per_turn_timeout_s=240, max_no_progress=3, max_verify_attempts=3,
                  refuter=False, max_refute=2, plan_mode=False, review_lenses=None,
                  max_transient=10, transcript_dir=None, run_id="", busy_writer=None,
-                 max_research=3, contract_budget=None, max_continue=6):
+                 max_research=3, contract_budget=None, max_continue=6,
+                 resilience_profile="off", max_fresh_replays=0):
         self.page = None
         self.drv = None
+        self.goal_record = freeze_goal_dict(goal) if isinstance(goal, dict) else {"text": str(goal)}
         text, checks, cwd = goal_fields(goal)
         self.goal = text
         self.checks = checks
         self.cwd = cwd
+        self.task_envelope = task_envelope_from_goal(goal)
+        self.resilience_profile = str(resilience_profile or "off").lower()
+        # The resilience contract permits at most one identical replay per leaf task.
+        self.max_fresh_replays = min(1, max(0, int(max_fresh_replays or 0)))
+        self.fresh_replay_count = 0
+        self.refusal_count = 0
+        self.refusal_history = []
+        self.original_goal_hash = self.task_envelope.goal_hash
+        self.recovery_state = ""
+        self.recovery_cause = ""
+        self.recovery_result = ""
+        self.attempt_transcripts = []
         # resume_conv: when a goal dict carries it, this worker RESUMES that existing Copilot
         # conversation URL instead of opening a fresh chat -- so a FINISHED fleet task can take a
         # CONTEXT-CARRYING follow-up (the prior turns stay in the conversation the agent reads).
@@ -1016,9 +1040,78 @@ class RelayWorker:
         # is run-unique (run_id includes the fleet start time) so reused worker names
         # (w0/w1) across rounds never share a file. Path is exposed via .transcript so
         # the snapshot can hand it to the UI. None when no dir was passed (back-compat).
-        self._tx_key = ((run_id + "_") if run_id else "") + name
+        self._tx_base_key = ((run_id + "_") if run_id else "") + name
+        self._tx_key = (self._tx_base_key + "_a0"
+                        if self.resilience_profile != "off" else self._tx_base_key)
         self._tx = _Transcript(transcript_dir, self._tx_key, name, self.goal)
         self.transcript = self._tx.path or ""
+        if self.transcript:
+            self.attempt_transcripts.append(self.transcript)
+
+    def _start_fresh_replay(self):
+        """Move this worker to a brand-new conversation and resend the identical envelope."""
+        replay_envelope = task_envelope_from_goal(self.goal_record)
+        if not same_task_envelope(self.task_envelope, replay_envelope):
+            self.status, self.outcome = "error", "ERROR"
+            self.reason = "fresh replay envelope hash mismatch"
+            return False
+
+        old_url = self.conv_url or (getattr(self.page, "url", "") if self.page is not None else "")
+        self.refusal_history.append({
+            "attempt": self.fresh_replay_count,
+            "conversation_url": old_url,
+            "response": self.last_response,
+            "goal_hash": self.original_goal_hash,
+        })
+        try:
+            if self.page is not None:
+                self.page.close()
+        except Exception:
+            pass
+        self.page = None
+        self.drv = None
+        self.conv_url = ""
+        self.conv_title = ""
+
+        self.fresh_replay_count += 1
+        self.status = "fresh_replay"
+        self.recovery_state = "fresh_replay"
+        self.reason = "policy refusal -> identical task in a fresh conversation"
+
+        # Conversation-local state must not leak into the replay.
+        self.turn = 0
+        self.no_progress = 0
+        self.last_norm = None
+        self.last_response = ""
+        self._continue_count = 0
+        self.transient = 0
+        self.first_transient_ts = 0.0
+        self._toolerr_ts = 0.0
+        self._last_text = None
+        self._stable_since = None
+        self._count_before = 0
+        self._t_send = 0.0
+        self._cooldown_until = 0.0
+        self.closed = False
+
+        attempt_key = "%s_a%d" % (self._tx_base_key, self.fresh_replay_count)
+        self._tx = _Transcript(getattr(self._tx, "dir", None), attempt_key, self.name, self.goal)
+        self.transcript = self._tx.path or ""
+        if self.transcript:
+            self.attempt_transcripts.append(self.transcript)
+
+        try:
+            self.page = _open_fresh(self._context, self._agent_url)
+            self.drv = CopilotWebDriver(self.page)
+        except Exception as e:
+            self.status, self.outcome = "error", "ERROR"
+            self.reason = "fresh replay open failed: %s: %s" % (type(e).__name__, e)
+            return False
+
+        # This is the same initial payload as the original non-plan review task.
+        self.job = PROTOCOL + self.goal
+        self.status = "ready"
+        return True
 
     def _reset_agent_error_window(self):
         """Forget stale agent-disabled evidence after a different recoverable state wins."""
@@ -2068,6 +2161,27 @@ class RelayWorker:
             self._cooldown_until = now + transient_backoff(self._copilot_err_streak)  # back off, don't hammer
             return
         self._reset_agent_error_window()
+        # P2c policy-refusal recovery. Infrastructure/tool/login/canned/admin signals above
+        # have priority, so their generic errors can never be misclassified as a policy refusal.
+        if looks_like_policy_refusal(resp):
+            self.refusal_count += 1
+            if self.resilience_profile != "off" \
+                    and self.fresh_replay_count < self.max_fresh_replays:
+                self._start_fresh_replay()
+                return
+            if self.resilience_profile != "off" and self.fresh_replay_count > 0:
+                self.refusal_history.append({
+                    "attempt": self.fresh_replay_count,
+                    "conversation_url": self.conv_url or getattr(self.page, "url", ""),
+                    "response": resp,
+                    "goal_hash": self.original_goal_hash,
+                })
+                self.status, self.outcome = "content_refused", "CONTENT_REFUSED"
+                self.recovery_state = "content_refused"
+                self.recovery_cause = "task_content"
+                self.recovery_result = "needs_decomposition"
+                self.reason = "identical task refused in two independent conversations"
+                return
         norm = " ".join(resp.lower().split())[:300]
         self.no_progress = self.no_progress + 1 if norm and norm == self.last_norm else 0
         self.last_norm = norm
@@ -2272,6 +2386,10 @@ class RelayWorker:
                     self.last_response).start()
             self.status = "refuting"
             return
+        if self.fresh_replay_count:
+            self.recovery_cause = "session_state"
+            self.recovery_result = "recovered"
+            self.recovery_state = "recovered"
         self.status, self.outcome = "done", "DONE"
 
     def _start_next_lens(self):
@@ -2317,6 +2435,10 @@ class RelayWorker:
             self.job = REFUTE_FIX_JOB % (reason or "(no reason)")
             self.status = "ready"
             return False
+        if self.fresh_replay_count:
+            self.recovery_cause = "session_state"
+            self.recovery_result = "recovered"
+            self.recovery_state = "recovered"
         self.status, self.outcome = "done", "DONE"
         return True
 
@@ -2454,7 +2576,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     disk_floor_gb=None, eval_disk_gb=None, disk_box=None,
                     ram_box=None,
                     transcript_dir=None, run_id="", busy_writer=None,
-                    pause_box=None, stop_box=None):
+                     pause_box=None, stop_box=None, resilience_profile="off",
+                     max_fresh_replays=0):
     """Drive len(goals) autonomous relays in parallel to completion, but never with
     more than `max_concurrent` tabs open at once (defaults to what free RAM allows).
     A goal's tab is opened only when a slot frees and CLOSED the moment it finishes.
@@ -2539,8 +2662,10 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                            refuter=refuter, max_refute=max_refute, plan_mode=plan_mode,
                            review_lenses=review_lenses, max_transient=max_transient,
                            transcript_dir=transcript_dir, run_id=run_id,
-                           busy_writer=busy_writer, max_research=max_research,
-                           contract_budget=_contract_budget)
+                            busy_writer=busy_writer, max_research=max_research,
+                            contract_budget=_contract_budget,
+                            resilience_profile=resilience_profile,
+                            max_fresh_replays=max_fresh_replays)
                for i, g in enumerate(goals)]
     pending = list(workers)            # FIFO queue of not-yet-attached workers
 
@@ -2579,8 +2704,11 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # own network/tunnel/tool path looked unhealthy (see the INFRA_STUCK branches in _decide),
         # NOT that the goal/agent is broken -- that's transient infra, re-queueable by design, so a
         # fresh Edge context still gets another shot at it.
-        FINISHED_OUTCOMES = ("DONE", "CANCELLED", "STUCK")
-        return [{"text": w.goal, "checks": w.checks, "cwd": w.cwd}
+        FINISHED_OUTCOMES = (
+            "DONE", "CANCELLED", "STUCK", "CONTENT_REFUSED", "UNRESOLVED_REFUSAL",
+        )
+        return [freeze_goal_dict(getattr(w, "goal_record", None) or
+                                 {"text": w.goal, "checks": w.checks, "cwd": w.cwd})
                 for w in workers if w.outcome not in FINISHED_OUTCOMES]
 
     _reap_counter = 0
@@ -2633,8 +2761,10 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                                  refuter=refuter, max_refute=max_refute,
                                  plan_mode=plan_mode, review_lenses=review_lenses,
                                  max_transient=max_transient, busy_writer=busy_writer,
-                                 max_research=max_research,
-                                 contract_budget=_contract_budget)
+                                  max_research=max_research,
+                                  contract_budget=_contract_budget,
+                                  resilience_profile=resilience_profile,
+                                  max_fresh_replays=max_fresh_replays)
                 workers.append(nw)
                 if item.get("priority"):
                     pending.insert(0, nw)
@@ -2766,5 +2896,18 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
              "phase_events": list(getattr(w, "phase_events", [])),
              # FIX 2 (P0): carry the worker's final assistant text so fleet_runner can
              # populate display_result and keep `last` non-blank in the final snapshot.
-             "last_response": getattr(w, "last_response", "") or ""}
+             "last_response": getattr(w, "last_response", "") or "",
+             "task_id": getattr(getattr(w, "task_envelope", None), "task_id", ""),
+             "parent_task_id": getattr(getattr(w, "task_envelope", None), "parent_task_id", None),
+             "campaign_id": getattr(getattr(w, "task_envelope", None), "campaign_id", ""),
+             "role": getattr(getattr(w, "task_envelope", None), "role", ""),
+             "depth": getattr(getattr(w, "task_envelope", None), "depth", 0),
+             "goal_hash": getattr(w, "original_goal_hash", ""),
+             "fresh_replay_count": getattr(w, "fresh_replay_count", 0),
+             "refusal_count": getattr(w, "refusal_count", 0),
+             "refusal_history": list(getattr(w, "refusal_history", [])),
+             "recovery_cause": getattr(w, "recovery_cause", ""),
+             "recovery_result": getattr(w, "recovery_result", ""),
+             "recovery_state": getattr(w, "recovery_state", ""),
+             "attempt_transcripts": list(getattr(w, "attempt_transcripts", []))}
             for w in workers]
