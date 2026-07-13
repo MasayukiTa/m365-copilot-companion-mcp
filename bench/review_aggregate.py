@@ -446,6 +446,40 @@ def render_markdown(agg):
     if dims_covered:
         lines.append("- dimensions covered: %s" % ", ".join(dims_covered))
 
+    resilience = agg.get("resilience")
+    if resilience:
+        lines.append("- P2c resilience: profile=%s fresh_replays=%d content_refusals=%d "
+                     "decomposed_parents=%d child_goals=%d unresolved=%d" % (
+                         resilience.get("profile", "?"),
+                         resilience.get("fresh_replays", 0),
+                         resilience.get("content_refusals", 0),
+                         resilience.get("decomposed_parents", 0),
+                         resilience.get("child_goals", 0),
+                         resilience.get("unresolved_refusals", 0),
+                     ))
+        lines.append("- P2c recovery budget: %d/%d goal(s) used" % (
+            resilience.get("recovery_goals_used", 0),
+            resilience.get("recovery_goal_budget", 0),
+        ))
+        if resilience.get("budget_truncated_children"):
+            lines.append("  NOTE: %d decomposed child goal(s) were not launched because the "
+                         "hard recovery-goal budget was reached." %
+                         resilience.get("budget_truncated_children"))
+        if resilience.get("validation_errors"):
+            lines.append("- P2c decomposition validation errors: %d" %
+                         len(resilience.get("validation_errors") or []))
+        if resilience.get("events"):
+            lines.append("- P2c recovery events:")
+            for event in resilience.get("events") or []:
+                if not isinstance(event, dict):
+                    continue
+                lines.append("  - %s: %s (depth=%s%s)" % (
+                    event.get("task_id", "?"), event.get("result", "?"),
+                    event.get("depth", "?"),
+                    ", children=%s" % event.get("children")
+                    if event.get("children") is not None else "",
+                ))
+
     # P3 piece C: loop-until-dry + completeness-critic metadata. Purely additive -- both keys
     # are absent from `agg` unless bench.review_run.py's --loop/--completeness were actually
     # used, so a report built without P3 renders byte-identical to before P3 existed.
@@ -513,6 +547,10 @@ def render_markdown(agg):
                 meta_bits.append("CONFIRMED")
             elif verify_verdict == "unclear":
                 meta_bits.append("refute: unclear")
+            if it.get("finding_state"):
+                meta_bits.append("state=" + str(it.get("finding_state")))
+            if it.get("adjudicator_verdict"):
+                meta_bits.append("adjudicator=" + str(it.get("adjudicator_verdict")))
             behavioral_verdict = it.get("behavioral_verdict")
             if behavioral_verdict == "reproduced":
                 meta_bits.append("DEMONSTRATED")
@@ -527,6 +565,8 @@ def render_markdown(agg):
             behavioral_evidence = it.get("behavioral_evidence")
             if behavioral_evidence:
                 lines.append("  behavior evidence: %s" % behavioral_evidence)
+            if it.get("adjudicator_reason"):
+                lines.append("  adjudicator: %s" % it.get("adjudicator_reason"))
         lines.append("")
 
     refuted = [f for f in findings_all if f.get("verify_verdict") == "false_positive"]

@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 
 _SECURITY_TOKENS = ("security-review", "securityreview", "security")
+_P2C_REVIEW_TOKENS = ("review-2", "review2")
+_P2C_SECURITY_TOKENS = ("security-review-2", "securityreview-2", "securityreview2")
 
 
 def parse_review_command(cmd):
@@ -40,16 +42,23 @@ def parse_review_command(cmd):
         head = parts[0].lstrip("/").lower()
         rest = parts[1].strip() if len(parts) > 1 else ""
 
-        kind = "security" if head in _SECURITY_TOKENS else "review"
+        p2c = head in _P2C_REVIEW_TOKENS or head in _P2C_SECURITY_TOKENS
+        kind = "security" if head in (_SECURITY_TOKENS + _P2C_SECURITY_TOKENS) else "review"
+
+        def result(mode, target_path):
+            out = {"kind": kind, "mode": mode, "target_path": target_path}
+            if p2c:
+                out["resilience"] = True
+            return out
 
         if not rest:
-            return {"kind": kind, "mode": "all", "target_path": None}
+            return result("all", None)
 
         first_word = rest.split(None, 1)[0].lower()
         if first_word == "diff":
-            return {"kind": kind, "mode": "diff", "target_path": None}
+            return result("diff", None)
 
-        return {"kind": kind, "mode": "all", "target_path": rest}
+        return result("all", rest)
     except Exception:
         return {"kind": "review", "mode": "all", "target_path": None}
 
@@ -71,6 +80,8 @@ def build_review_argv(parsed, repo_root, venvpy):
     target = parsed.get("target_path")
     if target:
         argv += ["--target-path", target]
+    if parsed.get("resilience"):
+        argv += ["--resilience-profile", parsed.get("kind", "review")]
     return argv
 
 
