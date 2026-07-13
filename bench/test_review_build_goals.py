@@ -19,6 +19,7 @@ from bench.review_build_goals import (
     REVIEW_RUBRIC,
     SECURITY_RUBRIC,
     build_dimension_goal,
+    build_refute_goal,
     build_review_goal,
     dimensions_for_kind,
     enumerate_files,
@@ -26,6 +27,7 @@ from bench.review_build_goals import (
     main,
     write_goals_jsonl,
 )
+from relay.refuter import LENS_PROMPTS, REFUTER_INSTRUCTION
 
 
 def _run(cmd, cwd):
@@ -437,6 +439,67 @@ def test_build_dimension_goal_different_dimensions_differ():
     a = build_dimension_goal("correctness", ["a.py"], "C:/fakerepo")
     b = build_dimension_goal("test_hygiene", ["a.py"], "C:/fakerepo")
     assert a["text"] != b["text"]
+
+
+# --- build_refute_goal (P1b: reuse relay/refuter.py instead of a bespoke verifier) ----------
+
+def _finding(**over):
+    base = {"file": "pkg/a.py", "line": 42, "severity": "high",
+            "title": "SQL injection via string concat", "detail": "raw input reaches the query"}
+    base.update(over)
+    return base
+
+
+def test_build_refute_goal_contains_verdict_instruction_and_claim():
+    goal_text = build_refute_goal(_finding(), "review")
+    # the refuter's own verdict-output contract must be present verbatim
+    assert REFUTER_INSTRUCTION in goal_text
+    assert "REFUTED" in goal_text and "UPHELD" in goal_text
+    # the finding's claim (title + detail) must appear -- this is what gets attacked
+    assert "SQL injection via string concat" in goal_text
+    assert "raw input reaches the query" in goal_text
+    assert "pkg/a.py" in goal_text
+    # must NOT be wrapped in the FINDINGS delimiters -- different contract
+    assert FINDINGS_BEGIN not in goal_text
+    assert FINDINGS_END not in goal_text
+
+
+def test_build_refute_goal_kind_review_defaults_to_correctness_lens():
+    goal_text = build_refute_goal(_finding(dimension=None), "review")
+    assert LENS_PROMPTS["correctness"] in goal_text
+
+
+def test_build_refute_goal_kind_security_defaults_to_security_lens():
+    finding = _finding(title="hardcoded API key")
+    goal_text = build_refute_goal(finding, "security")
+    assert LENS_PROMPTS["security"] in goal_text
+
+
+def test_build_refute_goal_dimension_overrides_kind_default():
+    # runtime_behavior maps to the "edge" lens regardless of kind="review" (whose own
+    # kind-fallback would otherwise be "correctness")
+    finding = _finding(dimension="runtime_behavior")
+    goal_text = build_refute_goal(finding, "review")
+    assert LENS_PROMPTS["edge"] in goal_text
+    assert LENS_PROMPTS["correctness"] not in goal_text
+
+
+def test_build_refute_goal_unknown_dimension_falls_back_to_kind():
+    finding = _finding(dimension="not_a_real_dimension")
+    goal_text = build_refute_goal(finding, "security")
+    assert LENS_PROMPTS["security"] in goal_text
+
+
+def test_build_refute_goal_explicit_lens_overrides_everything():
+    finding = _finding(dimension="runtime_behavior")  # would normally pick "edge"
+    goal_text = build_refute_goal(finding, "review", lens="security")
+    assert LENS_PROMPTS["security"] in goal_text
+    assert LENS_PROMPTS["edge"] not in goal_text
+
+
+def test_build_refute_goal_returns_plain_string_not_dict():
+    goal_text = build_refute_goal(_finding(), "review")
+    assert isinstance(goal_text, str)
 
 
 if __name__ == "__main__":
