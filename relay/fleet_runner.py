@@ -137,6 +137,9 @@ STATUS_PILL = {
     "maxturns":  ("上限",   "bad"),
     "error":     ("エラー", "bad"),
     "cancelled": ("停止",   "muted"),    # user released it from the cockpit
+    "fresh_replay": ("新規会話", "good"),
+    "content_refused": ("内容拒否", "bad"),
+    "unresolved_refusal": ("未解決拒否", "bad"),
 }
 
 DEFAULT_MAX_CONCURRENT = 3
@@ -579,6 +582,19 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
             # before its terminal marker; the relay parses them and stores them here.
             "next_step": getattr(w, "next_step", "") or "",
             "self_confidence": getattr(w, "self_confidence", "") or "",
+            "task_id": getattr(getattr(w, "task_envelope", None), "task_id", ""),
+            "parent_task_id": getattr(getattr(w, "task_envelope", None), "parent_task_id", None),
+            "campaign_id": getattr(getattr(w, "task_envelope", None), "campaign_id", ""),
+            "role": getattr(getattr(w, "task_envelope", None), "role", ""),
+            "depth": getattr(getattr(w, "task_envelope", None), "depth", 0),
+            "goal_hash": getattr(w, "original_goal_hash", ""),
+            "fresh_replay_count": getattr(w, "fresh_replay_count", 0),
+            "refusal_count": getattr(w, "refusal_count", 0),
+            "refusal_history": list(getattr(w, "refusal_history", [])),
+            "recovery_cause": getattr(w, "recovery_cause", ""),
+            "recovery_result": getattr(w, "recovery_result", ""),
+            "recovery_state": getattr(w, "recovery_state", ""),
+            "attempt_transcripts": list(getattr(w, "attempt_transcripts", [])),
         } for w in workers],
         # Pending HITL gates from the autonomy contract gate (contract_gate.py).
         # Each entry: {"token": str, "question": str, "context": str, "ts": float, "path": str}
@@ -638,6 +654,11 @@ def _normalize_goal_for_ledger(goal):
     priority flag (goal_fields drops it) and the stable key."""
     text, checks, cwd = goal_fields(goal)
     priority = bool(goal.get("priority")) if isinstance(goal, dict) else False
+    if isinstance(goal, dict):
+        out = dict(goal)
+        out.update({"text": text, "checks": checks, "cwd": cwd,
+                    "priority": priority, "key": _goal_key(text)})
+        return out
     return {"text": text, "checks": checks, "cwd": cwd,
             "priority": priority, "key": _goal_key(text)}
 
@@ -647,13 +668,9 @@ def _ledger_to_goal(entry):
     with text/checks/cwd/priority (checks/cwd only when present so a plain goal stays
     minimal). goal_fields reads text/checks/cwd downstream; priority is honoured by the
     add-goal queue if the goal is later re-queued."""
-    g = {"text": entry.get("text", "")}
-    if entry.get("checks"):
-        g["checks"] = entry["checks"]
-    if entry.get("cwd"):
-        g["cwd"] = entry["cwd"]
-    if entry.get("priority"):
-        g["priority"] = True
+    g = dict(entry or {})
+    g.pop("key", None)
+    g["text"] = entry.get("text", "")
     return g
 
 
@@ -928,6 +945,10 @@ def main():
                          "there is no ledger), prints a one-line summary and exits 0.")
     ap.add_argument("--max-turns", type=int, default=1000,
                     help="hard cap on turns per goal (default 1000 ~ unlimited)")
+    ap.add_argument("--resilience-profile", choices=["off", "review", "security", "fix"],
+                    default="off", help="review refusal recovery profile (default off)")
+    ap.add_argument("--max-fresh-replays", type=int, default=0,
+                    help="identical fresh-conversation replays per goal (default 0)")
     ap.add_argument("--max-concurrent", type=int, default=-1,
                     help="max tabs open at once. -1 = use the cockpit's setting "
                          "(maxtabs, default 3); 0 = auto from free RAM; N = exactly N. "
@@ -1470,9 +1491,11 @@ def main():
                                       autoscale_up_margin_mb=args.autoscale_up_margin_mb,
                                       disk_floor_gb=disk_floor, eval_disk_gb=eval_disk,
                                       disk_box=disk_box, ram_box=ram_box,
-                                      pause_box=pause_box, stop_box=stop_box,
-                                      transcript_dir=transcripts_dir,
-                                      run_id="r%x_a%d" % (int(started), attempt))
+                                       pause_box=pause_box, stop_box=stop_box,
+                                       transcript_dir=transcripts_dir,
+                                       run_id="r%x_a%d" % (int(started), attempt),
+                                       resilience_profile=args.resilience_profile,
+                                       max_fresh_replays=max(0, args.max_fresh_replays))
             for r in res:
                 results_by_goal[r["goal"]] = r
             pending = []                                   # finished cleanly
@@ -1509,6 +1532,8 @@ def main():
     # "done" (which made failed/stuck goals show as green 完了).
     def _ostatus(o):
         if o == "DONE": return "done"
+        if o == "CONTENT_REFUSED": return "content_refused"
+        if o == "UNRESOLVED_REFUSAL": return "unresolved_refusal"
         if o == "CANCELLED": return "cancelled"
         if o == "MAXTURNS": return "maxturns"
         if o in ("STUCK", "VERIFY_FAILED"): return "stuck"
@@ -1539,6 +1564,19 @@ def main():
             # can distinguish "display result" from the mid-run live tail.
             "display_result": cleaned,
             "phase_events": r.get("phase_events", []),
+            "task_id": r.get("task_id", ""),
+            "parent_task_id": r.get("parent_task_id"),
+            "campaign_id": r.get("campaign_id", ""),
+            "role": r.get("role", ""),
+            "depth": r.get("depth", 0),
+            "goal_hash": r.get("goal_hash", ""),
+            "fresh_replay_count": r.get("fresh_replay_count", 0),
+            "refusal_count": r.get("refusal_count", 0),
+            "refusal_history": r.get("refusal_history", []),
+            "recovery_cause": r.get("recovery_cause", ""),
+            "recovery_result": r.get("recovery_result", ""),
+            "recovery_state": r.get("recovery_state", ""),
+            "attempt_transcripts": r.get("attempt_transcripts", []),
         }
 
     elapsed = round(time.time() - started, 1)
