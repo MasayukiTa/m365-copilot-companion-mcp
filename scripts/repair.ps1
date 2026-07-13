@@ -122,6 +122,7 @@ $Registry = @{
 
     tunnel_cli      = @{ Tier = 'B'; Key = 'tunnel_cli_install'; Cmd = $tunnelCliCmd;   Note = 'installs software (devtunnel CLI) -- confirm first' }
     tunnel_exists   = @{ Tier = 'B'; Key = 'tunnel_setup';       Cmd = $tunnelSetupCmd; Note = 're-creates the tunnel -- changes the public URL; the Copilot Studio connector may need updating' }
+    tunnel_name_private = @{ Tier = 'B'; Key = 'tunnel_rename';  Cmd = $tunnelSetupCmd; Note = 'recreates the tunnel under a private name -- changes the public URL; the Copilot Studio connector will need the new URL afterward' }
     ui_copilotchat  = @{ Tier = 'B'; Key = 'ui_rebuild';         Cmd = $uiRebuildCmd;   Note = 'closes and rebuilds both UI windows' }
     ui_fleetcockpit = @{ Tier = 'B'; Key = 'ui_rebuild';         Cmd = $uiRebuildCmd;   Note = 'same rebuild as ui_copilotchat -- covers both apps' }
 

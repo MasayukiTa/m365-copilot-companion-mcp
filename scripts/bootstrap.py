@@ -25,9 +25,12 @@
 from __future__ import annotations
 
 import argparse
+import getpass
+import hashlib
 import inspect
 import json
 import os
+import platform
 import re
 import secrets
 import shutil
@@ -46,6 +49,63 @@ STATE_DIR = ROOT / ".setup"
 STATE_FILE = STATE_DIR / "state.json"
 VENV_PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"  # Windows layout
 GENERATED_DIR = ROOT / "generated"
+
+DEFAULT_TUNNEL_NAME = "m365-copilot-companion"
+
+# Privacy guard: some tunnel names leak an identifying (organization/user) token to the
+# GLOBAL devtunnels.ms namespace, which is visible to Microsoft and to the tunnel owner.
+# These two SHA-256 values are a blocklist of the specific leaked token and the specific
+# leaked full tunnel name seen in the wild -- the plaintext is intentionally never written
+# here; only its hash is, so this file cannot itself leak it. Hashing is over the UTF-8
+# bytes of the lowercased input, hex-encoded lowercase. Mirrors setup_devtunnel.ps1's
+# Test-IdentifyingTunnelName -- keep both in sync.
+TOKEN_SHA256 = "2a0341296bb96dc7d205036f9f693427809772f6136a46f58b04a1c492de9e04"
+FULLNAME_SHA256 = "5ba174b8e87faf4e8106e36a7cf5a901bbec3435d01fbd56914c2b0346858261"
+
+
+def _sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _machine_suffix() -> str:
+    """Short, stable-per-machine suffix (~8 hex chars) so a tunnel-name collision
+    (devtunnel ids live in the GLOBAL devtunnels.ms namespace, so two different
+    users'/machines' clones of this repo trying to create the same default name
+    WILL collide) resolves to a name unique per machine/user yet stable across
+    re-runs on that same machine. Lowercase hex only, valid for a devtunnel id."""
+    seed = "%s|%s" % (platform.node(), getpass.getuser())
+    return _sha256_hex(seed.lower())[:8]
+
+
+def _is_identifying_tunnel_name(name: str | None) -> bool:
+    """Returns True if 'name' leaks an identifying token. Mirrors
+    Test-IdentifyingTunnelName in setup_devtunnel.ps1 -- keep both in sync.
+    Empty/whitespace name -> False (nothing to leak, "no name set")."""
+    if not name or not name.strip():
+        return False
+    lower = name.strip().lower()
+
+    # 1. Whole-name blocklist hash match.
+    if _sha256_hex(lower) == FULLNAME_SHA256:
+        return True
+
+    # 2. Per-token blocklist hash match (split on any non-alphanumeric).
+    tokens = [t for t in re.split(r"[^a-z0-9]+", lower) if t]
+    for t in tokens:
+        if _sha256_hex(t) == TOKEN_SHA256:
+            return True
+
+    # 3. Generic runtime checks (no hash needed) -- catches folder-derived /
+    #    user-derived names on any machine, beyond the specific blocklist above.
+    repo_leaf = ROOT.name.lower()
+    user_name = getpass.getuser().lower()
+    for t in tokens:
+        if (repo_leaf and t == repo_leaf) or (user_name and t == user_name):
+            return True
+    if (repo_leaf and repo_leaf in lower) or (user_name and user_name in lower):
+        return True
+
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -367,12 +427,31 @@ def step_dev_tunnel() -> None:
         if cand.exists():
             dt = str(cand)
 
-    # Prefer the user's chosen tunnel name (MCP_TUNNEL_NAME in .env) when set, else
-    # the default. Without this, provisioning a renamed setup that happens to be
-    # missing MCP_TUNNEL_URL would target the DEFAULT tunnel, and _write_tunnel_to_env
-    # would then overwrite MCP_TUNNEL_NAME -- silently flipping a renamed setup back to
-    # the default. Mirrors setup_devtunnel.ps1, which reads MCP_TUNNEL_NAME from .env.
-    tunnel = _read_env_value("MCP_TUNNEL_NAME") or "m365-copilot-companion"
+    # Prefer the user's chosen tunnel name (MCP_TUNNEL_NAME in .env) when set, else a
+    # fresh, machine-unique default (DEFAULT_TUNNEL_NAME + a per-machine suffix, so
+    # different clones/machines never collide in devtunnels.ms's GLOBAL namespace, and
+    # the default never identifies anyone). Without honoring a recorded name,
+    # provisioning a renamed setup that happens to be missing MCP_TUNNEL_URL would
+    # target the DEFAULT tunnel, and _write_tunnel_to_env would then overwrite
+    # MCP_TUNNEL_NAME -- silently flipping a renamed setup back to the default.
+    # Mirrors setup_devtunnel.ps1, which reads MCP_TUNNEL_NAME from .env.
+    #
+    # Privacy guard: if the recorded name is itself identifying (leaks an org/user
+    # token to the tunnel service), it must NOT be reused -- fall through to the fresh
+    # safe name instead, and tell the user the public URL will change.
+    recorded = _read_env_value("MCP_TUNNEL_NAME")
+    safe_default = "%s-%s" % (DEFAULT_TUNNEL_NAME, _machine_suffix())
+    if recorded and _is_identifying_tunnel_name(recorded):
+        log("    NOTICE: the previous Dev Tunnel name ('%s') is identifying (it leaks" % recorded)
+        log("            an organization/user token to the dev tunnel service) and will be")
+        log("            replaced with a private name for this machine.")
+        log("            The PUBLIC URL will change -- after this run, re-paste the new")
+        log("            MCP_TUNNEL_URL into the Copilot Studio MCP connector.")
+        log("            Manual cleanup of the old tunnel (optional; not done automatically):")
+        log("                devtunnel delete %s" % recorded)
+        tunnel = safe_default
+    else:
+        tunnel = recorded or safe_default
 
     # This step must NEVER wall a clean-PC novice. The script that actually
     # installs devtunnel (without winget) and walks the interactive Microsoft
