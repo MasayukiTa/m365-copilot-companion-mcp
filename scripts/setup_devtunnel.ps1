@@ -73,8 +73,8 @@ function Get-MachineSuffix {
 # leaked full tunnel name seen in the wild -- the plaintext is intentionally never written
 # here; only its hash is, so this file cannot itself leak it. Hashing is over the UTF-8
 # bytes of the lowercased input, hex-encoded lowercase.
-$script:TOKEN_SHA256 = "2a0341296bb96dc7d205036f9f693427809772f6136a46f58b04a1c492de9e04"
-$script:FULLNAME_SHA256 = "5ba174b8e87faf4e8106e36a7cf5a901bbec3435d01fbd56914c2b0346858261"
+$script:TOKEN_SHA256 = "2a0341296bb96dc7d205036f9f693427809772f6136a46f58b04a1c492de9e04"  # gitleaks:allow
+$script:FULLNAME_SHA256 = "5ba174b8e87faf4e8106e36a7cf5a901bbec3435d01fbd56914c2b0346858261"  # gitleaks:allow
 
 function Get-Sha256Hex([string]$s) {
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
