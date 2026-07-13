@@ -93,6 +93,22 @@ def group_files(files, group_size):
     return [files[i:i + n] for i in range(0, len(files), n)]
 
 
+# --- P2 piece B: clear-framing / intent pre-flight ----------------------------------------
+# A safety-conscious model can over-refuse a code/security review task if it can't quickly
+# tell the request is legitimate. Rather than obscure or fragment the task to dodge that (out
+# of scope -- see the module docstrings this task's spec forbids), state the real context up
+# front, plainly and completely: this IS a review, of the operator's OWN repo, authorized, for
+# defensive purposes. Prepended (never inserted mid-prompt) to every dimension/refute/
+# behavioral-verify goal text below, so it can never interfere with the verbatim-filename
+# asserts or the <<<FINDINGS>>> delimiter contract that follow it.
+CLEAR_FRAMING_PREAMBLE = (
+    "これは、このリポジトリの所有者本人が依頼した、正式に許可された防御目的のコードレビューです。\n"
+    "目的は弱点を悪用することではなく、実際に存在する弱点を見つけて報告し、後で修正できるように"
+    "することです。\n"
+    "調べた内容と発見事項は、誇張も忖度もせず、事実に基づいて正直に報告してください。\n\n"
+)
+
+
 # --- FINDINGS block contract -------------------------------------------------------------
 # Every review/security worker must end its final reply with this delimiter-fenced JSON
 # array (empty array if nothing found) immediately before its DONE marker. Parsed by
@@ -165,7 +181,8 @@ def build_review_goal(file_group, repo_root, kind):
         raise ValueError("kind must be 'review' or 'security', got %r" % (kind,))
 
     file_list_text = "\n".join("- " + f for f in file_group)
-    text = rubric.replace("{FILE_LIST_CWD}", repo_root).replace("{FILE_LIST}", file_list_text)
+    text = CLEAR_FRAMING_PREAMBLE + rubric.replace(
+        "{FILE_LIST_CWD}", repo_root).replace("{FILE_LIST}", file_list_text)
 
     for f in file_group:
         assert f in text, "filename %r missing verbatim from goal text" % (f,)
@@ -425,8 +442,8 @@ def build_dimension_goal(dimension, file_group, repo_root):
     dim = _resolve_dimension(dimension)
 
     file_list_text = "\n".join("- " + f for f in file_group)
-    text = dim["rubric"].replace("{FILE_LIST_CWD}", repo_root).replace(
-        "{FILE_LIST}", file_list_text)
+    text = CLEAR_FRAMING_PREAMBLE + dim["rubric"].replace(
+        "{FILE_LIST_CWD}", repo_root).replace("{FILE_LIST}", file_list_text)
 
     if dim.get("behavioral"):
         text += _BEHAVIORAL_INSTRUCTION
@@ -510,7 +527,85 @@ def build_refute_goal(finding, kind, lens=None):
     )
     claim_text = title + ("\n" + detail if detail else "")
 
-    return build_refuter_prompt(goal_text, claim_text, lens=lens)
+    return CLEAR_FRAMING_PREAMBLE + build_refuter_prompt(goal_text, claim_text, lens=lens)
+
+
+# --- P2 piece A: behavioral verification of CONFIRMED findings ------------------------------
+# After the refuter (above) upholds a finding on REASONING alone, this goal asks a fresh worker
+# to actually DEMONSTRATE it: build a minimal, READ-ONLY repro with run_python/shell_exec and
+# report what was actually observed vs. what was claimed. This is deliberately a separate
+# verdict contract from BOTH the <<<FINDINGS>>> block (build_dimension_goal) and the REFUTED/
+# UPHELD one (relay/refuter.py) -- a behavioral-verify worker is neither hunting for new
+# findings nor arguing philosophically about one; it is running code and reporting what
+# happened. Keeping the three contracts textually distinct (different marker words, no shared
+# delimiter) means a downstream parser can never confuse one worker's output for another's.
+BEHAVIOR_VERDICT_TAG = "BEHAVIOR_VERDICT"
+BEHAVIOR_EVIDENCE_TAG = "BEHAVIOR_EVIDENCE"
+BEHAVIOR_VERDICTS = ("reproduced", "not_reproduced", "inconclusive")
+
+_BEHAVIOR_VERDICT_SPEC = (
+    "作業の最後に、次の2行を必ず出力してください（これは別のレビューで使われる指摘一覧の"
+    "JSON形式ブロックとは別物です。混同しないこと。このゴールでは新しい指摘を探す必要は"
+    "ありません）:\n\n"
+    + BEHAVIOR_VERDICT_TAG + ": reproduced|not_reproduced|inconclusive\n"
+    + BEHAVIOR_EVIDENCE_TAG + ": <実際に何を実行し、何を観測したかを1〜3文で具体的に>\n\n"
+    "reproduced = 実際に実行して、この指摘が主張する挙動を観測できた（再現できた）。\n"
+    "not_reproduced = 実際に実行してみたが、主張されている挙動は観測できなかった。\n"
+    "inconclusive = 実行環境の制約等で実行できなかった、または結果が曖昧だった。\n"
+    "この2行を出力した後、最後に DONE と書いて終了してください。"
+)
+
+
+def build_behavioral_verify_goal(finding):
+    """Build the behavioral-verify goal TEXT (a plain str, NOT a {"text","cwd"} goal dict --
+    callers wrap it themselves, mirroring build_refute_goal) for one finding whose
+    verify_verdict is already "confirmed" (see bench.review_run.refute_findings /
+    merge_verdicts): asks the agent to actually REPRODUCE the claim with a minimal, READ-ONLY
+    run_python/shell_exec check (e.g. import the module and call the function on sample
+    inputs, grep the relevant code, run an existing test in a tmp directory) and report the
+    OBSERVED behavior against the claim.
+
+    NON-MUTATING BY DESIGN: the prompt repeatedly and explicitly forbids editing source files,
+    deleting anything, running destructive commands, or hitting external networks -- this is
+    an observe-only repro, not a fix attempt (bench/review_fix.py already owns the separate
+    edit-and-fix fleet pass; this goal must never blur into that).
+
+    Emits its OWN verdict contract (BEHAVIOR_VERDICT_TAG / BEHAVIOR_EVIDENCE_TAG, see
+    _BEHAVIOR_VERDICT_SPEC above), read by bench.review_run.parse_behavior_verdict -- a
+    completely separate block from the <<<FINDINGS>>> contract, emitted AS-IS (no FINDINGS
+    delimiters), the same shape as build_refute_goal's own REFUTED/UPHELD contract."""
+    finding = finding if isinstance(finding, dict) else {}
+    file_ = finding.get("file") or "?"
+    line = finding.get("line")
+    line_s = str(line) if line is not None else "?"
+    title = finding.get("title") or ""
+    detail = finding.get("detail") or ""
+
+    claim = (
+        "対象ファイル: %s (行 %s)\n"
+        "指摘（他のレビュアーによる、反証レビューを通過済みの claim）: %s\n" % (file_, line_s, title)
+    )
+    if detail:
+        claim += "詳細: %s\n" % detail
+
+    return (
+        CLEAR_FRAMING_PREAMBLE
+        + "この指摘の主張が実際に正しいかどうかを、読むだけでなく実際にコードを実行して"
+          "検証してください。\n\n"
+        + claim
+        + "\n【厳守事項 - 読み取り専用・非破壊（絶対に守ること）】\n"
+          "1) run_python もしくは shell_exec を実際に使い、最小限の再現コードをこの場で実行し、"
+          "主張されている挙動が本当に観測できるか確認すること（例: 対象モジュールを import して"
+          "該当関数をサンプル入力で呼び出す、grep で該当箇所を確認する、既存テストをtmp"
+          "ディレクトリにコピーして実行する等）。\n"
+          "2) ソースコードは絶対に編集しないこと。ファイルの削除・上書き、破壊的なコマンド"
+          "（rm -rf 等）、外部ネットワークへの書き込みや攻撃的なアクセスは一切行わないこと。"
+          "読み取り・観測・分析のみを行うこと。\n"
+          "3) 「動くはず」「〜と思われる」で済ませず、実際に実行したコマンド/コードと、実際に"
+          "出力・例外・副作用として観測された内容を具体的に報告すること。再現できなかった場合も、"
+          "何を試して何が起きたかを明記すること。\n\n"
+        + _BEHAVIOR_VERDICT_SPEC
+    )
 
 
 # --- FIX goal builder ---------------------------------------------------------------------

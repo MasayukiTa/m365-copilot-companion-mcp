@@ -16,7 +16,15 @@ import pytest
 
 import bench.review_run as review_run
 from bench.review_build_goals import REVIEW_DIMENSIONS, dimensions_for_kind
-from bench.review_run import fleet_cmd, main, merge_verdicts, plan_goals, refute_findings
+from bench.review_run import (
+    behavioral_verify,
+    fleet_cmd,
+    main,
+    merge_verdicts,
+    parse_behavior_verdict,
+    plan_goals,
+    refute_findings,
+)
 from relay.fleet_runner import _read_goals_file
 from relay.refuter import PANEL_LENSES
 
@@ -531,6 +539,320 @@ def test_report_notes_dimension_coverage(repo, monkeypatch, capsys):
     with open(os.path.join(out_dir, json_files[0]), encoding="utf-8") as f:
         report = json.load(f)
     assert report["dimensions_covered"] == ["correctness"]
+
+
+# --- parse_behavior_verdict: tolerant reader of the BEHAVIOR_VERDICT contract ----------------
+
+def test_parse_behavior_verdict_reproduced():
+    text = "実行しました。\nBEHAVIOR_VERDICT: reproduced\nBEHAVIOR_EVIDENCE: 例外が実際に発生した\nDONE"
+    verdict, evidence = parse_behavior_verdict(text)
+    assert verdict == "reproduced"
+    assert "例外が実際に発生した" in evidence
+
+
+def test_parse_behavior_verdict_not_reproduced():
+    text = "BEHAVIOR_VERDICT: not_reproduced\nBEHAVIOR_EVIDENCE: 実行したが問題は起きなかった\nDONE"
+    verdict, evidence = parse_behavior_verdict(text)
+    assert verdict == "not_reproduced"
+    assert "問題は起きなかった" in evidence
+
+
+def test_parse_behavior_verdict_inconclusive_explicit():
+    text = "BEHAVIOR_VERDICT: inconclusive\nBEHAVIOR_EVIDENCE: 実行環境が無かった\nDONE"
+    verdict, evidence = parse_behavior_verdict(text)
+    assert verdict == "inconclusive"
+    assert "実行環境が無かった" in evidence
+
+
+def test_parse_behavior_verdict_garbage_folds_to_inconclusive():
+    for garbage in ("", "no marker at all here", "BEHAVIOR_VERDICT: bogus_word\nDONE",
+                     "some prose mentioning reproduced in passing but no tag"):
+        verdict, evidence = parse_behavior_verdict(garbage)
+        assert verdict == "inconclusive"
+
+
+def test_parse_behavior_verdict_never_raises_on_none():
+    verdict, evidence = parse_behavior_verdict(None)
+    assert verdict == "inconclusive"
+    assert evidence == ""
+
+
+def test_parse_behavior_verdict_case_and_fullwidth_colon_tolerant():
+    verdict, _ = parse_behavior_verdict("behavior_verdict：reproduced")
+    assert verdict == "reproduced"
+
+
+def test_parse_behavior_verdict_last_tag_wins():
+    # an agent may restate its reasoning before the final answer -- last recognized tag wins
+    text = "BEHAVIOR_VERDICT: inconclusive\n(more thinking...)\nBEHAVIOR_VERDICT: reproduced\nDONE"
+    verdict, _ = parse_behavior_verdict(text)
+    assert verdict == "reproduced"
+
+
+# --- behavioral_verify(): P2 piece A, mirrors refute_findings' own wiring -------------------
+
+def _fake_behavioral_fleet_factory(status_payload):
+    def _fake(goals_path, max_concurrent, effort, state_dir=None):
+        assert state_dir, "behavioral_verify must launch its own state_dir'd fleet run"
+        os.makedirs(state_dir, exist_ok=True)
+        with open(os.path.join(state_dir, "status.json"), "w", encoding="utf-8") as f:
+            json.dump(status_payload, f)
+        return 0
+    return _fake
+
+
+def test_behavioral_verify_attaches_verdict_only_to_confirmed_findings(tmp_path, monkeypatch):
+    findings = [
+        {"file": "a.py", "line": 1, "title": "T1", "detail": "d1", "severity": "high",
+         "verify_verdict": "confirmed"},
+        {"file": "b.py", "line": 2, "title": "T2", "detail": "d2", "severity": "medium",
+         "verify_verdict": "false_positive"},
+        {"file": "c.py", "line": 3, "title": "T3", "detail": "d3", "severity": "low",
+         "verify_verdict": "unclear"},
+        {"file": "d.py", "line": 4, "title": "T4", "detail": "d4", "severity": "high",
+         "verify_verdict": None},
+    ]
+    # only findings[0] ("T1") is CONFIRMED -> exactly one goal -> w0.
+    status_payload = {"workers": [
+        {"name": "w0", "display_result": "実行しました。\nBEHAVIOR_VERDICT: reproduced\n"
+                                          "BEHAVIOR_EVIDENCE: 実際に確認できた\nDONE",
+         "transcript": ""},
+    ]}
+    monkeypatch.setattr(review_run, "run_fleet", _fake_behavioral_fleet_factory(status_payload))
+
+    out_dir = str(tmp_path / "out")
+    attached = behavioral_verify(findings, out_dir, now=0.0, repo_root=str(tmp_path),
+                                  stamp="BSTAMP1")
+
+    assert len(attached) == 1
+    assert findings[0]["behavioral_verdict"] == "reproduced"
+    assert "実際に確認できた" in findings[0]["behavioral_evidence"]
+    # false_positive/unclear/None-verdict findings must NEVER get a behavioral pass
+    assert "behavioral_verdict" not in findings[1]
+    assert "behavioral_verdict" not in findings[2]
+    assert "behavioral_verdict" not in findings[3]
+
+    # exactly one goal was written (only the confirmed finding)
+    goals_path = os.path.join(out_dir, "behavioral_goals_BSTAMP1.jsonl")
+    with open(goals_path, encoding="utf-8") as f:
+        lines = [l for l in f if l.strip()]
+    assert len(lines) == 1
+    assert "T1" in lines[0]
+
+
+def test_behavioral_verify_severity_filter(tmp_path, monkeypatch):
+    findings = [
+        {"file": "a.py", "line": 1, "title": "High one", "detail": "", "severity": "high",
+         "verify_verdict": "confirmed"},
+        {"file": "b.py", "line": 2, "title": "Low one", "detail": "", "severity": "low",
+         "verify_verdict": "confirmed"},
+    ]
+    status_payload = {"workers": [
+        {"name": "w0", "display_result": "BEHAVIOR_VERDICT: reproduced\nDONE", "transcript": ""},
+    ]}
+    monkeypatch.setattr(review_run, "run_fleet", _fake_behavioral_fleet_factory(status_payload))
+
+    out_dir = str(tmp_path / "out2")
+    attached = behavioral_verify(findings, out_dir, now=0.0, repo_root=str(tmp_path),
+                                  stamp="BSTAMP2", severity_filter={"high"})
+
+    assert len(attached) == 1
+    assert findings[0]["behavioral_verdict"] == "reproduced"  # high one -- selected
+    assert "behavioral_verdict" not in findings[1]             # low one -- filtered out
+
+    goals_path = os.path.join(out_dir, "behavioral_goals_BSTAMP2.jsonl")
+    with open(goals_path, encoding="utf-8") as f:
+        lines = [l for l in f if l.strip()]
+    assert len(lines) == 1
+
+
+def test_behavioral_verify_not_reproduced_verdict(tmp_path, monkeypatch):
+    findings = [{"file": "a.py", "line": 1, "title": "T1", "detail": "d1", "severity": "high",
+                 "verify_verdict": "confirmed"}]
+    status_payload = {"workers": [
+        {"name": "w0", "display_result": "実際に実行しましたが問題は再現しませんでした。\n"
+                                          "BEHAVIOR_VERDICT: not_reproduced\n"
+                                          "BEHAVIOR_EVIDENCE: 入力を与えたが例外は出なかった\nDONE",
+         "transcript": ""},
+    ]}
+    monkeypatch.setattr(review_run, "run_fleet", _fake_behavioral_fleet_factory(status_payload))
+
+    out_dir = str(tmp_path / "out6")
+    attached = behavioral_verify(findings, out_dir, now=0.0, repo_root=str(tmp_path),
+                                  stamp="BSTAMP6")
+    assert len(attached) == 1
+    assert findings[0]["behavioral_verdict"] == "not_reproduced"
+    assert "例外は出なかった" in findings[0]["behavioral_evidence"]
+
+
+def test_behavioral_verify_no_confirmed_findings_never_launches_fleet(tmp_path, monkeypatch):
+    _no_fleet_guard(monkeypatch)
+    findings = [{"file": "a.py", "line": 1, "title": "T", "detail": "", "severity": "low",
+                 "verify_verdict": "unclear"}]
+    attached = behavioral_verify(findings, str(tmp_path / "out3"), now=0.0,
+                                  repo_root=str(tmp_path))
+    assert attached == []
+
+
+def test_behavioral_verify_empty_findings_never_launches_fleet(tmp_path, monkeypatch):
+    _no_fleet_guard(monkeypatch)
+    attached = behavioral_verify([], str(tmp_path / "out4"), now=0.0, repo_root=str(tmp_path))
+    assert attached == []
+
+
+def test_behavioral_verify_no_status_json_degrades_to_empty(tmp_path, monkeypatch):
+    findings = [{"file": "a.py", "line": 1, "title": "T", "detail": "", "severity": "low",
+                 "verify_verdict": "confirmed"}]
+
+    def _fake(goals_path, max_concurrent, effort, state_dir=None):
+        return 0  # simulate a fleet that never wrote a status.json
+
+    monkeypatch.setattr(review_run, "run_fleet", _fake)
+    attached = behavioral_verify(findings, str(tmp_path / "out5"), now=0.0,
+                                  repo_root=str(tmp_path), stamp="BSTAMP5")
+    assert attached == []
+    assert "behavioral_verdict" not in findings[0]
+
+
+# --- CLI: --behavioral is OFF by default; --behavioral-severity filters --------------------
+
+def test_cli_behavioral_off_by_default_never_launches_second_pass(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    findings_json = json.dumps(
+        [{"file": "a.py", "line": 1, "severity": "high", "title": "bad", "detail": "d"}],
+        ensure_ascii=False)
+    worker_text = (review_run.FINDINGS_BEGIN + "\n" + findings_json + "\n" +
+                   review_run.FINDINGS_END + "\nDONE")
+    review_status = {"workers": [{"name": "w0", "display_result": worker_text, "transcript": ""}]}
+    refute_status = {"workers": [{"name": "w0", "display_result": "UPHELD", "transcript": ""}]}
+
+    calls = []
+
+    def _fake(goals_path, max_concurrent, effort, state_dir=None):
+        calls.append(state_dir)
+        payload = refute_status if (state_dir and "refute_state" in state_dir) else review_status
+        fleet_dir = state_dir or os.path.join(repo, ".fleet")
+        os.makedirs(fleet_dir, exist_ok=True)
+        with open(os.path.join(fleet_dir, "status.json"), "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        return 0
+
+    monkeypatch.setattr(review_run, "run_fleet", _fake)
+
+    rc = main(["--kind", "review", "--group-size", "10"])  # --behavioral NOT passed
+    assert rc == 0
+    # only review pass (state_dir=None) + refute pass (state_dir'd) -- no behavioral_state_*.
+    assert not any(sd and "behavioral_state" in sd for sd in calls)
+
+    out = capsys.readouterr().out
+    assert "behavioral:" not in out
+
+
+def test_cli_behavioral_flag_runs_pass_and_marks_demonstrated(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    findings_json = json.dumps(
+        [{"file": "a.py", "line": 1, "severity": "high", "title": "bad", "detail": "d"}],
+        ensure_ascii=False)
+    worker_text = (review_run.FINDINGS_BEGIN + "\n" + findings_json + "\n" +
+                   review_run.FINDINGS_END + "\nDONE")
+    review_status = {"workers": [{"name": "w0", "display_result": worker_text, "transcript": ""}]}
+    refute_status = {"workers": [{"name": "w0", "display_result": "UPHELD", "transcript": ""}]}
+    behavioral_status = {"workers": [
+        {"name": "w0", "display_result": "BEHAVIOR_VERDICT: reproduced\n"
+                                          "BEHAVIOR_EVIDENCE: 実際に実行して確認\nDONE",
+         "transcript": ""},
+    ]}
+
+    def _fake(goals_path, max_concurrent, effort, state_dir=None):
+        if state_dir and "refute_state" in state_dir:
+            payload = refute_status
+        elif state_dir and "behavioral_state" in state_dir:
+            payload = behavioral_status
+        else:
+            payload = review_status
+        fleet_dir = state_dir or os.path.join(repo, ".fleet")
+        os.makedirs(fleet_dir, exist_ok=True)
+        with open(os.path.join(fleet_dir, "status.json"), "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        return 0
+
+    monkeypatch.setattr(review_run, "run_fleet", _fake)
+
+    rc = main(["--kind", "review", "--group-size", "10", "--behavioral"])
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "behavioral: reproduced=1 not_reproduced=0 inconclusive=0" in out
+
+    out_dir = os.path.join(repo, ".fleet", "review")
+    json_files = [f for f in os.listdir(out_dir)
+                  if f.startswith("review_report_") and f.endswith(".json")]
+    assert len(json_files) == 1
+    with open(os.path.join(out_dir, json_files[0]), encoding="utf-8") as f:
+        report = json.load(f)
+    assert report["findings"][0]["behavioral_verdict"] == "reproduced"
+    assert report.get("behavioral_summary") == {"reproduced": 1, "not_reproduced": 0,
+                                                 "inconclusive": 0}
+
+    md_files = [f for f in os.listdir(out_dir)
+                if f.startswith("review_report_") and f.endswith(".md")]
+    with open(os.path.join(out_dir, md_files[0]), encoding="utf-8") as f:
+        md = f.read()
+    assert "DEMONSTRATED" in md
+    assert "behavioral verification: reproduced=1" in md
+
+
+def test_cli_behavioral_severity_filters(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    findings_json = json.dumps([
+        {"file": "a.py", "line": 1, "severity": "high", "title": "high one", "detail": "d"},
+        {"file": "sub/b.py", "line": 2, "severity": "low", "title": "low one", "detail": "d2"},
+    ], ensure_ascii=False)
+    worker_text = (review_run.FINDINGS_BEGIN + "\n" + findings_json + "\n" +
+                   review_run.FINDINGS_END + "\nDONE")
+    review_status = {"workers": [{"name": "w0", "display_result": worker_text, "transcript": ""}]}
+    # refuter uphelds both findings (w0 for finding 0, w1 for finding 1)
+    refute_status = {"workers": [
+        {"name": "w0", "display_result": "UPHELD", "transcript": ""},
+        {"name": "w1", "display_result": "UPHELD", "transcript": ""},
+    ]}
+    behavioral_calls = []
+
+    def _fake(goals_path, max_concurrent, effort, state_dir=None):
+        if state_dir and "behavioral_state" in state_dir:
+            with open(goals_path, encoding="utf-8") as f:
+                behavioral_calls.append([json.loads(l) for l in f if l.strip()])
+            payload = {"workers": [
+                {"name": "w0", "display_result": "BEHAVIOR_VERDICT: reproduced\nDONE",
+                 "transcript": ""},
+            ]}
+        elif state_dir and "refute_state" in state_dir:
+            payload = refute_status
+        else:
+            payload = review_status
+        fleet_dir = state_dir or os.path.join(repo, ".fleet")
+        os.makedirs(fleet_dir, exist_ok=True)
+        with open(os.path.join(fleet_dir, "status.json"), "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        return 0
+
+    monkeypatch.setattr(review_run, "run_fleet", _fake)
+
+    rc = main(["--kind", "review", "--group-size", "10", "--behavioral",
+               "--behavioral-severity", "high"])
+    assert rc == 0
+
+    # only ONE behavioral goal was written (the high-severity finding)
+    assert len(behavioral_calls) == 1
+    assert len(behavioral_calls[0]) == 1
+    assert "high one" in behavioral_calls[0][0]["text"]
+    assert "low one" not in behavioral_calls[0][0]["text"]
 
 
 if __name__ == "__main__":

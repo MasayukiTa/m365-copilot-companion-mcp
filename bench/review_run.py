@@ -9,6 +9,8 @@ relay.fleet_runner and waiting for it to finish.
   python bench/review_run.py --kind security --mode diff       # review only the working diff
   python bench/review_run.py --kind review --no-refute         # skip the refuter pass
   python bench/review_run.py --kind review --refute-panel      # 3-lens refuter panel/finding
+  python bench/review_run.py --kind review --behavioral        # + behavioral-verify CONFIRMED
+  python bench/review_run.py --kind review --behavioral --behavioral-severity high
 
 FLOW:
   1. enumerate_files -> optional --target-path filter -> group_files -> fan out one
@@ -29,6 +31,15 @@ FLOW:
      instead of one lens per finding. This SUPERSEDES the old bespoke VERIFY_RUBRIC 2nd-pass
      verifier (removed) -- there is now exactly one verification mechanism. --verify is kept
      as a deprecated alias that also enables panel mode, for old callers/scripts.
+  5. OPT-IN via --behavioral (default OFF -- this executes real code, unlike the
+     pure-reasoning refuter): every finding whose verify_verdict == "confirmed" is handed to
+     behavioral_verify(), its own fleet pass that asks a fresh worker to actually REPRODUCE the
+     finding with a minimal, READ-ONLY run_python/shell_exec repro (build_behavioral_verify_goal
+     in bench/review_build_goals.py) and report BEHAVIOR_VERDICT (reproduced/not_reproduced/
+     inconclusive) + BEHAVIOR_EVIDENCE (parse_behavior_verdict). "reproduced" findings are
+     rendered as DEMONSTRATED and ranked first in the report (bench/review_aggregate.py);
+     "not_reproduced" CONFIRMED findings are flagged reasoned-but-not-reproduced.
+     --behavioral-severity restricts this pass to the given severity(ies) to bound cost.
 
 Everything that actually launches a subprocess lives in run_fleet() -- the only function
 tests must monkeypatch to stay hermetic. Every other step (planning, refute-goal building,
@@ -56,8 +67,12 @@ if REPO not in sys.path:
 
 from bench.review_aggregate import aggregate, render_json, render_markdown, worker_final_text
 from bench.review_build_goals import (
+    BEHAVIOR_EVIDENCE_TAG,
+    BEHAVIOR_VERDICT_TAG,
+    BEHAVIOR_VERDICTS,
     FINDINGS_BEGIN,
     FINDINGS_END,
+    build_behavioral_verify_goal,
     build_dimension_goal,
     build_refute_goal,
     dimensions_for_kind,
@@ -211,6 +226,43 @@ def _worker_index(worker):
         return None
 
 
+_BEHAVIOR_VERDICT_RE = re.compile(
+    re.escape(BEHAVIOR_VERDICT_TAG) + r"\s*[:：]\s*(\w+)", re.IGNORECASE
+)
+_BEHAVIOR_EVIDENCE_RE = re.compile(
+    re.escape(BEHAVIOR_EVIDENCE_TAG) + r"\s*[:：]\s*(.+)", re.IGNORECASE
+)
+_VALID_BEHAVIOR_VERDICTS = frozenset(BEHAVIOR_VERDICTS)
+
+
+def parse_behavior_verdict(text):
+    """Parse a behavioral-verify worker's final reply into (verdict, evidence).
+
+    verdict is one of bench.review_build_goals.BEHAVIOR_VERDICTS ("reproduced" /
+    "not_reproduced" / "inconclusive") -- the exact 3-way contract
+    build_behavioral_verify_goal's own prompt asks for (see its _BEHAVIOR_VERDICT_SPEC).
+    Tolerant like relay.refuter.parse_verdict: scans the WHOLE text for a
+    "BEHAVIOR_VERDICT: <word>" line (case-insensitive, half/full-width colon), last
+    recognized match wins (an agent may restate its reasoning before the final line, so the
+    latest valid tag is treated as the final answer); an unrecognized word, missing tag, or
+    empty/garbage text all fold to ("inconclusive", ""). evidence is the last
+    "BEHAVIOR_EVIDENCE: <...>" line found, or "" if absent. Never raises."""
+    if not text:
+        return ("inconclusive", "")
+
+    verdict = "inconclusive"
+    for m in _BEHAVIOR_VERDICT_RE.finditer(text):
+        candidate = m.group(1).strip().lower()
+        if candidate in _VALID_BEHAVIOR_VERDICTS:
+            verdict = candidate
+
+    evidence = ""
+    for m in _BEHAVIOR_EVIDENCE_RE.finditer(text):
+        evidence = m.group(1).strip()
+
+    return (verdict, evidence)
+
+
 def refute_findings(findings, kind, out_dir, now, panel=False, max_concurrent=None,
                      effort="auto", repo_root=None, stamp=None):
     """Run EACH finding through the existing adversarial refuter (relay/refuter.py) as its own
@@ -310,6 +362,113 @@ def refute_findings(findings, kind, out_dir, now, panel=False, max_concurrent=No
     return verdicts
 
 
+def behavioral_verify(findings, out_dir, now, max_concurrent=None, effort="auto",
+                       repo_root=None, stamp=None, severity_filter=None, max_findings=None):
+    """P2 piece A: run each CONFIRMED finding (verify_verdict == "confirmed", set by
+    refute_findings + merge_verdicts) through a BEHAVIORAL-VERIFY fleet pass -- a fresh worker
+    tries to actually REPRODUCE the finding with a minimal, READ-ONLY run_python/shell_exec
+    check (build_behavioral_verify_goal) instead of only reasoning about it, and reports
+    BEHAVIOR_VERDICT/BEHAVIOR_EVIDENCE (parse_behavior_verdict). Mutates the matching finding
+    dicts IN PLACE with "behavioral_verdict" and "behavioral_evidence" (same objects
+    aggregate() already shares between agg["findings"] and agg["by_severity"], mirroring how
+    merge_verdicts mutates in place) and also returns the list of dicts it touched.
+
+    Only findings with verify_verdict == "confirmed" are ever selected -- false_positive/
+    unclear/None-verdict findings never get a behavioral pass (there is nothing to
+    demonstrate for a finding that was never upheld in the first place). severity_filter
+    (e.g. {"high"}) further restricts the CONFIRMED set to bound cost; max_findings
+    additionally caps the absolute count. max_concurrent is clamped via
+    _clamp_max_concurrent exactly like refute_findings.
+
+    OPT-IN AT THE CALLER LAYER: this function itself always runs when given findings -- the
+    "--behavioral defaults to OFF" gate lives in main() (this executes real code, unlike the
+    pure-reasoning refuter, so bench/review_run.py's CLI keeps it opt-in; see build_arg_parser
+    --behavioral). Kept ungated here so tests (and any other caller) can drive it directly.
+
+    Goal order is deterministic (one goal per selected finding, in the same relative order
+    they appear in `findings`) and _worker_index() recovers each finished worker's goal index
+    from its "w<N>" name -- identical wiring to refute_findings' own goal_index_map.
+
+    Never raises: a missing goals dir write, a fleet run producing no status.json, or an
+    unparseable worker reply all degrade to that finding getting NO behavioral_verdict
+    attached (same graceful-degradation contract as refute_findings). Returns [] immediately
+    (no fleet launch) if there is nothing selected to verify."""
+    repo_root = repo_root or REPO
+    stamp = stamp or _stamp()
+    max_concurrent = _clamp_max_concurrent(
+        max_concurrent if max_concurrent is not None else DEFAULT_MAX_CONCURRENT)
+
+    selected = []  # list of (index into `findings`, finding dict)
+    for fi, finding in enumerate(findings or []):
+        if not isinstance(finding, dict):
+            continue
+        if finding.get("verify_verdict") != "confirmed":
+            continue
+        if severity_filter:
+            sev = str(finding.get("severity", "")).lower()
+            if sev not in severity_filter:
+                continue
+        selected.append((fi, finding))
+
+    if max_findings is not None:
+        selected = selected[:max_findings]
+
+    if not selected:
+        return []
+
+    goal_dicts = []
+    goal_index_map = []  # parallel to goal_dicts: index into `findings`
+    for fi, finding in selected:
+        text = build_behavioral_verify_goal(finding)
+        goal_dicts.append({"text": text, "cwd": repo_root})
+        goal_index_map.append(fi)
+
+    goals_path = os.path.join(out_dir, "behavioral_goals_%s.jsonl" % stamp)
+    write_goals_jsonl(goal_dicts, goals_path)
+
+    # Own state dir (mirrors refute_findings' refute_state_dir) so this run's status.json/
+    # transcripts never collide with the review pass's or the refuter pass's own.
+    behavioral_state_dir = os.path.join(out_dir, "behavioral_state_%s" % stamp)
+    behavioral_status_path = os.path.join(behavioral_state_dir, "status.json")
+    behavioral_transcripts_dir = os.path.join(behavioral_state_dir, "transcripts")
+
+    run_fleet(goals_path, max_concurrent, effort, state_dir=behavioral_state_dir)
+
+    if not os.path.isfile(behavioral_status_path):
+        print("WARNING: behavioral-verify pass produced no status.json at %s; skipping "
+              "(findings keep no behavioral_verdict)" % behavioral_status_path)
+        return []
+
+    try:
+        with open(behavioral_status_path, encoding="utf-8") as f:
+            status = json.load(f)
+    except Exception as e:
+        print("WARNING: could not read behavioral-verify status.json: %s" % e)
+        return []
+    workers = status.get("workers", []) if isinstance(status, dict) else []
+    if not isinstance(workers, list):
+        workers = []
+
+    attached = []
+    for w in workers:
+        if not isinstance(w, dict):
+            continue
+        idx = _worker_index(w)
+        if idx is None or idx < 0 or idx >= len(goal_index_map):
+            continue
+        fi = goal_index_map[idx]
+        if fi < 0 or fi >= len(findings):
+            continue
+        text = worker_final_text(w, behavioral_transcripts_dir)
+        verdict, evidence = parse_behavior_verdict(text)
+        finding = findings[fi]
+        finding["behavioral_verdict"] = verdict
+        finding["behavioral_evidence"] = evidence
+        attached.append(finding)
+
+    return attached
+
+
 def _finding_key(f):
     return (str(f.get("file", "")), str(f.get("line", "")), str(f.get("title", "")))
 
@@ -366,6 +525,16 @@ def build_arg_parser():
     ap.add_argument("--verify", action="store_true",
                      help="DEPRECATED alias for the refuter pass (which already runs by "
                           "default) -- also enables --refute-panel, for old callers/scripts")
+    ap.add_argument("--behavioral", action="store_true",
+                     help="OPT-IN (default OFF): after refutation, run a behavioral-verify "
+                          "fleet pass on CONFIRMED findings that tries to actually REPRODUCE "
+                          "each one via a READ-ONLY run_python/shell_exec repro instead of "
+                          "just reasoning about it. This executes real code -- unlike the "
+                          "pure-reasoning refuter it is explicit opt-in, never the default")
+    ap.add_argument("--behavioral-severity", default=None,
+                     help="comma-separated severity(ies) (low/medium/high) to restrict the "
+                          "--behavioral pass to, to bound cost (default: every CONFIRMED "
+                          "finding regardless of severity)")
     ap.add_argument("--dry-run", action="store_true",
                      help="build goals and print the plan without launching the fleet")
     ap.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
@@ -459,6 +628,28 @@ def main(argv=None):
                                         effort=args.effort, repo_root=repo_root, stamp=stamp)
             merge_verdicts(agg, verdicts)
 
+    # P2 piece A: OPT-IN behavioral-verify pass (executes real code, so unlike the refuter
+    # above it never runs unless --behavioral was explicitly passed).
+    if args.behavioral:
+        confirmed_findings = [f for f in agg.get("findings", [])
+                               if f.get("verify_verdict") == "confirmed"]
+        severity_filter = None
+        if args.behavioral_severity:
+            severity_filter = {s.strip().lower() for s in args.behavioral_severity.split(",")
+                                if s.strip()}
+            confirmed_findings = [f for f in confirmed_findings
+                                   if str(f.get("severity", "")).lower() in severity_filter]
+        if not confirmed_findings:
+            print("no CONFIRMED findings to behaviorally verify; skipping --behavioral pass")
+        else:
+            print("launching behavioral-verify pass: %d confirmed finding(s)%s..." %
+                  (len(confirmed_findings),
+                   " (severity=%s)" % ",".join(sorted(severity_filter)) if severity_filter
+                   else ""))
+            behavioral_verify(agg.get("findings", []), out_dir, time.time(),
+                               max_concurrent=max_concurrent, effort=args.effort,
+                               repo_root=repo_root, stamp=stamp, severity_filter=severity_filter)
+
     os.makedirs(out_dir, exist_ok=True)
     md_path = os.path.join(out_dir, "review_report_%s.md" % stamp)
     json_path = os.path.join(out_dir, "review_report_%s.json" % stamp)
@@ -478,6 +669,13 @@ def main(argv=None):
         refuted = sum(1 for f in agg.get("findings", []) if f.get("verify_verdict") == "false_positive")
         unclear = sum(1 for f in agg.get("findings", []) if f.get("verify_verdict") == "unclear")
         print("refuter: confirmed=%d refuted/dropped=%d unclear=%d" % (confirmed, refuted, unclear))
+    if args.behavioral:
+        all_findings = agg.get("findings", [])
+        reproduced = sum(1 for f in all_findings if f.get("behavioral_verdict") == "reproduced")
+        not_repro = sum(1 for f in all_findings if f.get("behavioral_verdict") == "not_reproduced")
+        inconclusive = sum(1 for f in all_findings if f.get("behavioral_verdict") == "inconclusive")
+        print("behavioral: reproduced=%d not_reproduced=%d inconclusive=%d" %
+              (reproduced, not_repro, inconclusive))
     return 0
 
 
