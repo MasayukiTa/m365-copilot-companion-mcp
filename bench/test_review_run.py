@@ -1667,6 +1667,74 @@ def test_cli_baseline_auto_with_fail_on_prints_local_iteration_caveat(repo, monk
     assert "pinned explicit --baseline PATH is recommended for CI gating" in out
 
 
+def test_cli_p2c_baseline_uses_final_adjudicated_findings_for_gate_and_snapshot(
+        repo, monkeypatch, capsys):
+    """P2c baseline evaluation happens after recovery/refutation/adjudication.
+
+    A producer finding disputed by the refuter but confirmed by the P2c adjudicator must be
+    treated exactly like a normal confirmed finding: it is a regression, trips --fail-on, and
+    is eligible for the next baseline snapshot.
+    """
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    from bench.review_baseline import load_baseline, save_baseline
+    baseline_path = os.path.join(repo, "p2c_old_baseline.json")
+    next_baseline_path = os.path.join(repo, "p2c_next_baseline.json")
+    finding = {"file": "a.py", "line": 1, "severity": "high",
+               "title": "old bug", "detail": "proof"}
+    save_baseline(baseline_path, [finding], kind="review", generated_at=1.0)
+
+    worker_text = _findings_worker_text([finding])
+    primary_status = {"workers": [
+        {"name": "w0", "display_result": worker_text, "transcript": ""},
+    ]}
+
+    def fake_run_fleet(goals_path, max_concurrent, effort, state_dir=None, **kwargs):
+        assert kwargs.get("resilience_profile") == "review"
+        fleet_dir = state_dir or os.path.join(repo, ".fleet")
+        os.makedirs(fleet_dir, exist_ok=True)
+        with open(os.path.join(fleet_dir, "status.json"), "w", encoding="utf-8") as f:
+            json.dump(primary_status, f)
+        return 0
+
+    monkeypatch.setattr(review_run, "run_fleet", fake_run_fleet)
+    monkeypatch.setattr(review_run, "recover_content_refusals", lambda *a, **kw: {})
+    monkeypatch.setattr(review_run, "refute_findings", lambda findings, *a, **kw: [{
+        **findings[0], "verdict": "unclear", "refuter_verdict": "REFUTED",
+        "reason": "disputed",
+    }])
+
+    def fake_adjudicate(findings, *args, **kwargs):
+        findings[0]["adjudicator_verdict"] = "CONFIRM"
+        findings[0]["adjudicator_reason"] = "independent confirmation"
+        return findings
+
+    monkeypatch.setattr(review_run, "adjudicate_findings", fake_adjudicate)
+
+    rc = main(["--kind", "review", "--group-size", "10",
+               "--resilience-profile", "review",
+               "--baseline", baseline_path, "--write-baseline", next_baseline_path,
+               "--fail-on", "high"])
+    assert rc == 3
+    out = capsys.readouterr().out
+    assert "GATE: 1 finding(s) at or above 'high' severity are NEW or REGRESSED" in out
+
+    out_dir = os.path.join(repo, ".fleet", "review")
+    report_names = [name for name in os.listdir(out_dir)
+                    if name.startswith("review_report_") and name.endswith(".json")]
+    assert len(report_names) == 1
+    with open(os.path.join(out_dir, report_names[0]), encoding="utf-8") as f:
+        report = json.load(f)
+    final_finding = report["findings"][0]
+    assert final_finding["finding_state"] == "confirmed"
+    assert final_finding["verify_verdict"] == "confirmed"
+    assert [item["title"] for item in report["baseline_diff"]["regressed"]] == ["old bug"]
+
+    next_baseline = load_baseline(next_baseline_path)
+    assert [item["title"] for item in next_baseline["accepted"]] == ["old bug"]
+
+
 # --- --baseline / --write-baseline / --fail-on: without them, behavior is unchanged ----------
 
 def test_cli_without_baseline_flags_report_has_no_baseline_diff_key(repo, monkeypatch, capsys):

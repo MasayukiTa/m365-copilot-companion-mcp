@@ -1403,8 +1403,10 @@ def main(argv=None):
             else:
                 print("completeness critic: no gaps identified")
 
-    # --baseline / --write-baseline: purely additive, applies identically whether `agg` came
-    # from the single-pass branch above or run_review_loop -- both shapes carry "findings".
+    # --baseline / --write-baseline: purely additive. In P2c single-pass runs this deliberately
+    # executes after refusal recovery, refutation, adjudication, behavioral verification, and
+    # finding-state derivation, so the gate sees the final P2c verdict rather than the producer's
+    # provisional candidate. It also applies to the normal single-pass and loop aggregate shapes.
     baseline_diff = None
     if args.baseline:
         if args.baseline == "auto":
