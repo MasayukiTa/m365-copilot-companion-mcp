@@ -39,12 +39,12 @@ param(
     # Just bring the (already-running) companion Edge to the foreground -- used when
     # sign-in is required. Does not launch anything.
     [switch]$Surface,
-    # TRUE BACKGROUND (recommended): run Edge with --headless=new -- there is NO window
+    # TRUE BACKGROUND (mandatory default): run Edge with --headless=new -- there is NO window
     # at all (nothing in the taskbar, no flash, zero foreground interference), yet CDP,
     # SSO auto-sign-in, and sends all work (verified). The only caveat: if interactive
     # sign-in is ever required (SSO usually persists so this is rare), relaunch once with
-    # -Foreground to sign in, then go back to -Headless. The mode is remembered so
-    # -HardReset / auto-recovery relaunch in the same mode.
+    # -Foreground to sign in. Foreground is deliberately one-shot: every ordinary launch,
+    # -HardReset, and auto-recovery returns to headless without relying on persisted state.
     [switch]$Headless
 )
 
@@ -56,15 +56,17 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 
 $dataDir = Join-Path $env:LOCALAPPDATA $Profile
 
-# Remember the chosen window mode so recovery (-HardReset) relaunches the same way.
-# Per-profile so the bridge Edge and the fleet Edge don't clobber each other's mode.
+# Headless is the invariant recovery baseline. The marker is retained for compatibility and
+# diagnostics, but a headed sign-in session is NEVER persisted: -Foreground affects only the
+# explicit invocation that carries it. This also makes recovery from a separate git worktree
+# headless even when that worktree has no prior .fleet state.
 $modeFile = Join-Path $repoRoot ".fleet\edge_mode_$Profile"
-if ($Headless) { try { New-Item -ItemType Directory -Force (Split-Path $modeFile) | Out-Null; Set-Content -Path $modeFile -Value "headless" -Encoding ascii } catch {} }
-if ($Foreground) { try { New-Item -ItemType Directory -Force (Split-Path $modeFile) | Out-Null; Set-Content -Path $modeFile -Value "headed" -Encoding ascii } catch {} }
-$useHeadless = $Headless
-if (-not $Headless -and -not $Foreground -and (Test-Path $modeFile)) {
-    if ((Get-Content $modeFile -Raw -ErrorAction SilentlyContinue).Trim() -eq "headless") { $useHeadless = $true }
-}
+if ($Headless -and $Foreground) { throw "-Headless and -Foreground are mutually exclusive." }
+try {
+    New-Item -ItemType Directory -Force (Split-Path $modeFile) | Out-Null
+    Set-Content -Path $modeFile -Value "headless" -Encoding ascii
+} catch {}
+$useHeadless = -not $Foreground
 
 # --- Win32 window helpers (hide to background / surface for auth) --------------
 # Find() enumerates ALL top-level windows (including HIDDEN ones) belonging to the
