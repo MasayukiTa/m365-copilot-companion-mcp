@@ -53,11 +53,89 @@ Check "MCP server up (http://127.0.0.1:8000/health)" `
     { (Invoke-WebRequest -Uri 'http://127.0.0.1:8000/health' -TimeoutSec 4 -UseBasicParsing).StatusCode -eq 200 } `
     "start the stack: double-click start_all.bat   (or run .\scripts\start.ps1)"
 
-# 3. Dev Tunnel (public reachability of the server through the tunnel)
+# 3. Dev Tunnel -- LAYERED diagnosis. A single reachability probe cannot tell "CLI not
+#    installed" from "not logged in" from "tunnel deleted/expired" from "exists but not
+#    currently hosted" -- and each of those needs a DIFFERENT fix; running start_all.bat
+#    only ever fixes the last one. This mirrors supervisor.ps1's binary resolution
+#    (prefer the winget-installed devtunnel.exe, else "devtunnel" on PATH) and its
+#    login detection (devtunnel user show) so doctor agrees with what actually hosts
+#    the tunnel. All calls are read-only (--version / user show / show) and bounded so
+#    a hung/offline CLI cannot stall doctor. Chained: once the first link FAILs, the
+#    remaining links are not meaningful, so they are shown as [SKIP] instead of being
+#    run and possibly double-reporting -- only the one root cause counts toward $bad.
 $turl = $envv['MCP_TUNNEL_URL']
-Check "Dev Tunnel reachable (public URL -> server)" `
+$tname = $envv['MCP_TUNNEL_NAME']
+
+$DevTunnel = "devtunnel"
+$wingetDt = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\devtunnel.exe"
+if (Test-Path $wingetDt) { $DevTunnel = $wingetDt }
+
+function Invoke-DevTunnelBounded([string[]]$dtArgs, [int]$timeoutSec) {
+    # Start-Job + poll-with-deadline (same pattern as start_all.ps1's git-fetch timeout):
+    # a hung or offline devtunnel CLI call times out instead of hanging doctor forever.
+    try {
+        $job = Start-Job -ScriptBlock {
+            param($exe, $a)
+            try { & $exe @a 2>&1 | Out-String } catch { "" }
+        } -ArgumentList $DevTunnel, $dtArgs
+    } catch { return $null }
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ($job.State -eq 'Running' -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 150 }
+    if ($job.State -eq 'Running') {
+        try { Stop-Job $job -ErrorAction SilentlyContinue } catch { }
+        try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch { }
+        return $null
+    }
+    $out = Receive-Job $job
+    try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch { }
+    return $out
+}
+
+$script:tunnelChainBroken = $false
+function TunnelCheck([string]$name, [scriptblock]$test, [string]$fix) {
+    if ($script:tunnelChainBroken) {
+        Write-Host ("  [SKIP] " + $name) -ForegroundColor DarkGray
+        Write-Host ("         blocked by the Dev Tunnel check above -- fix that first, then re-run doctor") -ForegroundColor DarkGray
+        return
+    }
+    $pass = $false
+    try { $pass = [bool](& $test) } catch { $pass = $false }
+    if ($pass) {
+        Write-Host ("  [ OK ] " + $name) -ForegroundColor Green
+        $script:ok++
+    } else {
+        Write-Host ("  [FAIL] " + $name) -ForegroundColor Red
+        Write-Host ("         fix: " + $fix) -ForegroundColor Yellow
+        $script:bad++
+        $script:tunnelChainBroken = $true
+    }
+}
+
+TunnelCheck "devtunnel CLI installed" `
+    { $out = Invoke-DevTunnelBounded @('--version') 6; ($out) -and ($out -match 'Tunnel CLI version') } `
+    "install it: winget install Microsoft.devtunnel   (then re-run start_all.bat)"
+
+TunnelCheck "devtunnel signed in" `
+    {
+        $out = Invoke-DevTunnelBounded @('user', 'show') 6
+        if (-not $out) { return $false }
+        if ($out -match 'Not logged in' -or $out -match 'Login required') { return $false }
+        if ($out -match 'Logged in') { return $true }
+        return $false
+    } `
+    "run:  devtunnel login   (interactive, opens a browser -- this is the ONE step that needs a human; the supervisor will NOT host the tunnel until the CLI is logged in, so start_all.bat alone cannot fix this)"
+
+TunnelCheck "Dev Tunnel exists (MCP_TUNNEL_NAME)" `
+    {
+        if (-not $tname) { return $false }
+        $out = Invoke-DevTunnelBounded @('show', $tname) 8
+        ($out) -and ($out -match 'Tunnel ID') -and ($out -notmatch 'Tunnel not found')
+    } `
+    "the tunnel is missing or expired -- (re)create it: powershell -File scripts\setup_devtunnel.ps1"
+
+TunnelCheck "Dev Tunnel host serving (public URL -> server)" `
     { if (-not $turl) { return $false }; (Invoke-WebRequest -Uri (($turl.TrimEnd('/')) + '/health') -TimeoutSec 7 -UseBasicParsing).StatusCode -eq 200 } `
-    "the tunnel host is not serving: run start_all.bat (supervisor hosts it). To (re)create the tunnel: powershell -File scripts\setup_devtunnel.ps1"
+    "the tunnel exists but is not being served -- run start_all.bat (the supervisor hosts it). If this stays red while the checks above are green, MCP_TUNNEL_URL in .env may be stale -- compare it to the URL shown by 'devtunnel show <name>'."
 
 # 4. Companion Edge (:9222) for the fleet/agent
 Check "Companion Edge running (:9222 fleet/agent)" `
