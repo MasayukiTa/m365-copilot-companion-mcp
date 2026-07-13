@@ -30,6 +30,7 @@ REFUTER_INSTRUCTION = (
     "済ませ、必ず回答の最後の行に判定を書く**こと。形式は次のどちらか:\n"
     "・本当に達成されていない具体的欠陥が一つでもあれば: REFUTED: <その欠陥を1〜2文で>\n"
     "・全力で探しても具体的欠陥が見つからなければ: UPHELD\n"
+    "・証拠不足でどちらとも判定できなければ: INCONCLUSIVE: <不足している証拠>\n"
     "推測や些末な好みではなく、ゴール未達と言える具体的根拠のみを REFUTED の理由にしてください。"
 )
 
@@ -37,7 +38,7 @@ REFUTER_INSTRUCTION = (
 # "I'll check the files"). Asks it to finish and emit the marker now.
 REFUTER_NUDGE = (
     "確認は済みましたか。前置きは不要です。今の判定を、最後の行に "
-    "REFUTED: <理由> もしくは UPHELD の形式で必ず1行で書いてください。"
+    "REFUTED: <理由> / UPHELD / INCONCLUSIVE: <不足証拠> のいずれかを必ず1行で書いてください。"
 )
 
 # Both retry loops below (run_refuter's blocking while-loop, RefuterSession._nudge's
@@ -176,6 +177,10 @@ def parse_verdict(text: str):
         m = re.search(r"REFUTED\s*[:：]\s*(.+)", line, re.IGNORECASE)
         if m and m.group(1).strip():
             return ("REFUTED", m.group(1).strip())
+    for line in text.splitlines():
+        m = re.search(r"INCONCLUSIVE(?:\s*[:：]\s*(.*))?", line, re.IGNORECASE)
+        if m:
+            return ("INCONCLUSIVE", (m.group(1) or "").strip())
     up = text.upper()
     if "UPHELD" in up:
         return ("UPHELD", "")

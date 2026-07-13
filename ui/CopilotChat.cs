@@ -1959,8 +1959,53 @@ class ChatWindow : Window
         new[]{"/proscons","Pros and cons as a table"},
         new[]{"/table","Make a table"},
     };
-    // Display-only descriptions (insert uses Tag=name), localized at access time.
-    string[][] _commands { get { return _lang == 0 ? _commandsJa : _commandsEn; } }
+    static readonly string[] _p2cCommandJaReview =
+        new[]{"/review-2","P2c分割レビュー（拒否時のみ再試行・分割）"};
+    static readonly string[] _p2cCommandJaSecurity =
+        new[]{"/security-review-2","P2c分割セキュリティレビュー"};
+    static readonly string[] _p2cCommandEnReview =
+        new[]{"/review-2","P2c split review (retry/split only after refusal)"};
+    static readonly string[] _p2cCommandEnSecurity =
+        new[]{"/security-review-2","P2c split security review"};
+
+    // Read on demand: changing .env takes effect the next time the slash palette or /help opens,
+    // even when CopilotChat is already running. Keep the same precedence/semantics as the bridge:
+    // a repo .env value wins; the process environment is only a fallback; exactly "1" enables it.
+    bool P2cReviewEnabled()
+    {
+        try
+        {
+            string path = Path.Combine(RepoRoot(), ".env");
+            if (File.Exists(path))
+            {
+                foreach (string raw in File.ReadAllLines(path, Encoding.UTF8))
+                {
+                    string line = (raw ?? "").Trim().TrimStart('\uFEFF');
+                    if (line.StartsWith("MCP_REVIEW_P2C=", StringComparison.Ordinal))
+                        return line.Substring("MCP_REVIEW_P2C=".Length).Trim() == "1";
+                }
+            }
+        }
+        catch { }
+        return (Environment.GetEnvironmentVariable("MCP_REVIEW_P2C") ?? "0").Trim() == "1";
+    }
+
+    // Display-only descriptions (insert uses Tag=name), localized at access time. P2c commands
+    // are deliberately absent from the base arrays and are materialized only when the flag is on.
+    string[][] _commands
+    {
+        get
+        {
+            string[][] baseCommands = _lang == 0 ? _commandsJa : _commandsEn;
+            if (!P2cReviewEnabled()) return baseCommands;
+            var commands = new List<string[]>(baseCommands);
+            int reviewFix = commands.FindIndex(delegate(string[] c) { return c[0] == "/review-fix"; });
+            if (reviewFix < 0) reviewFix = commands.Count;
+            commands.Insert(reviewFix, _lang == 0 ? _p2cCommandJaSecurity : _p2cCommandEnSecurity);
+            commands.Insert(reviewFix, _lang == 0 ? _p2cCommandJaReview : _p2cCommandEnReview);
+            return commands.ToArray();
+        }
+    }
     void BuildCmdPopup()
     {
         _cmdList = new ListBox { MaxHeight = 240, BorderThickness = new Thickness(0) };
@@ -2014,12 +2059,20 @@ class ChatWindow : Window
 
     string CommandHelpText()
     {
+        string p2c = "";
+        if (P2cReviewEnabled())
+            p2c = _lang != 0
+                ? "/review-2 [diff|<path>] - P2c split review\n"
+                    + "/security-review-2 [diff|<path>] - P2c split security review\n"
+                : "/review-2 [diff|<パス>] - P2c分割レビュー\n"
+                    + "/security-review-2 [diff|<パス>] - P2c分割セキュリティレビュー\n";
         if (_lang != 0)
             return "Chat commands:\n"
                 + "/help - this list\n"
                 + "/research - deep research with the Claude researcher\n"
                 + "/review [diff|<path>] - review and summarize\n"
                 + "/security-review [diff|<path>] - security-focused review\n"
+                + p2c
                 + "/review-fix [high|verified] - fix review findings (2-step confirm, auto-backup + undo)\n"
                 + "/analyze - analyze a file\n"
                 + "/summarize - summarize\n"
@@ -2039,6 +2092,7 @@ class ChatWindow : Window
             + "/research - Claude researcher で深掘り調査\n"
             + "/review [diff|<パス>] - レビューして要約\n"
             + "/security-review [diff|<パス>] - セキュリティレビュー\n"
+            + p2c
             + "/review-fix [high|verified] - 指摘を修正（2段階確認・自動バックアップ＆undo）\n"
             + "/analyze - ファイル分析\n"
             + "/summarize - 要約\n"
