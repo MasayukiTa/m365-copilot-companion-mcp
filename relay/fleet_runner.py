@@ -168,26 +168,146 @@ def _repo_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _read_goals(args):
-    """Goals come from -g flags and/or a goals file. A goals-file line is either:
+
+# ── fragmented-goals-file guard ─────────────────────────────────────────────────
+# Incident (see project notes): a single coherent multi-line PROMPT (an intro
+# sentence, a "target repo:" line, a bare path, ~25 "tools/x.py" bullet lines, a
+# few numbered criteria, and a "<<<FINDINGS>>> [ ] <<<END_FINDINGS>>>" output-format
+# block) was passed to --goals-file instead of a real one-goal-per-line /
+# one-JSON-object-per-line file. _read_goals() naively split it into 53 nonsense
+# "goals" -- one per source line -- and almost every lane went STUCK immediately.
+#
+# The correct path for building a goals-file is bench/review_build_goals.py's
+# write_goals_jsonl() (used by bench/review_run.py / bench/review_fix.py): one
+# JSON object per line, e.g. {"text": "...", "cwd": "..."}.
+#
+# These tokens are the review PROMPT's own OUTPUT-FORMAT delimiters (see
+# bench/review_build_goals.py FINDINGS_BEGIN/FINDINGS_END and the JSON-array
+# example lines around them). They never legitimately appear as a goal's full
+# text in a real goals file, so any ONE of them alone on a line is a high-precision
+# signal that the file is a shredded prompt, not a goals list.
+_FRAGMENT_DELIMITER_TOKENS = frozenset([
+    "<<<FINDINGS>>>", "<<<END_FINDINGS>>>", "[", "]", "{", "}",
+])
+
+# Soft aggregate heuristic thresholds: a real goals-file file can have short lines
+# (a quick one-word-ish goal), but a shredded PROMPT typically produces MANY short
+# non-JSON fragments (file paths, a truncated intro, bullet lines). Require a
+# minimum sample size so a small legit file of a few short goals is never flagged.
+_FRAGMENT_MIN_LINES = 8
+_FRAGMENT_SHORT_LEN = 40
+
+
+def _fragment_guard_error(path, reason):
+    """Build the actionable error text for a rejected goals-file. `reason` is a
+    short, specific description of what tripped the guard (which line/token, or
+    the aggregate short-line ratio) -- always names the file and points at the
+    correct tool to build a real goals file instead of a raw prompt."""
+    return (
+        "goals-file '%s' looks like a single multi-line PROMPT that was split "
+        "into one (nonsense) goal per line, not a real per-goal list: %s. "
+        "Do not pass a raw multi-line prompt to --goals-file. Build a proper "
+        "goals file instead -- bench/review_build_goals.py's write_goals_jsonl() "
+        "writes one JSON object per line (e.g. {\"text\": \"...\", \"cwd\": \"...\"}), "
+        "the same way bench/review_run.py and bench/review_fix.py already do."
+        % (path, reason)
+    )
+
+
+def _read_goals_file(path):
+    """Parse one goals-file into a list of goals (plain strings, or dicts carrying
+    an acceptance gate), in the SAME format _read_goals() has always produced --
+    plus a defensive guard that fails fast when the file looks like a fragmented
+    single prompt (see module notes above) rather than a real per-goal list.
+
+    A line is either:
       * plain text                -> a goal with no acceptance check (back-compat), or
       * a JSON object starting '{' -> {"goal"/"text": str, "check"/"checks": ..., "cwd": ...}
         carrying a machine-checkable acceptance gate (spec 3-3). folder_coder --verify
-        emits these. Bad JSON falls back to treating the line as plain text."""
-    goals = list(args.goal or [])
-    if args.goals_file:
-        with open(args.goals_file, encoding="utf-8") as f:
-            for line in f:
-                s = line.strip()
+        emits these. Bad JSON falls back to treating the line as plain text.
+
+    Guard rules (any ONE hard rule = immediate reject; the soft rule needs a
+    large-enough sample):
+      * a plain-text line that is EXACTLY a findings/output delimiter token
+        (<<<FINDINGS>>>, <<<END_FINDINGS>>>, or a lone [ ] {{ }} bracket);
+      * a JSON-object line whose resolved goal text (the 'text'/'goal' key) is
+        empty/whitespace-only -- a goal must be non-empty, never silently
+        turned into an empty lane;
+      * (soft) if there are >= _FRAGMENT_MIN_LINES non-blank lines and more than
+        half of them are short (< _FRAGMENT_SHORT_LEN chars) plain-text lines,
+        the file is very likely a shredded prompt.
+
+    Raises SystemExit(<actionable message>) on detection (mirrors argparse's
+    ap.error() fatal-bad-input style elsewhere in this module) so the run aborts
+    cleanly instead of spawning nonsense lanes. Never raises any OTHER exception
+    itself: unexpected per-line failures are treated as "not fragmentary" for
+    that line so the guard can only be more permissive than intended, never
+    crash a legitimate run.
+    """
+    goals = []
+    total_lines = 0
+    short_nonjson = 0
+    with open(path, encoding="utf-8") as f:
+        for raw_line in f:
+            try:
+                s = raw_line.strip()
                 if not s or s.startswith("#"):
                     continue
+                total_lines += 1
+
                 if s.startswith("{"):
                     try:
-                        goals.append(json.loads(s))
-                        continue
+                        d = json.loads(s)
                     except Exception:
-                        pass            # not valid JSON -> treat the raw line as a goal
+                        d = None
+                    if d is not None:
+                        if not isinstance(d, dict):
+                            raise SystemExit(_fragment_guard_error(
+                                path, "line %d is a JSON value that is not an "
+                                "object (%s)" % (total_lines, type(d).__name__)))
+                        text = d.get("text") or d.get("goal") or ""
+                        if not str(text).strip():
+                            raise SystemExit(_fragment_guard_error(
+                                path, "line %d is a JSON object with no usable "
+                                "'text'/'goal' key, so it resolves to an EMPTY "
+                                "goal" % total_lines))
+                        goals.append(d)
+                        continue
+                    # not valid JSON -> fall through, treat the raw line as plain
+                    # text (existing back-compat), still subject to the checks below.
+
+                if s in _FRAGMENT_DELIMITER_TOKENS:
+                    raise SystemExit(_fragment_guard_error(
+                        path, "line %d is exactly the delimiter/marker token %r "
+                        "-- that only appears in a review-prompt's OUTPUT FORMAT "
+                        "block, never as a real goal" % (total_lines, s)))
+
+                if len(s) < _FRAGMENT_SHORT_LEN:
+                    short_nonjson += 1
                 goals.append(s)
+            except SystemExit:
+                raise
+            except Exception:
+                # be permissive on any unexpected per-line hiccup -- never let the
+                # guard itself crash a legitimate run.
+                continue
+
+    if total_lines >= _FRAGMENT_MIN_LINES and short_nonjson > total_lines / 2:
+        raise SystemExit(_fragment_guard_error(
+            path, "%d of %d non-blank lines are short (<%d chars) plain-text "
+            "fragments (file paths, truncated sentences, ...) -- consistent "
+            "with one prompt shredded line-by-line, not %d distinct goals"
+            % (short_nonjson, total_lines, _FRAGMENT_SHORT_LEN, total_lines)))
+
+    return goals
+
+
+def _read_goals(args):
+    """Goals come from -g flags and/or a goals file. See _read_goals_file() for
+    the goals-file line format and the fragmented-prompt guard it applies."""
+    goals = list(args.goal or [])
+    if args.goals_file:
+        goals.extend(_read_goals_file(args.goals_file))
     return goals
 
 
