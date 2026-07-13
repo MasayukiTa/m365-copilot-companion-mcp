@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import subprocess
 from typing import Optional
@@ -24,6 +25,16 @@ def notify_desktop(
         app_id: AppId string shown as the source. Defaults to m365-copilot-companion-mcp.
         icon_path: Optional file:// path to a PNG/JPG icon.
     """
+    # SYSTEMIC pytest guard (2026-07): this is the single real chokepoint that
+    # actually shells out to PowerShell to raise an OS toast. Every notify path
+    # in the codebase (default_notify, task_router, contract_gate, gate_ops,
+    # main.py) ultimately calls THIS function. pytest sets PYTEST_CURRENT_TEST
+    # in the environment for the duration of every test it runs, so checking it
+    # here -- once -- makes every test, present and future, inert by
+    # construction instead of relying on each test file remembering to mock.
+    # Production runtime never has this var set, so behavior there is unchanged.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return "[notify_desktop suppressed: running under pytest]"
     try:
         if not title:
             return "[notify_desktop error: title is required]"
