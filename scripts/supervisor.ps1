@@ -38,7 +38,11 @@ param(
     # run off the event loop, so the loop should never stall, but a higher debounce is
     # cheap insurance against a single slow /health response triggering a needless kill
     # that would tear down a live Copilot MCP session.
-    [int]$FailuresBeforeAction = 4
+    [int]$FailuresBeforeAction = 4,
+    # Dry-run the fleet coordinator auto-resume check only: log what WOULD happen
+    # (marker found, pid dead, would relaunch with these args) without actually
+    # starting a process. Used for verification -- never triggers a real relaunch.
+    [switch]$FleetResumeDryRun
 )
 
 $ErrorActionPreference = "SilentlyContinue"
@@ -178,7 +182,101 @@ function Start-TunnelHost {
     Write-Log "devtunnel host did not establish within ~50s (will retry next cycle)"
 }
 
+# ── Fleet coordinator auto-resume ───────────────────────────────────────────────
+# A fleet run (python -m relay.fleet_runner) killed by an unplanned reboot leaves
+# .fleet\fleet_run_active.json behind: fleet_runner.py writes it once at run start and
+# removes it on CLEAN completion or an explicit user stop (Ctrl+C / the graceful `stop`
+# command via commands.json -- both reach the same normal end-of-main() path that clears
+# it; see _write_active_marker / _clear_active_marker / should_auto_resume in
+# relay/fleet_runner.py). So the marker surviving with a DEAD pid means the run was
+# genuinely INTERRUPTED, not finished and not deliberately stopped -- there is no separate
+# persistent "user stopped" signal to check here because an explicit stop already clears
+# the marker itself before this code ever runs.
+#
+# Checked ONCE at startup (not on the health-check loop below): a fresh boot is the only
+# time an interrupted run needs discovering. The existing single-instance Mutex above
+# already makes this idempotent -- a second concurrent supervisor exits before reaching
+# this point, so it can never double-relaunch.
+#
+# Opt-out: set MCP_FLEET_AUTORESUME=0 (or false/no/off) in the environment. Default ON.
+$FleetMarkerPath = Join-Path $Root ".fleet\fleet_run_active.json"
+
+function Test-FleetAutoResumeEnabled {
+    $v = $env:MCP_FLEET_AUTORESUME
+    if ([string]::IsNullOrWhiteSpace($v)) { return $true }   # unset -> default ON
+    return -not ($v -in @("0", "false", "False", "FALSE", "no", "No", "NO", "off", "Off", "OFF"))
+}
+
+function Get-FleetActiveMarker {
+    # Tolerant read mirroring relay.fleet_runner._read_active_marker(): missing or
+    # corrupt JSON -> $null, never throws.
+    if (-not (Test-Path $FleetMarkerPath)) { return $null }
+    try {
+        $raw = Get-Content -Path $FleetMarkerPath -Raw -ErrorAction Stop
+        return $raw | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return $null
+    }
+}
+
+function Test-PidAlive {
+    param([int]$ProcId)
+    if (-not $ProcId -or $ProcId -le 0) { return $false }
+    return [bool](Get-Process -Id $ProcId -ErrorAction SilentlyContinue)
+}
+
+function Test-FleetShouldAutoResume {
+    # PURE decision, mirrors relay.fleet_runner.should_auto_resume(): marker present AND
+    # its recorded pid is DEAD -> resume. Marker absent, or its pid is still alive
+    # (already running -- never double-launch) -> do nothing. Kept side-effect free so it
+    # can be exercised with a fake marker + a known-dead pid (see docs/validation notes).
+    param($Marker)
+    if ($null -eq $Marker) { return $false }
+    $procId = 0
+    try { $procId = [int]$Marker.pid } catch { return $false }
+    if ($procId -le 0) { return $false }
+    return -not (Test-PidAlive -ProcId $procId)
+}
+
+function Invoke-FleetAutoResume {
+    # Returns $true iff it (would have) relaunched the coordinator; $false otherwise.
+    # -DryRun logs the would-be relaunch command without starting a process.
+    param([switch]$DryRun)
+    if (-not (Test-FleetAutoResumeEnabled)) {
+        Write-Log "fleet auto-resume disabled via MCP_FLEET_AUTORESUME -- skipping check"
+        return $false
+    }
+    $marker = Get-FleetActiveMarker
+    if (-not (Test-FleetShouldAutoResume $marker)) {
+        return $false
+    }
+    $resumeArgs = @()
+    if ($marker.resume_argv) { $resumeArgs = @($marker.resume_argv) }
+    $resumeArgs = @($resumeArgs) + "--resume"
+    $shown = ($resumeArgs -join " ")
+    Write-Log "fleet run INTERRUPTED (marker pid $($marker.pid) is dead) -> auto-resuming: python -m relay.fleet_runner $shown"
+    if ($DryRun) {
+        Write-Log "fleet auto-resume DRY RUN -- not relaunching (verification mode)"
+        return $true
+    }
+    try {
+        Start-Process -FilePath $Py -ArgumentList (@("-m", "relay.fleet_runner") + $resumeArgs) `
+            -WorkingDirectory $Root -WindowStyle Hidden
+        Write-Log "fleet coordinator relaunched with --resume"
+        try {
+            & $Py -c "import sys; sys.path.insert(0, r'$Root'); from tools.notify_ops import notify_desktop; notify_desktop('Fleet auto-resumed', 'An interrupted overnight fleet run was detected after startup and relaunched with --resume.')" 2>$null | Out-Null
+        } catch { }
+        return $true
+    } catch {
+        Write-Log "fleet auto-resume FAILED to relaunch: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 Write-Log "supervisor up (tunnel=$TunnelName port=$Port interval=${IntervalSeconds}s debounce=$FailuresBeforeAction)"
+
+# Checked once, here, before the forever health-check loop starts.
+Invoke-FleetAutoResume -DryRun:$FleetResumeDryRun | Out-Null
 
 $serverMiss = 0
 $tunnelMiss = 0
