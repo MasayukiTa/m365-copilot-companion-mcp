@@ -983,6 +983,127 @@ def test_renav_first_on_consent_and_dead_agent():
           w4.status == "stuck" and w4.outcome == "INFRA_STUCK")
 
 
+def test_unfinished_excludes_stuck_keeps_infra_stuck():
+    """REGRESSION (2026-07 overnight 53-lane fleet stall): _unfinished() is what
+    FleetContextLost hands back to the runner to RE-DISPATCH after an Edge-context-loss
+    recovery. Before this fix it excluded only DONE/CANCELLED, so a plain STUCK worker --
+    one that already burned its FULL transient-retry budget (NET_RETRY_WINDOW_S, up to 30
+    min) and is a genuinely broken/un-fixable goal -- got RESURRECTED from scratch on the
+    next attempt, burning another full retry window on the same un-fixable goal. INFRA_STUCK
+    (our own network/tunnel looked unhealthy, not the goal itself) must still be resurrected --
+    that is the entire point of the INFRA_STUCK classification. Exercised via a REAL
+    run_relay_fleet() sweep (not a hand-built list) so the actual _unfinished() closure runs."""
+    import time as _t
+    rf.avail_phys_mb = lambda: 64000.0
+    rf.free_disk_gb = lambda path=None: 500.0
+    orig = {"attach": RelayWorker.attach, "poll": RelayWorker.poll, "close": RelayWorker.close}
+
+    # each goal's TEXT encodes the terminal state its (single) poll() call should reach;
+    # "g_running" is deliberately absent from the map so it never goes terminal.
+    OUTCOME_BY_GOAL = {
+        "g_done": ("done", "DONE"),
+        "g_cancelled": ("cancelled", "CANCELLED"),
+        "g_stuck": ("stuck", "STUCK"),
+        "g_infra": ("stuck", "INFRA_STUCK"),
+    }
+
+    def fake_attach(self, context, agent_url):
+        self.page = object()
+        self.status = "waiting"
+        return True
+
+    def fake_poll(self):
+        if self.status in TERMINAL:
+            return True
+        target = OUTCOME_BY_GOAL.get(self.goal)
+        if target is not None:
+            self.status, self.outcome = target
+            return True
+        self.status = "waiting"        # g_running: never reaches a terminal status
+        return False
+
+    def fake_close(self):
+        self.page = None
+        self.closed = True
+
+    RelayWorker.attach = fake_attach
+    RelayWorker.poll = fake_poll
+    RelayWorker.close = fake_close
+
+    class _CookieBomb:
+        """Fake CDP context: cookies() is healthy until armed, then raises -- the same signal
+        run_relay_fleet uses to detect a wedged/hard-reset Edge and bail with _unfinished()."""
+        def __init__(self):
+            self.armed = False
+
+        def cookies(self):
+            if self.armed:
+                raise RuntimeError("simulated CDP context loss")
+            return []
+
+    ctx = _CookieBomb()
+
+    def on_tick(workers):
+        # arm the simulated context-loss only once every OTHER goal has reached its terminal
+        # outcome (g_running never will) -- so the snapshot _unfinished() sees on the NEXT
+        # sweep is a realistic mixed-outcome fleet, not a synthetic list the test built itself.
+        if all(w.outcome is not None for w in workers if w.goal != "g_running"):
+            ctx.armed = True
+
+    goals = ["g_done", "g_cancelled", "g_stuck", "g_infra", "g_running"]
+    try:
+        try:
+            run_relay_fleet(ctx, goals, "http://agent", max_concurrent=5,
+                            poll_s=0, on_tick=on_tick, notify=lambda *a, **k: None)
+            check("unfinished_context_lost_raised", False)   # must have raised before this
+        except rf.FleetContextLost as e:
+            names = {item["text"] for item in e.unfinished}
+            check("unfinished_keeps_running_goal", "g_running" in names)
+            check("unfinished_keeps_infra_stuck_regression", "g_infra" in names)
+            check("unfinished_drops_done", "g_done" not in names)
+            check("unfinished_drops_cancelled", "g_cancelled" not in names)
+            check("unfinished_drops_stuck_not_resurrected_regression", "g_stuck" not in names)
+    finally:
+        RelayWorker.attach = orig["attach"]
+        RelayWorker.poll = orig["poll"]
+        RelayWorker.close = orig["close"]
+
+
+def test_stuck_noprogress_early_exit():
+    """REGRESSION (2026-07 overnight stall): a STUCK reply that repeats VERBATIM must not burn
+    the full NET_RETRY_WINDOW_S (up to 30 min) before going terminal. Reuses the EXISTING
+    no-progress signal (self.no_progress, built in _decide from `norm == self.last_norm`,
+    already used elsewhere for the CONTINUE-nudge no-progress cutoff) rather than a new
+    response-comparison. Driven purely through _decide() turns -- no sleep, no wall-clock
+    manipulation needed -- proving the early-exit fires on TURN COUNT, not on time elapsed."""
+    msg = "STUCK: 原因不明のエラーが継続しています。"
+    w = RelayWorker("do the thing", "wnp")
+    for _ in range(rf.NET_RETRY_NOPROGRESS_MAX + 1):
+        if w.status == "stuck":
+            break
+        w._decide(msg)
+    check("noprogress_early_exit_fires", w.status == "stuck" and w.outcome == "STUCK")
+    check("noprogress_early_exit_reason_mentions_repeat",
+          any(kw in (w.reason or "").lower() for kw in ("repeat", "identical", "反復")))
+    # the EARLIER turns (no_progress still below the threshold) legitimately went through
+    # _retry_transient (transient budget grows 1 per turn until the threshold trips), but the
+    # FINAL triggering turn short-circuits BEFORE another _retry_transient call -- so transient
+    # stops exactly at the threshold instead of climbing every turn all the way to max_transient
+    # or waiting out NET_RETRY_WINDOW_S (up to 30 min) as it would without this fix.
+    check("noprogress_early_exit_stops_before_full_budget",
+          w.transient == rf.NET_RETRY_NOPROGRESS_MAX and w.transient < w.max_transient)
+
+    # NEGATIVE: CHANGING stuck replies (a real transient outage riding out with different
+    # errors/backoff each turn) must NOT trip the early exit -- proves genuine transient
+    # recovery is unaffected by this fix.
+    w2 = RelayWorker("do the thing", "wnp2")
+    for i in range(rf.NET_RETRY_NOPROGRESS_MAX + 2):
+        w2._decide("STUCK: 一時的なエラー(%d回目)、詳細コード=%d" % (i, i * 37))
+    check("changing_replies_do_not_early_exit", w2.status != "stuck")
+    check("changing_replies_used_normal_retry_path", w2.transient > 0)
+    check("changing_replies_no_progress_never_accumulated", w2.no_progress == 0)
+
+
 def main():
     test_disk_floor_predicate()
     test_tab_load_accounting()
@@ -1001,6 +1122,8 @@ def main():
     test_consent_detector()
     test_lock_detector_ignores_security_review_prose()
     test_renav_first_on_consent_and_dead_agent()
+    test_unfinished_excludes_stuck_keeps_infra_stuck()
+    test_stuck_noprogress_early_exit()
     print("\n=== %d/%d admission checks passed ===" % (sum(results), len(results)))
     return 0 if all(results) else 1
 
