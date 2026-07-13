@@ -15,9 +15,12 @@ from bench.review_build_goals import (
     BINARY_EXTS,
     FINDINGS_BEGIN,
     FINDINGS_END,
+    REVIEW_DIMENSIONS,
     REVIEW_RUBRIC,
     SECURITY_RUBRIC,
+    build_dimension_goal,
     build_review_goal,
+    dimensions_for_kind,
     enumerate_files,
     group_files,
     main,
@@ -298,6 +301,142 @@ def test_main_end_to_end(repo, tmp_path):
     for g in lines:
         assert g["cwd"] == os.path.abspath(repo)
         assert "checks" not in g
+
+
+# --- REVIEW_DIMENSIONS registry: well-formedness ---------------------------------------------
+
+_REQUIRED_DIM_KEYS = {"key", "title", "rubric", "applies_to", "behavioral"}
+
+
+def test_dimension_registry_well_formed():
+    assert len(REVIEW_DIMENSIONS) > 0
+    seen_keys = set()
+    for dim in REVIEW_DIMENSIONS:
+        assert _REQUIRED_DIM_KEYS <= set(dim.keys())
+        assert isinstance(dim["key"], str) and dim["key"]
+        assert dim["key"] not in seen_keys, "duplicate dimension key %r" % (dim["key"],)
+        seen_keys.add(dim["key"])
+        assert isinstance(dim["title"], str) and dim["title"]
+        assert isinstance(dim["rubric"], str) and dim["rubric"]
+        assert "{FILE_LIST_CWD}" in dim["rubric"]
+        assert "{FILE_LIST}" in dim["rubric"]
+        assert isinstance(dim["applies_to"], (set, frozenset))
+        assert dim["applies_to"], "dimension %r applies to nothing" % (dim["key"],)
+        assert dim["applies_to"] <= {"review", "security"}
+        assert isinstance(dim["behavioral"], bool)
+
+
+def test_dimension_registry_has_expected_keys():
+    keys = {d["key"] for d in REVIEW_DIMENSIONS}
+    assert keys == {
+        "correctness", "security", "runtime_behavior", "deployment_operational",
+        "test_hygiene", "false_green_ci", "missing_wiring", "adversarial_input",
+        "cross_file_interaction",
+    }
+
+
+def test_dimension_registry_marks_behavioral_dimensions():
+    behavioral_keys = {d["key"] for d in REVIEW_DIMENSIONS if d["behavioral"]}
+    assert behavioral_keys == {"runtime_behavior", "adversarial_input"}
+
+
+# --- dimensions_for_kind ----------------------------------------------------------------------
+
+def test_dimensions_for_kind_review_excludes_security_only():
+    review_keys = {d["key"] for d in dimensions_for_kind("review")}
+    assert "security" not in review_keys  # security-only dimension
+    assert "correctness" in review_keys
+    assert "test_hygiene" in review_keys
+    assert "missing_wiring" in review_keys
+    assert "cross_file_interaction" in review_keys
+    # shared dimensions still apply to review
+    assert "runtime_behavior" in review_keys
+    assert "adversarial_input" in review_keys
+
+
+def test_dimensions_for_kind_security_excludes_review_only():
+    security_keys = {d["key"] for d in dimensions_for_kind("security")}
+    assert "security" in security_keys
+    assert "correctness" not in security_keys  # review-only dimension
+    assert "test_hygiene" not in security_keys
+    assert "missing_wiring" not in security_keys
+    assert "cross_file_interaction" not in security_keys
+    # shared dimensions still apply to security
+    assert "runtime_behavior" in security_keys
+    assert "deployment_operational" in security_keys
+
+
+def test_dimensions_for_kind_bad_kind_raises():
+    with pytest.raises(ValueError):
+        dimensions_for_kind("bogus")
+
+
+def test_dimensions_for_kind_disjoint_partition_of_shared_dims():
+    review_keys = {d["key"] for d in dimensions_for_kind("review")}
+    security_keys = {d["key"] for d in dimensions_for_kind("security")}
+    all_keys = {d["key"] for d in REVIEW_DIMENSIONS}
+    assert review_keys | security_keys == all_keys
+    # every dimension applies to at least one of review/security (registry well-formedness
+    # already checked applies_to is non-empty and a subset of {"review","security"})
+
+
+# --- build_dimension_goal ----------------------------------------------------------------------
+
+@pytest.mark.parametrize("dim", REVIEW_DIMENSIONS, ids=[d["key"] for d in REVIEW_DIMENSIONS])
+def test_build_dimension_goal_shape_and_contract(dim):
+    group = ["pkg/mod.py", "pkg/other_mod.py"]
+    goal = build_dimension_goal(dim, group, "C:/fakerepo")
+
+    assert set(goal.keys()) == {"text", "cwd"}
+    assert goal["cwd"] == "C:/fakerepo"
+    assert "checks" not in goal
+    for f in group:
+        assert f in goal["text"]
+
+    # dimension's own rubric focus text must be present
+    assert dim["title"] in goal["text"]
+
+    # the goal must carry the exact FINDINGS delimiters + a DONE instruction, in that order,
+    # as the LAST thing appended to the goal (mirrors build_review_goal's own contract)
+    assert FINDINGS_BEGIN in goal["text"]
+    assert FINDINGS_END in goal["text"]
+    assert "DONE" in goal["text"]
+    end_idx = goal["text"].rfind(FINDINGS_END)
+    done_idx = goal["text"].rfind("DONE")
+    assert end_idx != -1 and done_idx != -1 and end_idx < done_idx
+
+    # behavioral dimensions must instruct the agent to actually run and observe
+    if dim["behavioral"]:
+        assert "run_python" in goal["text"]
+        assert "shell_exec" in goal["text"]
+    else:
+        # non-behavioral dimensions are not required to mention them, but if they do it
+        # must not be the ONLY content (no accidental cross-contamination check needed --
+        # this branch just documents the asymmetry the parametrized test is checking).
+        pass
+
+
+def test_build_dimension_goal_accepts_key_string_or_dict():
+    group = ["a.py"]
+    by_dict = build_dimension_goal(REVIEW_DIMENSIONS[0], group, "C:/fakerepo")
+    by_key = build_dimension_goal(REVIEW_DIMENSIONS[0]["key"], group, "C:/fakerepo")
+    assert by_dict == by_key
+
+
+def test_build_dimension_goal_unknown_key_raises():
+    with pytest.raises(ValueError):
+        build_dimension_goal("not_a_real_dimension", ["a.py"], "C:/fakerepo")
+
+
+def test_build_dimension_goal_tags_dimension_in_findings_example():
+    goal = build_dimension_goal("correctness", ["a.py"], "C:/fakerepo")
+    assert '"dimension": "correctness"' in goal["text"]
+
+
+def test_build_dimension_goal_different_dimensions_differ():
+    a = build_dimension_goal("correctness", ["a.py"], "C:/fakerepo")
+    b = build_dimension_goal("test_hygiene", ["a.py"], "C:/fakerepo")
+    assert a["text"] != b["text"]
 
 
 if __name__ == "__main__":

@@ -15,7 +15,12 @@ import sys
 import pytest
 
 import bench.review_run as review_run
+from bench.review_build_goals import REVIEW_DIMENSIONS, dimensions_for_kind
 from bench.review_run import fleet_cmd, main, merge_verdicts, plan_goals, verify_goals_from_findings
+from relay.fleet_runner import _read_goals_file
+
+REVIEW_DIM_COUNT = len(dimensions_for_kind("review"))
+SECURITY_DIM_COUNT = len(dimensions_for_kind("security"))
 
 
 def _run(cmd, cwd):
@@ -74,14 +79,22 @@ def test_dry_run_builds_goals_and_never_calls_fleet(repo, monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert "DRY RUN" in out
-    assert "goals: 2" in out  # a.py, sub/b.py each in their own goal (group-size 1)
+    # a.py, sub/b.py each in their own file-group (group-size 1), fanned out across every
+    # review-applicable dimension -> 2 groups * REVIEW_DIM_COUNT dimensions.
+    expected_goals = 2 * REVIEW_DIM_COUNT
+    assert "file groups: 2" in out
+    assert ("goals: %d" % expected_goals) in out
 
     goals_dir = os.path.join(repo, ".fleet", "review")
     goal_files = [f for f in os.listdir(goals_dir) if f.startswith("goals_")]
     assert len(goal_files) == 1
-    with open(os.path.join(goals_dir, goal_files[0]), encoding="utf-8") as f:
+    goals_path = os.path.join(goals_dir, goal_files[0])
+    with open(goals_path, encoding="utf-8") as f:
         lines = [json.loads(l) for l in f if l.strip()]
-    assert len(lines) == 2
+    assert len(lines) == expected_goals
+
+    # the goals file must not trip relay.fleet_runner's fragmented-goals-file guard
+    assert len(_read_goals_file(goals_path)) == expected_goals
 
     # no report should have been written -- dry-run stops before aggregation
     reports = [f for f in os.listdir(goals_dir) if f.startswith("review_report_")]
@@ -284,10 +297,132 @@ def test_plan_goals_diff_mode_defaults_to_one_group(repo):
     _write(repo, "a.py", "one\ntwo\n")  # modify tracked file, unstaged
     _write(repo, "new.py", "new\n")     # untracked -- diff --name-only won't see this one
 
-    files, groups, goals = plan_goals("review", "diff", repo)
+    files, groups, goals, goal_meta = plan_goals("review", "diff", repo)
     assert files == ["a.py"]
     assert groups == [["a.py"]]
-    assert len(goals) == 1
+    # diff mode still fans out across every review dimension for the single group.
+    assert len(goals) == REVIEW_DIM_COUNT
+    assert len(goal_meta) == REVIEW_DIM_COUNT
+    assert {m["dimension"] for m in goal_meta} == {d["key"] for d in dimensions_for_kind("review")}
+    assert all(m["files"] == ["a.py"] for m in goal_meta)
+
+
+# --- plan_goals(): multi-dimensional fan-out -------------------------------------------------
+
+def test_plan_goals_review_kind_uses_only_review_dimensions(repo):
+    files, groups, goals, goal_meta = plan_goals("review", "all", repo, group_size=20)
+    dims_seen = {m["dimension"] for m in goal_meta}
+    review_keys = {d["key"] for d in dimensions_for_kind("review")}
+    security_only_keys = {d["key"] for d in REVIEW_DIMENSIONS} - review_keys
+    assert dims_seen == review_keys
+    assert not (dims_seen & security_only_keys)
+    assert len(goals) == len(groups) * REVIEW_DIM_COUNT
+
+
+def test_plan_goals_security_kind_uses_only_security_dimensions(repo):
+    files, groups, goals, goal_meta = plan_goals("security", "all", repo, group_size=20)
+    dims_seen = {m["dimension"] for m in goal_meta}
+    security_keys = {d["key"] for d in dimensions_for_kind("security")}
+    review_only_keys = {d["key"] for d in REVIEW_DIMENSIONS} - security_keys
+    assert dims_seen == security_keys
+    assert not (dims_seen & review_only_keys)
+    assert len(goals) == len(groups) * SECURITY_DIM_COUNT
+
+
+def test_plan_goals_dimensions_filter_scopes_to_requested_keys(repo):
+    files, groups, goals, goal_meta = plan_goals(
+        "review", "all", repo, group_size=20, dimension_keys=["correctness", "test_hygiene"])
+    assert {m["dimension"] for m in goal_meta} == {"correctness", "test_hygiene"}
+    assert len(goals) == len(groups) * 2
+
+
+def test_plan_goals_dimensions_filter_unknown_key_raises(repo):
+    with pytest.raises(ValueError):
+        plan_goals("review", "all", repo, dimension_keys=["not_a_real_dimension"])
+
+
+def test_plan_goals_dimensions_filter_inapplicable_key_raises(repo):
+    # "security" dimension key exists but does not apply to kind="review"
+    with pytest.raises(ValueError):
+        plan_goals("review", "all", repo, dimension_keys=["security"])
+
+
+def test_plan_goals_no_files_yields_no_goals_regardless_of_dimensions(tmp_path):
+    root = str(tmp_path / "emptyrepo")
+    os.makedirs(root, exist_ok=True)
+    _init_repo(root)
+    files, groups, goals, goal_meta = plan_goals("review", "all", root)
+    assert files == []
+    assert groups == []
+    assert goals == []
+    assert goal_meta == []
+
+
+# --- --dimensions CLI filter ------------------------------------------------------------------
+
+def test_cli_dimensions_filter_scopes_dry_run(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    _no_fleet_guard(monkeypatch)
+
+    rc = main(["--kind", "review", "--dry-run", "--group-size", "20",
+               "--dimensions", "correctness,missing_wiring"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "dimensions: correctness, missing_wiring" in out
+    assert "goals: 2" in out  # 1 file group * 2 requested dimensions
+
+
+# --- concurrency clamp -------------------------------------------------------------------------
+
+def test_max_concurrent_clamped_to_ceiling(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "MAX_CONCURRENT_CEILING", 5)
+    _no_fleet_guard(monkeypatch)
+
+    rc = main(["--kind", "review", "--dry-run", "--max-concurrent", "999"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "'--max-concurrent', '5'" in out
+    assert "clamped: requested=999 effective=5" in out
+
+
+def test_max_concurrent_within_ceiling_unclamped(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "MAX_CONCURRENT_CEILING", 8)
+    _no_fleet_guard(monkeypatch)
+
+    rc = main(["--kind", "review", "--dry-run", "--max-concurrent", "3"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "'--max-concurrent', '3'" in out
+    assert "clamped" not in out
+
+
+# --- dimension coverage note in the rendered report --------------------------------------------
+
+def test_report_notes_dimension_coverage(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)  # must exist; never invoked
+    monkeypatch.setattr(review_run, "run_fleet",
+                         _fake_run_fleet_factory(repo, {"running": False, "workers": []}))
+
+    rc = main(["--kind", "review", "--group-size", "10", "--dimensions", "correctness"])
+    assert rc == 0
+
+    out_dir = os.path.join(repo, ".fleet", "review")
+    md_files = [f for f in os.listdir(out_dir)
+                if f.startswith("review_report_") and f.endswith(".md")]
+    json_files = [f for f in os.listdir(out_dir)
+                  if f.startswith("review_report_") and f.endswith(".json")]
+    assert len(md_files) == 1 and len(json_files) == 1
+
+    with open(os.path.join(out_dir, md_files[0]), encoding="utf-8") as f:
+        md = f.read()
+    assert "dimensions covered: correctness" in md
+
+    with open(os.path.join(out_dir, json_files[0]), encoding="utf-8") as f:
+        report = json.load(f)
+    assert report["dimensions_covered"] == ["correctness"]
 
 
 if __name__ == "__main__":

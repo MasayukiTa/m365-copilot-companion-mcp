@@ -353,6 +353,9 @@ def render_markdown(agg):
     lines.append("- findings total: %d" % len(agg.get("findings", [])))
     lines.append("- parse errors (worker text missing/malformed FINDINGS block): %d" %
                  agg.get("parse_errors", 0))
+    dims_covered = agg.get("dimensions_covered")
+    if dims_covered:
+        lines.append("- dimensions covered: %s" % ", ".join(dims_covered))
     lines.append("")
 
     by_severity = agg.get("by_severity", {})

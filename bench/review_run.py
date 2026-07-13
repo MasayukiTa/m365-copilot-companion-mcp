@@ -10,10 +10,12 @@ relay.fleet_runner and waiting for it to finish.
   python bench/review_run.py --kind review --verify            # + adversarial 2nd-pass check
 
 FLOW:
-  1. enumerate_files -> optional --target-path filter -> group_files -> one build_review_goal
-     per group -> write_goals_jsonl to <out-dir>/goals_<stamp>.jsonl.
-  2. --dry-run prints the plan (goal count, per-goal files, the exact fleet argv, output
-     paths) and returns WITHOUT launching anything.
+  1. enumerate_files -> optional --target-path filter -> group_files -> fan out one
+     build_dimension_goal per (dimension, file-group) pair, across every dimension
+     applicable to --kind (or the --dimensions subset) -> write_goals_jsonl to
+     <out-dir>/goals_<stamp>.jsonl.
+  2. --dry-run prints the plan (goal count, per-goal dimension + files, the exact fleet
+     argv, output paths) and returns WITHOUT launching anything.
   3. Otherwise: run_fleet() launches relay.fleet_runner and blocks until it exits, then
      aggregate()/render_markdown()/render_json() turn .fleet/status.json into
      <out-dir>/review_report_<stamp>.{md,json}.
@@ -48,7 +50,8 @@ from bench.review_aggregate import aggregate, render_json, render_markdown
 from bench.review_build_goals import (
     FINDINGS_BEGIN,
     FINDINGS_END,
-    build_review_goal,
+    build_dimension_goal,
+    dimensions_for_kind,
     enumerate_files,
     group_files,
     write_goals_jsonl,
@@ -58,6 +61,24 @@ DEFAULT_OUT_DIR = ".fleet/review"
 DEFAULT_ALL_GROUP_SIZE = 20
 DEFAULT_VERIFY_BATCH = 10
 FLEET_MAX_TURNS = "40"
+
+# Fan-out multiplies goal count by len(dimensions) vs. the old one-rubric-per-file-group
+# scheme, so --max-concurrent (still user-configurable, default unchanged/conservative below)
+# is additionally clamped to a hard ceiling -- override via env var, never via a CLI flag
+# that could be raised without noticing the multiplier. This keeps concurrency bounded even
+# if a caller passes an unreasonably large --max-concurrent by habit from the old, smaller
+# goal counts.
+DEFAULT_MAX_CONCURRENT = 4
+MAX_CONCURRENT_CEILING = int(os.environ.get("REVIEW_MAX_CONCURRENT_CEILING", "8") or "8")
+
+
+def _clamp_max_concurrent(requested):
+    """Bound `requested` to (1, MAX_CONCURRENT_CEILING]. A ceiling <= 0 disables clamping
+    (explicit opt-out via REVIEW_MAX_CONCURRENT_CEILING=0), matching the "configurable via
+    env" requirement without silently ignoring an operator's explicit choice."""
+    if MAX_CONCURRENT_CEILING <= 0:
+        return max(1, int(requested))
+    return max(1, min(int(requested), MAX_CONCURRENT_CEILING))
 
 
 def _stamp():
@@ -82,13 +103,24 @@ def _filter_target_path(files, target_path):
 
 
 def plan_goals(kind, mode, repo_root, base_ref=None, cached=False, target_path=None,
-               group_size=None):
+               group_size=None, dimension_keys=None):
     """Pure planning step (aside from enumerate_files' own git subprocess calls): enumerate
-    -> filter by target_path -> group -> build one review goal per group.
+    -> filter by target_path -> group -> fan out one goal per (dimension, file-group).
 
-    Returns (files, groups, goals). group_size=None picks a mode-appropriate default:
-    DEFAULT_ALL_GROUP_SIZE for "all", or every changed file in ONE goal for "diff" (a diff
-    is usually small, and a reviewer benefits from seeing the whole changeset together)."""
+    Replaces the old "one all-in-one rubric per file-group" scheme: for --kind review, one
+    goal per review-applicable REVIEW_DIMENSIONS entry x file-group; for --kind security,
+    one per security-applicable entry x file-group (see bench.review_build_goals.
+    dimensions_for_kind). dimension_keys optionally restricts to a subset of the kind's
+    applicable dimensions (raises ValueError if a requested key is unknown or not
+    applicable to `kind`); default None = every dimension applicable to `kind`.
+
+    Returns (files, groups, goals, goal_meta). group_size=None picks a mode-appropriate
+    default: DEFAULT_ALL_GROUP_SIZE for "all", or every changed file in ONE goal for "diff"
+    (a diff is usually small, and a reviewer benefits from seeing the whole changeset
+    together). goal_meta is a list parallel to `goals`: [{"dimension": key, "files": group},
+    ...] -- used for --dry-run printing and for the report's dimension-coverage note; it is
+    NEVER written to the goals JSONL (write_goals_jsonl only ever sees the plain
+    {"text","cwd"} dicts in `goals`)."""
     files = enumerate_files(mode, repo_root, base_ref=base_ref, cached=cached)
     files = _filter_target_path(files, target_path)
 
@@ -96,28 +128,53 @@ def plan_goals(kind, mode, repo_root, base_ref=None, cached=False, target_path=N
         group_size = len(files) if mode == "diff" else DEFAULT_ALL_GROUP_SIZE
 
     groups = group_files(files, group_size)
-    goals = [build_review_goal(g, repo_root, kind) for g in groups]
-    return files, groups, goals
+
+    dims = dimensions_for_kind(kind)
+    if dimension_keys:
+        wanted = set(dimension_keys)
+        applicable_keys = {d["key"] for d in dims}
+        unknown = wanted - applicable_keys
+        if unknown:
+            raise ValueError(
+                "--dimensions has unknown or inapplicable key(s) for kind=%r: %s "
+                "(applicable: %s)" % (kind, sorted(unknown), sorted(applicable_keys)))
+        dims = [d for d in dims if d["key"] in wanted]
+
+    goals = []
+    goal_meta = []
+    for dim in dims:
+        for g in groups:
+            goals.append(build_dimension_goal(dim, g, repo_root))
+            goal_meta.append({"dimension": dim["key"], "files": list(g)})
+    return files, groups, goals, goal_meta
 
 
-def fleet_cmd(goals_path, max_concurrent, effort):
+def fleet_cmd(goals_path, max_concurrent, effort, state_dir=None):
     """The exact, verified relay.fleet_runner launch contract. Do not add, rename, or drop
-    flags here -- other bench orchestrators (bench/swe_solve_decoupled.py) rely on this
-    same shape and it has been confirmed live against relay/fleet_runner.py's argparse."""
-    return [VENVPY, "-m", "relay.fleet_runner",
-            "--goals-file", goals_path,
-            "--max-concurrent", str(max_concurrent),
-            "--max-turns", FLEET_MAX_TURNS,
-            "--disk-floor-gb", "0",
-            "--effort", effort]
+    the core flags here -- other bench orchestrators (bench/swe_solve_decoupled.py) rely on
+    this same shape and it has been confirmed live against relay/fleet_runner.py's argparse.
+
+    state_dir is OPTIONAL and additive: when given, a --state-dir flag is appended so the run
+    writes its status.json / transcripts under that dir instead of the default .fleet. Callers
+    that omit it get the exact original argv (no behaviour change for existing orchestrators)."""
+    cmd = [VENVPY, "-m", "relay.fleet_runner",
+           "--goals-file", goals_path,
+           "--max-concurrent", str(max_concurrent),
+           "--max-turns", FLEET_MAX_TURNS,
+           "--disk-floor-gb", "0",
+           "--effort", effort]
+    if state_dir:
+        cmd += ["--state-dir", state_dir]
+    return cmd
 
 
-def run_fleet(goals_path, max_concurrent, effort):
+def run_fleet(goals_path, max_concurrent, effort, state_dir=None):
     """The ONE function that touches the fleet subprocess -- isolated so tests can
     monkeypatch it out entirely without a real Popen. Blocks until the fleet run exits
     (fleet_runner drives the M365 Copilot fleet on companion Edge :9222); returns its
-    return code. Writes .fleet/status.json and .fleet/transcripts/* as a side effect."""
-    cmd = fleet_cmd(goals_path, max_concurrent, effort)
+    return code. Writes <state_dir or .fleet>/status.json and .../transcripts/* as a side
+    effect."""
+    cmd = fleet_cmd(goals_path, max_concurrent, effort, state_dir=state_dir)
     print("fleet: " + " ".join(cmd[1:]))
     proc = subprocess.Popen(cmd, cwd=REPO, env=dict(os.environ))
     proc.wait()
@@ -208,7 +265,13 @@ def build_arg_parser():
                      help="restrict enumeration to files under this subdir")
     ap.add_argument("--group-size", type=int, default=None,
                      help="files per goal (default: 20 for --mode all, all-in-one for diff)")
-    ap.add_argument("--max-concurrent", type=int, default=4)
+    ap.add_argument("--dimensions", default=None,
+                     help="comma-separated REVIEW_DIMENSIONS key(s) to scope this run to "
+                          "(default: every dimension applicable to --kind)")
+    ap.add_argument("--max-concurrent", type=int, default=DEFAULT_MAX_CONCURRENT,
+                     help="clamped to <= REVIEW_MAX_CONCURRENT_CEILING (env, default %d) -- "
+                          "dimension fan-out multiplies goal count, so this stays bounded "
+                          "regardless of the value passed here" % MAX_CONCURRENT_CEILING)
     ap.add_argument("--effort", choices=["min", "auto"], default="auto")
     ap.add_argument("--verify", action="store_true",
                      help="run an optional 2nd adversarial verification pass (costs a "
@@ -226,22 +289,39 @@ def main(argv=None):
     out_dir = _resolve_out_dir(args.out_dir, repo_root)
     stamp = _stamp()
 
-    files, groups, goals = plan_goals(
+    dimension_keys = None
+    if args.dimensions:
+        dimension_keys = [s.strip() for s in args.dimensions.split(",") if s.strip()]
+
+    max_concurrent = _clamp_max_concurrent(args.max_concurrent)
+
+    files, groups, goals, goal_meta = plan_goals(
         args.kind, args.mode, repo_root, base_ref=args.base_ref, cached=args.cached,
         target_path=args.target_path, group_size=args.group_size,
+        dimension_keys=dimension_keys,
     )
+    dims_used = sorted({m["dimension"] for m in goal_meta})
+
     goals_path = os.path.join(out_dir, "goals_%s.jsonl" % stamp)
     write_goals_jsonl(goals, goals_path)
-    cmd = fleet_cmd(goals_path, args.max_concurrent, args.effort)
+    cmd = fleet_cmd(goals_path, max_concurrent, args.effort)
 
     if args.dry_run:
         print("DRY RUN -- plan only, fleet NOT launched")
         print("kind=%s mode=%s target-path=%s" %
               (args.kind, args.mode, args.target_path or "(none)"))
         print("files matched: %d" % len(files))
+        print("file groups: %d" % len(groups))
+        print("dimensions: %s" % (", ".join(dims_used) if dims_used else "(none)"))
         print("goals: %d" % len(goals))
-        for i, g in enumerate(groups):
-            print("  goal %d/%d: %d file(s): %s" % (i + 1, len(groups), len(g), ", ".join(g)))
+        for i, (g, meta) in enumerate(zip(goals, goal_meta)):
+            print("  goal %d/%d: dimension=%s %d file(s): %s" %
+                  (i + 1, len(goals), meta["dimension"], len(meta["files"]),
+                   ", ".join(meta["files"])))
+        if max_concurrent != args.max_concurrent:
+            print("max-concurrent clamped: requested=%d effective=%d (ceiling=%d, override "
+                  "via REVIEW_MAX_CONCURRENT_CEILING)" %
+                  (args.max_concurrent, max_concurrent, MAX_CONCURRENT_CEILING))
         print("goals file: %s" % goals_path)
         print("fleet cmd: %s" % cmd)
         print("report would be written under: %s" % out_dir)
@@ -256,8 +336,9 @@ def main(argv=None):
               (args.mode, args.target_path or "(none)"))
         return 0
 
-    print("launching %d review goal(s)..." % len(goals))
-    run_fleet(goals_path, args.max_concurrent, args.effort)
+    print("launching %d review goal(s) across dimensions: %s..." %
+          (len(goals), ", ".join(dims_used)))
+    run_fleet(goals_path, max_concurrent, args.effort)
 
     status_path = os.path.join(repo_root, ".fleet", "status.json")
     transcripts_dir = os.path.join(repo_root, ".fleet", "transcripts")
@@ -268,6 +349,7 @@ def main(argv=None):
         return 1
 
     agg = aggregate(status_path, transcripts_dir, now=time.time())
+    agg["dimensions_covered"] = dims_used
 
     if args.verify:
         findings = agg.get("findings", [])
@@ -277,13 +359,24 @@ def main(argv=None):
             vgoals = verify_goals_from_findings(findings, repo_root)
             vgoals_path = os.path.join(out_dir, "verify_goals_%s.jsonl" % stamp)
             write_goals_jsonl(vgoals, vgoals_path)
+            # Run the verify pass in its OWN state dir so it writes a FRESH status.json /
+            # transcripts. Reusing the default .fleet/status.json here meant the second
+            # aggregate() could read the FIRST pass's snapshot (fleet not yet started, or
+            # crashed before overwriting) and merge the original findings back in as if they
+            # were verify verdicts. A separate dir makes "no verify snapshot" detectable
+            # instead of silently reusing stale data.
+            verify_state_dir = os.path.join(out_dir, "verify_state_%s" % stamp)
+            verify_status_path = os.path.join(verify_state_dir, "status.json")
+            verify_transcripts_dir = os.path.join(verify_state_dir, "transcripts")
             print("launching verify pass: %d goal(s)..." % len(vgoals))
-            run_fleet(vgoals_path, args.max_concurrent, args.effort)
-            if os.path.isfile(status_path):
-                vagg = aggregate(status_path, transcripts_dir, now=time.time())
+            run_fleet(vgoals_path, max_concurrent, args.effort,
+                      state_dir=verify_state_dir)
+            if os.path.isfile(verify_status_path):
+                vagg = aggregate(verify_status_path, verify_transcripts_dir, now=time.time())
                 merge_verdicts(agg, vagg.get("findings", []))
             else:
-                print("WARNING: verify pass produced no status.json; skipping verdict merge")
+                print("WARNING: verify pass produced no status.json at %s; skipping verdict "
+                      "merge (findings keep verify_verdict=None)" % verify_status_path)
 
     os.makedirs(out_dir, exist_ok=True)
     md_path = os.path.join(out_dir, "review_report_%s.md" % stamp)
