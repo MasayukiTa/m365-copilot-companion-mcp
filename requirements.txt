@@ -13,7 +13,7 @@ send2trash>=1.8
 matplotlib
 pytesseract>=0.3.13
 ddgs>=9.0
-watchdog>=4.0
+watchdog>=6.0.0
 pyodbc>=5.0
 psutil>=7.2.2
 python-dotenv
