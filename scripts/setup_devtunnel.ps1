@@ -67,6 +67,53 @@ function Get-MachineSuffix {
     return $hex.Substring(0, 6)
 }
 
+# Privacy guard: some tunnel names leak an identifying (organization/user) token to the
+# GLOBAL devtunnels.ms namespace, which is visible to Microsoft and to the tunnel owner.
+# These two SHA-256 values are a blocklist of the specific leaked token and the specific
+# leaked full tunnel name seen in the wild -- the plaintext is intentionally never written
+# here; only its hash is, so this file cannot itself leak it. Hashing is over the UTF-8
+# bytes of the lowercased input, hex-encoded lowercase.
+$script:TOKEN_SHA256 = "2a0341296bb96dc7d205036f9f693427809772f6136a46f58b04a1c492de9e04"
+$script:FULLNAME_SHA256 = "5ba174b8e87faf4e8106e36a7cf5a901bbec3435d01fbd56914c2b0346858261"
+
+function Get-Sha256Hex([string]$s) {
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($s))
+    } finally {
+        $sha256.Dispose()
+    }
+    return (-join ($bytes | ForEach-Object { $_.ToString("x2") }))
+}
+
+# Detects whether a candidate dev tunnel name leaks an identifying token. Returns $true if
+# the name (or one of its hyphen/underscore/dot/space-separated tokens) is identifying,
+# $false otherwise (including an empty/whitespace name -- nothing to leak, "no name set").
+function Test-IdentifyingTunnelName([string]$name) {
+    if ([string]::IsNullOrWhiteSpace($name)) { return $false }
+    $lower = $name.ToLowerInvariant()
+
+    # 1. Whole-name blocklist hash match.
+    if ((Get-Sha256Hex $lower) -eq $script:FULLNAME_SHA256) { return $true }
+
+    # 2. Per-token blocklist hash match.
+    $tokens = @($lower -split '[^a-z0-9]+' | Where-Object { $_ })
+    foreach ($t in $tokens) {
+        if ((Get-Sha256Hex $t) -eq $script:TOKEN_SHA256) { return $true }
+    }
+
+    # 3. Generic runtime checks (no hash needed) -- catches folder-derived / user-derived
+    #    names on any machine, beyond the specific blocklist above.
+    $repoLeaf = (Split-Path -Leaf $root).ToLowerInvariant()
+    $userName = ("$env:USERNAME").ToLowerInvariant()
+    foreach ($t in $tokens) {
+        if (($repoLeaf -and $t -eq $repoLeaf) -or ($userName -and $t -eq $userName)) { return $true }
+    }
+    if (($repoLeaf -and $lower.Contains($repoLeaf)) -or ($userName -and $lower.Contains($userName))) { return $true }
+
+    return $false
+}
+
 # Non-fatal notes collected from tolerated (idempotent "already exists") non-zero devtunnel exits,
 # surfaced later only if the tunnel ultimately fails to come up -- so the real CLI text is visible
 # instead of silently swallowed.
@@ -231,9 +278,10 @@ $existingIds = @($listed | Select-String -Pattern '^\s*([a-z0-9][a-z0-9-]+\.[a-z
 $existingNames = @($existingIds | ForEach-Object { ($_ -split '\.')[0] })
 
 # A previous run (or the supervisor) may have recorded the tunnel name in .env.
-# That name MUST win over $DEFAULT_NAME: creating a differently-named tunnel here
+# That name MUST win over the default: creating a differently-named tunnel here
 # would rewrite .env and silently break an already-configured Copilot Studio
-# connector pointing at the old URL.
+# connector pointing at the old URL -- UNLESS that recorded (or explicitly passed)
+# name is itself identifying, in which case privacy wins (see the guard below).
 if (-not $TunnelName) {
     $envPath0 = Join-Path $root ".env"
     if (Test-Path $envPath0) {
@@ -243,16 +291,48 @@ if (-not $TunnelName) {
     }
 }
 
+# The default is made globally unique (and stable per machine) FROM THE FIRST RUN by
+# appending the machine suffix -- this prevents two different clones/users both trying
+# to create the same generic default name from colliding in the global devtunnels.ms
+# namespace, without identifying either of them. The plain (unsuffixed) default is still
+# recognized below for backward compatibility with installs created before this change.
+$machineSuffix = Get-MachineSuffix
+$safeDefault = "$DEFAULT_NAME-$machineSuffix"
+
+# Privacy guard: an explicitly-passed -TunnelName or a name recorded in .env is normally
+# honored as-is (see above) -- UNLESS it is identifying, in which case it must NOT be
+# reused/adopted. Discard it and fall through to the fresh, safe, machine-unique default
+# instead, and tell the user the public URL changed and how to clean up the old tunnel.
+if ($TunnelName -and (Test-IdentifyingTunnelName $TunnelName)) {
+    Write-Host ""
+    Write-Host "NOTICE: the previous Dev Tunnel name ('$TunnelName') is identifying (it leaks" -ForegroundColor Yellow
+    Write-Host "        an organization/user token to the dev tunnel service) and has been" -ForegroundColor Yellow
+    Write-Host "        replaced with a private name for this machine." -ForegroundColor Yellow
+    Write-Host "        The PUBLIC URL will change -- after this run, re-paste the new" -ForegroundColor Yellow
+    Write-Host "        MCP_TUNNEL_URL into the Copilot Studio MCP connector." -ForegroundColor Yellow
+    Write-Host "        Manual cleanup of the old tunnel (optional; not done automatically):" -ForegroundColor Yellow
+    Write-Host "            devtunnel delete $TunnelName" -ForegroundColor Yellow
+    Write-Host ""
+    $TunnelName = ""
+}
+
 $reuse = $false
 if ($TunnelName) {
     $target = $TunnelName
     if ($existingNames -contains $TunnelName) { $reuse = $true }
+} elseif ($existingNames -contains $safeDefault) {
+    # Prefer the tunnel matching our (suffixed) default name; never adopt an arbitrary
+    # first tunnel.
+    $target = $safeDefault
+    $reuse = $true
 } elseif ($existingNames -contains $DEFAULT_NAME) {
-    # Prefer the tunnel matching our default name; never adopt an arbitrary first tunnel.
+    # Backward-compat: a run from before this change may have created the bare,
+    # unsuffixed default name. That name is itself safe/generic (not identifying) --
+    # reuse it rather than creating a second tunnel.
     $target = $DEFAULT_NAME
     $reuse = $true
 } else {
-    $target = $DEFAULT_NAME
+    $target = $safeDefault
 }
 
 if ($reuse) {

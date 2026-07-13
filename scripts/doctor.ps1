@@ -178,6 +178,44 @@ TunnelCheck "tunnel_exists" "Dev Tunnel exists (MCP_TUNNEL_NAME)" `
     } `
     "the tunnel is missing or expired -- (re)create it: powershell -File scripts\setup_devtunnel.ps1"
 
+# 3b. Privacy advisory -- independent of the tunnel dependency chain above (it reads only
+# MCP_TUNNEL_NAME text, no devtunnel CLI call, so it is never [SKIP]'d by tunnelChainBroken).
+# Detects whether the recorded tunnel name leaks an identifying (organization/user) token
+# to the GLOBAL devtunnels.ms namespace. Mirrors Test-IdentifyingTunnelName in
+# setup_devtunnel.ps1 and _is_identifying_tunnel_name in bootstrap.py -- keep all three
+# in sync.
+$TOKEN_SHA256 = "2a0341296bb96dc7d205036f9f693427809772f6136a46f58b04a1c492de9e04"
+$FULLNAME_SHA256 = "5ba174b8e87faf4e8106e36a7cf5a901bbec3435d01fbd56914c2b0346858261"
+function Get-Sha256HexDoctor([string]$s) {
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($s))
+    } finally {
+        $sha256.Dispose()
+    }
+    return (-join ($bytes | ForEach-Object { $_.ToString("x2") }))
+}
+function Test-IdentifyingTunnelName([string]$name) {
+    if ([string]::IsNullOrWhiteSpace($name)) { return $false }
+    $lower = $name.ToLowerInvariant()
+    if ((Get-Sha256HexDoctor $lower) -eq $FULLNAME_SHA256) { return $true }
+    $tokens = @($lower -split '[^a-z0-9]+' | Where-Object { $_ })
+    foreach ($t in $tokens) {
+        if ((Get-Sha256HexDoctor $t) -eq $TOKEN_SHA256) { return $true }
+    }
+    $repoLeaf = (Split-Path -Leaf $repo).ToLowerInvariant()
+    $userName = ("$env:USERNAME").ToLowerInvariant()
+    foreach ($t in $tokens) {
+        if (($repoLeaf -and $t -eq $repoLeaf) -or ($userName -and $t -eq $userName)) { return $true }
+    }
+    if (($repoLeaf -and $lower.Contains($repoLeaf)) -or ($userName -and $lower.Contains($userName))) { return $true }
+    return $false
+}
+
+Check "tunnel_name_private" "Dev Tunnel name is private (no identifying token)" `
+    { -not (Test-IdentifyingTunnelName $tname) } `
+    "Tunnel name leaks an identifying token to the dev tunnel service. Recreate with a private name: powershell -File scripts\setup_devtunnel.ps1  (this changes the public URL -- re-paste MCP_TUNNEL_URL into Copilot Studio, then remove the old one: devtunnel delete <oldname>)."
+
 TunnelCheck "tunnel_serving" "Dev Tunnel host serving (public URL -> server)" `
     { if (-not $turl) { return $false }; (Invoke-WebRequest -Uri (($turl.TrimEnd('/')) + '/health') -TimeoutSec 7 -UseBasicParsing).StatusCode -eq 200 } `
     "the tunnel exists but is not being served -- run start_all.bat (the supervisor hosts it). If this stays red while the checks above are green, MCP_TUNNEL_URL in .env may be stale -- compare it to the URL shown by 'devtunnel show <name>'."
