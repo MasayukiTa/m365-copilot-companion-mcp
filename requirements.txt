@@ -26,4 +26,4 @@ pillow>=10.0
 # Office / COM + OCR helper tools (Windows). Optional: only the outlook_*/pptx_export/ocr_pdf tools
 # need these; pdf2image also needs the Poppler binary on PATH.
 pywin32>=312; sys_platform == "win32"
-pdf2image>=1.16
+pdf2image>=1.17.0
