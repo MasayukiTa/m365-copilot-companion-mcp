@@ -513,6 +513,15 @@ def render_markdown(agg):
         else:
             lines.append("- completeness critic: no gaps identified")
 
+    # Baseline/regression gate (bench/review_baseline.py, wired in by bench/review_run.py's
+    # --baseline). Purely additive -- absent from `agg` unless --baseline was actually used, so
+    # a report built without it renders byte-identical to before this feature existed.
+    baseline_diff = agg.get("baseline_diff")
+    if baseline_diff:
+        lines.append("- baseline diff: new=%d regressed=%d resolved=%d unchanged=%d" % (
+            len(baseline_diff.get("new") or []), len(baseline_diff.get("regressed") or []),
+            len(baseline_diff.get("resolved") or []), len(baseline_diff.get("unchanged") or [])))
+
     lines.append("")
 
     by_severity = agg.get("by_severity", {})
@@ -588,6 +597,37 @@ def render_markdown(agg):
             if reason:
                 lines.append("  refuter: %s" % reason)
         lines.append("")
+
+    if baseline_diff:
+        new_items = baseline_diff.get("new") or []
+        regressed_items = baseline_diff.get("regressed") or []
+        if new_items or regressed_items:
+            lines.append("## Baseline diff: new / regressed findings (%d)" %
+                         (len(new_items) + len(regressed_items)))
+            lines.append("")
+            lines.append("_These are the actionable findings from the baseline gate -- NEW "
+                          "findings never seen in the baseline, and REGRESSED findings the "
+                          "baseline already knew about that are freshly reconfirmed (or have "
+                          "no refute verdict this run). RESOLVED/UNCHANGED findings are not "
+                          "listed here (see the counts line above)._")
+            lines.append("")
+            if new_items:
+                lines.append("### New (%d)" % len(new_items))
+                for it in new_items:
+                    ln = it.get("line")
+                    lines.append("- %s:%s:%s:%s" % (
+                        it.get("file", "?"), ln if ln is not None else "?",
+                        it.get("title", ""), it.get("severity", "?")))
+                lines.append("")
+            if regressed_items:
+                lines.append("### Regressed (%d)" % len(regressed_items))
+                for it in regressed_items:
+                    ln = it.get("line")
+                    lines.append("- %s:%s:%s:%s" % (
+                        it.get("file", "?"), ln if ln is not None else "?",
+                        it.get("title", ""), it.get("severity", "?")))
+                lines.append("")
+
     return "\n".join(lines)
 
 

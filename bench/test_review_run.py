@@ -1318,5 +1318,387 @@ def test_cli_dry_run_ignores_loop_and_completeness(repo, monkeypatch, capsys):
     assert "ignored under --dry-run" in out
 
 
+# --- CLI: --baseline / --write-baseline / --fail-on ------------------------------------------
+
+def _fake_run_fleet_two_pass_factory(repo_root, review_status, refute_status=None):
+    """review pass (state_dir=None) returns review_status; a state_dir containing
+    "refute_state" returns refute_status (or an all-UPHELD status if not given)."""
+    def _fake(goals_path, max_concurrent, effort, state_dir=None):
+        if state_dir and "refute_state" in state_dir:
+            payload = refute_status
+            if payload is None:
+                with open(goals_path, encoding="utf-8") as f:
+                    n = sum(1 for l in f if l.strip())
+                payload = {"workers": [
+                    {"name": "w%d" % i, "display_result": "UPHELD", "transcript": ""}
+                    for i in range(n)]}
+        else:
+            payload = review_status
+        fleet_dir = state_dir or os.path.join(repo_root, ".fleet")
+        os.makedirs(fleet_dir, exist_ok=True)
+        with open(os.path.join(fleet_dir, "status.json"), "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        return 0
+    return _fake
+
+
+def test_cli_write_baseline_snapshots_confirmed_findings(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    findings_json = json.dumps([
+        {"file": "a.py", "line": 1, "severity": "high", "title": "bad", "detail": "d"},
+    ], ensure_ascii=False)
+    worker_text = (review_run.FINDINGS_BEGIN + "\n" + findings_json + "\n" +
+                   review_run.FINDINGS_END + "\nDONE")
+    review_status = {"workers": [{"name": "w0", "display_result": worker_text, "transcript": ""}]}
+    monkeypatch.setattr(review_run, "run_fleet",
+                         _fake_run_fleet_two_pass_factory(repo, review_status))
+
+    baseline_path = os.path.join(repo, "baseline.json")
+    rc = main(["--kind", "review", "--group-size", "10",
+               "--write-baseline", baseline_path])
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "baseline written: %s (1 accepted finding(s))" % baseline_path in out
+
+    from bench.review_baseline import load_baseline
+    baseline = load_baseline(baseline_path)
+    assert len(baseline["accepted"]) == 1
+    assert baseline["accepted"][0]["title"] == "bad"
+
+
+def test_cli_write_baseline_no_refute_snapshots_every_finding(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    findings_json = json.dumps([
+        {"file": "a.py", "line": 1, "severity": "high", "title": "one", "detail": "d"},
+        {"file": "sub/b.py", "line": 2, "severity": "low", "title": "two", "detail": "d2"},
+    ], ensure_ascii=False)
+    worker_text = (review_run.FINDINGS_BEGIN + "\n" + findings_json + "\n" +
+                   review_run.FINDINGS_END + "\nDONE")
+    status_payload = {"workers": [{"name": "w0", "display_result": worker_text, "transcript": ""}]}
+    monkeypatch.setattr(review_run, "run_fleet",
+                         _fake_run_fleet_factory(repo, status_payload))
+
+    baseline_path = os.path.join(repo, "baseline_norefute.json")
+    rc = main(["--kind", "review", "--group-size", "10", "--no-refute",
+               "--write-baseline", baseline_path])
+    assert rc == 0
+
+    from bench.review_baseline import load_baseline
+    baseline = load_baseline(baseline_path)
+    assert len(baseline["accepted"]) == 2
+
+
+def test_cli_baseline_diff_attached_to_report(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    from bench.review_baseline import save_baseline
+    baseline_path = os.path.join(repo, "baseline.json")
+    save_baseline(baseline_path, [
+        {"file": "a.py", "line": 1, "title": "old bug", "severity": "high"},
+    ], kind="review", generated_at=1.0)
+
+    findings_json = json.dumps([
+        {"file": "a.py", "line": 1, "severity": "high", "title": "old bug", "detail": "d"},
+        {"file": "sub/b.py", "line": 2, "severity": "low", "title": "new bug", "detail": "d2"},
+    ], ensure_ascii=False)
+    worker_text = (review_run.FINDINGS_BEGIN + "\n" + findings_json + "\n" +
+                   review_run.FINDINGS_END + "\nDONE")
+    review_status = {"workers": [{"name": "w0", "display_result": worker_text, "transcript": ""}]}
+    # refuter UPHOLDs both findings -> "old bug" is a reconfirmed baseline hit (regressed).
+    refute_status = {"workers": [
+        {"name": "w0", "display_result": "UPHELD", "transcript": ""},
+        {"name": "w1", "display_result": "UPHELD", "transcript": ""},
+    ]}
+    monkeypatch.setattr(review_run, "run_fleet",
+                         _fake_run_fleet_two_pass_factory(repo, review_status, refute_status))
+
+    rc = main(["--kind", "review", "--group-size", "10", "--baseline", baseline_path])
+    assert rc == 0
+
+    out_dir = os.path.join(repo, ".fleet", "review")
+    json_files = [f for f in os.listdir(out_dir)
+                  if f.startswith("review_report_") and f.endswith(".json")]
+    assert len(json_files) == 1
+    with open(os.path.join(out_dir, json_files[0]), encoding="utf-8") as f:
+        report = json.load(f)
+    diff = report["baseline_diff"]
+    assert [f["title"] for f in diff["new"]] == ["new bug"]
+    assert [f["title"] for f in diff["regressed"]] == ["old bug"]
+
+    md_files = [f for f in os.listdir(out_dir)
+                if f.startswith("review_report_") and f.endswith(".md")]
+    with open(os.path.join(out_dir, md_files[0]), encoding="utf-8") as f:
+        md = f.read()
+    assert "baseline diff: new=1 regressed=1" in md
+    assert "sub/b.py:2:new bug:low" in md
+    assert "a.py:1:old bug:high" in md
+
+
+def test_cli_baseline_bad_path_is_a_hard_error(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    corrupt_path = os.path.join(repo, "corrupt_baseline.json")
+    with open(corrupt_path, "w", encoding="utf-8") as f:
+        f.write("{not valid json,,,")
+
+    findings_json = json.dumps(
+        [{"file": "a.py", "line": 1, "severity": "high", "title": "bad", "detail": "d"}],
+        ensure_ascii=False)
+    worker_text = (review_run.FINDINGS_BEGIN + "\n" + findings_json + "\n" +
+                   review_run.FINDINGS_END + "\nDONE")
+    status_payload = {"workers": [{"name": "w0", "display_result": worker_text, "transcript": ""}]}
+    monkeypatch.setattr(review_run, "run_fleet",
+                         _fake_run_fleet_two_pass_factory(repo, status_payload))
+
+    rc = main(["--kind", "review", "--group-size", "10", "--baseline", corrupt_path])
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "ERROR: could not load --baseline" in out
+
+    # no report should have been written -- a bad baseline must not silently hide findings
+    out_dir = os.path.join(repo, ".fleet", "review")
+    reports = [f for f in os.listdir(out_dir) if f.startswith("review_report_")] \
+        if os.path.isdir(out_dir) else []
+    assert reports == []
+
+
+def test_cli_fail_on_without_baseline_is_a_hard_error(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    _no_fleet_guard(monkeypatch)
+
+    rc = main(["--kind", "review", "--group-size", "10", "--fail-on", "high"])
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "ERROR: --fail-on requires --baseline" in out
+
+
+def test_cli_fail_on_gates_when_new_finding_at_or_above_threshold(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    baseline_path = os.path.join(repo, "empty_baseline.json")  # nonexistent -> empty baseline
+
+    findings_json = json.dumps(
+        [{"file": "a.py", "line": 1, "severity": "high", "title": "bad", "detail": "d"}],
+        ensure_ascii=False)
+    worker_text = (review_run.FINDINGS_BEGIN + "\n" + findings_json + "\n" +
+                   review_run.FINDINGS_END + "\nDONE")
+    status_payload = {"workers": [{"name": "w0", "display_result": worker_text, "transcript": ""}]}
+    monkeypatch.setattr(review_run, "run_fleet",
+                         _fake_run_fleet_two_pass_factory(repo, status_payload))
+
+    rc = main(["--kind", "review", "--group-size", "10", "--baseline", baseline_path,
+               "--fail-on", "high"])
+    assert rc == 3
+    out = capsys.readouterr().out
+    assert "GATE: 1 finding(s) at or above 'high' severity are NEW or REGRESSED since baseline." \
+        in out
+    assert "a.py:1:bad:high" in out
+
+    # the report must still have been written -- the gate fires AFTER writing it.
+    out_dir = os.path.join(repo, ".fleet", "review")
+    reports = [f for f in os.listdir(out_dir) if f.startswith("review_report_")]
+    assert reports  # at least goals + report files exist
+
+
+def test_cli_fail_on_below_threshold_does_not_gate(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    baseline_path = os.path.join(repo, "empty_baseline2.json")
+
+    findings_json = json.dumps(
+        [{"file": "a.py", "line": 1, "severity": "low", "title": "minor", "detail": "d"}],
+        ensure_ascii=False)
+    worker_text = (review_run.FINDINGS_BEGIN + "\n" + findings_json + "\n" +
+                   review_run.FINDINGS_END + "\nDONE")
+    status_payload = {"workers": [{"name": "w0", "display_result": worker_text, "transcript": ""}]}
+    monkeypatch.setattr(review_run, "run_fleet",
+                         _fake_run_fleet_two_pass_factory(repo, status_payload))
+
+    rc = main(["--kind", "review", "--group-size", "10", "--baseline", baseline_path,
+               "--fail-on", "high"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "GATE:" not in out
+
+
+def test_cli_fail_on_with_loop_prints_notice_and_skips_gate(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    baseline_path = os.path.join(repo, "empty_baseline3.json")
+
+    same_finding = [{"file": "a.py", "line": 1, "severity": "high", "title": "loop finding",
+                      "detail": "d"}]
+    worker_text = _findings_worker_text(same_finding)
+    review_status = {"workers": [{"name": "w0", "display_result": worker_text, "transcript": ""}]}
+
+    def _fake(goals_path, max_concurrent, effort, state_dir=None):
+        fleet_dir = state_dir or os.path.join(repo, ".fleet")
+        os.makedirs(fleet_dir, exist_ok=True)
+        with open(os.path.join(fleet_dir, "status.json"), "w", encoding="utf-8") as f:
+            json.dump(review_status, f)
+        return 0
+
+    monkeypatch.setattr(review_run, "run_fleet", _fake)
+
+    rc = main(["--kind", "review", "--group-size", "10", "--no-refute", "--loop",
+               "--max-rounds", "2", "--dry-rounds", "1",
+               "--baseline", baseline_path, "--fail-on", "high"])
+    # gate is never evaluated under --loop -- rc stays 0 (or whatever the loop itself yields),
+    # never the gate's own exit code.
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "NOTE: --fail-on is not evaluated in --loop mode" in out
+
+    out_dir = os.path.join(repo, ".fleet", "review")
+    json_files = [f for f in os.listdir(out_dir)
+                  if f.startswith("review_report_") and f.endswith(".json")]
+    with open(os.path.join(out_dir, json_files[0]), encoding="utf-8") as f:
+        report = json.load(f)
+    # the diff is still computed and attached even though the gate itself didn't run.
+    assert "baseline_diff" in report
+
+
+def test_cli_baseline_auto_no_prior_report_bootstraps_empty_baseline(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    findings_json = json.dumps(
+        [{"file": "a.py", "line": 1, "severity": "high", "title": "bad", "detail": "d"}],
+        ensure_ascii=False)
+    worker_text = (review_run.FINDINGS_BEGIN + "\n" + findings_json + "\n" +
+                   review_run.FINDINGS_END + "\nDONE")
+    status_payload = {"workers": [{"name": "w0", "display_result": worker_text, "transcript": ""}]}
+    monkeypatch.setattr(review_run, "run_fleet",
+                         _fake_run_fleet_two_pass_factory(repo, status_payload))
+
+    rc = main(["--kind", "review", "--group-size", "10", "--baseline", "auto"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "baseline: no prior report found in" in out
+    assert "treating all findings as new" in out
+
+    out_dir = os.path.join(repo, ".fleet", "review")
+    json_files = [f for f in os.listdir(out_dir)
+                  if f.startswith("review_report_") and f.endswith(".json")]
+    with open(os.path.join(out_dir, json_files[0]), encoding="utf-8") as f:
+        report = json.load(f)
+    assert [f["title"] for f in report["baseline_diff"]["new"]] == ["bad"]
+
+
+def test_cli_baseline_auto_picks_newest_prior_report_excluding_current(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    out_dir = os.path.join(repo, ".fleet", "review")
+    os.makedirs(out_dir, exist_ok=True)
+    # an OLDER prior report (must be ignored -- not the newest)
+    with open(os.path.join(out_dir, "review_report_20200101_000000.json"), "w",
+              encoding="utf-8") as f:
+        json.dump({"generated_at": 1.0, "workers_total": 0, "parse_errors": 0, "findings": [
+            {"file": "z.py", "line": 9, "title": "stale, should be ignored", "severity": "low"},
+        ], "by_severity": {"high": [], "medium": [], "low": []}}, f)
+    # the NEWEST prior report -- this is the one --baseline auto must pick.
+    with open(os.path.join(out_dir, "review_report_20260101_000000.json"), "w",
+              encoding="utf-8") as f:
+        json.dump({"generated_at": 2.0, "workers_total": 0, "parse_errors": 0, "findings": [
+            {"file": "a.py", "line": 1, "title": "old bug", "severity": "high"},
+        ], "by_severity": {"high": [], "medium": [], "low": []}}, f)
+
+    findings_json = json.dumps([
+        {"file": "a.py", "line": 1, "severity": "high", "title": "old bug", "detail": "d"},
+        {"file": "sub/b.py", "line": 2, "severity": "low", "title": "new bug", "detail": "d2"},
+    ], ensure_ascii=False)
+    worker_text = (review_run.FINDINGS_BEGIN + "\n" + findings_json + "\n" +
+                   review_run.FINDINGS_END + "\nDONE")
+    review_status = {"workers": [{"name": "w0", "display_result": worker_text, "transcript": ""}]}
+    monkeypatch.setattr(review_run, "run_fleet",
+                         _fake_run_fleet_two_pass_factory(repo, review_status))
+
+    rc = main(["--kind", "review", "--group-size", "10", "--no-refute", "--baseline", "auto"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "baseline: auto-resolved to" in out
+    assert "20260101_000000" in out
+    assert "20200101_000000" not in out.split("baseline: auto-resolved to")[1].split("\n")[0]
+
+    known_prior = {"review_report_20200101_000000.json", "review_report_20260101_000000.json"}
+    json_files = [f for f in os.listdir(out_dir)
+                  if f.startswith("review_report_") and f.endswith(".json")
+                  and f not in known_prior]
+    # exactly one NEW report file was written by this run (the two prior ones are excluded by
+    # name -- this identifies THIS run's own report without depending on wall-clock ordering).
+    assert len(json_files) == 1
+    with open(os.path.join(out_dir, json_files[0]), encoding="utf-8") as f:
+        report = json.load(f)
+    diff = report["baseline_diff"]
+    assert [f["title"] for f in diff["new"]] == ["new bug"]
+    assert [f["title"] for f in diff["regressed"] + diff["unchanged"]] == ["old bug"]
+    # "stale, should be ignored" from the OLDER report must never appear as resolved
+    assert "stale, should be ignored" not in [e.get("title") for e in diff["resolved"]]
+
+
+def test_cli_baseline_auto_with_fail_on_prints_local_iteration_caveat(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    findings_json = json.dumps(
+        [{"file": "a.py", "line": 1, "severity": "low", "title": "minor", "detail": "d"}],
+        ensure_ascii=False)
+    worker_text = (review_run.FINDINGS_BEGIN + "\n" + findings_json + "\n" +
+                   review_run.FINDINGS_END + "\nDONE")
+    status_payload = {"workers": [{"name": "w0", "display_result": worker_text, "transcript": ""}]}
+    monkeypatch.setattr(review_run, "run_fleet",
+                         _fake_run_fleet_two_pass_factory(repo, status_payload))
+
+    rc = main(["--kind", "review", "--group-size", "10", "--baseline", "auto",
+               "--fail-on", "high"])
+    assert rc == 0  # "minor"/low severity, threshold high -> no gate trip
+    out = capsys.readouterr().out
+    assert "pinned explicit --baseline PATH is recommended for CI gating" in out
+
+
+# --- --baseline / --write-baseline / --fail-on: without them, behavior is unchanged ----------
+
+def test_cli_without_baseline_flags_report_has_no_baseline_diff_key(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    findings_json = json.dumps(
+        [{"file": "a.py", "line": 1, "severity": "high", "title": "bad", "detail": "d"}],
+        ensure_ascii=False)
+    worker_text = (review_run.FINDINGS_BEGIN + "\n" + findings_json + "\n" +
+                   review_run.FINDINGS_END + "\nDONE")
+    status_payload = {"workers": [{"name": "w0", "display_result": worker_text, "transcript": ""}]}
+    monkeypatch.setattr(review_run, "run_fleet",
+                         _fake_run_fleet_factory(repo, status_payload))
+
+    rc = main(["--kind", "review", "--group-size", "10", "--no-refute"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # note: don't assert "baseline" not in out wholesale -- pytest's own tmp_path directory
+    # name is derived from this test's function name and can itself contain "baseline",
+    # which would appear in the printed report path regardless of this feature.
+    assert "baseline diff" not in out
+    assert "baseline written" not in out
+    assert "GATE:" not in out
+
+    out_dir = os.path.join(repo, ".fleet", "review")
+    json_files = [f for f in os.listdir(out_dir)
+                  if f.startswith("review_report_") and f.endswith(".json")]
+    with open(os.path.join(out_dir, json_files[0]), encoding="utf-8") as f:
+        report = json.load(f)
+    assert "baseline_diff" not in report
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
