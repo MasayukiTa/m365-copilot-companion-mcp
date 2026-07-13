@@ -286,6 +286,25 @@ from tools import tool_probe
 
 load_dotenv()
 
+def _p2c_review_enabled():
+    """Read the flag on demand so editing .env works even if the bridge is already running."""
+    try:
+        env_path = REPO / ".env"
+        if env_path.is_file():
+            for raw in env_path.read_text(encoding="utf-8-sig").splitlines():
+                line = raw.strip()
+                if line.startswith("MCP_REVIEW_P2C="):
+                    return line.split("=", 1)[1].strip() == "1"
+    except Exception:
+        pass
+    return os.environ.get("MCP_REVIEW_P2C", "0").strip() == "1"
+
+
+P2C_HELP_TEXT = (
+    "- `/review-2 [diff|<path>]` — P2c: 拒否時に同一タスクを新規会話で再試行し、二度拒否された作業だけを上限付きで分割。\n"
+    "- `/security-review-2 [diff|<path>]` — 同上、セキュリティ観点のP2cレビュー。\n"
+)
+
 # Main-chat prompt clamp. Kept in TWO separate parts on purpose:
 #   * STYLE  -- kill the impl agent's advisor/lecturer/ego persona (what the user hated).
 #   * EXECUTION -- but do NOT let "be concise" become "do the minimum and stop". The full fleet
@@ -313,7 +332,7 @@ HELP_TEXT = (
     "- `/analyze <ファイルの絶対パス> | <分析指示>` — アナリストにデータファイルを渡して分析（数値は鵜呑みにせず自分でも確かめて）。`/an` も同じ。\n"
     "- `/review [diff|<path>]` — 全ファイル（または diff／指定パス）をレビューし要約を返す（数分〜）。\n"
     "- `/security-review [diff|<path>]` — 同上、セキュリティ観点のレビュー。\n"
-    "- `/review-fix [high|verified]` — レビューの指摘を修正（2段階: まず計画表示→ /review-fix confirm で実行。"
+    + "- `/review-fix [high|verified]` — レビューの指摘を修正（2段階: まず計画表示→ /review-fix confirm で実行。"
     "ファイル編集あり・自動バックアップ＆ワンクリックundo付き）。\n\n"
     "### プロンプトテンプレート（このエージェントが即応答・通常ストリーム）\n"
     "- `/summarize <文章/トピック>` — 要点を箇条書きで簡潔に要約。\n"
@@ -332,6 +351,13 @@ HELP_TEXT = (
     "- `/help` — このヘルプ。`/?` `/commands` も同じ。\n\n"
     "それ以外の文は、そのまま Copilot エージェントに送られます。"
 )
+
+
+def _current_help_text():
+    if not _p2c_review_enabled():
+        return HELP_TEXT
+    marker = "- `/review-fix"
+    return HELP_TEXT.replace(marker, P2C_HELP_TEXT + marker, 1)
 
 # Slash commands that are pure prompt-templates: they transform the user's args
 # into a fully-written instruction and send it through the NORMAL streaming path,
@@ -2969,7 +2995,7 @@ class Handler(BaseHTTPRequestHandler):
         # normalise: case-insensitive, tolerate a missing leading slash
         token = head.lstrip("/")
         if token in ("help", "?", "commands"):
-            self._sse({"delta": HELP_TEXT}); self._sse({}, "done"); return
+            self._sse({"delta": _current_help_text()}); self._sse({}, "done"); return
         if token in ("research", "deepresearch", "dr"):
             self._delegate("researcher", arg); return
         if token in ("analyze", "an"):
@@ -2980,7 +3006,8 @@ class Handler(BaseHTTPRequestHandler):
             # /review peek there), which calls _review_fix_stream directly.
             self._review_fix_stream(cmd if cmd.startswith("/") else "/" + cmd)
             return
-        if token in ("review", "security-review", "securityreview"):
+        if token in ("review", "security-review", "securityreview", "review-2", "review2",
+                     "security-review-2", "securityreview-2", "securityreview2"):
             # Defensive fallback only: the normal entry point is do_GET's /stream peek,
             # which calls _review_stream directly (bypassing PAGE_LOCK) before ever reaching
             # _command. This branch only fires if some other caller routes a review command
@@ -3086,6 +3113,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             parsed = review_command.parse_review_command(msg)
+            if parsed.get("resilience") and not _p2c_review_enabled():
+                self._sse({"delta": (
+                    "P2cレビューは無効です。.env の MCP_REVIEW_P2C=1 に変更して "
+                    "start_all.bat を再実行すると /review-2 と /security-review-2 が使えます。"
+                )})
+                self._sse({}, "done")
+                return
             argv = review_command.build_review_argv(parsed, repo_root, venvpy)
 
             self._sse({"delta": "レビューを開始します（数分〜）...\n"})
