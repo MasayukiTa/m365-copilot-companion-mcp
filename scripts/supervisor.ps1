@@ -283,6 +283,16 @@ $tunnelMiss = 0
 $loggedIn = $null   # tri-state ($null unknown / $true / $false) -- log only on transition
 
 while ($true) {
+    # Clear phantom fleet runs whose coordinator process died without a supervisor restart
+    # (Invoke-FleetAutoResume above only runs once at supervisor startup, so a mid-session
+    # coordinator kill/crash would otherwise leave .fleet/status.json stuck showing
+    # running=true forever). Best-effort, idempotent, never relaunches anything -- see
+    # relay/fleet_reaper.py.
+    try {
+        $reapOut = & $Py -c "import sys; sys.path.insert(0, r'$Root'); from relay.fleet_reaper import reap_stale_run; import json; r = reap_stale_run(); print(json.dumps(r) if r else '')" 2>$null
+        if ($reapOut) { Write-Log "reaped stale fleet run: $reapOut" }
+    } catch { }
+
     if (Test-ServerUp) {
         $serverMiss = 0
     } else {

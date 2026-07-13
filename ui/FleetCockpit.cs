@@ -2925,6 +2925,30 @@ class CockpitWindow : Window
     // line-based reader (incident: a multi-line review prompt split into 53 nonsense goals).
     // Returns true if the process started. `goalsFileName` lets callers use a distinct file so a
     // retry spawn never clobbers the manual Start input file (or vice-versa).
+    // Fire-and-forget: shell out to relay.fleet_reaper.reap_stale_run() so a phantom run's
+    // status.json/history.json/fleet_run_active.json get finalized to a clean cancelled state,
+    // not just the cockpit's in-memory view (see ArchiveAllStale's call site above). Mirrors
+    // SpawnFleet's ProcessStartInfo shape. Never blocks the UI thread, never throws.
+    void ReapStaleFleetRun()
+    {
+        try
+        {
+            string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+            string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+            if (!File.Exists(py)) py = "python";
+
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = py;
+            psi.Arguments = "-c \"from relay.fleet_reaper import reap_stale_run; reap_stale_run()\"";
+            psi.WorkingDirectory = repo;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+            System.Diagnostics.Process.Start(psi);
+        }
+        catch (Exception) { }
+    }
+
     bool SpawnFleet(List<string> goals, string goalsFileName, bool planMode = false)
     {
         string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
@@ -4629,7 +4653,14 @@ class CockpitWindow : Window
             if (_lastRoot != null
                 && (!_lastRoot.ContainsKey("running") || Convert.ToBoolean(_lastRoot["running"]))
                 && (NowUnix() - Dbl(_lastRoot, "updated")) > 8)
+            {
                 ArchiveAllStale();
+                // ArchiveAllStale only edits the LOCAL _history/_hiddenKeys lists (history.json /
+                // cockpit_hidden.json) -- it never touches status.json or fleet_run_active.json, so
+                // a fresh cockpit launch (or any other reader) would still see the phantom
+                // running=true. Finalize the actual sidecars too. See relay/fleet_reaper.py.
+                ReapStaleFleetRun();
+            }
         };
         group.Children.Add(_stopBtn);
 
