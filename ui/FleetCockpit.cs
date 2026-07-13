@@ -2804,7 +2804,10 @@ class CockpitWindow : Window
     // (instead of writing an add_goal that nothing alive would ever consume). The agent URL is
     // NOT passed -- the runner resolves it from MCP_FLEET_AGENT_URL / .env, exactly as a manual
     // Start does -- and --state-dir is the same .fleet dir this cockpit tails, so the relaunched
-    // run shows up live here. Goals are handed over via a UTF-8 file to dodge arg-encoding issues.
+    // run shows up live here. Goals are handed over via a UTF-8 file, written as JSONL (one JSON
+    // object per line -- see GoalsToJsonl) so a goal string containing embedded newlines survives
+    // as a SINGLE goal instead of being shredded one-line-per-fragment by fleet_runner's
+    // line-based reader (incident: a multi-line review prompt split into 53 nonsense goals).
     // Returns true if the process started. `goalsFileName` lets callers use a distinct file so a
     // retry spawn never clobbers the manual Start input file (or vice-versa).
     bool SpawnFleet(List<string> goals, string goalsFileName, bool planMode = false)
@@ -2814,7 +2817,7 @@ class CockpitWindow : Window
         if (!File.Exists(py)) py = "python";
         string stateDir = Path.GetDirectoryName(_statusPath);
         string goalsFile = Path.Combine(stateDir, goalsFileName);
-        File.WriteAllText(goalsFile, string.Join("\n", goals.ToArray()) + "\n", new UTF8Encoding(false));
+        File.WriteAllText(goalsFile, GoalsToJsonl(goals), new UTF8Encoding(false));
 
         var psi = new System.Diagnostics.ProcessStartInfo();
         psi.FileName = py;
@@ -2827,6 +2830,45 @@ class CockpitWindow : Window
         try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
         System.Diagnostics.Process.Start(psi);
         return true;
+    }
+
+    // Render a goals list as the JSONL text SpawnFleet writes to its goals-file: one JSON object
+    // per physical line, `{"text":"<goal, JSON-escaped>"}`. Using JavaScriptSerializer (already
+    // used elsewhere in this file, e.g. the continuation-goal encoding below) guarantees proper
+    // escaping of embedded newlines/quotes/backslashes/control chars, so a multi-line goal string
+    // round-trips as ONE goal instead of one bogus goal per source line (fleet_runner._read_goals
+    // splits a plain-text goals-file on newlines).
+    //
+    // A goal that is ALREADY a serialized JSON object (callers that need extra keys beyond "text",
+    // e.g. the "続ける"/Continue flow's {"text":...,"resume_conv":...}) is detected and passed
+    // through UNCHANGED rather than being wrapped a second time -- double-wrapping would bury the
+    // real text/resume_conv keys inside an opaque string and fleet_runner would lose resume_conv.
+    string GoalsToJsonl(List<string> goals)
+    {
+        var sb = new StringBuilder();
+        foreach (string g in (goals ?? new List<string>()))
+        {
+            string trimmed = (g ?? "").Trim();
+            string line = null;
+            if (trimmed.StartsWith("{"))
+            {
+                try
+                {
+                    var parsed = _js.DeserializeObject(trimmed) as Dictionary<string, object>;
+                    if (parsed != null) line = trimmed; // already a valid JSON-object goal; pass through as-is
+                }
+                catch (Exception) { line = null; }
+            }
+            if (line == null)
+            {
+                var gd = new Dictionary<string, object>();
+                gd["text"] = g ?? "";
+                line = _js.Serialize(gd);
+            }
+            sb.Append(line);
+            sb.Append("\n");
+        }
+        return sb.ToString();
     }
 
     // P2 RESUME: spawn a fresh fleet with --resume (re-queues the unfinished goals from the durable
@@ -6892,16 +6934,23 @@ class CockpitWindow : Window
                 string fu = PromptFollowup();
                 if (string.IsNullOrEmpty(fu)) return;
                 string goalText = BuildContinueGoal(contPrior, fu);
-                // The continuation goal is MULTI-LINE; SpawnFleet writes one goal per line and
-                // fleet_runner reads one goal PER LINE, so a plain multi-line string would be split
-                // into several broken goals. ALWAYS serialize as a SINGLE JSON object line (parsed
-                // back into one dict goal). resume_conv is added only when a conv URL exists.
-                var gd = new Dictionary<string, object>();
-                gd["text"] = goalText;
-                if (!string.IsNullOrEmpty(contConv)) gd["resume_conv"] = contConv;
-                string line = _js.Serialize(gd);
+                // The continuation goal is MULTI-LINE; SpawnFleet's GoalsToJsonl now escapes a
+                // plain multi-line goal string safely on its own, so no manual serialization is
+                // needed for the common case. Only pre-serialize here when there's an EXTRA key
+                // beyond "text" to carry (resume_conv) -- GoalsToJsonl detects an already-JSON
+                // goal string and passes it through as-is instead of double-wrapping it.
                 var glist = new List<string>();
-                glist.Add(line);
+                if (!string.IsNullOrEmpty(contConv))
+                {
+                    var gd = new Dictionary<string, object>();
+                    gd["text"] = goalText;
+                    gd["resume_conv"] = contConv;
+                    glist.Add(_js.Serialize(gd));
+                }
+                else
+                {
+                    glist.Add(goalText);
+                }
                 SpawnFleet(glist, "continue_input.txt");
                 if (_startNote != null)
                 {
@@ -8188,7 +8237,8 @@ class CockpitWindow : Window
     // SteerRow (割り込み). A done worker is terminal and can't take a steer, so instead of injecting
     // into a live worker this launches a FRESH continuation: BuildContinueGoal prepends the prior
     // goal + "re-read your on-disk outputs" so the agent recovers context, then runs the follow-up.
-    // Serialized as ONE JSON line (the prefix is multi-line; fleet_runner reads one goal per line).
+    // Written as ONE JSONL line by SpawnFleet's GoalsToJsonl (the prefix is multi-line; a plain
+    // multi-line string would otherwise be split one bogus goal per source line).
     // No RunIsLive gate -- a continuation starts its own run.
     UIElement ContinueRow(string name, string goal, string conv)
     {
@@ -8246,11 +8296,21 @@ class CockpitWindow : Window
             string t = (tb.Text ?? "").Trim();
             if (t.Length == 0) return false;
             string goalText = BuildContinueGoal(g, t);
-            var gd = new Dictionary<string, object>();
-            gd["text"] = goalText;
-            if (!string.IsNullOrEmpty(c)) gd["resume_conv"] = c;
+            // SpawnFleet's GoalsToJsonl escapes a plain multi-line goal string safely on its
+            // own; only pre-serialize here to carry the EXTRA resume_conv key (GoalsToJsonl
+            // detects an already-JSON goal string and passes it through as-is).
             var glist = new List<string>();
-            glist.Add(_js.Serialize(gd));
+            if (!string.IsNullOrEmpty(c))
+            {
+                var gd = new Dictionary<string, object>();
+                gd["text"] = goalText;
+                gd["resume_conv"] = c;
+                glist.Add(_js.Serialize(gd));
+            }
+            else
+            {
+                glist.Add(goalText);
+            }
             SpawnFleet(glist, "continue_input.txt");
             tb.Text = "";
             note.Text = _lang == 0 ? "続きを開始しました" : "Continuation started";
