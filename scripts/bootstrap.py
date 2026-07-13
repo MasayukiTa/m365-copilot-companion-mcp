@@ -59,8 +59,8 @@ DEFAULT_TUNNEL_NAME = "m365-copilot-companion"
 # here; only its hash is, so this file cannot itself leak it. Hashing is over the UTF-8
 # bytes of the lowercased input, hex-encoded lowercase. Mirrors setup_devtunnel.ps1's
 # Test-IdentifyingTunnelName -- keep both in sync.
-TOKEN_SHA256 = "2a0341296bb96dc7d205036f9f693427809772f6136a46f58b04a1c492de9e04"
-FULLNAME_SHA256 = "5ba174b8e87faf4e8106e36a7cf5a901bbec3435d01fbd56914c2b0346858261"
+TOKEN_SHA256 = "2a0341296bb96dc7d205036f9f693427809772f6136a46f58b04a1c492de9e04"  # gitleaks:allow
+FULLNAME_SHA256 = "5ba174b8e87faf4e8106e36a7cf5a901bbec3435d01fbd56914c2b0346858261"  # gitleaks:allow
 
 
 def _sha256_hex(s: str) -> str:

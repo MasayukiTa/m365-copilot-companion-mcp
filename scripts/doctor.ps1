@@ -184,8 +184,8 @@ TunnelCheck "tunnel_exists" "Dev Tunnel exists (MCP_TUNNEL_NAME)" `
 # to the GLOBAL devtunnels.ms namespace. Mirrors Test-IdentifyingTunnelName in
 # setup_devtunnel.ps1 and _is_identifying_tunnel_name in bootstrap.py -- keep all three
 # in sync.
-$TOKEN_SHA256 = "2a0341296bb96dc7d205036f9f693427809772f6136a46f58b04a1c492de9e04"
-$FULLNAME_SHA256 = "5ba174b8e87faf4e8106e36a7cf5a901bbec3435d01fbd56914c2b0346858261"
+$TOKEN_SHA256 = "2a0341296bb96dc7d205036f9f693427809772f6136a46f58b04a1c492de9e04"  # gitleaks:allow
+$FULLNAME_SHA256 = "5ba174b8e87faf4e8106e36a7cf5a901bbec3435d01fbd56914c2b0346858261"  # gitleaks:allow
 function Get-Sha256HexDoctor([string]$s) {
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
     try {
