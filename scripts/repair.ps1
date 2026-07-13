@@ -65,6 +65,13 @@
 #                the real doctor.ps1. When set, the real doctor is never invoked,
 #                and the run is always exactly one pass (a canned snapshot cannot
 #                be "re-checked" -- there is no live system behind it to change).
+#   -ResultJson : in addition to the normal human-readable output on every other
+#                line, emit ONE compact JSON object as the LAST stdout line:
+#                { autofixed: [{id,note}], confirmNeeded: [{id,note}],
+#                  humanSteps: [{id,step}], finalOk: <int>, finalBad: <int> }
+#                so a caller (e.g. a cockpit UI) can read just that last line to
+#                learn what got fixed, what still needs confirmation, and what
+#                manual steps remain, without scraping the colored text above it.
 #
 # SAFETY
 #   - repair.ps1 is the ONLY script here that mutates anything; doctor.ps1 never
@@ -81,7 +88,8 @@ param(
     [switch]$Yes,
     [Parameter()]
     [Alias('MockJson')]
-    [string]$JsonInput
+    [string]$JsonInput,
+    [switch]$ResultJson
 )
 
 $ErrorActionPreference = "Continue"
@@ -192,6 +200,9 @@ function Invoke-RepairPass([array]$failing) {
     $needsHuman   = @()   # Tier C ids (human_step text)
     $declined     = @()   # Tier B ids the user said no to (or -Auto skipped)
     $noRegistry   = @()   # ids with no registry entry at all
+    $wouldFix     = @()   # Tier A/B ids identified under -DryRun (nothing actually ran) --
+                           # only consumed by -ResultJson so a -DryRun test run still shows
+                           # what the dispatcher WOULD do, without claiming it ran anything
     $anyActionRan = $false
 
     foreach ($chk in $failing) {
@@ -232,6 +243,7 @@ function Invoke-RepairPass([array]$failing) {
             if ($DryRun) {
                 Write-Host "      DRY RUN -- not executed." -ForegroundColor DarkGray
                 $ranKeys[$key] = $false
+                $wouldFix += $id
                 continue
             }
             $ok = Invoke-RepairCommand $entry.Cmd
@@ -249,6 +261,7 @@ function Invoke-RepairPass([array]$failing) {
             if ($DryRun) {
                 Write-Host "      DRY RUN -- would prompt for confirmation, not executed." -ForegroundColor DarkGray
                 $ranKeys[$key] = $false
+                $wouldFix += $id
                 continue
             }
             if ($Auto -and -not $Yes) {
@@ -281,6 +294,7 @@ function Invoke-RepairPass([array]$failing) {
         NeedsHuman   = $needsHuman
         Declined     = $declined
         NoRegistry   = $noRegistry
+        WouldFix     = $wouldFix
         AnyActionRan = $anyActionRan
     }
 }
@@ -305,6 +319,7 @@ $allHuman = @()
 $allDeclined = @()
 $allNoRegistry = @()
 $allFixed = @()
+$allWouldFix = @()
 $lastResults = $null
 
 while ($true) {
@@ -330,6 +345,7 @@ while ($true) {
     $allDeclined   += $passResult.Declined
     $allNoRegistry += $passResult.NoRegistry
     $allFixed      += $passResult.AutoFixed
+    $allWouldFix   += $passResult.WouldFix
 
     # -DryRun and -JsonInput are both single-pass by design: -DryRun changes
     # nothing to re-check, and -JsonInput has no live system behind it to re-poll.
@@ -389,3 +405,50 @@ if ($lastResults) {
     Write-Host ("  Final doctor tally: " + $finalOk + " OK, " + $finalBad + " need attention.") -ForegroundColor $(if ($finalBad -eq 0) { "Green" } else { "Yellow" })
 }
 Write-Host ""
+
+# -----------------------------------------------------------------------------
+# -ResultJson: machine-readable summary for a caller (e.g. a cockpit UI) that
+# only wants the outcome, not the colored text above. Emitted as the ABSOLUTE
+# LAST stdout line -- nothing prints after this. Under -DryRun there is nothing
+# "actually fixed" to report (see Invoke-RepairPass), so Tier A/B ids identified
+# during the preview are folded into "autofixed" too (their note is suffixed to
+# say so) -- this is what lets a -DryRun -MockJson test run exercise the full
+# shape of this JSON without ever executing a repair command for real.
+# -----------------------------------------------------------------------------
+if ($ResultJson) {
+    $autofixedIds = if ($DryRun) { @($allFixed) + @($allWouldFix) } else { @($allFixed) }
+    $autofixedOut = @(
+        $autofixedIds | Select-Object -Unique | ForEach-Object {
+            $rid = $_
+            $baseNote = if ($Registry.ContainsKey($rid)) { $Registry[$rid].Note } else { "" }
+            $note = if ($DryRun) { ($baseNote + " (DRY RUN -- not executed)") } else { $baseNote }
+            [PSCustomObject]@{ id = $rid; note = $note }
+        }
+    )
+    $confirmNeededOut = @(
+        $allDeclined | Select-Object -Unique -Property id | ForEach-Object {
+            $rid = $_.id
+            $note = if ($Registry.ContainsKey($rid)) { $Registry[$rid].Note } else { "" }
+            [PSCustomObject]@{ id = $rid; note = $note }
+        }
+    )
+    $humanStepsOut = @(
+        $allHuman | Select-Object -Unique -Property id, step | ForEach-Object {
+            [PSCustomObject]@{ id = $_.id; step = $_.step }
+        }
+    )
+    $finalOkOut = 0
+    $finalBadOut = 0
+    if ($lastResults) {
+        $finalOkOut  = @($lastResults | Where-Object { $_.ok }).Count
+        $finalBadOut = @($lastResults | Where-Object { -not $_.ok -and -not $_.skipped -and -not $_.info }).Count
+    }
+    $resultObj = [PSCustomObject]@{
+        autofixed     = $autofixedOut
+        confirmNeeded = $confirmNeededOut
+        humanSteps    = $humanStepsOut
+        finalOk       = $finalOkOut
+        finalBad      = $finalBadOut
+    }
+    Write-Output (ConvertTo-Json -InputObject $resultObj -Compress -Depth 5)
+}
