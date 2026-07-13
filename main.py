@@ -176,7 +176,11 @@ mcp = FastMCP(
         "user's home profile, not the server's working directory. If a file or folder "
         "seems missing, use find_files (recursive name search) before concluding it is "
         "absent, and never claim a path is outside the allowed base unless a tool call "
-        "actually returned that error."
+        "actually returned that error. "
+        "Persistent memory: when durable knowledge emerges (procedures, data sources, "
+        "format templates, decisions, or facts) or the user says to remember it (e.g., "
+        "\"刻んで\"), call agent_memory_save via call_tool to persist it; before "
+        "re-deriving, search prior entries with agent_memory_search or agent_memory_list."
     ),
 )
 
