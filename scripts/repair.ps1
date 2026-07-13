@@ -112,11 +112,13 @@ $edgeCompanionCmd   = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$sc
 $edgeBridgeCmd      = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$scriptDir\start_bridge.ps1`" -Keepalive"
 $tunnelCliCmd       = "winget install Microsoft.devtunnel"
 $tunnelSetupCmd     = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$scriptDir\setup_devtunnel.ps1`""
+$tunnelHealCmd      = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$scriptDir\heal_tunnel.ps1`""
 $uiRebuildCmd       = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$repo\ui\rebuild_ui.ps1`" -NoLaunch"
 
 $Registry = @{
     server_up       = @{ Tier = 'A'; Key = 'stack_start';    Cmd = $stackStartCmd;   Note = 'starts the MCP server (via supervisor.ps1, hosted by start_all.ps1)' }
     tunnel_serving  = @{ Tier = 'A'; Key = 'stack_start';    Cmd = $stackStartCmd;   Note = 'same stack start as server_up -- the supervisor also hosts the Dev Tunnel' }
+    tunnel_owned    = @{ Tier = 'A'; Key = 'tunnel_heal';    Cmd = $tunnelHealCmd;   Note = 'repoints MCP_TUNNEL_NAME to a tunnel this account owns (URL-preserving when possible; safe to auto-run)' }
     edge_companion  = @{ Tier = 'A'; Key = 'edge_companion'; Cmd = $edgeCompanionCmd; Note = 'launches the dedicated companion Edge (:9222)' }
     edge_bridge     = @{ Tier = 'A'; Key = 'edge_bridge';    Cmd = $edgeBridgeCmd;   Note = 'optional -- only run because edge_bridge actually failed' }
 
