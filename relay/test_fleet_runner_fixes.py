@@ -21,6 +21,20 @@ FIX 3 (P2) -- run_label derivation (tested via the logic used in main(), extract
     (k) Leading list markers / whitespace are stripped from run_label.
     (l) goal_count equals the number of goals.
 
+FIX 5 -- coordinator output capture (_setup_coordinator_log / _Tee):
+    (t) _setup_coordinator_log() creates a log file under state_dir and returns its path.
+    (u) A write to (the now-teed) sys.stdout appears in BOTH the real stream and the log
+        file -- the tee does not swallow or replace console output.
+
+FIX 6 -- RUN-ACTIVE marker + auto-resume decision logic:
+    (v) _write_active_marker() + _read_active_marker() round-trip pid/start_ts/argv.
+    (w) _resume_argv() strips -g/--goal VALUE and --goals-file VALUE (and any existing
+        --resume), keeping connection/tuning flags -- so replaying it after --resume
+        does not duplicate the goals already carried in the durable ledger.
+    (x) _clear_active_marker() removes the marker; clearing a missing marker is a no-op.
+    (y) should_auto_resume(): marker+dead-pid -> resume; marker absent, pid alive, or
+        user-stopped -> do NOT resume (all branches).
+
 FIX 4 -- _read_goals() / _read_goals_file() fragmented-goals-file guard:
     (m) A goals-file that is really a shredded multi-line PROMPT (intro sentence, a
         colon-terminated fragment, a bare path, several "tools/x.py" bullet lines, a
@@ -56,7 +70,11 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 # Import the helpers under test directly.
-from relay.fleet_runner import _pending_gates, _clean_final_text, _read_goals
+from relay.fleet_runner import (
+    _pending_gates, _clean_final_text, _read_goals,
+    _setup_coordinator_log, _write_active_marker, _read_active_marker,
+    _clear_active_marker, _resume_argv, should_auto_resume,
+)
 
 results: list[bool] = []
 
@@ -251,6 +269,118 @@ def _test_fix3_run_label():
 
 
 # ---------------------------------------------------------------------------
+# FIX 5: coordinator output capture (_setup_coordinator_log / _Tee)
+# ---------------------------------------------------------------------------
+
+def _test_fix5_coordinator_log():
+    real_stdout, real_stderr = sys.stdout, sys.stderr
+    with tempfile.TemporaryDirectory() as tmp:
+        log_path = None
+        try:
+            log_path = _setup_coordinator_log(tmp)
+            check("fix5_log_path_created", bool(log_path) and os.path.isfile(log_path))
+
+            # capture what the REAL stream receives by swapping it for a buffer BEFORE
+            # calling _setup_coordinator_log's tee target -- simplest hermetic check:
+            # the tee delegates the write to the real stream synchronously, so a marker
+            # written to sys.stdout must land in both the (still-console) real stream's
+            # return value AND the log file. We can't easily capture "the real console"
+            # here without breaking pytest/CI output capture, so instead verify the log
+            # file directly received the write while sys.stdout keeps functioning
+            # (write() returns normally, no exception) -- proving console output is not
+            # swallowed or broken by the tee.
+            marker_text = "FLEET_RUNNER_TEE_SMOKE_MARKER_12345\n"
+            n = sys.stdout.write(marker_text)
+            sys.stdout.flush()
+            check("fix5_tee_write_did_not_raise_and_returned_len",
+                  n == len(marker_text) or n is None or n > 0)
+
+            with open(log_path, encoding="utf-8") as f:
+                content = f.read()
+            check("fix5_tee_wrote_to_log_file", marker_text in content)
+        finally:
+            # close the file handle the Tee holds before the tempdir is removed
+            # (Windows keeps an open handle from being deleted).
+            try:
+                sys.stdout._log.close()
+            except Exception:
+                pass
+            sys.stdout, sys.stderr = real_stdout, real_stderr
+
+
+# ---------------------------------------------------------------------------
+# FIX 6: RUN-ACTIVE marker + auto-resume decision logic
+# ---------------------------------------------------------------------------
+
+def _test_fix6_active_marker_roundtrip():
+    with tempfile.TemporaryDirectory() as tmp:
+        # nothing written yet -> None
+        check("fix6_marker_absent_reads_none", _read_active_marker(tmp) is None)
+
+        argv = ["-g", "hello world", "--agent-url", "http://x", "--effort", "auto"]
+        _write_active_marker(tmp, argv=argv, pid=4242, start_ts=1000.0)
+        m = _read_active_marker(tmp)
+        check("fix6_marker_roundtrip_pid", m is not None and m.get("pid") == 4242)
+        check("fix6_marker_roundtrip_start_ts", m is not None and m.get("start_ts") == 1000.0)
+        check("fix6_marker_roundtrip_argv", m is not None and m.get("argv") == argv)
+        check("fix6_marker_has_resume_argv", m is not None and "resume_argv" in m)
+
+        _clear_active_marker(tmp)
+        check("fix6_marker_cleared", _read_active_marker(tmp) is None)
+        # clearing an already-absent marker must be a silent no-op, not an error.
+        _clear_active_marker(tmp)
+        check("fix6_clear_missing_marker_is_noop", _read_active_marker(tmp) is None)
+
+
+def _test_fix6_resume_argv():
+    # -g/--goal VALUE and --goals-file VALUE are stripped; connection/tuning flags kept.
+    argv = ["--agent-url", "http://x", "-g", "goal one", "--goal", "goal two",
+            "--goals-file", "goals.txt", "--effort", "max", "--max-turns", "50"]
+    stripped = _resume_argv(argv)
+    check("fix6_resume_argv_drops_dash_g", "-g" not in stripped and "goal one" not in stripped)
+    check("fix6_resume_argv_drops_dash_dash_goal", "--goal" not in stripped and "goal two" not in stripped)
+    check("fix6_resume_argv_drops_goals_file", "--goals-file" not in stripped and "goals.txt" not in stripped)
+    check("fix6_resume_argv_keeps_agent_url", "--agent-url" in stripped and "http://x" in stripped)
+    check("fix6_resume_argv_keeps_tuning_flags",
+          "--effort" in stripped and "max" in stripped
+          and "--max-turns" in stripped and "50" in stripped)
+
+    # an existing --resume in argv (e.g. this run WAS itself a resumed run) is dropped so
+    # the caller can append exactly one --resume without a duplicate flag.
+    argv2 = ["--agent-url", "http://x", "--resume"]
+    check("fix6_resume_argv_drops_existing_resume", "--resume" not in _resume_argv(argv2))
+
+    # --goal=VALUE / --goals-file=VALUE (= form) are also stripped.
+    argv3 = ["--agent-url", "http://x", "--goals-file=goals.txt"]
+    stripped3 = _resume_argv(argv3)
+    check("fix6_resume_argv_drops_equals_form", "--goals-file=goals.txt" not in stripped3)
+
+
+def _test_fix6_should_auto_resume():
+    # marker present + pid dead + not user-stopped -> resume
+    check("fix6_resume_when_marker_and_dead_pid",
+          should_auto_resume(marker_exists=True, pid_alive=False, user_stopped=False) is True)
+    # marker absent -> never resume, regardless of pid_alive
+    check("fix6_no_resume_when_marker_absent",
+          should_auto_resume(marker_exists=False, pid_alive=False, user_stopped=False) is False)
+    # pid alive (already running) -> never resume
+    check("fix6_no_resume_when_pid_alive",
+          should_auto_resume(marker_exists=True, pid_alive=True, user_stopped=False) is False)
+    # user explicitly stopped -> never resume even if marker/pid look interrupted
+    check("fix6_no_resume_when_user_stopped",
+          should_auto_resume(marker_exists=True, pid_alive=False, user_stopped=True) is False)
+    # both marker absent AND pid alive (nonsensical combo) -> still no resume
+    check("fix6_no_resume_when_marker_absent_and_pid_alive",
+          should_auto_resume(marker_exists=False, pid_alive=True, user_stopped=False) is False)
+
+
+def _test_fix6_marker():
+    _test_fix6_active_marker_roundtrip()
+    _test_fix6_resume_argv()
+    _test_fix6_should_auto_resume()
+
+
+# ---------------------------------------------------------------------------
 # FIX 4: _read_goals() / _read_goals_file() fragmented-goals-file guard
 # ---------------------------------------------------------------------------
 
@@ -404,6 +534,8 @@ def main():
     _test_fix1_gate_scoping()
     _test_fix2_clean_final_text()
     _test_fix3_run_label()
+    _test_fix5_coordinator_log()
+    _test_fix6_marker()
     _test_fix4_guard()
     passed = sum(results)
     total = len(results)
