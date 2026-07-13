@@ -1,4 +1,4 @@
-fastmcp>=2.0,<3.0
+fastmcp>=3.4.4,<4.0
 # httpx + anyio are imported DIRECTLY by our code (tools/web_ops.py, tools/diagram_ops.py,
 # tools/registry.py). They are also transitive deps of fastmcp/mcp today, but we declare
 # them explicitly so a future framework change that drops them cannot break a fresh install.
