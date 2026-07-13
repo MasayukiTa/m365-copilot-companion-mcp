@@ -608,6 +608,97 @@ def build_behavioral_verify_goal(finding):
     )
 
 
+# --- P3 piece B: completeness critic --------------------------------------------------------
+# After a review round completes, this goal asks a FRESH worker to look at what has been
+# covered so far (which REVIEW_DIMENSIONS keys ran, which files were examined, and the current
+# findings list) and report what's MISSING: an un-run dimension, an unexamined file/area, or a
+# current finding whose claim is asserted but not actually verified. Built ONLY through
+# CLEAR_FRAMING_PREAMBLE + a plain rubric string below -- this function never reads, copies, or
+# string-matches the preamble's own contents, so a future rewrite of CLEAR_FRAMING_PREAMBLE
+# (see the module-level warning above it) stays entirely localized and cannot break this goal
+# builder or bench/review_run.py's loop-until-dry orchestration that consumes it.
+#
+# Emits its OWN small delimiter-fenced JSON object (GAPS_BEGIN/GAPS_END), parsed in exactly one
+# place: bench.review_run.parse_completeness_gaps. Deliberately a fourth distinct contract from
+# <<<FINDINGS>>>, the REFUTED/UPHELD text block, and the BEHAVIOR_VERDICT block above -- a
+# completeness-critic worker is not hunting for new findings (that's the next round's job) and
+# not arguing about one finding (that's the refuter's job); it is auditing COVERAGE.
+GAPS_BEGIN = "<<<GAPS>>>"
+GAPS_END = "<<<END_GAPS>>>"
+
+_COMPLETENESS_RUBRIC = (
+    "あなたはこのリポジトリのレビューが十分に網羅的か検証する「完全性チェック」だけを担当します。"
+    "新しい指摘を探す必要はありません。\n"
+    "対象リポジトリ（このPCのローカル、git チェックアウト済み）:\n"
+    "  {FILE_LIST_CWD}\n\n"
+    "これまでに実行されたレビュー観点(dimension)一覧:\n"
+    "{DIMENSIONS_RUN}\n\n"
+    "これまでにレビュー対象となったファイル一覧:\n"
+    "{FILES_COVERED}\n\n"
+    "現在までに得られている指摘一覧（file:line:title のみ、詳細は省略）:\n"
+    "{FINDINGS_SUMMARY}\n\n"
+    "次の3点を、必要であれば実際にファイルツール（read_file / grep 等）で確認したうえで"
+    "報告してください:\n"
+    "1) 上記でまだ実行されていないレビュー観点(dimension)のうち、追加で実施すべきものが"
+    "あるか。\n"
+    "2) 上記でまだ調べられていないファイル・領域のうち、追加でレビューすべきものが"
+    "あるか。\n"
+    "3) 現在の指摘一覧の中に、主張されているだけで実際には検証されていない(未確認の)ものが"
+    "あるか。\n\n"
+)
+
+_GAPS_SPEC = (
+    "作業の最後に、次の形式で結果をJSON1個として出力してください（これは他のゴールで使われる"
+    "指摘一覧のJSON配列ブロックとは別物です。混同しないこと）:\n\n"
+    + GAPS_BEGIN + "\n"
+    '{"missing_dimensions": ["dimension_key", ...], '
+    '"missing_files": ["path/to/file.py", ...], '
+    '"unverified_claims": ["finding title等の短い説明", ...]}\n'
+    + GAPS_END + "\n\n"
+    "不足が無い項目は空配列 [] にしてください。\n"
+    "このブロックを出力した後、最後に DONE と書いて終了してください。"
+)
+
+
+def build_completeness_goal(dimensions_run, files_covered, findings_so_far, repo_root):
+    """Build one fleet goal dict {"text": str, "cwd": repo_root} (P3 piece B) that asks a
+    fresh worker to audit COVERAGE (not hunt new findings): which REVIEW_DIMENSIONS keys have
+    already run (`dimensions_run`, a list of key strings), which files have already been
+    examined (`files_covered`, a list of repo-relative path strings), and a compact summary of
+    the findings accumulated so far (`findings_so_far`, a list of finding dicts -- only
+    file/line/title are ever included in the prompt, never the full "detail", to keep this
+    goal small).
+
+    Built ONLY through CLEAR_FRAMING_PREAMBLE (imported, prepended as-is) + a plain rubric
+    string local to this function -- never reads, copies, or string-matches the preamble's own
+    contents, so a future rewrite of CLEAR_FRAMING_PREAMBLE cannot break this function.
+
+    Emits the GAPS_BEGIN/GAPS_END contract (see module comment above), parsed by
+    bench.review_run.parse_completeness_gaps -- NOT the <<<FINDINGS>>> contract."""
+    dims_text = "\n".join("- " + str(d) for d in dimensions_run) if dimensions_run else "(none)"
+    files_text = "\n".join("- " + str(f) for f in files_covered) if files_covered else "(none)"
+
+    finding_lines = []
+    for f in (findings_so_far or []):
+        if not isinstance(f, dict):
+            continue
+        file_ = f.get("file") or "?"
+        line = f.get("line")
+        line_s = str(line) if line is not None else "?"
+        title = f.get("title") or ""
+        finding_lines.append("- %s:%s %s" % (file_, line_s, title))
+    findings_text = "\n".join(finding_lines) if finding_lines else "(none)"
+
+    text = CLEAR_FRAMING_PREAMBLE + _COMPLETENESS_RUBRIC.replace(
+        "{FILE_LIST_CWD}", repo_root).replace(
+        "{DIMENSIONS_RUN}", dims_text).replace(
+        "{FILES_COVERED}", files_text).replace(
+        "{FINDINGS_SUMMARY}", findings_text)
+    text += _GAPS_SPEC
+
+    return {"text": text, "cwd": repo_root}
+
+
 # --- FIX goal builder ---------------------------------------------------------------------
 # Takes findings already produced by a review run (bench/review_aggregate.aggregate) and asks
 # a fresh fleet worker to FIX them -- edit-with-file-tools, mirroring bench/swe_build_goals.py's

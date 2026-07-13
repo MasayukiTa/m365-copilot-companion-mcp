@@ -445,6 +445,40 @@ def render_markdown(agg):
     dims_covered = agg.get("dimensions_covered")
     if dims_covered:
         lines.append("- dimensions covered: %s" % ", ".join(dims_covered))
+
+    # P3 piece C: loop-until-dry + completeness-critic metadata. Purely additive -- both keys
+    # are absent from `agg` unless bench.review_run.py's --loop/--completeness were actually
+    # used, so a report built without P3 renders byte-identical to before P3 existed.
+    loop_meta = agg.get("loop_meta")
+    if loop_meta:
+        lines.append("- loop: %d/%d round(s) run, stopped: %s" %
+                     (loop_meta.get("rounds_run", 0), loop_meta.get("max_rounds", 0),
+                      loop_meta.get("stopped_reason", "?")))
+        if loop_meta.get("stopped_reason") == "max_rounds":
+            lines.append("  NOTE: stopped because the max-rounds cap was reached, NOT because "
+                         "findings went dry -- rounds may remain; re-run with a higher "
+                         "--max-rounds to keep looking.")
+        lines.append("- loop: %d unique finding(s) accumulated across all rounds" %
+                     loop_meta.get("unique_findings", 0))
+
+    gaps = agg.get("completeness_gaps")
+    if gaps:
+        missing_dims = gaps.get("missing_dimensions") or []
+        missing_files = gaps.get("missing_files") or []
+        unverified = gaps.get("unverified_claims") or []
+        if missing_dims or missing_files or unverified:
+            lines.append("- completeness critic:")
+            if missing_dims:
+                lines.append("  missing dimensions: %s" % ", ".join(missing_dims))
+            if missing_files:
+                lines.append("  missing files/areas: %s" % ", ".join(missing_files))
+            if unverified:
+                lines.append("  unverified claims:")
+                for c in unverified:
+                    lines.append("    - %s" % c)
+        else:
+            lines.append("- completeness critic: no gaps identified")
+
     lines.append("")
 
     by_severity = agg.get("by_severity", {})

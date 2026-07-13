@@ -19,10 +19,13 @@ from bench.review_build_goals import (
     CLEAR_FRAMING_PREAMBLE,
     FINDINGS_BEGIN,
     FINDINGS_END,
+    GAPS_BEGIN,
+    GAPS_END,
     REVIEW_DIMENSIONS,
     REVIEW_RUBRIC,
     SECURITY_RUBRIC,
     build_behavioral_verify_goal,
+    build_completeness_goal,
     build_dimension_goal,
     build_refute_goal,
     build_review_goal,
@@ -618,6 +621,84 @@ def test_build_behavioral_verify_goal_handles_missing_fields_gracefully():
     goal_text2 = build_behavioral_verify_goal(None)
     assert isinstance(goal_text2, str)
     assert BEHAVIOR_VERDICT_TAG in goal_text2
+
+
+# --- P3 piece B: build_completeness_goal + GAPS contract -------------------------------------
+
+def test_build_completeness_goal_returns_goal_dict_shape():
+    goal = build_completeness_goal(["correctness"], ["a.py"], [], "C:/fakerepo")
+    assert set(goal.keys()) == {"text", "cwd"}
+    assert goal["cwd"] == "C:/fakerepo"
+    assert "checks" not in goal
+    assert isinstance(goal["text"], str) and goal["text"]
+
+
+def test_build_completeness_goal_text_is_non_empty_and_includes_summaries():
+    goal = build_completeness_goal(
+        ["correctness", "test_hygiene"], ["pkg/a.py", "pkg/b.py"], [], "C:/fakerepo")
+    text = goal["text"]
+    assert text
+    # dimensions-run summary present
+    assert "correctness" in text
+    assert "test_hygiene" in text
+    # files-covered summary present
+    assert "pkg/a.py" in text
+    assert "pkg/b.py" in text
+
+
+def test_build_completeness_goal_includes_findings_summary():
+    findings = [
+        {"file": "a.py", "line": 12, "title": "SQL injection", "detail": "long detail text"},
+        {"file": "b.py", "line": None, "title": "naming issue", "detail": "d"},
+    ]
+    goal = build_completeness_goal(["correctness"], ["a.py", "b.py"], findings, "C:/fakerepo")
+    text = goal["text"]
+    assert "a.py:12" in text
+    assert "SQL injection" in text
+    assert "naming issue" in text
+    # only file:line:title is included -- the long "detail" text must NOT be dumped verbatim
+    assert "long detail text" not in text
+
+
+def test_build_completeness_goal_handles_empty_inputs_gracefully():
+    goal = build_completeness_goal([], [], [], "C:/fakerepo")
+    assert isinstance(goal["text"], str) and goal["text"]
+    goal2 = build_completeness_goal(None, None, None, "C:/fakerepo")
+    assert isinstance(goal2["text"], str) and goal2["text"]
+
+
+def test_build_completeness_goal_emits_gaps_contract_not_findings_block():
+    goal = build_completeness_goal(["correctness"], ["a.py"], [], "C:/fakerepo")
+    text = goal["text"]
+    assert GAPS_BEGIN in text
+    assert GAPS_END in text
+    assert "missing_dimensions" in text
+    assert "missing_files" in text
+    assert "unverified_claims" in text
+    # must NOT be wrapped in the <<<FINDINGS>>> delimiters -- a separate contract
+    assert FINDINGS_BEGIN not in text
+    assert FINDINGS_END not in text
+    assert "DONE" in text
+    gaps_idx = text.rfind(GAPS_END)
+    done_idx = text.rfind("DONE")
+    assert 0 <= gaps_idx < done_idx
+
+
+def test_build_completeness_goal_uses_clear_framing_preamble_seam():
+    # Must go through the SAME framing seam as every other builder (imported constant,
+    # prepended as-is) -- never a hardcoded/duplicated copy of the preamble's own wording.
+    goal = build_completeness_goal(["correctness"], ["a.py"], [], "C:/fakerepo")
+    assert goal["text"].startswith(CLEAR_FRAMING_PREAMBLE)
+
+
+def test_build_completeness_goal_returns_plain_dict_not_mutating_inputs():
+    dims = ["correctness"]
+    files = ["a.py"]
+    findings = [{"file": "a.py", "line": 1, "title": "t", "detail": "d"}]
+    build_completeness_goal(dims, files, findings, "C:/fakerepo")
+    assert dims == ["correctness"]
+    assert files == ["a.py"]
+    assert findings == [{"file": "a.py", "line": 1, "title": "t", "detail": "d"}]
 
 
 if __name__ == "__main__":
