@@ -217,14 +217,38 @@ def edge_recover_surface(port=None, open_url=""):
 
 # UNLOCK-REQUIRED detector. Write/exec MCP tools require unlock(password) per client IP
 # (tools/security.py::require_unlocked). When the agent calls a write/exec tool before the
-# (rotating M365 backend) IP is unlocked, the server returns
-#   "[locked client IP: 'x.x.x.x'] Call unlock(password='...') first."
+# (rotating M365 backend) IP is unlocked, the server returns ONE of its two literal error
+# strings (tools/security.py require_unlocked(), ~line 129 and ~line 138):
+#   "[locked: no HTTP request context] Call unlock(password='<password>') first."
+#   "[locked client IP: 'x.x.x.x'] Mutating and execution tools require an unlock. Call
+#    unlock(password='<password>') first. The unlock is stored per client IP for
+#    MCP_UNLOCK_TTL_DAYS days."
 # which the agent echoes. We AUTO-INJECT the unlock: re-anchor the turn to first call the
 # 'unlock' tool with MCP_UNLOCK_PASSWORD read LOCALLY from .env -- deliberately NOT baked into
 # the agent's Copilot Studio instructions (that would expose the password permanently). The
 # password appears only in this transient turn. Bounded: the backend IP can rotate and re-lock,
 # so a few auto-unlocks are normal; past the cap we STUCK with an actionable reason.
-LOCKED_MARKERS = ("locked client ip", "call unlock(password", "unlock(password=")
+#
+# FALSE-POSITIVE FIX (2026-07-13): the original markers included the bare "call unlock(password"
+# / "unlock(password=" substrings as SUFFICIENT triggers on their own. Those phrases are the tail
+# of the real server error, but they ALSO appear whenever a worker's own PROSE discusses or
+# reviews the unlock() API -- PROVEN live: a fleet security-review worker examining
+# tools/security.py wrote a response describing the code ("unlock(password='<password>')の
+# プレースホルダとテスト値"), which false-matched and made the relay auto-unlock 4x, then go
+# STUCK with a misleading "M365 backend IP rotates" reason. A worker's analytical prose is long;
+# the server's real lock error is the ENTIRE (short) tool-call return value. So detection now
+# requires BOTH:
+#   1. a DISTINCTIVE marker -- the "[locked ...]" bracket prefix the server actually emits.
+#      This is the phrase least likely to be reproduced verbatim by prose ABOUT the API.
+#   2. DOMINANCE -- the response is short (below LOCKED_DOMINANCE_MAX_CHARS), i.e. it looks like
+#      the raw tool error rather than a long analysis that merely quotes/mentions it.
+# The loose "unlock(password=" phrasing is kept only as documentation of what NOT to use alone;
+# it is deliberately NOT part of LOCKED_MARKERS below.
+LOCKED_MARKERS = ("locked client ip", "[locked:")
+# A real lock error (see the two literal strings above) is ~90-230 chars. A security-review /
+# analytical response that merely mentions unlock() runs to many hundreds/thousands of chars.
+# Chosen well above the longest real error and well below a genuine multi-sentence review.
+LOCKED_DOMINANCE_MAX_CHARS = 400
 MAX_UNLOCK_ATTEMPTS = int(os.environ.get("MCP_FLEET_MAX_UNLOCK", "4"))
 UNLOCK_PREFIX = (
     "【要解錠】書込/実行ツールは接続のIP単位ロック解除が必要です。まず最初に call_tool で "
@@ -232,6 +256,25 @@ UNLOCK_PREFIX = (
     "接続で書込/実行ツールが使えるので）当初のゴールをそのまま続行してください。解錠後は "
     "password を二度と出力しないこと。\n--- 元のゴール ---\n"
 )
+
+
+def _looks_locked(resp: str) -> bool:
+    """True iff `resp` looks like the SERVER's require_unlocked() lock error, not a worker's
+    prose that merely discusses/quotes the unlock() API (see the FALSE-POSITIVE FIX comment
+    above LOCKED_MARKERS for the incident this guards against: a security-review worker
+    describing tools/security.py false-tripped the old loose markers).
+
+    Deterministic two-part rule (both required):
+      1. DISTINCTIVE marker present -- one of LOCKED_MARKERS, the "[locked ...]" bracket prefix
+         the server actually emits. Prose about the API rarely reproduces this exact bracket.
+      2. DOMINANCE -- len(resp) < LOCKED_DOMINANCE_MAX_CHARS. The genuine server error IS the
+         entire (short) tool-call return value; a long analytical response merely mentioning
+         unlock(password=...) is not.
+    """
+    low = (resp or "").lower()
+    if not any(m in low for m in LOCKED_MARKERS):
+        return False
+    return len(resp or "") < LOCKED_DOMINANCE_MAX_CHARS
 
 
 def _unlock_password():
@@ -1759,8 +1802,10 @@ class RelayWorker:
         # UNLOCK-REQUIRED: a write/exec tool hit a locked client IP. Auto-inject unlock(password)
         # with the LOCAL .env password (NOT the agent's persistent instructions), then resume the
         # goal. Bounded -- the M365 backend IP can rotate and re-lock, so a few auto-unlocks are
-        # normal; past the cap STUCK with an actionable reason.
-        if any(m in _low for m in LOCKED_MARKERS):
+        # normal; past the cap STUCK with an actionable reason. Uses _looks_locked() (distinctive
+        # marker + dominance) rather than a bare substring match so a long security-review
+        # response that merely discusses unlock() is never mistaken for the real lock error.
+        if _looks_locked(resp):
             pw = _unlock_password()
             if not pw:
                 self.status, self.outcome = "stuck", "STUCK"

@@ -689,8 +689,13 @@ def test_consent_detector():
         rf.default_notify = orig_notify
 
     # an English consent card trips the automatic ladder the same way (bounded consent streak,
-    # not asserting on surface behavior here -- that's covered above).
+    # not asserting on surface behavior here -- that's covered above). This hits the same
+    # exhaustion branch as block (1)/(2) above (streak >= 2 -> surface() -> default_notify),
+    # so default_notify must be stubbed here too (same save/patch/assert-on-list/restore
+    # pattern used elsewhere in this test) -- otherwise it fires a REAL desktop toast.
     er.surface = lambda *a, **k: True
+    notify_calls_en = []
+    rf.default_notify = lambda *a, **k: notify_calls_en.append((a, k))
     try:
         w2 = RelayWorker("g", "w1")
         en = "Please open connection manager and verify your credential, then retry."
@@ -698,6 +703,7 @@ def test_consent_detector():
         check("consent_detector_english", w2._consent_streak >= 2)
     finally:
         er.surface = orig
+        rf.default_notify = orig_notify
     # a real tool result (no card) does NOT trip it
     w3 = RelayWorker("g", "w2")
     w3._decide('{"platform":"win32","python_version":"3.11"} 完了。CONTINUE')
@@ -807,6 +813,87 @@ def test_tab_budget_admission():
         _restore_worker(orig)
 
 
+def test_lock_detector_ignores_security_review_prose():
+    # REGRESSION (2026-07-13): relay_fleet.LOCKED_MARKERS used to include the bare
+    # "call unlock(password" / "unlock(password=" substrings as SUFFICIENT triggers on their
+    # own. Those phrases are the tail of the real tools/security.py::require_unlocked() error,
+    # but they ALSO show up whenever a worker's own PROSE discusses/reviews the unlock() API.
+    # PROVEN live: a fleet security-review worker examining tools/security.py wrote a response
+    # describing the code (quoting "unlock(password='<password>')" as a placeholder/test value),
+    # which false-matched the old markers -> the relay wrongly auto-injected unlock() 4x (each
+    # re-review re-emitted the phrase) -> STUCK with a misleading "M365 backend IP rotates"
+    # reason. The fix requires a DISTINCTIVE "[locked ...]" marker AND dominance (short response)
+    # -- see relay_fleet._looks_locked(). This test proves both halves of that regulation.
+    import relay.relay_fleet as rf2
+
+    # ---- POSITIVE: the actual short server lock-error strings (tools/security.py
+    # require_unlocked(), lines ~129-141) DO trigger the lock/auto-unlock path.
+    real_err_no_ctx = "[locked: no HTTP request context] Call unlock(password='<password>') first."
+    real_err_ip = (
+        "[locked client IP: '203.0.113.7'] Mutating and execution tools require an unlock. "
+        "Call unlock(password='<password>') first. The unlock is stored per client IP "
+        "for MCP_UNLOCK_TTL_DAYS days."
+    )
+    check("looks_locked_true_no_ctx", rf2._looks_locked(real_err_no_ctx) is True)
+    check("looks_locked_true_with_ip", rf2._looks_locked(real_err_ip) is True)
+
+    orig_pw = rf2._unlock_password
+    rf2._unlock_password = lambda: "test-password-123"
+    try:
+        w = RelayWorker("do the thing", "wlock")
+        w._decide(real_err_ip)
+        check("real_lock_error_triggers_unlock_injection",
+              w._unlock_attempts == 1 and "unlock" in (w.job or "").lower()
+              and w.status != "stuck")
+    finally:
+        rf2._unlock_password = orig_pw
+
+    # ---- NEGATIVE (the proven false positive): a long (~1000+ char) security-review-style
+    # response that discusses unlock(password='<password>') and the per-client-IP unlock design
+    # in prose must NOT be classified as locked -- this is the exact class of text that caused
+    # the incident (a worker reviewing tools/security.py, not a genuine tool-call error).
+    review = (
+        "tools/security.py のセキュリティレビューを完了しました。require_unlocked() は "
+        "呼び出し元の IP が信頼済みローカルピアでない限り、ロックエラー文字列を返します。"
+        "レビュー対象のコードでは unlock(password='<password>') のプレースホルダとテスト値が"
+        "ドキュメント文字列内に例として記載されており、これは実際の解錠エラーではなく、関数の"
+        "使い方を説明する散文です。実装は HMAC の compare_digest を使ってタイミング攻撃を"
+        "防いでおり、パスワードが一致すると unlock(password=...) の呼び出しにより該当 IP が "
+        "MCP_UNLOCK_TTL_DAYS 日間だけ解錠されます。IP ごとの解錠状態は .unlock_state.json に "
+        "保存され、期限が切れると is_unlocked() が False を返すため、再度 unlock(password=...) "
+        "を呼ぶ必要があります。全体として、この実装はフェイルクローズドな設計であり、"
+        "X-Forwarded-For の検証や信頼済みプロキシの許可リストも適切に扱われています。"
+        "結論として、このモジュールに重大なセキュリティ上の欠陥は見つかりませんでした。"
+        "レビューは以上です。DONE"
+    )
+    check("review_prose_is_long_enough", len(review) >= 400)
+    check("looks_locked_false_on_long_review", rf2._looks_locked(review) is False)
+
+    calls = {"n": 0}
+    orig_pw2 = rf2._unlock_password
+    rf2._unlock_password = lambda: calls.__setitem__("n", calls["n"] + 1) or "test-password-123"
+    try:
+        w2 = RelayWorker("review the security module", "wreview")
+        w2._decide(review)
+        check("review_prose_does_not_trigger_unlock",
+              w2._unlock_attempts == 0 and calls["n"] == 0 and w2.status != "stuck")
+    finally:
+        rf2._unlock_password = orig_pw2
+
+    # ---- EDGE: a medium response that mentions unlock in passing but is SHORT and carries the
+    # distinctive "[locked ...]" bracket (e.g. an agent echoing the raw tool error verbatim,
+    # followed by a brief remark) is still classified as locked -- dominance is about length,
+    # not about the marker being the ONLY content.
+    medium = real_err_ip + " 続けて再試行します。"
+    check("medium_len_under_threshold", len(medium) < rf2.LOCKED_DOMINANCE_MAX_CHARS)
+    check("looks_locked_true_on_short_echo_plus_remark", rf2._looks_locked(medium) is True)
+
+    # ---- EDGE: mentioning unlock() in passing WITHOUT the distinctive bracket marker (no
+    # "[locked" prefix at all) must never be classified as locked, regardless of length.
+    passing_mention = "unlock(password='<password>') is called once the IP is verified."
+    check("passing_mention_no_distinctive_marker", rf2._looks_locked(passing_mention) is False)
+
+
 def test_renav_first_on_consent_and_dead_agent():
     # 2026-07 fix: the consent card / "agent dead" reply is frequently a SYMPTOM of a drifted tab
     # (SPA normalized the URL but silently dropped the loaded custom agent), not genuine consent-
@@ -912,6 +999,7 @@ def main():
     test_tool_unreachable_infra()
     test_transient_outage_window()
     test_consent_detector()
+    test_lock_detector_ignores_security_review_prose()
     test_renav_first_on_consent_and_dead_agent()
     print("\n=== %d/%d admission checks passed ===" % (sum(results), len(results)))
     return 0 if all(results) else 1
