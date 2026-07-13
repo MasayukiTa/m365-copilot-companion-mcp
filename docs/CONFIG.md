@@ -23,6 +23,7 @@
 | `MCP_TOOL_MAP_INCLUDE` | map mode で追加で第一級ツールとして載せたいツール名（カンマ区切り） | 空 |
 | `MCP_IMPL_AGENT_URL` | bridge / fleet が駆動する主 Copilot エージェントの URL（テナント固有 `T_…`） | 手動で貼る（**必須**） |
 | `MCP_FLEET_AGENT_URL` | fleet 専用エージェント URL | 未指定なら `MCP_IMPL_AGENT_URL` |
+| `MCP_REVIEW_P2C` | 分割レビュー `/review-2` `/security-review-2` の表示・実行 | `0`（無効）/ `1`（有効） |
 | `MCP_RESEARCHER_AGENT_URL` | `/research` が使う調査エージェント（Researcher `…dr_work`） | 内蔵既定・通常は空 |
 | `MCP_ANALYST_AGENT_URL` | `/analyze` が使う分析エージェント（Analyst `…diceberry`） | 内蔵既定・通常は空 |
 | `MCP_CDP_URL` | 専用 Edge の CDP エンドポイント | `http://localhost:9222` |
@@ -81,6 +82,18 @@ call_tool(name="X", arguments={...}) → X を実行
 | **専用 Edge プロファイル** `copilot-companion-edge`(:9222) / `copilot-bridge-edge`(:9223) | M365 サインイン状態（Cookie） | ❌ 各 PC で初回 1 回サインイン |
 | **devtunnel** のローカルトークン | Dev Tunnel ログイン状態 | ❌ 各 PC で 1 回 `setup_devtunnel.ps1` |
 | **Copilot Studio**（クラウド） | エージェント本体・MCP コネクタ登録 | ☁ クラウドに 1 個作れば全 PC 共通。URL を `.env` に貼るだけ |
+
+---
+
+## P2c 分割レビュー
+
+`MCP_REVIEW_P2C=0` が既定で自動生成されます。`1` に変更して `start_all.bat` を
+実行すると、`/review-2` と `/security-review-2` がコマンド一覧に表示されます。
+この2コマンドだけが Fresh Session Replay と上限付きタスク分割を使い、従来の
+`/review` と `/security-review` の挙動は変わりません。
+
+既存の `.env` にキーがない場合は、起動時に `0` が追記されます。既に設定した
+`0` / `1` や他の値は上書きされません。
 
 ---
 
