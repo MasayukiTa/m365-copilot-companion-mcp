@@ -21,6 +21,25 @@ FIX 3 (P2) -- run_label derivation (tested via the logic used in main(), extract
     (k) Leading list markers / whitespace are stripped from run_label.
     (l) goal_count equals the number of goals.
 
+FIX 4 -- _read_goals() / _read_goals_file() fragmented-goals-file guard:
+    (m) A goals-file that is really a shredded multi-line PROMPT (intro sentence, a
+        colon-terminated fragment, a bare path, several "tools/x.py" bullet lines, a
+        "<<<FINDINGS>>>" delimiter, a lone "[" line, a JSON object with no text/goal
+        key) is REJECTED with an actionable SystemExit that points at
+        bench/review_build_goals.py's write_goals_jsonl().
+    (n) A goals-file of many short plain-text fragments (no delimiters, no bad JSON)
+        is rejected by the soft aggregate heuristic alone.
+    (o) A legit plain-text one-goal-per-line file (+ a # comment + a blank line)
+        parses to exactly the real goals -- NOT regressed by the guard.
+    (p) A legit JSONL file in write_goals_jsonl format ({"text": "..."} per line)
+        parses to those goals -- NOT regressed.
+    (q) A single-goal file (ONE real goal) parses to exactly 1 goal.
+    (r) A JSON-object line with no recognized goal key is rejected as EMPTY, not
+        silently turned into an empty lane.
+    (s) The reject test actually exercises the guard code path (proven by
+        temporarily neutering the guard and observing the test FAIL -- see the
+        VERIFY step in the delegating task; not re-run automatically here).
+
 Run:  .venv\\Scripts\\python.exe relay\\test_fleet_runner_fixes.py
 """
 from __future__ import annotations
@@ -30,13 +49,14 @@ import os
 import sys
 import tempfile
 import re
+from argparse import Namespace
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 # Import the helpers under test directly.
-from relay.fleet_runner import _pending_gates, _clean_final_text
+from relay.fleet_runner import _pending_gates, _clean_final_text, _read_goals
 
 results: list[bool] = []
 
@@ -231,6 +251,152 @@ def _test_fix3_run_label():
 
 
 # ---------------------------------------------------------------------------
+# FIX 4: _read_goals() / _read_goals_file() fragmented-goals-file guard
+# ---------------------------------------------------------------------------
+
+def _goals_args(goals_file):
+    """A minimal args-like object -- _read_goals() only reads .goal and .goals_file."""
+    return Namespace(goal=None, goals_file=str(goals_file))
+
+
+def _write_tmp(tmp_dir: Path, name: str, content: str) -> Path:
+    p = tmp_dir / name
+    p.write_text(content, encoding="utf-8")
+    return p
+
+
+def _test_fix4_reject_fragmented_prompt():
+    """(m) A shredded multi-line review PROMPT must be REJECTED with an actionable error."""
+    fragmented = "\n".join([
+        "あなたはこのリポジトリのコードレビューを行います。",          # intro sentence
+        "対象リポジトリ（このPCのローカル、git チェックアウト済み）:",   # colon-terminated fragment
+        "C:/Users/example/some-repo",                                    # bare path line
+        "- tools/notify_ops.py",
+        "- tools/file_ops.py",
+        "- tools/contract_gate.py",
+        "1. セキュリティ上の懸念を洗い出すこと",
+        "<<<FINDINGS>>>",
+        "[",
+        '{"file": "tools/notify_ops.py", "line": 12, "severity": "high"}',
+        "]",
+        "<<<END_FINDINGS>>>",
+    ])
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write_tmp(Path(tmp), "retry_input.txt", fragmented)
+        raised = False
+        msg = ""
+        try:
+            _read_goals(_goals_args(p))
+        except SystemExit as e:
+            raised = True
+            msg = str(e)
+        check("fix4_fragmented_prompt_rejected", raised)
+        check("fix4_error_mentions_jsonl_builder",
+              "write_goals_jsonl" in msg and "review_build_goals" in msg)
+        check("fix4_error_names_the_file", str(p) in msg)
+
+
+def _test_fix4_reject_soft_aggregate_only():
+    """(n) Many short plain-text fragments (no delimiter tokens, no bad JSON) trip
+    the SOFT aggregate heuristic alone -- proves that path works standalone."""
+    lines = ["tools/file_%d.py" % i for i in range(10)]   # 10 short (<40 char) lines
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write_tmp(Path(tmp), "shredded_paths.txt", "\n".join(lines))
+        raised = False
+        msg = ""
+        try:
+            _read_goals(_goals_args(p))
+        except SystemExit as e:
+            raised = True
+            msg = str(e)
+        check("fix4_soft_aggregate_rejected", raised)
+        check("fix4_soft_aggregate_mentions_jsonl_builder", "write_goals_jsonl" in msg)
+
+
+def _test_fix4_accept_legit_plaintext():
+    """(o) A legit one-goal-per-line plain-text file (+ comment + blank line) must
+    NOT be regressed by the guard -- parses to exactly the real goals."""
+    real_goals = [
+        "Fix the login redirect bug by validating the session token before redirecting.",
+        "Update the README to document the new --resume flag and its ledger files.",
+        "Add unit tests for the disk-floor admission gate under low free space.",
+    ]
+    content = "\n".join([
+        "# this is a comment and should be ignored",
+        "",
+        real_goals[0],
+        real_goals[1],
+        real_goals[2],
+    ])
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write_tmp(Path(tmp), "goals.txt", content)
+        goals = _read_goals(_goals_args(p))
+        check("fix4_legit_plaintext_not_regressed", goals == real_goals)
+
+
+def _test_fix4_accept_legit_jsonl():
+    """(p) A legit write_goals_jsonl-format file ({"text": "..."} per line) must
+    NOT be regressed -- parses to those goal dicts."""
+    entries = [
+        {"text": "Review tools/notify_ops.py for unhandled exceptions.", "cwd": "C:/repo"},
+        {"text": "Review tools/file_ops.py for path traversal issues.", "cwd": "C:/repo"},
+    ]
+    content = "\n".join(json.dumps(e, ensure_ascii=False) for e in entries)
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write_tmp(Path(tmp), "goals.jsonl", content)
+        goals = _read_goals(_goals_args(p))
+        check("fix4_legit_jsonl_not_regressed",
+              len(goals) == 2 and all(isinstance(g, dict) for g in goals)
+              and [g["text"] for g in goals] == [e["text"] for e in entries])
+
+
+def _test_fix4_accept_single_goal():
+    """(q) A single-goal file (ONE real goal) parses to exactly 1 goal."""
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write_tmp(Path(tmp), "one_goal.txt",
+                        "Investigate why the nightly backup job silently skips large files.\n")
+        goals = _read_goals(_goals_args(p))
+        check("fix4_single_goal_parses_to_one", goals == [
+            "Investigate why the nightly backup job silently skips large files."])
+
+
+def _test_fix4_reject_empty_goal_from_json():
+    """(r) A JSON-object line with no recognized goal key resolves to an EMPTY goal
+    and must be rejected -- never silently turned into an empty lane."""
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write_tmp(Path(tmp), "bad_goal.jsonl",
+                        '{"file": "tools/notify_ops.py", "line": 5}\n')
+        raised = False
+        msg = ""
+        try:
+            _read_goals(_goals_args(p))
+        except SystemExit as e:
+            raised = True
+            msg = str(e)
+        check("fix4_empty_goal_from_missing_key_rejected", raised)
+        check("fix4_empty_goal_error_mentions_empty", "EMPTY" in msg)
+
+    # also: a dict WITH a 'text' key but whose value is whitespace-only
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write_tmp(Path(tmp), "blank_text.jsonl", '{"text": "   "}\n')
+        raised = False
+        try:
+            _read_goals(_goals_args(p))
+        except SystemExit:
+            raised = True
+        check("fix4_whitespace_only_text_rejected", raised)
+
+
+def _test_fix4_guard():
+    _test_fix4_reject_fragmented_prompt()
+    _test_fix4_reject_soft_aggregate_only()
+    _test_fix4_accept_legit_plaintext()
+    _test_fix4_accept_legit_jsonl()
+    _test_fix4_accept_single_goal()
+    _test_fix4_reject_empty_goal_from_json()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -238,6 +404,7 @@ def main():
     _test_fix1_gate_scoping()
     _test_fix2_clean_final_text()
     _test_fix3_run_label()
+    _test_fix4_guard()
     passed = sum(results)
     total = len(results)
     print("\n=== %d/%d fleet_runner fix checks passed ===" % (passed, total))
