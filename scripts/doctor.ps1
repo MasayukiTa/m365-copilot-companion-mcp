@@ -4,8 +4,35 @@
 #  auth) and prints a GREEN/RED checklist with the exact fix for each RED line,
 #  so "is it actually working?" is answered in one run. Read-only; safe any time.
 #  ASCII / ENGLISH ONLY (cmd/console safe).
+#
+#  -Json: emit ONE compressed JSON array line on stdout (id/ok/name/fix/optional/
+#  info/skipped per check) instead of the colored checklist. This is the single
+#  machine-readable source of truth that scripts\repair.ps1 (and any other tool,
+#  e.g. a cockpit UI) parses to decide what to fix -- doctor stays READ-ONLY
+#  (detect only); it never repairs anything itself.
 # =============================================================================
+param(
+    [switch]$Json
+)
 $ErrorActionPreference = "SilentlyContinue"
+
+# In -Json mode, stdout must carry ONLY the one JSON line (so callers can parse it
+# cleanly). Rather than gate every single Write-Host call below, shadow the Write-Host
+# cmdlet with a no-op function for the rest of this script run -- a locally defined
+# function always wins command resolution over a cmdlet of the same name, so every
+# existing Write-Host call site below is silenced automatically and needs no edits.
+if ($Json) {
+    function Write-Host {
+        param(
+            [Parameter(Position = 0, ValueFromPipeline = $true)] $Object,
+            [ConsoleColor]$ForegroundColor,
+            [ConsoleColor]$BackgroundColor,
+            [switch]$NoNewline,
+            $Separator
+        )
+        # suppressed in -Json mode -- stdout carries only the final JSON line
+    }
+}
 # This script lives in <repo>\scripts; the .env it reads is at the REPO ROOT (one level up).
 $scriptDir = $PSScriptRoot
 if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
@@ -21,9 +48,25 @@ if (Test-Path $envPath) {
 }
 
 $script:ok = 0; $script:bad = 0
-function Check([string]$name, [scriptblock]$test, [string]$fix) {
+# Machine-readable accumulator: one entry per check, in the exact order checks run
+# (== the dependency order documented at the top of this file). This -- not the
+# colored console text -- is the single source of truth a repair dispatcher reads.
+$script:results = @()
+function Add-Result([string]$id, [bool]$pass, [string]$name, [string]$fix, [bool]$optional, [bool]$info, [bool]$skipped) {
+    $script:results += [PSCustomObject]@{
+        id       = $id
+        ok       = $pass
+        name     = $name
+        fix      = $fix
+        optional = $optional
+        info     = $info
+        skipped  = $skipped
+    }
+}
+function Check([string]$id, [string]$name, [scriptblock]$test, [string]$fix, [switch]$Optional, [switch]$Info) {
     $pass = $false
     try { $pass = [bool](& $test) } catch { $pass = $false }
+    Add-Result $id $pass $name $fix $Optional.IsPresent $Info.IsPresent $false
     if ($pass) {
         Write-Host ("  [ OK ] " + $name) -ForegroundColor Green
         $script:ok++
@@ -40,16 +83,16 @@ Write-Host "m365-copilot-companion-mcp  --  setup doctor" -ForegroundColor Cyan
 Write-Host "============================================="
 
 # 1. secrets / .env
-Check ".env present with a Bearer token (MCP_API_KEY)" `
+Check "env_api_key" ".env present with a Bearer token (MCP_API_KEY)" `
     { $envv.ContainsKey('MCP_API_KEY') -and $envv['MCP_API_KEY'] } `
     "run quickstart.bat -- it creates .env with a fresh Bearer + unlock password"
 
-Check "Agent URL configured (Copilot Studio agent pasted)" `
+Check "agent_url" "Agent URL configured (Copilot Studio agent pasted)" `
     { ($envv['MCP_FLEET_AGENT_URL']) -or ($envv['MCP_IMPL_AGENT_URL']) } `
     "double-click configure_env.bat and paste the Copilot Studio agent URL (README STEP 4)"
 
 # 2. local MCP server
-Check "MCP server up (http://127.0.0.1:8000/health)" `
+Check "server_up" "MCP server up (http://127.0.0.1:8000/health)" `
     { (Invoke-WebRequest -Uri 'http://127.0.0.1:8000/health' -TimeoutSec 4 -UseBasicParsing).StatusCode -eq 200 } `
     "start the stack: double-click start_all.bat   (or run .\scripts\start.ps1)"
 
@@ -92,14 +135,16 @@ function Invoke-DevTunnelBounded([string[]]$dtArgs, [int]$timeoutSec) {
 }
 
 $script:tunnelChainBroken = $false
-function TunnelCheck([string]$name, [scriptblock]$test, [string]$fix) {
+function TunnelCheck([string]$id, [string]$name, [scriptblock]$test, [string]$fix) {
     if ($script:tunnelChainBroken) {
         Write-Host ("  [SKIP] " + $name) -ForegroundColor DarkGray
         Write-Host ("         blocked by the Dev Tunnel check above -- fix that first, then re-run doctor") -ForegroundColor DarkGray
+        Add-Result $id $false $name $fix $false $false $true
         return
     }
     $pass = $false
     try { $pass = [bool](& $test) } catch { $pass = $false }
+    Add-Result $id $pass $name $fix $false $false $false
     if ($pass) {
         Write-Host ("  [ OK ] " + $name) -ForegroundColor Green
         $script:ok++
@@ -111,11 +156,11 @@ function TunnelCheck([string]$name, [scriptblock]$test, [string]$fix) {
     }
 }
 
-TunnelCheck "devtunnel CLI installed" `
+TunnelCheck "tunnel_cli" "devtunnel CLI installed" `
     { $out = Invoke-DevTunnelBounded @('--version') 6; ($out) -and ($out -match 'Tunnel CLI version') } `
     "install it: winget install Microsoft.devtunnel   (then re-run start_all.bat)"
 
-TunnelCheck "devtunnel signed in" `
+TunnelCheck "tunnel_login" "devtunnel signed in" `
     {
         $out = Invoke-DevTunnelBounded @('user', 'show') 6
         if (-not $out) { return $false }
@@ -125,7 +170,7 @@ TunnelCheck "devtunnel signed in" `
     } `
     "run:  devtunnel login   (interactive, opens a browser -- this is the ONE step that needs a human; the supervisor will NOT host the tunnel until the CLI is logged in, so start_all.bat alone cannot fix this)"
 
-TunnelCheck "Dev Tunnel exists (MCP_TUNNEL_NAME)" `
+TunnelCheck "tunnel_exists" "Dev Tunnel exists (MCP_TUNNEL_NAME)" `
     {
         if (-not $tname) { return $false }
         $out = Invoke-DevTunnelBounded @('show', $tname) 8
@@ -133,16 +178,16 @@ TunnelCheck "Dev Tunnel exists (MCP_TUNNEL_NAME)" `
     } `
     "the tunnel is missing or expired -- (re)create it: powershell -File scripts\setup_devtunnel.ps1"
 
-TunnelCheck "Dev Tunnel host serving (public URL -> server)" `
+TunnelCheck "tunnel_serving" "Dev Tunnel host serving (public URL -> server)" `
     { if (-not $turl) { return $false }; (Invoke-WebRequest -Uri (($turl.TrimEnd('/')) + '/health') -TimeoutSec 7 -UseBasicParsing).StatusCode -eq 200 } `
     "the tunnel exists but is not being served -- run start_all.bat (the supervisor hosts it). If this stays red while the checks above are green, MCP_TUNNEL_URL in .env may be stale -- compare it to the URL shown by 'devtunnel show <name>'."
 
 # 4. Companion Edge (:9222) for the fleet/agent
-Check "Companion Edge running (:9222 fleet/agent)" `
+Check "edge_companion" "Companion Edge running (:9222 fleet/agent)" `
     { Get-Json 'http://127.0.0.1:9222/json/version' | Out-Null; $true } `
     "launch it: powershell -File scripts\start_companion_edge.ps1   (then sign into M365 once)"
 
-Check "M365 signed in on the companion Edge (no login page)" `
+Check "m365_signin" "M365 signed in on the companion Edge (no login page)" `
     {
         $tabs = Get-Json 'http://127.0.0.1:9222/json'
         # A login WALL on ANY tab means sign-in is still required -- even if a separate
@@ -158,19 +203,20 @@ Check "M365 signed in on the companion Edge (no login page)" `
     "sign-in needed: run  powershell -File scripts\start_companion_edge.ps1 -Foreground  (or python -m relay.edge_recover then surface()) to bring the companion Edge window forward, then complete M365 (Entra ID) sign-in -- it persists across restarts"
 
 # 5. Bridge Edge (:9223) -- optional, only for conversation history/scrape
-Check "Bridge Edge running (:9223 history/scrape) [optional]" `
+Check "edge_bridge" "Bridge Edge running (:9223 history/scrape) [optional]" `
     { Get-Json 'http://127.0.0.1:9223/json/version' | Out-Null; $true } `
-    "optional: powershell -File scripts\start_bridge.ps1 -Keepalive   (only needed for past-conversation history)"
+    "optional: powershell -File scripts\start_bridge.ps1 -Keepalive   (only needed for past-conversation history)" `
+    -Optional
 
 # 5b. UI apps (CopilotChat.exe / FleetCockpit.exe) -- gitignored, so a fresh clone has neither
 #     until the first build. Checked individually so the fix line names the missing one.
 $copilotChatExe = Join-Path $repo "ui\CopilotChat.exe"
 $fleetCockpitExe = Join-Path $repo "ui\FleetCockpit.exe"
-Check "CopilotChat.exe built (ui\CopilotChat.exe)" `
+Check "ui_copilotchat" "CopilotChat.exe built (ui\CopilotChat.exe)" `
     { Test-Path $copilotChatExe } `
     "run ui\rebuild_ui.ps1 (first build; needs .NET Framework 4.8 csc.exe, preinstalled on stock Windows 10/11)"
 
-Check "FleetCockpit.exe built (ui\FleetCockpit.exe)" `
+Check "ui_fleetcockpit" "FleetCockpit.exe built (ui\FleetCockpit.exe)" `
     { Test-Path $fleetCockpitExe } `
     "run ui\rebuild_ui.ps1 (first build; needs .NET Framework 4.8 csc.exe, preinstalled on stock Windows 10/11)"
 
@@ -179,9 +225,10 @@ Check "FleetCockpit.exe built (ui\FleetCockpit.exe)" `
 # build (csc.exe present, just hasn't been run yet) vs. a genuinely missing .NET Framework 4.8.
 if (-not (Test-Path $copilotChatExe) -or -not (Test-Path $fleetCockpitExe)) {
     $cscPath = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-    Check "  (info) .NET Framework 4.8 csc.exe present ($cscPath)" `
+    Check "dotnet_csc" "  (info) .NET Framework 4.8 csc.exe present ($cscPath)" `
         { Test-Path $cscPath } `
-        "csc.exe not found -- enable 'Windows Features' > '.NET Framework 4.8 Advanced Services', then run ui\rebuild_ui.ps1. See docs\TROUBLESHOOTING.md ('csc.exe not found' row)"
+        "csc.exe not found -- enable 'Windows Features' > '.NET Framework 4.8 Advanced Services', then run ui\rebuild_ui.ps1. See docs\TROUBLESHOOTING.md ('csc.exe not found' row)" `
+        -Info
 }
 
 # 6. auth end-to-end: the server ACCEPTS the Bearer on /mcp. The MCP streamable-HTTP
@@ -199,7 +246,7 @@ function Mcp-Status([hashtable]$headers) {
         return 0
     }
 }
-Check "Auth OK end-to-end (Bearer accepted on /mcp)" `
+Check "auth_bearer" "Auth OK end-to-end (Bearer accepted on /mcp)" `
     {
         $key = $envv['MCP_API_KEY']; if (-not $key) { return $false }
         $withKey = Mcp-Status @{ Authorization = ("Bearer " + $key) }
@@ -217,3 +264,17 @@ if ($script:bad -eq 0) {
     Write-Host ("{0} OK, {1} need attention -- fix the red lines above, then re-run: doctor.bat" -f $script:ok, $script:bad) -ForegroundColor Yellow
 }
 Write-Host ""
+
+if ($Json) {
+    # Bind directly (not via the pipeline) so ConvertTo-Json always serializes this as
+    # ONE JSON array, even in the edge case where $script:results has exactly one entry
+    # (piping would unwrap it and emit a bare object instead of a 1-element array).
+    Write-Output (ConvertTo-Json -InputObject $script:results -Compress)
+}
+
+# Nonzero exit whenever anything needs attention, in BOTH modes -- additive only: no
+# existing caller reads this script's exit code (doctor.bat just runs it then `pause`;
+# start_all.ps1 does not invoke doctor.ps1 at all), so this cannot break anything that
+# already works, and it gives scripts\repair.ps1 (and any other automation) a cheap
+# "is there anything to do" signal without re-parsing -Json output.
+exit $script:bad
