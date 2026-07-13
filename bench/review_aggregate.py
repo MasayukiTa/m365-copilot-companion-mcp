@@ -349,6 +349,51 @@ def aggregate(status_path, transcripts_dir, now=None):
 # headline totals; bench/review_fix.py:filter_findings already drops them from any fix run.
 _VERIFY_RANK = {"confirmed": 0, "unclear": 2}  # anything else (None / missing) ranks 1
 
+# --- P2 piece A: behavioral_verdict rendering -----------------------------------------------
+# bench/review_run.py's OPT-IN --behavioral pass (behavioral_verify()) attaches
+# "behavioral_verdict" (bench.review_build_goals.BEHAVIOR_VERDICTS: reproduced/not_reproduced/
+# inconclusive) + "behavioral_evidence" to CONFIRMED findings it actually tried to reproduce
+# via READ-ONLY run_python/shell_exec. A "reproduced" finding has gone from reasoned to
+# DEMONSTRATED -- the most trustworthy signal this report can carry -- so it is marked and
+# ranked ahead of everything else, including a plain "confirmed" finding the behavioral pass
+# never touched. A "not_reproduced" CONFIRMED finding is flagged (not silently dropped: the
+# refuter already upheld it) so a human can see the discrepancy and judge it themselves.
+_BEHAVIOR_VERDICTS_COUNTED = ("reproduced", "not_reproduced", "inconclusive")
+
+
+def _behavioral_counts(findings):
+    """Count findings by behavioral_verdict. Returns {} (falsy) if NO finding carries a
+    "behavioral_verdict" key at all -- lets callers distinguish "the --behavioral pass never
+    ran" from "it ran" the same way _verify_counts distinguishes the refuter pass."""
+    if not any(isinstance(f, dict) and "behavioral_verdict" in f for f in findings):
+        return {}
+    counts = {k: 0 for k in _BEHAVIOR_VERDICTS_COUNTED}
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        bv = f.get("behavioral_verdict")
+        if bv in counts:
+            counts[bv] += 1
+    return counts
+
+
+def _rank_key(it):
+    """Sort key for findings within one severity section (highest-trust first):
+
+      1) behavioral_verdict == "reproduced" -- actually DEMONSTRATED by running code, not
+         just reasoned about -- always sorts first, ahead of every other finding regardless
+         of its verify_verdict.
+      2) otherwise, the existing _VERIFY_RANK order (confirmed -> no-verdict -> unclear),
+         with a "not_reproduced" behavioral_verdict pushing a finding just behind its
+         verify_verdict peers (a CONFIRMED-but-not-reproduced finding is de-prioritized
+         relative to a CONFIRMED finding the behavioral pass never touched or found
+         inconclusive)."""
+    if it.get("behavioral_verdict") == "reproduced":
+        return (-1, 0)
+    base = _VERIFY_RANK.get(it.get("verify_verdict"), 1)
+    bump = 1 if it.get("behavioral_verdict") == "not_reproduced" else 0
+    return (base, bump)
+
 
 def _verify_counts(findings):
     """Count findings by verify_verdict. Returns {} (falsy) if NO finding carries a
@@ -391,6 +436,12 @@ def render_markdown(agg):
     if counts:
         lines.append("- refuter verdicts: confirmed=%d refuted/dropped=%d unclear=%d" %
                      (counts["confirmed"], counts["false_positive"], counts["unclear"]))
+    behavior_counts = _behavioral_counts(findings_all)
+    if behavior_counts:
+        lines.append(
+            "- behavioral verification: reproduced=%d (DEMONSTRATED) not_reproduced=%d "
+            "inconclusive=%d" % (behavior_counts["reproduced"], behavior_counts["not_reproduced"],
+                                  behavior_counts["inconclusive"]))
     dims_covered = agg.get("dimensions_covered")
     if dims_covered:
         lines.append("- dimensions covered: %s" % ", ".join(dims_covered))
@@ -400,7 +451,7 @@ def render_markdown(agg):
     for sev in _SEVERITIES:
         raw_items = by_severity.get(sev, [])
         items = [it for it in raw_items if it.get("verify_verdict") != "false_positive"]
-        items = sorted(items, key=lambda it: _VERIFY_RANK.get(it.get("verify_verdict"), 1))
+        items = sorted(items, key=_rank_key)
         lines.append("## %s (%d)" % (sev, len(items)))
         lines.append("")
         if not items:
@@ -428,10 +479,20 @@ def render_markdown(agg):
                 meta_bits.append("CONFIRMED")
             elif verify_verdict == "unclear":
                 meta_bits.append("refute: unclear")
+            behavioral_verdict = it.get("behavioral_verdict")
+            if behavioral_verdict == "reproduced":
+                meta_bits.append("DEMONSTRATED")
+            elif behavioral_verdict == "not_reproduced":
+                meta_bits.append("reasoned-but-not-reproduced")
+            elif behavioral_verdict == "inconclusive":
+                meta_bits.append("behavior: inconclusive")
             meta = ", ".join(meta_bits)
             lines.append("- [%s] %s:%s — %s (%s)" % (sev, file_, ln_s, title, meta))
             if detail:
                 lines.append("  %s" % detail)
+            behavioral_evidence = it.get("behavioral_evidence")
+            if behavioral_evidence:
+                lines.append("  behavior evidence: %s" % behavioral_evidence)
         lines.append("")
 
     refuted = [f for f in findings_all if f.get("verify_verdict") == "false_positive"]
@@ -458,15 +519,21 @@ def render_markdown(agg):
 
 def render_json(agg):
     """Return agg as a plain JSON-serializable dict (a shallow copy), plus a "verify_summary"
-    counts dict (see _verify_counts) IF at least one finding carries a verify_verdict --
-    otherwise the output is an exact shallow copy of agg (no key added), matching the old
-    "plain dict copy" contract for reports built without the refuter pass. Any timestamp
-    stamping is the caller's responsibility (agg["generated_at"] is already set by
-    aggregate()'s `now` argument if the caller passed one)."""
+    counts dict (see _verify_counts) IF at least one finding carries a verify_verdict, and a
+    "behavioral_summary" counts dict (see _behavioral_counts) IF at least one finding carries
+    a behavioral_verdict -- otherwise the output is an exact shallow copy of agg (no key
+    added), matching the old "plain dict copy" contract for reports built without the
+    refuter/behavioral passes. Any timestamp stamping is the caller's responsibility
+    (agg["generated_at"] is already set by aggregate()'s `now` argument if the caller passed
+    one)."""
     out = dict(agg)
-    counts = _verify_counts(out.get("findings", []))
+    findings = out.get("findings", [])
+    counts = _verify_counts(findings)
     if counts:
         out["verify_summary"] = counts
+    behavior_counts = _behavioral_counts(findings)
+    if behavior_counts:
+        out["behavioral_summary"] = behavior_counts
     return out
 
 

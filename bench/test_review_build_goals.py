@@ -12,12 +12,17 @@ import subprocess
 import pytest
 
 from bench.review_build_goals import (
+    BEHAVIOR_EVIDENCE_TAG,
+    BEHAVIOR_VERDICT_TAG,
+    BEHAVIOR_VERDICTS,
     BINARY_EXTS,
+    CLEAR_FRAMING_PREAMBLE,
     FINDINGS_BEGIN,
     FINDINGS_END,
     REVIEW_DIMENSIONS,
     REVIEW_RUBRIC,
     SECURITY_RUBRIC,
+    build_behavioral_verify_goal,
     build_dimension_goal,
     build_refute_goal,
     build_review_goal,
@@ -500,6 +505,119 @@ def test_build_refute_goal_explicit_lens_overrides_everything():
 def test_build_refute_goal_returns_plain_string_not_dict():
     goal_text = build_refute_goal(_finding(), "review")
     assert isinstance(goal_text, str)
+
+
+# --- P2 piece B: clear-framing / intent pre-flight preamble ---------------------------------
+# Jailbreak-style phrases the preamble must NEVER contain (case-insensitive substring match) --
+# this is purely "state the legitimate context clearly", not a guideline-bypass mechanism.
+_JAILBREAK_PHRASES = (
+    "ignore", "無視して", "無視しろ", "disregard", "pretend", "ふりをして", "のふりをして",
+    "override your", "bypass", "jailbreak", "do anything now", "you are no longer",
+    "forget your instructions", "指示を忘れ", "ガイドラインを無視", "safety guidelines",
+    "act as if you have no", "there are no rules",
+)
+
+
+def test_clear_framing_preamble_has_no_jailbreak_phrasing():
+    low = CLEAR_FRAMING_PREAMBLE.lower()
+    for phrase in _JAILBREAK_PHRASES:
+        assert phrase.lower() not in low, "preamble contains jailbreak-style phrase %r" % (phrase,)
+
+
+def test_clear_framing_preamble_states_authorized_defensive_purpose():
+    # transparent, truthful framing: authorized + defensive + own repo + report (not exploit)
+    assert "許可" in CLEAR_FRAMING_PREAMBLE or "承認" in CLEAR_FRAMING_PREAMBLE
+    assert "防御" in CLEAR_FRAMING_PREAMBLE
+    assert "所有者" in CLEAR_FRAMING_PREAMBLE
+
+
+def test_clear_framing_preamble_present_on_dimension_goal():
+    goal = build_dimension_goal("correctness", ["a.py"], "C:/fakerepo")
+    assert goal["text"].startswith(CLEAR_FRAMING_PREAMBLE)
+
+
+def test_clear_framing_preamble_present_on_review_goal_legacy():
+    goal = build_review_goal(["a.py"], "C:/fakerepo", "review")
+    assert goal["text"].startswith(CLEAR_FRAMING_PREAMBLE)
+
+
+def test_clear_framing_preamble_present_on_refute_goal():
+    goal_text = build_refute_goal(_finding(), "review")
+    assert goal_text.startswith(CLEAR_FRAMING_PREAMBLE)
+
+
+def test_clear_framing_preamble_present_on_behavioral_verify_goal():
+    goal_text = build_behavioral_verify_goal(_finding())
+    assert goal_text.startswith(CLEAR_FRAMING_PREAMBLE)
+
+
+def test_clear_framing_preamble_prepend_does_not_break_verbatim_filename_assert():
+    # build_dimension_goal/build_review_goal's own asserts already ran inside the call above
+    # (they would have raised) -- this test additionally re-checks explicitly, and checks the
+    # FINDINGS contract still parses in the expected order after the preamble is prepended.
+    goal = build_dimension_goal("correctness", ["pkg/mod.py"], "C:/fakerepo")
+    assert "pkg/mod.py" in goal["text"]
+    assert FINDINGS_BEGIN in goal["text"]
+    assert FINDINGS_END in goal["text"]
+    begin_idx = goal["text"].find(FINDINGS_BEGIN)
+    end_idx = goal["text"].find(FINDINGS_END)
+    assert 0 <= begin_idx < end_idx
+
+
+def test_clear_framing_preamble_does_not_contain_findings_delimiters():
+    # sanity: the preamble itself must not accidentally smuggle in a FINDINGS delimiter
+    assert FINDINGS_BEGIN not in CLEAR_FRAMING_PREAMBLE
+    assert FINDINGS_END not in CLEAR_FRAMING_PREAMBLE
+
+
+# --- P2 piece A: build_behavioral_verify_goal + BEHAVIOR_VERDICT contract -------------------
+
+def test_build_behavioral_verify_goal_contains_read_only_repro_instruction():
+    finding = _finding()
+    goal_text = build_behavioral_verify_goal(finding)
+    assert "run_python" in goal_text
+    assert "shell_exec" in goal_text
+    # explicit do-not-modify / read-only instruction
+    assert "編集しない" in goal_text or "読み取り専用" in goal_text
+    assert "削除" in goal_text or "破壊的" in goal_text
+
+
+def test_build_behavioral_verify_goal_carries_the_finding_claim():
+    finding = _finding()
+    goal_text = build_behavioral_verify_goal(finding)
+    assert finding["file"] in goal_text
+    assert finding["title"] in goal_text
+    assert finding["detail"] in goal_text
+
+
+def test_build_behavioral_verify_goal_emits_verdict_contract_not_findings_block():
+    goal_text = build_behavioral_verify_goal(_finding())
+    assert BEHAVIOR_VERDICT_TAG in goal_text
+    assert BEHAVIOR_EVIDENCE_TAG in goal_text
+    for v in BEHAVIOR_VERDICTS:
+        assert v in goal_text
+    # must NOT be wrapped in the <<<FINDINGS>>> delimiters -- a different, separate contract
+    assert FINDINGS_BEGIN not in goal_text
+    assert FINDINGS_END not in goal_text
+    assert "DONE" in goal_text
+    # the verdict tag must come before the final DONE instruction
+    tag_idx = goal_text.rfind(BEHAVIOR_VERDICT_TAG)
+    done_idx = goal_text.rfind("DONE")
+    assert 0 <= tag_idx < done_idx
+
+
+def test_build_behavioral_verify_goal_returns_plain_string_not_dict():
+    goal_text = build_behavioral_verify_goal(_finding())
+    assert isinstance(goal_text, str)
+
+
+def test_build_behavioral_verify_goal_handles_missing_fields_gracefully():
+    goal_text = build_behavioral_verify_goal({})
+    assert isinstance(goal_text, str)
+    assert BEHAVIOR_VERDICT_TAG in goal_text
+    goal_text2 = build_behavioral_verify_goal(None)
+    assert isinstance(goal_text2, str)
+    assert BEHAVIOR_VERDICT_TAG in goal_text2
 
 
 if __name__ == "__main__":

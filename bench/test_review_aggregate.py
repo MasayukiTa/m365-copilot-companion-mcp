@@ -696,6 +696,92 @@ def test_render_json_is_plain_dict_copy():
     json.dumps(out)  # must be JSON-serializable
 
 
+# --- P2 piece A: behavioral_verdict rendering (DEMONSTRATED marker + ranking) ----------------
+
+def _finding(**over):
+    base = {"file": "a.py", "line": 1, "severity": "high", "title": "t", "detail": "d",
+            "worker": "w0", "reason": "", "verified": None}
+    base.update(over)
+    return base
+
+
+def test_render_markdown_reproduced_marked_demonstrated_and_ranked_first():
+    not_reproduced = _finding(title="confirmed-not-reproduced", verify_verdict="confirmed",
+                               behavioral_verdict="not_reproduced")
+    reproduced = _finding(title="confirmed-reproduced", verify_verdict="confirmed",
+                           behavioral_verdict="reproduced")
+    plain_confirmed = _finding(title="confirmed-plain", verify_verdict="confirmed")
+    agg = {
+        "generated_at": 1.0, "workers_total": 1, "parse_errors": 0,
+        "findings": [not_reproduced, reproduced, plain_confirmed],
+        "by_severity": {"high": [not_reproduced, reproduced, plain_confirmed],
+                         "medium": [], "low": []},
+    }
+    md = render_markdown(agg)
+    assert "DEMONSTRATED" in md
+    assert "reasoned-but-not-reproduced" in md
+
+    # ranking: the reproduced finding's line must come before both other findings' lines
+    demonstrated_idx = md.index("confirmed-reproduced")
+    plain_idx = md.index("confirmed-plain")
+    not_repro_idx = md.index("confirmed-not-reproduced")
+    assert demonstrated_idx < plain_idx
+    assert demonstrated_idx < not_repro_idx
+
+
+def test_render_markdown_behavioral_header_summary_present_when_any_finding_carries_it():
+    agg = {
+        "generated_at": 1.0, "workers_total": 1, "parse_errors": 0,
+        "findings": [_finding(behavioral_verdict="reproduced"),
+                     _finding(title="t2", behavioral_verdict="not_reproduced"),
+                     _finding(title="t3", behavioral_verdict="inconclusive")],
+        "by_severity": {"high": [], "medium": [], "low": []},
+    }
+    md = render_markdown(agg)
+    assert "behavioral verification: reproduced=1 (DEMONSTRATED) not_reproduced=1 inconclusive=1" in md
+
+
+def test_render_markdown_no_behavioral_header_when_no_finding_carries_verdict():
+    agg = {
+        "generated_at": 1.0, "workers_total": 1, "parse_errors": 0,
+        "findings": [_finding()],
+        "by_severity": {"high": [_finding()], "medium": [], "low": []},
+    }
+    md = render_markdown(agg)
+    assert "behavioral verification" not in md
+    assert "DEMONSTRATED" not in md
+
+
+def test_render_markdown_behavioral_evidence_printed():
+    agg = {
+        "generated_at": 1.0, "workers_total": 1, "parse_errors": 0,
+        "findings": [_finding(behavioral_verdict="reproduced",
+                               behavioral_evidence="実際に例外が発生した")],
+        "by_severity": {"high": [_finding(behavioral_verdict="reproduced",
+                                           behavioral_evidence="実際に例外が発生した")],
+                         "medium": [], "low": []},
+    }
+    md = render_markdown(agg)
+    assert "実際に例外が発生した" in md
+
+
+def test_render_json_adds_behavioral_summary_when_present():
+    agg = {"generated_at": 1.0, "workers_total": 0, "parse_errors": 0,
+           "findings": [_finding(behavioral_verdict="reproduced"),
+                        _finding(title="t2", behavioral_verdict="not_reproduced")],
+           "by_severity": {"high": [], "medium": [], "low": []}}
+    out = render_json(agg)
+    assert out["behavioral_summary"] == {"reproduced": 1, "not_reproduced": 1, "inconclusive": 0}
+
+
+def test_render_json_no_behavioral_summary_when_absent():
+    agg = {"generated_at": 1.0, "workers_total": 0, "parse_errors": 0,
+           "findings": [_finding()],
+           "by_severity": {"high": [], "medium": [], "low": []}}
+    out = render_json(agg)
+    assert "behavioral_summary" not in out
+
+
 if __name__ == "__main__":
     import sys
     raise SystemExit(pytest.main([__file__, "-q"] + sys.argv[1:]))
