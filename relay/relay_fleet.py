@@ -83,6 +83,16 @@ AGENT_DEAD_MARKERS = TRANSIENT_ERROR_MARKERS + ADMIN_BLOCK_MARKERS
 NET_RETRY_WINDOW_S = float(os.environ.get("MCP_NET_RETRY_S", "1800"))      # send/CDP/network: 30 min
 AGENT_ERR_WINDOW_S = float(os.environ.get("MCP_AGENT_ERR_S", "1200"))     # agent SystemError: 20 min
 
+# DEAD-ENDPOINT EARLY-EXIT (2026-07 fix). NET_RETRY_WINDOW_S rides out a REAL outage, which by
+# definition produces CHANGING symptoms over time (different errors, eventual recovery). If a
+# STUCK reply instead repeats byte-identical turn after turn, the endpoint isn't flapping -- it is
+# dead for this goal, and burning the full 30-min window against it just delays the inevitable
+# terminal STUCK. Reuses the EXISTING no-progress/normalization signal (self.no_progress, computed
+# in _decide from `norm == self.last_norm`) rather than a new response-comparison. Small K so a
+# couple of coincidental identical replies from a slow-but-alive agent don't false-trip, but a
+# genuinely wedged endpoint stops burning wall-clock quickly.
+NET_RETRY_NOPROGRESS_MAX = int(os.environ.get("MCP_NET_RETRY_NOPROGRESS_MAX", "3"))
+
 # TOOL-BACKEND-UNREACHABLE detector. When the MCP tool path (devtunnel) drops for even a moment, the
 # agent's tool calls fail and it WRONGLY concludes its tools don't exist / aren't assigned and self-
 # locks ("再試行では解消しません / won't respond without new input"). That is INFRA-FALSE (the tools
@@ -2082,6 +2092,21 @@ class RelayWorker:
                 self._goal_resends, self.max_goal_resends)
             return
         if reported_stuck(resp):
+            # DEAD-ENDPOINT EARLY-EXIT (2026-07 fix): self.no_progress (updated above, BEFORE this
+            # branch, from `norm == self.last_norm`) already counts consecutive VERBATIM-identical
+            # replies. A real transient outage produces CHANGING text turn to turn (different
+            # errors, eventual recovery) -- only a genuinely dead endpoint echoes the exact same
+            # STUCK text repeatedly. Don't wait out the full NET_RETRY_WINDOW_S (up to 30 min) on a
+            # goal that has already proven it cannot change; go terminal now. This does NOT touch
+            # the wall-clock cap itself (a slow-but-changing outage still rides the full window via
+            # _retry_transient below) -- it only adds an earlier terminal condition.
+            if self.no_progress >= NET_RETRY_NOPROGRESS_MAX:
+                if self._salvage_via_checks():
+                    return
+                self.status, self.outcome, self.reason = "stuck", "STUCK", \
+                    ("identical STUCK reply repeated %d times (no progress) -> dead endpoint, "
+                     "not waiting out the full %ds retry window" % (self.no_progress, NET_RETRY_WINDOW_S))
+                return
             # Under load, an agent STUCK is usually a downstream symptom of a transient
             # tool/network failure (the agent couldn't write a file etc.). Retry the turn
             # (re-prompt to try the tools again) before giving up, up to the budget.
@@ -2544,8 +2569,19 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     def _unfinished():
         # reconstruct the full goal (incl. acceptance checks/cwd) so a resume after a
         # wedged Edge keeps verifying -- returning bare text would drop the gate.
+        #
+        # FINISHED set (do NOT resurrect): DONE/CANCELLED were already excluded. STUCK is added
+        # here (2026-07 overnight-stall fix) because a plain STUCK worker already exhausted its
+        # full transient-retry budget (_retry_transient / NET_RETRY_WINDOW_S) or another terminal
+        # check in _decide and is a genuinely broken/un-fixable goal -- resurrecting it after an
+        # Edge-context-loss recovery just re-runs the SAME un-fixable goal through another full
+        # 30-minute retry window. INFRA_STUCK is DELIBERATELY EXCLUDED from this set: it means our
+        # own network/tunnel/tool path looked unhealthy (see the INFRA_STUCK branches in _decide),
+        # NOT that the goal/agent is broken -- that's transient infra, re-queueable by design, so a
+        # fresh Edge context still gets another shot at it.
+        FINISHED_OUTCOMES = ("DONE", "CANCELLED", "STUCK")
         return [{"text": w.goal, "checks": w.checks, "cwd": w.cwd}
-                for w in workers if w.outcome not in ("DONE", "CANCELLED")]
+                for w in workers if w.outcome not in FINISHED_OUTCOMES]
 
     _reap_counter = 0
     while any(w.status not in TERMINAL for w in workers) or (add_box and len(add_box) > 0):
