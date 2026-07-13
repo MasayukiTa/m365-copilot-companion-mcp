@@ -64,6 +64,7 @@ jobs:
             tools/test_data_discovery.py \
             tools/test_data_aliases.py \
             tools/test_procedural_memory.py \
+            tools/test_agent_memory_ops.py \
             tools/test_auth_stats.py \
             scripts/test_bootstrap.py \
             relay/test_acceptance.py \

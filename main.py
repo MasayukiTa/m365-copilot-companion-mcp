@@ -60,6 +60,12 @@ from tools.procedural_memory import (
     procedural_memory_save,
     procedural_memory_search,
 )
+from tools.agent_memory_ops import (
+    agent_memory_list,
+    agent_memory_read,
+    agent_memory_save,
+    agent_memory_search,
+)
 from tools.data_discovery import find_db_objects
 from tools.data_memory_hook import data_memory_status
 from tools.data_aliases import data_aliases_add, data_aliases_list
@@ -241,6 +247,16 @@ TOOLS = (
     # sets are fixed above, so MCP_TOOL_MAP truncation never registers it directly --
     # reachable only via call_tool("procedural_memory_import_markdown", {...})).
     procedural_memory_import_markdown,
+    # memory: agent_memory/ WRITE engine -- structured per-topic notebooks (summary,
+    # data_sources, method, key_facts, decisions, artifacts, next_actions, ...), distinct
+    # from the flat KV store above and from procedural_memory's slug-keyed snippets.
+    # Named agent_memory_* (not memory_*) because tools.memory_ops already exports
+    # module-level memory_save/memory_list -- reusing those names would collide in
+    # main.py's _ALL_TOOLS dict, which is keyed by function __name__. Gateway-only, same
+    # reasoning as procedural_memory_import_markdown above -- reachable only via
+    # call_tool("agent_memory_save"/"agent_memory_search"/"agent_memory_read"/
+    # "agent_memory_list", {...}).
+    agent_memory_save, agent_memory_search, agent_memory_read, agent_memory_list,
     # DB discovery: NL entry point over procedural memory + live ODBC fallback
     # (gateway-only, same reasoning as procedural_memory_import_markdown above).
     find_db_objects,
