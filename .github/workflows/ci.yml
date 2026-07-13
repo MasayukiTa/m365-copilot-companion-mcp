@@ -47,7 +47,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install "fastmcp>=2.0,<3.0" "python-dotenv" "pytest>=7.0" "psutil>=5.9" "pandas"
+          pip install "fastmcp>=3.4.4,<4.0" "python-dotenv" "pytest>=7.0" "psutil>=5.9" "pandas"
 
       # Run only the hermetic test paths. Explicit file list is the safest guard
       # against accidentally picking up non-hermetic tests when new files are added.
