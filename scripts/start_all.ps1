@@ -140,10 +140,69 @@ function Pump-Splash($splash) {
 # (Stop-Splash removed: the splash is shown MODALLY via ShowDialog and closed by the one-shot
 #  timer that drives Invoke-Startup; the minimum on-screen time is enforced inside Invoke-Startup.)
 
+function Invoke-TunnelHealPreflight {
+    # Self-heal MCP_TUNNEL_NAME/MCP_TUNNEL_URL BEFORE the supervisor starts, so it
+    # hosts the tunnel this account actually owns (an .env copied from another
+    # machine can otherwise name a tunnel that machine's account owns, which
+    # fails to host here). Same safety envelope as Check-ForUpdates below: a
+    # background job with a hard deadline so a hung/offline devtunnel CLI can
+    # never delay startup, and every error is swallowed -- this step must never
+    # be able to prevent the stack from coming up. Runs in BOTH normal and
+    # -NoUi startup (it is non-interactive and silent either way).
+    try {
+        $healScript = Join-Path $scriptDir "heal_tunnel.ps1"
+        if (-not (Test-Path $healScript)) { return }
+        $job = Start-Job -ScriptBlock {
+            param($p)
+            try { & $p 2>&1 | Out-String } catch { "" }
+        } -ArgumentList $healScript
+        $deadline = (Get-Date).AddSeconds(25)
+        while ($job.State -eq 'Running' -and (Get-Date) -lt $deadline) {
+            Pump-Splash $script:splash
+            Start-Sleep -Milliseconds 150
+        }
+        if ($job.State -eq 'Running') {
+            try { Stop-Job $job -ErrorAction SilentlyContinue } catch { }
+        } else {
+            $out = Receive-Job $job
+            if ($out -and $out.Trim()) { Write-Host ($out.Trim()) }
+        }
+        try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch { }
+    } catch {
+        # Tunnel self-heal is best-effort only; never block startup.
+    }
+}
+
+function Test-ShouldReExecAfterUpdate {
+    # PURE decision helper (no I/O, no side effects) -- should start_all re-exec
+    # itself after a self-update just landed new files on disk? True only when
+    # ALL of: this is not already the guarded fresh re-launch, the checkout was
+    # actually behind, and the pull actually succeeded. Factored out so the
+    # decision can be scenario-tested in isolation without running real git/UI.
+    param(
+        [bool]$GuardAlreadySet,
+        [int]$Behind,
+        [bool]$PullSucceeded
+    )
+    if ($GuardAlreadySet) { return $false }
+    if ($Behind -le 0) { return $false }
+    if (-not $PullSucceeded) { return $false }
+    return $true
+}
+
 function Check-ForUpdates {
     # Non-fatal pre-flight: if the local checkout is behind the remote, offer to update.
     # Any failure (no git, no upstream, offline, auth needed, fetch timeout, pull fail)
     # is swallowed so daily startup is NEVER blocked. Runs once, before services start.
+    #
+    # LOOP GUARD: if this process is already the FRESH re-launch of a self-update (see
+    # the re-exec block near the end of the try{} below), skip the update-check (and
+    # therefore any further re-exec) entirely -- this makes exactly one re-exec
+    # possible per real startup; it can never loop.
+    if ($env:MCP_STARTALL_REEXEC -eq "1") {
+        Write-Host "[update] update check skipped (already applied an update and re-launched this startup)"
+        return
+    }
     try {
         # 1) Must be a git work tree.
         & git -C $root rev-parse --is-inside-work-tree 2>$null | Out-Null
@@ -214,6 +273,35 @@ function Check-ForUpdates {
         } catch { $rebuildNote = "`n`nUI rebuild skipped (error)." }
 
         Show-OwnedDialog ("Updated to the latest version.{0}" -f $rebuildNote) $title "OK" "Information" | Out-Null
+
+        # 8) DESIGN NOTE: the pull above just landed new files on disk, but THIS process
+        #    is still running the OLD (pre-pull) start_all.ps1 that was already loaded
+        #    into memory when it started -- without re-exec, none of the freshly-pulled
+        #    code (this very fix included, e.g. tunnel self-heal wiring) takes effect
+        #    until a SECOND run. Fix: re-launch the just-pulled script now, the same
+        #    hidden way the .vbs launcher does, preserving the original switches, and
+        #    let the FRESH process finish this startup (heal + stack) with the pulled
+        #    code; THIS process then exits so only the fresh instance continues. Never
+        #    lets a re-exec failure stop startup: any error here is swallowed and this
+        #    (old) process simply falls through and keeps going on its own.
+        $guardAlreadySet = ($env:MCP_STARTALL_REEXEC -eq "1")
+        if (Test-ShouldReExecAfterUpdate -GuardAlreadySet $guardAlreadySet -Behind $behind -PullSucceeded $true) {
+            try {
+                $selfPath = Join-Path $scriptDir "start_all.ps1"
+                if (Test-Path $selfPath) {
+                    $reArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $selfPath)
+                    if ($NoUi) { $reArgs += "-NoUi" }
+                    if ($NoSplash) { $reArgs += "-NoSplash" }
+                    $env:MCP_STARTALL_REEXEC = "1"
+                    Start-Process powershell -WindowStyle Hidden -ArgumentList $reArgs | Out-Null
+                    exit
+                }
+            } catch {
+                # Re-exec is best-effort only -- fall through and let this (old)
+                # process finish the current startup rather than leaving nothing
+                # running.
+            }
+        }
     } catch {
         # Update check is best-effort only; never block startup.
         return
@@ -427,6 +515,12 @@ function Invoke-Startup {
         Set-SplashStatus $script:splash "Checking for updates..."
         Check-ForUpdates
     }
+
+    # Dev Tunnel self-heal (best-effort, non-blocking, runs even under -NoUi):
+    # repoints MCP_TUNNEL_NAME/MCP_TUNNEL_URL to a tunnel this account actually
+    # owns, BEFORE the supervisor (below) hosts it.
+    Set-SplashStatus $script:splash "Checking the Dev Tunnel..."
+    Invoke-TunnelHealPreflight
 
     Write-Host "=== Daily startup (idempotent -- already-running parts are left as-is) ==="
 
