@@ -424,6 +424,7 @@ class CockpitWindow : Window
         if (k == "hs_fix_stack") return ja ? "サーバ/トンネルを起動しています(最大2分)" : "Starting server/tunnel (up to ~2 min)";
         if (k == "hs_fix_done") return ja ? "完了" : "done";
         if (k == "hs_fix_err") return ja ? "修復でエラー" : "fix error";
+        if (k == "hs_fix_manual_needed") return ja ? "手動での対応が必要です" : "Manual step needed";
         if (k == "infra_wait") return ja ? "インフラ待ち" : "Infra wait";
         if (k == "infra_retry") return ja ? "再投入" : "Re-queue";
         if (k == "badge_default_copilot") return ja ? "既定Copilot" : "default Copilot";
@@ -1725,13 +1726,49 @@ class CockpitWindow : Window
             return;
         }
 
-        // Priority 4: Server RED or Tunnel RED -> actually launch the stack bring-up (the same
-        // path the desktop icon uses), instead of just telling the user to run start_all.bat.
+        // Priority 4: Server RED or Tunnel RED -> route through the situation-aware repair
+        // dispatcher (scripts\repair.ps1 -Auto -ResultJson) instead of blindly launching the
+        // stack bring-up. doctor.ps1's layered Dev Tunnel diagnosis (and repair.ps1's tiers
+        // built on it) know the difference between "server/tunnel just need starting" (Tier A,
+        // fixed by start_all -- repair.ps1 runs this itself under -Auto) and "the devtunnel CLI
+        // login expired" (Tier C, human-only -- start_all can NEVER fix this, so the old blind
+        // RunStartAll() here used to do nothing useful and leave the user stuck). Run off the
+        // UI thread like the other async tiers above so a slow repair pass cannot freeze the UI.
         if (server == HealthState.Red || tunnel == HealthState.Red)
         {
             note(T("hs_fix_stack"));
-            RunStartAll();
-            done();
+            var t = new Thread(new ThreadStart(delegate
+            {
+                try
+                {
+                    string repairPs1 = Path.Combine(repo, "scripts", "repair.ps1");
+                    RepairResult rr = File.Exists(repairPs1) ? ParseRepairResult(RunRepairDispatcher(repairPs1)) : null;
+                    if (rr == null)
+                    {
+                        // repair.ps1 missing, failed to run, or its output could not be parsed --
+                        // never regress: fall back to the previous blind stack bring-up.
+                        RunStartAll();
+                        note(T("hs_fix_stack"));
+                    }
+                    else if (rr.HumanSteps.Count > 0)
+                    {
+                        // The key win: tell the user the exact manual step (e.g. devtunnel login)
+                        // instead of silently re-running start_all, which cannot fix a Tier C cause.
+                        note(T("hs_fix_manual_needed") + ":  " + string.Join("   /   ", rr.HumanSteps.ToArray()));
+                    }
+                    else if (rr.FinalBad == 0)
+                    {
+                        note(T("hs_fix_done"));
+                    }
+                    else
+                    {
+                        note(T("hs_fix_stack"));
+                    }
+                }
+                catch (Exception ex) { note(T("hs_fix_err") + ": " + ex.Message); RunStartAll(); }
+                finally { done(); }
+            })) { IsBackground = true };
+            t.Start();
             return;
         }
 
@@ -1874,6 +1911,84 @@ class CockpitWindow : Window
             try { if (!p.WaitForExit(600000)) return -1; } catch (Exception) { return -1; }
             try { return p.ExitCode; } catch (Exception) { return -1; }
         }
+    }
+
+    // Parsed shape of scripts\repair.ps1 -ResultJson's final JSON line:
+    //   { autofixed:[{id,note}], confirmNeeded:[{id,note}], humanSteps:[{id,step}],
+    //     finalOk:<int>, finalBad:<int> }
+    // RunFix's Priority 4 tier only needs HumanSteps (to surface the manual step, e.g.
+    // "devtunnel login") and FinalBad (to tell "fixed" from "still broken, no human step
+    // known") -- autofixed/confirmNeeded are part of the JSON but not consumed here.
+    class RepairResult
+    {
+        public List<string> HumanSteps = new List<string>();
+        public int FinalOk;
+        public int FinalBad;
+    }
+
+    // Runs  scripts\repair.ps1 -Auto -ResultJson  windowless and returns its captured stdout.
+    // -Auto: Tier A repairs (e.g. start the stack) run automatically; Tier B (install/rebuild)
+    // is skipped, not attempted unattended; Tier C (human-only, e.g. devtunnel login) is only
+    // ever printed, never attempted. Same ProcessStartInfo shape as RunPowershellScript/
+    // RunReconnect above; up to ~2 min for the stack bring-up, same budget RunStartAll assumes.
+    string RunRepairDispatcher(string repairPs1)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo();
+        psi.FileName = "powershell";
+        psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" + repairPs1 + "\" -Auto -ResultJson";
+        psi.WorkingDirectory = RepoRoot();
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError = true;
+        string stdoutText = "";
+        using (var p = System.Diagnostics.Process.Start(psi))
+        {
+            try { stdoutText = p.StandardOutput.ReadToEnd(); } catch (Exception) { }
+            try { p.StandardError.ReadToEnd(); } catch (Exception) { }
+            try { p.WaitForExit(180000); } catch (Exception) { }
+        }
+        return stdoutText;
+    }
+
+    // Parses repair.ps1 -ResultJson's LAST non-empty stdout line as the compact JSON summary
+    // (every earlier line is repair.ps1's normal human-readable progress text). Returns null
+    // (never throws) if nothing parseable was produced -- the caller then falls back to the
+    // previous blind RunStartAll() behavior so a missing/broken repair.ps1 can never regress
+    // the Fix button. Reuses the file's existing _js (JavaScriptSerializer) instance.
+    RepairResult ParseRepairResult(string stdoutText)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(stdoutText)) return null;
+            string[] lines = stdoutText.Replace("\r\n", "\n").Split('\n');
+            string lastLine = null;
+            for (int i = lines.Length - 1; i >= 0; i--)
+            {
+                if (!string.IsNullOrEmpty(lines[i].Trim())) { lastLine = lines[i].Trim(); break; }
+            }
+            if (lastLine == null) return null;
+            var d = _js.DeserializeObject(lastLine) as Dictionary<string, object>;
+            if (d == null) return null;
+
+            var rr = new RepairResult();
+            object hs;
+            if (d.TryGetValue("humanSteps", out hs) && hs is object[])
+            {
+                foreach (var item in (object[])hs)
+                {
+                    var m = item as Dictionary<string, object>;
+                    object step;
+                    if (m != null && m.TryGetValue("step", out step) && step != null)
+                        rr.HumanSteps.Add(Convert.ToString(step));
+                }
+            }
+            object fo, fb;
+            rr.FinalOk  = d.TryGetValue("finalOk", out fo)  ? Convert.ToInt32(fo)  : 0;
+            rr.FinalBad = d.TryGetValue("finalBad", out fb) ? Convert.ToInt32(fb) : 0;
+            return rr;
+        }
+        catch (Exception) { return null; }
     }
 
     // Fire the full stack bring-up EXACTLY the way the desktop icon does: wscript.exe running
