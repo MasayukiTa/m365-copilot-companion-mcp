@@ -102,6 +102,7 @@ from bench.review_build_goals import (
     CLEAR_FRAMING_PREAMBLE,
 )
 from bench.review_adjudicate import adjudicate_findings
+from bench.review_baseline import diff_against_baseline, load_baseline, save_baseline, should_gate
 from bench.review_decompose import (
     MAX_CHILDREN_PER_PARENT, MAX_DECOMPOSITION_DEPTH, MAX_TOTAL_RECOVERY_GOALS,
     build_child_envelopes, build_decomposer_goal, parse_subtasks, validate_subtasks,
@@ -1059,6 +1060,46 @@ def _resolve_out_dir(out_dir, repo_root):
     return out_dir if os.path.isabs(out_dir) else os.path.join(repo_root, out_dir)
 
 
+_REPORT_JSON_PREFIX = "review_report_"
+_REPORT_JSON_SUFFIX = ".json"
+
+
+def _resolve_auto_baseline_path(out_dir, current_stamp):
+    """--baseline auto support: find the most recent prior review_report_<stamp>.json under
+    out_dir, EXCLUDING the report this run is about to write (current_stamp). Returns the
+    path, or None if no prior report exists (first-run bootstrap case).
+
+    Sorts primarily by the stamp embedded in the filename (review_run._stamp()'s
+    "%Y%m%d_%H%M%S" format sorts correctly as a plain string; --loop round reports append an
+    "_rN" suffix that still sorts after their own base stamp), with file mtime as a fallback
+    tiebreaker for stamps that don't compare meaningfully on their own. Never raises: an
+    unreadable out_dir or a stat() failure on a candidate degrades that candidate away rather
+    than propagating."""
+    if not os.path.isdir(out_dir):
+        return None
+    candidates = []
+    try:
+        names = os.listdir(out_dir)
+    except OSError:
+        return None
+    for name in names:
+        if not (name.startswith(_REPORT_JSON_PREFIX) and name.endswith(_REPORT_JSON_SUFFIX)):
+            continue
+        stamp = name[len(_REPORT_JSON_PREFIX):-len(_REPORT_JSON_SUFFIX)]
+        if stamp == current_stamp:
+            continue
+        full = os.path.join(out_dir, name)
+        try:
+            mtime = os.path.getmtime(full)
+        except OSError:
+            mtime = 0
+        candidates.append((stamp, mtime, full))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: (c[0], c[1]))
+    return candidates[-1][2]
+
+
 def build_arg_parser():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1129,6 +1170,30 @@ def build_arg_parser():
                           "each round and seeds the next round's plan_goals with its "
                           "suggested extra dimensions/files. Independent of --loop -- works "
                           "on its own")
+    ap.add_argument("--baseline", default=None,
+                     help="path to a baseline JSON file (bench/review_baseline.py), OR the "
+                          "literal value 'auto' to use the most recent prior "
+                          "review_report_<stamp>.json in --out-dir (excluding the report this "
+                          "run is about to write). After aggregation, this run's findings are "
+                          "diffed against it and the result is attached to the report as "
+                          "agg['baseline_diff']. A missing explicit path is treated as an "
+                          "empty baseline (bootstrap, not an error); a corrupt/unreadable "
+                          "explicit path is a hard error. 'auto' with no prior report found "
+                          "also bootstraps an empty baseline (printed, not an error)")
+    ap.add_argument("--write-baseline", default=None,
+                     help="write a NEW baseline JSON file to this path after the run, "
+                          "snapshotting every CONFIRMED finding (or every reported finding if "
+                          "--no-refute was passed, since there is then no verdict to filter "
+                          "on). Can be combined with --baseline (diff against the OLD one, "
+                          "then write a NEW one reflecting this run) or used standalone to "
+                          "bootstrap a first baseline")
+    ap.add_argument("--fail-on", choices=["low", "medium", "high"], default=None,
+                     help="requires --baseline (path or 'auto'): after the report is written, "
+                          "exit nonzero if any NEW or REGRESSED finding (relative to the "
+                          "baseline) is at or above this severity. Passing --fail-on without "
+                          "--baseline is a misconfiguration and exits immediately. Not "
+                          "evaluated in --loop mode (a one-line notice is printed instead, "
+                          "and the baseline diff is still attached to the report)")
     return ap
 
 
@@ -1142,6 +1207,10 @@ def main(argv=None):
     if resilience_profile != "off" and args.loop:
         print("ERROR: P2c resilience currently runs as a bounded single campaign; --loop is not "
               "combined with --resilience-profile (use /review-2 or /security-review-2 without --loop).")
+        return 2
+    if args.fail_on and not args.baseline:
+        print("ERROR: --fail-on requires --baseline (path or 'auto') -- there is nothing to "
+              "gate against without one.")
         return 2
 
     repo_root = REPO
@@ -1334,6 +1403,50 @@ def main(argv=None):
             else:
                 print("completeness critic: no gaps identified")
 
+    # --baseline / --write-baseline: purely additive, applies identically whether `agg` came
+    # from the single-pass branch above or run_review_loop -- both shapes carry "findings".
+    baseline_diff = None
+    if args.baseline:
+        if args.baseline == "auto":
+            auto_path = _resolve_auto_baseline_path(out_dir, stamp)
+            if auto_path is None:
+                print("baseline: no prior report found in %s; treating all findings as new" %
+                      out_dir)
+                baseline_data = {"version": 1, "accepted": []}
+            else:
+                print("baseline: auto-resolved to %s" % auto_path)
+                try:
+                    baseline_data = load_baseline(auto_path)
+                except ValueError as e:
+                    print("ERROR: could not load auto-resolved baseline %r: %s" %
+                          (auto_path, e))
+                    return 2
+            if args.fail_on:
+                print("NOTE: --fail-on with --baseline auto gates against the LAST RUN's "
+                      "own report, which shifts every run -- fine for local iteration, but a "
+                      "pinned explicit --baseline PATH is recommended for CI gating.")
+        else:
+            try:
+                baseline_data = load_baseline(args.baseline)
+            except ValueError as e:
+                print("ERROR: could not load --baseline %r: %s" % (args.baseline, e))
+                return 2
+        baseline_diff = diff_against_baseline(agg.get("findings", []), baseline_data)
+        agg["baseline_diff"] = baseline_diff
+
+    if args.write_baseline:
+        # Mirrors the "confirmed, or everything if no verdict data" rule
+        # bench.review_baseline._accepted_from_run_report uses for --baseline auto, so a
+        # --write-baseline file and an auto-resolved prior report always mean the same thing.
+        if run_refute:
+            accepted = [f for f in agg.get("findings", [])
+                        if f.get("verify_verdict") == "confirmed"]
+        else:
+            accepted = list(agg.get("findings", []))
+        save_baseline(args.write_baseline, accepted, kind=args.kind, generated_at=stamp)
+        print("baseline written: %s (%d accepted finding(s))" %
+              (args.write_baseline, len(accepted)))
+
     os.makedirs(out_dir, exist_ok=True)
     md_path = os.path.join(out_dir, "review_report_%s.md" % stamp)
     json_path = os.path.join(out_dir, "review_report_%s.json" % stamp)
@@ -1364,6 +1477,27 @@ def main(argv=None):
         print("loop: rounds_run=%d/%d stopped_reason=%s unique_findings=%d" %
               (loop_meta["rounds_run"], loop_meta["max_rounds"], loop_meta["stopped_reason"],
                loop_meta["unique_findings"]))
+
+    # --fail-on: evaluated AFTER the report is written (the report is the audit trail even
+    # when the run goes on to fail CI). --fail-on without --baseline already returned 2 above,
+    # before any of this ran -- fail fast, never a silent no-op.
+    if args.fail_on:
+        if args.loop:
+            print("NOTE: --fail-on is not evaluated in --loop mode -- the baseline diff is "
+                  "still attached to the report (agg['baseline_diff']), but no gate check "
+                  "runs. Re-run without --loop against the same --baseline to gate.")
+        else:
+            should_fail, offending = should_gate(baseline_diff or {"new": [], "regressed": []},
+                                                  args.fail_on)
+            if should_fail:
+                print("GATE: %d finding(s) at or above '%s' severity are NEW or REGRESSED "
+                      "since baseline." % (len(offending), args.fail_on))
+                for f in offending:
+                    line = f.get("line")
+                    print("  %s:%s:%s:%s" % (
+                        f.get("file", "?"), line if line is not None else "?",
+                        f.get("title", ""), f.get("severity", "?")))
+                return 3
     return 0
 
 

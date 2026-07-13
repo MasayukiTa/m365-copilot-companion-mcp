@@ -851,6 +851,70 @@ def test_render_markdown_no_completeness_gaps_key_omits_section():
     assert "completeness critic" not in md
 
 
+def test_render_markdown_no_baseline_diff_key_renders_identically_to_before():
+    """agg without a "baseline_diff" key must render byte-identical to before this feature
+    existed -- same contract as the loop_meta/completeness_gaps regression guard above."""
+    agg = _base_agg()
+    md = render_markdown(agg)
+    assert "baseline" not in md.lower()
+
+
+def test_render_markdown_baseline_diff_counts_line():
+    agg = _base_agg(baseline_diff={
+        "new": [{"file": "a.py", "line": 1, "title": "New one", "severity": "high"}],
+        "regressed": [{"file": "b.py", "line": 2, "title": "Regressed one", "severity": "medium"}],
+        "resolved": [{"file": "c.py", "line": 3, "title": "Resolved one", "severity": "low"}],
+        "unchanged": [],
+    })
+    md = render_markdown(agg)
+    assert "baseline diff: new=1 regressed=1 resolved=1 unchanged=0" in md
+
+
+def test_render_markdown_baseline_diff_lists_new_and_regressed():
+    agg = _base_agg(baseline_diff={
+        "new": [{"file": "a.py", "line": 1, "title": "New one", "severity": "high"}],
+        "regressed": [{"file": "b.py", "line": 2, "title": "Regressed one", "severity": "medium"}],
+        "resolved": [],
+        "unchanged": [],
+    })
+    md = render_markdown(agg)
+    assert "## Baseline diff: new / regressed findings (2)" in md
+    assert "### New (1)" in md
+    assert "a.py:1:New one:high" in md
+    assert "### Regressed (1)" in md
+    assert "b.py:2:Regressed one:medium" in md
+
+
+def test_render_markdown_baseline_diff_only_resolved_unchanged_omits_detail_section():
+    """Counts line still shows, but the actionable detail section is omitted when there's
+    nothing new/regressed to act on."""
+    agg = _base_agg(baseline_diff={
+        "new": [], "regressed": [],
+        "resolved": [{"file": "a.py", "line": 1, "title": "Fixed", "severity": "high"}],
+        "unchanged": [{"file": "b.py", "line": 2, "title": "Still fine", "severity": "low"}],
+    })
+    md = render_markdown(agg)
+    assert "baseline diff: new=0 regressed=0 resolved=1 unchanged=1" in md
+    assert "## Baseline diff" not in md
+
+
+def test_render_markdown_baseline_diff_empty_dict_is_falsy_omits_section():
+    agg = _base_agg(baseline_diff={"new": [], "regressed": [], "resolved": [], "unchanged": []})
+    md = render_markdown(agg)
+    assert "baseline diff: new=0 regressed=0 resolved=0 unchanged=0" in md
+    assert "## Baseline diff" not in md
+
+
+def test_render_json_carries_baseline_diff_verbatim():
+    agg = _base_agg(baseline_diff={
+        "new": [{"file": "a.py", "line": 1, "title": "T", "severity": "high"}],
+        "regressed": [], "resolved": [], "unchanged": [],
+    })
+    out = render_json(agg)
+    assert out["baseline_diff"] == agg["baseline_diff"]
+    json.dumps(out)
+
+
 def test_render_json_carries_loop_meta_and_completeness_gaps_verbatim():
     """render_json needs NO extra code for this -- it's already a shallow dict copy, so any
     key present on `agg` (including the new P3 ones) is carried over automatically."""
