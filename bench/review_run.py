@@ -7,7 +7,8 @@ relay.fleet_runner and waiting for it to finish.
   python bench/review_run.py --kind review --dry-run          # plan only, no fleet launch
   python bench/review_run.py --kind review                    # full repo, launches the fleet
   python bench/review_run.py --kind security --mode diff       # review only the working diff
-  python bench/review_run.py --kind review --verify            # + adversarial 2nd-pass check
+  python bench/review_run.py --kind review --no-refute         # skip the refuter pass
+  python bench/review_run.py --kind review --refute-panel      # 3-lens refuter panel/finding
 
 FLOW:
   1. enumerate_files -> optional --target-path filter -> group_files -> fan out one
@@ -19,12 +20,18 @@ FLOW:
   3. Otherwise: run_fleet() launches relay.fleet_runner and blocks until it exits, then
      aggregate()/render_markdown()/render_json() turn .fleet/status.json into
      <out-dir>/review_report_<stamp>.{md,json}.
-  4. --verify (optional, off by default -- costs a second fleet run): takes the flattened
-     findings from step 3 and asks a FRESH batch of workers to adversarially confirm or
-     reject each one (verify_goals_from_findings), then merges verdicts back into the report.
+  4. By DEFAULT (skip with --no-refute): every finding from step 3 is handed to the EXISTING
+     adversarial refuter (relay/refuter.py, via refute_findings()) -- an independent skeptic
+     that tries to REFUTE the finding, run as its own fleet pass. REFUTED findings get
+     verify_verdict="false_positive" (bench/review_fix.py's filter_findings already drops
+     these); UPHELD -> "confirmed"; unparseable/UNCLEAR -> "unclear". --refute-panel widens
+     this to relay.refuter.PANEL_LENSES (3 independent lenses per finding, majority vote)
+     instead of one lens per finding. This SUPERSEDES the old bespoke VERIFY_RUBRIC 2nd-pass
+     verifier (removed) -- there is now exactly one verification mechanism. --verify is kept
+     as a deprecated alias that also enables panel mode, for old callers/scripts.
 
 Everything that actually launches a subprocess lives in run_fleet() -- the only function
-tests must monkeypatch to stay hermetic. Every other step (planning, verify-goal building,
+tests must monkeypatch to stay hermetic. Every other step (planning, refute-goal building,
 aggregation wiring) is reachable and tested without the fleet.
 """
 from __future__ import annotations
@@ -32,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -46,20 +54,21 @@ VENVPY = os.path.join(REPO, ".venv", "Scripts", "python.exe")
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
-from bench.review_aggregate import aggregate, render_json, render_markdown
+from bench.review_aggregate import aggregate, render_json, render_markdown, worker_final_text
 from bench.review_build_goals import (
     FINDINGS_BEGIN,
     FINDINGS_END,
     build_dimension_goal,
+    build_refute_goal,
     dimensions_for_kind,
     enumerate_files,
     group_files,
     write_goals_jsonl,
 )
+from relay.refuter import PANEL_LENSES, aggregate_panel, parse_verdict
 
 DEFAULT_OUT_DIR = ".fleet/review"
 DEFAULT_ALL_GROUP_SIZE = 20
-DEFAULT_VERIFY_BATCH = 10
 FLEET_MAX_TURNS = "40"
 
 # Fan-out multiplies goal count by len(dimensions) vs. the old one-rubric-per-file-group
@@ -181,52 +190,124 @@ def run_fleet(goals_path, max_concurrent, effort, state_dir=None):
     return proc.returncode
 
 
-VERIFY_RUBRIC = (
-    "以下はコードレビューで報告された指摘事項です。それぞれについて該当ファイルを\n"
-    "ファイルツール（read_file / grep 等）で実際に読み、指摘が本当に正しいか、誤検知でないかを\n"
-    "判定してください。\n"
-    "対象リポジトリ（このPCのローカル、git チェックアウト済み）:\n"
-    "  {REPO}\n\n"
-    "指摘一覧:\n"
-    "{FINDINGS_TEXT}\n\n"
-    "作業の最後に、次の形式で各指摘の判定をJSON配列として出力してください（この行より前にも\n"
-    "後にも文章を書いて構いませんが、必ず以下の2行のデリミタで囲んでください）:\n\n"
-    + FINDINGS_BEGIN + "\n"
-    "[\n"
-    '  {"file": "path/to/file.py", "line": 123, "title": "...", '
-    '"verdict": "confirmed", "reason": "..."}\n'
-    "]\n"
-    + FINDINGS_END + "\n\n"
-    "verdict は \"confirmed\" / \"false_positive\" / \"unclear\" のいずれか。\n"
-    "このブロックを出力した後、最後に DONE と書いて終了してください。"
-)
+_WORKER_NAME_RE = re.compile(r"w(\d+)$")
 
 
-def verify_goals_from_findings(findings, repo_root, batch_size=DEFAULT_VERIFY_BATCH):
-    """PURE (no fleet, no I/O): build second-round adversarial-verification goals from a
-    flattened findings list (as produced by bench.review_aggregate.aggregate()["findings"]).
+def _worker_index(worker):
+    """Recover the 0-based goal index from a relay.relay_fleet worker's "name" field
+    ("w0", "w1", ...). relay.relay_fleet.py assigns names as "w%d" % i in the SAME order
+    the goals list was submitted (workers = [RelayWorker(g, "w%d" % i, ...) for i, g in
+    enumerate(goals)]), and its final status.json workers[] list preserves that same order
+    -- so this index reliably maps a finished worker back to the goal (and, via
+    refute_findings' own goal_index_map, the finding/lens) it was given. Returns None if the
+    name is missing or doesn't match the "w<N>" shape (never raises)."""
+    name = worker.get("name", "") if isinstance(worker, dict) else ""
+    m = _WORKER_NAME_RE.search(name)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
 
-    Chunks findings into batches of `batch_size` using group_files -- it is a generic list
-    chunker, not git-specific, so it is safe to reuse here on findings dicts instead of
-    filenames. Each finding's file/line/title appears verbatim in its goal's text, followed
-    by a <<<FINDINGS>>>...<<<END_FINDINGS>>> verdict-block instruction: the SAME delimiters
-    the first pass uses, so bench.review_aggregate.parse_findings_block can parse a
-    worker's verdict list exactly like it parses findings, with no separate parser needed."""
-    batches = group_files(findings, batch_size)
-    goals = []
-    for batch in batches:
-        lines = []
-        for i, f in enumerate(batch):
-            lines.append(
-                "%d. file=%s line=%s severity=%s title=%s\n   detail: %s" % (
-                    i + 1, f.get("file", "?"), f.get("line"), f.get("severity", "?"),
-                    f.get("title", ""), f.get("detail", ""),
-                )
-            )
-        text = VERIFY_RUBRIC.replace("{REPO}", repo_root).replace(
-            "{FINDINGS_TEXT}", "\n".join(lines))
-        goals.append({"text": text, "cwd": repo_root})
-    return goals
+
+def refute_findings(findings, kind, out_dir, now, panel=False, max_concurrent=None,
+                     effort="auto", repo_root=None, stamp=None):
+    """Run EACH finding through the existing adversarial refuter (relay/refuter.py) as its own
+    fleet pass, and return a verdicts list shaped for merge_verdicts(findings, verdicts).
+
+    One refute goal per finding (default, single lens picked by build_refute_goal); with
+    panel=True, PANEL_LENSES (correctness/edge/security) goals per finding, later combined by
+    relay.refuter.aggregate_panel's majority vote. Goal order is deterministic (finding 0's
+    lens(es), then finding 1's, ...) and _worker_index() recovers each finished worker's goal
+    index from its "w<N>" name -- this is how a specific verdict is mapped back to the
+    specific finding it refutes (relay.refuter's own verdict text carries no file/line/title).
+
+    Never raises: a missing goals dir write, a fleet run that produces no status.json, or an
+    unparseable worker reply all degrade to that finding getting NO verdict entry (merge_verdicts
+    leaves its verify_verdict as None, same as "the refuter pass never ran" for it) -- a
+    refutation is a bonus signal, never a hard requirement for the review report to exist.
+
+    Returns [] immediately (no fleet launch) if `findings` is empty."""
+    if not findings:
+        return []
+    repo_root = repo_root or REPO
+    stamp = stamp or _stamp()
+    max_concurrent = _clamp_max_concurrent(
+        max_concurrent if max_concurrent is not None else DEFAULT_MAX_CONCURRENT)
+
+    lens_variants = list(PANEL_LENSES) if panel else [None]
+
+    goal_dicts = []
+    goal_index_map = []  # parallel to goal_dicts: (finding_index, lens_or_None)
+    for fi, finding in enumerate(findings):
+        for lens in lens_variants:
+            text = build_refute_goal(finding, kind, lens=lens)
+            goal_dicts.append({"text": text, "cwd": repo_root})
+            goal_index_map.append((fi, lens))
+
+    goals_path = os.path.join(out_dir, "refute_goals_%s.jsonl" % stamp)
+    write_goals_jsonl(goal_dicts, goals_path)
+
+    # Own state dir (mirrors the old verify pass) so this run's status.json/transcripts never
+    # collide with -- or get silently read back as -- the review pass's own .fleet/status.json.
+    refute_state_dir = os.path.join(out_dir, "refute_state_%s" % stamp)
+    refute_status_path = os.path.join(refute_state_dir, "status.json")
+    refute_transcripts_dir = os.path.join(refute_state_dir, "transcripts")
+
+    run_fleet(goals_path, max_concurrent, effort, state_dir=refute_state_dir)
+
+    if not os.path.isfile(refute_status_path):
+        print("WARNING: refuter pass produced no status.json at %s; skipping (findings keep "
+              "verify_verdict=None)" % refute_status_path)
+        return []
+
+    try:
+        with open(refute_status_path, encoding="utf-8") as f:
+            status = json.load(f)
+    except Exception as e:
+        print("WARNING: could not read refuter status.json: %s" % e)
+        return []
+    workers = status.get("workers", []) if isinstance(status, dict) else []
+    if not isinstance(workers, list):
+        workers = []
+
+    # finding_index -> list of (lens, verdict_kind, reason)
+    per_finding = {}
+    for w in workers:
+        if not isinstance(w, dict):
+            continue
+        idx = _worker_index(w)
+        if idx is None or idx < 0 or idx >= len(goal_index_map):
+            continue
+        fi, lens = goal_index_map[idx]
+        text = worker_final_text(w, refute_transcripts_dir)
+        vkind, vreason = parse_verdict(text)
+        per_finding.setdefault(fi, []).append((lens or "", vkind, vreason))
+
+    verdicts = []
+    for fi, finding in enumerate(findings):
+        results = per_finding.get(fi)
+        if not results:
+            continue
+        if panel:
+            vkind, vreason = aggregate_panel(results)
+        else:
+            vkind, vreason = results[0][1], results[0][2]
+        if vkind == "REFUTED":
+            vv = "false_positive"
+        elif vkind == "UPHELD":
+            vv = "confirmed"
+        else:
+            vv = "unclear"
+        verdicts.append({
+            "file": finding.get("file", ""),
+            "line": finding.get("line"),
+            "title": finding.get("title", ""),
+            "verdict": vv,
+            "reason": vreason,
+        })
+    return verdicts
 
 
 def _finding_key(f):
@@ -273,9 +354,18 @@ def build_arg_parser():
                           "dimension fan-out multiplies goal count, so this stays bounded "
                           "regardless of the value passed here" % MAX_CONCURRENT_CEILING)
     ap.add_argument("--effort", choices=["min", "auto"], default="auto")
+    ap.add_argument("--no-refute", action="store_true",
+                     help="skip the adversarial refuter pass (relay/refuter.py) that runs by "
+                          "default: normally every finding is handed to an independent "
+                          "skeptic and REFUTED ones are dropped/demoted (costs a second "
+                          "fleet run, one goal per finding)")
+    ap.add_argument("--refute-panel", action="store_true",
+                     help="use a 3-lens refuter panel (relay.refuter.PANEL_LENSES: "
+                          "correctness/edge/security, majority vote) per finding instead of "
+                          "one lens per finding -- higher cost, more robust")
     ap.add_argument("--verify", action="store_true",
-                     help="run an optional 2nd adversarial verification pass (costs a "
-                          "second fleet run)")
+                     help="DEPRECATED alias for the refuter pass (which already runs by "
+                          "default) -- also enables --refute-panel, for old callers/scripts")
     ap.add_argument("--dry-run", action="store_true",
                      help="build goals and print the plan without launching the fleet")
     ap.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
@@ -352,31 +442,22 @@ def main(argv=None):
     agg["dimensions_covered"] = dims_used
 
     if args.verify:
+        print("--verify is deprecated; routing to the refuter-based pass (which already runs "
+              "by default) in panel mode")
+    run_refute = not args.no_refute
+    panel = args.refute_panel or args.verify
+
+    if run_refute:
         findings = agg.get("findings", [])
         if not findings:
-            print("--verify requested but there are no findings to verify; skipping")
+            print("no findings to refute; skipping refuter pass")
         else:
-            vgoals = verify_goals_from_findings(findings, repo_root)
-            vgoals_path = os.path.join(out_dir, "verify_goals_%s.jsonl" % stamp)
-            write_goals_jsonl(vgoals, vgoals_path)
-            # Run the verify pass in its OWN state dir so it writes a FRESH status.json /
-            # transcripts. Reusing the default .fleet/status.json here meant the second
-            # aggregate() could read the FIRST pass's snapshot (fleet not yet started, or
-            # crashed before overwriting) and merge the original findings back in as if they
-            # were verify verdicts. A separate dir makes "no verify snapshot" detectable
-            # instead of silently reusing stale data.
-            verify_state_dir = os.path.join(out_dir, "verify_state_%s" % stamp)
-            verify_status_path = os.path.join(verify_state_dir, "status.json")
-            verify_transcripts_dir = os.path.join(verify_state_dir, "transcripts")
-            print("launching verify pass: %d goal(s)..." % len(vgoals))
-            run_fleet(vgoals_path, max_concurrent, args.effort,
-                      state_dir=verify_state_dir)
-            if os.path.isfile(verify_status_path):
-                vagg = aggregate(verify_status_path, verify_transcripts_dir, now=time.time())
-                merge_verdicts(agg, vagg.get("findings", []))
-            else:
-                print("WARNING: verify pass produced no status.json at %s; skipping verdict "
-                      "merge (findings keep verify_verdict=None)" % verify_status_path)
+            print("launching refuter pass: %d finding(s)%s..." %
+                  (len(findings), " (panel)" if panel else ""))
+            verdicts = refute_findings(findings, args.kind, out_dir, time.time(),
+                                        panel=panel, max_concurrent=max_concurrent,
+                                        effort=args.effort, repo_root=repo_root, stamp=stamp)
+            merge_verdicts(agg, verdicts)
 
     os.makedirs(out_dir, exist_ok=True)
     md_path = os.path.join(out_dir, "review_report_%s.md" % stamp)
@@ -392,6 +473,11 @@ def main(argv=None):
         len(by_sev.get("high", [])), len(by_sev.get("medium", [])),
         len(by_sev.get("low", [])), agg.get("parse_errors", 0),
     ))
+    if run_refute:
+        confirmed = sum(1 for f in agg.get("findings", []) if f.get("verify_verdict") == "confirmed")
+        refuted = sum(1 for f in agg.get("findings", []) if f.get("verify_verdict") == "false_positive")
+        unclear = sum(1 for f in agg.get("findings", []) if f.get("verify_verdict") == "unclear")
+        print("refuter: confirmed=%d refuted/dropped=%d unclear=%d" % (confirmed, refuted, unclear))
     return 0
 
 
