@@ -216,6 +216,28 @@ Check "tunnel_name_private" "Dev Tunnel name is private (no identifying token)" 
     { -not (Test-IdentifyingTunnelName $tname) } `
     "Tunnel name leaks an identifying token to the dev tunnel service. Recreate with a private name: powershell -File scripts\setup_devtunnel.ps1  (this changes the public URL -- re-paste MCP_TUNNEL_URL into Copilot Studio, then remove the old one: devtunnel delete <oldname>)."
 
+# 3c. Ownership check -- catches an .env copied from another machine (MCP_TUNNEL_NAME
+# names a tunnel THIS account does not own, so `devtunnel host` fails with a scopes
+# error). Uses Check (not TunnelCheck) so it runs independently of the tunnel
+# dependency short-circuit above -- an unowned name is informative even when e.g.
+# the CLI isn't logged in (in which case the bounded call below just no-ops to a
+# safe PASS, since there is nothing to contradict "empty or unknown"). Bounded the
+# same way as the other devtunnel calls in this file.
+function Test-TunnelOwned([string]$name) {
+    if ([string]::IsNullOrWhiteSpace($name)) { return $true }
+    $out = Invoke-DevTunnelBounded @('list') 8
+    if (-not $out) { return $false }
+    $bareName = (($name -split '\.')[0]).ToLowerInvariant()
+    $ids = @($out -split "`r?`n" | ForEach-Object {
+        if ($_ -match '^\s*([a-z0-9][a-z0-9-]+\.[a-z0-9]+)\s') { $matches[1] }
+    } | Where-Object { $_ } | ForEach-Object { (($_ -split '\.')[0]).ToLowerInvariant() })
+    return ($ids -contains $bareName)
+}
+
+Check "tunnel_owned" "Dev Tunnel name is owned by this account (MCP_TUNNEL_NAME)" `
+    { Test-TunnelOwned $tname } `
+    "This .env names a dev tunnel your account does not own (it was likely copied from another machine). Run start_all.bat (it now repoints to your own tunnel automatically) or: powershell -File scripts\heal_tunnel.ps1"
+
 TunnelCheck "tunnel_serving" "Dev Tunnel host serving (public URL -> server)" `
     { if (-not $turl) { return $false }; (Invoke-WebRequest -Uri (($turl.TrimEnd('/')) + '/health') -TimeoutSec 7 -UseBasicParsing).StatusCode -eq 200 } `
     "the tunnel exists but is not being served -- run start_all.bat (the supervisor hosts it). If this stays red while the checks above are green, MCP_TUNNEL_URL in .env may be stale -- compare it to the URL shown by 'devtunnel show <name>'."
