@@ -260,7 +260,8 @@ class RefuterSession:
     send/wait state machine. Never raises; any failure yields ("UNCLEAR", "")."""
 
     def __init__(self, context, base_url, goal, final_response,
-                 dwell_s=4.0, timeout_s=600, max_nudges=2, lens=""):
+                 dwell_s=4.0, timeout_s=600, max_nudges=2, lens="",
+                 max_network_reopens=2):
         self.context = context
         self.base_url = base_url
         self.goal = goal
@@ -278,6 +279,8 @@ class RefuterSession:
         self._nudges_used = 0
         self._pending_open = True  # side-page not opened yet -- deferred until there's free RAM
         self._done = None          # verdict tuple once finished
+        self._network_reopens = 0
+        self.max_network_reopens = max_network_reopens
 
     def start(self):
         # Defer the side-page open until poll() sees enough free RAM (ram_room_for_tab) -- the
@@ -290,7 +293,10 @@ class RefuterSession:
 
     def _do_open(self):
         import time
-        from .copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver
+        from .copilot_autopilot_relay import (
+            COPILOT_SELECTORS, CopilotWebDriver, _is_network_failure,
+            _page_network_available,
+        )
         try:
             if self.context is None or not self.base_url:
                 self._finish(("UNCLEAR", ""))
@@ -312,13 +318,41 @@ class RefuterSession:
             self.drv.send(build_refuter_prompt(self.goal, self.final, lens=self.lens))
             self._pending_open = False
             self._t_send = time.time()
-        except Exception:
+        except Exception as exc:
+            if (_is_network_failure(exc)
+                    or (self.page is not None and not _page_network_available(self.page))):
+                self._schedule_network_reopen("open failed: %s" % type(exc).__name__)
+            else:
+                self._finish(("UNCLEAR", ""))
+
+    def _schedule_network_reopen(self, reason):
+        """Close the stale side page and retry the same read-only refuter prompt later."""
+        import sys
+        import time
+        if self._network_reopens >= self.max_network_reopens:
             self._finish(("UNCLEAR", ""))
+            return
+        self._network_reopens += 1
+        try:
+            if self.page is not None:
+                self.page.close()
+        except Exception:
+            pass
+        self.page = None
+        self.drv = None
+        self._count_before = 0
+        self._last = None
+        self._stable_since = None
+        self._pending_open = True
+        # Reset the timeout window: time spent disconnected is not reviewer latency.
+        self._t_send = time.time()
+        sys.stderr.write("[refuter] NETWORK_RETRY %d/%d: %s\n" %
+                         (self._network_reopens, self.max_network_reopens, reason))
 
     def poll(self):
         """None while the reviewer is still answering; else (kind, reason)."""
         import time
-        from .copilot_autopilot_relay import _is_processing
+        from .copilot_autopilot_relay import _is_processing, _page_network_available
         if self._done is not None:
             return self._done
         # RAM-gated lazy open (bounded by timeout); returns quickly so the sweep stays responsive.
@@ -343,6 +377,9 @@ class RefuterSession:
         if self.drv is None:
             return self._done
         try:
+            if self.page is not None and not _page_network_available(self.page):
+                self._schedule_network_reopen("browser reported offline during review")
+                return self._done
             if self._t_send and time.time() - self._t_send > self.timeout_s:
                 self._finish(("UNCLEAR", ""))
                 return self._done
