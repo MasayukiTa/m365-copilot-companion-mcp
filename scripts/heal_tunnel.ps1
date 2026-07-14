@@ -16,9 +16,14 @@
 # offline CLI cannot block the caller.
 #
 # DECISION (see Get-TunnelHealAction, a pure function with no I/O):
-#   1. MCP_TUNNEL_NAME is owned by this account -> ALREADY CORRECT. No-op.
-#      (this is the case on a machine that has always been correctly set up --
-#      it must be left completely untouched.)
+#   1. MCP_TUNNEL_NAME is owned by this account -> validate MCP_TUNNEL_URL
+#      against that owned tunnel's real forwarding URL:
+#      1a. URL matches (or already blank and gets filled in) -> ALREADY
+#          CORRECT. No-op. (the common case on a machine that has always been
+#          correctly set up -- left completely untouched.)
+#      1b. URL is stale/blank and the tunnel's real URL is known -> URL_FIX:
+#          rewrite only MCP_TUNNEL_URL (name is already right), then
+#          desktop-notify that the URL changed and must be re-pasted.
 #   2. Not owned (or empty), but an owned tunnel's forwarding URL equals the
 #      recorded MCP_TUNNEL_URL -> REPOINT: rewrite only MCP_TUNNEL_NAME to that
 #      owned tunnel's id. The public URL is UNCHANGED, so nothing needs to be
@@ -123,7 +128,7 @@ function Get-TunnelHealAction {
     # PURE decision function. $Owned is an array of PSCustomObject with:
     #   Id  = the owned tunnel's id (bare or full -- either works)
     #   Url = that tunnel's forwarding URL, or "" if unknown/unresolved
-    # Returns a PSCustomObject: Action ('noop'|'repoint'|'rename_url'|'setup_needed'),
+    # Returns a PSCustomObject: Action ('noop'|'repoint'|'rename_url'|'setup_needed'|'url_fix'),
     # TargetId, TargetUrl, Note.
     param(
         [string]$Name,
@@ -133,8 +138,25 @@ function Get-TunnelHealAction {
     $ownedList = @($Owned)
     $ownedIds = @($ownedList | ForEach-Object { $_.Id })
 
-    # 1. Already correct -- N is owned. Left completely untouched.
+    # 1. N is owned. That alone does not guarantee MCP_TUNNEL_URL is correct --
+    #    .env can be stale (e.g. NAME and URL pasted in from different tunnels
+    #    at different times), so validate the recorded URL against this owned
+    #    tunnel's real forwarding URL before declaring "nothing to do".
     if ($Name -and (Test-TunnelNameOwned $Name $ownedIds)) {
+        $bareName = Get-BareTunnelId $Name
+        $match = $ownedList | Where-Object { (Get-BareTunnelId $_.Id) -eq $bareName } | Select-Object -First 1
+        if ($match -and $match.Url) {
+            if ((-not $Url) -or ((Normalize-TunnelUrl $Url) -ne (Normalize-TunnelUrl $match.Url))) {
+                return [PSCustomObject]@{
+                    Action    = 'url_fix'
+                    TargetId  = $Name
+                    TargetUrl = $match.Url
+                    Note      = "corrected stale MCP_TUNNEL_URL for owned tunnel $Name; re-paste required"
+                }
+            }
+        }
+        # URL matches, or the owned entry's real URL is unknown/empty so it
+        # cannot be safely corrected -- never churn on unknown data.
         return [PSCustomObject]@{
             Action    = 'noop'
             TargetId  = $Name
@@ -290,29 +312,50 @@ function Invoke-TunnelHeal([switch]$DryRunMode) {
         }
         $ownedIds = @($rawIds | ForEach-Object { Get-BareTunnelId $_ } | Select-Object -Unique)
 
-        # 3. Already correct? Check BEFORE resolving any URLs -- this is the
-        #    common case and must stay a pure no-op with no further devtunnel calls.
-        if ($N -and (Test-TunnelNameOwned $N $ownedIds)) {
-            Write-Host "[heal_tunnel] tunnel $N is owned; nothing to do"
-            return
-        }
-
-        # 4. Resolve each owned tunnel's forwarding URL so the decision function
-        #    can compare against the recorded MCP_TUNNEL_URL.
+        # 3/4. Resolve the URL(s) needed to decide, then hand off to the pure
+        #    decision function -- it (not this caller) decides noop vs. url_fix
+        #    vs. repoint vs. rename_url. In the owned case, resolve ONLY that
+        #    one tunnel's real URL (a single cheap 'show' call) so a stale
+        #    MCP_TUNNEL_URL can be corrected even when the name itself is
+        #    already right. In the not-owned case, resolve every owned
+        #    tunnel's URL as before so repoint/rename_url can find a match.
         $owned = @()
-        foreach ($id in $ownedIds) {
-            $showOut = Invoke-DevTunnelBounded @('show', $id) 8
+        if ($N -and (Test-TunnelNameOwned $N $ownedIds)) {
+            $bareN = Get-BareTunnelId $N
+            $showOut = Invoke-DevTunnelBounded @('show', $bareN) 8
             $url = ""
             if ($showOut) {
                 $m = [regex]::Match($showOut, 'https://[A-Za-z0-9-]+\.[A-Za-z0-9-]+\.devtunnels\.ms\S*')
                 if ($m.Success) { $url = $m.Value }
             }
-            $owned += [PSCustomObject]@{ Id = $id; Url = $url }
+            $owned = @([PSCustomObject]@{ Id = $N; Url = $url })
+        } else {
+            foreach ($id in $ownedIds) {
+                $showOut = Invoke-DevTunnelBounded @('show', $id) 8
+                $url = ""
+                if ($showOut) {
+                    $m = [regex]::Match($showOut, 'https://[A-Za-z0-9-]+\.[A-Za-z0-9-]+\.devtunnels\.ms\S*')
+                    if ($m.Success) { $url = $m.Value }
+                }
+                $owned += [PSCustomObject]@{ Id = $id; Url = $url }
+            }
         }
 
         $decision = Get-TunnelHealAction -Name $N -Url $U -Owned $owned
 
         switch ($decision.Action) {
+            'url_fix' {
+                if ($DryRunMode) {
+                    Write-Host "[heal_tunnel] DRY RUN: would correct MCP_TUNNEL_URL for $N -> $($decision.TargetUrl) (re-paste required)"
+                } else {
+                    if (Update-EnvTunnelFields -EnvPath $envPath -NewName $N -NewUrl $decision.TargetUrl) {
+                        Write-Host "[heal_tunnel] $($decision.Note)"
+                        Send-TunnelHealNotice "Dev Tunnel URL corrected" "Your dev tunnel URL in .env was stale and has been corrected to $($decision.TargetUrl) -- re-paste it into the Copilot Studio MCP connector."
+                    } else {
+                        Write-Host "[heal_tunnel] url_fix decided but .env rewrite failed -- no-op"
+                    }
+                }
+            }
             'repoint' {
                 if ($DryRunMode) {
                     Write-Host "[heal_tunnel] DRY RUN: would repoint MCP_TUNNEL_NAME $N -> $($decision.TargetId), URL preserved"
@@ -354,4 +397,12 @@ function Invoke-TunnelHeal([switch]$DryRunMode) {
     }
 }
 
-Invoke-TunnelHeal -DryRunMode:$DryRun
+# Dot-source guard: only run the heal automatically when this script is
+# invoked directly (`powershell -File heal_tunnel.ps1` / `& .\heal_tunnel.ps1`),
+# not when it is dot-sourced (`. .\heal_tunnel.ps1`) to reuse its pure
+# functions -- e.g. Get-TunnelHealAction -- in unit tests without triggering
+# real devtunnel/.env I/O. $MyInvocation.InvocationName is literally '.' only
+# for a dot-sourced call.
+if ($MyInvocation.InvocationName -ne '.') {
+    Invoke-TunnelHeal -DryRunMode:$DryRun
+}
