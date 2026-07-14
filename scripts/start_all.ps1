@@ -315,7 +315,15 @@ function Check-ForUpdates {
                     if ($NoSplash) { $reArgs += "-NoSplash" }
                     $env:MCP_STARTALL_REEXEC = "1"
                     Start-Process powershell -WindowStyle Hidden -ArgumentList $reArgs | Out-Null
-                    exit
+                    # Terminate THIS (old) process hard. A bare `exit` here throws a
+                    # System.Management.Automation.ExitException; when Invoke-Startup runs
+                    # inside the splash's WinForms message loop (the one-shot timer), that
+                    # ExitException escapes as an UNHANDLED "Microsoft .NET Framework"
+                    # exception dialog instead of just exiting -- and its "Continue" button
+                    # would leave THIS stale-code process running alongside the freshly
+                    # re-exec'd instance (double startup). Environment.Exit ends the process
+                    # cleanly from any host context (timer callback, runspace, or console).
+                    [System.Environment]::Exit(0)
                 }
             } catch {
                 # Re-exec is best-effort only -- fall through and let this (old)
