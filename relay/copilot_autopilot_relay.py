@@ -88,6 +88,41 @@ class GenerationInProgress(RuntimeError):
     catches RuntimeError still behaves safely (it just won't get the no-budget benefit)."""
 
 
+class NetworkUnavailable(RuntimeError):
+    """Raised before a send when the browser explicitly reports an offline/error page.
+
+    Network-adapter switches can leave the existing Copilot DOM and Stop button visible even
+    though the page cannot reach M365. Treat that as a transient send failure immediately,
+    instead of misclassifying the stale Stop control as four more minutes of generation.
+    """
+
+
+def _page_network_available(page) -> bool:
+    """Best-effort browser-network probe; only explicit offline signals return False."""
+    try:
+        url = str(page.url or "").lower()
+        if url.startswith(("edge-error://", "chrome-error://")):
+            return False
+    except Exception:
+        pass
+    try:
+        if page.evaluate("() => navigator.onLine") is False:
+            return False
+    except Exception:
+        # A probe failure is not proof of network loss; normal page liveness checks decide.
+        pass
+    return True
+
+
+def _is_network_failure(exc: BaseException) -> bool:
+    """Recognise browser navigation errors emitted during a network-adapter switch."""
+    text = str(exc).upper()
+    return any(token in text for token in (
+        "ERR_INTERNET_DISCONNECTED", "ERR_NETWORK_CHANGED", "ERR_NAME_NOT_RESOLVED",
+        "ERR_CONNECTION_RESET", "ERR_CONNECTION_CLOSED", "ERR_TIMED_OUT",
+    ))
+
+
 # --- Selectors captured from the live M365 Copilot DOM (2026-06) ------------
 COPILOT_SELECTORS = {
     "composer": "#m365-chat-editor-target-element",          # contenteditable, role=textbox
@@ -671,6 +706,8 @@ class CopilotWebDriver:
                 return False
             if not self._page_alive():
                 return False
+            if not _page_network_available(self.page):
+                return False
             if not self._is_generating():
                 return True
             self.page.wait_for_timeout(poll_ms)
@@ -864,6 +901,9 @@ class CopilotWebDriver:
         if not self._page_alive():
             raise ConversationClosed(
                 "send aborted: conversation tab/composer is closed (dead target)")
+        if not _page_network_available(self.page):
+            raise NetworkUnavailable(
+                "send deferred: browser is offline or showing a network error page")
         # GENERATION GATE: if the PREVIOUS turn is still generating (Stop button showing),
         # do NOT type/click into it -- that was the W0 django__django-14730 STUCK
         # (is_processing=True in the failure snapshot; the click then hung the default 30s).
@@ -879,6 +919,9 @@ class CopilotWebDriver:
                     raise ConversationClosed(
                         "send aborted: tab/composer closed while waiting for the "
                         "previous turn to finish generating")
+                if not _page_network_available(self.page):
+                    raise NetworkUnavailable(
+                        "send deferred: network was lost while waiting for the previous turn")
                 raise GenerationInProgress(
                     "send deferred: previous turn still generating after "
                     "%.0fs wait (not a send failure)" % gw)
