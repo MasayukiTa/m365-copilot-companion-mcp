@@ -19,6 +19,12 @@ $ErrorActionPreference = "Continue"
 $scriptDir = $PSScriptRoot
 $root = Split-Path -Parent $scriptDir
 
+# Shared PURE helpers (Get-SupervisorArgTunnel / Get-BareTunnelName /
+# Test-SupervisorTunnelDrift) for detecting a supervisor that drifted onto a
+# stale/borrowed tunnel -- see tunnel_name_util.ps1's header comment. No
+# top-level side effects, so dot-sourcing it here is safe.
+. (Join-Path $scriptDir "tunnel_name_util.ps1")
+
 function Ensure-EnvDefaults {
     # Release upgrades must not overwrite a user's .env, but existing installations need new
     # safe defaults. Append MCP_REVIEW_P2C=0 only when the key is absent; an explicit 1 is kept.
@@ -555,15 +561,58 @@ function Invoke-Startup {
 
     # 1) Supervisor = MCP server + Dev Tunnel host. Its own global mutex makes a second instance
     #    exit quietly, and it never touches a live `devtunnel host` -- so a live tunnel is kept.
+    #    EXCEPT: a running supervisor that has drifted onto a different tunnel than .env
+    #    currently names (e.g. heal_tunnel.ps1 repointed .env to this account's own tunnel
+    #    while the supervisor was already hosting a borrowed one from a copied .env) is NOT
+    #    "left as-is" -- it is actively polluting someone else's tunnel while this machine's
+    #    own tunnel stays unhosted, and doctor.ps1's tunnel_serving check would stay red
+    #    forever. Detect that with Test-SupervisorTunnelDrift and restart on the correct
+    #    tunnel; otherwise behave exactly as before.
     Set-SplashStatus $script:splash "Starting the MCP server and Dev Tunnel..."
-    if (Proc-Running 'supervisor\.ps1') {
-        Write-Host "[1/4] supervisor (MCP server + tunnel): already running -- left as-is"
-    } else {
-        $tn = Env-Value "MCP_TUNNEL_NAME"
+    function Start-FreshSupervisor([string]$tn) {
         $supArgs = @("-NoProfile","-ExecutionPolicy","Bypass","-File","$scriptDir\supervisor.ps1")
         if ($tn) { $supArgs += @("-TunnelName", $tn); Write-Host "[1/4] supervisor (MCP server + tunnel '$tn'): starting" }
         else     { Write-Host "[1/4] supervisor (MCP server + tunnel): starting" }
         Start-Process powershell -WindowStyle Hidden -ArgumentList $supArgs
+    }
+    function Get-RunningSupervisorProcesses {
+        # All Win32_Process entries whose command line launches supervisor.ps1. Normally
+        # zero or one; returned as an array so a drift-restart can stop every match.
+        try {
+            return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                      Where-Object { $_.CommandLine -and ($_.CommandLine -match 'supervisor\.ps1') })
+        } catch { return @() }
+    }
+    $envTn = Env-Value "MCP_TUNNEL_NAME"
+    $runningSupervisors = Get-RunningSupervisorProcesses
+    if ($runningSupervisors.Count -eq 0) {
+        Start-FreshSupervisor $envTn
+    } else {
+        $runCmdLine = $runningSupervisors[0].CommandLine
+        if (Test-SupervisorTunnelDrift -RunningCommandLine $runCmdLine -EnvTunnelName $envTn) {
+            $runTn = Get-SupervisorArgTunnel $runCmdLine
+            Write-Host "[1/4] supervisor is hosting a STALE tunnel ('$runTn') != .env ('$envTn') -- stopping and restarting on the correct tunnel"
+            try {
+                foreach ($p in $runningSupervisors) {
+                    Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+                }
+                # Also stop the stale devtunnel host process for the OLD (borrowed) name --
+                # same targeted match supervisor.ps1 itself uses -- so this machine stops
+                # polluting the borrowed tunnel. NEVER a bare `Get-Process devtunnel |
+                # Stop-Process`: that would reap an interactive `devtunnel login` or any
+                # unrelated tunnel the user hosts by hand.
+                if ($runTn) {
+                    Get-CimInstance Win32_Process -Filter "Name='devtunnel.exe'" -ErrorAction SilentlyContinue |
+                        Where-Object { $_.CommandLine -match '\bhost\b' -and $_.CommandLine -match [regex]::Escape($runTn) } |
+                        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+                }
+            } catch {
+                # Best-effort: a failure to stop the stale supervisor/host must never block startup.
+            }
+            Start-FreshSupervisor $envTn
+        } else {
+            Write-Host "[1/4] supervisor (MCP server + tunnel): already running -- left as-is"
+        }
     }
 
     # 2) Companion Edge :9222 (the fleet / agent Edge). Idempotent; skip if the port answers.
