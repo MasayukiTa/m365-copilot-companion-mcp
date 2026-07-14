@@ -50,17 +50,35 @@ $ErrorActionPreference = "SilentlyContinue"
 # (which this hosts) all live there.
 $Root = Split-Path -Parent $PSScriptRoot
 
-# Resolve the tunnel name: explicit -TunnelName wins; else .env's MCP_TUNNEL_NAME (set by
-# setup_devtunnel.ps1 to this machine's actual tunnel); else the generic default. This keeps the
-# supervisor machine-agnostic -- every install hosts ITS OWN tunnel, not a hardcoded one.
-if (-not $TunnelName) {
+# Shared PURE helpers (Get-BareTunnelName / Test-SupervisorTunnelDrift) used below to
+# self-correct if .env's MCP_TUNNEL_NAME changes while this supervisor is already
+# running -- see tunnel_name_util.ps1's header comment. No top-level side effects, so
+# dot-sourcing it here is safe.
+. (Join-Path $PSScriptRoot "tunnel_name_util.ps1")
+
+function Get-EnvTunnelName {
+    # Reads MCP_TUNNEL_NAME fresh from .env. Used both to resolve the STARTUP default
+    # below (when -TunnelName was not passed) and, every main-loop iteration, to detect
+    # a LIVE .env change (e.g. heal_tunnel.ps1's self-heal repointing .env to this
+    # account's own tunnel after this supervisor already started hosting a borrowed
+    # one) -- so a later .env change is picked up without requiring an external restart.
     try {
         $envp = Join-Path $Root ".env"
         if (Test-Path $envp) {
             $m = (Get-Content $envp | Where-Object { $_ -match '^\s*MCP_TUNNEL_NAME\s*=' } | Select-Object -First 1)
-            if ($m) { $TunnelName = ($m -replace '^\s*MCP_TUNNEL_NAME\s*=\s*', '').Trim() }
+            if ($m) { return ($m -replace '^\s*MCP_TUNNEL_NAME\s*=\s*', '').Trim() }
         }
     } catch { }
+    return ""
+}
+
+# Resolve the tunnel name: explicit -TunnelName wins; else .env's MCP_TUNNEL_NAME (set by
+# setup_devtunnel.ps1 to this machine's actual tunnel); else the generic default. This keeps the
+# supervisor machine-agnostic -- every install hosts ITS OWN tunnel, not a hardcoded one. This is
+# only the STARTUP default -- the main loop below re-reads .env every cycle and switches live if
+# it changes, so -TunnelName does not pin the supervisor to a name forever.
+if (-not $TunnelName) {
+    $TunnelName = Get-EnvTunnelName
 }
 if (-not $TunnelName) { $TunnelName = "m365-copilot-companion" }
 
@@ -283,6 +301,28 @@ $tunnelMiss = 0
 $loggedIn = $null   # tri-state ($null unknown / $true / $false) -- log only on transition
 
 while ($true) {
+    # Live self-correction ("never again" / defense-in-depth): if .env's MCP_TUNNEL_NAME
+    # changed since this supervisor started hosting $TunnelName -- e.g. heal_tunnel.ps1's
+    # self-heal repointed .env to this account's own tunnel while this supervisor was
+    # already hosting a stale/borrowed one from a copied .env -- stop the OLD host and
+    # switch to the new name. This makes the running supervisor self-correct even if
+    # nothing ever re-runs start_all.bat (which also detects and restarts this drift, but
+    # only at the moment it is invoked). Bare-name compare (ignores the ".cluster" suffix)
+    # so a URL-only .env rewrite of the SAME tunnel never causes a needless churn.
+    $freshTn = Get-EnvTunnelName
+    if ($freshTn -and ((Get-BareTunnelName $freshTn) -ne (Get-BareTunnelName $TunnelName))) {
+        Write-Log "tunnel name changed in .env ('$TunnelName' -> '$freshTn') -- stopping the old host and switching"
+        # Stop only OUR stale host process(es) for the OLD name -- the exact same
+        # targeted match Start-TunnelHost uses below. NEVER `Get-Process devtunnel |
+        # Stop-Process`: that would reap an interactive `devtunnel login` (see
+        # Test-DevtunnelLoggedIn's comment) or any unrelated tunnel the user hosts by hand.
+        Get-CimInstance Win32_Process -Filter "Name='devtunnel.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match '\bhost\b' -and $_.CommandLine -match [regex]::Escape($TunnelName) } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        $TunnelName = $freshTn
+        $tunnelMiss = 0
+    }
+
     # Clear phantom fleet runs whose coordinator process died without a supervisor restart
     # (Invoke-FleetAutoResume above only runs once at supervisor startup, so a mid-session
     # coordinator kill/crash would otherwise leave .fleet/status.json stuck showing

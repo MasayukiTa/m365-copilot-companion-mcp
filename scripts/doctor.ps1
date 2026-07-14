@@ -38,6 +38,11 @@ $scriptDir = $PSScriptRoot
 if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
 $repo = Split-Path -Parent $scriptDir
 
+# Shared PURE helpers (Get-SupervisorArgTunnel / Get-BareTunnelName /
+# Test-SupervisorTunnelDrift) -- see tunnel_name_util.ps1's header comment. No
+# top-level side effects, so dot-sourcing it here is safe.
+. (Join-Path $scriptDir "tunnel_name_util.ps1")
+
 # --- load .env into a hashtable -------------------------------------------------
 $envv = @{}
 $envPath = Join-Path $repo ".env"
@@ -241,6 +246,32 @@ Check "tunnel_owned" "Dev Tunnel name is owned by this account (MCP_TUNNEL_NAME)
 TunnelCheck "tunnel_serving" "Dev Tunnel host serving (public URL -> server)" `
     { if (-not $turl) { return $false }; (Invoke-WebRequest -Uri (($turl.TrimEnd('/')) + '/health') -TimeoutSec 7 -UseBasicParsing).StatusCode -eq 200 } `
     "the tunnel exists but is not being served -- run start_all.bat (the supervisor hosts it). If this stays red while the checks above are green, MCP_TUNNEL_URL in .env may be stale -- compare it to the URL shown by 'devtunnel show <name>'."
+
+# 3d. Supervisor/env match -- catches a RUNNING supervisor that is hosting a different
+# (stale/borrowed) tunnel than .env currently names. This happens when .env was copied
+# from another machine (naming a tunnel that machine's account owns), the supervisor
+# started hosting that borrowed tunnel, and heal_tunnel.ps1's self-heal later repointed
+# .env's MCP_TUNNEL_NAME to this account's own tunnel WHILE the already-running
+# supervisor kept hosting the old one -- the exact scenario tunnel_serving above cannot
+# distinguish from "not hosted at all". Uses Check (not TunnelCheck) so it runs
+# independently of the tunnel dependency chain above: if no supervisor is running there
+# is nothing to mismatch, so it passes.
+function Get-RunningSupervisorCommandLineDoctor {
+    try {
+        $p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+             Where-Object { $_.CommandLine -and ($_.CommandLine -match 'supervisor\.ps1') } |
+             Select-Object -First 1
+        if ($p) { return $p.CommandLine }
+    } catch { }
+    return ""
+}
+Check "tunnel_supervisor_match" "Running supervisor hosts the tunnel named in .env" `
+    {
+        $runCmdLine = Get-RunningSupervisorCommandLineDoctor
+        if (-not $runCmdLine) { return $true }   # no supervisor running -- nothing to mismatch
+        -not (Test-SupervisorTunnelDrift -RunningCommandLine $runCmdLine -EnvTunnelName $tname)
+    } `
+    "The running supervisor is hosting a different (stale/borrowed) tunnel than .env names. Re-run start_all.bat -- it now stops the stale supervisor and re-hosts your own tunnel."
 
 # 4. Companion Edge (:9222) for the fleet/agent
 Check "edge_companion" "Companion Edge running (:9222 fleet/agent)" `
