@@ -72,8 +72,15 @@ import subprocess
 import sys
 import time
 
+from dotenv import load_dotenv
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VENVPY = os.path.join(REPO, ".venv", "Scripts", "python.exe")
+# review_run is also a supported direct CLI. The bridge inherits .env from its parent,
+# but `python -m bench.review_run` does not unless we load it here. Without this, the same
+# /deep-security-review silently used legacy scraping from the CLI while using LOCAL_LOOP
+# through the bridge.
+load_dotenv(os.path.join(REPO, ".env"), override=False)
 
 # bench/ has no __init__.py (implicit namespace package); when this file is run directly as
 # a script (python bench\review_run.py, not `python -m bench.review_run`), only bench/'s own
@@ -237,6 +244,17 @@ def fleet_cmd(goals_path, max_concurrent, effort, state_dir=None,
     return cmd
 
 
+def _use_local_review_transport(resilience_profile) -> bool:
+    if not resilience_profile:
+        return False
+    transport = os.environ.get("MCP_DEEP_REVIEW_TRANSPORT", "auto").strip().lower()
+    if transport in {"local", "local_loop", "sqlite"}:
+        return True
+    if transport == "auto":
+        return os.environ.get("MCP_EXECUTION_PROFILES", "0").strip() == "1"
+    return False
+
+
 def run_fleet(goals_path, max_concurrent, effort, state_dir=None,
               resilience_profile=None, max_turns=None):
     """The ONE function that touches the fleet subprocess -- isolated so tests can
@@ -244,11 +262,7 @@ def run_fleet(goals_path, max_concurrent, effort, state_dir=None,
     (fleet_runner drives the M365 Copilot fleet on companion Edge :9222); returns its
     return code. Writes <state_dir or .fleet>/status.json and .../transcripts/* as a side
     effect."""
-    transport = os.environ.get("MCP_DEEP_REVIEW_TRANSPORT", "auto").strip().lower()
-    use_local = resilience_profile and transport in {"local", "local_loop", "sqlite"}
-    if resilience_profile and transport == "auto":
-        use_local = os.environ.get("MCP_EXECUTION_PROFILES", "0").strip() == "1"
-    if use_local:
+    if _use_local_review_transport(resilience_profile):
         from bench.local_review_transport import run_local_review_fleet
         target_state = state_dir or os.path.join(REPO, ".fleet")
         print("fleet: LOCAL_LOOP transport (response-content reads disabled)")
@@ -1271,6 +1285,8 @@ def main(argv=None):
                   (args.max_concurrent, max_concurrent, MAX_CONCURRENT_CEILING))
         print("goals file: %s" % goals_path)
         print("fleet cmd: %s" % cmd)
+        if _use_local_review_transport(resilience_profile):
+            print("transport: LOCAL_LOOP (the fleet cmd above is the legacy comparison contract)")
         print("report would be written under: %s" % out_dir)
         if args.loop or args.completeness:
             print("note: --loop/--completeness are ignored under --dry-run -- the plan shown "
