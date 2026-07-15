@@ -131,9 +131,6 @@ ui/_buildcheck/
 # internal bench process docs / work logs: keep in history, exclude going forward
 # (architecture/system docs + the README-referenced scorecard stay tracked)
 /bench/*.md
-!/bench/SELF_IMPROVEMENT_CONTROLLER.md
-!/bench/SELF_GROWTH_L4_DESIGN.md
-!/bench/SYSTEM_MAP.md
 !/bench/SCORECARD_swebench_lite300_strong.md
 
 # HumanEval dataset -- not shipped in the repo; fetch it yourself if you want to run that bench
@@ -191,3 +188,9 @@ _attic/
 # Kept out of the tree for the same reason; do not commit.
 # ----------------------------------------------------------------------
 /deploy/
+
+# Root-level one-off probes and review dumps.
+/_*.py
+
+# Overnight comparison orchestration is a local experiment harness, not product code.
+/relay/overnight_task.py

@@ -1206,7 +1206,7 @@ def main(argv=None):
         return 2
     if resilience_profile != "off" and args.loop:
         print("ERROR: P2c resilience currently runs as a bounded single campaign; --loop is not "
-              "combined with --resilience-profile (use /review-2 or /security-review-2 without --loop).")
+              "combined with --resilience-profile (use /deep-review or /deep-security-review without --loop).")
         return 2
     if args.fail_on and not args.baseline:
         print("ERROR: --fail-on requires --baseline (path or 'auto') -- there is nothing to "
