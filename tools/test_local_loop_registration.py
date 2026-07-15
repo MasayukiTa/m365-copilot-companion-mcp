@@ -42,8 +42,9 @@ def test_feature_flag_registers_protocol_tools_ahead_of_map_limit(tmp_path):
     assert proc.returncode == 0, proc.stderr
     names = proc.stdout.strip().split(",")
     for name in ("claim_turn", "heartbeat", "commit_turn", "abort_turn",
-                 "read_job_context", "get_job_status"):
+                 "read_job_context", "get_job_status", "call_tool"):
         assert name in names
+    assert len(names) == 8
 
 
 def test_feature_flag_off_hides_protocol_tools(tmp_path):
