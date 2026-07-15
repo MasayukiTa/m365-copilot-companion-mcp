@@ -1,7 +1,13 @@
 import json
 
 from relay.local_job_store import LocalJobStore
-from relay.local_loop_controller import LocalLoopController, _write_atomic
+from relay.local_loop_controller import (
+    LocalLoopController,
+    _AUTH_ACTION_SELECTOR,
+    _CREDENTIAL_INPUT_SELECTOR,
+    _write_atomic,
+    probe_browser_interaction,
+)
 
 
 def _job(job_id="job_1", max_turns=10):
@@ -262,3 +268,77 @@ def test_thirty_turn_smoke_rotates_without_any_response_content_reads(tmp_path):
     assert len(rotations) == 5
     assert all(driver.answer_content_reads == 0 for driver in drivers)
     assert store.get_job_status("job_1", event_limit=50)["status"] == "DONE"
+
+
+class _AuthItem:
+    def __init__(self, click=None):
+        self._click = click
+
+    def is_visible(self):
+        return True
+
+    def click(self):
+        if self._click:
+            self._click()
+
+
+class _AuthLocator:
+    def __init__(self, items):
+        self.items = items
+
+    def count(self):
+        return len(self.items)
+
+    def nth(self, index):
+        return self.items[index]
+
+
+class _AuthPage:
+    def __init__(self, actions_per_step, credential=False):
+        self.url = "https://login.microsoftonline.com/signin"
+        self.actions_per_step = list(actions_per_step)
+        self.credential = credential
+        self.step = 0
+
+    def locator(self, selector):
+        if selector == _CREDENTIAL_INPUT_SELECTOR:
+            return _AuthLocator([_AuthItem()] if self.credential else [])
+        if selector == _AUTH_ACTION_SELECTOR:
+            count = self.actions_per_step[min(self.step, len(self.actions_per_step) - 1)]
+
+            def clicked():
+                self.step += 1
+                if self.step >= len(self.actions_per_step):
+                    self.url = "https://m365.cloud.microsoft/chat"
+
+            return _AuthLocator([_AuthItem(clicked) for _ in range(count)])
+        return _AuthLocator([])
+
+    def wait_for_timeout(self, _milliseconds):
+        return None
+
+
+class _AuthDriver:
+    def __init__(self, page):
+        self.page = page
+
+
+def test_auth_probe_follows_only_single_choice_chain(monkeypatch):
+    monkeypatch.setattr("relay.edge_reconnect.click_through_consent", lambda page: False)
+    page = _AuthPage([1, 1])
+    assert probe_browser_interaction(_AuthDriver(page)) == "CLEAR"
+    assert page.step == 2
+
+
+def test_auth_probe_stops_for_multiple_accounts(monkeypatch):
+    monkeypatch.setattr("relay.edge_reconnect.click_through_consent", lambda page: False)
+    page = _AuthPage([2])
+    assert probe_browser_interaction(_AuthDriver(page)) == "WAITING_AUTH"
+    assert page.step == 0
+
+
+def test_auth_probe_never_submits_visible_credentials(monkeypatch):
+    monkeypatch.setattr("relay.edge_reconnect.click_through_consent", lambda page: False)
+    page = _AuthPage([1], credential=True)
+    assert probe_browser_interaction(_AuthDriver(page)) == "WAITING_AUTH"
+    assert page.step == 0

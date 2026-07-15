@@ -27,6 +27,44 @@ PAUSED_STATUSES = frozenset({
     "WAITING_USER", "WAITING_EXTERNAL", "NEEDS_ROUTING", "WAITING_AUTH", "WAITING_CONSENT",
 })
 
+_AUTH_URL_MARKERS = (
+    "login.microsoftonline.com", "/adfs/", "/oauth2/", "/signin", "/auth/",
+)
+_AUTH_ACTION_SELECTOR = ", ".join((
+    'button:has-text("Sign in")', 'button:has-text("サインイン")',
+    'button:has-text("Continue")', 'button:has-text("続行")',
+    'button:has-text("Next")', 'button:has-text("次へ")',
+    'input[type="submit"][value="Sign in"]',
+    'input[type="submit"][value="Continue"]',
+    '[data-test-id="accountTile"]', '[role="button"][data-test-id*="account"]',
+))
+_CREDENTIAL_INPUT_SELECTOR = (
+    'input[type="password"], input[name="passwd"], input[autocomplete="current-password"]'
+)
+
+
+def _visible_count(locator) -> int:
+    """Count visible matches without reading page text or response content."""
+    try:
+        return sum(1 for index in range(locator.count()) if locator.nth(index).is_visible())
+    except Exception:
+        return 0
+
+
+def _single_visible(locator):
+    """Return the sole visible locator, otherwise None.
+
+    A single compound selector is important here: the same DOM element can match several
+    auth selectors, and counting each selector independently falsely turns one safe choice
+    into several choices.
+    """
+    try:
+        visible = [locator.nth(index) for index in range(locator.count())
+                   if locator.nth(index).is_visible()]
+        return visible[0] if len(visible) == 1 else None
+    except Exception:
+        return None
+
 
 def probe_browser_interaction(driver) -> str:
     """Handle safe single-choice auth/consent UI without inspecting assistant content."""
@@ -37,40 +75,31 @@ def probe_browser_interaction(driver) -> str:
         return "CLEAR"
 
     url = str(getattr(page, "url", "") or "").lower()
-    auth_markers = (
-        "login.microsoftonline.com", "/adfs/", "/oauth2/", "/signin", "/auth/",
-    )
-    if any(marker in url for marker in auth_markers):
-        selectors = (
-            'button:has-text("Sign in")', 'button:has-text("サインイン")',
-            'button:has-text("Continue")', 'button:has-text("続行")',
-            '[data-test-id="accountTile"]', '[role="button"][data-test-id*="account"]',
-        )
-        visible = []
-        for selector in selectors:
+    if any(marker in url for marker in _AUTH_URL_MARKERS):
+        # Microsoft/ADFS often presents account tile -> Continue -> Sign in as separate
+        # pages. Follow a short chain only while every page has exactly one safe action.
+        # Credential entry is never automated: the persistent browser profile should own
+        # that state, and a visible password control is an explicit operator boundary.
+        for _ in range(4):
+            if _visible_count(page.locator(_CREDENTIAL_INPUT_SELECTOR)):
+                return "WAITING_AUTH"
+            action = _single_visible(page.locator(_AUTH_ACTION_SELECTOR))
+            if action is None:
+                return "WAITING_AUTH"
             try:
-                locator = page.locator(selector)
-                for index in range(locator.count()):
-                    item = locator.nth(index)
-                    if item.is_visible():
-                        visible.append(item)
+                action.click()
+                page.wait_for_timeout(2000)
             except Exception:
-                continue
-        if len(visible) == 1:
-            try:
-                visible[0].click()
-                page.wait_for_timeout(3000)
-                url = str(getattr(page, "url", "") or "").lower()
-                if not any(marker in url for marker in auth_markers):
-                    return "CLEAR"
-            except Exception:
-                pass
+                return "WAITING_AUTH"
+            url = str(getattr(page, "url", "") or "").lower()
+            if not any(marker in url for marker in _AUTH_URL_MARKERS):
+                return "CLEAR"
         return "WAITING_AUTH"
 
     try:
         pending = page.locator(
             'button:has-text("Allow"), button:has-text("許可"), '
-            'a:has-text("connection manager")'
+            'a:has-text("connection manager"), a:has-text("接続マネージャーを開く")'
         )
         if pending.count() and any(pending.nth(i).is_visible() for i in range(pending.count())):
             return "WAITING_CONSENT"
