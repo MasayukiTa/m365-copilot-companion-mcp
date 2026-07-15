@@ -205,6 +205,8 @@ echo ===========================================================================
 echo   Daily startup : double-click  "M365 Companion"  on your Desktop
 echo   Check anytime : double-click  doctor.bat        (all green = fully wired)
 echo   Two windows opened: CopilotChat (talk to it) and FleetCockpit (watch runs)
+echo   Optional Deep Review: set MCP_REVIEW_P2C=1 and MCP_EXECUTION_PROFILES=1
+echo   in .env, then re-run start_all.bat. It uses headless LOCAL_LOOP by default.
 echo   Any RED above?  doctor printed the exact fix for each line.
 echo.
 pause
