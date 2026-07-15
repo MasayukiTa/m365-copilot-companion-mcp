@@ -451,6 +451,16 @@ def _open_driver(context, agent_url):
     return CopilotWebDriver(page)
 
 
+def _close_driver_page(driver) -> None:
+    """Close only the page owned by this controller; never close the shared CDP browser."""
+    page = getattr(driver, "page", None)
+    try:
+        if page is not None and not page.is_closed():
+            page.close()
+    except Exception:
+        pass
+
+
 def main(argv=None):
     from dotenv import load_dotenv
 
@@ -520,9 +530,15 @@ def main(argv=None):
             consent_probe=probe_browser_interaction,
             metrics_probe=lambda drv: collect_browser_metrics(drv.page, companion_edge_mb),
         )
-        result = controller.run()
-        print(f"LOCAL_LOOP {job_id}: {result}")
-        return 0 if result == "DONE" else 2
+        try:
+            result = controller.run()
+            print(f"LOCAL_LOOP {job_id}: {result}")
+            return 0 if result == "DONE" else 2
+        finally:
+            # connect_over_cdp disconnect does not close pages created in the persistent
+            # companion Edge. Leaving one page per completed job steadily recreates the
+            # memory problem LOCAL_LOOP is meant to solve.
+            _close_driver_page(controller.driver)
 
 
 if __name__ == "__main__":
