@@ -215,6 +215,51 @@ def test_retryable_abort_releases_lease_and_restart_recovers(tmp_path):
     assert reopened.get_job_status("job_1")["retry_count"] == 1
 
 
+def test_deep_review_unsafe_abort_is_rescoped_instead_of_failed(tmp_path):
+    store = _store(tmp_path)
+    job = _job()
+    job["task"]["type"] = "deep_review"
+    job["constraints"].update({
+        "continue_on_unsafe_abort": True,
+        "max_safe_rescopes": 2,
+        "unsafe_abort_fallback_instruction": "Use safe execution, isolation, or static review.",
+    })
+    store.create_job(job, now=0)
+    claim = store.claim_turn("job_1", 1, "w", now=1)
+    result = store.abort_turn(
+        "job_1", 1, claim["lease_id"], claim["fencing_token"],
+        "REFUSED_UNSAFE_EXECUTION", "live side effect refused", False, now=2,
+    )
+    assert result["retryable"] is True
+    assert result["rescoped"] is True
+    duplicate = store.abort_turn(
+        "job_1", 1, claim["lease_id"], claim["fencing_token"],
+        "REFUSED_UNSAFE_EXECUTION", "live side effect refused", False, now=2.5,
+    )
+    assert duplicate == {
+        "ok": True, "idempotent": True, "retryable": True, "rescoped": True,
+    }
+    assert store.get_job_status("job_1")["status"] == "READY"
+    retry = store.claim_turn("job_1", 1, "w2", now=3)
+    assert "Use safe execution, isolation, or static review." in retry["instruction"]
+    assert "ORIGINAL SCOPED TURN" in retry["instruction"]
+    events = store.get_job_status("job_1", event_limit=20)["events"]
+    assert any(event["event"] == "UNSAFE_ABORT_RESCOPED" for event in events)
+
+
+def test_non_review_unsafe_abort_still_fails_closed(tmp_path):
+    store = _store(tmp_path)
+    store.create_job(_job(), now=0)
+    claim = store.claim_turn("job_1", 1, "w", now=1)
+    result = store.abort_turn(
+        "job_1", 1, claim["lease_id"], claim["fencing_token"],
+        "REFUSED_UNSAFE_EXECUTION", "refused", False, now=2,
+    )
+    assert result["retryable"] is False
+    assert result["rescoped"] is False
+    assert store.get_job_status("job_1")["status"] == "FAILED"
+
+
 def test_console_projection_uses_committed_summary_not_web_transcript(tmp_path):
     store = _store(tmp_path)
     store.create_job(_job(), now=0)

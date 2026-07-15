@@ -251,6 +251,21 @@ def test_retryable_abort_is_retried_without_waiting_for_commit_timeout(tmp_path)
     assert store.get_job_status("job_1")["retry_count"] == 1
 
 
+def test_retry_attempt_does_not_consume_logical_turn_budget(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    job = _job(max_turns=1)
+    job["constraints"]["max_attempts"] = 2
+    store.create_job(job)
+    driver = RetryAbortThenCommitDriver(store)
+    controller = LocalLoopController(
+        store, "job_1", driver, rotate_after_turns=0, poll_seconds=.01,
+        acceptance_runner=lambda current: (True, "verified"),
+    )
+    assert controller.run() == "DONE"
+    assert len(driver.sent) == 2
+    assert store.get_job_status("job_1")["current_seq"] == 1
+
+
 def test_thirty_turn_smoke_rotates_without_any_response_content_reads(tmp_path):
     store = LocalJobStore(tmp_path / "jobs.sqlite3")
     store.create_job(_job(max_turns=35))

@@ -26,6 +26,12 @@ def test_build_job_has_fixed_read_only_three_pass_plan():
     assert all("Do not edit source files" in step["instruction"] for step in job["turn_plan"])
     assert job["constraints"]["allowed_base"] == "C:/repo"
     assert job["constraints"]["allow_network"] is False
+    assert job["constraints"]["max_turns"] == 3
+    assert job["constraints"]["max_attempts"] == 5
+    assert job["constraints"]["continue_on_unsafe_abort"] is True
+    assert all("P2C SAFE-PROGRESS POLICY" in step["instruction"] for step in job["turn_plan"])
+    assert all("Do not abort the entire review" in step["instruction"]
+               for step in job["turn_plan"])
 
 
 def test_campaign_snapshot_projects_final_sqlite_summary_without_transcript(tmp_path):

@@ -28,6 +28,12 @@ COMMIT_STATUSES = frozenset({
 })
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
+_SAFE_REVIEW_ABORT_CODES = frozenset({
+    "EXECUTION_TOOLS_UNAVAILABLE",
+    "REFUSED_UNSAFE_EXECUTION",
+    "UNSAFE_INSTRUCTION_REFUSED",
+})
+
 
 class JobStoreError(RuntimeError):
     def __init__(self, code: str, message: str):
@@ -423,18 +429,55 @@ class LocalJobStore:
                    now: float | None = None) -> dict:
         job_id = self._validate_job_id(job_id)
         now = time.time() if now is None else float(now)
+        requested_retryable = bool(retryable)
         payload = {
             "job_id": job_id, "seq": int(seq),
             "error_code": _bounded_text(error_code, 256, "error_code"),
             "detail": _bounded_text(detail, 4096, "detail"),
-            "retryable": bool(retryable),
+            "retryable": requested_retryable,
         }
         digest = _hash(payload)
         with self._transaction() as conn:
-            _, turn = self._job_and_turn(conn, job_id, int(seq))
+            job, turn = self._job_and_turn(conn, job_id, int(seq))
+            job_data = json.loads(job["job_json"])
+            constraints = (job_data.get("constraints")
+                           if isinstance(job_data.get("constraints"), dict) else {})
+            task = job_data.get("task") if isinstance(job_data.get("task"), dict) else {}
+            error = payload["error_code"].upper()
+            safe_rescope = (
+                not requested_retryable
+                and task.get("type") == "deep_review"
+                and bool(constraints.get("continue_on_unsafe_abort"))
+                and error in _SAFE_REVIEW_ABORT_CODES
+                and int(turn["retry_count"] or 0) < int(constraints.get("max_safe_rescopes", 1))
+            )
+            if safe_rescope:
+                retryable = True
+                fallback = str(constraints.get("unsafe_abort_fallback_instruction") or "").strip()
+                if fallback:
+                    max_claim = int(constraints.get("max_claim_bytes", 32768))
+                    rescoped = (
+                        fallback
+                        + "\n\nThe previous worker declined this turn. Continue with only the safe, "
+                          "isolated, and static slices described above. Do not repeat a broad refusal."
+                        + "\n\nORIGINAL SCOPED TURN (retain its review target, not unsafe execution clauses):\n"
+                        + str(turn["instruction"])
+                    )
+                    instruction = rescoped.encode("utf-8")[:max_claim].decode("utf-8", "ignore")
+                    conn.execute(
+                        "UPDATE turns SET instruction=? WHERE job_id=? AND seq=?",
+                        (instruction, job_id, int(seq)),
+                    )
+                payload["retryable"] = True
+                payload["rescoped_from_nonretryable"] = True
             if turn["abort_hash"]:
                 if secrets.compare_digest(str(turn["abort_hash"]), digest):
-                    return {"ok": True, "idempotent": True, "retryable": bool(retryable)}
+                    stored_abort = json.loads(turn["abort_json"] or "{}")
+                    return {
+                        "ok": True, "idempotent": True,
+                        "retryable": bool(stored_abort.get("retryable", retryable)),
+                        "rescoped": bool(stored_abort.get("rescoped_from_nonretryable", False)),
+                    }
                 raise JobStoreError("ABORT_CONFLICT", "turn already has a different abort")
             self._validate_lease(turn, lease_id, fencing_token, now)
             stored = dict(payload, aborted_at=now, abort_hash=digest)
@@ -455,7 +498,14 @@ class LocalJobStore:
                 job_status = "FAILED"
             conn.execute("UPDATE jobs SET status=?,updated_at=? WHERE job_id=?", (job_status, now, job_id))
             self._event(conn, job_id, int(seq), "TURN_ABORTED", payload, now)
-        return {"ok": True, "idempotent": False, "retryable": bool(retryable)}
+            if safe_rescope:
+                self._event(conn, job_id, int(seq), "UNSAFE_ABORT_RESCOPED", {
+                    "error_code": payload["error_code"], "retry_count": int(turn["retry_count"]) + 1,
+                }, now)
+        return {
+            "ok": True, "idempotent": False, "retryable": bool(retryable),
+            "rescoped": bool(safe_rescope),
+        }
 
     def verify_candidate(self, job_id: str, passed: bool, detail: str = "",
                          failure_instruction: str = "", now: float | None = None) -> dict:
