@@ -23,7 +23,7 @@
 | `MCP_TOOL_MAP_INCLUDE` | map mode で追加で第一級ツールとして載せたいツール名（カンマ区切り） | 空 |
 | `MCP_IMPL_AGENT_URL` | bridge / fleet が駆動する主 Copilot エージェントの URL（テナント固有 `T_…`） | 手動で貼る（**必須**） |
 | `MCP_FLEET_AGENT_URL` | fleet 専用エージェント URL | 未指定なら `MCP_IMPL_AGENT_URL` |
-| `MCP_REVIEW_P2C` | 分割レビュー `/review-2` `/security-review-2` の表示・実行 | `0`（無効）/ `1`（有効） |
+| `MCP_REVIEW_P2C` | 深掘りレビュー `/deep-review` `/deep-security-review` の表示・実行 | `0`（無効）/ `1`（有効） |
 | `MCP_RESEARCHER_AGENT_URL` | `/research` が使う調査エージェント（Researcher `…dr_work`） | 内蔵既定・通常は空 |
 | `MCP_ANALYST_AGENT_URL` | `/analyze` が使う分析エージェント（Analyst `…diceberry`） | 内蔵既定・通常は空 |
 | `MCP_CDP_URL` | 専用 Edge の CDP エンドポイント | `http://localhost:9222` |
@@ -85,10 +85,10 @@ call_tool(name="X", arguments={...}) → X を実行
 
 ---
 
-## P2c 分割レビュー
+## 深掘りレビュー
 
 `MCP_REVIEW_P2C=0` が既定で自動生成されます。`1` に変更して `start_all.bat` を
-実行すると、`/review-2` と `/security-review-2` がコマンド一覧に表示されます。
+実行すると、`/deep-review` と `/deep-security-review` がコマンド一覧に表示されます。
 この2コマンドだけが Fresh Session Replay と上限付きタスク分割を使い、従来の
 `/review` と `/security-review` の挙動は変わりません。
 

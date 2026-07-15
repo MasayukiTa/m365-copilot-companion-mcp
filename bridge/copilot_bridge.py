@@ -301,8 +301,8 @@ def _p2c_review_enabled():
 
 
 P2C_HELP_TEXT = (
-    "- `/review-2 [diff|<path>]` — P2c: 拒否時に同一タスクを新規会話で再試行し、二度拒否された作業だけを上限付きで分割。\n"
-    "- `/security-review-2 [diff|<path>]` — 同上、セキュリティ観点のP2cレビュー。\n"
+    "- `/deep-review [diff|<path>]` — 深掘りレビュー: 拒否時に同一タスクを新規会話で再試行し、二度拒否された作業だけを上限付きで分割。\n"
+    "- `/deep-security-review [diff|<path>]` — 同上、セキュリティ観点の深掘りレビュー。\n"
 )
 
 # Main-chat prompt clamp. Kept in TWO separate parts on purpose:
@@ -3006,8 +3006,10 @@ class Handler(BaseHTTPRequestHandler):
             # /review peek there), which calls _review_fix_stream directly.
             self._review_fix_stream(cmd if cmd.startswith("/") else "/" + cmd)
             return
-        if token in ("review", "security-review", "securityreview", "review-2", "review2",
-                     "security-review-2", "securityreview-2", "securityreview2"):
+        if token in ("review", "security-review", "securityreview",
+                     "deep-review", "deepreview", "deep-security-review", "deepsecurityreview",
+                     "review-2", "review2", "security-review-2", "securityreview-2",
+                     "securityreview2"):
             # Defensive fallback only: the normal entry point is do_GET's /stream peek,
             # which calls _review_stream directly (bypassing PAGE_LOCK) before ever reaching
             # _command. This branch only fires if some other caller routes a review command
@@ -3115,8 +3117,8 @@ class Handler(BaseHTTPRequestHandler):
             parsed = review_command.parse_review_command(msg)
             if parsed.get("resilience") and not _p2c_review_enabled():
                 self._sse({"delta": (
-                    "P2cレビューは無効です。.env の MCP_REVIEW_P2C=1 に変更して "
-                    "start_all.bat を再実行すると /review-2 と /security-review-2 が使えます。"
+                    "深掘りレビューは無効です。.env の MCP_REVIEW_P2C=1 に変更して "
+                    "start_all.bat を再実行すると /deep-review と /deep-security-review が使えます。"
                 )})
                 self._sse({}, "done")
                 return
