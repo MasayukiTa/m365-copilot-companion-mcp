@@ -99,7 +99,8 @@ def build_local_review_job(goal: dict, job_id: str) -> dict:
     }
 
 
-def _campaign_snapshot(store: LocalJobStore, entries: list[dict], started: float) -> dict:
+def _campaign_snapshot(store: LocalJobStore, entries: list[dict], started: float,
+                       active_workers: set[str] | None = None) -> dict:
     workers = []
     done = 0
     running = False
@@ -134,7 +135,10 @@ def _campaign_snapshot(store: LocalJobStore, entries: list[dict], started: float
         "total": len(entries),
         "done_count": done,
         "running": running,
-        "open_tabs": sum(1 for worker in workers if not worker["closed"]),
+        # READY includes all pre-created jobs, not open conversations. During a live run the
+        # process table is authoritative; after completion there are no active workers.
+        "open_tabs": (len(active_workers) if active_workers is not None else
+                      sum(1 for worker in workers if worker["status"] == "running")),
         "execution_mode": "LOCAL_LOOP",
         "response_content_reads": 0,
         "workers": workers,
@@ -253,11 +257,13 @@ def run_local_review_fleet(
                 continue
             log.close()
             active.pop(worker, None)
-        _atomic_json(status_path, _campaign_snapshot(store, entries, started))
+        _atomic_json(status_path, _campaign_snapshot(
+            store, entries, started, active_workers=set(active),
+        ))
         if pending or active:
             time.sleep(1.0)
 
-    snapshot = _campaign_snapshot(store, entries, started)
+    snapshot = _campaign_snapshot(store, entries, started, active_workers=set())
     _atomic_json(status_path, snapshot)
     failures = [worker for worker in snapshot["workers"] if worker["outcome"] != "DONE"]
     if failures:

@@ -90,6 +90,7 @@ class RetryAbortThenCommitDriver(CommitOnSendDriver):
 def test_controller_completes_two_turns_without_reading_response_content(tmp_path):
     store = LocalJobStore(tmp_path / "jobs.sqlite3")
     store.create_job(_job())
+    store.create_job(_job("unrelated_shared_db_job"))
     driver = CommitOnSendDriver(store, ["CONTINUE", "CANDIDATE_DONE"])
     status_path = tmp_path / "status.json"
     controller = LocalLoopController(
@@ -103,6 +104,8 @@ def test_controller_completes_two_turns_without_reading_response_content(tmp_pat
     assert driver.answer_content_reads == 0
     projected = json.loads(status_path.read_text(encoding="utf-8"))
     assert projected["local_loop_answer_content_reads"] == 0
+    assert projected["total"] == 1
+    assert [worker["name"] for worker in projected["workers"]] == ["job_1"]
     assert projected["workers"][0]["outcome"] == "DONE"
 
 
