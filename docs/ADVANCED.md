@@ -154,6 +154,17 @@ checkで検証します。SQLiteはPython標準機能であり、管理者権限
   --rotate-after-turns 5
 ```
 
+`MCP_REVIEW_P2C=1`と`MCP_EXECUTION_PROFILES=1`を併用すると、`/deep-review`と
+`/deep-security-review`は既定でLOCAL_LOOP輸送になります。producer・adversarial・
+adjudicationの3ターンをSQLiteへコミットし、最終コミットだけを既存のレビュー集計へ
+渡します。通常の`/review`と`/security-review`は従来動作のままです。比較や切り戻しで
+旧輸送を明示する場合だけ`MCP_DEEP_REVIEW_TRANSPORT=fleet`を指定します。
+
+FleetCockpitは同じ`.fleet/status.json`を読み、LOCAL_LOOPジョブのターン・最終コミット・
+待機状態を表示します。カードの停止と全停止は`.fleet/commands.json`を介してSQLiteの
+該当ジョブを`CANCELLED`へ遷移させます。認証は単一のアカウント選択・続行だけ自動で
+進め、複数アカウントまたは資格情報入力が必要な場合は`WAITING_AUTH`で停止します。
+
 状態は従来と同じ`.fleet/status.json`へ投影されるためFleetCockpitで確認でき、停止指示は
 `.fleet/commands.json`から取り込みます。意味上の結果は`.jobs/jobs.sqlite3`が正本です。
 通常チャット、SSE、従来fleetの挙動は変更しません。

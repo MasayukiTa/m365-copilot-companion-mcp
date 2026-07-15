@@ -2,6 +2,7 @@ import json
 
 from bench.local_review_transport import (
     _campaign_snapshot,
+    _consume_console_commands,
     build_local_review_job,
 )
 from relay.local_job_store import LocalJobStore
@@ -50,3 +51,17 @@ def test_campaign_snapshot_projects_final_sqlite_summary_without_transcript(tmp_
     assert worker["transcript"] == ""
     assert snapshot["response_content_reads"] == 0
     json.dumps(snapshot)
+
+
+def test_console_stop_cancels_campaign_job(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    job = build_local_review_job(_goal(), "deep_test_0001")
+    store.create_job(job)
+    commands = tmp_path / "commands.json"
+    commands.write_text(json.dumps({"close": ["w0"]}), encoding="utf-8")
+    stopped = _consume_console_commands(commands, store, [{
+        "job_id": "deep_test_0001", "worker": "w0", "goal": _goal(),
+    }])
+    assert stopped == {"w0"}
+    assert store.get_job_status("deep_test_0001")["status"] == "CANCELLED"
+    assert not commands.exists()
