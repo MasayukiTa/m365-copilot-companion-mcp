@@ -297,10 +297,11 @@ def step_install_deps() -> None:
     # pip returning 0 is NECESSARY but not SUFFICIENT: a partial download, a
     # broken wheel, or an install against the wrong interpreter can leave core
     # deps unimportable while pip still exits 0. Verify by actually importing a
-    # couple of CORE sentinel packages in the venv (fastmcp -- the MCP framework
-    # main.py needs; httpx -- imported directly by our tools). If either fails to
+    # CORE sentinel packages in the venv (including the v0.3 headless LOCAL_LOOP
+    # execution path). sqlite3 is from the standard library, but checking it here also
+    # catches unusually stripped Python distributions. If any import fails to
     # import, the environment is not usable; raise a novice-readable StepError.
-    sentinels = ["fastmcp", "httpx"]
+    sentinels = ["fastmcp", "httpx", "dotenv", "playwright", "psutil", "sqlite3"]
     check = subprocess.run(
         [py, "-c", "import " + ", ".join(sentinels)],
         capture_output=True, text=True,
@@ -322,7 +323,7 @@ def step_install_deps() -> None:
     # existing Edge/Chrome -- it never drives a Playwright-managed browser. A
     # 'playwright install' would download ~400MB of browser binaries for nothing
     # and can require extra permissions. So: no browser download here, on purpose.
-    log("    OK: dependencies installed and import-verified (fastmcp, httpx)")
+    log("    OK: dependencies installed and import-verified (server + headless LOCAL_LOOP)")
 
 
 # --------------------------------------------------------------------------- #
