@@ -1,0 +1,25 @@
+{
+  "job_id": "local_demo_001",
+  "execution_profile": "LOCAL_LOOP",
+  "data_location": "LOCAL",
+  "requires_local_tool": true,
+  "task": {
+    "type": "code_fix",
+    "instruction": "Run the project tests, fix the failure, and report the changed files."
+  },
+  "constraints": {
+    "max_turns": 10,
+    "allowed_base": "C:\\work\\project",
+    "allow_shell": true,
+    "allow_network": false,
+    "rotate_after_turns": 5,
+    "max_claim_bytes": 8192,
+    "max_commit_summary_bytes": 4096
+  },
+  "acceptance_checks": [
+    {
+      "type": "pytest",
+      "args": "-q"
+    }
+  ]
+}
