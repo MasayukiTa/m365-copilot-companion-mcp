@@ -43,13 +43,14 @@ def test_campaign_snapshot_projects_final_sqlite_summary_without_transcript(tmp_
     store.verify_candidate("deep_test_0001", True, "verified", now=40)
     snapshot = _campaign_snapshot(store, [{
         "job_id": "deep_test_0001", "worker": "w0", "goal": _goal(),
-    }], started=1)
+    }], started=1, active_workers=set())
     worker = snapshot["workers"][0]
     assert worker["outcome"] == "DONE"
     assert worker["last"].startswith("<<<FINDINGS>>>")
     assert worker["display_result"] == worker["last"]
     assert worker["transcript"] == ""
     assert snapshot["response_content_reads"] == 0
+    assert snapshot["open_tabs"] == 0
     json.dumps(snapshot)
 
 
