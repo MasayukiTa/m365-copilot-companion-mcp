@@ -384,7 +384,10 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
     _LOCAL_LOOP_PRIORITY = (
         claim_turn, heartbeat, commit_turn, abort_turn, read_job_context, get_job_status,
     ) if EXECUTION_PROFILE_TOOLS else ()
-    _PRIORITY = (unlock, list_unlocked, *_LOCAL_LOOP_PRIORITY, call_tool, list_my_tools, env_info)
+    # With the default cap=8, LOCAL_LOOP needs all six protocol tools plus unlock and
+    # call_tool. Keep call_tool inside that hard boundary so claimed jobs can still use
+    # the hidden local work tools; list_unlocked is diagnostic and may safely spill out.
+    _PRIORITY = (unlock, *_LOCAL_LOOP_PRIORITY, call_tool, list_unlocked, list_my_tools, env_info)
     # A SMALL registered set is not just about the 70 cap: each tool's schema costs input
     # tokens, and a Copilot Studio agent's model has a limited budget -- with all ~70 schemas
     # loaded, even a short task prompt overflows (OpenAIModelTokenLimit) before any work. So
