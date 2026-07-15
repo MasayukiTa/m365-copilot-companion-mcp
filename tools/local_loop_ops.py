@@ -67,7 +67,7 @@ def commit_turn(job_id: str, seq: int, lease_id: str, fencing_token: int,
 
 def abort_turn(job_id: str, seq: int, lease_id: str, fencing_token: int,
                error_code: str, detail: str, retryable: bool) -> dict:
-    """Abort a LOCAL_LOOP turn, preserving retryability and its fenced lease."""
+    """Abort a LOCAL_LOOP turn. P2c reviews may safely rescope an unsafe refusal instead of failing the whole review."""
     error = require_unlocked()
     if error:
         return {"ok": False, "error": "LOCKED", "detail": error}
