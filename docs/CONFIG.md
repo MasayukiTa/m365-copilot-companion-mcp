@@ -26,6 +26,10 @@
 | `MCP_REVIEW_P2C` | 深掘りレビュー `/deep-review` `/deep-security-review` の表示・実行 | `0`（無効）/ `1`（有効） |
 | `MCP_EXECUTION_PROFILES` | 回答本文非依存の実験的 `LOCAL_LOOP` MCPツールを登録 | `0`（無効）/ `1`（有効） |
 | `MCP_LOCAL_JOB_DB` | `LOCAL_LOOP` のSQLite状態ストア | 未指定なら `.jobs/jobs.sqlite3` |
+| `MCP_DEEP_REVIEW_TRANSPORT` | Deep Reviewの輸送方式。`auto`は実行プロファイル有効時にLOCAL_LOOP | `auto` / `local_loop` / `fleet` |
+| `MCP_LOCAL_REVIEW_MAX_CONCURRENT` | LOCAL_LOOP Deep Reviewの同時会話数 | `2` |
+| `MCP_LOCAL_ROTATE_AFTER_TURNS` | 新しい会話へ切り替えるターン数 | `3` |
+| `MCP_LOCAL_EDGE_MB_LIMIT` | 会話切替を促すcompanion Edge使用量（MB） | `1400` |
 | `MCP_RESEARCHER_AGENT_URL` | `/research` が使う調査エージェント（Researcher `…dr_work`） | 内蔵既定・通常は空 |
 | `MCP_ANALYST_AGENT_URL` | `/analyze` が使う分析エージェント（Analyst `…diceberry`） | 内蔵既定・通常は空 |
 | `MCP_CDP_URL` | 専用 Edge の CDP エンドポイント | `http://localhost:9222` |
