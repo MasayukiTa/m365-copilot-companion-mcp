@@ -228,7 +228,7 @@ class LocalLoopController:
             )
             return None
 
-    def _wait_for_commit(self, seq: int) -> dict | None:
+    def _wait_for_commit(self, seq: int, retry_count_before: int = 0) -> dict | None:
         deadline = self.monotonic() + self.turn_timeout_seconds
         next_consent_probe = self.monotonic()
         while self.monotonic() < deadline:
@@ -237,6 +237,15 @@ class LocalLoopController:
             commit = self.store.get_turn_commit(self.job_id, seq)
             if commit is not None:
                 return commit
+            turn_status = self.store.get_job_status(self.job_id)
+            if turn_status["status"] in TERMINAL_JOB_STATUSES:
+                return {"status": "ABORTED"}
+            if (
+                turn_status["current_seq"] == seq
+                and turn_status["turn_status"] == "READY"
+                and int(turn_status["retry_count"]) > int(retry_count_before)
+            ):
+                return {"status": "RETRYABLE_ABORT"}
             if self.monotonic() >= next_consent_probe:
                 self._probe_consent()
                 if self.store.get_job_status(self.job_id)["status"] in INTERACTION_WAIT_STATUSES:
@@ -335,6 +344,7 @@ class LocalLoopController:
                 return "CANCELLED"
 
             seq = int(status["current_seq"])
+            retry_count_before = int(status.get("retry_count", 0))
             trigger = f"RUN {self.job_id} seq={seq} worker={self.worker_id}"
             self.driver.send(trigger, track_answer=False)
             self.store.record_event(self.job_id, "UI_TRIGGER_SENT", {
@@ -343,7 +353,7 @@ class LocalLoopController:
             sent_turns += 1
             self.turns_in_conversation += 1
 
-            commit = self._wait_for_commit(seq)
+            commit = self._wait_for_commit(seq, retry_count_before)
             if commit is None:
                 current_status = self.store.get_job_status(self.job_id)["status"]
                 if current_status == "CANCELLED":

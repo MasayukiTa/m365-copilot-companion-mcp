@@ -55,6 +55,31 @@ class NoCommitDriver(CommitOnSendDriver):
         self.sent.append(text)
 
 
+class RetryAbortThenCommitDriver(CommitOnSendDriver):
+    def __init__(self, store):
+        super().__init__(store, [])
+        self.calls = 0
+
+    def send(self, text, track_answer=True):
+        assert track_answer is False
+        self.sent.append(text)
+        parts = dict(part.split("=", 1) for part in text.split()[2:])
+        seq = int(parts["seq"])
+        worker = parts["worker"]
+        claim = self.store.claim_turn("job_1", seq, worker)
+        self.calls += 1
+        if self.calls == 1:
+            self.store.abort_turn(
+                "job_1", seq, claim["lease_id"], claim["fencing_token"],
+                "POLICY_RETRY", "visible confirmation required", True,
+            )
+        else:
+            self.store.commit_turn(
+                "job_1", seq, claim["lease_id"], claim["fencing_token"],
+                status="CANDIDATE_DONE", summary="confirmed",
+            )
+
+
 def test_controller_completes_two_turns_without_reading_response_content(tmp_path):
     store = LocalJobStore(tmp_path / "jobs.sqlite3")
     store.create_job(_job())
@@ -180,6 +205,19 @@ def test_console_stop_cancels_job_without_browser_response(tmp_path):
     controller = LocalLoopController(store, "job_1", driver, commands_path=commands)
     assert controller.run() == "CANCELLED"
     assert driver.sent == []
+
+
+def test_retryable_abort_is_retried_without_waiting_for_commit_timeout(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job())
+    driver = RetryAbortThenCommitDriver(store)
+    controller = LocalLoopController(
+        store, "job_1", driver, rotate_after_turns=0, poll_seconds=.01,
+        acceptance_runner=lambda job: (True, "verified"),
+    )
+    assert controller.run() == "DONE"
+    assert len(driver.sent) == 2
+    assert store.get_job_status("job_1")["retry_count"] == 1
 
 
 def test_thirty_turn_smoke_rotates_without_any_response_content_reads(tmp_path):
