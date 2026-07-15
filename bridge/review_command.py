@@ -11,8 +11,13 @@ from __future__ import annotations
 import os
 
 _SECURITY_TOKENS = ("security-review", "securityreview", "security")
-_P2C_REVIEW_TOKENS = ("review-2", "review2")
-_P2C_SECURITY_TOKENS = ("security-review-2", "securityreview-2", "securityreview2")
+# Public names describe the behavior. The old -2 spellings remain accepted as hidden
+# compatibility aliases so existing scripts do not break, but they are never advertised.
+_P2C_REVIEW_TOKENS = ("deep-review", "deepreview", "review-2", "review2")
+_P2C_SECURITY_TOKENS = (
+    "deep-security-review", "deepsecurityreview",
+    "security-review-2", "securityreview-2", "securityreview2",
+)
 
 
 def parse_review_command(cmd):
