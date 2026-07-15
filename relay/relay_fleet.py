@@ -714,10 +714,11 @@ def _open_fresh(context, url):
     attempt = 0
     while True:
         attempt += 1
+        navigation_failed = False
         try:
             pg.goto(url, wait_until="domcontentloaded", timeout=45000)
         except Exception:
-            pass
+            navigation_failed = True
         for k in range(25):
             pg.wait_for_timeout(1000)
             if pg.locator(COPILOT_SELECTORS["composer"]).count() > 0:
@@ -740,6 +741,11 @@ def _open_fresh(context, url):
                     touch_pause()          # keep the keeper backed off through a long login
                 elif u == "about:blank" and k >= 3:
                     break                  # stuck on about:blank -> re-navigate
+                elif navigation_failed and k >= 3:
+                    # A timed-out navigation can report the requested URL while the
+                    # target still has an about:blank document. Do not spend another
+                    # 25s waiting for a composer that cannot exist; retry the navigation.
+                    break
             except Exception:
                 pass
         # Non-surfaced path unchanged: give up after 3 navigation attempts (~75s).
