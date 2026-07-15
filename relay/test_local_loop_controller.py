@@ -5,6 +5,7 @@ from relay.local_loop_controller import (
     LocalLoopController,
     _AUTH_ACTION_SELECTOR,
     _CREDENTIAL_INPUT_SELECTOR,
+    _close_driver_page,
     _write_atomic,
     probe_browser_interaction,
 )
@@ -342,3 +343,20 @@ def test_auth_probe_never_submits_visible_credentials(monkeypatch):
     page = _AuthPage([1], credential=True)
     assert probe_browser_interaction(_AuthDriver(page)) == "WAITING_AUTH"
     assert page.step == 0
+
+
+def test_close_driver_page_closes_only_owned_page():
+    class Page:
+        closed = False
+
+        def is_closed(self):
+            return self.closed
+
+        def close(self):
+            self.closed = True
+
+    page = Page()
+    driver = type("Driver", (), {"page": page})()
+    _close_driver_page(driver)
+    assert page.closed is True
+    _close_driver_page(driver)  # idempotent

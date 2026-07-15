@@ -34,6 +34,10 @@ Write-Host "  3) API key value  :  " -NoNewline; Write-Host $bearer -ForegroundC
 Write-Host "==================================================================================="
 Write-Host "Then:  Save  ->  Add connection / Test  (the tool list should load:"
 Write-Host "       list_my_tools, read_file, ...)  ->  Publish: visibility = JUST ME."
+Write-Host ""
+Write-Host "For LOCAL_LOOP / Deep Review, append this file to the agent's Instructions:" -ForegroundColor Cyan
+Write-Host ("       " + (Join-Path $repo "docs\examples\local_loop_agent_instructions.txt")) -ForegroundColor Green
+Write-Host "Keep the agent's existing instructions; append the file, Save, then Publish again."
 Write-Host "Finally: open the agent's chat, copy its URL, and paste it into configure_env.bat."
 Write-Host "Verify the whole chain any time with:  doctor.bat"
 Write-Host ""
