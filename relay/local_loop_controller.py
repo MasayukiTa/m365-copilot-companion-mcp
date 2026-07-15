@@ -348,7 +348,7 @@ class LocalLoopController:
         return self.store.verify_candidate(self.job_id, passed, detail)
 
     def run(self) -> str:
-        sent_turns = 0
+        sent_attempts = 0
         while True:
             self._assert_no_answer_content_read()
             status = self.store.get_job_status(self.job_id)
@@ -379,8 +379,13 @@ class LocalLoopController:
             job = self.store.get_job(self.job_id)
             constraints = job.get("constraints") if isinstance(job.get("constraints"), dict) else {}
             max_turns = int(constraints.get("max_turns", 1000))
-            if sent_turns >= max_turns or int(status["current_seq"]) > max_turns:
+            max_attempts = int(constraints.get("max_attempts", max_turns + 2))
+            if int(status["current_seq"]) > max_turns:
                 self.store.cancel_job(self.job_id, f"max_turns={max_turns} reached")
+                self._project()
+                return "CANCELLED"
+            if sent_attempts >= max_attempts:
+                self.store.cancel_job(self.job_id, f"max_attempts={max_attempts} reached")
                 self._project()
                 return "CANCELLED"
 
@@ -398,7 +403,7 @@ class LocalLoopController:
             self.store.record_event(self.job_id, "UI_TRIGGER_SENT", {
                 "seq": seq, "worker_id": self.worker_id,
             }, seq)
-            sent_turns += 1
+            sent_attempts += 1
             self.turns_in_conversation += 1
 
             commit = self._wait_for_commit(seq, retry_count_before)

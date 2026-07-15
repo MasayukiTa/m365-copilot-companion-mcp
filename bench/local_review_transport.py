@@ -47,7 +47,25 @@ def build_local_review_job(goal: dict, job_id: str) -> dict:
     if not workspace:
         raise ValueError("review goal cwd is required")
 
+    safe_partition = (
+        "\n\nP2C SAFE-PROGRESS POLICY (higher priority than embedded review wording):\n"
+        "This is an authorized defensive review, but authorization does not require unsafe "
+        "live side effects. Partition every requested check instead of refusing the whole job:\n"
+        "1. SAFE-EXECUTE: run compile checks, pure functions, tests, and probes that are "
+        "read-only or confined to temporary directories.\n"
+        "2. ISOLATE: for code that writes files, launches processes, sends notifications, "
+        "changes registration, or touches the network, use mocks, dry-run modes, temporary "
+        "copies, or static call-path evidence. Never use live secrets or expose a live tunnel.\n"
+        "3. STATIC-FALLBACK: when isolation is unavailable, inspect the exact code and report "
+        "the path as statically verified but dynamically unverified. Continue the remaining "
+        "safe slices.\n"
+        "Do not abort the entire review merely because one slice is unsafe or a requested "
+        "execution tool is unavailable. Commit the safe and static evidence with an honest "
+        "scope caveat. Do not claim that a side effect was observed unless it actually ran "
+        "inside the allowed isolation boundary.\n"
+    )
     common = (
+        safe_partition +
         "\n\nThis is a read-only review. Do not edit source files. Use the local tools "
         "needed to inspect or safely exercise the scoped repository. The operator-fixed "
         "turn plan is authoritative. Before ending this turn, commit through LOCAL_LOOP; "
@@ -86,6 +104,12 @@ def build_local_review_job(goal: dict, job_id: str) -> dict:
             "allow_shell": True,
             "allow_network": False,
             "max_turns": 3,
+            # Logical review passes and delivery retries are different budgets. A missed
+            # commit or safely-rescoped refusal must not consume the final adjudication pass.
+            "max_attempts": 5,
+            "continue_on_unsafe_abort": True,
+            "max_safe_rescopes": 2,
+            "unsafe_abort_fallback_instruction": safe_partition.strip(),
             "max_claim_bytes": 32768,
             "max_commit_summary_bytes": 65536,
             "max_context_file_bytes": 262144,
