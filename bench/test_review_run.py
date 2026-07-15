@@ -139,6 +139,26 @@ def test_fleet_cmd_shape():
     ]
 
 
+def test_deep_run_uses_local_transport_when_execution_profiles_enabled(tmp_path, monkeypatch):
+    called = {}
+
+    def fake_local(goals_path, max_concurrent, state_dir, **kwargs):
+        called.update(goals_path=goals_path, max_concurrent=max_concurrent,
+                      state_dir=state_dir, kwargs=kwargs)
+        return 17
+
+    monkeypatch.setenv("MCP_EXECUTION_PROFILES", "1")
+    monkeypatch.setenv("MCP_DEEP_REVIEW_TRANSPORT", "auto")
+    monkeypatch.setattr("bench.local_review_transport.run_local_review_fleet", fake_local)
+    state = str(tmp_path / "state")
+    result = review_run.run_fleet(
+        "goals.jsonl", 2, "auto", state_dir=state, resilience_profile="security",
+    )
+    assert result == 17
+    assert called["state_dir"] == state
+    assert called["max_concurrent"] == 2
+
+
 # --- merge_verdicts: pure --------------------------------------------------------------------
 
 def test_merge_verdicts_matches_by_file_line_title():
