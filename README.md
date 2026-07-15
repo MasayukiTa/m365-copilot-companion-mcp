@@ -137,7 +137,14 @@ git を使わないなら: GitHub ページの緑色の「**Code**」ボタン �
 
 **6. 「作成」をクリック** — 接続がテストされ、ツール一覧がロードされれば成功です。
 
-**7. 「公開」→「利用者を自分だけ」に設定** — 必ず自分のみ。組織全体は絶対に選ばないでください。
+**7. エージェントの「指示」を編集し、LOCAL_LOOP指示を末尾へ追記**
+
+既存の指示は消さず、[`docs/examples/local_loop_agent_instructions.txt`](docs/examples/local_loop_agent_instructions.txt)
+の全文を末尾へ貼り、「保存」を押します。これは`MCP_EXECUTION_PROFILES=1`で使う
+`/deep-review`・`/deep-security-review`とSQLite実行に必須です。通常チャットの指示とは
+`RUN <job_id> ...`形式で明確に分離されるため、通常利用の応答は変えません。
+
+**8. 「公開」→「利用者を自分だけ」に設定** — 必ず自分のみ。組織全体は絶対に選ばないでください。
 
 **うまくいった目安:** ツール登録画面に `list_my_tools`, `read_file` などのツール名がずらっと表示されます。
 
@@ -343,7 +350,11 @@ This is the only manual step. Go to `https://copilotstudio.microsoft.com` and fo
    > **Critical:** paste the whole `Bearer <key>` line into the "API key value" field, including the word `Bearer` and the space (e.g. `Bearer 4baf1c2e...`). The field is labeled "API key," which tempts people to paste the raw key alone — that gets a 401. The server does accept a raw key as a fallback, but the Bearer-prefixed form is canonical and is exactly what `copilot_studio_values.bat` prints, so just paste that line as-is.
 
 6. Click **"Create"**. If the connection succeeds, the tools list loads (`list_my_tools`, `read_file`, and so on).
-7. Click **"Publish"** → set visibility to **"Just me" only**. Never select organization-wide.
+7. Edit the agent's **Instructions**. Keep the existing text and append the complete contents of
+   [`docs/examples/local_loop_agent_instructions.txt`](docs/examples/local_loop_agent_instructions.txt),
+   then save. This is required for SQLite-backed LOCAL_LOOP and the Deep Review commands; it is
+   activated only by the explicit `RUN <job_id> ...` protocol and does not replace normal chat rules.
+8. Click **"Publish"** → set visibility to **"Just me" only**. Never select organization-wide.
 
 Once registered, open the agent's chat and paste the URL from the browser's address bar into the STEP 6 dialog.
 
