@@ -244,6 +244,18 @@ def run_fleet(goals_path, max_concurrent, effort, state_dir=None,
     (fleet_runner drives the M365 Copilot fleet on companion Edge :9222); returns its
     return code. Writes <state_dir or .fleet>/status.json and .../transcripts/* as a side
     effect."""
+    transport = os.environ.get("MCP_DEEP_REVIEW_TRANSPORT", "auto").strip().lower()
+    use_local = resilience_profile and transport in {"local", "local_loop", "sqlite"}
+    if resilience_profile and transport == "auto":
+        use_local = os.environ.get("MCP_EXECUTION_PROFILES", "0").strip() == "1"
+    if use_local:
+        from bench.local_review_transport import run_local_review_fleet
+        target_state = state_dir or os.path.join(REPO, ".fleet")
+        print("fleet: LOCAL_LOOP transport (response-content reads disabled)")
+        return run_local_review_fleet(
+            goals_path, max_concurrent, target_state, repo_root=REPO, python_exe=VENVPY,
+        )
+
     cmd = fleet_cmd(goals_path, max_concurrent, effort, state_dir=state_dir,
                     resilience_profile=resilience_profile, max_turns=max_turns)
     print("fleet: " + " ".join(cmd[1:]))

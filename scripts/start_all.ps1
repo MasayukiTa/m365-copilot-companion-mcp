@@ -27,16 +27,30 @@ $root = Split-Path -Parent $scriptDir
 
 function Ensure-EnvDefaults {
     # Release upgrades must not overwrite a user's .env, but existing installations need new
-    # safe defaults. Append MCP_REVIEW_P2C=0 only when the key is absent; an explicit 1 is kept.
+    # safe defaults. Append only absent keys; every explicit user choice is kept.
     try {
         $path = Join-Path $root ".env"
         if (-not (Test-Path $path)) { return }
         $text = [System.IO.File]::ReadAllText($path)
-        if ($text -match '(?m)^\s*MCP_REVIEW_P2C\s*=') { return }
-        if ($text.Length -gt 0 -and -not ($text.EndsWith("`n") -or $text.EndsWith("`r"))) {
-            $text += "`r`n"
+        $defaults = [ordered]@{
+            MCP_REVIEW_P2C = "0"
+            MCP_EXECUTION_PROFILES = "0"
+            MCP_DEEP_REVIEW_TRANSPORT = "auto"
+            MCP_LOCAL_REVIEW_MAX_CONCURRENT = "2"
+            MCP_LOCAL_ROTATE_AFTER_TURNS = "3"
+            MCP_LOCAL_EDGE_MB_LIMIT = "1400"
         }
-        $text += "MCP_REVIEW_P2C=0`r`n"
+        $added = $false
+        foreach ($entry in $defaults.GetEnumerator()) {
+            $pattern = '(?m)^\s*' + [regex]::Escape($entry.Key) + '\s*='
+            if ($text -match $pattern) { continue }
+            if ($text.Length -gt 0 -and -not ($text.EndsWith("`n") -or $text.EndsWith("`r"))) {
+                $text += "`r`n"
+            }
+            $text += $entry.Key + "=" + $entry.Value + "`r`n"
+            $added = $true
+        }
+        if (-not $added) { return }
         $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
         [System.IO.File]::WriteAllText($path, $text, $utf8NoBom)
     } catch {

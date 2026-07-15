@@ -341,6 +341,10 @@ def step_gen_env() -> None:
         for key, value in (
             ("MCP_REVIEW_P2C", "0"),
             ("MCP_EXECUTION_PROFILES", "0"),
+            ("MCP_DEEP_REVIEW_TRANSPORT", "auto"),
+            ("MCP_LOCAL_REVIEW_MAX_CONCURRENT", "2"),
+            ("MCP_LOCAL_ROTATE_AFTER_TURNS", "3"),
+            ("MCP_LOCAL_EDGE_MB_LIMIT", "1400"),
         ):
             if not any(line.strip().startswith(key + "=") for line in current.splitlines()):
                 missing.append(f"{key}={value}")
