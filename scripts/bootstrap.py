@@ -337,10 +337,17 @@ def step_gen_env() -> None:
         # Preserve every existing value/secret, but backfill newly introduced safe defaults.
         # This is deliberately append-only and never changes a user's explicit 0/1 choice.
         current = env_path.read_text(encoding="utf-8-sig")
-        if not any(line.strip().startswith("MCP_REVIEW_P2C=") for line in current.splitlines()):
+        missing = []
+        for key, value in (
+            ("MCP_REVIEW_P2C", "0"),
+            ("MCP_EXECUTION_PROFILES", "0"),
+        ):
+            if not any(line.strip().startswith(key + "=") for line in current.splitlines()):
+                missing.append(f"{key}={value}")
+        if missing:
             suffix = "" if not current or current.endswith(("\n", "\r")) else "\n"
-            env_path.write_text(current + suffix + "MCP_REVIEW_P2C=0\n", encoding="utf-8")
-            log("    OK: .env already exists; added MCP_REVIEW_P2C=0 (default OFF)")
+            env_path.write_text(current + suffix + "\n".join(missing) + "\n", encoding="utf-8")
+            log("    OK: .env already exists; added safe default(s): " + ", ".join(missing))
         else:
             log("    OK: .env already exists (left untouched)")
         return

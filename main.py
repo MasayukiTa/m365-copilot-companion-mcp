@@ -131,6 +131,14 @@ from tools.jobs import (
     run_in_background,
     run_python_in_background,
 )
+from tools.local_loop_ops import (
+    abort_turn,
+    claim_turn,
+    commit_turn,
+    get_job_status,
+    heartbeat,
+    read_job_context,
+)
 from tools.pdf_ops import pdf_info, read_pdf
 from tools.pptx_ops import (
     create_pptx,
@@ -149,6 +157,10 @@ from tools.task_ops import todo_clear, todo_list, todo_write
 from tools.web_ops import github_file, web_fetch
 
 load_dotenv()
+
+EXECUTION_PROFILE_TOOLS = (
+    claim_turn, heartbeat, commit_turn, abort_turn, read_job_context, get_job_status,
+) if os.environ.get("MCP_EXECUTION_PROFILES", "0") == "1" else ()
 
 API_KEY = os.environ["MCP_API_KEY"]
 
@@ -304,6 +316,8 @@ TOOLS = (
     # orchestration: human-in-the-loop gate + kill-switch (operator E)
     gate_ask, gate_poll, gate_answer, gate_list,
     stop_request, stop_check, stop_clear,
+    # orchestration: response-content-independent LOCAL_LOOP control plane
+    *EXECUTION_PROFILE_TOOLS,
     # orchestration: verification-loop helpers (operator C)
     verify_python, verify_numeric_close, verify_file_contains,
     verify_json_schema, verify_table_stat,
@@ -367,7 +381,10 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
             return "[call_tool %s error: %s: %s]" % (name, type(_e).__name__, _e)
 
     # critical tools FIRST (survive a front-biased truncation), then fill from the existing order
-    _PRIORITY = (unlock, list_unlocked, call_tool, list_my_tools, env_info)
+    _LOCAL_LOOP_PRIORITY = (
+        claim_turn, heartbeat, commit_turn, abort_turn, read_job_context, get_job_status,
+    ) if EXECUTION_PROFILE_TOOLS else ()
+    _PRIORITY = (unlock, list_unlocked, *_LOCAL_LOOP_PRIORITY, call_tool, list_my_tools, env_info)
     # A SMALL registered set is not just about the 70 cap: each tool's schema costs input
     # tokens, and a Copilot Studio agent's model has a limited budget -- with all ~70 schemas
     # loaded, even a short task prompt overflows (OpenAIModelTokenLimit) before any work. So

@@ -1,0 +1,18 @@
+When a user message has exactly this shape:
+
+RUN <job_id> seq=<integer> worker=<worker_id>
+
+run the LOCAL_LOOP protocol below. Do not infer a task from conversation history.
+
+1. Call claim_turn(job_id, expected_seq=seq, worker_id=worker_id).
+2. If claim_turn returns ok=false, do not perform local work. Return only its error code.
+3. Treat only the returned instruction and context as the current task.
+4. Use heartbeat for long-running work. Preserve lease_id and fencing_token exactly.
+5. Use only tools and paths allowed by the returned constraints.
+6. Store large logs and outputs as files and commit artifact references; do not embed them.
+7. Before ending the turn, call exactly one of commit_turn or abort_turn.
+8. Report apparent completion as CANDIDATE_DONE. Never commit authoritative DONE.
+9. Use CONTINUE only with a concrete next_instruction.
+10. After commit_turn or abort_turn, return only the ACK or error code from that tool.
+
+Never process CLOUD_WORKIQ with these LOCAL_LOOP tools. Never change execution_profile.

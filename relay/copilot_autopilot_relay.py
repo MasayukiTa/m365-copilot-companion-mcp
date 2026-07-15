@@ -581,6 +581,9 @@ class CopilotWebDriver:
     def __init__(self, page):
         self.page = page
         self._count_before = 0  # number of answer blocks before the current send
+        # Observable proof for LOCAL_LOOP acceptance tests: the response-content-independent
+        # path must leave this at zero for the whole run.
+        self.answer_content_reads = 0
         # Cap the default action timeout so no single locator op can hang the worker for
         # Playwright's default 30s. Best-effort: a driver built on a mock/stub page (tests)
         # has no such method, so guard it.
@@ -776,7 +779,8 @@ class CopilotWebDriver:
             self.page.wait_for_timeout(300)
         return False
 
-    def _snapshot_send_failure(self, attempt: int, phase: str) -> None:
+    def _snapshot_send_failure(self, attempt: int, phase: str,
+                               allow_answer_content: bool = True) -> None:
         """Best-effort diagnostic snapshot written to .fleet/send_failures.jsonl.
 
         DIAGNOSTIC ONLY. This method is fully self-contained and TOTALLY wrapped in
@@ -842,6 +846,8 @@ class CopilotWebDriver:
             def _is_processing_now():
                 # _is_processing() applied to the current last-answer text: was a Stop
                 # (generation-in-progress) indicator effectively showing?
+                if not allow_answer_content:
+                    return self._is_generating()
                 return _is_processing(self.read_last_response())
 
             def _page_url():
@@ -891,7 +897,8 @@ class CopilotWebDriver:
     # W0 STUCK (send into a generating turn). Per-call overridable via send(gen_wait_s=...).
     GEN_WAIT_S = 240.0
 
-    def send(self, text: str, gen_wait_s: float | None = None) -> None:
+    def send(self, text: str, gen_wait_s: float | None = None,
+             track_answer: bool = True) -> None:
         # EARLY DEAD-CHECK: if the tab/composer is already gone (conversation ended),
         # do NOT enter the type/arm/click retry loop -- it would just throw
         # TargetClosedError on every probe and waste the full 3x12s budget (the
@@ -913,7 +920,9 @@ class CopilotWebDriver:
         # a slow turn must never count toward STUCK. The composer is untouched here.
         gw = self.GEN_WAIT_S if gen_wait_s is None else gen_wait_s
         if self._is_generating():
-            self._snapshot_send_failure(attempt=0, phase="waiting_processing")
+            self._snapshot_send_failure(
+                attempt=0, phase="waiting_processing", allow_answer_content=track_answer,
+            )
             if not self._wait_generation_idle(timeout_s=gw):
                 if not self._page_alive():
                     raise ConversationClosed(
@@ -931,9 +940,12 @@ class CopilotWebDriver:
         one_line = " ".join(str(text).split())
         # remember how many answer blocks exist now, so wait_for_idle can detect a
         # genuinely NEW one (rather than re-reading the previous turn's answer).
-        try:
-            self._count_before = self._answers().count()
-        except Exception:
+        if track_answer:
+            try:
+                self._count_before = self._answers().count()
+            except Exception:
+                self._count_before = 0
+        else:
             self._count_before = 0
         composer = self.page.locator(COPILOT_SELECTORS["composer"]).first
 
@@ -988,11 +1000,12 @@ class CopilotWebDriver:
                 # is already replying, so the send DID go through -- even if the composer
                 # is slow to visually clear under memory pressure. Without this, a laggy
                 # composer caused false 'send failed' + a double-send on retry.
-                try:
-                    if self._answers().count() > self._count_before:
-                        return
-                except Exception:
-                    pass
+                if track_answer:
+                    try:
+                        if self._answers().count() > self._count_before:
+                            return
+                    except Exception:
+                        pass
                 if i and i % 4 == 0:             # ~every 1s, nudge a re-armed Send button
                     try:
                         btn = self._send_button()
@@ -1002,10 +1015,14 @@ class CopilotWebDriver:
                         pass
             # This attempt did not submit (no return above). Record a diagnostic
             # snapshot. Pure side effect, fully guarded -- does NOT change the loop.
-            self._snapshot_send_failure(attempt=attempt, phase="attempt_failed")
+            self._snapshot_send_failure(
+                attempt=attempt, phase="attempt_failed", allow_answer_content=track_answer,
+            )
         # All 3 attempts exhausted. One final snapshot just before the RuntimeError so
         # the terminal state is captured. Pure side effect, fully guarded.
-        self._snapshot_send_failure(attempt=3, phase="final_before_raise")
+        self._snapshot_send_failure(
+            attempt=3, phase="final_before_raise", allow_answer_content=track_answer,
+        )
         raise RuntimeError(
             "send failed: composer still holds text after 3 attempts "
             "(Send button never submitted the message)"
@@ -1085,6 +1102,7 @@ class CopilotWebDriver:
         return False
 
     def read_last_response(self) -> str:
+        self.answer_content_reads += 1
         loc = self._answers()
         if loc.count() == 0:
             loc = self.page.locator(COPILOT_SELECTORS["assistant_msg_fallback"])

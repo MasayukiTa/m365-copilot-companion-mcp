@@ -194,3 +194,6 @@ _attic/
 
 # Overnight comparison orchestration is a local experiment harness, not product code.
 /relay/overnight_task.py
+
+# LOCAL_LOOP SQLite control plane and artifacts are machine-local runtime state.
+/.jobs/
