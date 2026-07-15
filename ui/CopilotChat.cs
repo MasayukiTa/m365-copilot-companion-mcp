@@ -1960,13 +1960,13 @@ class ChatWindow : Window
         new[]{"/table","Make a table"},
     };
     static readonly string[] _p2cCommandJaReview =
-        new[]{"/review-2","P2c分割レビュー（拒否時のみ再試行・分割）"};
+        new[]{"/deep-review","深掘りレビュー（拒否時のみ再試行・分割）"};
     static readonly string[] _p2cCommandJaSecurity =
-        new[]{"/security-review-2","P2c分割セキュリティレビュー"};
+        new[]{"/deep-security-review","深掘りセキュリティレビュー"};
     static readonly string[] _p2cCommandEnReview =
-        new[]{"/review-2","P2c split review (retry/split only after refusal)"};
+        new[]{"/deep-review","Deep review (retry/split only after refusal)"};
     static readonly string[] _p2cCommandEnSecurity =
-        new[]{"/security-review-2","P2c split security review"};
+        new[]{"/deep-security-review","Deep security review"};
 
     // Read on demand: changing .env takes effect the next time the slash palette or /help opens,
     // even when CopilotChat is already running. Keep the same precedence/semantics as the bridge:
@@ -2062,10 +2062,10 @@ class ChatWindow : Window
         string p2c = "";
         if (P2cReviewEnabled())
             p2c = _lang != 0
-                ? "/review-2 [diff|<path>] - P2c split review\n"
-                    + "/security-review-2 [diff|<path>] - P2c split security review\n"
-                : "/review-2 [diff|<パス>] - P2c分割レビュー\n"
-                    + "/security-review-2 [diff|<パス>] - P2c分割セキュリティレビュー\n";
+                ? "/deep-review [diff|<path>] - deep review\n"
+                    + "/deep-security-review [diff|<path>] - deep security review\n"
+                : "/deep-review [diff|<パス>] - 深掘りレビュー\n"
+                    + "/deep-security-review [diff|<パス>] - 深掘りセキュリティレビュー\n";
         if (_lang != 0)
             return "Chat commands:\n"
                 + "/help - this list\n"
