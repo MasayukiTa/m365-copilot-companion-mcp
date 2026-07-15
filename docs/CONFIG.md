@@ -24,6 +24,8 @@
 | `MCP_IMPL_AGENT_URL` | bridge / fleet が駆動する主 Copilot エージェントの URL（テナント固有 `T_…`） | 手動で貼る（**必須**） |
 | `MCP_FLEET_AGENT_URL` | fleet 専用エージェント URL | 未指定なら `MCP_IMPL_AGENT_URL` |
 | `MCP_REVIEW_P2C` | 深掘りレビュー `/deep-review` `/deep-security-review` の表示・実行 | `0`（無効）/ `1`（有効） |
+| `MCP_EXECUTION_PROFILES` | 回答本文非依存の実験的 `LOCAL_LOOP` MCPツールを登録 | `0`（無効）/ `1`（有効） |
+| `MCP_LOCAL_JOB_DB` | `LOCAL_LOOP` のSQLite状態ストア | 未指定なら `.jobs/jobs.sqlite3` |
 | `MCP_RESEARCHER_AGENT_URL` | `/research` が使う調査エージェント（Researcher `…dr_work`） | 内蔵既定・通常は空 |
 | `MCP_ANALYST_AGENT_URL` | `/analyze` が使う分析エージェント（Analyst `…diceberry`） | 内蔵既定・通常は空 |
 | `MCP_CDP_URL` | 専用 Edge の CDP エンドポイント | `http://localhost:9222` |

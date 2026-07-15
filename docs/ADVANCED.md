@@ -136,6 +136,35 @@ relay の上に Claude Code のような自律コーディング体験を載せ�
 
 制御ロジックはブラウザ無しで決定的にテスト（138 本超のユニットテスト）し、実機 Copilot 相手の end-to-end もライブ実証済み。
 
+### 実験的LOCAL_LOOP（回答本文を制御に使わない）
+
+`MCP_EXECUTION_PROFILES=1` にすると、`claim_turn` / `heartbeat` / `commit_turn` /
+`abort_turn` / `read_job_context` / `get_job_status` が登録されます。Copilot Studioの
+エージェント指示には `docs/examples/local_loop_agent_instructions.txt` を追加し、MCPを
+再接続してください。
+
+LOCAL_LOOPはWeb UIへ短い`RUN job seq worker`だけを入力し、回答本文を読みません。
+Copilotの構造化commitをSQLiteで待ち、`CANDIDATE_DONE`を従来のローカルacceptance
+checkで検証します。SQLiteはPython標準機能であり、管理者権限やDBサービスは不要です。
+
+```powershell
+# サンプルJSONのallowed_baseとtaskを変更してから実行
+.\.venv\Scripts\python.exe -m relay.local_loop_controller `
+  --job-file docs\examples\local_loop_job.example.json `
+  --rotate-after-turns 5
+```
+
+状態は従来と同じ`.fleet/status.json`へ投影されるためFleetCockpitで確認でき、停止指示は
+`.fleet/commands.json`から取り込みます。意味上の結果は`.jobs/jobs.sqlite3`が正本です。
+通常チャット、SSE、従来fleetの挙動は変更しません。
+
+単一候補のMicrosoft/ADFSサインインと既存MCP承認は、回答欄ではなくURLと操作コントロール
+だけを見て自動操作します。安全に一意選択できない場合は`WAITING_AUTH`または
+`WAITING_CONSENT`として停止し、ユーザー対応後に同じseqを新しいfencing tokenで再開します。
+
+会話コンテキストのcompactは、各commitの短いsummaryを次ターンへ渡し、詳細をartifactと
+eventsへ退避する方式です。DB容量は完了時のWAL checkpointで抑え、実行中にVACUUMは行いません。
+
 ---
 
 ## fleet 並列と RAM 連動 autoscale
