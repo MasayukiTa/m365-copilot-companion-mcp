@@ -217,6 +217,18 @@ class LocalLoopController:
             return
         snapshot = self.store.console_snapshot()
         status = self.store.get_job_status(self.job_id)["status"]
+        # The SQLite database is intentionally shared by campaigns and smoke jobs. A
+        # controller-owned status file must describe only this controller's job; projecting
+        # every historical/shared job makes one worker directory look like an entire fleet.
+        snapshot["workers"] = [
+            worker for worker in snapshot.get("workers", [])
+            if worker.get("name") == self.job_id
+        ]
+        snapshot["total"] = len(snapshot["workers"])
+        snapshot["done_count"] = sum(
+            1 for worker in snapshot["workers"] if worker.get("outcome") == "DONE"
+        )
+        snapshot["running"] = status not in TERMINAL_JOB_STATUSES
         snapshot["open_tabs"] = 0 if status in TERMINAL_JOB_STATUSES else 1
         snapshot["local_loop_answer_content_reads"] = (
             int(getattr(self.driver, "answer_content_reads", 0)) - self._answer_reads_at_attach
