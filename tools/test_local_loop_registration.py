@@ -45,6 +45,7 @@ def test_feature_flag_registers_protocol_tools_ahead_of_map_limit(tmp_path):
                  "read_job_context", "get_job_status", "call_tool"):
         assert name in names
     assert len(names) == 8
+    assert names[:2] == ["unlock", "call_tool"]
 
 
 def test_feature_flag_off_hides_protocol_tools(tmp_path):

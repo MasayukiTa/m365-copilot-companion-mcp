@@ -99,6 +99,27 @@ def test_controller_completes_two_turns_without_reading_response_content(tmp_pat
     assert projected["workers"][0]["outcome"] == "DONE"
 
 
+def test_fixed_plan_trigger_is_short_and_transparent(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    job = _job()
+    job["constraints"]["read_only"] = True
+    job["turn_plan"] = [
+        {"instruction": "Inspect the first file"},
+        {"instruction": "Inspect the second file"},
+    ]
+    store.create_job(job)
+    driver = CommitOnSendDriver(store, ["CONTINUE", "CANDIDATE_DONE"])
+    controller = LocalLoopController(
+        store, "job_1", driver, rotate_after_turns=0, poll_seconds=.01,
+        acceptance_runner=lambda current: (True, "verified"),
+    )
+    assert controller.run() == "DONE"
+    assert driver.sent[0].startswith("RUN job_1 seq=1 worker=local_")
+    assert driver.sent[0].endswith(" plan=1/2 mode=read-only")
+    assert driver.sent[1].startswith("RUN job_1 seq=2 worker=local_")
+    assert driver.sent[1].endswith(" plan=2/2 mode=read-only")
+
+
 def test_failed_acceptance_becomes_next_seq_not_done(tmp_path):
     store = LocalJobStore(tmp_path / "jobs.sqlite3")
     store.create_job(_job())

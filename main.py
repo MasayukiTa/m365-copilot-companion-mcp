@@ -387,7 +387,10 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
     # With the default cap=8, LOCAL_LOOP needs all six protocol tools plus unlock and
     # call_tool. Keep call_tool inside that hard boundary so claimed jobs can still use
     # the hidden local work tools; list_unlocked is diagnostic and may safely spill out.
-    _PRIORITY = (unlock, *_LOCAL_LOOP_PRIORITY, call_tool, list_unlocked, list_my_tools, env_info)
+    # Keep the gateway immediately after unlock. Some hosts truncate or cache a
+    # front-biased schema subset; losing diagnostic get_job_status is survivable, while
+    # losing call_tool makes claimed work impossible.
+    _PRIORITY = (unlock, call_tool, *_LOCAL_LOOP_PRIORITY, list_unlocked, list_my_tools, env_info)
     # A SMALL registered set is not just about the 70 cap: each tool's schema costs input
     # tokens, and a Copilot Studio agent's model has a limited budget -- with all ~70 schemas
     # loaded, even a short task prompt overflows (OpenAIModelTokenLimit) before any work. So

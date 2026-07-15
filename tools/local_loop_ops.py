@@ -33,7 +33,7 @@ def _call(fn, *args, **kwargs):
 
 def claim_turn(job_id: str, expected_seq: int, worker_id: str,
                lease_seconds: int = 300) -> dict:
-    """Claim one LOCAL_LOOP turn. Call this first after RUN; requires unlock."""
+    """Claim an operator-authored LOCAL_LOOP turn after RUN; requires unlock."""
     error = require_unlocked()
     if error:
         return {"ok": False, "error": "LOCKED", "detail": error}
@@ -55,7 +55,7 @@ def heartbeat(job_id: str, seq: int, lease_id: str, fencing_token: int,
 def commit_turn(job_id: str, seq: int, lease_id: str, fencing_token: int,
                 status: str, summary: str, next_instruction: str = "",
                 artifacts: list[dict] | None = None, metrics: dict | None = None) -> dict:
-    """Commit structured turn state. Use CANDIDATE_DONE, never authoritative DONE."""
+    """Commit state and return a short receipt. A fixed plan rejects CANDIDATE_DONE before its final turn; use CONTINUE with empty next_instruction. CANDIDATE_DONE is not DONE."""
     error = require_unlocked()
     if error:
         return {"ok": False, "error": "LOCKED", "detail": error}
@@ -79,7 +79,7 @@ def abort_turn(job_id: str, seq: int, lease_id: str, fencing_token: int,
 
 def read_job_context(job_id: str, seq: int, lease_id: str, fencing_token: int,
                      keys: list[str]) -> dict:
-    """Read bounded job context after a successful claim; the current lease is required."""
+    """Read bounded job context after claim. Use key file:<relative-path> for read-only UTF-8 file content inside allowed_base; the current lease is required."""
     return _call(
         _store().read_job_context, job_id, seq, lease_id, fencing_token, keys,
     )

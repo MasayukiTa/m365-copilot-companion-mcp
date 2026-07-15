@@ -346,6 +346,13 @@ class LocalLoopController:
             seq = int(status["current_seq"])
             retry_count_before = int(status.get("retry_count", 0))
             trigger = f"RUN {self.job_id} seq={seq} worker={self.worker_id}"
+            turn_plan = job.get("turn_plan") if isinstance(job.get("turn_plan"), list) else []
+            if turn_plan:
+                initial_seq = int(job.get("initial_seq", 1))
+                turn_number = max(1, seq - initial_seq + 1)
+                trigger += f" plan={turn_number}/{len(turn_plan)}"
+            if bool(constraints.get("read_only")):
+                trigger += " mode=read-only"
             self.driver.send(trigger, track_answer=False)
             self.store.record_event(self.job_id, "UI_TRIGGER_SENT", {
                 "seq": seq, "worker_id": self.worker_id,
