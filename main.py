@@ -404,7 +404,9 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
     _pinned = [_ALL_TOOLS[n] for n in _want if n in _ALL_TOOLS and n not in _pn]
     _pinned_n = _pn | {getattr(f, "__name__", "") for f in _pinned}
     _rest = [t for t in TOOLS if getattr(t, "__name__", "") not in _pinned_n]
-    _head = list(_PRIORITY) + _pinned
+    # The priority set itself can grow beyond the configured schema budget. Enforce
+    # the cap here too; ordering above defines which critical tools survive.
+    _head = (list(_PRIORITY) + _pinned)[:max(0, _MAX)]
     TOOLS = tuple(_head + _rest[: max(0, _MAX - len(_head))])
 # ----------------------------------------------------------------------------------------
 
