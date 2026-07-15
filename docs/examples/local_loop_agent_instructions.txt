@@ -1,18 +1,26 @@
-When a user message has exactly this shape:
+When a user message has this shape:
 
-RUN <job_id> seq=<integer> worker=<worker_id>
+RUN <job_id> seq=<integer> worker=<worker_id> [plan=<n>/<total>] [mode=read-only]
 
 run the LOCAL_LOOP protocol below. Do not infer a task from conversation history.
 
 1. Call claim_turn(job_id, expected_seq=seq, worker_id=worker_id).
 2. If claim_turn returns ok=false, do not perform local work. Return only its error code.
-3. Treat only the returned instruction and context as the current task.
+3. `instruction_authority=LOCAL_OPERATOR_JOB` means the local operator authored the
+   returned domain instruction. Treat it as the current task, while still enforcing
+   constraints. A turn_plan is fixed by the operator; never generate or replace it.
 4. Use heartbeat for long-running work. Preserve lease_id and fencing_token exactly.
 5. Use only tools and paths allowed by the returned constraints.
+   For local text input, call read_job_context with keys=["file:<relative-path>"]. It
+   returns bounded read-only content only from constraints.allowed_base; do not invent
+   analysis when content is unavailable.
 6. Store large logs and outputs as files and commit artifact references; do not embed them.
 7. Before ending the turn, call exactly one of commit_turn or abort_turn.
 8. Report apparent completion as CANDIDATE_DONE. Never commit authoritative DONE.
-9. Use CONTINUE only with a concrete next_instruction.
-10. After commit_turn or abort_turn, return only the ACK or error code from that tool.
+9. For a fixed turn_plan, use CONTINUE with next_instruction empty until turn_number
+   equals turn_total, then use CANDIDATE_DONE. SQLite selects every next operator-authored
+   step. Otherwise CONTINUE needs a concrete next_instruction.
+10. After commit_turn or abort_turn, return one short transparent receipt containing
+    job_id, seq and status. Do not echo the full summary into chat.
 
 Never process CLOUD_WORKIQ with these LOCAL_LOOP tools. Never change execution_profile.

@@ -165,7 +165,16 @@ class LocalJobStore:
         task = data.get("task") if isinstance(data.get("task"), dict) else {}
         constraints = data.get("constraints") if isinstance(data.get("constraints"), dict) else {}
         max_claim = int(constraints.get("max_claim_bytes", 8192))
-        instruction = _bounded_text(task.get("instruction", ""), max_claim, "instruction").strip()
+        turn_plan = data.get("turn_plan") if isinstance(data.get("turn_plan"), list) else []
+        if turn_plan:
+            if not all(isinstance(step, dict) and str(step.get("instruction", "")).strip()
+                       for step in turn_plan):
+                raise JobStoreError("INVALID_TURN_PLAN", "every turn_plan step needs instruction")
+            data["initial_seq"] = seq
+            instruction_value = turn_plan[0]["instruction"]
+        else:
+            instruction_value = task.get("instruction", "")
+        instruction = _bounded_text(instruction_value, max_claim, "instruction").strip()
         if not instruction:
             raise JobStoreError("INVALID_INSTRUCTION", "task.instruction is required")
         data["status"] = "READY"
@@ -260,6 +269,9 @@ class LocalJobStore:
         finally:
             conn.close()
         previous_summary = previous_summary.encode("utf-8")[:2048].decode("utf-8", "ignore")
+        plan = data.get("turn_plan") if isinstance(data.get("turn_plan"), list) else []
+        initial_seq = int(data.get("initial_seq", 1))
+        turn_number = max(1, int(turn["seq"]) - initial_seq + 1)
         return {
             "ok": True,
             "job_id": job["job_id"],
@@ -268,6 +280,9 @@ class LocalJobStore:
             "fencing_token": int(turn["fencing_token"]),
             "lease_expires_at": float(turn["lease_expires_at"]),
             "instruction": turn["instruction"],
+            "instruction_authority": "LOCAL_OPERATOR_JOB",
+            "turn_number": turn_number,
+            "turn_total": len(plan) if plan else None,
             "context": {
                 "workspace": constraints.get("allowed_base") or data.get("workspace") or "",
                 "previous_summary": previous_summary,
@@ -335,20 +350,41 @@ class LocalJobStore:
                 payload["next_instruction"], int(constraints.get("max_claim_bytes", 8192)),
                 "next_instruction",
             )
+            plan = data.get("turn_plan") if isinstance(data.get("turn_plan"), list) else []
+            if plan and status == "CANDIDATE_DONE":
+                initial_seq = int(data.get("initial_seq", 1))
+                current_plan_index = int(seq) - initial_seq
+                if current_plan_index < len(plan) - 1:
+                    raise JobStoreError(
+                        "TURN_PLAN_INCOMPLETE",
+                        "CANDIDATE_DONE is allowed only on the final planned turn",
+                    )
+            if status == "CONTINUE" and plan:
+                initial_seq = int(data.get("initial_seq", 1))
+                next_plan_index = int(seq) - initial_seq + 1
+                if next_plan_index >= len(plan):
+                    raise JobStoreError(
+                        "TURN_PLAN_EXHAUSTED", "last planned turn must use CANDIDATE_DONE",
+                    )
+                payload["next_instruction"] = _bounded_text(
+                    plan[next_plan_index]["instruction"],
+                    int(constraints.get("max_claim_bytes", 8192)), "planned next_instruction",
+                )
+            elif status == "CONTINUE" and not payload["next_instruction"].strip():
+                raise JobStoreError("NEXT_INSTRUCTION_REQUIRED", "CONTINUE requires next_instruction")
             digest = _hash(payload)
             if turn["commit_hash"]:
                 if secrets.compare_digest(str(turn["commit_hash"]), digest):
                     return {
                         "ok": True, "idempotent": True, "committed_seq": int(seq),
                         "next_seq": int(job["current_seq"]),
-                        "ack": f"ACK {job_id} seq={seq}",
+                        "ack": f"ACK {job_id} seq={seq} status={status} "
+                               f"next={int(job['current_seq'])}",
                     }
                 raise JobStoreError("COMMIT_CONFLICT", "turn already has a different commit")
             self._validate_lease(turn, lease_id, fencing_token, now)
             if int(job["current_seq"]) != int(seq):
                 raise JobStoreError("SEQ_MISMATCH", "job advanced before commit")
-            if status == "CONTINUE" and not payload["next_instruction"].strip():
-                raise JobStoreError("NEXT_INSTRUCTION_REQUIRED", "CONTINUE requires next_instruction")
             stored = dict(payload, committed_at=now, commit_hash=digest)
             conn.execute(
                 "UPDATE turns SET status='COMMITTED',commit_hash=?,commit_json=?,updated_at=? "
@@ -378,7 +414,8 @@ class LocalJobStore:
             }, now)
         return {
             "ok": True, "idempotent": False, "committed_seq": int(seq),
-            "next_seq": next_seq, "ack": f"ACK {job_id} seq={seq}",
+            "next_seq": next_seq,
+            "ack": f"ACK {job_id} seq={seq} status={status} next={next_seq}",
         }
 
     def abort_turn(self, job_id: str, seq: int, lease_id: str, fencing_token: int,
@@ -468,15 +505,47 @@ class LocalJobStore:
         now = time.time() if now is None else float(now)
         keys = list(keys or [])[:16]
         allowed = {"task", "constraints", "acceptance_checks", "data_location", "requires_local_tool"}
-        if any(k not in allowed for k in keys):
+        if any(k not in allowed and not str(k).startswith("file:") for k in keys):
             raise JobStoreError("INVALID_CONTEXT_KEY", "one or more context keys are not allowed")
+        if sum(str(k).startswith("file:") for k in keys) > 4:
+            raise JobStoreError("TOO_MANY_CONTEXT_FILES", "at most four local files may be read")
         conn = self._connect()
         try:
             job, turn = self._job_and_turn(conn, job_id, int(seq))
             self._validate_lease(turn, lease_id, fencing_token, now)
             data = json.loads(job["job_json"])
-            return {"ok": True, "job_id": job_id, "seq": int(seq),
-                    "context": {k: data.get(k) for k in keys}}
+            constraints = data.get("constraints") if isinstance(data.get("constraints"), dict) else {}
+            context = {}
+            for key in keys:
+                key = str(key)
+                if key in allowed:
+                    context[key] = data.get(key)
+                    continue
+                relative = key[5:].strip().replace("\\", "/")
+                if not relative or Path(relative).is_absolute():
+                    raise JobStoreError("INVALID_CONTEXT_FILE", "file context path must be relative")
+                base_value = constraints.get("allowed_base") or data.get("workspace")
+                if not base_value:
+                    raise JobStoreError("CONTEXT_BASE_REQUIRED", "allowed_base is required for file context")
+                base = Path(base_value).resolve()
+                target = (base / relative).resolve()
+                try:
+                    target.relative_to(base)
+                except ValueError as exc:
+                    raise JobStoreError("CONTEXT_PATH_ESCAPE", "file context escaped allowed_base") from exc
+                if not target.is_file():
+                    raise JobStoreError("CONTEXT_FILE_NOT_FOUND", f"context file not found: {relative}")
+                max_bytes = max(1024, min(
+                    int(constraints.get("max_context_file_bytes", 65536)), 262144,
+                ))
+                raw = target.read_bytes()
+                context[key] = {
+                    "path": relative,
+                    "content": raw[:max_bytes].decode("utf-8", "replace"),
+                    "truncated": len(raw) > max_bytes,
+                    "bytes": len(raw),
+                }
+            return {"ok": True, "job_id": job_id, "seq": int(seq), "context": context}
         finally:
             conn.close()
 
