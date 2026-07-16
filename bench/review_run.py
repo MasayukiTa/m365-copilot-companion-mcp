@@ -287,8 +287,129 @@ _P2C_PROHIBITED_ACTIONS = (
 )
 
 
-def _prepare_resilience_goals(goals, goal_meta, kind, stamp):
-    """Add immutable Task Envelope metadata without changing any goal text/cwd."""
+ACTIVE_VALIDATION_BEGIN = "<<<ACTIVE_VALIDATION>>>"
+ACTIVE_VALIDATION_END = "<<<END_ACTIVE_VALIDATION>>>"
+_FULL_ACTIVE_DIMENSIONS = frozenset({"runtime_behavior", "adversarial_input"})
+_FULL_ACTIVE_STATUSES = frozenset({"executed", "vulnerable", "not_applicable", "inconclusive"})
+
+
+def _full_validation_instruction(dimension):
+    """Structured active-validation contract for P2c level 2 behavioral lenses."""
+    return (
+        "\n\nP2C LEVEL 2 FULL VALIDATION (operator opt-in):\n"
+        "This is an authorized assessment of the scoped local workspace. For this "
+        f"{dimension} slice, active execution is the primary evidence source, not an "
+        "optional enhancement. Exercise the relevant code with realistic adversarial "
+        "inputs using the repository test harness, localhost services, temporary copies, "
+        "test accounts, and synthetic secrets/data. Keep every effect inside the scoped "
+        "workspace or an ephemeral local test boundary. Do not target third parties, use "
+        "live credentials, establish persistence, or exfiltrate real data.\n"
+        "Static inspection alone is INCONCLUSIVE. If execution is unavailable, refused, "
+        "or cannot be contained, report that honestly; never turn it into a clean result. "
+        "Before the FINDINGS block in the final answer emit exactly one JSON object in this "
+        "contract (method/evidence must name the command, harness, input, and observed result):\n"
+        f"{ACTIVE_VALIDATION_BEGIN}\n"
+        '{"status":"executed|vulnerable|not_applicable|inconclusive",'
+        '"method":"...","evidence":"..."}\n'
+        f"{ACTIVE_VALIDATION_END}\n"
+        "Use not_applicable only when the scoped files expose no executable path for this "
+        "dimension, and explain the call-path evidence.\n"
+    )
+
+
+def parse_active_validation(text):
+    """Return a normalized level-2 evidence object, or None for missing/malformed output."""
+    matches = re.findall(
+        re.escape(ACTIVE_VALIDATION_BEGIN) + r"\s*(\{.*?\})\s*" +
+        re.escape(ACTIVE_VALIDATION_END), text or "", flags=re.DOTALL)
+    for raw in reversed(matches):
+        try:
+            value = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(value, dict):
+            continue
+        status = str(value.get("status") or "").strip().lower()
+        method = str(value.get("method") or "").strip()
+        evidence = str(value.get("evidence") or "").strip()
+        if status not in _FULL_ACTIVE_STATUSES or not method or not evidence:
+            continue
+        return {"status": status, "method": method, "evidence": evidence}
+    return None
+
+
+def evaluate_full_validation(status_path, transcripts_dir, envelopes, findings,
+                             parse_errors=0, completeness_gaps=None):
+    """Build a fail-closed assurance verdict for P2c level 2.
+
+    A clean verdict requires every primary active-validation slice to finish and emit
+    structured dynamic evidence. Missing evidence, worker failure, unclear findings, parse
+    errors, or completeness gaps make the run INCONCLUSIVE rather than safe.
+    """
+    status_file = os.fspath(status_path)
+    status_dir = (os.path.dirname(status_file)
+                  if os.path.basename(status_file).lower() == "status.json" else status_file)
+    status = _load_status(status_dir)
+    workers = status.get("workers", []) if isinstance(status, dict) else []
+    by_task = {str(w.get("task_id") or ""): w for w in workers if isinstance(w, dict)}
+    required = []
+    incomplete = []
+    evidence = []
+    for task_id, envelope in envelopes.items():
+        dimension = str((envelope.metadata or {}).get("dimension") or "")
+        if dimension not in _FULL_ACTIVE_DIMENSIONS:
+            continue
+        required.append(task_id)
+        worker = by_task.get(task_id)
+        outcome = str((worker or {}).get("outcome") or (worker or {}).get("status") or "").upper()
+        parsed = parse_active_validation(worker_final_text(worker or {}, transcripts_dir))
+        entry = {"task_id": task_id, "dimension": dimension, "outcome": outcome or "MISSING"}
+        if parsed:
+            entry.update(parsed)
+        evidence.append(entry)
+        if outcome != "DONE" or not parsed or parsed.get("status") == "inconclusive":
+            incomplete.append(task_id)
+
+    confirmed = [f for f in findings or []
+                 if isinstance(f, dict) and f.get("verify_verdict") == "confirmed"]
+    unclear = [f for f in findings or []
+               if isinstance(f, dict) and f.get("verify_verdict") in (None, "unclear")]
+    gaps = completeness_gaps or {}
+    has_gaps = any(gaps.get(key) for key in _EMPTY_GAPS)
+    vulnerable_evidence = any(e.get("status") == "vulnerable" for e in evidence)
+
+    reasons = []
+    if not required:
+        reasons.append("no active-validation goals were planned")
+    if incomplete:
+        reasons.append("%d active-validation goal(s) incomplete" % len(incomplete))
+    if parse_errors:
+        reasons.append("%d worker output parse error(s)" % int(parse_errors))
+    if unclear:
+        reasons.append("%d finding(s) remain unclear/unadjudicated" % len(unclear))
+    if has_gaps:
+        reasons.append("completeness critic reported coverage gaps")
+
+    if confirmed or vulnerable_evidence:
+        verdict = "VULNERABLE"
+    elif reasons:
+        verdict = "INCONCLUSIVE"
+    else:
+        verdict = "VERIFIED_WITHIN_SCOPE"
+    return {
+        "p2c_level": 2,
+        "verdict": verdict,
+        "required_active_goals": len(required),
+        "completed_active_goals": len(required) - len(incomplete),
+        "incomplete_task_ids": incomplete,
+        "confirmed_findings": len(confirmed),
+        "reasons": reasons,
+        "evidence": evidence,
+    }
+
+
+def _prepare_resilience_goals(goals, goal_meta, kind, stamp, p2c_level=1):
+    """Add immutable Task Envelope metadata and the opt-in level-2 evidence contract."""
     campaign_id = "%s-%s" % (kind, stamp)
     prepared = []
     envelopes = {}
@@ -302,13 +423,17 @@ def _prepare_resilience_goals(goals, goal_meta, kind, stamp):
             "authorization_preamble": CLEAR_FRAMING_PREAMBLE,
             "prohibited_actions": list(_P2C_PROHIBITED_ACTIONS),
             "resilience_profile": kind,
+            "p2c_level": p2c_level,
         }
+        goal_text = goal.get("text", "")
+        if p2c_level == 2 and meta.get("dimension") in _FULL_ACTIVE_DIMENSIONS:
+            goal_text += _full_validation_instruction(meta.get("dimension"))
         envelope = TaskEnvelope(
             task_id=task_id,
             parent_task_id=None,
             campaign_id=campaign_id,
             role="producer",
-            goal_text=goal.get("text", ""),
+            goal_text=goal_text,
             cwd=goal.get("cwd", ""),
             depth=0,
             metadata=metadata,
@@ -654,7 +779,7 @@ def refute_findings(findings, kind, out_dir, now, panel=False, max_concurrent=No
 
 def behavioral_verify(findings, out_dir, now, max_concurrent=None, effort="auto",
                        repo_root=None, stamp=None, severity_filter=None, max_findings=None,
-                       resilience_profile=None):
+                       resilience_profile=None, p2c_level=1):
     """P2 piece A: run each CONFIRMED finding (verify_verdict == "confirmed", set by
     refute_findings + merge_verdicts) through a BEHAVIORAL-VERIFY fleet pass -- a fresh worker
     tries to actually REPRODUCE the finding with a minimal, READ-ONLY run_python/shell_exec
@@ -711,7 +836,10 @@ def behavioral_verify(findings, out_dir, now, max_concurrent=None, effort="auto"
     goal_index_map = []  # parallel to goal_dicts: index into `findings`
     for fi, finding in selected:
         text = build_behavioral_verify_goal(finding)
-        goal_dicts.append({"text": text, "cwd": repo_root})
+        goal_dict = {"text": text, "cwd": repo_root}
+        if p2c_level == 2:
+            goal_dict["metadata"] = {"p2c_level": 2, "full_validation": True}
+        goal_dicts.append(goal_dict)
         goal_index_map.append(fi)
 
     goals_path = os.path.join(out_dir, "behavioral_goals_%s.jsonl" % stamp)
@@ -1132,6 +1260,8 @@ def build_arg_parser():
     ap.add_argument("--kind", choices=["review", "security"], required=True)
     ap.add_argument("--resilience-profile", choices=["off", "review", "security"],
                     default="off", help=argparse.SUPPRESS)
+    ap.add_argument("--p2c-level", type=int, choices=[1, 2], default=1,
+                    help=argparse.SUPPRESS)
     ap.add_argument("--no-auto-behavioral-high", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--mode", choices=["all", "diff"], default="all")
     ap.add_argument("--base-ref", default=None)
@@ -1234,6 +1364,10 @@ def main(argv=None):
         print("ERROR: P2c resilience currently runs as a bounded single campaign; --loop is not "
               "combined with --resilience-profile (use /deep-review or /deep-security-review without --loop).")
         return 2
+    if resilience_profile == "off" and args.p2c_level != 1:
+        print("ERROR: --p2c-level requires --resilience-profile")
+        return 2
+    full_validation = resilience_profile != "off" and args.p2c_level == 2
     if args.fail_on and not args.baseline:
         print("ERROR: --fail-on requires --baseline (path or 'auto') -- there is nothing to "
               "gate against without one.")
@@ -1259,7 +1393,7 @@ def main(argv=None):
     envelopes = {}
     if resilience_profile != "off":
         goals, envelopes = _prepare_resilience_goals(
-            goals, goal_meta, resilience_profile, stamp)
+            goals, goal_meta, resilience_profile, stamp, p2c_level=args.p2c_level)
 
     goals_path = os.path.join(out_dir, "goals_%s.jsonl" % stamp)
     write_goals_jsonl(goals, goals_path)
@@ -1305,18 +1439,23 @@ def main(argv=None):
     if args.verify:
         print("--verify is deprecated; routing to the refuter-based pass (which already runs "
               "by default) in panel mode")
-    run_refute = not args.no_refute
-    panel = args.refute_panel or args.verify
+    run_refute = True if full_validation else not args.no_refute
+    if full_validation and args.no_refute:
+        print("NOTE: --no-refute is ignored by P2c level 2; adversarial verification is mandatory.")
+    panel = args.refute_panel or args.verify or full_validation
     behavioral_severity_set = None
     if args.behavioral_severity:
         behavioral_severity_set = {s.strip().lower() for s in args.behavioral_severity.split(",")
                                     if s.strip()}
 
-    run_behavioral = args.behavioral or (
+    run_behavioral = args.behavioral or full_validation or (
         resilience_profile == "security" and not args.no_auto_behavioral_high)
-    if resilience_profile == "security" and not args.behavioral \
+    if not full_validation and resilience_profile == "security" and not args.behavioral \
             and not args.no_auto_behavioral_high:
         behavioral_severity_set = {"high"}
+    if full_validation:
+        behavioral_severity_set = None
+    run_completeness = args.completeness or full_validation
 
     loop_meta = None
     if args.loop:
@@ -1412,14 +1551,15 @@ def main(argv=None):
                                    max_concurrent=max_concurrent, effort=args.effort,
                                    repo_root=repo_root, stamp=stamp, severity_filter=severity_filter,
                                    resilience_profile=(resilience_profile
-                                                       if resilience_profile != "off" else None))
+                                                       if resilience_profile != "off" else None),
+                                   p2c_level=args.p2c_level)
 
         if resilience_profile != "off":
             derive_and_attach_finding_states(agg.get("findings", []))
 
         # P3 piece B: OPT-IN completeness critic, independent of --loop -- works standalone
         # too (a single extra goal after the single pass above).
-        if args.completeness:
+        if run_completeness:
             gaps = run_completeness_critic(dims_used, files, agg.get("findings", []), out_dir,
                                             repo_root, effort=args.effort, stamp=stamp)
             agg["completeness_gaps"] = gaps
@@ -1430,6 +1570,17 @@ def main(argv=None):
                        len(gaps.get("unverified_claims") or [])))
             else:
                 print("completeness critic: no gaps identified")
+
+    if full_validation:
+        assurance = evaluate_full_validation(
+            status_path, transcripts_dir, envelopes, agg.get("findings", []),
+            parse_errors=agg.get("parse_errors", 0),
+            completeness_gaps=agg.get("completeness_gaps"),
+        )
+        agg["validation_assurance"] = assurance
+        print("full-validation: verdict=%s active=%d/%d confirmed=%d" % (
+            assurance["verdict"], assurance["completed_active_goals"],
+            assurance["required_active_goals"], assurance["confirmed_findings"]))
 
     # --baseline / --write-baseline: purely additive. In P2c single-pass runs this deliberately
     # executes after refusal recovery, refutation, adjudication, behavioral verification, and
@@ -1528,6 +1679,14 @@ def main(argv=None):
                         f.get("file", "?"), line if line is not None else "?",
                         f.get("title", ""), f.get("severity", "?")))
                 return 3
+    if full_validation:
+        verdict = (agg.get("validation_assurance") or {}).get("verdict")
+        if verdict == "INCONCLUSIVE":
+            print("FULL-VALIDATION GATE: INCONCLUSIVE -- required active evidence is incomplete.")
+            return 4
+        if verdict == "VULNERABLE":
+            print("FULL-VALIDATION GATE: VULNERABLE -- confirmed findings require remediation.")
+            return 5
     return 0
 
 

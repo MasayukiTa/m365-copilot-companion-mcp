@@ -68,7 +68,7 @@ def parse_review_command(cmd):
         return {"kind": "review", "mode": "all", "target_path": None}
 
 
-def build_review_argv(parsed, repo_root, venvpy):
+def build_review_argv(parsed, repo_root, venvpy, p2c_level=1):
     """Build the argv list to launch bench/review_run.py for a parsed /review command.
 
     Pure list assembly: repo_root/venvpy are supplied by the caller (which knows the real
@@ -87,6 +87,13 @@ def build_review_argv(parsed, repo_root, venvpy):
         argv += ["--target-path", target]
     if parsed.get("resilience"):
         argv += ["--resilience-profile", parsed.get("kind", "review")]
+        try:
+            level = int(p2c_level)
+        except (TypeError, ValueError):
+            level = 0
+        if level not in (1, 2):
+            level = 1
+        argv += ["--p2c-level", str(level)]
     return argv
 
 

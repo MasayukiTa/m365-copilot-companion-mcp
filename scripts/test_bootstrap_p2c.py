@@ -32,3 +32,16 @@ def test_existing_explicit_on_is_never_overwritten(tmp_path, monkeypatch):
     monkeypatch.setattr(bootstrap, "log", lambda _text: None)
     bootstrap.step_gen_env()
     assert env.read_text(encoding="utf-8") == original
+
+
+def test_existing_explicit_full_validation_is_never_overwritten(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    original = "MCP_REVIEW_P2C=2\nMCP_EXECUTION_PROFILES=1\n"
+    env.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(bootstrap, "ROOT", tmp_path)
+    monkeypatch.setattr(bootstrap, "step_header", lambda _text: None)
+    monkeypatch.setattr(bootstrap, "log", lambda _text: None)
+    bootstrap.step_gen_env()
+    text = env.read_text(encoding="utf-8")
+    assert text.startswith(original)
+    assert text.count("MCP_REVIEW_P2C=2") == 1

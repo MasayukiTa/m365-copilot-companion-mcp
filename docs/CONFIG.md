@@ -23,7 +23,7 @@
 | `MCP_TOOL_MAP_INCLUDE` | map mode で追加で第一級ツールとして載せたいツール名（カンマ区切り） | 空 |
 | `MCP_IMPL_AGENT_URL` | bridge / fleet が駆動する主 Copilot エージェントの URL（テナント固有 `T_…`） | 手動で貼る（**必須**） |
 | `MCP_FLEET_AGENT_URL` | fleet 専用エージェント URL | 未指定なら `MCP_IMPL_AGENT_URL` |
-| `MCP_REVIEW_P2C` | 深掘りレビュー `/deep-review` `/deep-security-review` の表示・実行 | `0`（無効）/ `1`（有効） |
+| `MCP_REVIEW_P2C` | 深掘りレビュー `/deep-review` `/deep-security-review` の表示・実行と保証レベル | `0`（無効）/ `1`（深掘り）/ `2`（フル検証） |
 | `MCP_EXECUTION_PROFILES` | 回答本文非依存の実験的 `LOCAL_LOOP` MCPツールを登録 | `0`（無効）/ `1`（有効） |
 | `MCP_LOCAL_JOB_DB` | `LOCAL_LOOP` のSQLite状態ストア | 未指定なら `.jobs/jobs.sqlite3` |
 | `MCP_DEEP_REVIEW_TRANSPORT` | Deep Reviewの輸送方式。`auto`は実行プロファイル有効時にLOCAL_LOOP | `auto` / `local_loop` / `fleet` |
@@ -93,8 +93,18 @@ call_tool(name="X", arguments={...}) → X を実行
 
 ## 深掘りレビュー
 
-`MCP_REVIEW_P2C=0` が既定で自動生成されます。`1` に変更して `start_all.bat` を
+`MCP_REVIEW_P2C=0` が既定で自動生成されます。`1` または `2` に変更して `start_all.bat` を
 実行すると、`/deep-review` と `/deep-security-review` がコマンド一覧に表示されます。
+
+- `0`: 無効。通常レビューのみ。
+- `1`: 拒否・タイムアウトに耐える深掘りレビュー。意図を偽装せず、安全に分割・再試行します。
+- `2`: 同じコマンド名でフル検証を実行します。許可されたローカル範囲で動的検証を優先し、
+  全severityの確認済み指摘を再現、3視点反証、完全性検査を実施します。必要な動的証跡が
+  欠ける場合は `INCONCLUSIVE`、脆弱性を確認した場合は `VULNERABLE` として非ゼロ終了し、
+  「問題なし」にはしません。
+
+レベル2の `VERIFIED_WITHIN_SCOPE` は、記録された対象・時点・証跡の範囲に限る判定です。
+将来の変更や未知の攻撃を含む無条件の安全保証ではありません。
 この2コマンドだけが Fresh Session Replay と上限付きタスク分割を使い、従来の
 `/review` と `/security-review` の挙動は変わりません。
 

@@ -14,6 +14,8 @@ def test_p2c_commands_are_flag_gated_in_native_slash_palette():
     assert 'new[]{"/deep-review"' in SOURCE
     assert 'new[]{"/deep-security-review"' in SOURCE
     assert 'new[]{"/review-2"' not in SOURCE
+    assert "int P2cReviewLevel()" in SOURCE
+    assert "level < 0 || level > 2" in SOURCE
 
 
 def test_p2c_commands_are_flag_gated_in_native_help():

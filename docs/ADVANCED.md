@@ -154,7 +154,7 @@ checkで検証します。SQLiteはPython標準機能であり、管理者権限
   --rotate-after-turns 5
 ```
 
-`MCP_REVIEW_P2C=1`と`MCP_EXECUTION_PROFILES=1`を併用すると、`/deep-review`と
+`MCP_REVIEW_P2C=1`（またはフル検証の`2`）と`MCP_EXECUTION_PROFILES=1`を併用すると、`/deep-review`と
 `/deep-security-review`は既定でLOCAL_LOOP輸送になります。producer・adversarial・
 adjudicationの3ターンをSQLiteへコミットし、最終コミットだけを既存のレビュー集計へ
 渡します。通常の`/review`と`/security-review`は従来動作のままです。比較や切り戻しで
