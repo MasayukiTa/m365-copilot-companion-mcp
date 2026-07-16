@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from .file_ops import ALLOWED_BASE
-from .notify_ops import notify_desktop
+from .notify_ops import notify_approval_gate
 from .security import require_unlocked
 
 GATE_DIR = ALLOWED_BASE / ".companion_gates"
@@ -59,11 +59,12 @@ def gate_ask(question: str, context: Optional[str] = None, notify: bool = True) 
             "answered": False,
             "answer": None,
         }
-        (GATE_DIR / f"{token}.json").write_text(
+        gate_path = GATE_DIR / f"{token}.json"
+        gate_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         if notify:
-            notify_desktop("HITL gate — input needed", question[:180])
+            notify_approval_gate("HITL gate - input needed", question[:180], gate_path)
         return (
             f"token: {token}\n"
             f"question posted. The human answers with gate_answer(token, ...), "

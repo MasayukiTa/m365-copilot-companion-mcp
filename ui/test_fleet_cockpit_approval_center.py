@@ -29,3 +29,19 @@ def test_approval_center_has_accessibility_and_audit_history():
     assert 'AutomationProperties.SetName(approve' in SOURCE
     assert 'gd["answered_at"] = NowUnix();' in SOURCE
     assert '"最近の判断"' in SOURCE
+
+
+def test_actionable_notification_prompt_can_answer_without_opening_chat():
+    assert 'args[0].Equals("--approval-gate"' in SOURCE
+    assert "class ApprovalPromptWindow : Window" in SOURCE
+    assert '_approve.Click += delegate { Answer("approved"); }' in SOURCE
+    assert '_deny.Click += delegate { Answer("denied"); }' in SOURCE
+    assert "M365CompanionApprovalPrompt" in SOURCE
+
+
+def test_confirmation_auto_and_bypass_are_visible_and_persistent():
+    assert 'AddPolicyItem("確認（推奨）", "default")' in SOURCE
+    assert 'AddPolicyItem("自動", "auto")' in SOURCE
+    assert 'AddPolicyItem("バイパス", "bypass")' in SOURCE
+    assert "job_approval_mode=" in SOURCE
+    assert "ApprovalPromptWindow.SavePolicy(next)" in SOURCE

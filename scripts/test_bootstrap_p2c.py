@@ -10,6 +10,7 @@ def test_existing_env_gets_default_off_once(tmp_path, monkeypatch):
     bootstrap.step_gen_env()
     bootstrap.step_gen_env()
     text = env.read_text(encoding="utf-8")
+    assert text.count("TASK_JOB_APPROVAL_MODE=default") == 1
     assert text.count("MCP_REVIEW_P2C=0") == 1
     assert text.count("MCP_EXECUTION_PROFILES=0") == 1
     assert text.count("MCP_DEEP_REVIEW_TRANSPORT=auto") == 1
@@ -31,7 +32,10 @@ def test_existing_explicit_on_is_never_overwritten(tmp_path, monkeypatch):
     monkeypatch.setattr(bootstrap, "step_header", lambda _text: None)
     monkeypatch.setattr(bootstrap, "log", lambda _text: None)
     bootstrap.step_gen_env()
-    assert env.read_text(encoding="utf-8") == original
+    text = env.read_text(encoding="utf-8")
+    assert text.startswith(original)
+    assert text.count("TASK_JOB_APPROVAL_MODE=default") == 1
+    assert text.count("MCP_REVIEW_P2C=1") == 1
 
 
 def test_existing_explicit_full_validation_is_never_overwritten(tmp_path, monkeypatch):
