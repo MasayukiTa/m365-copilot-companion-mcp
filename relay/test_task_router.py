@@ -20,8 +20,8 @@ def check(name, cond):
 NOTIFY_CALLS = []
 
 
-def _stub_notify_desktop(*args, **kwargs):
-    """Stand-in for tr.notify_desktop -- captures calls instead of firing a real Windows
+def _stub_notify_approval_gate(*args, **kwargs):
+    """Stand-in for tr.notify_approval_gate -- captures calls instead of firing a real Windows
     desktop toast. The CONFIRM path of job_gate/dispatch (see test_dispatch_awaiting_gate_flow)
     calls tr.notify_desktop() directly, and without this stub every test run popped a real
     OS notification with the test fixture payload. Mirrors the discipline test_admission.py
@@ -42,7 +42,7 @@ def _use_tmp_tasks():
     tr.ensure_dirs()
     # Stub the real desktop-toast side effect for every test path -- never let the actual
     # OS notification fire during a test run.
-    tr.notify_desktop = _stub_notify_desktop
+    tr.notify_approval_gate = _stub_notify_approval_gate
     return d
 
 

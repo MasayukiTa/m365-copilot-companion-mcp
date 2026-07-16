@@ -362,6 +362,11 @@ class SkillStore:
             "changed_files": changed_files,
             "instruction_preview": skill.body[:8000],
             "instruction_preview_truncated": len(skill.body) > 8000,
+            "bundle_limits": {
+                "max_files": MAX_FILES,
+                "max_file_bytes": MAX_FILE_BYTES,
+                "max_total_bytes": MAX_TOTAL_BYTES,
+            },
             "warning": (
                 "This approval only trusts this exact bundle digest. "
                 "Shell, file changes, and outbound actions remain subject to existing gates."
@@ -413,7 +418,10 @@ class SkillStore:
                 f"skill approval: {skill.path}\n"
                 f"digest: {skill.digest}\n"
                 f"changed_files: {json.dumps(changed_files, ensure_ascii=False)}\n"
-                f"scripts: {json.dumps(scripts, ensure_ascii=False)}"
+                f"scripts: {json.dumps(scripts, ensure_ascii=False)}\n"
+                f"bundle: {len(skill.files)} files / {skill.total_bytes} bytes\n"
+                f"safety_limits: {MAX_FILES} files / {MAX_FILE_BYTES} bytes per file / "
+                f"{MAX_TOTAL_BYTES} bytes total"
             ),
             "asked_at": now,
             "expires_at": now + APPROVAL_TTL_SECONDS,
@@ -425,8 +433,8 @@ class SkillStore:
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, path)
         try:
-            from tools.notify_ops import notify_desktop
-            notify_desktop("Skill approval needed / Skill承認", question[:180])
+            from tools.notify_ops import notify_approval_gate
+            notify_approval_gate("Skill approval needed / Skill承認", question[:180], path)
         except Exception:
             pass
 

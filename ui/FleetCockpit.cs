@@ -47,8 +47,329 @@ class CockpitProgram
     static void Main(string[] args)
     {
         try { AppContext.SetSwitch("Switch.System.Windows.DoNotScaleForDpiChanges", false); } catch { }
+        if (args.Length >= 2 && args[0].Equals("--approval-gate", StringComparison.OrdinalIgnoreCase))
+        {
+            bool createdNew = false;
+            bool ownsMutex = false;
+            using (var mutex = new Mutex(true, "Local\\M365CompanionApprovalPrompt", out createdNew))
+            {
+                try
+                {
+                    ownsMutex = createdNew;
+                    if (!ownsMutex)
+                    {
+                        try { ownsMutex = mutex.WaitOne(0, false); }
+                        catch (AbandonedMutexException) { ownsMutex = true; }
+                    }
+                    // The existing prompt polls the gate directory and will surface this request.
+                    if (!ownsMutex) return;
+                    new Application().Run(new ApprovalPromptWindow(args[1]));
+                }
+                finally { if (ownsMutex) try { mutex.ReleaseMutex(); } catch { } }
+            }
+            return;
+        }
         string path = args.Length > 0 ? args[0] : null;
         new Application().Run(new CockpitWindow(path));
+    }
+}
+
+// Small native action surface launched alongside an approval toast. It is intentionally part of
+// FleetCockpit.exe: no installer, protocol registration, browser, admin rights, or extra runtime is
+// required. One process drains all pending gates so a burst of workers never creates a window storm.
+class ApprovalPromptWindow : Window
+{
+    readonly JavaScriptSerializer _js = new JavaScriptSerializer();
+    string _gateDir;
+    string _currentPath;
+    Dictionary<string, object> _current;
+    TextBlock _kind, _question, _context, _count, _policyHelp;
+    Button _approve, _deny;
+    ComboBox _policy;
+    DispatcherTimer _timer;
+    bool _changingPolicy;
+
+    static readonly Brush Bg = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#111827"));
+    static readonly Brush Surface = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1f2937"));
+    static readonly Brush Line = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#374151"));
+    static readonly Brush Fg = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#f9fafb"));
+    static readonly Brush Muted = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#a7b0bf"));
+    static readonly Brush Accent = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#2563eb"));
+    static readonly Brush Danger = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#f87171"));
+
+    static double NowUnix()
+    { return (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds; }
+
+    static string SettingsFile
+    {
+        get
+        {
+            string app = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            return Path.Combine(app, "copilot-bridge", "settings.txt");
+        }
+    }
+
+    public ApprovalPromptWindow(string initialGatePath)
+    {
+        Title = "承認が必要です / Approval required";
+        Width = 600; Height = 620; MinWidth = 500; MinHeight = 480;
+        WindowStartupLocation = WindowStartupLocation.CenterScreen;
+        Background = Bg; ShowInTaskbar = true;
+        try
+        {
+            string full = Path.GetFullPath(initialGatePath);
+            _gateDir = Path.GetDirectoryName(full);
+            if (!Path.GetFileName(full).StartsWith("gate_", StringComparison.OrdinalIgnoreCase) ||
+                !Path.GetExtension(full).Equals(".json", StringComparison.OrdinalIgnoreCase) ||
+                !Path.GetFileName(_gateDir).Equals(".companion_gates", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("invalid approval-gate path");
+            _currentPath = full;
+        }
+        catch { _gateDir = null; _currentPath = null; }
+
+        Build();
+        Loaded += delegate
+        {
+            if (_gateDir == null) { Close(); return; }
+            LoadNext();
+            _timer = new DispatcherTimer(); _timer.Interval = TimeSpan.FromSeconds(2);
+            _timer.Tick += delegate { RefreshPendingCount(); if (_current == null) LoadNext(); };
+            _timer.Start();
+            Activate();
+        };
+        Closed += delegate { if (_timer != null) _timer.Stop(); };
+        KeyDown += delegate (object sender, KeyEventArgs e)
+        { if (e.Key == Key.Escape) { Close(); e.Handled = true; } };
+    }
+
+    void Build()
+    {
+        var root = new DockPanel();
+        var head = new Border { Background = Surface, BorderBrush = Line,
+            BorderThickness = new Thickness(0, 0, 0, 1), Padding = new Thickness(22, 18, 22, 16) };
+        DockPanel.SetDock(head, Dock.Top);
+        var headRow = new DockPanel();
+        _count = new TextBlock { Foreground = Muted, FontSize = 12, VerticalAlignment = VerticalAlignment.Center };
+        DockPanel.SetDock(_count, Dock.Right); headRow.Children.Add(_count);
+        var titles = new StackPanel();
+        titles.Children.Add(new TextBlock { Text = "承認が必要です", Foreground = Fg,
+            FontSize = 20, FontWeight = FontWeights.SemiBold });
+        titles.Children.Add(new TextBlock { Text = "内容を確認して、この場で承認または拒否できます。",
+            Foreground = Muted, FontSize = 12, Margin = new Thickness(0, 4, 0, 0) });
+        headRow.Children.Add(titles); head.Child = headRow; root.Children.Add(head);
+
+        var footer = new Border { Background = Surface, BorderBrush = Line,
+            BorderThickness = new Thickness(0, 1, 0, 0), Padding = new Thickness(22, 14, 22, 16) };
+        DockPanel.SetDock(footer, Dock.Bottom);
+        var actions = new DockPanel();
+        var later = new Button { Content = "あとで", Padding = new Thickness(16, 7, 16, 7),
+            Background = Brushes.Transparent, Foreground = Muted, BorderBrush = Line, Cursor = Cursors.Hand };
+        later.Click += delegate { Close(); }; DockPanel.SetDock(later, Dock.Right); actions.Children.Add(later);
+        _deny = new Button { Content = "拒否", Padding = new Thickness(18, 7, 18, 7),
+            Margin = new Thickness(0, 0, 8, 0), Background = Brushes.Transparent,
+            Foreground = Danger, BorderBrush = Danger, Cursor = Cursors.Hand };
+        _deny.Click += delegate { Answer("denied"); }; DockPanel.SetDock(_deny, Dock.Right); actions.Children.Add(_deny);
+        _approve = new Button { Content = "承認", Padding = new Thickness(22, 8, 22, 8),
+            Margin = new Thickness(0, 0, 8, 0), Background = Accent, Foreground = Brushes.White,
+            BorderThickness = new Thickness(0), FontWeight = FontWeights.SemiBold, Cursor = Cursors.Hand };
+        _approve.Click += delegate { Answer("approved"); }; DockPanel.SetDock(_approve, Dock.Right); actions.Children.Add(_approve);
+        footer.Child = actions; root.Children.Add(footer);
+
+        var scroll = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
+        var body = new StackPanel { Margin = new Thickness(22, 18, 22, 22) };
+        _kind = new TextBlock { Foreground = Muted, FontSize = 11, FontWeight = FontWeights.SemiBold };
+        body.Children.Add(_kind);
+        _question = new TextBlock { Foreground = Fg, FontSize = 15, FontWeight = FontWeights.SemiBold,
+            TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 0) };
+        body.Children.Add(_question);
+        var detailBox = new Border { Background = Surface, BorderBrush = Line, BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(7), Padding = new Thickness(12), Margin = new Thickness(0, 14, 0, 0) };
+        _context = new TextBlock { Foreground = Muted, FontFamily = new FontFamily("Cascadia Mono, Consolas"),
+            FontSize = 11, TextWrapping = TextWrapping.Wrap };
+        detailBox.Child = _context; body.Children.Add(detailBox);
+
+        var policyBox = new Border { BorderBrush = Line, BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(7), Padding = new Thickness(12), Margin = new Thickness(0, 18, 0, 0) };
+        var policyCol = new StackPanel();
+        policyCol.Children.Add(new TextBlock { Text = "今後の操作承認", Foreground = Fg,
+            FontSize = 12, FontWeight = FontWeights.SemiBold });
+        _policy = new ComboBox { Margin = new Thickness(0, 8, 0, 0), MinWidth = 220,
+            HorizontalAlignment = HorizontalAlignment.Left, Background = Surface, Foreground = Fg };
+        AddPolicyItem("確認（推奨）", "default"); AddPolicyItem("自動", "auto"); AddPolicyItem("バイパス", "bypass");
+        _policy.SelectionChanged += PolicyChanged; policyCol.Children.Add(_policy);
+        _policyHelp = new TextBlock { Foreground = Muted, FontSize = 11, TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 7, 0, 0) }; policyCol.Children.Add(_policyHelp);
+        policyBox.Child = policyCol; body.Children.Add(policyBox);
+        scroll.Content = body; root.Children.Add(scroll); Content = root;
+        SelectPolicy(ReadPolicy());
+    }
+
+    void AddPolicyItem(string label, string value)
+    { _policy.Items.Add(new ComboBoxItem { Content = label, Tag = value, Foreground = Brushes.Black }); }
+
+    string SelectedPolicy()
+    { var item = _policy.SelectedItem as ComboBoxItem; return item == null ? "default" : (string)item.Tag; }
+
+    void SelectPolicy(string mode)
+    {
+        _changingPolicy = true;
+        foreach (object obj in _policy.Items)
+        {
+            var item = obj as ComboBoxItem;
+            if (item != null && (string)item.Tag == mode) { _policy.SelectedItem = item; break; }
+        }
+        _changingPolicy = false; UpdatePolicyHelp();
+    }
+
+    void PolicyChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_changingPolicy) return;
+        string oldMode = ReadPolicy(), mode = SelectedPolicy();
+        if (mode == "bypass")
+        {
+            string warning = "バイパスではローカルジョブと自律契約の手動確認を省略します。\n" +
+                "STOP条件、ファイル範囲、外部Skillの初回・変更承認は残ります。\n\n本当に有効にしますか？";
+            if (MessageBox.Show(this, warning, "バイパスを有効化", MessageBoxButton.YesNo,
+                MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes)
+            { SelectPolicy(oldMode); return; }
+        }
+        SavePolicy(mode); UpdatePolicyHelp();
+    }
+
+    void UpdatePolicyHelp()
+    {
+        if (_policyHelp == null) return;
+        string mode = SelectedPolicy();
+        if (mode == "auto") _policyHelp.Text = "安全判定が通った操作は自動実行。要確認はここで承認、禁止判定は拒否します。";
+        else if (mode == "bypass") _policyHelp.Text = "手動確認を省略します。STOP条件・パス制限・外部Skillのハッシュ承認は解除しません。";
+        else _policyHelp.Text = "初回の操作クラスを確認し、承認済みでも危険な内容は毎回確認します。";
+    }
+
+    public static string ReadPolicy()
+    {
+        string fallback = (Environment.GetEnvironmentVariable("TASK_JOB_APPROVAL_MODE") ?? "default").Trim().ToLowerInvariant();
+        if (fallback != "auto" && fallback != "bypass") fallback = "default";
+        try
+        {
+            if (!File.Exists(SettingsFile)) return fallback;
+            foreach (string line in File.ReadAllLines(SettingsFile, new UTF8Encoding(false)))
+                if (line.StartsWith("job_approval_mode="))
+                {
+                    string mode = line.Substring(18).Trim().ToLowerInvariant();
+                    if (mode == "default" || mode == "auto" || mode == "bypass") return mode;
+                }
+        }
+        catch { }
+        return fallback;
+    }
+
+    public static void SavePolicy(string mode)
+    {
+        try
+        {
+            var lines = new List<string>(); bool found = false;
+            if (File.Exists(SettingsFile)) foreach (string line in File.ReadAllLines(SettingsFile))
+            {
+                if (line.StartsWith("job_approval_mode=")) { lines.Add("job_approval_mode=" + mode); found = true; }
+                else lines.Add(line);
+            }
+            if (!found) lines.Add("job_approval_mode=" + mode);
+            Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile));
+            File.WriteAllText(SettingsFile, string.Join("\n", lines.ToArray()) + "\n", new UTF8Encoding(false));
+        }
+        catch { }
+    }
+
+    Dictionary<string, object> ReadGate(string path)
+    {
+        try
+        {
+            string full = Path.GetFullPath(path);
+            string root = Path.GetFullPath(_gateDir).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase) || !File.Exists(full)) return null;
+            string text;
+            using (var fs = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var sr = new StreamReader(fs, Encoding.UTF8)) text = sr.ReadToEnd();
+            var gate = _js.DeserializeObject(text) as Dictionary<string, object>;
+            if (gate != null) gate["path"] = full;
+            return gate;
+        }
+        catch { return null; }
+    }
+
+    static string S(Dictionary<string, object> d, string key)
+    { object v; return d != null && d.TryGetValue(key, out v) && v != null ? v.ToString() : ""; }
+
+    static double D(Dictionary<string, object> d, string key)
+    { double v; return double.TryParse(S(d, key), NumberStyles.Float, CultureInfo.InvariantCulture, out v) ? v : 0; }
+
+    static bool Answered(Dictionary<string, object> d)
+    { object v; try { return d != null && d.TryGetValue("answered", out v) && Convert.ToBoolean(v); } catch { return false; } }
+
+    void LoadNext()
+    {
+        Dictionary<string, object> gate = _currentPath == null ? null : ReadGate(_currentPath);
+        if (gate == null || Answered(gate))
+        {
+            gate = null; _currentPath = null;
+            try
+            {
+                var candidates = new List<Dictionary<string, object>>();
+                foreach (string path in Directory.GetFiles(_gateDir, "gate_*.json"))
+                { var item = ReadGate(path); if (item != null && !Answered(item)) candidates.Add(item); }
+                candidates.Sort(delegate (Dictionary<string, object> a, Dictionary<string, object> b)
+                { return D(b, "asked_at").CompareTo(D(a, "asked_at")); });
+                if (candidates.Count > 0) gate = candidates[0];
+            }
+            catch { }
+        }
+        _current = gate;
+        if (gate == null) { Close(); return; }
+        _currentPath = S(gate, "path");
+        string hay = (S(gate, "token") + " " + S(gate, "context") + " " + S(gate, "question")).ToLowerInvariant();
+        bool skill = hay.Contains("gate_skill_") || hay.Contains("skill approval");
+        bool high = hay.Contains("contract gate: delete") || hay.Contains("outbound") ||
+                    hay.Contains("shell_destructive") || hay.Contains("destructive shell");
+        bool expired = D(gate, "expires_at") > 0 && D(gate, "expires_at") < NowUnix();
+        _kind.Text = (skill ? "EXTERNAL SKILL" : high ? "HIGH IMPACT" : "OPERATION") + (expired ? "  ·  期限切れ" : "");
+        _kind.Foreground = expired || high ? Danger : Muted;
+        _question.Text = S(gate, "question"); _context.Text = S(gate, "context");
+        _approve.IsEnabled = !expired; _deny.IsEnabled = true;
+        if (skill) _policyHelp.Text = "外部Skillはこの設定に関係なく、初回と内容変更時に必ずハッシュ承認します。";
+        else UpdatePolicyHelp();
+        RefreshPendingCount();
+    }
+
+    void RefreshPendingCount()
+    {
+        if (_count == null || _gateDir == null) return;
+        int count = 0;
+        try { foreach (string path in Directory.GetFiles(_gateDir, "gate_*.json"))
+        { var gate = ReadGate(path); if (gate != null && !Answered(gate)) count++; } } catch { }
+        _count.Text = count + " 件待機";
+    }
+
+    void Answer(string verdict)
+    {
+        if (_current == null || string.IsNullOrEmpty(_currentPath)) return;
+        string hay = (S(_current, "context") + " " + S(_current, "question")).ToLowerInvariant();
+        bool high = hay.Contains("contract gate: delete") || hay.Contains("outbound") ||
+                    hay.Contains("shell_destructive") || hay.Contains("destructive shell");
+        if (verdict == "approved" && high && MessageBox.Show(this,
+            "影響の大きい操作です。対象を確認したうえで本当に承認しますか？\n\n" + S(_current, "question"),
+            "最終確認", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes) return;
+        try
+        {
+            var gate = ReadGate(_currentPath); if (gate == null) return;
+            gate.Remove("path"); gate["answered"] = true; gate["answer"] = verdict; gate["answered_at"] = NowUnix();
+            string tmp = _currentPath + ".tmp";
+            File.WriteAllText(tmp, _js.Serialize(gate), new UTF8Encoding(false));
+            try { File.Replace(tmp, _currentPath, null); }
+            catch { File.Copy(tmp, _currentPath, true); try { File.Delete(tmp); } catch { } }
+        }
+        catch { return; }
+        _current = null; _currentPath = null; LoadNext();
     }
 }
 
@@ -5465,6 +5786,7 @@ class CockpitWindow : Window
         var scroll = new ScrollViewer(); scroll.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
         scroll.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
         var body = new StackPanel(); body.Margin = new Thickness(24, 20, 24, 28);
+        body.Children.Add(BuildJobApprovalPolicyPanel());
         var pendingTitle = new TextBlock();
         pendingTitle.Text = _lang == 0 ? "判断が必要" : "Needs your decision";
         pendingTitle.Foreground = Fg; pendingTitle.FontSize = 14; pendingTitle.FontWeight = FontWeights.SemiBold;
@@ -5481,6 +5803,79 @@ class CockpitWindow : Window
         _approvalCenterSig = "";
         RefreshApprovalCenter();
         w.ShowDialog();
+    }
+
+    UIElement BuildJobApprovalPolicyPanel()
+    {
+        var box = new Border(); box.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+        box.BorderBrush = Border; box.BorderThickness = new Thickness(1);
+        box.CornerRadius = new CornerRadius(8); box.Padding = new Thickness(14, 12, 14, 12);
+        box.Margin = new Thickness(0, 0, 0, 20);
+        var col = new StackPanel();
+        var title = new TextBlock(); title.Text = _lang == 0 ? "操作承認ポリシー" : "Operation approval policy";
+        title.Foreground = Fg; title.FontSize = 13; title.FontWeight = FontWeights.SemiBold;
+        col.Children.Add(title);
+        var note = new TextBlock(); note.Foreground = Muted; note.FontSize = 11;
+        note.TextWrapping = TextWrapping.Wrap; note.Margin = new Thickness(0, 4, 0, 0);
+        note.Text = _lang == 0
+            ? "ローカルジョブと自律契約に即時反映。STOP・パス制限・外部Skillの初回/変更承認は常に残ります。"
+            : "Applies live to local jobs and autonomy contracts. STOP, path limits, and external-Skill trust remain enforced.";
+        col.Children.Add(note);
+
+        var selector = new ComboBox(); selector.MinWidth = 230; selector.HorizontalAlignment = HorizontalAlignment.Left;
+        selector.Margin = new Thickness(0, 10, 0, 0); selector.Background = CardBg; selector.Foreground = Fg;
+        var labels = _lang == 0
+            ? new string[] { "確認（推奨）", "自動", "バイパス" }
+            : new string[] { "Confirm (recommended)", "Auto", "Bypass" };
+        var values = new string[] { "default", "auto", "bypass" };
+        string current = ApprovalPromptWindow.ReadPolicy();
+        for (int i = 0; i < values.Length; i++)
+        {
+            var item = new ComboBoxItem(); item.Content = labels[i]; item.Tag = values[i];
+            selector.Items.Add(item); if (values[i] == current) selector.SelectedItem = item;
+        }
+        StyleFlatCombo(selector); col.Children.Add(selector);
+        var help = new TextBlock(); help.Foreground = Muted; help.FontSize = 11;
+        help.TextWrapping = TextWrapping.Wrap; help.Margin = new Thickness(0, 7, 0, 0);
+        col.Children.Add(help);
+        Action updateHelp = delegate
+        {
+            var selected = selector.SelectedItem as ComboBoxItem;
+            string mode = selected == null ? "default" : selected.Tag as string;
+            if (mode == "auto") help.Text = _lang == 0
+                ? "安全な操作は自動実行、要確認は承認待ち、禁止判定は拒否。"
+                : "Safe operations run automatically; risky ones ask; prohibited ones are denied.";
+            else if (mode == "bypass") help.Text = _lang == 0
+                ? "手動確認を省略。常時有効な安全境界は解除しません。"
+                : "Skip manual confirmations. Always-on safety boundaries remain.";
+            else help.Text = _lang == 0
+                ? "初回クラスを確認し、承認後も危険な内容は毎回確認。"
+                : "Confirm first-seen classes; risky payloads still ask every time.";
+        };
+        updateHelp();
+        bool reverting = false;
+        selector.SelectionChanged += delegate
+        {
+            if (reverting) return;
+            var item = selector.SelectedItem as ComboBoxItem; if (item == null) return;
+            string next = item.Tag as string; string previous = ApprovalPromptWindow.ReadPolicy();
+            if (next == "bypass")
+            {
+                string warning = _lang == 0
+                    ? "バイパスではローカルジョブと自律契約の手動確認を省略します。\nSTOP条件、ファイル範囲、外部Skill承認は残ります。\n\n有効にしますか？"
+                    : "Bypass skips manual approval for local jobs and autonomy contracts.\nSTOP rules, path limits, and external-Skill approval remain.\n\nEnable it?";
+                if (MessageBox.Show(_approvalCenterWindow, warning, _lang == 0 ? "バイパスを有効化" : "Enable bypass",
+                    MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes)
+                {
+                    reverting = true;
+                    foreach (object obj in selector.Items)
+                    { var old = obj as ComboBoxItem; if (old != null && (old.Tag as string) == previous) selector.SelectedItem = old; }
+                    reverting = false; updateHelp(); return;
+                }
+            }
+            ApprovalPromptWindow.SavePolicy(next); updateHelp();
+        };
+        box.Child = col; return box;
     }
 
     void RefreshApprovalCenter()
