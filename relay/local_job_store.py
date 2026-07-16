@@ -215,7 +215,7 @@ class LocalJobStore:
         return job, turn
 
     def claim_turn(self, job_id: str, expected_seq: int, worker_id: str,
-                   lease_seconds: int = 300, now: float | None = None) -> dict:
+                   lease_seconds: int = 3600, now: float | None = None) -> dict:
         job_id = self._validate_job_id(job_id)
         now = time.time() if now is None else float(now)
         worker_id = _bounded_text(worker_id, 256, "worker_id").strip()
@@ -684,6 +684,44 @@ class LocalJobStore:
             )
             self._event(conn, job_id, int(turn["seq"]), "JOB_CANCELLED", {"reason": reason}, now)
         return {"ok": True, "idempotent": False, "status": "CANCELLED"}
+
+    def retry_uncommitted_turn(self, job_id: str, seq: int, reason: str,
+                               now: float | None = None) -> dict:
+        """Invalidate a browser turn that visibly ended without a SQLite commit.
+
+        This is deliberately a controller-only recovery operation and is not exposed as
+        an MCP tool.  It fences out a late commit, preserves the logical sequence number,
+        and makes the same turn claimable in a fresh conversation.
+        """
+        job_id = self._validate_job_id(job_id)
+        now = time.time() if now is None else float(now)
+        reason = _bounded_text(reason, 2048, "retry reason")
+        with self._transaction() as conn:
+            job, turn = self._job_and_turn(conn, job_id, int(seq))
+            if job["status"] in TERMINAL_JOB_STATUSES:
+                raise JobStoreError("JOB_TERMINAL", f"job status is {job['status']}")
+            if turn["commit_json"]:
+                return {"ok": True, "idempotent": True, "status": job["status"]}
+            if int(job["current_seq"]) != int(seq):
+                raise JobStoreError(
+                    "SEQ_MISMATCH", f"expected {seq}, current seq is {job['current_seq']}",
+                )
+            next_retry = int(turn["retry_count"] or 0) + 1
+            conn.execute(
+                "UPDATE turns SET status='READY',worker_id=NULL,lease_id=NULL,"
+                "lease_expires_at=NULL,abort_hash=NULL,abort_json=NULL,"
+                "retry_count=?,updated_at=? WHERE job_id=? AND seq=?",
+                (next_retry, now, job_id, int(seq)),
+            )
+            conn.execute(
+                "UPDATE jobs SET status='READY',verification_detail=?,updated_at=? "
+                "WHERE job_id=?", (reason, now, job_id),
+            )
+            self._event(conn, job_id, int(seq), "TURN_CONTROLLER_RETRY", {
+                "reason": reason, "retry_count": next_retry,
+            }, now)
+        return {"ok": True, "idempotent": False, "status": "READY",
+                "retry_count": next_retry}
 
     def record_event(self, job_id: str, event_type: str, payload: dict | None = None,
                      seq: int | None = None, now: float | None = None) -> None:

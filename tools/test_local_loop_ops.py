@@ -20,6 +20,20 @@ def test_status_is_read_only_and_store_errors_are_structured(monkeypatch):
     }
 
 
+def test_claim_default_lease_covers_long_review_turn(monkeypatch):
+    seen = {}
+
+    class FakeStore:
+        def claim_turn(self, *args):
+            seen["args"] = args
+            return {"ok": True}
+
+    monkeypatch.setattr(ops, "require_unlocked", lambda: None)
+    monkeypatch.setattr(ops, "_store", lambda: FakeStore())
+    assert ops.claim_turn("j", 3, "worker")["ok"]
+    assert seen["args"] == ("j", 3, "worker", 3600)
+
+
 def test_commit_forwards_fencing_token(monkeypatch):
     seen = {}
 
