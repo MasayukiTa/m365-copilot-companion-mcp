@@ -78,7 +78,6 @@ from tools.outlook_ops import (
     outlook_send_mail,
 )
 from tools.gate_ops import (
-    gate_answer,
     gate_ask,
     gate_list,
     gate_poll,
@@ -139,6 +138,7 @@ from tools.local_loop_ops import (
     heartbeat,
     read_job_context,
 )
+from tools.skill_ops import skill_list, skill_load, skill_match, skill_read_resource
 from tools.pdf_ops import pdf_info, read_pdf
 from tools.pptx_ops import (
     create_pptx,
@@ -192,7 +192,10 @@ mcp = FastMCP(
         "Persistent memory: when durable knowledge emerges (procedures, data sources, "
         "format templates, decisions, or facts) or the user says to remember it (e.g., "
         "\"刻んで\"), call agent_memory_save via call_tool to persist it; before "
-        "re-deriving, search prior entries with agent_memory_search or agent_memory_list."
+        "re-deriving, search prior entries with agent_memory_search or agent_memory_list. "
+        "Reusable Skills: call skill_match using the user's request, then skill_load only "
+        "for a confident trusted match. Skill trust never grants extra execution rights; "
+        "every mutating, shell, or outbound tool keeps its normal unlock/contract gate."
     ),
 )
 
@@ -314,8 +317,11 @@ TOOLS = (
     # orchestration: tool-call trace (observability; only records when MCP_TRACE_TOOLCALLS set)
     toolcalls_tail,
     # orchestration: human-in-the-loop gate + kill-switch (operator E)
-    gate_ask, gate_poll, gate_answer, gate_list,
+    # gate_answer is intentionally local-operator-only; a model must not approve its own gate.
+    gate_ask, gate_poll, gate_list,
     stop_request, stop_check, stop_clear,
+    # Model-facing Skill operations are read-only and accept only exact trusted digests.
+    skill_list, skill_match, skill_load, skill_read_resource,
     # orchestration: response-content-independent LOCAL_LOOP control plane
     *EXECUTION_PROFILE_TOOLS,
     # orchestration: verification-loop helpers (operator C)
