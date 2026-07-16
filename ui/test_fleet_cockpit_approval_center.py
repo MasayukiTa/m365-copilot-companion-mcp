@@ -53,3 +53,12 @@ def test_approval_prompt_uses_the_shared_theme_and_live_preferences():
     assert "Theme.Accent(_dark)" in SOURCE
     assert "Theme.UiFont" in SOURCE
     assert "UiPreferencesChanged()" in SOURCE
+
+
+def test_unfinished_run_banner_has_persistent_close_button():
+    assert 'IconButton("close", 14' in SOURCE
+    assert "DismissResumeState(capturedSignature)" in SOURCE
+    assert "cockpit_resume_dismissed.json" in SOURCE
+    assert "ResumeStateSignature()" in SOURCE
+    assert "ResumeStateDismissed(resumeSig)" in SOURCE
+    assert 'rd["signature"] = resumeSig' in SOURCE
