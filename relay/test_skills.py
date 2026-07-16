@@ -60,7 +60,7 @@ def test_any_bundle_change_invalidates_trust(tmp_path, monkeypatch):
     challenge = store.request_approval("model-review")
     store.confirm_approval("model-review", challenge["token"])
 
-    installed = tmp_path / "project" / ".claude" / "skills" / "model-review"
+    installed = tmp_path / "project" / "skills" / "model-review"
     (installed / "scripts" / "check.py").write_text("print('two')\n", encoding="utf-8")
     assert store.get("model-review").trust == "changed"
     with pytest.raises(SkillError, match="changed"):
@@ -75,7 +75,7 @@ def test_change_during_approval_requires_new_review(tmp_path, monkeypatch):
     source = _write_skill(tmp_path / "download")
     store.import_external(source)
     challenge = store.request_approval("model-review")
-    installed = tmp_path / "project" / ".claude" / "skills" / "model-review" / "SKILL.md"
+    installed = tmp_path / "project" / "skills" / "model-review" / "SKILL.md"
     installed.write_text(installed.read_text(encoding="utf-8") + "\nChanged.\n", encoding="utf-8")
     with pytest.raises(SkillError, match="changed after review"):
         store.confirm_approval("model-review", challenge["token"])
@@ -111,6 +111,48 @@ def test_locally_created_skill_is_trusted_exact_digest(tmp_path, monkeypatch):
     assert skill.provenance == "local-authored"
     assert skill.trust == "trusted"
     assert "Do the local workflow" in store.render("my-skill")
+    assert skill.path == tmp_path / "project" / "skills" / "my-skill"
+
+
+def test_discovers_native_and_claude_compatible_roots(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch)
+    project = tmp_path / "project"
+    home = tmp_path / "home"
+    expected = {
+        "project-native": project / "skills",
+        "project-claude": project / ".claude" / "skills",
+        "personal-native": home / "skills",
+        "personal-claude": home / ".claude" / "skills",
+    }
+    for name, root in expected.items():
+        _write_skill(root, name=name, description=name)
+
+    found = {skill.name: skill for skill in store.discover()}
+    assert set(found) == set(expected)
+    assert found["project-native"].scope == "project"
+    assert found["project-claude"].scope == "project"
+    assert found["personal-native"].scope == "personal"
+    assert found["personal-claude"].scope == "personal"
+    for name, root in expected.items():
+        assert found[name].path == root / name
+
+
+def test_native_and_personal_roots_win_same_name_collisions(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch)
+    project = tmp_path / "project"
+    home = tmp_path / "home"
+    roots = [
+        project / ".claude" / "skills",
+        project / "skills",
+        home / ".claude" / "skills",
+        home / "skills",
+    ]
+    for index, root in enumerate(roots):
+        _write_skill(root, description=f"candidate {index}")
+
+    selected = store.get("model-review")
+    assert selected.path == home / "skills" / "model-review"
+    assert selected.description == "candidate 3"
 
 
 def test_resource_traversal_is_rejected(tmp_path, monkeypatch):

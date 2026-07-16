@@ -241,10 +241,16 @@ class SkillStore:
         return os.path.normcase(str(path.resolve()))
 
     def roots(self) -> list[tuple[str, Path]]:
+        # Native, product-neutral `skills/` locations let people use Skills without
+        # installing Claude. `.claude/skills/` remains a compatibility source so an
+        # existing Claude Skill library works unchanged. Later entries win on a
+        # same-name collision; native folders therefore override compatibility ones.
         return [
             ("project", self.project_root / ".claude" / "skills"),
-            # Personal Skills have the final say on a same-name collision.
+            ("project", self.project_root / "skills"),
             ("personal", Path.home() / ".claude" / "skills"),
+            # Personal Skills have the final say on a same-name collision.
+            ("personal", Path.home() / "skills"),
         ]
 
     def _state_for(self, skill: Skill) -> tuple[str, str]:
@@ -267,7 +273,8 @@ class SkillStore:
 
     def discover(self) -> list[Skill]:
         self._sync_gate_approvals()
-        # Later roots override earlier ones, mirroring project-over-personal lookup.
+        # Later roots override earlier ones: native beats compatibility within a
+        # scope, and the user's personal library beats a project collision.
         selected: dict[str, Skill] = {}
         errors: list[Skill] = []
         for scope, root in self.roots():
@@ -516,7 +523,7 @@ class SkillStore:
             raise SkillError("Skill name must use lowercase letters, digits, and hyphens (max 64)")
         if not description.strip():
             raise SkillError("description is required")
-        target = self.project_root / ".claude" / "skills" / name
+        target = self.project_root / "skills" / name
         if target.exists():
             raise SkillError(f"Skill already exists: {target}")
         target.mkdir(parents=True)

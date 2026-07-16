@@ -158,7 +158,7 @@ git を使わないなら: GitHub ページの緑色の「**Code**」ボタン �
 
 ### Skills（再利用できる仕事のやり方）
 
-- `/skills` で、個人共通の `~/.claude/skills/` とプロジェクト固有の `.claude/skills/` を一覧表示します。
+- `/skills` で、Claude非依存の個人共通 `~/skills/`・プロジェクト固有 `skills/` と、Claude互換の `~/.claude/skills/`・`.claude/skills/` を一覧表示します。
 - `/<skill-name> 引数` で承認済み Skill を明示実行できます。信頼度の高い一致だけは通常文から自動選択されます。
 - 自作はローカル端末で `/skill-create <name> | <description> | <instructions>`。作成時の内容だけが自動で信頼されます。
 - 外部Skillは `/skill-import <path>` で実行せず取り込み、`/skill-approve <name>` で内容・差分・スクリプトを確認します。承認待ちはフリート停止中でも FleetCockpit 上部の「承認」から開け、承認後もそのハッシュにしか効きません。
@@ -373,7 +373,7 @@ Once registered, open the agent's chat and paste the URL from the browser's addr
 
 #### Skills (reusable workflows)
 
-- `/skills` lists personal `~/.claude/skills/` and project `.claude/skills/` bundles without loading their bodies.
+- `/skills` lists product-neutral personal `~/skills/` and project `skills/` bundles plus Claude-compatible `~/.claude/skills/` and `.claude/skills/`, without loading their bodies.
 - Run an approved Skill explicitly with `/<skill-name> arguments`; only high-confidence metadata matches may be selected automatically.
 - Create a local Skill from the terminal with `/skill-create <name> | <description> | <instructions>`.
 - Import an external folder without executing it using `/skill-import <path>`, then run `/skill-approve <name>`. FleetCockpit's persistent Approval Center shows the request even while the fleet is idle, including its digest, changed files, bundled scripts, and requested tools. Any content change invalidates that approval.

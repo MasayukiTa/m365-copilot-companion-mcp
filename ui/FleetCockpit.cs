@@ -1092,7 +1092,7 @@ class CockpitWindow : Window
         headRow.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // title + controls
         headRow.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // subtitle (full width)
 
-        // right controls: autoscale group, language, theme  (row 0, col 1).
+        // right controls: live status/actions, language, theme (row 0, col 1).
         // Vertically CENTERED so the control cluster shares one horizontal center line with the
         // left-edge health strip (redesign: single clean header band, dots flush-left / controls
         // flush-right, all centered on one line — no big in-content title above).
@@ -1101,12 +1101,13 @@ class CockpitWindow : Window
         ctrls.VerticalAlignment = VerticalAlignment.Center;
         ctrls.HorizontalAlignment = HorizontalAlignment.Right;
 
-        // "N workers" neutral info chip (live count updated in OnTick; shows maxtabs until first tick)
+        // Read-only live tab pressure. Configuration belongs in Settings; while idle this chip is
+        // hidden so the header does not duplicate the Start/ceiling/autoscale controls.
         _workerChip = new TextBlock();
         _workerChip.FontSize = 12; _workerChip.VerticalAlignment = VerticalAlignment.Center;
         _workerChip.Margin = new Thickness(0, 0, 12, 0);
         _workerChip.Padding = new Thickness(10, 3, 10, 3);
-        UpdateWorkerChip(0, false);   // initial paint
+        UpdateWorkerChip(0, 0, false);   // initial paint
         _workerChipBorder = new Border();
         _workerChipBorder.Child = _workerChip;
         _workerChipBorder.BorderThickness = new Thickness(1);
@@ -1114,10 +1115,10 @@ class CockpitWindow : Window
         _workerChipBorder.Padding = new Thickness(0);
         _workerChipBorder.VerticalAlignment = VerticalAlignment.Center;
         _workerChipBorder.Margin = new Thickness(0, 0, 12, 0);
+        _workerChipBorder.Visibility = Visibility.Collapsed;
         PaintWorkerChipBorder(_workerChipBorder);
         ctrls.Children.Add(_workerChipBorder);
 
-        ctrls.Children.Add(AutoscaleControls());
         ctrls.Children.Add(EffortControl());
         ctrls.Children.Add(ApprovalControl());
         ctrls.Children.Add(ApprovalCenterControl());
@@ -4462,18 +4463,15 @@ class CockpitWindow : Window
     Button _autoMinus, _autoPlus;
     TextBlock _autoLbl, _autoValue;
 
-    // Autoscale control GROUP (header): just [ RAM自動調整: ON/OFF ]. The 開始(デフォルト) and 上限
-    // steppers were moved OUT of the header into the settings panel (gear popup); only the toggle
-    // remains here. The toggle live-applies via RequestSetAutoscale/RequestSetMaxtabs; the steppers
-    // in settings route through SetMaxTabs/SetAutoMax.
+    // Autoscale toggle for the Settings panel. Autoscale, start tabs and ceiling are one concept,
+    // so they live together instead of splitting one setting between the header and gear menu.
     UIElement AutoscaleControls()
     {
         var group = new StackPanel(); group.Orientation = Orientation.Horizontal;
-        group.VerticalAlignment = VerticalAlignment.Center; group.Margin = new Thickness(0, 0, 12, 0);
-        // GAP5: explain this dense cluster -- the two −/+ steppers were indistinguishable.
+        group.VerticalAlignment = VerticalAlignment.Center; group.Margin = new Thickness(0, 2, 0, 4);
         group.ToolTip = _lang == 0
-            ? "RAM自動調整=ON なら空きRAMに応じて並列タブ数を自動増減。開始タブ数・上限は設定（⚙）内。"
-            : "Autoscale ON auto-adjusts parallel tabs to free RAM. Start count & ceiling live in Settings (⚙).";
+            ? "空きRAMに応じて並列タブ数を開始値から上限まで自動調整します。"
+            : "Automatically adjust parallel tabs from the start value up to the ceiling based on free RAM.";
 
         // a. autoscale ON/OFF toggle (simple themed button whose label flips)
         _autoToggle = new Button();
@@ -4481,7 +4479,7 @@ class CockpitWindow : Window
         _autoToggle.Cursor = Cursors.Hand; _autoToggle.BorderThickness = new Thickness(1);
         _autoToggle.Padding = new Thickness(10, 3, 10, 3); _autoToggle.FontSize = 12;
         _autoToggle.FontWeight = FontWeights.SemiBold;
-        _autoToggle.Margin = new Thickness(0, 0, 12, 0);
+        _autoToggle.Margin = new Thickness(0);
         _autoToggle.VerticalAlignment = VerticalAlignment.Center;
         _autoToggle.Click += delegate
         {
@@ -4495,10 +4493,6 @@ class CockpitWindow : Window
         };
         group.Children.Add(_autoToggle);
 
-        // b+c. Both the start (開始/デフォルト) and ceiling (上限) steppers were RELOCATED into the
-        //    settings panel (gear popup) to declutter the header. BuildSettingsPanel builds both and
-        //    keeps the _max*/_auto* field refs, so PaintChrome/UpdateAutoEnabled/SetMaxTabs/SetAutoMax
-        //    keep driving them. Only the autoscale ON/OFF toggle remains in the header.
         return group;
     }
 
@@ -4696,6 +4690,7 @@ class CockpitWindow : Window
 
         // ── Parallel tabs: start + ceiling (上限) steppers ──
         col.Children.Add(SectionHeader(T("set_tabs_section")));
+        col.Children.Add(AutoscaleControls());
         var startMinus = MiniButton("−"); startMinus.Click += delegate { SetMaxTabs(_maxtabs - 1); };
         var startPlus = MiniButton("+"); startPlus.Click += delegate { SetMaxTabs(_maxtabs + 1); };
         _maxMinus = startMinus; _maxPlus = startPlus;   // keep refs so PaintChrome re-themes them (mirrors ceiling)
@@ -5348,7 +5343,7 @@ class CockpitWindow : Window
     void PaintAutoToggle()
     {
         if (_autoToggle == null) return;
-        _autoToggle.Content = _autoscale ? "Auto" : (_lang == 0 ? "Auto · 切" : "Auto · off");
+        _autoToggle.Content = T("autoscale") + ": " + (_autoscale ? "ON" : "OFF");
         if (_autoscale)
         {
             _autoToggle.Foreground = Theme.Br(Theme.Accent(_dark));
@@ -6335,13 +6330,16 @@ class CockpitWindow : Window
         if (except != "slash" && _gcmdPopup != null) _gcmdPopup.IsOpen = false;
     }
 
-    // Update the "N workers" chip text.  liveCount = 0 when idle (falls back to maxtabs).
-    // isLive = true when status.json shows an active run (show actual worker count).
-    void UpdateWorkerChip(int liveCount, bool isLive)
+    // Read-only runtime status. Hide it while idle/finished; Settings owns configuration.
+    void UpdateWorkerChip(int openTabs, int liveCap, bool isLive)
     {
         if (_workerChip == null) return;
-        int n = isLive ? liveCount : _maxtabs;
-        string label = _lang == 0 ? (n + " タブ") : (n + " workers");
+        if (_workerChipBorder != null)
+            _workerChipBorder.Visibility = isLive ? Visibility.Visible : Visibility.Collapsed;
+        if (!isLive) return;
+        int open = Math.Max(0, openTabs);
+        int cap = Math.Max(1, liveCap > 0 ? liveCap : _maxtabs);
+        string label = _lang == 0 ? ("タブ " + open + "/" + cap) : ("Tabs " + open + "/" + cap);
         _workerChip.Text = label;
         _workerChip.Foreground = Theme.Br(Theme.Muted(_dark));
     }
@@ -6371,7 +6369,7 @@ class CockpitWindow : Window
         if (_maxValue != null) _maxValue.Foreground = Fg;
         if (_autoLbl != null) _autoLbl.Foreground = Muted;
         if (_autoValue != null) _autoValue.Foreground = Fg;
-        if (_workerChip != null) UpdateWorkerChip(0, false);
+        if (_workerChip != null) UpdateWorkerChip(0, 0, false);
         PaintWorkerChipBorder(_workerChipBorder);
         PaintHealthChrome();
         ApplyHealthToUi();     // re-tint the dots for the new theme
@@ -6536,7 +6534,7 @@ class CockpitWindow : Window
             _header.Text = "Fleet";
             _sub.Text = "";                // the empty-state block in the body carries the message now
             if (_subChips != null) _subChips.Children.Clear();   // Feature 2: no chips while idle either
-            UpdateWorkerChip(0, false);    // show maxtabs while idle
+            UpdateWorkerChip(0, 0, false); // configuration lives in Settings while idle
             // A2-2: collapse spine and idle composer when no run
             RefreshSpine(root, true);
             PaintComposerMode(false);
@@ -6573,17 +6571,16 @@ class CockpitWindow : Window
             return;
         }
         UpdateHeader(root);                 // live elapsed every tick
-        // Update the "N workers" chip with the actual total worker count each tick.
+        bool runningNow = !root.ContainsKey("running") || Convert.ToBoolean(root["running"]);
+        // Snapshot exposes actual browser tabs and the current live concurrency cap. This is
+        // operational status, not another place to edit those settings.
         {
-            int wCount = 0;
-            object wo3;
-            if (root.TryGetValue("workers", out wo3) && wo3 is object[])
-                wCount = ((object[])wo3).Length;
-            UpdateWorkerChip(wCount, true);
+            int openTabs = I(root, "open_tabs");
+            int liveCap = I(root, "max_concurrent");
+            UpdateWorkerChip(openTabs, liveCap, runningNow);
         }
         // only archive while the run is LIVE -- otherwise the finished run's final
         // snapshot would re-add cleared tasks every tick (Clear would never stick).
-        bool runningNow = !root.ContainsKey("running") || Convert.ToBoolean(root["running"]);
         if (runningNow) ArchiveTerminal(root);
         // opt-in auto-retry runs every tick (before the sig short-circuit) so it catches a
         // stopped goal even when nothing else changed. Bounded by _autoRetryMax per goal text.
