@@ -67,6 +67,13 @@ jobs:
             tools/test_agent_memory_ops.py \
             tools/test_auth_stats.py \
             scripts/test_bootstrap.py \
+            scripts/test_bootstrap_p2c.py \
+            bridge/test_p2c_flag.py \
+            bridge/test_review_command_p2c.py \
+            ui/test_copilot_chat_p2c.py \
+            bench/test_local_review_transport.py \
+            bench/test_review_p2c_integration.py \
+            bench/test_review_run.py \
             relay/test_acceptance.py \
             relay/test_admission.py \
             relay/test_autoscale.py \

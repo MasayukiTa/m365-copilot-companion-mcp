@@ -336,7 +336,7 @@ def step_gen_env() -> None:
 
     if env_path.exists():
         # Preserve every existing value/secret, but backfill newly introduced safe defaults.
-        # This is deliberately append-only and never changes a user's explicit 0/1 choice.
+        # This is deliberately append-only and never changes a user's explicit 0/1/2 choice.
         current = env_path.read_text(encoding="utf-8-sig")
         missing = []
         for key, value in (

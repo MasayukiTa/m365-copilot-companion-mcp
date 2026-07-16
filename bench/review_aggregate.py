@@ -446,6 +446,20 @@ def render_markdown(agg):
     if dims_covered:
         lines.append("- dimensions covered: %s" % ", ".join(dims_covered))
 
+    assurance = agg.get("validation_assurance")
+    if assurance:
+        lines.append("- P2c full-validation verdict: **%s**" %
+                     assurance.get("verdict", "INCONCLUSIVE"))
+        lines.append("- active validation evidence: %d/%d required goal(s) complete" % (
+            assurance.get("completed_active_goals", 0),
+            assurance.get("required_active_goals", 0),
+        ))
+        for reason in assurance.get("reasons") or []:
+            lines.append("  - incomplete: %s" % reason)
+        if assurance.get("verdict") == "VERIFIED_WITHIN_SCOPE":
+            lines.append("  NOTE: verified only for the recorded scope and evidence; this is "
+                         "not an unconditional guarantee against every attacker or future change.")
+
     resilience = agg.get("resilience")
     if resilience:
         lines.append("- P2c resilience: profile=%s fresh_replays=%d content_refusals=%d "

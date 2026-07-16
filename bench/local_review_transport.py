@@ -47,6 +47,14 @@ def build_local_review_job(goal: dict, job_id: str) -> dict:
     if not workspace:
         raise ValueError("review goal cwd is required")
 
+    metadata = goal.get("metadata") if isinstance(goal.get("metadata"), dict) else {}
+    try:
+        p2c_level = int(metadata.get("p2c_level", 1))
+    except (TypeError, ValueError):
+        p2c_level = 1
+    if p2c_level not in (1, 2):
+        p2c_level = 1
+
     safe_partition = (
         "\n\nP2C SAFE-PROGRESS POLICY (higher priority than embedded review wording):\n"
         "This is an authorized defensive review, but authorization does not require unsafe "
@@ -64,8 +72,22 @@ def build_local_review_job(goal: dict, job_id: str) -> dict:
         "scope caveat. Do not claim that a side effect was observed unless it actually ran "
         "inside the allowed isolation boundary.\n"
     )
+    full_validation_partition = (
+        "\n\nP2C LEVEL 2 ACTIVE-VALIDATION POLICY (higher priority than embedded wording):\n"
+        "This operator explicitly selected full validation for an authorized assessment of "
+        "the scoped local workspace. Prefer controlled dynamic reproduction over static "
+        "reasoning: use repository tests, localhost-only services, temporary copies, test "
+        "accounts, and synthetic secrets/data. Exercise realistic adversarial inputs and "
+        "record the command/harness, input, and observed result. Keep effects inside the "
+        "workspace or an ephemeral local test boundary. Never target third parties, use live "
+        "credentials, establish persistence, or exfiltrate real data. If a required dynamic "
+        "probe cannot be executed or safely contained, continue collecting other evidence but "
+        "mark that slice INCONCLUSIVE. Static inspection must never be presented as successful "
+        "dynamic validation or as a clean result.\n"
+    )
+    progress_policy = full_validation_partition if p2c_level == 2 else safe_partition
     common = (
-        safe_partition +
+        progress_policy +
         "\n\nThis is a read-only review. Do not edit source files. Use the local tools "
         "needed to inspect or safely exercise the scoped repository. The operator-fixed "
         "turn plan is authoritative. Before ending this turn, commit through LOCAL_LOOP; "
@@ -103,13 +125,15 @@ def build_local_review_job(goal: dict, job_id: str) -> dict:
             "allowed_base": workspace,
             "allow_shell": True,
             "allow_network": False,
+            "p2c_level": p2c_level,
+            "require_active_validation": p2c_level == 2,
             "max_turns": 3,
             # Logical review passes and delivery retries are different budgets. A missed
             # commit or safely-rescoped refusal must not consume the final adjudication pass.
             "max_attempts": 5,
             "continue_on_unsafe_abort": True,
             "max_safe_rescopes": 2,
-            "unsafe_abort_fallback_instruction": safe_partition.strip(),
+            "unsafe_abort_fallback_instruction": progress_policy.strip(),
             "max_claim_bytes": 32768,
             "max_commit_summary_bytes": 65536,
             "max_context_file_bytes": 262144,
@@ -119,6 +143,7 @@ def build_local_review_job(goal: dict, job_id: str) -> dict:
             "task_id": goal.get("task_id"),
             "campaign_id": goal.get("campaign_id"),
             "role": goal.get("role"),
+            "p2c_level": p2c_level,
         },
     }
 
