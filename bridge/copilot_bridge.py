@@ -23,6 +23,7 @@ Setup (once):
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import logging
 import os
@@ -4062,18 +4063,22 @@ def _run_tool_probe():
         since_user = time.time() - _LAST_USER_TURN_TS
         if since_user < TOOL_PROBE_MIN_IDLE_SEC:
             logger.debug("tool probe: skipped (user turn %.0fs ago)", since_user)
-            return
+            return max(5.0, TOOL_PROBE_MIN_IDLE_SEC - since_user)
         if PAGE is None:
             # Startup not finished yet (or _page_main never got there) -- report this directly
             # instead of calling run_on_page_thread, which would block this timer thread
             # forever if the page-owner thread never reaches PAGE_EXECUTOR.run_forever().
-            tool_probe.record_probe(False, "agent_unreachable", detail="PAGE not initialized")
-            logger.info("tool probe: agent_unreachable (PAGE not initialized)")
-            return
+            tool_probe.record_probe(False, "starting", detail="PAGE not initialized; retrying")
+            logger.info("tool probe: starting (PAGE not initialized); short retry armed")
+            return 15.0
         if not PAGE_LOCK.acquire(blocking=False):
             logger.debug("tool probe: skipped (page busy)")
-            return
+            return 15.0
         try:
+            # Persist an explicit transitional state BEFORE the potentially long M365 turn.
+            # FleetCockpit renders this as a spinner, so a 30-180s real tool round-trip never
+            # looks like an inert stale-red indicator.
+            tool_probe.record_probe(False, "checking", detail="tool probe in progress")
             agent_loaded, reply, timed_out = run_on_page_thread(_do_tool_probe_turn)
             if timed_out:
                 ok, kind = False, "timeout"
@@ -4114,12 +4119,14 @@ def _run_tool_probe():
         # this is the authoritative snapshot /health reads.
         tool_probe.record_probe(ok, kind, detail=(reply or "")[:200])
         logger.info("tool probe: ok=%s kind=%s", ok, kind)
+        return None
     except Exception:
         logger.warning("tool probe: _run_tool_probe raised", exc_info=True)
         try:
             tool_probe.record_probe(False, "error", detail="probe driver raised")
         except Exception:
             pass
+        return 30.0
 
 
 # BUG 1 fix: how long to wait before the FIRST probe after startup (short), vs. the normal idle
@@ -4152,12 +4159,16 @@ def _schedule_tool_probe(delay=None):
     wait = MCP_TOOL_PROBE_SEC if delay is None else max(0.0, delay)
 
     def _tick():
+        retry_delay = None
         try:
-            _run_tool_probe()
+            retry_delay = _run_tool_probe()
         except Exception:
             logger.warning("tool probe: _tick raised", exc_info=True)
+            retry_delay = 30.0
         finally:
-            _schedule_tool_probe()   # re-arm regardless of outcome -- keeps probing forever
+            # Normal outcomes keep the configured cadence. Startup/page-busy/error outcomes
+            # return a short delay so recovery is visible in seconds, not after the old 10 min.
+            _schedule_tool_probe(delay=retry_delay)
 
     _TOOL_PROBE_TIMER = threading.Timer(wait, _tick)
     _TOOL_PROBE_TIMER.daemon = True
@@ -4194,6 +4205,60 @@ def _port_already_served(port, timeout=2.0):
         return True
     except OSError:
         return False
+
+
+# The PowerShell keepalive supervisor can only restart the bridge after this Python process
+# exits. Previously, if the dedicated Edge (:9223) died while Python and :8765 stayed alive,
+# the supervisor remained blocked forever inside `& python`: the cockpit showed Tool red, but
+# neither process repaired the half-dead stack. This watchdog closes that gap. Three consecutive
+# local CDP failures are required to ignore a brief Edge restart; exit 70 hands control back to
+# start_bridge.ps1, which recreates Edge and relaunches the bridge. Session state is durable in
+# SQLite, so the restart does not discard the conversation ledger.
+CDP_WATCHDOG_SEC = max(2.0, float(os.environ.get("MCP_CDP_WATCHDOG_SEC", "10")))
+CDP_WATCHDOG_FAILURES = max(2, int(os.environ.get("MCP_CDP_WATCHDOG_FAILURES", "3")))
+
+
+def _cdp_healthy(cdp, timeout=2.0):
+    try:
+        parsed = urllib.parse.urlparse(cdp)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 80
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        conn.request("GET", "/json/version")
+        response = conn.getresponse()
+        response.read(256)
+        conn.close()
+        return response.status == 200
+    except Exception:
+        return False
+
+
+def _start_cdp_watchdog(cdp):
+    def _watch():
+        failures = 0
+        while True:
+            time.sleep(CDP_WATCHDOG_SEC)
+            if _cdp_healthy(cdp):
+                if failures:
+                    logger.info("CDP watchdog: recovered after %d failed check(s)", failures)
+                failures = 0
+                continue
+            failures += 1
+            logger.warning("CDP watchdog: %s failed (%d/%d)", cdp, failures,
+                           CDP_WATCHDOG_FAILURES)
+            if failures >= CDP_WATCHDOG_FAILURES:
+                try:
+                    tool_probe.record_probe(False, "starting",
+                                            detail="bridge Edge lost; supervisor restarting")
+                except Exception:
+                    pass
+                logger.error("CDP watchdog: dedicated Edge remained unavailable; exiting for "
+                             "keepalive recovery")
+                os._exit(70)
+
+    thread = threading.Thread(target=_watch, daemon=True, name="cdp-watchdog")
+    thread.start()
+    return thread
 
 
 def _page_main(cdp, fresh):
@@ -4311,6 +4376,7 @@ def main():
     # no separate "ready" event is needed because do_GET's first PAGE access is always via
     # run_on_page_thread, which is a no-op-until-queued blocking call.
     PAGE_EXECUTOR.start(lambda: _page_main(cdp, fresh))
+    _start_cdp_watchdog(cdp)
     # Arm the idle tool-call self-probe AFTER the page-owner thread has been started (so PAGE
     # exists, or is about to, by the time the first tick fires -- see "tool-call self-probe"
     # section above _SingleBindHTTPServer). No-ops entirely when MCP_TOOL_PROBE_SEC<=0 (opt-out).

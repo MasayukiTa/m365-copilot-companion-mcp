@@ -56,7 +56,7 @@ PROBE_OK_TOKEN = "===TOOLPROBE_OK==="
 
 # The full set of `kind` values record_probe()/classify_probe_reply() may produce.
 PROBE_KINDS = ("answer", "consent_card", "canned_fallback", "timeout",
-               "agent_unreachable", "error")
+               "agent_unreachable", "error", "starting", "checking")
 
 # Where the cockpit / /health can read the same summary without driving the browser.
 _PROBE_FILE = Path(__file__).resolve().parent.parent / ".fleet" / "tool_probe.json"
