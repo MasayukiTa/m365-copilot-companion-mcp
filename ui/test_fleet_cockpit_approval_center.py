@@ -40,8 +40,16 @@ def test_actionable_notification_prompt_can_answer_without_opening_chat():
 
 
 def test_confirmation_auto_and_bypass_are_visible_and_persistent():
-    assert 'AddPolicyItem("確認（推奨）", "default")' in SOURCE
-    assert 'AddPolicyItem("自動", "auto")' in SOURCE
-    assert 'AddPolicyItem("バイパス", "bypass")' in SOURCE
+    assert '"default")' in SOURCE
+    assert '"auto")' in SOURCE
+    assert '"bypass")' in SOURCE
     assert "job_approval_mode=" in SOURCE
     assert "ApprovalPromptWindow.SavePolicy(next)" in SOURCE
+
+
+def test_approval_prompt_uses_the_shared_theme_and_live_preferences():
+    assert "Theme.Bg(_dark)" in SOURCE
+    assert "Theme.Surface(_dark)" in SOURCE
+    assert "Theme.Accent(_dark)" in SOURCE
+    assert "Theme.UiFont" in SOURCE
+    assert "UiPreferencesChanged()" in SOURCE

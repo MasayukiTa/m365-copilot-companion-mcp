@@ -88,14 +88,10 @@ class ApprovalPromptWindow : Window
     ComboBox _policy;
     DispatcherTimer _timer;
     bool _changingPolicy;
-
-    static readonly Brush Bg = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#111827"));
-    static readonly Brush Surface = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1f2937"));
-    static readonly Brush Line = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#374151"));
-    static readonly Brush Fg = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#f9fafb"));
-    static readonly Brush Muted = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#a7b0bf"));
-    static readonly Brush Accent = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#2563eb"));
-    static readonly Brush Danger = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#f87171"));
+    bool _dark = true;
+    int _lang = 0;
+    long _settingsStamp = -1;
+    Brush Bg, Surface, SurfaceSubtle, Line, Fg, Muted, Accent, AccentFg, Danger, Warning;
 
     static double NowUnix()
     { return (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds; }
@@ -111,10 +107,12 @@ class ApprovalPromptWindow : Window
 
     public ApprovalPromptWindow(string initialGatePath)
     {
-        Title = "承認が必要です / Approval required";
+        LoadUiPreferences();
+        ApplyThemeTokens();
+        Title = L("承認が必要です", "Approval required");
         Width = 600; Height = 620; MinWidth = 500; MinHeight = 480;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
-        Background = Bg; ShowInTaskbar = true;
+        Background = Bg; ShowInTaskbar = true; FontFamily = new FontFamily(Theme.UiFont);
         try
         {
             string full = Path.GetFullPath(initialGatePath);
@@ -133,7 +131,15 @@ class ApprovalPromptWindow : Window
             if (_gateDir == null) { Close(); return; }
             LoadNext();
             _timer = new DispatcherTimer(); _timer.Interval = TimeSpan.FromSeconds(2);
-            _timer.Tick += delegate { RefreshPendingCount(); if (_current == null) LoadNext(); };
+            _timer.Tick += delegate
+            {
+                if (UiPreferencesChanged())
+                {
+                    ApplyThemeTokens(); Background = Bg; Title = L("承認が必要です", "Approval required");
+                    Build(); LoadNext();
+                }
+                RefreshPendingCount(); if (_current == null) LoadNext();
+            };
             _timer.Start();
             Activate();
         };
@@ -142,63 +148,124 @@ class ApprovalPromptWindow : Window
         { if (e.Key == Key.Escape) { Close(); e.Handled = true; } };
     }
 
+    string L(string ja, string en) { return _lang == 0 ? ja : en; }
+
+    void LoadUiPreferences()
+    {
+        try
+        {
+            if (!File.Exists(SettingsFile)) { _settingsStamp = 0; return; }
+            _settingsStamp = File.GetLastWriteTimeUtc(SettingsFile).Ticks;
+            foreach (string raw in File.ReadAllLines(SettingsFile, new UTF8Encoding(false)))
+            {
+                string line = raw.Trim();
+                if (line.StartsWith("dark=")) _dark = line.Substring(5).Trim() != "0";
+                else if (line.StartsWith("lang=")) _lang = line.Substring(5).Trim() == "1" ? 1 : 0;
+            }
+        }
+        catch { }
+    }
+
+    bool UiPreferencesChanged()
+    {
+        try
+        {
+            long stamp = File.Exists(SettingsFile) ? File.GetLastWriteTimeUtc(SettingsFile).Ticks : 0;
+            if (stamp == _settingsStamp) return false;
+            LoadUiPreferences(); return true;
+        }
+        catch { return false; }
+    }
+
+    void ApplyThemeTokens()
+    {
+        Bg = Theme.Br(Theme.Bg(_dark)); Surface = Theme.Br(Theme.Surface(_dark));
+        SurfaceSubtle = Theme.Br(Theme.SurfaceSubtle(_dark)); Line = Theme.Br(Theme.Border(_dark));
+        Fg = Theme.Br(Theme.Text(_dark)); Muted = Theme.Br(Theme.Muted(_dark));
+        Accent = Theme.Br(Theme.Accent(_dark)); AccentFg = Theme.Br(Theme.AccentFg(_dark));
+        Danger = Theme.Br(Theme.Danger(_dark)); Warning = Theme.Br(Theme.Warning(_dark));
+    }
+
+    ControlTemplate FlatButtonTemplate()
+    {
+        var border = new FrameworkElementFactory(typeof(Border));
+        border.SetBinding(Border.BackgroundProperty, new Binding("Background") { RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent) });
+        border.SetBinding(Border.BorderBrushProperty, new Binding("BorderBrush") { RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent) });
+        border.SetBinding(Border.BorderThicknessProperty, new Binding("BorderThickness") { RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent) });
+        border.SetValue(Border.CornerRadiusProperty, new CornerRadius(Theme.RadSmall));
+        var presenter = new FrameworkElementFactory(typeof(ContentPresenter));
+        presenter.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+        presenter.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
+        presenter.SetBinding(ContentPresenter.MarginProperty, new Binding("Padding") { RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent) });
+        border.AppendChild(presenter);
+        return new ControlTemplate(typeof(Button)) { VisualTree = border };
+    }
+
     void Build()
     {
         var root = new DockPanel();
         var head = new Border { Background = Surface, BorderBrush = Line,
-            BorderThickness = new Thickness(0, 0, 0, 1), Padding = new Thickness(22, 18, 22, 16) };
+            BorderThickness = new Thickness(0, 0, 0, 1), Padding = new Thickness(Theme.PadApp) };
         DockPanel.SetDock(head, Dock.Top);
         var headRow = new DockPanel();
-        _count = new TextBlock { Foreground = Muted, FontSize = 12, VerticalAlignment = VerticalAlignment.Center };
+        _count = new TextBlock { Foreground = Muted, FontSize = Theme.FsMeta, VerticalAlignment = VerticalAlignment.Center };
         DockPanel.SetDock(_count, Dock.Right); headRow.Children.Add(_count);
         var titles = new StackPanel();
-        titles.Children.Add(new TextBlock { Text = "承認が必要です", Foreground = Fg,
-            FontSize = 20, FontWeight = FontWeights.SemiBold });
-        titles.Children.Add(new TextBlock { Text = "内容を確認して、この場で承認または拒否できます。",
-            Foreground = Muted, FontSize = 12, Margin = new Thickness(0, 4, 0, 0) });
+        titles.Children.Add(new TextBlock { Text = L("承認が必要です", "Approval required"), Foreground = Fg,
+            FontSize = Theme.FsTitle, FontWeight = FontWeights.SemiBold });
+        titles.Children.Add(new TextBlock { Text = L("対象と影響を確認して判断します。", "Review the exact scope and impact before deciding."),
+            Foreground = Muted, FontSize = Theme.FsMeta, Margin = new Thickness(0, 4, 0, 0) });
         headRow.Children.Add(titles); head.Child = headRow; root.Children.Add(head);
 
         var footer = new Border { Background = Surface, BorderBrush = Line,
-            BorderThickness = new Thickness(0, 1, 0, 0), Padding = new Thickness(22, 14, 22, 16) };
+            BorderThickness = new Thickness(0, 1, 0, 0), Padding = new Thickness(Theme.PadApp) };
         DockPanel.SetDock(footer, Dock.Bottom);
         var actions = new DockPanel();
-        var later = new Button { Content = "あとで", Padding = new Thickness(16, 7, 16, 7),
-            Background = Brushes.Transparent, Foreground = Muted, BorderBrush = Line, Cursor = Cursors.Hand };
+        var later = new Button { Content = L("あとで", "Later"), Padding = new Thickness(16, 7, 16, 7),
+            Background = SurfaceSubtle, Foreground = Fg, BorderBrush = Line, BorderThickness = new Thickness(1), Cursor = Cursors.Hand };
+        later.Template = FlatButtonTemplate();
         later.Click += delegate { Close(); }; DockPanel.SetDock(later, Dock.Right); actions.Children.Add(later);
-        _deny = new Button { Content = "拒否", Padding = new Thickness(18, 7, 18, 7),
+        _deny = new Button { Content = L("拒否", "Deny"), Padding = new Thickness(18, 7, 18, 7),
             Margin = new Thickness(0, 0, 8, 0), Background = Brushes.Transparent,
-            Foreground = Danger, BorderBrush = Danger, Cursor = Cursors.Hand };
+            Foreground = Danger, BorderBrush = Danger, BorderThickness = new Thickness(1), Cursor = Cursors.Hand };
+        _deny.Template = FlatButtonTemplate();
         _deny.Click += delegate { Answer("denied"); }; DockPanel.SetDock(_deny, Dock.Right); actions.Children.Add(_deny);
-        _approve = new Button { Content = "承認", Padding = new Thickness(22, 8, 22, 8),
-            Margin = new Thickness(0, 0, 8, 0), Background = Accent, Foreground = Brushes.White,
+        _approve = new Button { Content = L("承認", "Approve"), Padding = new Thickness(22, 8, 22, 8),
+            Margin = new Thickness(0, 0, 8, 0), Background = Accent, Foreground = AccentFg,
             BorderThickness = new Thickness(0), FontWeight = FontWeights.SemiBold, Cursor = Cursors.Hand };
+        _approve.Template = FlatButtonTemplate();
         _approve.Click += delegate { Answer("approved"); }; DockPanel.SetDock(_approve, Dock.Right); actions.Children.Add(_approve);
         footer.Child = actions; root.Children.Add(footer);
 
         var scroll = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
             HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
-        var body = new StackPanel { Margin = new Thickness(22, 18, 22, 22) };
-        _kind = new TextBlock { Foreground = Muted, FontSize = 11, FontWeight = FontWeights.SemiBold };
-        body.Children.Add(_kind);
-        _question = new TextBlock { Foreground = Fg, FontSize = 15, FontWeight = FontWeights.SemiBold,
+        var body = new StackPanel { Margin = new Thickness(Theme.PadApp) };
+        var decisionCard = new Border { Background = Surface, BorderBrush = Warning,
+            BorderThickness = new Thickness(Theme.RailW, 1, 1, 1), CornerRadius = new CornerRadius(Theme.RadCard),
+            Padding = new Thickness(14, 12, 14, 12) };
+        var decisionCol = new StackPanel();
+        _kind = new TextBlock { Foreground = Muted, FontSize = Theme.FsMeta, FontWeight = FontWeights.SemiBold };
+        decisionCol.Children.Add(_kind);
+        _question = new TextBlock { Foreground = Fg, FontSize = Theme.FsBody, FontWeight = FontWeights.SemiBold,
             TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 0) };
-        body.Children.Add(_question);
-        var detailBox = new Border { Background = Surface, BorderBrush = Line, BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(7), Padding = new Thickness(12), Margin = new Thickness(0, 14, 0, 0) };
-        _context = new TextBlock { Foreground = Muted, FontFamily = new FontFamily("Cascadia Mono, Consolas"),
-            FontSize = 11, TextWrapping = TextWrapping.Wrap };
-        detailBox.Child = _context; body.Children.Add(detailBox);
+        decisionCol.Children.Add(_question);
+        var detailBox = new Border { Background = SurfaceSubtle, BorderBrush = Line, BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(Theme.RadSmall), Padding = new Thickness(12), Margin = new Thickness(0, 12, 0, 0) };
+        _context = new TextBlock { Foreground = Muted, FontFamily = new FontFamily(Theme.CodeFont),
+            FontSize = Theme.FsLog, TextWrapping = TextWrapping.Wrap };
+        detailBox.Child = _context; decisionCol.Children.Add(detailBox); decisionCard.Child = decisionCol; body.Children.Add(decisionCard);
 
-        var policyBox = new Border { BorderBrush = Line, BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(7), Padding = new Thickness(12), Margin = new Thickness(0, 18, 0, 0) };
+        var policyBox = new Border { Background = SurfaceSubtle, BorderBrush = Line, BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(Theme.RadCard), Padding = new Thickness(14, 12, 14, 12), Margin = new Thickness(0, Theme.SectionGap, 0, 0) };
         var policyCol = new StackPanel();
-        policyCol.Children.Add(new TextBlock { Text = "今後の操作承認", Foreground = Fg,
-            FontSize = 12, FontWeight = FontWeights.SemiBold });
+        policyCol.Children.Add(new TextBlock { Text = L("今後の操作承認", "Approval policy"), Foreground = Fg,
+            FontSize = Theme.FsSection, FontWeight = FontWeights.SemiBold });
         _policy = new ComboBox { Margin = new Thickness(0, 8, 0, 0), MinWidth = 220,
             HorizontalAlignment = HorizontalAlignment.Left, Background = Surface, Foreground = Fg };
-        AddPolicyItem("確認（推奨）", "default"); AddPolicyItem("自動", "auto"); AddPolicyItem("バイパス", "bypass");
+        AddPolicyItem(L("確認（推奨）", "Confirm (recommended)"), "default");
+        AddPolicyItem(L("自動", "Auto"), "auto"); AddPolicyItem(L("バイパス", "Bypass"), "bypass");
         _policy.SelectionChanged += PolicyChanged; policyCol.Children.Add(_policy);
-        _policyHelp = new TextBlock { Foreground = Muted, FontSize = 11, TextWrapping = TextWrapping.Wrap,
+        _policyHelp = new TextBlock { Foreground = Muted, FontSize = Theme.FsMeta, TextWrapping = TextWrapping.Wrap,
             Margin = new Thickness(0, 7, 0, 0) }; policyCol.Children.Add(_policyHelp);
         policyBox.Child = policyCol; body.Children.Add(policyBox);
         scroll.Content = body; root.Children.Add(scroll); Content = root;
@@ -206,7 +273,7 @@ class ApprovalPromptWindow : Window
     }
 
     void AddPolicyItem(string label, string value)
-    { _policy.Items.Add(new ComboBoxItem { Content = label, Tag = value, Foreground = Brushes.Black }); }
+    { _policy.Items.Add(new ComboBoxItem { Content = label, Tag = value, Foreground = Fg, Background = Surface }); }
 
     string SelectedPolicy()
     { var item = _policy.SelectedItem as ComboBoxItem; return item == null ? "default" : (string)item.Tag; }
@@ -228,9 +295,10 @@ class ApprovalPromptWindow : Window
         string oldMode = ReadPolicy(), mode = SelectedPolicy();
         if (mode == "bypass")
         {
-            string warning = "バイパスではローカルジョブと自律契約の手動確認を省略します。\n" +
-                "STOP条件、ファイル範囲、外部Skillの初回・変更承認は残ります。\n\n本当に有効にしますか？";
-            if (MessageBox.Show(this, warning, "バイパスを有効化", MessageBoxButton.YesNo,
+            string warning = L(
+                "バイパスではローカルジョブと自律契約の手動確認を省略します。\nSTOP条件、ファイル範囲、外部Skillの初回・変更承認は残ります。\n\n本当に有効にしますか？",
+                "Bypass skips manual approval for local jobs and autonomy contracts.\nSTOP rules, path limits, and external-Skill approval remain.\n\nEnable it?");
+            if (MessageBox.Show(this, warning, L("バイパスを有効化", "Enable bypass"), MessageBoxButton.YesNo,
                 MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes)
             { SelectPolicy(oldMode); return; }
         }
@@ -241,9 +309,12 @@ class ApprovalPromptWindow : Window
     {
         if (_policyHelp == null) return;
         string mode = SelectedPolicy();
-        if (mode == "auto") _policyHelp.Text = "安全判定が通った操作は自動実行。要確認はここで承認、禁止判定は拒否します。";
-        else if (mode == "bypass") _policyHelp.Text = "手動確認を省略します。STOP条件・パス制限・外部Skillのハッシュ承認は解除しません。";
-        else _policyHelp.Text = "初回の操作クラスを確認し、承認済みでも危険な内容は毎回確認します。";
+        if (mode == "auto") _policyHelp.Text = L("安全判定が通った操作は自動実行。要確認はここで承認、禁止判定は拒否します。",
+            "Safe operations run automatically; risky ones ask here; prohibited ones are denied.");
+        else if (mode == "bypass") _policyHelp.Text = L("手動確認を省略します。STOP条件・パス制限・外部Skillのハッシュ承認は解除しません。",
+            "Skip manual confirmation. STOP rules, path limits, and external-Skill hash approval remain.");
+        else _policyHelp.Text = L("初回の操作クラスを確認し、承認済みでも危険な内容は毎回確認します。",
+            "Confirm first-seen operation classes; risky payloads still ask every time.");
     }
 
     public static string ReadPolicy()
@@ -332,11 +403,13 @@ class ApprovalPromptWindow : Window
         bool high = hay.Contains("contract gate: delete") || hay.Contains("outbound") ||
                     hay.Contains("shell_destructive") || hay.Contains("destructive shell");
         bool expired = D(gate, "expires_at") > 0 && D(gate, "expires_at") < NowUnix();
-        _kind.Text = (skill ? "EXTERNAL SKILL" : high ? "HIGH IMPACT" : "OPERATION") + (expired ? "  ·  期限切れ" : "");
-        _kind.Foreground = expired || high ? Danger : Muted;
+        _kind.Text = (skill ? L("外部Skill", "External Skill") : high ? L("影響の大きい操作", "High impact") : L("操作", "Operation")) +
+            (expired ? L("  ·  期限切れ", "  ·  Expired") : "");
+        _kind.Foreground = expired || high ? Danger : Warning;
         _question.Text = S(gate, "question"); _context.Text = S(gate, "context");
         _approve.IsEnabled = !expired; _deny.IsEnabled = true;
-        if (skill) _policyHelp.Text = "外部Skillはこの設定に関係なく、初回と内容変更時に必ずハッシュ承認します。";
+        if (skill) _policyHelp.Text = L("外部Skillはこの設定に関係なく、初回と内容変更時に必ずハッシュ承認します。",
+            "External Skills always require hash approval on first use and after changes, regardless of this policy.");
         else UpdatePolicyHelp();
         RefreshPendingCount();
     }
@@ -347,7 +420,7 @@ class ApprovalPromptWindow : Window
         int count = 0;
         try { foreach (string path in Directory.GetFiles(_gateDir, "gate_*.json"))
         { var gate = ReadGate(path); if (gate != null && !Answered(gate)) count++; } } catch { }
-        _count.Text = count + " 件待機";
+        _count.Text = _lang == 0 ? count + " 件待機" : count + " pending";
     }
 
     void Answer(string verdict)
@@ -357,8 +430,9 @@ class ApprovalPromptWindow : Window
         bool high = hay.Contains("contract gate: delete") || hay.Contains("outbound") ||
                     hay.Contains("shell_destructive") || hay.Contains("destructive shell");
         if (verdict == "approved" && high && MessageBox.Show(this,
-            "影響の大きい操作です。対象を確認したうえで本当に承認しますか？\n\n" + S(_current, "question"),
-            "最終確認", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes) return;
+            L("影響の大きい操作です。対象を確認したうえで本当に承認しますか？\n\n",
+              "This is a high-impact operation. Approve after reviewing the exact scope?\n\n") + S(_current, "question"),
+            L("最終確認", "Final confirmation"), MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes) return;
         try
         {
             var gate = ReadGate(_currentPath); if (gate == null) return;
