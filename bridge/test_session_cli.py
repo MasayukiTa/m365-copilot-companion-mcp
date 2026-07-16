@@ -573,7 +573,7 @@ def test_skill_admin_create_and_approve_flow_is_local(tmp_path, monkeypatch, cap
     )
     out = capsys.readouterr().out
     assert "created and trusted local Skill /my-local" in out
-    assert (project / ".claude" / "skills" / "my-local" / "SKILL.md").is_file()
+    assert (project / "skills" / "my-local" / "SKILL.md").is_file()
 
 
 def test_unknown_slash_command_is_forwarded_for_dynamic_skills(capsys):

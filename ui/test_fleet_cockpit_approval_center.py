@@ -73,3 +73,12 @@ def test_health_repairs_have_immediate_busy_feedback():
     assert "_healthWake.Set()" in SOURCE
     assert 'kind == "checking" || kind == "starting"' in SOURCE
     assert 'Path.GetDirectoryName(Path.GetFullPath(_statusPath))' in SOURCE
+
+
+def test_tab_configuration_lives_in_settings_and_header_is_runtime_only():
+    assert 'ctrls.Children.Add(AutoscaleControls())' not in SOURCE
+    assert 'col.Children.Add(AutoscaleControls())' in SOURCE
+    assert 'T("autoscale") + ": " + (_autoscale ? "ON" : "OFF")' in SOURCE
+    assert '_workerChipBorder.Visibility = Visibility.Collapsed;' in SOURCE
+    assert 'UpdateWorkerChip(openTabs, liveCap, runningNow);' in SOURCE
+    assert '"タブ " + open + "/" + cap' in SOURCE
