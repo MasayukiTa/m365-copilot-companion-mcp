@@ -32,7 +32,7 @@ def _call(fn, *args, **kwargs):
 
 
 def claim_turn(job_id: str, expected_seq: int, worker_id: str,
-               lease_seconds: int = 300) -> dict:
+               lease_seconds: int = 3600) -> dict:
     """Claim an operator-authored LOCAL_LOOP turn after RUN; requires unlock."""
     error = require_unlocked()
     if error:

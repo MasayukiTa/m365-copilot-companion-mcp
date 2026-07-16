@@ -215,6 +215,33 @@ def test_retryable_abort_releases_lease_and_restart_recovers(tmp_path):
     assert reopened.get_job_status("job_1")["retry_count"] == 1
 
 
+def test_controller_retry_fences_late_commit_and_preserves_sequence(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job(), now=0)
+    first = store.claim_turn("job_1", 1, "stalled-browser", now=1)
+
+    retry = store.retry_uncommitted_turn(
+        "job_1", 1, "response finished without commit", now=2,
+    )
+
+    assert retry == {
+        "ok": True, "idempotent": False, "status": "READY", "retry_count": 1,
+    }
+    with pytest.raises(JobStoreError) as stale:
+        store.commit_turn(
+            "job_1", 1, first["lease_id"], first["fencing_token"],
+            "CANDIDATE_DONE", "late result", now=3,
+        )
+    assert stale.value.code == "LEASE_MISMATCH"
+    second = store.claim_turn("job_1", 1, "replacement-browser", now=4)
+    assert second["fencing_token"] == first["fencing_token"] + 1
+    assert store.get_job_status("job_1")["retry_count"] == 1
+    assert any(
+        event["event"] == "TURN_CONTROLLER_RETRY"
+        for event in store.get_job_status("job_1", event_limit=20)["events"]
+    )
+
+
 def test_deep_review_unsafe_abort_is_rescoped_instead_of_failed(tmp_path):
     store = _store(tmp_path)
     job = _job()

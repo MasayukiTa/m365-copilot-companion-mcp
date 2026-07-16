@@ -177,6 +177,7 @@ class LocalLoopController:
                  js_heap_limit_mb: float = 0,
                  dom_node_limit: int = 0,
                  edge_mb_limit: float = 0,
+                 no_commit_idle_seconds: float = 8,
                  rotate_driver=None, consent_probe=None, metrics_probe=None,
                  acceptance_runner=run_acceptance_checks,
                  sleep_fn=time.sleep, monotonic_fn=time.monotonic):
@@ -192,6 +193,7 @@ class LocalLoopController:
         self.js_heap_limit_mb = max(0.0, float(js_heap_limit_mb))
         self.dom_node_limit = max(0, int(dom_node_limit))
         self.edge_mb_limit = max(0.0, float(edge_mb_limit))
+        self.no_commit_idle_seconds = max(1.0, float(no_commit_idle_seconds))
         self.rotate_driver = rotate_driver
         self.consent_probe = consent_probe
         self.metrics_probe = metrics_probe or (lambda drv: {})
@@ -269,9 +271,20 @@ class LocalLoopController:
             )
             return None
 
-    def _wait_for_commit(self, seq: int, retry_count_before: int = 0) -> dict | None:
+    def _response_block_count(self) -> int | None:
+        probe = getattr(self.driver, "response_block_count", None)
+        if probe is None:
+            return None
+        try:
+            return int(probe())
+        except Exception:
+            return None
+
+    def _wait_for_commit(self, seq: int, retry_count_before: int = 0,
+                         response_count_before: int | None = None) -> dict | None:
         deadline = self.monotonic() + self.turn_timeout_seconds
         next_consent_probe = self.monotonic()
+        idle_without_commit_since = None
         while self.monotonic() < deadline:
             if self._drain_commands():
                 return None
@@ -292,6 +305,28 @@ class LocalLoopController:
                 if self.store.get_job_status(self.job_id)["status"] in INTERACTION_WAIT_STATUSES:
                     return None
                 next_consent_probe = self.monotonic() + 5.0
+            response_count = self._response_block_count()
+            response_arrived = (
+                response_count_before is not None and response_count is not None
+                and response_count > response_count_before
+            )
+            if response_arrived:
+                try:
+                    generating = bool(self.driver._is_generating())
+                except Exception:
+                    generating = True
+                if not generating:
+                    if idle_without_commit_since is None:
+                        idle_without_commit_since = self.monotonic()
+                    elif self.monotonic() - idle_without_commit_since >= self.no_commit_idle_seconds:
+                        self.store.record_event(self.job_id, "TURN_FINISHED_WITHOUT_COMMIT", {
+                            "response_blocks_before": response_count_before,
+                            "response_blocks_after": response_count,
+                            "idle_seconds": self.no_commit_idle_seconds,
+                        }, seq)
+                        return {"status": "NO_COMMIT_AFTER_RESPONSE"}
+                else:
+                    idle_without_commit_since = None
             self._project()
             self.sleep(self.poll_seconds)
         self.store.record_event(self.job_id, "TURN_COMMIT_TIMEOUT", {"timeout_s": self.turn_timeout_seconds}, seq)
@@ -399,14 +434,40 @@ class LocalLoopController:
                 trigger += f" plan={turn_number}/{len(turn_plan)}"
             if bool(constraints.get("read_only")):
                 trigger += " mode=read-only"
-            self.driver.send(trigger, track_answer=False)
+            response_count_before = self._response_block_count()
+            try:
+                self.driver.send(trigger, track_answer=False)
+            except Exception as exc:
+                reason = f"send failed: {type(exc).__name__}: {exc}"
+                self.store.record_event(self.job_id, "UI_TRIGGER_FAILED", {
+                    "seq": seq, "worker_id": self.worker_id, "reason": reason,
+                }, seq)
+                self.store.retry_uncommitted_turn(self.job_id, seq, reason)
+                sent_attempts += 1
+                if not self._rotate("send failed"):
+                    self.store.mark_waiting_runtime(
+                        self.job_id, "send failed; no replacement conversation",
+                    )
+                    self._project()
+                    return "WAITING_RUNTIME"
+                continue
             self.store.record_event(self.job_id, "UI_TRIGGER_SENT", {
                 "seq": seq, "worker_id": self.worker_id,
             }, seq)
             sent_attempts += 1
             self.turns_in_conversation += 1
 
-            commit = self._wait_for_commit(seq, retry_count_before)
+            commit = self._wait_for_commit(seq, retry_count_before, response_count_before)
+            if commit is not None and commit.get("status") == "NO_COMMIT_AFTER_RESPONSE":
+                reason = "browser response finished without LOCAL_LOOP commit"
+                self.store.retry_uncommitted_turn(self.job_id, seq, reason)
+                if not self._rotate("response finished without commit"):
+                    self.store.mark_waiting_runtime(
+                        self.job_id, reason + "; no replacement conversation",
+                    )
+                    self._project()
+                    return "WAITING_RUNTIME"
+                continue
             if commit is None:
                 current_status = self.store.get_job_status(self.job_id)["status"]
                 if current_status == "CANCELLED":
@@ -414,6 +475,9 @@ class LocalLoopController:
                 if current_status in PAUSED_STATUSES:
                     self._project()
                     return current_status
+                self.store.retry_uncommitted_turn(
+                    self.job_id, seq, "LOCAL_LOOP commit timeout",
+                )
                 if not self._rotate("commit timeout"):
                     self.store.mark_waiting_runtime(self.job_id, "commit timeout; no replacement conversation")
                     self._project()

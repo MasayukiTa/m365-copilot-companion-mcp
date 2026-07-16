@@ -595,6 +595,13 @@ class CopilotWebDriver:
     def _answers(self):
         return self.page.locator(COPILOT_SELECTORS["assistant_msg"])
 
+    def response_block_count(self) -> int:
+        """Return only the number of assistant blocks; never read response content."""
+        try:
+            return int(self._answers().count())
+        except Exception:
+            return 0
+
     # Priority-ordered candidates: exact labels first, broad fallbacks LAST. The broad
     # substring candidates can match imposters -- observed live 2026-06-13: the
     # composer-expand toggle is labeled "[Copilot にメッセージを送信する] 入力ボックスを
@@ -896,6 +903,7 @@ class CopilotWebDriver:
     # not consume the transient/Stuck budget), so a too-short value here is what caused the
     # W0 STUCK (send into a generating turn). Per-call overridable via send(gen_wait_s=...).
     GEN_WAIT_S = 240.0
+    SUBMIT_ACK_WAIT_S = 15.0
 
     def send(self, text: str, gen_wait_s: float | None = None,
              track_answer: bool = True) -> None:
@@ -940,6 +948,8 @@ class CopilotWebDriver:
         one_line = " ".join(str(text).split())
         # remember how many answer blocks exist now, so wait_for_idle can detect a
         # genuinely NEW one (rather than re-reading the previous turn's answer).
+        start_url = str(getattr(self.page, "url", "") or "")
+        fresh_conversation = "/conversation/" not in start_url.lower()
         if track_answer:
             try:
                 self._count_before = self._answers().count()
@@ -995,7 +1005,25 @@ class CopilotWebDriver:
             for i in range(48):                  # up to ~12s
                 self.page.wait_for_timeout(250)
                 if not self._composer_text():
-                    return  # composer emptied => message was submitted
+                    # On a fresh agent page the composer can be cleared by an SPA reset even
+                    # though no message was submitted.  Require a response-independent receipt:
+                    # a conversation URL, a live generation control, or a new response block.
+                    if not fresh_conversation:
+                        return
+                    ack_deadline = time.time() + self.SUBMIT_ACK_WAIT_S
+                    while time.time() < ack_deadline:
+                        current_url = str(getattr(self.page, "url", "") or "")
+                        if "/conversation/" in current_url.lower() or self._is_generating():
+                            return
+                        self.page.wait_for_timeout(250)
+                    self._snapshot_send_failure(
+                        attempt=attempt, phase="composer_cleared_without_turn_ack",
+                        allow_answer_content=track_answer,
+                    )
+                    raise RuntimeError(
+                        "send failed: composer cleared without a conversation or "
+                        "generation acknowledgement"
+                    )
                 # STRONGER success signal: if a new answer block has appeared, the agent
                 # is already replying, so the send DID go through -- even if the composer
                 # is slow to visually clear under memory pressure. Without this, a laggy
