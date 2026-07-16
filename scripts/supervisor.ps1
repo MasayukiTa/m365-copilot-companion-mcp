@@ -218,6 +218,9 @@ function Start-TunnelHost {
 #
 # Opt-out: set MCP_FLEET_AUTORESUME=0 (or false/no/off) in the environment. Default ON.
 $FleetMarkerPath = Join-Path $Root ".fleet\fleet_run_active.json"
+$ReviewMarkerPath = Join-Path $Root ".fleet\review_run_active.json"
+$script:LastReviewResumeKey = ""
+$script:LastReviewResumeAttempt = [datetime]::MinValue
 
 function Test-FleetAutoResumeEnabled {
     $v = $env:MCP_FLEET_AUTORESUME
@@ -291,10 +294,86 @@ function Invoke-FleetAutoResume {
     }
 }
 
+function Test-ReviewAutoResumeEnabled {
+    $v = $env:MCP_REVIEW_AUTORESUME
+    if ([string]::IsNullOrWhiteSpace($v)) { return $true }
+    return -not ($v -in @("0", "false", "False", "FALSE", "no", "No", "NO", "off", "Off", "OFF"))
+}
+
+function Get-ReviewActiveMarker {
+    if (-not (Test-Path $ReviewMarkerPath)) { return $null }
+    try {
+        return (Get-Content -Path $ReviewMarkerPath -Raw -ErrorAction Stop) |
+            ConvertFrom-Json -ErrorAction Stop
+    } catch { return $null }
+}
+
+function Test-ReviewMarkerProcessAlive {
+    param($Marker)
+    $procId = 0
+    $markerStarted = 0.0
+    try {
+        $procId = [int]$Marker.pid
+        $markerStarted = [double]$Marker.started
+    } catch { return $false }
+    if ($procId -le 0) { return $false }
+    $process = Get-Process -Id $procId -ErrorAction SilentlyContinue
+    if ($null -eq $process) { return $false }
+    # A PID can be reused after a reboot. The real coordinator necessarily started no
+    # later than its marker; a newer process with the same PID must not suppress recovery.
+    try {
+        $processStarted = [DateTimeOffset]::new($process.StartTime).ToUnixTimeSeconds()
+        if ($markerStarted -gt 0 -and $processStarted -gt ($markerStarted + 60)) {
+            return $false
+        }
+        if ($process.ProcessName -notlike "python*") { return $false }
+    } catch { return $false }
+    return $true
+}
+
+function Invoke-ReviewAutoResume {
+    # Unlike the legacy fleet marker, check this on EVERY supervisor cycle. A multi-hour
+    # LOCAL_LOOP pipeline can lose its coordinator without a reboot; waiting for the next
+    # Windows startup would defeat overnight resilience.
+    if (-not (Test-ReviewAutoResumeEnabled)) { return $false }
+    $marker = Get-ReviewActiveMarker
+    if ($null -eq $marker) { return $false }
+    $procId = 0
+    try { $procId = [int]$marker.pid } catch { return $false }
+    if (Test-ReviewMarkerProcessAlive $marker) { return $false }
+    try {
+        $retryAfter = [double]$marker.retry_after
+        $nowEpoch = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+        if ($retryAfter -gt $nowEpoch) { return $false }
+    } catch { }
+    $resumeArgs = @($marker.resume_argv)
+    if ($resumeArgs.Count -eq 0) {
+        Write-Log "review auto-resume skipped: marker has no resume_argv"
+        return $false
+    }
+    $key = "$($marker.started)|$($marker.stamp)|$($marker.restart_count)"
+    $since = ((Get-Date) - $script:LastReviewResumeAttempt).TotalSeconds
+    if ($key -eq $script:LastReviewResumeKey -and $since -lt 300) { return $false }
+    $script:LastReviewResumeKey = $key
+    $script:LastReviewResumeAttempt = Get-Date
+    $shown = $resumeArgs -join " "
+    Write-Log "review pipeline INTERRUPTED (marker pid $procId is dead) -> auto-resuming: python -m bench.review_run $shown"
+    try {
+        Start-Process -FilePath $Py -ArgumentList (@("-m", "bench.review_run") + $resumeArgs) `
+            -WorkingDirectory $Root -WindowStyle Hidden
+        Write-Log "review pipeline relaunched from durable stamp $($marker.stamp)"
+        return $true
+    } catch {
+        Write-Log "review auto-resume FAILED to relaunch: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 Write-Log "supervisor up (tunnel=$TunnelName port=$Port interval=${IntervalSeconds}s debounce=$FailuresBeforeAction)"
 
 # Checked once, here, before the forever health-check loop starts.
 Invoke-FleetAutoResume -DryRun:$FleetResumeDryRun | Out-Null
+Invoke-ReviewAutoResume | Out-Null
 
 $serverMiss = 0
 $tunnelMiss = 0
@@ -332,6 +411,7 @@ while ($true) {
         $reapOut = & $Py -c "import sys; sys.path.insert(0, r'$Root'); from relay.fleet_reaper import reap_stale_run; import json; r = reap_stale_run(); print(json.dumps(r) if r else '')" 2>$null
         if ($reapOut) { Write-Log "reaped stale fleet run: $reapOut" }
     } catch { }
+    Invoke-ReviewAutoResume | Out-Null
 
     if (Test-ServerUp) {
         $serverMiss = 0

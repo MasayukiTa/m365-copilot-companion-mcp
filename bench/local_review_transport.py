@@ -7,15 +7,22 @@ the small subset of relay.fleet_runner's snapshot consumed by those parsers.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
 import sys
 import time
-import uuid
 from pathlib import Path
 
 from relay.local_job_store import JobStoreError, LocalJobStore, TERMINAL_JOB_STATUSES
+
+
+CAMPAIGN_MANIFEST = "local_review_campaign.json"
+CONTROLLER_PAUSED_STATUSES = {
+    "WAITING_USER", "WAITING_EXTERNAL", "NEEDS_ROUTING", "WAITING_AUTH",
+    "WAITING_CONSENT", "WAITING_RUNTIME",
+}
 
 
 def _atomic_json(path: Path, payload: dict) -> None:
@@ -36,6 +43,97 @@ def _read_goals(path: str | os.PathLike) -> list[dict]:
             if isinstance(value, dict):
                 goals.append(value)
     return goals
+
+
+def _goals_digest(goals: list[dict]) -> str:
+    payload = json.dumps(goals, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _campaign_entries(state: Path, jobs_dir: Path, store: LocalJobStore,
+                      goals: list[dict]) -> tuple[list[dict], float, bool]:
+    """Create a durable campaign once, or reopen the exact same SQLite jobs.
+
+    Reusing job ids is the critical coordinator-crash/reboot property: restarting the
+    parent process must never create a second set of browser conversations for work that
+    is already committed in SQLite.
+    """
+    manifest_path = state / CAMPAIGN_MANIFEST
+    digest = _goals_digest(goals)
+    resumed = manifest_path.is_file()
+    if resumed:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        except Exception as exc:
+            raise RuntimeError(f"LOCAL_LOOP campaign manifest is unreadable: {exc}") from exc
+        if manifest.get("goals_digest") != digest or int(manifest.get("total", -1)) != len(goals):
+            raise RuntimeError(
+                "LOCAL_LOOP state directory already belongs to a different goal set"
+            )
+        rows = manifest.get("entries") if isinstance(manifest.get("entries"), list) else []
+        if len(rows) != len(goals):
+            raise RuntimeError("LOCAL_LOOP campaign manifest entry count is invalid")
+        started = float(manifest.get("started") or time.time())
+    else:
+        # Derive ids from state+goals and persist the manifest BEFORE creating jobs. If
+        # power is lost anywhere in bootstrap, the next process recreates only missing
+        # rows under the exact same ids instead of starting a duplicate campaign.
+        identity = (str(state.resolve()) + "\0" + digest).encode("utf-8")
+        campaign = hashlib.sha256(identity).hexdigest()[:12]
+        started = time.time()
+        rows = [{
+            "job_id": "deep_%s_%04d" % (campaign, index),
+            "worker": "w%d" % index,
+            "restart_count": 0,
+        } for index in range(len(goals))]
+        _atomic_json(manifest_path, {
+            "version": 1, "started": started, "goals_digest": digest,
+            "total": len(goals), "entries": rows,
+        })
+
+    entries = []
+    for index, (row, goal) in enumerate(zip(rows, goals)):
+        job_id = str(row.get("job_id") or "")
+        if not job_id:
+            raise RuntimeError("LOCAL_LOOP campaign manifest has an empty job id")
+        job = build_local_review_job(goal, job_id)
+        try:
+            store.get_job_status(job_id)
+        except JobStoreError as exc:
+            if exc.code != "JOB_NOT_FOUND":
+                raise
+            try:
+                store.create_job(job)
+            except JobStoreError as create_exc:
+                # A second recovering coordinator may have won the same deterministic
+                # insert. JOB_EXISTS is therefore success; every other error is real.
+                if create_exc.code != "JOB_EXISTS":
+                    raise
+        job_file = jobs_dir / (job_id + ".json")
+        _atomic_json(job_file, job)
+        entries.append({
+            "job_id": job_id,
+            "worker": str(row.get("worker") or "w%d" % index),
+            "goal": goal,
+            "job_file": job_file,
+            "worker_dir": jobs_dir / job_id,
+            "restart_count": int(row.get("restart_count", 0)),
+            "next_launch_at": 0.0,
+        })
+    return entries, started, resumed
+
+
+def _persist_restart_counts(state: Path, entries: list[dict]) -> None:
+    path = state / CAMPAIGN_MANIFEST
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8-sig"))
+        counts = {entry["job_id"]: int(entry.get("restart_count", 0)) for entry in entries}
+        for row in manifest.get("entries", []):
+            row["restart_count"] = counts.get(str(row.get("job_id")), 0)
+        _atomic_json(path, manifest)
+    except Exception:
+        # SQLite remains authoritative. Losing only the restart counter must not stop work.
+        pass
 
 
 def build_local_review_job(goal: dict, job_id: str) -> dict:
@@ -248,31 +346,23 @@ def run_local_review_fleet(
     if not db_path.is_absolute():
         db_path = Path(repo_root) / db_path
     store = LocalJobStore(db_path)
-    campaign = uuid.uuid4().hex[:12]
-    entries = []
-    for index, goal in enumerate(goals):
-        job_id = "deep_%s_%04d" % (campaign, index)
-        job = build_local_review_job(goal, job_id)
-        store.create_job(job)
-        job_file = jobs_dir / (job_id + ".json")
-        _atomic_json(job_file, job)
-        entries.append({
-            "job_id": job_id,
-            "worker": "w%d" % index,
-            "goal": goal,
-            "job_file": job_file,
-            "worker_dir": jobs_dir / job_id,
-        })
+    entries, started, resumed = _campaign_entries(state, jobs_dir, store, goals)
+    if resumed:
+        print("LOCAL_LOOP: resuming durable campaign from %s" % (state / CAMPAIGN_MANIFEST))
 
     effective = max(1, min(int(max_concurrent), int(os.environ.get(
         "MCP_LOCAL_REVIEW_MAX_CONCURRENT", "2"))))
     python_exe = python_exe or sys.executable
-    pending = list(entries)
-    active: dict[str, tuple[subprocess.Popen, object]] = {}
-    started = time.time()
+    pending = [entry for entry in entries
+               if store.get_job_status(entry["job_id"])["status"] not in
+               TERMINAL_JOB_STATUSES | CONTROLLER_PAUSED_STATUSES]
+    active: dict[str, tuple[subprocess.Popen, object, dict]] = {}
     status_path = state / "status.json"
     commands_path = state / "commands.json"
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    restart_cap = max(0, int(os.environ.get("MCP_LOCAL_CONTROLLER_MAX_RESTARTS", "0")))
+    restart_backoff_cap = max(1.0, float(os.environ.get(
+        "MCP_LOCAL_CONTROLLER_RESTART_BACKOFF_MAX", "60")))
 
     def launch(entry: dict) -> None:
         entry["worker_dir"].mkdir(parents=True, exist_ok=True)
@@ -291,21 +381,58 @@ def run_local_review_fleet(
             cmd, cwd=repo_root, env=dict(os.environ), stdout=log,
             stderr=subprocess.STDOUT, creationflags=creationflags,
         )
-        active[entry["worker"]] = (proc, log)
+        active[entry["worker"]] = (proc, log, entry)
+        store.record_event(entry["job_id"], "CONTROLLER_LAUNCHED", {
+            "pid": proc.pid, "restart_count": int(entry.get("restart_count", 0)),
+        })
 
     while pending or active:
+        now = time.time()
         while pending and len(active) < effective:
-            launch(pending.pop(0))
+            ready_index = next((index for index, entry in enumerate(pending)
+                                if float(entry.get("next_launch_at", 0)) <= now), None)
+            if ready_index is None:
+                break
+            launch(pending.pop(ready_index))
         stopped = _consume_console_commands(commands_path, store, entries)
         for worker in stopped:
             pair = active.get(worker)
             if pair and pair[0].poll() is None:
                 pair[0].terminate()
-        for worker, (proc, log) in list(active.items()):
+        for worker, (proc, log, entry) in list(active.items()):
             if proc.poll() is None:
                 continue
+            exit_code = proc.returncode
             log.close()
             active.pop(worker, None)
+            status = store.get_job_status(entry["job_id"])
+            store.record_event(entry["job_id"], "CONTROLLER_EXITED", {
+                "exit_code": exit_code, "job_status": status["status"],
+            })
+            if (worker not in stopped and status["status"] not in
+                    TERMINAL_JOB_STATUSES | CONTROLLER_PAUSED_STATUSES):
+                entry["restart_count"] = int(entry.get("restart_count", 0)) + 1
+                if restart_cap and entry["restart_count"] > restart_cap:
+                    store.mark_waiting_runtime(
+                        entry["job_id"],
+                        "controller restart limit reached (%d)" % restart_cap,
+                    )
+                else:
+                    try:
+                        store.retry_uncommitted_turn(
+                            entry["job_id"], int(status["current_seq"]),
+                            "controller exited unexpectedly with code %s" % exit_code,
+                        )
+                    except JobStoreError:
+                        pass
+                    backoff = min(restart_backoff_cap, 2 ** min(entry["restart_count"], 8))
+                    entry["next_launch_at"] = time.time() + backoff
+                    pending.append(entry)
+                    store.record_event(entry["job_id"], "CONTROLLER_RESTART_SCHEDULED", {
+                        "restart_count": entry["restart_count"], "backoff_seconds": backoff,
+                        "exit_code": exit_code,
+                    })
+                    _persist_restart_counts(state, entries)
         _atomic_json(status_path, _campaign_snapshot(
             store, entries, started, active_workers=set(active),
         ))
