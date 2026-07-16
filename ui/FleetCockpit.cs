@@ -142,6 +142,15 @@ class CockpitWindow : Window
     TextBlock _workerChip;       // live "N workers" neutral chip in the header controls row
     Border _workerChipBorder;   // the Border wrapping _workerChip (for PaintChrome re-theming)
     Button _themeBtn, _langBtn, _mainBtn, _siBtn;
+    Button _approvalCenterBtn;
+    TextBlock _approvalCenterLabel, _approvalCenterBadgeText;
+    Border _approvalCenterBadge;
+    Window _approvalCenterWindow;
+    StackPanel _approvalPendingHost, _approvalRecentHost;
+    TextBlock _approvalCenterSummary;
+    string _approvalCenterSig = "";
+    List<Dictionary<string, object>> _gateCache = new List<Dictionary<string, object>>();
+    double _gateCacheAt = 0;
     Button _overflowBtn;
     System.Windows.Controls.Primitives.Popup _overflowPopup;
     Border _headBar;
@@ -380,6 +389,7 @@ class CockpitWindow : Window
         // Effort selector + fleet-wide pause/stop (NEW)
         if (k == "effort") return ja ? "推論" : "Reasoning";
         if (k == "approval") return ja ? "承認" : "Approval";
+        if (k == "run_mode") return ja ? "実行方式" : "Run mode";
         if (k == "pause") return ja ? "一時停止" : "Pause";
         if (k == "resume") return ja ? "再開" : "Resume";
         if (k == "stopall") return ja ? "全停止" : "Stop all";
@@ -708,6 +718,7 @@ class CockpitWindow : Window
         ctrls.Children.Add(AutoscaleControls());
         ctrls.Children.Add(EffortControl());
         ctrls.Children.Add(ApprovalControl());
+        ctrls.Children.Add(ApprovalCenterControl());
         ctrls.Children.Add(FleetControls());
         // gear -> settings popup consolidating the scattered start/上限/retry/disk-floor controls.
         ctrls.Children.Add(SettingsControl());
@@ -2785,7 +2796,7 @@ class CockpitWindow : Window
                 {
                     string v = g0.Substring(10).Trim().ToLower();
                     if (v == "run" || v == "plan" || v == "auto")
-                    { _approval = v; SaveKey("approval", _approval); PaintApproval(); _goalInput.Text = ""; _startNote.Text = (_lang == 0 ? "承認モード→ " : "Approval set to ") + _approval; handled = true; }
+                    { _approval = v; SaveKey("approval", _approval); PaintApproval(); _goalInput.Text = ""; _startNote.Text = (_lang == 0 ? "実行方式→ " : "Run mode set to ") + _approval; handled = true; }
                 }
                 if (handled) return;
             }
@@ -3105,7 +3116,7 @@ class CockpitWindow : Window
         new[]{"/review","<対象> をレビューして問題点を箇条書きで挙げる"},
         new[]{"/research","<問い> を Claude で深掘り調査する"},
         new[]{"/effort","推論モードを設定: min|max|ultra|auto"},
-        new[]{"/approval","承認モードを設定: run|plan|auto"},
+        new[]{"/approval","実行方式を設定: run|plan|auto（互換コマンド）"},
     };
     static readonly string[][] _goalCommandsEn = {
         new[]{"/help","Show the command list"},
@@ -3220,7 +3231,7 @@ class CockpitWindow : Window
                             SaveKey("approval", _approval);
                             PaintApproval();
                             applied = true;
-                            if (_startNote != null) _startNote.Text = (_lang == 0 ? "承認モード→ " : "Approval set to ") + _approval;
+                            if (_startNote != null) _startNote.Text = (_lang == 0 ? "実行方式→ " : "Run mode set to ") + _approval;
                         }
                     }
                     if (applied)
@@ -3281,7 +3292,7 @@ class CockpitWindow : Window
                 + "max - deepest reasoning\n"
                 + "ultra - max + extra checks\n"
                 + "auto - pick per task\n"
-                + "\nApproval (top bar)\n"
+                + "\nRun mode (top bar)\n"
                 + "run - run now\n"
                 + "plan - wait for plan approval\n"
                 + "auto - plain fleet waits for plan approval\n"
@@ -3299,7 +3310,7 @@ class CockpitWindow : Window
             + "max - 最も深い推論\n"
             + "ultra - max + 追加チェック\n"
             + "auto - タスクに応じ自動\n"
-            + "\n承認（上部設定）\n"
+            + "\n実行方式（上部設定）\n"
             + "run - 即実行\n"
             + "plan - 計画承認待ち\n"
             + "auto - 通常フリートは計画承認待ち\n"
@@ -3795,7 +3806,7 @@ class CockpitWindow : Window
         effortVal.Margin = new Thickness(4, 0, 24, 0);
         effortRow.Children.Add(effortVal);
         var approvalLbl = new TextBlock();
-        approvalLbl.Text = (ja ? "承認 / Approval: " : "Approval: ");
+        approvalLbl.Text = (ja ? "実行方式 / Run mode: " : "Run mode: ");
         approvalLbl.FontSize = 12;
         approvalLbl.Foreground = Theme.Br(Theme.Muted(_dark));
         approvalLbl.VerticalAlignment = VerticalAlignment.Center;
@@ -4473,8 +4484,9 @@ class CockpitWindow : Window
         return st;
     }
 
-    // Approval selector: compact run/plan/auto mode next to effort. This avoids adding another
-    // header button in the already-dense fleet toolbar.
+    // Run-mode selector: run/plan/auto controls how a task starts.  It is intentionally labelled
+    // separately from the Approval Center; the old "Approval" label made users expect this combo
+    // to contain the actual pending decisions.
     static readonly string[] _approvalModes = { "run", "plan", "auto" };
     UIElement ApprovalControl()
     {
@@ -4487,13 +4499,13 @@ class CockpitWindow : Window
 
         _approvalBox = new ComboBox();
         _approvalBox.ToolTip = _lang == 0
-            ? "承認モード: run=すぐ実行、plan=計画承認待ち、auto=通常フリートは計画承認待ち/フォルダ自律はGO-ASK-STOP判定"
-            : "Approval mode: run=run now, plan=wait for approval, auto=plain fleet waits for plan approval; folder autonomy uses GO/ASK/STOP";
+            ? "実行方式: run=すぐ実行、plan=計画承認待ち、auto=通常フリートは計画承認待ち/フォルダ自律はGO-ASK-STOP判定"
+            : "Run mode: run=run now, plan=wait for approval, auto=plain fleet waits for plan approval; folder autonomy uses GO/ASK/STOP";
         _approvalBox.Cursor = Cursors.Hand; _approvalBox.FontSize = 12;
         _approvalBox.FontWeight = FontWeights.SemiBold; _approvalBox.MinWidth = 74;
         _approvalBox.Padding = new Thickness(8, 2, 4, 2);
         _approvalBox.VerticalAlignment = VerticalAlignment.Center;
-        System.Windows.Automation.AutomationProperties.SetName(_approvalBox, _lang == 0 ? "承認" : "Approval");
+        System.Windows.Automation.AutomationProperties.SetName(_approvalBox, _lang == 0 ? "実行方式" : "Run mode");
         FillComboWithHelp(_approvalBox, _approvalModes, ApprovalHelp(), _approval);  // per-option hover help
         _approvalBox.DropDownOpened += delegate { CloseHeaderPopups("approval"); };
         _approvalBox.SelectionChanged += delegate
@@ -4510,11 +4522,11 @@ class CockpitWindow : Window
     }
     void PaintApproval()
     {
-        if (_approvalLbl != null) { _approvalLbl.Text = T("approval"); _approvalLbl.Foreground = Muted; }
+        if (_approvalLbl != null) { _approvalLbl.Text = T("run_mode"); _approvalLbl.Foreground = Muted; }
         if (_approvalBox == null) return;
         if (!Equals(ComboVal(_approvalBox), _approval)) ComboSelectVal(_approvalBox, _approval);
         _approvalBox.Background = BtnBg; _approvalBox.Foreground = Fg; _approvalBox.BorderBrush = Border;
-        System.Windows.Automation.AutomationProperties.SetName(_approvalBox, _lang == 0 ? "承認" : "Approval");
+        System.Windows.Automation.AutomationProperties.SetName(_approvalBox, _lang == 0 ? "実行方式" : "Run mode");
         StyleFlatCombo(_approvalBox);   // same flat-template fix so the open list matches the theme
     }
 
@@ -4547,6 +4559,68 @@ class CockpitWindow : Window
                 { "run", "run: execute immediately, no approval step." },
                 { "plan", "plan: present a plan and pause at approval; steer the card to approve/edit." },
                 { "auto", "auto: plain fleet waits for plan approval; folder autonomy self-runs via GO-ASK-STOP." } };
+    }
+
+    // Persistent decision entry point.  Unlike the run-mode combo, this button represents actual
+    // human decisions and remains useful while the fleet is idle.
+    UIElement ApprovalCenterControl()
+    {
+        _approvalCenterBtn = new Button();
+        _approvalCenterBtn.Cursor = Cursors.Hand;
+        _approvalCenterBtn.BorderThickness = new Thickness(1);
+        _approvalCenterBtn.Padding = new Thickness(10, 3, 8, 3);
+        _approvalCenterBtn.Margin = new Thickness(0, 0, 12, 0);
+        _approvalCenterBtn.VerticalAlignment = VerticalAlignment.Center;
+        _approvalCenterBtn.Template = FlatButtonTemplate();
+
+        var row = new StackPanel(); row.Orientation = Orientation.Horizontal;
+        row.VerticalAlignment = VerticalAlignment.Center;
+        _approvalCenterLabel = new TextBlock();
+        _approvalCenterLabel.FontSize = 12; _approvalCenterLabel.FontWeight = FontWeights.SemiBold;
+        _approvalCenterLabel.VerticalAlignment = VerticalAlignment.Center;
+        row.Children.Add(_approvalCenterLabel);
+
+        _approvalCenterBadge = new Border();
+        _approvalCenterBadge.CornerRadius = new CornerRadius(8);
+        _approvalCenterBadge.MinWidth = 18; _approvalCenterBadge.Height = 18;
+        _approvalCenterBadge.Margin = new Thickness(7, 0, 0, 0);
+        _approvalCenterBadge.Padding = new Thickness(4, 0, 4, 0);
+        _approvalCenterBadgeText = new TextBlock();
+        _approvalCenterBadgeText.FontSize = 10; _approvalCenterBadgeText.FontWeight = FontWeights.Bold;
+        _approvalCenterBadgeText.HorizontalAlignment = HorizontalAlignment.Center;
+        _approvalCenterBadgeText.VerticalAlignment = VerticalAlignment.Center;
+        _approvalCenterBadge.Child = _approvalCenterBadgeText;
+        row.Children.Add(_approvalCenterBadge);
+        _approvalCenterBtn.Content = row;
+        _approvalCenterBtn.Click += delegate { CloseHeaderPopups(null); ShowApprovalCenter(); };
+        PaintApprovalCenterButton(0);
+        return _approvalCenterBtn;
+    }
+
+    void PaintApprovalCenterButton(int pending)
+    {
+        if (_approvalCenterBtn == null) return;
+        bool hasPending = pending > 0;
+        _approvalCenterBtn.Background = hasPending ? Theme.Br(Theme.SurfaceSubtle(_dark)) : BtnBg;
+        _approvalCenterBtn.BorderBrush = hasPending ? Theme.Br(Theme.Warning(_dark)) : Border;
+        _approvalCenterBtn.Foreground = Fg;
+        if (_approvalCenterLabel != null)
+        {
+            _approvalCenterLabel.Text = _lang == 0 ? "承認" : "Approvals";
+            _approvalCenterLabel.Foreground = hasPending ? Theme.Br(Theme.Warning(_dark)) : Fg;
+        }
+        if (_approvalCenterBadge != null)
+            _approvalCenterBadge.Background = hasPending ? Theme.Br(Theme.Warning(_dark)) : Theme.Br(Theme.SurfaceSubtle(_dark));
+        if (_approvalCenterBadgeText != null)
+        {
+            _approvalCenterBadgeText.Text = pending.ToString();
+            _approvalCenterBadgeText.Foreground = hasPending ? White : Muted;
+        }
+        string accessible = _lang == 0
+            ? ("承認センター、未処理 " + pending + " 件")
+            : ("Approval Center, " + pending + " pending");
+        _approvalCenterBtn.ToolTip = accessible;
+        System.Windows.Automation.AutomationProperties.SetName(_approvalCenterBtn, accessible);
     }
     void FillComboWithHelp(ComboBox cb, string[] opts, Dictionary<string, string> help, string current)
     {
@@ -5058,7 +5132,121 @@ class CockpitWindow : Window
         UpdateCapBanner(ReadStatus());
     }
 
-    // ── TASK 2 (Bucket C): gate approval banner build + update ───────────────────────────
+    // ── APPROVAL CENTER: durable gates, available even while the fleet is idle ───────────
+    string GateDirectory()
+    {
+        try
+        {
+            string raw = Environment.GetEnvironmentVariable("MCP_ALLOWED_BASE") ?? "";
+            if (string.IsNullOrWhiteSpace(raw)) raw = EnvValue("MCP_ALLOWED_BASE");
+            raw = (raw ?? "").Trim();
+            string basePath;
+            if (raw.Length == 0 || raw == "*")
+                basePath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            else
+            {
+                string[] roots = raw.Split(Path.PathSeparator);
+                basePath = roots.Length > 0 ? roots[0].Trim().Trim('"') : "";
+                if (basePath == "~") basePath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                else if (basePath.StartsWith("~" + Path.DirectorySeparatorChar) || basePath.StartsWith("~/"))
+                    basePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), basePath.Substring(2));
+                if (basePath.Length == 2 && basePath[1] == ':') basePath += Path.DirectorySeparatorChar;
+                if (basePath.Length == 0) basePath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            }
+            return Path.Combine(Path.GetFullPath(basePath), ".companion_gates");
+        }
+        catch (Exception)
+        {
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".companion_gates");
+        }
+    }
+
+    List<Dictionary<string, object>> ReadAllGates(Dictionary<string, object> statusRoot)
+    {
+        // A 1.5-second cache keeps the 700ms UI tick from repeatedly parsing a large audit history,
+        // while still surfacing new approvals promptly. AnswerGate invalidates it immediately.
+        double now = NowUnix();
+        if (now - _gateCacheAt < 1.5) return new List<Dictionary<string, object>>(_gateCache);
+        var gates = new List<Dictionary<string, object>>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            string dir = GateDirectory();
+            if (Directory.Exists(dir))
+            {
+                foreach (string p in Directory.GetFiles(dir, "gate_*.json"))
+                {
+                    try
+                    {
+                        string text;
+                        using (var fs = new FileStream(p, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                        using (var sr = new StreamReader(fs, Encoding.UTF8)) text = sr.ReadToEnd();
+                        var g = _js.DeserializeObject(text) as Dictionary<string, object>;
+                        if (g == null) continue;
+                        string token = S(g, "token");
+                        if (token.Length == 0) token = Path.GetFileNameWithoutExtension(p);
+                        g["token"] = token; g["path"] = p;
+                        if (seen.Add(token)) gates.Add(g);
+                    }
+                    catch (Exception) { }
+                }
+            }
+        }
+        catch (Exception) { }
+
+        gates.Sort(delegate (Dictionary<string, object> a, Dictionary<string, object> b)
+        { return Dbl(b, "asked_at").CompareTo(Dbl(a, "asked_at")); });
+        _gateCache = gates; _gateCacheAt = now;
+        return new List<Dictionary<string, object>>(_gateCache);
+    }
+
+    static bool GateAnswered(Dictionary<string, object> gate)
+    {
+        try { return gate.ContainsKey("answered") && Convert.ToBoolean(gate["answered"]); }
+        catch (Exception) { return false; }
+    }
+
+    static bool GateExpired(Dictionary<string, object> gate)
+    {
+        double expiry = Dbl(gate, "expires_at");
+        return expiry > 0 && expiry < NowUnix();
+    }
+
+    string GateKind(Dictionary<string, object> gate)
+    {
+        string token = S(gate, "token").ToLowerInvariant();
+        string hay = (S(gate, "context") + " " + S(gate, "question")).ToLowerInvariant();
+        if (token.StartsWith("gate_skill_") || hay.Contains("skill approval")) return _lang == 0 ? "Skill" : "Skill";
+        if (hay.Contains("contract gate: delete") || hay.Contains(" delete")) return _lang == 0 ? "削除" : "Delete";
+        if (hay.Contains("outbound") || hay.Contains("send_immediately")) return _lang == 0 ? "外部送信" : "External send";
+        if (hay.Contains("shell_destructive") || hay.Contains("destructive shell")) return _lang == 0 ? "破壊的shell" : "Destructive shell";
+        if (hay.Contains("task_router job class")) return _lang == 0 ? "ジョブ" : "Job";
+        return _lang == 0 ? "確認" : "Decision";
+    }
+
+    bool GateNeedsSecondConfirmation(Dictionary<string, object> gate)
+    {
+        string kind = GateKind(gate);
+        return kind == "削除" || kind == "Delete" || kind == "外部送信" ||
+               kind == "External send" || kind == "破壊的shell" || kind == "Destructive shell";
+    }
+
+    string GateAge(Dictionary<string, object> gate)
+    {
+        double age = Math.Max(0, NowUnix() - Dbl(gate, "asked_at"));
+        if (age < 60) return _lang == 0 ? "たった今" : "just now";
+        if (age < 3600) return ((int)(age / 60)).ToString() + (_lang == 0 ? "分前" : " min ago");
+        if (age < 86400) return ((int)(age / 3600)).ToString() + (_lang == 0 ? "時間前" : " hr ago");
+        return ((int)(age / 86400)).ToString() + (_lang == 0 ? "日前" : " days ago");
+    }
+
+    List<Dictionary<string, object>> PendingGates(Dictionary<string, object> root)
+    {
+        var pending = new List<Dictionary<string, object>>();
+        foreach (var gate in ReadAllGates(root)) if (!GateAnswered(gate)) pending.Add(gate);
+        return pending;
+    }
+
     // Builds the outer gate banner container (always Collapsed until a gate appears).
     UIElement BuildGateBanner()
     {
@@ -5080,20 +5268,12 @@ class CockpitWindow : Window
     {
         if (_gateBanner == null || _gateCardsPanel == null) return;
 
-        // Extract pending_gates array from root.
-        List<Dictionary<string, object>> gates = new List<Dictionary<string, object>>();
-        if (root != null)
-        {
-            object pgObj;
-            if (root.TryGetValue("pending_gates", out pgObj) && pgObj is object[])
-            {
-                foreach (object o in (object[])pgObj)
-                {
-                    var g = o as Dictionary<string, object>;
-                    if (g != null) gates.Add(g);
-                }
-            }
-        }
+        // Read the durable gate directory directly.  This is deliberately independent of
+        // status.json so Skill/import approvals remain visible before and after a fleet run.
+        List<Dictionary<string, object>> gates = PendingGates(root);
+        PaintApprovalCenterButton(gates.Count);
+        if (_approvalCenterWindow != null && _approvalCenterWindow.IsVisible)
+            RefreshApprovalCenter();
 
         // Build a signature from the current token set (order-insensitive for stability).
         var sb2 = new StringBuilder();
@@ -5130,7 +5310,6 @@ class CockpitWindow : Window
             string question = S(g2, "question");
             string context2 = S(g2, "context");
             string gatePath = S(g2, "path");
-            string token2 = S(g2, "token");
 
             // Question card.
             var gCard = new Border();
@@ -5174,12 +5353,22 @@ class CockpitWindow : Window
             approveBtn.FontSize = 12;
             approveBtn.Background = Theme.Br(Theme.Accent(_dark));
             approveBtn.Foreground = White;
-            approveBtn.Content = ja3 ? "承認 / Approve" : "Approve / 承認";
-            string gPath2 = gatePath; string gToken2 = token2;
+            bool reviewFirst = GateNeedsSecondConfirmation(g2) || GateKind(g2) == "Skill";
+            approveBtn.Content = reviewFirst
+                ? (ja3 ? "詳細を確認" : "Review details")
+                : (ja3 ? "承認 / Approve" : "Approve / 承認");
+            approveBtn.IsEnabled = !GateExpired(g2);
+            if (!approveBtn.IsEnabled)
+                approveBtn.ToolTip = ja3 ? "期限切れです。元の操作から承認を再要求してください。" : "Expired. Request approval again from the originating action.";
+            string gPath2 = gatePath;
+            Dictionary<string, object> capturedGate = g2;
             approveBtn.Click += delegate (object s2, RoutedEventArgs e2)
             {
                 e2.Handled = true;
-                AnswerGate(gPath2, "approved");
+                // High-impact operations require their exact scope to be reviewed in the
+                // Approval Center before the second confirmation is offered.
+                if (GateNeedsSecondConfirmation(capturedGate) || GateKind(capturedGate) == "Skill") ShowApprovalCenter();
+                else AnswerGate(gPath2, "approved");
             };
             btnRow.Children.Add(approveBtn);
 
@@ -5208,17 +5397,229 @@ class CockpitWindow : Window
 
         if (gates.Count > showCount)
         {
-            var moreTb = new TextBlock();
-            moreTb.Text = (ja3
+            var moreBtn = new Button();
+            moreBtn.Content = (ja3
                 ? ("+ さらに " + (gates.Count - showCount) + " 件の承認待ち")
                 : ("+ " + (gates.Count - showCount) + " more gate(s) pending"));
-            moreTb.FontSize = 11;
-            moreTb.Foreground = Theme.Br(Theme.Muted(_dark));
-            moreTb.Margin = new Thickness(0, 6, 0, 0);
-            _gateCardsPanel.Children.Add(moreTb);
+            moreBtn.FontSize = 11; moreBtn.Cursor = Cursors.Hand;
+            moreBtn.Foreground = Theme.Br(Theme.Warning(_dark));
+            moreBtn.Background = Brushes.Transparent; moreBtn.BorderThickness = new Thickness(0);
+            moreBtn.HorizontalAlignment = HorizontalAlignment.Left;
+            moreBtn.Padding = new Thickness(0); moreBtn.Margin = new Thickness(0, 6, 0, 0);
+            moreBtn.Click += delegate { ShowApprovalCenter(); };
+            _gateCardsPanel.Children.Add(moreBtn);
         }
 
         _gateBanner.Visibility = Visibility.Visible;
+    }
+
+    void ShowApprovalCenter()
+    {
+        if (_approvalCenterWindow != null && _approvalCenterWindow.IsVisible)
+        {
+            _approvalCenterWindow.Activate();
+            return;
+        }
+        var w = new Window();
+        _approvalCenterWindow = w;
+        w.Title = _lang == 0 ? "承認センター" : "Approval Center";
+        w.Width = 760; w.Height = 720; w.MinWidth = 560; w.MinHeight = 460;
+        w.WindowStartupLocation = WindowStartupLocation.CenterOwner; w.Owner = this;
+        w.Background = Bg;
+        w.KeyDown += delegate (object sender, KeyEventArgs e)
+        { if (e.Key == Key.Escape) { w.Close(); e.Handled = true; } };
+        w.Closed += delegate
+        {
+            _approvalCenterWindow = null; _approvalPendingHost = null; _approvalRecentHost = null;
+            _approvalCenterSummary = null; _approvalCenterSig = "";
+        };
+
+        var root = new DockPanel();
+        var head = new Border();
+        head.Background = CardBg; head.BorderBrush = Border;
+        head.BorderThickness = new Thickness(0, 0, 0, 1);
+        head.Padding = new Thickness(24, 18, 24, 16);
+        DockPanel.SetDock(head, Dock.Top);
+        var headGrid = new Grid();
+        headGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        headGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var titleCol = new StackPanel();
+        var title = new TextBlock(); title.Text = w.Title; title.Foreground = Fg;
+        title.FontSize = 20; title.FontWeight = FontWeights.SemiBold;
+        titleCol.Children.Add(title);
+        var note = new TextBlock();
+        note.Text = _lang == 0
+            ? "実際の操作許可をここで判断します。run / plan / auto の実行方式とは別です。"
+            : "Decide actual operation permissions here. This is separate from run / plan / auto mode.";
+        note.Foreground = Muted; note.FontSize = 12; note.Margin = new Thickness(0, 4, 0, 0);
+        note.TextWrapping = TextWrapping.Wrap; titleCol.Children.Add(note);
+        headGrid.Children.Add(titleCol);
+        _approvalCenterSummary = new TextBlock();
+        _approvalCenterSummary.Foreground = Theme.Br(Theme.Warning(_dark));
+        _approvalCenterSummary.FontWeight = FontWeights.SemiBold;
+        _approvalCenterSummary.VerticalAlignment = VerticalAlignment.Center;
+        _approvalCenterSummary.Margin = new Thickness(18, 0, 0, 0);
+        Grid.SetColumn(_approvalCenterSummary, 1); headGrid.Children.Add(_approvalCenterSummary);
+        head.Child = headGrid; root.Children.Add(head);
+
+        var scroll = new ScrollViewer(); scroll.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+        scroll.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
+        var body = new StackPanel(); body.Margin = new Thickness(24, 20, 24, 28);
+        var pendingTitle = new TextBlock();
+        pendingTitle.Text = _lang == 0 ? "判断が必要" : "Needs your decision";
+        pendingTitle.Foreground = Fg; pendingTitle.FontSize = 14; pendingTitle.FontWeight = FontWeights.SemiBold;
+        pendingTitle.Margin = new Thickness(0, 0, 0, 10); body.Children.Add(pendingTitle);
+        _approvalPendingHost = new StackPanel(); body.Children.Add(_approvalPendingHost);
+
+        var recentTitle = new TextBlock();
+        recentTitle.Text = _lang == 0 ? "最近の判断" : "Recent decisions";
+        recentTitle.Foreground = Fg; recentTitle.FontSize = 14; recentTitle.FontWeight = FontWeights.SemiBold;
+        recentTitle.Margin = new Thickness(0, 24, 0, 10); body.Children.Add(recentTitle);
+        _approvalRecentHost = new StackPanel(); body.Children.Add(_approvalRecentHost);
+        scroll.Content = body; root.Children.Add(scroll);
+        w.Content = root;
+        _approvalCenterSig = "";
+        RefreshApprovalCenter();
+        w.ShowDialog();
+    }
+
+    void RefreshApprovalCenter()
+    {
+        if (_approvalCenterWindow == null || _approvalPendingHost == null || _approvalRecentHost == null) return;
+        var all = ReadAllGates(ReadStatus());
+        var sig = new StringBuilder();
+        foreach (var gate in all)
+            sig.Append(S(gate, "token")).Append(':').Append(GateAnswered(gate) ? S(gate, "answer") : "open").Append(';');
+        string currentSig = sig.ToString() + (_dark ? "D" : "L") + _lang;
+        if (currentSig == _approvalCenterSig) return;
+        _approvalCenterSig = currentSig;
+
+        _approvalPendingHost.Children.Clear(); _approvalRecentHost.Children.Clear();
+        var pending = new List<Dictionary<string, object>>();
+        var recent = new List<Dictionary<string, object>>();
+        foreach (var gate in all)
+        {
+            if (GateAnswered(gate)) recent.Add(gate); else pending.Add(gate);
+        }
+        if (_approvalCenterSummary != null)
+            _approvalCenterSummary.Text = _lang == 0 ? (pending.Count + " 件 未処理") : (pending.Count + " pending");
+        PaintApprovalCenterButton(pending.Count);
+
+        if (pending.Count == 0)
+        {
+            var empty = new Border(); empty.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+            empty.BorderBrush = Border; empty.BorderThickness = new Thickness(1);
+            empty.CornerRadius = new CornerRadius(8); empty.Padding = new Thickness(16, 18, 16, 18);
+            var text = new TextBlock();
+            text.Text = _lang == 0 ? "未処理の承認はありません。" : "No approvals are waiting.";
+            text.Foreground = Muted; text.FontSize = 13; empty.Child = text;
+            _approvalPendingHost.Children.Add(empty);
+        }
+        else foreach (var gate in pending) _approvalPendingHost.Children.Add(BuildGateDecisionCard(gate, true));
+
+        int limit = Math.Min(20, recent.Count);
+        if (limit == 0)
+        {
+            var none = new TextBlock(); none.Text = _lang == 0 ? "履歴はまだありません。" : "No decision history yet.";
+            none.Foreground = Muted; none.FontSize = 12; _approvalRecentHost.Children.Add(none);
+        }
+        else for (int i = 0; i < limit; i++) _approvalRecentHost.Children.Add(BuildGateDecisionCard(recent[i], false));
+    }
+
+    UIElement BuildGateDecisionCard(Dictionary<string, object> gate, bool actionable)
+    {
+        bool expired = GateExpired(gate);
+        var card = new Border();
+        card.Background = CardBg;
+        card.BorderBrush = actionable ? Theme.Br(expired ? Theme.Danger(_dark) : Theme.Warning(_dark)) : Border;
+        card.BorderThickness = new Thickness(actionable ? 3 : 1, 1, 1, 1);
+        card.CornerRadius = new CornerRadius(8); card.Padding = new Thickness(14, 12, 14, 12);
+        card.Margin = new Thickness(0, 0, 0, 10);
+        var col = new StackPanel();
+
+        var meta = new DockPanel(); meta.LastChildFill = true;
+        var chip = new Border(); chip.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+        chip.BorderBrush = actionable ? Theme.Br(Theme.Warning(_dark)) : Border;
+        chip.BorderThickness = new Thickness(1); chip.CornerRadius = new CornerRadius(8);
+        chip.Padding = new Thickness(7, 2, 7, 2); chip.Margin = new Thickness(0, 0, 8, 0);
+        var chipText = new TextBlock(); chipText.Text = GateKind(gate); chipText.FontSize = 10;
+        chipText.FontWeight = FontWeights.SemiBold; chipText.Foreground = actionable ? Theme.Br(Theme.Warning(_dark)) : Muted;
+        chip.Child = chipText; DockPanel.SetDock(chip, Dock.Left); meta.Children.Add(chip);
+        var age = new TextBlock();
+        age.Text = (expired ? (_lang == 0 ? "期限切れ · " : "Expired · ") : "") + GateAge(gate);
+        age.Foreground = expired ? Theme.Br(Theme.Danger(_dark)) : Muted; age.FontSize = 11;
+        age.VerticalAlignment = VerticalAlignment.Center; meta.Children.Add(age);
+        col.Children.Add(meta);
+
+        var question = new TextBlock(); question.Text = S(gate, "question");
+        question.Foreground = Fg; question.FontSize = 13; question.FontWeight = FontWeights.SemiBold;
+        question.TextWrapping = TextWrapping.Wrap; question.Margin = new Thickness(0, 8, 0, 0);
+        col.Children.Add(question);
+
+        string context = S(gate, "context");
+        if (context.Length > 0)
+        {
+            var details = new Expander(); details.Header = _lang == 0 ? "対象と詳細を確認" : "Review scope and details";
+            details.Foreground = Muted; details.FontSize = 11; details.Margin = new Thickness(0, 7, 0, 0);
+            details.IsExpanded = actionable && (GateNeedsSecondConfirmation(gate) || GateKind(gate) == "Skill");
+            var detailText = new TextBlock(); detailText.Text = context; detailText.Foreground = Muted;
+            detailText.FontFamily = new FontFamily("Cascadia Mono, Consolas"); detailText.FontSize = 11;
+            detailText.TextWrapping = TextWrapping.Wrap; detailText.Margin = new Thickness(10, 6, 0, 0);
+            details.Content = detailText; col.Children.Add(details);
+        }
+
+        if (actionable)
+        {
+            var row = new StackPanel(); row.Orientation = Orientation.Horizontal; row.Margin = new Thickness(0, 12, 0, 0);
+            var approve = new Button(); approve.Content = _lang == 0 ? "承認" : "Approve";
+            approve.Cursor = Cursors.Hand; approve.Padding = new Thickness(18, 6, 18, 6);
+            approve.BorderThickness = new Thickness(0); approve.Background = Accent; approve.Foreground = White;
+            approve.FontWeight = FontWeights.SemiBold; approve.IsEnabled = !expired;
+            System.Windows.Automation.AutomationProperties.SetName(approve, _lang == 0 ? "この操作を承認" : "Approve this operation");
+            Dictionary<string, object> captured = gate;
+            approve.Click += delegate
+            {
+                if (GateNeedsSecondConfirmation(captured))
+                {
+                    string msg = (_lang == 0 ? "影響の大きい操作です。対象を確認したうえで本当に承認しますか？\n\n" :
+                        "This is a high-impact operation. Approve after reviewing the exact scope?\n\n") + S(captured, "question");
+                    if (MessageBox.Show(_approvalCenterWindow, msg, _lang == 0 ? "最終確認" : "Final confirmation",
+                        MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes) return;
+                }
+                AnswerGate(S(captured, "path"), "approved"); RefreshApprovalCenter();
+            };
+            row.Children.Add(approve);
+
+            var deny = new Button(); deny.Content = _lang == 0 ? "拒否" : "Deny";
+            deny.Cursor = Cursors.Hand; deny.Padding = new Thickness(18, 6, 18, 6);
+            deny.Margin = new Thickness(8, 0, 0, 0); deny.Background = Brushes.Transparent;
+            deny.Foreground = Theme.Br(Theme.Danger(_dark)); deny.BorderBrush = Theme.Br(Theme.Danger(_dark));
+            deny.BorderThickness = new Thickness(1);
+            System.Windows.Automation.AutomationProperties.SetName(deny, _lang == 0 ? "この操作を拒否" : "Deny this operation");
+            deny.Click += delegate { AnswerGate(S(captured, "path"), "denied"); RefreshApprovalCenter(); };
+            row.Children.Add(deny); col.Children.Add(row);
+
+            if (expired)
+            {
+                var expiredNote = new TextBlock();
+                expiredNote.Text = _lang == 0 ? "期限切れのため承認できません。拒否するか、元の操作から再要求してください。" :
+                    "This request expired. Deny it or request approval again from the originating action.";
+                expiredNote.Foreground = Theme.Br(Theme.Danger(_dark)); expiredNote.FontSize = 11;
+                expiredNote.Margin = new Thickness(0, 7, 0, 0); expiredNote.TextWrapping = TextWrapping.Wrap;
+                col.Children.Add(expiredNote);
+            }
+        }
+        else
+        {
+            var verdict = new TextBlock();
+            string answer = S(gate, "answer");
+            bool approved = answer.Equals("approved", StringComparison.OrdinalIgnoreCase);
+            verdict.Text = approved ? (_lang == 0 ? "承認済み" : "Approved") : (_lang == 0 ? "拒否済み" : "Denied");
+            verdict.Foreground = Theme.Br(approved ? Theme.Success(_dark) : Theme.Danger(_dark));
+            verdict.FontSize = 11; verdict.FontWeight = FontWeights.SemiBold; verdict.Margin = new Thickness(0, 8, 0, 0);
+            col.Children.Add(verdict);
+        }
+        card.Child = col; return card;
     }
 
     // Atomic gate answer: read the file at `path`, set answered=true + answer=<verdict>, write back.
@@ -5229,7 +5630,9 @@ class CockpitWindow : Window
         try
         {
             // Normalize: forward slashes may be in the path from status.json.
-            string localPath = path.Replace('/', Path.DirectorySeparatorChar);
+            string localPath = Path.GetFullPath(path.Replace('/', Path.DirectorySeparatorChar));
+            string gateRoot = Path.GetFullPath(GateDirectory()).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            if (!localPath.StartsWith(gateRoot, StringComparison.OrdinalIgnoreCase)) return;
             if (!File.Exists(localPath)) return;
 
             string text;
@@ -5241,18 +5644,27 @@ class CockpitWindow : Window
             if (gd == null) gd = new Dictionary<string, object>();
             gd["answered"] = true;
             gd["answer"] = verdict;
+            gd["answered_at"] = NowUnix();
 
             string updated = _js.Serialize(gd);
             // Atomic: write to a temp file in the same directory, then rename.
             string dir2 = Path.GetDirectoryName(localPath);
             string tmp = Path.Combine(dir2, Path.GetFileName(localPath) + ".tmp");
             File.WriteAllText(tmp, updated, new UTF8Encoding(false));
-            File.Copy(tmp, localPath, true);
-            try { File.Delete(tmp); } catch (Exception) { }
+            try { File.Replace(tmp, localPath, null); }
+            catch (Exception)
+            {
+                // Older/non-NTFS environments may not implement Replace; keep the same-directory
+                // fallback for compatibility, then remove the temporary file.
+                File.Copy(tmp, localPath, true);
+                try { File.Delete(tmp); } catch (Exception) { }
+            }
 
             // Force a sig reset so the banner refreshes on the next tick (the relay
             // will drop this gate from pending_gates once it sees answered=true).
             _gateSig = "";
+            _approvalCenterSig = "";
+            _gateCacheAt = 0;
         }
         catch (Exception) { }
     }
@@ -5366,6 +5778,7 @@ class CockpitWindow : Window
         UpdateAutoEnabled();
         PaintEffort();
         PaintApproval();
+        PaintApprovalCenterButton(PendingGates(ReadStatus()).Count);
         PaintPause();
         PaintStop();
         if (_stopBtn != null) { _stopBtn.Background = BtnBg; _stopBtn.Foreground = Fg; _stopBtn.BorderBrush = Border; }
@@ -5427,6 +5840,7 @@ class CockpitWindow : Window
         PaintAutoToggle();
         PaintEffort();
         PaintApproval();
+        PaintApprovalCenterButton(PendingGates(ReadStatus()).Count);
         PaintPause();
         PaintStop();
         // _stopBtn / _pauseBtn now render drawn icons (PaintPause/PaintStop), not text labels.
