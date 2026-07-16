@@ -279,12 +279,15 @@ from relay.copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver, P
 from relay.relay_fleet import CONSENT_MARKERS
 from bridge import session_store as S
 from bridge import review_command
+from relay.skills import SkillError, SkillStore, format_skill_list
 # tool_probe is stdlib-only (see its module docstring) -- cheap to import here regardless of
 # the heavy relay chain already loaded above. Used by the idle tool-call self-probe, see the
 # "tool-call self-probe" section near the bottom of this file.
 from tools import tool_probe
 
 load_dotenv()
+
+SKILL_STORE = SkillStore(REPO)
 
 def _p2c_review_level():
     """Return the on-demand P2c level (0=off, 1=deep, 2=full validation).
@@ -362,6 +365,9 @@ HELP_TEXT = (
     "- `/eli5 <トピック>` — できるだけ易しく説明。\n"
     "- `/proscons <トピック>` — 賛否（メリット/デメリット）を表で。\n"
     "- `/table <説明>` — 説明に沿った Markdown 表を作成。\n\n"
+    "### Skills\n"
+    "- `/skills` — 利用可能な Skill と承認状態を一覧表示。\n"
+    "- `/<skill-name> [引数]` — 承認済み Skill を明示実行。作成・取込・承認はローカル端末のみ。\n\n"
     "### その他\n"
     "- `/history` — （HTTP `GET /history?url=...` 経由）会話全文をロール付きで取得。\n"
     "- `/help` — このヘルプ。`/?` `/commands` も同じ。\n\n"
@@ -3012,6 +3018,15 @@ class Handler(BaseHTTPRequestHandler):
         token = head.lstrip("/")
         if token in ("help", "?", "commands"):
             self._sse({"delta": _current_help_text()}); self._sse({}, "done"); return
+        if token == "skills":
+            self._sse({"delta": format_skill_list(SKILL_STORE.list_metadata())})
+            self._sse({}, "done"); return
+        if token in ("skill-approve", "skill-import", "skill-create", "gate-answer"):
+            self._sse({"delta": (
+                "この管理コマンドは、人間だけが操作できるローカル端末で実行してください。"
+                "モデルやWeb会話から承認状態を変更することはできません。"
+            )})
+            self._sse({}, "done"); return
         if token in ("research", "deepresearch", "dr"):
             self._delegate("researcher", arg); return
         if token in ("analyze", "an"):
@@ -3038,6 +3053,21 @@ class Handler(BaseHTTPRequestHandler):
             if not arg.strip():
                 self._sse({"delta": "使い方: " + usage}); self._sse({}, "done"); return
             self._stream_text(build(arg.strip()))
+            return
+        try:
+            skill = SKILL_STORE.get(token)
+        except SkillError:
+            skill = None
+        if skill is not None:
+            if skill.metadata.get("user-invocable", True) is False:
+                self._sse({"delta": f"Skill /{token} は明示呼び出しが無効です。"})
+                self._sse({}, "done"); return
+            try:
+                prompt = SKILL_STORE.render(token, arg)
+            except SkillError as exc:
+                self._sse({"delta": f"Skill /{token} を読み込めません: {exc}"})
+                self._sse({}, "done"); return
+            self._stream_text(BRIDGE_DISCIPLINE + prompt)
             return
         self._sse({"delta": "未知のコマンド `" + head + "`。`/help` で一覧を表示します。"})
         self._sse({}, "done")
@@ -3101,6 +3131,17 @@ class Handler(BaseHTTPRequestHandler):
         # full discipline's "answer concisely and stop" clause, which was halting autonomous
         # multi-step tasks after the first tool result. Slash / prompt-template commands keep
         # their own framing and are NOT wrapped.
+        matched = SKILL_STORE.match(msg)
+        if matched:
+            try:
+                skill_prompt = SKILL_STORE.render(matched["name"], msg)
+                self._stream_text(
+                    BRIDGE_DISCIPLINE + skill_prompt + "\n\nOriginal user request:\n" + msg
+                )
+                return
+            except SkillError:
+                # A concurrent edit can invalidate the digest between match and load.
+                pass
         self._stream_text(BRIDGE_DISCIPLINE + msg)
 
     def _review_stream(self, msg: str):

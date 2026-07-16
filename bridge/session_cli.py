@@ -24,6 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 DEFAULT_PORT = 8765
 HELP_TEXT = """\
@@ -38,6 +39,15 @@ Commands:
                      same, but adds a verification phase: after the work
                      loop finishes, a critic checks the AC and can send it
                      back for fixes (up to max_loops, default 3).
+  /skills            list Skills and their exact-digest trust state
+  /skill-create <name> | <description> [| <instructions>]
+                     create and trust a project-local Skill
+  /skill-import <path> [| project|personal]
+                     copy an external Skill without running it
+  /skill-approve <name> [confirm <token>]
+                     review/approve the exact current digest (human only)
+  /gate-answer <token> <approved|denied>
+                     answer a fleet gate from this local human console
   /help              show this help
   /quit              exit
 Anything else is sent to Copilot as a single message.
@@ -578,7 +588,72 @@ def _do_new(client: BridgeClient, title: str) -> None:
         print(f"[new session failed: {result.get('error', 'unknown error')}]")
 
 
-def repl(client: BridgeClient, reader: StdinReader | None = None, chat_only: bool = False) -> None:
+def _skill_store(repo_root: str | None = None):
+    from relay.skills import SkillStore
+
+    root = Path(repo_root).resolve() if repo_root else Path(__file__).resolve().parent.parent
+    return SkillStore(root)
+
+
+def _skill_admin(line: str, repo_root: str | None = None) -> bool:
+    """Handle human-only Skill/gate commands locally, never through Copilot/MCP."""
+    from relay.skills import SkillError, format_skill_list
+
+    cmd, _, raw = line[1:].partition(" ")
+    cmd = cmd.lower()
+    raw = raw.strip()
+    if cmd not in ("skills", "skill-create", "skill-import", "skill-approve", "gate-answer"):
+        return False
+    try:
+        if cmd == "gate-answer":
+            token, _, answer = raw.partition(" ")
+            if not token or answer.strip().lower() not in ("approved", "denied"):
+                print("usage: /gate-answer <token> <approved|denied>")
+            else:
+                from tools.gate_ops import gate_answer
+                print(gate_answer(token, answer.strip().lower()))
+            return True
+
+        store = _skill_store(repo_root)
+        if cmd == "skills":
+            print(format_skill_list(store.list_metadata()))
+        elif cmd == "skill-create":
+            parts = [part.strip() for part in raw.split("|", 2)]
+            if len(parts) < 2 or not parts[0] or not parts[1]:
+                print("usage: /skill-create <name> | <description> [| <instructions>]")
+            else:
+                skill = store.create_local(parts[0], parts[1], parts[2] if len(parts) > 2 else "")
+                print(f"created and trusted local Skill /{skill.name} ({skill.digest[:12]})")
+        elif cmd == "skill-import":
+            parts = [part.strip() for part in raw.rsplit("|", 1)]
+            source = parts[0]
+            scope = parts[1] if len(parts) == 2 else "project"
+            if not source:
+                print("usage: /skill-import <path> [| project|personal]")
+            else:
+                skill = store.import_external(source, scope)
+                print(f"imported /{skill.name} as untrusted; run /skill-approve {skill.name}")
+        elif cmd == "skill-approve":
+            fields = raw.split()
+            if len(fields) == 1:
+                review = store.request_approval(fields[0])
+                print(json.dumps(review, ensure_ascii=False, indent=2))
+                if review.get("token"):
+                    print(f"confirm with: /skill-approve {fields[0]} confirm {review['token']}")
+            elif len(fields) == 3 and fields[1].lower() == "confirm":
+                result = store.confirm_approval(fields[0], fields[2])
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                print("usage: /skill-approve <name> [confirm <token>]")
+    except SkillError as exc:
+        print(f"[Skill refused: {exc}]")
+    except Exception as exc:
+        print(f"[Skill error: {type(exc).__name__}: {exc}]")
+    return True
+
+
+def repl(client: BridgeClient, reader: StdinReader | None = None, chat_only: bool = False,
+         repo_root: str | None = None) -> None:
     reader = reader or StdinReader()
     print(HELP_TEXT)
     empty_ctrl_c = False
@@ -600,6 +675,8 @@ def repl(client: BridgeClient, reader: StdinReader | None = None, chat_only: boo
         if not line:
             continue
         if line.startswith("/"):
+            if _skill_admin(line, repo_root=repo_root):
+                continue
             cmd, _, arg = line[1:].partition(" ")
             cmd = cmd.lower()
             arg = arg.strip()
@@ -625,7 +702,8 @@ def repl(client: BridgeClient, reader: StdinReader | None = None, chat_only: boo
                     else:
                         run_goal(client, goal_text, reader.q)
             else:
-                print(f"[unknown command /{cmd}. Type /help for a list.]")
+                # Dynamic /skill-name commands are resolved by the bridge.
+                _print_stream(client, line)
             continue
         _print_stream(client, line)
 
@@ -672,7 +750,7 @@ def main(argv=None) -> int:
     else:
         _print_banner_and_maybe_resume(client, auto_continue=False)
 
-    repl(client, chat_only=chat_only)
+    repl(client, chat_only=chat_only, repo_root=repo_root)
     return 0
 
 
