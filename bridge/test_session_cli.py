@@ -565,6 +565,38 @@ def test_help_text_mentions_goal():
     assert "/goal" in cli.HELP_TEXT
 
 
+def test_skill_admin_create_and_approve_flow_is_local(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("MCP_SKILLS_STATE_DB", str(tmp_path / "skills.sqlite3"))
+    project = tmp_path / "project"
+    assert cli._skill_admin(
+        "/skill-create my-local | Local workflow | Do the local thing.", str(project)
+    )
+    out = capsys.readouterr().out
+    assert "created and trusted local Skill /my-local" in out
+    assert (project / ".claude" / "skills" / "my-local" / "SKILL.md").is_file()
+
+
+def test_unknown_slash_command_is_forwarded_for_dynamic_skills(capsys):
+    class Reader:
+        q = queue.Queue()
+        lines = iter(["/my-dynamic target.py", "/quit"])
+
+        def readline(self, _prompt=""):
+            return next(self.lines)
+
+    class Client(FakeClient):
+        def stream(self, msg):
+            assert msg == "/my-dynamic target.py"
+            yield 'data: {"delta": "dynamic skill ran"}\n'
+            yield 'event: done\n'
+            yield 'data: {}\n'
+            yield '\n'
+
+    client = Client(sessions=[])
+    cli.repl(client, reader=Reader())
+    assert "dynamic skill ran" in capsys.readouterr().out
+
+
 # --------------------------------------------------------------------------
 # VERIFICATION phase -- {"verify_start": n} / {"verdict": {...}} payloads,
 # and the three new goal_done outcomes: done_verified / verify_failed /
