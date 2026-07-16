@@ -161,8 +161,9 @@ git を使わないなら: GitHub ページの緑色の「**Code**」ボタン �
 - `/skills` で、個人共通の `~/.claude/skills/` とプロジェクト固有の `.claude/skills/` を一覧表示します。
 - `/<skill-name> 引数` で承認済み Skill を明示実行できます。信頼度の高い一致だけは通常文から自動選択されます。
 - 自作はローカル端末で `/skill-create <name> | <description> | <instructions>`。作成時の内容だけが自動で信頼されます。
-- 外部Skillは `/skill-import <path>` で実行せず取り込み、`/skill-approve <name>` で内容・差分・スクリプトを確認します。承認待ちは FleetCockpit に表示され、承認後もそのハッシュにしか効きません。
+- 外部Skillは `/skill-import <path>` で実行せず取り込み、`/skill-approve <name>` で内容・差分・スクリプトを確認します。承認待ちはフリート停止中でも FleetCockpit 上部の「承認」から開け、承認後もそのハッシュにしか効きません。
 - Skill承認は手順書の読込み許可だけです。shell、ファイル変更、外部送信は従来どおり `unlock` とフリートの `GO / ASK / STOP`・逐次承認に従います。
+- 上部の `run / plan / auto` は「実行方式」です。実際の操作許可は件数バッジ付きの「承認センター」に集約され、削除・外部送信・破壊的shellは対象確認後にもう一度確認します。一括承認はありません。
 
 - **起動**: デスクトップの「**M365 Companion**」アイコンをダブルクリックするだけ（quickstart が初回に作成）。サーバー・トンネル・Edge・UI を一括起動します。何度押しても安全です（冪等）。
 - **2 つの窓**:
@@ -375,8 +376,9 @@ Once registered, open the agent's chat and paste the URL from the browser's addr
 - `/skills` lists personal `~/.claude/skills/` and project `.claude/skills/` bundles without loading their bodies.
 - Run an approved Skill explicitly with `/<skill-name> arguments`; only high-confidence metadata matches may be selected automatically.
 - Create a local Skill from the terminal with `/skill-create <name> | <description> | <instructions>`.
-- Import an external folder without executing it using `/skill-import <path>`, then run `/skill-approve <name>`. FleetCockpit shows the approval request with its digest, changed files, bundled scripts, and requested tools. Any content change invalidates that approval.
+- Import an external folder without executing it using `/skill-import <path>`, then run `/skill-approve <name>`. FleetCockpit's persistent Approval Center shows the request even while the fleet is idle, including its digest, changed files, bundled scripts, and requested tools. Any content change invalidates that approval.
 - Skill approval permits loading instructions only. Shell, file mutations, and outbound actions still use the existing unlock and fleet `GO / ASK / STOP` gates.
+- The `run / plan / auto` selector is explicitly a run mode. Actual operation decisions live in the count-badged Approval Center; delete, outbound, and destructive-shell approvals require a second confirmation after scope review, and there is no bulk approve.
 
 - **Launch**: double-click the **"M365 Companion"** desktop icon (created by quickstart on first run). It starts the server, tunnel, Edge, and UI together. Safe to click any number of times (idempotent).
 - **Two windows**:

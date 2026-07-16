@@ -39,7 +39,10 @@ def test_external_skill_requires_two_step_approval_and_renders(tmp_path, monkeyp
 
     challenge = store.request_approval("model-review")
     assert challenge["status"] == "confirmation-required"
-    assert Path(challenge["gate_path"]).is_file()
+    gate_path = Path(challenge["gate_path"])
+    assert gate_path.is_file()
+    gate = __import__("json").loads(gate_path.read_text(encoding="utf-8"))
+    assert gate["expires_at"] > gate["asked_at"]
     approved = store.confirm_approval("model-review", challenge["token"])
     assert approved["status"] == "trusted"
     rendered = store.render("model-review", "src/model.py strict")

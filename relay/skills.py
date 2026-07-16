@@ -416,6 +416,7 @@ class SkillStore:
                 f"scripts: {json.dumps(scripts, ensure_ascii=False)}"
             ),
             "asked_at": now,
+            "expires_at": now + APPROVAL_TTL_SECONDS,
             "answered": False,
             "answer": None,
         }
