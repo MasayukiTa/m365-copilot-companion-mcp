@@ -62,3 +62,14 @@ def test_unfinished_run_banner_has_persistent_close_button():
     assert "ResumeStateSignature()" in SOURCE
     assert "ResumeStateDismissed(resumeSig)" in SOURCE
     assert 'rd["signature"] = resumeSig' in SOURCE
+
+
+def test_health_repairs_have_immediate_busy_feedback():
+    assert "HealthState.Checking" in SOURCE
+    assert "BuildSpinner(10)" in SOURCE
+    assert 'BuildFixPillContent(_fixRunning)' in SOURCE
+    assert 'T(busy ? "hs_fixing_button" : "hs_fix")' in SOURCE
+    assert "_fixTargetMask" in SOURCE
+    assert "_healthWake.Set()" in SOURCE
+    assert 'kind == "checking" || kind == "starting"' in SOURCE
+    assert 'Path.GetDirectoryName(Path.GetFullPath(_statusPath))' in SOURCE
