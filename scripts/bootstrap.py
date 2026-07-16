@@ -340,6 +340,7 @@ def step_gen_env() -> None:
         current = env_path.read_text(encoding="utf-8-sig")
         missing = []
         for key, value in (
+            ("TASK_JOB_APPROVAL_MODE", "default"),
             ("MCP_REVIEW_P2C", "0"),
             ("MCP_EXECUTION_PROFILES", "0"),
             ("MCP_DEEP_REVIEW_TRANSPORT", "auto"),

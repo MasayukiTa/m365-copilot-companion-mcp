@@ -33,6 +33,7 @@ function Ensure-EnvDefaults {
         if (-not (Test-Path $path)) { return }
         $text = [System.IO.File]::ReadAllText($path)
         $defaults = [ordered]@{
+            TASK_JOB_APPROVAL_MODE = "default"
             MCP_REVIEW_P2C = "0"
             MCP_EXECUTION_PROFILES = "0"
             MCP_DEEP_REVIEW_TRANSPORT = "auto"
