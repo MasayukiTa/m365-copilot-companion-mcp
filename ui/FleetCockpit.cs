@@ -643,13 +643,14 @@ class CockpitWindow : Window
     // chat (Edge profile copilot-bridge-edge, CDP :9223) can actually call an MCP tool. Tool
     // reads .fleet\tool_probe.json, written by the bridge's own idle self-probe (a separate
     // component -- bridge/copilot_bridge.py + tools/tool_probe.py -- this file only reads it).
-    enum HealthState { Gray = 0, Green = 1, Yellow = 2, Red = 3 }
+    enum HealthState { Gray = 0, Green = 1, Yellow = 2, Red = 3, Checking = 4 }
     class DotState { public HealthState State = HealthState.Gray; public string Detail = ""; public DateTime Checked = DateTime.MinValue; }
     // Index map: 0=server 1=tunnel 2=edge 3=signin 4=agent 5=tool(bridge probe).
     readonly DotState[] _health = { new DotState(), new DotState(), new DotState(), new DotState(), new DotState(), new DotState() };
     readonly object _healthLock = new object();
     const int HEALTH_DOT_COUNT = 6;
     Border[] _healthDot;           // the 6 colored dots (re-tinted by ApplyHealthToUi)
+    TextBlock[] _healthSpin;       // rotating in-progress marks, shown instead of a stale color
     TextBlock[] _healthLbl;        // the 6 labels (re-textable on language toggle)
     Border[] _healthDotWrap;       // per-dot wrapper (tooltip host)
     Button _fixBtn;                // the 「直す」/Fix button (shown only when a dot is red/yellow)
@@ -658,6 +659,8 @@ class CockpitWindow : Window
     Thread _healthThread;
     volatile bool _healthStop = false;
     volatile bool _fixRunning = false;   // guard: never run two fixes at once
+    volatile int _fixTargetMask = 0;     // health axes currently being repaired; renders as Checking
+    readonly AutoResetEvent _healthWake = new AutoResetEvent(false); // immediate post-action refresh
     volatile bool _bridgeReconnectRunning = false;   // guard: manual "Reconnect chat" button, never two at once
     string _agentMarkerId = "";    // T_.../P_... id extracted from the configured agent URL (.env)
     volatile bool _startAllLaunched = false;   // reentry guard for RunStartAll (per-cooldown, not per-app-run only)
@@ -702,6 +705,7 @@ class CockpitWindow : Window
     protected override void OnClosed(EventArgs e)
     {
         _healthStop = true;
+        try { _healthWake.Set(); } catch (Exception) { }
         base.OnClosed(e);
     }
 
@@ -800,6 +804,7 @@ class CockpitWindow : Window
         if (k == "hs_signin") return ja ? "サインイン" : "Sign-in";
         if (k == "hs_agent") return ja ? "エージェント" : "Agent";
         if (k == "hs_fix") return ja ? "直す" : "Fix";
+        if (k == "hs_fixing_button") return ja ? "修復中…" : "Fixing…";
         if (k == "hs_fix_hint") return ja ? "検出された不具合を直す" : "Fix the detected problem";
         if (k == "hs_ok") return ja ? "正常" : "OK";
         if (k == "hs_down") return ja ? "応答なし" : "down";
@@ -876,6 +881,7 @@ class CockpitWindow : Window
         if (k == "hs_tool_detail_down") return ja ? "応答なし(再接続が必要)" : "no response (reconnect needed)";
         if (k == "hs_tool_detail_stale") return ja ? "自己診断が実行されていません" : "self-probe hasn't run recently";
         if (k == "hs_tool_detail_none") return ja ? "自己診断は未設定(機能無効)" : "self-probe not configured (feature off)";
+        if (k == "hs_tool_detail_checking") return ja ? "ツール接続を確認中…" : "checking tool connection…";
         // Bridge-targeted Fix tier (RunFix priority 5) + the always-available manual button.
         if (k == "hs_fix_bridge") return ja ? "チャットのブリッジを再接続しています…" : "Reconnecting the chat bridge…";
         if (k == "hs_fix_bridge_ok") return ja ? "ブリッジの再接続に成功しました" : "Bridge reconnect succeeded";
@@ -1485,8 +1491,21 @@ class CockpitWindow : Window
     // ══════════════════════════════════════════════════════════════════════════════════
     //  P0 HEALTH STRIP  —  infra state, glanceable + one-click fixable
     // ══════════════════════════════════════════════════════════════════════════════════
-    // Repo root is resolved the same way SpawnFleet does (exe is in ...\ui, repo is one up).
-    string RepoRoot() { return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..")); }
+    // Prefer the status file supplied to this process: it lets an isolated/preview cockpit build
+    // monitor and repair the selected workspace instead of accidentally acting on the directory
+    // that happens to contain the exe. Normal installs still resolve exactly as before because
+    // status.json lives in <repo>\.fleet. Fall back to exe\.. for custom/non-.fleet paths.
+    string RepoRoot()
+    {
+        try
+        {
+            string stateDir = Path.GetDirectoryName(Path.GetFullPath(_statusPath));
+            if (string.Equals(Path.GetFileName(stateDir), ".fleet", StringComparison.OrdinalIgnoreCase))
+                return Path.GetFullPath(Path.Combine(stateDir, ".."));
+        }
+        catch (Exception) { }
+        return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+    }
 
     // Build the health strip: 5 dots with labels + an INLINE Fix pill + an inline note, all on ONE
     // horizontal row. Redesign: left-aligned & vertically centered (it sits at the left edge of the
@@ -1498,6 +1517,7 @@ class CockpitWindow : Window
     UIElement BuildHealthStrip()
     {
         _healthDot = new Border[HEALTH_DOT_COUNT];
+        _healthSpin = new TextBlock[HEALTH_DOT_COUNT];
         _healthLbl = new TextBlock[HEALTH_DOT_COUNT];
         _healthDotWrap = new Border[HEALTH_DOT_COUNT];
 
@@ -1518,13 +1538,21 @@ class CockpitWindow : Window
             wrap.Padding = new Thickness(0);
             wrap.VerticalAlignment = VerticalAlignment.Center;
             var dr = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            var mark = new Grid { Width = 10, Height = 10, VerticalAlignment = VerticalAlignment.Center,
+                                  Margin = new Thickness(0, 0, 4, 0) };
             var dot = new Border { Width = 8, Height = 8, CornerRadius = new CornerRadius(4),
-                                   VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 4, 0) };
+                                   HorizontalAlignment = HorizontalAlignment.Center,
+                                   VerticalAlignment = VerticalAlignment.Center };
+            var spin = BuildSpinner(10);
+            spin.Visibility = Visibility.Collapsed;
+            mark.Children.Add(dot);
+            mark.Children.Add(spin);
             var lbl = new TextBlock { FontSize = 11, VerticalAlignment = VerticalAlignment.Center, Text = T(keys[i]) };
-            dr.Children.Add(dot);
+            dr.Children.Add(mark);
             dr.Children.Add(lbl);
             wrap.Child = dr;
             _healthDot[i] = dot;
+            _healthSpin[i] = spin;
             _healthLbl[i] = lbl;
             _healthDotWrap[i] = wrap;
             row.Children.Add(wrap);
@@ -1533,7 +1561,7 @@ class CockpitWindow : Window
         // INLINE Fix pill (hidden unless red/yellow): refined warning-outlined pill (transparent fill,
         // Warning outline + text) with a small Material Symbol + the label. Sits right after the 5th dot.
         _fixBtn = new Button();
-        _fixBtn.Content = BuildFixPillContent();
+        _fixBtn.Content = BuildFixPillContent(false);
         _fixBtn.FontSize = 11; _fixBtn.FontWeight = FontWeights.SemiBold;
         _fixBtn.Padding = new Thickness(8, 1, 9, 1);
         _fixBtn.Margin = new Thickness(10, 0, 0, 0);      // gap after エージェント dot
@@ -1561,14 +1589,31 @@ class CockpitWindow : Window
     // The inline Fix pill's content: a small Material Symbol (settings/cog — the closest repair glyph
     // in the subset) at 14px + the localized "Fix" label, tinted with the Warning token to match the
     // pill's outline. Rebuilt on theme/lang flips via RebuildChrome (whole chrome is reconstructed).
-    UIElement BuildFixPillContent()
+    TextBlock BuildSpinner(double size)
+    {
+        var spin = new TextBlock { Text = "⟳", FontFamily = new FontFamily("Segoe UI Symbol"),
+                                   FontSize = size, FontWeight = FontWeights.SemiBold,
+                                   HorizontalAlignment = HorizontalAlignment.Center,
+                                   VerticalAlignment = VerticalAlignment.Center,
+                                   TextAlignment = TextAlignment.Center,
+                                   RenderTransformOrigin = new Point(0.5, 0.5),
+                                   Foreground = Theme.Br(Theme.Warning(_dark)) };
+        var rotate = new RotateTransform(0);
+        spin.RenderTransform = rotate;
+        var animation = new DoubleAnimation(0, 360, new Duration(TimeSpan.FromMilliseconds(850)));
+        animation.RepeatBehavior = RepeatBehavior.Forever;
+        rotate.BeginAnimation(RotateTransform.AngleProperty, animation);
+        return spin;
+    }
+
+    UIElement BuildFixPillContent(bool busy)
     {
         var sp = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
-        var ic = MakeIcon("settings", 14, Theme.Br(Theme.Warning(_dark)));
+        UIElement ic = busy ? (UIElement)BuildSpinner(13) : MakeIcon("settings", 14, Theme.Br(Theme.Warning(_dark)));
         ((FrameworkElement)ic).Margin = new Thickness(0, 0, 4, 0);
         ((FrameworkElement)ic).VerticalAlignment = VerticalAlignment.Center;
         sp.Children.Add(ic);
-        sp.Children.Add(new TextBlock { Text = T("hs_fix"), FontSize = 11, FontWeight = FontWeights.SemiBold,
+        sp.Children.Add(new TextBlock { Text = T(busy ? "hs_fixing_button" : "hs_fix"), FontSize = 11, FontWeight = FontWeights.SemiBold,
                                         VerticalAlignment = VerticalAlignment.Center });
         return sp;
     }
@@ -1585,7 +1630,11 @@ class CockpitWindow : Window
             _fixBtn.Background = Brushes.Transparent;
             _fixBtn.Foreground = Theme.Br(Theme.Warning(_dark));
             _fixBtn.BorderBrush = Theme.Br(Theme.Warning(_dark));
+            _fixBtn.Content = BuildFixPillContent(_fixRunning);
         }
+        if (_healthSpin != null)
+            for (int i = 0; i < _healthSpin.Length; i++)
+                if (_healthSpin[i] != null) _healthSpin[i].Foreground = Theme.Br(Theme.Warning(_dark));
         if (_fixNote != null) _fixNote.Foreground = Muted;
     }
 
@@ -1595,6 +1644,7 @@ class CockpitWindow : Window
         if (s == HealthState.Green) return Theme.Br(Theme.Success(_dark));
         if (s == HealthState.Red) return Theme.Br(Theme.Danger(_dark));
         if (s == HealthState.Yellow) return Theme.Br(Theme.Warning(_dark));
+        if (s == HealthState.Checking) return Theme.Br(Theme.Warning(_dark));
         return Theme.Br(Theme.Muted(_dark));   // gray / unknown
     }
 
@@ -1610,7 +1660,14 @@ class CockpitWindow : Window
                 snap[i] = new DotState { State = _health[i].State, Detail = _health[i].Detail, Checked = _health[i].Checked };
         for (int i = 0; i < HEALTH_DOT_COUNT; i++)
         {
-            if (_healthDot[i] != null) _healthDot[i].Background = HealthBrush(snap[i].State);
+            bool checking = snap[i].State == HealthState.Checking || (_fixRunning && (_fixTargetMask & (1 << i)) != 0);
+            if (_healthDot[i] != null)
+            {
+                _healthDot[i].Background = HealthBrush(snap[i].State);
+                _healthDot[i].Visibility = checking ? Visibility.Collapsed : Visibility.Visible;
+            }
+            if (_healthSpin != null && _healthSpin[i] != null)
+                _healthSpin[i].Visibility = checking ? Visibility.Visible : Visibility.Collapsed;
             if (snap[i].State == HealthState.Red || snap[i].State == HealthState.Yellow) anyBad = true;
             if (_healthDotWrap[i] != null)
             {
@@ -1626,6 +1683,7 @@ class CockpitWindow : Window
             // Never hide the button mid-fix (it is disabled while running so it can't re-enter).
             _fixBtn.Visibility = (anyBad || _fixRunning) ? Visibility.Visible : Visibility.Collapsed;
             _fixBtn.IsEnabled = !_fixRunning;
+            _fixBtn.Content = BuildFixPillContent(_fixRunning);
         }
         // Clear the stale hint text once everything the strip knows about is healthy again (not
         // mid-fix): RunFix's note() writes _fixNote.Text once and nothing else used to clear it,
@@ -1687,8 +1745,10 @@ class CockpitWindow : Window
                     Dispatcher.BeginInvoke(new Action(delegate { try { ApplyHealthToUi(); } catch (Exception) { } }));
             }
             catch (Exception) { }
-            // Sleep in short slices so a Stop/close is responsive (~15s total).
-            for (int i = 0; i < 30 && !_healthStop; i++) Thread.Sleep(500);
+            // Normally poll every 15s, but wake immediately after a repair action changes state.
+            // This removes the old dead interval where the user clicked Fix, the command had
+            // already completed, yet the strip kept showing the pre-fix red snapshot.
+            if (!_healthStop) _healthWake.WaitOne(15000);
         }
     }
 
@@ -1801,6 +1861,8 @@ class CockpitWindow : Window
             string ageTxt = ts > 0 ? AgeMinutesText(ageMin) : T("hs_never");
             if (ageMin >= 20.0)
                 SetDot(5, HealthState.Red, ageTxt + " " + T("hs_tool_detail_stale"), now);
+            else if (kind == "checking" || kind == "starting")
+                SetDot(5, HealthState.Checking, ageTxt + " " + T("hs_tool_detail_checking"), now);
             else if (ok)
                 SetDot(5, HealthState.Green, ageTxt + " " + T("hs_tool_detail_ok"), now);
             else if (kind == "consent_card" || kind == "canned_fallback")
@@ -2066,8 +2128,17 @@ class CockpitWindow : Window
             server = _health[0].State; tunnel = _health[1].State; edge = _health[2].State;
             signin = _health[3].State; agent = _health[4].State; tool = _health[5].State;
         }
+        if (signin == HealthState.Red) _fixTargetMask = 1 << 3;
+        else if (edge == HealthState.Red) _fixTargetMask = 1 << 2;
+        else if (agent == HealthState.Yellow) _fixTargetMask = 1 << 4;
+        else if (server == HealthState.Red || tunnel == HealthState.Red)
+            _fixTargetMask = ((server == HealthState.Red) ? (1 << 0) : 0)
+                           | ((tunnel == HealthState.Red) ? (1 << 1) : 0);
+        else if (tool == HealthState.Red || tool == HealthState.Yellow) _fixTargetMask = 1 << 5;
+        else _fixTargetMask = 0;
         _fixRunning = true;
         ApplyHealthToUi();   // disable + keep the button visible
+        if (_fixNote != null) _fixNote.Text = T("hs_fixing");
 
         string repo = RepoRoot();
         Action<string> note = delegate (string s)
@@ -2075,7 +2146,13 @@ class CockpitWindow : Window
             try { if (!Dispatcher.HasShutdownStarted) Dispatcher.BeginInvoke(new Action(delegate { if (_fixNote != null) _fixNote.Text = s; })); }
             catch (Exception) { }
         };
-        Action done = delegate { _fixRunning = false; try { if (!Dispatcher.HasShutdownStarted) Dispatcher.BeginInvoke(new Action(delegate { ApplyHealthToUi(); })); } catch (Exception) { } };
+        Action done = delegate
+        {
+            _fixRunning = false;
+            _fixTargetMask = 0;
+            try { _healthWake.Set(); } catch (Exception) { }
+            try { if (!Dispatcher.HasShutdownStarted) Dispatcher.BeginInvoke(new Action(delegate { ApplyHealthToUi(); })); } catch (Exception) { }
+        };
 
         // Priority 1: Sign-in RED -> relaunch companion Edge HEADED for the user to sign in.
         if (signin == HealthState.Red)
