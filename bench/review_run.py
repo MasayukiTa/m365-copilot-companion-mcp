@@ -76,11 +76,100 @@ from dotenv import load_dotenv
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VENVPY = os.path.join(REPO, ".venv", "Scripts", "python.exe")
+REVIEW_ACTIVE_MARKER = os.path.join(REPO, ".fleet", "review_run_active.json")
 # review_run is also a supported direct CLI. The bridge inherits .env from its parent,
 # but `python -m bench.review_run` does not unless we load it here. Without this, the same
 # /deep-security-review silently used legacy scraping from the CLI while using LOCAL_LOOP
 # through the bridge.
 load_dotenv(os.path.join(REPO, ".env"), override=False)
+
+
+def _resume_argv(argv, stamp):
+    """Return one canonical argv carrying the durable review stamp exactly once."""
+    source = list(sys.argv[1:] if argv is None else argv)
+    result = []
+    skip = False
+    for item in source:
+        if skip:
+            skip = False
+            continue
+        if item == "--resume-stamp":
+            skip = True
+            continue
+        if str(item).startswith("--resume-stamp="):
+            continue
+        result.append(str(item))
+    result.extend(["--resume-stamp", str(stamp)])
+    return result
+
+
+def _write_review_active_marker(path, out_dir, stamp, argv, pid=None, started=None):
+    """Persist enough information for the headless supervisor to restart this pipeline."""
+    pid = os.getpid() if pid is None else int(pid)
+    previous = {}
+    try:
+        with open(path, encoding="utf-8-sig") as handle:
+            candidate = json.load(handle)
+        if str(candidate.get("stamp") or "") == str(stamp):
+            previous = candidate
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    started = (float(previous.get("started")) if previous.get("started") is not None
+               else (time.time() if started is None else float(started)))
+    payload = {
+        "version": 1, "pid": pid, "started": started, "stamp": str(stamp),
+        "out_dir": os.path.abspath(out_dir), "resume_argv": _resume_argv(argv, stamp),
+        "restart_count": int(previous.get("restart_count", 0)),
+        "last_error": str(previous.get("last_error") or "")[:2000],
+        "last_failure_at": previous.get("last_failure_at"),
+        "retry_after": 0,
+    }
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = "%s.%s.tmp" % (path, pid)
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False)
+    os.replace(temporary, path)
+    return payload
+
+
+def _record_review_failure(path, error, pid=None, now=None):
+    """Keep the marker and persist exponential retry state after an unhandled failure."""
+    pid = os.getpid() if pid is None else int(pid)
+    now = time.time() if now is None else float(now)
+    try:
+        with open(path, encoding="utf-8-sig") as handle:
+            marker = json.load(handle)
+        if int(marker.get("pid", 0)) != pid:
+            return False
+        count = int(marker.get("restart_count", 0)) + 1
+        delay = min(900, 15 * (2 ** min(count - 1, 6)))
+        marker.update({
+            "restart_count": count,
+            "last_error": ("%s: %s" % (type(error).__name__, error))[:2000],
+            "last_failure_at": now,
+            "retry_after": now + delay,
+        })
+        temporary = "%s.%s.tmp" % (path, pid)
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(marker, handle, ensure_ascii=False)
+        os.replace(temporary, path)
+        return True
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def _clear_review_active_marker(path, pid=None):
+    """Clear only this process's marker; never erase a replacement coordinator's marker."""
+    pid = os.getpid() if pid is None else int(pid)
+    try:
+        with open(path, encoding="utf-8-sig") as handle:
+            marker = json.load(handle)
+        if int(marker.get("pid", 0)) != pid:
+            return False
+        os.remove(path)
+        return True
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
 
 # bench/ has no __init__.py (implicit namespace package); when this file is run directly as
 # a script (python bench\review_run.py, not `python -m bench.review_run`), only bench/'s own
@@ -1262,6 +1351,7 @@ def build_arg_parser():
                     default="off", help=argparse.SUPPRESS)
     ap.add_argument("--p2c-level", type=int, choices=[1, 2], default=1,
                     help=argparse.SUPPRESS)
+    ap.add_argument("--resume-stamp", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--no-auto-behavioral-high", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--mode", choices=["all", "diff"], default="all")
     ap.add_argument("--base-ref", default=None)
@@ -1375,7 +1465,10 @@ def main(argv=None):
 
     repo_root = REPO
     out_dir = _resolve_out_dir(args.out_dir, repo_root)
-    stamp = _stamp()
+    if args.resume_stamp and not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", args.resume_stamp):
+        print("ERROR: --resume-stamp contains unsupported characters")
+        return 2
+    stamp = args.resume_stamp or _stamp()
 
     dimension_keys = None
     if args.dimensions:
@@ -1435,6 +1528,10 @@ def main(argv=None):
         print("no files matched --mode %s --target-path %s -- nothing to review" %
               (args.mode, args.target_path or "(none)"))
         return 0
+
+    if resilience_profile != "off":
+        marker_path = os.path.join(REPO, ".fleet", "review_run_active.json")
+        _write_review_active_marker(marker_path, out_dir, stamp, argv)
 
     if args.verify:
         print("--verify is deprecated; routing to the refuter-based pass (which already runs "
@@ -1691,4 +1788,19 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        _exit_code = main()
+    except KeyboardInterrupt:
+        # Ctrl+C is an explicit operator stop, not an interruption to resurrect.
+        _clear_review_active_marker(REVIEW_ACTIVE_MARKER, os.getpid())
+        raise
+    except Exception as _error:
+        # Preserve diagnostics and throttle deterministic crash loops while still retrying
+        # transient coordinator failures indefinitely (up to a 15-minute interval).
+        _record_review_failure(REVIEW_ACTIVE_MARKER, _error, os.getpid())
+        raise
+    else:
+        # Only a clean return clears the durable marker. An unhandled exception, process
+        # termination, power loss, or reboot leaves it for the supervisor to resume.
+        _clear_review_active_marker(REVIEW_ACTIVE_MARKER, os.getpid())
+        raise SystemExit(_exit_code)

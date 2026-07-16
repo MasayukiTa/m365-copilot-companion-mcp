@@ -17,6 +17,10 @@ import pytest
 import bench.review_run as review_run
 from bench.review_build_goals import GAPS_BEGIN, GAPS_END, REVIEW_DIMENSIONS, dimensions_for_kind
 from bench.review_run import (
+    _clear_review_active_marker,
+    _record_review_failure,
+    _resume_argv,
+    _write_review_active_marker,
     behavioral_verify,
     fleet_cmd,
     main,
@@ -78,6 +82,53 @@ def _no_fleet_guard(monkeypatch):
     def _boom(*a, **kw):
         raise AssertionError("run_fleet must not be called in this test")
     monkeypatch.setattr(review_run, "run_fleet", _boom)
+
+
+def test_review_resume_marker_preserves_stamp_and_is_pid_fenced(tmp_path):
+    marker = tmp_path / "review_run_active.json"
+    argv = ["--kind", "security", "--resilience-profile", "security",
+            "--resume-stamp", "old"]
+
+    written = _write_review_active_marker(
+        str(marker), str(tmp_path / "out"), "stable-stamp", argv,
+        pid=1234, started=10,
+    )
+
+    assert written["resume_argv"] == [
+        "--kind", "security", "--resilience-profile", "security",
+        "--resume-stamp", "stable-stamp",
+    ]
+    assert _resume_argv(written["resume_argv"], "stable-stamp").count(
+        "--resume-stamp") == 1
+    assert _clear_review_active_marker(str(marker), pid=9999) is False
+    assert marker.exists()
+    assert _clear_review_active_marker(str(marker), pid=1234) is True
+    assert not marker.exists()
+
+
+def test_review_resume_marker_preserves_failure_backoff_across_relaunch(tmp_path):
+    marker = tmp_path / "review_run_active.json"
+    _write_review_active_marker(
+        str(marker), str(tmp_path / "out"), "stable", ["--kind", "security"],
+        pid=100, started=20,
+    )
+    assert _record_review_failure(
+        str(marker), RuntimeError("network disappeared"), pid=100, now=30,
+    ) is True
+    failed = json.loads(marker.read_text(encoding="utf-8"))
+    assert failed["restart_count"] == 1
+    assert failed["retry_after"] == 45
+    assert "network disappeared" in failed["last_error"]
+
+    relaunched = _write_review_active_marker(
+        str(marker), str(tmp_path / "out"), "stable",
+        ["--kind", "security", "--resume-stamp", "stable"], pid=200,
+    )
+    assert relaunched["started"] == 20
+    assert relaunched["restart_count"] == 1
+    assert relaunched["retry_after"] == 0
+    assert _clear_review_active_marker(str(marker), pid=100) is False
+    assert _clear_review_active_marker(str(marker), pid=200) is True
 
 
 # --- --dry-run: plan only, never touches run_fleet ------------------------------------------
