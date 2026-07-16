@@ -519,7 +519,7 @@ class CockpitWindow : Window
     TextBlock _uiScaleVal;
 
     readonly string _statusPath, _commandsPath, _historyPath, _openPath;
-    string _convsPath, _hiddenPath;
+    string _convsPath, _hiddenPath, _resumeDismissPath;
     System.Collections.Generic.HashSet<string> _archivedKeys = new System.Collections.Generic.HashSet<string>();
     // Persistent "cleared" set: keys of TERMINAL cards the user dismissed via Clear. Survives
     // the runner regenerating status.json every second, so cleared cards stay gone mid-run.
@@ -673,6 +673,7 @@ class CockpitWindow : Window
         _openPath = Path.Combine(dir, "open.json");
         _convsPath = Path.Combine(dir, "conversations.json");
         _hiddenPath = Path.Combine(dir, "cockpit_hidden.json");
+        _resumeDismissPath = Path.Combine(dir, "cockpit_resume_dismissed.json");
         LoadGlyphs();
         LoadHistory();
         LoadHidden();
@@ -3496,6 +3497,61 @@ class CockpitWindow : Window
             return n;
         }
         catch (Exception) { return 0; }
+    }
+
+    // Fingerprint the exact resume state, not just its count. Dismissing one stale banner must
+    // survive restarts, but a genuinely new interrupted run (new ledger/done-map contents) must
+    // become visible again. The sidecar is UI-only: it never edits the resume ledger itself.
+    string ResumeStateSignature()
+    {
+        try
+        {
+            string stateDir = Path.GetDirectoryName(_statusPath);
+            string goalsPath = Path.Combine(stateDir, "last_run_goals.json");
+            if (!File.Exists(goalsPath)) return "";
+            string donePath = Path.Combine(stateDir, "last_run_done.json");
+            string payload = File.ReadAllText(goalsPath, Encoding.UTF8) + "\n\0\n"
+                           + (File.Exists(donePath) ? File.ReadAllText(donePath, Encoding.UTF8) : "");
+            byte[] bytes = new UTF8Encoding(false).GetBytes(payload);
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            {
+                byte[] hash = sha.ComputeHash(bytes);
+                var sb = new StringBuilder();
+                foreach (byte b in hash) sb.Append(b.ToString("x2"));
+                return sb.ToString().Substring(0, 24);
+            }
+        }
+        catch (Exception) { return ""; }
+    }
+
+    bool ResumeStateDismissed(string signature)
+    {
+        if (string.IsNullOrEmpty(signature)) return false;
+        try
+        {
+            if (!File.Exists(_resumeDismissPath)) return false;
+            var data = _js.DeserializeObject(File.ReadAllText(_resumeDismissPath, Encoding.UTF8))
+                       as Dictionary<string, object>;
+            return data != null && S(data, "signature") == signature;
+        }
+        catch (Exception) { return false; }
+    }
+
+    void DismissResumeState(string signature)
+    {
+        if (string.IsNullOrEmpty(signature)) return;
+        try
+        {
+            var data = new Dictionary<string, object>();
+            data["signature"] = signature; data["dismissed_at"] = NowUnix();
+            string tmp = _resumeDismissPath + ".tmp";
+            File.WriteAllText(tmp, _js.Serialize(data), new UTF8Encoding(false));
+            try { File.Replace(tmp, _resumeDismissPath, null); }
+            catch { File.Copy(tmp, _resumeDismissPath, true); try { File.Delete(tmp); } catch { } }
+        }
+        catch (Exception) { }
+        _lastSig = "";
+        OnTick(null, null);
     }
 
     // --- slash-command autocomplete for the goal box (parity with the main chat) ---
@@ -6418,16 +6474,18 @@ class CockpitWindow : Window
             // P2 RESUME affordance: only meaningful when NO run is live (this idle branch). Compute the
             // unfinished count from the last run's durable ledger; hide when 0.
             int resumeN = UnfinishedResumeCount();
+            string resumeSig = resumeN > 0 ? ResumeStateSignature() : "";
+            bool resumeDismissed = resumeN > 0 && ResumeStateDismissed(resumeSig);
             string isig = "IDLE" + _history.Count + (_dark ? "D" : "L") + _lang + "|q" + (_histQuery ?? "")
-                          + "|r" + resumeN;
+                          + "|r" + resumeN + "|rs" + resumeSig + "|rd" + (resumeDismissed ? "1" : "0");
             if (_lastSig != isig)
             {
                 _lastRoot = null;
                 var rows = new List<object>();
-                if (resumeN > 0)
+                if (resumeN > 0 && !resumeDismissed)
                 {
                     var rd = new Dictionary<string, object>();
-                    rd["n"] = resumeN;
+                    rd["n"] = resumeN; rd["signature"] = resumeSig;
                     rows.Add(MkRow(8, null, rd));   // resume affordance (idle + N>0 only)
                 }
                 AppendHistoryRows(rows, null);   // idle: no live run on board -> show all history
@@ -7096,7 +7154,8 @@ class CockpitWindow : Window
             case 7:                                            // date-group subheader: keyed on its label
                 return "HG|" + g + "|" + (hist != null ? S(hist, "label") : "");
             case 8:                                            // resume affordance: keyed on N
-                return "RA|" + g + "|" + (hist != null ? I(hist, "n") : 0);
+                return "RA|" + g + "|" + (hist != null ? I(hist, "n") : 0)
+                       + "|" + (hist != null ? S(hist, "signature") : "");
             case 4: return "DV|" + g;                          // "完了 (this run)" divider
             case 5: return "ES|" + g;                          // empty state (static chrome)
             case 6:                                            // directive band: keyed on first-worker goal + started
@@ -7228,7 +7287,9 @@ class CockpitWindow : Window
             if (r.Kind == 5) return _w.EmptyState();
             if (r.Kind == 6) return _w.DirectiveBand(r.Worker);
             if (r.Kind == 7) return _w.HistoryGroupHeader(r.Hist != null ? S(r.Hist, "label") : "");
-            if (r.Kind == 8) return _w.ResumeAffordance(r.Hist != null ? I(r.Hist, "n") : 0);
+            if (r.Kind == 8) return _w.ResumeAffordance(
+                r.Hist != null ? I(r.Hist, "n") : 0,
+                r.Hist != null ? S(r.Hist, "signature") : "");
             return null;
         }
         public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
@@ -7321,13 +7382,26 @@ class CockpitWindow : Window
     // P2 RESUME: inline banner shown (idle only, N>0) offering to relaunch the fleet with --resume,
     // which re-queues the unfinished goals from the last run's durable ledger. Hidden while a run is
     // live or when N==0 (the row is simply not emitted in those cases).
-    UIElement ResumeAffordance(int n)
+    UIElement ResumeAffordance(int n, string signature)
     {
         var row = new Border {
             BorderThickness = new Thickness(1), BorderBrush = Border, Background = BtnBg,
             CornerRadius = new CornerRadius(Theme.RadCard),
             Padding = new Thickness(14, 8, 14, 8), Margin = new Thickness(8, 8, 8, 4) };
         var dp = new DockPanel { LastChildFill = true };
+
+        // This banner is advisory, not a blocking error. Let the user dismiss this exact stale
+        // resume state permanently; a new interrupted run has a different signature and returns.
+        var close = IconButton("close", 14, _lang == 0 ? "未完了ランの通知を閉じる" : "Dismiss unfinished-run notice");
+        close.Width = 28; close.Height = 28; close.Margin = new Thickness(8, 0, 0, 0);
+        close.Padding = new Thickness(0); close.BorderThickness = new Thickness(0);
+        close.Background = Brushes.Transparent; close.Foreground = Muted;
+        close.Template = FlatButtonTemplate();
+        close.ToolTip = _lang == 0 ? "この未完了ランを非表示" : "Hide this unfinished run";
+        string capturedSignature = signature;
+        close.Click += delegate (object sender, RoutedEventArgs e)
+        { e.Handled = true; DismissResumeState(capturedSignature); };
+        DockPanel.SetDock(close, Dock.Right); dp.Children.Add(close);
 
         var btn = new Button {
             Content = _lang == 0 ? "再開" : "Resume", Cursor = Cursors.Hand, FontSize = 12,
