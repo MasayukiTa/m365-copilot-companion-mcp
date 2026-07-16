@@ -286,18 +286,34 @@ from tools import tool_probe
 
 load_dotenv()
 
-def _p2c_review_enabled():
-    """Read the flag on demand so editing .env works even if the bridge is already running."""
+def _p2c_review_level():
+    """Return the on-demand P2c level (0=off, 1=deep, 2=full validation).
+
+    Invalid values fail closed to 0.  Reading the file on demand keeps the existing
+    behavior where editing .env takes effect without rebuilding the native UI.
+    """
+    raw_value = None
     try:
         env_path = REPO / ".env"
         if env_path.is_file():
             for raw in env_path.read_text(encoding="utf-8-sig").splitlines():
                 line = raw.strip()
                 if line.startswith("MCP_REVIEW_P2C="):
-                    return line.split("=", 1)[1].strip() == "1"
+                    raw_value = line.split("=", 1)[1].strip()
+                    break
     except Exception:
         pass
-    return os.environ.get("MCP_REVIEW_P2C", "0").strip() == "1"
+    if raw_value is None:
+        raw_value = os.environ.get("MCP_REVIEW_P2C", "0").strip()
+    try:
+        level = int(raw_value)
+    except (TypeError, ValueError):
+        return 0
+    return level if level in (0, 1, 2) else 0
+
+
+def _p2c_review_enabled():
+    return _p2c_review_level() > 0
 
 
 P2C_HELP_TEXT = (
@@ -3115,14 +3131,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             parsed = review_command.parse_review_command(msg)
-            if parsed.get("resilience") and not _p2c_review_enabled():
+            p2c_level = _p2c_review_level()
+            if parsed.get("resilience") and p2c_level == 0:
                 self._sse({"delta": (
-                    "深掘りレビューは無効です。.env の MCP_REVIEW_P2C=1 に変更して "
+                    "深掘りレビューは無効です。.env の MCP_REVIEW_P2C=1（深掘り）または "
+                    "2（フル検証）に変更して "
                     "start_all.bat を再実行すると /deep-review と /deep-security-review が使えます。"
                 )})
                 self._sse({}, "done")
                 return
-            argv = review_command.build_review_argv(parsed, repo_root, venvpy)
+            argv = review_command.build_review_argv(
+                parsed, repo_root, venvpy, p2c_level=p2c_level)
 
             self._sse({"delta": "レビューを開始します（数分〜）...\n"})
 

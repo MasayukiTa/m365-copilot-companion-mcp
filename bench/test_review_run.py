@@ -1755,6 +1755,118 @@ def test_cli_p2c_baseline_uses_final_adjudicated_findings_for_gate_and_snapshot(
     assert [item["title"] for item in next_baseline["accepted"]] == ["old bug"]
 
 
+def test_p2c_level_two_active_evidence_is_fail_closed(tmp_path):
+    goals, envelopes = review_run._prepare_resilience_goals(
+        [{"text": "inspect x.py", "cwd": str(tmp_path)}],
+        [{"dimension": "runtime_behavior", "files": ["x.py"]}],
+        "security", "20260716_000000", p2c_level=2,
+    )
+    assert review_run.ACTIVE_VALIDATION_BEGIN in goals[0]["text"]
+    assert goals[0]["metadata"]["p2c_level"] == 2
+    task_id = next(iter(envelopes))
+    state = tmp_path / "state"
+    state.mkdir()
+    status_path = state / "status.json"
+    evidence = (
+        review_run.ACTIVE_VALIDATION_BEGIN + "\n" +
+        json.dumps({"status": "executed", "method": "pytest x.py",
+                    "evidence": "payload rejected with exit 0"}) + "\n" +
+        review_run.ACTIVE_VALIDATION_END
+    )
+    status_path.write_text(json.dumps({"workers": [{
+        "task_id": task_id, "outcome": "DONE", "display_result": evidence,
+    }]}), encoding="utf-8")
+    assurance = review_run.evaluate_full_validation(
+        status_path, state / "transcripts", envelopes, [], completeness_gaps={})
+    assert assurance["verdict"] == "VERIFIED_WITHIN_SCOPE"
+
+    status_path.write_text(json.dumps({"workers": [{
+        "task_id": task_id, "outcome": "DONE", "display_result": "static only",
+    }]}), encoding="utf-8")
+    assurance = review_run.evaluate_full_validation(
+        status_path, state / "transcripts", envelopes, [], completeness_gaps={})
+    assert assurance["verdict"] == "INCONCLUSIVE"
+
+
+def test_p2c_level_two_confirmed_finding_is_vulnerable(tmp_path):
+    goals, envelopes = review_run._prepare_resilience_goals(
+        [{"text": "inspect x.py", "cwd": str(tmp_path)}],
+        [{"dimension": "adversarial_input", "files": ["x.py"]}],
+        "security", "20260716_000001", p2c_level=2,
+    )
+    task_id = next(iter(envelopes))
+    status_path = tmp_path / "status.json"
+    evidence = (review_run.ACTIVE_VALIDATION_BEGIN + "\n" + json.dumps({
+        "status": "vulnerable", "method": "local harness", "evidence": "injection reproduced",
+    }) + "\n" + review_run.ACTIVE_VALIDATION_END)
+    status_path.write_text(json.dumps({"workers": [{
+        "task_id": task_id, "outcome": "DONE", "display_result": evidence,
+    }]}), encoding="utf-8")
+    assurance = review_run.evaluate_full_validation(
+        status_path, tmp_path / "transcripts", envelopes,
+        [{"verify_verdict": "confirmed"}], completeness_gaps={})
+    assert assurance["verdict"] == "VULNERABLE"
+
+
+def test_cli_p2c_level_two_missing_active_evidence_exits_inconclusive(
+        repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    def fake_run_fleet(goals_path, max_concurrent, effort, state_dir=None, **kwargs):
+        with open(goals_path, encoding="utf-8") as handle:
+            goal = json.loads(next(line for line in handle if line.strip()))
+        os.makedirs(state_dir, exist_ok=True)
+        with open(os.path.join(state_dir, "status.json"), "w", encoding="utf-8") as handle:
+            json.dump({"workers": [{
+                "task_id": goal["task_id"], "outcome": "DONE", "status": "done",
+                "display_result": _findings_worker_text([]), "transcript": "",
+            }]}, handle)
+        return 0
+
+    monkeypatch.setattr(review_run, "run_fleet", fake_run_fleet)
+    monkeypatch.setattr(review_run, "run_completeness_critic", lambda *a, **kw: {
+        "missing_dimensions": [], "missing_files": [], "unverified_claims": [],
+    })
+    rc = main([
+        "--kind", "security", "--group-size", "10", "--dimensions", "runtime_behavior",
+        "--resilience-profile", "security", "--p2c-level", "2", "--no-refute",
+    ])
+    assert rc == 4
+    assert "FULL-VALIDATION GATE: INCONCLUSIVE" in capsys.readouterr().out
+
+
+def test_cli_p2c_level_two_complete_active_evidence_can_pass(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    def fake_run_fleet(goals_path, max_concurrent, effort, state_dir=None, **kwargs):
+        with open(goals_path, encoding="utf-8") as handle:
+            goal = json.loads(next(line for line in handle if line.strip()))
+        active = (review_run.ACTIVE_VALIDATION_BEGIN + "\n" + json.dumps({
+            "status": "executed", "method": "pytest local harness",
+            "evidence": "adversarial sample rejected and state remained unchanged",
+        }) + "\n" + review_run.ACTIVE_VALIDATION_END + "\n")
+        os.makedirs(state_dir, exist_ok=True)
+        with open(os.path.join(state_dir, "status.json"), "w", encoding="utf-8") as handle:
+            json.dump({"workers": [{
+                "task_id": goal["task_id"], "outcome": "DONE", "status": "done",
+                "display_result": active + _findings_worker_text([]), "transcript": "",
+            }]}, handle)
+        return 0
+
+    monkeypatch.setattr(review_run, "run_fleet", fake_run_fleet)
+    monkeypatch.setattr(review_run, "run_completeness_critic", lambda *a, **kw: {
+        "missing_dimensions": [], "missing_files": [], "unverified_claims": [],
+    })
+    rc = main([
+        "--kind", "security", "--group-size", "10", "--dimensions", "runtime_behavior",
+        "--resilience-profile", "security", "--p2c-level", "2", "--no-refute",
+    ])
+    assert rc == 0
+    assert "full-validation: verdict=VERIFIED_WITHIN_SCOPE" in capsys.readouterr().out
+
+
 # --- --baseline / --write-baseline / --fail-on: without them, behavior is unchanged ----------
 
 def test_cli_without_baseline_flags_report_has_no_baseline_diff_key(repo, monkeypatch, capsys):

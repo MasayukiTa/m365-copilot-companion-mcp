@@ -19,7 +19,13 @@ def test_deep_review_argv_enables_matching_profile():
     parsed = parse_review_command("/deep-security-review")
     argv = build_review_argv(parsed, "C:/repo", "python.exe")
     assert argv[:2] == ["python.exe", os.path.join("C:/repo", "bench", "review_run.py")]
-    assert argv[-2:] == ["--resilience-profile", "security"]
+    assert argv[-4:] == ["--resilience-profile", "security", "--p2c-level", "1"]
+
+
+def test_deep_review_argv_propagates_full_validation_level():
+    parsed = parse_review_command("/deep-security-review")
+    argv = build_review_argv(parsed, "C:/repo", "python.exe", p2c_level=2)
+    assert argv[-4:] == ["--resilience-profile", "security", "--p2c-level", "2"]
 
 
 def test_legacy_p2c_names_remain_compatibility_aliases():

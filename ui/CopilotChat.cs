@@ -1970,9 +1970,11 @@ class ChatWindow : Window
 
     // Read on demand: changing .env takes effect the next time the slash palette or /help opens,
     // even when CopilotChat is already running. Keep the same precedence/semantics as the bridge:
-    // a repo .env value wins; the process environment is only a fallback; exactly "1" enables it.
-    bool P2cReviewEnabled()
+    // a repo .env value wins; the process environment is only a fallback. 0=off, 1=deep,
+    // 2=full validation. Invalid values fail closed.
+    int P2cReviewLevel()
     {
+        string rawValue = null;
         try
         {
             string path = Path.Combine(RepoRoot(), ".env");
@@ -1982,13 +1984,22 @@ class ChatWindow : Window
                 {
                     string line = (raw ?? "").Trim().TrimStart('\uFEFF');
                     if (line.StartsWith("MCP_REVIEW_P2C=", StringComparison.Ordinal))
-                        return line.Substring("MCP_REVIEW_P2C=".Length).Trim() == "1";
+                    {
+                        rawValue = line.Substring("MCP_REVIEW_P2C=".Length).Trim();
+                        break;
+                    }
                 }
             }
         }
         catch { }
-        return (Environment.GetEnvironmentVariable("MCP_REVIEW_P2C") ?? "0").Trim() == "1";
+        if (rawValue == null)
+            rawValue = (Environment.GetEnvironmentVariable("MCP_REVIEW_P2C") ?? "0").Trim();
+        int level;
+        if (!Int32.TryParse(rawValue, out level) || level < 0 || level > 2) return 0;
+        return level;
     }
+
+    bool P2cReviewEnabled() { return P2cReviewLevel() > 0; }
 
     // Display-only descriptions (insert uses Tag=name), localized at access time. P2c commands
     // are deliberately absent from the base arrays and are materialized only when the flag is on.
