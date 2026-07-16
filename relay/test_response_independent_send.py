@@ -24,6 +24,7 @@ class _Locator:
 class _Page:
     def __init__(self):
         self.keyboard = _Keyboard()
+        self.url = "https://m365.cloud.microsoft/chat/agent/test/conversation/existing"
 
     def locator(self, selector):
         return _Locator()
@@ -54,3 +55,20 @@ def test_answer_read_counter_is_observable(monkeypatch):
     monkeypatch.setattr(driver, "_answers", lambda: type("A", (), {"count": lambda self: 0})())
     assert driver.read_last_response() == ""
     assert driver.answer_content_reads == 1
+
+
+def test_fresh_page_requires_submission_acknowledgement(monkeypatch):
+    page = _Page()
+    page.url = "https://m365.cloud.microsoft/chat/agent/test"
+    driver = relay.CopilotWebDriver(page)
+    driver.SUBMIT_ACK_WAIT_S = .01
+    monkeypatch.setattr(relay, "_page_network_available", lambda current: True)
+    monkeypatch.setattr(driver, "_page_alive", lambda: True)
+    monkeypatch.setattr(driver, "_is_generating", lambda: False)
+    monkeypatch.setattr(driver, "_wait_send_armed", lambda timeout_s: True)
+    monkeypatch.setattr(driver, "_send_button", lambda: None)
+    monkeypatch.setattr(driver, "_composer_text", lambda: "")
+
+    import pytest
+    with pytest.raises(RuntimeError, match="without a conversation or generation"):
+        driver.send("RUN job_1 seq=1 worker=w", track_answer=False)

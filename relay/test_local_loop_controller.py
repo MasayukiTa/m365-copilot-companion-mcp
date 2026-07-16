@@ -62,6 +62,27 @@ class NoCommitDriver(CommitOnSendDriver):
         self.sent.append(text)
 
 
+class FinishedWithoutCommitDriver(NoCommitDriver):
+    def __init__(self, store):
+        super().__init__(store, [])
+        self.responses = 0
+
+    def send(self, text, track_answer=True):
+        assert track_answer is False
+        self.sent.append(text)
+        parts = dict(part.split("=", 1) for part in text.split()[2:])
+        self.store.claim_turn("job_1", int(parts["seq"]), parts["worker"])
+        self.responses += 1
+
+    def response_block_count(self):
+        return self.responses
+
+
+class SendFailureDriver(NoCommitDriver):
+    def send(self, text, track_answer=True):
+        raise RuntimeError("composer cleared without a conversation receipt")
+
+
 class RetryAbortThenCommitDriver(CommitOnSendDriver):
     def __init__(self, store):
         super().__init__(store, [])
@@ -249,6 +270,48 @@ def test_retryable_abort_is_retried_without_waiting_for_commit_timeout(tmp_path)
     assert controller.run() == "DONE"
     assert len(driver.sent) == 2
     assert store.get_job_status("job_1")["retry_count"] == 1
+
+
+def test_finished_response_without_commit_rotates_immediately_and_retries(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job())
+    first = FinishedWithoutCommitDriver(store)
+    second = CommitOnSendDriver(store, ["CANDIDATE_DONE"])
+    rotations = []
+    controller = LocalLoopController(
+        store, "job_1", first, rotate_after_turns=0, poll_seconds=.005,
+        no_commit_idle_seconds=.01,
+        rotate_driver=lambda old, reason: rotations.append(reason) or second,
+        acceptance_runner=lambda current: (True, "verified"),
+    )
+
+    assert controller.run() == "DONE"
+    assert rotations == ["response finished without commit"]
+    assert len(first.sent) == 1 and len(second.sent) == 1
+    status = store.get_job_status("job_1", event_limit=30)
+    assert status["retry_count"] == 1
+    assert any(event["event"] == "TURN_FINISHED_WITHOUT_COMMIT"
+               for event in status["events"])
+
+
+def test_send_failure_rotates_instead_of_terminating_controller(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    store.create_job(_job())
+    first = SendFailureDriver(store, [])
+    second = CommitOnSendDriver(store, ["CANDIDATE_DONE"])
+    rotations = []
+    controller = LocalLoopController(
+        store, "job_1", first, rotate_after_turns=0, poll_seconds=.01,
+        rotate_driver=lambda old, reason: rotations.append(reason) or second,
+        acceptance_runner=lambda current: (True, "verified"),
+    )
+
+    assert controller.run() == "DONE"
+    assert rotations == ["send failed"]
+    assert any(
+        event["event"] == "UI_TRIGGER_FAILED"
+        for event in store.get_job_status("job_1", event_limit=30)["events"]
+    )
 
 
 def test_retry_attempt_does_not_consume_logical_turn_budget(tmp_path):
