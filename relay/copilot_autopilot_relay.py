@@ -47,12 +47,34 @@ NOTES
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import os
 import random
 import re
 import sys
 import time
 from pathlib import Path
+
+
+def conversation_start_label(worker_name: str = "", now: datetime | None = None) -> str:
+    """Return a short, non-instructional label for the first message in a new chat.
+
+    M365 Copilot derives conversation titles from the beginning of the first user
+    message.  Fleet prompts otherwise all begin with the same protocol, making the
+    agent-side history impossible to distinguish.  Keep the changing metadata out
+    of the protocol itself: it is display/operations metadata only and is added once
+    per new conversation (not to continuation or retry turns).
+    """
+    current = (now or datetime.now().astimezone())
+    if current.tzinfo is None:
+        current = current.astimezone()
+    offset = current.strftime("%z")
+    if len(offset) == 5:
+        offset = offset[:3] + ":" + offset[3:]
+    worker = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(worker_name or "relay")).strip("-")
+    worker = worker[:24] or "relay"
+    return "[%s %s | %s]\n" % (
+        current.strftime("%Y-%m-%d %H:%M:%S"), offset or "local", worker)
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -1463,7 +1485,9 @@ def run_relay(
             notify("♻ Relay 会話リサイクル",
                    f"トークン上限 → 新会話で続行 ({recycles}/{max_recycles})")
             # Re-anchor the goal as the first message of the fresh conversation.
-            job = PROTOCOL + RECYCLE_PREFIX + goal + context + (FORGE_HINT if forge else "")
+            job = (conversation_start_label((run_id or "relay") + "-recycle%d" % recycles)
+                   + PROTOCOL + RECYCLE_PREFIX + goal + context
+                   + (FORGE_HINT if forge else ""))
             no_progress = 0
             last_norm = None
             turn -= 1                       # the recycle itself is not a work turn
