@@ -6,6 +6,7 @@ tmp_path only -- no network, no fleet, no real repo.
 """
 import json
 import os
+import posixpath
 
 import pytest
 
@@ -22,7 +23,7 @@ from bench.review_baseline import (
 
 def test_dedupe_key_shape():
     f = {"file": "a/b.py", "line": 10, "title": "  Some Title  "}
-    assert dedupe_key(f) == (os.path.normpath("a/b.py"), 10, "some title")
+    assert dedupe_key(f) == (posixpath.normpath("a/b.py"), 10, "some title")
 
 
 def test_dedupe_key_normalizes_path_separators():
@@ -38,14 +39,14 @@ def test_dedupe_key_case_and_whitespace_insensitive_title():
 
 
 def test_dedupe_key_missing_fields_never_raises():
-    assert dedupe_key({}) == (os.path.normpath(""), None, "")
-    assert dedupe_key({"file": "a.py"}) == (os.path.normpath("a.py"), None, "")
+    assert dedupe_key({}) == (posixpath.normpath(""), None, "")
+    assert dedupe_key({"file": "a.py"}) == (posixpath.normpath("a.py"), None, "")
 
 
 def test_dedupe_key_non_dict_never_raises():
-    assert dedupe_key(None) == (os.path.normpath(""), None, "")
-    assert dedupe_key("garbage") == (os.path.normpath(""), None, "")
-    assert dedupe_key(42) == (os.path.normpath(""), None, "")
+    assert dedupe_key(None) == (posixpath.normpath(""), None, "")
+    assert dedupe_key("garbage") == (posixpath.normpath(""), None, "")
+    assert dedupe_key(42) == (posixpath.normpath(""), None, "")
 
 
 # --- load_baseline -----------------------------------------------------------------------
@@ -59,7 +60,7 @@ def test_load_baseline_well_formed_file(tmp_path):
     path = str(tmp_path / "baseline.json")
     payload = {"version": 1, "kind": "review", "generated_at": 123.0, "accepted": [
         {"file": "a.py", "line": 1, "title": "T", "severity": "high",
-         "key": [os.path.normpath("a.py"), 1, "t"]},
+         "key": [posixpath.normpath("a.py"), 1, "t"]},
     ]}
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f)
@@ -122,7 +123,7 @@ def test_load_baseline_normalizes_run_report_shape_confirmed_only(tmp_path):
     assert baseline["version"] == 1
     assert len(baseline["accepted"]) == 1
     assert baseline["accepted"][0]["title"] == "Confirmed one"
-    assert baseline["accepted"][0]["key"] == [os.path.normpath("a.py"), 1, "confirmed one"]
+    assert baseline["accepted"][0]["key"] == [posixpath.normpath("a.py"), 1, "confirmed one"]
 
 
 def test_load_baseline_normalizes_run_report_shape_no_verify_data_accepts_all(tmp_path):
@@ -190,7 +191,7 @@ def test_save_baseline_round_trips_through_load_baseline(tmp_path):
     assert entry0["line"] == 1
     assert entry0["title"] == "Bug One"
     assert entry0["severity"] == "high"
-    assert entry0["key"] == [os.path.normpath("a.py"), 1, "bug one"]
+    assert entry0["key"] == [posixpath.normpath("a.py"), 1, "bug one"]
     assert "extra" not in entry0  # only the documented fields are extracted
 
 
@@ -234,7 +235,7 @@ def _baseline_with(*entries):
 
 def _entry(file, line, title, severity="low"):
     return {"file": file, "line": line, "title": title, "severity": severity,
-            "key": [os.path.normpath(file), line, title.strip().lower()]}
+            "key": [posixpath.normpath(file), line, title.strip().lower()]}
 
 
 def test_diff_new_finding_not_in_baseline():

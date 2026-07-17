@@ -39,6 +39,12 @@ REVIEW_DIM_COUNT = len(dimensions_for_kind("review"))
 SECURITY_DIM_COUNT = len(dimensions_for_kind("security"))
 
 
+def test_review_loop_dedupe_key_is_separator_portable():
+    forward = {"file": "src/module.py", "line": 7, "title": "Issue"}
+    backward = {"file": "src\\module.py", "line": 7, "title": "Issue"}
+    assert review_run._dedupe_key(forward) == review_run._dedupe_key(backward)
+
+
 def _run(cmd, cwd):
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8")
     assert r.returncode == 0, "cmd %r failed: %s\n%s" % (cmd, r.stdout, r.stderr)
