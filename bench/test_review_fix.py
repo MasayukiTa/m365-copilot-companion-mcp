@@ -27,6 +27,7 @@ from bench.review_fix import (
     load_manifest,
     load_report,
     main,
+    report_completion_error,
     undo,
     write_manifest,
     write_undo_bat,
@@ -75,12 +76,14 @@ def repo(tmp_path):
 
 
 def _finding(file="a.py", line=1, severity="medium", title="issue", detail="d",
-             verified=None, verify_verdict=None):
+             verified=None, verify_verdict=None, finding_state="confirmed"):
     f = {"file": file, "line": line, "severity": severity, "title": title, "detail": detail}
     if verified is not None:
         f["verified"] = verified
     if verify_verdict is not None:
         f["verify_verdict"] = verify_verdict
+    if finding_state is not None:
+        f["finding_state"] = finding_state
     return f
 
 
@@ -130,14 +133,38 @@ def test_filter_findings_verified_only_keeps_true_only(capsys):
     assert "verified data absent" not in capsys.readouterr().out
 
 
-def test_filter_findings_verified_only_warns_when_field_absent(capsys):
+def test_filter_findings_verified_only_fails_closed_when_field_absent(capsys):
     findings = [_finding(title="no-verified-field")]
     assert "verified" not in findings[0]
     kept = filter_findings(findings, min_severity="low", verified_only=True)
     out = capsys.readouterr().out
     assert "verified data absent" in out
-    # NOT silently emptied: the severity-filtered findings are still returned
-    assert [f["title"] for f in kept] == ["no-verified-field"]
+    assert kept == []
+
+
+def test_filter_findings_drops_unclear_and_unverified_by_default():
+    findings = [
+        _finding(title="unclear", verify_verdict="unclear", finding_state="contested"),
+        _finding(title="legacy", finding_state=None),
+        _finding(title="confirmed", verify_verdict="confirmed", finding_state=None),
+    ]
+    assert [f["title"] for f in filter_findings(findings, min_severity="low")] == ["confirmed"]
+    assert [f["title"] for f in filter_findings(
+        findings, min_severity="low", include_unverified=True
+    )] == ["legacy", "confirmed"]
+
+
+def test_report_completion_error_is_fail_closed():
+    assert "no phase_completion" in report_completion_error({})
+    assert "PARTIAL" in report_completion_error({
+        "phase_completion": {"complete": False, "incomplete_count": 2}
+    })
+    assert "PARTIAL" in report_completion_error({
+        "phase_completion": {"complete": False, "status": "complete"}
+    })
+    assert report_completion_error({
+        "phase_completion": {"complete": True, "status": "complete"}
+    }) is None
 
 
 # --- group_findings_by_file -------------------------------------------------------------------
@@ -419,6 +446,8 @@ def _write_report(review_dir, stamp, findings):
     os.makedirs(review_dir, exist_ok=True)
     path = os.path.join(review_dir, "review_report_%s.json" % stamp)
     payload = {"workers_total": 1, "parse_errors": 0, "findings": findings,
+               "phase_completion": {"complete": True, "status": "complete",
+                                    "incomplete_count": 0},
                "by_severity": {"high": [], "medium": [], "low": []}}
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)
@@ -475,6 +504,25 @@ def test_main_zero_findings_after_filter(repo, monkeypatch, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "0 findings match, nothing to fix" in out
+
+
+def test_main_refuses_partial_report(repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_fix, "REPO", repo)
+    monkeypatch.setattr(review_run, "REPO", repo)
+    _no_fleet_guard(monkeypatch)
+    review_dir = os.path.join(repo, ".fleet", "review")
+    path = _write_report(review_dir, "20260101_000000", [
+        _finding(file="a.py", severity="high")
+    ])
+    with open(path, encoding="utf-8") as f:
+        payload = json.load(f)
+    payload["phase_completion"] = {"complete": False, "status": "partial",
+                                   "incomplete_count": 1}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+
+    assert main(["--dry-run"]) == 2
+    assert "REFUSING reviewfix" in capsys.readouterr().out
 
 
 # --- main() non-dry-run: fake fleet + failing test gate ---------------------------------------
@@ -613,6 +661,8 @@ def test_build_arg_parser_defaults():
     args = build_arg_parser().parse_args([])
     assert args.min_severity == "medium"
     assert args.verified_only is False
+    assert args.include_unverified is False
+    assert args.allow_incomplete_report is False
     assert args.max_concurrent == 4
     assert args.group_size == 5
     assert args.effort == "auto"

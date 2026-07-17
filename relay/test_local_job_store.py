@@ -287,6 +287,37 @@ def test_non_review_unsafe_abort_still_fails_closed(tmp_path):
     assert store.get_job_status("job_1")["status"] == "FAILED"
 
 
+def test_terminal_review_turn_can_be_requeued_without_losing_prior_commits(tmp_path):
+    store = _store(tmp_path)
+    job = _job()
+    job["turn_plan"] = [
+        {"instruction": "pass one"},
+        {"instruction": "pass two"},
+    ]
+    store.create_job(job, now=0)
+    first = store.claim_turn("job_1", 1, "w1", now=1)
+    store.commit_turn(
+        "job_1", 1, first["lease_id"], first["fencing_token"],
+        "CONTINUE", "preserved evidence", now=2,
+    )
+    second = store.claim_turn("job_1", 2, "w2", now=3)
+    store.abort_turn(
+        "job_1", 2, second["lease_id"], second["fencing_token"],
+        "RUNTIME_FAILURE", "browser target vanished", False, now=4,
+    )
+
+    result = store.requeue_terminal_turn("job_1", "automatic replay", now=5)
+
+    assert result["status"] == "READY"
+    status = store.get_job_status("job_1", event_limit=30)
+    assert status["current_seq"] == 2
+    assert status["last_committed_seq"] == 1
+    assert status["retry_count"] == 0
+    replay = store.claim_turn("job_1", 2, "replacement", now=6)
+    assert replay["context"]["previous_summary"] == "preserved evidence"
+    assert any(event["event"] == "TERMINAL_JOB_REQUEUED" for event in status["events"])
+
+
 def test_console_projection_uses_committed_summary_not_web_transcript(tmp_path):
     store = _store(tmp_path)
     store.create_job(_job(), now=0)

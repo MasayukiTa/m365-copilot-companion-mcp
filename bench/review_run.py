@@ -367,6 +367,52 @@ def run_fleet(goals_path, max_concurrent, effort, state_dir=None,
     return proc.returncode
 
 
+def evaluate_phase_completion(expected_phases):
+    """Summarize executed phase status files without treating a report as completion."""
+    phases = []
+    incomplete_total = 0
+    for name, status_path in expected_phases:
+        phase = {
+            "name": str(name), "status_path": os.path.abspath(status_path),
+            "complete": False, "total": 0, "done": 0, "incomplete_workers": [],
+        }
+        try:
+            with open(status_path, encoding="utf-8-sig") as handle:
+                payload = json.load(handle)
+            workers = payload.get("workers", []) if isinstance(payload, dict) else []
+            if not isinstance(workers, list):
+                workers = []
+            phase["total"] = len(workers)
+            for worker in workers:
+                if not isinstance(worker, dict):
+                    continue
+                status = str(worker.get("status") or "").lower()
+                outcome = str(worker.get("outcome") or "").upper()
+                if status == "done" or outcome == "DONE":
+                    phase["done"] += 1
+                else:
+                    phase["incomplete_workers"].append({
+                        "name": str(worker.get("name") or "?"),
+                        "status": status or outcome.lower() or "unknown",
+                        "reason": str(worker.get("reason") or "")[:1000],
+                    })
+            phase["complete"] = bool(workers) and not phase["incomplete_workers"]
+            if not workers:
+                phase["error"] = "status contains no workers"
+        except Exception as exc:
+            phase["error"] = "%s: %s" % (type(exc).__name__, exc)
+        if not phase["complete"]:
+            incomplete_total += max(1, len(phase["incomplete_workers"]))
+        phases.append(phase)
+    return {
+        "status": "complete" if phases and incomplete_total == 0 else "partial",
+        "complete": bool(phases) and incomplete_total == 0,
+        "phase_count": len(phases),
+        "incomplete_count": incomplete_total,
+        "phases": phases,
+    }
+
+
 _P2C_PROHIBITED_ACTIONS = (
     "do not remove or weaken the authorization preamble",
     "do not expand the parent file scope",
@@ -1555,6 +1601,7 @@ def main(argv=None):
     run_completeness = args.completeness or full_validation
 
     loop_meta = None
+    expected_phase_states = []
     if args.loop:
         # P3 piece A: loop-until-dry. Everything below this branch (plan_goals/run_fleet for
         # a single pass, and the single-pass refute/behavioral/completeness wiring in the
@@ -1585,6 +1632,8 @@ def main(argv=None):
                              if resilience_profile != "off"
                              else os.path.join(repo_root, ".fleet"))
         if resilience_profile != "off":
+            expected_phase_states.append(("primary", os.path.join(primary_state_dir, "status.json")))
+        if resilience_profile != "off":
             run_fleet(goals_path, max_concurrent, args.effort, state_dir=primary_state_dir,
                       resilience_profile=resilience_profile, max_turns=12)
         else:
@@ -1613,6 +1662,10 @@ def main(argv=None):
             else:
                 print("launching refuter pass: %d finding(s)%s..." %
                       (len(findings), " (panel)" if panel else ""))
+                if resilience_profile != "off":
+                    expected_phase_states.append((
+                        "refute", os.path.join(out_dir, "refute_state_%s" % stamp, "status.json"),
+                    ))
                 verdicts = refute_findings(findings, args.kind, out_dir, time.time(),
                                             panel=panel, max_concurrent=max_concurrent,
                                             effort=args.effort, repo_root=repo_root, stamp=stamp,
@@ -1622,6 +1675,13 @@ def main(argv=None):
                 merge_verdicts(agg, verdicts)
 
                 if resilience_profile != "off":
+                    if any(str(f.get("refuter_verdict") or "").upper()
+                           in ("REFUTED", "INCONCLUSIVE", "UNCLEAR")
+                           for f in agg.get("findings", [])):
+                        expected_phase_states.append((
+                            "adjudicate",
+                            os.path.join(out_dir, "adjudicate_state_%s" % stamp, "status.json"),
+                        ))
                     adjudicate_findings(
                         agg.get("findings", []), args.kind, out_dir, max_concurrent,
                         args.effort, repo_root, stamp, run_fleet)
@@ -1644,6 +1704,11 @@ def main(argv=None):
                       (len(confirmed_findings),
                        " (severity=%s)" % ",".join(sorted(severity_filter)) if severity_filter
                        else ""))
+                if resilience_profile != "off":
+                    expected_phase_states.append((
+                        "behavioral",
+                        os.path.join(out_dir, "behavioral_state_%s" % stamp, "status.json"),
+                    ))
                 behavioral_verify(agg.get("findings", []), out_dir, time.time(),
                                    max_concurrent=max_concurrent, effort=args.effort,
                                    repo_root=repo_root, stamp=stamp, severity_filter=severity_filter,
@@ -1657,6 +1722,11 @@ def main(argv=None):
         # P3 piece B: OPT-IN completeness critic, independent of --loop -- works standalone
         # too (a single extra goal after the single pass above).
         if run_completeness:
+            if resilience_profile != "off":
+                expected_phase_states.append((
+                    "completeness",
+                    os.path.join(out_dir, "completeness_state_%s" % stamp, "status.json"),
+                ))
             gaps = run_completeness_critic(dims_used, files, agg.get("findings", []), out_dir,
                                             repo_root, effort=args.effort, stamp=stamp)
             agg["completeness_gaps"] = gaps
@@ -1667,6 +1737,24 @@ def main(argv=None):
                        len(gaps.get("unverified_claims") or [])))
             else:
                 print("completeness critic: no gaps identified")
+
+    if resilience_profile != "off":
+        # Recovery decomposition creates additional phase directories internally. Include
+        # every status carrying this durable stamp so none can disappear from completion.
+        known_paths = {os.path.abspath(path) for _, path in expected_phase_states}
+        try:
+            candidates = os.listdir(out_dir)
+        except OSError:
+            candidates = []
+        for candidate in candidates:
+            candidate_path = os.path.join(out_dir, candidate)
+            candidate_status = os.path.join(candidate_path, "status.json")
+            if (stamp in candidate and "state" in candidate and
+                    os.path.isfile(candidate_status) and
+                    os.path.abspath(candidate_status) not in known_paths):
+                expected_phase_states.append((candidate, candidate_status))
+                known_paths.add(os.path.abspath(candidate_status))
+        agg["phase_completion"] = evaluate_phase_completion(expected_phase_states)
 
     if full_validation:
         assurance = evaluate_full_validation(
@@ -1784,6 +1872,11 @@ def main(argv=None):
         if verdict == "VULNERABLE":
             print("FULL-VALIDATION GATE: VULNERABLE -- confirmed findings require remediation.")
             return 5
+    phase_completion = agg.get("phase_completion") or {}
+    if resilience_profile != "off" and not phase_completion.get("complete"):
+        print("REVIEW PARTIAL: one or more review phases remain incomplete; "
+              "the report is an audit artifact, not a completed review result.")
+        return 6
     return 0
 
 
