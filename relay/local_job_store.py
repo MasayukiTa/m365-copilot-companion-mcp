@@ -723,6 +723,44 @@ class LocalJobStore:
         return {"ok": True, "idempotent": False, "status": "READY",
                 "retry_count": next_retry}
 
+    def requeue_terminal_turn(self, job_id: str, reason: str,
+                              now: float | None = None) -> dict:
+        """Re-open an infrastructure-terminated turn while preserving prior commits.
+
+        This is a controller-only operation. The caller must exclude explicit operator
+        cancellations. The current turn must be uncommitted; completed earlier passes and
+        the event history stay intact while delivery and lease state receive a fresh budget.
+        """
+        job_id = self._validate_job_id(job_id)
+        now = time.time() if now is None else float(now)
+        reason = _bounded_text(reason, 2048, "terminal retry reason")
+        with self._transaction() as conn:
+            job, turn = self._job_and_turn(conn, job_id)
+            prior = str(job["status"])
+            if prior not in {"FAILED", "CANCELLED"}:
+                return {"ok": True, "idempotent": True, "status": prior}
+            if turn["commit_json"]:
+                raise JobStoreError(
+                    "TURN_COMMITTED",
+                    "a terminal job with a committed current turn cannot be replayed safely",
+                )
+            conn.execute(
+                "UPDATE turns SET status='READY',worker_id=NULL,lease_id=NULL,"
+                "lease_expires_at=NULL,abort_hash=NULL,abort_json=NULL,retry_count=0,"
+                "updated_at=? WHERE job_id=? AND seq=?",
+                (now, job_id, int(turn["seq"])),
+            )
+            conn.execute(
+                "UPDATE jobs SET status='READY',verification_detail=?,updated_at=? "
+                "WHERE job_id=?",
+                (reason, now, job_id),
+            )
+            self._event(conn, job_id, int(turn["seq"]), "TERMINAL_JOB_REQUEUED", {
+                "prior_status": prior, "reason": reason,
+            }, now)
+        return {"ok": True, "idempotent": False, "status": "READY",
+                "prior_status": prior}
+
     def record_event(self, job_id: str, event_type: str, payload: dict | None = None,
                      seq: int | None = None, now: float | None = None) -> None:
         job_id = self._validate_job_id(job_id)

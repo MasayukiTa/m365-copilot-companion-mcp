@@ -134,6 +134,28 @@ def test_campaign_manifest_recovers_jobs_missing_after_bootstrap_crash(tmp_path)
     assert recovered_store.get_job_status(job_id)["status"] == "READY"
 
 
+def test_runtime_terminal_job_is_requeued_but_operator_stop_is_not(tmp_path):
+    store = LocalJobStore(tmp_path / "jobs.sqlite3")
+    runtime_job = build_local_review_job(_goal(), "deep_runtime_0001")
+    operator_job = build_local_review_job(_goal(), "deep_operator_0001")
+    store.create_job(runtime_job)
+    store.create_job(operator_job)
+    store.cancel_job("deep_runtime_0001", "max_attempts=5 reached")
+    store.cancel_job("deep_operator_0001", "console stop")
+    runtime_entry = {"job_id": "deep_runtime_0001", "terminal_replay_count": 0}
+    operator_entry = {"job_id": "deep_operator_0001", "terminal_replay_count": 0}
+
+    assert transport._requeue_terminal_failure(
+        store, runtime_entry, replay_cap=3, source="test",
+    ) is True
+    assert store.get_job_status("deep_runtime_0001")["status"] == "READY"
+    assert runtime_entry["terminal_replay_count"] == 1
+    assert transport._requeue_terminal_failure(
+        store, operator_entry, replay_cap=3, source="test",
+    ) is False
+    assert store.get_job_status("deep_operator_0001")["status"] == "CANCELLED"
+
+
 def test_unexpected_controller_exit_restarts_same_job_until_done(tmp_path, monkeypatch):
     goals = tmp_path / "goals.jsonl"
     goals.write_text(json.dumps(_goal(), ensure_ascii=False) + "\n", encoding="utf-8")
