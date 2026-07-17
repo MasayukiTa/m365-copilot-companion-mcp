@@ -38,6 +38,27 @@ $ErrorActionPreference = "Stop"
 # the sibling start_companion_edge.ps1 is referenced via $PSScriptRoot below.
 $root = Split-Path -Parent $PSScriptRoot
 
+# A second -Keepalive process used to sit behind the first one's Python child and then race it
+# every time that child exited. Both supervisors could hard-reset the same Edge profile, causing
+# otherwise healthy overnight runs to flap. Hold a per-port, per-user-session mutex for the whole
+# supervisor lifetime. The OS releases it even after a crash; an abandoned mutex is safe to adopt.
+$keepaliveMutex = $null
+$keepaliveMutexOwned = $false
+if ($Keepalive) {
+    $mutexName = "Local\M365CopilotCompanion_BridgeKeepalive_${BridgePort}_${CdpPort}"
+    $keepaliveMutex = New-Object System.Threading.Mutex($false, $mutexName)
+    try {
+        $keepaliveMutexOwned = $keepaliveMutex.WaitOne(0)
+    } catch [System.Threading.AbandonedMutexException] {
+        $keepaliveMutexOwned = $true
+    }
+    if (-not $keepaliveMutexOwned) {
+        Write-Host "Keepalive supervisor already owns bridge :$BridgePort / CDP :$CdpPort -- leaving it running."
+        $keepaliveMutex.Dispose()
+        exit 0
+    }
+}
+
 # Bring up the dedicated bridge Edge (separate profile + port). HEADLESS by default -- no window,
 # no taskbar flash, zero foreground interference; the profile's SSO persists so it just connects.
 # A VISIBLE window is shown ONLY when interactive sign-in is actually required (-Visible). An

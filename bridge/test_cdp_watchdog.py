@@ -40,3 +40,28 @@ def test_main_starts_watchdog_before_serving_forever():
     assert "_start_cdp_watchdog(cdp)" in source
     assert "os._exit(70)" in source
     assert 'tool_probe.record_probe(False, "starting"' in source
+
+
+def test_page_probe_restart_requires_consecutive_unreachable_results(monkeypatch):
+    monkeypatch.setattr(bridge, "PAGE_UNREACHABLE_FAILURES", 3)
+    monkeypatch.setattr(bridge, "_PAGE_UNREACHABLE_STREAK", 0)
+
+    assert bridge._page_probe_requires_restart("agent_unreachable") is False
+    assert bridge._page_probe_requires_restart("agent_unreachable") is False
+    assert bridge._page_probe_requires_restart("agent_unreachable") is True
+
+
+def test_page_probe_recovery_streak_resets_after_any_reachable_classification(monkeypatch):
+    monkeypatch.setattr(bridge, "PAGE_UNREACHABLE_FAILURES", 2)
+    monkeypatch.setattr(bridge, "_PAGE_UNREACHABLE_STREAK", 1)
+
+    assert bridge._page_probe_requires_restart("answer") is False
+    assert bridge._PAGE_UNREACHABLE_STREAK == 0
+    assert bridge._page_probe_requires_restart("agent_unreachable") is False
+
+
+def test_page_probe_restart_hands_control_back_to_keepalive():
+    source = bridge.Path(bridge.__file__).read_text(encoding="utf-8")
+    assert "_page_probe_requires_restart(kind)" in source
+    assert "PAGE_EXECUTOR.submit_bounded(" in source
+    assert "os._exit(71)" in source

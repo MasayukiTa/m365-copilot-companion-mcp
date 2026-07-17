@@ -6,7 +6,7 @@
 #
 #  Flow: run doctor.ps1 -Json (or read a supplied mock JSON -- see -JsonInput /
 #  -MockJson below), parse the per-check results, and for each FAILING check (not
-#  OK, not [SKIP]'d by the tunnel chain, not an info-only line) -- IN DOCTOR'S OWN
+#  OK, not [SKIP]'d by the tunnel chain, not an info-only or indeterminate line) -- IN DOCTOR'S OWN
 #  EMITTED ORDER, i.e. its dependency order -- look up a repair in the REGISTRY
 #  below and act according to its TIER:
 #
@@ -334,7 +334,8 @@ while ($true) {
     }
     $lastResults = $results
 
-    $failing = @($results | Where-Object { -not $_.ok -and -not $_.skipped -and -not $_.info })
+    # An indeterminate doctor result is a transient observation, not permission to mutate state.
+    $failing = @($results | Where-Object { -not $_.ok -and -not $_.skipped -and -not $_.info -and -not $_.indeterminate })
 
     Write-Host ("--- pass $pass of $maxPasses : " + $failing.Count + " failing check(s) ---") -ForegroundColor Cyan
 
@@ -402,7 +403,7 @@ if ($allHuman.Count -gt 0) {
     }
 }
 if ($lastResults) {
-    $finalBad = @($lastResults | Where-Object { -not $_.ok -and -not $_.skipped -and -not $_.info }).Count
+    $finalBad = @($lastResults | Where-Object { -not $_.ok -and -not $_.skipped -and -not $_.info -and -not $_.indeterminate }).Count
     $finalOk  = @($lastResults | Where-Object { $_.ok }).Count
     Write-Host ""
     Write-Host ("  Final doctor tally: " + $finalOk + " OK, " + $finalBad + " need attention.") -ForegroundColor $(if ($finalBad -eq 0) { "Green" } else { "Yellow" })
@@ -444,7 +445,7 @@ if ($ResultJson) {
     $finalBadOut = 0
     if ($lastResults) {
         $finalOkOut  = @($lastResults | Where-Object { $_.ok }).Count
-        $finalBadOut = @($lastResults | Where-Object { -not $_.ok -and -not $_.skipped -and -not $_.info }).Count
+        $finalBadOut = @($lastResults | Where-Object { -not $_.ok -and -not $_.skipped -and -not $_.info -and -not $_.indeterminate }).Count
     }
     $resultObj = [PSCustomObject]@{
         autofixed     = $autofixedOut
