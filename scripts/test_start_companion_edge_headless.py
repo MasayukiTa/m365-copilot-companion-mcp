@@ -13,3 +13,9 @@ def test_headless_is_the_unconditional_default_and_recovery_baseline():
 def test_foreground_is_explicit_and_cannot_conflict_with_headless():
     assert "if ($Headless -and $Foreground)" in SOURCE
     assert "mutually exclusive" in SOURCE
+
+
+def test_cdp_is_loopback_only_without_browser_origin_wildcard():
+    assert '"--remote-debugging-address=127.0.0.1"' in SOURCE
+    assert '"--remote-debugging-port=$Port"' in SOURCE
+    assert "--remote-allow-origins=*" not in SOURCE
