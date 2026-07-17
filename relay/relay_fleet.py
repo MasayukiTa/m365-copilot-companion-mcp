@@ -38,6 +38,7 @@ from .copilot_autopilot_relay import (
     GenerationInProgress, PROTOCOL, REFUTE_FIX_JOB, RETRY_JOB, VERIFY_FIX_JOB,
     _is_processing, default_notify, extract_research, goal_not_seen, has_end_marker,
     reported_stuck, transient_backoff, conversation_exhausted, RECYCLE_PREFIX,
+    conversation_start_label,
 )
 from .planner import PLAN_PROMPT, extract_plan, plan_ready
 from .review_resilience import (
@@ -1024,7 +1025,9 @@ class RelayWorker:
         self.plan_mode = plan_mode
         self.plan_steps = []
         self._plan_approved = False
-        self.job = (PLAN_PROMPT + self.goal) if plan_mode else (PROTOCOL + self.goal)
+        initial_body = (PLAN_PROMPT + self.goal) if plan_mode else (PROTOCOL + self.goal)
+        self.job = (initial_body if self.resume_conv
+                    else conversation_start_label(self.name) + initial_body)
         self.turn = 0
         self.no_progress = 0
         self.last_norm = None
@@ -1115,7 +1118,7 @@ class RelayWorker:
             return False
 
         # This is the same initial payload as the original non-plan review task.
-        self.job = PROTOCOL + self.goal
+        self.job = conversation_start_label(self.name + "-replay%d" % self.fresh_replay_count) + PROTOCOL + self.goal
         self.status = "ready"
         return True
 
@@ -1788,7 +1791,8 @@ class RelayWorker:
                 self.status, self.outcome = "stuck", "STUCK"
                 self.reason = "token-limit recycle: fresh conversation did not render"
                 return
-            self.job = PROTOCOL + RECYCLE_PREFIX + self.goal   # re-anchor in the fresh chat
+            self.job = (conversation_start_label(self.name + "-recycle%d" % self._recycles)
+                        + PROTOCOL + RECYCLE_PREFIX + self.goal)  # re-anchor in the fresh chat
             self.reason = f"会話トークン上限 → 新会話で続行 ({self._recycles}/{self._max_recycles})"
             try:
                 default_notify("♻ Fleet 会話リサイクル", self.reason)

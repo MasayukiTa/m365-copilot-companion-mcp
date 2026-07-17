@@ -1,6 +1,10 @@
 """Unit tests for the self-improvement guardrails. Run: python -m relay.selfimprove.test_guards"""
 import os
+import subprocess
+import sys
 import tempfile
+import time
+import uuid
 
 from relay.selfimprove import guards as G
 
@@ -93,9 +97,26 @@ def test_done_after_last_start():
 
 
 def test_proc_alive():
-    # this very interpreter is alive; its cmdline contains 'test_guards'
-    assert G.proc_alive("test_guards") >= 1
-    assert G.proc_alive("a_substring_that_should_match_nothing_zzz") == 0
+    # Use a dedicated marker instead of assuming pytest's parent command line
+    # contains this test module's filename during a full-suite run.
+    marker = "proc_alive_test_" + uuid.uuid4().hex
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)", marker]
+    )
+    try:
+        for _ in range(40):
+            if G.proc_alive(marker) >= 1:
+                break
+            time.sleep(0.05)
+        assert G.proc_alive(marker) >= 1
+        assert G.proc_alive("a_substring_that_should_match_nothing_zzz") == 0
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
     print("ok test_proc_alive")
 
 

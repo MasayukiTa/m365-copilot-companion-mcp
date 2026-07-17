@@ -113,10 +113,16 @@ except Exception:
     ALLOWED_BASE = None
 
 try:
-    from tools.notify_ops import notify_desktop
+    from tools.notify_ops import notify_approval_gate
 except Exception:
-    def notify_desktop(_title, _body):
+    def notify_approval_gate(_title, _body, _gate_path):
         return None
+
+try:
+    from tools.approval_policy import current_approval_mode as _current_approval_mode
+except Exception:
+    def _current_approval_mode(default=None):
+        return default or "default"
 
 
 def destination_for(job):
@@ -419,7 +425,7 @@ def _write_job_gate(token, question, context):
         }
         gate_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         try:
-            notify_desktop("ジョブ承認が必要です / Job approval needed", question[:180])
+            notify_approval_gate("ジョブ承認が必要です / Job approval needed", question[:180], gate_file)
         except Exception:
             pass
     except Exception:
@@ -456,7 +462,11 @@ def run_job(job, now_ts=None):
                 payload = dict(job.get("payload") or {}, id=jid)
                 # ── approval gate chokepoint: this is where TASK_JOB_APPROVAL_MODE bites,
                 # immediately before fn(payload) would otherwise run unconditionally ──
-                decision, reason = job_gate(job_type, payload, TASK_JOB_APPROVAL_MODE)
+                # Read the cockpit's persistent choice live. This lets an operator switch
+                # confirmation/auto/bypass without restarting a long-running router.
+                decision, reason = job_gate(
+                    job_type, payload, _current_approval_mode(TASK_JOB_APPROVAL_MODE)
+                )
                 if decision == "ALLOW":
                     rec["status"], rec["result"], rec["error"] = fn(payload)
                 elif decision == "DENY":
