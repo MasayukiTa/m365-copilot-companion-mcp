@@ -54,6 +54,7 @@ jobs:
             tests/test_scroll_transcript.py \
             tests/test_golden.py \
             tools/test_python_gate.py \
+            tools/test_approval_policy.py \
             tools/test_layer1_security.py \
             tools/test_data_report.py \
             tools/test_data_memory_hook.py \
@@ -61,21 +62,26 @@ jobs:
             tools/test_data_aliases.py \
             tools/test_local_loop_ops.py \
             tools/test_local_loop_registration.py \
+            tools/test_notify_ops.py \
             tools/test_procedural_memory.py \
             tools/test_agent_memory_ops.py \
             tools/test_auth_stats.py \
             tools/test_tool_probe.py \
+            tools/test_skill_registration.py \
             scripts/test_bootstrap.py \
             scripts/test_bootstrap_p2c.py \
             scripts/test_start_companion_edge_headless.py \
             bridge/test_bridge_sessions.py \
+            bridge/test_cdp_watchdog.py \
             bridge/test_consent_surface.py \
             bridge/test_p2c_flag.py \
             bridge/test_review_command.py \
             bridge/test_review_command_p2c.py \
             bridge/test_session_cli.py \
             bridge/test_session_store.py \
+            bridge/test_skills_bridge.py \
             ui/test_copilot_chat_p2c.py \
+            ui/test_fleet_cockpit_approval_center.py \
             bench/gaia/test_run_pipeline.py \
             bench/test_local_review_transport.py \
             bench/test_review_adjudicate.py \
@@ -94,6 +100,7 @@ jobs:
             relay/test_bestofn.py \
             relay/test_bestofn_run.py \
             relay/test_code_task.py \
+            relay/test_conversation_start_label.py \
             relay/test_confidence.py \
             relay/test_continue_escalation.py \
             relay/test_edge_auth.py \
@@ -119,6 +126,7 @@ jobs:
             relay/test_response_independent_send.py \
             relay/test_soak.py \
             relay/test_solve_policy.py \
+            relay/test_skills.py \
             relay/test_task_router.py \
             relay/test_transient.py \
             relay/test_unlock_inject.py \

@@ -53,7 +53,8 @@ def main():
 
     # --- worker plan flow ---
     w = RelayWorker("g", "w0", plan_mode=True)
-    check("plan_initial_job", w.job.startswith(PLAN_PROMPT[:10]) and w.goal in w.job)
+    check("plan_initial_job", w.job.startswith("[") and PLAN_PROMPT[:10] in w.job
+          and w.goal in w.job)
 
     # turn 1 returns a plan -> pause for approval
     w._decide("1. step one\n2. step two\nPLAN_READY")

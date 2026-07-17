@@ -47,8 +47,403 @@ class CockpitProgram
     static void Main(string[] args)
     {
         try { AppContext.SetSwitch("Switch.System.Windows.DoNotScaleForDpiChanges", false); } catch { }
+        if (args.Length >= 2 && args[0].Equals("--approval-gate", StringComparison.OrdinalIgnoreCase))
+        {
+            bool createdNew = false;
+            bool ownsMutex = false;
+            using (var mutex = new Mutex(true, "Local\\M365CompanionApprovalPrompt", out createdNew))
+            {
+                try
+                {
+                    ownsMutex = createdNew;
+                    if (!ownsMutex)
+                    {
+                        try { ownsMutex = mutex.WaitOne(0, false); }
+                        catch (AbandonedMutexException) { ownsMutex = true; }
+                    }
+                    // The existing prompt polls the gate directory and will surface this request.
+                    if (!ownsMutex) return;
+                    new Application().Run(new ApprovalPromptWindow(args[1]));
+                }
+                finally { if (ownsMutex) try { mutex.ReleaseMutex(); } catch { } }
+            }
+            return;
+        }
         string path = args.Length > 0 ? args[0] : null;
         new Application().Run(new CockpitWindow(path));
+    }
+}
+
+// Small native action surface launched alongside an approval toast. It is intentionally part of
+// FleetCockpit.exe: no installer, protocol registration, browser, admin rights, or extra runtime is
+// required. One process drains all pending gates so a burst of workers never creates a window storm.
+class ApprovalPromptWindow : Window
+{
+    readonly JavaScriptSerializer _js = new JavaScriptSerializer();
+    string _gateDir;
+    string _currentPath;
+    Dictionary<string, object> _current;
+    TextBlock _kind, _question, _context, _count, _policyHelp;
+    Button _approve, _deny;
+    ComboBox _policy;
+    DispatcherTimer _timer;
+    bool _changingPolicy;
+    bool _dark = true;
+    int _lang = 0;
+    long _settingsStamp = -1;
+    Brush Bg, Surface, SurfaceSubtle, Line, Fg, Muted, Accent, AccentFg, Danger, Warning;
+
+    static double NowUnix()
+    { return (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds; }
+
+    static string SettingsFile
+    {
+        get
+        {
+            string app = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            return Path.Combine(app, "copilot-bridge", "settings.txt");
+        }
+    }
+
+    public ApprovalPromptWindow(string initialGatePath)
+    {
+        LoadUiPreferences();
+        ApplyThemeTokens();
+        Title = L("承認が必要です", "Approval required");
+        Width = 600; Height = 620; MinWidth = 500; MinHeight = 480;
+        WindowStartupLocation = WindowStartupLocation.CenterScreen;
+        Background = Bg; ShowInTaskbar = true; FontFamily = new FontFamily(Theme.UiFont);
+        try
+        {
+            string full = Path.GetFullPath(initialGatePath);
+            _gateDir = Path.GetDirectoryName(full);
+            if (!Path.GetFileName(full).StartsWith("gate_", StringComparison.OrdinalIgnoreCase) ||
+                !Path.GetExtension(full).Equals(".json", StringComparison.OrdinalIgnoreCase) ||
+                !Path.GetFileName(_gateDir).Equals(".companion_gates", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("invalid approval-gate path");
+            _currentPath = full;
+        }
+        catch { _gateDir = null; _currentPath = null; }
+
+        Build();
+        Loaded += delegate
+        {
+            if (_gateDir == null) { Close(); return; }
+            LoadNext();
+            _timer = new DispatcherTimer(); _timer.Interval = TimeSpan.FromSeconds(2);
+            _timer.Tick += delegate
+            {
+                if (UiPreferencesChanged())
+                {
+                    ApplyThemeTokens(); Background = Bg; Title = L("承認が必要です", "Approval required");
+                    Build(); LoadNext();
+                }
+                RefreshPendingCount(); if (_current == null) LoadNext();
+            };
+            _timer.Start();
+            Activate();
+        };
+        Closed += delegate { if (_timer != null) _timer.Stop(); };
+        KeyDown += delegate (object sender, KeyEventArgs e)
+        { if (e.Key == Key.Escape) { Close(); e.Handled = true; } };
+    }
+
+    string L(string ja, string en) { return _lang == 0 ? ja : en; }
+
+    void LoadUiPreferences()
+    {
+        try
+        {
+            if (!File.Exists(SettingsFile)) { _settingsStamp = 0; return; }
+            _settingsStamp = File.GetLastWriteTimeUtc(SettingsFile).Ticks;
+            foreach (string raw in File.ReadAllLines(SettingsFile, new UTF8Encoding(false)))
+            {
+                string line = raw.Trim();
+                if (line.StartsWith("dark=")) _dark = line.Substring(5).Trim() != "0";
+                else if (line.StartsWith("lang=")) _lang = line.Substring(5).Trim() == "1" ? 1 : 0;
+            }
+        }
+        catch { }
+    }
+
+    bool UiPreferencesChanged()
+    {
+        try
+        {
+            long stamp = File.Exists(SettingsFile) ? File.GetLastWriteTimeUtc(SettingsFile).Ticks : 0;
+            if (stamp == _settingsStamp) return false;
+            LoadUiPreferences(); return true;
+        }
+        catch { return false; }
+    }
+
+    void ApplyThemeTokens()
+    {
+        Bg = Theme.Br(Theme.Bg(_dark)); Surface = Theme.Br(Theme.Surface(_dark));
+        SurfaceSubtle = Theme.Br(Theme.SurfaceSubtle(_dark)); Line = Theme.Br(Theme.Border(_dark));
+        Fg = Theme.Br(Theme.Text(_dark)); Muted = Theme.Br(Theme.Muted(_dark));
+        Accent = Theme.Br(Theme.Accent(_dark)); AccentFg = Theme.Br(Theme.AccentFg(_dark));
+        Danger = Theme.Br(Theme.Danger(_dark)); Warning = Theme.Br(Theme.Warning(_dark));
+    }
+
+    ControlTemplate FlatButtonTemplate()
+    {
+        var border = new FrameworkElementFactory(typeof(Border));
+        border.SetBinding(Border.BackgroundProperty, new Binding("Background") { RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent) });
+        border.SetBinding(Border.BorderBrushProperty, new Binding("BorderBrush") { RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent) });
+        border.SetBinding(Border.BorderThicknessProperty, new Binding("BorderThickness") { RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent) });
+        border.SetValue(Border.CornerRadiusProperty, new CornerRadius(Theme.RadSmall));
+        var presenter = new FrameworkElementFactory(typeof(ContentPresenter));
+        presenter.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+        presenter.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
+        presenter.SetBinding(ContentPresenter.MarginProperty, new Binding("Padding") { RelativeSource = new RelativeSource(RelativeSourceMode.TemplatedParent) });
+        border.AppendChild(presenter);
+        return new ControlTemplate(typeof(Button)) { VisualTree = border };
+    }
+
+    void Build()
+    {
+        var root = new DockPanel();
+        var head = new Border { Background = Surface, BorderBrush = Line,
+            BorderThickness = new Thickness(0, 0, 0, 1), Padding = new Thickness(Theme.PadApp) };
+        DockPanel.SetDock(head, Dock.Top);
+        var headRow = new DockPanel();
+        _count = new TextBlock { Foreground = Muted, FontSize = Theme.FsMeta, VerticalAlignment = VerticalAlignment.Center };
+        DockPanel.SetDock(_count, Dock.Right); headRow.Children.Add(_count);
+        var titles = new StackPanel();
+        titles.Children.Add(new TextBlock { Text = L("承認が必要です", "Approval required"), Foreground = Fg,
+            FontSize = Theme.FsTitle, FontWeight = FontWeights.SemiBold });
+        titles.Children.Add(new TextBlock { Text = L("対象と影響を確認して判断します。", "Review the exact scope and impact before deciding."),
+            Foreground = Muted, FontSize = Theme.FsMeta, Margin = new Thickness(0, 4, 0, 0) });
+        headRow.Children.Add(titles); head.Child = headRow; root.Children.Add(head);
+
+        var footer = new Border { Background = Surface, BorderBrush = Line,
+            BorderThickness = new Thickness(0, 1, 0, 0), Padding = new Thickness(Theme.PadApp) };
+        DockPanel.SetDock(footer, Dock.Bottom);
+        var actions = new DockPanel();
+        var later = new Button { Content = L("あとで", "Later"), Padding = new Thickness(16, 7, 16, 7),
+            Background = SurfaceSubtle, Foreground = Fg, BorderBrush = Line, BorderThickness = new Thickness(1), Cursor = Cursors.Hand };
+        later.Template = FlatButtonTemplate();
+        later.Click += delegate { Close(); }; DockPanel.SetDock(later, Dock.Right); actions.Children.Add(later);
+        _deny = new Button { Content = L("拒否", "Deny"), Padding = new Thickness(18, 7, 18, 7),
+            Margin = new Thickness(0, 0, 8, 0), Background = Brushes.Transparent,
+            Foreground = Danger, BorderBrush = Danger, BorderThickness = new Thickness(1), Cursor = Cursors.Hand };
+        _deny.Template = FlatButtonTemplate();
+        _deny.Click += delegate { Answer("denied"); }; DockPanel.SetDock(_deny, Dock.Right); actions.Children.Add(_deny);
+        _approve = new Button { Content = L("承認", "Approve"), Padding = new Thickness(22, 8, 22, 8),
+            Margin = new Thickness(0, 0, 8, 0), Background = Accent, Foreground = AccentFg,
+            BorderThickness = new Thickness(0), FontWeight = FontWeights.SemiBold, Cursor = Cursors.Hand };
+        _approve.Template = FlatButtonTemplate();
+        _approve.Click += delegate { Answer("approved"); }; DockPanel.SetDock(_approve, Dock.Right); actions.Children.Add(_approve);
+        footer.Child = actions; root.Children.Add(footer);
+
+        var scroll = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
+        var body = new StackPanel { Margin = new Thickness(Theme.PadApp) };
+        var decisionCard = new Border { Background = Surface, BorderBrush = Warning,
+            BorderThickness = new Thickness(Theme.RailW, 1, 1, 1), CornerRadius = new CornerRadius(Theme.RadCard),
+            Padding = new Thickness(14, 12, 14, 12) };
+        var decisionCol = new StackPanel();
+        _kind = new TextBlock { Foreground = Muted, FontSize = Theme.FsMeta, FontWeight = FontWeights.SemiBold };
+        decisionCol.Children.Add(_kind);
+        _question = new TextBlock { Foreground = Fg, FontSize = Theme.FsBody, FontWeight = FontWeights.SemiBold,
+            TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 0) };
+        decisionCol.Children.Add(_question);
+        var detailBox = new Border { Background = SurfaceSubtle, BorderBrush = Line, BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(Theme.RadSmall), Padding = new Thickness(12), Margin = new Thickness(0, 12, 0, 0) };
+        _context = new TextBlock { Foreground = Muted, FontFamily = new FontFamily(Theme.CodeFont),
+            FontSize = Theme.FsLog, TextWrapping = TextWrapping.Wrap };
+        detailBox.Child = _context; decisionCol.Children.Add(detailBox); decisionCard.Child = decisionCol; body.Children.Add(decisionCard);
+
+        var policyBox = new Border { Background = SurfaceSubtle, BorderBrush = Line, BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(Theme.RadCard), Padding = new Thickness(14, 12, 14, 12), Margin = new Thickness(0, Theme.SectionGap, 0, 0) };
+        var policyCol = new StackPanel();
+        policyCol.Children.Add(new TextBlock { Text = L("今後の操作承認", "Approval policy"), Foreground = Fg,
+            FontSize = Theme.FsSection, FontWeight = FontWeights.SemiBold });
+        _policy = new ComboBox { Margin = new Thickness(0, 8, 0, 0), MinWidth = 220,
+            HorizontalAlignment = HorizontalAlignment.Left, Background = Surface, Foreground = Fg };
+        AddPolicyItem(L("確認（推奨）", "Confirm (recommended)"), "default");
+        AddPolicyItem(L("自動", "Auto"), "auto"); AddPolicyItem(L("バイパス", "Bypass"), "bypass");
+        _policy.SelectionChanged += PolicyChanged; policyCol.Children.Add(_policy);
+        _policyHelp = new TextBlock { Foreground = Muted, FontSize = Theme.FsMeta, TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 7, 0, 0) }; policyCol.Children.Add(_policyHelp);
+        policyBox.Child = policyCol; body.Children.Add(policyBox);
+        scroll.Content = body; root.Children.Add(scroll); Content = root;
+        SelectPolicy(ReadPolicy());
+    }
+
+    void AddPolicyItem(string label, string value)
+    { _policy.Items.Add(new ComboBoxItem { Content = label, Tag = value, Foreground = Fg, Background = Surface }); }
+
+    string SelectedPolicy()
+    { var item = _policy.SelectedItem as ComboBoxItem; return item == null ? "default" : (string)item.Tag; }
+
+    void SelectPolicy(string mode)
+    {
+        _changingPolicy = true;
+        foreach (object obj in _policy.Items)
+        {
+            var item = obj as ComboBoxItem;
+            if (item != null && (string)item.Tag == mode) { _policy.SelectedItem = item; break; }
+        }
+        _changingPolicy = false; UpdatePolicyHelp();
+    }
+
+    void PolicyChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_changingPolicy) return;
+        string oldMode = ReadPolicy(), mode = SelectedPolicy();
+        if (mode == "bypass")
+        {
+            string warning = L(
+                "バイパスではローカルジョブと自律契約の手動確認を省略します。\nSTOP条件、ファイル範囲、外部Skillの初回・変更承認は残ります。\n\n本当に有効にしますか？",
+                "Bypass skips manual approval for local jobs and autonomy contracts.\nSTOP rules, path limits, and external-Skill approval remain.\n\nEnable it?");
+            if (MessageBox.Show(this, warning, L("バイパスを有効化", "Enable bypass"), MessageBoxButton.YesNo,
+                MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes)
+            { SelectPolicy(oldMode); return; }
+        }
+        SavePolicy(mode); UpdatePolicyHelp();
+    }
+
+    void UpdatePolicyHelp()
+    {
+        if (_policyHelp == null) return;
+        string mode = SelectedPolicy();
+        if (mode == "auto") _policyHelp.Text = L("安全判定が通った操作は自動実行。要確認はここで承認、禁止判定は拒否します。",
+            "Safe operations run automatically; risky ones ask here; prohibited ones are denied.");
+        else if (mode == "bypass") _policyHelp.Text = L("手動確認を省略します。STOP条件・パス制限・外部Skillのハッシュ承認は解除しません。",
+            "Skip manual confirmation. STOP rules, path limits, and external-Skill hash approval remain.");
+        else _policyHelp.Text = L("初回の操作クラスを確認し、承認済みでも危険な内容は毎回確認します。",
+            "Confirm first-seen operation classes; risky payloads still ask every time.");
+    }
+
+    public static string ReadPolicy()
+    {
+        string fallback = (Environment.GetEnvironmentVariable("TASK_JOB_APPROVAL_MODE") ?? "default").Trim().ToLowerInvariant();
+        if (fallback != "auto" && fallback != "bypass") fallback = "default";
+        try
+        {
+            if (!File.Exists(SettingsFile)) return fallback;
+            foreach (string line in File.ReadAllLines(SettingsFile, new UTF8Encoding(false)))
+                if (line.StartsWith("job_approval_mode="))
+                {
+                    string mode = line.Substring(18).Trim().ToLowerInvariant();
+                    if (mode == "default" || mode == "auto" || mode == "bypass") return mode;
+                }
+        }
+        catch { }
+        return fallback;
+    }
+
+    public static void SavePolicy(string mode)
+    {
+        try
+        {
+            var lines = new List<string>(); bool found = false;
+            if (File.Exists(SettingsFile)) foreach (string line in File.ReadAllLines(SettingsFile))
+            {
+                if (line.StartsWith("job_approval_mode=")) { lines.Add("job_approval_mode=" + mode); found = true; }
+                else lines.Add(line);
+            }
+            if (!found) lines.Add("job_approval_mode=" + mode);
+            Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile));
+            File.WriteAllText(SettingsFile, string.Join("\n", lines.ToArray()) + "\n", new UTF8Encoding(false));
+        }
+        catch { }
+    }
+
+    Dictionary<string, object> ReadGate(string path)
+    {
+        try
+        {
+            string full = Path.GetFullPath(path);
+            string root = Path.GetFullPath(_gateDir).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase) || !File.Exists(full)) return null;
+            string text;
+            using (var fs = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var sr = new StreamReader(fs, Encoding.UTF8)) text = sr.ReadToEnd();
+            var gate = _js.DeserializeObject(text) as Dictionary<string, object>;
+            if (gate != null) gate["path"] = full;
+            return gate;
+        }
+        catch { return null; }
+    }
+
+    static string S(Dictionary<string, object> d, string key)
+    { object v; return d != null && d.TryGetValue(key, out v) && v != null ? v.ToString() : ""; }
+
+    static double D(Dictionary<string, object> d, string key)
+    { double v; return double.TryParse(S(d, key), NumberStyles.Float, CultureInfo.InvariantCulture, out v) ? v : 0; }
+
+    static bool Answered(Dictionary<string, object> d)
+    { object v; try { return d != null && d.TryGetValue("answered", out v) && Convert.ToBoolean(v); } catch { return false; } }
+
+    void LoadNext()
+    {
+        Dictionary<string, object> gate = _currentPath == null ? null : ReadGate(_currentPath);
+        if (gate == null || Answered(gate))
+        {
+            gate = null; _currentPath = null;
+            try
+            {
+                var candidates = new List<Dictionary<string, object>>();
+                foreach (string path in Directory.GetFiles(_gateDir, "gate_*.json"))
+                { var item = ReadGate(path); if (item != null && !Answered(item)) candidates.Add(item); }
+                candidates.Sort(delegate (Dictionary<string, object> a, Dictionary<string, object> b)
+                { return D(b, "asked_at").CompareTo(D(a, "asked_at")); });
+                if (candidates.Count > 0) gate = candidates[0];
+            }
+            catch { }
+        }
+        _current = gate;
+        if (gate == null) { Close(); return; }
+        _currentPath = S(gate, "path");
+        string hay = (S(gate, "token") + " " + S(gate, "context") + " " + S(gate, "question")).ToLowerInvariant();
+        bool skill = hay.Contains("gate_skill_") || hay.Contains("skill approval");
+        bool high = hay.Contains("contract gate: delete") || hay.Contains("outbound") ||
+                    hay.Contains("shell_destructive") || hay.Contains("destructive shell");
+        bool expired = D(gate, "expires_at") > 0 && D(gate, "expires_at") < NowUnix();
+        _kind.Text = (skill ? L("外部Skill", "External Skill") : high ? L("影響の大きい操作", "High impact") : L("操作", "Operation")) +
+            (expired ? L("  ·  期限切れ", "  ·  Expired") : "");
+        _kind.Foreground = expired || high ? Danger : Warning;
+        _question.Text = S(gate, "question"); _context.Text = S(gate, "context");
+        _approve.IsEnabled = !expired; _deny.IsEnabled = true;
+        if (skill) _policyHelp.Text = L("外部Skillはこの設定に関係なく、初回と内容変更時に必ずハッシュ承認します。",
+            "External Skills always require hash approval on first use and after changes, regardless of this policy.");
+        else UpdatePolicyHelp();
+        RefreshPendingCount();
+    }
+
+    void RefreshPendingCount()
+    {
+        if (_count == null || _gateDir == null) return;
+        int count = 0;
+        try { foreach (string path in Directory.GetFiles(_gateDir, "gate_*.json"))
+        { var gate = ReadGate(path); if (gate != null && !Answered(gate)) count++; } } catch { }
+        _count.Text = _lang == 0 ? count + " 件待機" : count + " pending";
+    }
+
+    void Answer(string verdict)
+    {
+        if (_current == null || string.IsNullOrEmpty(_currentPath)) return;
+        string hay = (S(_current, "context") + " " + S(_current, "question")).ToLowerInvariant();
+        bool high = hay.Contains("contract gate: delete") || hay.Contains("outbound") ||
+                    hay.Contains("shell_destructive") || hay.Contains("destructive shell");
+        if (verdict == "approved" && high && MessageBox.Show(this,
+            L("影響の大きい操作です。対象を確認したうえで本当に承認しますか？\n\n",
+              "This is a high-impact operation. Approve after reviewing the exact scope?\n\n") + S(_current, "question"),
+            L("最終確認", "Final confirmation"), MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes) return;
+        try
+        {
+            var gate = ReadGate(_currentPath); if (gate == null) return;
+            gate.Remove("path"); gate["answered"] = true; gate["answer"] = verdict; gate["answered_at"] = NowUnix();
+            string tmp = _currentPath + ".tmp";
+            File.WriteAllText(tmp, _js.Serialize(gate), new UTF8Encoding(false));
+            try { File.Replace(tmp, _currentPath, null); }
+            catch { File.Copy(tmp, _currentPath, true); try { File.Delete(tmp); } catch { } }
+        }
+        catch { return; }
+        _current = null; _currentPath = null; LoadNext();
     }
 }
 
@@ -124,7 +519,7 @@ class CockpitWindow : Window
     TextBlock _uiScaleVal;
 
     readonly string _statusPath, _commandsPath, _historyPath, _openPath;
-    string _convsPath, _hiddenPath;
+    string _convsPath, _hiddenPath, _resumeDismissPath;
     System.Collections.Generic.HashSet<string> _archivedKeys = new System.Collections.Generic.HashSet<string>();
     // Persistent "cleared" set: keys of TERMINAL cards the user dismissed via Clear. Survives
     // the runner regenerating status.json every second, so cleared cards stay gone mid-run.
@@ -142,6 +537,15 @@ class CockpitWindow : Window
     TextBlock _workerChip;       // live "N workers" neutral chip in the header controls row
     Border _workerChipBorder;   // the Border wrapping _workerChip (for PaintChrome re-theming)
     Button _themeBtn, _langBtn, _mainBtn, _siBtn;
+    Button _approvalCenterBtn;
+    TextBlock _approvalCenterLabel, _approvalCenterBadgeText;
+    Border _approvalCenterBadge;
+    Window _approvalCenterWindow;
+    StackPanel _approvalPendingHost, _approvalRecentHost;
+    TextBlock _approvalCenterSummary;
+    string _approvalCenterSig = "";
+    List<Dictionary<string, object>> _gateCache = new List<Dictionary<string, object>>();
+    double _gateCacheAt = 0;
     Button _overflowBtn;
     System.Windows.Controls.Primitives.Popup _overflowPopup;
     Border _headBar;
@@ -239,13 +643,14 @@ class CockpitWindow : Window
     // chat (Edge profile copilot-bridge-edge, CDP :9223) can actually call an MCP tool. Tool
     // reads .fleet\tool_probe.json, written by the bridge's own idle self-probe (a separate
     // component -- bridge/copilot_bridge.py + tools/tool_probe.py -- this file only reads it).
-    enum HealthState { Gray = 0, Green = 1, Yellow = 2, Red = 3 }
+    enum HealthState { Gray = 0, Green = 1, Yellow = 2, Red = 3, Checking = 4 }
     class DotState { public HealthState State = HealthState.Gray; public string Detail = ""; public DateTime Checked = DateTime.MinValue; }
     // Index map: 0=server 1=tunnel 2=edge 3=signin 4=agent 5=tool(bridge probe).
     readonly DotState[] _health = { new DotState(), new DotState(), new DotState(), new DotState(), new DotState(), new DotState() };
     readonly object _healthLock = new object();
     const int HEALTH_DOT_COUNT = 6;
     Border[] _healthDot;           // the 6 colored dots (re-tinted by ApplyHealthToUi)
+    TextBlock[] _healthSpin;       // rotating in-progress marks, shown instead of a stale color
     TextBlock[] _healthLbl;        // the 6 labels (re-textable on language toggle)
     Border[] _healthDotWrap;       // per-dot wrapper (tooltip host)
     Button _fixBtn;                // the 「直す」/Fix button (shown only when a dot is red/yellow)
@@ -254,6 +659,8 @@ class CockpitWindow : Window
     Thread _healthThread;
     volatile bool _healthStop = false;
     volatile bool _fixRunning = false;   // guard: never run two fixes at once
+    volatile int _fixTargetMask = 0;     // health axes currently being repaired; renders as Checking
+    readonly AutoResetEvent _healthWake = new AutoResetEvent(false); // immediate post-action refresh
     volatile bool _bridgeReconnectRunning = false;   // guard: manual "Reconnect chat" button, never two at once
     string _agentMarkerId = "";    // T_.../P_... id extracted from the configured agent URL (.env)
     volatile bool _startAllLaunched = false;   // reentry guard for RunStartAll (per-cooldown, not per-app-run only)
@@ -269,6 +676,7 @@ class CockpitWindow : Window
         _openPath = Path.Combine(dir, "open.json");
         _convsPath = Path.Combine(dir, "conversations.json");
         _hiddenPath = Path.Combine(dir, "cockpit_hidden.json");
+        _resumeDismissPath = Path.Combine(dir, "cockpit_resume_dismissed.json");
         LoadGlyphs();
         LoadHistory();
         LoadHidden();
@@ -297,6 +705,7 @@ class CockpitWindow : Window
     protected override void OnClosed(EventArgs e)
     {
         _healthStop = true;
+        try { _healthWake.Set(); } catch (Exception) { }
         base.OnClosed(e);
     }
 
@@ -380,6 +789,7 @@ class CockpitWindow : Window
         // Effort selector + fleet-wide pause/stop (NEW)
         if (k == "effort") return ja ? "推論" : "Reasoning";
         if (k == "approval") return ja ? "承認" : "Approval";
+        if (k == "run_mode") return ja ? "実行方式" : "Run mode";
         if (k == "pause") return ja ? "一時停止" : "Pause";
         if (k == "resume") return ja ? "再開" : "Resume";
         if (k == "stopall") return ja ? "全停止" : "Stop all";
@@ -394,6 +804,7 @@ class CockpitWindow : Window
         if (k == "hs_signin") return ja ? "サインイン" : "Sign-in";
         if (k == "hs_agent") return ja ? "エージェント" : "Agent";
         if (k == "hs_fix") return ja ? "直す" : "Fix";
+        if (k == "hs_fixing_button") return ja ? "修復中…" : "Fixing…";
         if (k == "hs_fix_hint") return ja ? "検出された不具合を直す" : "Fix the detected problem";
         if (k == "hs_ok") return ja ? "正常" : "OK";
         if (k == "hs_down") return ja ? "応答なし" : "down";
@@ -470,6 +881,7 @@ class CockpitWindow : Window
         if (k == "hs_tool_detail_down") return ja ? "応答なし(再接続が必要)" : "no response (reconnect needed)";
         if (k == "hs_tool_detail_stale") return ja ? "自己診断が実行されていません" : "self-probe hasn't run recently";
         if (k == "hs_tool_detail_none") return ja ? "自己診断は未設定(機能無効)" : "self-probe not configured (feature off)";
+        if (k == "hs_tool_detail_checking") return ja ? "ツール接続を確認中…" : "checking tool connection…";
         // Bridge-targeted Fix tier (RunFix priority 5) + the always-available manual button.
         if (k == "hs_fix_bridge") return ja ? "チャットのブリッジを再接続しています…" : "Reconnecting the chat bridge…";
         if (k == "hs_fix_bridge_ok") return ja ? "ブリッジの再接続に成功しました" : "Bridge reconnect succeeded";
@@ -680,7 +1092,7 @@ class CockpitWindow : Window
         headRow.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // title + controls
         headRow.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // subtitle (full width)
 
-        // right controls: autoscale group, language, theme  (row 0, col 1).
+        // right controls: live status/actions, language, theme (row 0, col 1).
         // Vertically CENTERED so the control cluster shares one horizontal center line with the
         // left-edge health strip (redesign: single clean header band, dots flush-left / controls
         // flush-right, all centered on one line — no big in-content title above).
@@ -689,12 +1101,13 @@ class CockpitWindow : Window
         ctrls.VerticalAlignment = VerticalAlignment.Center;
         ctrls.HorizontalAlignment = HorizontalAlignment.Right;
 
-        // "N workers" neutral info chip (live count updated in OnTick; shows maxtabs until first tick)
+        // Read-only live tab pressure. Configuration belongs in Settings; while idle this chip is
+        // hidden so the header does not duplicate the Start/ceiling/autoscale controls.
         _workerChip = new TextBlock();
         _workerChip.FontSize = 12; _workerChip.VerticalAlignment = VerticalAlignment.Center;
         _workerChip.Margin = new Thickness(0, 0, 12, 0);
         _workerChip.Padding = new Thickness(10, 3, 10, 3);
-        UpdateWorkerChip(0, false);   // initial paint
+        UpdateWorkerChip(0, 0, false);   // initial paint
         _workerChipBorder = new Border();
         _workerChipBorder.Child = _workerChip;
         _workerChipBorder.BorderThickness = new Thickness(1);
@@ -702,12 +1115,13 @@ class CockpitWindow : Window
         _workerChipBorder.Padding = new Thickness(0);
         _workerChipBorder.VerticalAlignment = VerticalAlignment.Center;
         _workerChipBorder.Margin = new Thickness(0, 0, 12, 0);
+        _workerChipBorder.Visibility = Visibility.Collapsed;
         PaintWorkerChipBorder(_workerChipBorder);
         ctrls.Children.Add(_workerChipBorder);
 
-        ctrls.Children.Add(AutoscaleControls());
         ctrls.Children.Add(EffortControl());
         ctrls.Children.Add(ApprovalControl());
+        ctrls.Children.Add(ApprovalCenterControl());
         ctrls.Children.Add(FleetControls());
         // gear -> settings popup consolidating the scattered start/上限/retry/disk-floor controls.
         ctrls.Children.Add(SettingsControl());
@@ -1078,8 +1492,21 @@ class CockpitWindow : Window
     // ══════════════════════════════════════════════════════════════════════════════════
     //  P0 HEALTH STRIP  —  infra state, glanceable + one-click fixable
     // ══════════════════════════════════════════════════════════════════════════════════
-    // Repo root is resolved the same way SpawnFleet does (exe is in ...\ui, repo is one up).
-    string RepoRoot() { return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..")); }
+    // Prefer the status file supplied to this process: it lets an isolated/preview cockpit build
+    // monitor and repair the selected workspace instead of accidentally acting on the directory
+    // that happens to contain the exe. Normal installs still resolve exactly as before because
+    // status.json lives in <repo>\.fleet. Fall back to exe\.. for custom/non-.fleet paths.
+    string RepoRoot()
+    {
+        try
+        {
+            string stateDir = Path.GetDirectoryName(Path.GetFullPath(_statusPath));
+            if (string.Equals(Path.GetFileName(stateDir), ".fleet", StringComparison.OrdinalIgnoreCase))
+                return Path.GetFullPath(Path.Combine(stateDir, ".."));
+        }
+        catch (Exception) { }
+        return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+    }
 
     // Build the health strip: 5 dots with labels + an INLINE Fix pill + an inline note, all on ONE
     // horizontal row. Redesign: left-aligned & vertically centered (it sits at the left edge of the
@@ -1091,6 +1518,7 @@ class CockpitWindow : Window
     UIElement BuildHealthStrip()
     {
         _healthDot = new Border[HEALTH_DOT_COUNT];
+        _healthSpin = new TextBlock[HEALTH_DOT_COUNT];
         _healthLbl = new TextBlock[HEALTH_DOT_COUNT];
         _healthDotWrap = new Border[HEALTH_DOT_COUNT];
 
@@ -1111,13 +1539,21 @@ class CockpitWindow : Window
             wrap.Padding = new Thickness(0);
             wrap.VerticalAlignment = VerticalAlignment.Center;
             var dr = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            var mark = new Grid { Width = 10, Height = 10, VerticalAlignment = VerticalAlignment.Center,
+                                  Margin = new Thickness(0, 0, 4, 0) };
             var dot = new Border { Width = 8, Height = 8, CornerRadius = new CornerRadius(4),
-                                   VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 4, 0) };
+                                   HorizontalAlignment = HorizontalAlignment.Center,
+                                   VerticalAlignment = VerticalAlignment.Center };
+            var spin = BuildSpinner(10);
+            spin.Visibility = Visibility.Collapsed;
+            mark.Children.Add(dot);
+            mark.Children.Add(spin);
             var lbl = new TextBlock { FontSize = 11, VerticalAlignment = VerticalAlignment.Center, Text = T(keys[i]) };
-            dr.Children.Add(dot);
+            dr.Children.Add(mark);
             dr.Children.Add(lbl);
             wrap.Child = dr;
             _healthDot[i] = dot;
+            _healthSpin[i] = spin;
             _healthLbl[i] = lbl;
             _healthDotWrap[i] = wrap;
             row.Children.Add(wrap);
@@ -1126,7 +1562,7 @@ class CockpitWindow : Window
         // INLINE Fix pill (hidden unless red/yellow): refined warning-outlined pill (transparent fill,
         // Warning outline + text) with a small Material Symbol + the label. Sits right after the 5th dot.
         _fixBtn = new Button();
-        _fixBtn.Content = BuildFixPillContent();
+        _fixBtn.Content = BuildFixPillContent(false);
         _fixBtn.FontSize = 11; _fixBtn.FontWeight = FontWeights.SemiBold;
         _fixBtn.Padding = new Thickness(8, 1, 9, 1);
         _fixBtn.Margin = new Thickness(10, 0, 0, 0);      // gap after エージェント dot
@@ -1154,14 +1590,31 @@ class CockpitWindow : Window
     // The inline Fix pill's content: a small Material Symbol (settings/cog — the closest repair glyph
     // in the subset) at 14px + the localized "Fix" label, tinted with the Warning token to match the
     // pill's outline. Rebuilt on theme/lang flips via RebuildChrome (whole chrome is reconstructed).
-    UIElement BuildFixPillContent()
+    TextBlock BuildSpinner(double size)
+    {
+        var spin = new TextBlock { Text = "⟳", FontFamily = new FontFamily("Segoe UI Symbol"),
+                                   FontSize = size, FontWeight = FontWeights.SemiBold,
+                                   HorizontalAlignment = HorizontalAlignment.Center,
+                                   VerticalAlignment = VerticalAlignment.Center,
+                                   TextAlignment = TextAlignment.Center,
+                                   RenderTransformOrigin = new Point(0.5, 0.5),
+                                   Foreground = Theme.Br(Theme.Warning(_dark)) };
+        var rotate = new RotateTransform(0);
+        spin.RenderTransform = rotate;
+        var animation = new DoubleAnimation(0, 360, new Duration(TimeSpan.FromMilliseconds(850)));
+        animation.RepeatBehavior = RepeatBehavior.Forever;
+        rotate.BeginAnimation(RotateTransform.AngleProperty, animation);
+        return spin;
+    }
+
+    UIElement BuildFixPillContent(bool busy)
     {
         var sp = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
-        var ic = MakeIcon("settings", 14, Theme.Br(Theme.Warning(_dark)));
+        UIElement ic = busy ? (UIElement)BuildSpinner(13) : MakeIcon("settings", 14, Theme.Br(Theme.Warning(_dark)));
         ((FrameworkElement)ic).Margin = new Thickness(0, 0, 4, 0);
         ((FrameworkElement)ic).VerticalAlignment = VerticalAlignment.Center;
         sp.Children.Add(ic);
-        sp.Children.Add(new TextBlock { Text = T("hs_fix"), FontSize = 11, FontWeight = FontWeights.SemiBold,
+        sp.Children.Add(new TextBlock { Text = T(busy ? "hs_fixing_button" : "hs_fix"), FontSize = 11, FontWeight = FontWeights.SemiBold,
                                         VerticalAlignment = VerticalAlignment.Center });
         return sp;
     }
@@ -1178,7 +1631,11 @@ class CockpitWindow : Window
             _fixBtn.Background = Brushes.Transparent;
             _fixBtn.Foreground = Theme.Br(Theme.Warning(_dark));
             _fixBtn.BorderBrush = Theme.Br(Theme.Warning(_dark));
+            _fixBtn.Content = BuildFixPillContent(_fixRunning);
         }
+        if (_healthSpin != null)
+            for (int i = 0; i < _healthSpin.Length; i++)
+                if (_healthSpin[i] != null) _healthSpin[i].Foreground = Theme.Br(Theme.Warning(_dark));
         if (_fixNote != null) _fixNote.Foreground = Muted;
     }
 
@@ -1188,6 +1645,7 @@ class CockpitWindow : Window
         if (s == HealthState.Green) return Theme.Br(Theme.Success(_dark));
         if (s == HealthState.Red) return Theme.Br(Theme.Danger(_dark));
         if (s == HealthState.Yellow) return Theme.Br(Theme.Warning(_dark));
+        if (s == HealthState.Checking) return Theme.Br(Theme.Warning(_dark));
         return Theme.Br(Theme.Muted(_dark));   // gray / unknown
     }
 
@@ -1203,7 +1661,14 @@ class CockpitWindow : Window
                 snap[i] = new DotState { State = _health[i].State, Detail = _health[i].Detail, Checked = _health[i].Checked };
         for (int i = 0; i < HEALTH_DOT_COUNT; i++)
         {
-            if (_healthDot[i] != null) _healthDot[i].Background = HealthBrush(snap[i].State);
+            bool checking = snap[i].State == HealthState.Checking || (_fixRunning && (_fixTargetMask & (1 << i)) != 0);
+            if (_healthDot[i] != null)
+            {
+                _healthDot[i].Background = HealthBrush(snap[i].State);
+                _healthDot[i].Visibility = checking ? Visibility.Collapsed : Visibility.Visible;
+            }
+            if (_healthSpin != null && _healthSpin[i] != null)
+                _healthSpin[i].Visibility = checking ? Visibility.Visible : Visibility.Collapsed;
             if (snap[i].State == HealthState.Red || snap[i].State == HealthState.Yellow) anyBad = true;
             if (_healthDotWrap[i] != null)
             {
@@ -1219,6 +1684,7 @@ class CockpitWindow : Window
             // Never hide the button mid-fix (it is disabled while running so it can't re-enter).
             _fixBtn.Visibility = (anyBad || _fixRunning) ? Visibility.Visible : Visibility.Collapsed;
             _fixBtn.IsEnabled = !_fixRunning;
+            _fixBtn.Content = BuildFixPillContent(_fixRunning);
         }
         // Clear the stale hint text once everything the strip knows about is healthy again (not
         // mid-fix): RunFix's note() writes _fixNote.Text once and nothing else used to clear it,
@@ -1280,8 +1746,10 @@ class CockpitWindow : Window
                     Dispatcher.BeginInvoke(new Action(delegate { try { ApplyHealthToUi(); } catch (Exception) { } }));
             }
             catch (Exception) { }
-            // Sleep in short slices so a Stop/close is responsive (~15s total).
-            for (int i = 0; i < 30 && !_healthStop; i++) Thread.Sleep(500);
+            // Normally poll every 15s, but wake immediately after a repair action changes state.
+            // This removes the old dead interval where the user clicked Fix, the command had
+            // already completed, yet the strip kept showing the pre-fix red snapshot.
+            if (!_healthStop) _healthWake.WaitOne(15000);
         }
     }
 
@@ -1394,6 +1862,8 @@ class CockpitWindow : Window
             string ageTxt = ts > 0 ? AgeMinutesText(ageMin) : T("hs_never");
             if (ageMin >= 20.0)
                 SetDot(5, HealthState.Red, ageTxt + " " + T("hs_tool_detail_stale"), now);
+            else if (kind == "checking" || kind == "starting")
+                SetDot(5, HealthState.Checking, ageTxt + " " + T("hs_tool_detail_checking"), now);
             else if (ok)
                 SetDot(5, HealthState.Green, ageTxt + " " + T("hs_tool_detail_ok"), now);
             else if (kind == "consent_card" || kind == "canned_fallback")
@@ -1659,8 +2129,17 @@ class CockpitWindow : Window
             server = _health[0].State; tunnel = _health[1].State; edge = _health[2].State;
             signin = _health[3].State; agent = _health[4].State; tool = _health[5].State;
         }
+        if (signin == HealthState.Red) _fixTargetMask = 1 << 3;
+        else if (edge == HealthState.Red) _fixTargetMask = 1 << 2;
+        else if (agent == HealthState.Yellow) _fixTargetMask = 1 << 4;
+        else if (server == HealthState.Red || tunnel == HealthState.Red)
+            _fixTargetMask = ((server == HealthState.Red) ? (1 << 0) : 0)
+                           | ((tunnel == HealthState.Red) ? (1 << 1) : 0);
+        else if (tool == HealthState.Red || tool == HealthState.Yellow) _fixTargetMask = 1 << 5;
+        else _fixTargetMask = 0;
         _fixRunning = true;
         ApplyHealthToUi();   // disable + keep the button visible
+        if (_fixNote != null) _fixNote.Text = T("hs_fixing");
 
         string repo = RepoRoot();
         Action<string> note = delegate (string s)
@@ -1668,7 +2147,13 @@ class CockpitWindow : Window
             try { if (!Dispatcher.HasShutdownStarted) Dispatcher.BeginInvoke(new Action(delegate { if (_fixNote != null) _fixNote.Text = s; })); }
             catch (Exception) { }
         };
-        Action done = delegate { _fixRunning = false; try { if (!Dispatcher.HasShutdownStarted) Dispatcher.BeginInvoke(new Action(delegate { ApplyHealthToUi(); })); } catch (Exception) { } };
+        Action done = delegate
+        {
+            _fixRunning = false;
+            _fixTargetMask = 0;
+            try { _healthWake.Set(); } catch (Exception) { }
+            try { if (!Dispatcher.HasShutdownStarted) Dispatcher.BeginInvoke(new Action(delegate { ApplyHealthToUi(); })); } catch (Exception) { }
+        };
 
         // Priority 1: Sign-in RED -> relaunch companion Edge HEADED for the user to sign in.
         if (signin == HealthState.Red)
@@ -2785,7 +3270,7 @@ class CockpitWindow : Window
                 {
                     string v = g0.Substring(10).Trim().ToLower();
                     if (v == "run" || v == "plan" || v == "auto")
-                    { _approval = v; SaveKey("approval", _approval); PaintApproval(); _goalInput.Text = ""; _startNote.Text = (_lang == 0 ? "承認モード→ " : "Approval set to ") + _approval; handled = true; }
+                    { _approval = v; SaveKey("approval", _approval); PaintApproval(); _goalInput.Text = ""; _startNote.Text = (_lang == 0 ? "実行方式→ " : "Run mode set to ") + _approval; handled = true; }
                 }
                 if (handled) return;
             }
@@ -3092,6 +3577,61 @@ class CockpitWindow : Window
         catch (Exception) { return 0; }
     }
 
+    // Fingerprint the exact resume state, not just its count. Dismissing one stale banner must
+    // survive restarts, but a genuinely new interrupted run (new ledger/done-map contents) must
+    // become visible again. The sidecar is UI-only: it never edits the resume ledger itself.
+    string ResumeStateSignature()
+    {
+        try
+        {
+            string stateDir = Path.GetDirectoryName(_statusPath);
+            string goalsPath = Path.Combine(stateDir, "last_run_goals.json");
+            if (!File.Exists(goalsPath)) return "";
+            string donePath = Path.Combine(stateDir, "last_run_done.json");
+            string payload = File.ReadAllText(goalsPath, Encoding.UTF8) + "\n\0\n"
+                           + (File.Exists(donePath) ? File.ReadAllText(donePath, Encoding.UTF8) : "");
+            byte[] bytes = new UTF8Encoding(false).GetBytes(payload);
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            {
+                byte[] hash = sha.ComputeHash(bytes);
+                var sb = new StringBuilder();
+                foreach (byte b in hash) sb.Append(b.ToString("x2"));
+                return sb.ToString().Substring(0, 24);
+            }
+        }
+        catch (Exception) { return ""; }
+    }
+
+    bool ResumeStateDismissed(string signature)
+    {
+        if (string.IsNullOrEmpty(signature)) return false;
+        try
+        {
+            if (!File.Exists(_resumeDismissPath)) return false;
+            var data = _js.DeserializeObject(File.ReadAllText(_resumeDismissPath, Encoding.UTF8))
+                       as Dictionary<string, object>;
+            return data != null && S(data, "signature") == signature;
+        }
+        catch (Exception) { return false; }
+    }
+
+    void DismissResumeState(string signature)
+    {
+        if (string.IsNullOrEmpty(signature)) return;
+        try
+        {
+            var data = new Dictionary<string, object>();
+            data["signature"] = signature; data["dismissed_at"] = NowUnix();
+            string tmp = _resumeDismissPath + ".tmp";
+            File.WriteAllText(tmp, _js.Serialize(data), new UTF8Encoding(false));
+            try { File.Replace(tmp, _resumeDismissPath, null); }
+            catch { File.Copy(tmp, _resumeDismissPath, true); try { File.Delete(tmp); } catch { } }
+        }
+        catch (Exception) { }
+        _lastSig = "";
+        OnTick(null, null);
+    }
+
     // --- slash-command autocomplete for the goal box (parity with the main chat) ---
     Popup _gcmdPopup; ListBox _gcmdList;
     Popup _helpPopup;   // /help text shown HERE (a compact popup) instead of dumped into the goal box
@@ -3105,7 +3645,7 @@ class CockpitWindow : Window
         new[]{"/review","<対象> をレビューして問題点を箇条書きで挙げる"},
         new[]{"/research","<問い> を Claude で深掘り調査する"},
         new[]{"/effort","推論モードを設定: min|max|ultra|auto"},
-        new[]{"/approval","承認モードを設定: run|plan|auto"},
+        new[]{"/approval","実行方式を設定: run|plan|auto（互換コマンド）"},
     };
     static readonly string[][] _goalCommandsEn = {
         new[]{"/help","Show the command list"},
@@ -3220,7 +3760,7 @@ class CockpitWindow : Window
                             SaveKey("approval", _approval);
                             PaintApproval();
                             applied = true;
-                            if (_startNote != null) _startNote.Text = (_lang == 0 ? "承認モード→ " : "Approval set to ") + _approval;
+                            if (_startNote != null) _startNote.Text = (_lang == 0 ? "実行方式→ " : "Run mode set to ") + _approval;
                         }
                     }
                     if (applied)
@@ -3281,7 +3821,7 @@ class CockpitWindow : Window
                 + "max - deepest reasoning\n"
                 + "ultra - max + extra checks\n"
                 + "auto - pick per task\n"
-                + "\nApproval (top bar)\n"
+                + "\nRun mode (top bar)\n"
                 + "run - run now\n"
                 + "plan - wait for plan approval\n"
                 + "auto - plain fleet waits for plan approval\n"
@@ -3299,7 +3839,7 @@ class CockpitWindow : Window
             + "max - 最も深い推論\n"
             + "ultra - max + 追加チェック\n"
             + "auto - タスクに応じ自動\n"
-            + "\n承認（上部設定）\n"
+            + "\n実行方式（上部設定）\n"
             + "run - 即実行\n"
             + "plan - 計画承認待ち\n"
             + "auto - 通常フリートは計画承認待ち\n"
@@ -3795,7 +4335,7 @@ class CockpitWindow : Window
         effortVal.Margin = new Thickness(4, 0, 24, 0);
         effortRow.Children.Add(effortVal);
         var approvalLbl = new TextBlock();
-        approvalLbl.Text = (ja ? "承認 / Approval: " : "Approval: ");
+        approvalLbl.Text = (ja ? "実行方式 / Run mode: " : "Run mode: ");
         approvalLbl.FontSize = 12;
         approvalLbl.Foreground = Theme.Br(Theme.Muted(_dark));
         approvalLbl.VerticalAlignment = VerticalAlignment.Center;
@@ -3923,18 +4463,15 @@ class CockpitWindow : Window
     Button _autoMinus, _autoPlus;
     TextBlock _autoLbl, _autoValue;
 
-    // Autoscale control GROUP (header): just [ RAM自動調整: ON/OFF ]. The 開始(デフォルト) and 上限
-    // steppers were moved OUT of the header into the settings panel (gear popup); only the toggle
-    // remains here. The toggle live-applies via RequestSetAutoscale/RequestSetMaxtabs; the steppers
-    // in settings route through SetMaxTabs/SetAutoMax.
+    // Autoscale toggle for the Settings panel. Autoscale, start tabs and ceiling are one concept,
+    // so they live together instead of splitting one setting between the header and gear menu.
     UIElement AutoscaleControls()
     {
         var group = new StackPanel(); group.Orientation = Orientation.Horizontal;
-        group.VerticalAlignment = VerticalAlignment.Center; group.Margin = new Thickness(0, 0, 12, 0);
-        // GAP5: explain this dense cluster -- the two −/+ steppers were indistinguishable.
+        group.VerticalAlignment = VerticalAlignment.Center; group.Margin = new Thickness(0, 2, 0, 4);
         group.ToolTip = _lang == 0
-            ? "RAM自動調整=ON なら空きRAMに応じて並列タブ数を自動増減。開始タブ数・上限は設定（⚙）内。"
-            : "Autoscale ON auto-adjusts parallel tabs to free RAM. Start count & ceiling live in Settings (⚙).";
+            ? "空きRAMに応じて並列タブ数を開始値から上限まで自動調整します。"
+            : "Automatically adjust parallel tabs from the start value up to the ceiling based on free RAM.";
 
         // a. autoscale ON/OFF toggle (simple themed button whose label flips)
         _autoToggle = new Button();
@@ -3942,7 +4479,7 @@ class CockpitWindow : Window
         _autoToggle.Cursor = Cursors.Hand; _autoToggle.BorderThickness = new Thickness(1);
         _autoToggle.Padding = new Thickness(10, 3, 10, 3); _autoToggle.FontSize = 12;
         _autoToggle.FontWeight = FontWeights.SemiBold;
-        _autoToggle.Margin = new Thickness(0, 0, 12, 0);
+        _autoToggle.Margin = new Thickness(0);
         _autoToggle.VerticalAlignment = VerticalAlignment.Center;
         _autoToggle.Click += delegate
         {
@@ -3956,10 +4493,6 @@ class CockpitWindow : Window
         };
         group.Children.Add(_autoToggle);
 
-        // b+c. Both the start (開始/デフォルト) and ceiling (上限) steppers were RELOCATED into the
-        //    settings panel (gear popup) to declutter the header. BuildSettingsPanel builds both and
-        //    keeps the _max*/_auto* field refs, so PaintChrome/UpdateAutoEnabled/SetMaxTabs/SetAutoMax
-        //    keep driving them. Only the autoscale ON/OFF toggle remains in the header.
         return group;
     }
 
@@ -4157,6 +4690,7 @@ class CockpitWindow : Window
 
         // ── Parallel tabs: start + ceiling (上限) steppers ──
         col.Children.Add(SectionHeader(T("set_tabs_section")));
+        col.Children.Add(AutoscaleControls());
         var startMinus = MiniButton("−"); startMinus.Click += delegate { SetMaxTabs(_maxtabs - 1); };
         var startPlus = MiniButton("+"); startPlus.Click += delegate { SetMaxTabs(_maxtabs + 1); };
         _maxMinus = startMinus; _maxPlus = startPlus;   // keep refs so PaintChrome re-themes them (mirrors ceiling)
@@ -4473,8 +5007,9 @@ class CockpitWindow : Window
         return st;
     }
 
-    // Approval selector: compact run/plan/auto mode next to effort. This avoids adding another
-    // header button in the already-dense fleet toolbar.
+    // Run-mode selector: run/plan/auto controls how a task starts.  It is intentionally labelled
+    // separately from the Approval Center; the old "Approval" label made users expect this combo
+    // to contain the actual pending decisions.
     static readonly string[] _approvalModes = { "run", "plan", "auto" };
     UIElement ApprovalControl()
     {
@@ -4487,13 +5022,13 @@ class CockpitWindow : Window
 
         _approvalBox = new ComboBox();
         _approvalBox.ToolTip = _lang == 0
-            ? "承認モード: run=すぐ実行、plan=計画承認待ち、auto=通常フリートは計画承認待ち/フォルダ自律はGO-ASK-STOP判定"
-            : "Approval mode: run=run now, plan=wait for approval, auto=plain fleet waits for plan approval; folder autonomy uses GO/ASK/STOP";
+            ? "実行方式: run=すぐ実行、plan=計画承認待ち、auto=通常フリートは計画承認待ち/フォルダ自律はGO-ASK-STOP判定"
+            : "Run mode: run=run now, plan=wait for approval, auto=plain fleet waits for plan approval; folder autonomy uses GO/ASK/STOP";
         _approvalBox.Cursor = Cursors.Hand; _approvalBox.FontSize = 12;
         _approvalBox.FontWeight = FontWeights.SemiBold; _approvalBox.MinWidth = 74;
         _approvalBox.Padding = new Thickness(8, 2, 4, 2);
         _approvalBox.VerticalAlignment = VerticalAlignment.Center;
-        System.Windows.Automation.AutomationProperties.SetName(_approvalBox, _lang == 0 ? "承認" : "Approval");
+        System.Windows.Automation.AutomationProperties.SetName(_approvalBox, _lang == 0 ? "実行方式" : "Run mode");
         FillComboWithHelp(_approvalBox, _approvalModes, ApprovalHelp(), _approval);  // per-option hover help
         _approvalBox.DropDownOpened += delegate { CloseHeaderPopups("approval"); };
         _approvalBox.SelectionChanged += delegate
@@ -4510,11 +5045,11 @@ class CockpitWindow : Window
     }
     void PaintApproval()
     {
-        if (_approvalLbl != null) { _approvalLbl.Text = T("approval"); _approvalLbl.Foreground = Muted; }
+        if (_approvalLbl != null) { _approvalLbl.Text = T("run_mode"); _approvalLbl.Foreground = Muted; }
         if (_approvalBox == null) return;
         if (!Equals(ComboVal(_approvalBox), _approval)) ComboSelectVal(_approvalBox, _approval);
         _approvalBox.Background = BtnBg; _approvalBox.Foreground = Fg; _approvalBox.BorderBrush = Border;
-        System.Windows.Automation.AutomationProperties.SetName(_approvalBox, _lang == 0 ? "承認" : "Approval");
+        System.Windows.Automation.AutomationProperties.SetName(_approvalBox, _lang == 0 ? "実行方式" : "Run mode");
         StyleFlatCombo(_approvalBox);   // same flat-template fix so the open list matches the theme
     }
 
@@ -4547,6 +5082,68 @@ class CockpitWindow : Window
                 { "run", "run: execute immediately, no approval step." },
                 { "plan", "plan: present a plan and pause at approval; steer the card to approve/edit." },
                 { "auto", "auto: plain fleet waits for plan approval; folder autonomy self-runs via GO-ASK-STOP." } };
+    }
+
+    // Persistent decision entry point.  Unlike the run-mode combo, this button represents actual
+    // human decisions and remains useful while the fleet is idle.
+    UIElement ApprovalCenterControl()
+    {
+        _approvalCenterBtn = new Button();
+        _approvalCenterBtn.Cursor = Cursors.Hand;
+        _approvalCenterBtn.BorderThickness = new Thickness(1);
+        _approvalCenterBtn.Padding = new Thickness(10, 3, 8, 3);
+        _approvalCenterBtn.Margin = new Thickness(0, 0, 12, 0);
+        _approvalCenterBtn.VerticalAlignment = VerticalAlignment.Center;
+        _approvalCenterBtn.Template = FlatButtonTemplate();
+
+        var row = new StackPanel(); row.Orientation = Orientation.Horizontal;
+        row.VerticalAlignment = VerticalAlignment.Center;
+        _approvalCenterLabel = new TextBlock();
+        _approvalCenterLabel.FontSize = 12; _approvalCenterLabel.FontWeight = FontWeights.SemiBold;
+        _approvalCenterLabel.VerticalAlignment = VerticalAlignment.Center;
+        row.Children.Add(_approvalCenterLabel);
+
+        _approvalCenterBadge = new Border();
+        _approvalCenterBadge.CornerRadius = new CornerRadius(8);
+        _approvalCenterBadge.MinWidth = 18; _approvalCenterBadge.Height = 18;
+        _approvalCenterBadge.Margin = new Thickness(7, 0, 0, 0);
+        _approvalCenterBadge.Padding = new Thickness(4, 0, 4, 0);
+        _approvalCenterBadgeText = new TextBlock();
+        _approvalCenterBadgeText.FontSize = 10; _approvalCenterBadgeText.FontWeight = FontWeights.Bold;
+        _approvalCenterBadgeText.HorizontalAlignment = HorizontalAlignment.Center;
+        _approvalCenterBadgeText.VerticalAlignment = VerticalAlignment.Center;
+        _approvalCenterBadge.Child = _approvalCenterBadgeText;
+        row.Children.Add(_approvalCenterBadge);
+        _approvalCenterBtn.Content = row;
+        _approvalCenterBtn.Click += delegate { CloseHeaderPopups(null); ShowApprovalCenter(); };
+        PaintApprovalCenterButton(0);
+        return _approvalCenterBtn;
+    }
+
+    void PaintApprovalCenterButton(int pending)
+    {
+        if (_approvalCenterBtn == null) return;
+        bool hasPending = pending > 0;
+        _approvalCenterBtn.Background = hasPending ? Theme.Br(Theme.SurfaceSubtle(_dark)) : BtnBg;
+        _approvalCenterBtn.BorderBrush = hasPending ? Theme.Br(Theme.Warning(_dark)) : Border;
+        _approvalCenterBtn.Foreground = Fg;
+        if (_approvalCenterLabel != null)
+        {
+            _approvalCenterLabel.Text = _lang == 0 ? "承認" : "Approvals";
+            _approvalCenterLabel.Foreground = hasPending ? Theme.Br(Theme.Warning(_dark)) : Fg;
+        }
+        if (_approvalCenterBadge != null)
+            _approvalCenterBadge.Background = hasPending ? Theme.Br(Theme.Warning(_dark)) : Theme.Br(Theme.SurfaceSubtle(_dark));
+        if (_approvalCenterBadgeText != null)
+        {
+            _approvalCenterBadgeText.Text = pending.ToString();
+            _approvalCenterBadgeText.Foreground = hasPending ? White : Muted;
+        }
+        string accessible = _lang == 0
+            ? ("承認センター、未処理 " + pending + " 件")
+            : ("Approval Center, " + pending + " pending");
+        _approvalCenterBtn.ToolTip = accessible;
+        System.Windows.Automation.AutomationProperties.SetName(_approvalCenterBtn, accessible);
     }
     void FillComboWithHelp(ComboBox cb, string[] opts, Dictionary<string, string> help, string current)
     {
@@ -4746,7 +5343,7 @@ class CockpitWindow : Window
     void PaintAutoToggle()
     {
         if (_autoToggle == null) return;
-        _autoToggle.Content = _autoscale ? "Auto" : (_lang == 0 ? "Auto · 切" : "Auto · off");
+        _autoToggle.Content = T("autoscale") + ": " + (_autoscale ? "ON" : "OFF");
         if (_autoscale)
         {
             _autoToggle.Foreground = Theme.Br(Theme.Accent(_dark));
@@ -5058,7 +5655,121 @@ class CockpitWindow : Window
         UpdateCapBanner(ReadStatus());
     }
 
-    // ── TASK 2 (Bucket C): gate approval banner build + update ───────────────────────────
+    // ── APPROVAL CENTER: durable gates, available even while the fleet is idle ───────────
+    string GateDirectory()
+    {
+        try
+        {
+            string raw = Environment.GetEnvironmentVariable("MCP_ALLOWED_BASE") ?? "";
+            if (string.IsNullOrWhiteSpace(raw)) raw = EnvValue("MCP_ALLOWED_BASE");
+            raw = (raw ?? "").Trim();
+            string basePath;
+            if (raw.Length == 0 || raw == "*")
+                basePath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            else
+            {
+                string[] roots = raw.Split(Path.PathSeparator);
+                basePath = roots.Length > 0 ? roots[0].Trim().Trim('"') : "";
+                if (basePath == "~") basePath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                else if (basePath.StartsWith("~" + Path.DirectorySeparatorChar) || basePath.StartsWith("~/"))
+                    basePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), basePath.Substring(2));
+                if (basePath.Length == 2 && basePath[1] == ':') basePath += Path.DirectorySeparatorChar;
+                if (basePath.Length == 0) basePath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            }
+            return Path.Combine(Path.GetFullPath(basePath), ".companion_gates");
+        }
+        catch (Exception)
+        {
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".companion_gates");
+        }
+    }
+
+    List<Dictionary<string, object>> ReadAllGates(Dictionary<string, object> statusRoot)
+    {
+        // A 1.5-second cache keeps the 700ms UI tick from repeatedly parsing a large audit history,
+        // while still surfacing new approvals promptly. AnswerGate invalidates it immediately.
+        double now = NowUnix();
+        if (now - _gateCacheAt < 1.5) return new List<Dictionary<string, object>>(_gateCache);
+        var gates = new List<Dictionary<string, object>>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            string dir = GateDirectory();
+            if (Directory.Exists(dir))
+            {
+                foreach (string p in Directory.GetFiles(dir, "gate_*.json"))
+                {
+                    try
+                    {
+                        string text;
+                        using (var fs = new FileStream(p, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                        using (var sr = new StreamReader(fs, Encoding.UTF8)) text = sr.ReadToEnd();
+                        var g = _js.DeserializeObject(text) as Dictionary<string, object>;
+                        if (g == null) continue;
+                        string token = S(g, "token");
+                        if (token.Length == 0) token = Path.GetFileNameWithoutExtension(p);
+                        g["token"] = token; g["path"] = p;
+                        if (seen.Add(token)) gates.Add(g);
+                    }
+                    catch (Exception) { }
+                }
+            }
+        }
+        catch (Exception) { }
+
+        gates.Sort(delegate (Dictionary<string, object> a, Dictionary<string, object> b)
+        { return Dbl(b, "asked_at").CompareTo(Dbl(a, "asked_at")); });
+        _gateCache = gates; _gateCacheAt = now;
+        return new List<Dictionary<string, object>>(_gateCache);
+    }
+
+    static bool GateAnswered(Dictionary<string, object> gate)
+    {
+        try { return gate.ContainsKey("answered") && Convert.ToBoolean(gate["answered"]); }
+        catch (Exception) { return false; }
+    }
+
+    static bool GateExpired(Dictionary<string, object> gate)
+    {
+        double expiry = Dbl(gate, "expires_at");
+        return expiry > 0 && expiry < NowUnix();
+    }
+
+    string GateKind(Dictionary<string, object> gate)
+    {
+        string token = S(gate, "token").ToLowerInvariant();
+        string hay = (S(gate, "context") + " " + S(gate, "question")).ToLowerInvariant();
+        if (token.StartsWith("gate_skill_") || hay.Contains("skill approval")) return _lang == 0 ? "Skill" : "Skill";
+        if (hay.Contains("contract gate: delete") || hay.Contains(" delete")) return _lang == 0 ? "削除" : "Delete";
+        if (hay.Contains("outbound") || hay.Contains("send_immediately")) return _lang == 0 ? "外部送信" : "External send";
+        if (hay.Contains("shell_destructive") || hay.Contains("destructive shell")) return _lang == 0 ? "破壊的shell" : "Destructive shell";
+        if (hay.Contains("task_router job class")) return _lang == 0 ? "ジョブ" : "Job";
+        return _lang == 0 ? "確認" : "Decision";
+    }
+
+    bool GateNeedsSecondConfirmation(Dictionary<string, object> gate)
+    {
+        string kind = GateKind(gate);
+        return kind == "削除" || kind == "Delete" || kind == "外部送信" ||
+               kind == "External send" || kind == "破壊的shell" || kind == "Destructive shell";
+    }
+
+    string GateAge(Dictionary<string, object> gate)
+    {
+        double age = Math.Max(0, NowUnix() - Dbl(gate, "asked_at"));
+        if (age < 60) return _lang == 0 ? "たった今" : "just now";
+        if (age < 3600) return ((int)(age / 60)).ToString() + (_lang == 0 ? "分前" : " min ago");
+        if (age < 86400) return ((int)(age / 3600)).ToString() + (_lang == 0 ? "時間前" : " hr ago");
+        return ((int)(age / 86400)).ToString() + (_lang == 0 ? "日前" : " days ago");
+    }
+
+    List<Dictionary<string, object>> PendingGates(Dictionary<string, object> root)
+    {
+        var pending = new List<Dictionary<string, object>>();
+        foreach (var gate in ReadAllGates(root)) if (!GateAnswered(gate)) pending.Add(gate);
+        return pending;
+    }
+
     // Builds the outer gate banner container (always Collapsed until a gate appears).
     UIElement BuildGateBanner()
     {
@@ -5080,20 +5791,12 @@ class CockpitWindow : Window
     {
         if (_gateBanner == null || _gateCardsPanel == null) return;
 
-        // Extract pending_gates array from root.
-        List<Dictionary<string, object>> gates = new List<Dictionary<string, object>>();
-        if (root != null)
-        {
-            object pgObj;
-            if (root.TryGetValue("pending_gates", out pgObj) && pgObj is object[])
-            {
-                foreach (object o in (object[])pgObj)
-                {
-                    var g = o as Dictionary<string, object>;
-                    if (g != null) gates.Add(g);
-                }
-            }
-        }
+        // Read the durable gate directory directly.  This is deliberately independent of
+        // status.json so Skill/import approvals remain visible before and after a fleet run.
+        List<Dictionary<string, object>> gates = PendingGates(root);
+        PaintApprovalCenterButton(gates.Count);
+        if (_approvalCenterWindow != null && _approvalCenterWindow.IsVisible)
+            RefreshApprovalCenter();
 
         // Build a signature from the current token set (order-insensitive for stability).
         var sb2 = new StringBuilder();
@@ -5130,7 +5833,6 @@ class CockpitWindow : Window
             string question = S(g2, "question");
             string context2 = S(g2, "context");
             string gatePath = S(g2, "path");
-            string token2 = S(g2, "token");
 
             // Question card.
             var gCard = new Border();
@@ -5174,12 +5876,22 @@ class CockpitWindow : Window
             approveBtn.FontSize = 12;
             approveBtn.Background = Theme.Br(Theme.Accent(_dark));
             approveBtn.Foreground = White;
-            approveBtn.Content = ja3 ? "承認 / Approve" : "Approve / 承認";
-            string gPath2 = gatePath; string gToken2 = token2;
+            bool reviewFirst = GateNeedsSecondConfirmation(g2) || GateKind(g2) == "Skill";
+            approveBtn.Content = reviewFirst
+                ? (ja3 ? "詳細を確認" : "Review details")
+                : (ja3 ? "承認 / Approve" : "Approve / 承認");
+            approveBtn.IsEnabled = !GateExpired(g2);
+            if (!approveBtn.IsEnabled)
+                approveBtn.ToolTip = ja3 ? "期限切れです。元の操作から承認を再要求してください。" : "Expired. Request approval again from the originating action.";
+            string gPath2 = gatePath;
+            Dictionary<string, object> capturedGate = g2;
             approveBtn.Click += delegate (object s2, RoutedEventArgs e2)
             {
                 e2.Handled = true;
-                AnswerGate(gPath2, "approved");
+                // High-impact operations require their exact scope to be reviewed in the
+                // Approval Center before the second confirmation is offered.
+                if (GateNeedsSecondConfirmation(capturedGate) || GateKind(capturedGate) == "Skill") ShowApprovalCenter();
+                else AnswerGate(gPath2, "approved");
             };
             btnRow.Children.Add(approveBtn);
 
@@ -5208,17 +5920,303 @@ class CockpitWindow : Window
 
         if (gates.Count > showCount)
         {
-            var moreTb = new TextBlock();
-            moreTb.Text = (ja3
+            var moreBtn = new Button();
+            moreBtn.Content = (ja3
                 ? ("+ さらに " + (gates.Count - showCount) + " 件の承認待ち")
                 : ("+ " + (gates.Count - showCount) + " more gate(s) pending"));
-            moreTb.FontSize = 11;
-            moreTb.Foreground = Theme.Br(Theme.Muted(_dark));
-            moreTb.Margin = new Thickness(0, 6, 0, 0);
-            _gateCardsPanel.Children.Add(moreTb);
+            moreBtn.FontSize = 11; moreBtn.Cursor = Cursors.Hand;
+            moreBtn.Foreground = Theme.Br(Theme.Warning(_dark));
+            moreBtn.Background = Brushes.Transparent; moreBtn.BorderThickness = new Thickness(0);
+            moreBtn.HorizontalAlignment = HorizontalAlignment.Left;
+            moreBtn.Padding = new Thickness(0); moreBtn.Margin = new Thickness(0, 6, 0, 0);
+            moreBtn.Click += delegate { ShowApprovalCenter(); };
+            _gateCardsPanel.Children.Add(moreBtn);
         }
 
         _gateBanner.Visibility = Visibility.Visible;
+    }
+
+    void ShowApprovalCenter()
+    {
+        if (_approvalCenterWindow != null && _approvalCenterWindow.IsVisible)
+        {
+            _approvalCenterWindow.Activate();
+            return;
+        }
+        var w = new Window();
+        _approvalCenterWindow = w;
+        w.Title = _lang == 0 ? "承認センター" : "Approval Center";
+        w.Width = 760; w.Height = 720; w.MinWidth = 560; w.MinHeight = 460;
+        w.WindowStartupLocation = WindowStartupLocation.CenterOwner; w.Owner = this;
+        w.Background = Bg;
+        w.KeyDown += delegate (object sender, KeyEventArgs e)
+        { if (e.Key == Key.Escape) { w.Close(); e.Handled = true; } };
+        w.Closed += delegate
+        {
+            _approvalCenterWindow = null; _approvalPendingHost = null; _approvalRecentHost = null;
+            _approvalCenterSummary = null; _approvalCenterSig = "";
+        };
+
+        var root = new DockPanel();
+        var head = new Border();
+        head.Background = CardBg; head.BorderBrush = Border;
+        head.BorderThickness = new Thickness(0, 0, 0, 1);
+        head.Padding = new Thickness(24, 18, 24, 16);
+        DockPanel.SetDock(head, Dock.Top);
+        var headGrid = new Grid();
+        headGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        headGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var titleCol = new StackPanel();
+        var title = new TextBlock(); title.Text = w.Title; title.Foreground = Fg;
+        title.FontSize = 20; title.FontWeight = FontWeights.SemiBold;
+        titleCol.Children.Add(title);
+        var note = new TextBlock();
+        note.Text = _lang == 0
+            ? "実際の操作許可をここで判断します。run / plan / auto の実行方式とは別です。"
+            : "Decide actual operation permissions here. This is separate from run / plan / auto mode.";
+        note.Foreground = Muted; note.FontSize = 12; note.Margin = new Thickness(0, 4, 0, 0);
+        note.TextWrapping = TextWrapping.Wrap; titleCol.Children.Add(note);
+        headGrid.Children.Add(titleCol);
+        _approvalCenterSummary = new TextBlock();
+        _approvalCenterSummary.Foreground = Theme.Br(Theme.Warning(_dark));
+        _approvalCenterSummary.FontWeight = FontWeights.SemiBold;
+        _approvalCenterSummary.VerticalAlignment = VerticalAlignment.Center;
+        _approvalCenterSummary.Margin = new Thickness(18, 0, 0, 0);
+        Grid.SetColumn(_approvalCenterSummary, 1); headGrid.Children.Add(_approvalCenterSummary);
+        head.Child = headGrid; root.Children.Add(head);
+
+        var scroll = new ScrollViewer(); scroll.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+        scroll.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
+        var body = new StackPanel(); body.Margin = new Thickness(24, 20, 24, 28);
+        body.Children.Add(BuildJobApprovalPolicyPanel());
+        var pendingTitle = new TextBlock();
+        pendingTitle.Text = _lang == 0 ? "判断が必要" : "Needs your decision";
+        pendingTitle.Foreground = Fg; pendingTitle.FontSize = 14; pendingTitle.FontWeight = FontWeights.SemiBold;
+        pendingTitle.Margin = new Thickness(0, 0, 0, 10); body.Children.Add(pendingTitle);
+        _approvalPendingHost = new StackPanel(); body.Children.Add(_approvalPendingHost);
+
+        var recentTitle = new TextBlock();
+        recentTitle.Text = _lang == 0 ? "最近の判断" : "Recent decisions";
+        recentTitle.Foreground = Fg; recentTitle.FontSize = 14; recentTitle.FontWeight = FontWeights.SemiBold;
+        recentTitle.Margin = new Thickness(0, 24, 0, 10); body.Children.Add(recentTitle);
+        _approvalRecentHost = new StackPanel(); body.Children.Add(_approvalRecentHost);
+        scroll.Content = body; root.Children.Add(scroll);
+        w.Content = root;
+        _approvalCenterSig = "";
+        RefreshApprovalCenter();
+        w.ShowDialog();
+    }
+
+    UIElement BuildJobApprovalPolicyPanel()
+    {
+        var box = new Border(); box.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+        box.BorderBrush = Border; box.BorderThickness = new Thickness(1);
+        box.CornerRadius = new CornerRadius(8); box.Padding = new Thickness(14, 12, 14, 12);
+        box.Margin = new Thickness(0, 0, 0, 20);
+        var col = new StackPanel();
+        var title = new TextBlock(); title.Text = _lang == 0 ? "操作承認ポリシー" : "Operation approval policy";
+        title.Foreground = Fg; title.FontSize = 13; title.FontWeight = FontWeights.SemiBold;
+        col.Children.Add(title);
+        var note = new TextBlock(); note.Foreground = Muted; note.FontSize = 11;
+        note.TextWrapping = TextWrapping.Wrap; note.Margin = new Thickness(0, 4, 0, 0);
+        note.Text = _lang == 0
+            ? "ローカルジョブと自律契約に即時反映。STOP・パス制限・外部Skillの初回/変更承認は常に残ります。"
+            : "Applies live to local jobs and autonomy contracts. STOP, path limits, and external-Skill trust remain enforced.";
+        col.Children.Add(note);
+
+        var selector = new ComboBox(); selector.MinWidth = 230; selector.HorizontalAlignment = HorizontalAlignment.Left;
+        selector.Margin = new Thickness(0, 10, 0, 0); selector.Background = CardBg; selector.Foreground = Fg;
+        var labels = _lang == 0
+            ? new string[] { "確認（推奨）", "自動", "バイパス" }
+            : new string[] { "Confirm (recommended)", "Auto", "Bypass" };
+        var values = new string[] { "default", "auto", "bypass" };
+        string current = ApprovalPromptWindow.ReadPolicy();
+        for (int i = 0; i < values.Length; i++)
+        {
+            var item = new ComboBoxItem(); item.Content = labels[i]; item.Tag = values[i];
+            selector.Items.Add(item); if (values[i] == current) selector.SelectedItem = item;
+        }
+        StyleFlatCombo(selector); col.Children.Add(selector);
+        var help = new TextBlock(); help.Foreground = Muted; help.FontSize = 11;
+        help.TextWrapping = TextWrapping.Wrap; help.Margin = new Thickness(0, 7, 0, 0);
+        col.Children.Add(help);
+        Action updateHelp = delegate
+        {
+            var selected = selector.SelectedItem as ComboBoxItem;
+            string mode = selected == null ? "default" : selected.Tag as string;
+            if (mode == "auto") help.Text = _lang == 0
+                ? "安全な操作は自動実行、要確認は承認待ち、禁止判定は拒否。"
+                : "Safe operations run automatically; risky ones ask; prohibited ones are denied.";
+            else if (mode == "bypass") help.Text = _lang == 0
+                ? "手動確認を省略。常時有効な安全境界は解除しません。"
+                : "Skip manual confirmations. Always-on safety boundaries remain.";
+            else help.Text = _lang == 0
+                ? "初回クラスを確認し、承認後も危険な内容は毎回確認。"
+                : "Confirm first-seen classes; risky payloads still ask every time.";
+        };
+        updateHelp();
+        bool reverting = false;
+        selector.SelectionChanged += delegate
+        {
+            if (reverting) return;
+            var item = selector.SelectedItem as ComboBoxItem; if (item == null) return;
+            string next = item.Tag as string; string previous = ApprovalPromptWindow.ReadPolicy();
+            if (next == "bypass")
+            {
+                string warning = _lang == 0
+                    ? "バイパスではローカルジョブと自律契約の手動確認を省略します。\nSTOP条件、ファイル範囲、外部Skill承認は残ります。\n\n有効にしますか？"
+                    : "Bypass skips manual approval for local jobs and autonomy contracts.\nSTOP rules, path limits, and external-Skill approval remain.\n\nEnable it?";
+                if (MessageBox.Show(_approvalCenterWindow, warning, _lang == 0 ? "バイパスを有効化" : "Enable bypass",
+                    MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes)
+                {
+                    reverting = true;
+                    foreach (object obj in selector.Items)
+                    { var old = obj as ComboBoxItem; if (old != null && (old.Tag as string) == previous) selector.SelectedItem = old; }
+                    reverting = false; updateHelp(); return;
+                }
+            }
+            ApprovalPromptWindow.SavePolicy(next); updateHelp();
+        };
+        box.Child = col; return box;
+    }
+
+    void RefreshApprovalCenter()
+    {
+        if (_approvalCenterWindow == null || _approvalPendingHost == null || _approvalRecentHost == null) return;
+        var all = ReadAllGates(ReadStatus());
+        var sig = new StringBuilder();
+        foreach (var gate in all)
+            sig.Append(S(gate, "token")).Append(':').Append(GateAnswered(gate) ? S(gate, "answer") : "open").Append(';');
+        string currentSig = sig.ToString() + (_dark ? "D" : "L") + _lang;
+        if (currentSig == _approvalCenterSig) return;
+        _approvalCenterSig = currentSig;
+
+        _approvalPendingHost.Children.Clear(); _approvalRecentHost.Children.Clear();
+        var pending = new List<Dictionary<string, object>>();
+        var recent = new List<Dictionary<string, object>>();
+        foreach (var gate in all)
+        {
+            if (GateAnswered(gate)) recent.Add(gate); else pending.Add(gate);
+        }
+        if (_approvalCenterSummary != null)
+            _approvalCenterSummary.Text = _lang == 0 ? (pending.Count + " 件 未処理") : (pending.Count + " pending");
+        PaintApprovalCenterButton(pending.Count);
+
+        if (pending.Count == 0)
+        {
+            var empty = new Border(); empty.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+            empty.BorderBrush = Border; empty.BorderThickness = new Thickness(1);
+            empty.CornerRadius = new CornerRadius(8); empty.Padding = new Thickness(16, 18, 16, 18);
+            var text = new TextBlock();
+            text.Text = _lang == 0 ? "未処理の承認はありません。" : "No approvals are waiting.";
+            text.Foreground = Muted; text.FontSize = 13; empty.Child = text;
+            _approvalPendingHost.Children.Add(empty);
+        }
+        else foreach (var gate in pending) _approvalPendingHost.Children.Add(BuildGateDecisionCard(gate, true));
+
+        int limit = Math.Min(20, recent.Count);
+        if (limit == 0)
+        {
+            var none = new TextBlock(); none.Text = _lang == 0 ? "履歴はまだありません。" : "No decision history yet.";
+            none.Foreground = Muted; none.FontSize = 12; _approvalRecentHost.Children.Add(none);
+        }
+        else for (int i = 0; i < limit; i++) _approvalRecentHost.Children.Add(BuildGateDecisionCard(recent[i], false));
+    }
+
+    UIElement BuildGateDecisionCard(Dictionary<string, object> gate, bool actionable)
+    {
+        bool expired = GateExpired(gate);
+        var card = new Border();
+        card.Background = CardBg;
+        card.BorderBrush = actionable ? Theme.Br(expired ? Theme.Danger(_dark) : Theme.Warning(_dark)) : Border;
+        card.BorderThickness = new Thickness(actionable ? 3 : 1, 1, 1, 1);
+        card.CornerRadius = new CornerRadius(8); card.Padding = new Thickness(14, 12, 14, 12);
+        card.Margin = new Thickness(0, 0, 0, 10);
+        var col = new StackPanel();
+
+        var meta = new DockPanel(); meta.LastChildFill = true;
+        var chip = new Border(); chip.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+        chip.BorderBrush = actionable ? Theme.Br(Theme.Warning(_dark)) : Border;
+        chip.BorderThickness = new Thickness(1); chip.CornerRadius = new CornerRadius(8);
+        chip.Padding = new Thickness(7, 2, 7, 2); chip.Margin = new Thickness(0, 0, 8, 0);
+        var chipText = new TextBlock(); chipText.Text = GateKind(gate); chipText.FontSize = 10;
+        chipText.FontWeight = FontWeights.SemiBold; chipText.Foreground = actionable ? Theme.Br(Theme.Warning(_dark)) : Muted;
+        chip.Child = chipText; DockPanel.SetDock(chip, Dock.Left); meta.Children.Add(chip);
+        var age = new TextBlock();
+        age.Text = (expired ? (_lang == 0 ? "期限切れ · " : "Expired · ") : "") + GateAge(gate);
+        age.Foreground = expired ? Theme.Br(Theme.Danger(_dark)) : Muted; age.FontSize = 11;
+        age.VerticalAlignment = VerticalAlignment.Center; meta.Children.Add(age);
+        col.Children.Add(meta);
+
+        var question = new TextBlock(); question.Text = S(gate, "question");
+        question.Foreground = Fg; question.FontSize = 13; question.FontWeight = FontWeights.SemiBold;
+        question.TextWrapping = TextWrapping.Wrap; question.Margin = new Thickness(0, 8, 0, 0);
+        col.Children.Add(question);
+
+        string context = S(gate, "context");
+        if (context.Length > 0)
+        {
+            var details = new Expander(); details.Header = _lang == 0 ? "対象と詳細を確認" : "Review scope and details";
+            details.Foreground = Muted; details.FontSize = 11; details.Margin = new Thickness(0, 7, 0, 0);
+            details.IsExpanded = actionable && (GateNeedsSecondConfirmation(gate) || GateKind(gate) == "Skill");
+            var detailText = new TextBlock(); detailText.Text = context; detailText.Foreground = Muted;
+            detailText.FontFamily = new FontFamily("Cascadia Mono, Consolas"); detailText.FontSize = 11;
+            detailText.TextWrapping = TextWrapping.Wrap; detailText.Margin = new Thickness(10, 6, 0, 0);
+            details.Content = detailText; col.Children.Add(details);
+        }
+
+        if (actionable)
+        {
+            var row = new StackPanel(); row.Orientation = Orientation.Horizontal; row.Margin = new Thickness(0, 12, 0, 0);
+            var approve = new Button(); approve.Content = _lang == 0 ? "承認" : "Approve";
+            approve.Cursor = Cursors.Hand; approve.Padding = new Thickness(18, 6, 18, 6);
+            approve.BorderThickness = new Thickness(0); approve.Background = Accent; approve.Foreground = White;
+            approve.FontWeight = FontWeights.SemiBold; approve.IsEnabled = !expired;
+            System.Windows.Automation.AutomationProperties.SetName(approve, _lang == 0 ? "この操作を承認" : "Approve this operation");
+            Dictionary<string, object> captured = gate;
+            approve.Click += delegate
+            {
+                if (GateNeedsSecondConfirmation(captured))
+                {
+                    string msg = (_lang == 0 ? "影響の大きい操作です。対象を確認したうえで本当に承認しますか？\n\n" :
+                        "This is a high-impact operation. Approve after reviewing the exact scope?\n\n") + S(captured, "question");
+                    if (MessageBox.Show(_approvalCenterWindow, msg, _lang == 0 ? "最終確認" : "Final confirmation",
+                        MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes) return;
+                }
+                AnswerGate(S(captured, "path"), "approved"); RefreshApprovalCenter();
+            };
+            row.Children.Add(approve);
+
+            var deny = new Button(); deny.Content = _lang == 0 ? "拒否" : "Deny";
+            deny.Cursor = Cursors.Hand; deny.Padding = new Thickness(18, 6, 18, 6);
+            deny.Margin = new Thickness(8, 0, 0, 0); deny.Background = Brushes.Transparent;
+            deny.Foreground = Theme.Br(Theme.Danger(_dark)); deny.BorderBrush = Theme.Br(Theme.Danger(_dark));
+            deny.BorderThickness = new Thickness(1);
+            System.Windows.Automation.AutomationProperties.SetName(deny, _lang == 0 ? "この操作を拒否" : "Deny this operation");
+            deny.Click += delegate { AnswerGate(S(captured, "path"), "denied"); RefreshApprovalCenter(); };
+            row.Children.Add(deny); col.Children.Add(row);
+
+            if (expired)
+            {
+                var expiredNote = new TextBlock();
+                expiredNote.Text = _lang == 0 ? "期限切れのため承認できません。拒否するか、元の操作から再要求してください。" :
+                    "This request expired. Deny it or request approval again from the originating action.";
+                expiredNote.Foreground = Theme.Br(Theme.Danger(_dark)); expiredNote.FontSize = 11;
+                expiredNote.Margin = new Thickness(0, 7, 0, 0); expiredNote.TextWrapping = TextWrapping.Wrap;
+                col.Children.Add(expiredNote);
+            }
+        }
+        else
+        {
+            var verdict = new TextBlock();
+            string answer = S(gate, "answer");
+            bool approved = answer.Equals("approved", StringComparison.OrdinalIgnoreCase);
+            verdict.Text = approved ? (_lang == 0 ? "承認済み" : "Approved") : (_lang == 0 ? "拒否済み" : "Denied");
+            verdict.Foreground = Theme.Br(approved ? Theme.Success(_dark) : Theme.Danger(_dark));
+            verdict.FontSize = 11; verdict.FontWeight = FontWeights.SemiBold; verdict.Margin = new Thickness(0, 8, 0, 0);
+            col.Children.Add(verdict);
+        }
+        card.Child = col; return card;
     }
 
     // Atomic gate answer: read the file at `path`, set answered=true + answer=<verdict>, write back.
@@ -5229,7 +6227,9 @@ class CockpitWindow : Window
         try
         {
             // Normalize: forward slashes may be in the path from status.json.
-            string localPath = path.Replace('/', Path.DirectorySeparatorChar);
+            string localPath = Path.GetFullPath(path.Replace('/', Path.DirectorySeparatorChar));
+            string gateRoot = Path.GetFullPath(GateDirectory()).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            if (!localPath.StartsWith(gateRoot, StringComparison.OrdinalIgnoreCase)) return;
             if (!File.Exists(localPath)) return;
 
             string text;
@@ -5241,18 +6241,27 @@ class CockpitWindow : Window
             if (gd == null) gd = new Dictionary<string, object>();
             gd["answered"] = true;
             gd["answer"] = verdict;
+            gd["answered_at"] = NowUnix();
 
             string updated = _js.Serialize(gd);
             // Atomic: write to a temp file in the same directory, then rename.
             string dir2 = Path.GetDirectoryName(localPath);
             string tmp = Path.Combine(dir2, Path.GetFileName(localPath) + ".tmp");
             File.WriteAllText(tmp, updated, new UTF8Encoding(false));
-            File.Copy(tmp, localPath, true);
-            try { File.Delete(tmp); } catch (Exception) { }
+            try { File.Replace(tmp, localPath, null); }
+            catch (Exception)
+            {
+                // Older/non-NTFS environments may not implement Replace; keep the same-directory
+                // fallback for compatibility, then remove the temporary file.
+                File.Copy(tmp, localPath, true);
+                try { File.Delete(tmp); } catch (Exception) { }
+            }
 
             // Force a sig reset so the banner refreshes on the next tick (the relay
             // will drop this gate from pending_gates once it sees answered=true).
             _gateSig = "";
+            _approvalCenterSig = "";
+            _gateCacheAt = 0;
         }
         catch (Exception) { }
     }
@@ -5321,13 +6330,16 @@ class CockpitWindow : Window
         if (except != "slash" && _gcmdPopup != null) _gcmdPopup.IsOpen = false;
     }
 
-    // Update the "N workers" chip text.  liveCount = 0 when idle (falls back to maxtabs).
-    // isLive = true when status.json shows an active run (show actual worker count).
-    void UpdateWorkerChip(int liveCount, bool isLive)
+    // Read-only runtime status. Hide it while idle/finished; Settings owns configuration.
+    void UpdateWorkerChip(int openTabs, int liveCap, bool isLive)
     {
         if (_workerChip == null) return;
-        int n = isLive ? liveCount : _maxtabs;
-        string label = _lang == 0 ? (n + " タブ") : (n + " workers");
+        if (_workerChipBorder != null)
+            _workerChipBorder.Visibility = isLive ? Visibility.Visible : Visibility.Collapsed;
+        if (!isLive) return;
+        int open = Math.Max(0, openTabs);
+        int cap = Math.Max(1, liveCap > 0 ? liveCap : _maxtabs);
+        string label = _lang == 0 ? ("タブ " + open + "/" + cap) : ("Tabs " + open + "/" + cap);
         _workerChip.Text = label;
         _workerChip.Foreground = Theme.Br(Theme.Muted(_dark));
     }
@@ -5357,7 +6369,7 @@ class CockpitWindow : Window
         if (_maxValue != null) _maxValue.Foreground = Fg;
         if (_autoLbl != null) _autoLbl.Foreground = Muted;
         if (_autoValue != null) _autoValue.Foreground = Fg;
-        if (_workerChip != null) UpdateWorkerChip(0, false);
+        if (_workerChip != null) UpdateWorkerChip(0, 0, false);
         PaintWorkerChipBorder(_workerChipBorder);
         PaintHealthChrome();
         ApplyHealthToUi();     // re-tint the dots for the new theme
@@ -5366,6 +6378,7 @@ class CockpitWindow : Window
         UpdateAutoEnabled();
         PaintEffort();
         PaintApproval();
+        PaintApprovalCenterButton(PendingGates(ReadStatus()).Count);
         PaintPause();
         PaintStop();
         if (_stopBtn != null) { _stopBtn.Background = BtnBg; _stopBtn.Foreground = Fg; _stopBtn.BorderBrush = Border; }
@@ -5427,6 +6440,7 @@ class CockpitWindow : Window
         PaintAutoToggle();
         PaintEffort();
         PaintApproval();
+        PaintApprovalCenterButton(PendingGates(ReadStatus()).Count);
         PaintPause();
         PaintStop();
         // _stopBtn / _pauseBtn now render drawn icons (PaintPause/PaintStop), not text labels.
@@ -5520,7 +6534,7 @@ class CockpitWindow : Window
             _header.Text = "Fleet";
             _sub.Text = "";                // the empty-state block in the body carries the message now
             if (_subChips != null) _subChips.Children.Clear();   // Feature 2: no chips while idle either
-            UpdateWorkerChip(0, false);    // show maxtabs while idle
+            UpdateWorkerChip(0, 0, false); // configuration lives in Settings while idle
             // A2-2: collapse spine and idle composer when no run
             RefreshSpine(root, true);
             PaintComposerMode(false);
@@ -5535,16 +6549,18 @@ class CockpitWindow : Window
             // P2 RESUME affordance: only meaningful when NO run is live (this idle branch). Compute the
             // unfinished count from the last run's durable ledger; hide when 0.
             int resumeN = UnfinishedResumeCount();
+            string resumeSig = resumeN > 0 ? ResumeStateSignature() : "";
+            bool resumeDismissed = resumeN > 0 && ResumeStateDismissed(resumeSig);
             string isig = "IDLE" + _history.Count + (_dark ? "D" : "L") + _lang + "|q" + (_histQuery ?? "")
-                          + "|r" + resumeN;
+                          + "|r" + resumeN + "|rs" + resumeSig + "|rd" + (resumeDismissed ? "1" : "0");
             if (_lastSig != isig)
             {
                 _lastRoot = null;
                 var rows = new List<object>();
-                if (resumeN > 0)
+                if (resumeN > 0 && !resumeDismissed)
                 {
                     var rd = new Dictionary<string, object>();
-                    rd["n"] = resumeN;
+                    rd["n"] = resumeN; rd["signature"] = resumeSig;
                     rows.Add(MkRow(8, null, rd));   // resume affordance (idle + N>0 only)
                 }
                 AppendHistoryRows(rows, null);   // idle: no live run on board -> show all history
@@ -5555,17 +6571,16 @@ class CockpitWindow : Window
             return;
         }
         UpdateHeader(root);                 // live elapsed every tick
-        // Update the "N workers" chip with the actual total worker count each tick.
+        bool runningNow = !root.ContainsKey("running") || Convert.ToBoolean(root["running"]);
+        // Snapshot exposes actual browser tabs and the current live concurrency cap. This is
+        // operational status, not another place to edit those settings.
         {
-            int wCount = 0;
-            object wo3;
-            if (root.TryGetValue("workers", out wo3) && wo3 is object[])
-                wCount = ((object[])wo3).Length;
-            UpdateWorkerChip(wCount, true);
+            int openTabs = I(root, "open_tabs");
+            int liveCap = I(root, "max_concurrent");
+            UpdateWorkerChip(openTabs, liveCap, runningNow);
         }
         // only archive while the run is LIVE -- otherwise the finished run's final
         // snapshot would re-add cleared tasks every tick (Clear would never stick).
-        bool runningNow = !root.ContainsKey("running") || Convert.ToBoolean(root["running"]);
         if (runningNow) ArchiveTerminal(root);
         // opt-in auto-retry runs every tick (before the sig short-circuit) so it catches a
         // stopped goal even when nothing else changed. Bounded by _autoRetryMax per goal text.
@@ -6213,7 +7228,8 @@ class CockpitWindow : Window
             case 7:                                            // date-group subheader: keyed on its label
                 return "HG|" + g + "|" + (hist != null ? S(hist, "label") : "");
             case 8:                                            // resume affordance: keyed on N
-                return "RA|" + g + "|" + (hist != null ? I(hist, "n") : 0);
+                return "RA|" + g + "|" + (hist != null ? I(hist, "n") : 0)
+                       + "|" + (hist != null ? S(hist, "signature") : "");
             case 4: return "DV|" + g;                          // "完了 (this run)" divider
             case 5: return "ES|" + g;                          // empty state (static chrome)
             case 6:                                            // directive band: keyed on first-worker goal + started
@@ -6345,7 +7361,9 @@ class CockpitWindow : Window
             if (r.Kind == 5) return _w.EmptyState();
             if (r.Kind == 6) return _w.DirectiveBand(r.Worker);
             if (r.Kind == 7) return _w.HistoryGroupHeader(r.Hist != null ? S(r.Hist, "label") : "");
-            if (r.Kind == 8) return _w.ResumeAffordance(r.Hist != null ? I(r.Hist, "n") : 0);
+            if (r.Kind == 8) return _w.ResumeAffordance(
+                r.Hist != null ? I(r.Hist, "n") : 0,
+                r.Hist != null ? S(r.Hist, "signature") : "");
             return null;
         }
         public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
@@ -6438,13 +7456,26 @@ class CockpitWindow : Window
     // P2 RESUME: inline banner shown (idle only, N>0) offering to relaunch the fleet with --resume,
     // which re-queues the unfinished goals from the last run's durable ledger. Hidden while a run is
     // live or when N==0 (the row is simply not emitted in those cases).
-    UIElement ResumeAffordance(int n)
+    UIElement ResumeAffordance(int n, string signature)
     {
         var row = new Border {
             BorderThickness = new Thickness(1), BorderBrush = Border, Background = BtnBg,
             CornerRadius = new CornerRadius(Theme.RadCard),
             Padding = new Thickness(14, 8, 14, 8), Margin = new Thickness(8, 8, 8, 4) };
         var dp = new DockPanel { LastChildFill = true };
+
+        // This banner is advisory, not a blocking error. Let the user dismiss this exact stale
+        // resume state permanently; a new interrupted run has a different signature and returns.
+        var close = IconButton("close", 14, _lang == 0 ? "未完了ランの通知を閉じる" : "Dismiss unfinished-run notice");
+        close.Width = 28; close.Height = 28; close.Margin = new Thickness(8, 0, 0, 0);
+        close.Padding = new Thickness(0); close.BorderThickness = new Thickness(0);
+        close.Background = Brushes.Transparent; close.Foreground = Muted;
+        close.Template = FlatButtonTemplate();
+        close.ToolTip = _lang == 0 ? "この未完了ランを非表示" : "Hide this unfinished run";
+        string capturedSignature = signature;
+        close.Click += delegate (object sender, RoutedEventArgs e)
+        { e.Handled = true; DismissResumeState(capturedSignature); };
+        DockPanel.SetDock(close, Dock.Right); dp.Children.Add(close);
 
         var btn = new Button {
             Content = _lang == 0 ? "再開" : "Resume", Cursor = Cursors.Hand, FontSize = 12,

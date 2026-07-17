@@ -7,6 +7,9 @@ so the shell-only destructive matcher missed os.remove / shutil.rmtree / Path.un
 truncating open(...,'w') / os.system / subprocess. destructive_python() now catches those
 and run_python() routes them through the existing 'shell_destructive' contract op_class.
 """
+import json
+
+from tools import approval_policy, contract_gate
 from tools.contract_gate import destructive_python, destructive_shell, check_op
 
 
@@ -59,6 +62,25 @@ def test_shell_still_works():
     assert destructive_shell("rm -rf /tmp/x")
     assert not destructive_shell("pytest -q")
     print("ok test_shell_still_works")
+
+
+def test_bypass_skips_ask_but_never_contract_stop(monkeypatch, tmp_path):
+    contract_path = tmp_path / "active_contract.json"
+    monkeypatch.setattr(contract_gate, "_CONTRACT_FILE", contract_path)
+    monkeypatch.setattr(approval_policy, "current_approval_mode", lambda default=None: "bypass")
+    contract_path.write_text(json.dumps({
+        "active": True,
+        "ask_before": ["delete"],
+        "stop_when": [],
+    }), encoding="utf-8")
+    assert contract_gate.check_op("delete", "example.txt") is None
+
+    contract_path.write_text(json.dumps({
+        "active": True,
+        "ask_before": [],
+        "stop_when": ["delete"],
+    }), encoding="utf-8")
+    assert contract_gate.check_op("delete", "example.txt") is not None
 
 
 if __name__ == "__main__":
