@@ -70,6 +70,7 @@ jobs:
             tools/test_skill_registration.py \
             scripts/test_bootstrap.py \
             scripts/test_bootstrap_p2c.py \
+            scripts/test_operational_resilience.py \
             scripts/test_start_companion_edge_headless.py \
             bridge/test_bridge_sessions.py \
             bridge/test_cdp_watchdog.py \
