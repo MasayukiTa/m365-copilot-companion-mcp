@@ -3996,8 +3996,26 @@ TOOL_PROBE_TIMEOUT_SEC = 180
 
 # Desktop path resolved at runtime (same construction relay/edge_reconnect.py's DEFAULT_PROBE
 # uses) so the probe instruction works for any user, not just the one who wrote this file.
-_TOOL_PROBE_DESKTOP_DIR = os.path.join(
-    os.environ.get("USERPROFILE", os.path.expanduser("~")), "Desktop").replace("\\", "/")
+# Honors OneDrive Known Folder Move (Desktop redirected under "OneDrive - <org>\Desktop"),
+# a common corporate M365 setup -- the plain USERPROFILE\Desktop join 404s there and made the
+# probe itself fail (list_directory: not found), misreporting a real connector as broken.
+def _resolve_desktop_dir() -> str:
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        ) as key:
+            val, _ = winreg.QueryValueEx(key, "Desktop")
+            resolved = os.path.expandvars(val)
+            if resolved:
+                return resolved.replace("\\", "/")
+    except Exception:
+        pass
+    return os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Desktop").replace("\\", "/")
+
+
+_TOOL_PROBE_DESKTOP_DIR = _resolve_desktop_dir()
 # The probe instruction: forces a real call_tool(list_directory) round-trip and asks the agent
 # to emit tool_probe.PROBE_OK_TOKEN as the LAST line ONLY on success, so a canned/no-connector
 # reply or a consent card (neither of which would emit the token) is distinguishable from a
