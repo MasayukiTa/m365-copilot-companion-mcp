@@ -265,10 +265,12 @@ if ($useHeadless) {
 $arguments += "--window-size=1400,1000"
 $arguments += @(
     "--user-data-dir=$dataDir",
+    # CDP has no built-in authentication. Keep it reachable only by local
+    # processes; remote users still reach the MCP server through Dev Tunnel.
+    "--remote-debugging-address=127.0.0.1",
     "--remote-debugging-port=$Port",
     "--no-first-run",
     "--no-default-browser-check",
-    "--remote-allow-origins=*",
     # suppress the "restore pages?" / crashed-session bubble so a kill+relaunch comes up
     # clean (recovery normally closes tabs one by one via relay\edge_recover.py)
     "--hide-crash-restore-bubble",

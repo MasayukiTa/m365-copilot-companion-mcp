@@ -234,3 +234,32 @@ def test_probe_timeout_skips_consent_recovery(monkeypatch):
 
     assert recorded[-1] == (False, "timeout")
     assert surface_calls == []
+
+
+def test_probe_startup_is_transitional_and_retries_quickly(monkeypatch):
+    _reset_state(monkeypatch)
+    monkeypatch.setattr(B, "PAGE", None)
+    monkeypatch.setattr(B, "_LAST_USER_TURN_TS", 0.0)
+    monkeypatch.setattr(B, "MCP_TOOL_PROBE_SEC", 600.0)
+    recorded = []
+    monkeypatch.setattr(B.tool_probe, "record_probe",
+                        lambda ok, kind, detail="", ts=None: recorded.append((ok, kind, detail)))
+
+    retry = B._run_tool_probe()
+
+    assert retry == 15.0
+    assert recorded[-1][0:2] == (False, "starting")
+
+
+def test_probe_records_checking_before_the_real_turn(monkeypatch):
+    _reset_state(monkeypatch)
+    _patch_probe_plumbing(monkeypatch, [(True, "===TOOLPROBE_OK===", False)])
+    _patch_surface(monkeypatch, [])
+    recorded = []
+    monkeypatch.setattr(B.tool_probe, "record_probe",
+                        lambda ok, kind, detail="", ts=None: recorded.append((ok, kind)))
+
+    B._run_tool_probe()
+
+    assert recorded[0] == (False, "checking")
+    assert recorded[-1] == (True, "answer")

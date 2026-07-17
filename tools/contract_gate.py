@@ -221,7 +221,7 @@ def _create_gate(token: str, question: str, context: str) -> None:
     """Write a gate file for the given token (used instead of gate_ask to supply our own token)."""
     try:
         from tools.file_ops import ALLOWED_BASE
-        from tools.notify_ops import notify_desktop
+        from tools.notify_ops import notify_approval_gate
         gate_dir = ALLOWED_BASE / ".companion_gates"
         gate_dir.mkdir(parents=True, exist_ok=True)
         gate_file = gate_dir / f"{token}.json"
@@ -237,7 +237,7 @@ def _create_gate(token: str, question: str, context: str) -> None:
         }
         gate_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         try:
-            notify_desktop("自律契約ゲート — 承認が必要です", question[:180])
+            notify_approval_gate("自律契約ゲート - 承認が必要です", question[:180], gate_file)
         except Exception:
             pass
     except Exception:
@@ -287,6 +287,15 @@ def check_op(op_class: str, detail: str = "") -> Optional[str]:
 
     # ── ask_before: HITL approval gate ─────────────────────────────────────
     if op_class in ask_before:
+        # Bypass suppresses only human confirmation. The stop_when branch above
+        # remains an always-on hard stop, and external Skill trust uses its own
+        # exact-digest approval path.
+        try:
+            from tools.approval_policy import current_approval_mode
+            if current_approval_mode() == "bypass":
+                return None
+        except Exception:
+            pass
         token = _stable_token(op_class, detail)
         existing = _find_existing_gate(token)
 

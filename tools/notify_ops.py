@@ -2,9 +2,41 @@ import json
 import os
 import shutil
 import subprocess
+from pathlib import Path
 from typing import Optional
 
 POWERSHELL_TIMEOUT = 20
+
+
+def notify_approval_gate(title: str, body: str, gate_path: str | Path) -> str:
+    """Show the normal toast and open FleetCockpit's actionable gate prompt.
+
+    The prompt runs in a separate GUI process, so a long-running worker is never
+    blocked while the user decides.  It also provides the live confirmation,
+    auto, and bypass policy controls.
+    """
+    toast_result = notify_desktop(title, body) or "[notification handler returned no status]"
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return toast_result + "; approval prompt suppressed under pytest"
+
+    try:
+        gate = Path(gate_path).expanduser().resolve()
+        if gate.suffix.lower() != ".json" or not gate.name.lower().startswith("gate_"):
+            return toast_result + "; approval prompt rejected invalid gate path"
+        cockpit = Path(__file__).resolve().parents[1] / "ui" / "FleetCockpit.exe"
+        if not cockpit.is_file():
+            return toast_result + "; approval prompt unavailable (FleetCockpit.exe not built)"
+        subprocess.Popen(
+            [str(cockpit), "--approval-gate", str(gate)],
+            cwd=str(cockpit.parent.parent),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return toast_result + "; actionable approval prompt opened"
+    except Exception as e:
+        return toast_result + f"; approval prompt error: {type(e).__name__}: {e}"
 
 
 def notify_desktop(
