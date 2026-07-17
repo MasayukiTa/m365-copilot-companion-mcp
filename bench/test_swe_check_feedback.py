@@ -24,6 +24,14 @@ class _FakeProc:
         self.stdout = stdout
 
 
+def test_to_wsl_preserves_posix_checkout(monkeypatch):
+    monkeypatch.setattr(swe_check.os.path, "abspath", lambda _path: "/home/runner/work/repo")
+    monkeypatch.setattr(
+        swe_check.os.path, "splitdrive", lambda path: ("", path)
+    )
+    assert swe_check._to_wsl("ignored") == "/home/runner/work/repo"
+
+
 def _patch_report(monkey_report):
     """Replace swe_check.wsl so _verdict_breakdown reads our synthetic report.json instead of WSL."""
     def fake_wsl(script, timeout=1000, capture=False):

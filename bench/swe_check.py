@@ -18,10 +18,18 @@ DISTRO = "MiasmaLab"
 
 
 def _to_wsl(win_path):
-    """Convert a Windows path (C:\\...) to its /mnt/<drive>/... WSL form, so the paths we hand
-    to wsl.exe/docker point at THIS checkout regardless of the folder it was cloned into."""
+    """Convert a Windows drive path to WSL form; preserve native POSIX paths.
+
+    The module is imported by hermetic tests on Linux as well as used by the real
+    Windows/WSL evaluator.  A POSIX checkout has no drive component and must not
+    be indexed as though it were ``C:``.
+    """
     p = os.path.abspath(win_path)
     drive, rest = os.path.splitdrive(p)
+    if not drive:
+        return p.replace("\\", "/")
+    if len(drive) < 2 or drive[1] != ":":
+        raise ValueError("WSL path conversion requires a drive-letter or POSIX path")
     return "/mnt/" + drive[0].lower() + rest.replace("\\", "/")
 
 
