@@ -1769,7 +1769,13 @@ class CockpitWindow : Window
             SetDot(1, HealthState.Gray, T("hs_tun_detail_none"), now);
         else
         {
-            string turl = tunnel.TrimEnd('/') + "/health";
+            // MCP_TUNNEL_URL points at the /mcp path (e.g. https://host.devtunnels.ms/mcp);
+            // /health is a SIBLING route at the tunnel origin, not nested under /mcp -- so
+            // naively appending "/health" produced .../mcp/health, a 404 that always red'd
+            // this dot even when the tunnel was serving correctly. Use the origin instead.
+            string origin = tunnel;
+            try { Uri u = new Uri(tunnel); origin = u.GetLeftPart(UriPartial.Authority); } catch (Exception) { }
+            string turl = origin + "/health";
             // 6s, not the local 4s budget: this is a remote round-trip (devtunnels region)
             // that on a corporate machine also traverses the system proxy -- 4s false-reds it.
             bool tunOk = HttpOk(turl, 6000);
