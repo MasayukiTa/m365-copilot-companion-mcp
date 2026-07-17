@@ -67,6 +67,7 @@ import argparse
 import hashlib
 import json
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -596,7 +597,9 @@ def _resilience_finding_key(finding):
     detail = " ".join(str(finding.get("detail", "") or "").lower().split())
     detail_hash = hashlib.sha256(detail.encode("utf-8")).hexdigest()[:16]
     return (
-        os.path.normcase(os.path.normpath(str(finding.get("file", "") or ""))),
+        os.path.normcase(posixpath.normpath(
+            str(finding.get("file", "") or "").replace("\\", "/")
+        )).replace("\\", "/"),
         finding.get("line"),
         str(finding.get("title", "") or "").strip().lower(),
         detail_hash,
@@ -1115,7 +1118,9 @@ def _dedupe_key(finding):
     refuter REFUTED in an earlier round still counts as "already seen" and never re-triggers
     a "new finding this round" count (which would otherwise stall the loop at dry_rounds=0
     forever, since a refuted finding can keep reappearing every round)."""
-    file_ = os.path.normpath(str(finding.get("file", "") or ""))
+    file_ = posixpath.normpath(
+        str(finding.get("file", "") or "").replace("\\", "/")
+    )
     line = finding.get("line")
     title = str(finding.get("title", "") or "").strip().lower()
     return (file_, line, title)

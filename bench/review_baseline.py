@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 
 
 def dedupe_key(finding):
@@ -31,7 +32,9 @@ def dedupe_key(finding):
     produces a key rather than raising."""
     if not isinstance(finding, dict):
         finding = {}
-    file_ = os.path.normpath(str(finding.get("file", "") or ""))
+    file_ = posixpath.normpath(
+        str(finding.get("file", "") or "").replace("\\", "/")
+    )
     line = finding.get("line")
     title = str(finding.get("title", "") or "").strip().lower()
     return (file_, line, title)
