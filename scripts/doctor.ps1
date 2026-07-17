@@ -244,7 +244,16 @@ Check "tunnel_owned" "Dev Tunnel name is owned by this account (MCP_TUNNEL_NAME)
     "This .env names a dev tunnel your account does not own (it was likely copied from another machine). Run start_all.bat (it now repoints to your own tunnel automatically) or: powershell -File scripts\heal_tunnel.ps1"
 
 TunnelCheck "tunnel_serving" "Dev Tunnel host serving (public URL -> server)" `
-    { if (-not $turl) { return $false }; (Invoke-WebRequest -Uri (($turl.TrimEnd('/')) + '/health') -TimeoutSec 7 -UseBasicParsing).StatusCode -eq 200 } `
+    {
+        if (-not $turl) { return $false }
+        # MCP_TUNNEL_URL points at the /mcp path (e.g. https://host.devtunnels.ms/mcp);
+        # /health is a SIBLING route at the tunnel origin, not nested under /mcp -- so
+        # naively appending "/health" to $turl produced .../mcp/health, a 404 that made
+        # this check FAIL even when the tunnel was being served correctly. Use the
+        # origin (scheme+host) instead.
+        $origin = ([Uri]$turl).GetLeftPart([UriPartial]::Authority)
+        (Invoke-WebRequest -Uri ($origin + '/health') -TimeoutSec 7 -UseBasicParsing).StatusCode -eq 200
+    } `
     "the tunnel exists but is not being served -- run start_all.bat (the supervisor hosts it). If this stays red while the checks above are green, MCP_TUNNEL_URL in .env may be stale -- compare it to the URL shown by 'devtunnel show <name>'."
 
 # 3d. Supervisor/env match -- catches a RUNNING supervisor that is hosting a different
