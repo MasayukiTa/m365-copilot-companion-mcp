@@ -34,10 +34,25 @@ from relay.copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver
 # A probe that REQUIRES the connector (list_directory) and asks for a one-line answer, so
 # a working connector returns "N個" while a connector-less default Copilot says 実行不可.
 # The probe target is the current user's Desktop, resolved at runtime so it works for any user.
-_DESKTOP_PROBE_PATH = (
-    os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Desktop")
-    .replace("\\", "/")
-)
+# Honors OneDrive Known Folder Move (Desktop redirected under "OneDrive - <org>\Desktop") --
+# see bridge/copilot_bridge.py's _resolve_desktop_dir (same fix, kept in sync).
+def _resolve_desktop_dir() -> str:
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        ) as key:
+            val, _ = winreg.QueryValueEx(key, "Desktop")
+            resolved = os.path.expandvars(val)
+            if resolved:
+                return resolved.replace("\\", "/")
+    except Exception:
+        pass
+    return os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Desktop").replace("\\", "/")
+
+
+_DESKTOP_PROBE_PATH = _resolve_desktop_dir()
 DEFAULT_PROBE = (
     "接続確認。call_tool 経由で list_directory を使い "
     + _DESKTOP_PROBE_PATH + " 直下の項目数だけを『N個』の形で1行で答えて。"
