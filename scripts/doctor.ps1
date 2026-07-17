@@ -6,7 +6,7 @@
 #  ASCII / ENGLISH ONLY (cmd/console safe).
 #
 #  -Json: emit ONE compressed JSON array line on stdout (id/ok/name/fix/optional/
-#  info/skipped per check) instead of the colored checklist. This is the single
+#  info/skipped/indeterminate per check) instead of the colored checklist. This is the single
 #  machine-readable source of truth that scripts\repair.ps1 (and any other tool,
 #  e.g. a cockpit UI) parses to decide what to fix -- doctor stays READ-ONLY
 #  (detect only); it never repairs anything itself.
@@ -52,12 +52,12 @@ if (Test-Path $envPath) {
     }
 }
 
-$script:ok = 0; $script:bad = 0
+$script:ok = 0; $script:bad = 0; $script:warn = 0
 # Machine-readable accumulator: one entry per check, in the exact order checks run
 # (== the dependency order documented at the top of this file). This -- not the
 # colored console text -- is the single source of truth a repair dispatcher reads.
 $script:results = @()
-function Add-Result([string]$id, [bool]$pass, [string]$name, [string]$fix, [bool]$optional, [bool]$info, [bool]$skipped) {
+function Add-Result([string]$id, [bool]$pass, [string]$name, [string]$fix, [bool]$optional, [bool]$info, [bool]$skipped, [bool]$indeterminate = $false) {
     $script:results += [PSCustomObject]@{
         id       = $id
         ok       = $pass
@@ -66,6 +66,30 @@ function Add-Result([string]$id, [bool]$pass, [string]$name, [string]$fix, [bool
         optional = $optional
         info     = $info
         skipped  = $skipped
+        indeterminate = $indeterminate
+    }
+}
+function Check-TriState([string]$id, [string]$name, [scriptblock]$test, [string]$fix) {
+    # `$null` means the dependency could not be queried reliably (for example, the devtunnel CLI
+    # timed out during a network switch). It is neither a security PASS nor a repairable FAIL.
+    $value = $null
+    try { $value = & $test } catch { $value = $null }
+    if ($null -eq $value) {
+        Add-Result $id $false $name $fix $false $false $false $true
+        Write-Host ("  [WARN] " + $name + " (temporarily indeterminate)") -ForegroundColor Yellow
+        Write-Host ("         retry: " + $fix) -ForegroundColor DarkYellow
+        $script:warn++
+        return
+    }
+    $pass = [bool]$value
+    Add-Result $id $pass $name $fix $false $false $false $false
+    if ($pass) {
+        Write-Host ("  [ OK ] " + $name) -ForegroundColor Green
+        $script:ok++
+    } else {
+        Write-Host ("  [FAIL] " + $name) -ForegroundColor Red
+        Write-Host ("         fix: " + $fix) -ForegroundColor Yellow
+        $script:bad++
     }
 }
 function Check([string]$id, [string]$name, [scriptblock]$test, [string]$fix, [switch]$Optional, [switch]$Info) {
@@ -223,25 +247,33 @@ Check "tunnel_name_private" "Dev Tunnel name is private (no identifying token)" 
 
 # 3c. Ownership check -- catches an .env copied from another machine (MCP_TUNNEL_NAME
 # names a tunnel THIS account does not own, so `devtunnel host` fails with a scopes
-# error). Uses Check (not TunnelCheck) so it runs independently of the tunnel
+# error). Uses a tri-state check (not TunnelCheck) so it runs independently of the tunnel
 # dependency short-circuit above -- an unowned name is informative even when e.g.
-# the CLI isn't logged in (in which case the bounded call below just no-ops to a
-# safe PASS, since there is nothing to contradict "empty or unknown"). Bounded the
-# same way as the other devtunnel calls in this file.
+# the CLI is temporarily unreachable. A transient timeout is WARN/indeterminate rather than
+# falsely declaring another account's tunnel or launching an unnecessary repair.
 function Test-TunnelOwned([string]$name) {
     if ([string]::IsNullOrWhiteSpace($name)) { return $true }
-    $out = Invoke-DevTunnelBounded @('list') 8
-    if (-not $out) { return $false }
     $bareName = (($name -split '\.')[0]).ToLowerInvariant()
-    $ids = @($out -split "`r?`n" | ForEach-Object {
-        if ($_ -match '^\s*([a-z0-9][a-z0-9-]+\.[a-z0-9]+)\s') { $matches[1] }
-    } | Where-Object { $_ } | ForEach-Object { (($_ -split '\.')[0]).ToLowerInvariant() })
-    return ($ids -contains $bareName)
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        # The CLI commonly needs 6-8s even on a healthy connection (token refresh/service round
+        # trip), so each attempt gets 10s. Three bounded attempts still cap the worst case.
+        $out = Invoke-DevTunnelBounded @('list') 10
+        if ($out) {
+            $ids = @($out -split "`r?`n" | ForEach-Object {
+                if ($_ -match '^\s*([a-z0-9][a-z0-9-]+\.[a-z0-9]+)\s') { $matches[1] }
+            } | Where-Object { $_ } | ForEach-Object { (($_ -split '\.')[0]).ToLowerInvariant() })
+            if ($ids.Count -gt 0) { return ($ids -contains $bareName) }
+            # An explicit empty result is authoritative; arbitrary/partial output is not.
+            if ($out -match '(?i)no (dev )?tunnels|0 tunnels') { return $false }
+        }
+        if ($attempt -lt 3) { Start-Sleep -Milliseconds 500 }
+    }
+    return $null
 }
 
-Check "tunnel_owned" "Dev Tunnel name is owned by this account (MCP_TUNNEL_NAME)" `
+Check-TriState "tunnel_owned" "Dev Tunnel name is owned by this account (MCP_TUNNEL_NAME)" `
     { Test-TunnelOwned $tname } `
-    "This .env names a dev tunnel your account does not own (it was likely copied from another machine). Run start_all.bat (it now repoints to your own tunnel automatically) or: powershell -File scripts\heal_tunnel.ps1"
+    "Re-run doctor.bat after connectivity settles. If it remains FAIL, run start_all.bat or: powershell -File scripts\heal_tunnel.ps1"
 
 TunnelCheck "tunnel_serving" "Dev Tunnel host serving (public URL -> server)" `
     {
@@ -357,11 +389,13 @@ Check "auth_bearer" "Auth OK end-to-end (Bearer accepted on /mcp)" `
 
 Write-Host ""
 Write-Host "---------------------------------------------"
-if ($script:bad -eq 0) {
+if ($script:bad -eq 0 -and $script:warn -eq 0) {
     Write-Host ("ALL GREEN ({0} checks). You're set." -f $script:ok) -ForegroundColor Green
     Write-Host "Daily startup: double-click the 'M365 Companion' icon on your Desktop." -ForegroundColor Green
+} elseif ($script:bad -eq 0) {
+    Write-Host ("{0} OK, {1} temporarily indeterminate -- re-run doctor.bat after connectivity settles." -f $script:ok, $script:warn) -ForegroundColor Yellow
 } else {
-    Write-Host ("{0} OK, {1} need attention -- fix the red lines above, then re-run: doctor.bat" -f $script:ok, $script:bad) -ForegroundColor Yellow
+    Write-Host ("{0} OK, {1} need attention, {2} indeterminate -- fix red lines, then re-run: doctor.bat" -f $script:ok, $script:bad, $script:warn) -ForegroundColor Yellow
 }
 Write-Host ""
 
@@ -372,7 +406,8 @@ if ($Json) {
     Write-Output (ConvertTo-Json -InputObject $script:results -Compress)
 }
 
-# Nonzero exit whenever anything needs attention, in BOTH modes -- additive only: no
+# Nonzero exit for confirmed failures in BOTH modes; transient indeterminate warnings remain 0
+# so automation does not treat a temporary CLI timeout as permission to repair. Additive only: no
 # existing caller reads this script's exit code (doctor.bat just runs it then `pause`;
 # start_all.ps1 does not invoke doctor.ps1 at all), so this cannot break anything that
 # already works, and it gives scripts\repair.ps1 (and any other automation) a cheap

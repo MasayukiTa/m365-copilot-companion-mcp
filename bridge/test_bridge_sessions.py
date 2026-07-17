@@ -270,6 +270,18 @@ def test_page_executor_propagates_exceptions_to_caller():
         pass
 
 
+def test_page_executor_bounded_submit_detects_a_wedged_owner_thread():
+    """A liveness probe must not wait forever if Playwright's owner thread is wedged."""
+    ex = B.PageExecutor()  # deliberately do not start a queue consumer
+
+    raised = False
+    try:
+        ex.submit_bounded(0.01, lambda: None)
+    except TimeoutError:
+        raised = True
+    assert raised
+
+
 def test_page_executor_serializes_concurrent_submits():
     """Two threads calling submit() concurrently must never have their jobs run
     simultaneously -- PageExecutor is a single-worker queue, so this is true by

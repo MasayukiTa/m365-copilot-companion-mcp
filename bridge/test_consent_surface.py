@@ -13,7 +13,7 @@ No browser/Playwright/CDP is touched: bridge.copilot_bridge only imports playwri
 inside main()/the page-owner thread (see bridge/test_bridge_sessions.py's docstring for the
 same hermetic-import argument), and every Playwright-touching call this test exercises is
 monkeypatched out (relay.edge_recover.surface, B._bridge_auto_consent, B._do_tool_probe_turn,
-B.run_on_page_thread).
+B._run_bounded_page_probe_call).
 """
 import relay.edge_recover as edge_recover
 import bridge.copilot_bridge as B
@@ -30,6 +30,7 @@ def _reset_state(monkeypatch):
     monkeypatch.setattr(B, "CONSENT_SURFACE_RETRY_MAX", 3)
     monkeypatch.setattr(B, "AGENT_URL", "https://example.invalid/agent")
     monkeypatch.setattr(B, "PAGE", object())  # non-None sentinel; AGENT_URL short-circuits .url
+    monkeypatch.setattr(B, "_PAGE_UNREACHABLE_STREAK", 0)
     # Avoid a real 90s background rehide timer lingering past the test.
     monkeypatch.setattr(B, "_schedule_force_rehide", lambda *a, **kw: None)
 
@@ -147,7 +148,7 @@ def test_reset_episode_gives_a_fresh_budget(monkeypatch):
 
 def _patch_probe_plumbing(monkeypatch, page_thread_results, auto_consent_result=None):
     """Stub out everything _run_tool_probe touches besides the pure classify/record logic:
-    run_on_page_thread (bypasses the real page-owner-thread queue -- just calls fn directly),
+    _run_bounded_page_probe_call (bypasses the real page-owner-thread queue),
     _do_tool_probe_turn (consumed once per call from `page_thread_results`), and
     _bridge_auto_consent (returns `auto_consent_result`)."""
     results = iter(page_thread_results)
@@ -157,7 +158,7 @@ def _patch_probe_plumbing(monkeypatch, page_thread_results, auto_consent_result=
             return auto_consent_result
         return next(results)
 
-    monkeypatch.setattr(B, "run_on_page_thread", _fake_run_on_page_thread)
+    monkeypatch.setattr(B, "_run_bounded_page_probe_call", _fake_run_on_page_thread)
     monkeypatch.setattr(B, "_LAST_USER_TURN_TS", 0.0)
     monkeypatch.setattr(B, "MCP_TOOL_PROBE_SEC", 600.0)
     monkeypatch.setattr(B, "TOOL_PROBE_MIN_IDLE_SEC", 30.0)

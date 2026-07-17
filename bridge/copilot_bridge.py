@@ -696,6 +696,31 @@ class PageExecutor:
             raise box["error"]
         return box["result"]
 
+    def submit_bounded(self, timeout, fn, *args, **kwargs):
+        """Like submit(), but fail closed if the owner thread stops servicing its queue.
+
+        This is intentionally reserved for liveness probes. A timed-out Playwright callable cannot
+        be cancelled safely, so callers must terminate the bridge process and let the keepalive
+        supervisor rebuild the page rather than continuing with a possibly wedged owner thread.
+        """
+        done = threading.Event()
+        box = {}
+
+        def _job():
+            try:
+                box["result"] = fn(*args, **kwargs)
+            except BaseException as e:  # noqa: BLE001 -- match submit() propagation semantics
+                box["error"] = e
+            finally:
+                done.set()
+
+        self._q.put(_job)
+        if not done.wait(timeout=max(0.0, float(timeout))):
+            raise TimeoutError("page executor did not complete its liveness probe")
+        if "error" in box:
+            raise box["error"]
+        return box["result"]
+
     def run_forever(self):
         """Owner-thread loop: pull and run jobs until the process exits. Call this from
         INSIDE `target` (see start()) after PAGE/DRIVER are constructed on this same thread."""
@@ -4058,6 +4083,49 @@ def _do_tool_probe_turn():
         return True, "", False
 
 
+# CDP can stay healthy while the M365 page object has gone stale (observed after long runs and
+# network switches). The idle tool probe is the safest liveness signal because it already executes
+# on the Playwright owner thread and only while PAGE_LOCK is free. Require consecutive failures so
+# a single slow render never kills the process; exiting hands recovery to start_bridge -Keepalive.
+PAGE_UNREACHABLE_RETRY_SEC = max(
+    5.0, float(os.environ.get("MCP_PAGE_UNREACHABLE_RETRY_SEC", "20"))
+)
+PAGE_UNREACHABLE_FAILURES = max(
+    2, int(os.environ.get("MCP_PAGE_UNREACHABLE_FAILURES", "3"))
+)
+PAGE_PROBE_EXECUTOR_TIMEOUT_SEC = max(
+    TOOL_PROBE_TIMEOUT_SEC + 30.0,
+    float(os.environ.get("MCP_PAGE_PROBE_EXECUTOR_TIMEOUT_SEC", "240")),
+)
+_PAGE_UNREACHABLE_STREAK = 0
+
+
+def _page_probe_requires_restart(kind):
+    global _PAGE_UNREACHABLE_STREAK
+    if kind != "agent_unreachable":
+        _PAGE_UNREACHABLE_STREAK = 0
+        return False
+    _PAGE_UNREACHABLE_STREAK += 1
+    return _PAGE_UNREACHABLE_STREAK >= PAGE_UNREACHABLE_FAILURES
+
+
+def _run_bounded_page_probe_call(fn):
+    try:
+        return PAGE_EXECUTOR.submit_bounded(PAGE_PROBE_EXECUTOR_TIMEOUT_SEC, fn)
+    except TimeoutError:
+        try:
+            tool_probe.record_probe(
+                False, "starting", detail="Playwright page thread wedged; restarting"
+            )
+        except Exception:
+            pass
+        logger.error(
+            "tool probe: page-owner thread exceeded %.0fs; exiting for keepalive recovery",
+            PAGE_PROBE_EXECUTOR_TIMEOUT_SEC,
+        )
+        os._exit(71)
+
+
 def _run_tool_probe():
     """Idle-only self-probe entry point, called from the self-re-arming timer in
     _schedule_tool_probe(). Skips silently (no page touch, no record) if disabled, if a real
@@ -4097,7 +4165,7 @@ def _run_tool_probe():
             # FleetCockpit renders this as a spinner, so a 30-180s real tool round-trip never
             # looks like an inert stale-red indicator.
             tool_probe.record_probe(False, "checking", detail="tool probe in progress")
-            agent_loaded, reply, timed_out = run_on_page_thread(_do_tool_probe_turn)
+            agent_loaded, reply, timed_out = _run_bounded_page_probe_call(_do_tool_probe_turn)
             if timed_out:
                 ok, kind = False, "timeout"
             else:
@@ -4106,14 +4174,16 @@ def _run_tool_probe():
                     logger.info("tool probe: consent_card sighted -- driving recovery")
                     consented = False
                     try:
-                        consented = run_on_page_thread(_bridge_auto_consent)
+                        consented = _run_bounded_page_probe_call(_bridge_auto_consent)
                     except Exception:
                         logger.warning("tool probe: _bridge_auto_consent raised", exc_info=True)
                     if consented:
                         # consent resolved without needing surface() -- fresh episode for later.
                         _reset_consent_surface_episode()
                         try:
-                            agent_loaded, reply, timed_out = run_on_page_thread(_do_tool_probe_turn)
+                            agent_loaded, reply, timed_out = _run_bounded_page_probe_call(
+                                _do_tool_probe_turn
+                            )
                             if timed_out:
                                 ok, kind = False, "timeout"
                             else:
@@ -4137,6 +4207,21 @@ def _run_tool_probe():
         # this is the authoritative snapshot /health reads.
         tool_probe.record_probe(ok, kind, detail=(reply or "")[:200])
         logger.info("tool probe: ok=%s kind=%s", ok, kind)
+        if _page_probe_requires_restart(kind):
+            try:
+                tool_probe.record_probe(
+                    False, "starting", detail="Copilot page stale; supervisor restarting"
+                )
+            except Exception:
+                pass
+            logger.error(
+                "tool probe: Copilot page remained unreachable for %d checks; exiting for "
+                "keepalive recovery",
+                _PAGE_UNREACHABLE_STREAK,
+            )
+            os._exit(71)
+        if kind == "agent_unreachable":
+            return PAGE_UNREACHABLE_RETRY_SEC
         return None
     except Exception:
         logger.warning("tool probe: _run_tool_probe raised", exc_info=True)
