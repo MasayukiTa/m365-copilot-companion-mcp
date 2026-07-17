@@ -446,6 +446,28 @@ def render_markdown(agg):
     if dims_covered:
         lines.append("- dimensions covered: %s" % ", ".join(dims_covered))
 
+    phase_completion = agg.get("phase_completion")
+    if phase_completion:
+        phase_status = str(phase_completion.get("status") or "partial").upper()
+        lines.append("- review phase completion: **%s** (%d phase(s), %d incomplete job(s))" % (
+            phase_status,
+            int(phase_completion.get("phase_count", 0)),
+            int(phase_completion.get("incomplete_count", 0)),
+        ))
+        for phase in phase_completion.get("phases") or []:
+            if not isinstance(phase, dict) or phase.get("complete"):
+                continue
+            lines.append("  - %s: %d/%d complete%s" % (
+                phase.get("name", "?"), int(phase.get("done", 0)),
+                int(phase.get("total", 0)),
+                " (%s)" % phase.get("error") if phase.get("error") else "",
+            ))
+            for worker in (phase.get("incomplete_workers") or [])[:20]:
+                lines.append("    - %s=%s%s" % (
+                    worker.get("name", "?"), worker.get("status", "unknown"),
+                    ": %s" % worker.get("reason") if worker.get("reason") else "",
+                ))
+
     assurance = agg.get("validation_assurance")
     if assurance:
         lines.append("- P2c full-validation verdict: **%s**" %

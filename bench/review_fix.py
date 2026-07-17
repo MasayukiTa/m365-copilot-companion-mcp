@@ -7,6 +7,9 @@ own findings-block parser reuse (bench.review_aggregate.parse_findings_block, fo
 worker's "what I changed" block -- same delimiters, no second parser).
 
 SAFETY MODEL (the whole point of this module):
+  - A partial review report is rejected by default. Findings are also fail-closed: only
+    confirmed/reproduced findings are selected unless the operator explicitly opts into legacy
+    or unverified findings.
   - Before the fleet touches anything, every file that will be targeted is copied into
     .fleet/review_fix/backup_<stamp>/ (backup_files/write_manifest). A file that does not yet
     exist is recorded as backed_up=False so undo() knows to DELETE it (not "restore" nothing).
@@ -60,6 +63,10 @@ DEFAULT_MAX_CONCURRENT = 4
 DEFAULT_EFFORT = "auto"
 
 _SEV_RANK = {"low": 0, "medium": 1, "high": 2}
+_FIXABLE_FINDING_STATES = frozenset({"confirmed", "reproduced"})
+_NON_FIXABLE_VERDICTS = frozenset({
+    "false_positive", "disproved", "contested", "unclear", "inconclusive",
+})
 
 
 def _stamp():
@@ -106,19 +113,39 @@ def load_report(path):
 
 # --- filtering / grouping -------------------------------------------------------------------
 
-def filter_findings(findings, min_severity=DEFAULT_MIN_SEVERITY, verified_only=False):
-    """Keep findings at or above min_severity ("low" < "medium" < "high"); ALWAYS drop
-    verify_verdict == "false_positive" regardless of severity. If verified_only is requested
-    but NO finding in the input carries a "verified" key at all (the report was built without
-    `/review --verify`), the verified-only filter is skipped (not silently emptied) and a
-    warning is printed so the caller notices the report has no verified data."""
+def _finding_is_fixable(finding):
+    """Return True only when the report contains affirmative verification evidence."""
+    state = str(finding.get("finding_state") or "").strip().lower()
+    if state:
+        return state in _FIXABLE_FINDING_STATES
+    verdict = str(finding.get("verify_verdict") or "").strip().lower()
+    if verdict:
+        return verdict == "confirmed"
+    return finding.get("verified") is True
+
+
+def filter_findings(findings, min_severity=DEFAULT_MIN_SEVERITY, verified_only=False,
+                    include_unverified=False):
+    """Keep severity-matching findings that are safe to hand to an automatic fixer.
+
+    Disproved/false-positive/unclear findings are always excluded. By default a finding must
+    also have an affirmative finding_state, verify_verdict, or legacy verified=True marker.
+    `include_unverified` is an explicit compatibility escape hatch for old reports; it never
+    re-enables a finding carrying a negative or uncertain verdict.
+    """
     min_rank = _SEV_RANK.get(str(min_severity).lower(), _SEV_RANK[DEFAULT_MIN_SEVERITY])
 
     kept = []
     for f in findings:
         if not isinstance(f, dict):
             continue
-        if f.get("verify_verdict") == "false_positive":
+        verdict = str(f.get("verify_verdict") or "").strip().lower()
+        state = str(f.get("finding_state") or "").strip().lower()
+        if verdict in _NON_FIXABLE_VERDICTS or state in {
+            "disproved", "contested", "unclear", "inconclusive",
+        }:
+            continue
+        if not include_unverified and not _finding_is_fixable(f):
             continue
         sev = str(f.get("severity", "low")).lower()
         rank = _SEV_RANK.get(sev, _SEV_RANK["low"])
@@ -133,11 +160,25 @@ def filter_findings(findings, min_severity=DEFAULT_MIN_SEVERITY, verified_only=F
         if not has_verified_field:
             print("warning: verified data absent -- no finding in this report carries a "
                   "'verified' field (report was likely built without /review --verify); "
-                  "--verified-only NOT applied, keeping severity-filtered findings as-is")
+                  "--verified-only matched nothing (fail-closed)")
+            kept = []
         else:
             kept = [f for f in kept if f.get("verified") is True]
 
     return kept
+
+
+def report_completion_error(report):
+    """Explain why a report is unsafe for automatic fixing, or return None when complete."""
+    completion = report.get("phase_completion")
+    if not isinstance(completion, dict):
+        return "review report has no phase_completion evidence (legacy or incomplete report)"
+    if (completion.get("complete") is True and
+            str(completion.get("status", "")).lower() == "complete"):
+        return None
+    incomplete = completion.get("incomplete_count")
+    suffix = "" if incomplete is None else " (%s incomplete phase/worker record(s))" % incomplete
+    return "review report is PARTIAL%s" % suffix
 
 
 def group_findings_by_file(findings, max_files_per_goal=DEFAULT_MAX_FILES_PER_GOAL):
@@ -423,6 +464,11 @@ def build_arg_parser():
     ap.add_argument("--min-severity", choices=["low", "medium", "high"],
                      default=DEFAULT_MIN_SEVERITY)
     ap.add_argument("--verified-only", action="store_true")
+    ap.add_argument("--include-unverified", action="store_true",
+                    help="DANGEROUS compatibility mode: include legacy findings without an "
+                         "affirmative verification state (negative/unclear verdicts stay excluded)")
+    ap.add_argument("--allow-incomplete-report", action="store_true",
+                    help="DANGEROUS compatibility mode: permit a partial/legacy report")
     ap.add_argument("--max-concurrent", type=int, default=DEFAULT_MAX_CONCURRENT)
     ap.add_argument("--group-size", type=int, default=DEFAULT_MAX_FILES_PER_GOAL,
                      help="max files per fix goal (a file's findings always stay together)")
@@ -461,9 +507,17 @@ def main(argv=None):
         print("could not use report %s: %s" % (report_path, report["error"]))
         return 0
 
+    completion_error = report_completion_error(report)
+    if completion_error and not args.allow_incomplete_report:
+        print("REFUSING reviewfix: %s. Complete/resume the review first. "
+              "If this is an intentional legacy recovery, rerun with "
+              "--allow-incomplete-report." % completion_error)
+        return 2
+
     findings = filter_findings(report.get("findings", []),
                                 min_severity=args.min_severity,
-                                verified_only=args.verified_only)
+                                verified_only=args.verified_only,
+                                include_unverified=args.include_unverified)
     if not findings:
         print("0 findings match, nothing to fix")
         return 0
@@ -480,8 +534,10 @@ def main(argv=None):
     if args.dry_run:
         print("DRY RUN -- plan only, no backup / no git / fleet NOT launched")
         print("report: %s" % report_path)
-        print("findings matched: %d (min-severity=%s verified-only=%s)" %
-              (len(findings), args.min_severity, args.verified_only))
+        print("findings matched: %d (min-severity=%s verified-only=%s "
+              "include-unverified=%s)" %
+              (len(findings), args.min_severity, args.verified_only,
+               args.include_unverified))
         print("goals: %d" % len(goals))
         for i, g in enumerate(groups):
             files_in_group = []

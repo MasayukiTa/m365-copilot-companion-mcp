@@ -180,7 +180,11 @@ def start_relay(relay_reset_every="6"):
             time.sleep(3)
 
     if not up:
-        log("  WARNING: relay did not respond within timeout; continuing anyway.")
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        raise RuntimeError("relay did not respond within %ds" % RELAY_WAIT_SECS)
 
     log(f"  Sleeping {RELAY_SETTLE_SECS}s for MCP connector to settle …")
     time.sleep(RELAY_SETTLE_SECS)
@@ -218,20 +222,22 @@ def _is_infra_fail(prediction) -> bool:
     return False
 
 
-def find_newest_full_results() -> Path | None:
+def find_newest_full_results(not_before: float | None = None) -> Path | None:
     pattern = str(FLEET_BENCH / "gaia_full_*.json")
     matches = sorted(glob.glob(pattern), key=os.path.getmtime)
+    if not_before is not None:
+        matches = [path for path in matches if os.path.getmtime(path) >= not_before]
     if not matches:
         return None
     return Path(matches[-1])
 
 
-def build_keep_retry_split():
+def build_keep_retry_split(not_before: float | None = None):
     log("STEP 4: Building keep_results.json and retry_ids.json …")
-    newest = find_newest_full_results()
+    newest = find_newest_full_results(not_before=not_before)
     if newest is None:
         log("  ERROR: No gaia_full_*.json found in .fleet/bench/. Cannot build split.")
-        return [], []
+        raise RuntimeError("no current-run gaia_full_*.json result was produced")
 
     log(f"  Loading results from: {newest}")
     with open(newest, encoding="utf-8") as fh:
@@ -243,6 +249,13 @@ def build_keep_retry_split():
             rows = rows.get("results", rows.get("rows", list(rows.values())))
         else:
             rows = []
+
+    task_ids = [row.get("task_id", row.get("id", "")) for row in rows
+                if isinstance(row, dict)]
+    if len(rows) != 127 or len(set(task_ids)) != 127 or any(not task_id for task_id in task_ids):
+        raise RuntimeError(
+            "full evaluation result is incomplete: rows=%d unique_nonempty_ids=%d expected=127" %
+            (len(rows), len({task_id for task_id in task_ids if task_id})))
 
     keep_rows = []
     retry_ids = []
@@ -294,13 +307,15 @@ def _level_key(row) -> str:
     return str(lv)
 
 
-def compute_final(keep_rows, retry_ids):
+def compute_final(keep_rows, retry_ids, not_before: float | None = None):
     log("STEP 6: Computing final scores …")
 
     all_rows: list[dict] = []
 
     # Prefer the controller-merged output
-    if FINAL_JSON.exists():
+    final_is_current = (FINAL_JSON.exists() and
+                        (not_before is None or FINAL_JSON.stat().st_mtime >= not_before))
+    if final_is_current:
         log(f"  Loading controller output: {FINAL_JSON}")
         with open(FINAL_JSON, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -314,7 +329,10 @@ def compute_final(keep_rows, retry_ids):
         log("  gaia_final_127.json not found; merging keep + chunk results manually.")
         all_rows = list(keep_rows)
         chunk_pattern = str(FLEET_GAIA / "chunk_*_res.json")
-        for chunk_file in sorted(glob.glob(chunk_pattern)):
+        chunk_files = sorted(glob.glob(chunk_pattern))
+        if not_before is not None:
+            chunk_files = [path for path in chunk_files if os.path.getmtime(path) >= not_before]
+        for chunk_file in chunk_files:
             try:
                 with open(chunk_file, encoding="utf-8") as fh:
                     chunk_data = json.load(fh)
@@ -325,6 +343,9 @@ def compute_final(keep_rows, retry_ids):
             except Exception as exc:
                 log(f"  WARNING: could not load {chunk_file}: {exc}")
 
+    task_ids = [r.get("task_id", r.get("id", "")) for r in all_rows
+                if isinstance(r, dict)]
+    unique_ids = {task_id for task_id in task_ids if task_id}
     total = len(all_rows)
     correct = sum(1 for r in all_rows if r.get("correct") is True or r.get("correct") == 1)
 
@@ -342,8 +363,9 @@ def compute_final(keep_rows, retry_ids):
     pct = (correct / 127 * 100) if 127 > 0 else 0.0
     unrecovered = [tid for tid in retry_ids if not any(r.get("task_id") == tid for r in all_rows)]
 
+    complete = (total == 127 and len(unique_ids) == 127 and not unrecovered)
     summary_line = (
-        f"PIPELINE FINAL: {correct}/127 = {pct:.1f}%  "
+        f"PIPELINE {'FINAL' if complete else 'PARTIAL'}: {correct}/127 = {pct:.1f}%  "
         f"(answered {answered}, unrecovered {len(unrecovered)})"
     )
     level_lines = []
@@ -358,6 +380,7 @@ def compute_final(keep_rows, retry_ids):
 
     # Write pipeline_final.json
     final_payload = {
+        "status": "complete" if complete else "partial",
         "answered": answered,
         "correct": correct,
         "score_of_127": round(pct, 2),
@@ -369,13 +392,25 @@ def compute_final(keep_rows, retry_ids):
         json.dump(final_payload, fh, ensure_ascii=False, indent=2)
     log(f"  Written: {PIPELINE_FINAL_JSON}")
 
-    return correct, pct
+    return final_payload
+
+
+def _write_failed_pipeline(errors):
+    payload = {
+        "status": "failed",
+        "errors": [str(error) for error in errors],
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    with open(PIPELINE_FINAL_JSON, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+    return payload
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    run_started_at = time.time()
     _open_log()
     log("=" * 70)
     log("GAIA PIPELINE START")
@@ -385,6 +420,7 @@ def main():
 
     keep_rows: list = []
     retry_ids: list = []
+    errors: list[str] = []
 
     # ---- Step 1: Kill relay ------------------------------------------------
     try:
@@ -398,36 +434,54 @@ def main():
         relay_proc = start_relay(relay_reset_every="6")
     except Exception as exc:
         log(f"Step 2 ERROR starting relay: {exc}")
-        log("  Continuing — runner will fail if :8011 is not up.")
+        errors.append("step 2: %s" % exc)
 
     # ---- Step 3: Full eval -------------------------------------------------
-    try:
-        run_full_eval()
-    except Exception as exc:
-        log(f"Step 3 ERROR running full eval: {exc}")
-        log("  Continuing to build split from whatever results exist.")
+    if not errors:
+        try:
+            eval_rc = run_full_eval()
+            if eval_rc != 0:
+                raise RuntimeError("runner.py exited with code %d" % eval_rc)
+        except Exception as exc:
+            log(f"Step 3 ERROR running full eval: {exc}")
+            errors.append("step 3: %s" % exc)
 
     # ---- Step 4: Split keep / retry ----------------------------------------
-    try:
-        keep_rows, retry_ids = build_keep_retry_split()
-    except Exception as exc:
-        log(f"Step 4 ERROR building split: {exc}")
+    if not errors:
+        try:
+            keep_rows, retry_ids = build_keep_retry_split(not_before=run_started_at)
+        except Exception as exc:
+            log(f"Step 4 ERROR building split: {exc}")
+            errors.append("step 4: %s" % exc)
 
     # ---- Step 5: Retry controller ------------------------------------------
-    if retry_ids:
+    if retry_ids and not errors:
         try:
-            run_retry_controller()
+            retry_rc = run_retry_controller()
+            if retry_rc != 0:
+                raise RuntimeError("retry_controller.py exited with code %d" % retry_rc)
         except Exception as exc:
             log(f"Step 5 ERROR in retry controller: {exc}")
-            log("  Final score will be computed from main-run keep rows only.")
-    else:
+            errors.append("step 5: %s" % exc)
+    elif not errors:
         log("STEP 5: No retry_ids — skipping retry controller.")
 
     # ---- Step 6: Final scores ----------------------------------------------
-    try:
-        compute_final(keep_rows, retry_ids)
-    except Exception as exc:
-        log(f"Step 6 ERROR computing final: {exc}")
+    if not errors:
+        try:
+            final_payload = compute_final(keep_rows, retry_ids, not_before=run_started_at)
+            if final_payload.get("status") != "complete":
+                raise RuntimeError(
+                    "current run did not produce 127 unique complete results "
+                    "(answered=%s unrecovered=%s)" % (
+                        final_payload.get("answered"),
+                        len(final_payload.get("unrecovered") or [])))
+        except Exception as exc:
+            log(f"Step 6 ERROR computing final: {exc}")
+            errors.append("step 6: %s" % exc)
+
+    if errors:
+        _write_failed_pipeline(errors)
 
     # ---- Step 7: Leave :8011 running ---------------------------------------
     log("STEP 7: Leaving relay :8011 running (PID kept alive).")
@@ -439,12 +493,13 @@ def main():
             log(f"  Relay PID {relay_proc.pid} already exited with code {poll}.")
 
     log("=" * 70)
-    log("GAIA PIPELINE COMPLETE")
+    log("GAIA PIPELINE FAILED" if errors else "GAIA PIPELINE COMPLETE")
     log("=" * 70)
 
     if _log_fh:
         _log_fh.close()
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

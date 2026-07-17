@@ -332,15 +332,15 @@ def test_refute_findings_single_lens_maps_verdicts_by_goal_order(tmp_path, monke
         lines = [l for l in f if l.strip()]
     assert len(lines) == len(findings)
 
-    # end-to-end: merge_verdicts -> review_fix.filter_findings must actually DROP the
-    # REFUTED finding, keep the confirmed/unclear ones. This is the whole point of P1b.
+    # end-to-end: merge_verdicts -> review_fix.filter_findings must only hand affirmative
+    # findings to the automatic fixer. REFUTED and UNCLEAR are both fail-closed.
     from bench.review_fix import filter_findings
     agg = {"findings": [dict(f) for f in findings]}
     merge_verdicts(agg, verdicts)
     kept_titles = {f["title"] for f in filter_findings(agg["findings"], min_severity="low")}
     assert "T1" not in kept_titles       # REFUTED -> dropped
     assert "T2" in kept_titles           # UPHELD -> confirmed, kept
-    assert "T3" in kept_titles           # UNCLEAR is not dropped, only false_positive is
+    assert "T3" not in kept_titles       # UNCLEAR -> requires human verification, not auto-fix
 
 
 def test_refute_findings_panel_mode_majority_vote(tmp_path, monkeypatch):
@@ -1859,6 +1859,60 @@ def test_p2c_level_two_confirmed_finding_is_vulnerable(tmp_path):
     assert assurance["verdict"] == "VULNERABLE"
 
 
+def test_phase_completion_reports_incomplete_workers_and_missing_status(tmp_path):
+    primary = tmp_path / "primary" / "status.json"
+    primary.parent.mkdir()
+    primary.write_text(json.dumps({"workers": [
+        {"name": "w0", "status": "done", "outcome": "DONE"},
+        {"name": "w1", "status": "cancelled", "outcome": "CANCELLED",
+         "reason": "max_attempts=5 reached"},
+    ]}), encoding="utf-8")
+
+    result = review_run.evaluate_phase_completion([
+        ("primary", str(primary)),
+        ("refute", str(tmp_path / "missing" / "status.json")),
+    ])
+
+    assert result["status"] == "partial"
+    assert result["complete"] is False
+    assert result["incomplete_count"] == 2
+    assert result["phases"][0]["done"] == 1
+    assert result["phases"][0]["incomplete_workers"][0]["name"] == "w1"
+    assert "error" in result["phases"][1]
+
+
+def test_cli_p2c_level_one_incomplete_phase_writes_partial_report_and_fails(
+        repo, monkeypatch, capsys):
+    monkeypatch.setattr(review_run, "REPO", repo)
+    monkeypatch.setattr(review_run, "VENVPY", sys.executable)
+
+    def fake_run_fleet(goals_path, max_concurrent, effort, state_dir=None, **kwargs):
+        os.makedirs(state_dir, exist_ok=True)
+        with open(os.path.join(state_dir, "status.json"), "w", encoding="utf-8") as handle:
+            json.dump({"workers": [{
+                "name": "w0", "status": "cancelled", "outcome": "CANCELLED",
+                "reason": "max_attempts=5 reached", "display_result": "",
+            }]}, handle)
+        return 2
+
+    monkeypatch.setattr(review_run, "run_fleet", fake_run_fleet)
+    rc = main([
+        "--kind", "security", "--group-size", "10", "--dimensions", "security",
+        "--resilience-profile", "security", "--no-refute", "--no-auto-behavioral-high",
+    ])
+
+    assert rc == 6
+    assert "REVIEW PARTIAL" in capsys.readouterr().out
+    out_dir = os.path.join(repo, ".fleet", "review")
+    report_path = next(
+        os.path.join(out_dir, name) for name in os.listdir(out_dir)
+        if name.startswith("review_report_") and name.endswith(".json")
+    )
+    with open(report_path, encoding="utf-8") as handle:
+        report = json.load(handle)
+    assert report["phase_completion"]["status"] == "partial"
+
+
 def test_cli_p2c_level_two_missing_active_evidence_exits_inconclusive(
         repo, monkeypatch, capsys):
     monkeypatch.setattr(review_run, "REPO", repo)
@@ -1876,9 +1930,19 @@ def test_cli_p2c_level_two_missing_active_evidence_exits_inconclusive(
         return 0
 
     monkeypatch.setattr(review_run, "run_fleet", fake_run_fleet)
-    monkeypatch.setattr(review_run, "run_completeness_critic", lambda *a, **kw: {
-        "missing_dimensions": [], "missing_files": [], "unverified_claims": [],
-    })
+    def fake_completeness(*args, **kwargs):
+        out_dir = args[3]
+        stamp = kwargs.get("stamp")
+        state_dir = os.path.join(out_dir, "completeness_state_%s" % stamp)
+        os.makedirs(state_dir, exist_ok=True)
+        with open(os.path.join(state_dir, "status.json"), "w", encoding="utf-8") as handle:
+            json.dump({"workers": [{
+                "name": "w0", "status": "done", "outcome": "DONE",
+                "display_result": "", "transcript": "",
+            }]}, handle)
+        return {"missing_dimensions": [], "missing_files": [], "unverified_claims": []}
+
+    monkeypatch.setattr(review_run, "run_completeness_critic", fake_completeness)
     rc = main([
         "--kind", "security", "--group-size", "10", "--dimensions", "runtime_behavior",
         "--resilience-profile", "security", "--p2c-level", "2", "--no-refute",
@@ -1907,9 +1971,19 @@ def test_cli_p2c_level_two_complete_active_evidence_can_pass(repo, monkeypatch, 
         return 0
 
     monkeypatch.setattr(review_run, "run_fleet", fake_run_fleet)
-    monkeypatch.setattr(review_run, "run_completeness_critic", lambda *a, **kw: {
-        "missing_dimensions": [], "missing_files": [], "unverified_claims": [],
-    })
+    def fake_completeness(*args, **kwargs):
+        out_dir = args[3]
+        stamp = kwargs.get("stamp")
+        state_dir = os.path.join(out_dir, "completeness_state_%s" % stamp)
+        os.makedirs(state_dir, exist_ok=True)
+        with open(os.path.join(state_dir, "status.json"), "w", encoding="utf-8") as handle:
+            json.dump({"workers": [{
+                "name": "w0", "status": "done", "outcome": "DONE",
+                "display_result": "", "transcript": "",
+            }]}, handle)
+        return {"missing_dimensions": [], "missing_files": [], "unverified_claims": []}
+
+    monkeypatch.setattr(review_run, "run_completeness_critic", fake_completeness)
     rc = main([
         "--kind", "security", "--group-size", "10", "--dimensions", "runtime_behavior",
         "--resilience-profile", "security", "--p2c-level", "2", "--no-refute",

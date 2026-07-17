@@ -85,6 +85,7 @@ def _campaign_entries(state: Path, jobs_dir: Path, store: LocalJobStore,
             "job_id": "deep_%s_%04d" % (campaign, index),
             "worker": "w%d" % index,
             "restart_count": 0,
+            "terminal_replay_count": 0,
         } for index in range(len(goals))]
         _atomic_json(manifest_path, {
             "version": 1, "started": started, "goals_digest": digest,
@@ -118,6 +119,7 @@ def _campaign_entries(state: Path, jobs_dir: Path, store: LocalJobStore,
             "job_file": job_file,
             "worker_dir": jobs_dir / job_id,
             "restart_count": int(row.get("restart_count", 0)),
+            "terminal_replay_count": int(row.get("terminal_replay_count", 0)),
             "next_launch_at": 0.0,
         })
     return entries, started, resumed
@@ -127,13 +129,53 @@ def _persist_restart_counts(state: Path, entries: list[dict]) -> None:
     path = state / CAMPAIGN_MANIFEST
     try:
         manifest = json.loads(path.read_text(encoding="utf-8-sig"))
-        counts = {entry["job_id"]: int(entry.get("restart_count", 0)) for entry in entries}
+        counts = {entry["job_id"]: (
+            int(entry.get("restart_count", 0)),
+            int(entry.get("terminal_replay_count", 0)),
+        ) for entry in entries}
         for row in manifest.get("entries", []):
-            row["restart_count"] = counts.get(str(row.get("job_id")), 0)
+            restart_count, terminal_replay_count = counts.get(
+                str(row.get("job_id")), (0, 0))
+            row["restart_count"] = restart_count
+            row["terminal_replay_count"] = terminal_replay_count
         _atomic_json(path, manifest)
     except Exception:
         # SQLite remains authoritative. Losing only the restart counter must not stop work.
         pass
+
+
+def _terminal_failure_is_recoverable(status: dict) -> bool:
+    """Recognize runtime exhaustion while leaving explicit operator stops terminal."""
+    state = str(status.get("status") or "").upper()
+    if state == "FAILED":
+        return True
+    if state != "CANCELLED":
+        return False
+    reason = str(status.get("verification_detail") or "").strip().lower()
+    return reason.startswith("max_attempts=") or reason.startswith("max_turns=")
+
+
+def _requeue_terminal_failure(store: LocalJobStore, entry: dict, replay_cap: int,
+                              source: str) -> bool:
+    status = store.get_job_status(entry["job_id"], event_limit=20)
+    if not _terminal_failure_is_recoverable(status):
+        return False
+    used = int(entry.get("terminal_replay_count", 0))
+    if used >= replay_cap:
+        return False
+    next_count = used + 1
+    try:
+        store.requeue_terminal_turn(
+            entry["job_id"],
+            "automatic terminal replay %d/%d after %s" % (
+                next_count, replay_cap, source),
+        )
+    except JobStoreError as exc:
+        if exc.code == "TURN_COMMITTED":
+            return False
+        raise
+    entry["terminal_replay_count"] = next_count
+    return True
 
 
 def build_local_review_job(goal: dict, job_id: str) -> dict:
@@ -353,16 +395,26 @@ def run_local_review_fleet(
     effective = max(1, min(int(max_concurrent), int(os.environ.get(
         "MCP_LOCAL_REVIEW_MAX_CONCURRENT", "2"))))
     python_exe = python_exe or sys.executable
-    pending = [entry for entry in entries
-               if store.get_job_status(entry["job_id"])["status"] not in
-               TERMINAL_JOB_STATUSES | CONTROLLER_PAUSED_STATUSES]
     active: dict[str, tuple[subprocess.Popen, object, dict]] = {}
     status_path = state / "status.json"
     commands_path = state / "commands.json"
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     restart_cap = max(0, int(os.environ.get("MCP_LOCAL_CONTROLLER_MAX_RESTARTS", "0")))
+    terminal_replay_cap = max(0, int(os.environ.get(
+        "MCP_LOCAL_TERMINAL_REPLAYS", "3")))
     restart_backoff_cap = max(1.0, float(os.environ.get(
         "MCP_LOCAL_CONTROLLER_RESTART_BACKOFF_MAX", "60")))
+
+    # A previous coordinator may have returned after an older controller exhausted its
+    # delivery budget. Re-open those runtime failures, but never resurrect console/operator
+    # stops. The durable manifest bounds this across process restarts and reboots.
+    for entry in entries:
+        if _requeue_terminal_failure(store, entry, terminal_replay_cap, "campaign resume"):
+            entry["next_launch_at"] = time.time()
+    _persist_restart_counts(state, entries)
+    pending = [entry for entry in entries
+               if store.get_job_status(entry["job_id"])["status"] not in
+               TERMINAL_JOB_STATUSES | CONTROLLER_PAUSED_STATUSES]
 
     def launch(entry: dict) -> None:
         entry["worker_dir"].mkdir(parents=True, exist_ok=True)
@@ -409,6 +461,14 @@ def run_local_review_fleet(
             store.record_event(entry["job_id"], "CONTROLLER_EXITED", {
                 "exit_code": exit_code, "job_status": status["status"],
             })
+            if (worker not in stopped and _requeue_terminal_failure(
+                    store, entry, terminal_replay_cap, "controller terminal exit")):
+                backoff = min(restart_backoff_cap, 2 ** min(
+                    int(entry.get("terminal_replay_count", 0)), 8))
+                entry["next_launch_at"] = time.time() + backoff
+                pending.append(entry)
+                _persist_restart_counts(state, entries)
+                continue
             if (worker not in stopped and status["status"] not in
                     TERMINAL_JOB_STATUSES | CONTROLLER_PAUSED_STATUSES):
                 entry["restart_count"] = int(entry.get("restart_count", 0)) + 1
