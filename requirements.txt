@@ -17,7 +17,7 @@ watchdog>=6.0.0
 pyodbc>=5.0
 psutil>=7.2.2
 python-dotenv
-PyYAML>=6.0
+PyYAML>=6.0.3
 pytest>=7.0
 # Browser automation for the bridge + SWE fleet. Used via connect_over_cdp (attaches to the
 # already-running Edge), so NO `playwright install` browser download is needed -- the pip package
