@@ -232,6 +232,80 @@ function Test-ShouldReExecAfterUpdate {
     return $true
 }
 
+function Invoke-PostUpdateTail {
+    # Shared tail run once the checkout has ACTUALLY landed the new commits --
+    # by either `git pull --ff-only` (plain fast-forward) or `git reset --hard
+    # @{u}` (rewritten-upstream recovery, see Check-ForUpdates). Both paths
+    # need the exact same follow-up: rebuild the UI if ui/*.cs changed, tell
+    # the user it's done, then re-exec so the freshly-landed code takes effect
+    # for the rest of THIS startup. Kept as one function so neither path can
+    # accidentally drift from the other's semantics.
+    param(
+        [string]$Title,
+        [string]$OldRef,
+        [int]$Behind
+    )
+    # If the update changed any ui/*.cs, rebuild the UI exes (non-fatal if it fails).
+    # NOTE: the success dialog below is deliberately the SAME text regardless of which
+    # strategy Check-ForUpdates used to land the update (plain fast-forward, or the
+    # silent rewritten-upstream recovery) -- an end user of this app is not a git user
+    # and never committed/pushed anything, so there is nothing backup-related to tell
+    # them; that detail is Write-Host-logged by the caller instead, for a developer
+    # reading the startup log later.
+    $rebuildNote = ""
+    try {
+        $changed = & git -C $root diff --name-only $OldRef HEAD 2>$null
+        $uiTouched = $changed | Where-Object { $_ -match '^ui/.*\.cs$' }
+        if ($uiTouched) {
+            $rebuildScript = Join-Path $root "ui\rebuild_ui.ps1"
+            if (Test-Path $rebuildScript) {
+                & $rebuildScript | Out-Null
+                if ($LASTEXITCODE -eq 0) { $rebuildNote = "`n`nUI rebuilt." }
+                else { $rebuildNote = "`n`nUI rebuild reported an error (will use existing exe)." }
+            }
+        }
+    } catch { $rebuildNote = "`n`nUI rebuild skipped (error)." }
+
+    Show-OwnedDialog ("Updated to the latest version.{0}" -f $rebuildNote) $Title "OK" "Information" | Out-Null
+
+    # DESIGN NOTE: the update above just landed new files on disk, but THIS process
+    # is still running the OLD (pre-update) start_all.ps1 that was already loaded
+    # into memory when it started -- without re-exec, none of the freshly-landed
+    # code (this very fix included, e.g. tunnel self-heal wiring) takes effect
+    # until a SECOND run. Fix: re-launch the just-updated script now, the same
+    # hidden way the .vbs launcher does, preserving the original switches, and
+    # let the FRESH process finish this startup (heal + stack) with the updated
+    # code; THIS process then exits so only the fresh instance continues. Never
+    # lets a re-exec failure stop startup: any error here is swallowed and this
+    # (old) process simply falls through and keeps going on its own.
+    $guardAlreadySet = ($env:MCP_STARTALL_REEXEC -eq "1")
+    if (Test-ShouldReExecAfterUpdate -GuardAlreadySet $guardAlreadySet -Behind $Behind -PullSucceeded $true) {
+        try {
+            $selfPath = Join-Path $scriptDir "start_all.ps1"
+            if (Test-Path $selfPath) {
+                $reArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $selfPath)
+                if ($NoUi) { $reArgs += "-NoUi" }
+                if ($NoSplash) { $reArgs += "-NoSplash" }
+                $env:MCP_STARTALL_REEXEC = "1"
+                Start-Process powershell -WindowStyle Hidden -ArgumentList $reArgs | Out-Null
+                # Terminate THIS (old) process hard. A bare `exit` here throws a
+                # System.Management.Automation.ExitException; when Invoke-Startup runs
+                # inside the splash's WinForms message loop (the one-shot timer), that
+                # ExitException escapes as an UNHANDLED "Microsoft .NET Framework"
+                # exception dialog instead of just exiting -- and its "Continue" button
+                # would leave THIS stale-code process running alongside the freshly
+                # re-exec'd instance (double startup). Environment.Exit ends the process
+                # cleanly from any host context (timer callback, runspace, or console).
+                [System.Environment]::Exit(0)
+            }
+        } catch {
+            # Re-exec is best-effort only -- fall through and let this (old)
+            # process finish the current startup rather than leaving nothing
+            # running.
+        }
+    }
+}
+
 function Check-ForUpdates {
     # Non-fatal pre-flight: if the local checkout is behind the remote, offer to update.
     # Any failure (no git, no upstream, offline, auth needed, fetch timeout, pull fail)
@@ -282,8 +356,31 @@ function Check-ForUpdates {
         if (-not [int]::TryParse(($behindRaw | Select-Object -First 1), [ref]$behind)) { return }
         if ($behind -le 0) { return }   # already up to date -> no dialog
 
+        # 4b) Also work out whether we are ahead (local-only commits) and whether a plain
+        #    fast-forward is possible. Together with $behind, Get-UpdateStrategy
+        #    (tunnel_name_util.ps1) uses these to tell an ordinary "behind" state apart
+        #    from a REWRITTEN UPSTREAM: the project's main was once force-pushed to scrub
+        #    bad commit metadata, so every clone taken before that showed "behind AND
+        #    ahead" (the "ahead" commits being old pre-rewrite versions of content already
+        #    in the new history) and a fast-forward is impossible. This is purely an
+        #    INTERNAL strategy choice -- the user is asked the exact same single question
+        #    in step 5 below no matter which branch is taken; an end user of this app never
+        #    commits or pushes, so nothing here is ever surfaced as a decision to them.
+        $aheadRaw = & git -C $root rev-list --count "@{u}..HEAD" 2>$null
+        $aheadExit = $LASTEXITCODE
+        $ahead = 0
+        if ($aheadExit -ne 0 -or -not [int]::TryParse(($aheadRaw | Select-Object -First 1), [ref]$ahead)) {
+            $ahead = 0
+        }
+        & git -C $root merge-base --is-ancestor HEAD "@{u}" 2>$null | Out-Null
+        $canFF = ($LASTEXITCODE -eq 0)
+        $strategy = Get-UpdateStrategy -Behind $behind -Ahead $ahead -CanFastForward $canFF
+        Write-Host "[update] behind=$behind ahead=$ahead canFastForward=$canFF strategy=$strategy"
+
         # 5) Ask the user (visible even though the host process is hidden). Phrase the count as
-        #    "version(s)", NOT "commit(s)" -- commit jargon does not communicate to a general user.
+        #    "version(s)", NOT "commit(s)" -- commit jargon does not communicate to a general
+        #    user. SAME single question regardless of $strategy: a general user has no basis to
+        #    answer a different question about rewritten history, so none is ever asked.
         $title = "M365 Companion - Update available"
         $verWord = "versions"
         if ($behind -eq 1) { $verWord = "version" }
@@ -291,6 +388,71 @@ function Check-ForUpdates {
         $answer = Show-OwnedDialog $body $title "YesNo" "Information"
         if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
 
+        if ($strategy -eq 'rewritten-upstream' -or $strategy -eq 'diverged-unknown') {
+            # RECOVERY PATH: `pull --ff-only` below would just fail forever on this shape (by
+            # design -- it must never silently merge/rebase over the user's own work), leaving
+            # the user stuck with no way forward. Silently take a guided reset instead. Every
+            # safety/diagnostic detail here is Write-Host-logged only (for a developer reading
+            # the startup log later) and NEVER shown in a dialog -- the user only ever sees the
+            # single question above, then either the existing generic failure dialog or the
+            # existing generic success dialog, identical to the fast-forward path.
+            $oldSha = (& git -C $root rev-parse HEAD 2>$null | Select-Object -First 1)
+            if ($LASTEXITCODE -ne 0 -or -not $oldSha) {
+                Write-Host "[update] recovery aborted: could not resolve current HEAD"
+                Show-OwnedDialog "Update could not complete. Your current version is kept." $title "OK" "Warning" | Out-Null
+                return
+            }
+
+            $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+            $backupBranch = "backup/pre-reset-$stamp"
+
+            # a) Safety backup of the current HEAD FIRST -- never reset without this ref
+            #    existing. If it cannot be created, abort the whole recovery rather than risk
+            #    an unrecoverable reset.
+            & git -C $root branch $backupBranch HEAD 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "[update] recovery aborted: could not create backup ref $backupBranch"
+                Show-OwnedDialog "Update could not complete. Your current version is kept." $title "OK" "Warning" | Out-Null
+                return
+            }
+            Write-Host "[update] recovery: backup ref $backupBranch created (strategy=$strategy)"
+
+            # b) Stash uncommitted work, including untracked files -- only if there is any. If
+            #    local changes exist but the stash itself fails, abort rather than risk
+            #    destroying them in the reset below.
+            $statusOut = & git -C $root status --porcelain 2>$null
+            $hadLocalChanges = [bool]$statusOut
+            $stashed = $false
+            if ($hadLocalChanges) {
+                & git -C $root stash push -u -m "pre-reset $stamp" 2>$null | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "[update] recovery aborted: local changes present but stash failed"
+                    Show-OwnedDialog "Update could not complete. Your current version is kept." $title "OK" "Warning" | Out-Null
+                    return
+                }
+                $stashed = $true
+                Write-Host "[update] recovery: local changes stashed (pre-reset $stamp)"
+            }
+
+            # c) Reset to exactly match upstream.
+            & git -C $root reset --hard "@{u}" 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "[update] recovery aborted: reset --hard @{u} failed"
+                Show-OwnedDialog "Update could not complete. Your current version is kept." $title "OK" "Warning" | Out-Null
+                return
+            }
+            Write-Host "[update] recovery: reset to @{u} succeeded (backup=$backupBranch stashed=$stashed)"
+
+            # Same shared tail (rebuild + generic success dialog + re-exec) as the
+            # fast-forward path -- diff the ui-rebuild check from the PRE-RESET sha
+            # captured above rather than HEAD@{1} (still valid after reset --hard, but
+            # the explicit sha is unambiguous and documents the intent).
+            Invoke-PostUpdateTail -Title $title -OldRef $oldSha -Behind $behind
+            return
+        }
+
+        # strategy -eq 'fast-forward' (the only remaining possibility once $behind -gt 0,
+        # since 'up-to-date' already returned above) -- EXACTLY today's existing behavior.
         # 6) Pull fast-forward only. Keep the dialog jargon-free: no raw git output (it can carry
         #    non-ASCII commit text and only confuses a general user).
         & git -C $root pull --ff-only 2>&1 | Out-Null
@@ -299,59 +461,7 @@ function Check-ForUpdates {
             return
         }
 
-        # 7b) If the pull changed any ui/*.cs, rebuild the UI exes (non-fatal if it fails).
-        $rebuildNote = ""
-        try {
-            $changed = & git -C $root diff --name-only "HEAD@{1}" HEAD 2>$null
-            $uiTouched = $changed | Where-Object { $_ -match '^ui/.*\.cs$' }
-            if ($uiTouched) {
-                $rebuildScript = Join-Path $root "ui\rebuild_ui.ps1"
-                if (Test-Path $rebuildScript) {
-                    & $rebuildScript | Out-Null
-                    if ($LASTEXITCODE -eq 0) { $rebuildNote = "`n`nUI rebuilt." }
-                    else { $rebuildNote = "`n`nUI rebuild reported an error (will use existing exe)." }
-                }
-            }
-        } catch { $rebuildNote = "`n`nUI rebuild skipped (error)." }
-
-        Show-OwnedDialog ("Updated to the latest version.{0}" -f $rebuildNote) $title "OK" "Information" | Out-Null
-
-        # 8) DESIGN NOTE: the pull above just landed new files on disk, but THIS process
-        #    is still running the OLD (pre-pull) start_all.ps1 that was already loaded
-        #    into memory when it started -- without re-exec, none of the freshly-pulled
-        #    code (this very fix included, e.g. tunnel self-heal wiring) takes effect
-        #    until a SECOND run. Fix: re-launch the just-pulled script now, the same
-        #    hidden way the .vbs launcher does, preserving the original switches, and
-        #    let the FRESH process finish this startup (heal + stack) with the pulled
-        #    code; THIS process then exits so only the fresh instance continues. Never
-        #    lets a re-exec failure stop startup: any error here is swallowed and this
-        #    (old) process simply falls through and keeps going on its own.
-        $guardAlreadySet = ($env:MCP_STARTALL_REEXEC -eq "1")
-        if (Test-ShouldReExecAfterUpdate -GuardAlreadySet $guardAlreadySet -Behind $behind -PullSucceeded $true) {
-            try {
-                $selfPath = Join-Path $scriptDir "start_all.ps1"
-                if (Test-Path $selfPath) {
-                    $reArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $selfPath)
-                    if ($NoUi) { $reArgs += "-NoUi" }
-                    if ($NoSplash) { $reArgs += "-NoSplash" }
-                    $env:MCP_STARTALL_REEXEC = "1"
-                    Start-Process powershell -WindowStyle Hidden -ArgumentList $reArgs | Out-Null
-                    # Terminate THIS (old) process hard. A bare `exit` here throws a
-                    # System.Management.Automation.ExitException; when Invoke-Startup runs
-                    # inside the splash's WinForms message loop (the one-shot timer), that
-                    # ExitException escapes as an UNHANDLED "Microsoft .NET Framework"
-                    # exception dialog instead of just exiting -- and its "Continue" button
-                    # would leave THIS stale-code process running alongside the freshly
-                    # re-exec'd instance (double startup). Environment.Exit ends the process
-                    # cleanly from any host context (timer callback, runspace, or console).
-                    [System.Environment]::Exit(0)
-                }
-            } catch {
-                # Re-exec is best-effort only -- fall through and let this (old)
-                # process finish the current startup rather than leaving nothing
-                # running.
-            }
-        }
+        Invoke-PostUpdateTail -Title $title -OldRef "HEAD@{1}" -Behind $behind
     } catch {
         # Update check is best-effort only; never block startup.
         return
