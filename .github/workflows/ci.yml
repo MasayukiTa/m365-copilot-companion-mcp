@@ -177,3 +177,11 @@ jobs:
 
       - name: Run Windows path tests
         run: python -m pytest -q tools/test_file_ops.py
+
+      - name: Run force-push updater integration tests
+        shell: powershell
+        run: |
+          $result = Invoke-Pester .\scripts\update_recovery.Tests.ps1 -PassThru
+          if ($result.FailedCount -gt 0) {
+            exit 1
+          }
