@@ -1,10 +1,10 @@
 # update_recovery.Tests.ps1 -- Pester 3.4.0 unit and disposable-repository
 # integration tests for start_all.ps1's force-push recovery.
 
-$scriptPath = Join-Path $PSScriptRoot "update_recovery.ps1"
-. $scriptPath
-
 Describe "Get-UpdateStrategy" {
+    BeforeAll {
+        . (Join-Path $PSScriptRoot "update_recovery.ps1")
+    }
 
     It "up to date: Behind 0 -> up-to-date" {
         Get-UpdateStrategy -Behind 0 -Ahead 0 -CanFastForward $false | Should Be "up-to-date"
@@ -39,22 +39,30 @@ Describe "Get-UpdateStrategy" {
     }
 }
 
-function Set-TestFile([string]$Path, [string]$Text) {
-    $parent = Split-Path -Parent $Path
-    if ($parent -and -not (Test-Path $parent)) {
-        New-Item -ItemType Directory -Force -Path $parent | Out-Null
-    }
-    [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
-}
-
-function Initialize-TestRepo([string]$Path) {
-    New-Item -ItemType Directory -Force -Path $Path | Out-Null
-    & git init --quiet $Path
-    & git -C $Path config user.name "Update Recovery Test"
-    & git -C $Path config user.email "update-recovery@example.invalid"
-}
-
 Describe "Invoke-RewrittenUpstreamRecovery integration" {
+    BeforeAll {
+        . (Join-Path $PSScriptRoot "update_recovery.ps1")
+
+        function Set-TestFile([string]$Path, [string]$Text) {
+            $parent = Split-Path -Parent $Path
+            if ($parent -and -not (Test-Path $parent)) {
+                New-Item -ItemType Directory -Force -Path $parent | Out-Null
+            }
+            [System.IO.File]::WriteAllText(
+                $Path,
+                $Text,
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+        }
+
+        function Initialize-TestRepo([string]$Path) {
+            New-Item -ItemType Directory -Force -Path $Path | Out-Null
+            & git init --quiet $Path
+            & git -C $Path config user.name "Update Recovery Test"
+            & git -C $Path config user.email "update-recovery@example.invalid"
+        }
+    }
+
     BeforeEach {
         # Pester 3 keeps TestDrive for the whole Describe, not each It.
         $caseRoot = Join-Path $TestDrive ([guid]::NewGuid().ToString("N"))

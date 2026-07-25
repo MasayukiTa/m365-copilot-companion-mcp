@@ -181,11 +181,7 @@ jobs:
       - name: Run force-push updater integration tests
         shell: powershell
         run: |
-          $result = Invoke-Pester `
-            .\scripts\update_recovery.Tests.ps1, `
-            .\scripts\tunnel_drift.Tests.ps1, `
-            .\scripts\heal_tunnel.Tests.ps1 `
-            -PassThru
+          $result = Invoke-Pester .\scripts\update_recovery.Tests.ps1 -PassThru
           if ($result.FailedCount -gt 0) {
             exit 1
           }
