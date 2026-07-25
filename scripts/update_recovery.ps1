@@ -17,6 +17,48 @@ function Get-UpdateStrategy {
     return "diverged-unknown"
 }
 
+function Invoke-GitResetQuiet {
+    # Run the one Git operation for which a non-zero exit is an expected,
+    # explicitly handled outcome without publishing native stderr into the
+    # caller's PowerShell error stream. Pester 5 promotes native stderr to an
+    # ErrorRecord; the hidden production launcher also has nowhere useful to
+    # display it. The exit code remains authoritative.
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Target
+    )
+
+    if ($Target -match '["\r\n]') { return 2 }
+
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = "git"
+        $psi.WorkingDirectory = $RepoRoot
+        $psi.Arguments = 'reset --hard "' + $Target + '"'
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $psi
+        [void]$process.Start()
+        # Drain both redirected streams before WaitForExit to avoid a full pipe
+        # blocking the child process.
+        [void]$process.StandardOutput.ReadToEnd()
+        [void]$process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        $exitCode = $process.ExitCode
+        $process.Dispose()
+        return $exitCode
+    } catch {
+        return 1
+    }
+}
+
 function Invoke-RewrittenUpstreamRecovery {
     <#
     .SYNOPSIS
@@ -102,14 +144,11 @@ function Invoke-RewrittenUpstreamRecovery {
         $result.StashRef = [string]$stashRef
     }
 
-    # Merge native stderr into the success stream and consume it. Pester 5
-    # promotes native stderr to ErrorRecord during tests even when the command's
-    # non-zero exit is the expected branch we are explicitly handling here.
-    & git -C $RepoRoot reset --hard $Upstream 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
+    $resetExit = Invoke-GitResetQuiet -RepoRoot $RepoRoot -Target $Upstream
+    if ($resetExit -ne 0) {
         # The normal failure shape leaves HEAD untouched, but explicitly return
         # to the captured SHA so a partial reset cannot strand the checkout.
-        & git -C $RepoRoot reset --hard $oldSha 2>&1 | Out-Null
+        [void](Invoke-GitResetQuiet -RepoRoot $RepoRoot -Target $oldSha)
         if ($result.StashCreated) {
             # Apply, do not pop: the immutable stash ref remains available even
             # if restoring the worktree reports a conflict.
