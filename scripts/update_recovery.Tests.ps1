@@ -1,16 +1,7 @@
-# update_recovery.Tests.ps1 -- Pester 3.4.0 unit tests for the PURE
-# Get-UpdateStrategy decision helper (defined in tunnel_name_util.ps1) that
-# Check-ForUpdates (start_all.ps1) uses to pick between a normal
-# fast-forward update and the silent rewritten-upstream recovery path. See
-# tunnel_name_util.ps1's own comment block above Get-UpdateStrategy for the
-# incident this backs and the full decision table.
-#
-# tunnel_name_util.ps1 has no top-level side effects (it only defines
-# functions), so it is dot-sourced directly here -- no
-# `$MyInvocation.InvocationName -ne '.'` guard is needed (unlike
-# heal_tunnel.ps1, which does real work at the bottom of its file).
+# update_recovery.Tests.ps1 -- Pester 3.4.0 unit and disposable-repository
+# integration tests for start_all.ps1's force-push recovery.
 
-$scriptPath = Join-Path $PSScriptRoot "tunnel_name_util.ps1"
+$scriptPath = Join-Path $PSScriptRoot "update_recovery.ps1"
 . $scriptPath
 
 Describe "Get-UpdateStrategy" {
@@ -45,5 +36,108 @@ Describe "Get-UpdateStrategy" {
         $result = Get-UpdateStrategy -Behind 7 -Ahead -2 -CanFastForward $false
         $validValues = @("up-to-date", "fast-forward", "rewritten-upstream", "diverged-unknown")
         ($validValues -contains $result) | Should Be $true
+    }
+}
+
+function Set-TestFile([string]$Path, [string]$Text) {
+    $parent = Split-Path -Parent $Path
+    if ($parent -and -not (Test-Path $parent)) {
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    }
+    [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Initialize-TestRepo([string]$Path) {
+    New-Item -ItemType Directory -Force -Path $Path | Out-Null
+    & git init --quiet $Path
+    & git -C $Path config user.name "Update Recovery Test"
+    & git -C $Path config user.email "update-recovery@example.invalid"
+}
+
+Describe "Invoke-RewrittenUpstreamRecovery integration" {
+    BeforeEach {
+        # Pester 3 keeps TestDrive for the whole Describe, not each It.
+        $caseRoot = Join-Path $TestDrive ([guid]::NewGuid().ToString("N"))
+        $remote = Join-Path $caseRoot "remote.git"
+        $oldSource = Join-Path $caseRoot "old-source"
+        $rewriteSource = Join-Path $caseRoot "rewrite-source"
+        $client = Join-Path $caseRoot "client"
+
+        & git init --quiet --bare $remote
+
+        Initialize-TestRepo $oldSource
+        Set-TestFile (Join-Path $oldSource "version.txt") "old-base"
+        & git -C $oldSource add version.txt
+        & git -C $oldSource commit --quiet -m "old base"
+        Set-TestFile (Join-Path $oldSource "version.txt") "old-tip"
+        & git -C $oldSource commit --quiet -am "old tip"
+        & git -C $oldSource branch -M main
+        & git -C $oldSource remote add origin $remote
+        & git -C $oldSource push --quiet -u origin main
+        & git --git-dir=$remote symbolic-ref HEAD refs/heads/main
+
+        & git clone --quiet $remote $client
+        & git -C $client config user.name "Update Recovery Client"
+        & git -C $client config user.email "update-client@example.invalid"
+        $oldClientSha = (& git -C $client rev-parse HEAD).Trim()
+
+        # Model a metadata scrub: an unrelated clean history replaces remote
+        # main and then gains a newer commit.
+        Initialize-TestRepo $rewriteSource
+        Set-TestFile (Join-Path $rewriteSource "version.txt") "clean-base"
+        & git -C $rewriteSource add version.txt
+        & git -C $rewriteSource commit --quiet -m "clean rewritten base"
+        Set-TestFile (Join-Path $rewriteSource "version.txt") "clean-latest"
+        & git -C $rewriteSource commit --quiet -am "clean latest"
+        & git -C $rewriteSource branch -M main
+        & git -C $rewriteSource remote add origin $remote
+        & git -C $rewriteSource push --quiet --force origin main
+
+        & git -C $client fetch --quiet origin
+    }
+
+    It "recovers the real non-fast-forward shape and retains every local change" {
+        Set-TestFile (Join-Path $client "version.txt") "local tracked edit"
+        Set-TestFile (Join-Path $client "local-note.txt") "local untracked note"
+
+        $behind = [int]((& git -C $client rev-list --count "HEAD..@{u}").Trim())
+        $ahead = [int]((& git -C $client rev-list --count "@{u}..HEAD").Trim())
+        & git -C $client merge-base --is-ancestor HEAD "@{u}"
+        $canFF = ($LASTEXITCODE -eq 0)
+
+        Get-UpdateStrategy -Behind $behind -Ahead $ahead -CanFastForward $canFF |
+            Should Be "rewritten-upstream"
+        $result = Invoke-RewrittenUpstreamRecovery `
+            -RepoRoot $client -Upstream "@{u}" -Timestamp "20260725-120000"
+
+        $result.Success | Should Be $true
+        (& git -C $client rev-parse HEAD).Trim() |
+            Should Be (& git -C $client rev-parse "@{u}").Trim()
+        (& git -C $client rev-parse $result.BackupBranch).Trim() | Should Be $oldClientSha
+        $result.StashCreated | Should Be $true
+        $stashedPaths = @(& git -C $client stash show --include-untracked --name-only $result.StashRef)
+        ($stashedPaths -contains "version.txt") | Should Be $true
+        ($stashedPaths -contains "local-note.txt") | Should Be $true
+        @(& git -C $client status --porcelain).Count | Should Be 0
+        (Get-Content (Join-Path $client "version.txt") -Raw).Trim() | Should Be "clean-latest"
+    }
+
+    It "rolls back to the original checkout if the requested reset target fails" {
+        Set-TestFile (Join-Path $client "version.txt") "tracked work to restore"
+        Set-TestFile (Join-Path $client "untracked-work.txt") "untracked work to restore"
+
+        $result = Invoke-RewrittenUpstreamRecovery `
+            -RepoRoot $client -Upstream "refs/remotes/origin/does-not-exist" `
+            -Timestamp "20260725-120001"
+
+        $result.Success | Should Be $false
+        $result.Error | Should Match "reset --hard"
+        (& git -C $client rev-parse HEAD).Trim() | Should Be $oldClientSha
+        (Get-Content (Join-Path $client "version.txt") -Raw).Trim() |
+            Should Be "tracked work to restore"
+        (Get-Content (Join-Path $client "untracked-work.txt") -Raw).Trim() |
+            Should Be "untracked work to restore"
+        $result.StashCreated | Should Be $true
+        (& git -C $client rev-parse $result.StashRef).Trim() | Should Be $result.StashRef
     }
 }

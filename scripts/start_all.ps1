@@ -24,6 +24,7 @@ $root = Split-Path -Parent $scriptDir
 # stale/borrowed tunnel -- see tunnel_name_util.ps1's header comment. No
 # top-level side effects, so dot-sourcing it here is safe.
 . (Join-Path $scriptDir "tunnel_name_util.ps1")
+. (Join-Path $scriptDir "update_recovery.ps1")
 
 function Ensure-EnvDefaults {
     # Release upgrades must not overwrite a user's .env, but existing installations need new
@@ -327,26 +328,47 @@ function Check-ForUpdates {
         # 2) Never let git prompt for credentials (would hang the hidden process).
         $env:GIT_TERMINAL_PROMPT = '0'
 
-        # 3) Fetch with a hard timeout via a background job. Offline/auth/slow -> give up quietly.
-        $job = Start-Job -ScriptBlock {
-            param($r)
-            $env:GIT_TERMINAL_PROMPT = '0'
-            & git -C $r fetch --quiet 2>$null
-            $LASTEXITCODE
-        } -ArgumentList $root
-        # Poll (not Wait-Job) so the splash stays painted/animated during the fetch.
-        $deadline = (Get-Date).AddSeconds(15)
-        while ($job.State -eq 'Running' -and (Get-Date) -lt $deadline) {
-            Pump-Splash $script:splash
-            Start-Sleep -Milliseconds 120
-        }
-        if ($job.State -eq 'Running') {
-            try { Stop-Job $job -ErrorAction SilentlyContinue } catch { }
+        # 3) Fetch with a hard timeout and bounded retries. A Wi-Fi/VPN handover can
+        #    transiently break the first connection even though the network is healthy a
+        #    few seconds later. Keep every attempt bounded so startup cannot hang forever.
+        $fetchExit = 1
+        for ($fetchAttempt = 1; $fetchAttempt -le 3; $fetchAttempt++) {
+            $job = Start-Job -ScriptBlock {
+                param($r)
+                $env:GIT_TERMINAL_PROMPT = '0'
+                & git -C $r fetch --quiet 2>$null
+                $LASTEXITCODE
+            } -ArgumentList $root
+            # Poll (not Wait-Job) so the splash stays painted/animated during the fetch.
+            $deadline = (Get-Date).AddSeconds(15)
+            while ($job.State -eq 'Running' -and (Get-Date) -lt $deadline) {
+                Pump-Splash $script:splash
+                Start-Sleep -Milliseconds 120
+            }
+            if ($job.State -eq 'Running') {
+                $fetchExit = 124
+                try { Stop-Job $job -ErrorAction SilentlyContinue } catch { }
+            } else {
+                $fetchResult = @(Receive-Job $job)
+                $fetchExitRaw = ($fetchResult | Select-Object -Last 1)
+                $parsedFetchExit = 1
+                if ($null -ne $fetchExitRaw) {
+                    [void][int]::TryParse(([string]$fetchExitRaw).Trim(), [ref]$parsedFetchExit)
+                }
+                $fetchExit = $parsedFetchExit
+            }
             try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch { }
-            return
+            if ($fetchExit -eq 0) { break }
+
+            Write-Host "[update] fetch attempt $fetchAttempt/3 failed (exit=$fetchExit)"
+            if ($fetchAttempt -lt 3) {
+                $retryUntil = (Get-Date).AddSeconds($fetchAttempt)
+                while ((Get-Date) -lt $retryUntil) {
+                    Pump-Splash $script:splash
+                    Start-Sleep -Milliseconds 120
+                }
+            }
         }
-        $fetchExit = Receive-Job $job
-        try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch { }
         if ($fetchExit -ne 0) { return }
 
         # 4) How many commits behind upstream? Upstream unset -> fails -> return.
@@ -396,58 +418,22 @@ function Check-ForUpdates {
             # the startup log later) and NEVER shown in a dialog -- the user only ever sees the
             # single question above, then either the existing generic failure dialog or the
             # existing generic success dialog, identical to the fast-forward path.
-            $oldSha = (& git -C $root rev-parse HEAD 2>$null | Select-Object -First 1)
-            if ($LASTEXITCODE -ne 0 -or -not $oldSha) {
-                Write-Host "[update] recovery aborted: could not resolve current HEAD"
-                Show-OwnedDialog "Update could not complete. Your current version is kept." $title "OK" "Warning" | Out-Null
-                return
-            }
-
             $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-            $backupBranch = "backup/pre-reset-$stamp"
-
-            # a) Safety backup of the current HEAD FIRST -- never reset without this ref
-            #    existing. If it cannot be created, abort the whole recovery rather than risk
-            #    an unrecoverable reset.
-            & git -C $root branch $backupBranch HEAD 2>$null | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                Write-Host "[update] recovery aborted: could not create backup ref $backupBranch"
+            $recovery = Invoke-RewrittenUpstreamRecovery -RepoRoot $root -Upstream "@{u}" -Timestamp $stamp
+            if (-not $recovery.Success) {
+                Write-Host "[update] recovery aborted: $($recovery.Error)"
                 Show-OwnedDialog "Update could not complete. Your current version is kept." $title "OK" "Warning" | Out-Null
                 return
             }
-            Write-Host "[update] recovery: backup ref $backupBranch created (strategy=$strategy)"
-
-            # b) Stash uncommitted work, including untracked files -- only if there is any. If
-            #    local changes exist but the stash itself fails, abort rather than risk
-            #    destroying them in the reset below.
-            $statusOut = & git -C $root status --porcelain 2>$null
-            $hadLocalChanges = [bool]$statusOut
-            $stashed = $false
-            if ($hadLocalChanges) {
-                & git -C $root stash push -u -m "pre-reset $stamp" 2>$null | Out-Null
-                if ($LASTEXITCODE -ne 0) {
-                    Write-Host "[update] recovery aborted: local changes present but stash failed"
-                    Show-OwnedDialog "Update could not complete. Your current version is kept." $title "OK" "Warning" | Out-Null
-                    return
-                }
-                $stashed = $true
-                Write-Host "[update] recovery: local changes stashed (pre-reset $stamp)"
-            }
-
-            # c) Reset to exactly match upstream.
-            & git -C $root reset --hard "@{u}" 2>$null | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                Write-Host "[update] recovery aborted: reset --hard @{u} failed"
-                Show-OwnedDialog "Update could not complete. Your current version is kept." $title "OK" "Warning" | Out-Null
-                return
-            }
-            Write-Host "[update] recovery: reset to @{u} succeeded (backup=$backupBranch stashed=$stashed)"
+            Write-Host ("[update] recovery: reset to @{{u}} succeeded " +
+                        "(backup=$($recovery.BackupBranch) stashed=$($recovery.StashCreated) " +
+                        "stashRef=$($recovery.StashRef))")
 
             # Same shared tail (rebuild + generic success dialog + re-exec) as the
             # fast-forward path -- diff the ui-rebuild check from the PRE-RESET sha
             # captured above rather than HEAD@{1} (still valid after reset --hard, but
             # the explicit sha is unambiguous and documents the intent).
-            Invoke-PostUpdateTail -Title $title -OldRef $oldSha -Behind $behind
+            Invoke-PostUpdateTail -Title $title -OldRef $recovery.OldSha -Behind $behind
             return
         }
 
