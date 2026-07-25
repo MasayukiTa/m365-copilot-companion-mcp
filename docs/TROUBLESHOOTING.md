@@ -57,6 +57,21 @@ powershell -ExecutionPolicy Bypass -File scripts\register-supervisor.ps1
 
 ---
 
+## `start_all.bat` の更新と force-push 復旧
+
+Gitで導入した環境では、`start_all.bat` が起動前に更新を確認します。通常の更新はfast-forwardで取り込みます。公開履歴がforce-pushなどで書き換えられ、ローカル履歴と分岐した場合は、次の順序で自動復旧します。
+
+1. 現在のHEADを `backup/pre-reset-<日時>` というローカルブランチへ退避
+2. 追跡中・未追跡の作業ファイルがあればstashへ退避
+3. 書き換え後のupstreamへ作業ツリーを合わせる
+4. 更新後の `start_all.ps1` を再実行して通常起動を継続
+
+バックアップブランチまたはstashを作れない場合はresetせず、現在の環境を維持します。ネットワーク切替直後の一時的なfetch失敗には、時間制限付きで3回まで再試行します。
+
+この自動復旧は、この機能を含む版へ一度到達した環境から有効です。それ以前のFF-only版は、分岐したクリーン履歴を自分自身だけで取得できません。その場合は一度だけ `update.bat` で最新Releaseを適用するか、管理者がクリーン版へ移行してください。
+
+---
+
 ## ツールが動かないとき
 
 | 症状 | 対処 |
