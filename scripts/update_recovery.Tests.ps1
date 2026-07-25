@@ -4,30 +4,35 @@
 Describe "Get-UpdateStrategy" {
     BeforeAll {
         . (Join-Path $PSScriptRoot "update_recovery.ps1")
+        function Assert-Equal($Actual, $Expected) {
+            if ($Actual -ne $Expected) {
+                throw "Expected <$Expected>, got <$Actual>"
+            }
+        }
     }
 
     It "up to date: Behind 0 -> up-to-date" {
-        Get-UpdateStrategy -Behind 0 -Ahead 0 -CanFastForward $false | Should Be "up-to-date"
+        Assert-Equal (Get-UpdateStrategy -Behind 0 -Ahead 0 -CanFastForward $false) "up-to-date"
     }
 
     It "already caught up (negative Behind, e.g. a parse quirk) -> up-to-date" {
-        Get-UpdateStrategy -Behind -1 -Ahead 0 -CanFastForward $false | Should Be "up-to-date"
+        Assert-Equal (Get-UpdateStrategy -Behind -1 -Ahead 0 -CanFastForward $false) "up-to-date"
     }
 
     It "plain fast-forward: Behind 5, Ahead 0, CanFastForward true -> fast-forward" {
-        Get-UpdateStrategy -Behind 5 -Ahead 0 -CanFastForward $true | Should Be "fast-forward"
+        Assert-Equal (Get-UpdateStrategy -Behind 5 -Ahead 0 -CanFastForward $true) "fast-forward"
     }
 
     It "the real incident shape: Behind 10, Ahead 4, CanFastForward false -> rewritten-upstream" {
-        Get-UpdateStrategy -Behind 10 -Ahead 4 -CanFastForward $false | Should Be "rewritten-upstream"
+        Assert-Equal (Get-UpdateStrategy -Behind 10 -Ahead 4 -CanFastForward $false) "rewritten-upstream"
     }
 
     It "diverged with Ahead 0 and CanFastForward false -> diverged-unknown" {
-        Get-UpdateStrategy -Behind 3 -Ahead 0 -CanFastForward $false | Should Be "diverged-unknown"
+        Assert-Equal (Get-UpdateStrategy -Behind 3 -Ahead 0 -CanFastForward $false) "diverged-unknown"
     }
 
     It "fast-forward wins even if Ahead is also (nonsensically) positive" {
-        Get-UpdateStrategy -Behind 2 -Ahead 1 -CanFastForward $true | Should Be "fast-forward"
+        Assert-Equal (Get-UpdateStrategy -Behind 2 -Ahead 1 -CanFastForward $true) "fast-forward"
     }
 
     It "nonsense/negative Ahead with Behind>0 and not fast-forwardable -> still returns a valid value" {
@@ -35,13 +40,25 @@ Describe "Get-UpdateStrategy" {
         # use PowerShell's own -contains operator against the known-valid result set.
         $result = Get-UpdateStrategy -Behind 7 -Ahead -2 -CanFastForward $false
         $validValues = @("up-to-date", "fast-forward", "rewritten-upstream", "diverged-unknown")
-        ($validValues -contains $result) | Should Be $true
+        Assert-Equal ($validValues -contains $result) $true
     }
 }
 
 Describe "Invoke-RewrittenUpstreamRecovery integration" {
     BeforeAll {
         . (Join-Path $PSScriptRoot "update_recovery.ps1")
+
+        function Assert-Equal($Actual, $Expected) {
+            if ($Actual -ne $Expected) {
+                throw "Expected <$Expected>, got <$Actual>"
+            }
+        }
+
+        function Assert-Matches([string]$Actual, [string]$Pattern) {
+            if ($Actual -notmatch $Pattern) {
+                throw "Expected <$Actual> to match <$Pattern>"
+            }
+        }
 
         function Set-TestFile([string]$Path, [string]$Text) {
             $parent = Split-Path -Parent $Path
@@ -113,21 +130,23 @@ Describe "Invoke-RewrittenUpstreamRecovery integration" {
         & git -C $client merge-base --is-ancestor HEAD "@{u}"
         $canFF = ($LASTEXITCODE -eq 0)
 
-        Get-UpdateStrategy -Behind $behind -Ahead $ahead -CanFastForward $canFF |
-            Should Be "rewritten-upstream"
+        Assert-Equal `
+            (Get-UpdateStrategy -Behind $behind -Ahead $ahead -CanFastForward $canFF) `
+            "rewritten-upstream"
         $result = Invoke-RewrittenUpstreamRecovery `
             -RepoRoot $client -Upstream "@{u}" -Timestamp "20260725-120000"
 
-        $result.Success | Should Be $true
-        (& git -C $client rev-parse HEAD).Trim() |
-            Should Be (& git -C $client rev-parse "@{u}").Trim()
-        (& git -C $client rev-parse $result.BackupBranch).Trim() | Should Be $oldClientSha
-        $result.StashCreated | Should Be $true
+        Assert-Equal $result.Success $true
+        Assert-Equal `
+            ((& git -C $client rev-parse HEAD).Trim()) `
+            ((& git -C $client rev-parse "@{u}").Trim())
+        Assert-Equal ((& git -C $client rev-parse $result.BackupBranch).Trim()) $oldClientSha
+        Assert-Equal $result.StashCreated $true
         $stashedPaths = @(& git -C $client stash show --include-untracked --name-only $result.StashRef)
-        ($stashedPaths -contains "version.txt") | Should Be $true
-        ($stashedPaths -contains "local-note.txt") | Should Be $true
-        @(& git -C $client status --porcelain).Count | Should Be 0
-        (Get-Content (Join-Path $client "version.txt") -Raw).Trim() | Should Be "clean-latest"
+        Assert-Equal ($stashedPaths -contains "version.txt") $true
+        Assert-Equal ($stashedPaths -contains "local-note.txt") $true
+        Assert-Equal @(& git -C $client status --porcelain).Count 0
+        Assert-Equal (Get-Content (Join-Path $client "version.txt") -Raw).Trim() "clean-latest"
     }
 
     It "rolls back to the original checkout if the requested reset target fails" {
@@ -138,14 +157,16 @@ Describe "Invoke-RewrittenUpstreamRecovery integration" {
             -RepoRoot $client -Upstream "refs/remotes/origin/does-not-exist" `
             -Timestamp "20260725-120001"
 
-        $result.Success | Should Be $false
-        $result.Error | Should Match "reset --hard"
-        (& git -C $client rev-parse HEAD).Trim() | Should Be $oldClientSha
-        (Get-Content (Join-Path $client "version.txt") -Raw).Trim() |
-            Should Be "tracked work to restore"
-        (Get-Content (Join-Path $client "untracked-work.txt") -Raw).Trim() |
-            Should Be "untracked work to restore"
-        $result.StashCreated | Should Be $true
-        (& git -C $client rev-parse $result.StashRef).Trim() | Should Be $result.StashRef
+        Assert-Equal $result.Success $false
+        Assert-Matches $result.Error "reset --hard"
+        Assert-Equal ((& git -C $client rev-parse HEAD).Trim()) $oldClientSha
+        Assert-Equal `
+            (Get-Content (Join-Path $client "version.txt") -Raw).Trim() `
+            "tracked work to restore"
+        Assert-Equal `
+            (Get-Content (Join-Path $client "untracked-work.txt") -Raw).Trim() `
+            "untracked work to restore"
+        Assert-Equal $result.StashCreated $true
+        Assert-Equal ((& git -C $client rev-parse $result.StashRef).Trim()) $result.StashRef
     }
 }

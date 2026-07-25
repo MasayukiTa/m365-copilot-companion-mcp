@@ -102,15 +102,18 @@ function Invoke-RewrittenUpstreamRecovery {
         $result.StashRef = [string]$stashRef
     }
 
-    & git -C $RepoRoot reset --hard $Upstream 2>$null | Out-Null
+    # Merge native stderr into the success stream and consume it. Pester 5
+    # promotes native stderr to ErrorRecord during tests even when the command's
+    # non-zero exit is the expected branch we are explicitly handling here.
+    & git -C $RepoRoot reset --hard $Upstream 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
         # The normal failure shape leaves HEAD untouched, but explicitly return
         # to the captured SHA so a partial reset cannot strand the checkout.
-        & git -C $RepoRoot reset --hard $oldSha 2>$null | Out-Null
+        & git -C $RepoRoot reset --hard $oldSha 2>&1 | Out-Null
         if ($result.StashCreated) {
             # Apply, do not pop: the immutable stash ref remains available even
             # if restoring the worktree reports a conflict.
-            & git -C $RepoRoot stash apply --index $result.StashRef 2>$null | Out-Null
+            & git -C $RepoRoot stash apply --index $result.StashRef 2>&1 | Out-Null
         }
         $result.Error = "reset --hard $Upstream failed"
         return [pscustomobject]$result
