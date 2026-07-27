@@ -1,5 +1,8 @@
 # m365-copilot-companion-mcp
 
+> [!IMPORTANT]
+> **既存ユーザーの方へ:** 次回リリースの公開後、必ずそのリリースへ更新してください。更新手順と配布物は [Releases](https://github.com/MasayukiTa/m365-copilot-companion-mcp/releases) で案内します。
+
 M365 Copilot を、**あなたの PC を操作できる自律エージェント**にするツールです。
 API 契約は不要。会社アカウントのまま。管理者権限も不要。
 ファイルを読むだけだった Copilot に「手」を生やして、実際に作業させます。
