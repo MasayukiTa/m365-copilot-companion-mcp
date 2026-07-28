@@ -136,3 +136,17 @@ def test_cached_history_search_box_is_detached_before_re_parenting():
     detach = SOURCE.index("prevWrap.Child = null;")
     rewrap = SOURCE.index("new Border { Child = _histSearchBox")
     assert detach < rewrap
+
+
+def test_autoscale_toggle_is_painted_when_it_is_built():
+    """The settings panel rebuilds AutoscaleControls() on every open, but only the Click
+    handler used to call PaintAutoToggle -- the control that sets the button's label and
+    colours. So the RAM auto-adjust toggle first rendered as a blank pill, and the only
+    way to see its state was to click it, which flipped the setting."""
+    body = SOURCE[SOURCE.index("UIElement AutoscaleControls()"):]
+    body = body[:body.index("\n    }")]
+    assert "group.Children.Add(_autoToggle);" in body
+    paint = body.index("PaintAutoToggle();", body.index("group.Children.Add(_autoToggle);"))
+    ret = body.index("return group;")
+    assert paint < ret, "must paint before returning, not only from the Click handler"
+    assert body.index("UpdateAutoEnabled();", paint) < ret

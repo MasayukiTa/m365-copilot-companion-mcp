@@ -4648,6 +4648,14 @@ class CockpitWindow : Window
         };
         group.Children.Add(_autoToggle);
 
+        // Paint it NOW, not only from the Click handler. The settings panel rebuilds this
+        // control every time it opens, and PaintAutoToggle is what sets the button's label and
+        // colours -- so until the user clicked it the toggle rendered as an empty pill with no
+        // text, giving no clue whether RAM auto-adjust was on or off. Clicking to find out also
+        // flipped the setting, which is the opposite of what someone checking the state wants.
+        PaintAutoToggle();
+        UpdateAutoEnabled();
+
         return group;
     }
 
