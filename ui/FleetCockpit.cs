@@ -1294,7 +1294,8 @@ class CockpitWindow : Window
         _headBar.Child = headRow;
         root.Children.Add(_headBar);
         root.Children.Add(BuildMtBanner());
-        root.Children.Add(BuildGateBanner());
+        // BuildGateBanner() is NOT added here -- it is docked inside the run column (col1) so it
+        // cannot overhang the timeline spine. See the comment at that call site.
         root.Children.Add(BuildCapBanner());
         // The composer docks to the BOTTOM (spec: agent-workspace feel, not a form). It must be
         // added before _list so the list — the LastChildFill element — fills the space above it.
@@ -1359,6 +1360,12 @@ class CockpitWindow : Window
         // area directly under the header. The left padding matches the list's inner padding (18) so
         // the bar and the cards under it share the same left edge.
         var col1 = new DockPanel { LastChildFill = true };
+        // The approval banner belongs to the RUN column, not to the whole window. Docked on the
+        // root it spanned the full width and overhung the timeline spine once that column opened,
+        // so the banner's box crossed the spine's frame instead of lining up with the cards it
+        // refers to. Docking it here keeps its left edge on the same 18px gutter as the toolbar
+        // and the cards below it.
+        col1.Children.Add(BuildGateBanner());
         _pinnedToolbarHost = new Border();
         _pinnedToolbarHost.Padding = new Thickness(18, 6, 18, 0);
         _pinnedToolbarHost.Visibility = Visibility.Collapsed;   // shown once there is a run/history to filter
@@ -5964,7 +5971,9 @@ class CockpitWindow : Window
         // decoration. The banner's border colour already carries the urgency.
         _gateBanner.BorderThickness = new Thickness(1);
         _gateBanner.Padding = new Thickness(14, 10, 12, 10);
-        _gateBanner.Margin = new Thickness(26, 0, 18, 6);
+        // 18px left gutter: the same one _pinnedToolbarHost and the card list use, so inside the
+        // run column the banner shares its left edge with the cards it is about.
+        _gateBanner.Margin = new Thickness(18, 6, 18, 6);
         DockPanel.SetDock(_gateBanner, Dock.Top);
         _gateCardsPanel = new StackPanel();
         // The banner is DOCKED, so it sits outside the card list's ScrollViewer -- the only
