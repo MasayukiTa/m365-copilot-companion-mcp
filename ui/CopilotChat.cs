@@ -541,6 +541,7 @@ class ChatWindow : Window
         LoadConversations();
         Loaded += delegate
         {
+            ForceVisibleOnce();
             _input.Focus();
             // UI-scale first run. AUTO is the default for NEW users: seed _scaleTarget from the PRIMARY
             // monitor's scale (the size the user is used to) and compute the per-monitor effective scale.
@@ -2125,6 +2126,32 @@ class ChatWindow : Window
     string RepoRoot() { return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..")); }
 
     [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int nCmdShow);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    static extern bool RedrawWindow(IntPtr h, IntPtr lprc, IntPtr hrgn, uint flags);
+
+    // The daily launcher is windowless: start_all_hidden.vbs -> start_all.ps1 (-WindowStyle
+    // Hidden = SW_HIDE) -> this app. A child of an SW_HIDE parent INHERITS that show-state
+    // via STARTUPINFO.wShowWindow, so WPF builds the HWND without a real first paint: DWM
+    // has no composed surface and the window shows as black / stale rectangles even though
+    // the visual tree is intact (PrintWindow of the same HWND returns correct content).
+    // One SW_SHOW + full redraw right after load discards the inherited state. Idempotent,
+    // and a no-op when the app was started normally.
+    void ForceVisibleOnce()
+    {
+        try
+        {
+            IntPtr h = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+            if (h == IntPtr.Zero) return;
+            const int SW_SHOW = 5;
+            const uint RDW_INVALIDATE = 0x0001, RDW_ERASE = 0x0004,
+                       RDW_ALLCHILDREN = 0x0080, RDW_UPDATENOW = 0x0100;
+            ShowWindow(h, SW_SHOW);
+            RedrawWindow(h, IntPtr.Zero, IntPtr.Zero,
+                         RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        }
+        catch { }
+    }
     // Launch (or focus) the parallel-execution cockpit -- so the user never has to close
     // everything and restart just to reach it.
     void OpenCockpit()
