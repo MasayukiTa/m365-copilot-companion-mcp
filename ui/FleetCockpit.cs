@@ -124,8 +124,13 @@ class ApprovalPromptWindow : Window
         // space Width/Height use, so no DPI conversion is needed here.
         double workW = SystemParameters.WorkArea.Width;
         double workH = SystemParameters.WorkArea.Height;
-        Width = Math.Min(600, Math.Max(360, workW - 80));
-        Height = Math.Min(620, Math.Max(360, workH - 80));
+        // Divide by the UI zoom before clamping: the window is measured in unscaled
+        // units, so at 1.5x a 620-unit window occupies 930 physical units. Without this
+        // the footer -- the Approve/Deny row -- lands past the bottom edge, and since it
+        // is docked rather than inside the scroller there is no way to scroll to it.
+        double zoom = ReadUiScale();
+        Width = Math.Min(600, Math.Max(360, workW / zoom - 60));
+        Height = Math.Min(620, Math.Max(360, workH / zoom - 60));
         MinWidth = Math.Min(500, Width);
         MinHeight = Math.Min(480, Height);
         MaxHeight = workH;   // never taller than the desktop, whatever the content asks for
@@ -167,6 +172,43 @@ class ApprovalPromptWindow : Window
     }
 
     string L(string ja, string en) { return _lang == 0 ? ja : en; }
+
+    // The zoom the cockpit is running at, read straight from settings.txt. This window
+    // is not itself scaled, but it is sized in the same unscaled units, so it must know
+    // the zoom to avoid asking for a window taller than the screen can show. "auto"
+    // (the default) resolves to the persisted target, falling back to 1.5 like the
+    // cockpit does. Clamped to the same 0.8-2.0 range the cockpit enforces.
+    double ReadUiScale()
+    {
+        double scale = 1.0, target = 1.5, parsed = 0.0;
+        bool auto = false, haveScale = false;
+        try
+        {
+            if (File.Exists(SettingsFile))
+            {
+                foreach (string raw in File.ReadAllLines(SettingsFile, new UTF8Encoding(false)))
+                {
+                    string line = raw.Trim();
+                    if (line.StartsWith("ui_scale="))
+                    {
+                        string v = line.Substring(9).Trim();
+                        if (v.Equals("auto", StringComparison.OrdinalIgnoreCase)) auto = true;
+                        else if (double.TryParse(v, System.Globalization.NumberStyles.Float,
+                                                 System.Globalization.CultureInfo.InvariantCulture, out parsed))
+                        { scale = parsed; haveScale = true; }
+                    }
+                    else if (line.StartsWith("ui_scale_target="))
+                    {
+                        double.TryParse(line.Substring(16).Trim(), System.Globalization.NumberStyles.Float,
+                                        System.Globalization.CultureInfo.InvariantCulture, out target);
+                    }
+                }
+            }
+        }
+        catch { }
+        if (auto || !haveScale) scale = target > 0.1 ? target : 1.5;
+        return Math.Max(0.8, Math.Min(2.0, scale));
+    }
 
     void LoadUiPreferences()
     {
@@ -5629,6 +5671,7 @@ class CockpitWindow : Window
     // When status.json has a non-empty `pending_gates` array, a worker is blocked waiting for
     // human approval. This banner surfaces the gate prominently so it cannot be missed.
     Border _gateBanner;
+    ScrollViewer _gateScroll;           // bounds the banner so it cannot starve the rest of the window
     StackPanel _gateCardsPanel;         // holds one card per pending gate (or first gate + count)
     string _gateSig = "";               // last rendered gate set (by token); rebuild only on change
 
@@ -5883,6 +5926,26 @@ class CockpitWindow : Window
         return pending;
     }
 
+    // First two lines of a gate context, ellipsised. Keeps the banner card a fixed, predictable
+    // height so the Approve/Deny row below it stays on screen no matter how long the context is.
+    static string GateContextPreview(string context)
+    {
+        if (string.IsNullOrEmpty(context)) return "";
+        string[] lines = context.Replace("\r\n", "\n").Split('\n');
+        var kept = new List<string>();
+        foreach (string line in lines)
+        {
+            if (line.Trim().Length == 0) continue;
+            kept.Add(line.Length > 110 ? line.Substring(0, 110) + "..." : line);
+            if (kept.Count == 2) break;
+        }
+        string text = string.Join("\n", kept.ToArray());
+        int shown = kept.Count, total = 0;
+        foreach (string line in lines) if (line.Trim().Length > 0) total++;
+        if (total > shown) text += "\n... (+" + (total - shown) + " 行)";
+        return text;
+    }
+
     // Builds the outer gate banner container (always Collapsed until a gate appears).
     UIElement BuildGateBanner()
     {
@@ -5896,7 +5959,18 @@ class CockpitWindow : Window
         _gateBanner.Margin = new Thickness(26, 0, 18, 6);
         DockPanel.SetDock(_gateBanner, Dock.Top);
         _gateCardsPanel = new StackPanel();
-        _gateBanner.Child = _gateCardsPanel;
+        // The banner is DOCKED, so it sits outside the card list's ScrollViewer -- the only
+        // scroller in the window. Left unbounded it takes whatever height it wants: with three
+        // pending Skill gates at 1.5x zoom the health strip and counters were measured at zero
+        // height, the list's viewport collapsed to nothing, and controls landed at y=1199 on a
+        // 1080-tall screen. On a shorter display the Approve/Deny rows themselves cross the
+        // bottom edge, and with the list scroller gone there is nothing left to scroll -- the
+        // request becomes impossible to answer. Its own scroller bounds it instead.
+        _gateScroll = new ScrollViewer();
+        _gateScroll.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+        _gateScroll.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
+        _gateScroll.Content = _gateCardsPanel;
+        _gateBanner.Child = _gateScroll;
         return _gateBanner;
     }
 
@@ -5910,6 +5984,16 @@ class CockpitWindow : Window
         // status.json so Skill/import approvals remain visible before and after a fleet run.
         List<Dictionary<string, object>> gates = PendingGates(root);
         PaintApprovalCenterButton(gates.Count);
+
+        // Re-cap on every tick: the window can be resized and the zoom changed at any time.
+        // ActualHeight is in physical units while the banner lives inside the scaled root, so
+        // divide by the zoom to get the units this MaxHeight is actually measured in.
+        if (_gateScroll != null)
+        {
+            double zoom = (_rootScale != null && _rootScale.ScaleY > 0.1) ? _rootScale.ScaleY : 1.0;
+            double usable = (ActualHeight > 0 ? ActualHeight : 760) / zoom;
+            _gateScroll.MaxHeight = Math.Max(150, usable * 0.45);
+        }
         if (_approvalCenterWindow != null && _approvalCenterWindow.IsVisible)
             RefreshApprovalCenter();
 
@@ -5970,7 +6054,11 @@ class CockpitWindow : Window
             if (!string.IsNullOrEmpty(context2))
             {
                 var ctxTb = new TextBlock();
-                ctxTb.Text = context2;
+                // Preview only. A Skill gate's context is a multi-line file/hash manifest; printed
+                // in full it pushed the Approve/Deny row below the fold. The complete text is one
+                // click away in the Approval Center, which scrolls.
+                ctxTb.Text = GateContextPreview(context2);
+                ctxTb.ToolTip = context2;
                 ctxTb.FontSize = 11;
                 ctxTb.Foreground = Theme.Br(Theme.Muted(_dark));
                 ctxTb.TextWrapping = TextWrapping.Wrap;
@@ -6061,7 +6149,18 @@ class CockpitWindow : Window
         var w = new Window();
         _approvalCenterWindow = w;
         w.Title = _lang == 0 ? "承認センター" : "Approval Center";
-        w.Width = 760; w.Height = 720; w.MinWidth = 560; w.MinHeight = 460;
+        // Clamp to the work area. A fixed 760x720 already filled a 1080-tall screen once
+        // the UI scale (1.5 by default) was applied, pushing the Approve/Deny row off the
+        // bottom -- and because the footer is docked rather than inside the scroller,
+        // there was nothing to scroll to reach it: the request became undecidable.
+        double waW = SystemParameters.WorkArea.Width;
+        double waH = SystemParameters.WorkArea.Height;
+        double scale = (_rootScale != null && _rootScale.ScaleY > 0.1) ? _rootScale.ScaleY : 1.0;
+        w.Width = Math.Min(760, Math.Max(480, waW / scale - 60));
+        w.Height = Math.Min(720, Math.Max(380, waH / scale - 60));
+        w.MinWidth = Math.Min(560, w.Width);
+        w.MinHeight = Math.Min(460, w.Height);
+        w.MaxHeight = waH;
         w.WindowStartupLocation = WindowStartupLocation.CenterOwner; w.Owner = this;
         w.Background = Bg;
         w.KeyDown += delegate (object sender, KeyEventArgs e)
