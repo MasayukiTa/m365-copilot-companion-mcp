@@ -9,6 +9,35 @@ from .file_ops import _validate_path
 _EASYOCR_READERS: dict = {}
 
 
+def _wants_japanese(lang: str) -> bool:
+    return any(part.strip().lower() in ("jpn", "jp", "ja", "japanese")
+               for part in str(lang).replace(",", "+").split("+"))
+
+
+def _has_cjk(text: str) -> bool:
+    """True when the text contains at least one Japanese/CJK character."""
+    for ch in text or "":
+        code = ord(ch)
+        if (0x3040 <= code <= 0x30FF        # hiragana + katakana
+                or 0x4E00 <= code <= 0x9FFF  # CJK ideographs
+                or 0x3400 <= code <= 0x4DBF):
+            return True
+    return False
+
+
+def _tesseract_failed_japanese(text: str, lang: str) -> bool:
+    """True when Japanese was asked for but Tesseract clearly did not read it.
+
+    Without the `jpn` language pack Tesseract does not fail and does not return
+    empty -- it transliterates the glyphs into whatever Latin shapes fit, so a
+    column reading 良/良/注意 comes back as "R/R/aa". That output is confidently
+    wrong, which is worse than empty: it looks like a successful read, so nothing
+    downstream questions it. Treat "Japanese requested but no CJK produced" as a
+    failed read and let the fallback engine handle it.
+    """
+    return _wants_japanese(lang) and not _has_cjk(text)
+
+
 def _easyocr_langs(lang: str) -> list:
     """Map a Tesseract language string ("jpn+eng") to EasyOCR codes (["ja", "en"])."""
     codes = {"jpn": "ja", "jp": "ja", "japanese": "ja",
@@ -137,17 +166,19 @@ def ocr_image(
             text = ""
 
         text = (text or "").strip()
-        if text:
+        if text and not _tesseract_failed_japanese(text, lang):
             return text
 
-        # Tesseract produced nothing. That is ambiguous -- genuinely blank image, or a
-        # script this install cannot read (the usual case for Japanese, whose language
-        # pack is not part of a default install). Retry with EasyOCR so an unreadable
-        # script is not silently reported as "no text".
+        # Either nothing came back, or Japanese was requested and the result contains
+        # no Japanese at all (the language pack is missing and the glyphs were
+        # transliterated into Latin). Both mean "this engine may not have read the
+        # page". Try the fallback, but keep whatever Tesseract produced: an image
+        # that genuinely holds only Latin text also lands here, and its correct
+        # result must not be thrown away just because no Japanese appeared.
         alt = _easyocr_text(p, lang)
-        if alt:
+        if alt and (not text or _has_cjk(alt)):
             return alt
-        return "(no text recognized)"
+        return text or "(no text recognized)"
     except Exception as e:
         return f"[ocr_image error: {type(e).__name__}: {e}]"
 
