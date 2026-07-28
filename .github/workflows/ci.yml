@@ -63,6 +63,7 @@ jobs:
             tools/test_local_loop_ops.py \
             tools/test_local_loop_registration.py \
             tools/test_notify_ops.py \
+            tools/test_ocr_ops.py \
             tools/test_procedural_memory.py \
             tools/test_agent_memory_ops.py \
             tools/test_auth_stats.py \
