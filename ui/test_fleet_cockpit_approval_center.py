@@ -82,3 +82,42 @@ def test_tab_configuration_lives_in_settings_and_header_is_runtime_only():
     assert '_workerChipBorder.Visibility = Visibility.Collapsed;' in SOURCE
     assert 'UpdateWorkerChip(openTabs, liveCap, runningNow);' in SOURCE
     assert '"タブ " + open + "/" + cap' in SOURCE
+
+
+def test_gate_banner_cannot_starve_the_window_of_its_scroller():
+    """The gate banner is docked, so it sits outside the card list's ScrollViewer --
+    the only scroller in the cockpit. Left unbounded it took whatever height it
+    wanted: measured with three pending Skill gates at 1.5x zoom, the health strip
+    and counters had zero height, the list viewport collapsed to nothing, and
+    controls landed at y=1199 on a 1080-tall screen. With no scroller left, an
+    Approve/Deny row pushed past the bottom edge could not be reached at all.
+    """
+    # The banner owns a bounded scroller rather than hosting the cards directly.
+    assert "ScrollViewer _gateScroll;" in SOURCE
+    assert "_gateScroll.Content = _gateCardsPanel;" in SOURCE
+    assert "_gateBanner.Child = _gateScroll;" in SOURCE
+    # ...re-capped every tick, in the units the banner is actually measured in.
+    assert "_gateScroll.MaxHeight = Math.Max(150, usable * 0.45);" in SOURCE
+    assert "(ActualHeight > 0 ? ActualHeight : 760) / zoom" in SOURCE
+
+
+def test_gate_banner_shows_a_context_preview_not_the_whole_manifest():
+    """A Skill gate's context is a multi-line file/hash manifest. Printed in full it
+    pushed the Approve/Deny row below the fold; the complete text stays available
+    in the Approval Center (which scrolls) and as a tooltip."""
+    assert "static string GateContextPreview(string context)" in SOURCE
+    assert "ctxTb.Text = GateContextPreview(context2);" in SOURCE
+    assert "ctxTb.ToolTip = context2;" in SOURCE
+    assert "if (kept.Count == 2) break;" in SOURCE
+
+
+def test_approval_windows_are_sized_against_the_work_area_and_the_zoom():
+    """Both approval surfaces are measured in unscaled units while the cockpit runs
+    at a zoom, so the work area must be divided by that zoom before clamping --
+    otherwise the footer holding Approve/Deny lands past the bottom of the screen."""
+    assert "double ReadUiScale()" in SOURCE
+    assert "Width = Math.Min(600, Math.Max(360, workW / zoom - 60));" in SOURCE
+    assert "Height = Math.Min(620, Math.Max(360, workH / zoom - 60));" in SOURCE
+    assert "w.Width = Math.Min(760, Math.Max(480, waW / scale - 60));" in SOURCE
+    assert "w.Height = Math.Min(720, Math.Max(380, waH / scale - 60));" in SOURCE
+    assert "w.MaxHeight = waH;" in SOURCE
