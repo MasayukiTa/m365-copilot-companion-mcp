@@ -3,6 +3,78 @@ from typing import Optional
 
 from .file_ops import _validate_path
 
+# EasyOCR reader cache. Building a Reader loads the detection + recognition models
+# (a few hundred MB the first time, then cached on disk), which takes ~10-20s, so we
+# keep one per language set for the life of the process.
+_EASYOCR_READERS: dict = {}
+
+
+def _easyocr_langs(lang: str) -> list:
+    """Map a Tesseract language string ("jpn+eng") to EasyOCR codes (["ja", "en"])."""
+    codes = {"jpn": "ja", "jp": "ja", "japanese": "ja",
+             "eng": "en", "en": "en", "english": "en"}
+    langs = [codes.get(part.strip().lower(), part.strip().lower())
+             for part in str(lang).replace(",", "+").split("+") if part.strip()]
+    langs = [l for i, l in enumerate(langs) if l and l not in langs[:i]] or ["en"]
+    if "ja" in langs and "en" not in langs:
+        langs.append("en")   # EasyOCR pairs Japanese with English
+    return langs
+
+
+def _easyocr_image_text(im, lang: str) -> Optional[str]:
+    """OCR an already-open PIL image with EasyOCR. None when unavailable/empty.
+
+    Takes a numpy array rather than a path: EasyOCR loads paths through OpenCV,
+    whose Windows imread returns None for any path containing non-ASCII characters
+    (and then fails deep inside the library). Passing pixels sidesteps that entirely.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    langs = _easyocr_langs(lang)
+    key = "+".join(sorted(langs))
+    try:
+        reader = _EASYOCR_READERS.get(key)
+        if reader is None:
+            import easyocr
+            reader = easyocr.Reader(langs, gpu=False, verbose=False)
+            _EASYOCR_READERS[key] = reader
+        arr = np.array(im.convert("RGB"))
+        parts = reader.readtext(arr, detail=0)
+        text = "\n".join(s for s in (str(x).strip() for x in parts) if s)
+        return text or None
+    except Exception:
+        return None
+
+
+def _easyocr_text(p: Path, lang: str) -> Optional[str]:
+    """OCR with EasyOCR, or None when it is unavailable / finds nothing.
+
+    Why this exists: the Tesseract path needs a per-language .traineddata file, and
+    a stock Windows install ships English only -- so Japanese silently comes back
+    EMPTY rather than as an error. An agent that only sees "" cannot tell "no text
+    here" from "this engine cannot read this script", and in practice it then fills
+    the gap by INFERRING values from surrounding data and reports them as if they
+    were read. EasyOCR bundles its own Japanese model, so it turns that silent gap
+    into an actual reading.
+
+    Images are decoded with Pillow and handed over as a numpy array on purpose:
+    EasyOCR reads paths through OpenCV, whose Windows imread cannot open a path
+    containing non-ASCII characters (it returns None and the call dies deep inside
+    the library). Japanese file names are exactly the case this fallback is for.
+    """
+    try:
+        from PIL import Image as PILImage
+    except ImportError:
+        return None
+    try:
+        with PILImage.open(p) as im:
+            im.load()
+            return _easyocr_image_text(im, lang)
+    except Exception:
+        return None
+
 
 def ocr_image(
     path: str,
@@ -24,10 +96,17 @@ def ocr_image(
             3 = auto with OSD (default), 6 = uniform block of text,
             11 = sparse text, 12 = sparse text with OSD.
 
-    Requires:
-        - Tesseract binary on PATH (Windows: install from
+    Engines:
+        Tesseract runs first. If it is missing, or returns nothing (which is what a
+        default Windows install does for Japanese, because only the English
+        .traineddata ships), EasyOCR runs as a fallback -- it carries its own
+        Japanese model, so no extra language pack is needed. EasyOCR's first call
+        in a process loads its models (~10-20s); later calls reuse them.
+
+    Optional:
+        - Tesseract binary on PATH (fastest path; Windows: install from
           https://github.com/UB-Mannheim/tesseract/wiki and add to PATH)
-        - For Japanese, install the `jpn` language pack (jpn.traineddata)
+        - `jpn.traineddata` to let Tesseract itself handle Japanese
     """
     try:
         try:
@@ -44,21 +123,31 @@ def ocr_image(
         except ImportError:
             return "[ocr_image error: Pillow not installed]"
 
+        text = ""
         try:
             with PILImage.open(p) as im:
                 im.load()
                 config = f"--psm {int(psm)}"
                 text = pytesseract.image_to_string(im, lang=lang, config=config)
         except pytesseract.TesseractNotFoundError:
-            return (
-                "[ocr_image error: Tesseract binary not found on PATH. "
-                "Install from https://github.com/UB-Mannheim/tesseract/wiki "
-                "and ensure tesseract.exe is on PATH.]"
-            )
-        text = text.strip()
-        if not text:
-            return "(no text recognized)"
-        return text
+            text = ""   # no binary at all -- EasyOCR below may still handle it
+        except Exception:
+            # Missing .traineddata for the requested language raises here. Do not give
+            # up yet: EasyOCR carries its own models and is tried next.
+            text = ""
+
+        text = (text or "").strip()
+        if text:
+            return text
+
+        # Tesseract produced nothing. That is ambiguous -- genuinely blank image, or a
+        # script this install cannot read (the usual case for Japanese, whose language
+        # pack is not part of a default install). Retry with EasyOCR so an unreadable
+        # script is not silently reported as "no text".
+        alt = _easyocr_text(p, lang)
+        if alt:
+            return alt
+        return "(no text recognized)"
     except Exception as e:
         return f"[ocr_image error: {type(e).__name__}: {e}]"
 
@@ -112,7 +201,15 @@ def ocr_pdf(path: str, pages: Optional[str] = None, lang: str = "jpn+eng") -> st
             try:
                 text = pytesseract.image_to_string(im, lang=lang).strip()
             except pytesseract.TesseractNotFoundError:
-                return "[ocr_pdf error: Tesseract not on PATH]"
+                text = ""
+            except Exception:
+                text = ""   # e.g. the requested language pack is not installed
+            if not text:
+                # Same reasoning as ocr_image: an empty result from Tesseract does not
+                # distinguish "blank page" from "cannot read this script", and Japanese
+                # is unreadable on a default install. Fall back to EasyOCR, which brings
+                # its own models, before declaring the page empty.
+                text = _easyocr_image_text(im, lang) or ""
             label = first_page + i - 1 if first_page else i
             chunks.append(f"--- page {label} ---\n{text or '(empty)'}")
         return "\n\n".join(chunks)
