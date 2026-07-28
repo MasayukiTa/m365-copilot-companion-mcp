@@ -81,6 +81,25 @@ def default_state_db() -> Path:
     return root / "m365-copilot-companion" / "skills.sqlite3"
 
 
+def _declared_name(skill_md: Path) -> str:
+    """Best-effort `name:` from a SKILL.md whose YAML does not parse.
+
+    Used only to label an INVALID bundle, so a plain line scan is enough (and must
+    never raise): the file is broken by definition -- that is why yaml.safe_load
+    failed. Authors look a Skill up by the name they wrote in the file, which need
+    not match the folder it sits in, so both keys are recorded.
+    """
+    try:
+        head = skill_md.read_text(encoding="utf-8", errors="replace").splitlines()[:12]
+        for line in head:
+            stripped = line.strip()
+            if stripped.startswith("name:"):
+                return stripped[len("name:"):].strip().strip("\"'")
+    except Exception:
+        pass
+    return ""
+
+
 def _split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     if not text.startswith("---"):
         raise SkillError("SKILL.md must start with YAML frontmatter delimited by ---")
@@ -276,7 +295,13 @@ class SkillStore:
         # Later roots override earlier ones: native beats compatibility within a
         # scope, and the user's personal library beats a project collision.
         selected: dict[str, Skill] = {}
-        errors: list[Skill] = []
+        # Bundles that failed to load, as {folder name: reason}. Kept on the store so
+        # callers can SAY why a Skill is missing. Silently skipping them (the previous
+        # behaviour) is the worst outcome for an author: a SKILL.md with, say, an
+        # unquoted ':' in its description is invalid YAML, so the Skill never appears
+        # in any listing and no error is raised anywhere -- it just does not exist,
+        # with nothing to debug.
+        self.invalid: dict[str, str] = {}
         for scope, root in self.roots():
             if not root.is_dir():
                 continue
@@ -287,14 +312,37 @@ class SkillStore:
                     selected[skill.name] = Skill(**{
                         **skill.__dict__, "provenance": provenance, "trust": trust
                     })
-                except SkillError:
-                    # Invalid bundles are not partially exposed to the model.
+                except SkillError as exc:
+                    # The bundle is never partially exposed to the model, but the
+                    # reason is recorded so a human can be told what to fix. Record it
+                    # under the folder name AND under the `name:` the file declares:
+                    # a broken bundle is usually looked up by the name its author
+                    # wrote, which need not match the folder it sits in.
+                    self.invalid[skill_md.parent.name] = str(exc)
+                    declared = _declared_name(skill_md)
+                    if declared and declared != skill_md.parent.name:
+                        self.invalid[declared] = str(exc)
                     continue
         return sorted(selected.values(), key=lambda s: s.name)
+
+    def invalid_bundles(self) -> dict[str, str]:
+        """Folder name -> why its SKILL.md could not be loaded (after discover())."""
+        if not hasattr(self, "invalid"):
+            self.discover()
+        return dict(self.invalid)
 
     def get(self, name: str) -> Skill:
         match = next((s for s in self.discover() if s.name == name), None)
         if not match:
+            # A folder of that name that failed to parse is the likeliest reason a
+            # Skill "does not exist": say so instead of the bare unknown-name error,
+            # which sends the author looking in the wrong place.
+            reason = self.invalid_bundles().get(name)
+            if reason:
+                raise SkillError(
+                    f"Skill '{name}' exists on disk but its SKILL.md could not be "
+                    f"loaded: {reason}"
+                )
             raise SkillError(f"unknown Skill: {name}")
         return match
 

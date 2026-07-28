@@ -122,6 +122,7 @@ jobs:
             relay/test_project_memory.py \
             relay/test_recycle.py \
             relay/test_refuter.py \
+            relay/test_skill_invalid_reporting.py \
             relay/test_refuter_memory.py \
             relay/test_relay_loop.py \
             relay/test_repo_map.py \
