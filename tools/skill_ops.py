@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Any
 from pathlib import Path
 
 from relay.skills import SkillError, SkillStore
@@ -19,11 +20,47 @@ def _store() -> SkillStore:
 
 
 def skill_list() -> str:
-    """List Skill metadata and trust state without loading instruction bodies."""
+    """List Skill metadata and trust state without loading instruction bodies.
+
+    Also reports bundles that FAILED to load, under "invalid". A malformed SKILL.md
+    used to be skipped in silence, so a Skill that had just been written simply never
+    appeared and there was nothing to debug -- the commonest cause being an unquoted
+    ':' in the description, which makes the YAML frontmatter invalid. The reason is
+    surfaced here (folder name + parser message); the bundle's contents stay
+    unexposed, so an untrusted body still cannot reach the model through this path.
+    """
     try:
-        return json.dumps(_store().list_metadata(model_safe=True), ensure_ascii=False, indent=2)
+        store = _store()
+        payload: Any = store.list_metadata(model_safe=True)
+        try:
+            invalid = store.invalid_bundles()
+        except Exception:
+            invalid = {}
+        if invalid:
+            payload = {
+                "skills": payload,
+                "invalid": [
+                    {"folder": folder, "error": reason, "hint": _invalid_hint(reason)}
+                    for folder, reason in sorted(invalid.items())
+                ],
+            }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
     except Exception as exc:
         return f"[skill_list error: {type(exc).__name__}: {exc}]"
+
+
+def _invalid_hint(reason: str) -> str:
+    """Turn a parser message into the concrete edit that fixes it."""
+    text = (reason or "").lower()
+    if "yaml" in text or "mapping values" in text:
+        return ("SKILL.md の frontmatter が YAML として壊れています。"
+                "description に ':' や '#' が含まれる場合は "
+                'description: "..." のように引用符で囲んでください。')
+    if "frontmatter" in text:
+        return "SKILL.md の先頭を --- で開き、--- で閉じてください。"
+    if "no SKILL.md" in reason:
+        return "フォルダ直下に SKILL.md を置いてください。"
+    return "SKILL.md を修正してから再度 skill_list を実行してください。"
 
 
 def skill_match(text: str) -> str:
