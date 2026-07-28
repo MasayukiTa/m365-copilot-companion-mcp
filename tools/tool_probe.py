@@ -58,6 +58,60 @@ PROBE_OK_TOKEN = "===TOOLPROBE_OK==="
 PROBE_KINDS = ("answer", "consent_card", "canned_fallback", "timeout",
                "agent_unreachable", "error", "starting", "checking")
 
+# ---------------------------------------------------------------------------
+# Probe instruction text.
+#
+# This used to be a single constant in bridge/copilot_bridge.py, re-sent BYTE-FOR-BYTE
+# into the SAME long-lived bridge conversation every probe interval, indefinitely. That
+# is the identical-nudge-repetition disease already fixed for the implementer's CONTINUE
+# loop (relay/relay_fleet.py) and for the refuter's side chat (relay/refuter.py's
+# _next_refuter_nudge) -- but never for this third caller. Observed result: Copilot
+# eventually recognised the loop and answered "結果は変わりません。このループは続きません
+# ... 完了トークンは出力しません", deliberately withholding PROBE_OK_TOKEN. The probe then
+# classified its own poisoned conversation as kind="error" and the cockpit's Tool dot went
+# red while every other health check, and doctor.bat, reported the stack fully healthy.
+#
+# Unlike the refuter's bounded retry (2 nudges), this probe repeats forever, so rotating a
+# couple of phrasings is not enough on its own -- consecutive probes would still cycle a
+# short fixed pattern. Each instruction therefore also carries its own sequence number, so
+# no two probe turns in a conversation are ever byte-identical.
+#
+# Kept here rather than in the bridge because this module is stdlib-only and import-safe
+# (see the module docstring), which is what lets the text be unit-tested without paying for
+# the bridge's Playwright import chain -- the same reason classify_probe_reply lives here.
+PROBE_INSTRUCTION_VARIANTS = (
+    "システム自己診断です。call_tool 経由で list_directory を使い {dir} 直下の項目数を"
+    "数えてください。",
+    "接続確認です。call_tool から list_directory を呼び出し、{dir} 直下にある項目の"
+    "総数を報告してください。",
+    "動作確認を行います。call_tool 経由の list_directory で {dir} 直下を一覧し、"
+    "その件数を答えてください。",
+)
+
+_PROBE_INSTRUCTION_TAIL = (
+    "list_directory の呼び出しに成功した場合のみ、回答の最後の行に次のトークンだけを"
+    "正確に出力してください: " + PROBE_OK_TOKEN + "\n"
+    "ツールが呼び出せない、接続確認が必要、エラーが起きた等、成功以外の場合はこの"
+    "トークンを絶対に出力しないでください。"
+)
+
+
+def next_probe_instruction(count: int, desktop_dir: str) -> str:
+    """Instruction text for probe number `count` (1-based). Pure and deterministic.
+
+    Rotates the opening sentence and appends the sequence number, so repeated probes in
+    one conversation are never byte-identical and never settle into a short fixed cycle.
+    """
+    try:
+        n = int(count)
+    except (TypeError, ValueError):
+        n = 1
+    if n < 1:
+        n = 1
+    head = PROBE_INSTRUCTION_VARIANTS[(n - 1) % len(PROBE_INSTRUCTION_VARIANTS)]
+    return head.format(dir=desktop_dir) + "\n" + _PROBE_INSTRUCTION_TAIL + \
+        "\n（自己診断 #" + str(n) + "）"
+
 # Where the cockpit / /health can read the same summary without driving the browser.
 _PROBE_FILE = Path(__file__).resolve().parent.parent / ".fleet" / "tool_probe.json"
 

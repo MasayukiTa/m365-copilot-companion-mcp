@@ -219,3 +219,43 @@ def test_get_summary_never_raises_on_unreadable_path(monkeypatch):
     monkeypatch.setattr(tool_probe, "_PROBE_FILE", Path("\x00bad\x00path\x00tool_probe.json"))
     summary = tool_probe.get_summary()  # must not raise
     assert summary == {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None}
+
+
+# --- probe instruction must never repeat byte-for-byte ------------------------
+# The bridge re-sent one constant instruction into the same long-lived conversation
+# every probe interval, forever. Copilot recognised the loop and answered "結果は
+# 変わりません。このループは続きません ... 完了トークンは出力しません", withholding
+# PROBE_OK_TOKEN on purpose. The probe then classified its own poisoned conversation
+# as an error and the cockpit's Tool dot went red while doctor.bat reported the whole
+# stack healthy. Same defect class as relay/relay_fleet.py's CONTINUE nudge and
+# relay/refuter.py's _next_refuter_nudge -- this was the third, uncovered caller.
+
+DESK = "C:/Users/example/Desktop"
+
+
+def test_consecutive_probe_instructions_are_never_identical():
+    seen = [tool_probe.next_probe_instruction(i, DESK) for i in range(1, 51)]
+    for a, b in zip(seen, seen[1:]):
+        assert a != b
+    assert len(set(seen)) == len(seen), "instructions must not repeat at all, not just consecutively"
+
+
+def test_probe_instruction_keeps_the_contract_every_time():
+    """Varying the wording must not drop what the classifier depends on."""
+    for i in (1, 2, 3, 4, 17, 500):
+        text = tool_probe.next_probe_instruction(i, DESK)
+        assert tool_probe.PROBE_OK_TOKEN in text
+        assert "list_directory" in text
+        assert DESK in text
+        assert "絶対に出力しないでください" in text
+
+
+def test_probe_instruction_rotates_its_opening_sentence():
+    heads = {tool_probe.next_probe_instruction(i, DESK).split("\n")[0] for i in range(1, 4)}
+    assert len(heads) == len(tool_probe.PROBE_INSTRUCTION_VARIANTS)
+
+
+def test_probe_instruction_tolerates_a_bad_counter():
+    for bad in (0, -3, None, "x"):
+        text = tool_probe.next_probe_instruction(bad, DESK)
+        assert tool_probe.PROBE_OK_TOKEN in text
