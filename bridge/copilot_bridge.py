@@ -4045,16 +4045,12 @@ _TOOL_PROBE_DESKTOP_DIR = _resolve_desktop_dir()
 # to emit tool_probe.PROBE_OK_TOKEN as the LAST line ONLY on success, so a canned/no-connector
 # reply or a consent card (neither of which would emit the token) is distinguishable from a
 # genuine tool-backed answer by tools.tool_probe.classify_probe_reply.
-TOOL_PROBE_INSTRUCTION = (
-    "システム自己診断です。call_tool 経由で list_directory を使い "
-    + _TOOL_PROBE_DESKTOP_DIR + " 直下の項目数を数えてください。\n"
-    "list_directory の呼び出しに成功した場合のみ、回答の最後の行に次のトークンだけを"
-    "正確に出力してください: " + tool_probe.PROBE_OK_TOKEN + "\n"
-    "ツールが呼び出せない、接続確認が必要、エラーが起きた等、成功以外の場合はこの"
-    "トークンを絶対に出力しないでください。"
-)
+# Text for the FIRST probe. Every subsequent probe varies -- see tool_probe.
+# next_probe_instruction for why re-sending one constant forever poisoned the conversation.
+TOOL_PROBE_INSTRUCTION = tool_probe.next_probe_instruction(1, _TOOL_PROBE_DESKTOP_DIR)
 
 _TOOL_PROBE_TIMER = None  # the pending threading.Timer, so _schedule_tool_probe can re-arm it
+_TOOL_PROBE_SEQ = 0       # probes issued this process; feeds the varying instruction text
 
 
 def _do_tool_probe_turn():
@@ -4073,8 +4069,10 @@ def _do_tool_probe_turn():
         agent_loaded = False
     if not agent_loaded:
         return False, "", False
+    global _TOOL_PROBE_SEQ
+    _TOOL_PROBE_SEQ += 1
     try:
-        DRIVER.send(TOOL_PROBE_INSTRUCTION)
+        DRIVER.send(tool_probe.next_probe_instruction(_TOOL_PROBE_SEQ, _TOOL_PROBE_DESKTOP_DIR))
         idle_ok = DRIVER.wait_for_idle(timeout_s=TOOL_PROBE_TIMEOUT_SEC)
         reply = DRIVER.read_last_response() or ""
         return True, reply, (not idle_ok)
