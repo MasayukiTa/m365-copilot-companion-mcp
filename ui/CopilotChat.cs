@@ -222,7 +222,11 @@ class ChatWindow : Window
     public ChatWindow()
     {
         Title = "Copilot — native (WPF, no JS)";
-        Width = 1120; Height = 780;
+        // Clamp to the work area rather than trusting a fixed size: 1120x780 overflows a
+        // shorter desktop (and the UI scale multiplies it), leaving the composer and its
+        // send button off-screen. SystemParameters are already device-independent units.
+        Width = Math.Min(1120, Math.Max(760, SystemParameters.WorkArea.Width - 80));
+        Height = Math.Min(780, Math.Max(540, SystemParameters.WorkArea.Height - 80));
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         SetRef(this, BackgroundProperty, "Bg");
         ApplyTheme();
