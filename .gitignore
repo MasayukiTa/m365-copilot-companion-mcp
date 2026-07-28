@@ -197,3 +197,6 @@ _attic/
 
 # LOCAL_LOOP SQLite control plane and artifacts are machine-local runtime state.
 /.jobs/
+
+# Review run dumps are per-run local evidence, not product code.
+/review_artifacts/
