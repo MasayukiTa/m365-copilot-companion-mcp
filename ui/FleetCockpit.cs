@@ -8190,6 +8190,14 @@ class CockpitWindow : Window
             _histSearchBox.TextChanged += delegate { OnHistSearchChanged(); };
         }
         _histSearchBox.Background = BtnBg; _histSearchBox.Foreground = Fg; _histSearchBox.BorderBrush = Border;
+        // The box is cached so focus and caret survive a re-filter, but the wrapper around it is
+        // not: this method runs again whenever the list re-realizes the header row (virtualization
+        // recycling, DataContext change), and handing an element that still has a logical parent
+        // to a second Border throws InvalidOperationException. That escapes through a binding
+        // converter, where nothing catches it, and WPF aborts the process -- the cockpit was
+        // dying mid-run. Disconnect from the previous wrapper first.
+        var prevWrap = LogicalTreeHelper.GetParent(_histSearchBox) as Decorator;
+        if (prevWrap != null) prevWrap.Child = null;
         var searchWrap = new Border { Child = _histSearchBox, Margin = new Thickness(8, 0, 8, 0) };
         DockPanel.SetDock(searchWrap, Dock.Right);
         head.Children.Add(searchWrap);

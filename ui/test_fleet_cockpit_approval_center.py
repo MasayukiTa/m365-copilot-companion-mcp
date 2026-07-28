@@ -121,3 +121,18 @@ def test_approval_windows_are_sized_against_the_work_area_and_the_zoom():
     assert "w.Width = Math.Min(760, Math.Max(480, waW / scale - 60));" in SOURCE
     assert "w.Height = Math.Min(720, Math.Max(380, waH / scale - 60));" in SOURCE
     assert "w.MaxHeight = waH;" in SOURCE
+
+
+def test_cached_history_search_box_is_detached_before_re_parenting():
+    """HistoryHeader() runs again whenever the list re-realizes the header row, but
+    _histSearchBox is cached so focus and caret survive a re-filter. Wrapping a
+    still-parented element in a fresh Border throws InvalidOperationException, and
+    because the call sits inside a binding converter nothing catches it -- WPF
+    aborted the process and the cockpit died mid-run (three times in one session).
+    """
+    assert "LogicalTreeHelper.GetParent(_histSearchBox) as Decorator" in SOURCE
+    assert "if (prevWrap != null) prevWrap.Child = null;" in SOURCE
+    # The detach must come before the new wrapper is built, not after.
+    detach = SOURCE.index("prevWrap.Child = null;")
+    rewrap = SOURCE.index("new Border { Child = _histSearchBox")
+    assert detach < rewrap
