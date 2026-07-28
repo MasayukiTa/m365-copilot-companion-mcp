@@ -1451,9 +1451,42 @@ class CockpitWindow : Window
     // monitor's scale (the "comfortable size" the user is used to) and compute the per-monitor effective
     // scale now. If a scale was already persisted (manual OR auto, from either app) honor it and just
     // reflect it on the live transform. Guarded by _uiScaleLoaded so a chosen scale is never overridden.
+    // Windows API used to break out of an inherited-hidden startup state (see ForceVisibleOnce).
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    static extern bool RedrawWindow(IntPtr hWnd, IntPtr lprc, IntPtr hrgn, uint flags);
+
+    // The daily launcher chain is fully windowless: a desktop shortcut runs
+    // scripts\start_all_hidden.vbs, which runs start_all.ps1 with -WindowStyle Hidden
+    // (SW_HIDE), which in turn starts this app. A process started from an SW_HIDE parent
+    // INHERITS that "hidden" show-state through STARTUPINFO.wShowWindow, so WPF creates
+    // the HWND without a proper first paint: DWM never gets a composed surface and the
+    // window renders as black / stale rectangles on screen -- even though the visual tree
+    // itself is fine (PrintWindow of the same HWND returns the correct content).
+    // Forcing SW_SHOW + a full redraw once, right after the HWND exists, discards the
+    // inherited state and makes the window paint normally. Cheap, idempotent, and a no-op
+    // when the app was launched normally (already visible).
+    void ForceVisibleOnce()
+    {
+        try
+        {
+            IntPtr h = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+            if (h == IntPtr.Zero) return;
+            const int SW_SHOW = 5;
+            const uint RDW_INVALIDATE = 0x0001, RDW_ERASE = 0x0004,
+                       RDW_ALLCHILDREN = 0x0080, RDW_UPDATENOW = 0x0100;
+            ShowWindow(h, SW_SHOW);
+            RedrawWindow(h, IntPtr.Zero, IntPtr.Zero,
+                         RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        }
+        catch { }
+    }
+
     protected override void OnSourceInitialized(EventArgs e)
     {
         base.OnSourceInitialized(e);
+        ForceVisibleOnce();
         try
         {
             double monitorScale = CurrentMonitorScale();
