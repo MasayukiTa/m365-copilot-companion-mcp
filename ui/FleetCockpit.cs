@@ -263,21 +263,20 @@ class ApprovalPromptWindow : Window
         _context = new TextBlock { Foreground = Muted, FontFamily = new FontFamily(Theme.CodeFont),
             FontSize = Theme.FsLog, TextWrapping = TextWrapping.Wrap };
         detailBox.Child = _context;
-        // The raw gate detail (digest, file list, the untrusted instruction preview) can
-        // run to hundreds of lines. Left expanded it pushes the approval-policy control
-        // far below the fold, where nobody finds it -- the decision itself is the short
-        // part. Collapse it by default and let anyone who wants the evidence open it.
+        // Foldable, but OPEN by default: this is the evidence for the decision, and a
+        // gate that hides what it is asking about invites approving it unseen. It runs
+        // long, so it is placed after the policy control rather than before it (see
+        // where this is added to `body`), which keeps both reachable without scrolling.
         _detailExpander = new Expander
         {
-            Header = L("詳細を表示（対象・ハッシュ・指示プレビュー）",
-                       "Show details (target, digest, instruction preview)"),
-            IsExpanded = false,
+            Header = L("承認対象の詳細（対象・ハッシュ・指示プレビュー）",
+                       "What you are approving (target, digest, instruction preview)"),
+            IsExpanded = true,
             Foreground = Muted,
             FontSize = Theme.FsMeta,
             Margin = new Thickness(0, 12, 0, 0),
             Content = detailBox,
         };
-        decisionCol.Children.Add(_detailExpander);
         decisionCard.Child = decisionCol; body.Children.Add(decisionCard);
 
         var policyBox = new Border { Background = SurfaceSubtle, BorderBrush = Line, BorderThickness = new Thickness(1),
@@ -293,6 +292,11 @@ class ApprovalPromptWindow : Window
         _policyHelp = new TextBlock { Foreground = Muted, FontSize = Theme.FsMeta, TextWrapping = TextWrapping.Wrap,
             Margin = new Thickness(0, 7, 0, 0) }; policyCol.Children.Add(_policyHelp);
         policyBox.Child = policyCol; body.Children.Add(policyBox);
+        // Evidence goes LAST and starts OPEN. Collapsing what is being approved would
+        // invite approving it unseen, which defeats the gate; the policy control sits
+        // above it instead, so it is visible without scrolling either way. Anyone who
+        // has already read the preview can fold it away.
+        body.Children.Add(_detailExpander);
         scroll.Content = body; root.Children.Add(scroll); Content = root;
         SelectPolicy(ReadPolicy());
     }
