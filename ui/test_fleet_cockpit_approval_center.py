@@ -150,3 +150,14 @@ def test_autoscale_toggle_is_painted_when_it_is_built():
     ret = body.index("return group;")
     assert paint < ret, "must paint before returning, not only from the Click handler"
     assert body.index("UpdateAutoEnabled();", paint) < ret
+
+
+def test_gate_banner_lives_in_the_run_column_not_across_the_window():
+    """Docked on the root DockPanel the banner spanned the whole window, so once the
+    timeline spine column opened the banner's box overhung it -- crossing the spine's
+    frame instead of lining up with the cards it refers to."""
+    assert "col1.Children.Add(BuildGateBanner());" in SOURCE
+    assert "root.Children.Add(BuildGateBanner());" not in SOURCE
+    # ...on the same 18px gutter the toolbar host and the card list use.
+    assert "_gateBanner.Margin = new Thickness(18, 6, 18, 6);" in SOURCE
+    assert "_pinnedToolbarHost.Padding = new Thickness(18, 6, 18, 0);" in SOURCE
