@@ -117,7 +117,18 @@ class ApprovalPromptWindow : Window
         LoadUiPreferences();
         ApplyThemeTokens();
         Title = L("承認が必要です", "Approval required");
-        Width = 600; Height = 620; MinWidth = 500; MinHeight = 480;
+        // Size against the WORK AREA, not a fixed number. 620 exceeded the desktop on a
+        // short screen (and the UI scale multiplies it further), leaving the footer --
+        // the Approve/Deny buttons -- off-screen with no way to reach them. WPF's
+        // SystemParameters are already in device-independent units, which is the same
+        // space Width/Height use, so no DPI conversion is needed here.
+        double workW = SystemParameters.WorkArea.Width;
+        double workH = SystemParameters.WorkArea.Height;
+        Width = Math.Min(600, Math.Max(360, workW - 80));
+        Height = Math.Min(620, Math.Max(360, workH - 80));
+        MinWidth = Math.Min(500, Width);
+        MinHeight = Math.Min(480, Height);
+        MaxHeight = workH;   // never taller than the desktop, whatever the content asks for
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         Background = Bg; ShowInTaskbar = true; FontFamily = new FontFamily(Theme.UiFont);
         try
@@ -425,6 +436,14 @@ class ApprovalPromptWindow : Window
             catch { }
         }
         _current = gate;
+        if (gate != null)
+        {
+            // A request was actually shown, so this window did its job. Any later empty
+            // pass is the normal end of the queue -- typically the user having just
+            // answered -- and must close without comment. Leaving the flag set made
+            // approving pop "already handled" and kept the window up until dismissed.
+            _openedFromToast = false;
+        }
         if (gate == null)
         {
             // Nothing left to decide. Closing in silence is indistinguishable from the
@@ -734,7 +753,11 @@ class CockpitWindow : Window
         LoadSettings();
         ApplyThemeBrushes();
         Title = "Fleet Cockpit";   // also lets the taskbar / alt-tab / automation name this window
-        Width = 1080; Height = 760;
+        // Clamp to the work area: a fixed 1080x760 overflows a shorter desktop (and the
+        // UI scale multiplies it), pushing the footer off-screen. SystemParameters are
+        // in device-independent units, the same space Width/Height use.
+        Width = Math.Min(1080, Math.Max(720, SystemParameters.WorkArea.Width - 80));
+        Height = Math.Min(760, Math.Max(520, SystemParameters.WorkArea.Height - 80));
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         BuildChrome();
         // ── UI-scale shortcuts (window level) ────────────────────────────────────
