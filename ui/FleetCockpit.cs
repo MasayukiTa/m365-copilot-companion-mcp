@@ -86,6 +86,7 @@ class ApprovalPromptWindow : Window
     TextBlock _kind, _question, _context, _count, _policyHelp;
     Button _approve, _deny;
     ComboBox _policy;
+    Expander _detailExpander;
     DispatcherTimer _timer;
     bool _changingPolicy;
     bool _dark = true;
@@ -104,6 +105,12 @@ class ApprovalPromptWindow : Window
             return Path.Combine(app, "copilot-bridge", "settings.txt");
         }
     }
+
+    // True until the FIRST LoadNext() completes. The prompt is normally launched by
+    // clicking a toast, so an empty gate list on that first pass means "the thing you
+    // just clicked is already handled" and deserves a word. Later passes come from the
+    // 2s poll, where closing quietly is correct -- the user watched it happen.
+    bool _openedFromToast = true;
 
     public ApprovalPromptWindow(string initialGatePath)
     {
@@ -240,8 +247,10 @@ class ApprovalPromptWindow : Window
         var scroll = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
             HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
         var body = new StackPanel { Margin = new Thickness(Theme.PadApp) };
+        // Uniform border on purpose. A thicker left edge reads as a sticky-note accent
+        // stripe; the card already carries the warning colour, which is what marks it.
         var decisionCard = new Border { Background = Surface, BorderBrush = Warning,
-            BorderThickness = new Thickness(Theme.RailW, 1, 1, 1), CornerRadius = new CornerRadius(Theme.RadCard),
+            BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(Theme.RadCard),
             Padding = new Thickness(14, 12, 14, 12) };
         var decisionCol = new StackPanel();
         _kind = new TextBlock { Foreground = Muted, FontSize = Theme.FsMeta, FontWeight = FontWeights.SemiBold };
@@ -250,10 +259,26 @@ class ApprovalPromptWindow : Window
             TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 0) };
         decisionCol.Children.Add(_question);
         var detailBox = new Border { Background = SurfaceSubtle, BorderBrush = Line, BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(Theme.RadSmall), Padding = new Thickness(12), Margin = new Thickness(0, 12, 0, 0) };
+            CornerRadius = new CornerRadius(Theme.RadSmall), Padding = new Thickness(12), Margin = new Thickness(0, 8, 0, 0) };
         _context = new TextBlock { Foreground = Muted, FontFamily = new FontFamily(Theme.CodeFont),
             FontSize = Theme.FsLog, TextWrapping = TextWrapping.Wrap };
-        detailBox.Child = _context; decisionCol.Children.Add(detailBox); decisionCard.Child = decisionCol; body.Children.Add(decisionCard);
+        detailBox.Child = _context;
+        // The raw gate detail (digest, file list, the untrusted instruction preview) can
+        // run to hundreds of lines. Left expanded it pushes the approval-policy control
+        // far below the fold, where nobody finds it -- the decision itself is the short
+        // part. Collapse it by default and let anyone who wants the evidence open it.
+        _detailExpander = new Expander
+        {
+            Header = L("詳細を表示（対象・ハッシュ・指示プレビュー）",
+                       "Show details (target, digest, instruction preview)"),
+            IsExpanded = false,
+            Foreground = Muted,
+            FontSize = Theme.FsMeta,
+            Margin = new Thickness(0, 12, 0, 0),
+            Content = detailBox,
+        };
+        decisionCol.Children.Add(_detailExpander);
+        decisionCard.Child = decisionCol; body.Children.Add(decisionCard);
 
         var policyBox = new Border { Background = SurfaceSubtle, BorderBrush = Line, BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(Theme.RadCard), Padding = new Thickness(14, 12, 14, 12), Margin = new Thickness(0, Theme.SectionGap, 0, 0) };
@@ -396,7 +421,29 @@ class ApprovalPromptWindow : Window
             catch { }
         }
         _current = gate;
-        if (gate == null) { Close(); return; }
+        if (gate == null)
+        {
+            // Nothing left to decide. Closing in silence is indistinguishable from the
+            // window failing to open: the user clicks the toast, a window flashes (or
+            // does not appear at all) and nothing happens. That is exactly what a
+            // request already answered elsewhere looks like -- e.g. approved from the
+            // console, or handled on a second click. Say so once, then close.
+            if (_openedFromToast)
+            {
+                _openedFromToast = false;
+                try
+                {
+                    MessageBox.Show(this,
+                        L("この承認はすでに処理済みです。ほかに待機中の承認はありません。",
+                          "This request has already been handled. No approvals are waiting."),
+                        L("承認は不要です", "Nothing to approve"),
+                        MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+                catch { }
+            }
+            Close();
+            return;
+        }
         _currentPath = S(gate, "path");
         string hay = (S(gate, "token") + " " + S(gate, "context") + " " + S(gate, "question")).ToLowerInvariant();
         bool skill = hay.Contains("gate_skill_") || hay.Contains("skill approval");
@@ -5815,7 +5862,9 @@ class CockpitWindow : Window
         _gateBanner = new Border();
         _gateBanner.Visibility = Visibility.Collapsed;
         _gateBanner.CornerRadius = new CornerRadius(10);
-        _gateBanner.BorderThickness = new Thickness(3, 1, 1, 1);
+        // Uniform, not a thicker left edge: a one-sided stripe reads as sticky-note
+        // decoration. The banner's border colour already carries the urgency.
+        _gateBanner.BorderThickness = new Thickness(1);
         _gateBanner.Padding = new Thickness(14, 10, 12, 10);
         _gateBanner.Margin = new Thickness(26, 0, 18, 6);
         DockPanel.SetDock(_gateBanner, Dock.Top);
@@ -6168,7 +6217,9 @@ class CockpitWindow : Window
         var card = new Border();
         card.Background = CardBg;
         card.BorderBrush = actionable ? Theme.Br(expired ? Theme.Danger(_dark) : Theme.Warning(_dark)) : Border;
-        card.BorderThickness = new Thickness(actionable ? 3 : 1, 1, 1, 1);
+        // Actionable cards are marked by border COLOUR, not by a fatter left edge --
+        // a one-sided stripe reads as sticky-note decoration.
+        card.BorderThickness = new Thickness(1);
         card.CornerRadius = new CornerRadius(8); card.Padding = new Thickness(14, 12, 14, 12);
         card.Margin = new Thickness(0, 0, 0, 10);
         var col = new StackPanel();
@@ -6445,7 +6496,7 @@ class CockpitWindow : Window
         if (_mtBanner != null)
         {
             _mtBanner.Background = CardBg;
-            _mtBanner.BorderThickness = new Thickness(3, 1, 1, 1);
+            _mtBanner.BorderThickness = new Thickness(1);
             _mtBanner.BorderBrush = warn;
             if (_mtBannerLbl != null) _mtBannerLbl.Foreground = Fg;
         }
@@ -6454,7 +6505,9 @@ class CockpitWindow : Window
         if (_gateBanner != null)
         {
             _gateBanner.Background = CardBg;
-            _gateBanner.BorderThickness = new Thickness(3, 1, 1, 1);
+            // Uniform, not a thicker left edge: a one-sided stripe reads as sticky-note
+        // decoration. The banner's border colour already carries the urgency.
+        _gateBanner.BorderThickness = new Thickness(1);
             _gateBanner.BorderBrush = warn;
             // Force a full rebuild on theme change so buttons repaint correctly.
             _gateSig = "";
@@ -6462,7 +6515,7 @@ class CockpitWindow : Window
         if (_capBanner != null)
         {
             _capBanner.Background = CardBg;
-            _capBanner.BorderThickness = new Thickness(3, 1, 1, 1);
+            _capBanner.BorderThickness = new Thickness(1);
             _capBanner.BorderBrush = warn;
             if (_capBannerLbl != null) _capBannerLbl.Foreground = Fg;
         }
