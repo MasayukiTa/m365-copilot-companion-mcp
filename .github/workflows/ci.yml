@@ -84,6 +84,8 @@ jobs:
             bridge/test_session_store.py \
             bridge/test_skills_bridge.py \
             ui/test_copilot_chat_p2c.py \
+            bridge/test_bridge_unlock.py \
+            ui/test_copilot_chat_conv_lifecycle.py \
             ui/test_fleet_cockpit_approval_center.py \
             bench/gaia/test_run_pipeline.py \
             bench/test_local_review_transport.py \

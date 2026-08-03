@@ -98,6 +98,7 @@ class ChatWindow : Window
     string _fleetStripSig = null;         // last-rendered signature; skip rebuild when unchanged
     // ── sidebar collapse/expand (Codex/Claude-desktop style) ──
     bool _sidebarCollapsed = false;
+    string _lastOpenId = "";             // conversation to reopen on next launch (see LoadAll)
     Border _sideBorderRef;               // the sidebar Border in root Grid col0
     Grid _rootGrid;                      // root two-column Grid
     Button _sideToggleBtn;              // hamburger toggle in main header far-left
@@ -2481,7 +2482,8 @@ class ChatWindow : Window
         var contentRow = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
         if (isPinned)
         {
-            var pinMark = new TextBlock { Text = "\uE718", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 11, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 5, 0) };            SetRef(pinMark, TextBlock.ForegroundProperty, "Muted");
+            var pinMark = new TextBlock { Text = "\uE718", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 11, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 5, 0) };
+            SetRef(pinMark, TextBlock.ForegroundProperty, "Muted");
             contentRow.Children.Add(pinMark);
         }
         var lbl = new TextBlock
@@ -2559,7 +2561,7 @@ class ChatWindow : Window
         trash.Click += delegate
         {
             if ((Keyboard.Modifiers & ModifierKeys.Shift) != 0) ShowDeleteBanner(cc);
-            else ExecuteDelete(cc, 1);
+            else { ExecuteDelete(cc, 1); ToastUndo(); }
         };
         bool actionable = cc.Messages.Count > 0 || !string.IsNullOrEmpty(cc.ConvUrl)
                           || !string.IsNullOrEmpty(cc.Title);
@@ -2928,6 +2930,10 @@ class ChatWindow : Window
     void OpenConversation(Conversation c)
     {
         _conv = c;
+        // Persist which conversation is open NOW. SaveSettings only ran on theme / language /
+        // zoom / sidebar changes, so nothing recorded the active conversation and the restore
+        // on next launch had nothing to restore.
+        SaveSettings();
         _messages.Children.Clear();
         // FIRST: the disk transcript. Reading the .jsonl is instant and works regardless of which
         // agent the bridge is currently on -- this is what actually makes a past FLEET chat openable.
@@ -2983,17 +2989,67 @@ class ChatWindow : Window
             }) { IsBackground = true }.Start();
     }
 
+    // A plain click on the trash used to delete the file immediately, with no confirmation
+    // and nothing to undo -- one stray click on a small icon in a list of hundreds and the
+    // record was gone. A confirmation dialog would be worse here (it is in the way of exactly
+    // the bulk tidy-up the list invites), so the delete is deferred instead: the row leaves at
+    // once and the file is removed only once the undo window closes.
+    static readonly TimeSpan UndoWindow = TimeSpan.FromSeconds(8);
+    Conversation _pendingUndo;                 // removed from the list, file not yet deleted
+    int _pendingUndoIndex = -1;
+    DispatcherTimer _undoTimer;
+
+    void CommitPendingDelete()
+    {
+        var c = _pendingUndo;
+        _pendingUndo = null; _pendingUndoIndex = -1;
+        if (_undoTimer != null) { _undoTimer.Stop(); _undoTimer = null; }
+        if (c == null) return;
+        try { var p = Path_(c.Id); if (File.Exists(p)) File.Delete(p); } catch { }
+    }
+
+    void UndoPendingDelete()
+    {
+        var c = _pendingUndo;
+        if (c == null) return;
+        _pendingUndo = null;
+        if (_undoTimer != null) { _undoTimer.Stop(); _undoTimer = null; }
+        int at = _pendingUndoIndex;
+        if (at < 0 || at > _all.Count) at = _all.Count;
+        _all.Insert(at, c);
+        _pendingUndoIndex = -1;
+        OpenConversation(c);
+        RefreshConvList();
+        Toast(_lang == 0 ? "削除を取り消しました。" : "Deletion undone.");
+    }
+
     void DeleteLocal(Conversation c)
     {
-        try { var p = Path_(c.Id); if (File.Exists(p)) File.Delete(p); } catch { }
+        // Any earlier pending delete is now settled -- only one can be undone at a time.
+        CommitPendingDelete();
         // Clean up sidebar state for the deleted conversation.
         bool _sc = _pinned.Remove(c.Id) | _archived.Remove(c.Id) | _forcedToday.Remove(c.Id);
         if (_sc) SaveSidebarState();
         if (_renamingId == c.Id) _renamingId = null;   // clear any in-flight rename of the deleted conv
+        // Remember where it sat so the next conversation opened is the NEIGHBOUR, not
+        // whatever happens to be first on disk. Deleting several in a row otherwise threw
+        // the user back to the top of the list every time.
+        int was = _all.IndexOf(c);
         _all.Remove(c);
+        // Hold the record for UndoWindow before touching the file.
+        _pendingUndo = c; _pendingUndoIndex = was;
+        _undoTimer = new DispatcherTimer { Interval = UndoWindow };
+        _undoTimer.Tick += delegate { CommitPendingDelete(); };
+        _undoTimer.Start();
         if (_conv.Id == c.Id)
         {
-            if (_all.Count > 0) OpenConversation(_all[0]);
+            if (_all.Count > 0)
+            {
+                int next = was;
+                if (next >= _all.Count) next = _all.Count - 1;
+                if (next < 0) next = 0;
+                OpenConversation(_all[next]);
+            }
             else { _conv = new Conversation(); _all.Add(_conv); _messages.Children.Clear(); }
         }
         RefreshConvList();
@@ -3322,6 +3378,7 @@ class ChatWindow : Window
                 else if (ln.StartsWith("lang=") && int.TryParse(ln.Substring(5).Trim(), out v)) _lang = v;
                 else if (ln.StartsWith("dark=")) _dark = ln.Substring(5).Trim() != "0";
                 else if (ln.StartsWith("sidebar_collapsed=")) _sidebarCollapsed = ln.Substring(18).Trim() == "1";
+                else if (ln.StartsWith("last_open_conv=")) _lastOpenId = ln.Substring(15).Trim();
                 else if (ln.StartsWith("ui_scale="))
                 {
                     string sv = ln.Substring(9).Trim();
@@ -3361,6 +3418,7 @@ class ChatWindow : Window
                 { "lang", _lang.ToString() },
                 { "dark", _dark ? "1" : "0" },
                 { "sidebar_collapsed", _sidebarCollapsed ? "1" : "0" },
+                { "last_open_conv", _conv != null ? (_conv.Id ?? "") : "" },
                 // ui_scale holds the literal "auto" in auto mode, else the fixed number (manual).
                 { "ui_scale", _uiAuto ? "auto" : _uiScale.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) },
                 { "ui_scale_target", _scaleTarget.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture) },
@@ -3467,6 +3525,39 @@ class ChatWindow : Window
                 }
             }));
         }) { IsBackground = true }.Start();
+    }
+
+    // The plain toast states what happened; this one lets it be taken back. Shown after a
+    // single-click delete, whose whole point is that it did not stop to ask first.
+    void ToastUndo()
+    {
+        if (_pendingUndo == null) return;
+        var row = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Margin = new Thickness(0, 10, 0, 4)
+        };
+        var tb = new TextBlock
+        {
+            Text = (_lang == 0 ? "一覧から削除しました（Copilot 側は残しています）。"
+                               : "Removed from the list (kept on the Copilot side)."),
+            FontSize = 12, VerticalAlignment = VerticalAlignment.Center, TextWrapping = TextWrapping.Wrap
+        };
+        SetRef(tb, TextBlock.ForegroundProperty, "Muted");
+        row.Children.Add(tb);
+        var undo = new Button
+        {
+            Content = (_lang == 0 ? "元に戻す" : "Undo"),
+            FontSize = 12, Cursor = Cursors.Hand, Margin = new Thickness(10, 0, 0, 0),
+            Padding = new Thickness(8, 1, 8, 1), BorderThickness = new Thickness(1),
+            Background = Brushes.Transparent
+        };
+        SetRef(undo, ForegroundProperty, "Fg");
+        undo.Click += delegate { UndoPendingDelete(); row.Visibility = Visibility.Collapsed; };
+        row.Children.Add(undo);
+        _messages.Children.Add(row);
+        StickToEnd();
     }
 
     void Toast(string text)
@@ -4151,7 +4242,22 @@ class ChatWindow : Window
         }
         catch { }
         DiscoverTranscripts();   // surface every fleet worker's disk transcript as a past chat
-        if (_all.Count > 0) { _conv = _all[0]; foreach (var m in _conv.Messages) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); } }
+        // Restore what was open last time. _all[0] is just the first record read off disk --
+        // neither the newest nor the one being worked on -- so startup used to reopen whatever
+        // happened to sit at the top of the file, leaving a months-old conversation resident.
+        if (_all.Count > 0)
+        {
+            Conversation want = null;
+            if (!string.IsNullOrEmpty(_lastOpenId))
+                foreach (var c in _all) if (c.Id == _lastOpenId) { want = c; break; }
+            if (want == null)
+            {
+                want = _all[0];                       // fall back to the most recent by activity
+                foreach (var c in _all) if (c.Ts > want.Ts) want = c;
+            }
+            _conv = want;
+            foreach (var m in _conv.Messages) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
+        }
         else { _conv = new Conversation(); _all.Add(_conv); }
         ShowEmptyState();        // no-op if the active conversation rendered any real message
         RefreshConvList();

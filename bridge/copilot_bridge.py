@@ -3579,6 +3579,25 @@ class Handler(BaseHTTPRequestHandler):
         elif final is not None:
             # Normal answer, no consent issue at all -- also a clean episode boundary.
             _reset_consent_surface_episode()
+
+        # A write/exec tool refused for lock looks like a normal answer here: the agent
+        # reports it in prose. Ask the server's own record instead, then unlock and redo
+        # the turn -- the same shape as the consent retry above. The backend IP rotates,
+        # so a few of these across a session are normal; the attempt cap stops a loop.
+        global _BRIDGE_UNLOCK_ATTEMPTS
+        if _bridge_should_auto_unlock():
+            pw = _bridge_unlock_password()
+            if pw:
+                _BRIDGE_UNLOCK_ATTEMPTS += 1
+                logger.info("bridge auto-unlock: attempt %d/%d",
+                            _BRIDGE_UNLOCK_ATTEMPTS, MAX_BRIDGE_UNLOCK_ATTEMPTS)
+                try:
+                    final = self._send_and_stream_once(
+                        (BRIDGE_UNLOCK_PREFIX % pw) + msg, stream_out=stream_out)
+                except Exception:
+                    logger.warning("bridge auto-unlock turn raised", exc_info=True)
+            else:
+                logger.warning("bridge auto-unlock: MCP_UNLOCK_PASSWORD not set locally")
         return final
 
     def _stream_text(self, msg: str):
@@ -4051,6 +4070,49 @@ TOOL_PROBE_INSTRUCTION = tool_probe.next_probe_instruction(1, _TOOL_PROBE_DESKTO
 
 _TOOL_PROBE_TIMER = None  # the pending threading.Timer, so _schedule_tool_probe can re-arm it
 _TOOL_PROBE_SEQ = 0       # probes issued this process; feeds the varying instruction text
+
+
+# ── auto-unlock for the MAIN chat ────────────────────────────────────────────────
+# Write/exec MCP tools are locked per client IP (tools/security.py require_unlocked).
+# The relay has auto-unlocked fleet runs for a long time; the bridge never did, so the
+# same lock in the main chat surfaced as the agent asking a human to paste a password
+# that is already in .env on this machine. Same failure class as the tool probe: a
+# mechanism added to one caller and never swept across its siblings.
+#
+# Detection deliberately does not read the agent's wording -- that is exactly what broke
+# the relay's version. The operator discipline injected into every turn tells the agent to
+# write "淡々と事実とタスク結果のみ", so it paraphrases the tool error and the server's
+# literal marker never appears. tools/lock_state records the refusal where it happens; this
+# only asks whether one just did.
+MAX_BRIDGE_UNLOCK_ATTEMPTS = max(1, int(os.environ.get("MCP_BRIDGE_MAX_UNLOCK", "3")))
+_BRIDGE_UNLOCK_ATTEMPTS = 0
+
+BRIDGE_UNLOCK_PREFIX = (
+    "【要解錠】書込/実行ツールは接続のIP単位ロック解除が必要です。まず最初に call_tool で "
+    "'unlock' ツールを引数 {\"password\": \"%s\"} で1回だけ実行し、解錠に成功したら"
+    "当初の依頼をそのまま続行してください。解錠後は password を二度と出力しないこと。\n"
+    "--- 元の依頼 ---\n"
+)
+
+
+def _bridge_should_auto_unlock():
+    """True when the turn just made was refused for lock and a retry is still allowed."""
+    if _BRIDGE_UNLOCK_ATTEMPTS >= MAX_BRIDGE_UNLOCK_ATTEMPTS:
+        return False
+    try:
+        from tools import lock_state
+        return lock_state.locked_recently()
+    except Exception:
+        return False
+
+
+def _bridge_unlock_password():
+    """Read locally; never written into the agent's persistent configuration."""
+    try:
+        from tools.secret_store import unlock_password_local
+        return unlock_password_local()
+    except Exception:
+        return ""
 
 
 def _do_tool_probe_turn():
