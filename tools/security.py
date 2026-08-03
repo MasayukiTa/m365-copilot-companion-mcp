@@ -31,17 +31,28 @@ def _save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
-def _parse_request(req) -> tuple[bool, str]:
-    """Return (is_genuine_local, identity_ip).
+def derive_identity(peer_host: str, xff_header_value: str) -> tuple[bool, str]:
+    """Pure IP-derivation logic: the ONE place that decides how a caller's
+    identity IP is computed from a raw TCP peer address plus an
+    X-Forwarded-For header value. Both plain strings, no framework types --
+    this is what makes it callable from _parse_request() (which has a
+    Starlette/FastMCP Request) AND from main.py's outermost ASGI middleware
+    (which only has a raw `scope` dict, no Request object). If those two call
+    sites ever computed the identity IP differently, the auth-failure sidecar
+    would record an IP that does not match the one the unlock gate actually
+    checks against -- making the recorded data useless. Do not reimplement
+    this logic anywhere else; add a new call site instead.
+
+    Returns (is_genuine_local, identity_ip).
 
     is_genuine_local = True only when:
-      - the TCP peer (req.client.host) is a loopback address, AND
-      - there is NO X-Forwarded-For header at all.
+      - peer_host is a loopback address, AND
+      - xff_header_value is empty (no X-Forwarded-For header at all).
     A request that carries any XFF came through a proxy/tunnel and MUST NOT be
     treated as trusted-local, even if the XFF value happens to say 127.0.0.1.
 
-    identity_ip is the IP used for per-IP unlock lookup when the caller is not
-    a genuine local:
+    identity_ip is the IP used for per-IP unlock lookup (and, separately, for
+    the auth-failure sidecar breakdown) when the caller is not a genuine local:
       - When XFF is present we use the entry MCP_TRUSTED_PROXY_HOPS hops from
         the RIGHT (default 1). This is the address the last trusted proxy
         observed, not the leftmost client-supplied entry.
@@ -52,12 +63,11 @@ def _parse_request(req) -> tuple[bool, str]:
         hop). With hops=1, index[-1] == index[0], so existing stored unlocks
         continue to match. If a second trusted proxy is added in future, raise
         MCP_TRUSTED_PROXY_HOPS to 2.
-      - When there is no XFF, identity_ip is req.client.host (direct connection).
+      - When there is no XFF, identity_ip is peer_host (direct connection).
     """
-    client = getattr(req, "client", None)
-    peer = client.host if client else ""
+    peer = peer_host or ""
+    xff = xff_header_value or ""
 
-    xff = req.headers.get("x-forwarded-for", "")
     if not xff:
         # No forwarding header: genuine local if peer is loopback.
         is_local = peer in TRUSTED_LOCAL_PEERS
@@ -71,6 +81,23 @@ def _parse_request(req) -> tuple[bool, str]:
     # Take the entry `hops` from the right; clamp to index 0 if fewer entries.
     idx = max(0, len(entries) - hops)
     return False, entries[idx]
+
+
+def _parse_request(req) -> tuple[bool, str]:
+    """Return (is_genuine_local, identity_ip) for a Starlette/FastMCP Request.
+
+    Thin adapter over derive_identity(): pulls the peer host and the raw
+    X-Forwarded-For header value off `req` and hands them to the shared, pure
+    derivation function. See derive_identity()'s docstring for the full
+    rationale (loopback-only trust, MCP_TRUSTED_PROXY_HOPS, etc). Do not
+    duplicate that logic here -- add call sites against derive_identity()
+    instead, so there remains exactly one place that decides how the IP is
+    derived.
+    """
+    client = getattr(req, "client", None)
+    peer = client.host if client else ""
+    xff = req.headers.get("x-forwarded-for", "")
+    return derive_identity(peer, xff)
 
 
 def get_client_ip() -> str:

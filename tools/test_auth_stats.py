@@ -102,6 +102,107 @@ def test_independent_instances_do_not_share_state():
 
 
 # ===========================================================================
+# 1b. Per-IP breakdown (request origin): record(ip=...) / summary(include_ip_breakdown=True)
+# ===========================================================================
+
+
+def test_summary_default_never_includes_ip_breakdown():
+    """summary() with no args must keep returning exactly the original
+    two-key shape -- this is what get_summary()/the public /health route
+    consume, and it must never grow the per-IP data."""
+    t = auth_stats.AuthFailureTracker(window_s=600.0)
+    t.record(ts=1.0, ip="1.2.3.4")
+    s = t.summary(ts=2.0)
+    assert set(s.keys()) == {"auth_fail_10m", "auth_fail_last_ts"}
+
+
+def test_per_ip_counts_within_window():
+    t = auth_stats.AuthFailureTracker(window_s=600.0)
+    t.record(ts=1.0, ip="1.1.1.1")
+    t.record(ts=2.0, ip="1.1.1.1")
+    t.record(ts=3.0, ip="2.2.2.2")
+    s = t.summary(ts=4.0, include_ip_breakdown=True)
+    assert s["auth_fail_by_ip"] == {"1.1.1.1": 2, "2.2.2.2": 1}
+    # Existing fields untouched by asking for the breakdown too.
+    assert s["auth_fail_10m"] == 3
+    assert s["auth_fail_last_ts"] == 3.0
+
+
+def test_per_ip_window_pruning_matches_global_pruning():
+    """Per-IP counts must prune on the same window as the global count, not
+    just accumulate forever."""
+    t = auth_stats.AuthFailureTracker(window_s=600.0)
+    t.record(ts=0.0, ip="1.1.1.1")     # will age out
+    t.record(ts=100.0, ip="1.1.1.1")   # survives
+    t.record(ts=500.0, ip="2.2.2.2")   # survives
+    s = t.summary(ts=650.0, include_ip_breakdown=True)  # cutoff = 50
+    assert s["auth_fail_by_ip"] == {"1.1.1.1": 1, "2.2.2.2": 1}
+
+    # Push further out so both IPs fully age out and their slots are freed.
+    s2 = t.summary(ts=2000.0, include_ip_breakdown=True)
+    assert s2["auth_fail_by_ip"] == {}
+
+
+def test_unknown_or_missing_ip_uses_placeholder_bucket():
+    t = auth_stats.AuthFailureTracker(window_s=600.0)
+    t.record(ts=1.0)             # ip omitted entirely
+    t.record(ts=2.0, ip=None)    # ip explicitly None
+    t.record(ts=3.0, ip="")      # ip explicitly empty
+    s = t.summary(ts=4.0, include_ip_breakdown=True)
+    assert s["auth_fail_by_ip"] == {"": 3}
+
+
+def test_record_with_ip_never_raises_on_bad_ip_type():
+    t = auth_stats.AuthFailureTracker(window_s=600.0)
+
+    class _Unstringable:
+        def __str__(self):
+            raise RuntimeError("boom")
+
+    t.record(ts=1.0, ip=_Unstringable())  # must not raise
+    s = t.summary(ts=2.0, include_ip_breakdown=True)
+    assert s["auth_fail_by_ip"] == {"": 1}
+
+
+def test_ip_cap_folds_overflow_into_other_bucket():
+    """With a small ip_cap, IPs beyond the cap must fold into the "__other__"
+    bucket instead of growing the per-IP dict without bound."""
+    t = auth_stats.AuthFailureTracker(window_s=600.0, ip_cap=2)
+    t.record(ts=1.0, ip="1.1.1.1")
+    t.record(ts=2.0, ip="2.2.2.2")
+    # Cap (2) already reached by two distinct real IPs above; a third
+    # distinct IP must NOT get its own bucket.
+    t.record(ts=3.0, ip="3.3.3.3")
+    t.record(ts=4.0, ip="4.4.4.4")
+    s = t.summary(ts=5.0, include_ip_breakdown=True)
+    assert s["auth_fail_by_ip"] == {
+        "1.1.1.1": 1,
+        "2.2.2.2": 1,
+        "__other__": 2,
+    }
+    # The overflow does not affect the plain global count.
+    assert s["auth_fail_10m"] == 4
+
+
+def test_ip_cap_slot_frees_up_once_events_age_out():
+    """Once a tracked IP's events fully age out of the window, its slot is
+    freed and a later, previously-unseen IP can claim its own bucket again --
+    the cap self-heals rather than permanently starving new addresses."""
+    t = auth_stats.AuthFailureTracker(window_s=10.0, ip_cap=1)
+    t.record(ts=0.0, ip="1.1.1.1")
+    # Still within window at ts=5: cap is full, "2.2.2.2" must overflow.
+    t.record(ts=5.0, ip="2.2.2.2")
+    s_mid = t.summary(ts=5.0, include_ip_breakdown=True)
+    assert s_mid["auth_fail_by_ip"] == {"1.1.1.1": 1, "__other__": 1}
+
+    # By ts=25, "1.1.1.1"'s only event (ts=0.0) is long out of the 10s window,
+    # so its slot should free up for the next distinct IP.
+    t.record(ts=25.0, ip="3.3.3.3")
+    s_late = t.summary(ts=26.0, include_ip_breakdown=True)
+    assert s_late["auth_fail_by_ip"] == {"3.3.3.3": 1}
+
+
+# ===========================================================================
 # 2. Module-level wrappers: record_auth_failure / get_summary / write_snapshot
 # ===========================================================================
 
@@ -122,10 +223,19 @@ def test_record_auth_failure_updates_module_singleton_and_writes_snapshot(monkey
     summary = auth_stats.get_summary()
     assert summary["auth_fail_10m"] == 1
     assert summary["auth_fail_last_ts"] == now
+    assert "auth_fail_by_ip" not in summary, (
+        "get_summary() feeds the public /health route and must never carry "
+        "the per-IP breakdown -- that is sidecar-only, see write_snapshot()"
+    )
 
     assert stats_file.is_file(), "write_snapshot must have created .fleet/auth_stats.json"
     on_disk = json.loads(stats_file.read_text(encoding="utf-8"))
-    assert on_disk == summary
+    # The sidecar is intentionally richer than get_summary(): it also carries
+    # the per-IP breakdown (recorded here with no ip -> the "" placeholder
+    # bucket), which must never be surfaced through get_summary()/health.
+    assert on_disk["auth_fail_10m"] == summary["auth_fail_10m"]
+    assert on_disk["auth_fail_last_ts"] == summary["auth_fail_last_ts"]
+    assert on_disk["auth_fail_by_ip"] == {"": 1}
 
 
 def test_write_snapshot_is_atomic_no_tmp_left_behind(monkeypatch, tmp_path):
