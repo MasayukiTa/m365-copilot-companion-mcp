@@ -146,11 +146,17 @@ def test_reset_episode_gives_a_fresh_budget(monkeypatch):
 
 # ── _run_tool_probe: probe-result -> action decision (BUG 1) ───────────────────────────────
 
-def _patch_probe_plumbing(monkeypatch, page_thread_results, auto_consent_result=None):
+def _patch_probe_plumbing(monkeypatch, page_thread_results, auto_consent_result=None,
+                           challenge_token="TESTTOKEN"):
     """Stub out everything _run_tool_probe touches besides the pure classify/record logic:
     _run_bounded_page_probe_call (bypasses the real page-owner-thread queue),
     _do_tool_probe_turn (consumed once per call from `page_thread_results`), and
-    _bridge_auto_consent (returns `auto_consent_result`)."""
+    _bridge_auto_consent (returns `auto_consent_result`).
+
+    Also stubs tool_probe.new_probe_challenge() (which _run_tool_probe now calls before every
+    turn it sends -- see tools/tool_probe.py's new_probe_challenge) to a fixed, deterministic
+    (instruction, `challenge_token`) pair, so canned replies in `page_thread_results` can be
+    verified with a token the test controls instead of a real random one."""
     results = iter(page_thread_results)
 
     def _fake_run_on_page_thread(fn, *a, **kw):
@@ -159,6 +165,8 @@ def _patch_probe_plumbing(monkeypatch, page_thread_results, auto_consent_result=
         return next(results)
 
     monkeypatch.setattr(B, "_run_bounded_page_probe_call", _fake_run_on_page_thread)
+    monkeypatch.setattr(B.tool_probe, "new_probe_challenge",
+                        lambda *a, **kw: ("test challenge instruction", challenge_token))
     monkeypatch.setattr(B, "_LAST_USER_TURN_TS", 0.0)
     monkeypatch.setattr(B, "MCP_TOOL_PROBE_SEC", 600.0)
     monkeypatch.setattr(B, "TOOL_PROBE_MIN_IDLE_SEC", 30.0)
@@ -166,7 +174,7 @@ def _patch_probe_plumbing(monkeypatch, page_thread_results, auto_consent_result=
 
 def test_probe_answer_no_recovery_needed(monkeypatch):
     _reset_state(monkeypatch)
-    _patch_probe_plumbing(monkeypatch, [(True, "===TOOLPROBE_OK===", False)])
+    _patch_probe_plumbing(monkeypatch, [(True, "found file: probe_TESTTOKEN.txt", False)])
     surface_calls = _patch_surface(monkeypatch, [])
     recorded = []
     monkeypatch.setattr(B.tool_probe, "record_probe",
@@ -186,7 +194,7 @@ def test_probe_consent_card_auto_consent_succeeds(monkeypatch):
         monkeypatch,
         page_thread_results=[
             (True, "接続マネージャーを開く", False),   # first probe: consent card
-            (True, "===TOOLPROBE_OK===", False),       # re-probe after auto-consent: recovered
+            (True, "found file: probe_TESTTOKEN.txt", False),  # re-probe: recovered
         ],
         auto_consent_result=True,
     )
@@ -254,7 +262,7 @@ def test_probe_startup_is_transitional_and_retries_quickly(monkeypatch):
 
 def test_probe_records_checking_before_the_real_turn(monkeypatch):
     _reset_state(monkeypatch)
-    _patch_probe_plumbing(monkeypatch, [(True, "===TOOLPROBE_OK===", False)])
+    _patch_probe_plumbing(monkeypatch, [(True, "found file: probe_TESTTOKEN.txt", False)])
     _patch_surface(monkeypatch, [])
     recorded = []
     monkeypatch.setattr(B.tool_probe, "record_probe",
