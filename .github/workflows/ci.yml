@@ -62,6 +62,7 @@ jobs:
             tools/test_data_aliases.py \
             tools/test_local_loop_ops.py \
             tools/test_local_loop_registration.py \
+            tools/test_lock_state.py \
             tools/test_notify_ops.py \
             tools/test_ocr_ops.py \
             tools/test_procedural_memory.py \

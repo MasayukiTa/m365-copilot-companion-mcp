@@ -7,6 +7,9 @@ from fastmcp.server.dependencies import get_http_request
 
 from tools.secret_store import unlock_password_from_env
 
+# Records lock refusals so readers never have to infer them from agent prose.
+from tools import lock_state
+
 STATE_FILE = Path(__file__).resolve().parent.parent / ".unlock_state.json"
 
 # IPs that are always trusted when they appear as the *real connection peer*
@@ -108,20 +111,24 @@ def require_unlocked() -> str | None:
         req = get_http_request()
     except Exception:
         # No HTTP request context (e.g. called from a test or CLI): deny.
-        return (
+        msg = (
             "[locked: no HTTP request context] "
             "Call unlock(password='<password>') first."
         )
+        lock_state.record_locked("", msg)
+        return msg
     is_local, ip = _parse_request(req)
     if is_local:
         return None
     if is_unlocked(ip):
         return None
-    return (
+    msg = (
         f"[locked client IP: {ip!r}] Mutating and execution tools require an unlock. "
         "Call unlock(password='<password>') first. The unlock is stored per client IP "
         "for MCP_UNLOCK_TTL_DAYS days."
     )
+    lock_state.record_locked(ip, msg)
+    return msg
 
 
 def unlock(password: str) -> str:
@@ -145,6 +152,9 @@ def unlock(password: str) -> str:
     state = _load_state()
     state[ip] = {"expires_at": expires, "unlocked_at": time.time()}
     _save_state(state)
+    # The refusal that prompted this unlock is now history; drop it so a reader
+    # checking "was a call just refused?" is not answered by a stale record.
+    lock_state.clear()
     return f"Unlocked IP {ip!r} for {ttl_days} days."
 
 

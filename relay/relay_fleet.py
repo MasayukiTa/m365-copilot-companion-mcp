@@ -290,9 +290,26 @@ def _looks_locked(resp: str) -> bool:
          unlock(password=...) is not.
     """
     low = (resp or "").lower()
-    if not any(m in low for m in LOCKED_MARKERS):
+    if any(m in low for m in LOCKED_MARKERS):
+        return len(resp or "") < LOCKED_DOMINANCE_MAX_CHARS
+
+    # The marker rule only fires while the agent pastes the tool error back
+    # verbatim. It often does not: the operator discipline injected into every
+    # turn tells it to write "淡々と事実とタスク結果のみ", so a real lock comes
+    # back paraphrased -- "unlock パスワード欠如で確定。STUCK: unlock パスワード
+    # 未提供。" -- carrying no marker at all. Detection missed, the generic retry
+    # nudge ran instead of the unlock injection, and the run STUCKed asking a
+    # human for a password already sitting in .env.
+    #
+    # So fall back to the server's own record. Whether a call was refused for
+    # lock is a server fact, known exactly at the point of refusal; it does not
+    # need to be recovered from prose. Freshness is what keeps this honest -- an
+    # old refusal must not colour an unrelated later turn.
+    try:
+        from tools import lock_state
+        return lock_state.locked_recently()
+    except Exception:
         return False
-    return len(resp or "") < LOCKED_DOMINANCE_MAX_CHARS
 
 
 def _unlock_password():
