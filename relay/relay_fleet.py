@@ -276,7 +276,7 @@ UNLOCK_PREFIX = (
 )
 
 
-def _looks_locked(resp: str) -> bool:
+def _looks_locked(resp: str, since: float = 0.0) -> bool:
     """True iff `resp` looks like the SERVER's require_unlocked() lock error, not a worker's
     prose that merely discusses/quotes the unlock() API (see the FALSE-POSITIVE FIX comment
     above LOCKED_MARKERS for the incident this guards against: a security-review worker
@@ -305,9 +305,15 @@ def _looks_locked(resp: str) -> bool:
     # lock is a server fact, known exactly at the point of refusal; it does not
     # need to be recovered from prose. Freshness is what keeps this honest -- an
     # old refusal must not colour an unrelated later turn.
+    # `since` is the moment this turn was sent. Without it a refusal from an unrelated
+    # earlier call would mark the next few minutes of replies as locked -- CI caught
+    # exactly that: one test triggered require_unlocked(), and a later test's ordinary
+    # refusal reply ("I cannot assist with that request") was then read as a lock.
+    if since <= 0.0:
+        return False
     try:
         from tools import lock_state
-        return lock_state.locked_recently()
+        return lock_state.locked_since(since)
     except Exception:
         return False
 
@@ -1039,6 +1045,7 @@ class RelayWorker:
         self.job = (initial_body if self.resume_conv
                     else conversation_start_label(self.name) + initial_body)
         self.turn = 0
+        self._turn_sent_at = 0.0
         self.no_progress = 0
         self.last_norm = None
         # phase_events MUST be initialized before `self.status = PENDING` so the setter
@@ -1099,6 +1106,7 @@ class RelayWorker:
 
         # Conversation-local state must not leak into the replay.
         self.turn = 0
+        self._turn_sent_at = 0.0
         self.no_progress = 0
         self.last_norm = None
         self.last_response = ""
@@ -1353,6 +1361,9 @@ class RelayWorker:
                 self.transient, type(e).__name__, str(e))
             return
         self.turn += 1
+        # When this turn went out. The lock fallback below compares the server's refusal
+        # record against it, so only a refusal caused BY THIS TURN counts.
+        self._turn_sent_at = time.time()
         # a send actually went through -> reset BOTH the generation-wait count and the
         # wall-clock streak stamp so the next slow turn gets a fresh full patience budget.
         self.gen_waits = 0
@@ -1928,7 +1939,7 @@ class RelayWorker:
         # normal; past the cap STUCK with an actionable reason. Uses _looks_locked() (distinctive
         # marker + dominance) rather than a bare substring match so a long security-review
         # response that merely discusses unlock() is never mistaken for the real lock error.
-        if _looks_locked(resp):
+        if _looks_locked(resp, getattr(self, "_turn_sent_at", 0.0)):
             pw = _unlock_password()
             if not pw:
                 self.status, self.outcome = "stuck", "STUCK"

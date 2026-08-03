@@ -28,7 +28,7 @@ def test_detection_asks_the_server_record_not_the_agent_wording():
     literal marker never appears."""
     body = SOURCE[SOURCE.index("def _bridge_should_auto_unlock"):]
     body = body[:body.index("\ndef ")]
-    assert "lock_state.locked_recently()" in body
+    assert "lock_state.locked_since(sent_at)" in body
     assert "locked client ip" not in body.lower()
 
 
@@ -37,7 +37,7 @@ def test_the_unlock_turn_is_wired_into_the_shared_turn_helper():
     retry has to live there to cover both."""
     body = SOURCE[SOURCE.index("def _run_one_turn"):]
     body = body[:body.index("\n    def _stream_text")]
-    assert "_bridge_should_auto_unlock()" in body
+    assert "_bridge_should_auto_unlock(_turn_sent_at)" in body
     assert "_send_and_stream_once" in body
     assert "BRIDGE_UNLOCK_PREFIX % pw" in body
 
@@ -61,3 +61,10 @@ def test_relay_and_bridge_share_one_password_reader():
     relay = (Path(__file__).parent.parent / "relay" / "relay_fleet.py").read_text(encoding="utf-8")
     assert "unlock_password_local" in relay
     assert "load_dotenv" not in relay.split("def _unlock_password")[1].split("\ndef ")[0]
+
+
+def test_the_check_is_scoped_to_the_turn_not_to_recent_history():
+    """A refusal from an unrelated earlier call must not mark this turn as locked --
+    CI caught exactly that contamination in the relay's version."""
+    assert "_bridge_should_auto_unlock(_turn_sent_at)" in SOURCE
+    assert "locked_recently" not in SOURCE

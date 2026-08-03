@@ -97,3 +97,29 @@ def clear() -> None:
                 _STATE_FILE.unlink()
     except Exception:
         pass
+
+
+def locked_since(since: float, now: Optional[float] = None) -> bool:
+    """True iff a refusal was recorded at or after `since`.
+
+    This is the form callers should use. `locked_recently` answers "was anything
+    refused lately", which is too broad to judge one turn by: a refusal from an
+    unrelated earlier call would mark every reply for the next few minutes as
+    locked. Pass the moment the turn was sent and only its own refusal counts.
+    """
+    try:
+        boundary = float(since)
+    except (TypeError, ValueError):
+        return False
+    if boundary <= 0.0:
+        return False
+    state = read_state()
+    try:
+        ts = float(state.get("ts") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if ts < boundary:
+        return False
+    current = float(now if now is not None else time.time())
+    # Still bounded by freshness so a clock jump cannot resurrect an ancient record.
+    return (current - ts) <= DEFAULT_FRESH_SEC
