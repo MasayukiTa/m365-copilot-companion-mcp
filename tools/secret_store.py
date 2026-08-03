@@ -96,3 +96,27 @@ def unlock_password_from_env(environ=None) -> str:
         return unprotect_secret(protected)
     except Exception:
         return ""
+
+
+def unlock_password_local(environ=None) -> str:
+    """The unlock password as a LOCAL process can see it: env first, then the repo .env.
+
+    The relay carried its own copy of this env-then-dotenv fallback while the bridge
+    carried none, which is why auto-unlock worked for fleet runs and never for the main
+    chat. One implementation, so a caller cannot be quietly left out.
+
+    Local only, by design: the password is read on this machine and injected into a turn,
+    never written into the agent's persistent configuration where it would live forever.
+    Returns '' when unset.
+    """
+    pw = unlock_password_from_env(environ)
+    if pw:
+        return pw
+    try:
+        from dotenv import load_dotenv
+
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        load_dotenv(os.path.join(repo, ".env"))
+    except Exception:
+        return ""
+    return unlock_password_from_env(environ)

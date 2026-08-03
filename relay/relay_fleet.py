@@ -315,17 +315,10 @@ def _looks_locked(resp: str) -> bool:
 def _unlock_password():
     """The unlock password, read LOCALLY (process env or .env) -- never stored in the agent
     config. Returns '' if unset."""
-    from tools.secret_store import unlock_password_from_env
-    pw = unlock_password_from_env()
-    if not pw:
-        try:
-            from dotenv import load_dotenv
-            repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            load_dotenv(os.path.join(repo, ".env"))
-            pw = unlock_password_from_env()
-        except Exception:
-            pass
-    return pw
+    # Single implementation, shared with the bridge: this fallback used to live only
+    # here, which is why auto-unlock worked for fleet runs and never for the main chat.
+    from tools.secret_store import unlock_password_local
+    return unlock_password_local()
 
 
 def _mcp_tunnel_url():
