@@ -3549,6 +3549,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         global _LAST_USER_TURN_TS
         _LAST_USER_TURN_TS = time.time()   # see its module-level docstring: the tool probe reads this
+        _turn_sent_at = _LAST_USER_TURN_TS  # boundary for the lock check at the end of this turn
         _prepare_capture_baseline(sid)
         final = self._send_and_stream_once(msg, stream_out=stream_out)
         if final is not None and _looks_like_consent(final):
@@ -3585,7 +3586,7 @@ class Handler(BaseHTTPRequestHandler):
         # the turn -- the same shape as the consent retry above. The backend IP rotates,
         # so a few of these across a session are normal; the attempt cap stops a loop.
         global _BRIDGE_UNLOCK_ATTEMPTS
-        if _bridge_should_auto_unlock():
+        if _bridge_should_auto_unlock(_turn_sent_at):
             pw = _bridge_unlock_password()
             if pw:
                 _BRIDGE_UNLOCK_ATTEMPTS += 1
@@ -4095,13 +4096,17 @@ BRIDGE_UNLOCK_PREFIX = (
 )
 
 
-def _bridge_should_auto_unlock():
-    """True when the turn just made was refused for lock and a retry is still allowed."""
+def _bridge_should_auto_unlock(sent_at):
+    """True when THIS turn was refused for lock and a retry is still allowed.
+
+    Scoped to the turn on purpose: "was anything refused lately" would let a refusal
+    from an unrelated earlier call mark the next few minutes of replies as locked.
+    """
     if _BRIDGE_UNLOCK_ATTEMPTS >= MAX_BRIDGE_UNLOCK_ATTEMPTS:
         return False
     try:
         from tools import lock_state
-        return lock_state.locked_recently()
+        return lock_state.locked_since(sent_at)
     except Exception:
         return False
 

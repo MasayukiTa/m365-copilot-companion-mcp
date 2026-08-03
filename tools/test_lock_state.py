@@ -75,3 +75,39 @@ def test_recording_never_raises_even_when_the_path_is_unusable(tmp_path, monkeyp
     monkeypatch.setattr(lock_state, "_STATE_FILE", tmp_path / "nope" / "\0bad" / "s.json")
     lock_state.record_locked("203.0.113.7")      # must not raise
     lock_state.clear()                            # must not raise
+
+
+# --- turn scoping ------------------------------------------------------------
+# CI caught the reason this matters. tools/security.py records a refusal into the
+# real sidecar, so one test calling require_unlocked() left a fresh record behind;
+# a later test's ordinary refusal reply ("I cannot assist with that request") was
+# then read as a lock, and two unrelated resilience tests failed. "Was anything
+# refused lately" is too broad to judge one turn by.
+
+
+def test_only_a_refusal_from_this_turn_counts():
+    sent_at = 1_000.0
+    lock_state.record_locked("203.0.113.7", ts=sent_at + 1)
+    assert lock_state.locked_since(sent_at, now=sent_at + 2) is True
+
+
+def test_a_refusal_from_before_the_turn_is_ignored():
+    """The exact CI contamination: an earlier, unrelated call left the record."""
+    sent_at = 1_000.0
+    lock_state.record_locked("203.0.113.7", ts=sent_at - 5)
+    assert lock_state.locked_since(sent_at, now=sent_at + 2) is False
+    # ...while the broad query would still have said yes, which is the bug.
+    assert lock_state.locked_recently(within_sec=180.0, now=sent_at + 2) is True
+
+
+def test_no_boundary_means_no_detection():
+    """A caller that cannot say when its turn started gets nothing, not everything."""
+    lock_state.record_locked("203.0.113.7")
+    for bad in (0.0, -1.0, None, "x"):
+        assert lock_state.locked_since(bad) is False
+
+
+def test_freshness_still_bounds_a_scoped_query():
+    sent_at = 1_000.0
+    lock_state.record_locked("203.0.113.7", ts=sent_at + 1)
+    assert lock_state.locked_since(sent_at, now=sent_at + 10_000) is False
