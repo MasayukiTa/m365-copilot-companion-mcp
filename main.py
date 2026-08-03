@@ -577,7 +577,16 @@ if __name__ == "__main__":
         call to 401 with zero surfaced signal. record_response_start() below inspects
         the outgoing "http.response.start" ASGI event for status 401 on the /mcp path
         and calls tools.auth_stats.record_auth_failure(); everything is wrapped in
-        try/except so a bookkeeping bug can never break the real request/response."""
+        try/except so a bookkeeping bug can never break the real request/response.
+
+        The recorded IP is derived from the raw ASGI `scope` (peer address plus any
+        X-Forwarded-For header) via tools.security.derive_identity() -- the SAME pure
+        helper _parse_request() uses for unlock decisions. This module only has a
+        scope dict, not a Starlette Request, but the derivation itself must not be
+        reimplemented here: if this and the unlock gate ever computed the IP
+        differently, the recorded origin would not match the IP the unlock gate
+        actually saw, making the data useless for anything an operator wants to do
+        with it."""
 
         def __init__(self, app):
             self.app = app
@@ -612,7 +621,21 @@ if __name__ == "__main__":
                 try:
                     if message.get("type") == "http.response.start" and message.get("status") == 401:
                         from tools.auth_stats import record_auth_failure
-                        record_auth_failure()
+                        from tools.security import derive_identity
+
+                        # Raw ASGI scope, not a Starlette Request: pull the peer
+                        # host and the raw X-Forwarded-For header value by hand,
+                        # then hand both to the SAME derivation _parse_request()
+                        # uses, rather than guessing at the IP independently here.
+                        client = scope.get("client")
+                        peer_host = client[0] if client else ""
+                        xff_value = ""
+                        for (hk, hv) in (scope.get("headers") or []):
+                            if hk.lower() == b"x-forwarded-for":
+                                xff_value = hv.decode("latin-1")
+                                break
+                        _, identity_ip = derive_identity(peer_host, xff_value)
+                        record_auth_failure(ip=identity_ip)
                 except Exception:
                     pass
                 await send(message)

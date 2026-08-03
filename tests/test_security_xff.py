@@ -171,6 +171,80 @@ def test_xff_multi_hop_hops2():
     _check("xff_hops2_picks_second_from_right", ip == "client_ip")
 
 
+# ── derive_identity(): the shared, pure IP-derivation helper ──────────────────
+#
+# tools.security._parse_request() (above tests) is a thin adapter over
+# sec.derive_identity(peer_host, xff_header_value) -- the same pure function
+# main.py's ASGI auth-failure observer calls directly (it only has a raw
+# scope, not a Starlette Request). These tests exercise derive_identity()
+# itself, as plain strings, with no Request/mock object involved at all.
+
+
+def test_derive_identity_no_xff_uses_peer():
+    """No X-Forwarded-For header at all: identity_ip falls back to the raw
+    peer address, and a loopback peer is genuinely local."""
+    is_local, ip = sec.derive_identity("127.0.0.1", "")
+    _check("derive_no_xff_peer_used", ip == "127.0.0.1")
+    _check("derive_no_xff_is_local", is_local)
+
+    is_local2, ip2 = sec.derive_identity("20.210.146.129", "")
+    _check("derive_no_xff_remote_peer_used", ip2 == "20.210.146.129")
+    _check("derive_no_xff_remote_not_local", not is_local2)
+
+
+def test_derive_identity_empty_xff_string_same_as_absent():
+    """An empty-string XFF value must behave identically to no header at
+    all (this is the exact input main.py's scope-header scan produces when
+    it never finds an X-Forwarded-For entry)."""
+    is_local, ip = sec.derive_identity("127.0.0.1", "")
+    _check("derive_empty_xff_is_local", is_local)
+    _check("derive_empty_xff_peer_used", ip == "127.0.0.1")
+
+
+def test_derive_identity_single_entry_xff():
+    """A single-entry XFF is never trusted-local, and its one entry is the
+    identity IP regardless of MCP_TRUSTED_PROXY_HOPS (index clamps to 0)."""
+    with patch.dict(os.environ, {"MCP_TRUSTED_PROXY_HOPS": "1"}):
+        is_local, ip = sec.derive_identity("127.0.0.1", "20.210.146.129")
+    _check("derive_single_entry_not_local", not is_local)
+    _check("derive_single_entry_picks_it", ip == "20.210.146.129")
+
+
+def test_derive_identity_multi_entry_hops1():
+    """Multi-entry XFF with hops=1 (default): rightmost entry wins."""
+    with patch.dict(os.environ, {"MCP_TRUSTED_PROXY_HOPS": "1"}):
+        is_local, ip = sec.derive_identity("127.0.0.1", "client_ip, mid_hop, right_hop")
+    _check("derive_multi_hops1_picks_rightmost", ip == "right_hop")
+    _check("derive_multi_hops1_not_local", not is_local)
+
+
+def test_derive_identity_multi_entry_hops2():
+    """Multi-entry XFF with hops=2: second entry from the right wins."""
+    with patch.dict(os.environ, {"MCP_TRUSTED_PROXY_HOPS": "2"}):
+        is_local, ip = sec.derive_identity("127.0.0.1", "client_ip, mid_hop, right_hop")
+    _check("derive_multi_hops2_picks_second_from_right", ip == "mid_hop")
+
+
+def test_derive_identity_none_inputs_never_raise():
+    """derive_identity must tolerate None for either argument (e.g. a scope
+    with no client tuple, or a header scan that found nothing) and degrade
+    to the empty-peer / no-XFF path rather than raising."""
+    is_local, ip = sec.derive_identity(None, None)
+    _check("derive_none_inputs_no_raise_not_local", not is_local)
+    _check("derive_none_inputs_no_raise_empty_ip", ip == "")
+
+
+def test_parse_request_delegates_to_derive_identity():
+    """_parse_request() must be a pure pass-through to derive_identity() --
+    if it ever diverged, the unlock gate and the auth-failure sidecar would
+    disagree on the same request's IP."""
+    req = _make_req(peer_host="127.0.0.1", xff="a, b, c")
+    with patch.dict(os.environ, {"MCP_TRUSTED_PROXY_HOPS": "1"}):
+        via_parse_request = sec._parse_request(req)
+        via_direct_call = sec.derive_identity("127.0.0.1", "a, b, c")
+    _check("parse_request_matches_derive_identity", via_parse_request == via_direct_call)
+
+
 # ── Standalone runner ──────────────────────────────────────────────────────────
 
 def _run_all():
@@ -183,6 +257,13 @@ def _run_all():
     test_d_expired_unlock_denied()
     test_xff_multi_hop_hops1()
     test_xff_multi_hop_hops2()
+    test_derive_identity_no_xff_uses_peer()
+    test_derive_identity_empty_xff_string_same_as_absent()
+    test_derive_identity_single_entry_xff()
+    test_derive_identity_multi_entry_hops1()
+    test_derive_identity_multi_entry_hops2()
+    test_derive_identity_none_inputs_never_raise()
+    test_parse_request_delegates_to_derive_identity()
 
     passed = sum(1 for _, ok in results if ok)
     total = len(results)
