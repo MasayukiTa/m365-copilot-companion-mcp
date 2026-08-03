@@ -30,33 +30,15 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from relay.copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver
+from tools import tool_probe
 
-# A probe that REQUIRES the connector (list_directory) and asks for a one-line answer, so
-# a working connector returns "N個" while a connector-less default Copilot says 実行不可.
-# The probe target is the current user's Desktop, resolved at runtime so it works for any user.
-# Honors OneDrive Known Folder Move (Desktop redirected under "OneDrive - <org>\Desktop") --
-# see bridge/copilot_bridge.py's _resolve_desktop_dir (same fix, kept in sync).
-def _resolve_desktop_dir() -> str:
-    try:
-        import winreg
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
-        ) as key:
-            val, _ = winreg.QueryValueEx(key, "Desktop")
-            resolved = os.path.expandvars(val)
-            if resolved:
-                return resolved.replace("\\", "/")
-    except Exception:
-        pass
-    return os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Desktop").replace("\\", "/")
-
-
-_DESKTOP_PROBE_PATH = _resolve_desktop_dir()
-DEFAULT_PROBE = (
-    "接続確認。call_tool 経由で list_directory を使い "
-    + _DESKTOP_PROBE_PATH + " 直下の項目数だけを『N個』の形で1行で答えて。"
-)
+# The old DEFAULT_PROBE asked an INVARIANT question ("count the items under Desktop" -- always
+# the same answer), the same defect fixed in bridge/copilot_bridge.py's idle tool probe (see
+# tools/tool_probe.py's module docstring, "SECOND incident"). The no-override (default) path
+# now uses tool_probe.new_probe_challenge(): a fresh, unguessable random-file challenge every
+# call, verified with tool_probe.verify_probe_reply() instead of the old "個" in reply
+# heuristic. An explicit --probe override still uses the old heuristic check, since a
+# caller-supplied custom question has no expected token to verify against.
 CONSENT_MARKERS = ("接続マネージャーを開く", "connection manager")
 NO_CONNECTOR_MARKERS = ("実行不可", "コネクタ無し", "コネクタがありません", "ツールが使用できません")
 
@@ -326,10 +308,31 @@ def reconnect_via_connection_manager(cdp_url: str, conn_url: str, want: str = ""
     return out
 
 
-def reconnect(cdp_url: str, agent_url: str, probe: str, turn_timeout_s: int = 180) -> dict:
+def _next_probe_challenge():
+    """Build one fresh probe challenge for edge_reconnect's default (non-custom-probe) path --
+    a thin wrapper around tool_probe.new_probe_challenge() kept as its own function so tests
+    can call the EXACT function reconnect() uses to build what it sends, without needing a
+    live CDP/Playwright connection, guarding directly against a future regression back to the
+    old fixed DEFAULT_PROBE string."""
+    return tool_probe.new_probe_challenge()
+
+
+def reconnect(cdp_url: str, agent_url: str, probe: str = None, turn_timeout_s: int = 180) -> dict:
+    """`probe`=None (the default -- no --probe override on the CLI) drives a FRESH, unguessable
+    tool_probe.new_probe_challenge() for every turn this sends, verified with
+    tool_probe.verify_probe_reply() against that turn's own token -- see the module docstring
+    for why the old fixed DEFAULT_PROBE question ("count items under Desktop", always the same
+    answer) is the defect this replaces. The re-send after a successful click-through (below)
+    deliberately generates ANOTHER fresh challenge rather than repeating the first one's token.
+
+    Passing an explicit `probe` string (the CLI's --probe override, for ad-hoc manual checks
+    with a custom question) keeps the old heuristic "個" (a bare item count) in the final reply,
+    since an arbitrary caller-supplied question has no expected token to verify against.
+    """
     from playwright.sync_api import sync_playwright
     out = {"ok": False, "agent_loaded": False, "had_card": False, "clicked": False,
            "resp1": "", "resp2": "", "url": ""}
+    use_challenge = not probe
     with sync_playwright() as p:
         b = p.chromium.connect_over_cdp(cdp_url)
         ctx = b.contexts[0] if b.contexts else b.new_context()
@@ -346,24 +349,44 @@ def reconnect(cdp_url: str, agent_url: str, probe: str, turn_timeout_s: int = 18
                 out["error"] = "composer never rendered (agent did not load)"
                 return out
             drv = CopilotWebDriver(page)
-            drv.send(probe)
+            if use_challenge:
+                instruction, expected_token = _next_probe_challenge()
+            else:
+                instruction, expected_token = probe, None
+            drv.send(instruction)
             drv.wait_for_idle(timeout_s=turn_timeout_s)
             resp = drv.read_last_response() or ""
             out["resp1"] = resp[:600]
-            out["had_card"] = any(m in resp for m in CONSENT_MARKERS)
+            if use_challenge:
+                ok1, kind1 = tool_probe.verify_probe_reply(resp, expected_token, True)
+                out["had_card"] = kind1 == "consent_card"
+            else:
+                ok1 = False
+                out["had_card"] = any(m in resp for m in CONSENT_MARKERS)
+            final_ok = ok1
             if out["had_card"]:
                 out["clicked"] = click_through_consent(page)
                 if out["clicked"]:
-                    drv.send(probe)      # re-invoke the tool on the now-valid connection
+                    if use_challenge:
+                        # a FRESH challenge for the re-send -- never repeat the first token.
+                        instruction, expected_token = _next_probe_challenge()
+                    drv.send(instruction)      # re-invoke the tool on the now-valid connection
                     drv.wait_for_idle(timeout_s=turn_timeout_s)
                     resp2 = drv.read_last_response() or ""
                     out["resp2"] = resp2[:600]
-            final = out["resp2"] or out["resp1"]
-            out["ok"] = (
-                "個" in final
-                and not any(m in final for m in NO_CONNECTOR_MARKERS)
-                and not any(m in final for m in CONSENT_MARKERS)
-            )
+                    if use_challenge:
+                        final_ok, _kind2 = tool_probe.verify_probe_reply(
+                            resp2, expected_token, True
+                        )
+            if use_challenge:
+                out["ok"] = final_ok
+            else:
+                final = out["resp2"] or out["resp1"]
+                out["ok"] = (
+                    "個" in final
+                    and not any(m in final for m in NO_CONNECTOR_MARKERS)
+                    and not any(m in final for m in CONSENT_MARKERS)
+                )
         finally:
             try:
                 page.close()
@@ -376,7 +399,10 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Auto-reconnect the MCP connector (no credentials).")
     ap.add_argument("--cdp-url", default=os.environ.get("MCP_CDP_URL", "http://localhost:9222"))
     ap.add_argument("--agent-url", default="")
-    ap.add_argument("--probe", default=DEFAULT_PROBE)
+    ap.add_argument("--probe", default=None,
+                    help="custom probe question (e.g. for manual testing). Default (omitted) "
+                         "drives a fresh tool_probe.new_probe_challenge() every call instead of "
+                         "a fixed question.")
     ap.add_argument("--turn-timeout", type=int, default=180)
     ap.add_argument("--reconnect-url", default="",
                     help="Copilot Studio .../user-connections page URL. When set, drive that "

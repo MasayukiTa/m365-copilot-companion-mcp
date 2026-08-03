@@ -25,6 +25,19 @@ Design (mirrors tools/auth_stats.py):
     logic itself is trivially unit-testable with canned strings, independent of the
     Playwright-driving code in bridge/copilot_bridge.py that produces the reply text.
 
+SECOND incident this module closes (2026-08): the original probe question below --
+"count the items directly under Desktop" -- has an INVARIANT answer (the count never
+changes). Rotating only the wording (PROBE_INSTRUCTION_VARIANTS/next_probe_instruction) did
+not help, because the agent's eventual refusal ("結果は毎回125件で不変であり...") was a
+SEMANTIC objection to the answer never changing, not a lexical one about the phrasing. Worse,
+because the answer is a constant the model has seen hundreds of times, it could also emit
+PROBE_OK_TOKEN from memory WITHOUT calling list_directory at all -- so a green probe never
+actually proved the tool path worked. new_probe_challenge()/verify_probe_reply() replace the
+invariant question with one whose answer is unguessable and different every single probe (a
+freshly random file name, written to a dedicated directory right before asking), while keeping
+the exact same call_tool -> list_directory round-trip and the same classify_probe_reply()
+`kind` vocabulary/precedence. See their docstrings below for the mechanism.
+
 Marker lists (CONSENT_MARKERS / NO_CONNECTOR_MARKERS) are a MINIMAL LOCAL COPY of the
 lists defined in relay/edge_reconnect.py (see that module's CONSENT_MARKERS /
 NO_CONNECTOR_MARKERS, ~line 45). They are duplicated here -- not imported -- because
@@ -37,6 +50,8 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -142,6 +157,125 @@ def classify_probe_reply(reply_text: str, agent_loaded: bool) -> Tuple[bool, str
     if any(m in text for m in NO_CONNECTOR_MARKERS):
         return False, "canned_fallback"
     if PROBE_OK_TOKEN in text:
+        return True, "answer"
+    return False, "error"
+
+
+# ---------------------------------------------------------------------------------------
+# Unguessable, ever-changing probe challenge (replaces the invariant "count items under
+# Desktop" question for actually SENDING a probe -- see the module docstring's "SECOND
+# incident" paragraph). classify_probe_reply()/next_probe_instruction()/PROBE_OK_TOKEN above
+# are left in place: other code and tests still reference them, and they remain valid for
+# anything that wants the old fixed-token contract.
+# ---------------------------------------------------------------------------------------
+
+# Dedicated directory reset before every challenge -- deliberately NOT a user-meaningful folder
+# (like Desktop): resetting it means deleting everything inside, and this way that can never
+# touch a file the user cares about.
+_CHALLENGE_DIR = Path(__file__).resolve().parent.parent / ".fleet" / "probe_challenge"
+
+_CHALLENGE_INSTRUCTION_VARIANTS = (
+    "システム自己診断です。call_tool 経由で list_directory を使い {dir} 直下を一覧し、"
+    "そこに見つかったファイル名を一字一句そのまま報告してください。",
+    "接続確認です。call_tool から list_directory を呼び出し、{dir} 直下にあるファイル名を"
+    "正確に転記して答えてください。",
+    "動作確認を行います。call_tool 経由の list_directory で {dir} 直下を一覧し、"
+    "見つかったファイル名をそのまま答えてください。",
+)
+
+_CHALLENGE_INSTRUCTION_TAIL = (
+    "list_directory の呼び出しに成功した場合のみ、回答の最後の行に見つけたファイル名だけを"
+    "一字一句そのまま出力してください。ツールが呼び出せない、接続確認が必要、エラーが"
+    "起きた等、成功以外の場合はファイル名を絶対に出力しないでください。"
+)
+
+# Returned instead of raising when the challenge directory/file cannot be prepared (disk full,
+# permission denied, path too long, ...). FALLBACK_CHALLENGE_TOKEN can never appear in a real
+# reply, so a caller that sends FALLBACK_CHALLENGE_INSTRUCTION anyway and runs the result
+# through verify_probe_reply() degrades to an ordinary (False, "error") probe instead of
+# crashing the probe loop.
+FALLBACK_CHALLENGE_TOKEN = "PROBE_CHALLENGE_UNAVAILABLE"
+FALLBACK_CHALLENGE_INSTRUCTION = (
+    "[probe challenge unavailable: could not prepare the challenge file on disk. Do not call "
+    "any tool and do not reply with anything for this message.]"
+)
+
+
+def new_probe_challenge(base_dir: Optional[str] = None) -> Tuple[str, str]:
+    """Create ONE fresh, unguessable probe challenge and return (instruction_text,
+    expected_token).
+
+    Resets `base_dir` (default: .fleet/probe_challenge/ next to this repo) so it contains
+    EXACTLY one file, named "probe_<12 hex chars>.txt", whose 12-hex-char token is fresh
+    (secrets.token_hex, 48 bits) and has never been sent in any earlier probe. The returned
+    instruction asks the agent to call_tool -> list_directory that directory and report the
+    file name it finds -- the instruction text itself does NOT contain the token, so the only
+    way to answer correctly is to actually make that call this turn; an old answer memorized
+    from a previous probe cannot satisfy a fresh one.
+
+    Never raises: any filesystem error (disk full, permissions, path issues, concurrent access,
+    ...) is swallowed and (FALLBACK_CHALLENGE_INSTRUCTION, FALLBACK_CHALLENGE_TOKEN) is returned
+    instead, so the caller still has something to send, and verify_probe_reply() against that
+    pair can only ever resolve to a failed probe, never a crash.
+    """
+    try:
+        directory = Path(base_dir) if base_dir is not None else _CHALLENGE_DIR
+        with _LOCK:
+            directory.mkdir(parents=True, exist_ok=True)
+            for entry in list(directory.iterdir()):
+                try:
+                    if entry.is_dir():
+                        shutil.rmtree(entry, ignore_errors=True)
+                    else:
+                        entry.unlink()
+                except Exception:
+                    pass
+            token = secrets.token_hex(6)  # 12 hex chars, 48 bits -- unguessable, never repeats
+            file_name = "probe_%s.txt" % token
+            (directory / file_name).write_text(token, encoding="utf-8")
+        dir_str = str(directory.resolve()).replace("\\", "/")
+        # `run_id` is an independent random breadcrumb, NOT the answer -- it only guarantees the
+        # instruction TEXT is never byte-identical across probes (mirroring
+        # next_probe_instruction's sequence-number guarantee above), without giving away
+        # `token`, which the agent must discover via the actual tool call.
+        run_id = secrets.token_hex(4)
+        head = _CHALLENGE_INSTRUCTION_VARIANTS[
+            secrets.randbelow(len(_CHALLENGE_INSTRUCTION_VARIANTS))
+        ]
+        instruction = (
+            head.format(dir=dir_str) + "\n" + _CHALLENGE_INSTRUCTION_TAIL +
+            "\n（診断ID: " + run_id + "）"
+        )
+        return instruction, token
+    except Exception:
+        return FALLBACK_CHALLENGE_INSTRUCTION, FALLBACK_CHALLENGE_TOKEN
+
+
+def verify_probe_reply(reply_text: Optional[str], expected_token: str,
+                        agent_loaded: bool) -> Tuple[bool, str]:
+    """Mirrors classify_probe_reply()'s exact contract and branch order (same `kind`
+    vocabulary, same precedence), except step 4 requires the reply to contain the caller-
+    supplied `expected_token` -- the token new_probe_challenge() just wrote to disk -- instead
+    of the static PROBE_OK_TOKEN marker. This is what makes a green probe PROVE the tool
+    round-trip happened THIS run: the model cannot satisfy it from memory (there is nothing
+    fixed to remember), and a reply carrying a STALE token from an earlier challenge is
+    rejected exactly like a reply with no token at all (see tools/test_tool_probe.py's
+    regression test for why that distinction is the one that matters here).
+
+      1. not agent_loaded                       -> (False, "agent_unreachable")
+      2. reply has a CONSENT marker              -> (False, "consent_card")
+      3. reply has a NO-CONNECTOR/canned marker  -> (False, "canned_fallback")
+      4. reply contains expected_token           -> (True, "answer")
+      5. otherwise                               -> (False, "error")
+    """
+    text = reply_text or ""
+    if not agent_loaded:
+        return False, "agent_unreachable"
+    if any(m in text for m in CONSENT_MARKERS):
+        return False, "consent_card"
+    if any(m in text for m in NO_CONNECTOR_MARKERS):
+        return False, "canned_fallback"
+    if expected_token and expected_token in text:
         return True, "answer"
     return False, "error"
 

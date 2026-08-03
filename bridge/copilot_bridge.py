@@ -4039,38 +4039,15 @@ TOOL_PROBE_MIN_IDLE_SEC = 30.0
 # never hold PAGE_LOCK for long.
 TOOL_PROBE_TIMEOUT_SEC = 180
 
-# Desktop path resolved at runtime (same construction relay/edge_reconnect.py's DEFAULT_PROBE
-# uses) so the probe instruction works for any user, not just the one who wrote this file.
-# Honors OneDrive Known Folder Move (Desktop redirected under "OneDrive - <org>\Desktop"),
-# a common corporate M365 setup -- the plain USERPROFILE\Desktop join 404s there and made the
-# probe itself fail (list_directory: not found), misreporting a real connector as broken.
-def _resolve_desktop_dir() -> str:
-    try:
-        import winreg
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
-        ) as key:
-            val, _ = winreg.QueryValueEx(key, "Desktop")
-            resolved = os.path.expandvars(val)
-            if resolved:
-                return resolved.replace("\\", "/")
-    except Exception:
-        pass
-    return os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Desktop").replace("\\", "/")
-
-
-_TOOL_PROBE_DESKTOP_DIR = _resolve_desktop_dir()
-# The probe instruction: forces a real call_tool(list_directory) round-trip and asks the agent
-# to emit tool_probe.PROBE_OK_TOKEN as the LAST line ONLY on success, so a canned/no-connector
-# reply or a consent card (neither of which would emit the token) is distinguishable from a
-# genuine tool-backed answer by tools.tool_probe.classify_probe_reply.
-# Text for the FIRST probe. Every subsequent probe varies -- see tool_probe.
-# next_probe_instruction for why re-sending one constant forever poisoned the conversation.
-TOOL_PROBE_INSTRUCTION = tool_probe.next_probe_instruction(1, _TOOL_PROBE_DESKTOP_DIR)
+# The probe instruction/answer used to be "count the items under Desktop" -- an INVARIANT
+# question whose answer never changes, so the agent eventually refused it outright as
+# pointless ("結果は毎回125件で不変であり..."), and -- independently -- could also emit the
+# success token from memory without ever calling list_directory. tools.tool_probe.
+# new_probe_challenge() replaces that with a fresh, unguessable random-file challenge every
+# probe (see its docstring / the module docstring's "SECOND incident" paragraph); this bridge
+# no longer needs to resolve or reference the user's Desktop path for probing at all.
 
 _TOOL_PROBE_TIMER = None  # the pending threading.Timer, so _schedule_tool_probe can re-arm it
-_TOOL_PROBE_SEQ = 0       # probes issued this process; feeds the varying instruction text
 
 
 # ── auto-unlock for the MAIN chat ────────────────────────────────────────────────
@@ -4120,15 +4097,27 @@ def _bridge_unlock_password():
         return ""
 
 
-def _do_tool_probe_turn():
+def _next_tool_probe_challenge():
+    """Build one fresh probe challenge for this bridge's idle tool probe -- a thin wrapper
+    around tool_probe.new_probe_challenge() kept as its own function so tests can call the
+    EXACT function _run_tool_probe uses to build what it sends, without needing a live
+    DRIVER/page, guarding directly against a future regression back to a fixed instruction
+    string (see bridge/test_consent_surface.py's rotation test and this module's history:
+    the previous fix only rotated WORDING, which did not stop the agent's semantic refusal of
+    an answer that never changes -- see tools/tool_probe.py's module docstring)."""
+    return tool_probe.new_probe_challenge()
+
+
+def _do_tool_probe_turn(instruction):
     """Runs ON the page-owner thread (via run_on_page_thread -- see PageExecutor's docstring
-    for why Playwright calls must run there). Sends TOOL_PROBE_INSTRUCTION through the SAME
-    module-global DRIVER a real turn uses and reads back the reply. Returns
-    (agent_loaded, reply_text, timed_out). Never raises: a driver/page exception mid-probe is
-    folded into (True, "", False) -- agent_loaded stays True because the composer check above
-    it already passed, so classify_probe_reply naturally resolves this to kind="error" rather
-    than the misleading "agent_unreachable" (which is reserved for the composer never having
-    rendered at all)."""
+    for why Playwright calls must run there). Sends `instruction` (a fresh challenge from
+    tool_probe.new_probe_challenge(), built by the caller so a NEW one is generated every probe
+    -- see _run_tool_probe) through the SAME module-global DRIVER a real turn uses and reads
+    back the reply. Returns (agent_loaded, reply_text, timed_out). Never raises: a driver/page
+    exception mid-probe is folded into (True, "", False) -- agent_loaded stays True because the
+    composer check above it already passed, so verify_probe_reply naturally resolves this to
+    kind="error" rather than the misleading "agent_unreachable" (which is reserved for the
+    composer never having rendered at all)."""
     agent_loaded = False
     try:
         agent_loaded = PAGE is not None and PAGE.locator(COPILOT_SELECTORS["composer"]).count() > 0
@@ -4136,10 +4125,8 @@ def _do_tool_probe_turn():
         agent_loaded = False
     if not agent_loaded:
         return False, "", False
-    global _TOOL_PROBE_SEQ
-    _TOOL_PROBE_SEQ += 1
     try:
-        DRIVER.send(tool_probe.next_probe_instruction(_TOOL_PROBE_SEQ, _TOOL_PROBE_DESKTOP_DIR))
+        DRIVER.send(instruction)
         idle_ok = DRIVER.wait_for_idle(timeout_s=TOOL_PROBE_TIMEOUT_SEC)
         reply = DRIVER.read_last_response() or ""
         return True, reply, (not idle_ok)
@@ -4230,11 +4217,18 @@ def _run_tool_probe():
             # FleetCockpit renders this as a spinner, so a 30-180s real tool round-trip never
             # looks like an inert stale-red indicator.
             tool_probe.record_probe(False, "checking", detail="tool probe in progress")
-            agent_loaded, reply, timed_out = _run_bounded_page_probe_call(_do_tool_probe_turn)
+            # A FRESH, unguessable challenge every probe (see tool_probe.new_probe_challenge's
+            # docstring) -- the token has to travel with this specific turn, so it is captured
+            # here and threaded through to the verify_probe_reply() call(s) below rather than
+            # looked up from any shared/global state.
+            instruction, expected_token = _next_tool_probe_challenge()
+            agent_loaded, reply, timed_out = _run_bounded_page_probe_call(
+                lambda: _do_tool_probe_turn(instruction)
+            )
             if timed_out:
                 ok, kind = False, "timeout"
             else:
-                ok, kind = tool_probe.classify_probe_reply(reply, agent_loaded)
+                ok, kind = tool_probe.verify_probe_reply(reply, expected_token, agent_loaded)
                 if kind == "consent_card":
                     logger.info("tool probe: consent_card sighted -- driving recovery")
                     consented = False
@@ -4246,13 +4240,18 @@ def _run_tool_probe():
                         # consent resolved without needing surface() -- fresh episode for later.
                         _reset_consent_surface_episode()
                         try:
+                            # FRESH challenge for the re-probe too -- never repeat the token the
+                            # consent-card turn already saw.
+                            instruction2, expected_token2 = _next_tool_probe_challenge()
                             agent_loaded, reply, timed_out = _run_bounded_page_probe_call(
-                                _do_tool_probe_turn
+                                lambda: _do_tool_probe_turn(instruction2)
                             )
                             if timed_out:
                                 ok, kind = False, "timeout"
                             else:
-                                ok, kind = tool_probe.classify_probe_reply(reply, agent_loaded)
+                                ok, kind = tool_probe.verify_probe_reply(
+                                    reply, expected_token2, agent_loaded
+                                )
                         except Exception:
                             logger.warning("tool probe: re-probe after auto-consent raised",
                                            exc_info=True)
