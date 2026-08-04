@@ -422,3 +422,179 @@ def test_edge_reconnect_probe_challenge_never_repeats_consecutively(tmp_path, mo
     instr2, token2 = ER._next_probe_challenge()
     assert instr1 != instr2
     assert token1 != token2
+
+
+# ===========================================================================
+# 9. journal_probe_failure(): append-only FULL-reply evidence journal for FAILED probes.
+#
+# Incident this closes: record_probe()'s `detail` is the reply truncated to 200 chars, which
+# is enough to distinguish OK from not-OK but not enough to tell a repetition-refusal apart
+# from a genuinely broken tool path apart from "answered with the token from the PREVIOUS
+# challenge" -- all three collapse into kind="error" once truncated. journal_probe_failure()
+# is additive: it must never touch tool_probe.json / record_probe()'s contract (pinned in
+# section 9c below), must only ever write for FAILED probes, and must be bounded so it cannot
+# grow without limit (see PROBE_FAILURE_JOURNAL_MAX_RECORDS/_MAX_BYTES's docstring for why both
+# a count and a byte-size cap are enforced).
+# ===========================================================================
+
+
+def _read_journal_records(path):
+    if not path.exists():
+        return []
+    lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    return [json.loads(ln) for ln in lines]
+
+
+def test_journal_probe_failure_appends_one_record_with_full_untruncated_reply(monkeypatch, tmp_path):
+    journal = tmp_path / "probe_failures.jsonl"
+    monkeypatch.setattr(tool_probe, "PROBE_FAILURE_JOURNAL", journal)
+    long_reply = "エラーの詳細説明です。" * 40  # comfortably over 200 chars
+    assert len(long_reply) > 200
+    tool_probe.journal_probe_failure(False, "error", long_reply, expected_token="abc123abc123",
+                                      ts=100.0)
+    records = _read_journal_records(journal)
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["reply"] == long_reply  # full text, NOT cut to 200 chars
+    assert rec["kind"] == "error"
+    assert rec["ts"] == 100.0
+    assert rec["expected_token"] == "abc123abc123"
+
+
+def test_journal_probe_failure_appends_nothing_on_success(monkeypatch, tmp_path):
+    journal = tmp_path / "probe_failures.jsonl"
+    monkeypatch.setattr(tool_probe, "PROBE_FAILURE_JOURNAL", journal)
+    tool_probe.journal_probe_failure(True, "answer", "everything worked, token abc123abc123",
+                                      expected_token="abc123abc123", ts=100.0)
+    # No I/O at all on the success path -- the file must not even be created.
+    assert not journal.exists()
+
+
+def test_journal_probe_failure_distinguishes_stale_token_from_no_token(monkeypatch, tmp_path):
+    journal = tmp_path / "probe_failures.jsonl"
+    monkeypatch.setattr(tool_probe, "PROBE_FAILURE_JOURNAL", journal)
+
+    # Case A: the real production example from the incident report -- reply carries a STALE
+    # token (from a previous challenge), current challenge expected a different one.
+    stale_reply = ("call_tool 経由の list_directory の呼び出しに成功しました。指定パス直下に"
+                   "見つかったファイルは1件です。 probe_bcac6dc36c5a.txt")
+    tool_probe.journal_probe_failure(False, "error", stale_reply,
+                                      expected_token="e3fb184aa028", ts=1.0)
+
+    # Case B: reply carries no probe-token-shaped text at all.
+    no_token_reply = "すみません、よくわかりませんでした。"
+    tool_probe.journal_probe_failure(False, "error", no_token_reply,
+                                      expected_token="e3fb184aa028", ts=2.0)
+
+    records = _read_journal_records(journal)
+    assert len(records) == 2
+    stale_rec, no_token_rec = records
+
+    # Distinguishable from the recorded fields alone, no need to eyeball `reply`:
+    assert stale_rec["has_probe_token"] is True
+    assert stale_rec["found_probe_tokens"] == ["probe_bcac6dc36c5a.txt"]
+    assert stale_rec["expected_token"] == "e3fb184aa028"
+    # The found token's hex differs from expected_token -- proves it's a STALE token, not a
+    # match that verify_probe_reply somehow missed.
+    assert "e3fb184aa028" not in stale_rec["found_probe_tokens"][0]
+
+    assert no_token_rec["has_probe_token"] is False
+    assert no_token_rec["found_probe_tokens"] == []
+
+
+def test_journal_probe_failure_records_multiple_found_tokens(monkeypatch, tmp_path):
+    journal = tmp_path / "probe_failures.jsonl"
+    monkeypatch.setattr(tool_probe, "PROBE_FAILURE_JOURNAL", journal)
+    reply = "見つかったのは probe_aaaaaaaaaaaa.txt と probe_bbbbbbbbbbbb.txt の2件です。"
+    tool_probe.journal_probe_failure(False, "error", reply, expected_token="cccccccccccc",
+                                      ts=1.0)
+    rec = _read_journal_records(journal)[0]
+    assert rec["has_probe_token"] is True
+    assert set(rec["found_probe_tokens"]) == {"probe_aaaaaaaaaaaa.txt", "probe_bbbbbbbbbbbb.txt"}
+
+
+def test_journal_probe_failure_expected_token_none_when_no_challenge(monkeypatch, tmp_path):
+    journal = tmp_path / "probe_failures.jsonl"
+    monkeypatch.setattr(tool_probe, "PROBE_FAILURE_JOURNAL", journal)
+    tool_probe.journal_probe_failure(False, "error", "some reply", expected_token=None, ts=1.0)
+    rec = _read_journal_records(journal)[0]
+    assert rec["expected_token"] is None
+
+
+def test_journal_probe_failure_caps_record_count_and_keeps_newest(monkeypatch, tmp_path):
+    journal = tmp_path / "probe_failures.jsonl"
+    monkeypatch.setattr(tool_probe, "PROBE_FAILURE_JOURNAL", journal)
+    monkeypatch.setattr(tool_probe, "PROBE_FAILURE_JOURNAL_MAX_RECORDS", 10)
+    total = 25
+    for i in range(total):
+        tool_probe.journal_probe_failure(False, "error", "reply #%d" % i, ts=float(i))
+    records = _read_journal_records(journal)
+    assert len(records) == 10
+    # The bound holds AND the newest records are the ones that survived.
+    assert [r["ts"] for r in records] == [float(i) for i in range(total - 10, total)]
+    assert records[-1]["reply"] == "reply #24"
+
+
+def test_journal_probe_failure_caps_byte_size_and_keeps_newest(monkeypatch, tmp_path):
+    journal = tmp_path / "probe_failures.jsonl"
+    monkeypatch.setattr(tool_probe, "PROBE_FAILURE_JOURNAL", journal)
+    # Record count cap left generous; byte cap is the one under test here.
+    monkeypatch.setattr(tool_probe, "PROBE_FAILURE_JOURNAL_MAX_RECORDS", 10_000)
+    monkeypatch.setattr(tool_probe, "PROBE_FAILURE_JOURNAL_MAX_BYTES", 2_000)
+    for i in range(40):
+        tool_probe.journal_probe_failure(False, "error", "x" * 100, ts=float(i))
+    assert journal.stat().st_size <= 2_000 + 512  # small slop for the last write's own line
+    records = _read_journal_records(journal)
+    assert len(records) >= 1
+    # Newest entries (highest ts) survived, not the oldest.
+    assert records[-1]["ts"] == 39.0
+    tss = [r["ts"] for r in records]
+    assert tss == sorted(tss)
+
+
+def test_journal_probe_failure_never_raises_on_unwritable_path(monkeypatch):
+    from pathlib import Path
+    monkeypatch.setattr(tool_probe, "PROBE_FAILURE_JOURNAL",
+                         Path("\x00bad\x00path\x00probe_failures.jsonl"))
+    # Must not raise even though the path can never be created.
+    tool_probe.journal_probe_failure(False, "error", "a reply that will never be persisted")
+
+
+def test_journal_probe_failure_never_raises_when_journal_dir_unwritable_on_success_path(monkeypatch):
+    from pathlib import Path
+    monkeypatch.setattr(tool_probe, "PROBE_FAILURE_JOURNAL",
+                         Path("\x00bad\x00path\x00probe_failures.jsonl"))
+    # ok=True short-circuits before any I/O is attempted, so this is really testing the no-op
+    # path stays a no-op even given a hostile path -- must not raise either way.
+    tool_probe.journal_probe_failure(True, "answer", "fine")
+
+
+def test_find_probe_tokens_pure_helper_dedupes_and_matches_shape():
+    text = ("probe_aaaaaaaaaaaa.txt appears twice: probe_aaaaaaaaaaaa.txt, plus "
+            "probe_bbbbbbbbbbbb.txt, and NOT probe_short.txt or PROBE_AAAAAAAAAAAA.txt")
+    found = tool_probe._find_probe_tokens(text)
+    assert found == ["probe_aaaaaaaaaaaa.txt", "probe_bbbbbbbbbbbb.txt"]
+
+
+def test_journal_probe_failure_does_not_alter_tool_probe_json_contract(monkeypatch, tmp_path):
+    """record_probe()/.fleet/tool_probe.json must be byte-identical to what the current code
+    produces for the same inputs -- the journal is purely additive, /health and the cockpit
+    must be unaffected. Pins record_probe()'s exact on-disk shape."""
+    probe_file = tmp_path / "tool_probe.json"
+    journal = tmp_path / "probe_failures.jsonl"
+    monkeypatch.setattr(tool_probe, "_PROBE_FILE", probe_file)
+    monkeypatch.setattr(tool_probe, "PROBE_FAILURE_JOURNAL", journal)
+
+    tool_probe.record_probe(False, "error", detail="stale token seen", ts=7.0)
+    tool_probe.journal_probe_failure(False, "error", "the full stale-token reply text",
+                                      expected_token="deadbeefcafe", ts=7.0)
+
+    # tool_probe.json: exact same shape record_probe has always produced -- no new keys, no
+    # change to existing ones, `detail` still whatever the caller passed (unaffected by the
+    # journal call that ran right alongside it).
+    on_disk = json.loads(probe_file.read_text(encoding="utf-8"))
+    assert on_disk == {"ts": 7.0, "ok": False, "kind": "error", "detail": "stale token seen"}
+
+    # The journal is a SEPARATE file with its own shape -- confirms the two never merge/collide.
+    assert journal.exists()
+    assert probe_file != journal

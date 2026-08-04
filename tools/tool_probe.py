@@ -50,12 +50,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 # ---------------------------------------------------------------------------------------
 # Local copy of relay/edge_reconnect.py's marker lists (see module docstring above for why
@@ -296,6 +297,130 @@ def record_probe(ok: bool, kind: str, detail: str = "", ts: Optional[float] = No
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False)
             os.replace(tmp, str(_PROBE_FILE))
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------------------
+# Append-only FAILURE evidence journal.
+#
+# Incident this closes: both probe callers persist only ok/kind/detail to tool_probe.json,
+# and `detail` is the reply TRUNCATED to 200 chars (record_probe's contract below is left
+# unchanged on purpose -- /health and the cockpit read that exact shape). For a FAILED probe
+# that truncation destroys the one thing needed to tell failures apart after the fact: a
+# repetition-refusal, a genuinely broken tool path, and "answered correctly but with the
+# token from the PREVIOUS challenge" all collapse into kind="error" and look identical once
+# the reply is cut off. A real production example: the reply was "...probe_bcac6dc36c5a.txt"
+# while the current challenge's token was "e3fb184aa028" -- correctly rejected by
+# verify_probe_reply, but with the 200-char detail alone there is no way to tell that apart
+# from a reply that never mentioned a probe token at all.
+#
+# journal_probe_failure() is additive: it does not change record_probe()/tool_probe.json in
+# any way, is only ever called ALONGSIDE the existing record_probe() call (never instead of
+# it), and only ever writes for a FAILED probe (ok=False) -- successes are not journalled, so
+# the common (healthy) path never grows this file.
+# ---------------------------------------------------------------------------------------
+
+PROBE_FAILURE_JOURNAL = Path(__file__).resolve().parent.parent / ".fleet" / "probe_failures.jsonl"
+
+# Matches the exact file-name shape new_probe_challenge() writes ("probe_<12 hex chars>.txt"),
+# so a reply can be checked for "did it mention ANY probe-challenge-shaped token" independent
+# of whether that token happens to be the one THIS probe expected.
+_PROBE_TOKEN_RE = re.compile(r"probe_[0-9a-f]{12}\.txt")
+
+# Cap chosen to bound the file two ways at once, because this journal's whole point is to keep
+# the FULL untruncated reply (unlike tool_probe.json's 200-char detail), so a single record's
+# size is not fixed the way a normal log line's is:
+#   - PROBE_FAILURE_JOURNAL_MAX_RECORDS: recent failure history is what is actionable here --
+#     500 records is generous for "what went wrong recently" without keeping ancient entries.
+#   - PROBE_FAILURE_JOURNAL_MAX_BYTES: a safety net independent of record count, in case a
+#     handful of unusually large replies would otherwise blow past a reasonable file size well
+#     before 500 records accumulate. 5 MB is small next to the 35 MB unrotated log this repo
+#     already hit once, while still comfortably holding hundreds of ordinary-sized replies.
+# Whichever bound is hit first wins; the OLDEST records are dropped and the NEWEST are always
+# kept, since a post-incident read wants what just happened, not what happened weeks ago.
+PROBE_FAILURE_JOURNAL_MAX_RECORDS = 500
+PROBE_FAILURE_JOURNAL_MAX_BYTES = 5 * 1024 * 1024  # 5 MiB
+
+_JOURNAL_LOCK = threading.Lock()
+
+
+def _find_probe_tokens(text: str) -> List[str]:
+    """Pure helper: every probe_<hex>.txt-shaped token found in `text`, de-duplicated but
+    order-preserved. Exposed separately from journal_probe_failure so the "does the reply
+    contain a token at all" question is independently unit-testable without any file I/O."""
+    seen = []
+    for m in _PROBE_TOKEN_RE.findall(text or ""):
+        if m not in seen:
+            seen.append(m)
+    return seen
+
+
+def journal_probe_failure(ok: bool, kind: str, reply: Optional[str],
+                           expected_token: Optional[str] = None,
+                           ts: Optional[float] = None) -> None:
+    """Append one evidence record for a FAILED probe to PROBE_FAILURE_JOURNAL (JSON Lines,
+    newest entry last). No-ops immediately (no I/O, no lock) when `ok` is True -- a caller may
+    call this unconditionally on every probe outcome without needing its own success/failure
+    gate, mirroring record_probe()'s (ok, kind, detail) signature so the two calls stay easy to
+    keep side by side at each call site.
+
+    Each record carries, in addition to timestamp/kind:
+      - "reply": the FULL, untruncated reply text (never cut to 200 chars like record_probe's
+        `detail`) -- this is the entire point of the journal.
+      - "expected_token": the challenge token this probe turn was checked against, or None if
+        the caller had none (e.g. edge_reconnect's --probe override path, or the fallback
+        challenge pair).
+      - "found_probe_tokens": every probe_<hex>.txt-shaped token actually present in the reply
+        (see _find_probe_tokens), independent of whether it matches expected_token.
+      - "has_probe_token": bool(found_probe_tokens) -- the field that alone distinguishes "the
+        reply carried a STALE token from an earlier challenge" (found_probe_tokens non-empty,
+        none of them equal to expected_token) from "the reply carried no token at all"
+        (found_probe_tokens empty), without a human needing to eyeball the full reply text.
+
+    Best-effort like record_probe(): any failure (permissions, full disk, unwritable path,
+    concurrent access, ...) is swallowed and this never raises, so a journalling hiccup can
+    never break a probe or a request.
+    """
+    if ok:
+        return
+    try:
+        now = time.time() if ts is None else ts
+        text = reply or ""
+        record = {
+            "ts": now,
+            "kind": kind,
+            "reply": text,
+            "expected_token": expected_token or None,
+            "found_probe_tokens": _find_probe_tokens(text),
+        }
+        record["has_probe_token"] = bool(record["found_probe_tokens"])
+        line = json.dumps(record, ensure_ascii=False)
+        with _JOURNAL_LOCK:
+            PROBE_FAILURE_JOURNAL.parent.mkdir(parents=True, exist_ok=True)
+            lines: List[str] = []
+            if PROBE_FAILURE_JOURNAL.exists():
+                try:
+                    with open(PROBE_FAILURE_JOURNAL, "r", encoding="utf-8") as f:
+                        lines = [ln.rstrip("\n") for ln in f if ln.strip()]
+                except Exception:
+                    lines = []
+            lines.append(line)
+            # Record-count cap first (cheap, and the common case that actually bites).
+            if len(lines) > PROBE_FAILURE_JOURNAL_MAX_RECORDS:
+                lines = lines[-PROBE_FAILURE_JOURNAL_MAX_RECORDS:]
+
+            def _total_bytes(ls: List[str]) -> int:
+                return sum(len(ln.encode("utf-8")) + 1 for ln in ls)
+
+            # Byte-size cap second, in case a run of oversized replies blows past it while
+            # still under the record-count cap. Always keep at least the newest record.
+            while len(lines) > 1 and _total_bytes(lines) > PROBE_FAILURE_JOURNAL_MAX_BYTES:
+                lines.pop(0)
+            tmp = str(PROBE_FAILURE_JOURNAL) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + ("\n" if lines else ""))
+            os.replace(tmp, str(PROBE_FAILURE_JOURNAL))
     except Exception:
         pass
 

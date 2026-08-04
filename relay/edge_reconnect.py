@@ -364,6 +364,12 @@ def reconnect(cdp_url: str, agent_url: str, probe: str = None, turn_timeout_s: i
                 ok1 = False
                 out["had_card"] = any(m in resp for m in CONSENT_MARKERS)
             final_ok = ok1
+            # Tracks whichever (kind, reply) pair `final_ok` was actually decided from, so the
+            # failure journal below records the SAME evidence `final_ok`/`out["ok"]` reflects --
+            # the first-send outcome unless a consent-card click-through led to a re-send, in
+            # which case that re-send's outcome wins (mirrors `final_ok` itself, one line down).
+            final_kind = kind1 if use_challenge else None
+            final_reply = resp
             if out["had_card"]:
                 out["clicked"] = click_through_consent(page)
                 if out["clicked"]:
@@ -375,11 +381,25 @@ def reconnect(cdp_url: str, agent_url: str, probe: str = None, turn_timeout_s: i
                     resp2 = drv.read_last_response() or ""
                     out["resp2"] = resp2[:600]
                     if use_challenge:
-                        final_ok, _kind2 = tool_probe.verify_probe_reply(
+                        final_ok, final_kind = tool_probe.verify_probe_reply(
                             resp2, expected_token, True
                         )
+                        final_reply = resp2
             if use_challenge:
                 out["ok"] = final_ok
+                # Additive evidence journal (see tools/tool_probe.py's journal_probe_failure
+                # docstring) -- this standalone script never called tool_probe.record_probe()
+                # at all, so unlike the bridge's idle probe there is no existing .fleet/
+                # tool_probe.json write to sit alongside here; this is purely additive. No-ops
+                # when final_ok is True. `reply`/`resp` here are the FULL untruncated text --
+                # out["resp1"]/out["resp2"] above are deliberately capped to 600 chars for the
+                # returned dict, which is not what the journal wants.
+                try:
+                    tool_probe.journal_probe_failure(
+                        final_ok, final_kind, final_reply, expected_token=expected_token
+                    )
+                except Exception:
+                    pass
             else:
                 final = out["resp2"] or out["resp1"]
                 out["ok"] = (
