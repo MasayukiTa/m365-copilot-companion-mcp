@@ -109,6 +109,7 @@ jobs:
             relay/test_confidence.py \
             relay/test_continue_escalation.py \
             relay/test_edge_auth.py \
+            relay/test_edge_rehide_guard.py \
             relay/test_execution_profiles.py \
             relay/test_feedback.py \
             relay/test_fleet_reaper.py \
