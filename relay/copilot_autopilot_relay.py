@@ -334,6 +334,133 @@ RETRY_JOB = (
     " " + OUTPUT_DISCIPLINE
 )
 
+# How old a recorded tool-probe result (tools/tool_probe.py's .fleet/tool_probe.json, refreshed
+# on the bridge's MCP_TOOL_PROBE_SEC cadence -- 600s/10min by default, see
+# bridge/copilot_bridge.py) may be before we stop trusting it as proof the tool path is
+# CURRENTLY alive. 3x the default probe cadence (30 min): generous enough to ride out one
+# delayed/retried probe tick without flapping between healthy/stale, while still catching a
+# probe subsystem that has gone quiet for a sustained stretch -- which is exactly the mined
+# incident this closes (tools were unreachable for the WHOLE run, not for a single missed tick).
+STUCK_TOOL_HEALTH_MAX_AGE_S = float(os.environ.get("MCP_STUCK_TOOL_HEALTH_MAX_AGE_S", "1800"))
+
+
+def _tool_health_for_stuck(max_age_s: float = STUCK_TOOL_HEALTH_MAX_AGE_S,
+                            now: float | None = None) -> tuple[bool, str]:
+    """Independent signal for whether a self-reported STUCK is worth retrying: is the tool
+    round-trip (tools/tool_probe.py's .fleet/tool_probe.json sidecar) actually alive right now?
+    Deliberately does NOT read `resp` / the agent's reply text -- see bridge/copilot_bridge.py's
+    comment above MAX_BRIDGE_UNLOCK_ATTEMPTS for why that specific approach already failed once.
+
+    Returns (keep_retrying, detail).
+
+    keep_retrying=True (today's behaviour) when we cannot PROVE the tool path is broken:
+      * the probe subsystem could not even be read (import failure, or get_summary() raising
+        despite its own no-raise contract) -- a broken READ must never be the reason a
+        genuinely transient failure gives up early;
+      * no probe has EVER been recorded (tool_ts is None) -- get_summary() returns this exact
+        same all-None shape whether the sidecar file is missing, corrupt, or simply never
+        written (e.g. probing disabled, or the process hasn't reached its first tick yet), so
+        this is precisely "the sidecar is missing/unreadable/malformed" -- we have no positive
+        evidence either way and must not let an unrelated absence curtail retries.
+
+    keep_retrying=False (terminal -- do not retry) only when we DO have positive evidence:
+      * the last recorded probe is older than max_age_s ("stale" -- no longer trustworthy as
+        CURRENT proof the tool path works), or
+      * the last recorded probe is fresh but reports ok=False (an active, recent failure).
+    """
+    try:
+        from tools import tool_probe
+        summary = tool_probe.get_summary(now=now)
+    except Exception as e:
+        return True, "tool-probe unreadable (%s: %s) -- degrading to retry" % (
+            type(e).__name__, e)
+    tool_ts = summary.get("tool_ts")
+    if tool_ts is None:
+        return True, "no tool-probe result on record -- degrading to retry"
+    age = summary.get("tool_age_s")
+    kind = summary.get("tool_kind")
+    if age is None or age > max_age_s:
+        return False, "tool-probe result is stale (age=%s > %.0fs threshold, kind=%s)" % (
+            ("%.0fs" % age) if age is not None else "unknown", max_age_s, kind)
+    if not summary.get("tool_ok"):
+        return False, "tool-probe reports the tool path unreachable (kind=%s, age=%.0fs)" % (
+            kind, age)
+    return True, "tool-probe healthy (kind=%s, age=%.0fs)" % (kind, age)
+
+
+# Escalating/varying nudge text for RETRY_JOB (required) and CONTINUE_JOB/FIX_JOB (same
+# treatment) re-sends in run_relay()'s own loop -- this loop was the one place the
+# identical-nudge-repetition fix (see relay_fleet.py's _continue_nudge / refuter.py's
+# _next_refuter_nudge, both referenced above) had been missed. Mined evidence for RETRY_JOB:
+# 240 of 296 "tools absent" STUCK replies across 2,628 stored transcripts were replies to this
+# exact byte-identical text; the agent explicitly recognised the repetition in its own prose.
+#
+# Same shape as _continue_nudge: counts 1-2 keep the ORIGINAL constant unchanged (back-compat
+# for the common fast case); count 3+ rotates through a distinct, stronger phrasing and always
+# embeds the attempt number. Each counter below is a simple per-run running total incremented
+# ONLY at its own single call site in run_relay() -- not a strict "immediately consecutive"
+# streak with resets elsewhere -- which is sufficient because "never byte-identical" only
+# requires that two invocations of the SAME call site see strictly increasing counts, which a
+# monotonic per-site counter already guarantees regardless of what other branches ran between
+# them.
+
+_RETRY_ESCALATION_PHRASES = (
+    "同じ手順を単純に繰り返すのではなく、直前に失敗した呼び出しの引数・パス指定・権限を"
+    "見直してから再試行してください。",
+    "ツール呼び出しの前提（対象ファイルの存在、パス表記、権限）を確認し直してから、"
+    "もう一度実行してください。",
+    "エラーの内容を踏まえて手順を調整し、同じ失敗を繰り返さないようにしてから"
+    "再試行してください。",
+)
+
+
+def _next_retry_job(count: int) -> str:
+    """RETRY-branch nudge for the count-th (1-based) transient STUCK retry in this run."""
+    if count <= 2:
+        return RETRY_JOB
+    phrase = _RETRY_ESCALATION_PHRASES[(count - 3) % len(_RETRY_ESCALATION_PHRASES)]
+    return ("%s（再試行%d回目）完了したら最後の行に DONE、本当に解決不能な場合のみ "
+            "STUCK: と理由を書いてください。 %s" % (phrase, count, OUTPUT_DISCIPLINE))
+
+
+_CONTINUE_ESCALATION_PHRASES = (
+    "ここまでの作業を踏まえ、残りは簡潔に進めてください。",
+    "同じ作業の繰り返しは不要です。残タスクを絞って手短に進めてください。",
+    "ここまでの内容を土台に、まだ終わっていない部分だけ手早く仕上げてください。",
+)
+
+
+def _next_continue_job(count: int) -> str:
+    """CONTINUE-branch nudge for the count-th (1-based) plain-continue turn in this run.
+    Same shape as relay_fleet.py's _continue_nudge: counts 1-2 are the original CONTINUE_JOB
+    unchanged (back-compat), count 3+ rotates through varied phrasing tagged with the count so
+    consecutive sends past the gentle window are never byte-identical."""
+    if count <= 2:
+        return CONTINUE_JOB
+    phrase = _CONTINUE_ESCALATION_PHRASES[(count - 3) % len(_CONTINUE_ESCALATION_PHRASES)]
+    return ("%s（継続%d回目）ゴール全体が完了したら最後の行に DONE、まだ続きがあれば "
+            "CONTINUE、行き詰まったら STUCK: 理由 と書いてください。"
+            " %s" % (phrase, count, OUTPUT_DISCIPLINE))
+
+
+_FIX_ESCALATION_PHRASES = (
+    "同じ修正を繰り返すのではなく、直前の失敗の根本原因をもう一段掘り下げてから対処してください。",
+    "これまでの修正で解消しなかった点を踏まえ、別の角度から原因を特定してから修正してください。",
+    "直前の失敗内容を見直し、まだ試していない対処を検討してから修正してください。",
+)
+
+
+def _next_fix_job(count: int) -> str:
+    """FIX-branch nudge for the count-th (1-based) FAIL-triggered turn in this run. Same shape
+    as _next_continue_job / _next_retry_job above: counts 1-2 are the original FIX_JOB
+    unchanged, count 3+ rotates through varied phrasing tagged with the count."""
+    if count <= 2:
+        return FIX_JOB
+    phrase = _FIX_ESCALATION_PHRASES[(count - 3) % len(_FIX_ESCALATION_PHRASES)]
+    return ("%s（修正%d回目）どうしても無理なら最後の行に STUCK: 理由 と書いてください。"
+            " %s" % (phrase, count, OUTPUT_DISCIPLINE))
+
+
 # Re-anchored as the FIRST message of a fresh conversation after the previous one hit the
 # Copilot model token limit (OpenAIModelTokenLimit). The new chat has NO memory of prior
 # turns, so the agent must re-derive progress from the actual artifacts on disk (the target
@@ -1417,6 +1544,8 @@ def run_relay(
     analyze_count = 0
     forge_count = 0
     verify_attempts = 0
+    continue_count = 0     # consecutive plain-CONTINUE turns (drives _next_continue_job escalation)
+    fix_count = 0          # consecutive FAIL->fix turns (drives _next_fix_job escalation)
     transient = 0          # transient-failure retries (send/timeout/likely-transient STUCK)
     gen_waits = 0          # consecutive "previous turn still generating" reschedules.
     # This is NOT the transient budget: waiting out a slow (django/sympy) turn is not a
@@ -1698,13 +1827,21 @@ def run_relay(
         last_line = (resp.strip().splitlines() or [""])[-1].upper()
 
         if reported_stuck(resp):
+            tool_ok_for_retry, tool_detail = _tool_health_for_stuck()
+            if not tool_ok_for_retry:
+                runlog_append(run_id, {"turn": turn, "event": "stuck_terminal_tool_unhealthy",
+                                       "detail": tool_detail})
+                outcome, reason = "STUCK", (
+                    "agent reported STUCK and the tool path is not currently reachable (%s) -- "
+                    "retrying would not help, so not retrying" % tool_detail)
+                break
             # under load an agent STUCK is usually a downstream symptom of a transient
             # tool/network failure -- retry the turn before giving up, with backoff.
             if transient < max_transient:
                 transient += 1
                 runlog_append(run_id, {"turn": turn, "event": "transient_retry",
-                                       "kind": "stuck", "n": transient})
-                job = RETRY_JOB
+                                       "kind": "stuck", "n": transient, "tool_health": tool_detail})
+                job = _next_retry_job(transient)
                 time.sleep(sleep_s + transient_backoff(transient))
                 continue
             outcome, reason = "STUCK", f"agent reported STUCK (after {transient} retries)"
@@ -1771,9 +1908,11 @@ def run_relay(
             outcome, reason = "STUCK", f"no progress for {no_progress + 1} turns"
             break
         if "FAIL" in last_line:
-            job = FIX_JOB
+            fix_count += 1
+            job = _next_fix_job(fix_count)
         else:
-            job = CONTINUE_JOB
+            continue_count += 1
+            job = _next_continue_job(continue_count)
         time.sleep(sleep_s + backoff_s)
 
     if outcome is None:
