@@ -354,11 +354,19 @@ def reconnect(cdp_url: str, agent_url: str, probe: str = None, turn_timeout_s: i
             else:
                 instruction, expected_token = probe, None
             drv.send(instruction)
-            drv.wait_for_idle(timeout_s=turn_timeout_s)
+            idle_ok = drv.wait_for_idle(timeout_s=turn_timeout_s)
             resp = drv.read_last_response() or ""
             out["resp1"] = resp[:600]
             if use_challenge:
-                ok1, kind1 = tool_probe.verify_probe_reply(resp, expected_token, True)
+                if idle_ok:
+                    ok1, kind1 = tool_probe.verify_probe_reply(resp, expected_token, True)
+                else:
+                    # wait_for_idle's settle+turn-correspondence check never confirmed a
+                    # genuinely NEW, settled reply for this send (timeout, or the DOM kept
+                    # echoing a previous turn's answer -- the stale-capture signature).
+                    # Classify as a timeout instead of running verify_probe_reply against
+                    # text that may not even belong to this turn.
+                    ok1, kind1 = False, "timeout"
                 out["had_card"] = kind1 == "consent_card"
             else:
                 ok1 = False
@@ -377,13 +385,16 @@ def reconnect(cdp_url: str, agent_url: str, probe: str = None, turn_timeout_s: i
                         # a FRESH challenge for the re-send -- never repeat the first token.
                         instruction, expected_token = _next_probe_challenge()
                     drv.send(instruction)      # re-invoke the tool on the now-valid connection
-                    drv.wait_for_idle(timeout_s=turn_timeout_s)
+                    idle_ok2 = drv.wait_for_idle(timeout_s=turn_timeout_s)
                     resp2 = drv.read_last_response() or ""
                     out["resp2"] = resp2[:600]
                     if use_challenge:
-                        final_ok, final_kind = tool_probe.verify_probe_reply(
-                            resp2, expected_token, True
-                        )
+                        if idle_ok2:
+                            final_ok, final_kind = tool_probe.verify_probe_reply(
+                                resp2, expected_token, True
+                            )
+                        else:
+                            final_ok, final_kind = False, "timeout"
                         final_reply = resp2
             if use_challenge:
                 out["ok"] = final_ok

@@ -480,6 +480,33 @@ def has_end_marker(text: str) -> bool:
     return any(m in last for m in _END_MARKERS)
 
 
+# ── settle-detection tuning (env-overridable) ───────────────────────────────────────
+# Mined from 2,628 stored transcripts (3,931 replies): 275 replies (7.0%) were captured
+# TRUNCATED -- the DOM read landed while the page was still rendering, so a partial
+# string (e.g. "takeuchifile操作\nリ", 2 characters after the header) got persisted as
+# if it were the final answer. A read taken mid-render is, by construction, still
+# CHANGING on the very next read a moment later -- so "the text held identical across
+# several consecutive samples, a short interval apart" is the actual completion signal,
+# not "the text looked the same once" or "the DOM went idle for an instant".
+#
+# Interval between consecutive reply-text samples once generation has stopped (the Stop
+# button is gone). 0.5s: short enough that an already-complete reply is confirmed in
+# ~1s (see REPLY_SETTLE_SAMPLES below), long enough that it is not just re-reading the
+# same unflushed synchronous DOM state twice in a row.
+REPLY_SETTLE_INTERVAL_S = max(
+    0.05, float(os.environ.get("MCP_REPLY_SETTLE_INTERVAL_S", "0.5"))
+)
+# Consecutive identical samples required before text is accepted as settled (a floor;
+# dwell_s below can still require more elapsed time). 3 is the smallest number that
+# rejects a coincidental one-off repeat: a single truncated capture is, by definition,
+# different from the read taken one interval earlier (it is still growing), so even 2
+# identical reads would already catch it -- 3 adds one more confirmation so two samples
+# landing on the same unlucky mid-word instant still cannot slip through. A markerless
+# tail (no DONE/CONTINUE/STUCK/... on the last line) doubles this, exactly as it doubles
+# dwell_s below, because a mid-stream pause can otherwise look "stable" for a while.
+REPLY_SETTLE_SAMPLES = max(2, int(os.environ.get("MCP_REPLY_SETTLE_SAMPLES", "3")))
+
+
 def extract_research(resp: str) -> str:
     """Pull the query out of a `RESEARCH: <...>` line if the agent asked for a
     deep-dive. Returns '' if no research was requested."""
@@ -606,6 +633,13 @@ class CopilotWebDriver:
         # Observable proof for LOCAL_LOOP acceptance tests: the response-content-independent
         # path must leave this at zero for the whole run.
         self.answer_content_reads = 0
+        # The reply text ACCEPTED (via wait_for_idle's settle+correspondence check, or a
+        # caller using _accept_new_reply directly) for the most recent turn on this driver
+        # instance. None until a first turn is accepted. Used to detect the stale-capture
+        # signature observed live: the idle tool probe read back a reply carrying the
+        # PREVIOUS challenge's token (probe_bcac6dc36c5a.txt while the current challenge was
+        # e3fb184aa028) -- i.e. the reader returned the prior turn's answer, not a new one.
+        self._last_returned_reply = None
         # Cap the default action timeout so no single locator op can hang the worker for
         # Playwright's default 30s. Best-effort: a driver built on a mock/stub page (tests)
         # has no such method, so guard it.
@@ -1078,11 +1112,30 @@ class CopilotWebDriver:
             "(Send button never submitted the message)"
         )
 
+    def _is_stale_repeat(self, text: str) -> bool:
+        """True iff `text` is byte-identical to the reply already ACCEPTED for the
+        PREVIOUS turn on this driver instance (see `_last_returned_reply`). This is the
+        stale-capture signature from the live incident: the idle tool probe read back a
+        reply carrying the challenge token from the PREVIOUS probe even though a new
+        answer block had appeared -- the reader returned the prior turn's answer instead
+        of the one just sent. `None` (no turn accepted yet) never matches, so a driver's
+        very first turn is never rejected on this basis."""
+        return self._last_returned_reply is not None and text == self._last_returned_reply
+
+    def _accept_new_reply(self, text: str) -> None:
+        """Record `text` as the accepted answer for the CURRENT turn, so the NEXT turn's
+        settle check can recognize a stale repeat of it. Callers that read the DOM through
+        their own poll loop (bypassing wait_for_idle) should call this at the exact point
+        they commit a settled answer, so the same cross-turn guard applies to them too."""
+        self._last_returned_reply = text
+
     def wait_for_idle(self, timeout_s: int = 1800, dwell_s: float = 4.0,
                       appear_timeout_s: int = 180) -> bool:
         """Completion = a NEW answer block appears, the agent is NO LONGER GENERATING,
-        and the answer text is STABLE. We do NOT rely on the loading indicator (it stays
-        present/visible while idle, so it is useless). The completion signal is twofold:
+        the answer text is STABLE, and that stable text is a genuinely NEW reply (not a
+        repeat of what the previous turn on this driver already returned). We do NOT rely
+        on the loading indicator (it stays present/visible while idle, so it is useless).
+        The completion signal has three parts:
 
           (1) the agent is not generating  -- the live Stop (square) button is GONE
               (`_is_generating()`); this is the authoritative "the turn finished"
@@ -1090,15 +1143,23 @@ class CopilotWebDriver:
               showing was the root cause of partial capture (transcript turn5: 102
               chars, mid-word "...隠し", no marker) -- a streaming pause longer than
               dwell_s made partial text look 'stable' and it was captured as final.
-          (2) the answer text has stopped changing for `dwell_s`.
+          (2) the answer text is STABLE: byte-identical across REPLY_SETTLE_SAMPLES
+              consecutive reads, REPLY_SETTLE_INTERVAL_S apart (module constants,
+              env-overridable -- see their definitions for the values chosen and why),
+              AND unchanged for at least `dwell_s` seconds. A markerless tail (no
+              DONE/CONTINUE/STUCK/... on the last line) doubles BOTH requirements, in
+              case the Stop button flickered off between two streamed chunks and a
+              mid-stream pause is what looks stable.
+          (3) TURN CORRESPONDENCE: the settled text must differ from the reply already
+              accepted for the previous turn (`_is_stale_repeat`). A byte-identical
+              repeat is not accepted as this turn's answer -- we keep polling (still
+              bounded by `timeout_s`) in case a genuinely new answer still lands. If the
+              timeout expires with the text never having changed, this returns False
+              exactly like any other timeout, so the caller can tell "no new reply yet"
+              from "answered" instead of silently getting back the old string.
 
-        BELT-AND-SUSPENDERS for the case where the Stop button briefly disappears between
-        streamed chunks: a stable answer whose TAIL has NO protocol marker
-        (DONE/CONTINUE/STUCK/FAIL/RESEARCH/ANALYZE/PLAN_READY) is treated as 'possibly
-        still streaming' and must stay stable for an EXTENDED window (2x dwell) before we
-        accept it. A marker-terminated tail is accepted at the normal dwell. Either way
-        the wait is bounded by `timeout_s`, so this can never hang. Polls the kill-switch
-        so STOP aborts promptly."""
+        The wait is bounded by `timeout_s` in every branch, so this can never hang.
+        Polls the kill-switch so STOP aborts promptly."""
         deadline = time.time() + timeout_s
         # 1) wait for a brand-new answer block to appear.
         appear_deadline = time.time() + min(appear_timeout_s, timeout_s)
@@ -1119,7 +1180,7 @@ class CopilotWebDriver:
         # While the block still shows a processing placeholder ("処理中です" etc.) OR the
         # agent is still generating (Stop button present), keep waiting -- otherwise we
         # would lock onto a placeholder or a mid-stream partial as the final answer.
-        last, stable_since = None, None
+        last, stable_count, stable_since = None, 0, None
         while time.time() < deadline:
             if stop_check().startswith("STOP"):
                 return False
@@ -1131,24 +1192,40 @@ class CopilotWebDriver:
             except Exception:
                 generating = False
             if generating:
-                last, stable_since = None, None
-                time.sleep(1.0)
+                last, stable_count, stable_since = None, 0, None
+                time.sleep(REPLY_SETTLE_INTERVAL_S)
                 continue
             t = self.read_last_response()
             if _is_processing(t):
-                last, stable_since = None, None
+                last, stable_count, stable_since = None, 0, None
             elif t == last:
+                stable_count += 1
+                marker_ok = has_end_marker(t)
                 # require a longer settle when the tail carries no protocol marker, in
                 # case the Stop button flickered off between two streamed chunks.
-                need = dwell_s if has_end_marker(t) else dwell_s * 2.0
-                if stable_since and (time.time() - stable_since) >= need:
-                    if not has_end_marker(t):
+                need_samples = REPLY_SETTLE_SAMPLES if marker_ok else REPLY_SETTLE_SAMPLES * 2
+                need_dwell = dwell_s if marker_ok else dwell_s * 2.0
+                # NOTE: compare to None, not truthiness -- stable_since is a time.time()
+                # timestamp, and a bare `if stable_since:` treats a legitimate 0.0 as
+                # "unset" and silently keeps `elapsed` pinned at 0.0 forever.
+                elapsed = (time.time() - stable_since) if stable_since is not None else 0.0
+                if stable_count >= need_samples and elapsed >= need_dwell:
+                    if self._is_stale_repeat(t):
+                        # Settled, but byte-identical to the PREVIOUS turn's already-
+                        # accepted answer -- do NOT accept this as the current turn's
+                        # reply (the stale-capture signature). Keep polling; still
+                        # bounded by `timeout_s` above.
+                        time.sleep(REPLY_SETTLE_INTERVAL_S)
+                        continue
+                    if not marker_ok:
                         print("[relay] accepting marker-less but idle+stable response "
-                              "(%.0fs) -- no DONE/CONTINUE/STUCK tail" % need)
+                              "(%.0fs, %d samples) -- no DONE/CONTINUE/STUCK tail"
+                              % (elapsed, stable_count))
+                    self._accept_new_reply(t)
                     return True
             else:
-                last, stable_since = t, time.time()
-            time.sleep(1.0)
+                last, stable_count, stable_since = t, 1, time.time()
+            time.sleep(REPLY_SETTLE_INTERVAL_S)
         return False
 
     def read_last_response(self) -> str:

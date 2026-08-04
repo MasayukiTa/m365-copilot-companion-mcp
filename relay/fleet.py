@@ -78,6 +78,16 @@ class FleetWorker:
             return False
         if t == self.last_text:
             if self.stable_since and (time.time() - self.stable_since) >= dwell_s:
+                # This poll loop bypasses CopilotWebDriver.wait_for_idle -- apply the
+                # same cross-turn correspondence guard directly (see its docstring): a
+                # settled text byte-identical to the PREVIOUS task's accepted answer on
+                # this same driver is the stale-capture signature, not a fresh result.
+                # Keep waiting; still bounded by `timeout_s` above.
+                if getattr(self.drv, "_is_stale_repeat", lambda _t: False)(t):
+                    return False
+                accept = getattr(self.drv, "_accept_new_reply", None)
+                if callable(accept):
+                    accept(t)
                 self.result = t
                 self.state = "idle"
                 return True
