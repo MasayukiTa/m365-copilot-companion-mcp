@@ -4241,16 +4241,19 @@ def _run_tool_probe():
                         _reset_consent_surface_episode()
                         try:
                             # FRESH challenge for the re-probe too -- never repeat the token the
-                            # consent-card turn already saw.
-                            instruction2, expected_token2 = _next_tool_probe_challenge()
+                            # consent-card turn already saw. Reassigns `instruction`/
+                            # `expected_token` themselves (rather than new `...2` names) so a
+                            # single `expected_token` var always matches whatever `reply` ends
+                            # up holding when the final record/journal calls below run.
+                            instruction, expected_token = _next_tool_probe_challenge()
                             agent_loaded, reply, timed_out = _run_bounded_page_probe_call(
-                                lambda: _do_tool_probe_turn(instruction2)
+                                lambda: _do_tool_probe_turn(instruction)
                             )
                             if timed_out:
                                 ok, kind = False, "timeout"
                             else:
                                 ok, kind = tool_probe.verify_probe_reply(
-                                    reply, expected_token2, agent_loaded
+                                    reply, expected_token, agent_loaded
                                 )
                         except Exception:
                             logger.warning("tool probe: re-probe after auto-consent raised",
@@ -4270,6 +4273,14 @@ def _run_tool_probe():
         # successful auto-consent's re-probe result if one ran, else the original outcome) --
         # this is the authoritative snapshot /health reads.
         tool_probe.record_probe(ok, kind, detail=(reply or "")[:200])
+        # Additive: preserve the FULL reply (record_probe's `detail` above stays truncated to
+        # 200 chars unchanged, per tool_probe.journal_probe_failure's contract) so a failed
+        # probe's evidence -- e.g. a reply carrying a STALE token from a previous challenge --
+        # survives for later inspection instead of being cut off. No-ops for a successful probe.
+        try:
+            tool_probe.journal_probe_failure(ok, kind, reply, expected_token=expected_token)
+        except Exception:
+            pass
         logger.info("tool probe: ok=%s kind=%s", ok, kind)
         if _page_probe_requires_restart(kind):
             try:
