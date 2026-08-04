@@ -329,7 +329,18 @@ def _wait_research_done(drv: CopilotWebDriver, profile: AgentProfile) -> bool:
             # FULL dwell of stability regardless: only a block that has stopped growing for
             # dwell*2 is the finished report.
             if stable_since and substantial and (time.time() - stable_since) >= profile.dwell_s * 2:
-                return True
+                # This loop bypasses CopilotWebDriver.wait_for_idle -- apply the same
+                # cross-turn correspondence guard directly (see its docstring): a
+                # settled, substantial text byte-identical to the PREVIOUS turn's
+                # accepted answer on this driver is the stale-capture signature, not a
+                # freshly finished report. Keep waiting; still bounded by `deadline`.
+                if getattr(drv, "_is_stale_repeat", lambda _t: False)(t):
+                    last, stable_since = t, stable_since  # keep sampling, do not reset
+                else:
+                    accept = getattr(drv, "_accept_new_reply", None)
+                    if callable(accept):
+                        accept(t)
+                    return True
         else:
             last, stable_since = t, time.time()
         time.sleep(2.0)
@@ -505,6 +516,16 @@ class ResearchSession:
             if t == self._last:
                 if self._stable_since and substantial and (
                         time.time() - self._stable_since) >= self.dwell_s * 2:
+                    # This poll loop bypasses CopilotWebDriver.wait_for_idle -- apply the
+                    # same cross-turn correspondence guard directly (see its docstring): a
+                    # settled, substantial text byte-identical to the PREVIOUS turn's
+                    # accepted answer on this driver is the stale-capture signature, not
+                    # a fresh report. Keep waiting; still bounded by self.timeout_s above.
+                    if getattr(self.drv, "_is_stale_repeat", lambda _t: False)(t):
+                        return None
+                    accept = getattr(self.drv, "_accept_new_reply", None)
+                    if callable(accept):
+                        accept(t)
                     self._report_full = t          # keep the WHOLE report for the sub-transcript
                     self._finish(t[:3500]); return self._done
                 return None

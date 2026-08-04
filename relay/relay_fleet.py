@@ -2589,6 +2589,17 @@ class RelayWorker:
                 # commits once it stays byte-identical for the extended window.
                 need = self.dwell_s if has_end_marker(t) else self.dwell_s * 2.0
                 if self._stable_since and (time.time() - self._stable_since) >= need:
+                    # This poll loop bypasses CopilotWebDriver.wait_for_idle -- apply the
+                    # same cross-turn correspondence guard directly (see its docstring):
+                    # a settled text byte-identical to the PREVIOUS turn's accepted
+                    # answer on this driver is the stale-capture signature (the idle
+                    # tool probe incident), not a fresh reply. Keep polling instead of
+                    # re-deciding on stale text; still bounded by per_turn_timeout_s.
+                    if getattr(self.drv, "_is_stale_repeat", lambda _t: False)(t):
+                        return False
+                    accept = getattr(self.drv, "_accept_new_reply", None)
+                    if callable(accept):
+                        accept(t)
                     self._decide(t)
                     return self.status in TERMINAL
                 return False

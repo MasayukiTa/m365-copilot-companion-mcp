@@ -391,11 +391,21 @@ class RefuterSession:
                 return None
             if t == self._last:
                 if self._stable_since and (time.time() - self._stable_since) >= self.dwell_s:
+                    # This poll loop bypasses CopilotWebDriver.wait_for_idle -- apply the
+                    # same cross-turn correspondence guard directly (see its docstring): a
+                    # settled text byte-identical to the PREVIOUS turn's accepted answer on
+                    # this driver is the stale-capture signature, not a fresh verdict. Keep
+                    # waiting; still bounded by self.timeout_s above.
+                    if getattr(self.drv, "_is_stale_repeat", lambda _t: False)(t):
+                        return None
                     verdict = parse_verdict(t)
                     # preamble-only answer ("I'll check...") -> nudge for the verdict
                     if verdict[0] == "UNCLEAR" and self._nudges_used < self.max_nudges:
                         self._nudge()
                         return None
+                    accept = getattr(self.drv, "_accept_new_reply", None)
+                    if callable(accept):
+                        accept(t)
                     self._finish(verdict)
                     return self._done
                 return None
