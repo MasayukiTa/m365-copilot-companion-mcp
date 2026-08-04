@@ -81,6 +81,8 @@ public class Cw {
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
   [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] static extern int GetClassName(IntPtr h, StringBuilder s, int max);
@@ -302,8 +304,15 @@ function Hide-Companion {
     $h = Get-CompanionWindow
     # SW_MINIMIZE (6), NOT SW_HIDE: fully hiding makes Edge discard the tab renderer
     # (the driver then hits TargetClosedError). Minimized is stable and CDP keeps driving
-    # it; edge_keeper keeps it minimized so it stays out of the way after launch.
-    if ($h -ne [IntPtr]::Zero) { [Cw]::ShowWindow($h, 6) | Out-Null }
+    # it; edge_keeper keeps it minimized so it stays out of the way after launch. Only
+    # minimize a window that is actually visible and not already minimized: a headless
+    # (WS_VISIBLE clear) window has no window to minimize, and ShowWindow(SW_MINIMIZE) on
+    # it makes Windows SET WS_VISIBLE and show it minimized -- creating a taskbar button
+    # on what is supposed to be a windowless instance. Mirrors the same guard in
+    # scripts\win\edge_keeper.ps1 / relay\edge_recover.py's _REHIDE_PS.
+    if ($h -ne [IntPtr]::Zero -and [Cw]::IsWindowVisible($h) -and -not [Cw]::IsIconic($h)) {
+        [Cw]::ShowWindow($h, 6) | Out-Null
+    }
 }
 
 # Hide from the very first moment the window exists, and keep hiding while CDP comes up

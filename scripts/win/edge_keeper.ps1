@@ -69,9 +69,14 @@ while ($true) {
 
     # SW_MINIMIZE (6), NOT SW_HIDE: a fully-hidden window makes Edge discard the tab's
     # renderer (TargetClosedError mid-drive). Minimized is stable -- CDP keeps driving it
-    # and the send path is focus-independent. Re-minimize only if it has popped back up.
+    # and the send path is focus-independent. Re-minimize only if it has popped back up
+    # AND it is currently visible: a headless (--headless=new) window has WS_VISIBLE
+    # clear, and calling ShowWindow(SW_MINIMIZE) on such a window makes Windows SET
+    # WS_VISIBLE and show it minimized -- which is exactly how a taskbar button appears
+    # on a companion Edge that is supposed to have no window at all. A window that is not
+    # visible needs no minimizing; touching it is what reveals it.
     $h = [K]::Find($pids)
-    if ($h -ne [IntPtr]::Zero -and -not [K]::IsIconic($h)) {
+    if ($h -ne [IntPtr]::Zero -and [K]::IsWindowVisible($h) -and -not [K]::IsIconic($h)) {
         [K]::ShowWindow($h, 6) | Out-Null
     }
 }

@@ -264,7 +264,10 @@ def touch_pause():
 
 # PowerShell snippet that finds the DEDICATED companion Edge's top-level window
 # (msedge process whose command line contains 'copilot-companion-edge', its
-# Chrome_WidgetWin_1 window) and MINIMIZES it right away (ShowWindow SW_MINIMIZE=6).
+# Chrome_WidgetWin_1 window) and MINIMIZES it right away (ShowWindow SW_MINIMIZE=6) --
+# but ONLY if it is currently visible and not already minimized: minimizing a hidden
+# (e.g. headless) window makes Windows set WS_VISIBLE and show it minimized instead,
+# which reveals a window that was supposed to have no on-screen presence at all.
 # Mirrors the Find()/ShowWindow technique in scripts\win\edge_keeper.ps1. ASCII only.
 _REHIDE_PS = r'''
 $ErrorActionPreference = "SilentlyContinue"
@@ -276,6 +279,7 @@ using System.Text;
 public class RK {
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] static extern int GetClassName(IntPtr h, StringBuilder s, int max);
@@ -301,7 +305,11 @@ $pids = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
           ForEach-Object { [int]$_.ProcessId })
 if ($pids.Count -gt 0) {
   $h = [RK]::Find($pids)
-  if ($h -ne [IntPtr]::Zero -and -not [RK]::IsIconic($h)) {
+  # Only minimize a window that is actually visible: a headless (WS_VISIBLE clear)
+  # window has no window to minimize, and ShowWindow(SW_MINIMIZE) on it makes Windows
+  # SET WS_VISIBLE and show it minimized -- creating a taskbar button. Mirrors the
+  # same guard in scripts\win\edge_keeper.ps1.
+  if ($h -ne [IntPtr]::Zero -and [RK]::IsWindowVisible($h) -and -not [RK]::IsIconic($h)) {
     [RK]::ShowWindow($h, 6) | Out-Null
   }
 }
