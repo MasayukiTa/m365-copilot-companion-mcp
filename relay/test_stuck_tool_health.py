@@ -155,3 +155,39 @@ def test_fix_job_escalation_never_repeats_past_backcompat_window():
     assert _next_fix_job(2) == FIX_JOB
     assert _next_fix_job(3) != FIX_JOB
     assert _next_fix_job(3) != _next_fix_job(4)
+
+
+def _talking_but_refusing_summary(now=None):
+    """The outage this pair of tests exists for: Copilot answers every probe, but with the
+    same refusal each time, so the turn loop times the reply out as a stale repeat."""
+    return {"tool_ok": False, "tool_kind": "stale_repeat",
+            "tool_ts": time.time(), "tool_age_s": 5.0}
+
+
+def _silent_summary(now=None):
+    return {"tool_ok": False, "tool_kind": "timeout",
+            "tool_ts": time.time(), "tool_age_s": 5.0}
+
+
+def test_stuck_retries_when_the_path_answered_but_failed(monkeypatch):
+    """A probe that FAILED is not a probe that proved the path dead. When the far side
+    replied -- here, the same refusal over and over -- the round trip demonstrably works,
+    so a self-reported STUCK still gets its retry instead of being cut off."""
+    monkeypatch.setattr(tool_probe, "get_summary", _talking_but_refusing_summary)
+    driver = MockDriver(["STUCK: a", "STUCK: b", "all done DONE"])
+    outcome = run_relay(driver, goal="test goal", run_id="test_alive_retry",
+                        notify=lambda title, body: None, sleep_s=0)
+    assert outcome == "DONE"
+    assert RETRY_JOB in driver.sent
+
+
+def test_stuck_terminal_when_nothing_came_back(monkeypatch):
+    """The genuine unreachable case still gives up immediately: no reply at all means
+    retrying cannot help."""
+    monkeypatch.setattr(tool_probe, "get_summary", _silent_summary)
+    driver = MockDriver(["STUCK: tools missing"])
+    notes = []
+    outcome = run_relay(driver, goal="test goal", run_id="test_silent_terminal",
+                        notify=lambda title, body: notes.append((title, body)), sleep_s=0)
+    assert outcome == "STUCK"
+    assert RETRY_JOB not in driver.sent

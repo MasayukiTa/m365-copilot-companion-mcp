@@ -598,3 +598,19 @@ def test_journal_probe_failure_does_not_alter_tool_probe_json_contract(monkeypat
     # The journal is a SEPARATE file with its own shape -- confirms the two never merge/collide.
     assert journal.exists()
     assert probe_file != journal
+
+
+def test_probe_kind_liveness_separates_a_reply_from_a_dead_path():
+    """stale_repeat means the model answered (just with what it already said), so it must
+    not read as an unreachable path -- that conflation is what hid a live connection behind
+    a "timeout". canned_fallback is the deliberate exception: that reply IS the proof the
+    connector is missing."""
+    assert tool_probe.probe_kind_is_alive("stale_repeat") is True
+    assert tool_probe.probe_kind_is_alive("error") is True
+    assert tool_probe.probe_kind_is_alive("timeout") is False
+    assert tool_probe.probe_kind_is_alive("agent_unreachable") is False
+    assert tool_probe.probe_kind_is_alive("canned_fallback") is False
+    # Transitional and unknown kinds carry no evidence either way.
+    assert tool_probe.probe_kind_is_alive("checking") is None
+    assert tool_probe.probe_kind_is_alive("nonsense") is None
+    assert "stale_repeat" in tool_probe.PROBE_KINDS

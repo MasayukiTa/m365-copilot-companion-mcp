@@ -382,10 +382,20 @@ def _tool_health_for_stuck(max_age_s: float = STUCK_TOOL_HEALTH_MAX_AGE_S,
     if age is None or age > max_age_s:
         return False, "tool-probe result is stale (age=%s > %.0fs threshold, kind=%s)" % (
             ("%.0fs" % age) if age is not None else "unknown", max_age_s, kind)
-    if not summary.get("tool_ok"):
-        return False, "tool-probe reports the tool path unreachable (kind=%s, age=%.0fs)" % (
+    if summary.get("tool_ok"):
+        return True, "tool-probe healthy (kind=%s, age=%.0fs)" % (kind, age)
+    # A failed probe is not automatically an unreachable path. When the far side answered --
+    # even to refuse, or to repeat itself -- the round trip demonstrably works, and cutting
+    # retries off on that evidence would be giving up on a live connection.
+    alive = tool_probe.probe_kind_is_alive(kind)
+    if alive is None:
+        return True, "tool-probe result is inconclusive (kind=%s, age=%.0fs) -- retry" % (
             kind, age)
-    return True, "tool-probe healthy (kind=%s, age=%.0fs)" % (kind, age)
+    if alive:
+        return True, ("tool-probe failed but the path answered (kind=%s, age=%.0fs) -- retry"
+                      % (kind, age))
+    return False, "tool-probe reports the tool path unreachable (kind=%s, age=%.0fs)" % (
+        kind, age)
 
 
 # Escalating/varying nudge text for RETRY_JOB (required) and CONTINUE_JOB/FIX_JOB (same

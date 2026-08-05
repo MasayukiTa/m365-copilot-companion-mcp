@@ -72,7 +72,34 @@ PROBE_OK_TOKEN = "===TOOLPROBE_OK==="
 
 # The full set of `kind` values record_probe()/classify_probe_reply() may produce.
 PROBE_KINDS = ("answer", "consent_card", "canned_fallback", "timeout",
-               "agent_unreachable", "error", "starting", "checking")
+               "stale_repeat", "agent_unreachable", "error", "starting", "checking")
+
+# Whether a probe outcome leaves the tool path usable.
+#
+# A failed probe and an unreachable path are not the same thing, and conflating them cost a
+# real outage diagnosis: when the model hardened into refusing the probe it returned the very
+# same sentence every time, the turn loop refused that repeat as a stale answer, and the
+# outcome was filed as "timeout" -- "nothing came back" -- while the reply text sat in the
+# failure journal the whole time. What settles this is whether a reply arrived at all, never
+# what the reply says; reading the wording is the mistake that broke an earlier version of
+# this check, so it stays out of here.
+#
+# canned_fallback is the one reply that counts against the path rather than for it: it IS the
+# "no connector attached" answer, so Copilot being reachable says nothing -- the tool is
+# provably not there.
+PROBE_KINDS_ALIVE = ("answer", "consent_card", "stale_repeat", "error")
+PROBE_KINDS_NOT_ALIVE = ("timeout", "agent_unreachable", "canned_fallback")
+
+
+def probe_kind_is_alive(kind: Optional[str]) -> Optional[bool]:
+    """True/False if `kind` settles whether the tool path is still usable, None for the
+    transitional kinds ("starting", "checking") and anything unrecognised -- callers must
+    treat None as "no evidence" rather than as a negative."""
+    if kind in PROBE_KINDS_ALIVE:
+        return True
+    if kind in PROBE_KINDS_NOT_ALIVE:
+        return False
+    return None
 
 # ---------------------------------------------------------------------------
 # Probe instruction text.

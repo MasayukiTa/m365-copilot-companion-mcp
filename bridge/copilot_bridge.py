@@ -4226,7 +4226,12 @@ def _run_tool_probe():
                 lambda: _do_tool_probe_turn(instruction)
             )
             if timed_out:
-                ok, kind = False, "timeout"
+                # A turn can time out with text already in hand: the model answers, but the
+                # answer is byte-for-byte what it said last time, so the settle check refuses
+                # it as a repeat and we wait out the clock. Filing that as "timeout" claims
+                # nothing came back, which is how a talking-but-refusing Copilot got read as
+                # an unreachable tool path. Keep them apart -- the reply itself is the proof.
+                ok, kind = False, ("stale_repeat" if (reply or "").strip() else "timeout")
             else:
                 ok, kind = tool_probe.verify_probe_reply(reply, expected_token, agent_loaded)
                 if kind == "consent_card":
@@ -4250,7 +4255,9 @@ def _run_tool_probe():
                                 lambda: _do_tool_probe_turn(instruction)
                             )
                             if timed_out:
-                                ok, kind = False, "timeout"
+                                ok, kind = False, (
+                                    "stale_repeat" if (reply or "").strip() else "timeout"
+                                )
                             else:
                                 ok, kind = tool_probe.verify_probe_reply(
                                     reply, expected_token, agent_loaded
