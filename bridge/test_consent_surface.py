@@ -94,7 +94,7 @@ def test_bounded_retries_then_terminal_marker(monkeypatch):
     _patch_surface(monkeypatch, [False, False, False])
     recorded = []
     monkeypatch.setattr(B.tool_probe, "record_probe",
-                         lambda ok, kind, detail="", ts=None: recorded.append((ok, kind, detail)))
+                         lambda ok, kind, detail="", ts=None, alive=None: recorded.append((ok, kind, detail)))
 
     for _ in range(3):
         assert B._consent_surface_attempt("ep1") is False
@@ -178,7 +178,7 @@ def test_probe_answer_no_recovery_needed(monkeypatch):
     surface_calls = _patch_surface(monkeypatch, [])
     recorded = []
     monkeypatch.setattr(B.tool_probe, "record_probe",
-                         lambda ok, kind, detail="", ts=None: recorded.append((ok, kind)))
+                         lambda ok, kind, detail="", ts=None, alive=None: recorded.append((ok, kind)))
 
     B._run_tool_probe()
 
@@ -201,7 +201,7 @@ def test_probe_consent_card_auto_consent_succeeds(monkeypatch):
     surface_calls = _patch_surface(monkeypatch, [])
     recorded = []
     monkeypatch.setattr(B.tool_probe, "record_probe",
-                         lambda ok, kind, detail="", ts=None: recorded.append((ok, kind)))
+                         lambda ok, kind, detail="", ts=None, alive=None: recorded.append((ok, kind)))
 
     B._run_tool_probe()
 
@@ -222,7 +222,7 @@ def test_probe_consent_card_auto_consent_fails_falls_to_surface(monkeypatch):
     surface_calls = _patch_surface(monkeypatch, [True])
     recorded = []
     monkeypatch.setattr(B.tool_probe, "record_probe",
-                         lambda ok, kind, detail="", ts=None: recorded.append((ok, kind)))
+                         lambda ok, kind, detail="", ts=None, alive=None: recorded.append((ok, kind)))
 
     B._run_tool_probe()
 
@@ -237,7 +237,7 @@ def test_probe_timeout_skips_consent_recovery(monkeypatch):
     surface_calls = _patch_surface(monkeypatch, [])
     recorded = []
     monkeypatch.setattr(B.tool_probe, "record_probe",
-                         lambda ok, kind, detail="", ts=None: recorded.append((ok, kind)))
+                         lambda ok, kind, detail="", ts=None, alive=None: recorded.append((ok, kind)))
 
     B._run_tool_probe()
 
@@ -252,7 +252,7 @@ def test_probe_startup_is_transitional_and_retries_quickly(monkeypatch):
     monkeypatch.setattr(B, "MCP_TOOL_PROBE_SEC", 600.0)
     recorded = []
     monkeypatch.setattr(B.tool_probe, "record_probe",
-                        lambda ok, kind, detail="", ts=None: recorded.append((ok, kind, detail)))
+                        lambda ok, kind, detail="", ts=None, alive=None: recorded.append((ok, kind, detail)))
 
     retry = B._run_tool_probe()
 
@@ -266,7 +266,7 @@ def test_probe_records_checking_before_the_real_turn(monkeypatch):
     _patch_surface(monkeypatch, [])
     recorded = []
     monkeypatch.setattr(B.tool_probe, "record_probe",
-                        lambda ok, kind, detail="", ts=None: recorded.append((ok, kind)))
+                        lambda ok, kind, detail="", ts=None, alive=None: recorded.append((ok, kind)))
 
     B._run_tool_probe()
 

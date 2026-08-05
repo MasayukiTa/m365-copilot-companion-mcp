@@ -191,3 +191,19 @@ def test_stuck_terminal_when_nothing_came_back(monkeypatch):
                         notify=lambda title, body: notes.append((title, body)), sleep_s=0)
     assert outcome == "STUCK"
     assert RETRY_JOB not in driver.sent
+
+
+def _silent_but_error_kind_summary(now=None):
+    """The case the kind alone gets wrong: nothing came back, but the catch-all kind is
+    "error" all the same."""
+    return {"tool_ok": False, "tool_kind": "error", "tool_alive": False,
+            "tool_ts": time.time(), "tool_age_s": 5.0}
+
+
+def test_recorded_liveness_wins_over_the_kind_guess(monkeypatch):
+    monkeypatch.setattr(tool_probe, "get_summary", _silent_but_error_kind_summary)
+    driver = MockDriver(["STUCK: tools missing"])
+    outcome = run_relay(driver, goal="test goal", run_id="test_recorded_dead",
+                        notify=lambda title, body: None, sleep_s=0)
+    assert outcome == "STUCK"
+    assert RETRY_JOB not in driver.sent
