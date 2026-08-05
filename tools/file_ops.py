@@ -74,15 +74,36 @@ def _validate_path(path: str) -> Path:
         p = None
     if p is None:
         p = Path(path).expanduser().resolve()
-    if ALLOWED_BASES is None:
+    # Per-scope policy first: it is settings-driven and re-read live, so it is the one a user
+    # can actually change. MCP_ALLOWED_BASE stays underneath as the process-wide floor, so an
+    # install that already relies on it keeps exactly the scope it had.
+    bases = ALLOWED_BASES
+    try:
+        from . import folder_policy
+        scoped = folder_policy.allowed_bases()
+    except Exception:
+        scoped = None                      # policy layer must never break the file tools
+    if scoped is not None:
+        bases = scoped if bases is None else [b for b in scoped
+                                              if any(_under(b, a) or _under(a, b)
+                                                     for a in bases)]
+    if not bases:
         return p  # unrestricted (default-open policy)
-    for base in ALLOWED_BASES:
+    for base in bases:
         try:
             p.relative_to(base)
             return p
         except ValueError:
             continue
     raise PermissionError(f"Path is outside the allowed base: {path}")
+
+
+def _under(child: Path, parent: Path) -> bool:
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
 
 
 def read_file(
