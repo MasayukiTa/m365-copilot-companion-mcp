@@ -995,6 +995,7 @@ class CockpitWindow : Window
         if (k == "hs_tool_detail_ok") return ja ? "ツール呼び出し確認 OK" : "tool call confirmed OK";
         if (k == "hs_tool_detail_consent") return ja ? "consent待ち（再接続で解消可）" : "consent pending (reconnect can clear this)";
         if (k == "hs_tool_detail_down") return ja ? "応答なし(再接続が必要)" : "no response (reconnect needed)";
+        if (k == "hs_tool_detail_no_tool") return ja ? "チャットは応答あり／ツール未接続の可能性" : "chat is answering; tool may not be attached";
         if (k == "hs_tool_detail_stale") return ja ? "自己診断が実行されていません" : "self-probe hasn't run recently";
         if (k == "hs_tool_detail_none") return ja ? "自己診断は未設定(機能無効)" : "self-probe not configured (feature off)";
         if (k == "hs_tool_detail_checking") return ja ? "ツール接続を確認中…" : "checking tool connection…";
@@ -2007,9 +2008,12 @@ class CockpitWindow : Window
     //            Deliberately NOT red: a new/unconfigured feature must never read as an outage.
     //   RED   -- file missing after having looked (can't happen here since we check Exists first,
     //            kept as a safety fallback) OR stale (>20 min since ts -- the probe itself isn't
-    //            running) OR kind is timeout/agent_unreachable/error (probe ran and failed).
+    //            running) OR the probe failed with nothing coming back at all.
     //   GREEN -- ok==true AND fresh (<20 min old).
-    //   YELLOW-- kind is consent_card/canned_fallback -- actionable, "Reconnect chat" can fix it.
+    //   YELLOW-- consent_card/canned_fallback, or the probe failed while "alive" says a reply
+    //            DID arrive. Red is reserved for silence: a failed probe on a chat that is
+    //            answering normally used to paint this dot red, and a red dot is read as
+    //            "everything is broken" by every user who sees it.
     void PollToolProbeOnce(DateTime now)
     {
         string path = Path.Combine(RepoRoot(), ".fleet", "tool_probe.json");
@@ -2030,7 +2034,12 @@ class CockpitWindow : Window
                 SetDot(5, HealthState.Green, ageTxt + " " + T("hs_tool_detail_ok"), now);
             else if (kind == "consent_card" || kind == "canned_fallback")
                 SetDot(5, HealthState.Yellow, ageTxt + " " + T("hs_tool_detail_consent"), now);
-            else   // timeout | agent_unreachable | error | unrecognized kind
+            else if (o != null && o.ContainsKey("alive") && Convert.ToBoolean(o["alive"]))
+                // The chat answered, it just did not complete the probe's round trip. Calling
+                // that "no response, reconnect needed" in red told everyone the stack was down
+                // while it was serving turns perfectly well -- the one reading a user acts on.
+                SetDot(5, HealthState.Yellow, ageTxt + " " + T("hs_tool_detail_no_tool"), now);
+            else   // timeout | agent_unreachable | genuinely silent | unrecognized kind
                 SetDot(5, HealthState.Red, ageTxt + " " + T("hs_tool_detail_down"), now);
         }
         catch (Exception)

@@ -637,3 +637,16 @@ def test_summary_reports_no_evidence_for_records_without_the_field(tmp_path, mon
     monkeypatch.setattr(tool_probe, "_PROBE_FILE", tmp_path / "tool_probe.json")
     tool_probe.record_probe(False, "error", detail="legacy record")
     assert tool_probe.get_summary()["tool_alive"] is None
+
+
+def test_the_no_tool_answer_is_classified_as_a_missing_connector():
+    """The clearest "the tool is not attached" reply we actually get in the wild names no
+    connector at all -- it says the tool does not exist in this environment and offers
+    OneDrive instead. It used to fall through to the catch-all, which the cockpit painted
+    red as "no response" even though the chat was answering normally."""
+    reply = ("ローカルのデスクトップにアクセスするツールがこの環境に存在しないため、"
+             "デスクトップ上の .md ファイル数は取得できません。"
+             "対応可能な代替は OneDrive または SharePoint 内の .md ファイル検索です。")
+    ok, kind = tool_probe.verify_probe_reply(reply, "deadbeef1234", agent_loaded=True)
+    assert ok is False
+    assert kind == "canned_fallback"

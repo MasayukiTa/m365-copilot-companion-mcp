@@ -75,6 +75,42 @@ function Port-Up([int]$p) {
 function Http-Up([string]$url) {
     try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 $url | Out-Null; return $true } catch { return $false }
 }
+function Bridge-Is-Outdated([string]$repo) {
+    # True when a bridge process is running that started BEFORE the newest source file it
+    # loads. Only the modules the bridge imports at startup are considered, so editing docs
+    # or an unrelated tool never forces a restart. Any failure answers $false: an unreadable
+    # timestamp must never be the reason a healthy bridge gets torn down.
+    try {
+        $procs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                   Where-Object { $_.CommandLine -and ($_.CommandLine -match 'copilot_bridge\.py') })
+        if ($procs.Count -eq 0) { return $false }   # nothing running -> normal start path
+        $started = ($procs | Measure-Object -Property CreationDate -Minimum).Minimum
+        if (-not $started) { return $false }
+        $newest = $null
+        foreach ($sub in @('bridge', 'tools', 'relay')) {
+            $d = Join-Path $repo $sub
+            if (-not (Test-Path $d)) { continue }
+            $m = (Get-ChildItem $d -Filter *.py -File -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -notlike 'test_*' } |
+                  Measure-Object -Property LastWriteTime -Maximum).Maximum
+            if ($m -and (-not $newest -or $m -gt $newest)) { $newest = $m }
+        }
+        if (-not $newest) { return $false }
+        return ($newest -gt $started)
+    } catch { return $false }
+}
+function Stop-Bridge-Processes() {
+    # Take the keepalive supervisor down first, otherwise it just respawns the python we are
+    # about to stop and the restart silently does nothing.
+    try {
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and ($_.CommandLine -match 'start_bridge\.ps1') } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and ($_.CommandLine -match 'copilot_bridge\.py') } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    } catch { }
+}
 function Env-Value([string]$key) {
     # read a value from .env (so the Dev Tunnel name from setup_devtunnel.ps1 propagates here)
     try {
@@ -736,7 +772,20 @@ function Invoke-Startup {
     }
 
     # 3) Bridge :9223 + chat backend (start_bridge -Keepalive). Skip if already up.
+    #
+    # ...unless the code on disk is newer than the process running it. Leaving a running
+    # bridge alone is what keeps this script safe to double-click mid-session, but it also
+    # means pulling a fix changes nothing until someone happens to restart: a bridge that had
+    # been up since the previous day was still serving the previous day's code, so every fix
+    # shipped that day was inert and the bug they fixed looked unfixed. Restarting only when
+    # the source is actually newer keeps the idempotent behaviour for the ordinary case and
+    # makes "pull, then click this" enough on its own.
     Set-SplashStatus $script:splash "Starting the chat bridge..."
+    if (Bridge-Is-Outdated $root) {
+        Write-Host "[3/4] bridge: code is newer than the running process -- restarting"
+        Stop-Bridge-Processes
+        Start-Sleep -Seconds 2
+    }
     if (Proc-Running 'start_bridge\.ps1') {
         Write-Host "[3/4] bridge keepalive: already running"
     } elseif (Http-Up "http://127.0.0.1:8765/conv") {
