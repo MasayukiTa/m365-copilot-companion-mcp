@@ -129,7 +129,8 @@ def test_record_probe_defaults_ts_to_wallclock(monkeypatch, tmp_path):
 def test_get_summary_missing_file_returns_null_shape(monkeypatch, tmp_path):
     monkeypatch.setattr(tool_probe, "_PROBE_FILE", tmp_path / "does_not_exist.json")
     summary = tool_probe.get_summary(now=1000.0)
-    assert summary == {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None}
+    assert summary == {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None,
+                       "tool_alive": None}
 
 
 def test_get_summary_corrupt_json_returns_null_shape(monkeypatch, tmp_path):
@@ -137,7 +138,8 @@ def test_get_summary_corrupt_json_returns_null_shape(monkeypatch, tmp_path):
     probe_file.write_text("{not valid json::", encoding="utf-8")
     monkeypatch.setattr(tool_probe, "_PROBE_FILE", probe_file)
     summary = tool_probe.get_summary(now=1000.0)
-    assert summary == {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None}
+    assert summary == {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None,
+                       "tool_alive": None}
 
 
 def test_get_summary_missing_ts_key_returns_null_shape(monkeypatch, tmp_path):
@@ -145,7 +147,8 @@ def test_get_summary_missing_ts_key_returns_null_shape(monkeypatch, tmp_path):
     probe_file.write_text(json.dumps({"ok": True, "kind": "answer"}), encoding="utf-8")
     monkeypatch.setattr(tool_probe, "_PROBE_FILE", probe_file)
     summary = tool_probe.get_summary(now=1000.0)
-    assert summary == {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None}
+    assert summary == {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None,
+                       "tool_alive": None}
 
 
 def test_get_summary_non_numeric_ts_returns_null_shape(monkeypatch, tmp_path):
@@ -154,7 +157,8 @@ def test_get_summary_non_numeric_ts_returns_null_shape(monkeypatch, tmp_path):
                            encoding="utf-8")
     monkeypatch.setattr(tool_probe, "_PROBE_FILE", probe_file)
     summary = tool_probe.get_summary(now=1000.0)
-    assert summary == {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None}
+    assert summary == {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None,
+                       "tool_alive": None}
 
 
 # ===========================================================================
@@ -218,7 +222,8 @@ def test_get_summary_never_raises_on_unreadable_path(monkeypatch):
     from pathlib import Path
     monkeypatch.setattr(tool_probe, "_PROBE_FILE", Path("\x00bad\x00path\x00tool_probe.json"))
     summary = tool_probe.get_summary()  # must not raise
-    assert summary == {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None}
+    assert summary == {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None,
+                       "tool_alive": None}
 
 
 # --- probe instruction must never repeat byte-for-byte ------------------------
@@ -614,3 +619,21 @@ def test_probe_kind_liveness_separates_a_reply_from_a_dead_path():
     assert tool_probe.probe_kind_is_alive("checking") is None
     assert tool_probe.probe_kind_is_alive("nonsense") is None
     assert "stale_repeat" in tool_probe.PROBE_KINDS
+
+
+def test_empty_reply_is_not_alive_even_though_its_kind_is_error(tmp_path, monkeypatch):
+    """The catch-all "error" kind covers a reply that came back empty as well as one that
+    answered off-target, so liveness has to come from what the prober actually saw. Getting
+    this from the kind alone would call a silent turn a live path."""
+    monkeypatch.setattr(tool_probe, "_PROBE_FILE", tmp_path / "tool_probe.json")
+    tool_probe.record_probe(False, "error", detail="", alive=False)
+    assert tool_probe.get_summary()["tool_alive"] is False
+    tool_probe.record_probe(False, "error", detail="answered, wrong token", alive=True)
+    assert tool_probe.get_summary()["tool_alive"] is True
+
+
+def test_summary_reports_no_evidence_for_records_without_the_field(tmp_path, monkeypatch):
+    """Records written before `alive` existed must read as "unknown", never as "dead"."""
+    monkeypatch.setattr(tool_probe, "_PROBE_FILE", tmp_path / "tool_probe.json")
+    tool_probe.record_probe(False, "error", detail="legacy record")
+    assert tool_probe.get_summary()["tool_alive"] is None

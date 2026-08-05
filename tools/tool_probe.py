@@ -308,16 +308,26 @@ def verify_probe_reply(reply_text: Optional[str], expected_token: str,
     return False, "error"
 
 
-def record_probe(ok: bool, kind: str, detail: str = "", ts: Optional[float] = None) -> None:
+def record_probe(ok: bool, kind: str, detail: str = "", ts: Optional[float] = None,
+                 alive: Optional[bool] = None) -> None:
     """Record the outcome of one tool-call self-probe and best-effort persist it to
     .fleet/tool_probe.json (atomic tmp+os.replace, utf-8, ensure_ascii=False -- same pattern
     as tools/auth_stats.write_snapshot). Never raises.
 
     `ts` defaults to time.time() but accepts a caller-supplied value so callers (and tests)
-    can be deterministic instead of depending on wallclock at call time."""
+    can be deterministic instead of depending on wallclock at call time.
+
+    `alive` is whether text actually came back on this turn. It has to be passed in because
+    the caller is the only place that still holds the reply: "error" is the catch-all branch
+    of verify_probe_reply, so it covers BOTH "answered, but not with our challenge" and "came
+    back empty", and those two must not be read the same way. Inferring liveness from `kind`
+    alone got exactly that wrong. None means the caller had no reply to judge (the transitional
+    "starting"/"checking" records), and readers must treat it as no evidence."""
     try:
         now = time.time() if ts is None else ts
         payload = {"ts": now, "ok": bool(ok), "kind": kind, "detail": detail or ""}
+        if alive is not None:
+            payload["alive"] = bool(alive)
         with _LOCK:
             _PROBE_FILE.parent.mkdir(parents=True, exist_ok=True)
             tmp = str(_PROBE_FILE) + ".tmp"
@@ -455,14 +465,19 @@ def journal_probe_failure(ok: bool, kind: str, reply: Optional[str],
 def get_summary(now: Optional[float] = None) -> dict:
     """Read the last-recorded probe outcome from .fleet/tool_probe.json and return
     {"tool_ok": bool|None, "tool_kind": str|None, "tool_ts": float|None,
-    "tool_age_s": float|None} -- the shape /health's payload.update(...) mirrors from
-    tools.auth_stats.get_summary().
+    "tool_age_s": float|None, "tool_alive": bool|None} -- the shape /health's
+    payload.update(...) mirrors from tools.auth_stats.get_summary().
+
+    tool_alive is whether text came back on that turn, recorded by the caller that still had
+    the reply. Records written before this field existed simply lack it, so it reads as None
+    ("no evidence") rather than as a negative.
 
     Tolerates a missing or corrupt file (never raises): returns the all-None shape in
     either case, exactly as tools.auth_stats.get_summary() zeroes out on failure. `now`
     is a caller-supplied reference time for computing tool_age_s, defaulting to
     time.time() -- deterministic for tests, real wallclock in production (e.g. /health)."""
-    empty = {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None}
+    empty = {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None,
+             "tool_alive": None}
     try:
         with open(_PROBE_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
@@ -475,6 +490,7 @@ def get_summary(now: Optional[float] = None) -> dict:
             "tool_kind": raw.get("kind"),
             "tool_ts": ts,
             "tool_age_s": max(0.0, ref - ts),
+            "tool_alive": raw.get("alive"),
         }
     except Exception:
         return dict(empty)

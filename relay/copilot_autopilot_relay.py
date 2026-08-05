@@ -387,7 +387,14 @@ def _tool_health_for_stuck(max_age_s: float = STUCK_TOOL_HEALTH_MAX_AGE_S,
     # A failed probe is not automatically an unreachable path. When the far side answered --
     # even to refuse, or to repeat itself -- the round trip demonstrably works, and cutting
     # retries off on that evidence would be giving up on a live connection.
-    alive = tool_probe.probe_kind_is_alive(kind)
+    #
+    # Prefer what the prober recorded, since only it held the reply. The kind-based guess is
+    # the fallback for records written before that field existed; it leans towards "alive"
+    # for the catch-all kind, which keeps this function on its documented side of the line --
+    # never let a doubt be the reason retries stop.
+    alive = summary.get("tool_alive")
+    if alive is None:
+        alive = tool_probe.probe_kind_is_alive(kind)
     if alive is None:
         return True, "tool-probe result is inconclusive (kind=%s, age=%.0fs) -- retry" % (
             kind, age)

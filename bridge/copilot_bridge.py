@@ -4279,7 +4279,11 @@ def _run_tool_probe():
         # Final record reflects whatever the LAST classification actually established (a
         # successful auto-consent's re-probe result if one ran, else the original outcome) --
         # this is the authoritative snapshot /health reads.
-        tool_probe.record_probe(ok, kind, detail=(reply or "")[:200])
+        # `alive` has to be decided here, where the reply still exists: "error" is
+        # verify_probe_reply's catch-all and covers both "answered, but not with our
+        # challenge" and "came back empty", so the kind alone cannot tell them apart.
+        tool_probe.record_probe(ok, kind, detail=(reply or "")[:200],
+                                alive=bool((reply or "").strip()))
         # Additive: preserve the FULL reply (record_probe's `detail` above stays truncated to
         # 200 chars unchanged, per tool_probe.journal_probe_failure's contract) so a failed
         # probe's evidence -- e.g. a reply carrying a STALE token from a previous challenge --
