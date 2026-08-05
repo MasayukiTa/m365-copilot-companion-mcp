@@ -63,7 +63,13 @@ from typing import List, Optional, Tuple
 # this is a copy, not an import). Keep in sync with relay/edge_reconnect.py by hand.
 # ---------------------------------------------------------------------------------------
 CONSENT_MARKERS = ("接続マネージャーを開く", "connection manager")
-NO_CONNECTOR_MARKERS = ("実行不可", "コネクタ無し", "コネクタがありません", "ツールが使用できません")
+NO_CONNECTOR_MARKERS = ("実行不可", "コネクタ無し", "コネクタがありません", "ツールが使用できません",
+                        # Observed live 2026-08-05: with no connector attached the chat says
+                        # "ローカルのデスクトップにアクセスするツールがこの環境に存在しないため..."
+                        # and offers OneDrive/SharePoint instead. None of the phrasings above
+                        # match it, so the clearest "the tool is not attached" answer we get was
+                        # landing in the catch-all and reading as a generic failure.
+                        "ツールがこの環境に存在しない", "ツールがありません")
 
 # Distinctive marker token the probe instruction asks the agent to emit ONLY when the
 # list_directory tool call actually succeeded -- see bridge/copilot_bridge.py's
