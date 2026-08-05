@@ -98,24 +98,22 @@ def load_policy(force: bool = False) -> dict:
 
 
 def current_scope() -> str:
-    """The authenticated caller's scope name, or "" when there is no request context."""
+    """The authenticated caller's scope name, or "" when there is none.
+
+    client_id comes from the verified access token via FastMCP's own accessor. An earlier
+    draft of this read it off request.state, which is not where FastMCP puts it -- the
+    lookup would have quietly returned "" for every caller and silently collapsed every
+    scope onto the global list, with nothing in the behaviour to show it was broken.
+    """
     try:
-        from fastmcp.server.dependencies import get_http_request
-        req = get_http_request()
+        from fastmcp.server.dependencies import get_access_token
+        tok = get_access_token()
+        cid = getattr(tok, "client_id", None) if tok is not None else None
+        if isinstance(cid, str) and cid.strip():
+            return cid.strip()
     except Exception:
-        return ""
-    for attr in ("client_id", "scope_name"):
-        try:
-            val = getattr(getattr(req, "state", None), attr, None)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-        except Exception:
-            pass
-    try:
-        hdr = req.headers.get("x-mcp-scope", "")
-        return hdr.strip() if isinstance(hdr, str) else ""
-    except Exception:
-        return ""
+        pass
+    return ""
 
 
 def _expand(entries: List[str]) -> List[Path]:

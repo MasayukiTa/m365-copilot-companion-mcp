@@ -7,6 +7,10 @@ import pytest
 
 from tools import file_ops, folder_policy
 
+# Captured before the autouse fixture below stubs it out, so the one test that needs the
+# real resolver can still reach it.
+_real_current_scope = folder_policy.current_scope
+
 
 @pytest.fixture(autouse=True)
 def _isolated_policy(tmp_path, monkeypatch):
@@ -114,3 +118,25 @@ def test_describe_explains_what_applied(tmp_path, monkeypatch):
     assert d["enabled"] is True and d["scope"] == "fleet-w1"
     assert d["matched"] == "scope" and d["restricted"] is True
     assert str(lane.resolve()) in d["allowed"]
+
+
+def test_scope_comes_from_the_verified_token(monkeypatch):
+    """The scope name has to be the token's client_id, read through FastMCP's accessor.
+    Reading it from the wrong place returns "" for everyone, which looks like "no scope
+    configured" and silently applies the global list to callers that had their own rule."""
+    import fastmcp.server.dependencies as dep
+
+    class _Tok:
+        client_id = "fleet-w1"
+
+    monkeypatch.setattr(dep, "get_access_token", lambda: _Tok())
+    assert _real_current_scope() == "fleet-w1"
+
+    monkeypatch.setattr(dep, "get_access_token", lambda: None)
+    assert _real_current_scope() == ""
+
+    def _boom():
+        raise RuntimeError("no request context")
+
+    monkeypatch.setattr(dep, "get_access_token", _boom)
+    assert _real_current_scope() == ""
