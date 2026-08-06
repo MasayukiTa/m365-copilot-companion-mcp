@@ -66,8 +66,26 @@ def _invalid_hint(reason: str) -> str:
 def skill_match(text: str) -> str:
     """Find a confidently matching trusted Skill using metadata only; does not load it."""
     try:
-        result = _store().match(text)
-        return json.dumps(result, ensure_ascii=False, indent=2) if result else "(no confident Skill match)"
+        store = _store()
+        result = store.match(text)
+        if result:
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        # 一致なしとだけ返していたとき、呼び出し側は「そんな手順は無い」と読み、
+        # 自分でやり方を考え始めた。実際には手順はあって、束を1文字直したせいで
+        # 再承認待ちになっていただけだった。照合は信頼済みしか見ないので、
+        # 待っているものがあるならそれを言う。承認そのものは人の操作のまま。
+        try:
+            waiting = [row["name"] for row in store.list_metadata(model_safe=True)
+                       if row.get("trust") == "changed"]
+        except Exception:
+            waiting = []
+        if waiting:
+            return ("(no confident Skill match among TRUSTED Skills. "
+                    "These exist but their contents changed and are waiting for human "
+                    "re-approval, so they cannot be matched or loaded yet: %s. "
+                    "Ask the user to approve, or proceed without them -- do not invent "
+                    "your own procedure and present it as theirs.)" % ", ".join(waiting))
+        return "(no confident Skill match)"
     except Exception as exc:
         return f"[skill_match error: {type(exc).__name__}: {exc}]"
 

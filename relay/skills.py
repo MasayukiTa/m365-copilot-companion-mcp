@@ -31,7 +31,11 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 MAX_FILES = 256
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_TOTAL_BYTES = 5 * 1024 * 1024
-APPROVAL_TTL_SECONDS = 10 * 60
+# 人が席を外して戻ってくるまでの時間。10分にしていたときは、6分遅れで承認ボタンを
+# 押した操作が黙って捨てられ、画面には承認できたように見えて実際には信頼されない、
+# という一番たちの悪い状態になった。長くしても、承認はそのときのハッシュに対して
+# しか効かず、確定の直前に取り直して突き合わせる（束が変わっていれば拒否される）。
+APPROVAL_TTL_SECONDS = 24 * 60 * 60
 SUPPORTED_DIRS = ("scripts", "references", "assets")
 
 
@@ -517,9 +521,18 @@ class SkillStore:
         except (OSError, json.JSONDecodeError):
             return
 
-    def _sync_gate_approvals(self) -> None:
+    def sync_approvals(self) -> int:
+        """外から呼べる入口。押された承認を信頼状態へ取り込み、扱った件数を返す。
+
+        これまで取り込みは discover() の中でしか動かず、誰かが Skill を一覧する
+        まで反映されなかった。承認を押しても画面が変わらないのはこれが理由。
+        """
+        return self._sync_gate_approvals()
+
+    def _sync_gate_approvals(self) -> int:
         """Import FleetCockpit Approve/Deny clicks into exact-digest trust state."""
         now = time.time()
+        handled = 0
         with self._connect() as db:
             rows = db.execute("SELECT * FROM approval_challenges").fetchall()
         for row in rows:
@@ -531,10 +544,11 @@ class SkillStore:
                 with self._connect() as db:
                     db.execute("DELETE FROM approval_challenges WHERE token_hash=?",
                                (row["token_hash"],))
-                try:
-                    gate_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                # 期限切れを黙って消さない。押した本人には、承認したつもりが効いて
+                # いないことが分かるようにする。消してしまうと、画面から消えた＝
+                # 通ったのだと読めてしまう。
+                self._mark_gate_expired(gate_path)
+                handled += 1
                 continue
             try:
                 gate = json.loads(gate_path.read_text(encoding="utf-8"))
@@ -560,6 +574,37 @@ class SkillStore:
             with self._connect() as db:
                 db.execute("DELETE FROM approval_challenges WHERE token_hash=?",
                            (row["token_hash"],))
+            handled += 1
+        return handled
+
+    def _mark_gate_expired(self, gate_path: Path) -> None:
+        """期限切れの確認画面に、何が起きたのかを書いて残す。"""
+        if not gate_path.is_file():
+            return
+        try:
+            payload = json.loads(gate_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if payload.get("outcome") == "expired":
+            return
+        was = str(payload.get("answer") or "").strip().lower()
+        payload.update({
+            "answered": True,
+            "answer": "expired",
+            "outcome": "expired",
+            "answered_at": payload.get("answered_at") or time.time(),
+            "note": ("有効期限が切れたため、この承認は反映されていません。"
+                     "元の操作からやり直してください。"
+                     if was == "approved" else
+                     "有効期限が切れました。元の操作からやり直してください。"),
+        })
+        try:
+            tmp = gate_path.with_suffix(gate_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            os.replace(tmp, gate_path)
+        except OSError:
+            return
 
     def _record_source(self, skill: Skill, provenance: str, auto_trust: bool) -> None:
         now = time.time()

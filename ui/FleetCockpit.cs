@@ -6326,7 +6326,15 @@ class CockpitWindow : Window
         var all = ReadAllGates(ReadStatus());
         var sig = new StringBuilder();
         foreach (var gate in all)
-            sig.Append(S(gate, "token")).Append(':').Append(GateAnswered(gate) ? S(gate, "answer") : "open").Append(';');
+        {
+            // Expiry belongs in the signature. Without it a card drawn while the request
+            // was still valid kept its Approve button ENABLED after the deadline passed:
+            // the click then wrote "approved" that the trust store refused, so the user
+            // saw an approval that never took effect. Redraw when the deadline crosses.
+            sig.Append(S(gate, "token")).Append(':')
+               .Append(GateAnswered(gate) ? S(gate, "answer") : "open").Append(':')
+               .Append(GateExpired(gate) ? "exp" : "live").Append(';');
+        }
         string currentSig = sig.ToString() + (_dark ? "D" : "L") + _lang;
         if (currentSig == _approvalCenterSig) return;
         _approvalCenterSig = currentSig;
