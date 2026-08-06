@@ -120,3 +120,55 @@ def unlock_password_local(environ=None) -> str:
     except Exception:
         return ""
     return unlock_password_from_env(environ)
+
+
+# 記録に残してはいけない値。名前で拾う。解錠パスワードだけを伏せていた頃、
+# エージェントが .env の中身を読み上げた回があり、API キーと HF トークンが
+# そのまま転写ログに平文で残った（2026-08-06 実データで1件発見）。
+# 秘密を1つずつ足していく形だと、次に増えた鍵をまた取りこぼす。
+SECRET_NAME_HINTS = ("PASSWORD", "TOKEN", "SECRET", "API_KEY", "APIKEY", "CREDENTIAL")
+
+# 短すぎる値は伏せない。"1" や "auto" のような設定値まで置換すると、本文が
+# 読めなくなるうえ、伏字だらけで何が起きたのか追えなくなる。
+_MIN_SECRET_LEN = 8
+
+
+def secret_values(environ=None) -> list[str]:
+    """伏せるべき値を集める。環境変数と .env の両方から、名前で選ぶ。"""
+    env = dict(os.environ if environ is None else environ)
+    try:
+        from dotenv import dotenv_values
+
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for k, v in (dotenv_values(os.path.join(repo, ".env")) or {}).items():
+            if v and k not in env:
+                env[k] = v
+    except Exception:
+        pass
+
+    out: list[str] = []
+    for name, value in env.items():
+        if not value or len(value.strip()) < _MIN_SECRET_LEN:
+            continue
+        upper = name.upper()
+        if any(hint in upper for hint in SECRET_NAME_HINTS):
+            out.append(value.strip())
+    # 長いものから消す。短い値が長い値の一部だったとき、先に短い方を消すと
+    # 長い方が部分的に残る。
+    return sorted(set(out), key=len, reverse=True)
+
+
+def redact_secrets(text: str, environ=None) -> str:
+    """本文から秘密を伏せる。書き出す直前にだけ使う。
+
+    送る文には掛けないこと。解錠は本物のパスワードが相手に届いて初めて通る。
+    掛けてよいのは「ファイルに書く瞬間」だけ。
+    """
+    value = text or ""
+    try:
+        for secret in secret_values(environ):
+            if secret in value:
+                value = value.replace(secret, "<redacted>")
+    except Exception:
+        pass
+    return value

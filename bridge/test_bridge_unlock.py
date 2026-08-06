@@ -42,6 +42,14 @@ def test_the_unlock_turn_is_wired_into_the_shared_turn_helper():
     assert "BRIDGE_UNLOCK_PREFIX % pw" in body
 
 
+def test_first_turn_proactively_unlocks_before_tool_discovery():
+    body = SOURCE[SOURCE.index("def _run_one_turn"):]
+    body = body[:body.index("\n    def _stream_text")]
+    assert "_BRIDGE_UNLOCK_PREFLIGHT_DONE" in body
+    assert "turn_payload = (BRIDGE_UNLOCK_PREFIX % pw) + msg" in body
+    assert "_send_and_stream_once(turn_payload" in body
+
+
 def test_retries_are_capped_so_a_rotating_ip_cannot_loop():
     body = SOURCE[SOURCE.index("def _bridge_should_auto_unlock"):]
     body = body[:body.index("\ndef ")]

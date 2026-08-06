@@ -1449,6 +1449,25 @@ def _prepare_capture_baseline(sid):
         logger.warning("prepare_capture_baseline failed for sid=%s", sid, exc_info=True)
 
 
+def _redact_unlock_password(text):
+    """秘密を台帳に平文で残さない。
+
+    掛けるのは「ファイルに書く瞬間」だけで、エージェントへ送る文には掛けない。
+    送る側を伏せたら解錠そのものが通らなくなるので、そこは触らない。読み戻して
+    再送する経路は無い（再開は会話URLを開き直すだけで、過去の発言は送り直さない）
+    ので、伏せても動作に影響しない。
+
+    対象は解錠パスワードだけではない。エージェントが .env の中身を読み上げた回が
+    あり、API キーと HF トークンまで転写ログに平文で残っていた。名前で拾う共通の
+    仕組みに寄せて、鍵が増えても取りこぼさないようにする。
+    """
+    try:
+        from tools.secret_store import redact_secrets
+        return redact_secrets(text)
+    except Exception:
+        return text or ""
+
+
 def _persist_exchange(sid, user_msg, final_text):
     """Persist one completed exchange to the session ledger, maintaining conv_url via
     CHANGE-BASED capture. Rules (all ASCII logs):
@@ -1459,8 +1478,10 @@ def _persist_exchange(sid, user_msg, final_text):
         and warn on mismatch.
     Exception-guarded: a persistence hiccup must never break the chat turn."""
     try:
-        S.append_turn(sid, "user", user_msg)
-        S.append_turn(sid, "assistant", final_text)
+        # 送る側は元の文（解錠の前置きを付けない方）を渡しているので平文は入らないが、
+        # 返ってきた側は相手次第。復唱されれば同じ台帳に平文で残る。両方に掛ける。
+        S.append_turn(sid, "user", _redact_unlock_password(user_msg))
+        S.append_turn(sid, "assistant", _redact_unlock_password(final_text))
         sess = S.load(sid) or {}
         existing = sess.get("conv_url") or ""
         if existing:
@@ -3536,18 +3557,27 @@ class Handler(BaseHTTPRequestHandler):
         both. Raises on a driver/page error, exactly as _send_and_stream_once did before this
         was split out of _stream_text -- callers own the Esc/Stop-button + error-SSE handling.
         """
-        global _LAST_USER_TURN_TS
+        global _LAST_USER_TURN_TS, _BRIDGE_UNLOCK_ATTEMPTS, _BRIDGE_UNLOCK_PREFLIGHT_DONE
         _LAST_USER_TURN_TS = time.time()   # see its module-level docstring: the tool probe reads this
         _turn_sent_at = _LAST_USER_TURN_TS  # boundary for the lock check at the end of this turn
+        turn_payload = msg
+        if not _BRIDGE_UNLOCK_PREFLIGHT_DONE:
+            _BRIDGE_UNLOCK_PREFLIGHT_DONE = True
+            pw = _bridge_unlock_password()
+            if pw and _BRIDGE_UNLOCK_ATTEMPTS < MAX_BRIDGE_UNLOCK_ATTEMPTS:
+                _BRIDGE_UNLOCK_ATTEMPTS += 1
+                turn_payload = (BRIDGE_UNLOCK_PREFIX % pw) + msg
+                logger.info("bridge proactive unlock: attempt %d/%d",
+                            _BRIDGE_UNLOCK_ATTEMPTS, MAX_BRIDGE_UNLOCK_ATTEMPTS)
         _prepare_capture_baseline(sid)
-        final = self._send_and_stream_once(msg, stream_out=stream_out)
+        final = self._send_and_stream_once(turn_payload, stream_out=stream_out)
         # The conversation can simply be out of budget. Every later turn then returns the
         # same error, so retrying in place is useless -- move to a fresh chat and resend
         # this turn once. Checked before the consent branch because an exhausted turn is
         # not a consent card and must not be mistaken for one.
         if isinstance(final, str) and _bridge_recycle_if_exhausted(final):
             _prepare_capture_baseline(ACTIVE_SID)
-            final = self._send_and_stream_once(msg, stream_out=stream_out)
+            final = self._send_and_stream_once(turn_payload, stream_out=stream_out)
         if final is not None and _looks_like_consent(final):
             # Consent card, not a real answer -- do NOT show it to the user; auto-approve and
             # retry SILENTLY first (this is a connection-SELECT confirm, not a credential
@@ -3560,7 +3590,7 @@ class Handler(BaseHTTPRequestHandler):
                 consented = False
             if consented:
                 try:
-                    final = self._send_and_stream_once(msg, stream_out=stream_out)
+                    final = self._send_and_stream_once(turn_payload, stream_out=stream_out)
                 except Exception:
                     final = None
                 if final is not None and _looks_like_consent(final):
@@ -3581,7 +3611,6 @@ class Handler(BaseHTTPRequestHandler):
         # reports it in prose. Ask the server's own record instead, then unlock and redo
         # the turn -- the same shape as the consent retry above. The backend IP rotates,
         # so a few of these across a session are normal; the attempt cap stops a loop.
-        global _BRIDGE_UNLOCK_ATTEMPTS
         if _bridge_should_auto_unlock(_turn_sent_at):
             pw = _bridge_unlock_password()
             if pw:
@@ -4121,6 +4150,7 @@ def _bridge_recycle_if_exhausted(resp):
 # only asks whether one just did.
 MAX_BRIDGE_UNLOCK_ATTEMPTS = max(1, int(os.environ.get("MCP_BRIDGE_MAX_UNLOCK", "3")))
 _BRIDGE_UNLOCK_ATTEMPTS = 0
+_BRIDGE_UNLOCK_PREFLIGHT_DONE = False
 
 BRIDGE_UNLOCK_PREFIX = (
     "【要解錠】書込/実行ツールは接続のIP単位ロック解除が必要です。まず最初に call_tool で "
