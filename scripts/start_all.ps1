@@ -75,19 +75,19 @@ function Port-Up([int]$p) {
 function Http-Up([string]$url) {
     try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 $url | Out-Null; return $true } catch { return $false }
 }
-function Bridge-Is-Outdated([string]$repo) {
-    # True when a bridge process is running that started BEFORE the newest source file it
-    # loads. Only the modules the bridge imports at startup are considered, so editing docs
-    # or an unrelated tool never forces a restart. Any failure answers $false: an unreadable
-    # timestamp must never be the reason a healthy bridge gets torn down.
+function Proc-Is-Outdated([string]$repo, [string]$match, [string[]]$dirs, [string[]]$files) {
+    # True when a process matching $match is running that started BEFORE the newest source
+    # it loads. Only the modules that process imports at startup are considered, so editing
+    # docs or an unrelated tool never forces a restart. Any failure answers $false: an
+    # unreadable timestamp must never be the reason a healthy process gets torn down.
     try {
         $procs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-                   Where-Object { $_.CommandLine -and ($_.CommandLine -match 'copilot_bridge\.py') })
+                   Where-Object { $_.CommandLine -and ($_.CommandLine -match $match) })
         if ($procs.Count -eq 0) { return $false }   # nothing running -> normal start path
         $started = ($procs | Measure-Object -Property CreationDate -Minimum).Minimum
         if (-not $started) { return $false }
         $newest = $null
-        foreach ($sub in @('bridge', 'tools', 'relay')) {
+        foreach ($sub in $dirs) {
             $d = Join-Path $repo $sub
             if (-not (Test-Path $d)) { continue }
             $m = (Get-ChildItem $d -Filter *.py -File -ErrorAction SilentlyContinue |
@@ -95,9 +95,24 @@ function Bridge-Is-Outdated([string]$repo) {
                   Measure-Object -Property LastWriteTime -Maximum).Maximum
             if ($m -and (-not $newest -or $m -gt $newest)) { $newest = $m }
         }
+        foreach ($f in $files) {
+            $p = Join-Path $repo $f
+            if (-not (Test-Path $p)) { continue }
+            $m = (Get-Item $p -ErrorAction SilentlyContinue).LastWriteTime
+            if ($m -and (-not $newest -or $m -gt $newest)) { $newest = $m }
+        }
         if (-not $newest) { return $false }
         return ($newest -gt $started)
     } catch { return $false }
+}
+function Bridge-Is-Outdated([string]$repo) {
+    return (Proc-Is-Outdated $repo 'copilot_bridge\.py' @('bridge', 'tools', 'relay') @())
+}
+function Server-Is-Outdated([string]$repo) {
+    # main.py そのものと、それが起動時に取り込む tools/relay を見る。ブリッジだけを
+    # 見ていた頃、main.py の説明文を書き換えても再起動されず、古い文言が配られ続けた。
+    # 直したのに直っていない、という一番たちの悪い状態になる。
+    return (Proc-Is-Outdated $repo 'main\.py' @('tools', 'relay') @('main.py'))
 }
 function Stop-Bridge-Processes() {
     # Take the keepalive supervisor down first, otherwise it just respawns the python we are
@@ -729,6 +744,19 @@ function Invoke-Startup {
             return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
                       Where-Object { $_.CommandLine -and ($_.CommandLine -match 'supervisor\.ps1') })
         } catch { return @() }
+    }
+    # main.py が自分のソースより古ければ落とす。supervisor が居れば数十秒で拾い直し、
+    # 居なければ下の起動経路が立ち上げる。トンネルには触らない。
+    # ここが無かった頃、main.py を直しても古いプロセスが残り、直したはずの説明文が
+    # 配られ続けた（直っていないのか反映されていないのかが切り分けられない）。
+    if (Server-Is-Outdated $root) {
+        Write-Host "[1/4] MCP server: code is newer than the running process -- restarting"
+        try {
+            Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -and ($_.CommandLine -match 'main\.py') } |
+                ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        } catch { }
+        Start-Sleep -Seconds 2
     }
     $envTn = Env-Value "MCP_TUNNEL_NAME"
     $runningSupervisors = Get-RunningSupervisorProcesses
