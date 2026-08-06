@@ -18,6 +18,40 @@ def _working_dir(path: Optional[str]) -> str:
     return str(p)
 
 
+def _decode(raw: bytes) -> str:
+    """子プロセスの出力を、落とさずに文字へ直す。
+
+    text=True にすると、その場のコードページ（日本語Windowsなら cp932）で復号する。
+    UTF-8 で出力するスクリプトを走らせると、そこで例外になって出力が丸ごと消える。
+    実際、日本語を出す調査スクリプトが returncode 0 なのに「cp932 で復号できない」で
+    落ち、呼び出し側はファイルへ迂回する羽目になった。
+
+    UTF-8 を先に試し、駄目ならその場のコードページへ落とす。どちらでも読めない字は
+    捨てずに置き換える。出力の一部が化けるより、出力ごと消えるほうが困る。
+    """
+    if not raw:
+        return ""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    import locale
+    fallback = locale.getpreferredencoding(False) or "utf-8"
+    return raw.decode(fallback, errors="replace")
+
+
+def _format_output(result, label: str) -> str:
+    out = ""
+    stdout, stderr = _decode(result.stdout), _decode(result.stderr)
+    if stdout:
+        out += f"[stdout]\n{stdout}"
+    if stderr:
+        out += f"[stderr]\n{stderr}"
+    if result.returncode != 0:
+        out += f"\n[returncode: {result.returncode}]"
+    return out or "(no output)"
+
+
 def run_python(
     code: str,
     timeout: int = 60,
@@ -62,20 +96,12 @@ def run_python(
         result = subprocess.run(
             [sys.executable, tmp_path],
             capture_output=True,
-            text=True,
             timeout=timeout,
             cwd=_working_dir(working_dir),
             shell=False,
             env=sanitized_child_env(),
         )
-        output = ""
-        if result.stdout:
-            output += f"[stdout]\n{result.stdout}"
-        if result.stderr:
-            output += f"[stderr]\n{result.stderr}"
-        if result.returncode != 0:
-            output += f"\n[returncode: {result.returncode}]"
-        return output or "(no output)"
+        return _format_output(result, "run_python")
     except subprocess.TimeoutExpired:
         return f"[timeout: exceeded {timeout} seconds]"
     except Exception as e:
@@ -113,19 +139,11 @@ def shell_exec(
             command,
             shell=True,
             capture_output=True,
-            text=True,
             timeout=timeout,
             cwd=_working_dir(working_dir),
             env=sanitized_child_env(),
         )
-        output = ""
-        if result.stdout:
-            output += f"[stdout]\n{result.stdout}"
-        if result.stderr:
-            output += f"[stderr]\n{result.stderr}"
-        if result.returncode != 0:
-            output += f"\n[returncode: {result.returncode}]"
-        return output or "(no output)"
+        return _format_output(result, "shell_exec")
     except subprocess.TimeoutExpired:
         return f"[timeout: exceeded {timeout} seconds]"
     except Exception as e:
