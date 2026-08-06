@@ -2837,22 +2837,11 @@ class Handler(BaseHTTPRequestHandler):
     # bodies this replaced.
 
     def _do_new(self, parsed):
-        global ACTIVE_SID
         title = (urllib.parse.parse_qs(parsed.query).get("title") or [""])[0]
-        ok = False
         try:
-            if AGENT_URL:
-                PAGE.goto(AGENT_URL, wait_until="domcontentloaded")
-                ok = _wait_composer()
+            ok = _open_fresh_conversation(title)
         except Exception as e:
             self._json({"ok": False, "error": str(e)}); return
-        # Change-based capture baseline: the pane is now on the bare agent page, but
-        # aria-current can STILL mark the previously-open conversation's row (observed
-        # live) -- that stale marker plus all currently-known guids IS the baseline the
-        # post-send capture diffs against. Refreshed again right before the send.
-        _record_capture_baseline()
-        sess = S.new_session(title=title)
-        ACTIVE_SID = sess["sid"]
         self._json({"ok": ok, "url": PAGE.url, "sid": ACTIVE_SID})
 
     def _do_switch(self, parsed):
@@ -3552,6 +3541,13 @@ class Handler(BaseHTTPRequestHandler):
         _turn_sent_at = _LAST_USER_TURN_TS  # boundary for the lock check at the end of this turn
         _prepare_capture_baseline(sid)
         final = self._send_and_stream_once(msg, stream_out=stream_out)
+        # The conversation can simply be out of budget. Every later turn then returns the
+        # same error, so retrying in place is useless -- move to a fresh chat and resend
+        # this turn once. Checked before the consent branch because an exhausted turn is
+        # not a consent card and must not be mistaken for one.
+        if isinstance(final, str) and _bridge_recycle_if_exhausted(final):
+            _prepare_capture_baseline(ACTIVE_SID)
+            final = self._send_and_stream_once(msg, stream_out=stream_out)
         if final is not None and _looks_like_consent(final):
             # Consent card, not a real answer -- do NOT show it to the user; auto-approve and
             # retry SILENTLY first (this is a connection-SELECT confirm, not a credential
@@ -4048,6 +4044,67 @@ TOOL_PROBE_TIMEOUT_SEC = 180
 # no longer needs to resolve or reference the user's Desktop path for probing at all.
 
 _TOOL_PROBE_TIMER = None  # the pending threading.Timer, so _schedule_tool_probe can re-arm it
+
+
+# ── conversation recycling on token exhaustion ──────────────────────────────────
+# The relay and the fleet worker both detect Copilot's own "conversation is out of model
+# token budget" error and open a fresh chat (relay/copilot_autopilot_relay.py
+# conversation_exhausted + RECYCLE_PREFIX, mirrored in relay/relay_fleet.py). The bridge --
+# the third caller of the same driver -- never had it, and it is the one that appends to a
+# SINGLE conversation the longest: real user turns plus a liveness probe every 10 minutes
+# (144/day). Once the limit is hit, EVERY later turn returns the same error and the bridge
+# just keeps reporting it. Same failure class the auto-unlock comment above names: a
+# mechanism added to one caller and never swept across its siblings.
+MAX_BRIDGE_RECYCLES = max(0, int(os.environ.get("MCP_BRIDGE_MAX_RECYCLES", "8")))
+_BRIDGE_RECYCLES = 0
+
+
+def _open_fresh_conversation(title=""):
+    """Point the page at a brand-new chat on the same agent. Runs on the page thread.
+
+    Split out of the /new handler so the turn loop can reuse it. The handler used to own
+    this logic AND the HTTP reply, so nothing else could start a new conversation.
+    """
+    global ACTIVE_SID
+    ok = False
+    if AGENT_URL:
+        PAGE.goto(AGENT_URL, wait_until="domcontentloaded")
+        ok = _wait_composer()
+    # Change-based capture baseline: the pane is now on the bare agent page, but
+    # aria-current can STILL mark the previously-open conversation's row (observed
+    # live) -- that stale marker plus all currently-known guids IS the baseline the
+    # post-send capture diffs against. Refreshed again right before the send.
+    _record_capture_baseline()
+    sess = S.new_session(title=title)
+    ACTIVE_SID = sess["sid"]
+    return ok
+
+
+def _bridge_recycle_if_exhausted(resp):
+    """When Copilot says the conversation is out of budget, move to a fresh one.
+
+    Returns True when a new conversation was opened, so the caller can resend. Bounded:
+    if a fresh conversation reports exhaustion too, the cause is not conversation length
+    and retrying forever would only hide it.
+    """
+    global _BRIDGE_RECYCLES
+    if _BRIDGE_RECYCLES >= MAX_BRIDGE_RECYCLES:
+        return False
+    try:
+        from relay.copilot_autopilot_relay import conversation_exhausted
+    except Exception:
+        return False
+    if not conversation_exhausted(resp if isinstance(resp, str) else ""):
+        return False
+    _BRIDGE_RECYCLES += 1
+    logger.info("conversation is out of token budget -- opening a fresh one (%d/%d)",
+                _BRIDGE_RECYCLES, MAX_BRIDGE_RECYCLES)
+    try:
+        _open_fresh_conversation(title="")
+        return True
+    except Exception as e:
+        logger.warning("could not open a fresh conversation: %s: %s", type(e).__name__, e)
+        return False
 
 
 # ── auto-unlock for the MAIN chat ────────────────────────────────────────────────
