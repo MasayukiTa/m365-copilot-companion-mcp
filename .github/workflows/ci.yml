@@ -53,6 +53,12 @@ jobs:
             tests/test_security_xff.py \
             tests/test_scroll_transcript.py \
             tests/test_golden.py \
+            tests/test_listing_counts.py \
+            tests/test_child_output_decoding.py \
+            tests/test_skill_approval_flow.py \
+            tests/test_bridge_recycle.py \
+            tests/test_copper_scatter_target.py \
+            tools/test_folder_policy.py \
             tools/test_python_gate.py \
             tools/test_approval_policy.py \
             tools/test_layer1_security.py \

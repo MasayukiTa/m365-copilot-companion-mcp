@@ -27,8 +27,14 @@ jobs:
       - name: Install PSScriptAnalyzer
         shell: pwsh
         run: |
-          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          # PSGallery is not always registered on the runner image -- it stopped being
+          # there on 2026-08-06 and Set-PSRepository failed outright, taking the job
+          # with it. Register it when missing instead of assuming it is there.
+          if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+            Register-PSRepository -Default -ErrorAction SilentlyContinue
+          }
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -Repository PSGallery
 
       - name: Run PSScriptAnalyzer
         shell: pwsh

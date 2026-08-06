@@ -109,10 +109,16 @@ def test_head_says_where_it_looked(tmp_path):
     assert " under " in glob("*.nothing_matches_this").splitlines()[0]
 
 
-def test_home_relative_pattern_expands(tmp_path):
+def test_home_relative_pattern_expands(tmp_path, monkeypatch):
+    # ホームを差し替えて確かめる。実際のホームに何かある前提で書くと、空の環境
+    # （CI がそう）で落ちる。見たいのは ~ が展開されることだけ。
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    _make(tmp_path, n_md=2, n_other=1, n_dir=0)
     head = glob("~/*").splitlines()[0]
     assert head.split()[1] == "matches"
-    assert os.path.expanduser("~") in head
+    assert head.split()[0] == "3"
+    assert str(tmp_path) in head
 
 
 def test_missing_directory_is_not_zero_matches(tmp_path):
