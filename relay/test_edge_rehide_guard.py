@@ -55,11 +55,21 @@ def test_rehide_ps_minimize_guard_checks_window_visible():
     assert "IsIconic" in guard, guard
 
 
-def test_rehide_ps_never_calls_sw_hide():
-    # SW_HIDE (0) must never appear: edge_keeper.ps1's own comment records why -- a fully
-    # hidden window makes Edge discard the tab's renderer and the driver dies mid-drive
-    # with TargetClosedError. SW_MINIMIZE (6) is the only state change allowed.
-    assert not re.search(r"ShowWindow\([^)]*,\s*0\s*\)", _REHIDE_PS)
+def test_rehide_ps_never_leaves_the_window_hidden():
+    """SW_HIDE の状態で終えないこと。
+
+    元は「SW_HIDE を一度も書かない」と固定していた。いまは WS_EX_TOOLWINDOW を
+    立てるためにその一瞬だけ使う（属性変更は窓を隠してからでないと効かない）ので、
+    禁じるべきは「使うこと」ではなく「隠したまま終えること」。隠したままにすると
+    Edge がタブの描画を捨て、駆動中に TargetClosedError で落ちる。
+    """
+    calls = re.findall(r"ShowWindow\(\$h,\s*(\d+)\)", _REHIDE_PS)
+    assert calls, "ShowWindow の呼び出しが無い"
+    assert calls[-1] != "0", "最後が SW_HIDE のまま: %s" % calls
+    # 隠した直後に必ず戻していること（隠しっぱなしの経路を作らない）
+    for i, c in enumerate(calls):
+        if c == "0":
+            assert "6" in calls[i + 1:], "SW_HIDE の後に最小化へ戻していない: %s" % calls
 
 
 def test_edge_keeper_ps1_declares_is_window_visible_pinvoke():

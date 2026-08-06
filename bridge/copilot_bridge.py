@@ -497,7 +497,7 @@ def _schedule_force_rehide(timeout=None):
     def _safe_rehide():
         try:
             from relay.edge_recover import rehide
-            rehide()
+            rehide(port=int(os.environ.get('MCP_BRIDGE_CDP_PORT', '9223')))
             logger.info("force-rehide safety net fired after %.0fs", t)
         except Exception:
             logger.warning("force-rehide safety net: rehide() raised", exc_info=True)
@@ -1049,7 +1049,7 @@ def _wait_composer(timeout=40):
                 _cancel_force_rehide(force_timer)  # real rehide is happening now; drop the net
                 try:
                     from relay.edge_recover import rehide
-                    rehide()
+                    rehide(port=int(os.environ.get('MCP_BRIDGE_CDP_PORT', '9223')))
                 except Exception:
                     pass
             return True
@@ -1128,7 +1128,7 @@ def _goto_settled(url, timeout=25000, tries=3, compose_wait=40):
                 _cancel_force_rehide(force_timer)  # real rehide is happening now; drop the net
                 try:
                     from relay.edge_recover import rehide
-                    rehide()
+                    rehide(port=int(os.environ.get('MCP_BRIDGE_CDP_PORT', '9223')))
                 except Exception:
                     pass
             return True
@@ -1163,7 +1163,7 @@ def _goto_settled(url, timeout=25000, tries=3, compose_wait=40):
         _cancel_force_rehide(force_timer)
         try:
             from relay.edge_recover import rehide
-            rehide()
+            rehide(port=int(os.environ.get('MCP_BRIDGE_CDP_PORT', '9223')))
         except Exception:
             pass
     return settled
@@ -4572,6 +4572,18 @@ def _page_main(cdp, fresh):
                             "(none present, or all tiers found nothing to click)")
         except Exception:
             logger.warning("startup proactive auto-consent raised", exc_info=True)
+
+        # Take this bridge's own Edge out of the taskbar. Sign-in and consent surface it,
+        # and once a window exists it keeps a taskbar button even while minimized -- the
+        # user sees it and has to close it. rehide() used to be hardcoded to the fleet's
+        # profile, so every rehide the bridge asked for went to the WRONG Edge and its own
+        # window stayed on screen. Doing it once at startup covers the case where nobody
+        # surfaced anything this run but a window survived from a previous one.
+        try:
+            from relay.edge_recover import rehide
+            rehide(port=int(os.environ.get("MCP_BRIDGE_CDP_PORT", "9223")))
+        except Exception:
+            logger.warning("startup rehide raised", exc_info=True)
 
         # STARTUP AUTO-RESUME: reattach to the most recently active session that has a
         # reattachable conv_url, so a bridge restart (including the -Keepalive restart
