@@ -1,4 +1,4 @@
-# move_companion_to_desktop.ps1
+﻿# move_companion_to_desktop.ps1
 # Move the dedicated companion Edge window onto a SEPARATE Windows virtual desktop so
 # it is truly out of sight (a real background), without minimizing/hiding it.
 #
@@ -28,7 +28,11 @@
 
 param(
     # Target desktop index to move the companion window to (0-based). Default 1 = 2nd desktop.
-    [int]$TargetIndex = 1
+    [int]$TargetIndex = 1,
+    # Which Edge to move. The bridge runs its own profile (copilot-bridge-edge on :9223);
+    # hardcoding the fleet's profile here meant the bridge window could be surfaced for
+    # sign-in and never taken off the user's desktop again.
+    [string]$ProfileMarker = "copilot-companion-edge"
 )
 
 $ErrorActionPreference = "Stop"
@@ -77,10 +81,10 @@ public class CwMove {
 "@
 
 $pids = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
-          Where-Object { $_.CommandLine -match 'copilot-companion-edge' } |
+          Where-Object { $_.CommandLine -match $ProfileMarker } |
           ForEach-Object { [int]$_.ProcessId })
 if ($pids.Count -eq 0) {
-    Write-Host "No companion Edge process found (CommandLine contains 'copilot-companion-edge'). Is it running?"
+    Write-Host "No Edge process found (CommandLine contains '$ProfileMarker'). Is it running?"
     exit 1
 }
 

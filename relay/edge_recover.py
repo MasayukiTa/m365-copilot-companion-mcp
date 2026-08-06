@@ -278,6 +278,8 @@ using System.Runtime.InteropServices;
 using System.Text;
 public class RK {
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+  [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int i);
+  [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int i, int v);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
@@ -301,7 +303,7 @@ public class RK {
 }
 "@
 $pids = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
-          Where-Object { $_.CommandLine -match 'copilot-companion-edge' } |
+          Where-Object { $_.CommandLine -match '__PROFILE__' } |
           ForEach-Object { [int]$_.ProcessId })
 if ($pids.Count -gt 0) {
   $h = [RK]::Find($pids)
@@ -312,18 +314,39 @@ if ($pids.Count -gt 0) {
   if ($h -ne [IntPtr]::Zero -and [RK]::IsWindowVisible($h) -and -not [RK]::IsIconic($h)) {
     [RK]::ShowWindow($h, 6) | Out-Null
   }
+  # Minimizing is not enough: a minimized window still owns a taskbar button, which is
+  # what the user actually sees. SW_HIDE would remove it but makes Edge discard the
+  # tab's renderer (TargetClosedError mid-drive), so it is never used here. Marking the
+  # window WS_EX_TOOLWINDOW takes it out of the taskbar and Alt+Tab while leaving it a
+  # live, drivable window. Measured on the bridge Edge: CDP :9223 and the bridge kept
+  # answering with the flag set.
+  if ($h -ne [IntPtr]::Zero) {
+    $ex = [RK]::GetWindowLong($h, -20)
+    if (($ex -band 0x80) -eq 0) {
+      [RK]::ShowWindow($h, 0) | Out-Null                       # SW_HIDE, momentarily:
+      [RK]::SetWindowLong($h, -20, ($ex -bor 0x80) -band (-bnot 0x40000)) | Out-Null
+      [RK]::ShowWindow($h, 6) | Out-Null                       # back to minimized
+    }
+  }
 }
 '''
 
 
-def rehide():
-    """Return the companion Edge to the background IMMEDIATELY once auth completes:
+def rehide(port=None, profile=""):
+    """Return the surfaced Edge to the background IMMEDIATELY once auth completes:
     delete the keeper's pause file (so it resumes its 2s re-minimize duty) and
     directly minimize the window RIGHT NOW rather than waiting up to 2s for the
     keeper's next tick. Shells out to a PowerShell snippet that finds the dedicated
-    Edge (command line contains 'copilot-companion-edge') and calls ShowWindow(6)
-    on its Chrome_WidgetWin_1 window -- mirrors edge_keeper.ps1. Thread-safe like
-    surface() (no Playwright) and swallows all errors."""
+    Edge by profile marker and calls ShowWindow(6) on its Chrome_WidgetWin_1 window
+    -- mirrors edge_keeper.ps1. Thread-safe like surface() (no Playwright) and
+    swallows all errors.
+
+    `profile` selects WHICH Edge to put back. It used to be hardcoded to
+    'copilot-companion-edge', so the bridge -- which runs its own profile
+    'copilot-bridge-edge' on :9223 -- could be surfaced for sign-in but never put
+    back, and its window stayed on the taskbar indefinitely. surface() already takes
+    a port; this is the missing other half.
+    """
     import subprocess
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     fleet = os.path.join(repo, ".fleet")
@@ -336,8 +359,13 @@ def rehide():
         pass
     # Minimize immediately so the window drops to the background without a 2s lag.
     try:
+        # port が来たらそこからプロファイルを引く。surface(port=...) と対称にして、
+        # プロファイル名を呼び出し側に散らさない。
+        marker = profile or (_profile_for_port(port) if port is not None
+                             else _profile_for_port(9222))
         subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", _REHIDE_PS],
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+             _REHIDE_PS.replace("__PROFILE__", marker)],
             cwd=repo, timeout=20,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
