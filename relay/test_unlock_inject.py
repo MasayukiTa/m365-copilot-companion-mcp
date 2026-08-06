@@ -19,7 +19,37 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 PW = "unit_test_pw_abc123"
-os.environ["MCP_UNLOCK_PASSWORD"] = PW   # set BEFORE import so _unlock_password reads env, not .env
+# Set before importing so _unlock_password reads the environment rather than .env --
+# and REMOVED again at the end of this module (see the atexit hook below).
+#
+# Leaving it set leaked into whatever pytest imported next in the same process: the
+# first turn then carried an unlock preamble, and two unrelated tests that assert the
+# turn ends with the goal failed in CI while passing locally, purely on import order.
+_PREVIOUS_PW = os.environ.get("MCP_UNLOCK_PASSWORD")
+os.environ["MCP_UNLOCK_PASSWORD"] = PW
+
+
+def _restore_env():
+    if _PREVIOUS_PW is None:
+        os.environ.pop("MCP_UNLOCK_PASSWORD", None)
+    else:
+        os.environ["MCP_UNLOCK_PASSWORD"] = _PREVIOUS_PW
+
+
+# このモジュールは import されるだけで環境を書き換える（下の import より前に
+# 立てないと .env を読みに行ってしまうため）。pytest が続けて別のテストを
+# import する前に戻す必要があるので、収集後すぐ動くフィクスチャで戻す。
+# atexit ではプロセス終了時になり、同じ実行内の後続テストには間に合わない。
+try:
+    import pytest
+
+    @pytest.fixture(scope="module", autouse=True)
+    def _unlock_env():
+        os.environ["MCP_UNLOCK_PASSWORD"] = PW
+        yield
+        _restore_env()
+except ImportError:      # 単体スクリプトとして走らせたとき
+    pytest = None
 
 import relay.relay_fleet as rf
 from relay.relay_fleet import RelayWorker, MAX_UNLOCK_ATTEMPTS

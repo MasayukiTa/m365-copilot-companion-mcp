@@ -12,13 +12,19 @@ def test_kebab_click_is_not_consumed_before_button_click():
     assert "btn.PreviewMouseLeftButtonUp" not in body
 
 
+def test_kebab_menu_is_shifted_inside_the_fleet_window():
+    assert "cm.HorizontalOffset = -250;" in SOURCE
+
+
 def test_completed_card_menu_has_reuse_and_archive_actions():
     assert 'T("copy_result")' in SOURCE
     assert 'T("reveal_artifacts")' in SOURCE
     assert 'T("rerun_same")' in SOURCE
     assert 'menuLabels.Add(null)' in SOURCE
     assert 'T("to_history")' in SOURCE
+    assert 'ShowScaleToast(RevealPath(firstArtifact)' in SOURCE
 
 
-def test_released_card_has_no_noop_kebab():
+def test_released_card_keeps_the_functional_kebab():
+    assert "if (closed || terminal)" in SOURCE
     assert 'CardKebabBtn(new string[] { T("released") }' not in SOURCE
