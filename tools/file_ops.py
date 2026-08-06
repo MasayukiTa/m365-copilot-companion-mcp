@@ -1,3 +1,4 @@
+import fnmatch as _fnmatch
 import hashlib
 import os
 import shutil
@@ -166,13 +167,17 @@ def append_file(path: str, content: str, encoding: str = "utf-8") -> str:
         return f"[append_file error: {type(e).__name__}: {e}]"
 
 
-def list_directory(path: str = ".", recursive: bool = False, max_entries: int = 200) -> str:
-    """List files and directories.
+def list_directory(path: str = ".", recursive: bool = False, max_entries: int = 200,
+                   pattern: str = "") -> str:
+    """List files and directories. The first line gives the counts -- use it as the answer
+    to "how many"; do not tally the listing by hand.
 
     Args:
         path: Directory path under the allowed base.
         recursive: Recurse into subdirectories when true.
         max_entries: Maximum entries to return.
+        pattern: Optional filename filter, e.g. "*.md". Directories are excluded when set,
+            and the count on the first line covers only the matches.
     """
     try:
         p = _validate_path(path)
@@ -186,15 +191,37 @@ def list_directory(path: str = ".", recursive: bool = False, max_entries: int = 
             return f"[list_directory error: not a directory: {p}]"
         entries = p.rglob("*") if recursive else p.iterdir()
         lines: list[str] = []
+        n_dir = n_file = 0
+        truncated = False
         for entry in sorted(entries, key=lambda x: str(x).lower()):
             rel = entry.relative_to(p)
-            kind = "DIR" if entry.is_dir() else "FILE"
-            size = "" if entry.is_dir() else f" ({entry.stat().st_size:,} bytes)"
+            is_dir = entry.is_dir()
+            if pattern:
+                # 絞り込み時にディレクトリを混ぜない。混ざった一覧から目的の種類だけを
+                # 拾って数える作業を呼び出し側にさせると、そこで数を外していた。
+                if is_dir or not _fnmatch.fnmatch(entry.name, pattern):
+                    continue
+            kind = "DIR" if is_dir else "FILE"
+            size = "" if is_dir else f" ({entry.stat().st_size:,} bytes)"
             lines.append(f"[{kind}] {rel}{size}")
+            n_dir += is_dir
+            n_file += not is_dir
             if len(lines) >= max_entries:
-                lines.append(f"... truncated at {max_entries} entries")
+                truncated = True
                 break
-        return "\n".join(lines) if lines else "(empty directory)"
+        # 件数を先頭で返す。返していなかった頃は、呼び出し側が一覧を目で数えて
+        # 同じ問いに違う数を答えていた。数えるのはこちらの仕事。
+        # どこの件数なのかを書く。省略時の "." はサーバの作業ディレクトリなので、
+        # 場所を書かないと別の場所の結果と取り違えられる。
+        if pattern:
+            head = f"{n_file} files matching {pattern} in {p}"
+        else:
+            head = f"{n_file} files, {n_dir} directories in {p}"
+        if truncated:
+            head += f" (truncated at {max_entries}; more exist)"
+        elif not lines:
+            head += " (nothing matched)" if pattern else " (empty directory)"
+        return "\n".join([head] + lines)
     except Exception as e:
         return f"[list_directory error: {type(e).__name__}: {e}]"
 
