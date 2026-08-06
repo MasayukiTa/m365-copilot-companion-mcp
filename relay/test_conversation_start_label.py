@@ -15,13 +15,16 @@ def test_fleet_initial_prompt_starts_with_label_without_changing_goal():
     worker = RelayWorker("固有の確認対象", "W12")
     first_line, body = worker.job.split("\n", 1)
     assert first_line.endswith("| W12]")
-    assert body.endswith("Goal: 固有の確認対象")
+    # 見たいのは「ゴールの文が書き換えられていないこと」。前置きに何が足されても
+    # 末尾がゴールで終わっていればよい。解錠の前置きが入った途端に落ちたのは、
+    # PROTOCOL の書式そのものに結び付けていたため。
+    assert body.rstrip().endswith("固有の確認対象")
 
 
 def test_resumed_conversation_is_not_relabelled():
     worker = RelayWorker({"text": "続き", "resume_conv": "https://example/conversation/1"}, "W12")
     assert not worker.job.startswith("[")
-    assert worker.job.endswith("Goal: 続き")
+    assert worker.job.rstrip().endswith("続き")
 
 
 def test_worker_name_is_sanitized_for_one_line_title_metadata():

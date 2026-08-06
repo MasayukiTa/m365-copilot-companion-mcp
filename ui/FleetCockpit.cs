@@ -962,6 +962,8 @@ class CockpitWindow : Window
         if (k == "copy_result_done") return ja ? "結果をコピーしました" : "Result copied";
         if (k == "copy_result_fail") return ja ? "結果をコピーできませんでした" : "Could not copy result";
         if (k == "reveal_artifacts") return ja ? "成果物を表示" : "Show artifacts";
+        if (k == "reveal_artifacts_done") return ja ? "成果物をExplorerで表示しました" : "Opened artifacts in Explorer";
+        if (k == "reveal_artifacts_fail") return ja ? "成果物を表示できませんでした" : "Could not open artifacts";
         if (k == "rerun_same") return ja ? "同じ条件でもう一度実行" : "Run again with the same goal";
         if (k == "rerun_started") return ja ? "同じ条件で再実行を開始しました" : "Started the same goal again";
         if (k == "path_missing") return ja ? "見つかりません" : "Not found";
@@ -8187,6 +8189,10 @@ class CockpitWindow : Window
         cm.BorderBrush = Theme.Br(Theme.Border(_dark));
         cm.BorderThickness = new Thickness(1);
         cm.Padding = new Thickness(2);
+        // The kebab sits at the far-right edge of a card. Shift the popup left so the complete
+        // menu remains inside the Fleet window instead of growing off its right edge.
+        cm.MinWidth = 240;
+        cm.HorizontalOffset = -250;
 
         string[] lbls = labels;
         Action[] acts = actions;
@@ -8593,13 +8599,11 @@ class CockpitWindow : Window
             openLink.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; FlashOpen(card); OpenWorker(onm, ourl); };
             right.Children.Add(openLink);
         }
-        if (closed)
+        if (closed || terminal)
         {
-            // A released card has no secondary action; do not render a dead/no-op kebab.
-        }
-        else if (terminal)
-        {
-            // Completed-card menu: reuse actions first, destructive/cleanup action after a separator.
+            // Completed/released Fleet card menu: keep the kebab available after its agent tab is
+            // released. The result and artifacts remain useful, and the same goal can be run again.
+            // Reuse actions come first; the cleanup action sits after a separator.
             var wt2 = w;
             string menuResult = WorkerResultText(wt2, true);
             var artifactPaths = DetectExistingPaths(menuResult);
@@ -8614,7 +8618,9 @@ class CockpitWindow : Window
             {
                 string firstArtifact = artifactPaths[0];
                 menuLabels.Add(T("reveal_artifacts"));
-                menuActions.Add(delegate { RevealPath(firstArtifact); });
+                menuActions.Add(delegate {
+                    ShowScaleToast(RevealPath(firstArtifact) ? T("reveal_artifacts_done") : T("reveal_artifacts_fail"));
+                });
             }
 
             menuLabels.Add(T("rerun_same"));
@@ -9068,16 +9074,23 @@ class CockpitWindow : Window
 
     // Reveal a detected path: file -> explorer /select (highlight in its folder); directory ->
     // open the folder; neither exists -> no-op (the run is rendered non-interactive with a tooltip).
-    static void RevealPath(string path)
+    static bool RevealPath(string path)
     {
         try
         {
             if (File.Exists(path))
+            {
                 System.Diagnostics.Process.Start("explorer.exe", "/select,\"" + path + "\"");
+                return true;
+            }
             else if (Directory.Exists(path))
+            {
                 System.Diagnostics.Process.Start("explorer.exe", "\"" + path + "\"");
+                return true;
+            }
         }
         catch (Exception) { }
+        return false;
     }
 
     // Distinct EXISTING paths (file or folder) found in `text`, in first-seen order, capped scan.
