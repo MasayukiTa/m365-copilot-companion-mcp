@@ -12,6 +12,7 @@ Run:  .venv\\Scripts\\python.exe relay\\test_unlock_inject.py
 """
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -35,10 +36,16 @@ def check(name, cond):
 
 
 def main():
-    # 1. a locked reply -> inject unlock(password) with the LOCAL password, stay non-terminal
+    # 1. The first turn proactively unlocks before tool discovery / task execution.
     w = RelayWorker("デスクトップにフォルダ作って", "u0")
+    check("preflight_attempt_counted", w._unlock_attempts == 1)
+    check("preflight_job_has_unlock", "unlock" in (w.job or ""))
+    check("preflight_job_has_password", PW in (w.job or ""))
+    check("preflight_job_keeps_goal", "フォルダ作って" in (w.job or ""))
+
+    # A later locked reply (for example after backend IP rotation) still injects a bounded retry.
     w._decide(LOCKED)
-    check("inject_increments", w._unlock_attempts == 1)
+    check("inject_increments", w._unlock_attempts == 2)
     check("inject_job_has_unlock", "unlock" in (w.job or ""))
     check("inject_job_has_password", PW in (w.job or ""))
     check("inject_job_keeps_goal", "フォルダ作って" in (w.job or ""))
@@ -47,7 +54,7 @@ def main():
 
     # 2. cap: after MAX_UNLOCK_ATTEMPTS injections, the next locked reply -> STUCK (no infinite loop)
     w2 = RelayWorker("g", "u1")
-    for _ in range(MAX_UNLOCK_ATTEMPTS):
+    for _ in range(MAX_UNLOCK_ATTEMPTS - 1):
         w2._decide(LOCKED)
     check("cap_attempts_reached", w2._unlock_attempts == MAX_UNLOCK_ATTEMPTS)
     w2._decide(LOCKED)                                  # one past the cap
@@ -65,10 +72,18 @@ def main():
     finally:
         rf._unlock_password = orig
 
-    # 4. a benign reply (no locked marker) must NOT trigger an unlock injection
+    # 4. A benign reply must not add a reactive attempt beyond the proactive one.
     w4 = RelayWorker("g", "u3")
     w4._decide("作業を続けています。CONTINUE")
-    check("benign_no_unlock", w4._unlock_attempts == 0)
+    check("benign_no_extra_unlock", w4._unlock_attempts == 1)
+
+    # 5. The transient password must never be persisted in the local transcript.
+    with tempfile.TemporaryDirectory() as td:
+        tx = rf._Transcript(td, "unlock-redaction", "u4", "g")
+        tx.user(1, 'unlock {"password": "%s"}' % PW)
+        transcript_text = Path(tx.path).read_text(encoding="utf-8")
+        check("transcript_redacts_password", PW not in transcript_text)
+        check("transcript_has_redaction_marker", "<redacted-unlock-password>" in transcript_text)
 
     ok = sum(results)
     total = len(results)

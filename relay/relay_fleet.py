@@ -327,6 +327,39 @@ def _unlock_password():
     return unlock_password_local()
 
 
+def _initial_job_with_unlock(goal: str, plan_mode: bool = False):
+    """Build the first worker turn with a proactive unlock when local credentials exist.
+
+    Waiting for a write/exec tool to fail is too late: the agent may give up before it has
+    discovered the usable tool set.  The unlock must still be called by the M365-side agent
+    because the gate is keyed to that remote client IP, so the password is injected only into
+    this transient first turn and never into persistent agent configuration.
+    """
+    original = (PLAN_PROMPT + goal) if plan_mode else goal
+    pw = _unlock_password()
+    if not pw:
+        return ((PLAN_PROMPT + goal) if plan_mode else (PROTOCOL + goal)), False
+    return PROTOCOL + (UNLOCK_PREFIX % pw) + original, True
+
+
+def _redact_unlock_password(text: str) -> str:
+    """Keep local secrets out of the fleet transcript files.
+
+    Applied only where text is WRITTEN. The turn actually sent to the agent keeps the
+    real password -- redacting that would stop the unlock from working at all. Nothing
+    reads a transcript back and resends it, so redacting the stored copy costs nothing.
+
+    Not just the unlock password: an agent that read .env once echoed it back, and the
+    API key and HF token landed in a transcript in clear text. Selection is by NAME in
+    one shared place, so a newly added key is not missed the same way.
+    """
+    try:
+        from tools.secret_store import redact_secrets
+        return redact_secrets(text)
+    except Exception:
+        return text or ""
+
+
 def _mcp_tunnel_url():
     """MCP_TUNNEL_URL, read LOCALLY (process env or .env) the same way _unlock_password reads
     MCP_UNLOCK_PASSWORD. '' if unset (no tunnel configured / everything is local)."""
@@ -534,10 +567,14 @@ class _Transcript:
             pass
 
     def user(self, turn, text):
-        self._append({"turn": turn, "role": "user", "text": text or "", "ts": time.time()})
+        self._append({"turn": turn, "role": "user", "text": _redact_unlock_password(text), "ts": time.time()})
 
     def assistant(self, turn, text):
-        self._append({"turn": turn, "role": "assistant", "text": text or "", "ts": time.time()})
+        # 返ってきた側にも掛ける。こちらが送った文だけ伏せても、相手が復唱すれば
+        # 同じ記録に平文で残る。プロンプトでは「二度と出力するな」と頼んでいるが、
+        # 頼みごとであって保証ではない。
+        self._append({"turn": turn, "role": "assistant",
+                      "text": _redact_unlock_password(text), "ts": time.time()})
 
     def note_guid(self, guid):
         """Record the conversation guid once it's known (idempotent)."""
@@ -1041,7 +1078,11 @@ class RelayWorker:
         self.plan_mode = plan_mode
         self.plan_steps = []
         self._plan_approved = False
-        initial_body = (PLAN_PROMPT + self.goal) if plan_mode else (PROTOCOL + self.goal)
+        initial_body, preflight_unlock = _initial_job_with_unlock(self.goal, plan_mode)
+        if preflight_unlock:
+            # Count the proactive attempt against the same bounded budget used by reactive
+            # re-unlocks when the M365 backend later rotates to a different source IP.
+            self._unlock_attempts = 1
         self.job = (initial_body if self.resume_conv
                     else conversation_start_label(self.name) + initial_body)
         self.turn = 0

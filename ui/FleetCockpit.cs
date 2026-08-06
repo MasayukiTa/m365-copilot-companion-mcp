@@ -939,6 +939,7 @@ class CockpitWindow : Window
         if (k == "hs_signin_bad") return ja ? "サインインが必要です（ログイン画面を検出）" : "Sign-in required (login wall detected)";
         if (k == "hs_agent_ok") return ja ? "専用エージェントに接続中" : "Bound to the configured agent";
         if (k == "hs_agent_warn") return ja ? "既定Copilotに落ちている可能性（エージェント未検出）" : "Possible default-Copilot fallback (agent tab not found)";
+        if (k == "hs_agent_bad") return ja ? "実行中ですがM365チャットタブを検出できません" : "Run is active but no M365 chat tab is available";
         if (k == "hs_agent_gray") return ja ? "Edge 停止中のため判定不可" : "Edge down — cannot tell";
         if (k == "hs_fixing") return ja ? "修復中… " : "Fixing… ";
         if (k == "hs_fix_signin") return ja ? "サインイン用に Edge を開いています…" : "Opening Edge for sign-in…";
@@ -957,6 +958,12 @@ class CockpitWindow : Window
         if (k == "badge_default_copilot") return ja ? "既定Copilot" : "default Copilot";
         // ── P1/P2 UX: artifacts, history groups/search/auto-archive, resume ──────────
         if (k == "artifacts") return ja ? "成果物" : "Artifacts";
+        if (k == "copy_result") return ja ? "結果をコピー" : "Copy result";
+        if (k == "copy_result_done") return ja ? "結果をコピーしました" : "Result copied";
+        if (k == "copy_result_fail") return ja ? "結果をコピーできませんでした" : "Could not copy result";
+        if (k == "reveal_artifacts") return ja ? "成果物を表示" : "Show artifacts";
+        if (k == "rerun_same") return ja ? "同じ条件でもう一度実行" : "Run again with the same goal";
+        if (k == "rerun_started") return ja ? "同じ条件で再実行を開始しました" : "Started the same goal again";
         if (k == "path_missing") return ja ? "見つかりません" : "Not found";
         if (k == "hist_today") return ja ? "今日" : "Today";
         if (k == "hist_yesterday") return ja ? "昨日" : "Yesterday";
@@ -1962,26 +1969,37 @@ class CockpitWindow : Window
         string tabsJson = HttpGetBody("http://127.0.0.1:9222/json", 3500);
         List<string> urls = ExtractTabUrls(tabsJson);
 
-        // 3) Sign-in: RED if ANY tab url matches the login-wall regex (mirrors doctor.ps1).
+        // 3) Sign-in: a stale login tab must not override a live M365 chat tab. Edge can retain
+        //    an old login.microsoftonline.com page after authentication while the custom-agent
+        //    conversation is already working in another tab. Red only when a login wall exists
+        //    AND there is no usable signed-in M365 chat tab.
         bool onLoginWall = false;
+        bool hasUsableM365Chat = false;
         foreach (string u in urls) if (LooksLikeLoginWall(u)) { onLoginWall = true; break; }
-        SetDot(3, onLoginWall ? HealthState.Red : HealthState.Green,
-               T(onLoginWall ? "hs_signin_bad" : "hs_signin_ok"), now);
+        foreach (string u in urls)
+            if (LooksLikeUsableM365Chat(u)) { hasUsableM365Chat = true; break; }
+        bool needsSignin = onLoginWall && !hasUsableM365Chat;
+        SetDot(3, needsSignin ? HealthState.Red : HealthState.Green,
+               T(needsSignin ? "hs_signin_bad" : "hs_signin_ok"), now);
 
         // 4) Agent: the tab URL is NOT a reliable signal -- the M365 SPA keeps the loaded
         //    custom agent while the URL normalizes to '/chat/?redirfrom=CsrToSSR' (verified:
         //    a working agent that returned real tool results showed exactly that URL). So we
         //    judge from the GROUND TRUTH instead: the newest transcript's last assistant turn.
         //    The custom agent prefixes its replies with its display name; a default-Copilot
-        //    fallback returns the canned non-answer. GREEN when answering, YELLOW on the canned
-        //    non-answer (the real fallback), GRAY when idle / nothing to judge yet.
+        //    fallback returns the canned non-answer. While a run is live, a usable M365 chat tab
+        //    is enough to show GREEN immediately (including before the first assistant reply),
+        //    YELLOW is the canned default-Copilot fallback, and RED means the run is active but
+        //    no usable chat tab exists. GRAY is reserved for idle / not currently running.
         if (!RunIsLive())
             SetDot(4, HealthState.Gray, T("hs_agent_gray"), now);
+        else if (!hasUsableM365Chat)
+            SetDot(4, HealthState.Red, T("hs_agent_bad"), now);
         else
         {
             string lastAssistant = NewestAssistantText();
             if (lastAssistant == null)
-                SetDot(4, HealthState.Gray, T("hs_agent_gray"), now);          // run live, no reply yet
+                SetDot(4, HealthState.Green, T("hs_agent_ok"), now);          // run live, first reply pending
             else if (LooksLikeCannedNonAnswer(lastAssistant))
                 SetDot(4, HealthState.Yellow, T("hs_agent_warn"), now);        // default-Copilot fallback
             else
@@ -2160,6 +2178,15 @@ class CockpitWindow : Window
             || u.Contains("login_hint=");
     }
 
+    static bool LooksLikeUsableM365Chat(string url)
+    {
+        if (string.IsNullOrEmpty(url) || LooksLikeLoginWall(url)) return false;
+        string u = url.ToLowerInvariant();
+        return (u.StartsWith("https://m365.cloud.microsoft/")
+                || u.StartsWith("https://www.microsoft365.com/"))
+            && u.Contains("/chat");
+    }
+
     // Pull every "url":"..." value out of the raw :9222/json tab-list body. Uses the shared
     // JavaScriptSerializer when the body parses as an array; falls back to a cheap scan otherwise.
     List<string> ExtractTabUrls(string json)
@@ -2287,7 +2314,7 @@ class CockpitWindow : Window
     }
 
     // ── Fix button: run the remedy for the WORST current problem ─────────────────────
-    // Priority (worst first): sign-in RED -> Edge RED -> agent YELLOW -> server RED.
+    // Priority (worst first): sign-in RED -> Edge RED -> agent RED/YELLOW -> server RED.
     // Each remedy is a short-lived, windowless, async shell; never blocks the UI; guarded.
     // Never two at once (button disabled while running).
     void RunFix()
@@ -2302,7 +2329,7 @@ class CockpitWindow : Window
         }
         if (signin == HealthState.Red) _fixTargetMask = 1 << 3;
         else if (edge == HealthState.Red) _fixTargetMask = 1 << 2;
-        else if (agent == HealthState.Yellow) _fixTargetMask = 1 << 4;
+        else if (agent == HealthState.Yellow || agent == HealthState.Red) _fixTargetMask = 1 << 4;
         else if (server == HealthState.Red || tunnel == HealthState.Red)
             _fixTargetMask = ((server == HealthState.Red) ? (1 << 0) : 0)
                            | ((tunnel == HealthState.Red) ? (1 << 1) : 0);
@@ -2364,8 +2391,8 @@ class CockpitWindow : Window
             return;
         }
 
-        // Priority 3: Agent YELLOW (default-Copilot fallback / stale connector) -> edge_reconnect.
-        if (agent == HealthState.Yellow)
+        // Priority 3: Agent RED/YELLOW (missing chat / default-Copilot fallback) -> edge_reconnect.
+        if (agent == HealthState.Yellow || agent == HealthState.Red)
         {
             note(T("hs_fix_agent"));
             var t = new Thread(new ThreadStart(delegate
@@ -8120,7 +8147,8 @@ class CockpitWindow : Window
         return SegFilterButton(label, val, isNeeds, needsCount, false, false);
     }
 
-    // "⋮" kebab button for card secondary actions (terminal/closed). Uses a WPF ContextMenu
+    // "⋮" kebab button for card secondary actions. A null label inserts a visual separator.
+    // Uses a WPF ContextMenu
     // (not a manual Popup) so it survives the VirtualizingStackPanel recycling its host row
     // without causing layout/focus loops. A ContextMenu is hosted in its own popup root and
     // is NOT tied to the visual tree of the virtualized element; it handles detach gracefully.
@@ -8165,6 +8193,11 @@ class CockpitWindow : Window
         for (int i = 0; i < lbls.Length; i++)
         {
             int idx = i;
+            if (lbls[idx] == null)
+            {
+                cm.Items.Add(new Separator { Margin = new Thickness(4, 3, 4, 3) });
+                continue;
+            }
             var mi = new MenuItem();
             mi.Header = lbls[idx];
             mi.Background = Brushes.Transparent;
@@ -8188,8 +8221,8 @@ class CockpitWindow : Window
                 btn.ContextMenu.IsOpen = true;
             }
         };
-        // Swallow mouse-up so the kebab click doesn't bubble to the card's open-conversation handler
-        btn.PreviewMouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; };
+        // ButtonBase already handles its mouse-up. Do not mark PreviewMouseLeftButtonUp handled:
+        // doing so prevents ButtonBase from raising Click, leaving this menu apparently dead.
         return btn;
     }
 
@@ -8446,6 +8479,38 @@ class CockpitWindow : Window
         return b;
     }
 
+    // One canonical user-facing result string for the expanded result panel, clipboard, and
+    // artifact detection. Keeping these entry points together prevents the menu from copying raw
+    // runner chatter while the card displays the cleaned final answer.
+    string WorkerResultText(Dictionary<string, object> w, bool terminal)
+    {
+        string displayResult = w != null ? S(w, "display_result") : "";
+        if (!string.IsNullOrEmpty(displayResult)) return displayResult;
+
+        string last = w != null ? S(w, "last") : "";
+        if (!string.IsNullOrEmpty(last))
+        {
+            string cleaned = CleanAgentResultForUi(last);
+            return !string.IsNullOrEmpty(cleaned)
+                ? cleaned
+                : (_lang == 0 ? "結果を受信しました" : "Result received");
+        }
+
+        string outcome = w != null ? S(w, "outcome") : "";
+        return terminal ? OutcomeLabel(outcome) : (_lang == 0 ? "実行中…" : "Working…");
+    }
+
+    void CopyWorkerResult(string result)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(result)) throw new InvalidOperationException();
+            Clipboard.SetText(result);
+            ShowScaleToast(T("copy_result_done"));
+        }
+        catch (Exception) { ShowScaleToast(T("copy_result_fail")); }
+    }
+
     Border Card(Dictionary<string, object> w)
     {
         string name = S(w, "name");
@@ -8530,16 +8595,36 @@ class CockpitWindow : Window
         }
         if (closed)
         {
-            // closed: "解放済" in a tiny kebab (secondary only) — keep Open visible
-            right.Children.Add(CardKebabBtn(new string[] { T("released") }, new Action[] { delegate { } }, w));
+            // A released card has no secondary action; do not render a dead/no-op kebab.
         }
         else if (terminal)
         {
-            // terminal card: archive/to-history is secondary -> into kebab
+            // Completed-card menu: reuse actions first, destructive/cleanup action after a separator.
             var wt2 = w;
-            string[] klabels = new string[] { "→ " + T("to_history") };
-            Action[] kactions = new Action[] { delegate { ArchiveAndHide(wt2); } };
-            right.Children.Add(CardKebabBtn(klabels, kactions, w));
+            string menuResult = WorkerResultText(wt2, true);
+            var artifactPaths = DetectExistingPaths(menuResult);
+            var menuLabels = new List<string>();
+            var menuActions = new List<Action>();
+
+            string copyText = menuResult;
+            menuLabels.Add(T("copy_result"));
+            menuActions.Add(delegate { CopyWorkerResult(copyText); });
+
+            if (artifactPaths.Count > 0)
+            {
+                string firstArtifact = artifactPaths[0];
+                menuLabels.Add(T("reveal_artifacts"));
+                menuActions.Add(delegate { RevealPath(firstArtifact); });
+            }
+
+            menuLabels.Add(T("rerun_same"));
+            menuActions.Add(delegate { RetryGoal(wt2); ShowScaleToast(T("rerun_started")); });
+
+            menuLabels.Add(null);
+            menuActions.Add(null);
+            menuLabels.Add("→ " + T("to_history"));
+            menuActions.Add(delegate { ArchiveAndHide(wt2); });
+            right.Children.Add(CardKebabBtn(menuLabels.ToArray(), menuActions.ToArray(), w));
         }
         else
         {
@@ -9145,22 +9230,7 @@ class CockpitWindow : Window
         sp.Children.Add(SectLabel(_lang == 0 ? "結果" : "Result"));
         // Precedence: display_result (cleaned final answer from runner) > last > OutcomeLabel fallback.
         string displayResult = (w != null) ? S(w, "display_result") : "";
-        string result;
-        if (!string.IsNullOrEmpty(displayResult))
-        {
-            result = displayResult;
-        }
-        else if (!string.IsNullOrEmpty(last))
-        {
-            string cleaned = CleanAgentResultForUi(last);
-            result = !string.IsNullOrEmpty(cleaned)
-                ? cleaned
-                : (_lang == 0 ? "結果を受信しました" : "Result received");
-        }
-        else
-        {
-            result = terminal ? OutcomeLabel(outcome) : (_lang == 0 ? "実行中…" : "Working…");
-        }
+        string result = WorkerResultText(w, terminal);
         // P1: render the result with clickable file/folder paths (falls back to plain text when none).
         sp.Children.Add(ResultText(result, Fg, 13));
 
