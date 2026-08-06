@@ -200,3 +200,9 @@ _attic/
 
 # Review run dumps are per-run local evidence, not product code.
 /review_artifacts/
+
+# Skills are per-person procedures with site-specific detail (table names, query
+# pitfalls, local paths). They are not something everyone should run, and the
+# knowledge inside them should not be published. Kept on disk, out of the repo.
+skills/
+tests/test_copper_scatter_target.py

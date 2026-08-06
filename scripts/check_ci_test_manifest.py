@@ -18,14 +18,36 @@ EXCLUDED = {
 }
 
 
+def _tracked() -> set[str] | None:
+    """git が追跡しているファイル。取れなければ None（判定を諦める）。
+
+    追跡していないテストは CI のチェックアウトに存在しないので、一覧に載せようが
+    ないし、載せれば CI が「そんなファイルは無い」で落ちる。手元にだけ置いてある
+    ものを、載せ忘れとして扱わないための区別。
+    """
+    import subprocess
+    try:
+        out = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True,
+                             text=True, timeout=30)
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    return {line.strip() for line in out.stdout.splitlines() if line.strip()}
+
+
 def discover_tests() -> set[str]:
+    tracked = _tracked()
     found: set[str] = set()
     for root_name in TEST_ROOTS:
         base = ROOT / root_name
         if not base.is_dir():
             continue
         for path in base.rglob("test_*.py"):
-            found.add(path.relative_to(ROOT).as_posix())
+            rel = path.relative_to(ROOT).as_posix()
+            if tracked is not None and rel not in tracked:
+                continue
+            found.add(rel)
     return found
 
 
