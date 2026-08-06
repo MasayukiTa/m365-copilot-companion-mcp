@@ -1,4 +1,5 @@
 import os
+import time
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
@@ -177,13 +178,60 @@ mcp = FastMCP(
     "m365-copilot-companion-mcp",
     auth=auth,
     instructions=(
-        "m365-copilot-companion-mcp toolkit. Use these tools to read, search, edit, "
-        "and inspect local project files; run bounded Python or shell commands; work "
-        "with CSV/Excel/JSON; generate PowerPoint decks and diagrams; manage "
-        "long-running background jobs; verify your own outputs via read_image and "
-        "pptx_export_png; and install Python dependencies when needed. Read-only tools "
-        "are available after token authentication; mutating or execution tools require "
-        "unlock(password) per IP. Call list_my_tools to see the full catalog. "
+        "m365-copilot-companion-mcp toolkit. "
+        # The catalogue is reachable ONLY through the call_tool gateway. Naming tools as
+        # though they were directly callable made agents look for read_file/list_directory
+        # in their own tool list, not find them, and conclude the tools did not exist --
+        # then answer 'この環境には存在しません' while holding 166 usable tools. State the gateway
+        # first, before anything else, and never imply a bare tool name is callable.
+        # 実測: 同じ問いを3回投げると、一覧を取った回は成功し、取らなかった回は
+        # 「この環境にファイルシステムのツールは無い」と断定して拒否した。差はそこだけ
+        # だったので、一覧取得を「推奨」ではなく「最初の行動」として書き切る。
+        "RULE 1 -- DO THIS FIRST, ALWAYS: call call_tool(name='') and read the returned "
+        "catalogue (about 160 entries) BEFORE answering anything about what you can or "
+        "cannot do. This is not optional and not a fallback. "
+        # 実測: 「MT18EX5 RM の期限切れを調べて」の一言を投げたら、承認済みの手順が
+        # あるのに skill_match を呼ばず、DB を自分で叩いて別解を作文した。もっともらしいが
+        # 問い自体がすり替わっていた（材料の期限切れの話になり、本来の「期限を過ぎてから
+        # 使われたロット」を出していない）。手順の記述は末尾に置いていて読まれなかったので、
+        # 一覧取得の直後に上げる。
+        "RULE 2 -- DO THIS SECOND: call skill_match with the user's request, before "
+        "doing any domain work. If it returns a confident trusted match, call "
+        "skill_load and FOLLOW that procedure as written. Do not re-derive it, do not "
+        "write your own query, and do not substitute a similar-sounding question: a "
+        "matched Skill encodes decisions that were verified against the real data, and "
+        "improvising past it has produced confident wrong answers. Skill trust never "
+        "grants extra execution rights; unlock and contract gates still apply. "
+        "RULE 3: every tool lives BEHIND the call_tool gateway. Names like read_file / "
+        "list_directory / run_python / glob are NOT in your own tool list and you will "
+        "not find them there. Their absence from your tool list is EXPECTED and proves "
+        "nothing. "
+        "RULE 4: you may never state that a capability is unavailable, that this "
+        "environment lacks filesystem access, or that only Microsoft 365 / GitHub tools "
+        "are connected, unless you have already run call_tool(name='') in THIS "
+        "conversation and the catalogue actually lacks what you need. Saying it without "
+        "having looked is a factual error. "
+        "Usage: call_tool(name='X') for a tool's signature, then "
+        "call_tool(name='X', arguments={...}) to run it. "
+        # 実測: 一覧取得は10/10通るのに、答えは 14〜18 とばらけた(正解16)。
+        # 最初は「run_python で計算しろ」と書いたが、run_python は unlock 必須で、
+        # 解錠に当たった回がまるごと拒否に戻り 5/10 -> 4/10 と悪化した。
+        # そこで glob / list_directory 自身に件数を返させ、ここではそれを読めと言う。
+        "RULE 5: read-only listing tools (glob, list_directory, find_files) return "
+        "the count on their FIRST line, e.g. '16 matches' or '16 files, 3 "
+        "directories'. When asked how many, report THAT number verbatim. Never "
+        "tally the listing yourself -- hand-counting is where answers drift. To count files of a kind, call glob('*.md', path) or list_directory(path, pattern='*.md') -- both filter first and hand you the number. Never enumerate an UNFILTERED list_directory and pick out the rows you want: every wrong answer measured came from doing that, and each one was low by one. If you want to cross-check, run both and compare the two first lines. Do not re-derive the number by picking rows out of an unfiltered listing: the run that did that had the correct count in hand, discarded it, and answered 15 instead of 16. "
+        "RULE 6: read-only tools (glob, list_directory, find_files, read_file, "
+        "search) need no unlock. Only mutating or executing tools (run_python, "
+        "shell, write_file) do. Never refuse a read-only request on the grounds "
+        "that you are not unlocked, and never reach for run_python when a "
+        "read-only tool already answers the question. "
+        "With that gateway you can read, search, edit and inspect local files; run "
+        "bounded Python or shell commands; work with CSV/Excel/JSON; generate PowerPoint "
+        "decks and diagrams; manage long-running jobs; verify your own output via "
+        "read_image and pptx_export_png; and install Python dependencies. Read-only "
+        "tools work after token authentication; mutating or execution tools additionally "
+        "require unlock(password), per client IP. "
         "Relative user-folder names (Desktop, Documents, Downloads, ...) resolve to the "
         "user's home profile, not the server's working directory. If a file or folder "
         "seems missing, use find_files (recursive name search) before concluding it is "
@@ -350,10 +398,20 @@ _ALL_TOOLS = {getattr(t, "__name__", repr(t)): t for t in TOOLS}
 
 if os.environ.get("MCP_TOOL_MAP") == "1":
     def call_tool(name: str = "", arguments: dict = None):
-        """Gateway to EVERY tool on this server. This client caps the tool list, so rarely-used
-        tools are reached through this one. Call call_tool(name="") to LIST all tools (name,
-        signature, one-line summary); then call_tool(name="<tool>", arguments={...}) to invoke
-        one. The target tool's own auth/unlock still applies.
+        """Gateway to EVERY tool on this server -- START HERE by calling call_tool(name="").
+
+        This client caps the tool list, so most tools are NOT visible to you and are reached
+        only through this one. File, shell, Excel, database and image tools all exist here.
+        Their absence from your own tool list is expected and proves nothing about what this
+        server can do -- so never answer "there is no tool for that", "this environment has no
+        filesystem access", or "only Microsoft 365 tools are connected" without having called
+        call_tool(name="") in this conversation and read the catalogue. Measured: the runs that
+        listed first answered correctly; the runs that declared a capability missing without
+        listing were simply wrong.
+
+        Then call_tool(name="<tool>") shows one tool's signature, and
+        call_tool(name="<tool>", arguments={...}) runs it. Read-only tools (glob, read_file,
+        list_directory, find_files) run as-is; only mutating or executing tools need unlock.
 
         Args:
             name: the tool's name (e.g. "odbc_query"). Empty or "?" lists every tool.
@@ -525,8 +583,34 @@ def _install_faulthandler() -> None:
 _FAULTHANDLER_FILE = None
 
 
+def _start_approval_watcher(period: float = 3.0) -> None:
+    """押された承認を、押した直後に信頼状態へ取り込む。
+
+    取り込みは Skill を一覧したときにしか走らなかったので、承認を押しても誰も
+    一覧しない限り何も起きず、確認画面が消えないままになった（押した側からは
+    「承認したのに反応しない」としか見えない）。ここで定期的に拾う。
+
+    失敗しても黙って次の周回へ行く。承認の取り込みが、サーバが立たない理由に
+    なってはいけない。
+    """
+    import threading
+
+    def loop():
+        while True:
+            try:
+                from relay.skills import SkillStore
+                SkillStore(os.path.dirname(os.path.abspath(__file__))).sync_approvals()
+            except Exception:
+                pass
+            time.sleep(period)
+
+    t = threading.Thread(target=loop, name="approval-watcher", daemon=True)
+    t.start()
+
+
 if __name__ == "__main__":
     _install_faulthandler()
+    _start_approval_watcher()
     # timeout_graceful_shutdown gives in-flight requests up to 30s to finish on SIGTERM
     # instead of an immediate hard kill (uvicorn default 0 = no grace). Passed through
     # FastMCP.run_http_async -> uvicorn.Config(**uvicorn_config).
