@@ -58,6 +58,7 @@ jobs:
             tests/test_skill_approval_flow.py \
             tests/test_bridge_recycle.py \
             tests/test_unlock_redaction.py \
+            tests/test_edge_keeper_coverage.py \
             tests/test_edge_taskbar_hygiene.py \
             ui/test_fleet_cockpit_health.py \
             ui/test_fleet_cockpit_card_menu.py \
@@ -76,6 +77,7 @@ jobs:
             tools/test_lock_state.py \
             tools/test_notify_ops.py \
             tools/test_ocr_ops.py \
+            tools/test_untrusted_coverage.py \
             tools/test_procedural_memory.py \
             tools/test_agent_memory_ops.py \
             tools/test_auth_stats.py \
@@ -87,6 +89,7 @@ jobs:
             scripts/test_start_companion_edge_headless.py \
             bridge/test_bridge_sessions.py \
             bridge/test_cdp_watchdog.py \
+            bridge/test_consent_chain.py \
             bridge/test_consent_surface.py \
             bridge/test_p2c_flag.py \
             bridge/test_review_command.py \
@@ -143,6 +146,8 @@ jobs:
             relay/test_relay_loop.py \
             relay/test_repo_map.py \
             relay/test_response_independent_send.py \
+            relay/test_send_never_submits_empty.py \
+            relay/test_settle_survives_placeholder.py \
             relay/test_soak.py \
             relay/test_solve_policy.py \
             relay/test_skills.py \
