@@ -8,7 +8,7 @@ pandas
 openpyxl
 python-pptx>=1.0.2,<2.0
 python-docx>=1.2.0
-pypdf>=6.14.2
+pypdf>=6.15.0
 send2trash>=2.1.0
 matplotlib
 pytesseract>=0.3.13
