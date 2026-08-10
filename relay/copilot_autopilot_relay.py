@@ -1200,8 +1200,19 @@ class CopilotWebDriver:
                         btn.click(force=True, timeout=4000)
                 except Exception:
                     pass
+            elif not self._composer_text():
+                # Send never armed AND the composer is EMPTY: the insert_text landed
+                # nowhere (a force=True composer click can miss, leaving focus outside
+                # the editor -- then Control+a selects the page, Delete no-ops, and the
+                # inserted text is dropped). Pressing Enter here is what SUBMITS AN EMPTY
+                # TURN: the agent then answers "your message appears to be empty" (or
+                # greets with its capability list), which reads exactly like a refusal
+                # to anything judging by reply text. Do NOT press Enter -- fall through
+                # to the next attempt, which re-clicks the composer and retypes.
+                self.page.wait_for_timeout(250)
+                continue
             else:
-                # Send never armed (rare): last-ditch Enter.
+                # Send never armed but text IS present (rare): last-ditch Enter.
                 try:
                     self.page.keyboard.press("Enter")
                 except Exception:
