@@ -9,7 +9,13 @@
 #
 # ASCII / ENGLISH ONLY. Started (and re-started) by start_companion_edge.ps1.
 
-param([int]$Port = 9222)
+# $ProfileMarker is a regex matched against msedge.exe command lines. It defaults to BOTH
+# dedicated profiles: the fleet Edge (copilot-companion-edge, :9222) AND the interactive
+# bridge Edge (copilot-bridge-edge, :9223). Hardcoding the companion profile left the
+# bridge window entirely unwatched, so a bridge window that popped back up stayed up --
+# the loop that is supposed to keep these windows out of the way simply never saw it.
+param([int]$Port = 9222,
+      [string]$ProfileMarker = 'copilot-companion-edge|copilot-bridge-edge')
 
 $ErrorActionPreference = "SilentlyContinue"
 
@@ -37,18 +43,23 @@ public class K {
   [DllImport("user32.dll")] static extern int GetClassName(IntPtr h, StringBuilder s, int max);
   [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr h);
   delegate bool EnumProc(IntPtr h, IntPtr p);
-  public static IntPtr Find(int[] pids) {
-    IntPtr found = IntPtr.Zero;
+  // ALL matching windows, not just the first. One Edge process can own several
+  // top-level windows (a second window, a detached tab, a picture-in-picture). The
+  // previous version returned on the first hit, so every window after it was left
+  // untouched -- and one stray visible window is all it takes for the operator to see
+  // a companion Edge they are never supposed to see.
+  public static IntPtr[] FindAll(int[] pids) {
+    List<IntPtr> found = new List<IntPtr>();
     HashSet<int> set = new HashSet<int>(pids);
     EnumWindows(delegate(IntPtr h, IntPtr p) {
       uint pid; GetWindowThreadProcessId(h, out pid);
       if (set.Contains((int)pid)) {
         StringBuilder sb = new StringBuilder(64); GetClassName(h, sb, 64);
-        if (sb.ToString() == "Chrome_WidgetWin_1" && GetWindowTextLength(h) > 0) { found = h; return false; }
+        if (sb.ToString() == "Chrome_WidgetWin_1" && GetWindowTextLength(h) > 0) { found.Add(h); }
       }
       return true;
     }, IntPtr.Zero);
-    return found;
+    return found.ToArray();
   }
 }
 "@
@@ -63,7 +74,7 @@ while ($true) {
     }
 
     $pids = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
-              Where-Object { $_.CommandLine -match 'copilot-companion-edge' } |
+              Where-Object { $_.CommandLine -match $ProfileMarker } |
               ForEach-Object { [int]$_.ProcessId })
     if ($pids.Count -eq 0) { continue }
 
@@ -75,8 +86,9 @@ while ($true) {
     # WS_VISIBLE and show it minimized -- which is exactly how a taskbar button appears
     # on a companion Edge that is supposed to have no window at all. A window that is not
     # visible needs no minimizing; touching it is what reveals it.
-    $h = [K]::Find($pids)
-    if ($h -ne [IntPtr]::Zero -and [K]::IsWindowVisible($h) -and -not [K]::IsIconic($h)) {
-        [K]::ShowWindow($h, 6) | Out-Null
+    foreach ($h in [K]::FindAll($pids)) {
+        if ($h -ne [IntPtr]::Zero -and [K]::IsWindowVisible($h) -and -not [K]::IsIconic($h)) {
+            [K]::ShowWindow($h, 6) | Out-Null
+        }
     }
 }
