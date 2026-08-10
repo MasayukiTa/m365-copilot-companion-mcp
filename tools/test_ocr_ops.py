@@ -8,6 +8,10 @@ context and report them as if they had been read.
 
 Run: pytest -q tools/test_ocr_ops.py
 """
+# 認識結果は untrusted としてマークされて返る（tools/_untrusted.wrap_if_content）。
+# ここで見たいのは「どちらのエンジンの読みが採用されたか」なので、包みの中に
+# 期待した本文が入っていることで判定する。自前の状態行は包まれないので等値のまま。
+
 from pathlib import Path
 
 from tools import ocr_ops
@@ -92,7 +96,9 @@ def test_ocr_image_prefers_tesseract_when_it_succeeds(tmp_path, monkeypatch):
     monkeypatch.setattr(ocr_ops, "_easyocr_text", boom)
     # lang="eng" means no Japanese was expected, so Latin-only output is a complete
     # answer and the fallback must not run at all.
-    assert ocr_ops.ocr_image(str(img), lang="eng") == "hello"
+    out = ocr_ops.ocr_image(str(img), lang="eng")
+    assert "<untrusted_external_content" in out
+    assert "hello" in out
 
 
 def test_latin_result_is_kept_when_the_fallback_also_finds_no_japanese(tmp_path, monkeypatch):
@@ -119,7 +125,9 @@ def test_latin_result_is_kept_when_the_fallback_also_finds_no_japanese(tmp_path,
     # Fallback runs but returns Latin too -> Tesseract's result must win.
     monkeypatch.setattr(ocr_ops, "_easyocr_text", lambda p, l: "hello vvorld")
 
-    assert ocr_ops.ocr_image(str(img), lang="jpn+eng") == "hello world"
+    out = ocr_ops.ocr_image(str(img), lang="jpn+eng")
+    assert "<untrusted_external_content" in out
+    assert "hello world" in out
 
 def test_detects_transliterated_japanese_as_a_failed_read():
     """Without the jpn pack Tesseract returns confident Latin garbage, not empty.

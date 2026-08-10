@@ -52,3 +52,30 @@ def wrap_untrusted(content: str, source: str, origin: str = "") -> str:
         f"{safe_content}\n"
         f"</untrusted_external_content>"
     )
+
+
+# Our own status lines, produced HERE rather than by the image / clipboard / search
+# engine: "[ocr_image error: ...]" for a failure, "(no text recognized)" for an empty
+# result. Wrapping those would mislabel our own output as external and bury a real
+# error inside a data block, so they pass through untouched.
+_OWN_ERROR_RE = re.compile(r"^\[[a-z_]+ error:", re.IGNORECASE)
+
+
+def wrap_if_content(text: str, source: str, origin: str = "") -> str:
+    """wrap_untrusted() for tools whose return value is EITHER external content or a
+    status line of ours. Wraps the former, passes the latter through.
+
+    Added when an audit found the wrapper applied in only three modules: OCR text,
+    clipboard contents and web-search snippets all reached the model unmarked, and all
+    three are exactly the channel this defence exists for -- a scanned page, something
+    the user copied off a web page, or a search snippet can each carry "ignore your
+    previous instructions" written by someone else.
+    """
+    s = text or ""
+    if not s.strip():
+        return s
+    if _OWN_ERROR_RE.match(s):
+        return s
+    if s.startswith("(") and s.endswith(")") and "\n" not in s:
+        return s
+    return wrap_untrusted(s, source=source, origin=origin)

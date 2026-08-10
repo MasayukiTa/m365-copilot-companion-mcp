@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Optional
 
 from .file_ops import _validate_path
+from ._untrusted import wrap_if_content
 
 # EasyOCR reader cache. Building a Reader loads the detection + recognition models
 # (a few hundred MB the first time, then cached on disk), which takes ~10-20s, so we
@@ -167,7 +168,7 @@ def ocr_image(
 
         text = (text or "").strip()
         if text and not _tesseract_failed_japanese(text, lang):
-            return text
+            return wrap_if_content(text, source="ocr", origin=str(p))
 
         # Either nothing came back, or Japanese was requested and the result contains
         # no Japanese at all (the language pack is missing and the glyphs were
@@ -177,8 +178,8 @@ def ocr_image(
         # result must not be thrown away just because no Japanese appeared.
         alt = _easyocr_text(p, lang)
         if alt and (not text or _has_cjk(alt)):
-            return alt
-        return text or "(no text recognized)"
+            return wrap_if_content(alt, source="ocr", origin=str(p))
+        return wrap_if_content(text or "(no text recognized)", source="ocr", origin=str(p))
     except Exception as e:
         return f"[ocr_image error: {type(e).__name__}: {e}]"
 
@@ -243,6 +244,6 @@ def ocr_pdf(path: str, pages: Optional[str] = None, lang: str = "jpn+eng") -> st
                 text = _easyocr_image_text(im, lang) or ""
             label = first_page + i - 1 if first_page else i
             chunks.append(f"--- page {label} ---\n{text or '(empty)'}")
-        return "\n\n".join(chunks)
+        return wrap_if_content("\n\n".join(chunks), source="ocr_pdf", origin=str(p))
     except Exception as e:
         return f"[ocr_pdf error: {type(e).__name__}: {e}]"

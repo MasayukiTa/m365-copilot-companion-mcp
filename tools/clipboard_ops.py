@@ -1,4 +1,5 @@
 from .security import require_unlocked
+from ._untrusted import wrap_if_content
 
 
 def clipboard_get() -> str:
@@ -17,7 +18,7 @@ def clipboard_get() -> str:
             return f"[clipboard_get error: {e}]"
         if value is None:
             return "(clipboard is empty or non-text)"
-        return value
+        return wrap_if_content(value, source="clipboard", origin="system clipboard")
     except Exception as e:
         return f"[clipboard_get error: {type(e).__name__}: {e}]"
 

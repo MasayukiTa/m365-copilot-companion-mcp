@@ -1,3 +1,4 @@
+from ._untrusted import wrap_if_content
 from typing import Optional
 
 
@@ -50,7 +51,7 @@ def web_search(
             if len(body) > 280:
                 body = body[:280] + "…"
             lines.append(f"\n[{i}] {title}\n    {url}\n    {body}")
-        return "\n".join(lines)
+        return wrap_if_content("\n".join(lines), source="web_search", origin=str(query))
     except Exception as e:
         return f"[web_search error: {type(e).__name__}: {e}]"
 
@@ -92,6 +93,6 @@ def web_search_news(
             if len(body) > 240:
                 body = body[:240] + "…"
             lines.append(f"\n[{i}] {title}\n    {source}  {date}\n    {url}\n    {body}")
-        return "\n".join(lines)
+        return wrap_if_content("\n".join(lines), source="web_search_news", origin=str(query))
     except Exception as e:
         return f"[web_search_news error: {type(e).__name__}: {e}]"
