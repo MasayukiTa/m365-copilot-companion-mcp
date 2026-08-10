@@ -16,11 +16,46 @@ def _body(start_marker: str, end_marker: str) -> str:
     return SOURCE[start:end]
 
 
-def test_advanced_section_lives_in_the_settings_panel():
+def test_advanced_opens_as_a_submenu_from_the_settings_panel():
+    """設定パネルの中に直接置かず、横に開く子パネルにする。
+
+    インラインだと、フォルダ一覧と接続クライアント一覧で画面ほぼ1枚ぶん伸び、
+    上にある日常の設定が押し出されて、そもそも見つけられなかった。
+    """
     assert 'col.Children.Add(SectionHeader(L("詳細設定", "Advanced")));' in SOURCE
-    assert "col.Children.Add(BuildAdvancedSettingsSection());" in SOURCE
+    assert "col.Children.Add(AdvancedSubmenuRow());" in SOURCE
     panel_body = _body("UIElement BuildSettingsPanel()", "\n    static string FmtFloor")
-    assert "BuildAdvancedSettingsSection()" in panel_body
+    assert "AdvancedSubmenuRow()" in panel_body
+    # 本体を設定パネルへ直接足す行が復活していないこと。関数定義そのものにも同じ名前が
+    # 出るので、探すのは「追加している行」に限定する。
+    assert "col.Children.Add(BuildAdvancedSettingsSection());" not in SOURCE
+
+
+def test_the_submenu_carries_the_advanced_section_and_can_scroll():
+    body = _body("void ToggleAdvancedPopup(UIElement anchor)", "\n    UIElement BuildSettingsPanel()")
+    assert "BuildAdvancedSettingsSection()" in body
+    # 一覧が伸びても下端のボタンに手が届くこと
+    assert "ScrollViewer" in body and "MaxHeight" in body
+
+
+def test_the_submenu_does_not_dismiss_its_own_parent():
+    """親は自分の視覚ツリー外のクリックで閉じる。子は別 HWND なので、
+    開いた瞬間に親ごと消えるのを防ぐ必要がある。"""
+    body = _body("void ToggleAdvancedPopup(UIElement anchor)", "\n    UIElement BuildSettingsPanel()")
+    assert "_settingsPopup.StaysOpen = true;" in body
+    assert "Closed +=" in body and "StaysOpen = false;" in body
+
+
+def test_the_submenu_opens_toward_the_screen_not_off_it():
+    """設定パネルは歯車に右寄せで左へ伸びる。右に出すと画面外か親の上に重なる。"""
+    body = _body("void ToggleAdvancedPopup(UIElement anchor)", "\n    UIElement BuildSettingsPanel()")
+    assert "PlacementMode.Left" in body
+
+
+def test_the_row_is_findable_by_the_name_operators_look_for():
+    """行のラベルは中身の説明なので、そのままでは 詳細設定 で引けない。"""
+    body = _body("UIElement AdvancedSubmenuRow()", "\n    void ToggleAdvancedPopup")
+    assert 'AutomationProperties.SetName(btn, L("詳細設定", "Advanced"))' in body
 
 
 def test_access_scope_has_both_choices():

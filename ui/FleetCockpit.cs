@@ -4892,6 +4892,97 @@ class CockpitWindow : Window
         return t;
     }
 
+    System.Windows.Controls.Primitives.Popup _advancedPopup;
+
+    // The row that opens 詳細設定 to the side. Styled as a menu item -- label left, chevron
+    // right -- so it reads as "there is more behind this", not as another setting.
+    UIElement AdvancedSubmenuRow()
+    {
+        var btn = new Button();
+        btn.Cursor = Cursors.Hand;
+        btn.HorizontalContentAlignment = HorizontalAlignment.Stretch;
+        btn.Padding = new Thickness(8, 6, 8, 6);
+        btn.Margin = new Thickness(0, 2, 0, 2);
+        btn.Background = BtnBg; btn.Foreground = Fg; btn.BorderBrush = Border;
+        btn.BorderThickness = new Thickness(1);
+        btn.Template = FlatButtonTemplate();
+
+        var row = new DockPanel(); row.LastChildFill = true;
+        var chev = new TextBlock();
+        chev.Text = "›";                       // ›
+        chev.Foreground = Muted; chev.FontSize = 14;
+        chev.VerticalAlignment = VerticalAlignment.Center;
+        DockPanel.SetDock(chev, Dock.Right); row.Children.Add(chev);
+        var lbl = new TextBlock();
+        lbl.Text = L("アクセス範囲・接続クライアント", "Access scope & connected clients");
+        lbl.Foreground = Fg; lbl.FontSize = 12.5;
+        lbl.VerticalAlignment = VerticalAlignment.Center;
+        row.Children.Add(lbl);
+        btn.Content = row;
+
+        // Automation name: the row's own label describes its CONTENTS, so without this the
+        // submenu is unfindable by name in tooling and by a screen reader looking for 詳細設定.
+        System.Windows.Automation.AutomationProperties.SetName(btn, L("詳細設定", "Advanced"));
+
+        btn.Click += delegate { ToggleAdvancedPopup(btn); };
+        return btn;
+    }
+
+    void ToggleAdvancedPopup(UIElement anchor)
+    {
+        if (_advancedPopup != null && _advancedPopup.IsOpen)
+        {
+            _advancedPopup.IsOpen = false;
+            return;
+        }
+        _advancedPopup = new System.Windows.Controls.Primitives.Popup();
+        _advancedPopup.PlacementTarget = anchor;
+        // Left, not Right: the settings panel is right-aligned to the gear and grows leftward,
+        // so its right edge is already at the window edge -- a submenu placed to the right
+        // opens off-screen or on top of its own parent.
+        _advancedPopup.Placement = System.Windows.Controls.Primitives.PlacementMode.Left;
+        _advancedPopup.VerticalOffset = -8;
+        _advancedPopup.AllowsTransparency = true;
+        _advancedPopup.StaysOpen = false;
+
+        var card = new System.Windows.Controls.Border();
+        card.Background = CardBg; card.BorderBrush = Border; card.BorderThickness = new Thickness(1);
+        card.CornerRadius = new CornerRadius(10); card.Padding = new Thickness(16, 12, 16, 14);
+        card.Margin = new Thickness(8, 6, 8, 6); card.MinWidth = 340; card.MaxWidth = 420;
+        card.Effect = new System.Windows.Media.Effects.DropShadowEffect
+        { BlurRadius = 16, ShadowDepth = 2, Opacity = 0.28, Color = C("#000000") };
+
+        var col = new StackPanel(); col.Orientation = Orientation.Vertical;
+        var title = new TextBlock(); title.Text = L("詳細設定", "Advanced"); title.Foreground = Fg;
+        title.FontSize = 14; title.FontWeight = FontWeights.SemiBold;
+        title.Margin = new Thickness(0, 0, 0, 6);
+        col.Children.Add(title);
+        // The lists inside can be long (one row per allowed folder, one per connected client),
+        // and a popup does not scroll on its own -- without this it grows past the screen and
+        // the buttons at the bottom become unreachable.
+        var scroll = new ScrollViewer();
+        scroll.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+        scroll.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
+        scroll.MaxHeight = 520;
+        scroll.Content = BuildAdvancedSettingsSection();
+        col.Children.Add(scroll);
+        card.Child = col;
+        _advancedPopup.Child = card;
+
+        // The parent settings popup closes on any click outside its own visual tree, and this
+        // child is a separate HWND -- so opening it would immediately dismiss the parent and
+        // take the child with it. Hold the parent open for as long as the child is up.
+        if (_settingsPopup != null)
+        {
+            _settingsPopup.StaysOpen = true;
+            _advancedPopup.Closed += delegate
+            {
+                if (_settingsPopup != null) _settingsPopup.StaysOpen = false;
+            };
+        }
+        _advancedPopup.IsOpen = true;
+    }
+
     UIElement BuildSettingsPanel()
     {
         var card = new Border();
@@ -5019,9 +5110,13 @@ class CockpitWindow : Window
         col.Children.Add(usHint);
         RefreshUiScaleControls();   // set label/toggle/stepper-enabled to match the current mode
 
-        // ── 詳細設定 / Advanced: アクセス範囲 (folder_access.json) + 接続クライアント (.unlock_state.json) ──
+        // ── 詳細設定 / Advanced ──
+        // A submenu ROW, not an inline section. Inlined, it added roughly a screen of folder
+        // list + client list to a panel that is already long, so the everyday settings above
+        // it got pushed off and the operator could not find it at all. It opens to the side
+        // like a context-menu submenu, which is where people expect "more, over here".
         col.Children.Add(SectionHeader(L("詳細設定", "Advanced")));
-        col.Children.Add(BuildAdvancedSettingsSection());
+        col.Children.Add(AdvancedSubmenuRow());
 
         card.Child = col;
         UpdateAutoEnabled();   // grey the ceiling stepper if autoscale is off
