@@ -603,6 +603,63 @@ def bare_agent_url(url: str) -> str:
     return u
 
 
+# Observability for the one failure this module cannot be debugged without: a turn whose
+# answer is complete and correct on screen, yet never settles, so the caller sits until
+# wait_for_idle's deadline. Measured repeatedly on 2026-08-10 (954s, 949s, 448s, 428s,
+# 443s) with no way to tell WHICH predicate kept rejecting the text -- there is no bridge
+# log, and attaching a second CDP client changes what is being measured.
+#
+# Only turns already past _SETTLE_TRACE_AFTER_S are recorded, so a healthy turn (which
+# settles in seconds) writes nothing at all. Never raises; a tracing failure must not be
+# able to break a turn.
+_SETTLE_TRACE_AFTER_S = float(os.environ.get("MCP_SETTLE_TRACE_AFTER_S", "60"))
+_SETTLE_TRACE_PATH = os.path.join(".fleet", "settle_trace.jsonl")
+_SETTLE_TRACE_MAX_BYTES = 2_000_000
+_settle_trace_started_at = {}
+
+
+def _settle_trace(drv, phase, text, generating, stable_count, stable_since, **extra):
+    """Append one line describing why this poll did not settle. Silent before the
+    threshold, and silent on any error."""
+    try:
+        key = id(drv)
+        t0 = _settle_trace_started_at.get(key)
+        now = time.time()
+        if t0 is None:
+            _settle_trace_started_at[key] = now
+            return
+        age = now - t0
+        if age < _SETTLE_TRACE_AFTER_S:
+            return
+        try:
+            if os.path.getsize(_SETTLE_TRACE_PATH) > _SETTLE_TRACE_MAX_BYTES:
+                return
+        except OSError:
+            pass
+        rec = {
+            "ts": round(now, 3), "age_s": round(age, 1), "phase": phase,
+            "generating": bool(generating), "stable_count": int(stable_count),
+            "text_len": len(text or ""), "text_tail": (text or "")[-90:],
+            "is_stale_repeat": bool(drv._is_stale_repeat(text or "")),
+        }
+        rec.update({k: (round(v, 2) if isinstance(v, float) else v)
+                    for k, v in extra.items()})
+        import json as _json   # this module has no module-level json import
+        os.makedirs(os.path.dirname(_SETTLE_TRACE_PATH), exist_ok=True)
+        with open(_SETTLE_TRACE_PATH, "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(rec, ensure_ascii=False) + chr(10))
+    except Exception:
+        pass
+
+
+def _settle_trace_reset(drv):
+    """Start a fresh age clock for this driver's next turn."""
+    try:
+        _settle_trace_started_at[id(drv)] = time.time()
+    except Exception:
+        pass
+
+
 def _is_processing(text: str) -> bool:
     t = (text or "").strip().lower()
     if not t:
@@ -1331,17 +1388,23 @@ class CopilotWebDriver:
         # 1) wait for a brand-new answer block to appear.
         appear_deadline = time.time() + min(appear_timeout_s, timeout_s)
         appeared = False
+        _settle_trace_reset(self)
         while time.time() < appear_deadline:
             if stop_check().startswith("STOP"):
                 return False
             try:
-                if self._answers().count() > self._count_before:
-                    appeared = True
-                    break
+                n_now = self._answers().count()
             except Exception:
-                pass
+                n_now = -1
+            if n_now > self._count_before:
+                appeared = True
+                break
+            _settle_trace(self, "appear_wait", "", False, 0, None,
+                          count_now=n_now, count_before=self._count_before)
             time.sleep(1.0)
         if not appeared:
+            _settle_trace(self, "appear_timeout", "", False, 0, None,
+                          count_before=self._count_before)
             return False
         # 2) wait for the last answer's REAL text to stabilize AND generation to stop.
         # While the block still shows a processing placeholder ("処理中です" etc.) OR the
@@ -1360,9 +1423,16 @@ class CopilotWebDriver:
                 generating = False
             if generating:
                 last, stable_count, stable_since = None, 0, None
+                _settle_trace(self, "generating", "", True, 0, None)
                 time.sleep(REPLY_SETTLE_INTERVAL_S)
                 continue
             t = self.read_last_response()
+            if not _is_processing(t) and t != last:
+                # The text CHANGED since the previous poll. Recorded because a turn that
+                # never settles while the answer looks complete on screen is otherwise
+                # indistinguishable from one that is still streaming.
+                _settle_trace(self, "changed", t, generating, stable_count, stable_since,
+                              prev_len=len(last or ""), prev_tail=(last or "")[-60:])
             if _is_processing(t):
                 # A placeholder ("処理中です。") or an empty read carries NO information
                 # about the answer -- it is not evidence that the answer changed. Clearing
@@ -1383,6 +1453,7 @@ class CopilotWebDriver:
                 # does a placeholder stop destroying accumulated stability.
                 if generating:
                     last, stable_count, stable_since = None, 0, None
+                _settle_trace(self, "processing", t, generating, stable_count, stable_since)
             elif t == last:
                 stable_count += 1
                 marker_ok = has_end_marker(t)
@@ -1394,8 +1465,13 @@ class CopilotWebDriver:
                 # timestamp, and a bare `if stable_since:` treats a legitimate 0.0 as
                 # "unset" and silently keeps `elapsed` pinned at 0.0 forever.
                 elapsed = (time.time() - stable_since) if stable_since is not None else 0.0
+                _settle_trace(self, "stable", t, generating, stable_count, stable_since,
+                              need_samples=need_samples, need_dwell=need_dwell,
+                              elapsed=elapsed, marker=marker_ok)
                 if stable_count >= need_samples and elapsed >= need_dwell:
                     if self._is_stale_repeat(t):
+                        _settle_trace(self, "stale_repeat", t, generating, stable_count,
+                                      stable_since)
                         # Settled, but byte-identical to the PREVIOUS turn's already-
                         # accepted answer -- do NOT accept this as the current turn's
                         # reply (the stale-capture signature). Keep polling; still
