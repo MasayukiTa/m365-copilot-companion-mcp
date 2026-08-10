@@ -1085,7 +1085,13 @@ class RelayWorker:
         self.plan_mode = plan_mode
         self.plan_steps = []
         self._plan_approved = False
-        initial_body, preflight_unlock = _initial_job_with_unlock(self.goal, plan_mode)
+        # Prime what we already know about this goal's THEME into the body that gets sent,
+        # never into self.goal. self.goal is this worker's IDENTITY -- the transcript key,
+        # the replay envelope, and what record_task derives the theme from. An earlier
+        # version prepended the memory to the goal text itself and broke all three at once
+        # (and hung a fleet sweep whose workers are keyed by goal text).
+        initial_body, preflight_unlock = _initial_job_with_unlock(
+            _with_theme_memory(self.goal), plan_mode)
         if preflight_unlock:
             # Count the proactive attempt against the same bounded budget used by reactive
             # re-unlocks when the M365 backend later rotates to a different source IP.
@@ -2665,6 +2671,51 @@ class RelayWorker:
         return False
 
 
+def _refresh_selfimprove_dashboard():
+    """Regenerate .fleet/selfimprove_dashboard.json after a run.
+
+    The feed used to be rebuilt only by ui/SelfImproveDashboard.cs when the operator
+    opened it, so the numbers were as old as the last time somebody looked -- measured
+    2026-08-10, five days stale while runs kept happening. Rebuilding here means the panel
+    is already correct when it is opened.
+
+    Best-effort and silent: it reads ledgers and writes one JSON file, so a failure is
+    cosmetic and must not touch the run that just finished.
+    """
+    try:
+        from relay.selfimprove.dashboard import write_json
+        write_json()
+    except Exception:
+        pass
+
+
+_MEMORY_HEADER = "--- このテーマでの過去の作業メモ ---"
+
+
+def _with_theme_memory(goal_text):
+    """Return the goal body with this theme's history prepended, or unchanged on any doubt.
+
+    Applied to the BODY that is sent, never to the worker's goal. Recording without recall
+    is pointless -- until now recall lived only in relay/code_task.py, so a fleet run could
+    write a memory it would never read back -- but recall must not cost the runner its
+    identity: workers are keyed by goal text (transcript key, replay envelope, and the
+    theme record_task derives), and rewriting it breaks all of them.
+
+    Never raises and never returns empty: on any failure the original body is used.
+    """
+    try:
+        from relay.project_memory import load_notes, theme_from_goal
+        text = str(goal_text or "")
+        if not text or _MEMORY_HEADER in text:
+            return goal_text
+        notes = load_notes(theme_from_goal(text), goal=text)
+        if not notes:
+            return goal_text
+        return "%s\n%s\n--- メモここまで ---\n\n%s" % (_MEMORY_HEADER, notes, text)
+    except Exception:
+        return goal_text
+
+
 def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     notify=default_notify, on_tick=None, max_concurrent=None,
                     mc_box=None, add_box=None, refuter=False, max_refute=2,
@@ -2972,6 +3023,21 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     for w in workers:
         if not w.closed:
             w.close()
+
+    # Record what this run actually DID, per theme, so the next run on the same theme
+    # starts primed instead of rediscovering. Until now only relay/code_task.py recorded
+    # anything, so 2636 fleet transcripts had produced exactly one memory entry -- the
+    # store existed and nothing flowed into it. Frame-side and best-effort: a memory
+    # failure must never affect the run that just finished.
+    try:
+        from relay.project_memory import record_task, theme_from_goal
+        for w in workers:
+            record_task(theme_from_goal(w.goal), w.goal, w.outcome or "?",
+                        note=(w.reason or getattr(w, "last_response", "") or "")[:280])
+    except Exception:
+        pass
+
+    _refresh_selfimprove_dashboard()
 
     notify("🛰 並列自律フリート 完了",
            "%d ゴール: %s" % (len(workers), ", ".join(w.outcome or "?" for w in workers)))

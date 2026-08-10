@@ -614,6 +614,20 @@ def main(argv=None):
         try:
             result = controller.run()
             print(f"LOCAL_LOOP {job_id}: {result}")
+            # Record the run per theme. Everything needed is already in the job spec, so
+            # this costs one write and gives the next job on the same theme its history.
+            # Frame-side and best-effort -- and deliberately AFTER the result is printed,
+            # so a memory failure can never change what the CLI reports or returns.
+            try:
+                from relay.project_memory import record_task, theme_from_goal
+                task = (job or {}).get("task") or {}
+                instruction = task.get("instruction") or task.get("type") or job_id
+                record_task(theme_from_goal(instruction), instruction, result,
+                            note="job=%s base=%s" % (
+                                job_id,
+                                ((job or {}).get("constraints") or {}).get("allowed_base", "")))
+            except Exception:
+                pass
             return 0 if result == "DONE" else 2
         finally:
             # connect_over_cdp disconnect does not close pages created in the persistent
