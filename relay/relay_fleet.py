@@ -139,6 +139,13 @@ CONSENT_SURFACE_RETRY_MAX = int(os.environ.get("MCP_CONSENT_SURFACE_RETRY_MAX", 
 CONSENT_SURFACE_FORCE_REHIDE_SEC = float(os.environ.get("MCP_FORCE_REHIDE_SEC", "90"))
 
 
+# Work IQ surfaces its connection consent as a CHAIN of cards, not one: seven as measured
+# on 2026-08-10 (User, Copilot, Teams, SharePoint, OneDrive, Mail, Calendar), each
+# appearing only after the previous one is approved. The cap is the chain length plus
+# headroom, so a card that re-renders instead of resolving cannot spin.
+CONSENT_CHAIN_MAX = int(os.environ.get("MCP_CONSENT_CHAIN_MAX", "12"))
+
+
 def _schedule_force_rehide(timeout=None):
     """Start a one-shot background timer that force-rehides the dedicated Edge after `timeout`
     seconds (default CONSENT_SURFACE_FORCE_REHIDE_SEC). Safety net for BUG 4a/4b: covers every
@@ -1748,16 +1755,25 @@ class RelayWorker:
         pg = self.page
         if pg is None:
             return False
+        # CLICK THE WHOLE CHAIN. Work IQ is no longer one connection: a fresh conversation
+        # surfaces seven cards in sequence (User, Copilot, Teams, SharePoint, OneDrive,
+        # Mail, Calendar), each appearing only once its predecessor is approved -- observed
+        # directly on 2026-08-10. A single click left six pending, which matters most HERE:
+        # the fleet creates a conversation per worker, so every worker met the full chain
+        # and every worker gave up after one card.
+        #
+        # LAST, not first: approved cards stay in the transcript and stack downward, so the
+        # one still waiting is the bottom one. Bounded, so a card that re-renders instead
+        # of resolving cannot spin.
+        # Shared with edge_reconnect so there is ONE implementation of the stop condition.
+        # It matters: "click until no Allow remains" never terminates, because an approved
+        # card keeps its buttons in the transcript -- measured, that wasted 72s per attempt.
+        # The chain GROWS by one card per approval, so growth is the real signal.
         try:
-            for label in ("許可", "Allow"):
-                btn = pg.locator('button:has-text("%s")' % label)
-                if btn.count():
-                    btn.first.click()
-                    pg.wait_for_timeout(4000)
-                    return True
+            from relay.edge_reconnect import _click_consent_chain
+            return bool(_click_consent_chain(pg))
         except Exception:
-            pass
-        return False
+            return False
 
     def _auto_consent(self, skip_tier0=False):
         """Re-establish the MCP connection AUTOMATICALLY. NOT a credential entry -- the Bearer key

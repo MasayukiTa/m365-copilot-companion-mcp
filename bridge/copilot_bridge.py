@@ -2034,28 +2034,17 @@ def _bridge_auto_consent() -> bool:
     # not cause that.
     #
     # Bounded so a card that re-renders instead of resolving cannot spin here forever.
-    clicked_any = False
+    # Shared implementation, so the stop condition lives in exactly one place. It is not
+    # the obvious one: an APPROVED card keeps its 許可/キャンセル buttons in the transcript,
+    # so "click until no Allow remains" never terminates (measured: 12 rounds, 72 wasted
+    # seconds, nothing approved). The chain GROWS by one card per approval, so growth is
+    # the signal, and its absence means there is nothing left to approve.
     try:
-        for _ in range(_CONSENT_CHAIN_MAX):
-            hit = False
-            for label in ("許可", "Allow"):
-                btn = pg.locator('button:has-text("%s")' % label).locator("visible=true")
-                if btn.count():
-                    # LAST, not first: the cards stack down the transcript and the newest --
-                    # the one actually awaiting an answer -- is at the bottom. Clicking the
-                    # first re-clicks an already-approved card near the top and never
-                    # advances the chain.
-                    btn.last.click()
-                    pg.wait_for_timeout(4000)
-                    clicked_any = hit = True
-                    break
-            if not hit:
-                break
-        if clicked_any:
+        from relay.edge_reconnect import _click_consent_chain
+        if _click_consent_chain(pg):
             return True
     except Exception:
-        if clicked_any:
-            return True
+        pass
     # Tier 1: DIRECT-HIT a cached connection-manager URL (skip if it now redirects to login --
     # that would be a genuine sign-in event, which this path must never surface for).
     try:

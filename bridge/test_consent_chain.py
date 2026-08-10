@@ -1,63 +1,74 @@
-"""Work IQ's consent is a CHAIN of cards. One click is not enough.
+"""Work IQ's consent is a CHAIN of cards, and the obvious stop condition does not work.
 
-Measured 2026-08-10 on a fresh conversation: approving the connection surfaced seven cards
-in sequence -- Work IQ User, Copilot, Teams, SharePoint, OneDrive, Mail, Calendar -- each
-appearing only once its predecessor was approved. _bridge_auto_consent's tier 0 clicked the
-first Allow and returned, so the rest stayed pending.
+Two things were measured on 2026-08-10, and the second only showed up when the code was
+run against a real page rather than asserted about.
 
-The consequence is a failed consent, and an unresolved card left sitting where later reads
-expect an answer.
+  * Approving the connection surfaces SEVEN cards in sequence -- Work IQ User, Copilot,
+    Teams, SharePoint, OneDrive, Mail, Calendar -- each appearing only once its
+    predecessor is approved. Clicking the first Allow and returning left six pending.
 
-Correction, because the original version of this file claimed more: this was first written
-up as the cause of an apparent 15-minute hang in the interactive chat. It was not. The
-bridge answers in ~28s; the "hang" was a test client reading the SSE stream to EOF on a
-keep-alive connection, so it never saw `event: done`. The seven-card chain below was
-observed directly and is worth fixing on its own.
+  * "Keep clicking until no Allow button remains" does NOT terminate. An APPROVED card
+    keeps its 許可/キャンセル buttons rendered in the transcript, so against a page holding
+    two already-approved cards the loop burned all 12 rounds and 72 SECONDS, approved
+    nothing, and still reported success.
+
+What the chain actually does is GROW: the visible-Allow count went 2 -> 3 -> 4 -> 5 -> 6
+-> 7 and then stayed at 7. Growth is the signal that a click landed on a pending card;
+no growth means there is nothing left. Same page, same two stale cards, after the fix:
+5.8 seconds instead of 72.2.
+
+Note also that the chain is per browser PROFILE, not per conversation -- verified by
+opening a brand-new conversation afterwards and getting no cards at all. It is an
+onboarding cost for a fresh profile, not a per-run cost.
 """
 import re
 from pathlib import Path
 
-SRC = Path(__file__).with_name("copilot_bridge.py").read_text(encoding="utf-8")
+REPO = Path(__file__).resolve().parents[1]
+RECONNECT = (REPO / "relay" / "edge_reconnect.py").read_text(encoding="utf-8")
+BRIDGE = (REPO / "bridge" / "copilot_bridge.py").read_text(encoding="utf-8")
+FLEET = (REPO / "relay" / "relay_fleet.py").read_text(encoding="utf-8")
 
 
-def _tier0() -> str:
-    i = SRC.index("def _bridge_auto_consent() -> bool:")
-    j = SRC.index("# Tier 1:", i)
-    return SRC[i:j]
+def _chain() -> str:
+    i = RECONNECT.index("def _click_consent_chain(page) -> bool:")
+    return RECONNECT[i:i + 2600]
 
 
-def test_the_chain_cap_is_a_named_constant_not_a_bare_number():
-    assert "_CONSENT_CHAIN_MAX" in SRC
-    assert re.search(r"_CONSENT_CHAIN_MAX = int\(os\.environ\.get\(", SRC)
+def test_the_chain_clicker_exists_in_exactly_one_place():
+    assert "def _click_consent_chain(page) -> bool:" in RECONNECT
+    for name, src in (("bridge", BRIDGE), ("fleet", FLEET)):
+        assert "_click_consent_chain" in src, "%s が共有実装を使っていない" % name
 
 
-def test_tier0_keeps_clicking_until_no_card_remains():
-    t0 = _tier0()
-    assert "for _ in range(_CONSENT_CHAIN_MAX):" in t0, "1枚で打ち切っている"
-    # 1回クリックして即 return する形に戻っていないこと
-    assert not re.search(r"btn\.first\.click\(\)\s*\n\s*pg\.wait_for_timeout\(\d+\)\s*\n\s*return True", t0)
+def test_it_stops_when_the_chain_stops_growing():
+    """承認済みカードもボタンを残すので「無くなるまで」では止まらない。"""
+    c = _chain()
+    assert "after <= before" in c, "増加を停止条件にしていない"
+    assert "break" in c.split("after <= before")[1][:80]
 
 
-def test_tier0_clicks_the_newest_card_not_the_oldest():
-    """カードは履歴に積み上がる。承認待ちは常に一番下。"""
-    t0 = _tier0()
-    assert "btn.last.click()" in t0, "先頭のカード（承認済み）を押し続けている"
-    assert "btn.first.click()" not in t0
+def test_it_is_still_bounded():
+    c = _chain()
+    assert "for _ in range(CONSENT_CHAIN_MAX):" in c
+    assert "while True" not in c
 
 
-def test_tier0_only_considers_visible_buttons():
-    t0 = _tier0()
-    assert 'locator("visible=true")' in t0
+def test_it_clicks_the_newest_card():
+    c = _chain()
+    assert ".last.click()" in c, "先頭（承認済み）を押している"
+    assert ".first.click()" not in c
 
 
-def test_tier0_is_bounded():
-    """解決せず再描画し続けるカードでも無限ループしないこと。"""
-    t0 = _tier0()
-    assert "while True" not in t0
-    assert "if not hit:" in t0 and "break" in t0
+def test_it_only_counts_visible_buttons():
+    assert 'locator("visible=true")' in RECONNECT
 
 
-def test_tier0_reports_success_only_when_it_actually_clicked():
-    t0 = _tier0()
-    assert "clicked_any" in t0
-    assert "if clicked_any:" in t0
+def test_it_reports_success_only_when_it_clicked():
+    c = _chain()
+    assert "clicked = False" in c and "return clicked" in c
+
+
+def test_the_cap_is_a_named_env_overridable_constant():
+    assert re.search(r'CONSENT_CHAIN_MAX = int\(os\.environ\.get\("MCP_CONSENT_CHAIN_MAX"',
+                     RECONNECT)

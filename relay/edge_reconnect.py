@@ -164,6 +164,65 @@ def _load_agent_url() -> str:
             or os.environ.get("MCP_IMPL_AGENT_URL") or "").strip()
 
 
+# Work IQ surfaces its connection consent as a CHAIN of cards, not one: seven as measured
+# on 2026-08-10 (User, Copilot, Teams, SharePoint, OneDrive, Mail, Calendar), each
+# appearing only after the previous one is approved. The cap is the chain length plus
+# headroom, so a card that re-renders instead of resolving cannot spin.
+CONSENT_CHAIN_MAX = int(os.environ.get("MCP_CONSENT_CHAIN_MAX", "12"))
+
+
+def _visible_allow(page):
+    """Every visible 許可/Allow button on the page, as one locator list."""
+    out = []
+    for label in ("許可", "Allow"):
+        try:
+            loc = page.locator('button:has-text("%s")' % label).locator("visible=true")
+            n = loc.count()
+        except Exception:
+            n = 0
+        if n:
+            out.append((loc, n))
+    return out
+
+
+def _click_consent_chain(page) -> bool:
+    """Approve a whole consent chain, and STOP as soon as it stops growing.
+
+    "Keep clicking until no Allow button remains" is the obvious rule and it is wrong.
+    An APPROVED card keeps its 許可/キャンセル buttons rendered in the transcript, so that
+    condition never becomes true: measured 2026-08-10 against a page holding two already
+    approved cards, the loop burned all 12 rounds and 72 SECONDS, clicked nothing that
+    mattered, and still reported success.
+
+    What the chain actually does is grow: each approval APPENDS the next card, so the
+    visible-Allow count went 2 -> 3 -> 4 -> 5 -> 6 -> 7 and then stayed at 7. Growth is
+    therefore the signal that the click landed on a pending card, and the absence of
+    growth means there is nothing left to approve. One wasted click at the end (~4s), not
+    twelve.
+    """
+    clicked = False
+    for _ in range(CONSENT_CHAIN_MAX):
+        groups = _visible_allow(page)
+        if not groups:
+            break
+        before = sum(n for _, n in groups)
+        try:
+            # LAST, not first: approved cards stack downward, so the newest -- the one
+            # still waiting -- is at the bottom.
+            groups[0][0].last.click()
+        except Exception:
+            break
+        clicked = True
+        try:
+            page.wait_for_timeout(4000)
+        except Exception:
+            pass
+        after = sum(n for _, n in _visible_allow(page))
+        if after <= before:
+            break                       # nothing new appeared -> the chain is done
+    return clicked
+
+
 def click_through_consent(page) -> bool:
     """Click the MCP connection-consent card through to a committed connection. NOT a credential
     entry. Handles two variants:
@@ -172,16 +231,15 @@ def click_through_consent(page) -> bool:
           fix ALL stale rows via fix_all_stale_connections.
     Returns True iff a commit happened."""
     try:
-        # variant (a): 許可/Allow directly on the chat card -> single click completes consent.
-        for label in ("許可", "Allow"):
-            try:
-                btn = page.locator('button:has-text("%s")' % label)
-                if btn.count():
-                    btn.first.click()
-                    page.wait_for_timeout(4000)
-                    return True
-            except Exception:
-                continue
+        # variant (a): 許可/Allow directly on the chat card. NOT a single click -- Work IQ
+        # surfaces a CHAIN (User, Copilot, Teams, SharePoint, OneDrive, Mail, Calendar,
+        # seven as measured on 2026-08-10), each card appearing only once its predecessor
+        # is approved. Take the LAST visible Allow each round: approved cards remain in the
+        # transcript and stack downward, so the newest is the one still waiting, and
+        # re-clicking the topmost one never advances the chain. Bounded.
+        clicked_any = _click_consent_chain(page)
+        if clicked_any:
+            return True
         # variant (b): 接続マネージャーを開く opens the connection-manager popup.
         ctx = page.context
         link = page.locator('a:has-text("接続マネージャーを開く"), a:has-text("connection manager")')
