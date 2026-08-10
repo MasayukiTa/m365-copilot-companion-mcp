@@ -153,6 +153,7 @@ jobs:
             relay/test_skills.py \
             relay/test_stuck_tool_health.py \
             relay/test_task_router.py \
+            relay/test_theme_memory.py \
             relay/test_transient.py \
             relay/test_unlock_inject.py \
             relay/test_watchdog.py \
