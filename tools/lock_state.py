@@ -123,3 +123,19 @@ def locked_since(since: float, now: Optional[float] = None) -> bool:
     current = float(now if now is not None else time.time())
     # Still bounded by freshness so a clock jump cannot resurrect an ancient record.
     return (current - ts) <= DEFAULT_FRESH_SEC
+
+
+def _cli() -> None:
+    """`python -m tools.lock_state show` -- prints the last recorded refusal (or {}) as
+    JSON. The cockpit's 詳細設定/Advanced panel shells out to this to surface the most
+    recently refused client without a human having to look the IP up by hand."""
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] != "show":
+        print(json.dumps({"error": "usage: python -m tools.lock_state show"}))
+        raise SystemExit(2)
+    print(json.dumps(read_state(), ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    _cli()

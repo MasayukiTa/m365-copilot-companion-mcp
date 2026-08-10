@@ -1023,6 +1023,11 @@ class CockpitWindow : Window
             : "Agent did not load. Run: powershell -File scripts\\start_bridge.ps1 -HardReset -Keepalive";
         return k;
     }
+    // Inline bilingual helper for one-off strings that don't warrant a T() dictionary entry
+    // (e.g. the 詳細設定/Advanced panel). Same signature/behaviour as ApprovalPromptWindow's L()
+    // elsewhere in this file -- kept as a small per-class duplicate rather than a shared static
+    // because both classes' _lang fields are independent instance state.
+    string L(string ja, string en) { return _lang == 0 ? ja : en; }
     string StatusLabel(string s)
     {
         bool ja = _lang == 0;
@@ -4663,6 +4668,13 @@ class CockpitWindow : Window
     Button _autoMinus, _autoPlus;
     TextBlock _autoLbl, _autoValue;
 
+    // 詳細設定 / Advanced (settings panel) -- アクセス範囲 (folder_access.json) +
+    // 接続クライアント (.unlock_state.json via tools.security's grant_ip/revoke_ip). Rebuilt
+    // fresh every time the gear popup opens, same as the rest of BuildSettingsPanel.
+    Button _accessFullBtn, _accessRestrictedBtn;
+    StackPanel _folderRowsPanel;
+    StackPanel _clientRowsPanel;
+
     // Autoscale toggle for the Settings panel. Autoscale, start tabs and ceiling are one concept,
     // so they live together instead of splitting one setting between the header and gear menu.
     UIElement AutoscaleControls()
@@ -5007,9 +5019,526 @@ class CockpitWindow : Window
         col.Children.Add(usHint);
         RefreshUiScaleControls();   // set label/toggle/stepper-enabled to match the current mode
 
+        // ── 詳細設定 / Advanced: アクセス範囲 (folder_access.json) + 接続クライアント (.unlock_state.json) ──
+        col.Children.Add(SectionHeader(L("詳細設定", "Advanced")));
+        col.Children.Add(BuildAdvancedSettingsSection());
+
         card.Child = col;
         UpdateAutoEnabled();   // grey the ceiling stepper if autoscale is off
         return card;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════
+    // 詳細設定 / Advanced
+    // ══════════════════════════════════════════════════════════════════════════════════
+    //
+    // アクセス範囲 (access scope): the folder allow-list tools/folder_policy.py reads from
+    // .fleet/folder_access.json ({"enabled":bool, "global":[...], "scopes":{...}}). This panel
+    // only ever touches "enabled" and "global" -- "scopes" (per fleet-lane overrides) is read
+    // back and re-written byte-for-byte untouched on every save, never edited here.
+    //
+    // フルアクセス (full access, enabled:false) is the operator's explicit choice and MUST stay
+    // the default and MUST stay reachable with one click and no confirmation dialog -- do not
+    // "improve" this into a warning prompt or flip the default to restricted.
+    //
+    // 接続クライアント (connected clients): tools/security.py's grant_ip/revoke_ip are LOCAL
+    // admin functions (never MCP tools -- see that file's header comment) that this panel shells
+    // out to via `python -m tools.security ...`, exactly like the file's own _cli() docstring
+    // says the cockpit does. The cockpit never opens or writes .unlock_state.json itself, so the
+    // atomic tmp-file+os.replace write tools/security.py already does is the only writer.
+    UIElement BuildAdvancedSettingsSection()
+    {
+        var col = new StackPanel();
+        col.Children.Add(BuildAccessScopeControls());
+        col.Children.Add(BuildConnectedClientsControls());
+        return col;
+    }
+
+    // ── アクセス範囲 ──────────────────────────────────────────────────────────────────
+    string FolderAccessPath() { return Path.Combine(RepoRoot(), ".fleet", "folder_access.json"); }
+
+    Dictionary<string, object> ReadFolderAccessRaw()
+    {
+        try
+        {
+            string p = FolderAccessPath();
+            if (File.Exists(p))
+            {
+                var d = _js.DeserializeObject(File.ReadAllText(p, Encoding.UTF8)) as Dictionary<string, object>;
+                if (d != null) return d;
+            }
+        }
+        catch (Exception) { }
+        return new Dictionary<string, object>();
+    }
+
+    // DEFAULT-OPEN, mirroring folder_policy.py's own _normalise(): a missing/unreadable/
+    // malformed policy file means unrestricted (フルアクセス), never restricted.
+    bool AccessEnabled()
+    {
+        var d = ReadFolderAccessRaw();
+        object v;
+        if (d.TryGetValue("enabled", out v) && v != null)
+        {
+            try { return Convert.ToBoolean(v); } catch (Exception) { }
+        }
+        return false;
+    }
+
+    List<string> AccessGlobalFolders()
+    {
+        var d = ReadFolderAccessRaw();
+        var outp = new List<string>();
+        object v;
+        if (d.TryGetValue("global", out v) && v is object[])
+            foreach (object o in (object[])v) if (o != null) outp.Add(o.ToString());
+        return outp;
+    }
+
+    // Whole-dict atomic write (tmp file in the same directory + File.Replace), same shape as
+    // AnswerGate's gate-file write above -- .fleet/ is not written concurrently by the live
+    // server for this particular file, but a torn write here would still corrupt the JSON a
+    // reader (this same UI, or a future python reader) parses next, so the same discipline
+    // applies. Never edits keys the caller didn't set (SetAccessScope/AddAccessFolder/
+    // RemoveAccessFolder each read-modify-write a single key so "scopes" always survives).
+    void WriteFolderAccessRaw(Dictionary<string, object> d)
+    {
+        try
+        {
+            string path = FolderAccessPath();
+            string dir = Path.GetDirectoryName(path);
+            Directory.CreateDirectory(dir);
+            string json = _js.Serialize(d);
+            string tmp = Path.Combine(dir, Path.GetFileName(path) + ".tmp");
+            File.WriteAllText(tmp, json, new UTF8Encoding(false));
+            if (File.Exists(path))
+            {
+                try { File.Replace(tmp, path, null); }
+                catch (Exception)
+                {
+                    File.Copy(tmp, path, true);
+                    try { File.Delete(tmp); } catch (Exception) { }
+                }
+            }
+            else
+            {
+                File.Move(tmp, path);
+            }
+        }
+        catch (Exception) { }
+    }
+
+    // Toggle ONLY "enabled". "global" (the saved folder list) and "scopes" are read back and
+    // written out exactly as found -- choosing フルアクセス must never lose the folder list a
+    // user built up under 指定フォルダのみ, so that re-enabling restriction restores it intact.
+    void SetAccessScope(bool restricted)
+    {
+        var d = ReadFolderAccessRaw();
+        d["enabled"] = restricted;
+        if (!d.ContainsKey("global")) d["global"] = new object[0];
+        if (!d.ContainsKey("scopes")) d["scopes"] = new Dictionary<string, object>();
+        WriteFolderAccessRaw(d);
+        PaintAccessScopeButtons(restricted);
+    }
+
+    void PaintAccessScopeButtons(bool restricted)
+    {
+        if (_accessFullBtn != null)
+        {
+            bool sel = !restricted;
+            _accessFullBtn.Background = sel ? Theme.Br(Theme.Accent(_dark)) : BtnBg;
+            _accessFullBtn.Foreground = sel ? White : Muted;
+            _accessFullBtn.BorderBrush = sel ? Theme.Br(Theme.Accent(_dark)) : Border;
+        }
+        if (_accessRestrictedBtn != null)
+        {
+            bool sel = restricted;
+            _accessRestrictedBtn.Background = sel ? Theme.Br(Theme.Accent(_dark)) : BtnBg;
+            _accessRestrictedBtn.Foreground = sel ? White : Muted;
+            _accessRestrictedBtn.BorderBrush = sel ? Theme.Br(Theme.Accent(_dark)) : Border;
+        }
+    }
+
+    void RefreshFolderRows(List<string> folders)
+    {
+        if (_folderRowsPanel == null) return;
+        _folderRowsPanel.Children.Clear();
+        if (folders.Count == 0)
+        {
+            var none = new TextBlock();
+            none.Text = L("(フォルダ未設定)", "(no folders yet)");
+            none.Foreground = Muted; none.FontSize = 11; none.Margin = new Thickness(0, 2, 0, 2);
+            _folderRowsPanel.Children.Add(none);
+            return;
+        }
+        foreach (string f in folders)
+        {
+            var row = new DockPanel(); row.Margin = new Thickness(0, 2, 0, 2); row.LastChildFill = false;
+            var rm = MiniButton("×");
+            rm.Width = 22; rm.Height = 22; rm.FontSize = 12;
+            rm.ToolTip = L("削除", "Remove");
+            System.Windows.Automation.AutomationProperties.SetName(rm, L("削除", "Remove") + ": " + f);
+            string captured = f;
+            rm.Click += delegate { RemoveAccessFolder(captured); };
+            DockPanel.SetDock(rm, Dock.Right); row.Children.Add(rm);
+            var tb = new TextBlock(); tb.Text = f; tb.Foreground = Fg; tb.FontSize = 11.5;
+            tb.VerticalAlignment = VerticalAlignment.Center; tb.TextTrimming = TextTrimming.CharacterEllipsis;
+            tb.ToolTip = f; tb.Margin = new Thickness(0, 0, 6, 0);
+            DockPanel.SetDock(tb, Dock.Left); row.Children.Add(tb);
+            _folderRowsPanel.Children.Add(row);
+        }
+    }
+
+    // Same "pick any file, use its parent folder" picker FolderToGoals() already uses --
+    // reliable, no COM FolderBrowserDialog needed.
+    void AddAccessFolder()
+    {
+        try
+        {
+            var ofd = new Microsoft.Win32.OpenFileDialog();
+            ofd.Title = L("追加するフォルダ内の任意のファイルを選択（その親フォルダが追加されます）",
+                          "Pick ANY file inside the folder to add (its parent folder is added)");
+            ofd.Filter = L("すべてのファイル|*.*", "All files|*.*");
+            ofd.CheckFileExists = true;
+            if (ofd.ShowDialog() != true) return;
+            string folder = Path.GetDirectoryName(ofd.FileName);
+            if (string.IsNullOrEmpty(folder)) return;
+
+            var d = ReadFolderAccessRaw();
+            var list = new List<string>();
+            object v;
+            if (d.TryGetValue("global", out v) && v is object[])
+                foreach (object o in (object[])v) if (o != null) list.Add(o.ToString());
+            bool exists = false;
+            foreach (string existing in list)
+                if (string.Equals(existing, folder, StringComparison.OrdinalIgnoreCase)) { exists = true; break; }
+            if (!exists) list.Add(folder);
+            d["global"] = list.ToArray();
+            if (!d.ContainsKey("enabled")) d["enabled"] = false;
+            if (!d.ContainsKey("scopes")) d["scopes"] = new Dictionary<string, object>();
+            WriteFolderAccessRaw(d);
+            RefreshFolderRows(list);
+        }
+        catch (Exception) { }
+    }
+
+    void RemoveAccessFolder(string folder)
+    {
+        try
+        {
+            var d = ReadFolderAccessRaw();
+            var list = new List<string>();
+            object v;
+            if (d.TryGetValue("global", out v) && v is object[])
+                foreach (object o in (object[])v) if (o != null) list.Add(o.ToString());
+            list.RemoveAll(delegate (string x) { return string.Equals(x, folder, StringComparison.OrdinalIgnoreCase); });
+            d["global"] = list.ToArray();
+            WriteFolderAccessRaw(d);
+            RefreshFolderRows(list);
+        }
+        catch (Exception) { }
+    }
+
+    UIElement BuildAccessScopeControls()
+    {
+        var wrap = new StackPanel();
+        var subHead = new TextBlock(); subHead.Text = L("アクセス範囲", "Access scope");
+        subHead.Foreground = Fg; subHead.FontSize = 12.5; subHead.FontWeight = FontWeights.SemiBold;
+        subHead.Margin = new Thickness(0, 4, 0, 4);
+        wrap.Children.Add(subHead);
+
+        bool restricted = AccessEnabled();
+        var folders = AccessGlobalFolders();
+
+        var choiceRow = new StackPanel(); choiceRow.Orientation = Orientation.Horizontal;
+        choiceRow.Margin = new Thickness(0, 0, 0, 4);
+
+        _accessFullBtn = new Button();
+        _accessFullBtn.Content = L("フルアクセス", "Full access");
+        _accessFullBtn.FontSize = 12; _accessFullBtn.FontWeight = FontWeights.SemiBold;
+        _accessFullBtn.Cursor = Cursors.Hand; _accessFullBtn.BorderThickness = new Thickness(1);
+        _accessFullBtn.Padding = new Thickness(10, 4, 10, 4); _accessFullBtn.Template = FlatButtonTemplate();
+        _accessFullBtn.ToolTip = L("すべてのフォルダを操作できます（既定）。", "Can operate on any folder (default).");
+        _accessFullBtn.Click += delegate { SetAccessScope(false); };
+        choiceRow.Children.Add(_accessFullBtn);
+
+        _accessRestrictedBtn = new Button();
+        _accessRestrictedBtn.Content = L("指定フォルダのみ", "Selected folders only");
+        _accessRestrictedBtn.FontSize = 12; _accessRestrictedBtn.FontWeight = FontWeights.SemiBold;
+        _accessRestrictedBtn.Cursor = Cursors.Hand; _accessRestrictedBtn.BorderThickness = new Thickness(1);
+        _accessRestrictedBtn.Padding = new Thickness(10, 4, 10, 4); _accessRestrictedBtn.Template = FlatButtonTemplate();
+        _accessRestrictedBtn.Margin = new Thickness(6, 0, 0, 0);
+        _accessRestrictedBtn.ToolTip = L("下のリストのフォルダだけに操作を限定します。", "Limits operations to the folders listed below.");
+        _accessRestrictedBtn.Click += delegate { SetAccessScope(true); };
+        choiceRow.Children.Add(_accessRestrictedBtn);
+
+        wrap.Children.Add(choiceRow);
+        PaintAccessScopeButtons(restricted);
+
+        var hint = new TextBlock();
+        hint.Text = L("フルアクセス: すべてのフォルダを操作可能（既定）。指定フォルダのみ: 下のリストのフォルダに限定します。",
+                      "Full access: can operate on any folder (default). Selected folders only: limited to the list below.");
+        hint.Foreground = Muted; hint.FontSize = 10.5; hint.TextWrapping = TextWrapping.Wrap;
+        hint.Margin = new Thickness(0, 4, 0, 6);
+        wrap.Children.Add(hint);
+
+        _folderRowsPanel = new StackPanel();
+        RefreshFolderRows(folders);
+        var listScroll = new ScrollViewer();
+        listScroll.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+        listScroll.MaxHeight = 110;
+        listScroll.Content = _folderRowsPanel;
+        wrap.Children.Add(listScroll);
+
+        var addBtn = new Button();
+        addBtn.Content = L("＋ フォルダを追加", "+ Add folder");
+        addBtn.FontSize = 12; addBtn.Cursor = Cursors.Hand; addBtn.BorderThickness = new Thickness(1);
+        addBtn.Padding = new Thickness(10, 4, 10, 4); addBtn.HorizontalAlignment = HorizontalAlignment.Left;
+        addBtn.Margin = new Thickness(0, 4, 0, 10); addBtn.Template = FlatButtonTemplate();
+        addBtn.Background = BtnBg; addBtn.Foreground = Fg; addBtn.BorderBrush = Border;
+        addBtn.Click += delegate { AddAccessFolder(); };
+        wrap.Children.Add(addBtn);
+
+        return wrap;
+    }
+
+    // ── 接続クライアント ──────────────────────────────────────────────────────────────
+    // Never opens/writes .unlock_state.json directly -- shells out to
+    // `python -m tools.security ...` / `python -m tools.lock_state show`, the exact CLI
+    // surface tools/security.py's _cli() and tools/lock_state.py's _cli() document as being
+    // for this panel. Those modules own the atomic write and the require_unlocked() gate;
+    // this panel only ever reads their JSON output and asks them to grant/revoke.
+    string RunPyModule(string module, string args, int timeoutMs)
+    {
+        try
+        {
+            string repo = RepoRoot();
+            string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+            if (!File.Exists(py)) py = "python";
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = py;
+            psi.Arguments = "-m " + module + (string.IsNullOrEmpty(args) ? "" : " " + args);
+            psi.WorkingDirectory = repo;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+            string stdoutText = "";
+            using (var p = System.Diagnostics.Process.Start(psi))
+            {
+                try { stdoutText = p.StandardOutput.ReadToEnd(); } catch (Exception) { }
+                try { p.StandardError.ReadToEnd(); } catch (Exception) { }
+                try { p.WaitForExit(timeoutMs); } catch (Exception) { }
+            }
+            return stdoutText;
+        }
+        catch (Exception) { return ""; }
+    }
+
+    List<Dictionary<string, object>> ListUnlockGrants()
+    {
+        var outp = new List<Dictionary<string, object>>();
+        string stdout = RunPyModule("tools.security", "list", 15000);
+        try
+        {
+            var arr = _js.DeserializeObject(stdout) as object[];
+            if (arr != null)
+                foreach (object o in arr)
+                {
+                    var d = o as Dictionary<string, object>;
+                    if (d != null) outp.Add(d);
+                }
+        }
+        catch (Exception) { }
+        return outp;
+    }
+
+    // .fleet/lock_state.json's most recent refusal, via tools/lock_state.py's own CLI -- the
+    // primary path this panel exists for: a refusal happens, the operator opens 詳細設定, and
+    // the refused client is already sitting at the top with an Allow button, never a box to
+    // type an address into.
+    Dictionary<string, object> ReadRefusedClient()
+    {
+        string stdout = RunPyModule("tools.lock_state", "show", 15000);
+        try
+        {
+            var d = _js.DeserializeObject(stdout) as Dictionary<string, object>;
+            if (d != null) return d;
+        }
+        catch (Exception) { }
+        return new Dictionary<string, object>();
+    }
+
+    void GrantClientIp(string ip)
+    {
+        RunPyModule("tools.security", "grant \"" + ip.Replace("\"", "") + "\"", 15000);
+    }
+
+    void RevokeClientIp(string ip)
+    {
+        RunPyModule("tools.security", "revoke \"" + ip.Replace("\"", "") + "\"", 15000);
+    }
+
+    void RefreshClientRows()
+    {
+        if (_clientRowsPanel == null) return;
+        _clientRowsPanel.Children.Clear();
+
+        var grants = ListUnlockGrants();
+        var refused = ReadRefusedClient();
+        string refusedIp = "";
+        object rv;
+        if (refused.TryGetValue("client_ip", out rv) && rv != null) refusedIp = rv.ToString();
+
+        // Surface the refused IP up top UNLESS it is already granted and not expired -- an
+        // already-resolved refusal shows up in the ordinary list below, not as "pending" too.
+        if (!string.IsNullOrEmpty(refusedIp))
+        {
+            bool covered = false;
+            foreach (var g in grants)
+            {
+                object ipv, ev;
+                if (g.TryGetValue("ip", out ipv) && ipv != null && ipv.ToString() == refusedIp)
+                {
+                    bool expired = false;
+                    if (g.TryGetValue("expired", out ev) && ev != null)
+                        try { expired = Convert.ToBoolean(ev); } catch (Exception) { }
+                    covered = !expired;
+                    break;
+                }
+            }
+            if (!covered) _clientRowsPanel.Children.Add(BuildPendingClientRow(refusedIp));
+        }
+
+        if (grants.Count == 0)
+        {
+            var none = new TextBlock();
+            none.Text = L("(接続履歴なし)", "(no clients yet)");
+            none.Foreground = Muted; none.FontSize = 11; none.Margin = new Thickness(0, 2, 0, 2);
+            _clientRowsPanel.Children.Add(none);
+            return;
+        }
+        foreach (var g in grants) _clientRowsPanel.Children.Add(BuildClientRow(g));
+    }
+
+    UIElement BuildPendingClientRow(string ip)
+    {
+        var card = new Border();
+        card.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+        card.BorderBrush = Theme.Br(Theme.Danger(_dark));
+        card.BorderThickness = new Thickness(1);
+        card.CornerRadius = new CornerRadius(6);
+        card.Padding = new Thickness(8, 6, 8, 6);
+        card.Margin = new Thickness(0, 0, 0, 6);
+
+        var col = new StackPanel();
+        var badge = new TextBlock();
+        badge.Text = L("直近で拒否された接続", "Most recently refused");
+        badge.Foreground = Theme.Br(Theme.Danger(_dark)); badge.FontSize = 10.5; badge.FontWeight = FontWeights.SemiBold;
+        col.Children.Add(badge);
+
+        var row = new DockPanel(); row.Margin = new Thickness(0, 4, 0, 0); row.LastChildFill = false;
+        var allow = new Button();
+        allow.Content = L("許可", "Allow");
+        allow.FontSize = 11.5; allow.FontWeight = FontWeights.SemiBold; allow.Cursor = Cursors.Hand;
+        allow.BorderThickness = new Thickness(0); allow.Padding = new Thickness(10, 3, 10, 3);
+        allow.Template = FlatButtonTemplate(); allow.Background = Theme.Br(Theme.Accent(_dark)); allow.Foreground = White;
+        string capturedIp = ip;
+        allow.Click += delegate { GrantClientIp(capturedIp); RefreshClientRows(); };
+        DockPanel.SetDock(allow, Dock.Right); row.Children.Add(allow);
+
+        var ipTb = new TextBlock(); ipTb.Text = ip; ipTb.Foreground = Fg; ipTb.FontSize = 12;
+        ipTb.VerticalAlignment = VerticalAlignment.Center; ipTb.Margin = new Thickness(0, 0, 8, 0);
+        DockPanel.SetDock(ipTb, Dock.Left); row.Children.Add(ipTb);
+        col.Children.Add(row);
+
+        card.Child = col;
+        return card;
+    }
+
+    UIElement BuildClientRow(Dictionary<string, object> g)
+    {
+        string ip = "";
+        object v;
+        if (g.TryGetValue("ip", out v) && v != null) ip = v.ToString();
+        bool expired = false;
+        if (g.TryGetValue("expired", out v) && v != null)
+            try { expired = Convert.ToBoolean(v); } catch (Exception) { }
+        double remainingSec = 0;
+        if (g.TryGetValue("remaining_seconds", out v) && v != null)
+            try { remainingSec = Convert.ToDouble(v); } catch (Exception) { }
+
+        var row = new DockPanel(); row.Margin = new Thickness(0, 3, 0, 3); row.LastChildFill = false;
+
+        var revoke = new Button();
+        revoke.Content = L("取り消し", "Revoke");
+        revoke.FontSize = 11; revoke.Cursor = Cursors.Hand; revoke.BorderThickness = new Thickness(1);
+        revoke.Padding = new Thickness(8, 3, 8, 3); revoke.Template = FlatButtonTemplate();
+        revoke.Background = Brushes.Transparent; revoke.Foreground = Theme.Br(Theme.Danger(_dark));
+        revoke.BorderBrush = Theme.Br(Theme.Danger(_dark));
+        string capturedIp1 = ip;
+        revoke.Click += delegate { RevokeClientIp(capturedIp1); RefreshClientRows(); };
+        DockPanel.SetDock(revoke, Dock.Right); row.Children.Add(revoke);
+
+        var allow = new Button();
+        allow.Content = L("許可", "Allow");
+        allow.FontSize = 11; allow.Cursor = Cursors.Hand; allow.BorderThickness = new Thickness(1);
+        allow.Padding = new Thickness(8, 3, 8, 3); allow.Template = FlatButtonTemplate();
+        allow.Background = BtnBg; allow.Foreground = Fg; allow.BorderBrush = Border;
+        allow.Margin = new Thickness(0, 0, 6, 0);
+        allow.ToolTip = L("延長（同じTTLで再付与）", "Extend (re-grant with the same TTL rule)");
+        string capturedIp2 = ip;
+        allow.Click += delegate { GrantClientIp(capturedIp2); RefreshClientRows(); };
+        DockPanel.SetDock(allow, Dock.Right); row.Children.Add(allow);
+
+        var statusTb = new TextBlock();
+        statusTb.FontSize = 11; statusTb.VerticalAlignment = VerticalAlignment.Center;
+        statusTb.Margin = new Thickness(0, 0, 8, 0);
+        if (expired)
+        {
+            statusTb.Text = L("期限切れ", "Expired");
+            statusTb.Foreground = Theme.Br(Theme.Danger(_dark));
+        }
+        else
+        {
+            double days = remainingSec / 86400.0;
+            statusTb.Text = days.ToString("0.#", CultureInfo.InvariantCulture) + L("日", "d");
+            statusTb.Foreground = Muted;
+        }
+        DockPanel.SetDock(statusTb, Dock.Right); row.Children.Add(statusTb);
+
+        var ipTb = new TextBlock(); ipTb.Text = ip; ipTb.Foreground = Fg; ipTb.FontSize = 12;
+        ipTb.VerticalAlignment = VerticalAlignment.Center; ipTb.TextTrimming = TextTrimming.CharacterEllipsis;
+        ipTb.ToolTip = ip;
+        DockPanel.SetDock(ipTb, Dock.Left); row.Children.Add(ipTb);
+
+        return row;
+    }
+
+    UIElement BuildConnectedClientsControls()
+    {
+        var wrap = new StackPanel();
+        var subHead = new TextBlock(); subHead.Text = L("接続クライアント", "Connected clients");
+        subHead.Foreground = Fg; subHead.FontSize = 12.5; subHead.FontWeight = FontWeights.SemiBold;
+        subHead.Margin = new Thickness(0, 10, 0, 4);
+        wrap.Children.Add(subHead);
+
+        var hint = new TextBlock();
+        hint.Text = L("拒否された接続先はここで許可できます。", "Refused connections can be allowed here.");
+        hint.Foreground = Muted; hint.FontSize = 10.5; hint.TextWrapping = TextWrapping.Wrap;
+        hint.Margin = new Thickness(0, 0, 0, 4);
+        wrap.Children.Add(hint);
+
+        _clientRowsPanel = new StackPanel();
+        RefreshClientRows();
+        var scroll = new ScrollViewer();
+        scroll.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+        scroll.MaxHeight = 170;
+        scroll.Content = _clientRowsPanel;
+        wrap.Children.Add(scroll);
+
+        return wrap;
     }
 
     static string FmtFloor(double v)

@@ -1,5 +1,8 @@
+import ipaddress
 import json
 import os
+import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -200,3 +203,159 @@ def list_unlocked() -> str:
         else:
             lines.append(f"{ip}: {remain_days:.1f} days remaining")
     return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────
+# Local (non-HTTP) per-IP unlock admin -- for the cockpit UI ONLY.
+#
+# unlock() above only ever authorises the CALLER's own IP, derived from a live HTTP
+# request (_parse_request(get_http_request())). That is right for the MCP tool -- a
+# remote agent can only unlock itself, never grant access to some other address -- but
+# it means unlock() cannot be reused to let a human sitting at this machine authorise a
+# *different* client from the desktop cockpit after watching it get refused. The
+# functions below fill that gap. They:
+#
+#   * take the target IP as a plain argument instead of deriving it from a request;
+#   * are local Python calls (imported from a script / invoked via `python -m
+#     tools.security ...`), never registered as MCP tools -- so a remote model can never
+#     call them and grant itself access;
+#   * do not touch require_unlocked(), unlock(), or _parse_request() -- the unlock gate
+#     that mutating tools go through is completely unchanged;
+#   * write .unlock_state.json atomically (tmp file + os.replace), because the running
+#     MCP server process reads and writes the very same file on every unlock() call and
+#     a half-written file must never be observable.
+# ─────────────────────────────────────────────────────────────────────────────────────
+
+_GRANT_LOCK = threading.Lock()
+
+
+def _valid_ip(ip: str) -> bool:
+    """True iff `ip` parses as a real IPv4 or IPv6 address. Rejects "", whitespace, and
+    garbage rather than letting it become a junk key in .unlock_state.json."""
+    ip = (ip or "").strip()
+    if not ip:
+        return False
+    try:
+        ipaddress.ip_address(ip)
+        return True
+    except ValueError:
+        return False
+
+
+def _save_state_atomic(state: dict) -> None:
+    """Same on-disk shape and location as _save_state(), but tmp-file + os.replace so a
+    concurrent unlock() write from the live server process can never observe (or produce)
+    a partially-written file. _save_state() itself is left untouched -- unlock()'s own
+    write path is out of scope for this change."""
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(STATE_FILE.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise
+
+
+def grant_ip(ip: str, ttl_days: float | None = None) -> dict:
+    """LOCAL operator action: create or extend an unlock for `ip`, exactly like unlock()
+    would for the caller's own address, but callable from the desktop cockpit for an
+    arbitrary remote client. Same TTL rule as unlock(): MCP_UNLOCK_TTL_DAYS (default 30)
+    unless overridden. Raises ValueError for an empty/garbage IP rather than writing junk.
+
+    Returns {"ip", "expires_at", "unlocked_at", "ttl_days"}.
+    """
+    ip = (ip or "").strip()
+    if not _valid_ip(ip):
+        raise ValueError(f"invalid IP address: {ip!r}")
+    if ttl_days is None:
+        ttl_days = float(os.environ.get("MCP_UNLOCK_TTL_DAYS", "30"))
+    ttl_days = float(ttl_days)
+    with _GRANT_LOCK:
+        state = _load_state()
+        now = time.time()
+        expires = now + ttl_days * 86400
+        state[ip] = {"expires_at": expires, "unlocked_at": now}
+        _save_state_atomic(state)
+    return {"ip": ip, "expires_at": expires, "unlocked_at": now, "ttl_days": ttl_days}
+
+
+def revoke_ip(ip: str) -> bool:
+    """LOCAL operator action: remove any unlock for `ip`. Returns True if an entry was
+    removed, False if `ip` had no entry (a no-op, not an error). Raises ValueError for an
+    empty/garbage IP."""
+    ip = (ip or "").strip()
+    if not _valid_ip(ip):
+        raise ValueError(f"invalid IP address: {ip!r}")
+    with _GRANT_LOCK:
+        state = _load_state()
+        existed = ip in state
+        if existed:
+            del state[ip]
+            _save_state_atomic(state)
+    return existed
+
+
+def list_grants() -> list[dict]:
+    """Every entry in .unlock_state.json as a plain list, newest-expiring first, each with
+    a pre-computed remaining_seconds/expired so callers (the cockpit UI, tests) never have
+    to redo the clock math list_unlocked()'s string form hides."""
+    state = _load_state()
+    now = time.time()
+    out = []
+    for ip, entry in state.items():
+        expires_at = float(entry.get("expires_at", 0) or 0)
+        remaining = expires_at - now
+        out.append({
+            "ip": ip,
+            "expires_at": expires_at,
+            "unlocked_at": entry.get("unlocked_at"),
+            "remaining_seconds": remaining,
+            "expired": remaining <= 0,
+        })
+    out.sort(key=lambda r: -r["expires_at"])
+    return out
+
+
+def _cli() -> None:
+    """`python -m tools.security <list|grant|revoke>` -- the local admin surface the
+    cockpit's 詳細設定/Advanced panel shells out to. Never registered as an MCP tool."""
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="Local (non-HTTP) per-IP unlock admin. Not an MCP tool.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list")
+    g = sub.add_parser("grant")
+    g.add_argument("ip")
+    g.add_argument("--ttl-days", type=float, default=None)
+    r = sub.add_parser("revoke")
+    r.add_argument("ip")
+
+    args = ap.parse_args()
+    if args.cmd == "list":
+        print(json.dumps(list_grants(), ensure_ascii=False))
+        return
+    if args.cmd == "grant":
+        try:
+            print(json.dumps(grant_ip(args.ip, args.ttl_days), ensure_ascii=False))
+        except ValueError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+            raise SystemExit(1)
+        return
+    if args.cmd == "revoke":
+        try:
+            revoked = revoke_ip(args.ip)
+        except ValueError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+            raise SystemExit(1)
+        print(json.dumps({"ip": args.ip, "revoked": revoked}, ensure_ascii=False))
+        return
+
+
+if __name__ == "__main__":
+    _cli()

@@ -61,7 +61,9 @@ jobs:
             tests/test_edge_taskbar_hygiene.py \
             ui/test_fleet_cockpit_health.py \
             ui/test_fleet_cockpit_card_menu.py \
+            ui/test_fleet_cockpit_advanced_settings.py \
             tools/test_folder_policy.py \
+            tools/test_security.py \
             tools/test_python_gate.py \
             tools/test_approval_policy.py \
             tools/test_layer1_security.py \
