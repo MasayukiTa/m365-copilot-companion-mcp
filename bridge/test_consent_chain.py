@@ -5,11 +5,14 @@ in sequence -- Work IQ User, Copilot, Teams, SharePoint, OneDrive, Mail, Calenda
 appearing only once its predecessor was approved. _bridge_auto_consent's tier 0 clicked the
 first Allow and returned, so the rest stayed pending.
 
-The consequence was not just a failed consent. The unresolved card remained the LAST
-assistant block in the conversation, so every subsequent turn's settle loop read a consent
-card where it expected an answer, and /stream ran to wait_for_idle's 1800s deadline
-(measured 954s, 949s, 448s, 428s -- all client timeouts, with the correct answer sitting in
-the transcript just above the card).
+The consequence is a failed consent, and an unresolved card left sitting where later reads
+expect an answer.
+
+Correction, because the original version of this file claimed more: this was first written
+up as the cause of an apparent 15-minute hang in the interactive chat. It was not. The
+bridge answers in ~28s; the "hang" was a test client reading the SSE stream to EOF on a
+keep-alive connection, so it never saw `event: done`. The seven-card chain below was
+observed directly and is worth fixing on its own.
 """
 import re
 from pathlib import Path

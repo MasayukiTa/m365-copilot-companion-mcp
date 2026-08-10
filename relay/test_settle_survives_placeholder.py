@@ -3,9 +3,13 @@
 Measured live on 2026-08-10: with the answer complete and the Stop button absent, the
 last assistant block cycled answer -> "処理中です。" -> name-only -> answer about every
 four seconds. _is_processing() is True for the middle two (an empty read counts as
-processing), and each one CLEARED the stability counters, so the turn never settled and
-/stream ran to wait_for_idle's 1800s deadline. Three measurements -- 954s, 949s and >328s
--- all with the correct answer already on screen.
+processing), and each one CLEARED the stability counters -- so a turn that has already
+finished keeps being told it has not.
+
+Correction: this was first written up as the cause of an apparent 15-minute hang in the
+interactive chat. It was not. The bridge answers in ~28s; the "hang" was a test client
+reading the SSE stream to EOF on a keep-alive connection, so it never saw `event: done`.
+The oscillation is real and was observed directly; that is what this change rests on.
 
 A placeholder still must never be accepted AS the answer, and a real mid-stream partial
 must still be rejected. Both are asserted here alongside the fix.
