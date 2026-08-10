@@ -1933,6 +1933,68 @@ def _looks_like_consent(text: str) -> bool:
 _CONSENT_CHAIN_MAX = int(os.environ.get("MCP_CONSENT_CHAIN_MAX", "12"))
 
 
+# Why a turn did not settle. This loop has a 600s outer bound, so a turn that never
+# settles does not hang forever -- it burns ten minutes and the caller times out first
+# (measured 2026-08-10: 954s and 949s against a 900s client, 448/428/443s against a 400s
+# one, every time with the correct answer already on screen). There is no bridge log, and
+# attaching a second CDP client changes what is being measured, so the only way to see
+# WHICH poll reset the settle window is to record it here.
+#
+# Only resets after _SETTLE_RESET_TRACE_AFTER_S are written, so a healthy turn (settled in
+# about a second) writes nothing. Never raises.
+_SETTLE_RESET_TRACE_AFTER_S = float(os.environ.get("MCP_SETTLE_RESET_TRACE_AFTER_S", "20"))
+_SETTLE_RESET_TRACE_PATH = os.path.join(".fleet", "settle_reset.jsonl")
+_SETTLE_RESET_TRACE_MAX_BYTES = 2_000_000
+
+
+def _outer_read_trace(t0, cleaned, final, partial):
+    """One line per outer-loop poll, once the turn is already slow. Never raises."""
+    try:
+        age = time.time() - t0
+        if age < _SETTLE_RESET_TRACE_AFTER_S:
+            return
+        path = os.path.join(".fleet", "outer_read.jsonl")
+        try:
+            if os.path.getsize(path) > _SETTLE_RESET_TRACE_MAX_BYTES:
+                return
+        except OSError:
+            pass
+        rec = {
+            "age_s": round(age, 1),
+            "clean_len": len(cleaned or ""), "clean_tail": (cleaned or "")[-70:],
+            "final_len": len(final or ""), "final_tail": (final or "")[-70:],
+            "partial_len": len(partial or ""),
+            "final_is_proc": bool(_is_proc(final or "")),
+        }
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + chr(10))
+    except Exception:
+        pass
+
+
+def _settle_reset_trace(t0, final, stable_text, gen_active):
+    try:
+        age = time.time() - t0
+        if age < _SETTLE_RESET_TRACE_AFTER_S:
+            return
+        try:
+            if os.path.getsize(_SETTLE_RESET_TRACE_PATH) > _SETTLE_RESET_TRACE_MAX_BYTES:
+                return
+        except OSError:
+            pass
+        rec = {
+            "age_s": round(age, 1), "gen_active": bool(gen_active),
+            "final_len": len(final or ""), "stable_len": len(stable_text or ""),
+            "final_tail": (final or "")[-80:], "stable_tail": (stable_text or "")[-80:],
+        }
+        os.makedirs(os.path.dirname(_SETTLE_RESET_TRACE_PATH), exist_ok=True)
+        with open(_SETTLE_RESET_TRACE_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + chr(10))
+    except Exception:
+        pass
+
+
 def _bridge_auto_consent() -> bool:
     """Auto-approve an MCP connection-consent card on the bridge's PAGE, mirroring
     RelayWorker._auto_consent's three tiers -- this is a connection-SELECT confirm, NOT a
@@ -3492,6 +3554,11 @@ class Handler(BaseHTTPRequestHandler):
             # below filters if it's a status/placeholder line.
             _pc = _clean_answer_text(); partial = _pc if _pc else _text(LOADING)
             _cleaned = _clean_answer_text(); final = _cleaned if _cleaned else _text(LASTMSG)
+            # Records WHAT the outer loop is actually reading. The inner settle loop was
+            # never entered across a full 600s run, which means this condition never held --
+            # so the failure is in the READ, not in the settle arithmetic. Same 20s
+            # threshold: a healthy turn enters the inner loop at once and writes nothing.
+            _outer_read_trace(t0, _cleaned, final, partial)
             # stream growing partial (skip "処理中" AND search-status lines)
             if stream_out and not _is_proc(partial) and not _is_search_status(partial) and len(partial) > sent:
                 self._sse({"delta": partial[sent:]})
@@ -3521,10 +3588,21 @@ class Handler(BaseHTTPRequestHandler):
                             break
                     else:
                         # text still growing OR Copilot still generating -> reset settle window
+                        _settle_reset_trace(t0, final, stable_text, gen_active)
                         stable_text, stable_since = final, time.time()
                     time.sleep(0.3)
                     self._ping()             # detect Esc/Stop disconnect promptly
-                    _cleaned2 = _clean_answer_text(); final = _cleaned2 if _cleaned2 else _text(LASTMSG)
+                    # An EMPTY clean body is not a new answer -- it is a failed read. Falling
+                    # back to the RAW last message here was the bug: the raw text carries the
+                    # "<agent> said:" heading and the avatar's alt text, so it never equals the
+                    # clean body, the settle window reset on every such poll, and the turn spun
+                    # for the full 600s outer bound with the correct answer already on screen
+                    # (measured 2026-08-10: the block cycles clean-body -> placeholder -> empty
+                    # roughly every 4s while the Stop button stays absent). LASTMSG stays the
+                    # fallback for ENTERING this loop; once inside, stable_text is the better
+                    # answer to an unreadable poll -- same treatment a placeholder already got.
+                    _cleaned2 = _clean_answer_text()
+                    final = _cleaned2 if _cleaned2 else stable_text
                     if _is_proc(final):
                         final = stable_text
                 # authoritative final: the CLEAN body, regardless of any streaming artifacts
