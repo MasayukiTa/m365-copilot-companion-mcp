@@ -1934,11 +1934,15 @@ _CONSENT_CHAIN_MAX = int(os.environ.get("MCP_CONSENT_CHAIN_MAX", "12"))
 
 
 # Why a turn did not settle. This loop has a 600s outer bound, so a turn that never
-# settles does not hang forever -- it burns ten minutes and the caller times out first
-# (measured 2026-08-10: 954s and 949s against a 900s client, 448/428/443s against a 400s
-# one, every time with the correct answer already on screen). There is no bridge log, and
-# attaching a second CDP client changes what is being measured, so the only way to see
-# WHICH poll reset the settle window is to record it here.
+# settles does not hang forever -- it burns ten minutes and the caller sees nothing. There
+# is no bridge log, and attaching a second CDP client changes what is being measured, so
+# the only way to see WHICH poll reset the settle window is to record it here.
+#
+# This tracing was added while chasing an apparent 15-minute hang. It earned its keep by
+# staying EMPTY: no records across a full run meant the loop was never even entered, which
+# is what finally pointed away from the bridge and at the measurement client (it read the
+# SSE stream to EOF on a keep-alive connection, so it never noticed `event: done`; the
+# bridge was answering in ~28s the whole time). Silence from a trace is evidence too.
 #
 # Only resets after _SETTLE_RESET_TRACE_AFTER_S are written, so a healthy turn (settled in
 # about a second) writes nothing. Never raises.
@@ -2018,11 +2022,16 @@ def _bridge_auto_consent() -> bool:
     # surfaces a CHAIN of cards -- measured 2026-08-10, seven of them, one after another
     # (User -> Copilot -> Teams -> SharePoint -> OneDrive -> Mail -> Calendar), each
     # appearing only once its predecessor is approved. Returning after a single click left
-    # the rest pending, the caller re-sent, saw a card again and reported consent_failed --
-    # and, worse, the unresolved card stayed as the LAST assistant block, so every later
-    # turn's settle loop read a consent card instead of an answer and ran to wait_for_idle's
-    # 1800s deadline. That is the /stream hang (448s, 428s, 954s, 949s -- all client-side
-    # timeouts, with the real answer sitting correctly in the transcript above the card).
+    # the rest pending, so the caller re-sent, saw a card again and reported consent_failed,
+    # and the unresolved card stayed as the LAST assistant block where later reads expect an
+    # answer.
+    #
+    # This was first written up as the cause of a 15-minute hang in the interactive chat.
+    # That was wrong and the correction belongs here: the bridge was healthy throughout
+    # (28.2s, 27.7s, 29.3s per turn once measured properly) and the hang was in the test
+    # client, which read the SSE stream to EOF on a keep-alive connection and so never saw
+    # `event: done`. The seven-card chain is real and was observed directly; it simply did
+    # not cause that.
     #
     # Bounded so a card that re-renders instead of resolving cannot spin here forever.
     clicked_any = False

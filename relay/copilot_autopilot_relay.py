@@ -603,11 +603,18 @@ def bare_agent_url(url: str) -> str:
     return u
 
 
-# Observability for the one failure this module cannot be debugged without: a turn whose
-# answer is complete and correct on screen, yet never settles, so the caller sits until
-# wait_for_idle's deadline. Measured repeatedly on 2026-08-10 (954s, 949s, 448s, 428s,
-# 443s) with no way to tell WHICH predicate kept rejecting the text -- there is no bridge
-# log, and attaching a second CDP client changes what is being measured.
+# Observability for the failure this module cannot be debugged without: a turn whose answer
+# is complete and correct on screen, yet never settles, so the caller sits until
+# wait_for_idle's deadline. There is no bridge log, and attaching a second CDP client
+# changes what is being measured, so without this there is no way to tell WHICH predicate
+# kept rejecting the text.
+#
+# Added on 2026-08-10 while chasing what looked like a 15-minute hang. Its value turned out
+# to be its SILENCE: no records at all across a full run proved wait_for_idle was never
+# entered, which is what redirected the search away from this module and eventually to the
+# real culprit -- a test client that read the SSE stream to EOF on a keep-alive connection
+# and so never noticed `event: done`, while the bridge answered in ~28s throughout. Keep
+# that in mind when reading a trace: an empty file is a finding, not a broken tracer.
 #
 # Only turns already past _SETTLE_TRACE_AFTER_S are recorded, so a healthy turn (which
 # settles in seconds) writes nothing at all. Never raises; a tracing failure must not be
@@ -656,6 +663,38 @@ def _settle_trace_reset(drv):
     """Start a fresh age clock for this driver's next turn."""
     try:
         _settle_trace_started_at[id(drv)] = time.time()
+    except Exception:
+        pass
+
+
+# Where send() actually spends its time. The interactive turn was measured at 440s four
+# times over, and every earlier attempt instrumented the SETTLE path -- which send() never
+# reaches. Only after tracing proved the bridge's outer loop was never entered did it
+# become clear the whole budget is consumed inside send() itself, before a single answer
+# poll. GEN_WAIT_S alone is 240s and the three type/arm/click attempts add ~130s more.
+#
+# Stages are recorded only once a send is already slow, so a healthy send writes nothing.
+_SEND_STAGE_AFTER_S = float(os.environ.get("MCP_SEND_STAGE_AFTER_S", "5"))
+_SEND_STAGE_PATH = os.path.join(".fleet", "send_stage.jsonl")
+
+
+def _send_stage(t0, name, **extra):
+    """One line per send() milestone once the send is already slow. Never raises."""
+    try:
+        import json as _json
+        age = time.time() - t0
+        if age < _SEND_STAGE_AFTER_S:
+            return
+        try:
+            if os.path.getsize(_SEND_STAGE_PATH) > 2_000_000:
+                return
+        except OSError:
+            pass
+        rec = {"age_s": round(age, 1), "stage": name}
+        rec.update(extra)
+        os.makedirs(os.path.dirname(_SEND_STAGE_PATH), exist_ok=True)
+        with open(_SEND_STAGE_PATH, "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(rec, ensure_ascii=False) + chr(10))
     except Exception:
         pass
 
@@ -1195,6 +1234,7 @@ class CopilotWebDriver:
         # If it is STILL generating after the generous window, raise GenerationInProgress so
         # the caller RESCHEDULES WITHOUT consuming the transient budget -- merely waiting out
         # a slow turn must never count toward STUCK. The composer is untouched here.
+        _send_t0 = time.time()
         gw = self.GEN_WAIT_S if gen_wait_s is None else gen_wait_s
         if self._is_generating():
             self._snapshot_send_failure(
@@ -1214,6 +1254,7 @@ class CopilotWebDriver:
         # CRITICAL: a newline in the Copilot composer SUBMITS the message. Collapse
         # all whitespace (incl. newlines) to single spaces so the whole job is sent
         # as ONE message with a single trailing Enter.
+        _send_stage(_send_t0, "gate_done", gw=gw)
         one_line = " ".join(str(text).split())
         # remember how many answer blocks exist now, so wait_for_idle can detect a
         # genuinely NEW one (rather than re-reading the previous turn's answer).
@@ -1250,6 +1291,8 @@ class CopilotWebDriver:
             # long Japanese goal lands intact -> the Send button arms reliably. type()
             # was the cause of "Send button never submitted" on long JP goals.
             self.page.keyboard.insert_text(one_line)
+            _send_stage(_send_t0, "typed", attempt=attempt,
+                        composer_len=len(self._composer_text() or ""))
             if self._wait_send_armed(timeout_s=12.0):
                 try:
                     btn = self._send_button()
@@ -1282,6 +1325,7 @@ class CopilotWebDriver:
             # many seconds to clear the composer; a too-short window both falsely fails AND
             # causes the retry to double-send. Re-click the Send button each second in case
             # it re-armed without submitting (a load-induced no-op click).
+            _send_stage(_send_t0, "clicked", attempt=attempt)
             for i in range(48):                  # up to ~12s
                 self.page.wait_for_timeout(250)
                 if not self._composer_text():
@@ -1435,15 +1479,19 @@ class CopilotWebDriver:
                               prev_len=len(last or ""), prev_tail=(last or "")[-60:])
             if _is_processing(t):
                 # A placeholder ("処理中です。") or an empty read carries NO information
-                # about the answer -- it is not evidence that the answer changed. Clearing
-                # the counters here is what made a finished turn hang: measured live on
-                # 2026-08-10, the last block cycles answer -> "処理中です。" -> name-only
-                # (empty once the prefix is stripped) -> answer, roughly every 4s, while
-                # the Stop button stays absent the whole time. Every placeholder sample
-                # reset the stability counters, so a complete, correct answer never
-                # settled and /stream ran to wait_for_idle's 1800s deadline (three
-                # measurements: 954s, 949s, >328s, all with the right answer already on
-                # screen).
+                # about the answer -- it is not evidence that the answer changed.
+                # Measured live on 2026-08-10: the last block cycles answer ->
+                # "処理中です。" -> name-only (empty once the prefix is stripped) ->
+                # answer, roughly every 4s, while the Stop button stays absent the whole
+                # time. Each placeholder sample cleared the stability counters, which
+                # needlessly delays a turn that has already finished.
+                #
+                # This was originally written up as the cause of a 15-minute hang in the
+                # interactive chat. That was wrong: the bridge was healthy the whole time
+                # and the hang was in the measurement client (it read the SSE stream to
+                # EOF on a keep-alive connection and never saw `event: done`). The
+                # oscillation above is real and was observed directly; the change stands
+                # on that, not on the hang.
                 #
                 # So: SKIP the sample instead of resetting. A placeholder still can never
                 # be ACCEPTED (that is this branch's original job and it is unchanged --
