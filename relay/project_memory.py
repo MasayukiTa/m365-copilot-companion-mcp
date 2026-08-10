@@ -1,83 +1,244 @@
-"""project_memory.py -- persistent, AUTO-accumulated memory of a codebase across tasks.
+"""project_memory.py -- what this agent has actually DONE, kept per THEME, read back later.
 
-Claude Code remembers a repo only through a hand-written CLAUDE.md. This goes further:
-every finished code_task records a compact note (goal + outcome + a snippet of what the
-agent reported) keyed by the folder, and the NEXT task on that folder gets those notes
-primed into its goal. So the agent accumulates understanding of your codebase over time
-without you writing anything -- "last time on this repo I ...".
+Not a file the operator writes. Every finished task records a compact note by itself, and
+the next task on the same theme gets those notes primed into its goal, so the agent
+accumulates working knowledge without anyone maintaining it.
 
-Frame-side only: notes live in a plain JSON file (.fleet/project_notes.json), so no MCP
-unlock is needed and nothing executes. stdlib only.
+SHAPE (follows where Claude Code and Codex both landed, deliberately):
+
+    .fleet/memory/INDEX.md          one line per theme -- the only thing read every time
+    .fleet/memory/<slug>.md         one file per theme: frontmatter + newest-first entries
+
+Claude Code writes its own learnings to ~/.claude/projects/<project>/memory/ as one fact
+per file behind a MEMORY.md index it loads each session; Codex summarises prior sessions
+into ~/.codex/memories/ and reads them on the next one. Both separate a always-read INDEX
+from on-demand bodies, and both use markdown rather than an opaque blob so a human can read
+and edit the store. This does the same.
+
+WHY THEME AND NOT FOLDER: the first version keyed on the working folder. Two unrelated jobs
+that both touched Desktop/test landed in one bucket and primed each other with irrelevant
+history. A theme ("OGF 異物解析", "ブリッジの同意カード") is what the agent actually needs to
+recall, and it survives the work moving between folders.
+
+Frame-side only: plain files under .fleet, stdlib only, no MCP unlock, nothing executes.
+Every function swallows its own errors -- memory is an enhancement, and a broken store must
+never take down the run that was trying to record into it.
 """
 from __future__ import annotations
 
-import json
 import os
+import re
 import time
 
-_MAX_PER_FOLDER = 20          # keep the most recent N notes per folder
+_MAX_PER_THEME = 20           # keep the most recent N entries per theme
 _NOTE_CAP = 280               # chars per note snippet
+_GOAL_CAP = 160
+_INDEX_NAME = "INDEX.md"
+# The index is the part that gets read on EVERY task, so it is capped the way Claude Code
+# caps MEMORY.md: enough to see what exists, never enough to crowd out the actual work.
+_INDEX_MAX_THEMES = 40
+_SLUG_MAX = 48
 
 
-def _store_path(state_dir):
-    return os.path.join(state_dir or ".fleet", "project_notes.json")
+def _mem_dir(state_dir):
+    return os.path.join(state_dir or ".fleet", "memory")
 
 
-def _load(state_dir):
+def _index_path(state_dir):
+    return os.path.join(_mem_dir(state_dir), _INDEX_NAME)
+
+
+def slugify(theme):
+    """A stable, filesystem-safe slug for a theme.
+
+    Japanese themes are the normal case here, so this cannot be the usual ASCII-only
+    slugifier -- that would collapse every Japanese theme to the empty string and put all
+    of them in one file. Keep word characters (which include kana/kanji under re.UNICODE),
+    fold everything else to a hyphen, and fall back to a hash only when nothing survives.
+    """
+    s = " ".join(str(theme or "").split()).lower()
+    s = re.sub(r"[^\w]+", "-", s, flags=re.UNICODE).strip("-")
+    s = s[:_SLUG_MAX].strip("-")
+    if not s:
+        s = "theme-%08x" % (abs(hash(str(theme or ""))) & 0xFFFFFFFF)
+    return s
+
+
+def theme_from_goal(goal, folder=""):
+    """Best-effort theme when a caller has none.
+
+    A caller that knows its theme should pass it. This exists so that wiring a new call
+    site is never blocked on inventing a taxonomy: a goal's first clause is a decent
+    theme, and a wrong-but-stable theme still beats no memory at all.
+    """
+    text = " ".join(str(goal or "").split())
+    if not text:
+        return os.path.basename(str(folder or "").rstrip("/\\")) or "general"
+    # first clause: split on the punctuation people actually end a topic with
+    head = re.split(r"[。．\.\n:：,、/／]", text, 1)[0]
+    return (head or text)[:_GOAL_CAP]
+
+
+def _looks_like_path(value):
+    v = str(value or "")
+    return bool(v) and (os.sep in v or "/" in v or (len(v) > 1 and v[1] == ":"))
+
+
+def _resolve(key, goal="", folder=""):
+    """(display theme, slug) for whatever the caller passed.
+
+    A PATH stays folder-grouped. That is not just back-compat: deriving the theme from the
+    goal instead would scatter every task on one repo into its own file, which loses both
+    the isolation between folders and the point of accumulating anything. The slug carries
+    a hash of the full path so two folders that happen to share a basename stay separate.
+    """
+    if _looks_like_path(key):
+        full = os.path.abspath(str(key)).replace("\\", "/").rstrip("/").lower()
+        base = os.path.basename(full) or "folder"
+        return base, "folder-%s-%08x" % (slugify(base), abs(hash(full)) & 0xFFFFFFFF)
+    theme = " ".join(str(key or "").split())[:_GOAL_CAP]
+    if not theme:
+        theme = theme_from_goal(goal, folder)
+    return theme, slugify(theme)
+
+
+def _theme_path(slug, state_dir):
+    return os.path.join(_mem_dir(state_dir), slug + ".md")
+
+
+def _read(path):
     try:
-        with open(_store_path(state_dir), encoding="utf-8") as f:
-            d = json.load(f)
-        return d if isinstance(d, dict) else {}
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
     except Exception:
-        return {}
+        return ""
 
 
-def _save(state_dir, data):
-    p = _store_path(state_dir)
-    os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-    os.replace(tmp, p)
-
-
-def _key(folder):
-    return os.path.abspath(folder).replace("\\", "/").lower()
-
-
-def record_task(folder, goal, outcome, note="", state_dir=".fleet", ts=None):
-    """Append one task note for `folder` (most-recent-last, capped). `note` is a short
-    free-text takeaway (e.g. a slice of the agent's final report). Never raises."""
+def _write_atomic(path, text):
+    """Write via a temp file in the same directory, then replace. A half-written memory
+    file would be read back on the next task, so a crash mid-write must not be able to
+    leave one."""
     try:
-        data = _load(state_dir)
-        key = _key(folder)
-        items = data.get(key) or []
-        items.append({
-            "ts": ts if ts is not None else time.time(),
-            "goal": (goal or "")[:160],
-            "outcome": outcome or "",
-            "note": " ".join((note or "").split())[:_NOTE_CAP],
-        })
-        data[key] = items[-_MAX_PER_FOLDER:]
-        _save(state_dir, data)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(path + ".tmp"):
+                os.remove(path + ".tmp")
+        except Exception:
+            pass
+        return False
+
+
+def _entry_lines(text):
+    """The entry lines of a theme file, newest first, frontmatter excluded."""
+    body = text.split("---", 2)[-1] if text.startswith("---") else text
+    return [ln for ln in body.splitlines() if ln.startswith("- [")]
+
+
+def _fmt_ts(ts):
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
+    except Exception:
+        return ""
+
+
+def record_task(theme, goal, outcome, note="", state_dir=".fleet", ts=None, folder=""):
+    """Record one finished piece of work under `theme`. Never raises; returns bool.
+
+    `theme` may be a path for back-compat with the folder-keyed call sites -- a caller
+    that passes one gets a theme derived from the goal instead, so old wiring keeps
+    working and starts producing theme-shaped memory without being touched.
+    """
+    try:
+        theme, slug = _resolve(theme, goal, folder)
+        when = time.time() if ts is None else ts
+        line = "- [%s] %s — %s%s" % (
+            (outcome or "?").strip() or "?",
+            " ".join(str(goal or "").split())[:_GOAL_CAP],
+            " ".join(str(note or "").split())[:_NOTE_CAP] or "(記録なし)",
+            "  <!-- %s -->" % _fmt_ts(when),
+        )
+        path = _theme_path(slug, state_dir)
+        old = _entry_lines(_read(path))
+        entries = ([line] + old)[:_MAX_PER_THEME]          # newest first
+        text = (
+            "---\n"
+            "theme: %s\n"
+            "updated: %s\n"
+            "entries: %d\n"
+            "---\n\n"
+            "# %s\n\n"
+            "%s\n"
+        ) % (theme, _fmt_ts(when), len(entries), theme, "\n".join(entries))
+        if not _write_atomic(path, text):
+            return False
+        _upsert_index(theme, slug, len(entries), when, state_dir)
         return True
     except Exception:
         return False
 
 
-def load_notes(folder, max_items=5, state_dir=".fleet"):
-    """Return a short text block of the most recent task notes for `folder`, or "" if
-    none. Suitable to prime into a goal so the agent recalls prior work on this repo."""
+def _upsert_index(theme, slug, count, when, state_dir):
+    """Keep INDEX.md as one line per theme, most recently touched first."""
     try:
-        items = _load(state_dir).get(_key(folder)) or []
+        keep = []
+        for ln in _read(_index_path(state_dir)).splitlines():
+            if ln.startswith("- [") and ("(%s.md)" % slug) not in ln:
+                keep.append(ln)
+        line = "- [%s](%s.md) — %d件 / 最終 %s" % (theme, slug, count, _fmt_ts(when))
+        lines = ([line] + keep)[:_INDEX_MAX_THEMES]
+        text = ("# 実施済みの作業（テーマ別）\n\n"
+                "各テーマの詳細は同じディレクトリの .md を読むこと。\n\n"
+                "%s\n") % "\n".join(lines)
+        _write_atomic(_index_path(state_dir), text)
     except Exception:
-        items = []
-    if not items:
+        pass
+
+
+def load_notes(theme, max_items=5, state_dir=".fleet", goal="", include_index=True):
+    """Text block to prime into a goal: this theme's recent entries, plus the index of
+    what else is remembered. Returns "" when there is nothing. Never raises.
+
+    Two layers on purpose. The theme's own entries are what the agent needs right now;
+    the index is how it discovers that a NEIGHBOURING theme exists and is worth reading.
+    Without the index every theme is an island and the store stops compounding.
+    """
+    try:
+        theme, slug = _resolve(theme, goal)
+        entries = _entry_lines(_read(_theme_path(slug, state_dir)))[:max_items]
+        index = _read(_index_path(state_dir)).strip() if include_index else ""
+        blocks = []
+        if entries:
+            blocks.append("このテーマ「%s」での過去の作業（新しい順）:\n%s"
+                          % (theme, "\n".join(entries)))
+        if index:
+            other = [ln for ln in index.splitlines()
+                     if ln.startswith("- [") and ("(%s.md)" % slug) not in ln]
+            if other:
+                blocks.append("記憶している他のテーマ（必要なら .fleet/memory/ を読む）:\n"
+                              + "\n".join(other[:_INDEX_MAX_THEMES]))
+        return "\n\n".join(blocks)
+    except Exception:
         return ""
-    lines = ["このリポジトリでの過去の作業（新しい順）:"]
-    for it in reversed(items[-max_items:]):
-        g = it.get("goal", "")
-        o = it.get("outcome", "")
-        n = it.get("note", "")
-        lines.append("- [%s] %s%s" % (o, g, ("  / " + n) if n else ""))
-    return "\n".join(lines)
+
+
+def list_themes(state_dir=".fleet"):
+    """Every remembered theme as (theme, slug, path). For the cockpit and for tests."""
+    out = []
+    try:
+        d = _mem_dir(state_dir)
+        for name in sorted(os.listdir(d)):
+            if not name.endswith(".md") or name == _INDEX_NAME:
+                continue
+            text = _read(os.path.join(d, name))
+            m = re.search(r"^theme:\s*(.+)$", text, re.M)
+            out.append(((m.group(1).strip() if m else name[:-3]), name[:-3],
+                        os.path.join(d, name)))
+    except Exception:
+        pass
+    return out

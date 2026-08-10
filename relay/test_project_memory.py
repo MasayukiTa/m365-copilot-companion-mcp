@@ -37,8 +37,20 @@ def main():
     check("notes_have_outcome_and_note", "[DONE]" in notes and "calc.add を + に修正" in notes)
 
     # different folder is isolated
+    # A different folder has no ENTRIES of its own -- but it does see the INDEX. That is
+    # deliberate and is the whole point of the two-layer shape: without the index every
+    # theme is an island and the store never compounds, which is exactly the failure mode
+    # this rewrite was for. Assert the useful invariant instead of the old strict one:
+    # nothing from another folder's history leaks into this folder's own entry list.
     other = tempfile.mkdtemp(prefix="pm_other_")
-    check("folder_isolated", load_notes(other, state_dir=sd) == "")
+    other_notes = load_notes(other, state_dir=sd)
+    check("other_folder_has_no_entries_of_its_own",
+          "このテーマ" not in other_notes)
+    check("other_folder_still_sees_the_index",
+          "記憶している他のテーマ" in other_notes)
+    check("index_only_when_something_is_remembered",
+          load_notes(tempfile.mkdtemp(prefix="pm_empty_"),
+                     state_dir=tempfile.mkdtemp(prefix="pm_nostate_")) == "")
 
     # cap at 20 most recent
     for i in range(25):
