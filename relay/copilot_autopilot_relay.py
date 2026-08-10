@@ -1364,7 +1364,25 @@ class CopilotWebDriver:
                 continue
             t = self.read_last_response()
             if _is_processing(t):
-                last, stable_count, stable_since = None, 0, None
+                # A placeholder ("処理中です。") or an empty read carries NO information
+                # about the answer -- it is not evidence that the answer changed. Clearing
+                # the counters here is what made a finished turn hang: measured live on
+                # 2026-08-10, the last block cycles answer -> "処理中です。" -> name-only
+                # (empty once the prefix is stripped) -> answer, roughly every 4s, while
+                # the Stop button stays absent the whole time. Every placeholder sample
+                # reset the stability counters, so a complete, correct answer never
+                # settled and /stream ran to wait_for_idle's 1800s deadline (three
+                # measurements: 954s, 949s, >328s, all with the right answer already on
+                # screen).
+                #
+                # So: SKIP the sample instead of resetting. A placeholder still can never
+                # be ACCEPTED (that is this branch's original job and it is unchanged --
+                # `last` is only ever set from a non-processing read below), and a real
+                # mid-stream partial is still caught by the PRIMARY gate above, which
+                # resets on `generating`. Only when generation is demonstrably finished
+                # does a placeholder stop destroying accumulated stability.
+                if generating:
+                    last, stable_count, stable_since = None, 0, None
             elif t == last:
                 stable_count += 1
                 marker_ok = has_end_marker(t)

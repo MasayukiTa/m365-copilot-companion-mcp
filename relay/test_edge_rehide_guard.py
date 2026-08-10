@@ -84,6 +84,31 @@ def test_edge_keeper_ps1_minimize_guard_checks_window_visible():
     assert "IsIconic" in guard, guard
 
 
-def test_edge_keeper_ps1_never_calls_sw_hide():
+def test_edge_keeper_ps1_never_leaves_the_window_hidden():
+    """SW_HIDE の状態で終えないこと。
+
+    _REHIDE_PS と同じ基準に揃えた。元は「keeper は SW_HIDE を一度も書かない」と
+    固定していたが、最小化だけでは taskbar ボタンが残り、利用者が見るのはそれ。
+    WS_EX_TOOLWINDOW を立てるには属性変更の一瞬だけ窓を隠す必要があるので、
+    禁じるべきは「使うこと」ではなく「隠したまま終えること」。隠したままにすると
+    Edge がタブの描画を捨て、駆動中に TargetClosedError で落ちる。
+    """
     text = EDGE_KEEPER_PS1.read_text(encoding="utf-8")
-    assert not re.search(r"ShowWindow\([^)]*,\s*0\s*\)", text)
+    calls = re.findall(r"ShowWindow\(\$h,\s*(\d+)\)", text)
+    assert calls, "ShowWindow の呼び出しが無い"
+    assert calls[-1] != "0", "最後が SW_HIDE のまま: %s" % calls
+    for i, c in enumerate(calls):
+        if c == "0":
+            assert "6" in calls[i + 1:], "SW_HIDE の後に最小化へ戻していない: %s" % calls
+
+
+def test_edge_keeper_ps1_removes_the_taskbar_button_not_just_minimizes():
+    """常駐しているのはこのループだけ。起動直後の窓に印を付けられるのもここだけ。
+
+    rehide() は復旧時にしか走らないので、再起動のたびに窓がタスクバーへ戻っていた
+    （2026-08-10 に2回報告）。
+    """
+    text = EDGE_KEEPER_PS1.read_text(encoding="utf-8")
+    assert "SetWindowLong" in text, "WS_EX_TOOLWINDOW を立てていない"
+    assert "0x80" in text
+    assert "GetWindowLong" in text, "既に立っているかを見ずに毎回書き換えている"

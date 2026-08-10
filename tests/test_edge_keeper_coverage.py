@@ -30,10 +30,28 @@ def test_keeper_is_not_hardcoded_to_the_fleet_profile():
     assert "copilot-bridge-edge" in SRC, "ブリッジ側プロファイルが既定に含まれていない"
 
 
-def test_keeper_still_never_hides_the_window():
-    """SW_HIDE は Edge にタブの描画を捨てさせる。既存の不変条件を壊していないこと。"""
-    assert "ShowWindow($h, 0)" not in SRC
-    assert "ShowWindow($h, 6)" in SRC
+def test_keeper_never_leaves_the_window_hidden():
+    """SW_HIDE で終えないこと。
+
+    最初に書いたときは「一度も使わない」で固定したが、それでは taskbar ボタンが残る。
+    WS_EX_TOOLWINDOW を立てるには属性変更の一瞬だけ隠す必要があるので、守るべき
+    不変条件は「隠したまま終えない」。隠しっぱなしにすると Edge がタブの描画を捨て、
+    駆動中の CDP が TargetClosedError で落ちる。
+    """
+    import re as _re
+    calls = _re.findall(r"ShowWindow\(\$h,\s*(\d+)\)", SRC)
+    assert calls, "ShowWindow の呼び出しが無い"
+    assert calls[-1] != "0", "最後が SW_HIDE のまま: %s" % calls
+    for i, c in enumerate(calls):
+        if c == "0":
+            assert "6" in calls[i + 1:], "SW_HIDE の後に最小化へ戻していない: %s" % calls
+
+
+def test_keeper_marks_the_window_out_of_the_taskbar():
+    """常駐しているのはこのループだけ＝起動直後の窓に印を付けられる唯一の場所。"""
+    assert "SetWindowLong" in SRC
+    assert "0x80" in SRC
+    assert "GetWindowLong" in SRC, "既に立っているかを見ずに毎回書き換えている"
 
 
 def test_keeper_still_only_minimizes_a_visible_window():

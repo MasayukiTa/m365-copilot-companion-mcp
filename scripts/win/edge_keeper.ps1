@@ -38,6 +38,8 @@ public class K {
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int i);
+  [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int i, int v);
   [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] static extern int GetClassName(IntPtr h, StringBuilder s, int max);
@@ -87,7 +89,31 @@ while ($true) {
     # on a companion Edge that is supposed to have no window at all. A window that is not
     # visible needs no minimizing; touching it is what reveals it.
     foreach ($h in [K]::FindAll($pids)) {
-        if ($h -ne [IntPtr]::Zero -and [K]::IsWindowVisible($h) -and -not [K]::IsIconic($h)) {
+        if ($h -eq [IntPtr]::Zero) { continue }
+        if ([K]::IsWindowVisible($h) -and -not [K]::IsIconic($h)) {
+            [K]::ShowWindow($h, 6) | Out-Null
+        }
+        # Minimizing is not enough. A minimized window KEEPS its taskbar button, and the
+        # taskbar button is the thing the operator actually sees -- reported twice on
+        # 2026-08-10, both times right after the bridge was restarted. WS_EX_TOOLWINDOW
+        # takes the window out of the taskbar and Alt+Tab while leaving it live and
+        # drivable over CDP (measured on the bridge Edge: :9223 kept answering with the
+        # flag set).
+        #
+        # Until now this loop only minimized, and the flag was set solely by
+        # relay/edge_recover.py's rehide() -- which runs on RECOVERY, not at launch. So a
+        # freshly launched Edge had nobody to mark it, and every restart put the window
+        # back in the taskbar until something happened to trigger a recovery. This loop is
+        # the only thing that watches continuously, so it is where the flag belongs.
+        #
+        # The style change needs the window hidden for the instant it is applied; that is
+        # why SW_HIDE (0) appears here. It is never the FINAL state -- leaving it hidden
+        # makes Edge discard the tab's renderer and the next CDP call dies with
+        # TargetClosedError. Same sequence, same reasoning as _REHIDE_PS.
+        $ex = [K]::GetWindowLong($h, -20)
+        if (($ex -band 0x80) -eq 0) {
+            [K]::ShowWindow($h, 0) | Out-Null
+            [K]::SetWindowLong($h, -20, ($ex -bor 0x80) -band (-bnot 0x40000)) | Out-Null
             [K]::ShowWindow($h, 6) | Out-Null
         }
     }

@@ -74,8 +74,15 @@ def test_sw_hide_is_never_left_set():
     assert calls, "ShowWindow の呼び出しが無い"
     assert calls[-1] != "0", "最後が SW_HIDE のままだと描画が捨てられる: %s" % calls
 
-    keeper = _src(KEEPER)
-    assert "ShowWindow($h, 0)" not in keeper
+    # keeper にも同じ基準を適用する。最小化だけでは taskbar ボタンが残るため、keeper も
+    # WS_EX_TOOLWINDOW を立てるようになった（属性変更には一瞬の SW_HIDE が要る）。
+    # 禁じるのは「使うこと」ではなく「隠したまま終えること」。
+    keeper_calls = re.findall(r"ShowWindow\(\$h,\s*(\d+)\)", _src(KEEPER))
+    assert keeper_calls, "keeper に ShowWindow の呼び出しが無い"
+    assert keeper_calls[-1] != "0", "keeper が SW_HIDE で終えている: %s" % keeper_calls
+    for i, c in enumerate(keeper_calls):
+        if c == "0":
+            assert "6" in keeper_calls[i + 1:], "keeper が隠したまま戻していない: %s" % keeper_calls
 
 
 def test_the_bridge_actually_asks_for_its_own_edge():

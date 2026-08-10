@@ -1926,6 +1926,13 @@ def _looks_like_consent(text: str) -> bool:
     return any(m in t for m in CONSENT_MARKERS) or any(m in tl for m in CONSENT_MARKERS)
 
 
+# Work IQ surfaces its connection consent as a CHAIN of cards, not one: measured
+# 2026-08-10, seven (User, Copilot, Teams, SharePoint, OneDrive, Mail, Calendar),
+# each appearing only after the previous one is approved. The cap is the chain
+# length plus headroom, so a card that re-renders instead of resolving cannot spin.
+_CONSENT_CHAIN_MAX = int(os.environ.get("MCP_CONSENT_CHAIN_MAX", "12"))
+
+
 def _bridge_auto_consent() -> bool:
     """Auto-approve an MCP connection-consent card on the bridge's PAGE, mirroring
     RelayWorker._auto_consent's three tiers -- this is a connection-SELECT confirm, NOT a
@@ -1943,16 +1950,41 @@ def _bridge_auto_consent() -> bool:
     pg = PAGE
     if pg is None:
         return False
-    # Tier 0: an Allow (許可/Allow) button directly on the current page/card -> one click.
+    # Tier 0: Allow (許可/Allow) buttons directly on the current page/card.
+    #
+    # CLICK THEM ALL, not just the first. Work IQ is no longer one connection: approving it
+    # surfaces a CHAIN of cards -- measured 2026-08-10, seven of them, one after another
+    # (User -> Copilot -> Teams -> SharePoint -> OneDrive -> Mail -> Calendar), each
+    # appearing only once its predecessor is approved. Returning after a single click left
+    # the rest pending, the caller re-sent, saw a card again and reported consent_failed --
+    # and, worse, the unresolved card stayed as the LAST assistant block, so every later
+    # turn's settle loop read a consent card instead of an answer and ran to wait_for_idle's
+    # 1800s deadline. That is the /stream hang (448s, 428s, 954s, 949s -- all client-side
+    # timeouts, with the real answer sitting correctly in the transcript above the card).
+    #
+    # Bounded so a card that re-renders instead of resolving cannot spin here forever.
+    clicked_any = False
     try:
-        for label in ("許可", "Allow"):
-            btn = pg.locator('button:has-text("%s")' % label)
-            if btn.count():
-                btn.first.click()
-                pg.wait_for_timeout(4000)
-                return True
+        for _ in range(_CONSENT_CHAIN_MAX):
+            hit = False
+            for label in ("許可", "Allow"):
+                btn = pg.locator('button:has-text("%s")' % label).locator("visible=true")
+                if btn.count():
+                    # LAST, not first: the cards stack down the transcript and the newest --
+                    # the one actually awaiting an answer -- is at the bottom. Clicking the
+                    # first re-clicks an already-approved card near the top and never
+                    # advances the chain.
+                    btn.last.click()
+                    pg.wait_for_timeout(4000)
+                    clicked_any = hit = True
+                    break
+            if not hit:
+                break
+        if clicked_any:
+            return True
     except Exception:
-        pass
+        if clicked_any:
+            return True
     # Tier 1: DIRECT-HIT a cached connection-manager URL (skip if it now redirects to login --
     # that would be a genuine sign-in event, which this path must never surface for).
     try:
