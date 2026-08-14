@@ -206,3 +206,9 @@ _attic/
 # knowledge inside them should not be published. Kept on disk, out of the repo.
 skills/
 tests/test_copper_scatter_target.py
+
+# Research briefs and planning documents kept beside the code they describe, but not
+# published with it: they name internal priorities, effort estimates and unreleased
+# research directions. The implementation they produce IS committed -- only the brief
+# itself stays local.
+docs/research/
