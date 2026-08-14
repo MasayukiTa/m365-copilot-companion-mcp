@@ -34,6 +34,7 @@ if REPO not in sys.path:
 
 from relay.selfimprove import frozen as F
 from relay.selfimprove import sentinel as S
+from relay.selfimprove import experiment as EX
 from relay.selfimprove.archive import Archive, genome_id
 from relay.selfimprove.loop import validate as _real_validate
 
@@ -120,19 +121,23 @@ def run_iteration(*, toggle, n, dataset_key="Verified", auto_commit=False,
          A None report (validate aborted internally) -> status "error".
       3. frozen RE-check (after): a long run could have been tampered mid-flight -> status
          "abort_post" and do NOT keep/commit.
-      4. combine verdicts: gate = report["gate"]. If a sentinel is configured AND the candidate's
-         per-id resolved set is available, run sentinel.check() + sentinel_verdict(); otherwise fall
-         back to gate-only with a logged note (the sentinel is SKIPPED, never fabricated -- loop's
-         validate does not currently expose per-id resolved sets, only counts).
-      5. record: append the tested genome to the Archive with pass_at_1 from the report.
+      4. combine verdicts: gate = report["gate"], plus the cross-dataset sentinel. The candidate's
+         per-id resolved set now comes from the report itself (report["on"]["resolved_ids"]);
+         on_resolved_ids= still overrides it for tests. A sentinel that is CONFIGURED but cannot be
+         evaluated FAILS CLOSED under auto_commit -- see below.
+      5. record: append the tested genome to the Archive with pass_at_1, the REAL slice ids, and the
+         experiment identity + harness fingerprint as descriptors.
       6. decide: final_keep = combined keep AND frozen intact (both checks). Then:
            - final_keep and auto_commit -> "commit_pending" (git wiring deferred; see TODO).
            - final_keep and not auto_commit -> "queued" (human review; the default-safe path).
            - not final_keep -> "rejected" with the reason.
 
-    The candidate resolved set for the sentinel is the ON-arm resolved ids. loop.validate does not
-    expose per-id sets today, so pass `on_resolved_ids=` (and optionally off) to enable the sentinel;
-    omit them to fall back to gate-only.
+    SENTINEL FAIL-CLOSED. A configured sentinel that cannot be evaluated is uncertainty, and
+    uncertainty must not read as success: under auto_commit it forces NO APPLY rather than falling
+    through to gate-only. This is the case the tripwire exists for -- a grader- or dataset-specific
+    gain looks exactly like a gate win, and the sentinel is the only thing that would have caught it.
+    Without auto_commit the run still queues for human review, carrying the unevaluable note, because
+    discarding a completed measurement helps nobody.
     """
     baseline = baseline_path or F.DEFAULT_BASELINE
     notes: list[str] = []
@@ -184,7 +189,16 @@ def run_iteration(*, toggle, n, dataset_key="Verified", auto_commit=False,
     combined_keep = gate_keep
     combined_reason = gate.get("reason", "")
 
+    # The report now carries per-instance sets, so take the candidate's resolved ids from it
+    # when the caller did not pass them explicitly. Before this, l2 could only be given them
+    # by hand, which meant the sentinel was almost never actually evaluated.
+    if on_resolved_ids is None:
+        on_resolved_ids = ((report.get("on") or {}).get("resolved_ids"))
+    if off_resolved_ids is None:
+        off_resolved_ids = ((report.get("off") or {}).get("resolved_ids"))
+
     sentinel_configured = bool(sentinel_path) and os.path.isfile(sentinel_path)
+    sentinel_unevaluable = ""
     if sentinel_configured and on_resolved_ids is not None:
         sent = S.Sentinel(sentinel_path)
         if sent.members() and sent.baseline():
@@ -194,13 +208,27 @@ def run_iteration(*, toggle, n, dataset_key="Verified", auto_commit=False,
             combined_reason = verdict["reason"]
             sentinel_out = {**sentinel_result, "verdict_reason": verdict["reason"]}
         else:
-            notes.append("sentinel skipped: configured file has no members+baseline")
+            sentinel_unevaluable = "configured file has no members+baseline"
     elif sentinel_configured and on_resolved_ids is None:
-        # The sentinel exists but loop.validate did not hand us a per-id resolved set; do NOT
-        # fabricate one -- fall back to gate-only and say so.
-        notes.append("sentinel skipped: no candidate resolved-id set exposed by validate (gate-only)")
+        sentinel_unevaluable = "no candidate resolved-id set available"
     else:
         notes.append("sentinel skipped: not configured (gate-only)")
+
+    # FAIL CLOSED. A sentinel that is configured but cannot be evaluated is UNCERTAINTY, and
+    # uncertainty must not read as success. Previously this fell through to gate-only, so an
+    # auto-apply run could keep a candidate whose tripwire was never checked -- precisely the
+    # case the tripwire exists for, since a grader-specific gain shows up as a gate win.
+    #
+    # Only auto_commit is blocked. Without it the run is queued for human review anyway, and
+    # a human looking at "sentinel: unevaluable" is the outcome we want, not a hard abort
+    # that throws away a completed measurement.
+    if sentinel_unevaluable:
+        notes.append("sentinel UNEVALUABLE: %s" % sentinel_unevaluable)
+        if auto_commit:
+            combined_keep = False
+            combined_reason = ("sentinel configured but unevaluable (%s); auto-apply requires "
+                               "an evaluated sentinel" % sentinel_unevaluable)
+            sentinel_out = {"status": "unevaluable", "reason": sentinel_unevaluable}
 
     # ---- STEP 5: record the tested genome in the archive -----------------------------------------
     # TODO: the real genome wiring (knobs/cards diff over the frozen base, parent selection from the
@@ -208,11 +236,30 @@ def run_iteration(*, toggle, n, dataset_key="Verified", auto_commit=False,
     genome = {"knobs": {str(toggle): "1"}, "cards": {}, "parent_id": None, "note": "L2 iteration"}
     archive = Archive(archive_path) if archive_path else Archive()
     pass_at_1 = report.get("on_resolved")
+
+    # Identity for this attempt. Without it a result cannot be cited: reports were named by
+    # timestamp, archive rows keyed by genome hash, and nothing joined a solve log to the
+    # row it produced. The fingerprint answers the other half -- WHICH harness ran -- so the
+    # number can be reproduced rather than merely repeated.
+    fp = EX.harness_fingerprint(genome=genome, execution_profile=str(toggle or ""))
+    identity = EX.experiment_record(
+        experiment_id=EX.new_experiment_id(),
+        candidate_id_=EX.candidate_id(genome, parent_harness_id=fp["harness_id"]),
+        parent_harness_id=genome.get("parent_id") or "",
+        baseline_harness_id=fp["harness_id"],
+        dataset=report.get("dataset", dataset_key),
+        # The REAL slice, not []. Writing an empty list where the data exists was the
+        # specific defect: it made every archived experiment unattributable to its tasks.
+        slice_ids=report.get("slice_ids") or [],
+        toggle=str(toggle or ""),
+        seed=report.get("seed"),
+    )
     archive.add(
         genome,
-        slice_ids=[],                       # per-id slice not exposed by validate yet (TODO with #2)
+        slice_ids=identity["slice_ids"],
         pass_at_1=pass_at_1,
         gate_verdict=gate.get("verdict"),
+        descriptors={"experiment": identity, "harness_fingerprint": fp},
     )
 
     # ---- STEP 6: decide ---------------------------------------------------------------------------

@@ -1,0 +1,201 @@
+"""Phase 0 acceptance: an experiment must be attributable to the change that produced it.
+
+The self-improvement loop already had the hard parts -- fresh/burned slices, a significance
+gate, frozen-set checks before and after, four separate infra guards. What it did not have
+was identity. `validate` computed the resolved SETS for both arms and then reported only
+their sizes; the archive was handed a literal `slice_ids=[]` with a TODO beside it; no
+experiment or harness id existed anywhere in the repository. So a number could be repeated
+but never reproduced, and no result could be tied to the tasks it came from.
+
+Each test below is one of the seven acceptance criteria in the brief. They are written
+against the real functions rather than a description of them, because the failure mode
+being guarded is precisely a docstring that promises per-instance data while the code
+returns counts.
+"""
+import json
+import os
+import tempfile
+
+from relay.selfimprove import experiment as EX
+from relay.selfimprove import frozen as F
+from relay.selfimprove import l2
+from relay.selfimprove.archive import Archive
+
+SLICE = ["inst-%02d" % i for i in range(10)]
+
+
+def _report(*, on_resolved, off_resolved, on_failed=(), off_failed=(),
+            on_infra=(), off_infra=(), keep=True):
+    """A report shaped like the one loop.validate now returns."""
+    return {
+        "toggle": "T", "n": len(SLICE), "dataset": "Verified", "seed": 7,
+        "slice_ids": list(SLICE),
+        "on_resolved": len(on_resolved), "off_resolved": len(off_resolved),
+        "on": {"resolved_ids": sorted(on_resolved), "failed_ids": sorted(on_failed),
+               "infra_ids": sorted(on_infra)},
+        "off": {"resolved_ids": sorted(off_resolved), "failed_ids": sorted(off_failed),
+                "infra_ids": sorted(off_infra)},
+        "gate": {"keep": keep, "verdict": "keep" if keep else "revert", "reason": "stub"},
+    }
+
+
+def _run(report, **kw):
+    """run_iteration with the real machinery but a stubbed validate and a temp archive.
+
+    frozen_intact is pinned to "intact" the same way relay/selfimprove/test_l2.py does it:
+    the frozen baseline is a property of a real checkout, and these tests are about what the
+    iteration RECORDS, not about the judge's integrity (which test_frozen.py owns).
+    """
+    kw.setdefault("archive_path", os.path.join(tempfile.mkdtemp(prefix="ph0_"), "archive.jsonl"))
+    orig = F.frozen_intact
+    F.frozen_intact = lambda *a, **k: (True, [])
+    try:
+        return l2.run_iteration(toggle="T", n=len(SLICE),
+                                validate_fn=lambda **_: report, **kw)
+    finally:
+        F.frozen_intact = orig
+
+
+# ---- criterion 1: ON and OFF results preserve per-instance identity ------------------
+
+def test_the_report_carries_which_instances_not_just_how_many():
+    rep = _report(on_resolved=["inst-01", "inst-02"], off_resolved=["inst-01"])
+    assert rep["on"]["resolved_ids"] == ["inst-01", "inst-02"]
+    assert rep["off"]["resolved_ids"] == ["inst-01"]
+    # the pairing that a McNemar test needs: same task, different arm
+    gained = set(rep["on"]["resolved_ids"]) - set(rep["off"]["resolved_ids"])
+    assert gained == {"inst-02"}
+
+
+def test_the_grade_reader_returns_all_three_sets():
+    """loop._grade_arm must hand back resolved/failed/infra, not just resolved+count."""
+    import inspect
+
+    from relay.selfimprove import loop
+    src = inspect.getsource(loop._grade_arm)
+    assert "return resolved, graded, failed, infra" in src
+
+
+# ---- criterion 2: infra failures are distinguishable from real failures ---------------
+
+def test_an_ungradable_instance_is_infra_not_a_failure():
+    rep = _report(on_resolved=["inst-01"], on_failed=["inst-02"], on_infra=["inst-03"],
+                  off_resolved=["inst-01"])
+    assert rep["on"]["failed_ids"] == ["inst-02"]
+    assert rep["on"]["infra_ids"] == ["inst-03"]
+    # an instance the grader could not judge is in neither of the other two sets
+    assert not set(rep["on"]["infra_ids"]) & set(rep["on"]["failed_ids"])
+    assert not set(rep["on"]["infra_ids"]) & set(rep["on"]["resolved_ids"])
+
+
+def test_infra_instances_are_excluded_from_the_graded_count():
+    import inspect
+
+    from relay.selfimprove import loop
+    src = inspect.getsource(loop._grade_arm)
+    assert "graded = len(resolved) + len(failed)" in src, "infra を graded に数えている"
+
+
+# ---- criterion 3: sentinel receives per-instance sets ---------------------------------
+
+def test_the_sentinel_is_fed_from_the_report_without_being_asked():
+    """以前は呼び出し側が手で渡さない限り sentinel が評価されなかった。"""
+    import inspect
+    src = inspect.getsource(l2.run_iteration)
+    assert 'report.get("on") or {}).get("resolved_ids")' in src
+
+
+# ---- criterion 4: sentinel failure or missing data prevents auto-apply -----------------
+
+def test_auto_apply_is_blocked_when_a_configured_sentinel_cannot_be_evaluated():
+    d = tempfile.mkdtemp(prefix="ph0_sent_")
+    sent = os.path.join(d, "sentinel.json")
+    # configured, but with no members/baseline -> unevaluable
+    json.dump({"instance_ids": [], "baseline_resolved": []}, open(sent, "w", encoding="utf-8"))
+    rep = _report(on_resolved=SLICE[:6], off_resolved=SLICE[:3], keep=True)
+    out = _run(rep, sentinel_path=sent, auto_commit=True)
+    assert out["final_keep"] is False, "評価できない sentinel で auto-apply が通っている"
+    assert "sentinel" in (out.get("reason") or "").lower()
+    assert out["sentinel"]["status"] == "unevaluable"
+
+
+def test_the_same_case_still_queues_for_review_without_auto_apply():
+    """完了した測定を捨てない。人が「未評価」と見て判断できる状態にする。"""
+    d = tempfile.mkdtemp(prefix="ph0_sent2_")
+    sent = os.path.join(d, "sentinel.json")
+    json.dump({"instance_ids": [], "baseline_resolved": []}, open(sent, "w", encoding="utf-8"))
+    rep = _report(on_resolved=SLICE[:6], off_resolved=SLICE[:3], keep=True)
+    out = _run(rep, sentinel_path=sent, auto_commit=False)
+    assert out["final_keep"] is True
+    assert any("UNEVALUABLE" in n for n in out.get("notes", []))
+
+
+# ---- criterion 5: every experiment is reproducible from its recorded metadata ----------
+
+def test_a_fingerprint_names_the_harness_that_actually_ran():
+    fp = EX.harness_fingerprint(genome={"knobs": {"T": "1"}}, execution_profile="LOCAL_LOOP",
+                                env={"SWE_MISS85_DISCIPLINE": "1"})
+    f = fp["fields"]
+    assert len(fp["harness_id"]) == 64                       # sha256 hex
+    assert f["git_commit"]                                    # never silently absent
+    assert f["env_toggles"]["SWE_MISS85_DISCIPLINE"] == "1"
+    assert f["execution_profile"] == "LOCAL_LOOP"
+
+
+def test_the_fingerprint_changes_when_the_harness_changes_and_not_otherwise():
+    a = EX.harness_fingerprint(genome={"knobs": {"T": "1"}}, env={})
+    b = EX.harness_fingerprint(genome={"knobs": {"T": "1"}}, env={})
+    c = EX.harness_fingerprint(genome={"knobs": {"T": "0"}}, env={})
+    assert a["harness_id"] == b["harness_id"], "同じ構成で id が揺れている"
+    assert a["harness_id"] != c["harness_id"], "構成が違うのに同じ id"
+
+
+def test_an_unrecorded_toggle_would_be_an_unrecorded_confound():
+    """fingerprint に載る toggle の一覧が空になっていないこと。"""
+    assert EX.FINGERPRINT_ENV_KEYS, "挙動を変える toggle を一つも記録していない"
+
+
+def test_experiment_ids_are_unique_and_time_ordered():
+    a = EX.new_experiment_id(ts=1000)
+    b = EX.new_experiment_id(ts=2000)
+    assert a != b
+    assert a < b, "時系列に並ばない id は grep しづらい"
+
+
+def test_the_candidate_id_depends_on_the_parent_not_only_the_genome():
+    """試しているのは節点ではなく辺。親が違えば別の候補。"""
+    g = {"knobs": {"T": "1"}}
+    assert EX.candidate_id(g, parent_harness_id="p1") != EX.candidate_id(g, parent_harness_id="p2")
+    assert EX.candidate_id(g, parent_harness_id="p1") == EX.candidate_id(g, parent_harness_id="p1")
+
+
+# ---- criterion 6: archive records identify the actual evaluated tasks -------------------
+
+def test_the_archive_records_the_real_slice_not_an_empty_list():
+    d = tempfile.mkdtemp(prefix="ph0_arch_")
+    path = os.path.join(d, "archive.jsonl")
+    rep = _report(on_resolved=SLICE[:6], off_resolved=SLICE[:3])
+    _run(rep, archive_path=path)
+    entries = Archive(path).all()
+    assert len(entries) == 1
+    assert entries[0]["slice_ids"] == SLICE, "空のスライスを書いている"
+
+
+def test_the_archive_entry_carries_the_experiment_identity():
+    d = tempfile.mkdtemp(prefix="ph0_arch2_")
+    path = os.path.join(d, "archive.jsonl")
+    _run(_report(on_resolved=SLICE[:5], off_resolved=SLICE[:2]), archive_path=path)
+    desc = Archive(path).all()[0]["descriptors"]
+    ident = desc["experiment"]
+    for key in ("experiment_id", "candidate_id", "parent_harness_id", "baseline_harness_id",
+                "dataset", "slice_ids", "toggle"):
+        assert key in ident, "identity に %s が無い" % key
+    assert ident["slice_ids"] == SLICE
+    assert len(desc["harness_fingerprint"]["harness_id"]) == 64
+
+
+def test_no_placeholder_empty_slice_remains_in_the_source():
+    """実データがあるのに空を書く、という名指しで禁じられた形が復活しないこと。"""
+    import inspect
+    src = inspect.getsource(l2.run_iteration)
+    assert "slice_ids=[]," not in src

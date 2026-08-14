@@ -165,6 +165,7 @@ jobs:
             relay/selfimprove/test_frozen.py \
             relay/selfimprove/test_guards.py \
             relay/selfimprove/test_l2.py \
+            relay/selfimprove/test_measurement_integrity.py \
             relay/selfimprove/test_l2_cron.py \
             relay/selfimprove/test_policy.py \
             relay/selfimprove/test_propose.py \
