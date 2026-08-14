@@ -91,13 +91,19 @@ def component(name: str, default: str = "") -> str:
     return active_manifest().get("components", {}).get(name, default)
 
 
-def write_active(manifest: dict, path: str = ACTIVE_PATH) -> str:
+def write_active(manifest: dict, path: str | None = None) -> str:
     """Install a manifest as the active harness. Returns its harness_id.
 
     Validates first: activating a manifest that names a forbidden component would be the
     single worst thing this module could do, and it is exactly what an unchecked write
     would allow.
+
+    `path` defaults to None and is resolved HERE rather than in the signature. A default of
+    `path=ACTIVE_PATH` binds the module attribute once at import, so anything that later
+    redirects ACTIVE_PATH -- a test, or an operator pointing at a second profile -- is
+    silently ignored and the manifest lands somewhere nobody is looking.
     """
+    path = path or ACTIVE_PATH
     M.validate(manifest)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
