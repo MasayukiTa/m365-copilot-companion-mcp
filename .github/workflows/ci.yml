@@ -103,6 +103,7 @@ jobs:
             ui/test_fleet_cockpit_approval_center.py \
             bench/companionbench/test_companionbench.py \
             bench/companionbench/test_office_episodes.py \
+            bench/companionbench/test_runner.py \
             bench/companionbench/test_runtime_episodes.py \
             bench/gaia/test_run_pipeline.py \
             bench/test_local_review_transport.py \
