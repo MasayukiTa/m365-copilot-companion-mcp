@@ -200,7 +200,24 @@ def _upsert_index(theme, slug, count, when, state_dir):
         pass
 
 
-def load_notes(theme, max_items=5, state_dir=".fleet", goal="", include_index=True):
+def _default_max_items():
+    """How many entries to prime, from the ACTIVE HARNESS rather than a constant.
+
+    This is the point where a genome stops being a record and starts being a behaviour.
+    An evolvable parameter that no running code reads produces A/B arms that are the same
+    program, and every experiment over it measures noise.
+
+    Falls back to 5 if the harness config is unavailable -- memory is an enhancement and
+    must not be able to break a run by failing to resolve.
+    """
+    try:
+        from relay.selfimprove.runtime_config import memory_max_items
+        return memory_max_items()
+    except Exception:
+        return 5
+
+
+def load_notes(theme, max_items=None, state_dir=".fleet", goal="", include_index=True):
     """Text block to prime into a goal: this theme's recent entries, plus the index of
     what else is remembered. Returns "" when there is nothing. Never raises.
 
@@ -209,6 +226,8 @@ def load_notes(theme, max_items=5, state_dir=".fleet", goal="", include_index=Tr
     Without the index every theme is an island and the store stops compounding.
     """
     try:
+        if max_items is None:
+            max_items = _default_max_items()
         theme, slug = _resolve(theme, goal)
         entries = _entry_lines(_read(_theme_path(slug, state_dir)))[:max_items]
         index = _read(_index_path(state_dir)).strip() if include_index else ""
