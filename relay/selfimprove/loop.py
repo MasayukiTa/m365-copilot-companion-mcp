@@ -90,16 +90,28 @@ def _run_solve_arm(spec_path, targets_file, preds_dir, tag, toggle, on, chunk, c
 def _grade_arm(preds_dir, targets_file, dataset, run_id, max_wait_min=200):
     """Run the the eval host batch grade synchronously.
 
-    Returns (resolved_ids, graded_count): the set of RESOLVED instance ids, and how many instances
-    got a REAL verdict (RESOLVED or 'not') for this run_id. graded_count == 0 means the grade never
-    actually ran -- the eval host unreachable, scp failed, EVALERR-everything -- i.e. an INFRA fault, NOT a
-    real 0%. The caller must distinguish that from a genuine low pass rate (which has 'not' verdicts).
+    Returns (resolved_ids, graded_count, failed_ids, infra_ids) for this run_id:
+
+      resolved_ids  verdict RESOLVED
+      failed_ids    verdict 'not' -- a real task failure
+      infra_ids     anything else (EVALERR, crash, missing) -- the grader did not judge it
+      graded_count  len(resolved) + len(failed), i.e. how many got a REAL verdict
+
+    graded_count == 0 means the grade never actually ran -- the eval host unreachable, scp failed,
+    EVALERR-everything -- i.e. an INFRA fault, NOT a real 0%. The caller must distinguish that from a
+    genuine low pass rate (which has 'not' verdicts).
+
+    The three SETS matter as much as the counts. A paired test, the sentinel, and any later
+    failure mining all need to know WHICH instances, not how many; returning only totals is
+    what left the sentinel unevaluable and the archive slice empty.
     """
     args = [VENVPY, GRADER, "--preds-dir", preds_dir, "--targets-file", targets_file,
             "--dataset-name", dataset, "--max-workers", "12", "--run-id", run_id,
             "--max-wait-min", str(max_wait_min)]
     subprocess.run(args, cwd=REPO)
     resolved = set()
+    failed = set()
+    infra = set()
     graded = 0
     if os.path.isfile(GRADE_RESULTS):
         latest = {}
@@ -115,8 +127,15 @@ def _grade_arm(preds_dir, targets_file, dataset, run_id, max_wait_min=200):
                 latest[r["instance_id"]] = r["verdict"]
         resolved = {i for i, v in latest.items() if v == "RESOLVED"}
         # a REAL verdict is RESOLVED or 'not'; EVALERR / missing = the grader did not actually judge it.
-        graded = sum(1 for v in latest.values() if v in ("RESOLVED", "not"))
-    return resolved, graded
+        failed = {i for i, v in latest.items() if v == "not"}
+        # Per-INSTANCE infra, which the arm-level guards below cannot see: an instance the
+        # grader could not judge (EVALERR, crash, timeout) is not a task failure, and
+        # counting it as one silently depresses the arm it happened to hit. The arm guards
+        # catch "the grade never ran at all"; this catches "the grade ran and could not
+        # judge these three".
+        infra = {i for i, v in latest.items() if v not in ("RESOLVED", "not")}
+        graded = len(resolved) + len(failed)
+    return resolved, graded, failed, infra
 
 
 def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
@@ -155,7 +174,8 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
         log("ON solve captured 0 predictions -> INFRA ABORT (disk floor / wedge); NOT burning, NOT gating")
         return {"status": "infra_abort", "arm": "ON", "reason": "ON solve produced no predictions (infra)",
                 "burned": False, "report": None}
-    on_resolved, on_graded = _grade_arm(on_dir, targets_file, dataset, "sion" + time.strftime("%m%d%H%M"))
+    on_resolved, on_graded, on_failed, on_infra = _grade_arm(
+        on_dir, targets_file, dataset, "sion" + time.strftime("%m%d%H%M"))
     log("ON resolved: %d/%d (graded %d)" % (len(on_resolved), len(fresh), on_graded))
     # GRADE-INFRA GUARD: 0 real verdicts means the grade never ran (the eval host down / scp failed / EVALERR-
     # everything) -- NOT a real 0%. Gating/burning on a failed grade would record a garbage A/B and burn
@@ -176,7 +196,8 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
         log("OFF solve captured 0 predictions -> INFRA ABORT; NOT burning, NOT gating")
         return {"status": "infra_abort", "arm": "OFF", "reason": "OFF solve produced no predictions (infra)",
                 "burned": False, "report": None}
-    off_resolved, off_graded = _grade_arm(off_dir, targets_file, dataset, "sioff" + time.strftime("%m%d%H%M"))
+    off_resolved, off_graded, off_failed, off_infra = _grade_arm(
+        off_dir, targets_file, dataset, "sioff" + time.strftime("%m%d%H%M"))
     log("OFF resolved: %d/%d (graded %d)" % (len(off_resolved), len(fresh), off_graded))
     if off_graded == 0:
         log("OFF grade produced 0 real verdicts -> INFRA ABORT (the eval host unreachable / scp failed); NOT gating, NOT burning")
@@ -186,7 +207,19 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
 
     gate = G.significance_gate(on_resolved, off_resolved, fresh, alpha=alpha, min_n=min_n, min_pp=min_pp)
     burned.add(fresh, reason="selfimprove A/B %s" % toggle, ts=int(time.time()))
-    report = {**plan, "on_resolved": len(on_resolved), "off_resolved": len(off_resolved), "gate": gate}
+    # PER-INSTANCE, not just counts. The sets were already computed above and then thrown
+    # away, which is why the sentinel had nothing to check, the archive recorded an empty
+    # slice, and no paired test was possible: every one of those needs identity, not a
+    # total. Counts stay for back-compat with existing readers.
+    report = {
+        **plan,
+        "on_resolved": len(on_resolved), "off_resolved": len(off_resolved), "gate": gate,
+        "slice_ids": list(fresh),
+        "on": {"resolved_ids": sorted(on_resolved), "failed_ids": sorted(on_failed),
+               "infra_ids": sorted(on_infra)},
+        "off": {"resolved_ids": sorted(off_resolved), "failed_ids": sorted(off_failed),
+                "infra_ids": sorted(off_infra)},
+    }
     out = os.path.join(SWEDIR, "selfimprove_report_%s.json" % time.strftime("%m%d%H%M"))
     json.dump(report, open(out, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     log("GATE verdict=%s keep=%s | %s" % (gate["verdict"], gate["keep"], gate["reason"]))
