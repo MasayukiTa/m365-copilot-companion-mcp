@@ -47,16 +47,31 @@ STATES = (KEEP, REJECT, INCONCLUSIVE, INFRA_ABORT, SECURITY_REJECT,
 ACTIVATING = frozenset({KEEP})
 
 
+def _evaluated(result) -> bool:
+    """True only when a gate actually reports something.
+
+    `{}` is not an evaluation. It was accepted as one, so any caller could hand in an empty
+    dict -- including by accident, since that is what "no findings" looks like -- and buy a
+    pass for a gate that never ran. A gate must say what it checked.
+    """
+    return isinstance(result, dict) and bool(result)
+
+
 def decide(*, gate=None, sentinel=None, security=None, regression=None,
-           infra=None, frozen_ok=True, auto_apply=False) -> dict:
+           infra=None, frozen_ok=True, auto_apply=False, will_activate=False) -> dict:
     """Combine the gates into one state plus the reason it was reached.
 
     Every argument is optional and None means "not evaluated", which is deliberately NOT
-    the same as "passed". Under auto_apply an unevaluated REQUIRED gate escalates to
-    NEEDS_HUMAN_REVIEW rather than being skipped -- the same fail-closed rule Phase 0
-    applied to the sentinel, for the same reason: absence of evidence reads as success
-    unless something makes it not.
+    the same as "passed", and neither is `{}` -- an empty dict is what "no findings" looks
+    like and it used to buy a pass for a gate that never ran.
+
+    `will_activate` is what actually gates the requirements, NOT auto_apply. Those were
+    separate flags, so EvolutionController(activate=True, auto_apply=False) skipped the
+    security requirement entirely and then wrote the manifest. The dangerous act is
+    ACTIVATION; whether a human pressed the button is irrelevant to whether the candidate
+    was checked. Either flag now demands the same evidence.
     """
+    strict = bool(auto_apply or will_activate)
     reasons = []
 
     # 0. the judge itself
@@ -69,30 +84,52 @@ def decide(*, gate=None, sentinel=None, security=None, regression=None,
         return _out(INFRA_ABORT, infra.get("reason") or "infrastructure abort", reasons)
 
     # 2. security, before any question of usefulness
-    if security is not None:
+    if _evaluated(security):
         if security.get("regressed"):
             return _out(SECURITY_REJECT,
                         security.get("reason") or "a security episode regressed", reasons)
-        reasons.append("security: no regression")
-    elif auto_apply:
+        # A regression check alone is not a security gate: if every security episode fails
+        # on BOTH arms there is no regression to find, and a candidate that passes none of
+        # them sails through. Require positive evidence that something actually held.
+        #
+        # "no security episode was RUN" and "none of them PASSED" are different facts and
+        # must not collapse into one verdict. Zero comparable episodes is an unevaluated
+        # gate -- which under strict escalates for review -- while zero passes out of some
+        # is a rejection. Conflating them would reject every suite that has no security
+        # episodes at all, and hide the case worth catching.
+        comparable = security.get("comparable")
+        passed = security.get("passed_count")
+        if comparable is not None and not comparable:
+            if strict:
+                return _out(NEEDS_HUMAN_REVIEW,
+                            "no security episode was comparable across the arms; there is "
+                            "nothing to conclude from", reasons)
+            reasons.append("security: nothing comparable to check")
+        elif passed is not None and not passed:
+            return _out(SECURITY_REJECT,
+                        "no security episode passed on the candidate; a regression check "
+                        "cannot see a floor that was already zero", reasons)
+        else:
+            reasons.append("security: no regression")
+    elif strict:
         return _out(NEEDS_HUMAN_REVIEW,
-                    "security was not evaluated; auto-apply requires it", reasons)
+                    "security was not evaluated; activation requires it", reasons)
 
     # 3. previously-passing work must still pass
-    if regression is not None:
+    if _evaluated(regression):
         if regression.get("regressed"):
             return _out(REGRESSION_REJECT,
                         regression.get("reason") or "a previously-passing episode broke",
                         reasons)
         reasons.append("regression: none")
-    elif auto_apply:
+    elif strict:
         return _out(NEEDS_HUMAN_REVIEW,
-                    "the regression pool was not run; auto-apply requires it", reasons)
+                    "the regression pool was not run; activation requires it", reasons)
 
     # 4. the cross-dataset canary
     if sentinel is not None:
         if sentinel.get("unevaluable"):
-            if auto_apply:
+            if strict:
                 return _out(NEEDS_HUMAN_REVIEW,
                             "sentinel configured but unevaluable: uncertainty must not read "
                             "as success", reasons)

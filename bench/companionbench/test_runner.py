@@ -249,8 +249,10 @@ def test_the_evaluator_plugs_into_the_controller(monkeypatch):
         target_failure_class="missing_evidence",
         evaluate=R.make_evaluator(_agent, tmpdir=tmp, min_n=1),
     )
-    # identical behaviour on both arms -> no evidence of improvement, and that is correct
-    assert out["decision"]["state"] in (Dec.INCONCLUSIVE, Dec.REJECT)
+    # identical behaviour on both arms -> no evidence of improvement, and that is correct.
+    # NEEDS_HUMAN_REVIEW is also acceptable here: with no security episodes among the stubs
+    # there is nothing for that gate to report, and an unevaluated gate no longer passes.
+    assert out["decision"]["state"] in (Dec.INCONCLUSIVE, Dec.REJECT, Dec.NEEDS_HUMAN_REVIEW)
     assert out["result"]["paired_ids"]
 
 

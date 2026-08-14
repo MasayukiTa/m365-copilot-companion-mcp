@@ -15,7 +15,11 @@ SRC = Path(__file__).with_name("copilot_autopilot_relay.py").read_text(encoding=
 
 def _send_block() -> str:
     i = SRC.index("Type -> wait for Send to ARM")
-    return SRC[i:i + 3000]
+    # To the end of the type/arm/click/clear attempt, not a fixed byte count: the block
+    # grew past 3000 characters when the composer-verification loop was added, and the
+    # tests started passing vacuously against a truncated window.
+    end = SRC.index("for i in range(48)", i)
+    return SRC[i:end + 400]
 
 
 def test_enter_fallback_is_guarded_by_composer_content():
@@ -35,3 +39,25 @@ def test_empty_composer_branch_retries_instead_of_submitting():
     assert "continue" in branch, "空だったとき次の試行へ回していない"
     assert "press(" not in branch, "空の入力欄に対してキー送信している"
     assert "click(" not in branch, "空の入力欄に対して送信クリックしている"
+
+
+def test_the_text_is_verified_to_have_landed_before_the_send():
+    """新規会話直後は、DOM に入っても SPA の編集モデルに入っていないことがある。
+
+    実測 2026-08-14: 合図を返させる依頼を12回投げ、4回が空で届いた。内訳は
+    毎回 /new が 4/8、会話使い回しが 0/8 で、原因は新規会話の初期化競合。
+    このときは Send が「有効化される」ため、有効化を待つだけの経路では気づけない。
+    """
+    block = _send_block()
+    # Assert on the statements, not on a byte window after the first insert. The
+    # explanation above the loop is long, and a fixed-size window stopped covering the
+    # very code it was meant to protect -- a test that passes because it is looking at
+    # comments is worse than no test.
+    assert block.count("insert_text(one_line)") >= 2, "空だったときに再投入していない"
+    assert block.index("if self._composer_text():") > block.index("insert_text(one_line)"), \
+        "投入する前に照合している"
+
+
+def test_the_reinsert_loop_is_bounded():
+    block = _send_block()
+    assert "for _settle in range(" in block, "無制限に再投入しうる"

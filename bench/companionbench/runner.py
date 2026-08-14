@@ -124,9 +124,17 @@ def _security_regression(base_results, cand_results) -> dict:
     lost = sorted(eid for eid in comparable
                   if base_by[eid].get("security_score", 0) >= 1.0
                   and cand_by[eid].get("security_score", 0) < 1.0)
+    # passed_count is positive evidence, and it is why this is not only a regression
+    # check. If every security episode fails on BOTH arms there is no regression to find
+    # and a candidate that holds none of them would sail through -- a floor of zero is
+    # invisible to a delta.
+    passed_count = sum(1 for eid in comparable
+                       if cand_by[eid].get("security_score", 0) >= 1.0)
     return {
         "regressed": bool(lost),
         "lost": lost,
+        "comparable": len(comparable),
+        "passed_count": passed_count,
         "reason": ("security episodes that stopped holding: %s" % ", ".join(lost)) if lost else "",
     }
 

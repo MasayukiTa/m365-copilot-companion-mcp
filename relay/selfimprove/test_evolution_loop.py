@@ -222,15 +222,20 @@ def _gate(keep=True, verdict="significant"):
     return {"keep": keep, "verdict": verdict, "reason": "stub"}
 
 
+def _clean():
+    return {"sentinel": {"regressed": False},
+            "security": {"regressed": False, "passed_count": 2},
+            "regression": {"regressed": False}}
+
+
 def test_everything_passing_activates():
-    d = D.decide(gate=_gate(), sentinel={}, security={}, regression={})
+    d = D.decide(gate=_gate(), **_clean())
     assert d["state"] == D.KEEP and d["may_activate"]
 
 
 def test_a_security_regression_beats_any_improvement():
     """通過率が上がっても、注入防御を壊した変更は取引の対象ではない。"""
-    d = D.decide(gate=_gate(keep=True), security={"regressed": True},
-                 regression={}, sentinel={})
+    d = D.decide(gate=_gate(keep=True), **{**_clean(), "security": {"regressed": True}})
     assert d["state"] == D.SECURITY_REJECT and not d["may_activate"]
 
 
@@ -247,14 +252,12 @@ def test_a_tampered_judge_invalidates_the_whole_run():
 
 def test_a_null_result_is_inconclusive_not_a_rejection():
     """REJECT と記録すると、正しいかもしれない方向を避けるよう学習させてしまう。"""
-    d = D.decide(gate=_gate(keep=False, verdict="suggestive"),
-                 security={}, regression={}, sentinel={})
+    d = D.decide(gate=_gate(keep=False, verdict="suggestive"), **_clean())
     assert d["state"] == D.INCONCLUSIVE and not d["may_activate"]
 
 
 def test_a_real_negative_is_a_rejection():
-    d = D.decide(gate=_gate(keep=False, verdict="negative"),
-                 security={}, regression={}, sentinel={})
+    d = D.decide(gate=_gate(keep=False, verdict="negative"), **_clean())
     assert d["state"] == D.REJECT
 
 
@@ -265,29 +268,28 @@ def test_auto_apply_requires_security_to_have_been_evaluated():
 
 
 def test_auto_apply_requires_the_regression_pool_to_have_run():
-    d = D.decide(gate=_gate(), security={}, sentinel={}, auto_apply=True)
+    d = D.decide(gate=_gate(), security={"regressed": False, "passed_count": 2},
+                 sentinel={"regressed": False}, auto_apply=True)
     assert d["state"] == D.NEEDS_HUMAN_REVIEW
     assert "regression" in d["reason"]
 
 
 def test_an_unevaluable_sentinel_blocks_auto_apply_but_not_review():
     unevaluable = {"unevaluable": True}
-    auto = D.decide(gate=_gate(), security={}, regression={}, sentinel=unevaluable,
-                    auto_apply=True)
+    auto = D.decide(gate=_gate(), **{**_clean(), "sentinel": unevaluable}, auto_apply=True)
     assert auto["state"] == D.NEEDS_HUMAN_REVIEW
-    manual = D.decide(gate=_gate(), security={}, regression={}, sentinel=unevaluable)
+    manual = D.decide(gate=_gate(), **{**_clean(), "sentinel": unevaluable})
     assert manual["state"] == D.KEEP
     assert any("unevaluable" in r for r in manual["passed_gates"])
 
 
 def test_a_sentinel_regression_is_its_own_state():
-    d = D.decide(gate=_gate(), security={}, regression={},
-                 sentinel={"regressed": True})
+    d = D.decide(gate=_gate(), **{**_clean(), "sentinel": {"regressed": True}})
     assert d["state"] == D.SENTINEL_REJECT
 
 
 def test_a_regression_pool_break_is_its_own_state():
-    d = D.decide(gate=_gate(), security={}, regression={"regressed": True}, sentinel={})
+    d = D.decide(gate=_gate(), **{**_clean(), "regression": {"regressed": True}})
     assert d["state"] == D.REGRESSION_REJECT
 
 
@@ -302,3 +304,23 @@ def test_a_campaign_is_read_by_its_shape_not_its_keep_rate():
                                                        {"state": D.INFRA_ABORT}] * 1)
     assert s["total"] == 9 and s["activated"] == 1
     assert s["inconclusive_share"] > 0.7
+
+
+def test_no_security_episodes_is_unevaluated_not_a_rejection():
+    """『1件も走らなかった』と『1件も通らなかった』は別の事実。混ぜると、
+    セキュリティエピソードを持たないスイートが全部 REJECT になる。"""
+    none_run = {"regressed": False, "comparable": 0, "passed_count": 0}
+    strict = D.decide(gate=_gate(), sentinel={"regressed": False},
+                      regression={"regressed": False}, security=none_run, auto_apply=True)
+    assert strict["state"] == D.NEEDS_HUMAN_REVIEW
+    lenient = D.decide(gate=_gate(), sentinel={"regressed": False},
+                       regression={"regressed": False}, security=none_run)
+    assert lenient["state"] == D.KEEP
+
+
+def test_a_floor_of_zero_passes_is_rejected():
+    """全滅は差分に映らない。回帰検査だけでは床がゼロなのを見抜けない。"""
+    d = D.decide(gate=_gate(), sentinel={"regressed": False},
+                 regression={"regressed": False},
+                 security={"regressed": False, "comparable": 3, "passed_count": 0})
+    assert d["state"] == D.SECURITY_REJECT

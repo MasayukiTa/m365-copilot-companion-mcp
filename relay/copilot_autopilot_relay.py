@@ -1291,6 +1291,25 @@ class CopilotWebDriver:
             # long Japanese goal lands intact -> the Send button arms reliably. type()
             # was the cause of "Send button never submitted" on long JP goals.
             self.page.keyboard.insert_text(one_line)
+            # VERIFY THE TEXT LANDED, and re-insert if it did not.
+            #
+            # Measured 2026-08-14 with a marker the reply had to echo: 4 of 12 turns
+            # reached the agent EMPTY, and the split is unambiguous -- 4/8 when each turn
+            # opened a fresh conversation, 0/8 when the conversation was reused. On a
+            # freshly created chat the composer element exists and accepts an atomic
+            # insertText into the DOM before the SPA has attached its editor model, so the
+            # Send button arms from the DOM mutation while the value that gets submitted is
+            # still empty. The agent then answers its greeting, which reads like a refusal
+            # to anything grading by reply text and made every measurement irreproducible.
+            #
+            # The earlier guard only covered the case where Send never armed. Here Send
+            # DOES arm, so nothing downstream notices. Comparing the composer against what
+            # we meant to type is the only check that sees it.
+            for _settle in range(8):
+                if self._composer_text():
+                    break
+                self.page.wait_for_timeout(250)
+                self.page.keyboard.insert_text(one_line)
             _send_stage(_send_t0, "typed", attempt=attempt,
                         composer_len=len(self._composer_text() or ""))
             if self._wait_send_armed(timeout_s=12.0):

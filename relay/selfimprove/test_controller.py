@@ -33,8 +33,15 @@ def _run(ctl, result, genome=None, **kw):
 
 
 def _all_gates_pass():
+    """Gates that actually SAY something.
+
+    `{}` used to count as "evaluated and clean". It does not any more: an empty dict is
+    exactly what "no findings" looks like, so it bought a pass for a gate that never ran.
+    """
     return {"gate": {"keep": True, "verdict": "significant", "reason": "ok"},
-            "sentinel": {}, "security": {}, "regression": {}}
+            "sentinel": {"regressed": False},
+            "security": {"regressed": False, "passed_count": 3, "comparable": 3},
+            "regression": {"regressed": False, "lost": []}}
 
 
 @pytest.fixture(autouse=True)
@@ -84,9 +91,36 @@ def test_an_inconclusive_result_does_not_activate():
 
 
 def test_auto_apply_without_security_evaluation_escalates_instead_of_proceeding():
-    result = {"gate": {"keep": True, "verdict": "significant"}, "regression": {}}
+    result = {"gate": {"keep": True, "verdict": "significant"},
+              "regression": {"regressed": False}}
     out = _run(_controller(activate=True, auto_apply=True), result)
     assert out["decision"]["state"] == D.NEEDS_HUMAN_REVIEW
+    assert out["activated"] is False
+
+
+def test_activation_alone_also_requires_security_even_without_auto_apply():
+    """有効化こそが危険な行為。自動かどうかは、検査したかどうかと無関係。"""
+    result = {"gate": {"keep": True, "verdict": "significant"},
+              "regression": {"regressed": False}}
+    out = _run(_controller(activate=True, auto_apply=False), result)
+    assert out["decision"]["state"] == D.NEEDS_HUMAN_REVIEW
+    assert out["activated"] is False
+
+
+def test_an_empty_gate_dict_is_not_an_evaluation():
+    """{} は「異常なし」の見た目そのもの。走らなかったゲートに合格を与えない。"""
+    result = {"gate": {"keep": True, "verdict": "significant"},
+              "security": {}, "regression": {}}
+    out = _run(_controller(activate=True), result)
+    assert out["decision"]["state"] == D.NEEDS_HUMAN_REVIEW
+
+
+def test_a_candidate_that_holds_no_security_episode_is_rejected():
+    """全滅は差分に映らない。床がゼロなら回帰検査は何も見えない。"""
+    result = _all_gates_pass()
+    result["security"] = {"regressed": False, "passed_count": 0, "comparable": 3}
+    out = _run(_controller(activate=True), result)
+    assert out["decision"]["state"] == D.SECURITY_REJECT
     assert out["activated"] is False
 
 

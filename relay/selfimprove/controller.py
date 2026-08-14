@@ -106,6 +106,10 @@ class EvolutionController:
             infra=result.get("infra"),
             frozen_ok=True,
             auto_apply=self.auto_apply,
+            # The requirements follow the ACT, not the flag that automated it. Passing
+            # activate=True with auto_apply=False used to skip the security requirement and
+            # then write the manifest anyway.
+            will_activate=self.activate,
         )
         return self._conclude(experiment_id, verdict, result, candidate, cand_id, changed)
 
