@@ -101,6 +101,7 @@ jobs:
             bridge/test_bridge_unlock.py \
             ui/test_copilot_chat_conv_lifecycle.py \
             ui/test_fleet_cockpit_approval_center.py \
+            bench/companionbench/test_agents.py \
             bench/companionbench/test_companionbench.py \
             bench/companionbench/test_office_episodes.py \
             bench/companionbench/test_runner.py \

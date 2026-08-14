@@ -1,0 +1,173 @@
+"""Agents an episode can be run against.
+
+The suite takes `agent(prompt, workdir) -> reply` and nothing else. That deliberate
+narrowness is what lets the same episodes grade a simulated agent in CI, the real companion
+on a workstation, and eventually a candidate harness under evaluation, without any of them
+knowing about the others.
+
+THE SSE TRAP, WRITTEN DOWN SO IT IS NOT REDISCOVERED
+
+The bridge answers /stream as text/event-stream with Connection: keep-alive and periodic
+`: ping` comment frames. A client that calls read() and waits for EOF therefore blocks
+forever even though the answer arrived seconds earlier. That cost most of a day: five
+"hangs" were measured at 954s, 949s, 448s, 428s and 443s against a bridge that was
+answering in about 28 seconds throughout, and three separate product "fixes" were attributed
+to it before the client turned out to be the fault. So BridgeAgent sends Connection: close
+and stops at `event: done`.
+
+WHY THE PROMPT CARRIES THE WORKDIR
+
+The episode builds fixtures in a temp directory the agent has never heard of. Telling it the
+absolute path is not a hint, it is the whole address space of the task -- without it the
+agent works in whatever folder it last used and the grader correctly reports that nothing
+happened.
+"""
+from __future__ import annotations
+
+import json
+import os
+import socket
+import time
+import urllib.parse
+
+BRIDGE_HOST = "127.0.0.1"
+BRIDGE_PORT = 8765
+
+
+class SimulatedAgent:
+    """A scripted agent for testing the harness itself, never for measuring capability.
+
+    Takes {episode_id: callable(workdir) -> reply}. Anything unscripted does nothing and
+    says so, which grades as a failure -- the honest outcome for an agent that was not
+    given an answer.
+    """
+
+    def __init__(self, script=None, default_reply="(no action taken)"):
+        self.script = dict(script or {})
+        self.default_reply = default_reply
+        self.calls = []
+
+    def for_episode(self, episode_id):
+        def agent(prompt, workdir):
+            self.calls.append({"episode_id": episode_id, "prompt": prompt})
+            fn = self.script.get(episode_id)
+            if fn is None:
+                return self.default_reply
+            return fn(workdir) or ""
+        return agent
+
+
+class BridgeAgent:
+    """Drives the real companion through the bridge's /stream endpoint.
+
+    One conversation per episode by default: episodes are independent by construction, and
+    letting one carry the previous one's context would make the suite's results depend on
+    the order it happened to run in.
+    """
+
+    def __init__(self, *, host=BRIDGE_HOST, port=BRIDGE_PORT, timeout=300,
+                 fresh_conversation=True, retry_busy_s=180):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.fresh_conversation = fresh_conversation
+        self.retry_busy_s = retry_busy_s
+        self.transcript = []
+
+    # -- transport ---------------------------------------------------------------------
+
+    def _request(self, path, timeout=None):
+        """One HTTP/1.0-style request that ends at `event: done` or EOF.
+
+        Connection: close is not decoration -- see the module docstring. `event: done` is
+        checked first so a keep-alive server that never closes still terminates the read.
+        """
+        s = socket.create_connection((self.host, self.port), timeout=15)
+        s.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n"
+                   % (path, self.host)).encode())
+        s.settimeout(timeout or self.timeout)
+        buf = b""
+        started = time.time()
+        try:
+            while time.time() - started < (timeout or self.timeout):
+                chunk = s.recv(8192)
+                if not chunk:
+                    break
+                buf += chunk
+                if b"event: done" in buf:
+                    break
+        except socket.timeout:
+            pass
+        finally:
+            s.close()
+        return buf.decode("utf-8", "replace")
+
+    @staticmethod
+    def _answer(raw):
+        """The final answer out of an SSE body.
+
+        `replace` frames carry the settled answer and supersede the streamed deltas; the
+        deltas are only a fallback for a turn that streamed and never settled.
+        """
+        replace, deltas = "", []
+        for line in raw.splitlines():
+            if not line.startswith("data: "):
+                continue
+            try:
+                d = json.loads(line[6:])
+            except Exception:
+                continue
+            if not isinstance(d, dict):
+                continue
+            if d.get("replace"):
+                replace = d["replace"]
+            elif d.get("delta"):
+                deltas.append(d["delta"])
+        return replace or "".join(deltas)
+
+    def _new_conversation(self):
+        deadline = time.time() + self.retry_busy_s
+        while time.time() < deadline:
+            raw = self._request("/new", timeout=90)
+            if '"busy"' not in raw:
+                return True
+            time.sleep(15)
+        return False
+
+    # -- the contract ------------------------------------------------------------------
+
+    def __call__(self, prompt, workdir):
+        if self.fresh_conversation:
+            self._new_conversation()
+        full = (
+            "作業フォルダは %s です。このフォルダの中だけで作業し、"
+            "指示されていないファイルは変更しないでください。\n\n%s" % (workdir, prompt)
+        )
+        started = time.time()
+        deadline = time.time() + self.retry_busy_s
+        raw = ""
+        while time.time() < deadline:
+            raw = self._request("/stream?msg=" + urllib.parse.quote(full))
+            if '"busy"' not in raw[:200]:
+                break
+            time.sleep(15)
+        reply = self._answer(raw)
+        self.transcript.append({
+            "prompt": full, "reply": reply,
+            "elapsed_s": round(time.time() - started, 1),
+            "settled": "event: done" in raw,
+        })
+        return reply
+
+
+def bridge_available(host=BRIDGE_HOST, port=BRIDGE_PORT) -> bool:
+    """True iff something is listening. Used to SKIP live runs, never to fail them.
+
+    A missing bridge is an environment fact. Scoring it as a capability result would be the
+    same mistake the suite refuses everywhere else.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=2):
+            return True
+    except OSError:
+        return False

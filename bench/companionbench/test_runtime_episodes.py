@@ -187,3 +187,19 @@ def test_the_regression_pool_is_not_empty():
     """回帰プールが空だと、既知の破壊を捕まえる仕組みが存在しないことになる。"""
     from bench.companionbench.pools import REGRESSION
     assert REGISTRY.get(REGRESSION)
+
+
+def test_the_count_is_read_as_a_number_not_as_concatenated_digits():
+    """実エージェントは "app_2026.log: 3" と書いた。全桁連結だと "20263" になり、
+    正しい振る舞いを不合格にする。測定器が製品を疑わせる、最も高くつく壊れ方。"""
+    ep = _ep("steer_narrowed_requirement")
+    for written, want_pass in (("3", True),
+                               ("app_2026.log: 3", True),
+                               ("ERROR件数は 3 件です", True),
+                               ("4", False),
+                               ("app_2026.log: 4", False)):
+        with EpisodeRun(ep) as run:
+            ep.setup(run.workdir)
+            _w(run.workdir, "counts.txt", written)
+            g = ep.grade_final_state(run.workdir)
+        assert g.success is want_pass, "%r -> %s" % (written, g.details)

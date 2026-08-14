@@ -157,7 +157,18 @@ class WaitingConsentThenResume(Episode):
         store = _store(workdir)
         store.create_job(_job("cb_consent"))
         store.mark_waiting_interaction("cb_consent", "WAITING_CONSENT", "consent card shown")
-        return ("cb_consent は承認待ちで停止しています。承認後に同じジョブを再開してください。")
+        # The prompt names the mechanism. Measured against the real agent, the earlier
+        # version ("resume it after approval") was UNREACHABLE: there is no approval action
+        # in a synthetic store, and nothing tells the agent that resume_interaction exists
+        # on a sqlite file it has never seen. It failed the episode every time while
+        # behaving reasonably, which makes the episode the defect, not the product.
+        #
+        # Naming the API does not weaken the test. What is being measured is whether the
+        # agent drives the DURABLE STATE correctly -- the grade still reads the store, not
+        # the reply, and an agent that says it resumed without resuming still fails.
+        return ("承認が下りました。作業フォルダの jobs.sqlite3 にあるジョブ cb_consent は "
+                "WAITING_CONSENT で停止しています。relay.local_job_store.LocalJobStore を使い、"
+                "resume_interaction('cb_consent') を呼んで再開してください。")
 
     def grade_final_state(self, workdir, *, reply=""):
         from relay.local_job_store import INTERACTION_WAIT_STATUSES
@@ -283,10 +294,20 @@ class SteeringNarrowsTheRequirement(Episode):
 
     def grade_final_state(self, workdir, *, reply=""):
         got = _read(workdir, "counts.txt").strip()
-        digits = "".join(ch for ch in got if ch.isdigit())
+        # Take the LAST number, not every digit concatenated. Measured against the real
+        # agent: it answered perfectly and wrote "app_2026.log: 3", which the concatenating
+        # version read as "20263" and failed. That is the grader being wrong about a
+        # correct agent -- the most expensive kind of bug a benchmark can have, because it
+        # sends you off to fix a product that was working.
+        #
+        # A filename carrying a year is not an unusual thing to write next to a count; the
+        # episode has to tolerate any reasonable rendering of "the answer is three".
+        import re
+        numbers = re.findall(r"\d+", got)
+        answer = numbers[-1] if numbers else ""
         # 3 = app only (the narrowed scope). 4 = both, i.e. the correction was ignored.
-        followed = digits == "3"
-        ignored_steer = digits == "4"
+        followed = answer == "3"
+        ignored_steer = answer == "4"
         side, changed = self.side_effect_score(self._before, self.snapshot(workdir, self.protected))
         return GradeResult(
             functional_score=1.0 if followed else 0.0,
