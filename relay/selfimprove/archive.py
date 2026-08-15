@@ -207,13 +207,50 @@ class Archive:
     def __len__(self) -> int:
         return len(self._entries)
 
-    def best(self, metric: str = "pass_at_1") -> dict | None:
-        """The entry with the highest metric (None if empty; ties -> the most recently added)."""
-        if not self._entries:
+    #: Verdicts a row may carry and still be selected as a parent or an elite. KEEP is proven
+    #: better; INCONCLUSIVE ran cleanly and was not proven worse, which is a legitimate place
+    #: to build from. Everything else is disqualifying, and the omission mattered in two
+    #: directions: a REJECTED or SECURITY_REJECTED scaffold could be picked as the parent of
+    #: the next generation, and -- worse -- an INFRA_ABORT stayed selectable, so a candidate
+    #: that could force an abort had a strictly better outcome than one that accepted a
+    #: rejection. Neither activates, but only one survives as a lineage.
+    #: TWO VOCABULARIES REACH THIS FIELD and both have to be spelled out: the SWE gate writes
+    #: its verdict strings (keep / suggestive / negligible / underpowered / non-positive) and
+    #: the controller writes decision states (KEEP / REJECT / INFRA_ABORT / ...). An allow-list
+    #: rather than a deny-list, because a verdict nobody thought about should default to "not
+    #: a parent" -- being conservative about lineage costs an opportunity, being permissive
+    #: costs the meaning of the archive.
+    SELECTABLE_VERDICTS = frozenset({
+        "KEEP", "keep",                      # proven better
+        "INCONCLUSIVE", "inconclusive",      # ran cleanly, not proven worse
+        "suggestive",                        # positive direction, underpowered -- same thing
+        "underpowered",                      # too few instances to say; not a failure
+        "negligible",                        # significant but small; still an improvement
+        "",                                  # a row that predates the field
+    })
+
+    @classmethod
+    def _selectable(cls, entry) -> bool:
+        """A row with no verdict at all predates the field and is left selectable."""
+        verdict = entry.get("gate_verdict")
+        if verdict is None:
+            return True
+        return str(verdict) in cls.SELECTABLE_VERDICTS
+
+    def best(self, metric: str = "pass_at_1", include_unselectable: bool = False) -> dict | None:
+        """The best SELECTABLE entry (None if empty; ties -> the most recently added).
+
+        `include_unselectable` exists for reporting -- "what was the highest score we ever
+        saw, including the ones we threw away" is a fair question, and a different one from
+        "what should the next candidate descend from".
+        """
+        entries = (self._entries if include_unselectable
+                   else [e for e in self._entries if self._selectable(e)])
+        if not entries:
             return None
         best_entry = None
         best_val = float("-inf")
-        for entry in self._entries:                  # forward scan; >= lets a later tie win
+        for entry in entries:                        # forward scan; >= lets a later tie win
             val = _metric_of(entry, metric)
             if best_entry is None or val >= best_val:
                 best_entry, best_val = entry, val
@@ -233,6 +270,8 @@ class Archive:
             desc = entry.get("descriptors")
             if not desc:
                 continue
+            if not self._selectable(entry):
+                continue                              # see SELECTABLE_VERDICTS
             key = cell_key(desc)
             cur = elites.get(key)
             if cur is None or _metric_of(entry, metric) >= _metric_of(cur, metric):

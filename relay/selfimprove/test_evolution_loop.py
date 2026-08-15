@@ -541,3 +541,46 @@ def test_legacy_genome_ids_did_not_move():
     from relay.selfimprove.archive import genome_id
     legacy = {"knobs": {"SWE_X": "1"}, "cards": {}}
     assert genome_id(legacy) == genome_id(dict(legacy, components={}, parameters={}))
+
+
+def test_a_rejected_scaffold_is_not_selectable_as_a_parent():
+    """棄却された足場が次世代の親になれるなら、棄却は記録でしかない。"""
+    from relay.selfimprove.archive import Archive
+
+    path = os.path.join(tempfile.mkdtemp(prefix="arc_"), "a.jsonl")
+    arc = Archive(path)
+    arc.add({"knobs": {"A": "1"}}, slice_ids=["s1"], pass_at_1=0.9,
+            gate_verdict="SECURITY_REJECT", descriptors={"diff_bin": "surgical"})
+    arc.add({"knobs": {"B": "1"}}, slice_ids=["s2"], pass_at_1=0.5,
+            gate_verdict="KEEP", descriptors={"diff_bin": "surgical"})
+    best = arc.best()
+    assert best["genome"]["knobs"] == {"B": "1"}, "棄却された高スコア行が親に選ばれた"
+    # 報告目的では見える
+    assert arc.best(include_unselectable=True)["genome"]["knobs"] == {"A": "1"}
+
+
+def test_an_infra_abort_is_not_a_better_outcome_than_a_rejection():
+    """abort も reject も有効化はしない。だが abort だけが系統として生き残るなら、
+    棄却されそうな候補には『わざと壊す』動機ができる。"""
+    from relay.selfimprove.archive import Archive
+
+    path = os.path.join(tempfile.mkdtemp(prefix="arc2_"), "a.jsonl")
+    arc = Archive(path)
+    arc.add({"knobs": {"A": "1"}}, slice_ids=["s1"], pass_at_1=0.9,
+            gate_verdict="INFRA_ABORT", descriptors={"diff_bin": "surgical"})
+    assert arc.best() is None
+    assert arc.qd_map() == {}
+
+
+def test_an_underpowered_result_is_still_a_legitimate_parent():
+    """『まだ証明できていない』と『悪いと分かった』は別。前者まで捨てると
+    有望な枝が毎回死ぬ。"""
+    from relay.selfimprove.archive import Archive
+
+    path = os.path.join(tempfile.mkdtemp(prefix="arc3_"), "a.jsonl")
+    arc = Archive(path)
+    for verdict in ("suggestive", "underpowered", "inconclusive", "negligible"):
+        arc.add({"knobs": {verdict: "1"}}, slice_ids=["s"], pass_at_1=0.5,
+                gate_verdict=verdict, descriptors={"diff_bin": "surgical"})
+    assert arc.best() is not None
+    assert len(arc.qd_map()) == 1

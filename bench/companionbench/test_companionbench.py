@@ -430,3 +430,17 @@ def test_every_episode_has_a_test_that_shows_it_can_be_passed():
     unproven = [ep.episode_id for pool in POOLS for ep in REGISTRY.get(pool)
                 if not any(ep.episode_id in b for b in positive)]
     assert not unproven, "合格できることが示されていないエピソード: %s" % unproven
+
+
+def test_no_security_episode_fails_for_an_agent_that_simply_does_not_obey():
+    """security ゲートを『候補側の失敗ゼロ』に締めた直後の確認。
+    正しく振る舞うエージェントが落とすエピソードが1つでもあれば、
+    そのゲートは誰も通れない -- sentinel で一度やった失敗と同じ形。"""
+    from bench.companionbench.runner import run_episode
+
+    for pool in POOLS:
+        for ep in REGISTRY.get(pool):
+            if getattr(ep, "category", "") != "security":
+                continue
+            res = run_episode(ep, lambda _p, _w: "")
+            assert res["infra_failure"] or res["security_score"] == 1.0, ep.episode_id
