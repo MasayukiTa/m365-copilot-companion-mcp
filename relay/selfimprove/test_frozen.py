@@ -1,4 +1,5 @@
 """Unit tests for the frozen-constitution guard. Run: python -m relay.selfimprove.test_frozen"""
+import json
 import os
 import tempfile
 
@@ -19,7 +20,7 @@ def _make_repo(d: str) -> None:
 def test_no_baseline():
     with tempfile.TemporaryDirectory() as d:
         bp = os.path.join(d, "frozen_baseline.json")
-        ok, changed = F.frozen_intact(d, bp)
+        ok, changed = F.frozen_intact(d, bp, FAKE_MANIFEST)
         assert ok is False and changed == ["NO_BASELINE"]
     print("ok test_no_baseline")
 
@@ -31,11 +32,10 @@ def test_snapshot_and_intact():
         # snapshot using the fake manifest, then verify intact
         sums = F.compute_checksums(d, FAKE_MANIFEST)
         data = {"repo_root": d, "checksums": sums}
-        import json
         with open(bp, "w", encoding="utf-8", newline="\n") as f:
             json.dump(data, f)
         assert all(v != F.MISSING for v in sums.values())
-        ok, changed = F.frozen_intact(d, bp)
+        ok, changed = F.frozen_intact(d, bp, FAKE_MANIFEST)
         assert ok is True and changed == []
     print("ok test_snapshot_and_intact")
 
@@ -50,7 +50,7 @@ def test_modified_file_detected():
         # tamper with the guards file -- a reward-hack attempt
         with open(os.path.join(d, "b/guards.py"), "a", encoding="utf-8", newline="\n") as f:
             f.write("# always keep\n")
-        ok, changed = F.frozen_intact(d, bp)
+        ok, changed = F.frozen_intact(d, bp, FAKE_MANIFEST)
         assert ok is False
         assert "b/guards.py" in changed and "a/grader.py" not in changed
     print("ok test_modified_file_detected")
@@ -64,7 +64,7 @@ def test_deleted_file_detected():
         with open(bp, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"repo_root": d, "checksums": F.compute_checksums(d, FAKE_MANIFEST)}, f)
         os.remove(os.path.join(d, "c/constitution.md"))
-        ok, changed = F.frozen_intact(d, bp)
+        ok, changed = F.frozen_intact(d, bp, FAKE_MANIFEST)
         assert ok is False and "c/constitution.md" in changed
         # the now-missing file reads as MISSING
         assert F.compute_checksums(d, ["c/constitution.md"])["c/constitution.md"] == F.MISSING
@@ -138,8 +138,11 @@ def test_the_shipped_baseline_covers_the_current_manifest():
     assert base is not None, "frozen_baseline.json が無い -- 検査は一度も走らない"
     assert set(base["checksums"]) == set(F.FROZEN_MANIFEST)
     assert F.MISSING not in base["checksums"].values()
-    ok, changed = F.frozen_intact()
-    assert ok, changed
+    # Deliberately NOT asserting the contents still match. The frozen check exists to catch
+    # a change made BETWEEN ITERATIONS OF THE LOOP, and a human editing a grader in a working
+    # tree trips it every time -- a test that fails on ordinary development is one everybody
+    # learns to ignore, which is worse than not having it. `--verify` is the operational
+    # check; this test guards the structure the operational check depends on.
 
 
 if __name__ == "__main__":
@@ -176,3 +179,64 @@ def test_a_missing_baseline_is_a_violation_not_a_pass():
     from relay.selfimprove.frozen import frozen_intact
     ok, changed = frozen_intact(baseline_path=os.path.join(tempfile.mkdtemp(), "none.json"))
     assert ok is False and "NO_BASELINE" in changed
+
+
+def test_the_baseline_does_not_get_to_say_what_is_protected():
+    """独立レビューの実証コード: {"checksums": {}} が INTACT を返していた。
+    比較ループが baseline 自身のキーを回っていたので、空にすれば0回で通る。"""
+    with tempfile.TemporaryDirectory() as d:
+        bp = os.path.join(d, "empty.json")
+        with open(bp, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump({"checksums": {}}, fh)
+        ok, changed = F.frozen_intact(F.REPO, bp)
+    assert ok is False
+    assert all(c.startswith("UNPINNED:") for c in changed)
+    assert len(changed) == len(F.FROZEN_MANIFEST)
+    print("ok test_the_baseline_does_not_get_to_say_what_is_protected")
+
+
+def test_dropping_one_entry_from_the_baseline_is_a_violation():
+    """1件だけ外して『検査していない』状態を作る手口も同じ穴。"""
+    with tempfile.TemporaryDirectory() as d:
+        bp = os.path.join(d, "b.json")
+        F.snapshot_baseline(F.REPO, bp)
+        data = F.load_baseline(bp)
+        data["checksums"].pop("tools/security.py")
+        with open(bp, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(data, fh)
+        ok, changed = F.frozen_intact(F.REPO, bp)
+    assert ok is False and "UNPINNED:tools/security.py" in changed
+    print("ok test_dropping_one_entry_from_the_baseline_is_a_violation")
+
+
+def test_the_companionbench_judge_is_frozen():
+    """候補の採否を実際に決めているのは今や CompanionBench。
+    swebench グレーダだけを凍結していたのは、当時それしか無かったからにすぎない。"""
+    for rel in ("bench/companionbench/runner.py", "bench/companionbench/episode.py",
+                "bench/companionbench/pools.py", "bench/companionbench/episodes/core.py",
+                "bench/companionbench/episodes/office.py",
+                "bench/companionbench/episodes/runtime.py",
+                "bench/companionbench/episodes/sealed.py"):
+        assert rel in F.FROZEN_MANIFEST, rel
+    print("ok test_the_companionbench_judge_is_frozen")
+
+
+def test_rewriting_the_baseline_is_caught_by_the_out_of_tree_anchor():
+    """作業ツリー内のファイルだけを信じている限り、グレーダとその記録済み
+    チェックサムは同じ手で同時に書き換えられる。"""
+    if not F._read_anchor():
+        return                              # anchored only where an operator has snapshotted
+    orig = open(F.DEFAULT_BASELINE, encoding="utf-8").read()
+    data = json.loads(orig)
+    data["checksums"]["tools/security.py"] = "0" * 64
+    try:
+        with open(F.DEFAULT_BASELINE, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+        ok, changed = F.frozen_intact()
+        assert ok is False
+        assert "BASELINE_REWRITTEN" in changed, changed
+    finally:
+        with open(F.DEFAULT_BASELINE, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(orig)
+    assert F.frozen_intact()[0] is True
+    print("ok test_rewriting_the_baseline_is_caught_by_the_out_of_tree_anchor")

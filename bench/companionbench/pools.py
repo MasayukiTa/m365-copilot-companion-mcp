@@ -42,6 +42,21 @@ POOLS = (EVOLUTION, REGRESSION, SEALED)
 SALT_ENV = "COMPANIONBENCH_SEAL_SALT"
 SALT_FILE_ENV = "COMPANIONBENCH_SEAL_SALT_FILE"
 
+#: Last-resort salt location: the operator's home directory, resolved at runtime so no
+#: absolute path is written into the source. Outside every checkout, which is the property
+#: that matters. A fresh clone has no salt and its sealed episodes refuse to grade -- the
+#: correct behaviour, since a holdout that travels with the repo is not a holdout.
+DEFAULT_SALT_FILE = os.path.join(os.path.expanduser("~"), ".companionbench_seal_salt")
+
+#: WHAT THE SEAL DOES AND DOES NOT DO, stated plainly because the overclaim is tempting.
+#: It keeps the answer key out of the working tree, which is the realistic leak: an
+#: optimiser given this repository can read every file in it, and a plaintext expected
+#: answer sitting in bench/ is an invitation to fit to it. It does NOT defend against a
+#: process that can read the operator's home directory -- same user, same machine, and the
+#: grader must be able to read the salt to grade at all. Treat sealed results as a
+#: generalisation check under an honest optimiser, not as a security boundary.
+SEAL_THREAT_MODEL = "keeps the key out of the tree; not a boundary against a local reader"
+
 
 class SealError(RuntimeError):
     """Raised when a sealed answer cannot be checked. Never downgraded to a plaintext path."""
@@ -52,11 +67,13 @@ def seal_salt() -> str:
     salt = os.environ.get(SALT_ENV, "").strip()
     if salt:
         return salt
-    path = os.environ.get(SALT_FILE_ENV, "").strip()
+    path = os.environ.get(SALT_FILE_ENV, "").strip() or DEFAULT_SALT_FILE
     if path:
         try:
             with open(path, encoding="utf-8") as fh:
                 salt = (fh.read() or "").strip()
+        except FileNotFoundError:
+            salt = ""
         except OSError as exc:
             raise SealError("sealed salt file unreadable: %s" % exc) from exc
         if salt:

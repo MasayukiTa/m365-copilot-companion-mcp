@@ -1,10 +1,17 @@
 {
   "checksums": {
+    "bench/companionbench/episode.py": "b00e687b519fcc1007ad8ac882af34f1d345c8f2cc8956cabe01ae00aa02a090",
+    "bench/companionbench/episodes/core.py": "e254b3ab96823ba0b9afffef66304ed18f3d36ebcf7b6643b2fe56967dafe09e",
+    "bench/companionbench/episodes/office.py": "1c9c9fa291354a6382f802308fee3f457951bb69c89192a67b82294219ba8796",
+    "bench/companionbench/episodes/runtime.py": "049902fdea04c801bc7a07e91a9373659b540779918f09109c1a81b186c2df16",
+    "bench/companionbench/episodes/sealed.py": "ed1cac7f134de66cdaca8a07b0d608bfa777aadb1e0fc18429e3494841ac6c55",
+    "bench/companionbench/pools.py": "1f3f04fbf15aabb5da592d963231561884a1061637c5efa1eb9ed0355a20b385",
+    "bench/companionbench/runner.py": "2444f76950898f11d547e3b7621290d9301d86b15004a9e18cfab7a648da47ec",
     "bench/the eval host_batch_grade.py": "5d30b0f5970358e1c9414265b9a6bfb8bb83e69274f5c4d2883b4789f5be12ab",
     "bench/swe_grade_swebench.py": "622e41695f2a50ba69be3a06bc0fd217ddc3a8446c1a07329d46503a5672b7e9",
     "docs/SECURITY.md": "6deaa0e2ab9d8480bf5cf2ce2508a2e49e31962e275be2e7acbf7dd5c7f114b8",
     "relay/selfimprove/decision.py": "3768951b6020d1b8d888ee3a1349cd049de303e2193c26ed310d2bdcd5e29ca7",
-    "relay/selfimprove/frozen.py": "cb5ca1c087e889552756a23090c084b090b49e5e076224a6b3eaeeeb10a603d2",
+    "relay/selfimprove/frozen.py": "3ebff3d994ea3ef07cdfe7f726ed353d75ee69ff8183f29c9499059ec0324eb1",
     "relay/selfimprove/guards.py": "4f68805a20bd8a70eda769e749591222e5618e4054f6ef817422c45cafd1377a",
     "relay/selfimprove/manifest.py": "08a790cc0fe90b1f521835ba1879f81adf48b9112ccc7bd28d86978eafe47119",
     "tools/_untrusted.py": "2fe9c6b36a0188775db7de2b55649df3b6d923b97b104701d81e43a1065b59df",

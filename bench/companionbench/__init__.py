@@ -8,6 +8,7 @@ can be judged against the work the harness actually does.
 Importing this package registers every episode into bench.companionbench.pools.REGISTRY.
 """
 from bench.companionbench import episode, pools          # noqa: F401
-from bench.companionbench.episodes import core, office, runtime  # noqa: F401  (registers)
+from bench.companionbench.episodes import (core, office, runtime,  # noqa: F401
+                                          sealed)          # (registers)
 
 __all__ = ["episode", "pools"]

@@ -12,6 +12,7 @@ it was asked to summarise.
 """
 import json
 import os
+import tempfile
 
 import pytest
 
@@ -258,8 +259,14 @@ def test_the_same_answer_under_a_different_salt_does_not_match():
 
 def test_sealed_grading_refuses_rather_than_falling_back_to_plaintext(monkeypatch):
     """salt が無いときに平文比較へ退化しないこと。退化した holdout は数字だけ信頼できて見える。"""
+    import bench.companionbench.pools as P
+
     monkeypatch.delenv("COMPANIONBENCH_SEAL_SALT", raising=False)
     monkeypatch.delenv("COMPANIONBENCH_SEAL_SALT_FILE", raising=False)
+    # 既定の salt 置き場(ホーム配下)も塞ぐ。塞がないとこのテストは salt を持つ
+    # マシンで前提ごと消える -- 実際に消えて、それが追加時に判明した。
+    monkeypatch.setattr(P, "DEFAULT_SALT_FILE",
+                        os.path.join(tempfile.mkdtemp(prefix="nosalt_"), "absent"))
     with pytest.raises(SealError):
         seal("anything")
 

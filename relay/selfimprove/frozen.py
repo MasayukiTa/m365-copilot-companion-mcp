@@ -50,11 +50,42 @@ FROZEN_MANIFEST = [
     # and decision.py is where a gate could be made optional again.
     "relay/selfimprove/manifest.py",
     "relay/selfimprove/decision.py",
+
+    # THE JUDGE THAT ACTUALLY RUNS NOW. The manifest froze the swebench graders and stopped
+    # there, from a time when those were the only graders. CompanionBench decides candidate
+    # acceptance today, and every one of these files is a place where an episode could be
+    # made easier, a security check softened, or a pool quietly re-pointed -- with the
+    # frozen check reporting INTACT throughout.
+    "bench/companionbench/episode.py",
+    "bench/companionbench/pools.py",
+    "bench/companionbench/runner.py",
+    "bench/companionbench/episodes/core.py",
+    "bench/companionbench/episodes/office.py",
+    "bench/companionbench/episodes/runtime.py",
+    "bench/companionbench/episodes/sealed.py",
 ]
 
 DEFAULT_BASELINE = os.path.join(os.path.dirname(__file__), "frozen_baseline.json")
 
+#: Where the baseline's own digest is kept: the operator's home, resolved at runtime, so no
+#: absolute path is written into the source. Outside every checkout is the entire point --
+#: an anchor stored beside the thing it anchors is decoration.
+ANCHOR_ENV = "SELFIMPROVE_FROZEN_ANCHOR_FILE"
+DEFAULT_ANCHOR = os.path.join(os.path.expanduser("~"), ".selfimprove_frozen_anchor")
+
 MISSING = "MISSING"
+
+
+def _anchor_path() -> str:
+    return os.environ.get(ANCHOR_ENV, "").strip() or DEFAULT_ANCHOR
+
+
+def _read_anchor() -> str:
+    try:
+        with open(_anchor_path(), encoding="utf-8") as fh:
+            return (fh.read() or "").strip()
+    except OSError:
+        return ""
 
 
 def _sha256(path: str) -> str:
@@ -113,6 +144,15 @@ def snapshot_baseline(repo_root: str = REPO, baseline_path: str = DEFAULT_BASELI
     with open(baseline_path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
         f.write("\n")
+    # Anchor the baseline outside the tree, so a later rewrite of it is detectable.
+    if baseline_path == DEFAULT_BASELINE:
+        try:
+            with open(baseline_path, "rb") as fh:
+                digest = hashlib.sha256(fh.read()).hexdigest()
+            with open(_anchor_path(), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(digest + "\n")
+        except OSError:
+            pass                            # an unwritable home is not a reason to fail here
     return data
 
 
@@ -128,7 +168,8 @@ def load_baseline(baseline_path: str = DEFAULT_BASELINE) -> dict | None:
 
 
 def frozen_intact(repo_root: str = REPO,
-                  baseline_path: str = DEFAULT_BASELINE) -> tuple[bool, list[str]]:
+                  baseline_path: str = DEFAULT_BASELINE,
+                  manifest: Iterable[str] | None = None) -> tuple[bool, list[str]]:
     """Verify the frozen set against the baseline.
 
     Returns (ok, changed_paths). ok is True iff the current checksum of every manifest path equals
@@ -140,11 +181,51 @@ def frozen_intact(repo_root: str = REPO,
     if base is None:
         return False, ["NO_BASELINE"]
     baseline_sums = base.get("checksums", {})
-    current = compute_checksums(repo_root, baseline_sums.keys() or FROZEN_MANIFEST)
+    # The manifest is an ARGUMENT defaulting to code -- never data read from the baseline.
+    # Tests pin their own fake constitution through it; nothing else should pass it.
+    manifest = list(FROZEN_MANIFEST if manifest is None else manifest)
     changed: list[str] = []
-    for rel, expected in baseline_sums.items():
+
+    # THE BASELINE DOES NOT GET TO SAY WHAT IS PROTECTED. It used to: the loop iterated over
+    # the baseline's own keys, so a baseline of `{"checksums": {}}` iterated zero times and
+    # reported INTACT -- an independent review demonstrated exactly that in four lines. The
+    # authoritative list is FROZEN_MANIFEST, which is code, and which is itself in the
+    # frozen set. A manifest entry the baseline never pinned is a violation, not a silence.
+    for rel in manifest:
+        if rel not in baseline_sums:
+            changed.append("UNPINNED:" + rel)
+    # An entry the manifest no longer names is also worth reporting: it means the baseline
+    # and the code disagree about the constitution, and which one is stale is not knowable
+    # from here.
+    for rel in baseline_sums:
+        if rel not in manifest:
+            changed.append("UNKNOWN_IN_BASELINE:" + rel)
+
+    current = compute_checksums(repo_root, manifest)
+    for rel in manifest:
+        expected = baseline_sums.get(rel)
+        if expected is None:
+            continue                       # already reported as UNPINNED
         if current.get(rel, MISSING) != expected:
             changed.append(rel)
+
+    # THE BASELINE FILE ITSELF. Everything above still trusts a file inside the working
+    # tree, so anything that can edit the grader can edit its recorded checksum in the same
+    # breath. `snapshot_baseline` refusing to overwrite does not help -- that is a function,
+    # not a permission. The anchor is a digest of the baseline kept OUTSIDE every checkout;
+    # when it exists, a rewritten baseline is caught. When it does not (a fresh clone) we
+    # cannot detect the substitution, and say so rather than implying a guarantee.
+    # Only THE baseline is anchored -- a temp baseline written by a test or a one-off audit
+    # was never anchored and must not be reported as a rewrite of something else.
+    anchor = _read_anchor() if baseline_path == DEFAULT_BASELINE else ""
+    if anchor:
+        try:
+            with open(baseline_path, "rb") as fh:
+                if hashlib.sha256(fh.read()).hexdigest() != anchor:
+                    changed.append("BASELINE_REWRITTEN")
+        except OSError:
+            changed.append("BASELINE_UNREADABLE")
+
     return (not changed), changed
 
 
