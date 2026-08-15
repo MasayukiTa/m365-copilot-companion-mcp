@@ -459,3 +459,60 @@ def test_without_a_salt_the_sentinel_is_unevaluable_not_a_pass(monkeypatch, tmp_
                    security={"regressed": False, "comparable": 1, "passed_count": 1},
                    regression={"regressed": False}, will_activate=True)
     assert d["may_activate"] is False
+
+
+# ---- round 5: does the manifest reach the thing being measured ---------------------------
+
+def test_an_agent_that_cannot_carry_the_manifest_is_refused():
+    """最も深い欠陥: BridgeAgent は別プロセスの bridge に投げるだけなので、
+    evaluator 側で manifest を切り替えても両腕は同じプログラムを走らせていた。
+    ここから直せないので、数字を出さずに拒否する。"""
+    class _External:
+        applies_manifest = False
+
+        def __call__(self, prompt, workdir):
+            return ""
+
+    base_m = M.base_manifest()
+    cand_m = M.apply_genome(base_m, {"parameters": {"memory_max_items": 9}})
+    out = R.paired_evaluate(base_m, cand_m, _External(),
+                            tmpdir=tempfile.mkdtemp(prefix="pe4_"))
+    assert out["infra"]["aborted"] is True
+    assert out["gate"] is None, "測れていないのに gate を出している"
+
+
+def test_the_real_bridge_adapter_declares_that_it_cannot():
+    from bench.companionbench.agents import BridgeAgent
+    assert BridgeAgent.applies_manifest is False
+
+
+def test_an_in_process_agent_is_still_accepted():
+    base_m = M.base_manifest()
+    out = R.paired_evaluate(base_m, base_m, lambda *_a: "",
+                            tmpdir=tempfile.mkdtemp(prefix="pe5_"))
+    assert out["gate"] is not None
+
+
+def test_a_security_episode_failing_on_both_arms_is_still_a_failure():
+    """差分だけを見ていたので、既に壊れている防御は壊れたまま KEEP に到達できた。
+    「今ある危険なものと同程度」はセキュリティ性質ではない。"""
+    base = [{"episode_id": "sec_a", "category": "security", "security_score": 0.0},
+            {"episode_id": "sec_b", "category": "security", "security_score": 1.0}]
+    cand = [{"episode_id": "sec_a", "category": "security", "security_score": 0.0},
+            {"episode_id": "sec_b", "category": "security", "security_score": 1.0}]
+    out = R._security_regression(base, cand)
+    assert out["regressed"] is False       # 悪化はしていない
+    assert out["failing"] == ["sec_a"]     # が、破れている
+
+    from relay.selfimprove import decision as Dec
+    d = Dec.decide(gate={"keep": True, "verdict": "keep"}, security=out,
+                   sentinel={"regressed": False}, regression={"regressed": False})
+    assert d["state"] == Dec.SECURITY_REJECT
+
+
+def test_the_sealed_sentinel_does_not_return_per_episode_ids():
+    """候補ごとに封印プールを走らせる時点で反復フィードバックになっている。
+    どのエピソードを落としたかまで返せば、holdout を1問ずつ潰せてしまう。"""
+    import inspect
+    src = inspect.getsource(R._sealed_sentinel)
+    assert '"lost_count"' in src and '"lost":' not in src

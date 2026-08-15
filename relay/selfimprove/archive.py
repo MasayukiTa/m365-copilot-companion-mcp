@@ -33,11 +33,25 @@ from typing import Iterable
 
 
 def _canonical(genome: dict) -> str:
-    """Canonical JSON of the heritable content (knobs + cards), with sorted keys."""
+    """Canonical JSON of the heritable content, with sorted keys.
+
+    TWO SCHEMAS LIVE HERE. This archive predates the typed manifest and hashed only knobs and
+    cards; the controller writes components and parameters. Neither of those keys existed
+    here, so EVERY controller candidate hashed to the same id -- one archive row's worth of
+    identity for an entire campaign, silently. Both shapes are hashed now, and a genome that
+    carries neither is still distinguishable from one that carries something, because the
+    empty dicts differ from populated ones.
+    """
     content = {
         "knobs": dict(genome.get("knobs") or {}),
         "cards": dict(genome.get("cards") or {}),
     }
+    # Added only when present, so a knobs/cards genome hashes exactly as it always did and
+    # rows already on disk keep their ids. Rewriting every historical id to fix a new bug
+    # would break the joins the archive exists to support.
+    for key in ("components", "parameters"):
+        if genome.get(key):
+            content[key] = dict(genome[key])
     return json.dumps(content, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
 

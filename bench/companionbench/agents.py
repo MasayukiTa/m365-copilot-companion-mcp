@@ -63,7 +63,23 @@ class BridgeAgent:
     One conversation per episode by default: episodes are independent by construction, and
     letting one carry the previous one's context would make the suite's results depend on
     the order it happened to run in.
+
+    THIS ADAPTER CANNOT RUN AN A/B, and saying so here is the point of the flag below. The
+    work happens inside a bridge process that was started with whatever harness it was
+    started with; this class posts a prompt and reads a reply. Setting the active manifest in
+    the evaluator changes nothing about that process, so a paired comparison driven through
+    here executes the SAME program on both arms and any p-value it produces is about noise.
+    An independent review found this after four rounds, and it is the most damaging kind of
+    defect: everything looks wired up and the number means nothing.
+
+    Making it true requires the bridge to accept a harness for a request and honour it --
+    a real change on the bridge side, not here. Until then paired_evaluate refuses this
+    adapter rather than producing an unattributable result.
     """
+
+    #: See the class docstring. Do not set this True until the bridge honours a per-request
+    #: harness; the flag is what stops an invalid comparison from being reported as valid.
+    applies_manifest = False
 
     def __init__(self, *, host=BRIDGE_HOST, port=BRIDGE_PORT, timeout=300,
                  fresh_conversation=True, retry_busy_s=180):

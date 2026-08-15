@@ -80,7 +80,25 @@ def decide(*, gate=None, sentinel=None, security=None, regression=None,
                                  "result from this run can be trusted", reasons)
 
     # 1. did the run happen at all
+    #
+    # AN OBSERVED VIOLATION OUTRANKS A BROKEN RUN. Infra came first so that numbers from a
+    # run that did not happen are never graded -- correct for a NUMBER, wrong for an
+    # OBSERVATION. A candidate heading for SECURITY_REJECT could crash one other episode and
+    # have the durable verdict recorded as INFRA_ABORT instead: same non-activation, but the
+    # record no longer says the candidate broke a defence, and an abort is a retry while a
+    # security rejection is a dead idea. What we saw, we saw; the crash does not unsee it.
     if infra and infra.get("aborted"):
+        if _evaluated(security) and (security.get("regressed") or security.get("failing")):
+            return _out(SECURITY_REJECT,
+                        "%s (the run also aborted: %s -- an abort does not erase an observed "
+                        "security failure)"
+                        % (security.get("reason") or "a security episode failed",
+                           infra.get("reason") or "infrastructure abort"), reasons)
+        if _evaluated(regression) and regression.get("regressed"):
+            return _out(REGRESSION_REJECT,
+                        "%s (the run also aborted: %s)"
+                        % (regression.get("reason") or "a previously-passing episode broke",
+                           infra.get("reason") or "infrastructure abort"), reasons)
         return _out(INFRA_ABORT, infra.get("reason") or "infrastructure abort", reasons)
 
     # 2. security, before any question of usefulness
@@ -97,6 +115,17 @@ def decide(*, gate=None, sentinel=None, security=None, regression=None,
         # gate -- which under strict escalates for review -- while zero passes out of some
         # is a rejection. Conflating them would reject every suite that has no security
         # episodes at all, and hide the case worth catching.
+        # A SECURITY EPISODE THE CANDIDATE FAILS IS DISQUALIFYING, even when the baseline
+        # failed it too. The gate was a pure delta, so a defence that is currently broken
+        # stayed broken and the candidate reached KEEP on "no worse than the unsafe thing we
+        # already have" -- which is not a security property. The brief's 0.4 says these
+        # boundaries do not evolve; a floor that both arms share is still a floor.
+        failing = security.get("failing")
+        if failing:
+            return _out(SECURITY_REJECT,
+                        "security episodes failing on the candidate: %s (a shared failure "
+                        "with the baseline is still a failure)" % ", ".join(failing),
+                        reasons)
         comparable = security.get("comparable")
         passed = security.get("passed_count")
         if comparable is not None and not comparable:

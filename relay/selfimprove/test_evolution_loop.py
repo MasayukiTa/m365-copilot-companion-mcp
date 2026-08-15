@@ -148,9 +148,9 @@ def test_the_harness_id_moves_only_when_the_harness_moves():
 
 def test_the_diff_names_what_changed_in_one_line():
     a = M.base_manifest()
-    b = M.apply_genome(a, {"components": {"memory": "memory/v3"},
+    b = M.apply_genome(a, {"components": {"memory": "memory/v2"},
                            "parameters": {"memory_max_items": 12}})
-    assert M.diff(a, b) == {"components.memory": ("memory/v1", "memory/v3"),
+    assert M.diff(a, b) == {"components.memory": ("memory/v1", "memory/v2"),
                             "parameters.memory_max_items": (5, 12)}
 
 
@@ -496,3 +496,48 @@ def test_the_same_hidden_regression_is_only_a_note_when_nothing_activates():
                  regression={"regressed": False, "lost": [], "unevaluable": ["hard"]})
     assert d["state"] == D.KEEP
     assert any("unevaluable" in r for r in d["passed_gates"])
+
+
+def test_an_abort_does_not_erase_an_observed_security_failure():
+    """SECURITY_REJECT に向かっている候補が別のエピソードで例外を投げれば、
+    永続記録が INFRA_ABORT に置き換わっていた。有効化は防げるが、記録から
+    「防御を破った」という事実が消える -- しかも abort は再試行、拒否は死んだ案。"""
+    d = D.decide(infra={"aborted": True, "reason": "candidate-only crash"},
+                 security={"regressed": True, "reason": "injection defence broke"},
+                 regression={"regressed": True})
+    assert d["state"] == D.SECURITY_REJECT
+    assert "aborted" in d["reason"]
+
+
+def test_a_genuine_infra_abort_is_still_an_infra_abort():
+    d = D.decide(infra={"aborted": True, "reason": "eval host unreachable"},
+                 security={"regressed": False, "comparable": 2, "passed_count": 2},
+                 regression={"regressed": False})
+    assert d["state"] == D.INFRA_ABORT
+
+
+def test_a_component_version_nothing_implements_is_refused():
+    """名前しか検査していなかったので、memory/does-not-exist が manifest を通り、
+    harness id を変え、実行時に v1 へ黙って落ちていた -- 版テーブルが
+    無くそうとしたはずの『別 manifest・同一挙動』そのもの。"""
+    with pytest.raises(M.ManifestError):
+        M.apply_genome(M.base_manifest(), {"components": {"memory": "memory/does-not-exist"}})
+    # 実装のある版は通る
+    M.apply_genome(M.base_manifest(), {"components": {"memory": "memory/v2"}})
+
+
+def test_typed_genomes_get_distinct_archive_ids():
+    """archive は knobs/cards しか hash しておらず、controller が書く
+    components/parameters は両方とも欠けていた = 全候補が同じ id。"""
+    from relay.selfimprove.archive import genome_id
+
+    a = {"components": {"memory": "memory/v1"}, "parameters": {"memory_max_items": 5}}
+    b = {"components": {"memory": "memory/v2"}, "parameters": {"memory_max_items": 50}}
+    assert genome_id(a) != genome_id(b)
+
+
+def test_legacy_genome_ids_did_not_move():
+    """既存の archive 行の id を書き換えると、archive が支える join が壊れる。"""
+    from relay.selfimprove.archive import genome_id
+    legacy = {"knobs": {"SWE_X": "1"}, "cards": {}}
+    assert genome_id(legacy) == genome_id(dict(legacy, components={}, parameters={}))

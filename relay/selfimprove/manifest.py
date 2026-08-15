@@ -111,6 +111,21 @@ def base_manifest() -> dict:
     }
 
 
+def known_versions(component: str) -> frozenset:
+    """The versions a component actually dispatches on, read from the implementation.
+
+    Read rather than declared, so the allowlist and the dispatch table cannot disagree --
+    a second copy of this list is a second thing to forget to update.
+    """
+    if component == "memory":
+        try:
+            from relay.project_memory import MEMORY_VERSIONS
+            return frozenset(MEMORY_VERSIONS)
+        except Exception:
+            return frozenset()
+    return frozenset()
+
+
 def validate(manifest: dict) -> None:
     """Raise unless the manifest is well-formed AND touches nothing forbidden."""
     if not isinstance(manifest, dict):
@@ -129,6 +144,17 @@ def validate(manifest: dict) -> None:
         if name not in EVOLVABLE_COMPONENTS:
             raise ManifestError("unknown component %r; add it to EVOLVABLE_COMPONENTS "
                                 "deliberately rather than by accident" % name)
+        # A VERSION NOTHING IMPLEMENTS IS THE NO-OP CANDIDATE AGAIN. Only the component NAME
+        # was checked, so "memory/does-not-exist" validated, changed the harness id, and then
+        # fell back to memory/v1 at runtime -- a different manifest running identical code,
+        # which is the exact defect the version table was introduced to eliminate. Checked
+        # against the dispatch table itself so the two cannot drift.
+        known = known_versions(name)
+        if known and components[name] not in known:
+            raise ManifestError(
+                "component %r has no implementation for version %r (known: %s); a version "
+                "nothing dispatches on changes the harness id and not the behaviour"
+                % (name, components[name], ", ".join(sorted(known))))
     params = manifest.get("parameters")
     if not isinstance(params, dict):
         raise ManifestError("manifest.parameters must be a dict")
