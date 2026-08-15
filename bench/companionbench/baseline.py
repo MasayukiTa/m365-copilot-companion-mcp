@@ -267,8 +267,23 @@ def build_agent(kind: str):
                 "absent target, and pretending otherwise is what the infra category is for")
         return A.BridgeAgent()
     if kind == "fleet":
+        # `agent_url` is REQUIRED and is the chat URL a worker's tab opens -- not an API
+        # endpoint and not the bridge. This function used to call FleetAgent() with no
+        # arguments, which cannot construct: the fleet target was reachable from the CLI in
+        # name only. It comes from the operator's environment because it is tenant-specific
+        # and does not belong in this repository.
         from bench.companionbench.fleet_agent import FleetAgent
-        return FleetAgent()
+        agent_url = (os.environ.get("MCP_FLEET_AGENT_URL")
+                     or os.environ.get("MCP_IMPL_AGENT_URL") or "")
+        if not agent_url:
+            raise RefusedToMeasure(
+                "the fleet target needs MCP_FLEET_AGENT_URL (or MCP_IMPL_AGENT_URL): the "
+                "chat URL a worker tab opens. Without it the fleet opens a tab with no "
+                "composer and reports a dead target ninety seconds later")
+        return FleetAgent(agent_url=agent_url,
+                          cdp_url=os.environ.get("MCP_FLEET_CDP_URL",
+                                                 "http://127.0.0.1:9222"),
+                          memory_seed=os.environ.get("MCP_FLEET_MEMORY_SEED") or None)
     raise RefusedToMeasure("unknown target %r; use bridge or fleet" % kind)
 
 
