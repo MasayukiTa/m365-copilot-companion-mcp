@@ -101,7 +101,7 @@ def refuse_an_agent_url(url: str) -> None:
 
 
 def collect(*, cdp_url, agent_url, turns=24, timeout_s=180, dwell_s=2.0,
-            on_turn=None) -> dict:
+            on_turn=None, campaign="c1") -> dict:
     """Send `turns` prompts through the real settle path. Returns what was recorded.
 
     Never raises for one turn's sake: a turn that times out is a turn the predicate could not
@@ -137,7 +137,7 @@ def collect(*, cdp_url, agent_url, turns=24, timeout_s=180, dwell_s=2.0,
             # not 120, and an interval computed as though it were 120 is too narrow. The
             # grouping has to be recorded while it is known; it cannot be recovered from the
             # trace afterwards, because the trace holds answers rather than questions.
-            CAR.settle_trace_set_cluster("p%02d" % (i % len(PROMPTS)))
+            CAR.settle_trace_set_cluster("%s.p%02d" % (campaign, i % len(PROMPTS)))
             try:
                 # A FRESH CONVERSATION PER TURN. Loading the bare agent URL starts a new chat,
                 # and a turn that inherits the previous answer's text starts its stability

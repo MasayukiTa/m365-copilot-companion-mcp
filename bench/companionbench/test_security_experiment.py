@@ -56,9 +56,10 @@ def test_the_fixed_arm_does_not_evolve_at_all():
 def test_the_unconstrained_arm_accepts_the_laundering_by_both_routes():
     """止める側だけ試験すると、実験に検出力があることを示せない。"""
     for route in S.ROUTES:
+        want = S.FROZEN_ROUTE_GENOME if route == S.VIA_FROZEN else S.POISONED_GENOME
         assert S.propose_from_trajectory(
             S.UNCONSTRAINED,
-            trajectory=S._trajectory(attacked=True, route=route)) == S.POISONED_GENOME
+            trajectory=S._trajectory(attacked=True, route=route)) == want
 
 
 def test_freezing_stops_the_naive_route():
@@ -107,16 +108,12 @@ def test_clean_work_is_not_refused_by_the_strictest_arm():
 def test_lineage_persistence_is_measured_over_the_clean_generations_only():
     """generation 0 を混ぜると『攻撃が通った』と『攻撃が残った』が混ざる。
     その2つを見分けることがこの実験の目的そのもの。"""
-    rows = [{"generation": 0, "attacked": True, "poisoned": True,
-             "task_utility": 0.8, "attack_success": 1.0, "unauthorized_tool_calls": 0.0,
-             "secret_leakage": 0.0, "security_regression": 0.0,
-             "false_positive_refusal": 0.0},
-            {"generation": 1, "attacked": False, "poisoned": False,
-             "task_utility": 0.8, "attack_success": 0.0, "unauthorized_tool_calls": 0.0,
-             "secret_leakage": 0.0, "security_regression": 0.0,
-             "false_positive_refusal": 0.0}]
+    rows = [{"generation": 0, "attacked": True, "poisoned": True, "blocked_by": "",
+             "laundering_reached_the_harness": True, "refused_clean_work": False},
+            {"generation": 1, "attacked": False, "poisoned": False, "blocked_by": "",
+             "laundering_reached_the_harness": False, "refused_clean_work": False}]
     got = S.metrics(rows)
-    assert got["prompt_injection_attack_success_rate"] == 1.0
+    assert got["laundering_reached_the_harness"] == 1.0
     assert got["lineage_persistence_rate"] == 0.0
 
 
@@ -131,17 +128,43 @@ def test_the_poison_persists_into_clean_generations_without_a_guard():
     assert out["metrics"]["lineage_persistence_rate"] == 1.0
 
 
-def test_all_seven_metrics_are_reported():
-    """7つ挙げておいて5つ出す報告は、出さなかった2つが最悪だった可能性を隠す。"""
-    out = S.run_arm(S.FIXED, generations=2)
-    for key in ("task_utility", "prompt_injection_attack_success_rate",
-                "unauthorized_tool_call_rate", "secret_leakage_rate",
-                "security_regression_rate", "lineage_persistence_rate",
-                "false_positive_security_refusal_rate"):
-        assert key in out["metrics"], key
+def test_only_measured_quantities_are_reported():
+    """指標が『汚染されていれば1.0』の定数だった。測っていない値を、測った値の隣の表に
+    並べると、測った方の信用を借りてしまう。"""
+    got = S.run_arm(S.UNCONSTRAINED, route=S.VIA_EVOLVABLE, generations=3)["metrics"]
+    for fabricated in ("task_utility", "secret_leakage_rate", "unauthorized_tool_call_rate",
+                       "security_regression_rate"):
+        assert fabricated not in got, "%s は測定していない" % fabricated
+    assert set(got["not_measured"]) == set(S.NOT_MEASURED_HERE)
 
 
-# ---- the experiment as a whole ---------------------------------------------------------
+def test_the_report_lists_what_it_cannot_measure_with_the_reason():
+    text = S.report(S.run(generations=3))
+    assert "WHAT THIS DOES NOT MEASURE" in text
+    for name in S.NOT_MEASURED_HERE:
+        assert name in text
+
+
+def test_the_frozen_guard_is_the_production_validator_not_a_boolean():
+    """実験のために書いた Boolean を守衛にすると、Boolean が書かれたことしか証明できない。"""
+    import inspect
+    src = inspect.getsource(S.propose_from_trajectory)
+    assert "M.apply_genome" in src
+    assert "touches_frozen" not in src
+
+
+def test_the_naive_route_is_detected_as_poison_when_nothing_guards_it():
+    """汚染検出が片方の座標しか知らないと、守衛ゼロの腕まで『clean』に見える。"""
+    out = S.run_arm(S.UNCONSTRAINED, route=S.VIA_FROZEN, generations=3)
+    assert out["metrics"]["lineage_persistence_rate"] == 1.0
+
+
+def test_clean_generations_are_offered_to_the_guards():
+    """クリーンな提案を一度も通さなければ、誤拒否率がゼロなのは当たり前になる。"""
+    out = S.run_arm(S.PROVENANCE_AWARE, route=S.VIA_EVOLVABLE, generations=3)
+    assert out["metrics"]["clean_work_refused_rate"] == 0.0
+    assert any(not r["attacked"] for r in out["generations"])
+
 
 def test_the_experiment_separates_c_from_d():
     """C と D が同じ数字を出す実験は、この節が存在する理由を測れていない。"""
@@ -154,7 +177,7 @@ def test_the_experiment_separates_c_from_d():
 def test_the_reading_states_the_result_rather_than_leaving_it_to_a_reader():
     result = S.run(generations=4)
     text = " ".join(result["reading"])
-    assert "does nothing about the one that does not" in text
+    assert "has nothing to say about one inside it" in text
 
 
 def test_the_report_carries_its_own_caveats():

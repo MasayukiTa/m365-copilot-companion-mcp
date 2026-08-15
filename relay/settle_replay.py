@@ -100,7 +100,7 @@ def load_turns(path=None) -> dict:
     -- which is the failure this whole exercise exists to avoid.
     """
     path = path or DEFAULT_TRACE
-    rows = []
+    rows, dropped = [], 0
     try:
         for line in io.open(path, encoding="utf-8", errors="replace"):
             line = line.strip()
@@ -108,9 +108,20 @@ def load_turns(path=None) -> dict:
                 try:
                     rows.append(json.loads(line))
                 except Exception:
-                    pass
+                    # COUNTED, NOT SILENTLY DISCARDED. A partial line at the end of a file
+                    # being appended to is ordinary; a hundred of them mid-file means polls or
+                    # whole turns went missing, and dropping them without a word changes every
+                    # denominator downstream while nothing in the output moves.
+                    dropped += 1
     except OSError as exc:
         raise NotReplayable("no trace at %s (%s)" % (path, exc))
+
+    if dropped > 1:
+        raise NotReplayable(
+            "%d lines of %s could not be parsed. One trailing partial line is a file being "
+            "written; more than that means polls are missing, and a replay over what survived "
+            "would report denominators nobody can reconcile."
+            % (dropped, os.path.basename(path)))
 
     if not rows:
         raise NotReplayable(
@@ -212,12 +223,14 @@ def accept_index_sampled(polls, *, need_stable=2, need_samples=3) -> int:
             continue
         if _is_placeholder(text):
             continue
-        seen += 1
         run = run + 1 if text == previous else 1
         previous = text
-        # The floor counts INFORMATIVE samples, not raw polls: counting placeholders towards
-        # it would let a burst of "処理中です" satisfy a rule whose whole purpose is to have
-        # looked at the answer three times.
+        # THE FLOOR COUNTS OBSERVATIONS OF THIS TEXT, not informative samples ever seen. An
+        # earlier version incremented a running total that was never reset, so after any
+        # earlier partial read the first two identical reads in a later pause already
+        # satisfied a "three samples" rule -- the arm collapsed to the legacy predicate
+        # exactly where the floor was supposed to bite, and the comparison had no second arm.
+        seen = run
         if run >= need_stable and seen >= need_samples and text.strip():
             return i
     return -1
@@ -246,9 +259,17 @@ def _split_label(polls):
     """
     decidable = [p for p in polls if not p.get("post_accept")]
     tail = [p for p in polls if p.get("post_accept")]
-    final = (tail[-1].get("text") if tail else
-             (decidable[-1].get("text") if decidable else "")) or ""
-    return decidable, final, bool(tail)
+    if not tail:
+        return decidable, (decidable[-1].get("text") if decidable else "") or "", False
+
+    # THE TAIL HAS TO HAVE SETTLED, not merely ended. Taking its last sample as truth treats
+    # "we stopped looking" as "the text stopped changing" -- the same substitution that made
+    # production's accepted text the label in the first place. A tail whose last two samples
+    # still differ is a turn we watched while it was moving, and its label is not established.
+    texts = [(p.get("text") or "") for p in tail]
+    if len(texts) >= 2 and texts[-1] != texts[-2]:
+        return decidable, texts[-1], False
+    return decidable, texts[-1], True
 
 
 def replay(turns, implementations=None) -> dict:
@@ -267,7 +288,15 @@ def replay(turns, implementations=None) -> dict:
     for turn_id, polls in sorted(turns.items()):
         decidable, final, labelled = _split_label(polls)
         if not labelled:
+            # NOT SCORED. The module said these were "reported as unlabelled rather than
+            # scored" and then scored them anyway: they went into every per-arm count and into
+            # the reduction denominator, so a run of turns whose label is production's own
+            # accepted text diluted the rate towards zero while the warning line said the
+            # opposite. Excluded here, counted, and reported.
             unlabelled_turns += 1
+            rows.append({"turn_id": turn_id, "polls": len(decidable), "labelled": False,
+                         "legacy": None, "sampled": None})
+            continue
         outcome = {}
         for name, fn in impls.items():
             idx = fn(decidable)
@@ -300,7 +329,7 @@ def replay(turns, implementations=None) -> dict:
         rows.append({"turn_id": turn_id, "polls": len(decidable),
                      "labelled": labelled, **outcome})
 
-    total = len(turns)
+    total = len(turns) - unlabelled_turns
     for name, counts in per.items():
         counts["truncation_rate"] = (counts["truncated"] / counts["accepted"]
                                      if counts["accepted"] else None)
@@ -353,8 +382,18 @@ def reduction(per, turns, rows=None) -> dict:
     """
     legacy = per.get("legacy") or {}
     sampled = per.get("sampled") or {}
-    fixed = max(0, legacy.get("truncated", 0) - sampled.get("truncated", 0))
+    # COUNTED FROM THE PAIRS, not from two totals. Subtracting counts credited the sampled arm
+    # for every turn the legacy arm truncated -- including turns the sampled arm simply never
+    # accepted, which is a production TIMEOUT rather than a fix. A predicate that accepts
+    # nothing would have scored a perfect reduction.
+    fixed = sum(1 for r in (rows or [])
+                if (r.get("legacy") or {}).get("truncated")
+                and (r.get("sampled") or {}) and not r["sampled"].get("truncated"))
+    if not rows:
+        fixed = legacy.get("truncated", 0) - sampled.get("truncated", 0)
     n = max(1, turns)
+    # NOT CLAMPED. Clamping at zero hides the case worth knowing about -- the sampled arm
+    # being WORSE -- behind the same number as "no difference".
     point = fixed / n
 
     clustered = _cluster_interval(rows)
@@ -393,8 +432,21 @@ def _cluster_interval(rows, draws=2000, seed=20260815):
     if len(groups) < 2:
         return None
 
-    import random
     keys = sorted(groups)
+
+    # THE ALL-ZERO CASE, WHICH IS THE ONE THIS DATA IS IN. A nonparametric bootstrap resamples
+    # the values it saw; if every cluster contains only zeros, every draw is zero and the
+    # interval is [0, 0]. That is not "we are certain the rate is zero" -- it is "a bootstrap
+    # cannot invent an event it never observed", and reporting it as an interval would claim
+    # more certainty than the turn-level Wilson figure this was meant to correct.
+    #
+    # With no events, the honest bound is the rule of three over the number of INDEPENDENT
+    # units: with c clusters and none showing the event, the upper bound is about 3/c. Twelve
+    # prompts and no truncation is an upper bound near 0.25, not zero.
+    if not any(any(g) for g in groups.values()):
+        return 0.0, min(1.0, 3.0 / len(keys)), len(keys)
+
+    import random
     rng = random.Random(seed)
     points = []
     for _ in range(draws):

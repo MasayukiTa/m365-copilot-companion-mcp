@@ -94,7 +94,7 @@ class _Bridge(A.BridgeAgent):
         return self._raw
 
     def _new_conversation(self):
-        pass
+        return True
 
 
 _DONE = ('data: {"replace": "the answer"}\n\n'
@@ -152,3 +152,38 @@ def test_the_runner_records_a_non_settling_turn_as_infra():
     out = R.run_episode(ep, _Bridge(""))
     assert out["infra_failure"] is True
     assert out["success"] is False
+
+
+def test_a_failed_fresh_conversation_is_an_environment_result_not_a_silent_carry_over():
+    """戻り値を捨てていたので、ブリッジが混雑していると前のエピソードの会話の中で走った。
+    一方のエピソードが他方の文脈を持つのは、この adapter が新規会話を開く理由そのもの。
+    しかも採点は通るので、スイートの答えが実行順に依存する。"""
+    class _NoNew(_Bridge):
+        def _new_conversation(self):
+            return False
+
+    with pytest.raises(A.TurnDidNotSettle) as exc:
+        _NoNew(_DONE)("x", "C:/wd")
+    assert "order-dependent" in str(exc.value)
+
+
+def test_a_bridge_error_that_terminated_the_stream_is_not_an_answer():
+    """ブリッジは自分の例外の後にも done を出す。settled だけでは足りない。"""
+    raw = 'data: {"ok": false, "error": "page went away"}\n\nevent: done\ndata: {}\n\n'
+    with pytest.raises(A.TurnDidNotSettle) as exc:
+        _Bridge(raw)("x", "C:/wd")
+    assert "reported an error" in str(exc.value)
+
+
+def test_an_answer_that_merely_mentions_errors_is_still_an_answer():
+    """本文に error という語が出るだけで infra に落とすと、本物の回答が消える。"""
+    raw = ('data: {"replace": "Common causes: an error in the config, ok: false in the log"}'
+           '\n\nevent: done\ndata: {}\n\n')
+    assert "Common causes" in _Bridge(raw)("x", "C:/wd")
+
+
+def test_the_client_does_not_give_up_before_the_bridge_does():
+    """クライアントが先に諦めると、遅いターンが infra になって分母から消える --
+    対象が遅くなるほど pass rate が上がる。"""
+    from bench.companionbench.agents import BridgeAgent
+    assert BridgeAgent().timeout >= 600

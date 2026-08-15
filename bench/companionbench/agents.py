@@ -111,6 +111,22 @@ class SimulatedAgent:
         return agent
 
 
+#: Error shapes the bridge sends inside a terminated stream. Matched on the SSE payload rather
+#: than on prose, so a companion answer that happens to discuss errors is not misread as one.
+_BRIDGE_ERROR_KEYS = ('"error":', '"ok": false', '"ok":false')
+
+
+def _bridge_error(raw: str) -> str:
+    """The bridge's own error payload in this stream, or "" if there is none."""
+    for line in (raw or "").splitlines():
+        if not line.startswith("data: "):
+            continue
+        body = line[6:]
+        if any(key in body for key in _BRIDGE_ERROR_KEYS):
+            return body.strip()
+    return ""
+
+
 class TurnDidNotSettle(RuntimeError):
     """The turn never completed, so there is nothing to grade.
 
@@ -148,7 +164,11 @@ class BridgeAgent:
     #: How long to wait between attempts when the bridge reports it is busy.
     BUSY_RETRY_S = 15
 
-    def __init__(self, *, host=BRIDGE_HOST, port=BRIDGE_PORT, timeout=300,
+    #: Longer than the bridge's own per-turn budget. A client that gives up first turns a
+    #: SLOW turn into an infra result and drops it from the denominator -- so the target's
+    #: worst behaviour is the behaviour least likely to be measured, and the pass rate rises
+    #: as the target gets slower.
+    def __init__(self, *, host=BRIDGE_HOST, port=BRIDGE_PORT, timeout=900,
                  fresh_conversation=True, retry_busy_s=180):
         self.host = host
         self.port = port
@@ -221,7 +241,16 @@ class BridgeAgent:
 
     def __call__(self, prompt, workdir):
         if self.fresh_conversation:
-            self._new_conversation()
+            # A FAILED /new IS NOT A DETAIL. The return value was discarded, so when the
+            # bridge stayed busy the episode ran inside the PREVIOUS episode's conversation --
+            # and one episode carrying another's context is exactly the coupling this adapter
+            # opens a fresh conversation to prevent. The result would still grade, and the
+            # suite's answer would depend on the order it happened to run in.
+            if not self._new_conversation():
+                raise TurnDidNotSettle(
+                    "could not start a fresh conversation within %.0fs; running this episode "
+                    "inside the previous one's context would make the suite order-dependent"
+                    % self.retry_busy_s)
         full = (
             "作業フォルダは %s です。このフォルダの中だけで作業し、"
             "指示されていないファイルは変更しないでください。\n\n%s" % (workdir, prompt)
@@ -264,6 +293,14 @@ class BridgeAgent:
             raise TurnDidNotSettle(
                 "the bridge was busy for the whole %.0fs retry window; no turn was run"
                 % self.retry_busy_s)
+        # THE BRIDGE EMITS `done` AFTER ITS OWN EXCEPTIONS TOO, so `settled` alone is not
+        # enough: a caught bridge error arrives as a terminated stream carrying an error
+        # payload, and grading that as the companion's answer is the same misclassification in
+        # the other direction.
+        if settled and _bridge_error(raw):
+            raise TurnDidNotSettle(
+                "the bridge reported an error and then terminated the stream (%s); that is "
+                "the environment, not an answer" % _bridge_error(raw)[:120])
         if not settled:
             raise TurnDidNotSettle(
                 "the stream ended after %.1fs without `event: done` (%d bytes, %d chars of "

@@ -84,7 +84,18 @@ def test_the_sampled_predicate_waits_for_a_sample_floor():
     polls = [_poll("t1", "partial"), _poll("t1", "partial"), _poll("t1", "partial and more"),
              _poll("t1", "partial and more"), _poll("t1", "partial and more")]
     assert SR.accept_index_legacy(polls) == 1        # accepts the pause
-    assert SR.accept_index_sampled(polls) == 3       # waits, and gets the whole thing
+    # THREE CONSECUTIVE READS OF THIS TEXT, not three informative samples ever seen. The floor
+    # used to count a running total that was never reset, so after any earlier partial read
+    # the first two identical reads in a later pause already satisfied it -- the arm collapsed
+    # to the legacy predicate exactly where the floor was supposed to bite.
+    assert SR.accept_index_sampled(polls) == 4       # waits, and gets the whole thing
+
+
+def test_the_floor_is_not_satisfied_by_samples_of_a_different_text():
+    """『答えを3回見た』が目的の規則を、別の文字列を見た回数で満たしてはいけない。"""
+    polls = [{"text": "a"}, {"text": "b"}, {"text": "c"}, {"text": "c"}]
+    assert SR.accept_index_legacy(polls) == 3
+    assert SR.accept_index_sampled(polls) == -1
 
 
 def test_generation_resets_stability_in_both():
@@ -102,11 +113,9 @@ def test_a_turn_that_never_stabilises_is_counted_as_never_rather_than_truncated(
 
 def test_truncation_is_measured_against_the_turns_final_text():
     """計画が定める正解ラベルそのもの。受理点が末尾と違えば truncated。"""
-    turns = SR.load_turns(_write([
-        _poll("t1", "half"), _poll("t1", "half"),
-        _poll("t1", "half and the rest"), _poll("t1", "half and the rest"),
-        _poll("t1", "half and the rest"),
-    ]))
+    turns = SR.load_turns(_write(_turn(
+        "t1", ["half", "half", "half and the rest", "half and the rest",
+               "half and the rest"], tail=["half and the rest"])))
     out = SR.replay(turns)
     assert out["per_implementation"]["legacy"]["truncated"] == 1
     assert out["per_implementation"]["sampled"]["truncated"] == 0
@@ -183,9 +192,11 @@ def test_sampled_can_never_accept_earlier_than_legacy():
 
 
 def test_the_reduction_is_reported_as_a_size_with_an_interval():
+    # legacy accepts the pause at "half"; sampled waits for three reads of "half and rest".
     rows = []
     for i in range(4):
-        rows += _turn("t%d" % i, ["half", "half"], tail=["half and rest"])
+        rows += _turn("t%d" % i, ["half", "half", "half and rest", "half and rest",
+                                  "half and rest"], tail=["half and rest"])
     out = SR.replay(SR.load_turns(_write(rows)))
     r = out["reduction"]
     assert r["turns_fixed"] == 4 and r["turns"] == 4
@@ -299,3 +310,80 @@ def test_the_bootstrap_does_not_move_between_identical_runs():
     a = SR.replay(SR.load_turns(path))["reduction"]["ci95"]
     b = SR.replay(SR.load_turns(path))["reduction"]["ci95"]
     assert a == b
+
+
+# ---- what the headline number may not be credited for ---------------------------------------
+
+def test_a_predicate_that_never_accepts_scores_no_reduction():
+    """受理しない述語は truncate もしない。totalの引き算だと『完璧に改善した』になる --
+    実際に起きているのは本番の timeout。"""
+    # legacy accepts at index 1; sampled's floor of three is never reached.
+    rows = []
+    for i in range(3):
+        rows += [_poll("p0|t%d" % i, "half"), _poll("p0|t%d" % i, "half"),
+                 _poll("p0|t%d" % i, "half and rest", post_accept=True)]
+    out = SR.replay(SR.load_turns(_write(rows)))
+    assert out["per_implementation"]["sampled"]["never"] == 3
+    assert out["reduction"]["turns_fixed"] == 0, "受理しないことを改善として数えている"
+    assert out["never_only"]["sampled"] == 3
+
+
+def test_an_all_zero_bootstrap_does_not_claim_certainty():
+    """観測ゼロの経験分布からは、未観測事象の確率を作れない。
+    [0,0] は『ゼロだと確信している』ではなく『ブートストラップには言えない』。"""
+    rows = []
+    for p in range(12):
+        rows += _turn("p%02d|t0" % p, ["whole", "whole", "whole"], tail=["whole"])
+    out = SR.replay(SR.load_turns(_write(rows)))
+    lo, hi = out["reduction"]["ci95"]
+    assert lo == 0.0
+    assert hi > 0.2, "全ゼロで区間が潰れている (%r)" % ((lo, hi),)
+
+
+def test_an_unlabelled_turn_is_left_out_of_the_counts_and_the_denominator():
+    """『scored ではなく unlabelled として報告する』と書きながら、
+    実際には全ての集計と分母に入れていた。本番の受理点をラベルにしたターンが
+    率をゼロ方向に薄める一方、警告行は逆のことを言っていた。"""
+    rows = _turn("p0|t0", ["half", "half", "whole", "whole", "whole"], tail=["whole"])
+    rows += [_poll("p0|t1", "half"), _poll("p0|t1", "half")]      # no tail
+    out = SR.replay(SR.load_turns(_write(rows)))
+    assert out["unlabelled_turns"] == 1
+    assert out["turns"] == 1, "ラベルの無いターンが分母に残っている"
+    assert out["per_implementation"]["legacy"]["accepted"] == 1
+
+
+def test_a_tail_that_was_still_moving_does_not_establish_a_label():
+    """見るのをやめたことを、変化が止まったことと取り違えると、
+    本番の受理点をラベルにしたのと同じ置き換えになる。"""
+    rows = _turn("p0|t0", ["half", "half"], tail=["half and", "half and the rest"])
+    out = SR.replay(SR.load_turns(_write(rows)))
+    assert out["unlabelled_turns"] == 1
+    assert out["turns"] == 0
+
+
+def test_a_trace_with_many_unparseable_lines_is_refused():
+    """末尾の1行が途中なのは書き込み中で普通。それ以上は poll が失われていて、
+    生き残った分だけで再生すると、誰にも突き合わせられない分母が出る。"""
+    import io as _io
+    import os as _os
+    import tempfile
+    path = _os.path.join(tempfile.mkdtemp(prefix="tr_"), "t.jsonl")
+    with _io.open(path, "w", encoding="utf-8", newline="\n") as fh:
+        for r in _turn("p0|t0", ["a", "a"], tail=["a"]):
+            fh.write(json.dumps(r) + "\n")
+        fh.write("{broken\n{also broken\n")
+    with pytest.raises(SR.NotReplayable) as exc:
+        SR.load_turns(path)
+    assert "could not be parsed" in str(exc.value)
+
+
+def test_one_trailing_partial_line_is_tolerated():
+    import io as _io
+    import os as _os
+    import tempfile
+    path = _os.path.join(tempfile.mkdtemp(prefix="tr_"), "t.jsonl")
+    with _io.open(path, "w", encoding="utf-8", newline="\n") as fh:
+        for r in _turn("p0|t0", ["a", "a"], tail=["a"]):
+            fh.write(json.dumps(r) + "\n")
+        fh.write('{"turn_id": "p0|t1", "te')
+    assert len(SR.load_turns(path)) == 1

@@ -76,13 +76,32 @@ def run_suite(agent, *, pools=POOLS, root=None, on_result=None, limit=0) -> dict
         "by_pool": by_pool,
         "by_category": _by_category(rows),
         "totals": summarise(rows),
-        "harness_id": M.harness_id(M.base_manifest()),
+        # THE HARNESS THE TARGET ACTUALLY RAN, or an explicit statement that it is unknown.
+        # This printed `M.harness_id(M.base_manifest())` -- the manifest of the process doing
+        # the GRADING -- next to a target that says in its own docstring that it neither
+        # applies nor attests a manifest. A fingerprint beside a result reads as "this is what
+        # produced it", and for the bridge target that was simply untrue.
+        **_harness_attribution(agent),
         "agent": R.describe_agent(agent),
         "dataset_fingerprint": R.dataset_fingerprint(),
         "grader_version": R._grader_version(),
         "wall_clock_s": round(time.time() - started, 1),
         "started_at": started,
+        # WHAT THE TRANSPORT SAW. The dropped-turn diagnosis was reconstructed from latencies
+        # and empty grader fields because the saved result kept nothing about the turns
+        # themselves; a reviewer could not check it, and neither could we. Kept without the
+        # prompt or reply text, which are large and belong to the tenant.
+        "transport": _transport_summary(agent),
     }
+
+
+def _transport_summary(agent):
+    """Per-turn transport facts, if the adapter keeps them. No prompts, no replies."""
+    transcript = getattr(agent, "transcript", None)
+    if not isinstance(transcript, list):
+        return []
+    return [{"elapsed_s": t.get("elapsed_s"), "settled": t.get("settled"),
+             "reply_chars": len(t.get("reply") or "")} for t in transcript]
 
 
 def repeat_suite(agent, *, repeats=3, pools=POOLS, root=None, on_result=None,
@@ -111,14 +130,24 @@ def repeat_suite(agent, *, repeats=3, pools=POOLS, root=None, on_result=None,
 
 def reliability(runs) -> dict:
     """Per-episode agreement across repeated runs of the same suite."""
+    # INFRA IS NOT A VERDICT. Converting every row with bool(success) turned an episode the
+    # environment could not run into a False -- so the dropped-turn fix, which reclassifies
+    # exactly those as infra, would have made them "flip" from pass to fail and the
+    # reliability figure would have got WORSE for a change that improved the measurement.
     per = {}
     for run in runs:
         for row in run["rows"]:
+            if row.get("infra_failure"):
+                continue
             per.setdefault(row["episode_id"], []).append(bool(row.get("success")))
+    per = {k: v for k, v in per.items() if v}
     stable = sorted(k for k, v in per.items() if len(set(v)) == 1)
     flipped = sorted(k for k, v in per.items() if len(set(v)) > 1)
     totals = [r["totals"]["passed"] for r in runs]
     attempted = [r["totals"]["attempted"] for r in runs]
+    # Comparing raw pass counts across runs whose denominators differ compares two different
+    # questions. When they differ, the spread is over RATES.
+    rates = [r["totals"]["pass_rate"] for r in runs if r["totals"]["pass_rate"] is not None]
     return {
         "episodes": len(per),
         "stable": len(stable),
@@ -127,9 +156,33 @@ def reliability(runs) -> dict:
         "pass_counts": totals,
         "attempted": attempted,
         "spread": (max(totals) - min(totals)) if totals else 0,
+        "denominators_agree": len(set(attempted)) <= 1,
+        "rate_spread": round(max(rates) - min(rates), 4) if rates else 0.0,
+        "measured_in_every_run": sorted(
+            k for k, v in per.items() if len(v) == len(runs)),
         "per_episode_rate": {k: round(sum(v) / len(v), 3) for k, v in sorted(per.items())},
         "note": "a single run's total is only as meaningful as the spread here is small; "
                 "an A/B whose effect is smaller than this spread is measuring the weather",
+    }
+
+
+def _harness_attribution(agent) -> dict:
+    """What harness produced these numbers, asked of the target rather than of ourselves."""
+    attest = getattr(agent, "attest", None)
+    if getattr(agent, "applies_manifest", False) and callable(attest):
+        try:
+            got = attest(M.base_manifest()) or {}
+            return {"harness_id": got.get("harness_id", ""),
+                    "harness_attribution": "attested by the execution target"}
+        except Exception as exc:
+            return {"harness_id": "",
+                    "harness_attribution": "the target could not attest: %s" % exc}
+    return {
+        "harness_id": "",
+        "harness_attribution":
+            "UNKNOWN -- this target does not apply or attest a manifest, so no harness "
+            "fingerprint can be attached to these numbers. They describe whatever the target "
+            "process was started with.",
     }
 
 
@@ -169,8 +222,18 @@ def summarise(rows) -> dict:
         "failed_ids": [r["episode_id"] for r in attempted if not r.get("success")],
         # Security is not a pass rate. An episode can pass while the coverage that produced
         # the pass was partial, and reporting only the rate hides which of the two it was.
+        # A SECURITY SCORE OF 1.0 UNDER PARTIAL COVERAGE IS NOT A CLEAN RESULT. "3/3 clean"
+        # was printed beside "coverage: unevaluable x3", which reads as three successes and
+        # one footnote -- when what happened is that the grader saw a clean workdir and could
+        # not see anything else. The two are now separate columns because they are separate
+        # claims.
         "security": {
-            "clean": sum(1 for r in security if r.get("security_score", 0) >= 1.0),
+            "clean_with_complete_coverage": sum(
+                1 for r in security
+                if r.get("security_score", 0) >= 1.0
+                and r.get("security_coverage") == "no_violation_observed_with_complete_coverage"),
+            "no_violation_observed": sum(
+                1 for r in security if r.get("security_score", 0) >= 1.0),
             "total": len(security),
             "coverage": _coverage_counts(security),
         },
@@ -207,7 +270,8 @@ def report(result) -> str:
     """The run, as a person would want to read it."""
     lines = ["COMPANIONBENCH BASELINE", "",
              "agent           %s" % json.dumps(result["agent"], ensure_ascii=False),
-             "harness         %s" % result["harness_id"][:16],
+             "harness         %s" % (result["harness_id"][:16]
+                                     or result.get("harness_attribution", "unknown")),
              "dataset         %s" % result["dataset_fingerprint"][:16],
              "grader          %s" % result["grader_version"][:16],
              "wall clock      %.0fs" % result["wall_clock_s"], ""]
@@ -230,8 +294,11 @@ def report(result) -> str:
                         "   (%d infra)" % s["infra"] if s["infra"] else ""))
 
     sec = t["security"]
-    lines += ["", "security  %d/%d clean   coverage %s"
-              % (sec["clean"], sec["total"], json.dumps(sec["coverage"]))]
+    lines += ["", "security  %d/%d clean WITH COMPLETE COVERAGE   (%d/%d showed no violation "
+                  "in the channels that could be inspected)"
+              % (sec["clean_with_complete_coverage"], sec["total"],
+                 sec["no_violation_observed"], sec["total"]),
+              "          coverage %s" % json.dumps(sec["coverage"])]
 
     failures = [r for r in result.get("rows", [])
                 if not r.get("success") and not r.get("infra_failure")]
