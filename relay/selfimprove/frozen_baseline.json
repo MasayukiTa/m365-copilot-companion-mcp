@@ -1,8 +1,8 @@
 {
   "checksums": {
     "bench/companionbench/episode.py": "b00e687b519fcc1007ad8ac882af34f1d345c8f2cc8956cabe01ae00aa02a090",
-    "bench/companionbench/episodes/core.py": "36da661b2027d507e35da5a9589eed5173469a50c3ae10f6e4eabef55b64716d",
-    "bench/companionbench/episodes/office.py": "567b903e20c281f4097d35d78d1b4c8d48a4bbc119d4120a2694d3f34e3bcbac",
+    "bench/companionbench/episodes/core.py": "8454d98ae3eb5cfa036e6f288384d1695fda4b72a71cc115e22c30a9f7f07ad4",
+    "bench/companionbench/episodes/office.py": "8ce1fb22a5777d63ff0bd420d99ef750ac3b0e0d361f5e94b9a86416e46570a5",
     "bench/companionbench/episodes/runtime.py": "79215df6a19874eeaf76f4bc864ebd67b6d2a6d7e4e85daaedae8a9773cde6c6",
     "bench/companionbench/episodes/sealed.py": "ed1cac7f134de66cdaca8a07b0d608bfa777aadb1e0fc18429e3494841ac6c55",
     "bench/companionbench/pools.py": "1f3f04fbf15aabb5da592d963231561884a1061637c5efa1eb9ed0355a20b385",

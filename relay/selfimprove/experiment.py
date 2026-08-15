@@ -44,6 +44,22 @@ FINGERPRINT_ENV_KEYS = (
 )
 
 
+def _judge_digest() -> str:
+    """One hash over the current contents of the frozen set, or "unavailable".
+
+    Deliberately the FROZEN files rather than the whole tree: hashing everything would make
+    the fingerprint change on an unrelated edit and nobody would trust it, while hashing
+    nothing leaves git as the only witness -- and git is frequently not available here. The
+    frozen set is exactly the code whose change invalidates a comparison.
+    """
+    try:
+        from relay.selfimprove import frozen as _F
+        sums = _F.compute_checksums()
+        return hashlib.sha256(canonical(sums).encode("utf-8")).hexdigest()[:32]
+    except Exception:
+        return "unavailable"
+
+
 def _git_commit() -> str:
     """The exact commit the harness ran from, or "unknown".
 
@@ -103,6 +119,13 @@ def harness_fingerprint(*, genome=None, component_versions=None, execution_profi
         "execution_profile": execution_profile or source.get("MCP_EXECUTION_PROFILE", ""),
         "model": model,
         "env_toggles": {k: source.get(k) for k in FINGERPRINT_ENV_KEYS if source.get(k) is not None},
+        # THE COMMIT IS NOT ENOUGH, and on this machine it is often not even available: git
+        # off PATH makes git_commit "unknown" for every run, and a dirty tree records only
+        # git_dirty=True, so two harnesses with completely different uncommitted changes
+        # fingerprint identically. That turns the id from "which harness ran" into "which
+        # harness roughly ran", which is the half that cannot be cited. Hashing the judge's
+        # own files pins the part that decides outcomes, independently of git.
+        "judge_digest": _judge_digest(),
     }
     if extra:
         fields["extra"] = extra
