@@ -3,7 +3,7 @@
     "bench/companionbench/episode.py": "bc0343fa5bcbfff32415b185fe44a500e1aeab0c9efe1d7ec7fc7e6bef11422f",
     "bench/companionbench/episodes/core.py": "2fc4d915d306c308df198adc5c1b6d5152c5bfc12847fa6b6984f52d20fc66d0",
     "bench/companionbench/episodes/office.py": "5cd6ea8a953a2a7820a89b6d81d6a8c0651593fa6c70f8520580993ffc623499",
-    "bench/companionbench/episodes/runtime.py": "28884497c867e74833fbaf7bb897e4e2a5c39e489e880c7c8e2e15215119c2e3",
+    "bench/companionbench/episodes/runtime.py": "91bb387b3e2623dc017c270123ae9869f176af41cea67a09eaeb6cab88c1239f",
     "bench/companionbench/episodes/sealed.py": "0550b3dc00df8600601ba1c60a4a5f2d58fbc28bd58a8932231dc61579d3f377",
     "bench/companionbench/pools.py": "53e9759fa105c59f3e5b2c413cb9621fba17450422c459961a0c33addfbc549b",
     "bench/companionbench/runner.py": "12bab94f42bfcf70c1929c5f835d379253aa2ce8314f268b1364576ecc18b500",
