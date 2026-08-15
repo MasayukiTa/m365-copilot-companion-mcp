@@ -668,3 +668,57 @@ def test_the_arms_are_interleaved_rather_than_run_end_to_end():
     half = len(order) // 2
     assert 8 in order[:half], "候補側が全部後半に固まっている(順序交絡)"
     assert 2 in order[half:]
+
+
+# ---- round 7: guards that were reachable around --------------------------------------------
+
+def test_a_synthesised_failure_does_not_count_as_complete_security_coverage():
+    """runner が合成する結果(入力削除・グレーダ破壊)は security_score 1.0 で
+    coverage 無し。None を『完全』扱いしていたので、セキュリティエピソードを
+    壊した候補が『合格』としてゲートを通れた。"""
+    base = [{"episode_id": "sec_a", "category": "security", "success": True,
+             "infra_failure": False, "security_score": 1.0,
+             "security_coverage": "no_violation_observed_with_complete_coverage"}]
+    cand = [{"episode_id": "sec_a", "category": "security", "success": False,
+             "infra_failure": False, "security_score": 1.0}]      # synthesised: no coverage
+    sec = R._security_regression(base, cand)
+    assert sec["incomplete_coverage"] == ["sec_a"]
+
+    from relay.selfimprove import decision as Dec
+    d = Dec.decide(gate={"keep": True, "verdict": "keep"}, security=sec,
+                   sentinel={"regressed": False}, regression={"regressed": False},
+                   will_activate=True)
+    assert d["state"] == Dec.NEEDS_HUMAN_REVIEW
+
+
+def test_the_evaluator_applies_the_adapters_own_refusals():
+    """FleetAgent.check_genome は誰からも呼ばれていなかったので、
+    『refuter 無効時の refute 予算』『seed 無しの記憶実験』の拒否は
+    人が手で呼んだときだけ働くオペレータ用チェックにとどまっていた。"""
+    class _Picky:
+        applies_manifest = True
+        execution_target = A.IN_PROCESS
+        covered_fields = A.IN_PROCESS_FIELDS
+
+        def __call__(self, p, w):
+            return ""
+
+        def attest(self, manifest):
+            return A.attest_in_process(manifest)
+
+        def check_genome(self, base, cand):
+            raise RuntimeError("this adapter knows something the runner cannot")
+
+    base_m = M.base_manifest()
+    cand_m = M.apply_genome(base_m, {"parameters": {"memory_max_items": 9}})
+    out = R.paired_evaluate(base_m, cand_m, _Picky(), tmpdir=tempfile.mkdtemp())
+    assert out["infra"]["aborted"] is True
+    assert "refused this comparison" in out["infra"]["reason"]
+
+
+def test_the_sealed_sentinel_is_interleaved_too():
+    """封印プールをベース全件→候補全件で走らせると、状態を持つアダプタが
+    1周目で salt 由来のフィクスチャを全部見て、2周目で再生できる。"""
+    import inspect
+    src = inspect.getsource(R._sealed_sentinel)
+    assert "order.reverse()" in src, "sentinel が交互実行になっていない"

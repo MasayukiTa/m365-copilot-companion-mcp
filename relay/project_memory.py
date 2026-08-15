@@ -42,8 +42,17 @@ _INDEX_MAX_THEMES = 40
 _SLUG_MAX = 48
 
 
+#: An explicit state root, for a run that must not share memory with anything else. The
+#: fleet A/B adapter seeds one per arm: fleet memory is read AND written every run, so two
+#: arms sharing a store turn a paired comparison into a sequence where the baseline teaches
+#: the candidate. The adapter set this and nothing read it, so the isolation it advertised
+#: did not exist -- an independent review found the seeded directory sitting unused.
+STATE_DIR_ENV = "FLEET_STATE_DIR"
+
+
 def _mem_dir(state_dir):
-    return os.path.join(state_dir or ".fleet", "memory")
+    root = state_dir or os.environ.get(STATE_DIR_ENV, "").strip() or ".fleet"
+    return os.path.join(root, "memory")
 
 
 def _index_path(state_dir):
@@ -155,7 +164,7 @@ def entry_authority(line):
     return P.normalise(line.split(marker, 1)[1].split("-->", 1)[0])
 
 
-def authorities_in(theme, state_dir=".fleet", goal=""):
+def authorities_in(theme, state_dir=None, goal=""):
     """Every distinct authority present in a theme's entries. For the evolution loop."""
     try:
         _theme, slug = _resolve(theme, goal)
@@ -172,7 +181,7 @@ def _fmt_ts(ts):
         return ""
 
 
-def record_task(theme, goal, outcome, note="", state_dir=".fleet", ts=None, folder="",
+def record_task(theme, goal, outcome, note="", state_dir=None, ts=None, folder="",
                 authority=None):
     """Record one finished piece of work under `theme`. Never raises; returns bool.
 
@@ -299,7 +308,7 @@ def _select_entries(entries, max_items):
     return impl(entries, max_items)
 
 
-def load_notes(theme, max_items=None, state_dir=".fleet", goal="", include_index=True):
+def load_notes(theme, max_items=None, state_dir=None, goal="", include_index=True):
     """Text block to prime into a goal: this theme's recent entries, plus the index of
     what else is remembered. Returns "" when there is nothing. Never raises.
 
@@ -329,7 +338,7 @@ def load_notes(theme, max_items=None, state_dir=".fleet", goal="", include_index
         return ""
 
 
-def list_themes(state_dir=".fleet"):
+def list_themes(state_dir=None):
     """Every remembered theme as (theme, slug, path). For the cockpit and for tests."""
     out = []
     try:

@@ -36,10 +36,19 @@ which is the failure this whole module is a correction for:
     would prime the next and the comparison becomes a sequence;
   * a harness id from the child that is not the one we sent.
 
-NOT VERIFIED AGAINST A LIVE FLEET. The refusals, the attestation protocol and the isolation
-are tested; an actual browser-driven run is not, and this docstring should not be read as
-claiming otherwise. What is guaranteed today is that a run which cannot be attributed will
-refuse rather than produce a number.
+NOT VERIFIED AGAINST A LIVE FLEET -- and the first version of this note UNDERSTATED that.
+It said "not verified", which invites the reading "probably works, untested". A reviewer
+found it could not have worked at all: the parent put a live Playwright context into a JSON
+payload, and a browser handle does not survive json.dumps. The child now attaches to a CDP
+endpoint and owns its own context, which is both the only arrangement that can work and the
+one that keeps each arm's cookies and session state to itself. A second defect in the same
+path read the fleet's result under the wrong key, so even a successful run returned an empty
+reply.
+
+Both are fixed and neither is exercised by a browser here. What IS tested: the refusals, the
+attestation protocol, the per-arm state isolation, and that an error inside the child arrives
+as infrastructure rather than as a wrong answer. What is NOT: a single real episode. Treat
+the live path as unproven code, because that is what it is.
 """
 from __future__ import annotations
 
@@ -95,15 +104,28 @@ if mode == "attest":
 payload = json.loads(sys.stdin.read() or "{}")
 out = {"attest": attest, "reply": "", "error": ""}
 try:
+    # THE CHILD OPENS ITS OWN BROWSER. The first version took a `context` out of the JSON
+    # payload, which cannot work for even one run: a Playwright context is a live handle to
+    # another process's objects and does not survive json.dumps. That made the adapter
+    # unrunnable rather than merely unverified, and the docstring's "not verified against a
+    # live fleet" hid it. Owning the browser is also the correct arrangement -- a per-arm
+    # context is what stops one arm's cookies and session state reaching the other.
+    from playwright.sync_api import sync_playwright
     from relay.relay_fleet import run_relay_fleet
-    res = run_relay_fleet(
-        payload.get("context"), [payload["goal"]], payload["agent_url"],
-        max_concurrent=1, refuter=payload.get("refuter", False),
-        # max_transient / max_refute are LEFT UNSET on purpose: run_relay_fleet takes them
-        # from the active manifest when they are None, and passing them here would silence
-        # the very fields under test.
-    )
-    out["reply"] = (res or [{}])[0].get("response", "") if isinstance(res, list) else str(res)
+    with sync_playwright() as pw:
+        browser = pw.chromium.connect_over_cdp(payload["cdp_url"])
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        res = run_relay_fleet(
+            context, [payload["goal"]], payload["agent_url"],
+            max_concurrent=1, refuter=payload.get("refuter", False),
+            # max_transient / max_refute are LEFT UNSET on purpose: run_relay_fleet takes
+            # them from the active manifest when they are None, and passing them here would
+            # silence the very fields under test.
+        )
+    # `response` was a guess and it was wrong; the fleet reports the final text as
+    # last_response, so every successful run also returned an empty reply.
+    first = (res or [{}])[0] if isinstance(res, list) else {}
+    out["reply"] = (first.get("last_response") or "") if isinstance(first, dict) else str(res)
 except Exception as exc:
     out["error"] = "%s: %s" % (type(exc).__name__, exc)
 print("__COMPANIONBENCH_RESULT__ " + json.dumps(out, ensure_ascii=False))
@@ -123,15 +145,18 @@ class FleetAgent:
     execution_target = FLEET
     covered_fields = FLEET_FIELDS
 
-    def __init__(self, *, agent_url, context=None, refuter=False, memory_seed=None,
+    def __init__(self, *, agent_url, cdp_url=None, refuter=False, memory_seed=None,
                  python=None, timeout_s=1800):
         self.agent_url = agent_url
-        self.context = context
+        # A CDP endpoint, not a live context: the child attaches its own. See the child
+        # source for why a context cannot be handed across the boundary.
+        self.cdp_url = cdp_url
         self.refuter = bool(refuter)
         self.memory_seed = memory_seed
         self.python = python or sys.executable
         self.timeout_s = timeout_s
         self.runs = []
+        self._expected_harness_id = ""
 
     # -- the contract ------------------------------------------------------------------
 
@@ -162,18 +187,38 @@ class FleetAgent:
                 "primes the second")
 
     def attest(self, manifest):
-        """Ask a child which harness it loads, and hand back its answer verbatim."""
+        """Ask a child which harness it loads, and hand back its answer verbatim.
+
+        The answer is also remembered, so every subsequent run in this arm can be checked
+        against it rather than trusting that nothing moved in between.
+        """
+        from relay.selfimprove import manifest as M
         out = self._run_child("attest", None)
-        return out.get("attest") or {}
+        got = out.get("attest") or {}
+        self._expected_harness_id = M.harness_id(manifest)
+        return got
 
     # -- the episode contract ------------------------------------------------------------
 
     def __call__(self, prompt, workdir):
-        payload = {"goal": prompt, "agent_url": self.agent_url, "context": self.context,
+        payload = {"goal": prompt, "agent_url": self.agent_url, "cdp_url": self.cdp_url,
                    "refuter": self.refuter}
         out = self._run_child("run", payload, workdir=workdir)
         self.runs.append({"workdir": workdir, "attest": out.get("attest"),
                           "error": out.get("error")})
+        # AN ERROR IN THE CHILD IS INFRASTRUCTURE, NOT A WRONG ANSWER. The error field was
+        # collected and then dropped, so a browser that would not start arrived at the grader
+        # as an empty reply -- scored as a task the candidate failed. Raising lets the runner
+        # classify it, which is the whole point of its infra/agent distinction.
+        if out.get("error"):
+            raise FleetContractError("the fleet child failed: %s" % out["error"])
+        # The per-run attestation is checked here, not only in the preflight: a manifest that
+        # was right when we asked and wrong when we ran is exactly the case worth catching.
+        got = (out.get("attest") or {}).get("harness_id")
+        if self._expected_harness_id and got != self._expected_harness_id:
+            raise FleetContractError(
+                "the child ran under harness %s but %s was active when the arm began"
+                % (str(got)[:12], self._expected_harness_id[:12]))
         return out.get("reply", "")
 
     # -- internals -----------------------------------------------------------------------
@@ -194,13 +239,20 @@ class FleetAgent:
         return d, state
 
     def _run_child(self, mode, payload, workdir=None):
-        cwd, _state = self._arm_state_dir()
+        cwd, state = self._arm_state_dir()
         env = dict(os.environ)          # MCP_HARNESS_MANIFEST is inherited from _ManifestArm
+        # THE SEEDED MEMORY WAS BEING BUILT AND THEN IGNORED. project_memory resolves `.fleet`
+        # relative to the CURRENT DIRECTORY, and the child was run in the episode's workdir --
+        # so the carefully isolated, identically-seeded store sat unused in a temp folder
+        # while both arms shared whatever `.fleet` the workdir happened to have. The
+        # isolation this class advertises did not exist. FLEET_STATE_DIR carries it
+        # explicitly; the cwd carries it for anything that still resolves relatively.
+        env["FLEET_STATE_DIR"] = state
         try:
             proc = subprocess.run(
                 [self.python, "-c", _child_source(), REPO, mode],
                 input=json.dumps(payload or {}), capture_output=True, text=True,
-                cwd=workdir or cwd, env=env, timeout=self.timeout_s)
+                cwd=cwd, env=env, timeout=self.timeout_s)
         except subprocess.TimeoutExpired:
             raise FleetContractError("the %s child exceeded %ss" % (mode, self.timeout_s))
         for line in (proc.stdout or "").splitlines():

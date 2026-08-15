@@ -26,10 +26,16 @@ concealing the ANSWER while the QUESTION stayed public: the fixtures must be in 
 run, the tests must solve the episodes to prove the seals are right, and from a public
 question the answer is a short walk.
 
-So the question moved instead. `derived()` seeds a generator from the salt, and the amounts,
-the shipped order ids, the duplicate count and the disagreeing totals all come out of it. A
-reader of this repository now sees the SHAPE of each episode -- which is the part that should
-be reviewable -- and none of its values. Deterministic for a given salt, so both arms of an
+So the VALUES moved. `derived()` seeds a generator from the salt, and the amounts, the
+shipped order ids, the duplicate count and the disagreeing totals all come out of it.
+
+Be exact about what that is and is not, because "the question moved" -- which this said --
+is too strong and a reviewer called it. The task shapes, the file names, the traps and the
+solving algorithms are all still public, and the tests here still contain a working solver
+for each episode. What a reader of this repository cannot obtain is the concrete INSTANCE:
+five public templates, instantiated with numbers nobody outside this deployment has. That
+stops an answer being precomputed or memorised; it does not hold out the task or the failure
+pathology, and a sealed result should not be quoted as though it did. Deterministic for a given salt, so both arms of an
 A/B face an identical fixture; different across deployments, so a result fitted to one
 operator's numbers does not transfer to another's.
 

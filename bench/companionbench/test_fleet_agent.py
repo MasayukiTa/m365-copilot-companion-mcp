@@ -16,7 +16,8 @@ import tempfile
 
 import pytest
 
-from bench.companionbench.fleet_agent import FleetAgent, FleetContractError
+from bench.companionbench.fleet_agent import (RESULT_PREFIX, FleetAgent,
+                                              FleetContractError)
 from relay.selfimprove import manifest as M
 from relay.selfimprove import runtime_config as RC
 
@@ -131,3 +132,66 @@ def test_the_adapter_satisfies_the_runner_contract():
     assert FleetAgent.execution_target == A.FLEET
     assert "parameters.max_retries" in FleetAgent.covered_fields
     assert hasattr(FleetAgent, "attest")
+
+
+# ---- round 7: the adapter could not have run at all ---------------------------------------
+
+def test_the_child_is_not_handed_a_browser_context():
+    """Playwright の context は json.dumps を通らない。渡そうとしていた時点で、
+    このアダプタは『未検証』ではなく『動作不能』だった。"""
+    from bench.companionbench.fleet_agent import _child_source
+    src = _child_source()
+    assert "connect_over_cdp" in src, "子が自分でブラウザに接続していない"
+    assert 'payload.get("context")' not in src
+
+
+def test_the_child_reads_the_key_the_fleet_actually_writes():
+    """`response` は当て推量で、実際は last_response。成功した走行まで空返答になっていた。"""
+    from bench.companionbench.fleet_agent import _child_source
+    assert "last_response" in _child_source()
+
+
+def test_a_child_error_is_raised_rather_than_returned_as_an_empty_reply():
+    """ブラウザが起動しない事象が『候補が失敗したタスク』として採点されていた。"""
+    a = _agent(memory_seed=_seed())
+    a._run_child = lambda mode, payload, workdir=None: {
+        "attest": {"harness_id": "x"}, "reply": "", "error": "BrowserType.launch failed"}
+    with pytest.raises(FleetContractError) as exc:
+        a("prompt", tempfile.mkdtemp())
+    assert "fleet child failed" in str(exc.value)
+
+
+def test_the_seeded_memory_directory_is_actually_used(monkeypatch):
+    """seed を作って使っていなかった -- 子は workdir で走り、project_memory は
+    カレント基準で .fleet を解決するので、両腕が同じ store を共有していた。"""
+    from relay import project_memory as PM
+
+    captured = {}
+
+    def fake_run(args, **kw):
+        captured["cwd"] = kw.get("cwd")
+        captured["state"] = (kw.get("env") or {}).get(PM.STATE_DIR_ENV)
+
+        class _P:
+            returncode = 0
+            stdout = RESULT_PREFIX + json.dumps({"attest": {"harness_id": "x"}})
+            stderr = ""
+        return _P()
+
+    import bench.companionbench.fleet_agent as FA
+    monkeypatch.setattr(FA.subprocess, "run", fake_run)
+    a = _agent(memory_seed=_seed())
+    a._run_child("attest", None, workdir=tempfile.mkdtemp(prefix="wd_"))
+    assert captured["state"], "FLEET_STATE_DIR が渡されていない"
+    assert os.path.isfile(os.path.join(captured["state"], "memory", "INDEX.md"))
+    assert captured["cwd"] != "" and captured["state"].startswith(captured["cwd"])
+
+
+def test_project_memory_honours_an_explicit_state_root(monkeypatch):
+    """既定値が真の文字列だったので、env は一度も参照されていなかった。"""
+    from relay import project_memory as PM
+
+    root = tempfile.mkdtemp(prefix="stateroot_")
+    monkeypatch.setenv(PM.STATE_DIR_ENV, root)
+    PM.record_task("テーマ", "作業", "DONE", note="x", authority="MACHINE_VERIFIER")
+    assert os.path.isdir(os.path.join(root, "memory"))
