@@ -261,3 +261,52 @@ def test_a_regression_episode_that_could_not_run_is_not_counted_as_broken():
     base = [{"episode_id": "r1", "success": True}]
     cand = [{"episode_id": "r1", "success": False, "infra_failure": True}]
     assert R._regression_pool_break(base, cand)["regressed"] is False
+
+
+# ---- a candidate must not be able to delete the episodes it would fail -------------------
+
+def _deleting_agent(*names):
+    def agent(_prompt, workdir):
+        for name in names:
+            path = os.path.join(workdir, name)
+            if os.path.isfile(path):
+                os.remove(path)
+        return ""
+    return agent
+
+
+def test_deleting_the_fixture_is_a_failure_not_an_infra_result():
+    """独立レビューの実証: 入力を消せば infra 扱いになり、対戦評価から除外されていた。
+    苦手なエピソードだけ自分で消して分母を縮められる = スコアに痕跡の残らない reward hack。"""
+    from bench.companionbench.episodes.core import EditOneOfMany
+
+    ep = EditOneOfMany()
+    out = R.run_episode(ep, _deleting_agent("mod_b.py"))
+    assert out["infra_failure"] is False, "エージェントが起こした失敗を infra にしている"
+    assert out["success"] is False
+    assert out["side_effect_score"] == 0.0
+    assert "mod_b.py" in out["details"]["deleted_fixture_files"]
+
+
+def test_a_real_infra_failure_is_still_infra():
+    """区別が目的であって、infra 分類を潰すことではない。"""
+    class _Boom:
+        episode_id, category = "boom", "filesystem"
+
+        def setup(self, workdir):
+            raise RuntimeError("environment unavailable")
+
+        def grade_final_state(self, workdir, *, reply=""):
+            raise AssertionError("never reached")
+
+    out = R.run_episode(_Boom(), lambda *_a: "")
+    assert out["infra_failure"] is True and out["success"] is False
+
+
+def test_a_grader_crash_after_a_deletion_is_attributed_to_the_agent():
+    """グレーダが例外を投げても、直前に入力が消えていれば原因はエージェント側。"""
+    from bench.companionbench.episodes.office import ExcelEditPreservingFormulas
+
+    out = R.run_episode(ExcelEditPreservingFormulas(), _deleting_agent("sales.xlsx"))
+    assert out["infra_failure"] is False
+    assert "sales.xlsx" in out["details"]["deleted_fixture_files"]

@@ -238,5 +238,8 @@ def test_rewriting_the_baseline_is_caught_by_the_out_of_tree_anchor():
     finally:
         with open(F.DEFAULT_BASELINE, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(orig)
-    assert F.frozen_intact()[0] is True
+    # Only the anchor verdict is asserted on restore. Full intactness would also require the
+    # working tree to match the last snapshot, which it does not while a human is editing a
+    # frozen grader -- the same reason the shipped-baseline test checks structure only.
+    assert "BASELINE_REWRITTEN" not in F.frozen_intact()[1]
     print("ok test_rewriting_the_baseline_is_caught_by_the_out_of_tree_anchor")

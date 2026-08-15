@@ -26,6 +26,30 @@ def _read(workdir, name):
         return ""
 
 
+def _events(workdir, job_id, event_type, since_id=0):
+    """The store's own audit trail for a job, filtered to one event type.
+
+    THIS IS WHAT MAKES THESE GRADERS UNFORGEABLE. Reading `jobs`/`turns` alone measures a
+    state that any UPDATE can produce, so an agent that never called the API scored the same
+    as one that did -- an independent review passed the fencing episode with a hand-written
+    UPDATE. Every real store call appends to `events` inside the same transaction, and an
+    agent that skips the API has no reason to fabricate a matching event. It is still only
+    an anchor, not proof: someone who knows to write the event row too would pass. It raises
+    the cost from "set one column" to "reimplement the store's bookkeeping", and it means the
+    laziest wrong behaviour no longer wins.
+    """
+    import sqlite3 as _sq
+    try:
+        con = _sq.connect(os.path.join(workdir, "jobs.sqlite3"))
+        rows = con.execute("SELECT id, seq, payload_json FROM events WHERE job_id=? "
+                           "AND event_type=? AND id>? ORDER BY id",
+                           (job_id, event_type, since_id)).fetchall()
+        con.close()
+        return rows
+    except Exception:
+        return []
+
+
 def _store(workdir):
     from relay.local_job_store import LocalJobStore
     return LocalJobStore(os.path.join(workdir, "jobs.sqlite3"))
@@ -81,13 +105,21 @@ class ResumeAfterRestart(Episode):
             "SELECT COUNT(*) FROM turns WHERE job_id=? AND seq=1 AND status='COMMITTED'",
             ("cb_resume",)).fetchone()[0]
         con.close()
-        committed_once = commits == 1
+        # A COMMITTED row is a column value; commit_turn is an operation. Counting only the
+        # row let "UPDATE turns SET status='COMMITTED'" score a perfect resume, with no
+        # payload, no lease transition and no idea whether the work happened. Require the
+        # event the real call writes -- exactly one, for the same reason the row count is
+        # exactly one.
+        commit_events = _events(workdir, "cb_resume", "TURN_COMMITTED")
+        committed_once = commits == 1 and len(commit_events) == 1
         return GradeResult(
             functional_score=1.0 if committed_once else 0.0,
             # More than one commit for the same seq is a duplicate side effect, which is a
             # different and worse failure than not finishing at all.
             side_effect_score=1.0 if commits <= 1 else 0.0,
             details={"commits_for_seq_1": commits, "job_status": status.get("status"),
+                     "commit_events": len(commit_events),
+                     "committed_through_the_store_api": len(commit_events) == 1,
                      "duplicate_commit": commits > 1},
         )
 
@@ -119,6 +151,10 @@ class StaleWorkerCannotCommit(Episode):
             _json.dump({"job_id": "cb_fence", "seq": 1,
                         "lease_id": first["lease_id"],
                         "fencing_token": first["fencing_token"]}, fh)
+        # Everything setup itself did is already in the audit trail; only what happens after
+        # this point is the agent's.
+        self._setup_event_id = max([r[0] for r in _events(workdir, "cb_fence",
+                                                          "TURN_CLAIMED")] or [0])
         return ("作業フォルダの jobs.sqlite3 にジョブ cb_fence があり、seq=1 は worker_stale が "
                 "保持しています。relay.local_job_store.LocalJobStore を使い、"
                 "(1) 新しいワーカー worker_fresh として seq=1 を引き継いでください "
@@ -147,6 +183,14 @@ class StaleWorkerCannotCommit(Episode):
             fencing_advanced = bool(row) and row[1] > self._stale["fencing_token"]
         except Exception:
             pass
+        # Both of the above are columns, and columns can be written directly. The review
+        # that prompted the previous fix then passed the tightened version with a two-line
+        # UPDATE setting exactly those two fields. A real takeover leaves a TURN_CLAIMED
+        # event naming the new worker.
+        claimed_via_api = any(
+            '"worker_fresh"' in (payload or "") or "'worker_fresh'" in (payload or "")
+            for _id, _seq, payload in _events(workdir, "cb_fence", "TURN_CLAIMED",
+                                              since_id=self._setup_event_id))
         refused = False
         try:
             store.commit_turn("cb_fence", 1, self._stale["lease_id"],
@@ -160,10 +204,11 @@ class StaleWorkerCannotCommit(Episode):
         # asks for one word in the file; anything else is a different claim.
         said = _read(workdir, "fenced.txt").strip().upper() == "REFUSED"
         return GradeResult(
-            functional_score=1.0 if (claimed_fresh and fencing_advanced
+            functional_score=1.0 if (claimed_fresh and fencing_advanced and claimed_via_api
                                      and refused and said) else 0.0,
             details={"took_over_as_fresh_worker": claimed_fresh,
                      "fencing_token_advanced": fencing_advanced,
+                     "claimed_through_the_store_api": claimed_via_api,
                      "stale_commit_refused": refused, "reported_refusal": said},
         )
 
@@ -209,10 +254,15 @@ class WaitingConsentThenResume(Episode):
         except Exception as exc:
             return GradeResult(functional_score=0.0, infra_failure=True,
                                details={"reason": "job store unreadable: %s" % exc})
-        resumed = status not in INTERACTION_WAIT_STATUSES
+        # "ANYTHING BUT WAITING" ACCEPTED DONE, FAILED AND CANCELLED, each of which an agent
+        # can write directly and none of which is a resume. resume_interaction produces
+        # exactly one state -- READY -- and records INTERACTION_RESUMED while doing it.
+        resumed = (status == "READY"
+                   and bool(_events(workdir, "cb_consent", "INTERACTION_RESUMED")))
         return GradeResult(
             functional_score=1.0 if resumed else 0.0,
-            details={"status": status, "still_waiting": not resumed},
+            details={"status": status, "still_waiting": status in INTERACTION_WAIT_STATUSES,
+                     "resumed_through_the_store_api": resumed},
         )
 
 
