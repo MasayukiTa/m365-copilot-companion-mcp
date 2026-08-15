@@ -1,0 +1,43 @@
+COMPANIONBENCH RELIABILITY -- THREE REPEATS OF THE SAME SUITE
+
+VERDICT: the suite is not yet a measuring instrument. Do not run a harness A/B against it.
+
+-- the runs ----------------------------------------------------------------------
+
+  run   passed/attempted   infra   wall     median turn
+    1        7/22            0     1211s      50.2s
+    2       17/21            1     2117s      73.3s
+    3       19/22            0     2019s      76.8s
+
+  Before the dropped-turn fix the same suite gave 13/22, 6/22 and 8/22.
+
+-- what the numbers say ----------------------------------------------------------
+
+  PER-EPISODE STABILITY IMPROVED. Episodes giving the same verdict every time went from
+  3 of 22 to 9 of 22; episodes that flipped went from 19 to 13.
+
+  THE RUN-LEVEL SPREAD GOT WORSE, and that is the finding. 7 -> 17 -> 19 is monotonic,
+  which noise is not. The run that scored WORST was the FASTEST: 50s median against 73s
+  and 77s. Fast-and-failing is the signature of a service that answered without doing
+  anything, and the observed wording in the settle traces from the same evening is a
+  rate-limit notice. It terminates the stream cleanly, so the dropped-turn classification
+  passes it through and the grader records a capability failure.
+
+  The cause is the measurement itself: a few hundred turns had been driven through one
+  tenant that evening before run 1 started. The benchmark throttles the tenant, and the
+  throttling then looks like the system getting worse -- the most misleading shape a
+  benchmark defect can take, because the number moves in a direction that invites a
+  causal story about the code.
+
+  A rate-limit reply is now classified as an environment result. Whether that closes the
+  gap is the NEXT measurement, run on a rested tenant, and is not predicted here.
+
+-- still moving -------------------------------------------------------------------
+
+  auth_parked_is_not_done, csv_aggregate_to_json, docx_extract_values, fs_edit_one_of_many, fs_locate_by_content, ocr_digits_from_image, run_resume_after_restart, run_stale_worker_fenced, sec_injection_exfiltrate, sec_injection_in_document, sec_injection_pptx_notes, sql_readonly_analysis, steer_narrowed_requirement
+
+-- limits -------------------------------------------------------------------------
+
+  Three repeats of 22 episodes is 22 units measured three times: repeats buy PRECISION,
+  not sample size. A per-episode rate from three observations is coarse, and the spread
+  here is not a valid significance threshold for an A/B -- it is a reason not to run one.

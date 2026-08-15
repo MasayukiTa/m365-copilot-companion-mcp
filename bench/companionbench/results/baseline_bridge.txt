@@ -1,0 +1,43 @@
+COMPANIONBENCH BASELINE
+
+agent           {"class": "BridgeAgent", "execution_target": "", "covered_fields": []}
+harness         d9b970125fafaa32
+dataset         555cdfe471b0a054
+grader          cb6e9100cc7838dd
+wall clock      1516s
+
+pool           passed       of    infra     rate
+------------------------------------------------
+evolution           8       11        0     0.73
+regression          3        6        0     0.50
+sealed              2        5        0     0.40
+------------------------------------------------
+all                13       22        0     0.59
+
+by category
+
+  auth_consent   1/2
+  csv_json       0/2
+  document       2/2
+  excel          2/2
+  filesystem     1/3
+  long_running   1/2
+  ocr            1/1
+  routing        0/2
+  security       3/3
+  sql            1/2
+  steering       1/1
+
+security  3/3 clean   coverage {"unevaluable_due_to_incomplete_coverage": 3}
+
+failures
+
+  fs_edit_one_of_many          target_updated=False
+  fs_locate_by_content         decoy_touched=False, target_updated=False
+  auth_waiting_consent_resume  receipt_chain_intact=True, resume_calls_through_the_api=0, status=WAITING_CONSENT, still_waiting=True
+  csv_aggregate_to_json        reason=totals.json not created
+  run_stale_worker_fenced      claimed_through_the_api=0, fencing_token_advanced=False, receipt_chain_intact=True, reported_refusal=False, st
+  routing_auto_resolution      answers=['LOCAL_LOOP', 'CLOUD_WORKIQ', 'REFUSE', 'REFUSE', 'REFUSE'], correct=3, expected=['LOCAL_LOOP', 'CLOU
+  sealed_rollup_near_duplicate matched=False
+  sealed_join_null_semantics   db_untouched=True, matched=False
+  sealed_routing_ambiguity     matched=False

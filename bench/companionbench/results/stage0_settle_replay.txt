@@ -1,0 +1,58 @@
+SETTLE UNIFICATION -- STAGE 0 (SECOND COLLECTION, DECISIVE)
+
+VERDICT: the proposed change is not justified by this evidence. Do not proceed to the
+implementation stages. The one real early-accept found came from somewhere else and is
+already fixed.
+
+-- the collection ----------------------------------------------------------------
+
+  120 turns, 12 prompts x 10 cycles, driven through the real wait_for_idle on a live
+  tenant, recorded into this campaign's own file. Zero probe contamination.
+
+  Label tail: 15 polls, about 8 seconds past acceptance -- comfortably beyond the dwell
+  production itself requires. The first collection used 4 polls (~2s) and every one of its
+  127 tails was exactly 4 long with no change, which left the result unreadable: a zero
+  could have meant the predicate was fine or that nobody looked long enough.
+
+-- the result --------------------------------------------------------------------
+
+  TURNS WHOSE TEXT CHANGED AFTER PRODUCTION ACCEPTED: 0 of 120, at 8 seconds.
+
+  That is a direct observation of the phenomenon, not an inference from a rate. Production
+  accepted, and the answer then sat unchanged for eight seconds, on every turn.
+
+settle replay: 120 turns
+  legacy   accepted  120  never   0  truncated    0  rate 0.000
+  sampled  accepted  120  never   0  truncated    0  rate 0.000
+  reduction:  0 of 120 turns no longer truncated  =  0.000  95% CI [0.000, 0.250]
+              interval method: cluster bootstrap over 12 prompt(s)
+  discordant: legacy worse 0 / sampled worse 0
+  (sampled_worse is structurally zero: the sampled predicate is the legacy one plus a floor, so it cannot accept earlier. This is not evidence -- it is the definition.)
+
+  The interval is over 12 clusters, not 120 turns: twelve prompts cycled ten times are
+  twelve independent units. With no events observed the bound is the rule of three over
+  those units, so 0.250 rather than the 0.030 a turn-level Wilson would print. A
+  nonparametric bootstrap would give [0, 0] here, which claims certainty a bootstrap
+  cannot have about an event it never saw.
+
+-- what this does and does not settle ---------------------------------------------
+
+  SETTLED: the plan's ~7% truncated-capture figure is not reproduced on this population,
+  and the sampled predicate has nothing to fix here. Its sample floor never changed an
+  acceptance to a different text.
+
+  NOT SETTLED, and this is the limit that matters: the prompts are ordinary chat questions.
+  They stream steadily. The turns most at risk of an early accept are the ones with PAUSES
+  -- a tool call, a retrieval, a long think -- and this population does not contain them.
+  A convenience sample of one tenant on one night may therefore exclude precisely the turns
+  the plan was written about. Reproducing it with agent/tool turns is the collection that
+  would close this, and it is not the same run.
+
+-- what WAS found ----------------------------------------------------------------
+
+  In the first collection, one genuine early accept: on a throttled request Copilot showed
+  a 'still organising the information' placeholder and production accepted it as the
+  answer, because that string was not in PROCESSING_MARKERS. No sample floor prevents that
+  -- a placeholder is perfectly stable for as many samples as you require. It is now a
+  marker. The defect was in the marker table, not in the predicate the plan proposes to
+  replace.
