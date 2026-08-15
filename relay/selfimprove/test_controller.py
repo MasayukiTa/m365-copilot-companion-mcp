@@ -224,3 +224,28 @@ def test_a_genome_touching_a_forbidden_component_never_reaches_evaluation():
         ctl.run_candidate(genome={"components": {"security": "permissive/v2"}},
                           hypothesis="h", target_failure_class="f",
                           evaluate=lambda m, e: _all_gates_pass())
+
+
+def test_a_failed_archive_write_blocks_activation(monkeypatch, tmp_path):
+    """記録が残らないまま有効化すると、稼働中の変更を誰も実験に紐付けられない。
+    以前は bare except で握り潰し、順序も activate が先だった。"""
+    class _BrokenArchive:
+        def add(self, *a, **k):
+            raise OSError("no space left on device")
+
+    monkeypatch.setenv(RC.OVERRIDE_ENV, str(tmp_path / "active.json"))
+    ctl = _controller(activate=True)
+    ctl.archive = _BrokenArchive()
+    out = _run(ctl, _all_gates_pass())
+    assert out["activated"] is False, "記録が無いのに有効化した"
+    assert out["archive_error"]
+    assert out["decision"]["state"] == D.NEEDS_HUMAN_REVIEW
+
+
+def test_a_working_archive_still_activates(monkeypatch, tmp_path):
+    """締めた結果、正常系まで止まっていないこと。"""
+    monkeypatch.setenv(RC.OVERRIDE_ENV, str(tmp_path / "active.json"))
+    ctl = _controller(activate=True)
+    out = _run(ctl, _all_gates_pass())
+    assert out["archive_error"] == ""
+    assert out["activated"] is True

@@ -191,7 +191,16 @@ def test_the_archive_entry_carries_the_experiment_identity():
                 "dataset", "slice_ids", "toggle"):
         assert key in ident, "identity に %s が無い" % key
     assert ident["slice_ids"] == SLICE
-    assert len(desc["harness_fingerprint"]["harness_id"]) == 64
+    # 二つの指紋が別物として記録されること。以前は候補込みで取った指紋ひとつを
+    # baseline_harness_id にも parent にも使い回し、parent_harness_id は空だった --
+    # 同じハッシュを指す3フィールドのうち2つが嘘という状態。
+    assert len(desc["baseline_fingerprint"]["harness_id"]) == 64
+    assert len(desc["candidate_fingerprint"]["harness_id"]) == 64
+    assert (desc["baseline_fingerprint"]["harness_id"]
+            != desc["candidate_fingerprint"]["harness_id"]), "候補と基準の指紋が同一"
+    assert ident["parent_harness_id"] == desc["baseline_fingerprint"]["harness_id"]
+    assert ident["baseline_harness_id"] == ident["parent_harness_id"]
+    assert ident["parent_harness_id"], "親が空のまま -- 何からの派生か記録されていない"
 
 
 def test_no_placeholder_empty_slice_remains_in_the_source():

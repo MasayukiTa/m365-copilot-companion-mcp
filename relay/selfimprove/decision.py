@@ -127,7 +127,20 @@ def decide(*, gate=None, sentinel=None, security=None, regression=None,
                     "the regression pool was not run; activation requires it", reasons)
 
     # 4. the cross-dataset canary
-    if sentinel is not None:
+    if sentinel is None:
+        # NOT CONFIGURING THE TRIPWIRE DISABLED THE TRIPWIRE. A deleted sentinel file was
+        # made to fail closed, but the default -- no sentinel path at all -- still sailed
+        # straight through to the statistical gate and could activate. That makes the
+        # strongest guard against a grader-specific gain optional by omission, which is the
+        # easiest kind of guard to lose. Under strict it is now required like the others;
+        # without strict it stays a note, because a run that only reports is allowed to be
+        # partial.
+        if strict:
+            return _out(NEEDS_HUMAN_REVIEW,
+                        "no sentinel was configured; activation requires the cross-dataset "
+                        "canary, and omitting it is not the same as passing it", reasons)
+        reasons.append("sentinel: not configured (gate-only, not activating)")
+    else:
         if sentinel.get("unevaluable"):
             if strict:
                 return _out(NEEDS_HUMAN_REVIEW,

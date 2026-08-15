@@ -136,10 +136,13 @@ class EvolutionController:
             infra_delta=result.get("infra_delta"),
             note=verdict["reason"],
         )
-        activated = False
-        if verdict["may_activate"] and self.activate:
-            RC.write_active(candidate)
-            activated = True
+        # ARCHIVE BEFORE ACTIVATE, and refuse to activate if the record did not land. The
+        # order was the other way round with the write wrapped in a bare except, so a full
+        # disk or a bad path activated a candidate whose durable record does not exist --
+        # a live harness change with nothing saying which experiment produced it. The ledger
+        # conclusion above survives either way; what this protects is the ability to answer
+        # "what is running and why" later.
+        archive_error = ""
         if self.archive is not None:
             try:
                 self.archive.add(
@@ -151,18 +154,35 @@ class EvolutionController:
                     gate_verdict=verdict["state"],
                     descriptors={"experiment_id": experiment_id,
                                  "harness_id": cand_id,
-                                 "changed": changed},
+                                 "candidate_harness_id": cand_id,
+                                 "components": dict(candidate["components"]),
+                                 "parameters": dict(candidate["parameters"]),
+                                 "changed": changed,
+                                 "decision_state": verdict["state"],
+                                 "decision_reason": verdict.get("reason", "")},
                 )
-            except Exception:
-                # A full archive write failing must not lose the decision itself, which is
-                # already durable in the ledger.
-                pass
+            except Exception as exc:
+                # Recorded, not swallowed. The decision itself is already durable in the
+                # ledger, so this is not fatal to the run -- but it IS fatal to activation.
+                archive_error = "%s: %s" % (type(exc).__name__, exc)
+
+        activated = False
+        if verdict["may_activate"] and self.activate:
+            if archive_error:
+                verdict = dict(verdict, state=D.NEEDS_HUMAN_REVIEW, may_activate=False,
+                               reason="the experiment record could not be written (%s); "
+                                      "activating without it would leave a live harness "
+                                      "change nobody can attribute" % archive_error)
+            else:
+                RC.write_active(candidate)
+                activated = True
         return {
             "experiment_id": experiment_id,
             "harness_id": cand_id,
             "changed": changed,
             "decision": verdict,
             "activated": activated,
+            "archive_error": archive_error,
             "result": result,
         }
 

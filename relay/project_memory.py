@@ -217,6 +217,49 @@ def _default_max_items():
         return 5
 
 
+def _memory_v1(entries, max_items):
+    """The original: the most recent N, whatever they say."""
+    return entries[:max_items]
+
+
+def _memory_v2(entries, max_items):
+    """Recent N after collapsing near-identical entries.
+
+    A loop that repeats a task writes the same line many times, and v1 then spends the whole
+    budget re-telling the agent one fact. Whether that is an improvement is a question for
+    the benchmark, which is the point of having two.
+    """
+    seen, out = set(), []
+    for line in entries:
+        key = "".join(ch for ch in line.lower() if ch.isalnum())[:80]
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(line)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+#: The versioned implementations of the `memory` component. THIS is what makes component
+#: evolution real rather than a label: an independent review found that none of the seven
+#: declared components had a single production reader, so changing planner/v1 to planner/v2
+#: moved the manifest hash and executed exactly the same code -- an A/B whose two arms were
+#: the same program, reporting a p-value about noise. A component belongs in
+#: EVOLVABLE_COMPONENTS only once it has a table like this one behind it.
+MEMORY_VERSIONS = {"memory/v1": _memory_v1, "memory/v2": _memory_v2}
+
+
+def _select_entries(entries, max_items):
+    """Pick the entries to prime, using whichever memory version the active harness names."""
+    try:
+        from relay.selfimprove import runtime_config as _rc
+        impl = MEMORY_VERSIONS.get(_rc.component("memory"), _memory_v1)
+    except Exception:
+        impl = _memory_v1
+    return impl(entries, max_items)
+
+
 def load_notes(theme, max_items=None, state_dir=".fleet", goal="", include_index=True):
     """Text block to prime into a goal: this theme's recent entries, plus the index of
     what else is remembered. Returns "" when there is nothing. Never raises.
@@ -229,7 +272,8 @@ def load_notes(theme, max_items=None, state_dir=".fleet", goal="", include_index
         if max_items is None:
             max_items = _default_max_items()
         theme, slug = _resolve(theme, goal)
-        entries = _entry_lines(_read(_theme_path(slug, state_dir)))[:max_items]
+        entries = _select_entries(_entry_lines(_read(_theme_path(slug, state_dir))),
+                                  max_items)
         index = _read(_index_path(state_dir)).strip() if include_index else ""
         blocks = []
         if entries:

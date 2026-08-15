@@ -377,3 +377,97 @@ def test_an_explicit_argument_still_beats_the_genome():
     head = src[:src.index("workers = [")] if "workers = [" in src else src
     assert "if max_transient is None:" in head
     assert "if max_refute is None:" in head
+
+
+def test_every_evolvable_component_has_something_that_dispatches_on_it():
+    """パラメータと同じ規律をコンポーネントにも。読み手の無いバージョン名は
+    A/B の両腕を同一プログラムにする。"""
+    from relay import project_memory as PM
+
+    DISPATCHERS = {"memory": PM.MEMORY_VERSIONS}
+    assert set(M.EVOLVABLE_COMPONENTS) == set(DISPATCHERS), (
+        "実装の無いコンポーネントが evolvable になっている: %s"
+        % (set(M.EVOLVABLE_COMPONENTS) ^ set(DISPATCHERS)))
+    for name, table in DISPATCHERS.items():
+        assert len(table) >= 2, "%s は版が1つしかない -- 比較する相手がいない" % name
+        assert M.DEFAULT_COMPONENTS[name] in table
+
+
+def test_the_unimplemented_components_are_not_evolvable():
+    """意図は残すが、実験は許可しない。"""
+    assert M.UNIMPLEMENTED_COMPONENTS
+    assert not (M.UNIMPLEMENTED_COMPONENTS & M.EVOLVABLE_COMPONENTS)
+    for name in M.UNIMPLEMENTED_COMPONENTS:
+        with pytest.raises(M.ManifestError):
+            M.apply_genome(M.base_manifest(), {"components": {name: name + "/v2"}})
+
+
+def test_the_memory_component_version_changes_what_is_primed(monkeypatch):
+    """v1 は直近N件そのまま、v2 は重複を畳んでからN件。実際に違う出力になること。"""
+    from relay import project_memory as PM
+
+    state = tempfile.mkdtemp(prefix="pmc_")
+    for i in range(6):
+        PM.record_task("テーマ", "同じ作業", "DONE", state_dir=state, ts=100 + i)
+    PM.record_task("テーマ", "別の作業", "DONE", state_dir=state, ts=200)
+
+    def _notes(version):
+        tmp = tempfile.mkdtemp(prefix="pmc_%s_" % version.replace("/", "_"))
+        man = M.apply_genome(M.base_manifest(), {"components": {"memory": version},
+                                                 "parameters": {"memory_max_items": 3}})
+        path = os.path.join(tmp, "m.json")
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(man, fh)
+        monkeypatch.setenv(RC.OVERRIDE_ENV, path)
+        RC.active_manifest(refresh=True)
+        return PM.load_notes("テーマ", state_dir=state)
+
+    v1, v2 = _notes("memory/v1"), _notes("memory/v2")
+    assert v1 != v2, "版を変えても出力が同じ -- それは同じプログラムを2回走らせている"
+    assert v1.count("同じ作業") > v2.count("同じ作業")
+    assert "別の作業" in v2, "重複を畳んだ結果、新しい情報が入るのが v2 の狙い"
+
+
+def test_two_writers_cannot_both_propose_the_same_experiment():
+    """重複検査が各インスタンスの構築時スナップショットに対して行われていたので、
+    先に両方が構築されれば両方とも通り、1実験に不変の仮説が2つ生まれていた。"""
+    path = os.path.join(tempfile.mkdtemp(prefix="led2_"), "h.jsonl")
+    a = HypothesisLedger(path)
+    b = HypothesisLedger(path)          # 両方とも「空」を見ている
+    a.propose(experiment_id="e1", candidate_id="c1", hypothesis="first",
+              target_failure_class="retry_loop")
+    with pytest.raises(LedgerError):
+        b.propose(experiment_id="e1", candidate_id="c1", hypothesis="second",
+                  target_failure_class="retry_loop")
+    rows = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
+    assert len([r for r in rows if r["kind"] == "proposal"]) == 1
+
+
+def test_a_corrupt_line_is_visible_rather_than_skipped_when_re_read():
+    """壊れた行を黙って飛ばすと、監査が実態より綺麗に見える。"""
+    path = os.path.join(tempfile.mkdtemp(prefix="led3_"), "h.jsonl")
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("{not json at all\n")
+    led = HypothesisLedger(path)
+    kinds = [r.get("kind") for r in led._read_rows_from_disk()]
+    assert "corrupt" in kinds
+
+
+def test_omitting_the_sentinel_entirely_does_not_permit_activation():
+    """消したファイルは fail closed にしたが、そもそも設定しない既定は素通りだった。
+    省略で無効化できるガードは、最も失いやすいガード。"""
+    d = D.decide(gate=_gate(), sentinel=None,
+                 regression={"regressed": False},
+                 security={"regressed": False, "comparable": 3, "passed_count": 3},
+                 auto_apply=True)
+    assert d["state"] == D.NEEDS_HUMAN_REVIEW
+    assert d["may_activate"] is False
+
+
+def test_omitting_the_sentinel_is_still_fine_for_a_report_only_run():
+    """報告だけの走行まで止めるのは行き過ぎ -- 有効化しないなら部分的でよい。"""
+    d = D.decide(gate=_gate(), sentinel=None,
+                 regression={"regressed": False},
+                 security={"regressed": False, "comparable": 3, "passed_count": 3})
+    assert d["state"] == D.KEEP
+    assert any("not configured" in r for r in d["passed_gates"])

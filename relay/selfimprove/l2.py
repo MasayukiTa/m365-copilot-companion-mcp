@@ -249,12 +249,20 @@ def run_iteration(*, toggle, n, dataset_key="Verified", auto_commit=False,
     # timestamp, archive rows keyed by genome hash, and nothing joined a solve log to the
     # row it produced. The fingerprint answers the other half -- WHICH harness ran -- so the
     # number can be reproduced rather than merely repeated.
-    fp = EX.harness_fingerprint(genome=genome, execution_profile=str(toggle or ""))
+    # TWO FINGERPRINTS, NOT ONE. The single fingerprint here was taken WITH the candidate
+    # genome and then stored as `baseline_harness_id` while also serving as the parent for
+    # `candidate_id` -- and `parent_harness_id` was left empty. Three fields describing the
+    # same hash, two of them describing it wrongly, so a reader could not tell what was
+    # compared with what. The baseline is the harness WITHOUT the genome; the candidate is
+    # the harness WITH it; the parent of the candidate is the baseline.
+    base_fp = EX.harness_fingerprint(genome={}, execution_profile=str(toggle or ""))
+    cand_fp = EX.harness_fingerprint(genome=genome, execution_profile=str(toggle or ""))
     identity = EX.experiment_record(
         experiment_id=EX.new_experiment_id(),
-        candidate_id_=EX.candidate_id(genome, parent_harness_id=fp["harness_id"]),
-        parent_harness_id=genome.get("parent_id") or "",
-        baseline_harness_id=fp["harness_id"],
+        candidate_id_=EX.candidate_id(genome,
+                                      parent_harness_id=base_fp["harness_id"]),
+        parent_harness_id=base_fp["harness_id"],
+        baseline_harness_id=base_fp["harness_id"],
         dataset=report.get("dataset", dataset_key),
         # The REAL slice, not []. Writing an empty list where the data exists was the
         # specific defect: it made every archived experiment unattributable to its tasks.
@@ -267,7 +275,12 @@ def run_iteration(*, toggle, n, dataset_key="Verified", auto_commit=False,
         slice_ids=identity["slice_ids"],
         pass_at_1=pass_at_1,
         gate_verdict=gate.get("verdict"),
-        descriptors={"experiment": identity, "harness_fingerprint": fp},
+        # Both fingerprints, with their fields, so a reader can see WHY the two differ
+        # rather than being handed two opaque hashes and told they are not equal.
+        descriptors={"experiment": identity,
+                     "baseline_fingerprint": base_fp,
+                     "candidate_fingerprint": cand_fp,
+                     "candidate_harness_id": cand_fp["harness_id"]},
     )
 
     # ---- STEP 6: decide ---------------------------------------------------------------------------

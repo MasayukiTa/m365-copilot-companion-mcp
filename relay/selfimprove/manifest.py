@@ -30,8 +30,24 @@ SCHEMA_VERSION = 1
 # Components the evolver may propose new versions of. Everything here is policy or
 # configuration -- how much context to keep, when to ask for review, how many times to
 # retry -- none of it decides whether an action is permitted.
+#
+# A COMPONENT BELONGS HERE ONLY ONCE SOMETHING DISPATCHES ON IT. All seven of the original
+# entries were labels: an independent review found not one production call site, so swapping
+# planner/v1 for planner/v2 changed the manifest hash and ran identical code -- both arms of
+# the A/B were the same program and the p-value described noise. Aspirational entries are
+# worse than absent ones, because an experiment over them looks valid and cannot be.
+#
+# `memory` earns its place: relay/project_memory.MEMORY_VERSIONS maps each version to a
+# different selection strategy. The other six are listed in UNIMPLEMENTED_COMPONENTS below,
+# where they document intent without licensing an experiment.
 EVOLVABLE_COMPONENTS = frozenset({
     "memory",
+})
+
+#: Named so the intent survives, and so a future implementer knows where to look -- but NOT
+#: evolvable, because there is nothing behind them yet. Moving one up is a two-part edit:
+#: write the version table, then move the name.
+UNIMPLEMENTED_COMPONENTS = frozenset({
     "planner",
     "reviewer",
     "retry",
@@ -55,14 +71,11 @@ FORBIDDEN_COMPONENTS = frozenset({
     "provenance",          # authority classes; see the brief's lineage-poisoning section
 })
 
+#: Only the components that exist. The six aspirational names moved to
+#: UNIMPLEMENTED_COMPONENTS: carrying them here made every manifest advertise seven knobs
+#: while six of them dispatched to nothing.
 DEFAULT_COMPONENTS = {
     "memory": "memory/v1",
-    "planner": "planner/v1",
-    "reviewer": "reviewer/v1",
-    "retry": "retry/v1",
-    "context": "context/v1",
-    "routing": "routing/v1",
-    "quality_cards": "quality/v1",
 }
 
 # Every parameter here MUST have a production reader. An independent review found three of

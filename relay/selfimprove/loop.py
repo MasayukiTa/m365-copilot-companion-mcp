@@ -173,6 +173,29 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
     os.makedirs(on_dir, exist_ok=True)
     os.makedirs(off_dir, exist_ok=True)
 
+    # THESE DIRECTORIES ARE REUSED BETWEEN RUNS, and the "did the solve capture anything"
+    # guard below counted every json file in them. A solve that produced nothing therefore
+    # passed the guard on the strength of the PREVIOUS run's predictions, which were then
+    # graded and reported as this experiment's evidence -- the exact failure the guard was
+    # written to prevent, wearing the guard's own uniform. Mark the moment the arm starts
+    # and count only what appears after it.
+    solve_started_at = time.time()
+
+    def _captured(pred_dir):
+        """Prediction files written by THIS run, not whatever was lying in the directory."""
+        if not os.path.isdir(pred_dir):
+            return 0
+        n = 0
+        for name in os.listdir(pred_dir):
+            if not name.endswith(".json"):
+                continue
+            try:
+                if os.path.getmtime(os.path.join(pred_dir, name)) >= solve_started_at:
+                    n += 1
+            except OSError:
+                pass
+        return n
+
     # ON arm (blocking child; resumable so a transient blip just re-runs the uncaptured chunk)
     log("solve ON (%s=1) ..." % toggle)
     rc, done = _run_solve_arm(spec_path, targets_file, on_dir, "sion", toggle, True, chunk, conc, turns, floor)
@@ -183,7 +206,7 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
     # actually ran -- this is an INFRA fault, not a measurement. Do NOT grade, gate, or burn (burning
     # a slice that was never solved would silently consume fresh instances; cf. the disk-floor
     # incident that wrongly burned 200). Return an infra_abort status so the caller retries later.
-    on_cap = len([f for f in os.listdir(on_dir) if f.endswith(".json")]) if os.path.isdir(on_dir) else 0
+    on_cap = _captured(on_dir)
     if on_cap == 0:
         log("ON solve captured 0 predictions -> INFRA ABORT (disk floor / wedge); NOT burning, NOT gating")
         return {"status": "infra_abort", "arm": "ON", "reason": "ON solve produced no predictions (infra)",
@@ -205,7 +228,7 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
     rc, done = _run_solve_arm(spec_path, targets_file, off_dir, "sioff", toggle, False, chunk, conc, turns, floor)
     if not done:
         log("OFF solve did not reach its done marker (rc=%s); aborting" % rc); return None
-    off_cap = len([f for f in os.listdir(off_dir) if f.endswith(".json")]) if os.path.isdir(off_dir) else 0
+    off_cap = _captured(off_dir)
     if off_cap == 0:
         log("OFF solve captured 0 predictions -> INFRA ABORT; NOT burning, NOT gating")
         return {"status": "infra_abort", "arm": "OFF", "reason": "OFF solve produced no predictions (infra)",

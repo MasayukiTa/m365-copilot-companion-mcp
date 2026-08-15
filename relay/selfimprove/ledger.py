@@ -26,6 +26,7 @@ the change did nothing", and those must never be pooled.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
@@ -42,6 +43,44 @@ VERDICTS = (KEEP, REJECT, INCONCLUSIVE, INFRA_ABORT, NEEDS_HUMAN_REVIEW)
 
 PROPOSAL = "proposal"
 CONCLUSION = "conclusion"
+
+#: What a line that will not parse becomes when the file is re-read. It is kept rather than
+#: dropped: a corrupt line is evidence about the ledger's history, and silently skipping it
+#: makes an audit read clean when it is not.
+CORRUPT = "corrupt"
+
+
+@contextlib.contextmanager
+def _exclusive(lock_path):
+    """A cross-process exclusive lock, held for the duration of an append.
+
+    O_CREAT|O_EXCL rather than a library, because this has to work identically on Windows
+    (where fcntl does not exist) and the critical section is two file operations long. A
+    stale lock from a killed process is broken after a bounded wait -- refusing to ever
+    write again would be a worse failure than a rare double-append, and the re-read inside
+    the section catches that case anyway.
+    """
+    deadline = time.time() + 10.0
+    fd = None
+    while fd is None:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if time.time() > deadline:
+                try:
+                    os.unlink(lock_path)          # presumed stale; the re-read still guards
+                except OSError:
+                    pass
+                deadline = time.time() + 10.0
+            time.sleep(0.02)
+    try:
+        yield
+    finally:
+        os.close(fd)
+        try:
+            os.unlink(lock_path)
+        except OSError:
+            pass
 
 
 class LedgerError(RuntimeError):
@@ -142,10 +181,47 @@ class HypothesisLedger:
         return row
 
     def _append(self, row: dict) -> None:
+        """Append under an exclusive lock, re-checking uniqueness against the FILE.
+
+        The duplicate-proposal check ran against this instance's private snapshot, taken
+        when it was constructed. Two ledgers built before either wrote could therefore both
+        accept the same experiment_id and both append, producing two immutable proposals for
+        one experiment -- the exact thing the check exists to prevent, and invisible
+        afterwards because both rows look legitimate. The lock plus the re-read make the
+        check mean what it says: last writer to arrive loses, rather than both winning.
+        """
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        with open(self.path, "a", encoding="utf-8", newline="\n") as fh:
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        with _exclusive(self.path + ".lock"):
+            if row.get("kind") == PROPOSAL:
+                for existing in self._read_rows_from_disk():
+                    if (existing.get("kind") == PROPOSAL
+                            and existing.get("experiment_id") == row.get("experiment_id")):
+                        raise LedgerError(
+                            "experiment %s was proposed by another writer while this one "
+                            "was deciding; a hypothesis is never rewritten"
+                            % row.get("experiment_id"))
+            with open(self.path, "a", encoding="utf-8", newline="\n") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
         self._rows.append(row)
+
+    def _read_rows_from_disk(self) -> list:
+        """What the file actually contains right now, not what this instance remembers."""
+        rows = []
+        try:
+            with open(self.path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        rows.append({"kind": CORRUPT, "raw": line[:200]})
+        except OSError:
+            pass
+        return rows
 
     # -- reading ---------------------------------------------------------------------
 
