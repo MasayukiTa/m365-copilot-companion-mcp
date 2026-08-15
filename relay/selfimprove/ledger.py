@@ -31,6 +31,8 @@ import json
 import os
 import time
 
+from relay import provenance as PROV
+
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DEFAULT_PATH = os.path.join(REPO, ".fleet", "selfimprove", "hypotheses.jsonl")
 
@@ -133,6 +135,20 @@ class HypothesisLedger:
                               "justification; say what you expect and why")
         if not str(target_failure_class).strip():
             raise LedgerError("a proposal must name the failure class it targets")
+        # PROVENANCE, AT THE POINT WHERE EVIDENCE BECOMES AUTHORITY. This is the step the
+        # brief's lineage-poisoning chain ends at: external content reaches a solver, gets
+        # summarised into memory or a failure analysis, and is then cited as the reason to
+        # change the harness -- after which a single poisoned document is shaping tasks it
+        # never touched, permanently, and every later run looks normal.
+        #
+        # Untrusted evidence stays usable for the task it came from. It cannot be the
+        # justification for a mutation. An empty evidence list is refused too, since
+        # "cite nothing" would otherwise be the cheapest way around the check.
+        try:
+            effective_authority = PROV.require_authority_for_evolution(
+                evidence, what="experiment %s" % experiment_id)
+        except PROV.ProvenanceError as exc:
+            raise LedgerError(str(exc)) from exc
         if self.proposal_for(experiment_id) is not None:
             raise LedgerError("experiment %s already has a proposal; the ledger is "
                               "append-only and a hypothesis is never rewritten"
@@ -144,6 +160,7 @@ class HypothesisLedger:
             "parent_harness_id": parent_harness_id,
             "target_failure_class": target_failure_class,
             "evidence": list(evidence or []),
+            "evidence_authority": effective_authority,
             "hypothesis": hypothesis,
             "changed_components": list(changed_components or []),
             "predicted_effect": dict(predicted_effect or {}),

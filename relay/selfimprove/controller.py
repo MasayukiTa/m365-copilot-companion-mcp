@@ -23,6 +23,7 @@ judge, and the whole structure exists to keep those apart.
 """
 from __future__ import annotations
 
+from relay import provenance as PROV
 from relay.selfimprove import decision as D
 from relay.selfimprove import experiment as EX
 from relay.selfimprove import frozen as F
@@ -62,6 +63,19 @@ class EvolutionController:
         self._parent_id = parent_id          # the archive needs it; it was writing None
         cand_id = M.harness_id(candidate)
         changed = M.diff(base, candidate)
+
+        # WHAT THIS PROPOSAL IS BUILT ON, declared rather than assumed. A proposer that
+        # cites nothing hides the one thing worth checking: whether the reasoning came from
+        # measurements or from text an attacker wrote into a document that got summarised
+        # into memory. The default says "the optimiser's own inference over its own runs",
+        # which is a legitimate basis for a change; anything read from outside must be
+        # tagged by the caller and will be refused if it is untrusted.
+        evidence = list(evidence or []) or [{
+            "kind": "proposer_inference",
+            "authority": PROV.AGENT_INFERENCE,
+            "note": "no external evidence cited; the proposal rests on the loop's own "
+                    "analysis of its own measurements",
+        }]
 
         experiment_id = EX.new_experiment_id()
         self.ledger.propose(

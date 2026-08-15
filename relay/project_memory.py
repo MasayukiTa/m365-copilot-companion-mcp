@@ -30,6 +30,8 @@ import os
 import re
 import time
 
+from relay import provenance as P
+
 _MAX_PER_THEME = 20           # keep the most recent N entries per theme
 _NOTE_CAP = 280               # chars per note snippet
 _GOAL_CAP = 160
@@ -140,6 +142,29 @@ def _entry_lines(text):
     return [ln for ln in body.splitlines() if ln.startswith("- [")]
 
 
+def entry_authority(line):
+    """The authority recorded on a memory line, or EXTERNAL_UNTRUSTED if there is none.
+
+    Entries written before provenance existed have no marker, and they are exactly the ones
+    whose origin nobody can now establish -- so they read as untrusted. That is the safe
+    direction and it is also the true one.
+    """
+    marker = "<!-- authority="
+    if marker not in (line or ""):
+        return P.EXTERNAL_UNTRUSTED
+    return P.normalise(line.split(marker, 1)[1].split("-->", 1)[0])
+
+
+def authorities_in(theme, state_dir=".fleet", goal=""):
+    """Every distinct authority present in a theme's entries. For the evolution loop."""
+    try:
+        _theme, slug = _resolve(theme, goal)
+        return sorted({entry_authority(ln)
+                       for ln in _entry_lines(_read(_theme_path(slug, state_dir)))})
+    except Exception:
+        return [P.EXTERNAL_UNTRUSTED]
+
+
 def _fmt_ts(ts):
     try:
         return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
@@ -147,20 +172,34 @@ def _fmt_ts(ts):
         return ""
 
 
-def record_task(theme, goal, outcome, note="", state_dir=".fleet", ts=None, folder=""):
+def record_task(theme, goal, outcome, note="", state_dir=".fleet", ts=None, folder="",
+                authority=None):
     """Record one finished piece of work under `theme`. Never raises; returns bool.
 
     `theme` may be a path for back-compat with the folder-keyed call sites -- a caller
     that passes one gets a theme derived from the goal instead, so old wiring keeps
     working and starts producing theme-shaped memory without being touched.
+
+    `authority` is where the CONTENT of this entry came from. This store is the live
+    contamination channel for lineage poisoning: whatever lands here is prepended to future
+    goals by load_notes, so text an attacker put in a document can end up shaping tasks it
+    never touched. Recording the origin does not stop that text being written -- notes about
+    a document are legitimately about the document -- it keeps the mark attached, so the
+    evolution loop can refuse to treat it as a REASON to change the harness.
+
+    An omitted authority becomes EXTERNAL_UNTRUSTED, deliberately. Most callers here
+    summarise a run that read external content, and "nobody recorded where this came from"
+    must not read as "it is fine".
     """
     try:
         theme, slug = _resolve(theme, goal, folder)
         when = time.time() if ts is None else ts
-        line = "- [%s] %s — %s%s" % (
+        auth = P.normalise(authority)
+        line = "- [%s] %s — %s%s%s" % (
             (outcome or "?").strip() or "?",
             " ".join(str(goal or "").split())[:_GOAL_CAP],
             " ".join(str(note or "").split())[:_NOTE_CAP] or "(記録なし)",
+            "  <!-- authority=%s -->" % auth,
             "  <!-- %s -->" % _fmt_ts(when),
         )
         path = _theme_path(slug, state_dir)

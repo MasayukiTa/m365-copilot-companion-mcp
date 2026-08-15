@@ -32,6 +32,9 @@ def _propose(led, exp="e1", **kw):
     kw.setdefault("candidate_id", "c1")
     kw.setdefault("hypothesis", "memory recall is crowding out the task")
     kw.setdefault("target_failure_class", "irrelevant_context")
+    # A proposal must now say what it rests on; the loop's own measurements are the
+    # ordinary case and are a legitimate basis for a change.
+    kw.setdefault("evidence", [{"kind": "gate", "authority": "MACHINE_VERIFIER"}])
     return led.propose(experiment_id=exp, **kw)
 
 
@@ -74,10 +77,12 @@ def test_a_proposal_must_say_what_it_expects_to_fix():
     led = _ledger()
     with pytest.raises(LedgerError):
         led.propose(experiment_id="x", candidate_id="c", hypothesis="",
-                    target_failure_class="retry_loop")
+                    target_failure_class="retry_loop",
+                    evidence=[{"authority": "MACHINE_VERIFIER"}])
     with pytest.raises(LedgerError):
         led.propose(experiment_id="y", candidate_id="c", hypothesis="something",
-                    target_failure_class="")
+                    target_failure_class="",
+                    evidence=[{"authority": "MACHINE_VERIFIER"}])
 
 
 def test_the_file_is_append_only_on_disk():
@@ -435,10 +440,12 @@ def test_two_writers_cannot_both_propose_the_same_experiment():
     a = HypothesisLedger(path)
     b = HypothesisLedger(path)          # 両方とも「空」を見ている
     a.propose(experiment_id="e1", candidate_id="c1", hypothesis="first",
-              target_failure_class="retry_loop")
+              target_failure_class="retry_loop",
+              evidence=[{"authority": "MACHINE_VERIFIER"}])
     with pytest.raises(LedgerError):
         b.propose(experiment_id="e1", candidate_id="c1", hypothesis="second",
-                  target_failure_class="retry_loop")
+                  target_failure_class="retry_loop",
+                  evidence=[{"authority": "MACHINE_VERIFIER"}])
     rows = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
     assert len([r for r in rows if r["kind"] == "proposal"]) == 1
 

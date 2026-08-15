@@ -145,6 +145,7 @@ jobs:
             relay/test_network_recovery.py \
             relay/test_planner.py \
             relay/test_project_memory.py \
+            relay/test_provenance.py \
             relay/test_recycle.py \
             relay/test_refuter.py \
             relay/test_reply_settle.py \
