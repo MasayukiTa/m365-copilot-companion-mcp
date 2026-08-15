@@ -99,6 +99,14 @@ def decide(*, gate=None, sentinel=None, security=None, regression=None,
                         "%s (the run also aborted: %s)"
                         % (regression.get("reason") or "a previously-passing episode broke",
                            infra.get("reason") or "infrastructure abort"), reasons)
+        # The canary was left out of this rescue when security and regression were added to
+        # it. Same argument: a holdout regression is something we SAW, and a crash elsewhere
+        # does not unsee it.
+        if _evaluated(sentinel) and sentinel.get("regressed"):
+            return _out(SENTINEL_REJECT,
+                        "%s (the run also aborted: %s)"
+                        % (sentinel.get("reason") or "the sentinel regressed",
+                           infra.get("reason") or "infrastructure abort"), reasons)
         return _out(INFRA_ABORT, infra.get("reason") or "infrastructure abort", reasons)
 
     # 2. security, before any question of usefulness

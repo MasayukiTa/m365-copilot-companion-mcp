@@ -42,6 +42,12 @@ class SimulatedAgent:
     given an answer.
     """
 
+    #: This one runs IN THIS PROCESS, so the active manifest set by _ManifestArm genuinely
+    #: governs everything it touches. That is the only reason the flag is true here, and the
+    #: only reason it may be true anywhere: the claim is about the execution mechanism, not
+    #: about intent.
+    applies_manifest = True
+
     def __init__(self, script=None, default_reply="(no action taken)"):
         self.script = dict(script or {})
         self.default_reply = default_reply
@@ -174,6 +180,26 @@ class BridgeAgent:
             "settled": "event: done" in raw,
         })
         return reply
+
+
+class in_process:
+    """Mark a plain callable as running in THIS process, so paired_evaluate will accept it.
+
+        agent = in_process(lambda prompt, workdir: ...)
+
+    The refusal in paired_evaluate defaults to "no", which is right -- but it also means a
+    perfectly valid one-line in-process agent gets turned away unless it can say so. This is
+    the way to say so, and it is deliberately explicit: writing `in_process(...)` around a
+    lambda that actually posts to another machine is a lie somebody has to type.
+    """
+
+    applies_manifest = True
+
+    def __init__(self, fn):
+        self._fn = fn
+
+    def __call__(self, prompt, workdir):
+        return self._fn(prompt, workdir)
 
 
 def bridge_available(host=BRIDGE_HOST, port=BRIDGE_PORT) -> bool:

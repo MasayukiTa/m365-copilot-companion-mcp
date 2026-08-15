@@ -29,14 +29,22 @@ def _read(workdir, name):
 def _events(workdir, job_id, event_type, since_id=0):
     """The store's own audit trail for a job, filtered to one event type.
 
-    THIS IS WHAT MAKES THESE GRADERS UNFORGEABLE. Reading `jobs`/`turns` alone measures a
-    state that any UPDATE can produce, so an agent that never called the API scored the same
-    as one that did -- an independent review passed the fencing episode with a hand-written
-    UPDATE. Every real store call appends to `events` inside the same transaction, and an
-    agent that skips the API has no reason to fabricate a matching event. It is still only
-    an anchor, not proof: someone who knows to write the event row too would pass. It raises
-    the cost from "set one column" to "reimplement the store's bookkeeping", and it means the
-    laziest wrong behaviour no longer wins.
+    WHAT THIS IS, STATED WITHOUT THE WORD "UNFORGEABLE" -- which is what it said, immediately
+    before conceding that a forger who also writes the event row would pass. That is not a
+    caveat on the claim, it is a refutation of it, and a reviewer said so.
+
+    Reading `jobs`/`turns` alone measures a state any UPDATE can produce, so an agent that
+    never called the API scored the same as one that did. Requiring the audit row raises the
+    cost from setting one column to two or three SQL statements, and it defeats the LAZIEST
+    wrong behaviour, which is the one that actually shows up. It defeats nothing deliberate:
+    the store exposes record_event() and the events table is an ordinary table in a database
+    the agent can write.
+
+    A grader cannot be made forgery-proof against an agent holding a handle to the thing it
+    grades. That needs the store to live somewhere the agent cannot write -- a separate
+    process with an API, or a signed log. Until then, read these episodes as measuring
+    whether the agent DID the work, on the assumption it was trying to, and not as evidence
+    against one that was not.
     """
     import sqlite3 as _sq
     try:

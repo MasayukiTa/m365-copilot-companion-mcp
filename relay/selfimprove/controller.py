@@ -84,7 +84,16 @@ class EvolutionController:
                                   changed)
 
         try:
-            result = evaluate(candidate, experiment_id) or {}
+            # THE BASE THE CONTROLLER RECORDED AS THE PARENT, handed to the evaluator so the
+            # comparison is against the harness the record names. make_evaluator grew an
+            # optional `base` argument and nothing passed it, so a run could record parent A
+            # while comparing against the evaluator's own default B -- a wrong record, which
+            # is worse than a missing one. Evaluators that do not accept it are still called
+            # the old way rather than being broken.
+            try:
+                result = evaluate(candidate, experiment_id, base=base) or {}
+            except TypeError:
+                result = evaluate(candidate, experiment_id) or {}
         except Exception as exc:
             # An evaluator that raised told us nothing about the candidate. Recording that
             # as a rejection would blame the change for the harness's own failure.

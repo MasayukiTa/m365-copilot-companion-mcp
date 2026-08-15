@@ -78,6 +78,16 @@ DEFAULT_COMPONENTS = {
     "memory": "memory/v1",
 }
 
+#: Every parameter's type and the range a run may actually use. The upper bounds are not
+#: arbitrary tidiness: max_retries or the refuter budget set to a million is a candidate that
+#: never finishes, which arrives as an infra abort -- an outcome a candidate now has reasons
+#: to prefer. A range is the cheapest way to keep "the experiment ran" true.
+PARAMETER_TYPES = {
+    "max_refute_passes": (0, 10),
+    "max_retries": (0, 50),
+    "memory_max_items": (0, 100),
+}
+
 # Every parameter here MUST have a production reader. An independent review found three of
 # four had none, which means an A/B over them ran the same program twice and reported a
 # p-value about noise. max_context_budget was removed rather than wired: there is no context
@@ -158,6 +168,23 @@ def validate(manifest: dict) -> None:
     params = manifest.get("parameters")
     if not isinstance(params, dict):
         raise ManifestError("manifest.parameters must be a dict")
+    # THE SAME NO-OP DEFECT ONE LEVEL DOWN. Component versions were validated and parameter
+    # VALUES were not, so {"memory_max_items": "not-an-integer"} validated, changed the
+    # harness id, and ran with the default five -- a different manifest executing identical
+    # code, which is the thing this module exists to prevent. And 5 / 5.0 / "5" hashed three
+    # ways while behaving one way, so an A/B could compare a genome with itself.
+    for name, value in params.items():
+        if name not in PARAMETER_TYPES:
+            raise ManifestError("unknown parameter %r; add it to DEFAULT_PARAMETERS with a "
+                                "production reader rather than by accident" % name)
+        low, high = PARAMETER_TYPES[name]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ManifestError(
+                "parameter %r must be an int, got %r -- a value the runtime cannot use "
+                "changes the harness id and not the behaviour" % (name, value))
+        if not (low <= value <= high):
+            raise ManifestError("parameter %r out of range [%d, %d]: %r"
+                                % (name, low, high, value))
 
 
 def apply_genome(base: dict, genome: dict) -> dict:

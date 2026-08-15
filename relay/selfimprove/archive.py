@@ -229,13 +229,47 @@ class Archive:
         "",                                  # a row that predates the field
     })
 
+    #: How far a lineage may run on unproven steps before it must be re-validated.
+    #: Keeping "not proven worse" selectable is right -- most real experiments are
+    #: underpowered, and discarding them kills promising branches. But chaining them without
+    #: limit lets a lineage drift arbitrarily far from anything the gate ever accepted, one
+    #: statistically invisible step at a time, and the archive would still call the result a
+    #: descendant of a validated scaffold. Bounded exploration; the bound is the point.
+    MAX_UNVALIDATED_DEPTH = 3
+
     @classmethod
-    def _selectable(cls, entry) -> bool:
-        """A row with no verdict at all predates the field and is left selectable."""
+    def _verdict_ok(cls, entry) -> bool:
         verdict = entry.get("gate_verdict")
         if verdict is None:
-            return True
+            return True                      # predates the field
         return str(verdict) in cls.SELECTABLE_VERDICTS
+
+    @staticmethod
+    def _is_accepted(entry) -> bool:
+        return str(entry.get("gate_verdict") or "") in ("KEEP", "keep")
+
+    def _unvalidated_depth(self, entry) -> int:
+        """How many unaccepted steps sit between this row and its nearest KEEP ancestor."""
+        by_id = {e.get("id"): e for e in self._entries if e.get("id")}
+        depth, seen = 0, set()
+        cur = entry
+        while cur is not None and not self._is_accepted(cur):
+            cur_id = cur.get("id")
+            if cur_id in seen:               # a cycle in recorded lineage; stop counting
+                break
+            seen.add(cur_id)
+            depth += 1
+            parent = cur.get("genome", {}).get("parent_id") or cur.get("parent_id")
+            cur = by_id.get(parent)
+            if cur is None:
+                break                        # root, or a parent not in this archive
+        return depth
+
+    def _selectable(self, entry) -> bool:
+        """A row with no verdict at all predates the field and is left selectable."""
+        if not self._verdict_ok(entry):
+            return False
+        return self._unvalidated_depth(entry) <= self.MAX_UNVALIDATED_DEPTH
 
     def best(self, metric: str = "pass_at_1", include_unselectable: bool = False) -> dict | None:
         """The best SELECTABLE entry (None if empty; ties -> the most recently added).

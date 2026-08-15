@@ -584,3 +584,51 @@ def test_an_underpowered_result_is_still_a_legitimate_parent():
                 gate_verdict=verdict, descriptors={"diff_bin": "surgical"})
     assert arc.best() is not None
     assert len(arc.qd_map()) == 1
+
+
+def test_a_lineage_cannot_drift_forever_on_unproven_steps():
+    """『まだ悪いと証明されていない』を親にし続けると、gate が一度も受理していない
+    変更を積み上げたまま『検証済み足場の子孫』を名乗れてしまう。"""
+    from relay.selfimprove.archive import Archive
+
+    path = os.path.join(tempfile.mkdtemp(prefix="arc4_"), "a.jsonl")
+    arc = Archive(path)
+    parent = arc.add({"knobs": {"root": "1"}}, slice_ids=["s"], pass_at_1=0.5,
+                     gate_verdict="KEEP", descriptors={"diff_bin": "surgical"})
+    for i in range(Archive.MAX_UNVALIDATED_DEPTH + 1):
+        parent = arc.add({"knobs": {"step%d" % i: "1"}, "parent_id": parent},
+                         slice_ids=["s"], pass_at_1=0.5 + i / 100.0,
+                         gate_verdict="inconclusive",
+                         descriptors={"diff_bin": "surgical"})
+    picked = arc.best()
+    assert picked is not None
+    depth = arc._unvalidated_depth(picked)
+    assert depth <= Archive.MAX_UNVALIDATED_DEPTH, depth
+
+
+def test_a_short_unproven_chain_is_still_explorable():
+    """境界を入れた結果、探索そのものが死んでいないこと。"""
+    from relay.selfimprove.archive import Archive
+
+    path = os.path.join(tempfile.mkdtemp(prefix="arc5_"), "a.jsonl")
+    arc = Archive(path)
+    parent = arc.add({"knobs": {"root": "1"}}, slice_ids=["s"], pass_at_1=0.5,
+                     gate_verdict="KEEP", descriptors={"diff_bin": "surgical"})
+    child = arc.add({"knobs": {"step": "1"}, "parent_id": parent}, slice_ids=["s"],
+                    pass_at_1=0.9, gate_verdict="inconclusive",
+                    descriptors={"diff_bin": "surgical"})
+    assert arc.best()["id"] == child
+
+
+def test_a_parameter_value_the_runtime_cannot_use_is_refused():
+    """コンポーネント版だけ検査していたので、パラメータ値は素通りしていた。
+    'not-an-integer' は harness id を変え、実行時は既定の5で走る。"""
+    for bad in ("not-an-integer", 5.0, True, None, -1, 10_000):
+        with pytest.raises(M.ManifestError):
+            M.apply_genome(M.base_manifest(), {"parameters": {"memory_max_items": bad}})
+    M.apply_genome(M.base_manifest(), {"parameters": {"memory_max_items": 7}})
+
+
+def test_an_unknown_parameter_is_refused():
+    with pytest.raises(M.ManifestError):
+        M.apply_genome(M.base_manifest(), {"parameters": {"invented_knob": 3}})

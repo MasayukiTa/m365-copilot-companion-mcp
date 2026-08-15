@@ -17,6 +17,7 @@ Each test below is one of those.
 import os
 import tempfile
 
+import bench.companionbench.agents as A
 from bench.companionbench import runner as R
 from bench.companionbench.episode import Episode, GradeResult
 from bench.companionbench.pools import EVOLUTION, REGISTRY
@@ -50,7 +51,10 @@ class _Ep(Episode):
                            security_score=1.0 if self.category != "security" or ok else 0.0)
 
 
+@A.in_process
 def _agent(prompt, workdir):
+    """A/B 用のエージェントは manifest 配下で走ることを宣言しなければ受け付けられない。
+    このプロセス内で動くので、宣言は事実。"""
     return "done"
 
 
@@ -176,6 +180,7 @@ def test_pairing_is_by_episode_identity_not_by_count(monkeypatch):
     _with_episodes(monkeypatch, eps)
 
     # candidate fixes p0 and breaks p1: same totals, no real gain
+    @A.in_process
     def agent(prompt, workdir):
         return "x"
 
@@ -377,7 +382,7 @@ def test_a_candidate_that_crashes_only_on_its_own_arm_aborts_the_comparison():
                 raise RuntimeError("candidate arm refuses this one")
             return ""
 
-    out = R.paired_evaluate(base_m, cand_m, _Wrap(),
+    out = R.paired_evaluate(base_m, cand_m, A.in_process(_Wrap()),
                             tmpdir=tempfile.mkdtemp(prefix="pe1_"))
     assert out["infra"]["aborted"] is True, out["infra"]
     assert out["infra"]["candidate_only_infra"]
@@ -427,7 +432,7 @@ def test_the_advertised_integration_produces_a_sentinel_at_all():
     誰も満たせないガードは安全性ではない -- 最初に外されるのがそれ。"""
     base_m = M.base_manifest()
     cand_m = M.apply_genome(base_m, {"parameters": {"memory_max_items": 9}})
-    out = R.paired_evaluate(base_m, cand_m, lambda *_a: "",
+    out = R.paired_evaluate(base_m, cand_m, A.in_process(lambda *_a: ""),
                             tmpdir=tempfile.mkdtemp(prefix="pe2_"))
     assert "sentinel" in out and out["sentinel"], "sentinel が空のまま"
     # salt がある機械では評価され、無ければ unevaluable。どちらも「黙って通す」ではない。
@@ -451,7 +456,7 @@ def test_without_a_salt_the_sentinel_is_unevaluable_not_a_pass(monkeypatch, tmp_
     monkeypatch.setattr(P, "DEFAULT_SALT_FILE", str(tmp_path / "also_absent"))
 
     base_m = M.base_manifest()
-    out = R.paired_evaluate(base_m, base_m, lambda *_a: "",
+    out = R.paired_evaluate(base_m, base_m, A.in_process(lambda *_a: ""),
                             tmpdir=tempfile.mkdtemp(prefix="pe3_"))
     assert out["sentinel"].get("unevaluable") is True
     from relay.selfimprove import decision as Dec
@@ -488,7 +493,7 @@ def test_the_real_bridge_adapter_declares_that_it_cannot():
 
 def test_an_in_process_agent_is_still_accepted():
     base_m = M.base_manifest()
-    out = R.paired_evaluate(base_m, base_m, lambda *_a: "",
+    out = R.paired_evaluate(base_m, base_m, A.in_process(lambda *_a: ""),
                             tmpdir=tempfile.mkdtemp(prefix="pe5_"))
     assert out["gate"] is not None
 
@@ -516,3 +521,41 @@ def test_the_sealed_sentinel_does_not_return_per_episode_ids():
     import inspect
     src = inspect.getsource(R._sealed_sentinel)
     assert '"lost_count"' in src and '"lost":' not in src
+
+
+def test_the_manifest_gate_defaults_to_refusal():
+    """`getattr(agent, "applies_manifest", True)` だったので、
+    lambda で包むだけで外部 bridge がすり抜けていた。"""
+    base_m = M.base_manifest()
+    out = R.paired_evaluate(base_m, base_m, lambda _p, _w: "",
+                            tmpdir=tempfile.mkdtemp(prefix="pe6_"))
+    assert out["infra"]["aborted"] is True
+    assert out["gate"] is None
+
+
+def test_wrapping_the_bridge_agent_does_not_launder_it():
+    from bench.companionbench.agents import BridgeAgent
+
+    bridge = BridgeAgent()
+    wrapped = lambda p, w: bridge(p, w)          # noqa: E731 - the exact bypass reported
+    base_m = M.base_manifest()
+    out = R.paired_evaluate(base_m, base_m, wrapped,
+                            tmpdir=tempfile.mkdtemp(prefix="pe7_"))
+    assert out["infra"]["aborted"] is True
+
+
+def test_a_candidate_security_failure_counts_even_if_the_baseline_could_not_run_it():
+    """ベース側が infra だとその回のセキュリティ違反が捨てられていた。
+    絶対的な床は候補単独の性質であって、比較可能性の問題ではない。"""
+    base = [{"episode_id": "sec_a", "category": "security",
+             "infra_failure": True, "security_score": 1.0}]
+    cand = [{"episode_id": "sec_a", "category": "security",
+             "infra_failure": False, "security_score": 0.0}]
+    out = R._security_regression(base, cand)
+    assert out["failing"] == ["sec_a"]
+
+
+def test_the_sentinel_unevaluable_reason_does_not_name_sealed_episodes():
+    import inspect
+    src = inspect.getsource(R._sealed_sentinel)
+    assert 'join(candidate_only_infra)' not in src
