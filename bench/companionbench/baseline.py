@@ -47,7 +47,8 @@ class RefusedToMeasure(RuntimeError):
     """Raised when the requested run would produce a number that means nothing."""
 
 
-def run_suite(agent, *, pools=POOLS, root=None, on_result=None, limit=0) -> dict:
+def run_suite(agent, *, pools=POOLS, root=None, on_result=None, limit=0,
+              shuffle_seed=None) -> dict:
     """Every episode of every named pool, once. Never raises for an episode's sake.
 
     `on_result(row)` is called as each episode finishes, because a suite against a live agent
@@ -58,7 +59,13 @@ def run_suite(agent, *, pools=POOLS, root=None, on_result=None, limit=0) -> dict
     started = time.time()
     rows, by_pool = [], {}
     for pool in pools:
-        episodes = REGISTRY.get(pool)
+        episodes = list(REGISTRY.get(pool))
+        if shuffle_seed is not None:
+            # ORDER IS A VARIABLE. Running the same sequence every time means an episode's
+            # position in the tenant's fatigue curve is fixed, so a position effect is
+            # indistinguishable from a property of that episode.
+            import random
+            random.Random(shuffle_seed).shuffle(episodes)
         if limit:
             episodes = episodes[:limit]
         pool_rows = []
@@ -105,7 +112,7 @@ def _transport_summary(agent):
 
 
 def repeat_suite(agent, *, repeats=3, pools=POOLS, root=None, on_result=None,
-                 on_run=None, limit=0) -> dict:
+                 on_run=None, limit=0, rest_s=0, shuffle_seed=None) -> dict:
     """Run the whole suite `repeats` times and report how much the verdicts move.
 
     WHY THIS EXISTS. Three runs of this suite against the same system, with nothing changed
@@ -121,11 +128,25 @@ def repeat_suite(agent, *, repeats=3, pools=POOLS, root=None, on_result=None,
     """
     runs = []
     for i in range(max(1, repeats)):
-        out = run_suite(agent, pools=pools, root=root, on_result=on_result, limit=limit)
+        # REST BETWEEN REPEATS, and it is not politeness. Three runs back to back are three
+        # points on the tenant's throttle-recovery curve, not three independent repeats: the
+        # first round gave 7 -> 17 -> 19, monotonic, and a spread computed from that measures
+        # the recovery rather than the system. Time between runs is the only thing that
+        # separates them.
+        if i and rest_s:
+            time.sleep(rest_s)
+        out = run_suite(agent, pools=pools, root=root, on_result=on_result, limit=limit,
+                        shuffle_seed=None if shuffle_seed is None else shuffle_seed + i)
         runs.append(out)
         if on_run is not None:
             on_run(i + 1, out)
-    return {"repeats": len(runs), "runs": runs, "reliability": reliability(runs)}
+    return {"repeats": len(runs), "runs": runs, "reliability": reliability(runs),
+            "rest_s": rest_s, "shuffled": shuffle_seed is not None,
+            "confounding": (
+                "" if (rest_s or shuffle_seed is not None) else
+                "RUN BACK TO BACK IN A FIXED ORDER: any trend across the runs is confounded "
+                "with the tenant's state over the same period, and the spread is not an "
+                "estimate of run-to-run variance")}
 
 
 def reliability(runs) -> dict:

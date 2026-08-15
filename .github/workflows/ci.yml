@@ -45,6 +45,11 @@ jobs:
       - name: Audit hermetic test manifest
         run: python scripts/check_ci_test_manifest.py
 
+      # The rule is absolute and has been broken twice; the last time it was a GENERATED
+      # file that reintroduced it, which no review reads. Enforced rather than remembered.
+      - name: No identifying names in tracked files
+        run: python scripts/check_no_identifying_names.py .
+
       # Run only the hermetic test paths. Explicit file list is the safest guard
       # against accidentally picking up non-hermetic tests when new files are added.
       - name: Run hermetic unit tests

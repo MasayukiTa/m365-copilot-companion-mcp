@@ -215,3 +215,48 @@ def test_a_work_agent_url_is_accepted(monkeypatch):
     monkeypatch.setenv("MCP_RESEARCHER_AGENT_URL", "https://m365.cloud.microsoft/chat/agent/R")
     monkeypatch.setenv("MCP_FLEET_AGENT_URL", "https://m365.cloud.microsoft/chat/agent/W")
     assert B.build_agent("fleet").describe()["execution_target"] == "relay_fleet/v1"
+
+
+def test_back_to_back_repeats_are_reported_as_confounded(monkeypatch):
+    """連続3回はテナントの回復曲線上の3点で、独立した3反復ではない。
+    7 -> 17 -> 19 の単調増加から出したばらつきは、系ではなく回復速度を測っている。"""
+    monkeypatch.setattr(B.REGISTRY, "get", lambda pool: [])
+
+    class _A:
+        applies_manifest = False
+        transcript = []
+        def __call__(self, prompt, workdir):
+            return ""
+
+    out = B.repeat_suite(_A(), repeats=2, pools=("evolution",))
+    assert "confounded" in out["confounding"]
+    out = B.repeat_suite(_A(), repeats=2, pools=("evolution",), rest_s=0.01)
+    assert out["confounding"] == ""
+
+
+def test_the_episode_order_can_be_varied_between_runs(monkeypatch):
+    """毎回同じ順序だと、エピソードの位置がテナントの疲弊曲線上で固定され、
+    位置の効果とそのエピソードの性質が区別できない。"""
+    seen = []
+
+    class _Ep:
+        def __init__(self, i):
+            self.episode_id = "e%d" % i
+            self.category = "excel"
+
+    eps = [_Ep(i) for i in range(6)]
+    monkeypatch.setattr(B.REGISTRY, "get", lambda pool: eps)
+    monkeypatch.setattr(B.R, "run_episode",
+                        lambda ep, agent, root=None: seen.append(ep.episode_id) or
+                        {"episode_id": ep.episode_id, "success": True, "infra_failure": False,
+                         "category": "excel", "latency_s": 1.0})
+
+    class _A:
+        applies_manifest = False
+        transcript = []
+
+    B.run_suite(_A(), pools=("evolution",), shuffle_seed=1)
+    first = list(seen)
+    seen.clear()
+    B.run_suite(_A(), pools=("evolution",), shuffle_seed=2)
+    assert first != seen, "seed を変えても順序が同じ"

@@ -28,7 +28,12 @@ import sys
 import tempfile
 import time
 
-SSH_HOST = os.environ.get("EVAL_HOST_SSH_HOST", "eval-host")
+# THE HOST COMES FROM THE ENVIRONMENT, WITH NO DEFAULT. It used to default to the machine's
+# actual name, which put an operator's hostname in a public repository -- and a wrong default
+# here fails obscurely anyway, because ssh resolves it and reports a name nobody recognises.
+SSH_HOST = os.environ.get("EVAL_SSH_HOST", "").strip()
+if not SSH_HOST and __name__ == "__main__":
+    raise SystemExit("set EVAL_SSH_HOST to the eval host this script should reach over ssh")
 DISTRO = os.environ.get("EVAL_HOST_WSL_DISTRO", "Ubuntu")
 REMOTE_DIR = "C:/wsl-setup"                       # Windows-side staging on the eval host
 REMOTE_DIFFS_WIN = REMOTE_DIR + "/diffs"

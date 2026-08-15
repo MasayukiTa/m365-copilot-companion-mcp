@@ -4,7 +4,7 @@ native parallel evaluator (--max_workers), so each repo's env image is built ONC
 instances run concurrently inside one process -- no per-grade env-image build race. Writes a
 compact result + a .done marker to the Windows-shared verdicts dir for the caller to scp back.
 
-    python3 the eval host_batch_grade.py <predictions.json> <run_id> <max_workers> [dataset_name]
+    python3 evalhost_batch_grade.py <predictions.json> <run_id> <max_workers> [dataset_name]
 """
 import glob
 import json

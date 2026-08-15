@@ -1,8 +1,20 @@
-SETTLE UNIFICATION -- STAGE 0 (SECOND COLLECTION, DECISIVE)
+SETTLE UNIFICATION -- STAGE 0 (SECOND COLLECTION)
 
-VERDICT: the proposed change is not justified by this evidence. Do not proceed to the
-implementation stages. The one real early-accept found came from somewhere else and is
-already fixed.
+VERDICT: THIS EVIDENCE CANNOT DECIDE IT. The population excludes the at-risk stratum, and the
+interval contains the effect the plan was written about. Do not proceed to the implementation
+stages -- not because the benefit was shown to be absent, but because there is not yet a
+sample that could tell absence from a failure to look.
+
+  The distinction matters when this is read back. "Not reproduced" is not "refuted". The 95%
+  upper bound is 0.250, so this sample does not separate 0% from the plan's 7%: that figure
+  sits comfortably inside the interval. And the turns most at risk of an early accept are the
+  ones with PAUSES -- a tool call, a retrieval, a long think -- of which this population
+  contains none. So the state is not "7% is false"; it is "the stratum where 7% could live
+  was not measured".
+
+  The one genuine early accept found anywhere came from the marker table rather than the
+  predicate. That is a fix, not an acquittal: it says nothing about whether the predicate
+  itself truncates on turns this collection did not contain.
 
 -- the collection ----------------------------------------------------------------
 
@@ -37,9 +49,12 @@ settle replay: 120 turns
 
 -- what this does and does not settle ---------------------------------------------
 
-  SETTLED: the plan's ~7% truncated-capture figure is not reproduced on this population,
-  and the sampled predicate has nothing to fix here. Its sample floor never changed an
-  acceptance to a different text.
+  SETTLED: on THIS population the sampled predicate has nothing to fix -- its sample floor
+  never changed an acceptance to a different text -- and the label is now real, which the
+  first collection's could not be shown to be.
+
+  NOT SETTLED: whether the plan's ~7% is wrong. With an upper bound of 0.250 this sample
+  cannot separate 0% from 7%. Absence of evidence, at this sample size, over this stratum.
 
   NOT SETTLED, and this is the limit that matters: the prompts are ordinary chat questions.
   They stream steadily. The turns most at risk of an early accept are the ones with PAUSES

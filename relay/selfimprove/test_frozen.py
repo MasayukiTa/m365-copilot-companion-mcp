@@ -271,3 +271,17 @@ def test_pointing_the_anchor_at_nothing_is_a_violation_not_a_skip():
     if F.anchor_state() != "redirected":
         assert "ANCHOR_REDIRECTED_AWAY_FROM_EXISTING" not in F.frozen_intact()[1]
     print("ok test_pointing_the_anchor_at_nothing_is_a_violation_not_a_skip")
+
+
+def test_the_baseline_never_records_an_absolute_path(tmp_path):
+    """このファイルは追跡され push される -- 今回は公開リポジトリへ。
+    repo_root をそのまま書いていたので、スナップショットのたびにユーザ名と
+    ディレクトリ名が履歴に入っていた。しかも読み返されてもいなかった。"""
+    import json
+    import re
+
+    path = str(tmp_path / "baseline.json")
+    F.snapshot_baseline(baseline_path=path, force=True)
+    text = open(path, encoding="utf-8").read()
+    assert not re.search(r"[A-Za-z]:\\|[A-Za-z]:/", text), "絶対パスが記録されている"
+    assert json.loads(text)["checksums"], "checksums が空"

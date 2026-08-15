@@ -212,3 +212,16 @@ def test_the_declined_check_is_case_insensitive_and_covers_english():
     assert A.service_declined("Too Many Requests")
     assert A.service_declined("Please try again later.")
     assert not A.service_declined("the report is ready")
+
+
+def test_degraded_throttling_is_knowingly_not_detected():
+    """スロットルが『拒否』で来れば拾えるが、『品質低下』で来ると
+    能力の失敗と区別がつかない。非対称な取りこぼしが残ることを、
+    検査のある場所に書いておく -- 別の場所に書いた但し書きは数字と一緒に旅をしない。"""
+    import inspect
+    doc = inspect.getdoc(A.service_declined)
+    assert "DEGRADATION" in doc
+    assert "one-sided" in doc
+    # and it behaves that way: a short, plausible, wrong answer is still an answer
+    raw = 'data: {"replace": "42"}\n\nevent: done\ndata: {}\n\n'
+    assert _Bridge(raw)("x", "C:/wd") == "42"

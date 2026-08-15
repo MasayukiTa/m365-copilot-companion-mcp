@@ -48,7 +48,7 @@ if runid:
     local_logs = os.path.join(OUT, "_logs")
     os.makedirs(local_logs, exist_ok=True)
     subprocess.run(["scp", "-q", "-o", "ConnectTimeout=30", "-o", "BatchMode=yes", "-r",
-                    "eval-host:C:/wsl-setup/_miss/.", local_logs],
+                    os.environ.get("EVAL_SSH_HOST", "") + ":C:/wsl-setup/_miss/.", local_logs],
                    capture_output=True, text=True, timeout=180)
     for i in misses:
         s = safe[i]

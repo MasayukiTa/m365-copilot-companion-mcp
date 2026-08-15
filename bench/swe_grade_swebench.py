@@ -22,7 +22,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SWEDIR = os.path.join(REPO, ".fleet", "swe")
 PREDS = os.path.join(SWEDIR, "preds_solve")
 RESULTS = os.path.join(SWEDIR, "grade_results.jsonl")
-RUNNER_LOCAL = os.path.join(REPO, "bench", "the eval host_batch_grade.py")
+RUNNER_LOCAL = os.path.join(REPO, "bench", "evalhost_batch_grade.py")
 TMP = os.path.join(SWEDIR, "_grade_batch")
 
 
@@ -78,8 +78,8 @@ def main():
     R._ssh_ps("New-Item -ItemType Directory -Force '%s' | Out-Null; 'ok'" % R.REMOTE_DIR)
     preds_win = "%s/preds_%s.json" % (R.REMOTE_DIR, runid)
     preds_wsl = "/mnt/c/wsl-setup/preds_%s.json" % runid
-    runner_win = "%s/the eval host_batch_grade.py" % R.REMOTE_DIR
-    runner_wsl = "/mnt/c/wsl-setup/the eval host_batch_grade.py"
+    runner_win = "%s/evalhost_batch_grade.py" % R.REMOTE_DIR
+    runner_wsl = "/mnt/c/wsl-setup/evalhost_batch_grade.py"
     def _scp_retry(local, remote, n=6):
         # the eval host sshd has a very low MaxStartups; a single scp can be transiently rejected.
         # retry a few times (waiting for the handshake window to clear) before giving up.

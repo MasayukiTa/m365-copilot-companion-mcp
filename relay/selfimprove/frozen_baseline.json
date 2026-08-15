@@ -7,16 +7,16 @@
     "bench/companionbench/episodes/sealed.py": "0550b3dc00df8600601ba1c60a4a5f2d58fbc28bd58a8932231dc61579d3f377",
     "bench/companionbench/pools.py": "53e9759fa105c59f3e5b2c413cb9621fba17450422c459961a0c33addfbc549b",
     "bench/companionbench/runner.py": "c516a28ea981f505eeb8947d559ca84f7bc8ea78c245885981b1d877507b2b18",
-    "bench/the eval host_batch_grade.py": "5d30b0f5970358e1c9414265b9a6bfb8bb83e69274f5c4d2883b4789f5be12ab",
-    "bench/swe_grade_swebench.py": "622e41695f2a50ba69be3a06bc0fd217ddc3a8446c1a07329d46503a5672b7e9",
+    "bench/evalhost_batch_grade.py": "9b2449a0532d423b25875e48f9dc1ae7fc6d2bdd9bea95347ff875b6df990665",
+    "bench/swe_grade_swebench.py": "3391a0410b5d7e12f9f97c48ca8f92732174f06c8ad34a0e05cde91bbe2755f7",
     "docs/SECURITY.md": "6deaa0e2ab9d8480bf5cf2ce2508a2e49e31962e275be2e7acbf7dd5c7f114b8",
     "relay/selfimprove/decision.py": "a92fc06ca9f5ea51f5aac47c2aeaf93ed7cf66d2bf8068e2b39df976894c3f5c",
-    "relay/selfimprove/frozen.py": "56df952f7266d331abb70f2db6e20c0c278bf5933fe87b7df6d506a98069d167",
+    "relay/selfimprove/frozen.py": "dda8f88d1b2fcb6fceebe7b45566348442f8916dc2517c73ec10c0a153fcbdae",
     "relay/selfimprove/guards.py": "4f68805a20bd8a70eda769e749591222e5618e4054f6ef817422c45cafd1377a",
     "relay/selfimprove/manifest.py": "824f47ce9207e799ba3719dba35b109de5dbcf36e4fb2dbe4f3fc275914015e6",
     "tools/_untrusted.py": "2fe9c6b36a0188775db7de2b55649df3b6d923b97b104701d81e43a1065b59df",
     "tools/folder_policy.py": "d7b4dc0adcd82e8745bba4be1d2f6feea87f3c373d4bb0cac23121e14ebd2717",
     "tools/security.py": "94beda0d936206db8a957e5b49993018098a9a480fec6e5b28351da75e56cf5a"
   },
-  "repo_root": "C:\\Users\\<user>\\<repo>"
+  "repo_root": "<repo>"
 }

@@ -151,6 +151,18 @@ _SERVICE_DECLINED = (
 def service_declined(reply: str) -> str:
     """The phrase showing the service refused to serve this turn, or "".
 
+    WHAT THIS CANNOT CATCH, and the asymmetry is worth stating where the check is rather than
+    somewhere else. Throttling that arrives as a REFUSAL is detectable: the reply says so and
+    it says so in a handful of words. Throttling that arrives as DEGRADATION -- a shorter
+    answer, a skipped tool call, a shallower attempt under load -- looks exactly like the
+    companion trying and doing worse, because that is what it is. Those turns pass this check
+    and are scored as capability failures.
+    
+    So the classification is one-sided: it removes the loud form of an environment effect and
+    leaves the quiet form in the numbers. The quiet form is also the one that biases a
+    comparison, because it depends on load and load depends on how much measuring is going on.
+    Pacing the measurement is the remedy; this function is not.
+
     Matched on the WHOLE reply being short as well as containing the phrase: a long answer
     that discusses rate limiting is an answer, and turning it into infra would delete real
     evidence in the direction that flatters the system.

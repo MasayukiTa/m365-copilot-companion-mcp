@@ -31,7 +31,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # violation, which is the safety-relevant direction.
 FROZEN_MANIFEST = [
     "bench/swe_grade_swebench.py",        # the swebench grader
-    "bench/the eval host_batch_grade.py",         # the batch grader
+    "bench/evalhost_batch_grade.py",         # the batch grader
     "relay/selfimprove/guards.py",        # the ENFORCING guards (significance_gate, BurnedRegistry, ...)
     "docs/SECURITY.md",                   # constitution doc: the stated security model
     "relay/selfimprove/frozen.py",        # this manifest itself
@@ -156,7 +156,13 @@ def snapshot_baseline(repo_root: str = REPO, baseline_path: str = DEFAULT_BASELI
             "a baseline already exists at %s; re-snapshotting would bless any change made "
             "since it was written. Pass force=True (CLI: --snapshot --force) only as a "
             "deliberate human act." % baseline_path)
-    data = {"repo_root": repo_root, "checksums": sums}
+    # NO ABSOLUTE PATH IN A COMMITTED FILE. `repo_root` was written verbatim, so every
+    # snapshot recorded the checkout's full path -- and this file is tracked and pushed, in
+    # this case to a public repository, which put a username and a directory name into the
+    # history on every run. The path was never used for anything either: `frozen_intact`
+    # takes its own repo_root argument and the recorded one was only ever read back for
+    # display. What the baseline is FOR is the checksums.
+    data = {"repo_root": "<repo>", "checksums": sums}
     os.makedirs(os.path.dirname(baseline_path) or ".", exist_ok=True)
     with open(baseline_path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
