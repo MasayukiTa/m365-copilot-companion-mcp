@@ -730,6 +730,13 @@ def _settle_trace_rotate():
         pass
 
 
+#: A monotonic turn counter. `id(drv)` is only a KEY into these dicts and must never be part
+#: of the turn label: CPython reuses an id once the object is collected, so over a long
+#: campaign two different drivers can be handed the same one, and their polls merge into a
+#: turn that never happened. A counter cannot collide with itself.
+_settle_trace_seq = [0]
+
+
 def _settle_trace_reset(drv, turn_id=""):
     """Start a fresh age clock for this driver's next turn, and label that turn.
 
@@ -738,9 +745,48 @@ def _settle_trace_reset(drv, turn_id=""):
     """
     try:
         _settle_trace_started_at[id(drv)] = time.time()
-        _settle_trace_turn[id(drv)] = turn_id or ("t%x" % int(time.time() * 1000))
+        _settle_trace_seq[0] += 1
+        _settle_trace_turn[id(drv)] = turn_id or (
+            "t%x-%d" % (int(time.time() * 1000), _settle_trace_seq[0]))
     except Exception:
         pass
+
+
+#: How many extra polls to read AFTER production accepts, in collect mode only.
+_SETTLE_TRACE_LABEL_TAIL = int(os.environ.get("MCP_SETTLE_TRACE_LABEL_TAIL", "4"))
+
+
+def _settle_trace_label_tail(drv):
+    """Read a few more times after acceptance, purely so the LABEL is real.
+
+    THIS IS THE FIX FOR A REPLAY THAT COULD ONLY EVER MEASURE ZERO. `_settle_trace` is called
+    from inside the settle loop, and the loop ENDS when production's predicate accepts -- so
+    the recorded sequence stops at production's accept point and `polls[-1]["text"]` is
+    production's accepted text. Both replayed arms are strictly weaker than production
+    (production needs 3 samples, or 6 without a marker, AND dwell; the arms need 2, or 2 plus
+    a floor of 3), so both accept at an index at or before production's. Scored against a
+    label that IS production's accepted text, truncation is zero by construction -- and the
+    7% the plan was looking for is counted as zero precisely when production truncates,
+    because that is the moment the recording stops.
+
+    So in collect mode the recording continues past acceptance. These samples are marked
+    `post_accept` and are NEVER used to decide anything: production has already returned, and
+    the arms' accept indices are computed over the pre-acceptance polls only. They exist so
+    that the ground truth is what the text ACTUALLY settled to rather than what production
+    decided it had settled to. The cost is a few extra DOM reads per turn, in a mode that is
+    off by default.
+    """
+    if not _SETTLE_TRACE_COLLECT:
+        return
+    for _ in range(max(0, _SETTLE_TRACE_LABEL_TAIL)):
+        try:
+            time.sleep(REPLY_SETTLE_INTERVAL_S)
+            text = drv.read_last_response()
+            if _is_processing(text):
+                continue
+            _settle_trace(drv, "post_accept", text, False, 0, None, post_accept=True)
+        except Exception:
+            return
 
 
 # Where send() actually spends its time. The interactive turn was measured at 440s four
@@ -1625,6 +1671,7 @@ class CopilotWebDriver:
                         print("[relay] accepting marker-less but idle+stable response "
                               "(%.0fs, %d samples) -- no DONE/CONTINUE/STUCK tail"
                               % (elapsed, stable_count))
+                    _settle_trace_label_tail(self)
                     self._accept_new_reply(t)
                     return True
             else:

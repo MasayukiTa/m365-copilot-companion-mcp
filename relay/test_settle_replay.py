@@ -25,9 +25,25 @@ def _write(rows):
     return path
 
 
-def _poll(turn, text, generating=False):
-    return {"turn_id": turn, "text": text, "generating": generating,
-            "text_len": len(text), "phase": "stable"}
+def _poll(turn, text, generating=False, post_accept=False):
+    row = {"turn_id": turn, "text": text, "generating": generating,
+           "text_len": len(text), "phase": "stable"}
+    if post_accept:
+        row["post_accept"] = True
+        row["phase"] = "post_accept"
+    return row
+
+
+def _turn(turn, texts, tail=()):
+    """A recorded turn: what the arms may decide on, then the label-only tail.
+
+    Every constructed turn gets a tail, because a turn WITHOUT one has production's accepted
+    text as its label and can only ever score zero -- which is the defect these tests exist
+    to keep out.
+    """
+    rows = [_poll(turn, t) for t in texts]
+    rows += [_poll(turn, t, post_accept=True) for t in (tail or [texts[-1]])]
+    return rows
 
 
 # ---- the refusals -----------------------------------------------------------------------
@@ -39,7 +55,7 @@ def test_a_debug_mode_trace_is_refused_rather_than_summarised():
                     "text_tail": "...", "generating": False, "stable_count": 3}])
     with pytest.raises(SR.NotReplayable) as exc:
         SR.load_turns(path)
-    assert "collect mode" in str(exc.value)
+    assert "collect-mode" in str(exc.value)
     assert "60-second gate" in str(exc.value)
 
 
@@ -96,32 +112,124 @@ def test_truncation_is_measured_against_the_turns_final_text():
     assert out["per_implementation"]["sampled"]["truncated"] == 0
 
 
-def test_the_discordant_pairs_are_reported_because_the_test_consumes_them():
-    """2つの率だけ出すと対応が消え、検出力の大半が一緒に消える。"""
+def test_the_discordant_pairs_are_reported_because_the_pairing_is_the_point():
+    """2つの率だけ出すと対応が消える。"""
     rows = []
     for i in range(3):
-        t = "t%d" % i
-        rows += [_poll(t, "half"), _poll(t, "half"),
-                 _poll(t, "half and rest"), _poll(t, "half and rest"),
-                 _poll(t, "half and rest")]
+        rows += _turn("t%d" % i, ["half", "half", "half and rest", "half and rest",
+                                  "half and rest"])
     out = SR.replay(SR.load_turns(_write(rows)))
     assert out["discordant"]["legacy_worse"] == 3
     assert out["discordant"]["sampled_worse"] == 0
-    assert out["discordant_total"] == 3
 
 
-def test_an_underpowered_run_says_so_where_the_number_is_produced():
-    """計画は不一致対およそ40を要求している。それ未満の差は証拠ではない。"""
-    rows = [_poll("t1", "a"), _poll("t1", "a"), _poll("t1", "ab"), _poll("t1", "ab"),
-            _poll("t1", "ab")]
+# ---- the label ---------------------------------------------------------------------------
+
+def test_the_label_comes_from_after_production_accepted():
+    """`_settle_trace` は settle ループの中から呼ばれ、ループは本番が受理した時点で終わる。
+    受理後を記録しなければ、最後のテキストは『本番が受理したテキスト』であり、
+    本番より弱い両腕はそれ以前でしか受理しない -- truncation は定義上ゼロになる。
+    狙っていた truncation は、本番が切った瞬間に記録が止まるので、まさにその時ゼロと数えられる。"""
+    # production accepted "half"; the text actually went on to grow.
+    rows = _turn("t1", ["half", "half"], tail=["half and the rest"])
     out = SR.replay(SR.load_turns(_write(rows)))
-    assert out["sufficiently_powered"] is False
-    assert "UNDERPOWERED" in SR.report(out)
+    assert out["per_implementation"]["legacy"]["truncated"] == 1,         "受理後の記録が正解ラベルとして使われていない"
 
 
-def test_both_arms_are_scored_by_the_same_imperfect_label():
-    """末尾を正解とするのは下限の推定。両腕を同じ物差しで測る限り対応比較は成立する。"""
-    import inspect
-    src = inspect.getsource(SR.replay)
-    assert 'final = (polls[-1].get("text")' in src
-    assert src.count("truncated = accepted != final") == 1
+def test_without_a_tail_the_turn_is_reported_as_unlabelled_rather_than_as_clean():
+    """ラベルの無いターンから出るゼロは、測定ではなく定義。"""
+    rows = [_poll("t1", "half"), _poll("t1", "half")]
+    out = SR.replay(SR.load_turns(_write(rows)))
+    assert out["unlabelled_turns"] == 1
+    assert "zero by construction" in SR.report(out)
+
+
+def test_the_post_accept_samples_are_never_offered_as_decision_points():
+    """本番が既に戻った後のサンプルで受理する述語は、誰も走らせられない述語。"""
+    rows = _turn("t1", ["a", "a"], tail=["a", "a", "a"])
+    out = SR.replay(SR.load_turns(_write(rows)))
+    assert out["rows"][0]["legacy"]["index"] < 2
+    assert out["rows"][0]["polls"] == 2
+
+
+# ---- what may and may not be claimed ------------------------------------------------------
+
+def test_there_is_no_significance_test_because_there_is_no_null_that_could_be_true():
+    """sampled の条件は legacy の条件の真部分集合(floor が増えるだけ)なので、
+    sampled が先に受理することはありえない。McNemar の帰無仮説 p=0.5 は成立しない。
+    p値は『起こりえないことが起きなかった』としか言わない。"""
+    assert not hasattr(SR, "mcnemar")
+    rows = _turn("t1", ["half", "half", "whole", "whole", "whole"])
+    out = SR.replay(SR.load_turns(_write(rows)))
+    assert "sufficiently_powered" not in out
+    assert "p_value" not in out
+
+
+def test_sampled_can_never_accept_earlier_than_legacy():
+    """構造的優越を実挙動で固定する。ここが崩れたら報告の形も変わる。"""
+    import random
+    rng = random.Random(11)
+    for _ in range(200):
+        polls = []
+        text = ""
+        for _ in range(rng.randint(2, 12)):
+            if rng.random() < 0.4:
+                text += "x" * rng.randint(1, 4)
+            polls.append({"text": text, "generating": rng.random() < 0.15})
+        legacy = SR.accept_index_legacy(polls)
+        sampled = SR.accept_index_sampled(polls)
+        if legacy >= 0 and sampled >= 0:
+            assert sampled >= legacy
+
+
+def test_the_reduction_is_reported_as_a_size_with_an_interval():
+    rows = []
+    for i in range(4):
+        rows += _turn("t%d" % i, ["half", "half"], tail=["half and rest"])
+    out = SR.replay(SR.load_turns(_write(rows)))
+    r = out["reduction"]
+    assert r["turns_fixed"] == 4 and r["turns"] == 4
+    assert r["ci95"][0] <= r["point"] <= r["ci95"][1]
+    assert "no null that could be true" in r["note"]
+
+
+def test_the_interval_behaves_at_the_boundaries():
+    """0件と全件で正規近似は壊れる。Wilson は壊れない。"""
+    low, high = SR._wilson(0, 20)
+    assert low == 0.0 and 0 < high < 1
+    low, high = SR._wilson(20, 20)
+    assert 0 < low < 1 and high == 1.0
+
+
+# ---- the cost, which was dropped from the comparison ---------------------------------------
+
+def test_a_turn_one_arm_never_accepted_is_not_dropped_from_the_comparison():
+    """『受理できなかった』は sampled 唯一の失敗様式(floor が本番の timeout まで持ちこたえる)。
+    片方の腕の失敗だけが集計から落ちる設計になっていた。"""
+    # legacy accepts at index 1; sampled's floor of 3 is never reached.
+    rows = [_poll("t1", "a"), _poll("t1", "a"), _poll("t1", "a", post_accept=True)]
+    out = SR.replay(SR.load_turns(_write(rows)))
+    assert out["per_implementation"]["sampled"]["never"] == 1
+    assert out["never_only"]["sampled"] == 1
+    assert "timeout in production" in SR.report(out)
+
+
+# ---- grouping ------------------------------------------------------------------------------
+
+def test_a_trace_whose_format_changed_part_way_is_refused():
+    """rows[0] だけ見る検査は、途中で形式が変わったトレースを素通りさせる。"""
+    rows = _turn("t1", ["a", "a"])
+    rows.append({"ts": 1, "phase": "stable", "text_len": 3})
+    with pytest.raises(SR.NotReplayable) as exc:
+        SR.load_turns(_write(rows))
+    assert "not fully collect-mode" in str(exc.value)
+
+
+def test_unlabelled_rows_are_refused_rather_than_merged():
+    """空の turn_id をまとめると、無関係なポーリングから1つの巨大な擬似ターンができ、
+    その正解ラベルはたまたま最後だったターンのものになる。"""
+    rows = _turn("t1", ["a", "a"])
+    rows.append({"turn_id": "", "text": "b", "generating": False})
+    with pytest.raises(SR.NotReplayable) as exc:
+        SR.load_turns(_write(rows))
+    assert "empty turn_id" in str(exc.value)
