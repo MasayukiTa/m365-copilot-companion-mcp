@@ -347,6 +347,19 @@ def build_agent(kind: str):
                 "the fleet target needs MCP_FLEET_AGENT_URL (or MCP_IMPL_AGENT_URL): the "
                 "chat URL a worker tab opens. Without it the fleet opens a tab with no "
                 "composer and reports a dead target ninety seconds later")
+        # NOT THE RESEARCH OR ANALYST AGENT. Those answer a request with a scoping question
+        # and wait for approval; the settle predicate accepts that question as a settled
+        # reply, so a run reports success while nothing was done, and every parked turn
+        # notifies the operator on their phone. That happened once already, to a different
+        # collector, for the same reason.
+        for name in ("MCP_RESEARCHER_AGENT_URL", "MCP_ANALYST_AGENT_URL"):
+            other = (os.environ.get(name) or "").strip()
+            if other and other == agent_url.strip():
+                raise RefusedToMeasure(
+                    "the fleet agent url is %s, which answers with a scoping question and "
+                    "waits: episodes would report success having done nothing, and each "
+                    "parked turn notifies the operator. Point MCP_FLEET_AGENT_URL at the "
+                    "work agent" % name)
         return FleetAgent(agent_url=agent_url,
                           cdp_url=os.environ.get("MCP_FLEET_CDP_URL",
                                                  "http://127.0.0.1:9222"),

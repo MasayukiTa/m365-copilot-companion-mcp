@@ -198,3 +198,20 @@ def test_the_transport_facts_are_saved_so_a_diagnosis_can_be_checked(monkeypatch
     monkeypatch.setattr(B.REGISTRY, "get", lambda pool: [])
     out = B.run_suite(_WithTranscript(), pools=("evolution",))
     assert out["transport"] == [{"elapsed_s": 24.1, "settled": False, "reply_chars": 0}]
+
+
+def test_the_fleet_is_not_pointed_at_the_research_agent(monkeypatch):
+    """リサーチ系は問い合わせにスコーピング質問を返して待つ。settle 述語はそれを受理するので、
+    実行は成功を報告しながら何もしていない。停止したターンごとに運用者へ通知も飛ぶ。
+    同じ理由で一度起きている。"""
+    monkeypatch.setenv("MCP_RESEARCHER_AGENT_URL", "https://m365.cloud.microsoft/chat/agent/R")
+    monkeypatch.setenv("MCP_FLEET_AGENT_URL", "https://m365.cloud.microsoft/chat/agent/R")
+    with pytest.raises(B.RefusedToMeasure) as exc:
+        B.build_agent("fleet")
+    assert "scoping question" in str(exc.value)
+
+
+def test_a_work_agent_url_is_accepted(monkeypatch):
+    monkeypatch.setenv("MCP_RESEARCHER_AGENT_URL", "https://m365.cloud.microsoft/chat/agent/R")
+    monkeypatch.setenv("MCP_FLEET_AGENT_URL", "https://m365.cloud.microsoft/chat/agent/W")
+    assert B.build_agent("fleet").describe()["execution_target"] == "relay_fleet/v1"
