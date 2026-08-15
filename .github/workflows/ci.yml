@@ -106,6 +106,7 @@ jobs:
             bench/companionbench/test_office_episodes.py \
             bench/companionbench/test_runner.py \
             bench/companionbench/test_runtime_episodes.py \
+            bench/companionbench/test_sealed.py \
             bench/gaia/test_run_pipeline.py \
             bench/test_local_review_transport.py \
             bench/test_review_adjudicate.py \
