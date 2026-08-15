@@ -169,6 +169,7 @@ jobs:
             relay/selfimprove/test_apply.py \
             relay/selfimprove/test_archive.py \
             relay/selfimprove/test_calibration.py \
+            relay/selfimprove/test_campaign.py \
             relay/selfimprove/test_dashboard.py \
             relay/selfimprove/test_diversify.py \
             relay/selfimprove/test_frozen.py \
