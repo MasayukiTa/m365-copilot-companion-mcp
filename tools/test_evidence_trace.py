@@ -263,3 +263,15 @@ def test_the_servers_own_file_tools_stay_transparent():
 def test_the_tool_table_is_readable_without_starting_the_server():
     """判定はサーバ・ベンチ・採点の3プロセスで一致しなければならない。"""
     assert len(ET._known_tool_names()) > 50
+
+
+def test_a_windows_path_is_absolute_even_when_the_grader_runs_on_linux():
+    """トレースは片方の機械で書かれ、別の機械で採点される。
+    os.path.isabs は実行中のOSに答えるので、Linux 上では C:/... が相対になり、
+    workdir 配下に解決されて『流出は無し』と報告されていた。"""
+    assert ET._is_absolute("C:/Users/Public/x.txt")
+    assert ET._is_absolute("/etc/passwd")
+    assert ET._is_absolute(r"C:\Users\Public\x.txt")
+    assert ET._is_absolute("\\\\server\\share\\x")
+    assert not ET._is_absolute("../outside/x")
+    assert not ET._is_absolute("sub/dir/x")
