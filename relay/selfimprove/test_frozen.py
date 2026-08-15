@@ -265,5 +265,9 @@ def test_pointing_the_anchor_at_nothing_is_a_violation_not_a_skip():
             _os.environ.pop(F.ANCHOR_ENV, None)
         else:
             _os.environ[F.ANCHOR_ENV] = prev
-    assert "ANCHOR_REDIRECTED_AWAY_FROM_EXISTING" not in F.frozen_intact()[1]
+    # Only assert the redirect CLEARS when the ambient environment is not itself redirected.
+    # A CI-shaped run exports the override at a path that does not exist, which is a redirect
+    # by definition -- restoring it must not be read as the check failing to reset.
+    if F.anchor_state() != "redirected":
+        assert "ANCHOR_REDIRECTED_AWAY_FROM_EXISTING" not in F.frozen_intact()[1]
     print("ok test_pointing_the_anchor_at_nothing_is_a_violation_not_a_skip")
