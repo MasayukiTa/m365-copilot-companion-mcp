@@ -30,7 +30,8 @@ param(
     [string]$Profile  = "copilot-bridge-edge",
     [switch]$HardReset,
     [switch]$Keepalive,
-    [switch]$SignIn        # force a VISIBLE window now to sign in (normally automatic on demand)
+    [switch]$SignIn,       # force a VISIBLE window now to sign in (normally automatic on demand)
+    [switch]$CollectSettleTrace   # record settle samples for the Stage 0 replay (see below)
 )
 
 $ErrorActionPreference = "Stop"
@@ -101,6 +102,27 @@ if (-not (Ensure-Edge -Hard:$HardReset -Visible:$SignIn)) {
 # Start the Python bridge, pointed at the bridge Edge's CDP port (NOT the fleet's :9222).
 $env:MCP_CDP_URL     = "http://127.0.0.1:$CdpPort"
 $env:MCP_BRIDGE_PORT = "$BridgePort"
+
+# SETTLE TRACE COLLECTION (opt-in, off by default).
+#
+# The ordinary trace records only turns already past 60 seconds and keeps text_len plus the last
+# 90 characters. That is the wrong population and an unusable shape for the settle-unification
+# Stage 0: its primary endpoint is TRUNCATED CAPTURE, which is an early accept, so the turns that
+# matter settle in seconds and wrote nothing at all -- and without a turn id, the full text and
+# the turn's final text, the recorded lines cannot be grouped or labelled.
+#
+# Collect mode drops the age gate and records what a replay needs. It is heavier: every sample of
+# every turn, with text. Hence opt-in, and hence the rotation the relay applies -- the previous
+# trace stopped silently at 2 MB in the middle of a night and nobody noticed for four days.
+#
+# The path is ABSOLUTE. The default is relative, so the file landed in whatever directory the
+# process happened to start in (scripts\.fleet\ rather than the repo's .fleet\), which is how the
+# real trace came to be somewhere nobody was looking for it.
+if ($CollectSettleTrace) {
+    $env:MCP_SETTLE_TRACE_COLLECT = "1"
+    $env:MCP_SETTLE_TRACE_PATH    = (Join-Path $root ".fleet\settle_trace.jsonl")
+    Write-Host "Settle-trace collection ON -> $env:MCP_SETTLE_TRACE_PATH"
+}
 $py     = Join-Path $root ".venv\Scripts\python.exe"
 $bridge = Join-Path $root "bridge\copilot_bridge.py"
 Write-Host ""
