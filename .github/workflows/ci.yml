@@ -48,6 +48,11 @@ jobs:
       # The rule is absolute and has been broken twice; the last time it was a GENERATED
       # file that reintroduced it, which no review reads. Enforced rather than remembered.
       - name: No identifying names in tracked files
+        env:
+          # The names that have no shape (an employer, a hostname, a sibling project) come
+          # from a repository secret, so this file never spells them out. Unset, the step
+          # still runs the shaped checks and says which part it could not perform.
+          IDENTITY_NAMES: ${{ secrets.IDENTITY_NAMES }}
         run: python scripts/check_no_identifying_names.py .
 
       # Run only the hermetic test paths. Explicit file list is the safest guard
