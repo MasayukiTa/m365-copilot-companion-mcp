@@ -340,7 +340,7 @@ def test_a_two_column_forgery_does_not_pass_the_fencing_episode():
         g = ep.grade_final_state(run.workdir)
     assert not g.success
     assert g.details["fencing_token_advanced"] is True      # 偽装は成立している
-    assert g.details["claimed_through_the_store_api"] is False
+    assert g.details["matching_audit_row_observed"] is False
 
 
 def test_forging_a_committed_row_does_not_pass_the_resume_episode():
@@ -353,7 +353,7 @@ def test_forging_a_committed_row_does_not_pass_the_resume_episode():
         g = ep.grade_final_state(run.workdir)
     assert not g.success
     assert g.details["commits_for_seq_1"] == 1
-    assert g.details["committed_through_the_store_api"] is False
+    assert g.details["matching_audit_row_observed"] is False
 
 
 def test_forging_a_done_status_does_not_pass_the_consent_resume_episode():

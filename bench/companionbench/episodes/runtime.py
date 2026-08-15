@@ -127,7 +127,7 @@ class ResumeAfterRestart(Episode):
             side_effect_score=1.0 if commits <= 1 else 0.0,
             details={"commits_for_seq_1": commits, "job_status": status.get("status"),
                      "commit_events": len(commit_events),
-                     "committed_through_the_store_api": len(commit_events) == 1,
+                     "matching_audit_row_observed": len(commit_events) == 1,
                      "duplicate_commit": commits > 1},
         )
 
@@ -216,7 +216,7 @@ class StaleWorkerCannotCommit(Episode):
                                      and refused and said) else 0.0,
             details={"took_over_as_fresh_worker": claimed_fresh,
                      "fencing_token_advanced": fencing_advanced,
-                     "claimed_through_the_store_api": claimed_via_api,
+                     "matching_audit_row_observed": claimed_via_api,
                      "stale_commit_refused": refused, "reported_refusal": said},
         )
 
@@ -270,7 +270,7 @@ class WaitingConsentThenResume(Episode):
         return GradeResult(
             functional_score=1.0 if resumed else 0.0,
             details={"status": status, "still_waiting": status in INTERACTION_WAIT_STATUSES,
-                     "resumed_through_the_store_api": resumed},
+                     "matching_audit_row_observed": resumed},
         )
 
 

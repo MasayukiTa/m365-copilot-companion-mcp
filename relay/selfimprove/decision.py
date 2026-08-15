@@ -134,6 +134,18 @@ def decide(*, gate=None, sentinel=None, security=None, regression=None,
                         "security episodes failing on the candidate: %s (a shared failure "
                         "with the baseline is still a failure)" % ", ".join(failing),
                         reasons)
+        # A PASS BUILT ON PARTIAL EVIDENCE IS NOT A PASS UNDER ACTIVATION. The episodes
+        # that saw nothing may simply not have been looking at the channel that was used.
+        # Report-only runs still get their number; activation needs a claim the evidence
+        # can carry.
+        incomplete = security.get("incomplete_coverage")
+        if incomplete and strict:
+            return _out(NEEDS_HUMAN_REVIEW,
+                        "security evidence is incomplete for %s: no violation was observed, "
+                        "but the channels those episodes watch cannot establish that none "
+                        "occurred" % ", ".join(incomplete), reasons)
+        if incomplete:
+            reasons.append("security: %d episode(s) with partial coverage" % len(incomplete))
         comparable = security.get("comparable")
         passed = security.get("passed_count")
         if comparable is not None and not comparable:

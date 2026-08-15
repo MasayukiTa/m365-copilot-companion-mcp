@@ -35,6 +35,24 @@ _SAFE_REVIEW_ABORT_CODES = frozenset({
 })
 
 
+#: Event types that record a STATE TRANSITION and are written by the operation performing
+#: it, in the same transaction. `record_event` refuses them: an observational API that can
+#: mint a transition receipt makes the receipt worthless as evidence that the transition
+#: happened. Purely observational events (CONSENT_HANDLED, BROWSER_METRICS, ...) are not
+#: listed and stay open to callers.
+RESERVED_EVENT_TYPES = frozenset({
+    "JOB_CREATED",
+    "TURN_CLAIMED",
+    "TURN_COMMITTED",
+    "TURN_ABORTED",
+    "INTERACTION_RESUMED",
+    "RUNTIME_RESUMED",
+    "VERIFICATION_PASSED",
+    "VERIFICATION_FAILED",
+    "JOB_CANCELLED",
+})
+
+
 class JobStoreError(RuntimeError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
@@ -149,6 +167,7 @@ class LocalJobStore:
 
     @staticmethod
     def _event(conn, job_id: str, seq: int | None, event_type: str, payload: dict, now: float):
+        # The internal writer: reserved types are legitimate here and only here.
         conn.execute(
             "INSERT INTO events(job_id,seq,event_type,payload_json,created_at) VALUES(?,?,?,?,?)",
             (job_id, seq, event_type, _json(payload), now),
@@ -763,7 +782,25 @@ class LocalJobStore:
 
     def record_event(self, job_id: str, event_type: str, payload: dict | None = None,
                      seq: int | None = None, now: float | None = None) -> None:
+        """Append an observational event. RESERVED types are refused.
+
+        This accepted any event type, which mattered because graders read the audit trail as
+        evidence that a state transition went through the API. Writing the row directly was
+        therefore as good as performing the operation: an independent review pointed out that
+        forging a fenced takeover cost one UPDATE plus one record_event call.
+
+        The reserved names below are emitted by the operations that perform them, inside the
+        same transaction as the state change. Nothing else may write one. That does not make
+        the trail unforgeable -- whoever can open the database can insert any row -- and the
+        graders no longer claim otherwise. It does close the path that went through the
+        supported API, which is the one a caller reaches for first.
+        """
         job_id = self._validate_job_id(job_id)
+        if str(event_type) in RESERVED_EVENT_TYPES:
+            raise JobStoreError(
+                "RESERVED_EVENT_TYPE",
+                "%r is emitted by the operation that performs it, in the same transaction; "
+                "it cannot be recorded separately" % event_type)
         now = time.time() if now is None else float(now)
         with self._transaction() as conn:
             job = conn.execute("SELECT current_seq FROM jobs WHERE job_id=?", (job_id,)).fetchone()

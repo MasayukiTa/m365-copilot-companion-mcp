@@ -333,3 +333,30 @@ def test_console_projection_uses_committed_summary_not_web_transcript(tmp_path):
     assert worker["artifacts"] == [{"path": "a.txt"}]
     json.dumps(snapshot)
     assert store.checkpoint()["ok"] is True
+
+
+def test_a_reserved_event_type_cannot_be_recorded_through_the_public_api():
+    """状態遷移の受領証を観測用APIから発行できるなら、その受領証は
+    「遷移が起きた」証拠にならない。偽装が UPDATE 1回 + record_event 1回で済んでいた。"""
+    import os
+    import tempfile
+
+    from relay.local_job_store import JobStoreError, LocalJobStore, RESERVED_EVENT_TYPES
+
+    store = LocalJobStore(os.path.join(tempfile.mkdtemp(prefix="ljs_"), "jobs.sqlite3"))
+    store.create_job({
+        "job_id": "reserved_probe", "execution_profile": "LOCAL_LOOP",
+        "data_location": "LOCAL", "requires_local_tool": True,
+        "task": {"type": "file_write", "instruction": "x"},
+        "constraints": {"max_turns": 2, "allowed_base": ".", "allow_shell": False},
+    })
+    for reserved in ("TURN_COMMITTED", "TURN_CLAIMED", "INTERACTION_RESUMED"):
+        assert reserved in RESERVED_EVENT_TYPES
+        try:
+            store.record_event("reserved_probe", reserved, {"worker_id": "forged"})
+            assert False, "%s を観測用APIから書けてしまった" % reserved
+        except JobStoreError as exc:
+            assert "cannot be recorded separately" in str(exc)
+
+    # observational events are unaffected
+    store.record_event("reserved_probe", "BROWSER_METRICS", {"fps": 60})
