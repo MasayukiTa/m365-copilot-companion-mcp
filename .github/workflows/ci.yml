@@ -177,6 +177,7 @@ jobs:
             relay/selfimprove/test_controller.py \
             relay/selfimprove/test_evolution_loop.py \
             relay/selfimprove/test_measurement_integrity.py \
+            relay/selfimprove/test_trace_to_eval.py \
             relay/selfimprove/test_l2_cron.py \
             relay/selfimprove/test_policy.py \
             relay/selfimprove/test_propose.py \
