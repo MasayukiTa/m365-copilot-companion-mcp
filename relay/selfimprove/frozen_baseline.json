@@ -1,0 +1,15 @@
+{
+  "checksums": {
+    "bench/the eval host_batch_grade.py": "5d30b0f5970358e1c9414265b9a6bfb8bb83e69274f5c4d2883b4789f5be12ab",
+    "bench/swe_grade_swebench.py": "622e41695f2a50ba69be3a06bc0fd217ddc3a8446c1a07329d46503a5672b7e9",
+    "docs/SECURITY.md": "6deaa0e2ab9d8480bf5cf2ce2508a2e49e31962e275be2e7acbf7dd5c7f114b8",
+    "relay/selfimprove/decision.py": "3768951b6020d1b8d888ee3a1349cd049de303e2193c26ed310d2bdcd5e29ca7",
+    "relay/selfimprove/frozen.py": "cb5ca1c087e889552756a23090c084b090b49e5e076224a6b3eaeeeb10a603d2",
+    "relay/selfimprove/guards.py": "4f68805a20bd8a70eda769e749591222e5618e4054f6ef817422c45cafd1377a",
+    "relay/selfimprove/manifest.py": "08a790cc0fe90b1f521835ba1879f81adf48b9112ccc7bd28d86978eafe47119",
+    "tools/_untrusted.py": "2fe9c6b36a0188775db7de2b55649df3b6d923b97b104701d81e43a1065b59df",
+    "tools/folder_policy.py": "d7b4dc0adcd82e8745bba4be1d2f6feea87f3c373d4bb0cac23121e14ebd2717",
+    "tools/security.py": "94beda0d936206db8a957e5b49993018098a9a480fec6e5b28351da75e56cf5a"
+  },
+  "repo_root": "C:\\Users\\<user>\\<repo>"
+}

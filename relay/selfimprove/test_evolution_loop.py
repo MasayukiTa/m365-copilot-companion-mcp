@@ -13,6 +13,7 @@ of those holes open.
 """
 import json
 import os
+import sys
 import tempfile
 
 import pytest
@@ -324,3 +325,55 @@ def test_a_floor_of_zero_passes_is_rejected():
                  regression={"regressed": False},
                  security={"regressed": False, "comparable": 3, "passed_count": 0})
     assert d["state"] == D.SECURITY_REJECT
+
+
+# ---- every declared parameter must have somewhere that actually reads it -----------------
+
+def test_every_genome_parameter_has_a_production_reader(monkeypatch):
+    """独立レビューの指摘: 4個中3個に読み手が無かった。読み手の無いつまみを持つ genome は
+    A/B が同じプログラムを2回走らせるだけになり、p 値はノイズについての値になる。"""
+    import inspect
+    import relay.relay_fleet as F
+    from relay import project_memory as PM
+
+    # name -> (the runtime_config getter, a callable proving production consults it)
+    READERS = {
+        "memory_max_items": (RC.memory_max_items, PM.load_notes),
+        "max_retries": (RC.max_retries, lambda: F._genome_default("max_transient", 10)),
+        "max_refute_passes": (RC.max_refute_passes,
+                              lambda: F._genome_default("max_refute", 2)),
+    }
+    assert set(M.DEFAULT_PARAMETERS) == set(READERS), (
+        "パラメータを足すなら本番の読み手も同時に足すこと: %s"
+        % (set(M.DEFAULT_PARAMETERS) ^ set(READERS)))
+
+    # and the production consumer must be reachable, not merely named
+    assert "runtime_config" in inspect.getsource(F._genome_default)
+
+
+def test_the_fleet_takes_its_retry_and_review_budget_from_the_active_genome(monkeypatch):
+    """署名に直書きされた既定値では genome を変えても挙動が変わらない。"""
+    import relay.relay_fleet as F
+
+    tmp = tempfile.mkdtemp(prefix="fl1_")
+    monkeypatch.setenv(RC.OVERRIDE_ENV,
+                       _write_manifest(tmp, max_retries=1, max_refute_passes=0))
+    RC.active_manifest(refresh=True)
+    assert F._genome_default("max_transient", 10) == 1
+    assert F._genome_default("max_refute", 2) == 0
+
+    tmp2 = tempfile.mkdtemp(prefix="fl2_")
+    monkeypatch.setenv(RC.OVERRIDE_ENV,
+                       _write_manifest(tmp2, max_retries=9, max_refute_passes=5))
+    RC.active_manifest(refresh=True)
+    assert F._genome_default("max_transient", 10) == 9
+    assert F._genome_default("max_refute", 2) == 5
+
+
+def test_an_explicit_argument_still_beats_the_genome():
+    """既定値を genome から取るのであって、呼び出し側の指定を上書きするのではない。"""
+    import inspect
+    src = inspect.getsource(sys.modules["relay.relay_fleet"].run_relay_fleet)
+    head = src[:src.index("workers = [")] if "workers = [" in src else src
+    assert "if max_transient is None:" in head
+    assert "if max_refute is None:" in head

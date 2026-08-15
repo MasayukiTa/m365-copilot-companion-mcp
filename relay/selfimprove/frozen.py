@@ -33,9 +33,23 @@ FROZEN_MANIFEST = [
     "bench/swe_grade_swebench.py",        # the swebench grader
     "bench/the eval host_batch_grade.py",         # the batch grader
     "relay/selfimprove/guards.py",        # the ENFORCING guards (significance_gate, BurnedRegistry, ...)
-    "bench/SELF_IMPROVEMENT_CONTROLLER.md",  # constitution doc
-    "bench/SELF_GROWTH_L4_DESIGN.md",        # constitution doc
+    "docs/SECURITY.md",                   # constitution doc: the stated security model
     "relay/selfimprove/frozen.py",        # this manifest itself
+
+    # THE SECURITY CONSTITUTION. Absent until an independent review pointed out that the
+    # controller's "the judge was intact" check could not see an edit to the permission
+    # gate or to external-content distrust -- the two boundaries the evolution loop is most
+    # likely to find inconvenient. The manifest covered the thing that MEASURES and left out
+    # the thing that PERMITS.
+    "tools/security.py",                  # the unlock / per-IP permission gate
+    "tools/_untrusted.py",                # external content is data, never instructions
+    "tools/folder_policy.py",             # which folders may be touched at all
+
+    # The evolution machinery's own boundary. manifest.py holds EVOLVABLE_COMPONENTS and
+    # FORBIDDEN_COMPONENTS: a loop that can quietly widen its own allowlist has no allowlist,
+    # and decision.py is where a gate could be made optional again.
+    "relay/selfimprove/manifest.py",
+    "relay/selfimprove/decision.py",
 ]
 
 DEFAULT_BASELINE = os.path.join(os.path.dirname(__file__), "frozen_baseline.json")
@@ -61,9 +75,39 @@ def compute_checksums(repo_root: str = REPO, manifest: Iterable[str] = FROZEN_MA
     return out
 
 
-def snapshot_baseline(repo_root: str = REPO, baseline_path: str = DEFAULT_BASELINE) -> dict:
-    """Compute the frozen checksums and write them as the baseline json. Returns the baseline dict."""
+class BaselineRefused(Exception):
+    """Raised when re-blessing the constitution would destroy the thing it is for."""
+
+
+def snapshot_baseline(repo_root: str = REPO, baseline_path: str = DEFAULT_BASELINE,
+                      force: bool = False) -> dict:
+    """Compute the frozen checksums and write them as the baseline json. Returns the baseline dict.
+
+    TWO REFUSALS, both of which used to be silent successes.
+
+    A baseline that already exists is NOT overwritten. Snapshotting is how a tamper is
+    laundered: edit the grader, re-snapshot, and `frozen_intact` says INTACT forever after.
+    The function is exported from the package and reachable by anything running in-process,
+    which is precisely the loop this guard exists to constrain. Re-blessing is a deliberate
+    human act -- `--snapshot --force` from the CLI -- and never something code does for
+    itself mid-run.
+
+    A manifest entry that resolves to no file is refused outright. MISSING was accepted as a
+    legitimate baseline value, which made two dead paths (constitution docs untracked months
+    earlier) pin nothing at all while the verifier cheerfully reported "11 files match". It
+    also made deletion a passing state: remove the grader, snapshot, MISSING == MISSING.
+    """
     sums = compute_checksums(repo_root)
+    absent = sorted(rel for rel, h in sums.items() if h == MISSING)
+    if absent:
+        raise BaselineRefused(
+            "cannot baseline a frozen set with missing files -- these pin nothing: %s"
+            % ", ".join(absent))
+    if os.path.isfile(baseline_path) and not force:
+        raise BaselineRefused(
+            "a baseline already exists at %s; re-snapshotting would bless any change made "
+            "since it was written. Pass force=True (CLI: --snapshot --force) only as a "
+            "deliberate human act." % baseline_path)
     data = {"repo_root": repo_root, "checksums": sums}
     os.makedirs(os.path.dirname(baseline_path) or ".", exist_ok=True)
     with open(baseline_path, "w", encoding="utf-8", newline="\n") as f:
@@ -127,10 +171,16 @@ def _main(argv: list[str] | None = None) -> int:
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--snapshot", action="store_true", help="compute + write the baseline")
     g.add_argument("--verify", action="store_true", help="check current frozen set vs baseline")
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite an existing baseline (re-bless the constitution)")
     args = ap.parse_args(argv)
 
     if args.snapshot:
-        data = snapshot_baseline(args.repo, args.baseline)
+        try:
+            data = snapshot_baseline(args.repo, args.baseline, force=args.force)
+        except BaselineRefused as exc:
+            print("REFUSED: %s" % exc)
+            return 2
         print("snapshot written: %s" % args.baseline)
         for rel, h in sorted(data["checksums"].items()):
             print("  %s  %s" % (h[:16] if h != MISSING else MISSING.ljust(16), rel))

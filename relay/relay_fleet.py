@@ -2716,10 +2716,25 @@ def _with_theme_memory(goal_text):
         return goal_text
 
 
+def _genome_default(name, fallback):
+    """A default taken from the ACTIVE HARNESS rather than written in the signature.
+
+    This is what makes max_retries and max_refute_passes evolvable in fact and not only on
+    paper: an A/B over a parameter that no running code reads is two runs of the same
+    program. Explicit arguments still win -- the caller who passed a value meant it.
+    """
+    try:
+        from relay.selfimprove import runtime_config as _rc
+        return {"max_transient": _rc.max_retries,
+                "max_refute": _rc.max_refute_passes}[name]()
+    except Exception:
+        return fallback
+
+
 def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     notify=default_notify, on_tick=None, max_concurrent=None,
-                    mc_box=None, add_box=None, refuter=False, max_refute=2,
-                    plan_mode=False, review_lenses=None, max_transient=10, max_research=3,
+                    mc_box=None, add_box=None, refuter=False, max_refute=None,
+                    plan_mode=False, review_lenses=None, max_transient=None, max_research=3,
                     autoscale=False, autoscale_max=None, asc_box=None,
                     autoscale_per_tab_mb=700, autoscale_headroom_mb=1400,
                     autoscale_up_margin_mb=0,
@@ -2807,6 +2822,13 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         pass
     effective_max_turns = (min(max_turns, _contract_budget)
                            if _contract_budget is not None else max_turns)
+
+    # None means "whatever the active harness says". Resolved here, once, so the value is
+    # the same for every worker in the run and shows up in the fingerprint.
+    if max_transient is None:
+        max_transient = _genome_default("max_transient", 10)
+    if max_refute is None:
+        max_refute = _genome_default("max_refute", 2)
 
     workers = [RelayWorker(g, "w%d" % i, max_turns=effective_max_turns,
                            refuter=refuter, max_refute=max_refute, plan_mode=plan_mode,

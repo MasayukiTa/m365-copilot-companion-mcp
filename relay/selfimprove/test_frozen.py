@@ -96,6 +96,52 @@ def test_real_manifest_snapshot_roundtrip():
     print("ok test_real_manifest_snapshot_roundtrip")
 
 
+def test_a_baseline_is_not_silently_re_blessed():
+    """再スナップショットは改ざん洗浄の経路。上書きは人間の明示行為に限る。"""
+    with tempfile.TemporaryDirectory() as d:
+        bp = os.path.join(d, "b.json")
+        first = F.snapshot_baseline(F.REPO, bp)
+        try:
+            F.snapshot_baseline(F.REPO, bp)
+            assert False, "既存 baseline を黙って上書きした"
+        except F.BaselineRefused:
+            pass
+        assert F.load_baseline(bp) == first
+        # --force は通る。禁止ではなく、事故で起きないことが要件。
+        assert F.snapshot_baseline(F.REPO, bp, force=True) == first
+    print("ok test_a_baseline_is_not_silently_re_blessed")
+
+
+def test_a_frozen_path_that_does_not_exist_is_refused():
+    """存在しないパスは何も pin しない。MISSING を正当な baseline 値として受け入れていたため、
+    数か月前に untrack された2つの憲章ドキュメントが黙って無効化されていた。"""
+    with tempfile.TemporaryDirectory() as d:
+        bp = os.path.join(d, "b.json")
+        orig = list(F.FROZEN_MANIFEST)
+        F.FROZEN_MANIFEST.append("bench/this_file_does_not_exist.md")
+        try:
+            F.snapshot_baseline(F.REPO, bp)
+            assert False, "存在しないファイルを baseline に入れた"
+        except F.BaselineRefused as exc:
+            assert "this_file_does_not_exist" in str(exc)
+        finally:
+            F.FROZEN_MANIFEST[:] = orig
+        assert not os.path.exists(bp)
+    print("ok test_a_frozen_path_that_does_not_exist_is_refused")
+
+
+def test_the_shipped_baseline_covers_the_current_manifest():
+    """本番の baseline が実際に存在し、現在の凍結集合と一致していること。
+    独立レビューまで baseline は存在せず、frozen_intact は常に NO_BASELINE を返していた。
+    フェイルセーフではあったが、この検査は一度も稼働していなかった。"""
+    base = F.load_baseline()
+    assert base is not None, "frozen_baseline.json が無い -- 検査は一度も走らない"
+    assert set(base["checksums"]) == set(F.FROZEN_MANIFEST)
+    assert F.MISSING not in base["checksums"].values()
+    ok, changed = F.frozen_intact()
+    assert ok, changed
+
+
 if __name__ == "__main__":
     test_no_baseline()
     test_snapshot_and_intact()
@@ -104,3 +150,29 @@ if __name__ == "__main__":
     test_burned_append_only()
     test_real_manifest_snapshot_roundtrip()
     print("ALL FROZEN TESTS PASSED")
+
+
+def test_the_security_boundary_is_part_of_the_frozen_set():
+    """独立レビューの指摘: 「judge が無事か」の検査が、許可を決める側を見ていなかった。
+
+    測定する側だけを凍結し、許可する側を外していた。進化ループが最も不都合に感じるのは
+    後者であり、そこが検査対象外なら「憲法は無傷」という報告に意味がない。
+    """
+    from relay.selfimprove.frozen import FROZEN_MANIFEST
+    for path in ("tools/security.py", "tools/_untrusted.py", "tools/folder_policy.py"):
+        assert path in FROZEN_MANIFEST, "%s が凍結対象に入っていない" % path
+
+
+def test_the_evolution_boundary_is_frozen_too():
+    """許可リストを自分で広げられるなら、許可リストは存在しないのと同じ。"""
+    from relay.selfimprove.frozen import FROZEN_MANIFEST
+    assert "relay/selfimprove/manifest.py" in FROZEN_MANIFEST
+    assert "relay/selfimprove/decision.py" in FROZEN_MANIFEST
+
+
+def test_a_missing_baseline_is_a_violation_not_a_pass():
+    """ベースライン不在で「無傷」と答えたら、検査は存在しないのと同じ。"""
+    import tempfile, os
+    from relay.selfimprove.frozen import frozen_intact
+    ok, changed = frozen_intact(baseline_path=os.path.join(tempfile.mkdtemp(), "none.json"))
+    assert ok is False and "NO_BASELINE" in changed

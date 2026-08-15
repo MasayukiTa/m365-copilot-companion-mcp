@@ -141,15 +141,18 @@ def max_retries() -> int:
         return 3
 
 
-def review_threshold() -> float:
-    try:
-        return float(parameter("review_threshold", 0.35))
-    except (TypeError, ValueError):
-        return 0.35
+def max_refute_passes() -> int:
+    """How many refuter passes a candidate answer gets before it is accepted.
 
+    This was `review_threshold`, a 0..1 float that nothing read. Wiring it meant inventing a
+    mapping -- count = threshold * 10 -- and a knob whose name says "threshold" while its
+    value is secretly a count is the same species of dishonesty this review exists to find.
+    Renamed to what production actually consumes.
 
-def max_context_budget() -> int:
+    A real trade-off with both directions visible in the benchmark: too few passes and wrong
+    answers are upheld, too many and every turn pays for review it did not need.
+    """
     try:
-        return max(0, int(parameter("max_context_budget", 18000)))
+        return max(0, int(parameter("max_refute_passes", 2)))
     except (TypeError, ValueError):
-        return 18000
+        return 2

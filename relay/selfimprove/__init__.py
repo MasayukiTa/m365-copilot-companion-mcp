@@ -25,6 +25,7 @@ from .archive import (
 from .frozen import (
     frozen_intact,
     snapshot_baseline,
+    BaselineRefused,
     compute_checksums,
     burned_append_only,
     FROZEN_MANIFEST,
@@ -94,6 +95,7 @@ __all__ = [
     "cell_key",
     "frozen_intact",
     "snapshot_baseline",
+    "BaselineRefused",
     "compute_checksums",
     "burned_append_only",
     "FROZEN_MANIFEST",

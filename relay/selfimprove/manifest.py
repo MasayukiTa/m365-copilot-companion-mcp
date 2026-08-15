@@ -65,11 +65,15 @@ DEFAULT_COMPONENTS = {
     "quality_cards": "quality/v1",
 }
 
+# Every parameter here MUST have a production reader. An independent review found three of
+# four had none, which means an A/B over them ran the same program twice and reported a
+# p-value about noise. max_context_budget was removed rather than wired: there is no context
+# budgeter in this harness to tune, and a knob with nothing behind it is worse than a
+# missing knob -- it invites experiments that cannot possibly measure anything.
 DEFAULT_PARAMETERS = {
-    "max_context_budget": 18000,
-    "review_threshold": 0.35,
-    "max_retries": 3,
-    "memory_max_items": 5,
+    "max_refute_passes": 2,       # -> relay_fleet: how many refuter passes a candidate gets
+    "max_retries": 3,             # -> relay_fleet: transient-retry budget per worker
+    "memory_max_items": 5,        # -> project_memory: how much history is primed into a goal
 }
 
 
