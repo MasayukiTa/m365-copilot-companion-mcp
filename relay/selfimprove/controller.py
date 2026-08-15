@@ -28,6 +28,7 @@ from relay.selfimprove import decision as D
 from relay.selfimprove import experiment as EX
 from relay.selfimprove import frozen as F
 from relay.selfimprove import manifest as M
+from relay.selfimprove import qd as QD
 from relay.selfimprove import runtime_config as RC
 from relay.selfimprove.ledger import HypothesisLedger
 
@@ -228,6 +229,13 @@ class EvolutionController:
                     # answer. The execution target comes from the adapter rather than being
                     # left empty, since "which target ran this" decides what the numbers
                     # cover.
+                    # BEHAVIOUR, not size. archive.descriptors bins by diff size and turn
+                    # count, which are properties of the EPISODE here rather than of the
+                    # harness -- so two genomes that behave completely differently land in
+                    # one cell and the QD map keeps one elite at some expense. See
+                    # relay/selfimprove/qd.py.
+                    "semantic": QD.descriptors(
+                        (result.get("candidate_results") or [])),
                     "harness_fingerprint": EX.harness_fingerprint(
                         genome={"components": candidate["components"],
                                 "parameters": candidate["parameters"]},
