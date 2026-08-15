@@ -36,7 +36,15 @@ which is the failure this whole module is a correction for:
     would prime the next and the comparison becomes a sequence;
   * a harness id from the child that is not the one we sent.
 
-NOT VERIFIED AGAINST A LIVE FLEET -- and the first version of this note UNDERSTATED that.
+VERIFIED AGAINST A LIVE FLEET on 2026-08-15: one episode end to end, 72 seconds -- the
+manifest reached the child, the child attached over CDP, the fleet drove a real Copilot turn,
+the agent used its tools, and the graded artefact was correct. That is the first time this
+path has been shown to work rather than argued to.
+
+Getting there took three fixes and one embarrassment, all recorded below because each is a
+trap the next person will otherwise walk into.
+
+WHAT THE FIRST VERSION GOT WRONG -- and the note UNDERSTATED it.
 It said "not verified", which invites the reading "probably works, untested". A reviewer
 found it could not have worked at all: the parent put a live Playwright context into a JSON
 payload, and a browser handle does not survive json.dumps. The child now attaches to a CDP
@@ -45,10 +53,14 @@ one that keeps each arm's cookies and session state to itself. A second defect i
 path read the fleet's result under the wrong key, so even a successful run returned an empty
 reply.
 
-Both are fixed and neither is exercised by a browser here. What IS tested: the refusals, the
-attestation protocol, the per-arm state isolation, and that an error inside the child arrives
-as infrastructure rather than as a wrong answer. What is NOT: a single real episode. Treat
-the live path as unproven code, because that is what it is.
+The third was the operator-facing one: `agent_url` is the CHAT URL the worker's tab opens,
+and it was given the bridge's HTTP port. The fleet dutifully opened a tab on a page with no
+Copilot composer and reported a dead target ninety seconds later. The constructor now rejects
+anything that is not an http(s) URL, and the parameter says what it is for.
+
+What is tested without a browser: the refusals, the attestation protocol, the per-arm state
+isolation, and that a child error or a zero-turn run arrives as infrastructure rather than as
+a wrong answer. What needed a live run to establish: everything above.
 """
 from __future__ import annotations
 
@@ -157,6 +169,14 @@ class FleetAgent:
 
     def __init__(self, *, agent_url, cdp_url=None, refuter=False, memory_seed=None,
                  python=None, timeout_s=1800):
+        # THE CHAT URL THE WORKER'S TAB OPENS -- not an API endpoint, and not the bridge.
+        # The fleet navigates a fresh tab to this and waits for the Copilot composer to
+        # render; anything else produces a tab with no composer, which the relay reports as
+        # "dead target" after a minute and a half. The first live run failed exactly that
+        # way because this was handed the bridge's HTTP port. Comes from the operator's
+        # MCP_FLEET_AGENT_URL; it is not in this repository and must not be.
+        if agent_url and not str(agent_url).lower().startswith(("http://", "https://")):
+            raise FleetContractError("agent_url must be the chat URL the tab opens")
         self.agent_url = agent_url
         # A CDP endpoint, not a live context: the child attaches its own. See the child
         # source for why a context cannot be handed across the boundary.

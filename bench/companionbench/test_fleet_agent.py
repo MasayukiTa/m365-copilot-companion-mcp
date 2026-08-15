@@ -221,3 +221,11 @@ def test_a_real_answer_is_returned_normally():
         "worker": {"outcome": "DONE", "turns": 3, "reason": ""},
     }
     assert a("prompt", tempfile.mkdtemp()) == "84"
+
+
+def test_agent_url_must_be_a_url_the_tab_can_open():
+    """agent_url はワーカーのタブが開くチャットURL。API エンドポイントを渡すと
+    composer の無いページが開き、90秒後に dead target になる -- 実際にそうなった。"""
+    with pytest.raises(FleetContractError):
+        FleetAgent(agent_url="127.0.0.1:8765")
+    FleetAgent(agent_url="https://example.invalid/chat")     # 受理される形
