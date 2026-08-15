@@ -191,11 +191,17 @@ def test_the_transport_facts_are_saved_so_a_diagnosis_can_be_checked(monkeypatch
     class _WithTranscript:
         applies_manifest = False
         def __init__(self):
-            self.transcript = [{"elapsed_s": 24.1, "settled": False, "reply": ""}]
+            self.transcript = []
         def __call__(self, prompt, workdir):
+            self.transcript.append({"elapsed_s": 24.1, "settled": False, "reply": ""})
             return ""
 
-    monkeypatch.setattr(B.REGISTRY, "get", lambda pool: [])
+    ep = type("E", (), {"episode_id": "e1", "category": "excel"})()
+    monkeypatch.setattr(B.REGISTRY, "get", lambda pool: [ep])
+    monkeypatch.setattr(B.R, "run_episode",
+                        lambda e, a, root=None: a("p", "w") or
+                        {"episode_id": "e1", "success": False, "infra_failure": False,
+                         "category": "excel", "latency_s": 24.1})
     out = B.run_suite(_WithTranscript(), pools=("evolution",))
     assert out["transport"] == [{"elapsed_s": 24.1, "settled": False, "reply_chars": 0}]
 
@@ -260,3 +266,31 @@ def test_the_episode_order_can_be_varied_between_runs(monkeypatch):
     seen.clear()
     B.run_suite(_A(), pools=("evolution",), shuffle_seed=2)
     assert first != seen, "seed を変えても順序が同じ"
+
+
+def test_each_run_reports_only_its_own_turns(monkeypatch):
+    """アダプタは生涯1本の transcript を持つので、毎回全部を要約すると
+    run 2 に run 1 のターンが混ざる(22 -> 44 -> 66)。
+    しかも他と違って見えるのは、まさにその最初の run。"""
+    monkeypatch.setattr(B.REGISTRY, "get", lambda pool: [])
+
+    class _A:
+        applies_manifest = False
+        def __init__(self):
+            self.transcript = []
+        def __call__(self, prompt, workdir):
+            self.transcript.append({"elapsed_s": 1.0, "settled": True, "reply": "x"})
+            return ""
+
+    ep = type("E", (), {"episode_id": "e1", "category": "excel"})()
+    monkeypatch.setattr(B.REGISTRY, "get", lambda pool: [ep])
+    monkeypatch.setattr(B.R, "run_episode",
+                        lambda e, a, root=None: a("p", "w") or
+                        {"episode_id": "e1", "success": True, "infra_failure": False,
+                         "category": "excel", "latency_s": 1.0})
+    agent = _A()
+    first = B.run_suite(agent, pools=("evolution",))
+    second = B.run_suite(agent, pools=("evolution",))
+    assert len(agent.transcript) == 2, "前提: transcript は生涯累積する"
+    assert len(first["transport"]) == 1
+    assert len(second["transport"]) == 1, "前の走行のターンが混ざっている"

@@ -57,6 +57,11 @@ def run_suite(agent, *, pools=POOLS, root=None, on_result=None, limit=0,
     _refuse_a_meaningless_target(agent)
 
     started = time.time()
+    # WHERE THIS RUN'S TURNS START. The adapter keeps one transcript for its whole life, so
+    # summarising all of it per run gave run 2 run 1's turns as well (22, then 44, then 66).
+    # Every per-run transport figure after the first was a blend of that run and its
+    # predecessors -- and the first run is exactly the one that looks different.
+    transcript_start = len(getattr(agent, "transcript", []) or [])
     rows, by_pool = [], {}
     for pool in pools:
         episodes = list(REGISTRY.get(pool))
@@ -98,17 +103,17 @@ def run_suite(agent, *, pools=POOLS, root=None, on_result=None, limit=0,
         # and empty grader fields because the saved result kept nothing about the turns
         # themselves; a reviewer could not check it, and neither could we. Kept without the
         # prompt or reply text, which are large and belong to the tenant.
-        "transport": _transport_summary(agent),
+        "transport": _transport_summary(agent, since=transcript_start),
     }
 
 
-def _transport_summary(agent):
-    """Per-turn transport facts, if the adapter keeps them. No prompts, no replies."""
+def _transport_summary(agent, since=0):
+    """Per-turn transport facts for THIS run. No prompts, no replies."""
     transcript = getattr(agent, "transcript", None)
     if not isinstance(transcript, list):
         return []
     return [{"elapsed_s": t.get("elapsed_s"), "settled": t.get("settled"),
-             "reply_chars": len(t.get("reply") or "")} for t in transcript]
+             "reply_chars": len(t.get("reply") or "")} for t in transcript[since:]]
 
 
 def repeat_suite(agent, *, repeats=3, pools=POOLS, root=None, on_result=None,
