@@ -6,7 +6,7 @@
     "bench/companionbench/episodes/runtime.py": "91bb387b3e2623dc017c270123ae9869f176af41cea67a09eaeb6cab88c1239f",
     "bench/companionbench/episodes/sealed.py": "0550b3dc00df8600601ba1c60a4a5f2d58fbc28bd58a8932231dc61579d3f377",
     "bench/companionbench/pools.py": "53e9759fa105c59f3e5b2c413cb9621fba17450422c459961a0c33addfbc549b",
-    "bench/companionbench/runner.py": "12bab94f42bfcf70c1929c5f835d379253aa2ce8314f268b1364576ecc18b500",
+    "bench/companionbench/runner.py": "c516a28ea981f505eeb8947d559ca84f7bc8ea78c245885981b1d877507b2b18",
     "bench/the eval host_batch_grade.py": "5d30b0f5970358e1c9414265b9a6bfb8bb83e69274f5c4d2883b4789f5be12ab",
     "bench/swe_grade_swebench.py": "622e41695f2a50ba69be3a06bc0fd217ddc3a8446c1a07329d46503a5672b7e9",
     "docs/SECURITY.md": "6deaa0e2ab9d8480bf5cf2ce2508a2e49e31962e275be2e7acbf7dd5c7f114b8",

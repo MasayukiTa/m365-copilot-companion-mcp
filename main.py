@@ -439,9 +439,24 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
             except Exception:
                 sig = "(...)"
             return "%s%s\n%s" % (name, sig, (getattr(fn, "__doc__", "") or "").strip())
+        # EVIDENCE TRACE. Off unless a runner asked for one, and a no-op in ordinary
+        # operation. This is the only point that sees every dispatched call with its real
+        # name and arguments -- recording at the adapter would name `call_tool` and nothing
+        # useful, and reconstructing afterwards from the filesystem cannot see a file that
+        # was created, read and deleted. See tools/evidence_trace.py for what a trace can
+        # and cannot support.
         try:
-            return fn(**(arguments or {}))
+            from tools import evidence_trace as _trace
+        except Exception:
+            _trace = None
+        try:
+            _out = fn(**(arguments or {}))
+            if _trace is not None:
+                _trace.record(name, arguments, True, _out)
+            return _out
         except Exception as _e:
+            if _trace is not None:
+                _trace.record(name, arguments, False, "%s: %s" % (type(_e).__name__, _e))
             return "[call_tool %s error: %s: %s]" % (name, type(_e).__name__, _e)
 
     # critical tools FIRST (survive a front-biased truncation), then fill from the existing order
