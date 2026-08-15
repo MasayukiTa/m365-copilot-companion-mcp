@@ -11,7 +11,10 @@ Connection: close, and the read stops at `event: done`. Neither is verifiable by
 the adapter (a healthy bridge hides the bug), so they are asserted against the source and
 the parser directly.
 """
+import pytest
+
 import bench.companionbench  # noqa: F401
+import bench.companionbench.agents as A
 from bench.companionbench.agents import BridgeAgent, SimulatedAgent, bridge_available
 
 
@@ -74,3 +77,78 @@ def test_an_unscripted_episode_does_nothing_and_says_so():
     """台本の無いエピソードを勝手に成功させない。不合格が正しい。"""
     sim = SimulatedAgent({})
     assert "no action" in sim.for_episode("unknown")("p", "/tmp/x")
+
+
+# ---------------------------------------------------------------------------------------
+# A turn that did not complete is not a wrong answer
+# ---------------------------------------------------------------------------------------
+
+class _Bridge(A.BridgeAgent):
+    """A BridgeAgent whose transport returns a canned SSE body."""
+
+    def __init__(self, raw, **kw):
+        super().__init__(**kw)
+        self._raw = raw
+
+    def _request(self, path, timeout=None):
+        return self._raw
+
+    def _new_conversation(self):
+        pass
+
+
+_DONE = ('data: {"replace": "the answer"}\n\n'
+         'event: done\ndata: {}\n\n')
+
+
+def test_a_completed_turn_returns_its_answer():
+    assert _Bridge(_DONE)("do the thing", "C:/wd") == "the answer"
+
+
+def test_a_stream_that_ended_without_done_is_an_environment_result():
+    """3回走らせて 13/22・6/22・8/22、22件中19件が判定を反転した。
+    失敗回は24-25秒/46-50秒に固まり、produced:"" / X not created /
+    calls_through_the_api:0 -- 誤答ではなく『ターンが起きていない』署名。
+    ブリッジは必ず done を出すので、その不在は未完了を意味する。"""
+    with pytest.raises(A.TurnDidNotSettle) as exc:
+        _Bridge('data: {"delta": "half an ans')("do the thing", "C:/wd")
+    assert "did not complete" in str(exc.value)
+
+
+def test_an_empty_stream_is_not_graded_as_an_empty_answer():
+    """空返答をゼロ点にすると、環境障害が能力の低下として記録される。"""
+    with pytest.raises(A.TurnDidNotSettle):
+        _Bridge("")("do the thing", "C:/wd")
+
+
+def test_a_bridge_busy_for_the_whole_window_is_an_environment_result(monkeypatch):
+    """混雑で1ターンも走らなかったのは、能力ではなく環境の結果。"""
+    monkeypatch.setattr(A.BridgeAgent, "BUSY_RETRY_S", 0.01)
+    with pytest.raises(A.TurnDidNotSettle) as exc:
+        _Bridge('{"ok": false, "error": "busy"}', retry_busy_s=0.05)("x", "C:/wd")
+    assert "busy" in str(exc.value)
+
+
+def test_a_zero_retry_window_still_asks_once(monkeypatch):
+    """締切を先に見ていたので retry_busy_s=0 は『一度も聞かない』を意味していた。"""
+    monkeypatch.setattr(A.BridgeAgent, "BUSY_RETRY_S", 0.01)
+    b = _Bridge(_DONE, retry_busy_s=0)
+    assert b("x", "C:/wd") == "the answer"
+
+
+def test_a_settled_but_empty_answer_is_still_graded():
+    """完了したのに何も書かなかったのは、環境ではなく能力の結果。
+    ここを infra に逃がすと、本物の失敗が分母から消える。"""
+    assert _Bridge('event: done\ndata: {}\n\n')("x", "C:/wd") == ""
+
+
+def test_the_runner_records_a_non_settling_turn_as_infra():
+    """例外 -> INFRA は既存の仕組み。分母から外れることが要点。"""
+    from bench.companionbench import runner as R
+    from bench.companionbench.pools import EVOLUTION, REGISTRY
+    import bench.companionbench.episodes  # noqa: F401
+
+    ep = REGISTRY.get(EVOLUTION)[0]
+    out = R.run_episode(ep, _Bridge(""))
+    assert out["infra_failure"] is True
+    assert out["success"] is False

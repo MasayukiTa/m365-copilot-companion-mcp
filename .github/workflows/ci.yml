@@ -161,6 +161,7 @@ jobs:
             relay/test_settle_survives_placeholder.py \
             relay/test_settle_replay.py \
             relay/test_settle_trace_collect.py \
+            relay/test_settle_collect.py \
             relay/test_soak.py \
             relay/test_solve_policy.py \
             relay/test_skills.py \

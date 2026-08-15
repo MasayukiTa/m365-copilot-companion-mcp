@@ -111,6 +111,16 @@ class SimulatedAgent:
         return agent
 
 
+class TurnDidNotSettle(RuntimeError):
+    """The turn never completed, so there is nothing to grade.
+
+    Distinct from a wrong answer on purpose. run_episode turns an exception into an INFRA
+    result, which leaves the episode out of the denominator -- the suite's own rule that an
+    environment failure must not be scored as a capability zero, applied to the one path that
+    was quietly breaking it.
+    """
+
+
 class BridgeAgent:
     """Drives the real companion through the bridge's /stream endpoint.
 
@@ -134,6 +144,9 @@ class BridgeAgent:
     #: See the class docstring. Do not set this True until the bridge honours a per-request
     #: harness; the flag is what stops an invalid comparison from being reported as valid.
     applies_manifest = False
+
+    #: How long to wait between attempts when the bridge reports it is busy.
+    BUSY_RETRY_S = 15
 
     def __init__(self, *, host=BRIDGE_HOST, port=BRIDGE_PORT, timeout=300,
                  fresh_conversation=True, retry_busy_s=180):
@@ -216,17 +229,46 @@ class BridgeAgent:
         started = time.time()
         deadline = time.time() + self.retry_busy_s
         raw = ""
-        while time.time() < deadline:
+        while True:
             raw = self._request("/stream?msg=" + urllib.parse.quote(full))
             if '"busy"' not in raw[:200]:
                 break
-            time.sleep(15)
+            # Sleep only if there is time left to retry INTO. The loop used to sleep 15s and
+            # then re-check the deadline, so the last wait was always spent for nothing; and
+            # it tested the deadline before the first request, so retry_busy_s=0 meant "never
+            # ask at all" rather than "ask once and do not retry".
+            if time.time() + self.BUSY_RETRY_S >= deadline:
+                break
+            time.sleep(self.BUSY_RETRY_S)
         reply = self._answer(raw)
+        elapsed = round(time.time() - started, 1)
+        settled = "event: done" in raw
         self.transcript.append({
-            "prompt": full, "reply": reply,
-            "elapsed_s": round(time.time() - started, 1),
-            "settled": "event: done" in raw,
+            "prompt": full, "reply": reply, "elapsed_s": elapsed, "settled": settled,
         })
+
+        # A TURN THAT DID NOT COMPLETE IS NOT A WRONG ANSWER. `settled` was computed here and
+        # then discarded, so a stream that ended without `event: done` returned whatever had
+        # arrived -- usually nothing -- and the grader scored the empty reply as a capability
+        # failure. Three runs of the suite scored 13/22, 6/22 and 8/22 with 19 of 22 episodes
+        # changing verdict, which read as enormous model variance; the failing runs were
+        # clustered at 24-25s and 46-50s and reported `produced: ""`, `read: ""`, `answer: ""`,
+        # `X not created` and `calls_through_the_api: 0` -- the signature of a turn that never
+        # happened rather than one that went wrong.
+        #
+        # The bridge always emits a terminating `done` (see _send_and_stream_once), so its
+        # absence means the turn did not finish. Raising here is what the suite already does
+        # with an environment failure: run_episode turns an exception into an INFRA result,
+        # which is excluded from the denominator instead of counted as a zero.
+        if '"busy"' in raw[:200]:
+            raise TurnDidNotSettle(
+                "the bridge was busy for the whole %.0fs retry window; no turn was run"
+                % self.retry_busy_s)
+        if not settled:
+            raise TurnDidNotSettle(
+                "the stream ended after %.1fs without `event: done` (%d bytes, %d chars of "
+                "reply): the turn did not complete, so this is an environment result and not "
+                "an answer to grade" % (elapsed, len(raw), len(reply)))
         return reply
 
 

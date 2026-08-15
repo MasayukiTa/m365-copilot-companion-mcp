@@ -85,6 +85,54 @@ def run_suite(agent, *, pools=POOLS, root=None, on_result=None, limit=0) -> dict
     }
 
 
+def repeat_suite(agent, *, repeats=3, pools=POOLS, root=None, on_result=None,
+                 on_run=None, limit=0) -> dict:
+    """Run the whole suite `repeats` times and report how much the verdicts move.
+
+    WHY THIS EXISTS. Three runs of this suite against the same system, with nothing changed
+    between them, scored 13/22, 6/22 and 8/22 -- and 19 of the 22 episodes returned a
+    different verdict in at least one run. Only three were stable. A single run's number is
+    therefore mostly noise, and every comparison built on top of one inherits that: a paired
+    A/B assumes a difference between arms is attributable to the arm, which cannot hold while
+    one episode's verdict is close to a coin flip.
+
+    So the reliability is measured rather than assumed. `stable` is the count of episodes that
+    gave the same answer every time; `flipped` is the rest, listed, because which ones move is
+    more actionable than how many.
+    """
+    runs = []
+    for i in range(max(1, repeats)):
+        out = run_suite(agent, pools=pools, root=root, on_result=on_result, limit=limit)
+        runs.append(out)
+        if on_run is not None:
+            on_run(i + 1, out)
+    return {"repeats": len(runs), "runs": runs, "reliability": reliability(runs)}
+
+
+def reliability(runs) -> dict:
+    """Per-episode agreement across repeated runs of the same suite."""
+    per = {}
+    for run in runs:
+        for row in run["rows"]:
+            per.setdefault(row["episode_id"], []).append(bool(row.get("success")))
+    stable = sorted(k for k, v in per.items() if len(set(v)) == 1)
+    flipped = sorted(k for k, v in per.items() if len(set(v)) > 1)
+    totals = [r["totals"]["passed"] for r in runs]
+    attempted = [r["totals"]["attempted"] for r in runs]
+    return {
+        "episodes": len(per),
+        "stable": len(stable),
+        "flipped": len(flipped),
+        "flipped_ids": flipped,
+        "pass_counts": totals,
+        "attempted": attempted,
+        "spread": (max(totals) - min(totals)) if totals else 0,
+        "per_episode_rate": {k: round(sum(v) / len(v), 3) for k, v in sorted(per.items())},
+        "note": "a single run's total is only as meaningful as the spread here is small; "
+                "an A/B whose effect is smaller than this spread is measuring the weather",
+    }
+
+
 def _refuse_a_meaningless_target(agent):
     """A baseline from a scripted agent measures the script.
 
