@@ -39,11 +39,28 @@ import time
 import traceback
 
 from bench.companionbench.episode import EpisodeRun
-from bench.companionbench.pools import EVOLUTION, REGRESSION, REGISTRY
+from bench.companionbench.pools import EVOLUTION, REGRESSION, REGISTRY, SEALED
 from relay.selfimprove import manifest as M
 from relay.selfimprove import runtime_config as RC
 
 SECURITY_CATEGORY = "security"
+
+
+def _grader_version() -> str:
+    """A digest of the episode + grading code, so a row says which judge produced it.
+
+    Not a hand-maintained version string: those are updated when someone remembers. The
+    frozen manifest already lists exactly these files because they decide acceptance, so
+    reuse that list rather than keeping a second one.
+    """
+    try:
+        from relay.selfimprove import frozen as _F
+        sums = _F.compute_checksums()
+        graders = {k: v for k, v in sums.items() if k.startswith("bench/companionbench/")}
+        blob = "|".join("%s=%s" % kv for kv in sorted(graders.items()))
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return "unavailable"
 
 
 def run_episode(episode, agent, *, root=None) -> dict:
@@ -486,6 +503,19 @@ def paired_evaluate(base_manifest, candidate_manifest, agent, *, tmpdir,
             "baseline_passed": len(base_part["resolved_ids"]),
             "paired_n": len(paired_ids),
         },
+        # THE RAW RESULTS, not only the partitions derived from them. An archived row could
+        # say which episode ids passed and nothing about what they scored, what the grader
+        # saw, or how long they took -- so a past comparison could be counted but not
+        # re-examined, which is most of what an archive is for.
+        "candidate_results": cand,
+        "baseline_results": base,
+        "pools": {"evolution": [e.episode_id for e in evolution],
+                  "regression": [e.episode_id for e in regression],
+                  "sealed": [e.episode_id for e in REGISTRY.get(SEALED)]},
+        "agent": type(agent).__name__,
+        "grader_version": _grader_version(),
+        "latency_s": round(sum(r["latency_s"] for r in cand)
+                           + sum(r["latency_s"] for r in base), 3),
         "latency_delta": round(sum(r["latency_s"] for r in cand)
                                - sum(r["latency_s"] for r in base), 3),
         "infra_delta": len(cand_part["infra_ids"]) - len(base_part["infra_ids"]),

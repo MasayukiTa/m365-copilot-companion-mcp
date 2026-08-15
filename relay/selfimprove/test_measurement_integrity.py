@@ -282,3 +282,75 @@ def test_a_deleted_sentinel_file_is_unevaluable_not_unconfigured():
 
     assert res["final_keep"] is False, "canary が消えたまま auto_commit を許した"
     assert any("missing" in (nt or "") for nt in res["notes"]), res["notes"]
+
+
+# ---- an archived row must be able to answer what it was ---------------------------------
+
+def test_the_archive_row_can_reconstruct_the_comparison():
+    """『どの id が通ったか』しか答えられない行は、再検証には使えない。
+    数えられるが読み直せない記録は、archive の目的の大半を果たしていない。"""
+    import tempfile as _tf
+
+    from relay.selfimprove.archive import Archive
+    from relay.selfimprove.controller import EvolutionController
+    from relay.selfimprove.ledger import HypothesisLedger
+
+    d = _tf.mkdtemp(prefix="arcfull_")
+    arc = Archive(os.path.join(d, "a.jsonl"))
+    ctl = EvolutionController(
+        ledger=HypothesisLedger(os.path.join(d, "h.jsonl")), archive=arc)
+
+    orig = F.frozen_intact
+    F.frozen_intact = lambda *a, **k: (True, [])
+    try:
+        ctl.run_candidate(
+            genome={"parameters": {"memory_max_items": 9}},
+            hypothesis="more recall helps", target_failure_class="missing_evidence",
+            evaluate=lambda *a, **k: {
+                "gate": {"keep": False, "verdict": "inconclusive", "reason": "noise"},
+                "paired_ids": ["e1", "e2"],
+                "on": {"resolved_ids": ["e1"], "failed_ids": ["e2"], "infra_ids": []},
+                "off": {"resolved_ids": ["e1"], "failed_ids": ["e2"], "infra_ids": []},
+                "candidate_results": [{"episode_id": "e1", "success": True,
+                                       "functional_score": 1.0, "latency_s": 0.2}],
+                "baseline_results": [{"episode_id": "e1", "success": True,
+                                      "functional_score": 1.0, "latency_s": 0.3}],
+                "security": {"regressed": False, "failing": [], "comparable": 1,
+                             "passed_count": 1},
+                "sentinel": {"regressed": False, "comparable": 3},
+                "regression": {"regressed": False},
+                "pools": {"evolution": ["e1"], "regression": ["e2"], "sealed": ["s1"]},
+                "grader_version": "abc123", "seed": 7, "agent": "SimulatedAgent",
+                "baseline_harness_id": "b" * 64,
+            })
+    finally:
+        F.frozen_intact = orig
+
+    desc = arc.all()[-1]["descriptors"]
+    for key in ("experiment_id", "candidate_id", "candidate_harness_id",
+                "parent_harness_id", "baseline_harness_id", "components", "parameters",
+                "decision_state", "decision_reason", "paired_ids", "on", "off",
+                "episode_results", "security", "sentinel", "regression", "infra",
+                "pools", "grader_version", "seed", "agent", "harness_fingerprint"):
+        assert key in desc, "archive 行に %s が無い" % key
+    assert desc["episode_results"]["candidate"][0]["functional_score"] == 1.0
+    assert desc["parent_harness_id"] and desc["parent_harness_id"] != desc["candidate_harness_id"]
+    assert desc["grader_version"] == "abc123"
+
+
+def test_the_runner_supplies_what_the_archive_records():
+    """archive 側だけ広げても、runner が渡さなければ空欄が並ぶだけ。"""
+    import tempfile as _tf
+
+    import bench.companionbench.agents as A
+    from bench.companionbench import runner as R
+    from relay.selfimprove import manifest as MM
+
+    base = MM.base_manifest()
+    out = R.paired_evaluate(base, base, A.in_process(lambda *_a: ""),
+                            tmpdir=_tf.mkdtemp(prefix="pefull_"))
+    for key in ("candidate_results", "baseline_results", "pools", "agent",
+                "grader_version", "latency_s"):
+        assert key in out, "runner が %s を返していない" % key
+    assert out["pools"]["sealed"], "封印プールが記録されていない"
+    assert out["grader_version"] != "unavailable"

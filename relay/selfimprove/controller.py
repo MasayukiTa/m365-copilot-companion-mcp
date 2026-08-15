@@ -155,23 +155,46 @@ class EvolutionController:
                 pass_at_1=result.get("pass_at_1"),
                 gate_verdict=verdict["state"],
                 descriptors={
+                    # -- identity: which experiment, which harnesses, which candidate ------
                     "experiment_id": experiment_id,
+                    "candidate_id": EX.candidate_id(
+                        {"components": candidate["components"],
+                         "parameters": candidate["parameters"]},
+                        parent_harness_id=self._parent_id),
                     "harness_id": cand_id,
                     "candidate_harness_id": cand_id,
                     "parent_harness_id": self._parent_id,
+                    "baseline_harness_id": (result.get("baseline_harness_id")
+                                            or self._parent_id),
                     "components": dict(candidate["components"]),
                     "parameters": dict(candidate["parameters"]),
                     "changed": changed,
+                    # -- verdict -----------------------------------------------------------
                     "decision_state": verdict["state"],
                     "decision_reason": verdict.get("reason", ""),
-                    # The per-instance sets, so the row can be re-examined without re-running
+                    # -- the evidence, not a summary of it ---------------------------------
+                    # A review asked what an archived row can actually answer, and the
+                    # answer was "which ids passed" -- not which episodes moved, what they
+                    # scored, what the graders saw, or what the suite even was. Every field
+                    # below exists because reconstructing a past comparison needed it and
+                    # it was not there.
                     "paired_ids": result.get("paired_ids") or [],
                     "on": result.get("on") or {},
                     "off": result.get("off") or {},
+                    "episode_results": {
+                        "candidate": result.get("candidate_results") or [],
+                        "baseline": result.get("baseline_results") or [],
+                    },
                     "security": result.get("security") or {},
                     "sentinel": result.get("sentinel") or {},
                     "regression": result.get("regression") or {},
                     "infra": result.get("infra") or {},
+                    # -- what produced it --------------------------------------------------
+                    "pools": result.get("pools") or {},
+                    "grader_version": result.get("grader_version", ""),
+                    "seed": result.get("seed"),
+                    "agent": result.get("agent", ""),
+                    "latency_s": result.get("latency_s"),
                     "harness_fingerprint": EX.harness_fingerprint(
                         genome={"components": candidate["components"],
                                 "parameters": candidate["parameters"]}),
