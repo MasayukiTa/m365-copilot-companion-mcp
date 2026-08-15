@@ -10,21 +10,27 @@ not an estimate of generalisation -- it is a training score with a misleading na
 regression pool is explicitly NOT held out for that reason: it is run constantly, so it
 tells you nothing about unseen work, only that what used to pass still does.
 
-WHY SEALING NEEDS A MECHANISM
+WHY SEALING NEEDS A MECHANISM, AND HOW FAR THIS ONE GOES
 
 "Do not look at the sealed set" is not a control when the thing being asked runs with
-filesystem tools and is being optimised to score well. It has to be structurally unreadable
-rather than merely off-limits.
+filesystem tools and is being optimised to score well. So a sealed episode's expected answer
+is stored ONLY as an HMAC-SHA256 under a salt kept outside every checkout. The grader can
+still check an answer; the file gives up no literal.
 
-So a sealed episode's expected answer is stored ONLY as a salted SHA-256. The grader can
-still check an answer (hash what the agent produced, compare), but reading the file gives
-an optimiser nothing to fit: it cannot invert the hash, and without the salt it cannot even
-build a rainbow table against a small answer space like "3" or "OK".
+That is weaker than it first sounds, and this docstring previously claimed the stronger
+version -- that reading the file "gives an optimiser nothing to fit". An independent
+reviewer disproved it by deriving all five sealed answers from the fixtures and the tests in
+this repository, without the salt, and then confirming them against the seals. The fixtures
+have to be here to run and the tests have to solve the episodes to prove the seals are
+right, so the answers are reachable by reading the tree.
 
-The salt lives outside the repository -- an environment variable, or a file the working
-tree does not contain. If it is absent, sealed episodes REFUSE TO GRADE rather than falling
-back to plaintext comparison. A holdout that silently degrades into a readable one is worse
-than no holdout, because the number it produces still looks trustworthy.
+The honest statement of what sealing buys is in SEAL_THREAT_MODEL below. The stronger
+property needs the fixtures themselves derived from the salt, so the concrete instance is
+not in the tree at all -- a real design, and not this one.
+
+If the salt is absent, sealed episodes REFUSE TO GRADE rather than falling back to plaintext
+comparison. A holdout that silently degrades into a readable one is worse than no holdout,
+because the number it produces still looks trustworthy.
 """
 from __future__ import annotations
 
@@ -48,14 +54,20 @@ SALT_FILE_ENV = "COMPANIONBENCH_SEAL_SALT_FILE"
 #: correct behaviour, since a holdout that travels with the repo is not a holdout.
 DEFAULT_SALT_FILE = os.path.join(os.path.expanduser("~"), ".companionbench_seal_salt")
 
-#: WHAT THE SEAL DOES AND DOES NOT DO, stated plainly because the overclaim is tempting.
-#: It keeps the answer key out of the working tree, which is the realistic leak: an
-#: optimiser given this repository can read every file in it, and a plaintext expected
-#: answer sitting in bench/ is an invitation to fit to it. It does NOT defend against a
-#: process that can read the operator's home directory -- same user, same machine, and the
-#: grader must be able to read the salt to grade at all. Treat sealed results as a
-#: generalisation check under an honest optimiser, not as a security boundary.
-SEAL_THREAT_MODEL = "keeps the key out of the tree; not a boundary against a local reader"
+#: WHAT THE SEAL DOES AND DOES NOT DO. The first version of this note already tried to be
+#: careful and still overclaimed: it said the seal keeps the answer key out of the tree, and
+#: left the reader to conclude the answers were therefore unavailable. They are not. An
+#: independent reviewer derived all five sealed answers from the fixtures and tests in this
+#: repository without ever seeing the salt. The fixtures must be in the tree to run, and the
+#: tests must solve the episodes to prove the seals are correct, so the answers are
+#: reachable by anyone who can read the checkout.
+#:
+#: What remains true: no plaintext key sits in bench/ to be matched or trained on, the sealed
+#: episodes never enter `optimiser_visible()`, and a missing salt stops the grade instead of
+#: weakening it. What is NOT true: secrecy against an optimiser that reads the repository, or
+#: against anything that can read the operator's home directory.
+SEAL_THREAT_MODEL = ("no plaintext key in the tree and no visibility on the optimiser path; "
+                     "NOT secrecy against a reader of the repository")
 
 
 class SealError(RuntimeError):

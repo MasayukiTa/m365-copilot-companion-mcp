@@ -77,12 +77,15 @@ def run_episode(episode, agent, *, root=None) -> dict:
                 return _agent_broke_the_grade(episode, started, reason)
             return _infra(episode, reason, started,
                           trace=traceback.format_exc(limit=3))
-    if destroyed and grade.infra_failure:
+    # DELETING THE INPUT IS A FAILURE WHETHER OR NOT THE GRADER NOTICED. This only rewrote
+    # the outcome when the grader raised or reported infra, so an episode whose grader reads
+    # class-level data rather than the fixture -- routing being the live example -- could
+    # have its fixture deleted and still pass. The rule was stated as an invariant and was
+    # not one.
+    if destroyed:
         return _agent_destroyed_fixture(episode, destroyed, started,
                                         grade.details.get("reason", ""))
     out = grade.as_dict()
-    if destroyed:
-        out.setdefault("details", {})["deleted_fixture_files"] = destroyed
     out.update({"episode_id": episode.episode_id, "category": episode.category,
                 "latency_s": round(time.time() - started, 3)})
     return out
@@ -218,6 +221,54 @@ def _security_regression(base_results, cand_results) -> dict:
     }
 
 
+def _sealed_sentinel(base_manifest, candidate_manifest, agent, *, tmpdir, root=None) -> dict:
+    """The sealed pool, run on both arms, as the cross-distribution canary.
+
+    paired_evaluate produced no sentinel at all, and the decision layer was then tightened to
+    require one before activating -- which meant nothing evaluated through the advertised
+    integration could ever activate. A dead end is not a safety property; it is a guard
+    nobody can satisfy, and the first thing anyone does with one is take it out.
+
+    The sealed pool is the right thing to put here rather than a placeholder. It is the only
+    set the optimiser is not being scored on, so a candidate that climbs the evolution pool
+    while dropping sealed episodes is the exact shape of a gain fitted to what it was shown.
+
+    Without the salt the sealed graders REFUSE to grade, and that arrives as unevaluable --
+    which fails closed against activation. That is the correct reading: you cannot activate
+    on the strength of a holdout you did not run.
+    """
+    from bench.companionbench.pools import SEALED, SealError
+
+    sealed = REGISTRY.get(SEALED)
+    if not sealed:
+        return {"unevaluable": True, "reason": "the sealed pool is empty"}
+    try:
+        with _ManifestArm(base_manifest, tmpdir):
+            base = run_pool(None, agent, root=root, episodes=sealed)
+        with _ManifestArm(candidate_manifest, tmpdir):
+            cand = run_pool(None, agent, root=root, episodes=sealed)
+    except SealError as exc:
+        return {"unevaluable": True, "reason": "sealed pool cannot be graded: %s" % exc}
+
+    base_ok = {r["episode_id"] for r in base if r.get("success")}
+    cand_ok = {r["episode_id"] for r in cand if r.get("success")}
+    comparable = [r["episode_id"] for r in base
+                  if not r.get("infra_failure")
+                  and not next((c for c in cand if c["episode_id"] == r["episode_id"]),
+                               {}).get("infra_failure", True)]
+    if not comparable:
+        return {"unevaluable": True, "reason": "no sealed episode ran on both arms"}
+    lost = sorted((base_ok - cand_ok) & set(comparable))
+    return {
+        "regressed": bool(lost),
+        "lost": lost,
+        "gained": sorted((cand_ok - base_ok) & set(comparable)),
+        "comparable": len(comparable),
+        "reason": ("sealed episodes lost: %s -- the gain looks fitted to the pool the "
+                   "optimiser can see" % ", ".join(lost)) if lost else "",
+    }
+
+
 def _regression_pool_break(base_results, cand_results) -> dict:
     """Did anything that used to pass in the REGRESSION pool break?"""
     base_by = {r["episode_id"]: r for r in base_results}
@@ -231,10 +282,23 @@ def _regression_pool_break(base_results, cand_results) -> dict:
                   and not cand_by[eid].get("infra_failure")]
     lost = sorted(eid for eid in comparable
                   if base_by[eid].get("success") and not cand_by[eid].get("success"))
+    # AN EPISODE THAT PASSED ON THE BASE AND WENT INFRA ON THE CANDIDATE reported as "no
+    # regression", which is the single most useful thing to hide here: crash the episode you
+    # are about to break and the regression pool sees nothing. It is not a regression -- we
+    # genuinely do not know -- but it is not a pass either, and the difference has to reach
+    # the decision rather than be resolved silently in favour of the candidate.
+    hidden = sorted(eid for eid in base_by
+                    if eid in cand_by and eid not in comparable
+                    and base_by[eid].get("success")
+                    and cand_by[eid].get("infra_failure")
+                    and not base_by[eid].get("infra_failure"))
     return {
         "regressed": bool(lost),
         "lost": lost,
-        "reason": ("previously-passing episodes broke: %s" % ", ".join(lost)) if lost else "",
+        "unevaluable": hidden,
+        "reason": ("previously-passing episodes broke: %s" % ", ".join(lost)) if lost
+                  else ("previously-passing episodes became unrunnable on the candidate "
+                        "only: %s" % ", ".join(hidden)) if hidden else "",
     }
 
 
@@ -300,6 +364,16 @@ def paired_evaluate(base_manifest, candidate_manifest, agent, *, tmpdir,
     infra_either = set(base_part["infra_ids"]) | set(cand_part["infra_ids"])
     paired_ids = [e.episode_id for e in all_eps if e.episode_id not in infra_either]
 
+    # WHO DECIDED WHICH EPISODES WERE COMPARABLE. Any exception out of the agent becomes
+    # infra, and infra on either arm leaves the paired set -- so a candidate that raises on
+    # the episodes it expects to fail simply removes them from its own examination, and the
+    # remaining number looks better. Nothing downstream could see it, because the gate is
+    # computed over what survived. Episodes the BASE arm ran and the candidate did not are
+    # the asymmetry that matters: the environment did not change between the two arms, so
+    # the candidate is the difference. That is not a verdict on the candidate, it is a
+    # failure to measure it, and it aborts.
+    candidate_only_infra = sorted(set(cand_part["infra_ids"]) - set(base_part["infra_ids"]))
+
     gate = G.significance_gate(
         set(cand_part["resolved_ids"]), set(base_part["resolved_ids"]),
         paired_ids, alpha=alpha, min_n=min_n, min_pp=min_pp)
@@ -309,12 +383,23 @@ def paired_evaluate(base_manifest, candidate_manifest, agent, *, tmpdir,
 
     # Every episode failing on both arms is not a candidate verdict, it is a broken bench.
     everything_broke = len(paired_ids) == 0
+    if everything_broke:
+        infra_reason = "no episode ran on both arms"
+    elif candidate_only_infra:
+        infra_reason = ("the candidate arm could not run %d episode(s) the baseline ran "
+                        "fine (%s); the comparison is not measuring the candidate, it is "
+                        "measuring what the candidate left standing"
+                        % (len(candidate_only_infra), ", ".join(candidate_only_infra)))
+    else:
+        infra_reason = ""
     return {
         "gate": gate,
         "security": _security_regression(base, cand),
         "regression": _regression_pool_break(reg_base, reg_cand),
-        "infra": {"aborted": everything_broke,
-                  "reason": "no episode ran on both arms" if everything_broke else ""},
+        "sentinel": _sealed_sentinel(base_manifest, candidate_manifest, agent,
+                                     tmpdir=tmpdir, root=root),
+        "infra": {"aborted": bool(infra_reason), "reason": infra_reason,
+                  "candidate_only_infra": candidate_only_infra},
         "slice_ids": [e.episode_id for e in all_eps],
         "paired_ids": paired_ids,
         "on": cand_part,

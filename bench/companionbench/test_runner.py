@@ -342,3 +342,120 @@ def test_an_untouched_workdir_with_a_crashing_grader_is_still_infra():
 
     out = R.run_episode(_CrashingGrader(), lambda *_a: "")
     assert out["infra_failure"] is True
+
+
+# ---- round 4: who gets to decide what is comparable --------------------------------------
+
+def test_a_candidate_that_crashes_only_on_its_own_arm_aborts_the_comparison():
+    """エージェントの例外は infra になり、infra は対戦集合から外れる。
+    苦手なエピソードでだけ例外を投げれば、自分の分母を自分で選べていた。"""
+    base_m = M.base_manifest()
+    cand_m = M.apply_genome(base_m, {"parameters": {"memory_max_items": 9}})
+
+    seen = {"arm": 0}
+
+    def agent(prompt, workdir):
+        # 2周目(候補側)だけ、特定のエピソードで落ちる
+        if "mod_b.py" in prompt and seen["arm"] >= 1:
+            raise RuntimeError("candidate arm refuses this one")
+        return ""
+
+    def counting_agent(prompt, workdir):
+        try:
+            return agent(prompt, workdir)
+        finally:
+            pass
+
+    # ベース側を先に走らせるので、arm カウンタはエピソード数で切り替える
+    class _Wrap:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, prompt, workdir):
+            self.calls += 1
+            if "mod_b.py" in prompt and self.calls > 1:
+                raise RuntimeError("candidate arm refuses this one")
+            return ""
+
+    out = R.paired_evaluate(base_m, cand_m, _Wrap(),
+                            tmpdir=tempfile.mkdtemp(prefix="pe1_"))
+    assert out["infra"]["aborted"] is True, out["infra"]
+    assert out["infra"]["candidate_only_infra"]
+
+
+def test_a_regression_hidden_behind_an_infra_failure_is_not_reported_as_clean():
+    """ベースで通っていたものが候補側で実行不能になったとき、
+    『回帰なし』と答えるのは最も隠したい事実を隠すこと。"""
+    base = [{"episode_id": "hard", "success": True}]
+    cand = [{"episode_id": "hard", "success": False, "infra_failure": True}]
+    out = R._regression_pool_break(base, cand)
+    assert out["regressed"] is False          # 回帰と断定はできない
+    assert out["unevaluable"] == ["hard"]     # が、通過扱いにもしない
+    assert out["reason"]
+
+
+def test_deleting_the_fixture_fails_even_when_the_grader_would_have_passed():
+    """グレーダがクラス側のデータで採点していると、入力を消しても合格していた。
+    routing がまさにそれ。"""
+    from bench.companionbench.episodes.runtime import RoutingChoosesCorrectProfile
+    import json as _json
+    from relay.execution_profiles import RoutingError, resolve_profile
+
+    ep = RoutingChoosesCorrectProfile()
+
+    def answer_then_delete(_prompt, workdir):
+        out = []
+        for job, _want in ep.CASES:
+            try:
+                out.append(resolve_profile(dict(job)).value)
+            except RoutingError:
+                out.append("REFUSE")
+        with open(os.path.join(workdir, "answers.json"), "w", encoding="utf-8") as fh:
+            _json.dump(out, fh)
+        os.remove(os.path.join(workdir, "jobs.json"))
+        return ""
+
+    res = R.run_episode(ep, answer_then_delete)
+    assert res["success"] is False, "入力を消しても合格した"
+    assert res["infra_failure"] is False
+    assert "jobs.json" in res["details"]["deleted_fixture_files"]
+
+
+def test_the_advertised_integration_produces_a_sentinel_at_all():
+    """paired_evaluate は sentinel を一切返しておらず、decision 側だけを締めた結果
+    『正規の経路で評価した候補は永久に有効化できない』という行き止まりになっていた。
+    誰も満たせないガードは安全性ではない -- 最初に外されるのがそれ。"""
+    base_m = M.base_manifest()
+    cand_m = M.apply_genome(base_m, {"parameters": {"memory_max_items": 9}})
+    out = R.paired_evaluate(base_m, cand_m, lambda *_a: "",
+                            tmpdir=tempfile.mkdtemp(prefix="pe2_"))
+    assert "sentinel" in out and out["sentinel"], "sentinel が空のまま"
+    # salt がある機械では評価され、無ければ unevaluable。どちらも「黙って通す」ではない。
+    s = out["sentinel"]
+    assert ("regressed" in s) or s.get("unevaluable") is True
+
+
+def test_the_sealed_pool_is_what_the_sentinel_runs():
+    """canary は『オプティマイザが見ていない集合』でなければ意味がない。"""
+    import inspect
+    src = inspect.getsource(R._sealed_sentinel)
+    assert "SEALED" in src and "run_pool" in src
+
+
+def test_without_a_salt_the_sentinel_is_unevaluable_not_a_pass(monkeypatch, tmp_path):
+    """holdout を走らせずに有効化できてはいけない。"""
+    import bench.companionbench.pools as P
+
+    monkeypatch.delenv("COMPANIONBENCH_SEAL_SALT", raising=False)
+    monkeypatch.setenv("COMPANIONBENCH_SEAL_SALT_FILE", str(tmp_path / "absent"))
+    monkeypatch.setattr(P, "DEFAULT_SALT_FILE", str(tmp_path / "also_absent"))
+
+    base_m = M.base_manifest()
+    out = R.paired_evaluate(base_m, base_m, lambda *_a: "",
+                            tmpdir=tempfile.mkdtemp(prefix="pe3_"))
+    assert out["sentinel"].get("unevaluable") is True
+    from relay.selfimprove import decision as Dec
+    d = Dec.decide(gate={"keep": True, "verdict": "keep"}, sentinel=out["sentinel"],
+                   security={"regressed": False, "comparable": 1, "passed_count": 1},
+                   regression={"regressed": False}, will_activate=True)
+    assert d["may_activate"] is False

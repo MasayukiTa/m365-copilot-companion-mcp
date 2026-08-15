@@ -121,13 +121,32 @@ def decide(*, gate=None, sentinel=None, security=None, regression=None,
             return _out(REGRESSION_REJECT,
                         regression.get("reason") or "a previously-passing episode broke",
                         reasons)
-        reasons.append("regression: none")
+        # Passed on the baseline, unrunnable on the candidate. Not a proven regression, but
+        # crashing the episode you are about to break is how a regression check is defeated,
+        # so uncertainty here must not read as a pass when something will be activated.
+        if regression.get("unevaluable"):
+            if strict:
+                return _out(NEEDS_HUMAN_REVIEW,
+                            regression.get("reason")
+                            or "previously-passing episodes became unrunnable on the "
+                               "candidate only; that is not evidence of no regression",
+                            reasons)
+            reasons.append("regression: %d previously-passing episode(s) unevaluable"
+                           % len(regression["unevaluable"]))
+        else:
+            reasons.append("regression: none")
     elif strict:
         return _out(NEEDS_HUMAN_REVIEW,
                     "the regression pool was not run; activation requires it", reasons)
 
     # 4. the cross-dataset canary
-    if sentinel is None:
+    #
+    # `{}` REACHED THE "CONFIGURED" BRANCH AND READ AS "no regression", so an empty dict --
+    # which is what a caller produces by accident, and what a gate that never ran looks like
+    # -- bought a KEEP under activation. The same mistake `_evaluated` was written to stop
+    # for the other gates, left in the one gate whose whole job is to catch a result that
+    # only looks good.
+    if not _evaluated(sentinel):
         # NOT CONFIGURING THE TRIPWIRE DISABLED THE TRIPWIRE. A deleted sentinel file was
         # made to fail closed, but the default -- no sentinel path at all -- still sailed
         # straight through to the statistical gate and could activate. That makes the

@@ -16,7 +16,7 @@ capability surface:
     like a duplicate and is not, a NULL that changes a join, two documents that disagree
   - the expected answers are absent from this repository. Only their HMACs are here.
 
-THE SEAL
+THE SEAL, AND WHAT IT IS NOT
 
 `pools.seal()` stores each answer as an HMAC-SHA256 under a salt that lives outside every
 checkout. The grader recomputes the HMAC of what the agent produced and compares in
@@ -24,9 +24,25 @@ constant time. Without the salt these episodes REFUSE to grade -- see `SealError
 than falling back to a plaintext comparison, because a holdout that quietly stops being
 sealed still reports a number that looks trustworthy.
 
-Read `pools.SEAL_THREAT_MODEL` before quoting a sealed result: this keeps the answer key
-out of the working tree, which is the leak that actually happens. It is not a defence
-against a process that can read the operator's home directory.
+BE PRECISE ABOUT WHAT THAT BUYS, because the obvious reading is wrong and was written down
+here as though it were right. An independent reviewer derived all five exact answers from
+this repository WITHOUT the salt, in one pass, and then confirmed them against the seals.
+That is not a flaw in the HMAC; it is what the construction can do. The fixtures are here,
+the prompts are here, and bench/companionbench/test_sealed.py has to solve each episode in
+order to prove the seal accepts the right answer -- so the answers are derivable by anyone
+who can read the tree, which includes an optimiser operating on it.
+
+So this is NOT a secrecy boundary against a repository-aware optimiser. What it does buy:
+
+  - no plaintext answer key sits in the tree to be pattern-matched or accidentally trained on
+  - the episodes are absent from `optimiser_visible()`, so the ordinary evolution path never
+    scores against them, and a gain fitted to the visible pools shows up here as a drop
+  - a grader whose salt has gone missing refuses rather than reporting zeros
+
+Treat a sealed result as a cross-distribution generalisation check under an optimiser that
+is not deliberately mining the repository -- and if you need the stronger property, the
+fixtures themselves have to be generated from the salt so the concrete instance does not
+exist in the tree at all. That is a real design, and it is not what this is.
 
 HOW TO ADD ONE
 

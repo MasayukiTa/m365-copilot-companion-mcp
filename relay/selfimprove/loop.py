@@ -179,9 +179,7 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
     # graded and reported as this experiment's evidence -- the exact failure the guard was
     # written to prevent, wearing the guard's own uniform. Mark the moment the arm starts
     # and count only what appears after it.
-    solve_started_at = time.time()
-
-    def _captured(pred_dir):
+    def _captured(pred_dir, since):
         """Prediction files written by THIS run, not whatever was lying in the directory."""
         if not os.path.isdir(pred_dir):
             return 0
@@ -190,13 +188,17 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
             if not name.endswith(".json"):
                 continue
             try:
-                if os.path.getmtime(os.path.join(pred_dir, name)) >= solve_started_at:
+                if os.path.getmtime(os.path.join(pred_dir, name)) >= since:
                     n += 1
             except OSError:
                 pass
         return n
 
     # ON arm (blocking child; resumable so a transient blip just re-runs the uncaptured chunk)
+    # ONE TIMESTAMP FOR BOTH ARMS was not enough: a file touched in the OFF directory while
+    # the ON arm was still running predates the OFF arm and still counted as an OFF capture.
+    # Each arm is marked when it starts.
+    on_started_at = time.time()
     log("solve ON (%s=1) ..." % toggle)
     rc, done = _run_solve_arm(spec_path, targets_file, on_dir, "sion", toggle, True, chunk, conc, turns, floor)
     if not done:
@@ -206,7 +208,7 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
     # actually ran -- this is an INFRA fault, not a measurement. Do NOT grade, gate, or burn (burning
     # a slice that was never solved would silently consume fresh instances; cf. the disk-floor
     # incident that wrongly burned 200). Return an infra_abort status so the caller retries later.
-    on_cap = _captured(on_dir)
+    on_cap = _captured(on_dir, on_started_at)
     if on_cap == 0:
         log("ON solve captured 0 predictions -> INFRA ABORT (disk floor / wedge); NOT burning, NOT gating")
         return {"status": "infra_abort", "arm": "ON", "reason": "ON solve produced no predictions (infra)",
@@ -224,11 +226,12 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
                 "burned": False, "report": None}
 
     # OFF arm
+    off_started_at = time.time()
     log("solve OFF (%s=0) ..." % toggle)
     rc, done = _run_solve_arm(spec_path, targets_file, off_dir, "sioff", toggle, False, chunk, conc, turns, floor)
     if not done:
         log("OFF solve did not reach its done marker (rc=%s); aborting" % rc); return None
-    off_cap = _captured(off_dir)
+    off_cap = _captured(off_dir, off_started_at)
     if off_cap == 0:
         log("OFF solve captured 0 predictions -> INFRA ABORT; NOT burning, NOT gating")
         return {"status": "infra_abort", "arm": "OFF", "reason": "OFF solve produced no predictions (infra)",
@@ -242,7 +245,18 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
                 "reason": "OFF grade did not run (infra: the eval host unreachable / scp failed)",
                 "burned": False, "report": None}
 
-    gate = G.significance_gate(on_resolved, off_resolved, fresh, alpha=alpha, min_n=min_n, min_pp=min_pp)
+    # THE GATE WAS STILL HANDED THE WHOLE SLICE. Per-instance infra was being classified
+    # correctly above and then discarded here: an instance the grader could not judge on
+    # either arm entered McNemar as "not resolved on that arm", which is evidence of failure
+    # rather than absence of evidence. Half the previous fix, undone one line later. The
+    # paired set is the slice minus anything either arm could not judge.
+    infra_either = set(on_infra) | set(off_infra)
+    paired = [i for i in fresh if i not in infra_either]
+    if len(paired) < len(fresh):
+        log("excluded %d instance(s) from the pair: ungradable on at least one arm"
+            % (len(fresh) - len(paired)))
+    gate = G.significance_gate(on_resolved, off_resolved, paired,
+                               alpha=alpha, min_n=min_n, min_pp=min_pp)
     burned.add(fresh, reason="selfimprove A/B %s" % toggle, ts=int(time.time()))
     # PER-INSTANCE, not just counts. The sets were already computed above and then thrown
     # away, which is why the sentinel had nothing to check, the archive recorded an empty

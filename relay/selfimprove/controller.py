@@ -44,6 +44,7 @@ class EvolutionController:
         # you get by not thinking about it.
         self.activate = bool(activate)
         self.auto_apply = bool(auto_apply)
+        self._parent_id = ""
 
     def run_candidate(self, *, genome, hypothesis, target_failure_class, evaluate,
                       evidence=None, predicted_effect=None, possible_regressions=None,
@@ -58,6 +59,7 @@ class EvolutionController:
         base = base or M.base_manifest()
         candidate = M.apply_genome(base, genome or {})
         parent_id = M.harness_id(base)
+        self._parent_id = parent_id          # the archive needs it; it was writing None
         cand_id = M.harness_id(candidate)
         changed = M.diff(base, candidate)
 
@@ -124,7 +126,65 @@ class EvolutionController:
             # Unable to check is not the same as intact, and must not be treated as it.
             return False, ["frozen check failed: %s" % exc]
 
+    def _archive(self, experiment_id, verdict, result, candidate, cand_id, changed):
+        """Write the durable experiment record. Returns "" on success, the error otherwise.
+
+        WHAT GOES IN IS THE EVIDENCE, not a summary of it. The row carried a pass count, the
+        slice ids and three descriptors -- so an archived experiment could not answer which
+        episodes moved, whether security held, or which harness produced it, and the brief's
+        first principle asks exactly those. parent_id was written as None while the parent
+        was sitting in a local variable.
+        """
+        if self.archive is None:
+            return ""
+        try:
+            self.archive.add(
+                {"components": candidate["components"],
+                 "parameters": candidate["parameters"],
+                 "parent_id": result.get("parent_harness_id") or self._parent_id},
+                slice_ids=result.get("slice_ids") or [],
+                pass_at_1=result.get("pass_at_1"),
+                gate_verdict=verdict["state"],
+                descriptors={
+                    "experiment_id": experiment_id,
+                    "harness_id": cand_id,
+                    "candidate_harness_id": cand_id,
+                    "parent_harness_id": self._parent_id,
+                    "components": dict(candidate["components"]),
+                    "parameters": dict(candidate["parameters"]),
+                    "changed": changed,
+                    "decision_state": verdict["state"],
+                    "decision_reason": verdict.get("reason", ""),
+                    # The per-instance sets, so the row can be re-examined without re-running
+                    "paired_ids": result.get("paired_ids") or [],
+                    "on": result.get("on") or {},
+                    "off": result.get("off") or {},
+                    "security": result.get("security") or {},
+                    "sentinel": result.get("sentinel") or {},
+                    "regression": result.get("regression") or {},
+                    "infra": result.get("infra") or {},
+                    "harness_fingerprint": EX.harness_fingerprint(
+                        genome={"components": candidate["components"],
+                                "parameters": candidate["parameters"]}),
+                },
+            )
+        except Exception as exc:
+            return "%s: %s" % (type(exc).__name__, exc)
+        return ""
+
     def _conclude(self, experiment_id, verdict, result, candidate, cand_id, changed):
+        # ARCHIVE FIRST, THEN CONCLUDE, THEN ACTIVATE. The ledger conclusion was written
+        # before the archive attempt, and a failed archive then downgraded the RETURNED
+        # verdict from KEEP to NEEDS_HUMAN_REVIEW -- leaving the durable record saying
+        # "keep" and the caller saying "review". The durable record is the one that survives
+        # the session, so it is the one that must not be wrong.
+        archive_error = self._archive(experiment_id, verdict, result, candidate, cand_id,
+                                      changed)
+        if archive_error and verdict["may_activate"]:
+            verdict = dict(verdict, state=D.NEEDS_HUMAN_REVIEW, may_activate=False,
+                           reason="the experiment record could not be written (%s); "
+                                  "activating without it would leave a live harness change "
+                                  "nobody can attribute" % archive_error)
         self.ledger.conclude(
             experiment_id=experiment_id,
             verdict=_ledger_verdict(verdict["state"]),
@@ -136,46 +196,10 @@ class EvolutionController:
             infra_delta=result.get("infra_delta"),
             note=verdict["reason"],
         )
-        # ARCHIVE BEFORE ACTIVATE, and refuse to activate if the record did not land. The
-        # order was the other way round with the write wrapped in a bare except, so a full
-        # disk or a bad path activated a candidate whose durable record does not exist --
-        # a live harness change with nothing saying which experiment produced it. The ledger
-        # conclusion above survives either way; what this protects is the ability to answer
-        # "what is running and why" later.
-        archive_error = ""
-        if self.archive is not None:
-            try:
-                self.archive.add(
-                    {"components": candidate["components"],
-                     "parameters": candidate["parameters"],
-                     "parent_id": None},
-                    slice_ids=result.get("slice_ids") or [],
-                    pass_at_1=result.get("pass_at_1"),
-                    gate_verdict=verdict["state"],
-                    descriptors={"experiment_id": experiment_id,
-                                 "harness_id": cand_id,
-                                 "candidate_harness_id": cand_id,
-                                 "components": dict(candidate["components"]),
-                                 "parameters": dict(candidate["parameters"]),
-                                 "changed": changed,
-                                 "decision_state": verdict["state"],
-                                 "decision_reason": verdict.get("reason", "")},
-                )
-            except Exception as exc:
-                # Recorded, not swallowed. The decision itself is already durable in the
-                # ledger, so this is not fatal to the run -- but it IS fatal to activation.
-                archive_error = "%s: %s" % (type(exc).__name__, exc)
-
         activated = False
         if verdict["may_activate"] and self.activate:
-            if archive_error:
-                verdict = dict(verdict, state=D.NEEDS_HUMAN_REVIEW, may_activate=False,
-                               reason="the experiment record could not be written (%s); "
-                                      "activating without it would leave a live harness "
-                                      "change nobody can attribute" % archive_error)
-            else:
-                RC.write_active(candidate)
-                activated = True
+            RC.write_active(candidate)
+            activated = True
         return {
             "experiment_id": experiment_id,
             "harness_id": cand_id,

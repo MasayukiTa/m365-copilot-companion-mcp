@@ -471,3 +471,28 @@ def test_omitting_the_sentinel_is_still_fine_for_a_report_only_run():
                  security={"regressed": False, "comparable": 3, "passed_count": 3})
     assert d["state"] == D.KEEP
     assert any("not configured" in r for r in d["passed_gates"])
+
+
+def test_an_empty_sentinel_dict_does_not_buy_a_keep():
+    """None は fail closed にしたが、{} は『設定済み・回帰なし』の枝に入って
+    有効化まで通っていた。他のゲートで潰したはずの穴が、canary だけに残っていた。"""
+    d = D.decide(gate=_gate(), sentinel={},
+                 security={"regressed": False, "comparable": 1, "passed_count": 1},
+                 regression={"regressed": False}, will_activate=True)
+    assert d["state"] == D.NEEDS_HUMAN_REVIEW and d["may_activate"] is False
+
+
+def test_a_regression_hidden_behind_infra_blocks_activation():
+    d = D.decide(gate=_gate(), sentinel={"regressed": False},
+                 security={"regressed": False, "comparable": 1, "passed_count": 1},
+                 regression={"regressed": False, "lost": [], "unevaluable": ["hard"]},
+                 will_activate=True)
+    assert d["state"] == D.NEEDS_HUMAN_REVIEW
+
+
+def test_the_same_hidden_regression_is_only_a_note_when_nothing_activates():
+    d = D.decide(gate=_gate(), sentinel={"regressed": False},
+                 security={"regressed": False, "comparable": 1, "passed_count": 1},
+                 regression={"regressed": False, "lost": [], "unevaluable": ["hard"]})
+    assert d["state"] == D.KEEP
+    assert any("unevaluable" in r for r in d["passed_gates"])
