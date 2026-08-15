@@ -95,7 +95,12 @@ PARAMETER_TYPES = {
 # missing knob -- it invites experiments that cannot possibly measure anything.
 DEFAULT_PARAMETERS = {
     "max_refute_passes": 2,       # -> relay_fleet: how many refuter passes a candidate gets
-    "max_retries": 3,             # -> relay_fleet: transient-retry budget per worker
+    # 10, NOT 3 -- this is the value run_relay_fleet had in its signature before the manifest
+    # became the source of it. Writing 3 here silently cut the fleet's transient-retry budget
+    # to a third for every production run, with no manifest configured and nothing to see in
+    # a diff of the fleet. THE BASE MANIFEST MUST REPRODUCE CURRENT PRODUCTION EXACTLY, or
+    # adopting it is itself an unreviewed change to the product.
+    "max_retries": 10,            # -> relay_fleet: transient-retry budget per worker
     "memory_max_items": 5,        # -> project_memory: how much history is primed into a goal
 }
 

@@ -102,8 +102,16 @@ def write_active(manifest: dict, path: str | None = None) -> str:
     `path=ACTIVE_PATH` binds the module attribute once at import, so anything that later
     redirects ACTIVE_PATH -- a test, or an operator pointing at a second profile -- is
     silently ignored and the manifest lands somewhere nobody is looking.
+
+    THE OVERRIDE IS HONOURED ON WRITE, NOT ONLY ON READ. It was read-only, so a caller that
+    had redirected the active manifest to a temp file still WROTE to the production path.
+    That is not hypothetical: a controller test with activate=True installed a manifest into
+    the real `.fleet/selfimprove/active_manifest.json`, which is gitignored, so it never
+    appeared in a diff -- and from then on every fleet run used a retry budget of 3 instead
+    of 10 and primed 9 memory entries instead of 5. Read and write must resolve the same
+    location, or "the active manifest" means two different files depending on the verb.
     """
-    path = path or ACTIVE_PATH
+    path = path or os.environ.get(OVERRIDE_ENV, "").strip() or ACTIVE_PATH
     M.validate(manifest)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
@@ -135,10 +143,13 @@ def memory_max_items() -> int:
 
 
 def max_retries() -> int:
+    # The fallback must be the PRODUCTION value, not a smaller round number. A fallback that
+    # disagrees with the base manifest silently changes behaviour exactly when the manifest
+    # cannot be read -- which is the moment nobody is looking.
     try:
-        return max(0, int(parameter("max_retries", 3)))
+        return max(0, int(parameter("max_retries", 10)))
     except (TypeError, ValueError):
-        return 3
+        return 10
 
 
 def max_refute_passes() -> int:

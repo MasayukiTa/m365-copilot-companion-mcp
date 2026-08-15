@@ -639,3 +639,54 @@ def test_a_parameter_value_the_runtime_cannot_use_is_refused():
 def test_an_unknown_parameter_is_refused():
     with pytest.raises(M.ManifestError):
         M.apply_genome(M.base_manifest(), {"parameters": {"invented_knob": 3}})
+
+
+def test_the_base_manifest_reproduces_production_exactly():
+    """base manifest が本番構成と1つでもズレていれば、それを採用するだけで
+    レビューされていない製品変更になる。実際に max_retries が 10 -> 3 になり、
+    フリートの transient 耐性が全走行で 1/3 になっていた。"""
+    import os
+
+    from relay import project_memory as PM
+    from relay.relay_fleet import _genome_default
+
+    prev = os.environ.pop(RC.OVERRIDE_ENV, None)
+    RC.active_manifest(refresh=True)
+    try:
+        # 署名に直書きされていた当時の本番既定値
+        assert _genome_default("max_transient", 10) == 10
+        assert _genome_default("max_refute", 2) == 2
+        assert PM._default_max_items() == 5
+    finally:
+        if prev is not None:
+            os.environ[RC.OVERRIDE_ENV] = prev
+        RC.active_manifest(refresh=True)
+
+
+def test_the_fallbacks_agree_with_the_base_manifest():
+    """manifest が読めないときだけ挙動が変わる、という最も気づきにくい形を禁じる。"""
+    for name, getter in (("max_retries", RC.max_retries),
+                         ("max_refute_passes", RC.max_refute_passes),
+                         ("memory_max_items", RC.memory_max_items)):
+        import inspect
+        src = inspect.getsource(getter)
+        assert str(M.DEFAULT_PARAMETERS[name]) in src, (
+            "%s のフォールバックが base manifest と違う" % name)
+
+
+def test_activating_under_an_override_does_not_touch_the_production_manifest(monkeypatch,
+                                                                             tmp_path):
+    """テストが本番の active_manifest.json を書いていた。.fleet は gitignore なので
+    diff にも出ず、以後すべてのフリート走行が汚染された設定で回っていた。"""
+    import json as _json
+
+    target = tmp_path / "active.json"
+    monkeypatch.setenv(RC.OVERRIDE_ENV, str(target))
+    before = os.path.isfile(RC.ACTIVE_PATH)
+
+    RC.write_active(M.apply_genome(M.base_manifest(),
+                                   {"parameters": {"memory_max_items": 7}}))
+
+    assert target.is_file(), "override 先に書かれていない"
+    assert _json.loads(target.read_text(encoding="utf-8"))["parameters"]["memory_max_items"] == 7
+    assert os.path.isfile(RC.ACTIVE_PATH) == before, "本番の active manifest を作成/変更した"
