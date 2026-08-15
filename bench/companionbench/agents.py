@@ -127,6 +127,44 @@ def _bridge_error(raw: str) -> str:
     return ""
 
 
+#: Replies that mean the SERVICE declined to work, not that the companion tried and failed.
+#:
+#: Three runs of the suite scored 7/22, 17/21 and 19/22, and the run that scored worst was the
+#: FASTEST: median turn 50s against 73s and 77s. Fast-and-failing is the signature of a service
+#: that answered without doing anything, and the observed wording is a rate-limit notice. It
+#: terminates the stream properly, so `event: done` is present and the earlier classification
+#: passes it straight through to the grader, which records a capability failure.
+#:
+#: Driving a few hundred turns through one tenant in an evening is what produces it -- so the
+#: measurement causes the throttling, and the throttling then looks like the system getting
+#: worse. That is the most misleading shape a benchmark defect can take.
+_SERVICE_DECLINED = (
+    "この量のリクエストには",
+    "現在一時的に応答できません",
+    "後でもう一度お試しください",
+    "too many requests",
+    "rate limit",
+    "please try again later",
+)
+
+
+def service_declined(reply: str) -> str:
+    """The phrase showing the service refused to serve this turn, or "".
+
+    Matched on the WHOLE reply being short as well as containing the phrase: a long answer
+    that discusses rate limiting is an answer, and turning it into infra would delete real
+    evidence in the direction that flatters the system.
+    """
+    text = (reply or "").strip()
+    if len(text) > 200:
+        return ""
+    low = text.lower()
+    for phrase in _SERVICE_DECLINED:
+        if phrase.lower() in low:
+            return phrase
+    return ""
+
+
 class TurnDidNotSettle(RuntimeError):
     """The turn never completed, so there is nothing to grade.
 
@@ -301,6 +339,13 @@ class BridgeAgent:
             raise TurnDidNotSettle(
                 "the bridge reported an error and then terminated the stream (%s); that is "
                 "the environment, not an answer" % _bridge_error(raw)[:120])
+        declined = service_declined(reply)
+        if declined:
+            raise TurnDidNotSettle(
+                "the service declined this turn (%r): a rate-limit notice is the environment "
+                "refusing to work, not the companion trying and failing. It arrives fast and "
+                "terminates cleanly, which is why it was being graded as a capability result"
+                % declined)
         if not settled:
             raise TurnDidNotSettle(
                 "the stream ended after %.1fs without `event: done` (%d bytes, %d chars of "

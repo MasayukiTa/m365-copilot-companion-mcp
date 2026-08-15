@@ -187,3 +187,28 @@ def test_the_client_does_not_give_up_before_the_bridge_does():
     対象が遅くなるほど pass rate が上がる。"""
     from bench.companionbench.agents import BridgeAgent
     assert BridgeAgent().timeout >= 600
+
+
+def test_a_rate_limit_notice_is_the_environment_not_a_wrong_answer():
+    """3回の実行が 7/22・17/21・19/22 で、最悪の回が最速だった(中央値50秒 対 73秒/77秒)。
+    速くて落ちるのは『何もせずに答えた』署名で、観測された文面はレート制限の通知。
+    正常に done で終わるので、それまでの分類を素通りして能力の失敗として記録されていた。"""
+    raw = ('data: {"replace": "この量のリクエストには、現在一時的に応答できません。'
+           '後でもう一度お試しください。"}\n\nevent: done\ndata: {}\n\n')
+    with pytest.raises(A.TurnDidNotSettle) as exc:
+        _Bridge(raw)("x", "C:/wd")
+    assert "declined this turn" in str(exc.value)
+
+
+def test_a_long_answer_that_discusses_rate_limiting_is_still_an_answer():
+    """レート制限について説明した回答まで infra にすると、
+    系に都合のよい方向で本物の証拠が消える。"""
+    body = ("Rate limiting protects a service from too many requests. " * 6)
+    raw = 'data: {"replace": "%s"}\n\nevent: done\ndata: {}\n\n' % body
+    assert "Rate limiting protects" in _Bridge(raw)("x", "C:/wd")
+
+
+def test_the_declined_check_is_case_insensitive_and_covers_english():
+    assert A.service_declined("Too Many Requests")
+    assert A.service_declined("Please try again later.")
+    assert not A.service_declined("the report is ready")
