@@ -123,11 +123,28 @@ def lock_held(lock_path=None):
 
 
 def take_lock(lock_path=None, *, note=""):
+    """Take the lock, or raise. The create is ATOMIC.
+
+    Checking `lock_held` and then opening for write is two operations, and two schedulers
+    that both check before either writes both proceed -- which is the exact situation the
+    lock exists to prevent, arriving only under the timing that makes it hardest to see
+    afterwards. O_CREAT|O_EXCL makes the creation itself the test.
+    """
     path = lock_path or DEFAULT_LOCK
-    if lock_held(path):
-        raise Blocked("a campaign is already in flight")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        if lock_held(path):
+            raise Blocked("a campaign is already in flight")
+        # A lock file older than STALE_LOCK_S is an abandoned one; take it over rather than
+        # letting yesterday's crash block every night from here on.
+        release_lock(path)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            raise Blocked("a campaign is already in flight")
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
         json.dump({"started_at": time.time(), "pid": os.getpid(), "note": note}, fh)
     return path
 
@@ -166,3 +183,92 @@ def scheduled_run(run_campaign, *, budget_candidates=5, lock_path=None,
     finally:
         release_lock(lock_path)
     return {"ran": True, "blocked_by": [], "result": result, "note": ""}
+
+
+# --------------------------------------------------------------------------------------
+# The entry point
+# --------------------------------------------------------------------------------------
+
+def nightly(*, budget_candidates=5, activate=False, operator_approved_activation=False,
+            evaluate=None, archive_path=None, lock_path=None) -> dict:
+    """One scheduled campaign, with the phases that decide WHAT to run wired in.
+
+    This exists because the parts had no caller. Phase 9 selected a replay set, Phase 6
+    judged the harness, Phase 11 decided whether to start -- each tested, none reachable
+    from anything a person could run, which is a way of being finished that does not survive
+    someone trying to use it.
+
+    The order is the argument. The recent decisions are read FIRST, because they answer two
+    different questions: whether the harness is well enough to run at all (Phase 6, a
+    precondition here) and which failures the next run should replay (Phase 9). Running a
+    campaign against a harness that mostly aborts produces more aborts, and choosing what to
+    replay from that history chooses noise.
+    """
+    from relay.selfimprove import archive as A
+    from relay.selfimprove import campaign as C
+    from relay.selfimprove import coreset as CS
+    from relay.selfimprove.controller import EvolutionController
+
+    archive = A.Archive(archive_path) if archive_path else A.Archive()
+    decisions = [{"state": (e.get("verdict") or "").upper()} for e in archive.entries()][-20:]
+
+    reasons = preconditions(recent_decisions=decisions, lock_path=lock_path,
+                            activate=activate,
+                            operator_approved_activation=operator_approved_activation,
+                            budget_candidates=budget_candidates)
+    if reasons:
+        return {"ran": False, "blocked_by": reasons, "result": None,
+                "note": "a failed precondition is information; retrying past it converts a "
+                        "blocked night into a busy one and the record stops saying which"}
+
+    replay = CS.select(_recent_failures(archive), budget=budget_candidates)
+
+    def run(budget):
+        controller = EvolutionController(activate=activate)
+        return C.sweep(controller, evaluate=evaluate or _refuse,
+                       on_result=lambda row: None)
+
+    out = scheduled_run(run, budget_candidates=budget_candidates, lock_path=lock_path,
+                        recent_decisions=decisions, activate=activate,
+                        operator_approved_activation=operator_approved_activation)
+    out["replay_set"] = replay
+    return out
+
+
+def _recent_failures(archive) -> list:
+    """Episode-level failures from the archive's recent entries, for the replay coreset."""
+    rows = []
+    for entry in archive.entries()[-20:]:
+        for row in ((entry.get("results") or {}).get("episodes") or []):
+            if not row.get("success", True):
+                rows.append(row)
+    return rows
+
+
+def _refuse(*_a, **_k):
+    raise Blocked("nightly() needs an evaluator; it will not invent one and call the result "
+                  "a measurement")
+
+
+if __name__ == "__main__":                                   # pragma: no cover
+    import argparse
+
+    ap = argparse.ArgumentParser(description="One scheduled evolution campaign.")
+    ap.add_argument("--budget", type=int, default=5)
+    ap.add_argument("--activate", action="store_true",
+                    help="install the winner (needs --operator-approved as well)")
+    ap.add_argument("--operator-approved", action="store_true")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report the preconditions and stop")
+    args = ap.parse_args()
+
+    if args.dry_run:
+        for reason in preconditions(budget_candidates=args.budget, activate=args.activate,
+                                    operator_approved_activation=args.operator_approved):
+            print("BLOCKED:", reason)
+        else:
+            print("preconditions OK")
+    else:
+        print(json.dumps(nightly(budget_candidates=args.budget, activate=args.activate,
+                                 operator_approved_activation=args.operator_approved),
+                         ensure_ascii=False, indent=2, default=str))

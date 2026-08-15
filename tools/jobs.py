@@ -391,3 +391,11 @@ def job_kill(job_id: str) -> str:
         return f"Killed job {job_id}"
     except Exception as e:
         return f"[job_kill error: {type(e).__name__}: {e}]"
+
+
+#: This tool runs caller-supplied code, so the evidence trace cannot see what it did:
+#: it records that the call happened and nothing about its effects. Declared HERE rather
+#: than in a list inside evidence_trace.py, because a list in another file is a list that
+#: goes stale the first time an executor is added -- which is exactly what happened.
+run_in_background.evidence_opaque = True
+run_python_in_background.evidence_opaque = True

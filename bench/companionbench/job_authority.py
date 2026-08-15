@@ -20,11 +20,20 @@ endpoint and a capability token that permit exactly five operations -- the ones 
 is for. There is no endpoint that writes an arbitrary row, and no path from the agent to the
 file.
 
-Receipts are appended by the operation itself, inside the same transaction as the state
-change, with a monotonic sequence and an HMAC chain over the previous receipt. The judge
-reads them over a separate token that the agent is never given, and verifies the chain. An
-agent that skips the API cannot produce a receipt; an agent that fabricates one cannot make
-it chain.
+Receipts are appended by the operation itself -- under the same lock as the state change,
+though NOT inside the same database transaction: the store commits, and the receipt is
+written immediately after, so a crash in the gap between them leaves a state change without
+its receipt. That window is small and it is real, and describing it as transactional (as an
+earlier version of this text did) would make a reader trust an ordering guarantee that does
+not exist.
+
+Each receipt carries a monotonic sequence and an HMAC chain over the previous one. The judge
+reads them over a separate token the agent is never given, and verifies the chain. An agent
+that skips the API cannot produce a receipt; an agent that fabricates one cannot make it
+chain; and an agent that DELETES one is caught because every response carries the sequence
+of the receipt it produced, so a caller can insist on finding the receipt it was promised --
+without that, verification began from whatever list it was handed, and a list with its last
+entry removed chained perfectly.
 
 WHAT IT STILL DOES NOT DO
 
@@ -43,6 +52,7 @@ import json
 import os
 import secrets
 import socket
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -73,11 +83,17 @@ def _server_source() -> str:
 import hashlib, hmac, json, os, sys, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-sys.path.insert(0, sys.argv[1])
-DB       = sys.argv[2]
-AGENT_T  = sys.argv[3]
-JUDGE_T  = sys.argv[4]
-SECRET   = sys.argv[5].encode("utf-8")
+# CONFIGURATION ARRIVES ON STDIN, not in argv. An earlier version passed the DB path, both
+# tokens and the HMAC secret as command-line arguments, where any process running as the same
+# OS user could read them straight out of the process table -- so the "the agent cannot reach
+# the evidence" boundary was one `wmic process get commandline` from being no boundary at all.
+# stdin is not a boundary either, but it is not a public listing.
+_CFG     = json.loads(sys.stdin.readline() or "{}")
+sys.path.insert(0, _CFG["repo"])
+DB       = _CFG["db"]
+AGENT_T  = _CFG["agent_token"]
+JUDGE_T  = _CFG["judge_token"]
+SECRET   = _CFG["secret"].encode("utf-8")
 
 from relay.local_job_store import LocalJobStore, JobStoreError
 
@@ -91,7 +107,13 @@ JUDGE_OPS = ("create_job", "mark_waiting_interaction")
 
 
 def _append(op, args, ok, result):
-    """A receipt, chained. Written by the operation, not by a caller."""
+    """A receipt, chained. Written by the operation, not by a caller. Returns its seq.
+
+    The seq goes back to the caller in the response, which is what makes a MISSING receipt
+    detectable: a party that has been told "your call is receipt 7" can check that receipt 7
+    is still there. Without it, a verifier starts from whatever list it is handed, and a list
+    with the last entry removed chains perfectly.
+    """
     prev = RECEIPTS[-1]["mac"] if RECEIPTS else ""
     body = {
         "seq": len(RECEIPTS) + 1,
@@ -105,6 +127,7 @@ def _append(op, args, ok, result):
     body["mac"] = hmac.new(
         SECRET, json.dumps(body, sort_keys=True).encode("utf-8"), hashlib.sha256).hexdigest()
     RECEIPTS.append(body)
+    return body["seq"]
 
 
 class H(BaseHTTPRequestHandler):
@@ -159,15 +182,16 @@ class H(BaseHTTPRequestHandler):
         with LOCK:
             try:
                 result = fn(**args)
-                _append(op, args, True, result)
-                return self._send(200, {"result": result})
+                seq = _append(op, args, True, result)
+                return self._send(200, {"result": result, "receipt_seq": seq})
             except JobStoreError as exc:
-                _append(op, args, False, str(exc))
-                return self._send(409, {"error": str(exc), "code": exc.args[0]
-                                        if exc.args else ""})
+                seq = _append(op, args, False, str(exc))
+                return self._send(409, {"error": str(exc), "receipt_seq": seq,
+                                        "code": exc.args[0] if exc.args else ""})
             except Exception as exc:
-                _append(op, args, False, str(exc))
-                return self._send(500, {"error": "%s: %s" % (type(exc).__name__, exc)})
+                seq = _append(op, args, False, str(exc))
+                return self._send(500, {"receipt_seq": seq,
+                                        "error": "%s: %s" % (type(exc).__name__, exc)})
 
 
 srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
@@ -190,14 +214,20 @@ class JobAuthority:
         self._secret = secrets.token_hex(32)
         self.port = 0
         self._proc = None
+        #: Every receipt seq the authority has told a caller it wrote. Verification starts
+        #: from this rather than from the returned list, so a truncated list is detectable.
+        self._promised = set()
 
     # -- lifecycle ---------------------------------------------------------------------
 
     def __enter__(self):
         self._proc = subprocess.Popen(
-            [self.python, "-c", _server_source(), REPO, self.db,
-             self.agent_token, self.judge_token, self._secret],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            [self.python, "-c", _server_source()],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self._proc.stdin.write(json.dumps({
+            "repo": REPO, "db": self.db, "agent_token": self.agent_token,
+            "judge_token": self.judge_token, "secret": self._secret}) + "\n")
+        self._proc.stdin.flush()
         deadline = time.time() + 30
         while time.time() < deadline:
             line = self._proc.stdout.readline()
@@ -213,6 +243,10 @@ class JobAuthority:
         if self._proc is not None:
             self._proc.kill()
             self._proc.wait(timeout=10)
+        # The DB holds the episode's job state and lived outside the workdir precisely so the
+        # agent could not reach it; leaving it in the temp directory afterwards keeps it
+        # reachable for as long as the machine keeps temp files.
+        shutil.rmtree(self.root, ignore_errors=True)
         return False
 
     # -- calling ------------------------------------------------------------------------
@@ -227,11 +261,21 @@ class JobAuthority:
                                      headers={"Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read() or b"{}")
+                return self._note(json.loads(resp.read() or b"{}"))
         except urllib.error.HTTPError as exc:
-            return json.loads(exc.read() or b"{}")
+            return self._note(json.loads(exc.read() or b"{}"))
         except Exception as exc:
             raise AuthorityError("authority unreachable: %s: %s" % (type(exc).__name__, exc))
+
+    def _note(self, payload):
+        """Remember the receipt seq this call was told it produced."""
+        try:
+            seq = payload.get("receipt_seq")
+            if isinstance(seq, int):
+                self._promised.add(seq)
+        except Exception:
+            pass
+        return payload
 
     def as_judge(self, op, **args):
         return self._call(op, args, self.judge_token)
@@ -246,13 +290,21 @@ class JobAuthority:
         return [r for r in rows if op is None or r.get("op") == op]
 
     def receipts_intact(self):
-        """Verify the chain. A forged or edited receipt breaks it; a missing one breaks it.
+        """Verify the chain, and that nothing was removed from the end of it.
 
-        Recomputing the MAC here, in the judge, is the point: the secret never leaves this
-        process and the authority, so a receipt the agent invented cannot chain.
+        Two separate claims, and the first version only made the first one. Recomputing the
+        MAC catches a forged or edited receipt, because the secret never leaves this process
+        and the authority. It does NOT catch a receipt that is simply absent: verification
+        began from whatever list the server returned, and a list with its last entry removed
+        -- or an empty list -- chains perfectly and verified.
+
+        So every response carries the seq of the receipt it produced, and every seq this
+        process has been promised must still be present. A truncation now has to remove a
+        receipt somebody was told about, which the caller's own record contradicts.
         """
+        rows = self.as_judge("receipts").get("receipts") or []
         prev = ""
-        for i, row in enumerate(self.as_judge("receipts").get("receipts") or [], start=1):
+        for i, row in enumerate(rows, start=1):
             body = {k: row[k] for k in ("seq", "op", "args", "ok", "result_digest", "prev")}
             expect = hmac.new(self._secret.encode("utf-8"),
                               json.dumps(body, sort_keys=True).encode("utf-8"),
@@ -260,7 +312,8 @@ class JobAuthority:
             if row.get("seq") != i or row.get("prev") != prev or row.get("mac") != expect:
                 return False
             prev = row["mac"]
-        return True
+        present = {r.get("seq") for r in rows}
+        return self._promised.issubset(present)
 
     def state(self):
         return self.as_judge("state")

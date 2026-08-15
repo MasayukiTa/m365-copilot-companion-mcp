@@ -16,6 +16,7 @@ import json
 import os
 import tempfile
 
+from relay import provenance as PROV
 from relay.selfimprove import experiment as EX
 from relay.selfimprove import frozen as F
 from relay.selfimprove import l2
@@ -304,6 +305,7 @@ def test_the_archive_row_can_reconstruct_the_comparison():
     F.frozen_intact = lambda *a, **k: (True, [])
     try:
         ctl.run_candidate(
+        evidence=[{"kind": "own_measurements", "authority": PROV.AGENT_INFERENCE}],
             genome={"parameters": {"memory_max_items": 9}},
             hypothesis="more recall helps", target_failure_class="missing_evidence",
             evaluate=lambda *a, **k: {

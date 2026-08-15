@@ -159,3 +159,11 @@ def shell_which() -> str:
         path = shutil.which(c)
         lines.append(f"  {c:<14}  {path or '(not found)'}")
     return "\n".join(lines)
+
+
+#: This tool runs caller-supplied code, so the evidence trace cannot see what it did:
+#: it records that the call happened and nothing about its effects. Declared HERE rather
+#: than in a list inside evidence_trace.py, because a list in another file is a list that
+#: goes stale the first time an executor is added -- which is exactly what happened.
+pwsh_exec.evidence_opaque = True
+pwsh_exec_file.evidence_opaque = True

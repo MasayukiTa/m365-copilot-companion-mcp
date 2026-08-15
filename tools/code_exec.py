@@ -148,3 +148,11 @@ def shell_exec(
         return f"[timeout: exceeded {timeout} seconds]"
     except Exception as e:
         return f"[shell_exec error: {type(e).__name__}: {e}]"
+
+
+#: This tool runs caller-supplied code, so the evidence trace cannot see what it did:
+#: it records that the call happened and nothing about its effects. Declared HERE rather
+#: than in a list inside evidence_trace.py, because a list in another file is a list that
+#: goes stale the first time an executor is added -- which is exactly what happened.
+run_python.evidence_opaque = True
+shell_exec.evidence_opaque = True

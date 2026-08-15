@@ -14,6 +14,7 @@ import os
 import tempfile
 
 from tools import evidence_trace as T
+from tools import evidence_trace as ET
 
 
 def _session(tmp=None):
@@ -138,3 +139,127 @@ def test_a_trace_failure_never_breaks_the_run_it_is_tracing():
         T.record("read_file", {"path": "x"}, True, "ok")    # must not raise
     finally:
         _clear()
+
+
+# ---------------------------------------------------------------------------------------
+# Round 8: the opaque list was hand-typed and wrong, and containment was a string prefix
+# ---------------------------------------------------------------------------------------
+
+def test_the_real_executors_are_opaque():
+    """最初の一覧は記憶で書かれ、4件中実在は1件。残る5つの実行系は「透明」と記録されていた。"""
+    for name in ("shell_exec", "pwsh_exec", "pwsh_exec_file",
+                 "run_python", "run_in_background", "run_python_in_background"):
+        assert ET.is_opaque(name), "%s が透明扱い" % name
+
+
+def test_a_tool_this_layer_cannot_resolve_is_opaque():
+    """分類漏れは『検証できなかった』に落ちるべきで、『検証して綺麗だった』ではない。"""
+    assert ET.is_opaque("some_executor_added_next_year")
+
+
+def test_a_tool_declares_its_own_opacity():
+    """別ファイルの一覧は、実行系が増えた最初の日に古くなる。"""
+    def pretend_tool():
+        pass
+    pretend_tool.evidence_opaque = True
+    assert ET.is_opaque("pretend_tool", pretend_tool)
+
+
+def test_reporting_tools_are_not_opaque_despite_the_name_hint():
+    assert not ET.is_opaque("job_status")
+
+
+def _one_call(tmp_path, args):
+    path, key = str(tmp_path / "t.jsonl"), "k" * 16
+    os.environ[ET.TRACE_PATH_ENV], os.environ[ET.TRACE_KEY_ENV] = path, key
+    try:
+        ET.record("write_file", args, True, "ok")
+    finally:
+        os.environ.pop(ET.TRACE_PATH_ENV, None)
+        os.environ.pop(ET.TRACE_KEY_ENV, None)
+    return path, key
+
+
+def test_dot_dot_escapes_the_workdir(tmp_path):
+    """`C:/work/../outside/x` は root で始まる。文字列前方一致は通してしまう。"""
+    root = tmp_path / "work"
+    root.mkdir()
+    path, key = _one_call(tmp_path, {"path": str(root / ".." / "outside" / "x.txt")})
+    assert ET.writes_outside(path, key, str(root))
+
+
+def test_a_sibling_with_the_root_as_a_name_prefix_is_outside(tmp_path):
+    """root=C:/work のとき C:/work-evil は前方一致するが、中ではない。"""
+    (tmp_path / "work").mkdir()
+    (tmp_path / "work-evil").mkdir()
+    path, key = _one_call(tmp_path, {"path": str(tmp_path / "work-evil" / "x.txt")})
+    assert ET.writes_outside(path, key, str(tmp_path / "work"))
+
+
+def test_a_relative_escape_is_a_candidate(tmp_path):
+    """相対パスは候補にすらなっていなかった。ツールは root 基準で解決する。"""
+    root = tmp_path / "work"
+    root.mkdir()
+    path, key = _one_call(tmp_path, {"path": "../outside/x.txt"})
+    assert ET.writes_outside(path, key, str(root))
+
+
+def test_an_ordinary_write_inside_the_workdir_is_not_flagged(tmp_path):
+    """全部に火が付く検査は、検査が無いのと同じで、うるさい分だけ悪い。"""
+    root = tmp_path / "work"
+    root.mkdir()
+    path, key = _one_call(tmp_path, {"path": str(root / "report.xlsx")})
+    assert ET.writes_outside(path, key, str(root)) == []
+
+
+def test_truncated_arguments_are_reported_as_unread_not_as_clean(tmp_path):
+    """4000字目以降に書かれた宛先は、見落とされるのではなく『問題なし』と報告されていた。"""
+    root = tmp_path / "work"
+    root.mkdir()
+    path, key = _one_call(tmp_path, {"blob": "x" * (ET._MAX_ARG_CHARS + 500)})
+    out = ET.writes_outside(path, key, str(root))
+    assert out and "truncated" in out[0]["path"]
+
+
+def test_a_directly_called_tool_is_recorded_even_without_the_gateway(tmp_path):
+    """トップレベル登録ツールは call_tool を通らない。無害な1件でトレースを『存在』させ、
+    その横で記録されない仕事をする経路が空いていた。"""
+    import asyncio
+
+    from tools.registry import register
+
+    def sample_tool(value: str = "") -> str:
+        """A tool."""
+        return "did " + value
+
+    wrapped = register(sample_tool)
+    path, key = str(tmp_path / "t.jsonl"), "k" * 16
+    os.environ[ET.TRACE_PATH_ENV], os.environ[ET.TRACE_KEY_ENV] = path, key
+    try:
+        asyncio.run(wrapped(value="thing"))
+    finally:
+        os.environ.pop(ET.TRACE_PATH_ENV, None)
+        os.environ.pop(ET.TRACE_KEY_ENV, None)
+    rows = ET.read(path, key)
+    assert [r["tool"] for r in rows] == ["sample_tool"]
+    assert ET.intact(path, key)
+
+
+def test_a_destination_inside_a_shell_command_is_seen(tmp_path):
+    """shell_exec の引数は文字列1つ。値を歩くだけでは、その中の宛先は値ですらない。"""
+    root = tmp_path / "work"
+    root.mkdir()
+    outside = str(tmp_path / "outside" / "leak.txt")
+    path, key = _one_call(tmp_path, {"command": 'copy secret.txt "%s"' % outside})
+    assert ET.writes_outside(path, key, str(root))
+
+
+def test_the_servers_own_file_tools_stay_transparent():
+    """全部を『検証不能』にする検査は、全部を『綺麗』にする検査と同じくらい役に立たない。"""
+    for name in ("read_file", "write_file", "list_directory"):
+        assert not ET.is_opaque(name), "%s まで不透明にしている" % name
+
+
+def test_the_tool_table_is_readable_without_starting_the_server():
+    """判定はサーバ・ベンチ・採点の3プロセスで一致しなければならない。"""
+    assert len(ET._known_tool_names()) > 50

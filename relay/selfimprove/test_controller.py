@@ -10,6 +10,7 @@ import tempfile
 
 import pytest
 
+from relay import provenance as PROV
 from relay.selfimprove import decision as D
 from relay.selfimprove import frozen as F
 from relay.selfimprove import manifest as M
@@ -18,12 +19,20 @@ from relay.selfimprove.controller import EvolutionController
 from relay.selfimprove.ledger import HypothesisLedger
 
 
+#: What these candidates rest on, said out loud. The controller used to supply this for a
+#: caller who omitted it -- asserting, on the caller's behalf, that no external content was
+#: involved. It cannot know that, and the assertion made the provenance check unreachable.
+OWN_MEASUREMENTS = ({"kind": "own_measurements", "authority": PROV.AGENT_INFERENCE,
+                     "note": "this loop's analysis of its own runs"},)
+
+
 def _controller(**kw):
     led = HypothesisLedger(os.path.join(tempfile.mkdtemp(prefix="ctl_"), "h.jsonl"))
     return EvolutionController(ledger=led, **kw)
 
 
 def _run(ctl, result, genome=None, **kw):
+    kw.setdefault("evidence", list(OWN_MEASUREMENTS))
     return ctl.run_candidate(
         genome=genome or {"parameters": {"memory_max_items": 9}},
         hypothesis="more recall should help the steering episodes",
@@ -131,7 +140,7 @@ def test_a_judge_that_changed_before_the_run_stops_everything(monkeypatch):
     called = []
     ctl = _controller()
     out = ctl.run_candidate(genome={}, hypothesis="h", target_failure_class="f",
-                            evaluate=lambda m, e: called.append(1) or _all_gates_pass())
+                            evidence=list(OWN_MEASUREMENTS), evaluate=lambda m, e: called.append(1) or _all_gates_pass())
     assert out["decision"]["state"] == D.INFRA_ABORT
     assert not called, "judge が壊れているのに評価を走らせている"
 
@@ -168,7 +177,8 @@ def test_the_hypothesis_is_written_before_the_evaluator_runs():
         seen["proposal_exists"] = ctl.ledger.proposal_for(exp_id) is not None
         return _all_gates_pass()
 
-    ctl.run_candidate(genome={}, hypothesis="h", target_failure_class="f", evaluate=evaluate)
+    ctl.run_candidate(genome={}, hypothesis="h", target_failure_class="f",
+                      evidence=list(OWN_MEASUREMENTS), evaluate=evaluate)
     assert seen["proposal_exists"] is True
 
 
@@ -187,7 +197,7 @@ def test_an_evaluator_that_raised_is_infra_not_a_rejected_change():
     ctl = _controller()
     out = ctl.run_candidate(
         genome={}, hypothesis="h", target_failure_class="f",
-        evaluate=lambda m, e: (_ for _ in ()).throw(RuntimeError("eval host down")))
+        evidence=list(OWN_MEASUREMENTS), evaluate=lambda m, e: (_ for _ in ()).throw(RuntimeError("eval host down")))
     assert out["decision"]["state"] == D.INFRA_ABORT
     concl = ctl.ledger.conclusions_for(out["experiment_id"])[0]
     assert concl["verdict"] == "infra_abort"
@@ -198,7 +208,7 @@ def test_the_evaluator_is_called_exactly_once():
     calls = []
     ctl = _controller()
     ctl.run_candidate(genome={}, hypothesis="h", target_failure_class="f",
-                      evaluate=lambda m, e: calls.append(1) or _all_gates_pass())
+                      evidence=list(OWN_MEASUREMENTS), evaluate=lambda m, e: calls.append(1) or _all_gates_pass())
     assert len(calls) == 1
 
 
@@ -208,6 +218,7 @@ def test_the_evaluator_receives_the_candidate_not_the_base():
     seen = {}
     ctl = _controller()
     ctl.run_candidate(genome={"parameters": {"max_retries": 7}},
+                      evidence=list(OWN_MEASUREMENTS),
                       hypothesis="h", target_failure_class="f",
                       evaluate=lambda m, e: seen.update(m["parameters"]) or _all_gates_pass())
     assert seen["max_retries"] == 7
@@ -249,3 +260,25 @@ def test_a_working_archive_still_activates(monkeypatch, tmp_path):
     out = _run(ctl, _all_gates_pass())
     assert out["archive_error"] == ""
     assert out["activated"] is True
+
+
+def test_a_proposal_that_cites_nothing_is_refused():
+    """既定値がここを埋めていた -- 呼び出し側の推論について、それを見ることのできない
+    callee が『外部の内容は関与していない』と断言していた。証拠なしの拒否は到達不能だった。"""
+    ctl = _controller()
+    with pytest.raises(Exception) as exc:
+        ctl.run_candidate(genome={}, hypothesis="h", target_failure_class="f",
+                          evaluate=lambda m, e: _all_gates_pass())
+    assert "cites no evidence" in str(exc.value)
+
+
+def test_untrusted_evidence_cannot_justify_a_harness_change():
+    """外部文書は、それが来たタスクに影響してよい。ハーネスを変えてよいわけではない。"""
+    ctl = _controller()
+    with pytest.raises(Exception) as exc:
+        ctl.run_candidate(
+            genome={}, hypothesis="h", target_failure_class="f",
+            evidence=[{"kind": "summarised_document",
+                       "authority": PROV.EXTERNAL_UNTRUSTED}],
+            evaluate=lambda m, e: _all_gates_pass())
+    assert "may not authorise a change to the harness" in str(exc.value)

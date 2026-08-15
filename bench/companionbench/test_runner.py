@@ -21,6 +21,7 @@ import bench.companionbench.agents as A
 from bench.companionbench import runner as R
 from bench.companionbench.episode import Episode, GradeResult
 from bench.companionbench.pools import EVOLUTION, REGISTRY
+from relay import provenance as PROV
 from relay.selfimprove import manifest as M
 from relay.selfimprove import runtime_config as RC
 
@@ -249,6 +250,7 @@ def test_the_evaluator_plugs_into_the_controller(monkeypatch):
     tmp = _tmp()
     ctl = EvolutionController(ledger=HypothesisLedger(os.path.join(tmp, "h.jsonl")))
     out = ctl.run_candidate(
+        evidence=[{"kind": "own_measurements", "authority": PROV.AGENT_INFERENCE}],
         genome={"parameters": {"memory_max_items": 7}},
         hypothesis="more recall helps",
         target_failure_class="missing_evidence",

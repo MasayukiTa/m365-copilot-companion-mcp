@@ -30,6 +30,21 @@ WHAT A RESULT MEANS
 where the text was shorter than the turn's final text. It is a lower bound -- a turn that
 settled correctly might still have been about to change -- and it is measured identically for
 both arms, which is what makes the paired comparison fair even where the label is imperfect.
+
+WHAT THESE TWO ARMS ARE, AND WHAT THEY ARE NOT
+
+They are the two ACCEPTANCE RULES -- generation counting and repeated text -- replayed over
+recorded samples. They are not production's settle predicate, which additionally varies its
+sample count by marker, requires dwell time, skips processing placeholders, and refuses a
+repeat it considers stale. A difference measured here is therefore a difference between the
+rules, not a prediction of the difference between the two builds; the live A/B the plan
+schedules afterwards is what answers that, and this stage exists to decide whether it is
+worth running at all.
+
+The simplification is deliberate rather than incidental. Replaying the full predicate would
+mean reproducing its timing behaviour from a log that records no timing, which would put
+invented dwell values inside the comparison -- and a paired test is only worth running when
+both arms differ in the one thing being tested.
 """
 from __future__ import annotations
 

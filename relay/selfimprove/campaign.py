@@ -27,6 +27,7 @@ the operator asked for it. This module chooses what to TRY; nothing here can kee
 """
 from __future__ import annotations
 
+from relay import provenance as PROV
 from relay.selfimprove import manifest as M
 from relay.selfimprove.controller import EvolutionController
 
@@ -83,43 +84,93 @@ def coordinates(agent=None) -> list:
             if ("components.%s" % c) in covered or ("parameters.%s" % c) in covered]
 
 
+#: What a sweep's proposals rest on, stated rather than left to a default. A coordinate sweep
+#: enumerates the manifest's own declared parameter ranges and measures each one; no external
+#: text enters the choice. The controller no longer fills this in for an absent caller -- it
+#: cannot see the caller's reasoning, and an assertion made on someone else's behalf was
+#: exactly the hole that let untrusted content reach a harness change by saying nothing.
+SWEEP_EVIDENCE = ({
+    "kind": "coordinate_enumeration",
+    "authority": PROV.AGENT_INFERENCE,
+    "note": "the candidates are the manifest's own declared ranges, enumerated; the decision "
+            "between them is this loop's measurement of its own runs",
+},)
+
+
 def sweep(controller: EvolutionController, evaluate, *, base=None, coords=None,
-          agent=None, hypothesis_for=None, on_result=None) -> dict:
+          agent=None, hypothesis_for=None, on_result=None, evidence=None) -> dict:
     """One pass over the coordinates. Returns the winners and every decision reached.
 
     `evaluate` is the controller's evaluator, unchanged. `hypothesis_for(coord, genome)`
     supplies the prediction that has to exist before a candidate runs -- the ledger refuses a
     proposal without one, and this module does not invent them, because a generated
     hypothesis is a sentence rather than a prediction.
+
+    The COMBINED genome is run as a candidate like any other when more than one coordinate
+    wins. An earlier version built it and returned it unevaluated, which meant the one genome
+    most likely to be adopted was the only one in the sweep nobody had measured -- and two
+    changes that each helped alone are precisely the pair that can fight each other.
     """
     base = base or M.base_manifest()
+    evidence = list(evidence or SWEEP_EVIDENCE)
     results, winners = [], {}
 
+    def _run(genome, coord):
+        out = controller.run_candidate(
+            genome=genome,
+            hypothesis=(hypothesis_for or _default_hypothesis)(coord, genome),
+            target_failure_class=coord,
+            evaluate=evaluate,
+            evidence=evidence,
+            base=base,
+        )
+        row = {"coordinate": coord, "genome": genome,
+               "state": out["decision"]["state"], "reason": out["decision"]["reason"],
+               "effect": _effect(out)}
+        results.append(row)
+        if on_result is not None:
+            on_result(row)
+        return row
+
     for coord in (coords or coordinates(agent)):
-        best = None
+        kept = []
         for genome in variants_for(coord, base):
-            out = controller.run_candidate(
-                genome=genome,
-                hypothesis=(hypothesis_for or _default_hypothesis)(coord, genome),
-                target_failure_class=coord,
-                evaluate=evaluate,
-                base=base,
-            )
-            row = {"coordinate": coord, "genome": genome,
-                   "state": out["decision"]["state"], "reason": out["decision"]["reason"]}
-            results.append(row)
-            if on_result is not None:
-                on_result(row)
+            row = _run(genome, coord)
             # KEEP is the only state that may win a coordinate. INCONCLUSIVE is the common
             # outcome and explicitly does not win: carrying an unproven change forward as a
             # winner is how a sweep accumulates noise and calls it progress.
-            if out["decision"]["state"] == "KEEP":
-                best = genome
-        if best is not None:
-            winners[coord] = best
+            if row["state"] == "KEEP":
+                kept.append(row)
+        if kept:
+            # THE BEST MEASURED ONE, not the last enumerated one. Two variants of a
+            # coordinate can both be kept, and taking whichever happened to come last makes
+            # the winner a function of dict ordering rather than of the measurement.
+            winners[coord] = max(kept, key=lambda r: r["effect"])["genome"]
 
-    return {"winners": winners, "results": results,
-            "combined": _combine(winners) if len(winners) > 1 else None}
+    combined, combined_row = None, None
+    if len(winners) > 1:
+        combined = _combine(winners)
+        combined_row = _run(combined, "combined")
+        if combined_row["state"] != "KEEP":
+            # The parts won and the whole did not. That is a real finding and the reason the
+            # combination is not installed on the strength of its parts.
+            combined = None
+
+    return {"winners": winners, "results": results, "combined": combined,
+            "combined_decision": combined_row}
+
+
+def _effect(out) -> float:
+    """How much a kept candidate actually moved, for ranking two winners of one coordinate.
+
+    Falls back to 0.0 rather than guessing: an unranked winner should tie, not invent a lead.
+    """
+    for key in ("effect", "delta", "improvement"):
+        value = (out.get("measurements") or {}).get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    value = (out.get("decision") or {}).get("effect")
+    return float(value) if isinstance(value, (int, float)) else 0.0
 
 
 def _combine(winners) -> dict:

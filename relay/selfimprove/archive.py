@@ -122,7 +122,21 @@ def descriptors(records: Iterable[dict]) -> dict:
 
 
 def cell_key(desc: dict) -> str:
-    """Stable string key for a MAP-Elites cell from a descriptors dict."""
+    """Stable string key for a MAP-Elites cell from a descriptors dict.
+
+    SEMANTIC DESCRIPTORS WIN WHEN THEY ARE PRESENT. The original axes bin by diff size and
+    turn count, which are properties of the EPISODE rather than of the harness, so two
+    genomes that behave completely differently land in one cell and the map keeps one elite
+    at the other's expense. Phase 7 added behavioural axes and stored them under
+    "semantic" -- and this function went on reading the top level, so every row carrying the
+    new descriptors resolved to `empty|empty|none` and the whole archive collapsed into a
+    single cell. A diversity map with one cell reports maximum quality and no diversity, and
+    nothing about that looks like a failure.
+    """
+    semantic = desc.get("semantic")
+    if isinstance(semantic, dict) and semantic:
+        from relay.selfimprove import qd as QD
+        return QD.cell_key(semantic)
     return "%s|%s|%s" % (
         desc.get("diff_bin", "empty"),
         desc.get("turns_bin", "empty"),

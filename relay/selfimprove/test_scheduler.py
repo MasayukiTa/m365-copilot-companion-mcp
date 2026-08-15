@@ -144,3 +144,39 @@ def test_it_never_retries():
     src = inspect.getsource(S.scheduled_run)
     assert "while" not in src and "for _" not in src
     assert "retry" not in src.lower() or "never retries" in src.lower()
+
+
+# ---- round 8: the lock was check-then-write, and nothing called any of this -------------
+
+def test_two_schedulers_cannot_both_take_the_lock(monkeypatch):
+    """lock_held してから open するのは2操作。両方が確認してから両方が書けば、
+    2つとも進む -- ロックが防ぐはずの状況が、最も気づきにくい形で起きる。"""
+    _ok_frozen(monkeypatch)
+    path = _lock()
+    S.take_lock(path)
+    with pytest.raises(S.Blocked):
+        S.take_lock(path)
+
+
+def test_an_abandoned_lock_can_still_be_taken_over(monkeypatch):
+    _ok_frozen(monkeypatch)
+    path = _lock()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"started_at": time.time() - S.STALE_LOCK_S - 60}, fh)
+    assert S.take_lock(path) == path
+
+
+def test_there_is_an_entry_point_a_person_can_run():
+    """テストからしか到達できない段階は、動く機能ではなく設計文書。"""
+    assert callable(getattr(S, "nightly", None))
+    import inspect
+    src = inspect.getsource(S)
+    assert '__main__' in src, "コマンドとして起動できない"
+
+
+def test_the_nightly_run_refuses_rather_than_inventing_an_evaluator():
+    """評価器を捏造して返す夜間実行は、測っていない数字を archive に書く。"""
+    with pytest.raises(Exception) as exc:
+        S._refuse()
+    assert "will not invent one" in str(exc.value)

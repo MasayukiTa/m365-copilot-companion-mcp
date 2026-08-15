@@ -452,11 +452,12 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
         try:
             _out = fn(**(arguments or {}))
             if _trace is not None:
-                _trace.record(name, arguments, True, _out)
+                _trace.record(name, arguments, True, _out, fn)
             return _out
         except Exception as _e:
             if _trace is not None:
-                _trace.record(name, arguments, False, "%s: %s" % (type(_e).__name__, _e))
+                _trace.record(name, arguments, False,
+                              "%s: %s" % (type(_e).__name__, _e), fn)
             return "[call_tool %s error: %s: %s]" % (name, type(_e).__name__, _e)
 
     # critical tools FIRST (survive a front-biased truncation), then fill from the existing order

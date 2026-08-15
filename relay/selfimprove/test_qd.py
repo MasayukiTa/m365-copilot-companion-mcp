@@ -96,3 +96,43 @@ def test_categories_are_grouped_rather_than_one_cell_each():
     assert QD.family_of("filesystem") == QD.family_of("excel") == "documents"
     assert QD.family_of("long_running") == QD.family_of("routing") == "orchestration"
     assert QD.family_of("something_new") == "other"
+
+
+# ---------------------------------------------------------------------------------------
+# Round 8: the descriptors were computed and then not read
+# ---------------------------------------------------------------------------------------
+
+def test_the_archive_uses_the_semantic_descriptors_when_they_are_there():
+    """controller は descriptors["semantic"] に書き、archive.cell_key は最上位を読んでいた。
+    結果、新しい記述子を持つ行は全部 empty|empty|none -- 地図が1セルに潰れる。
+    1セルの多様性地図は『品質最大・多様性ゼロ』と報告し、それは故障に見えない。"""
+    from relay.selfimprove import archive as A
+
+    a = {"semantic": {"strength": "office", "failure_mode": "none", "caution": "safe"}}
+    b = {"semantic": {"strength": "runtime", "failure_mode": "side_effect",
+                      "caution": "acts_without_asking"}}
+    assert A.cell_key(a) != A.cell_key(b)
+    assert A.cell_key(a) != "empty|empty|none"
+
+
+def test_the_old_axes_still_work_for_rows_that_only_have_them():
+    """既存の行を読めなくする移行は、移行ではなく喪失。"""
+    from relay.selfimprove import archive as A
+
+    assert A.cell_key({"diff_bin": "small", "turns_bin": "short",
+                       "dominant_miss": "none"}) == "small|short|none"
+
+
+def test_two_behaviours_do_not_share_a_cell_in_a_real_map():
+    from relay.selfimprove import archive as A
+
+    entries = [
+        {"descriptors": {"semantic": {"strength": "office", "failure_mode": "none",
+                                      "caution": "safe"}},
+         "verdict": "keep", "results": {"pass_at_1": 0.5}},
+        {"descriptors": {"semantic": {"strength": "runtime", "failure_mode": "side_effect",
+                                      "caution": "acts_without_asking"}},
+         "verdict": "keep", "results": {"pass_at_1": 0.9}},
+    ]
+    keys = {A.cell_key(e["descriptors"]) for e in entries}
+    assert len(keys) == 2

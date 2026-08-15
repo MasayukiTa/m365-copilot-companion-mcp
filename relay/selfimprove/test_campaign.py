@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from relay import provenance as PROV
 from relay.selfimprove import campaign as C
 from relay.selfimprove import manifest as M
 
@@ -63,7 +64,11 @@ class _StubController:
         self.states = list(states)
         self.calls = []
 
-    def run_candidate(self, *, genome, hypothesis, target_failure_class, evaluate, base=None):
+    def run_candidate(self, *, genome, hypothesis, target_failure_class, evaluate,
+                      evidence=None, base=None):
+        # The real controller refuses a proposal that cites nothing. A double that accepted
+        # one would let the sweep stop passing evidence without a test noticing.
+        assert evidence, "sweep が証拠なしで候補を出している"
         self.calls.append({"genome": genome, "hypothesis": hypothesis,
                            "coord": target_failure_class})
         state = self.states.pop(0) if self.states else "REJECT"
@@ -98,12 +103,29 @@ def test_the_combination_is_a_candidate_and_not_an_installation():
     combined = C._combine(winners)
     assert combined == {"components": {"memory": "memory/v2"},
                         "parameters": {"memory_max_items": 9}}
-    # it is returned for evaluation, not applied
-    ctl = _StubController(["KEEP", "KEEP"])
+
+    # AND IT IS RUN. This assertion used to be its opposite -- it checked that the sweep did
+    # NOT evaluate the combination -- which fixed in place the one thing wrong with the
+    # phase: the genome most likely to be adopted was the only one nobody had measured.
+    # memory has one variant, memory_max_items has four; the combination is the sixth call.
+    ctl = _StubController(["KEEP"] + ["INCONCLUSIVE"] * 3 + ["KEEP", "KEEP"])
     out = C.sweep(ctl, evaluate=lambda *a, **k: {},
                   coords=["memory", "memory_max_items"])
     assert out["combined"] is not None
-    assert len(ctl.calls) == len(out["results"]), "組み合わせを勝手に走らせている"
+    assert out["combined_decision"]["state"] == "KEEP"
+    assert ctl.calls[-1]["coord"] == "combined"
+    assert ctl.calls[-1]["genome"] == out["combined"], "合成genomeが候補として走っていない"
+
+
+def test_a_combination_whose_parts_won_but_whose_whole_did_not_is_dropped():
+    """個別に効いた2つが互いを打ち消すのは、まさにありふれた結果。
+    部品が勝ったことを根拠に合成を採るなら、測っていないものを採っている。"""
+    ctl = _StubController(["KEEP"] + ["INCONCLUSIVE"] * 3 + ["KEEP", "INCONCLUSIVE"])
+    out = C.sweep(ctl, evaluate=lambda *a, **k: {},
+                  coords=["memory", "memory_max_items"])
+    assert len(out["winners"]) == 2
+    assert out["combined"] is None
+    assert out["combined_decision"]["state"] == "INCONCLUSIVE"
 
 
 def test_a_single_winner_produces_no_combination():

@@ -72,7 +72,50 @@ def register(fn: Callable) -> Callable:
     _REGISTERED.append({"name": fn.__name__, "summary": summary})
     # trace wrapper first (innermost), then offload to a thread so the trace timing also
     # measures the real work and the whole thing runs off-loop.
-    return _to_async(wrap_for_trace(fn))
+    return _to_async(_wrap_for_evidence(wrap_for_trace(fn), fn))
+
+
+def _wrap_for_evidence(wrapped: Callable, original: Callable) -> Callable:
+    """Record DIRECTLY-CALLED tools in the evidence trace.
+
+    The trace was instrumented at the `call_tool` gateway on the reasoning that the gateway
+    is the only point that sees every dispatched call with its real name. That is true of
+    calls that GO THROUGH the gateway -- but a top-level registered tool is invoked by the
+    host without touching it, so a security claim could be certified by a trace holding one
+    innocuous gateway call while the interesting work happened beside it, unrecorded.
+
+    So the recording point is here as well, where every tool passes regardless of how it was
+    reached. `call_tool` itself is skipped: the gateway records the inner tool under its real
+    name, and recording the wrapper too would add an entry saying only "a call was made".
+    """
+    if getattr(original, "__name__", "") == "call_tool":
+        return wrapped
+
+    @functools.wraps(wrapped)
+    def evidence_wrapper(*args, **kwargs):
+        try:
+            from tools import evidence_trace as _trace
+        except Exception:
+            return wrapped(*args, **kwargs)
+        if not _trace.enabled():
+            return wrapped(*args, **kwargs)
+        payload = dict(kwargs)
+        if args:
+            payload["_positional"] = list(args)
+        try:
+            out = wrapped(*args, **kwargs)
+        except Exception as exc:
+            _trace.record(original.__name__, payload, False,
+                          "%s: %s" % (type(exc).__name__, exc), original)
+            raise
+        _trace.record(original.__name__, payload, True, out, original)
+        return out
+
+    try:
+        evidence_wrapper.__signature__ = inspect.signature(wrapped)
+    except (ValueError, TypeError):
+        pass
+    return evidence_wrapper
 
 
 def list_my_tools(filter: Optional[str] = None) -> str:

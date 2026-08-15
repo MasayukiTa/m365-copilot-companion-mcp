@@ -78,18 +78,18 @@ class EvolutionController:
         cand_id = M.harness_id(candidate)
         changed = M.diff(base, candidate)
 
-        # WHAT THIS PROPOSAL IS BUILT ON, declared rather than assumed. A proposer that
-        # cites nothing hides the one thing worth checking: whether the reasoning came from
-        # measurements or from text an attacker wrote into a document that got summarised
-        # into memory. The default says "the optimiser's own inference over its own runs",
-        # which is a legitimate basis for a change; anything read from outside must be
-        # tagged by the caller and will be refused if it is untrusted.
-        evidence = list(evidence or []) or [{
-            "kind": "proposer_inference",
-            "authority": PROV.AGENT_INFERENCE,
-            "note": "no external evidence cited; the proposal rests on the loop's own "
-                    "analysis of its own measurements",
-        }]
+        # WHAT THIS PROPOSAL IS BUILT ON, declared rather than assumed -- and NOT supplied on
+        # the caller's behalf. An earlier version defaulted an absent `evidence` to a record
+        # asserting AGENT_INFERENCE, "no external evidence cited". That is an assertion about
+        # the caller's reasoning made by the callee, which cannot see it, and it converted the
+        # provenance check into a formality: the one route that mattered -- external text
+        # reaching a harness mutation -- was open to anyone who simply passed nothing, and the
+        # refusal for unevidenced proposals downstream became unreachable code.
+        #
+        # So an absent list stays absent, and the check refuses it. A caller whose proposal
+        # really does rest on its own measurements says so; that is one line, and it is the
+        # line that makes the answer mean anything.
+        evidence = list(evidence or [])
 
         experiment_id = EX.new_experiment_id()
         self.ledger.propose(
