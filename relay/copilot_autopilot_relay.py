@@ -619,50 +619,126 @@ def bare_agent_url(url: str) -> str:
 # Only turns already past _SETTLE_TRACE_AFTER_S are recorded, so a healthy turn (which
 # settles in seconds) writes nothing at all. Never raises; a tracing failure must not be
 # able to break a turn.
-_SETTLE_TRACE_AFTER_S = float(os.environ.get("MCP_SETTLE_TRACE_AFTER_S", "60"))
-_SETTLE_TRACE_PATH = os.path.join(".fleet", "settle_trace.jsonl")
-_SETTLE_TRACE_MAX_BYTES = 2_000_000
+#
+# THAT DEFAULT IS RIGHT FOR DEBUGGING AND WRONG FOR MEASUREMENT, and the difference matters
+# enough to have its own mode. The settle-unification plan wants to replay recorded sample
+# sequences through two implementations and compare where each accepted -- and its primary
+# endpoint, truncated capture, is BY DEFINITION an early accept. Those turns settle in
+# seconds and write nothing, so the trace as configured records the opposite population from
+# the one the measurement is about.
+#
+# Three more things stood between the file and a replay, all found by reading the 5,731 lines
+# that had accumulated rather than by reasoning about the code:
+#
+#   * the path was RELATIVE, so it followed whatever cwd the writer had -- the real file was
+#     under scripts/.fleet/, and anything looking in the repo root found nothing;
+#   * it hit the 2 MB cap on 2026-08-11 and then returned silently on every call, so the
+#     trace had been dead for four days and looked merely quiet;
+#   * each line carried text_len and the last 90 characters, with no turn identifier and no
+#     final text -- enough to see that a turn was struggling, not enough to reconstruct its
+#     sample sequence, group lines into turns, or build the ground-truth label the replay
+#     compares against.
+#
+# COLLECT MODE fixes all four for the duration of a recording campaign. It is off by default
+# because a full-text trace of every poll is large and is not what the debugging use wants.
+_SETTLE_TRACE_COLLECT = os.environ.get("MCP_SETTLE_TRACE_COLLECT") == "1"
+_SETTLE_TRACE_AFTER_S = float(os.environ.get(
+    "MCP_SETTLE_TRACE_AFTER_S", "0" if _SETTLE_TRACE_COLLECT else "60"))
+_SETTLE_TRACE_PATH = os.environ.get("MCP_SETTLE_TRACE_PATH") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".fleet",
+    "settle_trace.jsonl")
+_SETTLE_TRACE_MAX_BYTES = int(os.environ.get(
+    "MCP_SETTLE_TRACE_MAX_BYTES", "40000000" if _SETTLE_TRACE_COLLECT else "2000000"))
+#: How many rotated files to keep. Rotating rather than stopping: a tracer that goes quiet at
+#: a size limit is indistinguishable from a tracer that had nothing to say, and this one was
+#: read as the latter for four days.
+_SETTLE_TRACE_KEEP = 5
 _settle_trace_started_at = {}
+_settle_trace_turn = {}
 
 
 def _settle_trace(drv, phase, text, generating, stable_count, stable_since, **extra):
     """Append one line describing why this poll did not settle. Silent before the
-    threshold, and silent on any error."""
+    threshold, and silent on any error.
+
+    In collect mode the line additionally carries a turn id and the full text, which is what
+    makes a recorded run replayable: the sequence of texts a turn went through, grouped, with
+    the last one available as the ground truth the replay scores against.
+    """
     try:
         key = id(drv)
         t0 = _settle_trace_started_at.get(key)
         now = time.time()
         if t0 is None:
             _settle_trace_started_at[key] = now
-            return
+            if not _SETTLE_TRACE_COLLECT:
+                # In collect mode the FIRST poll is the most interesting one -- an early
+                # accept happens there -- so it is recorded rather than used to start a clock.
+                return
+            t0 = now
         age = now - t0
         if age < _SETTLE_TRACE_AFTER_S:
             return
-        try:
-            if os.path.getsize(_SETTLE_TRACE_PATH) > _SETTLE_TRACE_MAX_BYTES:
-                return
-        except OSError:
-            pass
+        _settle_trace_rotate()
         rec = {
             "ts": round(now, 3), "age_s": round(age, 1), "phase": phase,
             "generating": bool(generating), "stable_count": int(stable_count),
             "text_len": len(text or ""), "text_tail": (text or "")[-90:],
             "is_stale_repeat": bool(drv._is_stale_repeat(text or "")),
         }
+        if _SETTLE_TRACE_COLLECT:
+            # WITHOUT THESE THE FILE CANNOT BE REPLAYED. turn_id groups the polls of one turn;
+            # text carries what the predicate actually saw. text_len and a 90-character tail
+            # can show that a turn was struggling and cannot reconstruct what it was deciding
+            # about.
+            rec["turn_id"] = _settle_trace_turn.get(key, "")
+            rec["text"] = text or ""
         rec.update({k: (round(v, 2) if isinstance(v, float) else v)
                     for k, v in extra.items()})
         import json as _json   # this module has no module-level json import
-        os.makedirs(os.path.dirname(_SETTLE_TRACE_PATH), exist_ok=True)
+        os.makedirs(os.path.dirname(_SETTLE_TRACE_PATH) or ".", exist_ok=True)
         with open(_SETTLE_TRACE_PATH, "a", encoding="utf-8") as fh:
             fh.write(_json.dumps(rec, ensure_ascii=False) + chr(10))
     except Exception:
         pass
 
 
-def _settle_trace_reset(drv):
-    """Start a fresh age clock for this driver's next turn."""
+def _settle_trace_rotate():
+    """Roll the file at the size cap instead of going silent. Never raises.
+
+    The previous behaviour returned without writing once the cap was reached, so the trace
+    stopped on 2026-08-11 and every later reader saw a quiet tracer rather than a full one.
+    An empty trace is a legitimate finding in this module -- it is how a fifteen-minute hang
+    was traced to a client bug -- which is exactly why "full" must not look like "empty".
+    """
+    try:
+        if os.path.getsize(_SETTLE_TRACE_PATH) <= _SETTLE_TRACE_MAX_BYTES:
+            return
+    except OSError:
+        return
+    try:
+        oldest = "%s.%d" % (_SETTLE_TRACE_PATH, _SETTLE_TRACE_KEEP)
+        if os.path.exists(oldest):
+            os.remove(oldest)
+        for i in range(_SETTLE_TRACE_KEEP - 1, 0, -1):
+            src, dst = ("%s.%d" % (_SETTLE_TRACE_PATH, i),
+                        "%s.%d" % (_SETTLE_TRACE_PATH, i + 1))
+            if os.path.exists(src):
+                os.replace(src, dst)
+        os.replace(_SETTLE_TRACE_PATH, _SETTLE_TRACE_PATH + ".1")
+    except Exception:
+        pass
+
+
+def _settle_trace_reset(drv, turn_id=""):
+    """Start a fresh age clock for this driver's next turn, and label that turn.
+
+    The label is what lets a recorded file be grouped back into turns. Without it every line
+    is an independent observation and the replay has no sequences to replay.
+    """
     try:
         _settle_trace_started_at[id(drv)] = time.time()
+        _settle_trace_turn[id(drv)] = turn_id or ("t%x" % int(time.time() * 1000))
     except Exception:
         pass
 
