@@ -127,6 +127,15 @@ try:
     # last_response, so every successful run also returned an empty reply.
     first = (res or [{}])[0] if isinstance(res, list) else {}
     out["reply"] = (first.get("last_response") or "") if isinstance(first, dict) else str(res)
+    # THE WORKER'S VERDICT, not only its text. A live run returned an empty reply, no error
+    # and 85 seconds of silence, and there was nothing in the result to say whether the tab
+    # never opened, the turn was refused, or the answer simply did not settle. The reply is
+    # what the grader needs; this is what a HUMAN needs when the grader gets nothing.
+    if isinstance(first, dict):
+        out["worker"] = {k: first.get(k) for k in
+                         ("name", "outcome", "reason", "status", "turns", "cwd",
+                          "refusal_count", "recovery_cause", "recovery_result")}
+        out["transcript_tail"] = (first.get("transcript") or "")[-1500:]
 except Exception as exc:
     out["error"] = "%s: %s" % (type(exc).__name__, exc)
 print("__COMPANIONBENCH_RESULT__ " + json.dumps(out, ensure_ascii=False))
@@ -242,6 +251,19 @@ class FleetAgent:
         # classify it, which is the whole point of its infra/agent distinction.
         if out.get("error"):
             raise FleetContractError("the fleet child failed: %s" % out["error"])
+        # A TURN THAT NEVER STARTED IS INFRASTRUCTURE. The first live run reported outcome
+        # STUCK, reason "conversation tab/composer is closed (dead target)", turns 0 -- the
+        # fleet Edge was sitting on a sign-in screen, so there was no composer to type into.
+        # Without this the adapter returns an empty reply and the grader scores it as a task
+        # the candidate failed, which is the misclassification this whole distinction exists
+        # to prevent: an unusable environment must not look like a worse harness.
+        worker = out.get("worker") or {}
+        if not (out.get("reply") or "").strip() and int(worker.get("turns") or 0) == 0:
+            raise FleetContractError(
+                "the fleet completed no turns (%s: %s) -- the environment could not run the "
+                "episode, which is not evidence about the candidate"
+                % (worker.get("outcome") or "no outcome",
+                   worker.get("reason") or "no reason given"))
         # The per-run attestation is checked here, not only in the preflight: a manifest that
         # was right when we asked and wrong when we ran is exactly the case worth catching.
         got = (out.get("attest") or {}).get("harness_id")
@@ -287,7 +309,15 @@ class FleetAgent:
             raise FleetContractError("the %s child exceeded %ss" % (mode, self.timeout_s))
         for line in (proc.stdout or "").splitlines():
             if line.startswith(RESULT_PREFIX):
-                return json.loads(line[len(RESULT_PREFIX):])
+                out = json.loads(line[len(RESULT_PREFIX):])
+                # THE CHILD'S OWN OUTPUT, KEPT. Everything but the result line was discarded,
+                # so the first live run produced an empty reply, no error, and nothing to
+                # diagnose it with -- the fleet logs its whole turn to stdout and all of it
+                # went in the bin. A failure you cannot read is a failure you cannot fix.
+                out["child_stdout_tail"] = (proc.stdout or "")[-4000:]
+                out["child_stderr_tail"] = (proc.stderr or "")[-2000:]
+                out["child_returncode"] = proc.returncode
+                return out
         raise FleetContractError(
             "the %s child produced no result line (rc=%s); stderr: %s"
             % (mode, proc.returncode, (proc.stderr or "")[-400:]))

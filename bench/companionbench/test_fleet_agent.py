@@ -195,3 +195,29 @@ def test_project_memory_honours_an_explicit_state_root(monkeypatch):
     monkeypatch.setenv(PM.STATE_DIR_ENV, root)
     PM.record_task("テーマ", "作業", "DONE", note="x", authority="MACHINE_VERIFIER")
     assert os.path.isdir(os.path.join(root, "memory"))
+
+
+def test_a_turn_that_never_started_is_refused_rather_than_scored():
+    """実走行で判明: フリート Edge がサインイン画面だと composer が無く、
+    outcome STUCK / turns 0 で空返答が返る。それを『候補が失敗したタスク』と
+    採点したら、使えない環境が『劣ったハーネス』に見える。"""
+    a = _agent(memory_seed=_seed())
+    a._run_child = lambda mode, payload, workdir=None: {
+        "attest": {"harness_id": ""}, "reply": "", "error": "",
+        "worker": {"outcome": "STUCK", "turns": 0,
+                   "reason": "conversation tab/composer is closed (dead target)"},
+    }
+    with pytest.raises(FleetContractError) as exc:
+        a("prompt", tempfile.mkdtemp())
+    assert "completed no turns" in str(exc.value)
+    assert "dead target" in str(exc.value)
+
+
+def test_a_real_answer_is_returned_normally():
+    """締めた結果、成功経路まで拒否していないこと。"""
+    a = _agent(memory_seed=_seed())
+    a._run_child = lambda mode, payload, workdir=None: {
+        "attest": {"harness_id": ""}, "reply": "84", "error": "",
+        "worker": {"outcome": "DONE", "turns": 3, "reason": ""},
+    }
+    assert a("prompt", tempfile.mkdtemp()) == "84"
