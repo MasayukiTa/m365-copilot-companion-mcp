@@ -34,6 +34,46 @@ BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 8765
 
 
+#: The execution targets an adapter may name, and what each one can actually exercise.
+#: "Covered" means a production reader on that target consults the field -- not that the
+#: field exists. A target that names a field it cannot reach reintroduces the defect this
+#: whole mechanism exists to prevent: two arms differing in something nothing reads.
+IN_PROCESS = "in_process/v1"
+IN_PROCESS_FIELDS = frozenset({
+    "components.memory",              # project_memory.MEMORY_VERSIONS dispatches on it
+    "parameters.memory_max_items",    # project_memory.load_notes reads it
+})
+
+#: The fleet target additionally reaches the retry and refuter budgets, because
+#: run_relay_fleet defaults them from the manifest. It is declared here so the contract can
+#: refuse a fleet experiment over a field even the fleet does not read.
+FLEET = "relay_fleet/v1"
+FLEET_FIELDS = IN_PROCESS_FIELDS | frozenset({
+    "parameters.max_retries",         # -> run_relay_fleet max_transient
+    "parameters.max_refute_passes",   # -> run_relay_fleet max_refute (only when refuter=True)
+})
+
+
+def attest_in_process(manifest):
+    """What harness this process actually loaded, and the values it resolved.
+
+    Read back through the ordinary runtime accessors rather than from the manifest that was
+    handed in -- the question is what the CODE sees, and answering it from the argument would
+    make the attestation a tautology.
+    """
+    from relay.selfimprove import manifest as M
+    from relay.selfimprove import runtime_config as RC
+    active = RC.active_manifest(refresh=True)
+    return {
+        "harness_id": M.harness_id(active),
+        "execution_target": IN_PROCESS,
+        "effective": {
+            "memory_version": RC.component("memory"),
+            "memory_max_items": RC.memory_max_items(),
+        },
+    }
+
+
 class SimulatedAgent:
     """A scripted agent for testing the harness itself, never for measuring capability.
 
@@ -42,11 +82,15 @@ class SimulatedAgent:
     given an answer.
     """
 
-    #: This one runs IN THIS PROCESS, so the active manifest set by _ManifestArm genuinely
-    #: governs everything it touches. That is the only reason the flag is true here, and the
-    #: only reason it may be true anywhere: the claim is about the execution mechanism, not
-    #: about intent.
+    #: Runs IN THIS PROCESS, so the active manifest genuinely governs everything it touches.
+    #: The claim is about the execution mechanism, not about intent -- and it is checked
+    #: rather than believed, via attest() below.
     applies_manifest = True
+    execution_target = IN_PROCESS
+    covered_fields = IN_PROCESS_FIELDS
+
+    def attest(self, manifest):
+        return attest_in_process(manifest)
 
     def __init__(self, script=None, default_reply="(no action taken)"):
         self.script = dict(script or {})
@@ -187,19 +231,23 @@ class in_process:
 
         agent = in_process(lambda prompt, workdir: ...)
 
-    The refusal in paired_evaluate defaults to "no", which is right -- but it also means a
-    perfectly valid one-line in-process agent gets turned away unless it can say so. This is
-    the way to say so, and it is deliberately explicit: writing `in_process(...)` around a
-    lambda that actually posts to another machine is a lie somebody has to type.
+    Deliberately explicit: writing `in_process(...)` around a lambda that actually posts to
+    another machine is a lie somebody has to type -- and one the attestation would then catch,
+    because a remote executor cannot report this process's harness id.
     """
 
     applies_manifest = True
+    execution_target = IN_PROCESS
+    covered_fields = IN_PROCESS_FIELDS
 
     def __init__(self, fn):
         self._fn = fn
 
     def __call__(self, prompt, workdir):
         return self._fn(prompt, workdir)
+
+    def attest(self, manifest):
+        return attest_in_process(manifest)
 
 
 def bridge_available(host=BRIDGE_HOST, port=BRIDGE_PORT) -> bool:

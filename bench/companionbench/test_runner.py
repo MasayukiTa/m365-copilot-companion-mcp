@@ -187,7 +187,7 @@ def test_pairing_is_by_episode_identity_not_by_count(monkeypatch):
     for e in eps:
         e._outcome = True
     base = M.base_manifest()
-    cand = M.apply_genome(base, {"parameters": {"max_retries": 4}})
+    cand = M.apply_genome(base, {"parameters": {"memory_max_items": 4}})
     out = R.paired_evaluate(base, cand, agent, tmpdir=_tmp(), min_n=1)
     assert out["on"]["resolved_ids"] == out["off"]["resolved_ids"]
     assert out["gate"]["keep"] is False, "同一結果で keep が出ている"
@@ -211,7 +211,7 @@ def test_an_episode_that_only_one_arm_could_run_is_not_paired(monkeypatch):
 
     _with_episodes(monkeypatch, [_Ep("stable"), Flaky()])
     out = R.paired_evaluate(M.base_manifest(),
-                            M.apply_genome(M.base_manifest(), {"parameters": {"max_retries": 4}}),
+                            M.apply_genome(M.base_manifest(), {"parameters": {"memory_max_items": 4}}),
                             _agent, tmpdir=_tmp(), min_n=1)
     assert "flaky" not in out["paired_ids"]
     assert "stable" in out["paired_ids"]
@@ -220,7 +220,7 @@ def test_an_episode_that_only_one_arm_could_run_is_not_paired(monkeypatch):
 def test_a_bench_where_nothing_ran_is_infra_not_a_verdict(monkeypatch):
     _with_episodes(monkeypatch, [_Ep("x", boom="setup")])
     out = R.paired_evaluate(M.base_manifest(),
-                            M.apply_genome(M.base_manifest(), {"parameters": {"max_retries": 4}}),
+                            M.apply_genome(M.base_manifest(), {"parameters": {"memory_max_items": 4}}),
                             _agent, tmpdir=_tmp(), min_n=1)
     assert out["infra"]["aborted"] is True
 
@@ -228,7 +228,7 @@ def test_a_bench_where_nothing_ran_is_infra_not_a_verdict(monkeypatch):
 def test_the_result_carries_per_instance_sets_for_later_reexamination(monkeypatch):
     _with_episodes(monkeypatch, [_Ep("a"), _Ep("b", outcome=False)])
     out = R.paired_evaluate(M.base_manifest(),
-                            M.apply_genome(M.base_manifest(), {"parameters": {"max_retries": 4}}),
+                            M.apply_genome(M.base_manifest(), {"parameters": {"memory_max_items": 4}}),
                             _agent, tmpdir=_tmp(), min_n=1)
     assert out["on"]["resolved_ids"] == ["a"] and out["on"]["failed_ids"] == ["b"]
     assert out["slice_ids"] == ["a", "b"]
@@ -457,7 +457,7 @@ def test_without_a_salt_the_sentinel_is_unevaluable_not_a_pass(monkeypatch, tmp_
 
     base_m = M.base_manifest()
     out = R.paired_evaluate(base_m, base_m, A.in_process(lambda *_a: ""),
-                            tmpdir=tempfile.mkdtemp(prefix="pe3_"))
+                            tmpdir=tempfile.mkdtemp(prefix="pe3_"), allow_identical=True)
     assert out["sentinel"].get("unevaluable") is True
     from relay.selfimprove import decision as Dec
     d = Dec.decide(gate={"keep": True, "verdict": "keep"}, sentinel=out["sentinel"],
@@ -494,7 +494,7 @@ def test_the_real_bridge_adapter_declares_that_it_cannot():
 def test_an_in_process_agent_is_still_accepted():
     base_m = M.base_manifest()
     out = R.paired_evaluate(base_m, base_m, A.in_process(lambda *_a: ""),
-                            tmpdir=tempfile.mkdtemp(prefix="pe5_"))
+                            tmpdir=tempfile.mkdtemp(prefix="pe5_"), allow_identical=True)
     assert out["gate"] is not None
 
 
@@ -559,3 +559,112 @@ def test_the_sentinel_unevaluable_reason_does_not_name_sealed_episodes():
     import inspect
     src = inspect.getsource(R._sealed_sentinel)
     assert 'join(candidate_only_infra)' not in src
+
+
+# ---- the contract: target + covered fields + attestation ---------------------------------
+
+def test_an_agent_with_no_execution_target_is_refused():
+    """Boolean は約束、これは検査。何を測る対象なのか名乗れないものは受け付けない。"""
+    class _Nameless:
+        applies_manifest = True
+
+        def __call__(self, p, w):
+            return ""
+
+    base_m = M.base_manifest()
+    cand_m = M.apply_genome(base_m, {"parameters": {"memory_max_items": 9}})
+    out = R.paired_evaluate(base_m, cand_m, _Nameless(), tmpdir=tempfile.mkdtemp())
+    assert out["infra"]["aborted"] is True
+    assert "execution target" in out["infra"]["reason"]
+
+
+def test_a_genome_the_target_cannot_exercise_is_refused():
+    """これ単体で元の欠陥を捕まえる: 対象が読まないフィールドだけが違うなら、
+    エージェントが自分をどう申告していようと両腕は同じプログラム。
+    in_process は max_retries を読まない -- それはフリート側の消費者。"""
+    base_m = M.base_manifest()
+    cand_m = M.apply_genome(base_m, {"parameters": {"max_retries": 9}})
+    out = R.paired_evaluate(base_m, cand_m, A.in_process(lambda *_a: ""),
+                            tmpdir=tempfile.mkdtemp())
+    assert out["infra"]["aborted"] is True
+    assert "cannot exercise" in out["infra"]["reason"]
+    assert "parameters.max_retries" in out["infra"]["reason"]
+
+
+def test_an_adapter_that_cannot_attest_is_refused():
+    """『manifest が届いた』を主張ではなく提示させる。"""
+    class _Unattested:
+        applies_manifest = True
+        execution_target = A.IN_PROCESS
+        covered_fields = A.IN_PROCESS_FIELDS
+
+        def __call__(self, p, w):
+            return ""
+
+    base_m = M.base_manifest()
+    cand_m = M.apply_genome(base_m, {"parameters": {"memory_max_items": 9}})
+    out = R.paired_evaluate(base_m, cand_m, _Unattested(), tmpdir=tempfile.mkdtemp())
+    assert out["infra"]["aborted"] is True
+    assert "attest" in out["infra"]["reason"]
+
+
+def test_an_adapter_that_attests_the_wrong_harness_is_refused():
+    """別プロセスに投げているのに in_process を名乗る嘘は、ここで露見する。"""
+    class _Liar:
+        applies_manifest = True
+        execution_target = A.IN_PROCESS
+        covered_fields = A.IN_PROCESS_FIELDS
+
+        def __call__(self, p, w):
+            return ""
+
+        def attest(self, manifest):
+            return {"harness_id": "0" * 64}
+
+    base_m = M.base_manifest()
+    cand_m = M.apply_genome(base_m, {"parameters": {"memory_max_items": 9}})
+    out = R.paired_evaluate(base_m, cand_m, _Liar(), tmpdir=tempfile.mkdtemp())
+    assert out["infra"]["aborted"] is True
+    assert "did not reach the executor" in out["infra"]["reason"]
+
+
+def test_the_attestation_reports_what_the_code_sees_not_what_was_handed_in():
+    """引数から答えたら同語反復。実行時アクセサ経由で読み戻すこと。"""
+    import bench.companionbench.agents as AA
+    from relay.selfimprove import runtime_config as RC
+
+    base_m = M.base_manifest()
+    cand_m = M.apply_genome(base_m, {"parameters": {"memory_max_items": 11}})
+    tmp = tempfile.mkdtemp(prefix="att_")
+    with R._ManifestArm(cand_m, tmp):
+        got = AA.attest_in_process(cand_m)
+    assert got["harness_id"] == M.harness_id(cand_m)
+    assert got["effective"]["memory_max_items"] == 11
+    RC.active_manifest(refresh=True)
+
+
+def test_the_arms_are_interleaved_rather_than_run_end_to_end():
+    """ベース全件→候補全件だと、候補側だけが常に後になる。ライブなモデル相手では
+    負荷や時間帯のドリフトが片腕に丸ごと乗り、候補の効果と見分けがつかない。"""
+    order = []
+
+    class _Recorder:
+        applies_manifest = True
+        execution_target = A.IN_PROCESS
+        covered_fields = A.IN_PROCESS_FIELDS
+
+        def __call__(self, prompt, workdir):
+            from relay.selfimprove import runtime_config as RC
+            order.append(RC.memory_max_items())
+            return ""
+
+        def attest(self, manifest):
+            return A.attest_in_process(manifest)
+
+    base_m = M.apply_genome(M.base_manifest(), {"parameters": {"memory_max_items": 2}})
+    cand_m = M.apply_genome(M.base_manifest(), {"parameters": {"memory_max_items": 8}})
+    R.paired_evaluate(base_m, cand_m, _Recorder(), tmpdir=tempfile.mkdtemp(prefix="il_"))
+    # 交互になっていれば、前半に候補側の値が現れる
+    half = len(order) // 2
+    assert 8 in order[:half], "候補側が全部後半に固まっている(順序交絡)"
+    assert 2 in order[half:]

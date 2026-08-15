@@ -63,6 +63,65 @@ def _grader_version() -> str:
         return "unavailable"
 
 
+def _contract_violation(agent, base_manifest, candidate_manifest,
+                        allow_identical=False) -> str:
+    """Why this agent may not be used for this comparison, or "" if it may.
+
+    A BOOLEAN IS A PROMISE; THIS IS A CHECK. The first version of the gate asked the agent
+    whether it ran under the manifest and believed the answer, which stops an honest caller
+    and nothing else. An adapter now has to name the execution target it drives, enumerate
+    the manifest fields that target can actually exercise, and -- at run time -- report back
+    which harness it loaded. Three things that can be wrong, instead of one that cannot.
+
+    The second check is the one that would have caught the original defect on its own: if the
+    candidate differs from the baseline only in fields the target cannot reach, the two arms
+    ARE the same program, whatever the adapter believes about itself. That is true of
+    BridgeAgent for every field in today's manifest, which is why it is refused -- not
+    because it set a flag to False.
+    """
+    target = getattr(agent, "execution_target", "")
+    if not target:
+        return ("%s names no execution target; without one there is no statement of what "
+                "the manifest is supposed to govern, and both arms may execute the same "
+                "program" % type(agent).__name__)
+
+    covered = frozenset(getattr(agent, "covered_fields", ()) or ())
+    changed = set(M.diff(base_manifest, candidate_manifest))
+    if not changed and not allow_identical:
+        # An A/A run is a legitimate diagnostic -- it is how you check the harness reports no
+        # difference when there is none -- but it has to be asked for. Accepting it silently
+        # is how a null result gets written up as a finding.
+        return ("the candidate manifest is identical to the baseline; there is nothing to "
+                "compare (pass allow_identical=True for a deliberate A/A run)")
+    uncovered = sorted(changed - covered)
+    if uncovered:
+        return ("execution target %s cannot exercise %s -- the candidate differs only in "
+                "fields this target never reads, so both arms would run the same program"
+                % (target, ", ".join(uncovered)))
+    return ""
+
+
+def _attestation_mismatch(agent, manifest, arm) -> str:
+    """Ask the adapter which harness it actually loaded, and refuse a disagreement.
+
+    An adapter that cannot answer is not trusted to have applied anything: `attest` is how a
+    subprocess or a remote executor proves the manifest reached it, rather than asserting it.
+    """
+    attest = getattr(agent, "attest", None)
+    if attest is None:
+        return ("%s provides no attest(); it cannot show that the %s manifest reached the "
+                "code being measured" % (type(agent).__name__, arm))
+    try:
+        got = attest(manifest) or {}
+    except Exception as exc:
+        return "attestation failed on the %s arm: %s: %s" % (arm, type(exc).__name__, exc)
+    expected = M.harness_id(manifest)
+    if got.get("harness_id") != expected:
+        return ("the %s arm loaded harness %s but %s was expected; the manifest did not "
+                "reach the executor" % (arm, str(got.get("harness_id"))[:12], expected[:12]))
+    return ""
+
+
 def run_episode(episode, agent, *, root=None) -> dict:
     """One episode end to end. Never raises -- a crash here is an infra result, not a zero.
 
@@ -401,7 +460,8 @@ class _ManifestArm:
 
 
 def paired_evaluate(base_manifest, candidate_manifest, agent, *, tmpdir,
-                    alpha=0.05, min_n=1, min_pp=0.0, root=None) -> dict:
+                    alpha=0.05, min_n=1, min_pp=0.0, root=None,
+                    allow_identical=False) -> dict:
     """Run both arms over the same episodes and return what the controller decides on.
 
     Returns the gate / security / regression / infra structure decision.decide() expects,
@@ -425,30 +485,45 @@ def paired_evaluate(base_manifest, candidate_manifest, agent, *, tmpdir,
     # honour it -- so the honest action is to refuse rather than produce a number that cannot
     # be attributed to the candidate. An agent declares `applies_manifest = True` only when
     # the manifest genuinely governs its execution.
-    # DEFAULT TO REFUSAL. The first version of this check read
-    # `getattr(agent, "applies_manifest", True)`, so anything without the attribute was
-    # accepted -- including `lambda p, w: bridge(p, w)`, one line, still posting both arms to
-    # the same external process. A gate whose default is "allow" only stops the callers who
-    # were already being careful.
-    if not getattr(agent, "applies_manifest", False):
-        return {
-            "gate": None, "security": None, "regression": None, "sentinel": None,
-            "infra": {"aborted": True,
-                      "reason": "%s does not declare that it runs under the manifest being "
-                                "tested; without that the two arms may execute the same "
-                                "program and the comparison means nothing"
-                                % type(agent).__name__},
-            "slice_ids": [], "paired_ids": [],
-        }
+    refusal = _contract_violation(agent, base_manifest, candidate_manifest,
+                                  allow_identical=allow_identical)
+    if refusal:
+        return {"gate": None, "security": None, "regression": None, "sentinel": None,
+                "infra": {"aborted": True, "reason": refusal},
+                "slice_ids": [], "paired_ids": []}
 
     evolution = REGISTRY.get(EVOLUTION)
     regression = REGISTRY.get(REGRESSION)
     all_eps = evolution + regression
 
+    # ATTEST BEFORE MEASURING. Each arm is asked, inside its own manifest, which harness it
+    # actually loaded; a disagreement aborts rather than producing a number nobody can
+    # attribute.
     with _ManifestArm(base_manifest, tmpdir):
-        base = run_pool(None, agent, root=root, episodes=all_eps)
-    with _ManifestArm(candidate_manifest, tmpdir):
-        cand = run_pool(None, agent, root=root, episodes=all_eps)
+        bad = _attestation_mismatch(agent, base_manifest, "baseline")
+    if not bad:
+        with _ManifestArm(candidate_manifest, tmpdir):
+            bad = _attestation_mismatch(agent, candidate_manifest, "candidate")
+    if bad:
+        return {"gate": None, "security": None, "regression": None, "sentinel": None,
+                "infra": {"aborted": True, "reason": bad},
+                "slice_ids": [e.episode_id for e in all_eps], "paired_ids": []}
+
+    # INTERLEAVED, NOT ALL-BASELINE-THEN-ALL-CANDIDATE. Running one whole arm before the
+    # other puts every candidate episode later in wall-clock time than its pair, so anything
+    # that drifts -- a live model's load, a machine warming up, a quota tightening -- lands
+    # entirely on one arm and is indistinguishable from the candidate's effect. Alternating
+    # the order per episode does not remove drift; it stops drift from having a direction.
+    base_by, cand_by = {}, {}
+    for i, ep in enumerate(all_eps):
+        first, second = ((base_by, base_manifest), (cand_by, candidate_manifest))
+        if i % 2:
+            first, second = second, first
+        for bucket, manifest in (first, second):
+            with _ManifestArm(manifest, tmpdir):
+                bucket[ep.episode_id] = run_pool(None, agent, root=root, episodes=[ep])[0]
+    base = [base_by[e.episode_id] for e in all_eps]
+    cand = [cand_by[e.episode_id] for e in all_eps]
 
     base_part, cand_part = _partition(base), _partition(cand)
 

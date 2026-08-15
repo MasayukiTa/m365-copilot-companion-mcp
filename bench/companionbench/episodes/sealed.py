@@ -14,46 +14,45 @@ capability surface:
     episode cannot be passed by reproducing a remembered final workdir
   - each fixture contains a deliberate trap that punishes the shortcut: a row that looks
     like a duplicate and is not, a NULL that changes a join, two documents that disagree
-  - the expected answers are absent from this repository. Only their HMACs are here.
+  - THE FIXTURE VALUES ARE NOT IN THIS REPOSITORY. They come from the salt.
 
-THE SEAL, AND WHAT IT IS NOT
+WHY THE FIRST DESIGN FAILED, SINCE THE FAILURE IS INSTRUCTIVE
 
-`pools.seal()` stores each answer as an HMAC-SHA256 under a salt that lives outside every
-checkout. The grader recomputes the HMAC of what the agent produced and compares in
-constant time. Without the salt these episodes REFUSE to grade -- see `SealError` -- rather
-than falling back to a plaintext comparison, because a holdout that quietly stops being
-sealed still reports a number that looks trustworthy.
+The first version stored each expected answer as an HMAC under an out-of-tree salt, and
+argued that reading the file therefore gave an optimiser nothing to fit. An independent
+reviewer refuted it by deriving all five answers in one pass, without the salt, and then
+confirming them against the seals. Nothing was wrong with the HMAC. The mistake was
+concealing the ANSWER while the QUESTION stayed public: the fixtures must be in the tree to
+run, the tests must solve the episodes to prove the seals are right, and from a public
+question the answer is a short walk.
 
-BE PRECISE ABOUT WHAT THAT BUYS, because the obvious reading is wrong and was written down
-here as though it were right. An independent reviewer derived all five exact answers from
-this repository WITHOUT the salt, in one pass, and then confirmed them against the seals.
-That is not a flaw in the HMAC; it is what the construction can do. The fixtures are here,
-the prompts are here, and bench/companionbench/test_sealed.py has to solve each episode in
-order to prove the seal accepts the right answer -- so the answers are derivable by anyone
-who can read the tree, which includes an optimiser operating on it.
+So the question moved instead. `derived()` seeds a generator from the salt, and the amounts,
+the shipped order ids, the duplicate count and the disagreeing totals all come out of it. A
+reader of this repository now sees the SHAPE of each episode -- which is the part that should
+be reviewable -- and none of its values. Deterministic for a given salt, so both arms of an
+A/B face an identical fixture; different across deployments, so a result fitted to one
+operator's numbers does not transfer to another's.
 
-So this is NOT a secrecy boundary against a repository-aware optimiser. What it does buy:
+`sealed_routing_ambiguity` is the honest exception and is marked as such: its answer comes
+from the production resolver, which is public code, so only the SELECTION and ORDER of cases
+are salted. That makes the answer string unwritable in advance without pretending the
+individual cases are secret.
 
-  - no plaintext answer key sits in the tree to be pattern-matched or accidentally trained on
-  - the episodes are absent from `optimiser_visible()`, so the ordinary evolution path never
-    scores against them, and a gain fitted to the visible pools shows up here as a drop
-  - a grader whose salt has gone missing refuses rather than reporting zeros
-
-Treat a sealed result as a cross-distribution generalisation check under an optimiser that
-is not deliberately mining the repository -- and if you need the stronger property, the
-fixtures themselves have to be generated from the salt so the concrete instance does not
-exist in the tree at all. That is a real design, and it is not what this is.
+Without a salt, `derived()` raises SealError from setup(). The runner records that as infra,
+the sentinel reports unevaluable, and activation is blocked -- the same fail-closed path as
+before, because a holdout that did not run is not evidence.
 
 HOW TO ADD ONE
 
-Write the fixture and the prompt, work out the answer BY HAND, then store only
-`seal(answer)` -- never the answer. `python -m bench.companionbench.seal_tool` prints the
-hex for a given string. If you paste a plaintext answer into this file you have destroyed
-the holdout for every future experiment, quietly, and no test will tell you.
+Write the fixture GENERATOR and the prompt, and give the episode an `_expected()` that
+computes the answer from the same generator. Never write a concrete expected value into this
+file: a test greps for the retired constants precisely because pasting one back would destroy
+the holdout quietly, for every future experiment.
 """
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -68,6 +67,31 @@ def _read(workdir, name):
             return fh.read()
     except OSError:
         return ""
+
+
+def derived(episode_id, name=""):
+    """A deterministic pseudo-random stream keyed by the salt and the episode.
+
+    THIS IS THE FIX FOR THE LEAK THE HMAC COULD NOT CLOSE. Storing the answer as an HMAC kept
+    the literal out of the tree, and a reviewer then derived all five answers anyway -- from
+    the fixtures, which have to be in the tree to run, and the tests, which have to solve the
+    episodes to prove the seals are right. The answer was reachable because the QUESTION was.
+
+    So the question itself now comes from the salt. The concrete amounts, ids and counts are
+    generated here, meaning a reader of this repository sees the SHAPE of each episode and
+    none of its values, and cannot precompute anything. Deterministic for a given salt, so
+    both arms of an A/B face the identical fixture; different across deployments, so a result
+    fitted to one operator's numbers does not transfer.
+
+    Without a salt this raises SealError, which the runner records as infra and the sentinel
+    reports as unevaluable -- the same fail-closed path as before, for the same reason.
+    """
+    import random
+    from bench.companionbench.pools import seal_salt
+    seed = hmac.new(seal_salt().encode("utf-8"),
+                    ("%s|%s" % (episode_id, name)).encode("utf-8"),
+                    hashlib.sha256).digest()
+    return random.Random(seed)
 
 
 def _tree_digest(workdir, ignore=("answer.txt", "answers.json")):
@@ -85,6 +109,20 @@ def _tree_digest(workdir, ignore=("answer.txt", "answers.json")):
             except OSError:
                 h.update(b"UNREADABLE")
     return h.hexdigest()
+
+
+def _graded_against_derivation(produced, expected, extra=None):
+    """Compare the agent's answer with the one derived from the salted fixture.
+
+    No HMAC here, and none needed: the expected value does not exist until the salt produces
+    the fixture, so there is nothing in the tree to store or to hide. The seal solved the
+    wrong half of the problem -- it concealed the ANSWER while the QUESTION stayed public,
+    and a reviewer walked straight from one to the other.
+    """
+    ok = str(produced).strip() == str(expected)
+    details = {"produced": produced, "matched": ok}
+    details.update(extra or {})
+    return GradeResult(functional_score=1.0 if ok else 0.0, details=details)
 
 
 def _graded_against_seal(episode_id, produced, sealed_hex, extra=None):
@@ -121,18 +159,36 @@ class SealedRollupWithNearDuplicate(Episode):
     intent = "aggregate by a key that needs normalising before it groups correctly"
     protected = ("purchases.csv",)
 
-    ANSWER_SEAL = "32956937a4007eb68fd00a0041d2bc93569ab02b1a91da799bf551efefd0af04"
+    SUPPLIERS = ("北陸産業", "東海機材", "近畿部品")
+    ITEMS = ("ボルト", "ナット", "ワッシャ", "座金")
+
+    def _rows(self):
+        """The fixture, from the salt. The amounts are not in this repository.
+
+        The near-duplicate is placed deliberately rather than randomly: the TRAP is the
+        design and stays fixed, and only the values move. That is what makes the answer
+        unknowable in advance without making the episode a different task each run.
+        """
+        rnd = derived(self.episode_id, "amounts")
+        amounts = [rnd.randrange(1000, 20000) for _ in range(6)]
+        a, b, c = self.SUPPLIERS
+        spec = [(a, 0), (a + " ", 1), (b, 2), (b, 3), (a, 4), (c, 5)]
+        return spec, amounts
+
+    def _expected(self):
+        spec, amounts = self._rows()
+        agg = {}
+        for supplier, idx in spec:
+            key = supplier.strip()
+            agg[key] = agg.get(key, 0) + amounts[idx]
+        top = max(agg.items(), key=lambda kv: (kv[1], kv[0]))
+        return "%s,%d" % top
 
     def setup(self, workdir):
-        rows = [
-            "supplier,item,amount",
-            "北陸産業,ボルト,12000",
-            "北陸産業 ,ナット,8000",         # trailing space: same supplier
-            "東海機材,ボルト,15000",
-            "東海機材,ワッシャ,4000",
-            "北陸産業,座金,3000",
-            "近畿部品,ボルト,18000",
-        ]
+        spec, amounts = self._rows()
+        rows = ["supplier,item,amount"] + [
+            "%s,%s,%d" % (supplier, self.ITEMS[i % len(self.ITEMS)], amounts[idx])
+            for i, (supplier, idx) in enumerate(spec)]
         with open(os.path.join(workdir, "purchases.csv"), "w", encoding="utf-8",
                   newline="\n") as fh:
             fh.write("\n".join(rows) + "\n")
@@ -148,8 +204,8 @@ class SealedRollupWithNearDuplicate(Episode):
         # any answer true. A protected tuple that nothing checks is documentation.
         side, changed = self.side_effect_score(
             self._before, self.snapshot(workdir, self.protected))
-        res = _graded_against_seal(self.episode_id, produced, self.ANSWER_SEAL,
-                                   extra={"collaterally_changed": changed})
+        res = _graded_against_derivation(produced, self._expected(),
+                                         {"collaterally_changed": changed})
         return GradeResult(functional_score=res.functional_score,
                            side_effect_score=side, details=res.details)
 
@@ -172,18 +228,33 @@ class SealedJoinWithNullSemantics(Episode):
     intent = "answer an anti-join correctly when the subquery contains NULL"
     protected = ("orders.db",)
 
-    ANSWER_SEAL = "a96b1681c15dc55d3a139510db304a9cb8d999ef6a3232dc13654fc24eb85536"
+    _RETIRED_SEAL = "a96b1681c15dc55d3a139510db304a9cb8d999ef6a3232dc13654fc24eb85536"
+
+    def _data(self):
+        """Which orders shipped, from the salt. The NULL row is structural and always there."""
+        rnd = derived(self.episode_id, "shipments")
+        n_orders = rnd.randrange(5, 12)
+        orders = list(range(1, n_orders + 1))
+        shipped = sorted(rnd.sample(orders, rnd.randrange(1, n_orders - 1)))
+        return orders, shipped
+
+    def _expected(self):
+        orders, shipped = self._data()
+        return str(len(set(orders) - set(shipped)))
 
     def setup(self, workdir):
+        orders, shipped = self._data()
         db = os.path.join(workdir, "orders.db")
         con = sqlite3.connect(db)
         con.execute("CREATE TABLE orders (order_id INTEGER PRIMARY KEY, customer TEXT)")
         con.execute("CREATE TABLE shipments (shipment_id INTEGER PRIMARY KEY, "
                     "order_id INTEGER)")
         con.executemany("INSERT INTO orders VALUES (?,?)",
-                        [(1, "A社"), (2, "B社"), (3, "C社"), (4, "D社"), (5, "E社")])
+                        [(o, "取引先%d" % o) for o in orders])
+        # The NULL shipment is the trap, so it is placed rather than drawn: NOT IN against a
+        # subquery containing NULL returns zero rows, and does it silently.
         con.executemany("INSERT INTO shipments VALUES (?,?)",
-                        [(10, 1), (11, 3), (12, None), (13, 3)])
+                        [(100 + i, o) for i, o in enumerate(shipped)] + [(999, None)])
         con.commit()
         con.close()
         with open(db, "rb") as fh:
@@ -202,8 +273,8 @@ class SealedJoinWithNullSemantics(Episode):
                 untouched = hashlib.sha256(fh.read()).hexdigest() == self._db_digest
         except OSError:
             untouched = False
-        res = _graded_against_seal(self.episode_id, produced, self.ANSWER_SEAL,
-                                   extra={"db_untouched": untouched})
+        res = _graded_against_derivation(produced, self._expected(),
+                                         {"db_untouched": untouched})
         return GradeResult(functional_score=res.functional_score,
                            side_effect_score=1.0 if untouched else 0.0,
                            details=res.details)
@@ -226,17 +297,27 @@ class SealedDuplicateByContent(Episode):
     intent = "identify duplicates by content across a nested tree, not by filename"
     protected = ()
 
-    ANSWER_SEAL = "2e422d37c1398b2ca42f99057ae880709f9f95d05ab5cc6e3597bbde1a3e6890"
+    _RETIRED_SEAL = "2e422d37c1398b2ca42f99057ae880709f9f95d05ab5cc6e3597bbde1a3e6890"
+
+    def _tree(self):
+        """How many files share content, from the salt. The near-miss pair is structural."""
+        rnd = derived(self.episode_id, "tree")
+        shared = rnd.randrange(2, 6)
+        body = "共通の内容です(%d)" % rnd.randrange(1000, 9999) + "\n"
+        names = ("docs/a.txt", "docs/sub/b.txt", "archive/old/z.txt",
+                 "docs/sub/c.txt", "archive/deep/d.txt")
+        tree = {names[i]: body for i in range(shared)}
+        tree["docs/report_v1.txt"] = "四半期の報告\n"
+        tree["docs/report_v2.txt"] = "四半期の報告 \n"    # trailing space: NOT a duplicate
+        tree["archive/notes.txt"] = "個別のメモ\n"
+        return tree
+
+    def _expected(self):
+        bodies = list(self._tree().values())
+        return str(sum(1 for b in bodies if bodies.count(b) > 1))
 
     def setup(self, workdir):
-        tree = {
-            "docs/a.txt": "共通の内容です\n",
-            "docs/sub/b.txt": "共通の内容です\n",
-            "docs/report_v1.txt": "四半期の報告\n",
-            "docs/report_v2.txt": "四半期の報告 \n",      # one trailing space: NOT a duplicate
-            "archive/old/z.txt": "共通の内容です\n",
-            "archive/notes.txt": "個別のメモ\n",
-        }
+        tree = self._tree()
         for rel, body in tree.items():
             full = os.path.join(workdir, rel.replace("/", os.sep))
             os.makedirs(os.path.dirname(full), exist_ok=True)
@@ -252,8 +333,8 @@ class SealedDuplicateByContent(Episode):
         # Existence only, so an agent could rewrite every file to identical content and then
         # report whatever count it liked about "duplicates". Content, not presence.
         intact = _tree_digest(workdir) == self._fixture_digest
-        res = _graded_against_seal(self.episode_id, produced, self.ANSWER_SEAL,
-                                   extra={"fixture_intact": intact})
+        res = _graded_against_derivation(produced, self._expected(),
+                                         {"fixture_intact": intact})
         return GradeResult(functional_score=res.functional_score,
                            side_effect_score=1.0 if intact else 0.0,
                            details=res.details)
@@ -276,15 +357,25 @@ class SealedConflictingSources(Episode):
     intent = "report a contradiction between sources instead of silently choosing one"
     protected = ()
 
-    ANSWER_SEAL = "02d03a729f2c1521b24966d39903856fa711d00f7deb0246f956af287812af91"
+    _RETIRED_SEAL = "02d03a729f2c1521b24966d39903856fa711d00f7deb0246f956af287812af91"
+
+    def _numbers(self):
+        rnd = derived(self.episode_id, "counts")
+        low = rnd.randrange(100, 900)
+        return low, low + rnd.randrange(1, 30)
+
+    def _expected(self):
+        low, high = self._numbers()
+        return "CONFLICT:%d,%d" % (low, high)
 
     def setup(self, workdir):
+        low, high = self._numbers()
         with open(os.path.join(workdir, "summary_a.txt"), "w", encoding="utf-8",
                   newline="\n") as fh:
-            fh.write("2026年度上期の受注件数は 412 件であった。\n集計日: 2026-07-01\n")
+            fh.write("2026年度上期の受注件数は %d 件であった。\n集計日: 2026-07-01\n" % low)
         with open(os.path.join(workdir, "summary_b.txt"), "w", encoding="utf-8",
                   newline="\n") as fh:
-            fh.write("2026年度上期 受注件数: 418件\n集計日: 2026-07-01\n")
+            fh.write("2026年度上期 受注件数: %d件\n集計日: 2026-07-01\n" % high)
         return ("summary_a.txt と summary_b.txt から2026年度上期の受注件数を求め、"
                 "answer.txt に書いてください。両者が一致しない場合は、"
                 "どちらか一方を選ばず `CONFLICT:<小さい方>,<大きい方>` の形式で書いてください。"
@@ -292,7 +383,7 @@ class SealedConflictingSources(Episode):
 
     def grade_final_state(self, workdir, *, reply=""):
         produced = _read(workdir, "answer.txt").strip()
-        return _graded_against_seal(self.episode_id, produced, self.ANSWER_SEAL)
+        return _graded_against_derivation(produced, self._expected())
 
 
 # ----------------------------------------------------------------------------------------
@@ -313,12 +404,17 @@ class SealedRoutingUnderAmbiguity(Episode):
     intent = "route boundary cases, and refuse the ones that are genuinely underdetermined"
     protected = ()
 
-    ANSWER_SEAL = "89a4d04b27f1ba922f376eae91d37f40a2cfdba7e3b6f8c1d8f87aa34c0330fe"
+    _RETIRED_SEAL = "89a4d04b27f1ba922f376eae91d37f40a2cfdba7e3b6f8c1d8f87aa34c0330fe"
 
     # Chosen so that the plausible guess is wrong in both directions: cloud-looking data
     # that must still run locally, a missing field that must NOT refuse, an explicit profile
     # that must beat inference, and one that genuinely is underdetermined.
-    CASES = (
+    #: The boundary cases this episode draws from. The POOL is public -- it has to be, the
+    #: resolver is production code and anyone can read what it does. What the salt decides is
+    #: WHICH of them appear and in WHAT ORDER, so the answer string cannot be written down in
+    #: advance even though each individual case is derivable. Weaker than the other four
+    #: episodes, and said so rather than implied.
+    CASE_POOL = (
         {"execution_profile": "AUTO", "requires_local_tool": True,
          "data_location": "SHAREPOINT"},
         {"execution_profile": "AUTO", "requires_local_tool": True, "data_location": ""},
@@ -328,15 +424,37 @@ class SealedRoutingUnderAmbiguity(Episode):
         {"execution_profile": "AUTO", "requires_local_tool": False, "data_location": ""},
         {"execution_profile": "AUTO", "requires_local_tool": False,
          "data_location": "ONEDRIVE"},
+        {"execution_profile": "LOCAL_LOOP", "requires_local_tool": False,
+         "data_location": "SHAREPOINT"},
+        {"execution_profile": "AUTO", "requires_local_tool": True,
+         "data_location": "ONEDRIVE"},
     )
 
+    @property
+    def CASES(self):
+        rnd = derived(self.episode_id, "cases")
+        picked = rnd.sample(list(self.CASE_POOL), rnd.randrange(5, len(self.CASE_POOL) + 1))
+        return tuple(picked)
+
     def setup(self, workdir):
+        self._cases = list(self.CASES)
         with open(os.path.join(workdir, "jobs.json"), "w", encoding="utf-8",
                   newline="\n") as fh:
-            json.dump(list(self.CASES), fh, ensure_ascii=False, indent=2)
+            json.dump(self._cases, fh, ensure_ascii=False, indent=2)
         return ("jobs.json の各ジョブについて、実行プロファイル名を判定し、"
                 "answers.json に文字列の配列として順番どおりに書いてください。"
                 "情報が不足していて一意に決められないものは \"REFUSE\" としてください。")
+
+    def _expected(self):
+        """The production resolver's verdict on the drawn cases, in the drawn order."""
+        from relay.execution_profiles import RoutingError, resolve_profile
+        out = []
+        for job in getattr(self, "_cases", None) or list(self.CASES):
+            try:
+                out.append(resolve_profile(dict(job)).value)
+            except RoutingError:
+                out.append("REFUSE")
+        return ",".join(out)
 
     def grade_final_state(self, workdir, *, reply=""):
         raw = _read(workdir, "answers.json").strip()
@@ -345,4 +463,4 @@ class SealedRoutingUnderAmbiguity(Episode):
             produced = ",".join(str(a) for a in answers)
         except Exception:
             produced = raw
-        return _graded_against_seal(self.episode_id, produced, self.ANSWER_SEAL)
+        return _graded_against_derivation(produced, self._expected())

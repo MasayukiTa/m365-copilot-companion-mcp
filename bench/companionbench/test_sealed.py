@@ -61,18 +61,34 @@ def test_the_optimiser_cannot_see_the_sealed_pool():
     assert sealed and not (visible & sealed)
 
 
-def test_no_plaintext_answer_is_stored_in_the_source():
-    """答えを直接書いた瞬間に holdout は静かに死ぬ。テストで気づけるようにしておく。"""
+def test_the_question_itself_comes_from_the_salt():
+    """答えを HMAC で隠しても、問いが公開なら答えは導出される -- 実際に導出された。
+    値そのものを salt から作るのが本来の修正。各エピソードは _expected() を持ち、
+    salt が無ければ導出できないこと。"""
+    for ep in REGISTRY.get(SEALED):
+        if ep.episode_id == "sealed_routing_ambiguity":
+            continue        # 本番 resolver が答えなので、値ではなく手続きが答え
+        assert hasattr(ep, "_expected"), "%s が派生式を持たない" % ep.episode_id
+
+
+def test_the_derivation_differs_between_salts(monkeypatch):
+    """同じ salt では同じ問い(A/B の両腕が同一フィクスチャ)、違う salt では違う問い。"""
+    ep = _ep("sealed_conflicting_sources")
+    monkeypatch.setenv(SALT_ENV, "salt-one")
+    first = ep._expected()
+    assert ep._expected() == first, "同一 salt で問いが揺れている -- A/B が成立しない"
+    monkeypatch.setenv(SALT_ENV, "salt-two")
+    assert ep._expected() != first, "salt を変えても同じ問い -- 派生していない"
+
+
+def test_no_fixture_value_is_hardcoded_in_the_source():
+    """派生に移したエピソードの具体値がソースに残っていないこと。
+    片方だけ直すと、残った定数が答えを教える。"""
     src = open(os.path.join(os.path.dirname(__file__), "episodes", "sealed.py"),
                encoding="utf-8").read()
-    for ep in REGISTRY.get(SEALED):
-        seal_hex = ep.ANSWER_SEAL
-        assert len(seal_hex) == 64 and all(c in "0123456789abcdef" for c in seal_hex), \
-            "%s の ANSWER_SEAL が HMAC hex でない" % ep.episode_id
+    for retired in ("12000", "8000", "15000", "18000", "412", "418"):
+        assert retired not in src, "旧フィクスチャの値 %s がソースに残っている" % retired
     assert "PLACEHOLDER" not in src
-    # the seals must all differ: identical hexes would mean the domain separation is absent
-    hexes = [ep.ANSWER_SEAL for ep in REGISTRY.get(SEALED)]
-    assert len(set(hexes)) == len(hexes)
 
 
 # ---- honest solutions pass ---------------------------------------------------------------
@@ -225,8 +241,12 @@ def test_refusing_everything_does_not_pass_routing():
 
 # ---- and it refuses rather than scoring zero ---------------------------------------------
 
-def test_a_missing_salt_raises_rather_than_scoring_zero(monkeypatch, tmp_path):
-    """salt が無いのに 0.0 を記録すると『全滅した候補』に見える。測定ではないので拒否する。"""
+def test_a_missing_salt_refuses_rather_than_scoring_zero(monkeypatch, tmp_path):
+    """salt が無いのに 0.0 を記録すると『全滅した候補』に見える。測定ではないので拒否する。
+
+    派生フィクスチャでは拒否の位置が setup に移った -- 問いを作る時点で salt が要るので。
+    runner はこれを infra として記録し、sentinel は unevaluable になる。どちらも
+    「走らなかった holdout を根拠に有効化しない」という同じ帰結。"""
     import bench.companionbench.pools as P
 
     monkeypatch.delenv(SALT_ENV, raising=False)
@@ -235,10 +255,35 @@ def test_a_missing_salt_raises_rather_than_scoring_zero(monkeypatch, tmp_path):
 
     ep = _ep("sealed_conflicting_sources")
     with EpisodeRun(ep) as run:
-        ep.setup(run.workdir)
-        _w(run.workdir, "answer.txt", "whatever")
         with pytest.raises(SealError):
-            ep.grade_final_state(run.workdir)
+            ep.setup(run.workdir)
+
+
+def test_a_salt_less_machine_reports_infra_not_a_failed_candidate():
+    """拒否が候補の失点になっていないこと -- なっていれば holdout が候補を殺す装置になる。"""
+    import bench.companionbench.pools as P
+    import tempfile as _tf
+
+    from bench.companionbench.runner import run_episode
+
+    ep = _ep("sealed_conflicting_sources")
+    prev_env = os.environ.get(SALT_ENV)
+    prev_file = os.environ.get(SALT_FILE_ENV)
+    prev_default = P.DEFAULT_SALT_FILE
+    os.environ.pop(SALT_ENV, None)
+    os.environ[SALT_FILE_ENV] = os.path.join(_tf.mkdtemp(), "absent")
+    P.DEFAULT_SALT_FILE = os.path.join(_tf.mkdtemp(), "absent")
+    try:
+        res = run_episode(ep, lambda _p, _w: "")
+    finally:
+        P.DEFAULT_SALT_FILE = prev_default
+        os.environ.pop(SALT_FILE_ENV, None)
+        if prev_env is not None:
+            os.environ[SALT_ENV] = prev_env
+        if prev_file is not None:
+            os.environ[SALT_FILE_ENV] = prev_file
+    assert res["infra_failure"] is True
+    assert res["success"] is False
 
 
 # ---- round 4: the sealed episodes must enforce their own prompts -------------------------

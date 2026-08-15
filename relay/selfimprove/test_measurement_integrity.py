@@ -347,7 +347,8 @@ def test_the_runner_supplies_what_the_archive_records():
     from relay.selfimprove import manifest as MM
 
     base = MM.base_manifest()
-    out = R.paired_evaluate(base, base, A.in_process(lambda *_a: ""),
+    cand = MM.apply_genome(base, {"parameters": {"memory_max_items": 9}})
+    out = R.paired_evaluate(base, cand, A.in_process(lambda *_a: ""),
                             tmpdir=_tf.mkdtemp(prefix="pefull_"))
     for key in ("candidate_results", "baseline_results", "pools", "agent",
                 "grader_version", "latency_s"):
