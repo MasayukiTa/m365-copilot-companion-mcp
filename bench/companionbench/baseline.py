@@ -185,8 +185,20 @@ def report(result) -> str:
     lines += ["", "security  %d/%d clean   coverage %s"
               % (sec["clean"], sec["total"], json.dumps(sec["coverage"]))]
 
-    if t["failed_ids"]:
-        lines += ["", "failed:  " + ", ".join(t["failed_ids"])]
+    failures = [r for r in result.get("rows", [])
+                if not r.get("success") and not r.get("infra_failure")]
+    if failures:
+        # WHAT THE GRADER SAW, not just which ids failed. Each grader records its own keys --
+        # `target_updated`, `collaterally_changed`, whatever that episode is about -- and an
+        # earlier version of this report looked only for `details.reason`, which almost none
+        # of them set. So every failure printed as a bare id and the run said what broke
+        # without saying anything about why, which is most of the value of a baseline.
+        lines += ["", "failures", ""]
+        for row in failures:
+            detail = ", ".join("%s=%s" % (k, v)
+                               for k, v in sorted((row.get("details") or {}).items())
+                               if v not in ((), [], {}, "", None)) or "(grader recorded no detail)"
+            lines.append("  %-28s %s" % (row["episode_id"], detail[:110]))
     if t["infra_ids"]:
         lines += ["infra:   " + ", ".join(t["infra_ids"]),
                   "",
