@@ -199,3 +199,77 @@ def test_no_placeholder_empty_slice_remains_in_the_source():
     import inspect
     src = inspect.getsource(l2.run_iteration)
     assert "slice_ids=[]," not in src
+
+
+# ---- an instance the grader never mentioned at all ------------------------------------
+
+def test_a_target_the_grader_never_judged_is_infra_not_a_silent_disappearance():
+    """独立レビューの指摘: 結果ファイルに行が無い instance はどの集合にも入らず、
+    会計から消えていた。分母が黙って縮むと『半分しか走らなかった arm』が
+    『走った arm』と同じ顔をする。"""
+    import json as _json
+    import tempfile as _tf
+
+    from relay.selfimprove import loop
+
+    d = _tf.mkdtemp(prefix="ga_")
+    targets = os.path.join(d, "t.txt")
+    with open(targets, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("inst-01\ninst-02\ninst-03\ninst-04\n")
+    results = os.path.join(d, "grade_results.jsonl")
+    with open(results, "w", encoding="utf-8", newline="\n") as fh:
+        for iid, verdict in (("inst-01", "RESOLVED"), ("inst-02", "not"),
+                             ("inst-03", "EVALERR")):
+            fh.write(_json.dumps({"runid": "R", "instance_id": iid,
+                                  "verdict": verdict}) + "\n")
+        # inst-04 は一行も無い -- グレーダが触れなかった
+
+    orig_run, orig_results = loop.subprocess.run, loop.GRADE_RESULTS
+    loop.subprocess.run = lambda *a, **k: None
+    loop.GRADE_RESULTS = results
+    try:
+        resolved, graded, failed, infra = loop._grade_arm(d, targets, "ds", "R")
+    finally:
+        loop.subprocess.run, loop.GRADE_RESULTS = orig_run, orig_results
+
+    assert resolved == {"inst-01"}
+    assert failed == {"inst-02"}
+    assert infra == {"inst-03", "inst-04"}, "触れられなかった inst-04 が infra でない"
+    assert graded == 2, "判定されていないものを graded に数えてはいけない"
+
+
+def test_no_result_file_makes_every_target_infra_not_zero_failures():
+    import tempfile as _tf
+
+    from relay.selfimprove import loop
+
+    d = _tf.mkdtemp(prefix="ga2_")
+    targets = os.path.join(d, "t.txt")
+    with open(targets, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("inst-01\ninst-02\n")
+
+    orig_run, orig_results = loop.subprocess.run, loop.GRADE_RESULTS
+    loop.subprocess.run = lambda *a, **k: None
+    loop.GRADE_RESULTS = os.path.join(d, "nope.jsonl")
+    try:
+        resolved, graded, failed, infra = loop._grade_arm(d, targets, "ds", "R")
+    finally:
+        loop.subprocess.run, loop.GRADE_RESULTS = orig_run, orig_results
+
+    assert graded == 0 and not resolved and not failed
+    assert infra == {"inst-01", "inst-02"}
+
+
+def test_a_deleted_sentinel_file_is_unevaluable_not_unconfigured():
+    """sentinel.json を消すだけで tripwire が黙って外れていた。
+    パスを渡した呼び出し側は『検査してほしい』と言っている。"""
+    import tempfile as _tf
+
+    with _tf.TemporaryDirectory() as d:
+        res = _run(_report(on_resolved=list(SLICE), off_resolved=list(SLICE)[:1]),
+                   sentinel_path=os.path.join(d, "sentinel_deleted.json"),
+                   auto_commit=True,
+                   archive_path=os.path.join(d, "a.jsonl"))
+
+    assert res["final_keep"] is False, "canary が消えたまま auto_commit を許した"
+    assert any("missing" in (nt or "") for nt in res["notes"]), res["notes"]

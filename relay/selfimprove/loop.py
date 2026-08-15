@@ -135,6 +135,20 @@ def _grade_arm(preds_dir, targets_file, dataset, run_id, max_wait_min=200):
         # judge these three".
         infra = {i for i, v in latest.items() if v not in ("RESOLVED", "not")}
         graded = len(resolved) + len(failed)
+
+    # A TARGET THE GRADER NEVER MENTIONED. The classification above can only see instances
+    # that produced a line, so an instance the grader skipped entirely -- the run died
+    # partway, the prediction file was never written, the id was dropped in transit -- was
+    # in none of the three sets and vanished from the accounting. It has to land somewhere,
+    # and the only honest place is infra: we do not know how it would have gone, and
+    # silently shrinking the denominator is how an arm that half-ran looks like an arm that
+    # ran. This also covers GRADE_RESULTS being absent, where every target is unjudged.
+    try:
+        with open(targets_file, encoding="utf-8") as fh:
+            targets = {ln.strip() for ln in fh if ln.strip()}
+    except OSError:
+        targets = set()
+    infra |= (targets - resolved - failed - infra)
     return resolved, graded, failed, infra
 
 

@@ -197,9 +197,17 @@ def run_iteration(*, toggle, n, dataset_key="Verified", auto_commit=False,
     if off_resolved_ids is None:
         off_resolved_ids = ((report.get("off") or {}).get("resolved_ids"))
 
-    sentinel_configured = bool(sentinel_path) and os.path.isfile(sentinel_path)
+    # "NO SENTINEL WAS ASKED FOR" AND "THE SENTINEL WE ASKED FOR IS GONE" ARE DIFFERENT FACTS.
+    # Both used to land in the same branch -- not configured, gate-only -- so deleting
+    # sentinel.json silently removed the tripwire and every subsequent run reported a clean
+    # gate-only pass. A caller that named a path is a caller that wanted the canary checked;
+    # its absence is the unevaluable case, not the unconfigured one.
+    sentinel_requested = bool(sentinel_path)
+    sentinel_configured = sentinel_requested and os.path.isfile(sentinel_path)
     sentinel_unevaluable = ""
-    if sentinel_configured and on_resolved_ids is not None:
+    if sentinel_requested and not sentinel_configured:
+        sentinel_unevaluable = "configured sentinel file is missing: %s" % sentinel_path
+    elif sentinel_configured and on_resolved_ids is not None:
         sent = S.Sentinel(sentinel_path)
         if sent.members() and sent.baseline():
             sentinel_result = sent.check(on_resolved_ids)
