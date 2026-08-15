@@ -80,6 +80,23 @@ def _anchor_path() -> str:
     return os.environ.get(ANCHOR_ENV, "").strip() or DEFAULT_ANCHOR
 
 
+def anchor_state() -> str:
+    """"present" | "absent" | "redirected". Which one matters to the caller.
+
+    The env override exists so tests and a second checkout can point somewhere else. It also
+    means a candidate running in-process can set it to a path that does not exist and turn
+    the anchor check off, because a missing anchor simply skipped it. Absent is unavoidable
+    on a fresh clone and cannot be fatal; REDIRECTED is different -- somebody chose it -- and
+    is treated as a violation when the default anchor exists and the redirect does not.
+    """
+    override = os.environ.get(ANCHOR_ENV, "").strip()
+    if not override:
+        return "present" if os.path.isfile(DEFAULT_ANCHOR) else "absent"
+    if os.path.isfile(override):
+        return "present"
+    return "redirected" if os.path.isfile(DEFAULT_ANCHOR) else "absent"
+
+
 def _read_anchor() -> str:
     try:
         with open(_anchor_path(), encoding="utf-8") as fh:
@@ -218,6 +235,10 @@ def frozen_intact(repo_root: str = REPO,
     # Only THE baseline is anchored -- a temp baseline written by a test or a one-off audit
     # was never anchored and must not be reported as a rewrite of something else.
     anchor = _read_anchor() if baseline_path == DEFAULT_BASELINE else ""
+    if baseline_path == DEFAULT_BASELINE and anchor_state() == "redirected":
+        # Pointing the anchor at nothing while a real one exists is not a configuration, it
+        # is the check being switched off from inside the process it constrains.
+        changed.append("ANCHOR_REDIRECTED_AWAY_FROM_EXISTING")
     if anchor:
         try:
             with open(baseline_path, "rb") as fh:

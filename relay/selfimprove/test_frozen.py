@@ -243,3 +243,27 @@ def test_rewriting_the_baseline_is_caught_by_the_out_of_tree_anchor():
     # frozen grader -- the same reason the shipped-baseline test checks structure only.
     assert "BASELINE_REWRITTEN" not in F.frozen_intact()[1]
     print("ok test_rewriting_the_baseline_is_caught_by_the_out_of_tree_anchor")
+
+
+def test_pointing_the_anchor_at_nothing_is_a_violation_not_a_skip():
+    """anchor が無ければ検査を飛ばす仕様だったので、同一プロセスの候補が
+    環境変数を存在しないパスへ向けるだけで検査を無効化できた。
+    fresh clone に anchor が無いのは避けられない(=absent)。
+    実在するのに別を指すのは選択(=redirected)であり、区別する。"""
+    import os as _os
+    if not _os.path.isfile(F.DEFAULT_ANCHOR):
+        return                       # anchored only where an operator has snapshotted
+    prev = _os.environ.get(F.ANCHOR_ENV)
+    _os.environ[F.ANCHOR_ENV] = _os.path.join(tempfile.mkdtemp(), "not_here")
+    try:
+        assert F.anchor_state() == "redirected"
+        ok, changed = F.frozen_intact()
+        assert ok is False
+        assert "ANCHOR_REDIRECTED_AWAY_FROM_EXISTING" in changed
+    finally:
+        if prev is None:
+            _os.environ.pop(F.ANCHOR_ENV, None)
+        else:
+            _os.environ[F.ANCHOR_ENV] = prev
+    assert "ANCHOR_REDIRECTED_AWAY_FROM_EXISTING" not in F.frozen_intact()[1]
+    print("ok test_pointing_the_anchor_at_nothing_is_a_violation_not_a_skip")
