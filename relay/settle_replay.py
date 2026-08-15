@@ -151,11 +151,29 @@ def load_turns(path=None) -> dict:
 # The two implementations, as pure functions over a recorded sequence
 # --------------------------------------------------------------------------------------
 
+def _is_placeholder(text: str) -> bool:
+    """Whether this sample carries no information about the answer.
+
+    BOTH production predicates skip these, so modelling them is not a difference between the
+    arms -- it is fidelity they share, and leaving it out cost a real result: a throttling
+    turn accepted `情報を整理しています…` (a processing placeholder) and scored as a truncated
+    capture in both arms. That is an artefact of the replay, not a property of either
+    predicate, and it was one of only three truncations in the whole run.
+
+    Imported from the relay rather than restated, so the two cannot drift apart.
+    """
+    try:
+        from relay.copilot_autopilot_relay import _is_processing
+    except Exception:
+        return not (text or "").strip()
+    return _is_processing(text or "")
+
+
 def accept_index_legacy(polls, *, need_stable=2) -> int:
     """Where the current predicate would have accepted, or -1.
 
-    Modelled on wait_for_idle's rule as it stands: not generating, and the text unchanged for
-    `need_stable` consecutive polls.
+    Modelled on wait_for_idle's rule as it stands: not generating, not a placeholder, and the
+    text unchanged for `need_stable` consecutive polls.
     """
     # RUN LENGTH, counting the first read. Two identical reads is a run of two, which is what
     # "unchanged for two polls" means to everyone who says it -- counting transitions instead
@@ -167,6 +185,8 @@ def accept_index_legacy(polls, *, need_stable=2) -> int:
         if p.get("generating"):
             run, previous = 0, None
             continue
+        if _is_placeholder(text):
+            continue                      # skipped, not reset -- production's behaviour
         run = run + 1 if text == previous else 1
         previous = text
         if run >= need_stable and text.strip():
@@ -184,14 +204,21 @@ def accept_index_sampled(polls, *, need_stable=2, need_samples=3) -> int:
     """
     run = 0
     previous = None
+    seen = 0
     for i, p in enumerate(polls):
         text = p.get("text", "")
         if p.get("generating"):
             run, previous = 0, None
             continue
+        if _is_placeholder(text):
+            continue
+        seen += 1
         run = run + 1 if text == previous else 1
         previous = text
-        if run >= need_stable and i + 1 >= need_samples and text.strip():
+        # The floor counts INFORMATIVE samples, not raw polls: counting placeholders towards
+        # it would let a burst of "処理中です" satisfy a rule whose whole purpose is to have
+        # looked at the answer three times.
+        if run >= need_stable and seen >= need_samples and text.strip():
             return i
     return -1
 
@@ -288,12 +315,22 @@ def replay(turns, implementations=None) -> dict:
         # rather than folded into them: never-accepting is a latency cost, not a truncation,
         # and adding it to the same column would make two different problems one number.
         "never_only": never_only,
-        "reduction": reduction(per, total),
+        "reduction": reduction(per, total, rows),
         "rows": rows,
     }
 
 
-def reduction(per, turns) -> dict:
+def cluster_of(turn_id: str) -> str:
+    """The prompt a turn came from, if the collector labelled it.
+
+    The label is a prefix the collector writes (`p03|t1a00...`) because the trace records
+    answers rather than questions and the grouping cannot be recovered afterwards.
+    """
+    tid = str(turn_id or "")
+    return tid.split("|", 1)[0] if "|" in tid else ""
+
+
+def reduction(per, turns, rows=None) -> dict:
     """How much smaller the truncation rate got, with an interval -- NOT a McNemar p-value.
 
     THE PLAN ASKED FOR THE WRONG TEST AND THIS IS WHERE THAT SHOWS. McNemar's null hypothesis
@@ -306,21 +343,68 @@ def reduction(per, turns) -> dict:
     that an impossible thing did not occur.
 
     What is actually wanted is the SIZE of the reduction, since its direction is a property of
-    the predicates rather than something to be discovered. So: the difference in truncation
-    counts over the turns, with a Wilson interval, and no significance claim at all.
+    the predicates rather than something to be discovered.
+
+    AND THE INTERVAL IS OVER CLUSTERS, NOT TURNS, whenever the turns are labelled. A campaign
+    of twelve prompts cycled ten times has 120 rows and twelve independent units; a Wilson
+    interval over 120 treats correlated repeats as fresh evidence and comes out far too narrow.
+    The turns from one prompt succeed or fail together far more often than two turns from
+    different prompts do, and the honest width says so.
     """
     legacy = per.get("legacy") or {}
     sampled = per.get("sampled") or {}
     fixed = max(0, legacy.get("truncated", 0) - sampled.get("truncated", 0))
     n = max(1, turns)
     point = fixed / n
-    low, high = _wilson(fixed, n)
+
+    clustered = _cluster_interval(rows)
+    if clustered is not None:
+        low, high, clusters = clustered
+        method = "cluster bootstrap over %d prompt(s)" % clusters
+    else:
+        low, high = _wilson(fixed, n)
+        method = ("Wilson over %d turns -- NOT cluster-corrected, because the turns carry no "
+                  "cluster label; if they are repeats of a few prompts this is too narrow" % n)
+
     return {"turns": n, "turns_fixed": fixed, "point": round(point, 4),
-            "ci95": [round(low, 4), round(high, 4)],
+            "ci95": [round(low, 4), round(high, 4)], "method": method,
             "note": "the direction is structural -- the sampled predicate is the legacy one "
                     "plus a sample floor, so it can only accept later. The estimate is of "
                     "the SIZE of the reduction; there is no hypothesis test here because "
                     "there is no null that could be true."}
+
+
+def _cluster_interval(rows, draws=2000, seed=20260815):
+    """Percentile bootstrap RESAMPLING CLUSTERS, not turns. None if nothing is labelled.
+
+    Deterministic seed: a confidence interval that moves when you re-run the same analysis on
+    the same file invites re-running it until it says something.
+    """
+    if not rows:
+        return None
+    groups = {}
+    for row in rows:
+        key = cluster_of(row.get("turn_id"))
+        if not key:
+            return None
+        legacy = (row.get("legacy") or {}).get("truncated")
+        sampled = (row.get("sampled") or {}).get("truncated")
+        groups.setdefault(key, []).append(1 if (legacy and not sampled) else 0)
+    if len(groups) < 2:
+        return None
+
+    import random
+    keys = sorted(groups)
+    rng = random.Random(seed)
+    points = []
+    for _ in range(draws):
+        drawn = [groups[keys[rng.randrange(len(keys))]] for _ in keys]
+        flat = [v for g in drawn for v in g]
+        points.append(sum(flat) / len(flat) if flat else 0.0)
+    points.sort()
+    lo = points[int(0.025 * len(points))]
+    hi = points[min(len(points) - 1, int(0.975 * len(points)))]
+    return lo, hi, len(keys)
 
 
 def _wilson(successes, n, z=1.96):
@@ -346,6 +430,7 @@ def report(result) -> str:
     lines.append("  reduction:  %d of %d turns no longer truncated  =  %.3f  95%% CI "
                  "[%.3f, %.3f]" % (r["turns_fixed"], r["turns"], r["point"],
                                    r["ci95"][0], r["ci95"][1]))
+    lines.append("              interval method: %s" % r["method"])
 
     never_only = result.get("never_only") or {}
     for name, count in sorted(never_only.items()):

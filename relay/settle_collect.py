@@ -59,6 +59,15 @@ PROMPTS = (
 #: The plain Copilot chat. NOT an agent.
 DEFAULT_CHAT_URL = "https://m365.cloud.microsoft/chat/"
 
+#: A trace file of this collector's OWN, separate from whatever else is recording.
+#:
+#: The first run shared the default path with a bridge that was also in collect mode, and the
+#: bridge's idle tool-probe wrote its synthetic turns into the same file. Two of the three
+#: truncations the replay then found were probe turns -- a different population entirely,
+#: mixed in silently because both writers agreed on a filename. A campaign's data should be
+#: identifiable as that campaign's.
+DEFAULT_TRACE_NAME = "settle_trace_collect.jsonl"
+
 #: URL fragments that identify a custom agent rather than the plain chat.
 _AGENT_MARKERS = ("/chat/agent/", "/agents/")
 
@@ -99,6 +108,12 @@ def collect(*, cdp_url, agent_url, turns=24, timeout_s=180, dwell_s=2.0,
     settle, which is data rather than an error, and losing the rest of the run over it would
     trade a whole recording for one row.
     """
+    if not os.environ.get("MCP_SETTLE_TRACE_PATH"):
+        raise SystemExit(
+            "set MCP_SETTLE_TRACE_PATH to this campaign's own file (suggested name: %s). "
+            "Sharing the default path with a bridge that is also recording mixes its "
+            "synthetic probe turns into the population, which is how two of the first run's "
+            "three findings turned out to be probes." % DEFAULT_TRACE_NAME)
     if os.environ.get("MCP_SETTLE_TRACE_COLLECT") != "1":
         raise SystemExit(
             "refusing to run without MCP_SETTLE_TRACE_COLLECT=1: the ordinary trace records "
@@ -108,6 +123,7 @@ def collect(*, cdp_url, agent_url, turns=24, timeout_s=180, dwell_s=2.0,
 
     from playwright.sync_api import sync_playwright
 
+    from relay import copilot_autopilot_relay as CAR
     from relay.copilot_autopilot_relay import (CopilotWebDriver, find_conversation_page)
 
     done, failed, started = 0, 0, time.time()
@@ -117,6 +133,11 @@ def collect(*, cdp_url, agent_url, turns=24, timeout_s=180, dwell_s=2.0,
 
         for i in range(turns):
             prompt = PROMPTS[i % len(PROMPTS)]
+            # LABEL THE CLUSTER. Twelve prompts cycled ten times is twelve independent units,
+            # not 120, and an interval computed as though it were 120 is too narrow. The
+            # grouping has to be recorded while it is known; it cannot be recovered from the
+            # trace afterwards, because the trace holds answers rather than questions.
+            CAR.settle_trace_set_cluster("p%02d" % (i % len(PROMPTS)))
             try:
                 # A FRESH CONVERSATION PER TURN. Loading the bare agent URL starts a new chat,
                 # and a turn that inherits the previous answer's text starts its stability

@@ -64,6 +64,7 @@ def driven(monkeypatch):
             return _C()
 
     monkeypatch.setitem(os.environ, "MCP_SETTLE_TRACE_COLLECT", "1")
+    monkeypatch.setitem(os.environ, "MCP_SETTLE_TRACE_PATH", "campaign.jsonl")
     monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: _PW())
 
     import relay.copilot_autopilot_relay as CAR
@@ -116,10 +117,22 @@ def test_the_prompts_ask_for_a_range_of_answer_lengths():
 
 # ---- what it refuses ----------------------------------------------------------------------
 
+def test_it_refuses_to_share_a_trace_file_with_another_recorder(monkeypatch):
+    """既定パスをcollect modeのブリッジと共有し、ブリッジの合成プローブが同じファイルに
+    書かれた。最初の実行で見つかった truncation 3件のうち2件はそのプローブだった --
+    別母集団が、両者がファイル名で一致していただけで静かに混ざっていた。"""
+    monkeypatch.setitem(os.environ, "MCP_SETTLE_TRACE_COLLECT", "1")
+    monkeypatch.delenv("MCP_SETTLE_TRACE_PATH", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        SC.collect(cdp_url="http://x", agent_url="http://agent", turns=1)
+    assert "own file" in str(exc.value)
+
+
 def test_it_refuses_to_drive_a_tenant_without_collect_mode(monkeypatch):
     """通常モードは60秒超のターンしか記録せず全文も持たない。
     そのまま30分回せば、残るのは再生できないファイルだけ。"""
     monkeypatch.delenv("MCP_SETTLE_TRACE_COLLECT", raising=False)
+    monkeypatch.setitem(os.environ, "MCP_SETTLE_TRACE_PATH", "campaign.jsonl")
     with pytest.raises(SystemExit) as exc:
         SC.collect(cdp_url="http://x", agent_url="http://agent", turns=1)
     assert "nothing replayable" in str(exc.value)
@@ -167,6 +180,7 @@ def test_the_plain_chat_is_accepted():
 def test_collect_refuses_an_agent_url_before_touching_the_browser(monkeypatch):
     """ブラウザに触る前に断ること。断るのが遅ければ、会話は既に作られている。"""
     monkeypatch.setitem(os.environ, "MCP_SETTLE_TRACE_COLLECT", "1")
+    monkeypatch.setitem(os.environ, "MCP_SETTLE_TRACE_PATH", "campaign.jsonl")
     with pytest.raises(SystemExit):
         SC.collect(cdp_url="http://x",
                    agent_url="https://m365.cloud.microsoft/chat/agent/P_x.dr_work", turns=1)

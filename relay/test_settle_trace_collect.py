@@ -144,3 +144,27 @@ def test_the_collected_shape_is_what_the_replay_refuses_to_do_without(trace):
     out = SR.replay(turns)
     assert out["turns"] == 1
     assert out["unlabelled_turns"] == 0
+
+
+# ---- the marker list, found by the trace it was recorded for -------------------------------
+
+def test_the_placeholder_copilot_actually_showed_is_recognised():
+    """127ターンの実トレースで、スロットルされた要求の答えとして
+    『情報を整理しています…』がそのまま受理されていた。
+    認識されないプレースホルダは、安定判定が『返答』として数える文字列になる --
+    この一連の作業が対象にしている truncated capture が、述語ではなくマーカー表から来ていた。"""
+    assert CAR._is_processing("情報を整理しています…")
+    assert CAR._is_processing("情報を整理しています")
+
+
+def test_a_short_genuine_answer_ending_in_an_ellipsis_is_not_a_placeholder():
+    """全角…単体をマーカーにすると、短い本物の回答が永遠に未完了になり、
+    稀な早期受理を確実なハングと交換することになる。"""
+    assert not CAR._is_processing("done…")
+    assert not CAR._is_processing("東京…")
+
+
+def test_the_existing_markers_still_hold():
+    for text in ("処理中です。", "working on it", "thinking"):
+        assert CAR._is_processing(text), text
+    assert not CAR._is_processing("the complete answer to the question")

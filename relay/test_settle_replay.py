@@ -233,3 +233,69 @@ def test_unlabelled_rows_are_refused_rather_than_merged():
     with pytest.raises(SR.NotReplayable) as exc:
         SR.load_turns(_write(rows))
     assert "empty turn_id" in str(exc.value)
+
+
+# ---- fidelity the two arms SHARE ----------------------------------------------------------
+
+def test_a_processing_placeholder_is_not_an_answer_in_either_arm():
+    """スロットリングのターンが `情報を整理しています…` を受理し、両腕で truncated と数えられた。
+    本番はプレースホルダを飛ばす。これは腕の差ではなく共通の忠実度で、
+    実行3件しかない truncation のうち1件がこの人工物だった。"""
+    rows = _turn("t1", ["情報を整理しています…", "情報を整理しています…", "real answer",
+                        "real answer"], tail=["real answer"])
+    out = SR.replay(SR.load_turns(_write(rows)))
+    assert out["per_implementation"]["legacy"]["truncated"] == 0
+
+
+def test_the_sample_floor_counts_informative_samples_not_placeholders():
+    """『答えを3回見た』が目的の規則を、処理中表示の連打で満たせてはいけない。"""
+    polls = [{"text": "処理中です。"}, {"text": "処理中です。"}, {"text": "処理中です。"},
+             {"text": "answer"}, {"text": "answer"}]
+    assert SR.accept_index_sampled(polls) == -1
+
+
+# ---- clustering: 120 rows from 12 prompts is 12 units, not 120 ------------------------------
+
+def _clustered(prompt, n, texts, tail):
+    rows = []
+    for i in range(n):
+        rows += _turn("%s|t%d" % (prompt, i), texts, tail=tail)
+    return rows
+
+
+def test_the_interval_is_computed_over_clusters_when_the_turns_are_labelled():
+    """12プロンプト×10巡は120の観測ではなく12の独立単位。
+    120として区間を出すと、相関した反復を新しい証拠として数え、幅が不当に狭くなる。"""
+    rows = _clustered("p00", 10, ["half", "half"], ["half and rest"])
+    rows += _clustered("p01", 10, ["whole", "whole"], ["whole"])
+    out = SR.replay(SR.load_turns(_write(rows)))
+    r = out["reduction"]
+    assert "cluster bootstrap" in r["method"]
+    assert "2 prompt" in r["method"]
+
+
+def test_the_clustered_interval_is_wider_than_the_turn_level_one():
+    """狭い区間は、証拠が多いように見せる。ここが今回いちばん誤解を生む場所。"""
+    rows = _clustered("p00", 10, ["half", "half"], ["half and rest"])
+    rows += _clustered("p01", 10, ["whole", "whole"], ["whole"])
+    out = SR.replay(SR.load_turns(_write(rows)))
+    lo, hi = out["reduction"]["ci95"]
+    wlo, whi = SR._wilson(out["reduction"]["turns_fixed"], out["reduction"]["turns"])
+    assert (hi - lo) > (whi - wlo), "クラスタ補正が幅を広げていない"
+
+
+def test_unlabelled_turns_fall_back_and_say_the_interval_is_not_corrected():
+    """補正できないことを黙っているのが最悪。"""
+    rows = _turn("t1", ["half", "half"], tail=["half and rest"])
+    out = SR.replay(SR.load_turns(_write(rows)))
+    assert "NOT cluster-corrected" in out["reduction"]["method"]
+
+
+def test_the_bootstrap_does_not_move_between_identical_runs():
+    """再実行のたびに動く区間は、望む答えが出るまで再実行させる。"""
+    rows = _clustered("p00", 6, ["half", "half"], ["half and rest"])
+    rows += _clustered("p01", 6, ["whole", "whole"], ["whole"])
+    path = _write(rows)
+    a = SR.replay(SR.load_turns(path))["reduction"]["ci95"]
+    b = SR.replay(SR.load_turns(path))["reduction"]["ci95"]
+    assert a == b

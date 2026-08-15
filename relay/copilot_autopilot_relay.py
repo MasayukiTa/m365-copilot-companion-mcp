@@ -531,8 +531,21 @@ def transient_backoff(n, retry_after=None,
 
 # Placeholder text Copilot shows in the answer block WHILE it is still working.
 # Treat these as "not finished" so completion detection never stabilizes on them.
+#
+# 「情報を整理しています…」 was MISSING, and it is not a cosmetic omission: a settle
+# trace of 127 real turns caught production accepting that string as the turn's answer
+# on a throttled request. A placeholder that is not recognised is a placeholder the
+# stability rule counts as the reply, holds still for three samples, and returns -- the
+# truncated capture this whole line of work is about, arriving through the marker list
+# rather than through the predicate.
+#
+# The bare ellipsis character is deliberately NOT a marker on its own. "..." is already
+# here and is common in English placeholders; adding … unqualified would classify a
+# short genuine answer ending in one as forever-unfinished, and wait_for_idle would then
+# time out rather than accept it -- trading a rare early accept for a guaranteed hang.
 PROCESSING_MARKERS = ("処理中", "生成しています", "考えています", "working on it",
-                      "thinking", "...")
+                      "thinking", "...",
+                      "情報を整理", "整理しています")
 
 
 # Phrases Copilot emits when it never actually received/registered the task and is asking what
@@ -746,14 +759,42 @@ def _settle_trace_reset(drv, turn_id=""):
     try:
         _settle_trace_started_at[id(drv)] = time.time()
         _settle_trace_seq[0] += 1
+        cluster = _settle_trace_cluster[0]
         _settle_trace_turn[id(drv)] = turn_id or (
-            "t%x-%d" % (int(time.time() * 1000), _settle_trace_seq[0]))
+            "%st%x-%d" % ((cluster + "|") if cluster else "",
+                          int(time.time() * 1000), _settle_trace_seq[0]))
     except Exception:
         pass
 
 
 #: How many extra polls to read AFTER production accepts, in collect mode only.
-_SETTLE_TRACE_LABEL_TAIL = int(os.environ.get("MCP_SETTLE_TRACE_LABEL_TAIL", "4"))
+#:
+#: FOUR WAS TOO FEW, AND THE RUN THAT PROVED IT LOOKED LIKE A CLEAN RESULT. A campaign of 127
+#: turns recorded a tail on every single one -- and in 127 of 127 the text after acceptance was
+#: byte-identical to the text at acceptance. Every tail was exactly four polls long, about two
+#: seconds at the default interval. So the label the replay scored against was, once again,
+#: production's own accepted text, and the endpoint came back as zero.
+#:
+#: That zero has two readings and they are not close together: either the settle predicate is
+#: genuinely near-perfect on this population and the plan's ~7% belongs to an older build, or
+#: two seconds is simply shorter than the pause this is meant to catch. A stream that resumes
+#: at 2.5 seconds is invisible either way, and nothing in the output distinguishes the cases.
+#: Fifteen polls is roughly eight seconds, comfortably past the dwell production itself
+#: requires, which makes "no change in the tail" a statement about the stream rather than a
+#: statement about how briefly we looked.
+_SETTLE_TRACE_LABEL_TAIL = int(os.environ.get("MCP_SETTLE_TRACE_LABEL_TAIL", "15"))
+
+#: A label the collector can attach to the next turn, so recorded turns can be grouped by what
+#: was ASKED. Twelve prompts cycled ten times is not 120 independent observations -- it is
+#: twelve clusters -- and an interval computed as though it were 120 is too narrow. Without
+#: this the trace cannot say which turns share a prompt, so the correction is not computable
+#: after the fact.
+_settle_trace_cluster = [""]
+
+
+def settle_trace_set_cluster(label: str) -> None:
+    """Label the turns recorded from here until the next call."""
+    _settle_trace_cluster[0] = str(label or "")
 
 
 def _settle_trace_label_tail(drv):
@@ -778,13 +819,19 @@ def _settle_trace_label_tail(drv):
     """
     if not _SETTLE_TRACE_COLLECT:
         return
+    started = time.time()
     for _ in range(max(0, _SETTLE_TRACE_LABEL_TAIL)):
         try:
             time.sleep(REPLY_SETTLE_INTERVAL_S)
             text = drv.read_last_response()
             if _is_processing(text):
                 continue
-            _settle_trace(drv, "post_accept", text, False, 0, None, post_accept=True)
+            # `watched_s` is how long this tail had been looking when the sample was taken.
+            # Without it, "the text did not change in the tail" cannot be told apart from "the
+            # tail was too short to see a change", which is exactly the ambiguity a 4-poll tail
+            # left behind on a 127-turn campaign.
+            _settle_trace(drv, "post_accept", text, False, 0, None, post_accept=True,
+                          watched_s=round(time.time() - started, 2))
         except Exception:
             return
 
