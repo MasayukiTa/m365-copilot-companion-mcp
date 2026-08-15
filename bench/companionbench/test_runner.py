@@ -310,3 +310,35 @@ def test_a_grader_crash_after_a_deletion_is_attributed_to_the_agent():
     out = R.run_episode(ExcelEditPreservingFormulas(), _deleting_agent("sales.xlsx"))
     assert out["infra_failure"] is False
     assert "sales.xlsx" in out["details"]["deleted_fixture_files"]
+
+
+def test_corrupting_a_fixture_in_place_is_also_the_agents_failure():
+    """削除は塞いだが、その場で壊してグレーダを落とす手が残っていた。
+    どちらも狙いは同じ -- 苦手なエピソードを infra にして対戦から外すこと。"""
+    from bench.companionbench.episodes.office import ExcelEditPreservingFormulas
+
+    def corrupt(_prompt, workdir):
+        with open(os.path.join(workdir, "sales.xlsx"), "wb") as fh:
+            fh.write(b"not a workbook at all")
+        return ""
+
+    out = R.run_episode(ExcelEditPreservingFormulas(), corrupt)
+    assert out["infra_failure"] is False, "壊した結果を環境のせいにしている"
+    assert out["success"] is False
+
+
+def test_an_untouched_workdir_with_a_crashing_grader_is_still_infra():
+    """区別が目的。エージェントが何もしていないのに落ちたなら、それは環境。"""
+    class _CrashingGrader:
+        episode_id, category = "crashy", "filesystem"
+
+        def setup(self, workdir):
+            with open(os.path.join(workdir, "a.txt"), "w", encoding="utf-8") as fh:
+                fh.write("x")
+            return "何もしないでください"
+
+        def grade_final_state(self, workdir, *, reply=""):
+            raise RuntimeError("grader dependency unavailable")
+
+    out = R.run_episode(_CrashingGrader(), lambda *_a: "")
+    assert out["infra_failure"] is True
