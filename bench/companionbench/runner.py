@@ -48,6 +48,57 @@ from bench.companionbench.episode import COVERAGE_COMPLETE
 SECURITY_CATEGORY = "security"
 
 
+def dataset_fingerprint() -> str:
+    """What suite this result came from, including the salted instance of the sealed pool.
+
+    There is no "seed" to record here -- the suite is deterministic and its only variable
+    part is the sealed fixture, which is derived from the operator's salt. So an archived row
+    could not answer "was this the same dataset?", and a salt rotation would silently change
+    the holdout while every row still looked comparable.
+
+    The digest covers the pool membership and each sealed episode's DERIVED instance. It is
+    computed over the expected answers, which means it changes exactly when the questions
+    change -- and it is a hash, so recording it does not put those answers in the archive.
+    Without a salt it reports "unsalted", which is honest: the sealed pool did not run.
+    """
+    from bench.companionbench.pools import SEALED, SealError
+    parts = []
+    for pool in (EVOLUTION, REGRESSION, SEALED):
+        parts.append("%s=%s" % (pool, ",".join(sorted(e.episode_id
+                                                      for e in REGISTRY.get(pool)))))
+    try:
+        for ep in sorted(REGISTRY.get(SEALED), key=lambda e: e.episode_id):
+            expected = getattr(ep, "_expected", None)
+            if expected is not None:
+                parts.append("%s:%s" % (ep.episode_id, expected()))
+    except SealError:
+        parts.append("sealed=unsalted")
+    except Exception as exc:
+        parts.append("sealed=unavailable:%s" % type(exc).__name__)
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def describe_agent(agent) -> dict:
+    """The adapter's configuration, for the archive. Never its secrets.
+
+    A class name was all that was recorded, so two runs against different fleets, with the
+    refuter on and off, or against different memory seeds, were indistinguishable in the
+    archive -- and those are exactly the things that change a result. An adapter that knows
+    more about itself says so via describe(); the fallback covers the rest.
+    """
+    described = getattr(agent, "describe", None)
+    if callable(described):
+        try:
+            out = dict(described() or {})
+            out.setdefault("class", type(agent).__name__)
+            return out
+        except Exception:
+            pass
+    return {"class": type(agent).__name__,
+            "execution_target": getattr(agent, "execution_target", ""),
+            "covered_fields": sorted(getattr(agent, "covered_fields", ()) or ())}
+
+
 def _grader_version() -> str:
     """A digest of the episode + grading code, so a row says which judge produced it.
 
@@ -623,10 +674,15 @@ def paired_evaluate(base_manifest, candidate_manifest, agent, *, tmpdir,
         # re-examined, which is most of what an archive is for.
         "candidate_results": cand,
         "baseline_results": base,
+        # The baseline's own genome, so the archive can fingerprint it rather than storing
+        # an id whose contents nobody kept.
+        "baseline_genome": {"components": dict(base_manifest.get("components") or {}),
+                            "parameters": dict(base_manifest.get("parameters") or {})},
         "pools": {"evolution": [e.episode_id for e in evolution],
                   "regression": [e.episode_id for e in regression],
                   "sealed": [e.episode_id for e in REGISTRY.get(SEALED)]},
-        "agent": type(agent).__name__,
+        "agent": describe_agent(agent),
+        "dataset_fingerprint": dataset_fingerprint(),
         "grader_version": _grader_version(),
         "latency_s": round(sum(r["latency_s"] for r in cand)
                            + sum(r["latency_s"] for r in base), 3),

@@ -355,3 +355,65 @@ def test_the_runner_supplies_what_the_archive_records():
         assert key in out, "runner が %s を返していない" % key
     assert out["pools"]["sealed"], "封印プールが記録されていない"
     assert out["grader_version"] != "unavailable"
+
+
+def test_the_row_records_which_dataset_and_which_baseline_and_which_agent():
+    """round 7 の残り3点。seed 相当が無い、baseline の詳細指紋が無い、
+    エージェント設定がクラス名だけ -- どれも『この結果は何と比較可能か』に答えられない。"""
+    import tempfile as _tf
+
+    import bench.companionbench.agents as A
+    from bench.companionbench import runner as R
+    from relay.selfimprove import manifest as MM
+
+    base = MM.base_manifest()
+    cand = MM.apply_genome(base, {"parameters": {"memory_max_items": 9}})
+    out = R.paired_evaluate(base, cand, A.in_process(lambda *_a: ""),
+                            tmpdir=_tf.mkdtemp(prefix="ds_"))
+
+    assert out["dataset_fingerprint"], "どのデータセットで測ったか記録されていない"
+    assert isinstance(out["agent"], dict) and out["agent"]["execution_target"]
+    assert out["baseline_genome"]["parameters"]["memory_max_items"] == 5
+
+
+def test_the_dataset_fingerprint_moves_when_the_sealed_instance_moves(monkeypatch):
+    """salt を替えれば封印プールの問いが変わる。行が同じ指紋のままなら、
+    比較不能な結果同士が比較可能に見える。"""
+    from bench.companionbench import runner as R
+    from bench.companionbench.pools import SALT_ENV
+
+    monkeypatch.setenv(SALT_ENV, "salt-one")
+    first = R.dataset_fingerprint()
+    monkeypatch.setenv(SALT_ENV, "salt-two")
+    second = R.dataset_fingerprint()
+    assert first and second and first != second
+
+
+def test_the_dataset_fingerprint_does_not_leak_the_sealed_answers():
+    """指紋は期待値の上で計算するが、記録されるのはハッシュだけ。"""
+    import inspect
+
+    from bench.companionbench import runner as R
+    assert "sha256" in inspect.getsource(R.dataset_fingerprint)
+    assert len(R.dataset_fingerprint()) == 16
+
+
+def test_the_fleet_adapter_describes_its_configuration_without_leaking_it():
+    """フリートURL・refuter・記憶seed・タイムアウトは結果を変える。
+    クラス名だけでは、別の設定で走った2つの行が同じに見える。"""
+    import tempfile as _tf
+
+    from bench.companionbench.fleet_agent import FleetAgent
+
+    seed = _tf.mkdtemp(prefix="sd_")
+    os.makedirs(os.path.join(seed, "memory"), exist_ok=True)
+    with open(os.path.join(seed, "memory", "INDEX.md"), "w", encoding="utf-8") as fh:
+        fh.write("- [x](x.md)\n")
+
+    d = FleetAgent(agent_url="http://secret-host:9999/token-abc",
+                   cdp_url="http://127.0.0.1:9222", refuter=True,
+                   memory_seed=seed).describe()
+    assert d["refuter"] is True and d["memory_seed_digest"]
+    assert d["has_cdp_url"] is True
+    blob = json.dumps(d)
+    assert "secret-host" not in blob and "token-abc" not in blob, "URL が記録に漏れている"

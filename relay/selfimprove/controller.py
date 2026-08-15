@@ -32,6 +32,19 @@ from relay.selfimprove import runtime_config as RC
 from relay.selfimprove.ledger import HypothesisLedger
 
 
+def _target_of(result) -> str:
+    """The execution target an evaluator reported, tolerating the older string shape.
+
+    `agent` used to be a bare class name and is now a description dict. An archive write
+    must not raise on a result produced by either -- the row is the durable record, and a
+    format quibble is not a reason to lose it.
+    """
+    agent = (result or {}).get("agent")
+    if isinstance(agent, dict):
+        return agent.get("execution_target", "")
+    return ""
+
+
 class EvolutionController:
     """Runs one candidate end to end. Stateless between calls except for its stores."""
 
@@ -209,9 +222,21 @@ class EvolutionController:
                     "seed": result.get("seed"),
                     "agent": result.get("agent", ""),
                     "latency_s": result.get("latency_s"),
+                    # BOTH SIDES, IN FULL. Only the candidate had a detailed fingerprint;
+                    # the baseline had an id, so a reader could see that two harnesses
+                    # differed and not why -- which is the question a fingerprint exists to
+                    # answer. The execution target comes from the adapter rather than being
+                    # left empty, since "which target ran this" decides what the numbers
+                    # cover.
                     "harness_fingerprint": EX.harness_fingerprint(
                         genome={"components": candidate["components"],
-                                "parameters": candidate["parameters"]}),
+                                "parameters": candidate["parameters"]},
+                        execution_profile=_target_of(result)),
+                    "baseline_fingerprint": EX.harness_fingerprint(
+                        genome=(result.get("baseline_genome")
+                                or {"components": {}, "parameters": {}}),
+                        execution_profile=_target_of(result)),
+                    "dataset_fingerprint": result.get("dataset_fingerprint", ""),
                 },
             )
         except Exception as exc:

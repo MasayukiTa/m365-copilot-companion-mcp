@@ -92,6 +92,10 @@ class SimulatedAgent:
     def attest(self, manifest):
         return attest_in_process(manifest)
 
+    def describe(self):
+        return {"class": "SimulatedAgent", "execution_target": IN_PROCESS,
+                "scripted_episodes": sorted(self.script)}
+
     def __init__(self, script=None, default_reply="(no action taken)"):
         self.script = dict(script or {})
         self.default_reply = default_reply

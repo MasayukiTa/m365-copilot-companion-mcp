@@ -52,6 +52,7 @@ the live path as unproven code, because that is what it is.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -185,6 +186,35 @@ class FleetAgent:
                 "a memory experiment needs a memory_seed: against an empty store the "
                 "component is never exercised, and against a shared one the first arm "
                 "primes the second")
+
+    def describe(self):
+        """The configuration that changes a result. No credentials, no URLs with tokens.
+
+        The memory seed is recorded by DIGEST rather than by path: which seed was used is the
+        reproducibility question, and the path is a temp directory that will not exist later.
+        """
+        seed_id = ""
+        if self.memory_seed and os.path.isdir(self.memory_seed):
+            h = hashlib.sha256()
+            for root_dir, _dirs, files in sorted(os.walk(self.memory_seed)):
+                for name in sorted(files):
+                    full = os.path.join(root_dir, name)
+                    h.update(os.path.relpath(full, self.memory_seed).encode("utf-8"))
+                    try:
+                        with open(full, "rb") as fh:
+                            h.update(fh.read())
+                    except OSError:
+                        pass
+            seed_id = h.hexdigest()[:16]
+        return {
+            "class": "FleetAgent",
+            "execution_target": self.execution_target,
+            "refuter": self.refuter,
+            "memory_seed_digest": seed_id,
+            "timeout_s": self.timeout_s,
+            "python": os.path.basename(self.python),
+            "has_cdp_url": bool(self.cdp_url),
+        }
 
     def attest(self, manifest):
         """Ask a child which harness it loads, and hand back its answer verbatim.
