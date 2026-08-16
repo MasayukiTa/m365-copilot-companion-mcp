@@ -398,8 +398,15 @@ def reduction(per, turns, rows=None) -> dict:
 
     clustered = _cluster_interval(rows)
     if clustered is not None:
-        low, high, clusters = clustered
-        method = "cluster bootstrap over %d prompt(s)" % clusters
+        low, high, clusters = clustered[:3]
+        method = (clustered[3] if len(clustered) > 3
+                  else "cluster bootstrap over %d prompt(s)" % clusters)
+        if len(clustered) > 3:
+            method += (" -- NOT a bootstrap and not the same estimand as the point figure: "
+                       "that is a turn-level proportion, this treats a prompt as the unit. "
+                       "Read it as a conservative sensitivity bound. And that twelve prompts "
+                       "ARE twelve independent units is an assumption, not something cycling "
+                       "them through one tenant established")
     else:
         low, high = _wilson(fixed, n)
         method = ("Wilson over %d turns -- NOT cluster-corrected, because the turns carry no "
@@ -444,7 +451,14 @@ def _cluster_interval(rows, draws=2000, seed=20260815):
     # units: with c clusters and none showing the event, the upper bound is about 3/c. Twelve
     # prompts and no truncation is an upper bound near 0.25, not zero.
     if not any(any(g) for g in groups.values()):
-        return 0.0, min(1.0, 3.0 / len(keys)), len(keys)
+        # AND IT IS NOT A BOOTSTRAP, so it must not be labelled as one. This is the rule of
+        # three over the CLUSTERS: with c independent units and no unit showing the event, the
+        # upper bound is about 3/c. It also changes the estimand -- the point estimate is a
+        # turn-level proportion while this bound treats a prompt as the Bernoulli unit -- so it
+        # is a conservative sensitivity bound and not a calibrated interval for the same
+        # quantity. Saying "cluster bootstrap" over it would be a third kind of the mistake
+        # this module keeps making: a correct number under a label describing something else.
+        return 0.0, min(1.0, 3.0 / len(keys)), len(keys), "rule of three over %d cluster(s)" % len(keys)
 
     import random
     rng = random.Random(seed)

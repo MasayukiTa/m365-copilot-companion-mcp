@@ -36,8 +36,61 @@ import sys
 #: Where the unshaped names come from. A comma-separated list; never a default in this file.
 NAMES_ENV = "IDENTITY_NAMES"
 
-#: An employee id, by shape. Deliberately broad: a near-miss costs a moment, a miss is public.
-ID_SHAPE = re.compile(r"\b[A-Z]\d{6,}\b")
+#: An employee id, by shape.
+#:
+#: THE FIRST VERSION OF THIS NEVER MATCHED THE ACTUAL ID. It was `[A-Z]\d{6,}` -- a letter and
+#: then six or more DIGITS -- and the real id interleaves letters with digits, so the check
+#: written to catch it could not. It passed the repository throughout, and the leak was caught
+#: by the home-directory rule instead, by luck: the id happened to be a folder name.
+#:
+#: The shape now is what such ids look like: seven to twelve upper-case alphanumerics starting
+#: with a letter, at least five of them digits. That excludes git sha prefixes (lower case),
+#: HTTP200, SHA256, ISO8601 and M365, all of which appear in this repository, and includes
+#: both the observed id and the letter-then-digits form the old pattern was aiming at.
+#: The candidate token; the digit count is applied to the TOKEN in `_IdShape.search`. Written
+#: as a filter rather than as one clever regex because the clever version counted digits
+#: anywhere in the LINE -- so `FASTEST` matched whenever the sentence around it happened to
+#: contain five digits, and the check reported thirty-three false positives across the repo.
+_ID_CANDIDATE = re.compile(r"\b[A-Z][A-Z0-9]{6,11}\b")
+_ID_MIN_DIGITS = 5
+
+#: An employee id carries a SHORT letter prefix. Without this the shape also matched
+#: `TEST20260625` (a dated test fixture) and `C2F03A33` (a GUID fragment in vendored COM
+#: interop) -- both of which identify nobody, and a check that cries about them is one people
+#: learn to run with their eyes closed.
+_ID_MAX_LETTERS = 3
+
+#: A GUID: eight hex, then four, then four. Its first group satisfies the id shape exactly.
+#: Built from a character class rather than written with \b, because an earlier edit put a
+#: literal backspace here -- the pattern then required a control character at both ends and
+#: never matched anything, silently.
+_GUID = re.compile("[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}")
+
+
+class _IdShape:
+    """A regex-shaped object so the caller can treat it like the other patterns."""
+
+    pattern = _ID_CANDIDATE.pattern
+
+    def search(self, text):
+        text = text or ""
+        for m in _ID_CANDIDATE.finditer(text):
+            token = m.group(0)
+            digits = sum(c.isdigit() for c in token)
+            letters = len(token) - digits
+            if digits < _ID_MIN_DIGITS or letters > _ID_MAX_LETTERS:
+                continue
+            # A GUID's first group is eight hex characters and passes every test above. The
+            # exclusion is on the SURROUNDING SHAPE rather than on the token being hex,
+            # because an id like A123456 is also valid hex and excluding all hex would drop a
+            # real one to spare a vendored COM interop file.
+            if _GUID.search(text[max(0, m.start() - 2):m.end() + 30]):
+                continue
+            return m
+        return None
+
+
+ID_SHAPE = _IdShape()
 
 #: A Windows home directory, which names whoever owns it -- unless the segment is one of the
 #: names that identify nobody. Test fixtures need a plausible path, and flagging
@@ -45,13 +98,18 @@ ID_SHAPE = re.compile(r"\b[A-Z]\d{6,}\b")
 #: having it at all.
 HOME_SHAPE = re.compile(r"[A-Za-z]:[\\/]{1,2}Users[\\/]{1,2}([A-Za-z0-9_.~<>-]+)", re.I)
 
+#: Segments that identify nobody. A docstring or fixture illustrating the SHAPE of a path is
+#: a description of the problem rather than an instance of it, and flagging those teaches a
+#: reader to skim past this check -- which is worse than not having it.
+#:
+#: "alice", "bob", "runner" and "administrator" were here and have been removed. Every one of
+#: them can be somebody's actual account name, and a placeholder list that swallows a real one
+#: is the same failure as no list at all. The names left are ones Windows reserves or that no
+#: account is called.
 NON_IDENTIFYING_USERS = {"public", "default", "defaultuser", "example", "test", "testuser",
-                         "user", "<user>", "<home>", "alice", "bob", "someone", "you",
-                         "runner", "administrator", "hostedtoolcache",
-                         # Placeholders. A docstring or fixture that illustrates the SHAPE of
-                         # a path is a description of the problem, not an instance of it, and
-                         # flagging those teaches a reader to skim past this check.
-                         "...", "\\...", "x", "me", "name", "username", "<you>", "<name>"}
+                         "user", "username", "name", "hostedtoolcache",
+                         "<user>", "<home>", "<you>", "<name>",
+                         "...", "\\...", "x", "me"}
 
 #: This file, which describes the check, and .gitignore, which has to name what it ignores.
 ALLOWED = {".gitignore", "scripts/check_no_identifying_names.py"}
@@ -65,9 +123,22 @@ def configured_names():
     return [n.strip() for n in raw.split(",") if n.strip()]
 
 
+class CheckFailed(RuntimeError):
+    """The check could not be performed. Never the same thing as finding nothing."""
+
+
 def tracked_files(repo="."):
+    """Every tracked path, or raise. A failed git call used to yield an empty list, and an
+    empty list reads as "nothing identifying in 0 tracked files" -- a pass."""
     out = subprocess.run(["git", "-C", repo, "ls-files"], capture_output=True, text=True)
-    return [p for p in out.stdout.splitlines() if p.strip()]
+    if out.returncode != 0:
+        raise CheckFailed("git ls-files failed in %s: %s"
+                          % (repo, (out.stderr or "").strip()[:200]))
+    files = [p for p in out.stdout.splitlines() if p.strip()]
+    if not files:
+        raise CheckFailed("git reported no tracked files in %s, which is not a repository "
+                          "this check can vouch for" % repo)
+    return files
 
 
 def offences(repo=".", names=None):
@@ -76,8 +147,15 @@ def offences(repo=".", names=None):
     name_re = (re.compile("|".join(re.escape(n) for n in names), re.I)) if names else None
     found = []
     for rel in tracked_files(repo):
-        if rel in ALLOWED or not rel.endswith(TEXT_SUFFIXES):
+        if rel in ALLOWED:
             continue
+        # THE PATH ITSELF. A file called after a person or a project discloses it without any
+        # content being read, and a suffix whitelist never looks at the name at all.
+        for what, pattern in (("employee-id shape in a path", ID_SHAPE),
+                              ("configured name in a path", name_re)):
+            if pattern is not None and pattern.search(rel):
+                found.append((rel, what, 0, rel))
+                break
         try:
             with open(os.path.join(repo, rel), encoding="utf-8", errors="replace") as fh:
                 for n, line in enumerate(fh, 1):
@@ -97,20 +175,39 @@ def offences(repo=".", names=None):
                     else:
                         continue
                     break              # one report per file is enough to act on
-        except OSError:
-            continue
+        except OSError as exc:
+            # NOT SKIPPED SILENTLY. A file the check could not read is a file it cannot
+            # vouch for, and the whole point of this script is that "we did not look" must
+            # never come out looking like "we looked and it was fine".
+            found.append((rel, "unreadable, so unchecked", 0, str(exc)[:100]))
     return found
 
 
 def main(argv=None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
-    repo = argv[0] if argv else "."
+    args = [a for a in argv if not a.startswith("--")]
+    strict = "--require-names" in argv
+    repo = args[0] if args else "."
     names = configured_names()
-    found = offences(repo)
+
+    try:
+        found = offences(repo)
+    except CheckFailed as exc:
+        print("CHECK COULD NOT RUN: %s" % exc)
+        return 2
 
     if not names:
-        print("NOTE: %s is not set, so only the shaped checks ran (employee id, home path). "
-              "Set it to the comma-separated names that must not appear." % NAMES_ENV)
+        # STRICT IS FOR THE BRANCH THAT MATTERS. A fork PR has no secrets, so requiring the
+        # names everywhere would fail every outside contribution for a reason they cannot
+        # fix; requiring them nowhere means the rule called absolute is enforced only when
+        # somebody remembered to set a variable.
+        print("NOTE: %s is not set, so only the shaped checks ran (employee id, home path)."
+              % NAMES_ENV)
+        if strict:
+            print("REFUSING TO PASS: --require-names was given and there are none. On the "
+                  "branch this protects, a missing secret is a missing check, not a clean "
+                  "result.")
+            return 2
 
     if not found:
         print("nothing identifying in %d tracked files (%d configured name(s))"

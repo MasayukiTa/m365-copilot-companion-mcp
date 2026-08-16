@@ -1,0 +1,54 @@
+COMPANIONBENCH RELIABILITY -- RESTED TENANT, THREE REPEATS
+
+VERDICT: fails the criteria that were written down before the run. The suite is not yet a
+measuring instrument; a harness A/B against it would measure the instrument.
+
+-- against the pre-registered criteria (reliability_rested_prediction.md) --------
+
+  rate spread <= 0.10        : 0.5909    FAIL
+  no monotone trend          : 7/20/16   pass (not monotone)
+  stable episodes >= 18/22   : 7        FAIL
+
+  Two of three fail, so the answer is no. Recording it against criteria fixed in advance
+  is the only thing that stops a result from being explained afterwards, which is what
+  happened to the previous round.
+
+-- the runs ---------------------------------------------------------------------
+
+  run   passed/attempted   infra   wall     median turn
+    1        7/22            0     1344s      59.2s
+    2       20/22            0     1913s      79.3s
+    3       16/22            0     2060s      80.1s
+
+  Tenant rested 4h20m beforehand. Denominators agree; 7 of 22 episodes gave the same
+  verdict every time.
+
+-- ZERO INFRA DOES NOT MEAN ZERO ENVIRONMENT FAILURES ----------------------------
+
+  It means zero failures the classifier of the day recognised. Printing the replies
+  afterwards found a greeting (the task never reached the tab) and a bridge stack trace
+  arriving as reply text -- both inside this denominator, both scored as capability
+  failures. The classifier has since been extended twice more; these numbers predate it
+  and CANNOT BE RECLASSIFIED, because the saved transport record deliberately keeps no
+  prompts or replies.
+
+  So this run bounds the instrument's reliability from the wrong side: the true rate of
+  environment failures is higher than the zero recorded here, and every fix so far has
+  moved failures OUT of the denominator, which raises the pass rate.
+
+-- the first-run observation, and what it is worth -------------------------------
+
+  Both reliability batches scored exactly 7/22 on their first run, and both first runs
+  followed a bridge restart. That is two post-hoc points with no control, and the
+  composition is not even the same: fs_edit_one_of_many passed in one first run and failed
+  in the other. An identical total is not evidence of an identical mechanism. It is worth
+  a designed test -- alternate restart and no-restart, randomise which comes first -- and
+  it is not worth a sentence in a conclusion until then.
+
+-- limits ------------------------------------------------------------------------
+
+  Three repeats of 22 episodes is 22 units measured three times: repeats buy precision
+  about each episode's rate, not more episodes. Runs were back to back in a fixed episode
+  order, so any trend across them is confounded with the tenant's state over the same
+  period. repeat_suite can now rest between runs and vary the order, and says so when it
+  did neither; this run did neither.

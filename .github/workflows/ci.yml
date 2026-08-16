@@ -53,7 +53,7 @@ jobs:
           # from a repository secret, so this file never spells them out. Unset, the step
           # still runs the shaped checks and says which part it could not perform.
           IDENTITY_NAMES: ${{ secrets.IDENTITY_NAMES }}
-        run: python scripts/check_no_identifying_names.py .
+        run: python scripts/check_no_identifying_names.py . --require-names
 
       # Run only the hermetic test paths. Explicit file list is the safest guard
       # against accidentally picking up non-hermetic tests when new files are added.
@@ -61,6 +61,7 @@ jobs:
         run: |
           pytest -q \
             tests/test_security_xff.py \
+            scripts/test_check_no_identifying_names.py \
             tests/test_scroll_transcript.py \
             tests/test_golden.py \
             tests/test_listing_counts.py \

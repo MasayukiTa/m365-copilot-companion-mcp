@@ -41,11 +41,17 @@ settle replay: 120 turns
   discordant: legacy worse 0 / sampled worse 0
   (sampled_worse is structurally zero: the sampled predicate is the legacy one plus a floor, so it cannot accept earlier. This is not evidence -- it is the definition.)
 
-  The interval is over 12 clusters, not 120 turns: twelve prompts cycled ten times are
-  twelve independent units. With no events observed the bound is the rule of three over
-  those units, so 0.250 rather than the 0.030 a turn-level Wilson would print. A
-  nonparametric bootstrap would give [0, 0] here, which claims certainty a bootstrap
-  cannot have about an event it never saw.
+  THE INTERVAL IS NOT A BOOTSTRAP AND NOT THE SAME ESTIMAND AS THE POINT FIGURE. With no
+  events observed, a nonparametric bootstrap returns [0, 0] -- it cannot invent an event it
+  never saw -- so the bound is the rule of three over the twelve prompts: 0.250, against the
+  0.030 a turn-level Wilson would print. But the point estimate is a TURN-level proportion
+  while that bound treats a PROMPT as the unit, so read 0.250 as a conservative sensitivity
+  bound rather than a calibrated interval for the same quantity. It was labelled "cluster
+  bootstrap", which was a correct number under the name of a different method.
+
+  And that twelve prompts are twelve INDEPENDENT units is an assumption. Cycling twelve
+  convenience prompts through one tenant does not establish it; it is simply less wrong than
+  treating 120 correlated turns as 120.
 
 -- what this does and does not settle ---------------------------------------------
 
