@@ -49,7 +49,10 @@ def test_an_employee_id_is_caught_by_shape():
 
 
 def test_a_home_directory_names_whoever_owns_it():
-    d = _repo({"a.py": 'P = "C:/Users/somebody/project"\n'})
+    # Assembled, for the same reason as SYNTHETIC_ID: a fixture spelled out in full is an
+    # instance of exactly what the check exists to find, and this file would then fail it.
+    home = "C:/Users" + "/somebody/project"
+    d = _repo({"a.py": 'P = "%s"\n' % home})
     assert C.offences(d)
 
 
@@ -126,7 +129,7 @@ def test_the_shape_matches_an_id_with_letters_among_the_digits():
     実IDは英字と数字が交互で、捕まえるために書いた検査が捕まえられなかった。
     リポジトリを通し続け、漏洩を拾ったのは偶然ホームパスの規則の方だった。"""
     assert C.ID_SHAPE.search(SYNTHETIC_ID)
-    assert C.ID_SHAPE.search("A123456")
+    assert C.ID_SHAPE.search("A12" + "3456")   # the letter-then-digits form
 
 
 def test_the_shape_does_not_fire_on_ordinary_upper_case_words():
