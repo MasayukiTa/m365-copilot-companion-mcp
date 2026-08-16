@@ -214,6 +214,48 @@ def _harness_attribution(agent) -> dict:
     }
 
 
+#: How much of a suite has to be measured before a conditional rate means anything, and how
+#: far two arms may differ in that before the comparison stops being between the arms.
+MIN_COVERAGE = 0.80
+MAX_COVERAGE_GAP = 0.10
+
+
+def comparable(baseline_totals, candidate_totals) -> list:
+    """Every reason these two results must not be compared. Empty means they may.
+
+    THE FAILURE THIS PREVENTS is not a wrong p-value, it is a p-value about the wrong thing.
+    A conditional capability rate is computed over ATTEMPTS, so an arm that fails to attempt
+    more episodes than the other is measured on an easier subset of the suite -- and the more
+    environment failures it has, the better it can look. Nothing downstream can see that,
+    because by the time the gate runs the excluded episodes are gone.
+
+    So the comparison is refused when either arm measured too little of the suite, or when the
+    two measured materially different amounts of it. Both are stated as reasons rather than a
+    Boolean, because "these numbers are not comparable" is only useful with the number that
+    made them so.
+    """
+    reasons = []
+    for name, totals in (("baseline", baseline_totals), ("candidate", candidate_totals)):
+        coverage = totals.get("coverage")
+        if coverage is None:
+            reasons.append("%s measured nothing" % name)
+        elif coverage < MIN_COVERAGE:
+            reasons.append(
+                "%s covered only %.0f%% of the suite; a conditional rate over that is a "
+                "statement about that fraction, not about the system"
+                % (name, 100 * coverage))
+
+    a = baseline_totals.get("coverage")
+    b = candidate_totals.get("coverage")
+    if a is not None and b is not None and abs(a - b) > MAX_COVERAGE_GAP:
+        reasons.append(
+            "the arms covered %.0f%% and %.0f%% of the suite -- a %.0f point gap. The arm "
+            "that attempted less is being scored on a different subset, and an arm with more "
+            "environment failures can score better for that reason alone"
+            % (100 * a, 100 * b, 100 * abs(a - b)))
+    return reasons
+
+
 def _refuse_a_meaningless_target(agent):
     """A baseline from a scripted agent measures the script.
 
@@ -239,12 +281,38 @@ def summarise(rows) -> dict:
     infra = [r for r in rows if r.get("infra_failure")]
     attempted = [r for r in rows if not r.get("infra_failure")]
     passed = [r for r in attempted if r.get("success")]
+    # TWO QUESTIONS, NEVER ONE NUMBER.
+    #
+    # Every classification added to this suite has moved failures out of the denominator: a
+    # stream without a terminator, a rate-limit notice, a bridge error in the reply text. Each
+    # was correct on its own and each RAISED the reported pass rate, because "attempted" is
+    # the denominator and infra leaves it. Three rounds in the same direction is a structure,
+    # not a coincidence -- the instrument gets better and the number gets better with it, and
+    # nothing in the output distinguishes those two.
+    #
+    # So the rate is reported twice. `conditional_capability` asks what fraction of ATTEMPTS
+    # the system got right; excluding an environment failure is correct there. `end_to_end`
+    # asks what fraction of REQUESTS became a correct outcome, and an environment failure is
+    # a failure there, because a user who asked for something and got nothing does not care
+    # whose fault it was. `coverage` is the term that connects them and is the honesty of the
+    # first: a conditional rate over a third of the suite is a statement about a third of the
+    # suite.
+    delivered = [r for r in rows if r.get("delivery_confirmed")]
     security = [r for r in attempted if r.get("category") == SECURITY_CATEGORY]
     return {
         "total": len(rows),
         "attempted": len(attempted),
         "passed": len(passed),
         "pass_rate": round(len(passed) / len(attempted), 4) if attempted else None,
+        "conditional_capability": (round(len(passed) / len(attempted), 4)
+                                   if attempted else None),
+        "end_to_end": round(len(passed) / len(rows), 4) if rows else None,
+        "coverage": round(len(attempted) / len(rows), 4) if rows else None,
+        # Delivery is a stricter denominator than "not infra": it needs POSITIVE evidence the
+        # prompt arrived, rather than the absence of a recognised failure. The gap between
+        # `coverage` and this is the set of turns nothing is known about.
+        "delivery_confirmed": len(delivered),
+        "delivery_rate": round(len(delivered) / len(rows), 4) if rows else None,
         "infra": len(infra),
         "infra_ids": [r["episode_id"] for r in infra],
         "failed_ids": [r["episode_id"] for r in attempted if not r.get("success")],
@@ -304,16 +372,35 @@ def report(result) -> str:
              "grader          %s" % result["grader_version"][:16],
              "wall clock      %.0fs" % result["wall_clock_s"], ""]
 
-    lines += ["%-12s %8s %8s %8s %8s" % ("pool", "passed", "of", "infra", "rate"), "-" * 48]
-    for pool, s in result["by_pool"].items():
-        lines.append("%-12s %8d %8d %8d %8s"
-                     % (pool, s["passed"], s["attempted"], s["infra"],
-                        "n/a" if s["pass_rate"] is None else "%.2f" % s["pass_rate"]))
+    def _pct(v):
+        return "n/a" if v is None else "%.2f" % v
+
+    lines += ["%-12s %7s %7s %7s   %-11s %-11s %s"
+              % ("pool", "passed", "tried", "of", "capability", "end-to-end", "coverage"),
+              "-" * 72]
+    for pool, st in result["by_pool"].items():
+        lines.append("%-12s %7d %7d %7d   %-11s %-11s %s"
+                     % (pool, st["passed"], st["attempted"], st["total"],
+                        _pct(st["conditional_capability"]), _pct(st["end_to_end"]),
+                        _pct(st["coverage"])))
     t = result["totals"]
-    lines += ["-" * 48,
-              "%-12s %8d %8d %8d %8s"
-              % ("all", t["passed"], t["attempted"], t["infra"],
-                 "n/a" if t["pass_rate"] is None else "%.2f" % t["pass_rate"]), ""]
+    lines += ["-" * 72,
+              "%-12s %7d %7d %7d   %-11s %-11s %s"
+              % ("all", t["passed"], t["attempted"], t["total"],
+                 _pct(t["conditional_capability"]), _pct(t["end_to_end"]),
+                 _pct(t["coverage"])),
+              "",
+              "  capability = passed / attempted   (environment failures excluded)",
+              "  end-to-end = passed / all         (environment failures count against it)",
+              "  coverage   = attempted / all      (how much of the suite was measured)",
+              "",
+              "  Quote the pair. Every classification added to this suite so far removed",
+              "  failures from the capability denominator and raised it; end-to-end is the",
+              "  number that cannot be improved that way.",
+              "",
+              "  delivery confirmed on %d of %d (%s): positive evidence the prompt arrived --"
+              % (t["delivery_confirmed"], t["total"], _pct(t["delivery_rate"])),
+              "  the workdir changed, or the reply referred to the task."]
 
     lines += ["by category", ""]
     for cat, s in result["by_category"].items():

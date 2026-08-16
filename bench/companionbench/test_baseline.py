@@ -295,3 +295,63 @@ def test_each_run_reports_only_its_own_turns(monkeypatch):
     assert len(agent.transcript) == 2, "前提: transcript は生涯累積する"
     assert len(first["transport"]) == 1
     assert len(second["transport"]) == 1, "前の走行のターンが混ざっている"
+
+
+# ---- the two questions, and the gate between them -------------------------------------------
+
+def test_capability_and_end_to_end_are_both_reported():
+    """環境障害を分母から外す修正は、これまで3ラウンド続けて pass rate を押し上げてきた。
+    計器が良くなったのか数字が良くなったのかを、出力が区別できていなかった。"""
+    rows = [_row("a", True), _row("b", False), _row("c", False, infra=True)]
+    got = B.summarise(rows)
+    assert got["conditional_capability"] == 0.5     # 1 of 2 attempted
+    assert got["end_to_end"] == round(1 / 3, 4)     # 1 of 3 requested
+    assert got["coverage"] == round(2 / 3, 4)
+
+
+def test_end_to_end_cannot_be_improved_by_reclassifying_a_failure_as_infra():
+    """これが要点。conditional は分類の付け替えで上がるが、end-to-end は動かない。"""
+    as_failure = B.summarise([_row("a", True), _row("b", False)])
+    as_infra = B.summarise([_row("a", True), _row("b", False, infra=True)])
+    assert as_infra["conditional_capability"] > as_failure["conditional_capability"]
+    assert as_infra["end_to_end"] == as_failure["end_to_end"]
+
+
+def test_delivery_is_counted_from_positive_evidence():
+    rows = [_row("a", True), _row("b", False)]
+    rows[0]["delivery_confirmed"] = True
+    got = B.summarise(rows)
+    assert got["delivery_confirmed"] == 1
+    assert got["delivery_rate"] == 0.5
+
+
+# ---- the comparability gate -----------------------------------------------------------------
+
+def _totals(passed, attempted, total):
+    rows = ([_row("p%d" % i, True) for i in range(passed)]
+            + [_row("f%d" % i, False) for i in range(attempted - passed)]
+            + [_row("i%d" % i, False, infra=True) for i in range(total - attempted)])
+    return B.summarise(rows)
+
+
+def test_two_arms_that_measured_the_same_suite_may_be_compared():
+    assert B.comparable(_totals(5, 10, 10), _totals(7, 10, 10)) == []
+
+
+def test_an_arm_that_measured_a_third_of_the_suite_is_refused():
+    """3分の1に対する条件付き率は、その3分の1についての主張。"""
+    reasons = B.comparable(_totals(3, 4, 12), _totals(7, 10, 10))
+    assert any("covered only" in r for r in reasons)
+
+
+def test_arms_with_different_coverage_are_refused():
+    """試行しなかったエピソードが多い腕ほど、易しい部分集合で採点される。
+    環境障害が多いほど成績が良く見えうる。"""
+    reasons = B.comparable(_totals(8, 10, 10), _totals(7, 8, 10))
+    assert any("different subset" in r for r in reasons)
+
+
+def test_the_gate_names_the_number_that_blocked_it():
+    """『比較できません』は、そうさせた数字と一緒でなければ使えない。"""
+    reasons = B.comparable(_totals(2, 3, 12), _totals(7, 10, 10))
+    assert any("%" in r for r in reasons)

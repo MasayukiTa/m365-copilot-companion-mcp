@@ -266,6 +266,9 @@ def run_episode(episode, agent, *, root=None) -> dict:
         # no signature in the score at all. Demonstrated by an independent review with a
         # three-line agent that removed one workbook.
         before = _fixture_snapshot(run.workdir)
+        # WHERE THIS EPISODE'S TRANSPORT RECORD BEGINS, so the delivery evidence below can be
+        # joined to THIS turn rather than to whatever the adapter happened to do last.
+        transcript_mark = len(getattr(agent, "transcript", []) or [])
         trace = _EvidenceTrace()
         try:
             with trace:
@@ -314,7 +317,41 @@ def run_episode(episode, agent, *, root=None) -> dict:
             out["security_coverage"] = COVERAGE_COMPLETE
     out.update({"episode_id": episode.episode_id, "category": episode.category,
                 "latency_s": round(time.time() - started, 3)})
+    out.update(_delivery_evidence(agent, transcript_mark, before, after))
     return out
+
+
+def _delivery_evidence(agent, mark, before, after) -> dict:
+    """Did the prompt REACH the agent -- as evidence, not as an assumption.
+
+    Every episode's workdir is a fresh temporary directory whose path appears only in that
+    episode's prompt. So a change anywhere under it is proof that the prompt arrived and that
+    something acted on it: no inference about wording, no phrase list, nothing that a terse
+    answer can fail.
+
+    An episode whose whole answer is in the reply -- a routing decision, a read-only query --
+    touches nothing, so the reply-shaped check covers those. It is the weaker of the two and
+    is only consulted when the filesystem says nothing, which is the right order: one is a
+    fact about what happened, the other is a guess about what a sentence means.
+
+    WHY THIS IS RECORDED RATHER THAN ACTED ON. Every classification added here so far has
+    moved failures OUT of the denominator, which raises the pass rate. Delivery evidence is
+    the first thing that lets the two questions be asked separately instead -- what fraction
+    of ATTEMPTS the system got right, and what fraction of REQUESTS ever became an attempt --
+    and neither is allowed to hide inside the other. See baseline.summarise.
+    """
+    touched = _touched(before, after)
+    suspect = None
+    transcript = getattr(agent, "transcript", None)
+    if isinstance(transcript, list) and len(transcript) > mark:
+        suspect = bool(transcript[mark].get("delivery_suspect"))
+    return {
+        "touched_workdir": touched,
+        "delivery_confirmed": bool(touched or (suspect is False)),
+        "delivery_evidence": ("workdir changed" if touched
+                              else "reply referred to the prompt" if suspect is False
+                              else "none: nothing changed and the reply shared no term"),
+    }
 
 
 def _fixture_snapshot(workdir):
@@ -729,7 +766,14 @@ def paired_evaluate(base_manifest, candidate_manifest, agent, *, tmpdir,
                         "measuring what the candidate left standing"
                         % (len(candidate_only_infra), ", ".join(candidate_only_infra)))
     else:
-        infra_reason = ""
+        # HOW MUCH OF THE SUITE EACH ARM ACTUALLY MEASURED. The check above catches an
+        # asymmetry by EPISODE ID, which is the sharpest case; this catches the same failure
+        # by volume, including when the two arms lost different episodes and the ids
+        # therefore do not line up. An arm that attempted less is scored on an easier subset,
+        # and by the time the significance gate runs those episodes are already gone.
+        from bench.companionbench.baseline import comparable, summarise
+        coverage_reasons = comparable(summarise(base), summarise(cand))
+        infra_reason = "; ".join(coverage_reasons)
     return {
         "gate": gate,
         "security": _security_regression(base, cand),

@@ -816,3 +816,25 @@ def test_no_trace_leaves_the_claim_partial():
     out = R.run_episode(ep, A.in_process(plain))
     assert out["evidence_trace"]["present"] is False
     assert out["security_coverage"] == COVERAGE_PARTIAL
+
+
+def test_a_paired_run_whose_arms_measured_different_amounts_aborts(monkeypatch):
+    """試行数が違えば、条件付き率は別の部分集合についての数字になる。
+    エピソードIDでの非対称検査は最も鋭い場合を捕まえるが、
+    両腕が別々のエピソードを失った場合はIDが噛み合わず素通りする。"""
+    from bench.companionbench import baseline as B
+
+    def _rows(n_ok, n_infra, offset=0):
+        out = []
+        for i in range(n_ok):
+            out.append({"episode_id": "e%d" % i, "success": True, "infra_failure": False,
+                        "category": "excel", "latency_s": 1.0})
+        for i in range(n_infra):
+            out.append({"episode_id": "x%d" % (i + offset), "success": False,
+                        "infra_failure": True, "category": "excel", "latency_s": 1.0})
+        return out
+
+    # both arms lost episodes, but DIFFERENT ones, so the id-based check sees no asymmetry
+    reasons = B.comparable(B.summarise(_rows(9, 1)), B.summarise(_rows(5, 5, offset=100)))
+    assert reasons, "被覆の差が見逃されている"
+    assert any("different subset" in r or "covered only" in r for r in reasons)
