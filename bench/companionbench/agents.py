@@ -177,6 +177,54 @@ def service_declined(reply: str) -> str:
     return ""
 
 
+#: A bridge error can arrive as the REPLY TEXT rather than as an SSE error frame. Observed:
+#: "[bridge error: RuntimeError: send failed: composer cleared without a conversation or
+#: generation acknowledgement]". The frame-level check never saw it, so the grader scored a
+#: stack trace as the companion's answer.
+_BRIDGE_ERROR_IN_TEXT = ("[bridge error:", "[relay error:")
+
+
+def _distinctive(text, minimum=4):
+    """Tokens from a prompt that a reply would only contain if it had SEEN the prompt.
+
+    Filenames, paths and long words. Short words and punctuation are shared by every sentence
+    in the language and would make the check pass on anything.
+    """
+    import re
+    out = set()
+    for token in re.findall(r"[A-Za-z0-9_./\-]{%d,}" % minimum, text or ""):
+        token = token.strip("./\\")
+        if len(token) >= minimum and not token.isdigit():
+            out.add(token.lower())
+    return out
+
+
+def attempted_the_task(prompt: str, reply: str) -> bool:
+    """Whether this reply shows any sign of having seen the prompt.
+
+    THE PRINCIPLED VERSION OF A PHRASE LIST. A greeting -- "hello, what can I help you with?"
+    -- is what the companion says when the task never reached the tab. It settles cleanly, it
+    is short, and it grades as a capability failure, which is how a delivery failure gets
+    recorded as the system being bad at filesystem work.
+    
+    The relay already keeps a list of phrases for this and the observed greeting was not in
+    it, which is the ordinary fate of a hand-written list: it fails OPEN, and the miss looks
+    like a result. So this asks for positive evidence instead. Every episode prompt names a
+    workdir, a filename, or a term particular to the task; a reply that shares NO distinctive
+    token with its prompt and is also short has not engaged with it.
+
+    Both conditions, because either alone is wrong. A long answer that happens to paraphrase
+    without quoting is still an answer, and a short reply that names the file ("done, edited
+    mod_b.py") is an attempt -- possibly a false one, but that is the grader's question and
+    not this one's.
+    """
+    text = (reply or "").strip()
+    if len(text) >= 120:
+        return True
+    shared = _distinctive(prompt) & _distinctive(text)
+    return bool(shared)
+
+
 class TurnDidNotSettle(RuntimeError):
     """The turn never completed, so there is nothing to grade.
 
@@ -351,6 +399,18 @@ class BridgeAgent:
             raise TurnDidNotSettle(
                 "the bridge reported an error and then terminated the stream (%s); that is "
                 "the environment, not an answer" % _bridge_error(raw)[:120])
+        for marker in _BRIDGE_ERROR_IN_TEXT:
+            if marker in (reply or ""):
+                raise TurnDidNotSettle(
+                    "the bridge's own error arrived as the reply text (%s); a stack trace is "
+                    "not an answer, and the frame-level check does not see this shape"
+                    % (reply or "")[:120])
+
+        # ORDERED BY HOW MUCH IS BEING INFERRED. Each of these says "this was not a valid
+        # measurement", and the first three know it from something the transport reported --
+        # an error payload, a missing terminator, the service saying so in its own words. The
+        # last one INFERS it from the shape of the reply, which is weaker and can be wrong, so
+        # it runs only when none of the others has already explained the turn.
         declined = service_declined(reply)
         if declined:
             raise TurnDidNotSettle(
@@ -363,6 +423,17 @@ class BridgeAgent:
                 "the stream ended after %.1fs without `event: done` (%d bytes, %d chars of "
                 "reply): the turn did not complete, so this is an environment result and not "
                 "an answer to grade" % (elapsed, len(raw), len(reply)))
+        # FLAGGED, NOT RAISED. The first version of this raised, and it immediately
+        # misclassified a terse correct answer -- the reply "42" to an arithmetic question
+        # shares no distinctive token with its prompt and is short, which is exactly the
+        # shape of the greeting it was written to catch.
+        #
+        # Raising would move those turns out of the denominator, which RAISES the pass rate:
+        # the same direction as every other defect found here, and the one that flatters the
+        # system. While the failure modes are still being discovered one at a time, the
+        # honest thing is to record the suspicion where a person can look at it rather than
+        # to act on it silently. `bench/companionbench/baseline.py` reports the count.
+        self.transcript[-1]["delivery_suspect"] = not attempted_the_task(full, reply)
         return reply
 
 

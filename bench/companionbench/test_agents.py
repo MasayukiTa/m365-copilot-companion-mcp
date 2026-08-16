@@ -97,12 +97,16 @@ class _Bridge(A.BridgeAgent):
         return True
 
 
-_DONE = ('data: {"replace": "the answer"}\n\n'
+#: A completed turn. The reply names something from the prompt below, because a reply that
+#: shares nothing with its prompt is now itself a finding -- a delivery failure -- and these
+#: tests are about other things.
+_PROMPT = "edit mod_b.py in C:/wd and report"
+_DONE = ('data: {"replace": "done, mod_b.py updated"}\n\n'
          'event: done\ndata: {}\n\n')
 
 
 def test_a_completed_turn_returns_its_answer():
-    assert _Bridge(_DONE)("do the thing", "C:/wd") == "the answer"
+    assert _Bridge(_DONE)(_PROMPT, "C:/wd") == "done, mod_b.py updated"
 
 
 def test_a_stream_that_ended_without_done_is_an_environment_result():
@@ -111,21 +115,21 @@ def test_a_stream_that_ended_without_done_is_an_environment_result():
     calls_through_the_api:0 -- 誤答ではなく『ターンが起きていない』署名。
     ブリッジは必ず done を出すので、その不在は未完了を意味する。"""
     with pytest.raises(A.TurnDidNotSettle) as exc:
-        _Bridge('data: {"delta": "half an ans')("do the thing", "C:/wd")
+        _Bridge('data: {"delta": "half an ans')(_PROMPT, "C:/wd")
     assert "did not complete" in str(exc.value)
 
 
 def test_an_empty_stream_is_not_graded_as_an_empty_answer():
     """空返答をゼロ点にすると、環境障害が能力の低下として記録される。"""
     with pytest.raises(A.TurnDidNotSettle):
-        _Bridge("")("do the thing", "C:/wd")
+        _Bridge("")(_PROMPT, "C:/wd")
 
 
 def test_a_bridge_busy_for_the_whole_window_is_an_environment_result(monkeypatch):
     """混雑で1ターンも走らなかったのは、能力ではなく環境の結果。"""
     monkeypatch.setattr(A.BridgeAgent, "BUSY_RETRY_S", 0.01)
     with pytest.raises(A.TurnDidNotSettle) as exc:
-        _Bridge('{"ok": false, "error": "busy"}', retry_busy_s=0.05)("x", "C:/wd")
+        _Bridge('{"ok": false, "error": "busy"}', retry_busy_s=0.05)(_PROMPT, "C:/wd")
     assert "busy" in str(exc.value)
 
 
@@ -133,7 +137,7 @@ def test_a_zero_retry_window_still_asks_once(monkeypatch):
     """締切を先に見ていたので retry_busy_s=0 は『一度も聞かない』を意味していた。"""
     monkeypatch.setattr(A.BridgeAgent, "BUSY_RETRY_S", 0.01)
     b = _Bridge(_DONE, retry_busy_s=0)
-    assert b("x", "C:/wd") == "the answer"
+    assert b(_PROMPT, "C:/wd") == "done, mod_b.py updated"
 
 
 def test_a_settled_but_empty_answer_is_still_graded():
@@ -163,7 +167,7 @@ def test_a_failed_fresh_conversation_is_an_environment_result_not_a_silent_carry
             return False
 
     with pytest.raises(A.TurnDidNotSettle) as exc:
-        _NoNew(_DONE)("x", "C:/wd")
+        _NoNew(_DONE)(_PROMPT, "C:/wd")
     assert "order-dependent" in str(exc.value)
 
 
@@ -171,7 +175,7 @@ def test_a_bridge_error_that_terminated_the_stream_is_not_an_answer():
     """ブリッジは自分の例外の後にも done を出す。settled だけでは足りない。"""
     raw = 'data: {"ok": false, "error": "page went away"}\n\nevent: done\ndata: {}\n\n'
     with pytest.raises(A.TurnDidNotSettle) as exc:
-        _Bridge(raw)("x", "C:/wd")
+        _Bridge(raw)(_PROMPT, "C:/wd")
     assert "reported an error" in str(exc.value)
 
 
@@ -179,7 +183,7 @@ def test_an_answer_that_merely_mentions_errors_is_still_an_answer():
     """本文に error という語が出るだけで infra に落とすと、本物の回答が消える。"""
     raw = ('data: {"replace": "Common causes: an error in the config, ok: false in the log"}'
            '\n\nevent: done\ndata: {}\n\n')
-    assert "Common causes" in _Bridge(raw)("x", "C:/wd")
+    assert "Common causes" in _Bridge(raw)(_PROMPT, "C:/wd")
 
 
 def test_the_client_does_not_give_up_before_the_bridge_does():
@@ -196,7 +200,7 @@ def test_a_rate_limit_notice_is_the_environment_not_a_wrong_answer():
     raw = ('data: {"replace": "この量のリクエストには、現在一時的に応答できません。'
            '後でもう一度お試しください。"}\n\nevent: done\ndata: {}\n\n')
     with pytest.raises(A.TurnDidNotSettle) as exc:
-        _Bridge(raw)("x", "C:/wd")
+        _Bridge(raw)(_PROMPT, "C:/wd")
     assert "declined this turn" in str(exc.value)
 
 
@@ -224,4 +228,66 @@ def test_degraded_throttling_is_knowingly_not_detected():
     assert "one-sided" in doc
     # and it behaves that way: a short, plausible, wrong answer is still an answer
     raw = 'data: {"replace": "42"}\n\nevent: done\ndata: {}\n\n'
-    assert _Bridge(raw)("x", "C:/wd") == "42"
+    assert _Bridge(raw)("what is 6 times 7? answer with digits", "C:/wd") == "42"
+
+
+# ---------------------------------------------------------------------------------------
+# Delivery failures, found by printing the replies instead of inferring from latencies
+# ---------------------------------------------------------------------------------------
+
+def test_a_greeting_means_the_task_never_arrived():
+    """観測された返答: 『こんにちは。ご用件をお聞かせください。何かお手伝いできることは
+    ありますか？』 -- タスクがタブに届いていない。37文字、正常終了、そして
+    『filesystem が苦手な系』として記録されていた。"""
+    raw = ('data: {"replace": "こんにちは。ご用件をお聞かせください。'
+           '何かお手伝いできることはありますか？"}\n\nevent: done\ndata: {}\n\n')
+    b = _Bridge(raw)
+    b("作業フォルダは C:/wd です。mod_b.py の TIMEOUT を変更してください。", "C:/wd")
+    # FLAGGED, NOT EXCLUDED. Raising moves the turn out of the denominator and RAISES the pass
+    # rate -- the direction every defect found in this suite has already moved it -- and the
+    # same check calls a terse correct answer a delivery failure. So the suspicion is recorded
+    # for a person to look at, and the turn is still counted.
+    assert b.transcript[-1]["delivery_suspect"] is True
+
+
+def test_a_terse_correct_answer_is_only_suspected_never_excluded():
+    """『42』は短く、プロンプトと語を共有しない -- 捕まえたい挨拶文と同じ形。
+    ここで例外にすると、正しい回答を分母から外すことになる。"""
+    raw = 'data: {"replace": "42"}\n\nevent: done\ndata: {}\n\n'
+    b = _Bridge(raw)
+    assert b("what is 6 times 7? answer with digits", "C:/wd") == "42"
+    assert b.transcript[-1]["delivery_suspect"] is True
+
+
+def test_a_short_reply_that_names_the_file_is_an_attempt():
+    """『完了しました。mod_b.py を変更しました』は着手の証拠。
+    それが真実かどうかはグレーダの問いで、この関数の問いではない。"""
+    raw = ('data: {"replace": "完了しました。mod_b.py の TIMEOUT を変更しました。"}'
+           '\n\nevent: done\ndata: {}\n\n')
+    assert _Bridge(raw)("mod_b.py の TIMEOUT を 30 から 90 に変更してください。", "C:/wd")
+
+
+def test_a_long_answer_counts_as_an_attempt_even_without_shared_words():
+    """言い換えただけの長い回答も回答。両方の条件を要求するのはこのため。"""
+    assert A.attempted_the_task("edit mod_b.py in C:/wd", "x" * 200)
+
+
+def test_the_check_is_positive_evidence_rather_than_a_phrase_list():
+    """relay 側は語句一覧を持っていて、今回の挨拶文はそこに無かった。
+    手書き一覧は fail-open し、取りこぼしが結果の形をして出てくる。"""
+    from relay.copilot_autopilot_relay import _GOAL_NOT_SEEN_MARKERS
+    greeting = "こんにちは。ご用件をお聞かせください。何かお手伝いできることはありますか？"
+    assert not any(m in greeting for m in _GOAL_NOT_SEEN_MARKERS), \
+        "前提が変わった: 一覧が捕捉するようになったなら、この試験の理由を書き直すこと"
+    assert not A.attempted_the_task("edit mod_b.py in C:/wd", greeting)
+
+
+def test_a_bridge_error_arriving_as_reply_text_is_not_an_answer():
+    """観測: `[bridge error: RuntimeError: send failed: composer cleared ...]` が
+    返答本文として届き、フレーム単位の検査は見ていなかった。"""
+    raw = ('data: {"replace": "[bridge error: RuntimeError: send failed: composer cleared '
+           'without a conversation or generation acknowledgement]"}'
+           '\n\nevent: done\ndata: {}\n\n')
+    with pytest.raises(A.TurnDidNotSettle) as exc:
+        _Bridge(raw)("edit mod_b.py in C:/wd", "C:/wd")
+    assert "arrived as the reply text" in str(exc.value)

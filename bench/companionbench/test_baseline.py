@@ -203,7 +203,8 @@ def test_the_transport_facts_are_saved_so_a_diagnosis_can_be_checked(monkeypatch
                         {"episode_id": "e1", "success": False, "infra_failure": False,
                          "category": "excel", "latency_s": 24.1})
     out = B.run_suite(_WithTranscript(), pools=("evolution",))
-    assert out["transport"] == [{"elapsed_s": 24.1, "settled": False, "reply_chars": 0}]
+    assert out["transport"] == [{"elapsed_s": 24.1, "settled": False, "reply_chars": 0,
+                                 "delivery_suspect": False}]
 
 
 def test_the_fleet_is_not_pointed_at_the_research_agent(monkeypatch):

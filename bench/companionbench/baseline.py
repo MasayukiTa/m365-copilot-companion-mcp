@@ -113,7 +113,9 @@ def _transport_summary(agent, since=0):
     if not isinstance(transcript, list):
         return []
     return [{"elapsed_s": t.get("elapsed_s"), "settled": t.get("settled"),
-             "reply_chars": len(t.get("reply") or "")} for t in transcript[since:]]
+             "reply_chars": len(t.get("reply") or ""),
+             "delivery_suspect": bool(t.get("delivery_suspect"))}
+            for t in transcript[since:]]
 
 
 def repeat_suite(agent, *, repeats=3, pools=POOLS, root=None, on_result=None,
@@ -340,6 +342,16 @@ def report(result) -> str:
                                for k, v in sorted((row.get("details") or {}).items())
                                if v not in ((), [], {}, "", None)) or "(grader recorded no detail)"
             lines.append("  %-28s %s" % (row["episode_id"], detail[:110]))
+    suspect = [t for t in (result.get("transport") or []) if t.get("delivery_suspect")]
+    if suspect:
+        lines += ["",
+                  "%d turn(s) replied without any sign of having seen the prompt -- a"
+                  % len(suspect),
+                  "greeting, or a terse answer that happens to share no words with its task.",
+                  "These are STILL COUNTED. The check cannot tell a delivery failure from a",
+                  "short correct answer, and excluding them would raise the pass rate, which",
+                  "is the direction every defect found here has already moved it."]
+
     if t["infra_ids"]:
         lines += ["infra:   " + ", ".join(t["infra_ids"]),
                   "",
