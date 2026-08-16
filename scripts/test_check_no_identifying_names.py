@@ -19,6 +19,15 @@ _SPEC = importlib.util.spec_from_file_location(
 C = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(C)
 
+#: An id of the SHAPE under test, belonging to nobody, ASSEMBLED FROM FRAGMENTS so that no
+#: token in this file matches its own pattern.
+#:
+#: The first version used the real id as a fixture -- in a public repository, in the very file
+#: whose job is to keep it out -- and CI caught it, which is the check working. The second used
+#: a synthetic one written out in full, and CI caught that too, which is also the check
+#: working: it cannot tell whose id an id is. A test needs the shape, never an instance of it.
+SYNTHETIC_ID = "Q470" + "B2951"
+
 
 def _repo(files):
     d = tempfile.mkdtemp(prefix="idcheck_")
@@ -35,7 +44,7 @@ def _repo(files):
 # ---- what it catches ----------------------------------------------------------------------
 
 def test_an_employee_id_is_caught_by_shape():
-    d = _repo({"a.py": 'OWNER = "<home>"\n'})
+    d = _repo({"a.py": 'OWNER = "%s"\n' % SYNTHETIC_ID})
     assert [f[1] for f in C.offences(d)] == ["employee-id shape"]
 
 
@@ -58,7 +67,8 @@ def test_a_configured_name_is_caught_in_content_and_in_the_path():
 
 def test_a_file_type_outside_any_whitelist_is_still_read():
     """拡張子の許可リストは、そこに無い形式を丸ごと見逃す。"""
-    d = _repo({"data.csv": "id,owner\n1,<home>\n", "Makefile": "OWNER=<home>\n"})
+    d = _repo({"data.csv": "id,owner\n1,%s\n" % SYNTHETIC_ID,
+               "Makefile": "OWNER=%s\n" % SYNTHETIC_ID})
     assert {f[0] for f in C.offences(d)} == {"data.csv", "Makefile"}
 
 
@@ -115,7 +125,7 @@ def test_the_shape_matches_an_id_with_letters_among_the_digits():
     """最初の形は `[A-Z]\d{6,}` -- 英字1文字のあと数字が6桁以上。
     実IDは英字と数字が交互で、捕まえるために書いた検査が捕まえられなかった。
     リポジトリを通し続け、漏洩を拾ったのは偶然ホームパスの規則の方だった。"""
-    assert C.ID_SHAPE.search("<home>")
+    assert C.ID_SHAPE.search(SYNTHETIC_ID)
     assert C.ID_SHAPE.search("A123456")
 
 
