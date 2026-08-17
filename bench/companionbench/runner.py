@@ -51,6 +51,24 @@ from bench.companionbench.episode import (COVERAGE_COMPLETE, COVERAGE_PARTIAL,
 
 SECURITY_CATEGORY = "security"
 
+#: THE EVIDENCE TRACE FOR THE EPISODE RUNNING ON THIS THREAD, and a flag saying whether
+#: anything is running beside it. `os.environ` is process-global, so it can only carry
+#: per-episode state while episodes are serial; these two let the serial path keep working
+#: exactly as before while the concurrent path stops using the environment altogether.
+_TRACE_LOCAL = __import__("threading").local()
+_CONCURRENT = {"on": False}
+
+
+def trace_env() -> dict:
+    """Trace variables for the episode on THIS thread, for an adapter to give its child.
+
+    An adapter that runs work in a subprocess must merge this into the child's environment
+    rather than inheriting `os.environ`, which under concurrency names some other episode's
+    trace file -- or none.
+    """
+    trace = getattr(_TRACE_LOCAL, "current", None)
+    return trace.overrides() if trace is not None else {}
+
 
 def dataset_fingerprint() -> str:
     """What suite this result came from, including the salted instance of the sealed pool.
@@ -207,14 +225,37 @@ class _EvidenceTrace:
         self.key = secrets.token_hex(32)
         self._prev = {}
 
-    def __enter__(self):
+    def overrides(self) -> dict:
+        """The trace variables for THIS episode, to be merged into a child's environment."""
         from tools import evidence_trace as T
-        for env, value in ((T.TRACE_PATH_ENV, self.path), (T.TRACE_KEY_ENV, self.key)):
-            self._prev[env] = os.environ.get(env)
-            os.environ[env] = value
+        return {T.TRACE_PATH_ENV: self.path, T.TRACE_KEY_ENV: self.key}
+
+    def __enter__(self):
+        # `os.environ` IS PROCESS-GLOBAL AND THERE IS NO PER-THREAD ENVIRONMENT, so this
+        # cannot be the carrier once episodes run side by side. The interleaving is not
+        # exotic: A installs its trace, B records A's value as "previous" and installs its
+        # own, A's child inherits B's path, A exits and REMOVES the variables, B's child
+        # inherits nothing, and B exits restoring A's. Tool calls then land in another
+        # episode's evidence file or in none -- and this evidence is what the security
+        # coverage verdict is computed from, so the failure would arrive as a confident
+        # wrong answer rather than as an error.
+        #
+        # The thread-local is always set and is the authority; the environment is written
+        # only when nothing else can be running, so the serial path keeps working for
+        # in-process agents that read os.environ directly. An adapter that opts into
+        # concurrency has to take `overrides()` and put it in its child's environment
+        # itself -- see FleetAgent.
+        _TRACE_LOCAL.current = self
+        if not _CONCURRENT.get("on"):
+            from tools import evidence_trace as T
+            for env, value in ((T.TRACE_PATH_ENV, self.path), (T.TRACE_KEY_ENV, self.key)):
+                self._prev[env] = os.environ.get(env)
+                os.environ[env] = value
         return self
 
     def __exit__(self, *exc):
+        if getattr(_TRACE_LOCAL, "current", None) is self:
+            _TRACE_LOCAL.current = None
         for env, value in self._prev.items():
             if value is None:
                 os.environ.pop(env, None)
@@ -287,7 +328,8 @@ def run_episode(episode, agent, *, root=None) -> dict:
             return dict(
                 _infra(episode, "agent raised: %s: %s" % (type(exc).__name__, exc),
                        started, trace=traceback.format_exc(limit=3)),
-                **_delivery_evidence(agent, transcript_mark, before, crashed))
+                **_delivery_evidence(agent, transcript_mark, before, crashed,
+                                           workdir=run.workdir))
         after = _fixture_snapshot(run.workdir)
         run_workdir = run.workdir
         destroyed = sorted(set(before) - set(after))
@@ -298,7 +340,8 @@ def run_episode(episode, agent, *, root=None) -> dict:
             # THESE ROWS HAVE THE STRONGEST DELIVERY EVIDENCE THERE IS -- the agent deleted
             # or corrupted a fixture, which is a change under the workdir -- and they were
             # returning before the evidence was attached, so they counted as unconfirmed.
-            evidence = _delivery_evidence(agent, transcript_mark, before, after)
+            evidence = _delivery_evidence(agent, transcript_mark, before, after,
+                                     workdir=run.workdir)
             if destroyed:
                 return dict(_agent_destroyed_fixture(episode, destroyed, started, reason),
                             **evidence)
@@ -314,7 +357,8 @@ def run_episode(episode, agent, *, root=None) -> dict:
     if destroyed:
         return dict(_agent_destroyed_fixture(episode, destroyed, started,
                                              grade.details.get("reason", "")),
-                    **_delivery_evidence(agent, transcript_mark, before, after))
+                    **_delivery_evidence(agent, transcript_mark, before, after,
+                                     workdir=run.workdir))
     out = grade.as_dict()
     # THE TRACE DECIDES WHAT A CLEAN SECURITY RESULT MAY CLAIM. A grader that saw no
     # violation in the workdir has partial coverage by construction; if a trace exists, is
@@ -335,11 +379,12 @@ def run_episode(episode, agent, *, root=None) -> dict:
             out["security_coverage"] = COVERAGE_COMPLETE
     out.update({"episode_id": episode.episode_id, "category": episode.category,
                 "latency_s": round(time.time() - started, 3)})
-    out.update(_delivery_evidence(agent, transcript_mark, before, after))
+    out.update(_delivery_evidence(agent, transcript_mark, before, after,
+                                     workdir=run.workdir))
     return out
 
 
-def _delivery_evidence(agent, mark, before, after) -> dict:
+def _delivery_evidence(agent, mark, before, after, workdir=None) -> dict:
     """Did the prompt REACH the agent -- as evidence, not as an assumption.
 
     Every episode's workdir is a fresh temporary directory, and a change under it means
@@ -380,19 +425,43 @@ def _delivery_evidence(agent, mark, before, after) -> dict:
     # So the reply signal is reported as its own weaker grade. An episode that legitimately
     # touches nothing -- a routing decision, a read-only query -- lands there, and a reader can
     # see which kind of evidence a number rests on instead of being told they are the same.
-    suspect = None
+    # WHICH TRANSCRIPT ENTRY IS THIS EPISODE'S -- and a POSITION is the wrong answer as soon
+    # as episodes run side by side. The mark was `len(transcript)` taken before the turn, so
+    # three concurrent episodes all take the same mark, whoever finishes first appends there,
+    # and the other two read a neighbour's row. Delivery evidence would then be attributed to
+    # the wrong episode: silently, plausibly, and in the one part of this suite that exists
+    # to stop exactly that kind of mistake.
+    #
+    # The workdir is the join. It is a temporary directory created for this episode and
+    # handed to the adapter, so it is unique by construction and needs no coordination. The
+    # positional mark stays as the fallback for adapters that do not record it -- serial by
+    # definition today, since concurrency is opt-in per adapter.
     transcript = getattr(agent, "transcript", None)
-    if isinstance(transcript, list) and len(transcript) > mark:
-        entry = transcript[mark]
-        if "delivery_suspect" in entry:
-            suspect = bool(entry["delivery_suspect"])
+    entry = None
+    if isinstance(transcript, list):
+        if workdir:
+            for row in reversed(transcript):
+                if isinstance(row, dict) and row.get("workdir") == workdir:
+                    entry = row
+                    break
+        if entry is None and len(transcript) > mark:
+            candidate = transcript[mark]
+            # Do not accept a positional match that names a DIFFERENT workdir: that is the
+            # race, caught rather than read.
+            if not (workdir and isinstance(candidate, dict) and candidate.get("workdir")
+                    and candidate.get("workdir") != workdir):
+                entry = candidate
+
+    suspect = None
+    if isinstance(entry, dict) and "delivery_suspect" in entry:
+        suspect = bool(entry["delivery_suspect"])
 
     # THE CONVERSATION IS THE STRONGEST EVIDENCE, when the adapter can supply it: the prompt
     # was read back out of the page the bridge drove, carrying a marker minted for this turn.
     # The workdir tells us something acted on the workspace; this tells us the request arrived.
     in_conversation = None
-    if isinstance(transcript, list) and len(transcript) > mark:
-        in_conversation = transcript[mark].get("prompt_in_conversation")
+    if isinstance(entry, dict):
+        in_conversation = entry.get("prompt_in_conversation")
 
     if in_conversation is True:
         grade, why = "confirmed", "the prompt was found in the conversation"
@@ -489,7 +558,8 @@ def _infra(episode, reason, started, trace=""):
     }
 
 
-def run_pool(pool, agent, *, root=None, episodes=None, workers=None) -> list:
+def run_pool(pool, agent, *, root=None, episodes=None, workers=None,
+             on_result=None) -> list:
     """Every episode in a pool (or an explicit list), in registry order.
 
     EPISODES ARE INDEPENDENT BY CONSTRUCTION -- each one builds its fixtures in its own
@@ -509,20 +579,53 @@ def run_pool(pool, agent, *, root=None, episodes=None, workers=None) -> list:
     compared position-wise against other runs.
     """
     chosen = list(episodes if episodes is not None else REGISTRY.get(pool))
-    if workers is None:
-        workers = int(getattr(agent, "max_concurrent_episodes", 1) or 1)
+    declared = int(getattr(agent, "max_concurrent_episodes", 1) or 1)
+    # THE ADAPTER'S NUMBER IS A CEILING, NOT A DEFAULT. `workers` used to override it, so a
+    # caller could run BridgeAgent -- one page behind one lock -- three wide, and get retry
+    # noise it would then read as latency. An argument may lower the ceiling, never raise it.
+    workers = declared if workers is None else min(int(workers), declared)
     workers = max(1, min(workers, len(chosen) or 1))
     if workers == 1 or len(chosen) < 2:
-        return [run_episode(ep, agent, root=root) for ep in chosen]
+        return _serial(chosen, agent, root, on_result)
+
+    # AN ADAPTER THAT KEEPS A TRANSCRIPT MUST TAG ITS ROWS. Delivery evidence is joined to an
+    # episode by workdir; without it the join falls back to a POSITION, and concurrent
+    # episodes all take the same position and read whoever finished first. Refused rather
+    # than run, because the result would look ordinary and be wrong.
+    transcript = getattr(agent, "transcript", None)
+    if isinstance(transcript, list) and transcript and not any(
+            isinstance(r, dict) and "workdir" in r for r in transcript):
+        raise RuntimeError(
+            "%s declares max_concurrent_episodes=%d but its transcript rows carry no "
+            "'workdir', so delivery evidence would be joined by position and concurrent "
+            "episodes would consume each other's rows" % (type(agent).__name__, declared))
 
     import concurrent.futures as _cf
     out = [None] * len(chosen)
-    with _cf.ThreadPoolExecutor(max_workers=workers) as pool_exec:
-        futures = {pool_exec.submit(run_episode, ep, agent, root=root): i
-                   for i, ep in enumerate(chosen)}
-        for future in _cf.as_completed(futures):
-            out[futures[future]] = future.result()
+    was = _CONCURRENT["on"]
+    _CONCURRENT["on"] = True
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=workers) as pool_exec:
+            futures = {pool_exec.submit(run_episode, ep, agent, root=root): i
+                       for i, ep in enumerate(chosen)}
+            for future in _cf.as_completed(futures):
+                row = future.result()
+                out[futures[future]] = row
+                if on_result is not None:
+                    on_result(row)
+    finally:
+        _CONCURRENT["on"] = was
     return out
+
+
+def _serial(chosen, agent, root, on_result):
+    rows = []
+    for episode in chosen:
+        row = run_episode(episode, agent, root=root)
+        rows.append(row)
+        if on_result is not None:
+            on_result(row)
+    return rows
 
 
 def _partition(results) -> dict:

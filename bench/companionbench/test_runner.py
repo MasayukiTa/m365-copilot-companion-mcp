@@ -950,3 +950,38 @@ def test_an_adapter_that_says_nothing_is_treated_as_serial():
             return "done"
 
     assert getattr(_Silent(), "max_concurrent_episodes", 1) == 1
+
+
+def test_delivery_evidence_is_joined_by_workdir_not_by_position():
+    """同時実行では mark(=len(transcript)) が3エピソードで同値になり、
+    先に終わった隣の行を読む。配送証拠が別エピソードに帰属する -- 静かに、もっともらしく、
+    しかもこの suite がまさにその種の誤りを止めるために持っている部分で。"""
+    class _Agent:
+        transcript = [
+            {"workdir": "C:/wd_b", "prompt_in_conversation": True},
+            {"workdir": "C:/wd_a", "prompt_in_conversation": False},
+        ]
+
+    # Position 0 is episode B's row; this episode is A. The positional mark would read B.
+    got = R._delivery_evidence(_Agent(), 0, {}, {}, workdir="C:/wd_a")
+    assert got["delivery"] == "none", "read a neighbour's row"
+    got_b = R._delivery_evidence(_Agent(), 1, {}, {}, workdir="C:/wd_b")
+    assert got_b["delivery"] == "confirmed"
+
+
+def test_a_positional_match_naming_another_workdir_is_refused():
+    """位置が別の workdir を指しているなら、それは競合そのもの。読まずに unknown へ。"""
+    class _Agent:
+        transcript = [{"workdir": "C:/somewhere_else", "prompt_in_conversation": True}]
+
+    got = R._delivery_evidence(_Agent(), 0, {}, {}, workdir="C:/mine")
+    assert got["delivery"] == "unknown"
+
+
+def test_an_adapter_without_workdir_in_its_rows_still_works():
+    """workdir を記録しないアダプタは今日すべて直列。位置での結合を残す。"""
+    class _Agent:
+        transcript = [{"prompt_in_conversation": True}]
+
+    got = R._delivery_evidence(_Agent(), 0, {}, {}, workdir="C:/mine")
+    assert got["delivery"] == "confirmed"

@@ -355,10 +355,35 @@ class FleetAgent:
         # isolation this class advertises did not exist. FLEET_STATE_DIR carries it
         # explicitly; the cwd carries it for anything that still resolves relatively.
         env["FLEET_STATE_DIR"] = state
+        # THE CHILD MUST EMIT UTF-8, not merely be decoded as it. Decoding was fixed
+        # on the parent side, which stops the reader thread dying -- but a child
+        # printing ensure_ascii=False JSON through a cp932 stdout can raise
+        # UnicodeEncodeError before anything is written, and a cp932 byte sequence
+        # misread as UTF-8 can introduce a stray backslash that breaks json.loads.
+        # Both sides now agree on the encoding instead of one side coping.
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        # THIS EPISODE'S EVIDENCE TRACE, taken from the runner's thread-local rather
+        # than inherited from os.environ -- which is process-global and, once
+        # episodes run concurrently, names some other episode's trace file or none.
+        try:
+            from bench.companionbench import runner as _R
+            env.update(_R.trace_env())
+        except Exception:
+            pass
         try:
             proc = subprocess.run(
                 [self.python, "-c", _child_source(), REPO, mode],
                 input=json.dumps(payload or {}), capture_output=True, text=True,
+                # DECODE AS UTF-8 AND NEVER RAISE ON A BAD BYTE. `text=True` alone decodes
+                # with the locale codec, which on this machine is cp932 -- so a child that
+                # ran perfectly (rc=0) was reported as producing no result, because the
+                # PARENT's reader thread died on one byte of somebody else's deprecation
+                # warning. That failure is silent in the worst way: it looks like the fleet
+                # cannot run episodes, and the fleet is the only path that runs them in
+                # parallel. errors="replace" is right here -- a mangled character in a log
+                # line is worth strictly less than the result it was travelling with.
+                encoding="utf-8", errors="replace",
                 cwd=cwd, env=env, timeout=self.timeout_s)
         except subprocess.TimeoutExpired:
             raise FleetContractError("the %s child exceeded %ss" % (mode, self.timeout_s))

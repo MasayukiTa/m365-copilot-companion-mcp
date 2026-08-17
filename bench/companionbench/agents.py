@@ -290,6 +290,13 @@ class BridgeAgent:
         self.fresh_conversation = fresh_conversation
         self.retry_busy_s = retry_busy_s
         self.transcript = []
+        # A MARKER PREFIX UNIQUE TO THIS ADAPTER INSTANCE, because the constant one
+        # authenticated nothing. The fresh-conversation check accepts a view when every user
+        # message carries the prefix -- and with a constant prefix, EVERY conversation this
+        # bench has ever created qualifies. Rotating from a fresh conversation to any older
+        # CompanionBench one therefore passed the check, found no marker, and reported a
+        # confident non-delivery. Per-run, an old conversation is foreign, which is what it is.
+        self.run_marker = "%s-%s" % (self.NONCE_PREFIX, uuid.uuid4().hex[:8])
 
     # -- transport ---------------------------------------------------------------------
 
@@ -469,7 +476,7 @@ class BridgeAgent:
             # So it is checked the other way round: everything in view must be something this
             # adapter could have put there. A foreign user message means the page is showing
             # some other conversation, whatever its URL claims.
-            foreign = [m for m in users if self.NONCE_PREFIX not in
+            foreign = [m for m in users if self.run_marker not in
                        (m.get("text") or m.get("content") or "")]
             if foreign:
                 return {"delivered": None, "conversation": seen[-80:],
@@ -523,7 +530,7 @@ class BridgeAgent:
         # it entirely is behaving correctly. Its only job is to be findable afterwards in the
         # conversation the bridge says it used -- which is what makes delivery a fact read
         # back from the page rather than an inference from what came out of it.
-        nonce = "%s-%s" % (self.NONCE_PREFIX, uuid.uuid4().hex[:12])
+        nonce = "%s-%s" % (self.run_marker, uuid.uuid4().hex[:12])
         full = "%s\n\n[%s]" % (full, nonce)
         # WHAT THIS CONVERSATION HOLDS BEFORE THE TURN, so that afterwards there is a way to
         # tell this view from a different one. Not a URL: on this target page.url carries no
@@ -575,6 +582,11 @@ class BridgeAgent:
         # `capability` and `end_to_end` in baseline.summarise are where it is allowed to
         # change a number, because there both questions stay visible at once.
         self.transcript.append({
+            # WHICH EPISODE THIS ROW BELONGS TO. The runner used to join by POSITION, which
+            # is correct only while episodes run one at a time: concurrent turns all mark the
+            # same index and then read each other's rows. The workdir is unique per episode
+            # by construction, so it is the join that survives concurrency.
+            "workdir": workdir,
             "prompt": full, "reply": reply, "elapsed_s": elapsed, "settled": settled,
             "nonce": nonce, "prompt_in_conversation": confirmed.get("delivered"),
             "anchor_cost_s": anchor_cost, "anchored": anchor is not None,

@@ -327,10 +327,15 @@ def test_delivery_is_counted_from_positive_evidence():
 
 # ---- the comparability gate -----------------------------------------------------------------
 
-def _totals(passed, attempted, total):
-    rows = ([_row("p%d" % i, True) for i in range(passed)]
-            + [_row("f%d" % i, False) for i in range(attempted - passed)]
-            + [_row("i%d" % i, False, infra=True) for i in range(total - attempted)])
+def _totals(passed, attempted, total, delivery="confirmed"):
+    """行は実物と同じ形にする -- `delivery` を持たないフィクスチャは、runner が決して
+    作らない行に対してゲートをテストしていたことになる。"""
+    def _r(eid, ok, infra=False):
+        return dict(_row(eid, ok, infra=infra), delivery=delivery,
+                    delivery_confirmed=(delivery == "confirmed"))
+    rows = ([_r("p%d" % i, True) for i in range(passed)]
+            + [_r("f%d" % i, False) for i in range(attempted - passed)]
+            + [_r("i%d" % i, False, infra=True) for i in range(total - attempted)])
     return B.summarise(rows)
 
 
@@ -383,14 +388,39 @@ def test_the_gate_catches_a_delivery_gap_that_coverage_cannot_see():
     """coverage は『infra に分類されていない』の意味しかない。挨拶文を受け取ったターンは
     infra ではなく、ただの失敗した試行。両腕とも coverage 1.0 のまま、
     片方だけがタスクを受け取っていない companion と話していることがありうる。"""
-    def _t(delivered, n):
-        rows = [dict(_row("e%d" % i, True), delivery_confirmed=(i < delivered))
-                for i in range(n)]
+    def _t(delivered, n, unknown=0):
+        rows = [dict(_row("e%d" % i, True),
+                     delivery=("confirmed" if i < delivered else "none"),
+                     delivery_confirmed=(i < delivered))
+                for i in range(n - unknown)]
+        rows += [dict(_row("u%d" % i, True), delivery="unknown",
+                      delivery_confirmed=False) for i in range(unknown)]
         return B.summarise(rows)
 
     reasons = B.comparable(_t(10, 10), _t(4, 10))
     assert any("reached the agent" in r for r in reasons)
     assert B.comparable(_t(10, 10), _t(10, 10)) == []
+
+
+def test_the_gate_does_not_read_its_own_blindness_as_a_transport_gap():
+    """両腕の実配送は同一で、検出器の見えている割合だけが違うとき。
+
+    delivery_rate は全行で割るので、棄権が否定と同じだけ率を下げる -- 100%見えている腕と
+    50%しか見えていない腕が『50ポイントの輸送差』として却下されていた。計器が見えていない
+    ことを、系の性質として報告していたことになる。"""
+    def _t(n, unknown):
+        rows = [dict(_row("e%d" % i, True), delivery="confirmed",
+                     delivery_confirmed=True) for i in range(n - unknown)]
+        rows += [dict(_row("u%d" % i, True), delivery="unknown",
+                      delivery_confirmed=False) for i in range(unknown)]
+        return B.summarise(rows)
+
+    seen, half_blind = _t(10, 0), _t(10, 5)
+    assert seen["delivery_rate"] == 1.0 and half_blind["delivery_rate"] == 0.5
+    assert half_blind["delivery_rate_where_answered"] == 1.0, "実配送は同じ"
+    reasons = B.comparable(seen, half_blind)
+    assert not any("reached the agent" in r for r in reasons), "盲目を輸送差として報告した"
+    assert any("could answer for only" in r for r in reasons), "盲目そのものは報告される"
 
 
 # ---- which half of the flipping is worth working on -----------------------------------------
@@ -472,3 +502,15 @@ def test_the_delivery_check_reports_its_own_coverage():
     assert t["delivery_answered"] == 2
     assert t["delivery_check_coverage"] == round(2 / 3, 4)
     assert t["delivery_rate_where_answered"] == 0.5
+
+
+def test_a_target_with_no_conversation_to_inspect_is_not_called_blind():
+    """in-process エージェントには読むべき会話が無い。0件は『盲目』ではなく『非該当』。
+
+    区別せずに coverage で refuse したところ、in-process の比較が全て INFRA_ABORT になった。
+    計器が『適用されない』ことを『壊れている』と報告していた。"""
+    rows = [dict(_row("e%d" % i, True), delivery="unknown", delivery_confirmed=False)
+            for i in range(6)]
+    t = B.summarise(rows)
+    assert t["delivery_answered"] == 0
+    assert not any("could answer for only" in r for r in B.comparable(t, t))

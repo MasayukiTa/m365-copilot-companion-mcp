@@ -74,14 +74,19 @@ def run_suite(agent, *, pools=POOLS, root=None, on_result=None, limit=0,
             random.Random(shuffle_seed).shuffle(episodes)
         if limit:
             episodes = episodes[:limit]
-        pool_rows = []
-        for episode in episodes:
-            row = R.run_episode(episode, agent, root=root)
+        # THROUGH run_pool, WHICH IS WHERE CONCURRENCY LIVES. This loop was its own serial
+        # copy of run_pool, so making run_pool concurrent changed nothing about the run that
+        # actually takes two and a half hours -- the tests passed, the benchmark did not move,
+        # and a fleet run whose three episodes finished within nine seconds of each other was
+        # read as evidence of parallelism when it was three sequential turns of similar
+        # length. Two implementations of "run these episodes" is one too many.
+        def _tag(row):
             row["pool"] = pool
-            pool_rows.append(row)
-            rows.append(row)
             if on_result is not None:
                 on_result(row)
+
+        pool_rows = R.run_pool(pool, agent, root=root, episodes=episodes, on_result=_tag)
+        rows.extend(pool_rows)
         by_pool[pool] = summarise(pool_rows)
 
     return {
@@ -251,13 +256,34 @@ def comparable(baseline_totals, candidate_totals) -> list:
     # can show coverage 1.0 while one of them was talking to a companion that never received
     # the task, and the gate as first written would wave that through. The asymmetry that
     # matters is how many turns actually REACHED the agent.
-    da = baseline_totals.get("delivery_rate")
-    db = candidate_totals.get("delivery_rate")
+    # OVER THE TURNS THE CHECK COULD ANSWER FOR, not over every row. `delivery_rate` divides
+    # by all rows, so an abstention counts exactly as a denial does -- and two arms with
+    # IDENTICAL real delivery but different detector visibility (100% against 50%) came out
+    # as a fifty-point transport gap and were refused. That is the instrument's blindness
+    # being reported as a property of the system. The blindness gets its own reason below,
+    # where it belongs, instead of being folded into the delivery figure.
+    da = baseline_totals.get("delivery_rate_where_answered")
+    db = candidate_totals.get("delivery_rate_where_answered")
     if da is not None and db is not None and abs(da - db) > MAX_COVERAGE_GAP:
         reasons.append(
-            "the prompt reached the agent on %.0f%% and %.0f%% of turns -- a %.0f point gap. "
-            "Coverage can be identical while one arm was answering a task it never received"
+            "the prompt reached the agent on %.0f%% and %.0f%% of the turns the check could "
+            "answer for -- a %.0f point gap. Coverage can be identical while one arm was "
+            "answering a task it never received"
             % (100 * da, 100 * db, 100 * abs(da - db)))
+
+    # NOT APPLICABLE IS NOT BLIND. A target with no conversation to inspect -- an in-process
+    # agent -- answers for zero turns, and reading that as an instrument failure aborted every
+    # in-process comparison. The distinction is whether the check ANSWERED ANYTHING: none at
+    # all means it does not apply here; some but not enough means it went blind partway, and
+    # that is the case worth refusing.
+    for name, totals in (("baseline", baseline_totals), ("candidate", candidate_totals)):
+        answered = totals.get("delivery_answered") or 0
+        seen = totals.get("delivery_check_coverage")
+        if answered and seen is not None and seen < MIN_COVERAGE:
+            reasons.append(
+                "%s: the delivery check could answer for only %.0f%% of turns, so the "
+                "delivery figures describe that fraction and the rest is unknown rather "
+                "than fine" % (name, 100 * seen))
 
     a = baseline_totals.get("coverage")
     b = candidate_totals.get("coverage")
@@ -301,6 +327,13 @@ def why_they_flip(runs) -> dict:
         # An episode whose failures are all unanswered now falls through to `mixed`, where it
         # reads as what it is: no conclusion.
         answered = [r for r in failures if r.get("delivery") in ("confirmed", "none")]
+        # EVERY failure must have been answered before the episode gets a homogeneous label.
+        # Only the all-unknown case was excluded, so one confirmed failure beside one the
+        # check could not see still produced a categorical "the target varies" -- a claim
+        # about turns nothing was established about. Any unanswered failure means mixed.
+        if len(answered) != len(failures):
+            mixed.append(eid)
+            continue
         delivered = [r.get("delivery") == "confirmed" for r in answered]
         if delivered and all(delivered):
             varies.append(eid)

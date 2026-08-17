@@ -20,7 +20,8 @@ TIMEOUT = 30
 
 
 def _run(args: list[str]) -> tuple[int, str, str]:
-    r = subprocess.run(args, capture_output=True, text=True, timeout=TIMEOUT, shell=False)
+    r = subprocess.run(args, capture_output=True, text=True, errors="replace",
+                       timeout=TIMEOUT, shell=False)
     return r.returncode, r.stdout, r.stderr
 
 

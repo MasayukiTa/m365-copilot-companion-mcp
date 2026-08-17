@@ -62,7 +62,7 @@ def _pip_version() -> str:
     try:
         r = subprocess.run(
             [sys.executable, "-m", "pip", "--version"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, errors="replace", timeout=10,
         )
         return r.stdout.strip().split()[1] if r.returncode == 0 else "(error)"
     except Exception:
@@ -104,7 +104,8 @@ def pip_install(
                     return f"[pip_install error: flag {f!r} not in allowlist {sorted(ALLOWED_PIP_FLAGS)}]"
                 flags.append(f)
         cmd = [sys.executable, "-m", "pip", "install", *_trusted_host_args(), *flags, *cleaned]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                           timeout=timeout)
         head = f"$ {' '.join(cmd[3:])}\n"
         out = (r.stdout or "")[-4000:]
         err = (r.stderr or "")[-2000:]
