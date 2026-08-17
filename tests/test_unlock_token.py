@@ -150,11 +150,19 @@ def test_the_presented_token_is_cleared_between_calls():
 
 def test_the_gateway_strips_the_token_before_dispatch():
     """The tool has no such parameter and would raise TypeError; and a credential should not
-    be handed to arbitrary tool code by accident."""
-    import inspect
+    be handed to arbitrary tool code by accident.
 
-    import main
-    src = inspect.getsource(main)
+    READ FROM DISK RATHER THAN IMPORTED. This asserted over `inspect.getsource(main)`, which
+    means importing a module that reads MCP_API_KEY with `os.environ[...]` at import time and
+    registers ~170 tools. Locally something else in the suite had already loaded .env so it
+    worked; CI has no .env and it raised KeyError, and once that was fixed the import failed
+    differently depending on what had reloaded `main` first. A test that only needs the TEXT
+    of a file should read the file: the import was never part of what is being checked.
+    """
+    import pathlib
+
+    src = (pathlib.Path(__file__).resolve().parent.parent / "main.py").read_text(
+        encoding="utf-8")
     assert '_args.pop("unlock_token"' in src
     assert "fn(**_args)" in src, "the popped dict must be the one dispatched"
 
