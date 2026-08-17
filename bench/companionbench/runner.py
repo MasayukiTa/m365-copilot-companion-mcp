@@ -463,15 +463,23 @@ def _delivery_evidence(agent, mark, before, after, workdir=None) -> dict:
     if isinstance(entry, dict):
         in_conversation = entry.get("prompt_in_conversation")
 
+    # A WORKDIR CHANGE IS NOT THE CONVERSATION CHECK ANSWERING, and calling both of them
+    # "confirmed" let a composite be quoted as though it were the check's own result. It was:
+    # a run reported as "the detector confirmed 66 of 66, zero abstentions" was 59 marker
+    # sightings and 7 rows the filesystem rescued, with the conversation outcome for those
+    # seven recorded nowhere. The grade keeps its name for the rows the check DID answer;
+    # everything else says what it actually rests on, and `delivery_ui_marker` below carries
+    # the check's own tri-state so no denominator has to be reverse-engineered from a label.
     if in_conversation is True:
         grade, why = "confirmed", "the prompt was found in the conversation"
     elif in_conversation is False:
         # An explicit negative outranks a workdir change: something wrote there, but this
         # turn is not in the conversation, and that combination is worth seeing rather than
-        # being averaged into "confirmed".
+        # being averaged away.
         grade, why = "none", "the conversation does not contain this turn's prompt"
     elif touched:
-        grade, why = "confirmed", "the workdir changed"
+        grade, why = "workdir_only", ("the workdir changed; the conversation check did not "
+                                      "answer for this turn")
     elif suspect is False:
         grade, why = "weak", "the reply referred to the prompt, but nothing was written"
     elif suspect is True:
@@ -479,12 +487,35 @@ def _delivery_evidence(agent, mark, before, after, workdir=None) -> dict:
     else:
         grade, why = "unknown", "the adapter recorded nothing about this turn"
 
-    return {
+    out = {
         "touched_workdir": touched,
         "delivery": grade,
-        "delivery_confirmed": grade == "confirmed",
+        # KEPT AS "SOMETHING SHOWS THE TURN LANDED", which is what the A/B gate wants -- but
+        # it is no longer the same thing as the conversation check having said so.
+        "delivery_confirmed": grade in ("confirmed", "workdir_only"),
+        # WHAT THE CONVERSATION CHECK ITSELF SAID: True, False, or None for "did not answer".
+        # This is the field any statement about the DETECTOR must be computed from.
+        "delivery_ui_marker": in_conversation,
+        "delivery_source": ("conversation" if in_conversation is not None
+                            else "workdir" if touched
+                            else "reply" if suspect is not None
+                            else "none"),
         "delivery_evidence": why,
     }
+    # WHAT A FOUND MARKER PROVES, recorded beside the verdict rather than left in a commit
+    # message. /history scrapes rendered turn blocks, not the composer, so this is stronger
+    # than "the text stayed in the box" -- but it is still a same-page UI acknowledgement. It
+    # does not establish that the backend admitted the request, associated it with the
+    # intended conversation, or consumed it: an optimistically rendered bubble whose
+    # submission was then rejected looks identical from here. Nothing available today can
+    # separate those, so the field is present and honest rather than absent and assumed.
+    out["backend_accepted"] = None
+    if isinstance(entry, dict):
+        for key in ("attempts", "found_on_first_attempt", "confirm_latency_s",
+                    "saw_truncated", "anchored", "attempt_log"):
+            if key in entry:
+                out["delivery_%s" % key] = entry[key]
+    return out
 
 
 def _fixture_snapshot(workdir):

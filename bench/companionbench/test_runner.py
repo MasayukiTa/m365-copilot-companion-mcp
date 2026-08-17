@@ -861,7 +861,12 @@ def test_every_outcome_carries_delivery_evidence():
 
     row = R.run_episode(ep, _Writes())
     assert row["infra_failure"] is True
-    assert row["delivery"] == "confirmed", "書き込んだ証拠が付いていない"
+    # `workdir_only` であって `confirmed` ではない -- 会話検査は答えていないのだから。
+    # 両方を confirmed と呼んでいたせいで、59件のマーカー確認が66件として報告された。
+    assert row["delivery"] == "workdir_only", "書き込んだ証拠が付いていない"
+    assert row["delivery_confirmed"] is True, "ターンが着地した事実そのものは残す"
+    assert row["delivery_ui_marker"] is None, "会話検査は答えていないのに答えたことになっている"
+    assert row["delivery_source"] == "workdir"
     assert row["touched_workdir"] is True
 
 

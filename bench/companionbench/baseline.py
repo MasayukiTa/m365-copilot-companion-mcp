@@ -394,7 +394,18 @@ def summarise(rows) -> dict:
     # first: a conditional rate over a third of the suite is a statement about a third of the
     # suite.
     delivered = [r for r in rows if r.get("delivery_confirmed")]
-    delivery_answered = [r for r in rows if r.get("delivery") in ("confirmed", "none")]
+    # COMPUTED FROM THE CHECK'S OWN FIELD, not from the composite grade. Deriving it from the
+    # label counted workdir-rescued rows as "the check answered", which is how a run of 59
+    # marker sightings was reported as 66. `delivery_ui_marker` is the check's tri-state and
+    # nothing else writes it. The `delivery in (...)` fallback is for rows saved before the
+    # field existed, and it excludes `workdir_only` explicitly.
+    def _answered(row):
+        if "delivery_ui_marker" in row:
+            return row["delivery_ui_marker"] is not None
+        return row.get("delivery") in ("confirmed", "none")
+
+    delivery_answered = [r for r in rows if _answered(r)]
+    ui_marker_seen = [r for r in rows if r.get("delivery_ui_marker") is True]
     # A row the agent was never asked about. `never_requested` is set by the runner when it
     # returns before calling the agent.
     requested = [r for r in rows if not r.get("never_requested")]
@@ -427,6 +438,18 @@ def summarise(rows) -> dict:
         # much of the suite the rate is a statement about, so an instrument that has gone
         # blind shows up as low coverage instead of as a transport problem.
         "delivery_answered": len(delivery_answered),
+        # THE MARKER, ON ITS OWN. Separate from `delivery_confirmed`, which also counts rows
+        # the filesystem vouched for. Any claim about the DETECTOR belongs to this number.
+        "ui_marker_seen": len(ui_marker_seen),
+        # AND WHAT A SEEN MARKER PROVES. /history scrapes rendered turn blocks, so it is
+        # stronger than "the text stayed in the composer" -- but it is a same-page UI
+        # acknowledgement, not proof the backend admitted or consumed the request. Nothing
+        # available today separates those, so the field exists and is empty rather than being
+        # quietly folded into the number above.
+        "backend_accepted": None,
+        "delivery_rescued_by_retry": sum(
+            1 for r in rows if r.get("delivery_found_on_first_attempt") is False
+            and r.get("delivery_ui_marker") is True),
         "delivery_check_coverage": (round(len(delivery_answered) / len(rows), 4)
                                     if rows else None),
         "delivery_rate_where_answered": (round(len(delivered) / len(delivery_answered), 4)
@@ -529,6 +552,12 @@ def report(result) -> str:
               "",
               "  delivery confirmed on %d of %d (%s)."
               % (t["delivery_confirmed"], t["total"], _pct(t["delivery_rate"])),
+              "  the MARKER itself was seen on %d of %d; the rest of `confirmed` rests on"
+              % (t["ui_marker_seen"], t["total"]),
+              "  a workdir change, which is not the conversation check answering.",
+              "  %d confirmation(s) needed more than one look -- retrying until a marker"
+              % t.get("delivery_rescued_by_retry", 0),
+              "  appears is optional stopping, so that count belongs next to the rate.",
               "  the check could answer for %d of %d (%s); over those it confirmed %s."
               % (t["delivery_answered"], t["total"], _pct(t["delivery_check_coverage"]),
                  _pct(t["delivery_rate_where_answered"])),

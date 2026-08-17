@@ -432,45 +432,77 @@ class BridgeAgent:
         # probe, which is not a check but a coin landing on its edge. And an un-hydrated view
         # renders with no prior turns at all, so an `ok` response can simply be early; the
         # loop used to stop at the first one whatever it contained. Only the LAST look decides.
+        # EVERY ATTEMPT IS RECORDED, and it has to be. This loop keeps looking until the
+        # marker appears, which is optional stopping: it cannot re-send, but it can wait out
+        # rendering, hydration, and an optimistically drawn bubble, and then report the
+        # positive it was waiting for. The observation window is also far wider than "six
+        # attempts two seconds apart" -- each /history can poll internally for ~30s and the
+        # scroll pass is bounded at 45 -- so "confirmed" without a latency beside it is not a
+        # number anyone can weigh.
+        #
+        # The per-attempt log is also what makes the old rule replayable on the SAME data.
+        # The old check stopped at the first `ok` response whatever it contained; keeping
+        # (ok, found, truncated) per attempt lets both rules be scored offline, which turns
+        # "the old detector had a hydration race" from a mechanism I find plausible into a
+        # count of turns that were absent on the first look and present on a later one --
+        # with no second send in between.
+        began = time.time()
+        log = []
         data = None
         for attempt in range(self.HISTORY_ATTEMPTS):
             data = self._history_once()
             if data is None:
-                return {"delivered": None, "why": "history unavailable"}
-            if data.get("ok") and self._nonce_in(data, nonce):
+                return {"delivered": None, "why": "history unavailable",
+                        "attempts": attempt + 1, "attempt_log": log,
+                        "confirm_latency_s": round(time.time() - began, 1)}
+            found = bool(data.get("ok")) and self._nonce_in(data, nonce)
+            log.append({"ok": bool(data.get("ok")), "found": found,
+                        "truncated": bool(data.get("truncated")),
+                        "users": sum(1 for m in (data.get("messages") or [])
+                                     if m.get("role") == "user"),
+                        "at_s": round(time.time() - began, 1)})
+            if found:
                 return {"delivered": True, "why": "the prompt is in the conversation",
-                        "conversation": (data.get("url") or "")[-80:]}
+                        "conversation": (data.get("url") or "")[-80:],
+                        "attempts": attempt + 1, "attempt_log": log,
+                        "found_on_first_attempt": attempt == 0,
+                        "saw_truncated": any(a["truncated"] for a in log),
+                        "confirm_latency_s": round(time.time() - began, 1)}
             busy = "busy" in str(data.get("error") or "")
             if not data.get("ok") and not busy:
                 break
             if attempt + 1 < self.HISTORY_ATTEMPTS:
                 time.sleep(self.HISTORY_RETRY_S)
+        trail = {"attempts": len(log) or 1, "attempt_log": log,
+                 "found_on_first_attempt": False,
+                 "saw_truncated": any(a["truncated"] for a in log),
+                 "confirm_latency_s": round(time.time() - began, 1)}
         seen = (data or {}).get("url") or ""
         if not data or not data.get("ok"):
-            return {"delivered": None,
-                    "why": "history said: %s" % ((data or {}).get("error") or "?")}
+            return dict(trail, delivered=None,
+                        why="history said: %s" % ((data or {}).get("error") or "?"))
         if data.get("truncated"):
-            return {"delivered": None, "conversation": seen[-80:],
-                    "why": "the conversation was captured incompletely (%s of it), and it is "
-                           "scraped from the top, so the newest turn -- this one -- is the "
-                           "likeliest to be missing" % (data.get("captured") or "part")}
+            return dict(trail, delivered=None, conversation=seen[-80:],
+                why="the conversation was captured incompletely (%s of it), and it is "
+                    "scraped from the top, so the newest turn -- this one -- is the "
+                    "likeliest to be missing" % (data.get("captured") or "part"))
         if anchor is None:
-            return {"delivered": None, "conversation": seen[-80:],
-                    "why": "the conversation could not be fingerprinted before the turn, so "
-                           "there is no way to tell this view from a different one"}
+            return dict(trail, delivered=None, conversation=seen[-80:],
+                why="the conversation could not be fingerprinted before the turn, so "
+                    "there is no way to tell this view from a different one")
         users = [m for m in (data.get("messages") or []) if m.get("role") == "user"]
         if not users:
-            return {"delivered": None, "conversation": seen[-80:],
-                    "why": "no user messages came back after %d attempts, which is what an "
-                           "un-hydrated view looks like as well as an undelivered turn"
-                           % self.HISTORY_ATTEMPTS}
+            return dict(trail, delivered=None, conversation=seen[-80:],
+                why="no user messages came back after %d attempts, which is what an "
+                    "un-hydrated view looks like as well as an undelivered turn"
+                    % self.HISTORY_ATTEMPTS)
         after = [self._digest(m) for m in users]
         if anchor:
             if after[:len(anchor)] != anchor:
-                return {"delivered": None, "conversation": seen[-80:],
-                        "why": "the messages that were there before the turn are not there "
-                               "now: the page moved, and this view is not the one the turn "
-                               "was sent to"}
+                return dict(trail, delivered=None, conversation=seen[-80:],
+                    why="the messages that were there before the turn are not there "
+                        "now: the page moved, and this view is not the one the turn "
+                        "was sent to")
         else:
             # A FRESH CONVERSATION HAS AN EMPTY ANCHOR, AND AN EMPTY ANCHOR MATCHES ANYTHING.
             # So it is checked the other way round: everything in view must be something this
@@ -479,14 +511,13 @@ class BridgeAgent:
             foreign = [m for m in users if self.run_marker not in
                        (m.get("text") or m.get("content") or "")]
             if foreign:
-                return {"delivered": None, "conversation": seen[-80:],
-                        "why": "this conversation was opened fresh for the episode but holds "
-                               "%d message(s) this adapter did not send, so it is not the one "
-                               "the turn was sent to" % len(foreign)}
-        return {"delivered": False,
-                "why": "the conversation still holds the messages it had before the turn, "
-                       "and this turn's prompt is not among them",
-                "conversation": seen[-80:]}
+                return dict(trail, delivered=None, conversation=seen[-80:],
+                    why="this conversation was opened fresh for the episode but holds "
+                        "%d message(s) this adapter did not send, so it is not the one "
+                        "the turn was sent to" % len(foreign))
+        return dict(trail, delivered=False, conversation=seen[-80:],
+                why="the conversation still holds the messages it had before the turn, "
+                    "and this turn's prompt is not among them")
 
     @staticmethod
     def _nonce_in(data, nonce) -> bool:
@@ -591,6 +622,14 @@ class BridgeAgent:
             "nonce": nonce, "prompt_in_conversation": confirmed.get("delivered"),
             "anchor_cost_s": anchor_cost, "anchored": anchor is not None,
             "delivery_note": confirmed.get("why", ""),
+            # THE CHECK'S OWN WORKING, carried through to the row. Without it a "confirmed"
+            # cannot be told from a confirmed-after-four-looks-and-fifty-seconds, and the old
+            # rule cannot be replayed on the same data to see whether it would have said no.
+            "attempts": confirmed.get("attempts"),
+            "found_on_first_attempt": confirmed.get("found_on_first_attempt"),
+            "confirm_latency_s": confirmed.get("confirm_latency_s"),
+            "saw_truncated": confirmed.get("saw_truncated"),
+            "attempt_log": confirmed.get("attempt_log") or [],
             "conversation": confirmed.get("conversation", ""),
         })
 
