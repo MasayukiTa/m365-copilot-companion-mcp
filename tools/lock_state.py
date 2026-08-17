@@ -139,3 +139,60 @@ def _cli() -> None:
 
 if __name__ == "__main__":
     _cli()
+
+
+#: Calls that PASSED the unlock gate on the strength of the identity alone -- no matching
+#: unlock token was presented. Kept as a counter beside the state file rather than a single
+#: latest record, because the question it answers is "how many callers would enforcement
+#: break?", and that is a total over a period, not a most-recent event.
+_TOKEN_GAP_FILE = _STATE_FILE.parent / "unlock_token_gap.json"
+
+
+def record_token_gap(client_ip: str = "", ts: Optional[float] = None) -> None:
+    """Note a call allowed without a token, so enforcement can be switched on with evidence.
+
+    MCP_REQUIRE_UNLOCK_TOKEN defaults to off: turning it on before anyone has re-unlocked
+    would refuse every existing session at once, and an outage is how a security change gets
+    reverted wholesale instead of kept. This counter is what says when it is safe -- when it
+    stops growing, every live caller is presenting a token and the switch costs nothing.
+
+    Never raises: a counter that can fail a request is worse than a counter.
+    """
+    now = float(ts if ts is not None else time.time())
+    try:
+        with _LOCK:
+            data = {"count": 0, "ips": {}, "first_ts": now}
+            if _TOKEN_GAP_FILE.exists():
+                try:
+                    data = json.loads(_TOKEN_GAP_FILE.read_text(encoding="utf-8")) or data
+                except Exception:
+                    pass
+            data["count"] = int(data.get("count", 0)) + 1
+            data["last_ts"] = now
+            data.setdefault("first_ts", now)
+            ips = data.setdefault("ips", {})
+            key = str(client_ip or "")[:64]
+            ips[key] = int(ips.get(key, 0)) + 1
+            _TOKEN_GAP_FILE.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=str(_TOKEN_GAP_FILE.parent), suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh, ensure_ascii=False)
+                os.replace(tmp, _TOKEN_GAP_FILE)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def token_gap() -> dict:
+    """How many calls have passed without a token, and from where. {} if none."""
+    try:
+        if _TOKEN_GAP_FILE.exists():
+            return json.loads(_TOKEN_GAP_FILE.read_text(encoding="utf-8")) or {}
+    except Exception:
+        pass
+    return {}

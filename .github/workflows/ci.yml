@@ -71,6 +71,8 @@ jobs:
           pytest -q \
             tests/test_security_xff.py \
             tests/test_unlock_oracle.py \
+            tests/test_unlock_token.py \
+            tests/test_exec_via_gateway.py \
             scripts/test_check_no_identifying_names.py \
             tests/test_scroll_transcript.py \
             tests/test_golden.py \

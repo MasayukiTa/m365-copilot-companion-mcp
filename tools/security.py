@@ -1,6 +1,9 @@
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
+import secrets
 import tempfile
 import threading
 import time
@@ -135,6 +138,52 @@ def is_unlocked(ip: str) -> bool:
     return entry.get("expires_at", 0) > time.time()
 
 
+#: THE TOKEN PRESENTED BY THE CALL IN FLIGHT, set by the gateway for the duration of one
+#: invocation. A context variable rather than a parameter because the alternative is adding an
+#: argument to every gated tool, and 116 call sites is not a change anyone can review.
+_PRESENTED = threading.local()
+
+
+def set_presented_token(token: str) -> None:
+    """Record the unlock token accompanying the call currently being handled."""
+    _PRESENTED.token = (token or "").strip()
+
+
+def clear_presented_token() -> None:
+    _PRESENTED.token = ""
+
+
+def presented_token() -> str:
+    return getattr(_PRESENTED, "token", "") or ""
+
+
+def _token_matches(entry: dict, presented: str) -> bool:
+    stored = (entry or {}).get("token_sha256") or ""
+    if not stored:
+        # An unlock recorded before tokens existed. Whether that is acceptable is the
+        # caller's decision, not this function's; see `enforce_unlock_token`.
+        return False
+    if not presented:
+        return False
+    return hmac.compare_digest(
+        stored, hashlib.sha256(presented.encode("utf-8")).hexdigest())
+
+
+def enforce_unlock_token() -> bool:
+    """Whether a matching token is REQUIRED, or merely recorded when present.
+
+    Default off, and deliberately so. Requiring it is the fix; requiring it before anyone has
+    unlocked under the new scheme would lock out every existing session at once, including
+    unattended ones, and an outage is how a security change gets reverted wholesale instead of
+    kept. Turn it on -- MCP_REQUIRE_UNLOCK_TOKEN=1 -- once the operators have re-unlocked.
+
+    While it is off the gate is exactly as weak as it was, and `token_ok` on every refusal
+    record says whether the call WOULD have passed, so the switch can be flipped on evidence
+    rather than on hope.
+    """
+    return os.environ.get("MCP_REQUIRE_UNLOCK_TOKEN") == "1"
+
+
 def require_unlocked() -> str | None:
     """Return None when the caller can use mutating tools, otherwise an error string."""
     try:
@@ -151,7 +200,25 @@ def require_unlocked() -> str | None:
     if is_local:
         return None
     if is_unlocked(ip):
-        return None
+        # THE IP GOT US THIS FAR; THE TOKEN IS WHAT MAKES IT A SECOND KEY. The IP came out of
+        # a header the caller controls, so on its own it proves possession of the API key and
+        # nothing else. A token was issued to whoever supplied the password, and only its hash
+        # was kept.
+        entry = (_load_state() or {}).get(ip) or {}
+        ok = _token_matches(entry, presented_token())
+        if ok or not enforce_unlock_token():
+            if not ok:
+                # Recorded, not enforced: this is the number that says whether enforcement can
+                # be switched on without an outage.
+                lock_state.record_token_gap(ip)
+            return None
+        msg = (
+            f"[locked: no valid unlock token for {ip!r}] The identity in the forwarding "
+            "header is not sufficient on its own. Call unlock(password='<password>') and "
+            "pass the returned `unlock_token` with the call."
+        )
+        lock_state.record_locked(ip, msg)
+        return msg
     msg = (
         f"[locked client IP: {ip!r}] Mutating and execution tools require an unlock. "
         "Call unlock(password='<password>') first. The unlock is stored per client IP "
@@ -179,13 +246,34 @@ def unlock(password: str) -> str:
         return f"Local client {ip!r} is already trusted."
     ttl_days = int(os.environ.get("MCP_UNLOCK_TTL_DAYS", "30"))
     expires = time.time() + ttl_days * 86400
+    # A SECOND FACTOR THAT IS ACTUALLY A SECOND FACTOR.
+    #
+    # The unlock record was keyed on an IP, and an IP is a value a caller STATES rather than
+    # proves: it is derived from a forwarding header, and on this deployment nothing upstream
+    # appends its own hop, so the whole header is caller-supplied. Anyone holding the API key
+    # could therefore assert an unlocked identity and be believed. Two keys collapsed into one.
+    #
+    # The token fixes that because it is issued rather than asserted: it exists only in the
+    # reply to a correct password, and only its hash is stored, so the state file is no longer
+    # a list of things to impersonate. The IP stays in the record for auditing and for the
+    # grace path below; it is no longer sufficient on its own once a token has been issued.
+    token = secrets.token_urlsafe(24)
     state = _load_state()
-    state[ip] = {"expires_at": expires, "unlocked_at": time.time()}
+    state[ip] = {
+        "expires_at": expires,
+        "unlocked_at": time.time(),
+        "token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+    }
     _save_state(state)
     # The refusal that prompted this unlock is now history; drop it so a reader
     # checking "was a call just refused?" is not answered by a stale record.
     lock_state.clear()
-    return f"Unlocked IP {ip!r} for {ttl_days} days."
+    return (
+        f"Unlocked IP {ip!r} for {ttl_days} days.\n"
+        f"unlock_token: {token}\n"
+        "Pass this as `unlock_token` on call_tool for mutating and execution tools. "
+        "It is shown once and only its hash is kept."
+    )
 
 
 def _format_entry(ip: str, entry: dict, now: float) -> str:

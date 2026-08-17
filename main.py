@@ -449,16 +449,42 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
             from tools import evidence_trace as _trace
         except Exception:
             _trace = None
+        # THE UNLOCK TOKEN, WHICH ONLY HAS ONE PLACE TO ARRIVE.
+        #
+        # The gate's identity comes from a forwarding header, which a caller states rather
+        # than proves, so possession of the API key was enough to be believed. A second factor
+        # has to be presented per call; the client cannot vary headers per call; so the only
+        # channel is an argument. This is the single point every gated tool passes through --
+        # `unlock_token` is stripped here rather than being added to 116 signatures.
+        #
+        # Popped, not forwarded: the tool being invoked has no parameter for it and would
+        # raise TypeError, and passing a credential into arbitrary tool code is not something
+        # to do by accident.
+        _args = dict(arguments or {})
+        _token = _args.pop("unlock_token", "") or ""
         try:
-            _out = fn(**(arguments or {}))
+            from tools import security as _sec
+            _sec.set_presented_token(str(_token))
+        except Exception:
+            _sec = None
+        try:
+            _out = fn(**_args)
             if _trace is not None:
-                _trace.record(name, arguments, True, _out, fn)
+                _trace.record(name, _args, True, _out, fn)
             return _out
         except Exception as _e:
             if _trace is not None:
-                _trace.record(name, arguments, False,
+                _trace.record(name, _args, False,
                               "%s: %s" % (type(_e).__name__, _e), fn)
             return "[call_tool %s error: %s: %s]" % (name, type(_e).__name__, _e)
+        finally:
+            # SCOPED TO THIS CALL. A token left behind would authorise the next one, which is
+            # the same class of defect as the identity it replaces.
+            if _sec is not None:
+                try:
+                    _sec.clear_presented_token()
+                except Exception:
+                    pass
 
     # critical tools FIRST (survive a front-biased truncation), then fill from the existing order
     _LOCAL_LOOP_PRIORITY = (
@@ -482,11 +508,38 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
         _MAX = int(os.environ.get("MCP_TOOL_MAP_MAX", "70"))
     except ValueError:
         _MAX = 70
+    # EXECUTION GOES THROUGH THE GATEWAY, NOT AROUND IT.
+    #
+    # Every tool that runs code or a shell is removed from the DIRECT registration and stays
+    # reachable only via call_tool. Two reasons, and the second is the one that made this
+    # necessary rather than tidy:
+    #
+    #   The server's own instructions already tell an agent that every tool lives behind
+    #   call_tool, so this makes the registration match the documentation instead of
+    #   contradicting it in the eight most dangerous cases.
+    #
+    #   And it gives the execution family a single entry point. Without one there is nowhere
+    #   to require a second factor: an unlock token has to be presented somewhere, the client
+    #   cannot vary headers per call, and adding an argument to 116 gated tools is not a
+    #   change anyone can review. One gateway is one place.
+    #
+    # Nothing becomes unreachable. Measured: the direct set stays at the same size, the eight
+    # execution tools leave it, and eight others (render_math, the memory tools) move up into
+    # the space -- so the schema budget is unchanged too.
+    #
+    # MCP_TOOL_MAP_EXEC_DIRECT=1 restores the old behaviour, because a claim that "usage is
+    # unchanged" should be falsifiable by the operator rather than only by me.
+    _EXEC_ONLY_VIA_GATEWAY = frozenset({
+        "run_python", "shell_exec", "pwsh_exec", "pwsh_exec_file", "shell_which",
+        "run_in_background", "run_python_in_background", "job_kill",
+    })
+    _exec_direct = os.environ.get("MCP_TOOL_MAP_EXEC_DIRECT") == "1"
     _pn = {getattr(f, "__name__", "") for f in _PRIORITY}
     _want = [n.strip() for n in os.environ.get("MCP_TOOL_MAP_INCLUDE", "").split(",") if n.strip()]
     _pinned = [_ALL_TOOLS[n] for n in _want if n in _ALL_TOOLS and n not in _pn]
     _pinned_n = _pn | {getattr(f, "__name__", "") for f in _pinned}
-    _rest = [t for t in TOOLS if getattr(t, "__name__", "") not in _pinned_n]
+    _rest = [t for t in TOOLS if getattr(t, "__name__", "") not in _pinned_n
+             and (_exec_direct or getattr(t, "__name__", "") not in _EXEC_ONLY_VIA_GATEWAY)]
     # The priority set itself can grow beyond the configured schema budget. Enforce
     # the cap here too; ordering above defines which critical tools survive.
     _head = (list(_PRIORITY) + _pinned)[:max(0, _MAX)]
