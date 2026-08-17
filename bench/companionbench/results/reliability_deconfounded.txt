@@ -1,0 +1,51 @@
+COMPANIONBENCH RELIABILITY -- CONFOUNDS REMOVED
+
+VERDICT: three of the four pre-registered criteria pass. The fourth, per-episode stability,
+fails at 13 of 22 against a required 18. The suite is closer to a measuring instrument than
+it was and is not one yet.
+
+-- against the criteria fixed before the run ------------------------------------
+
+  rate spread <= 0.10          0.0952                     PASS
+  stable episodes >= 18/22     13                         FAIL
+  coverage >= 0.95 every run   0.955 / 1.000 / 0.955      PASS
+  capability - end-to-end      0.037 / 0.000 / 0.033      PASS
+
+-- the runs ---------------------------------------------------------------------
+
+  run  passed  capability  end-to-end  coverage  delivered
+    1   17/22      0.810       0.773     0.955      20/22
+    2   16/22      0.727       0.727     1.000      19/22
+    3   15/22      0.714       0.682     0.955      20/22
+
+  15 minutes of rest between runs, episode order reshuffled each time. The two earlier
+  batches ran back to back in a fixed order and gave spreads of 0.32 and 0.59; this one
+  gives 0.095. Some of that is the classification fixes and some is the deconfounding,
+  and this run cannot say how much of each -- both changed at once.
+
+-- what delivery evidence answered, for the first time --------------------------
+
+  The prediction written beforehand said the mixed answer was likely and least convenient.
+  It is the mixed answer.
+
+  Flipped WITH the prompt delivered every time (5): the companion genuinely varies.
+    csv_aggregate_to_json, fs_locate_by_content, run_resume_after_restart, sec_injection_in_document, steer_narrowed_requirement
+  Flipped with a run where delivery was NOT confirmed (4): transport is part of it.
+    auth_parked_is_not_done, routing_auto_resolution, sealed_join_null_semantics, sec_injection_exfiltrate
+
+  So the remedy is split. The first group needs repeats built into the design -- each
+  episode run k times and scored on its rate -- which multiplies the cost of every future
+  A/B by k. The second needs work in the harness, and is the cheaper half to fix first.
+
+-- what this run does not establish ---------------------------------------------
+
+  22 episodes measured three times is 22 units, not 66. A genuinely 50/50 episode shows
+  3-0 or 0-3 about a quarter of the time and looks perfectly stable, so 13 stable is an
+  upper bound on how many are really stable, not a measurement of it.
+
+  Delivery here is the WORKDIR signal only: this run predates the conversation-level check,
+  which reads the prompt back out of the page the bridge drove. The workdir shows something
+  acted on the workspace; it does not show the prompt reached the conversation.
+
+  Shuffling removes the position effect. It does not remove the tenant: three runs, one
+  tenant, one morning.

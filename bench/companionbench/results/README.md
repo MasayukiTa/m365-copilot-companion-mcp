@@ -12,7 +12,9 @@ in different words, that the figure does not mean what a reader would assume.
 | file | what it is |
 |---|---|
 | `baseline_bridge.txt` | first suite run against a live target, 13/22. Superseded as a capability figure by the reliability run below. |
-| `reliability_after_fix.txt` | three repeats of the same suite: 7, 17, 19. The suite is not yet a measuring instrument. |
+| `reliability_after_fix.txt` | three repeats: 7, 17, 19. Confounded -- back to back, fixed order. Superseded. |
+| `reliability_rested.txt` | three repeats on a rested tenant: 7, 20, 16. Same confound. Superseded. |
+| `reliability_deconfounded.txt` | three repeats, rested and reshuffled: 17, 16, 15. Three of four criteria pass; per-episode stability does not. **The current reading.** |
 | `stage0_settle_replay.txt` | settle-unification Stage 0: nothing changed after acceptance on any of 120 turns. |
 | `section15_security_experiment.txt` | the guard simulation, with a list of the metrics it cannot produce. |
 
