@@ -10,6 +10,13 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 TEST_ROOTS = ("bench", "bridge", "relay", "scripts", "tests", "tools", "ui")
 
+#: Both of pytest's default collection patterns. Only `test_*.py` was discovered, so a file
+#: named the other way -- which pytest DOES collect -- was invisible to this audit and could
+#: sit unlisted and unrun for as long as nobody noticed. This project configures no
+#: `python_files`, so pytest's defaults are what actually decide.
+_TEST_FILE_RE = r"(?:test_[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+_test)\.py"
+_TEST_GLOBS = ("test_*.py", "*_test.py")
+
 # Each exception needs a concrete alternate runner. This list is intentionally tiny so a new
 # test file cannot become permanently green-by-omission.
 EXCLUDED = {
@@ -37,10 +44,10 @@ def _tracked() -> set[str] | None:
     ないし、載せれば CI が「そんなファイルは無い」で落ちる。手元にだけ置いてある
     ものを、載せ忘れとして扱わないための区別。
 
-    ただし `git ls-files` だけを見ていたせいで、このチェックは自分が存在する理由その
-    ものを取り逃がしていた。新しいテストを書いて、add する前にこれを走らせると「OK」
-    と言う。add して commit して push して、はじめて CI で落ちる。実際にそうなった。
-    index も見ることで、`git add` した瞬間から要求が発生する。
+    `--cached` は明示だが既定と同じで、挙動は変わらない。以前これを「push するまで
+    落ちない欠陥の修正」と書いたが、それは誤りだった。`git ls-files` は元から index を
+    見ており、`git add` 済みのファイルは最初から見えていた。実際に CI で落ちた原因は
+    チェックの欠陥ではなく、add する前にチェックを走らせた手順のほうにある。
     """
     return _git("ls-files", "--cached")
 
@@ -52,20 +59,33 @@ def discover_tests() -> set[str]:
         base = ROOT / root_name
         if not base.is_dir():
             continue
-        for path in base.rglob("test_*.py"):
-            rel = path.relative_to(ROOT).as_posix()
-            if tracked is not None and rel not in tracked:
-                continue
-            found.add(rel)
+        for glob in _TEST_GLOBS:
+            for path in base.rglob(glob):
+                rel = path.relative_to(ROOT).as_posix()
+                if tracked is not None and rel not in tracked:
+                    continue
+                found.add(rel)
     return found
 
 
 def listed_tests() -> set[str]:
-    text = WORKFLOW.read_text(encoding="utf-8")
+    """Test files the workflow actually RUNS.
+
+    Comments are stripped first. Scanning the whole file counted a path in a `#` comment as
+    listed, so deleting a test from the pytest command and leaving a note about why kept the
+    audit green -- the exact "listed but not executed" state it exists to prevent. This still
+    does not prove the file is on a pytest command line rather than in, say, an `echo`; it
+    proves it is not in a comment, which is the hole that was reachable by accident.
+    """
+    lines = []
+    for raw in WORKFLOW.read_text(encoding="utf-8").splitlines():
+        stripped = raw.lstrip()
+        if stripped.startswith("#"):
+            continue
+        lines.append(raw.split(" #", 1)[0] if " #" in raw else raw)
     return set(re.findall(
-        r"(?:bench|bridge|relay|scripts|tests|tools|ui)/"
-        r"(?:[A-Za-z0-9_.-]+/)*test_[A-Za-z0-9_.-]+\.py",
-        text,
+        r"(?:%s)/(?:[A-Za-z0-9_.-]+/)*%s" % ("|".join(TEST_ROOTS), _TEST_FILE_RE),
+        "\n".join(lines),
     ))
 
 
@@ -92,12 +112,14 @@ def main() -> int:
     if missing or stale_listed or stale_excluded:
         return 1
 
-    # Untracked test files are not required yet -- they are not in the CI checkout -- but
-    # saying nothing about them is how "OK" came to mean "OK until you commit". Name them.
+    # Untracked test files are not required yet -- they are genuinely not in the CI checkout,
+    # so demanding they be listed would make CI fail on a file it cannot run. But saying
+    # nothing about them lets a test be written, never committed, and never noticed. Named,
+    # not enforced; the enforcement happens the moment they are added.
     others = _git("ls-files", "--others", "--exclude-standard") or set()
     pending = sorted(p for p in others
-                     if re.fullmatch(r"(?:%s)/(?:[^/]+/)*test_[^/]+\.py"
-                                     % "|".join(TEST_ROOTS), p))
+                     if re.fullmatch(r"(?:%s)/(?:[^/]+/)*%s"
+                                     % ("|".join(TEST_ROOTS), _TEST_FILE_RE), p))
     if pending:
         print("NOTE: not tracked yet, so not required yet -- but required the moment you "
               "`git add` them:")

@@ -97,3 +97,64 @@ def test_the_traceback_of_a_crashed_grader_is_redacted_where_it_is_captured():
     assert "example" not in row["details"]["trace"]
     assert "example" not in row["details"]["reason"]
     assert "Traceback" in row["details"]["trace"]
+
+
+# ---------------------------------------------------------------------------
+# Every case below was found by adversarial review, reproduced against the first version of
+# this module, and then fixed. They are the tests that matter: the ones above were written by
+# the same person who wrote the code and all passed while the module leaked four ways.
+# ---------------------------------------------------------------------------
+
+def test_an_account_name_with_a_space_does_not_leak_the_rest_of_the_path():
+    """The first version cut at the space, leaving the surname and the whole path after it."""
+    # Assembled: a two-word account name written as one literal would put a home shape with
+    # an unrecognised name into a tracked file, and the name check would flag it -- rightly.
+    spaced = "C:\\Users\\" + "Given" + " " + "Family" + "\\secret\\x.py"
+    out = RD.redact(spaced)
+    assert out == r"<home>\secret\x.py"
+    assert "Family" not in out
+
+
+def test_the_account_segment_stops_at_a_quote_so_a_traceback_line_survives():
+    quoted = 'File "' + "C:\\Users\\" + "Given" + " " + "Family" + "\\x.py" + '", line 3'
+    assert RD.redact(quoted) == 'File "' + r"<home>\x.py" + '", line 3'
+
+
+def test_a_placeholder_is_not_eaten_a_second_time():
+    assert RD.redact(r"<home>\wd") == r"<home>\wd"
+
+
+def test_a_checkout_outside_any_home_is_still_removed_whatever_the_case(monkeypatch):
+    """On Windows paths are case-insensitive; the first version's replacement was not.
+
+    A checkout in a build directory matched neither the exact string nor the home shape, so
+    the whole path survived -- the case that CI itself would hit.
+    """
+    monkeypatch.setattr(RD, "_ROOT", r"D:\build\OrgRepo")
+    assert RD.redact(r"d:\BUILD\orgrepo\bench\x.py") == r"<repo>\bench\x.py"
+
+
+def test_a_path_object_is_redacted_rather_than_left_for_default_str():
+    """`json.dump(default=str)` runs AFTER the walk. A Path that survives it is written raw.
+
+    This is the original bug one type away, which is why it is tested against the writer and
+    not against the redactor alone.
+    """
+    import json
+    import pathlib
+    blob = {"trace": pathlib.Path(r"C:\Users\example\secret.py"),
+            "raw": rb"C:\Users\example\secret.py"}
+    written = json.dumps(RD.redact_deep(blob), default=str)
+    assert "example" not in written
+    assert written.count("<home>") == 2
+
+
+def test_two_different_homes_do_not_collapse_into_one_row():
+    """Redacting keys made two records one, and one silently won. Evidence, destroyed."""
+    one = "C:\\Users\\" + "one-account" + "\\x"
+    other = "C:\\Users\\" + "other-account" + "\\x"
+    out = RD.redact_deep({one: 1, other: 2})
+    assert out["_redaction_collisions"] == 2
+    values = [v for k, v in out.items() if k != "_redaction_collisions"]
+    assert sorted(values) == [1, 2], "both rows survive"
+    assert "one-account" not in repr(out) and "other-account" not in repr(out)
