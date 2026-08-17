@@ -72,7 +72,7 @@ detector anchored to the conversation's own contents.
     pass counts        19, 16, 17 of 22
     stable / flipped   15 / 7
     coverage           1.0 on all three
-    delivery           66 of 66 CONFIRMED -- zero unknown, zero denied
+    delivery           66 of 66 "confirmed" -- BUT SEE BELOW, that grade is composite
 
 **THIS REVERSES THE EARLIER CONCLUSION.** An earlier probe found eight of nine failures with
 no prompt in the conversation and called non-delivery the leading explanation for why episodes
@@ -81,6 +81,25 @@ all 14 failures were delivered:
 
     failures 14  ->  delivered 14,  not delivered 0,  unknown 0
     why_they_flip: fails_without_delivery = []   varies_with_delivery = 7 episodes
+
+**AND "66 OF 66" WAS A MISREPORT.** `delivery: confirmed` is a COMPOSITE grade, and the raw
+rows say what actually produced it:
+
+    the prompt was found in the conversation   59
+    the workdir changed                         7
+
+So the conversation check answered for 59 of 66 (89.4%); the other seven were rescued by a
+filesystem fallback and the conversation outcome for them is not in this file at all. The
+headline was quoted as though the marker had been found 66 times. It was found 59 times.
+
+What survives is the part the conclusion rests on: all 14 failures are among the 59, so every
+failed turn did have a rendered user bubble carrying its marker.
+
+**AND THE ANCHOR CONTRIBUTED NOTHING TO THIS RESULT.** Every one of those 59 took the positive
+shortcut — the marker is looked for FIRST, and finding it returns immediately, before the
+truncation check and before the anchor comparison. So calling this "the anchored detector's
+result" is wrong: the anchor is what makes a NEGATIVE trustworthy, and this run produced no
+negatives. The anchoring work is not validated by these numbers.
 
 The detector is not abstaining its way out of the question — it is answering all of it. The
 old one stopped at the first `ok` response whatever it contained, so a view that had not
@@ -93,4 +112,28 @@ cannot be fixed once in the harness; it is variance in the target, and the only 
 repetition — which multiplies the cost of every future A/B by k. The cheap explanation was
 the wrong one.
 
-Milestone A is still not met: 15 episodes stable against the 18 required.
+**WHAT A RENDERED MARKER DOES AND DOES NOT PROVE.** `/history` scrapes `chatQuestion` inside
+rendered turn blocks, not the composer, so this is stronger than "the text stayed in the box".
+It is still a same-page UI acknowledgement. It does not establish that the backend admitted
+the request, associated it with the intended conversation, or consumed it — an optimistically
+rendered user bubble whose submission was then rejected looks identical from here. So the
+defensible claim is "the page eventually rendered this turn's prompt", and everything after
+UI submission — tool transport, consent state, reply capture, fixture and grader determinism —
+remains a candidate for the failures. "Variance in the target" is narrower than the evidence.
+
+**AND THE RETRY IS OPTIONAL STOPPING.** The loop cannot re-send, but it can keep looking until
+the marker appears, and the observation window is far wider than "six attempts two seconds
+apart" suggests: each `/history` can poll internally for up to 30 seconds and the scroll pass
+is bounded at 45. None of the saved rows records attempt count, first-attempt state,
+confirmation latency, truncation or anchor status — so it cannot be told from this file
+whether the 59 appeared immediately or were found minutes later.
+
+Milestone A is still not met: 15 episodes stable against the 18 required. AND THE SPREAD
+CRITERION IS ALSO FAILED, which the first write-up did not mention: 3/22 = 13.6% against the
+preregistered 0.10. The earlier run's 2/22 = 9.5% passed it. Reporting only the stability
+miss made this look like one criterion short when it is two.
+
+**"15 STABLE VERSUS 13" IS NOT DEMONSTRATED IMPROVEMENT.** 48/66 passes before, 52/66 now —
+about 6 points, which a naive independent-binomial check puts at p ≈ 0.42. Only three flipping
+episodes overlap between the two runs, and the rest period differed (15 minutes then, 10 now).
+Three trials also call a true 50/50 episode "stable" a quarter of the time.

@@ -159,6 +159,24 @@ print("__COMPANIONBENCH_RESULT__ " + json.dumps(out, ensure_ascii=False))
 '''
 
 
+def _maxtabs_was_chosen() -> bool:
+    """Whether `maxtabs=` is actually IN the settings file, rather than defaulted.
+
+    `settings_maxtabs()` cannot answer this: it returns 3 whether a human wrote `maxtabs=3`
+    or the file does not exist. The difference decides whether a number is a decision to
+    honour or a guess to check against the machine.
+    """
+    try:
+        from relay.fleet_runner import _settings_path
+        path = _settings_path()
+        if not os.path.isfile(path):
+            return False
+        with open(path, encoding="utf-8-sig") as fh:
+            return any(line.strip().startswith("maxtabs=") for line in fh)
+    except Exception:
+        return False
+
+
 class FleetAgent:
     """Runs one episode through the real fleet, in a child that carries the manifest.
 
@@ -198,6 +216,21 @@ class FleetAgent:
     #: free RAM up to the configured ceiling; otherwise the configured `maxtabs` stands as
     #: given, because with autoscale off that IS the operator's decision.
     #:
+    #: CONFIGURED IS NOT THE SAME AS DEFAULTED, and conflating them is what made the first
+    #: version of this comment describe behaviour the code does not have. `_settings_int`
+    #: swallows read and parse errors internally and returns its default, so
+    #: `settings_maxtabs()` answers 3 for a missing, corrupt or unreadable settings.txt: it
+    #: never raises, the `except` below is nearly unreachable, and the test that "proved" a
+    #: serial fallback did so by making the helper raise, which it does not.
+    #:
+    #: The distinction that matters is whether a human chose the number. If `maxtabs=` is in
+    #: the file, it is a decision and it is honoured exactly -- turning autoscale off is a
+    #: statement that RAM adaptation is not wanted, and quietly reimposing it here would be
+    #: taking away the control rather than using it. If the key is ABSENT, nobody chose
+    #: anything; 3 is this module's guess, and 3 on a box with 2 GB free is the guess that
+    #: turned 58-second episodes into fourteen-minute ones. An unchosen number defers to what
+    #: the machine can afford.
+    #:
     #: Read per access, not at import: free RAM is not a constant, and the browser the fleet
     #: drives is itself the largest consumer of it.
     @property
@@ -209,10 +242,15 @@ class FleetAgent:
             from relay.relay_fleet import auto_concurrency
             configured = max(1, int(settings_maxtabs()))
             on, ceiling = settings_autoscale()
+            ceiling = ceiling or configured
             if on:
-                return max(1, min(int(auto_concurrency(ceiling or configured)),
-                                  ceiling or configured))
-            return configured
+                return max(1, min(int(auto_concurrency(ceiling)), ceiling))
+            if _maxtabs_was_chosen():
+                # A HUMAN PICKED THIS. Autoscale off says RAM adaptation is not wanted, and
+                # `maxtabs=64` on a 512 GB machine means sixty-four. Honoured exactly.
+                return configured
+            # Nobody picked anything -- this is the module default. Defer to the machine.
+            return max(1, min(configured, int(auto_concurrency(ceiling))))
         except Exception:
             # UNKNOWN GOES TO THE SAFE SIDE. Running wide on a machine whose limits could not
             # be read is the accident that produced this property in the first place.

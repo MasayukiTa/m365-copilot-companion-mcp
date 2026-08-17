@@ -269,13 +269,19 @@ def _plain_agent():
     return FleetAgent(agent_url="https://example.invalid/chat/")
 
 
-def test_the_operators_setting_is_used_as_given_when_autoscale_is_off(monkeypatch):
-    """並列数には既に運用者の設定がある。16GB機と512GB機は別の問いなので、
-    このアダプタが自前の定数で答えたり、設定された値を勝手に切り詰めたりしてはいけない。"""
+def test_a_chosen_maxtabs_is_honoured_exactly_even_on_a_small_machine(monkeypatch):
+    """autoscale を切るのは『RAM適応は要らない』という運用者の明示的判断。
+
+    512GB機で maxtabs=64 と書いた人に対し、こちらが黙って RAM で切り詰めるのは
+    制御を使うのではなく奪うこと。人が選んだ値はそのまま通す。"""
+    import bench.companionbench.fleet_agent as FA
     import relay.fleet_runner as fr
+    import relay.relay_fleet as rf
     monkeypatch.setattr(fr, "settings_maxtabs", lambda default=3: 64)
     monkeypatch.setattr(fr, "settings_autoscale", lambda: (False, 0))
-    assert _plain_agent().max_concurrent_episodes == 64, "設定値を切り詰めた"
+    monkeypatch.setattr(FA, "_maxtabs_was_chosen", lambda: True)
+    monkeypatch.setattr(rf, "auto_concurrency", lambda n: 1)   # a cramped box
+    assert _plain_agent().max_concurrent_episodes == 64, "選ばれた設定値を切り詰めた"
 
 
 def test_autoscale_sizes_against_free_ram_up_to_the_configured_ceiling(monkeypatch):
@@ -299,13 +305,58 @@ def test_an_explicit_value_is_a_hard_cap_like_max_concurrent_on_the_cli(monkeypa
     assert agent.max_concurrent_episodes == 2
 
 
-def test_settings_that_cannot_be_read_fall_back_to_serial(monkeypatch):
-    """不明は危険側へ。限界が読めない機械で並列に突っ込むのが、この property を
-    書かせた事故そのもの -- 58〜116秒のエピソードが14〜16分になった。"""
+def test_an_unreadable_settings_file_does_not_yield_the_default_three(monkeypatch, tmp_path):
+    """『読めなければ直列』と書いていたが、コードはそう動いていなかった。
+
+    `_settings_int` は読み取り・パースの失敗を内部で握りつぶして既定値を返すので、
+    settings.txt が無い/壊れていても `settings_maxtabs()` は 3 を返し、例外は飛ばない。
+    それを『例外を投げさせる』テストで通していたので、実挙動を一度も検証していなかった。
+    3 は、この property を書かせた事故（58〜116秒→14〜16分）を起こした当の数字。"""
+    import relay.fleet_runner as fr
+    import relay.relay_fleet as rf
+    monkeypatch.setattr(fr, "_settings_path", lambda: str(tmp_path / "nope.txt"))
+    assert fr.settings_maxtabs() == 3, "前提が変わったらこのテストの意味も変わる"
+    monkeypatch.setattr(fr, "settings_autoscale", lambda: (False, 0))
+    monkeypatch.setattr(rf, "auto_concurrency", lambda n: 1)   # 2GB free box
+    assert _plain_agent().max_concurrent_episodes == 1, "余裕の無い機械で3を返した"
+
+
+def test_an_unchosen_default_defers_to_what_the_machine_can_afford(monkeypatch):
+    """誰も選んでいない 3 は、このモジュールの当て推量であって運用者の判断ではない。
+
+    そして 2GB しか空きの無い機械での 3 は、まさにこの property を書かせた事故
+    （58〜116秒のエピソードが14〜16分になった）を起こした当の数字。"""
+    import bench.companionbench.fleet_agent as FA
+    import relay.fleet_runner as fr
+    import relay.relay_fleet as rf
+    monkeypatch.setattr(fr, "settings_maxtabs", lambda default=3: 3)
+    monkeypatch.setattr(fr, "settings_autoscale", lambda: (False, 0))
+    monkeypatch.setattr(FA, "_maxtabs_was_chosen", lambda: False)
+    monkeypatch.setattr(rf, "auto_concurrency", lambda n: 1)
+    assert _plain_agent().max_concurrent_episodes == 1
+    monkeypatch.setattr(rf, "auto_concurrency", lambda n: 64)
+    assert _plain_agent().max_concurrent_episodes == 3, "既定値の上へ増やした"
+
+
+def test_whether_maxtabs_was_chosen_is_read_from_the_file_not_from_the_default(tmp_path,
+                                                                              monkeypatch):
+    """`settings_maxtabs()` は書かれた 3 と、無いときの 3 を区別できない。"""
+    import bench.companionbench.fleet_agent as FA
+    import relay.fleet_runner as fr
+    p = tmp_path / "settings.txt"
+    monkeypatch.setattr(fr, "_settings_path", lambda: str(p))
+    assert FA._maxtabs_was_chosen() is False, "存在しないファイルを『選ばれた』と読んだ"
+    p.write_text("effort=auto\n", encoding="utf-8")
+    assert FA._maxtabs_was_chosen() is False, "他のキーだけで『選ばれた』と読んだ"
+    p.write_text("effort=auto\nmaxtabs=12\n", encoding="utf-8")
+    assert FA._maxtabs_was_chosen() is True
+
+
+def test_a_genuine_exception_still_falls_back_to_serial(monkeypatch):
     import relay.fleet_runner as fr
 
     def _boom(*a, **k):
-        raise OSError("settings unreadable")
+        raise OSError("import or attribute failure")
 
-    monkeypatch.setattr(fr, "settings_maxtabs", _boom)
+    monkeypatch.setattr(fr, "settings_autoscale", _boom)
     assert _plain_agent().max_concurrent_episodes == 1
