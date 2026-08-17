@@ -189,21 +189,47 @@ def test_require_unlocked_still_denies_by_default():
 def test_grant_ip_is_honoured_by_the_real_unlock_gate():
     """grant_ip and require_unlocked() read/write the exact same state file, so a grant made
     from the cockpit unlocks that IP through the ordinary gate -- without grant_ip calling,
-    patching, or otherwise touching require_unlocked/unlock/_parse_request."""
-    sec.grant_ip("198.51.100.2")
+    patching, or otherwise touching require_unlocked/unlock/_parse_request.
+
+    THE TOKEN IS PRESENTED because grant_ip now issues one, and this then holds whether or not
+    enforcement is on. Without it the test passed only while enforcement was off, which made
+    it depend on the operator's .env: `main` loads it, so importing main anywhere in the suite
+    put MCP_REQUIRE_UNLOCK_TOKEN into the process and these two tests began to fail locally
+    while CI, which has no .env, stayed green. A test whose verdict depends on a file that is
+    not in the repository is not testing the code.
+    """
+    granted = sec.grant_ip("198.51.100.2")
     req = _make_req(peer_host="127.0.0.1", xff="198.51.100.2")
+    sec.set_presented_token(granted["unlock_token"])
+    try:
+        with patch("tools.security.get_http_request", return_value=req):
+            assert sec.require_unlocked() is None
+    finally:
+        sec.clear_presented_token()
+
+
+def test_a_granted_ip_without_its_token_is_refused_under_enforcement(monkeypatch):
+    """The other half: the grant is necessary and, once enforcement is on, not sufficient."""
+    sec.grant_ip("198.51.100.4")
+    req = _make_req(peer_host="127.0.0.1", xff="198.51.100.4")
+    monkeypatch.setenv("MCP_REQUIRE_UNLOCK_TOKEN", "1")
+    sec.clear_presented_token()
     with patch("tools.security.get_http_request", return_value=req):
-        assert sec.require_unlocked() is None
+        assert sec.require_unlocked() is not None
 
 
 def test_revoke_ip_re_locks_the_real_unlock_gate():
-    sec.grant_ip("198.51.100.3")
+    granted = sec.grant_ip("198.51.100.3")
     req = _make_req(peer_host="127.0.0.1", xff="198.51.100.3")
-    with patch("tools.security.get_http_request", return_value=req):
-        assert sec.require_unlocked() is None
-    sec.revoke_ip("198.51.100.3")
-    with patch("tools.security.get_http_request", return_value=req):
-        assert sec.require_unlocked() is not None
+    sec.set_presented_token(granted["unlock_token"])
+    try:
+        with patch("tools.security.get_http_request", return_value=req):
+            assert sec.require_unlocked() is None
+        sec.revoke_ip("198.51.100.3")
+        with patch("tools.security.get_http_request", return_value=req):
+            assert sec.require_unlocked() is not None
+    finally:
+        sec.clear_presented_token()
 
 
 def test_grant_ip_and_revoke_ip_are_not_registered_as_mcp_tools():
