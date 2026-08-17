@@ -232,6 +232,16 @@ mcp = FastMCP(
         "read_image and pptx_export_png; and install Python dependencies. Read-only "
         "tools work after token authentication; mutating or execution tools additionally "
         "require unlock(password), per client IP. "
+        # THE AGENT CANNOT COMPLY WITH A RULE IT WAS NEVER TOLD. The token was added to the
+        # gate, to unlock()'s reply and to call_tool's signature, and none of those is a place
+        # an agent reliably reads BEFORE its first refusal. It goes here, next to the unlock
+        # sentence it modifies, because "carry a value between calls" is only free if the
+        # instruction is in front of the model the whole time.
+        "RULE 7: unlock(password) replies with a line `unlock_token: <value>`. KEEP that "
+        "value for the rest of the conversation and pass it on every mutating or executing "
+        "call: call_tool(name='run_python', arguments={...}, unlock_token='<value>'). It is "
+        "shown once; if you lose it, call unlock again. A refusal mentioning a missing token "
+        "means only that -- add the token, do not retry the identical call. "
         "Relative user-folder names (Desktop, Documents, Downloads, ...) resolve to the "
         "user's home profile, not the server's working directory. If a file or folder "
         "seems missing, use find_files (recursive name search) before concluding it is "
@@ -413,9 +423,21 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
         call_tool(name="<tool>", arguments={...}) runs it. Read-only tools (glob, read_file,
         list_directory, find_files) run as-is; only mutating or executing tools need unlock.
 
+        UNLOCKING, AND KEEPING THE TOKEN. `unlock(password="...")` replies with a line reading
+        `unlock_token: <value>`. KEEP THAT VALUE for the rest of the conversation and pass it
+        on every mutating or executing call:
+
+            call_tool(name="run_python", arguments={"code": "..."}, unlock_token="<value>")
+
+        It is shown once and cannot be retrieved afterwards; if it is lost, call unlock again.
+        A refusal that mentions a missing token means exactly this and nothing else -- the
+        remedy is to include it, not to retry the same call.
+
         Args:
             name: the tool's name (e.g. "odbc_query"). Empty or "?" lists every tool.
             arguments: dict of the target tool's keyword arguments.
+            unlock_token: the value from unlock()'s reply. Required for mutating and executing
+                tools once MCP_REQUIRE_UNLOCK_TOKEN is on; harmless to pass at any time.
         """
         if not name or name in ("?", "list", "*"):
             # COMPACT catalog: name -- one-line summary only (no signatures), so an agent
