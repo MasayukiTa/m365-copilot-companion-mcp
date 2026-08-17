@@ -35,6 +35,7 @@ import time
 from bench.companionbench import agents as A
 from bench.companionbench import runner as R
 from bench.companionbench.pools import EVOLUTION, REGISTRY, REGRESSION, SEALED
+from bench.companionbench.redact import redact, redact_deep
 from bench.companionbench.runner import SECURITY_CATEGORY
 from relay.selfimprove import manifest as M
 
@@ -597,9 +598,13 @@ if __name__ == "__main__":                                   # pragma: no cover
     text = report(result)
     print("")
     print(text)
+    # Results files are committed to a public repository. Redact at the write boundary as well
+    # as at capture: capture covers the tracebacks we know about, this covers the ones we do
+    # not -- a grader reason built from a path, a workdir used as a dict key, a field added
+    # later by someone who never read this comment.
     if args.out:
         with open(args.out, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(text + "\n")
+            fh.write(redact(text) + "\n")
     if args.json:
         with open(args.json, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump(result, fh, ensure_ascii=False, indent=2, default=str)
+            json.dump(redact_deep(result), fh, ensure_ascii=False, indent=2, default=str)

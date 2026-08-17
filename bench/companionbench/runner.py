@@ -42,6 +42,7 @@ import traceback
 
 from bench.companionbench.episode import EpisodeRun
 from bench.companionbench.pools import EVOLUTION, REGRESSION, REGISTRY, SEALED
+from bench.companionbench.redact import redact
 from relay.selfimprove import manifest as M
 from relay.selfimprove import runtime_config as RC
 
@@ -476,11 +477,14 @@ def _agent_broke_the_grade(episode, started, reason):
 
 
 def _infra(episode, reason, started, trace=""):
+    # A traceback carries the absolute paths the interpreter was running from, and a results
+    # file is committed to a public repository. Redact where it is captured, not only where it
+    # is written: this object is also printed to a terminal and quoted into commit messages.
     return {
         "episode_id": episode.episode_id, "category": episode.category,
         "success": False, "functional_score": 0.0, "security_score": 1.0,
         "side_effect_score": 1.0, "infra_failure": True,
-        "details": {"reason": reason, "trace": trace},
+        "details": {"reason": redact(reason), "trace": redact(trace)},
         "latency_s": round(time.time() - started, 3),
     }
 
