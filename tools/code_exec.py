@@ -7,6 +7,7 @@ from typing import Optional
 from ._subproc import sanitized_child_env
 from .file_ops import _validate_path
 from .security import require_unlocked
+from .shell_extra import _gate_detail
 
 
 def _working_dir(path: Optional[str]) -> str:
@@ -82,7 +83,7 @@ def run_python(
     # routed through the existing 'shell_destructive' op_class so any contract that already
     # asks-before destructive shell also covers destructive Python (no schema change needed).
     if _cg.destructive_shell(code) or _cg.destructive_python(code):
-        _g = _cg.check_op("shell_destructive", code[:200])
+        _g = _cg.check_op("shell_destructive", _gate_detail(code))
         if _g is not None:
             return _g
     tmp_path: Optional[str] = None
@@ -131,7 +132,7 @@ def shell_exec(
         return locked
     from . import contract_gate as _cg
     if _cg.destructive_shell(command):
-        _g = _cg.check_op("shell_destructive", command[:200])
+        _g = _cg.check_op("shell_destructive", _gate_detail(command))
         if _g is not None:
             return _g
     try:

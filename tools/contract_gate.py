@@ -125,6 +125,49 @@ _DESTRUCTIVE_PATTERNS = [
     re.compile(r"\bgit\s+reset\s+--hard\b"),
     re.compile(r"\bgit\s+clean\s+(?:.*\s)?-[fF]"),                   # git clean -f / -fd / -fdx
     re.compile(r"\bgit\s+clean\s+(?:.*\s)?-x"),                      # git clean -x (also destructive)
+
+    # ── PowerShell ────────────────────────────────────────────────────────────────────
+    # THE WEIGHTING WAS BACKWARDS. Sixteen patterns covered destructive PYTHON and two
+    # covered PowerShell -- one of which was subsumed by the other -- on Windows, where
+    # PowerShell is the most capable thing available. A probe of ten ordinary destructive
+    # one-liners caught two. These are the eight that slipped.
+    #
+    # Aliases matter as much as the full names: `ri` IS Remove-Item to the interpreter, and a
+    # denylist that only knows the long form is a denylist that asks nicely.
+    re.compile(r"\b(?:Remove-Item|ri|rmdir|erase)\b(?=.*[\\/*?])", re.IGNORECASE),
+    re.compile(r"\bRemove-Item\b(?=.*\bHK(?:LM|CU|CR|U|CC):)", re.IGNORECASE),
+    re.compile(r"\b(?:Clear-Content|Set-Content)\b", re.IGNORECASE),
+    re.compile(r"\b(?:Format-Volume|Clear-Disk|Initialize-Disk|Remove-Partition)\b",
+               re.IGNORECASE),
+    re.compile(r"\b(?:Stop-Computer|Restart-Computer|Stop-Service|Remove-Service)\b",
+               re.IGNORECASE),
+    re.compile(r"\b(?:Remove-ItemProperty|Set-ItemProperty)\b(?=.*\bHK(?:LM|CU|CR|U|CC):)",
+               re.IGNORECASE),
+    re.compile(r"\bRemove-(?:ADUser|LocalUser|Mailbox|AzResource)\b", re.IGNORECASE),
+
+    # ── EXFILTRATION, which is destruction of a different kind ────────────────────────
+    # A request that puts an environment variable into an outbound call is not a deletion, so
+    # it fell outside every pattern above -- and it is the shape that turns a one-time
+    # weakness into a permanent one.
+    #
+    # Scoped to network cmdlets rather than to `$env:` alone. `$env:PATH` appears in ordinary
+    # scripts constantly, and a gate that fires on all of them is a gate people learn to
+    # approve without reading, which is worse than not having it. The pairing is the signal.
+    re.compile(r"\b(?:Invoke-WebRequest|Invoke-RestMethod|iwr|irm|curl|wget|"
+               r"Start-BitsTransfer|Net\.WebClient)\b(?=.*\$env:)", re.IGNORECASE),
+
+    # ── THE TWO THAT MAKE REGEX INSUFFICIENT, matched anyway ──────────────────────────
+    # `-EncodedCommand` takes base64 and `iex` takes a string, so either one can carry
+    # anything past every pattern in this file. They cannot be matched THROUGH; they can only
+    # be matched ON. Treating their mere presence as destructive is not paranoia, it is the
+    # only sound reading: a script that hides what it runs has declined to be judged.
+    #
+    # This does not make the denylist complete. `shell_exec` runs through cmd.exe and can
+    # invoke `powershell -enc ...` itself, and the patterns above are the same list, so that
+    # route is covered by these two lines and not by the PowerShell-specific ones. Detection
+    # remains detection: it asks, it does not confine.
+    re.compile(r"-e(?:nc|ncoded|ncodedcommand)?\b\s+[A-Za-z0-9+/=]{16,}", re.IGNORECASE),
+    re.compile(r"\b(?:iex|Invoke-Expression)\b", re.IGNORECASE),
 ]
 
 
