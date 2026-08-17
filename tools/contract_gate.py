@@ -136,7 +136,22 @@ _DESTRUCTIVE_PATTERNS = [
     # denylist that only knows the long form is a denylist that asks nicely.
     re.compile(r"\b(?:Remove-Item|ri|rmdir|erase)\b(?=.*[\\/*?])", re.IGNORECASE),
     re.compile(r"\bRemove-Item\b(?=.*\bHK(?:LM|CU|CR|U|CC):)", re.IGNORECASE),
-    re.compile(r"\b(?:Clear-Content|Set-Content)\b", re.IGNORECASE),
+    # `Clear-Content` empties a file and is destructive on its own. `Set-Content` was in here
+    # too and should not have been: writing an output artefact is ordinary work, and a gate
+    # that fires on every generated report is one people learn to approve unread -- which
+    # costs more than it protects. Only the overwrite-a-thing-that-exists shapes remain.
+    re.compile(r"\bClear-Content\b", re.IGNORECASE),
+    re.compile(r"\b(?:Set-Content|Out-File)\b(?=.*-Force)", re.IGNORECASE),
+    # `del` / `rd` / `erase` ARE Remove-Item to the interpreter, so a denylist that only knows
+    # the long name is asking politely. Bare `del $PROFILE` deletes a file with no flags at all.
+    re.compile(r"\b(?:del|erase|rd)\s+[^\s|;]+", re.IGNORECASE),
+    re.compile(r"\bStop-Process\b", re.IGNORECASE),
+    # COMMAND NAMES BUILT AT RUN TIME. `& ('Remove-'+'Item')` is not matched by any pattern for
+    # `Remove-Item`, and cannot be: the name does not exist until the expression is evaluated.
+    # Like -EncodedCommand and iex, this is matched ON rather than THROUGH -- assembling a
+    # cmdlet name from pieces is a decision to be unreadable, and unreadable is unjudged.
+    re.compile(r"&\s*\(\s*['\"]", re.IGNORECASE),
+    re.compile(r"\b(?:Invoke-Command|Start-Process)\b(?=.*\$)", re.IGNORECASE),
     re.compile(r"\b(?:Format-Volume|Clear-Disk|Initialize-Disk|Remove-Partition)\b",
                re.IGNORECASE),
     re.compile(r"\b(?:Stop-Computer|Restart-Computer|Stop-Service|Remove-Service)\b",
@@ -167,7 +182,14 @@ _DESTRUCTIVE_PATTERNS = [
     # route is covered by these two lines and not by the PowerShell-specific ones. Detection
     # remains detection: it asks, it does not confine.
     re.compile(r"-e(?:nc|ncoded|ncodedcommand)?\b\s+[A-Za-z0-9+/=]{16,}", re.IGNORECASE),
-    re.compile(r"\b(?:iex|Invoke-Expression)\b", re.IGNORECASE),
+    # `iex` INVOKED, not `iex` MENTIONED. The bare word matched inside a quoted string, so
+    # `Write-Output 'iex is disabled by policy'` went to the approval queue -- and a gate that
+    # fires on a sentence about itself is training for approving without reading. Requiring
+    # something to follow it (an argument, a pipe into it) keeps the invocation and drops the
+    # mention. Not a parser, and a determined author can still evade it; the point is that
+    # ordinary text should not trip it.
+    re.compile(r"(?:^|[;|&{(]\s*)\s*(?:iex|Invoke-Expression)\b", re.IGNORECASE),
+    re.compile(r"\|\s*(?:iex|Invoke-Expression)\b", re.IGNORECASE),
 ]
 
 

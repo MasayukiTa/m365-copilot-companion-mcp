@@ -40,6 +40,52 @@ def _gate_detail(script: str) -> str:
     return "sha256:%s %s" % (digest, head)
 
 
+#: Byte-order marks, and what each one means. Built with chr() rather than written as escapes
+#: because a patch applied through a shell heredoc turns `\xNN` into the actual byte, and a
+#: source file containing a NUL does not compile -- which happened while writing this.
+_BOMS = (
+    (bytes([0xFF, 0xFE, 0x00, 0x00]), "utf-32-le"),
+    (bytes([0x00, 0x00, 0xFE, 0xFF]), "utf-32-be"),
+    (bytes([0xFF, 0xFE]), "utf-16-le"),
+    (bytes([0xFE, 0xFF]), "utf-16-be"),
+    (bytes([0xEF, 0xBB, 0xBF]), "utf-8-sig"),
+)
+
+UNJUDGED = "<unreadable script: treat as destructive>"
+
+
+def _decode_script(raw: bytes) -> str:
+    """Decode a .ps1 the way PowerShell would, for JUDGEMENT only.
+
+    PowerShell honours a BOM. A UTF-8-only decode turns a UTF-16LE script into letters
+    separated by NULs, so `\\bRemove-Item\\b` stops matching -- while PowerShell reads the file
+    itself, recognises the encoding, and runs it. Judging a different text than the one that
+    will execute is the entire defect, so the BOMs are handled explicitly and anything
+    undecodable is treated as unjudged rather than as empty.
+    """
+    for bom, enc in _BOMS:
+        if raw.startswith(bom):
+            try:
+                return raw.decode(enc, "replace")
+            except Exception:
+                return UNJUDGED
+    # No BOM: PowerShell 5.1 reads the ANSI code page, 7 reads UTF-8. Judge BOTH -- a pattern
+    # only has to match one of them for the gate to fire, and missing is the failure that costs
+    # something.
+    try:
+        text = raw.decode("utf-8", "replace")
+    except Exception:
+        return UNJUDGED
+    try:
+        import locale
+        alt = raw.decode(locale.getpreferredencoding(False), "replace")
+        if alt != text:
+            text = text + "\n" + alt
+    except Exception:
+        pass
+    return text
+
+
 def _resolve_shell(use_core: bool) -> Optional[str]:
     if use_core:
         return shutil.which("pwsh.exe") or shutil.which("pwsh")
@@ -164,34 +210,55 @@ def pwsh_exec_file(
     # Judged on the FILE'S CONTENTS, because the path is not the thing that executes. Reading
     # it here also means the approval is about the text that will actually run rather than
     # about a name.
+    # READ ONCE, JUDGE THOSE BYTES, EXECUTE THOSE BYTES. Reading for approval and then handing
+    # PowerShell the caller's PATH are two different objects, and two defects lived in the gap.
+    #
+    #   ENCODING. The detector decoded UTF-8; PowerShell decodes the file itself. A UTF-16LE
+    #   script reads here as letters separated by NULs, so no word-boundary pattern matches --
+    #   and PowerShell runs it. The approval was about a text that was never going to execute.
+    #
+    #   TOCTOU, AND A FAIL-OPEN. Between the read and the run, anything may replace the file.
+    #   And a path that did not exist at read time produced an empty body that skipped the gate
+    #   altogether, then appeared in time to be executed -- open in the one place that must not.
+    #
+    # So: read as BYTES once, decode BOM-aware for judgement only, and run a private copy that
+    # no other caller has a handle to.
+    _raw = None
     try:
         _p = _validate_path(path)
-        _body = _p.read_text(encoding="utf-8", errors="replace") if _p.is_file() else ""
+        if _p.is_file():
+            _raw = _p.read_bytes()
     except Exception:
-        # UNREADABLE MEANS UNJUDGED, AND UNJUDGED GOES TO THE GATE. Failing open here would
-        # make "make the file hard to read" the bypass.
-        _body = "<unreadable script: treat as destructive>"
+        _raw = None
+    # UNREADABLE OR ABSENT MEANS UNJUDGED, AND UNJUDGED GOES TO THE GATE -- otherwise "make the
+    # file hard to read" is the bypass.
+    _body = UNJUDGED if _raw is None else _decode_script(_raw)
     from . import contract_gate as _cg
-    if _body and (_cg.destructive_shell(_body) or _body.startswith("<unreadable")):
+    if _cg.destructive_shell(_body) or _body == UNJUDGED:
         _g = _cg.check_op("shell_destructive", _gate_detail(_body))
         if _g is not None:
             return _g
+    _snapshot = None
     try:
         shell = _resolve_shell(use_core)
         if not shell:
             return "[pwsh_exec_file error: no PowerShell on PATH]"
         p = _validate_path(path)
-        if not p.is_file():
-            return f"[pwsh_exec_file error: not a file: {p}]"
+        if _raw is None:
+            return f"[pwsh_exec_file error: not a readable file: {p}]"
         if p.suffix.lower() != ".ps1":
             return "[pwsh_exec_file error: path must be a .ps1 file]"
         cwd = str(_validate_path(working_dir)) if working_dir else str(p.parent)
+        import tempfile as _tempfile
+        _fd, _snapshot = _tempfile.mkstemp(suffix=".ps1", prefix="pwsh_snap_")
+        with os.fdopen(_fd, "wb") as _fh:
+            _fh.write(_raw)
         cmd = [
             shell,
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy", "Bypass",
-            "-File", str(p),
+            "-File", _snapshot,
         ] + [str(a) for a in (args or [])]
         r = subprocess.run(
             cmd,
@@ -208,6 +275,14 @@ def pwsh_exec_file(
         return f"[pwsh_exec_file timeout after {timeout}s]"
     except Exception as e:
         return f"[pwsh_exec_file error: {type(e).__name__}: {e}]"
+    finally:
+        # The snapshot exists only for the length of the run. Leaving copies of every executed
+        # script in the temp directory would be a second, quieter disclosure surface.
+        if _snapshot:
+            try:
+                os.unlink(_snapshot)
+            except OSError:
+                pass
 
 
 def shell_which() -> str:

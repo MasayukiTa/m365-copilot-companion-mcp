@@ -11,6 +11,7 @@ from typing import Optional
 from ._subproc import sanitized_child_env
 from .file_ops import _validate_path
 from .security import require_unlocked
+from .shell_extra import _gate_detail
 
 # ---------------------------------------------------------------------------
 # Background-job watchdog cap (MCP spec §21.6 fix B.2)
@@ -185,7 +186,7 @@ def run_in_background(
     # of shell_exec skipped HITL approval entirely. Reuses destructive_shell/check_op
     # verbatim; no detection logic duplicated here.
     if _cg.destructive_shell(command):
-        _g = _cg.check_op("shell_destructive", command[:200])
+        _g = _cg.check_op("shell_destructive", _gate_detail(command))
         if _g is not None:
             return _g
     try:
@@ -241,7 +242,7 @@ def run_python_in_background(code: str, label: str = "") -> str:
     # destructive_shell/destructive_python/check_op verbatim; no detection logic
     # duplicated here.
     if _cg.destructive_shell(code) or _cg.destructive_python(code):
-        _g = _cg.check_op("shell_destructive", code[:200])
+        _g = _cg.check_op("shell_destructive", _gate_detail(code))
         if _g is not None:
             return _g
     try:

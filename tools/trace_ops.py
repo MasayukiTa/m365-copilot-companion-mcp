@@ -65,19 +65,62 @@ def _summarize(value, cap):
     return s
 
 
+#: Parameters whose VALUE is a credential. Observability that records these hands an
+#: API-key-only caller the second key: this wrapper sits OUTSIDE call_tool, so it binds the
+#: arguments before `unlock_token` is popped, and the trace log lives under a base that
+#: `read_file` can read without an unlock. Tracing is off by default, which makes this dormant
+#: rather than absent -- and "dormant unless someone turns on the observability flag" is not a
+#: property to rely on.
+_SECRET_PARAMS = frozenset({
+    "password", "passwd", "pwd", "unlock_token", "token", "api_key", "apikey",
+    "secret", "credential", "credentials", "auth", "authorization", "bearer",
+    "private_key", "session_key", "access_token", "refresh_token",
+})
+
+#: Tools whose RESULT is a credential, whatever it is called. `unlock` returns the token in
+#: its reply text, so redacting parameters alone would still write it down.
+_SECRET_RESULT_TOOLS = frozenset({"unlock", "grant_ip"})
+
+_REDACTED = "<redacted>"
+
+
+def redact_secret_args(summary: dict) -> dict:
+    """Blank any bound argument whose NAME says it carries a credential."""
+    return {k: (_REDACTED if k.lower() in _SECRET_PARAMS else v)
+            for k, v in (summary or {}).items()}
+
+
+def redact_secret_result(name: str, result_summary):
+    """Blank a result that is itself a credential."""
+    return _REDACTED if (name or "").lower() in _SECRET_RESULT_TOOLS else result_summary
+
+
 def _summarize_args(fn, args, kwargs):
     """Bind call args to parameter names so the trace reads name=value, not positional
-    junk. Falls back to a positional list if binding fails."""
+    junk. Falls back to a positional list if binding fails.
+
+    Redacted by NAME rather than by value: a value-matching filter has to know what a secret
+    looks like, and `secrets.token_urlsafe` output looks like any other identifier.
+    """
     try:
         sig = inspect.signature(fn)
         bound = sig.bind_partial(*args, **kwargs)
-        return {k: _summarize(v, _ARG_CAP) for k, v in bound.arguments.items()}
+        return redact_secret_args(
+            {k: _summarize(v, _ARG_CAP) for k, v in bound.arguments.items()})
     except Exception:
         out = {}
         for i, a in enumerate(args):
             out["arg%d" % i] = _summarize(a, _ARG_CAP)
         for k, v in (kwargs or {}).items():
             out[k] = _summarize(v, _ARG_CAP)
+        # THE FALLBACK IS WHERE THIS WOULD HAVE LEAKED. Binding fails for exactly the
+        # awkward calls, and an unredacted fallback is a filter with a hole in the shape of
+        # every call it could not parse. Positional args cannot be named, so they are dropped
+        # rather than guessed at for a tool known to take a credential.
+        out = redact_secret_args(out)
+        if any(k.startswith("arg") for k in out) and getattr(fn, "__name__", "") in (
+                _SECRET_RESULT_TOOLS | {"call_tool"}):
+            out = {k: (_REDACTED if k.startswith("arg") else v) for k, v in out.items()}
         return out
 
 
@@ -85,8 +128,8 @@ def record_call(name, args_summary, ok, dur_ms, result_summary="", error=""):
     """Append one tool-call record to today's trace log. Best-effort; never raises."""
     try:
         entry = {"ts": time.time(), "name": name, "ok": bool(ok),
-                 "dur_ms": int(dur_ms), "args": args_summary,
-                 "result": result_summary, "error": error}
+                 "dur_ms": int(dur_ms), "args": redact_secret_args(args_summary),
+                 "result": redact_secret_result(name, result_summary), "error": error}
         with _tracelog_path().open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception:
