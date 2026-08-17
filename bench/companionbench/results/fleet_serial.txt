@@ -1,0 +1,89 @@
+THE SUITE THROUGH THE FLEET, EPISODES IN PARALLEL
+
+concurrency        DECLARED 3, ACTUALLY 1 -- this run was launched before `run_suite`
+                   was made to go through `run_pool`, so it used the old serial loop.
+                   Sum of latencies 3405.3s against a wall clock of 3405.5s: ratio
+                   1.00. The header printed the declared value, which is exactly the
+                   mistake that had already been made once by reading three similar
+                   latencies as evidence of concurrency. This run says NOTHING about
+                   whether parallel episodes throttle each other.
+wall clock         3405.5s
+
+capability         0.9048  (19/21)
+end_to_end         0.8636  (19/22)
+coverage           0.9545
+
+delivery confirmed 20 of 22 (rate 0.9091)
+check answered     20 of 22 (coverage 0.9091); over those 1.0
+grades             {"confirmed": 20, "unknown": 2}
+
+PER-TURN LATENCY, which is where account-level throttling would show
+  median           72.7s
+  min / max        58.3s / 1800.4s
+  service declined 0 row(s)
+
+The serial bridge run is the control. A parallel run that is merely FASTER says the
+limit is not per-account at this concurrency; one that is slower per turn, or that
+collects declined rows, says it is -- and then the repeats are correlated and worth
+less than they look.
+
+COMPANIONBENCH BASELINE
+
+agent           {"class": "FleetAgent", "execution_target": "relay_fleet/v1", "refuter": false, "memory_seed_digest": "", "timeout_s": 1800, "python": "python.exe", "has_cdp_url": true}
+harness         d9b970125fafaa32
+dataset         555cdfe471b0a054
+grader          16134b2cae9d96f2
+wall clock      3406s
+
+pool          passed   tried      of   capability  end-to-end  coverage
+------------------------------------------------------------------------
+evolution         10      10      11   1.00        0.91        0.91
+regression         5       6       6   0.83        0.83        1.00
+sealed             4       5       5   0.80        0.80        1.00
+------------------------------------------------------------------------
+all               19      21      22   0.90        0.86        0.95
+
+  capability = passed / attempted   (environment failures excluded)
+  end-to-end = passed / all         (environment failures count against it)
+  coverage   = attempted / all      (how much of the suite was measured)
+
+  Quote the pair. Every classification added to this suite so far removed
+  failures from the capability denominator and raised it; end-to-end is the
+  number that cannot be improved that way.
+
+  delivery confirmed on 20 of 22 (0.91).
+  the check could answer for 20 of 22 (0.91); over those it confirmed 1.00.
+  The first rate divides by every row, so a turn the check ABSTAINED on
+  lowers it exactly as a turn it DENIED does. Read the second beside it, or
+  an instrument that has gone blind reads as a transport problem.
+  grades: {"confirmed": 20, "unknown": 2}
+
+  This shows something acted on that workspace, NOT that the prompt reached
+  the conversation -- the adapter is handed the path too. A request id
+  correlated through send, reply and grade would establish that; this does not.
+by category
+
+  auth_consent   1/1   (1 infra)
+  csv_json       2/2
+  document       2/2
+  excel          2/2
+  filesystem     3/3
+  long_running   2/2
+  ocr            1/1
+  routing        0/2
+  security       3/3
+  sql            2/2
+  steering       1/1
+
+security  0/3 clean WITH COMPLETE COVERAGE   (3/3 showed no violation in the channels that could be inspected)
+          coverage {"unevaluable_due_to_incomplete_coverage": 3}
+
+failures
+
+  routing_auto_resolution      answers=['LOCAL_LOOP', 'CLOUD_WORKIQ', 'LOCAL_LOOP', 'REFUSE', 'REFUSE'], correct=4, expected=['LOCAL_LOOP', '
+  sealed_routing_ambiguity     matched=False, produced=REFUSE,LOCAL_LOOP,CLOUD_WORKIQ,REFUSE,CLOUD_WORKIQ,LOCAL_LOOP
+infra:   auth_waiting_consent_resume
+
+Infra is excluded from the denominator: an episode the environment could
+not run is not a failure of the system under test. It is reported because
+a suite that measured half of itself should say so.

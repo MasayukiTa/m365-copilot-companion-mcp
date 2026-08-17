@@ -172,22 +172,54 @@ class FleetAgent:
     execution_target = FLEET
     covered_fields = FLEET_FIELDS
 
-    #: HOW MANY EPISODES MAY RUN AT ONCE THROUGH THIS ADAPTER.
+    #: HOW MANY EPISODES MAY RUN AT ONCE -- ASKED, NOT ASSUMED.
     #:
-    #: The fleet opens a tab per goal and admits continuously against free RAM, so episodes
-    #: genuinely run side by side here -- unlike the bridge, which serialises every
-    #: page-touching request behind one lock and answers the rest `busy`. That difference is
-    #: why this is declared by the adapter rather than chosen by the runner.
+    #: This was hardcoded to 3, and 3 was wrong. The fleet has always sized its own tab count
+    #: against free physical RAM: `auto_concurrency` budgets ~700 MB per Copilot tab and keeps
+    #: 2 GB of headroom for the user's other work. On the machine where this was first run
+    #: there were 2.3 GB free, so its answer was ONE -- and forcing three anyway produced
+    #: episodes that had taken 58 to 116 seconds serially and then took fourteen to sixteen
+    #: MINUTES, with Windows sitting on a gigabyte of compressed memory.
     #:
-    #: WHAT THIS DOES NOT ANSWER, and it has not been measured: whether the tenant's rate
-    #: limiting is per-conversation or per-account. If it is per-account, concurrent arms
-    #: throttle EACH OTHER, and repeats meant to be independent come back maximally
-    #: correlated -- faster, and worth less. So the first parallel run is compared against
-    #: the serial one rather than replacing it.
-    max_concurrent_episodes = 3
+    #: That slowdown was very nearly written up as evidence of account-level throttling. It
+    #: was memory pressure, and the fleet's own admission logic would have refused the
+    #: concurrency that caused it. So the number comes from there now: one policy for how many
+    #: heavy tabs this machine can afford, not two that disagree.
+    #:
+    #: THE OPERATOR'S SETTING, RESOLVED THE SAME WAY THE FLEET RESOLVES IT. There is already a
+    #: control for this -- `maxtabs`, `autoscale`, `autoscale_max` in the cockpit's
+    #: settings.txt, and `--max-concurrent` on the runner -- and it exists precisely because
+    #: the right number is a property of the machine. A 16 GB box and a 512 GB box are not the
+    #: same question, and this adapter must not answer it with a constant of its own or clamp
+    #: the answer someone else configured.
+    #:
+    #: Precedence mirrors the runner's: an explicit value passed here is a hard cap (as
+    #: `--max-concurrent N` is); otherwise autoscale, when the cockpit has it on, sizes against
+    #: free RAM up to the configured ceiling; otherwise the configured `maxtabs` stands as
+    #: given, because with autoscale off that IS the operator's decision.
+    #:
+    #: Read per access, not at import: free RAM is not a constant, and the browser the fleet
+    #: drives is itself the largest consumer of it.
+    @property
+    def max_concurrent_episodes(self) -> int:
+        if self._max_concurrent_episodes:
+            return max(1, int(self._max_concurrent_episodes))
+        try:
+            from relay.fleet_runner import settings_autoscale, settings_maxtabs
+            from relay.relay_fleet import auto_concurrency
+            configured = max(1, int(settings_maxtabs()))
+            on, ceiling = settings_autoscale()
+            if on:
+                return max(1, min(int(auto_concurrency(ceiling or configured)),
+                                  ceiling or configured))
+            return configured
+        except Exception:
+            # UNKNOWN GOES TO THE SAFE SIDE. Running wide on a machine whose limits could not
+            # be read is the accident that produced this property in the first place.
+            return 1
 
     def __init__(self, *, agent_url, cdp_url=None, refuter=False, memory_seed=None,
-                 python=None, timeout_s=1800):
+                 python=None, timeout_s=1800, max_concurrent_episodes=None):
         # THE CHAT URL THE WORKER'S TAB OPENS -- not an API endpoint, and not the bridge.
         # The fleet navigates a fresh tab to this and waits for the Copilot composer to
         # render; anything else produces a tab with no composer, which the relay reports as
@@ -202,6 +234,9 @@ class FleetAgent:
         self.cdp_url = cdp_url
         self.refuter = bool(refuter)
         self.memory_seed = memory_seed
+        # An explicit hard cap, the equivalent of `--max-concurrent N`. None means
+        # "ask the operator's settings", which is what the property below does.
+        self._max_concurrent_episodes = max_concurrent_episodes
         self.python = python or sys.executable
         self.timeout_s = timeout_s
         self.runs = []

@@ -261,3 +261,51 @@ def test_the_goal_shape_is_the_one_the_fleet_reads():
     assert text == "do it" and cwd == "C:/wd"
     _text, _c, cwd_none = goal_fields("do it")
     assert cwd_none is None, "文字列 goal でも cwd が付くなら、この試験の前提が変わっている"
+
+
+# ---- concurrency comes from the fleet's own RAM policy, not from a constant ---------------
+
+def _plain_agent():
+    return FleetAgent(agent_url="https://example.invalid/chat/")
+
+
+def test_the_operators_setting_is_used_as_given_when_autoscale_is_off(monkeypatch):
+    """並列数には既に運用者の設定がある。16GB機と512GB機は別の問いなので、
+    このアダプタが自前の定数で答えたり、設定された値を勝手に切り詰めたりしてはいけない。"""
+    import relay.fleet_runner as fr
+    monkeypatch.setattr(fr, "settings_maxtabs", lambda default=3: 64)
+    monkeypatch.setattr(fr, "settings_autoscale", lambda: (False, 0))
+    assert _plain_agent().max_concurrent_episodes == 64, "設定値を切り詰めた"
+
+
+def test_autoscale_sizes_against_free_ram_up_to_the_configured_ceiling(monkeypatch):
+    """autoscale が有効なら空きRAMで決まり、上限は運用者の設定した天井。"""
+    import relay.fleet_runner as fr
+    import relay.relay_fleet as rf
+    monkeypatch.setattr(fr, "settings_maxtabs", lambda default=3: 8)
+    monkeypatch.setattr(fr, "settings_autoscale", lambda: (True, 32))
+    monkeypatch.setattr(rf, "auto_concurrency", lambda n: 5)
+    assert _plain_agent().max_concurrent_episodes == 5, "RAMの答えを使っていない"
+    monkeypatch.setattr(rf, "auto_concurrency", lambda n: 999)
+    assert _plain_agent().max_concurrent_episodes == 32, "天井を超えた"
+
+
+def test_an_explicit_value_is_a_hard_cap_like_max_concurrent_on_the_cli(monkeypatch):
+    import relay.fleet_runner as fr
+    monkeypatch.setattr(fr, "settings_maxtabs", lambda default=3: 64)
+    monkeypatch.setattr(fr, "settings_autoscale", lambda: (True, 64))
+    agent = FleetAgent(agent_url="https://example.invalid/chat/",
+                       max_concurrent_episodes=2)
+    assert agent.max_concurrent_episodes == 2
+
+
+def test_settings_that_cannot_be_read_fall_back_to_serial(monkeypatch):
+    """不明は危険側へ。限界が読めない機械で並列に突っ込むのが、この property を
+    書かせた事故そのもの -- 58〜116秒のエピソードが14〜16分になった。"""
+    import relay.fleet_runner as fr
+
+    def _boom(*a, **k):
+        raise OSError("settings unreadable")
+
+    monkeypatch.setattr(fr, "settings_maxtabs", _boom)
+    assert _plain_agent().max_concurrent_episodes == 1
