@@ -291,3 +291,64 @@ def test_a_bridge_error_arriving_as_reply_text_is_not_an_answer():
     with pytest.raises(A.TurnDidNotSettle) as exc:
         _Bridge(raw)("edit mod_b.py in C:/wd", "C:/wd")
     assert "arrived as the reply text" in str(exc.value)
+
+
+# ---- delivery, read back from the conversation ----------------------------------------------
+
+def test_the_prompt_carries_a_marker_minted_for_the_turn():
+    """workdir の変化は『その作業場所で何かが動いた』であって、
+    プロンプトが会話に届いたことの証明ではない -- アダプタもそのパスを持っている。"""
+    b = _Bridge(_DONE)
+    b("edit mod_b.py", "C:/wd")
+    prompt = b.transcript[-1]["prompt"]
+    assert b.transcript[-1]["nonce"] in prompt
+    assert prompt.rstrip().endswith("]"), "marker が末尾の独立行にない"
+
+
+def test_two_turns_never_share_a_marker():
+    b = _Bridge(_DONE)
+    b("edit mod_b.py", "C:/wd")
+    b("edit mod_b.py", "C:/wd")
+    assert b.transcript[0]["nonce"] != b.transcript[1]["nonce"]
+
+
+def test_a_history_the_bridge_could_not_serve_is_unknown_not_absent():
+    """『履歴が busy だった』は『プロンプトが届かなかった』ではない。
+    確認できなかったことを否定として記録すると、環境の不調が配送失敗として現れる。"""
+    class _NoHistory(_Bridge):
+        def _request(self, path, timeout=None):
+            if path == "/history":
+                raise OSError("connection refused")
+            return self._raw
+
+    b = _NoHistory(_DONE)
+    b("edit mod_b.py", "C:/wd")
+    assert b.transcript[-1]["prompt_in_conversation"] is None
+
+
+def test_a_conversation_without_the_marker_is_a_delivery_failure():
+    class _Empty(_Bridge):
+        def _request(self, path, timeout=None):
+            if path == "/history":
+                return 'HTTP/1.1 200 OK\r\n\r\n{"ok": true, "url": "u", "messages": []}'
+            return self._raw
+
+    b = _Empty(_DONE)
+    b("edit mod_b.py", "C:/wd")
+    assert b.transcript[-1]["prompt_in_conversation"] is False
+
+
+def test_a_conversation_carrying_the_marker_confirms_delivery():
+    class _Has(_Bridge):
+        def _request(self, path, timeout=None):
+            if path == "/history":
+                nonce = self.transcript[-1]["nonce"] if self.transcript else ""
+                return ('HTTP/1.1 200 OK\r\n\r\n{"ok": true, "url": "u", "messages": '
+                        '[{"role": "user", "text": "... %s"}]}' % nonce)
+            return self._raw
+
+    b = _Has(_DONE)
+    # the history call happens before the transcript append, so drive it directly
+    b.transcript.append({"nonce": "cb-turn-abc"})
+    got = b._confirm_delivered("cb-turn-abc")
+    assert got["delivered"] is True

@@ -386,7 +386,21 @@ def _delivery_evidence(agent, mark, before, after) -> dict:
         if "delivery_suspect" in entry:
             suspect = bool(entry["delivery_suspect"])
 
-    if touched:
+    # THE CONVERSATION IS THE STRONGEST EVIDENCE, when the adapter can supply it: the prompt
+    # was read back out of the page the bridge drove, carrying a marker minted for this turn.
+    # The workdir tells us something acted on the workspace; this tells us the request arrived.
+    in_conversation = None
+    if isinstance(transcript, list) and len(transcript) > mark:
+        in_conversation = transcript[mark].get("prompt_in_conversation")
+
+    if in_conversation is True:
+        grade, why = "confirmed", "the prompt was found in the conversation"
+    elif in_conversation is False:
+        # An explicit negative outranks a workdir change: something wrote there, but this
+        # turn is not in the conversation, and that combination is worth seeing rather than
+        # being averaged into "confirmed".
+        grade, why = "none", "the conversation does not contain this turn's prompt"
+    elif touched:
         grade, why = "confirmed", "the workdir changed"
     elif suspect is False:
         grade, why = "weak", "the reply referred to the prompt, but nothing was written"

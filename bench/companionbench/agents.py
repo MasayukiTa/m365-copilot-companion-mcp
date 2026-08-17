@@ -29,6 +29,7 @@ import os
 import socket
 import time
 import urllib.parse
+import uuid
 
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 8765
@@ -326,6 +327,43 @@ class BridgeAgent:
                 deltas.append(d["delta"])
         return replace or "".join(deltas)
 
+    #: The prefix of the per-turn marker. Short and unmistakable, so finding it in a
+    #: conversation is not a judgement call.
+    NONCE_PREFIX = "cb-turn"
+
+    def _confirm_delivered(self, nonce: str) -> dict:
+        """Ask the bridge what is actually IN the conversation, and look for this turn.
+
+        WHY THIS AND NOT THE WORKDIR. A change under the episode's workdir shows that
+        something acted on that directory. It is worth having and the runner records it, but
+        the adapter is handed that path too, so it cannot establish that the prompt reached
+        the conversation. This can: the message is read back from the page the bridge drove,
+        and the marker it carries was minted for this turn alone.
+
+        Never raises, and a failure to check is reported as None rather than as False. "The
+        history endpoint was busy" is not "the prompt never arrived", and a confirmation step
+        that can fail the run it is confirming would be a measurement breaking the thing it
+        measures.
+        """
+        try:
+            raw = self._request("/history", timeout=90)
+            body = raw.split("\r\n\r\n", 1)[-1]
+            data = json.loads(body[body.index("{"):])
+        except Exception as exc:
+            return {"delivered": None, "why": "history unavailable: %s" % type(exc).__name__}
+        if not data.get("ok"):
+            return {"delivered": None, "why": "history said: %s" % (data.get("error") or "?")}
+        for message in data.get("messages") or []:
+            if message.get("role") != "user":
+                continue
+            text = message.get("text") or message.get("content") or ""
+            if nonce in text:
+                return {"delivered": True, "why": "the prompt is in the conversation",
+                        "conversation": (data.get("url") or "")[-80:]}
+        return {"delivered": False,
+                "why": "the conversation does not contain this turn's prompt",
+                "conversation": (data.get("url") or "")[-80:]}
+
     def _new_conversation(self):
         deadline = time.time() + self.retry_busy_s
         while time.time() < deadline:
@@ -353,6 +391,13 @@ class BridgeAgent:
             "作業フォルダは %s です。このフォルダの中だけで作業し、"
             "指示されていないファイルは変更しないでください。\n\n%s" % (workdir, prompt)
         )
+        # A MARKER MINTED FOR THIS TURN, on its own line at the end, where it is inert: it
+        # names nothing to do and asks for nothing to be echoed, so a companion that ignores
+        # it entirely is behaving correctly. Its only job is to be findable afterwards in the
+        # conversation the bridge says it used -- which is what makes delivery a fact read
+        # back from the page rather than an inference from what came out of it.
+        nonce = "%s-%s" % (self.NONCE_PREFIX, uuid.uuid4().hex[:12])
+        full = "%s\n\n[%s]" % (full, nonce)
         started = time.time()
         deadline = time.time() + self.retry_busy_s
         raw = ""
@@ -370,8 +415,12 @@ class BridgeAgent:
         reply = self._answer(raw)
         elapsed = round(time.time() - started, 1)
         settled = "event: done" in raw
+        confirmed = self._confirm_delivered(nonce)
         self.transcript.append({
             "prompt": full, "reply": reply, "elapsed_s": elapsed, "settled": settled,
+            "nonce": nonce, "prompt_in_conversation": confirmed.get("delivered"),
+            "delivery_note": confirmed.get("why", ""),
+            "conversation": confirmed.get("conversation", ""),
         })
 
         # A TURN THAT DID NOT COMPLETE IS NOT A WRONG ANSWER. `settled` was computed here and
