@@ -1,3 +1,4 @@
+import contextvars
 import hashlib
 import hmac
 import ipaddress
@@ -34,7 +35,49 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    """Whole-file write. Prefer `_update_state` -- see why there."""
+    _atomic_write(state)
+
+
+def _atomic_write(state: dict) -> None:
+    """Write via a temp file and os.replace, so a reader never sees a half-written file.
+
+    `_load_state` returns {} on a parse error, and {} means nobody is unlocked. A plain
+    `write_text` leaves a window in which every caller is refused.
+    """
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(STATE_FILE.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+#: Serialises read-modify-write ON THIS PROCESS. Two unlocks racing used to both read the
+#: file, both edit their own copy, and the second write erase the first -- so one client's
+#: authorisation disappeared the moment another unlocked. This does not coordinate across
+#: PROCESSES; the cockpit CLI runs separately, and a cross-process lock is the next step if
+#: that ever races in practice. Stated rather than implied, because "we take a lock" reads
+#: like more of a guarantee than this is.
+_STATE_LOCK = threading.RLock()
+
+
+def _update_state(mutate) -> dict:
+    """Read, apply `mutate`, and write back as one operation.
+
+    Every writer goes through here so that no two of them can interleave a read with another's
+    write. `mutate` receives the loaded dict and returns the dict to persist.
+    """
+    with _STATE_LOCK:
+        state = mutate(_load_state()) or {}
+        _atomic_write(state)
+        return state
 
 
 def derive_identity(peer_host: str, xff_header_value: str) -> tuple[bool, str]:
@@ -138,35 +181,78 @@ def is_unlocked(ip: str) -> bool:
     return entry.get("expires_at", 0) > time.time()
 
 
-#: THE TOKEN PRESENTED BY THE CALL IN FLIGHT, set by the gateway for the duration of one
-#: invocation. A context variable rather than a parameter because the alternative is adding an
-#: argument to every gated tool, and 116 call sites is not a change anyone can review.
-_PRESENTED = threading.local()
+#: THE TOKEN PRESENTED BY THE CALL IN FLIGHT, set by the gateway for one invocation. A
+#: context variable rather than a parameter because the alternative is an argument on every
+#: gated tool, and 116 signatures is not a change anyone can review.
+#:
+#: A ContextVar, NOT a threading.local -- and the difference is not cosmetic. This server is
+#: ASGI. `threading.local` isolates OS threads, not asyncio tasks, so two tasks on the same
+#: event-loop thread share one slot: task B sets an empty token and awaits, task A sets its
+#: token and awaits, B resumes and the gate reads A's. That authorises B with A's credential,
+#: and the `finally` then clears whichever value happens to be there rather than its own.
+#:
+#: Today every registered tool is synchronous and runs to completion inside a worker thread,
+#: so the interleaving cannot occur -- which makes this the kind of defect that is invisible
+#: until the day someone adds one async tool, and then is a cross-request authorisation bug.
+#: A ContextVar is per-task by construction and costs nothing to use correctly.
+_PRESENTED: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "mcp_presented_unlock_token", default="")
 
 
-def set_presented_token(token: str) -> None:
-    """Record the unlock token accompanying the call currently being handled."""
-    _PRESENTED.token = (token or "").strip()
+def set_presented_token(token: str):
+    """Record the token accompanying this call. Returns a handle for `reset_presented_token`."""
+    return _PRESENTED.set((token or "").strip())
+
+
+def reset_presented_token(handle) -> None:
+    """Restore whatever this context held before -- the correct counterpart to `set`.
+
+    Resetting to the PREVIOUS value rather than blanking is what keeps a nested call from
+    erasing its caller's token.
+    """
+    try:
+        _PRESENTED.reset(handle)
+    except (ValueError, LookupError):
+        # The handle belongs to another context (a tool that hopped threads). Blanking is the
+        # safe direction: a token that outlives its call is the defect this replaces.
+        _PRESENTED.set("")
 
 
 def clear_presented_token() -> None:
-    _PRESENTED.token = ""
+    _PRESENTED.set("")
 
 
 def presented_token() -> str:
-    return getattr(_PRESENTED, "token", "") or ""
+    return _PRESENTED.get() or ""
+
+
+#: How many live tokens one identity may hold at once. Several agents can share an address --
+#: one NAT, one tenant egress -- and a single slot means each new unlock evicts the last, so
+#: two legitimate clients lock each other out in a loop. Bounded because the list is walked on
+#: every gated call and an unbounded one is a slow leak in a hot path.
+_MAX_TOKENS_PER_IDENTITY = 8
 
 
 def _token_matches(entry: dict, presented: str) -> bool:
-    stored = (entry or {}).get("token_sha256") or ""
-    if not stored:
-        # An unlock recorded before tokens existed. Whether that is acceptable is the
-        # caller's decision, not this function's; see `enforce_unlock_token`.
-        return False
+    """Whether `presented` is one of the tokens issued for this identity.
+
+    Compared against every live hash, in constant time per comparison. An entry written before
+    tokens existed has none, and this returns False -- whether that should refuse the call is
+    `enforce_unlock_token`'s decision, not this function's.
+    """
     if not presented:
         return False
-    return hmac.compare_digest(
-        stored, hashlib.sha256(presented.encode("utf-8")).hexdigest())
+    entry = entry or {}
+    stored = [h for h in (entry.get("token_hashes") or []) if isinstance(h, str)]
+    if entry.get("token_sha256"):
+        stored.append(entry["token_sha256"])
+    if not stored:
+        return False
+    candidate = hashlib.sha256(presented.encode("utf-8")).hexdigest()
+    # `any` over compare_digest rather than `candidate in stored`: the membership test on
+    # strings short-circuits on the first differing character, which is the thing
+    # compare_digest exists to avoid.
+    return any(hmac.compare_digest(h, candidate) for h in stored)
 
 
 def enforce_unlock_token() -> bool:
@@ -257,14 +343,33 @@ def unlock(password: str) -> str:
     # reply to a correct password, and only its hash is stored, so the state file is no longer
     # a list of things to impersonate. The IP stays in the record for auditing and for the
     # grace path below; it is no longer sufficient on its own once a token has been issued.
+    # SEVERAL TOKENS PER IDENTITY, because an identity is not a client. Two agents behind one
+    # NAT or one tenant egress present the SAME address: with a single stored hash, the second
+    # to unlock silently invalidated the first, and each would keep locking the other out
+    # forever. The identity is a namespace; the tokens are the credentials in it.
     token = secrets.token_urlsafe(24)
-    state = _load_state()
-    state[ip] = {
-        "expires_at": expires,
-        "unlocked_at": time.time(),
-        "token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
-    }
-    _save_state(state)
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def _add(state):
+        entry = dict(state.get(ip) or {})
+        hashes = [h for h in (entry.get("token_hashes") or []) if isinstance(h, str)]
+        # Carry a pre-multi-token entry across without losing it.
+        if entry.get("token_sha256") and entry["token_sha256"] not in hashes:
+            hashes.append(entry["token_sha256"])
+        hashes.append(digest)
+        entry.update({
+            "expires_at": max(float(entry.get("expires_at") or 0), expires),
+            "unlocked_at": time.time(),
+            # BOUNDED. Every unlock adds one; without a cap the file grows forever and each
+            # comparison walks all of it. The oldest go first -- they are the ones whose
+            # holders have already re-unlocked.
+            "token_hashes": hashes[-_MAX_TOKENS_PER_IDENTITY:],
+        })
+        entry.pop("token_sha256", None)
+        state[ip] = entry
+        return state
+
+    _update_state(_add)
     # The refusal that prompted this unlock is now history; drop it so a reader
     # checking "was a call just refused?" is not answered by a stale record.
     lock_state.clear()
@@ -401,17 +506,27 @@ def grant_ip(ip: str, ttl_days: float | None = None) -> dict:
     # one: this function exists precisely for the case where a human vouches for a machine
     # that cannot present the password itself.
     token = secrets.token_urlsafe(24)
-    with _GRANT_LOCK:
-        state = _load_state()
-        now = time.time()
-        expires = now + ttl_days * 86400
-        state[ip] = {
-            "expires_at": expires,
-            "unlocked_at": now,
-            "token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
-            "granted_by": "cockpit",
-        }
-        _save_state_atomic(state)
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    now = time.time()
+    expires = now + ttl_days * 86400
+
+    def _add(state):
+        # ADDED TO THE IDENTITY'S TOKENS, not written over them. Vouching for one more client
+        # behind a shared address must not evict the ones already there -- that was a second
+        # way for two legitimate clients to lock each other out.
+        entry = dict(state.get(ip) or {})
+        hashes = [h for h in (entry.get("token_hashes") or []) if isinstance(h, str)]
+        if entry.get("token_sha256") and entry["token_sha256"] not in hashes:
+            hashes.append(entry["token_sha256"])
+        hashes.append(digest)
+        entry.update({"expires_at": max(float(entry.get("expires_at") or 0), expires),
+                      "unlocked_at": now, "granted_by": "cockpit",
+                      "token_hashes": hashes[-_MAX_TOKENS_PER_IDENTITY:]})
+        entry.pop("token_sha256", None)
+        state[ip] = entry
+        return state
+
+    _update_state(_add)
     return {"ip": ip, "expires_at": expires, "unlocked_at": now, "ttl_days": ttl_days,
             "unlock_token": token}
 
@@ -423,13 +538,18 @@ def revoke_ip(ip: str) -> bool:
     ip = (ip or "").strip()
     if not _valid_ip(ip):
         raise ValueError(f"invalid IP address: {ip!r}")
-    with _GRANT_LOCK:
-        state = _load_state()
-        existed = ip in state
-        if existed:
-            del state[ip]
-            _save_state_atomic(state)
-    return existed
+    # ONE LOCK, NOT TWO. `_GRANT_LOCK` guarded the cockpit paths and nothing guarded unlock(),
+    # so the two could interleave and lose each other's writes -- two locks that do not
+    # exclude each other are no lock at all for the pair.
+    seen = {"existed": False}
+
+    def _drop(state):
+        seen["existed"] = ip in state
+        state.pop(ip, None)
+        return state
+
+    _update_state(_drop)
+    return seen["existed"]
 
 
 def list_grants() -> list[dict]:

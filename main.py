@@ -493,9 +493,10 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
         _args = dict(arguments or {})
         _token = (unlock_token or _args.pop("unlock_token", "") or "")
         _args.pop("unlock_token", None)
+        _sec, _tok_handle = None, None
         try:
             from tools import security as _sec
-            _sec.set_presented_token(str(_token))
+            _tok_handle = _sec.set_presented_token(str(_token))
         except Exception:
             _sec = None
         try:
@@ -511,9 +512,11 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
         finally:
             # SCOPED TO THIS CALL. A token left behind would authorise the next one, which is
             # the same class of defect as the identity it replaces.
-            if _sec is not None:
+            # RESET TO WHAT THIS CONTEXT HELD BEFORE, rather than blanking. Blanking erases a
+            # caller's token if a gated tool ever reaches the gateway again; reset restores it.
+            if _sec is not None and _tok_handle is not None:
                 try:
-                    _sec.clear_presented_token()
+                    _sec.reset_presented_token(_tok_handle)
                 except Exception:
                     pass
 

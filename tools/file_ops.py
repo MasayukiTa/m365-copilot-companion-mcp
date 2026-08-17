@@ -88,6 +88,16 @@ def _validate_path(path: str) -> Path:
         bases = scoped if bases is None else [b for b in scoped
                                               if any(_under(b, a) or _under(a, b)
                                                      for a in bases)]
+    # SECURITY STATE IS NEVER A FILE THESE TOOLS HAND OVER, whatever the base policy says.
+    # The default base is the user's home and the checkout sits under it, so `read_file` could
+    # return `.unlock_state.json` -- the table of authorised identities -- to any caller with
+    # only the API key. It holds hashes rather than tokens, so it is not directly usable, but
+    # publishing the list of identities to impersonate is the same mistake `list_unlocked` was
+    # narrowed for, reached by a different tool. This check is here rather than in `read_file`
+    # because every reader, writer, resource handler and search tool comes through this
+    # function, and a rule enforced in one caller is a rule with as many holes as there are
+    # other callers.
+    _refuse_security_state(p, path)
     if not bases:
         return p  # unrestricted (default-open policy)
     for base in bases:
@@ -97,6 +107,34 @@ def _validate_path(path: str) -> Path:
         except ValueError:
             continue
     raise PermissionError(f"Path is outside the allowed base: {path}")
+
+
+#: Files whose contents are authorisation state or an audit record of it. Matched on the
+#: basename so a copy elsewhere is refused too -- the name is what carries the meaning here,
+#: and a rule that only knew one absolute path would be defeated by moving the file.
+_SECURITY_STATE_NAMES = frozenset({
+    ".unlock_state.json",
+    "unlock_token_gap.json",
+    "lock_state.json",
+})
+
+#: Directories that exist to hold observability output. The trace log records tool arguments,
+#: which is exactly where credentials would be if a redaction rule were ever missed.
+_SECURITY_STATE_DIRS = ("companion_runs", ".companion_runs")
+
+
+def _refuse_security_state(resolved: Path, requested: str) -> None:
+    """Raise if `resolved` is the server's own authorisation or audit state."""
+    if resolved.name in _SECURITY_STATE_NAMES:
+        raise PermissionError(
+            "Refusing to touch the server's own authorisation state (%s). This file records "
+            "which identities may use mutating tools; handing it to a caller publishes the "
+            "list of identities to impersonate." % resolved.name)
+    parts = {q.lower() for q in resolved.parts}
+    if parts & {d.lower() for d in _SECURITY_STATE_DIRS}:
+        raise PermissionError(
+            "Refusing to touch the tool-call trace (%s). It records tool arguments, which is "
+            "where a credential ends up if any redaction rule is ever missed." % requested)
 
 
 def _under(child: Path, parent: Path) -> bool:

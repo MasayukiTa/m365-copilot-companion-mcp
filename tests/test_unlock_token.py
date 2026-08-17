@@ -56,7 +56,7 @@ def test_unlock_returns_a_token_and_stores_only_its_hash(monkeypatch):
     token = [l.split(": ", 1)[1] for l in out.splitlines() if l.startswith("unlock_token: ")][0]
     assert len(token) >= 20
     entry = json.loads(S.STATE_FILE.read_text(encoding="utf-8"))[IP]
-    assert entry["token_sha256"] == hashlib.sha256(token.encode()).hexdigest()
+    assert hashlib.sha256(token.encode()).hexdigest() in entry["token_hashes"]
     assert token not in S.STATE_FILE.read_text(encoding="utf-8"), (
         "the state file is a list of things to impersonate if it holds the token itself")
 
@@ -180,17 +180,69 @@ def test_the_cockpit_grant_path_also_issues_a_token(tmp_path, monkeypatch):
     machine that cannot present the password itself.
     """
     monkeypatch.setattr(S, "STATE_FILE", tmp_path / "unlock.json")
-    monkeypatch.setattr(S, "_save_state_atomic",
-                        lambda st: (tmp_path / "unlock.json").write_text(
-                            json.dumps(st), encoding="utf-8"))
     out = S.grant_ip("198.51.100.9", ttl_days=1)
     token = out["unlock_token"]
     assert len(token) >= 20
     entry = json.loads((tmp_path / "unlock.json").read_text(encoding="utf-8"))["198.51.100.9"]
-    assert entry["token_sha256"] == hashlib.sha256(token.encode()).hexdigest()
+    assert hashlib.sha256(token.encode()).hexdigest() in entry["token_hashes"]
     assert entry["granted_by"] == "cockpit"
 
     monkeypatch.setenv("MCP_REQUIRE_UNLOCK_TOKEN", "1")
     monkeypatch.setattr(S, "get_http_request", lambda: _Req(xff="198.51.100.9"))
     S.set_presented_token(token)
     assert S.require_unlocked() is None, "the granted client cannot use what it was given"
+
+
+# ---- several clients can share one asserted identity -------------------------------------
+
+def test_two_clients_behind_one_address_do_not_evict_each_other(monkeypatch):
+    """本番の識別子は転送ヘッダ由来なので、NAT や テナント egress の裏の複数エージェントが
+    同じ値を名乗る。1識別子1ハッシュだと、後から解錠した方が前の方を無効化し、
+    互いを永久にロックアウトし合う -- 攻撃ではなく通常運用で壊れる。"""
+    a = _unlock_with(monkeypatch)
+    ta = [l.split(": ", 1)[1] for l in a.splitlines() if l.startswith("unlock_token: ")][0]
+    b = _unlock_with(monkeypatch)
+    tb = [l.split(": ", 1)[1] for l in b.splitlines() if l.startswith("unlock_token: ")][0]
+    assert ta != tb
+    monkeypatch.setenv("MCP_REQUIRE_UNLOCK_TOKEN", "1")
+    for tok in (ta, tb):
+        S.set_presented_token(tok)
+        assert S.require_unlocked() is None, "one client's unlock evicted the other"
+
+
+def test_the_token_list_is_bounded(monkeypatch):
+    """毎回の解錠で1つ増える。上限が無ければファイルは無限に伸び、
+    照合はゲート付き呼び出しのたびに全部を歩く。"""
+    for _ in range(S._MAX_TOKENS_PER_IDENTITY + 4):
+        _unlock_with(monkeypatch)
+    entry = json.loads(S.STATE_FILE.read_text(encoding="utf-8"))[IP]
+    assert len(entry["token_hashes"]) == S._MAX_TOKENS_PER_IDENTITY
+
+
+def test_an_entry_written_before_multi_token_still_works(monkeypatch):
+    """移行中の状態を壊さない -- 古い形の1件も照合対象に含める。"""
+    tok = "legacy-token-value"
+    S.STATE_FILE.write_text(json.dumps({IP: {
+        "expires_at": time.time() + 86400,
+        "token_sha256": hashlib.sha256(tok.encode()).hexdigest()}}), encoding="utf-8")
+    monkeypatch.setenv("MCP_REQUIRE_UNLOCK_TOKEN", "1")
+    S.set_presented_token(tok)
+    assert S.require_unlocked() is None
+
+
+def test_a_partial_write_is_never_visible(tmp_path, monkeypatch):
+    """`_load_state` はパース失敗で {} を返し、{} は『誰も解錠されていない』を意味する。
+    途中まで書かれたファイルが読まれる窓があると、その間だけ全員が拒否される。"""
+    import inspect
+    src = inspect.getsource(S._atomic_write)
+    assert "os.replace" in src and "mkstemp" in src
+
+
+def test_the_context_variable_is_reset_not_blanked():
+    """ネストした呼び出しが呼び出し元のトークンを消さないこと。"""
+    outer = S.set_presented_token("outer")
+    inner = S.set_presented_token("inner")
+    assert S.presented_token() == "inner"
+    S.reset_presented_token(inner)
+    assert S.presented_token() == "outer", "呼び出し元のトークンが消えた"
+    S.reset_presented_token(outer)
