@@ -149,7 +149,6 @@ def _exec_shell(payload):
     if not cmd:
         return "error", None, "shell job missing 'cmd'"
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                       errors="replace",
                        errors="replace", timeout=LOCAL_TIMEOUT_S, cwd=REPO)
     out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
     return ("ok" if r.returncode == 0 else "error"), {"rc": r.returncode, "output": out[:20000]}, None
@@ -162,7 +161,6 @@ def _exec_python(payload):
     py = VENVPY if os.path.isfile(VENVPY) else sys.executable
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     r = subprocess.run([py, "-c", code], capture_output=True, text=True,
-                       errors="replace",
                        errors="replace", timeout=LOCAL_TIMEOUT_S, cwd=REPO, env=env)
     out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
     return ("ok" if r.returncode == 0 else "error"), {"rc": r.returncode, "output": out[:20000]}, None

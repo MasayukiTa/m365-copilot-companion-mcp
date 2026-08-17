@@ -420,7 +420,16 @@ class ResearchSession:
     Mirrors refuter.RefuterSession's send/wait state machine. Never raises."""
 
     def __init__(self, context, query, model_name="Claude", approval=DEFAULT_APPROVAL,
-                 dwell_s=4.0, timeout_s=600, tx_dir=None, parent_key="", parent_turn=0, sub_index=1):
+                 dwell_s=4.0, timeout_s=600, tx_dir=None, parent_key="", parent_turn=0,
+                 sub_index=1, profile=None, upload_path=""):
+        # WHICH SIDE AGENT, AND WHETHER IT NEEDS A FILE FIRST. Parameters rather than a second
+        # copy of this class: the fleet needed an ANALYZE: path as well as RESEARCH:, and the
+        # two differ only in which agent opens and whether a local file is uploaded before the
+        # instruction is sent. Duplicating a state machine this fiddly -- lazy RAM-gated open,
+        # dwell, stabilisation, timeout, sub-conversation capture -- is how one copy quietly
+        # stops matching the other.
+        self.profile = profile or RESEARCHER
+        self.upload_path = upload_path
         self.context = context
         self.query = query
         self.model_name = model_name
@@ -458,10 +467,16 @@ class ResearchSession:
             if self.context is None:
                 self._finish(""); return
             self.page = self.context.new_page()
-            if not open_agent(self.page, RESEARCHER):
+            if not open_agent(self.page, self.profile):
                 self._finish(""); return
-            if self.model_name and RESEARCHER.model_picker:
-                set_model(self.page, RESEARCHER, self.model_name)
+            if self.upload_path:
+                # THE ANALYST NEEDS THE DATA BEFORE THE QUESTION. A failed upload must end the
+                # session rather than send an instruction about a file that is not there --
+                # which would come back as a confident answer about nothing.
+                if not upload_file(self.page, self.upload_path):
+                    self._finish(""); return
+            if self.model_name and self.profile.model_picker:
+                set_model(self.page, self.profile, self.model_name)
             self.drv = CopilotWebDriver(self.page)
             self._count_before = self.drv._answers().count()
             self.drv._count_before = self._count_before

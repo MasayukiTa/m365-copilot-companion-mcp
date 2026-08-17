@@ -36,7 +36,8 @@ from .acceptance import Check, normalize_checks, run_all_blocking
 from .copilot_autopilot_relay import (
     CONTINUE_JOB, COPILOT_SELECTORS, ConversationClosed, CopilotWebDriver, FIX_JOB,
     GenerationInProgress, PROTOCOL, REFUTE_FIX_JOB, RETRY_JOB, VERIFY_FIX_JOB,
-    _is_processing, default_notify, extract_research, goal_not_seen, has_end_marker,
+    _is_processing, default_notify, extract_analyze, extract_research, goal_not_seen,
+    has_end_marker,
     reported_stuck, transient_backoff, conversation_exhausted, RECYCLE_PREFIX,
     conversation_start_label,
 )
@@ -2353,6 +2354,41 @@ class RelayWorker:
             self.status = "researching"
             self.reason = "🔎 外部調査中 (%d/%d): %s" % (self.research_count, self.max_research, rq[:48])
             return
+        # DATA-ANALYSIS DELEGATION -- the other half of a protocol that was only half wired.
+        # `extract_analyze` has existed for a long time, the agent has always been told it may
+        # write `ANALYZE: <path> | <instruction>`, an ANALYST profile is configured, and the
+        # SINGLE-AGENT relay acts on it. The fleet did not: it read RESEARCH: and dropped
+        # ANALYZE: on the floor. So every fleet worker that asked for analysis was answered
+        # with silence and carried on without it, and nothing recorded that it had asked.
+        #
+        # Non-blocking for the same reason research is: the analyst takes minutes, and a
+        # blocking wait here would freeze every other worker in the sweep.
+        az = extract_analyze(resp)
+        if az and self._context is not None and self.max_research > 0:
+            apath, ainstr = az
+            if self.research_count >= self.max_research:
+                self.job = ("これ以上は分析を依頼できません（上限到達）。自前ツールで分析するか、"
+                            "無理なら最後の行に STUCK: 理由 と書いてください。")
+                self.status = "ready"
+                return
+            if not os.path.isfile(apath):
+                # NAMED, NOT SILENT. A missing file used to be indistinguishable from the
+                # feature not existing, which is exactly how this stayed unnoticed.
+                self.job = ("指定されたファイルが見つかりません: %s。パスを確認するか、"
+                            "自前ツールで分析してください。" % apath[:200])
+                self.status = "ready"
+                return
+            self.research_count += 1
+            from .agent_profiles import ANALYST, ResearchSession
+            self._research_session = ResearchSession(
+                self._context, ainstr, model_name="", profile=ANALYST, upload_path=apath,
+                tx_dir=getattr(self._tx, "dir", None), parent_key=self._tx_key,
+                parent_turn=self.turn, sub_index=self.research_count).start()
+            self.status = "researching"
+            self.reason = "データ分析中 (%d/%d): %s" % (self.research_count, self.max_research,
+                                                       os.path.basename(apath)[:48])
+            return
+
         # plan phase (plan_mode): capture the proposed plan and PAUSE for approval; a steer
         # (approve as-is, or an edit) resumes into execution. Don't run DONE/CONTINUE yet.
         if self.plan_mode and not self._plan_approved:
