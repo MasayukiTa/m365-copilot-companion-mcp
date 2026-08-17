@@ -336,7 +336,7 @@ class BridgeAgent:
     HISTORY_ATTEMPTS = 6
     HISTORY_RETRY_S = 2
 
-    def _confirm_delivered(self, nonce: str) -> dict:
+    def _confirm_delivered(self, nonce: str, conversation_url: str = "") -> dict:
         """Ask the bridge what is actually IN the conversation, and look for this turn.
 
         WHY THIS AND NOT THE WORKDIR. A change under the episode's workdir shows that
@@ -356,31 +356,108 @@ class BridgeAgent:
         # of 10 turns: not a check, but a coin that lands on its edge half the time. Only
         # "busy" is retried; any other error will say the same thing six times and only add
         # thirty seconds to every turn.
+        # THREE WAYS "NOT FOUND" IS NOT "NOT DELIVERED", all of them reachable, none of them
+        # handled by the first version -- which reported every one as a definite negative:
+        #
+        #   TRUNCATION. /history sets `truncated` when the scrape hit a bound before reaching
+        #   the end, and it scrolls from the top, so the turn most likely to be missing is the
+        #   NEWEST one -- exactly the one being looked for. Absent from an incomplete record
+        #   is not absent.
+        #
+        #   THE WRONG CONVERSATION. Bare /history reports whatever conversation the page is on
+        #   NOW. If anything rotated it after the turn, the answer describes a different
+        #   conversation and the nonce is legitimately not in it. The URL is pinned to the one
+        #   the turn was sent to, when the caller knows it, and a reply that comes back from a
+        #   different conversation than the one asked for is not evidence about this turn.
+        #
+        #   HYDRATION LAG. The SPA can render a conversation view with no prior turns in it,
+        #   so an `ok` response with an empty or short message list can simply be early. The
+        #   loop used to stop at the first `ok` whatever it contained. It now keeps asking
+        #   while the nonce is missing, and only the LAST look decides.
+        #
+        # All three collapse to one rule: a negative is only returned from evidence that could
+        # have shown a positive. Everything else is `None`, which the summary reports as
+        # coverage rather than as failure.
+        path = "/history"
+        if conversation_url:
+            path += "?url=" + urllib.parse.quote(conversation_url, safe="")
         data = None
-        for _attempt in range(self.HISTORY_ATTEMPTS):
+        for attempt in range(self.HISTORY_ATTEMPTS):
             try:
-                raw = self._request("/history", timeout=90)
+                raw = self._request(path, timeout=90)
                 body = raw.split("\r\n\r\n", 1)[-1]
                 data = json.loads(body[body.index("{"):])
             except Exception as exc:
                 return {"delivered": None,
                         "why": "history unavailable: %s" % type(exc).__name__}
-            if data.get("ok") or "busy" not in str(data.get("error") or ""):
+            if data.get("ok") and self._nonce_in(data, nonce):
+                return {"delivered": True, "why": "the prompt is in the conversation",
+                        "conversation": (data.get("url") or "")[-80:]}
+            busy = "busy" in str(data.get("error") or "")
+            if not data.get("ok") and not busy:
                 break
-            time.sleep(self.HISTORY_RETRY_S)
+            if attempt + 1 < self.HISTORY_ATTEMPTS:
+                time.sleep(self.HISTORY_RETRY_S)
         if not data or not data.get("ok"):
             return {"delivered": None,
                     "why": "history said: %s" % ((data or {}).get("error") or "?")}
+        seen = (data.get("url") or "")
+        if data.get("truncated"):
+            return {"delivered": None, "conversation": seen[-80:],
+                    "why": "the conversation was captured incompletely (%s of it), so the "
+                           "prompt being absent from it means nothing"
+                           % (data.get("captured") or "part")}
+        if conversation_url and seen and not self._same_conversation(seen, conversation_url):
+            return {"delivered": None, "conversation": seen[-80:],
+                    "why": "history answered about a different conversation than the one the "
+                           "turn was sent to"}
+        if not (data.get("messages") or []):
+            return {"delivered": None, "conversation": seen[-80:],
+                    "why": "the conversation came back empty after %d attempts, which is what "
+                           "an un-hydrated view looks like as well as an undelivered turn"
+                           % self.HISTORY_ATTEMPTS}
+        return {"delivered": False,
+                "why": "the conversation does not contain this turn's prompt",
+                "conversation": seen[-80:]}
+
+    def _current_conversation(self) -> str:
+        """The conversation the page is on right now, or "" if it cannot be read.
+
+        Best effort on purpose. `/conv` needs the page lock and can answer "busy", and a
+        measurement that could fail the run it is measuring would be worse than a measurement
+        that sometimes says nothing: an empty answer degrades the later check to the old
+        unpinned behaviour rather than aborting the turn.
+        """
+        try:
+            raw = self._request("/conv", timeout=30)
+            body = raw.split("\r\n\r\n", 1)[-1]
+            return str(json.loads(body[body.index("{"):]).get("url") or "")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _nonce_in(data, nonce) -> bool:
         for message in data.get("messages") or []:
             if message.get("role") != "user":
                 continue
             text = message.get("text") or message.get("content") or ""
             if nonce in text:
-                return {"delivered": True, "why": "the prompt is in the conversation",
-                        "conversation": (data.get("url") or "")[-80:]}
-        return {"delivered": False,
-                "why": "the conversation does not contain this turn's prompt",
-                "conversation": (data.get("url") or "")[-80:]}
+                return True
+        return False
+
+    @staticmethod
+    def _same_conversation(seen, asked) -> bool:
+        """Whether two conversation URLs name the same conversation.
+
+        Compared on the last non-empty path segment -- the conversation id -- because the SPA
+        rewrites query strings and fragments freely and a raw string comparison would report
+        a rotation on every turn.
+        """
+        def _ident(url):
+            base = urllib.parse.urlsplit(url or "").path.rstrip("/")
+            return base.rsplit("/", 1)[-1].lower()
+        left, right = _ident(seen), _ident(asked)
+        return bool(left) and left == right
 
     def _new_conversation(self):
         deadline = time.time() + self.retry_busy_s
@@ -416,6 +493,12 @@ class BridgeAgent:
         # back from the page rather than an inference from what came out of it.
         nonce = "%s-%s" % (self.NONCE_PREFIX, uuid.uuid4().hex[:12])
         full = "%s\n\n[%s]" % (full, nonce)
+        # WHICH CONVERSATION THIS TURN IS BEING SENT TO, read BEFORE sending. Without it the
+        # check afterwards asks about whichever conversation the page is on by then, and a
+        # rotation between the two -- by the SPA, by recovery, or by the companion's own
+        # behaviour -- makes a delivered turn look absent. A failure that navigates would
+        # arrange its own exclusion, which is the worst possible bias for this instrument.
+        sent_to = self._current_conversation()
         started = time.time()
         deadline = time.time() + self.retry_busy_s
         raw = ""
@@ -433,30 +516,28 @@ class BridgeAgent:
         reply = self._answer(raw)
         elapsed = round(time.time() - started, 1)
         settled = "event: done" in raw
-        confirmed = self._confirm_delivered(nonce)
-        # A TURN WHOSE PROMPT IS NOT IN THE CONVERSATION DID NOT HAPPEN.
+        confirmed = self._confirm_delivered(nonce, sent_to)
+        # RECORDED, NOT ACTED ON -- and this is the second time that has had to be said.
         #
-        # Measured, not assumed. Four episodes, five repeats, twenty turns: every one of the
-        # eleven passes had its prompt in the conversation, and eight of the nine failures did
-        # not. The undelivered failures replied in 8 to 113 characters; the one delivered
-        # failure replied in 608. The check found an answer on 20 of 20 turns, so it is not
-        # quietly abstaining on the hard ones.
+        # An undelivered turn briefly RAISED here, on the strength of a probe in which eight
+        # of nine failures had no prompt in the conversation. Review took that apart and it
+        # does not survive:
         #
-        # This moves failures OUT of the capability denominator, which is the direction every
-        # correction in this suite has moved it, and the reason `end_to_end` exists: that
-        # figure still counts these, because a request that produced nothing is a failure to
-        # the person who made it however the fault is apportioned.
-        if confirmed.get("delivered") is False:
-            self.transcript.append({
-                "prompt": full, "reply": reply, "elapsed_s": elapsed, "settled": settled,
-                "nonce": nonce, "prompt_in_conversation": False,
-                "delivery_note": confirmed.get("why", ""),
-                "conversation": confirmed.get("conversation", ""),
-            })
-            raise TurnDidNotSettle(
-                "the prompt is not in the conversation the bridge drove (%d chars came back "
-                "in %.1fs): the turn was never put to the companion, so this is the harness "
-                "and not the answer" % (len(reply or ""), elapsed))
+        #   Raising skips the grader. A turn that edited the workdir CORRECTLY and then failed
+        #   the history check was thrown away as infrastructure -- the harness deleting a real
+        #   pass because its own instrument blinked. `_delivery_evidence` says in as many words
+        #   that this belongs in the summary and not in the control flow, and this code
+        #   contradicted the module it depends on.
+        #
+        #   It was also validated on the very failures it reclassified. Correlation between
+        #   "no marker" and "failed" was read as causation and then used to re-score the same
+        #   observations, with no held-out case where a DELIVERED turn was made to look absent.
+        #   `test_delivery_detector_validation.py` is that held-out matrix, and the detector
+        #   only earns the negative verdict on the rows where it survives it.
+        #
+        # So the finding stands and the response does not. The evidence goes on the record;
+        # `capability` and `end_to_end` in baseline.summarise are where it is allowed to
+        # change a number, because there both questions stay visible at once.
         self.transcript.append({
             "prompt": full, "reply": reply, "elapsed_s": elapsed, "settled": settled,
             "nonce": nonce, "prompt_in_conversation": confirmed.get("delivered"),

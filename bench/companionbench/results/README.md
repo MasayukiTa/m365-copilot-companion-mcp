@@ -19,3 +19,32 @@ in different words, that the figure does not mean what a reader would assume.
 | `section15_security_experiment.txt` | the guard simulation, with a list of the metrics it cannot produce. |
 
 The `.json` files are the raw rows behind two of the reports, with absolute paths stripped.
+
+## Transport: why episodes flip
+
+`transport_probe.json` — 4 episodes × 5 repeats = 20 turns, with the conversation read back
+after each one. Eleven passes, every one with its prompt in the conversation. Nine failures:
+one with the prompt present, replying in 608 characters, and eight without it, replying in 8
+to 113. The check answered on 20 of 20.
+
+**A CLAIM MADE FROM THIS AND THEN WITHDRAWN.** Those eight turns were briefly treated as
+never having happened, which moved them out of the capability denominator and took capability
+from 0.579 to 0.917. That figure is retracted; it was never earned.
+
+The reasoning was circular. The detector was validated on the same twenty observations it
+then re-scored, and "it abstained on none of them" measures whether the check *answers*, not
+whether the answers are *right*. Nothing tested the direction that matters: a turn that WAS
+delivered, made to look absent. Three ways that happens were reachable in the code and none
+were handled — a capture the bridge itself flagged as incomplete, a conversation that rotated
+between sending and looking, and a view read before it had rendered. A capability failure that
+navigated would have arranged its own exclusion.
+
+So capability stands at **0.579**, coverage at 0.950, end-to-end at 0.550. What the probe
+established is a CAUSE, not a correction: most flips are turns that never reached the
+companion. That belongs in `delivery_rate` and in `why_they_flip`, which is where it now is.
+
+`test_delivery_detector_validation.py` is the held-out matrix the original claim lacked —
+six constructed rows where the ground truth is known rather than inferred, including a
+delivered turn with a bad answer, which must never be excluded. One row is a knowing false
+negative: if the conversation renders the prompt without the marker, nothing here can tell
+that from an undelivered turn. It is recorded as a limit rather than left to be discovered.

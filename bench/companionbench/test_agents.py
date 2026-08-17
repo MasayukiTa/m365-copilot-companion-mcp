@@ -327,17 +327,22 @@ def test_a_history_the_bridge_could_not_serve_is_unknown_not_absent():
 
 
 def test_a_conversation_without_the_marker_is_a_delivery_failure():
-    class _Empty(_Bridge):
+    class _Other(_Bridge):
         def _request(self, path, timeout=None):
-            if path == "/history":
-                return 'HTTP/1.1 200 OK\r\n\r\n{"ok": true, "url": "u", "messages": []}'
+            if path.startswith("/history"):
+                return ('HTTP/1.1 200 OK\r\n\r\n{"ok": true, "url": "u", "messages": '
+                        '[{"role": "user", "text": "an earlier, unrelated turn"}]}')
+            if path == "/conv":
+                return 'HTTP/1.1 200 OK\r\n\r\n{"url": "u"}'
             return self._raw
 
-    # The turn is RECORDED and then refused. Recording it is what leaves something to
-    # diagnose with; refusing it is what keeps it out of the capability denominator.
-    b = _Empty(_DONE)
-    with pytest.raises(A.TurnDidNotSettle):
-        b("edit mod_b.py", "C:/wd")
+    # RECORDED, AND THAT IS ALL. This briefly raised, which threw away the grade as well --
+    # including for a turn that had edited the workdir correctly and only failed the check.
+    # The verdict belongs in the summary, where capability and end-to-end are both visible.
+    b = _Other(_DONE)
+    b.HISTORY_RETRY_S = 0
+    reply = b("edit mod_b.py", "C:/wd")
+    assert reply, "the turn still returns its answer to be graded"
     assert b.transcript[-1]["prompt_in_conversation"] is False
 
 
@@ -396,34 +401,43 @@ def test_a_non_busy_error_is_not_retried(monkeypatch):
     assert got["delivered"] is None and calls["n"] == 1
 
 
-def test_a_turn_missing_from_its_conversation_is_the_harness_not_the_answer():
-    """4エピソード×5反復=20ターン。合格11件は全て会話にプロンプトがあり、
-    失敗9件のうち8件は無かった。未配送の失敗は返答8〜113文字、
-    配送済みの失敗は608文字。確認は20/20で成立している。"""
-    class _Missing(_Bridge):
+def test_an_empty_conversation_abstains_instead_of_denying():
+    """空の会話は「未配送」と「まだ描画されていないビュー」を区別できない。
+
+    以前はこれを確定的な否定として扱い、さらに raise していた。会話が空という同じ観測から
+    両方が出てくる以上、否定と言い切れる証拠ではない。棄権して coverage に出す。"""
+    class _Empty(_Bridge):
         def _request(self, path, timeout=None):
-            if path == "/history":
+            if path.startswith("/history"):
                 return 'HTTP/1.1 200 OK\r\n\r\n{"ok": true, "url": "u", "messages": []}'
+            if path == "/conv":
+                return 'HTTP/1.1 200 OK\r\n\r\n{"url": "u"}'
             return self._raw
 
-    with pytest.raises(A.TurnDidNotSettle) as exc:
-        _Missing(_DONE)(_PROMPT, "C:/wd")
-    assert "not in the conversation" in str(exc.value)
+    b = _Empty(_DONE)
+    b.HISTORY_RETRY_S = 0
+    b(_PROMPT, "C:/wd")
+    assert b.transcript[-1]["prompt_in_conversation"] is None
+    assert "empty" in b.transcript[-1]["delivery_note"]
 
 
-def test_the_rejected_turn_is_still_recorded_before_it_raises():
+def test_the_turn_is_recorded_with_enough_to_diagnose_it():
     """診断できない却下は、次に同じものを探すときの手掛かりを消す。"""
-    class _Missing(_Bridge):
+    class _Other(_Bridge):
         def _request(self, path, timeout=None):
-            if path == "/history":
-                return 'HTTP/1.1 200 OK\r\n\r\n{"ok": true, "url": "u", "messages": []}'
+            if path.startswith("/history"):
+                return ('HTTP/1.1 200 OK\r\n\r\n{"ok": true, "url": "u", "messages": '
+                        '[{"role": "user", "text": "unrelated"}]}')
+            if path == "/conv":
+                return 'HTTP/1.1 200 OK\r\n\r\n{"url": "u"}'
             return self._raw
 
-    b = _Missing(_DONE)
-    with pytest.raises(A.TurnDidNotSettle):
-        b(_PROMPT, "C:/wd")
+    b = _Other(_DONE)
+    b.HISTORY_RETRY_S = 0
+    b(_PROMPT, "C:/wd")
     assert b.transcript[-1]["prompt_in_conversation"] is False
     assert b.transcript[-1]["nonce"]
+    assert b.transcript[-1]["reply"], "the reply is kept so the grader can still see it"
 
 
 def test_a_turn_the_check_could_not_answer_is_still_graded():
