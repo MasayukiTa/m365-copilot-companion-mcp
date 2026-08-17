@@ -128,6 +128,7 @@ jobs:
             bench/companionbench/test_job_authority.py \
             bench/companionbench/test_security_experiment.py \
             bench/companionbench/test_baseline.py \
+            bench/companionbench/test_redact.py \
             bench/companionbench/test_office_episodes.py \
             bench/companionbench/test_runner.py \
             bench/companionbench/test_runtime_episodes.py \

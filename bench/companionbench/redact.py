@@ -23,9 +23,10 @@ from __future__ import annotations
 import os
 import re
 
-# `C:\Users\someone`, `/home/someone`, `/Users/someone`, either separator, any case. The name
-# is whatever runs up to the next separator; it is the thing being removed, so it is not
-# spelled out here.
+# A Windows or POSIX home directory, either separator, any case. The account segment is
+# whatever runs up to the next separator; it is the thing being removed, so no example of one
+# is written down here -- `scripts/check_no_identifying_names.py` matches the SHAPE, and it is
+# right to flag a file that contains the shape, including this one.
 _HOME = re.compile(
     r"(?i)(?:[A-Za-z]:)?[\\/]{1,2}(?:Users|home)[\\/]{1,2}[^\\/\s\"'<>|]{1,64}"
 )
