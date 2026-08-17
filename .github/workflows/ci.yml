@@ -129,7 +129,8 @@ jobs:
             bench/companionbench/test_security_experiment.py \
             bench/companionbench/test_baseline.py \
             bench/companionbench/test_redact.py \
-            bench/companionbench/test_delivery_detector_validation.py \n            bench/companionbench/test_shadow_rules.py \
+            bench/companionbench/test_delivery_detector_validation.py \
+            bench/companionbench/test_shadow_rules.py \
             bench/companionbench/test_office_episodes.py \
             bench/companionbench/test_runner.py \
             bench/companionbench/test_runtime_episodes.py \
