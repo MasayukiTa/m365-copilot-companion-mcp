@@ -261,6 +261,20 @@ class BridgeAgent:
     #: harness; the flag is what stops an invalid comparison from being reported as valid.
     applies_manifest = False
 
+    #: EPISODES CANNOT RUN SIDE BY SIDE THROUGH THIS ADAPTER, and it is worth saying why
+    #: rather than leaving the 1 to be read as caution.
+    #:
+    #: The bridge holds ONE Playwright page, set once at startup, driven from one page-owner
+    #: thread because the sync API is thread-bound; /stream, /new and /history take a single
+    #: non-blocking lock and anything that arrives while it is held is answered `busy`. So a
+    #: second concurrent episode does not run second, it runs `busy` -- retrying, adding
+    #: nothing but wall-clock and retry noise in the latencies.
+    #:
+    #: This is a property of the bridge, not of the companion, and not of the tenant. The
+    #: project's fan-out path is the fleet on the other browser, and FleetAgent declares what
+    #: it can actually do.
+    max_concurrent_episodes = 1
+
     #: How long to wait between attempts when the bridge reports it is busy.
     BUSY_RETRY_S = 15
 

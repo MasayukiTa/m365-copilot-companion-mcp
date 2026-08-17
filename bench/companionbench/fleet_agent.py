@@ -130,6 +130,11 @@ try:
         context = browser.contexts[0] if browser.contexts else browser.new_context()
         res = run_relay_fleet(
             context, [payload["goal"]], payload["agent_url"],
+            # ONE GOAL, SO ONE TAB. This is not the place parallelism was being suppressed --
+            # a child is handed exactly one goal and `max_concurrent` bounds tabs WITHIN a
+            # call, so any other value here would be a lie about how many goals there are.
+            # Episodes run side by side by running several of these children at once, which
+            # is the runner's business; see `max_concurrent_episodes` on the class below.
             max_concurrent=1, refuter=payload.get("refuter", False),
             # max_transient / max_refute are LEFT UNSET on purpose: run_relay_fleet takes
             # them from the active manifest when they are None, and passing them here would
@@ -166,6 +171,20 @@ class FleetAgent:
     applies_manifest = True
     execution_target = FLEET
     covered_fields = FLEET_FIELDS
+
+    #: HOW MANY EPISODES MAY RUN AT ONCE THROUGH THIS ADAPTER.
+    #:
+    #: The fleet opens a tab per goal and admits continuously against free RAM, so episodes
+    #: genuinely run side by side here -- unlike the bridge, which serialises every
+    #: page-touching request behind one lock and answers the rest `busy`. That difference is
+    #: why this is declared by the adapter rather than chosen by the runner.
+    #:
+    #: WHAT THIS DOES NOT ANSWER, and it has not been measured: whether the tenant's rate
+    #: limiting is per-conversation or per-account. If it is per-account, concurrent arms
+    #: throttle EACH OTHER, and repeats meant to be independent come back maximally
+    #: correlated -- faster, and worth less. So the first parallel run is compared against
+    #: the serial one rather than replacing it.
+    max_concurrent_episodes = 3
 
     def __init__(self, *, agent_url, cdp_url=None, refuter=False, memory_seed=None,
                  python=None, timeout_s=1800):

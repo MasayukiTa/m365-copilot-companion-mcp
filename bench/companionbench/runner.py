@@ -489,10 +489,40 @@ def _infra(episode, reason, started, trace=""):
     }
 
 
-def run_pool(pool, agent, *, root=None, episodes=None) -> list:
-    """Every episode in a pool (or an explicit list), in registry order."""
-    chosen = episodes if episodes is not None else REGISTRY.get(pool)
-    return [run_episode(ep, agent, root=root) for ep in chosen]
+def run_pool(pool, agent, *, root=None, episodes=None, workers=None) -> list:
+    """Every episode in a pool (or an explicit list), in registry order.
+
+    EPISODES ARE INDEPENDENT BY CONSTRUCTION -- each one builds its fixtures in its own
+    temporary directory and is graded from that directory alone -- so running them one after
+    another was a property of this line and of nothing else. It cost about two and a half
+    hours per three-repeat reliability run, and the fleet target has had continuous
+    RAM-sized admission across tabs the whole time.
+
+    WHETHER CONCURRENCY IS REAL DEPENDS ON THE ADAPTER, so the adapter is asked instead of
+    assumed. BridgeAgent drives one Playwright page behind a single request lock: a second
+    concurrent turn is answered `busy` and retried, so running it with workers>1 buys nothing
+    and adds retry noise to the latencies. FleetAgent opens a tab per goal, so it genuinely
+    parallelises. An adapter that says nothing is treated as serial -- the safe direction,
+    and the one that cannot silently corrupt a measurement.
+
+    Results stay in registry order whatever the completion order, because a run's rows are
+    compared position-wise against other runs.
+    """
+    chosen = list(episodes if episodes is not None else REGISTRY.get(pool))
+    if workers is None:
+        workers = int(getattr(agent, "max_concurrent_episodes", 1) or 1)
+    workers = max(1, min(workers, len(chosen) or 1))
+    if workers == 1 or len(chosen) < 2:
+        return [run_episode(ep, agent, root=root) for ep in chosen]
+
+    import concurrent.futures as _cf
+    out = [None] * len(chosen)
+    with _cf.ThreadPoolExecutor(max_workers=workers) as pool_exec:
+        futures = {pool_exec.submit(run_episode, ep, agent, root=root): i
+                   for i, ep in enumerate(chosen)}
+        for future in _cf.as_completed(futures):
+            out[futures[future]] = future.result()
+    return out
 
 
 def _partition(results) -> dict:

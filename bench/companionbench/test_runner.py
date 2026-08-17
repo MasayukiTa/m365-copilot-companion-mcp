@@ -16,6 +16,7 @@ Each test below is one of those.
 """
 import os
 import tempfile
+import time
 
 import bench.companionbench.agents as A
 from bench.companionbench import runner as R
@@ -862,3 +863,90 @@ def test_every_outcome_carries_delivery_evidence():
     assert row["infra_failure"] is True
     assert row["delivery"] == "confirmed", "書き込んだ証拠が付いていない"
     assert row["touched_workdir"] is True
+
+
+# ---- episodes run side by side when the adapter says they can ---------------------------
+
+def _slow_agent(delay, concurrent_safe):
+    """An agent that takes `delay` seconds and records how many ran at the same time."""
+    import threading
+
+    class _A:
+        applies_manifest = True
+        execution_target = "in_process/v1"
+        covered_fields = frozenset()
+        max_concurrent_episodes = 3 if concurrent_safe else 1
+
+        def __init__(self):
+            self.transcript = []
+            self.live = 0
+            self.peak = 0
+            self._lock = threading.Lock()
+
+        def __call__(self, prompt, workdir):
+            with self._lock:
+                self.live += 1
+                self.peak = max(self.peak, self.live)
+            time.sleep(delay)
+            with self._lock:
+                self.live -= 1
+            return "done"
+
+    return _A()
+
+
+def test_a_serial_adapter_is_never_run_concurrently():
+    """BridgeAgent は1枚のページを1つのロックの後ろで駆動する。2本目は「2番目に走る」のでは
+    なく busy を返される -- 並列にしても待ち時間とリトライ雑音が増えるだけ。"""
+    agent = _slow_agent(0.05, concurrent_safe=False)
+    R.run_pool("evolution", agent, episodes=list(REGISTRY.get(EVOLUTION))[:3])
+    assert agent.peak == 1, "a serial adapter was driven concurrently"
+
+
+def test_an_adapter_that_can_take_it_gets_episodes_side_by_side():
+    """エピソードは構造上独立（各自のtempディレクトリ）。直列だったのは run_pool の1行だけで、
+    3反復の信頼性測定に約2.5時間かけていた。"""
+    agent = _slow_agent(0.2, concurrent_safe=True)
+    episodes = list(REGISTRY.get(EVOLUTION))[:3]
+    started = time.time()
+    rows = R.run_pool("evolution", agent, episodes=episodes)
+    elapsed = time.time() - started
+    assert agent.peak > 1, "declared concurrent, still ran one at a time"
+    assert elapsed < 0.2 * len(episodes), "no wall-clock was actually saved"
+    assert len(rows) == len(episodes)
+
+
+def test_results_keep_registry_order_whatever_finishes_first():
+    """行は位置で他の走行と突き合わせる。完了順に並べると、反復間の比較が別物同士になる。"""
+    import random
+
+    class _Jittery:
+        applies_manifest = True
+        execution_target = "in_process/v1"
+        covered_fields = frozenset()
+        max_concurrent_episodes = 4
+
+        def __init__(self):
+            self.transcript = []
+
+        def __call__(self, prompt, workdir):
+            time.sleep(random.uniform(0.01, 0.12))
+            return "done"
+
+    episodes = list(REGISTRY.get(EVOLUTION))[:4]
+    rows = R.run_pool("evolution", _Jittery(), episodes=episodes)
+    assert [r["episode_id"] for r in rows] == [e.episode_id for e in episodes]
+
+
+def test_an_adapter_that_says_nothing_is_treated_as_serial():
+    """不明は危険側へ。宣言の無いアダプタを並列に回すのは、測定を黙って壊す方向。"""
+    class _Silent:
+        applies_manifest = True
+        execution_target = "in_process/v1"
+        covered_fields = frozenset()
+        transcript = []
+
+        def __call__(self, prompt, workdir):
+            return "done"
+
+    assert getattr(_Silent(), "max_concurrent_episodes", 1) == 1
