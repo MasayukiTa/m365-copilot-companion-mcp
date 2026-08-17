@@ -397,7 +397,7 @@ import inspect as _inspect
 _ALL_TOOLS = {getattr(t, "__name__", repr(t)): t for t in TOOLS}
 
 if os.environ.get("MCP_TOOL_MAP") == "1":
-    def call_tool(name: str = "", arguments: dict = None):
+    def call_tool(name: str = "", arguments: dict = None, unlock_token: str = ""):
         """Gateway to EVERY tool on this server -- START HERE by calling call_tool(name="").
 
         This client caps the tool list, so most tools are NOT visible to you and are reached
@@ -455,13 +455,22 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
         # than proves, so possession of the API key was enough to be believed. A second factor
         # has to be presented per call; the client cannot vary headers per call; so the only
         # channel is an argument. This is the single point every gated tool passes through --
-        # `unlock_token` is stripped here rather than being added to 116 signatures.
+        # one declared parameter here rather than one added to 116 signatures.
         #
-        # Popped, not forwarded: the tool being invoked has no parameter for it and would
-        # raise TypeError, and passing a credential into arbitrary tool code is not something
-        # to do by accident.
+        # IT HAS TO BE A DECLARED PARAMETER, and finding that out took a live request. The
+        # first version accepted it as an extra key inside `arguments`, which every unit test
+        # was happy with because they call the function directly -- but the MCP layer
+        # validates the call against this signature and rejects an unexpected keyword before
+        # any of this code runs. The tests were testing the function; the client talks to the
+        # schema.
+        #
+        # Also accepted inside `arguments` for a client that finds that shape easier, and
+        # popped there so it never reaches the tool: the tool has no such parameter and would
+        # raise TypeError, and a credential should not be handed to arbitrary tool code by
+        # accident.
         _args = dict(arguments or {})
-        _token = _args.pop("unlock_token", "") or ""
+        _token = (unlock_token or _args.pop("unlock_token", "") or "")
+        _args.pop("unlock_token", None)
         try:
             from tools import security as _sec
             _sec.set_presented_token(str(_token))
