@@ -68,6 +68,25 @@ def discover_tests() -> set[str]:
     return found
 
 
+#: A path followed by a LITERAL backslash-n instead of a line continuation. Written by hand
+#: this would be strange; written by a patch script through a shell heredoc it happens
+#: constantly, and it happened seven times in one session. The audit could not see it because
+#: it matches test paths anywhere in the file and both paths are present -- just welded onto
+#: one line, where the shell hands pytest an argument called `n` and the run dies on a file
+#: that does not exist. So the check that exists to stop a test being listed-but-unrun was
+#: blind to a listing that is malformed rather than missing.
+_WELDED = re.compile(r"\.py\s+\\n\s")
+
+
+def malformed_listing() -> list[str]:
+    """Lines where an escape arrived as two characters instead of a continuation."""
+    out = []
+    for i, line in enumerate(WORKFLOW.read_text(encoding="utf-8").splitlines(), 1):
+        if _WELDED.search(line):
+            out.append("%s:%d  %s" % (WORKFLOW.name, i, line.strip()[:100]))
+    return out
+
+
 def listed_tests() -> set[str]:
     """Test files the workflow actually RUNS.
 
@@ -109,7 +128,13 @@ def main() -> int:
         print("ERROR: stale CI test exclusions:")
         for path in stale_excluded:
             print("  -", path)
-    if missing or stale_listed or stale_excluded:
+    welded = malformed_listing()
+    if welded:
+        print("ERROR: a literal '\\n' welds two test paths onto one line, so the shell will "
+              "pass pytest an argument called 'n':")
+        for line in welded:
+            print("  -", line)
+    if missing or stale_listed or stale_excluded or welded:
         return 1
 
     # Untracked test files are not required yet -- they are genuinely not in the CI checkout,

@@ -188,21 +188,46 @@ def unlock(password: str) -> str:
     return f"Unlocked IP {ip!r} for {ttl_days} days."
 
 
+def _format_entry(ip: str, entry: dict, now: float) -> str:
+    remain_days = (entry.get("expires_at", 0) - now) / 86400
+    return f"{ip}: expired" if remain_days <= 0 else f"{ip}: {remain_days:.1f} days remaining"
+
+
 def list_unlocked() -> str:
-    """List remote IPs currently unlocked for mutating tools."""
+    """Whether the CALLER is unlocked. Not a directory of everyone else.
+
+    IT USED TO RETURN THE WHOLE TABLE. This tool is registered as an ordinary MCP tool and is
+    not itself behind the unlock gate, so it handed any caller the full list of the identities
+    the authorisation check keys on. Whatever else is true of that check, a tool that
+    enumerates its keys for an unauthorised caller is doing part of the work for them.
+    (Raised in an external review and reproduced against this code, 2026-08-17.)
+
+    Removing the tool outright would have broken a real use: `bench/swe_unlock_bootstrap.py`
+    unlocks and then asks whether it worked. That question is about the CALLER, and answering
+    only that discloses nothing -- a caller who is already the identity in question learns
+    nothing it did not have. Everyone else's entries are not the caller's business.
+
+    A NARROWING, NOT A FIX. See tests/test_unlock_oracle.py, which asserts what is still
+    open. The consequences are not spelled out in this repository, which is public.
+
+    A genuine local caller (loopback peer, no forwarding header) still gets the full table:
+    that is the operator at the machine, and the same information is on their own disk.
+    """
     state = _load_state()
-    if not state:
-        return "(no unlocked remote IPs)"
     now = time.time()
-    lines = []
-    for ip, entry in state.items():
-        exp = entry.get("expires_at", 0)
-        remain_days = (exp - now) / 86400
-        if remain_days <= 0:
-            lines.append(f"{ip}: expired")
-        else:
-            lines.append(f"{ip}: {remain_days:.1f} days remaining")
-    return "\n".join(lines)
+    try:
+        is_local, ip = _parse_request(get_http_request())
+    except Exception:
+        # No HTTP context: the CLI / cockpit path, which is the operator on this machine.
+        return "\n".join(_format_entry(k, v, now) for k, v in state.items()) or \
+            "(no unlocked remote IPs)"
+    if is_local:
+        return "\n".join(_format_entry(k, v, now) for k, v in state.items()) or \
+            "(no unlocked remote IPs)"
+    entry = state.get(ip)
+    if not entry:
+        return f"{ip}: not unlocked"
+    return _format_entry(ip, entry, now)
 
 
 # ─────────────────────────────────────────────────────────────────────────────────────
