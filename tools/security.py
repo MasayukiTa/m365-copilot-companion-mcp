@@ -388,13 +388,32 @@ def grant_ip(ip: str, ttl_days: float | None = None) -> dict:
     if ttl_days is None:
         ttl_days = float(os.environ.get("MCP_UNLOCK_TTL_DAYS", "30"))
     ttl_days = float(ttl_days)
+    # A TOKEN HERE TOO, OR THIS PATH BECOMES THE BYPASS.
+    #
+    # `unlock()` issues one; this admin path did not. Under MCP_REQUIRE_UNLOCK_TOKEN=1 that
+    # leaves two bad outcomes and no good one: either an entry with no token is refused --
+    # locking out a client the operator deliberately authorised, who has no way to obtain a
+    # token because they never called unlock() -- or entries without tokens are accepted,
+    # which is the hole with extra steps.
+    #
+    # So the token is minted here and RETURNED to the operator, whose job it then is to hand
+    # it to the client they just authorised. That is a real manual step and it is the correct
+    # one: this function exists precisely for the case where a human vouches for a machine
+    # that cannot present the password itself.
+    token = secrets.token_urlsafe(24)
     with _GRANT_LOCK:
         state = _load_state()
         now = time.time()
         expires = now + ttl_days * 86400
-        state[ip] = {"expires_at": expires, "unlocked_at": now}
+        state[ip] = {
+            "expires_at": expires,
+            "unlocked_at": now,
+            "token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+            "granted_by": "cockpit",
+        }
         _save_state_atomic(state)
-    return {"ip": ip, "expires_at": expires, "unlocked_at": now, "ttl_days": ttl_days}
+    return {"ip": ip, "expires_at": expires, "unlocked_at": now, "ttl_days": ttl_days,
+            "unlock_token": token}
 
 
 def revoke_ip(ip: str) -> bool:

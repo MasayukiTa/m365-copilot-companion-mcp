@@ -157,3 +157,32 @@ def test_the_gateway_strips_the_token_before_dispatch():
     src = inspect.getsource(main)
     assert '_args.pop("unlock_token"' in src
     assert "fn(**_args)" in src, "the popped dict must be the one dispatched"
+
+
+def test_the_cockpit_grant_path_also_issues_a_token(tmp_path, monkeypatch):
+    """Otherwise this path becomes the bypass the moment enforcement is on.
+
+    `unlock()` issues a token; the operator-side `grant_ip()` did not. Under enforcement that
+    leaves two bad outcomes and no good one: refuse a client the operator deliberately
+    authorised -- who cannot obtain a token, never having called unlock() -- or accept
+    tokenless entries, which is the original hole with extra steps.
+
+    The token is returned to the operator, who hands it to the client they vouched for. That
+    manual step is the point: this function exists for the case where a human vouches for a
+    machine that cannot present the password itself.
+    """
+    monkeypatch.setattr(S, "STATE_FILE", tmp_path / "unlock.json")
+    monkeypatch.setattr(S, "_save_state_atomic",
+                        lambda st: (tmp_path / "unlock.json").write_text(
+                            json.dumps(st), encoding="utf-8"))
+    out = S.grant_ip("198.51.100.9", ttl_days=1)
+    token = out["unlock_token"]
+    assert len(token) >= 20
+    entry = json.loads((tmp_path / "unlock.json").read_text(encoding="utf-8"))["198.51.100.9"]
+    assert entry["token_sha256"] == hashlib.sha256(token.encode()).hexdigest()
+    assert entry["granted_by"] == "cockpit"
+
+    monkeypatch.setenv("MCP_REQUIRE_UNLOCK_TOKEN", "1")
+    monkeypatch.setattr(S, "get_http_request", lambda: _Req(xff="198.51.100.9"))
+    S.set_presented_token(token)
+    assert S.require_unlocked() is None, "the granted client cannot use what it was given"
