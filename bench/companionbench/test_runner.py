@@ -838,3 +838,27 @@ def test_a_paired_run_whose_arms_measured_different_amounts_aborts(monkeypatch):
     reasons = B.comparable(B.summarise(_rows(9, 1)), B.summarise(_rows(5, 5, offset=100)))
     assert reasons, "被覆の差が見逃されている"
     assert any("different subset" in r or "covered only" in r for r in reasons)
+
+
+def test_every_outcome_carries_delivery_evidence():
+    """workdir を変更した行が『配送未確認』として数えられていた。
+    エージェントが例外を投げた・フィクスチャを壊した・グレーダが落ちた経路は、
+    どれも証拠を付ける前に return していた -- 見なかったことを『無かった』と報告する形。"""
+    import bench.companionbench.episodes  # noqa: F401
+    from bench.companionbench.pools import EVOLUTION, REGISTRY
+
+    ep = REGISTRY.get(EVOLUTION)[0]
+
+    class _Writes:
+        applies_manifest = False
+        transcript = []
+
+        def __call__(self, prompt, workdir):
+            with open(os.path.join(workdir, "proof.txt"), "w") as fh:
+                fh.write("the agent was here")
+            raise RuntimeError("transport died on the way back")
+
+    row = R.run_episode(ep, _Writes())
+    assert row["infra_failure"] is True
+    assert row["delivery"] == "confirmed", "書き込んだ証拠が付いていない"
+    assert row["touched_workdir"] is True

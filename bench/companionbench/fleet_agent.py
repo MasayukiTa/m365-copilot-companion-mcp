@@ -260,7 +260,23 @@ class FleetAgent:
     # -- the episode contract ------------------------------------------------------------
 
     def __call__(self, prompt, workdir):
-        payload = {"goal": prompt, "agent_url": self.agent_url, "cdp_url": self.cdp_url,
+        # THE EPISODE'S PROMPT NAMES FILES, NOT PATHS. "change TIMEOUT in mod_b.py" is
+        # meaningless without the directory it lives in, and the directory is a fresh temp
+        # folder the agent has never heard of. BridgeAgent prepends it; this adapter took
+        # `workdir`, passed it to `_run_child`, and `_run_child` ignored it -- the child ran
+        # in its own state directory, so every filesystem episode measured work in the wrong
+        # workspace. The numbers were not wrong about the fleet, they were about somewhere
+        # else entirely.
+        #
+        # Two channels, because they answer to different code. The text tells the agent; the
+        # `cwd` field is what `run_relay_fleet` reads to decide where the run happens, and it
+        # only reads it when the goal is a dict.
+        addressed = (
+            "作業フォルダは %s です。このフォルダの中だけで作業し、"
+            "指示されていないファイルは変更しないでください。\n\n%s" % (workdir, prompt)
+        )
+        payload = {"goal": {"text": addressed, "cwd": workdir},
+                   "agent_url": self.agent_url, "cdp_url": self.cdp_url,
                    "refuter": self.refuter}
         out = self._run_child("run", payload, workdir=workdir)
         self.runs.append({"workdir": workdir, "attest": out.get("attest"),

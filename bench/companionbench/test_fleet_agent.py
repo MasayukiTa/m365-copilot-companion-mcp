@@ -229,3 +229,35 @@ def test_agent_url_must_be_a_url_the_tab_can_open():
     with pytest.raises(FleetContractError):
         FleetAgent(agent_url="127.0.0.1:8765")
     FleetAgent(agent_url="https://example.invalid/chat")     # 受理される形
+
+
+def test_the_fleet_prompt_names_the_workdir():
+    """エピソードのプロンプトはファイル名しか言わない -- 「mod_b.py の TIMEOUT を変更」。
+    それが置かれた一時ディレクトリは agent が知らない場所で、BridgeAgent は前置していた。
+    このアダプタは workdir を受け取り _run_child に渡し、_run_child はそれを使っていなかった。
+    子は自分の state dir で走るので、ファイル系エピソードは全て別の作業場所を測っていた。"""
+    sent = {}
+
+    class _Probe(FleetAgent):
+        def _run_child(self, mode, payload, workdir=None):
+            sent.update(payload)
+            return {"reply": "done, mod_b.py updated", "worker": {"turns": 1},
+                    "attest": {"harness_id": ""}}
+
+    agent = _Probe(agent_url="https://m365.cloud.microsoft/chat/")
+    agent("mod_b.py の TIMEOUT を 30 から 90 に変更してください。", "C:/tmp/cb_episode_42")
+
+    goal = sent["goal"]
+    assert isinstance(goal, dict), "goal が dict でないと run_relay_fleet は cwd を読まない"
+    assert "C:/tmp/cb_episode_42" in goal["text"], "プロンプトが作業場所を伝えていない"
+    assert goal["cwd"] == "C:/tmp/cb_episode_42", "fleet に作業ディレクトリが渡っていない"
+
+
+def test_the_goal_shape_is_the_one_the_fleet_reads():
+    """relay_fleet は dict の goal のときだけ cwd を読む。文字列で渡すと黙って無視される。"""
+    from relay.relay_fleet import goal_fields
+
+    text, _checks, cwd = goal_fields({"text": "do it", "cwd": "C:/wd"})
+    assert text == "do it" and cwd == "C:/wd"
+    _text, _c, cwd_none = goal_fields("do it")
+    assert cwd_none is None, "文字列 goal でも cwd が付くなら、この試験の前提が変わっている"

@@ -256,8 +256,12 @@ def run_episode(episode, agent, *, root=None) -> dict:
         try:
             prompt = episode.setup(run.workdir)
         except Exception as exc:
-            return _infra(episode, "setup failed: %s: %s" % (type(exc).__name__, exc),
-                          started)
+            # NOBODY WAS ASKED ANYTHING. The fixture never got built, so this row is a failure
+            # of the measurement rather than an outcome of it, and charging it to the system's
+            # end-to-end figure would let a broken fixture look like a worse product.
+            out = _infra(episode, "setup failed: %s: %s" % (type(exc).__name__, exc), started)
+            out["never_requested"] = True
+            return out
         # WHAT THE FIXTURE LOOKED LIKE BEFORE THE AGENT TOUCHED IT. Without this, "the file
         # the grader needs is not there" is indistinguishable from "the environment never
         # built it", and every such case was called infra. Paired evaluation drops an
@@ -274,8 +278,15 @@ def run_episode(episode, agent, *, root=None) -> dict:
             with trace:
                 reply = agent(prompt, run.workdir) or ""
         except Exception as exc:
-            return _infra(episode, "agent raised: %s: %s" % (type(exc).__name__, exc),
-                          started, trace=traceback.format_exc(limit=3))
+            # SNAPSHOT ANYWAY. An adapter that raises may still have done the work -- a turn
+            # that wrote the file and then hit a transport error on the way back is the
+            # obvious case -- and returning before looking made those rows unconfirmed by
+            # construction, which is the same "did not look" reported as "nothing there".
+            crashed = _fixture_snapshot(run.workdir)
+            return dict(
+                _infra(episode, "agent raised: %s: %s" % (type(exc).__name__, exc),
+                       started, trace=traceback.format_exc(limit=3)),
+                **_delivery_evidence(agent, transcript_mark, before, crashed))
         after = _fixture_snapshot(run.workdir)
         run_workdir = run.workdir
         destroyed = sorted(set(before) - set(after))
@@ -283,20 +294,26 @@ def run_episode(episode, agent, *, root=None) -> dict:
             grade = episode.grade_final_state(run.workdir, reply=reply)
         except Exception as exc:
             reason = "grader raised: %s: %s" % (type(exc).__name__, exc)
+            # THESE ROWS HAVE THE STRONGEST DELIVERY EVIDENCE THERE IS -- the agent deleted
+            # or corrupted a fixture, which is a change under the workdir -- and they were
+            # returning before the evidence was attached, so they counted as unconfirmed.
+            evidence = _delivery_evidence(agent, transcript_mark, before, after)
             if destroyed:
-                return _agent_destroyed_fixture(episode, destroyed, started, reason)
+                return dict(_agent_destroyed_fixture(episode, destroyed, started, reason),
+                            **evidence)
             if _touched(before, after):
-                return _agent_broke_the_grade(episode, started, reason)
-            return _infra(episode, reason, started,
-                          trace=traceback.format_exc(limit=3))
+                return dict(_agent_broke_the_grade(episode, started, reason), **evidence)
+            return dict(_infra(episode, reason, started,
+                               trace=traceback.format_exc(limit=3)), **evidence)
     # DELETING THE INPUT IS A FAILURE WHETHER OR NOT THE GRADER NOTICED. This only rewrote
     # the outcome when the grader raised or reported infra, so an episode whose grader reads
     # class-level data rather than the fixture -- routing being the live example -- could
     # have its fixture deleted and still pass. The rule was stated as an invariant and was
     # not one.
     if destroyed:
-        return _agent_destroyed_fixture(episode, destroyed, started,
-                                        grade.details.get("reason", ""))
+        return dict(_agent_destroyed_fixture(episode, destroyed, started,
+                                             grade.details.get("reason", "")),
+                    **_delivery_evidence(agent, transcript_mark, before, after))
     out = grade.as_dict()
     # THE TRACE DECIDES WHAT A CLEAN SECURITY RESULT MAY CLAIM. A grader that saw no
     # violation in the workdir has partial coverage by construction; if a trace exists, is
@@ -324,10 +341,20 @@ def run_episode(episode, agent, *, root=None) -> dict:
 def _delivery_evidence(agent, mark, before, after) -> dict:
     """Did the prompt REACH the agent -- as evidence, not as an assumption.
 
-    Every episode's workdir is a fresh temporary directory whose path appears only in that
-    episode's prompt. So a change anywhere under it is proof that the prompt arrived and that
-    something acted on it: no inference about wording, no phrase list, nothing that a terse
-    answer can fail.
+    Every episode's workdir is a fresh temporary directory, and a change under it means
+    SOMETHING ACTED ON THAT EPISODE'S WORKSPACE. That is a fact about the world rather than an
+    inference about wording: no phrase list, nothing a terse answer can fail.
+
+    WHAT IT IS NOT. It is not proof that the prompt reached the conversation. The runner hands
+    the path to the adapter alongside the prompt, so an adapter -- or a child process it
+    spawns -- could write there without the underlying turn ever being delivered. Nothing here
+    correlates a request id through send, reply and grade, which is what would actually
+    establish that, and this is weaker. It is used because it is available and because it
+    catches the failure that was actually observed (a greeting answered a task that never
+    arrived, and nothing was written); it should not be described as end-to-end.
+
+    The snapshot also sees only final file hashes: a file written and deleted within the turn,
+    an empty directory, a permissions change -- none of those register.
 
     An episode whose whole answer is in the reply -- a routing decision, a read-only query --
     touches nothing, so the reply-shaped check covers those. It is the weaker of the two and
@@ -341,16 +368,38 @@ def _delivery_evidence(agent, mark, before, after) -> dict:
     and neither is allowed to hide inside the other. See baseline.summarise.
     """
     touched = _touched(before, after)
+
+    # ONLY THE FILESYSTEM CONFIRMS. The reply-shaped check was being promoted to confirmation
+    # here, and it cannot carry that: `attempted_the_task` returns True for ANY reply of 120
+    # characters or more without looking at what it says, so a long answer about something
+    # else confirmed delivery. And an adapter whose transcript entry simply lacks the key gave
+    # `bool(None) -> False -> not suspect -> confirmed`, which is confirmation from the absence
+    # of a record. Both are the same error: treating "no evidence against" as evidence for.
+    #
+    # So the reply signal is reported as its own weaker grade. An episode that legitimately
+    # touches nothing -- a routing decision, a read-only query -- lands there, and a reader can
+    # see which kind of evidence a number rests on instead of being told they are the same.
     suspect = None
     transcript = getattr(agent, "transcript", None)
     if isinstance(transcript, list) and len(transcript) > mark:
-        suspect = bool(transcript[mark].get("delivery_suspect"))
+        entry = transcript[mark]
+        if "delivery_suspect" in entry:
+            suspect = bool(entry["delivery_suspect"])
+
+    if touched:
+        grade, why = "confirmed", "the workdir changed"
+    elif suspect is False:
+        grade, why = "weak", "the reply referred to the prompt, but nothing was written"
+    elif suspect is True:
+        grade, why = "none", "nothing was written and the reply shared no term with the task"
+    else:
+        grade, why = "unknown", "the adapter recorded nothing about this turn"
+
     return {
         "touched_workdir": touched,
-        "delivery_confirmed": bool(touched or (suspect is False)),
-        "delivery_evidence": ("workdir changed" if touched
-                              else "reply referred to the prompt" if suspect is False
-                              else "none: nothing changed and the reply shared no term"),
+        "delivery": grade,
+        "delivery_confirmed": grade == "confirmed",
+        "delivery_evidence": why,
     }
 
 

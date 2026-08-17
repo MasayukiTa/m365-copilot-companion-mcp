@@ -245,6 +245,19 @@ def comparable(baseline_totals, candidate_totals) -> list:
                 "statement about that fraction, not about the system"
                 % (name, 100 * coverage))
 
+    # DELIVERY, NOT ONLY COVERAGE. `coverage` means "not classified as infra", and a turn
+    # that got a greeting is not infra -- it is an ordinary attempt that failed. So both arms
+    # can show coverage 1.0 while one of them was talking to a companion that never received
+    # the task, and the gate as first written would wave that through. The asymmetry that
+    # matters is how many turns actually REACHED the agent.
+    da = baseline_totals.get("delivery_rate")
+    db = candidate_totals.get("delivery_rate")
+    if da is not None and db is not None and abs(da - db) > MAX_COVERAGE_GAP:
+        reasons.append(
+            "the prompt reached the agent on %.0f%% and %.0f%% of turns -- a %.0f point gap. "
+            "Coverage can be identical while one arm was answering a task it never received"
+            % (100 * da, 100 * db, 100 * abs(da - db)))
+
     a = baseline_totals.get("coverage")
     b = candidate_totals.get("coverage")
     if a is not None and b is not None and abs(a - b) > MAX_COVERAGE_GAP:
@@ -298,6 +311,9 @@ def summarise(rows) -> dict:
     # first: a conditional rate over a third of the suite is a statement about a third of the
     # suite.
     delivered = [r for r in rows if r.get("delivery_confirmed")]
+    # A row the agent was never asked about. `never_requested` is set by the runner when it
+    # returns before calling the agent.
+    requested = [r for r in rows if not r.get("never_requested")]
     security = [r for r in attempted if r.get("category") == SECURITY_CATEGORY]
     return {
         "total": len(rows),
@@ -306,13 +322,25 @@ def summarise(rows) -> dict:
         "pass_rate": round(len(passed) / len(attempted), 4) if attempted else None,
         "conditional_capability": (round(len(passed) / len(attempted), 4)
                                    if attempted else None),
-        "end_to_end": round(len(passed) / len(rows), 4) if rows else None,
+        # OVER THE REQUESTS THAT WERE ACTUALLY MADE. A setup exception returns before the
+        # agent is called at all, so counting it here would mean a broken fixture lowers the
+        # system's end-to-end figure -- the measurement's own failure charged to the thing
+        # being measured, which is the mirror image of the defect this metric exists to
+        # prevent. `requested` is the honest denominator; `not_requested` is reported beside
+        # it so the difference is visible rather than absorbed.
+        "requested": len(requested),
+        "not_requested": len(rows) - len(requested),
+        "end_to_end": round(len(passed) / len(requested), 4) if requested else None,
         "coverage": round(len(attempted) / len(rows), 4) if rows else None,
         # Delivery is a stricter denominator than "not infra": it needs POSITIVE evidence the
         # prompt arrived, rather than the absence of a recognised failure. The gap between
         # `coverage` and this is the set of turns nothing is known about.
         "delivery_confirmed": len(delivered),
         "delivery_rate": round(len(delivered) / len(rows), 4) if rows else None,
+        # The grades, because "confirmed" is one of four answers and the other three are not
+        # interchangeable. `none` is a turn that wrote nothing and said nothing relevant --
+        # the shape a greeting has. `unknown` is a turn the adapter recorded nothing about.
+        "delivery_grades": _count_by(rows, "delivery"),
         "infra": len(infra),
         "infra_ids": [r["episode_id"] for r in infra],
         "failed_ids": [r["episode_id"] for r in attempted if not r.get("success")],
@@ -335,6 +363,13 @@ def summarise(rows) -> dict:
         },
         "median_latency_s": _median([r.get("latency_s") or 0.0 for r in attempted]),
     }
+
+
+def _count_by(rows, key) -> dict:
+    out = {}
+    for row in rows:
+        out[row.get(key) or "unreported"] = out.get(row.get(key) or "unreported", 0) + 1
+    return out
 
 
 def _coverage_counts(rows) -> dict:
@@ -398,9 +433,13 @@ def report(result) -> str:
               "  failures from the capability denominator and raised it; end-to-end is the",
               "  number that cannot be improved that way.",
               "",
-              "  delivery confirmed on %d of %d (%s): positive evidence the prompt arrived --"
+              "  delivery confirmed on %d of %d (%s): the episode's workspace was changed."
               % (t["delivery_confirmed"], t["total"], _pct(t["delivery_rate"])),
-              "  the workdir changed, or the reply referred to the task."]
+              "  grades: %s" % json.dumps(t["delivery_grades"]),
+              "",
+              "  This shows something acted on that workspace, NOT that the prompt reached",
+              "  the conversation -- the adapter is handed the path too. A request id",
+              "  correlated through send, reply and grade would establish that; this does not."]
 
     lines += ["by category", ""]
     for cat, s in result["by_category"].items():

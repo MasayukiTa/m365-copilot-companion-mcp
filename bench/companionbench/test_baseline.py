@@ -355,3 +355,39 @@ def test_the_gate_names_the_number_that_blocked_it():
     """『比較できません』は、そうさせた数字と一緒でなければ使えない。"""
     reasons = B.comparable(_totals(2, 3, 12), _totals(7, 10, 10))
     assert any("%" in r for r in reasons)
+
+
+def test_a_setup_failure_does_not_lower_the_end_to_end_figure():
+    """setup が落ちた行は agent を呼ぶ前に返る。これを end-to-end の分母に入れると、
+    壊れたフィクスチャが『製品が悪い』として現れる -- この指標が防ごうとしている
+    誤りの、ちょうど鏡像。"""
+    rows = [_row("a", True), _row("b", False)]
+    rows.append(dict(_row("c", False, infra=True), never_requested=True))
+    got = B.summarise(rows)
+    assert got["requested"] == 2 and got["not_requested"] == 1
+    assert got["end_to_end"] == 0.5          # 1 of the 2 that were actually asked
+
+
+def test_delivery_is_only_confirmed_by_the_filesystem():
+    """返答ベースの判定は120文字以上なら中身を見ずに True を返す。
+    それを confirmed に昇格させると、無関係な長文が配送の証拠になる。"""
+    rows = [dict(_row("a", True), delivery="weak", delivery_confirmed=False),
+            dict(_row("b", True), delivery="confirmed", delivery_confirmed=True),
+            dict(_row("c", False), delivery="none", delivery_confirmed=False)]
+    got = B.summarise(rows)
+    assert got["delivery_confirmed"] == 1
+    assert got["delivery_grades"] == {"weak": 1, "confirmed": 1, "none": 1}
+
+
+def test_the_gate_catches_a_delivery_gap_that_coverage_cannot_see():
+    """coverage は『infra に分類されていない』の意味しかない。挨拶文を受け取ったターンは
+    infra ではなく、ただの失敗した試行。両腕とも coverage 1.0 のまま、
+    片方だけがタスクを受け取っていない companion と話していることがありうる。"""
+    def _t(delivered, n):
+        rows = [dict(_row("e%d" % i, True), delivery_confirmed=(i < delivered))
+                for i in range(n)]
+        return B.summarise(rows)
+
+    reasons = B.comparable(_t(10, 10), _t(4, 10))
+    assert any("reached the agent" in r for r in reasons)
+    assert B.comparable(_t(10, 10), _t(10, 10)) == []
