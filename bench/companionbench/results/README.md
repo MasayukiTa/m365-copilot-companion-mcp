@@ -39,7 +39,16 @@ were handled — a capture the bridge itself flagged as incomplete, a conversati
 between sending and looking, and a view read before it had rendered. A capability failure that
 navigated would have arranged its own exclusion.
 
-So capability stands at **0.579**, coverage at 0.950, end-to-end at 0.550.
+**AND 0.579 IS NOT THE SUITE'S CAPABILITY EITHER.** Retracting the inflated figure left the
+uninflated one in its place, quoted as though it described the system. It does not. It is
+11/19 over FOUR episodes chosen precisely because they flip -- a subsample selected on
+instability, which biases it downward by construction, and 19 turns of one episode repeated is
+not 19 episodes. The full-suite deconfounded run is the figure that describes the suite:
+15, 16 and 17 of 22, or roughly 0.68-0.77.
+
+Two numbers were therefore wrong in opposite directions for the same reason: a denominator
+was quoted without the population it came from. Over the four flip-prone episodes,
+capability is 0.579, coverage 0.950, end-to-end 0.550.
 
 **AND THE CAUSAL CLAIM IS WEAKENED TOO.** A second round of review pointed out that "the probe
 established a cause" is still more than the data carries. It established an ASSOCIATION,

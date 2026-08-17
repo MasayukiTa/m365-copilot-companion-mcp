@@ -337,13 +337,19 @@ class BridgeAgent:
     HISTORY_ATTEMPTS = 6
     HISTORY_RETRY_S = 2
 
-    #: How the conversation is identified WITHOUT a URL, because on this target it has no
-    #: usable one. Recorded in this repository from a live probe: page.url never carries a
-    #: conversation identifier on the M365 chat page shape, and does not change even when a
-    #: sidebar click visibly switches which conversation is displayed. Pinning /history to a
-    #: URL was therefore inoperative -- two different conversations compare equal, so the
-    #: rotation check could never fire -- and asking /history to navigate to that URL could
-    #: move the page away from the very conversation being inspected.
+    #: How the conversation is identified WITHOUT a URL, because whether the URL identifies
+    #: anything depends on which page shape the target happens to be on -- and the adapter
+    #: cannot know which.
+    #:
+    #: On the general-chat shape (`/chat/?titleId=...`) it identifies nothing: a live probe
+    #: recorded in the bridge found that page.url carries no conversation id and does not
+    #: change even when a sidebar click visibly switches the displayed conversation, so two
+    #: different conversations compare EQUAL and a rotation check could never fire. On the
+    #: agent shape (`/chat/agent/.../conversation/<guid>`) it does carry a conversation guid.
+    #: An earlier version of this comment claimed the first case held everywhere; it does not,
+    #: and the design does not need it to. Contents work on both shapes, a URL works on one,
+    #: and asking /history to navigate to a URL can move the page away from the very
+    #: conversation being inspected. So contents it is.
     #:
     #: What identifies it instead is its own contents. The conversation is fingerprinted
     #: immediately BEFORE the turn; afterwards, the same messages must still be there. If they
