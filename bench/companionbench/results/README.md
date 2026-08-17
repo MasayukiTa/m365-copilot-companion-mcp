@@ -39,9 +39,15 @@ were handled — a capture the bridge itself flagged as incomplete, a conversati
 between sending and looking, and a view read before it had rendered. A capability failure that
 navigated would have arranged its own exclusion.
 
-So capability stands at **0.579**, coverage at 0.950, end-to-end at 0.550. What the probe
-established is a CAUSE, not a correction: most flips are turns that never reached the
-companion. That belongs in `delivery_rate` and in `why_they_flip`, which is where it now is.
+So capability stands at **0.579**, coverage at 0.950, end-to-end at 0.550.
+
+**AND THE CAUSAL CLAIM IS WEAKENED TOO.** A second round of review pointed out that "the probe
+established a cause" is still more than the data carries. It established an ASSOCIATION,
+measured with the old detector, on a run whose saved rows record the booleans but not the
+truncation, hydration, busy or retry evidence needed to re-judge those turns under the rules
+that replaced it. Non-delivery is the leading hypothesis for why episodes flip. It is not a
+finding, and it will not be one until a run is measured with a detector whose negatives are
+anchored and whose abstentions are reported separately from its denials.
 
 `test_delivery_detector_validation.py` is the held-out matrix the original claim lacked —
 six constructed rows where the ground truth is known rather than inferred, including a

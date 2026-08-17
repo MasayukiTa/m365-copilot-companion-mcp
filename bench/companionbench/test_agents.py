@@ -410,15 +410,13 @@ def test_an_empty_conversation_abstains_instead_of_denying():
         def _request(self, path, timeout=None):
             if path.startswith("/history"):
                 return 'HTTP/1.1 200 OK\r\n\r\n{"ok": true, "url": "u", "messages": []}'
-            if path == "/conv":
-                return 'HTTP/1.1 200 OK\r\n\r\n{"url": "u"}'
             return self._raw
 
     b = _Empty(_DONE)
     b.HISTORY_RETRY_S = 0
     b(_PROMPT, "C:/wd")
     assert b.transcript[-1]["prompt_in_conversation"] is None
-    assert "empty" in b.transcript[-1]["delivery_note"]
+    assert "un-hydrated" in b.transcript[-1]["delivery_note"]
 
 
 def test_the_turn_is_recorded_with_enough_to_diagnose_it():

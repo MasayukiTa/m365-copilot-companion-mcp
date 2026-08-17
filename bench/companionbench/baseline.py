@@ -294,7 +294,14 @@ def why_they_flip(runs) -> dict:
         if len({bool(r.get("success")) for r in graded}) < 2:
             continue                      # did not flip
         failures = [r for r in graded if not r.get("success")]
-        delivered = [bool(r.get("delivery_confirmed")) for r in failures]
+        # ONLY FAILURES THE DETECTOR ACTUALLY ANSWERED FOR. `bool(delivery_confirmed)` made
+        # "unknown" indistinguishable from "confirmed not delivered", so an episode the check
+        # could not see was labelled `fails_without_delivery` -- an abstention promoted to
+        # evidence of transport causation, which is the whole error this file exists to avoid.
+        # An episode whose failures are all unanswered now falls through to `mixed`, where it
+        # reads as what it is: no conclusion.
+        answered = [r for r in failures if r.get("delivery") in ("confirmed", "none")]
+        delivered = [r.get("delivery") == "confirmed" for r in answered]
         if delivered and all(delivered):
             varies.append(eid)
         elif delivered and not any(delivered):
@@ -354,6 +361,7 @@ def summarise(rows) -> dict:
     # first: a conditional rate over a third of the suite is a statement about a third of the
     # suite.
     delivered = [r for r in rows if r.get("delivery_confirmed")]
+    delivery_answered = [r for r in rows if r.get("delivery") in ("confirmed", "none")]
     # A row the agent was never asked about. `never_requested` is set by the runner when it
     # returns before calling the agent.
     requested = [r for r in rows if not r.get("never_requested")]
@@ -380,6 +388,16 @@ def summarise(rows) -> dict:
         # `coverage` and this is the set of turns nothing is known about.
         "delivery_confirmed": len(delivered),
         "delivery_rate": round(len(delivered) / len(rows), 4) if rows else None,
+        # WHAT THE DETECTOR COULD SEE, kept separate from what it saw. `delivery_rate` divides
+        # by every row, so a turn the check ABSTAINED on lowers it exactly as a turn the check
+        # DENIED does -- an unanswered question read as a negative answer. These two say how
+        # much of the suite the rate is a statement about, so an instrument that has gone
+        # blind shows up as low coverage instead of as a transport problem.
+        "delivery_answered": len(delivery_answered),
+        "delivery_check_coverage": (round(len(delivery_answered) / len(rows), 4)
+                                    if rows else None),
+        "delivery_rate_where_answered": (round(len(delivered) / len(delivery_answered), 4)
+                                         if delivery_answered else None),
         # The grades, because "confirmed" is one of four answers and the other three are not
         # interchangeable. `none` is a turn that wrote nothing and said nothing relevant --
         # the shape a greeting has. `unknown` is a turn the adapter recorded nothing about.
@@ -476,8 +494,14 @@ def report(result) -> str:
               "  failures from the capability denominator and raised it; end-to-end is the",
               "  number that cannot be improved that way.",
               "",
-              "  delivery confirmed on %d of %d (%s): the episode's workspace was changed."
+              "  delivery confirmed on %d of %d (%s)."
               % (t["delivery_confirmed"], t["total"], _pct(t["delivery_rate"])),
+              "  the check could answer for %d of %d (%s); over those it confirmed %s."
+              % (t["delivery_answered"], t["total"], _pct(t["delivery_check_coverage"]),
+                 _pct(t["delivery_rate_where_answered"])),
+              "  The first rate divides by every row, so a turn the check ABSTAINED on",
+              "  lowers it exactly as a turn it DENIED does. Read the second beside it, or",
+              "  an instrument that has gone blind reads as a transport problem.",
               "  grades: %s" % json.dumps(t["delivery_grades"]),
               "",
               "  This shows something acted on that workspace, NOT that the prompt reached",

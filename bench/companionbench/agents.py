@@ -24,6 +24,7 @@ happened.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -336,7 +337,47 @@ class BridgeAgent:
     HISTORY_ATTEMPTS = 6
     HISTORY_RETRY_S = 2
 
-    def _confirm_delivered(self, nonce: str, conversation_url: str = "") -> dict:
+    #: How the conversation is identified WITHOUT a URL, because on this target it has no
+    #: usable one. Recorded in this repository from a live probe: page.url never carries a
+    #: conversation identifier on the M365 chat page shape, and does not change even when a
+    #: sidebar click visibly switches which conversation is displayed. Pinning /history to a
+    #: URL was therefore inoperative -- two different conversations compare equal, so the
+    #: rotation check could never fire -- and asking /history to navigate to that URL could
+    #: move the page away from the very conversation being inspected.
+    #:
+    #: What identifies it instead is its own contents. The conversation is fingerprinted
+    #: immediately BEFORE the turn; afterwards, the same messages must still be there. If they
+    #: are, the view is the one the turn was sent to, and an absent marker means the turn is
+    #: genuinely not in it. If they are not, the page moved and nothing can be concluded.
+
+    def _fingerprint(self):
+        """The conversation's user messages, right now, or None if it cannot be read.
+
+        None is not the same as an empty list. A fresh conversation legitimately has no
+        messages, and confusing the two would be fatal: an empty anchor matches every
+        conversation, so "I could not look" would silently become "the page did not change".
+        """
+        data = self._history_once()
+        if not data or not data.get("ok") or data.get("truncated"):
+            return None
+        return [self._digest(m) for m in (data.get("messages") or [])
+                if m.get("role") == "user"]
+
+    @staticmethod
+    def _digest(message) -> str:
+        text = message.get("text") or message.get("content") or ""
+        return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+    def _history_once(self):
+        """One /history read. The parsed body, or None if it could not be had."""
+        try:
+            raw = self._request("/history", timeout=90)
+            body = raw.split("\r\n\r\n", 1)[-1]
+            return json.loads(body[body.index("{"):])
+        except Exception:
+            return None
+
+    def _confirm_delivered(self, nonce: str, anchor=None) -> dict:
         """Ask the bridge what is actually IN the conversation, and look for this turn.
 
         WHY THIS AND NOT THE WORKDIR. A change under the episode's workdir shows that
@@ -345,51 +386,30 @@ class BridgeAgent:
         the conversation. This can: the message is read back from the page the bridge drove,
         and the marker it carries was minted for this turn alone.
 
-        Never raises, and a failure to check is reported as None rather than as False. "The
-        history endpoint was busy" is not "the prompt never arrived", and a confirmation step
-        that can fail the run it is confirming would be a measurement breaking the thing it
-        measures.
+        A POSITIVE AND A NEGATIVE ARE NOT SYMMETRIC, and treating them as though they were is
+        what made the first two versions of this wrong. Finding the marker proves delivery
+        outright: the text is there, in a conversation, and nothing else could have put it
+        there. NOT finding it proves nothing by itself -- the record may be incomplete, the
+        page may have moved, the view may not have rendered yet. So a negative is returned
+        only when the same conversation is demonstrably still in view AND the marker is
+        demonstrably not in it. Everything else is None.
+
+        None is not a soft failure to be tidied away. It is the honest answer to "was this
+        delivered?" when the instrument cannot see, and it is reported as coverage rather
+        than counted as a delivery failure. Never raises: a confirmation step that can fail
+        the run it is confirming would be a measurement breaking the thing it measures.
         """
-        # RETRY WHILE THE BRIDGE IS BUSY. /history needs the page lock, and it is asked for
-        # immediately after a turn that was holding it -- so the first attempt often lands on
-        # "busy" and the answer comes back as "could not check". In the first probe that was 4
-        # of 10 turns: not a check, but a coin that lands on its edge half the time. Only
-        # "busy" is retried; any other error will say the same thing six times and only add
-        # thirty seconds to every turn.
-        # THREE WAYS "NOT FOUND" IS NOT "NOT DELIVERED", all of them reachable, none of them
-        # handled by the first version -- which reported every one as a definite negative:
-        #
-        #   TRUNCATION. /history sets `truncated` when the scrape hit a bound before reaching
-        #   the end, and it scrolls from the top, so the turn most likely to be missing is the
-        #   NEWEST one -- exactly the one being looked for. Absent from an incomplete record
-        #   is not absent.
-        #
-        #   THE WRONG CONVERSATION. Bare /history reports whatever conversation the page is on
-        #   NOW. If anything rotated it after the turn, the answer describes a different
-        #   conversation and the nonce is legitimately not in it. The URL is pinned to the one
-        #   the turn was sent to, when the caller knows it, and a reply that comes back from a
-        #   different conversation than the one asked for is not evidence about this turn.
-        #
-        #   HYDRATION LAG. The SPA can render a conversation view with no prior turns in it,
-        #   so an `ok` response with an empty or short message list can simply be early. The
-        #   loop used to stop at the first `ok` whatever it contained. It now keeps asking
-        #   while the nonce is missing, and only the LAST look decides.
-        #
-        # All three collapse to one rule: a negative is only returned from evidence that could
-        # have shown a positive. Everything else is `None`, which the summary reports as
-        # coverage rather than as failure.
-        path = "/history"
-        if conversation_url:
-            path += "?url=" + urllib.parse.quote(conversation_url, safe="")
+        # RETRY WHILE THE BRIDGE IS BUSY, AND WHILE THE MARKER IS SIMPLY NOT THERE YET.
+        # /history needs the page lock and is asked for immediately after a turn that was
+        # holding it, so the first attempt often lands on "busy" -- 4 of 10 turns in the first
+        # probe, which is not a check but a coin landing on its edge. And an un-hydrated view
+        # renders with no prior turns at all, so an `ok` response can simply be early; the
+        # loop used to stop at the first one whatever it contained. Only the LAST look decides.
         data = None
         for attempt in range(self.HISTORY_ATTEMPTS):
-            try:
-                raw = self._request(path, timeout=90)
-                body = raw.split("\r\n\r\n", 1)[-1]
-                data = json.loads(body[body.index("{"):])
-            except Exception as exc:
-                return {"delivered": None,
-                        "why": "history unavailable: %s" % type(exc).__name__}
+            data = self._history_once()
+            if data is None:
+                return {"delivered": None, "why": "history unavailable"}
             if data.get("ok") and self._nonce_in(data, nonce):
                 return {"delivered": True, "why": "the prompt is in the conversation",
                         "conversation": (data.get("url") or "")[-80:]}
@@ -398,42 +418,48 @@ class BridgeAgent:
                 break
             if attempt + 1 < self.HISTORY_ATTEMPTS:
                 time.sleep(self.HISTORY_RETRY_S)
+        seen = (data or {}).get("url") or ""
         if not data or not data.get("ok"):
             return {"delivered": None,
                     "why": "history said: %s" % ((data or {}).get("error") or "?")}
-        seen = (data.get("url") or "")
         if data.get("truncated"):
             return {"delivered": None, "conversation": seen[-80:],
-                    "why": "the conversation was captured incompletely (%s of it), so the "
-                           "prompt being absent from it means nothing"
-                           % (data.get("captured") or "part")}
-        if conversation_url and seen and not self._same_conversation(seen, conversation_url):
+                    "why": "the conversation was captured incompletely (%s of it), and it is "
+                           "scraped from the top, so the newest turn -- this one -- is the "
+                           "likeliest to be missing" % (data.get("captured") or "part")}
+        if anchor is None:
             return {"delivered": None, "conversation": seen[-80:],
-                    "why": "history answered about a different conversation than the one the "
-                           "turn was sent to"}
-        if not (data.get("messages") or []):
+                    "why": "the conversation could not be fingerprinted before the turn, so "
+                           "there is no way to tell this view from a different one"}
+        users = [m for m in (data.get("messages") or []) if m.get("role") == "user"]
+        if not users:
             return {"delivered": None, "conversation": seen[-80:],
-                    "why": "the conversation came back empty after %d attempts, which is what "
-                           "an un-hydrated view looks like as well as an undelivered turn"
+                    "why": "no user messages came back after %d attempts, which is what an "
+                           "un-hydrated view looks like as well as an undelivered turn"
                            % self.HISTORY_ATTEMPTS}
+        after = [self._digest(m) for m in users]
+        if anchor:
+            if after[:len(anchor)] != anchor:
+                return {"delivered": None, "conversation": seen[-80:],
+                        "why": "the messages that were there before the turn are not there "
+                               "now: the page moved, and this view is not the one the turn "
+                               "was sent to"}
+        else:
+            # A FRESH CONVERSATION HAS AN EMPTY ANCHOR, AND AN EMPTY ANCHOR MATCHES ANYTHING.
+            # So it is checked the other way round: everything in view must be something this
+            # adapter could have put there. A foreign user message means the page is showing
+            # some other conversation, whatever its URL claims.
+            foreign = [m for m in users if self.NONCE_PREFIX not in
+                       (m.get("text") or m.get("content") or "")]
+            if foreign:
+                return {"delivered": None, "conversation": seen[-80:],
+                        "why": "this conversation was opened fresh for the episode but holds "
+                               "%d message(s) this adapter did not send, so it is not the one "
+                               "the turn was sent to" % len(foreign)}
         return {"delivered": False,
-                "why": "the conversation does not contain this turn's prompt",
+                "why": "the conversation still holds the messages it had before the turn, "
+                       "and this turn's prompt is not among them",
                 "conversation": seen[-80:]}
-
-    def _current_conversation(self) -> str:
-        """The conversation the page is on right now, or "" if it cannot be read.
-
-        Best effort on purpose. `/conv` needs the page lock and can answer "busy", and a
-        measurement that could fail the run it is measuring would be worse than a measurement
-        that sometimes says nothing: an empty answer degrades the later check to the old
-        unpinned behaviour rather than aborting the turn.
-        """
-        try:
-            raw = self._request("/conv", timeout=30)
-            body = raw.split("\r\n\r\n", 1)[-1]
-            return str(json.loads(body[body.index("{"):]).get("url") or "")
-        except Exception:
-            return ""
 
     @staticmethod
     def _nonce_in(data, nonce) -> bool:
@@ -444,20 +470,6 @@ class BridgeAgent:
             if nonce in text:
                 return True
         return False
-
-    @staticmethod
-    def _same_conversation(seen, asked) -> bool:
-        """Whether two conversation URLs name the same conversation.
-
-        Compared on the last non-empty path segment -- the conversation id -- because the SPA
-        rewrites query strings and fragments freely and a raw string comparison would report
-        a rotation on every turn.
-        """
-        def _ident(url):
-            base = urllib.parse.urlsplit(url or "").path.rstrip("/")
-            return base.rsplit("/", 1)[-1].lower()
-        left, right = _ident(seen), _ident(asked)
-        return bool(left) and left == right
 
     def _new_conversation(self):
         deadline = time.time() + self.retry_busy_s
@@ -493,13 +505,17 @@ class BridgeAgent:
         # back from the page rather than an inference from what came out of it.
         nonce = "%s-%s" % (self.NONCE_PREFIX, uuid.uuid4().hex[:12])
         full = "%s\n\n[%s]" % (full, nonce)
-        # WHICH CONVERSATION THIS TURN IS BEING SENT TO, read BEFORE sending. Without it the
-        # check afterwards asks about whichever conversation the page is on by then, and a
-        # rotation between the two -- by the SPA, by recovery, or by the companion's own
-        # behaviour -- makes a delivered turn look absent. A failure that navigates would
-        # arrange its own exclusion, which is the worst possible bias for this instrument.
-        sent_to = self._current_conversation()
+        # WHAT THIS CONVERSATION HOLDS BEFORE THE TURN, so that afterwards there is a way to
+        # tell this view from a different one. Not a URL: on this target page.url carries no
+        # conversation identifier at all and does not change when the displayed conversation
+        # does, which is recorded in the bridge from a live probe. The contents are the only
+        # identity available, so they are the identity used.
+        #
+        # The clock starts BEFORE this read. It costs a page-lock acquisition and it is the
+        # harness's own overhead, so excluding it would report a latency the run did not have.
         started = time.time()
+        anchor = self._fingerprint()
+        anchor_cost = round(time.time() - started, 1)
         deadline = time.time() + self.retry_busy_s
         raw = ""
         while True:
@@ -516,7 +532,7 @@ class BridgeAgent:
         reply = self._answer(raw)
         elapsed = round(time.time() - started, 1)
         settled = "event: done" in raw
-        confirmed = self._confirm_delivered(nonce, sent_to)
+        confirmed = self._confirm_delivered(nonce, anchor)
         # RECORDED, NOT ACTED ON -- and this is the second time that has had to be said.
         #
         # An undelivered turn briefly RAISED here, on the strength of a probe in which eight
@@ -541,6 +557,7 @@ class BridgeAgent:
         self.transcript.append({
             "prompt": full, "reply": reply, "elapsed_s": elapsed, "settled": settled,
             "nonce": nonce, "prompt_in_conversation": confirmed.get("delivered"),
+            "anchor_cost_s": anchor_cost, "anchored": anchor is not None,
             "delivery_note": confirmed.get("why", ""),
             "conversation": confirmed.get("conversation", ""),
         })

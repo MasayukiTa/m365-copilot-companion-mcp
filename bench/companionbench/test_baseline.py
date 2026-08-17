@@ -396,7 +396,15 @@ def test_the_gate_catches_a_delivery_gap_that_coverage_cannot_see():
 # ---- which half of the flipping is worth working on -----------------------------------------
 
 def _r(eid, ok, delivered=True, infra=False):
-    return dict(_row(eid, ok, infra=infra), delivery_confirmed=delivered)
+    """A row shaped like a real one: `delivery` and `delivery_confirmed` always agree.
+
+    The fixture used to set only `delivery_confirmed`, so it could not express the third
+    answer -- the check ABSTAINED -- and every test here silently ran against rows the runner
+    never produces. `delivered=None` is that third answer.
+    """
+    grade = {True: "confirmed", False: "none", None: "unknown"}[delivered]
+    return dict(_row(eid, ok, infra=infra),
+                delivery=grade, delivery_confirmed=(delivered is True))
 
 
 def _rn(rows):
@@ -438,3 +446,29 @@ def test_infra_rows_do_not_make_an_episode_look_like_it_flipped():
     runs = [_rn([_r("e", True)]), _rn([_r("e", False, infra=True)]), _rn([_r("e", True)])]
     got = B.why_they_flip(runs)
     assert got["varies_with_delivery"] == [] and got["fails_without_delivery"] == []
+
+
+def test_an_episode_whose_failures_the_check_could_not_see_is_not_called_a_harness_fault():
+    """棄権を否定として読むと、計器が見えていないことが「輸送のせい」に化ける。
+
+    `bool(delivery_confirmed)` は unknown と「配送されなかったと確認済み」を同じ False に
+    潰していたので、検査が答えられなかったエピソードが fails_without_delivery に入っていた。
+    答えなかったことを答えとして数えるのは、この関数が避けるべき当のもの。"""
+    runs = [_rn([_r("c", True)]), _rn([_r("c", False, delivered=None)]),
+            _rn([_r("c", True)])]
+    got = B.why_they_flip(runs)
+    assert got["fails_without_delivery"] == []
+    assert got["varies_with_delivery"] == []
+    assert got["mixed"] == ["c"], "no conclusion is its own answer"
+
+
+def test_the_delivery_check_reports_its_own_coverage():
+    """配送率は全行で割るので、棄権した行は否定した行と同じだけ率を下げる。
+
+    その2つを見分ける数字が無いと、計器が見えなくなった状態が輸送の問題に見える。"""
+    rows = [_r("a", True), _r("b", False, delivered=None), _r("c", False, delivered=False)]
+    t = B.summarise(rows)
+    assert t["delivery_rate"] == round(1 / 3, 4)
+    assert t["delivery_answered"] == 2
+    assert t["delivery_check_coverage"] == round(2 / 3, 4)
+    assert t["delivery_rate_where_answered"] == 0.5
