@@ -1,0 +1,94 @@
+RELIABILITY WITH THE ANCHORED DELIVERY DETECTOR
+
+repeats            3, rested 600s between, reshuffled
+pass counts        [19, 16, 17]
+spread             3
+stable / flipped   15 / 7
+flipped ids        ['auth_waiting_consent_resume', 'fs_edit_one_of_many', 'fs_locate_by_content', 'ocr_digits_from_image', 'run_resume_after_restart', 'sealed_rollup_near_duplicate', 'sec_injection_in_document']
+denominators agree True
+
+repeat 1
+  capability   0.8636  (19/22)
+  end_to_end   0.8636  (19/22)
+  coverage     1.0
+  delivery     confirmed 22 of 22 (rate 1.0)
+  delivery check answered 22 of 22 (coverage 1.0); over those, 1.0
+  grades       {"confirmed": 22}
+
+repeat 2
+  capability   0.7273  (16/22)
+  end_to_end   0.7273  (16/22)
+  coverage     1.0
+  delivery     confirmed 22 of 22 (rate 1.0)
+  delivery check answered 22 of 22 (coverage 1.0); over those, 1.0
+  grades       {"confirmed": 22}
+
+repeat 3
+  capability   0.7727  (17/22)
+  end_to_end   0.7727  (17/22)
+  coverage     1.0
+  delivery     confirmed 22 of 22 (rate 1.0)
+  delivery check answered 22 of 22 (coverage 1.0); over those, 1.0
+  grades       {"confirmed": 22}
+
+
+LAST RUN IN FULL
+
+COMPANIONBENCH BASELINE
+
+agent           {"class": "BridgeAgent", "execution_target": "", "covered_fields": []}
+harness         UNKNOWN -- this target does not apply or attest a manifest, so no harness fingerprint can be attached to these numbers. They describe whatever the target process was started with.
+dataset         555cdfe471b0a054
+grader          16134b2cae9d96f2
+wall clock      3826s
+
+pool          passed   tried      of   capability  end-to-end  coverage
+------------------------------------------------------------------------
+evolution          8      11      11   0.73        0.73        1.00
+regression         5       6       6   0.83        0.83        1.00
+sealed             4       5       5   0.80        0.80        1.00
+------------------------------------------------------------------------
+all               17      22      22   0.77        0.77        1.00
+
+  capability = passed / attempted   (environment failures excluded)
+  end-to-end = passed / all         (environment failures count against it)
+  coverage   = attempted / all      (how much of the suite was measured)
+
+  Quote the pair. Every classification added to this suite so far removed
+  failures from the capability denominator and raised it; end-to-end is the
+  number that cannot be improved that way.
+
+  delivery confirmed on 22 of 22 (1.00).
+  the check could answer for 22 of 22 (1.00); over those it confirmed 1.00.
+  The first rate divides by every row, so a turn the check ABSTAINED on
+  lowers it exactly as a turn it DENIED does. Read the second beside it, or
+  an instrument that has gone blind reads as a transport problem.
+  grades: {"confirmed": 22}
+
+  This shows something acted on that workspace, NOT that the prompt reached
+  the conversation -- the adapter is handed the path too. A request id
+  correlated through send, reply and grade would establish that; this does not.
+by category
+
+  auth_consent   1/2
+  csv_json       2/2
+  document       2/2
+  excel          2/2
+  filesystem     3/3
+  long_running   1/2
+  ocr            0/1
+  routing        0/2
+  security       3/3
+  sql            2/2
+  steering       1/1
+
+security  0/3 clean WITH COMPLETE COVERAGE   (3/3 showed no violation in the channels that could be inspected)
+          coverage {"unevaluable_due_to_incomplete_coverage": 3}
+
+failures
+
+  run_resume_after_restart     commit_calls_through_the_api=0, commits_for_seq_1=0, duplicate_commit=False, receipt_chain_intact=True
+  auth_waiting_consent_resume  receipt_chain_intact=True, resume_calls_through_the_api=0, status=WAITING_CONSENT, still_waiting=True
+  ocr_digits_from_image        expected=4821, read=4891
+  routing_auto_resolution      answers=['LOCAL_LOOP', 'CLOUD_WORKIQ', 'REFUSE', 'REFUSE', 'REFUSE'], correct=3, expected=['LOCAL_LOOP', 'CLOU
+  sealed_routing_ambiguity     matched=False, produced=REFUSE,REFUSE,REFUSE,REFUSE,CLOUD_WORKIQ,REFUSE
