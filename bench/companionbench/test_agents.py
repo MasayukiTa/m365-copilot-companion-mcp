@@ -333,8 +333,11 @@ def test_a_conversation_without_the_marker_is_a_delivery_failure():
                 return 'HTTP/1.1 200 OK\r\n\r\n{"ok": true, "url": "u", "messages": []}'
             return self._raw
 
+    # The turn is RECORDED and then refused. Recording it is what leaves something to
+    # diagnose with; refusing it is what keeps it out of the capability denominator.
     b = _Empty(_DONE)
-    b("edit mod_b.py", "C:/wd")
+    with pytest.raises(A.TurnDidNotSettle):
+        b("edit mod_b.py", "C:/wd")
     assert b.transcript[-1]["prompt_in_conversation"] is False
 
 
@@ -352,3 +355,86 @@ def test_a_conversation_carrying_the_marker_confirms_delivery():
     b.transcript.append({"nonce": "cb-turn-abc"})
     got = b._confirm_delivered("cb-turn-abc")
     assert got["delivered"] is True
+
+
+def test_the_history_check_retries_past_a_busy_bridge(monkeypatch):
+    """/history はページロックを要る。ターン直後に聞くので最初の試行は busy に当たりやすく、
+    最初の診断では10ターン中4件が『確認できず』になった。半分近く答えない検査は検査ではない。"""
+    monkeypatch.setattr(A.time, "sleep", lambda _s: None)
+    calls = {"n": 0}
+
+    class _BusyThenOk(_Bridge):
+        def _request(self, path, timeout=None):
+            if path != "/history":
+                return self._raw
+            calls["n"] += 1
+            if calls["n"] < 3:
+                return 'HTTP/1.1 200 OK\r\n\r\n{"ok": false, "error": "busy"}'
+            return ('HTTP/1.1 200 OK\r\n\r\n{"ok": true, "url": "u", "messages": '
+                    '[{"role": "user", "text": "... %s"}]}' % self._nonce)
+
+    b = _BusyThenOk(_DONE)
+    b._nonce = "cb-turn-xyz"
+    got = b._confirm_delivered("cb-turn-xyz")
+    assert got["delivered"] is True
+    assert calls["n"] == 3
+
+
+def test_a_non_busy_error_is_not_retried(monkeypatch):
+    """混雑以外の失敗を6回繰り返しても答えは変わらず、ターンごとに待ち時間が増えるだけ。"""
+    monkeypatch.setattr(A.time, "sleep", lambda _s: None)
+    calls = {"n": 0}
+
+    class _Broken(_Bridge):
+        def _request(self, path, timeout=None):
+            if path != "/history":
+                return self._raw
+            calls["n"] += 1
+            return 'HTTP/1.1 200 OK\r\n\r\n{"ok": false, "error": "page is gone"}'
+
+    got = _Broken(_DONE)._confirm_delivered("cb-turn-xyz")
+    assert got["delivered"] is None and calls["n"] == 1
+
+
+def test_a_turn_missing_from_its_conversation_is_the_harness_not_the_answer():
+    """4エピソード×5反復=20ターン。合格11件は全て会話にプロンプトがあり、
+    失敗9件のうち8件は無かった。未配送の失敗は返答8〜113文字、
+    配送済みの失敗は608文字。確認は20/20で成立している。"""
+    class _Missing(_Bridge):
+        def _request(self, path, timeout=None):
+            if path == "/history":
+                return 'HTTP/1.1 200 OK\r\n\r\n{"ok": true, "url": "u", "messages": []}'
+            return self._raw
+
+    with pytest.raises(A.TurnDidNotSettle) as exc:
+        _Missing(_DONE)(_PROMPT, "C:/wd")
+    assert "not in the conversation" in str(exc.value)
+
+
+def test_the_rejected_turn_is_still_recorded_before_it_raises():
+    """診断できない却下は、次に同じものを探すときの手掛かりを消す。"""
+    class _Missing(_Bridge):
+        def _request(self, path, timeout=None):
+            if path == "/history":
+                return 'HTTP/1.1 200 OK\r\n\r\n{"ok": true, "url": "u", "messages": []}'
+            return self._raw
+
+    b = _Missing(_DONE)
+    with pytest.raises(A.TurnDidNotSettle):
+        b(_PROMPT, "C:/wd")
+    assert b.transcript[-1]["prompt_in_conversation"] is False
+    assert b.transcript[-1]["nonce"]
+
+
+def test_a_turn_the_check_could_not_answer_is_still_graded():
+    """『履歴が答えられなかった』で採点をやめると、ブリッジの不調が
+    そのまま能力の分母を削る -- まさにこの一連で繰り返し見つけた形。"""
+    class _NoHistory(_Bridge):
+        def _request(self, path, timeout=None):
+            if path == "/history":
+                raise OSError("refused")
+            return self._raw
+
+    b = _NoHistory(_DONE)
+    assert b(_PROMPT, "C:/wd") == "done, mod_b.py updated"
+    assert b.transcript[-1]["prompt_in_conversation"] is None

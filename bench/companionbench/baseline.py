@@ -269,6 +269,48 @@ def comparable(baseline_totals, candidate_totals) -> list:
     return reasons
 
 
+def why_they_flip(runs) -> dict:
+    """For each episode that changed verdict, whether its failures came with delivery.
+
+    THE SPLIT THIS MAKES is the difference between two remedies that cost very different
+    amounts. An episode that fails while the prompt demonstrably arrived is the companion
+    varying, and the only honest fix is repeats built into the design -- every episode run k
+    times and scored on its rate, which multiplies the cost of every future A/B by k. An
+    episode whose failures all arrive without delivery is a harness fault, fixable once.
+
+    Reported as three groups rather than a number, because "9 flipped" tells you the size of
+    the problem and none of its shape, and the first thing anyone does with the shape is
+    decide which half to work on.
+    """
+    per = {}
+    for run in runs:
+        for row in run.get("rows") or []:
+            per.setdefault(row["episode_id"], []).append(row)
+
+    varies, transport, mixed = [], [], []
+    for eid, rows in sorted(per.items()):
+        graded = [r for r in rows if not r.get("infra_failure")]
+        if len({bool(r.get("success")) for r in graded}) < 2:
+            continue                      # did not flip
+        failures = [r for r in graded if not r.get("success")]
+        delivered = [bool(r.get("delivery_confirmed")) for r in failures]
+        if delivered and all(delivered):
+            varies.append(eid)
+        elif delivered and not any(delivered):
+            transport.append(eid)
+        else:
+            mixed.append(eid)
+
+    return {
+        "varies_with_delivery": varies,
+        "fails_without_delivery": transport,
+        "mixed": mixed,
+        "note": "delivery is only as strong as the adapter's evidence. From the workdir alone "
+                "it shows something acted on the workspace; from the conversation it shows "
+                "the prompt arrived. A split computed over the weaker signal is a hypothesis.",
+    }
+
+
 def _refuse_a_meaningless_target(agent):
     """A baseline from a scripted agent measures the script.
 

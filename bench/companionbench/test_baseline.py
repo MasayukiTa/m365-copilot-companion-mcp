@@ -391,3 +391,50 @@ def test_the_gate_catches_a_delivery_gap_that_coverage_cannot_see():
     reasons = B.comparable(_t(10, 10), _t(4, 10))
     assert any("reached the agent" in r for r in reasons)
     assert B.comparable(_t(10, 10), _t(10, 10)) == []
+
+
+# ---- which half of the flipping is worth working on -----------------------------------------
+
+def _r(eid, ok, delivered=True, infra=False):
+    return dict(_row(eid, ok, infra=infra), delivery_confirmed=delivered)
+
+
+def _rn(rows):
+    return {"rows": rows, "totals": B.summarise(rows)}
+
+
+def test_an_episode_that_fails_while_the_prompt_arrived_is_the_target_varying():
+    """届いた上で落ちるなら、直しようは設計に反復を入れることだけ --
+    そして将来のA/B全部のコストがk倍になる。"""
+    runs = [_rn([_r("a", True)]), _rn([_r("a", False)]), _rn([_r("a", True)])]
+    got = B.why_they_flip(runs)
+    assert got["varies_with_delivery"] == ["a"]
+    assert got["fails_without_delivery"] == []
+
+
+def test_an_episode_whose_failures_all_lack_delivery_is_a_harness_fault():
+    """こちらは一度直せば済む安い方。"""
+    runs = [_rn([_r("b", True)]), _rn([_r("b", False, delivered=False)]),
+            _rn([_r("b", True)])]
+    got = B.why_they_flip(runs)
+    assert got["fails_without_delivery"] == ["b"]
+
+
+def test_both_causes_at_once_are_reported_as_mixed_rather_than_picked():
+    """混在を片方に丸めると、残った半分が『直したのに直らない』として再発する。"""
+    runs = [_rn([_r("c", False)]), _rn([_r("c", False, delivered=False)]),
+            _rn([_r("c", True)])]
+    assert B.why_they_flip(runs)["mixed"] == ["c"]
+
+
+def test_a_stable_episode_is_not_in_any_group():
+    runs = [_rn([_r("d", True)]), _rn([_r("d", True)])]
+    got = B.why_they_flip(runs)
+    assert got["varies_with_delivery"] == [] and got["mixed"] == []
+
+
+def test_infra_rows_do_not_make_an_episode_look_like_it_flipped():
+    """環境が走らせられなかった回は判定ではない。"""
+    runs = [_rn([_r("e", True)]), _rn([_r("e", False, infra=True)]), _rn([_r("e", True)])]
+    got = B.why_they_flip(runs)
+    assert got["varies_with_delivery"] == [] and got["fails_without_delivery"] == []

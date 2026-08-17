@@ -331,6 +331,11 @@ class BridgeAgent:
     #: conversation is not a judgement call.
     NONCE_PREFIX = "cb-turn"
 
+    #: How hard to try to read the conversation back. The page lock is usually free within a
+    #: few seconds of a turn ending.
+    HISTORY_ATTEMPTS = 6
+    HISTORY_RETRY_S = 2
+
     def _confirm_delivered(self, nonce: str) -> dict:
         """Ask the bridge what is actually IN the conversation, and look for this turn.
 
@@ -345,14 +350,27 @@ class BridgeAgent:
         that can fail the run it is confirming would be a measurement breaking the thing it
         measures.
         """
-        try:
-            raw = self._request("/history", timeout=90)
-            body = raw.split("\r\n\r\n", 1)[-1]
-            data = json.loads(body[body.index("{"):])
-        except Exception as exc:
-            return {"delivered": None, "why": "history unavailable: %s" % type(exc).__name__}
-        if not data.get("ok"):
-            return {"delivered": None, "why": "history said: %s" % (data.get("error") or "?")}
+        # RETRY WHILE THE BRIDGE IS BUSY. /history needs the page lock, and it is asked for
+        # immediately after a turn that was holding it -- so the first attempt often lands on
+        # "busy" and the answer comes back as "could not check". In the first probe that was 4
+        # of 10 turns: not a check, but a coin that lands on its edge half the time. Only
+        # "busy" is retried; any other error will say the same thing six times and only add
+        # thirty seconds to every turn.
+        data = None
+        for _attempt in range(self.HISTORY_ATTEMPTS):
+            try:
+                raw = self._request("/history", timeout=90)
+                body = raw.split("\r\n\r\n", 1)[-1]
+                data = json.loads(body[body.index("{"):])
+            except Exception as exc:
+                return {"delivered": None,
+                        "why": "history unavailable: %s" % type(exc).__name__}
+            if data.get("ok") or "busy" not in str(data.get("error") or ""):
+                break
+            time.sleep(self.HISTORY_RETRY_S)
+        if not data or not data.get("ok"):
+            return {"delivered": None,
+                    "why": "history said: %s" % ((data or {}).get("error") or "?")}
         for message in data.get("messages") or []:
             if message.get("role") != "user":
                 continue
@@ -416,6 +434,29 @@ class BridgeAgent:
         elapsed = round(time.time() - started, 1)
         settled = "event: done" in raw
         confirmed = self._confirm_delivered(nonce)
+        # A TURN WHOSE PROMPT IS NOT IN THE CONVERSATION DID NOT HAPPEN.
+        #
+        # Measured, not assumed. Four episodes, five repeats, twenty turns: every one of the
+        # eleven passes had its prompt in the conversation, and eight of the nine failures did
+        # not. The undelivered failures replied in 8 to 113 characters; the one delivered
+        # failure replied in 608. The check found an answer on 20 of 20 turns, so it is not
+        # quietly abstaining on the hard ones.
+        #
+        # This moves failures OUT of the capability denominator, which is the direction every
+        # correction in this suite has moved it, and the reason `end_to_end` exists: that
+        # figure still counts these, because a request that produced nothing is a failure to
+        # the person who made it however the fault is apportioned.
+        if confirmed.get("delivered") is False:
+            self.transcript.append({
+                "prompt": full, "reply": reply, "elapsed_s": elapsed, "settled": settled,
+                "nonce": nonce, "prompt_in_conversation": False,
+                "delivery_note": confirmed.get("why", ""),
+                "conversation": confirmed.get("conversation", ""),
+            })
+            raise TurnDidNotSettle(
+                "the prompt is not in the conversation the bridge drove (%d chars came back "
+                "in %.1fs): the turn was never put to the companion, so this is the harness "
+                "and not the answer" % (len(reply or ""), elapsed))
         self.transcript.append({
             "prompt": full, "reply": reply, "elapsed_s": elapsed, "settled": settled,
             "nonce": nonce, "prompt_in_conversation": confirmed.get("delivered"),
