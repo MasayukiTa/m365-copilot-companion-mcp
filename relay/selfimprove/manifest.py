@@ -68,6 +68,9 @@ FORBIDDEN_COMPONENTS = frozenset({
     "sealed_answers",      # the holdout
     "permissions",
     "authorization",
+    "autonomy",            # relay/selfimprove/autonomy.py -- the ladder that decides which
+                           # guards apply. If the loop can move its own rung, every guard the
+                           # rung governs becomes advisory in a single step.
     "provenance",          # authority classes; see the brief's lineage-poisoning section
 })
 

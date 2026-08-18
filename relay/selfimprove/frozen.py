@@ -106,11 +106,28 @@ def _read_anchor() -> str:
 
 
 def _sha256(path: str) -> str:
-    """sha256 hex of a file read as binary."""
+    """sha256 hex of a file's content with line endings normalised to LF.
+
+    WHY NORMALISED, WHICH IS NOT AN OBVIOUS THING FOR AN INTEGRITY CHECK TO DO.
+
+    This hashed raw bytes, and on a Windows checkout with `core.autocrlf` git materialises
+    CRLF. The result: the frozen set reported the judge as tampered with, permanently, on a
+    tree where nothing had been touched. It was found by a baseline mismatch on
+    manifest.py that turned out to be 233 CRLF pairs and not one changed character.
+
+    Two costs, and the second is the serious one. Every scheduled run was blocked, since an
+    intact frozen set is a precondition. And an integrity check that cries wolf on a clean
+    tree is one that gets bypassed -- the failure mode is not that it stays noisy, it is that
+    someone adds a flag to skip it and the check quietly stops existing.
+
+    What normalising gives up: an attacker who can change line endings and nothing else. In
+    Python source that changes no behaviour, so the check loses nothing it was protecting.
+    What it buys: the same verdict for the same source on Linux CI and a Windows workstation,
+    which the raw-byte version could not give even in principle.
+    """
     h = hashlib.sha256()
     with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
+        h.update(f.read().replace(b"\r\n", b"\n"))
     return h.hexdigest()
 
 

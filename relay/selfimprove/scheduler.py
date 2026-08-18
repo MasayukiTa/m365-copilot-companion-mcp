@@ -55,14 +55,27 @@ class Blocked(RuntimeError):
 
 def preconditions(*, recent_decisions=None, lock_path=None, activate=False,
                   operator_approved_activation=False, budget_candidates=None,
-                  baseline_path=None) -> list:
+                  baseline_path=None, level="B") -> list:
     """Every reason this run should not start. Empty means it may.
 
     Returns reasons rather than raising so a caller can log all of them at once: fixing one
     and rediscovering the next on the following night is how a scheduled loop spends a week
     not running.
+
+    `level` is the autonomy rung (see `relay.selfimprove.autonomy`). It defaults to B because
+    a SCHEDULED run is by definition one the system started, and that is what B means -- level
+    A says a human starts the experiment, so a nightly campaign at level A is a contradiction
+    rather than a configuration.
     """
+    from relay.selfimprove import autonomy as AU
+
     reasons = []
+
+    if not AU.permits(level, AU.START_EXPERIMENT):
+        reasons.append(
+            "level %s does not permit the system to start an experiment; at that rung a human "
+            "starts it, so an unattended campaign is not a stricter version of this schedule "
+            "-- it is a different one" % AU.normalise(level))
 
     ok, changed = _frozen(baseline_path)
     if not ok:
@@ -76,10 +89,16 @@ def preconditions(*, recent_decisions=None, lock_path=None, activate=False,
                        "interleave their candidates and the second one's baseline is the "
                        "first one's half-applied state" % held)
 
-    if activate and not operator_approved_activation:
+    # LEVEL C IS WHERE SELF-ACTIVATION LIVES. Below it, activation still happens -- a human
+    # approves this schedule's winner, which is level B as the brief describes it. So the
+    # per-run approval is not redundant with the rung: it is what B looks like in practice,
+    # and the rung is what makes C not need it.
+    if activate and not AU.permits(level, AU.ACTIVATE_CONFIG, change_kind="parameters",
+                                   gates_all_passed=True) and not operator_approved_activation:
         reasons.append("activation is on but no operator approved it for this schedule; a "
                        "scheduled run that installs its own winner changes the system while "
-                       "nobody is watching")
+                       "nobody is watching (level %s; self-activation begins at C)"
+                       % AU.normalise(level))
 
     if budget_candidates is not None and int(budget_candidates) <= 0:
         reasons.append("no candidate budget; an unbounded scheduled loop can spend a night "

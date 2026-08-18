@@ -285,3 +285,34 @@ def test_the_baseline_never_records_an_absolute_path(tmp_path):
     text = open(path, encoding="utf-8").read()
     assert not re.search(r"[A-Za-z]:\\|[A-Za-z]:/", text), "絶対パスが記録されている"
     assert json.loads(text)["checksums"], "checksums が空"
+
+
+def test_a_checkout_with_windows_line_endings_is_not_tampering(tmp_path):
+    """生バイトで比較していたため、`core.autocrlf` の Windows チェックアウトでは
+    1文字も触れていない木で「判定器が改竄された」と恒久的に報告していた。
+    実例は manifest.py の 233 個の CRLF。
+
+    痛いのは2つ目のほう。整合性チェックが清潔な木で狼少年になると、
+    直るのではなく「飛ばすフラグ」が足され、検査は静かに存在しなくなる。"""
+    lf = tmp_path / "lf.py"
+    crlf = tmp_path / "crlf.py"
+    body = "def judge():\n    return 1\n"
+    lf.write_bytes(body.encode())
+    crlf.write_bytes(body.replace("\n", "\r\n").encode())
+    assert F._sha256(str(lf)) == F._sha256(str(crlf))
+
+
+def test_a_real_content_change_is_still_caught(tmp_path):
+    """正規化が検査そのものを無力化していないこと。"""
+    a = tmp_path / "a.py"
+    b = tmp_path / "b.py"
+    a.write_bytes(b"def judge():\r\n    return 1\r\n")
+    b.write_bytes(b"def judge():\r\n    return 2\r\n")
+    assert F._sha256(str(a)) != F._sha256(str(b))
+
+
+def test_the_shipped_frozen_set_matches_its_baseline():
+    """このテストが赤いとき、意味は2つに1つ -- 誰かが判定器を触ったか、
+    再ベースラインを伴う正当な変更が入ったか。どちらも人が読むべき事象。"""
+    ok, changed = F.frozen_intact()
+    assert ok, "frozen set adrift: %s" % changed
