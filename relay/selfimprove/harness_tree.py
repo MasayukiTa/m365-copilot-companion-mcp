@@ -40,6 +40,26 @@ from __future__ import annotations
 from relay.selfimprove import manifest as M
 
 
+#: The task classes a branch may be named for -- the brief's list, as a CLOSED set.
+#:
+#: Closed because `resolve` is public and takes a string. If any string could name a branch,
+#: a caller that derived a class from task content would reach a branch directly and the
+#: routing rules in `relay.selfimprove.routing` would be advisory. With the vocabulary shut,
+#: the worst such a caller can do is pick among branches an operator declared -- still worth
+#: preventing, which is what routing is for, but no longer an open door.
+TASK_CLASSES = (
+    "coding",
+    "spreadsheet",
+    "document",
+    "ocr",
+    "sql",
+    "research",
+    "long_running_local",
+    "m365_cloud",
+    "security_sensitive",
+)
+
+
 class TreeError(ValueError):
     """Raised when a tree would make the running configuration unaccountable."""
 
@@ -66,6 +86,11 @@ def validate(tree: dict) -> None:
     for task_class, genome in overrides.items():
         if not str(task_class).strip():
             raise TreeError("a task class must be named")
+        if str(task_class).strip() not in TASK_CLASSES:
+            raise TreeError(
+                "%r is not one of the task classes a branch may be named for. An open "
+                "vocabulary lets a class derived from task content name a branch, which "
+                "makes the routing rules advisory rather than enforced" % task_class)
         for section in ("components", "parameters"):
             for key in (genome.get(section) or {}):
                 if key not in (root.get(section) or {}):

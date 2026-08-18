@@ -208,6 +208,7 @@ jobs:
             relay/selfimprove/test_solver_feedback.py \
             relay/selfimprove/test_coreset.py \
             relay/selfimprove/test_harness_tree.py \
+            relay/selfimprove/test_routing.py \
             relay/selfimprove/test_scheduler.py \
             relay/selfimprove/test_dashboard.py \
             relay/selfimprove/test_diversify.py \
