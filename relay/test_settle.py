@@ -215,18 +215,45 @@ def test_explain_reports_zero_shortfall_once_the_requirements_are_met():
 
 # ---- 移行の進み具合 --------------------------------------------------------------------------
 
-def test_the_canonical_site_uses_this_and_the_others_have_not_moved_yet():
-    """手順2で正典サイトが移行済み。手順3〜5（fleet / refuter / research）は未着手で、
-    それを「まだ」と明示しておく -- 統一の価値は最後のサイトが移るまで実現しない。
-    移行済みの数がこの表と食い違ったら、どちらかが古い。"""
+def test_which_sites_have_moved_and_which_are_still_gated():
+    """統一の価値は最後のサイトが移るまで実現しない。表が古くなったら落ちる。
+
+    正典サイトだけがゲート無し -- 規則の出所であり、移行が何も変えないことが要件だった。
+    残りは採用そのものが挙動変更（どれもサンプル要求を持っていない）なので、
+    A/B が勝ちを示すまで既定は旧経路。"""
     import io
-    moved = {"relay/copilot_autopilot_relay.py": True,
-             "relay/relay_fleet.py": False,
-             "relay/refuter.py": False,
-             "relay/agent_profiles.py": False}
-    for path, expected in moved.items():
+    state = {"relay/copilot_autopilot_relay.py": "ungated",
+             "relay/relay_fleet.py": "gated",
+             "relay/refuter.py": "not_yet",
+             "relay/agent_profiles.py": "not_yet"}
+    for path, expected in state.items():
         src = io.open(path, encoding="utf-8").read()
-        assert ("_settle.settle_step(" in src) is expected, path
+        uses = "_settle.settle_step(" in src
+        gated = "_settle.unified()" in src
+        assert uses is (expected != "not_yet"), path
+        assert gated is (expected == "gated"), path
+
+
+def test_the_gate_is_off_by_default(monkeypatch):
+    """既定で有効になった瞬間、A/B は「新実装 対 新実装」になる。
+
+    測るのは出荷時の既定であって、いま走っている環境ではない -- 前者を測るつもりで
+    後者を読むと、ゲートを1に立てて回した瞬間にこのテストが落ちて、
+    「既定が変わった」と誤読される。"""
+    monkeypatch.delenv("MCP_SETTLE_UNIFIED", raising=False)
+    assert S.unified() is False
+    for off in ("0", "", " 0 ", "no"):
+        monkeypatch.setenv("MCP_SETTLE_UNIFIED", off)
+        assert S.unified() is False, off
+    monkeypatch.setenv("MCP_SETTLE_UNIFIED", "1")
+    assert S.unified() is True
+
+
+def test_the_gate_is_recorded_in_the_fingerprint():
+    """未記録トグルは未記録交絡。オンの走行とオフの走行は別のハーネス。"""
+    from relay.selfimprove import experiment as EX
+    assert "MCP_SETTLE_UNIFIED" in EX.FINGERPRINT_ENV_KEYS
+    assert "MCP_MARKERLESS_DWELL_FACTOR" in EX.FINGERPRINT_ENV_KEYS
 
 
 # ---- 移行が「振る舞い不変」であるための2性質 ------------------------------------------------

@@ -41,6 +41,7 @@ from .copilot_autopilot_relay import (
     reported_stuck, transient_backoff, conversation_exhausted, RECYCLE_PREFIX,
     conversation_start_label,
 )
+from relay import settle as _settle
 from .planner import PLAN_PROMPT, extract_plan, plan_ready
 from .review_resilience import (
     freeze_goal_dict, looks_like_policy_refusal, same_task_envelope,
@@ -1429,6 +1430,7 @@ class RelayWorker:
         self._redirect_renavs = 0
         self._tx.user(self.turn, self.job)     # persist the full sent prompt for this turn
         self._last_text, self._stable_since, self._t_send = None, None, time.time()
+        self._settle_state = _settle.SettleState()
         self.status = "waiting"
 
     def _on_redirect_page(self):
@@ -2661,6 +2663,7 @@ class RelayWorker:
                 try:
                     if _isgen():
                         self._last_text, self._stable_since = None, None
+                        self._settle_state = _settle.SettleState()
                         # LIVE PREVIEW ONLY: surface the in-flight partial so the cockpit shows
                         # mid-turn progress per worker (status.json "last" -> card body). This is
                         # display-only: we do NOT call _decide() and do NOT append to the transcript,
@@ -2676,6 +2679,30 @@ class RelayWorker:
                 except Exception:
                     pass
             t = self.drv.read_last_response()
+            if _settle.unified():
+                # THE ONE RULE, and for this site it is a real change rather than a move.
+                # This loop has no sample requirement at all -- only a dwell -- so the guard
+                # that 3,931 measured replies justified has never applied here, and a
+                # streaming pause longer than dwell_s is the whole failure it was written
+                # for. Gated because "stricter" is a claim, not a fact, until the A/B says
+                # so; the old path below is untouched and is still the default.
+                state = getattr(self, "_settle_state", None) or _settle.SettleState()
+                state, outcome = _settle.settle_step(
+                    state, t, now=time.time(), dwell_s=self.dwell_s, generating=False,
+                    is_processing=_is_processing(t), has_marker=has_end_marker)
+                self._settle_state = state
+                # Keep the legacy fields in step: the cockpit and the resume path read them,
+                # and leaving them frozen would make a unified run look permanently stalled.
+                self._last_text, self._stable_since = state.last, state.stable_since
+                if outcome != _settle.ACCEPT:
+                    return False
+                if getattr(self.drv, "_is_stale_repeat", lambda _t: False)(t):
+                    return False
+                accept = getattr(self.drv, "_accept_new_reply", None)
+                if callable(accept):
+                    accept(t)
+                self._decide(t)
+                return self.status in TERMINAL
             if _is_processing(t):
                 self._last_text, self._stable_since = None, None
                 return False
@@ -2687,6 +2714,9 @@ class RelayWorker:
                 # cannot hang the round-robin -- a turn that genuinely never marks still
                 # commits once it stays byte-identical for the extended window.
                 need = self.dwell_s if has_end_marker(t) else self.dwell_s * 2.0
+                # COMPARED TO None IN THE UNIFIED PATH, not for truthiness. Kept as-is here
+                # because this is the legacy branch and it must not move, but the defect is
+                # real: a clock reading of 0.0 reads as "never became stable".
                 if self._stable_since and (time.time() - self._stable_since) >= need:
                     # This poll loop bypasses CopilotWebDriver.wait_for_idle -- apply the
                     # same cross-turn correspondence guard directly (see its docstring):

@@ -188,6 +188,7 @@ jobs:
             relay/test_repo_map.py \
             relay/test_response_independent_send.py \
             relay/test_send_never_submits_empty.py \
+            relay/test_fleet_settle.py \
             relay/test_settle.py \
             relay/test_settle_survives_placeholder.py \
             relay/test_settle_replay.py \

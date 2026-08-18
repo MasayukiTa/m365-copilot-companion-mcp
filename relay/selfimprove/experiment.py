@@ -46,6 +46,10 @@ FINGERPRINT_ENV_KEYS = (
     # count was doubled at all; making it a constant also made it settable, and a settable
     # thing that changes when a reply is accepted belongs here.
     "MCP_MARKERLESS_DWELL_FACTOR",
+    # Which settle implementation the migrated-but-gated sites used. Comparing a run
+    # with it on against one without it is comparing two different harnesses, which is
+    # the entire point of the A/B it exists for.
+    "MCP_SETTLE_UNIFIED",
 )
 
 

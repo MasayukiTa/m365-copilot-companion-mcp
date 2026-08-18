@@ -63,6 +63,21 @@ DEFAULT_SAMPLES = max(2, int(os.environ.get("MCP_REPLY_SETTLE_SAMPLES", "3")))
 #: applied to the sample count as well as the dwell.
 MARKERLESS_DWELL_FACTOR = float(os.environ.get("MCP_MARKERLESS_DWELL_FACTOR", "2.0"))
 
+def unified() -> bool:
+    """Whether the migrated-but-gated sites use this rule yet. Default off.
+
+    The canonical site is not gated -- it was the source of the rule and its migration was
+    required to change nothing. The other three DO change: none of them has a sample
+    requirement today, so adopting it makes them stricter, and "stricter" still has to be
+    demonstrated rather than assumed. The old paths stay in place until an A/B says the new
+    one wins.
+
+    Read from the environment on every call rather than captured at import, so the value a
+    run actually used is the value the fingerprint records.
+    """
+    return os.environ.get("MCP_SETTLE_UNIFIED", "0").strip() == "1"
+
+
 #: The four things a step can conclude. Named rather than boolean because "skip" and
 #: "waiting" are different states that a two-valued return would merge, and the difference
 #: between them is the placeholder finding above.
