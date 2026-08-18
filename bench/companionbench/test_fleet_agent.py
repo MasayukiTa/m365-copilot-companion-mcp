@@ -360,3 +360,39 @@ def test_a_genuine_exception_still_falls_back_to_serial(monkeypatch):
 
     monkeypatch.setattr(fr, "settings_autoscale", _boom)
     assert _plain_agent().max_concurrent_episodes == 1
+
+
+def test_the_attestation_expectation_follows_the_ARM_not_the_last_attest(tmp_path, monkeypatch):
+    """基準アーム全件が infra になり、閉ループが一周できなかった原因。
+
+    プリフライトは基準→候補の順に attest するので、`_expected_harness_id` は候補のまま
+    残る。その後の交互実行で基準アームに入っても期待値は候補のままなので、基準側の
+    エピソードが全て『child ran base but candidate was active』で落ちる。
+    `paired_evaluate` は `no episode ran on both arms` で中断した。
+
+    親が『いま export しているもの』を見れば、答えのコピーが2つ存在しなくなるので
+    ずれようがない。"""
+    import json as _json
+
+    from relay.selfimprove import manifest as M
+    from relay.selfimprove import runtime_config as RC
+
+    base = M.base_manifest()
+    cand = M.apply_genome(base, {"parameters": {"max_retries": 6}})
+    path = tmp_path / "arm.json"
+    path.write_text(_json.dumps(base), encoding="utf-8")
+    monkeypatch.setenv(RC.OVERRIDE_ENV, str(path))
+
+    agent = FleetAgent(agent_url="https://example.invalid/chat/")
+    # the stale value the preflight would have left behind
+    agent._expected_harness_id = M.harness_id(cand)
+    assert agent._active_harness_id() == M.harness_id(base), (
+        "the parent must read the manifest it actually installed")
+
+
+def test_no_installed_manifest_means_no_expectation_to_check(monkeypatch):
+    """何も install されていなければ照合対象が無い -- 空を返し、直前の attest に委ねる。"""
+    from relay.selfimprove import runtime_config as RC
+    monkeypatch.delenv(RC.OVERRIDE_ENV, raising=False)
+    agent = FleetAgent(agent_url="https://example.invalid/chat/")
+    assert agent._active_harness_id() == ""

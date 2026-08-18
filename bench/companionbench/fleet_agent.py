@@ -337,6 +337,24 @@ class FleetAgent:
             "has_cdp_url": bool(self.cdp_url),
         }
 
+    def _active_harness_id(self) -> str:
+        """The harness id of the manifest THIS process currently exports, or "".
+
+        Read from the same place the child will read it, so parent and child cannot disagree
+        about which arm is running. Empty when nothing is installed -- there is then nothing to
+        check against, and the caller falls back to whatever was last attested.
+        """
+        try:
+            from relay.selfimprove import manifest as M
+            from relay.selfimprove import runtime_config as RC
+            path = os.environ.get(RC.OVERRIDE_ENV)
+            if not path or not os.path.isfile(path):
+                return ""
+            with open(path, encoding="utf-8") as fh:
+                return M.harness_id(json.load(fh))
+        except Exception:
+            return ""
+
     def attest(self, manifest):
         """Ask a child which harness it loads, and hand back its answer verbatim.
 
@@ -394,11 +412,24 @@ class FleetAgent:
                    worker.get("reason") or "no reason given"))
         # The per-run attestation is checked here, not only in the preflight: a manifest that
         # was right when we asked and wrong when we ran is exactly the case worth catching.
+        # WHAT THIS PROCESS HAS INSTALLED RIGHT NOW, not what it last attested.
+        #
+        # `_expected_harness_id` was set by attest() and never updated when the arm changed.
+        # The preflight attests the baseline and then the candidate, so it was left holding the
+        # CANDIDATE's id -- and every baseline episode of the real run then failed this check
+        # with "the child ran base but candidate was active", turning the entire baseline arm
+        # into infrastructure. The loop could not close: `no episode ran on both arms`.
+        #
+        # The parent knows what it exported for the arm it is in; the child reports what it
+        # loaded; those two are the pair that must agree. Taking the expectation from the
+        # environment makes it impossible for the two to drift, because there is no second
+        # copy of the answer to go stale.
+        expected = self._active_harness_id() or self._expected_harness_id
         got = (out.get("attest") or {}).get("harness_id")
-        if self._expected_harness_id and got != self._expected_harness_id:
+        if expected and got != expected:
             raise FleetContractError(
-                "the child ran under harness %s but %s was active when the arm began"
-                % (str(got)[:12], self._expected_harness_id[:12]))
+                "the child ran under harness %s but this process has %s installed for the "
+                "arm in flight" % (str(got)[:12], str(expected)[:12]))
         return out.get("reply", "")
 
     # -- internals -----------------------------------------------------------------------
