@@ -10,7 +10,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from relay.relay_fleet import RelayWorker
+from relay.relay_fleet import NET_RETRY_WINDOW_S, RelayWorker
 from relay.copilot_autopilot_relay import (
     transient_backoff, RETRY_INITIAL_DELAY, RETRY_MAX_DELAY,
 )
@@ -63,17 +63,33 @@ def main():
     w._begin_send()
     check("send_succeeds_after_retries", w.status == "waiting" and w.turn == 1)
 
-    # 2. send failures exhaust the budget -> STUCK
+    # 2. send failures: the budget is a WALL-CLOCK WINDOW, not a count.
+    #
+    # This asserted "terminal after max_transient retries" and had been failing since the
+    # budget was deliberately changed: a small count exhausted during a brief devtunnel
+    # outage and ended every worker, so the transport path now rides out NET_RETRY_WINDOW_S
+    # and gives up only if the failure PERSISTS past it. The count still applies to an
+    # agent-reported STUCK, where re-prompting a model that says it cannot proceed is not
+    # riding out anything -- see check 3.
+    import time as _t
     w = RelayWorker("g", "w1", max_transient=2)
     w.drv = FailSendDriver(fails=99)
     w.status = "ready"
     for _ in range(5):
         w._cooldown_until = 0
-        if w.status in ("stuck",):
-            break
         w._begin_send()
-    check("send_budget_exhausted_stuck", w.status == "stuck" and w.outcome == "STUCK"
-          and "after 2 retries" in (w.reason or ""))
+    check("send_keeps_retrying_inside_the_window",
+          w.status == "ready" and w.transient >= 3 and w.outcome is None)
+
+    # and gives up once the failure has outlived the window
+    w = RelayWorker("g", "w1b", max_transient=2)
+    w.drv = FailSendDriver(fails=99)
+    w.status = "ready"
+    w._begin_send()
+    w.first_transient_ts = _t.time() - (NET_RETRY_WINDOW_S + 60)
+    w._cooldown_until = 0
+    w._begin_send()
+    check("send_budget_exhausted_stuck", w.status == "stuck" and w.outcome == "STUCK")
 
     # 3. agent STUCK is retried with the RETRY nudge, then terminal at the budget
     w = RelayWorker("g", "w2", max_transient=2)
@@ -103,10 +119,18 @@ def main():
     w._count_before = 0
     term = w.poll()
     check("timeout_retry", w.status == "ready" and w.transient == 1 and term is False)
+    # Same correction as check 2: a turn timeout is a transport symptom, so it rides out the
+    # window rather than a count. Terminal is what happens once the stalls OUTLIVE the window.
     w._cooldown_until = 0
     w.status = "waiting"; w._t_send = time.time() - 100
     term = w.poll()
-    check("timeout_terminal", w.status == "stuck" and w.outcome == "STUCK")
+    check("timeout_keeps_retrying_inside_the_window",
+          w.status == "ready" and w.outcome is None and term is False)
+    w.first_transient_ts = time.time() - (NET_RETRY_WINDOW_S + 60)
+    w._cooldown_until = 0
+    w.status = "waiting"; w._t_send = time.time() - 100
+    term = w.poll()
+    check("timeout_terminal_past_the_window", w.status == "stuck" and w.outcome == "STUCK")
 
     # 6. backoff schedule is Claude-Code/SDK-style exponential with jitter (widening intervals)
     #    base (pre-jitter) = min(0.5 * 2**(n-1), 8). Jitter only ever SHORTENS (by <=25%), so

@@ -2321,7 +2321,22 @@ class RelayWorker:
             # Under load, an agent STUCK is usually a downstream symptom of a transient
             # tool/network failure (the agent couldn't write a file etc.). Retry the turn
             # (re-prompt to try the tools again) before giving up, up to the budget.
-            if self._retry_transient():
+            #
+            # AND THE COUNT IS THE BUDGET HERE, which it had stopped being. `_retry_transient`
+            # was changed from a count to a 30-minute wall-clock window -- correct for a
+            # transport failure, where a short count exhausted during a brief outage and
+            # "ended everything". It is not correct for a model saying it is stuck: with the
+            # backoff capped near 8s, that window is ~225 re-prompts of an agent that has
+            # already told us it cannot proceed. Meanwhile `max_transient` survived only
+            # inside the message, which printed "retry 3/2" against a limit that limited
+            # nothing.
+            #
+            # That mattered beyond this loop. `max_transient` is fed by the evolution
+            # manifest's `max_retries`, described there as "transient-retry budget per
+            # worker" -- so the self-improvement loop could tune a parameter with no effect
+            # and measure the noise. Transport retries keep the window; this one keeps the
+            # count, which is what both the name and the manifest already claimed.
+            if self.transient < self.max_transient and self._retry_transient():
                 self.job = self._task_anchor(RETRY_JOB)
                 self.reason = "STUCK -> transient retry %d/%d" % (self.transient, self.max_transient)
                 return

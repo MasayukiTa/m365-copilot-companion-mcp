@@ -98,12 +98,22 @@ PARAMETER_TYPES = {
 # missing knob -- it invites experiments that cannot possibly measure anything.
 DEFAULT_PARAMETERS = {
     "max_refute_passes": 2,       # -> relay_fleet: how many refuter passes a candidate gets
-    # 10, NOT 3 -- this is the value run_relay_fleet had in its signature before the manifest
-    # became the source of it. Writing 3 here silently cut the fleet's transient-retry budget
-    # to a third for every production run, with no manifest configured and nothing to see in
-    # a diff of the fleet. THE BASE MANIFEST MUST REPRODUCE CURRENT PRODUCTION EXACTLY, or
-    # adopting it is itself an unreviewed change to the product.
-    "max_retries": 10,            # -> relay_fleet: transient-retry budget per worker
+    # -> relay_fleet: how many times an AGENT-REPORTED STUCK is re-prompted before the
+    # worker goes terminal. Transport failures (send, turn timeout) are NOT bounded by
+    # this -- they ride out NET_RETRY_WINDOW_S, because a short count exhausted during a
+    # brief outage and ended every worker.
+    #
+    # It said "transient-retry budget per worker" and was reaching nothing but a display
+    # string: `max_transient` survived only inside "retry %d/%d", which printed "3/2"
+    # against a limit that limited nothing. A genome coordinate with no effect is worse
+    # than a missing one -- the loop tunes it, measures noise, and can KEEP the result.
+    #
+    # 10, NOT 3 -- the value run_relay_fleet had in its signature before the manifest
+    # became the source of it. Writing 3 would silently cut the budget to a third for
+    # every production run, with nothing to see in a diff of the fleet. THE BASE
+    # MANIFEST MUST REPRODUCE CURRENT PRODUCTION EXACTLY, or adopting it is itself an
+    # unreviewed change to the product.
+    "max_retries": 10,
     "memory_max_items": 5,        # -> project_memory: how much history is primed into a goal
 }
 

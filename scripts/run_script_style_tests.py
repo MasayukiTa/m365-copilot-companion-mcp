@@ -11,7 +11,9 @@ That was not a small gap. `relay/test_acceptance.py` alone runs 20 checks; the t
 together run several hundred, covering the relay loop, the planner, the watchdog, transient
 retry, and the unlock injection path. And four of them were RED, with seven failing checks
 nobody had seen -- including a kill-switch that never engaged, so a loop asked to abort ran
-to completion and finished STUCK. That one is fixed; three files and six checks remain.
+to completion and finished STUCK, and a per-worker retry budget that bounded nothing
+while the evolution loop was free to tune it. Those are fixed; two files and three
+checks remain.
 
 WHY A BASELINE RATHER THAN JUST FAILING
 
@@ -41,8 +43,6 @@ ROOT = Path(__file__).resolve().parent.parent
 #: failing checks, for whoever picks this up:
 #:
 #:   relay/test_fleet_verify.py   timeout_salvaged_done, timeout_fail_stays_stuck
-#:   relay/test_transient.py      send_budget_exhausted_stuck, agent_stuck_terminal,
-#:                                timeout_terminal
 #:   relay/test_unlock_inject.py  transcript_has_redaction_marker -- asserts a marker
 #:                                "<redacted-unlock-password>" that no code has ever
 #:                                emitted; the shared redactor writes "<redacted>". The
@@ -66,7 +66,7 @@ SUITES = {
     "relay/test_refuter_memory.py": None,
     "relay/test_relay_loop.py": None,
     "relay/test_repo_map.py": None,
-    "relay/test_transient.py": 12,
+    "relay/test_transient.py": None,
     "relay/test_unlock_inject.py": 17,
     "relay/test_watchdog.py": None,
 }
