@@ -212,6 +212,7 @@ jobs:
             relay/selfimprove/test_l2_cron.py \
             relay/selfimprove/test_parameters_have_effect.py \
             relay/selfimprove/test_reviewer_allocation.py \
+            relay/selfimprove/test_episode_record.py \
             relay/selfimprove/test_policy.py \
             relay/selfimprove/test_propose.py \
             relay/selfimprove/test_quality.py \

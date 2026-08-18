@@ -251,3 +251,36 @@ if __name__ == "__main__":
     test_write_json_writes_valid_feed()
     test_cli_json_mode_importable_and_callable()
     print("ALL DASHBOARD TESTS PASSED")
+
+
+# ---- §21 は、人が数を読む場所で効く ---------------------------------------------------------
+
+def test_a_gain_is_not_presented_as_claimable_when_the_state_does_not_say():
+    """注釈の無い gain こそ規則が扱っている当のもの。沈黙は許可ではない。"""
+    from relay.selfimprove.dashboard import render_text
+    got = render_text({"summary": {"latest_ab": {"net_pp": 6.2, "p": 0.18,
+                                                 "verdict": "suggestive", "keep": False}}})
+    assert "claimable     : NO" in got
+
+
+def test_a_gain_from_the_optimisation_pool_says_so():
+    """最適化に使った当のデータから出た数は、適合の推定。"""
+    from relay.selfimprove.dashboard import render_text
+    got = render_text({"summary": {"pools": ["evolution"],
+                                   "latest_ab": {"net_pp": 6.2, "keep": True}}})
+    assert "claimable     : NO" in got and "optimiser's own feedback" in got
+
+
+def test_a_gain_from_a_fresh_held_out_pool_is_claimable():
+    from relay.selfimprove.dashboard import render_text
+    got = render_text({"summary": {"pools": ["sealed"], "pool_reads": {"sealed": 1},
+                                   "latest_ab": {"net_pp": 6.2, "keep": True}}})
+    assert "claimable     : yes" in got
+
+
+def test_a_burned_held_out_pool_stops_being_claimable():
+    """3回覗いた sealed は、2回目の時点で最適化フィードバックに変わっている。"""
+    from relay.selfimprove.dashboard import render_text
+    got = render_text({"summary": {"pools": ["sealed"], "pool_reads": {"sealed": 3},
+                                   "latest_ab": {"net_pp": 6.2, "keep": True}}})
+    assert "claimable     : NO" in got and "second look" in got

@@ -318,6 +318,21 @@ def render_text(state) -> str:
     else:
         lines.append("latest A/B    : n/a")
 
+    # SECTION 21, AT THE PLACE A HUMAN READS THE NUMBER. The A/B line above shows a net
+    # percentage-point gain and says nothing about which pool produced it or whether that
+    # pool has been looked at often enough to have become optimisation feedback. A gain read
+    # off the data used to tune the harness estimates fit, not generalisation, and the line
+    # above is where that gets forgotten.
+    #
+    # Fails to "no" when the state does not say. An unannotated gain is exactly the thing the
+    # rule is about, so silence has to read as "cannot claim" rather than as permission.
+    from relay.selfimprove import episode_record as _ER
+    _pools = summary.get("pools") or []
+    _claim = _ER.may_claim_improvement(
+        [{"pool": p} for p in _pools], pool_reads=summary.get("pool_reads") or {})
+    lines.append("claimable     : %s -- %s"
+                 % ("yes" if _claim["may_claim"] else "NO", _claim["reason"]))
+
     lines.append("burned total  : %d" % int(summary.get("burned_total") or 0))
     lines.append("archive count : %d" % int(summary.get("archive_count") or 0))
 
