@@ -153,42 +153,26 @@ jobs:
             bench/test_review_resilience.py \
             bench/test_review_run.py \
             bench/test_swe_check_feedback.py \
-            relay/test_acceptance.py \
             relay/test_admission.py \
-            relay/test_autoscale.py \
             relay/test_bestofn.py \
             relay/test_bestofn_run.py \
-            relay/test_code_task.py \
             relay/test_conversation_start_label.py \
             relay/test_confidence.py \
-            relay/test_continue_escalation.py \
             relay/test_edge_auth.py \
             relay/test_edge_rehide_guard.py \
             relay/test_execution_profiles.py \
-            relay/test_feedback.py \
             relay/test_fleet_reaper.py \
-            relay/test_fleet_runner_fixes.py \
-            relay/test_fleet_refute.py \
             relay/test_fleet_resume.py \
-            relay/test_fleet_verify.py \
-            relay/test_folder_verify.py \
-            relay/test_forge.py \
             relay/test_local_job_store.py \
             relay/test_local_loop_controller.py \
             relay/test_network_recovery.py \
-            relay/test_planner.py \
-            relay/test_project_memory.py \
             relay/test_provenance.py \
-            relay/test_recycle.py \
-            relay/test_refuter.py \
             relay/test_reply_settle.py \
             relay/test_skill_invalid_reporting.py \
-            relay/test_refuter_memory.py \
-            relay/test_relay_loop.py \
-            relay/test_repo_map.py \
             relay/test_response_independent_send.py \
             relay/test_send_never_submits_empty.py \
             relay/test_fleet_settle.py \
+            relay/test_refuter_settle.py \
             relay/test_settle.py \
             relay/test_settle_survives_placeholder.py \
             relay/test_settle_replay.py \
@@ -200,9 +184,6 @@ jobs:
             relay/test_stuck_tool_health.py \
             relay/test_task_router.py \
             relay/test_theme_memory.py \
-            relay/test_transient.py \
-            relay/test_unlock_inject.py \
-            relay/test_watchdog.py \
             relay/selfimprove/test_apply.py \
             relay/selfimprove/test_archive.py \
             relay/selfimprove/test_calibration.py \
@@ -236,6 +217,13 @@ jobs:
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py
+
+      # 21 files sat in the pytest list above defining no test_* function. pytest imported
+      # them, collected nothing, and CI reported green over several hundred checks it had
+      # never executed -- four of them red. They run here, as the scripts they are, with
+      # their current results held to a recorded baseline.
+      - name: Run script-style suites
+        run: python scripts/run_script_style_tests.py
 
   windows-install-smoke:
     runs-on: windows-latest

@@ -18,6 +18,8 @@ from __future__ import annotations
 import os
 import re
 
+from relay import settle as _settle
+
 REFUTER_INSTRUCTION = (
     "あなたは厳格なレビュアーです。別のエージェントが下記のゴールに対して『完了(DONE)』と"
     "報告しました。あなたの仕事は、その完了を鵜呑みにせず、ゴールが本当には達成されていない"
@@ -276,6 +278,7 @@ class RefuterSession:
         self._t_send = None
         self._last = None
         self._stable_since = None
+        self._settle_state = _settle.SettleState()
         self._nudges_used = 0
         self._pending_open = True  # side-page not opened yet -- deferred until there's free RAM
         self._done = None          # verdict tuple once finished
@@ -343,6 +346,7 @@ class RefuterSession:
         self._count_before = 0
         self._last = None
         self._stable_since = None
+        self._settle_state = _settle.SettleState()
         self._pending_open = True
         # Reset the timeout window: time spent disconnected is not reviewer latency.
         self._t_send = time.time()
@@ -386,10 +390,45 @@ class RefuterSession:
             if self.drv._answers().count() <= self._count_before:
                 return None
             t = self.drv.read_last_response()
+            if _settle.unified():
+                # THE WEAKEST OF THE FOUR, and the one with the most to gain. This loop has
+                # no sample requirement and no marker concept at all: it waits one dwell and
+                # commits. A refutation still being written can therefore be parsed as a
+                # verdict, and this session is the SELECTOR in best-of-N -- the component
+                # this project's own notes call the ceiling on output quality.
+                #
+                # The marker is "a verdict can be extracted". That is the right analogue of
+                # a protocol tail here: a reply whose verdict does not parse is either
+                # preamble or unfinished, and both want the longer settle. The existing
+                # UNCLEAR-then-nudge path is unchanged and still runs after acceptance --
+                # it answers a DIFFERENT question ("the model would not commit") from the
+                # one the marker asks ("has the text stopped moving").
+                state = getattr(self, "_settle_state", None) or _settle.SettleState()
+                state, outcome = _settle.settle_step(
+                    state, t, now=time.time(), dwell_s=self.dwell_s, generating=False,
+                    is_processing=_is_processing(t),
+                    has_marker=lambda text: parse_verdict(text)[0] != "UNCLEAR")
+                self._settle_state = state
+                self._last, self._stable_since = state.last, state.stable_since
+                if outcome != _settle.ACCEPT:
+                    return None
+                if getattr(self.drv, "_is_stale_repeat", lambda _t: False)(t):
+                    return None
+                verdict = parse_verdict(t)
+                if verdict[0] == "UNCLEAR" and self._nudges_used < self.max_nudges:
+                    self._nudge()
+                    return None
+                accept = getattr(self.drv, "_accept_new_reply", None)
+                if callable(accept):
+                    accept(t)
+                self._finish(verdict)
+                return self._done
             if _is_processing(t):
                 self._last, self._stable_since = None, None
                 return None
             if t == self._last:
+                # LEGACY: one dwell, no samples, no marker doubling. Left exactly as it was
+                # -- the gated path above is the change under test.
                 if self._stable_since and (time.time() - self._stable_since) >= self.dwell_s:
                     # This poll loop bypasses CopilotWebDriver.wait_for_idle -- apply the
                     # same cross-turn correspondence guard directly (see its docstring): a
@@ -424,6 +463,10 @@ class RefuterSession:
             self.drv.send(_next_refuter_nudge(self._nudges_used))
             self._t_send = time.time()
             self._last, self._stable_since = None, None
+            # A nudge is a NEW turn. Carrying stability across it would let the settle
+            # accumulated on the preamble count toward accepting the answer to a question
+            # that had not been asked yet.
+            self._settle_state = _settle.SettleState()
         except Exception:
             self._finish(("UNCLEAR", ""))
 

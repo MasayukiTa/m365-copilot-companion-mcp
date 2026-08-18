@@ -108,11 +108,68 @@ def listed_tests() -> set[str]:
     ))
 
 
+def defines_no_pytest_tests(path: Path) -> bool:
+    """True when pytest would collect ZERO items from this file.
+
+    Parsed rather than executed: importing a test module to ask what is in it runs whatever
+    it does at import time, which for a script-style suite is the suite.
+
+    THIS IS THE CHECK THAT WAS MISSING. 21 of 166 listed files defined no test_* function.
+    pytest imported them, collected nothing, and CI stayed green over several hundred checks
+    it had never run -- four of the files were red. "Listed in CI" and "run by CI" had
+    quietly stopped meaning the same thing, and nothing said so.
+    """
+    import ast
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False        # unparseable is a different problem; pytest will say so loudly
+    # WALKED, NOT JUST THE MODULE BODY. The first version looked at top-level defs and
+    # `Test*` classes only, and flagged two files that pytest collects perfectly well:
+    # `unittest.TestCase` subclasses are collected whatever they are named, so
+    # `class LedgerTests(unittest.TestCase)` is 7 real tests that the check called hollow.
+    # An audit with false positives gets an exception list bolted onto it, and then it is
+    # the exception list rather than the audit.
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and node.name.startswith("test"):
+            return False
+        if isinstance(node, ast.ClassDef):
+            if node.name.startswith("Test"):
+                return False
+            for base in node.bases:
+                name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "")
+                if "TestCase" in str(name):
+                    return False
+    return True
+
+
+def script_style_suites() -> set[str]:
+    """The files the script-style runner actually executes.
+
+    Read from that module rather than duplicated here, so a file cannot be declared
+    script-style in one place and forgotten in the other -- which would recreate the gap
+    with a different name on it.
+    """
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_sst", ROOT / "scripts" / "run_script_style_tests.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return set(mod.SUITES)
+    except Exception:
+        return set()
+
+
 def main() -> int:
     discovered = discover_tests()
     listed = listed_tests()
     excluded = set(EXCLUDED)
-    missing = sorted(discovered - listed - excluded)
+    # Covered by the script-style runner rather than by pytest. Read from that module, not
+    # restated here -- a second copy of the list is a second place for it to go stale.
+    scripted_early = script_style_suites()
+    missing = sorted(discovered - listed - excluded - scripted_early)
     stale_listed = sorted(path for path in listed if not (ROOT / path).is_file())
     stale_excluded = sorted(excluded - discovered)
 
@@ -134,7 +191,35 @@ def main() -> int:
               "pass pytest an argument called 'n':")
         for line in welded:
             print("  -", line)
-    if missing or stale_listed or stale_excluded or welded:
+    # A LISTED FILE THAT COLLECTS NOTHING IS NOT A TEST THAT RUNS.
+    scripted = scripted_early
+    hollow = sorted(p for p in listed
+                    if (ROOT / p).is_file() and defines_no_pytest_tests(ROOT / p)
+                    and p not in scripted and p not in excluded)
+    if hollow:
+        print("ERROR: listed under the pytest step but defines no test_* function, so pytest "
+              "collects zero items and CI runs none of it:")
+        for path in hollow:
+            print("  -", path)
+        print("  Either give it test_* functions, or add it to "
+              "scripts/run_script_style_tests.py so it is executed as a script.")
+
+    # And the converse: a script-style file must not ALSO sit in the pytest list, where it
+    # contributes nothing and reads as covered.
+    double = sorted(scripted & listed)
+    if double:
+        print("ERROR: run as a script AND listed under pytest, where it collects nothing and "
+              "reads as covered:")
+        for path in double:
+            print("  -", path)
+
+    orphan = sorted(p for p in scripted if not (ROOT / p).is_file())
+    if orphan:
+        print("ERROR: the script-style runner names files that do not exist:")
+        for path in orphan:
+            print("  -", path)
+
+    if missing or stale_listed or stale_excluded or welded or hollow or double or orphan:
         return 1
 
     # Untracked test files are not required yet -- they are genuinely not in the CI checkout,

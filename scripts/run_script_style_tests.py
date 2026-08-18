@@ -1,0 +1,128 @@
+"""Run the test files pytest collects NOTHING from, and hold their results to a baseline.
+
+WHY THIS EXISTS
+
+21 of the 166 files listed in CI's pytest step defined no `test_*` function. They are
+script-style suites -- they build their own `results` list, print `=== N/M checks passed ===`
+and exit non-zero on failure -- and pytest imports them, collects zero items, and moves on.
+CI was green. It had never executed them.
+
+That was not a small gap. `relay/test_acceptance.py` alone runs 20 checks; the twenty files
+together run several hundred, covering the relay loop, the planner, the watchdog, transient
+retry, and the unlock injection path. And four of them were RED, with eight failing checks
+nobody had seen -- including a kill-switch that reports STUCK where the suite expects
+ABORTED.
+
+WHY A BASELINE RATHER THAN JUST FAILING
+
+Turning CI red on eight pre-existing failures would make it stop being read, which is how
+this happened in the first place. Turning them off would repeat the original mistake with
+extra steps. So each file carries the number of checks that pass TODAY:
+
+  * a file expected to pass completely must exit 0. No baseline, no leniency.
+  * a file with known failures must produce EXACTLY its recorded count. Fewer is a
+    regression. More is someone having fixed something, which is good news and still fails
+    -- because a baseline that silently shrinks stops being a record of anything.
+
+The recorded numbers are a debt, not a decision. Every one of them is a real failing check.
+"""
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+#: path -> expected passing checks, or None for "must pass completely".
+#:
+#: The four with numbers are the ones that were already failing when CI first ran them
+#: (2026-08-18). Their failing checks, for whoever picks this up:
+#:
+#:   relay/test_fleet_verify.py   timeout_salvaged_done, timeout_fail_stays_stuck
+#:   relay/test_relay_loop.py     killswitch (outcome STUCK, suite expects ABORTED)
+#:   relay/test_transient.py      send_budget_exhausted_stuck, agent_stuck_terminal,
+#:                                timeout_terminal
+#:   relay/test_unlock_inject.py  transcript_has_redaction_marker -- asserts a marker
+#:                                "<redacted-unlock-password>" that no code has ever
+#:                                emitted; the shared redactor writes "<redacted>". The
+#:                                password itself IS removed, so this is a stale
+#:                                expectation rather than a leak.
+SUITES = {
+    "relay/test_acceptance.py": None,
+    "relay/test_autoscale.py": None,
+    "relay/test_code_task.py": None,
+    "relay/test_continue_escalation.py": None,
+    "relay/test_feedback.py": None,
+    "relay/test_fleet_refute.py": None,
+    "relay/test_fleet_runner_fixes.py": None,
+    "relay/test_fleet_verify.py": 15,
+    "relay/test_folder_verify.py": None,
+    "relay/test_forge.py": None,
+    "relay/test_planner.py": None,
+    "relay/test_project_memory.py": None,
+    "relay/test_recycle.py": None,
+    "relay/test_refuter.py": None,
+    "relay/test_refuter_memory.py": None,
+    "relay/test_relay_loop.py": 8,
+    "relay/test_repo_map.py": None,
+    "relay/test_transient.py": 12,
+    "relay/test_unlock_inject.py": 17,
+    "relay/test_watchdog.py": None,
+}
+
+_COUNT = re.compile(r"===\s*(\d+)\s*/\s*(\d+)[^=]*passed\s*===")
+
+
+def run_one(rel: str, expected):
+    proc = subprocess.run([sys.executable, str(ROOT / rel)], cwd=str(ROOT),
+                          capture_output=True, text=True, timeout=600)
+    out = (proc.stdout or "") + (proc.stderr or "")
+    hit = _COUNT.search(out)
+    passed, total = (int(hit.group(1)), int(hit.group(2))) if hit else (None, None)
+
+    if expected is None:
+        if proc.returncode == 0:
+            return True, "%s ok (%s)" % (rel, "%d/%d" % (passed, total) if hit else "exit 0")
+        tail = "\n      ".join(l for l in out.splitlines() if l.startswith("[FAIL]"))
+        return False, ("%s FAILED (exit %d)\n      %s"
+                       % (rel, proc.returncode, tail or out.strip()[-300:]))
+
+    if passed is None:
+        return False, ("%s has a recorded baseline of %d but printed no count line -- the "
+                       "suite changed shape, so the baseline no longer means anything"
+                       % (rel, expected))
+    if passed == expected:
+        return True, "%s at its recorded baseline (%d/%d; %d known failures)" % (
+            rel, passed, total, total - passed)
+    if passed < expected:
+        return False, ("%s REGRESSED: %d/%d, was %d. Something that used to pass no longer "
+                       "does" % (rel, passed, total, expected))
+    return False, ("%s IMPROVED: %d/%d, baseline says %d. Good news -- update the baseline "
+                   "in this file so it keeps being a record of what is actually broken"
+                   % (rel, passed, total, expected))
+
+
+def main() -> int:
+    bad = []
+    for rel, expected in SUITES.items():
+        if not (ROOT / rel).is_file():
+            bad.append("%s is listed here but does not exist" % rel)
+            continue
+        ok, message = run_one(rel, expected)
+        print(("  " if ok else "  ! ") + message)
+        if not ok:
+            bad.append(message)
+
+    known = sum(1 for v in SUITES.values() if v is not None)
+    print()
+    if bad:
+        print("script-style suites: %d failing" % len(bad))
+        return 1
+    print("script-style suites OK: %d run, %d carrying recorded failures" % (len(SUITES), known))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
