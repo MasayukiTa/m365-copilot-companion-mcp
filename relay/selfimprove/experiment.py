@@ -41,6 +41,11 @@ FINGERPRINT_ENV_KEYS = (
     "MCP_REPLY_SETTLE_INTERVAL_S",
     "MCP_CONSENT_CHAIN_MAX",
     "MCP_SETTLE_TRACE_AFTER_S",
+    # A markerless tail multiplies both the sample count and the dwell. It was a bare `* 2`
+    # in several places, which is how two of them came to disagree about whether the sample
+    # count was doubled at all; making it a constant also made it settable, and a settable
+    # thing that changes when a reply is accepted belongs here.
+    "MCP_MARKERLESS_DWELL_FACTOR",
 )
 
 

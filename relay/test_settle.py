@@ -213,14 +213,66 @@ def test_explain_reports_zero_shortfall_once_the_requirements_are_met():
     assert got["short_by_samples"] == 0 and got["short_by_seconds"] == 0.0
 
 
-# ---- この段階では誰も呼んでいないこと -----------------------------------------------------------
+# ---- 移行の進み具合 --------------------------------------------------------------------------
 
-def test_step_one_leaves_every_existing_call_site_untouched():
-    """手順1は追加のみ。正典サイトの移行は手順2で、そこでの合格条件は
-    `test_reply_settle.py` が無改変で通ること -- 振る舞いが変わったら設計のほうが誤り。"""
-    import subprocess
-    # 語境界つき。`from relay import settle_trace` のような既存の別モジュールが
-    # 部分一致して、移行済みに見えてしまう。
-    out = subprocess.run(["git", "grep", "-lE", r"from relay import settle\b|relay\.settle\b"],
-                         capture_output=True, text=True).stdout.split()
-    assert [p for p in out if not p.endswith("test_settle.py")] == []
+def test_the_canonical_site_uses_this_and_the_others_have_not_moved_yet():
+    """手順2で正典サイトが移行済み。手順3〜5（fleet / refuter / research）は未着手で、
+    それを「まだ」と明示しておく -- 統一の価値は最後のサイトが移るまで実現しない。
+    移行済みの数がこの表と食い違ったら、どちらかが古い。"""
+    import io
+    moved = {"relay/copilot_autopilot_relay.py": True,
+             "relay/relay_fleet.py": False,
+             "relay/refuter.py": False,
+             "relay/agent_profiles.py": False}
+    for path, expected in moved.items():
+        src = io.open(path, encoding="utf-8").read()
+        assert ("_settle.settle_step(" in src) is expected, path
+
+
+# ---- 移行が「振る舞い不変」であるための2性質 ------------------------------------------------
+#
+# どちらも差分レビューで実際に見つかった欠陥。テストが無ければ、次の移行（手順3〜5）で
+# 同じ形が再発しても誰も気づかない。
+
+def test_the_marker_rule_is_not_run_on_polls_that_never_needed_it():
+    """マーカー判定を事前計算して渡すと、placeholder と初出テキストの2種類の
+    ポーリングで走る -- 旧ループが一度も呼んでいなかった場所。呼び出し回数が変わるだけでなく、
+    壊れた読み取りに新しい例外経路を与える。"""
+    calls = []
+
+    def marker(text):
+        calls.append(text)
+        return True
+
+    state = S.SettleState()
+    state, _ = S.settle_step(state, "処理中です。", now=0.0, dwell_s=1.0, generating=False,
+                             is_processing=True, has_marker=marker)
+    assert calls == [], "placeholder でマーカー規則が走った"
+
+    state, _ = S.settle_step(state, "初出の本文", now=1.0, dwell_s=1.0, generating=False,
+                             is_processing=False, has_marker=marker)
+    assert calls == [], "初出テキストでマーカー規則が走った"
+
+    S.settle_step(state, "初出の本文", now=2.0, dwell_s=1.0, generating=False,
+                  is_processing=False, has_marker=marker)
+    assert calls == ["初出の本文"], "安定判定のときだけ一度走る"
+
+
+def test_generating_short_circuits_before_any_predicate_runs():
+    """生成中は権威ある「まだ続いている」信号。他の述語を評価する理由が無い。"""
+    def boom(_text):
+        raise AssertionError("生成中に評価された")
+
+    _, outcome = S.settle_step(S.SettleState(), "x", now=0.0, dwell_s=1.0,
+                               generating=True, is_processing=boom, has_marker=boom)
+    assert outcome == S.RESET
+
+
+def test_the_canonical_loop_records_a_change_exactly_once():
+    """移行時に changed トレースが二重になっていた。collect モードでは1回の変化が
+    2行になり、トレースから再構成した履歴が実際の履歴と食い違う。"""
+    import io
+    src = io.open("relay/copilot_autopilot_relay.py", encoding="utf-8").read()
+    i = src.index("state = _settle.SettleState()")
+    j = src.index("return False", src.index("_accept_new_reply", i))
+    assert src[i:j].count('_settle_trace(self, "changed"') == 1

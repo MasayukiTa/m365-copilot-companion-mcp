@@ -125,7 +125,14 @@ def settle_step(state: SettleState, text, *, now, dwell_s, generating, is_proces
     this is a byte-identical repeat of the previous turn's accepted reply, which is the
     stale-capture signature and needs history this function does not carry.
     """
-    text = "" if text is None else str(text)
+    # None becomes empty; anything already a string is left ALONE. Coercing with `str()`
+    # would rebuild a `str` subclass as a plain one, so the next poll would compare the new
+    # value against a different object than the caller handed over -- a reset where the
+    # caller's own equality would have said "unchanged".
+    if text is None:
+        text = ""
+    elif not isinstance(text, str):
+        text = str(text)
     if _predicate(generating, text, name="generating"):
         return SettleState(), RESET
 

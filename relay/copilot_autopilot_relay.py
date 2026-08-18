@@ -79,6 +79,7 @@ def conversation_start_label(worker_name: str = "", now: datetime | None = None)
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+from relay import settle as _settle                     # the one settle rule
 from relay.acceptance import normalize_checks, run_all_blocking  # spec 3-3 verify gate
 from tools.gate_ops import stop_check                     # operator E: kill-switch
 from tools.memory_ops import memory_load, memory_save     # cross-session history
@@ -1642,7 +1643,15 @@ class CopilotWebDriver:
         # While the block still shows a processing placeholder ("処理中です" etc.) OR the
         # agent is still generating (Stop button present), keep waiting -- otherwise we
         # would lock onto a placeholder or a mid-stream partial as the final answer.
-        last, stable_count, stable_since = None, 0, None
+        # THE DECISION LIVES IN relay.settle NOW -- same rule, same numbers. This site was
+        # the canonical one and the pure function was promoted from it unchanged, so the
+        # acceptance criterion for this migration is that test_reply_settle passes without
+        # being touched: if behaviour moved, the function is wrong rather than the site.
+        #
+        # What stays here is everything that needs the driver. The Stop button, the trace,
+        # and `_is_stale_repeat` -- which asks whether this text was already accepted for the
+        # PREVIOUS turn, and so needs history a pure function has no business carrying.
+        state = _settle.SettleState()
         while time.time() < deadline:
             if stop_check().startswith("STOP"):
                 return False
@@ -1654,75 +1663,79 @@ class CopilotWebDriver:
             except Exception:
                 generating = False
             if generating:
-                last, stable_count, stable_since = None, 0, None
+                state = _settle.SettleState()
                 _settle_trace(self, "generating", "", True, 0, None)
                 time.sleep(REPLY_SETTLE_INTERVAL_S)
                 continue
             t = self.read_last_response()
-            if not _is_processing(t) and t != last:
+            # Read from the state BEFORE the step: the traces below report what was known
+            # when the observation was made, not what it became.
+            last, stable_count, stable_since = (state.last, state.stable_count,
+                                                state.stable_since)
+            processing = _is_processing(t)
+            if not processing and t != last:
                 # The text CHANGED since the previous poll. Recorded because a turn that
                 # never settles while the answer looks complete on screen is otherwise
                 # indistinguishable from one that is still streaming.
                 _settle_trace(self, "changed", t, generating, stable_count, stable_since,
                               prev_len=len(last or ""), prev_tail=(last or "")[-60:])
-            if _is_processing(t):
+            # `has_end_marker` goes in as a CALLABLE, so the pure function applies it only in
+            # the branch that needs it. Passing the computed bool instead evaluated it on
+            # placeholders and on the first sighting of new text, where this loop never used
+            # to call it -- which changes how often a marker rule runs and hands a malformed
+            # read a new way to raise, on the two poll kinds that previously could not.
+            state, outcome = _settle.settle_step(
+                state, t, now=time.time(), dwell_s=dwell_s, generating=False,
+                is_processing=processing, has_marker=has_end_marker,
+                samples=REPLY_SETTLE_SAMPLES)
+
+            if outcome == _settle.SKIP:
                 # A placeholder ("処理中です。") or an empty read carries NO information
-                # about the answer -- it is not evidence that the answer changed.
-                # Measured live on 2026-08-10: the last block cycles answer ->
-                # "処理中です。" -> name-only (empty once the prefix is stripped) ->
-                # answer, roughly every 4s, while the Stop button stays absent the whole
-                # time. Each placeholder sample cleared the stability counters, which
-                # needlessly delays a turn that has already finished.
+                # about the answer -- it is not evidence that the answer changed. Measured
+                # live on 2026-08-10: the last block cycles answer -> "処理中です。" ->
+                # name-only (empty once the prefix is stripped) -> answer, roughly every 4s,
+                # while the Stop button stays absent the whole time. Each placeholder sample
+                # cleared the stability counters, which needlessly delays a turn that has
+                # already finished.
                 #
                 # This was originally written up as the cause of a 15-minute hang in the
                 # interactive chat. That was wrong: the bridge was healthy the whole time
-                # and the hang was in the measurement client (it read the SSE stream to
-                # EOF on a keep-alive connection and never saw `event: done`). The
-                # oscillation above is real and was observed directly; the change stands
-                # on that, not on the hang.
+                # and the hang was in the measurement client (it read the SSE stream to EOF
+                # on a keep-alive connection and never saw `event: done`). The oscillation
+                # above is real and was observed directly; the change stands on that.
                 #
-                # So: SKIP the sample instead of resetting. A placeholder still can never
-                # be ACCEPTED (that is this branch's original job and it is unchanged --
-                # `last` is only ever set from a non-processing read below), and a real
-                # mid-stream partial is still caught by the PRIMARY gate above, which
-                # resets on `generating`. Only when generation is demonstrably finished
-                # does a placeholder stop destroying accumulated stability.
-                if generating:
-                    last, stable_count, stable_since = None, 0, None
+                # A placeholder still can never be ACCEPTED -- `state.last` is only ever set
+                # from a non-processing read -- and a real mid-stream partial is still caught
+                # by the PRIMARY gate above, which resets on `generating`.
                 _settle_trace(self, "processing", t, generating, stable_count, stable_since)
-            elif t == last:
-                stable_count += 1
+            elif outcome in (_settle.WAITING, _settle.ACCEPT):
+                # Only reachable when the text is unchanged, which is the one branch the old
+                # loop computed these in.
                 marker_ok = has_end_marker(t)
-                # require a longer settle when the tail carries no protocol marker, in
-                # case the Stop button flickered off between two streamed chunks.
-                need_samples = REPLY_SETTLE_SAMPLES if marker_ok else REPLY_SETTLE_SAMPLES * 2
-                need_dwell = dwell_s if marker_ok else dwell_s * 2.0
-                # NOTE: compare to None, not truthiness -- stable_since is a time.time()
-                # timestamp, and a bare `if stable_since:` treats a legitimate 0.0 as
-                # "unset" and silently keeps `elapsed` pinned at 0.0 forever.
-                elapsed = (time.time() - stable_since) if stable_since is not None else 0.0
-                _settle_trace(self, "stable", t, generating, stable_count, stable_since,
-                              need_samples=need_samples, need_dwell=need_dwell,
-                              elapsed=elapsed, marker=marker_ok)
-                if stable_count >= need_samples and elapsed >= need_dwell:
+                need_samples, need_dwell = _settle.requirements(
+                    dwell_s=dwell_s, has_marker=marker_ok, samples=REPLY_SETTLE_SAMPLES)
+                elapsed = ((time.time() - stable_since)
+                           if stable_since is not None else 0.0)
+                _settle_trace(self, "stable", t, generating, state.stable_count,
+                              state.stable_since, need_samples=need_samples,
+                              need_dwell=need_dwell, elapsed=elapsed, marker=marker_ok)
+                if outcome == _settle.ACCEPT:
                     if self._is_stale_repeat(t):
-                        _settle_trace(self, "stale_repeat", t, generating, stable_count,
-                                      stable_since)
+                        _settle_trace(self, "stale_repeat", t, generating,
+                                      state.stable_count, state.stable_since)
                         # Settled, but byte-identical to the PREVIOUS turn's already-
-                        # accepted answer -- do NOT accept this as the current turn's
-                        # reply (the stale-capture signature). Keep polling; still
-                        # bounded by `timeout_s` above.
+                        # accepted answer -- do NOT accept this as the current turn's reply
+                        # (the stale-capture signature). Keep polling; still bounded by
+                        # `timeout_s` above.
                         time.sleep(REPLY_SETTLE_INTERVAL_S)
                         continue
                     if not marker_ok:
                         print("[relay] accepting marker-less but idle+stable response "
                               "(%.0fs, %d samples) -- no DONE/CONTINUE/STUCK tail"
-                              % (elapsed, stable_count))
+                              % (elapsed, state.stable_count))
                     _settle_trace_label_tail(self)
                     self._accept_new_reply(t)
                     return True
-            else:
-                last, stable_count, stable_since = t, 1, time.time()
             time.sleep(REPLY_SETTLE_INTERVAL_S)
         return False
 
