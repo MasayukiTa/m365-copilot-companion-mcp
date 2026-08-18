@@ -1053,3 +1053,56 @@ def test_a_progress_callback_that_raises_does_not_stop_the_run():
         on_result=lambda row: (_ for _ in ()).throw(RuntimeError("reporter broke")),
         )
     assert out is not None
+
+
+# ---- the delivery tiers must agree with the evidence order --------------------------------
+#
+# `relay.provenance.EVIDENCE_ORDER` states the rule in the abstract: a machine's observation
+# of the final state outranks the solver's account of itself. This suite is where that rule
+# either holds or does not, because delivery grading is the one live place two sources
+# describe the same fact and disagree. Written as a conformance check rather than as prose so
+# the two cannot drift apart silently -- the ordering could be reversed here and every other
+# test in this file would still pass.
+
+def test_a_machine_negative_beats_a_reply_that_looks_engaged():
+    """会話チェックが「このターンは無い」と言い、返信は仕事をしたように読める場合。
+    最終状態の観測が勝たねばならない -- そうでなければ、流暢な返信が配送の証拠になる。"""
+    from relay import provenance as P
+
+    class _Agent:
+        transcript = [{"workdir": "C:/wd", "prompt_in_conversation": False,
+                       "delivery_suspect": False}]
+
+    got = R._delivery_evidence(_Agent(), 0, {}, {}, workdir="C:/wd")
+    assert got["delivery"] == "none"
+    assert got["delivery_source"] == "conversation"
+    assert P.outranks(P.MACHINE_VERIFIER, P.AGENT_INFERENCE), (
+        "実経路がこの順序に従っている以上、順序側が反転したら気づけねばならない")
+
+
+def test_the_reply_is_only_consulted_when_the_machine_says_nothing():
+    """返信由来の信号は最弱層。機械が答えている限り参照されない。"""
+    class _Agent:
+        transcript = [{"workdir": "C:/wd", "delivery_suspect": False}]
+
+    got = R._delivery_evidence(_Agent(), 0, {}, {}, workdir="C:/wd")
+    assert got["delivery"] == "weak" and got["delivery_source"] == "reply"
+    assert got["delivery_confirmed"] is False, (
+        "返信の形だけで配送を confirmed にしてはいけない -- 一度そうなっていた")
+
+
+def test_a_workdir_change_outranks_the_reply_but_not_a_machine_negative():
+    """観測の強さは 会話 > ファイルシステム > 返信。中段だけを確認する。"""
+    class _Agent:
+        transcript = [{"workdir": "C:/wd", "delivery_suspect": True}]
+
+    got = R._delivery_evidence(_Agent(), 0, {}, {"f.txt": "a"}, workdir="C:/wd")
+    assert got["delivery"] == "workdir_only" and got["delivery_source"] == "workdir"
+
+    class _AgentNeg:
+        transcript = [{"workdir": "C:/wd", "prompt_in_conversation": False,
+                       "delivery_suspect": True}]
+
+    got_neg = R._delivery_evidence(_AgentNeg(), 0, {}, {"f.txt": "a"}, workdir="C:/wd")
+    assert got_neg["delivery"] == "none", (
+        "workdir が変わっていても、このターンが会話に無いなら配送されていない")
