@@ -132,3 +132,41 @@ def test_a_single_winner_produces_no_combination():
     ctl = _StubController(["KEEP"])
     out = C.sweep(ctl, evaluate=lambda *a, **k: {}, coords=["memory"])
     assert out["combined"] is None
+
+
+def test_no_single_experiment_moves_more_than_one_coordinate():
+    """Phase 5 の中核要件そのもの: 一度に動かすのは1つ。
+
+    2つ同時に動かした実験は、どちらについても何も教えない -- 差が出ても、どちらの寄与か
+    分からない。掃引の全ての実験を数えて、複数座標を動かしたものは『組合せ』ただ1つで
+    なければならない。組合せは意図的に複数を動かすもので、だからこそ新しい候補として
+    別に評価される。
+    """
+    base = M.base_manifest()
+    ctl = _StubController(["KEEP"] * 20)
+    C.sweep(ctl, lambda m, e: {}, base=base,
+            coords=["max_retries", "memory_max_items"],
+            evidence=[{"kind": "own_measurements", "authority": PROV.AGENT_INFERENCE}])
+    multi = []
+    for call in ctl.calls:
+        moved = M.diff(base, M.apply_genome(base, call["genome"]))
+        if len(moved) > 1:
+            multi.append((call["coord"], sorted(moved)))
+    assert len(multi) <= 1, "1実験で複数座標を動かしている: %s" % multi
+    if multi:
+        assert multi[0][0] == "combined", "組合せ以外が複数座標を動かした: %s" % multi
+
+
+def test_each_coordinate_holds_the_others_at_base():
+    """他を固定していなければ、勝者は前の座標の勝者との相互作用かもしれない。"""
+    base = M.base_manifest()
+    ctl = _StubController(["KEEP", "REJECT", "REJECT", "REJECT"] * 5)
+    C.sweep(ctl, lambda m, e: {}, base=base,
+            coords=["max_retries", "memory_max_items"],
+            evidence=[{"kind": "own_measurements", "authority": PROV.AGENT_INFERENCE}])
+    for call in ctl.calls:
+        if call["coord"] == "combined":
+            continue
+        moved = {c.split(".")[-1] for c in M.diff(base, M.apply_genome(base, call["genome"]))}
+        assert moved <= {call["coord"]}, (
+            "%s の実験が %s も動かしている" % (call["coord"], moved - {call["coord"]}))

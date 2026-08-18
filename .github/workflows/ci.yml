@@ -205,6 +205,7 @@ jobs:
             relay/selfimprove/test_archive.py \
             relay/selfimprove/test_calibration.py \
             relay/selfimprove/test_campaign.py \
+            relay/selfimprove/test_solver_feedback.py \
             relay/selfimprove/test_coreset.py \
             relay/selfimprove/test_harness_tree.py \
             relay/selfimprove/test_scheduler.py \
