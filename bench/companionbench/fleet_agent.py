@@ -450,7 +450,20 @@ class FleetAgent:
         return d, state
 
     def _run_child(self, mode, payload, workdir=None):
+        # THE ARM'S PRIVATE STATE DIRECTORY IS REMOVED WHEN THE CHILD IS DONE. One was created
+        # per child and none were ever removed: a three-repeat run leaves 132 behind, and this
+        # machine had accumulated 520. Individually tiny, which is exactly why it went
+        # unnoticed for so long -- the count is the cost, not the bytes.
         cwd, state = self._arm_state_dir()
+        try:
+            return self._run_child_in(mode, payload, workdir, cwd, state)
+        finally:
+            try:
+                shutil.rmtree(cwd, ignore_errors=True)
+            except Exception:
+                pass
+
+    def _run_child_in(self, mode, payload, workdir, cwd, state):
         env = dict(os.environ)          # MCP_HARNESS_MANIFEST is inherited from _ManifestArm
         # THE SEEDED MEMORY WAS BEING BUILT AND THEN IGNORED. project_memory resolves `.fleet`
         # relative to the CURRENT DIRECTORY, and the child was run in the episode's workdir --

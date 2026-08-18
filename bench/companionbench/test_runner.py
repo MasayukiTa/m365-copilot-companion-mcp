@@ -990,3 +990,32 @@ def test_an_adapter_without_workdir_in_its_rows_still_works():
 
     got = R._delivery_evidence(_Agent(), 0, {}, {}, workdir="C:/mine")
     assert got["delivery"] == "confirmed"
+
+
+def test_an_episode_leaves_no_temporary_directory_behind():
+    """3,656個の一時ディレクトリが1台に溜まっていた。個々は数KBで、だから誰も気づかない。
+
+    痕跡ディレクトリはエピソードごとに1つ作られ、1つも消えていなかった。3反復の走行で
+    66個、測定を続けた機械では数千個になる。問題はバイト数ではなく個数のほう。"""
+    import glob
+    import tempfile as _tf
+
+    tmp = os.path.expandvars(r"%LOCALAPPDATA%\Temp") or _tf.gettempdir()
+
+    def _count():
+        return sum(len(glob.glob(os.path.join(tmp, p)))
+                   for p in ("cb_trace_*", "cb_leakcheck_*"))
+
+    before = _count()
+    for _ in range(3):
+        R.run_episode(_Ep("leakcheck"), _agent, root=_tf.mkdtemp(prefix="leakroot_"))
+    assert _count() <= before, "エピソードが一時ディレクトリを残している"
+
+
+def test_the_evidence_is_still_readable_when_the_directory_is_removed():
+    """最初の修正は __exit__ で消していて、summary() が読む前に証拠を消していた。
+    テスト2件が即座に落ちたので気づけた -- 消す時点は『読み終えた後』でなければならない。"""
+    r = R.run_episode(_Ep("evidence_after_discard"), _agent, root=_tmp())
+    assert "evidence_trace" in r
+    assert isinstance(r["evidence_trace"], dict)
+    assert "present" in r["evidence_trace"]

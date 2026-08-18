@@ -171,6 +171,12 @@ def test_the_seeded_memory_directory_is_actually_used(monkeypatch):
     def fake_run(args, **kw):
         captured["cwd"] = kw.get("cwd")
         captured["state"] = (kw.get("env") or {}).get(PM.STATE_DIR_ENV)
+        # OBSERVED WHILE THE CHILD IS RUNNING, because the directory is removed as soon as it
+        # returns -- one was leaked per child and 520 had accumulated on one machine. The
+        # property under test is unchanged; only the moment it can be seen has moved, and
+        # inside the call is the more honest place anyway: that is when the child sees it.
+        captured["seed_present"] = os.path.isfile(
+            os.path.join(captured["state"] or "", "memory", "INDEX.md"))
 
         class _P:
             returncode = 0
@@ -183,8 +189,9 @@ def test_the_seeded_memory_directory_is_actually_used(monkeypatch):
     a = _agent(memory_seed=_seed())
     a._run_child("attest", None, workdir=tempfile.mkdtemp(prefix="wd_"))
     assert captured["state"], "FLEET_STATE_DIR が渡されていない"
-    assert os.path.isfile(os.path.join(captured["state"], "memory", "INDEX.md"))
+    assert captured["seed_present"], "seed が子に見えていない"
     assert captured["cwd"] != "" and captured["state"].startswith(captured["cwd"])
+    assert not os.path.isdir(captured["cwd"]), "アーム状態ディレクトリが残っている"
 
 
 def test_project_memory_honours_an_explicit_state_root(monkeypatch):
@@ -396,3 +403,19 @@ def test_no_installed_manifest_means_no_expectation_to_check(monkeypatch):
     monkeypatch.delenv(RC.OVERRIDE_ENV, raising=False)
     agent = FleetAgent(agent_url="https://example.invalid/chat/")
     assert agent._active_harness_id() == ""
+
+
+@pytest.mark.parametrize("genome", [None, {"parameters": {"max_retries": 6}}])
+def test_parent_and_child_compute_the_same_id_for_the_same_file(tmp_path, monkeypatch, genome):
+    """置き換えた期待値が、静かな別の不一致になっていないこと。
+
+    親は生の JSON から id を計算し、子は `active_manifest(refresh=True)` から計算する。
+    後者が正規化や既定値の補完をしていれば、同じファイルに対して両者が違う答えを出し、
+    ひとつの不一致を別の不一致に取り替えただけになる。"""
+    man = M.base_manifest() if genome is None else M.apply_genome(M.base_manifest(), genome)
+    path = tmp_path / "m.json"
+    path.write_text(json.dumps(man), encoding="utf-8")
+    monkeypatch.setenv(RC.OVERRIDE_ENV, str(path))
+    parent = FleetAgent(agent_url="https://example.invalid/chat/")._active_harness_id()
+    child = M.harness_id(RC.active_manifest(refresh=True))
+    assert parent == child, "親と子が同じファイルに違う id を付けている"

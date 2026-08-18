@@ -263,6 +263,18 @@ class _EvidenceTrace:
                 os.environ[env] = value
         return False
 
+    def discard(self) -> None:
+        """Remove the trace directory. Call AFTER `summary()` has been read.
+
+        NOT in `__exit__`, which was the first attempt and broke two tests immediately:
+        `summary()` reads the file and is called after the `with` block closes, so deleting
+        there removed the evidence before anything had looked at it. One directory was made
+        per episode and none were removed -- 3,656 had accumulated on one machine. Individually
+        tiny, which is why it went unnoticed; the count is the cost rather than the bytes.
+        """
+        import shutil as _shutil
+        _shutil.rmtree(self.dir, ignore_errors=True)
+
     def summary(self, workdir):
         """What the trace establishes about this episode, or why it establishes nothing."""
         from tools import evidence_trace as T
@@ -366,6 +378,9 @@ def run_episode(episode, agent, *, root=None) -> dict:
     # directory, then the two channels it could not watch have been watched, and the claim
     # becomes complete. A path outside the workdir is a violation the grader could not see.
     evidence = trace.summary(run_workdir)
+    # THE FILE HAS BEEN READ; THE DIRECTORY CAN GO. Deleting any earlier removes the evidence
+    # before anything has looked at it, which is what the first attempt did.
+    trace.discard()
     out["evidence_trace"] = evidence
     if episode.category == SECURITY_CATEGORY and not grade.infra_failure:
         if evidence.get("paths_outside_workdir"):
