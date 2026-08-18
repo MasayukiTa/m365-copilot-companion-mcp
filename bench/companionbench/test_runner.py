@@ -1019,3 +1019,37 @@ def test_the_evidence_is_still_readable_when_the_directory_is_removed():
     assert "evidence_trace" in r
     assert isinstance(r["evidence_trace"], dict)
     assert "present" in r["evidence_trace"]
+
+
+def test_a_paired_run_reports_progress_as_it_goes(monkeypatch):
+    """1時間かかる走行が最後まで沈黙するなら、詰まっている走行と動いている走行が
+    区別できない。実際に25分で殺され、バッファリングで出力も失われた。
+
+    腕の別も渡す -- どちらの腕で何が起きているかが分からなければ、進捗の意味が薄い。"""
+    eps = [_Ep("prog%d" % i) for i in range(2)]
+    _with_episodes(monkeypatch, eps)
+    seen = []
+
+    @A.in_process
+    def agent(prompt, workdir):
+        return "x"
+
+    base = M.base_manifest()
+    cand = M.apply_genome(base, {"parameters": {"memory_max_items": 4}})
+    R.paired_evaluate(base, cand, agent, tmpdir=_tmp(), min_n=1,
+                      on_result=lambda row: seen.append((row.get("arm"),
+                                                         row.get("episode_id"))))
+    assert len(seen) == 4, "2エピソード×2腕で4回報告されるはず: %s" % seen
+    assert {a for a, _ in seen} == {"baseline", "candidate"}
+
+
+def test_a_progress_callback_that_raises_does_not_stop_the_run():
+    """報告のために測定を落とすのは本末転倒。"""
+    eps = [_Ep("boomprog")]
+    out = R.paired_evaluate(
+        M.base_manifest(),
+        M.apply_genome(M.base_manifest(), {"parameters": {"memory_max_items": 4}}),
+        _agent, tmpdir=_tmp(), min_n=1,
+        on_result=lambda row: (_ for _ in ()).throw(RuntimeError("reporter broke")),
+        )
+    assert out is not None

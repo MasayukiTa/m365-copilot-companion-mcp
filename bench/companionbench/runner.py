@@ -914,7 +914,7 @@ class _ManifestArm:
 
 def paired_evaluate(base_manifest, candidate_manifest, agent, *, tmpdir,
                     alpha=0.05, min_n=1, min_pp=0.0, root=None,
-                    allow_identical=False) -> dict:
+                    allow_identical=False, on_result=None) -> dict:
     """Run both arms over the same episodes and return what the controller decides on.
 
     Returns the gate / security / regression / infra structure decision.decide() expects,
@@ -973,8 +973,20 @@ def paired_evaluate(base_manifest, candidate_manifest, agent, *, tmpdir,
         if i % 2:
             first, second = second, first
         for bucket, manifest in (first, second):
+            arm = "baseline" if manifest is base_manifest else "candidate"
             with _ManifestArm(manifest, tmpdir):
-                bucket[ep.episode_id] = run_pool(None, agent, root=root, episodes=[ep])[0]
+                row = run_pool(None, agent, root=root, episodes=[ep])[0]
+            bucket[ep.episode_id] = row
+            # A PAIRED RUN IS TWO EPISODES PER PAIR AND CAN TAKE AN HOUR. Without this it is
+            # silent for the whole of it, and a run that was actually wedged looked identical
+            # to one that was working -- one was killed at 25 minutes with nothing written
+            # down, and its output was lost to buffering as well. Progress that only exists
+            # at the end is progress nobody can act on.
+            if on_result is not None:
+                try:
+                    on_result(dict(row, arm=arm))
+                except Exception:
+                    pass
     base = [base_by[e.episode_id] for e in all_eps]
     cand = [cand_by[e.episode_id] for e in all_eps]
 
