@@ -188,3 +188,76 @@ def to_hypotheses(tallied, *, min_episodes=2) -> list:
                 "genome": None,
             })
     return sorted(out, key=lambda h: -h["raised_by"])
+
+
+# ---------------------------------------------------------------------------------------
+# WHERE, for the quality-diversity map -- Phase 7's missing axis, populated from Phase 6.
+# ---------------------------------------------------------------------------------------
+
+#: Which harness component each feedback field points at. Phase 7 asks the archive to be
+#: organised around reusable failure PATHOLOGY, and the existing axes say what KIND of failure
+#: occurred (functional, side-effect, security) rather than WHERE in the harness it came from.
+#: "a functional failure" is not actionable; "the memory component is recalling the wrong
+#: things" is, and it is the link between the archive and the component sweep -- an archive
+#: that cannot say which component to work on cannot direct Phase 5.
+#:
+#: The mapping is deliberately narrow. Only fields that point at ONE component appear:
+#: `suggested_harness_change` is free text about anything, and guessing a component from it
+#: would manufacture attribution rather than read it.
+FIELD_TO_COMPONENT = {
+    "missing_information": "context",
+    "unnecessary_context": "context",
+    "tool_friction": "tool",
+    "missing_tool_capability": "tool",
+    "confusing_instruction": "instruction",
+    "memory_useful": "memory",
+    "memory_harmful": "memory",
+    "review_overhead": "reviewer",
+}
+
+#: What an episode gets when its feedback names no component -- which is the common case, and
+#: must stay visibly separate from "the harness was fine". A map that silently folded silence
+#: into a real cell would report attribution it does not have, and the archive already has a
+#: written-up incident of exactly that: descriptors resolving to a default collapsed every row
+#: into one cell, and a map with one cell reports maximum quality and no diversity.
+UNATTRIBUTED = "unattributed"
+
+
+def where(entry) -> str:
+    """Which harness component this episode's feedback points at, or `unattributed`.
+
+    ONE component or none. Feedback naming two different components is not evidence that
+    either is at fault -- it is evidence that the solver had several complaints, and picking
+    the first or the loudest would invent a finding. Ties go to `unattributed` for the same
+    reason a coin landing on its edge is not heads.
+
+    `memory_useful` is deliberately in the mapping alongside `memory_harmful`: the axis is
+    WHERE the harness made a difference, not where it went wrong, and a memory component that
+    is carrying an episode is as much a fact about that component as one that is misleading.
+    """
+    named = set()
+    for field, component in FIELD_TO_COMPONENT.items():
+        value = (entry or {}).get(field)
+        if isinstance(value, str):
+            value = [value] if value.strip() else []
+        if value:
+            named.add(component)
+    return named.pop() if len(named) == 1 else UNATTRIBUTED
+
+
+def where_distribution(entries) -> dict:
+    """How the episodes distribute over components, `unattributed` included.
+
+    Reported rather than hidden: if most episodes are unattributed then the WHERE axis is not
+    carrying information yet, and a reader needs to see that before treating the few attributed
+    cells as a map of the harness.
+    """
+    counts = Counter(where(e) for e in (entries or []))
+    total = sum(counts.values())
+    return {
+        "counts": dict(counts),
+        "attributed": total - counts.get(UNATTRIBUTED, 0),
+        "total": total,
+        "attribution_rate": round((total - counts.get(UNATTRIBUTED, 0)) / total, 4)
+        if total else None,
+    }

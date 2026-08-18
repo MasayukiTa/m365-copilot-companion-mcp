@@ -139,3 +139,57 @@ def test_the_prompt_asks_for_the_shape_the_reader_expects():
     for field in F.FIELDS:
         assert field in text, field
     assert "JSON only" in text
+
+
+# ---- WHERE: Phase 7's missing axis, populated from Phase 6 --------------------------------
+
+def test_feedback_naming_one_component_attributes_to_it():
+    """『functional な失敗だった』は行動につながらない。
+    『memory が違うものを思い出している』はつながる -- そしてそれが Phase 5 との接続点。"""
+    assert F.where(_entry("e1", memory_harmful=["recalled last week's schema"])) == "memory"
+    assert F.where(_entry("e2", tool_friction=["paging is awkward"])) == "tool"
+    assert F.where(_entry("e3", missing_information=["no schema"])) == "context"
+    assert F.where(_entry("e4", review_overhead="two rounds for a typo")) == "reviewer"
+
+
+def test_feedback_naming_two_components_attributes_to_neither():
+    """2つ挙がったのは『どちらかが原因』の証拠ではなく『不満が複数あった』の証拠。
+    最初のものや声の大きいものを選ぶのは、所見の捏造。"""
+    both = _entry("e1", memory_harmful=["stale"], tool_friction=["awkward"])
+    assert F.where(both) == F.UNATTRIBUTED
+
+
+def test_silence_is_not_an_attribution():
+    """黙っていることを実在のセルに畳み込むと、持っていない帰属を報告することになる。
+
+    アーカイブには既に同型の事故が記録されている -- 既定値に解決した descriptors が
+    全行を1セルに潰し、1セルの多様性マップは『品質最大・多様性ゼロ』を報告した。"""
+    assert F.where(_entry("e1")) == F.UNATTRIBUTED
+    assert F.where(F.collect("e2", "not json")) == F.UNATTRIBUTED
+
+
+def test_a_useful_memory_is_also_an_attribution():
+    """軸は『どこが悪かったか』ではなく『どこが効いたか』。
+    エピソードを支えている memory は、誤らせている memory と同じくらいその軸の事実。"""
+    assert F.where(_entry("e1", memory_useful=["the prior schema note"])) == "memory"
+
+
+def test_the_distribution_shows_how_much_is_unattributed():
+    """帰属できた数件を『ハーネスの地図』として読む前に、
+    大半が unattributed なら軸がまだ情報を運んでいないことを読者は知る必要がある。"""
+    entries = [_entry("e1", memory_harmful=["x"]),
+               _entry("e2"),
+               _entry("e3", memory_harmful=["x"], tool_friction=["y"])]
+    got = F.where_distribution(entries)
+    assert got["counts"]["memory"] == 1
+    assert got["counts"][F.UNATTRIBUTED] == 2
+    assert got["attributed"] == 1 and got["total"] == 3
+    assert got["attribution_rate"] == round(1 / 3, 4)
+
+
+def test_free_text_is_never_guessed_into_a_component():
+    """`suggested_harness_change` は何についてでも書ける自由記述。
+    そこから component を推測するのは、帰属を読むのではなく作ること。"""
+    assert "suggested_harness_change" not in F.FIELD_TO_COMPONENT
+    assert F.where(_entry("e1", suggested_harness_change="make memory better")) == \
+        F.UNATTRIBUTED
