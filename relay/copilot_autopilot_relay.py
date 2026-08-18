@@ -780,10 +780,19 @@ def _settle_trace_reset(drv, turn_id=""):
 #: genuinely near-perfect on this population and the plan's ~7% belongs to an older build, or
 #: two seconds is simply shorter than the pause this is meant to catch. A stream that resumes
 #: at 2.5 seconds is invisible either way, and nothing in the output distinguishes the cases.
-#: Fifteen polls is roughly eight seconds, comfortably past the dwell production itself
-#: requires, which makes "no change in the tail" a statement about the stream rather than a
-#: statement about how briefly we looked.
-_SETTLE_TRACE_LABEL_TAIL = int(os.environ.get("MCP_SETTLE_TRACE_LABEL_TAIL", "15"))
+#: FORTY POLLS, ABOUT TWENTY SECONDS. It was fifteen (~8s), described as "comfortably past
+#: the dwell production itself requires" -- and the recorded corpus shows production's
+#: markerless dwell was 4.0s, so eight seconds is barely twice it. The offline replay over
+#: that corpus reported zero truncations for both rules, and the honest reading was CANNOT
+#: DECIDE rather than "no difference": the failure being counted is a stream that resumes
+#: after a long pause, so a pause longer than the tail is recorded as "the text never grew".
+#: The blind spot overlapped the target.
+#:
+#: Twenty seconds is five times that dwell, which is the point at which the replay stops
+#: qualifying its own numbers. The cost is real -- roughly twelve extra seconds of DOM reads
+#: per turn, so an hour over a few hundred turns -- and it is paid only in collect mode,
+#: which is off by default and exists to be run deliberately.
+_SETTLE_TRACE_LABEL_TAIL = int(os.environ.get("MCP_SETTLE_TRACE_LABEL_TAIL", "40"))
 
 #: A label the collector can attach to the next turn, so recorded turns can be grouped by what
 #: was ASKED. Twelve prompts cycled ten times is not 120 independent observations -- it is

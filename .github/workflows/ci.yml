@@ -111,6 +111,7 @@ jobs:
             tools/test_auth_stats.py \
             tools/test_tool_probe.py \
             tools/test_skill_registration.py \
+            scripts/test_settle_stage0_replay.py \
             scripts/test_bootstrap.py \
             scripts/test_bootstrap_p2c.py \
             scripts/test_operational_resilience.py \

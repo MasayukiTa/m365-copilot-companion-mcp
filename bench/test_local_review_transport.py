@@ -156,6 +156,20 @@ def test_runtime_terminal_job_is_requeued_but_operator_stop_is_not(tmp_path):
     assert store.get_job_status("deep_operator_0001")["status"] == "CANCELLED"
 
 
+# KNOWN INTERMITTENT (observed 2026-08-18): this test failed in 2 of 3 full-suite runs and
+# passed every time it was run alone or in a small selection. It is not order-dependent in
+# the deterministic sense -- the same serial order both failed and passed -- so the trigger
+# is load.
+#
+# Not yet diagnosed. The leading hypothesis is the fake below: `FakeController.__init__`
+# opens a SECOND `LocalJobStore` on the same sqlite file and writes three turns from inside
+# the constructor, while the coordinator loop holds its own connection and polls on a 1.0s
+# sleep. Under contention a claim or commit there could fail without the assertion seeing
+# why, leaving the job short of DONE. That would be a defect in the harness rather than in
+# the transport, but it has not been confirmed and is written down rather than guessed at.
+#
+# Left failing-under-load rather than skipped: a skip would make the next full run green and
+# the question would stop being asked.
 def test_unexpected_controller_exit_restarts_same_job_until_done(tmp_path, monkeypatch):
     goals = tmp_path / "goals.jsonl"
     goals.write_text(json.dumps(_goal(), ensure_ascii=False) + "\n", encoding="utf-8")

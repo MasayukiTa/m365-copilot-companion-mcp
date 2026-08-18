@@ -1,0 +1,44 @@
+SETTLE STAGE 0 -- OFFLINE REPLAY
+  trace                    .fleet\settle_trace_collect.jsonl
+  parameters               per turn from the trace's own need_dwell/need_samples,
+                           never from a default -- see the note in replay()
+
+POPULATION
+  turns replayed           120
+  ... whose text EVER changed  98
+      A turn whose text never moved cannot exhibit truncation, so it carries no
+      information about the primary endpoint. The informative N is the second
+      number, not the first.
+  independent clusters     12
+      Turns sharing a prompt are not independent observations of the rule; they
+      are repeats of one observation. 120 turns over 12 prompts is 12 clusters, and
+      any interval computed as though N were 120 is too narrow.
+
+PRIMARY -- truncated capture (accepted text != the text the turn settled to)
+  legacy rule              0 / 120
+  unified rule             0 / 120
+  label observation window median 7.7s (min 7.5, max 8.2)
+      THE LABEL IS BLIND PAST THAT WINDOW. The failure being counted is a long
+      streaming pause, so a pause longer than the tail is recorded as 'the text
+      never grew' -- indistinguishable from no pause at all. A zero here is not
+      evidence that truncation does not happen; it is evidence that none was
+      visible within 8 seconds of the accept.
+
+SECONDARY -- where the two rules disagree
+  turns with different accept points  4 / 120
+  legacy never accepted    0
+  unified never accepted   0
+      A turn the unified rule never accepts inside the recorded window is the
+      REGRESSION the plan names: production settled it and the stricter rule would
+      still be waiting. Recorded windows are finite, so this over-counts -- it is a
+      list to investigate, not a verdict.
+
+SIDE EFFECT -- added latency (the plan budgets +1.5s on the median)
+  median  +0.00s   p95  +0.00s   (n=120 paired turns)
+  within the +1.5s budget: yes
+
+VERDICT
+  CANNOT DECIDE on the primary endpoint. The label's observation window is
+  short relative to the pauses that produce the failure, so neither a zero nor
+  a difference would mean what it appears to. Stage 1 is NOT justified by this
+  run; a longer post-accept tail is what would make the corpus answer.
