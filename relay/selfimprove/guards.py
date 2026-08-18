@@ -171,6 +171,26 @@ def significance_gate(on_resolved: Iterable[str], off_resolved: Iterable[str],
     if n < min_n:
         keep, verdict = False, "underpowered"
         reason = "N=%d < min_n=%d; enlarge the fresh slice before deciding" % (n, min_n)
+    elif b == 0 and c == 0:
+        # ZERO DISCORDANT PAIRS CARRY NO INFORMATION, and calling that a verdict on the
+        # candidate is the error this gate exists to prevent, pointing the other way.
+        #
+        # McNemar reads the pairs that DISAGREED; concordant pairs cancel and tell you
+        # nothing about the difference. With b=c=0 the test has no power at all -- "the change
+        # did nothing" and "the sample could not have detected anything" are the same
+        # observation, and only one of them is a statement about the candidate.
+        #
+        # It fell through to `non-positive` before, which reads as "the measurement says this
+        # is not an improvement". A live run produced exactly that: four episodes, all four
+        # passing on both arms, reported as REJECT. The prediction written before the run said
+        # INCONCLUSIVE, and the prediction was right.
+        #
+        # `n < min_n` did not catch it because that counts PAIRS, and four pairs clears any
+        # small threshold. The quantity that has to be large enough is the discordant count.
+        keep, verdict = False, "underpowered"
+        reason = ("N=%d but no pair disagreed (helped 0 / hurt 0): McNemar has nothing to "
+                  "work with, so this says the sample could not detect a difference, not "
+                  "that there is none" % n)
     elif not positive:
         keep, verdict = False, "non-positive"
         reason = "net %+.1f pp is not an improvement" % net_pp

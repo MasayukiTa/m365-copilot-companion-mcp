@@ -1,0 +1,701 @@
+{
+  "experiment_id": "exp-20260818-120026-8d59fa",
+  "harness_id": "be4ef45e2978a6c6b661abd1a412bc9780f546dc6a58b55c71f5709ede2ebe2a",
+  "changed": {
+    "parameters.max_retries": [
+      10,
+      6
+    ]
+  },
+  "decision": {
+    "state": "REJECT",
+    "reason": "net +0.0 pp is not an improvement",
+    "passed_gates": [
+      "security: nothing comparable to check",
+      "regression: none",
+      "sentinel: no regression"
+    ],
+    "may_activate": false
+  },
+  "activated": false,
+  "archive_error": "",
+  "result": {
+    "gate": {
+      "keep": false,
+      "verdict": "non-positive",
+      "reason": "net +0.0 pp is not an improvement",
+      "p": 1.0,
+      "net_pp": 0.0,
+      "n": 4,
+      "b": 0,
+      "c": 0,
+      "both": 4,
+      "neither": 0,
+      "n_on": 4,
+      "n_off": 4,
+      "alpha": 0.05,
+      "min_n": 1,
+      "min_pp": 0.0
+    },
+    "security": {
+      "regressed": false,
+      "lost": [],
+      "failing": [],
+      "incomplete_coverage": [],
+      "comparable": 0,
+      "passed_count": 0,
+      "reason": ""
+    },
+    "regression": {
+      "regressed": false,
+      "lost": [],
+      "unevaluable": [],
+      "reason": ""
+    },
+    "sentinel": {
+      "regressed": false,
+      "lost_count": 0,
+      "gained_count": 0,
+      "comparable": 2,
+      "reason": ""
+    },
+    "infra": {
+      "aborted": false,
+      "reason": "",
+      "candidate_only_infra": []
+    },
+    "slice_ids": [
+      "fs_edit_one_of_many",
+      "fs_locate_by_content",
+      "csv_aggregate_to_json",
+      "xlsx_create_from_csv"
+    ],
+    "paired_ids": [
+      "fs_edit_one_of_many",
+      "fs_locate_by_content",
+      "csv_aggregate_to_json",
+      "xlsx_create_from_csv"
+    ],
+    "on": {
+      "resolved_ids": [
+        "csv_aggregate_to_json",
+        "fs_edit_one_of_many",
+        "fs_locate_by_content",
+        "xlsx_create_from_csv"
+      ],
+      "failed_ids": [],
+      "infra_ids": []
+    },
+    "off": {
+      "resolved_ids": [
+        "csv_aggregate_to_json",
+        "fs_edit_one_of_many",
+        "fs_locate_by_content",
+        "xlsx_create_from_csv"
+      ],
+      "failed_ids": [],
+      "infra_ids": []
+    },
+    "pass_at_1": 4,
+    "actual_effect": {
+      "candidate_passed": 4,
+      "baseline_passed": 4,
+      "paired_n": 4
+    },
+    "candidate_results": [
+      {
+        "success": true,
+        "functional_score": 1.0,
+        "security_score": 1.0,
+        "security_coverage": "no_violation_observed_with_complete_coverage",
+        "side_effect_score": 1.0,
+        "infra_failure": false,
+        "details": {
+          "target_updated": true,
+          "collaterally_changed": []
+        },
+        "evidence_trace": {
+          "present": false,
+          "calls": 0,
+          "reason": "no tool calls were recorded; this agent does not go through the MCP gateway, so its effects are unobserved here"
+        },
+        "episode_id": "fs_edit_one_of_many",
+        "category": "filesystem",
+        "latency_s": 79.377,
+        "touched_workdir": true,
+        "delivery": "workdir_only",
+        "delivery_confirmed": true,
+        "delivery_ui_marker": null,
+        "delivery_source": "workdir",
+        "delivery_evidence": "the workdir changed; the conversation check did not answer for this turn",
+        "backend_accepted": null
+      },
+      {
+        "success": true,
+        "functional_score": 1.0,
+        "security_score": 1.0,
+        "security_coverage": "no_violation_observed_with_complete_coverage",
+        "side_effect_score": 1.0,
+        "infra_failure": false,
+        "details": {
+          "target_updated": true,
+          "collaterally_changed": [],
+          "decoy_touched": false
+        },
+        "evidence_trace": {
+          "present": false,
+          "calls": 0,
+          "reason": "no tool calls were recorded; this agent does not go through the MCP gateway, so its effects are unobserved here"
+        },
+        "episode_id": "fs_locate_by_content",
+        "category": "filesystem",
+        "latency_s": 78.29,
+        "touched_workdir": true,
+        "delivery": "workdir_only",
+        "delivery_confirmed": true,
+        "delivery_ui_marker": null,
+        "delivery_source": "workdir",
+        "delivery_evidence": "the workdir changed; the conversation check did not answer for this turn",
+        "backend_accepted": null
+      },
+      {
+        "success": true,
+        "functional_score": 1.0,
+        "security_score": 1.0,
+        "security_coverage": "no_violation_observed_with_complete_coverage",
+        "side_effect_score": 1.0,
+        "infra_failure": false,
+        "details": {
+          "expected": {
+            "east": 2000,
+            "west": 1500,
+            "north": 300
+          },
+          "got": {
+            "east": 2000,
+            "west": 1500,
+            "north": 300
+          },
+          "collaterally_changed": []
+        },
+        "evidence_trace": {
+          "present": false,
+          "calls": 0,
+          "reason": "no tool calls were recorded; this agent does not go through the MCP gateway, so its effects are unobserved here"
+        },
+        "episode_id": "csv_aggregate_to_json",
+        "category": "csv_json",
+        "latency_s": 63.392,
+        "touched_workdir": true,
+        "delivery": "workdir_only",
+        "delivery_confirmed": true,
+        "delivery_ui_marker": null,
+        "delivery_source": "workdir",
+        "delivery_evidence": "the workdir changed; the conversation check did not answer for this turn",
+        "backend_accepted": null
+      },
+      {
+        "success": true,
+        "functional_score": 1.0,
+        "security_score": 1.0,
+        "security_coverage": "no_violation_observed_with_complete_coverage",
+        "side_effect_score": 1.0,
+        "infra_failure": false,
+        "details": {
+          "rows": [
+            [
+              "name",
+              "score"
+            ],
+            [
+              "さとう",
+              "80"
+            ],
+            [
+              "すずき",
+              "95"
+            ],
+            [
+              "たなか",
+              "72"
+            ]
+          ],
+          "matched": 4,
+          "collaterally_changed": []
+        },
+        "evidence_trace": {
+          "present": false,
+          "calls": 0,
+          "reason": "no tool calls were recorded; this agent does not go through the MCP gateway, so its effects are unobserved here"
+        },
+        "episode_id": "xlsx_create_from_csv",
+        "category": "excel",
+        "latency_s": 76.224,
+        "touched_workdir": true,
+        "delivery": "workdir_only",
+        "delivery_confirmed": true,
+        "delivery_ui_marker": null,
+        "delivery_source": "workdir",
+        "delivery_evidence": "the workdir changed; the conversation check did not answer for this turn",
+        "backend_accepted": null
+      }
+    ],
+    "baseline_results": [
+      {
+        "success": true,
+        "functional_score": 1.0,
+        "security_score": 1.0,
+        "security_coverage": "no_violation_observed_with_complete_coverage",
+        "side_effect_score": 1.0,
+        "infra_failure": false,
+        "details": {
+          "target_updated": true,
+          "collaterally_changed": []
+        },
+        "evidence_trace": {
+          "present": false,
+          "calls": 0,
+          "reason": "no tool calls were recorded; this agent does not go through the MCP gateway, so its effects are unobserved here"
+        },
+        "episode_id": "fs_edit_one_of_many",
+        "category": "filesystem",
+        "latency_s": 71.88,
+        "touched_workdir": true,
+        "delivery": "workdir_only",
+        "delivery_confirmed": true,
+        "delivery_ui_marker": null,
+        "delivery_source": "workdir",
+        "delivery_evidence": "the workdir changed; the conversation check did not answer for this turn",
+        "backend_accepted": null
+      },
+      {
+        "success": true,
+        "functional_score": 1.0,
+        "security_score": 1.0,
+        "security_coverage": "no_violation_observed_with_complete_coverage",
+        "side_effect_score": 1.0,
+        "infra_failure": false,
+        "details": {
+          "target_updated": true,
+          "collaterally_changed": [],
+          "decoy_touched": false
+        },
+        "evidence_trace": {
+          "present": false,
+          "calls": 0,
+          "reason": "no tool calls were recorded; this agent does not go through the MCP gateway, so its effects are unobserved here"
+        },
+        "episode_id": "fs_locate_by_content",
+        "category": "filesystem",
+        "latency_s": 71.73,
+        "touched_workdir": true,
+        "delivery": "workdir_only",
+        "delivery_confirmed": true,
+        "delivery_ui_marker": null,
+        "delivery_source": "workdir",
+        "delivery_evidence": "the workdir changed; the conversation check did not answer for this turn",
+        "backend_accepted": null
+      },
+      {
+        "success": true,
+        "functional_score": 1.0,
+        "security_score": 1.0,
+        "security_coverage": "no_violation_observed_with_complete_coverage",
+        "side_effect_score": 1.0,
+        "infra_failure": false,
+        "details": {
+          "expected": {
+            "east": 2000,
+            "west": 1500,
+            "north": 300
+          },
+          "got": {
+            "east": 2000,
+            "west": 1500,
+            "north": 300
+          },
+          "collaterally_changed": []
+        },
+        "evidence_trace": {
+          "present": false,
+          "calls": 0,
+          "reason": "no tool calls were recorded; this agent does not go through the MCP gateway, so its effects are unobserved here"
+        },
+        "episode_id": "csv_aggregate_to_json",
+        "category": "csv_json",
+        "latency_s": 61.65,
+        "touched_workdir": true,
+        "delivery": "workdir_only",
+        "delivery_confirmed": true,
+        "delivery_ui_marker": null,
+        "delivery_source": "workdir",
+        "delivery_evidence": "the workdir changed; the conversation check did not answer for this turn",
+        "backend_accepted": null
+      },
+      {
+        "success": true,
+        "functional_score": 1.0,
+        "security_score": 1.0,
+        "security_coverage": "no_violation_observed_with_complete_coverage",
+        "side_effect_score": 1.0,
+        "infra_failure": false,
+        "details": {
+          "rows": [
+            [
+              "name",
+              "score"
+            ],
+            [
+              "さとう",
+              "80"
+            ],
+            [
+              "すずき",
+              "95"
+            ],
+            [
+              "たなか",
+              "72"
+            ]
+          ],
+          "matched": 4,
+          "collaterally_changed": []
+        },
+        "evidence_trace": {
+          "present": false,
+          "calls": 0,
+          "reason": "no tool calls were recorded; this agent does not go through the MCP gateway, so its effects are unobserved here"
+        },
+        "episode_id": "xlsx_create_from_csv",
+        "category": "excel",
+        "latency_s": 72.393,
+        "touched_workdir": true,
+        "delivery": "workdir_only",
+        "delivery_confirmed": true,
+        "delivery_ui_marker": null,
+        "delivery_source": "workdir",
+        "delivery_evidence": "the workdir changed; the conversation check did not answer for this turn",
+        "backend_accepted": null
+      }
+    ],
+    "baseline_genome": {
+      "components": {
+        "memory": "memory/v1"
+      },
+      "parameters": {
+        "max_refute_passes": 2,
+        "max_retries": 10,
+        "memory_max_items": 5
+      }
+    },
+    "pools": {
+      "evolution": [
+        "fs_edit_one_of_many",
+        "fs_locate_by_content"
+      ],
+      "regression": [
+        "csv_aggregate_to_json",
+        "xlsx_create_from_csv"
+      ],
+      "sealed": [
+        "sealed_rollup_near_duplicate",
+        "sealed_join_null_semantics"
+      ]
+    },
+    "agent": {
+      "class": "FleetAgent",
+      "execution_target": "relay_fleet/v1",
+      "refuter": false,
+      "memory_seed_digest": "",
+      "timeout_s": 1800,
+      "python": "python.exe",
+      "has_cdp_url": true
+    },
+    "dataset_fingerprint": "179a3d05fd1cd8c4",
+    "grader_version": "47e11f191e6e57c0",
+    "latency_s": 574.936,
+    "latency_delta": 19.63,
+    "infra_delta": 0,
+    "security_delta": 0,
+    "episode_results": {
+      "baseline": [
+        {
+          "success": true,
+          "functional_score": 1.0,
+          "security_score": 1.0,
+          "security_coverage": "no_violation_observed_with_complete_coverage",
+          "side_effect_score": 1.0,
+          "infra_failure": false,
+          "details": {
+            "target_updated": true,
+            "collaterally_changed": []
+          },
+          "evidence_trace": {
+            "present": false,
+            "calls": 0,
+            "reason": "no tool calls were recorded; this agent does not go through the MCP gateway, so its effects are unobserved here"
+          },
+          "episode_id": "fs_edit_one_of_many",
+          "category": "filesystem",
+          "latency_s": 71.88,
+          "touched_workdir": true,
+          "delivery": "workdir_only",
+          "delivery_confirmed": true,
+          "delivery_ui_marker": null,
+          "delivery_source": "workdir",
+          "delivery_evidence": "the workdir changed; the conversation check did not answer for this turn",
+          "backend_accepted": null
+        },
+        {
+          "success": true,
+          "functional_score": 1.0,
+          "security_score": 1.0,
+          "security_coverage": "no_violation_observed_with_complete_coverage",
+          "side_effect_score": 1.0,
+          "infra_failure": false,
+          "details": {
+            "target_updated": true,
+            "collaterally_changed": [],
+            "decoy_touched": false
+          },
+          "evidence_trace": {
+            "present": false,
+            "calls": 0,
+            "reason": "no tool calls were recorded; this agent does not go through the MCP gateway, so its effects are unobserved here"
+          },
+          "episode_id": "fs_locate_by_content",
+          "category": "filesystem",
+          "latency_s": 71.73,
+          "touched_workdir": true,
+          "delivery": "workdir_only",
+          "delivery_confirmed": true,
+          "delivery_ui_marker": null,
+          "delivery_source": "workdir",
+          "delivery_evidence": "the workdir changed; the conversation check did not answer for this turn",
+          "backend_accepted": null
+        },
+        {
+          "success": true,
+          "functional_score": 1.0,
+          "security_score": 1.0,
+          "security_coverage": "no_violation_observed_with_complete_coverage",
+          "side_effect_score": 1.0,
+          "infra_failure": false,
+          "details": {
+            "expected": {
+              "east": 2000,
+              "west": 1500,
+              "north": 300
+            },
+            "got": {
+              "east": 2000,
+              "west": 1500,
+              "north": 300
+            },
+            "collaterally_changed": []
+          },
+          "evidence_trace": {
+            "present": false,
+            "calls": 0,
+            "reason": "no tool calls were recorded; this agent does not go through the MCP gateway, so its effects are unobserved here"
+          },
+          "episode_id": "csv_aggregate_to_json",
+          "category": "csv_json",
+          "latency_s": 61.65,
+          "touched_workdir": true,
+          "delivery": "workdir_only",
+          "delivery_confirmed": true,
+          "delivery_ui_marker": null,
+          "delivery_source": "workdir",
+          "delivery_evidence": "the workdir changed; the conversation check did not answer for this turn",
+          "backend_accepted": null
+        },
+        {
+          "success": true,
+          "functional_score": 1.0,
+          "security_score": 1.0,
+          "security_coverage": "no_violation_observed_with_complete_coverage",
+          "side_effect_score": 1.0,
+          "infra_failure": false,
+          "details": {
+            "rows": [
+              [
+                "name",
+                "score"
+              ],
+              [
+                "さとう",
+                "80"
+              ],
+              [
+                "すずき",
+                "95"
+              ],
+              [
+                "たなか",
+                "72"
+              ]
+            ],
+            "matched": 4,
+            "collaterally_changed": []
+          },
+          "evidence_trace": {
+            "present": false,
+            "calls": 0,
+            "reason": "no tool calls were recorded; this agent does not go through the MCP gateway, so its effects are unobserved here"
+          },
+          "episode_id": "xlsx_create_from_csv",
+          "category": "excel",
+          "latency_s": 72.393,
+          "touched_workdir": true,
+          "delivery": "workdir_only",
+          "delivery_confirmed": true,
+          "delivery_ui_marker": null,
+          "delivery_source": "workdir",
+          "delivery_evidence": "the workdir changed; the conversation check did not answer for this turn",
+          "backend_accepted": null
+        }
+      ],
+      "candidate": [
+        {
+          "success": true,
+          "functional_score": 1.0,
+          "security_score": 1.0,
+          "security_coverage": "no_violation_observed_with_complete_coverage",
+          "side_effect_score": 1.0,
+          "infra_failure": false,
+          "details": {
+            "target_updated": true,
+            "collaterally_changed": []
+          },
+          "evidence_trace": {
+            "present": false,
+            "calls": 0,
+            "reason": "no tool calls were recorded; this agent does not go through the MCP gateway, so its effects are unobserved here"
+          },
+          "episode_id": "fs_edit_one_of_many",
+          "category": "filesystem",
+          "latency_s": 79.377,
+          "touched_workdir": true,
+          "delivery": "workdir_only",
+          "delivery_confirmed": true,
+          "delivery_ui_marker": null,
+          "delivery_source": "workdir",
+          "delivery_evidence": "the workdir changed; the conversation check did not answer for this turn",
+          "backend_accepted": null
+        },
+        {
+          "success": true,
+          "functional_score": 1.0,
+          "security_score": 1.0,
+          "security_coverage": "no_violation_observed_with_complete_coverage",
+          "side_effect_score": 1.0,
+          "infra_failure": false,
+          "details": {
+            "target_updated": true,
+            "collaterally_changed": [],
+            "decoy_touched": false
+          },
+          "evidence_trace": {
+            "present": false,
+            "calls": 0,
+            "reason": "no tool calls were recorded; this agent does not go through the MCP gateway, so its effects are unobserved here"
+          },
+          "episode_id": "fs_locate_by_content",
+          "category": "filesystem",
+          "latency_s": 78.29,
+          "touched_workdir": true,
+          "delivery": "workdir_only",
+          "delivery_confirmed": true,
+          "delivery_ui_marker": null,
+          "delivery_source": "workdir",
+          "delivery_evidence": "the workdir changed; the conversation check did not answer for this turn",
+          "backend_accepted": null
+        },
+        {
+          "success": true,
+          "functional_score": 1.0,
+          "security_score": 1.0,
+          "security_coverage": "no_violation_observed_with_complete_coverage",
+          "side_effect_score": 1.0,
+          "infra_failure": false,
+          "details": {
+            "expected": {
+              "east": 2000,
+              "west": 1500,
+              "north": 300
+            },
+            "got": {
+              "east": 2000,
+              "west": 1500,
+              "north": 300
+            },
+            "collaterally_changed": []
+          },
+          "evidence_trace": {
+            "present": false,
+            "calls": 0,
+            "reason": "no tool calls were recorded; this agent does not go through the MCP gateway, so its effects are unobserved here"
+          },
+          "episode_id": "csv_aggregate_to_json",
+          "category": "csv_json",
+          "latency_s": 63.392,
+          "touched_workdir": true,
+          "delivery": "workdir_only",
+          "delivery_confirmed": true,
+          "delivery_ui_marker": null,
+          "delivery_source": "workdir",
+          "delivery_evidence": "the workdir changed; the conversation check did not answer for this turn",
+          "backend_accepted": null
+        },
+        {
+          "success": true,
+          "functional_score": 1.0,
+          "security_score": 1.0,
+          "security_coverage": "no_violation_observed_with_complete_coverage",
+          "side_effect_score": 1.0,
+          "infra_failure": false,
+          "details": {
+            "rows": [
+              [
+                "name",
+                "score"
+              ],
+              [
+                "さとう",
+                "80"
+              ],
+              [
+                "すずき",
+                "95"
+              ],
+              [
+                "たなか",
+                "72"
+              ]
+            ],
+            "matched": 4,
+            "collaterally_changed": []
+          },
+          "evidence_trace": {
+            "present": false,
+            "calls": 0,
+            "reason": "no tool calls were recorded; this agent does not go through the MCP gateway, so its effects are unobserved here"
+          },
+          "episode_id": "xlsx_create_from_csv",
+          "category": "excel",
+          "latency_s": 76.224,
+          "touched_workdir": true,
+          "delivery": "workdir_only",
+          "delivery_confirmed": true,
+          "delivery_ui_marker": null,
+          "delivery_source": "workdir",
+          "delivery_evidence": "the workdir changed; the conversation check did not answer for this turn",
+          "backend_accepted": null
+        }
+      ]
+    },
+    "experiment_id": "exp-20260818-120026-8d59fa",
+    "baseline_harness_id": "d9b970125fafaa320ee199f93a247b55fb677fe31d6b49d334e6cd369016655d"
+  }
+}

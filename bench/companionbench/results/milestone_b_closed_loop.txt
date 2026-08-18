@@ -1,0 +1,32 @@
+PER-EPISODE PROGRESS
+
+
+ONE FULL TURN OF THE CLOSED LOOP, THROUGH THE CONTROLLER
+
+target        relay_fleet/v1
+genome        {"parameters": {"max_retries": 6}}
+episodes      2 per pool
+elapsed       870s
+
+DECISION      REJECT
+  reason      net +0.0 pp is not an improvement
+
+EVERY GATE REPORTED
+  gate        {"keep": false, "verdict": "non-positive", "reason": "net +0.0 pp is not an improvement", "p": 1.0, "net_pp": 0.0, "n": 4, "b": 0, "c": 0, "both": 4, "neither": 0, "n_on": 4, "n_off": 4, "alpha": 0.05, "min_n": 1, "min_p
+  security    {"regressed": false, "lost": [], "failing": [], "incomplete_coverage": [], "comparable": 0, "passed_count": 0, "reason": ""}
+  regression  {"regressed": false, "lost": [], "unevaluable": [], "reason": ""}
+  sentinel    {"regressed": false, "lost_count": 0, "gained_count": 0, "comparable": 2, "reason": ""}
+  infra       {"aborted": false, "reason": "", "candidate_only_infra": []}
+
+paired_ids    ['fs_edit_one_of_many', 'fs_locate_by_content', 'csv_aggregate_to_json', 'xlsx_create_from_csv']
+
+WHAT THIS SHOWS AND WHAT IT DOES NOT
+  It shows the loop closes: a hypothesis was recorded before the result existed, both
+  arms ran against a target that applies the manifest, every gate answered, and the
+  outcome is one of the named states rather than a pass/fail.
+
+  It does NOT show the genome is an improvement. At this N the honest verdict is
+  INCONCLUSIVE, and a KEEP would have meant the gate is too loose rather than that the
+  change was good. The prediction was written before the run for exactly that reason.
+
+hypothesis ledger entries: 2

@@ -173,7 +173,15 @@ class EvolutionController:
         was sitting in a local variable.
         """
         if self.archive is None:
-            return ""
+            # NOT CONFIGURED IS NOT ARCHIVED. This returned "" -- the same value as success --
+            # so a controller with no archive produced an experiment with no durable record
+            # and nothing said so. The guard below already refuses to ACTIVATE on a write
+            # error; it could not fire here, because an absent archive did not look like one.
+            #
+            # Reported rather than raised: a report-only run without an archive is a
+            # legitimate thing to do (most tests are exactly that), and `may_activate` is what
+            # decides whether the omission matters.
+            return "no archive is configured, so this experiment has no durable record"
         try:
             self.archive.add(
                 {"components": candidate["components"],

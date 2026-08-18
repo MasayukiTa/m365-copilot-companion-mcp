@@ -172,3 +172,43 @@ and 1.1: the numerator counted rows the filesystem vouched for while the denomin
 only rows the conversation check answered, so the two halves were measuring different sets.
 It is 1.000 with the denominator fixed. A rate over one is not a rounding artefact, and it was
 sitting next to figures a reader is asked to trust.
+
+## Milestone B: the loop closes, and running it found three things reading it had not
+
+`milestone_b_closed_loop.txt` -- one full turn through the controller against the fleet, four
+paired episodes, 870 seconds.
+
+    DECISION   REJECT      <- and this was WRONG; see below
+    gate       n=4, b=0, c=0, both=4, neither=0
+    security / regression / sentinel / infra   all reported, no regressions
+    paired_ids 4
+    hypothesis ledger       2 entries (proposed before the result existed, concluded after)
+
+Every stage ran: a hypothesis recorded before any data, both arms against a target that
+applies the manifest, every gate answering, and a named state rather than a pass/fail.
+
+**THE VERDICT WAS WRONG, AND THE PREDICTION CAUGHT IT.** Written before the run: "no change;
+expected verdict INCONCLUSIVE at this N". The loop said REJECT -- "the measurement says the
+change is not an improvement". With b=0 and c=0 not a single pair disagreed, and McNemar reads
+only the pairs that disagree; concordant pairs cancel. So the sample had no power at all, and
+"the change did nothing" and "this sample could not have detected anything" are the same
+observation. Only one of them is a statement about the candidate.
+
+The power check missed it because `n < min_n` counts PAIRS, and four pairs clears any small
+threshold. The quantity that has to be large enough is the DISCORDANT count. Zero discordant
+pairs is now `underpowered`.
+
+Two more, both found by running rather than reading:
+
+  The baseline arm was checking its children against the CANDIDATE's harness id, because the
+  expectation was set by the last preflight attestation and never updated when the arm
+  changed. Every baseline episode became infrastructure and the loop aborted with "no episode
+  ran on both arms". Recorded in the commit history; fixed before the run above.
+
+  A controller with no archive returned the same value as a successful write, so an
+  experiment could be kept -- and activated -- with no durable record and nothing saying so.
+  Three existing tests asserted that behaviour and passed, including one named
+  `test_a_working_archive_still_activates` which had no archive at all.
+
+So Milestone B's pipeline is demonstrated end to end. The one verdict it produced was
+incorrect, is now corrected, and the correction is the reason to write predictions down first.

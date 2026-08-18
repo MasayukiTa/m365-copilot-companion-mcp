@@ -128,3 +128,42 @@ if __name__ == "__main__":
     test_done_after_last_start()
     test_proc_alive()
     print("ALL GUARD TESTS PASSED")
+
+
+# ---------------------------------------------------------------------------
+# Zero discordant pairs is zero information, and must not be reported as a verdict on the
+# candidate. Found by running the closed loop: four episodes, all four passing on BOTH arms,
+# came back as REJECT with "net +0.0 pp is not an improvement". The prediction written before
+# the run said INCONCLUSIVE, and the prediction was right.
+# ---------------------------------------------------------------------------
+
+def test_no_pair_disagreed_is_underpowered_not_a_verdict():
+    """McNemar reads the pairs that DISAGREED; concordant pairs cancel and say nothing.
+
+    With b=c=0 the test has no power at all, so "the change did nothing" and "this sample
+    could not have detected anything" are the same observation -- and only one of them is a
+    statement about the candidate. `n < min_n` did not catch it because that counts PAIRS,
+    and four pairs clears any small threshold; the quantity that must be large enough is the
+    discordant count.
+    """
+    ids = ["a", "b", "c", "d"]
+    got = G.significance_gate(ids, ids, ids, min_n=1)
+    assert got["b"] == 0 and got["c"] == 0
+    assert got["verdict"] == "underpowered", "情報ゼロを候補への判定として報告している"
+    assert got["keep"] is False
+    assert "no pair disagreed" in got["reason"]
+
+
+def test_a_real_disagreement_is_still_judged_normally():
+    """情報ゼロだけを取り除く -- 実際に差が出ているケースの扱いは変えない。"""
+    ids = ["a", "b", "c", "d"]
+    hurt = G.significance_gate(["a", "b"], ["a", "b", "c"], ids, min_n=1)
+    assert hurt["verdict"] == "non-positive"
+    helped = G.significance_gate(["a", "b", "c"], ["a", "b"], ids, min_n=1)
+    assert helped["verdict"] == "suggestive"
+
+
+def test_an_empty_slice_is_still_underpowered_for_the_original_reason():
+    got = G.significance_gate([], [], [], min_n=1)
+    assert got["verdict"] == "underpowered"
+    assert "min_n" in got["reason"]
