@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 import os
 from typing import Iterable
 
@@ -199,7 +200,13 @@ class Archive:
             "ci": ci,
             "gate_verdict": gate_verdict,
             "descriptors": descriptors,
-            "ts": ts,
+            # STAMPED HERE IF THE CALLER DID NOT. Every existing row has `ts: null`,
+            # because the only caller never passed one -- so the durable record of an
+            # experiment could not say when it ran, could not be ordered against
+            # another, and could not be correlated with anything else that happened
+            # that day. A default of "now" is not a guess: the row is being written
+            # now, and an explicit `ts` still wins for a replayed or backfilled entry.
+            "ts": time.time() if ts is None else ts,
         }
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         with open(self.path, "a", encoding="utf-8", newline="\n") as f:

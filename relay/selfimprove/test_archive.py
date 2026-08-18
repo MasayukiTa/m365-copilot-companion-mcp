@@ -162,3 +162,80 @@ if __name__ == "__main__":
     test_qd_map()
     test_select_parent()
     print("ALL ARCHIVE TESTS PASSED")
+
+
+def test_a_row_records_when_it_was_written(tmp_path):
+    """全既存行が `ts: null` だった -- 呼び出し側が一度も渡していなかったため。
+
+    時刻の無い実験記録は、他の実験と順序づけられないし、その日に起きた他の事象と
+    突き合わせることもできない。いま書いているのだから「いま」は推測ではない。"""
+    import time as _t
+    a = A.Archive(path=str(tmp_path / "entries.jsonl"))
+    before = _t.time()
+    a.add({"components": {}, "parameters": {}}, slice_ids=["e1"], pass_at_1=0.5)
+    after = _t.time()
+    import json as _json
+    row = _json.loads((tmp_path / "entries.jsonl").read_text(encoding="utf-8").strip())
+    assert row["ts"] is not None, "時刻の無い行が書かれた"
+    assert before <= row["ts"] <= after
+
+
+def test_an_explicit_timestamp_still_wins(tmp_path):
+    """再生やバックフィルでは、書いた時刻ではなく起きた時刻が正しい。"""
+    a = A.Archive(path=str(tmp_path / "entries.jsonl"))
+    a.add({"components": {}, "parameters": {}}, slice_ids=["e1"], pass_at_1=0.5, ts=1234.5)
+    import json as _json
+    row = _json.loads((tmp_path / "entries.jsonl").read_text(encoding="utf-8").strip())
+    assert row["ts"] == 1234.5
+
+
+# ---------------------------------------------------------------------------
+# Every named state must be REACHABLE, not merely defined. A state in the enum that no input
+# can produce is a promise the loop does not keep, and the way to find out is to construct
+# the input for each rather than to read the branches.
+# ---------------------------------------------------------------------------
+
+def _decide(**kw):
+    from relay.selfimprove import decision as D
+    base = {"gate": {"keep": False, "verdict": "non-positive", "n": 4},
+            "security": {"regressed": False}, "regression": {"regressed": False},
+            "sentinel": {"regressed": False, "comparable": 2},
+            "infra": {"aborted": False}}
+    base.update(kw)
+    return (D.decide(**base) or {}).get("state")
+
+
+def test_every_named_state_is_reachable():
+    import pytest as _pytest
+
+    from relay.selfimprove import decision as D
+
+    wanted = {
+        D.KEEP: dict(gate={"keep": True, "verdict": "positive", "n": 40}),
+        D.REJECT: dict(gate={"keep": False, "verdict": "regression", "n": 40}),
+        D.INCONCLUSIVE: dict(gate={"keep": False, "verdict": "underpowered", "n": 1}),
+        D.INFRA_ABORT: dict(infra={"aborted": True, "reason": "x"}),
+        D.SECURITY_REJECT: dict(security={"regressed": True, "lost": ["s1"]}),
+        D.SENTINEL_REJECT: dict(sentinel={"regressed": True, "comparable": 2}),
+        D.REGRESSION_REJECT: dict(regression={"regressed": True, "lost": ["r1"]}),
+        # ONLY WHEN ACTIVATING. Incomplete evidence is worth reporting on any run and worth
+        # STOPPING only when something is about to be switched on -- so this state is
+        # unreachable in a report-only run by design, and that distinction is the point.
+        D.NEEDS_HUMAN_REVIEW: dict(gate={"keep": True, "verdict": "positive", "n": 40},
+                                   sentinel={"unevaluable": True, "reason": "no sealed pair"},
+                                   will_activate=True),
+    }
+    assert set(wanted) == set(D.STATES), "a state was added or removed without a way to reach it"
+    for state, kw in wanted.items():
+        assert _decide(**kw) == state, "%s is defined but not reachable" % state
+
+
+def test_uncertainty_stops_an_activation_but_not_a_report():
+    """報告のみの走行では『不完全な証拠』は報告して通す。有効化しようとした瞬間に止める。
+
+    危険な行為は有効化のほうであって、測ること自体ではない。"""
+    from relay.selfimprove import decision as D
+    incomplete = dict(gate={"keep": True, "verdict": "positive", "n": 40},
+                      security={"regressed": False, "incomplete_coverage": ["s1"]})
+    assert _decide(**incomplete) == D.KEEP
+    assert _decide(**dict(incomplete, will_activate=True)) == D.NEEDS_HUMAN_REVIEW
