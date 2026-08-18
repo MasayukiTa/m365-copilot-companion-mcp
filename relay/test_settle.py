@@ -225,7 +225,7 @@ def test_which_sites_have_moved_and_which_are_still_gated():
     state = {"relay/copilot_autopilot_relay.py": "ungated",
              "relay/relay_fleet.py": "gated",
              "relay/refuter.py": "gated",
-             "relay/agent_profiles.py": "not_yet"}
+             "relay/agent_profiles.py": "gated"}
     for path, expected in state.items():
         src = io.open(path, encoding="utf-8").read()
         uses = "_settle.settle_step(" in src

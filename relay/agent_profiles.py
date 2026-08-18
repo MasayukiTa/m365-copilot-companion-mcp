@@ -19,6 +19,7 @@ Selectors / URLs captured from the live M365 Copilot DOM (2026-06):
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -27,6 +28,7 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 
 from .copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver
+from relay import settle as _settle
 from tools.gate_ops import stop_check
 
 load_dotenv()
@@ -275,7 +277,51 @@ def set_model(page, profile: AgentProfile, model_name: str = "Claude") -> bool:
 CLARIFY_MARKERS = ("go ahead", "to make sure", "make sure i cover",
                    "問題ないですか", "でよいですか", "含めますか", "限定しますか")
 # Elements that appear ONLY once the deep-research report is finished (spec §7).
+#
+# KEPT FOR CALLERS THAT STILL READ IT, but `_report_marker` below is what decides. Three of
+# these five are words a finished report's BODY contains all the time -- a research report
+# about slide decks says "PowerPoint" in its second paragraph -- and the completion test was
+# `marker anywhere OR len >= 1000`, so a short status line that happened to mention one of
+# them was captured as the final report.
 DONE_MARKERS = ("ステップで完了", "推論が", "に変換:", "PowerPoint", "インフォグラフィック")
+
+#: The completion HEADER, anchored to the top of the block and matched as a shape rather than
+#: a word. "推論が" on its own appears in prose; "推論が 12 ステップで完了" is the header the
+#: UI writes when the run finishes.
+_REPORT_MARKERS = (re.compile(r"推論が\s*\d+\s*ステップで完了"),)
+
+#: Buttons the UI offers BELOW a finished report. Anchored to the tail for the same reason:
+#: the report's body mentions these formats; the affordance row is at the end.
+_UI_AFFORDANCE = ("に変換:", "PowerPoint", "インフォグラフィック")
+
+#: How much of each end to look at. Generous enough for a header that follows a title line,
+#: tight enough that the middle of a long report cannot trip either test.
+_MARKER_HEAD, _MARKER_TAIL = 400, 600
+
+#: How long a block must be to count as the report rather than a status line,
+#: when no completion marker is present. Named because it is one half of a pair:
+#: `_looks_like_clarification` caps at 900, and the gap between them is the
+#: whole point -- see the note there.
+SUBSTANTIAL_CHARS = 1000
+
+
+def _report_marker(text: str) -> bool:
+    """Whether this block carries evidence that the report FINISHED.
+
+    Position is half the signal. The old test asked only "does this string appear anywhere",
+    which cannot distinguish the UI announcing completion from the report discussing the same
+    words -- and the consequence was capturing a status line as the deliverable.
+    """
+    t = text or ""
+    if any(p.search(t[:_MARKER_HEAD]) for p in _REPORT_MARKERS):
+        return True
+    # THE TAIL HAS TO BE A TAIL. `t[-600:]` on a 200-character status line is the whole line,
+    # so anchoring bought nothing and "進捗: PowerPoint への変換を検討中です" still read as a
+    # finished report -- the exact failure this function was written to stop, surviving the
+    # rewrite intended to fix it. The affordance row only means anything below a body.
+    if len(t) <= _MARKER_TAIL:
+        return False
+    return any(a in t[-_MARKER_TAIL:] for a in _UI_AFFORDANCE)
 DEFAULT_APPROVAL = ("go ahead でお願いします。設定はお任せ（best judgment）で、"
                     "調査を開始して最終レポートまで進めてください。")
 
@@ -283,9 +329,17 @@ DEFAULT_APPROVAL = ("go ahead でお願いします。設定はお任せ（best 
 def _looks_like_clarification(text: str) -> bool:
     t = (text or "").lower()
     has_clarify = any(m.lower() in t for m in CLARIFY_MARKERS)
-    has_done = any(m.lower() in t for m in DONE_MARKERS)
-    # short-ish, asks/offers go-ahead, and is NOT already a finished report
-    return has_clarify and not has_done and len(text) < 1500
+    # THE FINISHED-REPORT TEST IS THE STRICT ONE NOW. Using the loose word list here meant a
+    # report that merely mentioned PowerPoint was exempted from the clarification check for
+    # the wrong reason -- right answer, wrong evidence, and it stopped working the moment the
+    # word list changed.
+    has_done = _report_marker(text or "")
+    # UNDER 900, NOT 1500. `substantial` (below and in _wait_research_done) starts at 1000, so
+    # 1000-1500 belonged to BOTH: a finished report of that length containing an approval word
+    # was read as a question, answered with the approval text, and the real report discarded --
+    # then the turn timed out. The 100-char gap is deliberate slack between the two bands so
+    # neither can creep into the other unnoticed.
+    return has_clarify and not has_done and len(text) < 900
 
 
 def _wait_research_done(drv: CopilotWebDriver, profile: AgentProfile) -> bool:
@@ -313,7 +367,7 @@ def _wait_research_done(drv: CopilotWebDriver, profile: AgentProfile) -> bool:
         if _is_processing(t):
             last, stable_since = None, None
         elif t == last:
-            has_marker = any(m in t for m in DONE_MARKERS)
+            has_marker = _report_marker(t)
             # A short, stable status line ("リサーチ ツール web 上の...収集") is an INTERMEDIATE
             # progress update, NOT the report -- the Researcher stalls on one for 30-60s while it
             # works in the background (observed: an identical status held a full 60s). Only treat
@@ -390,7 +444,7 @@ def ask_agent(page, query: str, profile: AgentProfile = RESEARCHER,
         clarification = first
         drv.send(approval)
         ok = _wait_research_done(drv, profile)
-    elif any(m in first for m in DONE_MARKERS) or len(first) >= 1000:
+    elif _report_marker(first) or len(first) >= SUBSTANTIAL_CHARS:
         # already the finished report (rare: a query that needed no scoping).
         ok = True
     else:
@@ -442,6 +496,7 @@ class ResearchSession:
         self._t_send = None
         self._last = None
         self._stable_since = None
+        self._settle_state = _settle.SettleState()
         self._approved = False
         self._pending_open = True  # side-page not opened yet -- deferred until there's free RAM
         self._done = None          # report string once finished ('' on failure)
@@ -517,17 +572,42 @@ class ResearchSession:
             t = self.drv.read_last_response()
             if _is_processing(t):
                 self._last, self._stable_since = None, None
+                self._settle_state = _settle.SettleState()
                 return None
             # one-time scoping/clarification approval (the Researcher may ask before it researches)
             if not self._approved and _looks_like_clarification(t) and self.approval:
                 self._approved = True
                 self.drv.send(self.approval)
                 self._last, self._stable_since = None, None
+                # The approval starts a NEW turn; carrying settle across it would let
+                # stability gathered on the question count toward accepting the answer.
+                self._settle_state = _settle.SettleState()
                 return None
             # a stable, SUBSTANTIAL block (completion marker OR >=1000 chars) is the finished
             # report; a short stalled status line is not (same gate as _wait_research_done). The
             # marker appears at the report header then the body streams, so require the full dwell.
-            substantial = any(m in t for m in DONE_MARKERS) or len(t) >= 1000
+            substantial = _report_marker(t) or len(t) >= SUBSTANTIAL_CHARS
+            if _settle.unified():
+                # THE ONE RULE. This site had no sample requirement either -- only a dwell,
+                # doubled unconditionally -- so a deep-research report that paused mid-stream
+                # for longer than 2x dwell was captured at the pause. The marker here is
+                # "the report finished", which is a stronger statement than the other three
+                # sites can make, so an unmarked block genuinely deserves the longer settle.
+                state = getattr(self, "_settle_state", None) or _settle.SettleState()
+                state, outcome = _settle.settle_step(
+                    state, t, now=time.time(), dwell_s=self.dwell_s, generating=False,
+                    is_processing=_is_processing(t), has_marker=_report_marker)
+                self._settle_state = state
+                self._last, self._stable_since = state.last, state.stable_since
+                if outcome != _settle.ACCEPT or not substantial:
+                    return None
+                if getattr(self.drv, "_is_stale_repeat", lambda _t: False)(t):
+                    return None
+                accept = getattr(self.drv, "_accept_new_reply", None)
+                if callable(accept):
+                    accept(t)
+                self._report_full = t
+                self._finish(t[:3500]); return self._done
             if t == self._last:
                 if self._stable_since and substantial and (
                         time.time() - self._stable_since) >= self.dwell_s * 2:
