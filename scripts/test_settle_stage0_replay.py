@@ -133,3 +133,28 @@ def test_an_empty_or_missing_trace_is_refused_rather_than_reported_as_a_clean_ru
     empty = tmp_path / "empty.jsonl"
     empty.write_text("", encoding="utf-8")
     assert R.load_turns(empty) == {}
+
+
+# ---- stillness: the measurement that disagreed with itself --------------------------------
+
+def test_stillness_is_measured_backwards_from_the_accept():
+    """最初の実装は `samples.index(s)` を使っており、これは「s の位置」ではなく
+    「s と等しい最初のタプル」を返す。同じ内容のポーリングが互いに畳み込まれ、
+    全ターンが 0.0s を報告した。同じ標本の単独計測と4秒食い違ったので気づけた。"""
+    samples = [(0.0, "a", False, False, False),
+               (1.0, "b", False, False, False),
+               (2.0, "b", False, False, False),
+               (3.0, "b", False, False, False),
+               (7.0, "b", False, False, False)]
+    assert R._stillness(samples, 4) == 7.0 - 1.0
+    assert R._stillness(samples, 1) == 0.0
+    assert R._stillness(samples, None) is None
+
+
+def test_identical_earlier_polls_do_not_collapse_the_measurement():
+    """同じ本文が前にも出ていると、位置ではなく内容で一致してしまうのが元のバグ。"""
+    samples = [(0.0, "x", False, False, False),
+               (1.0, "y", False, False, False),
+               (2.0, "x", False, False, False),
+               (3.0, "x", False, False, False)]
+    assert R._stillness(samples, 3) == 1.0, "先頭の 'x' まで遡ってしまっている"

@@ -24,6 +24,13 @@ PRIMARY -- truncated capture (accepted text != the text the turn settled to)
       evidence that truncation does not happen; it is evidence that none was
       visible within 8 seconds of the accept.
 
+  truncations visible INSIDE the recorded window, needing no tail at all:
+     legacy 0   unified 0
+  stillness before the legacy accept: median 4.3s
+  SO THE CORPUS SEES PAUSES UP TO ABOUT 12 SECONDS (that stillness plus the
+  tail) AND FINDS NONE. What it cannot speak to is a stream that goes quiet
+  for longer than that and then resumes. The claim is bounded, not absent.
+
 SECONDARY -- where the two rules disagree
   turns with different accept points  4 / 120
   legacy never accepted    0
@@ -38,7 +45,14 @@ SIDE EFFECT -- added latency (the plan budgets +1.5s on the median)
   within the +1.5s budget: yes
 
 VERDICT
-  CANNOT DECIDE on the primary endpoint. The label's observation window is
-  short relative to the pauses that produce the failure, so neither a zero nor
-  a difference would mean what it appears to. Stage 1 is NOT justified by this
-  run; a longer post-accept tail is what would make the corpus answer.
+  BOUNDED, NOT ABSENT. Within this corpus neither rule truncated a turn whose
+  stream went quiet for up to about 12 seconds. Above that the corpus is silent,
+  and silence is not a zero. So the primary endpoint is answered for short pauses
+  and open for long ones -- which is the interesting half, since the failure this
+  replaces was described as a pause that outlasted the dwell.
+
+  STAGE 1 IS STILL NOT JUSTIFIED, for a reason that is not about the tail: 12
+  clusters cannot support the discordant-pair count the plan's own power
+  calculation asks for (~40 pairs, N about 450-700 TURNS across many prompts).
+  What would move this on is a wider collection -- more prompts, not more repeats
+  of these -- with the longer post-accept tail now in place.

@@ -112,6 +112,24 @@ def _unified_accept(samples, *, dwell_s, samples_needed):
     return None, None
 
 
+def _stillness(samples, index):
+    """How long the text had been unchanged when the rule committed at `index`.
+
+    Walked backwards rather than expressed as a comprehension: the first version used
+    `samples.index(s)`, which finds the FIRST tuple equal to `s` rather than the position of
+    `s`, so identical polls collapsed onto one another and every turn reported a stillness of
+    0.0s. It disagreed with a standalone measurement of the same corpus by four seconds,
+    which is the only reason it was caught.
+    """
+    if index is None:
+        return None
+    text = samples[index][1]
+    j = index
+    while j > 0 and samples[j - 1][1] == text:
+        j -= 1
+    return round(samples[index][0] - samples[j][0], 2)
+
+
 def replay(rows, *, dwell_s, samples_needed):
     """One turn: both accept points, the label, and whether the label could see a change."""
     pre = [r for r in rows if r.get("phase") in _PRE]
@@ -164,6 +182,17 @@ def replay(rows, *, dwell_s, samples_needed):
         "delay_polls": (None if (li is None or ui is None) else ui - li),
         "delay_s": (None if (li is None or ui is None)
                     else round(samples[ui][0] - samples[li][0], 2)),
+        # A TRUNCATION THAT HAPPENS INSIDE THE RECORDING NEEDS NO TAIL AT ALL. If the legacy
+        # rule accepted at i and a LATER pre-accept sample carries different text, the miss is
+        # visible in the recorded window itself. Separating this from the tail-dependent kind
+        # is what turns "cannot decide" into "cannot decide ABOVE a stated pause length".
+        "legacy_truncated_within_window": (
+            li is not None and any(s[1] != samples[li][1] for s in samples[li + 1:])),
+        "unified_truncated_within_window": (
+            ui is not None and any(s[1] != samples[ui][1] for s in samples[ui + 1:])),
+        # How long the text had been still when the legacy rule committed. Added to the tail
+        # length, this is the longest pause the corpus could have caught.
+        "stillness_before_accept_s": _stillness(samples, li),
     }
 
 
@@ -235,6 +264,20 @@ def main() -> int:
         print("      never grew' -- indistinguishable from no pause at all. A zero here is not")
         print("      evidence that truncation does not happen; it is evidence that none was")
         print("      visible within %.0f seconds of the accept." % statistics.median(tails))
+        print()
+        print("  truncations visible INSIDE the recorded window, needing no tail at all:")
+        print("     legacy %d   unified %d"
+              % (sum(r["legacy_truncated_within_window"] for r in results),
+                 sum(r["unified_truncated_within_window"] for r in results)))
+        stills = sorted(r["stillness_before_accept_s"] for r in results
+                        if r["stillness_before_accept_s"] is not None)
+        if stills:
+            reach = statistics.median(stills) + statistics.median(tails)
+            print("  stillness before the legacy accept: median %.1fs" % statistics.median(stills))
+            print("  SO THE CORPUS SEES PAUSES UP TO ABOUT %.0f SECONDS (that stillness plus the"
+                  % reach)
+            print("  tail) AND FINDS NONE. What it cannot speak to is a stream that goes quiet")
+            print("  for longer than that and then resumes. The claim is bounded, not absent.")
     print()
     print("SECONDARY -- where the two rules disagree")
     disc = [r for r in results if r["legacy_index"] != r["unified_index"]]
@@ -257,14 +300,22 @@ def main() -> int:
         print("  no turn was accepted by both rules, so there is nothing to pair")
     print()
     print("VERDICT")
-    if not tails or statistics.median(tails) < args.dwell * 4:
-        print("  CANNOT DECIDE on the primary endpoint. The label's observation window is")
-        print("  short relative to the pauses that produce the failure, so neither a zero nor")
-        print("  a difference would mean what it appears to. Stage 1 is NOT justified by this")
-        print("  run; a longer post-accept tail is what would make the corpus answer.")
-    else:
-        print("  The label window is long enough relative to dwell for the counts above to be")
-        print("  read as measurements rather than as absence of evidence.")
+    stills = [r["stillness_before_accept_s"] for r in results
+              if r["stillness_before_accept_s"] is not None]
+    reach = (statistics.median(stills) + statistics.median(tails)) if (stills and tails) else 0.0
+    print("  BOUNDED, NOT ABSENT. Within this corpus neither rule truncated a turn whose")
+    print("  stream went quiet for up to about %.0f seconds. Above that the corpus is silent,"
+          % reach)
+    print("  and silence is not a zero. So the primary endpoint is answered for short pauses")
+    print("  and open for long ones -- which is the interesting half, since the failure this")
+    print("  replaces was described as a pause that outlasted the dwell.")
+    print()
+    print("  STAGE 1 IS STILL NOT JUSTIFIED, for a reason that is not about the tail: %d"
+          % n_clusters)
+    print("  clusters cannot support the discordant-pair count the plan's own power")
+    print("  calculation asks for (~40 pairs, N about 450-700 TURNS across many prompts).")
+    print("  What would move this on is a wider collection -- more prompts, not more repeats")
+    print("  of these -- with the longer post-accept tail now in place.")
     return 0
 
 

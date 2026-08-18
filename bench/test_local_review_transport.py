@@ -214,14 +214,32 @@ def test_unexpected_controller_exit_restarts_same_job_until_done(tmp_path, monke
         str(goals), 1, str(state), repo_root=str(tmp_path), python_exe="python",
     )
 
-    assert result == 0
-    assert len(launches) == 2
+    # THE ASSERTIONS CARRY THEIR STATE, because this test has failed twice under full-suite
+    # load and never once in isolation, and a bare `assert result == 0` says nothing about
+    # which of the three things went wrong. An intermittent failure that cannot be reproduced
+    # on demand is only diagnosable from the run that produced it, so that run has to be the
+    # one that explains itself.
+    def _why():
+        try:
+            entries = json.loads((state / CAMPAIGN_MANIFEST).read_text(encoding="utf-8"))
+            jid = entries["entries"][0]["job_id"]
+            st = LocalJobStore(db).get_job_status(jid, event_limit=30)
+            return "job=%s status=%s events=%s launches=%d exit_codes=%s" % (
+                jid, st.get("status"),
+                [e.get("event") for e in st.get("events") or []],
+                len(launches), [c.returncode for c in launches])
+        except Exception as exc:
+            return "could not read the job state either: %s: %s" % (type(exc).__name__, exc)
+
+    assert result == 0, "coordinator returned %r -- %s" % (result, _why())
+    assert len(launches) == 2, (
+        "expected one launch plus one restart, got %d -- %s" % (len(launches), _why()))
     manifest = json.loads((state / CAMPAIGN_MANIFEST).read_text(encoding="utf-8"))
     job_id = manifest["entries"][0]["job_id"]
     status = LocalJobStore(db).get_job_status(job_id, event_limit=30)
-    assert status["status"] == "DONE"
+    assert status["status"] == "DONE", _why()
     assert any(event["event"] == "CONTROLLER_RESTART_SCHEDULED"
-               for event in status["events"])
+               for event in status["events"]), _why()
 
     # Re-entering the same state directory is an instant no-op, not a duplicate campaign.
     assert transport.run_local_review_fleet(
