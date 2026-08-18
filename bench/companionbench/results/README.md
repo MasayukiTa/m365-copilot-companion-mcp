@@ -137,3 +137,38 @@ miss made this look like one criterion short when it is two.
 about 6 points, which a naive independent-binomial check puts at p ≈ 0.42. Only three flipping
 episodes overlap between the two runs, and the rest period differed (15 minutes then, 10 now).
 Three trials also call a true 50/50 episode "stable" a quarter of the time.
+
+## Milestone A's two criteria are met, and three trials is a thin basis for saying so
+
+`reliability_logged.txt` -- 3 repeats, rested 600s, reshuffled, with every `/history` attempt
+recorded.
+
+    pass counts        18, 20, 18 of 22
+    stable / flipped   18 / 4          (Milestone A requires 18)
+    spread             2/22 = 0.091    (requires <= 0.10)
+    coverage           1.0 on all three
+    marker seen        63 of 66; the other 3 rest on a workdir change
+
+Both criteria pass. What that is worth: a genuinely 50/50 episode looks "stable" in three
+trials a quarter of the time, so 18 of 22 is consistent with several coin-flips landing the
+same way. The earlier run was 15, 16, 17 (mean 16.0) against 18, 20, 18 (mean 18.7) here --
+the direction is consistent but three points either side is not a demonstration. The honest
+statement is that the suite now MEETS the bar it was given, not that it has been shown to sit
+comfortably above it.
+
+**AND THE HYDRATION EXPLANATION IS REFUTED BY THE INSTRUMENT BUILT TO TEST IT.** `shadow_rules`
+scored the old rule and the new one over the same 66 turns:
+
+    rescued  0        turns absent on the first `ok` look and present later
+    agreed   63 found, 3 unknown
+
+Forty turns did need more than one look -- but those were BUSY retries for the page lock, not
+a view that had not rendered. So "the old detector had a hydration race" is unsupported by
+this sample, and the earlier probe's eight-of-nine absences still have no explanation. The
+tool was written to be able to say that, and it said it.
+
+**A RATE ABOVE 1 WAS PRINTED IN THIS RUN.** `delivery_rate_where_answered` came out as 1.0476
+and 1.1: the numerator counted rows the filesystem vouched for while the denominator counted
+only rows the conversation check answered, so the two halves were measuring different sets.
+It is 1.000 with the denominator fixed. A rate over one is not a rounding artefact, and it was
+sitting next to figures a reader is asked to trust.

@@ -332,7 +332,9 @@ def _totals(passed, attempted, total, delivery="confirmed"):
     作らない行に対してゲートをテストしていたことになる。"""
     def _r(eid, ok, infra=False):
         return dict(_row(eid, ok, infra=infra), delivery=delivery,
-                    delivery_confirmed=(delivery == "confirmed"))
+                    delivery_confirmed=(delivery == "confirmed"),
+                    delivery_ui_marker=(True if delivery == "confirmed"
+                                        else False if delivery == "none" else None))
     rows = ([_r("p%d" % i, True) for i in range(passed)]
             + [_r("f%d" % i, False) for i in range(attempted - passed)]
             + [_r("i%d" % i, False, infra=True) for i in range(total - attempted)])
@@ -391,10 +393,12 @@ def test_the_gate_catches_a_delivery_gap_that_coverage_cannot_see():
     def _t(delivered, n, unknown=0):
         rows = [dict(_row("e%d" % i, True),
                      delivery=("confirmed" if i < delivered else "none"),
-                     delivery_confirmed=(i < delivered))
+                     delivery_confirmed=(i < delivered),
+                     delivery_ui_marker=(i < delivered))
                 for i in range(n - unknown)]
         rows += [dict(_row("u%d" % i, True), delivery="unknown",
-                      delivery_confirmed=False) for i in range(unknown)]
+                      delivery_confirmed=False, delivery_ui_marker=None)
+                 for i in range(unknown)]
         return B.summarise(rows)
 
     reasons = B.comparable(_t(10, 10), _t(4, 10))
@@ -410,9 +414,11 @@ def test_the_gate_does_not_read_its_own_blindness_as_a_transport_gap():
     ことを、系の性質として報告していたことになる。"""
     def _t(n, unknown):
         rows = [dict(_row("e%d" % i, True), delivery="confirmed",
-                     delivery_confirmed=True) for i in range(n - unknown)]
+                     delivery_confirmed=True, delivery_ui_marker=True)
+                for i in range(n - unknown)]
         rows += [dict(_row("u%d" % i, True), delivery="unknown",
-                      delivery_confirmed=False) for i in range(unknown)]
+                      delivery_confirmed=False, delivery_ui_marker=None)
+                 for i in range(unknown)]
         return B.summarise(rows)
 
     seen, half_blind = _t(10, 0), _t(10, 5)
@@ -433,8 +439,11 @@ def _r(eid, ok, delivered=True, infra=False):
     never produces. `delivered=None` is that third answer.
     """
     grade = {True: "confirmed", False: "none", None: "unknown"}[delivered]
-    return dict(_row(eid, ok, infra=infra),
-                delivery=grade, delivery_confirmed=(delivered is True))
+    # `delivery_ui_marker` is what any statement about the CHECK is computed from, so a
+    # fixture without it measures a row the runner never produces -- which is how this file
+    # came to be testing shapes that do not occur, twice.
+    return dict(_row(eid, ok, infra=infra), delivery=grade,
+                delivery_confirmed=(delivered is True), delivery_ui_marker=delivered)
 
 
 def _rn(rows):
@@ -509,8 +518,27 @@ def test_a_target_with_no_conversation_to_inspect_is_not_called_blind():
 
     区別せずに coverage で refuse したところ、in-process の比較が全て INFRA_ABORT になった。
     計器が『適用されない』ことを『壊れている』と報告していた。"""
-    rows = [dict(_row("e%d" % i, True), delivery="unknown", delivery_confirmed=False)
-            for i in range(6)]
+    rows = [dict(_row("e%d" % i, True), delivery="unknown", delivery_confirmed=False,
+                 delivery_ui_marker=None) for i in range(6)]
     t = B.summarise(rows)
     assert t["delivery_answered"] == 0
     assert not any("could answer for only" in r for r in B.comparable(t, t))
+
+
+def test_a_conditional_rate_can_never_exceed_one():
+    """1を超える率は丸め誤差ではなく、分子と分母が別の集合を数えている証拠。
+
+    `delivery_confirmed` は workdir 由来の行も含むのに、分母は会話検査が答えた行だけ
+    だったので、実走行で 1.0476 / 1.1 が出た -- 読者に信用してくれと言っている数字の
+    隣に印字されていた。"""
+    rows = [dict(_row("a", True), delivery="confirmed", delivery_confirmed=True,
+                 delivery_ui_marker=True),
+            dict(_row("b", True), delivery="workdir_only", delivery_confirmed=True,
+                 delivery_ui_marker=None),
+            dict(_row("c", False), delivery="none", delivery_confirmed=False,
+                 delivery_ui_marker=False)]
+    t = B.summarise(rows)
+    assert t["delivery_answered"] == 2, "workdir 由来を『検査が答えた』に数えている"
+    assert t["ui_marker_seen"] == 1
+    assert t["delivery_rate_where_answered"] == 0.5
+    assert t["delivery_rate_where_answered"] <= 1.0

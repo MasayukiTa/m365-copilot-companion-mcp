@@ -452,7 +452,13 @@ def summarise(rows) -> dict:
             and r.get("delivery_ui_marker") is True),
         "delivery_check_coverage": (round(len(delivery_answered) / len(rows), 4)
                                     if rows else None),
-        "delivery_rate_where_answered": (round(len(delivered) / len(delivery_answered), 4)
+        # OVER THE ROWS THE CHECK ANSWERED FOR, using the CHECK'S OWN positives. This divided
+        # `delivery_confirmed` -- which also counts rows the filesystem vouched for -- by the
+        # rows the conversation check answered, so a numerator counted rows the denominator
+        # excluded and the "rate" came out above 1 (1.0476, 1.1 in a live run). A rate over
+        # one is not a rounding artefact; it is a statement that the two halves are measuring
+        # different sets, and it was printed next to figures a reader is asked to trust.
+        "delivery_rate_where_answered": (round(len(ui_marker_seen) / len(delivery_answered), 4)
                                          if delivery_answered else None),
         # The grades, because "confirmed" is one of four answers and the other three are not
         # interchangeable. `none` is a turn that wrote nothing and said nothing relevant --
