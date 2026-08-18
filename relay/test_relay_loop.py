@@ -20,7 +20,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from relay.copilot_autopilot_relay import run_relay
-from tools.gate_ops import stop_clear, stop_request
+from tools.gate_ops import STOP_FILE, stop_check, stop_request_internal
 
 PY = sys.executable
 PASS_CHECK = {"type": "shell", "argv": [PY, "-c", "print('ok')"]}
@@ -100,15 +100,30 @@ def main():
         MockDriver(["a CONTINUE", "b CONTINUE", "c CONTINUE", "d CONTINUE"]),
         "MAXTURNS", max_turns=3))
 
+    # A LEFTOVER STOP FILE MAKES EVERY SCENARIO ABORT, and the report then reads as six
+    # unrelated failures rather than one stale file. It happened: a run whose teardown could
+    # not clear the switch left it set, and the next run reported done_happy -> ABORTED.
+    if stop_check().startswith("STOP"):
+        print("[setup] refusing to run: the kill-switch is already set -- %s" % stop_check())
+        print("        every scenario would abort and the report would blame the scenarios.")
+        sys.exit(2)
+
     # 7. kill-switch -> ABORTED
-    stop_request("test kill-switch")
+    # 内部経路。`stop_request` は HTTP 認可述語を通るので、スクリプトから呼ぶと
+    # 「locked」を返してスイッチを立てない -- このシナリオが5ターン走り切って
+    # STUCK で終わっていた原因。ここで検証したいのはループが中断するかであって、
+    # ツールが認可されるかではない。
+    stop_request_internal("test kill-switch", source="test")
     try:
         results.append(run_case(
             "killswitch",
             MockDriver(["should not run CONTINUE"]),
             "ABORTED"))
     finally:
-        stop_clear()  # IMPORTANT: never leave the kill-switch set
+        # 直接消す。解除は認可された方向のままで正しい -- ここで
+        # `stop_clear()` を呼ぶと、これもロックされてスイッチが残り、
+        # 後続シナリオが巻き添えで ABORTED になる（実際にそうなった）。
+        STOP_FILE.unlink(missing_ok=True)  # never leave the kill-switch set
 
     # 8. acceptance gate: DONE + passing check -> DONE (verified, not just claimed)
     results.append(run_case(

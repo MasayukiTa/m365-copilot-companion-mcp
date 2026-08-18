@@ -338,17 +338,33 @@ def check_op(op_class: str, detail: str = "") -> Optional[str]:
 
     # ── stop_when: trigger kill-switch ─────────────────────────────────────
     if op_class in stop_when:
+        # THE RESULT IS NOT DISCARDED. It used to be, inside `except Exception: pass`, and
+        # the message below asserted that the fleet was stopping. It was not: stop_request
+        # went through an HTTP authorisation check that denies in-process callers, returned
+        # a "locked" string, and never wrote the switch. The offending operation was refused
+        # -- that part always worked -- but every other worker kept running while the
+        # operator read that the run had stopped.
+        engaged, detail_msg = False, ""
         try:
-            from tools.gate_ops import stop_request
-            stop_request(f"contract stop_when triggered by op_class={op_class!r} detail={detail!r}")
-        except Exception:
-            pass
-        return (
-            f"[自律契約停止 / Contract stop] op_class={op_class!r} が stop_when に含まれているため"
-            f"このフリートランは停止します。操作は実行されませんでした。"
-            f" / op_class={op_class!r} is in stop_when; this fleet run is stopping. "
-            f"Operation not executed."
-        )
+            from tools.gate_ops import stop_request_internal, STOP_ENGAGED
+            got = stop_request_internal(
+                f"contract stop_when triggered by op_class={op_class!r} detail={detail!r}",
+                source="contract_gate")
+            engaged = (got == STOP_ENGAGED)
+            detail_msg = "" if engaged else " (%s)" % got
+        except Exception as e:
+            detail_msg = " (%s: %s)" % (type(e).__name__, e)
+        head = (f"[自律契約停止 / Contract stop] op_class={op_class!r} が stop_when に"
+                f"含まれているため、この操作は実行されませんでした。"
+                f" / op_class={op_class!r} is in stop_when; the operation was NOT executed.")
+        # SAID SEPARATELY, because they are separate facts and one of them used to be
+        # asserted on the strength of the other.
+        if engaged:
+            return head + " フリート全体の停止スイッチを立てました。 / The fleet-wide " \
+                          "kill-switch is engaged."
+        return head + (" 警告: フリート全体の停止スイッチは立っていません%s -- 他のワーカーは"
+                       "走り続けます。 / WARNING: the fleet-wide kill-switch is NOT engaged%s"
+                       " -- other workers keep running." % (detail_msg, detail_msg))
 
     # ── ask_before: HITL approval gate ─────────────────────────────────────
     if op_class in ask_before:

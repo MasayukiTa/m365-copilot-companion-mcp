@@ -9,13 +9,13 @@ CI was green. It had never executed them.
 
 That was not a small gap. `relay/test_acceptance.py` alone runs 20 checks; the twenty files
 together run several hundred, covering the relay loop, the planner, the watchdog, transient
-retry, and the unlock injection path. And four of them were RED, with eight failing checks
-nobody had seen -- including a kill-switch that reports STUCK where the suite expects
-ABORTED.
+retry, and the unlock injection path. And four of them were RED, with seven failing checks
+nobody had seen -- including a kill-switch that never engaged, so a loop asked to abort ran
+to completion and finished STUCK. That one is fixed; three files and six checks remain.
 
 WHY A BASELINE RATHER THAN JUST FAILING
 
-Turning CI red on eight pre-existing failures would make it stop being read, which is how
+Turning CI red on seven pre-existing failures would make it stop being read, which is how
 this happened in the first place. Turning them off would repeat the original mistake with
 extra steps. So each file carries the number of checks that pass TODAY:
 
@@ -37,11 +37,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 #: path -> expected passing checks, or None for "must pass completely".
 #:
-#: The four with numbers are the ones that were already failing when CI first ran them
-#: (2026-08-18). Their failing checks, for whoever picks this up:
+#: The ones with numbers were already failing when CI first ran them (2026-08-18). Their
+#: failing checks, for whoever picks this up:
 #:
 #:   relay/test_fleet_verify.py   timeout_salvaged_done, timeout_fail_stays_stuck
-#:   relay/test_relay_loop.py     killswitch (outcome STUCK, suite expects ABORTED)
 #:   relay/test_transient.py      send_budget_exhausted_stuck, agent_stuck_terminal,
 #:                                timeout_terminal
 #:   relay/test_unlock_inject.py  transcript_has_redaction_marker -- asserts a marker
@@ -65,7 +64,7 @@ SUITES = {
     "relay/test_recycle.py": None,
     "relay/test_refuter.py": None,
     "relay/test_refuter_memory.py": None,
-    "relay/test_relay_loop.py": 8,
+    "relay/test_relay_loop.py": None,
     "relay/test_repo_map.py": None,
     "relay/test_transient.py": 12,
     "relay/test_unlock_inject.py": 17,
