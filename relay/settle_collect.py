@@ -53,6 +53,67 @@ PROMPTS = (
     "In about 250 words, explain what makes a benchmark's held-out set valuable.",
     "What is the difference between latency and throughput? Two sentences.",
     "Outline a plan for migrating a service to a new authentication scheme, six bullets.",
+    # --- widened 2026-08-18 ------------------------------------------------------------
+    # TWELVE WAS THE CEILING ON THE WHOLE EXPERIMENT. The offline replay over the previous
+    # collection came out as twelve clusters carrying a hundred and twenty turns, and the
+    # plan's own power calculation asks for roughly forty discordant PAIRS -- which twelve
+    # units cannot produce however many times they are repeated. More turns against the same
+    # twelve prompts adds rows and no information.
+    #
+    # The axes below are the ones a stability rule is actually deciding about: how long the
+    # answer is, and whether it arrives smoothly or in bursts. So the set ranges over one-word
+    # replies, tables (which stream a row at a time), code blocks (which pause at fence
+    # boundaries), enumerations, and long prose.
+    "Reply with only: ok",
+    "What year did the first web browser ship? Just the number.",
+    "Give the SI unit of pressure and its definition in one line.",
+    "Name the four ACID properties, comma separated, nothing else.",
+    "In two sentences, why is UTC preferred over local time in logs?",
+    "What does a 503 mean, and how does it differ from a 500? Two lines.",
+    "Define cardinality in the context of a database index, briefly.",
+    "One sentence: what problem does a bloom filter solve?",
+    "Explain, in about 80 words, why floating point addition is not associative.",
+    "Describe the difference between at-least-once and exactly-once delivery, 100 words.",
+    "In about 120 words, explain what a race condition is, with one concrete example.",
+    "Summarise the CAP theorem in about 130 words without using the word 'trade-off'.",
+    "Explain in about 150 words how a hash join differs from a nested loop join.",
+    "In roughly 180 words, describe what happens between typing a URL and the first byte.",
+    "Explain garbage collection generational hypothesis in about 200 words.",
+    "In about 250 words, describe how TLS establishes a shared secret.",
+    "Write a markdown table of five sorting algorithms with time and space complexity.",
+    "Produce a table comparing four HTTP caching headers and when each applies.",
+    "Make a table of six git commands and what each one does to the index.",
+    "Write a short Python function that merges two sorted lists, with a docstring.",
+    "Show a SQL query that finds the second highest salary, and explain it briefly.",
+    "Write a bash one-liner that finds the ten largest files under a directory, explained.",
+    "Give a JSON example of a paginated API response, with a note on each field.",
+    "List seven code review smells, one line each.",
+    "Enumerate eight steps for onboarding a new service into an on-call rotation.",
+    "Give ten questions to ask before adopting a new dependency.",
+    "List five ways a retry can make an outage worse, one line each.",
+    "Name six metrics worth alerting on for a queue-backed worker, with thresholds.",
+    "Outline a rollback plan for a schema change that has already shipped, seven bullets.",
+    "Draft a five-point checklist for reviewing a change to authentication code.",
+    "Give a step-by-step plan for finding a memory leak in a long-running process.",
+    "Describe how you would bisect a performance regression across 200 commits.",
+    "Explain the difference between a feature flag and a config toggle, and when each fits.",
+    "In about 100 words, what makes an error message good? Give one bad and one good example.",
+    "Explain idempotency keys in payment APIs in about 140 words.",
+    "What is the difference between a leader election and a lock? About 120 words.",
+    "Describe backpressure and two ways to implement it, about 160 words.",
+    "In about 200 words, explain why distributed tracing needs sampling.",
+    "Explain what a flaky test costs a team, in about 120 words.",
+    "Describe three strategies for migrating data with zero downtime, one paragraph each.",
+    "What is the difference between authentication and authorisation? Two sentences.",
+    "Explain the purpose of a dead letter queue in about 90 words.",
+    "In one sentence each, define: p50, p95, p99.",
+    "Name five reasons a deploy might succeed in staging and fail in production.",
+    "Describe how a circuit breaker works and what its three states are.",
+    "Explain in about 110 words why timestamps from different machines cannot be compared.",
+    "Give a worked example of computing a confidence interval for a proportion.",
+    "Explain McNemar's test and when it is preferred over a chi-squared test, 150 words.",
+    "What is Simpson's paradox? Give a numeric example in about 130 words.",
+    "In about 170 words, explain the difference between precision and recall with an example.",
 )
 
 
@@ -125,6 +186,24 @@ def collect(*, cdp_url, agent_url, turns=24, timeout_s=180, dwell_s=2.0,
 
     from relay import copilot_autopilot_relay as CAR
     from relay.copilot_autopilot_relay import (CopilotWebDriver, find_conversation_page)
+
+    # WHAT THIS RUN BUYS, SAID BEFORE IT SPENDS AN HOUR. Turns beyond the number of distinct
+    # prompts are repeats of a cluster, not new clusters, and the statistic the plan needs
+    # counts clusters. Reported rather than enforced -- a repeat run is a legitimate thing to
+    # want, it just must not be mistaken for a wider one.
+    clusters = min(turns, len(PROMPTS))
+    repeats = turns / float(len(PROMPTS)) if PROMPTS else 0.0
+    print("[settle_collect] %d turns over %d prompts -> %d clusters, %.1f repeats each"
+          % (turns, len(PROMPTS), clusters, repeats))
+    if turns > len(PROMPTS):
+        print("[settle_collect] NOTE: %d of those turns are repeats of a prompt already "
+              "recorded. The plan's power calculation counts clusters, so this run adds "
+              "%d units of information and %d rows."
+              % (turns - clusters, clusters, turns))
+    if clusters < 40:
+        print("[settle_collect] WARNING: %d clusters is below the ~40 discordant pairs the "
+              "plan asks for; a Stage 1 built on this will be underpowered whatever the "
+              "turn count says." % clusters)
 
     done, failed, started = 0, 0, time.time()
     with sync_playwright() as p:

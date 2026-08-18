@@ -176,6 +176,7 @@ jobs:
             relay/test_fleet_settle.py \
             relay/test_refuter_settle.py \
             relay/test_research_settle.py \
+            relay/test_settle_collect_breadth.py \
             relay/test_settle.py \
             relay/test_settle_survives_placeholder.py \
             relay/test_settle_replay.py \
