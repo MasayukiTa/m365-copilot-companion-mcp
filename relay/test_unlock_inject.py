@@ -113,7 +113,12 @@ def main():
         tx.user(1, 'unlock {"password": "%s"}' % PW)
         transcript_text = Path(tx.path).read_text(encoding="utf-8")
         check("transcript_redacts_password", PW not in transcript_text)
-        check("transcript_has_redaction_marker", "<redacted-unlock-password>" in transcript_text)
+        # 期待していた "<redacted-unlock-password>" を出力するコードは一度も存在せず、
+        # 共有 redactor は "<redacted>" を書く。パスワードは確実に消えていた（上の
+        # チェック）ので漏洩ではなく期待値の陳腐化。固定すべき性質は「黙って削除
+        # されるのではなく、印が残ること」-- 出所の定数を import して比べる。
+        from tools.secret_store import REDACTION_MARKER
+        check("transcript_has_redaction_marker", REDACTION_MARKER in transcript_text)
 
     ok = sum(results)
     total = len(results)

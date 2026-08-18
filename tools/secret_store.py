@@ -158,6 +158,17 @@ def secret_values(environ=None) -> list[str]:
     return sorted(set(out), key=len, reverse=True)
 
 
+#: What replaces a secret in anything written down. A CONSTANT because a test asserted
+#: a marker -- "<redacted-unlock-password>" -- that no code has ever emitted, and it
+#: sat failing where nobody ran it. The literal being in one place is what stops the
+#: reader and the writer disagreeing about it again.
+#:
+#: MARKED, NOT DELETED. Removing the secret silently would leave a transcript that
+#: reads as though nothing was there, and "no secret in this file" and "a secret was
+#: taken out of this file" are different facts.
+REDACTION_MARKER = "<redacted>"
+
+
 def redact_secrets(text: str, environ=None) -> str:
     """本文から秘密を伏せる。書き出す直前にだけ使う。
 
@@ -168,7 +179,7 @@ def redact_secrets(text: str, environ=None) -> str:
     try:
         for secret in secret_values(environ):
             if secret in value:
-                value = value.replace(secret, "<redacted>")
+                value = value.replace(secret, REDACTION_MARKER)
     except Exception:
         pass
     return value

@@ -11,22 +11,23 @@ That was not a small gap. `relay/test_acceptance.py` alone runs 20 checks; the t
 together run several hundred, covering the relay loop, the planner, the watchdog, transient
 retry, and the unlock injection path. And four of them were RED, with seven failing checks
 nobody had seen -- including a kill-switch that never engaged, so a loop asked to abort ran
-to completion and finished STUCK, and a per-worker retry budget that bounded nothing
-while the evolution loop was free to tune it. Those are fixed; two files and three
-checks remain.
+to completion and finished STUCK, and a per-worker retry budget that bounded nothing while
+the evolution loop was free to tune it. All seven are fixed and every file is green.
 
-WHY A BASELINE RATHER THAN JUST FAILING
+WHY THE BASELINE MECHANISM SURVIVES ANYWAY
 
-Turning CI red on seven pre-existing failures would make it stop being read, which is how
-this happened in the first place. Turning them off would repeat the original mistake with
-extra steps. So each file carries the number of checks that pass TODAY:
+Turning CI red on seven pre-existing failures would have made it stop being read, which is
+how this happened in the first place; turning them off would have repeated the original
+mistake with extra steps. So each file carries the number of checks it passes:
 
   * a file expected to pass completely must exit 0. No baseline, no leniency.
   * a file with known failures must produce EXACTLY its recorded count. Fewer is a
     regression. More is someone having fixed something, which is good news and still fails
     -- because a baseline that silently shrinks stops being a record of anything.
 
-The recorded numbers are a debt, not a decision. Every one of them is a real failing check.
+Every entry is currently None, and the machinery is kept rather than deleted: the next
+suite added here may not be green, and a recorded number is how it says so out loud instead
+of being quietly excluded. A number is a debt, never a decision.
 """
 from __future__ import annotations
 
@@ -39,15 +40,23 @@ ROOT = Path(__file__).resolve().parent.parent
 
 #: path -> expected passing checks, or None for "must pass completely".
 #:
-#: The ones with numbers were already failing when CI first ran them (2026-08-18). Their
-#: failing checks, for whoever picks this up:
+#: EVERY ENTRY IS None AS OF 2026-08-18, and that is the point: when CI first ran
+#: these files, four of them were red with seven failing checks. All seven are now
+#: fixed, and the mechanism is kept rather than deleted because the next file added
+#: here may not be green, and a number is how it says so out loud.
 #:
-#:   relay/test_fleet_verify.py   timeout_salvaged_done, timeout_fail_stays_stuck
-#:   relay/test_unlock_inject.py  transcript_has_redaction_marker -- asserts a marker
-#:                                "<redacted-unlock-password>" that no code has ever
-#:                                emitted; the shared redactor writes "<redacted>". The
-#:                                password itself IS removed, so this is a stale
-#:                                expectation rather than a leak.
+#: What the seven were:
+#:   relay/test_relay_loop.py     the kill-switch went through an HTTP authorisation
+#:                                predicate that denies in-process callers, so it
+#:                                never engaged
+#:   relay/test_transient.py      the per-worker retry budget bounded nothing; it
+#:                                survived only inside "retry %d/%d"
+#:   relay/test_fleet_verify.py   same cause -- "retries exhausted" was expressed as
+#:                                max_transient=0, which stopped meaning anything
+#:                                when the transport budget became a time window
+#:   relay/test_unlock_inject.py  asserted a redaction marker no code has ever
+#:                                emitted. The password itself WAS removed, so a
+#:                                stale expectation rather than a leak
 SUITES = {
     "relay/test_acceptance.py": None,
     "relay/test_autoscale.py": None,
@@ -56,7 +65,7 @@ SUITES = {
     "relay/test_feedback.py": None,
     "relay/test_fleet_refute.py": None,
     "relay/test_fleet_runner_fixes.py": None,
-    "relay/test_fleet_verify.py": 15,
+    "relay/test_fleet_verify.py": None,
     "relay/test_folder_verify.py": None,
     "relay/test_forge.py": None,
     "relay/test_planner.py": None,
@@ -67,7 +76,7 @@ SUITES = {
     "relay/test_relay_loop.py": None,
     "relay/test_repo_map.py": None,
     "relay/test_transient.py": None,
-    "relay/test_unlock_inject.py": 17,
+    "relay/test_unlock_inject.py": None,
     "relay/test_watchdog.py": None,
 }
 

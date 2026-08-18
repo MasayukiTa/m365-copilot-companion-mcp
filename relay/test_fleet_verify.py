@@ -24,7 +24,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from relay.relay_fleet import RelayWorker, TERMINAL, goal_fields
+from relay.relay_fleet import (NET_RETRY_WINDOW_S, RelayWorker, TERMINAL,
+                               goal_fields)
 
 PY = sys.executable
 results = []
@@ -126,6 +127,12 @@ def main():
     w.status = "waiting"
     w._t_send = time.time() - 100         # already past the (0s) per-turn timeout
     w._count_before = 0
+    # "RETRIES EXHAUSTED" IS A WINDOW, NOT A COUNT, on the transport path.
+    # `max_transient=0` expressed it back when the budget was a count; since the
+    # change to a wall-clock window it expresses nothing, so the worker simply
+    # retried and the salvage branch was never reached. Exhausting the window is how
+    # a caller now says "this has persisted".
+    w.first_transient_ts = time.time() - (NET_RETRY_WINDOW_S + 60)
     term = w.poll()
     check("timeout_salvaged_done", term is True and w.status == "done"
           and w.outcome == "DONE" and w.verified is True)
@@ -136,6 +143,7 @@ def main():
     w.status = "waiting"
     w._t_send = time.time() - 100
     w._count_before = 0
+    w.first_transient_ts = time.time() - (NET_RETRY_WINDOW_S + 60)
     term = w.poll()
     check("timeout_fail_stays_stuck", term is True and w.status == "stuck"
           and w.outcome == "STUCK")
