@@ -173,3 +173,20 @@ def test_every_session_exit_that_cannot_ask_is_marked():
     assert len(exits) >= 8, exits
     unmarked = [e for e in exits if "HARNESS_REASON_PREFIX" not in e]
     assert unmarked == ['"the nudge budget ran out without a parseable verdict"'], unmarked
+
+
+def test_only_a_lens_that_could_not_be_asked_is_retried():
+    """評決が得られなかった場合のみ張り直す。気に入らない評決を引き直すのとは別物で、
+    前者は穴を観測に変えるだけ、後者は観測そのものを動かす。"""
+    src = Path(CL.__file__).read_text(encoding="utf-8")
+    i = src.index("for attempt in range(1 + LENS_RETRIES):")
+    body = src[i:src.index("def verdicts_only", i)]
+    assert "if not unclear_is_harness_fault(out[lens][" in body, (
+        "レビュアが答えた場合でも張り直している")
+    assert "break" in body
+
+
+def test_the_retry_count_is_recorded():
+    """3回目でようやく取れた評決と、一発で取れた評決は、同じではない。"""
+    src = Path(CL.__file__).read_text(encoding="utf-8")
+    assert '"attempts": attempt + 1' in src

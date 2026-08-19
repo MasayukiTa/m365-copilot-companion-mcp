@@ -67,6 +67,10 @@ NL = chr(10)
 #: A connect that takes longer than this is contention, not latency.
 SLOW_CONNECT_S = 10.0
 
+#: Extra attempts for a lens that could not be asked at all. Not for a lens that answered.
+LENS_RETRIES = 2
+RETRY_PAUSE_S = 20.0
+
 #: Consecutive candidates whose whole panel went silent before the run is called off.
 MAX_CONSECUTIVE_SILENT = 2
 
@@ -176,6 +180,11 @@ def run_lenses(cdp_url, agent_url, goal, reply, lenses, *, timeout_s=LENS_TIMEOU
     # verdicts per candidate on a box with 4.2 GB free and no RAM skip in the log -- the
     # third distinct way this collector found to record a harness fault as a reviewer's
     # opinion.
+    #: A harness fault is transient by nature -- a page that would not open, a floor that had
+    #: not cleared. Retrying it is not the same as retrying until a verdict is liked: the
+    #: retry fires only when NO verdict was obtainable, so it cannot move a verdict, only turn
+    #: a hole into an observation. Without it a single sporadic failure discards the whole
+    #: candidate, and with three lenses per candidate that is most of the corpus.
     out = {}
     with sync_playwright() as pw:
       opened = time.time()
@@ -200,39 +209,52 @@ def run_lenses(cdp_url, agent_url, goal, reply, lenses, *, timeout_s=LENS_TIMEOU
               "need; an empty one renders no composer and every lens goes silent." % cdp_url)
       context = browser.contexts[0]
       for lens in lenses:
-          # FREE RAM AT THE MOMENT THIS LENS STARTS. RefuterSession waits for the 2000 MB floor
-          # and then gives up with the same ("UNCLEAR", "") a thoughtful reviewer returns, so
-          # without this a starved lens and an unsure one look identical in the record. Elapsed
-          # time separates them; this says how close the box was, which is what decides whether
-          # a re-run has any chance.
-          try:
-              from relay.relay_fleet import avail_phys_mb
-              free_mb = round(avail_phys_mb())
-          except Exception:
-              free_mb = None
-          started = time.time()
-          session = RefuterSession(context, agent_url, goal, reply, lens=lens,
-                                   timeout_s=timeout_s).start()
-          deadline = started + timeout_s + 60
-          verdict, reason = None, "the poll loop gave up before the session finished"
-          while time.time() < deadline:
-              got = session.poll()
-              if got is not None:
-                  verdict, reason = got
-                  break
-              time.sleep(1.0)
-          # A LENS THAT NEVER ANSWERED PRODUCED NO EVIDENCE, which is what UNCLEAR means. It is
-          # not "the lens looked and found nothing" -- recording it as UPHELD would credit the
-          # policy that ran it with a clean result it never obtained.
-          # ELAPSED IS RECORDED SO THE COST AXIS CAN BE MEASURED RATHER THAN ASSUMED. A
-          # frontier trades false accepts against review calls, and treating every lens as
-          # equally expensive is a modelling choice that quietly favours whichever lens is in
-          # fact the slow one. Timed-out lenses are excluded downstream: their elapsed time is
-          # the timeout, not the lens.
-          out[lens] = {"verdict": verdict if verdict in A.VERDICTS else A.UNCLEAR,
-                       "reason": reason or "",
-                       "elapsed_s": round(time.time() - started, 1),
-                       "free_mb_at_start": free_mb}
+        for attempt in range(1 + LENS_RETRIES):
+            # FREE RAM AT THE MOMENT THIS LENS STARTS. RefuterSession waits for the 2000 MB floor
+            # and then gives up with the same ("UNCLEAR", "") a thoughtful reviewer returns, so
+            # without this a starved lens and an unsure one look identical in the record. Elapsed
+            # time separates them; this says how close the box was, which is what decides whether
+            # a re-run has any chance.
+            try:
+                from relay.relay_fleet import avail_phys_mb
+                free_mb = round(avail_phys_mb())
+            except Exception:
+                free_mb = None
+            started = time.time()
+            session = RefuterSession(context, agent_url, goal, reply, lens=lens,
+                                     timeout_s=timeout_s).start()
+            deadline = started + timeout_s + 60
+            verdict, reason = None, "the poll loop gave up before the session finished"
+            while time.time() < deadline:
+                got = session.poll()
+                if got is not None:
+                    verdict, reason = got
+                    break
+                time.sleep(1.0)
+            # A LENS THAT NEVER ANSWERED PRODUCED NO EVIDENCE, which is what UNCLEAR means. It is
+            # not "the lens looked and found nothing" -- recording it as UPHELD would credit the
+            # policy that ran it with a clean result it never obtained.
+            # ELAPSED IS RECORDED SO THE COST AXIS CAN BE MEASURED RATHER THAN ASSUMED. A
+            # frontier trades false accepts against review calls, and treating every lens as
+            # equally expensive is a modelling choice that quietly favours whichever lens is in
+            # fact the slow one. Timed-out lenses are excluded downstream: their elapsed time is
+            # the timeout, not the lens.
+            out[lens] = {"verdict": verdict if verdict in A.VERDICTS else A.UNCLEAR,
+                         "reason": reason or "",
+                         "elapsed_s": round(time.time() - started, 1),
+                         "free_mb_at_start": free_mb,
+                         "attempts": attempt + 1}
+            # RETRY ONLY WHAT COULD NOT BE ASKED. A lens that answered -- with a verdict or
+            # with "no parseable verdict after the nudges" -- has been observed, and asking
+            # again until the answer changes would be the difference between collecting data
+            # and shopping for it.
+            from relay.refuter import unclear_is_harness_fault
+            if not unclear_is_harness_fault(out[lens]["reason"]):
+                break
+            if attempt < LENS_RETRIES:
+                print("    %-12s could not be asked (%s); retrying"
+                      % (lens, out[lens]["reason"][:70]), flush=True)
+                time.sleep(RETRY_PAUSE_S)
     return out
 
 
