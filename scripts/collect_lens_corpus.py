@@ -145,6 +145,16 @@ def run_lenses(context, agent_url, goal, reply, lenses, *, timeout_s=LENS_TIMEOU
 
     out = {}
     for lens in lenses:
+        # FREE RAM AT THE MOMENT THIS LENS STARTS. RefuterSession waits for the 2000 MB floor
+        # and then gives up with the same ("UNCLEAR", "") a thoughtful reviewer returns, so
+        # without this a starved lens and an unsure one look identical in the record. Elapsed
+        # time separates them; this says how close the box was, which is what decides whether
+        # a re-run has any chance.
+        try:
+            from relay.relay_fleet import avail_phys_mb
+            free_mb = round(avail_phys_mb())
+        except Exception:
+            free_mb = None
         started = time.time()
         session = RefuterSession(context, agent_url, goal, reply, lens=lens,
                                  timeout_s=timeout_s).start()
@@ -166,7 +176,8 @@ def run_lenses(context, agent_url, goal, reply, lenses, *, timeout_s=LENS_TIMEOU
         # the timeout, not the lens.
         out[lens] = {"verdict": verdict if verdict in A.VERDICTS else A.UNCLEAR,
                      "reason": reason or "",
-                     "elapsed_s": round(time.time() - started, 1)}
+                     "elapsed_s": round(time.time() - started, 1),
+                     "free_mb_at_start": free_mb}
     return out
 
 
