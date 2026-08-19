@@ -209,27 +209,41 @@ def scheduled_run(run_campaign, *, budget_candidates=5, lock_path=None,
 # --------------------------------------------------------------------------------------
 
 def nightly(*, budget_candidates=5, activate=False, operator_approved_activation=False,
-            evaluate=None, archive_path=None, lock_path=None) -> dict:
+            evaluate=None, archive_path=None, lock_path=None,
+            trace_days=7, trace_dir=None, trace_ledger_path=None) -> dict:
     """One scheduled campaign, with the phases that decide WHAT to run wired in.
 
     This exists because the parts had no caller. Phase 9 selected a replay set, Phase 6
     judged the harness, Phase 11 decided whether to start -- each tested, none reachable
     from anything a person could run, which is a way of being finished that does not survive
-    someone trying to use it.
+    someone trying to use it. Phase 8 is the same story: `trace_to_eval.classify`/`promote`
+    were tested but nothing read a real corrections log, classified it, or kept a record of
+    what it had already promoted -- see `trace_to_eval.nightly_step` for what "reachable" means
+    when, as of this wiring, no production caller writes to that log yet.
 
     The order is the argument. The recent decisions are read FIRST, because they answer two
     different questions: whether the harness is well enough to run at all (Phase 6, a
     precondition here) and which failures the next run should replay (Phase 9). Running a
     campaign against a harness that mostly aborts produces more aborts, and choosing what to
-    replay from that history chooses noise.
+    replay from that history chooses noise. Phase 8's corrections are read and classified only
+    once the run is not blocked, for the same reason replay selection is: a blocked night's
+    report should say why it was blocked, not do unrelated bookkeeping first.
+
+    `trace_days`/`trace_dir`/`trace_ledger_path` exist so a caller (a test, an operator
+    pointing at a non-default log) can control where Phase 8 reads and writes without
+    touching the module-level defaults; see `trace_to_eval.nightly_step`.
     """
     from relay.selfimprove import archive as A
     from relay.selfimprove import campaign as C
     from relay.selfimprove import coreset as CS
+    from relay.selfimprove import trace_to_eval as T
     from relay.selfimprove.controller import EvolutionController
 
     archive = A.Archive(archive_path) if archive_path else A.Archive()
-    decisions = [{"state": (e.get("verdict") or "").upper()} for e in archive.entries()][-20:]
+    # `Archive`'s public accessor is `.all()` -- `.entries()` does not exist on it, which
+    # meant this line raised AttributeError the moment archive_path pointed at a real
+    # Archive instance. Nothing had ever called `nightly()` to notice.
+    decisions = [{"state": (e.get("verdict") or "").upper()} for e in archive.all()][-20:]
 
     reasons = preconditions(recent_decisions=decisions, lock_path=lock_path,
                             activate=activate,
@@ -241,6 +255,7 @@ def nightly(*, budget_candidates=5, activate=False, operator_approved_activation
                         "blocked night into a busy one and the record stops saying which"}
 
     replay = CS.select(_recent_failures(archive), budget=budget_candidates)
+    trace_eval = T.nightly_step(days=trace_days, dir_=trace_dir, ledger_path=trace_ledger_path)
 
     def run(budget):
         controller = EvolutionController(activate=activate)
@@ -251,13 +266,14 @@ def nightly(*, budget_candidates=5, activate=False, operator_approved_activation
                         recent_decisions=decisions, activate=activate,
                         operator_approved_activation=operator_approved_activation)
     out["replay_set"] = replay
+    out["trace_to_eval"] = trace_eval
     return out
 
 
 def _recent_failures(archive) -> list:
     """Episode-level failures from the archive's recent entries, for the replay coreset."""
     rows = []
-    for entry in archive.entries()[-20:]:
+    for entry in archive.all()[-20:]:
         for row in ((entry.get("results") or {}).get("episodes") or []):
             if not row.get("success", True):
                 rows.append(row)

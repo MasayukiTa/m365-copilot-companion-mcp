@@ -50,6 +50,11 @@ FINGERPRINT_ENV_KEYS = (
     # with it on against one without it is comparing two different harnesses, which is
     # the entire point of the A/B it exists for.
     "MCP_SETTLE_UNIFIED",
+    # Whether run_episode asked the solver a follow-up question after grading (Phase 6,
+    # relay.selfimprove.solver_feedback). The follow-up cannot change a grade -- it is asked
+    # only after grade_final_state has already run -- but it is an extra turn, and a run made
+    # with it on is not the same measurement as one made without it.
+    "MCP_SOLVER_FEEDBACK",
 )
 
 

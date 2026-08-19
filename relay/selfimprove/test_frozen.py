@@ -316,3 +316,30 @@ def test_the_shipped_frozen_set_matches_its_baseline():
     再ベースラインを伴う正当な変更が入ったか。どちらも人が読むべき事象。"""
     ok, changed = F.frozen_intact()
     assert ok, "frozen set adrift: %s" % changed
+
+
+def test_the_anchor_survives_a_checkout_that_rewrites_line_endings(tmp_path, monkeypatch):
+    """アンカーも生バイト digest だった -- チェックサム側で今朝直したのと同じ欠陥。
+
+    git は Windows で baseline.json を CRLF に展開するので、スナップショット時に書いた
+    アンカーは、そのファイルが checkout / stash / ブランチ切替を通った瞬間に一致しなく
+    なり、誰も触っていない baseline に対して BASELINE_REWRITTEN が出ていた。実測 22 個。
+
+    しかも frozen intact はスケジュール実行の前提条件なので、**アンカーだけで
+    `nightly()` を恒久的にブロックできる**。"""
+    baseline = tmp_path / "frozen_baseline.json"
+    baseline.write_bytes(b'{\n  "checksums": {}\n}\n')
+    digest_lf = F._baseline_digest(str(baseline))
+
+    baseline.write_bytes(b'{\r\n  "checksums": {}\r\n}\r\n')
+    assert F._baseline_digest(str(baseline)) == digest_lf, (
+        "改行の違いだけで別のファイルと判定されている")
+
+
+def test_a_real_edit_to_the_baseline_is_still_detected(tmp_path):
+    """正規化が検査そのものを無力化していないこと -- 書き換えは依然として検出する。"""
+    a = tmp_path / "a.json"
+    b = tmp_path / "b.json"
+    a.write_bytes(b'{"checksums": {"x": "1"}}\n')
+    b.write_bytes(b'{"checksums": {"x": "2"}}\n')
+    assert F._baseline_digest(str(a)) != F._baseline_digest(str(b))

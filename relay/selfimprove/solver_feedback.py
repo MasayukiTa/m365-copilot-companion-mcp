@@ -24,8 +24,28 @@ reader does not merge them.
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections import Counter
+
+
+def enabled() -> bool:
+    """Whether a runner should ask the solver for feedback after an episode's reply. Off.
+
+    Off by default, and deliberately: the question this module asks is a follow-up TURN, and
+    a follow-up turn costs time and -- for a stateful adapter -- may itself become part of
+    what the episode's history looks like from here on. That is a change to what the
+    benchmark measures, not a free observation, so it stays opt-in behind an environment
+    toggle exactly like `relay.settle.unified()`. Whoever turns this on for a run must also
+    be able to see that they did, which is why the flag is listed in
+    `relay.selfimprove.experiment.FINGERPRINT_ENV_KEYS` -- an unrecorded toggle is an
+    unrecorded confound.
+
+    Read from the environment on every call rather than captured at import, so the value a
+    run actually used is the value the fingerprint records.
+    """
+    return os.environ.get("MCP_SOLVER_FEEDBACK", "0").strip() == "1"
+
 
 #: The shape asked for in the brief. Every field is a list except the last two, which are
 #: free text -- kept exactly as specified so a solver prompted from the brief produces

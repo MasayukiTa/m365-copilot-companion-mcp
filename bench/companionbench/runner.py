@@ -45,6 +45,7 @@ from bench.companionbench.pools import EVOLUTION, REGRESSION, REGISTRY, SEALED
 from bench.companionbench.redact import redact
 from relay.selfimprove import manifest as M
 from relay.selfimprove import runtime_config as RC
+from relay.selfimprove import solver_feedback as SF
 
 from bench.companionbench.episode import (COVERAGE_COMPLETE, COVERAGE_PARTIAL,
                                           COVERAGE_VIOLATION)
@@ -361,6 +362,16 @@ def run_episode(episode, agent, *, root=None) -> dict:
                 return dict(_agent_broke_the_grade(episode, started, reason), **evidence)
             return dict(_infra(episode, reason, started,
                                trace=traceback.format_exc(limit=3)), **evidence)
+
+        # SOLVER FEEDBACK -- Phase 6, opt-in, and asked ONLY here. `grade` above is already
+        # final: nothing after this point can change what the episode scored, so a follow-up
+        # turn's own side effects -- on the workdir, on a stateful adapter's history -- cannot
+        # reach the grade. Skipped when the fixture was destroyed: that path is about to
+        # return a different result kind entirely (_agent_destroyed_fixture, below), and
+        # asking a question about a run that is being thrown out just spends a turn on it.
+        solver_feedback_entry = (
+            _ask_solver_for_feedback(agent, episode.episode_id, run.workdir)
+            if SF.enabled() and not destroyed else None)
     # DELETING THE INPUT IS A FAILURE WHETHER OR NOT THE GRADER NOTICED. This only rewrote
     # the outcome when the grader raised or reported infra, so an episode whose grader reads
     # class-level data rather than the fixture -- routing being the live example -- could
@@ -394,9 +405,62 @@ def run_episode(episode, agent, *, root=None) -> dict:
             out["security_coverage"] = COVERAGE_COMPLETE
     out.update({"episode_id": episode.episode_id, "category": episode.category,
                 "latency_s": round(time.time() - started, 3)})
+    # NOT PART OF THE GRADE ABOVE, and cannot be: `solver_feedback_entry` was computed after
+    # `grade` was already final (see the SOLVER FEEDBACK comment inside the `with` block). The
+    # key is added only when there is something to add -- with the flag off this is always
+    # None, and the row must come out exactly as it did before this wiring existed, key and
+    # all, for anything that compares a whole row rather than reading one field of it.
+    if solver_feedback_entry is not None:
+        out["solver_feedback"] = solver_feedback_entry
     out.update(_delivery_evidence(agent, transcript_mark, before, after,
                                      workdir=run.workdir))
     return out
+
+
+def _ask_solver_for_feedback(agent, episode_id, workdir):
+    """One follow-up turn, asked and read via `relay.selfimprove.solver_feedback`.
+
+    Called only from inside run_episode, only after `grade_final_state` has already produced
+    a final grade -- see the SOLVER FEEDBACK comment there. This function's whole job is to
+    not let anything about asking the question leak backward into that grade.
+
+    A SEPARATE SUBDIRECTORY, not the episode's own workdir. `_delivery_evidence` joins a
+    stateful adapter's transcript row to this episode by matching `workdir`, taking the MOST
+    RECENT row with that value. Handing this turn the same `workdir` the task turn used would
+    make the feedback turn's transcript row the one that match finds, misattributing the
+    episode's delivery evidence to a question about friction instead of to the task itself.
+    The subdirectory still exists on disk (the episode's own `with` block has not exited yet),
+    so an adapter that expects a real path to work in still gets one.
+
+    NEVER RAISES. A solver that cannot be asked a follow-up question is not a reason to lose
+    the episode's actual result, so any failure here is folded into the returned entry via
+    `parse_error` / `solver_feedback_error` rather than propagated.
+    """
+    feedback_dir = os.path.join(workdir, ".solver_feedback")
+    try:
+        os.makedirs(feedback_dir, exist_ok=True)
+        reply = agent(SF.prompt(), feedback_dir) or ""
+    except Exception as exc:
+        return dict(SF.collect(episode_id, ""),
+                    solver_feedback_error="%s: %s" % (type(exc).__name__, exc))
+    return SF.collect(episode_id, reply)
+
+
+def solver_feedback_entries(results) -> list:
+    """The solver-feedback entries carried by a completed pool's rows, in order.
+
+    Pass straight to `solver_feedback.tally` / `to_hypotheses` -- both already do the
+    counting-by-episode and the min_episodes gate that keep a single complaint from becoming
+    a finding. Nothing here aggregates or judges anything itself, which is the point: the
+    entries reach the ledger's proposal step (a human, or a future proposer reading
+    `to_hypotheses`' output) the same way any other hypothesis does, never a gate directly.
+
+    Rows carry no entry when the flag was off, when the episode never reached a graded reply
+    (setup/agent/grader failure), or when its fixture was destroyed -- all of those are
+    skipped rather than padded with a placeholder, so `len(...)` here is never mistaken for
+    the pool size.
+    """
+    return [r["solver_feedback"] for r in (results or []) if r.get("solver_feedback")]
 
 
 def _delivery_evidence(agent, mark, before, after, workdir=None) -> dict:

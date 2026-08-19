@@ -141,6 +141,7 @@ jobs:
             bench/companionbench/test_shadow_rules.py \
             bench/companionbench/test_office_episodes.py \
             bench/companionbench/test_runner.py \
+            bench/companionbench/test_solver_feedback_wiring.py \
             bench/companionbench/test_runtime_episodes.py \
             bench/companionbench/test_sealed.py \
             bench/gaia/test_run_pipeline.py \
@@ -209,6 +210,7 @@ jobs:
             relay/selfimprove/test_evolution_loop.py \
             relay/selfimprove/test_measurement_integrity.py \
             relay/selfimprove/test_trace_to_eval.py \
+            relay/selfimprove/test_trace_wiring.py \
             relay/selfimprove/test_l2_cron.py \
             relay/selfimprove/test_parameters_have_effect.py \
             relay/selfimprove/test_reviewer_allocation.py \

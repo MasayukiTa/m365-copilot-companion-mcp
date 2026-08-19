@@ -48,6 +48,7 @@ import hashlib
 import json
 import os
 import time
+from pathlib import Path
 
 from relay import provenance as P
 
@@ -215,3 +216,264 @@ def summarise(records) -> dict:
         "promotion_rate": (promoted / total) if total else None,
         "harness_share": (counts[HARNESS_FAILURE] / total) if total else None,
     }
+
+
+# --------------------------------------------------------------------------------------
+# Wiring: reading recorded corrections, classifying a batch, and making promotions durable
+#
+# WHERE THE RECORDS THIS SECTION READS COME FROM, AND WHERE THEY DO NOT
+#
+# `signal()` above is the shape a correction takes once something -- a human reviewing a
+# session, or a checker that already ran -- has looked at it and can say what kind of
+# correction it was and who is asserting it. As of this wiring, NOTHING ELSE IN THIS
+# REPOSITORY PRODUCES THOSE RECORDS. `tools/trace_ops.py` records individual MCP tool calls
+# (name, args, ok, error, a machine-generated summary) with no notion of a user's reaction to
+# a run; a retried tool call there could equally be the client's own transport retry, an
+# unrelated repeated command, or a person redoing something on purpose, and treating any of
+# those as `retried_task` would be inventing the judgement `classify` exists to require, not
+# reading it off the log. The `.fleet` directory (checked, see the wiring report) is a scratch
+# space of one-off analysis scripts and benchmark artifacts, not a structured trace store, and
+# holds nothing in the SIGNALS vocabulary either.
+#
+# So this section defines the durable, real contract Phase 8 promised instead of pretending
+# one already exists: a corrections log next to `tools/trace_ops.py`'s own toolcalls log
+# (same directory, same JSONL-per-day convention, also gitignored -- see `.companion_runs/`
+# in .gitignore -- because it is runtime state, not something to check in), a reader that
+# turns it into the batch `promote_from_corrections` consumes, and a ledger that makes
+# promotion idempotent across runs. `record_correction` has no production caller yet; until
+# something detects a real correction and calls it, `read_corrections` legitimately returns
+# nothing and `run_wiring` legitimately promotes nothing. That is the honest state of
+# production trace capture today -- not a bug in this wiring, and not something this wiring
+# should paper over by inventing signals from data that cannot support them.
+
+#: The fields a caller may attach to a signal to supply the judgement `classify` needs.
+#: Deliberately separate from what `signal()` itself produces: the correction and the
+#: judgement of *why* it happened are recorded by different people/steps in general, and
+#: merging them into one shape would make it look like `signal()` already knows the verdict.
+_JUDGEMENT_FIELDS = ("evidence", "refusal_was_correct", "environment_healthy",
+                     "instruction_was_unambiguous")
+
+#: Default ledger of promoted proposal_ids, next to burned.jsonl -- same append-only,
+#: checked-in-empty convention (see relay/selfimprove/burned.jsonl), so a promotion is
+#: recorded exactly once no matter how many times the corrections log is re-read.
+DEFAULT_LEDGER = os.path.join(os.path.dirname(__file__), "promoted_traces.jsonl")
+
+
+def _corrections_dir() -> Path:
+    """Where corrections are recorded and read from: next to the toolcalls trace log."""
+    from tools import trace_ops as TO
+    return TO.RUNS_DIR
+
+
+def _corrections_log_path(day=None, dir_=None) -> Path:
+    day = day or time.strftime("%Y-%m-%d")
+    base = Path(dir_) if dir_ is not None else _corrections_dir()
+    return base / ("corrections_%s.jsonl" % day)
+
+
+def record_correction(sig: dict, *, evidence=None, refusal_was_correct=None,
+                      environment_healthy=None, instruction_was_unambiguous=None,
+                      day=None, dir_=None) -> None:
+    """Append one reviewed correction to today's corrections log. Best-effort; never raises,
+    matching `tools/trace_ops.record_call` -- recording a correction must never be able to
+    break the call that produced it.
+
+    `sig` is a `signal()` dict. The judgement kwargs are optional and are exactly what
+    `classify` accepts; a caller with no judgement yet may omit all of them, and the record
+    will classify as unreviewed (MODEL_LIMITATION or USER_PREFERENCE, not promotable) until
+    someone attaches one -- see the module docstring for why that default is correct rather
+    than a gap.
+    """
+    try:
+        entry = dict(sig or {})
+        entry["evidence"] = list(evidence or [])
+        entry["refusal_was_correct"] = refusal_was_correct
+        entry["environment_healthy"] = environment_healthy
+        entry["instruction_was_unambiguous"] = instruction_was_unambiguous
+        path = _corrections_log_path(day, dir_)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def read_corrections(*, days=7, dir_=None) -> list:
+    """Every reviewed correction recorded in the last `days` days' logs, oldest first.
+
+    Missing files and unparsable lines are skipped rather than raising: a scheduled run
+    reading a log nothing has written today should see an empty list, not a crash -- the same
+    posture `toolcalls_tail` takes toward a missing trace file.
+    """
+    base = Path(dir_) if dir_ is not None else _corrections_dir()
+    out = []
+    try:
+        candidates = sorted(base.glob("corrections_*.jsonl"))
+    except OSError:
+        return out
+    if days:
+        candidates = candidates[-int(days):]
+    for path in candidates:
+        try:
+            with path.open(encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        out.append(json.loads(line))
+                    except ValueError:
+                        continue
+        except OSError:
+            continue
+    return out
+
+
+def reviewed_from_corrections(records) -> list:
+    """Adapt raw `read_corrections()` rows into what `promote_from_corrections` wants:
+    `{"signal": {...}, "evidence": [...], "refusal_was_correct": ..., ...}`.
+
+    A row missing a `kind` is not a signal at all (a hand-edited or truncated line, say) and
+    is dropped here rather than forced through `classify`, which would raise on it.
+    """
+    out = []
+    for row in records or []:
+        row = dict(row or {})
+        if not row.get("kind"):
+            continue
+        judged = {k: row.pop(k, None) for k in _JUDGEMENT_FIELDS}
+        out.append({"signal": row, **judged})
+    return out
+
+
+def promote_from_corrections(reviewed, *, already_promoted=None) -> dict:
+    """Classify a batch of reviewed corrections, promote what earns it, count the rest.
+
+    `reviewed` items are `{"signal": sig, "evidence": [...], "refusal_was_correct": ...,
+    "environment_healthy": ..., "instruction_was_unambiguous": ...}` -- the judgement fields
+    are exactly `classify`'s kwargs and are never invented here; a missing one is passed
+    through as None/absent, which is what makes an unreviewed correction refuse promotion by
+    default instead of by special-casing.
+
+    Corrections are grouped by (task_class, kind) -- the same key `promote` hashes into a
+    `proposal_id` -- because that is what "the same correction observed again" means in this
+    module: `support` (Phase 8's minimum-two-observations gate) is the count of
+    harness-failure-classified instances in a group, not a count of raw log lines.
+
+    `already_promoted` is the set of proposal_ids a previous run already promoted (see
+    `run_wiring`), so a correction reaching this function again -- because the log was
+    re-read on a later night -- is recognised as the SAME correction rather than promoted a
+    second time.
+    """
+    already_promoted = set(already_promoted or ())
+    verdict_rows = []
+    groups = {}
+    for item in reviewed or []:
+        sig = dict(item.get("signal") or {})
+        if not sig.get("kind"):
+            continue
+        v = classify(sig, evidence=item.get("evidence"),
+                    refusal_was_correct=item.get("refusal_was_correct"),
+                    environment_healthy=item.get("environment_healthy"),
+                    instruction_was_unambiguous=item.get("instruction_was_unambiguous"))
+        row = {"class": v["class"], "promoted": False}
+        verdict_rows.append(row)
+        key = (sig.get("task_class"), sig.get("kind"))
+        groups.setdefault(key, []).append((sig, v, item.get("evidence") or [], row))
+
+    promoted = []
+    for rows in groups.values():
+        failures = [r for r in rows if r[1].get("may_promote")]
+        if not failures:
+            continue
+        sig, verdict, _, _ = failures[0]
+        merged_evidence = []
+        for _, _, ev, _ in failures:
+            merged_evidence.extend(ev)
+        try:
+            proposal = promote(sig, verdict, evidence=merged_evidence, support=len(failures))
+        except PromotionRefused:
+            # classified as a harness failure but refused at the provenance or support gate
+            # (untrusted authority, or still short of MIN_SUPPORT) -- counted above via
+            # verdict_rows, left unpromoted here, exactly like any other refusal.
+            continue
+        if proposal["proposal_id"] in already_promoted:
+            continue
+        proposal = dict(proposal)
+        proposal["pool"] = promotion_pool()
+        promoted.append(proposal)
+        for _, _, _, row in failures:
+            row["promoted"] = True
+
+    return {"summary": summarise(verdict_rows), "promoted": promoted,
+           "considered": len(verdict_rows)}
+
+
+def promotion_pool() -> str:
+    """Which companionbench pool a promoted proposal belongs to, and why it is never sealed.
+
+    A promoted proposal is an unvalidated suggestion drawn from production behaviour that a
+    person has not yet written a grader for (`promote` sets `needs_human_grader`) -- exactly
+    the kind of thing the sealed pool exists to stay untouched by (bench/companionbench/
+    pools.py: "read at milestones only; the optimiser must not be able to inspect it").
+    EVOLUTION is the pool the optimiser may read, re-run and mine freely, which is what a
+    proposal is for until a person gives it a grader and it earns a place of its own.
+    """
+    from bench.companionbench import pools as POOLS
+    return POOLS.EVOLUTION
+
+
+def _read_ledger(path=None) -> set:
+    ids = set()
+    try:
+        with open(path or DEFAULT_LEDGER, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                pid = row.get("proposal_id")
+                if pid:
+                    ids.add(pid)
+    except FileNotFoundError:
+        pass
+    return ids
+
+
+def _append_ledger(proposals, path=None) -> None:
+    if not proposals:
+        return
+    path = path or DEFAULT_LEDGER
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        for p in proposals:
+            fh.write(json.dumps(p, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def run_wiring(reviewed, *, ledger_path=None) -> dict:
+    """The whole Phase 8 step, made idempotent: classify, promote what earns it, count the
+    rest, and record what was promoted so a second run over the same corrections does not
+    promote them again.
+
+    This is what `scheduler.nightly()` calls. It does not replace calling `classify`/
+    `promote` directly for a single correction under review -- it is the batch path a
+    scheduled run needs on top of them.
+    """
+    already = _read_ledger(ledger_path)
+    out = promote_from_corrections(reviewed, already_promoted=already)
+    _append_ledger(out["promoted"], ledger_path)
+    out["ledger_path"] = ledger_path or DEFAULT_LEDGER
+    out["already_promoted_count"] = len(already)
+    return out
+
+
+def nightly_step(*, days=7, dir_=None, ledger_path=None) -> dict:
+    """Everything a scheduled run needs from Phase 8: read the corrections log, classify,
+    promote what earns it, count the rest, keep promotion idempotent. See `scheduler.nightly`
+    for how this becomes part of a campaign's report.
+    """
+    reviewed = reviewed_from_corrections(read_corrections(days=days, dir_=dir_))
+    return run_wiring(reviewed, ledger_path=ledger_path)

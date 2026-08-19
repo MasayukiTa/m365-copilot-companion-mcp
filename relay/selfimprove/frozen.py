@@ -196,6 +196,23 @@ def snapshot_baseline(repo_root: str = REPO, baseline_path: str = DEFAULT_BASELI
     return data
 
 
+def _baseline_digest(baseline_path: str) -> str:
+    """The anchor's view of the baseline file, with line endings normalised.
+
+    RAW BYTES WERE WRONG HERE FOR THE SAME REASON THEY WERE WRONG FOR THE CHECKSUMS. git
+    materialises this file with CRLF on a Windows checkout, so the anchor written at snapshot
+    time stopped matching the moment the file was checked out, stashed, or switched across a
+    branch -- and `frozen_intact` then reported BASELINE_REWRITTEN on a baseline nobody had
+    touched. Measured: 22 CRLF pairs, LF-normalised digest matches the anchor exactly.
+
+    That false positive is not cosmetic. An intact frozen set is a precondition of the
+    scheduled run, so the anchor alone was enough to keep `nightly()` permanently blocked --
+    a second, independent reason on top of the AttributeError in `nightly` itself.
+    """
+    with open(baseline_path, "rb") as fh:
+        return hashlib.sha256(fh.read().replace(b"\r\n", b"\n")).hexdigest()
+
+
 def load_baseline(baseline_path: str = DEFAULT_BASELINE) -> dict | None:
     """Load the baseline json, or None if it does not exist / is unreadable."""
     if not os.path.isfile(baseline_path):
@@ -264,9 +281,8 @@ def frozen_intact(repo_root: str = REPO,
         changed.append("ANCHOR_REDIRECTED_AWAY_FROM_EXISTING")
     if anchor:
         try:
-            with open(baseline_path, "rb") as fh:
-                if hashlib.sha256(fh.read()).hexdigest() != anchor:
-                    changed.append("BASELINE_REWRITTEN")
+            if _baseline_digest(baseline_path) != anchor:
+                changed.append("BASELINE_REWRITTEN")
         except OSError:
             changed.append("BASELINE_UNREADABLE")
 
