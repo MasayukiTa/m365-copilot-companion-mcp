@@ -100,6 +100,23 @@ def _validate_selection(chosen, panel, k, policy):
     return out
 
 
+def memory_observations(memory) -> int:
+    """How many observations the adaptive policy has actually learned from.
+
+    Zero means the policy has nothing to be adaptive to. Measured rather than assumed,
+    because the failure it guards against is invisible from the outside: with an empty store
+    `select_lenses` returns the panel's own order, which IS the fixed policy -- verified on
+    this repo's live store, where adaptive and fixed chose identically on 10 of 10
+    candidates.
+    """
+    try:
+        cells = getattr(memory, "data", {}).get("cells") or {}
+        return sum(int(c.get("total", 0)) for c in cells.values() if isinstance(c, dict))
+    except Exception:
+        return 0
+
+
+
 def choose(policy, lenses, *, k, features=None, memory=None, seed=None):
     """Which lenses this policy would run for one candidate.
 
@@ -137,7 +154,8 @@ def choose(policy, lenses, *, k, features=None, memory=None, seed=None):
     raise AllocationError("%r is not one of %s" % (policy, ", ".join(POLICIES)))
 
 
-def simulate(corpus, policy, *, k, lens_cost=None, memory=None, seed_base=0):
+def simulate(corpus, policy, *, k, lens_cost=None, memory=None, seed_base=0,
+             allow_cold_start=False):
     """Score one policy over a corpus where every lens was run against every candidate.
 
     Each corpus row is
@@ -153,6 +171,21 @@ def simulate(corpus, policy, *, k, lens_cost=None, memory=None, seed_base=0):
     rows = list(corpus or [])
     if not rows:
         raise AllocationError("an empty corpus cannot compare anything")
+
+    # AN UNTRAINED ADAPTIVE ARM IS THE FIXED ARM WEARING A DIFFERENT LABEL, and a frontier
+    # drawn over the two would be a policy compared against itself. This repository has the
+    # failure written up already -- an A/B whose arms were the same program, reporting a
+    # p-value about noise -- and this is the same shape one layer up. Refused rather than
+    # noted, because a note on a run that took an hour is read after the conclusion has been
+    # formed. `allow_cold_start=True` is for deliberately measuring the cold start itself.
+    if normalise_policy(policy) == ADAPTIVE and not allow_cold_start:
+        seen = memory_observations(memory)
+        if seen <= 0:
+            raise AllocationError(
+                "the adaptive policy has no observations to be adaptive to, so it selects the "
+                "panel's own order -- which is exactly what the fixed policy does. Comparing "
+                "them would be one policy under two names. Warm the memory first, or pass "
+                "allow_cold_start=True if the cold start is what you meant to measure")
 
     panel = sorted({lens for row in rows for lens in (row.get("verdicts") or {})})
     if not panel:
@@ -232,6 +265,10 @@ def simulate(corpus, policy, *, k, lens_cost=None, memory=None, seed_base=0):
     clusters = {row.get("cluster") for row in rows if row.get("cluster")}
     return {
         "policy": normalise_policy(policy), "k": k, "candidates": len(rows), "panel": panel,
+        # Carried so a reader of the result can see how much the adaptive arm had learned,
+        # rather than inferring it from the fact that nobody mentioned it.
+        "adaptive_observations": (memory_observations(memory)
+                                  if normalise_policy(policy) == ADAPTIVE else None),
         "clusters": len(clusters) if clusters else None,
         "false_accept": false_accept, "false_reject": false_reject,
         "true_accept": true_accept, "true_reject": true_reject,

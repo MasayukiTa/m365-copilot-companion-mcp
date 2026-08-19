@@ -103,7 +103,7 @@ def test_the_adaptive_policy_is_asked_exactly_once_per_candidate(tmp_path):
             calls.append(k)
             return list(cands)[:k]
 
-    A.simulate(_corpus(), A.ADAPTIVE, k=2, memory=_Mem())
+    A.simulate(_corpus(), A.ADAPTIVE, k=2, memory=_Mem(), allow_cold_start=True)
     assert len(calls) == 5, "候補5件に対して %d 回呼ばれた" % len(calls)
 
 
@@ -244,7 +244,7 @@ def test_a_policy_that_selects_nothing_is_refused():
         def select_lenses(self, features, cands, k):
             return []
     with pytest.raises(A.AllocationError) as exc:
-        A.simulate(_corpus(), A.ADAPTIVE, k=2, memory=_Empty())
+        A.simulate(_corpus(), A.ADAPTIVE, k=2, memory=_Empty(), allow_cold_start=True)
     assert "zero cost" in str(exc.value)
 
 
@@ -253,7 +253,7 @@ def test_a_policy_that_selects_outside_the_panel_is_refused():
         def select_lenses(self, features, cands, k):
             return ["telepathy"]
     with pytest.raises(A.AllocationError) as exc:
-        A.simulate(_corpus(), A.ADAPTIVE, k=2, memory=_Wild())
+        A.simulate(_corpus(), A.ADAPTIVE, k=2, memory=_Wild(), allow_cold_start=True)
     assert "not in the panel" in str(exc.value)
 
 
@@ -263,7 +263,7 @@ def test_a_policy_that_repeats_a_lens_is_refused():
         def select_lenses(self, features, cands, k):
             return [cands[0], cands[0]]
     with pytest.raises(A.AllocationError):
-        A.simulate(_corpus(), A.ADAPTIVE, k=2, memory=_Dup())
+        A.simulate(_corpus(), A.ADAPTIVE, k=2, memory=_Dup(), allow_cold_start=True)
 
 
 def test_a_policy_that_exceeds_its_budget_is_refused():
@@ -271,7 +271,7 @@ def test_a_policy_that_exceeds_its_budget_is_refused():
         def select_lenses(self, features, cands, k):
             return list(cands)
     with pytest.raises(A.AllocationError) as exc:
-        A.simulate(_corpus(), A.ADAPTIVE, k=2, memory=_Greedy())
+        A.simulate(_corpus(), A.ADAPTIVE, k=2, memory=_Greedy(), allow_cold_start=True)
     assert "budget" in str(exc.value)
 
 
@@ -300,3 +300,50 @@ def test_the_output_names_what_it_cannot_support():
     joined = " ".join(got["does_not_support"]).lower()
     for topic in ("generalisation", "severity", "label certainty", "tuning"):
         assert topic in joined, topic
+
+
+# ---- 冷えた adaptive は fixed である（実測に基づく） --------------------------------------------
+
+def test_an_untrained_adaptive_arm_is_refused_because_it_is_the_fixed_arm():
+    """本リポジトリの実際の store は空で、その状態で adaptive は fixed と
+    10/10 候補で同一の選択をした。名前を2つ持つ1つの方策を frontier に並べると、
+    方策を自分自身と比べたことになる -- 同じ形の失敗がこのリポジトリには既に
+    記録されている（両アームが同じプログラムで、p値はノイズを記述していた）。"""
+    class _Cold:
+        data = {"cells": {}, "selects": 0}
+
+        def select_lenses(self, features, cands, k):
+            return list(cands)[:k]
+
+    with pytest.raises(A.AllocationError) as exc:
+        A.simulate(_corpus(), A.ADAPTIVE, k=2, memory=_Cold())
+    assert "one policy under two names" in str(exc.value)
+
+
+def test_a_warmed_memory_is_accepted():
+    class _Warm:
+        data = {"cells": {"b|correctness": {"refute": 3, "total": 9}}, "selects": 9}
+
+        def select_lenses(self, features, cands, k):
+            return list(cands)[:k]
+
+    got = A.simulate(_corpus(), A.ADAPTIVE, k=2, memory=_Warm())
+    assert got["adaptive_observations"] == 9
+
+
+def test_the_cold_start_can_be_measured_deliberately():
+    """冷えた挙動そのものを測りたい走行は正当。ただし明示的に言わせる。"""
+    class _Cold:
+        data = {"cells": {}}
+
+        def select_lenses(self, features, cands, k):
+            return list(cands)[:k]
+
+    got = A.simulate(_corpus(), A.ADAPTIVE, k=2, memory=_Cold(), allow_cold_start=True)
+    assert got["adaptive_observations"] == 0
+
+
+def test_the_observation_count_is_carried_so_a_reader_need_not_infer_it():
+    """『誰も触れなかった』から『学習していた』を推測させない。"""
+    got = A.simulate(_corpus(), A.FIXED, k=2)
+    assert got["adaptive_observations"] is None
