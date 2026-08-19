@@ -55,6 +55,11 @@ FINGERPRINT_ENV_KEYS = (
     # only after grade_final_state has already run -- but it is an extra turn, and a run made
     # with it on is not the same measurement as one made without it.
     "MCP_SOLVER_FEEDBACK",
+    # Whether a run recorded lens verdicts into the refuter memory. It does not change
+    # which lenses ran, but it changes what the ADAPTIVE policy will choose on every
+    # later run -- so two runs made either side of it are not the same harness.
+    "MCP_REFUTER_MEMORY_RECORD",
+    "MCP_ADAPTIVE_REFUTER",
 )
 
 

@@ -2512,11 +2512,25 @@ class RelayWorker:
                 # likely-to-refute lenses for THIS candidate's features -- fewer oracle calls,
                 # adaptive over time. Env unset => this branch is skipped and the full fixed
                 # panel runs exactly as before (byte-for-byte the old behaviour).
+                # SELECTING AND RECORDING WERE THE SAME SWITCH, AND THEY ARE DIFFERENT
+                # QUESTIONS. The memory was written only when adaptive selection was ON, so
+                # it could only ever learn about lenses the policy had already chosen -- the
+                # exploration slot keeps the others alive (measured: 15 observations of each
+                # unchosen lens per 30 candidates against 30 of the chosen one), but there
+                # was no way to warm it from a FULL panel at all.
+                #
+                # That matters beyond the bias. Section 18 compares allocation policies over
+                # a corpus where every lens ran against every candidate, and with an empty
+                # memory the adaptive policy returns the panel's own order -- which is the
+                # fixed policy, so the comparison would put one policy on the frontier twice.
+                # `MCP_REFUTER_MEMORY_RECORD=1` records without changing what runs.
                 self._adaptive_features = None
-                if os.environ.get("MCP_ADAPTIVE_REFUTER") == "1":
+                adaptive = os.environ.get("MCP_ADAPTIVE_REFUTER") == "1"
+                if adaptive or os.environ.get("MCP_REFUTER_MEMORY_RECORD") == "1":
                     from .refuter_memory import RefuterMemory, extract_features
                     self._adaptive_mem = RefuterMemory()
                     self._adaptive_features = extract_features(self.goal, self.last_response)
+                if adaptive:
                     try:
                         k = int(os.environ.get("MCP_ADAPTIVE_REFUTER_K", "2"))
                     except ValueError:
