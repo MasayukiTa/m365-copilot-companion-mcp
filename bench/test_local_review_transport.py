@@ -176,6 +176,7 @@ def test_unexpected_controller_exit_restarts_same_job_until_done(tmp_path, monke
     state = tmp_path / "state"
     db = tmp_path / "jobs.sqlite3"
     launches = []
+    fake_errors = []
 
     class FakeController:
         next_pid = 9000
@@ -187,17 +188,26 @@ def test_unexpected_controller_exit_restarts_same_job_until_done(tmp_path, monke
             self.returncode = 7 if not launches else 0
             launches.append(self)
             if self.returncode == 0:
-                job_file = Path(cmd[cmd.index("--job-file") + 1])
-                job_id = json.loads(job_file.read_text(encoding="utf-8"))["job_id"]
-                current = LocalJobStore(db)
-                for seq in (1, 2, 3):
-                    claim = current.claim_turn(job_id, seq, "replacement")
-                    current.commit_turn(
-                        job_id, seq, claim["lease_id"], claim["fencing_token"],
-                        "CANDIDATE_DONE" if seq == 3 else "CONTINUE",
-                        "final" if seq == 3 else "progress",
-                    )
-                current.verify_candidate(job_id, True, "verified")
+                # THE FAKE'S OWN FAILURES WERE THE ONE THING NOTHING COULD SEE. The leading
+                # hypothesis is contention on this second connection, and an exception raised
+                # here surfaces to the transport as "the launch failed" -- an entirely
+                # different story from the one the assertions below tell. Recorded rather
+                # than swallowed, so the run that fails is the run that names the cause.
+                try:
+                    job_file = Path(cmd[cmd.index("--job-file") + 1])
+                    job_id = json.loads(job_file.read_text(encoding="utf-8"))["job_id"]
+                    current = LocalJobStore(db)
+                    for seq in (1, 2, 3):
+                        claim = current.claim_turn(job_id, seq, "replacement")
+                        current.commit_turn(
+                            job_id, seq, claim["lease_id"], claim["fencing_token"],
+                            "CANDIDATE_DONE" if seq == 3 else "CONTINUE",
+                            "final" if seq == 3 else "progress",
+                        )
+                    current.verify_candidate(job_id, True, "verified")
+                except Exception as exc:
+                    fake_errors.append("%s: %s" % (type(exc).__name__, exc))
+                    raise
 
         def poll(self):
             return self.returncode
@@ -227,7 +237,10 @@ def test_unexpected_controller_exit_restarts_same_job_until_done(tmp_path, monke
             return "job=%s status=%s events=%s launches=%d exit_codes=%s" % (
                 jid, st.get("status"),
                 [e.get("event") for e in st.get("events") or []],
-                len(launches), [c.returncode for c in launches])
+                len(launches), [c.returncode for c in launches]) + (
+                    " fake_errors=%s" % fake_errors if fake_errors
+                    else " (the fake raised nothing, so contention on its second connection "
+                         "is NOT the cause)")
         except Exception as exc:
             return "could not read the job state either: %s: %s" % (type(exc).__name__, exc)
 

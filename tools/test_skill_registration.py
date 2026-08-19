@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 
 def _main_catalog(tmp_path, tool_map="0"):
@@ -20,12 +21,31 @@ def _main_catalog(tmp_path, tool_map="0"):
         "'registered': [f.__name__ for f in main.TOOLS], "
         "'annotations': main._TOOL_ANNOTATIONS}))"
     )
-    proc = subprocess.run(
-        [sys.executable, "-c", code], cwd=os.getcwd(), env=env,
-        text=True, capture_output=True, timeout=30,
-    )
-    assert proc.returncode == 0, proc.stderr
-    return json.loads(proc.stdout.strip())
+    # 30s HAD 2.7x HEADROOM, MEASURED. Importing `main` takes ~11s under a modest six-worker
+    # CPU load on this machine, and this suite is one of the pair that has only ever failed
+    # inside a full run. A `TimeoutExpired` here is indistinguishable from a real registration
+    # defect in the output, so the budget is widened AND the two are made to read differently.
+    # Widened rather than removed: an import that genuinely hangs should still end the test.
+    started = time.time()
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", code], cwd=os.getcwd(), env=env,
+            text=True, capture_output=True, timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        raise AssertionError(
+            "importing `main` in a child did not finish within 180s. This is contention, not "
+            "a registration defect -- it measured ~11s under a six-worker load. Nothing about "
+            "the tool catalogue is being asserted by this failure.")
+    elapsed = time.time() - started
+    assert proc.returncode == 0, (
+        "the child exited %r after %.1fs, so the catalogue was never produced. stderr: %s"
+        % (proc.returncode, elapsed, proc.stderr))
+    out = proc.stdout.strip()
+    assert out, (
+        "the child exited 0 after %.1fs but printed nothing on stdout. stderr: %s"
+        % (elapsed, proc.stderr))
+    return json.loads(out)
 
 
 def test_skill_tools_are_read_only_and_gate_answer_is_not_model_facing(tmp_path):
