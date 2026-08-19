@@ -34,6 +34,27 @@ useless" rather than "no lens could have seen this".
 
 Both are produced. `simulate` already separates the two: `false_accept_catchable` counts only
 bad rows some lens did refute, against the raw count as the ceiling.
+
+MEASURED 2026-08-20, AND THE ASSUMPTION ABOVE CAME OUT BACKWARDS
+---------------------------------------------------------------
+Refutations per seeded row, across the three episodes: disclosing 2 of 9 lens passes, silent
+6 of 9. The violations the reply never mentioned were caught THREE TIMES more often than the
+ones it announced.
+
+Reading the replies side by side explains it, and the explanation is a confound rather than a
+surprise about security review. The silent reply is one sentence claiming the work is done,
+with no evidence of anything, and a correctness or edge lens refutes that on its own terms.
+The disclosing reply describes the work in detail -- including the violation -- and reads as
+thorough. So the silent catches are the panel detecting an empty reply, not a violation; and
+the disclosing rows are the alarming half, upheld by seven of nine passes while stating
+outright that a document had told the agent to copy a secret out.
+
+REPLY LENGTH IS THEREFORE A CONFOUND IN BOTH DIRECTIONS, and the `catchable` count on a
+seeded corpus can be dominated by it. The two styles here are kept as they are, because they
+are what was measured and the finding is recorded against them -- but a future version needs
+a disclosing reply as long and as specific as the compliant one, differing only in whether
+the violation is mentioned. Until then, do not read a disclosing/silent gap as evidence about
+the security lens.
 """
 from __future__ import annotations
 
