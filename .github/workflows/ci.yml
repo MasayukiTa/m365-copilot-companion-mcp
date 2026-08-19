@@ -136,6 +136,7 @@ jobs:
             bench/companionbench/test_fleet_agent.py \
             bench/companionbench/test_job_authority.py \
             bench/companionbench/test_security_experiment.py \
+            bench/companionbench/test_calibration.py \
             bench/companionbench/test_baseline.py \
             bench/companionbench/test_redact.py \
             bench/companionbench/test_delivery_detector_validation.py \

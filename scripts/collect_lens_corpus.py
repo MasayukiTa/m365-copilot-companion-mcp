@@ -51,12 +51,17 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from bench.companionbench import episode as EP            # noqa: E402
+from bench.companionbench.calibration import CALIBRATION_KEY as CAL_KEY  # noqa: E402
 from relay.selfimprove import reviewer_allocation as A    # noqa: E402
 
 #: How long to let one lens think before recording UNCLEAR. Generous: a lens that timed out
 #: is recorded as having produced no evidence, which is what UNCLEAR means, but a timeout that
 #: is really impatience would fill the corpus with them.
 LENS_TIMEOUT_S = 420.0
+
+#: Written explicitly so the file is LF on every platform, and so no escape has to survive
+#: the shell that generated this module.
+NL = chr(10)
 
 
 def truth_from_grade(grade) -> dict:
@@ -120,8 +125,16 @@ def run_lenses(context, agent_url, goal, reply, lenses, *, timeout_s=LENS_TIMEOU
     return out
 
 
-def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None) -> dict:
-    """Run each episode, grade it, then run every lens over its reply. Append-only."""
+def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
+            calibrate=True) -> dict:
+    """Run each episode, grade it, then run every lens over its reply. Append-only.
+
+    `calibrate` seeds known-bad SECURITY candidates alongside the real run. It defaults on
+    because without them the security denominator on these pools is empty -- measured, not
+    assumed: the recorded 22-episode baseline has nine bad candidates, all functional, and
+    all three security episodes unevaluable. Every row is flagged, so the frontier can be
+    read with and without them.
+    """
     from playwright.sync_api import sync_playwright
 
     from relay.refuter import PANEL_LENSES
@@ -173,6 +186,7 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None) -> di
                 "bad": truth_from_grade(grade),
                 "verdicts": verdicts,
                 "features": {"kind": episode.category or "unknown"},
+                CAL_KEY: False,
             })
             with io.open(out_path, "a", encoding="utf-8", newline="\n") as fh:
                 fh.write(json.dumps(rows[-1], ensure_ascii=False, sort_keys=True) + "\n")
@@ -180,6 +194,25 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None) -> di
                   % (episode.episode_id, rows[-1]["bad"]["functional"],
                      rows[-1]["bad"]["security"],
                      " ".join("%s=%s" % (l, v[:1]) for l, v in verdicts.items())), flush=True)
+        if calibrate:
+            from bench.companionbench.calibration import known_bad_rows
+            seeds = [e for e in episodes if getattr(e, "category", "") == "security"]
+            for episode, style, prompt, reply, grade in known_bad_rows(seeds):
+                verdicts = run_lenses(context, agent_url, prompt, reply, lenses)
+                rows.append({
+                    "candidate_id": "%s#%s" % (episode.episode_id, style),
+                    "bad": truth_from_grade(grade),
+                    "verdicts": verdicts,
+                    "features": {"kind": episode.category or "unknown"},
+                    CAL_KEY: True,
+                    "reply_style": style,
+                })
+                with io.open(out_path, "a", encoding="utf-8", newline=NL) as fh:
+                    fh.write(json.dumps(rows[-1], ensure_ascii=False, sort_keys=True) + NL)
+                print("  %-28s [calibration/%s] security=%s  %s"
+                      % (episode.episode_id, style, rows[-1]["bad"]["security"],
+                         " ".join("%s=%s" % (ln, v[:1]) for ln, v in verdicts.items())),
+                      flush=True)
     return {"rows": rows, "skipped": skipped, "lenses": lenses}
 
 
@@ -200,6 +233,9 @@ def main() -> int:
     ap.add_argument("--out", default=str(ROOT / ".fleet" / "lens_corpus.jsonl"))
     ap.add_argument("--pool", default="evolution")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--no-calibration", action="store_true",
+                    help="omit the known-bad security candidates. The security axis then has "
+                         "an empty denominator on these pools and cannot discriminate.")
     args = ap.parse_args()
 
     if not args.agent_url:
@@ -222,7 +258,8 @@ def main() -> int:
     os.environ.setdefault("MCP_REFUTER_MEMORY_RECORD", "1")
 
     got = collect(cdp_url=args.cdp_url, agent_url=args.agent_url, episodes=episodes,
-                  agent=build_agent("fleet"), out_path=args.out)
+                  agent=build_agent("fleet"), out_path=args.out,
+                  calibrate=not args.no_calibration)
     print()
     print("recorded %d row(s) to %s" % (len(got["rows"]), args.out))
     if got["skipped"]:
