@@ -55,7 +55,7 @@ class Blocked(RuntimeError):
 
 def preconditions(*, recent_decisions=None, lock_path=None, activate=False,
                   operator_approved_activation=False, budget_candidates=None,
-                  baseline_path=None, level="B") -> list:
+                  baseline_path=None, level="B", plateau_k=5) -> list:
     """Every reason this run should not start. Empty means it may.
 
     Returns reasons rather than raising so a caller can log all of them at once: fixing one
@@ -109,7 +109,77 @@ def preconditions(*, recent_decisions=None, lock_path=None, activate=False,
             if "unwell" in observation["finding"]:
                 reasons.append("%s -- %s" % (observation["finding"], observation["evidence"]))
 
+        # PLATEAU (L3, relay.selfimprove.policy). A different question from "is the harness
+        # well": the environment can be perfectly healthy while the last K candidates all
+        # failed their gate, and continuing then is spending nights on a direction that has
+        # stopped paying. `harness_feedback` watches for aborts; this watches for a run of
+        # honest rejections, which look fine one at a time.
+        from relay.selfimprove import policy as POL
+        # `kept`, NOT `keep`. `policy._keep_flag` reads `final_keep` or `kept`; a dict with
+        # neither reads as a rejection, so an adapter using the wrong spelling makes EVERY
+        # decision look failed -- and the plateau then fires on five consecutive KEEPs, which
+        # is a precondition that blocks the schedule permanently and looks like a finding.
+        history = [{"kept": (d.get("state") or "").upper() == "KEEP"}
+                   for d in recent_decisions]
+        if POL.plateaued(history, plateau_k):
+            reasons.append(
+                "no candidate has passed its gate in the last %d decisions; a scheduled loop "
+                "that keeps proposing into a plateau is buying rows rather than findings, and "
+                "the next move is a human choosing a different direction" % plateau_k)
+
     return reasons
+
+
+
+def tripwires_after(result, *, prev_pass=None, baseline_path=None) -> dict:
+    """Which L3 tripwires the finished run fires, and therefore whether to page a human.
+
+    THE COUNTERPART TO `preconditions`, which only ever answers "may this start". A run that
+    started legitimately can still end somewhere a person needs to see: the judge changed
+    while it ran, the pass rate jumped further than a real change plausibly could, the
+    environment aborted a third of the episodes, or the sentinel regressed.
+
+    Assembled from what the result actually carries. A tripwire whose input is absent is NOT
+    evaluated -- `policy.evaluate_tripwires` is built that way on purpose, so a partial state
+    cannot fire one, and a missing measurement never becomes a fired alarm.
+    """
+    from relay.selfimprove import policy as POL
+
+    state = {}
+    ok, _changed = _frozen(baseline_path)
+    state["frozen_ok"] = ok
+
+    new_pass = (result or {}).get("pass_at_1")
+    if new_pass is not None:
+        state["new_pass"] = new_pass
+        state["prev_pass"] = prev_pass
+
+    infra = (result or {}).get("infra") or {}
+    slice_ids = (result or {}).get("slice_ids") or []
+    infra_ids = ((result or {}).get("on") or {}).get("infra_ids") or []
+    if slice_ids:
+        state["infra_rate"] = len(infra_ids) / float(len(slice_ids))
+    elif infra.get("aborted"):
+        # An abort with no slice to divide by is a total loss, not an unknown rate.
+        state["infra_rate"] = 1.0
+
+    sentinel = (result or {}).get("sentinel") or {}
+    if "regressed" in sentinel:
+        state["sentinel_regressed"] = bool(sentinel.get("regressed"))
+
+    fired = POL.evaluate_tripwires(state)
+    return {
+        "fired": fired,
+        "halt": bool(fired),
+        "state": state,
+        # SAID EXPLICITLY. "No tripwire fired" and "no tripwire could be evaluated" are
+        # different, and only the first is reassuring.
+        "evaluated": sorted(state),
+        "note": ("%d tripwire(s) fired; a scheduled run does not decide what to do about "
+                 "this -- it stops and says so" % len(fired)) if fired
+                else "nothing fired among the %d tripwires this result could answer"
+                     % len(state),
+    }
 
 
 def _frozen(baseline_path):
@@ -210,7 +280,8 @@ def scheduled_run(run_campaign, *, budget_candidates=5, lock_path=None,
 
 def nightly(*, budget_candidates=5, activate=False, operator_approved_activation=False,
             evaluate=None, archive_path=None, lock_path=None,
-            trace_days=7, trace_dir=None, trace_ledger_path=None) -> dict:
+            trace_days=7, trace_dir=None, trace_ledger_path=None,
+            baseline_path=None) -> dict:
     """One scheduled campaign, with the phases that decide WHAT to run wired in.
 
     This exists because the parts had no caller. Phase 9 selected a replay set, Phase 6
@@ -267,6 +338,12 @@ def nightly(*, budget_candidates=5, activate=False, operator_approved_activation
                         operator_approved_activation=operator_approved_activation)
     out["replay_set"] = replay
     out["trace_to_eval"] = trace_eval
+    # AFTER THE RUN, NOT INSTEAD OF THE GATES. The gates decide about the candidate; the
+    # tripwires decide whether the RUN itself is still trustworthy, and those are different
+    # questions with different answers -- a candidate can be correctly rejected by a run whose
+    # judge changed underneath it.
+    out["tripwires"] = tripwires_after((out.get("result") or {}),
+                                       baseline_path=baseline_path)
     return out
 
 

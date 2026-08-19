@@ -217,6 +217,7 @@ jobs:
             relay/selfimprove/test_episode_record.py \
             relay/selfimprove/test_record_wiring.py \
             relay/selfimprove/test_policy.py \
+            relay/selfimprove/test_policy_wiring.py \
             relay/selfimprove/test_propose.py \
             relay/selfimprove/test_quality.py \
             relay/selfimprove/test_quality_loop.py \

@@ -248,6 +248,11 @@ def main(argv=None) -> int:
                          "refuse_an_agent_url for what happened when one was driven.")
     ap.add_argument("--turns", type=int, default=24)
     ap.add_argument("--timeout", type=float, default=180)
+    # NAMES THE CORPUS. `turn_id` is "<campaign>.p<NN>|<turn>", so two runs sharing a
+    # campaign name produce prefixes that collide -- and the replay groups clusters by
+    # that prefix, so concatenating the files would silently merge two populations into
+    # one and understate the cluster count.
+    ap.add_argument("--campaign", default="c1")
     args = ap.parse_args(argv)
 
     def progress(n, prompt, ok):
@@ -255,7 +260,7 @@ def main(argv=None) -> int:
               flush=True)
 
     out = collect(cdp_url=args.cdp_url, agent_url=args.chat_url, turns=args.turns,
-                  timeout_s=args.timeout, on_turn=progress)
+                  timeout_s=args.timeout, on_turn=progress, campaign=args.campaign)
     print("driven %d, failed %d, %.0fs" % (out["turns_driven"], out["turns_failed"],
                                            out["wall_clock_s"]))
     return 0
