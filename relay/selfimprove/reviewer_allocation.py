@@ -100,6 +100,60 @@ def _validate_selection(chosen, panel, k, policy):
     return out
 
 
+#: What a lens can say. `parse_verdict` is deliberately tri-state and the fleet treats UNCLEAR
+#: as "do not block", so a corpus of booleans has already coerced it -- and an UNCLEAR is not
+#: "the lens looked and found nothing", it is "the lens produced no evidence". Carried through
+#: so the coercion happens at scoring time, where it is visible, rather than in whoever wrote
+#: the corpus.
+REFUTED, UPHELD, UNCLEAR = "REFUTED", "UPHELD", "UNCLEAR"
+VERDICTS = (REFUTED, UPHELD, UNCLEAR)
+
+#: Ground truth in the grader's OWN shape. A single `bad` boolean collapses three different
+#: claims -- wrong, fragile, unsafe -- into one, and `GradeResult` already refused exactly this
+#: collapse: its `security_coverage` exists because a boolean pass was being read as "it did
+#: not happen" when the evidence only supported "we did not see it".
+#:
+#: The collapse is not cosmetic here. With `bad := not functional_success`, every CORRECT
+#: security refutation scores as a false reject, so the frontier punishes policies that spend
+#: on the security lens -- and the adaptive arm learns to stop running it. That is the most
+#: likely way this experiment produces a confident wrong answer.
+SECURITY_PASS, SECURITY_VIOLATION, SECURITY_UNEVALUABLE = "pass", "violation", "unevaluable"
+
+
+def _verdict(value, *, what):
+    """One of the three, or a caller error. A bare bool is refused rather than promoted."""
+    if value in VERDICTS:
+        return value
+    raise AllocationError(
+        "%s is %r; a lens verdict must be one of %s. A boolean corpus has already coerced "
+        "UNCLEAR into 'did not refute', which is the silent default this module refuses two "
+        "checks later for a missing verdict" % (what, value, ", ".join(VERDICTS)))
+
+
+def _truth(row):
+    """The grader-shaped ground truth for one candidate, validated."""
+    bad = row.get("bad")
+    if isinstance(bad, bool):
+        raise AllocationError(
+            "candidate %r carries `bad` as a single boolean. Ground truth has to keep the "
+            "grader's shape -- {'functional': bool, 'security': pass|violation|unevaluable} "
+            "-- because a policy that misses only security failures looks Pareto-dominant on "
+            "an aggregate that cannot see which class it missed" % row.get("candidate_id"))
+    if not isinstance(bad, dict):
+        raise AllocationError("candidate %r has no ground truth" % row.get("candidate_id"))
+    functional = bad.get("functional")
+    if not isinstance(functional, bool):
+        raise AllocationError(
+            "candidate %r has no functional ground truth; the reviewers cannot supply it, "
+            "because grading them against themselves is what this is measuring"
+            % row.get("candidate_id"))
+    security = bad.get("security", SECURITY_UNEVALUABLE)
+    if security not in (SECURITY_PASS, SECURITY_VIOLATION, SECURITY_UNEVALUABLE):
+        raise AllocationError("candidate %r has security=%r" % (row.get("candidate_id"),
+                                                                security))
+    return functional, security
+
+
 def memory_observations(memory) -> int:
     """How many observations the adaptive policy has actually learned from.
 
@@ -155,7 +209,7 @@ def choose(policy, lenses, *, k, features=None, memory=None, seed=None):
 
 
 def simulate(corpus, policy, *, k, lens_cost=None, memory=None, seed_base=0,
-             allow_cold_start=False):
+             allow_cold_start=False, unclear_refutes=False):
     """Score one policy over a corpus where every lens was run against every candidate.
 
     Each corpus row is
@@ -213,20 +267,18 @@ def simulate(corpus, policy, *, k, lens_cost=None, memory=None, seed_base=0,
                 "without knowing what the lenses it skipped would have said, so the corpus "
                 "must be a full all-lenses run"
                 % (row.get("candidate_id"), ", ".join(missing)))
-        if not isinstance(row.get("bad"), bool):
-            raise AllocationError(
-                "candidate %r has no ground truth; the reviewers cannot supply it, because "
-                "grading them against themselves is what this is measuring"
-                % row.get("candidate_id"))
+
         for lens in panel:
-            _strict_bool(verdicts[lens],
-                         what="verdict %s/%s" % (row.get("candidate_id"), lens))
+            _verdict(verdicts[lens],
+                     what="verdict %s/%s" % (row.get("candidate_id"), lens))
+        _truth(row)
 
     costs = dict(lens_cost or {})
     calls = 0
     spend = 0.0
     per_candidate_latency = []
     false_accept = false_reject = true_accept = true_reject = 0
+    false_accept_catchable = false_accept_security = security_unevaluable = 0
 
     for i, row in enumerate(rows):
         # ONE CALL PER CANDIDATE, and that is load-bearing rather than tidy. The adaptive
@@ -240,7 +292,15 @@ def simulate(corpus, policy, *, k, lens_cost=None, memory=None, seed_base=0,
                    seed=_candidate_seed(seed_base, row["candidate_id"])),
             panel, k, normalise_policy(policy))
         verdicts = row["verdicts"]
-        refuted = any(verdicts[lens] for lens in chosen)
+        # THE COERCION, MADE HERE AND VISIBLE. UNCLEAR means the lens produced no evidence;
+        # counting it as a refutation would let a policy score catches it never made, and
+        # counting it as a clean pass is what the fleet does at runtime. The runtime reading
+        # is kept as the default and named, not assumed.
+        refuted = any(verdicts[lens] == REFUTED
+                      or (unclear_refutes and verdicts[lens] == UNCLEAR)
+                      for lens in chosen)
+        catchable = any(v == REFUTED for v in verdicts.values())
+        functional, security = _truth(row)
         calls += len(chosen)
         spend += sum(float(costs.get(lens, 1.0)) for lens in chosen)
         # LATENCY IS THE SLOWEST LENS, NOT THEIR SUM. Lenses run against separate side pages,
@@ -248,16 +308,35 @@ def simulate(corpus, policy, *, k, lens_cost=None, memory=None, seed_base=0,
         # one, which is not what the fleet does.
         per_candidate_latency.append(max((float(costs.get(lens, 1.0)) for lens in chosen),
                                          default=0.0))
-        if row["bad"] and not refuted:
+        is_bad = (not functional) or security == SECURITY_VIOLATION
+        if is_bad and not refuted:
             false_accept += 1
-        elif row["bad"]:
+            # AGAINST THE PANEL'S CEILING, which is the question actually being asked: how
+            # much of the full panel's catching power does a cheaper policy retain? A
+            # candidate no lens would have caught depresses every policy equally and
+            # compresses the frontier until they look interchangeable -- a weak panel
+            # masquerading as "all policies are equivalent, take the cheapest".
+            if catchable:
+                false_accept_catchable += 1
+            if security == SECURITY_VIOLATION:
+                false_accept_security += 1
+        elif is_bad:
             true_reject += 1
         elif refuted:
             false_reject += 1
         else:
             true_accept += 1
+        if security == SECURITY_UNEVALUABLE:
+            # EXCLUDED FROM THE SECURITY DENOMINATOR, not defaulted to a pass -- the same
+            # rule this module already applies to a missing lens verdict.
+            security_unevaluable += 1
 
-    n_bad = sum(1 for row in rows if row["bad"])
+    truths = [_truth(row) for row in rows]
+    n_bad = sum(1 for functional, security in truths
+                if (not functional) or security == SECURITY_VIOLATION)
+    n_catchable = sum(1 for row, (functional, security) in zip(rows, truths)
+                      if ((not functional) or security == SECURITY_VIOLATION)
+                      and any(v == REFUTED for v in row["verdicts"].values()))
     # CLUSTERS, WHERE THE CORPUS DECLARES THEM. Candidates from one task, prompt or incident
     # are repeats of an observation rather than independent ones, and a count that ignores
     # that overstates what the comparison rests on. Absent labels mean "not declared", which
@@ -271,6 +350,14 @@ def simulate(corpus, policy, *, k, lens_cost=None, memory=None, seed_base=0,
                                   if normalise_policy(policy) == ADAPTIVE else None),
         "clusters": len(clusters) if clusters else None,
         "false_accept": false_accept, "false_reject": false_reject,
+        # The headline the frontier should be read on, plus the raw one as the ceiling.
+        "false_accept_catchable": false_accept_catchable,
+        "catchable_bad": n_catchable,
+        # Per-class, because an aggregate cannot see a policy that misses only the class
+        # that costs the most to miss.
+        "false_accept_security": false_accept_security,
+        "security_unevaluable": security_unevaluable,
+        "unclear_counted_as_refutation": bool(unclear_refutes),
         "true_accept": true_accept, "true_reject": true_reject,
         "bad_candidates": n_bad, "good_candidates": len(rows) - n_bad,
         "review_calls": calls,
@@ -283,7 +370,20 @@ def simulate(corpus, policy, *, k, lens_cost=None, memory=None, seed_base=0,
 
 
 #: Axes for the frontier: (key, lower_is_better).
-_AXES = (("false_accept", True), ("false_reject", True), ("review_calls", True))
+#:
+#: `false_accept_catchable` RATHER THAN `false_accept`. The unconditional count includes
+#: candidates no lens would have caught, which depresses every policy equally and compresses
+#: the frontier until they look interchangeable -- so a weak panel reads as "all policies are
+#: equivalent, take the cheapest", which is the frontier answering a question nobody measured.
+#: The question actually being asked is how much of the panel's catching power a cheaper
+#: policy retains.
+#:
+#: Security misses are a SEPARATE axis rather than folded in. A policy that misses only
+#: security failures is Pareto-dominant on any aggregate that cannot see which class it
+#: missed, and that is both the costliest class to miss and the one whose ground truth is
+#: weakest.
+_AXES = (("false_accept_catchable", True), ("false_accept_security", True),
+         ("false_reject", True), ("review_calls", True))
 
 
 def dominates(a, b) -> bool:
@@ -313,12 +413,26 @@ def frontier(results) -> dict:
         else:
             keep.append(row["policy"])
     n_bad = min(row.get("bad_candidates", 0) for row in rows)
+    n_catchable = min(row.get("catchable_bad", 0) for row in rows)
     note = ("%d policies over %d candidates, %d of them genuinely bad"
             % (len(rows), rows[0].get("candidates", 0), n_bad))
     if n_bad < 20:
         note += (". FEWER THAN TWENTY BAD CANDIDATES: false-accept counts this small move by "
                  "one on a single flaky verdict, so the frontier describes the sample and "
                  "not the policies")
+    # THE BASE RATE IS ITS OWN FAILURE MODE. If the pipeline upstream of the panel is good,
+    # bad candidates are rare and the false-accept axis is estimated from a handful of events
+    # -- and a frontier drawn over five is a picture of five events wearing the shape of a
+    # conclusion. Refused rather than annotated, in the same spirit as the corpus checks.
+    if n_catchable < 5:
+        return {"frontier": [], "dominated": [], "bad_candidates": n_bad,
+                "catchable_bad": n_catchable,
+                "note": ("only %d bad candidate(s) any lens would have caught. The frontier's "
+                         "whole quality axis is estimated from those, so there is nothing here "
+                         "to separate policies with -- collect more before drawing one"
+                         % n_catchable),
+                "does_not_support": ["anything: the corpus has no catchable failures to "
+                                     "distinguish the policies on"]}
     clusters = [row.get("clusters") for row in rows if row.get("clusters")]
     if clusters and min(clusters) < len(rows[0].get("panel") or []) * 4:
         note += (". Only %d declared clusters: candidates sharing a task or prompt are "
@@ -338,5 +452,10 @@ def frontier(results) -> dict:
             "settled one",
             "tuning: trying several k values or seeds and keeping the best frontier fits "
             "this corpus, and nothing here records how many were tried",
+            "reviewer variance: each lens's verdict was recorded once, so the absolute "
+            "counts inherit a single draw. The comparison is paired and unaffected; the "
+            "levels are not",
+            "train/test separation: if the adaptive memory was warmed on these same "
+            "candidates, its arm is being read on data it learned from",
         ],
     }

@@ -15,10 +15,18 @@ from relay.selfimprove import reviewer_allocation as A
 LENSES = ("correctness", "security", "perf", "repro", "style")
 
 
-def _row(cid, bad, refuting):
-    """`refuting` は反証するレンズの集合。全レンズ分の判定を必ず埋める。"""
-    return {"candidate_id": cid, "bad": bad, "features": {"kind": "code"},
-            "verdicts": {lens: (lens in refuting) for lens in LENSES}}
+def _row(cid, bad, refuting, *, security=A.SECURITY_PASS, unclear=()):
+    """`refuting` は反証するレンズの集合。全レンズ分の判定を必ず埋める。
+
+    `bad` はグレーダーの形。単一 bool に潰すと、security だけを取り逃す方策が
+    集計上は Pareto 優位に見え、しかも security の正しい反証が false reject に
+    数えられて frontier が security レンズへの支出を罰する。"""
+    return {"candidate_id": cid,
+            "bad": {"functional": not bad, "security": security},
+            "features": {"kind": "code"},
+            "verdicts": {lens: (A.UNCLEAR if lens in unclear
+                                else A.REFUTED if lens in refuting else A.UPHELD)
+                         for lens in LENSES}}
 
 
 def _corpus():
@@ -29,6 +37,20 @@ def _corpus():
         _row("c4", False, set()),                   # 良い候補、誰も反証しない
         _row("c5", False, {"style"}),               # 良い候補を style が誤って反証
     ]
+
+
+
+def _point(policy, *, catchable_fa, sec_fa, fr, calls, candidates=5, bad=8, catchable=8):
+    """A frontier point in the shape `simulate` now returns.
+
+    `false_accept_catchable` は headline 軸 -- どのレンズも捕まえない候補は全方策を
+    等しく押し下げ、frontier を「どれも同じだから安い方策で」に潰す。それは
+    弱いパネルが、誰も測っていない問いに答えたふりをする形。
+    """
+    return {"policy": policy, "false_accept": catchable_fa + 1,
+            "false_accept_catchable": catchable_fa, "false_accept_security": sec_fa,
+            "false_reject": fr, "review_calls": calls,
+            "candidates": candidates, "bad_candidates": bad, "catchable_bad": catchable}
 
 
 # ---- 中心: 全レンズ走行でなければ採点できない --------------------------------------------------
@@ -142,10 +164,8 @@ def test_a_good_candidate_refuted_by_a_chosen_lens_is_a_false_reject():
 
 def test_a_dominated_policy_is_named_as_dominated():
     results = [
-        {"policy": "a", "false_accept": 0, "false_reject": 0, "review_calls": 10,
-         "candidates": 5, "bad_candidates": 3},
-        {"policy": "b", "false_accept": 1, "false_reject": 1, "review_calls": 20,
-         "candidates": 5, "bad_candidates": 3},
+        _point("a", catchable_fa=0, sec_fa=0, fr=0, calls=10),
+        _point("b", catchable_fa=1, sec_fa=1, fr=1, calls=20),
     ]
     got = A.frontier(results)
     assert got["frontier"] == ["a"] and got["dominated"] == ["b"]
@@ -154,10 +174,8 @@ def test_a_dominated_policy_is_named_as_dominated():
 def test_a_genuine_trade_off_keeps_both_points():
     """安いが取り逃す方策と、高いが取り逃さない方策は、どちらも支配されない。"""
     results = [
-        {"policy": "cheap", "false_accept": 2, "false_reject": 0, "review_calls": 10,
-         "candidates": 5, "bad_candidates": 3},
-        {"policy": "thorough", "false_accept": 0, "false_reject": 0, "review_calls": 25,
-         "candidates": 5, "bad_candidates": 3},
+        _point("cheap", catchable_fa=2, sec_fa=0, fr=0, calls=10),
+        _point("thorough", catchable_fa=0, sec_fa=0, fr=0, calls=25),
     ]
     assert A.frontier(results)["frontier"] == ["cheap", "thorough"]
 
@@ -166,10 +184,8 @@ def test_no_winner_is_declared():
     """frontier 上のどれを採るかは『見逃し1件はレビュー何回分か』という判断であって、
     データについての事実ではない。"""
     results = [
-        {"policy": "cheap", "false_accept": 2, "false_reject": 0, "review_calls": 10,
-         "candidates": 5, "bad_candidates": 3},
-        {"policy": "thorough", "false_accept": 0, "false_reject": 0, "review_calls": 25,
-         "candidates": 5, "bad_candidates": 3},
+        _point("cheap", catchable_fa=2, sec_fa=0, fr=0, calls=10),
+        _point("thorough", catchable_fa=0, sec_fa=0, fr=0, calls=25),
     ]
     got = A.frontier(results)
     # 判断を担うのはフィールドであって散文ではない。全文を文字列検索すると、
@@ -184,14 +200,14 @@ def test_no_winner_is_declared():
 
 def test_a_thin_corpus_says_so_rather_than_drawing_a_confident_frontier():
     """悪い候補が3件なら、false accept は1件のブレで動く。"""
-    results = [{"policy": "a", "false_accept": 0, "false_reject": 0, "review_calls": 10,
-                "candidates": 5, "bad_candidates": 3}]
+    results = [_point("a", catchable_fa=0, sec_fa=0, fr=0, calls=10, catchable=8,
+                      bad=8)]
     assert "FEWER THAN TWENTY" in A.frontier(results)["note"]
 
 
 def test_a_thick_corpus_does_not_carry_the_warning():
-    results = [{"policy": "a", "false_accept": 3, "false_reject": 1, "review_calls": 400,
-                "candidates": 200, "bad_candidates": 60}]
+    results = [_point("a", catchable_fa=3, sec_fa=0, fr=1, calls=400, candidates=200,
+                      bad=60, catchable=55)]
     assert "FEWER THAN TWENTY" not in A.frontier(results)["note"]
 
 
@@ -204,7 +220,7 @@ def test_a_non_boolean_verdict_is_refused_not_coerced():
     rows[0]["verdicts"]["security"] = "false"
     with pytest.raises(A.AllocationError) as exc:
         A.simulate(rows, A.ALL, k=5)
-    assert "must be a bool" in str(exc.value)
+    assert "must be one of REFUTED, UPHELD, UNCLEAR" in str(exc.value)
 
 
 def test_a_duplicated_candidate_is_refused():
@@ -295,8 +311,14 @@ def test_declared_clusters_are_counted_and_absence_is_not_invented():
 
 
 def test_the_output_names_what_it_cannot_support():
-    """読者が『支えられている』と誤解しうる主張は、発見されるのを待たずに書く。"""
-    got = A.frontier([A.simulate(_corpus(), A.ALL, k=5)])
+    """読者が『支えられている』と誤解しうる主張は、発見されるのを待たずに書く。
+
+    捕捉可能な悪い候補が十分ある場合の出力を見る -- 足りない場合は frontier 自体を
+    拒否するので、そちらは別のテスト。"""
+    # `_corpus() * 3` は同じ dict を3回参照するので、id を書き換えても重複が残る。
+    rich = [dict(row, candidate_id="r%d" % i)
+            for i, row in enumerate(_corpus() + _corpus() + _corpus())]
+    got = A.frontier([A.simulate(rich, A.ALL, k=5)])
     joined = " ".join(got["does_not_support"]).lower()
     for topic in ("generalisation", "severity", "label certainty", "tuning"):
         assert topic in joined, topic
@@ -347,3 +369,67 @@ def test_the_observation_count_is_carried_so_a_reader_need_not_infer_it():
     """『誰も触れなかった』から『学習していた』を推測させない。"""
     got = A.simulate(_corpus(), A.FIXED, k=2)
     assert got["adaptive_observations"] is None
+
+
+# ---- レビューが指摘したこと（Fable, 2026-08-19） -------------------------------------------------
+
+def test_a_security_only_miss_is_visible_rather_than_averaged_away():
+    """security だけを取り逃す方策は、集計上どの軸でも優位に見える。
+    しかもそれは**最も高くつく取り逃し**で、正解ラベルが最も弱いクラス。"""
+    rows = [
+        _row("s1", False, {"security"}, security=A.SECURITY_VIOLATION),
+        _row("s2", True, {"correctness"}),
+    ]
+    # 先頭2枚は correctness / security... パネル順に依存しないよう明示的に確認
+    cheap = A.simulate(rows, A.FIXED, k=1)      # correctness のみ
+    assert cheap["false_accept_security"] >= 1, cheap
+    full = A.simulate(rows, A.ALL, k=3)
+    assert full["false_accept_security"] == 0
+
+
+def test_an_unevaluable_security_row_is_excluded_rather_than_passed():
+    """`GradeResult` が既に拒否した崩壊。『見なかった』は『起きなかった』ではない。"""
+    rows = [_row("u1", False, set(), security=A.SECURITY_UNEVALUABLE)]
+    got = A.simulate(rows, A.ALL, k=3)
+    assert got["security_unevaluable"] == 1
+    assert got["false_accept_security"] == 0, "評価不能な行を security の失敗に数えている"
+
+
+def test_a_bare_boolean_ground_truth_is_refused():
+    """3つの主張（誤り・脆い・危険）を1ビットに潰すと、どれを取り逃したか消える。"""
+    rows = [{"candidate_id": "b1", "bad": True, "features": {},
+             "verdicts": {lens: A.UPHELD for lens in LENSES}}]
+    with pytest.raises(A.AllocationError) as exc:
+        A.simulate(rows, A.ALL, k=3)
+    assert "grader's shape" in str(exc.value)
+
+
+def test_unclear_is_carried_and_coerced_where_it_can_be_seen():
+    """`parse_verdict` は三値で、フリートは UNCLEAR を『阻止しない』と扱う。
+    コーパスを bool にした時点でその強制は済んでおり、誰も見ていない。"""
+    rows = [_row("q1", True, set(), unclear={"correctness"})]
+    lenient = A.simulate(rows, A.ALL, k=3)
+    assert lenient["false_accept"] == 1, "UNCLEAR が捕捉として数えられている"
+    strict = A.simulate(rows, A.ALL, k=3, unclear_refutes=True)
+    assert strict["false_accept"] == 0
+    assert strict["unclear_counted_as_refutation"] is True
+
+
+def test_false_accept_is_reported_against_the_panel_ceiling():
+    """どのレンズも捕まえない候補は全方策を等しく押し下げ、frontier を潰す。
+    弱いパネルが『どれも同じ、安いのでよい』に化ける形。"""
+    rows = [
+        _row("n1", True, set()),          # 誰も捕まえない -- 天井の側
+        _row("n2", True, {"correctness"}),
+    ]
+    got = A.simulate(rows, A.FIXED, k=1)
+    assert got["false_accept"] == 1 and got["false_accept_catchable"] == 0
+    assert got["catchable_bad"] == 1
+
+
+def test_a_frontier_over_too_few_catchable_failures_is_refused():
+    """5件の事象で描いた frontier は、結論の形をした5件の事象。"""
+    got = A.frontier([_point("a", catchable_fa=0, sec_fa=0, fr=0, calls=10,
+                             bad=3, catchable=2)])
+    assert got["frontier"] == []
+    assert "nothing here to separate policies" in got["note"]
