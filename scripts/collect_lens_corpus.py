@@ -178,6 +178,24 @@ def all_unclear(detail) -> bool:
     return all(d["verdict"] == A.UNCLEAR for d in detail.values())
 
 
+def timed_out_lenses(detail, *, timeout_s=LENS_TIMEOUT_S) -> list:
+    """Lenses whose UNCLEAR is a clock running out, not a reviewer being unsure.
+
+    THE DIFFERENCE IS THE WHOLE CORPUS. Section 18 asks what a policy would have missed by NOT
+    running a lens, which can only be answered if every lens's verdict is known for every
+    candidate. A lens that never answered leaves that cell empty, and scoring a policy that
+    would have chosen it against an empty cell credits it with a clean result it never got.
+    `RefuterSession` returns the same ("UNCLEAR", "") for both cases, so elapsed time is what
+    separates them: a session that ran the full budget did not form an opinion, it ran out.
+
+    Observed here: opening one reviewer page dropped free RAM from 2878 MB to 1081 MB, under
+    the 2000 MB floor the NEXT page needs -- so on this box the lenses starve each other, and
+    the first lens of a candidate can answer while the second and third cannot.
+    """
+    return [lens for lens, d in detail.items()
+            if d["verdict"] == A.UNCLEAR and float(d.get("elapsed_s") or 0) >= timeout_s * 0.95]
+
+
 def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
             calibrate=True) -> dict:
     """Run each episode, grade it, then run every lens over its reply. Append-only.
@@ -237,17 +255,16 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
 
             detail = run_lenses(context, agent_url, prompt, reply, lenses)
             verdicts = verdicts_only(detail)
-            if all_unclear(detail):
-                # EVERY LENS SILENT IS A HARNESS SYMPTOM BEFORE IT IS DATA. Recorded as a skip
-                # with the reasons attached, because a corpus of all-UNCLEAR rows makes every
-                # policy score identically and reads as "the choice of lenses does not matter".
-                skipped.append({"candidate_id": episode.episode_id,
-                                "why": "no lens produced a verdict: %s"
-                                       % {ln: d["reason"] for ln, d in detail.items()}})
-                print("  %-28s SKIPPED: no lens answered -- %s"
-                      % (episode.episode_id,
-                         {ln: (d["reason"] or "(no reason given)")[:60]
-                          for ln, d in detail.items()}), flush=True)
+            starved = timed_out_lenses(detail)
+            if starved or all_unclear(detail):
+                # A SILENT LENS IS A HARNESS SYMPTOM BEFORE IT IS DATA, and one silent lens is
+                # already enough: the row would be scored as if that lens had looked and found
+                # nothing, which is the one thing the corpus must never assert.
+                why = ("no lens produced a verdict" if all_unclear(detail)
+                       else "lens(es) ran out the clock without answering: %s" % starved)
+                skipped.append({"candidate_id": episode.episode_id, "why": why,
+                                "detail": detail})
+                print("  %-28s SKIPPED: %s" % (episode.episode_id, why), flush=True)
                 continue
             rows.append({
                 "candidate_id": episode.episode_id,
@@ -269,9 +286,13 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
             for episode, style, prompt, reply, grade in known_bad_rows(seeds):
                 detail = run_lenses(context, agent_url, prompt, reply, lenses)
                 verdicts = verdicts_only(detail)
-                if all_unclear(detail):
+                starved = timed_out_lenses(detail)
+                if starved or all_unclear(detail):
                     skipped.append({"candidate_id": "%s#%s" % (episode.episode_id, style),
-                                    "why": "no lens produced a verdict"})
+                                    "why": ("no lens produced a verdict" if all_unclear(detail)
+                                            else "lens(es) ran out the clock: %s" % starved)})
+                    print("  %-28s [calibration/%s] SKIPPED: incomplete panel"
+                          % (episode.episode_id, style), flush=True)
                     continue
                 rows.append({
                     "candidate_id": "%s#%s" % (episode.episode_id, style),

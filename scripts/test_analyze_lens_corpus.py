@@ -11,8 +11,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from relay.selfimprove import reviewer_allocation as A
-from scripts.analyze_lens_corpus import (describe, load, measured_lens_cost,
-                                         run, split, warm_memory)
+from scripts.analyze_lens_corpus import (describe, drop_incomplete, load,
+                                         measured_lens_cost, run, split,
+                                         warm_memory)
 
 LENSES = ("correctness", "edge", "security")
 
@@ -143,3 +144,44 @@ def test_the_held_out_view_does_not_print_a_caveat_that_is_false_for_it(tmp_path
     assert "does not support -- train/test separation" not in out
     assert "DOES support -- train/test separation" in out
     assert "still does not support -- generalisation" in out
+
+
+# ---- 穴の空いたパネルを行として扱わないこと ------------------------------------------------------
+
+def test_a_row_whose_lens_ran_out_the_clock_is_dropped():
+    """§18 が問うのは『そのレンズを走らせなかったら何を見逃したか』で、
+    答えるには全レンズの判定が要る。時間切れのセルを『見たが何も無かった』として
+    採点すると、そのレンズを選ぶ方策が、得ていない綺麗な結果を与えられる。
+
+    実測: レビュア用ページを1枚開いた時点で空きが 2878MB -> 1081MB。次のページが要る
+    2000MB の床を割るので、この箱ではレンズ同士が飢えさせ合う。1本目は答えられて
+    2本目3本目は答えられない、という並びが実際に起きる。"""
+    ok = {"correctness": {"verdict": A.REFUTED, "elapsed_s": 60.0},
+          "edge": {"verdict": A.UPHELD, "elapsed_s": 55.0},
+          "security": {"verdict": A.UNCLEAR, "elapsed_s": 48.0}}
+    holed = dict(ok, security={"verdict": A.UNCLEAR, "elapsed_s": 420.0})
+    rows = [dict(_row(1, False, A.SECURITY_PASS, (A.REFUTED, A.UPHELD, A.UNCLEAR)),
+                 lens_detail=ok),
+            dict(_row(2, False, A.SECURITY_PASS, (A.REFUTED, A.UPHELD, A.UNCLEAR)),
+                 lens_detail=holed)]
+    keep, drop = drop_incomplete(rows)
+    assert [r["candidate_id"] for r in keep] == ["c1"]
+    assert [r["candidate_id"] for r in drop] == ["c2"]
+
+
+def test_a_genuine_unclear_is_kept():
+    """時間内に答えて判断がつかなかったレンズは、立派な観測。落としてはいけない。"""
+    detail = {"correctness": {"verdict": A.UNCLEAR, "elapsed_s": 30.0},
+              "edge": {"verdict": A.UNCLEAR, "elapsed_s": 31.0},
+              "security": {"verdict": A.UNCLEAR, "elapsed_s": 29.0}}
+    rows = [dict(_row(1, False, A.SECURITY_PASS, (A.UNCLEAR,) * 3), lens_detail=detail)]
+    keep, drop = drop_incomplete(rows)
+    assert len(keep) == 1 and not drop
+
+
+def test_a_corpus_without_timings_is_not_silently_dropped():
+    """計時の無い古いコーパスを全部『穴あき』にすると、健全な走行が空の結果になる。"""
+    rows = [_row(i, False, A.SECURITY_PASS, (A.REFUTED, A.UPHELD, A.UPHELD))
+            for i in range(3)]
+    keep, drop = drop_incomplete(rows)
+    assert len(keep) == 3 and not drop

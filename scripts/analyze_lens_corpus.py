@@ -34,6 +34,28 @@ def load(path):
     return rows
 
 
+#: A lens session that ran its whole budget produced no opinion. Rows carrying one cannot be
+#: scored: the policy that would have run that lens gets credit for a clean cell it never got.
+LENS_TIMEOUT_S = 420.0
+
+
+def drop_incomplete(rows, *, timeout_s=LENS_TIMEOUT_S):
+    """(usable rows, dropped rows). Applied whoever wrote the corpus.
+
+    The collector refuses these at collection time, but an older corpus predates that check
+    and a hand-assembled one never had it. The filter lives here too so the analysis cannot
+    be handed a holed row by a file.
+    """
+    keep, drop = [], []
+    for row in rows:
+        detail = row.get("lens_detail") or {}
+        starved = [lens for lens, d in detail.items()
+                   if d.get("verdict") == A.UNCLEAR
+                   and float(d.get("elapsed_s") or 0) >= timeout_s * 0.95]
+        (drop if starved else keep).append(row)
+    return keep, drop
+
+
 def describe(rows) -> dict:
     """What the corpus contains, before any policy is scored against it."""
     bad_f = bad_s = unev = 0
@@ -184,6 +206,15 @@ def main() -> int:
               "skipped list before treating this as a result.")
         return 2
 
+    rows, holed = drop_incomplete(rows)
+    if holed:
+        print("dropped %d row(s) whose panel had a hole: at least one lens ran out the clock "
+              "rather than answering, and scoring a policy that would have run it against an "
+              "empty cell credits it with a result it never got" % len(holed))
+    if not rows:
+        print("nothing usable is left. Every row had a silent lens -- that is a harness "
+              "result, not a measurement of the policies.")
+        return 2
     shape = describe(rows)
     print("CORPUS: %(candidates)d candidates | bad: %(functional_bad)d functional, "
           "%(security_bad)d security | unevaluable: %(security_unevaluable)d | "
