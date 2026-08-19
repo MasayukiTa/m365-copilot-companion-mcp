@@ -1,0 +1,69 @@
+SETTLE STAGE 0 -- OFFLINE REPLAY
+  trace                    .fleet\settle_trace_c2.jsonl
+  parameters               per turn from the trace's own need_dwell/need_samples,
+                           never from a default -- see the note in replay()
+
+POPULATION
+  turns replayed           62
+  ... whose text EVER changed  59
+      A turn whose text never moved cannot exhibit truncation, so it carries no
+      information about the primary endpoint. The informative N is the second
+      number, not the first.
+  independent clusters     62
+      Turns sharing a prompt are not independent observations of the rule; they
+      are repeats of one observation. 62 turns over 62 prompts is 62 clusters, and
+      any interval computed as though N were 62 is too narrow.
+
+PRIMARY -- truncated capture (accepted text != the text the turn settled to)
+  legacy rule              0 / 62
+  unified rule             0 / 62
+  label observation window median 21.2s (min 20.7, max 21.9)
+      THE LABEL IS BLIND PAST THAT WINDOW. The failure being counted is a long
+      streaming pause, so a pause longer than the tail is recorded as 'the text
+      never grew' -- indistinguishable from no pause at all. A zero here is not
+      evidence that truncation does not happen; it is evidence that none was
+      visible within 21 seconds of the accept.
+
+  truncations visible INSIDE the recorded window, needing no tail at all:
+     legacy 0   unified 0
+  stillness before the legacy accept: median 4.4s
+  SO THE CORPUS SEES PAUSES UP TO ABOUT 26 SECONDS (that stillness plus the
+  tail) AND FINDS NONE. What it cannot speak to is a stream that goes quiet
+  for longer than that and then resumes. The claim is bounded, not absent.
+
+SECONDARY -- where the two rules disagree
+  turns with different accept points  0 / 62
+  legacy never accepted    0
+  unified never accepted   0
+      A turn the unified rule never accepts inside the recorded window is the
+      REGRESSION the plan names: production settled it and the stricter rule would
+      still be waiting. Recorded windows are finite, so this over-counts -- it is a
+      list to investigate, not a verdict.
+
+SIDE EFFECT -- added latency (the plan budgets +1.5s on the median)
+  median  +0.00s   p95  +0.00s   (n=62 paired turns)
+  within the +1.5s budget: yes
+
+VERDICT
+  BOUNDED, NOT ABSENT. Within this corpus neither rule truncated a turn whose
+  stream went quiet for up to about 26 seconds. Above that the corpus is silent,
+  and silence is not a zero. So the primary endpoint is answered for short pauses
+  and open for long ones -- which is the interesting half, since the failure this
+  replaces was described as a pause that outlasted the dwell.
+
+
+  WHY THEY AGREED, AND IT IS NOT SAMPLE SIZE.
+    6 samples at a measured 0.66s poll interval  ->  3.3s
+    the dwell itself                             ->  4.0s
+    binding constraint: DWELL
+
+  The sample requirement is satisfied BEFORE the dwell is, so at these
+  settings it can never be the thing that delays an accept. The two rules
+  are identical by arithmetic, not by luck -- 0 discordant pairs is
+  STRUCTURAL, and no number of extra clusters would produce one.
+
+  So Stage 1 would measure nothing here. That is not a reason to drop the
+  unified rule: it buys one rule in one place instead of four, and the
+  guard starts binding the moment the interval grows past 0.80s -- a slow
+  tenant or a loaded machine, which is exactly when a stream pauses and
+  truncation gets likely. It IS a reason not to claim it as an improvement.

@@ -193,6 +193,13 @@ def replay(rows, *, dwell_s, samples_needed):
         # How long the text had been still when the legacy rule committed. Added to the tail
         # length, this is the longest pause the corpus could have caught.
         "stillness_before_accept_s": _stillness(samples, li),
+        # THE INTERVAL IS WHAT DECIDES WHICH REQUIREMENT BINDS, and it is measurable from the
+        # trace rather than assumed from the configured constant -- a loaded machine polls
+        # slower than it was told to.
+        "poll_interval_s": (None if len(samples) < 2 else round(
+            statistics.median([b[0] - a[0] for a, b in zip(samples, samples[1:])]), 3)),
+        "need_samples": samples_needed if not stable else stable[-1].get("need_samples"),
+        "need_dwell": dwell_s if not stable else stable[-1].get("need_dwell"),
     }
 
 
@@ -310,12 +317,43 @@ def main() -> int:
     print("  and open for long ones -- which is the interesting half, since the failure this")
     print("  replaces was described as a pause that outlasted the dwell.")
     print()
-    print("  STAGE 1 IS STILL NOT JUSTIFIED, for a reason that is not about the tail: %d"
-          % n_clusters)
-    print("  clusters cannot support the discordant-pair count the plan's own power")
-    print("  calculation asks for (~40 pairs, N about 450-700 TURNS across many prompts).")
-    print("  What would move this on is a wider collection -- more prompts, not more repeats")
-    print("  of these -- with the longer post-accept tail now in place.")
+    # WHY THE TWO RULES AGREED, which is a different answer from "not enough data".
+    intervals = [r["poll_interval_s"] for r in results if r.get("poll_interval_s")]
+    needs = [(r.get("need_samples"), r.get("need_dwell")) for r in results
+             if r.get("need_samples") and r.get("need_dwell")]
+    if intervals and needs:
+        interval = statistics.median(intervals)
+        ns = statistics.median([n for n, _ in needs])
+        nd = statistics.median([d for _, d in needs])
+        to_samples = (ns - 1) * interval
+        print()
+        print("  WHY THEY AGREED, AND IT IS NOT SAMPLE SIZE.")
+        print("    %d samples at a measured %.2fs poll interval  ->  %.1fs"
+              % (ns, interval, to_samples))
+        print("    the dwell itself                             ->  %.1fs" % nd)
+        print("    binding constraint: %s" % ("DWELL" if nd > to_samples else "SAMPLES"))
+        if nd > to_samples:
+            print()
+            print("  The sample requirement is satisfied BEFORE the dwell is, so at these")
+            print("  settings it can never be the thing that delays an accept. The two rules")
+            print("  are identical by arithmetic, not by luck -- %d discordant pairs is"
+                  % len(disc))
+            print("  STRUCTURAL, and no number of extra clusters would produce one.")
+            print()
+            print("  So Stage 1 would measure nothing here. That is not a reason to drop the")
+            print("  unified rule: it buys one rule in one place instead of four, and the")
+            print("  guard starts binding the moment the interval grows past %.2fs -- a slow"
+                  % (nd / max(1.0, ns - 1)))
+            print("  tenant or a loaded machine, which is exactly when a stream pauses and")
+            print("  truncation gets likely. It IS a reason not to claim it as an improvement.")
+        else:
+            print()
+            print("  The sample requirement binds before the dwell, so the two rules CAN")
+            print("  differ and %d turns where they did is a measurement." % len(disc))
+    else:
+        print("  STAGE 1 IS NOT JUSTIFIED: %d clusters cannot support the discordant-pair"
+              % n_clusters)
+        print("  count the plan's power calculation asks for (~40 pairs).")
     return 0
 
 

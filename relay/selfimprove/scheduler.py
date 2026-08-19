@@ -100,6 +100,14 @@ def preconditions(*, recent_decisions=None, lock_path=None, activate=False,
                        "nobody is watching (level %s; self-activation begins at C)"
                        % AU.normalise(level))
 
+    fired = halt_on_record(lock_path)
+    if fired.get("fired"):
+        reasons.append(
+            "a tripwire fired on an earlier run (%s) and has not been cleared; the next "
+            "scheduled night is exactly when nobody is watching, and re-deriving the "
+            "preconditions from scratch would let it start as though that had not happened"
+            % ", ".join(fired["fired"]))
+
     if budget_candidates is not None and int(budget_candidates) <= 0:
         reasons.append("no candidate budget; an unbounded scheduled loop can spend a night "
                        "on a direction that looked productive at 2am")
@@ -145,40 +153,74 @@ def tripwires_after(result, *, prev_pass=None, baseline_path=None) -> dict:
     """
     from relay.selfimprove import policy as POL
 
+    def _sub(name):
+        """A nested section, only if it is a dict. A truthy STRING passed `or {}` and then
+        `"regressed" in "nothing regressed"` matched as a substring, and the next line called
+        .get on a str -- an AttributeError thrown AFTER the campaign, destroying the night's
+        whole report over a malformed field."""
+        value = (result or {}).get(name)
+        return value if isinstance(value, dict) else {}
+
     state = {}
     ok, _changed = _frozen(baseline_path)
     state["frozen_ok"] = ok
 
     new_pass = (result or {}).get("pass_at_1")
-    if new_pass is not None:
+    if isinstance(new_pass, (int, float)):
         state["new_pass"] = new_pass
-        state["prev_pass"] = prev_pass
+        if isinstance(prev_pass, (int, float)):
+            # ONLY WHEN THERE IS ONE. Putting `prev_pass=None` in the state made the jump
+            # tripwire evaluable-looking while it could never fire, which reads in
+            # `evaluated` as a check that ran.
+            state["prev_pass"] = prev_pass
 
-    infra = (result or {}).get("infra") or {}
+    infra = _sub("infra")
     slice_ids = (result or {}).get("slice_ids") or []
-    infra_ids = ((result or {}).get("on") or {}).get("infra_ids") or []
-    if slice_ids:
-        state["infra_rate"] = len(infra_ids) / float(len(slice_ids))
-    elif infra.get("aborted"):
-        # An abort with no slice to divide by is a total loss, not an unknown rate.
+    # BOTH ARMS. Counting only the candidate's infra failures halves the rate: a baseline-side
+    # abort is the same sick harness, and the tripwire is about the harness rather than about
+    # the candidate.
+    infra_ids = set(_sub("on").get("infra_ids") or []) | set(_sub("off").get("infra_ids") or [])
+    if infra.get("aborted"):
+        # An abort is a total loss whether or not a slice was already chosen. Dividing by the
+        # slice made the run that aborted AFTER selection read as a low rate.
         state["infra_rate"] = 1.0
+    elif slice_ids:
+        state["infra_rate"] = len(infra_ids) / float(len(slice_ids))
 
-    sentinel = (result or {}).get("sentinel") or {}
+    sentinel = _sub("sentinel")
     if "regressed" in sentinel:
         state["sentinel_regressed"] = bool(sentinel.get("regressed"))
 
     fired = POL.evaluate_tripwires(state)
+    # WHICH TRIPWIRES, NOT WHICH STATE KEYS. `len(state)` counted `prev_pass` as a tripwire,
+    # so the one field whose whole job is to say what was checked reported three where two
+    # existed.
+    checked = sorted({"frozen_changed" if k == "frozen_ok" else
+                      "implausible_jump" if k in ("new_pass", "prev_pass") else
+                      "infra_spike" if k == "infra_rate" else
+                      "sentinel_regressed"
+                      for k in state})
+    unreadable = [name for name in ("pass_at_1", "slice_ids", "sentinel")
+                  if name not in (result or {})]
     return {
         "fired": fired,
         "halt": bool(fired),
         "state": state,
         # SAID EXPLICITLY. "No tripwire fired" and "no tripwire could be evaluated" are
         # different, and only the first is reassuring.
-        "evaluated": sorted(state),
+        "evaluated": checked,
+        # AND WHY THE REST COULD NOT BE. The production caller was handing this a campaign
+        # SUMMARY rather than a paired-evaluation report, so only `frozen_ok` was ever
+        # present and the report said "nothing fired" every night -- wiring rot that reads
+        # exactly like health.
+        "unreadable_inputs": unreadable,
         "note": ("%d tripwire(s) fired; a scheduled run does not decide what to do about "
-                 "this -- it stops and says so" % len(fired)) if fired
-                else "nothing fired among the %d tripwires this result could answer"
-                     % len(state),
+                 "this -- it records the halt and says so" % len(fired)) if fired
+                else "nothing fired among the %d tripwire(s) this result could answer%s"
+                     % (len(checked),
+                        "" if not unreadable
+                        else "; %s absent from the result, so %d tripwire(s) were not checked"
+                             % (", ".join(unreadable), 4 - len(checked))),
     }
 
 
@@ -314,12 +356,24 @@ def nightly(*, budget_candidates=5, activate=False, operator_approved_activation
     # `Archive`'s public accessor is `.all()` -- `.entries()` does not exist on it, which
     # meant this line raised AttributeError the moment archive_path pointed at a real
     # Archive instance. Nothing had ever called `nightly()` to notice.
-    decisions = [{"state": (e.get("verdict") or "").upper()} for e in archive.all()][-20:]
+    # `gate_verdict`, WHICH IS THE KEY THE ARCHIVE ACTUALLY WRITES (archive.Archive.add).
+    # This read `verdict`, which no row has ever carried, so every state was "" -- and that is
+    # byte-for-byte the failure the commit one line down claims to have fixed, recommitted
+    # against the adjacent key. Two things died from it at once: `plateaued` saw nothing
+    # KEEP and fired on any archive with five rows including five KEEPs, and `HF.observe`
+    # counted zero of every state so "the harness is unwell" could never fire either.
+    decisions = [{"state": (e.get("gate_verdict") or "").upper()} for e in archive.all()][-20:]
 
+    # `baseline_path` REACHES THE PRECONDITION, NOT ONLY THE TRIPWIRE. It was forwarded only
+    # to `tripwires_after`, so a caller with a custom baseline had the DEFAULT frozen set
+    # checked before the run and its own checked after -- a corrupt custom baseline burned the
+    # whole night and then fired frozen_changed, which is the exact waste the precondition
+    # exists to prevent, and a corrupt default blocked a run that was never going to use it.
     reasons = preconditions(recent_decisions=decisions, lock_path=lock_path,
                             activate=activate,
                             operator_approved_activation=operator_approved_activation,
-                            budget_candidates=budget_candidates)
+                            budget_candidates=budget_candidates,
+                            baseline_path=baseline_path)
     if reasons:
         return {"ran": False, "blocked_by": reasons, "result": None,
                 "note": "a failed precondition is information; retrying past it converts a "
@@ -335,7 +389,8 @@ def nightly(*, budget_candidates=5, activate=False, operator_approved_activation
 
     out = scheduled_run(run, budget_candidates=budget_candidates, lock_path=lock_path,
                         recent_decisions=decisions, activate=activate,
-                        operator_approved_activation=operator_approved_activation)
+                        operator_approved_activation=operator_approved_activation,
+                        baseline_path=baseline_path)
     out["replay_set"] = replay
     out["trace_to_eval"] = trace_eval
     # AFTER THE RUN, NOT INSTEAD OF THE GATES. The gates decide about the candidate; the
@@ -343,15 +398,79 @@ def nightly(*, budget_candidates=5, activate=False, operator_approved_activation
     # questions with different answers -- a candidate can be correctly rejected by a run whose
     # judge changed underneath it.
     out["tripwires"] = tripwires_after((out.get("result") or {}),
+                                       prev_pass=_previous_pass(archive),
                                        baseline_path=baseline_path)
+    # A HALT THAT LIVES ONLY IN A RETURNED DICT IS NOT A HALT. Nothing read it, nothing was
+    # written, the exit status was 0 whether the night fired four tripwires or ran clean, and
+    # the next night re-derived everything from scratch -- so a fired sentinel or jump left no
+    # trace the following run could see. Recording it is the difference between "stops and
+    # says so" and "says so to a dict".
+    if out["tripwires"]["halt"]:
+        out["halt_recorded"] = _record_halt(out["tripwires"], lock_path=lock_path)
     return out
+
+
+#: Where a fired tripwire is written down. Beside the lock, because it is the same kind of
+#: thing: state about the schedule that has to outlive the process that produced it.
+def _halt_path(lock_path=None) -> str:
+    base = lock_path or DEFAULT_LOCK
+    return os.path.join(os.path.dirname(base) or ".", "tripwire_halt.json")
+
+
+def _record_halt(tripwires, *, lock_path=None) -> str:
+    """Persist a fired tripwire. Returns the path written, or the reason it could not."""
+    path = _halt_path(lock_path)
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        payload = json.dumps({"at": time.time(), "fired": tripwires.get("fired") or [],
+                              "state": tripwires.get("state") or {}},
+                             ensure_ascii=False, sort_keys=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(payload + "\n")
+        os.replace(tmp, path)
+        return path
+    except OSError as exc:
+        return "could not record the halt: %s" % exc
+
+
+def halt_on_record(lock_path=None) -> dict:
+    """A tripwire fired on an earlier night and nobody has cleared it, or {}."""
+    try:
+        with open(_halt_path(lock_path), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _previous_pass(archive):
+    """The most recent recorded pass@1, so the jump tripwire has something to compare to.
+
+    `prev_pass` was never passed, so `tw_implausible_jump` returned False unconditionally --
+    while the previous night's number sat in the archive the scheduler had just read.
+    """
+    try:
+        for entry in reversed(archive.all()):
+            value = entry.get("pass_at_1")
+            if isinstance(value, (int, float)):
+                return value
+    except Exception:
+        pass
+    return None
 
 
 def _recent_failures(archive) -> list:
     """Episode-level failures from the archive's recent entries, for the replay coreset."""
     rows = []
     for entry in archive.all()[-20:]:
-        for row in ((entry.get("results") or {}).get("episodes") or []):
+        # `descriptors.episode_results`, which is where the controller puts them. This read
+        # `entry["results"]["episodes"]` -- absent on every row -- so the replay coreset was
+        # always empty. The same class as the `.entries()` AttributeError memorialised above,
+        # except this one returned quietly instead of raising.
+        episodes = ((entry.get("descriptors") or {}).get("episode_results") or {})
+        for row in (list(episodes.get("candidate") or [])
+                    + list(episodes.get("baseline") or [])):
             if not row.get("success", True):
                 rows.append(row)
     return rows
