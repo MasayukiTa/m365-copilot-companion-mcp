@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bench.companionbench.episode import GradeResult, COVERAGE_COMPLETE, COVERAGE_PARTIAL
 from relay.selfimprove import reviewer_allocation as A
+from scripts import collect_lens_corpus as CL
 from scripts.collect_lens_corpus import truth_from_grade
 
 
@@ -81,4 +82,41 @@ def test_the_collector_does_not_build_on_the_runner_row():
 def test_a_lens_that_never_answered_is_recorded_as_unclear_not_upheld():
     src = Path(__file__).resolve().parent.joinpath("collect_lens_corpus.py").read_text(
         encoding="utf-8")
-    assert "out[lens] = verdict if verdict in A.VERDICTS else A.UNCLEAR" in src
+    assert '"verdict": verdict if verdict in A.VERDICTS else A.UNCLEAR' in src
+
+
+# ---- レンズが黙ったとき、それを意見として記録しないこと -------------------------------------------
+
+def test_a_run_that_could_only_produce_unclear_is_refused_before_it_starts(monkeypatch):
+    """レビュア用タブが開けない箱では、全レンズが UNCLEAR になる。
+    それは『見て判断がつかなかった』と同じ値で記録され、全方策が同点になる。
+    実際に一度、22分かけて全 UNCLEAR の1行だけを作った。"""
+    monkeypatch.setattr("relay.relay_fleet.ram_room_for_tab", lambda: False)
+    monkeypatch.setattr("relay.relay_fleet.avail_phys_mb", lambda: 954.0)
+    try:
+        CL.require_room_for_lenses()
+    except CL.NotEnoughRoom as exc:
+        assert "954" in str(exc) and "do not lower the floor" in str(exc)
+    else:
+        raise AssertionError("床を満たさない箱で収集を始めてはいけない")
+
+
+def test_room_present_means_no_refusal(monkeypatch):
+    monkeypatch.setattr("relay.relay_fleet.ram_room_for_tab", lambda: True)
+    CL.require_room_for_lenses()
+
+
+def test_the_reason_is_kept_so_a_silent_lens_can_be_told_from_an_unsure_one():
+    src = Path(CL.__file__).read_text(encoding="utf-8")
+    assert '"reason": reason or ""' in src
+    assert "verdict, _reason = got" not in src, "reason を捨てると診断が消える"
+
+
+def test_an_all_silent_panel_becomes_a_skip_not_a_row():
+    detail = {"correctness": {"verdict": "UNCLEAR", "reason": ""},
+              "edge": {"verdict": "UNCLEAR", "reason": ""},
+              "security": {"verdict": "UNCLEAR", "reason": ""}}
+    assert CL.all_unclear(detail)
+    detail["edge"]["verdict"] = "UPHELD"
+    assert not CL.all_unclear(detail)
+    assert CL.verdicts_only(detail)["edge"] == "UPHELD"

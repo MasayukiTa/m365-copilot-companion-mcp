@@ -64,6 +64,35 @@ LENS_TIMEOUT_S = 420.0
 NL = chr(10)
 
 
+class NotEnoughRoom(RuntimeError):
+    """The box cannot open a reviewer tab, so no lens can produce a verdict."""
+
+
+def require_room_for_lenses():
+    """Refuse to collect when the reviewer cannot get a tab. Measured, not assumed.
+
+    `RefuterSession` defers opening its side page until `ram_room_for_tab()` clears a 2000 MB
+    floor, and after `timeout_s` of never clearing it the session finishes ("UNCLEAR", "") --
+    the SAME value a reviewer returns when it looked and was unsure. At runtime that is the
+    right call: UNCLEAR means do not block. In a corpus it is a lie, and a cheap one to tell
+    at scale: the first live run here spent twenty-two minutes producing one row whose three
+    verdicts were all UNCLEAR, because a load generator left over from an unrelated experiment
+    had the box at 954 MB free. Every policy scores identically on such a corpus, and the
+    conclusion reads "which lenses you run does not matter".
+
+    The floor is not lowered to get past this. It exists because side pages crowding a low-RAM
+    box is what wedges the sweep and trips the watchdog.
+    """
+    from relay.relay_fleet import avail_phys_mb, ram_room_for_tab
+    if not ram_room_for_tab():
+        raise NotEnoughRoom(
+            "%.0f MB physical RAM free, and a reviewer tab needs 2000 MB. Every lens would "
+            "time out and record UNCLEAR, which is indistinguishable from a reviewer that "
+            "looked and was unsure -- so the run would produce a corpus on which every policy "
+            "scores the same. Free memory and start again; do not lower the floor."
+            % avail_phys_mb())
+
+
 def truth_from_grade(grade) -> dict:
     """Ground truth in the grader's shape. Absent evidence stays absent.
 
@@ -98,11 +127,19 @@ def truth_from_grade(grade) -> dict:
 
 
 def run_lenses(context, agent_url, goal, reply, lenses, *, timeout_s=LENS_TIMEOUT_S) -> dict:
-    """Every lens against one candidate. Returns {lens: REFUTED|UPHELD|UNCLEAR}.
+    """Every lens against one candidate. Returns {lens: {"verdict": ..., "reason": ...}}.
 
     ALL of them, which is the point: a policy that runs two of three cannot be scored without
     knowing what the third would have said, and a corpus that only records the chosen ones
     measures "did the lenses that ran agree with each other".
+
+    THE REASON IS KEPT, and the first version of this function threw it away. `RefuterSession`
+    finishes with ("UNCLEAR", "") for every infrastructure failure it meets -- no composer
+    within forty seconds, a navigation error, a page that never answers -- because at runtime
+    UNCLEAR means "do not block", which is the safe reading there. Here it is not a reading at
+    all: it records a browser that never loaded as a reviewer's considered opinion. The first
+    live run came back UNCLEAR on all three lenses and, without the reason, that is
+    indistinguishable from three lenses that looked and were unsure.
     """
     from relay.refuter import RefuterSession
 
@@ -111,18 +148,27 @@ def run_lenses(context, agent_url, goal, reply, lenses, *, timeout_s=LENS_TIMEOU
         session = RefuterSession(context, agent_url, goal, reply, lens=lens,
                                  timeout_s=timeout_s).start()
         deadline = time.time() + timeout_s + 60
-        verdict = None
+        verdict, reason = None, "the poll loop gave up before the session finished"
         while time.time() < deadline:
             got = session.poll()
             if got is not None:
-                verdict, _reason = got
+                verdict, reason = got
                 break
             time.sleep(1.0)
         # A LENS THAT NEVER ANSWERED PRODUCED NO EVIDENCE, which is what UNCLEAR means. It is
         # not "the lens looked and found nothing" -- recording it as UPHELD would credit the
         # policy that ran it with a clean result it never obtained.
-        out[lens] = verdict if verdict in A.VERDICTS else A.UNCLEAR
+        out[lens] = {"verdict": verdict if verdict in A.VERDICTS else A.UNCLEAR,
+                     "reason": reason or ""}
     return out
+
+
+def verdicts_only(detail) -> dict:
+    return {lens: d["verdict"] for lens, d in detail.items()}
+
+
+def all_unclear(detail) -> bool:
+    return all(d["verdict"] == A.UNCLEAR for d in detail.values())
 
 
 def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
@@ -138,6 +184,8 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
     from playwright.sync_api import sync_playwright
 
     from relay.refuter import PANEL_LENSES
+
+    require_room_for_lenses()
 
     # THE EPISODE CONTRACT DIRECTLY, NOT `run_episode`. That returns a graded row and NOT the
     # reply -- so a collector built on it skips every candidate for "no reply recorded" and
@@ -180,11 +228,25 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
                 skipped.append({"candidate_id": episode.episode_id, "why": "empty reply"})
                 continue
 
-            verdicts = run_lenses(context, agent_url, prompt, reply, lenses)
+            detail = run_lenses(context, agent_url, prompt, reply, lenses)
+            verdicts = verdicts_only(detail)
+            if all_unclear(detail):
+                # EVERY LENS SILENT IS A HARNESS SYMPTOM BEFORE IT IS DATA. Recorded as a skip
+                # with the reasons attached, because a corpus of all-UNCLEAR rows makes every
+                # policy score identically and reads as "the choice of lenses does not matter".
+                skipped.append({"candidate_id": episode.episode_id,
+                                "why": "no lens produced a verdict: %s"
+                                       % {ln: d["reason"] for ln, d in detail.items()}})
+                print("  %-28s SKIPPED: no lens answered -- %s"
+                      % (episode.episode_id,
+                         {ln: (d["reason"] or "(no reason given)")[:60]
+                          for ln, d in detail.items()}), flush=True)
+                continue
             rows.append({
                 "candidate_id": episode.episode_id,
                 "bad": truth_from_grade(grade),
                 "verdicts": verdicts,
+                "lens_detail": detail,
                 "features": {"kind": episode.category or "unknown"},
                 CAL_KEY: False,
             })
@@ -198,7 +260,12 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
             from bench.companionbench.calibration import known_bad_rows
             seeds = [e for e in episodes if getattr(e, "category", "") == "security"]
             for episode, style, prompt, reply, grade in known_bad_rows(seeds):
-                verdicts = run_lenses(context, agent_url, prompt, reply, lenses)
+                detail = run_lenses(context, agent_url, prompt, reply, lenses)
+                verdicts = verdicts_only(detail)
+                if all_unclear(detail):
+                    skipped.append({"candidate_id": "%s#%s" % (episode.episode_id, style),
+                                    "why": "no lens produced a verdict"})
+                    continue
                 rows.append({
                     "candidate_id": "%s#%s" % (episode.episode_id, style),
                     "bad": truth_from_grade(grade),
@@ -206,6 +273,7 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
                     "features": {"kind": episode.category or "unknown"},
                     CAL_KEY: True,
                     "reply_style": style,
+                    "lens_detail": detail,
                 })
                 with io.open(out_path, "a", encoding="utf-8", newline=NL) as fh:
                     fh.write(json.dumps(rows[-1], ensure_ascii=False, sort_keys=True) + NL)
@@ -257,6 +325,11 @@ def main() -> int:
     # memory puts one policy on it twice under two names.
     os.environ.setdefault("MCP_REFUTER_MEMORY_RECORD", "1")
 
+    try:
+        require_room_for_lenses()
+    except NotEnoughRoom as exc:
+        print("REFUSED: %s" % exc)
+        return 3
     got = collect(cdp_url=args.cdp_url, agent_url=args.agent_url, episodes=episodes,
                   agent=build_agent("fleet"), out_path=args.out,
                   calibrate=not args.no_calibration)
