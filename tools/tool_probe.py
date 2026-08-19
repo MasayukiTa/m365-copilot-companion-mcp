@@ -97,6 +97,36 @@ PROBE_KINDS_ALIVE = ("answer", "consent_card", "stale_repeat", "error")
 PROBE_KINDS_NOT_ALIVE = ("timeout", "agent_unreachable", "canned_fallback")
 
 
+# ---------------------------------------------------------------------------
+# When a long-lived conversation should be replaced.
+#
+# The bridge appends to ONE conversation forever: real user turns plus this probe every
+# MCP_TOOL_PROBE_SEC, 144 a day at the default. Measured 2026-08-19, that had grown a single
+# Edge tab to 1,340.9 MB -- the largest thing on a 16 GB machine, and enough to stop an
+# unrelated component that needs 2000 MB free to open a page.
+#
+# The decision lives HERE, not in the bridge, for the same reason classify_probe_reply does:
+# the bridge cannot be imported in a test (Playwright, a page-owner thread), so anything left
+# in it can only be checked by reading its source for a string. A rule about when to throw
+# away a working conversation is not something to verify by grep.
+def should_recycle_conversation(turns: int, max_turns: int, idle_s: float,
+                                min_idle_s: float) -> bool:
+    """Whether the current conversation has run long enough to be replaced.
+
+    `max_turns <= 0` disables recycling entirely -- the opt-out MCP_TOOL_PROBE_SEC=0 already
+    establishes for the probe itself.
+
+    The idle requirement is not the probe's 30-second collision guard. A recycle silently
+    drops the agent's context, so it waits until nobody is plausibly mid-conversation; the
+    collision guard only asks whether a turn is in flight right now.
+    """
+    if max_turns <= 0:
+        return False
+    if turns < max_turns:
+        return False
+    return idle_s >= min_idle_s
+
+
 def probe_kind_is_alive(kind: Optional[str]) -> Optional[bool]:
     """True/False if `kind` settles whether the tool path is still usable, None for the
     transitional kinds ("starting", "checking") and anything unrecognised -- callers must

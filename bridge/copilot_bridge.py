@@ -3542,7 +3542,7 @@ class Handler(BaseHTTPRequestHandler):
         outer-loop timeout / empty-body path). Raises on a driver/page error -- the caller
         (_stream_text) owns the Esc/Stop-button and error-SSE handling, exactly as before
         this was split out of _stream_text's inline loop."""
-        DRIVER.send(msg)
+        _send_counted(msg)
         sent = 0
         t0 = time.time()
         while time.time() - t0 < 600:
@@ -4196,6 +4196,154 @@ MAX_BRIDGE_RECYCLES = max(0, int(os.environ.get("MCP_BRIDGE_MAX_RECYCLES", "8"))
 _BRIDGE_RECYCLES = 0
 
 
+# -- periodic conversation recycling: the tab was the biggest thing on the machine ----------
+# Measured 2026-08-19: one Edge tab holding 1,340.9 MB, titled with the self-probe's own
+# instruction text. It was not a stray liveness tab -- it was THIS bridge's single long-lived
+# conversation, which the probe appends to every MCP_TOOL_PROBE_SEC (144 turns/day at the
+# default) on top of every real user turn. Nothing bounded its length, so the DOM grew until
+# either Copilot's token budget tripped or the box ran out of memory. On a 16 GB machine it
+# was the second: 1.3 GB free, and an unrelated component needing a 2000 MB floor to open a
+# page could not start at all.
+#
+# The tab is not the problem and closing it is not the fix -- and specifically NOT because it
+# holds the login. It does not: the session cookie lives in the browser profile and the
+# connector consent lives server-side, so a page can be reopened without losing either. What
+# the resident page buys is a composer already up, and what the probe needs is the real UI
+# path, because a consent card and a semantically-refusing model only ever appear there. The
+# unbounded thing is the CONVERSATION, so that is what gets bounded.
+#
+# SEPARATE COUNTER FROM _BRIDGE_RECYCLES ON PURPOSE. That one is the exhaustion safety net,
+# and its ceiling exists to detect "a fresh conversation is exhausted too, so length was never
+# the cause". Sharing it would burn the ceiling in a few days of ordinary uptime and leave the
+# real exhaustion case with no net.
+BRIDGE_CONVERSATION_MAX_TURNS = max(0, int(
+    os.environ.get("MCP_BRIDGE_CONVERSATION_MAX_TURNS", "120")))
+#: A recycle silently drops the agent's context, so it waits for a genuinely idle bridge.
+#: TOOL_PROBE_MIN_IDLE_SEC (30s) is the wrong clock: it exists to avoid colliding with a turn,
+#: not to tell whether somebody is in the middle of a conversation.
+BRIDGE_RECYCLE_MIN_IDLE_SEC = float(
+    os.environ.get("MCP_BRIDGE_RECYCLE_MIN_IDLE_SEC", "1800"))
+_CONVERSATION_TURNS = 0
+_PERIODIC_RECYCLES = 0
+_RECYCLE_MEMORY_MEASURED = False
+_RECYCLE_PENDING_BEFORE_MB = None
+
+
+def _send_counted(msg):
+    """DRIVER.send, plus the only honest place to count what the conversation now holds.
+
+    Counting at the callers undercounted by up to three-to-one. A single user turn can send
+    three times -- exhaustion resend, consent retry, auto-unlock retry -- and the probe sends
+    again after resolving a consent card. Every one of those appends to the DOM. This is the
+    one line all of them pass through.
+    """
+    global _CONVERSATION_TURNS
+    _CONVERSATION_TURNS += 1
+    DRIVER.send(msg)
+
+
+def _edge_working_set_mb():
+    """Total working set across Edge, in MB, or None. COARSE, AND LABELLED AS SUCH.
+
+    Per-tab attribution would need the renderer pid behind this specific page, which the CDP
+    target does not hand over. The only question this has to answer is whether navigating away
+    released the document, and a 1.3 GB conversation sits far above the noise of ordinary tab
+    churn -- so the total settles that, and is not a figure to quote per tab.
+    """
+    try:
+        import psutil
+    except Exception:
+        return None
+    total = 0
+    for proc in psutil.process_iter(["name", "memory_info"]):
+        try:
+            if (proc.info.get("name") or "").lower() == "msedge.exe":
+                total += proc.info["memory_info"].rss
+        except Exception:
+            continue
+    return round(total / (1024.0 * 1024.0), 1) if total else None
+
+
+def _recycle_long_conversation():
+    """Start a fresh conversation once the current one has run long enough.
+
+    Called from the idle probe AFTER its result is recorded, so a recycle never lands between
+    the transitional "checking" state and the authoritative one -- the health surface would
+    otherwise show a failure that belongs to housekeeping.
+
+    Returns True when a new conversation was opened.
+    """
+    global _PERIODIC_RECYCLES, _BRIDGE_RECYCLES, _RECYCLE_PENDING_BEFORE_MB
+    since_user = time.time() - _LAST_USER_TURN_TS
+    if not tool_probe.should_recycle_conversation(
+            _CONVERSATION_TURNS, BRIDGE_CONVERSATION_MAX_TURNS,
+            since_user, BRIDGE_RECYCLE_MIN_IDLE_SEC):
+        return False
+    # THE LOCK, RE-ACQUIRED. _run_tool_probe released PAGE_LOCK before this point, and the
+    # idle check above is advice about the past, not exclusion: a real turn can take the lock
+    # in the interval between the check and the navigation, and then goto lands in the middle
+    # of somebody's send. Non-blocking, because a busy bridge is a reason to skip housekeeping
+    # rather than to queue behind it.
+    if not PAGE_LOCK.acquire(blocking=False):
+        logger.debug("conversation recycle: skipped, page busy")
+        return False
+    turns = _CONVERSATION_TURNS
+    before = None if _RECYCLE_MEMORY_MEASURED else _edge_working_set_mb()
+    try:
+        # ON THE PAGE THREAD. An earlier draft called _open_fresh_conversation directly from
+        # this timer thread, where every Playwright call raises on thread affinity -- so the
+        # whole feature was an exception swallowed by the caller's except, and every test
+        # around it stayed green because they all read source rather than run it.
+        ok = _run_bounded_page_probe_call(lambda: _open_fresh_conversation(title=""))
+    except Exception as exc:
+        logger.warning("conversation recycle: could not open a fresh conversation: %s: %s",
+                       type(exc).__name__, exc)
+        return False
+    finally:
+        try:
+            PAGE_LOCK.release()
+        except Exception:
+            pass
+    if not ok:
+        # The page has already left the old conversation and the composer never came back, so
+        # this IS an unreachable agent. Filed with the existing vocabulary so the restart
+        # ladder handles it -- on the NEXT probe, not this one: the ladder reads this cycle's
+        # `kind`, which was decided before any of this ran.
+        try:
+            tool_probe.record_probe(False, "agent_unreachable",
+                                    detail="composer did not return after a periodic recycle")
+        except Exception:
+            pass
+        return False
+    _PERIODIC_RECYCLES += 1
+    # The exhaustion budget is restored, because "this conversation is too long" became a live
+    # hypothesis again the moment the conversation was replaced. The turn counter itself is
+    # reset inside _open_fresh_conversation, where the session is actually swapped.
+    _BRIDGE_RECYCLES = 0
+    if before is not None:
+        # MEASURED ON THE NEXT PROBE, NOT HERE. Reading it immediately answers nothing: the
+        # renderer releases lazily and the process that held the old document is still alive,
+        # so an immediate "after" is a near-certain false negative for the one question this
+        # is asked to settle.
+        _RECYCLE_PENDING_BEFORE_MB = before
+    logger.info("conversation recycle #%d after %d turns", _PERIODIC_RECYCLES, turns)
+    return True
+
+
+def _report_recycle_memory_effect():
+    """Log the before/after once, a full probe interval after the recycle that armed it."""
+    global _RECYCLE_PENDING_BEFORE_MB, _RECYCLE_MEMORY_MEASURED
+    before, _RECYCLE_PENDING_BEFORE_MB = _RECYCLE_PENDING_BEFORE_MB, None
+    if before is None:
+        return
+    _RECYCLE_MEMORY_MEASURED = True
+    after = _edge_working_set_mb()
+    logger.info("conversation recycle: Edge working set %.0f -> %s MB one probe interval "
+                "later (all Edge processes, coarse -- it answers only whether navigating "
+                "away eventually released the document, not any per-tab figure)",
+                before, ("%.0f" % after) if after is not None else "?")
+
+
 def _open_fresh_conversation(title=""):
     """Point the page at a brand-new chat on the same agent. Runs on the page thread.
 
@@ -4207,6 +4355,11 @@ def _open_fresh_conversation(title=""):
     if AGENT_URL:
         PAGE.goto(AGENT_URL, wait_until="domcontentloaded")
         ok = _wait_composer()
+    # NOT GUARDED ON `ok`, and an earlier draft got this backwards. The idea was to protect a
+    # healthy conversation by refusing to renumber when the new page failed to come up -- but
+    # the goto has already fired by then, so the old conversation is gone either way. Skipping
+    # the swap does not preserve anything; it only makes the ledger disagree with the page in
+    # the other direction. What the caller needs is the truth about `ok`, which is returned.
     # Change-based capture baseline: the pane is now on the bare agent page, but
     # aria-current can STILL mark the previously-open conversation's row (observed
     # live) -- that stale marker plus all currently-known guids IS the baseline the
@@ -4214,6 +4367,8 @@ def _open_fresh_conversation(title=""):
     _record_capture_baseline()
     sess = S.new_session(title=title)
     ACTIVE_SID = sess["sid"]
+    global _CONVERSATION_TURNS
+    _CONVERSATION_TURNS = 0
     return ok
 
 
@@ -4321,7 +4476,7 @@ def _do_tool_probe_turn(instruction):
     if not agent_loaded:
         return False, "", False
     try:
-        DRIVER.send(instruction)
+        _send_counted(instruction)
         idle_ok = DRIVER.wait_for_idle(timeout_s=TOOL_PROBE_TIMEOUT_SEC)
         reply = DRIVER.read_last_response() or ""
         return True, reply, (not idle_ok)
@@ -4488,6 +4643,19 @@ def _run_tool_probe():
         except Exception:
             pass
         logger.info("tool probe: ok=%s kind=%s", ok, kind)
+        try:
+            _report_recycle_memory_effect()
+        except Exception:
+            pass
+        if ok:
+            # ONLY AFTER A GOOD PROBE, and only after the record above. Recycling a
+            # conversation that just failed would replace the evidence of the failure with a
+            # blank page, and the next probe would report a healthy bridge that had never been
+            # shown to work.
+            try:
+                _recycle_long_conversation()
+            except Exception:
+                logger.warning("conversation recycle raised", exc_info=True)
         if _page_probe_requires_restart(kind):
             try:
                 tool_probe.record_probe(
@@ -4651,7 +4819,7 @@ def _page_main(cdp, fresh):
     Every later PAGE/DRIVER call (from any HTTP request thread) is routed here via
     run_on_page_thread -- see PageExecutor's docstring for why page creation and every later
     page call must share this one thread (Playwright sync-API thread affinity)."""
-    global PAGE, DRIVER, AGENT_URL, ACTIVE_SID
+    global PAGE, DRIVER, AGENT_URL, ACTIVE_SID, _CONVERSATION_TURNS
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         br = p.chromium.connect_over_cdp(cdp)
@@ -4720,7 +4888,19 @@ def _page_main(cdp, fresh):
                     # once the pane demonstrably shows the target conversation).
                     ACTIVE_SID = latest["sid"]
                     S.touch(ACTIVE_SID, status="active")
-                    print("resumed session %s" % ACTIVE_SID, flush=True)
+                    # SEED THE LENGTH COUNTER FROM WHAT WAS RESUMED. It starts at zero with
+                    # the process, and startup auto-resume reopens the PREVIOUS conversation
+                    # -- so without this, the very conversation that grew to 1.3 GB would be
+                    # treated as brand new and carry on for another full budget of turns.
+                    #
+                    # A LOWER BOUND, stated as one. The store counts turns it was asked to
+                    # persist; the idle probe's turns are synthetic and never recorded there,
+                    # and they are the majority at 144/day. So this under-reads, and it
+                    # under-reads in the direction of recycling later rather than sooner --
+                    # which is the safe direction, but it is not a measurement of the DOM.
+                    _CONVERSATION_TURNS = int(latest.get("turns") or 0)
+                    print("resumed session %s (conversation seeded at %d recorded turns)"
+                          % (ACTIVE_SID, _CONVERSATION_TURNS), flush=True)
                     # CRASH-RESUME (work mode): the resumed session was left mode=="working"
                     # by a /goal loop that never reached its own loop-end S.touch(mode="idle")
                     # -- i.e. the bridge process died mid-goal (crash, or the -Keepalive

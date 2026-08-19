@@ -82,6 +82,7 @@ jobs:
             tests/test_child_output_decoding.py \
             tests/test_skill_approval_flow.py \
             tests/test_bridge_recycle.py \
+            tests/test_bridge_conversation_length.py \
             tests/test_unlock_redaction.py \
             tests/test_edge_keeper_coverage.py \
             tests/test_edge_taskbar_hygiene.py \
