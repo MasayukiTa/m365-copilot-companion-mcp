@@ -185,3 +185,25 @@ def test_a_corpus_without_timings_is_not_silently_dropped():
             for i in range(3)]
     keep, drop = drop_incomplete(rows)
     assert len(keep) == 3 and not drop
+
+
+def test_a_reviewer_that_used_the_whole_budget_and_answered_is_not_a_hole():
+    """実際に走行を止めた誤り。3本とも『反証要求の予算内に解析可能な評決が出なかった』
+    = 3つの本物の観測を、経過時間だけ見てハーネス障害と呼んでいた。"""
+    detail = {ln: {"verdict": A.UNCLEAR, "elapsed_s": 419.0,
+                   "reason": "the nudge budget ran out without a parseable verdict"}
+              for ln in LENSES}
+    rows = [dict(_row(1, False, A.SECURITY_PASS, (A.UNCLEAR,) * 3), lens_detail=detail)]
+    keep, drop = drop_incomplete(rows)
+    assert len(keep) == 1 and not drop, "答えを時計で捨てている"
+
+
+def test_a_harness_fault_is_still_a_hole_however_fast_it_failed():
+    detail = {"correctness": {"verdict": A.UNCLEAR, "elapsed_s": 3.0,
+                              "reason": "harness: opening the side page failed: X: y"},
+              "edge": {"verdict": A.REFUTED, "elapsed_s": 90.0, "reason": ""},
+              "security": {"verdict": A.UPHELD, "elapsed_s": 92.0, "reason": ""}}
+    rows = [dict(_row(1, False, A.SECURITY_PASS, (A.UNCLEAR, A.REFUTED, A.UPHELD)),
+                 lens_detail=detail)]
+    keep, drop = drop_incomplete(rows)
+    assert not keep and len(drop) == 1

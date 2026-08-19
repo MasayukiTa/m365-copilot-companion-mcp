@@ -283,21 +283,21 @@ def harness_faults(detail) -> list:
 
 
 def timed_out_lenses(detail, *, timeout_s=LENS_TIMEOUT_S) -> list:
-    """Lenses whose UNCLEAR is a clock running out, not a reviewer being unsure.
+    """Kept only for corpora written before the reasons existed.
 
-    THE DIFFERENCE IS THE WHOLE CORPUS. Section 18 asks what a policy would have missed by NOT
-    running a lens, which can only be answered if every lens's verdict is known for every
-    candidate. A lens that never answered leaves that cell empty, and scoring a policy that
-    would have chosen it against an empty cell credits it with a clean result it never got.
-    `RefuterSession` returns the same ("UNCLEAR", "") for both cases, so elapsed time is what
-    separates them: a session that ran the full budget did not form an opinion, it ran out.
+    ELAPSED TIME WAS THE WRONG SIGNAL AND IT COST A RUN. It was chosen when every UNCLEAR
+    arrived as ("UNCLEAR", "") and the clock was the only thing that distinguished a starved
+    lens from an unsure one. Now the sessions say why, and the clock disagrees with them: a
+    reviewer that talks through the whole nudge budget and never produces a parseable verdict
+    burns the full timeout, and that is an ANSWER. Four rows in and the run stopped with all
+    three lenses reading "the nudge budget ran out without a parseable verdict" -- three
+    genuine observations, called a harness fault by a stopwatch.
 
-    Observed here: opening one reviewer page dropped free RAM from 2878 MB to 1081 MB, under
-    the 2000 MB floor the NEXT page needs -- so on this box the lenses starve each other, and
-    the first lens of a candidate can answer while the second and third cannot.
+    So this is now only consulted when a row carries no reason at all.
     """
     return [lens for lens, d in detail.items()
-            if d["verdict"] == A.UNCLEAR and float(d.get("elapsed_s") or 0) >= timeout_s * 0.95]
+            if d["verdict"] == A.UNCLEAR and not d.get("reason")
+            and float(d.get("elapsed_s") or 0) >= timeout_s * 0.95]
 
 
 def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
@@ -431,7 +431,29 @@ def load_corpus(path) -> list:
     return rows
 
 
+def load_operator_env(path=None):
+    """Read .env into the environment without printing any of it.
+
+    THE WRAPPER THAT USED TO DO THIS COST A RUN. It exec'd this script as a child, so
+    `pkill -f <wrapper>` killed the wrapper and left the collector alive -- and a second
+    collector launched afterwards shared the browser and the output file with the first.
+    The corpus came back with a duplicated candidate id and twelve UNCLEAR verdicts, which
+    is what two clients on one CDP endpoint looks like from the outside. One process, one
+    name to kill.
+    """
+    path = path or (ROOT / ".env")
+    try:
+        for line in io.open(path, encoding="utf-8-sig"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip())
+    except FileNotFoundError:
+        pass
+
+
 def main() -> int:
+    load_operator_env()
     ap = argparse.ArgumentParser()
     ap.add_argument("--cdp-url", default=os.environ.get("MCP_FLEET_CDP_URL",
                                                         "http://127.0.0.1:9222"))

@@ -49,9 +49,16 @@ def drop_incomplete(rows, *, timeout_s=LENS_TIMEOUT_S):
     keep, drop = [], []
     for row in rows:
         detail = row.get("lens_detail") or {}
+        # THE REASON FIRST. A reviewer that used the whole nudge budget and produced no
+        # parseable verdict took the full timeout and still answered; judging it by the clock
+        # discards a real observation. The clock is only consulted for rows written before
+        # the sessions carried reasons.
+        from relay.refuter import unclear_is_harness_fault
         starved = [lens for lens, d in detail.items()
                    if d.get("verdict") == A.UNCLEAR
-                   and float(d.get("elapsed_s") or 0) >= timeout_s * 0.95]
+                   and (unclear_is_harness_fault(d.get("reason"))
+                        or (not d.get("reason")
+                            and float(d.get("elapsed_s") or 0) >= timeout_s * 0.95))]
         (drop if starved else keep).append(row)
     return keep, drop
 
