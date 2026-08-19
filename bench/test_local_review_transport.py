@@ -170,6 +170,14 @@ def test_runtime_terminal_job_is_requeued_but_operator_stop_is_not(tmp_path):
 #
 # Left failing-under-load rather than skipped: a skip would make the next full run green and
 # the question would stop being asked.
+#
+# MEASURED 2026-08-19, so the next reader does not repeat it: one hundred runs of this file
+# under a sustained six-worker CPU load produced zero failures. The neighbouring intermittent
+# suite (tools/test_skill_registration.py) got sixty runs under the same load, also zero. So
+# the trigger is not CPU contention alone, and the hypothesis below is not confirmed by
+# absence -- it is simply still open. What did change is that the fake now records and
+# re-raises its own exceptions, so the next occurrence either names the contention or states
+# that contention was not the cause.
 def test_unexpected_controller_exit_restarts_same_job_until_done(tmp_path, monkeypatch):
     goals = tmp_path / "goals.jsonl"
     goals.write_text(json.dumps(_goal(), ensure_ascii=False) + "\n", encoding="utf-8")
