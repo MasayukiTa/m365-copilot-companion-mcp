@@ -448,8 +448,11 @@ def frontier(results) -> dict:
             "intervals, and nothing here is held out",
             "severity: every false accept counts one, so a missed cosmetic nit and a missed "
             "security defect are the same number",
-            "label certainty: `bad` is a boolean, so a disputed adjudication reads as a "
-            "settled one",
+            "label certainty: the ground truth records the grader's conclusion, not its "
+            "confidence, so a disputed adjudication reads as a settled one",
+            "severity within security: a violation the reply never mentions is uncatchable "
+            "by a panel that reads text, and it is counted the same as one it could have "
+            "seen -- read false_accept_catchable, not false_accept",
             "tuning: trying several k values or seeds and keeping the best frontier fits "
             "this corpus, and nothing here records how many were tried",
             "reviewer variance: each lens's verdict was recorded once, so the absolute "
