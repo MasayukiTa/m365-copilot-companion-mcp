@@ -14,6 +14,14 @@
 #   .\start_bridge.ps1                          # Edge CDP :9223 (copilot-bridge-edge), UI :8765
 #   .\start_bridge.ps1 -CdpPort 9224 -BridgePort 8766
 #   .\start_bridge.ps1 -HardReset               # relaunch the bridge Edge clean
+#   .\start_bridge.ps1 -Fresh                   # start on a NEW conversation, do not reattach
+#
+# Why -Fresh exists: startup normally reattaches to the last conversation, which is usually
+# what you want. It is not what you want when that conversation is the problem. Measured
+# 2026-08-19, the probe had grown one to 1,340.9 MB of renderer memory -- the largest thing on
+# a 16 GB machine. The bridge now recycles a conversation after MCP_BRIDGE_CONVERSATION_MAX_TURNS
+# turns, but reattaching first means loading the whole thing back in before that fires, so a
+# run started to escape it would spend a probe interval right back where it was.
 
 #   .\start_bridge.ps1 -Keepalive               # supervise: restart the bridge if it exits,
 #                                                 re-bring-up the Edge if CDP :9223 drops
@@ -31,7 +39,8 @@ param(
     [switch]$HardReset,
     [switch]$Keepalive,
     [switch]$SignIn,       # force a VISIBLE window now to sign in (normally automatic on demand)
-    [switch]$CollectSettleTrace   # record settle samples for the Stage 0 replay (see below)
+    [switch]$CollectSettleTrace,  # record settle samples for the Stage 0 replay (see below)
+    [switch]$Fresh                # do NOT reattach to the previous conversation on startup
 )
 
 $ErrorActionPreference = "Stop"
@@ -125,12 +134,16 @@ if ($CollectSettleTrace) {
 }
 $py     = Join-Path $root ".venv\Scripts\python.exe"
 $bridge = Join-Path $root "bridge\copilot_bridge.py"
+# Splatted rather than inlined: an empty @(if ...) can reach a native command as an empty
+# argument rather than as nothing at all, which the bridge would then have to ignore.
+$bridgeArgs = @()
+if ($Fresh) { $bridgeArgs += '--fresh' }
 Write-Host ""
 Write-Host "Starting bridge (headless):  UI http://127.0.0.1:$BridgePort   ->   Edge CDP :$CdpPort  (profile $Profile)"
 Write-Host "(The fleet's :9222 Edge is untouched -- you can run a SWE fleet at the same time.)"
 
 if (-not $Keepalive) {
-    & $py $bridge
+    & $py $bridge @bridgeArgs
     # If the bridge could not reach the agent because a real sign-in wall is up, surface a window.
     if (Needs-SignIn) { Write-Host "Sign-in required -> opening a visible window once."; Ensure-Edge -Hard -Visible | Out-Null }
     exit $LASTEXITCODE
@@ -146,7 +159,7 @@ while ($true) {
         Write-Host "CDP :$CdpPort not answering -- re-bringing up the bridge Edge (headless)..."
         Ensure-Edge -Hard | Out-Null
     }
-    & $py $bridge
+    & $py $bridge @bridgeArgs
     if (Needs-SignIn) {
         Write-Host "Sign-in required -> opening a visible window. Sign in to M365; it continues automatically."
         Ensure-Edge -Hard -Visible | Out-Null
