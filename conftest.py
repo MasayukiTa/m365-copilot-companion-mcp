@@ -83,3 +83,43 @@ def _no_leftover_kill_switch():
     STOP_FILE.unlink(missing_ok=True)
     yield
     STOP_FILE.unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------------------------------------
+# A TEST RUN MUST NOT READ THE OPERATOR'S .env.
+#
+# `relay/agent_profiles.py` and `bridge/copilot_bridge.py` call `load_dotenv()` AT IMPORT, and
+# pytest imports every selected test module during COLLECTION -- before the first test runs.
+# So merely including `bridge/` in a run injects the real .env into os.environ for every test
+# in it, whatever order they execute in.
+#
+# That is not hypothetical. `tools/` alone passes 497 tests; `tools/ tests/ bench/ bridge/ ui/`
+# fails four registration tests, because .env sets MCP_TOOL_MAP_INCLUDE and MCP_TOOL_MAP_MAX
+# and those tests set only some of the family. The failure looks like a bug in the tool map and
+# is a bug in what the test inherited.
+#
+# Neutralised at the source rather than by each test clearing more keys: a test that has to
+# remember which of twenty operator settings might reach it will forget one, and the forgetting
+# is invisible until some unrelated directory joins the run. Tests that WANT a value set it
+# themselves with monkeypatch, which is unaffected.
+def _no_dotenv(*_a, **_k):
+    return False
+
+
+try:
+    import dotenv as _dotenv
+    _dotenv.load_dotenv = _no_dotenv
+    _dotenv.main.load_dotenv = _no_dotenv
+except Exception:
+    pass
+@pytest.fixture(autouse=True, scope="session")
+def _dotenv_is_neutralised():
+    """Proof the patch took, rather than a try/except that swallowed an import error.
+
+    A neutralisation that silently failed would leave the leak in place and the comment above
+    describing a protection that is not there -- which is worse than no comment.
+    """
+    import dotenv
+    assert dotenv.load_dotenv is _no_dotenv, (
+        "load_dotenv was not neutralised; a test run can read the operator's .env")
+    yield
