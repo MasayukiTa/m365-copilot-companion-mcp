@@ -11,7 +11,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from relay.selfimprove import reviewer_allocation as A
-from scripts.analyze_lens_corpus import describe, load, run
+from scripts.analyze_lens_corpus import (describe, load, measured_lens_cost,
+                                         run, split, warm_memory)
 
 LENSES = ("correctness", "edge", "security")
 
@@ -82,3 +83,63 @@ def test_seeded_rows_are_reported_separately_from_the_real_ones(tmp_path, capsys
     out = capsys.readouterr().out
     assert "seeded included" in out and "real candidates only" in out, (
         "両方の見方を出さないと、セキュリティ比較が種のみに乗っていることが隠れる")
+
+
+# ---- 実測コストと保持データ ---------------------------------------------------------------------
+
+def _timed(i, functional, security, verdicts, secs):
+    r = _row(i, functional, security, verdicts)
+    r["lens_detail"] = {ln: {"verdict": v, "reason": "", "elapsed_s": secs[ln]}
+                        for ln, v in zip(LENSES, verdicts)}
+    return r
+
+
+def test_lens_cost_is_measured_and_timed_out_lenses_are_excluded():
+    """タイムアウトしたレンズの所要はタイムアウト値であって、レンズの値ではない。
+    混ぜると、黙ったレンズほど『高価』になり、frontier がそれを避け始める。"""
+    fast = {"correctness": 30.0, "edge": 40.0, "security": 50.0}
+    slow = {"correctness": 420.0, "edge": 420.0, "security": 420.0}
+    rows = [_timed(1, False, A.SECURITY_PASS, (A.REFUTED, A.UPHELD, A.UPHELD), fast),
+            _timed(2, False, A.SECURITY_PASS, (A.REFUTED, A.UPHELD, A.UPHELD), fast),
+            _timed(3, True, A.SECURITY_PASS, (A.UNCLEAR, A.UNCLEAR, A.UNCLEAR), slow)]
+    cost = measured_lens_cost(rows)
+    assert cost == fast, cost
+
+
+def test_no_timings_is_reported_as_a_modelling_choice_not_a_measurement():
+    assert measured_lens_cost([_row(1, False, A.SECURITY_PASS, (A.REFUTED,) * 3)]) is None
+
+
+def test_the_split_is_stratified_so_the_scarce_bad_rows_reach_both_halves(tmp_path):
+    """id 順に切ると、実際に不良候補が全部片側へ寄った。保持側の frontier は
+    そのせいだけで拒否になり、分割が結論を決めていた。"""
+    rows = ([_row(i, False, A.SECURITY_PASS, (A.REFUTED, A.UPHELD, A.UPHELD))
+             for i in range(10)]
+            + [_row(100 + i, True, A.SECURITY_PASS, (A.UPHELD,) * 3) for i in range(10)])
+    train, test = split(rows)
+    def bad(rs):
+        return sum(1 for r in rs if not A._truth(r)[0])
+    assert bad(train) > 0 and bad(test) > 0, (bad(train), bad(test))
+    assert abs(bad(train) - bad(test)) <= 1
+
+
+def test_warming_twice_does_not_double_the_observations(tmp_path):
+    """RefuterMemory は追記する。同じパスへ2回温めると観測数が倍になり、
+    adaptive は『解析を再実行した回数』だけ強く見える。"""
+    rows = [_row(i, False, A.SECURITY_PASS, (A.REFUTED, A.UPHELD, A.UPHELD))
+            for i in range(6)]
+    path = tmp_path / "mem.json"
+    _m1, first = warm_memory(rows, path)
+    _m2, second = warm_memory(rows, path)
+    assert first == second, (first, second)
+
+
+def test_the_held_out_view_does_not_print_a_caveat_that_is_false_for_it(tmp_path, capsys):
+    rows = [_row(i, False, A.SECURITY_PASS, (A.REFUTED, A.UPHELD, A.UPHELD))
+            for i in range(12)]
+    memory, _ = warm_memory(rows[:6], tmp_path / "m.json")
+    run(rows[6:], k=2, memory=memory, held_out=True)
+    out = capsys.readouterr().out
+    assert "does not support -- train/test separation" not in out
+    assert "DOES support -- train/test separation" in out
+    assert "still does not support -- generalisation" in out

@@ -145,9 +145,10 @@ def run_lenses(context, agent_url, goal, reply, lenses, *, timeout_s=LENS_TIMEOU
 
     out = {}
     for lens in lenses:
+        started = time.time()
         session = RefuterSession(context, agent_url, goal, reply, lens=lens,
                                  timeout_s=timeout_s).start()
-        deadline = time.time() + timeout_s + 60
+        deadline = started + timeout_s + 60
         verdict, reason = None, "the poll loop gave up before the session finished"
         while time.time() < deadline:
             got = session.poll()
@@ -158,8 +159,14 @@ def run_lenses(context, agent_url, goal, reply, lenses, *, timeout_s=LENS_TIMEOU
         # A LENS THAT NEVER ANSWERED PRODUCED NO EVIDENCE, which is what UNCLEAR means. It is
         # not "the lens looked and found nothing" -- recording it as UPHELD would credit the
         # policy that ran it with a clean result it never obtained.
+        # ELAPSED IS RECORDED SO THE COST AXIS CAN BE MEASURED RATHER THAN ASSUMED. A
+        # frontier trades false accepts against review calls, and treating every lens as
+        # equally expensive is a modelling choice that quietly favours whichever lens is in
+        # fact the slow one. Timed-out lenses are excluded downstream: their elapsed time is
+        # the timeout, not the lens.
         out[lens] = {"verdict": verdict if verdict in A.VERDICTS else A.UNCLEAR,
-                     "reason": reason or ""}
+                     "reason": reason or "",
+                     "elapsed_s": round(time.time() - started, 1)}
     return out
 
 
