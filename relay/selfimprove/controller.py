@@ -50,7 +50,7 @@ class EvolutionController:
     """Runs one candidate end to end. Stateless between calls except for its stores."""
 
     def __init__(self, *, ledger=None, archive=None, baseline_path=None,
-                 activate=False, auto_apply=False):
+                 activate=False, auto_apply=False, records_path=None):
         self.ledger = ledger or HypothesisLedger()
         self.archive = archive
         self.baseline_path = baseline_path
@@ -59,6 +59,10 @@ class EvolutionController:
         # you get by not thinking about it.
         self.activate = bool(activate)
         self.auto_apply = bool(auto_apply)
+        # WHERE THE DURABLE EPISODE RECORDS GO (sections 19-21). None means the loop runs
+        # exactly as before and writes none -- the record store is additive, and a run that
+        # cannot write one must still be able to run.
+        self.records_path = records_path
         self._parent_id = ""
 
     def run_candidate(self, *, genome, hypothesis, target_failure_class, evaluate,
@@ -136,6 +140,12 @@ class EvolutionController:
             return self._conclude(experiment_id, D.decide(frozen_ok=False),
                                   {"frozen_changed_during_run": changed_post},
                                   candidate, cand_id, changed)
+
+        # SECTIONS 19-21. Written before the decision, because a record whose contents
+        # depend on the verdict is a record of the verdict rather than of the run. Failure to
+        # write is carried into the conclusion rather than raised: an unwritable store is a
+        # gap in the evidence, not a reason to discard an evaluation that already happened.
+        records_error = self._write_records(experiment_id, cand_id, result)
 
         verdict = D.decide(
             gate=result.get("gate"),
@@ -258,6 +268,41 @@ class EvolutionController:
         except Exception as exc:
             return "%s: %s" % (type(exc).__name__, exc)
         return ""
+
+
+    def _write_records(self, experiment_id, cand_id, result) -> str:
+        """Append one episode record per arm per episode. Returns "" or the reason it could not.
+
+        The controller knows the experiment, the harness and its parent; it does NOT know the
+        per-episode latency, turn count or state hashes, because `paired_evaluate` returns id
+        sets rather than rows. Those arrive as absent and are named in `not_recorded` -- which
+        is the whole reason that field exists, and better than reaching into the frozen runner
+        for data that can be added later without re-blessing the judge.
+        """
+        if not self.records_path:
+            return ""
+        try:
+            from relay.selfimprove import episode_record as ER
+            rows = []
+            for arm in ("candidate", "baseline"):
+                rows.extend(ER.from_paired_result(
+                    result, experiment_id=experiment_id,
+                    harness_id=cand_id if arm == "candidate" else self._parent_id,
+                    candidate_parent=self._parent_id,
+                    git_commit=EX._git_commit(),
+                    model=(result or {}).get("model") or "unrecorded",
+                    pool_version=(result or {}).get("pool_version") or "unrecorded",
+                    random_seed=(result or {}).get("random_seed"),
+                    grader_version=(result or {}).get("grader_version") or "unrecorded",
+                    security_policy_version=(
+                        (result or {}).get("security_policy_version") or "unrecorded"),
+                    execution_profile=(result or {}).get("execution_profile") or "unrecorded",
+                    arm=arm))
+            for row in rows:
+                ER.append(self.records_path, row)
+            return ""
+        except Exception as exc:
+            return "%s: %s" % (type(exc).__name__, exc)
 
     def _conclude(self, experiment_id, verdict, result, candidate, cand_id, changed):
         # ARCHIVE FIRST, THEN CONCLUDE, THEN ACTIVATE. The ledger conclusion was written

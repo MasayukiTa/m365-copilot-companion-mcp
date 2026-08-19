@@ -291,3 +291,50 @@ def append(path, record) -> None:
     validate(record, what="the record being appended")
     with open(path, "a", encoding="utf-8", newline="\n") as fh:
         fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def from_paired_result(result, *, experiment_id, harness_id, candidate_parent,
+                       git_commit="", model="", pool_version="", random_seed=None,
+                       grader_version="", security_policy_version="",
+                       execution_profile="", arm="candidate") -> list:
+    """One record per episode, built from what a paired evaluation returns.
+
+    A DELIBERATELY THIN RECORD, and the thinness is the honest part. `paired_evaluate`
+    returns id sets and aggregates, not per-episode rows: no latency, no turn count, no state
+    hashes, no tool calls. Reaching for those would mean changing the runner, which sits in
+    the frozen judge set, for data that can be added later without re-blessing it.
+
+    So every field the caller cannot supply arrives as None and lands in `not_recorded`.
+    That is the difference between a record that says "this episode made no tool calls" and
+    one that says "nobody recorded them" -- and the whole module exists to keep those apart.
+
+    `arm` distinguishes the two halves of a paired run. Without it both arms produce a record
+    per episode id and the pair collapses into what looks like a duplicate.
+    """
+    part = (result or {}).get("on" if arm == "candidate" else "off") or {}
+    resolved = set(part.get("resolved_ids") or [])
+    infra = set(part.get("infra_ids") or [])
+    out = []
+    for episode_id in (result or {}).get("slice_ids") or []:
+        out.append(build(
+            episode_id="%s:%s" % (arm, episode_id),
+            experiment_id=experiment_id,
+            harness_id=harness_id,
+            candidate_parent=candidate_parent,
+            git_commit=git_commit,
+            model=model,
+            pool=(result or {}).get("pool") or "evolution",
+            pool_version=pool_version,
+            random_seed=random_seed,
+            grader_version=grader_version,
+            security_policy_version=security_policy_version,
+            execution_profile=execution_profile,
+            outcome={
+                "functional_success": episode_id in resolved,
+                "infra_failure": episode_id in infra,
+                # NOT CLAIMED. A paired result carries no per-episode security verdict, and
+                # defaulting this to True would report a security pass the run never made.
+                "security_success": None,
+            },
+        ))
+    return out
