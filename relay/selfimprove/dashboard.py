@@ -120,6 +120,13 @@ def _ab_history(reports_glob) -> list:
             "p": _to_float(gate.get("p")),
             "verdict": gate.get("verdict"),
             "keep": gate.get("keep"),
+            # WHICH DATA THE NUMBER CAME FROM. Without this the claimable check below is
+            # permanently red -- and a light that can never go green carries no information
+            # and teaches the reader to skip the line. A report that does not record its
+            # pools still reads as "not recorded", which is a true statement about the
+            # report rather than a verdict about the claim.
+            "pools": rep.get("pools") or [],
+            "pool_reads": rep.get("pool_reads") or {},
         }))
 
     rows.sort(key=lambda t: t[0])          # oldest -> newest, deterministic
@@ -246,6 +253,9 @@ def dashboard_state(*, archive_path=None, burned_path=None, grade_results_path=N
         "grade_results_count": len(grade_recs),
         # mirror the general-user quality headline up to the summary for one-glance reading
         "persona_leak_rate": usage.get("persona_leak_rate"),
+        # From the newest report that recorded them; absent stays absent.
+        "pools": (latest_ab or {}).get("pools") or [],
+        "pool_reads": (latest_ab or {}).get("pool_reads"),
     }
 
     return {
@@ -328,10 +338,19 @@ def render_text(state) -> str:
     # rule is about, so silence has to read as "cannot claim" rather than as permission.
     from relay.selfimprove import episode_record as _ER
     _pools = summary.get("pools") or []
-    _claim = _ER.may_claim_improvement(
-        [{"pool": p} for p in _pools], pool_reads=summary.get("pool_reads") or {})
-    lines.append("claimable     : %s -- %s"
-                 % ("yes" if _claim["may_claim"] else "NO", _claim["reason"]))
+    _reads = summary.get("pool_reads")
+    if not _pools:
+        # THREE STATES, NOT TWO. "The report does not say" is a fact about the report and is
+        # actionable (make the report say); "NO" is a verdict about the claim. Collapsing
+        # them made this line print NO on every dashboard ever rendered.
+        lines.append("claimable     : not recorded -- the report does not say which pool the "
+                     "gain came from, so it cannot be read as an improvement")
+    else:
+        _claim = _ER.may_claim_improvement(
+            [{"pool": p, "pool_version": "reported", "episode_id": "reported"}
+             for p in _pools], pool_reads=_reads)
+        lines.append("claimable     : %s -- %s"
+                     % ("yes" if _claim["may_claim"] else "NO", _claim["reason"]))
 
     lines.append("burned total  : %d" % int(summary.get("burned_total") or 0))
     lines.append("archive count : %d" % int(summary.get("archive_count") or 0))

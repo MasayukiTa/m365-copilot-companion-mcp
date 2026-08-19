@@ -38,6 +38,7 @@ that gets read.
 from __future__ import annotations
 
 import json
+import os
 import time
 
 #: Everything section 20 says must be reconstructable. Named here rather than checked inline
@@ -55,9 +56,14 @@ REPRODUCIBILITY_FIELDS = (
     "execution_profile",
 )
 
-#: Pools whose results may be cited as an estimate of generalisation. `evolution` is the
-#: optimiser's own feedback and can never be, however good the number looks.
-GENERALISATION_POOLS = frozenset({"sealed", "regression"})
+#: Pools whose results may be cited as an estimate of generalisation.
+#:
+#: `regression` USED TO BE HERE AND WAS WRONG. A regression pool is read on every candidate
+#: cycle by definition -- that is what it is for -- so under a one-read rule it is burned at
+#: the second candidate and permanently uncitable. Two constants disagreed, and the one that
+#: had to give was this: a regression pool detects LOSS against a known baseline; it does not
+#: estimate how a change generalises. Only the sealed holdout does that.
+GENERALISATION_POOLS = frozenset({"sealed"})
 
 #: How many reads of a held-out pool are tolerated before it stops being held out. ONE. The
 #: brief's rule is that repeated inspection converts a set into optimisation feedback, and the
@@ -73,7 +79,7 @@ def build(*, episode_id, experiment_id="", task_class="", failure_class=None,
           harness_id="", component_versions=None, execution_profile="",
           git_commit="", candidate_parent="", model="", pool="", pool_version="",
           random_seed=None, grader_version="", security_policy_version="",
-          start_state_hash="", end_state_hash="", turn_count=0, tool_calls=None,
+          start_state_hash="", end_state_hash="", turn_count=None, tool_calls=None,
           human_interventions=None, security_events=None, provenance_events=None,
           verification=None, outcome=None, latency=None, cost=None,
           raw_trace_path="", ts=None) -> dict:
@@ -93,6 +99,8 @@ def build(*, episode_id, experiment_id="", task_class="", failure_class=None,
         ("human_interventions", human_interventions), ("security_events", security_events),
         ("provenance_events", provenance_events), ("verification", verification),
         ("outcome", outcome), ("latency", latency), ("cost", cost),
+        # "turns not recorded" and "zero turns" were one row here too.
+        ("turn_count", turn_count), ("raw_trace_path", raw_trace_path or None),
     ) if value is None]
     if ts is None:
         # The build time is not the episode time. Recording it silently would let a record
@@ -118,7 +126,7 @@ def build(*, episode_id, experiment_id="", task_class="", failure_class=None,
         "security_policy_version": security_policy_version,
         "start_state_hash": start_state_hash,
         "end_state_hash": end_state_hash,
-        "turn_count": int(turn_count or 0),
+        "turn_count": None if turn_count is None else int(turn_count),
         "tool_calls": list(tool_calls or []),
         "human_interventions": list(human_interventions or []),
         "security_events": list(security_events or []),
@@ -130,12 +138,18 @@ def build(*, episode_id, experiment_id="", task_class="", failure_class=None,
         # THE RAW TRACE STAYS WHERE IT IS. Inlining a whole transcript makes the summary
         # unreadable and unsearchable, and the brief asks for them kept apart.
         "raw_trace_path": raw_trace_path,
-        "ts": time.time() if ts is None else ts,
+        # NONE, NOT THE BUILD TIME. Stamping `time.time()` and flagging it in `not_recorded`
+        # was a fig leaf: no consumer reads the flag, and the dashboard sorts on `ts`
+        # unconditionally, so a row built during a later analysis pass sorted as though it
+        # ran then. An absent time sorts nowhere, which is the correct amount of nowhere.
+        "ts": ts,
     }
 
 
 def missing_for_reproduction(record) -> list:
     """Which of section 20's fields this record cannot supply."""
+    if record is not None and not isinstance(record, dict):
+        raise RecordError("a record must be a dict, got %r" % type(record).__name__)
     out = []
     for field in REPRODUCIBILITY_FIELDS:
         value = (record or {}).get(field)
@@ -208,8 +222,24 @@ def may_claim_improvement(records, *, pool_reads=None) -> dict:
     if not rows:
         return {"may_claim": False, "reason": "no records", "pools": []}
 
-    pools = sorted({r.get("pool") or "" for r in rows})
-    reads = dict(pool_reads or {})
+    # A row too broken to store cannot license a sentence. The two refusals have to compose,
+    # or the weaker one becomes the way around the stronger.
+    unusable = [r for r in rows if not r.get("pool_version") or not r.get("episode_id")]
+    if unusable:
+        return {"may_claim": False, "pools": sorted({r.get("pool") or "" for r in rows}),
+                "reason": ("%d record(s) carry no pool_version or episode_id, so which data "
+                           "this number came from cannot be established" % len(unusable))}
+
+    pools = sorted({(r.get("pool") or "").strip().lower() for r in rows})
+    reads = {}
+    for key, value in dict(pool_reads or {}).items():
+        try:
+            reads[str(key).strip().lower()] = int(value)
+        except (TypeError, ValueError):
+            return {"may_claim": False, "pools": pools,
+                    "reason": ("the read count for %r is %r, which is not a number of looks; "
+                               "a malformed history is refused rather than raised through the "
+                               "caller" % (key, value))}
     optimisation = [p for p in pools if p and p not in GENERALISATION_POOLS]
     generalisation = [p for p in pools if p in GENERALISATION_POOLS]
 
@@ -219,6 +249,15 @@ def may_claim_improvement(records, *, pool_reads=None) -> dict:
                            "feedback. A number from the data used to tune the harness "
                            "estimates fit, not generalisation"
                            % ", ".join(optimisation or ["an unnamed pool"]))}
+
+    # UNKNOWN HISTORY IS NOT ZERO HISTORY -- asked AFTER the pool question, because for a set
+    # with no held-out pool at all the read count is irrelevant and answering with it would
+    # bury the stronger reason under a weaker one.
+    if pool_reads is None:
+        return {"may_claim": False, "pools": pools,
+                "reason": ("no reading history was supplied. A held-out set stops being held "
+                           "out on the second look, so not knowing how often it was looked at "
+                           "is not the same as knowing it was looked at once")}
 
     burned = [p for p in generalisation if int(reads.get(p, 0)) > MAX_HELDOUT_READS]
     if burned:

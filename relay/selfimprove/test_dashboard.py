@@ -255,18 +255,21 @@ if __name__ == "__main__":
 
 # ---- §21 は、人が数を読む場所で効く ---------------------------------------------------------
 
-def test_a_gain_is_not_presented_as_claimable_when_the_state_does_not_say():
-    """注釈の無い gain こそ規則が扱っている当のもの。沈黙は許可ではない。"""
+def test_a_report_that_does_not_say_reads_as_not_recorded_rather_than_as_a_verdict():
+    """3状態であること。『報告が言っていない』は報告についての事実で、行動につながる。
+    『NO』は主張についての判定。畳むと、この行は全ダッシュボードで常に赤になり、
+    永久に赤い信号は読み飛ばされる訓練にしかならない。"""
     from relay.selfimprove.dashboard import render_text
     got = render_text({"summary": {"latest_ab": {"net_pp": 6.2, "p": 0.18,
                                                  "verdict": "suggestive", "keep": False}}})
-    assert "claimable     : NO" in got
+    assert "claimable     : not recorded" in got
+    assert "claimable     : NO" not in got
 
 
 def test_a_gain_from_the_optimisation_pool_says_so():
     """最適化に使った当のデータから出た数は、適合の推定。"""
     from relay.selfimprove.dashboard import render_text
-    got = render_text({"summary": {"pools": ["evolution"],
+    got = render_text({"summary": {"pools": ["evolution"], "pool_reads": {"evolution": 1},
                                    "latest_ab": {"net_pp": 6.2, "keep": True}}})
     assert "claimable     : NO" in got and "optimiser's own feedback" in got
 
@@ -284,3 +287,30 @@ def test_a_burned_held_out_pool_stops_being_claimable():
     got = render_text({"summary": {"pools": ["sealed"], "pool_reads": {"sealed": 3},
                                    "latest_ab": {"net_pp": 6.2, "keep": True}}})
     assert "claimable     : NO" in got and "second look" in got
+
+
+def test_the_claimable_line_can_actually_go_green():
+    """死んだ配線でないことの証明。`dashboard_state` が pools を載せない限り
+    この行は永久に赤で、赤にしかならない検査は検査ではない。"""
+    from relay.selfimprove.dashboard import render_text
+    got = render_text({"summary": {"pools": ["sealed"], "pool_reads": {"sealed": 1},
+                                   "latest_ab": {"net_pp": 6.2, "keep": True}}})
+    assert "claimable     : yes" in got
+
+
+def test_the_report_row_carries_the_pools_so_the_summary_can_read_them():
+    """報告行に pools が無ければ、要約にも出ず、行は永久に『not recorded』のまま。"""
+    import inspect
+
+    from relay.selfimprove import dashboard as D
+    src = inspect.getsource(D._ab_history)
+    assert '"pools": rep.get("pools")' in src
+    assert '"pool_reads": rep.get("pool_reads")' in src
+
+
+def test_an_unknown_read_history_is_not_treated_as_never_read():
+    """pools はあるが読み回数が無い状態。履歴不明を0回と読むのが fail-open。"""
+    from relay.selfimprove.dashboard import render_text
+    got = render_text({"summary": {"pools": ["sealed"],
+                                   "latest_ab": {"net_pp": 6.2, "keep": True}}})
+    assert "claimable     : NO" in got and "no reading history" in got
