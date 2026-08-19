@@ -95,7 +95,18 @@ def require_room_for_lenses():
     box is what wedges the sweep and trips the watchdog.
     """
     from relay.relay_fleet import avail_phys_mb, ram_room_for_tab
-    if not ram_room_for_tab():
+    # SAMPLED, NOT SNAPPED. A single reading cancelled a run at 1,238 MB free while a check
+    # two minutes later read 5,376 MB -- the dip was this process's own imports landing.
+    # Refusing on an instant is the same class of error as accepting on one: the guard exists
+    # to catch a box that cannot host a reviewer page, not a box that was briefly busy.
+    best = 0.0
+    for i in range(4):
+        if i:
+            time.sleep(2.0)
+        best = max(best, avail_phys_mb())
+        if ram_room_for_tab():
+            return
+    if best < 2000.0:
         raise NotEnoughRoom(
             "%.0f MB physical RAM free, and a reviewer tab needs 2000 MB. Every lens would "
             "time out and record UNCLEAR, which is indistinguishable from a reviewer that "
