@@ -253,6 +253,20 @@ def run_refuter(context, conversation_url: str, goal: str, final_response: str,
     return verdict
 
 
+#: Prefix on the reasons where UNCLEAR means "this session could not ask the question",
+#: as opposed to "the reviewer was asked and did not produce a verdict". Both are UNCLEAR to
+#: the fleet, which is right -- neither blocks. They are opposites to anything measuring the
+#: reviewers: the second is an observation about a lens, and the first is a hole where an
+#: observation should be. A prefix rather than a lookup table, so a new exit that forgets to
+#: classify itself reads as a reviewer outcome only if its author wrote it that way.
+HARNESS_REASON_PREFIX = "harness: "
+
+
+def unclear_is_harness_fault(reason) -> bool:
+    """True when an UNCLEAR came from the session, not from the reviewer."""
+    return str(reason or "").startswith(HARNESS_REASON_PREFIX)
+
+
 class RefuterSession:
     """Non-blocking refuter for the FLEET (single-thread round-robin): a blocking
     side-page wait would freeze every other worker for minutes. start() opens the side
@@ -302,7 +316,7 @@ class RefuterSession:
         )
         try:
             if self.context is None or not self.base_url:
-                self._finish(("UNCLEAR", "no browser context or no agent url: the session was constructed without a target"))
+                self._finish(("UNCLEAR", HARNESS_REASON_PREFIX + "no browser context or no agent url: the session was constructed without a target"))
                 return
             self.page = self.context.new_page()
             self.page.goto(self.base_url, wait_until="domcontentloaded", timeout=45000)
@@ -313,7 +327,7 @@ class RefuterSession:
                     appeared = True
                     break
             if not appeared:
-                self._finish(("UNCLEAR", "the composer never rendered within 40s of loading the agent page"))
+                self._finish(("UNCLEAR", HARNESS_REASON_PREFIX + "the composer never rendered within 40s of loading the agent page"))
                 return
             self.drv = CopilotWebDriver(self.page)
             self._count_before = self.drv._answers().count()
@@ -326,14 +340,14 @@ class RefuterSession:
                     or (self.page is not None and not _page_network_available(self.page))):
                 self._schedule_network_reopen("open failed: %s" % type(exc).__name__)
             else:
-                self._finish(("UNCLEAR", "opening the side page failed: %s" % type(exc).__name__))
+                self._finish(("UNCLEAR", HARNESS_REASON_PREFIX + "opening the side page failed: %s: %s" % (type(exc).__name__, str(exc)[:160].replace(chr(10), " | "))))
 
     def _schedule_network_reopen(self, reason):
         """Close the stale side page and retry the same read-only refuter prompt later."""
         import sys
         import time
         if self._network_reopens >= self.max_network_reopens:
-            self._finish(("UNCLEAR", "the network-reopen budget ran out while the browser reported offline"))
+            self._finish(("UNCLEAR", HARNESS_REASON_PREFIX + "the network-reopen budget ran out while the browser reported offline"))
             return
         self._network_reopens += 1
         try:
@@ -372,7 +386,7 @@ class RefuterSession:
                 import sys
                 sys.stderr.write("[refuter] RAM_SKIP: no tab within %ds, review SKIPPED (instance "
                                  "solved without refutation)\n" % int(self.timeout_s))
-                self._finish(("UNCLEAR", "no tab within %ds: the RAM floor for another page never cleared" % int(self.timeout_s)))
+                self._finish(("UNCLEAR", HARNESS_REASON_PREFIX + "no tab within %ds: the RAM floor for another page never cleared" % int(self.timeout_s)))
                 return self._done
             if not ram_room_for_tab():
                 return None
@@ -385,7 +399,7 @@ class RefuterSession:
                 self._schedule_network_reopen("browser reported offline during review")
                 return self._done
             if self._t_send and time.time() - self._t_send > self.timeout_s:
-                self._finish(("UNCLEAR", "the reviewer did not answer within %ds" % int(self.timeout_s)))
+                self._finish(("UNCLEAR", HARNESS_REASON_PREFIX + "the reviewer did not answer within %ds" % int(self.timeout_s)))
                 return self._done
             if self.drv._answers().count() <= self._count_before:
                 return None
@@ -451,7 +465,7 @@ class RefuterSession:
             self._last, self._stable_since = t, time.time()
             return None
         except Exception:
-            self._finish(("UNCLEAR", "reading the reviewer's reply raised"))
+            self._finish(("UNCLEAR", HARNESS_REASON_PREFIX + "reading the reviewer's reply raised"))
             return self._done
 
     def _nudge(self):

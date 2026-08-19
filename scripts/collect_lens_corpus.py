@@ -233,6 +233,22 @@ def all_unclear(detail) -> bool:
     return all(d["verdict"] == A.UNCLEAR for d in detail.values())
 
 
+def harness_faults(detail) -> list:
+    """Lenses whose UNCLEAR is a hole rather than an answer.
+
+    A CANDIDATE WHERE EVERY LENS SAID UNCLEAR IS DATA, and an earlier version of this threw it
+    away. If three reviewers were asked and none produced a verdict, that is a real property
+    of the candidate -- every policy scores the same on it, correctly. What cannot be scored
+    is a lens that was never asked, because the counterfactual the whole experiment rests on
+    is unavailable. Observed on one candidate: correctness could not open its page while edge
+    and security both answered and simply had no verdict to give. Discarding that row loses
+    two genuine observations to punish one.
+    """
+    from relay.refuter import unclear_is_harness_fault
+    return [lens for lens, d in detail.items()
+            if d["verdict"] == A.UNCLEAR and unclear_is_harness_fault(d.get("reason"))]
+
+
 def timed_out_lenses(detail, *, timeout_s=LENS_TIMEOUT_S) -> list:
     """Lenses whose UNCLEAR is a clock running out, not a reviewer being unsure.
 
@@ -306,13 +322,12 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
 
             detail = run_lenses(cdp_url, agent_url, prompt, reply, lenses)
             verdicts = verdicts_only(detail)
-            starved = timed_out_lenses(detail)
-            if starved or all_unclear(detail):
+            starved = sorted(set(timed_out_lenses(detail)) | set(harness_faults(detail)))
+            if starved:
                 # A SILENT LENS IS A HARNESS SYMPTOM BEFORE IT IS DATA, and one silent lens is
                 # already enough: the row would be scored as if that lens had looked and found
                 # nothing, which is the one thing the corpus must never assert.
-                why = ("no lens produced a verdict" if all_unclear(detail)
-                       else "lens(es) ran out the clock without answering: %s" % starved)
+                why = "lens(es) could not be asked: %s" % starved
                 skipped.append({"candidate_id": episode.episode_id, "why": why,
                                 "detail": detail})
                 print("  %-28s SKIPPED: %s" % (episode.episode_id, why), flush=True)
@@ -349,11 +364,10 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
             for episode, style, prompt, reply, grade in known_bad_rows(seeds):
                 detail = run_lenses(cdp_url, agent_url, prompt, reply, lenses)
                 verdicts = verdicts_only(detail)
-                starved = timed_out_lenses(detail)
-                if starved or all_unclear(detail):
+                starved = sorted(set(timed_out_lenses(detail)) | set(harness_faults(detail)))
+                if starved:
                     skipped.append({"candidate_id": "%s#%s" % (episode.episode_id, style),
-                                    "why": ("no lens produced a verdict" if all_unclear(detail)
-                                            else "lens(es) ran out the clock: %s" % starved)})
+                                    "why": "lens(es) could not be asked: %s" % starved})
                     print("  %-28s [calibration/%s] SKIPPED: incomplete panel"
                           % (episode.episode_id, style), flush=True)
                     continue

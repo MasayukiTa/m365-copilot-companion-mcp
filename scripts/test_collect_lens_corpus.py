@@ -120,3 +120,56 @@ def test_an_all_silent_panel_becomes_a_skip_not_a_row():
     detail["edge"]["verdict"] = "UPHELD"
     assert not CL.all_unclear(detail)
     assert CL.verdicts_only(detail)["edge"] == "UPHELD"
+
+
+# ---- 穴と、答えとしての UNCLEAR は別物 ------------------------------------------------------------
+
+def test_a_candidate_every_lens_found_unclear_is_kept():
+    """3本とも聞かれて誰も評決を出せなかったなら、それは候補の性質。
+    どの方策も同じ点になるのが正しく、捨てると本物の観測を失う。"""
+    detail = {ln: {"verdict": "UNCLEAR", "elapsed_s": 200.0,
+                   "reason": "the nudge budget ran out without a parseable verdict"}
+              for ln in ("correctness", "edge", "security")}
+    assert CL.all_unclear(detail)
+    assert CL.harness_faults(detail) == [], "レビュアの答えを障害として扱っている"
+    assert CL.timed_out_lenses(detail) == []
+
+
+def test_a_lens_that_could_not_be_asked_is_a_hole():
+    """実測された組み合わせ: correctness はページが開けず、edge と security は
+    答えたうえで評決を出せなかった。行ごと捨てると、1本の障害のために
+    2本の本物の観測を失う -- ので行は落とすが、理由は『聞けなかった方』を指す。"""
+    detail = {
+        "correctness": {"verdict": "UNCLEAR", "elapsed_s": 12.0,
+                        "reason": "harness: opening the side page failed: RuntimeError: x"},
+        "edge": {"verdict": "UNCLEAR", "elapsed_s": 210.0,
+                 "reason": "the nudge budget ran out without a parseable verdict"},
+        "security": {"verdict": "UNCLEAR", "elapsed_s": 205.0,
+                     "reason": "the nudge budget ran out without a parseable verdict"},
+    }
+    assert CL.harness_faults(detail) == ["correctness"]
+
+
+def test_the_prefix_is_what_separates_them_not_a_string_table():
+    from relay.refuter import HARNESS_REASON_PREFIX, unclear_is_harness_fault
+    assert unclear_is_harness_fault(HARNESS_REASON_PREFIX + "anything")
+    assert not unclear_is_harness_fault("anything")
+    # 新しい出口が分類を忘れたら、レビュアの答え側に落ちる -- そちらが安全側
+    assert not unclear_is_harness_fault(None)
+
+
+def test_every_session_exit_that_cannot_ask_is_marked():
+    """出口を足した人が分類を忘れると、穴が観測として記録される。"""
+    from pathlib import Path
+    import relay.refuter as R
+    src = Path(R.__file__).read_text(encoding="utf-8")
+    needle = '_finish(("UNCLEAR", '
+    exits = []
+    at = src.find(needle)
+    while at != -1:
+        line = src[at:src.index(chr(10), at)]
+        exits.append(line[len(needle):].rstrip().rstrip(")").strip())
+        at = src.find(needle, at + 1)
+    assert len(exits) >= 8, exits
+    unmarked = [e for e in exits if "HARNESS_REASON_PREFIX" not in e]
+    assert unmarked == ['"the nudge budget ran out without a parseable verdict"'], unmarked
