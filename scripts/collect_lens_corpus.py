@@ -64,6 +64,17 @@ LENS_TIMEOUT_S = 420.0
 NL = chr(10)
 
 
+#: A connect that takes longer than this is contention, not latency.
+SLOW_CONNECT_S = 10.0
+
+#: Consecutive candidates whose whole panel went silent before the run is called off.
+MAX_CONSECUTIVE_SILENT = 2
+
+
+class LensHarnessFault(RuntimeError):
+    """The harness cannot produce verdicts. Not a result about the reviewers."""
+
+
 class NotEnoughRoom(RuntimeError):
     """The box cannot open a reviewer tab, so no lens can produce a verdict."""
 
@@ -126,7 +137,7 @@ def truth_from_grade(grade) -> dict:
     return {"functional": functional, "security": security}
 
 
-def run_lenses(context, agent_url, goal, reply, lenses, *, timeout_s=LENS_TIMEOUT_S) -> dict:
+def run_lenses(cdp_url, agent_url, goal, reply, lenses, *, timeout_s=LENS_TIMEOUT_S) -> dict:
     """Every lens against one candidate. Returns {lens: {"verdict": ..., "reason": ...}}.
 
     ALL of them, which is the point: a policy that runs two of three cannot be scored without
@@ -141,43 +152,76 @@ def run_lenses(context, agent_url, goal, reply, lenses, *, timeout_s=LENS_TIMEOU
     live run came back UNCLEAR on all three lenses and, without the reason, that is
     indistinguishable from three lenses that looked and were unsure.
     """
+    from playwright.sync_api import sync_playwright
+
     from relay.refuter import RefuterSession
 
+    # THE CONNECTION IS OPENED HERE AND CLOSED WHEN THE PANEL IS DONE, rather than held for
+    # the whole run. FleetAgent executes each episode in a CHILD PROCESS that opens its own
+    # connect_over_cdp to this same endpoint -- so a parent holding one across the episode
+    # puts two Playwright clients on one browser. Measured: a second connect_over_cdp against
+    # the busy endpoint hung for its full 180s timeout, and with nothing else attached the
+    # same call returned in two seconds. That contention is what produced three UNCLEAR
+    # verdicts per candidate on a box with 4.2 GB free and no RAM skip in the log -- the
+    # third distinct way this collector found to record a harness fault as a reviewer's
+    # opinion.
     out = {}
-    for lens in lenses:
-        # FREE RAM AT THE MOMENT THIS LENS STARTS. RefuterSession waits for the 2000 MB floor
-        # and then gives up with the same ("UNCLEAR", "") a thoughtful reviewer returns, so
-        # without this a starved lens and an unsure one look identical in the record. Elapsed
-        # time separates them; this says how close the box was, which is what decides whether
-        # a re-run has any chance.
-        try:
-            from relay.relay_fleet import avail_phys_mb
-            free_mb = round(avail_phys_mb())
-        except Exception:
-            free_mb = None
-        started = time.time()
-        session = RefuterSession(context, agent_url, goal, reply, lens=lens,
-                                 timeout_s=timeout_s).start()
-        deadline = started + timeout_s + 60
-        verdict, reason = None, "the poll loop gave up before the session finished"
-        while time.time() < deadline:
-            got = session.poll()
-            if got is not None:
-                verdict, reason = got
-                break
-            time.sleep(1.0)
-        # A LENS THAT NEVER ANSWERED PRODUCED NO EVIDENCE, which is what UNCLEAR means. It is
-        # not "the lens looked and found nothing" -- recording it as UPHELD would credit the
-        # policy that ran it with a clean result it never obtained.
-        # ELAPSED IS RECORDED SO THE COST AXIS CAN BE MEASURED RATHER THAN ASSUMED. A
-        # frontier trades false accepts against review calls, and treating every lens as
-        # equally expensive is a modelling choice that quietly favours whichever lens is in
-        # fact the slow one. Timed-out lenses are excluded downstream: their elapsed time is
-        # the timeout, not the lens.
-        out[lens] = {"verdict": verdict if verdict in A.VERDICTS else A.UNCLEAR,
-                     "reason": reason or "",
-                     "elapsed_s": round(time.time() - started, 1),
-                     "free_mb_at_start": free_mb}
+    with sync_playwright() as pw:
+      opened = time.time()
+      browser = pw.chromium.connect_over_cdp(cdp_url)
+      took = time.time() - opened
+      if took > SLOW_CONNECT_S:
+          # A CONNECT THAT CRAWLS MEANS SOMETHING ELSE IS ON THIS BROWSER. Measured: two
+          # seconds with nothing attached, the full 180s timeout while another client held
+          # it. Between those, the lenses come back UNCLEAR and the corpus fills with
+          # harness faults wearing reviewer verdicts.
+          raise LensHarnessFault(
+              "connecting to %s took %.0fs (over %.0fs). Another client is on this browser; "
+              "the reviewers will not get a usable page." % (cdp_url, took, SLOW_CONNECT_S))
+      if not browser.contexts:
+          # NOT new_context(). The fleet's real profile is the one that is signed in; a fresh
+          # context is a logged-out browser where the composer never renders, which produces
+          # three silent UNCLEAR verdicts per candidate -- exactly the symptom this whole
+          # sequence of empty runs was made of. There is no situation where continuing here
+          # is better than stopping.
+          raise LensHarnessFault(
+              "the browser at %s has no context. The signed-in profile is what the reviewers "
+              "need; an empty one renders no composer and every lens goes silent." % cdp_url)
+      context = browser.contexts[0]
+      for lens in lenses:
+          # FREE RAM AT THE MOMENT THIS LENS STARTS. RefuterSession waits for the 2000 MB floor
+          # and then gives up with the same ("UNCLEAR", "") a thoughtful reviewer returns, so
+          # without this a starved lens and an unsure one look identical in the record. Elapsed
+          # time separates them; this says how close the box was, which is what decides whether
+          # a re-run has any chance.
+          try:
+              from relay.relay_fleet import avail_phys_mb
+              free_mb = round(avail_phys_mb())
+          except Exception:
+              free_mb = None
+          started = time.time()
+          session = RefuterSession(context, agent_url, goal, reply, lens=lens,
+                                   timeout_s=timeout_s).start()
+          deadline = started + timeout_s + 60
+          verdict, reason = None, "the poll loop gave up before the session finished"
+          while time.time() < deadline:
+              got = session.poll()
+              if got is not None:
+                  verdict, reason = got
+                  break
+              time.sleep(1.0)
+          # A LENS THAT NEVER ANSWERED PRODUCED NO EVIDENCE, which is what UNCLEAR means. It is
+          # not "the lens looked and found nothing" -- recording it as UPHELD would credit the
+          # policy that ran it with a clean result it never obtained.
+          # ELAPSED IS RECORDED SO THE COST AXIS CAN BE MEASURED RATHER THAN ASSUMED. A
+          # frontier trades false accepts against review calls, and treating every lens as
+          # equally expensive is a modelling choice that quietly favours whichever lens is in
+          # fact the slow one. Timed-out lenses are excluded downstream: their elapsed time is
+          # the timeout, not the lens.
+          out[lens] = {"verdict": verdict if verdict in A.VERDICTS else A.UNCLEAR,
+                       "reason": reason or "",
+                       "elapsed_s": round(time.time() - started, 1),
+                       "free_mb_at_start": free_mb}
     return out
 
 
@@ -217,8 +261,6 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
     all three security episodes unevaluable. Every row is flagged, so the frontier can be
     read with and without them.
     """
-    from playwright.sync_api import sync_playwright
-
     from relay.refuter import PANEL_LENSES
 
     require_room_for_lenses()
@@ -233,10 +275,8 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
     # to `run_episode` would mean re-blessing the frozen judge for a convenience.
     lenses = list(lenses or PANEL_LENSES)
     rows, skipped = [], []
-    with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(cdp_url)
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
-
+    consecutive_silent = 0
+    if True:
         for episode in episodes:
             workdir = tempfile.mkdtemp(prefix="lenscorpus_")
             try:
@@ -264,7 +304,7 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
                 skipped.append({"candidate_id": episode.episode_id, "why": "empty reply"})
                 continue
 
-            detail = run_lenses(context, agent_url, prompt, reply, lenses)
+            detail = run_lenses(cdp_url, agent_url, prompt, reply, lenses)
             verdicts = verdicts_only(detail)
             starved = timed_out_lenses(detail)
             if starved or all_unclear(detail):
@@ -276,7 +316,19 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
                 skipped.append({"candidate_id": episode.episode_id, "why": why,
                                 "detail": detail})
                 print("  %-28s SKIPPED: %s" % (episode.episode_id, why), flush=True)
+                consecutive_silent += 1
+                if consecutive_silent >= MAX_CONSECUTIVE_SILENT:
+                    # STOP, DO NOT GRIND ON. Skipping and continuing is right for one bad
+                    # candidate and wrong for a broken harness: three separate collections
+                    # have now spent their whole budget skipping every candidate and
+                    # finishing with an empty file, which reads like a completed run.
+                    raise LensHarnessFault(
+                        "%d candidates in a row had no lens produce a verdict. That is the "
+                        "harness, not the reviewers -- the last one said: %s"
+                        % (consecutive_silent,
+                           {ln: (d["reason"] or "(silent)")[:90] for ln, d in detail.items()}))
                 continue
+            consecutive_silent = 0
             rows.append({
                 "candidate_id": episode.episode_id,
                 "bad": truth_from_grade(grade),
@@ -295,7 +347,7 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
             from bench.companionbench.calibration import known_bad_rows
             seeds = [e for e in episodes if getattr(e, "category", "") == "security"]
             for episode, style, prompt, reply, grade in known_bad_rows(seeds):
-                detail = run_lenses(context, agent_url, prompt, reply, lenses)
+                detail = run_lenses(cdp_url, agent_url, prompt, reply, lenses)
                 verdicts = verdicts_only(detail)
                 starved = timed_out_lenses(detail)
                 if starved or all_unclear(detail):
@@ -369,9 +421,16 @@ def main() -> int:
     except NotEnoughRoom as exc:
         print("REFUSED: %s" % exc)
         return 3
-    got = collect(cdp_url=args.cdp_url, agent_url=args.agent_url, episodes=episodes,
-                  agent=build_agent("fleet"), out_path=args.out,
-                  calibrate=not args.no_calibration)
+    try:
+        got = collect(cdp_url=args.cdp_url, agent_url=args.agent_url, episodes=episodes,
+                      agent=build_agent("fleet"), out_path=args.out,
+                      calibrate=not args.no_calibration)
+    except LensHarnessFault as exc:
+        print()
+        print("STOPPED: %s" % exc)
+        print("Anything already written to %s is usable; the rest was not collected."
+              % args.out)
+        return 4
     print()
     print("recorded %d row(s) to %s" % (len(got["rows"]), args.out))
     if got["skipped"]:

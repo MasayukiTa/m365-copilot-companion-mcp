@@ -302,7 +302,7 @@ class RefuterSession:
         )
         try:
             if self.context is None or not self.base_url:
-                self._finish(("UNCLEAR", ""))
+                self._finish(("UNCLEAR", "no browser context or no agent url: the session was constructed without a target"))
                 return
             self.page = self.context.new_page()
             self.page.goto(self.base_url, wait_until="domcontentloaded", timeout=45000)
@@ -313,7 +313,7 @@ class RefuterSession:
                     appeared = True
                     break
             if not appeared:
-                self._finish(("UNCLEAR", ""))
+                self._finish(("UNCLEAR", "the composer never rendered within 40s of loading the agent page"))
                 return
             self.drv = CopilotWebDriver(self.page)
             self._count_before = self.drv._answers().count()
@@ -326,14 +326,14 @@ class RefuterSession:
                     or (self.page is not None and not _page_network_available(self.page))):
                 self._schedule_network_reopen("open failed: %s" % type(exc).__name__)
             else:
-                self._finish(("UNCLEAR", ""))
+                self._finish(("UNCLEAR", "opening the side page failed: %s" % type(exc).__name__))
 
     def _schedule_network_reopen(self, reason):
         """Close the stale side page and retry the same read-only refuter prompt later."""
         import sys
         import time
         if self._network_reopens >= self.max_network_reopens:
-            self._finish(("UNCLEAR", ""))
+            self._finish(("UNCLEAR", "the network-reopen budget ran out while the browser reported offline"))
             return
         self._network_reopens += 1
         try:
@@ -372,7 +372,7 @@ class RefuterSession:
                 import sys
                 sys.stderr.write("[refuter] RAM_SKIP: no tab within %ds, review SKIPPED (instance "
                                  "solved without refutation)\n" % int(self.timeout_s))
-                self._finish(("UNCLEAR", ""))
+                self._finish(("UNCLEAR", "no tab within %ds: the RAM floor for another page never cleared" % int(self.timeout_s)))
                 return self._done
             if not ram_room_for_tab():
                 return None
@@ -385,7 +385,7 @@ class RefuterSession:
                 self._schedule_network_reopen("browser reported offline during review")
                 return self._done
             if self._t_send and time.time() - self._t_send > self.timeout_s:
-                self._finish(("UNCLEAR", ""))
+                self._finish(("UNCLEAR", "the reviewer did not answer within %ds" % int(self.timeout_s)))
                 return self._done
             if self.drv._answers().count() <= self._count_before:
                 return None
@@ -451,7 +451,7 @@ class RefuterSession:
             self._last, self._stable_since = t, time.time()
             return None
         except Exception:
-            self._finish(("UNCLEAR", ""))
+            self._finish(("UNCLEAR", "reading the reviewer's reply raised"))
             return self._done
 
     def _nudge(self):
@@ -468,8 +468,15 @@ class RefuterSession:
             # that had not been asked yet.
             self._settle_state = _settle.SettleState()
         except Exception:
-            self._finish(("UNCLEAR", ""))
+            self._finish(("UNCLEAR", "the nudge budget ran out without a parseable verdict"))
 
+    # EVERY EXIT SAYS WHY. UNCLEAR is returned both by a reviewer that looked and could not
+    # decide and by a page that never opened, and for a long time those were the same
+    # ("UNCLEAR", "") from eight places. The fleet reads only the verdict, so it cannot tell
+    # and does not need to -- it treats UNCLEAR as "do not block" either way. Anything
+    # MEASURING the reviewers does need to: three consecutive corpus collections came back
+    # empty, and the reason they took three runs to explain rather than one is that the
+    # sessions were silent about which of the eight had happened.
     def _finish(self, verdict):
         self._done = verdict
         self.close()
