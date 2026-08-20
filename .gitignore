@@ -219,3 +219,22 @@ docs/research/
 # committed on purpose, so the directory cannot be ignored wholesale -- dotfiles inside it can,
 # and a scratch file has no business being tracked in the first place.
 bench/companionbench/results/.*
+
+# ---- genome and skills: data, never code -------------------------------------------------
+# These are concentrations of whatever the system has learned, so the default is: not tracked.
+#
+# THE ARCHIVE IS THE EXCEPTION, and deliberately so. Today its entries are benchmark runs --
+# knob names, a card NAME with a boolean, and public SWE-bench instance ids -- which makes it
+# a genome template and the evidence behind the published pass@1 figures. Removing it would
+# discard a real public record to guard a risk that has not arrived.
+#
+# What guards the risk instead is content, not the path: tests/test_sensitive_paths_untracked.py
+# fails if a tracked archive entry cites a slice that is not a public benchmark instance. The
+# day a business episode reaches the archive, CI goes red and the entry has to be split out
+# rather than published. `genome.cards` will hold learned prompt text by then, and
+# `descriptors` and `slice_ids` will name the tasks it learned from.
+relay/selfimprove/active_genome.json
+relay/selfimprove/episode_records.jsonl
+relay/selfimprove/*.sqlite3
+skills.sqlite3
+*.skills.sqlite3

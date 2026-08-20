@@ -175,3 +175,43 @@ def test_a_status_line_names_what_is_never_allowed_too():
     assert got["level"] == "D" and got["next"] is None
     assert set(got["never"]) == {A.ACTIVATE_SOURCE, A.MERGE_SOURCE_PR}
     assert A.describe("A")["next"] == "B"
+
+
+# ---- 呼ばれないガバナンス・コードは、不在より悪い -------------------------------------------------
+
+def test_raise_to_has_no_production_caller():
+    """`operator_approved` は呼び出し側が主張する真偽値で、誰でも True を渡せる。
+    このまま配線すると「明らかなスタブ」が「効いているように見える統制」に変わり、
+    後から読む人と監査がそれを本物だと受け取る。
+
+    配線したくなったら、まずこのテストを消すことになる -- そのとき raise_to の
+    docstring を読むことになる、というのがこのテストの仕事。
+    """
+    import os
+    import re
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    hits = []
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs
+                   if d not in (".git", ".venv", "node_modules", "__pycache__", ".fleet")]
+        for name in files:
+            if not name.endswith(".py") or name.startswith("test_"):
+                continue
+            path = os.path.join(base, name)
+            try:
+                src = open(path, encoding="utf-8").read()
+            except Exception:
+                continue
+            if os.path.abspath(path) == os.path.abspath(A.__file__):
+                continue                      # 定義そのもの
+            if re.search(r"\braise_to\s*\(", src):
+                hits.append(os.path.relpath(path, root))
+    assert not hits, (
+        "raise_to に本番の呼び出し元ができている: %s。\n"
+        "配線する前に docstring を読むこと -- 呼び出し側が主張する承認は承認ではない" % hits)
+
+
+def test_raise_to_says_it_is_not_a_mechanism():
+    doc = A.raise_to.__doc__ or ""
+    assert "NOT A MECHANISM" in doc
+    assert "governance_of_promotion" in doc

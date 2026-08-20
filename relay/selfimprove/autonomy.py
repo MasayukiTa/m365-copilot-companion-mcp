@@ -158,6 +158,25 @@ def require(level, action, *, change_kind=None, gates_all_passed=None, what="thi
 def raise_to(current, target, *, operator_approved=False, evidence=None) -> str:
     """Move up one rung, with an operator behind it. Returns the new level or raises.
 
+    THIS IS NOT A MECHANISM, AND MUST NOT BE READ AS ONE. Nothing in production calls it, and
+    that is deliberate rather than an omission waiting to be filled in. `operator_approved` is
+    a boolean the CALLER asserts: any caller can pass True, including this system. Wiring it
+    as it stands would convert an obvious stub into a control that looks enforced and is not,
+    which is worse than the stub -- a later reader, or an audit, would take it for a working
+    gate on autonomy.
+
+    What it is: an executable statement of what an approval would have to contain. One rung at
+    a time, an operator behind it, and evidence that can be produced later. Keep it, because
+    the requirements are worth stating; do not call it until the assertion can come from
+    somewhere this process cannot forge.
+
+    See docs/research/governance_of_promotion.md: the honest ceiling on a single-machine
+    design is that an agent holding a shell cannot be fenced out of its own guards, so what a
+    protected key would buy is authenticity of the approval statement, never its enforcement.
+
+    test_autonomy.py fails if a production caller appears, so this note cannot be bypassed by
+    someone who did not read it.
+
     ONE RUNG AT A TIME. A to C would grant self-activation without the period in between --
     the system proposing, a human approving each winner, and someone able to see whether the
     proposals were any good. That period IS the evidence for the raise, so skipping it skips
