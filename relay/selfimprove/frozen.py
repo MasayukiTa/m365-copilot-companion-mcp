@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
 from typing import Iterable
 
@@ -144,6 +145,31 @@ class BaselineRefused(Exception):
     """Raised when re-blessing the constitution would destroy the thing it is for."""
 
 
+#: A STANDING DELEGATION DOES NOT COVER THE MACHINERY THAT ENFORCES IT.
+#:
+#: The operator delegated re-signing on 2026-08-20 and kept Skills approval as a per-act human
+#: decision. But the rule that says Skills stay human lives in the constitution, and the
+#: constitution's re-signing is what was just delegated -- so that line could be erased by one
+#: delegated act, and so could this exclusion, and so could the revoke path that makes
+#: rollback possible. A boundary whose definition sits inside the delegated region is not a
+#: boundary.
+#:
+#: Touching any of these therefore falls OUT of the standing delegation and back to a
+#: specified decision. Everything else the operator delegated stays delegated.
+DELEGATION_EXCLUDED = (
+    "relay/selfimprove/frozen.py",            # this guard, its revoke path, this list
+    "relay/selfimprove/manifest.py",          # what may be evolved, and what never may
+    "tools/security.py",                      # the unlock boundary
+    "tools/folder_policy.py",
+    "tools/_untrusted.py",
+    "docs/SECURITY.md",
+)
+
+#: What a caller passes as `--authorization` when acting under the standing delegation rather
+#: than a decision made about this particular act. Named so the ledger shows which it was.
+STANDING_DELEGATION = "standing-delegation"
+
+
 def snapshot_baseline(repo_root: str = REPO, baseline_path: str = DEFAULT_BASELINE,
                       force: bool = False) -> dict:
     """Compute the frozen checksums and write them as the baseline json. Returns the baseline dict.
@@ -196,6 +222,15 @@ def snapshot_baseline(repo_root: str = REPO, baseline_path: str = DEFAULT_BASELI
     # display. What the baseline is FOR is the checksums.
     data = {"repo_root": "<repo>", "checksums": sums}
     os.makedirs(os.path.dirname(baseline_path) or ".", exist_ok=True)
+    # A CACHE, NOT THE RECORD. The authoritative copy of the previous baseline goes into the
+    # ledger, which is append-only and chained; this file is a plain mutable one beside the
+    # thing it is meant to protect. It exists because restoring from it is fast, and `revoke`
+    # falls back to the ledger whenever it is missing or does not match.
+    if os.path.isfile(baseline_path):
+        try:
+            shutil.copyfile(baseline_path, baseline_path + ".prev")
+        except OSError:
+            pass
     with open(baseline_path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
         f.write("\n")
@@ -334,6 +369,75 @@ def burned_append_only(old_lines: Iterable[str], new_lines: Iterable[str]) -> bo
     return new[:len(old)] == old
 
 
+def last_rebless(ledger_path=None):
+    """The most recent rebless record, or None. Reads the append-only ledger, not `.prev`."""
+    try:
+        from relay.selfimprove import authority_ledger as _led
+        for row in reversed(_led.read(ledger_path)):
+            if row.get("event") == _led.REBLESS:
+                return row
+    except Exception:
+        pass
+    return None
+
+
+def revoke_baseline(baseline_path: str = DEFAULT_BASELINE, *, reason: str = "",
+                    authorization: str = "", ledger_path=None) -> dict:
+    """Withdraw the last re-signing: put the previous baseline and anchor back.
+
+    THIS UNDOES AN APPROVAL, NOT A CHANGE. The files that were accepted are still whatever
+    they are; only the record saying they were accepted goes away. So the expected state
+    immediately afterwards is a BROKEN frozen check and a system that refuses to run -- that
+    is the effect, not a side effect. Undoing the code itself is version control's job, and
+    having this touch it would put two systems in charge of one thing.
+
+    The previous baseline comes from the LEDGER, which is append-only and chained. The `.prev`
+    file beside the baseline is only consulted as a fallback, because anything able to
+    overwrite the baseline can also delete the copy sitting next to it.
+    """
+    record = last_rebless(ledger_path)
+    previous = (record or {}).get("baseline_before")
+    source = "ledger record seq=%s" % (record or {}).get("seq")
+    if not previous:
+        prev_file = baseline_path + ".prev"
+        if not os.path.isfile(prev_file):
+            raise BaselineRefused(
+                "nothing to revoke to: the last rebless record carries no previous baseline "
+                "and %s does not exist. A re-signing made before this was recorded cannot be "
+                "undone here -- recover the baseline from version control instead." % prev_file)
+        with open(prev_file, encoding="utf-8") as fh:
+            previous = json.load(fh)
+        source = prev_file
+
+    with open(baseline_path, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(previous, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        fh.write("\n")
+    if baseline_path == DEFAULT_BASELINE:
+        try:
+            with open(_anchor_path(), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(_baseline_digest(baseline_path) + "\n")
+        except OSError:
+            pass
+
+    try:
+        from relay.selfimprove import authority_ledger as _led
+        _led.append(_led.REVOKE,
+                    reason=reason or "withdrawing the previous re-signing",
+                    actor_claimed="relay.selfimprove.frozen CLI",
+                    authorization=authorization or _led.SELF_INITIATED,
+                    command="frozen --revoke",
+                    changed={"relay/selfimprove/frozen_baseline.json":
+                             {"before": "(the re-signed baseline)", "after": source}},
+                    path=ledger_path)
+    except Exception:
+        pass
+    return previous
+
+
+def _excluded_from_delegation(changed) -> list:
+    return sorted(rel for rel in (changed or []) if rel in DELEGATION_EXCLUDED)
+
+
 def _record_rebless(args, before, after) -> None:
     """Append the act to the authority ledger and print its tail. Never fatal.
 
@@ -351,7 +455,11 @@ def _record_rebless(args, before, after) -> None:
                     actor_claimed="relay.selfimprove.frozen CLI",
                     authorization=args.authorization or _led.SELF_INITIATED,
                     command="frozen --snapshot%s" % (" --force" if args.force else ""),
-                    changed=changed)
+                    changed=changed,
+                    # THE WHOLE PREVIOUS BASELINE, not just the differing rows. Rollback has to
+                    # work from the ledger alone -- the .prev file beside the baseline is a
+                    # convenience that anything able to overwrite the baseline can also delete.
+                    baseline_before=before or None)
         print(_led.describe_tail())
     except Exception as exc:                      # never take the snapshot down with it
         print("(the act could not be recorded to the ledger: %s: %s)"
@@ -367,6 +475,10 @@ def _main(argv: list[str] | None = None) -> int:
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--snapshot", action="store_true", help="compute + write the baseline")
     g.add_argument("--verify", action="store_true", help="check current frozen set vs baseline")
+    g.add_argument("--revoke", action="store_true",
+                   help="withdraw the last re-signing: restore the previous baseline and "
+                        "anchor. This undoes the APPROVAL, not the code -- the frozen check "
+                        "will fail afterwards, which is the point")
     ap.add_argument("--force", action="store_true",
                     help="overwrite an existing baseline (re-sign the constitution)")
     ap.add_argument("--reason", default="",
@@ -378,12 +490,52 @@ def _main(argv: list[str] | None = None) -> int:
                          "act. A paraphrase is the actor's own reading of its mandate")
     args = ap.parse_args(argv)
 
+    if args.revoke:
+        try:
+            revoke_baseline(args.baseline, reason=args.reason,
+                            authorization=args.authorization)
+        except BaselineRefused as exc:
+            print("REFUSED: %s" % exc)
+            return 2
+        ok, changed = frozen_intact(args.repo, args.baseline)
+        print("revoked: the previous baseline is back at %s" % args.baseline)
+        print("frozen set intact: %s%s" % (ok, "" if ok else "  <- expected: the approval is "
+                                                             "gone while the files are not"))
+        if changed:
+            print("still differing: %s" % ", ".join(changed))
+        print()
+        print("to finish rolling back, from the repo root:")
+        print("  git log --oneline -- %s        # find the commit that made the change"
+              % ", ".join(sorted(changed)) if changed else "  (nothing differs)")
+        print("  git revert <commit>                     # undo the code as well")
+        print("or, to accept the change after all:")
+        print("  python -m relay.selfimprove.frozen --snapshot --force --reason ...")
+        try:
+            from relay.selfimprove import authority_ledger as _led
+            print(_led.describe_tail())
+        except Exception:
+            pass
+        return 0
+
     if args.snapshot:
         before = load_baseline(args.baseline) or {}
         if args.force and not str(args.reason).strip():
             print("REFUSED: --force needs --reason. Re-signing accepts every change made "
                   "since the baseline was written, and a record that cannot say why is the "
                   "gap this requirement exists to close.")
+            return 2
+        # THE HOLE IN THE STANDING DELEGATION. Re-signing is delegated; re-signing the
+        # machinery that enforces the delegation is not, because a boundary whose definition
+        # sits inside the delegated region can be erased by one delegated act.
+        would_change = [rel for rel, h in compute_checksums(args.repo).items()
+                        if (before.get("checksums") or {}).get(rel) != h]
+        excluded = _excluded_from_delegation(would_change)
+        if excluded and str(args.authorization).strip() in ("", STANDING_DELEGATION,
+                                                            "self-initiated"):
+            print("REFUSED: this re-signing touches %s, which the standing delegation does "
+                  "not cover -- these files define what may be evolved, what the delegation "
+                  "excludes, and how a re-signing is withdrawn. Pass --authorization with the "
+                  "operator's decision about THIS change." % ", ".join(excluded))
             return 2
         try:
             data = snapshot_baseline(args.repo, args.baseline, force=args.force)

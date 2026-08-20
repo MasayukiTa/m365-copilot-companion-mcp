@@ -238,3 +238,8 @@ relay/selfimprove/episode_records.jsonl
 relay/selfimprove/*.sqlite3
 skills.sqlite3
 *.skills.sqlite3
+
+# The convenience copy `revoke` reads when the ledger is unavailable. A cache, not the record
+# -- the authoritative previous baseline lives in the append-only ledger, because anything
+# able to overwrite the baseline can also delete the copy sitting next to it.
+relay/selfimprove/frozen_baseline.json.prev

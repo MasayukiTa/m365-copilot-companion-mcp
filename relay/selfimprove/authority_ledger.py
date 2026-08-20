@@ -36,6 +36,7 @@ Only acts that change what the system may become, plus the one observation that 
 such an act happened:
 
     rebless           the frozen constitution's baseline was re-signed
+    rebless_revoke    a previous re-signing was withdrawn, restoring the baseline before it
     genome_apply      a genome was applied to the running scaffold
     genome_revert     an applied genome was withdrawn
     baseline_mismatch the frozen set was found altered
@@ -84,11 +85,17 @@ def _path(path=None) -> str:
     return path or os.environ.get(ENV_PATH) or DEFAULT_PATH
 
 REBLESS = "rebless"
+#: SEPARATE FROM REBLESS ON PURPOSE, because their post-conditions are opposites: after a
+#: rebless the frozen set verifies, and after a revoke it does NOT -- the approval is gone
+#: while the files are still changed, which is the whole point of withdrawing it. Filing both
+#: under one type would make any reader that reconstructs state from this ledger branch on a
+#: field instead of a type, and that branch is where such readers rot.
+REVOKE = "rebless_revoke"
 GENOME_APPLY = "genome_apply"
 GENOME_REVERT = "genome_revert"
 BASELINE_MISMATCH = "baseline_mismatch"
 GENESIS = "genesis"
-EVENTS = (REBLESS, GENOME_APPLY, GENOME_REVERT, BASELINE_MISMATCH)
+EVENTS = (REBLESS, REVOKE, GENOME_APPLY, GENOME_REVERT, BASELINE_MISMATCH)
 
 #: Carried in the genesis record so it travels with the file rather than living only here.
 CONTRACT = (
@@ -149,7 +156,8 @@ def _genesis(path: str) -> dict:
 
 
 def append(event: str, *, reason: str, actor_claimed: str, authorization: str = "",
-           command: str = "", changed=None, path=None, now=None) -> dict:
+           command: str = "", changed=None, baseline_before=None, path=None,
+           now=None) -> dict:
     """Append one record and return it. Creates the genesis record on first use.
 
     `reason` is required and may not be blank. A record that cannot say why is the shape this
@@ -192,6 +200,10 @@ def append(event: str, *, reason: str, actor_claimed: str, authorization: str = 
         "reason": str(reason),
         "command": str(command or ""),
         "changed": dict(changed or {}),
+        # Present only where a full prior state is needed to undo the act. The rebless record
+        # carries the entire previous baseline so `revoke` can reconstruct it byte-exactly
+        # from an append-only source rather than from a mutable file beside the target.
+        "baseline_before": baseline_before,
         "prev_hash": prev.get("hash"),
     }
     record["hash"] = _digest(record)

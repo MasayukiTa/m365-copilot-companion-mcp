@@ -1,4 +1,5 @@
 """Unit tests for the frozen-constitution guard. Run: python -m relay.selfimprove.test_frozen"""
+import pytest
 import json
 import os
 import tempfile
@@ -402,3 +403,117 @@ def test_a_mismatch_is_recorded_once_not_once_per_check(tmp_path, monkeypatch):
     led.record_mismatch_once(["a.py", "b.py"], reason="more drift", actor_claimed="t")
     rows = [r for r in led.read(ledger_path) if r.get("event") == led.BASELINE_MISMATCH]
     assert len(rows) == 2, "差分が変わったら新しい記録が要る"
+
+
+# ---- 恒久委任と、その外側に置いたもの -------------------------------------------------------------
+
+def test_the_standing_delegation_does_not_cover_the_machinery_that_enforces_it(tmp_path,
+                                                                               capsys):
+    """operator は再署名を委任し、Skills の承認だけ人間に残した。だがその
+    「Skills は人間」というルールは憲法の中にあり、憲法の書き換えは委任済み。
+    線を守るルールが線の内側にあると、委任された1手で線ごと消せる。
+    取り消し経路とこの除外リスト自身も同じ。"""
+    bp = str(tmp_path / "b.json")
+    F.snapshot_baseline(F.REPO, bp)
+    data = json.loads(open(bp, encoding="utf-8").read())
+    data["checksums"]["relay/selfimprove/manifest.py"] = "0" * 64   # 触ったことにする
+    open(bp, "w", encoding="utf-8", newline="\n").write(
+        json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+    rc = F._main(["--snapshot", "--force", "--repo", F.REPO, "--baseline", bp,
+                  "--reason", "routine", "--authorization", F.STANDING_DELEGATION])
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "standing delegation does not cover" in out
+    assert "manifest.py" in out
+
+
+def test_an_ordinary_change_stays_delegated(tmp_path):
+    """除外は狭くなければ意味がない。全部を除外すれば委任は無効化される。"""
+    bp = str(tmp_path / "b.json")
+    F.snapshot_baseline(F.REPO, bp)
+    data = json.loads(open(bp, encoding="utf-8").read())
+    data["checksums"]["bench/companionbench/runner.py"] = "0" * 64
+    open(bp, "w", encoding="utf-8", newline="\n").write(
+        json.dumps(data, indent=2, sort_keys=True) + "\n")
+    rc = F._main(["--snapshot", "--force", "--repo", F.REPO, "--baseline", bp,
+                  "--reason", "routine", "--authorization", F.STANDING_DELEGATION])
+    assert rc == 0
+
+
+def test_the_excluded_list_holds_what_defines_the_boundary():
+    for rel in ("relay/selfimprove/frozen.py", "relay/selfimprove/manifest.py",
+                "tools/security.py"):
+        assert rel in F.DELEGATION_EXCLUDED, rel
+
+
+# ---- 巻き戻し -----------------------------------------------------------------------------------
+
+def test_revoke_restores_the_previous_baseline_from_the_ledger(tmp_path, monkeypatch):
+    """`.prev` はキャッシュ。ベースラインを上書きできる者は隣のコピーも消せるので、
+    正本は追記専用・連鎖済みの台帳側に置く。"""
+    from relay.selfimprove import authority_ledger as led
+    monkeypatch.setenv(led.ENV_PATH, str(tmp_path / "l.jsonl"))
+    bp = str(tmp_path / "b.json")
+    F.snapshot_baseline(F.REPO, bp)
+    original = open(bp, encoding="utf-8").read()
+    data = json.loads(original)
+    data["checksums"]["bench/companionbench/runner.py"] = "0" * 64
+    open(bp, "w", encoding="utf-8", newline="\n").write(
+        json.dumps(data, indent=2, sort_keys=True) + "\n")
+    F._main(["--snapshot", "--force", "--repo", F.REPO, "--baseline", bp,
+             "--reason", "accepting", "--authorization", F.STANDING_DELEGATION])
+    os.remove(bp + ".prev")                     # キャッシュを消しても復元できること
+    F.revoke_baseline(bp, reason="undo")
+    assert json.loads(open(bp, encoding="utf-8").read())["checksums"][
+        "bench/companionbench/runner.py"] == "0" * 64
+
+
+def test_revoke_is_its_own_event_not_a_rebless(tmp_path, monkeypatch):
+    """事後の不変条件が正反対（rebless の後は intact、revoke の後は破れているのが正常）。
+    同じ型にすると、台帳から状態を再構成する側が必ず条件分岐で腐る。"""
+    from relay.selfimprove import authority_ledger as led
+    monkeypatch.setenv(led.ENV_PATH, str(tmp_path / "l.jsonl"))
+    bp = str(tmp_path / "b.json")
+    F.snapshot_baseline(F.REPO, bp)
+    F._main(["--snapshot", "--force", "--repo", F.REPO, "--baseline", bp,
+             "--reason", "r", "--authorization", F.STANDING_DELEGATION])
+    F.revoke_baseline(bp, reason="undo")
+    assert [r["event"] for r in led.read()][-2:] == [led.REBLESS, led.REVOKE]
+
+
+def test_revoke_refuses_when_there_is_nothing_to_go_back_to(tmp_path, monkeypatch):
+    from relay.selfimprove import authority_ledger as led
+    monkeypatch.setenv(led.ENV_PATH, str(tmp_path / "l.jsonl"))
+    bp = str(tmp_path / "b.json")
+    F.snapshot_baseline(F.REPO, bp)
+    with pytest.raises(F.BaselineRefused) as exc:
+        F.revoke_baseline(bp, reason="undo")
+    assert "nothing to revoke to" in str(exc.value)
+
+
+def test_revoke_undoes_the_approval_and_says_the_code_is_still_changed(tmp_path, monkeypatch,
+                                                                       capsys):
+    """承認の取り消しであって版管理ではない。取り消した後に frozen が破れるのは
+    副作用ではなく狙い。それを出力で言わないと、壊れたと読まれる。"""
+    from relay.selfimprove import authority_ledger as led
+    monkeypatch.setenv(led.ENV_PATH, str(tmp_path / "l.jsonl"))
+    bp = str(tmp_path / "b.json")
+    F.snapshot_baseline(F.REPO, bp)
+    data = json.loads(open(bp, encoding="utf-8").read())
+    data["checksums"]["bench/companionbench/runner.py"] = "0" * 64
+    open(bp, "w", encoding="utf-8", newline="\n").write(
+        json.dumps(data, indent=2, sort_keys=True) + "\n")
+    F._main(["--snapshot", "--force", "--repo", F.REPO, "--baseline", bp,
+             "--reason", "r", "--authorization", F.STANDING_DELEGATION])
+    assert F._main(["--revoke", "--repo", F.REPO, "--baseline", bp, "--reason", "undo"]) == 0
+    out = capsys.readouterr().out
+    assert "frozen set intact: False" in out
+    assert "expected" in out
+    assert "git revert" in out, "コードを戻す手順が出ていない"
+
+
+def test_the_revoke_docstring_does_not_promise_to_undo_the_code():
+    doc = F.revoke_baseline.__doc__ or ""
+    assert "NOT A CHANGE" in doc.upper()
+    assert "version control" in doc
