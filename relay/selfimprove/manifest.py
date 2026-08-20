@@ -42,6 +42,12 @@ SCHEMA_VERSION = 1
 # where they document intent without licensing an experiment.
 EVOLVABLE_COMPONENTS = frozenset({
     "memory",
+    # PROMOTED 2026-08-20, in the two steps this comment block prescribes: the version table
+    # (relay.quality_cards.QUALITY_CARDS_VERSIONS) was written and shown to dispatch
+    # differently -- v2 suppresses, replaces and appends cards from the applied genome -- and
+    # only then was the name moved. Until that table existed the genome carried a `cards`
+    # field that NOTHING read, so every card A/B ran the same program twice.
+    "quality_cards",
 })
 
 #: Named so the intent survives, and so a future implementer knows where to look -- but NOT
@@ -52,8 +58,6 @@ UNIMPLEMENTED_COMPONENTS = frozenset({
     "reviewer",
     "retry",
     "context",
-    "routing",
-    "quality_cards",
 })
 
 # Never evolvable, at any autonomy level. These decide what is ALLOWED, or they are the
@@ -79,6 +83,7 @@ FORBIDDEN_COMPONENTS = frozenset({
 #: while six of them dispatched to nothing.
 DEFAULT_COMPONENTS = {
     "memory": "memory/v1",
+    "quality_cards": "quality_cards/v1",
 }
 
 #: Every parameter's type and the range a run may actually use. The upper bounds are not
@@ -149,6 +154,12 @@ def known_versions(component: str) -> frozenset:
         try:
             from relay.project_memory import MEMORY_VERSIONS
             return frozenset(MEMORY_VERSIONS)
+        except Exception:
+            return frozenset()
+    if component == "quality_cards":
+        try:
+            from relay.quality_cards import QUALITY_CARDS_VERSIONS
+            return frozenset(QUALITY_CARDS_VERSIONS)
         except Exception:
             return frozenset()
     return frozenset()

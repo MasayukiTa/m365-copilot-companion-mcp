@@ -11,9 +11,9 @@
     "bench/swe_grade_swebench.py": "3391a0410b5d7e12f9f97c48ca8f92732174f06c8ad34a0e05cde91bbe2755f7",
     "docs/SECURITY.md": "814a9ba0fbcb069f916b426689306015ba6bd5dead0cf5dcf61940510f10c6bd",
     "relay/selfimprove/decision.py": "a92fc06ca9f5ea51f5aac47c2aeaf93ed7cf66d2bf8068e2b39df976894c3f5c",
-    "relay/selfimprove/frozen.py": "45000db78c296c9cf56074a822aac25c318bd96b2caa73aeb2cf3cfc70d3d2f2",
+    "relay/selfimprove/frozen.py": "5abdc56a09db7f40bd38e3a5c9c8e61ac06b60837519aa6bea6fccbcc909418f",
     "relay/selfimprove/guards.py": "1967778b8a3d5e1ff58e7921f6c5a45387e7ebe5348be3c8c498585743eaad74",
-    "relay/selfimprove/manifest.py": "a0dc4a46d04428993233c100fb62b97bb9cf9d8f81dbc539cfe494adbfa60d67",
+    "relay/selfimprove/manifest.py": "2d83c7f51f18194f71fe7a5086aa08a893459781c3a01c5d8d2909fc2eb9fcd8",
     "tools/_untrusted.py": "2fe9c6b36a0188775db7de2b55649df3b6d923b97b104701d81e43a1065b59df",
     "tools/folder_policy.py": "d7b4dc0adcd82e8745bba4be1d2f6feea87f3c373d4bb0cac23121e14ebd2717",
     "tools/security.py": "affaf693375ce5d59aebb5c81b5a602f9db17ec4dfd64bd8546ef86f5a0ff147"

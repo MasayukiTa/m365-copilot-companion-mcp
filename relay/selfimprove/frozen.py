@@ -153,9 +153,24 @@ def snapshot_baseline(repo_root: str = REPO, baseline_path: str = DEFAULT_BASELI
     A baseline that already exists is NOT overwritten. Snapshotting is how a tamper is
     laundered: edit the grader, re-snapshot, and `frozen_intact` says INTACT forever after.
     The function is exported from the package and reachable by anything running in-process,
-    which is precisely the loop this guard exists to constrain. Re-blessing is a deliberate
-    human act -- `--snapshot --force` from the CLI -- and never something code does for
-    itself mid-run.
+    which is precisely the loop this guard exists to constrain.
+
+    WHAT `force` REQUIRES, restated 2026-08-20 because the previous wording had stopped being
+    true. It said re-signing was "never something code does for itself mid-run". An external
+    review established that nothing here enforces that: the agent holds a shell, can run this
+    CLI, and the anchor updates with it. The sentence described a discipline and read like a
+    boundary, which is the worse of the two failure modes -- the operator of this system had
+    in fact assumed the re-signing was already automatic, which is what a rule that cannot be
+    enforced eventually teaches everyone.
+
+    So the requirement is stated as what is actually defended: a re-signing must be a
+    SPECIFIED decision by the operator -- specified meaning they knew this particular act was
+    included, not that they approved a batch that happened to contain it -- and both the
+    approval and the act are recorded in the authority ledger, with the operator's
+    instruction quoted verbatim. `--reason` is mandatory for that reason.
+
+    What is NOT claimed: that this stops anything. The ledger records; it does not authorise
+    and cannot prevent. See authority_ledger.py's opening note.
 
     A manifest entry that resolves to no file is refused outright. MISSING was accepted as a
     legitimate baseline value, which made two dead paths (constitution docs untracked months
@@ -170,9 +185,9 @@ def snapshot_baseline(repo_root: str = REPO, baseline_path: str = DEFAULT_BASELI
             % ", ".join(absent))
     if os.path.isfile(baseline_path) and not force:
         raise BaselineRefused(
-            "a baseline already exists at %s; re-snapshotting would bless any change made "
-            "since it was written. Pass force=True (CLI: --snapshot --force) only as a "
-            "deliberate human act." % baseline_path)
+            "a baseline already exists at %s; re-snapshotting would accept any change made "
+            "since it was written. Pass force=True (CLI: --snapshot --force --reason ...) "
+            "only for a change the operator specified." % baseline_path)
     # NO ABSOLUTE PATH IN A COMMITTED FILE. `repo_root` was written verbatim, so every
     # snapshot recorded the checkout's full path -- and this file is tracked and pushed, in
     # this case to a public repository, which put a username and a directory name into the
@@ -222,6 +237,20 @@ def load_baseline(baseline_path: str = DEFAULT_BASELINE) -> dict | None:
             return json.load(f)
     except Exception:
         return None
+
+
+def _note_mismatch(changed, baseline_path) -> None:
+    """One ledger record per distinct mismatch. Never fatal, never noisy."""
+    if not changed:
+        return
+    try:
+        from relay.selfimprove import authority_ledger as _led
+        _led.record_mismatch_once(
+            changed,
+            reason="the frozen set no longer matches %s" % os.path.basename(baseline_path),
+            actor_claimed="relay.selfimprove.frozen.frozen_intact")
+    except Exception:
+        pass
 
 
 def frozen_intact(repo_root: str = REPO,
@@ -286,6 +315,7 @@ def frozen_intact(repo_root: str = REPO,
         except OSError:
             changed.append("BASELINE_UNREADABLE")
 
+    _note_mismatch(changed, baseline_path)
     return (not changed), changed
 
 
@@ -304,6 +334,31 @@ def burned_append_only(old_lines: Iterable[str], new_lines: Iterable[str]) -> bo
     return new[:len(old)] == old
 
 
+def _record_rebless(args, before, after) -> None:
+    """Append the act to the authority ledger and print its tail. Never fatal.
+
+    Printing the tail is the only external anchor available here: the chain catches an edit in
+    the middle of the ledger and not a shortened one, and this line lands in a transcript
+    outside the writing process's reach. It is weak and is not described as more.
+    """
+    try:
+        from relay.selfimprove import authority_ledger as _led
+        old = (before or {}).get("checksums", {})
+        new = (after or {}).get("checksums", {})
+        changed = {rel: {"before": old.get(rel), "after": new.get(rel)}
+                   for rel in sorted(set(old) | set(new)) if old.get(rel) != new.get(rel)}
+        _led.append(_led.REBLESS, reason=args.reason,
+                    actor_claimed="relay.selfimprove.frozen CLI",
+                    authorization=args.authorization or _led.SELF_INITIATED,
+                    command="frozen --snapshot%s" % (" --force" if args.force else ""),
+                    changed=changed)
+        print(_led.describe_tail())
+    except Exception as exc:                      # never take the snapshot down with it
+        print("(the act could not be recorded to the ledger: %s: %s)"
+              % (type(exc).__name__, exc))
+
+
+
 def _main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="relay.selfimprove.frozen",
                                  description="Frozen-constitution checksum guard.")
@@ -313,15 +368,29 @@ def _main(argv: list[str] | None = None) -> int:
     g.add_argument("--snapshot", action="store_true", help="compute + write the baseline")
     g.add_argument("--verify", action="store_true", help="check current frozen set vs baseline")
     ap.add_argument("--force", action="store_true",
-                    help="overwrite an existing baseline (re-bless the constitution)")
+                    help="overwrite an existing baseline (re-sign the constitution)")
+    ap.add_argument("--reason", default="",
+                    help="why this re-signing is correct. Required with --force: the git "
+                         "history of the baseline already records WHAT changed, and what was "
+                         "missing was why and on whose decision")
+    ap.add_argument("--authorization", default="",
+                    help="the operator's instruction, quoted verbatim, that specified this "
+                         "act. A paraphrase is the actor's own reading of its mandate")
     args = ap.parse_args(argv)
 
     if args.snapshot:
+        before = load_baseline(args.baseline) or {}
+        if args.force and not str(args.reason).strip():
+            print("REFUSED: --force needs --reason. Re-signing accepts every change made "
+                  "since the baseline was written, and a record that cannot say why is the "
+                  "gap this requirement exists to close.")
+            return 2
         try:
             data = snapshot_baseline(args.repo, args.baseline, force=args.force)
         except BaselineRefused as exc:
             print("REFUSED: %s" % exc)
             return 2
+        _record_rebless(args, before, data)
         print("snapshot written: %s" % args.baseline)
         for rel, h in sorted(data["checksums"].items()):
             print("  %s  %s" % (h[:16] if h != MISSING else MISSING.ljust(16), rel))

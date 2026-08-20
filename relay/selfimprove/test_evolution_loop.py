@@ -389,7 +389,9 @@ def test_every_evolvable_component_has_something_that_dispatches_on_it():
     A/B の両腕を同一プログラムにする。"""
     from relay import project_memory as PM
 
-    DISPATCHERS = {"memory": PM.MEMORY_VERSIONS}
+    from relay.quality_cards import QUALITY_CARDS_VERSIONS
+    DISPATCHERS = {"memory": PM.MEMORY_VERSIONS,
+                   "quality_cards": QUALITY_CARDS_VERSIONS}
     assert set(M.EVOLVABLE_COMPONENTS) == set(DISPATCHERS), (
         "実装の無いコンポーネントが evolvable になっている: %s"
         % (set(M.EVOLVABLE_COMPONENTS) ^ set(DISPATCHERS)))

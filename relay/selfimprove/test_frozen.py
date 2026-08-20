@@ -343,3 +343,62 @@ def test_a_real_edit_to_the_baseline_is_still_detected(tmp_path):
     a.write_bytes(b'{"checksums": {"x": "1"}}\n')
     b.write_bytes(b'{"checksums": {"x": "2"}}\n')
     assert F._baseline_digest(str(a)) != F._baseline_digest(str(b))
+
+
+# ---- 基準値の取り直しは、特定された判断であること ---------------------------------------------------
+
+def test_force_without_a_reason_is_refused(tmp_path, capsys):
+    bp = str(tmp_path / "b.json")
+    F.snapshot_baseline(F.REPO, bp)
+    assert F._main(["--snapshot", "--force", "--repo", F.REPO, "--baseline", bp]) == 2
+    assert "--reason" in capsys.readouterr().out
+
+
+def test_a_reblessing_is_recorded_with_the_operators_words(tmp_path, monkeypatch, capsys):
+    """台帳は許可しないし止めもしない。残すのは『誰が・なぜ・どの指示で』だけ。
+    原文で残すのは、要約が行為者による自分の権限の解釈になるから。"""
+    from relay.selfimprove import authority_ledger as led
+    ledger_path = str(tmp_path / "ledger.jsonl")
+    monkeypatch.setenv(led.ENV_PATH, ledger_path)
+    bp = str(tmp_path / "b.json")
+    F.snapshot_baseline(F.REPO, bp)
+    words = "OK問題なし。進めてよい。"
+    rc = F._main(["--snapshot", "--force", "--repo", F.REPO, "--baseline", bp,
+                  "--reason", "promoting quality_cards", "--authorization", words])
+    assert rc == 0
+    rows = [r for r in led.read(ledger_path) if r.get("event") == led.REBLESS]
+    assert len(rows) == 1
+    assert rows[0]["authorization"] == words
+    assert rows[0]["reason"] == "promoting quality_cards"
+    assert "ledger: seq=" in capsys.readouterr().out, "台帳の末尾が出力されていない"
+
+
+def test_the_docstring_no_longer_claims_something_nothing_enforces():
+    """以前は『コードが自分でやることでは決してない』と書いてあったが、それを
+    強制するものは無かった。強制できない規則を残すと、読む人はいずれ
+    規則全体を飾りとして扱う -- 実際 operator はこの操作が自動だと認識していた。"""
+    doc = F.snapshot_baseline.__doc__ or ""
+    assert "SPECIFIED decision" in doc
+    assert "not claimed" in doc.lower()
+    # 旧文は残っているが、それは**引用**としてであり主張としてではない。
+    # 単に「文字列が無いこと」を見ると、引退させた規則を歴史として書き残す
+    # 正しいやり方まで落としてしまう。
+    retired = "never something code does"
+    if retired in doc:
+        before = doc[max(0, doc.index(retired) - 200):doc.index(retired)]
+        assert "It said" in before or "previous wording" in before, (
+            "旧い主張が、引退したものとしてではなく現役の規則として残っている")
+
+
+def test_a_mismatch_is_recorded_once_not_once_per_check(tmp_path, monkeypatch):
+    """照合は毎回走る。未解決の不一致を毎回積むと、記録すべき『行為』が埋もれる。"""
+    from relay.selfimprove import authority_ledger as led
+    ledger_path = str(tmp_path / "ledger.jsonl")
+    monkeypatch.setenv(led.ENV_PATH, ledger_path)
+    for _ in range(3):
+        led.record_mismatch_once(["a.py"], reason="drift", actor_claimed="t")
+    rows = [r for r in led.read(ledger_path) if r.get("event") == led.BASELINE_MISMATCH]
+    assert len(rows) == 1
+    led.record_mismatch_once(["a.py", "b.py"], reason="more drift", actor_claimed="t")
+    rows = [r for r in led.read(ledger_path) if r.get("event") == led.BASELINE_MISMATCH]
+    assert len(rows) == 2, "差分が変わったら新しい記録が要る"

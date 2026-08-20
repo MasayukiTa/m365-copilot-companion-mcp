@@ -208,6 +208,35 @@ def _write(path: str, record: dict) -> None:
         os.fsync(fh.fileno())
 
 
+def record_mismatch_once(changed, *, reason, actor_claimed, path=None) -> bool:
+    """Record a frozen-set mismatch, unless the same one is already the latest mismatch.
+
+    DEDUPED BECAUSE THE CHECK RUNS CONSTANTLY. Every run verifies the frozen set, so an
+    unresolved mismatch would append a record per attempt and bury the acts this ledger exists
+    to make findable -- and a ledger nobody reads because it is mostly noise protects nothing.
+
+    The mismatch is recorded at all because a rebless record's `reason` is usually "the
+    baseline no longer matched", and without an independent record of the mismatch that reason
+    is the actor's own unverifiable account of why it was allowed to act.
+
+    Returns True when a record was written.
+    """
+    key = sorted(changed or [])
+    for row in reversed(read(path)):
+        if row.get("event") == BASELINE_MISMATCH:
+            if sorted((row.get("changed") or {}).keys()) == key:
+                return False
+            break
+        if row.get("event") == REBLESS:
+            break                      # a rebless closes the previous mismatch episode
+    try:
+        append(BASELINE_MISMATCH, reason=reason, actor_claimed=actor_claimed,
+               changed={rel: {"before": None, "after": None} for rel in key}, path=path)
+        return True
+    except Exception:
+        return False
+
+
 def verify(path=None) -> tuple:
     """(ok, problems). Checks the chain links and the sequence, nothing more.
 
