@@ -320,3 +320,119 @@ def test_the_socket_is_closed_even_when_the_turn_fails():
     with pytest.raises(CH.ChatHubError):
         CH.Conversation(lambda: _token()).ask("x", connect=connect)
     assert closed == [1]
+
+
+# ---- 実測から起こしたテスト (2026-08-20) --------------------------------------------------
+#
+# ここから下は全て「動かして分かったこと」を固定するもの。推測で書いた形は4回外し、
+# 実クライアントを捕獲して差分を取った瞬間に全部解けた。同じ間違いを繰り返さないための錠。
+
+def _urls_recording_connect(*scripts):
+    """接続ごとに URL を控える connect。鍵が接続に属することを検証するために必要。"""
+    socks = [_FakeSock(s) for s in scripts]
+    made, urls = [], []
+
+    def _connect(url, _headers, _timeout):
+        urls.append(url)
+        made.append(socks[len(made)])
+        return made[-1]
+
+    _connect.made, _connect.urls = made, urls
+    return _connect
+
+
+def _q(url):
+    from urllib.parse import urlsplit, parse_qsl
+    return dict(parse_qsl(urlsplit(url).query))
+
+
+def test_one_key_names_the_connection_and_a_new_connection_gets_a_new_one():
+    """実測: クライアントは1メッセージごとに socket を開き直し、そのたびに
+    chatsessionid / clientrequestid / XRoutingParameterSessionKey に同一の新しい値を入れる。
+    こちらは鍵を会話単位で使い回しており、2ターン目以降が全て InvalidRequest だった。"""
+    connect = _urls_recording_connect(["{}" + CH.RS, _update("a"), _done()],
+                                      ["{}" + CH.RS, _update("b"), _done()])
+    conv = CH.Conversation(lambda: _token())
+    conv.ask("one", connect=connect)
+    conv.ask("two", connect=connect)
+
+    first, second = _q(connect.urls[0]), _q(connect.urls[1])
+    for q in (first, second):
+        assert q["chatsessionid"] == q["clientrequestid"] == q["XRoutingParameterSessionKey"]
+    assert first["chatsessionid"] != second["chatsessionid"]
+    # 会話 id は据え置き。継続性は接続ではなく会話 id が担う。
+    assert first["ConversationId"] == second["ConversationId"]
+
+
+def test_a_snapshot_is_not_added_to_the_deltas_that_built_it():
+    """実測: 同じ答えが delta・type1 の messages・type2 の item と3経路で届き、
+    素朴に連結すると 166 が "166166166" になった。"""
+    snapshot = json.dumps({"type": 2, "item": {"messages": [
+        {"author": "bot", "messageType": "Chat", "text": "166"}]}}) + CH.RS
+    connect = _urls_recording_connect(["{}" + CH.RS, _update("1"), _update("66"),
+                                       snapshot, _done()])
+    assert CH.Conversation(lambda: _token()).ask("x", connect=connect) == "166"
+
+
+def test_deltas_are_used_when_no_snapshot_arrives():
+    connect = _urls_recording_connect(["{}" + CH.RS, _update("16"), _update("6"), _done()])
+    assert CH.Conversation(lambda: _token()).ask("x", connect=connect) == "166"
+
+
+def test_a_declined_request_carries_the_backend_s_own_reason():
+    """実測: 拒否は無言ではなく item.result.value に理由が入る。読まなかったので
+    『空文字を返す寡黙なモデル』に見え、fallback しても記録に残る理由が無かった。"""
+    declined = json.dumps({"type": 2, "item": {"result": {"value": "InvalidRequest"}}}) + CH.RS
+    connect = _urls_recording_connect(["{}" + CH.RS, declined, _done()])
+    with pytest.raises(CH.ChatHubError) as exc:
+        CH.Conversation(lambda: _token()).ask("x", connect=connect)
+    assert "InvalidRequest" in str(exc.value)
+
+
+def test_a_template_supplies_the_shape_and_the_turn_supplies_only_its_ids():
+    """捕獲した形はそのまま、ターン固有の値だけが上書きされる。
+    conversationId はフレームに入れない -- クライアントは URL にしか入れていない。"""
+    captured = {
+        "variants_marker": "kept",
+        "optionsSets": ["a", "b"],
+        "conversationId": "someone-elses",
+        "threadLevelGptId": {"id": "T_agent.x", "source": "MOS3"},
+        "isStartOfSession": False,
+        "clientInfo": {"clientSessionId": "old"},
+        "message": {"text": "old", "requestId": "old", "entityAnnotationTypes": ["People"]},
+    }
+    tpl = CH.RequestTemplate({"agent": "Agent", "gptId": "T_agent.x@MOS3"}, captured)
+    args = json.loads(CH.chat_frames("新しい質問", session_id="S", conversation_id="C",
+                                     request_id="R", started=True,
+                                     template=tpl).split(CH.RS)[0])["arguments"][0]
+
+    assert args["variants_marker"] == "kept" and args["optionsSets"] == ["a", "b"]
+    assert "conversationId" not in args
+    assert args["clientInfo"]["clientSessionId"] == "S"
+    assert args["message"]["text"] == "新しい質問" and args["message"]["requestId"] == "R"
+    assert args["message"]["entityAnnotationTypes"] == ["People"]   # 捕獲物は削らない
+    assert args["traceId"] == args["clientCorrelationId"] == "R"
+
+
+def test_a_template_never_carries_a_token():
+    """テンプレートは持ち回され、ログにも載る。資格情報が同居してはならない。"""
+    tpl = CH.RequestTemplate({"access_token": "SECRET", "agent": "Agent"}, {})
+    assert "access_token" not in tpl.query
+    assert "SECRET" not in json.dumps(tpl.query)
+
+
+def test_the_template_s_query_reaches_the_url_and_the_composed_default_does_not():
+    tpl = CH.RequestTemplate({"agent": "Agent", "scenario": "officeweb",
+                              "gptId": "T_agent.x@MOS3"}, {})
+    url = CH.build_ws_url(_token(), session_id="s", conversation_id="c", request_id="r",
+                          template=tpl)
+    q = _q(url)
+    assert q["agent"] == "Agent" and q["scenario"] == "officeweb"
+    assert q["gptId"] == "T_agent.x@MOS3"
+
+
+def test_a_conversation_takes_its_agent_from_its_template():
+    """エージェントを指定し忘れた socket は既定 Copilot に届く -- ツールもテナント接地も無い
+    別物が答える。テンプレートがエージェントを知っているなら、それを既定にする。"""
+    tpl = CH.RequestTemplate({}, {"threadLevelGptId": {"id": "T_agent.x", "source": "MOS3"}})
+    assert CH.Conversation(lambda: _token(), template=tpl).gpt_id == "T_agent.x"
