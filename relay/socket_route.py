@@ -16,8 +16,23 @@ THREE GUARDS, EACH FOR A DIFFERENT FAILURE
     and replacing it with a tab held open for the token would have been the same mistake with
     a better excuse. Measured token life is 60-79 minutes; a capture takes about 30 seconds.
 
-The route is OFF unless MCP_FLEET_SOCKET says otherwise. It has not yet run a long fleet job,
-and a default is a claim about something that has been observed.
+MEASURED AGAINST THE TAB PATH, 2026-08-21. The same four goals through the same fleet at
+concurrency 2, changing only the route:
+
+    peak Edge over the arm's start   sockets  +205 MB    tabs  +1653 MB
+    tabs held at once                sockets     0       tabs      2
+    wall clock                       sockets    77 s     tabs    104 s
+    goals reaching DONE              sockets   4/4       tabs    4/4
+    fallbacks                        sockets     0
+
+The +205 MB is not the conversations -- a conversation was measured at 1.9 MB. It is the
+capture tab, opened once per token lifetime and closed again, and it is counted here because
+pretending a route's own overhead belongs to something else is how a measurement flatters.
+
+STILL OFF BY DEFAULT. Four goals is not a long fleet job, and the failure this route's guards
+exist for -- a consent card only a tab can click, an attachment, an endpoint withdrawn without
+notice -- did not occur once in that run, so the run says nothing about them. Turning it on is
+a decision to be made from a longer run's fallback rate, not from a good afternoon.
 """
 from __future__ import annotations
 
