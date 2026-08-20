@@ -218,7 +218,8 @@ def test_a_failed_socket_turn_reopens_as_a_tab_and_resends_the_same_job(monkeypa
     monkeypatch.setattr(rf, "_socket_route",
                         lambda: type("R", (), {
                             "driver_for": lambda self, n: None,
-                            "note_failure": lambda self, why: noted.append(why)})())
+                            "note_failure": lambda self, why: noted.append(why),
+                            "record": lambda self, event, **f: None})())
     tab = _FakeDrv()
     monkeypatch.setattr(rf, "_open_fresh", lambda *a: object())
     monkeypatch.setattr(rf, "CopilotWebDriver", lambda page: tab)
@@ -359,3 +360,131 @@ def test_a_failed_turn_is_not_reported_as_a_success(monkeypatch):
     monkeypatch.setattr(w, "_fall_back_to_tab", lambda: True)
     w.poll()
     assert r.turns == 0
+
+
+# ---- 分類機の学習データ（B0） -----------------------------------------------------------------
+#
+# 分類機は「どの依頼がタブを要るか」を当てるもの。その正解ラベルは、実際に fallback した
+# 記録以外から作れない。print は実行が終われば消えるので、消えない場所に残す。
+
+def _route_logging(tmp_path, **kw):
+    kw.setdefault("enabled", True)
+    kw.setdefault("connect_fn", object())
+    kw.setdefault("log_path", str(tmp_path / "socket_route.jsonl"))
+    return SocketRoute(**kw)
+
+
+def _lines(tmp_path):
+    import json
+    p = tmp_path / "socket_route.jsonl"
+    if not p.exists():
+        return []
+    return [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+def test_a_record_survives_the_process_that_wrote_it(tmp_path):
+    r = _route_logging(tmp_path)
+    r.record("fallback", worker="w0", goal="請求書を集計して", reason="InvalidRequest")
+    rows = _lines(tmp_path)
+    assert len(rows) == 1
+    assert rows[0]["event"] == "fallback"
+    assert rows[0]["goal"] == "請求書を集計して"
+    assert rows[0]["reason"] == "InvalidRequest"
+    assert rows[0]["ts"] > 0 and rows[0]["at"]
+
+
+def test_records_append_rather_than_replace(tmp_path):
+    r = _route_logging(tmp_path)
+    r.record("fallback", worker="w0")
+    r.record("worker_done", worker="w1")
+    assert [x["event"] for x in _lines(tmp_path)] == ["fallback", "worker_done"]
+
+
+def test_a_disabled_route_writes_nothing_at_all(tmp_path):
+    """フラグ off の艦隊は、今まで書いていなかったファイルを書き始めてはならない。"""
+    r = _route_logging(tmp_path, enabled=False)
+    r.record("fallback", worker="w0")
+    assert not (tmp_path / "socket_route.jsonl").exists()
+
+
+def test_a_record_that_cannot_be_written_costs_nothing(tmp_path):
+    """記録はターンより優先されない。この経路の仕事はタブより安いことであって、
+    ログ基盤であることではない。"""
+    r = _route_logging(tmp_path, log_path=str(tmp_path / "no" / "such" / "\0" / "x.jsonl"))
+    r.record("fallback", worker="w0")          # 例外を出さないこと自体が要件
+
+
+def test_closing_the_route_is_itself_recorded(tmp_path):
+    r = _route_logging(tmp_path)
+    r.close_route("microsoft closed it")
+    rows = [x for x in _lines(tmp_path) if x["event"] == "route_closed"]
+    assert rows and rows[0]["reason"] == "microsoft closed it"
+
+
+def test_the_default_record_goes_somewhere_git_does_not_publish():
+    """記録には目標文が入る。目標文は利用者の仕事であって、公開するものではない。"""
+    import subprocess
+    from relay import socket_route as SR
+    assert ".fleet" in SR.DEFAULT_LOG.replace("\\", "/")
+    r = subprocess.run(["git", "check-ignore", "-q", SR.DEFAULT_LOG],
+                       capture_output=True)
+    assert r.returncode == 0, "DEFAULT_LOG is not gitignored"
+
+
+def test_a_fallback_records_the_goal_beside_the_reason(monkeypatch, tmp_path):
+    """分類機が要るのは『どの依頼が』『なぜ』タブを必要としたかの対。
+    片方だけでは学習データにならない。"""
+    r = _route_logging(tmp_path)
+    monkeypatch.setattr(rf, "_socket_route", lambda: r)
+    monkeypatch.setattr(rf, "_open_fresh", lambda *a: object())
+    monkeypatch.setattr(rf, "CopilotWebDriver", lambda page: _FakeDrv())
+
+    w = rf.RelayWorker("コネクタの承認が要る作業をして", "w0")
+    w._context, w._agent_url = object(), "u"
+    w.socket, w.drv = True, _FakeDrv()
+    w.drv.failed = "the turn completed but carried no text (a card the tab can show?)"
+    assert w._fall_back_to_tab() is True
+
+    row = next(x for x in _lines(tmp_path) if x["event"] == "fallback")
+    assert row["goal"] == "コネクタの承認が要る作業をして"
+    assert "carried no text" in row["reason"]
+    assert w._socket_fell_back is True
+
+
+def test_a_goal_that_never_needed_a_tab_is_recorded_too(monkeypatch, tmp_path):
+    """失敗だけを記録すると、分類機は『全部失敗する』を学ぶ。"""
+    r = _route_logging(tmp_path)
+    monkeypatch.setattr(rf, "_socket_route", lambda: r)
+    w = rf.RelayWorker("ツールの総数を数えて", "w1")
+    w.socket, w.drv = True, _FakeDrv(answers=2)
+    w.turn, w.outcome, w.status = 2, "DONE", "done"
+    w.close()
+
+    row = next(x for x in _lines(tmp_path) if x["event"] == "worker_done")
+    assert row["route"] == "socket" and row["fell_back"] is False
+    assert row["outcome"] == "DONE" and row["goal"] == "ツールの総数を数えて"
+
+
+def test_a_worker_that_fell_back_is_labelled_as_having_needed_a_tab(monkeypatch, tmp_path):
+    """`socket` は fallback 後に False になるので、それだけでは
+    『この目標はどちらの経路を必要としたか』に答えられない。"""
+    r = _route_logging(tmp_path)
+    monkeypatch.setattr(rf, "_socket_route", lambda: r)
+    w = rf.RelayWorker("承認カードが出る作業", "w2")
+    w.socket, w._socket_fell_back = False, True
+    w.drv, w.outcome, w.status = _FakeDrv(), "DONE", "done"
+    w.close()
+
+    row = next(x for x in _lines(tmp_path) if x["event"] == "worker_done")
+    assert row["route"] == "tab" and row["fell_back"] is True
+
+
+def test_a_long_goal_is_truncated_by_the_caller_not_by_the_record(monkeypatch, tmp_path):
+    """1件が会話まるごとになると、記録はすぐ読めない大きさになる。
+    切るのは呼び出し側 -- record() は渡されたものをそのまま書く道具に留める。"""
+    r = _route_logging(tmp_path)
+    monkeypatch.setattr(rf, "_socket_route", lambda: r)
+    w = rf.RelayWorker("あ" * 5000, "w9")
+    w.socket, w.drv, w.outcome, w.status = True, _FakeDrv(), "DONE", "done"
+    w.close()
+    assert len(next(x for x in _lines(tmp_path) if x["event"] == "worker_done")["goal"]) == 600

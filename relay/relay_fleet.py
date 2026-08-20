@@ -1016,6 +1016,10 @@ class RelayWorker:
         #: it nothing reports SUCCESS, the breaker's consecutive counter never resets, and a
         #: long healthy run closes the route on three failures scattered across hours.
         self._socket_turns_seen = 0
+        #: Whether this worker STARTED on a socket and had to open a tab. Distinct from
+        #: `socket`, which is False afterwards and so cannot answer "which route did this
+        #: goal actually need" -- the one question the classifier will be built to predict.
+        self._socket_fell_back = False
         self.goal_record = freeze_goal_dict(goal) if isinstance(goal, dict) else {"text": str(goal)}
         text, checks, cwd = goal_fields(goal)
         self.goal = text
@@ -1326,6 +1330,18 @@ class RelayWorker:
         if self.closed:
             return
         self.closed = True
+        try:
+            # THE POSITIVE EXAMPLES TOO. A record of only the failures teaches a classifier
+            # that everything fails; the goals that went the whole way over a socket are half
+            # the training set and they are only knowable here, at the end.
+            _socket_route().record(
+                "worker_done", worker=self.name, goal=(self.goal or "")[:600],
+                route=("socket" if getattr(self, "socket", False) else "tab"),
+                fell_back=bool(getattr(self, "_socket_fell_back", False)),
+                turns=self.turn, outcome=self.outcome, status=self.status,
+                reason=(self.reason or "")[:200])
+        except Exception:
+            pass
         try:
             if getattr(self, "socket", False) and self.drv is not None:
                 self.drv.close()          # a socket is cheap, but it is not free
@@ -2832,7 +2848,15 @@ class RelayWorker:
         is an ordinary open failure and is treated as one.
         """
         reason = getattr(self.drv, "failed", "") or "unknown"
-        _socket_route().note_failure("%s: %s" % (self.name, reason))
+        route = _socket_route()
+        route.note_failure("%s: %s" % (self.name, reason))
+        self._socket_fell_back = True
+        # RECORDED IMMEDIATELY, not at the end: a run that dies mid-goal still leaves the
+        # evidence behind, and this line is the only place the pairing of a goal with the
+        # reason it needed a tab exists at all.
+        route.record("fallback", worker=self.name, goal=(self.goal or "")[:600],
+                     turn=self.turn, socket_turns=getattr(self, "_socket_turns_seen", 0),
+                     reason=reason[:300])
         try:
             self.drv.close()
         except Exception:

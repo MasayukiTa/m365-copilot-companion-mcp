@@ -36,11 +36,17 @@ a decision to be made from a longer run's fallback rate, not from a good afterno
 """
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
 
 from relay.chathub import ChatHubError, Conversation, expires_in
+
+#: Where routing decisions are recorded. Under .fleet/, which is gitignored -- these lines
+#: carry GOAL TEXT, and goal text is the user's work, not something to publish.
+DEFAULT_LOG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           ".fleet", "socket_route.jsonl")
 
 #: Off by default. See the module note -- this is measured on spikes, not on a day of work yet.
 ENABLED = os.environ.get("MCP_FLEET_SOCKET", "").strip().lower() in ("1", "true", "yes", "on")
@@ -62,12 +68,18 @@ class SocketRoute:
 
     def __init__(self, *, capture_fn=None, connect_fn=None, enabled=None,
                  max_consecutive=MAX_CONSECUTIVE, max_fallbacks=MAX_FALLBACKS,
-                 refresh_margin_s=REFRESH_MARGIN_S, now=time.time, log=None):
+                 refresh_margin_s=REFRESH_MARGIN_S, now=time.time, log=None,
+                 log_path=DEFAULT_LOG):
         self.enabled = ENABLED if enabled is None else bool(enabled)
         self._capture_fn = capture_fn
         self._connect_fn = connect_fn
         self._now = now
         self._log = log or (lambda msg: None)
+        #: The durable record. A printed reason is gone the moment the run ends, and the
+        #: classifier that is supposed to predict which requests need a tab has to be built
+        #: from what actually fell back -- so those lines outlive the process or they never
+        #: become training data at all.
+        self.log_path = log_path
         self.max_consecutive = int(max_consecutive)
         self.max_fallbacks = int(max_fallbacks)
         self.refresh_margin_s = float(refresh_margin_s)
@@ -82,6 +94,34 @@ class SocketRoute:
         self.fallbacks = 0
         self.turns = 0
 
+    # ---- the durable record ------------------------------------------------------------------
+
+    def record(self, event: str, **fields) -> None:
+        """Append one line about a routing decision. Best effort; never raises, never blocks.
+
+        WRITTEN ONLY WHEN THE ROUTE IS ENABLED. With the flag off there is no routing decision
+        to record, and a fleet running the way it always has should not start writing a file
+        it never wrote before.
+        """
+        if not self.enabled or not self.log_path:
+            return
+        try:
+            now = float(self._now())
+            rec = {"ts": now,
+                   "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)),
+                   "event": str(event)}
+            rec.update(fields)
+            d = os.path.dirname(self.log_path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(self.log_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + chr(10))
+                fh.flush()
+        except Exception:
+            # A record that cannot be written must not cost a turn. The route's job is to be
+            # cheaper than a tab, not to be a logging subsystem.
+            pass
+
     # ---- state ------------------------------------------------------------------------------
 
     def open(self) -> bool:
@@ -94,6 +134,8 @@ class SocketRoute:
             return
         self.closed_reason = reason
         self._log("[socket_route] closed: %s -- workers now open tabs" % reason)
+        self.record("route_closed", reason=reason, turns=self.turns,
+                    fallbacks=self.fallbacks)
 
     def note_failure(self, reason: str) -> None:
         """A worker fell back. Counts twice: against the blip guard and the flap guard."""
