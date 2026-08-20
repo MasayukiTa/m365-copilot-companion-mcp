@@ -1,0 +1,217 @@
+"""Whether the fleet may talk over sockets right now, and what it does when it may not.
+
+THE ROUTE IS A SPEED-UP, NEVER A CAPABILITY. The endpoint is undocumented and Microsoft can
+close it without notice. So everything here is arranged so that losing it costs memory and
+latency and nothing else: a worker that cannot use a socket opens a tab and runs the same goal
+the same way. There is no path in this file that can fail a job.
+
+THREE GUARDS, EACH FOR A DIFFERENT FAILURE
+
+  * a circuit breaker on CONSECUTIVE failures, so one bad minute closes the route quickly
+    rather than making every worker discover it separately;
+  * a ONE-WAY total counter, so a route that half-works cannot flap -- keep falling back and
+    it stops being offered at all, permanently for this run;
+  * a token that is refreshed by OPENING A TAB, CAPTURING, AND CLOSING IT. The tab is not kept.
+    That is the whole point of this work: a tab held open "just in case" was costing 1.3 GB,
+    and replacing it with a tab held open for the token would have been the same mistake with
+    a better excuse. Measured token life is 60-79 minutes; a capture takes about 30 seconds.
+
+The route is OFF unless MCP_FLEET_SOCKET says otherwise. It has not yet run a long fleet job,
+and a default is a claim about something that has been observed.
+"""
+from __future__ import annotations
+
+import os
+import threading
+import time
+
+from relay.chathub import ChatHubError, Conversation, expires_in
+
+#: Off by default. See the module note -- this is measured on spikes, not on a day of work yet.
+ENABLED = os.environ.get("MCP_FLEET_SOCKET", "").strip().lower() in ("1", "true", "yes", "on")
+
+#: Refresh the token this long before it expires. Generous next to a 60-79 minute life: the
+#: cost of being early is one cheap capture, the cost of being late is a worker falling back.
+REFRESH_MARGIN_S = float(os.environ.get("MCP_FLEET_SOCKET_MARGIN_S", "600"))
+
+#: Consecutive failures that close the route. Three is "this is not a blip".
+MAX_CONSECUTIVE = int(os.environ.get("MCP_FLEET_SOCKET_MAX_CONSECUTIVE", "3"))
+
+#: Total fallbacks tolerated across the whole run, never reset. A route that works one turn in
+#: two is worse than no route: it pays the failure AND the tab open, every time.
+MAX_FALLBACKS = int(os.environ.get("MCP_FLEET_SOCKET_MAX_FALLBACKS", "10"))
+
+
+class SocketRoute:
+    """Fleet-wide state for the socket path: is it open, and what does it hand a worker."""
+
+    def __init__(self, *, capture_fn=None, connect_fn=None, enabled=None,
+                 max_consecutive=MAX_CONSECUTIVE, max_fallbacks=MAX_FALLBACKS,
+                 refresh_margin_s=REFRESH_MARGIN_S, now=time.time, log=None):
+        self.enabled = ENABLED if enabled is None else bool(enabled)
+        self._capture_fn = capture_fn
+        self._connect_fn = connect_fn
+        self._now = now
+        self._log = log or (lambda msg: None)
+        self.max_consecutive = int(max_consecutive)
+        self.max_fallbacks = int(max_fallbacks)
+        self.refresh_margin_s = float(refresh_margin_s)
+
+        self._lock = threading.Lock()
+        self._token = ""
+        self._template = None
+        #: Why the route is closed, or "". One-way: nothing in this file clears it.
+        self.closed_reason = ""
+        self.consecutive = 0
+        #: Never decremented. The flap guard.
+        self.fallbacks = 0
+        self.turns = 0
+
+    # ---- state ------------------------------------------------------------------------------
+
+    def open(self) -> bool:
+        """Whether a worker may be offered a socket. Cheap; called per admission."""
+        return bool(self.enabled and not self.closed_reason)
+
+    def close_route(self, reason: str) -> None:
+        """Stop offering sockets for the rest of this run. There is no reopen, by design."""
+        if self.closed_reason:
+            return
+        self.closed_reason = reason
+        self._log("[socket_route] closed: %s -- workers now open tabs" % reason)
+
+    def note_failure(self, reason: str) -> None:
+        """A worker fell back. Counts twice: against the blip guard and the flap guard."""
+        with self._lock:
+            self.consecutive += 1
+            self.fallbacks += 1
+            consecutive, fallbacks = self.consecutive, self.fallbacks
+        self._log("[socket_route] fallback %d (consecutive %d): %s"
+                  % (fallbacks, consecutive, reason))
+        if consecutive >= self.max_consecutive:
+            self.close_route("%d consecutive failures, last: %s" % (consecutive, reason))
+        elif fallbacks >= self.max_fallbacks:
+            self.close_route("%d fallbacks this run: the route is not reliable enough to be "
+                             "worth the failed turn plus the tab open" % fallbacks)
+
+    def note_success(self) -> None:
+        with self._lock:
+            self.consecutive = 0
+            self.turns += 1
+
+    def status(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "open": self.open(),
+            "closed_reason": self.closed_reason,
+            "turns": self.turns,
+            "fallbacks": self.fallbacks,
+            "consecutive": self.consecutive,
+            "token_seconds_left": int(self.token_life()),
+        }
+
+    # ---- the token and the shape --------------------------------------------------------------
+
+    def token_life(self) -> float:
+        return expires_in(self._token, now=self._now()) if self._token else 0.0
+
+    def needs_refresh(self) -> bool:
+        return self._template is None or self.token_life() <= self.refresh_margin_s
+
+    def refresh(self, context, agent_url) -> bool:
+        """Open a tab, capture the token and the request shape, CLOSE THE TAB.
+
+        Returns False rather than raising: a capture that fails means workers open tabs, which
+        is exactly what they did before this route existed.
+        """
+        if not self.open() or self._capture_fn is None:
+            return False
+        if not self.needs_refresh():
+            return True
+        try:
+            token, template = self._capture_fn(context, agent_url)
+        except Exception as exc:
+            self.note_failure("capture failed: %s: %s" % (type(exc).__name__, str(exc)[:160]))
+            return False
+        with self._lock:
+            self._token, self._template = token, template
+        self._log("[socket_route] captured: %.0f min of token, agent %s"
+                  % (self.token_life() / 60.0, (template.gpt_id or "(none)")[:28]))
+        return True
+
+    def driver_for(self, name: str):
+        """A socket driver for one worker, or None if the worker should open a tab."""
+        if not self.open() or self._connect_fn is None:
+            return None
+        with self._lock:
+            token, template = self._token, self._template
+        if not template or expires_in(token, now=self._now()) <= 0:
+            return None
+        from relay.socket_driver import CopilotSocketDriver
+
+        # A TOKEN SUPPLIER, NOT A TOKEN. The conversation asks whenever it needs one, so a
+        # refresh that happens mid-goal reaches a conversation that is already running.
+        def supply():
+            with self._lock:
+                return self._token
+
+        conv = Conversation(supply, template=template, turn_timeout_s=600.0,
+                            frame_timeout_s=90.0)
+        return CopilotSocketDriver(conv, connect=self._connect_fn)
+
+
+def websocket_connect(url, headers, timeout_s):
+    """The real socket, wrapped to the three methods a Conversation uses.
+
+    Kept out of chathub.py deliberately: that module chooses no socket library, which is what
+    lets its protocol be tested without a network.
+    """
+    import asyncio
+
+    import websockets
+
+    class _WS:
+        def __init__(self):
+            self._loop = asyncio.new_event_loop()
+            self._ws = self._loop.run_until_complete(asyncio.wait_for(
+                websockets.connect(url, additional_headers=headers or None,
+                                   max_size=8 * 1024 * 1024, open_timeout=timeout_s),
+                timeout=timeout_s + 5))
+
+        def send(self, blob):
+            self._loop.run_until_complete(self._ws.send(blob))
+
+        def recv(self, per_frame_timeout_s):
+            try:
+                out = self._loop.run_until_complete(
+                    asyncio.wait_for(self._ws.recv(), timeout=per_frame_timeout_s))
+            except asyncio.TimeoutError:
+                return None
+            return out.decode("utf-8", "replace") if isinstance(out, bytes) else out
+
+        def close(self):
+            try:
+                self._loop.run_until_complete(self._ws.close())
+            finally:
+                self._loop.close()
+
+    try:
+        return _WS()
+    except Exception as exc:
+        raise ChatHubError("could not open the socket: %s: %s"
+                           % (type(exc).__name__, str(exc)[:160]))
+
+
+def capture_via_tab(context, agent_url):
+    """Open a tab on the agent surface, capture, and close it. The tab is NOT kept."""
+    from relay.chathub_capture import capture
+    from relay.relay_fleet import _open_fresh
+
+    page = _open_fresh(context, agent_url)
+    try:
+        return capture(page)
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass

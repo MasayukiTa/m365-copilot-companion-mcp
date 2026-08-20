@@ -659,6 +659,40 @@ FLEET_HEAP_RECYCLE_MB = float(os.environ.get("MCP_FLEET_HEAP_RECYCLE_MB", "500")
 FLEET_HEAP_MIN_TURNS = int(os.environ.get("MCP_FLEET_HEAP_MIN_TURNS", "12"))
 
 
+def _holds_slot(w):
+    """Whether this worker is admitted and consuming the fleet's budget right now.
+
+    THE DISK UNIT, NOT THE TAB UNIT. A socket worker holds no tab and still checks out the
+    repository and runs the eval, so it counts here while contributing nothing to tab_load /
+    tab_weight. Conflating the two lets sockets over-admit against a disk floor that has
+    nothing to do with browsers -- which is silent until the disk is full.
+    """
+    return ((getattr(w, "page", None) is not None or getattr(w, "socket", False))
+            and w.status not in TERMINAL)
+
+
+_SOCKET_ROUTE = None
+_SOCKET_ROUTE_LOCK = threading.Lock()
+
+
+def _socket_route():
+    """The fleet's socket route, built once. Off unless MCP_FLEET_SOCKET says otherwise.
+
+    A worker asks this for a driver; if it gets None it opens a tab, which is what every
+    worker did before this existed. Nothing here can fail a goal -- see relay/socket_route.py.
+    """
+    global _SOCKET_ROUTE
+    if _SOCKET_ROUTE is None:
+        with _SOCKET_ROUTE_LOCK:
+            if _SOCKET_ROUTE is None:
+                from relay.socket_route import (SocketRoute, capture_via_tab,
+                                                websocket_connect)
+                _SOCKET_ROUTE = SocketRoute(capture_fn=capture_via_tab,
+                                            connect_fn=websocket_connect,
+                                            log=lambda m: print(m, flush=True))
+    return _SOCKET_ROUTE
+
+
 def auto_concurrency(n_goals, per_tab_mb=700, headroom_mb=2048, hard_cap=100):
     """How many heavy M365 tabs we can afford open at once, given free RAM right now.
     Keep `headroom_mb` for the user's other work; budget `per_tab_mb` per Copilot tab.
@@ -974,6 +1008,10 @@ class RelayWorker:
                  resilience_profile="off", max_fresh_replays=0):
         self.page = None
         self.drv = None
+        #: True while this worker is talking over a socket instead of holding a tab. It still
+        #: occupies a DISK slot (it runs the same eval) but no RAM slot, which is the whole
+        #: difference and the reason the two accountings are separated below.
+        self.socket = False
         self.goal_record = freeze_goal_dict(goal) if isinstance(goal, dict) else {"text": str(goal)}
         text, checks, cwd = goal_fields(goal)
         self.goal = text
@@ -1245,6 +1283,16 @@ class RelayWorker:
         self._context = context
         open_url = self.resume_conv or agent_url
         self._agent_url = open_url
+        # A SOCKET IF ONE IS ON OFFER, A TAB OTHERWISE. Nothing downstream branches on this:
+        # the socket driver answers to the same names, so the turn loop cannot tell. A worker
+        # RESUMING a named conversation is never offered one -- resume means "reopen that URL",
+        # and a socket has no URL to reopen.
+        if not self.resume_conv:
+            drv = _socket_route().driver_for(self.name)
+            if drv is not None:
+                self.page, self.drv, self.socket = None, drv, True
+                self.status = "ready"
+                return True
         try:
             self.page = _open_fresh(context, open_url)
             self.drv = CopilotWebDriver(self.page)
@@ -1274,6 +1322,11 @@ class RelayWorker:
         if self.closed:
             return
         self.closed = True
+        try:
+            if getattr(self, "socket", False) and self.drv is not None:
+                self.drv.close()          # a socket is cheap, but it is not free
+        except Exception:
+            pass
         try:
             if self.page is not None:
                 if not self.conv_url:
@@ -1768,9 +1821,9 @@ class RelayWorker:
         counts THIS (sum over workers), not just the worker count -- so an auto/ultra task that
         fans out to 3 tabs is treated as ~3 tabs of RAM pressure, automatically, without a human
         hand-capping concurrency. 0 while the worker holds no tab (pending / closed)."""
-        if self.page is None:
-            return 0
-        n = 1
+        # A SOCKET WORKER HOLDS NO MAIN TAB -- but it can still open side-pages, and counting
+        # zero for it would under-report exactly the tabs this accounting exists to bound.
+        n = 1 if self.page is not None else 0
         rs = self._research_session
         if rs is not None and getattr(rs, "page", None) is not None:
             n += 1
@@ -1793,9 +1846,10 @@ class RelayWorker:
         ram_room_for_tab() clears the ~2 GB floor (refuter.py / agent_profiles.py). So relaxing
         this risks at worst a transient STALL (a worker waits in 'refuting'/'researching' for RAM),
         never the balloon crash the peak-reservation was added to prevent."""
+        main = 0 if getattr(self, "socket", False) else 1        # a socket reserves no tab slot; it is not a tab
         if os.environ.get("SWE_SIDEPAGE_RESERVE", "1") == "0":
-            return 1
-        return 1 + (1 if self.max_research > 0 else 0) + (1 if self.refuter else 0)
+            return main
+        return main + (1 if self.max_research > 0 else 0) + (1 if self.refuter else 0)
 
     def _consent_tier0_allow(self):
         """Tier 0 of _auto_consent, factored out so _decide can try it BEFORE the re-nav-first
@@ -2739,10 +2793,53 @@ class RelayWorker:
         self.status = "ready"
         return False
 
+    def _fall_back_to_tab(self):
+        """The socket stopped working for this worker. Open a tab and re-send the same turn.
+
+        THE GOAL IS NOT AFFECTED. The turn that was lost is re-sent verbatim on the tab, and
+        the tab is the path every worker used before this route existed -- so the cost of the
+        socket failing is one turn's latency and the RAM of one tab, which is precisely what
+        the route was saving. Returns False only if the TAB could not be opened either, which
+        is an ordinary open failure and is treated as one.
+        """
+        reason = getattr(self.drv, "failed", "") or "unknown"
+        _socket_route().note_failure("%s: %s" % (self.name, reason))
+        try:
+            self.drv.close()
+        except Exception:
+            pass
+        self.socket, self.drv = False, None
+        try:
+            self.page = _open_fresh(self._context, self._agent_url)
+            self.drv = CopilotWebDriver(self.page)
+        except Exception as e:
+            self.status, self.outcome = "error", "ERROR"
+            self.reason = "socket fell back but the tab would not open: %s: %s" % (
+                type(e).__name__, e)
+            return False
+        try:
+            # The commonest reason a socket turn carries no text is a card only a tab can
+            # show. Now there is a tab, so click it before re-sending into the same wall.
+            self._auto_consent()
+        except Exception:
+            pass
+        # Re-send the same job: 'ready' is the state that sends self.job, which still holds it.
+        self.status = "ready"
+        self._last_text, self._stable_since = None, None
+        self._count_before = 0
+        print("[relay_fleet] %s: socket -> tab (%s)" % (self.name, reason[:120]))
+        return True
+
     def poll(self):
         """Advance one non-blocking step. Returns True when terminal."""
         if self.status in TERMINAL:
             return True
+        # getattr, like the rest of this loop: the settle tests drive poll() on a stand-in
+        # worker that never runs __init__, and a hard attribute read here would make a socket
+        # feature break a test about text stability.
+        if getattr(self, "socket", False) and getattr(self.drv, "failed", ""):
+            if not self._fall_back_to_tab():
+                return True
         if self.status == PENDING:
             return False                 # not attached yet; the fleet attaches it
         if self.status == "awaiting":
@@ -3047,8 +3144,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # Docker eval, so the disk gate reserves per main tab, not per sub-agent side-page.
         # Every worker that still HOLDS a tab counts -- including ones in 'verifying'/'refuting'
         # (a bounded eval / review still occupies its tab + the disk its eval used).
-        return sum(1 for w in workers
-                   if w.page is not None and w.status not in TERMINAL)
+        return sum(1 for w in workers if _holds_slot(w))
 
     def _active_tabs():
         # ACTUAL open browser tabs across the fleet = main tabs + every open sub-agent side-page
@@ -3061,8 +3157,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # reserves against THIS so N lean workers can't be admitted at 1 tab each and then balloon
         # to 3 tabs each at once (the overload that wedged the Edge). _active_tabs reacts AFTER a
         # fan-out; _projected_peak prevents the over-admission that makes the fan-out unaffordable.
-        return sum(w.tab_weight() for w in workers
-                   if w.page is not None and w.status not in TERMINAL)
+        return sum(w.tab_weight() for w in workers if _holds_slot(w))
 
     def _unfinished():
         # reconstruct the full goal (incl. acceptance checks/cwd) so a resume after a
@@ -3193,7 +3288,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 # SKIP-AHEAD: scan the queue for the FIRST job that fits alongside the in-flight
                 # builds, instead of only testing the head -> a light eval (requests 2GB) behind a
                 # heavy queue-head (sklearn 7GB) can still pair rather than waiting for the head.
-                open_ws = [x for x in workers if x.page is not None and x.status not in TERMINAL]
+                open_ws = [x for x in workers if _holds_slot(x)]
                 base = sum(repo_eval_gb(x.cwd) for x in open_ws)
                 pick = -1
                 for i, p in enumerate(pending):
@@ -3211,6 +3306,15 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 w = pending.pop(0)
             if w.status in TERMINAL:   # (shouldn't happen, but be safe)
                 continue
+            # BEFORE ADMITTING, make sure there is a live token to hand out -- a capture opens
+            # a tab, captures and CLOSES it, so nothing is held open between refreshes. When
+            # the route is off or the capture fails this is a no-op and the worker opens a tab.
+            try:
+                route = _socket_route()
+                if route.open() and route.needs_refresh():
+                    route.refresh(context, agent_url)
+            except Exception:
+                pass
             ok = w.attach(context, agent_url)
             if not ok:
                 # attach failed. If the WHOLE Edge/context died mid-open (e.g. the

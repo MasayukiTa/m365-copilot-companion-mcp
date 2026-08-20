@@ -168,3 +168,13 @@ def test_the_send_thread_does_not_outlive_the_answer():
     assert _settle(drv)
     time.sleep(0.05)
     assert threading.active_count() <= before + 1
+
+
+def test_a_completed_turn_with_no_text_falls_back_instead_of_counting():
+    """ツール承認カードは Chat ではない別の messageType で届く。socket は押せない。
+    『成功したが本文が無い』を回答として数えると、押されないカードを待ち続ける。"""
+    drv = SD.CopilotSocketDriver(_FakeConv(answer="   "), connect=object())
+    drv.send("q")
+    assert _settle(drv)
+    assert drv._answers().count() == 0
+    assert "no text" in drv.failed

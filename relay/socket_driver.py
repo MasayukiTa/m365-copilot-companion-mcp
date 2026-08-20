@@ -123,8 +123,17 @@ class CopilotSocketDriver:
             # `failed`, opens a tab and carries on with the same goal.
             self.failed = "%s: %s" % (type(exc).__name__, str(exc)[:200])
             return
+        clean = normalize_answer(answer)
+        if not clean:
+            # A COMPLETED TURN THAT SAYS NOTHING IS NOT AN ANSWER. The backend surfaces tool
+            # authorisation and confirmation as their own message types, which this reader
+            # deliberately does not treat as prose -- so a consent card arrives here as an
+            # empty answer. A tab can show that card and be clicked; a socket cannot. Falling
+            # back is therefore the correct move, not an error to swallow.
+            self.failed = "the turn completed but carried no text (a card the tab can show?)"
+            return
         with self._lock:
-            self._last = normalize_answer(answer)
+            self._last = clean
             self._partial = ""
             self._answers_done += 1
 
