@@ -177,6 +177,26 @@ def _maxtabs_was_chosen() -> bool:
         return False
 
 
+def addressed_goal(workdir: str, prompt: str) -> str:
+    """The episode prompt with the workdir named, exactly as the solving agent gets it.
+
+    EXPORTED SO THE REVIEWER RECEIVES THE SAME TEXT. Episode prompts are workdir-relative
+    ("edit mod_b.py"), and the path reaches the solver only through this prefix. A reviewer
+    handed the bare prompt looks in whatever workspace it happens to have and truthfully
+    reports the file is missing -- measured, verbatim: "the target mod_b.py does not exist
+    in the workspace, and the implementing agent made no change", on a run where the agent
+    had made the change and scored 1.0. That reads as a refutation of the work when it is a
+    refutation of the harness.
+
+    One definition rather than two: copies of a prompt prefix drift, and the drift is
+    invisible -- both sides keep working and only the comparison between them is wrong.
+    """
+    return ("作業フォルダは %s です。"
+            "このフォルダの中だけで作業し、"
+            "指示されていないファイルは変更しないでください。"
+            "\n\n%s" % (workdir, prompt))
+
+
 class FleetAgent:
     """Runs one episode through the real fleet, in a child that carries the manifest.
 
@@ -381,10 +401,7 @@ class FleetAgent:
         # Two channels, because they answer to different code. The text tells the agent; the
         # `cwd` field is what `run_relay_fleet` reads to decide where the run happens, and it
         # only reads it when the goal is a dict.
-        addressed = (
-            "作業フォルダは %s です。このフォルダの中だけで作業し、"
-            "指示されていないファイルは変更しないでください。\n\n%s" % (workdir, prompt)
-        )
+        addressed = addressed_goal(workdir, prompt)
         payload = {"goal": {"text": addressed, "cwd": workdir},
                    "agent_url": self.agent_url, "cdp_url": self.cdp_url,
                    "refuter": self.refuter}

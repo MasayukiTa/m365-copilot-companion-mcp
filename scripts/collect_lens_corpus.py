@@ -52,12 +52,18 @@ sys.path.insert(0, str(ROOT))
 
 from bench.companionbench import episode as EP            # noqa: E402
 from bench.companionbench.calibration import CALIBRATION_KEY as CAL_KEY  # noqa: E402
+from bench.companionbench.fleet_agent import addressed_goal          # noqa: E402
 from relay.selfimprove import reviewer_allocation as A    # noqa: E402
 
 #: How long to let one lens think before recording UNCLEAR. Generous: a lens that timed out
 #: is recorded as having produced no evidence, which is what UNCLEAR means, but a timeout that
 #: is really impatience would fill the corpus with them.
 LENS_TIMEOUT_S = 420.0
+
+#: A fragment every reviewer prompt carries, used only to recognise a side page this
+#: collector left behind after being killed. Matching on the prompt text is what
+#: makes the sweep safe: a real fleet worker tab never has it.
+REVIEWER_PAGE_MARK = "厳格なレビュア"
 
 #: Written explicitly so the file is LF on every platform, and so no escape has to survive
 #: the shell that generated this module.
@@ -185,6 +191,27 @@ def run_lenses(cdp_url, agent_url, goal, reply, lenses, *, timeout_s=LENS_TIMEOU
     #: retry fires only when NO verdict was obtainable, so it cannot move a verdict, only turn
     #: a hole into an observation. Without it a single sporadic failure discards the whole
     #: candidate, and with three lenses per candidate that is most of the corpus.
+    def _sweep_orphan_reviewer_pages(context):
+        """Close reviewer side pages left behind by an interrupted run.
+
+        MEASURED: after two probes were killed mid-flight, the fleet browser held four pages,
+        two of them dead reviewer side pages -- one still titled with the lens prompt it had
+        been sent. The next session's `drv.send` then failed with "composer cleared without a
+        conversation", and the run recorded that as the reviewer being unavailable.
+        RefuterSession closes its own page on every finish, so this only ever fires after a
+        kill; the cost of sweeping is one title read per page.
+        """
+        for page in list(getattr(context, "pages", []) or []):
+            try:
+                title = page.title() or ""
+            except Exception:
+                continue
+            if REVIEWER_PAGE_MARK in title or title.strip() in ("<br>", "&lt;br&gt;"):
+                try:
+                    page.close()
+                except Exception:
+                    pass
+
     out = {}
     with sync_playwright() as pw:
       opened = time.time()
@@ -208,6 +235,7 @@ def run_lenses(cdp_url, agent_url, goal, reply, lenses, *, timeout_s=LENS_TIMEOU
               "the browser at %s has no context. The signed-in profile is what the reviewers "
               "need; an empty one renders no composer and every lens goes silent." % cdp_url)
       context = browser.contexts[0]
+      _sweep_orphan_reviewer_pages(context)
       for lens in lenses:
         for attempt in range(1 + LENS_RETRIES):
             # FREE RAM AT THE MOMENT THIS LENS STARTS. RefuterSession waits for the 2000 MB floor
@@ -358,7 +386,12 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
                     skipped.append({"candidate_id": episode.episode_id, "why": "empty reply"})
                     continue
 
-                detail = run_lenses(cdp_url, agent_url, prompt, reply, lenses)
+                # THE SAME GOAL THE SOLVER SAW, workdir and all. Handing the reviewer the
+                # bare episode prompt sends it looking for files in the wrong place, and it
+                # correctly reports they are missing -- which reads as a refutation of the
+                # work rather than of the harness.
+                detail = run_lenses(cdp_url, agent_url,
+                                    addressed_goal(workdir, prompt), reply, lenses)
                 verdicts = verdicts_only(detail)
                 starved = sorted(set(timed_out_lenses(detail)) | set(harness_faults(detail)))
                 if starved:

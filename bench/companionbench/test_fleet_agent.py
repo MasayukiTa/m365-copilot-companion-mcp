@@ -419,3 +419,29 @@ def test_parent_and_child_compute_the_same_id_for_the_same_file(tmp_path, monkey
     parent = FleetAgent(agent_url="https://example.invalid/chat/")._active_harness_id()
     child = M.harness_id(RC.active_manifest(refresh=True))
     assert parent == child, "親と子が同じファイルに違う id を付けている"
+
+
+def test_the_reviewer_and_the_solver_are_given_the_same_goal():
+    """エピソードのプロンプトは workdir 相対で、パスは前置きでしか届かない。
+    レビュアに素のプロンプトを渡すと、手元のワークスペースを探して
+    「ファイルが無い」と正直に報告する — 実測(2026-08-20)の逐語:
+    「対象の mod_b.py がワークスペースに存在せず、実装エージェントも変更を行っていない」。
+    その走行でエージェントは実際に変更しており、採点は 1.0 だった。
+    作業への反証に見えて、ハーネスへの反証だった。"""
+    from bench.companionbench.fleet_agent import addressed_goal
+    import inspect
+    from scripts import collect_lens_corpus as CL
+    src = inspect.getsource(CL.collect)
+    assert "addressed_goal(workdir, prompt)" in src, (
+        "コレクタがレビュアに素のプロンプトを渡している")
+    g = addressed_goal("C:/w", "mod_b.py を直して")
+    assert "C:/w" in g and "mod_b.py" in g
+
+
+def test_extracting_the_prefix_did_not_change_what_the_solver_sees():
+    """定義を1箇所に出す変更で、ソルバのプロンプトが1バイトでも変われば
+    それは別の実験になる。分割位置は変えたが連結結果は変えていない。"""
+    from bench.companionbench.fleet_agent import addressed_goal
+    g = addressed_goal("C:/w", "P")
+    assert g == ("作業フォルダは C:/w です。このフォルダの中だけで作業し、"
+                 "指示されていないファイルは変更しないでください。\n\nP")
