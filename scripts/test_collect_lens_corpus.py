@@ -190,3 +190,25 @@ def test_the_retry_count_is_recorded():
     """3回目でようやく取れた評決と、一発で取れた評決は、同じではない。"""
     src = Path(CL.__file__).read_text(encoding="utf-8")
     assert '"attempts": attempt + 1' in src
+
+
+def test_the_workdir_outlives_the_lens_run():
+    """実測(2026-08-20)でレビュアが逐語でこう答えた:
+    「invoice.txt と total.txt が実在せず、報告された計算は事実として確認できない」。
+    採点直後に workdir を消し、その12行あとでレンズに検証を頼んでいた。
+    誠実なレビュアの正解は常に INCONCLUSIVE になり、語彙がそれを UNCLEAR に丸め、
+    全政策が同点のコーパスができる。パネルを死体の上で回していた。"""
+    src = Path(CL.__file__).read_text(encoding="utf-8")
+    body = src[src.index("def collect("):src.index("def load_corpus(")]
+    first_lens = body.index("run_lenses(cdp_url")
+    first_rm = body.index("shutil.rmtree(workdir")
+    assert first_lens < first_rm, "レンズより前に workdir を消している"
+
+
+def test_every_exit_from_a_candidate_releases_its_workdir():
+    """本体には continue が複数ある。末尾に片付けを置くと、
+    スキップのたびに workdir が残る。"""
+    src = Path(CL.__file__).read_text(encoding="utf-8")
+    body = src[src.index("def collect("):src.index("def load_corpus(")]
+    i = body.index("shutil.rmtree(workdir")
+    assert "finally:" in body[:i], "finally を通らない片付けになっている"

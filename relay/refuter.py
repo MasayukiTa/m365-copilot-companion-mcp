@@ -53,7 +53,8 @@ REFUTER_NUDGE = (
 _REFUTER_NUDGE_VARIANTS = (
     REFUTER_NUDGE,
     "まだ判定が書かれていません。前置きや再確認は不要です。今すぐ最後の行に "
-    "REFUTED: <理由> か UPHELD のどちらか一言だけを書いてください。",
+    "REFUTED: <理由> / UPHELD / INCONCLUSIVE: <不足証拠> のいずれか一言だけを書いてください。",  # 二択を強制すると、証拠不足のレビュアは従わず散文で答える
+    # -- そしてそれが「マーカー無し」として記録される。
 )
 
 
@@ -127,6 +128,12 @@ LENS_PROMPTS = {
                  "まだ吐く下流エミッタを放置した producer 修正は不完全（重複・矛盾を生む）。\n"
                  + "上のいずれも無く、独立再現ケースが通り、関連する全ての箇所が直っていれば UPHELD。",
 }
+#: Extra settle windows granted to a reply that has not produced a verdict yet, before the
+#: session decides the reviewer is refusing to commit and nudges it. Measured: the real
+#: verdict arrived two seconds after the early accept, so one window is already enough; two
+#: is for a reviewer running several tool calls.
+MARKER_WAITS = 2
+
 PANEL_LENSES = ("correctness", "edge", "security")
 
 
@@ -434,7 +441,13 @@ class RefuterSession:
                 # one the marker asks ("has the text stopped moving").
                 state = getattr(self, "_settle_state", None) or _settle.SettleState()
                 state, outcome = _settle.settle_step(
-                    state, t, now=time.time(), dwell_s=self.dwell_s, generating=False,
+                    state, t, now=time.time(), dwell_s=self.dwell_s,
+                    # THE STOP BUTTON IS NOT A RELIABLE "FINISHED" SIGNAL HERE, measured: it
+                    # disappears BETWEEN tool calls, so a reviewer that is reading files looks
+                    # idle for a second or two with a tool-status line as its whole reply.
+                    # Passing the real value would not have prevented the early accept that
+                    # motivated this change -- the page genuinely was not generating.
+                    generating=False,
                     is_processing=_is_processing(t),
                     has_marker=lambda text: parse_verdict(text)[0] != "UNCLEAR")
                 self._settle_state = state
@@ -445,6 +458,23 @@ class RefuterSession:
                     return None
                 verdict = parse_verdict(t)
                 if verdict[0] == "UNCLEAR" and self._nudges_used < self.max_nudges:
+                    # WAIT BEFORE NUDGING, because the measured failure was committing two
+                    # seconds early and then asking again. `has_marker` doubles the settle
+                    # requirement for a markerless reply, but doubling still ACCEPTS, so a
+                    # reviewer mid-way through its tool calls gets nudged instead of finished.
+                    # A nudge is for a model that will not commit; it is the wrong answer to a
+                    # model that simply has not finished, and it discards the real verdict --
+                    # the completed reply is never read, only the answer to the nudge is.
+                    #
+                    # So: give the page one more settle window and re-read first. Bounded by
+                    # the same clock as everything else, so a genuinely silent reviewer still
+                    # reaches the nudge, and then the timeout.
+                    waited = getattr(self, "_marker_waits", 0)
+                    if waited < MARKER_WAITS:
+                        self._marker_waits = waited + 1
+                        self._settle_state = _settle.SettleState()
+                        self._last, self._stable_since = None, None
+                        return None
                     self._nudge()
                     return None
                 accept = getattr(self.drv, "_accept_new_reply", None)

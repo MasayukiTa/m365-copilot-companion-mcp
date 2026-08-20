@@ -262,6 +262,16 @@ def verdicts_only(detail) -> dict:
     return {lens: d["verdict"] for lens, d in detail.items()}
 
 
+def all_inconclusive(detail) -> bool:
+    """Every lens looked and said it could not judge. That is an OBSERVATION, not a fault.
+
+    It used to be discarded: the verdict vocabulary had no INCONCLUSIVE, so the collector
+    rounded it to UNCLEAR and `all_unclear` threw the row away as an incomplete panel. A panel
+    where all three reviewers answered honestly was the one shape being deleted.
+    """
+    return bool(detail) and all(d["verdict"] == A.INCONCLUSIVE for d in detail.values())
+
+
 def all_unclear(detail) -> bool:
     return all(d["verdict"] == A.UNCLEAR for d in detail.values())
 
@@ -329,68 +339,81 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
         for episode in episodes:
             workdir = tempfile.mkdtemp(prefix="lenscorpus_")
             try:
-                prompt = episode.setup(workdir)
-                reply = agent(prompt, workdir) or ""
-                grade = episode.grade_final_state(workdir, reply=reply)
-            except Exception as exc:
-                skipped.append({"candidate_id": episode.episode_id,
-                                "why": "%s: %s" % (type(exc).__name__, exc)})
-                continue
+                try:
+                    prompt = episode.setup(workdir)
+                    reply = agent(prompt, workdir) or ""
+                    grade = episode.grade_final_state(workdir, reply=reply)
+                except Exception as exc:
+                    skipped.append({"candidate_id": episode.episode_id,
+                                    "why": "%s: %s" % (type(exc).__name__, exc)})
+                    continue
+
+                if getattr(grade, "infra_failure", False):
+                    # AN EPISODE THE ENVIRONMENT COULD NOT RUN IS NOT A CANDIDATE. Recording it
+                    # with a failed grade would hand every policy a bad row nothing could have
+                    # caught, which depresses the whole frontier for a reason unrelated to review.
+                    skipped.append({"candidate_id": episode.episode_id, "why": "infra_failure"})
+                    continue
+                if not reply.strip():
+                    skipped.append({"candidate_id": episode.episode_id, "why": "empty reply"})
+                    continue
+
+                detail = run_lenses(cdp_url, agent_url, prompt, reply, lenses)
+                verdicts = verdicts_only(detail)
+                starved = sorted(set(timed_out_lenses(detail)) | set(harness_faults(detail)))
+                if starved:
+                    # A SILENT LENS IS A HARNESS SYMPTOM BEFORE IT IS DATA, and one silent lens is
+                    # already enough: the row would be scored as if that lens had looked and found
+                    # nothing, which is the one thing the corpus must never assert.
+                    why = "lens(es) could not be asked: %s" % starved
+                    skipped.append({"candidate_id": episode.episode_id, "why": why,
+                                    "detail": detail})
+                    print("  %-28s SKIPPED: %s" % (episode.episode_id, why), flush=True)
+                    consecutive_silent += 1
+                    if consecutive_silent >= MAX_CONSECUTIVE_SILENT:
+                        # STOP, DO NOT GRIND ON. Skipping and continuing is right for one bad
+                        # candidate and wrong for a broken harness: three separate collections
+                        # have now spent their whole budget skipping every candidate and
+                        # finishing with an empty file, which reads like a completed run.
+                        raise LensHarnessFault(
+                            "%d candidates in a row had no lens produce a verdict. That is the "
+                            "harness, not the reviewers -- the last one said: %s"
+                            % (consecutive_silent,
+                               {ln: (d["reason"] or "(silent)")[:90] for ln, d in detail.items()}))
+                    continue
+                consecutive_silent = 0
+                rows.append({
+                    "candidate_id": episode.episode_id,
+                    "bad": truth_from_grade(grade),
+                    "verdicts": verdicts,
+                    "lens_detail": detail,
+                    "features": {"kind": episode.category or "unknown"},
+                    CAL_KEY: False,
+                })
+                with io.open(out_path, "a", encoding="utf-8", newline="\n") as fh:
+                    fh.write(json.dumps(rows[-1], ensure_ascii=False, sort_keys=True) + "\n")
+                print("  %-28s functional=%s security=%s  %s"
+                      % (episode.episode_id, rows[-1]["bad"]["functional"],
+                         rows[-1]["bad"]["security"],
+                         " ".join("%s=%s" % (l, v[:1]) for l, v in verdicts.items())), flush=True)
             finally:
+                # THE WORKDIR SURVIVES UNTIL THE REVIEWERS HAVE SEEN IT. It used to be removed
+                # immediately after grading, twelve lines before the lenses were asked to
+                # verify the work -- so a reviewer doing its job correctly answered, verbatim:
+                # "invoice.txt and total.txt do not exist ... the reported calculation cannot
+                # be confirmed". Every honest verdict was INCONCLUSIVE, the vocabulary rounds
+                # that to UNCLEAR, and a corpus of UNCLEAR scores every policy the same. The
+                # panel was being run on a deleted workdir.
+                #
+                # `finally` rather than a line at the end, because the body has several
+                # `continue`s and each one would otherwise leak a workdir per skipped
+                # candidate.
                 try:
                     episode.cleanup(workdir)
                 except Exception:
                     pass
                 shutil.rmtree(workdir, ignore_errors=True)
 
-            if getattr(grade, "infra_failure", False):
-                # AN EPISODE THE ENVIRONMENT COULD NOT RUN IS NOT A CANDIDATE. Recording it
-                # with a failed grade would hand every policy a bad row nothing could have
-                # caught, which depresses the whole frontier for a reason unrelated to review.
-                skipped.append({"candidate_id": episode.episode_id, "why": "infra_failure"})
-                continue
-            if not reply.strip():
-                skipped.append({"candidate_id": episode.episode_id, "why": "empty reply"})
-                continue
-
-            detail = run_lenses(cdp_url, agent_url, prompt, reply, lenses)
-            verdicts = verdicts_only(detail)
-            starved = sorted(set(timed_out_lenses(detail)) | set(harness_faults(detail)))
-            if starved:
-                # A SILENT LENS IS A HARNESS SYMPTOM BEFORE IT IS DATA, and one silent lens is
-                # already enough: the row would be scored as if that lens had looked and found
-                # nothing, which is the one thing the corpus must never assert.
-                why = "lens(es) could not be asked: %s" % starved
-                skipped.append({"candidate_id": episode.episode_id, "why": why,
-                                "detail": detail})
-                print("  %-28s SKIPPED: %s" % (episode.episode_id, why), flush=True)
-                consecutive_silent += 1
-                if consecutive_silent >= MAX_CONSECUTIVE_SILENT:
-                    # STOP, DO NOT GRIND ON. Skipping and continuing is right for one bad
-                    # candidate and wrong for a broken harness: three separate collections
-                    # have now spent their whole budget skipping every candidate and
-                    # finishing with an empty file, which reads like a completed run.
-                    raise LensHarnessFault(
-                        "%d candidates in a row had no lens produce a verdict. That is the "
-                        "harness, not the reviewers -- the last one said: %s"
-                        % (consecutive_silent,
-                           {ln: (d["reason"] or "(silent)")[:90] for ln, d in detail.items()}))
-                continue
-            consecutive_silent = 0
-            rows.append({
-                "candidate_id": episode.episode_id,
-                "bad": truth_from_grade(grade),
-                "verdicts": verdicts,
-                "lens_detail": detail,
-                "features": {"kind": episode.category or "unknown"},
-                CAL_KEY: False,
-            })
-            with io.open(out_path, "a", encoding="utf-8", newline="\n") as fh:
-                fh.write(json.dumps(rows[-1], ensure_ascii=False, sort_keys=True) + "\n")
-            print("  %-28s functional=%s security=%s  %s"
-                  % (episode.episode_id, rows[-1]["bad"]["functional"],
-                     rows[-1]["bad"]["security"],
-                     " ".join("%s=%s" % (l, v[:1]) for l, v in verdicts.items())), flush=True)
         if calibrate:
             # THE CLASS THE PANEL IS FOR, collected first because it is the one the last run
             # had none of: answers that pass the acceptance check and are wrong anyway. Ground

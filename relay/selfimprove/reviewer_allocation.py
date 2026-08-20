@@ -106,7 +106,15 @@ def _validate_selection(chosen, panel, k, policy):
 #: so the coercion happens at scoring time, where it is visible, rather than in whoever wrote
 #: the corpus.
 REFUTED, UPHELD, UNCLEAR = "REFUTED", "UPHELD", "UNCLEAR"
-VERDICTS = (REFUTED, UPHELD, UNCLEAR)
+
+#: "I looked and could not decide from what I was shown" -- distinct from UNCLEAR, which is
+#: "no verdict came back at all". The fleet is right to treat them alike, because both mean do
+#: not block. A MEASUREMENT must not: rounding one into the other is the same substitution
+#: `security_coverage` refuses, where absence of evidence was being read as evidence of
+#: absence. It also had a concrete cost -- a panel where all three lenses answered honestly
+#: that they lacked evidence was discarded as an "incomplete panel", which is exactly backwards.
+INCONCLUSIVE = "INCONCLUSIVE"
+VERDICTS = (REFUTED, UPHELD, UNCLEAR, INCONCLUSIVE)
 
 #: Ground truth in the grader's OWN shape. A single `bad` boolean collapses three different
 #: claims -- wrong, fragile, unsafe -- into one, and `GradeResult` already refused exactly this
@@ -335,6 +343,11 @@ def simulate(corpus, policy, *, k, lens_cost=None, memory=None, seed_base=0,
         refuted = any(verdicts[lens] == REFUTED
                       or (unclear_refutes and verdicts[lens] == UNCLEAR)
                       for lens in chosen)
+        # INCONCLUSIVE IS NOT A CLEAN PASS. It says the reviewer could not judge from what it
+        # was given, so a policy that ran only inconclusive lenses learned nothing -- counting
+        # that as "reviewed and found sound" credits it with a result nobody produced.
+        inconclusive_only = bool(chosen) and all(
+            verdicts[lens] == INCONCLUSIVE for lens in chosen)
         catchable = bool(distinguishing_lenses(row, rows))
         functional, security = _truth(row)
         calls += len(chosen)
