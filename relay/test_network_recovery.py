@@ -77,4 +77,10 @@ def test_refuter_network_reopen_budget_is_bounded():
     session._schedule_network_reopen("first")
     assert session._done is None
     session._schedule_network_reopen("second")
-    assert session._done == ("UNCLEAR", "")
+    # 判定は UNCLEAR、ただし理由付き。以前はここが ("UNCLEAR", "") で、
+    # 「見て判断がつかなかった」と「一度もページが開けなかった」が同じ値だった。
+    # フリートは verdict しか読まないので実行時は無害だが、レビュアを**測る**側は
+    # 区別が要る -- §18 のコーパス収集が3回空振りし、3回とも別の障害に見えた原因。
+    verdict, reason = session._done
+    assert verdict == "UNCLEAR"
+    assert "reopen budget" in reason, reason

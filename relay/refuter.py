@@ -154,7 +154,7 @@ def aggregate_panel(results, min_refute=None):
     """
     n = len(results)
     if n == 0:
-        return ("UNCLEAR", "")
+        return ("UNCLEAR", "harness: the panel produced no verdicts to aggregate")
     refuted = [(l, r) for (l, k, r) in results if k == "REFUTED"]
     if min_refute is None:
         min_refute = (n // 2) + 1
@@ -162,6 +162,19 @@ def aggregate_panel(results, min_refute=None):
         reason = " / ".join("[%s] %s" % (l, r) for (l, r) in refuted)
         return ("REFUTED", reason)
     return ("UPHELD", "")
+
+
+#: A reason that starts with this prefix means the review could not be CONDUCTED -- no page,
+#: no context, an exception -- as opposed to a reviewer that looked and could not decide. The
+#: fleet ignores the distinction and is right to: UNCLEAR means "do not block" either way.
+#: Anything MEASURING the reviewers must not, because scoring a policy against a lens that was
+#: never asked credits it with a clean result it did not obtain.
+HARNESS_FAULT_PREFIX = "harness: "
+
+
+def unclear_is_harness_fault(reason) -> bool:
+    """True when an UNCLEAR came from the harness rather than from the reviewer."""
+    return str(reason or "").startswith(HARNESS_FAULT_PREFIX)
 
 
 def parse_verdict(text: str):
@@ -173,7 +186,7 @@ def parse_verdict(text: str):
     "do not block" so ambiguous output can never trap the loop forever.
     """
     if not text:
-        return ("UNCLEAR", "")
+        return ("UNCLEAR", "the reviewer's reply was empty")
     # an explicit "REFUTED: <reason>" anywhere wins
     for line in text.splitlines():
         m = re.search(r"REFUTED\s*[:：]\s*(.+)", line, re.IGNORECASE)
@@ -187,8 +200,8 @@ def parse_verdict(text: str):
     if "UPHELD" in up:
         return ("UPHELD", "")
     if "REFUTED" in up:               # marker present but no concrete reason given
-        return ("UNCLEAR", "")
-    return ("UNCLEAR", "")
+        return ("UNCLEAR", "the reply says REFUTED but gives no reason to act on")
+    return ("UNCLEAR", "the reply carries no verdict marker")
 
 
 def agent_base_url(conversation_url: str) -> str:
@@ -210,7 +223,7 @@ def run_refuter(context, conversation_url: str, goal: str, final_response: str,
     from .copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver
     base = agent_base_url(conversation_url)
     if context is None or not base:
-        return ("UNCLEAR", "")
+        return ("UNCLEAR", "harness: no browser context or no agent url")
     page = None
     try:
         page = context.new_page()
@@ -222,11 +235,13 @@ def run_refuter(context, conversation_url: str, goal: str, final_response: str,
                 appeared = True
                 break
         if not appeared:
-            return ("UNCLEAR", "")
+            return ("UNCLEAR",
+                    "harness: the composer never rendered within 40s of loading the page")
         drv = CopilotWebDriver(page)
         drv.send(build_refuter_prompt(goal, final_response, lens=lens))
         ok = drv.wait_for_idle(timeout_s=timeout_s)
-        verdict = parse_verdict(drv.read_last_response()) if ok else ("UNCLEAR", "")
+        verdict = (parse_verdict(drv.read_last_response()) if ok else
+                   ("UNCLEAR", "harness: the reviewer did not settle within %ds" % timeout_s))
         # the reviewer often answers a preamble first ("I'll check the files") -- nudge it
         # to actually emit the verdict, like the implementer needs a CONTINUE.
         nudges = 0
@@ -236,8 +251,8 @@ def run_refuter(context, conversation_url: str, goal: str, final_response: str,
             if not drv.wait_for_idle(timeout_s=timeout_s):
                 break
             verdict = parse_verdict(drv.read_last_response())
-    except Exception:
-        verdict = ("UNCLEAR", "")
+    except Exception as exc:
+        verdict = ("UNCLEAR", "harness: the review raised %s" % type(exc).__name__)
     finally:
         try:
             if page is not None:
