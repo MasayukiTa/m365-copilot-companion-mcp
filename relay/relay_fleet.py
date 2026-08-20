@@ -593,6 +593,18 @@ class _Transcript:
         self._append({"turn": turn, "role": "assistant",
                       "text": _redact_unlock_password(text), "ts": time.time()})
 
+    def metric(self, turn, name, value, **extra):
+        """One measured number for this turn, beside the text it belongs to.
+
+        Kept in the same transcript rather than a separate file so a number can always be
+        read against the turn that produced it -- a memory reading with no idea what was
+        being sent at the time cannot tell a fat turn from a leak.
+        """
+        row = {"turn": turn, "role": "metric", "name": name, "value": value,
+               "ts": time.time()}
+        row.update(extra)
+        self._append(row)
+
     def note_guid(self, guid):
         """Record the conversation guid once it's known (idempotent)."""
         if self._guid_logged or not guid:
@@ -628,6 +640,23 @@ def ram_room_for_tab(floor_mb=2000.0) -> bool:
     the watchdog hard-reset it. Each side-page opens lazily once this returns True, so the live
     tab count tracks free RAM at ALL granularities, not just at worker admission."""
     return avail_phys_mb() >= floor_mb
+
+
+#: Recycle a worker's conversation once its renderer heap passes this, in MB. Measured on this
+#: machine 2026-08-20: a FRESH Copilot tab already holds 137-161 MB of JS heap with 926 DOM
+#: nodes and 2 KB of visible text, so roughly 150 MB is the web app itself and nothing to do
+#: with the conversation. Everything above that is what the turns put there.
+#:
+#: PROVISIONAL. The right threshold comes from MB-per-turn on real work, which is why every
+#: turn now logs the heap. A worker's turns carry OCR text and spreadsheet rows, so they are
+#: far fatter than the bridge probe's fixed round trips, and copying the bridge's 120-turn
+#: number would have been a guess wearing a measurement's clothes.
+FLEET_HEAP_RECYCLE_MB = float(os.environ.get("MCP_FLEET_HEAP_RECYCLE_MB", "500"))
+
+#: Never recycle for memory before this many turns, whatever the heap says. A conversation that
+#: is replaced every few turns re-anchors constantly, and re-anchoring costs a turn -- the cure
+#: would cost more turns than the disease.
+FLEET_HEAP_MIN_TURNS = int(os.environ.get("MCP_FLEET_HEAP_MIN_TURNS", "12"))
 
 
 def auto_concurrency(n_goals, per_tab_mb=700, headroom_mb=2048, hard_cap=100):
@@ -1850,9 +1879,60 @@ class RelayWorker:
         except Exception:
             return False
 
+
+    def _heap_mb(self):
+        """This tab's JS heap in MB, or None where the browser will not say.
+
+        `performance.memory` is Chromium-only and absent under some privacy settings, so this
+        must degrade to None rather than raise -- a memory reading is a nice-to-have and a
+        worker that dies for lack of one is a worse outcome than a tab that grows.
+        """
+        try:
+            v = self.page.evaluate(
+                "() => performance.memory ? performance.memory.usedJSHeapSize : null")
+            return None if v is None else float(v) / 1048576.0
+        except Exception:
+            return None
+
+    def _memory_pressure(self):
+        """Whether this conversation has grown heavy enough to be worth replacing.
+
+        Checked at a TURN BOUNDARY, which is what makes this safe: the fleet's recycle already
+        re-anchors the goal and the agent re-derives progress from the files on disk, so the
+        thing being discarded is chat history the design already treats as expendable. Doing it
+        while the conversation is healthy is gentler than the existing trigger, which fires
+        only once the model has started returning the token-limit error on every turn.
+        """
+        if FLEET_HEAP_RECYCLE_MB <= 0:
+            return False
+        # SINCE THE LAST MEMORY RECYCLE, not since the start. `self.turn` is the worker's
+        # global budget counter and is deliberately NOT reset when a conversation is replaced
+        # (max_turns has to keep counting), so an absolute guard would pass immediately after
+        # a recycle -- and if the fresh tab's heap has not fallen below the threshold yet, the
+        # worker would recycle every turn until it burned through max_recycles and went stuck.
+        if (self.turn - getattr(self, "_heap_recycle_turn", 0)) < FLEET_HEAP_MIN_TURNS:
+            return False
+        heap = self._heap_mb()
+        if heap is None:
+            return False
+        self._last_heap_mb = heap
+        return heap >= FLEET_HEAP_RECYCLE_MB
+
     def _decide(self, resp):
         self.last_response = resp
         self._tx.assistant(self.turn, resp)    # persist the full Copilot reply for this turn
+        # HEAP PER TURN, RECORDED. The recycle threshold above is provisional and the only way
+        # to replace it with a measured one is to know MB-per-turn on real work -- a worker's
+        # turns carry OCR text and spreadsheet rows and are nothing like the bridge probe's
+        # fixed round trips, so the bridge's turn count could not be copied. One number per
+        # turn, beside the transcript that already exists.
+        try:
+            _h = self._heap_mb()
+            if _h is not None:
+                self._tx.metric(self.turn, "heap_mb", round(_h, 1),
+                                recycles=self._recycles)
+        except Exception:
+            pass
         # Parse optional NEXT/CONFIDENCE turn markers (informational only, no gating).
         from relay.copilot_autopilot_relay import extract_next, extract_confidence
         self.next_step = extract_next(resp)
@@ -1864,11 +1944,13 @@ class RelayWorker:
         # MAXTURNS. Detect it, open a FRESH conversation on the same agent surface, and
         # re-anchor the goal so the agent re-derives progress from disk (the target Excel /
         # output files) instead of from the lost conversation history.
-        if conversation_exhausted(resp):
+        heavy = (not conversation_exhausted(resp)) and self._memory_pressure()
+        if conversation_exhausted(resp) or heavy:
             self._recycles += 1
+            self._heap_recycle_turn = self.turn
             if self._recycles > self._max_recycles:
                 self.status, self.outcome = "stuck", "STUCK"
-                self.reason = (f"conversation token limit; exceeded "
+                self.reason = (f"conversation recycled too often; exceeded "
                                f"max_recycles={self._max_recycles}")
                 return
             landed = False
@@ -1888,7 +1970,10 @@ class RelayWorker:
                 return
             self.job = (conversation_start_label(self.name + "-recycle%d" % self._recycles)
                         + PROTOCOL + RECYCLE_PREFIX + self.goal)  # re-anchor in the fresh chat
-            self.reason = f"会話トークン上限 → 新会話で続行 ({self._recycles}/{self._max_recycles})"
+            self.reason = (
+                f"ヒープ {getattr(self, '_last_heap_mb', 0):.0f}MB → 新会話で続行 "
+                f"({self._recycles}/{self._max_recycles})" if heavy else
+                f"会話トークン上限 → 新会話で続行 ({self._recycles}/{self._max_recycles})")
             try:
                 default_notify("♻ Fleet 会話リサイクル", self.reason)
             except Exception:

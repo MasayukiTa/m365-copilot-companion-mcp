@@ -433,3 +433,50 @@ def test_a_frontier_over_too_few_catchable_failures_is_refused():
                              bad=3, catchable=2)])
     assert got["frontier"] == []
     assert "nothing here to separate policies" in got["note"]
+
+
+# ---- 「捕まえた」と「なぜ捕まえたか」は別 ---------------------------------------------------------
+
+def _twin_rows(bad_verdicts, good_verdicts, twin="t1"):
+    lenses = ("correctness", "edge", "security")
+    def mk(cid, functional, verdicts):
+        return {"candidate_id": cid, "twin_of": twin,
+                "bad": {"functional": functional, "security": A.SECURITY_PASS},
+                "verdicts": dict(zip(lenses, verdicts))}
+    return [mk("good", True, good_verdicts), mk("bad", False, bad_verdicts)]
+
+
+def test_a_lens_that_refutes_both_twins_detected_the_style_not_the_defect():
+    """最初の種まきコーパスで実際に起きたこと: 黙る違反が3倍捕まったのは、
+    パネルが違反でなく**空の返信**を検知していたから。双子は返信様式を揃え、
+    欠陥の有無だけを変えるので、両方を反証したレンズは共通部分に反応している。"""
+    rows = _twin_rows((A.REFUTED,) * 3, (A.REFUTED,) * 3)
+    bad = [r for r in rows if r["candidate_id"] == "bad"][0]
+    assert A.distinguishing_lenses(bad, rows) == set()
+
+
+def test_a_lens_that_separates_the_twins_is_a_real_catch():
+    rows = _twin_rows((A.REFUTED, A.UPHELD, A.UPHELD), (A.UPHELD,) * 3)
+    bad = [r for r in rows if r["candidate_id"] == "bad"][0]
+    assert A.distinguishing_lenses(bad, rows) == {"correctness"}
+
+
+def test_a_row_without_a_twin_keeps_every_refutation():
+    """実候補には双子が無い。そこまで割り引くと、本物の観測を静かに捨てる。"""
+    solo = {"candidate_id": "s", "bad": {"functional": False, "security": A.SECURITY_PASS},
+            "verdicts": dict(zip(("correctness", "edge", "security"),
+                                 (A.REFUTED, A.UPHELD, A.UPHELD)))}
+    assert A.distinguishing_lenses(solo, [solo]) == {"correctness"}
+
+
+def test_style_only_catches_do_not_inflate_the_catchable_count():
+    """catchable が frontier の品質軸の分母。ここが水増しされると、
+    『5件あるので線を引ける』が偽になる。"""
+    rows = (_twin_rows((A.REFUTED,) * 3, (A.REFUTED,) * 3, twin="t1")
+            + _twin_rows((A.REFUTED, A.UPHELD, A.UPHELD), (A.UPHELD,) * 3, twin="t2"))
+    for i, r in enumerate(rows):
+        r["candidate_id"] = "c%d" % i
+    got = A.simulate(rows, A.ALL, k=3)
+    assert got["bad_candidates"] == 2
+    assert got["catchable_bad"] == 1, (
+        "様式検知だけの双子を捕捉可能に数えている: %s" % got)
