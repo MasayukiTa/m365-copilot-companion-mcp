@@ -53,6 +53,19 @@ FROZEN_MANIFEST = [
     "relay/selfimprove/manifest.py",
     "relay/selfimprove/decision.py",
 
+    # ROUTING: THE DECLARATION IS NOT THE DEFENCE. Marking `routing` forbidden in
+    # manifest.py only stops a GENOME from naming it. It does nothing about a candidate that
+    # edits routing.py and relaxes `at_least_as_strict`, and nothing about harness_tree,
+    # which is what actually hands out the manifest once a class has been decided -- routing
+    # could refuse and the tree would deliver anyway. Leaving these unfrozen is the same hole
+    # as freezing a judge that is not the one being run, three entries below.
+    "relay/selfimprove/routing.py",
+    "relay/selfimprove/harness_tree.py",
+
+    # The record of who changed what, and why. A ledger that the recorded party can quietly
+    # rewrite is worth less than it looks; this one sat outside the set until now.
+    "relay/selfimprove/authority_ledger.py",
+
     # THE JUDGE THAT ACTUALLY RUNS NOW. The manifest froze the swebench graders and stopped
     # there, from a time when those were the only graders. CompanionBench decides candidate
     # acceptance today, and every one of these files is a place where an episode could be

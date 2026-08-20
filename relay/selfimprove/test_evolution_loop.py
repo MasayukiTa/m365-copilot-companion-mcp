@@ -389,9 +389,11 @@ def test_every_evolvable_component_has_something_that_dispatches_on_it():
     A/B の両腕を同一プログラムにする。"""
     from relay import project_memory as PM
 
+    from relay.planner import PLANNER_VERSIONS
     from relay.quality_cards import QUALITY_CARDS_VERSIONS
     DISPATCHERS = {"memory": PM.MEMORY_VERSIONS,
-                   "quality_cards": QUALITY_CARDS_VERSIONS}
+                   "quality_cards": QUALITY_CARDS_VERSIONS,
+                   "planner": PLANNER_VERSIONS}
     assert set(M.EVOLVABLE_COMPONENTS) == set(DISPATCHERS), (
         "実装の無いコンポーネントが evolvable になっている: %s"
         % (set(M.EVOLVABLE_COMPONENTS) ^ set(DISPATCHERS)))
@@ -692,3 +694,51 @@ def test_activating_under_an_override_does_not_touch_the_production_manifest(mon
     assert target.is_file(), "override 先に書かれていない"
     assert _json.loads(target.read_text(encoding="utf-8"))["parameters"]["memory_max_items"] == 7
     assert os.path.isfile(RC.ACTIVE_PATH) == before, "本番の active manifest を作成/変更した"
+
+
+# ---- routing は「未実装だから不可」ではなく「決定により不可」 ---------------------------------------
+
+def test_routing_is_forbidden_by_decision_not_missing_by_accident():
+    """一度これを取り違えた。quality_cards の昇格時に routing も巻き添えで消し、
+    『宣言されているが進化させない』が『知らない名前』に変わっていた。
+    拒否はされ続けるので穴は開かないが、理由が失われる — 3つの集合の仕事はそこ。"""
+    assert "routing" in M.FORBIDDEN_COMPONENTS
+    assert "routing" not in M.UNIMPLEMENTED_COMPONENTS
+    with pytest.raises(M.ManifestError) as exc:
+        M.apply_genome(M.base_manifest(), {"components": {"routing": "routing/v2"}})
+    assert "forbidden" in str(exc.value), (
+        "unknown ではなく forbidden として断られること: %s" % exc.value)
+
+
+def test_the_files_that_decide_routing_are_frozen():
+    """宣言は防御ではない。genome が routing を名指せなくても、routing.py を編集して
+    at_least_as_strict を緩めることはできるし、クラスが決まったあと実際にマニフェストを
+    配るのは harness_tree なので、そこが未凍結なら検査は迂回できる。"""
+    from relay.selfimprove import frozen as F
+    for rel in ("relay/selfimprove/routing.py", "relay/selfimprove/harness_tree.py",
+                "relay/selfimprove/authority_ledger.py"):
+        assert rel in F.FROZEN_MANIFEST, rel
+
+
+# ---- planner ------------------------------------------------------------------------------
+
+def test_planner_versions_open_the_turn_differently():
+    """版が2つあっても、両方が同じ文字列を返すなら A/B は同じプログラムの二腕。"""
+    from relay.planner import PLANNER_VERSIONS
+    outs = {name: fn("do the thing", "PROTO ") for name, fn in PLANNER_VERSIONS.items()}
+    assert len(set(outs.values())) == len(outs), outs
+    assert outs["planner/v1"] == "PROTO do the thing"
+    assert outs["planner/v2"].startswith("PROTO ") and len(outs["planner/v2"]) > 40
+
+
+def test_the_planner_component_does_not_hijack_the_operators_plan_mode():
+    """plan_mode は人が承認するまで止まる設定。コンポーネント版がそれを黙って
+    上書きすると、operator が手で立てた旗の意味が実行ごとに変わる。
+    そして『人を待つ腕』は無人 A/B の片側になり得ない。"""
+    import inspect
+    from relay import relay_fleet as RF
+    src = inspect.getsource(RF._initial_job_with_unlock)
+    i = src.index("if plan_mode:")
+    j = src.index("else:", i)
+    assert "opening_turn" not in src[i:j], "plan_mode 経路がコンポーネント版に乗っ取られている"
+    assert "opening_turn" in src[j:], "plan_mode でない経路に本番の読み手が無い"

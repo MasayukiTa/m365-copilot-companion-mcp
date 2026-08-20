@@ -48,13 +48,18 @@ EVOLVABLE_COMPONENTS = frozenset({
     # only then was the name moved. Until that table existed the genome carried a `cards`
     # field that NOTHING read, so every card A/B ran the same program twice.
     "quality_cards",
+    # PROMOTED 2026-08-20, same two steps: planner.PLANNER_VERSIONS was written and shown to
+    # dispatch differently -- v1 opens with the goal, v2 opens with the plan prompt in front
+    # of it -- before the name was moved. plan_mode, the operator's plan-then-wait flag, is
+    # deliberately NOT what this selects; an arm that waits for a person cannot be one side
+    # of an unattended comparison.
+    "planner",
 })
 
 #: Named so the intent survives, and so a future implementer knows where to look -- but NOT
 #: evolvable, because there is nothing behind them yet. Moving one up is a two-part edit:
 #: write the version table, then move the name.
 UNIMPLEMENTED_COMPONENTS = frozenset({
-    "planner",
     "reviewer",
     "retry",
     "context",
@@ -76,6 +81,20 @@ FORBIDDEN_COMPONENTS = frozenset({
                            # guards apply. If the loop can move its own rung, every guard the
                            # rung governs becomes advisory in a single step.
     "provenance",          # authority classes; see the brief's lineage-poisoning section
+    # ROUTING IS HERE BY DECISION, not because it is unimplemented -- and it spent a few hours
+    # in neither set because I deleted it by accident while promoting quality_cards, which
+    # turned "declared, deliberately not evolvable" into "unknown name". Nothing opened: an
+    # unknown component is still refused. What was lost is the REASON, which is the whole job
+    # of these three sets.
+    #
+    # Forbidden rather than a future promotion: routing.py's own opening says a routing
+    # decision is a choice of configuration, and anything that can influence the choice can
+    # influence the configuration. Point an optimiser at that and the pressure is to learn a
+    # classifier that steers work toward the branch with the laxest checks -- which reads as a
+    # performance gain, because from outside that is what it looks like. Same shape as tuning
+    # the grader. That ROUTING_AUTHORITIES, SAFE_FEATURES and `at_least_as_strict` exist at
+    # all is this repository already conceding a routing decision can be an escalation.
+    "routing",
 })
 
 #: Only the components that exist. The six aspirational names moved to
@@ -84,6 +103,7 @@ FORBIDDEN_COMPONENTS = frozenset({
 DEFAULT_COMPONENTS = {
     "memory": "memory/v1",
     "quality_cards": "quality_cards/v1",
+    "planner": "planner/v1",
 }
 
 #: Every parameter's type and the range a run may actually use. The upper bounds are not
@@ -160,6 +180,12 @@ def known_versions(component: str) -> frozenset:
         try:
             from relay.quality_cards import QUALITY_CARDS_VERSIONS
             return frozenset(QUALITY_CARDS_VERSIONS)
+        except Exception:
+            return frozenset()
+    if component == "planner":
+        try:
+            from relay.planner import PLANNER_VERSIONS
+            return frozenset(PLANNER_VERSIONS)
         except Exception:
             return frozenset()
     return frozenset()

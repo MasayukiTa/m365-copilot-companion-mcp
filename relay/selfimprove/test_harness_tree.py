@@ -41,9 +41,15 @@ def test_every_resolution_is_accountable():
 def test_a_branch_cannot_introduce_something_the_root_does_not_declare():
     """枝が許可リストの見ていないコンポーネントを持ち込めるなら、
     許可リストは根にしか掛かっていない。"""
+    # 例は**導出する**。以前は "planner" と直書きしてあり、planner が進化可能へ昇格した
+    # 瞬間に「根が宣言していない」が偽になって落ちた。テストが壊れたのであって
+    # 不変条件が壊れたのではない、という紛らわしい落ち方をする。
+    undeclared = sorted(set(M.UNIMPLEMENTED_COMPONENTS) - set(M.DEFAULT_COMPONENTS))
+    assert undeclared, "根が宣言していないコンポーネントが1つも無く、この不変条件を試せない"
+    name = undeclared[0]
     with pytest.raises(T.TreeError) as exc:
         T.resolve({"root": M.base_manifest(),
-                   "overrides": {"coding": {"components": {"planner": "planner/v2"}}}}, "coding")
+                   "overrides": {"coding": {"components": {name: name + "/v2"}}}}, "coding")
     assert "does not declare" in str(exc.value)
 
 

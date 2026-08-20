@@ -208,7 +208,72 @@ def append(event: str, *, reason: str, actor_claimed: str, authorization: str = 
     }
     record["hash"] = _digest(record)
     _write(path, record)
+    _notify(record)
     return record
+
+
+#: Events worth interrupting the operator for, and what each one means when it arrives.
+#:
+#: WHY THE HOOK IS HERE AND NOT IN frozen.py. Every one of these passes through `append`, so
+#: this is the single chokepoint; and frozen.py is both frozen and excluded from the standing
+#: delegation, so putting a peripheral feature there would mean rewriting the constitution to
+#: add a notification. This module is neither, so wiring it costs nothing constitutional.
+#:
+#: WHY MISMATCH IS THE URGENT ONE. A re-signing is usually something the operator asked for.
+#: A mismatch is the frozen set having CHANGED WITHOUT ONE -- until now that was written to
+#: this file and nowhere else, so nobody learned of it unless they opened the dashboard. The
+#: detection existed and the telling did not.
+#:
+#: WHY EVERY REBLESS AND NOT JUST THE UNUSUAL ONES. Under a standing delegation the operator
+#: is not present for these, and the notification's whole value is that they can recognise a
+#: re-signing they did not ask for -- including one whose `authorization` field quotes words
+#: they never said. Filtering to "only the excluded paths" inverts that: those are precisely
+#: the acts they DID specify, so the message carries the least information. Re-signings are
+#: constitutional changes, not per-run events; if the volume ever becomes noise, the volume
+#: is itself the thing to look at.
+_URGENT = {BASELINE_MISMATCH}
+_NOTIFIED = {REBLESS, REVOKE, BASELINE_MISMATCH}
+
+
+def _headline(record) -> tuple:
+    event = record.get("event")
+    changed = ", ".join(sorted(record.get("changed") or {})) or "-"
+    auth = record.get("authorization") or SELF_INITIATED
+    if event == BASELINE_MISMATCH:
+        return ("Frozen set changed without a re-signing",
+                "%s\n\nNobody approved this. If it was not you, the judge has moved under a "
+                "running system." % changed)
+    if event == REVOKE:
+        return ("A re-signing was withdrawn",
+                "%s\n\nreason: %s" % (changed, record.get("reason")))
+    return ("The constitution was re-signed",
+            "%s\n\nreason: %s\nauthorization: %s\n\nIf you did not say this, nothing here "
+            "verified that you did." % (changed, record.get("reason"), auth))
+
+
+def _notify(record) -> None:
+    """Tell the operator. Never raises, never blocks the record.
+
+    A NOTIFICATION IS NOT A CONTROL, and this one is emitted from the same process as the act
+    it reports -- an actor that can write the record can suppress the message. It exists so an
+    act nobody asked for is noticed sooner than the next time somebody opens a dashboard, not
+    so that it cannot happen.
+    """
+    if record.get("event") not in _NOTIFIED:
+        return
+    try:
+        from tools.notify_ops import notify_desktop
+        title, body = _headline(record)
+        # NO `urgency` KWARG. notify_desktop takes (title, body, app_id, icon_path) and
+        # passing an argument it does not have would raise a TypeError straight into the
+        # except below -- a notification that silently never fires, which is the exact shape
+        # of defect this whole notification exists to catch elsewhere. Urgency rides in the
+        # title, which is the part a toast shows first.
+        if record.get("event") in _URGENT:
+            title = "! " + title
+        notify_desktop(title=title, body=body)
+    except Exception:
+        pass
 
 
 def _write(path: str, record: dict) -> None:

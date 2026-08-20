@@ -42,7 +42,7 @@ from .copilot_autopilot_relay import (
     conversation_start_label,
 )
 from relay import settle as _settle
-from .planner import PLAN_PROMPT, extract_plan, plan_ready
+from .planner import PLAN_PROMPT, extract_plan, opening_turn, plan_ready
 from .review_resilience import (
     freeze_goal_dict, looks_like_policy_refusal, same_task_envelope,
     task_envelope_from_goal,
@@ -344,10 +344,18 @@ def _initial_job_with_unlock(goal: str, plan_mode: bool = False):
     because the gate is keyed to that remote client IP, so the password is injected only into
     this transient first turn and never into persistent agent configuration.
     """
-    original = (PLAN_PROMPT + goal) if plan_mode else goal
+    # plan_mode (operator-set, plan-then-WAIT) is unchanged. When it is off, which version
+    # of the planner component opens the turn is the evolvable choice -- see
+    # planner.PLANNER_VERSIONS for why an unattended plan-first arm is the comparable one.
+    if plan_mode:
+        original = PLAN_PROMPT + goal
+        opening = PLAN_PROMPT + goal
+    else:
+        original = goal
+        opening = opening_turn(goal, PROTOCOL)
     pw = _unlock_password()
     if not pw:
-        return ((PLAN_PROMPT + goal) if plan_mode else (PROTOCOL + goal)), False
+        return opening, False
     return PROTOCOL + (UNLOCK_PREFIX % pw) + original, True
 
 

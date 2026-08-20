@@ -195,3 +195,79 @@ def test_the_path_is_resolved_at_call_time_not_bound_at_import(tmp_path, monkeyp
     monkeypatch.setenv(L.ENV_PATH, p)
     L.append(L.REBLESS, reason="r", actor_claimed="test")
     assert L.read(p), "環境変数での差し替えが効いていない"
+
+
+# ---- 恒久委任下では「聞かなかった」が合図にならないので、事後に届かせる -------------------------------
+
+def _fired(monkeypatch, tmp_path, event, **kw):
+    import tools.notify_ops as N
+    calls = []
+    monkeypatch.setenv(L.ENV_PATH, _p(tmp_path))
+    monkeypatch.setattr(N, "notify_desktop", lambda **k: calls.append(k) or "ok")
+    L.append(event, reason=kw.pop("reason", "r"), actor_claimed="a", **kw)
+    return calls
+
+
+def test_a_resigning_reaches_the_operator(tmp_path, monkeypatch):
+    """委任したので事前には聞かない。届かなければ、ダッシュボードを開くまで誰も知らない。"""
+    calls = _fired(monkeypatch, tmp_path, L.REBLESS, authorization="operator said so")
+    assert len(calls) == 1
+    assert "re-signed" in calls[0]["title"]
+    assert "operator said so" in calls[0]["body"], (
+        "自称の authorization を本人に見せないと、"
+        "『そんな指示はしていない』と気づける唯一の機会が消える")
+
+
+def test_a_mismatch_is_the_urgent_one(tmp_path, monkeypatch):
+    """再署名はたいてい頼まれた行為。不一致は**頼まれずに判定者が動いた**こと。
+    検知は前からあったが、台帳に書くだけで誰にも告げていなかった。"""
+    calls = _fired(monkeypatch, tmp_path, L.BASELINE_MISMATCH, changed={"x.py": {}})
+    assert calls[0]["title"].startswith("! ")
+    assert "Nobody approved" in calls[0]["body"]
+
+
+def test_routine_genome_activity_does_not_notify(tmp_path, monkeypatch):
+    """genome の適用は日常。全部鳴らすと、鳴っても読まれなくなる。"""
+    assert _fired(monkeypatch, tmp_path, L.GENOME_APPLY) == []
+
+
+def test_the_notification_call_passes_only_arguments_that_exist():
+    """存在しない引数を渡すと TypeError が except に飲まれ、通知は黙って永久に不発になる。
+    実際に一度 urgency= を渡しかけた。
+
+    本文の文字列検索では駄目で、最初の版はコメント中の "urgency" を拾って落ちた。
+    ast で**呼び出しのキーワード**を見る。notify_desktop 自身は装飾されていて
+    署名内省が *args/**kwargs を返すので、実引数名は元関数から取る。
+    """
+    import ast
+    from tools import notify_ops as N
+
+    # SOURCE, NOT THE LIVE OBJECT. Under pytest something wraps notify_desktop, so
+    # inspect.signature reports (*args, **kwargs) and the check would pass against anything.
+    # The definition in the file is what the call has to agree with.
+    ndef = ast.parse(open(N.__file__, encoding="utf-8").read())
+    allowed = None
+    for node in ast.walk(ndef):
+        if isinstance(node, ast.FunctionDef) and node.name == "notify_desktop":
+            allowed = {a.arg for a in node.args.args} | {a.arg for a in node.args.kwonlyargs}
+    assert allowed and "title" in allowed and "urgency" not in allowed, allowed
+
+    tree = ast.parse(open(L.__file__, encoding="utf-8").read())
+    seen = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and (getattr(node.func, "id", None)
+                                           or getattr(node.func, "attr", None)) == "notify_desktop":
+            seen.append({kw.arg for kw in node.keywords})
+    assert seen, "notify_desktop の呼び出しが見つからない"
+    for kwargs in seen:
+        extra = kwargs - allowed
+        assert not extra, "notify_desktop に無い引数を渡している: %s" % sorted(extra)
+
+
+def test_a_failing_notifier_never_blocks_the_record(tmp_path, monkeypatch):
+    import tools.notify_ops as N
+    monkeypatch.setenv(L.ENV_PATH, _p(tmp_path))
+    monkeypatch.setattr(N, "notify_desktop",
+                        lambda **k: (_ for _ in ()).throw(OSError("no toast here")))
+    rec = L.append(L.REBLESS, reason="r", actor_claimed="a")
+    assert rec["seq"] == 1 and L.verify(_p(tmp_path))[0]

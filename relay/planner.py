@@ -87,3 +87,52 @@ def extract_plan(resp: str):
             if len(s2) >= 8:
                 steps.append(s2)
     return steps
+
+
+# ── the evolvable component ──────────────────────────────────────────────────────────────
+# WHY TWO VERSIONS AND NOT A BOOLEAN. `plan_mode` already exists as a flag, and a flag with
+# two settings looks like the same thing as a table with two entries. It is not, and the
+# difference is the point: the existing flag selects PLAN-THEN-WAIT, where the worker stops
+# until a human approves the plan. That cannot be A/B'd, because an arm that blocks on a
+# person is not a scaffold strategy, it is an interaction.
+#
+# So the two versions here are the two strategies that can both run unattended:
+#
+#   planner/v1  straight to work. The first turn is the goal under the protocol.
+#   planner/v2  plan first, then continue on the plan WITHOUT waiting for approval.
+#
+# The question they put to a measurement is the one worth asking -- does making the model lay
+# out a plan before touching anything change what it achieves -- and both arms complete on
+# their own, so the comparison is between scaffolds rather than between a scaffold and a
+# human's availability.
+#
+# plan_mode is untouched and still means plan-then-wait. A component version does not get to
+# quietly redefine a flag that the operator sets by hand.
+
+def _planner_v1(goal: str, protocol: str) -> str:
+    """Straight to work: the goal under the protocol, which is what the fleet has always done."""
+    return protocol + goal
+
+
+def _planner_v2(goal: str, protocol: str) -> str:
+    """Plan first, then proceed on it unattended."""
+    return protocol + PLAN_PROMPT + goal
+
+
+#: What makes `planner` a component rather than a label. Until this table existed, moving
+#: planner/v1 to planner/v2 changed the manifest hash and executed identical code -- an A/B
+#: whose two arms were the same program.
+PLANNER_VERSIONS = {
+    "planner/v1": _planner_v1,
+    "planner/v2": _planner_v2,
+}
+
+
+def opening_turn(goal: str, protocol: str) -> str:
+    """The first turn's text, under whichever planner version the active harness names."""
+    try:
+        from relay.selfimprove import runtime_config as _rc
+        impl = PLANNER_VERSIONS.get(_rc.component("planner"), _planner_v1)
+    except Exception:
+        impl = _planner_v1
+    return impl(goal, protocol)
