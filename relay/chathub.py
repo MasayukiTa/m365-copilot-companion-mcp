@@ -225,7 +225,7 @@ class Conversation:
 
     def __init__(self, token_supplier, *, send_origin=False, user_agent=None,
                  connect_timeout_s=15.0, frame_timeout_s=30.0, turn_timeout_s=300.0,
-                 max_frames=2000):
+                 max_frames=2000, max_tool_rounds=16):
         if not callable(token_supplier):
             raise ChatHubError(
                 "token_supplier must be a callable that returns a token obtained elsewhere. "
@@ -241,6 +241,7 @@ class Conversation:
         self.frame_timeout_s = float(frame_timeout_s)
         self.turn_timeout_s = float(turn_timeout_s)
         self.max_frames = int(max_frames)
+        self.max_tool_rounds = int(max_tool_rounds)
         self.session_id = str(uuid.uuid4())
         self.conversation_id = str(uuid.uuid4())
         self.turns = 0
@@ -252,6 +253,78 @@ class Conversation:
         if self.user_agent:
             h["User-Agent"] = self.user_agent
         return h
+
+    def ask(self, text: str, *, connect, run_tool=None, catalogue=None, protocol="",
+            started=None):
+        """One turn: connect, send, read frames until the turn completes, return the answer.
+
+        `connect(url, headers, timeout_s)` is supplied by the caller and must return an object
+        with `send(str)`, `recv(timeout_s) -> str|bytes` and `close()`. Injected for the same
+        reason `token_supplier` is: this module has no business choosing a socket library, and
+        a seam here is what lets the protocol be tested without a network.
+
+        THE TOOL LOOP RUNS INSIDE THIS CALL and never surfaces. The decision machinery upstream
+        reads answers, and a raw fenced block is not an answer -- showing it one would have the
+        stuck detector, the refusal detector and the settle check all reasoning about a request
+        rather than a reply.
+        """
+        from relay import socket_tools as ST
+
+        started = self.turns == 0 if started is None else bool(started)
+        payload = ST.build_prompt(text, catalogue or [], protocol=protocol) if catalogue             else (protocol or "") + text
+        answer, rounds = "", 0
+        while True:
+            answer = self._one_exchange(payload, connect=connect, started=started)
+            started = False
+            self.turns += 1
+            if run_tool is None:
+                break
+            nxt, calls = ST.step(answer, run_tool)
+            if nxt is None:
+                break
+            rounds += 1
+            if rounds > self.max_tool_rounds:
+                # A model that keeps calling and never concludes is not making progress, and
+                # an unbounded loop here would spend a whole goal's budget on one turn.
+                raise ChatHubError("tool rounds exceeded %d without a final answer"
+                                   % self.max_tool_rounds)
+            payload = nxt
+        return ST.strip_calls(answer) if catalogue else answer
+
+    def _one_exchange(self, payload: str, *, connect, started: bool) -> str:
+        """Send one payload and read until the turn completes. Returns the reply text."""
+        request_id = str(uuid.uuid4())
+        sock = connect(self.url_for_turn(request_id), self.headers(), self.connect_timeout_s)
+        try:
+            sock.send('{"protocol":"json","version":1}' + RS)
+            sock.recv(self.frame_timeout_s)          # handshake ack
+            sock.send(chat_frames(payload, session_id=self.session_id,
+                                  conversation_id=self.conversation_id,
+                                  request_id=request_id, started=started))
+            text, seen, deadline = [], 0, time.time() + self.turn_timeout_s
+            while time.time() < deadline:
+                # A SILENT SOCKET IS NOT A FINISHED TURN. type-3 says the turn completed; it
+                # says nothing about a connection that died, so the read is bounded separately
+                # and the pings are what prove the far end is still there.
+                blob = sock.recv(self.frame_timeout_s)
+                if blob is None:
+                    raise ChatHubError("the socket went silent before the turn completed")
+                for frame in parse_frames(blob):
+                    seen += 1
+                    if seen > self.max_frames:
+                        raise ChatHubError("frame budget exhausted before completion")
+                    if is_ping(frame):
+                        sock.send(json.dumps({"type": 6}) + RS)
+                        continue
+                    text.append(collect_text(frame))
+                    if is_complete(frame):
+                        return "".join(text)
+            raise ChatHubError("turn deadline exceeded before a completion frame")
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
     def url_for_turn(self, request_id: str) -> str:
         token = self._token_supplier()

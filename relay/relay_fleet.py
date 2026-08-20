@@ -1509,6 +1509,10 @@ class RelayWorker:
 
         This does NOT touch status/job/cooldown/streaks -- callers decide what a successful or
         failed re-nav means for them (retry-same-job vs. fall through)."""
+        if self.page is None:
+            # NO TAB, NOTHING TO RE-NAVIGATE. A worker can exist without a page -- the socket
+            # route leaves it None -- and "did not land" is the honest answer, not a crash.
+            return False
         self._redirect_renavs += 1
         landed = False
         try:
@@ -1798,6 +1802,11 @@ class RelayWorker:
         recovery: if there is literally a 許可/Allow button on the CURRENT page, clicking it is
         the cheapest and most correct move (nothing to do with a drifted tab). Returns True iff a
         button was found and clicked. Never raises."""
+        if self.page is None:
+            # Consent is a card in a tab. Without one there is nothing to click, and nothing
+            # to approve either: a route that does not reach an external connector never
+            # raises the question.
+            return False
         pg = self.page
         if pg is None:
             return False
@@ -1836,6 +1845,8 @@ class RelayWorker:
                   do NOT delete the cache on failure -- the popup flow refreshes it).
         Tier 2 -- popup flow: edge_reconnect.click_through_consent(self.page), which now caches the
                   URL and fixes ALL rows (handles both variant (a) and the 接続マネージャー popup)."""
+        if self.page is None:
+            return False
         pg = self.page
         if pg is None:
             return False
@@ -1887,6 +1898,8 @@ class RelayWorker:
         must degrade to None rather than raise -- a memory reading is a nice-to-have and a
         worker that dies for lack of one is a worse outcome than a tab that grows.
         """
+        if self.page is None:
+            return None                      # no tab, no renderer heap -- not an error
         try:
             v = self.page.evaluate(
                 "() => performance.memory ? performance.memory.usedJSHeapSize : null")

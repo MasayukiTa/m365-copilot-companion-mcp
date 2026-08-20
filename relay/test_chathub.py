@@ -166,3 +166,157 @@ def _token(oid="oid-x", tid="tid-y", exp_in=3600):
     raw = base64.urlsafe_b64encode(
         json.dumps(payload).encode("utf-8")).decode("ascii").rstrip("=")
     return "eyJ0eXAiOiJKV1QifQ." + raw + ".sig"
+
+
+# ---- ターンのループ（ソケットは注入なので、ネットワーク無しで確かめられる） ------------------------
+
+class _FakeSock:
+    """A scripted socket. The seam exists so the protocol can be tested without a network."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.sent = []
+
+    def send(self, blob):
+        self.sent.append(blob)
+
+    def recv(self, _timeout):
+        return self.script.pop(0) if self.script else None
+
+    def close(self):
+        pass
+
+
+def _connect_returning(*scripts):
+    socks = [_FakeSock(s) for s in scripts]
+    made = []
+
+    def _connect(_url, _headers, _timeout):
+        made.append(socks[len(made)])
+        return made[-1]
+
+    _connect.made = made
+    return _connect
+
+
+def _update(text):
+    return json.dumps({"type": 1, "target": "update",
+                       "arguments": [{"writeAtCursor": text}]}) + CH.RS
+
+
+def _done():
+    return json.dumps({"type": 3}) + CH.RS
+
+
+def test_a_turn_returns_the_text_between_handshake_and_completion():
+    connect = _connect_returning(["{}" + CH.RS, _update("答え"), _done()])
+    conv = CH.Conversation(lambda: _token())
+    assert conv.ask("質問", connect=connect) == "答え"
+    assert conv.turns == 1
+
+
+def test_the_handshake_goes_first_and_the_chat_frame_second():
+    connect = _connect_returning(["{}" + CH.RS, _done()])
+    CH.Conversation(lambda: _token()).ask("x", connect=connect)
+    sent = connect.made[0].sent
+    assert sent[0] == '{"protocol":"json","version":1}' + CH.RS
+    assert '"target": "chat"' in sent[1] or '"target":"chat"' in sent[1]
+
+
+def test_a_ping_is_answered_so_the_far_end_keeps_the_socket():
+    connect = _connect_returning(["{}" + CH.RS,
+                                  json.dumps({"type": 6}) + CH.RS,
+                                  _update("ok"), _done()])
+    assert CH.Conversation(lambda: _token()).ask("x", connect=connect) == "ok"
+    assert json.dumps({"type": 6}) + CH.RS in connect.made[0].sent
+
+
+def test_a_socket_that_goes_silent_is_not_a_finished_turn():
+    """type-3 は『ターンが完了した』であって『接続が生きている』ではない。
+    無音を完了と読むと、死んだソケットが空の答えとして通る。"""
+    connect = _connect_returning(["{}" + CH.RS, _update("途中まで")])   # then None
+    with pytest.raises(CH.ChatHubError) as exc:
+        CH.Conversation(lambda: _token()).ask("x", connect=connect)
+    assert "silent" in str(exc.value)
+
+
+def test_the_frame_budget_is_bounded():
+    flood = ["{}" + CH.RS] + [_update("x")] * 50
+    connect = _connect_returning(flood)
+    conv = CH.Conversation(lambda: _token(), max_frames=10)
+    with pytest.raises(CH.ChatHubError) as exc:
+        conv.ask("x", connect=connect)
+    assert "frame budget" in str(exc.value)
+
+
+# ---- ツールループは send の内側に隠れること（判断機に生ブロックを見せない） ------------------------
+
+def test_the_tool_loop_runs_inside_and_the_caller_sees_only_the_answer():
+    """上流の判断機（stuck 検出・拒否検出・settle）は『答え』を読む。
+    生の fenced block を見せると、返信ではなく要求について推論し始める。"""
+    call = '```call_tool\n{"name": "ls"}\n```'
+    connect = _connect_returning(
+        ["{}" + CH.RS, _update("確認します。" + chr(10) + call), _done()],  # 1回目: ツール要求
+        ["{}" + CH.RS, _update("3件ありました。"), _done()],        # 2回目: 最終回答
+    )
+    ran = []
+
+    def run_tool(name, args):
+        ran.append((name, args))
+        return True, "a b c"
+
+    conv = CH.Conversation(lambda: _token())
+    out = conv.ask("数えて", connect=connect, run_tool=run_tool,
+                   catalogue=[{"name": "call_tool", "description": "gateway"}])
+    assert ran == [("call_tool", {"name": "ls"})]
+    assert out == "3件ありました。"
+    assert "```" not in out, "生の fenced block が呼び出し側へ漏れている"
+
+
+def test_the_tool_result_is_what_the_second_turn_carries():
+    connect = _connect_returning(
+        ["{}" + CH.RS, _update('```call_tool\n{"name": "ls"}\n```'), _done()],
+        ["{}" + CH.RS, _update("done"), _done()],
+    )
+    CH.Conversation(lambda: _token()).ask(
+        "x", connect=connect, run_tool=lambda n, a: (True, "RESULT-MARKER"),
+        catalogue=[{"name": "call_tool", "description": "d"}])
+    assert "RESULT-MARKER" in connect.made[1].sent[1]
+
+
+def test_a_model_that_never_stops_calling_is_bounded():
+    """呼び続けて結論しないモデルは進捗していない。無限ループはゴール1本の予算を
+    1ターンで使い切る。"""
+    call = ["{}" + CH.RS, _update('```call_tool\n{"name": "again"}\n```'), _done()]
+    connect = _connect_returning(*([call] * 10))
+    conv = CH.Conversation(lambda: _token(), max_tool_rounds=3)
+    with pytest.raises(CH.ChatHubError) as exc:
+        conv.ask("x", connect=connect, run_tool=lambda n, a: (True, "r"),
+                 catalogue=[{"name": "call_tool", "description": "d"}])
+    assert "tool rounds exceeded" in str(exc.value)
+
+
+def test_only_the_first_exchange_of_a_conversation_says_it_is_the_start():
+    connect = _connect_returning(["{}" + CH.RS, _done()], ["{}" + CH.RS, _done()])
+    conv = CH.Conversation(lambda: _token())
+    conv.ask("one", connect=connect)
+    conv.ask("two", connect=connect)
+    first = json.loads(connect.made[0].sent[1].split(CH.RS)[0])
+    second = json.loads(connect.made[1].sent[1].split(CH.RS)[0])
+    assert first["arguments"][0]["isStartOfSession"] is True
+    assert second["arguments"][0]["isStartOfSession"] is False
+
+
+def test_the_socket_is_closed_even_when_the_turn_fails():
+    closed = []
+
+    class Sock(_FakeSock):
+        def close(self):
+            closed.append(1)
+
+    def connect(_u, _h, _t):
+        return Sock(["{}" + CH.RS])          # no completion -> raises
+
+    with pytest.raises(CH.ChatHubError):
+        CH.Conversation(lambda: _token()).ask("x", connect=connect)
+    assert closed == [1]

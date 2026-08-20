@@ -143,3 +143,18 @@ def test_why_this_route_needs_no_credential_is_written_down():
     doc = ST.__doc__ or ""
     assert "AUTH" in doc and "CONSENT" in doc
     assert "Work IQ" in doc, "使えなくなるものも同じ場所に書いておくこと"
+
+
+def test_a_fence_must_start_its_own_line():
+    """文中に埋まった ``` を呼び出しとして読むと、モデルが説明のために書いた
+    引用まで実行対象になる。行頭要求は意図的な厳しさ。"""
+    inline = '確認します。```call_tool\n{"name": "ls"}\n```'
+    assert ST.parse_calls(inline) == []
+    proper = '確認します。\n```call_tool\n{"name": "ls"}\n```'
+    assert ST.parse_calls(proper) == [("call_tool", {"name": "ls"})]
+
+
+def test_an_indented_fence_still_counts():
+    """箇条書きの中でモデルがインデントすることはある。行頭要求は
+    『行の先頭が空白のみ』まで許す。"""
+    assert ST.parse_calls('- 手順:\n  ```call_tool\n  {"name": "ls"}\n  ```') != []
