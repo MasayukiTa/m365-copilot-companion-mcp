@@ -243,3 +243,9 @@ skills.sqlite3
 # -- the authoritative previous baseline lives in the append-only ledger, because anything
 # able to overwrite the baseline can also delete the copy sitting next to it.
 relay/selfimprove/frozen_baseline.json.prev
+
+# Not tracked, not in CI, not importable by anything shipped. Work that is being TRIED rather
+# than kept lives here -- currently the browser-token reader for the socket experiment, which
+# is a general-purpose credential extractor whatever the intent behind it, and does not belong
+# in a public repository while it is still a question rather than an answer.
+experiments/
