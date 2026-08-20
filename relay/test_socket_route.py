@@ -162,9 +162,15 @@ def test_the_capture_tab_is_closed_again():
 # ---- 艦隊への配線 ---------------------------------------------------------------------------
 
 class _FakeDrv:
-    def __init__(self):
+    """タブ用ドライバの代役。`answers` はループが見る完了回答数。"""
+
+    def __init__(self, answers=0):
         self.failed = ""
         self.closed = False
+        self.answers = answers
+
+    def _answers(self):
+        return type("A", (), {"count": lambda s: self.answers})()
 
     def close(self):
         self.closed = True
@@ -309,3 +315,47 @@ def test_the_disk_slot_counts_a_socket_worker_and_the_tab_slot_does_not():
 
     idle = _worker()
     assert rf._holds_slot(idle) is False          # まだ入場していない
+
+
+def test_turns_that_worked_are_reported_so_the_breaker_can_reset(monkeypatch):
+    """遮断器が失敗しか聞かされていないと、consecutive が 0 に戻らない。
+    何千ターン成功していても、何時間かに散らばった3回の失敗で経路が閉じる。"""
+    r = SocketRoute(enabled=True, connect_fn=object())
+    monkeypatch.setattr(rf, "_socket_route", lambda: r)
+
+    class _Drv(_FakeDrv):
+        n = 0
+
+        def _answers(self):
+            return type("A", (), {"count": lambda s: _Drv.n})()
+
+    w = _worker()
+    w.socket, w.drv, w.status = True, _Drv(), "waiting"
+
+    r.note_failure("a")
+    r.note_failure("b")
+    assert r.consecutive == 2
+
+    _Drv.n = 1                       # 1ターン成功した
+    w.poll()
+    assert r.consecutive == 0 and r.turns == 1
+
+    _Drv.n = 3                       # 見ていない間に2ターン進んだ
+    w.poll()
+    assert r.turns == 3
+    w.poll()
+    assert r.turns == 3              # 同じターンを二度数えない
+
+
+def test_a_failed_turn_is_not_reported_as_a_success(monkeypatch):
+    r = SocketRoute(enabled=True, connect_fn=object())
+    monkeypatch.setattr(rf, "_socket_route", lambda: r)
+    w = _worker()
+    # 1ターン成功したあとに落ちたドライバ。回答数は 1 のまま増えない --
+    # 失敗を成功として数えないのは、この構造そのものが担保している。
+    w.socket, w.drv, w.status = True, _FakeDrv(answers=1), "waiting"
+    w._socket_turns_seen = 1
+    w.drv.failed = "gone"
+    monkeypatch.setattr(w, "_fall_back_to_tab", lambda: True)
+    w.poll()
+    assert r.turns == 0

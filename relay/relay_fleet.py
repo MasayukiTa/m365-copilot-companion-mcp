@@ -1012,6 +1012,10 @@ class RelayWorker:
         #: occupies a DISK slot (it runs the same eval) but no RAM slot, which is the whole
         #: difference and the reason the two accountings are separated below.
         self.socket = False
+        #: How many socket turns of this worker the route has already been told about. Without
+        #: it nothing reports SUCCESS, the breaker's consecutive counter never resets, and a
+        #: long healthy run closes the route on three failures scattered across hours.
+        self._socket_turns_seen = 0
         self.goal_record = freeze_goal_dict(goal) if isinstance(goal, dict) else {"text": str(goal)}
         text, checks, cwd = goal_fields(goal)
         self.goal = text
@@ -2793,6 +2797,31 @@ class RelayWorker:
         self.status = "ready"
         return False
 
+    def _report_socket_turns(self):
+        """Tell the route about turns that WORKED, once each.
+
+        The breaker only ever heard about failures, so `consecutive` could not fall back to
+        zero and a run of thousands of good turns would still be closed by three bad ones
+        spread across hours. Counted from the driver's own completed-answer count, so a turn
+        is reported when it produced an answer -- not when it was merely started.
+
+        THAT COUNT IS ALSO WHAT MAKES A FAILED TURN UNREPORTABLE: a turn that failed
+        never increments it, so no ordering here can turn a failure into a success.
+        Mutation testing says as much -- moving this call above the failure check
+        changes nothing, which is a property of the design rather than a gap in a test.
+        """
+        try:
+            done = self.drv._answers().count()
+        except Exception:
+            return
+        seen = getattr(self, "_socket_turns_seen", 0)
+        if done <= seen:
+            return
+        self._socket_turns_seen = done
+        route = _socket_route()
+        for _ in range(done - seen):
+            route.note_success()
+
     def _fall_back_to_tab(self):
         """The socket stopped working for this worker. Open a tab and re-send the same turn.
 
@@ -2837,9 +2866,12 @@ class RelayWorker:
         # getattr, like the rest of this loop: the settle tests drive poll() on a stand-in
         # worker that never runs __init__, and a hard attribute read here would make a socket
         # feature break a test about text stability.
-        if getattr(self, "socket", False) and getattr(self.drv, "failed", ""):
-            if not self._fall_back_to_tab():
-                return True
+        if getattr(self, "socket", False):
+            if getattr(self.drv, "failed", ""):
+                if not self._fall_back_to_tab():
+                    return True
+            else:
+                self._report_socket_turns()
         if self.status == PENDING:
             return False                 # not attached yet; the fleet attaches it
         if self.status == "awaiting":
