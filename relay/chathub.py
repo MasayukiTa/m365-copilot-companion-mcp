@@ -491,7 +491,7 @@ class Conversation:
         return h
 
     def ask(self, text: str, *, connect, run_tool=None, catalogue=None, protocol="",
-            started=None):
+            started=None, on_text=None):
         """One turn: connect, send, read frames until the turn completes, return the answer.
 
         `connect(url, headers, timeout_s)` is supplied by the caller and must return an object
@@ -510,7 +510,8 @@ class Conversation:
         payload = ST.build_prompt(text, catalogue or [], protocol=protocol) if catalogue             else (protocol or "") + text
         answer, rounds = "", 0
         while True:
-            answer = self._one_exchange(payload, connect=connect, started=started)
+            answer = self._one_exchange(payload, connect=connect, started=started,
+                                        on_text=on_text)
             started = False
             self.turns += 1
             if run_tool is None:
@@ -527,8 +528,13 @@ class Conversation:
             payload = nxt
         return ST.strip_calls(answer) if catalogue else answer
 
-    def _one_exchange(self, payload: str, *, connect, started: bool) -> str:
-        """Send one payload and read until the turn completes. Returns the reply text."""
+    def _one_exchange(self, payload: str, *, connect, started: bool, on_text=None) -> str:
+        """Send one payload and read until the turn completes. Returns the reply text.
+
+        `on_text` sees the answer as it grows, so a caller that shows progress does not have
+        to wait for the turn. It is display-only and its failures are ignored: a callback that
+        raises must not cost a turn that is otherwise fine.
+        """
         request_id = str(uuid.uuid4())
         sock = self._connect(request_id, connect)
         try:
@@ -560,6 +566,11 @@ class Conversation:
                                                    or self.server_conversation_id)
                     deltas.append(collect_delta(frame))
                     final = collect_final(frame) or final
+                    if on_text is not None:
+                        try:
+                            on_text(final or "".join(deltas))
+                        except Exception:
+                            pass
                     if is_complete(frame):
                         self.last_result = result
                         # A VERDICT IS NOT AN ANSWER. The backend reports why it declined in
