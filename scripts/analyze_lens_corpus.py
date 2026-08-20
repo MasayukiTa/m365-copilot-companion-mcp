@@ -74,12 +74,26 @@ def describe(rows) -> dict:
             bad_s += 1
         elif security == A.SECURITY_UNEVALUABLE:
             unev += 1
+    # THE SAME RULE THE FRONTIER USES. Counting refutations here while `simulate` discounts
+    # style-only ones would put a headline on the screen that the table below contradicts.
     catchable = sum(1 for row in rows
                     if (not A._truth(row)[0] or A._truth(row)[1] == A.SECURITY_VIOLATION)
-                    and any(v == A.REFUTED for v in row["verdicts"].values()))
+                    and A.distinguishing_lenses(row, rows))
     return {"candidates": len(rows), "functional_bad": bad_f, "security_bad": bad_s,
             "security_unevaluable": unev, "catchable_bad": catchable,
-            "calibration_rows": sum(1 for r in rows if r.get(CALIBRATION_KEY))}
+            "calibration_rows": sum(1 for r in rows if r.get(CALIBRATION_KEY)),
+            # BROKEN OUT BY KIND rather than counted together. "seeded" hid that every
+            # catchable row in the last corpus came from the security half; the functional
+            # half is the one that answers what the panel is for.
+            "seeded_security": sum(1 for r in rows
+                                   if r.get(CALIBRATION_KEY) == "seeded_security"),
+            "seeded_functional": sum(1 for r in rows
+                                     if r.get(CALIBRATION_KEY) == "seeded_functional"),
+            # Corpora written before the flag became an enum carry `true`. Counted as
+            # unclassified rather than filed under a kind they never declared -- guessing
+            # which half they belonged to is the sort of quiet attribution this analysis
+            # exists to avoid.
+            "seeded_unclassified": sum(1 for r in rows if r.get(CALIBRATION_KEY) is True)}
 
 
 
@@ -225,7 +239,9 @@ def main() -> int:
     shape = describe(rows)
     print("CORPUS: %(candidates)d candidates | bad: %(functional_bad)d functional, "
           "%(security_bad)d security | unevaluable: %(security_unevaluable)d | "
-          "catchable: %(catchable_bad)d | seeded: %(calibration_rows)d" % shape)
+          "catchable: %(catchable_bad)d | seeded: %(calibration_rows)d "
+          "(security %(seeded_security)d, functional %(seeded_functional)d, "
+          "unclassified %(seeded_unclassified)d)" % shape)
 
     cost = measured_lens_cost(rows)
     if cost:

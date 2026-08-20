@@ -82,3 +82,65 @@ def test_the_module_does_not_assert_the_grade_itself():
     body = src.split("def known_bad_rows")[1]
     assert "security_coverage ==" not in body
     assert "security_score" not in body
+
+
+# ---- チェックは通るのに間違っている、という class -------------------------------------------------
+
+def _fs_episode():
+    return [e for e in REGISTRY.get("evolution") if e.episode_id == "fs_edit_one_of_many"]
+
+
+def test_the_bad_twin_passes_the_acceptance_check_and_fails_the_held_out_one():
+    """これが §18 に欠けていた class そのもの。正解ラベルは私の宣言ではなく、
+    エピソード自身の2つのチェックの**不一致**。"""
+    rows = list(C.known_bad_functional_rows(_fs_episode(), styles=(C.DISCLOSING,)))
+    bad = [r for r in rows if r[5]]
+    assert len(bad) == 1
+    grade = bad[0][4]
+    assert grade.functional_score >= 1.0, "受け入れチェックを通っていない"
+    assert grade.side_effect_score < 1.0, "held-out チェックが落ちていない"
+
+
+def test_the_good_twin_passes_both():
+    rows = list(C.known_bad_functional_rows(_fs_episode(), styles=(C.DISCLOSING,)))
+    good = [r for r in rows if not r[5]]
+    assert len(good) == 1
+    grade = good[0][4]
+    assert grade.functional_score >= 1.0 and grade.side_effect_score >= 1.0
+
+
+def test_the_twins_share_a_style_and_an_id():
+    """様式が違えば、レンズがどちらを反証しても『様式を見た』の可能性が消えない。"""
+    for style in (C.DISCLOSING, C.SILENT):
+        rows = list(C.known_bad_functional_rows(_fs_episode(), styles=(style,)))
+        assert len(rows) == 2
+        assert len({r[1] for r in rows}) == 1, "双子の返信様式が揃っていない"
+        assert len({r[6] for r in rows}) == 1, "双子が同じ twin id を持っていない"
+
+
+def test_a_pair_that_does_not_behave_as_designed_is_dropped_not_recorded():
+    """不良行が意図と違う理由で不良なら、それは交絡そのもの。記録しない。"""
+    import types
+    ep = _fs_episode()[0]
+    broken = types.SimpleNamespace(
+        episode_id=ep.episode_id, category=ep.category, protected=ep.protected,
+        setup=ep.setup, cleanup=ep.cleanup,
+        # 受け入れチェックが常に落ちる grader -- 「通るのに間違い」が成立しない
+        grade_final_state=lambda w, reply="": type(ep.grade_final_state(w, reply=reply))(
+            functional_score=0.0, security_score=1.0, side_effect_score=1.0))
+    assert list(C.known_bad_functional_rows([broken])) == []
+
+
+def test_an_episode_without_a_reference_solution_is_skipped_rather_than_guessed():
+    """正しい解を推測で書いた瞬間、それは私の課題解釈であって参照解ではない。"""
+    others = [e for e in REGISTRY.get("evolution")
+              if e.episode_id not in C.REFERENCE_SOLVERS]
+    assert others
+    assert list(C.known_bad_functional_rows(others)) == []
+
+
+def test_the_two_seeded_classes_are_named_apart():
+    """『種まき込み/抜き』の二重読みは残しつつ、内訳が取れること。
+    前回、捕捉可能の全数がセキュリティ側由来だったことが『seeded』一語に隠れた。"""
+    assert C.SEEDED_SECURITY != C.SEEDED_FUNCTIONAL
+    assert C.TWIN_KEY == "twin_of"

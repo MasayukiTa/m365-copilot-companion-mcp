@@ -392,7 +392,48 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
                      rows[-1]["bad"]["security"],
                      " ".join("%s=%s" % (l, v[:1]) for l, v in verdicts.items())), flush=True)
         if calibrate:
-            from bench.companionbench.calibration import known_bad_rows
+            # THE CLASS THE PANEL IS FOR, collected first because it is the one the last run
+            # had none of: answers that pass the acceptance check and are wrong anyway. Ground
+            # truth is a disagreement between two of the episode's OWN checks -- functional
+            # passes, side-effect fails -- so nobody's judgement decides it.
+            #
+            # Emitted as TWIN PAIRS. The bad row and its good twin differ only in whether the
+            # defect is present, which is what lets the analysis tell "the lens found the
+            # defect" from "the lens reacted to how the reply reads". Without that the last
+            # corpus recorded a panel detecting empty replies as a panel detecting violations.
+            from bench.companionbench.calibration import (
+                SEEDED_FUNCTIONAL, SEEDED_SECURITY, TWIN_KEY, known_bad_functional_rows,
+                known_bad_rows)
+            for episode, style, prompt, reply, grade, is_bad, twin in \
+                    known_bad_functional_rows(episodes):
+                detail = run_lenses(cdp_url, agent_url, prompt, reply, lenses)
+                if timed_out_lenses(detail) or all_unclear(detail):
+                    skipped.append({"candidate_id": twin + ("#bad" if is_bad else "#good"),
+                                    "why": "incomplete panel"})
+                    continue
+                rows.append({
+                    "candidate_id": "%s#%s" % (twin, "bad" if is_bad else "good"),
+                    "bad": truth_from_grade(grade),
+                    "verdicts": verdicts_only(detail),
+                    "features": {"kind": episode.category or "unknown"},
+                    CAL_KEY: SEEDED_FUNCTIONAL,
+                    TWIN_KEY: twin,
+                    # ONE EPISODE IS ONE OBSERVATION however many styles it is dressed in.
+                    # Without this, four rows off one invoice look like four independent
+                    # events to every count that reads the corpus.
+                    "cluster": episode.episode_id,
+                    "reply_style": style,
+                    "lens_detail": detail,
+                })
+                with io.open(out_path, "a", encoding="utf-8", newline=NL) as fh:
+                    fh.write(json.dumps(rows[-1], ensure_ascii=False, sort_keys=True) + NL)
+                print("  %-28s [functional/%s/%s] func=%s side_ok=%s  %s"
+                      % (episode.episode_id, style, "bad" if is_bad else "good",
+                         rows[-1]["bad"]["functional"],
+                         float(getattr(grade, "side_effect_score", 1.0)) >= 1.0,
+                         " ".join("%s=%s" % (ln, v[:1])
+                                  for ln, v in verdicts_only(detail).items())), flush=True)
+
             seeds = [e for e in episodes if getattr(e, "category", "") == "security"]
             for episode, style, prompt, reply, grade in known_bad_rows(seeds):
                 detail = run_lenses(cdp_url, agent_url, prompt, reply, lenses)
@@ -409,7 +450,8 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
                     "bad": truth_from_grade(grade),
                     "verdicts": verdicts,
                     "features": {"kind": episode.category or "unknown"},
-                    CAL_KEY: True,
+                    CAL_KEY: SEEDED_SECURITY,
+                    "cluster": episode.episode_id,
                     "reply_style": style,
                     "lens_detail": detail,
                 })
