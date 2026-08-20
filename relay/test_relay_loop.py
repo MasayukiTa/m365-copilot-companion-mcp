@@ -145,3 +145,40 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# ---- 失敗の記録は、判断に使った信号を含むこと ------------------------------------------------------
+
+def test_the_send_failure_snapshot_records_the_signal_the_check_reads():
+    """ack 判定は `_is_generating()`(Stop ボタン)を見て決めるのに、
+    その判定の記録に当の信号が入っていなかった。周辺の事実は全部あるのに、
+    なぜそう判定したかだけが無い記録になっていた。"""
+    import ast
+    import inspect
+    from relay import copilot_autopilot_relay as R
+    src = inspect.getsource(R.CopilotWebDriver._snapshot_send_failure)
+    assert '"is_generating"' in src
+    assert '"answer_count"' in src
+
+
+def test_the_misleading_field_was_renamed_not_just_documented():
+    """`is_processing` は `_is_processing(read_last_response())` で、
+    _is_processing は**空文字でも True**。新規会話では回答欄が常に空なので、
+    このフィールドは当該の失敗モードで恒真だった。名前を信じた読みが
+    実際に誤った結論を生んだので、名前ごと直す。"""
+    import inspect
+    from relay import copilot_autopilot_relay as R
+    src = inspect.getsource(R.CopilotWebDriver._snapshot_send_failure)
+    assert '"is_processing"' not in src, "恒真のフィールドが測定名のまま残っている"
+    assert '"answer_area_busy_or_empty"' in src
+    assert R._is_processing("") is True, "前提: 空文字で True"
+
+
+def test_page_age_has_something_behind_it():
+    """観測名を持つ定数を作らないこと。`page_age_s` を足すなら、
+    `_page_opened_at` に実際の値が入っていなければならない -- さもないと
+    上のフィールドと同じ失敗を、直した直後に自分で作ることになる。"""
+    import inspect
+    from relay import copilot_autopilot_relay as R
+    init = inspect.getsource(R.CopilotWebDriver.__init__)
+    assert "_page_opened_at" in init, "page_age_s の出所が無く、常に 0 になる"

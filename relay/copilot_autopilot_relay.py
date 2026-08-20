@@ -1060,6 +1060,11 @@ class CopilotWebDriver:
 
     def __init__(self, page):
         self.page = page
+        # WHEN THIS DRIVER TOOK THE PAGE. The send-failure snapshot reports the page's age
+        # because the editor-attach race predicts that younger pages fail more -- and a field
+        # with nothing behind it would be a constant wearing a measurement's name, which is
+        # the defect that made `is_processing` mislead a reading of these very snapshots.
+        self._page_opened_at = time.time()
         self._count_before = 0  # number of answer blocks before the current send
         # Observable proof for LOCAL_LOOP acceptance tests: the response-content-independent
         # path must leave this at zero for the whole run.
@@ -1367,7 +1372,23 @@ class CopilotWebDriver:
                     "visibility_state": _probe(_visibility_state),
                     "has_focus": _probe(_has_focus),
                 },
-                "is_processing": _probe(_is_processing_now),
+                # RENAMED FROM `is_processing`, which is what it was called while being read
+                # as "a turn is underway". It is not that: `_is_processing` returns True for
+                # empty text, and on a fresh conversation the answer area is always empty, so
+                # this field was permanently True in the one failure mode it looked like it
+                # explained. The name now says what it measures.
+                "answer_area_busy_or_empty": _probe(_is_processing_now),
+                # THE SIGNAL THE ACK CHECK ACTUALLY READS. It decides whether a send was
+                # acknowledged, and it was the one thing the record of that decision did not
+                # contain -- so a snapshot could show every surrounding fact and still not say
+                # why the check went the way it did.
+                "is_generating": _probe(lambda: self._is_generating()),
+                "answer_count": _probe(lambda: self._answers().count()),
+                # THE EDITOR-ATTACH RACE PREDICTS THAT YOUNGER PAGES FAIL MORE. Nothing here
+                # could test that, because nothing recorded how old the page was. Cheap to
+                # capture and it makes the hypothesis falsifiable from the log alone.
+                "page_age_s": _probe(lambda: round(time.time() - getattr(
+                    self, "_page_opened_at", time.time()), 1)),
                 "page_url": _probe(_page_url),
             }
 
