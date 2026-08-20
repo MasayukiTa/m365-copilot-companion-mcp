@@ -24,13 +24,14 @@ stdlib only; deterministic; no network; no BOM. frozen is imported READ-ONLY.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 from typing import Iterable
 
-from relay.selfimprove import frozen
+from relay.selfimprove import authority_ledger as ledger, frozen
 
 # Default applied-genome store, next to the other selfimprove state files.
 DEFAULT_STORE = os.path.join(os.path.dirname(__file__), "active_genome.json")
@@ -65,6 +66,41 @@ def _base_copy() -> dict:
     }
 
 
+# -- the ledger -------------------------------------------------------------------------------
+# Applying a genome changes what the running scaffold IS, and until now it left only the store
+# file behind: what the genome says, and nothing about when it was applied or why. The ledger
+# records the act. It does not authorise it and cannot prevent it -- see ledger.py's opening
+# note, which applies to every caller including this one.
+#
+# NEVER RAISES INTO THE CALLER. A ledger that can break an apply would be a new failure mode
+# bought for a record-keeping benefit, and the first unwritable home directory would take the
+# self-improvement loop down with it. A record that could not be written is worse than no
+# ledger only if somebody believes the ledger is complete, which is exactly what its own
+# contract says not to believe.
+def _store_digest(path):
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read().replace(b"\r\n", b"\n")).hexdigest()[:16]
+    except OSError:
+        return None
+
+
+def _record(event, *, reason, changed=None):
+    try:
+        ledger.append(event, reason=reason,
+                      # SELF-REPORTED, and the loop says so about itself. Nothing here can
+                      # verify who ran it, and a field that named a human would be a claim
+                      # this code is in no position to make.
+                      actor_claimed="relay.selfimprove.apply",
+                      authorization=os.environ.get("MCP_SELFIMPROVE_AUTHORIZATION", "")
+                                    or ledger.SELF_INITIATED,
+                      command="apply_genome/revert (in-process)",
+                      changed=changed)
+    except Exception:
+        pass
+
+
+
 def active_genome(store_path: str = DEFAULT_STORE) -> dict:
     """Return the currently-applied genome, or the empty base if no store exists yet.
 
@@ -90,12 +126,16 @@ def apply_genome(genome: dict, store_path: str = DEFAULT_STORE) -> dict:
     parent step (see module docstring TODO).
     """
     prev_path = store_path + ".prev"
+    before = _store_digest(store_path)
     if os.path.isfile(store_path):
         shutil.copyfile(store_path, prev_path)
     os.makedirs(os.path.dirname(store_path) or ".", exist_ok=True)
     with open(store_path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(genome, f, ensure_ascii=False, indent=2, sort_keys=True)
         f.write("\n")
+    _record(ledger.GENOME_APPLY,
+            reason=str(genome.get("note") or "no note on the genome"),
+            changed={store_path: {"before": before, "after": _store_digest(store_path)}})
     return genome
 
 
@@ -107,7 +147,10 @@ def revert(store_path: str = DEFAULT_STORE) -> bool:
     prev_path = store_path + ".prev"
     if not os.path.isfile(prev_path):
         return False
+    before = _store_digest(store_path)
     shutil.copyfile(prev_path, store_path)
+    _record(ledger.GENOME_REVERT, reason="one level of undo from %s" % prev_path,
+            changed={store_path: {"before": before, "after": _store_digest(store_path)}})
     return True
 
 

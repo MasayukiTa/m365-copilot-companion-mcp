@@ -66,6 +66,14 @@ _os.environ.setdefault(
     "MCP_GATE_DIR",
     _os.path.join(_tempfile.gettempdir(), "companion_gates_pytest_%d" % _os.getpid()))
 
+# Same reason, different file: relay.selfimprove.ledger appends to a hash-chained record in the
+# operator's home directory. A test run that wrote there would manufacture entries in the one
+# file whose entire value is that its contents were NOT manufactured -- and a chained ledger
+# cannot have those entries removed afterwards without breaking the chain.
+_os.environ.setdefault(
+    "MCP_SELFIMPROVE_LEDGER",
+    _os.path.join(_tempfile.gettempdir(), "selfimprove_ledger_pytest_%d.jsonl" % _os.getpid()))
+
 
 @pytest.fixture(autouse=True)
 def _no_leftover_kill_switch():
