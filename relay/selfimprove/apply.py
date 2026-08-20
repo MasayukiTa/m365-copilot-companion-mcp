@@ -12,13 +12,16 @@ What this module does:
 
 What this module deliberately does NOT do:
   - It does NOT edit relay/quality_cards.py (or any scaffold source). Applying a genome records
-    INTENT only; the scaffold actually READING the applied genome (merging knobs/cards into
-    quality_cards.py) is the DEFERRED parent step. A long measurement is currently re-importing
-    quality_cards.py, and editing it mid-run would corrupt that run.
+    INTENT; the scaffold READS that intent rather than having its source rewritten.
 
-    TODO(parent, post-measurement): wire quality_cards.py to read active_genome() so applied knobs
-    and card texts take effect. That merge is the parent's job AFTER the running measurement finishes
-    -- do not do it here.
+    DONE 2026-08-20, and this note is kept because the arrangement is easy to misread as the
+    old one. quality_cards.py now consults active_genome() through its own version table
+    (QUALITY_CARDS_VERSIONS: v1 is the built-in selection, v2 merges the applied genome), so
+    an applied `cards` field takes effect without anything editing a source file. Before that
+    the field had NO reader at all, which meant every A/B over card text ran the same program
+    twice and reported a p-value about noise.
+
+    `knobs` are read by whoever owns each knob, not from here.
 
 stdlib only; deterministic; no network; no BOM. frozen is imported READ-ONLY.
 """
