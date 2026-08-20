@@ -517,3 +517,39 @@ def test_the_revoke_docstring_does_not_promise_to_undo_the_code():
     doc = F.revoke_baseline.__doc__ or ""
     assert "NOT A CHANGE" in doc.upper()
     assert "version control" in doc
+
+
+def test_two_writers_cannot_interleave(tmp_path):
+    """再署名と取り消しはどちらもベースラインとアンカーの両方を書く。
+    片方だけ適用された対は、あとから誰にも診断できない唯一の状態。"""
+    bp = str(tmp_path / "b.json")
+    F.snapshot_baseline(F.REPO, bp)
+    with F._baseline_lock():
+        with pytest.raises(F.BaselineRefused) as exc:
+            with F._baseline_lock(timeout_s=0.2):
+                pass
+    assert "another process is writing" in str(exc.value)
+
+
+def test_the_loop_refuses_to_run_while_an_approval_is_withdrawn(tmp_path, monkeypatch):
+    """Fable の指摘: revoke 直後の自動ループ挙動は fail-safe のはずだが、
+    この経路は今日できたばかりで一度も踏んでいない。実際に踏む。
+
+    取り消すと凍結照合が破れる（それが狙い）。その状態で走行の事前条件が
+    通ってしまえば、承認を取り消しても自己改善は動き続けることになる。"""
+    from relay.selfimprove import scheduler as S
+    # 状態を**構成する**。いまたまたまツリーが漂流しているから通る、では
+    # 再署名した瞬間に落ちるテストになる（実際、最初の版がそうだった）。
+    # scheduler が実際に呼ぶのは F.frozen_intact。S 側に新しい属性を生やしても
+    # 誰も読まず、テストは周囲の状態で通ってしまう（最初の版がまさにそれだった）。
+    monkeypatch.setattr(F, "frozen_intact",
+                        lambda *a, **k: (False, ["relay/selfimprove/manifest.py"]))
+    broken = S.preconditions(budget_candidates=5, activate=False, level="B")
+    assert any("frozen" in r for r in broken), (
+        "凍結が破れているのに走行が拒否されていない: %s" % broken)
+
+    # 逆も見る。intact のときにこの理由が残っていたら、上の assert は
+    # 何も証明していない。
+    monkeypatch.setattr(F, "frozen_intact", lambda *a, **k: (True, []))
+    intact = S.preconditions(budget_candidates=5, activate=False, level="B")
+    assert not any("frozen" in r for r in intact), intact

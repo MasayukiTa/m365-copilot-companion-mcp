@@ -18,6 +18,7 @@ front, with zero or more lines appended).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -170,6 +171,42 @@ DELEGATION_EXCLUDED = (
 STANDING_DELEGATION = "standing-delegation"
 
 
+#: Held while the baseline is written or withdrawn. A self-improvement run verifies and may
+#: re-sign; a human may revoke from the dashboard at the same moment. Both write the baseline
+#: AND the anchor, and a half-applied pair is the one state nothing here can diagnose --
+#: `frozen_intact` would report a rewritten baseline and nobody would know which write lost.
+#: "Nothing is running when I press it" is an intention, not a guarantee.
+_BASELINE_LOCK = os.path.join(os.path.dirname(DEFAULT_BASELINE), ".baseline.lock")
+
+
+@contextlib.contextmanager
+def _baseline_lock(timeout_s: float = 20.0):
+    """Cross-process exclusive lock. O_CREAT|O_EXCL because this must behave the same on
+    Windows, and the critical section is three file writes long. Mirrors the same pattern in
+    ledger.py rather than introducing a second locking idiom."""
+    import time as _time
+    deadline = _time.time() + timeout_s
+    fd = None
+    while fd is None:
+        try:
+            fd = os.open(_BASELINE_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if _time.time() > deadline:
+                raise BaselineRefused(
+                    "another process is writing the baseline (%s). Re-signing and revoking "
+                    "both rewrite the baseline and its anchor, and interleaving them leaves a "
+                    "pair nothing can diagnose afterwards." % _BASELINE_LOCK)
+            _time.sleep(0.05)
+    try:
+        yield
+    finally:
+        os.close(fd)
+        try:
+            os.unlink(_BASELINE_LOCK)
+        except OSError:
+            pass
+
+
 def snapshot_baseline(repo_root: str = REPO, baseline_path: str = DEFAULT_BASELINE,
                       force: bool = False) -> dict:
     """Compute the frozen checksums and write them as the baseline json. Returns the baseline dict.
@@ -203,6 +240,11 @@ def snapshot_baseline(repo_root: str = REPO, baseline_path: str = DEFAULT_BASELI
     earlier) pin nothing at all while the verifier cheerfully reported "11 files match". It
     also made deletion a passing state: remove the grader, snapshot, MISSING == MISSING.
     """
+    with _baseline_lock():
+        return _snapshot_locked(repo_root, baseline_path, force)
+
+
+def _snapshot_locked(repo_root, baseline_path, force):
     sums = compute_checksums(repo_root)
     absent = sorted(rel for rel, h in sums.items() if h == MISSING)
     if absent:
@@ -395,6 +437,11 @@ def revoke_baseline(baseline_path: str = DEFAULT_BASELINE, *, reason: str = "",
     file beside the baseline is only consulted as a fallback, because anything able to
     overwrite the baseline can also delete the copy sitting next to it.
     """
+    with _baseline_lock():
+        return _revoke_locked(baseline_path, reason, authorization, ledger_path)
+
+
+def _revoke_locked(baseline_path, reason, authorization, ledger_path):
     record = last_rebless(ledger_path)
     previous = (record or {}).get("baseline_before")
     source = "ledger record seq=%s" % (record or {}).get("seq")

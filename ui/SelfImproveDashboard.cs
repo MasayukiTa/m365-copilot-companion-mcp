@@ -154,6 +154,42 @@ class SelfImproveDashboardWindow : Window
             ? "エージェントが自分の解決スキャフォルドをどう改善しているか（実タスクの完了率・A/Bテスト・採用履歴）"
             : "How the agent is improving its own solving scaffold — real-task completion, A/B tests, and what it kept.";
 
+        // authority section -- what changed what the system may become
+        if (k == "auth_sec") return ja ? "権限の履歴" : "Authority";
+        if (k == "auth_exp") return ja
+            ? "この系が「何になれるか」を変えた行為の記録。台帳は追記専用でハッシュ連鎖しているが、"
+              + "何も許可しないし、止めもしない。actor は自己申告で検証されていない。"
+            : "Acts that changed what this system may become. The ledger is append-only and "
+              + "chained; it authorises nothing and prevents nothing, and actor is self-reported.";
+        if (k == "auth_intact")   return ja ? "凍結セット照合" : "Frozen set";
+        if (k == "auth_ok")       return ja ? "一致" : "matches";
+        if (k == "auth_broken")   return ja ? "不一致" : "differs";
+        if (k == "auth_anchor")   return ja ? "アンカー" : "Anchor";
+        if (k == "auth_chain")    return ja ? "台帳の連結" : "Ledger links";
+        if (k == "auth_chain_ok") return ja ? "連続" : "contiguous";
+        if (k == "auth_verified_here") return ja
+            ? "この2つはこの画面が自分で計算している（python の自己申告ではない）。"
+              + "ただし各レコードの内容ハッシュまでは再計算していない — 連結と通し番号のみ。"
+            : "Both computed by this window, not reported by python. Record CONTENTS are not "
+              + "re-hashed here -- only the links and the sequence.";
+        if (k == "auth_rate")     return ja ? "直近7日の再署名" : "Re-signings, last 7d";
+        if (k == "auth_rate_hi")  return ja ? "平常より多い" : "above the usual";
+        if (k == "auth_none")     return ja ? "記録なし" : "no records";
+        if (k == "auth_revoke")   return ja ? "直前の再署名を取り消す" : "Revoke the last re-signing";
+        if (k == "auth_revoke_q") return ja
+            ? "直前の再署名を取り消します。\n\n戻すのは【承認】であって【コード】ではありません。"
+              + "ファイルは変わったままなので、直後に凍結セットは不一致になり、走行は止まります。"
+              + "それが狙いです。\n\n戻り先: "
+            : "Withdraw the last re-signing.\n\nThis undoes the APPROVAL, not the code. The files "
+              + "stay as they are, so the frozen set will differ immediately afterwards and runs "
+              + "will stop. That is the intent.\n\nRestoring: ";
+        if (k == "auth_revoke_t") return ja ? "最終確認" : "Final confirmation";
+        if (k == "auth_revoke_ok") return ja
+            ? "取り消しました。凍結セットが不一致になっているのは正常です。"
+            : "Revoked. The frozen set differing now is the expected state.";
+        if (k == "auth_revoke_no") return ja ? "取り消せませんでした" : "Could not revoke";
+        if (k == "auth_nothing")  return ja ? "取り消せる再署名がありません" : "No re-signing to withdraw";
+
         // no-data friendly message
         if (k == "nodata_title") return ja ? "まだデータがありません" : "No data yet";
         if (k == "nodata_body")  return ja
@@ -707,12 +743,291 @@ class SelfImproveDashboardWindow : Window
     void Render(Dictionary<string, object> state)
     {
         _body.Children.Clear();
+        _body.Children.Add(BuildAuthority());
         _body.Children.Add(BuildUsage(state));
         _body.Children.Add(BuildScorecard(state));
         _body.Children.Add(BuildAbHistory(state));
         _body.Children.Add(BuildBurnedLedger(state));
         _body.Children.Add(BuildPassTrend(state));
         _body.Children.Add(BuildArchive(state));
+    }
+
+    // ── AUTHORITY ───────────────────────────────────────────────────────────────
+    // What changed what this system may become, and the one way back.
+    //
+    // READ STRAIGHT FROM THE LEDGER AND THE BASELINE, not from the dashboard json. The json
+    // is written by the same python that performs these acts, and a component reporting that
+    // its own record is fine is self-report, not monitoring -- the moment worth watching is
+    // exactly the moment that component is misbehaving. The two checks below are computed
+    // here, by different code, from the files themselves.
+    //
+    // AGREEMENT WITH PYTHON WAS MEASURED, 2026-08-20, not assumed. Two implementations of one
+    // rule is a false-alarm generator unless they are actually compared: this logic was run
+    // standalone against the live repository and reported exactly what frozen_intact() did --
+    // the same single differing file, and the same anchor verdict. Re-check it after touching
+    // either side; a monitor that disagrees with the thing it monitors is worse than none.
+    //
+    // WHAT IS NOT CHECKED HERE, so the green does not claim more than it is: the per-record
+    // content hashes are not recomputed. Reproducing python's canonical JSON in C# means
+    // matching float formatting and non-ASCII escaping exactly, and getting that subtly wrong
+    // produces a monitor that cries "tampered" at an untouched ledger -- worse than a stated
+    // limit. Links and sequence are checked; contents are python's `verify()` to confirm.
+
+    static string LedgerPath()
+    {
+        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                            ".selfimprove_ledger.jsonl");
+    }
+
+    static string AnchorPath()
+    {
+        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                            ".selfimprove_frozen_anchor");
+    }
+
+    static string RepoRoot()
+    {
+        return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+    }
+
+    // sha256 with CRLF folded to LF -- the same normalisation python uses, and the reason it
+    // does: a Windows checkout materialises these files with CRLF and the raw bytes would
+    // differ from a baseline taken anywhere else.
+    static string Sha256Lf(string path)
+    {
+        try
+        {
+            byte[] raw = File.ReadAllBytes(path);
+            var outb = new List<byte>(raw.Length);
+            for (int i = 0; i < raw.Length; i++)
+            {
+                if (raw[i] == 0x0d && i + 1 < raw.Length && raw[i + 1] == 0x0a) continue;
+                outb.Add(raw[i]);
+            }
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            {
+                byte[] h = sha.ComputeHash(outb.ToArray());
+                var sb = new StringBuilder();
+                foreach (byte b in h) sb.Append(b.ToString("x2"));
+                return sb.ToString();
+            }
+        }
+        catch (Exception) { return null; }
+    }
+
+    List<Dictionary<string, object>> ReadLedger()
+    {
+        var rows = new List<Dictionary<string, object>>();
+        try
+        {
+            string p = LedgerPath();
+            if (!File.Exists(p)) return rows;
+            foreach (string line in File.ReadAllLines(p, Encoding.UTF8))
+            {
+                string t = line.Trim();
+                if (t.Length == 0) continue;
+                try { rows.Add((Dictionary<string, object>)_js.DeserializeObject(t)); }
+                catch (Exception) { }
+            }
+        }
+        catch (Exception) { }
+        return rows;
+    }
+
+    // links + sequence only. See the note above the section.
+    static bool LedgerLinksHold(List<Dictionary<string, object>> rows, out string problem)
+    {
+        problem = null;
+        string prev = null;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            object seq, ph, h;
+            rows[i].TryGetValue("seq", out seq);
+            rows[i].TryGetValue("prev_hash", out ph);
+            rows[i].TryGetValue("hash", out h);
+            if (seq == null || Convert.ToInt32(seq) != i)
+            { problem = "seq " + (seq == null ? "?" : seq.ToString()) + " != " + i; return false; }
+            string phs = ph == null ? null : ph.ToString();
+            if (phs != prev) { problem = "link breaks at seq " + i; return false; }
+            prev = h == null ? null : h.ToString();
+        }
+        return true;
+    }
+
+    // the frozen set, recomputed here from the baseline json and the files on disk
+    bool FrozenMatches(out int checkedCount, out List<string> differing, out bool anchorOk)
+    {
+        checkedCount = 0; differing = new List<string>(); anchorOk = false;
+        try
+        {
+            string root = RepoRoot();
+            string bp = Path.Combine(root, "relay", "selfimprove", "frozen_baseline.json");
+            if (!File.Exists(bp)) { differing.Add("NO_BASELINE"); return false; }
+            var doc = (Dictionary<string, object>)_js.DeserializeObject(
+                File.ReadAllText(bp, Encoding.UTF8));
+            object sumsObj; doc.TryGetValue("checksums", out sumsObj);
+            var sums = sumsObj as Dictionary<string, object>;
+            if (sums == null) { differing.Add("NO_CHECKSUMS"); return false; }
+            foreach (var kv in sums)
+            {
+                checkedCount++;
+                string actual = Sha256Lf(Path.Combine(root, kv.Key.Replace('/', Path.DirectorySeparatorChar)));
+                if (actual == null || actual != Convert.ToString(kv.Value)) differing.Add(kv.Key);
+            }
+            string anchorFile = AnchorPath();
+            if (File.Exists(anchorFile))
+                anchorOk = File.ReadAllText(anchorFile, Encoding.UTF8).Trim() == Sha256Lf(bp);
+        }
+        catch (Exception) { differing.Add("UNREADABLE"); }
+        return differing.Count == 0;
+    }
+
+    UIElement BuildAuthority()
+    {
+        var card = SectionCard("auth_sec", "auth_exp");
+        var col  = (StackPanel)card.Child;
+
+        var rows = ReadLedger();
+        int nChecked; List<string> differing; bool anchorOk;
+        bool intact = FrozenMatches(out nChecked, out differing, out anchorOk);
+        string chainProblem; bool linksOk = LedgerLinksHold(rows, out chainProblem);
+
+        // -- current state, always visible. An event list alone buries the one fact that
+        //    decides whether anything else on this screen can be trusted.
+        var head = new WrapPanel(); head.Margin = new Thickness(0, 10, 0, 0);
+        head.Children.Add(Pill(T("auth_intact") + ": " + (intact ? T("auth_ok") : T("auth_broken"))
+                               + " (" + nChecked + ")", intact ? "good" : "bad"));
+        head.Children.Add(Pill(T("auth_anchor") + ": " + (anchorOk ? T("auth_ok") : T("auth_broken")),
+                               anchorOk ? "good" : "bad"));
+        head.Children.Add(Pill(T("auth_chain") + ": "
+                               + (linksOk ? T("auth_chain_ok") : chainProblem),
+                               linksOk ? "good" : "bad"));
+        col.Children.Add(head);
+        if (!intact && differing.Count > 0)
+            col.Children.Add(MuteRow(string.Join(", ", differing.ToArray())));
+        col.Children.Add(MuteRow(T("auth_verified_here")));
+
+        // -- rate. A bare number is not monitoring; it needs a usual level to sit against.
+        double now = (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds;
+        int last7 = 0; int prior = 0;
+        foreach (var r in rows)
+        {
+            object ev, ts;
+            r.TryGetValue("event", out ev); r.TryGetValue("ts", out ts);
+            if (ev == null || Convert.ToString(ev) != "rebless" || ts == null) continue;
+            double age = now - Convert.ToDouble(ts);
+            if (age <= 7 * 86400) last7++; else if (age <= 35 * 86400) prior++;
+        }
+        double usual = prior / 4.0;
+        bool hot = last7 > Math.Max(2.0, usual * 3.0);
+        var rateRow = new WrapPanel(); rateRow.Margin = new Thickness(0, 8, 0, 0);
+        rateRow.Children.Add(Pill(T("auth_rate") + ": " + last7
+                                  + (usual > 0 ? "  (~" + usual.ToString("0.#") + ")" : ""),
+                                  hot ? "warn" : "muted"));
+        if (hot) rateRow.Children.Add(Pill(T("auth_rate_hi"), "warn"));
+        col.Children.Add(rateRow);
+
+        // -- the events themselves, newest first, with the actor and what was touched
+        int shown = 0;
+        for (int i = rows.Count - 1; i >= 0 && shown < 8; i--)
+        {
+            object ev; rows[i].TryGetValue("event", out ev);
+            string kind = Convert.ToString(ev);
+            if (kind == "genesis") continue;
+            object actor, reason, changed, auth;
+            rows[i].TryGetValue("actor_claimed", out actor);
+            rows[i].TryGetValue("reason", out reason);
+            rows[i].TryGetValue("changed", out changed);
+            rows[i].TryGetValue("authorization", out auth);
+            var files = changed as Dictionary<string, object>;
+            string scope = files == null || files.Count == 0
+                ? "" : "  [" + string.Join(", ", new List<string>(files.Keys).ToArray()) + "]";
+            var line = new TextBlock();
+            line.Text = kind + "  " + Convert.ToString(actor) + scope;
+            line.Foreground = Fg; line.FontSize = Theme.FsMeta;
+            line.TextWrapping = TextWrapping.Wrap; line.Margin = new Thickness(0, 8, 0, 0);
+            col.Children.Add(line);
+            col.Children.Add(MuteRow(Convert.ToString(reason)));
+            if (auth != null && Convert.ToString(auth) != "self-initiated")
+                col.Children.Add(MuteRow("“" + Convert.ToString(auth) + "”"));
+            shown++;
+        }
+        if (shown == 0) col.Children.Add(MuteRow(T("auth_none")));
+
+        // -- the way back. One step, repeatable. Jumping to an arbitrary earlier point would
+        //    be CHOOSING a state to install, and choosing is what promotion is; withdrawing
+        //    the last act is the only move that is purely an undo.
+        var btn = new Button();
+        btn.Content = T("auth_revoke");
+        btn.Padding = new Thickness(16, 6, 16, 6);
+        btn.Margin  = new Thickness(0, 14, 0, 0);
+        btn.HorizontalAlignment = HorizontalAlignment.Left;
+        btn.Click += delegate { RevokeLastRebless(); };
+        col.Children.Add(btn);
+        return card;
+    }
+
+    void RevokeLastRebless()
+    {
+        // the landing point, named before the click is confirmed
+        string landing = null;
+        var rows = ReadLedger();
+        for (int i = rows.Count - 1; i >= 0; i--)
+        {
+            object ev; rows[i].TryGetValue("event", out ev);
+            if (Convert.ToString(ev) != "rebless") continue;
+            object reason, seq;
+            rows[i].TryGetValue("reason", out reason); rows[i].TryGetValue("seq", out seq);
+            landing = "seq=" + Convert.ToString(seq) + "  " + Convert.ToString(reason);
+            break;
+        }
+        if (landing == null)
+        {
+            MessageBox.Show(this, T("auth_nothing"), T("auth_revoke_t"),
+                            MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+        // The same shape the cockpit uses for a high-impact action. Not a third dialect of
+        // confirmation -- one system, one way of asking.
+        if (MessageBox.Show(this, T("auth_revoke_q") + landing, T("auth_revoke_t"),
+                            MessageBoxButton.YesNo, MessageBoxImage.Warning,
+                            MessageBoxResult.No) != MessageBoxResult.Yes) return;
+
+        string root   = RepoRoot();
+        string venvPy = Path.Combine(root, ".venv", "Scripts", "python.exe");
+        string pyExe  = File.Exists(venvPy) ? venvPy : "python";
+        var psi = new ProcessStartInfo();
+        psi.FileName  = pyExe;
+        psi.Arguments = "-m relay.selfimprove.frozen --revoke --reason "
+                      + "\"withdrawn from the self-improvement dashboard\"";
+        psi.WorkingDirectory       = root;
+        psi.UseShellExecute        = false;
+        psi.CreateNoWindow         = true;
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError  = true;
+        try
+        {
+            var proc = new Process(); proc.StartInfo = psi; proc.Start();
+            // WAITED FOR, unlike the feed regeneration. A fire-and-forget revoke that died
+            // would leave no trace at all: the ledger records successes, so a failed attempt
+            // is invisible unless this window keeps the exit code and the stderr.
+            string so = proc.StandardOutput.ReadToEnd();
+            string se = proc.StandardError.ReadToEnd();
+            proc.WaitForExit(60000);
+            if (proc.ExitCode == 0)
+                MessageBox.Show(this, T("auth_revoke_ok") + "\n\n" + so, T("auth_revoke_t"),
+                                MessageBoxButton.OK, MessageBoxImage.Information);
+            else
+                MessageBox.Show(this, T("auth_revoke_no") + " (exit " + proc.ExitCode + ")\n\n"
+                                + so + "\n" + se, T("auth_revoke_t"),
+                                MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, T("auth_revoke_no") + "\n\n" + ex.Message,
+                            T("auth_revoke_t"), MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        ForceRender();
     }
 
     // ── (0) LIVE USAGE — general-user lens ───────────────────────────────────────
