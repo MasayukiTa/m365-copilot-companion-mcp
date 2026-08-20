@@ -125,6 +125,17 @@ def require_room_for_lenses():
             % avail_phys_mb())
 
 
+
+#: UPHELD and UNCLEAR both begin with U, and the progress line used the first letter -- so a
+#: run where every reviewer agreed the work was sound looked identical to one where no
+#: reviewer answered at all. It misled me twice on this very corpus before I read the file.
+_VERDICT_CODE = {"REFUTED": "REF", "UPHELD": "UPH", "UNCLEAR": "unk",
+                 "INCONCLUSIVE": "inc"}
+
+
+def code(verdict) -> str:
+    return _VERDICT_CODE.get(verdict, str(verdict)[:3])
+
 def truth_from_grade(grade) -> dict:
     """Ground truth in the grader's shape. Absent evidence stays absent.
 
@@ -428,7 +439,7 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
                 print("  %-28s functional=%s security=%s  %s"
                       % (episode.episode_id, rows[-1]["bad"]["functional"],
                          rows[-1]["bad"]["security"],
-                         " ".join("%s=%s" % (l, v[:1]) for l, v in verdicts.items())), flush=True)
+                         " ".join("%s=%s" % (l, code(v)) for l, v in verdicts.items())), flush=True)
             finally:
                 # THE WORKDIR SURVIVES UNTIL THE REVIEWERS HAVE SEEN IT. It used to be removed
                 # immediately after grading, twelve lines before the lenses were asked to
@@ -487,7 +498,7 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
                       % (episode.episode_id, style, "bad" if is_bad else "good",
                          rows[-1]["bad"]["functional"],
                          float(getattr(grade, "side_effect_score", 1.0)) >= 1.0,
-                         " ".join("%s=%s" % (ln, v[:1])
+                         " ".join("%s=%s" % (ln, code(v))
                                   for ln, v in verdicts_only(detail).items())), flush=True)
 
             seeds = [e for e in episodes if getattr(e, "category", "") == "security"]
@@ -515,7 +526,7 @@ def collect(*, cdp_url, agent_url, episodes, agent, out_path, lenses=None,
                     fh.write(json.dumps(rows[-1], ensure_ascii=False, sort_keys=True) + NL)
                 print("  %-28s [calibration/%s] security=%s  %s"
                       % (episode.episode_id, style, rows[-1]["bad"]["security"],
-                         " ".join("%s=%s" % (ln, v[:1]) for ln, v in verdicts.items())),
+                         " ".join("%s=%s" % (ln, code(v)) for ln, v in verdicts.items())),
                       flush=True)
     return {"rows": rows, "skipped": skipped, "lenses": lenses}
 
