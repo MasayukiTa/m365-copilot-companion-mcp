@@ -18,6 +18,45 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _no_writes_to_the_live_records(tmp_path_factory, monkeypatch):
+    """Autouse for every test in the repo: point the shared operational records at tmp.
+
+    THE SAME DEFECT, THREE TIMES IN ONE DAY. A new append-only file appears, the tests that
+    exercise the code around it have no reason to know it is shared, and they fill it: the
+    routing record got `route_closed` events for a route that never closed, and the refusal log
+    got 117 lines from 203.0.113.7 -- a documentation address no backend has ever called from.
+    Both had to be wiped, and a wipe loses whatever real history was in there too.
+
+    Per-file fixtures fixed each one after the fact. This is the layer that makes the NEXT one
+    inert by construction, in the same place and for the same reason as the toast stub below:
+    a test should not be able to write to an operator's records by accident.
+
+    Tests that are ABOUT these files redirect them again themselves, which is harmless -- and
+    they must keep doing so, because this fixture gives the whole session ONE directory and
+    two tests in a row would otherwise see each other's lines.
+    """
+    base = tmp_path_factory.mktemp("live_records")
+    try:
+        from pathlib import Path
+
+        import tools.lock_state as lock_state
+        monkeypatch.setattr(lock_state, "_LOG_FILE", Path(str(base / "lock_refusals.jsonl")),
+                            raising=False)
+        monkeypatch.setattr(lock_state, "_STATE_FILE", Path(str(base / "lock_state.json")),
+                            raising=False)
+    except Exception:
+        pass
+
+    try:
+        import relay.socket_route as socket_route
+        monkeypatch.setattr(socket_route, "DEFAULT_LOG", str(base / "socket_route.jsonl"),
+                            raising=False)
+    except Exception:
+        pass
+    yield base
+
+
+@pytest.fixture(autouse=True)
 def _no_desktop_toasts(monkeypatch):
     """Autouse for every test in the repo: stub known notify entry points."""
     calls = []
