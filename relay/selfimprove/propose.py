@@ -109,7 +109,15 @@ def propose_candidates(
             continue
         if archive.get(gid) is not None:  # (c) already tried
             continue
-        if parent_gid is not None and gid == parent_gid:  # (d) no-op mutation
+        # (d) NO-OP MUTATION, DECIDED ON THE HARNESS AND NOT ON THE ID.
+        #
+        # This compared genome ids, and two different ids can produce the same program: a
+        # genome that names a parameter at its default value has its own id and materialises
+        # to a manifest byte-identical to the one it "changed". Measured: genome ids
+        # 7a9b1bb314fe and 21a42e331dc2 both give harness 942eb26c19d2f138a688. Such a
+        # candidate passed this filter, went to the evaluator, and was scored as an
+        # experiment whose two arms were the same program.
+        if parent_gid is not None and _same_program(cand, parent_entry):
             continue
         if gid in batch_ids:              # (e) intra-batch duplicate
             continue
@@ -185,3 +193,19 @@ def mutation_generator(real_misses, parent: dict | None, n: int) -> list[dict]:
             "note": "mutation_generator placeholder: toggle %s + card %s" % (knob, card_name),
         })
     return out
+
+
+def _same_program(candidate, parent_entry, base=None):
+    """True iff the candidate materialises to the harness its parent already is.
+
+    Falls back to id equality when the parent's genome is not available -- a weaker check, but
+    the alternative is admitting everything when the archive row is thin.
+    """
+    from relay.selfimprove import manifest as M
+    parent_genome = (parent_entry or {}).get("genome")
+    if not isinstance(parent_genome, dict):
+        return False
+    try:
+        return M.same_program(candidate, parent_genome, base)
+    except Exception:
+        return False

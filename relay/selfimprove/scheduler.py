@@ -53,8 +53,8 @@ class Blocked(RuntimeError):
     """Raised when a scheduled run must not start, with the reason it must not."""
 
 
-def preconditions(*, recent_decisions=None, lock_path=None, activate=False,
-                  operator_approved_activation=False, budget_candidates=None,
+def preconditions(*, recent_decisions=None, lineage_decisions=None, lock_path=None,
+                  activate=False, operator_approved_activation=False, budget_candidates=None,
                   baseline_path=None, level="B", plateau_k=5) -> list:
     """Every reason this run should not start. Empty means it may.
 
@@ -127,8 +127,19 @@ def preconditions(*, recent_decisions=None, lock_path=None, activate=False,
         # neither reads as a rejection, so an adapter using the wrong spelling makes EVERY
         # decision look failed -- and the plateau then fires on five consecutive KEEPs, which
         # is a precondition that blocks the schedule permanently and looks like a finding.
+        #
+        # TWO POPULATIONS, NOT ONE. The health check above reads every recent decision,
+        # because an INFRA_ABORT is a property of the instrument and is a reason not to run
+        # tonight whichever line the run would follow. The plateau reads ONE LINEAGE, because
+        # "has this direction stopped paying" stops meaning anything the moment a second
+        # branch exists: a KEEP on branch B would reset the plateau for branch A, and the loop
+        # would keep spending nights on a line that has failed every time.
+        #
+        # Falls back to the flat list when no lineage is supplied, which is the single-branch
+        # world and the behaviour every existing caller had.
         history = [{"kept": (d.get("state") or "").upper() == "KEEP"}
-                   for d in recent_decisions]
+                   for d in (lineage_decisions if lineage_decisions is not None
+                             else recent_decisions)]
         if POL.plateaued(history, plateau_k):
             reasons.append(
                 "no candidate has passed its gate in the last %d decisions; a scheduled loop "
@@ -362,14 +373,23 @@ def nightly(*, budget_candidates=5, activate=False, operator_approved_activation
     # against the adjacent key. Two things died from it at once: `plateaued` saw nothing
     # KEEP and fired on any archive with five rows including five KEEPs, and `HF.observe`
     # counted zero of every state so "the harness is unwell" could never fire either.
-    decisions = [{"state": (e.get("gate_verdict") or "").upper()} for e in archive.all()][-20:]
+    def _states(entries):
+        return [{"state": (e.get("gate_verdict") or "").upper()} for e in entries]
+
+    # GLOBAL: every recent decision, for "is the instrument well enough to run".
+    decisions = _states(archive.all())[-20:]
+    # SCOPED: the line the loop is actually on, for "has this direction stopped paying". The
+    # tip is the most recent row -- the branch the last night extended.
+    tip = archive.tip()
+    lineage_decisions = _states(archive.lineage((tip or {}).get("id", "")))[-20:] or None
 
     # `baseline_path` REACHES THE PRECONDITION, NOT ONLY THE TRIPWIRE. It was forwarded only
     # to `tripwires_after`, so a caller with a custom baseline had the DEFAULT frozen set
     # checked before the run and its own checked after -- a corrupt custom baseline burned the
     # whole night and then fired frozen_changed, which is the exact waste the precondition
     # exists to prevent, and a corrupt default blocked a run that was never going to use it.
-    reasons = preconditions(recent_decisions=decisions, lock_path=lock_path,
+    reasons = preconditions(recent_decisions=decisions,
+                            lineage_decisions=lineage_decisions, lock_path=lock_path,
                             activate=activate,
                             operator_approved_activation=operator_approved_activation,
                             budget_candidates=budget_candidates,

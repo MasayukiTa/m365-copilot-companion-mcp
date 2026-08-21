@@ -269,6 +269,40 @@ class Archive:
     def _is_accepted(entry) -> bool:
         return str(entry.get("gate_verdict") or "") in ("KEEP", "keep")
 
+    def lineage(self, tip_id: str) -> list:
+        """The chain from the root down to `tip_id`, oldest first. Empty if the tip is unknown.
+
+        WHY A LINEAGE AND NOT THE WHOLE ARCHIVE
+
+        `plateaued` asks "has this DIRECTION stopped paying". Fed the flat archive, it answers
+        a different question the moment a second branch exists: one branch's KEEP resets the
+        plateau for a branch that has been failing for weeks, and the loop keeps spending
+        nights on it. The archive was built to branch -- that is the first thing its module
+        docstring says -- so the statistic that decides whether to keep going has to be scoped
+        to the line being pursued.
+
+        Health is deliberately NOT scoped this way. An INFRA_ABORT is a property of the
+        instrument, not of the branch it happened on, and it is a reason not to run tonight
+        whichever line the run would have followed.
+        """
+        by_id = {e.get("id"): e for e in self._entries if e.get("id")}
+        chain, seen = [], set()
+        cur = by_id.get(tip_id)
+        while cur is not None:
+            cur_id = cur.get("id")
+            if cur_id in seen:          # a cycle in recorded lineage; stop rather than spin
+                break
+            seen.add(cur_id)
+            chain.append(cur)
+            parent = cur.get("genome", {}).get("parent_id") or cur.get("parent_id")
+            cur = by_id.get(parent)
+        chain.reverse()
+        return chain
+
+    def tip(self):
+        """The most recently appended entry, or None. The line the loop is currently on."""
+        return self._entries[-1] if self._entries else None
+
     def _unvalidated_depth(self, entry) -> int:
         """How many unaccepted steps sit between this row and its nearest KEEP ancestor."""
         by_id = {e.get("id"): e for e in self._entries if e.get("id")}

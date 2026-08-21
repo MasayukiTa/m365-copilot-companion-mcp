@@ -311,3 +311,62 @@ def diff(a: dict, b: dict) -> dict:
             if before != after:
                 out["%s.%s" % (section, key)] = (before, after)
     return out
+
+
+def materialize(genome, base=None):
+    """Turn a genome into the harness it actually produces: (manifest, harness_id).
+
+    WHY THIS IS IN THE CONSTITUTION AND NOT A HELPER SOMEWHERE
+
+    Two genomes can be different objects with different ids and produce the SAME PROGRAM. A
+    genome that names a parameter at its default value -- {"parameters": {"max_retries": 10}}
+    against a base whose max_retries is already 10 -- has its own genome_id and materialises
+    to a manifest byte-identical to the base's. Measured, not argued: genome_id 7a9b1bb314fe
+    and 21a42e331dc2 both give harness_id 942eb26c19d2f138a688.
+
+    Every place that asks "are these two the same?" has to ask it here. Asking it of genome ids
+    lets an A/A comparison through wearing two names, which is the one thing an experiment may
+    never be, and it is the defect this repository has now found in five separate components.
+    """
+    manifest = apply_genome(base or base_manifest(), genome or {})
+    return manifest, harness_id(manifest)
+
+
+#: The only genome keys a manifest models. Anything else -- the archive's `knobs`/`cards`
+#: scaffold vocabulary, for instance -- is invisible here.
+MANIFEST_KEYS = ("components", "parameters")
+
+#: Keys that carry lineage or prose rather than behaviour, and so do not make a genome
+#: unrepresentable.
+INERT_KEYS = ("parent_id", "note", "id")
+
+
+def represented_by_manifest(genome) -> bool:
+    """True iff everything this genome can change is something a manifest models.
+
+    THE ANSWER FROM `same_program` IS ONLY MEANINGFUL WHEN THIS IS TRUE.
+
+    `apply_genome` reads `components` and `parameters` and nothing else, so two genomes that
+    differ ONLY in `cards` -- the archive's scaffold vocabulary -- materialise to the same
+    manifest while being genuinely different candidates. Asking `same_program` about them
+    returns True and means "the manifest cannot see the difference", not "there is none".
+
+    Found by measurement, not by reading: wiring same_program into the proposer's no-op filter
+    without this guard dropped EVERY candidate in two existing tests, real mutations included,
+    because their genomes speak the scaffold vocabulary.
+    """
+    if not isinstance(genome, dict):
+        return False
+    return all(k in MANIFEST_KEYS or k in INERT_KEYS for k in genome)
+
+
+def same_program(genome_a, genome_b, base=None) -> bool:
+    """True iff both genomes produce the same harness AND the manifest can see them both.
+
+    Returns False when either genome carries something the manifest does not model: "I cannot
+    tell" must not be reported as "they are the same", because the caller uses this to DROP a
+    candidate, and a false positive there silently empties the proposal.
+    """
+    if not (represented_by_manifest(genome_a) and represented_by_manifest(genome_b)):
+        return False
+    return materialize(genome_a, base)[1] == materialize(genome_b, base)[1]
