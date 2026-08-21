@@ -69,7 +69,7 @@ class SocketRoute:
     def __init__(self, *, capture_fn=None, connect_fn=None, enabled=None,
                  max_consecutive=MAX_CONSECUTIVE, max_fallbacks=MAX_FALLBACKS,
                  refresh_margin_s=REFRESH_MARGIN_S, now=time.time, log=None,
-                 log_path=DEFAULT_LOG):
+                 log_path=None):
         self.enabled = ENABLED if enabled is None else bool(enabled)
         self._capture_fn = capture_fn
         self._connect_fn = connect_fn
@@ -79,7 +79,11 @@ class SocketRoute:
         #: classifier that is supposed to predict which requests need a tab has to be built
         #: from what actually fell back -- so those lines outlive the process or they never
         #: become training data at all.
-        self.log_path = log_path
+        #: RESOLVED HERE, NOT IN THE SIGNATURE. A default evaluated at import time cannot be
+        #: redirected, and the first thing that needed redirecting was the test suite -- which
+        #: was writing `route_closed` lines into the live training data and putting three
+        #: events into a record that describes a route that never closed.
+        self.log_path = DEFAULT_LOG if log_path is None else log_path
         self.max_consecutive = int(max_consecutive)
         self.max_fallbacks = int(max_fallbacks)
         self.refresh_margin_s = float(refresh_margin_s)

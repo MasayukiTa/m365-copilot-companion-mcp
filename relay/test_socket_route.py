@@ -6,7 +6,24 @@
 import pytest
 
 from relay import relay_fleet as rf
+from relay import socket_route as _SR
 from relay.socket_route import SocketRoute
+
+#: The real default, read at import time -- before the autouse fixture below redirects it.
+#: The one test that must check the SHIPPED path cannot read the patched one.
+REAL_DEFAULT_LOG = _SR.DEFAULT_LOG
+
+
+@pytest.fixture(autouse=True)
+def _never_write_the_real_record(tmp_path, monkeypatch):
+    """どのテストも本番の記録ファイルに触らせない。
+
+    触れていた。close_route が記録を始めた瞬間、テスト由来の route_closed が
+    .fleet/socket_route.jsonl に混ざり、『閉じていない経路が3回閉じた』という
+    記録になった。学習データに合成行が混ざるのは、静かに間違いを教える。
+    """
+    from relay import socket_route as SR
+    monkeypatch.setattr(SR, "DEFAULT_LOG", str(tmp_path / "isolated.jsonl"))
 
 
 class _Tpl:
@@ -424,9 +441,8 @@ def test_closing_the_route_is_itself_recorded(tmp_path):
 def test_the_default_record_goes_somewhere_git_does_not_publish():
     """記録には目標文が入る。目標文は利用者の仕事であって、公開するものではない。"""
     import subprocess
-    from relay import socket_route as SR
-    assert ".fleet" in SR.DEFAULT_LOG.replace("\\", "/")
-    r = subprocess.run(["git", "check-ignore", "-q", SR.DEFAULT_LOG],
+    assert ".fleet" in REAL_DEFAULT_LOG.replace("\\", "/")
+    r = subprocess.run(["git", "check-ignore", "-q", REAL_DEFAULT_LOG],
                        capture_output=True)
     assert r.returncode == 0, "DEFAULT_LOG is not gitignored"
 
@@ -488,3 +504,12 @@ def test_a_long_goal_is_truncated_by_the_caller_not_by_the_record(monkeypatch, t
     w.socket, w.drv, w.outcome, w.status = True, _FakeDrv(), "DONE", "done"
     w.close()
     assert len(next(x for x in _lines(tmp_path) if x["event"] == "worker_done")["goal"]) == 600
+
+
+def test_no_test_in_this_file_can_reach_the_real_record():
+    """上の autouse fixture が効いていることを、明示的に1本で見張る。
+    効かなくなっても他のテストは緑のままなので、これが唯一の警報になる。"""
+    from relay import socket_route as SR
+    r = SocketRoute(enabled=True, connect_fn=object())
+    assert ".fleet" not in r.log_path.replace("\\", "/")
+    assert r.log_path == SR.DEFAULT_LOG
