@@ -176,3 +176,16 @@ def test_one_real_difference_is_enough_even_if_another_component_is_inert():
     src = inspect.getsource(C.refusals)
     assert "any_real" in src
     assert "not any_real" in src
+
+
+def test_a_run_that_cannot_record_turns_is_refused_before_it_starts():
+    """`worker_done` は経路が有効なときしか書かれない。両腕タブの走行は
+    数えるべき行を1つも残さないまま、20分間まったく正常に見える。
+    監査文書にその注意を書いた本人が、その直後にその走行を起動して30分待った。"""
+    reasons = PE.preflight(free_mb=8000.0, calibrated=1.0, observable_recorded=False)
+    assert any("worker_done" in r for r in reasons), reasons
+    assert any("both arms on tabs" in r for r in reasons), reasons
+
+
+def test_a_recordable_and_calibrated_run_is_allowed():
+    assert PE.preflight(free_mb=8000.0, calibrated=1.0, observable_recorded=True) == []

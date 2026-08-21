@@ -153,6 +153,11 @@ def main():
                                      candidate_first=candidate_first,
                                      warmup="--warmup" in sys.argv,
                                      null_arm="--null" in sys.argv,
+                                     # BOTH ARMS ON THE ROUTE. Needed whenever the observable
+                                     # lives in `worker_done` rows, which socket_route.record
+                                     # writes only while the route is enabled -- a tabs-only
+                                     # null pass records nothing and looks normal doing it.
+                                     control_socket="--socket-both" in sys.argv,
                                      transcript_dir=os.path.join(RESULTS, "tx", exp))
     t0 = time.time()
     out = evaluate(candidate, exp)

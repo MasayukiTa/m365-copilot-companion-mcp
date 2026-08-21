@@ -64,9 +64,23 @@ class NotCalibrated(RuntimeError):
     """A verdict was asked for before the instrument had a measured noise floor."""
 
 
-def preflight(*, free_mb, calibrated=None) -> list:
-    """Reasons this comparison must not run. Empty means it may."""
+def preflight(*, free_mb, calibrated=None, observable_recorded=True) -> list:
+    """Reasons this comparison must not run. Empty means it may.
+
+    `observable_recorded` is the one this instrument needs that the memory one does not.
+    `worker_done` rows -- where turns live -- are written by `socket_route.record`, which is a
+    NO-OP while the route is disabled. A run with both arms on tabs therefore produces a
+    complete, ordinary-looking result with zero rows to count, and the only way to find out is
+    to wait for it. Learned by waiting thirty minutes for exactly that, after writing the
+    warning down in the coordinate audit and then launching the run anyway.
+    """
     reasons = []
+    if not observable_recorded:
+        reasons.append(
+            "turns are read from `worker_done` rows, and those are written only while the "
+            "socket route is enabled -- a run with both arms on tabs records nothing to count "
+            "and looks entirely normal for the twenty minutes it takes to find out. Enable the "
+            "route on both arms, or measure a different observable.")
     if free_mb is not None and free_mb < MIN_FREE_MB:
         reasons.append("%.0f MB free, floor %.0f (the operator's setting for this machine)"
                        % (free_mb, MIN_FREE_MB))
