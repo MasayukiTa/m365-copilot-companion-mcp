@@ -297,6 +297,22 @@ def briefing_path(ledger_path=None) -> str:
     return os.path.join(base, "selfimprove_last_act.txt")
 
 
+
+def _when(record) -> str:
+    """The record's timestamp as local time, or "(no timestamp)" -- never blank.
+
+    A blank field reads as "nothing to say here". A record that cannot say when it happened
+    has to say THAT, or the reader supplies the missing answer themselves.
+    """
+    ts = record.get("ts")
+    if not ts:
+        return "(no timestamp)"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts)))
+    except Exception:
+        return str(ts)
+
+
 def _write_briefing(record, title, body) -> str:
     """Write what happened and what to do about it, and return a file:/// URI for the toast.
 
@@ -315,7 +331,12 @@ def _write_briefing(record, title, body) -> str:
             title,
             "=" * len(title),
             "",
-            "when          : %s" % record.get("at", ""),
+            # `ts`, NOT `at`. `append` writes `ts` as a unix float and no record has ever
+            # carried `at`, so this line rendered blank -- an audit record of a change to the
+            # graders, with the one field that says WHEN it happened missing. It reached the
+            # operator that way. Rendered as local time here because the reader is a person
+            # deciding whether they recognise the act, not a program.
+            "when          : %s" % _when(record),
             "event         : %s" % record.get("event", ""),
             "files affected: %s" % (", ".join(changed) or "-"),
             "reason        : %s" % (record.get("reason") or "-"),

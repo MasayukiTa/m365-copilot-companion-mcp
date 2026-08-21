@@ -368,3 +368,41 @@ def test_the_notification_asks_for_a_click_target(monkeypatch, tmp_path):
                 "authorization": "a", "at": "t"})
     assert seen.get("launch", "").startswith("file:///")
     assert AL.UNDO_CMD in seen.get("body", "")
+
+
+# ---- 通知の説明文が「いつ」を言えること -----------------------------------------------------------
+
+def test_the_briefing_reads_the_timestamp_key_the_ledger_actually_writes(tmp_path,
+                                                                        monkeypatch):
+    """`append` は `ts` を書き、`at` を書いたレコードは一度も無い。
+    briefing は `at` を読んでいたので空欄になり、
+    グレーダーの変更を告げる監査記録が『いつ』を持たないまま運用者に届いた。"""
+    from relay.selfimprove import authority_ledger as AL
+    p = tmp_path / "authority.jsonl"
+    monkeypatch.setattr(AL, "_notify", lambda record: None)
+    rec = AL.append(AL.REBLESS, reason="because", actor_claimed="test",
+                    authorization="operator said so", path=str(p))
+    assert "ts" in rec and "at" not in rec
+    when = AL._when(rec)
+    assert when and when != "(no timestamp)"
+    assert when[:2] == "20", when
+
+
+def test_a_record_without_a_timestamp_says_so_rather_than_going_blank():
+    """空欄は『ここには言うことがない』と読める。
+    言えないなら、言えないと書く。"""
+    from relay.selfimprove import authority_ledger as AL
+    assert AL._when({}) == "(no timestamp)"
+    assert AL._when({"ts": None}) == "(no timestamp)"
+
+
+def test_the_briefing_body_carries_the_time(tmp_path, monkeypatch):
+    from relay.selfimprove import authority_ledger as AL
+    monkeypatch.setattr(AL, "_notify", lambda record: None)
+    p = tmp_path / "authority.jsonl"
+    rec = AL.append(AL.REBLESS, reason="r", actor_claimed="t", path=str(p))
+    rec = dict(rec, _ledger_path=str(p))
+    AL._write_briefing(rec, "The constitution was re-signed", "body")
+    text = open(AL.briefing_path(str(p)), encoding="utf-8").read()
+    assert "when          :" in text
+    assert "(no timestamp)" not in text, text[:300]
