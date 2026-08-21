@@ -692,3 +692,43 @@ def test_a_driver_that_cannot_answer_does_not_get_infinite_patience():
 
     w = _deferring_worker(_Broken())
     assert w._defer_generation() is False
+
+
+def test_two_workers_do_not_capture_at_the_same_time(tmp_path):
+    """実測 2026-08-21、24目標・並列6: タブが基準1+捕獲1=2 のはずが peak 3 だった。
+    refresh は needs_refresh を読んでから捕獲するので、2人が同時に通れる。
+    捕獲2本 = 一時メモリ2倍 + 1つのトークンを知るための実ターン2回。"""
+    import threading
+
+    started, done = [], threading.Event()
+
+    def slow_capture(_ctx, url):
+        started.append(url)
+        done.wait(2.0)                      # 1本目が中にいる間に2本目が来る
+        return _token(), _Tpl2("T_impl")
+
+    r = _route_logging(tmp_path, capture_fn=slow_capture)
+    t = threading.Thread(target=lambda: r.refresh(object(), "a"), daemon=True)
+    t.start()
+    while not started:
+        import time as _t
+        _t.sleep(0.01)
+    second = {"ok": None}
+    t2 = threading.Thread(target=lambda: second.__setitem__("ok", r.refresh(object(), "a")),
+                          daemon=True)
+    t2.start()
+    done.set()
+    t.join(timeout=5)
+    t2.join(timeout=5)
+    assert len(started) == 1, "同じエージェントの捕獲が2本走った"
+    assert second["ok"] is True, "待った側はトークンを見つけて成功で返るべき"
+
+
+def test_two_agents_can_still_capture_at_the_same_time(tmp_path):
+    """直列化するのは同じエージェントだけ。別エージェントまで待たせると、
+    2種類のトークンを揃えるのに順番待ちの時間が積み上がる。"""
+    r = _route_logging(tmp_path, capture_fn=lambda _c, u: (_token(), _Tpl2(u)))
+    assert r.refresh(object(), "a") is True
+    assert r.refresh(object(), "b") is True
+    assert r.template_for("a").gpt_id == "a"
+    assert r.template_for("b").gpt_id == "b"

@@ -119,6 +119,11 @@ class SocketRoute:
         #: serves every agent -- but "probably" is not a measurement, and the cost of not
         #: assuming is one extra 40-second capture per agent per token lifetime.
         self._entries = {}
+        #: ONE CAPTURE AT A TIME, PER AGENT. `refresh` reads needs_refresh() and then captures,
+        #: and nothing stopped two workers passing that check together -- measured on a run of
+        #: 24 goals at concurrency 6, where the tab count peaked at 3 instead of 2. Two capture
+        #: tabs is twice the transient memory and two real turns to learn one token.
+        self._capturing = {}
         #: The agent a caller means when it names none. The first one captured.
         self.default_agent_url = ""
         #: Why the route is closed, or "". One-way: nothing in this file clears it.
@@ -231,6 +236,18 @@ class SocketRoute:
         key = self._key(agent_url)
         if not self.needs_refresh(key):
             return True
+        with self._lock:
+            gate = self._capturing.get(key)
+            if gate is None:
+                gate = self._capturing[key] = threading.Lock()
+        # The SECOND caller waits, and then finds the token the first one stored -- so it
+        # returns without opening a tab of its own rather than racing for the same answer.
+        with gate:
+            if not self.needs_refresh(key):
+                return True
+            return self._refresh_locked(context, agent_url, key)
+
+    def _refresh_locked(self, context, agent_url, key) -> bool:
         try:
             token, template = self._capture_fn(context, agent_url)
         except Exception as exc:
