@@ -515,6 +515,11 @@ class ResearchSession:
         self._approved = False
         self._pending_open = True  # side-page not opened yet -- deferred until there's free RAM
         self._done = None          # report string once finished ('' on failure)
+        #: WHY it finished empty, when it did. Every path to an empty report used to look
+        #: identical from outside -- a swallowed exception, a timeout and a RAM skip all
+        #: produced "" -- so a research that CRASHED was indistinguishable from one that found
+        #: nothing, and the worker carried on as if the deep dive had simply come back quiet.
+        self.error = ""
         # Sub-conversation capture: where to persist this deep-dive (query + full report) so it is
         # linked to the spawning worker and visible afterwards instead of vanishing on close().
         self.tx_dir = tx_dir
@@ -535,16 +540,18 @@ class ResearchSession:
         from .copilot_autopilot_relay import CopilotWebDriver
         try:
             if self.context is None:
-                self._finish(""); return
+                self._fail("no browser context"); return
             self.page = self.context.new_page()
             if not open_agent(self.page, self.profile):
-                self._finish(""); return
+                self._fail("the %s surface did not open" % self.profile.name); return
             if self.upload_path:
                 # THE ANALYST NEEDS THE DATA BEFORE THE QUESTION. A failed upload must end the
                 # session rather than send an instruction about a file that is not there --
                 # which would come back as a confident answer about nothing.
                 if not upload_file(self.page, self.upload_path):
-                    self._finish(""); return
+                    self._fail("the upload failed; an instruction about a file that is not "
+                               "there comes back as a confident answer about nothing")
+                    return
             if self.model_name and self.profile.model_picker:
                 set_model(self.page, self.profile, self.model_name)
             self.drv = CopilotWebDriver(self.page)
@@ -553,8 +560,8 @@ class ResearchSession:
             self.drv.send(self.query)
             self._pending_open = False
             self._t_send = time.time()   # reset the clock to when the query actually went out
-        except Exception:
-            self._finish("")
+        except Exception as exc:
+            self._fail("open failed: %s: %s" % (type(exc).__name__, str(exc)[:160]))
 
     def poll(self):
         """None while the Researcher is still working; else the report string ('' on failure)."""
@@ -572,7 +579,9 @@ class ResearchSession:
                 import sys
                 sys.stderr.write("[research] RAM_SKIP: no tab within %ds, deep-dive SKIPPED "
                                  "(instance solved without research)\n" % int(self.timeout_s))
-                self._finish(""); return self._done
+                self._fail("no tab within %ds: the box had no RAM for a side page"
+                           % int(self.timeout_s))
+                return self._done
             if not ram_room_for_tab():
                 return None
             self._do_open()
@@ -581,7 +590,8 @@ class ResearchSession:
             return self._done
         try:
             if self._t_send and time.time() - self._t_send > self.timeout_s:
-                self._finish(""); return self._done
+                self._fail("timeout: %ds without a finished report" % int(self.timeout_s))
+                return self._done
             if self.drv._answers().count() <= self._count_before:
                 return None
             t = self.drv.read_last_response()
@@ -641,8 +651,16 @@ class ResearchSession:
                 return None
             self._last, self._stable_since = t, time.time()
             return None
-        except Exception:
-            self._finish(""); return self._done
+        except Exception as exc:
+            self._fail("%s: %s" % (type(exc).__name__, str(exc)[:200]))
+            return self._done
+
+    def _fail(self, reason):
+        """Finish empty, but say why. An empty report is a fact; an empty reason is a bug."""
+        self.error = str(reason)
+        import sys as _sys
+        _sys.stderr.write("[research] gave up: %s" % self.error + chr(10))
+        self._finish("")
 
     def _finish(self, report):
         self._done = report or ""
