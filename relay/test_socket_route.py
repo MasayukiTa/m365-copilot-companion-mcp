@@ -732,3 +732,48 @@ def test_two_agents_can_still_capture_at_the_same_time(tmp_path):
     assert r.refresh(object(), "b") is True
     assert r.template_for("a").gpt_id == "a"
     assert r.template_for("b").gpt_id == "b"
+
+
+# ---- unlock が一度も送られていなかった件（Fable の調査 + 実物確認、2026-08-21） --------------
+#
+# 連鎖は3本だった:
+#   1. _decide の unlock 分岐が self.job を組み立てて status を設定しない -> 送信されない
+#   2. 送信されないので次の掃引が同じ回答を読み直し、また locked と判定して試行を消費する
+#   3. その回答は 533 文字で marker 分岐の上限を超えており、判定していたのは
+#      「誰かの拒否が最近あった」だけを見る fallback 分岐だった（並列時は他人の拒否）
+# 結果、4回の試行が約8秒で尽き、「IPが変わる/パスワード不一致」という
+# **実際には起きていない原因**を名指しするメッセージが出ていた。
+
+def test_the_unlock_job_is_actually_sent():
+    """job を組み立てても 'ready' にしなければ送信されない。
+    この1行が無いために、unlock は一度もエージェントに届いていなかった。"""
+    import relay.relay_fleet as rf
+    w = _worker()
+    w._turn_sent_at = 1.0
+    w._unlock_attempts = 0
+    orig_looks, orig_pw = rf._looks_locked, rf._unlock_password
+    rf._looks_locked = lambda resp, since=0.0: True
+    rf._unlock_password = lambda: "pw"
+    try:
+        w._decide("[locked: unlock required]")
+    finally:
+        rf._looks_locked, rf._unlock_password = orig_looks, orig_pw
+    assert w.status == "ready", "unlock ジョブが送信される状態になっていない"
+    assert "unlock" in w.job and w._unlock_attempts == 1
+
+
+def test_a_long_ordinary_answer_is_not_a_lock_error():
+    """並列実行では、拒否の記録は誰のものか分からないまま共有される。
+    533文字の会議要約が『ロック』と判定されたのがこれ。"""
+    import relay.relay_fleet as rf
+    import tools.lock_state as LS
+    orig = LS.locked_since
+    LS.locked_since = lambda since, now=None: True      # 誰かが拒否された直後
+    try:
+        long_answer = "会議の要約です。" * 80           # マーカー無し・長い
+        assert len(long_answer) >= rf.LOCKED_DOMINANCE_MAX_CHARS
+        assert rf._looks_locked(long_answer, since=1.0) is False
+        short_paraphrase = "unlock パスワード欠如で確定。STUCK。"
+        assert rf._looks_locked(short_paraphrase, since=1.0) is True
+    finally:
+        LS.locked_since = orig

@@ -78,6 +78,9 @@ class CopilotSocketDriver:
         self._count_before = 0
         self.answer_content_reads = 0
         self._last_returned_reply = None
+        #: The completed-answer count when the last reply was accepted. Distinguishes "you are
+        #: asking about the turn you already took" from "a later turn happened to say the same".
+        self._accepted_at = -1
 
     # ---- what the loop calls ---------------------------------------------------------------
 
@@ -147,17 +150,29 @@ class CopilotSocketDriver:
         return self.read_last_response()
 
     def _is_stale_repeat(self, text: str) -> bool:
-        """The tab reader could hand back the PREVIOUS turn's answer; this one cannot.
+        """Whether the loop is asking about a turn it has ALREADY taken.
 
-        Kept because the loop calls it, and answered honestly rather than copied: the text
-        here is produced by the turn that is running, so it is never a stale capture. Two
-        identical answers in a row are two identical answers, and suppressing the second would
-        lose a real turn.
+        NOT the tab's question, and the difference cost a run. The tab reader can hand back the
+        PREVIOUS turn's DOM, so its guard asks "is this text stale". A socket's text is always
+        produced by the turn that produced it, so this answered False -- and that removed a
+        protection the loop was leaning on for a second purpose: stopping the same settled
+        reply being decided twice.
+
+        It mattered because another branch could leave the worker in 'waiting' after deciding,
+        so the next sweep re-read the same answer and re-decided it. That branch is fixed, and
+        this stops being the only thing standing between a re-read and a repeated decision.
+
+        The honest form of the question here is not "is this stale" but "have I already handed
+        you this one": the same text, with no new turn completed since it was accepted. Two
+        genuinely identical answers on two different turns are still two answers.
         """
-        return False
+        return (bool(self._last_returned_reply)
+                and text == self._last_returned_reply
+                and self._answers_done == self._accepted_at)
 
     def _accept_new_reply(self, text: str) -> None:
         self._last_returned_reply = text
+        self._accepted_at = self._answers_done
 
     def conversation_title(self) -> str:
         """No tab, so no title strip to scrape. The caller falls back to the goal text."""

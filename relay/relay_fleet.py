@@ -320,6 +320,15 @@ def _looks_locked(resp: str, since: float = 0.0) -> bool:
     # refusal reply ("I cannot assist with that request") was then read as a lock.
     if since <= 0.0:
         return False
+    # THE SAME DOMINANCE RULE THE MARKER BRANCH USES. Without it this branch judged replies of
+    # any length: a 533-character summary of a meeting was classified as a lock error because
+    # some OTHER concurrent worker had been refused within the freshness window. The refusal
+    # record is a single global slot with no client identity, so under concurrency one caller's
+    # refusal colours everyone's reply -- and a long, ordinary answer is exactly what the
+    # dominance rule exists to exclude. Identity is the real fix and it is not available here;
+    # this removes the case that fired.
+    if len(resp or "") >= LOCKED_DOMINANCE_MAX_CHARS:
+        return False
     try:
         from tools import lock_state
         return lock_state.locked_since(since)
@@ -2230,6 +2239,13 @@ class RelayWorker:
                 self.job = PROTOCOL + (UNLOCK_PREFIX % pw) + self.goal
                 self.reason = "コネクタ未解錠 → unlock 自動投入 (%d/%d)" % (
                     self._unlock_attempts, MAX_UNLOCK_ATTEMPTS)
+                # WITHOUT THIS THE UNLOCK IS NEVER SENT. 'ready' is the state that sends
+                # self.job; the branch composed the job and left the worker in 'waiting', so
+                # the next sweep re-read the SAME reply, re-classified it as locked, and spent
+                # another attempt -- four gone in about eight seconds, and the message blamed
+                # a rotating IP and a wrong password for a turn that was never sent. Every
+                # sibling branch that sets self.job sets this too; this one did not.
+                self.status = "ready"
                 return
             self.status, self.outcome = "stuck", "STUCK"
             self.reason = ("⚠ unlock を %d 回投入したが解錠が続かない。M365バックエンドの送信元IPが"

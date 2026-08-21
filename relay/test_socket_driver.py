@@ -144,14 +144,36 @@ def test_it_answers_to_every_name_the_turn_loop_calls():
         assert hasattr(drv, attr), attr
 
 
-def test_an_identical_answer_twice_is_two_answers_not_a_stale_capture():
-    """タブ側の stale 判定は『読み手が前ターンの DOM を返した』事故への対策。
-    socket では走っているターン自身がテキストを作るので、同じ答えの抑止は
-    本物のターンを失うことにしかならない。"""
+def test_the_same_turn_asked_about_twice_is_recognised():
+    """ループが『もう受け取ったターン』についてまた尋ねている場合は True。
+
+    実測 2026-08-21: 別の分岐が判定後にワーカーを 'waiting' のまま残すため、次の掃引が
+    同じ回答を読み直して再判定していた。タブ側はこのガードで止まっていたが、socket 側は
+    常に False を返していたので素通りし、unlock の試行4回が8秒で溶けた。"""
     drv = _drv(answer="166")
     drv.send("q")
     assert _settle(drv)
+    assert drv._is_stale_repeat("166") is False, "まだ受け取っていないうちは stale ではない"
+    drv._accept_new_reply("166")
+    assert drv._is_stale_repeat("166") is True, "受け取ったターンをまた尋ねている"
+
+
+def test_a_later_turn_saying_the_same_thing_is_a_new_answer():
+    """2つの異なるターンがたまたま同じ文字列を返すことはある。
+    それを抑止すると本物のターンを失う -- タブ側の問いとは別物であることの要。"""
+    drv = SD.CopilotSocketDriver(_FakeConv(answer="166"), connect=object())
+    drv.send("q")
+    assert _settle(drv)
+    drv._accept_new_reply("166")
+    drv.send("q2")                       # 新しいターンが完了する
+    assert _settle(drv)
     assert drv._is_stale_repeat("166") is False
+
+
+def test_nothing_accepted_yet_is_never_stale():
+    drv = _drv(answer="166")
+    assert drv._is_stale_repeat("166") is False
+    assert drv._is_stale_repeat("") is False
 
 
 def test_closing_the_driver_closes_the_conversation():
