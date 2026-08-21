@@ -155,6 +155,19 @@ COPILOT_SELECTORS = {
     # it can read back the user's own message, which broke STUCK detection.
     "assistant_msg": ".fai-CopilotMessage",
     "assistant_msg_fallback": '[data-testid="copilot-message-reply-div"]',
+    # Within one .fai-CopilotMessage the block splits into a HEADER and a BODY:
+    #   <div>                                            <- header, all chrome
+    #     <h6  class="fai-CopilotMessage__accessibleHeading">"<NAME> said:"</h6>
+    #     <div class="fai-CopilotMessage__avatar"><img alt="<NAME>"></div>
+    #     <div class="fai-CopilotMessage__name"><span>NAME</span></div>   <- RENDERED
+    #     <div class="fai-CopilotMessage__disclaimer">
+    #   </div>
+    #   <div class="fai-CopilotMessage__content">...the reply...</div>    <- BODY
+    # so the block's inner_text is "<NAME> said:\n<NAME>\n<reply>". Reading the BODY
+    # selector gets the reply with no chrome and no string surgery. Captured live
+    # 2026-08-21 (CDP, fleet browser); the capture is the test fixture, see
+    # relay/testdata/copilot_message_dom.json.
+    "assistant_msg_body": ".fai-CopilotMessage__content",
     # The Send button. Pressing Enter in this rich editor does NOT reliably submit
     # (the text just sits in the composer) -- clicking this button does.
     #
@@ -1769,6 +1782,53 @@ class CopilotWebDriver:
             time.sleep(REPLY_SETTLE_INTERVAL_S)
         return False
 
+    @staticmethod
+    def _strip_agent_chrome(txt: str) -> str:
+        """Fallback text surgery for a block whose BODY sub-element could not be read.
+
+        Only reachable on the `assistant_msg_fallback` selector or an older/changed DOM;
+        the normal path reads `assistant_msg_body` and never comes here. Drops the
+        "<NAME> said:" accessible heading and then every leading line that is just NAME
+        again (the rendered `fai-CopilotMessage__name` label). Deriving NAME from the
+        heading keeps this generic over agents -- the previous rule only dropped the name
+        line when it happened to be duplicated, which the live DOM never does, so the
+        name survived into the answer as a "desktopfile<...>" prefix.
+        """
+        name = ""
+        if " said:" in txt:
+            name = txt.split(" said:", 1)[0].strip()
+            txt = txt.split(" said:", 1)[1]
+        lines = txt.splitlines()
+        while lines and (not lines[0].strip() or (name and lines[0].strip() == name)):
+            lines = lines[1:]
+        # Keep the old duplicate-line rule for DOMs that repeat the name without a heading.
+        if len(lines) >= 2 and lines[0].strip() and lines[0].strip() == lines[1].strip():
+            lines = lines[1:]
+        return "\n".join(lines).strip()
+
+    def _block_text(self, block) -> str:
+        """Reply text of ONE assistant block, with the header chrome excluded.
+
+        Prefers the BODY sub-element (`assistant_msg_body`), which by construction holds
+        the reply and nothing else -- the agent name, avatar and disclaimer live in a
+        sibling header div. Falls back to the whole block plus `_strip_agent_chrome` when
+        the body selector is absent (fallback selector / DOM change / test doubles), so a
+        markup change degrades to the old behaviour instead of returning "".
+        """
+        body = None
+        try:
+            sub = block.locator(COPILOT_SELECTORS["assistant_msg_body"])
+            if sub.count() > 0:
+                body = sub.first.inner_text() or ""
+        except Exception:
+            body = None
+        if body is not None:
+            return body.strip()
+        try:
+            return self._strip_agent_chrome(block.inner_text() or "")
+        except Exception:
+            return ""
+
     def read_last_response(self) -> str:
         self.answer_content_reads += 1
         loc = self._answers()
@@ -1776,33 +1836,25 @@ class CopilotWebDriver:
             loc = self.page.locator(COPILOT_SELECTORS["assistant_msg_fallback"])
         if loc.count() == 0:
             return ""
-        try:
-            txt = loc.last.inner_text() or ""
-        except Exception:
-            return ""
-        # strip the "<agent> said:" prefix Copilot prepends, then a duplicated
-        # agent-name line if present.
-        if " said:" in txt:
-            txt = txt.split(" said:", 1)[1]
-        lines = txt.splitlines()
-        while lines and not lines[0].strip():
-            lines = lines[1:]
-        if len(lines) >= 2 and lines[0].strip() and lines[0].strip() == lines[1].strip():
-            lines = lines[1:]
-        return "\n".join(lines).strip()
+        return self._block_text(loc.last)
 
     def read_last_reply_clean(self) -> str:
-        """Agent reply TEXT only -- for callers (the OpenAI-compat adapter) where ANY stray prefix
-        corrupts a downstream harness's action parsing.
+        """Agent reply TEXT only, from the FIRST block produced after this send.
 
-        The DOM of one agent turn is:
-            <h6 accessibleHeading>"<NAME> said:"</h6>  <img avatar alt="<NAME>">  <reply text...>
-        so inner_text reads back  "<NAME> said:\n<NAME>\n<actual reply>"  -- the accessible heading
-        AND the avatar's alt-text (the agent name a second time) BEFORE the real answer (here <NAME>
-        was e.g. "desktopfile<emoji>"). read_last_response() only splits off the heading and leaves
-        the avatar name line. We extract <NAME> from the heading, then drop the heading and every
-        leading line that merely repeats <NAME>. Generic over any agent name and multi-line replies;
-        Playwright already returns proper UTF-8."""
+        Same chrome-free text as read_last_response() -- both now go through _block_text()
+        -- and this one differs ONLY in WHICH block it reads (see below). It was written
+        for the OpenAI-compat adapter, which has since been removed (abde2c5), so it has
+        no production caller today; the socket driver still mirrors the name.
+
+        A correction to the note this docstring used to carry, and to 313718d's commit
+        message: the second name line is NOT the avatar's alt-text. inner_text does not
+        render alt attributes. It is `div.fai-CopilotMessage__name`, a real rendered label
+        -- verified against the live DOM on 2026-08-21 and captured in
+        relay/testdata/copilot_message_dom.json, where the avatar img alt and that label
+        carry the same string, which is what made the two indistinguishable from text
+        alone. Nothing downstream depended on the wrong attribution, but the fix does:
+        the name element sits in the header div, OUTSIDE the content div, which is why
+        reading the body selector removes it without any name matching."""
         loc = self._answers()
         # Prefer the FIRST block produced AFTER this send (index == _count_before)
         # over .last: on a freshly-recycled conversation a leftover greeting/
@@ -1827,18 +1879,7 @@ class CopilotWebDriver:
             target = loc.nth(self._count_before)
         else:
             target = loc.last
-        try:
-            txt = target.inner_text() or ""
-        except Exception:
-            return self.read_last_response()
-        name = ""
-        if " said:" in txt:
-            name = txt.split(" said:", 1)[0].strip()
-            txt = txt.split(" said:", 1)[1]
-        lines = txt.splitlines()
-        while lines and (not lines[0].strip() or (name and lines[0].strip() == name)):
-            lines = lines[1:]
-        return "\n".join(lines).strip()
+        return self._block_text(target)
 
     def conversation_title(self) -> str:
         """Best-effort scrape of the Copilot-generated conversation title.
