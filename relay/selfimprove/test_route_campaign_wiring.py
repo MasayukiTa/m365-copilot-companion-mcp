@@ -308,3 +308,56 @@ def test_a_null_run_is_labelled_in_the_result():
     『効果ゼロ』が『効果を検出できなかった』と混同される。"""
     src = inspect.getsource(S.route_evaluator_for)
     assert '"null_run"' in src
+
+
+# ---- 腕が独立な実験単位であること ----------------------------------------------------------------
+
+def test_each_arm_gets_its_own_memory_store():
+    """フリートは `_with_theme_memory` でそのテーマの過去メモを送信本文に前置し、
+    完了時に `record_task` で書き戻す。両腕が同じゴールを走るので、
+    腕2は腕1が直前に書いたものを読んでいた -- 実際の走行記録に
+    'The task is already complete per prior work memory' で始まる回答が残っている。
+    腕2は仕事をしておらず、その commit 増分は仕事のコストではない。"""
+    src = inspect.getsource(S.route_evaluator_for)
+    assert "FLEET_STATE_DIR" in src, "記憶ストアを隔離していない"
+    assert "isolate_memory" in src
+    i = src.index("if isolate_memory:")
+    block = src[i:i + 400]
+    assert "_arm_seq" in block, "腕ごとに別のパスになっていない"
+
+
+def test_memory_isolation_is_per_arm_and_not_a_global_switch():
+    """運用者の実フリートの記憶を消してはいけない。消すのはこの腕の間だけ。"""
+    src = inspect.getsource(S.route_evaluator_for)
+    i = src.index("if isolate_memory:")
+    block = src[i:i + 500]
+    assert "os.environ[\"FLEET_STATE_DIR\"]" in block.replace("_os.", "os.")
+    assert "record_task" not in block, "本番の記録機構そのものに手を入れている"
+
+
+def test_the_estimand_is_named_in_the_code():
+    """記憶を消すか残すかは推定対象の選択であって、掃除ではない。
+    どちらを測っているか書いていなければ、読む側は取り違える。"""
+    src = inspect.getsource(S.route_evaluator_for)
+    assert "estimand" in src
+
+
+def test_the_measurements_reach_the_field_the_ledger_reads():
+    """最初の nightly() は actual_effect {} を記録した。評価器は両腕・gain・
+    レンダラー数・メモリ床を返していたのに、契約が名指すフィールドを
+    埋めていなかったので、durable record に残った数値は
+    たまたま文章の中にあった1つだけだった。"""
+    src = inspect.getsource(S.route_evaluator_for)
+    assert '"actual_effect"' in src
+    # rindex: 最初の一致は abort 分岐のもの。判定分岐のほうを見る。
+    i = src.rindex('"actual_effect": {')
+    block = src[i:i + 700]
+    for key in ("control", "candidate", "memory_gain_mb", "renderers", "arm_order"):
+        assert key in block, key
+
+
+def test_an_aborted_run_also_records_what_it_saw():
+    """床を割った走行も『何を見たか』は残す。判定は出さないが観測は消さない。"""
+    src = inspect.getsource(S.route_evaluator_for)
+    i = src.index('low < RV.MIN_FREE_MB')
+    assert '"actual_effect"' in src[i:i + 1600]

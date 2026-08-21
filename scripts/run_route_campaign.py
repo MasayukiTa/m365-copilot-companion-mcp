@@ -25,12 +25,52 @@ from relay.selfimprove import ledger as L  # noqa: E402
 from relay.selfimprove import manifest as M  # noqa: E402
 from relay.selfimprove import scheduler as S  # noqa: E402
 
-#: Two that the FIXED predicate sends to a tab under v2, two it clears for a socket.
+#: THE GOAL SET, REBUILT AFTER READING THE TRANSCRIPTS.
+#:
+#: The first set had two defects that nine campaigns did not reveal, because nothing read
+#: what the arms actually said:
+#:
+#:   * A Teams goal asking what was decided in a meeting the operator did not organise. The
+#:     delegated token only reaches /me, so the transcript is not retrievable and the model
+#:     looped -- four identical replies, no DONE, no FAIL. It had looked like a success in
+#:     every earlier run because the fleet was feeding the arm its own past notes, so the
+#:     answer came from memory rather than from work. An unanswerable goal masked by memory
+#:     is worse than a failing one: it reports DONE.
+#:   * No acceptance checks. DONE meant "the marker appeared", so an arm could reach 4/4 by
+#:     saying the right shape of words. Completion parity between the arms was being read off
+#:     a signal that does not distinguish an answer from a performance.
+#:
+#: The coding goals now write a file and are checked by running it. The Work IQ goals stay on
+#: what a delegated token can actually reach.
+_OUT = os.path.join(os.environ.get("TEMP", "."), "route_campaign_work")
+
 GOALS = [
-    "Outlook の受信トレイから今日届いた未読メールの件名を3件挙げて",
-    "Teams の直近の会議で決まったことを1行でまとめて",
-    "Python で与えられた文字列が回文かどうかを判定する関数を書いて",
-    "1 から 100 までの整数のうち 3 と 5 の両方で割り切れるものを列挙して",
+    {"text": "自分の今日以降の予定を3件、開始日時と件名だけの箇条書きで挙げて。"
+             "取得できない場合はその理由を1行で書いて FAIL と出力して。"},
+    {"text": "自分宛の受信メールのうち直近3件の件名だけを箇条書きで挙げて。"
+             "取得できない場合はその理由を1行で書いて FAIL と出力して。"},
+    {"text": "ファイル %s を作成し、文字列が回文かどうかを判定する関数 is_palindrome(s) を"
+             "書いて。大文字小文字と空白は無視すること。"
+             "書き終えたら python -c \"import sys;sys.path.insert(0,r'%s');"
+             "from pal import is_palindrome;print(is_palindrome('A man a plan a canal Panama'))\" "
+             "を実行し、True になることを確認して。"
+             % (os.path.join(_OUT, "pal.py"), _OUT),
+     "checks": [{"type": "file_exists", "path": os.path.join(_OUT, "pal.py")},
+                {"type": "shell",
+                 "cmd": "python -c \"import sys;sys.path.insert(0,r'%s');"
+                        "from pal import is_palindrome;"
+                        "assert is_palindrome('A man a plan a canal Panama');"
+                        "assert not is_palindrome('hello')\"" % _OUT,
+                 "expect_code": 0}]},
+    {"text": "ファイル %s を作成し、1 から 100 までの整数のうち 3 と 5 の両方で"
+             "割り切れるものを昇順に並べたリストを変数 FIZZBUZZ に入れて。"
+             % os.path.join(_OUT, "fb.py"),
+     "checks": [{"type": "file_exists", "path": os.path.join(_OUT, "fb.py")},
+                {"type": "shell",
+                 "cmd": "python -c \"import sys;sys.path.insert(0,r'%s');"
+                        "from fb import FIZZBUZZ;"
+                        "assert FIZZBUZZ==[15,30,45,60,75,90],FIZZBUZZ\"" % _OUT,
+                 "expect_code": 0}]},
 ]
 
 RESULTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -49,6 +89,14 @@ def main():
             if line.startswith("MCP_FLEET_AGENT_URL="):
                 agent_url = line.split("=", 1)[1].strip()
                 break
+    os.makedirs(_OUT, exist_ok=True)
+    # Each campaign starts from an empty workspace. A file left by the previous run makes the
+    # file_exists check pass without the arm doing anything.
+    for name in ("pal.py", "fb.py"):
+        try:
+            os.remove(os.path.join(_OUT, name))
+        except OSError:
+            pass
     print("[campaign] candidate=%s goals=%d" % (version, len(GOALS)), flush=True)
     print("[campaign] agent=%s" % agent_url[:60], flush=True)
 
@@ -104,7 +152,8 @@ def main():
     evaluate = S.route_evaluator_for(GOALS, agent_url=agent_url, max_concurrent=2,
                                      candidate_first=candidate_first,
                                      warmup="--warmup" in sys.argv,
-                                     null_arm="--null" in sys.argv)
+                                     null_arm="--null" in sys.argv,
+                                     transcript_dir=os.path.join(RESULTS, "tx", exp))
     t0 = time.time()
     out = evaluate(candidate, exp)
     out["wall_s"] = round(time.time() - t0, 1)

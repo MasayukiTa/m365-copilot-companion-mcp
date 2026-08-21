@@ -516,7 +516,8 @@ CAMPAIGN_SOCKET_LOG = os.path.join(
 
 def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222",
                         max_concurrent=2, log_path=None, candidate_first=False,
-                        warmup=False, null_arm=False):
+                        warmup=False, null_arm=False,
+                        transcript_dir=None, isolate_memory=True):
     """An `evaluate(manifest, experiment_id)` that measures transport, not pass@1.
 
     CompanionBench answers "did the candidate solve more episodes". For a transport hypothesis
@@ -549,6 +550,9 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
     #: page file. The floor has to hold FOR the measurement, not merely at its beginning, so
     #: every sample records it and the result is thrown out below if it broke.
     _floor = {"min_free_mb": None}
+
+    #: Bumped per arm so each gets its own memory store path.
+    _arm_seq = [0]
 
     #: The processes that already existed when this arm started. Set per arm, never shared.
     _attr = {"baseline_pids": None, "peak_new_pids": 0}
@@ -674,6 +678,28 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
         from relay.relay_fleet import run_relay_fleet
         _os.environ["MCP_FLEET_SOCKET"] = "1" if socket_on else "0"
         SR.ENABLED = bool(socket_on)
+
+        # A FRESH MEMORY STORE PER ARM. THE ARMS WERE NOT INDEPENDENT UNITS WITHOUT IT.
+        #
+        # The fleet prepends this theme's past work notes to the body it sends
+        # (`_with_theme_memory`) and writes them back on completion (`record_task`). Both arms
+        # run the SAME goals, so arm 2 was reading what arm 1 had just written -- a transcript
+        # from one of these runs opens with "The task is already complete per prior work
+        # memory". Arm 2 was not doing the work, so its commit charge was not the cost of the
+        # work, and the dependent variable fixed earlier today was being corrupted by a
+        # channel that had nothing to do with memory measurement.
+        #
+        # This is not a global switch: the store relocates for the arm only, so an operator's
+        # real fleet keeps its memory. The estimand this picks is the COLD one -- what the
+        # transport costs per unit of actual work -- which is the question the hypothesis
+        # asks. A steady-state estimand would keep the memory and randomise instead.
+        if isolate_memory:
+            store = _os.path.join(
+                _os.environ.get("TEMP", "."), "route_arm_%s_%d"
+                % ("socket" if socket_on else "tab", _arm_seq[0]))
+            _arm_seq[0] += 1
+            _os.makedirs(store, exist_ok=True)
+            _os.environ["FLEET_STATE_DIR"] = store
         _activate(manifest)
         route = _fresh_route(socket_on)
         url = agent_url or _os.environ.get("MCP_FLEET_AGENT_URL", "")
@@ -681,8 +707,20 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
         with sync_playwright() as pw:
             browser = pw.chromium.connect_over_cdp(cdp_url)
             context = browser.contexts[0] if browser.contexts else browser.new_context()
+            # TRANSCRIPTS, BECAUSE DONE PARITY IS NOT QUALITY PARITY.
+            #
+            # Both arms have returned 4/4 in every run so far, and a count cannot tell a
+            # real answer from a plausible empty one. That distinction is the whole of the
+            # safety argument for which goals may take a socket, so the arm has to leave the
+            # text behind or the argument is being made from a number that cannot carry it.
+            tx = None
+            if transcript_dir:
+                tx = _os.path.join(transcript_dir,
+                                   "socket" if socket_on else "tab")
+                _os.makedirs(tx, exist_ok=True)
             rows = run_relay_fleet(context, list(goal_list), url,
                                    max_concurrent=max_concurrent,
+                                   transcript_dir=tx,
                                    on_tick=lambda *a, **k: sample())
             for row in (rows or []) if isinstance(rows, list) else []:
                 if str((row or {}).get("outcome", "")).upper() == "DONE":
@@ -796,7 +834,9 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
                                         % (low, RV.MIN_FREE_MB)},
                     "experiment_id": experiment_id,
                     "control": control, "candidate": candidate, "min_free_mb": round(low, 1),
-                    "arm_order": "candidate,control" if candidate_first else "control,candidate"}
+                    "arm_order": "candidate,control" if candidate_first else "control,candidate",
+                    "actual_effect": {"control": control, "candidate": candidate,
+                                      "min_free_mb": round(low, 1), "aborted": True}}
         verdict = RV.decide(control, candidate)
         return {
             "gate": {"keep": verdict["verdict"] == "keep",
@@ -811,12 +851,31 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
             "arm_order": "candidate,control" if candidate_first else "control,candidate",
             "warmup": bool(warmup),
             "null_run": bool(null_arm),
+            "isolated_memory": bool(isolate_memory),
             # THE MECHANISM, WHICH IS WORTH MORE THAN THE STATISTIC HERE. A socket goal should
             # create no renderer at all, so the fleet-scale difference is arithmetic --
             # renderers avoided times commit per renderer -- rather than an effect that has to
             # be detected against a swing four times the decision threshold.
             "renderers": {"control": control.get("new_renderers"),
                           "candidate": candidate.get("new_renderers")},
+            # THE KEY THE LEDGER ACTUALLY READS.
+            #
+            # The first `nightly()` run recorded actual_effect {} while the evaluator was
+            # returning both arms, the gain, the renderer counts and the memory floor. The
+            # controller was not dropping them -- the contract names one field and this
+            # evaluator had never filled it, so the only number that survived into the
+            # durable record was the one that happened to be inside a sentence. A record
+            # that keeps the verdict and loses the measurement cannot be re-read later.
+            "actual_effect": {
+                "control": control, "candidate": candidate,
+                "memory_gain_mb": verdict["memory_gain_mb"],
+                "renderers": {"control": control.get("new_renderers"),
+                              "candidate": candidate.get("new_renderers")},
+                "min_free_mb": round(low, 1) if low is not None else None,
+                "arm_order": "candidate,control" if candidate_first else "control,candidate",
+                "isolated_memory": bool(isolate_memory),
+                "null_run": bool(null_arm),
+            },
         }
 
     return evaluate
