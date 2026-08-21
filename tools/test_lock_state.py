@@ -111,3 +111,70 @@ def test_freshness_still_bounds_a_scoped_query():
     sent_at = 1_000.0
     lock_state.record_locked("203.0.113.7", ts=sent_at + 1)
     assert lock_state.locked_since(sent_at, now=sent_at + 10_000) is False
+
+
+# ---- 追記型の拒否ログ（2026-08-21、再構成できなかった事故より） -------------------------------
+#
+# 単一スロットで足りていたのは1ワーカーずつ動かしていた間だけ。並列6では、誰かの拒否が
+# 他の全員の回答を freshness の間ロック扱いにし、しかもファイルは「誰の拒否か」を言えなかった
+# -- client_ip が空の記録に至っては書いた場所すら分からなかった。
+
+def _log_lines(tmp_path, monkeypatch):
+    import json
+    from pathlib import Path
+    p = Path(str(tmp_path / "lock_refusals.jsonl"))
+    if not p.exists():
+        return []
+    return [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+def _redirect(tmp_path, monkeypatch):
+    from pathlib import Path
+    monkeypatch.setattr(lock_state, "_LOG_FILE", Path(str(tmp_path / "lock_refusals.jsonl")))
+    monkeypatch.setattr(lock_state, "_STATE_FILE", Path(str(tmp_path / "lock_state.json")))
+
+
+def test_every_refusal_is_kept_not_just_the_last(tmp_path, monkeypatch):
+    _redirect(tmp_path, monkeypatch)
+    lock_state.record_locked("203.0.113.7", "first", ts=100.0)
+    lock_state.record_locked("198.51.100.9", "second", ts=101.0)
+    rows = _log_lines(tmp_path, monkeypatch)
+    assert [r["client_ip"] for r in rows] == ["203.0.113.7", "198.51.100.9"]
+    # スロットは従来どおり最新1件。両方あることに意味がある。
+    assert lock_state.read_state()["client_ip"] == "198.51.100.9"
+
+
+def test_a_refusal_records_where_it_came_from(tmp_path, monkeypatch):
+    """client_ip が空の記録を誰が書いているか -- これが分からず調査が止まった。
+    ツール名は取れない（呼び出し元が凍結モジュール）ので、取れるものを取る。"""
+    _redirect(tmp_path, monkeypatch)
+    lock_state.record_locked("", "[locked: no HTTP request context]")
+    site = _log_lines(tmp_path, monkeypatch)[-1]["site"]
+    assert "test_lock_state.py" in site and ":" in site
+
+
+def test_a_classification_names_its_branch_and_its_evidence(tmp_path, monkeypatch):
+    _redirect(tmp_path, monkeypatch)
+    lock_state.record_locked("203.0.113.7", "refused", ts=100.0)
+    lock_state.record_classification("fallback", resp_len=533, since=99.0,
+                                     consumed=lock_state.read_state())
+    row = _log_lines(tmp_path, monkeypatch)[-1]
+    assert row["event"] == "classified_locked"
+    assert row["branch"] == "fallback" and row["resp_len"] == 533
+    assert row["consumed"]["client_ip"] == "203.0.113.7"
+
+
+def test_matching_record_returns_what_locked_since_agreed_to(tmp_path, monkeypatch):
+    _redirect(tmp_path, monkeypatch)
+    lock_state.record_locked("203.0.113.7", "refused", ts=100.0)
+    assert lock_state.matching_record(99.0, now=101.0)["client_ip"] == "203.0.113.7"
+    assert lock_state.matching_record(200.0, now=201.0) == {}
+
+
+def test_a_log_that_cannot_be_written_does_not_refuse_a_call(tmp_path, monkeypatch):
+    """記録できないことで、リクエスト処理が止まってはいけない。"""
+    from pathlib import Path
+    monkeypatch.setattr(lock_state, "_LOG_FILE", Path("\0/impossible/x.jsonl"))
+    monkeypatch.setattr(lock_state, "_STATE_FILE", Path(str(tmp_path / "s.json")))
+    lock_state.record_locked("203.0.113.7", "refused")      # 例外を出さないこと自体が要件
+    assert lock_state.read_state()["client_ip"] == "203.0.113.7"

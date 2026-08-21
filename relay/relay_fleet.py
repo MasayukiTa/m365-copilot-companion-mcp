@@ -300,7 +300,10 @@ def _looks_locked(resp: str, since: float = 0.0) -> bool:
     """
     low = (resp or "").lower()
     if any(m in low for m in LOCKED_MARKERS):
-        return len(resp or "") < LOCKED_DOMINANCE_MAX_CHARS
+        hit = len(resp or "") < LOCKED_DOMINANCE_MAX_CHARS
+        if hit:
+            _note_locked("marker", resp, since, None)
+        return hit
 
     # The marker rule only fires while the agent pastes the tool error back
     # verbatim. It often does not: the operator discipline injected into every
@@ -331,9 +334,29 @@ def _looks_locked(resp: str, since: float = 0.0) -> bool:
         return False
     try:
         from tools import lock_state
-        return lock_state.locked_since(since)
+        record = lock_state.matching_record(since)
+        if not record:
+            return False
+        _note_locked("fallback", resp, since, record)
+        return True
     except Exception:
         return False
+
+
+def _note_locked(branch, resp, since, consumed):
+    """Say which branch classified a reply as locked, and on what evidence. Never raises.
+
+    Written because the last incident could not be reconstructed: five workers reported an
+    unlock that would not hold, and nothing recorded WHICH test had fired or which refusal it
+    had read. The fallback in particular consumes a record written by some other caller, and
+    until now that record vanished behind a boolean.
+    """
+    try:
+        from tools import lock_state
+        lock_state.record_classification(branch, resp_len=len(resp or ""), since=since,
+                                         consumed=consumed)
+    except Exception:
+        pass
 
 
 def _unlock_password():

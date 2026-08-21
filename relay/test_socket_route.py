@@ -777,3 +777,53 @@ def test_a_long_ordinary_answer_is_not_a_lock_error():
         assert rf._looks_locked(short_paraphrase, since=1.0) is True
     finally:
         LS.locked_since = orig
+
+
+def _lock_tmp(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    import tools.lock_state as LS
+    monkeypatch.setattr(LS, "_LOG_FILE", Path(str(tmp_path / "lock_refusals.jsonl")))
+    monkeypatch.setattr(LS, "_STATE_FILE", Path(str(tmp_path / "lock_state.json")))
+    return LS
+
+
+def _rows(tmp_path):
+    import json
+    p = tmp_path / "lock_refusals.jsonl"
+    if not p.exists():
+        return []
+    return [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+def test_the_fallback_records_which_refusal_it_acted_on(tmp_path, monkeypatch):
+    """『ロックだ』と判定したのに、その根拠がどこにも残らないのが前回の行き止まり。
+    fallback は他人が書いた記録を消費するので、どれを読んだかが要る。"""
+    import relay.relay_fleet as rf
+    LS = _lock_tmp(tmp_path, monkeypatch)
+    LS.record_locked("203.0.113.7", "refused", ts=100.0)
+    import time as _t
+    monkeypatch.setattr(_t, "time", lambda: 101.0)
+    assert rf._looks_locked("unlock 未提供で STUCK。", since=99.0) is True
+    row = [r for r in _rows(tmp_path) if r.get("event") == "classified_locked"][-1]
+    assert row["branch"] == "fallback"
+    assert row["consumed"]["client_ip"] == "203.0.113.7"
+    assert row["turn_sent_at"] == 99.0
+
+
+def test_the_marker_branch_says_it_was_the_marker(tmp_path, monkeypatch):
+    """どちらの規則が発火したかで、次に疑う場所が変わる。"""
+    import relay.relay_fleet as rf
+    _lock_tmp(tmp_path, monkeypatch)
+    assert rf._looks_locked("[locked client IP: '203.0.113.7'] write refused", since=0.0) is True
+    row = [r for r in _rows(tmp_path) if r.get("event") == "classified_locked"][-1]
+    assert row["branch"] == "marker"
+    assert row["consumed"] == {}
+
+
+def test_a_reply_that_is_not_locked_records_nothing(tmp_path, monkeypatch):
+    """発火しなかった判定まで書くと、読む人がいなくなる。"""
+    import relay.relay_fleet as rf
+    _lock_tmp(tmp_path, monkeypatch)
+    assert rf._looks_locked("ふつうの回答です。", since=99.0) is False
+    assert [r for r in _rows(tmp_path) if r.get("event") == "classified_locked"] == []

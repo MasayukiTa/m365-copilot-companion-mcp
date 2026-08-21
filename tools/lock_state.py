@@ -31,11 +31,47 @@ from pathlib import Path
 from typing import Optional
 
 _STATE_FILE = Path(__file__).resolve().parent.parent / ".fleet" / "lock_state.json"
+
+#: EVERY refusal, not just the latest. The slot above holds one record, which was enough while
+#: one worker ran at a time and became the reason a real incident could not be reconstructed:
+#: with six workers, some caller's refusal marked every other worker's reply as locked for the
+#: freshness window, and the file could not say whose it was -- including the records written
+#: with an empty client_ip, whose author was unknown. Refusals are rare, so this grows slowly;
+#: .fleet is gitignored, so it publishes nothing.
+_LOG_FILE = Path(__file__).resolve().parent.parent / ".fleet" / "lock_refusals.jsonl"
 _LOCK = threading.Lock()
 
 # A reader asking "was a call just refused for lock?" only cares about the recent
 # past; an hour-old refusal says nothing about the turn being judged now.
 DEFAULT_FRESH_SEC = 180.0
+
+
+def _caller_site() -> str:
+    """Which refusal site wrote this, as file:line:function.
+
+    THE TOOL NAME IS NOT AVAILABLE HERE and the honest thing is to say so rather than invent a
+    field. The call sites live in a frozen, delegation-excluded module, so they cannot be
+    changed to pass one. The frame is what is on hand, and it answers the question that
+    actually blocked the last investigation: which of the three refusal sites -- and therefore
+    why some records carry an empty client_ip.
+    """
+    try:
+        import sys as _sys
+        f = _sys._getframe(2)
+        return "%s:%d:%s" % (os.path.basename(f.f_code.co_filename), f.f_lineno,
+                             f.f_code.co_name)
+    except Exception:
+        return ""
+
+
+def _append_log(payload: dict) -> None:
+    """One line per refusal. Best effort; a log that cannot be written must not refuse a call."""
+    try:
+        _LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(_LOG_FILE, "a", encoding="utf-8", newline=chr(10)) as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False) + chr(10))
+    except Exception:
+        pass
 
 
 def record_locked(client_ip: str = "", detail: str = "", ts: Optional[float] = None) -> None:
@@ -44,7 +80,9 @@ def record_locked(client_ip: str = "", detail: str = "", ts: Optional[float] = N
         "ts": float(ts if ts is not None else time.time()),
         "client_ip": str(client_ip or "")[:64],
         "detail": str(detail or "")[:200],
+        "site": _caller_site(),
     }
+    _append_log(dict(payload, event="refused"))
     try:
         with _LOCK:
             _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -97,6 +135,31 @@ def clear() -> None:
                 _STATE_FILE.unlink()
     except Exception:
         pass
+
+
+def matching_record(since: float, now: Optional[float] = None) -> dict:
+    """The refusal `locked_since` would match, or {} when there is none.
+
+    Exists so a caller can say WHICH record it acted on. `locked_since` answers yes or no, and
+    a yes that cannot name its evidence is what made one worker's refusal look like every
+    worker's lock for a whole run.
+    """
+    if not locked_since(since, now):
+        return {}
+    return read_state()
+
+
+def record_classification(branch: str, *, resp_len: int, since: float,
+                          consumed: Optional[dict] = None) -> None:
+    """Note that a reader classified a reply as locked, and on what evidence. Never raises."""
+    _append_log({
+        "ts": time.time(),
+        "event": "classified_locked",
+        "branch": str(branch),
+        "resp_len": int(resp_len),
+        "turn_sent_at": float(since or 0.0),
+        "consumed": consumed or {},
+    })
 
 
 def locked_since(since: float, now: Optional[float] = None) -> bool:
