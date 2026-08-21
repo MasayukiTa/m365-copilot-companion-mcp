@@ -62,6 +62,7 @@ import hashlib
 import io
 import json
 import os
+import unicodedata
 import time
 
 SCHEMA_VERSION = 1
@@ -244,26 +245,135 @@ UNDO_CMD = "python -m relay.selfimprove.frozen --revoke"
 VERIFY_CMD = "python -m relay.selfimprove.frozen --verify"
 
 
-def _headline(record) -> tuple:
+
+#: The name that appears as the SOURCE of the notification.
+#:
+#: A toast whose sender is not identifiable, carrying an exclamation mark and an instruction to
+#: run a command, is indistinguishable from malware -- the operator's own reaction to the first
+#: one was "is this a virus?". An alert dismissed on sight is worse than no alert: the detection
+#: was paid for and the telling failed. So the message names what is speaking, and urgency is
+#: carried by words rather than by punctuation that any scam also uses.
+NOTIFY_APP_ID = "Copilot Companion - self-improvement"
+
+
+def ui_language() -> str:
+    """"ja" or "en", from the operator's OS setting. Never raises.
+
+    The RECORD stays as it is in either case. Only the framing is translated: `reason` and
+    `authorization` are the operator's own words kept verbatim, and a paraphrase of the mandate
+    someone claimed is the one thing a reader most needs to judge for themselves.
+    """
+    override = os.environ.get("MCP_NOTIFY_LANG", "").strip().lower()
+    if override in ("ja", "en"):
+        return override
+    try:
+        import ctypes
+        lang_id = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+        if (lang_id & 0x3FF) == 0x11:            # LANG_JAPANESE
+            return "ja"
+        return "en"
+    except Exception:
+        pass
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        if os.environ.get(var, "").lower().startswith("ja"):
+            return "ja"
+    return "en"
+
+
+#: Framing only. Nothing here is a record; the record is the jsonl beside it.
+_MSG = {
+    "en": {
+        "mismatch_title": "Frozen set changed without a re-signing",
+        "mismatch_body": ("%s\n\nNobody approved this. If it was not you, the judge has moved "
+                          "under a running system.\n\nsee exactly what moved:\n  %s\n\nthen "
+                          "undo the code with git revert, or accept it deliberately with "
+                          "--snapshot --force --reason ..."),
+        "revoke_title": "A re-signing was withdrawn",
+        "revoke_body": ("%s\n\nreason: %s\n\nThe frozen check FAILS from now on, and that is "
+                        "the effect rather than a side effect: the approval is gone, the code "
+                        "is not. Finish with git revert, or re-sign on purpose."),
+        "rebless_title": "The constitution was re-signed",
+        "rebless_body": ("%s\n\nreason: %s\nauthorization: %s\n\nIf you did not say this, "
+                         "nothing here verified that you did.\n\nto withdraw it:\n  %s"),
+        "needs_attention": "Needs attention",
+        "b_when": "when", "b_event": "event", "b_files": "files affected",
+        "b_reason": "reason", "b_auth": "authorization", "b_actor": "actor claimed",
+        "b_notime": "(no timestamp)",
+        "b_withdraw": ("TO WITHDRAW THE APPROVAL (the code stays; the frozen check then fails "
+                       "on purpose):"),
+        "b_see": "TO SEE WHAT IS CURRENTLY OUT OF LINE:",
+        "b_undo": "TO UNDO THE CODE AS WELL, from the repo root:",
+        "b_tail": ("This file is rewritten on every act. The full history is append-only in "
+                   "the ledger beside it."),
+        "b_what": ("WHAT THIS IS: the audit trail for a change to the frozen set -- the "
+                   "graders and guards this system is not allowed to edit without saying so."),
+        "advice_mismatch": ("Nobody approved this. If it was not you, the judge has moved "
+                            "under a running system."),
+        "advice_revoke": ("The frozen check FAILS from now on, and that is the effect rather "
+                          "than a side effect: the approval is gone, the code is not."),
+        "advice_rebless": ("If you did not say the authorization above, nothing here verified "
+                           "that you did."),
+    },
+    "ja": {
+        "mismatch_title": "凍結ファイルが、承認なしに変更されました",
+        "mismatch_body": ("%s\n\n誰もこれを承認していません。あなたでないなら、"
+                          "稼働中のシステムの審判が動いたことになります。\n\n"
+                          "何が動いたかを見る:\n  %s\n\n"
+                          "そのうえで git revert でコードを戻すか、"
+                          "--snapshot --force --reason ... で意図的に受け入れてください。"),
+        "revoke_title": "承認が取り消されました",
+        "revoke_body": ("%s\n\n理由: %s\n\n以後、凍結チェックは失敗します。"
+                        "それは副作用ではなく意図した効果です -- 承認が消えただけで、"
+                        "コードは残っています。git revert で仕上げるか、"
+                        "意図して署名し直してください。"),
+        "rebless_title": "凍結ファイルの承認を更新しました",
+        "rebless_body": ("%s\n\n理由: %s\n権限の根拠: %s\n\n"
+                         "これをあなたが言っていないなら、それを検証したものはここにありません。"
+                         "\n\n取り消すには:\n  %s"),
+        "needs_attention": "要確認",
+        "b_when": "日時", "b_event": "種別", "b_files": "対象ファイル",
+        "b_reason": "理由", "b_auth": "権限の根拠", "b_actor": "実行者の自己申告",
+        "b_notime": "(日時なし)",
+        "b_withdraw": "承認だけを取り消す (コードは残り、凍結チェックは意図的に失敗するようになります):",
+        "b_see": "いま基準とずれているものを見る:",
+        "b_undo": "コードごと戻す (リポジトリのルートで):",
+        "b_tail": ("このファイルは操作のたびに上書きされます。"
+                   "完全な履歴は隣の台帳に追記のみで残ります。"),
+        "b_what": ("これは何か: 凍結ファイル -- このシステムが黙って書き換えてはいけない"
+                   "採点器と防護 -- への変更の監査記録です。"),
+        "advice_mismatch": ("誰もこれを承認していません。あなたでないなら、"
+                            "稼働中のシステムの審判が動いたことになります。"),
+        "advice_revoke": ("以後、凍結チェックは失敗します。それは副作用ではなく意図した効果です "
+                          "-- 承認が消えただけで、コードは残っています。"),
+        "advice_rebless": ("上の『権限の根拠』をあなたが言っていないなら、"
+                           "それを検証したものはここにありません。"),
+    },
+}
+
+
+def _t(key, lang=None):
+    lang = lang or ui_language()
+    return _MSG.get(lang, _MSG["en"]).get(key, _MSG["en"].get(key, key))
+
+
+def _headline(record, lang=None) -> tuple:
+    """(title, body) in the operator's language.
+
+    `reason` and `authorization` are interpolated VERBATIM and never translated. They are the
+    operator's own words and the claimed mandate; a paraphrase of either is the actor's opinion
+    of its own authority, which is the one thing the reader most needs to judge for themselves.
+    """
+    lang = lang or ui_language()
     event = record.get("event")
     changed = ", ".join(sorted(record.get("changed") or {})) or "-"
     auth = record.get("authorization") or SELF_INITIATED
     if event == BASELINE_MISMATCH:
-        return ("Frozen set changed without a re-signing",
-                "%s\n\nNobody approved this. If it was not you, the judge has moved under a "
-                "running system.\n\nsee exactly what moved:\n  %s\n\nthen undo the code with "
-                "git revert, or accept it deliberately with --snapshot --force --reason ..."
-                % (changed, VERIFY_CMD))
+        return (_t("mismatch_title", lang), _t("mismatch_body", lang) % (changed, VERIFY_CMD))
     if event == REVOKE:
-        return ("A re-signing was withdrawn",
-                "%s\n\nreason: %s\n\nThe frozen check FAILS from now on, and that is the "
-                "effect rather than a side effect: the approval is gone, the code is not. "
-                "Finish with git revert, or re-sign on purpose."
-                % (changed, record.get("reason")))
-    return ("The constitution was re-signed",
-            "%s\n\nreason: %s\nauthorization: %s\n\nIf you did not say this, nothing here "
-            "verified that you did.\n\nto withdraw it:\n  %s"
-            % (changed, record.get("reason"), auth, UNDO_CMD))
+        return (_t("revoke_title", lang),
+                _t("revoke_body", lang) % (changed, record.get("reason")))
+    return (_t("rebless_title", lang),
+            _t("rebless_body", lang) % (changed, record.get("reason"), auth, UNDO_CMD))
 
 
 def _notify(record) -> None:
@@ -285,8 +395,14 @@ def _notify(record) -> None:
         # of defect this whole notification exists to catch elsewhere. Urgency rides in the
         # title, which is the part a toast shows first.
         if record.get("event") in _URGENT:
-            title = "! " + title
-        notify_desktop(title=title, body=body, launch=_write_briefing(record, title, body))
+            # NOT "! ". A bare exclamation mark in front of a title, on a toast whose sender is
+            # not identifiable, telling you to run a command, is what a scam looks like -- the
+            # operator's first reaction to one of these was "is this a virus?". Urgency is
+            # carried by a word in their own language, and the SOURCE is named through app_id,
+            # because the fastest way to be believed is to be recognisable.
+            title = "%s: %s" % (_t("needs_attention"), title)
+        notify_desktop(title=title, body=body, app_id=NOTIFY_APP_ID,
+                       launch=_write_briefing(record, title, body))
     except Exception:
         pass
 
@@ -298,7 +414,7 @@ def briefing_path(ledger_path=None) -> str:
 
 
 
-def _when(record) -> str:
+def _when(record, lang=None) -> str:
     """The record's timestamp as local time, or "(no timestamp)" -- never blank.
 
     A blank field reads as "nothing to say here". A record that cannot say when it happened
@@ -306,7 +422,7 @@ def _when(record) -> str:
     """
     ts = record.get("ts")
     if not ts:
-        return "(no timestamp)"
+        return _t("b_notime", lang)
     try:
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts)))
     except Exception:
@@ -325,40 +441,59 @@ def _write_briefing(record, title, body) -> str:
     Never raises: a briefing that cannot be written must not stop the record or the alert.
     """
     try:
+        lang = ui_language()
         path = briefing_path(record.get("_ledger_path"))
         changed = sorted(record.get("changed") or {})
+
+        def _row(key, value):
+            # Padded on display width rather than character count: a Japanese label is half the
+            # characters and twice the width, and %-14s lines up one language by breaking the
+            # other.
+            label = _t(key, lang)
+            width = sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in label)
+            return "%s%s: %s" % (label, " " * max(1, 18 - width), value)
+
         lines = [
             title,
-            "=" * len(title),
+            "=" * 60,
+            "",
+            # WHAT IT IS, BEFORE WHAT IT SAYS. The operator opened one of these and asked what
+            # the file was -- reasonably, since it opened by itself and started with a term
+            # only this repository uses.
+            _t("b_what", lang),
             "",
             # `ts`, NOT `at`. `append` writes `ts` as a unix float and no record has ever
             # carried `at`, so this line rendered blank -- an audit record of a change to the
             # graders, with the one field that says WHEN it happened missing. It reached the
-            # operator that way. Rendered as local time here because the reader is a person
-            # deciding whether they recognise the act, not a program.
-            "when          : %s" % _when(record),
-            "event         : %s" % record.get("event", ""),
-            "files affected: %s" % (", ".join(changed) or "-"),
-            "reason        : %s" % (record.get("reason") or "-"),
-            "authorization : %s" % (record.get("authorization") or SELF_INITIATED),
-            "actor claimed : %s" % (record.get("actor_claimed") or "-"),
+            # operator that way.
+            _row("b_when", _when(record, lang)),
+            _row("b_event", record.get("event", "")),
+            _row("b_files", ", ".join(changed) or "-"),
+            # VERBATIM, NEVER TRANSLATED. These two are the operator's own words and the
+            # mandate someone claimed; a paraphrase is the actor's opinion of its own
+            # authority, which is exactly what the reader is here to judge.
+            _row("b_reason", record.get("reason") or "-"),
+            _row("b_auth", record.get("authorization") or SELF_INITIATED),
+            _row("b_actor", record.get("actor_claimed") or "-"),
             "",
-            body,
+            # THE ADVICE ONLY. The toast body repeats the reason and the authorization, which
+            # the table above already shows -- printing it here made the operator read the
+            # same two fields twice and look for the difference.
+            _t({BASELINE_MISMATCH: "advice_mismatch",
+                REVOKE: "advice_revoke"}.get(record.get("event"), "advice_rebless"), lang),
             "",
-            "-" * 72,
-            "TO WITHDRAW THE APPROVAL (the code stays; the frozen check then fails on",
-            "purpose, which is the effect and not a mistake):",
+            "-" * 60,
+            _t("b_withdraw", lang),
             "    %s" % UNDO_CMD,
             "",
-            "TO SEE WHAT IS CURRENTLY OUT OF LINE:",
+            _t("b_see", lang),
             "    %s" % VERIFY_CMD,
             "",
-            "TO UNDO THE CODE AS WELL, from the repo root:",
+            _t("b_undo", lang),
             "    git log --oneline -- <file>",
             "    git revert <commit>",
             "",
-            "This file is rewritten on every act. The full history is append-only in the",
-            "ledger beside it.",
+            _t("b_tail", lang),
         ]
         with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("\n".join(lines) + "\n")

@@ -210,6 +210,7 @@ def _fired(monkeypatch, tmp_path, event, **kw):
 
 def test_a_resigning_reaches_the_operator(tmp_path, monkeypatch):
     """委任したので事前には聞かない。届かなければ、ダッシュボードを開くまで誰も知らない。"""
+    monkeypatch.setenv("MCP_NOTIFY_LANG", "en")   # 文言は運用者の言語で出る。検査は英語で固定。
     calls = _fired(monkeypatch, tmp_path, L.REBLESS, authorization="operator said so")
     assert len(calls) == 1
     assert "re-signed" in calls[0]["title"]
@@ -221,8 +222,13 @@ def test_a_resigning_reaches_the_operator(tmp_path, monkeypatch):
 def test_a_mismatch_is_the_urgent_one(tmp_path, monkeypatch):
     """再署名はたいてい頼まれた行為。不一致は**頼まれずに判定者が動いた**こと。
     検知は前からあったが、台帳に書くだけで誰にも告げていなかった。"""
+    monkeypatch.setenv("MCP_NOTIFY_LANG", "en")
     calls = _fired(monkeypatch, tmp_path, L.BASELINE_MISMATCH, changed={"x.py": {}})
-    assert calls[0]["title"].startswith("! ")
+    # 『!』前置はやめた -- 差出人不明のトーストに『!』が付きコマンドの実行を促す形は
+    # 詐欺の見た目そのもので、実際に『ウイルス?』と受け取られた。緊急は読み手の言語の
+    # 語で伝え、差出人は app_id で名乗る。検査すべきは印ではなく「緊急だと分かること」。
+    assert calls[0]["title"].startswith(L._t("needs_attention", "en"))
+    assert not calls[0]["title"].startswith("! ")
     assert "Nobody approved" in calls[0]["body"]
 
 
@@ -300,7 +306,7 @@ def test_a_withdrawal_says_what_state_you_are_now_in():
     取り消した人は『壊した』と思って元に戻す。"""
     from relay.selfimprove import authority_ledger as AL
     _t, body = AL._headline({"event": AL.REVOKE, "changed": {"relay/x.py": "h"},
-                             "reason": "r"})
+                             "reason": "r"}, "en")
     assert "FAILS" in body and "git revert" in body
 
 
@@ -392,8 +398,8 @@ def test_a_record_without_a_timestamp_says_so_rather_than_going_blank():
     """空欄は『ここには言うことがない』と読める。
     言えないなら、言えないと書く。"""
     from relay.selfimprove import authority_ledger as AL
-    assert AL._when({}) == "(no timestamp)"
-    assert AL._when({"ts": None}) == "(no timestamp)"
+    assert AL._when({}, "en") == "(no timestamp)"
+    assert AL._when({"ts": None}, "ja") == "(日時なし)"
 
 
 def test_the_briefing_body_carries_the_time(tmp_path, monkeypatch):
@@ -402,7 +408,110 @@ def test_the_briefing_body_carries_the_time(tmp_path, monkeypatch):
     p = tmp_path / "authority.jsonl"
     rec = AL.append(AL.REBLESS, reason="r", actor_claimed="t", path=str(p))
     rec = dict(rec, _ledger_path=str(p))
+    monkeypatch.setenv("MCP_NOTIFY_LANG", "en")
     AL._write_briefing(rec, "The constitution was re-signed", "body")
     text = open(AL.briefing_path(str(p)), encoding="utf-8").read()
-    assert "when          :" in text
+    assert "when" in text
     assert "(no timestamp)" not in text, text[:300]
+
+
+# ---- 運用者の言語で届くこと ---------------------------------------------------------------------
+
+def test_the_notification_follows_the_operators_language(monkeypatch):
+    """日本語環境の利用者の多くは、英語の通知の意味を取れない。
+    取れない警告は、検知の費用だけ払って伝達に失敗している。"""
+    from relay.selfimprove import authority_ledger as AL
+    rec = {"event": AL.REBLESS, "reason": "r", "authorization": "a", "changed": {"x.py": {}}}
+    ja_title, ja_body = AL._headline(rec, "ja")
+    en_title, en_body = AL._headline(rec, "en")
+    assert ja_title != en_title
+    assert "承認" in ja_title and "re-signed" in en_title
+
+
+def test_the_operators_own_words_are_never_translated():
+    """reason と authorization は運用者の発言と、誰かが主張した権限の根拠。
+    言い換えは実行者による自分の権限の要約であり、
+    読み手が自分で判断したい唯一のものを奪う。"""
+    from relay.selfimprove import authority_ledger as AL
+    rec = {"event": AL.REBLESS, "reason": "keep this exact string",
+           "authorization": "これも一字一句", "changed": {"x.py": {}}}
+    for lang in ("ja", "en"):
+        _, body = AL._headline(rec, lang)
+        assert "keep this exact string" in body
+        assert "これも一字一句" in body
+
+
+def test_language_can_be_forced_for_a_deterministic_test(monkeypatch):
+    from relay.selfimprove import authority_ledger as AL
+    monkeypatch.setenv("MCP_NOTIFY_LANG", "en")
+    assert AL.ui_language() == "en"
+    monkeypatch.setenv("MCP_NOTIFY_LANG", "ja")
+    assert AL.ui_language() == "ja"
+
+
+def test_an_unknown_locale_falls_back_to_english(monkeypatch):
+    from relay.selfimprove import authority_ledger as AL
+    monkeypatch.setenv("MCP_NOTIFY_LANG", "kl")
+    monkeypatch.setattr(AL, "ui_language", lambda: "kl")
+    assert AL._t("rebless_title", "kl") == AL._t("rebless_title", "en")
+
+
+# ---- マルウェアに見えないこと -------------------------------------------------------------------
+
+def test_an_urgent_alert_does_not_open_with_a_bare_exclamation_mark():
+    """差出人の分からないトーストに『!』が付き、コマンドを実行しろと書いてある --
+    それは詐欺の見た目そのもので、実際に『ウイルス?』と受け取られた。
+    一目で消される警告は、警告が無いより悪い。"""
+    import ast
+    import inspect
+    from relay.selfimprove import authority_ledger as AL
+    src = inspect.getsource(AL._notify)
+    tree = ast.parse(src.lstrip())
+    literals = {n.value for n in ast.walk(tree)
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    assert "! " not in literals
+
+
+def test_the_notification_names_its_sender():
+    """信じてもらう一番の近道は、見覚えがあること。"""
+    from relay.selfimprove import authority_ledger as AL
+    import inspect
+    assert AL.NOTIFY_APP_ID
+    assert "app_id=NOTIFY_APP_ID" in inspect.getsource(AL._notify)
+
+
+def test_urgency_is_carried_by_a_word_in_the_readers_language():
+    from relay.selfimprove import authority_ledger as AL
+    assert AL._t("needs_attention", "ja") == "要確認"
+    assert AL._t("needs_attention", "en") == "Needs attention"
+
+
+# ---- 開いた人が「これは何か」を最初に読めること -----------------------------------------------------
+
+def test_the_briefing_opens_by_saying_what_it_is(tmp_path, monkeypatch):
+    """勝手に開き、このリポジトリしか使わない語で始まるファイルを見せられて
+    『これは何』と訊かれた。それが答えのある場所。"""
+    from relay.selfimprove import authority_ledger as AL
+    monkeypatch.setenv("MCP_NOTIFY_LANG", "ja")
+    monkeypatch.setattr(AL, "_notify", lambda r: None)
+    p = tmp_path / "authority.jsonl"
+    rec = AL.append(AL.REBLESS, reason="r", actor_claimed="t", path=str(p))
+    rec = dict(rec, _ledger_path=str(p))
+    AL._write_briefing(rec, *AL._headline(rec))
+    text = open(AL.briefing_path(str(p)), encoding="utf-8").read()
+    assert "これは何か" in text.split("\n")[3]
+
+
+def test_the_briefing_does_not_print_the_same_two_fields_twice(tmp_path, monkeypatch):
+    """表に出したものを本文でも繰り返すと、読み手は差分を探してしまう。"""
+    from relay.selfimprove import authority_ledger as AL
+    monkeypatch.setenv("MCP_NOTIFY_LANG", "ja")
+    monkeypatch.setattr(AL, "_notify", lambda r: None)
+    p = tmp_path / "authority.jsonl"
+    rec = AL.append(AL.REBLESS, reason="UNIQUEREASON", actor_claimed="t",
+                    authorization="UNIQUEAUTH", path=str(p))
+    rec = dict(rec, _ledger_path=str(p))
+    AL._write_briefing(rec, *AL._headline(rec))
+    text = open(AL.briefing_path(str(p)), encoding="utf-8").read()
+    assert text.count("UNIQUEREASON") == 1, text
+    assert text.count("UNIQUEAUTH") == 1, text
