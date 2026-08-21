@@ -18,6 +18,7 @@ from __future__ import annotations
 import glob as _glob
 import json
 import os
+import time as _time
 
 # Resolve every default path relative to the repo root (this file lives at
 # <root>/relay/selfimprove/dashboard.py, so the root is two directories up).
@@ -195,6 +196,71 @@ def _archive_sections(archive_path):
 # Public API
 # --------------------------------------------------------------------------------------------------
 
+
+def _branch_section():
+    """Branches, what is running right now, and every comparison attempt.
+
+    THE POINT OF THIS SECTION IS THE ONE LINE THAT SAYS WHAT IS RUNNING.
+
+    "Running on a harness nobody remembers naming" has no other symptom: the fleet works, runs
+    complete, and the numbers look like numbers. Resolving the live harness back to a label --
+    and reporting `unnamed` rather than rounding it to `base` -- is the only detector that
+    state has, which is why it is the first thing in here and not a footnote.
+
+    Read-only and defensive like every other section: a missing branches file or an archive
+    that will not open produces an empty section, never an exception. A dashboard that cannot
+    render because one ledger is absent is a dashboard nobody trusts during an incident.
+    """
+    out = {"active": {"kind": "unknown", "label": None}, "branches": [], "comparisons": [],
+           "pending": 0, "instrument": {"measures": [], "note": ""}}
+    try:
+        import os as _os
+
+        from relay.selfimprove import archive as A
+        from relay.selfimprove import branches as BR
+        from relay.selfimprove import compare as C
+
+        repo = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+        arc = A.Archive(_os.path.join(repo, ".fleet", "selfimprove", "archive.jsonl"))
+        out["active"] = BR.describe_active(archive=arc)
+        for label, ref in sorted(BR.read().items()):
+            row = {"label": label, "genome_id": ref.get("genome_id"),
+                   "last_run_at": ref.get("last_run_at"), "note": ref.get("note") or "",
+                   "resolves": True}
+            try:
+                BR.resolve(label, archive=arc)
+            except Exception:
+                row["resolves"] = False
+            out["branches"].append(row)
+
+        measures, note = C.instrument_measures()
+        out["instrument"] = {"measures": list(measures), "note": note}
+        out["pending"] = len(C.pending())
+
+        # EVERY attempt, oldest first. Not the best one, and not the latest one: a pair whose
+        # history shows only its most favourable run, beside a control that starts another, is
+        # an instrument for producing whichever answer was wanted.
+        gone = C.withdrawn_ids()
+        for row in C.read_results():
+            if row.get("withdraws"):
+                continue
+            verdict = row.get("verdict")
+            if row.get("request_id") in gone and verdict is not None:
+                verdict = "WITHDRAWN"
+            out["comparisons"].append({
+                "at": row.get("at"),
+                "a": (row.get("a") or {}).get("label"),
+                "b": (row.get("b") or {}).get("label"),
+                "verdict": verdict,
+                "original_verdict": row.get("verdict") if verdict == "WITHDRAWN" else None,
+                "why": row.get("why") or "",
+                "refused": bool(row.get("refused")),
+            })
+    except Exception:
+        return out
+    return out
+
+
 def dashboard_state(*, archive_path=None, burned_path=None, grade_results_path=None,
                     reports_glob=None) -> dict:
     """Aggregate the self-improvement ledgers into one JSON-safe ``dashboard_state`` dict.
@@ -261,6 +327,7 @@ def dashboard_state(*, archive_path=None, burned_path=None, grade_results_path=N
     return {
         "summary": summary,
         "usage": usage,
+        "branches": _branch_section(),
         "ab_history": ab_history,
         "pass1_trend": pass1_trend,
         "burned_ledger": burned_ledger,
@@ -302,6 +369,59 @@ def write_json(path=None) -> str:
         except Exception:
             pass
     return out_path
+
+
+
+def _render_branches(state) -> list:
+    """The branch block, with the running-harness line first."""
+    section = state.get("branches") or {}
+    active = section.get("active") or {}
+    lines = ["", "BRANCHES", "-" * 26]
+
+    kind, label = active.get("kind"), active.get("label")
+    if kind == "branch":
+        lines.append("running now   : %s" % label)
+    elif kind == "base":
+        lines.append("running now   : base (as shipped)")
+    elif kind == "unnamed":
+        # SAID LOUDLY, because it has no other symptom. Everything works; nobody can say what
+        # is running.
+        lines.append("running now   : UNNAMED HARNESS -- no branch points at it (%s)"
+                     % str(active.get("harness_id") or "")[:12])
+        lines.append("                nobody named what this machine is running")
+    else:
+        lines.append("running now   : unknown")
+
+    for row in section.get("branches") or []:
+        last = row.get("last_run_at")
+        stamp = _time.strftime("%Y-%m-%d", _time.localtime(last)) if last else "never"
+        broken = "" if row.get("resolves") else "  [BROKEN REF]"
+        lines.append("  %-18s %s  last run %s%s"
+                     % (row.get("label"), str(row.get("genome_id") or "")[:12], stamp, broken))
+    if not section.get("branches"):
+        lines.append("  (none)")
+
+    instrument = section.get("instrument") or {}
+    if instrument.get("measures"):
+        lines.append("instrument    : sees %s -- %s"
+                     % (", ".join(instrument["measures"]), instrument.get("note", "")[:60]))
+
+    comparisons = section.get("comparisons") or []
+    if comparisons or section.get("pending"):
+        lines.append("comparisons   : %d recorded, %d queued (ALL attempts shown)"
+                     % (len(comparisons), section.get("pending") or 0))
+    for row in comparisons[-8:]:
+        stamp = (_time.strftime("%m-%d %H:%M", _time.localtime(row["at"]))
+                 if row.get("at") else "     ")
+        verdict = row.get("verdict")
+        # INCONCLUSIVE is not a quiet win and must not read like one. A refusal is not a
+        # result at all, and neither is a withdrawn verdict.
+        mark = {"A": "->", "B": "<-", "INCONCLUSIVE": "==",
+                "WITHDRAWN": "xx", None: "--"}.get(verdict, "??")
+        shown = verdict or ("refused" if row.get("refused") else "no verdict")
+        lines.append("  %s %s %s %s %-12s %s"
+                     % (stamp, row.get("a"), mark, row.get("b"), shown, (row.get("why") or "")[:52]))
+    return lines
 
 
 def render_text(state) -> str:
@@ -372,6 +492,7 @@ def render_text(state) -> str:
     else:
         lines.append("A/B history   : none")
 
+    lines.extend(_render_branches(state))
     return "\n".join(lines)
 
 
