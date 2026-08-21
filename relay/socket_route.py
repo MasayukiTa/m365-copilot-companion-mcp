@@ -226,6 +226,12 @@ def websocket_connect(url, headers, timeout_s):
 
     Kept out of chathub.py deliberately: that module chooses no socket library, which is what
     lets its protocol be tested without a network.
+
+    NOT CALLABLE FROM A THREAD PLAYWRIGHT'S SYNC API IS DRIVING. That API owns an event loop on
+    its thread and this starts one of its own, so inside a `with sync_playwright()` block it
+    raises "Cannot run the event loop while another loop is running". Production never hits it
+    -- CopilotSocketDriver runs every turn on its own thread -- but a script that captures a
+    token and then speaks in the same block will, and the error does not say why.
     """
     import asyncio
 

@@ -611,6 +611,12 @@ class ResearchSession:
             if not open_agent(self.page, self.profile):
                 self._fail("the %s surface did not open" % self.profile.name); return
             if self.upload_path:
+                # AND THIS IS WHY THE ANALYST CANNOT USE A SOCKET: the file goes into a real
+                # <input type=file>, and a socket has nowhere to put one. Measured across
+                # twenty socket turns and eight request classes, it is the ONLY property found
+                # so far that structurally forces a tab -- and it is knowable here, from a
+                # parameter the caller already set, rather than predicted from request text.
+                # relay/transport_policy.py owns the transport decision; this belongs in it.
                 # THE ANALYST NEEDS THE DATA BEFORE THE QUESTION. A failed upload must end the
                 # session rather than send an instruction about a file that is not there --
                 # which would come back as a confident answer about nothing.
