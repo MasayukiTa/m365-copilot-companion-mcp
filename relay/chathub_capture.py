@@ -23,6 +23,15 @@ import json
 from relay.chathub import RS, ChatHubError, RequestTemplate, expires_in
 
 
+class NotAnAgentSurface(ChatHubError):
+    """The tab is not on an agent surface, so no capture from it can ever name an agent.
+
+    ITS OWN TYPE BECAUSE IT MUST NOT BE RETRIED. A capture costs a real turn, and this
+    condition is structural: the same tab will fail identically every time. Measured -- the
+    first version of the retry spent three real turns rediscovering it.
+    """
+
+
 def _frames(payloads):
     out = []
     for payload in payloads:
@@ -53,6 +62,9 @@ def capture(page, *, prompt: str = "ping", timeout_s: float = 180.0, attempts: i
     for attempt in range(max(1, int(attempts))):
         try:
             return _capture_once(page, prompt=prompt, timeout_s=timeout_s)
+        except NotAnAgentSurface:
+            # Structural, not flaky. Retrying buys nothing and costs a real turn each time.
+            raise
         except Exception as exc:
             last = exc
     raise ChatHubError("capture failed after %d attempts: %s: %s"
@@ -95,7 +107,7 @@ def _capture_once(page, *, prompt: str, timeout_s: float):
         # A template with no agent reaches the DEFAULT Copilot -- no tools, no tenant
         # grounding. That is a different product answering, and it must not pass silently as
         # if the socket route had worked.
-        raise ChatHubError("the captured request names no agent; the tab is not on an agent "
-                           "surface, and a socket built from it would reach the default "
-                           "Copilot instead")
+        raise NotAnAgentSurface(
+            "the captured request names no agent; the tab is not on an agent surface, and a "
+            "socket built from it would reach the default Copilot instead")
     return token, template

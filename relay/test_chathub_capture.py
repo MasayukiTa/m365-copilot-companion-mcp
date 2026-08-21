@@ -57,3 +57,25 @@ def test_attempts_is_never_zero_however_it_is_asked_for(monkeypatch):
                         lambda page, *, prompt, timeout_s: calls.append(1) or ("t", "p"))
     CC.capture(object(), attempts=0)
     assert len(calls) == 1
+
+
+def test_a_structural_failure_is_not_retried(monkeypatch):
+    """『このタブはエージェント面ではない』は何回やっても同じ結果になる。
+    捕獲1回は実ターン1回ぶんの費用なので、3回繰り返すのは3ターンの浪費。
+    実際にそうなった -- 最初の再試行実装がこれをやった。"""
+    calls = []
+
+    def structural(page, *, prompt, timeout_s):
+        calls.append(1)
+        raise CC.NotAnAgentSurface("names no agent")
+
+    monkeypatch.setattr(CC, "_capture_once", structural)
+    with pytest.raises(CC.NotAnAgentSurface):
+        CC.capture(object(), attempts=5)
+    assert len(calls) == 1
+
+
+def test_a_structural_failure_still_reads_as_a_capture_failure_to_the_caller():
+    """呼び出し側 (SocketRoute.refresh) は ChatHubError を捕まえてタブに落ちる。
+    新しい型がその網から漏れると、経路の失敗が例外になって艦隊まで届く。"""
+    assert issubclass(CC.NotAnAgentSurface, ChatHubError)
