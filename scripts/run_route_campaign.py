@@ -52,7 +52,8 @@ def main():
     print("[campaign] candidate=%s goals=%d" % (version, len(GOALS)), flush=True)
     print("[campaign] agent=%s" % agent_url[:60], flush=True)
 
-    exp = "route-%s-%s-%d" % (version.replace("/", "-"),
+    exp = "route-%s%s-%s-%d" % (version.replace("/", "-"),
+                              "-NULL" if "--null" in sys.argv else "",
                               "candfirst" if candidate_first else "ctrlfirst",
                               int(time.time()))
     led = L.HypothesisLedger()
@@ -65,9 +66,13 @@ def main():
         candidate_id=M.harness_id(candidate),
         parent_harness_id=M.harness_id(M.base_manifest()),
         target_failure_class="edge_memory_exhaustion",
-        hypothesis="Sending goals the fixed Work IQ predicate clears over a socket instead "
-                   "of a tab lowers peak Edge memory without losing completions, because a "
-                   "socket carries the conversation without a renderer.",
+        hypothesis=(
+            "NULL RUN: both arms are the control. Any difference reported is the "
+            "instrument's noise, and it is what the decision threshold has to clear."
+            if "--null" in sys.argv else
+            "Sending goals the fixed Work IQ predicate clears over a socket instead "
+            "of a tab lowers peak Edge memory without losing completions, because a "
+            "socket carries the conversation without a renderer."),
         changed_components={"transport": version},
         predicted_effect={"peak_edge_mb": "-300 or better", "done": "unchanged"},
         possible_regressions=["a goal that needed a tab falls back and costs a turn",
@@ -98,7 +103,8 @@ def main():
     )
     evaluate = S.route_evaluator_for(GOALS, agent_url=agent_url, max_concurrent=2,
                                      candidate_first=candidate_first,
-                                     warmup="--warmup" in sys.argv)
+                                     warmup="--warmup" in sys.argv,
+                                     null_arm="--null" in sys.argv)
     t0 = time.time()
     out = evaluate(candidate, exp)
     out["wall_s"] = round(time.time() - t0, 1)

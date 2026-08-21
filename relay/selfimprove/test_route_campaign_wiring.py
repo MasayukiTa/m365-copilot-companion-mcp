@@ -101,7 +101,10 @@ def test_the_route_singleton_is_rebuilt_between_arms():
 def test_the_arms_differ_by_the_switch_and_the_switch_is_set_both_ways():
     src = inspect.getsource(S.route_evaluator_for)
     assert 'MCP_FLEET_SOCKET"] = "1" if socket_on else "0"' in src
-    assert "socket_on=False" in src and "socket_on=True" in src
+    # null_arm を足した時点で literal "socket_on=True" は消え、この検査は落ちた。
+    # 検査すべきは「両腕でスイッチが逆になる」ことで、その書き方ではない。
+    assert "socket_on=False" in src
+    assert "socket_on=not null_arm" in src or "socket_on=True" in src
 
 
 def test_fallbacks_come_from_the_route_this_arm_built():
@@ -159,8 +162,12 @@ def test_the_candidate_manifest_reaches_the_candidate_arm():
     今日この系が4座標を正当に拒否した『両腕が同じプログラム』欠陥の、
     マニフェスト階層での再発。"""
     src = inspect.getsource(S.route_evaluator_for)
-    assert "manifest=candidate_manifest" in src, "候補腕が候補を読んでいない"
-    assert "manifest=None" in src, "対照腕が基準に戻っていない"
+    assert "candidate_manifest" in src, "候補腕が候補を読んでいない"
+    i = src.index("def _candidate():")
+    j = src.index("def _warmup")
+    assert "candidate_manifest" in src[i:j], "候補腕の中で候補が使われていない"
+    k = src.index("def _control():")
+    assert "manifest=None" in src[k:i], "対照腕が基準に戻っていない"
 
 
 def test_the_arm_does_not_rewrite_the_operators_active_harness():
@@ -238,9 +245,12 @@ def test_the_baseline_is_reset_before_the_arm_not_inside_the_sampler():
     """measure_arm は run_goals の前に1回サンプルを取る。サンプラ内で遅延初期化すると、
     その1回 -- start_mb になる値 -- だけ前の腕のベースラインを引き継ぐ。"""
     src = inspect.getsource(S.route_evaluator_for)
-    for arm in ("def _control():", "def _candidate():"):
-        i = src.index(arm)
-        assert "_begin_attribution()" in src[i:i + 200], arm
+    # docstring が伸びた分で落ちないよう、位置ではなく「腕の本体の最初の実文」を見る。
+    for arm, end in (("def _control():", "def _candidate():"),
+                     ("def _candidate():", "def _warmup")):
+        body = src[src.index(arm):src.index(end)]
+        assert "_begin_attribution()" in body, arm
+        assert body.index("_begin_attribution()") < body.index("RV.measure_arm"), arm
 
 
 def test_the_renderer_count_is_reported_because_the_mechanism_beats_the_statistic():
@@ -277,3 +287,24 @@ def test_a_shrinking_process_does_not_pay_the_arm_a_credit():
     i = src.index("def _edge_mb")
     body = src[i:i + 3600]
     assert "if grew > 0:" in body
+
+
+# ---- 閾値をノイズから較正するための帰無走行 ------------------------------------------------------
+
+def test_a_null_run_makes_both_arms_the_control():
+    """判定閾値 300MB は、いま壊れていると分かった総RSS計測から較正された値。
+    観測結果に合わせて下げれば『定規を対象に合わせて削る』ことになる。
+    同一の2腕がどれだけ離れて着地するかを測るのが、ゲームできない版の同じ問い。"""
+    src = inspect.getsource(S.route_evaluator_for)
+    assert "null_arm" in src
+    i, j = src.index("def _candidate():"), src.index("def _warmup")
+    body = src[i:j]
+    assert "None if null_arm else candidate_manifest" in body
+    assert "socket_on=not null_arm" in body, "帰無腕が socket を有効にしたままになる"
+
+
+def test_a_null_run_is_labelled_in_the_result():
+    """帰無走行の数字が処置の結果として読まれると、
+    『効果ゼロ』が『効果を検出できなかった』と混同される。"""
+    src = inspect.getsource(S.route_evaluator_for)
+    assert '"null_run"' in src

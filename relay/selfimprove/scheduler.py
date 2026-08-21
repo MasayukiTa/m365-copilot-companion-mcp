@@ -516,7 +516,7 @@ CAMPAIGN_SOCKET_LOG = os.path.join(
 
 def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222",
                         max_concurrent=2, log_path=None, candidate_first=False,
-                        warmup=False):
+                        warmup=False, null_arm=False):
     """An `evaluate(manifest, experiment_id)` that measures transport, not pass@1.
 
     CompanionBench answers "did the candidate solve more episodes". For a transport hypothesis
@@ -739,11 +739,23 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
             return out
 
         def _candidate():
+            """The candidate arm -- or, under `null_arm`, a SECOND CONTROL.
+
+            A null run answers the question a threshold cannot be set without: how far apart
+            do two identical arms land on this instrument. The 300 MB figure in the frozen
+            judge was derived from the total-RSS measurements, which are now known to have
+            been measuring arm order, so it is calibrated against an instrument that no
+            longer exists. Lowering it to fit an observed result would be tuning the ruler to
+            the object; measuring two identical arms is the version of that question that
+            cannot be gamed, because nothing in the comparison differs.
+            """
             _begin_attribution()
             out = RV.measure_arm(
-                lambda g, s, smp: _run(g, s, smp, manifest=candidate_manifest),
-                goals=goals, socket_on=True, peak_sampler=_edge_mb)
+                lambda g, s, smp: _run(g, s, smp,
+                                       manifest=None if null_arm else candidate_manifest),
+                goals=goals, socket_on=not null_arm, peak_sampler=_edge_mb)
             out["new_renderers"] = _attr["peak_new_pids"]
+            out["is_null"] = bool(null_arm)
             return out
 
         def _warmup():
@@ -798,6 +810,7 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
             "min_free_mb": round(low, 1) if low is not None else None,
             "arm_order": "candidate,control" if candidate_first else "control,candidate",
             "warmup": bool(warmup),
+            "null_run": bool(null_arm),
             # THE MECHANISM, WHICH IS WORTH MORE THAN THE STATISTIC HERE. A socket goal should
             # create no renderer at all, so the fleet-scale difference is arithmetic --
             # renderers avoided times commit per renderer -- rather than an effect that has to

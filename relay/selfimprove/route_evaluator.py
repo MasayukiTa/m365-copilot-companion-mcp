@@ -63,9 +63,26 @@ import time
 #: recorded with the result, because that bias is not something a floor can remove.
 MIN_FREE_MB = 512.0
 
-#: How much less peak memory the candidate must use before "better" is claimed. Set from the
-#: measured gap between the routes (+205 MB against +1653 MB) -- generous enough that noise
-#: cannot clear it, far below what the route actually delivers when it works.
+#: How much less memory the candidate must use before "better" is claimed.
+#:
+#: THE ORIGINAL DERIVATION WAS WORTHLESS AND THE NUMBER SURVIVED ANYWAY.
+#:
+#: It was set from a measured gap between the routes (+205 MB against +1653 MB) taken with the
+#: total-RSS sampler, which later turned out to be measuring which arm ran first. A threshold
+#: calibrated against an instrument that was reading the wrong quantity is not calibrated.
+#:
+#: What it now rests on is a null experiment: the same comparison run with BOTH arms set to the
+#: control, so the two arms are the same program and every difference reported is the
+#: instrument's own spread. Two null runs, in both arm orders:
+#:
+#:     null, control first      291.7 MB vs 471.5 MB     reported "gain" -179.8 MB
+#:     null, candidate first    237.3 MB vs 107.0 MB     reported "gain" -130.3 MB
+#:
+#: So identical arms land 130-180 MB apart, and 300 sits above that. The number is unchanged --
+#: which matters, because the two treatment runs measured +94.9 MB and -11.5 MB, and a
+#: threshold moved after seeing those would have been the ruler being cut to fit the object.
+#: The honest reading of those runs is that the effect, if any, is SMALLER than the noise: this
+#: design lacks the power to detect it, and no threshold can repair that.
 MIN_MEMORY_GAIN_MB = 300.0
 
 
