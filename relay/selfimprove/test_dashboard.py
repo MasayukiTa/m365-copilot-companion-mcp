@@ -83,7 +83,8 @@ def test_aggregates_correctly():
                                grade_results_path=grade, reports_glob=reports_glob)
 
         # top-level shape (now includes the general-user `usage` lens)
-        assert set(st.keys()) == {"summary", "usage", "ab_history", "pass1_trend", "burned_ledger", "archive"}
+        assert set(st.keys()) == {"summary", "usage", "ab_history", "pass1_trend",
+                                  "burned_ledger", "archive", "branches"}
 
         # summary
         s = st["summary"]
@@ -223,7 +224,8 @@ def test_write_json_writes_valid_feed():
         assert os.path.isfile(out)
         with open(out, encoding="utf-8") as f:
             obj = json.load(f)                                       # must be valid JSON
-        assert set(obj.keys()) == {"summary", "usage", "ab_history", "pass1_trend", "burned_ledger", "archive"}
+        assert set(obj.keys()) == {"summary", "usage", "ab_history", "pass1_trend",
+                                   "burned_ledger", "archive", "branches"}
         # pretty-printed (indent=2) -> multi-line with leading spaces, not a single dense line
         raw = open(out, encoding="utf-8").read()
         assert "\n  " in raw
