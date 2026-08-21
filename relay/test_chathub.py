@@ -516,3 +516,58 @@ def test_progress_from_the_user_is_not_collected():
     """author が bot でないものは、こちらが送った文の反射でしかない。"""
     frame = _progress_frame("これは自分が送った文", author="user")
     assert CH.collect_progress(frame) == []
+
+
+# ---- モデル指定（実測 2026-08-21） ------------------------------------------------------------
+#
+# Researcher のモデルピッカーはページ状態ではなくリクエストに乗る。Default と Claude で
+# 捕獲したフレームを突き合わせたところ、動いた非 volatile フィールドはちょうど1つ:
+#   gpts[0].clientOverrides.deepResearchModels[0]: "Default" -> "Claude"
+
+def _researcher_frame(model="Default"):
+    return {"gpts": [{"id": "P_x.dr_work", "source": "MOS3", "version": "1.4.19",
+                      "clientOverrides": {"capabilities": [{"name": "WebSearch"}],
+                                          "deepResearchModels": [model]}}],
+            "threadLevelGptId": {"id": "P_x.dr_work", "source": "MOS3"},
+            "optionsSets": ["keep-me"]}
+
+
+def test_a_template_can_name_the_model_the_picker_would_have_chosen():
+    tpl = CH.RequestTemplate({}, _researcher_frame("Default"))
+    assert tpl.deep_research_model == "Default"
+    claude = tpl.with_deep_research_model("Claude")
+    assert claude.deep_research_model == "Claude"
+
+
+def test_choosing_a_model_changes_nothing_else_in_the_capture():
+    """捕獲物をあちこち書き換え始めた瞬間、それは捕獲ではなくなる。"""
+    tpl = CH.RequestTemplate({"agent": "Agent"}, _researcher_frame("Default"))
+    claude = tpl.with_deep_research_model("Claude")
+    assert claude.frame["optionsSets"] == ["keep-me"]
+    assert claude.frame["gpts"][0]["clientOverrides"]["capabilities"] == [{"name": "WebSearch"}]
+    assert claude.frame["gpts"][0]["id"] == "P_x.dr_work"
+    assert claude.query == {"agent": "Agent"}
+
+
+def test_the_original_template_is_never_mutated():
+    """テンプレートは共有される。呼び出し側の1つがモデルを選んだだけで
+    他の全員のモデルが変わってはいけない。"""
+    tpl = CH.RequestTemplate({}, _researcher_frame("Default"))
+    tpl.with_deep_research_model("Claude")
+    assert tpl.deep_research_model == "Default"
+
+
+def test_asking_for_no_model_returns_a_copy_that_still_works():
+    tpl = CH.RequestTemplate({}, _researcher_frame("Default"))
+    same = tpl.with_deep_research_model("")
+    assert same is not tpl
+    assert same.deep_research_model == "Default"
+
+
+def test_a_template_with_no_such_field_is_left_alone():
+    """既定 Copilot のフレームには gpts が無い。無い物に書き込んで形を壊さない。"""
+    tpl = CH.RequestTemplate({}, {"threadLevelGptId": {"id": "T_x", "source": "MOS3"}})
+    assert tpl.deep_research_model == ""
+    out = tpl.with_deep_research_model("Claude")
+    assert "gpts" not in out.frame
+    assert out.gpt_id == "T_x"

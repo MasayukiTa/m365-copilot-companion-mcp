@@ -89,8 +89,17 @@ class SocketRoute:
         self.refresh_margin_s = float(refresh_margin_s)
 
         self._lock = threading.Lock()
-        self._token = ""
-        self._template = None
+        #: PER AGENT, keyed by the surface it was captured from. The fleet talks to more than
+        #: one: the implementation agent (T_...) and the Researcher (P_....dr_work) are
+        #: different agents, and a template names its agent in the frame -- so one shared
+        #: template would quietly send a research turn to the wrong agent, which answers.
+        #:
+        #: The token is stored per agent too. Its claims are user-scoped, so one probably
+        #: serves every agent -- but "probably" is not a measurement, and the cost of not
+        #: assuming is one extra 40-second capture per agent per token lifetime.
+        self._entries = {}
+        #: The agent a caller means when it names none. The first one captured.
+        self.default_agent_url = ""
         #: Why the route is closed, or "". One-way: nothing in this file clears it.
         self.closed_reason = ""
         self.consecutive = 0
@@ -168,18 +177,29 @@ class SocketRoute:
             "turns": self.turns,
             "fallbacks": self.fallbacks,
             "consecutive": self.consecutive,
+            "agents": len(self._entries),
             "token_seconds_left": int(self.token_life()),
         }
 
     # ---- the token and the shape --------------------------------------------------------------
 
-    def token_life(self) -> float:
-        return expires_in(self._token, now=self._now()) if self._token else 0.0
+    def _key(self, agent_url=None) -> str:
+        return str(agent_url or self.default_agent_url or "")
 
-    def needs_refresh(self) -> bool:
-        return self._template is None or self.token_life() <= self.refresh_margin_s
+    def token_life(self, agent_url=None) -> float:
+        entry = self._entries.get(self._key(agent_url)) or {}
+        tok = entry.get("token") or ""
+        return expires_in(tok, now=self._now()) if tok else 0.0
 
-    def refresh(self, context, agent_url) -> bool:
+    def template_for(self, agent_url=None):
+        return (self._entries.get(self._key(agent_url)) or {}).get("template")
+
+    def needs_refresh(self, agent_url=None) -> bool:
+        if self.template_for(agent_url) is None:
+            return True
+        return self.token_life(agent_url) <= self.refresh_margin_s
+
+    def refresh(self, context, agent_url=None) -> bool:
         """Open a tab, capture the token and the request shape, CLOSE THE TAB.
 
         Returns False rather than raising: a capture that fails means workers open tabs, which
@@ -187,37 +207,55 @@ class SocketRoute:
         """
         if not self.open() or self._capture_fn is None:
             return False
-        if not self.needs_refresh():
+        key = self._key(agent_url)
+        if not self.needs_refresh(key):
             return True
         try:
             token, template = self._capture_fn(context, agent_url)
         except Exception as exc:
-            self.note_failure("capture failed: %s: %s" % (type(exc).__name__, str(exc)[:160]))
+            self.note_failure("capture failed for %s: %s: %s"
+                              % (key[:40] or "(default)", type(exc).__name__, str(exc)[:140]))
             return False
         with self._lock:
-            self._token, self._template = token, template
+            self._entries[key] = {"token": token, "template": template}
+            if not self.default_agent_url:
+                self.default_agent_url = key
         self._log("[socket_route] captured: %.0f min of token, agent %s"
-                  % (self.token_life() / 60.0, (template.gpt_id or "(none)")[:28]))
+                  % (self.token_life(key) / 60.0, (template.gpt_id or "(none)")[:28]))
         return True
 
-    def driver_for(self, name: str):
-        """A socket driver for one worker, or None if the worker should open a tab."""
+    def driver_for(self, name: str, agent_url=None, model: str = "",
+                   turn_timeout_s: float = 600.0, frame_timeout_s: float = 90.0):
+        """A socket driver for one worker or side agent, or None to open a tab instead.
+
+        `agent_url` selects WHICH agent -- omitted means the first one captured, which is the
+        fleet's implementation agent. `model` names the deep-research model when the template
+        carries that field; it is applied to a copy, so the shared template is never edited.
+
+        The timeouts are arguments because a research turn is not a chat turn: ten minutes of
+        thinking is normal for one and a hang for the other.
+        """
         if not self.open() or self._connect_fn is None:
             return None
+        key = self._key(agent_url)
         with self._lock:
-            token, template = self._token, self._template
+            entry = dict(self._entries.get(key) or {})
+        template, token = entry.get("template"), entry.get("token") or ""
         if not template or expires_in(token, now=self._now()) <= 0:
             return None
+        if model:
+            template = template.with_deep_research_model(model)
         from relay.socket_driver import CopilotSocketDriver
 
         # A TOKEN SUPPLIER, NOT A TOKEN. The conversation asks whenever it needs one, so a
         # refresh that happens mid-goal reaches a conversation that is already running.
         def supply():
             with self._lock:
-                return self._token
+                return (self._entries.get(key) or {}).get("token") or ""
 
-        conv = Conversation(supply, template=template, turn_timeout_s=600.0,
-                            frame_timeout_s=90.0)
+        conv = Conversation(supply, template=template,
+                            turn_timeout_s=float(turn_timeout_s),
+                            frame_timeout_s=float(frame_timeout_s))
         return CopilotSocketDriver(conv, connect=self._connect_fn)
 
 

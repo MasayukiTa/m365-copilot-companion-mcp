@@ -137,6 +137,39 @@ class RequestTemplate:
         """The agent this template talks to, or "" for the default Copilot."""
         return ((self.frame.get("threadLevelGptId") or {}).get("id") or "")
 
+    def with_deep_research_model(self, model: str) -> "RequestTemplate":
+        """A COPY of this template that asks the Researcher for a particular model.
+
+        MEASURED, NOT GUESSED (2026-08-21). The client's chat frame was captured with the
+        picker at Default and again at Claude, and exactly one non-volatile field moved:
+
+            gpts[0].clientOverrides.deepResearchModels[0]:  "Default" -> "Claude"
+
+        So the choice travels in the request and a socket can make it -- which is what lets a
+        Researcher run without the tab that owns the picker. Nothing else is touched: a
+        template that gets edited in several places stops being a capture of anything.
+
+        Returns a copy even when it changes nothing, so a caller can never mutate the shared
+        template by accident.
+        """
+        tpl = RequestTemplate(dict(self.query), json.loads(json.dumps(self.frame)))
+        if not model:
+            return tpl
+        gpts = tpl.frame.get("gpts")
+        if isinstance(gpts, list) and gpts and isinstance(gpts[0], dict):
+            gpts[0].setdefault("clientOverrides", {})["deepResearchModels"] = [str(model)]
+        return tpl
+
+    @property
+    def deep_research_model(self) -> str:
+        """Which model this template asks for, or "" when it names no such field."""
+        gpts = self.frame.get("gpts")
+        if isinstance(gpts, list) and gpts and isinstance(gpts[0], dict):
+            models = (gpts[0].get("clientOverrides") or {}).get("deepResearchModels") or []
+            if models:
+                return str(models[0])
+        return ""
+
     def frame_for(self, text, *, session_id, request_id, started):
         """The captured frame with this turn's values written into it, and nothing else."""
         f = json.loads(json.dumps(self.frame))

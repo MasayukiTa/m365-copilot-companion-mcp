@@ -128,7 +128,7 @@ def test_the_token_is_refreshed_before_it_expires_not_after():
     r.refresh(object(), "u")
     assert len(calls) == 1              # まだ余裕がある -> 捕獲しない
 
-    r._token = _token(seconds=100)      # 期限が迫った
+    r._entries[r.default_agent_url]["token"] = _token(seconds=100)   # 期限が迫った
     assert r.needs_refresh() is True
 
 
@@ -140,7 +140,7 @@ def test_a_running_conversation_sees_a_refreshed_token():
     drv = r.driver_for("w0")
     assert drv is not None
     first = drv.conv._token_supplier()
-    r._token = _token(seconds=7200)
+    r._entries[r.default_agent_url]["token"] = _token(seconds=7200)
     assert drv.conv._token_supplier() != first
 
 
@@ -513,3 +513,88 @@ def test_no_test_in_this_file_can_reach_the_real_record():
     r = SocketRoute(enabled=True, connect_fn=object())
     assert ".fleet" not in r.log_path.replace("\\", "/")
     assert r.log_path == SR.DEFAULT_LOG
+
+
+# ---- 複数エージェント（A: 副エージェントの socket 化） ---------------------------------------
+#
+# 艦隊は1つのエージェントとだけ話しているわけではない。実装エージェント (T_...) と
+# Researcher (P_....dr_work) は別物で、テンプレートは自分のエージェントをフレームに書く。
+# 共有テンプレート1つだと、research のターンが黙って別のエージェントに届く -- そして
+# そのエージェントは普通に答えてしまうので、間違いが見えない。
+
+class _Tpl2:
+    def __init__(self, gpt_id, model="Default"):
+        self.gpt_id = gpt_id
+        self._model = model
+        self.applied = None
+
+    def with_deep_research_model(self, m):
+        out = _Tpl2(self.gpt_id, m)
+        out.applied = m
+        return out
+
+
+def test_two_agents_get_two_templates(tmp_path):
+    made = {}
+
+    def cap(_ctx, url):
+        made[url] = made.get(url, 0) + 1
+        return _token(), _Tpl2("T_impl" if "impl" in url else "P_dr")
+
+    r = _route_logging(tmp_path, capture_fn=cap)
+    assert r.refresh(object(), "https://x/impl")
+    assert r.refresh(object(), "https://x/researcher")
+    assert r.driver_for("w", agent_url="https://x/impl").conv.template.gpt_id == "T_impl"
+    assert r.driver_for("w", agent_url="https://x/researcher").conv.template.gpt_id == "P_dr"
+
+
+def test_the_first_agent_captured_is_what_an_unnamed_caller_gets(tmp_path):
+    """既存の呼び出し側は agent_url を渡さない。黙って別のエージェントに行かせない。"""
+    r = _route_logging(tmp_path, capture_fn=lambda _c, u: (_token(), _Tpl2("T_impl")))
+    r.refresh(object(), "https://x/impl")
+    r._entries["https://x/researcher"] = {"token": _token(), "template": _Tpl2("P_dr")}
+    assert r.default_agent_url == "https://x/impl"
+    assert r.driver_for("w").conv.template.gpt_id == "T_impl"
+
+
+def test_an_agent_never_captured_hands_out_no_driver(tmp_path):
+    """知らないエージェントを既定で代用すると、まさに防ぎたい取り違えになる。"""
+    r = _route_logging(tmp_path, capture_fn=lambda _c, u: (_token(), _Tpl2("T_impl")))
+    r.refresh(object(), "https://x/impl")
+    assert r.driver_for("w", agent_url="https://x/never-seen") is None
+
+
+def test_each_agent_keeps_its_own_token(tmp_path):
+    r = _route_logging(tmp_path, capture_fn=lambda _c, u: (_token(), _Tpl2("g")))
+    r.refresh(object(), "a")
+    r.refresh(object(), "b")
+    r._entries["a"]["token"] = _token(seconds=-1)
+    assert r.driver_for("w", agent_url="a") is None      # 期限切れ
+    assert r.driver_for("w", agent_url="b") is not None   # 巻き添えにしない
+
+
+def test_refreshing_one_agent_does_not_refresh_another(tmp_path):
+    calls = []
+    r = _route_logging(tmp_path,
+                       capture_fn=lambda _c, u: (calls.append(u), (_token(), _Tpl2("g")))[1])
+    r.refresh(object(), "a")
+    r.refresh(object(), "a")           # まだ余裕がある
+    r.refresh(object(), "b")
+    assert calls == ["a", "b"]
+
+
+def test_the_model_is_applied_to_a_copy_not_the_stored_template(tmp_path):
+    r = _route_logging(tmp_path, capture_fn=lambda _c, u: (_token(), _Tpl2("P_dr")))
+    r.refresh(object(), "res")
+    drv = r.driver_for("w", agent_url="res", model="Claude")
+    assert drv.conv.template.applied == "Claude"
+    assert r.template_for("res").applied is None, "共有テンプレートを書き換えている"
+
+
+def test_a_research_turn_gets_its_own_patience(tmp_path):
+    """10分考えるのは research では普通で、chat ではハング。同じ上限は使えない。"""
+    r = _route_logging(tmp_path, capture_fn=lambda _c, u: (_token(), _Tpl2("P_dr")))
+    r.refresh(object(), "res")
+    drv = r.driver_for("w", agent_url="res", turn_timeout_s=1800, frame_timeout_s=300)
+    assert drv.conv.turn_timeout_s == 1800
+    assert drv.conv.frame_timeout_s == 300
