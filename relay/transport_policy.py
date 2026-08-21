@@ -17,7 +17,7 @@ appeal to this file's name.
 WHAT MAY EVOLVE AND WHAT MAY NOT
 
     thresholds, the eligible-kind list, feature weights    evolvable
-    the Work IQ predicate                                  FIXED, in code
+    the attachment rule                                    FIXED, and above the version table
 
 The rule behind that split is not caution, it is observability: a mistake may be evolvable
 only where a frozen judge sees it. Over-routing to sockets is loud -- `note_failure` records
@@ -25,12 +25,29 @@ it, the circuit breaker and the one-way counter close the route, and all of that
 independently of whatever chose the transport. The classifier sits BEHIND a safety layer it
 does not control.
 
-Missing Work IQ is the opposite. A socket conversation without Work IQ context can return a
-plausible answer: no fallback fires, the goal reaches DONE, and the label records "the socket
-was fine" -- while the answer was formed without the data it needed. Evolving a dimension
-whose errors are silent is exactly how "learn to under-predict Work IQ" opens, and it opens
-undetectably. So the predicate is code a person maintains, updated from the fallback reasons
-this module classifies, not from a fit.
+A SILENT ERROR IS THE ONE THAT MUST NOT BE EVOLVABLE, and that argument stands. It was
+originally made about Work IQ: a socket conversation lacking M365 context could return a
+plausible answer, no fallback would fire, the goal would reach DONE, and the label would record
+"the socket was fine" while the answer was built without the data it needed. Errors nobody can
+see are exactly how "learn to under-predict" opens, undetectably.
+
+THE PREMISE UNDER THAT EXAMPLE WAS MEASURED AND IS FALSE (2026-08-21). Work IQ rides the
+socket. Twenty socket turns across eight request classes -- tool calls, arithmetic, image
+generation, external web search, an unlock-gated file write, inbox reads, calendar reads and a
+calendar WRITE -- produced zero fallbacks. And the check was built so plausibility could not
+pass it: both transports were asked about a calendar entry created earlier that same day and
+verified independently, and BOTH named it. A route without Work IQ cannot invent an entry it
+has never seen.
+
+So the fear was right and the target was wrong. What survives as FIXED is the one property
+measured to force a tab, and it is not a guess about text at all: an ATTACHMENT. The Analyst
+puts a local file into a real <input type=file>, and a socket has nowhere to put a file. It is
+knowable from a parameter the caller already set, so it needs no classifier and can never be
+wrong in the silent direction.
+
+It sits ABOVE the version table rather than inside a version, because it is not a policy. A
+version table exists to let two opinions be compared; there is no second opinion about where a
+file can be put.
 
 FALLBACKS ARE NOT ALL LABELS
 
@@ -47,14 +64,21 @@ TAB, SOCKET = "tab", "socket"
 
 #: FIXED. Not read from any genome, and `evolvable_fields()` refuses to return it.
 #:
-#: Anything touching M365 surfaces goes over a tab. The list is deliberately broad: a false
-#: "needs Work IQ" costs one tab's memory, and a false "does not" costs an answer built
-#: without the data, which nothing here would notice.
-WORKIQ_MARKERS = (
-    "sharepoint", "onedrive", "outlook", "teams", "m365", "office 365",
-    "メール", "予定表", "会議", "カレンダー", "受信トレイ", "添付",
-    "work iq", "workiq", "copilot connector", "コネクタ",
-)
+#: The whole rule. Measured across twenty socket turns and eight request classes as the only
+#: property that structurally forces a tab -- see the module note for why the previous rule
+#: (anything mentioning an M365 surface) was removed rather than narrowed.
+ATTACHMENT = "attachment: a socket has nowhere to put a local file"
+
+
+def needs_tab(upload_path: str = "") -> bool:
+    """True when this task cannot be carried by a socket, whatever any policy prefers.
+
+    Takes the caller's own parameter, NOT the goal text. Reading the text is what the removed
+    rule did, and the measurement says the text carries no signal about this: goals that name
+    mail, calendars and SharePoint were carried by the socket, with ground truth to prove it.
+    """
+    return bool(upload_path)
+
 
 #: A fallback reason matching any of these is the ROUTE's failure, not the goal's. Kept as
 #: patterns rather than exact strings because they are produced by several layers.
@@ -69,12 +93,6 @@ ROUTE_CAUSED = (
 TASK_CAUSED = (
     r"carried no text", r"card", r"consent", r"attachment", r"添付", r"許可",
 )
-
-
-def needs_workiq(goal: str) -> bool:
-    """The fixed predicate. True means: do not put this goal on a socket."""
-    text = (goal or "").lower()
-    return any(marker in text for marker in WORKIQ_MARKERS)
 
 
 def classify_fallback(reason: str) -> str:
@@ -123,8 +141,6 @@ def _policy_v2(goal: str, *, kind="", knobs=None, explore=False) -> str:
     random number would return different answers for one goal on two runs, and a component
     whose two arms are not reproducible is not measurable.
     """
-    if needs_workiq(goal):
-        return TAB
     knobs = knobs or {}
     eligible = knobs.get("transport_eligible_kinds")
     if eligible is not None and kind and kind not in set(eligible):
@@ -141,12 +157,19 @@ TRANSPORT_VERSIONS = {
 
 
 def evolvable_fields() -> tuple:
-    """The knobs a genome may move. The Work IQ predicate is deliberately absent."""
+    """The knobs a genome may move. The attachment rule is deliberately absent."""
     return ("transport_eligible_kinds", "transport_explore_rate")
 
 
-def choose(goal: str, *, kind="", knobs=None, explore=False) -> str:
-    """The transport for one goal, under whichever version the active harness names."""
+def choose(goal: str, *, kind="", knobs=None, explore=False, upload_path="") -> str:
+    """The transport for one goal, under whichever version the active harness names.
+
+    THE STRUCTURAL RULE IS APPLIED FIRST, so no version -- present or future, hand-written or
+    evolved -- can send an attachment over a socket. A version that could would not be a worse
+    policy; it would be a broken one.
+    """
+    if needs_tab(upload_path):
+        return TAB
     try:
         from relay.selfimprove import runtime_config as _rc
         impl = TRANSPORT_VERSIONS.get(_rc.component("transport"), _policy_v1)

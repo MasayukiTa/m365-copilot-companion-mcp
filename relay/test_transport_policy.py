@@ -6,19 +6,32 @@ transport 選択は routing 選択に変わる。だからテストは名前で�
 import pytest
 
 from relay.selfimprove import manifest as M
-from relay.transport_policy import (SOCKET, TAB, TRANSPORT_VERSIONS, WORKIQ_MARKERS,
+from relay.transport_policy import (SOCKET, TAB, TRANSPORT_VERSIONS, ATTACHMENT,
                                     _policy_v1, _policy_v2, classify_fallback,
-                                    evolvable_fields, needs_workiq)
+                                    choose, evolvable_fields, needs_tab)
 
 
 # ---- 版が実際に分岐すること -----------------------------------------------------------------------
 
 def test_the_two_versions_answer_differently_for_the_same_goal():
     """両腕が同じ答えを返すなら A/B は同じプログラムの二腕。
-    このリポジトリが4つのコンポーネントで見つけた欠陥。"""
-    # v1 は経路に任せ、v2 は Work IQ 目標をタブへ回す。分岐は Work IQ 側で出る。
-    assert _policy_v1("Outlook の受信トレイを整理して") == SOCKET
-    assert _policy_v2("Outlook の受信トレイを整理して") == TAB
+    このリポジトリが4つのコンポーネントで見つけた欠陥。
+
+    分岐点が変わった。以前は Work IQ 判定式が v1/v2 を分けていたが、その前提は
+    実測で否定され（Work IQ は socket に乗る）、判定式ごと外れた。残る差は
+    eligible-kinds ノブだけなので、**ノブが設定されていない既定では両版は一致する**。
+    キャンペーンの2腕はこのノブで作る必要がある。"""
+    knobs = {"transport_eligible_kinds": ["code"]}
+    goal, kind = "何かする", "other"
+    assert _policy_v1(goal, kind=kind, knobs=knobs) == SOCKET
+    assert _policy_v2(goal, kind=kind, knobs=knobs) == TAB
+
+
+def test_without_that_knob_the_two_versions_now_agree():
+    """外した判定式がしていた仕事を、他の何かがしているつもりにならないための明示。
+    既定ノブでの一致は欠陥ではなく、差分が1箇所しか無いという事実。"""
+    for goal in ("Outlook の受信トレイを整理して", "42 を答えて"):
+        assert _policy_v1(goal) == _policy_v2(goal) == SOCKET
 
 
 def test_v1_preserves_todays_behaviour_rather_than_yesterdays():
@@ -32,27 +45,44 @@ def test_v1_preserves_todays_behaviour_rather_than_yesterdays():
 
 # ---- 固定された述語 -------------------------------------------------------------------------------
 
-def test_workiq_goals_never_go_over_a_socket():
+def test_an_attachment_never_goes_over_a_socket():
+    """socket にファイルの置き場は無い。方針の good/bad ではなく物理。"""
+    assert needs_tab(r"C:\data\sales.csv") is True
+    assert choose("このCSVを分析して", upload_path=r"C:\data\sales.csv") == TAB
+
+
+def test_the_structural_rule_is_applied_before_the_version_is_even_chosen():
+    """版表は『2つの意見を比べる』ための仕組み。ファイルをどこに置けるかに
+    第2の意見は存在しないので、どの版にも判断させない。"""
+    for impl in TRANSPORT_VERSIONS.values():
+        assert impl("このCSVを分析して") == SOCKET      # 版そのものは知らない
+    assert choose("このCSVを分析して", upload_path="x.csv") == TAB
+
+
+def test_workiq_goals_are_no_longer_diverted():
+    """実測 2026-08-21: Work IQ は socket に乗る。socket 実ターン20回・8クラスで
+    fallback 0件。しかも尤もらしさで通らない検査をした -- 同日に作成し独立に検証した
+    予定について両経路に尋ね、**両方**がそれを名指しした。見たことのない予定を
+    発明することはできない。"""
     for goal in ("Outlook の受信トレイを整理して", "SharePoint の資料をまとめて",
-                 "Teams の会議メモを要約", "add a workiq connector"):
-        assert needs_workiq(goal), goal
-        assert _policy_v2(goal) == TAB, goal
+                 "Teams の会議メモを要約", "予定表に登録して"):
+        assert needs_tab() is False
+        assert choose(goal) == SOCKET, goal
 
 
-def test_the_workiq_predicate_is_not_in_the_evolvable_set():
-    """誤りが静かな次元を進化させると、『Work IQ 必要性の過少予測』が
-    検知不能な形で開く。socket 経由で Work IQ 抜きの尤もらしい答えが返ると、
-    フォールバックは鳴らず DONE に達し、ラベルは『socket で問題なし』と嘘をつく。"""
+def test_the_structural_rule_is_not_in_the_evolvable_set():
+    """誤りが静かな次元は進化させない -- この原則は残す。
+    変わったのは対象で、いま固定されているのは『添付』。しかもこれは
+    呼び出し側が持つ値なので、静かに間違えようがない。"""
     fields = evolvable_fields()
-    for banned in ("workiq", "WORKIQ_MARKERS", "needs_workiq"):
+    for banned in ("attachment", "needs_tab", "upload"):
         assert not any(banned in f for f in fields), fields
 
 
-def test_the_predicate_errs_toward_tabs():
-    """偽の『Work IQ が要る』はタブ1枚分のメモリ。偽の『要らない』は
-    必要なデータ抜きの答えで、ここでは誰も気づかない。非対称なので広く取る。"""
-    assert len(WORKIQ_MARKERS) >= 10
-    assert needs_workiq("メールの添付を確認して")
+def test_the_rule_reads_a_parameter_and_never_the_goal_text():
+    """テキストを読み始めた瞬間、実測が否定した前提に戻る。"""
+    assert needs_tab("") is False
+    assert choose("添付ファイルを見て", upload_path="") == SOCKET
 
 
 # ---- ラベルは3値 ---------------------------------------------------------------------------------
@@ -87,11 +117,13 @@ def test_exploration_can_send_a_tab_prediction_over_a_socket():
     assert _policy_v2("何かする", kind="other", knobs=knobs, explore=True) == SOCKET
 
 
-def test_exploration_never_overrides_the_fixed_predicate():
-    """探索が安全なのは誤分類の代償がフォールバックだから。Work IQ の欠落は
-    フォールバックにならないので、そこへ探索を伸ばしてはいけない。"""
-    assert _policy_v2("Outlook を開いて", kind="other",
-                      knobs={"transport_eligible_kinds": ["code"]}, explore=True) == TAB
+def test_exploration_never_overrides_the_fixed_rule():
+    """探索が安全なのは誤分類の代償がフォールバックだから。
+    添付はフォールバックにならない -- socket にファイルの置き場が無いのは
+    確率の話ではないので、探索を伸ばす先ではない。"""
+    assert choose("このCSVを分析して", kind="other",
+                  knobs={"transport_eligible_kinds": ["code"]},
+                  explore=True, upload_path=r"C:\d.csv") == TAB
 
 
 def test_the_policy_itself_does_not_draw_the_random_number():
@@ -164,3 +196,20 @@ def test_a_policy_that_cannot_answer_does_not_cost_a_goal():
     src = inspect.getsource(RF.RelayWorker)
     i = src.index("transport_policy import")
     assert "except Exception" in src[i:i + 400]
+
+
+def test_the_fixed_rule_cannot_be_given_goal_text_at_all():
+    """『テキストは読まない』は約束では守れない。引数として存在しないことで守る。
+
+    実測が否定したのは「M365 に触れる目標は socket に乗らない」という文字列判定であって、
+    同じ判定を別の語で書き直せば同じ誤りが戻る。だから signature を見張る --
+    このファイルが乱数について既にやっているのと同じ理由、同じやり方。"""
+    import inspect
+
+    from relay import transport_policy as TP
+    params = list(inspect.signature(TP.needs_tab).parameters)
+    assert params == ["upload_path"], params
+    src = inspect.getsource(TP.needs_tab)
+    body = src.split('"""')[-1]          # docstring を除いた本体だけを見る
+    for text_ish in ("goal", "lower()", "in text", "MARKERS"):
+        assert text_ish not in body, "本体がテキストを読み始めている: %s" % text_ish
