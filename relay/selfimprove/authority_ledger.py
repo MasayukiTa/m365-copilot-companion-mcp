@@ -286,9 +286,64 @@ def _notify(record) -> None:
         # title, which is the part a toast shows first.
         if record.get("event") in _URGENT:
             title = "! " + title
-        notify_desktop(title=title, body=body)
+        notify_desktop(title=title, body=body, launch=_write_briefing(record, title, body))
     except Exception:
         pass
+
+
+def briefing_path(ledger_path=None) -> str:
+    """Where the clickable explanation of the last act is written."""
+    base = os.path.dirname(os.path.abspath(_path(ledger_path))) or "."
+    return os.path.join(base, "selfimprove_last_act.txt")
+
+
+def _write_briefing(record, title, body) -> str:
+    """Write what happened and what to do about it, and return a file:/// URI for the toast.
+
+    WHY A FILE AND NOT JUST A LONGER TOAST. A toast shows two short lines and vanishes; the
+    operator's complaint was that clicking it did nothing and there was no way to act. The
+    body still carries the command so the message stands on its own, and the click now opens
+    the full account -- what changed, on whose words, and the two ways out -- in a plain text
+    file that survives the toast.
+
+    Never raises: a briefing that cannot be written must not stop the record or the alert.
+    """
+    try:
+        path = briefing_path(record.get("_ledger_path"))
+        changed = sorted(record.get("changed") or {})
+        lines = [
+            title,
+            "=" * len(title),
+            "",
+            "when          : %s" % record.get("at", ""),
+            "event         : %s" % record.get("event", ""),
+            "files affected: %s" % (", ".join(changed) or "-"),
+            "reason        : %s" % (record.get("reason") or "-"),
+            "authorization : %s" % (record.get("authorization") or SELF_INITIATED),
+            "actor claimed : %s" % (record.get("actor_claimed") or "-"),
+            "",
+            body,
+            "",
+            "-" * 72,
+            "TO WITHDRAW THE APPROVAL (the code stays; the frozen check then fails on",
+            "purpose, which is the effect and not a mistake):",
+            "    %s" % UNDO_CMD,
+            "",
+            "TO SEE WHAT IS CURRENTLY OUT OF LINE:",
+            "    %s" % VERIFY_CMD,
+            "",
+            "TO UNDO THE CODE AS WELL, from the repo root:",
+            "    git log --oneline -- <file>",
+            "    git revert <commit>",
+            "",
+            "This file is rewritten on every act. The full history is append-only in the",
+            "ledger beside it.",
+        ]
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(lines) + "\n")
+        return "file:///" + path.replace("\\", "/")
+    except Exception:
+        return ""
 
 
 def _write(path: str, record: dict) -> None:

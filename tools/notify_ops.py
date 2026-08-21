@@ -44,6 +44,7 @@ def notify_desktop(
     body: str,
     app_id: str = "m365-copilot-companion-mcp",
     icon_path: Optional[str] = None,
+    launch: str = "",
 ) -> str:
     """Show a native Windows toast notification on the host PC.
 
@@ -56,6 +57,18 @@ def notify_desktop(
         body: Toast body text.
         app_id: AppId string shown as the source. Defaults to m365-copilot-companion-mcp.
         icon_path: Optional file:// path to a PNG/JPG icon.
+        launch: Optional URI opened when the toast is CLICKED -- a file:/// path, a folder,
+            an http(s) URL. A notification that reports something a person must decide about
+            and then does nothing when clicked is an alarm, not a control; this is what turns
+            it back into one. Best effort: toast activation depends on the AppId being
+            registered, so a click that does nothing is still possible and the body must
+            therefore carry the instructions in its own right.
+
+    NEWLINES SURVIVE. The body used to be interpolated into a PowerShell double-quoted string,
+    which does not interpret backslash-n -- so a multi-line body arrived as literal "
+"
+    markers and rendered as garbage. It is passed base64-encoded now and decoded on the far
+    side, which is also what makes quotes and non-ASCII safe.
     """
     # SYSTEMIC pytest guard (2026-07): this is the single real chokepoint that
     # actually shells out to PowerShell to raise an OS toast. Every notify path
@@ -75,9 +88,16 @@ def notify_desktop(
         if not powershell:
             return "[notify_desktop error: PowerShell not found on PATH]"
 
-        safe_title = json.dumps(str(title), ensure_ascii=False)
-        safe_body = json.dumps(str(body or ""), ensure_ascii=False)
+        import base64 as _b64
+
+        def _b(text):
+            """Base64 of the UTF-8 bytes. Nothing in the value can then reach the shell."""
+            return json.dumps(_b64.b64encode(str(text).encode("utf-8")).decode("ascii"))
+
+        safe_title = _b(title)
+        safe_body = _b(body or "")
         safe_app = json.dumps(str(app_id), ensure_ascii=False)
+        safe_launch = json.dumps(str(launch or ""), ensure_ascii=False)
 
         # Two-stage, resilient. Stage 1: a proper WinRT toast built from a
         # template (GetTemplateContent avoids `New-Object XmlDocument`, which is
@@ -87,9 +107,11 @@ def notify_desktop(
         # on Windows 10/11. One of these will fire on any normal interactive PC.
         ps_script = f"""
 $ErrorActionPreference = 'Stop'
-$title = {safe_title}
-$body  = {safe_body}
-$appId = {safe_app}
+function Dec($s) {{ [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)) }}
+$title  = Dec {safe_title}
+$body   = Dec {safe_body}
+$appId  = {safe_app}
+$launch = {safe_launch}
 $shown = $false
 try {{
     [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
@@ -98,6 +120,12 @@ try {{
     $texts = $xml.GetElementsByTagName('text')
     [void]$texts.Item(0).AppendChild($xml.CreateTextNode($title))
     [void]$texts.Item(1).AppendChild($xml.CreateTextNode($body))
+    if ($launch) {{
+        # CLICKING SHOULD DO SOMETHING. Protocol activation opens the URI; if the AppId is not
+        # registered Windows ignores it, which is why the body still has to stand alone.
+        $xml.DocumentElement.SetAttribute('launch', $launch)
+        $xml.DocumentElement.SetAttribute('activationType', 'protocol')
+    }}
     $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
     [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast)
     $shown = $true

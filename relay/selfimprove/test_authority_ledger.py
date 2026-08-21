@@ -312,3 +312,59 @@ def test_no_notification_ends_on_a_warning_with_no_next_step():
                                  "reason": "r", "authorization": "a"})
         assert ("python -m relay.selfimprove.frozen" in body
                 or "git revert" in body), ev
+
+
+# ---- クリックできる通知（2026-08-21、運用者の指摘より） ---------------------------------------
+#
+# 「これクリックしても特に何も開かず解除も何もできないぞ」。加えてトースト本文の改行が
+# 文字として ¥n と表示されていた -- PowerShell の二重引用符文字列は \n を改行と解釈しない。
+# 前者は launch（protocol activation）、後者は本文の base64 受け渡しで直した。
+# ここで見張るのは、クリック先のファイルが必ず「次の一手」を持っていること。
+
+def test_the_click_target_says_how_to_undo(tmp_path, monkeypatch):
+    from relay.selfimprove import authority_ledger as AL
+    monkeypatch.setenv(AL.ENV_PATH, str(tmp_path / "led.jsonl"))
+    rec = {"event": AL.REBLESS, "at": "2026-08-21T13:00:00",
+           "changed": {"relay/x.py": {}}, "reason": "r", "authorization": "a",
+           "actor_claimed": "cli"}
+    title, body = AL._headline(rec)
+    uri = AL._write_briefing(rec, title, body)
+    assert uri.startswith("file:///")
+    text = (tmp_path / "selfimprove_last_act.txt").read_text(encoding="utf-8")
+    # 行動ブロックの中にあること。本文にも同じコマンドが埋まっているので、
+    # 「どこかに含まれる」だけでは専用の行を消しても通ってしまう -- 実際に素通りした。
+    after_rule = text.split("-" * 72, 1)[-1]
+    assert AL.UNDO_CMD in after_rule, "手順ブロックに取り消しコマンドが無い"
+    assert AL.VERIFY_CMD in after_rule
+    assert "git revert" in after_rule
+    assert "relay/x.py" in text and "a" in text
+
+
+def test_the_briefing_sits_beside_the_ledger_not_in_the_repo(tmp_path, monkeypatch):
+    """台帳と同じ場所に置く -- 片方だけ残る状態を作らない。リポジトリ内に書くと
+    clean checkout で消え、追跡すると学習した内容を公開してしまう。"""
+    from relay.selfimprove import authority_ledger as AL
+    monkeypatch.setenv(AL.ENV_PATH, str(tmp_path / "sub" / "led.jsonl"))
+    assert AL.briefing_path().replace("\\", "/").endswith("/sub/selfimprove_last_act.txt")
+
+
+def test_a_briefing_that_cannot_be_written_does_not_break_the_alert(monkeypatch):
+    """手順書が書けないことで、通知そのものや記録が止まってはいけない。"""
+    from relay.selfimprove import authority_ledger as AL
+    monkeypatch.setattr(AL, "briefing_path", lambda *a, **k: "\0/impossible/x.txt")
+    assert AL._write_briefing({"event": "rebless"}, "t", "b") == ""
+
+
+def test_the_notification_asks_for_a_click_target(monkeypatch, tmp_path):
+    """launch を渡し忘れると、直したはずのクリックが黙って死ぬ。"""
+    from relay.selfimprove import authority_ledger as AL
+    monkeypatch.setenv(AL.ENV_PATH, str(tmp_path / "led.jsonl"))
+    seen = {}
+
+    import tools.notify_ops as N
+    monkeypatch.setattr(N, "notify_desktop",
+                        lambda **kw: seen.update(kw) or "ok")
+    AL._notify({"event": AL.REBLESS, "changed": {"relay/x.py": {}}, "reason": "r",
+                "authorization": "a", "at": "t"})
+    assert seen.get("launch", "").startswith("file:///")
+    assert AL.UNDO_CMD in seen.get("body", "")
