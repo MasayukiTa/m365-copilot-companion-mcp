@@ -527,3 +527,28 @@ def test_a_scope_claim_is_about_mechanism_not_a_measured_sensitivity():
     block = src[max(0, i - 1400):i]
     assert "mechanism" in block.lower()
     assert "renderer" in block.lower()
+
+
+# ---- モジュールを「走らせた」ときにも壊れていないこと -----------------------------------------------
+
+def test_every_public_name_is_defined_before_the_entry_point():
+    """`withdraw` と `withdrawn_ids` を `if __name__` の後ろに追記していた。
+    `python -m` はその行で main() を呼ぶので、残りの定義がまだ無く
+    `history` が NameError で死んだ -- テストは全部緑のまま。
+    テストは import し、import は何かを呼ぶ前に最後まで走るから見えない。"""
+    import io
+    import inspect
+    src = io.open(inspect.getsourcefile(C), encoding="utf-8").read()
+    entry = src.index('if __name__ == "__main__":')
+    after = src[entry:]
+    assert "\ndef " not in after, "エントリポイントの後ろに定義がある"
+
+
+def test_the_cli_runs_as_a_module_not_only_as_an_import():
+    """import 経由でしか確かめないと、この種の欠陥は最後まで見えない。"""
+    import subprocess
+    import sys
+    out = subprocess.run([sys.executable, "-m", "relay.selfimprove.compare", "--help"],
+                         capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr[-400:]
+    assert "branches" in out.stdout and "history" in out.stdout

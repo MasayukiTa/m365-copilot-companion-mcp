@@ -654,9 +654,6 @@ def main(argv=None):                                            # pragma: no cov
         return 2
 
 
-if __name__ == "__main__":                                      # pragma: no cover
-    raise SystemExit(main())
-
 
 def withdraw(request_id: str, reason: str, *, path=None, now=None) -> dict:
     """Append a withdrawal of an earlier verdict. Nothing is rewritten.
@@ -683,3 +680,14 @@ def withdraw(request_id: str, reason: str, *, path=None, now=None) -> dict:
 def withdrawn_ids(path=None) -> set:
     """Request ids whose verdict has been withdrawn."""
     return {r["withdraws"] for r in read_results(path) if r.get("withdraws")}
+
+
+# THE ENTRY POINT LIVES AT THE VERY BOTTOM, AND THAT IS NOT STYLE.
+#
+# `withdraw` and `withdrawn_ids` were appended after this block. Under `python -m`, module
+# execution reaches this line and calls main() while the rest of the file is still undefined,
+# so `history` died with NameError -- on a module whose tests were all green, because a test
+# IMPORTS the module and an import runs to the end before anything is called. Running it is
+# what found this, and the entry point stays last so a later append cannot recreate it.
+if __name__ == "__main__":                                      # pragma: no cover
+    raise SystemExit(main())
