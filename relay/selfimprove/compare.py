@@ -111,8 +111,47 @@ def instrument_can_see(manifest_a: dict, manifest_b: dict) -> tuple:
         "empirical one" % ", ".join(sorted(changed)))
 
 
+
+def transport_versions_differ(manifest_a: dict, manifest_b: dict, goals) -> tuple:
+    """(bool, note). Do the two harnesses' transport policies actually decide differently?
+
+    THE SEVENTH DOOR THE SAME DEFECT WALKED THROUGH.
+
+    `same_program` compares MANIFESTS, and two manifests can name two different versions that
+    behave identically. Measured, not hypothesised: `transport/v1` and `transport/v2` differed
+    only in a Work IQ carve-out, that carve-out was removed once socket-borne Graph results
+    were shown to match Work IQ, and from that moment the two versions returned the same
+    transport for every goal. A real comparison was run between them and returned +15 MB and
+    +27 MB -- the null floor, correctly reported as INCONCLUSIVE, for a reason no reader could
+    have recovered from the number.
+
+    So for the ONE component this instrument measures, ask the policies. Undecidable in
+    general; entirely decidable for a pure function over the goals the comparison will use.
+    """
+    from relay import transport_policy as TP
+
+    va = (manifest_a.get("components") or {}).get("transport")
+    vb = (manifest_b.get("components") or {}).get("transport")
+    if va == vb:
+        return False, "both harnesses name %s" % va
+    fa, fb = TP.TRANSPORT_VERSIONS.get(va), TP.TRANSPORT_VERSIONS.get(vb)
+    if fa is None or fb is None:
+        return True, "one of %s / %s is not in the version table; cannot compare them here"             % (va, vb)
+    texts = []
+    for goal in goals or []:
+        texts.append(goal.get("text") or goal.get("goal") or ""
+                     if isinstance(goal, dict) else str(goal))
+    disagree = [t for t in texts if fa(t) != fb(t)]
+    if disagree:
+        return True, "%s and %s choose differently on %d of %d goals"             % (va, vb, len(disagree), len(texts))
+    return False, (
+        "%s and %s return the same transport for every one of these %d goals. The manifests "
+        "differ and the behaviour does not, so the two arms would be the same program -- the "
+        "difference this instrument would report is its own noise" % (va, vb, len(texts)))
+
+
 def refusals(label_a: str, label_b: str, *, archive, branches_path=None, lock_path=None,
-             free_mb=None, token_ok=None, check_live=True) -> list:
+             free_mb=None, token_ok=None, check_live=True, goals=None) -> list:
     """Every reason this comparison must not run. Empty means it may.
 
     Reasons rather than an exception so the operator sees all of them at once; fixing one and
@@ -147,6 +186,13 @@ def refusals(label_a: str, label_b: str, *, archive, branches_path=None, lock_pa
                 "%s and %s materialise to the same harness (%s); the two arms would be the "
                 "same program, which is the one thing a comparison may never be"
                 % (label_a, label_b, a["harness_id"][:12]))
+        else:
+            # DIFFERENT MANIFESTS ARE NOT YET DIFFERENT BEHAVIOUR. Asked of the component this
+            # instrument measures, over the goals this comparison will actually send.
+            differ, why = transport_versions_differ(a["manifest"], b["manifest"],
+                                                    goals or _default_goals())
+            if not differ and "both harnesses name" not in why:
+                out.append("%s and %s: %s" % (label_a, label_b, why))
 
     if check_live:
         ok, changed = F.frozen_intact()
@@ -209,13 +255,14 @@ def _token_capturable(cdp_url="http://127.0.0.1:9222", agent_url=None) -> bool:
 
 
 def enqueue(label_a: str, label_b: str, *, archive, note: str = "", branches_path=None,
-            queue_path=None, now=None) -> dict:
+            queue_path=None, now=None, goals=None) -> dict:
     """Record a request to compare two branches. Refuses on any reason found now.
 
     The refusals run here so the operator learns while they are looking at the screen, and
     again in `run` because the state can change in between.
     """
-    reasons = refusals(label_a, label_b, archive=archive, branches_path=branches_path)
+    reasons = refusals(label_a, label_b, archive=archive, branches_path=branches_path,
+                       goals=goals)
     if reasons:
         raise CompareError("; ".join(reasons))
 
@@ -288,8 +335,17 @@ def attempts_for(label_a: str, label_b: str, path=None) -> list:
     guard, and it only guards if it is the thing on the screen.
     """
     pair = {label_a, label_b}
-    return [r for r in read_results(path)
-            if {r.get("a", {}).get("label"), r.get("b", {}).get("label")} == pair]
+    gone = withdrawn_ids(path)
+    rows = []
+    for r in read_results(path):
+        labels = {(r.get("a") or {}).get("label"), (r.get("b") or {}).get("label")}
+        if labels != pair:
+            continue
+        if r.get("request_id") in gone and r.get("verdict") is not None:
+            # Shown, not hidden. That it was believed is part of the record.
+            r = dict(r, verdict="WITHDRAWN", original_verdict=r.get("verdict"))
+        rows.append(r)
+    return rows
 
 
 def decide(order_1: dict, order_2: dict, *, min_gain_mb=None) -> dict:
@@ -592,3 +648,30 @@ def main(argv=None):                                            # pragma: no cov
 
 if __name__ == "__main__":                                      # pragma: no cover
     raise SystemExit(main())
+
+
+def withdraw(request_id: str, reason: str, *, path=None, now=None) -> dict:
+    """Append a withdrawal of an earlier verdict. Nothing is rewritten.
+
+    The record is append-only for the same reason the hypothesis ledger is: a verdict that can
+    be edited once it is known to be wrong leaves no trace that it was ever believed, and the
+    fact that it WAS believed is part of what a later reader needs. So a withdrawal is another
+    row, and `attempts_for` returns it alongside the verdict it withdraws.
+    """
+    row = {
+        "request_id": request_id,
+        "at": int(time.time() if now is None else now()),
+        "verdict": None,
+        "withdraws": request_id,
+        "why": reason,
+    }
+    target = _p(path, "MCP_SELFIMPROVE_COMPARISONS", RESULTS_PATH)
+    os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+    with open(target, "a", encoding="utf-8", newline="\n") as fh:
+        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return row
+
+
+def withdrawn_ids(path=None) -> set:
+    """Request ids whose verdict has been withdrawn."""
+    return {r["withdraws"] for r in read_results(path) if r.get("withdraws")}

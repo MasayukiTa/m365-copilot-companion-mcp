@@ -50,6 +50,12 @@ def _clean(monkeypatch, tmp_path):
     monkeypatch.setattr(S, "halt_on_record", lambda *a, **k: {})
     monkeypatch.setattr("relay.relay_fleet.avail_phys_mb", lambda: 99999.0)
     monkeypatch.setattr(C, "_token_capturable", lambda *a, **k: True)
+    # transport/v1 and v2 genuinely behave the same right now -- the Work IQ carve-out was
+    # removed once socket-borne Graph results were shown to match Work IQ -- so the
+    # behavioural-equivalence refusal correctly blocks the fixture's branches. Stubbed for the
+    # tests that are not about that check; the tests that ARE about it do not call this.
+    monkeypatch.setattr(C, "transport_versions_differ",
+                        lambda a, b, goals: (True, "stubbed: the versions differ"))
 
 
 # ---- 計器が見える範囲を先に言う -------------------------------------------------------------------
@@ -423,3 +429,66 @@ def test_a_failed_probe_is_reported_as_no_token(monkeypatch):
     monkeypatch.setattr("playwright.sync_api.sync_playwright",
                         lambda: (_ for _ in ()).throw(RuntimeError("no browser")))
     assert C._token_capturable() is False
+
+
+# ---- 挙動が同じ2枝は比較させない -----------------------------------------------------------------
+
+def test_two_versions_that_now_behave_the_same_are_refused(env, monkeypatch, tmp_path):
+    """同じ欠陥が通った7つ目の扉。same_program はマニフェストを比べるので、
+    別バージョンを名指す2つのマニフェストが同一挙動になったことを見られない。
+
+    実測: transport/v1 と v2 は Work IQ 迂回だけで違っていた。socket 経由の Graph が
+    Work IQ と同結果と分かって迂回が削除された時点で、両者は全ゴールに同じ輸送を返す
+    ようになった。その状態で実比較が走り、+15MB と +27MB -- 帰無の床 -- を返した。"""
+    _clean(monkeypatch, tmp_path)
+    a = BR.resolve("fast", archive=env)["manifest"]
+    b = BR.resolve("slow", archive=env)["manifest"]
+    differ, why = C.transport_versions_differ(a, b, ["Outlook を整理", "Python を書いて"])
+    if not differ:
+        assert "same program" in why
+        reasons = C.refusals("fast", "slow", archive=env,
+                             goals=["Outlook を整理", "Python を書いて"])
+        assert any("same program" in r for r in reasons), reasons
+
+
+def test_versions_that_do_differ_are_not_refused(monkeypatch):
+    """挙動が違うなら通すこと。過剰な拒否は機能を無効化する。"""
+    from relay import transport_policy as TP
+    from relay.selfimprove import manifest as M
+    monkeypatch.setitem(TP.TRANSPORT_VERSIONS, "transport/v2",
+                        lambda goal, **k: TP.TAB)
+    a = M.apply_genome(M.base_manifest(), {"components": {"transport": "transport/v2"}})
+    differ, why = C.transport_versions_differ(a, M.base_manifest(), ["anything"])
+    assert differ is True and "choose differently" in why
+
+
+def test_an_unknown_version_is_not_silently_called_equivalent():
+    """版表に無いものを『同じ』と扱うと、未知が拒否ではなく通過になる。"""
+    from relay.selfimprove import manifest as M
+    a = dict(M.base_manifest())
+    a["components"] = dict(a["components"], transport="transport/v99")
+    differ, why = C.transport_versions_differ(a, M.base_manifest(), ["x"])
+    assert differ is True and "not in the version table" in why
+
+
+# ---- 撤回は追記であって書き換えではない -----------------------------------------------------------
+
+def test_a_withdrawn_verdict_is_shown_as_withdrawn_not_hidden(env, monkeypatch, tmp_path):
+    """信じられたという事実そのものが、後で読む人に必要な情報。"""
+    _clean(monkeypatch, tmp_path)
+    req = C.enqueue("fast", "slow", archive=env)
+    C.record(req, _order(400), _order(350), C.decide(_order(400), _order(350)))
+    C.withdraw(req["id"], "one ordering never ran")
+    rows = C.attempts_for("fast", "slow")
+    assert rows[0]["verdict"] == "WITHDRAWN"
+    assert rows[0]["original_verdict"] == C.VERDICT_A
+
+
+def test_withdrawing_rewrites_nothing(env, monkeypatch, tmp_path):
+    _clean(monkeypatch, tmp_path)
+    req = C.enqueue("fast", "slow", archive=env)
+    C.record(req, _order(400), _order(350), C.decide(_order(400), _order(350)))
+    raw_before = (tmp_path / "comparisons.jsonl").read_text(encoding="utf-8")
+    C.withdraw(req["id"], "because")
+    raw_after = (tmp_path / "comparisons.jsonl").read_text(encoding="utf-8")
+    assert raw_after.startswith(raw_before), "既存の行が書き換えられている"
