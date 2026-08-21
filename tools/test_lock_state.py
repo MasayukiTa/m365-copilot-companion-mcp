@@ -128,6 +128,27 @@ def _log_lines(tmp_path, monkeypatch):
     return [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
 
 
+@pytest.fixture(autouse=True)
+def _never_write_the_real_records(tmp_path, monkeypatch):
+    """どのテストも本番の記録に触らせない。
+
+    触れていた。追記ログを足した瞬間、このファイルのテストが 117 行を
+    .fleet/lock_refusals.jsonl に書き込み、実運用の拒否履歴に
+    `site=test_lock_state.py:34` が並んだ。今日これと同じ過ちを
+    socket_route.jsonl で一度直している -- 新しい追記型の記録は、
+    最初からテスト隔離を持たせないと必ずこうなる。
+    """
+    from pathlib import Path
+    monkeypatch.setattr(lock_state, "_LOG_FILE", Path(str(tmp_path / "refusals.jsonl")))
+    monkeypatch.setattr(lock_state, "_STATE_FILE", Path(str(tmp_path / "state.json")))
+
+
+def test_no_test_in_this_file_can_reach_the_real_records():
+    """上の fixture が効かなくなっても他のテストは緑のままなので、これが唯一の警報。"""
+    assert ".fleet" not in str(lock_state._LOG_FILE).replace("\\", "/")
+    assert ".fleet" not in str(lock_state._STATE_FILE).replace("\\", "/")
+
+
 def _redirect(tmp_path, monkeypatch):
     from pathlib import Path
     monkeypatch.setattr(lock_state, "_LOG_FILE", Path(str(tmp_path / "lock_refusals.jsonl")))
