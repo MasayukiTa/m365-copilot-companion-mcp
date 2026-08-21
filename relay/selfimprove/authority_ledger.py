@@ -235,6 +235,15 @@ _URGENT = {BASELINE_MISMATCH}
 _NOTIFIED = {REBLESS, REVOKE, BASELINE_MISMATCH}
 
 
+#: The commands that act on what these messages report. Carried IN the notification, because a
+#: message that reports an act without saying how to reverse it is an alarm rather than a
+#: control -- the operator's own words for the old version were "so what am I supposed to do
+#: about it". Every headline below ends with the next command, and none of them ends with a
+#: warning the reader cannot act on.
+UNDO_CMD = "python -m relay.selfimprove.frozen --revoke"
+VERIFY_CMD = "python -m relay.selfimprove.frozen --verify"
+
+
 def _headline(record) -> tuple:
     event = record.get("event")
     changed = ", ".join(sorted(record.get("changed") or {})) or "-"
@@ -242,13 +251,19 @@ def _headline(record) -> tuple:
     if event == BASELINE_MISMATCH:
         return ("Frozen set changed without a re-signing",
                 "%s\n\nNobody approved this. If it was not you, the judge has moved under a "
-                "running system." % changed)
+                "running system.\n\nsee exactly what moved:\n  %s\n\nthen undo the code with "
+                "git revert, or accept it deliberately with --snapshot --force --reason ..."
+                % (changed, VERIFY_CMD))
     if event == REVOKE:
         return ("A re-signing was withdrawn",
-                "%s\n\nreason: %s" % (changed, record.get("reason")))
+                "%s\n\nreason: %s\n\nThe frozen check FAILS from now on, and that is the "
+                "effect rather than a side effect: the approval is gone, the code is not. "
+                "Finish with git revert, or re-sign on purpose."
+                % (changed, record.get("reason")))
     return ("The constitution was re-signed",
             "%s\n\nreason: %s\nauthorization: %s\n\nIf you did not say this, nothing here "
-            "verified that you did." % (changed, record.get("reason"), auth))
+            "verified that you did.\n\nto withdraw it:\n  %s"
+            % (changed, record.get("reason"), auth, UNDO_CMD))
 
 
 def _notify(record) -> None:

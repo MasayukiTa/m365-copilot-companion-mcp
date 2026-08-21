@@ -48,8 +48,9 @@ def _route(**kw):
 
 # ---- 既定は off -----------------------------------------------------------------------------
 
-def test_the_route_is_off_unless_it_is_switched_on():
-    """まだ長時間の実運用を通していない。既定は観測済みのことについてだけ主張する。"""
+def test_the_route_can_still_be_switched_off():
+    """既定は socket（2026-08-21〜）。だが1つの環境変数で全部タブに戻せること自体が
+    この経路の安全装置なので、それが効くことを見張る。"""
     r = SocketRoute(enabled=False, capture_fn=lambda *a: (_token(), _Tpl()),
                     connect_fn=object())
     assert r.open() is False
@@ -598,3 +599,38 @@ def test_a_research_turn_gets_its_own_patience(tmp_path):
     drv = r.driver_for("w", agent_url="res", turn_timeout_s=1800, frame_timeout_s=300)
     assert drv.conv.turn_timeout_s == 1800
     assert drv.conv.frame_timeout_s == 300
+
+
+# ---- 既定 on（2026-08-21〜） -----------------------------------------------------------------
+
+def test_the_default_is_the_socket(monkeypatch):
+    """反転を正当化したのは速さでもメモリでもなく、**失敗が観測されたこと**。
+    socket レビューが期限超過でページに落ち、正しい判定を返し、理由が記録された。
+    それまで復旧経路は主張でしかなく、安全に失敗するところを見ていない経路を
+    既定にはできない。"""
+    import importlib
+
+    from relay import socket_route as SR
+    monkeypatch.delenv("MCP_FLEET_SOCKET", raising=False)
+    assert importlib.reload(SR).ENABLED is True
+
+
+def test_one_variable_puts_everything_back_on_tabs(monkeypatch):
+    import importlib
+
+    from relay import socket_route as SR
+    for off in ("0", "off", "false", "no", "OFF", ""):
+        monkeypatch.setenv("MCP_FLEET_SOCKET", off)
+        assert importlib.reload(SR).ENABLED is False, off
+
+
+def test_an_explicit_blank_is_off_and_an_absent_variable_is_on(monkeypatch):
+    """スクリプトは空文字を代入して無効化する。`get(key, "1")` では
+    『空を代入した』と『そもそも無い』が区別できず、無効化が黙って効かなくなる。"""
+    import importlib
+
+    from relay import socket_route as SR
+    monkeypatch.setenv("MCP_FLEET_SOCKET", "")
+    assert importlib.reload(SR).ENABLED is False
+    monkeypatch.delenv("MCP_FLEET_SOCKET", raising=False)
+    assert importlib.reload(SR).ENABLED is True

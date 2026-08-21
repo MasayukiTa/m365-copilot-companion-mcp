@@ -29,10 +29,24 @@ The +205 MB is not the conversations -- a conversation was measured at 1.9 MB. I
 capture tab, opened once per token lifetime and closed again, and it is counted here because
 pretending a route's own overhead belongs to something else is how a measurement flatters.
 
-STILL OFF BY DEFAULT. Four goals is not a long fleet job, and the failure this route's guards
-exist for -- a consent card only a tab can click, an attachment, an endpoint withdrawn without
-notice -- did not occur once in that run, so the run says nothing about them. Turning it on is
-a decision to be made from a longer run's fallback rate, not from a good afternoon.
+ON BY DEFAULT SINCE 2026-08-21, and the thing that justified flipping it was not the speed or
+the memory. It was a FAILURE. A socket review ran 400 seconds, exceeded its deadline, fell back
+to a page and finished with a correct verdict; the route recorded the reason and the job was
+never at risk. Until that happened the recovery path was a claim, and a route that has never
+been seen to fail safely should not be anyone's default however well it performs.
+
+What the same day measured, for the record:
+
+    chat turns        20+ across 8 request classes, zero fallbacks, Work IQ included --
+                      inbox, calendar read, calendar WRITE, SharePoint, verified against
+                      ground truth rather than against how convincing the answer sounded
+    memory            +205 MB peak against +1,653 for the same four goals on tabs
+    speed             77s against 104s for those goals; a deep research 198-255s against
+                      673-809 in a tab
+    side agents       ran at all. ram_room_for_tab() was False on this box, so research and
+                      review would have been SKIPPED rather than merely slowed
+
+Set MCP_FLEET_SOCKET=0 to go back to tabs everywhere.
 """
 from __future__ import annotations
 
@@ -48,8 +62,15 @@ from relay.chathub import ChatHubError, Conversation, expires_in
 DEFAULT_LOG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            ".fleet", "socket_route.jsonl")
 
-#: Off by default. See the module note -- this is measured on spikes, not on a day of work yet.
-ENABLED = os.environ.get("MCP_FLEET_SOCKET", "").strip().lower() in ("1", "true", "yes", "on")
+#: ON by default since 2026-08-21. See the module note for what was measured before flipping
+#: it, and in particular for the fallback that had to be observed first: a route whose recovery
+#: has never fired is a route whose recovery is a claim.
+#:
+#: UNSET MEANS ON; AN EXPLICIT BLANK MEANS OFF. The difference matters because scripts disable
+#: this by assigning an empty string, and `get(key, "1")` cannot tell that apart from absence.
+_RAW = os.environ.get("MCP_FLEET_SOCKET")
+ENABLED = (True if _RAW is None
+           else _RAW.strip().lower() not in ("0", "false", "no", "off", ""))
 
 #: Refresh the token this long before it expires. Generous next to a 60-79 minute life: the
 #: cost of being early is one cheap capture, the cost of being late is a worker falling back.

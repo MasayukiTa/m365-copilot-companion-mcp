@@ -271,3 +271,44 @@ def test_a_failing_notifier_never_blocks_the_record(tmp_path, monkeypatch):
                         lambda **k: (_ for _ in ()).throw(OSError("no toast here")))
     rec = L.append(L.REBLESS, reason="r", actor_claimed="a")
     assert rec["seq"] == 1 and L.verify(_p(tmp_path))[0]
+
+
+# ---- 通知は行動可能でなければならない（2026-08-21、運用者の指摘より） -------------------------
+#
+# 旧文面は「あなたがそう言っていないなら、そう言ったことをここでは何も検証していません」で
+# 終わっていた。何をすればよいかが1行も無い。運用者の言葉では
+# 「通知にもなんかくるけどそれどうしろっていうんだよぉになる」。
+# 取り消し方は最初から存在していた -- 通知が知らせていなかっただけ。
+
+def test_a_re_signing_tells_you_how_to_withdraw_it():
+    from relay.selfimprove import authority_ledger as AL
+    _t, body = AL._headline({"event": "REBLESS", "changed": {"relay/x.py": "h"},
+                             "reason": "r", "authorization": "a"})
+    assert AL.UNDO_CMD in body
+    assert "--revoke" in body
+
+
+def test_an_unapproved_change_tells_you_how_to_look_at_it():
+    from relay.selfimprove import authority_ledger as AL
+    _t, body = AL._headline({"event": AL.BASELINE_MISMATCH, "changed": {"relay/x.py": "h"}})
+    assert AL.VERIFY_CMD in body
+    assert "git revert" in body
+
+
+def test_a_withdrawal_says_what_state_you_are_now_in():
+    """--revoke の直後は凍結チェックが落ちる。それが目的だと書いていないと、
+    取り消した人は『壊した』と思って元に戻す。"""
+    from relay.selfimprove import authority_ledger as AL
+    _t, body = AL._headline({"event": AL.REVOKE, "changed": {"relay/x.py": "h"},
+                             "reason": "r"})
+    assert "FAILS" in body and "git revert" in body
+
+
+def test_no_notification_ends_on_a_warning_with_no_next_step():
+    """『気をつけろ』で終わる通知は制御ではなく警報。3種すべてに次の一手を持たせる。"""
+    from relay.selfimprove import authority_ledger as AL
+    for ev in (AL.BASELINE_MISMATCH, AL.REVOKE, "REBLESS"):
+        _t, body = AL._headline({"event": ev, "changed": {"relay/x.py": "h"},
+                                 "reason": "r", "authorization": "a"})
+        assert ("python -m relay.selfimprove.frozen" in body
+                or "git revert" in body), ev
