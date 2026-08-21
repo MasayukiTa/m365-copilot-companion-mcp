@@ -498,6 +498,223 @@ def companionbench_evaluator(*, agent_kind="fleet", tmpdir=None, base_manifest=N
                           tmpdir=tmpdir or tempfile.mkdtemp(prefix="campaign_"),
                           base_manifest=base_manifest, **kw)
 
+
+
+
+#: Where a campaign's own fallback rows go. NOT the live socket_route log.
+#:
+#: The rows an arm produces look like production rows and are not: both arms force a transport,
+#: so the socket arm carries goals the classifier would have sent to a tab. Those rows are the
+#: most informative labels available -- they are the only way to learn a tab was unnecessary --
+#: but appending them unmarked to the file the classifier trains from teaches it from a
+#: distribution production never shows. The test suite already polluted two production ledgers
+#: in this repository by exactly this route.
+CAMPAIGN_SOCKET_LOG = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "docs", "research", "results", "route_campaign_socket.jsonl")
+
+
+def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222",
+                        max_concurrent=2, log_path=None, candidate_first=False):
+    """An `evaluate(manifest, experiment_id)` that measures transport, not pass@1.
+
+    CompanionBench answers "did the candidate solve more episodes". For a transport hypothesis
+    that is the CONSTRAINT, not the question: the point of a socket is memory, and an evaluator
+    that only counted completions would score two arms identical and return inconclusive
+    forever -- the loop would look like it was measuring while learning nothing.
+
+    THE ARMS DIFFER BY THE ROUTE SWITCH, NOT BY THE COMPONENT
+
+    `transport` decides WHICH goals may use a socket; `MCP_FLEET_SOCKET` decides whether any
+    may. Running the candidate against a route that is off would compare two arms that both
+    open tabs -- the same identity defect that correctly killed the four coordinates before
+    this one. So the control is tabs-everywhere and the candidate is the route as configured.
+
+    THE SINGLETON IS REBUILT BETWEEN ARMS, AND THAT IS NOT TIDINESS
+
+    `SocketRoute.enabled` is read at CONSTRUCTION, and the fleet caches one instance per
+    process. Flipping the environment variable between arms would leave the second arm running
+    the first arm's route, so the candidate would silently run tabs and report a clean null.
+    """
+    import os as _os
+
+    from relay.selfimprove import route_evaluator as RV
+
+    #: The lowest free physical memory seen at any sample, across both arms.
+    #:
+    #: `preflight` checks the floor ONCE, before the run. That makes it a start condition, and
+    #: a start condition is not what the argument needs: an arm that begins at 2.2 GB and opens
+    #: two tabs can cross the floor halfway through and spend the rest of the run measuring the
+    #: page file. The floor has to hold FOR the measurement, not merely at its beginning, so
+    #: every sample records it and the result is thrown out below if it broke.
+    _floor = {"min_free_mb": None}
+
+    def _edge_mb():
+        try:
+            import psutil
+        except Exception:
+            return 0.0
+        try:
+            free = psutil.virtual_memory().available / (1024.0 * 1024.0)
+            if _floor["min_free_mb"] is None or free < _floor["min_free_mb"]:
+                _floor["min_free_mb"] = free
+        except Exception:
+            pass
+        total = 0
+        for proc in psutil.process_iter(["name", "memory_info"]):
+            try:
+                if (proc.info.get("name") or "").lower() == "msedge.exe":
+                    total += proc.info["memory_info"].rss
+            except Exception:
+                continue
+        return total / (1024.0 * 1024.0)
+
+    def _fresh_route(enabled):
+        """Build the route this arm will use and install it as the fleet's singleton."""
+        from relay import relay_fleet as RF
+        from relay.socket_route import SocketRoute, capture_via_tab, websocket_connect
+        route = SocketRoute(capture_fn=capture_via_tab, connect_fn=websocket_connect,
+                            enabled=enabled, log_path=log_path or CAMPAIGN_SOCKET_LOG,
+                            log=lambda m: print(m, flush=True))
+        RF._SOCKET_ROUTE = route
+        return route
+
+    def _activate(candidate_manifest):
+        """Point the harness at the candidate WITHOUT touching the operator's active file.
+
+        `runtime_config` already provides the override for exactly this: an A/B that rewrites
+        the live configuration is not an A/B, it is two sequential deployments. The control arm
+        clears it, so the two arms differ by the manifest and by nothing that leaked from the
+        previous one.
+        """
+        import json
+        import tempfile
+
+        from relay.selfimprove import runtime_config as RC
+        if candidate_manifest is None:
+            _os.environ.pop(RC.OVERRIDE_ENV, None)
+        else:
+            fh = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                             encoding="utf-8")
+            json.dump(candidate_manifest, fh)
+            fh.close()
+            _os.environ[RC.OVERRIDE_ENV] = fh.name
+        # The cache is keyed on (path, mtime); a new path invalidates it, but clearing the
+        # override returns to a path that may still be cached from before the arm.
+        RC.active_manifest(refresh=True)
+
+    def _run(goal_list, socket_on, sample, manifest=None):
+        from playwright.sync_api import sync_playwright
+
+        from relay import socket_route as SR
+        from relay.relay_fleet import run_relay_fleet
+        _os.environ["MCP_FLEET_SOCKET"] = "1" if socket_on else "0"
+        SR.ENABLED = bool(socket_on)
+        _activate(manifest)
+        route = _fresh_route(socket_on)
+        url = agent_url or _os.environ.get("MCP_FLEET_AGENT_URL", "")
+        done = 0
+        with sync_playwright() as pw:
+            browser = pw.chromium.connect_over_cdp(cdp_url)
+            context = browser.contexts[0] if browser.contexts else browser.new_context()
+            rows = run_relay_fleet(context, list(goal_list), url,
+                                   max_concurrent=max_concurrent,
+                                   on_tick=lambda *a, **k: sample())
+            for row in (rows or []) if isinstance(rows, list) else []:
+                if str((row or {}).get("outcome", "")).upper() == "DONE":
+                    done += 1
+        return {"done": done, "fallbacks": int(route.status().get("fallbacks", 0) or 0)}
+
+    def _token_is_capturable():
+        """Try once, for real. Cost: one tab opened and closed -- what the route itself does.
+
+        Asserting a token exists without capturing one is how the socket arm becomes the tab
+        arm while the run reports success, which is the single failure this precondition is
+        for. It has to actually look.
+        """
+        from playwright.sync_api import sync_playwright
+
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.connect_over_cdp(cdp_url)
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                from relay.socket_route import capture_via_tab, expires_in
+                token, _template = capture_via_tab(
+                    context, agent_url or _os.environ.get("MCP_FLEET_AGENT_URL", ""))
+                return bool(token) and expires_in(token) > 0
+        except Exception as exc:
+            print("[route_eval] token capture failed: %s: %s"
+                  % (type(exc).__name__, str(exc)[:160]), flush=True)
+            return False
+
+    def evaluate(candidate_manifest, experiment_id, base=None):
+        from relay.relay_fleet import avail_phys_mb
+        refusals = RV.preflight(free_mb=avail_phys_mb(), token_ok=_token_is_capturable())
+        if refusals:
+            return {"gate": None, "sentinel": None, "security": None, "regression": None,
+                    "infra": {"aborted": True, "reason": "; ".join(refusals)},
+                    "experiment_id": experiment_id}
+
+        # The control is tabs-everywhere under the BASE harness; the candidate is the route
+        # under the manifest being judged. Without the manifest the candidate arm would run
+        # whatever is active, and transport/v1 and transport/v2 would measure identically --
+        # the same identity defect one level up.
+        # ARM ORDER IS A PARAMETER BECAUSE IT IS A CONFOUND.
+        #
+        # Arms run in sequence and Edge does not give its memory back between them, so the
+        # second arm starts from the first one's residue and under pressure the OS trims its
+        # working set -- which biases the measurement in a direction that depends only on
+        # which arm went second. The first two campaigns both ran control-first and returned
+        # OPPOSITE signs, so order cannot be waved away by argument; it has to be swapped and
+        # the sign checked.
+        def _control():
+            return RV.measure_arm(lambda g, s, smp: _run(g, s, smp, manifest=None),
+                                  goals=goals, socket_on=False, peak_sampler=_edge_mb)
+
+        def _candidate():
+            return RV.measure_arm(
+                lambda g, s, smp: _run(g, s, smp, manifest=candidate_manifest),
+                goals=goals, socket_on=True, peak_sampler=_edge_mb)
+
+        try:
+            if candidate_first:
+                candidate = _candidate()
+                control = _control()
+            else:
+                control = _control()
+                candidate = _candidate()
+        finally:
+            _activate(None)
+        low = _floor["min_free_mb"]
+        if low is not None and low < RV.MIN_FREE_MB:
+            # NOT a gate result. The comparison ran, and what it measured is unknown -- which
+            # is a different thing from the routes being indistinguishable, and recording it as
+            # inconclusive would put a swap measurement into the archive wearing a verdict.
+            return {"gate": None, "sentinel": None, "security": None, "regression": None,
+                    "infra": {"aborted": True,
+                              "reason": "free memory fell to %.0f MB during the run, under the "
+                                        "%.0f MB floor. The quantity under test is memory, so "
+                                        "from that point the arms were measuring the page file."
+                                        % (low, RV.MIN_FREE_MB)},
+                    "experiment_id": experiment_id,
+                    "control": control, "candidate": candidate, "min_free_mb": round(low, 1),
+                    "arm_order": "candidate,control" if candidate_first else "control,candidate"}
+        verdict = RV.decide(control, candidate)
+        return {
+            "gate": {"keep": verdict["verdict"] == "keep",
+                     "verdict": verdict["verdict"],
+                     "reason": verdict["why"]},
+            "sentinel": None, "security": None, "regression": None,
+            "infra": {"aborted": False},
+            "experiment_id": experiment_id,
+            "control": control, "candidate": candidate,
+            "memory_gain_mb": verdict["memory_gain_mb"],
+            "min_free_mb": round(low, 1) if low is not None else None,
+            "arm_order": "candidate,control" if candidate_first else "control,candidate",
+        }
+
+    return evaluate
+
 def _refuse(*_a, **_k):
     raise Blocked("nightly() needs an evaluator; it will not invent one and call the result "
                   "a measurement")

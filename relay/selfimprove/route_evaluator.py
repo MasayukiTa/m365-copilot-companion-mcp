@@ -42,9 +42,26 @@ from __future__ import annotations
 
 import time
 
-#: Free physical memory an arm needs before it may start. The same floor a reviewer page uses,
-#: for the same reason: below it the machine is not running the thing you think it is.
-MIN_FREE_MB = 2000.0
+#: Free physical memory an arm needs. THE OPERATOR'S NUMBER, not one this file invented.
+#:
+#: The first value here was 2000, borrowed from the reviewer-page constant on the reasoning
+#: that "below it the machine is not running the thing you think it is". That was never
+#: calibrated for this measurement and it made every run on the operator's box abort. The
+#: fleet's own admission floor is the operator's setting (the cockpit ships 2048 and a
+#: recorded live run used 1024); 512 is the value they set for this machine.
+#:
+#: THOSE TWO FLOORS ARE NOT THE SAME QUANTITY. The fleet's `ram_floor_mb` asks "may I open
+#: another tab without taking RAM the operator is using". This one asks "are the numbers I am
+#: writing down about memory, or about the page file". They share a unit and nothing else, so
+#: this one does NOT track the cockpit setting -- it is set deliberately, here, and the reason
+#: is written next to it.
+#:
+#: What survives the lower floor is the SECOND-ORDER problem, which the floor never addressed:
+#: under memory pressure Windows trims working sets, so RSS under-reports, and it under-reports
+#: more for whichever arm ran under more pressure. Arms run in sequence, so the second one
+#: inherits the first one's residue. `start_mb` is recorded per arm and the arm order is
+#: recorded with the result, because that bias is not something a floor can remove.
+MIN_FREE_MB = 512.0
 
 #: How much less peak memory the candidate must use before "better" is claimed. Set from the
 #: measured gap between the routes (+205 MB against +1653 MB) -- generous enough that noise
@@ -61,8 +78,9 @@ def preflight(*, free_mb, token_ok) -> list:
     reasons = []
     if free_mb is not None and free_mb < MIN_FREE_MB:
         reasons.append(
-            "%.0f MB free, floor %.0f. The quantity under test is memory, so an arm that runs "
-            "while the machine swaps measures the swap." % (free_mb, MIN_FREE_MB))
+            "%.0f MB free, floor %.0f (the operator's setting for this machine). The quantity "
+            "under test is memory, so an arm that runs while the machine swaps measures the "
+            "swap." % (free_mb, MIN_FREE_MB))
     if not token_ok:
         reasons.append(
             "no usable socket token. The socket arm would fall back to tabs and the two arms "

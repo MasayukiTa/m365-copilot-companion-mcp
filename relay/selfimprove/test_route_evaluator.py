@@ -17,7 +17,7 @@ from relay.selfimprove import route_evaluator as RE
 def test_a_swapping_machine_is_refused_rather_than_measured():
     """測っている量そのものがメモリなので、スワップ中の腕はスワップを測る。
     2026-08-21 に実際これで片腕を落としている。"""
-    reasons = RE.preflight(free_mb=1200.0, token_ok=True)
+    reasons = RE.preflight(free_mb=300.0, token_ok=True)
     assert len(reasons) == 1
     assert "swap" in reasons[0]
 
@@ -111,3 +111,16 @@ def test_the_arm_records_fallbacks_because_a_route_that_gave_up_is_not_the_route
     got = RE.measure_arm(run_goals, goals=[1, 2, 3, 4], socket_on=True,
                          peak_sampler=lambda: 0.0)
     assert got["fallbacks"] == 3
+
+
+def test_the_floor_is_the_operators_number_and_says_so():
+    """最初の 2000 は reviewer page の定数からの流用で、この測定用に較正されていない。
+    運用者の箱では毎回 abort になった。床は借り物ではなく、
+    ここで意図して置き、理由を隣に書く。"""
+    import inspect
+    assert RE.MIN_FREE_MB == 512.0
+    src = inspect.getsource(RE)
+    i = src.index("MIN_FREE_MB = 512.0")
+    block = src[max(0, i - 1600):i]
+    assert "NOT THE SAME QUANTITY" in block.upper(), "アドミッション床との違いが書かれていない"
+    assert "trims working sets" in block, "床では消えない二次バイアスが書かれていない"
