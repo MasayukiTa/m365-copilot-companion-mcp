@@ -762,21 +762,24 @@ def test_the_unlock_job_is_actually_sent():
     assert "unlock" in w.job and w._unlock_attempts == 1
 
 
-def test_a_long_ordinary_answer_is_not_a_lock_error():
+def test_a_long_ordinary_answer_is_not_a_lock_error(tmp_path, monkeypatch):
     """並列実行では、拒否の記録は誰のものか分からないまま共有される。
-    533文字の会議要約が『ロック』と判定されたのがこれ。"""
+    533文字の会議要約が『ロック』と判定されたのがこれ。
+
+    boolean を差し替えるのではなく、実際に拒否を記録して判定させる -- 実装が
+    「はい/いいえ」から「どの記録か」に変わったとき、差し替え型のテストは
+    実装より先に古くなり、通らなくなって初めてそれに気づく。"""
     import relay.relay_fleet as rf
-    import tools.lock_state as LS
-    orig = LS.locked_since
-    LS.locked_since = lambda since, now=None: True      # 誰かが拒否された直後
-    try:
-        long_answer = "会議の要約です。" * 80           # マーカー無し・長い
-        assert len(long_answer) >= rf.LOCKED_DOMINANCE_MAX_CHARS
-        assert rf._looks_locked(long_answer, since=1.0) is False
-        short_paraphrase = "unlock パスワード欠如で確定。STUCK。"
-        assert rf._looks_locked(short_paraphrase, since=1.0) is True
-    finally:
-        LS.locked_since = orig
+    LS = _lock_tmp(tmp_path, monkeypatch)
+    LS.record_locked("203.0.113.7", "refused", ts=100.0)
+    import time as _t
+    monkeypatch.setattr(_t, "time", lambda: 101.0)
+
+    long_answer = "会議の要約です。" * 80           # マーカー無し・長い
+    assert len(long_answer) >= rf.LOCKED_DOMINANCE_MAX_CHARS
+    assert rf._looks_locked(long_answer, since=99.0) is False
+    short_paraphrase = "unlock パスワード欠如で確定。STUCK。"
+    assert rf._looks_locked(short_paraphrase, since=99.0) is True
 
 
 def _lock_tmp(tmp_path, monkeypatch):
