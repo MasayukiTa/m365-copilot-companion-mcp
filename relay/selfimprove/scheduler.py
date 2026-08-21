@@ -515,7 +515,8 @@ CAMPAIGN_SOCKET_LOG = os.path.join(
 
 
 def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222",
-                        max_concurrent=2, log_path=None, candidate_first=False):
+                        max_concurrent=2, log_path=None, candidate_first=False,
+                        warmup=False):
     """An `evaluate(manifest, experiment_id)` that measures transport, not pass@1.
 
     CompanionBench answers "did the candidate solve more episodes". For a transport hypothesis
@@ -549,7 +550,49 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
     #: every sample records it and the result is thrown out below if it broke.
     _floor = {"min_free_mb": None}
 
+    #: The processes that already existed when this arm started. Set per arm, never shared.
+    _attr = {"baseline_pids": None, "peak_new_pids": 0}
+
+    def _begin_attribution():
+        """Forget the previous arm's baseline. Called before each arm, not inside the sampler.
+
+        `measure_arm` takes its first sample BEFORE running anything, so a sampler that
+        lazily initialised itself would inherit the previous arm's baseline for exactly one
+        call -- the call whose value becomes `start_mb`.
+        """
+        _attr["baseline_pids"] = None
+        _attr["peak_new_pids"] = 0
+
     def _edge_mb():
+        """Commit charge of msedge processes THIS ARM CREATED. Not total Edge memory.
+
+        THE FIRST VERSION MEASURED PEAK TOTAL RSS AND IT MEASURED THE WRONG THING.
+
+        Two campaigns run with the arms swapped returned opposite signs (+449 MB, then
+        -666 MB), and in both the arm that ran FIRST showed the larger rise. Total RSS across
+        a browser shared with other sessions cannot be attributed to an arm at all: another
+        session opening a tab lands entirely on whichever arm is running, Windows trims
+        working sets under pressure so RSS tracks system-wide pressure rather than demand,
+        and the second arm inherits a high-water mark that leaves it almost no room to move.
+
+        WHAT IS ATTRIBUTABLE IS PER-PROCESS GROWTH, NOT NEW PROCESSES.
+
+        The first attempt at this counted only processes that did not exist when the arm
+        began, on the reasoning that a socket goal creates no renderer. The measurement said
+        otherwise: after a warm-up pass, an arm that opened four Copilot tabs created ONE new
+        process worth 18 MB. Edge keeps a warm renderer pool and reuses it, so a tab's cost
+        lands as growth inside processes that were already there -- which the new-process
+        rule scores as zero and which is most of the real number.
+
+        So the sum is over every msedge process, of how much MORE commit it holds than when
+        the arm started. New processes fall out of the same rule with a baseline of zero.
+        Commit (`private`) rather than RSS because commit is what the process asked for and
+        does not move when the OS trims a working set under pressure.
+
+        This still cannot separate another session's tab from ours -- nothing sampling from
+        outside the browser can. It removes the two effects that dominated the first design:
+        the absolute level the arm inherited, and trimming.
+        """
         try:
             import psutil
         except Exception:
@@ -560,13 +603,34 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
                 _floor["min_free_mb"] = free
         except Exception:
             pass
-        total = 0
-        for proc in psutil.process_iter(["name", "memory_info"]):
+
+        current = {}
+        for proc in psutil.process_iter(["pid", "name", "memory_info"]):
             try:
-                if (proc.info.get("name") or "").lower() == "msedge.exe":
-                    total += proc.info["memory_info"].rss
+                if (proc.info.get("name") or "").lower() != "msedge.exe":
+                    continue
+                mi = proc.info["memory_info"]
+                current[proc.info["pid"]] = float(getattr(mi, "private", mi.rss))
             except Exception:
                 continue
+
+        if _attr["baseline_pids"] is None:
+            # The whole map, not just the key set: a process that already existed can still
+            # GROW because of this arm, and on a warm browser that is where the cost lands.
+            _attr["baseline_pids"] = dict(current)
+            return 0.0
+        base = _attr["baseline_pids"]
+        new_pids = [pid for pid in current if pid not in base]
+        if len(new_pids) > _attr["peak_new_pids"]:
+            _attr["peak_new_pids"] = len(new_pids)
+        # Per-process GROWTH since the arm began, summed. Processes that shrank contribute
+        # zero rather than a negative: a renderer the arm never touched, trimmed by the OS
+        # while the arm ran, would otherwise pay the arm a credit it did not earn.
+        total = 0.0
+        for pid, value in current.items():
+            grew = value - base.get(pid, 0.0)
+            if grew > 0:
+                total += grew
         return total / (1024.0 * 1024.0)
 
     def _fresh_route(enabled):
@@ -668,15 +732,37 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
         # OPPOSITE signs, so order cannot be waved away by argument; it has to be swapped and
         # the sign checked.
         def _control():
-            return RV.measure_arm(lambda g, s, smp: _run(g, s, smp, manifest=None),
-                                  goals=goals, socket_on=False, peak_sampler=_edge_mb)
+            _begin_attribution()
+            out = RV.measure_arm(lambda g, s, smp: _run(g, s, smp, manifest=None),
+                                 goals=goals, socket_on=False, peak_sampler=_edge_mb)
+            out["new_renderers"] = _attr["peak_new_pids"]
+            return out
 
         def _candidate():
-            return RV.measure_arm(
+            _begin_attribution()
+            out = RV.measure_arm(
                 lambda g, s, smp: _run(g, s, smp, manifest=candidate_manifest),
                 goals=goals, socket_on=True, peak_sampler=_edge_mb)
+            out["new_renderers"] = _attr["peak_new_pids"]
+            return out
+
+        def _warmup():
+            """One pass whose numbers are thrown away.
+
+            The first arm of a session pays for renderer creation, authentication and the
+            Copilot session handshake, and that cost lands entirely on whichever arm went
+            first. It does not remove the other order effects -- a shared browser and a
+            shared machine still put another session's tab on whichever arm is running --
+            but it removes the one that is certain to be there.
+            """
+            _begin_attribution()
+            RV.measure_arm(lambda g, s, smp: _run(g, s, smp, manifest=None),
+                           goals=goals[:1], socket_on=False, peak_sampler=_edge_mb)
+            _floor["min_free_mb"] = None
 
         try:
+            if warmup:
+                _warmup()
             if candidate_first:
                 candidate = _candidate()
                 control = _control()
@@ -711,6 +797,13 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
             "memory_gain_mb": verdict["memory_gain_mb"],
             "min_free_mb": round(low, 1) if low is not None else None,
             "arm_order": "candidate,control" if candidate_first else "control,candidate",
+            "warmup": bool(warmup),
+            # THE MECHANISM, WHICH IS WORTH MORE THAN THE STATISTIC HERE. A socket goal should
+            # create no renderer at all, so the fleet-scale difference is arithmetic --
+            # renderers avoided times commit per renderer -- rather than an effect that has to
+            # be detected against a swing four times the decision threshold.
+            "renderers": {"control": control.get("new_renderers"),
+                          "candidate": candidate.get("new_renderers")},
         }
 
     return evaluate

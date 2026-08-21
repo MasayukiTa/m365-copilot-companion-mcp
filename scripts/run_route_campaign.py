@@ -97,7 +97,8 @@ def main():
         ],
     )
     evaluate = S.route_evaluator_for(GOALS, agent_url=agent_url, max_concurrent=2,
-                                     candidate_first=candidate_first)
+                                     candidate_first=candidate_first,
+                                     warmup="--warmup" in sys.argv)
     t0 = time.time()
     out = evaluate(candidate, exp)
     out["wall_s"] = round(time.time() - t0, 1)

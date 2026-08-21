@@ -16,7 +16,7 @@ to build, no component to reach, and nothing inert.
 
 WHAT IS MEASURED, FIXED BEFORE THE RUN
 
-    peak Edge memory over the arm     the reason the route exists
+    peak commit of processes the arm CREATED    the reason the route exists
     wall clock                        the other reason
     goals reaching DONE               the thing that must not get worse
     fallbacks                         how often the route gave up and opened a tab anyway
@@ -118,9 +118,16 @@ def measure_arm(run_goals, *, goals, socket_on, peak_sampler, now=time.time) -> 
 
     `run_goals(goals, socket_on)` is supplied by the caller so this module never imports the
     fleet: the decision rule and the measurement shape stay testable without a browser.
-    `peak_sampler()` returns current Edge memory in MB; the arm's peak is taken over the run
-    and reported as a RISE over its own start, because absolute totals carry whatever else the
-    machine happens to be doing.
+
+    `peak_sampler()` returns a memory figure in MB and the arm's peak is reported as a RISE
+    over its own start. WHAT THE CALLER PUTS BEHIND THAT SAMPLER DECIDES WHETHER THE NUMBER
+    MEANS ANYTHING. The first caller sampled total Edge RSS, and two campaigns run with the
+    arms swapped returned opposite signs: on a browser shared with other sessions, total RSS
+    is not attributable to an arm, Windows trims working sets so it tracks system pressure
+    rather than demand, and the second arm inherits a high-water mark. The sampler now returns
+    the commit charge of processes that did not exist when the arm began, which is a quantity
+    the arm actually caused. A rise over a start of zero, but the shape is unchanged and this
+    module still does not need to know which it was given.
     """
     start_mb = float(peak_sampler() or 0.0)
     peak = start_mb

@@ -217,3 +217,63 @@ def test_arm_order_is_swappable_and_recorded():
     i = src.index("if candidate_first:")
     block = src[i:i + 300]
     assert "candidate = _candidate()" in block and "control = _control()" in block
+
+
+# ---- 従属変数が腕に帰属できる量であること --------------------------------------------------------
+
+def test_the_measured_quantity_is_attributable_to_the_arm():
+    """合計RSSのピークは腕に帰属できない。別セッションがタブを開けば
+    その上昇は丸ごと走行中の腕に計上され、OS のトリミングで RSS は
+    需要ではなくシステム全体の圧を測り、第2腕は先行腕の高水位標に潰される。
+    腕の開始時に存在しなかったプロセスだけが、その腕のもの。"""
+    src = inspect.getsource(S.route_evaluator_for)
+    assert "baseline_pids" in src
+    assert "private" in src, "commit ではなく RSS を読んでいる"
+    i = src.index("def _edge_mb")
+    body = src[i:i + 3600]
+    assert "base.get(pid, 0.0)" in body, "既存プロセスの増分を見ていない"
+
+
+def test_the_baseline_is_reset_before_the_arm_not_inside_the_sampler():
+    """measure_arm は run_goals の前に1回サンプルを取る。サンプラ内で遅延初期化すると、
+    その1回 -- start_mb になる値 -- だけ前の腕のベースラインを引き継ぐ。"""
+    src = inspect.getsource(S.route_evaluator_for)
+    for arm in ("def _control():", "def _candidate():"):
+        i = src.index(arm)
+        assert "_begin_attribution()" in src[i:i + 200], arm
+
+
+def test_the_renderer_count_is_reported_because_the_mechanism_beats_the_statistic():
+    """観測された run 間スイングは判定閾値の約4倍。単発 run で検出しようとするより、
+    『socket ゴールはレンダラーを生まない』を測って算術で出すほうが強い。"""
+    src = inspect.getsource(S.route_evaluator_for)
+    assert "new_renderers" in src and '"renderers"' in src
+
+
+def test_a_warmup_pass_is_available_and_its_numbers_are_discarded():
+    """セッション最初の腕はレンダラー生成・認証・セッション確立の代金を払う。"""
+    src = inspect.getsource(S.route_evaluator_for)
+    i = src.index("def _warmup")
+    body = src[i:i + 900]
+    assert "goals[:1]" in body
+    assert '_floor["min_free_mb"] = None' in body, "捨て走行の圧が本測定の床判定に残る"
+
+
+def test_growth_inside_existing_processes_is_counted():
+    """最初の版は『腕が新たに生んだプロセス』だけを数え、警告走行の後に
+    タブ4枚を開いた腕が新規1プロセス18MBという値を返した。Edge は
+    レンダラープールを再利用するので、タブのコストは既存プロセスの
+    増分として乗る -- 新規プロセス規則はそれをゼロと採点する。"""
+    src = inspect.getsource(S.route_evaluator_for)
+    i = src.index("def _edge_mb")
+    body = src[i:i + 3600]
+    assert "grew = value - base.get(pid, 0.0)" in body
+
+
+def test_a_shrinking_process_does_not_pay_the_arm_a_credit():
+    """腕が触れていないレンダラーが OS にトリミングされただけで
+    『この腕はメモリを減らした』ことにされる。"""
+    src = inspect.getsource(S.route_evaluator_for)
+    i = src.index("def _edge_mb")
+    body = src[i:i + 3600]
+    assert "if grew > 0:" in body
