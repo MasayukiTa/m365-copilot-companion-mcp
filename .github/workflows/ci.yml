@@ -214,8 +214,10 @@ jobs:
             relay/selfimprove/test_frozen.py \
             relay/selfimprove/test_authority_ledger.py \
             relay/selfimprove/test_route_evaluator.py \
+            relay/test_transport_policy.py \
             relay/test_socket_driver.py \
             relay/test_socket_route.py \
+            relay/test_chathub_capture.py \
             relay/selfimprove/test_guards.py \
             relay/selfimprove/test_harness_feedback.py \
             relay/selfimprove/test_qd.py \

@@ -390,10 +390,12 @@ def test_every_evolvable_component_has_something_that_dispatches_on_it():
     from relay import project_memory as PM
 
     from relay.planner import PLANNER_VERSIONS
+    from relay.transport_policy import TRANSPORT_VERSIONS
     from relay.quality_cards import QUALITY_CARDS_VERSIONS
     DISPATCHERS = {"memory": PM.MEMORY_VERSIONS,
                    "quality_cards": QUALITY_CARDS_VERSIONS,
-                   "planner": PLANNER_VERSIONS}
+                   "planner": PLANNER_VERSIONS,
+                   "transport": TRANSPORT_VERSIONS}
     assert set(M.EVOLVABLE_COMPONENTS) == set(DISPATCHERS), (
         "実装の無いコンポーネントが evolvable になっている: %s"
         % (set(M.EVOLVABLE_COMPONENTS) ^ set(DISPATCHERS)))

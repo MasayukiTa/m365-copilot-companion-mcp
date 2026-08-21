@@ -54,6 +54,29 @@ EVOLVABLE_COMPONENTS = frozenset({
     # deliberately NOT what this selects; an arm that waits for a person cannot be one side
     # of an unattended comparison.
     "planner",
+    # PROMOTED 2026-08-21. NOT the same thing as `routing`, which stays forbidden three
+    # blocks down, and the difference is a property of the code rather than of the idea:
+    #
+    #   a routing decision selects the HARNESS a task runs under, so the checks differ
+    #   between branches and an optimiser learns to steer toward the lax one;
+    #   a transport decision selects only how the conversation is CARRIED. Manifest,
+    #   graders, folder policy and unlock boundary are identical on both sides, so getting
+    #   it wrong buys memory and never permission.
+    #
+    # THE INVARIANT THIS RESTS ON, stated so a future argument has to meet it rather than
+    # appeal to the name: the two transports must remain identical in permissions and
+    # checks. The day the socket side skips a consent step the tab performs, or accepts on a
+    # different rule, transport selection IS routing selection and belongs back below.
+    #
+    # And it rests on two files being frozen: route_evaluator.py, which holds the REJECT rule
+    # this family is judged by, and socket_route.py, which holds the circuit breaker, the
+    # one-way fallback counter and the label writer. A classifier that could relax those
+    # would make "route more to sockets" free.
+    #
+    # What may move is thresholds and the eligible-kind list. The Work IQ predicate is code,
+    # because its errors are SILENT -- a socket answer formed without Work IQ context can
+    # reach DONE with no fallback, and the label then says the socket was fine.
+    "transport",
 })
 
 #: Named so the intent survives, and so a future implementer knows where to look -- but NOT
@@ -104,6 +127,7 @@ DEFAULT_COMPONENTS = {
     "memory": "memory/v1",
     "quality_cards": "quality_cards/v1",
     "planner": "planner/v1",
+    "transport": "transport/v1",
 }
 
 #: Every parameter's type and the range a run may actually use. The upper bounds are not
@@ -186,6 +210,12 @@ def known_versions(component: str) -> frozenset:
         try:
             from relay.planner import PLANNER_VERSIONS
             return frozenset(PLANNER_VERSIONS)
+        except Exception:
+            return frozenset()
+    if component == "transport":
+        try:
+            from relay.transport_policy import TRANSPORT_VERSIONS
+            return frozenset(TRANSPORT_VERSIONS)
         except Exception:
             return frozenset()
     return frozenset()
