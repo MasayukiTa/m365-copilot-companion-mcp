@@ -368,6 +368,38 @@ def _payloads(frame):
     return []
 
 
+def collect_progress(frame) -> list:
+    """The messages the ANSWER deliberately excludes, kept instead of dropped.
+
+    MEASURED ON A LIVE RESEARCH, 2026-08-21: the Researcher streams `messageType: "Progress"`
+    with `contentOrigin: "ChainOfThoughtSummary"` -- 5,332 characters naming the benchmarks it
+    consulted and the numbers it took from each ("RRF combining BM25 and ELSER boosted nDCG@10
+    by 1.4% over ELSER alone", "TREC 2025 RAG track ... 0.468 to 0.615"). That is the route the
+    research took and the evidence it judged on, and this module was filtering it away to keep
+    the prose clean.
+
+    It stays OUT of the answer -- an answer is what the model said, not what it was thinking --
+    and it is returned separately so a caller can hand it to another agent and have the claims
+    checked instead of taking the report's word for itself.
+    """
+    out = []
+    for payload in _payloads(frame):
+        for msg in (payload.get("messages") or []):
+            if not isinstance(msg, dict):
+                continue
+            mt = msg.get("messageType")
+            if mt in (None, "", "Chat"):
+                continue                      # that is the answer; collect_final has it
+            if msg.get("author") not in (None, "", "bot", "assistant"):
+                continue
+            text = msg.get("text") or msg.get("hiddenText") or ""
+            if not isinstance(text, str) or not text:
+                continue
+            out.append({"type": str(mt), "origin": str(msg.get("contentOrigin") or ""),
+                        "text": text})
+    return out
+
+
 def collect_delta(frame) -> str:
     """Incremental text. Concatenating these across a turn rebuilds the answer."""
     return "".join(_delta_from_payload(p) for p in _payloads(frame))
@@ -475,6 +507,10 @@ class Conversation:
         self.last_result = ""
         #: The conversation id the backend used for the last turn, which may not be ours.
         self.server_conversation_id = ""
+        #: What the backend said while it was working, from the LAST turn -- progress lines,
+        #: search queries, chain-of-thought summaries. Not the answer, and kept apart from it
+        #: for that reason. Empty for turns that only ever said one thing.
+        self.last_progress = []
         #: The current connection, held only so a failed turn can drop it. A CONVERSATION IS
         #: NOT A CONNECTION here: the client opens a new socket for every message, and keeping
         #: one open was measured WORSE -- with the connection reused, the second turn was
@@ -491,7 +527,7 @@ class Conversation:
         return h
 
     def ask(self, text: str, *, connect, run_tool=None, catalogue=None, protocol="",
-            started=None, on_text=None):
+            started=None, on_text=None, on_progress=None):
         """One turn: connect, send, read frames until the turn completes, return the answer.
 
         `connect(url, headers, timeout_s)` is supplied by the caller and must return an object
@@ -511,7 +547,7 @@ class Conversation:
         answer, rounds = "", 0
         while True:
             answer = self._one_exchange(payload, connect=connect, started=started,
-                                        on_text=on_text)
+                                        on_text=on_text, on_progress=on_progress)
             started = False
             self.turns += 1
             if run_tool is None:
@@ -528,7 +564,8 @@ class Conversation:
             payload = nxt
         return ST.strip_calls(answer) if catalogue else answer
 
-    def _one_exchange(self, payload: str, *, connect, started: bool, on_text=None) -> str:
+    def _one_exchange(self, payload: str, *, connect, started: bool, on_text=None,
+                      on_progress=None) -> str:
         """Send one payload and read until the turn completes. Returns the reply text.
 
         `on_text` sees the answer as it grows, so a caller that shows progress does not have
@@ -546,6 +583,7 @@ class Conversation:
             # DELTAS ACCUMULATE, SNAPSHOTS REPLACE. Keeping them apart is what stops the same
             # answer being counted once per channel it arrives on.
             deltas, final, result, seen = [], "", "", 0
+            self.last_progress = []
             deadline = time.time() + self.turn_timeout_s
             while time.time() < deadline:
                 # A SILENT SOCKET IS NOT A FINISHED TURN. type-3 says the turn completed; it
@@ -564,6 +602,13 @@ class Conversation:
                     result = result_value(frame) or result
                     self.server_conversation_id = (conversation_id_of(frame)
                                                    or self.server_conversation_id)
+                    for item in collect_progress(frame):
+                        self.last_progress.append(item)
+                        if on_progress is not None:
+                            try:
+                                on_progress(item)
+                            except Exception:
+                                pass
                     deltas.append(collect_delta(frame))
                     final = collect_final(frame) or final
                     if on_text is not None:

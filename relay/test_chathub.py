@@ -436,3 +436,83 @@ def test_a_conversation_takes_its_agent_from_its_template():
     別物が答える。テンプレートがエージェントを知っているなら、それを既定にする。"""
     tpl = CH.RequestTemplate({}, {"threadLevelGptId": {"id": "T_agent.x", "source": "MOS3"}})
     assert CH.Conversation(lambda: _token(), template=tpl).gpt_id == "T_agent.x"
+
+
+# ---- 進捗（実測 2026-08-21） -----------------------------------------------------------------
+#
+# Researcher は調査中に messageType="Progress" / contentOrigin="ChainOfThoughtSummary" を流す。
+# 実機で捕獲した1件は 5,332 文字あり、参照したベンチマーク名と採った数値が並んでいた。
+# つまり「どの経路で調べ、何を根拠に判断したか」は最初から線の上にあり、こちらが捨てていた。
+
+def _progress_frame(text, mtype="Progress", origin="ChainOfThoughtSummary", author="bot"):
+    return {"type": 2, "item": {"messages": [
+        {"messageType": mtype, "contentOrigin": origin, "author": author, "text": text}]}}
+
+
+def test_progress_is_kept_and_not_mistaken_for_the_answer():
+    frame = _progress_frame("BEIR では BM25 が強いベースラインのままで…")
+    prog = CH.collect_progress(frame)
+    assert len(prog) == 1
+    assert prog[0]["type"] == "Progress"
+    assert prog[0]["origin"] == "ChainOfThoughtSummary"
+    assert "BEIR" in prog[0]["text"]
+    # 回答ではない。思考は「モデルが言ったこと」ではない。
+    assert CH.collect_final(frame) == ""
+    assert CH.collect_text(frame) == ""
+
+
+def test_the_answer_is_not_collected_as_progress():
+    frame = {"type": 2, "item": {"messages": [
+        {"messageType": "Chat", "author": "bot", "text": "166"}]}}
+    assert CH.collect_progress(frame) == []
+    assert CH.collect_final(frame) == "166"
+
+
+def test_a_turn_exposes_the_progress_it_saw():
+    connect = _urls_recording_connect(["{}" + CH.RS,
+                                       json.dumps(_progress_frame("検索クエリを組み立てています")) + CH.RS,
+                                       _update("できました"), _done()])
+    conv = CH.Conversation(lambda: _token())
+    assert conv.ask("x", connect=connect) == "できました"
+    assert [p["text"] for p in conv.last_progress] == ["検索クエリを組み立てています"]
+
+
+def test_progress_from_a_previous_turn_does_not_leak_into_the_next():
+    """前のターンの思考を今のターンの根拠として渡すと、検証が別物を検証する。"""
+    first = ["{}" + CH.RS, json.dumps(_progress_frame("一度目")) + CH.RS, _update("A"), _done()]
+    second = ["{}" + CH.RS, _update("B"), _done()]
+    connect = _urls_recording_connect(first, second)
+    conv = CH.Conversation(lambda: _token())
+    conv.ask("one", connect=connect)
+    assert len(conv.last_progress) == 1
+    conv.ask("two", connect=connect)
+    assert conv.last_progress == []
+
+
+def test_progress_can_be_watched_while_it_arrives():
+    seen = []
+    connect = _urls_recording_connect(["{}" + CH.RS,
+                                       json.dumps(_progress_frame("一歩目")) + CH.RS,
+                                       json.dumps(_progress_frame("二歩目")) + CH.RS,
+                                       _update("完了"), _done()])
+    CH.Conversation(lambda: _token()).ask("x", connect=connect,
+                                          on_progress=lambda p: seen.append(p["text"]))
+    assert seen == ["一歩目", "二歩目"]
+
+
+def test_a_progress_callback_that_raises_does_not_cost_the_turn():
+    connect = _urls_recording_connect(["{}" + CH.RS,
+                                       json.dumps(_progress_frame("一歩目")) + CH.RS,
+                                       _update("完了"), _done()])
+
+    def boom(_p):
+        raise RuntimeError("表示側の都合")
+
+    assert CH.Conversation(lambda: _token()).ask("x", connect=connect,
+                                                 on_progress=boom) == "完了"
+
+
+def test_progress_from_the_user_is_not_collected():
+    """author が bot でないものは、こちらが送った文の反射でしかない。"""
+    frame = _progress_frame("これは自分が送った文", author="user")
+    assert CH.collect_progress(frame) == []
