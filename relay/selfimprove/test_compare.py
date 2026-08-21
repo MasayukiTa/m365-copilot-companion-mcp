@@ -492,3 +492,38 @@ def test_withdrawing_rewrites_nothing(env, monkeypatch, tmp_path):
     C.withdraw(req["id"], "because")
     raw_after = (tmp_path / "comparisons.jsonl").read_text(encoding="utf-8")
     assert raw_after.startswith(raw_before), "既存の行が書き換えられている"
+
+
+# ---- 計器が自分の測定範囲を宣言すること -----------------------------------------------------------
+
+def test_the_scope_is_declared_by_the_instrument_not_by_this_module():
+    """範囲は測定の性質。呼び出し側が持つと、2つ目の評価器が来た日に
+    そのリストは最初に書かれた方を説明したまま、誰もそう言わない。"""
+    from relay.selfimprove import route_evaluator as RV
+    measures, note = C.instrument_measures()
+    assert measures == tuple(RV.MEASURES)
+    assert note == RV.MEASURES_NOTE
+    import inspect
+    src = inspect.getsource(C.instrument_can_see)
+    assert "instrument_measures()" in src
+
+
+def test_the_declared_note_reaches_the_operator(env):
+    """『測れません』だけでは、なぜ測れないのかが分からない。"""
+    from relay.selfimprove import route_evaluator as RV
+    a = BR.resolve("mem", archive=env)["manifest"]
+    b = BR.resolve("slow", archive=env)["manifest"]
+    _, why = C.instrument_can_see(a, b)
+    assert RV.MEASURES_NOTE[:30] in why
+
+
+def test_a_scope_claim_is_about_mechanism_not_a_measured_sensitivity():
+    """機序で説明できないものを範囲に入れると、
+    『測れるはず』が20分ごとに INCONCLUSIVE を返し続ける。"""
+    import inspect
+    from relay.selfimprove import route_evaluator as RV
+    src = inspect.getsource(RV)
+    i = src.index("MEASURES = (")
+    block = src[max(0, i - 1400):i]
+    assert "mechanism" in block.lower()
+    assert "renderer" in block.lower()

@@ -86,6 +86,30 @@ MIN_FREE_MB = 512.0
 MIN_MEMORY_GAIN_MB = 300.0
 
 
+
+#: WHAT THIS INSTRUMENT CAN SEE, DECLARED WHERE THE INSTRUMENT IS.
+#:
+#: The dependent variable is the commit charge a run creates in Edge. That responds to how many
+#: renderers a harness makes the fleet open, and to nothing else -- a harness differing only in
+#: `memory_max_items` or `max_retries` has no mechanism to move it, so a comparison of two such
+#: harnesses returns INCONCLUSIVE for a structural reason and twenty minutes buy nothing.
+#:
+#: DECLARED HERE RATHER THAN IN THE CALLER. The scope is a property of the measurement, and the
+#: first version had the caller hold a list of what this file could see -- so the day a second
+#: evaluator arrives, the caller's list describes whichever one was written first and nothing
+#: says so. A measurement that cannot state its own range will have a range attributed to it.
+#:
+#: This is a claim about MECHANISM, not a measured sensitivity. `transport` is here because a
+#: socket avoids opening a renderer; if a component is added whose effect on renderer count is
+#: argued rather than demonstrated, the honest move is to leave it out until a null run says
+#: otherwise.
+MEASURES = ("transport",)
+
+#: One line, shown to an operator deciding whether a comparison is worth twenty minutes.
+MEASURES_NOTE = ("the commit charge a run creates in Edge, which moves with how many "
+                 "renderers the harness makes the fleet open")
+
+
 class RouteRefusal(RuntimeError):
     """The comparison cannot be run honestly. Not a result about the routes."""
 

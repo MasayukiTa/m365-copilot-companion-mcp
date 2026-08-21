@@ -41,9 +41,16 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 QUEUE_PATH = os.path.join(REPO, ".fleet", "selfimprove", "compare_queue.jsonl")
 RESULTS_PATH = os.path.join(REPO, ".fleet", "selfimprove", "comparisons.jsonl")
 
-#: What the instrument is calibrated to see. A difference outside this is not measurable here,
-#: and saying so before the run is the difference between a tool and a slot machine.
-INSTRUMENT_SEES = ("transport",)
+def instrument_measures():
+    """What the active instrument declares it can see, and one line describing it.
+
+    READ FROM THE INSTRUMENT, NOT HELD HERE. The first version kept a tuple in this file, which
+    works exactly until a second evaluator exists -- at which point this module's list still
+    describes the first one and nothing says so. The scope is a property of the measurement, so
+    it travels with the measurement.
+    """
+    from relay.selfimprove import route_evaluator as RV
+    return tuple(getattr(RV, "MEASURES", ())), getattr(RV, "MEASURES_NOTE", "")
 
 VERDICT_A, VERDICT_B, VERDICT_NONE = "A", "B", "INCONCLUSIVE"
 
@@ -101,14 +108,15 @@ def instrument_can_see(manifest_a: dict, manifest_b: dict) -> tuple:
     changed = {key.split(".", 1)[-1] for key in delta}
     if not changed:
         return False, "the two harnesses are identical"
-    visible = changed & set(INSTRUMENT_SEES)
+    measures, note = instrument_measures()
+    visible = changed & set(measures)
     if visible:
         return True, "differs in %s, which this instrument measures" % ", ".join(sorted(visible))
     return False, (
-        "differs in %s. This instrument measures the commit charge a run creates in Edge, and "
-        "nothing in that difference has a mechanism to move it -- the run would take about "
-        "twenty minutes to return INCONCLUSIVE for a structural reason rather than an "
-        "empirical one" % ", ".join(sorted(changed)))
+        "differs in %s. This instrument measures %s, and nothing in that difference has a "
+        "mechanism to move it -- the run would take about twenty minutes to return "
+        "INCONCLUSIVE for a structural reason rather than an empirical one"
+        % (", ".join(sorted(changed)), note))
 
 
 
