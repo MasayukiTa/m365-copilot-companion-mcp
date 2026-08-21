@@ -213,3 +213,23 @@ def test_the_fixed_rule_cannot_be_given_goal_text_at_all():
     body = src.split('"""')[-1]          # docstring を除いた本体だけを見る
     for text_ish in ("goal", "lower()", "in text", "MARKERS"):
         assert text_ish not in body, "本体がテキストを読み始めている: %s" % text_ish
+
+
+def test_the_first_real_fallback_reason_is_classified(monkeypatch):
+    """実測 2026-08-21、初の本物の fallback:
+    'ChatHubError: turn deadline exceeded before a completion frame'
+
+    これを task-caused に数えると、分類機は『請求書レビューにはタブが要る』を
+    時計から学ぶ。時計は目標について何も語らない。"""
+    from relay.transport_policy import classify_fallback
+    assert classify_fallback(
+        "ChatHubError: turn deadline exceeded before a completion frame") == "route"
+    assert classify_fallback("ChatHubError: the socket went silent") == "route"
+
+
+def test_a_card_is_still_about_the_goal():
+    """経路語を足したせいで、目標起因の理由まで route に流れてはいけない。"""
+    from relay.transport_policy import classify_fallback
+    assert classify_fallback("the turn completed but carried no text "
+                             "(a card the tab can show?)") == "task"
+    assert classify_fallback("添付が必要です") == "task"

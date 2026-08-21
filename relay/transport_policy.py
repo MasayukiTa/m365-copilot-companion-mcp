@@ -86,6 +86,12 @@ ROUTE_CAUSED = (
     r"token", r"capture", r"unauthor", r"401", r"403",
     r"connectionclosed", r"websocket", r"timeout", r"handshake",
     r"refresh", r"expired", r"ChatHubError: this socket route already failed",
+    # ADDED FROM A REAL FALLBACK, 2026-08-21: "turn deadline exceeded before a completion
+    # frame". It classified as `unknown`, which was correct -- nobody had read it yet. Now
+    # somebody has: it is the socket's own budget running out, and nothing about the goal
+    # (reviewing an invoice script) made it slow. Left in the ROUTE list so a classifier is
+    # never taught "invoice reviews need tabs" from a clock.
+    r"deadline exceeded", r"went silent",
 )
 
 #: A fallback reason matching one of THESE is about the goal: the socket could carry the

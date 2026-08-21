@@ -289,6 +289,16 @@ def unclear_is_harness_fault(reason) -> bool:
     return str(reason or "").startswith(HARNESS_REASON_PREFIX)
 
 
+def _socket_share(budget_s) -> float:
+    """How much of a session's budget the socket attempt may spend before falling back.
+
+    Half, floored at two minutes. The floor matters because a small budget divided is a
+    socket that cannot finish anything; the halving matters because whatever the socket does
+    not use is what the page has left after a fallback.
+    """
+    return max(120.0, float(budget_s or 0) * 0.5)
+
+
 class RefuterSession:
     """Non-blocking refuter for the FLEET (single-thread round-robin): a blocking
     side-page wait would freeze every other worker for minutes. start() opens the side
@@ -389,8 +399,13 @@ class RefuterSession:
             if route.needs_refresh(self.base_url) and not route.refresh(self.context,
                                                                        self.base_url):
                 return False
+            # THE SOCKET GETS PART OF THE BUDGET, NOT ALL OF IT. Measured today: a socket
+            # review burned its full 400s deadline, fell back, and the page then finished in
+            # ~210s -- 853s in total for work a page does in about 210. A failed socket attempt
+            # on a long-running side agent costs its whole deadline, unlike a main-worker turn
+            # which costs one turn. Leaving the page half the budget bounds that.
             drv = route.driver_for("refuter", agent_url=self.base_url,
-                                   turn_timeout_s=float(self.timeout_s),
+                                   turn_timeout_s=_socket_share(self.timeout_s),
                                    frame_timeout_s=120.0)
             if drv is None:
                 return False

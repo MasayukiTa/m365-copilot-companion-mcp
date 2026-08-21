@@ -77,7 +77,7 @@ def test_it_reviews_on_the_agent_it_was_pointed_at(monkeypatch):
     s = _session(route, monkeypatch, timeout_s=900)
     s._try_socket()
     assert route.asked[0]["agent_url"] == "https://agent/impl"
-    assert route.asked[0]["turn_timeout_s"] == 900
+    assert route.asked[0]["turn_timeout_s"] == 450.0, "socket が予算を独り占めしている"
 
 
 def test_a_lens_reaches_the_socket_prompt(monkeypatch):
@@ -185,3 +185,18 @@ def test_closing_a_socket_review_closes_its_conversation(monkeypatch):
     s._try_socket()
     s.close()
     assert drv.closed is True and s.socket is False
+
+
+def test_the_socket_never_spends_the_whole_budget(monkeypatch):
+    """実測 2026-08-21: socket レビューが 400秒の期限を使い切って落ち、そこからページが
+    約210秒で完了した -- ページなら約210秒の作業に合計853秒。主ワーカーの1ターンと違い、
+    長時間の副エージェントでは失敗した socket が期限まるごとを食う。"""
+    for budget, expected in ((600, 300.0), (400, 200.0), (100, 120.0), (0, 120.0)):
+        assert RF._socket_share(budget) == expected
+
+
+def test_a_tiny_budget_still_gives_the_socket_a_usable_window():
+    """半分にした結果 socket が何も終えられない大きさになると、
+    毎回『試して落ちる』ぶんだけ遅くなる。下限を置く理由。"""
+    assert RF._socket_share(60) == 120.0
+    assert RF._socket_share(None) == 120.0

@@ -404,7 +404,9 @@ def test_it_asks_for_its_own_agent_and_its_own_model(monkeypatch):
     asked = route.asked[0]
     assert asked["agent_url"] == AP.RESEARCHER.url
     assert asked["model"] == "Claude"
-    assert asked["turn_timeout_s"] == 1234, "research のターンに chat の忍耐を使わない"
+    # socket にはセッション予算の半分だけ渡す。全額渡すと、失敗したときページの取り分が
+    # ゼロになる -- 実測でそれが起きて、210秒で済む作業に 853秒かかった。
+    assert asked["turn_timeout_s"] == 617.0, "socket が予算を独り占めしている"
 
 
 def test_the_analyst_never_asks_for_a_socket(monkeypatch):

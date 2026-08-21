@@ -609,6 +609,11 @@ class ResearchSession:
         self._t_send = time.time()
         return self
 
+    @staticmethod
+    def _socket_share(budget_s) -> float:
+        from relay.refuter import _socket_share as share
+        return share(budget_s)
+
     def _try_socket(self) -> bool:
         """Run this deep-dive over a socket if one can be had. Never raises, never blocks long.
 
@@ -642,7 +647,8 @@ class ResearchSession:
             drv = route.driver_for(
                 "research", agent_url=url,
                 model=(self.model_name if getattr(self.profile, "model_picker", None) else ""),
-                turn_timeout_s=float(self.timeout_s), frame_timeout_s=300.0)
+                turn_timeout_s=self._socket_share(self.timeout_s),
+                frame_timeout_s=300.0)
             if drv is None:
                 return False
             self.page, self.drv, self.socket = None, drv, True
