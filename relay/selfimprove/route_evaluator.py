@@ -129,29 +129,98 @@ def preflight(*, free_mb, token_ok) -> list:
     return reasons
 
 
+
+#: Task-caused fallbacks per goal that an arm may show before the comparison is worth doubting.
+#:
+#: NOT CALIBRATED, AND SAYING SO IS THE POINT. Across 22 recorded arms and 88 goals the observed
+#: task-caused fallback count is ZERO, so there is no measured baseline to set a rate against --
+#: and at four goals per arm the finest rate a run can even express is 25%. A threshold invented
+#: on top of that would be a number wearing a calibration's clothes, which is exactly what the
+#: 300 MB memory floor was before a null run gave it one.
+#:
+#: So this is a REPORTING threshold, not a gate: exceeding it annotates the result and does not
+#: decide it. It becomes a gate the day a null run produces a non-zero baseline to compare
+#: against, and the comment above is what tells the next person that day has not come.
+TASK_FALLBACK_NOTE_RATE = 0.25
+
+
+def fallback_verdict(control, candidate) -> dict:
+    """Did either arm stop being the arm it claims to be? Pure; no clock, no fleet.
+
+    THE HAZARD IS NOT THE COST OF A FALLBACK. IT IS THE ROUTE CLOSING.
+
+    A fallback costs one turn and one tab, which is small and priced in the memory figure. What
+    is not priced is the circuit breaker: after three consecutive failures, or ten in a run, the
+    route closes ONE-WAY and every remaining goal opens a tab. From that moment the candidate
+    arm IS the control arm -- the same-program defect this repository has now found seven ways
+    into, arriving an eighth way, in the middle of a run, with both arms reporting ordinary
+    numbers afterwards.
+
+    That is not a rate question and needs no calibration: `closed_reason` says it exactly.
+
+    Returns {"aborted": bool, "why": str, "task_rate": float|None}. An arm that closed makes the
+    comparison INFRA rather than a verdict, because "we learned nothing, the instrument changed
+    underneath" is a different claim from "the two are indistinguishable" -- the distinction the
+    hypothesis ledger has kept since the beginning and that the result side kept losing.
+    """
+    for name, arm in (("control", control), ("candidate", candidate)):
+        closed = str((arm or {}).get("route_closed_reason") or "")
+        if closed:
+            return {"aborted": True, "task_rate": None,
+                    "why": "the route closed during the %s arm (%s). Every goal after that "
+                           "point opened a tab, so from there the two arms were the same "
+                           "program -- the comparison stopped measuring transport partway "
+                           "through and the numbers after it are of something else"
+                           % (name, closed[:120])}
+
+    rates = []
+    for arm in (control, candidate):
+        goals = int((arm or {}).get("goals", 0) or 0)
+        task = int((arm or {}).get("task_fallbacks", 0) or 0)
+        rates.append((task / goals) if goals else 0.0)
+    worst = max(rates) if rates else 0.0
+    if worst > TASK_FALLBACK_NOTE_RATE:
+        return {"aborted": False, "task_rate": round(worst, 3),
+                "why": "%.0f%% of goals fell back for task reasons, above the %.0f%% this run "
+                       "annotates at. Recorded, not gated: there is no measured baseline for "
+                       "this rate yet." % (worst * 100, TASK_FALLBACK_NOTE_RATE * 100)}
+    return {"aborted": False, "task_rate": round(worst, 3), "why": ""}
+
+
 def decide(control, candidate, *, min_gain_mb=MIN_MEMORY_GAIN_MB) -> dict:
     """The verdict, from two arms' measurements. Pure -- no clock, no machine, no fleet.
 
     Kept separate from the running so it can be tested against numbers rather than against a
     live fleet, which is the only way the decision rule itself gets checked.
     """
+    # FIRST, BEFORE ANY NUMBER IS READ. An arm whose route closed is not the arm the row says
+    # it is, and comparing its memory to the other one's measures something nobody asked about.
+    route = fallback_verdict(control, candidate)
+    if route.get("aborted"):
+        return {"verdict": "inconclusive", "aborted": True, "memory_gain_mb": None,
+                "why": route["why"]}
+
     done_c = int(control.get("done", 0))
     done_p = int(candidate.get("done", 0))
     gain = float(control.get("peak_mb", 0.0)) - float(candidate.get("peak_mb", 0.0))
 
+    note = (" " + route["why"]) if route.get("why") else ""
     if done_p < done_c:
         return {"verdict": "reject", "memory_gain_mb": round(gain, 1),
+                "task_fallback_rate": route.get("task_rate"),
                 "why": "completion fell: %d of %d against the control's %d. A route is a "
                        "speed-up and never a capability, so any loss here settles it "
-                       "whatever the memory says." % (done_p, candidate.get("goals", 0), done_c)}
+                       "whatever the memory says.%s" % (done_p, candidate.get("goals", 0), done_c, note)}
     if gain >= min_gain_mb:
         return {"verdict": "keep", "memory_gain_mb": round(gain, 1),
+                "task_fallback_rate": route.get("task_rate"),
                 "why": "completion held at %d and peak memory fell by %.0f MB (floor %.0f)."
-                       % (done_p, gain, min_gain_mb)}
+                       "%s" % (done_p, gain, min_gain_mb, note)}
     return {"verdict": "inconclusive", "memory_gain_mb": round(gain, 1),
+            "task_fallback_rate": route.get("task_rate"),
             "why": "completion held at %d but peak memory moved only %.0f MB, under the "
                    "%.0f MB this run can distinguish from noise. That is not a finding that "
-                   "the route is worse." % (done_p, gain, min_gain_mb)}
+                   "the route is worse.%s" % (done_p, gain, min_gain_mb, note)}
 
 
 def measure_arm(run_goals, *, goals, socket_on, peak_sampler, now=time.time) -> dict:

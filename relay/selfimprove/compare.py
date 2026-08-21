@@ -377,7 +377,19 @@ def decide(order_1: dict, order_2: dict, *, min_gain_mb=None) -> dict:
     # other, and a WINNER was declared from a comparison where half of it never happened.
     # That is the ledger's INFRA_ABORT-is-not-a-verdict rule broken on the result side, which
     # is the same discipline this file's own threshold rests on.
+    # THE SAME RULE, NOT A SECOND COPY OF IT. `route_evaluator.fallback_verdict` is the judge's
+    # rule about an arm that stopped being itself; writing the condition again here is the shape
+    # of the harness_id hole -- two implementations of one question, drifting apart until one of
+    # them is wrong and nothing says which.
     for name, order in (("first", order_1), ("second", order_2)):
+        arms = (order.get("control") or {}, order.get("candidate") or {})
+        if all(arms):
+            closed = RV.fallback_verdict(*arms)
+            if closed.get("aborted"):
+                return {"verdict": VERDICT_NONE, "aborted": True,
+                        "why": "the %s ordering: %s" % (name, closed["why"]),
+                        "gains": [order_1.get("memory_gain_mb"),
+                                  order_2.get("memory_gain_mb")]}
         aborted = (order.get("infra") or {}).get("aborted")
         missing = not (order.get("control") and order.get("candidate"))
         if aborted or missing:
@@ -417,6 +429,16 @@ def decide(order_1: dict, order_2: dict, *, min_gain_mb=None) -> dict:
             "gains": [g1, g2]}
 
 
+
+def _active_harness_id() -> str:
+    """The harness in force on this machine right now, or "" if it cannot be read."""
+    try:
+        from relay.selfimprove import runtime_config as RC
+        return M.harness_id(RC.active_manifest(refresh=True))
+    except Exception:
+        return ""
+
+
 def record(request: dict, order_1: dict, order_2: dict, verdict: dict, *, path=None,
            now=None) -> dict:
     row = {
@@ -425,6 +447,14 @@ def record(request: dict, order_1: dict, order_2: dict, verdict: dict, *, path=N
         "a": request.get("a"), "b": request.get("b"),
         "diff": request.get("diff"),
         "instrument_can_see": request.get("instrument_can_see"),
+        # THE HARNESS THIS MACHINE WAS RUNNING WHEN THE COMPARISON HAPPENED.
+        #
+        # Activation is off today, so every row so far was taken against the base. The day a
+        # measured KEEP is applied that stops being true, and rows from before and after would
+        # sit in one file with nothing to tell them apart -- a history that cannot say which
+        # world each of its entries came from. Recorded now, while the answer is still trivially
+        # the same for every row, because a field added after the fact cannot describe the past.
+        "active_harness_id": _active_harness_id(),
         "verdict": verdict.get("verdict"),
         "why": verdict.get("why"),
         "orders": [order_1, order_2],

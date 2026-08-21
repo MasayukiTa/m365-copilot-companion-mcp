@@ -575,6 +575,10 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
     #: Bumped per arm so each gets its own memory store path.
     _arm_seq = [0]
 
+    #: When the current arm started, so its fallback rows can be told from the previous arm's
+    #: in a log both of them append to.
+    _arm_t0 = [0.0]
+
     #: The processes that already existed when this arm started. Set per arm, never shared.
     _attr = {"baseline_pids": None, "peak_new_pids": 0}
 
@@ -692,6 +696,62 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
         # override returns to a path that may still be cached from before the arm.
         RC.active_manifest(refresh=True)
 
+
+
+    def _evidence_lines(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read().splitlines()
+        except Exception:
+            return []
+
+    def _evidence_intact(path, before):
+        """True iff the fallback log only GREW since `before`.
+
+        THE RULE READS THIS FILE, SO THE FILE HAS TO BE WHAT IT WAS.
+
+        `fallback_verdict` decides whether an arm stopped being itself by counting rows here.
+        A log that was rewritten, reordered or truncated during the run makes that count a
+        statement about a file rather than about the arm -- and it would be a quiet one,
+        because a shorter log reads as "fewer fallbacks", which is the direction that flatters
+        the candidate. `frozen.burned_append_only` already encodes exactly this prefix rule for
+        the burned registry, for exactly this reason, so it is reused rather than re-argued.
+        """
+        try:
+            from relay.selfimprove import frozen as F
+            return F.burned_append_only(before, _evidence_lines(path))
+        except Exception:
+            return True
+
+    def _task_fallbacks(route):
+        """How many of this arm's fallbacks were the GOAL's fault rather than the route's.
+
+        A token that expired or a socket that dropped says nothing about which goals need a
+        tab; counting those would teach "tasks at this hour need tabs". Only task-caused
+        reasons are evidence about a classification, and `transport_policy.classify_fallback`
+        is where that line already lives -- read from the arm's own log so the count belongs
+        to the arm rather than to the day.
+        """
+        try:
+            import json as _json
+
+            from relay import transport_policy as TP
+            path = log_path or CAMPAIGN_SOCKET_LOG
+            count = 0
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        row = _json.loads(line)
+                    except Exception:
+                        continue
+                    if row.get("event") != "fallback" or float(row.get("ts", 0)) < _arm_t0[0]:
+                        continue
+                    if TP.classify_fallback(row.get("reason") or "") == "task":
+                        count += 1
+            return count
+        except Exception:
+            return 0
+
     def _run(goal_list, socket_on, sample, manifest=None):
         from playwright.sync_api import sync_playwright
 
@@ -722,6 +782,7 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
             _os.makedirs(store, exist_ok=True)
             _os.environ["FLEET_STATE_DIR"] = store
         _activate(manifest)
+        _arm_t0[0] = time.time()
         route = _fresh_route(socket_on)
         url = agent_url or _os.environ.get("MCP_FLEET_AGENT_URL", "")
         done = 0
@@ -746,7 +807,15 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
             for row in (rows or []) if isinstance(rows, list) else []:
                 if str((row or {}).get("outcome", "")).upper() == "DONE":
                     done += 1
-        return {"done": done, "fallbacks": int(route.status().get("fallbacks", 0) or 0)}
+        status = route.status()
+        # THE RULE IS INERT WITHOUT THESE. `fallback_verdict` reads `route_closed_reason` and
+        # `task_fallbacks`; an arm that does not carry them makes the check a branch that can
+        # never be taken -- which is the defect this repository has found in five components
+        # and would be reintroducing in the very commit that adds the check.
+        return {"done": done,
+                "fallbacks": int(status.get("fallbacks", 0) or 0),
+                "route_closed_reason": str(status.get("closed_reason") or ""),
+                "task_fallbacks": _task_fallbacks(route)}
 
     def _token_is_capturable():
         """Try once, for real. Cost: one tab opened and closed -- what the route itself does.
@@ -847,6 +916,8 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
                 goals=goals[:1], socket_on=bool(control_socket), peak_sampler=_edge_mb)
             _floor["min_free_mb"] = None
 
+        evidence_path = log_path or CAMPAIGN_SOCKET_LOG
+        evidence_before = _evidence_lines(evidence_path)
         try:
             if warmup:
                 _warmup()
@@ -858,6 +929,20 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
                 candidate = _candidate()
         finally:
             _activate(None)
+        if not _evidence_intact(evidence_path, evidence_before):
+            # NOT A VERDICT. The rows the route rule counts were rewritten while the arms ran,
+            # so what the count means is unknown -- and a truncated log reads as "fewer
+            # fallbacks", the direction that flatters the candidate.
+            return {"gate": None, "sentinel": None, "security": None, "regression": None,
+                    "infra": {"aborted": True,
+                              "reason": "the fallback log was rewritten during the run (%s); "
+                                        "the evidence the route rule reads is not the evidence "
+                                        "that was there when it started" % evidence_path},
+                    "experiment_id": experiment_id,
+                    "control": control, "candidate": candidate,
+                    "actual_effect": {"control": control, "candidate": candidate,
+                                      "evidence_rewritten": True}}
+
         low = _floor["min_free_mb"]
         if low is not None and low < RV.MIN_FREE_MB:
             # NOT a gate result. The comparison ran, and what it measured is unknown -- which

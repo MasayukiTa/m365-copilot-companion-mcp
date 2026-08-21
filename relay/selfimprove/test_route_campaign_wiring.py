@@ -116,7 +116,10 @@ def test_fallbacks_come_from_the_route_this_arm_built():
     フォールバック数が常に 0 の測定は、経路が全滅した腕を健全として通す。"""
     src = inspect.getsource(S.route_evaluator_for)
     assert "_SINGLETON" not in src
-    assert 'route.status().get("fallbacks"' in src
+    # `status = route.status()` に変わった。不変条件は「この腕が作った経路から読む」ことで、
+    # その書き方ではない。
+    assert "status = route.status()" in src
+    assert 'status.get("fallbacks"' in src
 
 
 # ---- 実験行が本番の学習データを汚さないこと ------------------------------------------------------
