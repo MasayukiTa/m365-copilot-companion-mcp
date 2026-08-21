@@ -136,3 +136,27 @@ def test_a_genome_may_not_name_routing_even_now():
     with pytest.raises(M.ManifestError) as exc:
         M.apply_genome(M.base_manifest(), {"components": {"routing": "routing/v2"}})
     assert "forbidden" in str(exc.value)
+
+
+def test_the_fleet_asks_the_policy_before_it_asks_for_a_socket():
+    """宣言する前に到達性を追跡する。quality_cards はこれを怠って
+    『ターゲットが読まないフィールド』として正当に拒否された。"""
+    import inspect
+
+    from bench.companionbench.agents import FLEET_FIELDS
+    from relay import relay_fleet as RF
+    src = inspect.getsource(RF.RelayWorker)
+    assert "transport_policy import" in src, "フリートが方策を読んでいない"
+    assert src.index("transport_policy import") < src.index("driver_for(self.name)"), (
+        "経路に頼んだ後で方策を聞いている")
+    assert "components.transport" in FLEET_FIELDS
+
+
+def test_a_policy_that_cannot_answer_does_not_cost_a_goal():
+    """経路は速度であって能力ではない、という socket_route の原則は
+    その手前の分類にも及ぶ。方策が壊れてもゴールは落ちてはいけない。"""
+    import inspect
+    from relay import relay_fleet as RF
+    src = inspect.getsource(RF.RelayWorker)
+    i = src.index("transport_policy import")
+    assert "except Exception" in src[i:i + 400]

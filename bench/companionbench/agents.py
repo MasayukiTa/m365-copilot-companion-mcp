@@ -58,6 +58,12 @@ FLEET_FIELDS = IN_PROCESS_FIELDS | frozenset({
     # calls planner.opening_turn, which dispatches on _rc.component("planner"). A candidate
     # that changes it changes the first turn the solver receives.
     "components.planner",
+    # TRACED BEFORE DECLARING, same as planner: relay_fleet's worker asks
+    # transport_policy.choose(self.goal, ...) before it requests a socket driver, and choose
+    # dispatches on _rc.component("transport"). v1 answers tab for everything, v2 answers
+    # socket where the fixed Work IQ predicate allows -- so a candidate that changes it
+    # changes which transport carries the goal.
+    "components.transport",
 })
 
 # NOT `components.quality_cards`, and the reason is worth keeping. It was promoted to an

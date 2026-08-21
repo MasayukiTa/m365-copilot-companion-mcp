@@ -1295,7 +1295,18 @@ class RelayWorker:
         # the socket driver answers to the same names, so the turn loop cannot tell. A worker
         # RESUMING a named conversation is never offered one -- resume means "reopen that URL",
         # and a socket has no URL to reopen.
-        if not self.resume_conv:
+        # WHICH TRANSPORT THIS GOAL SHOULD USE, asked before one is requested. Until now the
+        # answer was "a socket whenever the route offers one", which sends Work IQ goals over
+        # a transport that cannot reach Work IQ and relies on the fallback to notice -- and
+        # the fallback does not always notice, because an answer formed without that context
+        # can still look like an answer. transport_policy holds the fixed predicate.
+        want_socket = True
+        try:
+            from relay.transport_policy import SOCKET, choose
+            want_socket = choose(self.goal, kind=getattr(self, "task_kind", "") or "") == SOCKET
+        except Exception:
+            pass                      # a policy that cannot answer must not cost a goal
+        if not self.resume_conv and want_socket:
             drv = _socket_route().driver_for(self.name)
             if drv is not None:
                 self.page, self.drv, self.socket = None, drv, True
