@@ -123,13 +123,33 @@ def test_route_caused_fallbacks_are_not_counted_as_task_evidence():
 
 # ---- 規則が読むものを腕が運ぶこと -----------------------------------------------------------------
 
-def test_the_arm_carries_what_the_rule_reads():
-    """規則があっても腕がデータを運ばなければ、絶対に通らない分岐が増えるだけ。
-    このリポジトリが5つのコンポーネントで見つけた欠陥を、
-    その検査を足すコミット自体で再現することになる。"""
+def test_the_arm_carries_what_the_rule_reads_all_the_way_to_the_verdict():
+    """最初の版は `_run` のソースにキーがあることだけを確かめ、緑になった。
+    だが `measure_arm` は凍結されていて**固定キーの辞書**を返すので、
+    その値は判定に届く前に捨てられていた -- 規則を足したコミットそのものが、
+    絶対に通らない分岐を作っていた。検査すべきはホップではなく経路全体。"""
     src = inspect.getsource(S.route_evaluator_for)
-    assert '"route_closed_reason": str(status.get("closed_reason") or "")' in src
-    assert '"task_fallbacks": _task_fallbacks(route)' in src
+    assert "out.update(_extras)" in src, "measure_arm が落とす分を腕が拾っていない"
+
+    # measure_arm が実際に落とすことを、推測ではなく実行で確かめる。
+    from relay.selfimprove import route_evaluator as RV
+
+    def run_goals(goals, socket_on, sample):
+        return {"done": len(goals), "fallbacks": 0,
+                "route_closed_reason": "3 consecutive failures", "turns": 9}
+
+    got = RV.measure_arm(run_goals, goals=["a"], socket_on=True, peak_sampler=lambda: 0.0)
+    assert "route_closed_reason" not in got, (
+        "measure_arm が運ぶようになったなら、この迂回はもう要らない")
+    assert "turns" not in got
+
+
+def test_the_merged_arm_actually_reaches_a_verdict():
+    """経路の端から端まで: 腕に載った閉鎖理由が判定を止めること。"""
+    arm = {"done": 4, "goals": 4, "peak_mb": 100.0}
+    merged = dict(arm, route_closed_reason="10 fallbacks this run")
+    assert RV.decide(arm, merged).get("aborted") is True
+    assert RV.decide(arm, arm).get("aborted") is not True
 
 
 def test_the_arm_counts_only_its_own_fallback_rows():

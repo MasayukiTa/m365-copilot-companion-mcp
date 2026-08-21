@@ -579,6 +579,16 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
     #: in a log both of them append to.
     _arm_t0 = [0.0]
 
+    #: What `_run` learned that `measure_arm` does not carry.
+    #:
+    #: `measure_arm` is frozen and returns a FIXED set of keys, so anything `_run` returns
+    #: beyond done/fallbacks is dropped before the verdict ever sees it. The route-closure
+    #: reason and the turn count were wired into `_run` and stopped there -- a rule that could
+    #: never fire, in the same commit that added the rule, which is the defect this repository
+    #: has now found in six components. The arm merges these afterwards, the way
+    #: `new_renderers` already did.
+    _extras = {}
+
     #: The processes that already existed when this arm started. Set per arm, never shared.
     _attr = {"baseline_pids": None, "peak_new_pids": 0}
 
@@ -812,10 +822,24 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
         # `task_fallbacks`; an arm that does not carry them makes the check a branch that can
         # never be taken -- which is the defect this repository has found in five components
         # and would be reintroducing in the very commit that adds the check.
+        # TURNS COME FROM THE SAME LOG THE ARM ALREADY READS.
+        #
+        # `planner_evaluator` measures turns per goal, and `worker_done` rows carry the count
+        # per goal -- which is what made `planner` the cheapest of the six coordinates audited.
+        # Carried on the arm for the same reason the closure reason is: a rule whose input the
+        # arm does not carry is a branch that can never be taken.
+        from relay.selfimprove import planner_evaluator as _PE
+        seen = _PE.turns_from_log(log_path or CAMPAIGN_SOCKET_LOG, since_ts=_arm_t0[0])
+        _extras.clear()
+        _extras.update({
+            "route_closed_reason": str(status.get("closed_reason") or ""),
+            "task_fallbacks": _task_fallbacks(route),
+            "turns": seen["turns"], "logged_goals": seen["goals"]})
         return {"done": done,
                 "fallbacks": int(status.get("fallbacks", 0) or 0),
                 "route_closed_reason": str(status.get("closed_reason") or ""),
-                "task_fallbacks": _task_fallbacks(route)}
+                "task_fallbacks": _task_fallbacks(route),
+                "turns": seen["turns"], "logged_goals": seen["goals"]}
 
     def _token_is_capturable():
         """Try once, for real. Cost: one tab opened and closed -- what the route itself does.
@@ -876,6 +900,7 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
                 lambda g, s, smp: _run(g, s, smp, manifest=control_manifest),
                 goals=goals, socket_on=bool(control_socket), peak_sampler=_edge_mb)
             out["new_renderers"] = _attr["peak_new_pids"]
+            out.update(_extras)
             return out
 
         def _candidate():
@@ -898,6 +923,7 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
                 socket_on=bool(control_socket) if null_arm else True,
                 peak_sampler=_edge_mb)
             out["new_renderers"] = _attr["peak_new_pids"]
+            out.update(_extras)
             out["is_null"] = bool(null_arm)
             return out
 
