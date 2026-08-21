@@ -53,7 +53,22 @@ FLEET = "relay_fleet/v1"
 FLEET_FIELDS = IN_PROCESS_FIELDS | frozenset({
     "parameters.max_retries",         # -> run_relay_fleet max_transient
     "parameters.max_refute_passes",   # -> run_relay_fleet max_refute (only when refuter=True)
+    # TRACED BEFORE BEING DECLARED, because the comment above is a promise and not a wish:
+    # relay_fleet.py:1178 calls _initial_job_with_unlock on the worker's real path, which
+    # calls planner.opening_turn, which dispatches on _rc.component("planner"). A candidate
+    # that changes it changes the first turn the solver receives.
+    "components.planner",
 })
+
+# NOT `components.quality_cards`, and the reason is worth keeping. It was promoted to an
+# evolvable component the same day this line was written, and it does have a production
+# reader -- quality_cards_text consults active_genome through its version table. But the only
+# caller of that is coding_discipline_text, and the only caller of THAT is relay/code_task.py,
+# which the fleet worker never enters. So on this target the two arms really would run the
+# same program, and the contract refuses the comparison correctly.
+#
+# Promoting a component and reaching it from the target that measures it are two different
+# things. Cards can only be A/B'd on a target that goes through coding_discipline.
 
 
 def attest_in_process(manifest):

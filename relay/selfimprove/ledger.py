@@ -36,6 +36,17 @@ from relay import provenance as PROV
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DEFAULT_PATH = os.path.join(REPO, ".fleet", "selfimprove", "hypotheses.jsonl")
 
+#: Redirects the ledger, and is READ AT CONSTRUCTION rather than bound as a default argument.
+#: `nightly()` builds its controller internally, so a test calling it had no way to point the
+#: ledger anywhere -- and measured, one such test run added 120 rows to the production file.
+#: conftest points this at a temp path for the whole suite; an operator can point it at a
+#: scratch ledger for a rehearsal.
+ENV_PATH = "MCP_SELFIMPROVE_HYPOTHESES"
+
+
+def default_path() -> str:
+    return os.environ.get(ENV_PATH) or DEFAULT_PATH
+
 KEEP = "keep"
 REJECT = "reject"
 INCONCLUSIVE = "inconclusive"
@@ -99,11 +110,15 @@ class HypothesisLedger:
     defeated the point of writing anything down.
     """
 
-    def __init__(self, path: str = DEFAULT_PATH):
-        self.path = path
+    def __init__(self, path: str | None = None):
+        # RESOLVED HERE, NOT IN THE SIGNATURE. A default of `path=DEFAULT_PATH` binds the
+        # module attribute at import, which is how the redirect above would have been
+        # silently ineffective -- the same trap frozen.py records being caught by, and the
+        # same one the authority ledger hit last night.
+        self.path = path or default_path()
         self._rows: list[dict] = []
-        if os.path.isfile(path):
-            with open(path, encoding="utf-8") as fh:
+        if os.path.isfile(self.path):
+            with open(self.path, encoding="utf-8") as fh:
                 for line in fh:
                     line = line.strip()
                     if not line:

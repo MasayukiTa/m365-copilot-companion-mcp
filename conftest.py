@@ -74,6 +74,16 @@ _os.environ.setdefault(
     "MCP_SELFIMPROVE_LEDGER",
     _os.path.join(_tempfile.gettempdir(), "selfimprove_ledger_pytest_%d.jsonl" % _os.getpid()))
 
+# And the HYPOTHESIS ledger, which is a different file and a worse thing to pollute: it
+# records what an experiment predicted BEFORE it looked, and its value rests entirely on
+# nobody having manufactured entries. Measured: one run of test_policy_wiring added 120 rows
+# to the production file, and 1018 accumulated conclusions -- which I read as a scheduled loop
+# failing for two days -- were test runs.
+_os.environ.setdefault(
+    "MCP_SELFIMPROVE_HYPOTHESES",
+    _os.path.join(_tempfile.gettempdir(), "selfimprove_hypotheses_pytest_%d.jsonl"
+                  % _os.getpid()))
+
 
 @pytest.fixture(autouse=True)
 def _no_leftover_kill_switch():

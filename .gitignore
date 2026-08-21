@@ -249,3 +249,7 @@ relay/selfimprove/frozen_baseline.json.prev
 # is a general-purpose credential extractor whatever the intent behind it, and does not belong
 # in a public repository while it is still a question rather than an answer.
 experiments/
+
+# The scheduled campaign's cross-process lock. A killed run leaves it behind;
+# it is state, not source.
+relay/selfimprove/*.lock

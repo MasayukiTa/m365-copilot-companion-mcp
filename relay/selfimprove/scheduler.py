@@ -476,6 +476,28 @@ def _recent_failures(archive) -> list:
     return rows
 
 
+
+def companionbench_evaluator(*, agent_kind="fleet", tmpdir=None, base_manifest=None, **kw):
+    """The real evaluator: a paired CompanionBench run, baseline against candidate.
+
+    Kept out of `nightly()`'s default on purpose. A default evaluator would mean a campaign
+    that always finds SOMETHING to measure against, including when the operator has not said
+    what they want measured -- and the whole reason `_refuse` exists is that a measurement
+    nobody asked for is worth less than an honest refusal. This is the thing an operator
+    passes when they do want one.
+
+    Imported lazily because scheduler.py is imported by things that have no business pulling
+    in Playwright and the bench pools.
+    """
+    import tempfile
+
+    from bench.companionbench.baseline import build_agent
+    from bench.companionbench.runner import make_evaluator
+
+    return make_evaluator(build_agent(agent_kind),
+                          tmpdir=tmpdir or tempfile.mkdtemp(prefix="campaign_"),
+                          base_manifest=base_manifest, **kw)
+
 def _refuse(*_a, **_k):
     raise Blocked("nightly() needs an evaluator; it will not invent one and call the result "
                   "a measurement")
@@ -491,7 +513,20 @@ if __name__ == "__main__":                                   # pragma: no cover
     ap.add_argument("--operator-approved", action="store_true")
     ap.add_argument("--dry-run", action="store_true",
                     help="report the preconditions and stop")
+    ap.add_argument("--evaluator", default="", choices=("", "companionbench"),
+                    help="how candidates are measured. Empty means none, and the campaign "
+                         "will refuse rather than invent one -- which is what every run "
+                         "before this flag existed did, 1018 times")
+    ap.add_argument("--agent", default="fleet",
+                    help="which target the evaluator drives (bench|fleet)")
+    ap.add_argument("--min-n", type=int, default=0,
+                    help="episodes per arm; 0 uses the evaluator's own default")
     args = ap.parse_args()
+
+    evaluate = None
+    if args.evaluator == "companionbench":
+        kw = {"min_n": args.min_n} if args.min_n else {}
+        evaluate = companionbench_evaluator(agent_kind=args.agent, **kw)
 
     if args.dry_run:
         for reason in preconditions(budget_candidates=args.budget, activate=args.activate,
@@ -501,5 +536,6 @@ if __name__ == "__main__":                                   # pragma: no cover
             print("preconditions OK")
     else:
         print(json.dumps(nightly(budget_candidates=args.budget, activate=args.activate,
-                                 operator_approved_activation=args.operator_approved),
+                                 operator_approved_activation=args.operator_approved,
+                                 evaluate=evaluate),
                          ensure_ascii=False, indent=2, default=str))

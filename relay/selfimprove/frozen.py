@@ -66,6 +66,23 @@ FROZEN_MANIFEST = [
     # rewrite is worth less than it looks; this one sat outside the set until now.
     "relay/selfimprove/authority_ledger.py",
 
+    # THE GRADER OF THE FIRST HYPOTHESIS FAMILY THAT CAN ACTUALLY BE MEASURED, and the guards
+    # the whole safety argument for evolving it rests on.
+    #
+    # route_evaluator holds the REJECT rule and MIN_MEMORY_GAIN_MB: a candidate that could
+    # edit it could soften the judgement that decides its own fate. That is the reason
+    # CompanionBench's graders are in this list, applied to the judge that actually runs for
+    # this family.
+    #
+    # socket_route holds the circuit breaker, the one-way fallback counter and the fallback
+    # itself. Making a transport classifier evolvable is defensible ONLY because those guards
+    # act independently of it -- a classifier that over-routes is caught by machinery it does
+    # not control. Let a candidate relax MAX_FALLBACKS or stop counting failures and "route
+    # more to sockets" becomes free, which is the routing hazard arriving by another door.
+    # It also writes the labels; training data the trainee can edit is not training data.
+    "relay/selfimprove/route_evaluator.py",
+    "relay/socket_route.py",
+
     # THE JUDGE THAT ACTUALLY RUNS NOW. The manifest froze the swebench graders and stopped
     # there, from a time when those were the only graders. CompanionBench decides candidate
     # acceptance today, and every one of these files is a place where an episode could be

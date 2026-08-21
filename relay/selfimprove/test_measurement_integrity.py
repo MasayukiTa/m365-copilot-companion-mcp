@@ -419,3 +419,43 @@ def test_the_fleet_adapter_describes_its_configuration_without_leaking_it():
     assert d["has_cdp_url"] is True
     blob = json.dumps(d)
     assert "secret-host" not in blob and "token-abc" not in blob, "URL が記録に漏れている"
+
+
+# ---- テストが本番の予測記録を捏造しないこと -------------------------------------------------------
+
+def test_the_hypothesis_ledger_can_be_redirected(monkeypatch, tmp_path):
+    """`nightly()` はコントローラを内部で作るので、テストは台帳の行き先を指定できなかった。
+    実測: test_policy_wiring を1回走らせるだけで本番台帳が 2171 -> 2291 行に増えた。
+
+    害は小さくない。台帳には結論1018件が溜まり全部 infra_abort で、私はそれを
+    「自律ループが2日間失敗し続けた記録」と読んだ。**テスト実行の記録だった。**
+    ledger.py の冒頭が書いているとおり、後から書いた仮説は物語であって証拠ではない。
+    合成された千件に埋もれた本物の記録も、同じ理由で証拠として使えなくなる。
+    """
+    from relay.selfimprove.ledger import ENV_PATH, HypothesisLedger, default_path
+    target = str(tmp_path / "h.jsonl")
+    monkeypatch.setenv(ENV_PATH, target)
+    assert default_path() == target
+    assert HypothesisLedger().path == target
+
+
+def test_the_path_is_resolved_at_construction_not_bound_at_import(monkeypatch, tmp_path):
+    """`path=DEFAULT_PATH` を既定引数にすると import 時に束縛され、後から差し替えられない。
+    frozen.py と authority_ledger.py が同じ罠で記録を残している。3度目。"""
+    import inspect
+
+    from relay.selfimprove.ledger import ENV_PATH, HypothesisLedger
+    sig = inspect.signature(HypothesisLedger.__init__)
+    assert sig.parameters["path"].default is None, (
+        "既定引数に本番パスが焼き込まれている: %s" % sig.parameters["path"].default)
+    monkeypatch.setenv(ENV_PATH, str(tmp_path / "late.jsonl"))
+    assert HypothesisLedger().path.endswith("late.jsonl")
+
+
+def test_the_suite_itself_is_pointed_away_from_production():
+    """conftest がプロセス単位で逃がしていること。個々のテストが覚えている必要を無くす。"""
+    import os
+    from relay.selfimprove.ledger import DEFAULT_PATH, ENV_PATH
+    got = os.environ.get(ENV_PATH)
+    assert got, "conftest が %s を設定していない" % ENV_PATH
+    assert os.path.abspath(got) != os.path.abspath(DEFAULT_PATH)
