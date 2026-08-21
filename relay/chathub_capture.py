@@ -36,12 +36,31 @@ def _frames(payloads):
     return out
 
 
-def capture(page, *, prompt: str = "ping", timeout_s: float = 180.0):
+def capture(page, *, prompt: str = "ping", timeout_s: float = 180.0, attempts: int = 3):
     """One real turn on `page`, watched. Returns (token, RequestTemplate).
 
     The turn is a real one and costs what a turn costs; it is run about once per token
     lifetime (measured 15-79 minutes), not once per request.
+
+    RETRIED, BECAUSE THIS IS A SINGLE POINT OF FAILURE. Every socket in the fleet depends on
+    one capture succeeding, and a capture is an ordinary tab turn -- so it inherits the send
+    race the tab path already retries around ("composer cleared without a conversation or
+    generation acknowledgement"). That happened on the first attempt of a real run and left
+    the whole fleet on tabs for want of one send. One flaky turn should cost a retry, not the
+    route.
     """
+    last = None
+    for attempt in range(max(1, int(attempts))):
+        try:
+            return _capture_once(page, prompt=prompt, timeout_s=timeout_s)
+        except Exception as exc:
+            last = exc
+    raise ChatHubError("capture failed after %d attempts: %s: %s"
+                       % (max(1, int(attempts)), type(last).__name__, str(last)[:160]))
+
+
+def _capture_once(page, *, prompt: str, timeout_s: float):
+    """One attempt. Every failure mode here is a raise, so the retry above can see it."""
     from relay.copilot_autopilot_relay import CopilotWebDriver
 
     urls, sent = [], []
