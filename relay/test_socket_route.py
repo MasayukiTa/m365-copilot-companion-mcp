@@ -634,3 +634,61 @@ def test_an_explicit_blank_is_off_and_an_absent_variable_is_on(monkeypatch):
     assert importlib.reload(SR).ENABLED is False
     monkeypatch.delenv("MCP_FLEET_SOCKET", raising=False)
     assert importlib.reload(SR).ENABLED is True
+
+
+# ---- 二重の締め切り（実測 2026-08-21、12目標の並列走行より） ---------------------------------
+#
+# 実測: 12件中11件 DONE、fallback 0。唯一の失敗は最も重い目標（DB + skill_match）で、
+# socket のターンが 206 秒時点でまだ正常に動いていたのに、艦隊側のタブ時代の
+# 生成待ち予算が先に尽きて STUCK になった。
+#
+# タブ用の予算が要るのは「詰まったタブは詰まったと言わない」から。socket は言う --
+# turn_timeout_s があり、超えれば例外を投げ、ドライバの failed がタブへの切替を起こす。
+# 1つのターンに締め切りが2つあるのは1つ多い。
+
+class _GenDrv2(_FakeDrv):
+    def __init__(self, generating):
+        super().__init__()
+        self.generating = generating
+
+    def _is_generating(self):
+        return self.generating
+
+
+def _deferring_worker(drv, socket=True):
+    import time as _t
+    w = _worker()
+    w.socket, w.drv = socket, drv
+    w.first_defer_ts = _t.time() - 10_000      # 予算はとうに尽きている
+    w.gen_waits = 10_000                       # 回数の方も尽きている
+    w.max_gen_wait_s = 1.0
+    w.max_gen_waits = 1
+    w._defer_progress_sig = 5                  # 進捗も平坦（socket は途中で何も出さないことがある）
+    return w
+
+
+def test_a_working_socket_turn_is_not_killed_by_the_tab_era_budget():
+    w = _deferring_worker(_GenDrv2(generating=True))
+    assert w._defer_generation() is True, "健全な socket ターンを予算切れで殺している"
+    assert w.status == "ready"
+
+
+def test_a_socket_turn_that_has_stopped_falls_back_to_the_normal_rules():
+    """生成が止まっているのに待ち続けるのは、ただのハングになる。"""
+    w = _deferring_worker(_GenDrv2(generating=False))
+    assert w._defer_generation() is False
+
+
+def test_a_tab_worker_keeps_the_budget_it_always_had():
+    """タブは詰まったことを自分から言わない。だから予算はタブのために残す。"""
+    w = _deferring_worker(_GenDrv2(generating=True), socket=False)
+    assert w._defer_generation() is False
+
+
+def test_a_driver_that_cannot_answer_does_not_get_infinite_patience():
+    class _Broken(_FakeDrv):
+        def _is_generating(self):
+            raise RuntimeError("gone")
+
+    w = _deferring_worker(_Broken())
+    assert w._defer_generation() is False

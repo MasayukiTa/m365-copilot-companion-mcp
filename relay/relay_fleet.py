@@ -1709,6 +1709,28 @@ class RelayWorker:
         if self.first_defer_ts <= 0.0:
             self.first_defer_ts = now
             self._defer_progress_sig = self._gen_progress_sig()   # baseline output at wait start
+        # A SOCKET TURN CARRIES ITS OWN DEADLINE, so this one does not apply to it. Measured
+        # 2026-08-21 on twelve real past goals: the heaviest (a DB lookup with skill_match)
+        # was still working at 206s, this tab-era budget expired first, and the worker went
+        # STUCK while the turn was healthy -- 1 of 12, and the only failure in the run.
+        #
+        # The budget exists because a wedged TAB gives no signal that it is wedged. A socket
+        # does: Conversation bounds the turn with turn_timeout_s, raises when it passes, and
+        # the driver's `failed` then sends this worker to a tab. Two deadlines for one turn is
+        # one deadline too many, and the shorter one here knows nothing about the turn.
+        #
+        # The progress test below cannot cover this: a socket answer can arrive as a single
+        # snapshot at the end, so `_gen_progress_sig` is flat for a turn that is streaming
+        # perfectly well underneath.
+        if getattr(self, "socket", False) and getattr(self.drv, "_is_generating", None):
+            try:
+                if self.drv._is_generating():
+                    self.gen_waits += 1          # still counted, so the wait is observable
+                    self._cooldown_until = now + 2.0
+                    self.status = "ready"
+                    return True
+            except Exception:
+                pass
         budget_hit = (now - self.first_defer_ts) > self.max_gen_wait_s
         count_hit = self.gen_waits >= self.max_gen_waits
         # PROGRESS-AWARE cutoff. Hitting the budget/count is a real STUCK ONLY if the turn made
