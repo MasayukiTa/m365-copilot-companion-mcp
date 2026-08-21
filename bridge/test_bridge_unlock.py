@@ -28,7 +28,12 @@ def test_detection_asks_the_server_record_not_the_agent_wording():
     literal marker never appears."""
     body = SOURCE[SOURCE.index("def _bridge_should_auto_unlock"):]
     body = body[:body.index("\ndef ")]
-    assert "lock_state.locked_since(sent_at)" in body
+    # STILL THE SERVER'S RECORD, asked more precisely. matching_record returns WHICH refusal
+    # locked_since agreed to, so the reader can check whether it was even about a caller like
+    # itself -- a context-less refusal is always somebody else's. The property this test
+    # protects is that detection reads the record and not the agent's prose; the call it
+    # pinned by name has moved.
+    assert "lock_state.matching_record(sent_at)" in body
     assert "locked client ip" not in body.lower()
 
 
@@ -76,3 +81,61 @@ def test_the_check_is_scoped_to_the_turn_not_to_recent_history():
     CI caught exactly that contamination in the relay's version."""
     assert "_bridge_should_auto_unlock(_turn_sent_at)" in SOURCE
     assert "locked_recently" not in SOURCE
+
+
+# ---- 誰の拒否かを尋ねる（2026-08-21、艦隊側と同じ欠陥がここにも生きていた） -------------------
+#
+# 実測: relay が毎ターン、HTTP コンテキストの無い拒否を複数回生産していた。
+# 「最近誰か拒否されたか」しか尋ねない読み手は、ロックされていないターンに
+# unlock を注入する。艦隊側は直したが、bridge には同じ読み手が残っていた。
+
+def _lock_tmp(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    import tools.lock_state as LS
+    monkeypatch.setattr(LS, "_LOG_FILE", Path(str(tmp_path / "refusals.jsonl")))
+    monkeypatch.setattr(LS, "_STATE_FILE", Path(str(tmp_path / "state.json")))
+    return LS
+
+
+def test_a_context_less_refusal_does_not_trigger_the_bridge(tmp_path, monkeypatch):
+    import bridge.copilot_bridge as B
+    LS = _lock_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(B, "_BRIDGE_UNLOCK_ATTEMPTS", 0, raising=False)
+    LS.record_locked("", "[locked: no HTTP request context] Call unlock(...) first.", ts=100.0)
+    import time as _t
+    monkeypatch.setattr(_t, "time", lambda: 101.0)
+    assert B._bridge_should_auto_unlock(99.0) is False
+
+
+def test_a_real_refusal_still_triggers_the_bridge(tmp_path, monkeypatch):
+    """フィルタは『誰のものか分からない拒否』を外すのであって、拒否を無視しない。"""
+    import bridge.copilot_bridge as B
+    LS = _lock_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(B, "_BRIDGE_UNLOCK_ATTEMPTS", 0, raising=False)
+    LS.record_locked("203.0.113.7", "[locked client IP: '203.0.113.7'] ...", ts=100.0)
+    import time as _t
+    monkeypatch.setattr(_t, "time", lambda: 101.0)
+    assert B._bridge_should_auto_unlock(99.0) is True
+
+
+def test_a_blank_ip_from_a_real_request_still_triggers_the_bridge(tmp_path, monkeypatch):
+    """空 IP でも『[locked client IP』で始まるなら実リクエスト由来。
+    見える失敗の側に倒す -- 静かに素通りさせない。"""
+    import bridge.copilot_bridge as B
+    LS = _lock_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(B, "_BRIDGE_UNLOCK_ATTEMPTS", 0, raising=False)
+    LS.record_locked("", "[locked client IP: ''] ...", ts=100.0)
+    import time as _t
+    monkeypatch.setattr(_t, "time", lambda: 101.0)
+    assert B._bridge_should_auto_unlock(99.0) is True
+
+
+def test_an_old_refusal_still_does_not_count(tmp_path, monkeypatch):
+    import bridge.copilot_bridge as B
+    LS = _lock_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(B, "_BRIDGE_UNLOCK_ATTEMPTS", 0, raising=False)
+    LS.record_locked("203.0.113.7", "[locked client IP: ...] ...", ts=50.0)
+    import time as _t
+    monkeypatch.setattr(_t, "time", lambda: 101.0)
+    assert B._bridge_should_auto_unlock(99.0) is False

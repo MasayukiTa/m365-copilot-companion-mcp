@@ -832,6 +832,32 @@ def test_a_reply_that_is_not_locked_records_nothing(tmp_path, monkeypatch):
     assert [r for r in _rows(tmp_path) if r.get("event") == "classified_locked"] == []
 
 
+def test_the_pinned_prefix_still_matches_what_security_actually_writes():
+    """フィルタはこのリテラルの一致にしか支えられていない。凍結ファイル側が
+    文言を変えたら、フィルタは黙って効かなくなる -- だから文字列そのものを見張る。"""
+    import io as _io
+
+    import relay.relay_fleet as rf
+    src = _io.open("tools/security.py", encoding="utf-8").read()
+    assert rf.NO_CONTEXT_REFUSAL in src, "security.py の文言と食い違っている"
+
+
+def test_a_blank_ip_from_a_real_request_is_still_treated_as_a_lock(tmp_path, monkeypatch):
+    """最初の版は client_ip の空白をキーにしていて、それは穴だった。
+
+    derive_identity は X-Forwarded-For が区切り文字だけの実リクエストに対して空の識別子を
+    返す。そのヘッダは呼び出し元が付ける。つまり遠隔の呼び出し元が空 IP の拒否を好きなだけ
+    作れて、この分岐を無効化できた -- 見える STUCK が、ロック下で作られた気づかれない
+    回答に変わる。直そうとしたバグより悪い。"""
+    import relay.relay_fleet as rf
+    LS = _lock_tmp(tmp_path, monkeypatch)
+    LS.record_locked("", "[locked client IP: ''] Mutating and execution tools require...",
+                     ts=100.0)
+    import time as _t
+    monkeypatch.setattr(_t, "time", lambda: 101.0)
+    assert rf._looks_locked("unlock 未提供で STUCK。", since=99.0) is True
+
+
 def test_a_refusal_with_no_client_is_not_this_workers_lock(tmp_path, monkeypatch):
     """security.py はコンテキストの無い呼び出し元を拒否し、client_ip を空で記録する --
     それは in-process の誰かであって、遠隔ワーカーではない。ワーカーは必ず
@@ -841,7 +867,7 @@ def test_a_refusal_with_no_client_is_not_this_workers_lock(tmp_path, monkeypatch
     自動 unlock 試行4回を溶かしていた。"""
     import relay.relay_fleet as rf
     LS = _lock_tmp(tmp_path, monkeypatch)
-    LS.record_locked("", "[locked: no HTTP request context]", ts=100.0)
+    LS.record_locked("", "[locked: no HTTP request context] Call unlock(...) first.", ts=100.0)
     import time as _t
     monkeypatch.setattr(_t, "time", lambda: 101.0)
     assert rf._looks_locked("unlock 未提供で STUCK。", since=99.0) is False
@@ -855,3 +881,15 @@ def test_a_refusal_from_a_real_client_still_counts(tmp_path, monkeypatch):
     import time as _t
     monkeypatch.setattr(_t, "time", lambda: 101.0)
     assert rf._looks_locked("unlock 未提供で STUCK。", since=99.0) is True
+
+
+def test_all_three_copies_of_the_prefix_agree():
+    """同じリテラルが3箇所にある（security.py が書き、fleet と bridge が読む）。
+    1つだけ変わると、読む側が黙って効かなくなる -- 静かに壊れる形。"""
+    import io as _io
+
+    import relay.relay_fleet as rf
+    src = _io.open("tools/security.py", encoding="utf-8").read()
+    bridge = _io.open("bridge/copilot_bridge.py", encoding="utf-8").read()
+    assert rf.NO_CONTEXT_REFUSAL in src
+    assert ('NO_CONTEXT_REFUSAL = "%s"' % rf.NO_CONTEXT_REFUSAL) in bridge

@@ -54,3 +54,54 @@ def test_the_relay_imports_the_local_variant():
     src = io.open("relay/copilot_autopilot_relay.py", encoding="utf-8").read()
     assert "memory_save_local as memory_save" in src
     assert "import memory_load, memory_save" not in src
+
+
+def test_the_runlog_has_the_same_split(monkeypatch):
+    """同じ欠陥が runlog_append にもあった -- しかも呼び出しは16箇所で頻度は上。
+    監査ログは 2026-07-17 以降1行も書かれていなかった。"""
+    from tools import runlog_ops
+    monkeypatch.setattr(runlog_ops, "require_unlocked",
+                        lambda: "[locked: no HTTP request context] Call unlock(...) first.")
+    assert runlog_ops.runlog_append("r1", {"turn": 1}).startswith("[locked")
+    monkeypatch.setattr(runlog_ops, "require_unlocked",
+                        lambda: pytest.fail("local の追記がゲートを呼んでいる"))
+    assert not runlog_ops.runlog_append_local("r1", {"turn": 1}).startswith("[locked")
+
+
+def test_the_relay_imports_the_local_runlog():
+    import io
+    src = io.open("relay/copilot_autopilot_relay.py", encoding="utf-8").read()
+    assert "runlog_append_local as runlog_append" in src
+    assert "import runlog_append, runlog_summarize" not in src
+
+
+def test_neither_local_variant_is_exposed_as_a_tool():
+    """緩い方が道具として外に出ていたら、ゲートを外したのと同じ。"""
+    import io
+    src = io.open("main.py", encoding="utf-8").read()
+    for name in ("memory_save_local", "runlog_append_local"):
+        assert name not in src, "main.py が %s を公開している" % name
+
+
+def test_the_tool_catalogue_is_built_from_an_explicit_list_not_by_introspection():
+    """名前が main.py に無いことだけでは、動的登録の経路を見ていない。
+
+    main を import して確かめるのは筋が悪い -- API キーを要求し、サーバを組み立てる。
+    見るべき性質は静的に決まる: カタログが明示の集合から作られていて、
+    tools モジュールを introspection していないこと。getattr で引けるなら
+    「公開していない」は名前を書かなかっただけの話になる。"""
+    import ast as _ast
+    import io as _io
+
+    tree = _ast.parse(_io.open("main.py", encoding="utf-8").read())
+    bad = []
+    for node in _ast.walk(tree):
+        if not isinstance(node, _ast.Call):
+            continue
+        fn = node.func
+        if isinstance(fn, _ast.Name) and fn.id == "getattr":
+            target = node.args[0] if node.args else None
+            name = getattr(target, "id", "") or getattr(target, "attr", "")
+            if "ops" in name or "tools" in name:
+                bad.append("getattr on %s at line %d" % (name, node.lineno))
+    assert not bad, "カタログが introspection で作られている: %s" % bad

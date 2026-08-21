@@ -285,6 +285,13 @@ UNLOCK_PREFIX = (
 )
 
 
+#: The exact prefix tools/security.py writes when it denies a caller that arrived with no HTTP
+#: request context. Pinned here because that module is frozen and cannot import from this one,
+#: and because a filter keyed on it is only as good as the literal staying identical -- a test
+#: asserts the two match rather than trusting the copy.
+NO_CONTEXT_REFUSAL = "[locked: no HTTP request context]"
+
+
 def _looks_locked(resp: str, since: float = 0.0) -> bool:
     """True iff `resp` looks like the SERVER's require_unlocked() lock error, not a worker's
     prose that merely discusses/quotes the unlock() API (see the FALSE-POSITIVE FIX comment
@@ -337,12 +344,21 @@ def _looks_locked(resp: str, since: float = 0.0) -> bool:
         record = lock_state.matching_record(since)
         if not record:
             return False
-        # A REFUSAL WITH NO CLIENT IS NOT EVIDENCE ABOUT THIS WORKER. security.py denies any
-        # caller that has no HTTP request context and records it with an empty client_ip --
-        # an in-process caller, never a remote worker. This worker always HAS a context, so
-        # such a record can only have come from somebody else. Reading it as one's own lock is
-        # how one process's refusals cost several workers their unlock attempts.
-        if not (record.get("client_ip") or "").strip():
+        # A CONTEXT-LESS REFUSAL IS NOT EVIDENCE ABOUT THIS WORKER, and the test for one is the
+        # server's own prefix rather than a blank client_ip.
+        #
+        # THE FIRST VERSION KEYED ON THE BLANK IP AND WAS A HOLE. derive_identity returns an
+        # empty identity for a REAL request whose X-Forwarded-For holds only separators -- and
+        # that header is set by the caller. So a remote caller could mint blank-ip refusals at
+        # will and switch this branch off, blinding lock detection for every worker. Worse
+        # than the bug it was fixing: a visible STUCK became an answer produced under a lock
+        # nobody noticed.
+        #
+        # The prefix below is written by security.py itself and no caller influences it. Only
+        # the no-context branch emits it; a genuine remote refusal says "[locked client IP: ..."
+        # even when that IP is blank, and is treated as possibly this worker's -- which fails
+        # towards the bounded, visible unlock/STUCK path rather than towards a silent one.
+        if str(record.get("detail") or "").startswith(NO_CONTEXT_REFUSAL):
             return False
         _note_locked("fallback", resp, since, record)
         return True

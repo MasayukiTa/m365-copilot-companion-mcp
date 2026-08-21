@@ -89,7 +89,11 @@ from tools.gate_ops import stop_check                     # operator E: kill-swi
 # cannot answer anything about a caller with no remote identity.
 from tools.memory_ops import memory_load
 from tools.memory_ops import memory_save_local as memory_save   # cross-session history
-from tools.runlog_ops import runlog_append, runlog_summarize  # operator D: audit
+# THE LOCAL VARIANT for the same reason as memory_save above: sixteen call sites in this
+# file, every return value discarded, and the gate denying all of them because this process
+# has no HTTP request. The audit runlog has never been written.
+from tools.runlog_ops import runlog_append_local as runlog_append  # operator D: audit
+from tools.runlog_ops import runlog_summarize
 
 class ConversationClosed(RuntimeError):
     """Raised by send() when the target tab/composer is already gone (the

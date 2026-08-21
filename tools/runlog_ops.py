@@ -42,6 +42,24 @@ def runlog_append(run_id: str, record: dict, ts: Optional[float] = None) -> str:
     locked = require_unlocked()
     if locked:
         return locked
+    return runlog_append_local(run_id, record, ts)
+
+
+def runlog_append_local(run_id: str, record: dict, ts=None) -> str:
+    """Append without the unlock gate. FOR IN-PROCESS CALLERS ONLY; not exposed as a tool.
+
+    Same reasoning as tools/memory_ops.memory_save_local, and the same measured symptom, at a
+    higher rate. The relay calls runlog_append from SIXTEEN sites and discards every return
+    value; it runs as a standalone process, so require_unlocked() denied every one of them.
+    Two consequences, both silent: the audit runlog has never been written -- .companion_runs
+    holds nothing newer than 2026-07-17 despite heavy use since -- and each refusal freshened
+    the identity-less refusal slot several times per turn, which is what made one process's
+    refusals look like every fleet worker's lock.
+
+    The gate answers "has the REMOTE caller proved possession of the password for its IP". A
+    caller inside this process has no remote identity for that question to be about, and no way
+    to satisfy it either: unlock() needs a request context too.
+    """
     try:
         if not isinstance(record, dict):
             return "[runlog_append error: record must be an object]"

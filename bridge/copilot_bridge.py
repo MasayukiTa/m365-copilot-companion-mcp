@@ -4433,9 +4433,25 @@ def _bridge_should_auto_unlock(sent_at):
         return False
     try:
         from tools import lock_state
-        return lock_state.locked_since(sent_at)
+        record = lock_state.matching_record(sent_at)
+        if not record:
+            return False
+        # THE SAME FILTER THE FLEET USES, for the same reason. A refusal carrying this prefix
+        # came from a caller with no HTTP request context -- something in-process, never this
+        # bridge, which always has one. Measured 2026-08-21: a concurrent relay minted several
+        # such refusals per turn, and a reader that only asked "was anything refused" injected
+        # unlock into turns that were never locked. Asking the question without asking whose
+        # answer it is was the whole defect, and it lived in two readers.
+        if str(record.get("detail") or "").startswith(NO_CONTEXT_REFUSAL):
+            return False
+        return True
     except Exception:
         return False
+
+
+#: Kept in step with relay/relay_fleet.py: the prefix tools/security.py writes when it denies
+#: a caller that had no HTTP request context. A test asserts all three copies agree.
+NO_CONTEXT_REFUSAL = "[locked: no HTTP request context]"
 
 
 def _bridge_unlock_password():
