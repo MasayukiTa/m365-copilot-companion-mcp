@@ -226,7 +226,22 @@ def set_model(page, profile: AgentProfile, model_name: str = "Claude") -> bool:
 
     Patient + retrying: on a freshly opened page the picker button and its menu
     render a beat AFTER the composer, so we wait for each to appear before clicking
-    (clicking too early was the silent failure in the relay's side-page path)."""
+    (clicking too early was the silent failure in the relay's side-page path).
+
+    THIS CHOICE IS NOT PAGE STATE. Measured 2026-08-21 by capturing the client's own chat
+    frame with the picker at Default and at Claude and diffing them: exactly one non-volatile
+    field moved,
+
+        gpts[0].clientOverrides.deepResearchModels[0]:  "Default" -> "Claude"
+
+    so the model travels in the request. A socket-driven Researcher can therefore select the
+    model by setting that field and does not need a tab for the picker -- which matters,
+    because the side-pages are what a worker still pays tabs for. (The only other difference
+    was `feature.EnableExplicitWarmup` appearing in variants, which is unrelated to the model,
+    and clientSessionId, which differs in every capture.)
+
+    The Analyst is the opposite case and no experiment will move it: it needs a local file in
+    a real <input type=file>, and a socket has nowhere to put one."""
     if not profile.model_picker:
         return False
     btn = page.locator(profile.model_picker).first
