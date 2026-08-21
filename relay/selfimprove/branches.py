@@ -91,9 +91,11 @@ def _write(refs: dict, path=None) -> None:
 def _record(event, reason, label):
     """Branch creation and deletion belong in the authority ledger. Never raises.
 
-    Creating a branch is not activating one, so this is not a change to the running system --
-    but it is a change to what an operator can later activate with one click, and the ledger is
-    where "who added this, and why" has to live if the answer is ever going to exist.
+    UNDER THEIR OWN EVENT NAMES. The first version reused GENOME_APPLY/GENOME_REVERT because
+    those existed and the words fit loosely -- and put four label creations into the same
+    bucket as seven real activations, in the one place a reader goes to ask whether the
+    running harness changed. Creating a branch is not activating one: it changes what an
+    operator could later choose to run, which is worth recording and is a different fact.
     """
     try:
         from relay.selfimprove import authority_ledger as AL
@@ -165,7 +167,7 @@ def create(label: str, genome_id: str, *, archive, note: str = "", path=None,
                    "last_run_at": None,
                    "note": str(note or "")}
     _write(refs, path)
-    _record("genome_apply", "created -> %s" % genome_id, label)
+    _record("branch_create", "created -> %s" % genome_id, label)
     return dict(refs[label])
 
 
@@ -177,7 +179,7 @@ def delete(label: str, *, path=None) -> bool:
     gid = refs[label].get("genome_id")
     del refs[label]
     _write(refs, path)
-    _record("genome_revert", "deleted (pointed at %s; the row is untouched)" % gid, label)
+    _record("branch_delete", "deleted (pointed at %s; the row is untouched)" % gid, label)
     return True
 
 

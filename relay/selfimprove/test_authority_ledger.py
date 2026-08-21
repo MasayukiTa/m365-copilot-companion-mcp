@@ -577,3 +577,96 @@ def test_the_switch_the_notification_uses_exists_in_the_ui():
     src = _io.open("ui/FleetCockpit.cs", encoding="utf-8").read()
     assert '"--authority"' in src
     assert "SelfImproveDashboardWindow()" in src
+
+
+# ---- 枝の操作は genome の適用ではない ------------------------------------------------------------
+
+def test_naming_a_branch_is_not_recorded_as_applying_a_genome(tmp_path, monkeypatch):
+    """既存のイベント名を流用したので、ラベル作成4件が実活性化7件と
+    同じバケツに入った -- 読み手が『稼働ハーネスは変わったか』を
+    確かめに行く、まさにその場所で。"""
+    from relay.selfimprove import archive as A
+    from relay.selfimprove import authority_ledger as AL
+    from relay.selfimprove import branches as BR
+    monkeypatch.setenv("MCP_SELFIMPROVE_BRANCHES", str(tmp_path / "branches.json"))
+    monkeypatch.setattr(AL, "_path", lambda path=None: str(tmp_path / "authority.jsonl"))
+    monkeypatch.setattr(AL, "_notify", lambda record: None)
+    arc = A.Archive(path=str(tmp_path / "entries.jsonl"))
+    gid = arc.add({"components": {"transport": "transport/v2"}}, slice_ids=["e"],
+                  pass_at_1=0.5, ci=(0.4, 0.6), gate_verdict="KEEP")
+    BR.create("fast", gid, archive=arc)
+    BR.delete("fast")
+    events = [r.get("event") for r in AL.read(str(tmp_path / "authority.jsonl"))]
+    assert AL.BRANCH_CREATE in events and AL.BRANCH_DELETE in events
+    assert AL.GENOME_APPLY not in events, "枝の作成が活性化として記録されている"
+    assert AL.GENOME_REVERT not in events
+
+
+def test_branch_events_do_not_interrupt_the_operator():
+    """憲法が変わったわけではない。通知を増やせば、本物の通知が読まれなくなる。"""
+    from relay.selfimprove import authority_ledger as AL
+    assert AL.BRANCH_CREATE not in AL._NOTIFIED
+    assert AL.BRANCH_DELETE not in AL._NOTIFIED
+    assert AL.BRANCH_CREATE not in AL._URGENT
+
+
+# ---- 再署名の頻度そのものが言われること -----------------------------------------------------------
+
+def test_the_tool_says_how_often_the_constitution_has_been_re_signed(tmp_path, monkeypatch,
+                                                                    capsys):
+    """23件が1日に着地した。1件ずつは弁護できて、合計は弁護できない --
+    朝食から深夜までに23回改正される憲法は、文書であって制約ではない。
+    運用者は1件目を見て『ウイルス?』と訊き、23件目は誰も読まない。"""
+    import time
+    from relay.selfimprove import authority_ledger as AL
+    p = tmp_path / "authority.jsonl"
+    monkeypatch.setattr(AL, "_notify", lambda record: None)
+    for i in range(AL.RESIGN_NOISY_PER_DAY - 1):
+        AL.append(AL.REBLESS, reason="r%d" % i, actor_claimed="t", path=str(p))
+    capsys.readouterr()
+    AL.append(AL.REBLESS, reason="the one that tips it", actor_claimed="t", path=str(p))
+    out = capsys.readouterr().out
+    assert "re-signings in the last 24h" in out, out
+    assert "sign it once" in out
+
+
+def test_a_quiet_day_is_not_warned_about(tmp_path, monkeypatch, capsys):
+    from relay.selfimprove import authority_ledger as AL
+    p = tmp_path / "authority.jsonl"
+    monkeypatch.setattr(AL, "_notify", lambda record: None)
+    capsys.readouterr()
+    AL.append(AL.REBLESS, reason="one", actor_claimed="t", path=str(p))
+    assert capsys.readouterr().out == ""
+
+
+def test_the_rate_warns_and_does_not_block():
+    """8回目の不用意な編集と8回目の必要な編集を、道具は見分けられない。
+    数えて声に出すことはできる。"""
+    import ast
+    import inspect
+    from relay.selfimprove import authority_ledger as AL
+    tree = ast.parse(inspect.getsource(AL._warn_if_resigning_often).lstrip())
+    raises = [n for n in ast.walk(tree) if isinstance(n, ast.Raise)]
+    assert not raises, "頻度が高いことを理由に止めている"
+
+
+def test_the_rate_warning_is_not_in_the_delegation_excluded_file():
+    """frozen.py は DELEGATION_EXCLUDED -- 委任を執行する機構の再署名は
+    委任の外。そこに警告を足せば、『再署名が多すぎる』への修正自体が、
+    軽々に再署名してはいけない唯一のファイルの再署名を要求することになる。"""
+    import inspect
+    from relay.selfimprove import authority_ledger as AL
+    from relay.selfimprove import frozen as F
+    assert "relay/selfimprove/frozen.py" in F.DELEGATION_EXCLUDED
+    assert not hasattr(F, "_warn_if_resigning_often")
+    assert hasattr(AL, "_warn_if_resigning_often")
+
+
+def test_the_count_cannot_be_routed_around_by_another_entry_point():
+    """CLI に置くと、別の呼び口から署名すれば数えられない。
+    append は再署名が必ず通る場所。"""
+    import inspect
+    from relay.selfimprove import authority_ledger as AL
+    src = inspect.getsource(AL.append)
+    assert "_warn_if_resigning_often" in src
+    assert "REBLESS" in src[src.index("_warn_if_resigning_often") - 200:]

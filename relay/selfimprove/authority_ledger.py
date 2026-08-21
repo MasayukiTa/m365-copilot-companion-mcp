@@ -95,8 +95,20 @@ REVOKE = "rebless_revoke"
 GENOME_APPLY = "genome_apply"
 GENOME_REVERT = "genome_revert"
 BASELINE_MISMATCH = "baseline_mismatch"
+
+#: Naming a branch, or forgetting a name. NOT an activation.
+#:
+#: These were recorded as GENOME_APPLY/GENOME_REVERT because those events existed and the
+#: words fit loosely. They do not: applying a genome changes what this machine runs, and
+#: naming an archive row changes what an operator could later choose to run. Reusing the
+#: event put four label creations into the same bucket as seven real activations, in the one
+#: place a reader goes to answer "did the running harness change" -- which is the question
+#: the bucket exists for, diluted by rows that are not about it.
+BRANCH_CREATE = "branch_create"
+BRANCH_DELETE = "branch_delete"
 GENESIS = "genesis"
-EVENTS = (REBLESS, REVOKE, GENOME_APPLY, GENOME_REVERT, BASELINE_MISMATCH)
+EVENTS = (REBLESS, REVOKE, GENOME_APPLY, GENOME_REVERT, BASELINE_MISMATCH,
+          BRANCH_CREATE, BRANCH_DELETE)
 
 #: Carried in the genesis record so it travels with the file rather than living only here.
 CONTRACT = (
@@ -209,6 +221,11 @@ def append(event: str, *, reason: str, actor_claimed: str, authorization: str = 
     }
     record["hash"] = _digest(record)
     _write(path, record)
+    # THE RATE, SAID WHERE EVERY RE-SIGNING PASSES. Whatever invoked it -- the CLI, a test,
+    # a future caller -- it lands here, so the count cannot be routed around by using a
+    # different entry point.
+    if event == REBLESS:
+        _warn_if_resigning_often(read(path), float(record.get("ts") or time.time()))
     _notify(record)
     return record
 
@@ -356,6 +373,44 @@ _MSG = {
 def _t(key, lang=None):
     lang = lang or ui_language()
     return _MSG.get(lang, _MSG["en"]).get(key, _MSG["en"].get(key, key))
+
+
+
+#: Re-signings in a day past which the frozen set has stopped being frozen.
+#:
+#: Twenty-three landed in one day: route_evaluator.py eight times, authority_ledger.py six.
+#: Each was individually defensible and the total was not -- a constitution amended twenty-three
+#: times between breakfast and midnight is a document, not a constraint. The operator saw the
+#: FIRST notification and asked whether it was a virus; by the twenty-third nobody reads them,
+#: which is exactly the failure the notification exists to prevent, manufactured by volume.
+RESIGN_NOISY_PER_DAY = 5
+
+
+def _warn_if_resigning_often(rows, now) -> int:
+    """Say how many re-signings landed in the last day. Returns the count. Never raises.
+
+    HERE AND NOT IN frozen.py, WHICH IS WHERE IT WAS FIRST WRITTEN. `frozen.py` is
+    DELEGATION_EXCLUDED: re-signing the machinery that enforces the delegation is deliberately
+    outside the standing delegation, so a warning added there would itself have needed an
+    explicit approval -- the fix for "too many re-signings" requiring a re-signing of the one
+    file that may not be re-signed casually. It belongs here anyway: the rate is a property of
+    this ledger, `append` is on the path of every re-signing whatever invoked it, and the count
+    is already in front of us.
+
+    Warns rather than blocks. A tool cannot tell an eighth careless edit from an eighth
+    necessary one; it can say the number out loud while the actor is still deciding.
+    """
+    try:
+        since = now - 86400.0
+        n = sum(1 for r in rows if r.get("event") == REBLESS and (r.get("ts") or 0) >= since)
+        if n >= RESIGN_NOISY_PER_DAY:
+            print("[authority] %d re-signings in the last 24h. The frozen set is trusted "
+                  "BECAUSE changing it is rare; at this rate its notification is noise and the "
+                  "next real one will be ignored. If this is one design being iterated, finish "
+                  "the design and sign it once." % n, flush=True)
+        return n
+    except Exception:
+        return 0
 
 
 def _headline(record, lang=None) -> tuple:
