@@ -69,6 +69,21 @@ class CockpitProgram
             }
             return;
         }
+        // THE AUTHORITY RECORD, OPENED DIRECTLY. The self-improvement dashboard already holds
+        // everything a person needs when the constitution is re-signed -- what changed, the
+        // ledger, the frozen-set comparison this window computes ITSELF rather than believing
+        // python, and the button that withdraws the last re-signing. What it did not have was
+        // a way in: the notification about such an act opened a text file of commands to paste
+        // into a terminal, and the operator's reaction to that was the obvious one -- "and then
+        // what am I supposed to do with it".
+        //
+        // Same shape as --approval-gate above, and for the same reason: a notification about a
+        // decision should land the person on the control, not on a description of it.
+        if (args.Length >= 1 && args[0].Equals("--authority", StringComparison.OrdinalIgnoreCase))
+        {
+            new Application().Run(new SelfImproveDashboardWindow());
+            return;
+        }
         string path = args.Length > 0 ? args[0] : null;
         new Application().Run(new CockpitWindow(path));
     }

@@ -296,6 +296,7 @@ _MSG = {
         "rebless_body": ("%s\n\nreason: %s\nauthorization: %s\n\nIf you did not say this, "
                          "nothing here verified that you did.\n\nto withdraw it:\n  %s"),
         "needs_attention": "Needs attention",
+        "dashboard_opened": "(the self-improvement dashboard has been opened)",
         "b_when": "when", "b_event": "event", "b_files": "files affected",
         "b_reason": "reason", "b_auth": "authorization", "b_actor": "actor claimed",
         "b_notime": "(no timestamp)",
@@ -331,6 +332,7 @@ _MSG = {
                          "これをあなたが言っていないなら、それを検証したものはここにありません。"
                          "\n\n取り消すには:\n  %s"),
         "needs_attention": "要確認",
+        "dashboard_opened": "（自己改善ダッシュボードを開きました）",
         "b_when": "日時", "b_event": "種別", "b_files": "対象ファイル",
         "b_reason": "理由", "b_auth": "権限の根拠", "b_actor": "実行者の自己申告",
         "b_notime": "(日時なし)",
@@ -401,6 +403,15 @@ def _notify(record) -> None:
             # carried by a word in their own language, and the SOURCE is named through app_id,
             # because the fastest way to be believed is to be recognisable.
             title = "%s: %s" % (_t("needs_attention"), title)
+        # THE CONTROL, NOT A DESCRIPTION OF IT. The self-improvement dashboard holds the
+        # ledger, its own recomputation of the frozen set, and the button that withdraws the
+        # last re-signing -- so an alert about such an act should put the person in front of
+        # that. It used to open a text file of commands to paste into a terminal, which the
+        # operator summarised as "and then what am I supposed to do with it". The briefing
+        # stays as the toast's click target for a host where the UI was never built.
+        from tools.notify_ops import open_authority_dashboard
+        if open_authority_dashboard():
+            body += "\n\n" + _t("dashboard_opened")
         notify_desktop(title=title, body=body, app_id=NOTIFY_APP_ID,
                        launch=_write_briefing(record, title, body))
     except Exception:

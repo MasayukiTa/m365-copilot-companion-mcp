@@ -39,6 +39,36 @@ def notify_approval_gate(title: str, body: str, gate_path: str | Path) -> str:
         return toast_result + f"; approval prompt error: {type(e).__name__}: {e}"
 
 
+#: The built cockpit. A module constant rather than a path computed inside the function, so a
+#: test can point it at a file that is not there -- the "never built" branch is the one that
+#: runs on every host that only serves, and it had no test until it was made reachable.
+COCKPIT = Path(__file__).resolve().parents[1] / "ui" / "FleetCockpit.exe"
+
+
+def open_authority_dashboard() -> str:
+    """Open the self-improvement dashboard's Authority view. Returns "" when it cannot.
+
+    THE CONTROL, NOT A DESCRIPTION OF IT. The dashboard already computes the frozen-set
+    comparison itself rather than believing python, shows the ledger, and carries the button
+    that withdraws the last re-signing. A notification about such an act should land the person
+    there. Before this it opened a text file of commands to paste into a terminal, which the
+    operator summarised as "and then what am I supposed to do with it".
+
+    Best effort and non-blocking: the prompt runs in its own process, and a missing build is a
+    normal state on a machine where the UI was never compiled -- the caller keeps its written
+    briefing as the fallback for exactly that.
+    """
+    try:
+        cockpit = COCKPIT
+        if not cockpit.is_file():
+            return ""
+        subprocess.Popen([str(cockpit), "--authority"],
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return str(cockpit)
+    except Exception:
+        return ""
+
+
 def notify_desktop(
     title: str,
     body: str,

@@ -97,3 +97,43 @@ def test_it_stays_inert_under_pytest(monkeypatch):
     """この関数は全通知経路の唯一の出口。テスト中に本物のトーストを出さない。"""
     monkeypatch.setenv("PYTEST_CURRENT_TEST", "x")
     assert "suppressed" in _REAL(title="t", body="b")
+
+
+# ---- ダッシュボードを開く経路（2026-08-21） ---------------------------------------------------
+
+def test_a_host_without_the_built_ui_gets_nothing_and_no_exception(monkeypatch, tmp_path):
+    """サーバだけを動かすホストには EXE が無い。それは異常ではなく通常の状態で、
+    そこでは呼び出し側が書面の説明に落ちる。例外を投げたら通知ごと落ちる。"""
+    from pathlib import Path
+    # 記録して後で表明する。関数は except Exception で全部飲むので、中で raise しても
+    # 握り潰されて「通った」ように見える -- 実際に変異テストが素通りしてそれが分かった。
+    called = []
+    monkeypatch.setattr(N, "COCKPIT", Path(str(tmp_path / "not-built.exe")))
+    monkeypatch.setattr(N.subprocess, "Popen", lambda *a, **k: called.append(a))
+    assert N.open_authority_dashboard() == ""
+    assert called == [], "存在しない EXE を起動しようとした"
+
+
+def test_a_built_ui_is_launched_with_the_authority_switch(monkeypatch, tmp_path):
+    from pathlib import Path
+    exe = tmp_path / "FleetCockpit.exe"
+    exe.write_text("", encoding="utf-8")
+    seen = {}
+    monkeypatch.setattr(N, "COCKPIT", Path(str(exe)))
+    monkeypatch.setattr(N.subprocess, "Popen", lambda cmd, **k: seen.update(cmd=cmd))
+    out = N.open_authority_dashboard()
+    assert out.endswith("FleetCockpit.exe")
+    assert seen["cmd"][1] == "--authority"
+
+
+def test_a_launch_that_fails_is_not_fatal(monkeypatch, tmp_path):
+    from pathlib import Path
+    exe = tmp_path / "FleetCockpit.exe"
+    exe.write_text("", encoding="utf-8")
+    monkeypatch.setattr(N, "COCKPIT", Path(str(exe)))
+
+    def boom(*a, **k):
+        raise OSError("no window station")
+
+    monkeypatch.setattr(N.subprocess, "Popen", boom)
+    assert N.open_authority_dashboard() == ""

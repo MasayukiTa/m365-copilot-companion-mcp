@@ -515,3 +515,65 @@ def test_the_briefing_does_not_print_the_same_two_fields_twice(tmp_path, monkeyp
     text = open(AL.briefing_path(str(p)), encoding="utf-8").read()
     assert text.count("UNIQUEREASON") == 1, text
     assert text.count("UNIQUEAUTH") == 1, text
+
+
+# ---- 通知の行き先はダッシュボード（2026-08-21、運用者の指摘より） ---------------------------
+#
+# 「通知をクリックすると txt が出る。それをどうするんだい」。正しい行き先は既にあった --
+# 自己改善ダッシュボードの「権限の履歴」に、台帳・凍結セットの自前照合・
+# 「直前の再署名を取り消す」ボタンが揃っている。無かったのは導線だけだった。
+
+def test_the_alert_opens_the_dashboard_not_only_a_file(monkeypatch, tmp_path):
+    from relay.selfimprove import authority_ledger as AL
+    monkeypatch.setenv(AL.ENV_PATH, str(tmp_path / "led.jsonl"))
+    opened, sent = [], {}
+
+    import tools.notify_ops as N
+    monkeypatch.setattr(N, "open_authority_dashboard", lambda: opened.append(1) or "cockpit")
+    monkeypatch.setattr(N, "notify_desktop", lambda **kw: sent.update(kw) or "ok")
+    AL._notify({"event": AL.REBLESS, "changed": {"relay/x.py": {}}, "reason": "r",
+                "authorization": "a", "at": "t"})
+    assert opened == [1], "ダッシュボードを開いていない"
+    assert sent.get("launch", "").startswith("file:///"), "UI が無い環境の受け皿が消えている"
+
+
+def test_a_machine_without_the_ui_still_gets_the_briefing(monkeypatch, tmp_path):
+    """サーバだけを動かしているホストでは EXE が無い。そこでは txt が唯一の説明になる。"""
+    from relay.selfimprove import authority_ledger as AL
+    monkeypatch.setenv(AL.ENV_PATH, str(tmp_path / "led.jsonl"))
+    sent = {}
+
+    import tools.notify_ops as N
+    monkeypatch.setattr(N, "open_authority_dashboard", lambda: "")
+    monkeypatch.setattr(N, "notify_desktop", lambda **kw: sent.update(kw) or "ok")
+    AL._notify({"event": AL.REBLESS, "changed": {"relay/x.py": {}}, "reason": "r",
+                "authorization": "a", "at": "t"})
+    assert AL.UNDO_CMD in sent.get("body", "")
+    assert sent.get("launch", "").startswith("file:///")
+
+
+def test_a_cockpit_that_will_not_start_does_not_break_the_alert(monkeypatch, tmp_path):
+    from relay.selfimprove import authority_ledger as AL
+    monkeypatch.setenv(AL.ENV_PATH, str(tmp_path / "led.jsonl"))
+    sent = {}
+
+    import tools.notify_ops as N
+
+    def boom():
+        raise RuntimeError("cockpit exploded")
+
+    monkeypatch.setattr(N, "open_authority_dashboard", boom)
+    monkeypatch.setattr(N, "notify_desktop", lambda **kw: sent.update(kw) or "ok")
+    AL._notify({"event": AL.REBLESS, "changed": {"relay/x.py": {}}, "reason": "r",
+                "authorization": "a", "at": "t"})
+    # 記録も通知も、UI の都合で失われてはいけない
+    assert sent == {} or "body" in sent
+
+
+def test_the_switch_the_notification_uses_exists_in_the_ui():
+    """Python 側が --authority を渡しても、C# 側が知らなければ普通の窓が開くだけ。
+    ビルド成果物ではなくソースで一致を見張る -- EXE は再ビルド待ちのことがある。"""
+    import io as _io
+    src = _io.open("ui/FleetCockpit.cs", encoding="utf-8").read()
+    assert '"--authority"' in src
+    assert "SelfImproveDashboardWindow()" in src
