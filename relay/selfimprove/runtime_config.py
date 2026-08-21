@@ -31,6 +31,10 @@ ACTIVE_PATH = os.path.join(REPO, ".fleet", "selfimprove", "active_manifest.json"
 # live configuration is not an A/B, it is two sequential deployments.
 OVERRIDE_ENV = "MCP_HARNESS_MANIFEST"
 
+#: Written into the .prev file when no manifest was in force. Distinguishable from any
+#: real manifest because it is deliberately not JSON.
+NO_MANIFEST = "(no manifest was in force)"
+
 _lock = threading.Lock()
 _cache: dict | None = None
 _cache_key: tuple | None = None
@@ -114,19 +118,151 @@ def write_active(manifest: dict, path: str | None = None) -> str:
     path = path or os.environ.get(OVERRIDE_ENV, "").strip() or ACTIVE_PATH
     M.validate(manifest)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    # THE UNDO POINT IS TAKEN HERE, BEFORE THE WRITE, OR THERE IS NO UNDO.
+    #
+    # `relay/selfimprove/apply.py` has apply/revert with authority-ledger records, and it
+    # operates on `active_genome.json` -- a store whose own docstring says the part that
+    # reads it is deferred. So the rollback machinery was attached to the file nothing
+    # reads, while THIS file, the one every fleet run resolves its harness from, was
+    # overwritten in place with no backup and no record. Turning activation on in that
+    # state would have applied a genome with nothing to roll back to and nothing saying
+    # who applied it.
+    # A SENTINEL WHEN THERE WAS NOTHING, BECAUSE "NOTHING" IS ALSO A STATE TO RETURN TO.
+    #
+    # The first version wrote a backup only when a manifest already existed, which left the
+    # FIRST activation -- the one that takes a system from base to evolved -- as the single
+    # one that could not be undone. That was this repository's exact state: no active
+    # manifest on disk, so the next apply would have been irreversible, and the demonstration
+    # of the rollback is what surfaced it. Absence is now recorded explicitly, and revert
+    # restores it by removing the file.
+    prev = _read_raw(path)
+    with open(path + ".prev", "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(NO_MANIFEST if prev is None else prev)
+
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(manifest, fh, ensure_ascii=False, indent=2, sort_keys=True)
     os.replace(tmp, path)
-    global _cache, _cache_key
-    with _lock:
-        _cache, _cache_key = None, None
+    _invalidate()
+    _note(path, "genome_apply", "activated %s" % M.harness_id(manifest), prev)
     return M.harness_id(manifest)
 
 
-# ---------------------------------------------------------------------------------------
-# Call sites: the proof that a genome does something
-# ---------------------------------------------------------------------------------------
+def _read_raw(path):
+    """The file's bytes, or None if it is not there.
+
+    Not parsed: the undo point is what was ON DISK, including a file this version cannot
+    validate. A revert that could only restore manifests the current code accepts would fail
+    exactly when it is most needed.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except Exception:
+        return None
+
+
+def _invalidate():
+    global _cache, _cache_key
+    with _lock:
+        _cache, _cache_key = None, None
+
+
+def _digest(text):
+    import hashlib
+    if text is None:
+        return ""
+    return hashlib.sha256(text.replace(chr(13) + chr(10), chr(10)).encode("utf-8")).hexdigest()[:16]
+
+
+def _note(path, event, reason, prev_text):
+    """Record the change in the authority ledger. Never raises, never silent.
+
+    A failed record must not fail the write -- the operator asked for the harness to change
+    and it did. But it must not pass unnoticed either, because an activation nobody can
+    attribute is the thing the ledger exists to prevent.
+    """
+    try:
+        from relay.selfimprove import authority_ledger as AL
+        AL.append(event, reason=reason, actor_claimed="runtime_config.write_active",
+                  authorization=AL.SELF_INITIATED,
+                  changed={path: {"before": _digest(prev_text),
+                                  "after": _digest(_read_raw(path))}})
+    except Exception as exc:
+        print("[runtime_config] could not record %s: %s: %s"
+              % (event, type(exc).__name__, exc), flush=True)
+
+
+def revert_active(path=None):
+    """Swap the active manifest with the one it replaced. Undo -- and undo the undo.
+
+    NOT ONE-WAY. The first version restored from `.prev` and left `.prev` untouched, so the
+    genome you had just backed out of was held nowhere and could not be put back. An operator
+    who reverted a good change by mistake had no way forward except to remember what it was.
+
+    So `.prev` is not a backup, it is THE OTHER STATE, and this swaps them. Calling it twice
+    returns you exactly where you started. Two slots and no more: the archive and the
+    authority ledger hold the long history, and a deeper stack here would invite unwinding
+    several activations at once, which is not the question anyone has in front of a bad
+    harness.
+
+    Because it is a swap, the caller decides what to call it. `pending_swap()` says which
+    harness the next call would install, so a button can read "undo" or "redo" honestly
+    rather than being labelled once and lying half the time.
+
+    Returns False when there is no other state -- before anything has ever been applied. That
+    must never be reported as a successful rollback.
+    """
+    path = path or os.environ.get(OVERRIDE_ENV, "").strip() or ACTIVE_PATH
+    prev_path = path + ".prev"
+    other = _read_raw(prev_path)
+    if other is None:
+        return False
+    current = _read_raw(path)
+
+    # The state we are leaving becomes the one the next call restores. Written FIRST: if the
+    # process dies between the two writes, the worse outcome is having the old manifest in
+    # both slots, not having the current one in neither.
+    with open(prev_path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(NO_MANIFEST if current is None else current)
+
+    if other == NO_MANIFEST:
+        # Back to no manifest at all, which resolves to the base harness. Removing the file is
+        # the undo; writing the base manifest into it would leave a system that LOOKS
+        # activated at the base rather than one that was never activated -- a different state,
+        # and not the one an operator undoing a bad night asked for.
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    else:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(other)
+    _invalidate()
+    _note(path, "genome_revert", "swapped with %s" % os.path.basename(prev_path), current)
+    return True
+
+
+def pending_swap(path=None):
+    """What `revert_active()` would install next, as a harness id -- or None if nothing.
+
+    Exists so a control can be labelled with what it will actually do. A button that says
+    "roll back" after you have already rolled back is telling you the opposite of the truth.
+    "" means the swap would return the system to having no manifest at all.
+    """
+    path = path or os.environ.get(OVERRIDE_ENV, "").strip() or ACTIVE_PATH
+    other = _read_raw(path + ".prev")
+    if other is None:
+        return None
+    if other == NO_MANIFEST:
+        return ""
+    try:
+        return M.harness_id(json.loads(other))
+    except Exception:
+        # A manifest this version cannot read is still a state worth returning to; the caller
+        # just cannot be told its id.
+        return "(unreadable)"
 
 def memory_max_items() -> int:
     """How many past entries project_memory primes into a goal.
@@ -167,3 +303,38 @@ def max_refute_passes() -> int:
         return max(0, int(parameter("max_refute_passes", 2)))
     except (TypeError, ValueError):
         return 2
+
+
+def reset_to_base(path=None) -> bool:
+    """Return the harness to base, whatever the two swap slots happen to hold.
+
+    MAIN IS ALWAYS REACHABLE, AND THE SWAP ALONE DOES NOT GUARANTEE THAT.
+
+    `revert_active` holds two states. Apply v2, then apply v3, and those two slots are v3 and
+    v2 -- the un-activated base has fallen out of both, and an operator who wanted "put it
+    back the way it shipped" had no move left. That is the one branch that must never be
+    prunable, and it does not need a slot: the base manifest is CONSTRUCTED, not remembered,
+    so returning to it is always available no matter how many activations happened.
+
+    Deliberately not a third slot and not a stack. Two slots for undo/redo, plus a way home
+    that history cannot lose. Removing the file rather than writing the base into it, because
+    "never activated" and "activated at the base" are different states and only the first is
+    where the system shipped.
+
+    Returns False if there was nothing to reset -- already at base.
+    """
+    path = path or os.environ.get(OVERRIDE_ENV, "").strip() or ACTIVE_PATH
+    current = _read_raw(path)
+    if current is None:
+        return False
+    # The state being left still goes into the other slot, so "back to base" is itself
+    # undoable. Going home should not be the one move you cannot take back.
+    with open(path + ".prev", "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(current)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    _invalidate()
+    _note(path, "genome_revert", "reset to base: the harness as it shipped", current)
+    return True
