@@ -821,6 +821,28 @@ def repo_eval_gb(inst):
     return _REPO_EVAL_GB.get(repo, DEFAULT_REPO_EVAL_GB)
 
 
+
+#: When the disk-defer notice was last printed, so a long drain says so once a minute rather
+#: than once a sweep.
+_DISK_DEFER_LAST = [0.0]
+DISK_DEFER_NOTICE_S = 60.0
+
+
+def _note_disk_defer(floor_gb, waiting):
+    """Print why nothing is being admitted. Never raises; never becomes the log itself."""
+    try:
+        now = time.time()
+        if now - _DISK_DEFER_LAST[0] < DISK_DEFER_NOTICE_S:
+            return
+        _DISK_DEFER_LAST[0] = now
+        free = free_disk_gb()
+        print("[fleet] admitting nothing: %.2f GB free on C:, floor %.1f GB -- %d goal(s) "
+              "waiting. Free disk; lowering the floor turns this refusal into a crash."
+              % (free, float(floor_gb or DEFAULT_DISK_FLOOR_GB), waiting), flush=True)
+    except Exception:
+        pass
+
+
 def disk_admission_ok(floor_gb=None, eval_gb=None, free_gb=None, building=0, reserve_gb=None):
     """Pure predicate: may we open ANOTHER eval-bearing tab without risking the disk floor?
 
@@ -3453,6 +3475,14 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             else:
                 if not disk_admission_ok(floor_gb=disk_box[0], eval_gb=eval_disk_gb,
                                          building=_active_open()):
+                    # SAY IT, ONCE. Deferring is right -- admitting past the floor is how five
+                    # concurrent builds crashed C: -- but the defer was silent, so a fleet with
+                    # nothing admitted looked exactly like a fleet working: the process alive,
+                    # the browser fine, every worker at status=pending, turn=0. Two calibration
+                    # runs sat like that for twenty-five minutes each and the only way to find
+                    # out was a stack dump. Rate-limited to one line a minute so a long drain
+                    # does not become the log.
+                    _note_disk_defer(disk_box[0], len(pending))
                     break              # disk floor would be breached -> defer admission
                 w = pending.pop(0)
             if w.status in TERMINAL:   # (shouldn't happen, but be safe)

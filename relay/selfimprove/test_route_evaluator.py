@@ -1,5 +1,9 @@
 """判定規則そのものを、生きたフリート抜きで確かめる。
 
+`free_disk_gb` を明示するのは、preflight がディスクの床も見るようになったから。
+世界に触る前提条件は、世界についてでないテストではスタブする -- トークン探査を
+実物にした日にスイートが10分ハングしたのと同じ教訓。
+
 この系がこれまで測定に到達できなかったのは、どの座標も「両腕が同じプログラムになる」
 という理由で正当に拒否されたから。経路ポリシーは対照群が既に存在する唯一の族で、
 socket と tab は同じ目標を同じフリートで走らせ、輸送だけが違う。
@@ -17,7 +21,7 @@ from relay.selfimprove import route_evaluator as RE
 def test_a_swapping_machine_is_refused_rather_than_measured():
     """測っている量そのものがメモリなので、スワップ中の腕はスワップを測る。
     2026-08-21 に実際これで片腕を落としている。"""
-    reasons = RE.preflight(free_mb=300.0, token_ok=True)
+    reasons = RE.preflight(free_mb=300.0, token_ok=True, free_disk_gb=500.0)
     assert len(reasons) == 1
     assert "swap" in reasons[0]
 
@@ -25,18 +29,18 @@ def test_a_swapping_machine_is_refused_rather_than_measured():
 def test_no_token_is_refused_because_the_arms_would_be_identical():
     """トークンが無ければ socket 腕は黙ってタブ腕になる。
     『実験は問題なく走った』という顔をして入ってくる、最悪の同一化。"""
-    reasons = RE.preflight(free_mb=8000.0, token_ok=False)
+    reasons = RE.preflight(free_mb=8000.0, token_ok=False, free_disk_gb=500.0)
     assert len(reasons) == 1
     assert "same program" in reasons[0]
 
 
 def test_both_refusals_are_reported_together():
     """1つ直して走らせ、もう1つで落ちる、を避ける。"""
-    assert len(RE.preflight(free_mb=100.0, token_ok=False)) == 2
+    assert len(RE.preflight(free_mb=100.0, token_ok=False, free_disk_gb=500.0)) == 2
 
 
 def test_a_healthy_box_with_a_token_may_run():
-    assert RE.preflight(free_mb=8000.0, token_ok=True) == []
+    assert RE.preflight(free_mb=8000.0, token_ok=True, free_disk_gb=500.0) == []
 
 
 # ---- 判定 ---------------------------------------------------------------------------------------

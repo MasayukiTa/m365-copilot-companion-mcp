@@ -192,3 +192,51 @@ def test_a_comparison_records_the_harness_it_was_taken_under():
     src = inspect.getsource(C.record)
     assert '"active_harness_id": _active_harness_id()' in src
     assert C._active_harness_id()
+
+
+# ---- ディスクで塞がれた走行が黙らないこと ----------------------------------------------------------
+
+def test_the_preflight_refuses_below_the_fleets_own_disk_floor():
+    """床未満ではアドミッション門が全ワーカーを断り、そのまま sweep を続ける --
+    ログ1行も、エラーも、終端状態も無し。較正走行2本が
+    status=pending, turn=0 のまま25分ずつ座り、まったく健全に見えた。
+    スタックダンプで再現して初めて場所が分かった。"""
+    reasons = RV.preflight(free_mb=99999.0, token_ok=True, free_disk_gb=1.0)
+    assert any("free on C:" in r for r in reasons), reasons
+    assert any("silence" in r for r in reasons), reasons
+
+
+def test_the_preflight_reads_the_fleets_floor_rather_than_inventing_one():
+    """自分の床を持つと、preflight が通した走行をフリートが admit しない
+    という食い違いが生まれる -- これはまさにこの検査が防ぐはずの失敗。"""
+    from relay import relay_fleet as RF
+    assert RV._fleet_disk_floor_gb() == float(RF.DEFAULT_DISK_FLOOR_GB)
+
+
+def test_plenty_of_disk_is_not_refused():
+    assert RV.preflight(free_mb=99999.0, token_ok=True, free_disk_gb=500.0) == []
+
+
+def test_lowering_the_floor_is_named_as_the_wrong_fix():
+    """床を下げれば拒否は消えるが、5つの同時ビルドが C: を潰した事故がそれ。"""
+    reasons = RV.preflight(free_mb=99999.0, token_ok=True, free_disk_gb=1.0)
+    assert any("do not lower the floor" in r for r in reasons), reasons
+
+
+def test_the_fleet_says_why_it_is_admitting_nothing(capsys):
+    """繰り上げの判断自体は正しい。黙っていたことが欠陥。"""
+    from relay import relay_fleet as RF
+    RF._DISK_DEFER_LAST[0] = 0.0
+    RF._note_disk_defer(6.0, 3)
+    out = capsys.readouterr().out
+    assert "admitting nothing" in out and "floor" in out and "3 goal" in out
+
+
+def test_the_notice_does_not_become_the_log(capsys):
+    """毎 sweep 出すと、長いドレイン中はログがこの1行で埋まる。"""
+    from relay import relay_fleet as RF
+    RF._DISK_DEFER_LAST[0] = 0.0
+    RF._note_disk_defer(6.0, 3)
+    capsys.readouterr()
+    RF._note_disk_defer(6.0, 3)
+    assert capsys.readouterr().out == ""

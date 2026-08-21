@@ -110,13 +110,51 @@ MEASURES_NOTE = ("the commit charge a run creates in Edge, which moves with how 
                  "renderers the harness makes the fleet open")
 
 
+#: Free disk an arm needs before it may start, in GB.
+#:
+#: NOT A NUMBER THIS FILE CHOSE. `relay_fleet.DEFAULT_DISK_FLOOR_GB` is the floor the fleet's
+#: admission gate already enforces; this reads the same value so the two cannot disagree. A
+#: preflight with its own floor would pass a run the fleet then refuses to admit, which is
+#: exactly the failure this exists to prevent.
+#:
+#: WHY IT IS A PRECONDITION AND NOT SOMETHING TO DISCOVER LATER. Below the fleet's floor the
+#: admission gate declines every worker and simply keeps sweeping: no log line, no error, no
+#: terminal state. Two calibration runs sat at `status=pending, turn=0` for twenty-five minutes
+#: each and looked entirely healthy doing it -- the process was alive, the browser was fine,
+#: and the only symptom was silence. Measured by reproducing it with a stack dump: free disk
+#: was 5.2 GB against a 6 GB floor.
+def _fleet_disk_floor_gb():
+    try:
+        from relay.relay_fleet import DEFAULT_DISK_FLOOR_GB
+        return float(DEFAULT_DISK_FLOOR_GB)
+    except Exception:
+        return 6.0
+
+
 class RouteRefusal(RuntimeError):
     """The comparison cannot be run honestly. Not a result about the routes."""
 
 
-def preflight(*, free_mb, token_ok) -> list:
+def preflight(*, free_mb, token_ok, free_disk_gb=None) -> list:
     """Reasons this comparison must not run. Empty means it may."""
     reasons = []
+    if free_disk_gb is None:
+        # THE FLEET'S OWN READER, not a second one. `relay_fleet.free_disk_gb` is what the
+        # admission gate measures with; reading the disk a different way here would let this
+        # preflight and that gate disagree about the same drive.
+        try:
+            from relay.relay_fleet import free_disk_gb as _fleet_free
+            free_disk_gb = float(_fleet_free())
+        except Exception:
+            free_disk_gb = None
+    floor_gb = _fleet_disk_floor_gb()
+    if free_disk_gb is not None and free_disk_gb < floor_gb:
+        reasons.append(
+            "%.2f GB free on C:, and the fleet's admission gate needs %.1f GB. Below that it "
+            "declines every worker and keeps sweeping in silence -- no log line, no error, no "
+            "terminal state -- so the run looks healthy for as long as you are willing to wait. "
+            "Free disk; do not lower the floor, which converts a refusal into a crash."
+            % (free_disk_gb, floor_gb))
     if free_mb is not None and free_mb < MIN_FREE_MB:
         reasons.append(
             "%.0f MB free, floor %.0f (the operator's setting for this machine). The quantity "

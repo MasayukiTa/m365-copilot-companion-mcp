@@ -49,6 +49,9 @@ def _clean(monkeypatch, tmp_path):
     monkeypatch.setattr(S, "lock_held", lambda *a, **k: None)
     monkeypatch.setattr(S, "halt_on_record", lambda *a, **k: {})
     monkeypatch.setattr("relay.relay_fleet.avail_phys_mb", lambda: 99999.0)
+    # ディスクも世界。preflight が床を見るようになったので、
+    # 世界についてでないテストではスタブする(トークン探査と同じ教訓)。
+    monkeypatch.setattr("relay.relay_fleet.free_disk_gb", lambda *a, **k: 500.0)
     monkeypatch.setattr(C, "_token_capturable", lambda *a, **k: True)
     # transport/v1 and v2 genuinely behave the same right now -- the Work IQ carve-out was
     # removed once socket-borne Graph results were shown to match Work IQ -- so the
