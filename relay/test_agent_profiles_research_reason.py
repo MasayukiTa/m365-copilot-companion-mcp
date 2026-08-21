@@ -70,3 +70,162 @@ def test_a_session_that_succeeded_carries_no_reason():
     s._finish("本文" * 100)
     assert s.error == ""
     assert s._done.startswith("本文")
+
+
+# ---- 2回目以降の確認 ---------------------------------------------------------------------
+#
+# Researcher は 1 回で終わるとは限らない。承認が一度きりだと、2 回目の質問は無視され、
+# セッションは 1500 秒の予算を丸ごと待ってから空を返す -- 25 分かけて何も出さない経路。
+
+class _ScriptedDrv:
+    """送信するたびに次のブロックへ進む台本ドライバ。"""
+
+    def __init__(self, blocks):
+        self.blocks = list(blocks)
+        self.sent = []
+        self.i = 0
+        self.count = 1
+
+    def _answers(self):
+        return types.SimpleNamespace(count=lambda: self.count)
+
+    def read_last_response(self):
+        return self.blocks[min(self.i, len(self.blocks) - 1)]
+
+    def send(self, text):
+        self.sent.append(text)
+        self.i += 1
+        self.count += 1
+
+    def close(self):
+        pass
+
+
+CLARIFY_1 = "To make sure I cover what you need: A) 企業内検索 B) 一般 どちらですか。"
+CLARIFY_2 = "To make sure I cover what you need: 期間は 2025-2026 に限定しますか。"
+
+
+def _live_session(blocks, max_approvals):
+    s = AP.ResearchSession.__new__(AP.ResearchSession)
+    s.drv = _ScriptedDrv(blocks)
+    s._count_before = 0
+    s._t_send = __import__("time").time()
+    s.timeout_s = 10_000
+    s.dwell_s = 2.0
+    s.approval = AP.DEFAULT_APPROVAL
+    s.max_approvals = max_approvals
+    s._approvals = 0
+    s._approved = False
+    s._last = None
+    s._stable_since = None
+    s._settle_state = __import__("relay.settle", fromlist=["x"]).SettleState()
+    s._done = None
+    s._pending_open = False
+    s._report_full = ""
+    s.error = ""
+    s.page = None
+    s.tx_dir = None
+    s.parent_key = ""
+    return s
+
+
+def test_a_second_scoping_question_is_answered_too():
+    """一度きりの承認では、ここで沈黙して 25 分後に空が返る。"""
+    s = _live_session([CLARIFY_1, CLARIFY_2, "本文" * 800], max_approvals=3)
+    s.poll()
+    assert s.drv.sent == [AP.DEFAULT_APPROVAL]
+    s.poll()
+    assert s.drv.sent == [AP.DEFAULT_APPROVAL, AP.DEFAULT_APPROVAL], \
+        "2回目の確認に答えていない -- 予算を使い切って空で終わる経路"
+
+
+def test_being_asked_forever_does_not_consume_the_whole_budget():
+    """聞かれ続けるエージェントに無限に答えると、調査の予算が質疑応答で消える。"""
+    s = _live_session([CLARIFY_1] * 10, max_approvals=3)
+    for _ in range(10):
+        s.poll()
+    assert len(s.drv.sent) == 3
+
+
+def test_a_session_configured_without_approval_never_sends_one():
+    s = _live_session([CLARIFY_1, CLARIFY_1], max_approvals=3)
+    s.approval = ""
+    s.poll()
+    s.poll()
+    assert s.drv.sent == []
+
+
+# ---- ブロッキング側 (_wait_research_done) も同じ穴が空いていた -------------------------------
+#
+# ask_agent は最初のブロックにだけ承認を返し、その後は _wait_research_done に入る。
+# そちらには承認処理が存在しなかったので、2回目の質問は deadline まで無視されていた。
+# 「故障クラスは全呼び出し元を掃引しろ」-- 片方だけ直すと、直っていない方で再発する。
+
+class _Profile:
+    name = "researcher"
+    end_timeout_s = 30
+    appear_timeout_s = 5
+    dwell_s = 0.1
+
+
+def test_the_blocking_loop_answers_a_second_question_too(monkeypatch):
+    monkeypatch.setattr(AP, "stop_check", lambda *a, **k: "")
+    drv = _ScriptedDrv([CLARIFY_1, CLARIFY_2, "本文" * 800])
+    drv._count_before = 0
+    ok = AP._wait_research_done(drv, _Profile(), approval=AP.DEFAULT_APPROVAL,
+                                approvals_left=3)
+    assert ok is True
+    assert drv.sent == [AP.DEFAULT_APPROVAL, AP.DEFAULT_APPROVAL]
+
+
+def test_the_blocking_loop_without_a_budget_answers_nothing(monkeypatch):
+    """呼び出し側が承認を渡していないときに勝手に答え始めてはいけない。"""
+    monkeypatch.setattr(AP, "stop_check", lambda *a, **k: "")
+    drv = _ScriptedDrv([CLARIFY_1, "本文" * 800])
+    drv._count_before = 0
+    AP._wait_research_done(drv, _Profile(), approval=AP.DEFAULT_APPROVAL, approvals_left=0)
+    assert drv.sent == []
+
+
+def test_the_blocking_loop_stops_being_asked_forever(monkeypatch):
+    monkeypatch.setattr(AP, "stop_check", lambda *a, **k: "")
+    drv = _ScriptedDrv([CLARIFY_1] * 12)
+    drv._count_before = 0
+    AP._wait_research_done(drv, _Profile(), approval=AP.DEFAULT_APPROVAL, approvals_left=2)
+    assert len(drv.sent) == 2
+
+
+def test_ask_agent_hands_its_remaining_budget_to_the_wait_loop(monkeypatch):
+    """承認1回分は ask_agent 自身が使うので、残りを渡さないと 2 回目に答えられない。
+    渡し忘れても両者のテストは緑のままになる -- 配線そのものを見張る。"""
+    got = {}
+
+    class _Drv:
+        def __init__(self, page):
+            self.sent = []
+
+        def send(self, text):
+            self.sent.append(text)
+
+        def wait_for_idle(self, **kw):
+            return True
+
+        def read_last_response(self):
+            return CLARIFY_1
+
+    def _spy(drv, profile, approval="", approvals_left=0):
+        got["approval"] = approval
+        got["left"] = approvals_left
+        return True
+
+    monkeypatch.setattr(AP, "CopilotWebDriver", _Drv)
+    monkeypatch.setattr(AP, "open_agent", lambda page, profile: True)
+    monkeypatch.setattr(AP, "set_model", lambda page, profile, name: True)
+    monkeypatch.setattr(AP, "current_model", lambda page, profile: "Claude")
+    monkeypatch.setattr(AP, "stop_check", lambda *a, **k: "")
+    monkeypatch.setattr(AP, "_wait_research_done", _spy)
+
+    out = AP.ask_agent(object(), "調べて", approval=AP.DEFAULT_APPROVAL)
+    assert out["ok"] is True
+    assert got["approval"] == AP.DEFAULT_APPROVAL
+    assert got["left"] == AP.MAX_APPROVALS - 1, "ask_agent が使った1回分が引かれていない"

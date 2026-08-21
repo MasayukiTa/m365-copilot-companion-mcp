@@ -126,6 +126,12 @@ class _Session:
         self._stable_since = None
         self._settle_state = S.SettleState()
         self._approved = True
+        # The real session counts approvals rather than latching a flag (a Researcher that
+        # asks twice was never answered). Exhausted here on purpose: these tests are about
+        # settle, and an approval branch firing mid-test would be a different experiment.
+        self._approvals = 99
+        self.max_approvals = 0
+        self.error = ""
         self._done = None
         self._pending_open = False
         self._report_full = ""
@@ -134,6 +140,12 @@ class _Session:
     def _finish(self, report):
         self.finished.append(report)
         self._done = report or ""
+
+    def _fail(self, reason):
+        """The real session records WHY it finished empty; the stand-in must too, or a test
+        exercising a failure path dies on a missing method instead of testing the path."""
+        self.error = str(reason)
+        self._finish("")
 
     def _persist(self):
         pass

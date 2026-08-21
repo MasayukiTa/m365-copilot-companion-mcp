@@ -357,7 +357,14 @@ def _looks_like_clarification(text: str) -> bool:
     return has_clarify and not has_done and len(text) < 900
 
 
-def _wait_research_done(drv: CopilotWebDriver, profile: AgentProfile) -> bool:
+#: How many scoping questions the auto-approval will answer before giving up on being asked.
+#: More than one because the Researcher genuinely asks twice sometimes; bounded because an
+#: agent that only ever asks would otherwise consume a whole research budget in questions.
+MAX_APPROVALS = 3
+
+
+def _wait_research_done(drv: CopilotWebDriver, profile: AgentProfile,
+                        approval: str = "", approvals_left: int = 0) -> bool:
     """Wait out the long deep-research turn. Completion = a NEW answer block, then
     its text is non-placeholder AND (carries a completion marker OR has been stable
     for the dwell). Polls the kill-switch. Tolerant of multi-minute streaming with
@@ -379,6 +386,15 @@ def _wait_research_done(drv: CopilotWebDriver, profile: AgentProfile) -> bool:
         if stop_check().startswith("STOP"):
             return False
         t = drv.read_last_response()
+        # A SECOND SCOPING QUESTION IS STILL A SCOPING QUESTION. This loop used to have no
+        # notion of one at all: ask_agent answered the first and then waited here, so a
+        # Researcher that asked again was met with silence until the deadline.
+        if approval and approvals_left > 0 and _looks_like_clarification(t):
+            approvals_left -= 1
+            drv.send(approval)
+            last, stable_since = None, None
+            time.sleep(1.0)
+            continue
         if _is_processing(t):
             last, stable_since = None, None
         elif t == last:
@@ -458,7 +474,8 @@ def ask_agent(page, query: str, profile: AgentProfile = RESEARCHER,
         # a scoping step -> approve, then wait out the real research.
         clarification = first
         drv.send(approval)
-        ok = _wait_research_done(drv, profile)
+        ok = _wait_research_done(drv, profile, approval=approval,
+                                 approvals_left=MAX_APPROVALS - 1)
     elif _report_marker(first) or len(first) >= SUBSTANTIAL_CHARS:
         # already the finished report (rare: a query that needed no scoping).
         ok = True
@@ -469,7 +486,8 @@ def ask_agent(page, query: str, profile: AgentProfile = RESEARCHER,
         # stub -- THIS was the garbage-research bug (a status line fed back as the result, so the
         # implementer "coded from garbage"). _wait_research_done now ignores short stalled status
         # lines and only returns on a marker/substantial block.
-        ok = _wait_research_done(drv, profile)
+        ok = _wait_research_done(drv, profile, approval=approval,
+                                 approvals_left=MAX_APPROVALS)
 
     return {
         "ok": ok,
@@ -490,7 +508,7 @@ class ResearchSession:
 
     def __init__(self, context, query, model_name="Claude", approval=DEFAULT_APPROVAL,
                  dwell_s=4.0, timeout_s=600, tx_dir=None, parent_key="", parent_turn=0,
-                 sub_index=1, profile=None, upload_path=""):
+                 sub_index=1, profile=None, upload_path="", max_approvals=MAX_APPROVALS):
         # WHICH SIDE AGENT, AND WHETHER IT NEEDS A FILE FIRST. Parameters rather than a second
         # copy of this class: the fleet needed an ANALYZE: path as well as RESEARCH:, and the
         # two differ only in which agent opens and whether a local file is uploaded before the
@@ -503,6 +521,7 @@ class ResearchSession:
         self.query = query
         self.model_name = model_name
         self.approval = approval
+        self.max_approvals = max(0, int(max_approvals))
         self.dwell_s = dwell_s
         self.timeout_s = timeout_s
         self.page = None
@@ -512,7 +531,12 @@ class ResearchSession:
         self._last = None
         self._stable_since = None
         self._settle_state = _settle.SettleState()
-        self._approved = False
+        self._approved = False        # kept: other readers ask "was one ever sent"
+        #: HOW MANY have been sent. `_approved` was a one-shot flag, so a Researcher that asks
+        #: a SECOND scoping question was never answered -- the session then sat out its whole
+        #: budget and returned empty, which is a 25-minute way to produce nothing. Bounded,
+        #: because an agent that only ever asks must not spend the budget on being asked.
+        self._approvals = 0
         self._pending_open = True  # side-page not opened yet -- deferred until there's free RAM
         self._done = None          # report string once finished ('' on failure)
         #: WHY it finished empty, when it did. Every path to an empty report used to look
@@ -600,7 +624,9 @@ class ResearchSession:
                 self._settle_state = _settle.SettleState()
                 return None
             # one-time scoping/clarification approval (the Researcher may ask before it researches)
-            if not self._approved and _looks_like_clarification(t) and self.approval:
+            if (self._approvals < self.max_approvals and _looks_like_clarification(t)
+                    and self.approval):
+                self._approvals += 1
                 self._approved = True
                 self.drv.send(self.approval)
                 self._last, self._stable_since = None, None
