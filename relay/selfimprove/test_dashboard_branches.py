@@ -135,7 +135,7 @@ def test_the_instrument_scope_is_on_the_screen(env):
     """20分待ってから『測れませんでした』ではなく、押す前に読めること。"""
     arc, _ = env
     section = D._branch_section()
-    assert section["instrument"]["measures"] == ["transport"]
+    assert set(section["instrument"]["measures"]) == {"transport", "planner"}
     assert section["instrument"]["note"]
 
 

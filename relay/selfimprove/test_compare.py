@@ -54,8 +54,10 @@ def _clean(monkeypatch, tmp_path):
     # removed once socket-borne Graph results were shown to match Work IQ -- so the
     # behavioural-equivalence refusal correctly blocks the fixture's branches. Stubbed for the
     # tests that are not about that check; the tests that ARE about it do not call this.
-    monkeypatch.setattr(C, "transport_versions_differ",
-                        lambda a, b, goals: (True, "stubbed: the versions differ"))
+    # `versions_differ` は成分横断になったので、旧名 `transport_versions_differ` を
+    # 差し替えても拒否は素通りしない。実際に呼ばれる方を差し替える。
+    monkeypatch.setattr(C, "versions_differ",
+                        lambda comp, a, b, goals: (True, "stubbed: the versions differ"))
 
 
 # ---- 計器が見える範囲を先に言う -------------------------------------------------------------------
@@ -498,11 +500,15 @@ def test_withdrawing_rewrites_nothing(env, monkeypatch, tmp_path):
 
 def test_the_scope_is_declared_by_the_instrument_not_by_this_module():
     """範囲は測定の性質。呼び出し側が持つと、2つ目の評価器が来た日に
-    そのリストは最初に書かれた方を説明したまま、誰もそう言わない。"""
+    そのリストは最初に書かれた方を説明したまま、誰もそう言わない。
+    -- そしてその日が来た。いまは2つあり、どちらも自分の範囲を宣言している。"""
+    from relay.selfimprove import planner_evaluator as PE
     from relay.selfimprove import route_evaluator as RV
     measures, note = C.instrument_measures()
-    assert measures == tuple(RV.MEASURES)
-    assert note == RV.MEASURES_NOTE
+    for mod in (RV, PE):
+        for name in mod.MEASURES:
+            assert name in measures, name
+        assert mod.MEASURES_NOTE in note
     import inspect
     src = inspect.getsource(C.instrument_can_see)
     assert "instrument_measures()" in src

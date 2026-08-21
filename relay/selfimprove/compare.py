@@ -41,16 +41,38 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 QUEUE_PATH = os.path.join(REPO, ".fleet", "selfimprove", "compare_queue.jsonl")
 RESULTS_PATH = os.path.join(REPO, ".fleet", "selfimprove", "comparisons.jsonl")
 
-def instrument_measures():
-    """What the active instrument declares it can see, and one line describing it.
+def instruments():
+    """Every instrument that can judge something, in the order they are asked.
 
-    READ FROM THE INSTRUMENT, NOT HELD HERE. The first version kept a tuple in this file, which
-    works exactly until a second evaluator exists -- at which point this module's list still
-    describes the first one and nothing says so. The scope is a property of the measurement, so
-    it travels with the measurement.
+    A LIST, BECAUSE THE SECOND ONE EXISTS NOW. This started as a single import of
+    route_evaluator, which was honest while there was one -- and the comment then said the
+    scope is a property of the measurement, which is exactly the reason it could not stay a
+    single import once `planner_evaluator` arrived measuring turns instead of memory.
     """
+    from relay.selfimprove import planner_evaluator as PE
     from relay.selfimprove import route_evaluator as RV
-    return tuple(getattr(RV, "MEASURES", ())), getattr(RV, "MEASURES_NOTE", "")
+    return (RV, PE)
+
+
+def instrument_for(component):
+    """The instrument that declares it can see `component`, or None."""
+    for mod in instruments():
+        if component in tuple(getattr(mod, "MEASURES", ())):
+            return mod
+    return None
+
+
+def instrument_measures():
+    """Everything the instruments between them can see, and how each describes itself."""
+    seen, notes = [], []
+    for mod in instruments():
+        for name in tuple(getattr(mod, "MEASURES", ())):
+            if name not in seen:
+                seen.append(name)
+        note = getattr(mod, "MEASURES_NOTE", "")
+        if note:
+            notes.append(note)
+    return tuple(seen), "; ".join(notes)
 
 VERDICT_A, VERDICT_B, VERDICT_NONE = "A", "B", "INCONCLUSIVE"
 
@@ -120,42 +142,67 @@ def instrument_can_see(manifest_a: dict, manifest_b: dict) -> tuple:
 
 
 
-def transport_versions_differ(manifest_a: dict, manifest_b: dict, goals) -> tuple:
-    """(bool, note). Do the two harnesses' transport policies actually decide differently?
 
-    THE SEVENTH DOOR THE SAME DEFECT WALKED THROUGH.
-
-    `same_program` compares MANIFESTS, and two manifests can name two different versions that
-    behave identically. Measured, not hypothesised: `transport/v1` and `transport/v2` differed
-    only in a Work IQ carve-out, that carve-out was removed once socket-borne Graph results
-    were shown to match Work IQ, and from that moment the two versions returned the same
-    transport for every goal. A real comparison was run between them and returned +15 MB and
-    +27 MB -- the null floor, correctly reported as INCONCLUSIVE, for a reason no reader could
-    have recovered from the number.
-
-    So for the ONE component this instrument measures, ask the policies. Undecidable in
-    general; entirely decidable for a pure function over the goals the comparison will use.
-    """
+#: How to ask each component's version table what it would DO.
+#:
+#: Signatures differ per component, so a generic "are these two the same" needs the calling
+#: convention as data. Keyed by component name; a component absent from here has no probe and
+#: its versions cannot be compared behaviourally -- which is reported, not assumed away.
+def _probes():
+    from relay import planner as P
     from relay import transport_policy as TP
+    from relay.relay_fleet import PROTOCOL
+    return {
+        "transport": (TP.TRANSPORT_VERSIONS, lambda fn, text: fn(text)),
+        "planner": (P.PLANNER_VERSIONS, lambda fn, text: fn(text, PROTOCOL)),
+    }
 
-    va = (manifest_a.get("components") or {}).get("transport")
-    vb = (manifest_b.get("components") or {}).get("transport")
+
+def _goal_texts(goals):
+    out = []
+    for goal in goals or []:
+        out.append(goal.get("text") or goal.get("goal") or ""
+                   if isinstance(goal, dict) else str(goal))
+    return out
+
+
+def versions_differ(component, manifest_a, manifest_b, goals) -> tuple:
+    """(bool, note). Do the two harnesses' versions of `component` actually decide differently?
+
+    THE SAME QUESTION THE TRANSPORT CHECK ASKS, ASKED OF WHATEVER DIFFERS.
+
+    The first version of this was transport-only, so two branches differing in `planner` walked
+    straight past it. That is the same defect one component along: `same_program` compares
+    manifests, and two manifests naming two versions can behave identically -- measured twice
+    already, on transport/v1 vs v2 after a carve-out was removed, and on memory/v1 vs v2 on any
+    input without duplicates.
+
+    Undecidable in general; decidable for a pure function over the goals this run will send.
+    """
+    va = (manifest_a.get("components") or {}).get(component)
+    vb = (manifest_b.get("components") or {}).get(component)
     if va == vb:
         return False, "both harnesses name %s" % va
-    fa, fb = TP.TRANSPORT_VERSIONS.get(va), TP.TRANSPORT_VERSIONS.get(vb)
+    table, call = _probes().get(component, (None, None))
+    if table is None:
+        return True, ("%s has no behavioural probe here, so the versions cannot be compared "
+                      "on behaviour -- only that they are named differently" % component)
+    fa, fb = table.get(va), table.get(vb)
     if fa is None or fb is None:
         return True, "one of %s / %s is not in the version table; cannot compare them here"             % (va, vb)
-    texts = []
-    for goal in goals or []:
-        texts.append(goal.get("text") or goal.get("goal") or ""
-                     if isinstance(goal, dict) else str(goal))
-    disagree = [t for t in texts if fa(t) != fb(t)]
+    texts = _goal_texts(goals)
+    disagree = [t for t in texts if call(fa, t) != call(fb, t)]
     if disagree:
         return True, "%s and %s choose differently on %d of %d goals"             % (va, vb, len(disagree), len(texts))
     return False, (
-        "%s and %s return the same transport for every one of these %d goals. The manifests "
-        "differ and the behaviour does not, so the two arms would be the same program -- the "
-        "difference this instrument would report is its own noise" % (va, vb, len(texts)))
+        "%s and %s behave identically on every one of these %d goals. The manifests differ and "
+        "the behaviour does not, so the two arms would be the same program -- the difference "
+        "this instrument would report is its own noise" % (va, vb, len(texts)))
+
+
+def transport_versions_differ(manifest_a: dict, manifest_b: dict, goals) -> tuple:
+    """Kept as the transport-specific entry point; the question is now asked generically."""
+    return versions_differ("transport", manifest_a, manifest_b, goals)
 
 
 def refusals(label_a: str, label_b: str, *, archive, branches_path=None, lock_path=None,
@@ -195,12 +242,24 @@ def refusals(label_a: str, label_b: str, *, archive, branches_path=None, lock_pa
                 "same program, which is the one thing a comparison may never be"
                 % (label_a, label_b, a["harness_id"][:12]))
         else:
-            # DIFFERENT MANIFESTS ARE NOT YET DIFFERENT BEHAVIOUR. Asked of the component this
-            # instrument measures, over the goals this comparison will actually send.
-            differ, why = transport_versions_differ(a["manifest"], b["manifest"],
-                                                    goals or _default_goals())
-            if not differ and "both harnesses name" not in why:
-                out.append("%s and %s: %s" % (label_a, label_b, why))
+            # DIFFERENT MANIFESTS ARE NOT YET DIFFERENT BEHAVIOUR. Asked of EVERY component the
+            # two harnesses name differently -- the transport-only version let a pair differing
+            # in `planner` walk straight past the check it was written for.
+            #
+            # A pair is refused only when NO differing component actually behaves differently.
+            # One real difference is enough to make the arms two programs.
+            changed = {k.split(".", 1)[-1] for k in M.diff(a["manifest"], b["manifest"])
+                       if k.startswith("components.")}
+            notes, any_real = [], False
+            for component in sorted(changed):
+                differ, why = versions_differ(component, a["manifest"], b["manifest"],
+                                              goals or _default_goals())
+                if differ:
+                    any_real = True
+                elif "both harnesses name" not in why:
+                    notes.append("%s: %s" % (component, why))
+            if changed and not any_real and notes:
+                out.append("%s and %s -- %s" % (label_a, label_b, "; ".join(notes)))
 
     if check_live:
         ok, changed = F.frozen_intact()
