@@ -101,10 +101,14 @@ def test_the_route_singleton_is_rebuilt_between_arms():
 def test_the_arms_differ_by_the_switch_and_the_switch_is_set_both_ways():
     src = inspect.getsource(S.route_evaluator_for)
     assert 'MCP_FLEET_SOCKET"] = "1" if socket_on else "0"' in src
-    # null_arm を足した時点で literal "socket_on=True" は消え、この検査は落ちた。
-    # 検査すべきは「両腕でスイッチが逆になる」ことで、その書き方ではない。
-    assert "socket_on=False" in src
-    assert "socket_on=not null_arm" in src or "socket_on=True" in src
+    # 検査すべきは「両腕が同じ設定にならない」ことで、その書き方ではない。
+    # この assert は今日2度、不変条件が何も変わっていないのに書き換えで落ちている。
+    i, j = src.index("def _control():"), src.index("def _candidate():")
+    k = src.index("def _warmup")
+    control, candidate = src[i:j], src[j:k]
+    assert "socket_on=bool(control_socket)" in control
+    assert "else True" in candidate, "候補腕が経路を有効にしていない"
+    assert "control_manifest" in control and "candidate_manifest" in candidate
 
 
 def test_fallbacks_come_from_the_route_this_arm_built():
@@ -167,7 +171,9 @@ def test_the_candidate_manifest_reaches_the_candidate_arm():
     j = src.index("def _warmup")
     assert "candidate_manifest" in src[i:j], "候補腕の中で候補が使われていない"
     k = src.index("def _control():")
-    assert "manifest=None" in src[k:i], "対照腕が基準に戻っていない"
+    # 対照腕は候補を読まない。既定 control_manifest=None なので基底に戻る。
+    assert "candidate_manifest" not in src[k:i], "対照腕が候補を読んでいる"
+    assert "manifest=control_manifest" in src[k:i]
 
 
 def test_the_arm_does_not_rewrite_the_operators_active_harness():
@@ -299,8 +305,10 @@ def test_a_null_run_makes_both_arms_the_control():
     assert "null_arm" in src
     i, j = src.index("def _candidate():"), src.index("def _warmup")
     body = src[i:j]
-    assert "None if null_arm else candidate_manifest" in body
-    assert "socket_on=not null_arm" in body, "帰無腕が socket を有効にしたままになる"
+    # 対照腕を一般化したので、帰無腕は「基底に戻す」ではなく「対照と同じものを使う」。
+    # 基底に固定したままだと、枝A対枝Bの帰無走行が枝A対基底を測ってノイズと呼ぶ。
+    assert "control_manifest if null_arm" in body
+    assert "bool(control_socket) if null_arm" in body, "帰無腕が対照とスイッチで食い違う"
 
 
 def test_a_null_run_is_labelled_in_the_result():

@@ -537,7 +537,8 @@ CAMPAIGN_SOCKET_LOG = os.path.join(
 def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222",
                         max_concurrent=2, log_path=None, candidate_first=False,
                         warmup=False, null_arm=False,
-                        transcript_dir=None, isolate_memory=True):
+                        transcript_dir=None, isolate_memory=True,
+                        control_manifest=None, control_socket=False):
     """An `evaluate(manifest, experiment_id)` that measures transport, not pass@1.
 
     CompanionBench answers "did the candidate solve more episodes". For a transport hypothesis
@@ -790,9 +791,21 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
         # OPPOSITE signs, so order cannot be waved away by argument; it has to be swapped and
         # the sign checked.
         def _control():
+            """The arm the candidate is measured against.
+
+            NOT ALWAYS "TABS UNDER THE BASE HARNESS". That is the right control for "is the
+            route better than tabs", and it is the wrong one for two branches, where both arms
+            are harnesses and the transport switch is not what is being tested -- pinning the
+            control to socket-off there would compare branch A over tabs against branch B over
+            a socket and attribute the transport difference to the genome.
+
+            Defaults reproduce the original behaviour exactly, so every existing caller keeps
+            the control it was written against.
+            """
             _begin_attribution()
-            out = RV.measure_arm(lambda g, s, smp: _run(g, s, smp, manifest=None),
-                                 goals=goals, socket_on=False, peak_sampler=_edge_mb)
+            out = RV.measure_arm(
+                lambda g, s, smp: _run(g, s, smp, manifest=control_manifest),
+                goals=goals, socket_on=bool(control_socket), peak_sampler=_edge_mb)
             out["new_renderers"] = _attr["peak_new_pids"]
             return out
 
@@ -810,8 +823,11 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
             _begin_attribution()
             out = RV.measure_arm(
                 lambda g, s, smp: _run(g, s, smp,
-                                       manifest=None if null_arm else candidate_manifest),
-                goals=goals, socket_on=not null_arm, peak_sampler=_edge_mb)
+                                       manifest=(control_manifest if null_arm
+                                                 else candidate_manifest)),
+                goals=goals,
+                socket_on=bool(control_socket) if null_arm else True,
+                peak_sampler=_edge_mb)
             out["new_renderers"] = _attr["peak_new_pids"]
             out["is_null"] = bool(null_arm)
             return out
@@ -826,8 +842,9 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
             but it removes the one that is certain to be there.
             """
             _begin_attribution()
-            RV.measure_arm(lambda g, s, smp: _run(g, s, smp, manifest=None),
-                           goals=goals[:1], socket_on=False, peak_sampler=_edge_mb)
+            RV.measure_arm(
+                lambda g, s, smp: _run(g, s, smp, manifest=control_manifest),
+                goals=goals[:1], socket_on=bool(control_socket), peak_sampler=_edge_mb)
             _floor["min_free_mb"] = None
 
         try:
