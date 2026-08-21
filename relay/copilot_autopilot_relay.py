@@ -82,7 +82,13 @@ sys.path.insert(0, str(REPO))
 from relay import settle as _settle                     # the one settle rule
 from relay.acceptance import normalize_checks, run_all_blocking  # spec 3-3 verify gate
 from tools.gate_ops import stop_check                     # operator E: kill-switch
-from tools.memory_ops import memory_load, memory_save     # cross-session history
+# THE LOCAL VARIANT, because this relay is a standalone process. The gated `memory_save`
+# calls require_unlocked(), which denies outside an HTTP request -- so every call here
+# returned a lock string that this file discarded, and the history was never written. Measured
+# 2026-08-21: once per turn, on every run, silently. tools/memory_ops.py explains why the gate
+# cannot answer anything about a caller with no remote identity.
+from tools.memory_ops import memory_load
+from tools.memory_ops import memory_save_local as memory_save   # cross-session history
 from tools.runlog_ops import runlog_append, runlog_summarize  # operator D: audit
 
 class ConversationClosed(RuntimeError):

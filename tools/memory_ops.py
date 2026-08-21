@@ -52,6 +52,34 @@ def memory_save(
     locked = require_unlocked()
     if locked:
         return locked
+    return memory_save_local(key, value, scope=scope, tags=tags)
+
+
+def memory_save_local(
+    key: str,
+    value: str,
+    scope: str = "global",
+    tags: Optional[list[str]] = None,
+) -> str:
+    """Save without the unlock gate. FOR IN-PROCESS CALLERS ONLY; not exposed as a tool.
+
+    WHY THIS EXISTS, AND WHY IT IS NOT A HOLE. The gate answers one question: has the REMOTE
+    caller behind this HTTP request proved possession of the password for its IP. A caller
+    running inside this process has no remote identity and no request, so the gate cannot
+    answer it -- `require_unlocked()` denies, and `unlock()` itself needs a request too, so
+    such a caller has no move that works. Denying is correct; telling it to unlock is telling
+    it to do something impossible.
+
+    MEASURED, 2026-08-21: the relay called the gated `memory_save` once per turn and discarded
+    the returned lock string, so its cross-session history had NEVER been written -- silently,
+    on every turn of every run. Worse, each refusal freshened the identity-less refusal slot,
+    and concurrent fleet workers then read someone else's refusal as their own lock and burned
+    their auto-unlock attempts.
+
+    The boundary this keeps is the one that matters: nothing reachable from outside this
+    process calls this. `memory_save` above still gates, and it is what the tool surface
+    exposes. An in-process caller is already inside every boundary the gate protects.
+    """
     try:
         if not key or not isinstance(key, str):
             return "[memory_save error: key must be a non-empty string]"

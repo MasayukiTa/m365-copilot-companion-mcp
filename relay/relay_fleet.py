@@ -337,6 +337,13 @@ def _looks_locked(resp: str, since: float = 0.0) -> bool:
         record = lock_state.matching_record(since)
         if not record:
             return False
+        # A REFUSAL WITH NO CLIENT IS NOT EVIDENCE ABOUT THIS WORKER. security.py denies any
+        # caller that has no HTTP request context and records it with an empty client_ip --
+        # an in-process caller, never a remote worker. This worker always HAS a context, so
+        # such a record can only have come from somebody else. Reading it as one's own lock is
+        # how one process's refusals cost several workers their unlock attempts.
+        if not (record.get("client_ip") or "").strip():
+            return False
         _note_locked("fallback", resp, since, record)
         return True
     except Exception:

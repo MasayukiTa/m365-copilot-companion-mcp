@@ -830,3 +830,28 @@ def test_a_reply_that_is_not_locked_records_nothing(tmp_path, monkeypatch):
     _lock_tmp(tmp_path, monkeypatch)
     assert rf._looks_locked("ふつうの回答です。", since=99.0) is False
     assert [r for r in _rows(tmp_path) if r.get("event") == "classified_locked"] == []
+
+
+def test_a_refusal_with_no_client_is_not_this_workers_lock(tmp_path, monkeypatch):
+    """security.py はコンテキストの無い呼び出し元を拒否し、client_ip を空で記録する --
+    それは in-process の誰かであって、遠隔ワーカーではない。ワーカーは必ず
+    コンテキストを持つので、空 IP の記録は必ず他人のもの。
+
+    実測 2026-08-21: relay が毎ターン踏むこの拒否が、並行するワーカーの
+    自動 unlock 試行4回を溶かしていた。"""
+    import relay.relay_fleet as rf
+    LS = _lock_tmp(tmp_path, monkeypatch)
+    LS.record_locked("", "[locked: no HTTP request context]", ts=100.0)
+    import time as _t
+    monkeypatch.setattr(_t, "time", lambda: 101.0)
+    assert rf._looks_locked("unlock 未提供で STUCK。", since=99.0) is False
+
+
+def test_a_refusal_from_a_real_client_still_counts(tmp_path, monkeypatch):
+    """空 IP を無視するのであって、拒否そのものを無視するのではない。"""
+    import relay.relay_fleet as rf
+    LS = _lock_tmp(tmp_path, monkeypatch)
+    LS.record_locked("203.0.113.7", "[locked client IP]", ts=100.0)
+    import time as _t
+    monkeypatch.setattr(_t, "time", lambda: 101.0)
+    assert rf._looks_locked("unlock 未提供で STUCK。", since=99.0) is True
