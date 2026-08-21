@@ -363,6 +363,43 @@ def _looks_like_clarification(text: str) -> bool:
 MAX_APPROVALS = 3
 
 
+def _still_generating(drv) -> bool:
+    """Whether the agent is visibly still working, per the Stop button.
+
+    Defensive on purpose: a driver without the probe (a stub, or a socket driver whose turn
+    ends by protocol) degrades to the old text-only behaviour rather than raising. A failed
+    probe answers False, because "I could not tell" must not freeze a research that has in
+    fact finished -- the deadline is the backstop, not this.
+    """
+    probe = getattr(drv, "_is_generating", None)
+    if not callable(probe):
+        return False
+    try:
+        return bool(probe())
+    except Exception:
+        return False
+
+
+#: WHY A DOM SIGNAL DECIDES THIS AND TEXT CANNOT. Measured on two full researches,
+#: 2026-08-21:
+#:   * the completion header (`推論が N ステップで完了`) NEVER appeared -- not once, on a
+#:     finished 11,507-character report that then sat unchanged for two minutes. Requiring it
+#:     would hang every research until its deadline.
+#:   * length is useless: the block passes 1,000 characters at 30-45s, roughly ten minutes
+#:     before the report exists.
+#:   * stability is useless: while still working, the block held byte-identical for 169
+#:     seconds. Sixteen separate samples satisfied "substantial and stable for 24s" while the
+#:     research was still running, the earliest at 6,060 characters -- 52% of the final report.
+#:   * the block SHRINKS. It went 6,060 -> 929 -> 1,475 -> 11,507. Nothing monotonic can be
+#:     concluded from its size.
+#: The Stop button separated the two perfectly: True for the whole run, False from 673s, with
+#: the final text already in place. It is also not text, so it cannot be reworded.
+#:
+#: A SOCKET WOULD NOT NEED ANY OF THIS. Over ChatHub the backend sends a completion frame and
+#: the turn is over by protocol, which is a stronger signal than any button -- one more reason
+#: the side agents belong on the socket route.
+
+
 def _wait_research_done(drv: CopilotWebDriver, profile: AgentProfile,
                         approval: str = "", approvals_left: int = 0) -> bool:
     """Wait out the long deep-research turn. Completion = a NEW answer block, then
@@ -394,6 +431,11 @@ def _wait_research_done(drv: CopilotWebDriver, profile: AgentProfile,
             drv.send(approval)
             last, stable_since = None, None
             time.sleep(1.0)
+            continue
+        if _still_generating(drv):
+            # Still working. Reset the clock: stability gathered mid-run is not evidence.
+            last, stable_since = None, None
+            time.sleep(2.0)
             continue
         if _is_processing(t):
             last, stable_since = None, None
@@ -632,6 +674,12 @@ class ResearchSession:
                 self._last, self._stable_since = None, None
                 # The approval starts a NEW turn; carrying settle across it would let
                 # stability gathered on the question count toward accepting the answer.
+                self._settle_state = _settle.SettleState()
+                return None
+            if _still_generating(self.drv):
+                # Still working -- see the note on _wait_research_done. Everything below this
+                # line asks "has it settled", and settling while it runs means nothing.
+                self._last, self._stable_since = None, None
                 self._settle_state = _settle.SettleState()
                 return None
             # a stable, SUBSTANTIAL block (completion marker OR >=1000 chars) is the finished

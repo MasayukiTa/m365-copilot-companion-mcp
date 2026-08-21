@@ -229,3 +229,85 @@ def test_ask_agent_hands_its_remaining_budget_to_the_wait_loop(monkeypatch):
     assert out["ok"] is True
     assert got["approval"] == AP.DEFAULT_APPROVAL
     assert got["left"] == AP.MAX_APPROVALS - 1, "ask_agent が使った1回分が引かれていない"
+
+
+# ---- 完了判定は Stop ボタンで決める（実測 2026-08-21、2本の完走観測より） --------------------
+#
+#   完了マーカー : 一度も出ない（11,507文字の完成レポートが2分静止しても不在）
+#   文字数       : 30-45秒で1000字を超える（レポート完成の約10分前）
+#   静止時間     : 実行中に169秒静止した。「1000字以上かつ24秒静止」は実行中に16回成立し、
+#                  最も早いものは6,060文字＝最終の52%だった
+#   本文の長さ   : 6060 → 929 → 1475 → 11507 と縮む。単調性が無い
+#   Stop ボタン  : 実行中ずっと True、673秒で False、その時点で本文は最終形
+#
+# つまりテキストから決めることは原理的にできず、DOM の状態だけが分離できる。
+
+class _GenDrv(_ScriptedDrv):
+    """Stop ボタンの状態を持つ台本ドライバ。"""
+
+    def __init__(self, blocks, generating):
+        super().__init__(blocks)
+        self.generating = generating
+
+    def _is_generating(self):
+        return self.generating
+
+
+def test_a_settled_block_is_not_accepted_while_the_agent_is_still_working():
+    """実測 t=259s の再現: 6,060文字が106秒静止していたが、まだ調査中だった。"""
+    s = _live_session(["本文" * 3000], max_approvals=0)
+    s.drv = _GenDrv(["本文" * 3000], generating=True)
+    s.drv._count_before = 0
+    s._count_before = 0
+    s._last = "本文" * 3000
+    s._stable_since = 0.0                      # 遥か昔から静止している扱い
+    assert s.poll() is None
+    assert s._done is None
+    assert s._stable_since is None, "実行中に集めた静止は証拠にならないので捨てる"
+
+
+def test_the_same_block_is_accepted_once_the_agent_has_stopped():
+    body = "本文" * 3000
+    s = _live_session([body], max_approvals=0)
+    s.drv = _GenDrv([body], generating=False)
+    s.drv._count_before = 0
+    s._count_before = 0
+    for _ in range(6):                          # dwell を跨ぐまで回す
+        out = s.poll()
+        if out is not None:
+            break
+        import time as _t
+        _t.sleep(1.2)
+    assert s._done and s._done.startswith("本文")
+
+
+def test_a_driver_without_the_probe_behaves_as_before():
+    """socket ドライバや古いスタブには Stop ボタンが無い。
+    無いことを『実行中』と解釈すると、そちらの経路が永久に受理しなくなる。"""
+    assert AP._still_generating(object()) is False
+
+
+def test_a_probe_that_raises_does_not_freeze_a_finished_research():
+    class _Broken:
+        def _is_generating(self):
+            raise RuntimeError("page closed")
+
+    assert AP._still_generating(_Broken()) is False
+
+
+def test_the_blocking_loop_waits_for_the_stop_button_too(monkeypatch):
+    """同じ規則を両方の経路に入れる -- 片方だけだと、直っていない方で再発する。"""
+    monkeypatch.setattr(AP, "stop_check", lambda *a, **k: "")
+    drv = _GenDrv(["本文" * 3000], generating=True)
+    drv._count_before = 0
+
+    class _Profile2:
+        name = "researcher"
+        end_timeout_s = 3
+        appear_timeout_s = 2
+        dwell_s = 0.1
+
+    assert AP._wait_research_done(drv, _Profile2()) is False   # 実行中は受理しない
+    drv.generating = False
+    drv._count_before = 0
+    assert AP._wait_research_done(drv, _Profile2()) is True
