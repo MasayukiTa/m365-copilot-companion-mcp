@@ -16,14 +16,18 @@ from relay.transport_policy import (SOCKET, TAB, TRANSPORT_VERSIONS, WORKIQ_MARK
 def test_the_two_versions_answer_differently_for_the_same_goal():
     """両腕が同じ答えを返すなら A/B は同じプログラムの二腕。
     このリポジトリが4つのコンポーネントで見つけた欠陥。"""
-    goal = "パーサのリファクタリング"
-    assert _policy_v1(goal) == TAB
-    assert _policy_v2(goal) == SOCKET
+    # v1 は経路に任せ、v2 は Work IQ 目標をタブへ回す。分岐は Work IQ 側で出る。
+    assert _policy_v1("Outlook の受信トレイを整理して") == SOCKET
+    assert _policy_v2("Outlook の受信トレイを整理して") == TAB
 
 
-def test_v1_is_what_the_fleet_did_before_the_route_existed():
+def test_v1_preserves_todays_behaviour_rather_than_yesterdays():
+    """最初の版は v1 を『全部タブ』にし、socket 経路のテストが即座に落ちた。
+    経路はもう存在し独自のスイッチで gate されているので、『常にタブ』は
+    現状維持ではなく**機能の無効化**。コンポーネントの v1 は今日の挙動でなければ、
+    昇格そのものが、実験を頼んでいない人の挙動を変える。"""
     for goal in ("何でも", "Outlook を整理", ""):
-        assert _policy_v1(goal) == TAB
+        assert _policy_v1(goal) == SOCKET
 
 
 # ---- 固定された述語 -------------------------------------------------------------------------------

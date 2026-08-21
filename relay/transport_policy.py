@@ -96,8 +96,17 @@ def classify_fallback(reason: str) -> str:
 
 
 def _policy_v1(goal: str, *, kind="", knobs=None, explore=False) -> str:
-    """Every goal over a tab. What the fleet did before the socket route existed."""
-    return TAB
+    """Whatever the route offers. THE BEHAVIOUR THAT WAS ALREADY THERE.
+
+    The first draft of this returned TAB for everything, on the reasoning that tabs are what
+    the fleet did before sockets existed. That was wrong and a test of the socket route caught
+    it within the minute: the route IS here now, gated by its own switch, so a default of
+    "always tab" does not preserve the status quo -- it silently disables a feature.
+
+    A component's v1 has to be what happens today, or promoting the component changes
+    behaviour for everyone who never asked for the experiment.
+    """
+    return SOCKET
 
 
 def _policy_v2(goal: str, *, kind="", knobs=None, explore=False) -> str:
