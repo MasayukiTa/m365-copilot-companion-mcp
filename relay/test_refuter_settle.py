@@ -60,6 +60,10 @@ class _Session:
         self._nudges_used = 0
         self._done = None          # 実物と同じ契約: _finish が入れるまで None
         self._pending_open = False
+        # A TAB stand-in: these tests are about settle rules on DOM text, and a socket review
+        # ends by protocol instead of by settling.
+        self.socket = False
+        self._socket_tried = True
         self.finished = []
 
     def _finish(self, verdict):

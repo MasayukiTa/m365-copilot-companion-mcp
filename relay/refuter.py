@@ -320,6 +320,12 @@ class RefuterSession:
         self._done = None          # verdict tuple once finished
         self._network_reopens = 0
         self.max_network_reopens = max_network_reopens
+        #: True while this review runs over a socket rather than a side page. It passes no RAM
+        #: gate, which is what stops a review being SKIPPED on a busy box -- and a skipped
+        #: review means the candidate is accepted unreviewed, which is not a smaller review.
+        self.socket = False
+        #: Asked once. A capture costs a real tab and a real turn.
+        self._socket_tried = False
 
     def start(self):
         # Defer the side-page open until poll() sees enough free RAM (ram_room_for_tab) -- the
@@ -364,6 +370,42 @@ class RefuterSession:
             else:
                 self._finish(("UNCLEAR", HARNESS_REASON_PREFIX + "opening the side page failed: %s: %s" % (type(exc).__name__, str(exc)[:160].replace(chr(10), " | "))))
 
+    def _try_socket(self) -> bool:
+        """Review over a socket if one can be had. Never raises; falls through to a tab.
+
+        The refuter reads and judges; it uploads nothing and reopens no named conversation, so
+        nothing about it structurally needs a page (see relay/transport_policy.py). What it
+        does need is to RUN: on a busy box the RAM gate below turns a review into a RAM_SKIP,
+        and an unreviewed candidate is accepted rather than reviewed briefly.
+        """
+        import time
+        self._socket_tried = True
+        try:
+            from relay.relay_fleet import _socket_route
+
+            route = _socket_route()
+            if not route.open() or self.context is None or not self.base_url:
+                return False
+            if route.needs_refresh(self.base_url) and not route.refresh(self.context,
+                                                                       self.base_url):
+                return False
+            drv = route.driver_for("refuter", agent_url=self.base_url,
+                                   turn_timeout_s=float(self.timeout_s),
+                                   frame_timeout_s=120.0)
+            if drv is None:
+                return False
+            self.page, self.drv, self.socket = None, drv, True
+            self._count_before = 0
+            self.drv._count_before = 0
+            self.drv.send(build_refuter_prompt(self.goal, self.final, lens=self.lens))
+            self._pending_open = False
+            self._t_send = time.time()
+            return True
+        except Exception:
+            self.socket = False
+            self.page, self.drv = None, None
+            return False
+
     def _schedule_network_reopen(self, reason):
         """Close the stale side page and retry the same read-only refuter prompt later."""
         import sys
@@ -395,8 +437,29 @@ class RefuterSession:
         from .copilot_autopilot_relay import _is_processing, _page_network_available
         if self._done is not None:
             return self._done
+        if self.socket and getattr(self.drv, "failed", ""):
+            # THE ROUTE FAILING IS NOT THE REVIEW FAILING. Drop to a side page and let the
+            # RAM-gated open below do what it did before sockets existed.
+            reason = getattr(self.drv, "failed", "") or "unknown"
+            try:
+                from relay.relay_fleet import _socket_route
+                _socket_route().note_failure("refuter: %s" % reason)
+                _socket_route().record("fallback", worker="refuter",
+                                       goal=(self.goal or "")[:600], reason=reason[:300])
+            except Exception:
+                pass
+            try:
+                self.drv.close()
+            except Exception:
+                pass
+            self.socket, self.drv = False, None
+            self._pending_open = True
+            self._t_send = time.time()
+            return None
         # RAM-gated lazy open (bounded by timeout); returns quickly so the sweep stays responsive.
         if self._pending_open:
+            if not self._socket_tried and self._try_socket():
+                return None
             from .relay_fleet import ram_room_for_tab
             if self._t_send and time.time() - self._t_send > self.timeout_s:
                 # RAM-STARVED SKIP: the side-page never got a tab within timeout_s, so this
@@ -417,6 +480,9 @@ class RefuterSession:
         if self.drv is None:
             return self._done
         try:
+            # `self.page is None` on a socket, so this already never runs there. Left as the
+            # single guard rather than doubled with a `not self.socket` that can never be the
+            # deciding term -- a condition that cannot fail looks like protection and is not.
             if self.page is not None and not _page_network_available(self.page):
                 self._schedule_network_reopen("browser reported offline during review")
                 return self._done
@@ -542,8 +608,14 @@ class RefuterSession:
 
     def close(self):
         try:
+            if self.socket and self.drv is not None:
+                self.drv.close()
+        except Exception:
+            pass
+        try:
             if self.page is not None:
                 self.page.close()
         except Exception:
             pass
+        self.socket = False
         self.page = None
