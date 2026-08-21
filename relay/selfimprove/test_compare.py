@@ -36,13 +36,20 @@ def env(tmp_path, monkeypatch):
 
 
 def _clean(monkeypatch, tmp_path):
-    """No live refusals: frozen intact, no lock, no tripwire, plenty of memory."""
+    """No live refusals: frozen intact, no lock, no tripwire, memory, token.
+
+    The token stub matters: once the probe became real, every test that calls `refusals` or
+    `enqueue` without it tried to drive a browser, and the suite hung for ten minutes instead
+    of failing. A precondition that reaches the world has to be stubbed in tests that are not
+    about the world.
+    """
     from relay.selfimprove import frozen as F
     from relay.selfimprove import scheduler as S
     monkeypatch.setattr(F, "frozen_intact", lambda *a, **k: (True, []))
     monkeypatch.setattr(S, "lock_held", lambda *a, **k: None)
     monkeypatch.setattr(S, "halt_on_record", lambda *a, **k: {})
     monkeypatch.setattr("relay.relay_fleet.avail_phys_mb", lambda: 99999.0)
+    monkeypatch.setattr(C, "_token_capturable", lambda *a, **k: True)
 
 
 # ---- 計器が見える範囲を先に言う -------------------------------------------------------------------
@@ -133,7 +140,7 @@ def test_a_fired_tripwire_refuses(env, monkeypatch, tmp_path):
 
 def test_a_swapping_machine_refuses(env, monkeypatch, tmp_path):
     _clean(monkeypatch, tmp_path)
-    reasons = C.refusals("fast", "slow", archive=env, free_mb=100.0)
+    reasons = C.refusals("fast", "slow", archive=env, free_mb=100.0, token_ok=True)
     assert any("swap" in r for r in reasons), reasons
 
 
@@ -356,3 +363,63 @@ def test_running_against_base_stamps_only_the_branch(env, monkeypatch, tmp_path)
     C.run(req, archive=env, evaluator_for=lambda *a: (lambda *b, **k: _order(10)))
     assert BR.read()["fast"]["last_run_at"]
     assert "base" not in BR.read()
+
+
+# ---- 走らなかった順序は「引き分けた順序」ではない -------------------------------------------------
+
+def _aborted(reason="no usable socket token"):
+    return {"gate": None, "infra": {"aborted": True, "reason": reason}}
+
+
+def test_an_ordering_that_did_not_run_cannot_produce_a_winner():
+    """実走行で出た欠陥。トークンが捕獲できず第1順序がプリフライトで拒否され、
+    腕を1つも運ばなかった。`.get("done", 0)` がそれを 0 対 0 の引き分けに変え、
+    片方の順序だけで勝者が宣言された -- 半分が起きていない比較から。"""
+    got = C.decide(_aborted(), _order(400, done_b=3))
+    assert got["verdict"] == C.VERDICT_NONE
+    assert got["aborted"] is True
+    assert "did not run" in got["why"]
+
+
+def test_the_second_ordering_failing_is_caught_too():
+    got = C.decide(_order(400), _aborted("free memory fell below the floor"))
+    assert got["verdict"] == C.VERDICT_NONE
+    assert "second ordering" in got["why"]
+
+
+def test_an_order_with_no_arms_at_all_is_not_a_tie():
+    """gain だけあって腕が無い形。0 対 0 として読まれると引き分けになる。"""
+    got = C.decide(_order(400), {"memory_gain_mb": 0.0})
+    assert got["verdict"] == C.VERDICT_NONE
+    assert got.get("aborted") is True
+
+
+def test_a_completed_pair_still_reaches_a_verdict():
+    """拒否を足したせいで、正常な比較まで判定不能にしていないこと。"""
+    assert C.decide(_order(400), _order(350))["verdict"] == C.VERDICT_A
+
+
+# ---- トークンは主張ではなく実測 -------------------------------------------------------------------
+
+def test_the_token_precondition_probes_rather_than_asserts():
+    """token_ok は既定 True だった -- 前提条件が自分の結論を述べていた。
+    同じ欠陥をこの日、評価器の中で一度直している。実走行を1本失った。"""
+    import inspect
+    sig = inspect.signature(C.refusals)
+    assert sig.parameters["token_ok"].default is None, "既定で『トークンはある』と主張している"
+    src = inspect.getsource(C.refusals)
+    assert "_token_capturable()" in src
+
+
+def test_the_token_probe_actually_captures(monkeypatch):
+    """『あるはず』は検査ではない。1枚開いて掴んで閉じる。"""
+    import inspect
+    src = inspect.getsource(C._token_capturable)
+    assert "capture_via_tab" in src
+    assert "expires_in" in src, "期限切れトークンを有効として通す"
+
+
+def test_a_failed_probe_is_reported_as_no_token(monkeypatch):
+    monkeypatch.setattr("playwright.sync_api.sync_playwright",
+                        lambda: (_ for _ in ()).throw(RuntimeError("no browser")))
+    assert C._token_capturable() is False

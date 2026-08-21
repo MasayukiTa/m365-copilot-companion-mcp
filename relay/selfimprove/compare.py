@@ -112,7 +112,7 @@ def instrument_can_see(manifest_a: dict, manifest_b: dict) -> tuple:
 
 
 def refusals(label_a: str, label_b: str, *, archive, branches_path=None, lock_path=None,
-             free_mb=None, token_ok=True, check_live=True) -> list:
+             free_mb=None, token_ok=None, check_live=True) -> list:
     """Every reason this comparison must not run. Empty means it may.
 
     Reasons rather than an exception so the operator sees all of them at once; fixing one and
@@ -168,9 +168,44 @@ def refusals(label_a: str, label_b: str, *, archive, branches_path=None, lock_pa
         if free_mb is None:
             from relay.relay_fleet import avail_phys_mb
             free_mb = avail_phys_mb()
+        if token_ok is None:
+            # PROBE, DO NOT ASSERT. This defaulted to True, which is the same defect that was
+            # fixed inside the evaluator earlier the same day: a precondition that states its
+            # own conclusion. It cost a real run -- the token could not be captured, one
+            # ordering was refused at preflight, and the comparison went ahead on the other.
+            token_ok = _token_capturable()
         out.extend(RV.preflight(free_mb=free_mb, token_ok=token_ok))
 
     return out
+
+
+
+def _token_capturable(cdp_url="http://127.0.0.1:9222", agent_url=None) -> bool:
+    """Open a tab, capture, close. Costs one tab and answers the question for real.
+
+    Without a token the socket arm silently becomes the tab arm and the two arms are the same
+    program -- the one thing a comparison may never be, arriving through the door marked "the
+    experiment ran fine".
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+
+        from relay.socket_route import capture_via_tab, expires_in
+        url = agent_url or os.environ.get("MCP_FLEET_AGENT_URL", "")
+        if not url:
+            for line in open(os.path.join(REPO, ".env"), encoding="utf-8", errors="ignore"):
+                if line.startswith("MCP_FLEET_AGENT_URL="):
+                    url = line.split("=", 1)[1].strip()
+                    break
+        with sync_playwright() as pw:
+            browser = pw.chromium.connect_over_cdp(cdp_url)
+            context = browser.contexts[0] if browser.contexts else browser.new_context()
+            token, _template = capture_via_tab(context, url)
+            return bool(token) and expires_in(token) > 0
+    except Exception as exc:
+        print("[compare] token probe failed: %s: %s" % (type(exc).__name__, str(exc)[:160]),
+              flush=True)
+        return False
 
 
 def enqueue(label_a: str, label_b: str, *, archive, note: str = "", branches_path=None,
@@ -270,10 +305,25 @@ def decide(order_1: dict, order_2: dict, *, min_gain_mb=None) -> dict:
     g1 = float(order_1.get("memory_gain_mb") or 0.0)
     g2 = float(order_2.get("memory_gain_mb") or 0.0)
 
-    done_ok = all(int((o.get(k) or {}).get("done", 0)) >= 0 for o in (order_1, order_2)
-                  for k in ("control", "candidate"))
-    if not done_ok:                                    # pragma: no cover - shape guard
-        return {"verdict": VERDICT_NONE, "why": "an arm reported no completion count"}
+    # AN ORDERING THAT DID NOT RUN IS NOT AN ORDERING THAT TIED.
+    #
+    # Found by running this for real: the first ordering was refused at preflight because no
+    # socket token could be captured, so it carried no arms at all. `.get("done", 0)` turned
+    # that into 0 == 0, the pair looked like a tie in one direction and a difference in the
+    # other, and a WINNER was declared from a comparison where half of it never happened.
+    # That is the ledger's INFRA_ABORT-is-not-a-verdict rule broken on the result side, which
+    # is the same discipline this file's own threshold rests on.
+    for name, order in (("first", order_1), ("second", order_2)):
+        aborted = (order.get("infra") or {}).get("aborted")
+        missing = not (order.get("control") and order.get("candidate"))
+        if aborted or missing:
+            reason = (order.get("infra") or {}).get("reason") or "the arms carried no result"
+            return {"verdict": VERDICT_NONE, "aborted": True,
+                    "why": "the %s ordering did not run (%s). A comparison with one ordering "
+                           "is a comparison with an uncontrolled arm position, which is the "
+                           "confound both orderings exist to remove -- so this is not a "
+                           "finding about either branch." % (name, reason[:160]),
+                    "gains": [order_1.get("memory_gain_mb"), order_2.get("memory_gain_mb")]}
 
     for order in (order_1, order_2):
         c = int((order.get("control") or {}).get("done", 0))
