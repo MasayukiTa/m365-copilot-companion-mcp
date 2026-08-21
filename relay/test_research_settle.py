@@ -131,6 +131,10 @@ class _Session:
         # settle, and an approval branch firing mid-test would be a different experiment.
         self._approvals = 99
         self.max_approvals = 0
+        # This stand-in is a TAB session: these tests are about settle rules on DOM text, and
+        # a socket has no settle problem at all -- its turn ends by protocol.
+        self.socket = False
+        self._socket_tried = True
         self.error = ""
         self._done = None
         self._pending_open = False

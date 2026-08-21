@@ -580,6 +580,13 @@ class ResearchSession:
         #: because an agent that only ever asks must not spend the budget on being asked.
         self._approvals = 0
         self._pending_open = True  # side-page not opened yet -- deferred until there's free RAM
+        #: True while this deep-dive is running over a socket instead of a side page. A socket
+        #: passes no RAM gate, which is the point: measured today, ram_room_for_tab() was False
+        #: and the fleet would have solved WITHOUT its research rather than waiting for one.
+        self.socket = False
+        #: Asked once. A capture costs a real turn on a real tab, so retrying it every poll
+        #: would spend more than the tab it is trying to avoid.
+        self._socket_tried = False
         self._done = None          # report string once finished ('' on failure)
         #: WHY it finished empty, when it did. Every path to an empty report used to look
         #: identical from outside -- a swallowed exception, a timeout and a RAM skip all
@@ -601,6 +608,56 @@ class ResearchSession:
         self._pending_open = True
         self._t_send = time.time()
         return self
+
+    def _try_socket(self) -> bool:
+        """Run this deep-dive over a socket if one can be had. Never raises, never blocks long.
+
+        MEASURED END TO END, 2026-08-21: a Researcher turn over a socket finished in 255
+        seconds against 673-809 for the same work in a tab, returned a 5,906-character report
+        with citations, streamed 29 progress messages, and reported itself running as Claude --
+        the model chosen through the frame rather than through a picker only a tab has. No tab
+        was open at any point.
+
+        And the completion problem disappears. Over a tab, "is it finished" had to be inferred
+        from a Stop button because the text lies -- the block passes 1,000 characters ten
+        minutes early, holds still for 169 seconds mid-run, and SHRINKS. Over a socket the
+        backend sends a completion frame and the turn is over by protocol.
+        """
+        self._socket_tried = True
+        if self.upload_path:
+            # The Analyst reads a local file from a real <input type=file>. See
+            # relay/transport_policy.py -- the one property measured to force a tab.
+            return False
+        try:
+            from relay.relay_fleet import _socket_route
+
+            route = _socket_route()
+            if not route.open() or self.context is None:
+                return False
+            url = getattr(self.profile, "url", "") or ""
+            if not url:
+                return False
+            if route.needs_refresh(url) and not route.refresh(self.context, url):
+                return False
+            drv = route.driver_for(
+                "research", agent_url=url,
+                model=(self.model_name if getattr(self.profile, "model_picker", None) else ""),
+                turn_timeout_s=float(self.timeout_s), frame_timeout_s=300.0)
+            if drv is None:
+                return False
+            self.page, self.drv, self.socket = None, drv, True
+            self._count_before = 0
+            self.drv._count_before = 0
+            self.drv.send(self.query)
+            self._pending_open = False
+            self._t_send = time.time()
+            return True
+        except Exception:
+            # A route that cannot be had is not a failure of the deep-dive: the tab path is
+            # right there and is what ran before this existed.
+            self.socket = False
+            self.page, self.drv = None, None
+            return False
 
     def _do_open(self):
         from .copilot_autopilot_relay import CopilotWebDriver
@@ -642,7 +699,28 @@ class ResearchSession:
             return self._done
         # RAM-gated lazy open: hold off opening the side-page until there's room (bounded by the
         # timeout). Returns quickly each sweep, so the fleet stays responsive while it waits.
+        if self.socket and getattr(self.drv, "failed", ""):
+            # THE ROUTE FAILING IS NOT THE DEEP-DIVE FAILING. Drop to a tab and let the
+            # RAM-gated open below do exactly what it did before sockets existed.
+            reason = getattr(self.drv, "failed", "") or "unknown"
+            try:
+                from relay.relay_fleet import _socket_route
+                _socket_route().note_failure("research: %s" % reason)
+                _socket_route().record("fallback", worker="research",
+                                       goal=(self.query or "")[:600], reason=reason[:300])
+            except Exception:
+                pass
+            try:
+                self.drv.close()
+            except Exception:
+                pass
+            self.socket, self.drv = False, None
+            self._pending_open = True
+            self._t_send = time.time()
+            return None
         if self._pending_open:
+            if not self._socket_tried and self._try_socket():
+                return None
             from .relay_fleet import ram_room_for_tab
             if self._t_send and time.time() - self._t_send > self.timeout_s:
                 # RAM-STARVED SKIP (see refuter.py): research never got a tab within timeout_s,
@@ -767,12 +845,18 @@ class ResearchSession:
 
     def close(self):
         try:
+            if self.socket and self.drv is not None:
+                self.drv.close()          # a socket is cheap, but it is not free
+        except Exception:
+            pass
+        try:
             if self.page is not None:
                 self.page.close()
         except Exception:
             pass
         self.page = None
         self.drv = None
+        self.socket = False
 
 
 def upload_file(page, file_path: str, timeout_s: float = 30.0) -> bool:

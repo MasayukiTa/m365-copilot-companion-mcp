@@ -16,6 +16,8 @@ def _session():
     s = AP.ResearchSession.__new__(AP.ResearchSession)
     s._done = None
     s.error = ""
+    s.socket = False
+    s._socket_tried = True
     s.tx_dir = None
     s.parent_key = ""
     s._report_full = ""
@@ -121,6 +123,11 @@ def _live_session(blocks, max_approvals):
     s._settle_state = __import__("relay.settle", fromlist=["x"]).SettleState()
     s._done = None
     s._pending_open = False
+    # These sessions stand in for the TAB path: the settle/approval rules under test are about
+    # DOM text, and a socket turn ends by protocol instead.
+    s.socket = False
+    s._socket_tried = True
+    s.upload_path = ""
     s._report_full = ""
     s.error = ""
     s.page = None
@@ -311,3 +318,150 @@ def test_the_blocking_loop_waits_for_the_stop_button_too(monkeypatch):
     drv.generating = False
     drv._count_before = 0
     assert AP._wait_research_done(drv, _Profile2()) is True
+
+
+# ---- A: 副エージェントを socket に載せる（実測 2026-08-21） -----------------------------------
+#
+# 実測: Researcher の1ターンが socket で 255 秒（タブ経路の同等調査は 673〜809 秒）、
+# 出典付き 5,906 文字、進捗29件、モデル自己申告は Claude、そしてタブは一度も開いていない。
+# バックエンドが完了フレームを送るので、Stop ボタンも静止判定も要らない。
+
+class _FakeDrv:
+    """ドライバの代役。socket ドライバと同じ約束だけを持つ。"""
+
+    def __init__(self):
+        self.failed = ""
+        self.closed = False
+        self.sent = []
+        self._count_before = 0
+
+    def send(self, text, **_kw):
+        self.sent.append(text)
+
+    def _answers(self):
+        return types.SimpleNamespace(count=lambda: len(self.sent))
+
+    def read_last_response(self):
+        return ""
+
+    def close(self):
+        self.closed = True
+
+
+class _Route:
+    def __init__(self, driver=None, open_=True, refreshed=True):
+        self.driver, self._open, self._refreshed = driver, open_, refreshed
+        self.asked = []
+        self.failures = []
+        self.records = []
+
+    def open(self):
+        return self._open
+
+    def needs_refresh(self, url=None):
+        return not self._refreshed
+
+    def refresh(self, ctx, url):
+        return self._refreshed
+
+    def driver_for(self, name, agent_url=None, model="", turn_timeout_s=600.0,
+                   frame_timeout_s=90.0):
+        self.asked.append({"agent_url": agent_url, "model": model,
+                           "turn_timeout_s": turn_timeout_s})
+        return self.driver
+
+    def note_failure(self, why):
+        self.failures.append(why)
+
+    def record(self, event, **f):
+        self.records.append((event, f))
+
+
+def _session_for_socket(route, monkeypatch, **kw):
+    import relay.relay_fleet as rf
+    monkeypatch.setattr(rf, "_socket_route", lambda: route)
+    s = AP.ResearchSession(object(), "調べて", **kw)
+    return s
+
+
+def test_a_deep_dive_takes_a_socket_and_opens_no_tab(monkeypatch):
+    drv = _FakeDrv()
+    route = _Route(driver=drv)
+    monkeypatch.setattr(AP, "open_agent",
+                        lambda *a, **k: pytest.fail("a socket deep-dive must not open a tab"))
+    s = _session_for_socket(route, monkeypatch)
+    assert s._try_socket() is True
+    assert s.socket is True and s.page is None and s.drv is drv
+    assert s._pending_open is False, "RAM ゲートを通ってはならない -- socket はタブではない"
+
+
+def test_it_asks_for_its_own_agent_and_its_own_model(monkeypatch):
+    """Researcher は実装エージェントとは別物。共有テンプレートで送ると、
+    研究のターンが黙って別のエージェントに届き、そのエージェントは普通に答える。"""
+    route = _Route(driver=_FakeDrv())
+    s = _session_for_socket(route, monkeypatch, model_name="Claude", timeout_s=1234)
+    s._try_socket()
+    asked = route.asked[0]
+    assert asked["agent_url"] == AP.RESEARCHER.url
+    assert asked["model"] == "Claude"
+    assert asked["turn_timeout_s"] == 1234, "research のターンに chat の忍耐を使わない"
+
+
+def test_the_analyst_never_asks_for_a_socket(monkeypatch):
+    """アップロードは <input type=file> に入る。socket に置き場は無い。"""
+    route = _Route(driver=_FakeDrv())
+    s = _session_for_socket(route, monkeypatch, upload_path=r"C:\d.csv")
+    assert s._try_socket() is False
+    assert route.asked == [], "そもそも尋ねてもいけない"
+    assert s.socket is False
+
+
+def test_a_route_that_offers_nothing_falls_through_to_the_tab(monkeypatch):
+    s = _session_for_socket(_Route(driver=None), monkeypatch)
+    assert s._try_socket() is False
+    assert s.socket is False and s._pending_open is True
+
+
+def test_a_closed_route_is_not_asked(monkeypatch):
+    route = _Route(driver=_FakeDrv(), open_=False)
+    s = _session_for_socket(route, monkeypatch)
+    assert s._try_socket() is False
+    assert route.asked == []
+
+
+def test_the_socket_is_tried_once_and_not_on_every_poll(monkeypatch):
+    """捕獲は実タブ1枚と実ターン1回。毎 poll 試すと、避けようとしたタブより高くつく。"""
+    route = _Route(driver=None)
+    s = _session_for_socket(route, monkeypatch)
+    monkeypatch.setattr(AP, "ram_room_for_tab", lambda: False, raising=False)
+    import relay.relay_fleet as rf
+    monkeypatch.setattr(rf, "ram_room_for_tab", lambda: False)
+    s.start()
+    s.poll()
+    s.poll()
+    s.poll()
+    assert s._socket_tried is True
+    assert len(route.asked) <= 1
+
+
+def test_a_failed_socket_deep_dive_becomes_a_tab_deep_dive(monkeypatch):
+    """経路が落ちることと調査が落ちることは別。タブ経路はこの機能以前からそこにある。"""
+    drv = _FakeDrv()
+    route = _Route(driver=drv)
+    s = _session_for_socket(route, monkeypatch)
+    s._try_socket()
+    drv.failed = "ChatHubError: the socket went silent"
+    assert s.poll() is None
+    assert s.socket is False and s.drv is None
+    assert s._pending_open is True, "タブで開き直す状態に戻っていない"
+    assert route.failures and "went silent" in route.failures[0]
+    assert any(e == "fallback" for e, _ in route.records), "学習データに残っていない"
+
+
+def test_closing_a_socket_deep_dive_closes_its_conversation(monkeypatch):
+    drv = _FakeDrv()
+    s = _session_for_socket(_Route(driver=drv), monkeypatch)
+    s._try_socket()
+    s.close()
+    assert drv.closed is True
+    assert s.socket is False and s.drv is None
