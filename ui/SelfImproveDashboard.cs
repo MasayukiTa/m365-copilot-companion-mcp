@@ -1025,7 +1025,7 @@ class SelfImproveDashboardWindow : Window
             var c2 = new ColumnDefinition(); c2.Width = GridLength.Auto;
             g.ColumnDefinitions.Add(c0); g.ColumnDefinitions.Add(c1); g.ColumnDefinitions.Add(c2);
             var kindTb = new TextBlock();
-            kindTb.Text = kind; kindTb.Foreground = Fg;
+            kindTb.Text = kind; kindTb.Foreground = KindBrush(kind);
             kindTb.FontFamily = new FontFamily(Theme.CodeFont);
             kindTb.FontSize = Theme.FsMeta; kindTb.FontWeight = FontWeights.SemiBold;
             Grid.SetColumn(kindTb, 0); g.Children.Add(kindTb);
@@ -1080,10 +1080,10 @@ class SelfImproveDashboardWindow : Window
             }
 
             var rec = new Border();
-            rec.BorderThickness = new Thickness(Theme.RailW, 0, 0, 0);
-            rec.BorderBrush = RailForEvent(kind);
-            rec.Padding = new Thickness(10, 6, 0, 6);
-            rec.Margin  = new Thickness(0, 10, 0, 0);
+            rec.BorderThickness = new Thickness(0, 0, 0, 1);
+            rec.BorderBrush = new SolidColorBrush(Mix(Theme.Col(Theme.Faint(_dark)), CardColor(), 0.22));
+            rec.Padding = new Thickness(0, 0, 0, 12);
+            rec.Margin  = new Thickness(0, 12, 0, 0);
             rec.Background = Brushes.Transparent;   // the whole block is the hit target, not the text
             rec.Cursor = System.Windows.Input.Cursors.Hand;
             rec.Child = body;
@@ -1336,8 +1336,8 @@ class SelfImproveDashboardWindow : Window
                 var quote = new Border();
                 quote.Background      = QuoteBg;
                 quote.CornerRadius    = new CornerRadius(6);
-                quote.BorderThickness = new Thickness(3, 0, 0, 0);
-                quote.BorderBrush     = new SolidColorBrush(StatusColorFor("warn", _dark));
+                // The tinted ground already says "this is quoted material"; the bar only made
+                // it a sticky note.
                 quote.Padding         = new Thickness(9, 5, 9, 5);
                 quote.Margin          = new Thickness(0, 3, 0, 0);
 
@@ -1459,11 +1459,11 @@ class SelfImproveDashboardWindow : Window
             string vk = VerdictKey(r.ContainsKey("keep") ? r["keep"] : null, S(r, "verdict"));
             Color  sc = StatusColorFor(vk, _dark);
 
-            // left accent strip = verdict color
+            // No accent strip: the verdict is already stated twice in the row, as the chip at
+            // the end and as the colour on net_pp. A third copy as a bar down the left edge
+            // adds no information and is the look the operator has asked not to see.
             var strip = new Border();
-            strip.BorderThickness = new Thickness(3, 0, 0, 0);
-            strip.BorderBrush     = new SolidColorBrush(sc);
-            strip.Padding         = new Thickness(10, 4, 0, 4);
+            strip.Padding = new Thickness(0, 5, 0, 5);
 
             var row = new Grid();
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(3, GridUnitType.Star) });
@@ -1894,16 +1894,21 @@ class SelfImproveDashboardWindow : Window
         return ((int)(sec / 86400)).ToString() + (ja ? "日前" : " d ago");
     }
 
-    // One ledger record, as a rail-marked block. The rail is the only colour a record spends,
-    // and it encodes the one thing worth encoding: whether the act widened what this system
-    // may become. Everything else is typography.
-    Brush RailForEvent(string kind)
+    // The colour a record spends, spent on the event NAME rather than on a strip beside it.
+    //
+    // NO COLOURED LEFT RAILS. This was written with one, on the strength of a line in Theme.cs
+    // recommending them, and the operator's response was that they have said repeatedly they
+    // dislike the look -- a thick coloured bar down the left edge reads as a sticky note. The
+    // line in Theme.cs has been corrected too, because a stale recommendation will simply be
+    // followed again by whoever reads it next.
+    //
+    // Re-signing is the routine event here (24 in a week), so it stays neutral; the anomalies
+    // are what get colour, which is the same rule the header follows.
+    Brush KindBrush(string kind)
     {
         if (kind == "baseline_mismatch" || kind == "revoke")
             return new SolidColorBrush(StatusColorFor("bad", _dark));
-        if (kind == "rebless")
-            return new SolidColorBrush(StatusColorFor("warn", _dark));
-        return new SolidColorBrush(Mix(Theme.Col(Theme.Faint(_dark)), CardColor(), 0.55));
+        return Fg;
     }
 
     static void SetClip(TextBlock t, bool open)

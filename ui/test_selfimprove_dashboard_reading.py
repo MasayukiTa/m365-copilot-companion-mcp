@@ -27,6 +27,11 @@ def _fn(name: str, end: str = "\n    }") -> str:
     return body[:body.index(end)]
 
 
+# BuildAuthority is long enough that "the next closing brace" lands inside it, so its end is
+# named by the method that follows.
+END_OF_AUTHORITY = "\n    void RevokeLastRebless"
+
+
 # ── the chip ────────────────────────────────────────────────────────────────────────
 
 def test_the_chip_is_not_a_saturated_fill_with_white_text():
@@ -137,10 +142,32 @@ def test_a_record_can_be_opened_in_place():
     assert "SetClip(rTb, open); SetClip(sTb, open); SetClip(aTb, open);" in body
 
 
-def test_the_rail_encodes_the_kind_of_act():
-    body = _fn("    Brush RailForEvent(string kind)")
+def test_no_content_block_wears_a_coloured_left_rail():
+    """Standing instruction, stated more than once before this: a thick coloured bar down
+    the left edge of a block reads as a sticky note. It was reintroduced here on the strength
+    of a line in Theme.cs recommending exactly that, so the recommendation is pinned too --
+    a stale one in the single source of truth gets followed again by the next reader."""
+    import re
+    theme = (UI / "Theme.cs").read_text(encoding="utf-8")
+    assert "NO COLOURED LEFT RAILS ON CONTENT BLOCKS" in theme
+    assert "status shown as a thin left rail" not in theme
+
+    for m in re.finditer(r"BorderThickness\s*=\s*new Thickness\(\s*([0-9.]+)\s*,\s*0\s*,\s*0\s*,\s*0\s*\)", SRC):
+        near = SRC[m.start():m.start() + 260]
+        assert "StatusColorFor" not in near,             "a left-only border is being painted a status colour: " + near.splitlines()[0]
+
+
+def test_the_severity_is_carried_by_the_event_name():
+    body = _fn("    Brush KindBrush(string kind)")
     assert '"baseline_mismatch"' in body and '"revoke"' in body
-    assert '"rebless"' in body
+    assert "return Fg;" in body, "a routine re-signing must stay neutral"
+    body2 = _fn("    UIElement BuildAuthority()", END_OF_AUTHORITY)
+    assert "kindTb.Foreground = KindBrush(kind);" in body2
+
+
+def test_records_are_separated_by_a_rule_not_by_a_strip():
+    body = _fn("    UIElement BuildAuthority()", END_OF_AUTHORITY)
+    assert "rec.BorderThickness = new Thickness(0, 0, 0, 1);" in body
 
 
 # ── what leads ──────────────────────────────────────────────────────────────────────

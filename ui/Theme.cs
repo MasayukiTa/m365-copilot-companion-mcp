@@ -6,8 +6,17 @@
 // FleetCockpit.cs / CopilotChat.cs / SelfImproveDashboard.cs and drifted apart.
 //
 // Design target (fleet_ui_redesign_spec.md): a quiet code-work surface -- light/dark warm
-// neutrals, accent reserved for the single primary action, status shown as a thin left rail
-// + small chip (never a full-card fill).
+// neutrals, accent reserved for the single primary action, status shown as a small chip
+// (never a full-card fill).
+//
+// NO COLOURED LEFT RAILS ON CONTENT BLOCKS. The line above used to recommend "a thin left
+// rail + small chip", and that recommendation was read and followed when the self-improvement
+// records were rebuilt; the operator's response was that they have said repeatedly they
+// dislike the look -- a coloured bar down the left edge of a block reads as a sticky note.
+// Corrected here rather than only at the call site, because a stale recommendation in the
+// single source of truth is followed again by whoever reads it next. Put the status colour on
+// the text it describes, or in a small chip. RailW survives for the cockpit's run rows, where
+// it is a gutter marking rows in a dense list rather than a decoration on a block.
 //
 // IMPORTANT: this is compiled by legacy csc (Framework64 v4.0.30319, C# 5). NO expression-
 // bodied members, NO string interpolation, NO null-conditional. Classic method bodies only.
