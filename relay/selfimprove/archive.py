@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 import os
 from typing import Iterable
@@ -152,6 +153,62 @@ def cell_key(desc: dict) -> str:
 _DEFAULT_ARCHIVE = os.path.join(os.path.dirname(__file__), "archive", "entries.jsonl")
 
 
+#: A public benchmark instance id -- SWE-bench and SWE-bench Pro shapes. Defined here rather than
+#: only in the test that checks the published file, so the rule has ONE definition and the write
+#: path and the audit cannot drift apart.
+PUBLIC_BENCH_ID = re.compile(
+    r"^(instance_)?[A-Za-z0-9_.\-]+__[A-Za-z0-9_.\-]+-[0-9a-f]+(-v[0-9a-f]+|-vnan)?$")
+
+
+class NotPublishable(ValueError):
+    """Refused: this entry would put private work into the published archive."""
+
+
+def _refuse_if_unpublishable(path, genome, slice_ids):
+    """Nothing may enter the TRACKED archive that is not a public benchmark record.
+
+    THE DEFAULT PATH IS THE PUBLISHED ONE. Archive() with no argument writes to
+    relay/selfimprove/archive/entries.jsonl, which is tracked in a public repository, and
+    scheduler.nightly() -- reached from its own CLI with no archive_path -- takes that default.
+    So the loop's ordinary operation appends live genomes to a file that is pushed. Today the
+    file holds two benchmark rows and nothing has escaped; the route is simply open.
+
+    A test already audits the published file, but auditing is the wrong moment: it runs after
+    the commit exists, and the first person to learn would be whoever pulled it. This refuses
+    at the write, which is the only point where the alternative (write elsewhere) is still
+    available.
+
+    Two rules, both fail-closed:
+
+      * every slice id must look like a public benchmark instance. This is the rule the audit
+        already applies to slice_ids, moved to where it can prevent rather than report.
+      * card VALUES must be flags, not prose. Cards are named switches today, and .gitignore
+        already predicts that `genome.cards` will hold learned prompt text -- which is the
+        actual leak, since prompt text learned from real work quotes real work. A card whose
+        value is a string is refused here rather than published and noticed later.
+
+    Any other path -- the runtime archive under .fleet, a temp file in a test -- is
+    unrestricted. The restriction is a property of the destination, not of the data.
+    """
+    if os.path.abspath(path) != os.path.abspath(_DEFAULT_ARCHIVE):
+        return
+    bad = [str(s) for s in (slice_ids or []) if not PUBLIC_BENCH_ID.match(str(s))]
+    if bad:
+        raise NotPublishable(
+            "refusing to write %d slice id(s) that are not public benchmark instances into the "
+            "published archive (%s). Pass archive_path= a runtime archive such as "
+            ".fleet/selfimprove/archive.jsonl instead. First: %r"
+            % (len(bad), _DEFAULT_ARCHIVE, bad[0]))
+    cards = (genome or {}).get("cards") or {}
+    if isinstance(cards, dict):
+        prose = sorted(k for k, v in cards.items() if isinstance(v, str))
+        if prose:
+            raise NotPublishable(
+                "refusing to publish genome.cards carrying text rather than flags: %s. Learned "
+                "prompt text quotes the work it was learned from; write it to a runtime archive."
+                % ", ".join(prose))
+
+
 def _metric_of(entry: dict, metric: str) -> float:
     v = entry.get(metric)
     try:
@@ -220,6 +277,8 @@ class Archive:
             # now, and an explicit `ts` still wins for a replayed or backfilled entry.
             "ts": time.time() if ts is None else ts,
         }
+        # Checked BEFORE the file is touched, so a refusal leaves nothing half-written.
+        _refuse_if_unpublishable(self.path, genome, entry["slice_ids"])
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         with open(self.path, "a", encoding="utf-8", newline="\n") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")

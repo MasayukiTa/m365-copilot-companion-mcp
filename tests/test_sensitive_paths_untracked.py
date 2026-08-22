@@ -39,8 +39,12 @@ MUST_BE_IGNORED = (
 #:   SWE-bench Verified : astropy__astropy-13453
 #:   SWE-bench Pro      : instance_NodeBB__NodeBB-<sha>-v<sha|nan>
 #: 業務エピソードの ID はどちらの形にもならないので、これが由来の判別になる。
-PUBLIC_BENCH_ID = re.compile(
-    r"^(instance_)?[A-Za-z0-9_.\-]+__[A-Za-z0-9_.\-]+-[0-9a-f]+(-v[0-9a-f]+|-vnan)?$")
+#:
+#: 定義は archive.py 側に1つだけ置き、ここは import する。ここで別に持っていた頃、
+#: この判定は「公開済みファイルを監査する」ためだけのもので、書き込み経路は何も見て
+#: いなかった。監査はコミットが存在した後に走るので、最初に気づくのは pull した人に
+#: なる。同じ規則で書き込み時に拒否するようにした以上、二重定義は必ずずれる。
+from relay.selfimprove.archive import PUBLIC_BENCH_ID  # noqa: E402
 
 
 def _git(*args):
