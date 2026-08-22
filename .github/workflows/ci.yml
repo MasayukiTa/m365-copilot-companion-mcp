@@ -240,7 +240,28 @@ jobs:
             relay/selfimprove/test_sentinel.py \
             relay/selfimprove/test_status.py \
             relay/selfimprove/test_targeting.py \
-            relay/selfimprove/test_usage.py
+            relay/selfimprove/test_usage.py \
+            relay/selfimprove/test_activation_rollback.py \
+            relay/selfimprove/test_archive_note.py \
+            relay/selfimprove/test_branch_stage0.py \
+            relay/selfimprove/test_branches.py \
+            relay/selfimprove/test_compare.py \
+            relay/selfimprove/test_dashboard_branches.py \
+            relay/selfimprove/test_dashboard_superseded.py \
+            relay/selfimprove/test_fable_remainder.py \
+            relay/selfimprove/test_fallback_rule.py \
+            relay/selfimprove/test_planner_evaluator.py \
+            relay/selfimprove/test_route_campaign_wiring.py \
+            relay/test_agent_profiles_research_reason.py \
+            relay/test_fleet_lock_evidence.py \
+            relay/test_refuter_socket.py \
+            scripts/test_workload_multiturn.py \
+            tools/test_lock_state_matching_records.py \
+            tools/test_memory_ops_local.py \
+            tools/test_notify_ops_dashboard_guard.py \
+            tools/test_notify_ops_newlines.py \
+            ui/test_fleet_cockpit_authority_window.py \
+            ui/test_selfimprove_dashboard_reading.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py
