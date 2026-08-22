@@ -71,12 +71,25 @@ gave, but every arm sits at or beside 1.00 turns per goal, so a candidate has no
 an improvement and only harm remains detectable. The same ceiling as before, reached by a
 shorter route.
 
-MEMORY: the first of these two runs came back 5.3 MB apart and that looked like a tenfold
-improvement on the 130-180 MB the 111-goal set gives. The mirrored run came back 196.8 MB
-apart. The 5.3 was luck, this set is NO QUIETER than the one it replaced, and a floor adopted
-from the first run alone would have turned ordinary noise into a finding. In both runs the
-arm that ran SECOND carried the higher peak, which is the residue `start_mb` was added to
-handle and evidently does not.
+MEMORY: the first of these two runs came back 5.3 MB apart, the mirrored one 196.8 MB apart.
+The 5.3 was luck, and a floor adopted from the first run alone would have turned ordinary
+noise into a finding.
+
+    TWO CORRECTIONS TO WHAT WAS WRITTEN HERE FIRST. Both sets run FOUR goals; the 111 above is
+    the number of goal ROWS logged across the whole history, not the size of a campaign, and
+    calling the old one "the 111-goal set" was wrong. And the 130-180 MB it was compared
+    against comes from nulls taken BEFORE per-arm memory isolation. Every run with the current
+    instrument, listed by date:
+
+        saturated set, null      +50.8 MB      -1.3 MB
+        this set, null            -5.3 MB    +196.8 MB
+
+    So the current instrument's spread on the OLD set is about 50 MB, not 130-180, and this
+    set is the noisier of the two. The 300 MB floor in `route_evaluator` rests on the
+    pre-isolation pair and has not been re-derived since the isolation landed.
+
+In both of this set's runs the arm that ran SECOND carried the higher peak, which is the
+residue `start_mb` was added to handle and evidently does not.
 
 WHAT THIS SET IS AND IS NOT GOOD FOR. It is a correctness workload: the answers are known, the
 checks are exact, and a wrong answer is recorded as a failure instead of a completion. It is
