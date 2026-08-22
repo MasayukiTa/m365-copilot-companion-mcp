@@ -33,7 +33,7 @@ def test_detection_asks_the_server_record_not_the_agent_wording():
     # itself -- a context-less refusal is always somebody else's. The property this test
     # protects is that detection reads the record and not the agent's prose; the call it
     # pinned by name has moved.
-    assert "lock_state.matching_record(sent_at)" in body
+    assert "lock_state.matching_records(sent_at)" in body
     assert "locked client ip" not in body.lower()
 
 
@@ -138,4 +138,30 @@ def test_an_old_refusal_still_does_not_count(tmp_path, monkeypatch):
     LS.record_locked("203.0.113.7", "[locked client IP: ...] ...", ts=50.0)
     import time as _t
     monkeypatch.setattr(_t, "time", lambda: 101.0)
+    assert B._bridge_should_auto_unlock(99.0) is False
+
+
+def test_a_real_refusal_hidden_behind_a_later_context_less_one_still_triggers(tmp_path, monkeypatch):
+    """複数レコードで初めて表に出る向き。スロットは1件しか持たないので、
+    本物の拒否の後にコンテキスト無しの拒否が来ると本物が消え、
+    実際にはロックされているターンを「ロックされていない」と判定していた。"""
+    import bridge.copilot_bridge as B
+    LS = _lock_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(B, "_BRIDGE_UNLOCK_ATTEMPTS", 0, raising=False)
+    LS.record_locked("203.0.113.7", "[locked client IP: '203.0.113.7'] ...", ts=100.0)
+    LS.record_locked("", B.NO_CONTEXT_REFUSAL + " Denied ...", ts=101.0)
+    import time as _t
+    monkeypatch.setattr(_t, "time", lambda: 102.0)
+    assert B._bridge_should_auto_unlock(99.0) is True
+
+
+def test_only_context_less_refusals_still_do_not_trigger(tmp_path, monkeypatch):
+    """フィルタを「拒否が1件でもあれば」に緩めてはいけない。それが元の欠陥だった。"""
+    import bridge.copilot_bridge as B
+    LS = _lock_tmp(tmp_path, monkeypatch)
+    monkeypatch.setattr(B, "_BRIDGE_UNLOCK_ATTEMPTS", 0, raising=False)
+    LS.record_locked("", B.NO_CONTEXT_REFUSAL + " a", ts=100.0)
+    LS.record_locked("", B.NO_CONTEXT_REFUSAL + " b", ts=101.0)
+    import time as _t
+    monkeypatch.setattr(_t, "time", lambda: 102.0)
     assert B._bridge_should_auto_unlock(99.0) is False

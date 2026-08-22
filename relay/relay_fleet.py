@@ -341,8 +341,8 @@ def _looks_locked(resp: str, since: float = 0.0) -> bool:
         return False
     try:
         from tools import lock_state
-        record = lock_state.matching_record(since)
-        if not record:
+        records = lock_state.matching_records(since)
+        if not records:
             return False
         # A CONTEXT-LESS REFUSAL IS NOT EVIDENCE ABOUT THIS WORKER, and the test for one is the
         # server's own prefix rather than a blank client_ip.
@@ -358,9 +358,17 @@ def _looks_locked(resp: str, since: float = 0.0) -> bool:
         # the no-context branch emits it; a genuine remote refusal says "[locked client IP: ..."
         # even when that IP is blank, and is treated as possibly this worker's -- which fails
         # towards the bounded, visible unlock/STUCK path rather than towards a silent one.
-        if str(record.get("detail") or "").startswith(NO_CONTEXT_REFUSAL):
+        #
+        # ASKED OF EVERY REFUSAL IN THE WINDOW, not of one. The slot this used to read holds a
+        # single record, so a context-less refusal landing after a genuine one hid the genuine
+        # one and this branch answered "not locked" while a real lock stood.
+        mine = [r for r in records
+                if not str(r.get("detail") or "").startswith(NO_CONTEXT_REFUSAL)]
+        if not mine:
             return False
-        _note_locked("fallback", resp, since, record)
+        # Name the record actually decided on, not merely the last one to arrive. The note is
+        # the only way to check afterwards whether a classification had evidence behind it.
+        _note_locked("fallback", resp, since, mine[-1])
         return True
     except Exception:
         return False

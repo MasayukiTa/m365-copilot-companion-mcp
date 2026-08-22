@@ -137,16 +137,91 @@ def clear() -> None:
         pass
 
 
-def matching_record(since: float, now: Optional[float] = None) -> dict:
-    """The refusal `locked_since` would match, or {} when there is none.
+#: How far back from the end of the refusal log to read. Refusals are rare and every reader
+#: scopes to its own turn, so a window is enough -- and it keeps the cost of reading independent
+#: of how large the log has grown. Sized well above any plausible burst inside one turn.
+_LOG_TAIL_BYTES = 65536
 
-    Exists so a caller can say WHICH record it acted on. `locked_since` answers yes or no, and
-    a yes that cannot name its evidence is what made one worker's refusal look like every
-    worker's lock for a whole run.
+
+def matching_records(since: float, now: Optional[float] = None) -> list:
+    """Every refusal recorded at or after `since` and still fresh. Oldest first.
+
+    READS THE APPEND-ONLY LOG, NOT THE SLOT, because the slot holds exactly one record and a
+    reader asking "which refusal was mine" against a one-deep slot gets whichever refusal
+    landed last. That shadowing has produced three separate incidents already, all of them
+    fixed on the symptom side: one worker's refusal reading as every worker's lock, a 533-char
+    meeting summary classified as a lock, and a blank-ip refusal a remote caller could forge.
+    The slot itself was never the evidence it was being used as.
+
+    It also fixes the unmeasured direction of the same fault. A context-less refusal arriving
+    after a genuine one overwrites the slot, and a reader that filters context-less refusals
+    then concludes "not locked" while a real lock is standing.
+
+    The slot stays: `read_state`, `clear` and the CLI still use it to show the last refusal.
+    It is no longer asked to answer a question it cannot answer.
     """
-    if not locked_since(since, now):
-        return {}
-    return read_state()
+    try:
+        boundary = float(since)
+    except (TypeError, ValueError):
+        return []
+    if boundary <= 0.0:
+        return []
+    current = float(now if now is not None else time.time())
+
+    try:
+        with open(_LOG_FILE, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - _LOG_TAIL_BYTES))
+            blob = fh.read()
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+
+    # The window usually starts mid-record. Dropping the first line to compensate is worse
+    # than useless: a torn line is not valid JSON and the parse below already rejects it, and
+    # when the cut happens to land exactly on a line boundary that drop discards a real
+    # refusal. Let the parse decide.
+    lines = blob.decode("utf-8", "replace").split(chr(10))
+
+    out = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            # Several processes append here, so the tail can hold a half-written line.
+            continue
+        if not isinstance(rec, dict):
+            continue
+        # The same file carries `classified_locked` rows written by the readers themselves.
+        # Counting those would let a reader's own note read back as fresh evidence.
+        if rec.get("event") != "refused":
+            continue
+        try:
+            ts = float(rec.get("ts") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if ts < boundary:
+            continue
+        if (current - ts) > DEFAULT_FRESH_SEC:
+            continue
+        out.append(rec)
+    return out
+
+
+def matching_record(since: float, now: Optional[float] = None) -> dict:
+    """The most recent refusal `locked_since` would match, or {} when there is none.
+
+    Kept for callers that only want to name one record (the CLI, diagnostics). A caller
+    DECIDING whether it is locked wants `matching_records`: one record cannot tell it whether
+    some other refusal in the same window was about it.
+    """
+    records = matching_records(since, now)
+    return records[-1] if records else {}
 
 
 def record_classification(branch: str, *, resp_len: int, since: float,

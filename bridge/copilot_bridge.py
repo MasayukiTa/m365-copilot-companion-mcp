@@ -4433,8 +4433,8 @@ def _bridge_should_auto_unlock(sent_at):
         return False
     try:
         from tools import lock_state
-        record = lock_state.matching_record(sent_at)
-        if not record:
+        records = lock_state.matching_records(sent_at)
+        if not records:
             return False
         # THE SAME FILTER THE FLEET USES, for the same reason. A refusal carrying this prefix
         # came from a caller with no HTTP request context -- something in-process, never this
@@ -4442,7 +4442,9 @@ def _bridge_should_auto_unlock(sent_at):
         # such refusals per turn, and a reader that only asked "was anything refused" injected
         # unlock into turns that were never locked. Asking the question without asking whose
         # answer it is was the whole defect, and it lived in two readers.
-        if str(record.get("detail") or "").startswith(NO_CONTEXT_REFUSAL):
+        # Every refusal in the window, not the last one: see matching_records.
+        if not any(not str(r.get("detail") or "").startswith(NO_CONTEXT_REFUSAL)
+                   for r in records):
             return False
         return True
     except Exception:
