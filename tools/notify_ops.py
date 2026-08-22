@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -45,6 +46,54 @@ def notify_approval_gate(title: str, body: str, gate_path: str | Path) -> str:
 COCKPIT = Path(__file__).resolve().parents[1] / "ui" / "FleetCockpit.exe"
 
 
+#: When a dashboard was last opened from here, and how long before another may be.
+#:
+#: A NOTIFICATION MUST NOT BE ABLE TO SPAWN AN UNBOUNDED NUMBER OF WINDOWS.
+#:
+#: This opened one per notified event, with no cooldown and no check for a window already up.
+#: Forty-two notifiable acts landed in one day -- twenty-three re-signings and nineteen
+#: mismatches -- and the machine spent the afternoon opening forty-two copies of a WPF window
+#: until Claude was killed and then the PC went down. Neither half was fatal alone: the acts
+#: were too many, and a per-event window launcher survives only a workload that never bursts.
+#:
+#: The fix is here rather than at the caller because it is this function's promise that was
+#: wrong. Every caller, present and future, gets the bound.
+_DASHBOARD_LAST = [0.0]
+DASHBOARD_COOLDOWN_S = 300.0
+
+
+def cockpit_running() -> bool:
+    """True iff a cockpit process is up. Split out so a test can answer it without a machine.
+
+    Kept separate because the two halves of the guard fail differently and have to be testable
+    apart: the cooldown is arithmetic, this reads the world. A test of the cooldown that also
+    consults the real process list passes or fails on whether the operator happens to have the
+    dashboard open, which is not what it is asking.
+    """
+    try:
+        import psutil
+        want = COCKPIT.name.lower()
+        return any((p.info.get("name") or "").lower() == want
+                   for p in psutil.process_iter(["name"]))
+    except Exception:
+        return False
+
+
+def _dashboard_already_up() -> str:
+    """Why another dashboard must not be opened right now, or "" if one may be.
+
+    Two independent reasons, because either alone leaks. A cooldown does not notice a window
+    the operator left open from yesterday; a running-process check does not stop a burst that
+    all fires before the first process appears in the list.
+    """
+    now = time.time()
+    if now - _DASHBOARD_LAST[0] < DASHBOARD_COOLDOWN_S:
+        return "opened %.0fs ago" % (now - _DASHBOARD_LAST[0])
+    if cockpit_running():
+        return "already running"
+    return ""
+
+
 def open_authority_dashboard() -> str:
     """Open the self-improvement dashboard's Authority view. Returns "" when it cannot.
 
@@ -62,8 +111,12 @@ def open_authority_dashboard() -> str:
         cockpit = COCKPIT
         if not cockpit.is_file():
             return ""
+        blocked = _dashboard_already_up()
+        if blocked:
+            return ""
         subprocess.Popen([str(cockpit), "--authority"],
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        _DASHBOARD_LAST[0] = time.time()
         return str(cockpit)
     except Exception:
         return ""

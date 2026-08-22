@@ -11,6 +11,8 @@ import base64
 import json
 import re
 
+import pytest
+
 import tools.notify_ops as N
 
 #: THE REAL FUNCTION, taken at import time. conftest.py autouse-stubs notify_desktop for every
@@ -137,3 +139,103 @@ def test_a_launch_that_fails_is_not_fatal(monkeypatch, tmp_path):
 
     monkeypatch.setattr(N.subprocess, "Popen", boom)
     assert N.open_authority_dashboard() == ""
+
+
+@pytest.fixture(autouse=True)
+def _no_real_desktop_state(monkeypatch):
+    """このファイルのテストは、この端末で何が走っているかについてのものではない。
+
+    `open_authority_dashboard` が「既に窓が開いていれば開かない」を見るようになった時点で、
+    実機に FleetCockpit.exe が走っていると既存テストまで落ちる -- 実際、再起動後に2つ
+    走っていて2件落ちた。世界に触る前提条件は、世界についてでないテストではスタブする。
+    ここを見るテストは自分で上書きする。
+    """
+    from tools import notify_ops as _N
+    _N._DASHBOARD_LAST[0] = 0.0
+    monkeypatch.setattr(_N, "_dashboard_already_up", lambda: "")
+
+
+# ---- 通知がウィンドウを無制限に生めないこと --------------------------------------------------------
+
+#: The real guard, captured at import time before any fixture stubs it out. The tests that
+#: ARE about the guard put it back; the rest run without the machine's actual process list.
+_REAL_GUARD = N._dashboard_already_up
+
+
+def _fake_cockpit(tmp_path, monkeypatch):
+    exe = tmp_path / "FleetCockpit.exe"
+    exe.write_text("", encoding="utf-8")
+    from tools import notify_ops as N
+    monkeypatch.setattr(N, "COCKPIT", exe)
+    opened = []
+    monkeypatch.setattr(N.subprocess, "Popen",
+                        lambda *a, **k: opened.append(a) or type("P", (), {})())
+    N._DASHBOARD_LAST[0] = 0.0
+    return N, opened
+
+
+def test_a_burst_of_events_opens_one_window(tmp_path, monkeypatch):
+    """通知1件ごとに1枚開き、冷却も既存窓の確認も無かった。
+    通知対象の行為が1日に42件着地し(再署名23・不一致19)、
+    マシンは午後じゅう WPF の窓を42枚開き続け、
+    Claude が落ち、最後に PC ごと落ちた。
+
+    どちらの半分も単独では致命ではない -- 行為が多すぎたことと、
+    バーストしない負荷でしか生き延びない起動器と。"""
+    N, opened = _fake_cockpit(tmp_path, monkeypatch)
+    # 本物のガードを戻し、プロセス確認だけ黙らせる -- 冷却の側を試験したいので。
+    monkeypatch.setattr(N, "_dashboard_already_up", _REAL_GUARD)
+    monkeypatch.setattr(N, "cockpit_running", lambda: False)
+    for _ in range(42):
+        N.open_authority_dashboard()
+    assert len(opened) == 1, len(opened)
+
+
+def test_the_cooldown_alone_stops_a_burst(tmp_path, monkeypatch):
+    """走っているプロセスの確認だけでは、最初の1つが一覧に出る前に
+    全部発火するバーストを止められない。"""
+    N, opened = _fake_cockpit(tmp_path, monkeypatch)
+    monkeypatch.setattr(N, "_dashboard_already_up", _REAL_GUARD)
+    monkeypatch.setattr(N, "cockpit_running", lambda: False)
+    for _ in range(10):
+        N.open_authority_dashboard()
+    assert len(opened) == 1
+
+
+def test_a_window_left_open_from_yesterday_is_noticed(tmp_path, monkeypatch):
+    """冷却だけでは、昨日から開きっぱなしの窓に気づけない。"""
+    N, opened = _fake_cockpit(tmp_path, monkeypatch)
+    N._DASHBOARD_LAST[0] = 0.0
+    monkeypatch.setattr(N, "_dashboard_already_up", lambda: "already running")
+    assert N.open_authority_dashboard() == ""
+    assert opened == []
+
+
+def test_the_first_notification_still_opens_the_control(tmp_path, monkeypatch):
+    """上限を足したせいで、運用者を制御画面に連れて行く本来の目的まで
+    潰していないこと。"""
+    N, opened = _fake_cockpit(tmp_path, monkeypatch)
+    monkeypatch.setattr(N, "_dashboard_already_up", lambda: "")
+    assert N.open_authority_dashboard() != ""
+    assert len(opened) == 1
+
+
+def test_a_running_cockpit_is_seen_without_the_cooldown(tmp_path, monkeypatch):
+    """冷却が切れていても、開いている窓があればもう1枚開かない。"""
+    N, opened = _fake_cockpit(tmp_path, monkeypatch)
+    monkeypatch.setattr(N, "_dashboard_already_up", _REAL_GUARD)
+    monkeypatch.setattr(N, "cockpit_running", lambda: True)
+    N._DASHBOARD_LAST[0] = 0.0
+    assert N.open_authority_dashboard() == ""
+    assert opened == []
+
+
+def test_the_two_halves_are_testable_apart():
+    """冷却は算術、プロセス確認は世界を読む。混ぜると、冷却のテストが
+    『運用者がダッシュボードを開いているか』で通ったり落ちたりする --
+    実際そうなって2件落ちた。"""
+    # autouse フィクスチャがラムダに差し替えているので、本物を見る。
+    import inspect
+    src = inspect.getsource(_REAL_GUARD)
+    assert "cockpit_running()" in src
+    assert "psutil" not in src
