@@ -71,18 +71,37 @@ MIN_FREE_MB = 512.0
 #: total-RSS sampler, which later turned out to be measuring which arm ran first. A threshold
 #: calibrated against an instrument that was reading the wrong quantity is not calibrated.
 #:
-#: What it now rests on is a null experiment: the same comparison run with BOTH arms set to the
+#: What it rests on is a null experiment: the same comparison run with BOTH arms set to the
 #: control, so the two arms are the same program and every difference reported is the
-#: instrument's own spread. Two null runs, in both arm orders:
+#: instrument's own spread.
 #:
-#:     null, control first      291.7 MB vs 471.5 MB     reported "gain" -179.8 MB
-#:     null, candidate first    237.3 MB vs 107.0 MB     reported "gain" -130.3 MB
+#: THE DERIVATION RECORDED HERE FIRST WAS ITSELF FROM THE WRONG INSTRUMENT, and a reader acted
+#: on it. It cited two nulls landing 130-180 MB apart; both were run BEFORE the arms stopped
+#: sharing a memory store, so they measured a spread that channel was contributing to. On
+#: 2026-08-23 that stale figure was read as evidence the floor was far too high, on the
+#: strength of four current-instrument runs that happened to look tight. It was not.
 #:
-#: So identical arms land 130-180 MB apart, and 300 sits above that. The number is unchanged --
-#: which matters, because the two treatment runs measured +94.9 MB and -11.5 MB, and a
-#: threshold moved after seeing those would have been the ruler being cut to fit the object.
-#: The honest reading of those runs is that the effect, if any, is SMALLER than the noise: this
-#: design lacks the power to detect it, and no threshold can repair that.
+#: TWELVE RUNS, CURRENT INSTRUMENT, INTERLEAVED SO A DRIFT OVERNIGHT COULD NOT LINE UP WITH A
+#: CONDITION, on a goal set with the 8.3 short path removed (which had cost one arm 33 minutes
+#: on a single turn):
+#:
+#:     null, socket vs socket    -89.1  -40.9  -30.7  +61.5
+#:     null, tabs vs tabs        -46.8  +22.2  +114.3  +184.2
+#:     treatment, tabs vs socket -126.8  +34.4  +180.4  +252.4
+#:
+#: Identical arms land up to 273 MB apart and a single null pair reached +184 MB, so 300 is
+#: about right and is NOT too high. The treatment mean sits 63.3 MB above the null mean, an
+#: exact permutation test gives p=0.21 against a floor of 0.002 for these counts, and the
+#: pooled SD is 119 MB: detecting an effect that size at 80% power needs roughly 55 runs per
+#: group, about 111 runs and 17 hours. The effect, if any, is SMALLER than the noise; this
+#: design lacks the power to detect it and no threshold repairs that.
+#:
+#: TWO EARLIER READINGS OF THIS SAME QUESTION DID NOT SURVIVE. A null taken only under the
+#: socket condition gave a complete separation at p=0.0143; adding tabs-vs-tabs nulls dropped
+#: it to p=0.0238; removing the short path from the goal set took it to p=0.21. Each step made
+#: the ruler more honest and the finding smaller. `run_archive` holds the runs and the rule for
+#: which of them may be put in one column, so this does not have to be reconstructed by hand
+#: again -- doing it by hand is what produced both wrong readings.
 MIN_MEMORY_GAIN_MB = 300.0
 
 
