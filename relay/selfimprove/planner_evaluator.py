@@ -158,9 +158,22 @@ def turns_per_goal(arm) -> float | None:
     the sent count then reports a smaller average for a reason that has nothing to do with the
     harness: four turns over four goals is 1.0, and the same four turns over three logged goals
     is 1.33, and only one of those is a statement about how the harness works.
+
+    NOTHING LOGGED IS NOT ZERO TURNS. The first version fell back to `goals` when
+    `logged_goals` was 0, and an arm that recorded nothing at all became "0 turns over 4
+    goals = 0.0 turns per goal" -- a fabricated measurement, produced by the very change whose
+    comment was about dividing by what was counted. It cost a real run: the control arm logged
+    nothing, the judge read 0.0 against the candidate's 1.0, and reported a difference of
+    -1.00 that no measurement supports.
+
+    An arm with no rows returns None, and the caller has to decide what to do about that
+    rather than being handed a number.
     """
     arm = arm or {}
-    counted = int(arm.get("logged_goals") or 0) or int(arm.get("goals", 0) or 0)
+    if "logged_goals" in arm:
+        counted = int(arm.get("logged_goals") or 0)
+    else:
+        counted = int(arm.get("goals", 0) or 0)
     if counted <= 0:
         return None
     return float(arm.get("turns", 0) or 0) / counted
@@ -204,7 +217,20 @@ def decide(control, candidate, *, min_gain=None) -> dict:
         return {"verdict": "keep", "turns_gain": round(gain, 3),
                 "why": "completion held at %d and turns per goal fell by %.2f (floor %.2f)."
                        % (done_p, gain, floor)}
+    # A LARGE NEGATIVE GAIN IS A FINDING, NOT A SHRUG.
+    #
+    # The first version merged this with the null case and told the operator the number was
+    # "under the floor" -- of -1.00 against a floor of 0.75, which is 1.33 times it in the
+    # other direction. Detecting that the candidate costs a full extra turn per goal is
+    # exactly what this instrument was built for, and reporting it as "we could not tell"
+    # throws away the one clear result the day produced. The same wording sat in the route
+    # evaluator and had already misdescribed a -666 MB run as inconclusive.
+    if gain <= -floor:
+        return {"verdict": "reject", "turns_gain": round(gain, 3),
+                "why": "completion held at %d and turns per goal ROSE by %.2f, past the %.2f "
+                       "this instrument can distinguish from noise. That is a measured cost, "
+                       "not an absence of evidence." % (done_p, -gain, floor)}
     return {"verdict": "inconclusive", "turns_gain": round(gain, 3),
-            "why": "completion held at %d but turns per goal moved only %.2f, under the %.2f "
-                   "this instrument can distinguish from noise. That is not a finding that "
-                   "either harness is worse." % (done_p, gain, floor)}
+            "why": "completion held at %d and turns per goal moved %.2f, inside the %.2f this "
+                   "instrument can distinguish from noise. That is not a finding that either "
+                   "harness is worse." % (done_p, gain, floor)}

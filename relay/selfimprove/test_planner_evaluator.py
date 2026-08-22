@@ -283,3 +283,60 @@ def test_a_planner_candidate_selects_the_turns_judge():
     base = M.base_manifest()
     cand = M.apply_genome(base, {"components": {"planner": "planner/v2"}})
     assert C.instrument_for_pair(cand, base) is PE
+
+
+# ---- 大きく負の差は「分からなかった」ではない -----------------------------------------------------
+
+def test_a_candidate_that_costs_a_full_turn_is_rejected_not_shrugged_at():
+    """最初の版は帰無の場合と混ぜ、-1.00 を『閾値0.75未満』と書いた -- 逆向きに1.33倍。
+    候補が1ゴールあたり丸1ターン余計に使うと検出することが、
+    この計器を作った理由そのもの。それを『分からなかった』として捨てていた。"""
+    a = lambda t: {"turns": t, "goals": 4, "logged_goals": 4, "done": 4}
+    got = PE.decide(a(4), a(8))
+    assert got["verdict"] == "reject"
+    assert "ROSE by 1.00" in got["why"]
+    assert "measured cost, not an absence of evidence" in got["why"]
+
+
+def test_the_null_region_says_inside_rather_than_under():
+    """『under the floor』は符号のある数に対して嘘になる。"""
+    a = lambda t: {"turns": t, "goals": 4, "logged_goals": 4, "done": 4}
+    got = PE.decide(a(4), a(5))
+    assert got["verdict"] == "inconclusive"
+    assert "inside the" in got["why"] and "under the" not in got["why"]
+
+
+def test_the_memory_judge_has_the_same_three_regions():
+    """同じ文言が route_evaluator にもあり、今日の -666 MB の走行を
+    inconclusive と誤報していた。読んだ私もそのまま通した。"""
+    from relay.selfimprove import route_evaluator as RV
+    a = lambda p: {"done": 4, "goals": 4, "peak_mb": p}
+    assert RV.decide(a(600), a(200))["verdict"] == "keep"
+    assert RV.decide(a(200), a(866))["verdict"] == "reject"
+    assert RV.decide(a(400), a(500))["verdict"] == "inconclusive"
+
+
+# ---- 記録されなかった腕を数字に変えないこと --------------------------------------------------------
+
+def test_an_arm_that_logged_nothing_is_not_zero_turns():
+    """`or goals` のフォールバックが『0ターン÷4ゴール=0.0』という
+    存在しない測定値を作り、そこから -1.00 が出た --
+    『数えた分で割る』という注意を書いた、その変更自身が。"""
+    assert PE.turns_per_goal({"turns": 0, "goals": 4, "logged_goals": 0}) is None
+    got = PE.decide({"turns": 0, "goals": 4, "logged_goals": 0, "done": 4},
+                    {"turns": 4, "goals": 4, "logged_goals": 4, "done": 4})
+    assert got.get("aborted") is True
+    assert got["verdict"] == "inconclusive"
+
+
+def test_a_row_without_logged_goals_still_divides_by_goals():
+    """logged_goals を持たない古い行やテストは、これまで通り goals で割る。"""
+    assert PE.turns_per_goal({"turns": 4, "goals": 4}) == 1.0
+
+
+def test_the_nightly_path_enables_the_route_on_both_arms():
+    """対照腕がタブだと worker_done が書かれず、turns 計器は何も数えられない。
+    最初の planner 走行がまさにそれで、捏造された 0.0 を判定に渡した。"""
+    import io as _io
+    src = _io.open("scripts/run_nightly_real.py", encoding="utf-8").read()
+    assert "control_socket=True" in src

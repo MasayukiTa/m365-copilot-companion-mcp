@@ -58,9 +58,17 @@ def main():
     # Arm order alternates between nightly runs so the pair forms a crossover: whatever the
     # position of an arm costs, it costs each treatment once across the pair.
     candidate_first = "--candidate-first" in sys.argv
+    # BOTH ARMS ON THE ROUTE, ALWAYS.
+    #
+    # `worker_done` rows -- where the turns instrument reads its observable -- are written only
+    # while the socket route is enabled. With the control arm on tabs it logs nothing, and the
+    # first planner run did exactly that: the control recorded zero rows, the judge was handed
+    # a fabricated 0.0 turns per goal against the candidate's 1.0, and reported a difference of
+    # -1.00 that no measurement supports. Holding the transport fixed across both arms costs
+    # nothing here, because transport is not what this comparison is about.
     evaluate = S.route_evaluator_for(
         GOALS, agent_url=agent_url, max_concurrent=2, warmup=True,
-        candidate_first=candidate_first,
+        candidate_first=candidate_first, control_socket=True,
         transcript_dir=os.path.join(RESULTS, "tx", "nightly-%d" % stamp))
 
     reasons = S.preconditions(budget_candidates=1, activate=False)

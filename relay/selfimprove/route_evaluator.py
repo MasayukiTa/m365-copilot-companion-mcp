@@ -254,9 +254,19 @@ def decide(control, candidate, *, min_gain_mb=MIN_MEMORY_GAIN_MB) -> dict:
                 "task_fallback_rate": route.get("task_rate"),
                 "why": "completion held at %d and peak memory fell by %.0f MB (floor %.0f)."
                        "%s" % (done_p, gain, min_gain_mb, note)}
+    # A LARGE NEGATIVE GAIN IS A FINDING. It was folded into the null case, and the sentence
+    # then claimed the number was "under the floor" -- of -666 MB against a floor of 300, which
+    # is more than twice it in the other direction. That run was read as inconclusive and moved
+    # past. Detecting that the candidate costs memory is what this instrument is for.
+    if gain <= -min_gain_mb:
+        return {"verdict": "reject", "memory_gain_mb": round(gain, 1),
+                "task_fallback_rate": route.get("task_rate"),
+                "why": "completion held at %d and peak memory ROSE by %.0f MB, past the %.0f MB "
+                       "this run can distinguish from noise. That is a measured cost, not an "
+                       "absence of evidence.%s" % (done_p, -gain, min_gain_mb, note)}
     return {"verdict": "inconclusive", "memory_gain_mb": round(gain, 1),
             "task_fallback_rate": route.get("task_rate"),
-            "why": "completion held at %d but peak memory moved only %.0f MB, under the "
+            "why": "completion held at %d and peak memory moved %.0f MB, inside the "
                    "%.0f MB this run can distinguish from noise. That is not a finding that "
                    "the route is worse.%s" % (done_p, gain, min_gain_mb, note)}
 
