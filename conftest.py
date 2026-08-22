@@ -124,6 +124,17 @@ _os.environ.setdefault(
                   % _os.getpid()))
 
 
+# And the PROJECT MEMORY store, which is the third production record a test run was found
+# writing into. `.fleet/memory/*.md` is what the fleet primes into every goal, so a test that
+# writes there does not merely add noise -- it changes what the next REAL run is told about its
+# own past. Found by looking: five themes named g0..g4 sat in the operator's store minutes old,
+# alongside 62 real ones, and five more whose theme name was the memory HEADER itself, because
+# a primed body was recorded as if it were a fresh goal.
+_os.environ.setdefault(
+    "FLEET_STATE_DIR",
+    _os.path.join(_tempfile.gettempdir(), "fleet_state_pytest_%d" % _os.getpid()))
+
+
 @pytest.fixture(autouse=True)
 def _no_leftover_kill_switch():
     """And clear it around every test, so one test cannot abort the next.

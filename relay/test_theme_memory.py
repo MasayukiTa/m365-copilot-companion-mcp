@@ -169,3 +169,30 @@ def test_the_dashboard_is_refreshed_without_opening_the_ui():
     fn = FLEET_SRC[FLEET_SRC.index("def _refresh_selfimprove_dashboard"):]
     assert "write_json" in fn
     assert re.search(r"except Exception:\s*\n\s*pass", fn), "失敗が走行に波及しうる"
+
+
+def test_the_memory_store_is_redirected_away_from_the_operators_own():
+    """`.fleet/memory/*.md` はフリートが毎ゴールに前置するもの。
+    テストがそこへ書くのは雑音を足すのではなく、
+    **次の実走行が自分の過去について何を聞かされるか**を変える。
+
+    見つけ方は目視: 運用者のストアに g0..g4 が数分前の日付で並び、
+    実業務の62テーマと同居していた。さらに5件はテーマ名が
+    記憶ヘッダーそのもので、前置された本文が新しいゴールとして
+    記録されていた -- 記憶が自分を食っている。"""
+    import io as _io
+    src = _io.open("conftest.py", encoding="utf-8").read()
+    assert "FLEET_STATE_DIR" in src
+    i = src.index('"FLEET_STATE_DIR"')
+    block = src[max(0, i - 900):i]
+    assert "third production record" in block
+
+
+def test_a_primed_body_is_not_recorded_as_a_fresh_goal():
+    """記憶ヘッダーがテーマ名になった5件は、前置済みの本文を
+    そのままゴールとして記録した結果。`_with_theme_memory` が
+    self.goal ではなく送信本文にだけ効く、という不変条件が要る理由。"""
+    from relay.relay_fleet import _MEMORY_HEADER, _with_theme_memory
+    primed = _MEMORY_HEADER + "\n過去のメモ\n--- メモここまで ---\n\n本当のゴール"
+    # すでにヘッダーを含む本文は二度と前置されない
+    assert _with_theme_memory(primed) == primed
