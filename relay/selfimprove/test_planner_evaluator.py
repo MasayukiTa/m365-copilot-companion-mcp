@@ -340,3 +340,42 @@ def test_the_nightly_path_enables_the_route_on_both_arms():
     import io as _io
     src = _io.open("scripts/run_nightly_real.py", encoding="utf-8").read()
     assert "control_socket=True" in src
+
+
+# ---- 予測した機序が起きなかったことを、書き残すこと -------------------------------------------------
+
+def test_the_failed_mechanism_prediction_is_recorded_not_quietly_dropped():
+    """turns を planner に向けた論拠は『先に計画する版は計画に1ターン使う』だった。
+    測ると使っていない -- 開始本文が257文字長いだけで、同じ最初のターンの中で
+    計画して進む。両腕とも4ゴール4ターン、差はちょうど 0.00。
+
+    route_evaluator の MEASURES には『機序で説明できないものは、帰無走行が
+    そう言うまで範囲に入れるな』と自分で書いた。その規則を1ファイル隣で破った。"""
+    # 改行で語が割れるので空白を潰してから照合する。行の折り方が変わるだけで
+    # 落ちる検査は、次の人に assert を消させる。
+    import re
+    src = re.sub(r"\s+", " ", inspect.getsource(PE))
+    assert "THE MECHANISM I PREDICTED DID NOT HAPPEN" in src
+    assert "0.00 turns per goal" in src
+    assert "I wrote that rule and then broke it here" in src
+
+
+def test_the_claim_is_downgraded_rather_than_left_standing():
+    """1座標について常にゼロしか報告したことのない計器は、
+    ゼロ以外を報告できることを示していない。"""
+    import re
+    src = re.sub(r"\s+", " ", inspect.getsource(PE)).lower()
+    assert "not yet a demonstration" in src
+    assert "planner" in PE.MEASURES
+
+
+def test_the_record_carries_the_number_the_verdict_quotes():
+    """最初の planner 行は turns_gain=None を、0.00 を引用する判定の隣に載せた --
+    横の文章を再現できない durable record。"""
+    import inspect as _i
+    from relay.selfimprove import scheduler as S
+    src = _i.getsource(S.route_evaluator_for)
+    i = src.rindex('"actual_effect": {')
+    block = src[i:i + 700]
+    assert '"turns_gain": _turns_gain(control, candidate)' in block
+    assert '"instrument": judge.__name__' in block

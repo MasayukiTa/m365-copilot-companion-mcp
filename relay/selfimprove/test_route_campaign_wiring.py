@@ -361,8 +361,10 @@ def test_the_measurements_reach_the_field_the_ledger_reads():
     src = inspect.getsource(S.route_evaluator_for)
     assert '"actual_effect"' in src
     # rindex: 最初の一致は abort 分岐のもの。判定分岐のほうを見る。
+    # 固定幅の窓はコメントが増えるだけで検査が落ちる -- 実際そうなった。
+    # 辞書の終わりまでを見る。
     i = src.rindex('"actual_effect": {')
-    block = src[i:i + 700]
+    block = src[i:src.index(chr(10) + " " * 8 + "}", i)]
     for key in ("control", "candidate", "memory_gain_mb", "renderers", "arm_order"):
         assert key in block, key
 

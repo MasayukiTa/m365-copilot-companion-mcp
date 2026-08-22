@@ -1060,8 +1060,13 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
             # that keeps the verdict and loses the measurement cannot be re-read later.
             "actual_effect": {
                 "control": control, "candidate": candidate,
+                # BOTH QUANTITIES, whichever judged. The first planner row carried
+                # turns_gain=None beside a verdict quoting 0.00, because this dict was written
+                # before the turns figure existed and nobody added it -- a durable record that
+                # cannot reproduce the sentence next to it.
                 "instrument": judge.__name__.rsplit(".", 1)[-1],
-            "memory_gain_mb": verdict.get("memory_gain_mb"),
+                "turns_gain": _turns_gain(control, candidate),
+                "memory_gain_mb": verdict.get("memory_gain_mb"),
                 "renderers": {"control": control.get("new_renderers"),
                               "candidate": candidate.get("new_renderers")},
                 "min_free_mb": round(low, 1) if low is not None else None,

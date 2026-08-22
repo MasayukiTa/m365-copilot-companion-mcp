@@ -26,11 +26,28 @@ verdict nobody should trust.
 
 WHY TURNS
 
-A planner version that plans first spends a turn planning. That is a mechanism, not a
-correlation: `planner/v2`'s opening turn is measurably longer than `planner/v1`'s on every goal
-in the current set, and the extra turn either pays for itself in fewer later turns or it does
-not. `worker_done.turns` already carries the count per goal, so the observable exists and does
-not need building.
+`worker_done.turns` already carries a count per goal, so the observable exists without
+instrumenting anything -- which is what made `planner` the cheapest of the six coordinates
+audited.
+
+THE MECHANISM I PREDICTED DID NOT HAPPEN, AND THAT IS THE FIRST THING TO SAY
+
+The argument for pointing turns at `planner` was that a version which plans first spends a
+turn planning. Measured, it does not: `planner/v2`'s opening body is 257 characters longer
+than `planner/v1`'s, and the model plans and proceeds inside that same first turn. A clean
+comparison -- both arms logging four goals, four turns each -- put the difference at exactly
+0.00 turns per goal.
+
+`route_evaluator`'s own MEASURES comment says a component whose effect is argued rather than
+demonstrated should stay out until a null run says otherwise. I wrote that rule and then broke
+it here, one file later, on the strength of a docstring that says "plan first".
+
+WHAT THAT LEAVES. One clean comparison in ONE arm order says v1 and v2 cost the same turns on
+these four goals. That is a real result about this pair on this workload, and it is NOT yet a
+demonstration that turns can see planner in general -- an instrument that has only ever
+reported zero for its one coordinate has not shown it can report anything else. MEASURES keeps
+`planner` because the coordinate reaches the fleet and the observable is real, and the claim
+is downgraded here from mechanism to open question rather than quietly left standing.
 """
 from __future__ import annotations
 
