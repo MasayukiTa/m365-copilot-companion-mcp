@@ -74,7 +74,12 @@ def main():
     # honest way to run it -- the alternative is six rows about arms that were identical.
     archive = A.Archive(ARCHIVE)
     controller = EvolutionController(activate=False, archive=archive)
-    out = C.sweep(controller, evaluate=evaluate, coords=["transport"],
+    # WHICH COORDINATE, FROM THE COMMAND LINE. `transport` was the only one an instrument
+    # could judge when this was written; `planner` is the second, and hardcoding the first
+    # would have left the second unreachable from the entry point that exists.
+    coord = next((a for a in sys.argv[1:] if not a.startswith("-")), "transport")
+    print("[nightly] coordinate: %s" % coord, flush=True)
+    out = C.sweep(controller, evaluate=evaluate, coords=[coord],
                   on_result=lambda row: print("[nightly] %s -> %s: %s"
                                               % (row["coordinate"], row["state"],
                                                  row["reason"][:120]), flush=True))

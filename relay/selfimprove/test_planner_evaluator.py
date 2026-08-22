@@ -258,3 +258,28 @@ def test_the_arm_carries_the_other_instruments_quantity_too():
     from relay.selfimprove import scheduler as S
     src = inspect.getsource(S.route_evaluator_for)
     assert '"turns_gain": _turns_gain(control, candidate)' in src
+
+
+def test_the_nightly_path_also_picks_the_instrument():
+    """`compare.run` を直して、この adapter -- nightly が通る方 -- は
+    まだ全部 RV.decide を呼んでいた。同じ欠陥が1経路隣にあった。"""
+    import inspect
+    from relay.selfimprove import scheduler as S
+    src = inspect.getsource(S.route_evaluator_for)
+    assert "judge = _judge_for(candidate_manifest" in src
+    assert "judge.decide(control, candidate)" in src
+    assert "RV.decide(control, candidate)" not in src
+
+
+def test_the_result_says_which_ruler_produced_it():
+    """判定を受け取った側が、どの定規で測ったか言えなければ帰属できない。"""
+    import inspect
+    from relay.selfimprove import scheduler as S
+    assert '"instrument": judge.__name__' in inspect.getsource(S.route_evaluator_for)
+
+
+def test_a_planner_candidate_selects_the_turns_judge():
+    from relay.selfimprove import compare as C
+    base = M.base_manifest()
+    cand = M.apply_genome(base, {"components": {"planner": "planner/v2"}})
+    assert C.instrument_for_pair(cand, base) is PE

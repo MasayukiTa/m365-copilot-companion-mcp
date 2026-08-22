@@ -873,6 +873,23 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
         except Exception:
             return None
 
+
+    def _judge_for(candidate_manifest, base=None):
+        """The instrument declaring it can see whatever this candidate changed. RV by default.
+
+        Falls back to the route evaluator when the change spans several instruments or none,
+        because that is this adapter's original contract and a caller that gets a verdict has
+        to be able to say which ruler produced it -- `instrument` is carried on the result for
+        exactly that.
+        """
+        try:
+            from relay.selfimprove import compare as _C
+            from relay.selfimprove import manifest as _M
+            found = _C.instrument_for_pair(candidate_manifest, base or _M.base_manifest())
+            return found or RV
+        except Exception:
+            return RV
+
     def evaluate(candidate_manifest, experiment_id, base=None):
         from relay.relay_fleet import avail_phys_mb
         refusals = RV.preflight(free_mb=avail_phys_mb(), token_ok=_token_is_capturable())
@@ -995,7 +1012,15 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
                     "arm_order": "candidate,control" if candidate_first else "control,candidate",
                     "actual_effect": {"control": control, "candidate": candidate,
                                       "min_free_mb": round(low, 1), "aborted": True}}
-        verdict = RV.decide(control, candidate)
+        # THE INSTRUMENT THAT CAN JUDGE THIS CANDIDATE, not always the memory one.
+        #
+        # The same defect one path along: `compare.run` was fixed to pick an instrument and
+        # this adapter -- the one `nightly` goes through -- was still calling RV.decide for
+        # everything. A planner candidate would have been scored against a 300 MB memory
+        # threshold it has no mechanism to reach, and the loop would have recorded
+        # INCONCLUSIVE about a quantity nobody measured.
+        judge = _judge_for(candidate_manifest, base)
+        verdict = judge.decide(control, candidate)
         return {
             "gate": {"keep": verdict["verdict"] == "keep",
                      "verdict": verdict["verdict"],
@@ -1004,7 +1029,8 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
             "infra": {"aborted": False},
             "experiment_id": experiment_id,
             "control": control, "candidate": candidate,
-            "memory_gain_mb": verdict["memory_gain_mb"],
+            "instrument": judge.__name__.rsplit(".", 1)[-1],
+            "memory_gain_mb": verdict.get("memory_gain_mb"),
             # THE OTHER INSTRUMENT'S QUANTITY, from the same two arms.
             #
             # Running the arms is expensive and instrument-agnostic: the same warm-up, the same
@@ -1034,7 +1060,8 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
             # that keeps the verdict and loses the measurement cannot be re-read later.
             "actual_effect": {
                 "control": control, "candidate": candidate,
-                "memory_gain_mb": verdict["memory_gain_mb"],
+                "instrument": judge.__name__.rsplit(".", 1)[-1],
+            "memory_gain_mb": verdict.get("memory_gain_mb"),
                 "renderers": {"control": control.get("new_renderers"),
                               "candidate": candidate.get("new_renderers")},
                 "min_free_mb": round(low, 1) if low is not None else None,
