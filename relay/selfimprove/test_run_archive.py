@@ -83,3 +83,39 @@ def test_it_does_not_issue_a_verdict():
 
 def test_the_later_of_the_two_changes_is_the_one_a_run_has_to_clear():
     assert RA.INSTRUMENT_EPOCH > RA.SAMPLER_EPOCH
+
+
+# ---- 分離の度合い -------------------------------------------------------------------------------
+
+def test_a_clean_separation_at_two_against_two_cannot_beat_one_in_six():
+    """完全に分離していても p は 1/6 で止まる。
+    その p は効果の強さではなく標本の大きさを語っている。"""
+    s = RA.separation([-1.3, 50.8], [76.7, 188.8])
+    assert s["p"] == s["min_p"] == pytest.approx(0.1667, abs=1e-3)
+    assert s["observed"] == pytest.approx(108.0, abs=0.1)
+
+
+def test_more_runs_lower_the_floor():
+    """4対4なら 1/70。あと4本走らせる意味はここにある。"""
+    assert RA.separation([1, 2], [3, 4])["min_p"] == pytest.approx(1 / 6, abs=1e-4)
+    assert RA.separation([1, 2, 3, 4], [5, 6, 7, 8])["min_p"] == pytest.approx(1 / 70, abs=1e-4)
+
+
+def test_the_test_is_one_sided_in_the_direction_declared_in_advance():
+    """向きは仮説として先に決めてある(socket は使用量が減る)。
+    見てから向きを決めれば p はただで半分になる。引数を入れ替えれば結論も逆になること。"""
+    forward = RA.separation([-1.3, 50.8], [76.7, 188.8])["p"]
+    backward = RA.separation([76.7, 188.8], [-1.3, 50.8])["p"]
+    assert forward < backward
+    assert backward == pytest.approx(1.0, abs=1e-6)
+
+
+def test_overlapping_columns_are_not_reported_as_separated():
+    s = RA.separation([10, 200], [20, 150])
+    assert s["p"] > s["min_p"]
+
+
+def test_an_empty_column_reports_nothing_and_says_why():
+    """空を p=1 と返すと『差が無い』に化ける。測っていないことは差が無いことではない。"""
+    s = RA.separation([], [76.7])
+    assert s["p"] is None and s["why"]

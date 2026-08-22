@@ -22,7 +22,9 @@ rule now lives in code where it can be applied the same way twice.
 from __future__ import annotations
 
 import glob
+import itertools
 import json
+import math
 import os
 
 #: When the sampler began measuring the quantity the arm caused. Commit 1759570.
@@ -111,6 +113,47 @@ def spread(runs) -> dict:
             "widest": round(max(gains) - min(gains), 1)}
 
 
+def separation(null_gains, treatment_gains) -> dict:
+    """How surprising the treatment column would be if the label meant nothing.
+
+    An EXACT one-sided permutation test, not an approximation: pool the two columns, enumerate
+    every way of splitting the pool into groups of the observed sizes, and count how often the
+    difference in means is at least as large as the one observed. With this many runs the exact
+    enumeration is cheap and a normal approximation would be wrong.
+
+    ONE-SIDED IS LEGITIMATE HERE ONLY BECAUSE THE DIRECTION WAS FIXED FIRST. The hypothesis is
+    that a socket uses LESS memory, recorded before any of these runs; `memory_gain_mb` is
+    control minus candidate, so the prediction is that treatment gains sit ABOVE null gains. A
+    direction chosen after seeing the numbers would halve the p-value for free.
+
+    `min_p` is the smallest p this many runs can produce, and it is reported every time: with
+    two against two the answer cannot go below 0.167 no matter how cleanly the columns
+    separate, and a p that has hit its own floor is a statement about the sample size.
+
+    Both columns must come from `comparable()` with the SAME goal set and version. This takes
+    plain lists and cannot check that, so the caller carries it.
+    """
+    a, b = list(null_gains), list(treatment_gains)
+    if not a or not b:
+        return {"p": None, "min_p": None, "n_null": len(a), "n_treatment": len(b),
+                "observed": None, "why": "a column is empty"}
+    pool = a + b
+    n = len(a)
+    observed = sum(b) / len(b) - sum(a) / len(a)
+    total = at_least = 0
+    for combo in itertools.combinations(range(len(pool)), n):
+        left = [pool[i] for i in combo]
+        right = [pool[i] for i in range(len(pool)) if i not in set(combo)]
+        diff = sum(right) / len(right) - sum(left) / len(left)
+        total += 1
+        if diff >= observed - 1e-9:
+            at_least += 1
+    return {"p": round(at_least / total, 4),
+            "min_p": round(1.0 / math.comb(len(pool), n), 4),
+            "n_null": len(a), "n_treatment": len(b),
+            "observed": round(observed, 1)}
+
+
 def report(results_dir: str = None) -> str:
     """A table of what the archive holds, for a human deciding whether a floor can move."""
     runs = load(results_dir)
@@ -126,6 +169,14 @@ def report(results_dir: str = None) -> str:
                 lines.append("  %-13s %-3s %-9s n=%d  gains %s  spread %s MB"
                              % (goals, version, "null" if null else "treatment", s["n"],
                                 [r["memory_gain_mb"] for r in sel], s["widest"]))
+    for goals in sorted({r["goals"] for r in runs}):
+        nulls = [r["memory_gain_mb"] for r in comparable(runs, goals=goals, null=True)]
+        txs = [r["memory_gain_mb"] for r in comparable(runs, goals=goals, null=False)]
+        if nulls and txs:
+            sep = separation(nulls, txs)
+            lines.append("  %-13s treatment mean sits %s MB above null, p=%s "
+                         "(the smallest p this many runs can give: %s)"
+                         % (goals, sep["observed"], sep["p"], sep["min_p"]))
     return "\n".join(lines)
 
 
