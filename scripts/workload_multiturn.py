@@ -60,6 +60,30 @@ reset between arms, so whatever is left is either position or chance. A mirrored
 the only thing that separates those two, and no threshold on this set means anything until it
 has run.
 
+WHAT THE PAIR OF NULLS ON THE FIXED SET MEASURED (2026-08-23, both arm orders)
+
+    order              peak MB          reported "gain"      turns/goal      turns "gain"
+    control first      156.7 / 162.0      -5.3 MB            1.00 / 1.00      0.00
+    candidate first    354.7 / 157.9    +196.8 MB            1.25 / 1.00      0.25
+
+TURNS: the spread between identical arms is 0.00 and 0.25 -- tighter than the 0.50 the old set
+gave, but every arm sits at or beside 1.00 turns per goal, so a candidate has nowhere to show
+an improvement and only harm remains detectable. The same ceiling as before, reached by a
+shorter route.
+
+MEMORY: the first of these two runs came back 5.3 MB apart and that looked like a tenfold
+improvement on the 130-180 MB the 111-goal set gives. The mirrored run came back 196.8 MB
+apart. The 5.3 was luck, this set is NO QUIETER than the one it replaced, and a floor adopted
+from the first run alone would have turned ordinary noise into a finding. In both runs the
+arm that ran SECOND carried the higher peak, which is the residue `start_mb` was added to
+handle and evidently does not.
+
+WHAT THIS SET IS AND IS NOT GOOD FOR. It is a correctness workload: the answers are known, the
+checks are exact, and a wrong answer is recorded as a failure instead of a completion. It is
+not a power improvement for the memory instrument, and it does not create turn headroom. More
+power for a 245 MB effect against a ~160 MB spread comes from REPEATING the comparison, not
+from redesigning the ruler again -- every arm here is n=1.
+
 So turns/goal remains an instrument with nothing to measure on the operator's routine file
 work: the harness one-shots it correctly. A yardstick with headroom has to come from a measure
 that is not pinned at its floor -- correctness on answers that are actually hard, not turns.
