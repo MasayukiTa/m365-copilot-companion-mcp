@@ -184,15 +184,27 @@ class Archive:
                         pass
 
     def add(self, genome: dict, *, slice_ids, pass_at_1, ci=None, gate_verdict=None,
-            descriptors=None, ts=None) -> str:
+            descriptors=None, ts=None, note=None) -> str:
         """Append a validated genome and return its id.
 
         Entry = {"id", "genome", "parent_id", "slice_ids", "pass_at_1", "ci", "gate_verdict",
-        "descriptors", "ts"}. parent_id is taken from genome["parent_id"].
+        "descriptors", "ts", "note"}. parent_id is taken from genome["parent_id"].
+
+        `note` is free text about THIS measurement, and it exists because of one the archive
+        could not explain. The same genome was recorded at 0.34 and then at 0.50; the first
+        grade had been corrupted by the grading host and was re-run in isolation. Since the id
+        is a content hash, the second row supersedes the first by construction -- the archive
+        already says WHICH row was replaced. What it could not say was WHY, so a reader a month
+        later saw two measurements of one scaffold and no way to tell a correction from a
+        genuine change. The reason lived only in a commit message.
+
+        Not written into `descriptors`: those are behavioural coordinates and the QD map is
+        built from them, so prose there would invent cells.
         """
         eid = genome_id(genome)
         entry = {
             "id": eid,
+            "note": note,
             "genome": genome,
             "parent_id": genome.get("parent_id"),
             "slice_ids": list(slice_ids),

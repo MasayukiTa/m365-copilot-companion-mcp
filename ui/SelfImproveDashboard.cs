@@ -223,8 +223,8 @@ class SelfImproveDashboardWindow : Window
             ? "評価に使われたため再利用できない問題の台帳。理由別の内訳。"
             : "Problems that can no longer be reused for evaluation because they were consumed during testing — broken down by reason.";
         if (k == "trend_exp")  return ja
-            ? "各改善サイクル後の pass@1 の推移（新しい順・最大24件）。"
-            : "Pass@1 after each improvement cycle, newest first — up to 24 points shown.";
+            ? "各改善サイクル後の pass@1 の推移（新しい順・最大24件）。 薄い行は再測定で置き換えられた測定。"
+            : "Pass@1 after each improvement cycle, newest first — up to 24 points shown. Dimmed rows were replaced by a re-measurement.";
         if (k == "archive_exp") return ja
             ? "採用されたゲノム（解決スクリプトの変種）とその測定値。QDセルは問題タイプごとのスロット数。"
             : "Adopted genomes (scaffold variants) and what each measured. QD cells = slots by problem type.";
@@ -254,6 +254,8 @@ class SelfImproveDashboardWindow : Window
         if (k == "g_desc")        return ja ? "特性" : "Descriptors";
         if (k == "g_parent")      return ja ? "親" : "Parent";
         if (k == "g_best")        return ja ? "最良 pass@1" : "Best pass@1";
+        if (k == "superseded")    return ja ? "(再測定で置換)" : "(replaced by a re-measurement)";
+        if (k == "measured_n")    return ja ? "測定回数" : "Measurements";
         if (k == "g_root")        return ja ? "\u2014 (起点)" : "\u2014 (root)";
         if (k == "keep")          return ja ? "採用" : "Keep";
         if (k == "none")          return ja ? "なし" : "none";
@@ -1576,8 +1578,35 @@ class SelfImproveDashboardWindow : Window
             if (pass < 0) pass = 0;
             if (pass > 1) pass = 1;
             string ts = entry.ContainsKey("ts") && entry["ts"] != null ? entry["ts"].ToString() : "?";
-            col.Children.Add(BarRow(ts, -1, -1, pass,
-                Num(entry.ContainsKey("pass_at_1") ? entry["pass_at_1"] : null, "0.000")));
+
+            // A SUPERSEDED POINT IS NOT A STEP IN A SERIES. The archive holds one genome
+            // measured twice -- 0.34, then 0.50 after the first grade turned out to be a
+            // host artifact -- and drawn plainly this series says the loop improved by 16
+            // points. It did not; the same scaffold was measured again. Labelled and dimmed
+            // rather than dropped, because the loop did produce that number and the record
+            // of the correction is what makes it auditable.
+            bool superseded = false;
+            try
+            {
+                if (entry.ContainsKey("superseded") && entry["superseded"] != null)
+                    superseded = Convert.ToBoolean(entry["superseded"]);
+            }
+            catch (Exception) { }
+
+            // The recorded reason beats the generic label whenever there is one: "(replaced by
+            // a re-measurement)" says a row was replaced, and the reader's next question is
+            // always why.
+            string note = entry.ContainsKey("note") && entry["note"] != null
+                        ? Convert.ToString(entry["note"]) : "";
+            string tag = note.Length > 0 ? note : T("superseded");
+            var barRow = BarRow(superseded ? ts + "   " + tag : ts, -1, -1, pass,
+                Num(entry.ContainsKey("pass_at_1") ? entry["pass_at_1"] : null, "0.000"));
+            if (superseded)
+            {
+                var fe = barRow as FrameworkElement;
+                if (fe != null) fe.Opacity = 0.45;
+            }
+            col.Children.Add(barRow);
         }
         return card;
     }
@@ -1665,8 +1694,23 @@ class SelfImproveDashboardWindow : Window
                     dparts.Add(Convert.ToString(kv.Value));
             string dtxt = string.Join("  \u00b7  ", dparts.ToArray());
 
-            var idTb = RowCell(gid, Fg, true, 0) as TextBlock;
-            if (idTb != null) idTb.FontFamily = new FontFamily(Theme.CodeFont);
+            int nMeas = 1;
+            try
+            {
+                if (g.ContainsKey("measurements") && g["measurements"] != null)
+                    nMeas = Convert.ToInt32(g["measurements"]);
+            }
+            catch (Exception) { }
+
+            // Deduplicating the rows must not erase the fact that there were several. The id
+            // is a content hash, so a repeat means the same scaffold was measured again --
+            // which is exactly what the reader needs to know before reading the number.
+            var idTb = RowCell(gid + (nMeas > 1 ? "  ×" + nMeas : ""), Fg, true, 0) as TextBlock;
+            if (idTb != null)
+            {
+                idTb.FontFamily = new FontFamily(Theme.CodeFont);
+                if (nMeas > 1) idTb.ToolTip = T("measured_n") + ": " + nMeas;
+            }
             var cells = new UIElement[] {
                 (UIElement)idTb,
                 (UIElement)RowCell(Num(g.ContainsKey("pass_at_1") ? g["pass_at_1"] : null, "0.###"),

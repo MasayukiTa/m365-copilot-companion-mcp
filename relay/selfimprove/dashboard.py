@@ -154,7 +154,7 @@ def _archive_sections(archive_path):
     file yields an empty Archive (Archive.__init__ already guards that), so this degrades to empties.
     """
     pass1_trend: list = []
-    archive_section = {"count": 0, "genomes": [], "qd_cells": 0}
+    archive_section = {"count": 0, "records": 0, "genomes": [], "qd_cells": 0}
     try:
         from relay.selfimprove.archive import Archive
         arc = Archive(archive_path)
@@ -162,25 +162,53 @@ def _archive_sections(archive_path):
     except Exception:
         return pass1_trend, archive_section
 
-    for e in entries:
+    # A GENOME ID IS A CONTENT HASH, so re-measuring one appends a second row for the same
+    # genome -- archive.py says the collision is deliberate. Two rows are therefore not two
+    # adopted genomes, and a trend drawn straight over them shows a CORRECTION as progress.
+    #
+    # That is not hypothetical here. The live archive holds one genome measured twice: 0.34,
+    # then 0.50. The 0.34 was a grading-host artifact -- 19 instances silently produced no
+    # test output under a concurrent grade -- and the re-grade in isolation replaced it. The
+    # commit that landed the correction says in as many words that the dashboard would now
+    # show "0.34 -> 0.50", and it did: a measurement error, drawn as a 16-point improvement.
+    #
+    # Nothing is dropped. The superseded row stays in the trend, flagged, so the record of
+    # having measured it twice survives; what changes is that it stops being counted as a
+    # separate genome and stops being drawn as a rise.
+    latest_at = {}
+    for i, e in enumerate(entries):
+        if isinstance(e, dict):
+            latest_at[e.get("id")] = i
+
+    for i, e in enumerate(entries):
         if not isinstance(e, dict):
             continue
         pass1_trend.append({
             "ts": e.get("ts"),
             "pass_at_1": _to_float(e.get("pass_at_1")),
             "ci": e.get("ci"),
+            "superseded": latest_at.get(e.get("id")) != i,
+            "note": e.get("note"),
         })
 
+    measured = {}
+    for e in entries:
+        if isinstance(e, dict):
+            measured[e.get("id")] = measured.get(e.get("id"), 0) + 1
+
     genomes = []
-    for e in entries[:50]:
+    for i, e in enumerate(entries[:50]):
         if not isinstance(e, dict):
             continue
+        if latest_at.get(e.get("id")) != i:
+            continue                      # an earlier measurement of a genome listed below
         genomes.append({
             "id": e.get("id"),
             "parent_id": e.get("parent_id"),
             "pass_at_1": _to_float(e.get("pass_at_1")),
             "gate_verdict": e.get("gate_verdict"),
             "descriptors": e.get("descriptors"),
+            "measurements": measured.get(e.get("id"), 1),
         })
 
     try:
@@ -188,7 +216,10 @@ def _archive_sections(archive_path):
     except Exception:
         qd_cells = 0
 
-    archive_section = {"count": len(entries), "genomes": genomes, "qd_cells": qd_cells}
+    # `count` answers "how many genomes has this loop adopted", which is a count of distinct
+    # genomes; `records` keeps the raw row count so the difference is visible rather than lost.
+    archive_section = {"count": len(measured), "records": len(entries),
+                       "genomes": genomes, "qd_cells": qd_cells}
     return pass1_trend, archive_section
 
 
@@ -351,7 +382,7 @@ def write_json(path=None) -> str:
     except Exception:
         state = {"summary": {}, "ab_history": [], "pass1_trend": [],
                  "burned_ledger": {"total": 0, "by_reason": {}, "recent": []},
-                 "archive": {"count": 0, "genomes": [], "qd_cells": 0}}
+                 "archive": {"count": 0, "records": 0, "genomes": [], "qd_cells": 0}}
     try:
         parent = os.path.dirname(out_path)
         if parent:
@@ -525,7 +556,7 @@ def main(argv=None) -> int:
         if want_json:
             print(json.dumps({"summary": {}, "ab_history": [], "pass1_trend": [],
                               "burned_ledger": {"total": 0, "by_reason": {}, "recent": []},
-                              "archive": {"count": 0, "genomes": [], "qd_cells": 0}}, indent=2))
+                              "archive": {"count": 0, "records": 0, "genomes": [], "qd_cells": 0}}, indent=2))
         else:
             print("SELF-IMPROVEMENT SCORECARD\n  no data yet")
         return 0

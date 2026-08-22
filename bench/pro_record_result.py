@@ -89,6 +89,10 @@ def main(argv=None):
     ap.add_argument("--preds", default=os.path.join(REPO, ".fleet", "swe", "pro_preds_50.json"))
     ap.add_argument("--per-tab-mb", type=int, default=None, help="the measured autoscale_per_tab_mb the run used")
     ap.add_argument("--parent-id", default=None, help="prior genome id this builds on (if any)")
+    ap.add_argument("--note", default=None,
+                    help="why this measurement was taken -- required in spirit when re-measuring "
+                         "a genome already in the archive, because the identical id already says "
+                         "WHICH row is replaced and only the reason is missing")
     ap.add_argument("--commit", action="store_true", help="actually write (default: dry-run)")
     args = ap.parse_args(argv)
 
@@ -128,13 +132,15 @@ def main(argv=None):
     print("  descriptors : %s" % desc)
     print("  genome.knobs: %s" % genome["knobs"])
     print("  burn reason : %s" % reason)
+    if args.note:
+        print("  note        : %s" % args.note)
     if not args.commit:
         print("  (dry-run: nothing written; re-run with --commit)")
         return 0
 
     arc = Archive()
     eid = arc.add(genome, slice_ids=ids, pass_at_1=pass_at_1, ci=ci,
-                  gate_verdict="measured", descriptors=desc)
+                  gate_verdict="measured", descriptors=desc, note=args.note)
     burned = BurnedRegistry()
     n_new = burned.add(ids, reason)
     out = dashboard.write_json()

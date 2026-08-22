@@ -192,7 +192,7 @@ def test_all_sections_degrade_to_empty():
     assert st["ab_history"] == []
     assert st["pass1_trend"] == []
     assert st["burned_ledger"] == {"total": 0, "by_reason": {}, "recent": []}
-    assert st["archive"] == {"count": 0, "genomes": [], "qd_cells": 0}
+    assert st["archive"] == {"count": 0, "records": 0, "genomes": [], "qd_cells": 0}
     # usage section degrades to a valid dict (never raises) and still carries the persona keys.
     assert isinstance(st["usage"], dict)
     assert "persona_leak_rate" in st["usage"]
