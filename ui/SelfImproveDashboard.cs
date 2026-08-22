@@ -48,6 +48,8 @@ using System.Web.Script.Serialization;
 
 class SelfImproveDashboardWindow : Window
 {
+    public const string WindowTitle = "Self-Improvement";
+
     static Color C(string hex) { return (Color)ColorConverter.ConvertFromString(hex); }
 
     // theme-dependent brushes (Theme.cs is the single source of truth)
@@ -89,7 +91,9 @@ class SelfImproveDashboardWindow : Window
         LoadGlyphs();
         LoadSettings();
         ApplyThemeBrushes();
-        Title = "Self-Improvement";
+        // Named once and matched by name: FleetCockpit's --authority guard raises THIS window
+        // rather than opening a second one, and it identifies it by this exact title.
+        Title = WindowTitle;
         Width = 920; Height = 740;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         BuildChrome();

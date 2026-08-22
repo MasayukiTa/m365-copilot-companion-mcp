@@ -81,11 +81,67 @@ class CockpitProgram
         // decision should land the person on the control, not on a description of it.
         if (args.Length >= 1 && args[0].Equals("--authority", StringComparison.OrdinalIgnoreCase))
         {
-            new Application().Run(new SelfImproveDashboardWindow());
+            // SAME SHAPE MEANS THE MUTEX TOO. The paragraph above said this was built like
+            // --approval-gate and then left out the one mechanism that makes that shape work,
+            // so every re-signing opened its own window. A working day of them is a window
+            // storm, and a storm of identical windows is worse than no notification: the
+            // operator closes them all reflexively and the one that mattered goes with them.
+            //
+            // The second instance does NOT return silently the way --approval-gate does. That
+            // path is safe because the running prompt polls the gate directory and will show
+            // the new request by itself; nothing here polls. A notification whose click does
+            // nothing visible is the exact complaint that started this work, so when a window
+            // is already open we raise it instead.
+            bool createdNew = false;
+            bool ownsMutex = false;
+            using (var mutex = new Mutex(true, "Local\\M365CompanionAuthorityDashboard", out createdNew))
+            {
+                try
+                {
+                    ownsMutex = createdNew;
+                    if (!ownsMutex)
+                    {
+                        try { ownsMutex = mutex.WaitOne(0, false); }
+                        catch (AbandonedMutexException) { ownsMutex = true; }
+                    }
+                    if (!ownsMutex) { RaiseExistingDashboard(); return; }
+                    new Application().Run(new SelfImproveDashboardWindow());
+                }
+                finally { if (ownsMutex) try { mutex.ReleaseMutex(); } catch { } }
+            }
             return;
         }
         string path = args.Length > 0 ? args[0] : null;
         new Application().Run(new CockpitWindow(path));
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    static extern bool SetForegroundWindow(IntPtr hWnd);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    const int SW_RESTORE = 9;
+
+    // Best effort by design: if the handle cannot be resolved the window is still open, and a
+    // dashboard that failed to come forward is a far smaller harm than a second one appearing.
+    static void RaiseExistingDashboard()
+    {
+        try
+        {
+            var me = System.Diagnostics.Process.GetCurrentProcess();
+            foreach (var p in System.Diagnostics.Process.GetProcessesByName(me.ProcessName))
+            {
+                if (p.Id == me.Id) continue;
+                IntPtr h = p.MainWindowHandle;
+                if (h == IntPtr.Zero) continue;
+                // The exe also runs as the ordinary cockpit and as the approval prompt. Matching
+                // the process name alone would drag one of those to the front instead.
+                if (p.MainWindowTitle != SelfImproveDashboardWindow.WindowTitle) continue;
+                ShowWindow(h, SW_RESTORE);
+                SetForegroundWindow(h);
+                return;
+            }
+        }
+        catch { }
     }
 }
 
