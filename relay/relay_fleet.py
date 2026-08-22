@@ -2958,11 +2958,23 @@ class RelayWorker:
     def _fall_back_to_tab(self):
         """The socket stopped working for this worker. Open a tab and re-send the same turn.
 
-        THE GOAL IS NOT AFFECTED. The turn that was lost is re-sent verbatim on the tab, and
-        the tab is the path every worker used before this route existed -- so the cost of the
-        socket failing is one turn's latency and the RAM of one tab, which is precisely what
-        the route was saving. Returns False only if the TAB could not be opened either, which
-        is an ordinary open failure and is treated as one.
+        THE GOAL SURVIVES; WHETHER THE WORLD DOES DEPENDS ON THE REASON. The turn is re-sent
+        verbatim, and the tab is the path every worker used before this route existed, so the
+        usual cost of a socket failure is one turn's latency and one tab's RAM.
+
+        That is the whole story only when the turn never reached the server. It did reach it
+        whenever the failure was "the turn completed but carried no text" or a consent card --
+        the model acted, and only the ANSWER was unusable -- and re-sending then asks for the
+        act a second time. Invisible for a goal that writes a file; a second real event for one
+        that sends a message or appends to a record.
+
+        The re-send is unchanged, because trading a certain lost turn for a hazard nobody here
+        has measured is not an improvement -- no fallback has fired in any recorded arm. What
+        changed is that the record now names the delivery status, so a duplicate is something
+        the log can show rather than something nobody thought to look for.
+
+        Returns False only if the TAB could not be opened either, which is an ordinary open
+        failure and is treated as one.
         """
         reason = getattr(self.drv, "failed", "") or "unknown"
         route = _socket_route()
@@ -2971,8 +2983,18 @@ class RelayWorker:
         # RECORDED IMMEDIATELY, not at the end: a run that dies mid-goal still leaves the
         # evidence behind, and this line is the only place the pairing of a goal with the
         # reason it needed a tab exists at all.
+        try:
+            from relay.transport_policy import classify_fallback, delivery_status
+            cause, delivery = classify_fallback(reason), delivery_status(reason)
+        except Exception:
+            cause, delivery = "unknown", "unknown"
         route.record("fallback", worker=self.name, goal=(self.goal or "")[:600],
                      turn=self.turn, socket_turns=getattr(self, "_socket_turns_seen", 0),
+                     # WHOSE FAULT, AND WHETHER THE TURN HAD ALREADY LANDED. Both were
+                     # derivable from `reason` and neither was written down, so every question
+                     # about them had to be answered by re-reading prose after the fact.
+                     cause=cause, delivery=delivery,
+                     duplicate_risk=delivery in ("delivered", "unknown"),
                      reason=reason[:300])
         try:
             self.drv.close()

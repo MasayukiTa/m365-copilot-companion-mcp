@@ -15,14 +15,12 @@ What IS reused is the recipe, because that is where the day's lessons live:
     both arm orders         a sign that does not survive the swap is not a sign
     an arm that broke       INFRA, never a verdict
 
-THE THRESHOLD IS DELIBERATELY UNSET
+THE THRESHOLD WAS UNSET UNTIL IT WAS MEASURED
 
-`MIN_TURNS_GAIN` is None and `decide()` refuses while it is. The memory floor spent a day as a
-number borrowed from an unrelated constant, survived a threshold derivation that turned out to
-be measuring arm order, and only became meaningful when a null run gave it a spread to sit
-above. Starting this one uncalibrated is not an oversight to fix later -- it is the state that
-tells the truth until a null run has been done, and it fails loudly rather than producing a
-verdict nobody should trust.
+`MIN_TURNS_GAIN` began as None with `decide()` raising, because the memory floor had spent a
+day as a number borrowed from an unrelated constant and only meant something once a null run
+gave it a spread to sit above. It is 0.75 now, and the derivation is beside the constant --
+including why the two dedicated null passes reporting 0.000 could not be taken at face value.
 
 WHY TURNS
 
@@ -81,10 +79,11 @@ MEASURES_NOTE = ("turns per goal, which moves with how much of the work a harnes
 #: arms reach it routinely. 0.5 is the largest gap two same-program arms produced, and the
 #: threshold has to clear that rather than sit on it, which is why this is 0.75 and not 0.5.
 #:
-#: The mechanism it is meant to see is far above this. `planner/v2` spends a turn planning, so
-#: it should move turns per goal by about 1.0 -- larger than the whole observed noise range,
-#: and a much easier ratio than the memory instrument ever had (245 MB of effect against a
-#: 130-180 MB floor).
+#: THE EFFECT THIS WAS SIZED AGAINST TURNED OUT NOT TO EXIST. The floor was chosen expecting
+#: `planner/v2` to move turns by about 1.0 by spending a turn planning. It does not -- both
+#: arms measured 1.000 turns per goal in both orders. The floor is still the right floor for
+#: the quantity; what was wrong was the prediction it was sized against, and the module
+#: docstring says so.
 #:
 #: REVISIT IF THE GOALS CHANGE. This floor is a property of THESE goals: four of them, mostly
 #: one-turn. A set where goals routinely take three or four turns has a different spread, and
@@ -196,7 +195,7 @@ def turns_per_goal(arm) -> float | None:
     return float(arm.get("turns", 0) or 0) / counted
 
 
-def decide(control, candidate, *, min_gain=None) -> dict:
+def decide(control, candidate, *, min_gain=None, per_class=None) -> dict:
     """The verdict from two arms. Pure -- no clock, no fleet, no browser.
 
     Raises `NotCalibrated` when no threshold has been measured, because returning
@@ -247,7 +246,111 @@ def decide(control, candidate, *, min_gain=None) -> dict:
                 "why": "completion held at %d and turns per goal ROSE by %.2f, past the %.2f "
                        "this instrument can distinguish from noise. That is a measured cost, "
                        "not an absence of evidence." % (done_p, -gain, floor)}
+    # BEFORE CALLING IT A NULL, ASK THE CLASSES. An aggregate of zero is produced both by a
+    # harness that changed nothing and by one that helped one class and hurt another by the
+    # same amount, and only the first of those is "no difference". Skipped when the caller
+    # supplied no breakdown -- a comparison that cannot split its goals still gets a verdict,
+    # it just gets one with less behind it.
+    split = None
+    if per_class:
+        split = classes_disagree(per_class.get("control") or {},
+                                 per_class.get("candidate") or {}, floor)
+        if split["disagree"]:
+            return {"verdict": "inconclusive", "aborted": True,
+                    "turns_gain": round(gain, 3), "per_class": split["per_class"],
+                    "why": "the aggregate moved %.2f, but %s That is not a null result; it is "
+                           "two findings that cancelled." % (gain, split["why"])}
     return {"verdict": "inconclusive", "turns_gain": round(gain, 3),
+            "per_class": split["per_class"] if split else None,
             "why": "completion held at %d and turns per goal moved %.2f, inside the %.2f this "
                    "instrument can distinguish from noise. That is not a finding that either "
                    "harness is worse." % (done_p, gain, floor)}
+
+
+# ------------------------------------------------------------------------------------------
+# Per-class breakdown
+# ------------------------------------------------------------------------------------------
+#
+# NOT SIMPSON'S PARADOX, AND CALLING IT THAT WOULD BE BORROWING AUTHORITY.
+#
+# Simpson's needs unequal group sizes between the arms, and both arms here run the SAME goals,
+# so the mix is identical by construction and the classic reversal cannot occur. What CAN occur
+# is plainer and just as bad: a candidate that helps one class and hurts another by the same
+# amount averages to zero, and the run reports "no difference" about a harness that changed two
+# things in opposite directions.
+#
+# The classes are not a guess. A goal in this campaign either carries machine-checkable
+# acceptance criteria or it does not, which is a structural property of the goal rather than a
+# predicate somebody invented -- and it happens to separate the two kinds of work the set
+# contains: local artefacts that can be verified, and Work IQ answers that cannot.
+
+VERIFIED, UNVERIFIED = "verified", "unverified"
+
+
+def class_of(goal_text, goals) -> str:
+    """Which class a logged goal belongs to, by exact match against the campaign's goals.
+
+    Exact text, not a heuristic: the row's goal string came from the same list, so matching it
+    is a lookup. A row that matches nothing returns UNVERIFIED rather than raising -- an
+    unrecognised goal is unverified as far as anything here can tell.
+    """
+    from relay.relay_fleet import goal_fields
+    text = (goal_text or "").strip()
+    for goal in goals or []:
+        gt, checks, _cwd = goal_fields(goal)
+        if gt.strip()[:200] == text[:200]:
+            return VERIFIED if checks else UNVERIFIED
+    return UNVERIFIED
+
+
+def turns_by_class(path, goals, since_ts=0.0) -> dict:
+    """{class: {"goals": n, "turns": t, "done": d}} for `worker_done` rows after `since_ts`."""
+    import json as _json
+    out = {VERIFIED: {"goals": 0, "turns": 0, "done": 0},
+           UNVERIFIED: {"goals": 0, "turns": 0, "done": 0}}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    row = _json.loads(line)
+                except Exception:
+                    continue
+                if row.get("event") != "worker_done":
+                    continue
+                if float(row.get("ts", 0) or 0) < since_ts:
+                    continue
+                bucket = out[class_of(row.get("goal"), goals)]
+                bucket["goals"] += 1
+                bucket["turns"] += int(row.get("turns", 0) or 0)
+                if str(row.get("outcome", "")).upper() == "DONE":
+                    bucket["done"] += 1
+    except Exception:
+        pass
+    return out
+
+
+def classes_disagree(control_by_class, candidate_by_class, floor=None) -> dict:
+    """Do the classes move in opposite directions by enough to matter?
+
+    Returns {"disagree": bool, "per_class": {...}, "why": str}. The aggregate is not recomputed
+    here: this answers only whether reporting one number for both classes would hide something.
+    """
+    floor = MIN_TURNS_GAIN if floor is None else floor
+    per, signs = {}, []
+    for name in (VERIFIED, UNVERIFIED):
+        c, p = turns_per_goal(control_by_class.get(name)), \
+            turns_per_goal(candidate_by_class.get(name))
+        if c is None or p is None:
+            per[name] = None
+            continue
+        gain = round(c - p, 3)
+        per[name] = gain
+        if abs(gain) >= floor:
+            signs.append(1 if gain > 0 else -1)
+    if len(set(signs)) > 1:
+        return {"disagree": True, "per_class": per,
+                "why": "the classes moved in opposite directions past the %.2f floor (%s). "
+                       "One number for both would report the cancellation as no difference."
+                       % (floor, ", ".join("%s %+.2f" % (k, v) for k, v in per.items()
+                                           if v is not None))}
+    return {"disagree": False, "per_class": per, "why": ""}

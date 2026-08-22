@@ -830,8 +830,17 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
         # arm does not carry is a branch that can never be taken.
         from relay.selfimprove import planner_evaluator as _PE
         seen = _PE.turns_from_log(log_path or CAMPAIGN_SOCKET_LOG, since_ts=_arm_t0[0])
+        # THE PER-CLASS BREAKDOWN, from the same rows. Without it `decide`'s cancellation
+        # check is a branch that can never be taken -- the defect this repository has found in
+        # six components, and the reason the check is wired in the same commit that adds it.
+        try:
+            by_class = _PE.turns_by_class(log_path or CAMPAIGN_SOCKET_LOG, goals,
+                                          since_ts=_arm_t0[0])
+        except Exception:
+            by_class = None
         _extras.clear()
         _extras.update({
+            "by_class": by_class,
             "route_closed_reason": str(status.get("closed_reason") or ""),
             "task_fallbacks": _task_fallbacks(route),
             "turns": seen["turns"], "logged_goals": seen["goals"]})
@@ -1020,7 +1029,15 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
         # threshold it has no mechanism to reach, and the loop would have recorded
         # INCONCLUSIVE about a quantity nobody measured.
         judge = _judge_for(candidate_manifest, base)
-        verdict = judge.decide(control, candidate)
+        per_class = ({"control": control.get("by_class") or {},
+                      "candidate": candidate.get("by_class") or {}}
+                     if control.get("by_class") and candidate.get("by_class") else None)
+        try:
+            verdict = judge.decide(control, candidate, per_class=per_class)
+        except TypeError:
+            # The memory judge takes no breakdown: Edge memory is not attributable per goal,
+            # so there is nothing to split. Calling it the old way is correct, not a fallback.
+            verdict = judge.decide(control, candidate)
         return {
             "gate": {"keep": verdict["verdict"] == "keep",
                      "verdict": verdict["verdict"],

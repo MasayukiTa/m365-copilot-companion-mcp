@@ -182,3 +182,57 @@ def choose(goal: str, *, kind="", knobs=None, explore=False, upload_path="") -> 
     except Exception:
         impl = _policy_v1
     return impl(goal, kind=kind, knobs=knobs, explore=explore)
+
+
+# ------------------------------------------------------------------------------------------
+# Was the turn already delivered when the socket gave up?
+# ------------------------------------------------------------------------------------------
+#
+# THE FALLBACK RE-SENDS THE TURN VERBATIM, AND WHETHER THAT IS SAFE DEPENDS ON THE REASON.
+#
+# `_fall_back_to_tab` says "THE GOAL IS NOT AFFECTED... the turn that was lost is re-sent". That
+# holds when the turn never reached the server. It does not hold when the turn arrived, the
+# model acted on it, and only the ANSWER was unusable -- "the turn completed but carried no
+# text" is exactly that case, and re-sending it asks the model to do the work a second time.
+# For a goal that writes a file the repeat is invisible; for one that sends a message, books
+# something, or appends to a record, it is a second real-world act.
+#
+# This does not decide whether to re-send. It makes the ambiguity nameable and countable, so a
+# duplicate is something the record can show rather than something nobody thought to look for.
+# Changing the re-send behaviour on the strength of zero observed fallbacks would be trading a
+# known cost -- a lost turn -- for a hazard nobody here has measured.
+
+#: Reasons where the turn demonstrably reached the server before the failure.
+DELIVERED = (
+    r"carried no text", r"card", r"consent", r"empty answer", r"no DONE",
+)
+
+#: Reasons where the failure happened before anything could have been sent.
+NOT_DELIVERED = (
+    r"token", r"unauthor", r"401", r"403", r"expired", r"refresh",
+    r"capture", r"handshake", r"already failed",
+)
+
+
+def delivery_status(reason: str) -> str:
+    """'delivered', 'not_delivered' or 'unknown' for the turn that was being sent.
+
+    UNKNOWN IS THE HONEST MAJORITY AND IS NOT FOLDED EITHER WAY. A connection that dropped
+    mid-flight may or may not have delivered the frame; calling that "not delivered" would
+    quietly certify the re-send as safe, and calling it "delivered" would inflate a duplicate
+    count with events that never duplicated anything. It is left as its own value so what
+    accumulates there can be read by a person.
+    """
+    text = (reason or "").lower()
+    for pattern in DELIVERED:
+        if re.search(pattern, text, re.IGNORECASE):
+            return "delivered"
+    for pattern in NOT_DELIVERED:
+        if re.search(pattern, text, re.IGNORECASE):
+            return "not_delivered"
+    return "unknown"
+
+
+def duplicate_risk(reason: str) -> bool:
+    """True when re-sending this turn could repeat an act the model already performed."""
+    return delivery_status(reason) in ("delivered", "unknown")
