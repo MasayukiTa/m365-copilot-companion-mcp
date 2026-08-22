@@ -828,7 +828,7 @@ def test_lock_detector_ignores_security_review_prose():
 
     # ---- POSITIVE: the actual short server lock-error strings (tools/security.py
     # require_unlocked(), lines ~129-141) DO trigger the lock/auto-unlock path.
-    real_err_no_ctx = "[locked: no HTTP request context] Call unlock(password='<password>') first."
+    real_err_no_ctx = "[locked: no HTTP request context] Denied: this call ran in-process (test, CLI, or an internal hook), not through the MCP HTTP server. unlock() cannot help here -- it needs the same HTTP context and will fail the same way; do not retry it. Either route the call through the HTTP server, or use an internal *_local path that does not pass this gate (memory_save_local / runlog_append_local)."
     real_err_ip = (
         "[locked client IP: '203.0.113.7'] Mutating and execution tools require an unlock. "
         "Call unlock(password='<password>') first. The unlock is stored per client IP "

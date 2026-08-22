@@ -218,7 +218,7 @@ def test_locked_save_response_is_swallowed_without_raising(monkeypatch):
     monkeypatch.setenv("MCP_DATA_MEMORY_AUTO", "1")
 
     def _locked(intent, snippet, tags="", context=""):
-        return "[locked: no HTTP request context] Call unlock(password='<password>') first."
+        return "[locked: no HTTP request context] Denied: this call ran in-process (test, CLI, or an internal hook), not through the MCP HTTP server. unlock() cannot help here -- it needs the same HTTP context and will fail the same way; do not retry it. Either route the call through the HTTP server, or use an internal *_local path that does not pass this gate (memory_save_local / runlog_append_local)."
 
     monkeypatch.setattr("tools.procedural_memory.procedural_memory_save", _locked)
 
@@ -232,7 +232,7 @@ def test_locked_save_response_swallowed_for_tables_and_columns(monkeypatch):
     monkeypatch.setenv("MCP_DATA_MEMORY_AUTO", "1")
 
     def _locked(intent, snippet, tags="", context=""):
-        return "[locked: no HTTP request context] Call unlock(password='<password>') first."
+        return "[locked: no HTTP request context] Denied: this call ran in-process (test, CLI, or an internal hook), not through the MCP HTTP server. unlock() cannot help here -- it needs the same HTTP context and will fail the same way; do not retry it. Either route the call through the HTTP server, or use an internal *_local path that does not pass this gate (memory_save_local / runlog_append_local)."
 
     monkeypatch.setattr("tools.procedural_memory.procedural_memory_save", _locked)
 
@@ -296,7 +296,7 @@ def test_hooks_never_raise_on_empty_or_none_result(monkeypatch):
 
 def test_save_locked_increments_skipped_locked_and_logs_once(monkeypatch, caplog):
     def _locked(intent, snippet, tags="", context=""):
-        return "[locked: no HTTP request context] Call unlock(password='<password>') first."
+        return "[locked: no HTTP request context] Denied: this call ran in-process (test, CLI, or an internal hook), not through the MCP HTTP server. unlock() cannot help here -- it needs the same HTTP context and will fail the same way; do not retry it. Either route the call through the HTTP server, or use an internal *_local path that does not pass this gate (memory_save_local / runlog_append_local)."
 
     monkeypatch.setattr("tools.procedural_memory.procedural_memory_save", _locked)
 
@@ -355,7 +355,7 @@ def test_data_memory_status_reflects_auto_flag_off_when_opted_out(monkeypatch):
 
 def test_data_memory_status_reflects_counters_after_locked_skip(monkeypatch):
     def _locked(intent, snippet, tags="", context=""):
-        return "[locked: no HTTP request context] Call unlock(password='<password>') first."
+        return "[locked: no HTTP request context] Denied: this call ran in-process (test, CLI, or an internal hook), not through the MCP HTTP server. unlock() cannot help here -- it needs the same HTTP context and will fail the same way; do not retry it. Either route the call through the HTTP server, or use an internal *_local path that does not pass this gate (memory_save_local / runlog_append_local)."
 
     monkeypatch.setattr("tools.procedural_memory.procedural_memory_save", _locked)
     hook._save(intent="a", snippet="body a", tags="", context="")

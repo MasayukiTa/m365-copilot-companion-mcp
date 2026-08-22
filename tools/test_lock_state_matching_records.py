@@ -172,3 +172,50 @@ def test_a_window_that_lands_on_a_line_boundary_keeps_that_record(tmp_path, monk
 
     got = LS.matching_records(99.0, now=102.0)
     assert [r["detail"] for r in got] == [keep[0]["detail"], keep[1]["detail"]]
+
+
+# ── the message the server writes, checked as a whole ───────────────────────────────
+
+def test_the_context_less_refusal_does_not_instruct_an_impossible_action():
+    """It said "Call unlock(password=...) first", and unlock() needs the same HTTP context
+    the branch just failed to find -- so a reader obeying it fails identically, and an agent
+    reader retries until its attempt cap."""
+    import tools.security as S
+    src = open(S.__file__, encoding="utf-8").read()
+    i = src.index('"[locked: no HTTP request context] "')
+    body = src[i:i + 900]          # a fixed window: the message itself contains parentheses
+    assert "Call unlock(password='<password>') first." not in body
+    assert "unlock() cannot help here" in body
+    assert "do not " in body and "retry it" in body
+
+
+def test_the_prefix_is_unchanged_and_the_readers_still_key_on_it():
+    """Load-bearing: relay and bridge tell "in-process refusal" from "might be mine" by this
+    prefix alone. A byte of drift either blinds detection or injects unlock into clean turns."""
+    import tools.security as S
+    src = open(S.__file__, encoding="utf-8").read()
+    assert '"[locked: no HTTP request context] "' in src
+
+    import relay.relay_fleet as RF
+    assert RF.NO_CONTEXT_REFUSAL == "[locked: no HTTP request context]"
+
+
+def test_the_message_stays_short_enough_to_be_classified_as_a_lock(tmp_path, monkeypatch):
+    """Above LOCKED_DOMINANCE_MAX_CHARS the dominance rule reads it as prose that merely
+    mentions unlock, and the reply stops being recognised as the lock error it is."""
+    import relay.relay_fleet as RF
+    import tools.security as S
+    monkeypatch.setattr(LS, "_LOG_FILE", tmp_path / "r.jsonl")
+    monkeypatch.setattr(LS, "_STATE_FILE", tmp_path / "s.json")
+    msg = S.require_unlocked()
+    assert msg and len(msg) < RF.LOCKED_DOMINANCE_MAX_CHARS
+    assert RF._looks_locked(msg) is True
+
+
+def test_it_names_an_exit_that_exists(tmp_path, monkeypatch):
+    """The two in-process paths it points at have to be real, or the new wording repeats the
+    old defect in a longer form."""
+    import tools.memory_ops as M
+    import tools.runlog_ops as R
+    assert callable(getattr(M, "memory_save_local", None))
+    assert callable(getattr(R, "runlog_append_local", None))

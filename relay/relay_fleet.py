@@ -246,7 +246,7 @@ def edge_recover_surface(port=None, open_url=""):
 # (tools/security.py::require_unlocked). When the agent calls a write/exec tool before the
 # (rotating M365 backend) IP is unlocked, the server returns ONE of its two literal error
 # strings (tools/security.py require_unlocked(), ~line 129 and ~line 138):
-#   "[locked: no HTTP request context] Call unlock(password='<password>') first."
+#   "[locked: no HTTP request context] Denied: this call ran in-process (test, CLI, or an internal hook), not through the MCP HTTP server. unlock() cannot help here -- it needs the same HTTP context and will fail the same way; do not retry it. Either route the call through the HTTP server, or use an internal *_local path that does not pass this gate (memory_save_local / runlog_append_local)."
 #   "[locked client IP: 'x.x.x.x'] Mutating and execution tools require an unlock. Call
 #    unlock(password='<password>') first. The unlock is stored per client IP for
 #    MCP_UNLOCK_TTL_DAYS days."

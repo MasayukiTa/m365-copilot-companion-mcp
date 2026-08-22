@@ -276,9 +276,27 @@ def require_unlocked() -> str | None:
         req = get_http_request()
     except Exception:
         # No HTTP request context (e.g. called from a test or CLI): deny.
+        #
+        # THE INSTRUCTION USED TO BE IMPOSSIBLE TO FOLLOW. It said "Call unlock(password=...)
+        # first", and unlock() needs the same HTTP context this branch just failed to find --
+        # so a reader obeying it fails identically, and an agent reader retries until its
+        # attempt cap. Say what is actually true and name the two exits that exist.
+        #
+        # The bracket prefix is load-bearing and must not change by a byte: relay and bridge
+        # both key on it via str.startswith to tell "a refusal from something in-process" from
+        # "a refusal that might be mine", and mistaking the two either blinds lock detection or
+        # injects unlock into turns that were never locked. Everything after the prefix is free
+        # text, subject only to staying under LOCKED_DOMINANCE_MAX_CHARS (400) so the dominance
+        # rule still classifies it as the whole of a short tool return rather than prose that
+        # merely mentions unlock.
         msg = (
             "[locked: no HTTP request context] "
-            "Call unlock(password='<password>') first."
+            "Denied: this call ran in-process (test, CLI, or an internal hook), "
+            "not through the MCP HTTP server. unlock() cannot help here -- it "
+            "needs the same HTTP context and will fail the same way; do not "
+            "retry it. Either route the call through the HTTP server, or use an "
+            "internal *_local path that does not pass this gate "
+            "(memory_save_local / runlog_append_local)."
         )
         lock_state.record_locked("", msg)
         return msg
