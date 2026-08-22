@@ -44,10 +44,20 @@ def test_no_organisation_or_product_identifier_appears():
     # of them are real people's names. Assembled from fragments and escapes now; the
     # comparison is byte-identical and test_this_file_is_not_itself_the_leak keeps it so.
     for banned in _banned_ascii():
-        assert not re.search(r"\b%s\b" % re.escape(banned), src), banned
+        assert not re.search(_word_pattern(banned), src), banned
     for banned in _banned_terms():
         assert banned not in src, banned
 
+
+def _word_pattern(banned):
+    """The pattern the guard actually uses, so the tests below exercise IT and not a copy.
+
+    A copy is how this broke: the boundaries were lost here as literal backspace characters
+    -- most likely a plain string where a raw one was meant, which is a mistake this very
+    session reproduced twice while editing the file -- and no test was looking at the guard's
+    own pattern, so a check that could never fire read exactly like a check that passed."""
+    import re
+    return r"\b%s\b" % re.escape(banned)
 
 def _banned_ascii():
     """Organisation, employee and host identifiers, split so this file does not hold them."""
@@ -59,12 +69,24 @@ def _banned_terms():
     return ("scm\u9023\u643a", "\u99d2\u4e95", "\u5ddd\u5d0e", "\u696d\u52d9\u8cc7\u6599", "pap\u8abf\u67fb")
 
 
+def test_the_boundary_is_a_boundary():
+    """The comment above says why: a bare substring match puts "dic" inside "dict", and an
+    invariant that fires on innocent text is removed rather than fixed. Pinned because the
+    boundary has already been lost once -- as literal backspace characters, which made the
+    check unable to fail at all."""
+    import re
+    for banned in _banned_ascii():
+        pat = _word_pattern(banned)
+        assert not re.search(pat, "xx" + banned + "xx"), banned
+        assert re.search(pat, "xx " + banned + " xx"), banned
+
+
 def test_the_boundary_pattern_can_actually_fail():
     """The assertion above is only worth having if it can fire. It stopped being able to,
     and nothing noticed, because a check that never fails looks like a check that passes."""
     import re
     for banned in _banned_ascii():
-        assert re.search(r"\b%s\b" % re.escape(banned), "x " + banned + " y")
+        assert re.search(_word_pattern(banned), "x " + banned + " y")
 
 
 def test_this_file_is_not_itself_the_leak():
@@ -241,3 +263,13 @@ def test_the_evaluator_calls_the_reset_at_the_top_of_every_arm():
                        for x in ast.walk(n.test))
                and any(c in ast.walk(n) for c in calls)]
     assert not guarded, "記憶隔離の分岐の中に入っている"
+
+
+def test_the_goals_never_hand_over_an_8_3_short_path():
+    """`TEMP` はこの端末では 8.3 短縮形を返す。短縮名を含むパスを渡すと、
+    測っているのは作業ではなくパス表記の扱いになる。2026-08-23 の帰無走行で、
+    同一ハーネスの片腕が3ターン使い、その理由が『短縮名で書いたので
+    対象フォルダに実体が残らなかった』だった。"""
+    assert "~" not in W.WORKDIR, W.WORKDIR
+    for g in W.goals():
+        assert "~" not in g["text"], g["text"][:80]
