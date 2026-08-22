@@ -374,3 +374,18 @@ def test_an_aborted_run_also_records_what_it_saw():
     src = inspect.getsource(S.route_evaluator_for)
     i = src.index('low < RV.MIN_FREE_MB')
     assert '"actual_effect"' in src[i:i + 1600]
+
+
+def test_no_goal_set_hands_the_harness_an_8_3_short_path():
+    """`TEMP` はこの端末では短縮形を返す。短縮名を含むパスを渡すと、
+    ハーネスがそれを突き合わせる手間が測定値に乗る -- しかもどちらの腕に
+    乗るかは引きなので、輸送の効果と見分けがつかない。
+
+    multiturn 集合で見つけて直したが、飽和集合は同じ欠陥を8走行ぶん抱えたままだった。
+    片方だけ直して同じ穴を残さないよう、検査は両方を横断する。"""
+    from scripts.run_route_campaign import GOALS
+    from scripts import workload_multiturn as W
+
+    for name, goals in (("saturated-v1", GOALS), ("multiturn", W.goals())):
+        for g in goals:
+            assert "~" not in g["text"], (name, g["text"][:70])

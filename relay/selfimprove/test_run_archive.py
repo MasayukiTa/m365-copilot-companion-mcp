@@ -20,8 +20,11 @@ def _write(d, exp, *, null, gain, goals=None, control=200.0, candidate=150.0):
 @pytest.fixture
 def archive(tmp_path):
     d = str(tmp_path)
+    # 飽和集合にも世代がある(短縮パス修正)。計器の時刻だけを基準にすると、
+    # 作業負荷の世代で落ちたのをテストの不具合と読み違える。
+    base = max(RA.INSTRUMENT_EPOCH, RA.WORKLOAD_EPOCH.get("saturated-v1", 0))
     before = RA.INSTRUMENT_EPOCH - 100
-    after = RA.INSTRUMENT_EPOCH + 100
+    after = base + 100
     _write(d, "route-transport-v1-NULL-ctrlfirst-%d" % before, null=True, gain=-179.8)
     _write(d, "route-transport-v1-NULL-ctrlfirst-%d" % after, null=True, gain=50.8)
     _write(d, "route-transport-v1-ctrlfirst-%d" % (after + 10), null=False, gain=76.7)
@@ -55,8 +58,8 @@ def test_a_superseded_goal_set_keeps_its_name(tmp_path):
 
 def test_two_goal_sets_are_never_put_in_one_column(archive):
     """片方の集合で測った差は、もう片方についての証拠ではない。広がりが違う。"""
-    _write(archive, "route-transport-v1-NULL-ctrlfirst-%d" % (RA.WORKLOAD_EPOCH["multiturn"] + 5),
-           null=True, gain=196.8, goals="multiturn")
+    _write(archive, "route-transport-v1-NULL-ctrlfirst-%d"
+           % (max(RA.WORKLOAD_EPOCH.values()) + 5), null=True, gain=196.8, goals="multiturn")
     runs = RA.load(archive)
     sat = RA.comparable(runs, goals="saturated-v1", null=True)
     mt = RA.comparable(runs, goals="multiturn", null=True)

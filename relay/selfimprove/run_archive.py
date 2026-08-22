@@ -42,7 +42,12 @@ INSTRUMENT_EPOCH = 1787283181
 #: into (fixed in 254d18a). Runs from before those carry the same `goals` string as runs from
 #: after, so filtering on the name alone silently averages four numbers of which two describe
 #: broken goals. A set earns an entry here the moment a run of it is superseded by a fix.
-WORKLOAD_EPOCH = {"multiturn": 1787423013}
+WORKLOAD_EPOCH = {"multiturn": 1787423013,
+                  # The saturated set carried the SAME 8.3 short path through eight
+                  # measured runs before anyone looked. One tabs arm spent 33.2 minutes
+                  # on a single turn under it. Runs from before this stamp measured the
+                  # set with that defect in it.
+                  "saturated-v1": 1787431031}
 
 RESULTS = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
                        "docs", "research", "results")

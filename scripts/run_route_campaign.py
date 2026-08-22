@@ -42,7 +42,14 @@ from relay.selfimprove import scheduler as S  # noqa: E402
 #:
 #: The coding goals now write a file and are checked by running it. The Work IQ goals stay on
 #: what a delegated token can actually reach.
-_OUT = os.path.join(os.environ.get("TEMP", "."), "route_campaign_work")
+# REALPATH, BECAUSE `TEMP` IS AN 8.3 SHORT NAME HERE AND THE GOALS HAND IT TO THE HARNESS.
+#
+# Found in the multiturn set first and fixed there; this set had the same defect and kept it
+# through eight measured runs. In one of those a tabs arm spent 33.2 minutes on a single turn
+# of one file goal while the socket arm did the same run in 3.5, and a tabs-vs-tabs null came
+# back 148.1 MB apart -- inside the range the treatment runs produced. A path the harness has
+# to reconcile is variance the transport did not cause, and it lands on whichever arm draws it.
+_OUT = os.path.join(os.path.realpath(os.environ.get("TEMP", ".")), "route_campaign_work")
 
 GOALS = [
     {"text": "自分の今日以降の予定を3件、開始日時と件名だけの箇条書きで挙げて。"
