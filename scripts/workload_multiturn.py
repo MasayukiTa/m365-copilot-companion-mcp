@@ -46,6 +46,20 @@ now enforces both:
     cannot find its footing keeps going until the turn cap -- unbounded churn recorded as
     signal. All of the 2.25 turns/goal "gain" in that null run came from this one goal.
 
+WHAT THE SECOND NULL PASS ADDED (2026-08-23, after both rules above were in force)
+
+Completion came off the ceiling for the first time -- 2/4 against 4/4 between two IDENTICAL
+arms -- so this set can finally record a failure. That is the property the saturated set never
+had. But the arms were not measuring the work: the failing arm's own account was that it had
+written under the `~1` short name and the file had not landed, and that `run_python` writes to
+an isolated filesystem the acceptance check cannot see. WORKDIR is now resolved, which removes
+the first. The second is a real property of the harness rather than a fault in the ruler.
+
+THE SECOND ARM HAS NOW WON THREE RUNS IN A ROW. Memory is isolated per arm and the workspace is
+reset between arms, so whatever is left is either position or chance. A mirrored-order null is
+the only thing that separates those two, and no threshold on this set means anything until it
+has run.
+
 So turns/goal remains an instrument with nothing to measure on the operator's routine file
 work: the harness one-shots it correctly. A yardstick with headroom has to come from a measure
 that is not pinned at its floor -- correctness on answers that are actually hard, not turns.
@@ -58,7 +72,13 @@ import random
 
 #: Where the generated workbook lives. Regenerated per campaign so a leftover file cannot let a
 #: goal pass without the work being done.
-WORKDIR = os.path.join(os.environ.get("TEMP", "."), "multiturn_workload")
+#:
+#: REALPATH, BECAUSE `TEMP` IS AN 8.3 SHORT NAME HERE. Handing the harness a path with a `~1`
+#: component measured PATH HANDLING rather than the work: in the 2026-08-23 null pass one arm
+#: spent three turns on a goal the other did in one, and its own account was "I wrote it under
+#: the short name and the file did not land in the target folder". Both arms were the same
+#: harness, so that entire difference was the ruler, not the thing being measured.
+WORKDIR = os.path.join(os.path.realpath(os.environ.get("TEMP", ".")), "multiturn_workload")
 
 #: Fixed, so the same goals always have the same answers and a check can assert them.
 SEED = 20260822

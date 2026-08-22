@@ -265,11 +265,13 @@ def test_the_evaluator_calls_the_reset_at_the_top_of_every_arm():
     assert not guarded, "記憶隔離の分岐の中に入っている"
 
 
-def test_the_goals_never_hand_over_an_8_3_short_path():
+def test_the_goals_never_hand_over_an_8_3_short_path(tmp_path):
     """`TEMP` はこの端末では 8.3 短縮形を返す。短縮名を含むパスを渡すと、
     測っているのは作業ではなくパス表記の扱いになる。2026-08-23 の帰無走行で、
     同一ハーネスの片腕が3ターン使い、その理由が『短縮名で書いたので
     対象フォルダに実体が残らなかった』だった。"""
     assert "~" not in W.WORKDIR, W.WORKDIR
-    for g in W.goals():
+    # ゴール文面にも入らないこと。既定の WORKDIR で組むと本番の作業フォルダに
+    # 書いてしまうので、検査は使い捨てのフォルダで行う。
+    for g in W.goals(str(tmp_path / "wl")):
         assert "~" not in g["text"], g["text"][:80]
