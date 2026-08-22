@@ -28,9 +28,51 @@ def test_no_organisation_or_product_identifier_appears():
     src = io.open(W.__file__, encoding="utf-8").read().lower()
     # 語境界で見る。素の部分一致だと "dic" が "dict" に当たり、
     # 守りたい不変条件が『通らない検査』として消される側に回る。
-    for banned in ("resonac", "m118a8586", "shuttle", "kiyus"):
-        assert not re.search(r"%s" % re.escape(banned), src), banned
-    for banned in ("scm連携", "駒井", "川崎", "業務資料", "pap調査"):
+    # TWO SEPARATE FAULTS LIVED IN THESE FOUR LINES.
+    #
+    # The word boundaries were not word boundaries. The pattern reached this file as a
+    # plain string rather than a raw one, so \b became a literal backspace and the regex
+    # searched for control-character-delimited words. Nothing matches that, so the
+    # assertion could not fail -- the comment above warns in as many words that losing the
+    # boundary turns the invariant into a check that never fires, and that is exactly what
+    # it had become. Measured before the fix: the broken pattern finds nothing in a string
+    # that openly contains the word.
+    #
+    # And the guard was the leak. This file is tracked and the repository is public, so a
+    # plaintext list of the identifiers that may not appear published them here: a grep of
+    # the remote tree for any of the nine found exactly one file, and it was this one. Two
+    # of them are real people's names. Assembled from fragments and escapes now; the
+    # comparison is byte-identical and test_this_file_is_not_itself_the_leak keeps it so.
+    for banned in _banned_ascii():
+        assert not re.search(r"\b%s\b" % re.escape(banned), src), banned
+    for banned in _banned_terms():
+        assert banned not in src, banned
+
+
+def _banned_ascii():
+    """Organisation, employee and host identifiers, split so this file does not hold them."""
+    return ("res" + "onac", "m118" + "a8586", "shu" + "ttle", "ki" + "yus")
+
+
+def _banned_terms():
+    """Personal names and business-document words, escaped for the same reason."""
+    return ("scm\u9023\u643a", "\u99d2\u4e95", "\u5ddd\u5d0e", "\u696d\u52d9\u8cc7\u6599", "pap\u8abf\u67fb")
+
+
+def test_the_boundary_pattern_can_actually_fail():
+    """The assertion above is only worth having if it can fire. It stopped being able to,
+    and nothing noticed, because a check that never fails looks like a check that passes."""
+    import re
+    for banned in _banned_ascii():
+        assert re.search(r"\b%s\b" % re.escape(banned), "x " + banned + " y")
+
+
+def test_this_file_is_not_itself_the_leak():
+    """The check above reads another module; nothing read THIS one, which is how a tracked,
+    public file came to hold every forbidden word in plaintext."""
+    import io
+    src = io.open(__file__, encoding="utf-8").read().lower()
+    for banned in tuple(_banned_ascii()) + tuple(_banned_terms()):
         assert banned not in src, banned
 
 
@@ -99,22 +141,51 @@ def test_clean_removes_the_inputs_too(built):
     d, _facts = built
     open(os.path.join(d, "over_limit.txt"), "w", encoding="utf-8").write("stale")
     W.clean(d)
-    for name in ("over_limit.txt", "readings.csv", "limits.csv"):
+    for name in ("over_limit.txt", "worst.txt", "agenda.txt",
+                 "readings.csv", "limits.csv"):
         assert not os.path.exists(os.path.join(d, name)), name
 
 
-# ---- クラス分割がそのまま効くこと -----------------------------------------------------------------
+# ---- 独立ワーカーで走ることが文面に織り込まれていること ----------------------------------------
 
-def test_the_set_still_splits_into_two_classes():
-    """受入検証の有無でクラスを分ける仕組みは、この集合でもそのまま働く。"""
+def test_no_goal_points_outside_its_own_text(tmp_path):
+    """各ゴールは自分専用のワーカーで走り、前のゴールの会話は存在しない。
+    「同じフォルダ」と書いたゴールは、誰も教えていないフォルダを13ターンかけて
+    ディスク全体から探し、その空回りが turns_gain 2.25 として記録された。
+    実測 2026-08-22 の帰無走行。"""
+    d = str(tmp_path / "wl")
+    for g in W.goals(d):
+        text = g["text"]
+        assert d in text, "フォルダを名指ししていない: %s" % text[:60]
+        for pointer in ("同じフォルダ", "同フォルダ", "上記", "先ほど", "さきほど", "前のターン"):
+            assert pointer not in text, (pointer, text[:60])
+
+
+def test_every_goal_carries_an_acceptance_check(tmp_path):
+    """検査の無いゴールは落ちようがないので、足場を失ったハーネスは
+    ターン上限まで回り続け、その空回りが測定値として記録される。"""
+    for g in W.goals(str(tmp_path / "wl")):
+        assert g.get("checks"), g["text"][:60]
+
+
+def test_the_class_split_collapses_and_the_test_says_so(tmp_path):
+    """代償の記録。`class_of` は「検査の有無」でクラスを分けるので、
+    全ゴールに検査を付けたこの集合は単一クラスになり、
+    planner_evaluator の相殺検出はこの集合では働かない。
+    別の軸(ローカル資料 / Work IQ)で分け直すまで、それは使えない。"""
     from relay.selfimprove import planner_evaluator as PE
     from relay.relay_fleet import goal_fields
-    goals = W.goals()
+    goals = W.goals(str(tmp_path / "wl"))
     seen = {PE.class_of(goal_fields(g)[0], goals) for g in goals}
-    assert seen == {PE.VERIFIED, PE.UNVERIFIED}
+    assert seen == {PE.VERIFIED}, seen
 
 
-def test_the_headroom_claim_is_marked_as_unmeasured():
-    """『何ターンかかるか』はまだ測っていない。
-    設計上そう作った、というだけでは主張にならない。"""
-    assert "HEADROOM IS A CLAIM UNTIL IT IS MEASURED" in (W.__doc__ or "")
+# ---- 伸びしろが実測で語られていること --------------------------------------------------------------
+
+def test_the_docstring_records_the_measurement_not_the_intention():
+    """『複数ターンかかるように作った』は主張であって測定ではない。
+    実測では4ゴール中3つが両腕とも1ターンで、しかも正解だった。"""
+    doc = W.__doc__ or ""
+    assert "THREE OF FOUR FINISHED IN ONE TURN IN BOTH ARMS" in doc
+    assert "NO GOAL MAY POINT OUTSIDE ITS OWN TEXT" in doc
+    assert "EVERY GOAL CARRIES AN ACCEPTANCE CHECK" in doc

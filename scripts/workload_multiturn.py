@@ -20,16 +20,35 @@ ever can: this repository is public and the goals live in a tracked file. The da
 by `build()` from a fixed seed, so the numbers are reproducible, the answers are known, and the
 acceptance checks can verify them exactly.
 
-WHY THESE TAKE MORE THAN ONE TURN
+WHAT A NULL PASS ON THESE ACTUALLY MEASURED (2026-08-22, 51 min, two identical arms)
 
-Not because they are padded. Each needs a step whose input is the previous step's output: you
-cannot compute the summary before reading the files, and you cannot know which file to read
-before listing the directory. That is the same reason the operator's real tasks take several
-turns, and it is what gives a better-primed or better-planned harness something to save.
+    goal                                   arm A   arm B
+    join two tables -> write the subset       1       1
+    per-lot means -> write a csv              1       1
+    largest exceedance -> answer in text     13       4      <- BROKEN, see below
+    upcoming calendar entries                 1       1
 
-THE HEADROOM IS A CLAIM UNTIL IT IS MEASURED. These goals are BUILT to need several turns; how
-many they actually take is a question for a null pass on them, which also has to re-measure the
-noise floor -- the current 0.75 describes the old, saturated set and says nothing about this one.
+THREE OF FOUR FINISHED IN ONE TURN IN BOTH ARMS, and the acceptance checks passed with the
+exact generated answer (no VERIFY_FAILED in the run). The design argument above -- "each step
+needs the previous step's output, so it must take several turns" -- IS WRONG for this harness:
+it can run code, so list -> read -> join -> write happens inside a single turn. Intent is not
+a measurement, and this set has no more turn headroom than the saturated one it replaced.
+
+The fourth goal took 13 turns against 4 in an identical arm, and that spread was a DEFECT IN
+THE GOAL, not a property of the harness. Every goal runs in its OWN worker with no shared
+history, and that goal said "the same folder" while naming no path -- so it searched the whole
+disk for a folder nobody had told it about. The other file goals only worked because their
+output path happened to spell the folder out. Two rules follow, and `test_workload_multiturn`
+now enforces both:
+
+  * NO GOAL MAY POINT OUTSIDE ITS OWN TEXT. No "the same folder", "as above", "earlier".
+  * EVERY GOAL CARRIES AN ACCEPTANCE CHECK. An ungated goal cannot fail, so a harness that
+    cannot find its footing keeps going until the turn cap -- unbounded churn recorded as
+    signal. All of the 2.25 turns/goal "gain" in that null run came from this one goal.
+
+So turns/goal remains an instrument with nothing to measure on the operator's routine file
+work: the harness one-shots it correctly. A yardstick with headroom has to come from a measure
+that is not pinned at its floor -- correctness on answers that are actually hard, not turns.
 """
 from __future__ import annotations
 
@@ -99,7 +118,8 @@ def clean(workdir: str = WORKDIR) -> None:
     done nothing. The inputs are regenerated too, since a goal that reads a stale table answers
     a question nobody asked.
     """
-    for name in ("over_limit.txt", "summary.csv", "readings.csv", "limits.csv", "notes.csv"):
+    for name in ("over_limit.txt", "summary.csv", "worst.txt", "agenda.txt",
+                 "readings.csv", "limits.csv", "notes.csv"):
         try:
             os.remove(os.path.join(workdir, name))
         except OSError:
@@ -107,48 +127,72 @@ def clean(workdir: str = WORKDIR) -> None:
 
 
 def goals(workdir: str = WORKDIR) -> list:
-    """The goal set, with acceptance checks that assert the generated answers."""
+    """The goal set. Every goal names its own folder and carries an acceptance check.
+
+    Both properties are load-bearing rather than tidy: a goal that says "the same folder" is
+    unanswerable when each goal runs in its own worker, and a goal with no check cannot fail,
+    so a lost harness churns to the turn cap and the churn is recorded as a measurement.
+    """
     facts = build(workdir)
     d = workdir
-    py = ("python -c \"import csv,sys;"
-          "rows=list(csv.DictReader(open(r'%s',encoding='utf-8')));")
+    over_txt = os.path.join(d, "over_limit.txt")
+    summary_csv = os.path.join(d, "summary.csv")
+    worst_txt = os.path.join(d, "worst.txt")
+    agenda_txt = os.path.join(d, "agenda.txt")
 
     return [
-        # 1. list -> read two -> join -> write. Four steps, each needing the last.
+        # 1. list -> read two -> join -> write.
         {"text": ("フォルダ %s には CSV が3つある。readings.csv と limits.csv だけを使い"
                   "(notes.csv は無視)、lot ごとに value が limit を一度でも超えた lot を"
-                  "昇順で列挙して、1行1lotで %s に書いて。"
-                  % (d, os.path.join(d, "over_limit.txt"))),
+                  "昇順で列挙して、1行1lotで %s に書いて。" % (d, over_txt)),
          "checks": [
-             {"type": "file_exists", "path": os.path.join(d, "over_limit.txt")},
+             {"type": "file_exists", "path": over_txt},
              {"type": "shell", "expect_code": 0,
               "cmd": ("python -c \"expected=%r;"
                       "got=[l.strip() for l in open(r'%s',encoding='utf-8') if l.strip()];"
                       "assert got==expected,(got,expected)\""
-                      % (facts["over_limit"], os.path.join(d, "over_limit.txt")))}]},
+                      % (facts["over_limit"], over_txt))}]},
 
         # 2. the same inputs, a different question, and an artefact with structure.
-        {"text": ("同じフォルダで、lot ごとに value の平均を小数第2位まで求め、"
-                  "lot,mean の2列 CSV を lot 昇順で %s に書いて。ヘッダー行を付けて。"
-                  % os.path.join(d, "summary.csv")),
+        {"text": ("フォルダ %s の readings.csv を使い、lot ごとに value の平均を小数第2位まで"
+                  "求め、lot,mean の2列 CSV を lot 昇順で %s に書いて。ヘッダー行を付けて。"
+                  % (d, summary_csv)),
          "checks": [
-             {"type": "file_exists", "path": os.path.join(d, "summary.csv")},
+             {"type": "file_exists", "path": summary_csv},
              {"type": "shell", "expect_code": 0,
               "cmd": ("python -c \"import csv;"
                       "r=list(csv.DictReader(open(r'%s',encoding='utf-8')));"
                       "assert len(r)==12,len(r);"
                       "assert [x['lot'] for x in r]==sorted(x['lot'] for x in r);"
-                      "assert all(0<float(x['mean'])<10 for x in r)\""
-                      % os.path.join(d, "summary.csv"))}]},
+                      "assert all(0<float(x['mean'])<10 for x in r)\"" % summary_csv)}]},
 
-        # 3. a question whose answer is a single fact, but only after the join.
-        {"text": ("同じフォルダで、limit からの超過幅(value - limit)が最大の行の lot と day を"
-                  "「lot=..., day=...」の1行だけで答えて。ファイルは作らなくてよい。")},
+        # 3. one fact, but only after the join. Named folder and a checked artefact -- this is
+        #    the goal that burned 13 turns when it had neither.
+        {"text": ("フォルダ %s の readings.csv と limits.csv を使い、limit からの超過幅"
+                  "(value - limit)が最大の行を求め、「lot=<値>, day=<値>」の1行だけを "
+                  "%s に書いて。" % (d, worst_txt)),
+         "checks": [
+             {"type": "file_exists", "path": worst_txt},
+             {"type": "shell", "expect_code": 0,
+              "cmd": ("python -c \"expected='lot=%s, day=%s';"
+                      "got=open(r'%s',encoding='utf-8').read().strip();"
+                      "assert got==expected,(got,expected)\""
+                      % (facts["worst_lot"], facts["worst_day"], worst_txt))}]},
 
-        # 4. Work IQ, kept because the operator's day contains it and because a workload of
-        #    only local file work would measure a harness nobody runs.
-        {"text": ("自分の今日以降の予定を3件、開始日時と件名だけの箇条書きで挙げて。"
-                  "取得できない場合はその理由を1行で書いて FAIL と出力して。")},
+        # 4. Work IQ, kept because the operator's day contains it and a workload of only local
+        #    file work would measure a harness nobody runs. The answer depends on a live
+        #    calendar, so the check asserts SHAPE -- three dated lines, or a stated reason.
+        {"text": ("自分の今日以降の予定を3件、1行1件で「YYYY-MM-DD HH:MM 件名」の形式にして "
+                  "%s に書いて。取得できない場合は理由を1行だけ同じファイルに書いて。"
+                  % agenda_txt),
+         "checks": [
+             {"type": "file_exists", "path": agenda_txt},
+             {"type": "shell", "expect_code": 0,
+              "cmd": ("python -c \"import re;"
+                      "ls=[l.strip() for l in open(r'%s',encoding='utf-8') if l.strip()];"
+                      "assert ls,'empty';"
+                      "dated=[l for l in ls if re.match(r'^\d{4}-\d{2}-\d{2} ',l)];"
+                      "assert len(dated)==3 or len(ls)==1,(len(dated),len(ls))\"" % agenda_txt)}]},
     ]
 
 
