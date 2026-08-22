@@ -261,7 +261,9 @@ jobs:
             tools/test_notify_ops_dashboard_guard.py \
             tools/test_notify_ops_newlines.py \
             ui/test_fleet_cockpit_authority_window.py \
-            ui/test_selfimprove_dashboard_reading.py
+            ui/test_selfimprove_dashboard_reading.py \
+            relay/selfimprove/test_archive_publish_guard.py \
+            relay/selfimprove/test_run_archive.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py

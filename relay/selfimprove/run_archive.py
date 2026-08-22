@@ -1,0 +1,133 @@
+"""Which archived A/B runs the current instrument produced, and which measure something else.
+
+WHY THIS IS A MODULE AND NOT A JUDGEMENT MADE EACH TIME IT IS NEEDED
+
+The results directory keeps every campaign, and the ones in it were NOT all taken with the
+same instrument. Two changes landed on 2026-08-21 that altered what the number means:
+
+  11:06  the memory sampler stopped reporting total RSS -- which tracked which arm ran first --
+         and started reporting the commit growth each arm actually caused.
+  12:33  the arms stopped sharing a memory store, so arm 2 stopped opening on arm 1's notes
+         and reporting the cost of reading them as the cost of the work.
+
+A run from before either one is a measurement of a different quantity. It is not "older data
+worth less"; it is data about something else, and averaging it in is not conservatism.
+
+This was worked out by hand once and the hand-made version got it wrong: the 300 MB floor in
+`route_evaluator` was compared against a 130-180 MB spread that came entirely from PRE-isolation
+nulls, and a treatment effect was inferred from runs that predate the sampler fix. Both errors
+were the same error -- reading a number without asking which instrument produced it -- so the
+rule now lives in code where it can be applied the same way twice.
+"""
+from __future__ import annotations
+
+import glob
+import json
+import os
+
+#: When the sampler began measuring the quantity the arm caused. Commit 1759570.
+SAMPLER_EPOCH = 1787277967
+
+#: When the arms became independent units. Commit 477705a. This is the later of the two, so it
+#: is the one a run has to clear to be comparable with anything measured today.
+INSTRUMENT_EPOCH = 1787283181
+
+#: THE WORKLOAD IS PART OF THE INSTRUMENT TOO, AND ITS NAME DOES NOT CHANGE WHEN IT DOES.
+#:
+#: The `multiturn` set was run three times before it measured the work rather than its own
+#: defects: goals that pointed at "the same folder" while naming no path (fixed in 960e474)
+#: and a folder named by its 8.3 short form, which one arm spent three turns failing to write
+#: into (fixed in 254d18a). Runs from before those carry the same `goals` string as runs from
+#: after, so filtering on the name alone silently averages four numbers of which two describe
+#: broken goals. A set earns an entry here the moment a run of it is superseded by a fix.
+WORKLOAD_EPOCH = {"multiturn": 1787423013}
+
+RESULTS = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                       "docs", "research", "results")
+
+
+def _ts_of(experiment_id: str) -> int:
+    """The run's clock, from the trailing stamp the campaign puts in the id."""
+    tail = (experiment_id or "").rsplit("-", 1)[-1]
+    return int(tail) if tail.isdigit() else 0
+
+
+def load(results_dir: str = None) -> list:
+    """Every archived campaign, newest last, annotated with which instrument produced it."""
+    d = results_dir or RESULTS
+    out = []
+    for path in sorted(glob.glob(os.path.join(d, "route_campaign_*.json"))):
+        try:
+            rec = json.load(open(path, encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        exp = rec.get("ledger_experiment_id") or os.path.basename(path)
+        ts = _ts_of(exp)
+        out.append({
+            "path": path, "experiment_id": exp, "ts": ts,
+            "version": "v2" if "-v2-" in exp else "v1",
+            "null": bool(rec.get("null_run")),
+            # A run recorded before the field existed ran the set that was there then.
+            "goals": rec.get("goals") or "saturated-v1",
+            "arm_order": rec.get("arm_order") or "",
+            "control_peak_mb": (rec.get("control") or {}).get("peak_mb"),
+            "candidate_peak_mb": (rec.get("candidate") or {}).get("peak_mb"),
+            "memory_gain_mb": rec.get("memory_gain_mb"),
+            "current_instrument": ts >= INSTRUMENT_EPOCH,
+        })
+    out.sort(key=lambda r: r["ts"])
+    return out
+
+
+def comparable(runs, *, goals: str, version: str = "v1", null: bool = None) -> list:
+    """The runs that can be put in one column together.
+
+    Filters on the instrument AND on the goal set AND on the version of that goal set AND on
+    the candidate version. A difference measured on one goal set is not evidence about another
+    -- the two sets here have different spreads -- v1 and v2 are different candidates, and a
+    goal set keeps its name across the fixes that change what it measures.
+    """
+    since = WORKLOAD_EPOCH.get(goals, 0)
+    sel = [r for r in runs
+           if r["current_instrument"] and r["goals"] == goals and r["version"] == version
+           and r["ts"] >= since]
+    if null is not None:
+        sel = [r for r in sel if r["null"] is bool(null)]
+    return sel
+
+
+def spread(runs) -> dict:
+    """Summary of a column of runs. `None` where there is nothing to report.
+
+    Deliberately NOT a verdict. The verdict lives in `route_evaluator.decide`, which is frozen
+    and takes one pair; this only says what the archive contains, so a floor can be re-derived
+    from something reproducible instead of from whichever runs were remembered.
+    """
+    gains = [r["memory_gain_mb"] for r in runs if r["memory_gain_mb"] is not None]
+    if not gains:
+        return {"n": 0, "min": None, "max": None, "mean": None, "widest": None}
+    return {"n": len(gains), "min": min(gains), "max": max(gains),
+            "mean": round(sum(gains) / len(gains), 1),
+            "widest": round(max(gains) - min(gains), 1)}
+
+
+def report(results_dir: str = None) -> str:
+    """A table of what the archive holds, for a human deciding whether a floor can move."""
+    runs = load(results_dir)
+    lines = ["archive: %d runs, %d from the current instrument"
+             % (len(runs), sum(1 for r in runs if r["current_instrument"]))]
+    for goals in sorted({r["goals"] for r in runs}):
+        for version in sorted({r["version"] for r in runs}):
+            for null in (True, False):
+                sel = comparable(runs, goals=goals, version=version, null=null)
+                if not sel:
+                    continue
+                s = spread(sel)
+                lines.append("  %-13s %-3s %-9s n=%d  gains %s  spread %s MB"
+                             % (goals, version, "null" if null else "treatment", s["n"],
+                                [r["memory_gain_mb"] for r in sel], s["widest"]))
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":                                      # pragma: no cover
+    print(report())
