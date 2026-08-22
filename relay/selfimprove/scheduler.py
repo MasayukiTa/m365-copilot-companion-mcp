@@ -538,7 +538,8 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
                         max_concurrent=2, log_path=None, candidate_first=False,
                         warmup=False, null_arm=False,
                         transcript_dir=None, isolate_memory=True,
-                        control_manifest=None, control_socket=False):
+                        control_manifest=None, control_socket=False,
+                        arm_reset=None):
     """An `evaluate(manifest, experiment_id)` that measures transport, not pass@1.
 
     CompanionBench answers "did the candidate solve more episodes". For a transport hypothesis
@@ -784,6 +785,14 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
         # real fleet keeps its memory. The estimand this picks is the COLD one -- what the
         # transport costs per unit of actual work -- which is the question the hypothesis
         # asks. A steady-state estimand would keep the memory and randomise instead.
+        # THE WORKSPACE IS SHARED BETWEEN ARMS EVEN WHEN MEMORY IS NOT.
+        #
+        # Memory isolation above stops arm 2 READING arm 1's notes. It does nothing about arm 1's
+        # OUTPUT FILES: both arms run the same goals against the same folder, so arm 2 opens on
+        # finished work and its acceptance checks pass on arm 1's answers. The bias favours
+        # whichever arm ran second, which is the arm order rather than the treatment.
+        if arm_reset:
+            arm_reset()
         if isolate_memory:
             store = _os.path.join(
                 _os.environ.get("TEMP", "."), "route_arm_%s_%d"

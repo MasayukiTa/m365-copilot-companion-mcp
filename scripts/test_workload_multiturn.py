@@ -189,3 +189,55 @@ def test_the_docstring_records_the_measurement_not_the_intention():
     assert "THREE OF FOUR FINISHED IN ONE TURN IN BOTH ARMS" in doc
     assert "NO GOAL MAY POINT OUTSIDE ITS OWN TEXT" in doc
     assert "EVERY GOAL CARRIES AN ACCEPTANCE CHECK" in doc
+
+
+# ---- 腕どうしが独立した単位であること --------------------------------------------------------------
+
+def test_reset_outputs_removes_the_answers_and_keeps_the_inputs(built):
+    """腕2は腕1と同じゴールを同じフォルダで走らせるので、これが無いと
+    腕1の完成品を見て開始する。`file_exists` も内容一致も通ってしまい、
+    やっていない仕事が完了として記録される。偏りは常に後攻に有利で、
+    それは処置ではなく腕の順序。"""
+    d, _facts = built
+    for name in W.ANSWERS:
+        open(os.path.join(d, name), "w", encoding="utf-8").write("arm1 の成果")
+    W.reset_outputs(d)
+    for name in W.ANSWERS:
+        assert not os.path.exists(os.path.join(d, name)), name
+    for name in ("readings.csv", "limits.csv", "notes.csv"):
+        assert os.path.exists(os.path.join(d, name)), "入力まで消している: %s" % name
+
+
+def test_the_campaign_ships_that_reset_with_the_multiturn_set():
+    """フックがあっても渡していなければ何も起きない。"""
+    from scripts.run_route_campaign import active_goals
+    _g, name, reset = active_goals(["run", "--multiturn"])
+    assert name == "multiturn"
+    assert reset is W.reset_outputs
+    _g2, name2, reset2 = active_goals(["run"])
+    assert (name2, reset2) == ("saturated-v1", None)
+
+
+def test_the_evaluator_calls_the_reset_at_the_top_of_every_arm():
+    """構造検査。腕を1本走らせるには実ブラウザが要るので挙動では確かめられない。
+    見ているのは2点: 腕の関数の中で呼ばれていること、そして
+    `isolate_memory` の分岐の中に入っていないこと(記憶隔離を切ると
+    リセットも黙って消える、という壊れ方をさせない)。"""
+    import ast
+    import inspect
+    from relay.selfimprove import scheduler as S
+
+    assert "arm_reset" in inspect.signature(S.route_evaluator_for).parameters
+    tree = ast.parse(inspect.getsource(S.route_evaluator_for).lstrip())
+    run = next(n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "_run")
+    calls = [n for n in ast.walk(run)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id == "arm_reset"]
+    assert calls, "_run が arm_reset を呼んでいない"
+    guarded = [n for n in ast.walk(run)
+               if isinstance(n, ast.If)
+               and any(isinstance(x, ast.Name) and x.id == "isolate_memory"
+                       for x in ast.walk(n.test))
+               and any(c in ast.walk(n) for c in calls)]
+    assert not guarded, "記憶隔離の分岐の中に入っている"

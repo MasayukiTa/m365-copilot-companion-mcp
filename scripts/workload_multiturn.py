@@ -126,6 +126,28 @@ def clean(workdir: str = WORKDIR) -> None:
             pass
 
 
+#: The files a goal is supposed to PRODUCE, as opposed to the ones it reads.
+ANSWERS = ("over_limit.txt", "summary.csv", "worst.txt", "agenda.txt")
+
+
+def reset_outputs(workdir: str = WORKDIR) -> None:
+    """Remove the answers, keep the inputs. Called BETWEEN ARMS.
+
+    Arm 2 runs the same goals in the same folder, so without this it opens on arm 1's finished
+    work: `file_exists` passes, and the content checks pass too, because arm 1's answer is the
+    right one. Arm 2 then scores a completion for work it did not do, and the bias always
+    favours whichever arm ran second -- which is the arm order, not the treatment.
+
+    The inputs stay, because regenerating them is the campaign's job at the start and doing it
+    again here would hand arm 2 a folder whose modification times differ from arm 1's.
+    """
+    for name in ANSWERS:
+        try:
+            os.remove(os.path.join(workdir, name))
+        except OSError:
+            pass
+
+
 def goals(workdir: str = WORKDIR) -> list:
     """The goal set. Every goal names its own folder and carries an acceptance check.
 

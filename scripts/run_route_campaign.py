@@ -73,6 +73,28 @@ GOALS = [
                  "expect_code": 0}]},
 ]
 
+#: The workload this campaign runs. `--multiturn` swaps in the set with headroom.
+#:
+#: BOTH ARE KEPT AND THE CHOICE IS RECORDED. The old set is saturated -- 96.4% of its goals
+#: finish in one turn -- so a comparison on it can only detect harm. That does not make it
+#: worthless: every calibration measured so far was measured ON it, and a floor derived from
+#: one workload says nothing about another. Deleting it would leave those numbers describing a
+#: goal set nobody could look at.
+def active_goals(argv=None):
+    """(goals, name, arm_reset). `arm_reset` runs between arms, or None if the set needs none.
+
+    The name goes into the record so a later reader knows which set ran. The reset exists
+    because a set that writes files leaves arm 2 looking at arm 1's finished work.
+    """
+    import sys as _sys
+    argv = _sys.argv if argv is None else argv
+    if "--multiturn" in argv:
+        from scripts import workload_multiturn as _W
+        _W.clean()
+        return _W.goals(), "multiturn", _W.reset_outputs
+    return GOALS, "saturated-v1", None
+
+
 RESULTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                        "docs", "research", "results")
 OUT = os.path.join(RESULTS, "route_campaign.json")
@@ -97,7 +119,7 @@ def main():
             os.remove(os.path.join(_OUT, name))
         except OSError:
             pass
-    print("[campaign] candidate=%s goals=%d" % (version, len(GOALS)), flush=True)
+    print("[campaign] candidate=%s" % version, flush=True)
     print("[campaign] agent=%s" % agent_url[:60], flush=True)
 
     exp = "route-%s%s-%s-%d" % (version.replace("/", "-"),
@@ -149,7 +171,9 @@ def main():
              "note": "the memory floor for this machine is 512 MB"},
         ],
     )
-    evaluate = S.route_evaluator_for(GOALS, agent_url=agent_url, max_concurrent=2,
+    goals, goals_name, arm_reset = active_goals()
+    print("[campaign] goals: %s (%d)" % (goals_name, len(goals)), flush=True)
+    evaluate = S.route_evaluator_for(goals, agent_url=agent_url, max_concurrent=2,
                                      candidate_first=candidate_first,
                                      warmup="--warmup" in sys.argv,
                                      null_arm="--null" in sys.argv,
@@ -158,11 +182,13 @@ def main():
                                      # writes only while the route is enabled -- a tabs-only
                                      # null pass records nothing and looks normal doing it.
                                      control_socket="--socket-both" in sys.argv,
-                                     transcript_dir=os.path.join(RESULTS, "tx", exp))
+                                     transcript_dir=os.path.join(RESULTS, "tx", exp),
+                                     arm_reset=arm_reset)
     t0 = time.time()
     out = evaluate(candidate, exp)
     out["wall_s"] = round(time.time() - t0, 1)
     out["version"] = version
+    out["goals"] = goals_name
     infra = out.get("infra") or {}
     if infra.get("aborted"):
         # INFRA_ABORT, never INCONCLUSIVE. "the harness broke" and "the change did nothing"
