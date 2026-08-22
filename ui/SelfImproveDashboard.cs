@@ -206,7 +206,8 @@ class SelfImproveDashboardWindow : Window
         if (k == "ab_sec")        return ja ? "A/B 履歴" : "A/B history";
         if (k == "burned_sec")    return ja ? "Burned 台帳" : "Burned ledger";
         if (k == "trend_sec")     return ja ? "Pass@1 推移" : "Pass@1 trend";
-        if (k == "archive_sec")   return ja ? "アーカイブ" : "Archive";
+        if (k == "archive_sec")   return ja ? "ゲノム" : "Genomes";
+        if (k == "auth_detail")   return ja ? "記録と取り消し" : "Records and undo";
 
         // section explanations (one-liner below the label)
         if (k == "usage_exp")  return ja
@@ -225,8 +226,8 @@ class SelfImproveDashboardWindow : Window
             ? "各改善サイクル後の pass@1 の推移（新しい順・最大24件）。"
             : "Pass@1 after each improvement cycle, newest first — up to 24 points shown.";
         if (k == "archive_exp") return ja
-            ? "採用されたゲノム（解決スクリプトの変種）の多様性アーカイブ。QDセルは問題タイプごとのスロット数。"
-            : "Diversity archive of adopted genomes (scaffold variants). QD cells = slots by problem type.";
+            ? "採用されたゲノム（解決スクリプトの変種）とその測定値。QDセルは問題タイプごとのスロット数。"
+            : "Adopted genomes (scaffold variants) and what each measured. QD cells = slots by problem type.";
 
         // metric labels
         if (k == "u_completion")  return ja ? "完了率" : "Completion";
@@ -247,6 +248,13 @@ class SelfImproveDashboardWindow : Window
         if (k == "archive_count") return ja ? "採用ゲノム数" : "Archive count";
         if (k == "qd_cells")      return ja ? "QD セル" : "QD cells";
         if (k == "genomes")       return ja ? "ゲノム" : "Genomes";
+        if (k == "g_id")          return ja ? "ゲノム" : "Genome";
+        if (k == "g_pass")        return ja ? "pass@1" : "pass@1";
+        if (k == "g_gate")        return ja ? "ゲート判定" : "Gate";
+        if (k == "g_desc")        return ja ? "特性" : "Descriptors";
+        if (k == "g_parent")      return ja ? "親" : "Parent";
+        if (k == "g_best")        return ja ? "最良 pass@1" : "Best pass@1";
+        if (k == "g_root")        return ja ? "\u2014 (起点)" : "\u2014 (root)";
         if (k == "keep")          return ja ? "採用" : "Keep";
         if (k == "none")          return ja ? "なし" : "none";
         if (k == "total")         return ja ? "合計" : "Total";
@@ -746,14 +754,20 @@ class SelfImproveDashboardWindow : Window
 
     void Render(Dictionary<string, object> state)
     {
+        // ORDER IS AN ARGUMENT ABOUT WHAT MATTERS, and this one used to open on the audit
+        // log. The archive is what the loop is FOR -- the solvers it has actually adopted --
+        // and it sat last, as two integers, while the record of permission changes took the
+        // first screen every time. The integrity checks still have to be reachable without
+        // hunting, which is why they collapse to one line rather than moving out of sight,
+        // and why they expand themselves when a check fails.
         _body.Children.Clear();
-        _body.Children.Add(BuildAuthority());
-        _body.Children.Add(BuildUsage(state));
+        _body.Children.Add(BuildArchive(state));
         _body.Children.Add(BuildScorecard(state));
         _body.Children.Add(BuildAbHistory(state));
-        _body.Children.Add(BuildBurnedLedger(state));
         _body.Children.Add(BuildPassTrend(state));
-        _body.Children.Add(BuildArchive(state));
+        _body.Children.Add(BuildUsage(state));
+        _body.Children.Add(BuildBurnedLedger(state));
+        _body.Children.Add(BuildAuthority());
     }
 
     // ── AUTHORITY ───────────────────────────────────────────────────────────────
@@ -896,67 +910,193 @@ class SelfImproveDashboardWindow : Window
         bool intact = FrozenMatches(out nChecked, out differing, out anchorOk);
         string chainProblem; bool linksOk = LedgerLinksHold(rows, out chainProblem);
 
-        // -- current state, always visible. An event list alone buries the one fact that
-        //    decides whether anything else on this screen can be trusted.
-        var head = new WrapPanel(); head.Margin = new Thickness(0, 10, 0, 0);
-        head.Children.Add(Pill(T("auth_intact") + ": " + (intact ? T("auth_ok") : T("auth_broken"))
-                               + " (" + nChecked + ")", intact ? "good" : "bad"));
-        head.Children.Add(Pill(T("auth_anchor") + ": " + (anchorOk ? T("auth_ok") : T("auth_broken")),
-                               anchorOk ? "good" : "bad"));
-        head.Children.Add(Pill(T("auth_chain") + ": "
-                               + (linksOk ? T("auth_chain_ok") : chainProblem),
-                               linksOk ? "good" : "bad"));
-        col.Children.Add(head);
-        if (!intact && differing.Count > 0)
-            col.Children.Add(MuteRow(string.Join(", ", differing.ToArray())));
-        col.Children.Add(MuteRow(T("auth_verified_here")));
-
-        // -- rate. A bare number is not monitoring; it needs a usual level to sit against.
+        // -- rate first: it belongs in the same one-line verdict as the three checks, so it
+        //    has to be computed before the header is built. A bare number is not monitoring;
+        //    it needs a usual level to sit against.
         double now = (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds;
         int last7 = 0; int prior = 0;
-        foreach (var r in rows)
+        foreach (var r0 in rows)
         {
-            object ev, ts;
-            r.TryGetValue("event", out ev); r.TryGetValue("ts", out ts);
-            if (ev == null || Convert.ToString(ev) != "rebless" || ts == null) continue;
-            double age = now - Convert.ToDouble(ts);
+            object ev0, ts0;
+            r0.TryGetValue("event", out ev0); r0.TryGetValue("ts", out ts0);
+            if (ev0 == null || Convert.ToString(ev0) != "rebless" || ts0 == null) continue;
+            double age = now - Convert.ToDouble(ts0);
             if (age <= 7 * 86400) last7++; else if (age <= 35 * 86400) prior++;
         }
         double usual = prior / 4.0;
         bool hot = last7 > Math.Max(2.0, usual * 3.0);
-        var rateRow = new WrapPanel(); rateRow.Margin = new Thickness(0, 8, 0, 0);
-        rateRow.Children.Add(Pill(T("auth_rate") + ": " + last7
-                                  + (usual > 0 ? "  (~" + usual.ToString("0.#") + ")" : ""),
-                                  hot ? "warn" : "muted"));
-        if (hot) rateRow.Children.Add(Pill(T("auth_rate_hi"), "warn"));
-        col.Children.Add(rateRow);
+        string rateTxt = T("auth_rate") + ": " + last7
+                       + (usual > 0 ? "  (~" + usual.ToString("0.#") + ")" : "");
 
-        // -- the events themselves, newest first, with the actor and what was touched
+        // -- current state, always visible. An event list alone buries the one fact that
+        //    decides whether anything else on this screen can be trusted.
+        //
+        //    SETTLED AS ONE LINE WHEN IT IS SETTLED. Four saturated badges announcing that
+        //    nothing is wrong is an instruction to read four things in order to learn
+        //    nothing, and it spends the reader's attention precisely where there is nothing
+        //    to spend it on. A chip is now reserved for a check that FAILED; everything
+        //    holding collapses into one muted line. Nothing is hidden by this -- every count
+        //    and every verdict is still on screen, at the weight the news deserves.
+        var okBits = new List<string>();
+        var head = new WrapPanel(); head.Margin = new Thickness(0, 10, 0, 0);
+
+        if (intact) okBits.Add(T("auth_intact") + ": " + T("auth_ok") + " (" + nChecked + ")");
+        else head.Children.Add(Pill(T("auth_intact") + ": " + T("auth_broken")
+                                    + " (" + nChecked + ")", "bad"));
+
+        if (anchorOk) okBits.Add(T("auth_anchor") + ": " + T("auth_ok"));
+        else head.Children.Add(Pill(T("auth_anchor") + ": " + T("auth_broken"), "bad"));
+
+        if (linksOk) okBits.Add(T("auth_chain") + ": " + T("auth_chain_ok"));
+        else head.Children.Add(Pill(T("auth_chain") + ": " + chainProblem, "bad"));
+
+        if (hot) head.Children.Add(Pill(rateTxt + "  \u2014  " + T("auth_rate_hi"), "warn"));
+        else okBits.Add(rateTxt);
+
+        // EVERYTHING PASSING MEANS ONE LINE. The detail pane below carries the records, the
+        // disclosure of what this check does not cover, and the way back; it opens on click,
+        // and it opens BY ITSELF the moment any check fails, so the state that needs reading
+        // is never the state you have to go looking for. What stays visible when it is shut
+        // is the whole verdict -- three checks and the re-signing count -- so collapsing
+        // withholds detail, never news.
+        bool allWell = intact && anchorOk && linksOk && !hot;
+        var detail = new StackPanel();
+        detail.Visibility = allWell ? Visibility.Collapsed : Visibility.Visible;
+
+        if (head.Children.Count > 0) col.Children.Add(head);
+        if (okBits.Count > 0)
+        {
+            var okLine = new TextBlock();
+            okLine.Text = (head.Children.Count == 0 ? "\u2713  " : "")
+                        + string.Join("    \u00b7    ", okBits.ToArray());
+            okLine.Foreground = Muted; okLine.FontSize = Theme.FsMeta;
+            okLine.TextWrapping = TextWrapping.Wrap;
+            okLine.Margin = new Thickness(0, head.Children.Count > 0 ? 8 : 10, 0, 0);
+            col.Children.Add(okLine);
+        }
+
+        var toggle = new TextBlock();
+        toggle.Text = (allWell ? "\u25b8  " : "\u25be  ") + T("auth_detail");
+        toggle.Foreground = Accent; toggle.FontSize = 11.5;
+        toggle.Margin = new Thickness(0, 8, 0, 0);
+        toggle.Cursor = System.Windows.Input.Cursors.Hand;
+        var detailRef = detail; var toggleRef = toggle;
+        toggle.MouseLeftButtonUp += delegate
+        {
+            bool open = detailRef.Visibility != Visibility.Visible;
+            detailRef.Visibility = open ? Visibility.Visible : Visibility.Collapsed;
+            toggleRef.Text = (open ? "\u25be  " : "\u25b8  ") + T("auth_detail");
+        };
+        col.Children.Add(toggle);
+        col.Children.Add(detail);
+
+        if (!intact && differing.Count > 0)
+            detail.Children.Add(MuteRow(string.Join(", ", differing.ToArray())));
+        detail.Children.Add(MuteRow(T("auth_verified_here")));
+
+        // -- the events themselves, newest first. Previously one run-on line concatenated the
+        //    event kind, the actor and the touched files with no separator, and dropped the
+        //    reason to muted underneath -- so the four different kinds of thing inside a
+        //    record were typographically the same thing, and the record's actual content was
+        //    the faintest part of it. Now each record is a rail-marked block: what happened
+        //    and when on the first line, WHY in body text on the second, where underneath.
         int shown = 0;
         for (int i = rows.Count - 1; i >= 0 && shown < 8; i--)
         {
             object ev; rows[i].TryGetValue("event", out ev);
             string kind = Convert.ToString(ev);
             if (kind == "genesis") continue;
-            object actor, reason, changed, auth;
+            object actor, reason, changed, auth, ts;
             rows[i].TryGetValue("actor_claimed", out actor);
             rows[i].TryGetValue("reason", out reason);
             rows[i].TryGetValue("changed", out changed);
             rows[i].TryGetValue("authorization", out auth);
+            rows[i].TryGetValue("ts", out ts);
             var files = changed as Dictionary<string, object>;
             string scope = files == null || files.Count == 0
-                ? "" : "  [" + string.Join(", ", new List<string>(files.Keys).ToArray()) + "]";
-            var line = new TextBlock();
-            line.Text = kind + "  " + Convert.ToString(actor) + scope;
-            line.Foreground = Fg; line.FontSize = Theme.FsMeta;
-            line.TextWrapping = TextWrapping.Wrap; line.Margin = new Thickness(0, 8, 0, 0);
-            col.Children.Add(line);
-            col.Children.Add(MuteRow(Convert.ToString(reason)));
+                ? "" : string.Join(", ", new List<string>(files.Keys).ToArray());
+
+            var body = new StackPanel();
+
+            // line 1 -- what, by whom, when
+            var g = new Grid();
+            var c0 = new ColumnDefinition(); c0.Width = GridLength.Auto;
+            var c1 = new ColumnDefinition(); c1.Width = new GridLength(1, GridUnitType.Star);
+            var c2 = new ColumnDefinition(); c2.Width = GridLength.Auto;
+            g.ColumnDefinitions.Add(c0); g.ColumnDefinitions.Add(c1); g.ColumnDefinitions.Add(c2);
+            var kindTb = new TextBlock();
+            kindTb.Text = kind; kindTb.Foreground = Fg;
+            kindTb.FontFamily = new FontFamily(Theme.CodeFont);
+            kindTb.FontSize = Theme.FsMeta; kindTb.FontWeight = FontWeights.SemiBold;
+            Grid.SetColumn(kindTb, 0); g.Children.Add(kindTb);
+            var actorTb = ClipLine(Convert.ToString(actor), Muted, Theme.FsMeta, false);
+            actorTb.Margin = new Thickness(12, 0, 12, 0);
+            Grid.SetColumn(actorTb, 1); g.Children.Add(actorTb);
+            if (ts != null)
+            {
+                var when = new TextBlock();
+                when.Text = AgoText(Convert.ToDouble(ts), now);
+                when.Foreground = Theme.Br(Theme.Faint(_dark));
+                when.FontSize = 11;
+                when.VerticalAlignment = VerticalAlignment.Center;
+                when.ToolTip = new DateTime(1970, 1, 1).AddSeconds(Convert.ToDouble(ts))
+                                   .ToLocalTime().ToString("yyyy-MM-dd HH:mm");
+                Grid.SetColumn(when, 2); g.Children.Add(when);
+            }
+            body.Children.Add(g);
+
+            // line 2 -- WHY. Body colour: the reason is the record, not a footnote to it.
+            var reasonTb = ClipLine(Convert.ToString(reason), Fg, Theme.FsMeta, false);
+            reasonTb.Margin = new Thickness(0, 4, 0, 0);
+            body.Children.Add(reasonTb);
+
+            // line 3 -- where
+            TextBlock scopeTb = null;
+            if (scope.Length > 0)
+            {
+                scopeTb = ClipLine(scope, Theme.Br(Theme.Faint(_dark)), Theme.FsLog, true);
+                scopeTb.Margin = new Thickness(0, 3, 0, 0);
+                body.Children.Add(scopeTb);
+            }
+
+            // line 4 -- the words somebody outside this system used to permit the act. Given
+            //           the quote treatment so its provenance is legible from the shape.
             if (auth != null && Convert.ToString(auth) != "self-initiated")
-                col.Children.Add(MuteRow("“" + Convert.ToString(auth) + "”"));
+            {
+                var q = new Border();
+                q.Background = QuoteBg;
+                q.BorderBrush = new SolidColorBrush(Mix(Theme.Col(Theme.Faint(_dark)), CardColor(), 0.6));
+                q.BorderThickness = new Thickness(2, 0, 0, 0);
+                q.CornerRadius = new CornerRadius(0, Theme.RadSmall, Theme.RadSmall, 0);
+                q.Padding = new Thickness(8, 4, 8, 4);
+                q.Margin = new Thickness(0, 6, 0, 0);
+                q.HorizontalAlignment = HorizontalAlignment.Left;
+                var qt = new TextBlock();
+                qt.Text = "\u201c" + Convert.ToString(auth) + "\u201d";
+                qt.Foreground = Muted; qt.FontSize = Theme.FsMeta;
+                qt.TextWrapping = TextWrapping.Wrap; qt.MaxWidth = 620;
+                q.Child = qt;
+                body.Children.Add(q);
+            }
+
+            var rec = new Border();
+            rec.BorderThickness = new Thickness(Theme.RailW, 0, 0, 0);
+            rec.BorderBrush = RailForEvent(kind);
+            rec.Padding = new Thickness(10, 6, 0, 6);
+            rec.Margin  = new Thickness(0, 10, 0, 0);
+            rec.Background = Brushes.Transparent;   // the whole block is the hit target, not the text
+            rec.Cursor = System.Windows.Input.Cursors.Hand;
+            rec.Child = body;
+            var rTb = reasonTb; var sTb = scopeTb; var aTb = actorTb;
+            rec.MouseLeftButtonUp += delegate
+            {
+                bool open = rTb.TextWrapping == TextWrapping.NoWrap;
+                SetClip(rTb, open); SetClip(sTb, open); SetClip(aTb, open);
+            };
+            detail.Children.Add(rec);
             shown++;
         }
-        if (shown == 0) col.Children.Add(MuteRow(T("auth_none")));
+        if (shown == 0) detail.Children.Add(MuteRow(T("auth_none")));
 
         // -- the way back. One step, repeatable. Jumping to an arbitrary earlier point would
         //    be CHOOSING a state to install, and choosing is what promotion is; withdrawing
@@ -967,7 +1107,7 @@ class SelfImproveDashboardWindow : Window
         btn.Margin  = new Thickness(0, 14, 0, 0);
         btn.HorizontalAlignment = HorizontalAlignment.Left;
         btn.Click += delegate { RevokeLastRebless(); };
-        col.Children.Add(btn);
+        detail.Children.Add(btn);
         return card;
     }
 
@@ -1444,19 +1584,109 @@ class SelfImproveDashboardWindow : Window
 
     // ── (5) ARCHIVE ──────────────────────────────────────────────────────────────
     // Genome count + QD cells.
+    // Highest pass@1 across adopted genomes. The scorecard's "latest" answers a different
+    // question -- what the last cycle scored -- and the two diverge exactly when a cycle
+    // regresses, which is the case worth being able to see.
+    string BestPass(Dictionary<string, object> arc)
+    {
+        object[] gs = arc != null ? Arr(arc, "genomes") : null;
+        if (gs == null || gs.Length == 0) return "?";
+        double best = double.MinValue;
+        foreach (var o in gs)
+        {
+            var g = o as Dictionary<string, object>;
+            if (g == null || !g.ContainsKey("pass_at_1") || g["pass_at_1"] == null) continue;
+            try { double v = Convert.ToDouble(g["pass_at_1"]); if (v > best) best = v; }
+            catch (Exception) { }
+        }
+        return best == double.MinValue ? "?" : best.ToString("0.###");
+    }
+
     UIElement BuildArchive(Dictionary<string, object> state)
     {
         var card = SectionCard("archive_sec", "archive_exp");
         var col  = (StackPanel)card.Child;
         var arc  = Obj(state, "archive");
+        var sum  = Obj(state, "summary");
 
         var grid = new Grid(); grid.Margin = new Thickness(0, 10, 0, 0);
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(2, GridUnitType.Star) });
+        for (int c = 0; c < 3; c++)
+        {
+            var cd = new ColumnDefinition(); cd.Width = new GridLength(1, GridUnitType.Star);
+            grid.ColumnDefinitions.Add(cd);
+        }
         grid.Children.Add(MetricCell(T("genomes"),  I(arc, "count").ToString(),    Fg, 0));
         grid.Children.Add(MetricCell(T("qd_cells"), I(arc, "qd_cells").ToString(), Fg, 1));
+        grid.Children.Add(MetricCell(T("g_best"), BestPass(arc), Fg, 2));
         col.Children.Add(grid);
+
+        // THE GENOMES THEMSELVES. The feed has carried id, parent, pass@1, the gate verdict
+        // and the behavioural descriptors for every adopted genome all along; the card showed
+        // two integers derived from that list and threw the list away. Nothing here needed new
+        // data -- only for the screen to stop discarding what it was already given.
+        object[] gs = arc != null ? Arr(arc, "genomes") : null;
+        if (gs == null || gs.Length == 0) { col.Children.Add(MuteRow(T("none"))); return card; }
+
+        var table = new Grid(); table.Margin = new Thickness(0, 14, 0, 0);
+        double[] w = { 1.1, 0.7, 1.0, 2.0, 1.0 };
+        for (int c = 0; c < w.Length; c++)
+        {
+            var cd = new ColumnDefinition(); cd.Width = new GridLength(w[c], GridUnitType.Star);
+            table.ColumnDefinitions.Add(cd);
+        }
+        var hr = new RowDefinition(); hr.Height = GridLength.Auto;
+        table.RowDefinitions.Add(hr);
+        string[] heads = { T("g_id"), T("g_pass"), T("g_gate"), T("g_desc"), T("g_parent") };
+        for (int c = 0; c < heads.Length; c++)
+        {
+            var h = ColHeader(heads[c], c);
+            Grid.SetRow((UIElement)h, 0);
+            table.Children.Add((UIElement)h);
+        }
+
+        int shownG = 0;
+        for (int i = gs.Length - 1; i >= 0 && shownG < 12; i--)
+        {
+            var g = gs[i] as Dictionary<string, object>;
+            if (g == null) continue;
+            var rd = new RowDefinition(); rd.Height = GridLength.Auto;
+            table.RowDefinitions.Add(rd);
+            int row = table.RowDefinitions.Count - 1;
+
+            string gid    = S(g, "id");
+            string gate   = S(g, "gate_verdict");
+            object parent = g.ContainsKey("parent_id") ? g["parent_id"] : null;
+            string ptxt   = parent == null ? T("g_root") : Convert.ToString(parent);
+
+            var desc = Obj(g, "descriptors");
+            var dparts = new List<string>();
+            if (desc != null)
+                foreach (var kv in desc)
+                    dparts.Add(Convert.ToString(kv.Value));
+            string dtxt = string.Join("  \u00b7  ", dparts.ToArray());
+
+            var idTb = RowCell(gid, Fg, true, 0) as TextBlock;
+            if (idTb != null) idTb.FontFamily = new FontFamily(Theme.CodeFont);
+            var cells = new UIElement[] {
+                (UIElement)idTb,
+                (UIElement)RowCell(Num(g.ContainsKey("pass_at_1") ? g["pass_at_1"] : null, "0.###"),
+                                   Fg, true, 1),
+                (UIElement)RowCell(gate, Muted, false, 2),
+                (UIElement)RowCell(dtxt, Muted, false, 3),
+                (UIElement)RowCell(ptxt, Theme.Br(Theme.Faint(_dark)), false, 4)
+            };
+            for (int c = 0; c < cells.Length; c++)
+            {
+                var fe = cells[c] as FrameworkElement;
+                if (fe != null) fe.Margin = new Thickness(c == 0 ? 0 : 4, 6, 0, 0);
+                Grid.SetRow(cells[c], row);
+                table.Children.Add(cells[c]);
+            }
+            shownG++;
+        }
+        col.Children.Add(table);
+        if (gs.Length > shownG)
+            col.Children.Add(MuteRow("+" + (gs.Length - shownG) + (_lang == 0 ? " 件" : " more")));
         return card;
     }
 
@@ -1591,7 +1821,7 @@ class SelfImproveDashboardWindow : Window
 
         // bar: a two-star Grid inside a pill-shaped track
         var track = new Border();
-        track.Height = 8; track.CornerRadius = new CornerRadius(999);
+        track.Height = 8; track.CornerRadius = new CornerRadius(4);   // = height/2. 999 renders as a lens, not a bar.
         track.Background = QuoteBg;
         track.VerticalAlignment = VerticalAlignment.Center;
         track.Margin = new Thickness(0, 0, 10, 0);
@@ -1599,7 +1829,7 @@ class SelfImproveDashboardWindow : Window
         bargrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(frac,       GridUnitType.Star) });
         bargrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.0 - frac, GridUnitType.Star) });
         var fill = new Border();
-        fill.Height = 8; fill.CornerRadius = new CornerRadius(999); fill.Background = Accent;
+        fill.Height = 8; fill.CornerRadius = new CornerRadius(4); fill.Background = Accent;
         Grid.SetColumn(fill, 0); bargrid.Children.Add(fill);
         track.Child = bargrid;
         Grid.SetColumn(track, 1); grid.Children.Add(track);
@@ -1614,19 +1844,86 @@ class SelfImproveDashboardWindow : Window
         return grid;
     }
 
-    // Pill badge (saturated bg, white text).
+    // Status chip. Theme.cs states the design target in as many words -- status is "a thin
+    // left rail + small chip (never a full-card fill)" -- and this was a saturated full fill
+    // at radius 999, which is pixel-identical to the cockpit's RUNNING indicator. Three of
+    // them in a row over a static integrity check therefore read as three things spinning.
+    // Shape carries meaning whether or not that was intended.
+    //
+    // Now: soft tint, small radius, the status colour carried by the TEXT. The tint is mixed
+    // against the card, so the chip never becomes a dark ground and the white-on-dark rule
+    // has nothing to bind to. "muted" spends no colour at all -- a normal state should not
+    // cost a chip, and if everything is normal the caller should not be building one.
     Border Pill(string text, string ck)
     {
         var b = new Border();
-        b.Background   = new SolidColorBrush(StatusColorFor(ck, _dark));
-        b.CornerRadius = new CornerRadius(999);
-        b.Padding      = new Thickness(9, 2, 9, 2);
+        b.CornerRadius = new CornerRadius(Theme.RadSmall);
+        b.Padding      = new Thickness(8, 2, 8, 2);
+        b.Margin       = new Thickness(0, 0, 6, 0);
         b.VerticalAlignment = VerticalAlignment.Center;
         var t = new TextBlock();
         t.Text = string.IsNullOrEmpty(text) ? "?" : text;
-        t.Foreground = White;
-        t.FontSize = 11; t.FontWeight = FontWeights.SemiBold;
+        t.FontSize = Theme.FsChip; t.FontWeight = FontWeights.SemiBold;
+        if (ck == "good" || ck == "warn" || ck == "bad")
+        {
+            Color c = StatusColorFor(ck, _dark);
+            b.Background      = new SolidColorBrush(Mix(c, CardColor(), 0.14));
+            b.BorderBrush     = new SolidColorBrush(Mix(c, CardColor(), 0.45));
+            b.BorderThickness = new Thickness(1);
+            t.Foreground      = new SolidColorBrush(c);
+        }
+        else
+        {
+            t.Foreground = Muted;
+            b.Padding    = new Thickness(0, 2, 8, 2);
+        }
         b.Child = t;
         return b;
+    }
+
+    // "3日前" / "3 d ago" from a unix timestamp. The ledger has carried a ts on every record
+    // from the beginning and the history displayed none of it: a list of acts with no times
+    // is not a history, and it is the single largest reason the section could not be read.
+    string AgoText(double ts, double now)
+    {
+        bool ja = _lang == 0;
+        double sec = now - ts;
+        if (sec < 90) return ja ? "たった今" : "just now";
+        if (sec < 3600) return ((int)(sec / 60)).ToString() + (ja ? "分前" : " min ago");
+        if (sec < 86400) return ((int)(sec / 3600)).ToString() + (ja ? "時間前" : " hr ago");
+        return ((int)(sec / 86400)).ToString() + (ja ? "日前" : " d ago");
+    }
+
+    // One ledger record, as a rail-marked block. The rail is the only colour a record spends,
+    // and it encodes the one thing worth encoding: whether the act widened what this system
+    // may become. Everything else is typography.
+    Brush RailForEvent(string kind)
+    {
+        if (kind == "baseline_mismatch" || kind == "revoke")
+            return new SolidColorBrush(StatusColorFor("bad", _dark));
+        if (kind == "rebless")
+            return new SolidColorBrush(StatusColorFor("warn", _dark));
+        return new SolidColorBrush(Mix(Theme.Col(Theme.Faint(_dark)), CardColor(), 0.55));
+    }
+
+    static void SetClip(TextBlock t, bool open)
+    {
+        if (t == null) return;
+        t.TextWrapping = open ? TextWrapping.Wrap : TextWrapping.NoWrap;
+        t.TextTrimming = open ? TextTrimming.None : TextTrimming.CharacterEllipsis;
+    }
+
+    // Long single lines, clipped rather than wrapped: eight records that each wrap to four
+    // lines is the same unreadable wall in a different shape. The full text is on the tooltip
+    // and one click on the record opens every clipped line in it.
+    TextBlock ClipLine(string text, Brush fg, double size, bool mono)
+    {
+        var t = new TextBlock();
+        t.Text = text; t.Foreground = fg; t.FontSize = size;
+        if (mono) t.FontFamily = new FontFamily(Theme.CodeFont);
+        t.TextWrapping = TextWrapping.NoWrap;
+        t.TextTrimming = TextTrimming.CharacterEllipsis;
+        if (!string.IsNullOrEmpty(text)) t.ToolTip = text;
+        return t;
     }
 }

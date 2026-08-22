@@ -63,18 +63,34 @@ DASHBOARD_COOLDOWN_S = 300.0
 
 
 def cockpit_running() -> bool:
-    """True iff a cockpit process is up. Split out so a test can answer it without a machine.
+    """True iff the AUTHORITY dashboard is up. Split out so a test can answer it without a machine.
 
     Kept separate because the two halves of the guard fail differently and have to be testable
     apart: the cooldown is arithmetic, this reads the world. A test of the cooldown that also
     consults the real process list passes or fails on whether the operator happens to have the
     dashboard open, which is not what it is asking.
+
+    THE PROCESS NAME IS NOT THE WINDOW. One executable serves three windows -- the ordinary
+    cockpit, the approval prompt and this dashboard -- so matching the image name reported
+    "already running" whenever the operator had the cockpit open, which is nearly always, and
+    the re-signing notification then opened nothing at all. Measured: with the cockpit up, four
+    consecutive calls were refused and no dashboard ever appeared. The argv is what distinguishes
+    them, so the argv is what gets read.
+
+    A process whose cmdline cannot be read (access denied on a foreign owner) is not counted:
+    the harm of one extra window is small and bounded, and the harm of silently refusing to
+    open the control is the failure this whole path exists to prevent.
     """
     try:
         import psutil
         want = COCKPIT.name.lower()
-        return any((p.info.get("name") or "").lower() == want
-                   for p in psutil.process_iter(["name"]))
+        for proc in psutil.process_iter(["name", "cmdline"]):
+            if (proc.info.get("name") or "").lower() != want:
+                continue
+            argv = proc.info.get("cmdline") or []
+            if any(str(a).lower() == "--authority" for a in argv[1:]):
+                return True
+        return False
     except Exception:
         return False
 
@@ -85,6 +101,15 @@ def _dashboard_already_up() -> str:
     Two independent reasons, because either alone leaks. A cooldown does not notice a window
     the operator left open from yesterday; a running-process check does not stop a burst that
     all fires before the first process appears in the list.
+
+    NEITHER OF THESE IS THE LOAD-BEARING GUARD, and the file should not pretend otherwise. The
+    cooldown lives in module state, so it only sees repeats inside ONE python process; the
+    re-signings that produced 24 windows in a day were 24 separate CLI invocations, and this
+    arithmetic was blind to every one of them. What actually bounds the count is the named
+    mutex FleetCockpit.exe takes on --authority: it is cross-process, it cannot race, and a
+    second launch raises the open window instead of adding one. These two remain because they
+    are cheaper than spawning a process that will immediately exit -- an optimisation, not the
+    safety property.
     """
     now = time.time()
     if now - _DASHBOARD_LAST[0] < DASHBOARD_COOLDOWN_S:
