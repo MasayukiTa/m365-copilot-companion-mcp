@@ -200,3 +200,61 @@ def test_a_run_that_cannot_record_turns_is_refused_before_it_starts():
 
 def test_a_recordable_and_calibrated_run_is_allowed():
     assert PE.preflight(free_mb=8000.0, calibrated=1.0, observable_recorded=True) == []
+
+
+# ---- 計器の選択と、数えた分で割ること -------------------------------------------------------------
+
+def test_the_runner_picks_the_instrument_that_can_judge_the_difference():
+    """`run` は常にメモリの判定器を呼んでいた。planner の比較は turns を動かし
+    Edge メモリを動かす理由が無いので、届かない300MB閾値で採点され、
+    誰も測っていない量についての数字と共に INCONCLUSIVE を返すところだった。"""
+    from relay.selfimprove import route_evaluator as RV
+    base = M.base_manifest()
+    p2 = M.apply_genome(base, {"components": {"planner": "planner/v2"}})
+    t2 = M.apply_genome(base, {"components": {"transport": "transport/v2"}})
+    assert C.instrument_for_pair(p2, base) is PE
+    assert C.instrument_for_pair(t2, base) is RV
+
+
+def test_a_difference_spanning_two_instruments_picks_neither():
+    """どの定規で測るかを黙って決めない。"""
+    base = M.base_manifest()
+    both = M.apply_genome(base, {"components": {"planner": "planner/v2",
+                                                "transport": "transport/v2"}})
+    assert C.instrument_for_pair(both, base) is None
+
+
+def test_the_verdict_reads_the_quantity_its_instrument_measures():
+    """turns の比較で memory_gain_mb を読めば毎回ゼロで、
+    それを『差なし』として報告することになる。"""
+    a = {"turns_gain": 1.2, "control": {"done": 4, "goals": 4},
+         "candidate": {"done": 4, "goals": 4}}
+    got = C.decide(a, dict(a, turns_gain=1.1), instrument=PE)
+    assert got["verdict"] == C.VERDICT_A, got
+
+
+def test_an_uncalibrated_instrument_stops_the_comparison(monkeypatch):
+    monkeypatch.setattr(PE, "MIN_TURNS_GAIN", None)
+    a = {"turns_gain": 5.0, "control": {"done": 4, "goals": 4},
+         "candidate": {"done": 4, "goals": 4}}
+    got = C.decide(a, a, instrument=PE)
+    assert got["verdict"] == C.VERDICT_NONE and got.get("aborted") is True
+    assert "no measured floor" in got["why"]
+
+
+def test_turns_are_divided_by_what_was_counted_not_by_what_was_sent():
+    """4ターンを4ゴールで割れば 1.0、同じ4ターンをログに残った3ゴールで割れば 1.33。
+    ハーネスの性質についての主張なのは片方だけ。"""
+    assert PE.turns_per_goal({"turns": 4, "goals": 4, "logged_goals": 4}) == 1.0
+    assert round(PE.turns_per_goal({"turns": 4, "goals": 4, "logged_goals": 3}), 2) == 1.33
+    # logged_goals が無い呼び出し元(テストや古い行)は goals に落ちる
+    assert PE.turns_per_goal({"turns": 4, "goals": 4}) == 1.0
+    assert PE.turns_per_goal({"turns": 0, "goals": 0}) is None
+
+
+def test_the_arm_carries_the_other_instruments_quantity_too():
+    """腕を走らせるのは高価で計器に依存しない。読む数字だけが違う。"""
+    import inspect
+    from relay.selfimprove import scheduler as S
+    src = inspect.getsource(S.route_evaluator_for)
+    assert '"turns_gain": _turns_gain(control, candidate)' in src

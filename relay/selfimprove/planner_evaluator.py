@@ -150,11 +150,20 @@ def turns_from_log(path, since_ts=0.0, route=None) -> dict:
 
 
 def turns_per_goal(arm) -> float | None:
-    """The arm's turns per goal, or None when it completed nothing to divide by."""
-    goals = int((arm or {}).get("goals", 0) or 0)
-    if goals <= 0:
+    """The arm's turns per goal, or None when nothing was counted to divide by.
+
+    DIVIDED BY WHAT WAS COUNTED, NOT BY WHAT WAS SENT. An arm carries both `goals` -- how many
+    it was given -- and `logged_goals`, how many left a `worker_done` row for the turns to be
+    read from. Those differ whenever a goal produced no row, and dividing the counted turns by
+    the sent count then reports a smaller average for a reason that has nothing to do with the
+    harness: four turns over four goals is 1.0, and the same four turns over three logged goals
+    is 1.33, and only one of those is a statement about how the harness works.
+    """
+    arm = arm or {}
+    counted = int(arm.get("logged_goals") or 0) or int(arm.get("goals", 0) or 0)
+    if counted <= 0:
         return None
-    return float((arm or {}).get("turns", 0) or 0) / goals
+    return float(arm.get("turns", 0) or 0) / counted
 
 
 def decide(control, candidate, *, min_gain=None) -> dict:

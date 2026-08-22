@@ -415,7 +415,25 @@ def attempts_for(label_a: str, label_b: str, path=None) -> list:
     return rows
 
 
-def decide(order_1: dict, order_2: dict, *, min_gain_mb=None) -> dict:
+def instrument_for_pair(manifest_a, manifest_b):
+    """The instrument that can judge whatever these two harnesses differ in, or None.
+
+    WITHOUT THIS THE VERDICT COMES FROM THE WRONG RULER. `run` always called the memory
+    judge, so a planner comparison -- which moves turns and has no reason to move Edge
+    memory -- would have been scored against a 300 MB threshold it cannot reach, and reported
+    INCONCLUSIVE with a number about the wrong quantity. The instruments already declare what
+    they measure; this is the part that reads the declaration at the moment it matters.
+
+    Returns None when the difference spans several instruments or none: judging that with any
+    single ruler is a choice the code should not make quietly.
+    """
+    changed = {k.split(".", 1)[-1] for k in M.diff(manifest_a, manifest_b)}
+    found = {instrument_for(name) for name in changed}
+    found.discard(None)
+    return found.pop() if len(found) == 1 else None
+
+
+def decide(order_1: dict, order_2: dict, *, min_gain_mb=None, instrument=None) -> dict:
     """The verdict from the two orderings. A sign that does not survive the swap is not a sign.
 
     Both arms run twice, once in each order, because arm position was measured to be worth more
@@ -424,9 +442,22 @@ def decide(order_1: dict, order_2: dict, *, min_gain_mb=None) -> dict:
     from a confound into a control.
     """
     from relay.selfimprove import route_evaluator as RV
-    floor = RV.MIN_MEMORY_GAIN_MB if min_gain_mb is None else min_gain_mb
-    g1 = float(order_1.get("memory_gain_mb") or 0.0)
-    g2 = float(order_2.get("memory_gain_mb") or 0.0)
+    inst = instrument or RV
+    # THE QUANTITY THE CHOSEN INSTRUMENT MEASURES, not always memory. Each instrument names
+    # its own gain key and its own floor; reading memory_gain_mb off a turns comparison would
+    # be zero every time and would report that as "no difference".
+    if inst is RV:
+        floor = RV.MIN_MEMORY_GAIN_MB if min_gain_mb is None else min_gain_mb
+        key = "memory_gain_mb"
+    else:
+        floor = getattr(inst, "MIN_TURNS_GAIN", None) if min_gain_mb is None else min_gain_mb
+        key = "turns_gain"
+    if floor is None:
+        return {"verdict": VERDICT_NONE, "aborted": True,
+                "why": "%s has no measured floor yet; a verdict now would be a guess wearing "
+                       "the shape of a measurement" % inst.__name__.rsplit(".", 1)[-1]}
+    g1 = float(order_1.get(key) or 0.0)
+    g2 = float(order_2.get(key) or 0.0)
 
     # AN ORDERING THAT DID NOT RUN IS NOT AN ORDERING THAT TIED.
     #
@@ -587,7 +618,8 @@ def run(request: dict, *, archive, evaluator_for=None, branches_path=None, lock_
         for order, arms in ((order_1, "a,b"), (order_2, "b,a")):
             if isinstance(order, dict):
                 order["arm_order_labels"] = arms
-        verdict = decide(order_1, order_2)
+        verdict = decide(order_1, order_2, instrument=instrument_for_pair(
+            a["manifest"], b["manifest"]))
         # `touch` on a base operand is a no-op: there is no ref to stamp, which is correct --
         # base has no freshness to go stale.
         BR.touch(request["a"]["label"], path=branches_path)

@@ -863,6 +863,16 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
                   % (type(exc).__name__, str(exc)[:160]), flush=True)
             return False
 
+
+    def _turns_gain(control, candidate):
+        """control's turns per goal minus the candidate's, or None if either did nothing."""
+        try:
+            from relay.selfimprove import planner_evaluator as _PE
+            a, b = _PE.turns_per_goal(control), _PE.turns_per_goal(candidate)
+            return None if a is None or b is None else round(a - b, 3)
+        except Exception:
+            return None
+
     def evaluate(candidate_manifest, experiment_id, base=None):
         from relay.relay_fleet import avail_phys_mb
         refusals = RV.preflight(free_mb=avail_phys_mb(), token_ok=_token_is_capturable())
@@ -995,6 +1005,14 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
             "experiment_id": experiment_id,
             "control": control, "candidate": candidate,
             "memory_gain_mb": verdict["memory_gain_mb"],
+            # THE OTHER INSTRUMENT'S QUANTITY, from the same two arms.
+            #
+            # Running the arms is expensive and instrument-agnostic: the same warm-up, the same
+            # crossover, the same isolation. Only the number read off them differs. Computing
+            # both here means a planner comparison does not need its own campaign -- and it
+            # means `compare.decide` finds `turns_gain` populated, rather than reading zero and
+            # reporting "no difference" about a quantity nobody measured.
+            "turns_gain": _turns_gain(control, candidate),
             "min_free_mb": round(low, 1) if low is not None else None,
             "arm_order": "candidate,control" if candidate_first else "control,candidate",
             "warmup": bool(warmup),
