@@ -47,12 +47,36 @@ MEASURES_NOTE = ("turns per goal, which moves with how much of the work a harnes
 
 #: How many turns per goal the candidate must save before "better" is claimed.
 #:
-#: None until a null run measures how far two IDENTICAL arms land apart on this number. Any
-#: value put here before that is invented, and this repository has already run a full day on an
-#: invented threshold: 300 MB came from an unrelated constant, then from measurements that were
-#: reading arm order, and only meant something once two null runs put identical arms 130-180 MB
-#: apart. `decide` refuses while this is None rather than guessing.
-MIN_TURNS_GAIN = None
+#: MEASURED, FROM 22 ARMS THAT WERE ALL THE SAME PROGRAM.
+#:
+#: Two dedicated null passes both reported a spread of 0.000, and taking that at face value
+#: would have been the mistake: on those eight goals every one finished in a single turn, so
+#: the instrument had no room to vary and 0.000 was its resolution rather than its noise. The
+#: answer came from the log instead. Across all 89 `worker_done` rows recorded today -- 22
+#: four-goal arms, none of them a treatment against another -- turns per goal was 1.0 in 18
+#: arms, 1.25 in two, and 1.5 in one:
+#:
+#:     goals at 2 turns          4 of 89   (4.5%)
+#:     arm-to-arm difference     0 in 74% of the 231 pairs, 0.25 or 0.5 in the rest
+#:     largest pair difference   0.500
+#:
+#: So 0.25 -- the finest difference four goals can express -- sits INSIDE the noise: identical
+#: arms reach it routinely. 0.5 is the largest gap two same-program arms produced, and the
+#: threshold has to clear that rather than sit on it, which is why this is 0.75 and not 0.5.
+#:
+#: The mechanism it is meant to see is far above this. `planner/v2` spends a turn planning, so
+#: it should move turns per goal by about 1.0 -- larger than the whole observed noise range,
+#: and a much easier ratio than the memory instrument ever had (245 MB of effect against a
+#: 130-180 MB floor).
+#:
+#: REVISIT IF THE GOALS CHANGE. This floor is a property of THESE goals: four of them, mostly
+#: one-turn. A set where goals routinely take three or four turns has a different spread, and
+#: this number would then be describing a workload that no longer exists.
+MIN_TURNS_GAIN = 0.75
+
+#: What the floor above was derived from, so a later reader can check it rather than trust it.
+NULL_SPREAD_OBSERVED = {"arms": 22, "goals": 89, "max_pair_difference": 0.5,
+                        "pairs_nonzero": 0.26, "goals_over_one_turn": 4}
 
 #: Free physical memory an arm needs. Same quantity and same operator setting as the route
 #: evaluator's -- a fleet that swaps does not run the thing you think it does, whatever is

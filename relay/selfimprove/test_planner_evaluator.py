@@ -25,38 +25,49 @@ def _arm(goals=4, turns=8, done=4, **kw):
 
 # ---- 較正されるまで判定しない ---------------------------------------------------------------------
 
-def test_the_threshold_starts_unset():
-    """メモリの床は、無関係な定数からの借り物として1日を過ごし、
-    腕の順序を測っていたと判明した導出を生き延び、
-    帰無走行が広がりを与えて初めて意味を持った。
-    未較正で始めるのは後で直す手落ちではなく、
-    帰無走行が済むまで真実を言っている状態。"""
-    assert PE.MIN_TURNS_GAIN is None
+def test_the_threshold_clears_the_largest_gap_two_identical_arms_produced():
+    """0.25 は4ゴールが表現できる最小差だが、同一プログラムの腕どうしが
+    日常的に到達する -- 231ペア中26%が非ゼロで、最大 0.500。
+    閾値はそれに乗るのではなく越えなければならない。"""
+    assert PE.MIN_TURNS_GAIN > PE.NULL_SPREAD_OBSERVED["max_pair_difference"]
+    assert PE.MIN_TURNS_GAIN == 0.75
 
 
-def test_deciding_before_calibration_raises_rather_than_returning_inconclusive():
-    """INCONCLUSIVE を返すと『測ったが何も無かった』と区別がつかない。
-    この装置全体が引き離そうとしている2つの主張がそれ。"""
-    with pytest.raises(PE.NotCalibrated):
-        PE.decide(_arm(turns=12), _arm(turns=6))
+def test_the_derivation_is_recorded_rather_than_asserted():
+    """『測った』と書くだけなら、後の読み手は確かめようがない。"""
+    obs = PE.NULL_SPREAD_OBSERVED
+    assert obs["arms"] == 22 and obs["goals"] == 89
+    src = inspect.getsource(PE)
+    i = src.index("MIN_TURNS_GAIN = 0.75")
+    block = src[max(0, i - 2200):i]
+    assert "0.000" in block and "resolution rather than its noise" in block
 
 
-def test_preflight_names_the_missing_calibration():
-    reasons = PE.preflight(free_mb=8000.0)
-    assert any("no measured noise floor" in r for r in reasons), reasons
-    assert any("null pass" in r for r in reasons), reasons
+def test_the_two_dedicated_nulls_were_not_taken_at_face_value():
+    """専用の帰無走行2本はどちらも 0.000 を返した。
+    その8ゴールが全部1ターンで終わったからで、
+    計器に振れ幅が無かっただけ -- 額面で受け取れば、
+    ノイズより細かい目盛りで読む閾値になっていた。"""
+    src = inspect.getsource(PE)
+    i = src.index("MIN_TURNS_GAIN = 0.75")
+    assert "no room to vary" in src[max(0, i - 2200):i]
+
+
+def test_a_calibrated_instrument_no_longer_refuses():
+    assert PE.preflight(free_mb=8000.0, observable_recorded=True) == []
+
+
+def test_the_floor_is_named_as_a_property_of_these_goals():
+    """4ゴール・ほぼ1ターンという作業負荷の性質。
+    3-4ターンかかるゴール集合では別の広がりになる。"""
+    src = inspect.getsource(PE)
+    i = src.index("MIN_TURNS_GAIN = 0.75")
+    assert "REVISIT IF THE GOALS CHANGE" in src[max(0, i - 2200):i]
 
 
 def test_a_calibrated_instrument_decides():
     got = PE.decide(_arm(turns=12), _arm(turns=6), min_gain=1.0)
     assert got["verdict"] == "keep" and got["turns_gain"] == 1.5
-
-
-def test_the_reason_the_threshold_is_unset_is_written_down():
-    src = inspect.getsource(PE)
-    i = src.index("MIN_TURNS_GAIN = None")
-    block = src[max(0, i - 1400):i]
-    assert "null run" in block and "invented" in block
 
 
 # ---- 判定規則 -----------------------------------------------------------------------------------
