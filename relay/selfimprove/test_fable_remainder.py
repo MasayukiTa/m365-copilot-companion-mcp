@@ -190,3 +190,67 @@ def test_the_memory_judge_is_called_without_a_breakdown():
     src = inspect.getsource(S.route_evaluator_for)
     i = src.index("except TypeError:")
     assert "not a fallback" in src[i:i + 300]
+
+
+# ---- 作業負荷が飽和しており、改善は検出できない ---------------------------------------------------
+
+def test_the_workload_is_saturated_and_says_so(tmp_path):
+    """111ゴールのうち96.4%が既に1ターン、98.2%が既にDONE。
+    turns の下限は1、完了の上限は全部。この集合では
+    どんな計器も下方向しか検出できない。"""
+    rows = [{"event": "worker_done", "ts": 1.0, "turns": 1, "outcome": "DONE"}] * 96
+    rows += [{"event": "worker_done", "ts": 1.0, "turns": 2, "outcome": "DONE"}] * 4
+    p = tmp_path / "log.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    got = PE.headroom(str(p))
+    assert got["improvement_detectable"] is False
+    assert "can only detect harm" in got["why"]
+
+
+def test_a_workload_with_room_is_not_flagged(tmp_path):
+    rows = [{"event": "worker_done", "ts": 1.0, "turns": 3, "outcome": "DONE"}] * 10
+    p = tmp_path / "log.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    assert PE.headroom(str(p))["improvement_detectable"] is True
+
+
+def test_an_empty_log_does_not_claim_to_know(tmp_path):
+    got = PE.headroom(str(tmp_path / "nope.jsonl"))
+    assert got["improvement_detectable"] is None
+
+
+def test_the_preflight_says_it_before_the_run_not_after():
+    """20分待たせてから『改善は測れませんでした』は言い訳。"""
+    reasons = PE.preflight(free_mb=8000.0, improvement_detectable=False)
+    assert any("only detect harm" in r for r in reasons), reasons
+    assert PE.preflight(free_mb=8000.0, improvement_detectable=True) == []
+
+
+def test_picking_goals_after_seeing_a_result_is_named_as_the_trap():
+    """伸びしろのあるゴールに替えるのは正しいが、結果を見てから替えれば
+    答えに合わせて作業負荷を選んだことになる。"""
+    reasons = PE.preflight(free_mb=8000.0, improvement_detectable=False)
+    assert any("BEFORE seeing a result" in r for r in reasons), reasons
+
+
+def test_the_saturation_explains_three_results_rather_than_one():
+    """transport 245MB、planner 0.00、そして memory も同じ列に並ぶ。
+    前2つは効果が小さいという話で、これは定規に余地が無いという話。"""
+    import inspect
+    src = inspect.getsource(PE)
+    i = src.index("HEADROOM_OBSERVED")
+    block = src[max(0, i - 1800):i]
+    assert "245 MB" in block and "0.00" in block
+    assert "no room left" in block
+
+
+# ---- seed があれば memory の版は実際に分岐する ----------------------------------------------------
+
+def test_the_memory_versions_diverge_only_with_duplicates():
+    """memory/v2 は近似重複を潰す版。重複が無ければ v1 と1文字も違わない --
+    そして腕ごとの空ストアには重複が無い。"""
+    from relay import project_memory as PM
+    distinct = ["a", "b", "c", "d", "e", "f"]
+    assert PM._memory_v1(distinct, 4) == PM._memory_v2(distinct, 4)
+    dup = ["同じ話"] * 4 + ["別の話", "また別"]
+    assert PM._memory_v1(dup, 4) != PM._memory_v2(dup, 4)

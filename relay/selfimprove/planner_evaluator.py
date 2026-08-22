@@ -104,7 +104,8 @@ class NotCalibrated(RuntimeError):
     """A verdict was asked for before the instrument had a measured noise floor."""
 
 
-def preflight(*, free_mb, calibrated=None, observable_recorded=True) -> list:
+def preflight(*, free_mb, calibrated=None, observable_recorded=True,
+              improvement_detectable=None) -> list:
     """Reasons this comparison must not run. Empty means it may.
 
     `observable_recorded` is the one this instrument needs that the memory one does not.
@@ -115,6 +116,17 @@ def preflight(*, free_mb, calibrated=None, observable_recorded=True) -> list:
     warning down in the coordinate audit and then launching the run anyway.
     """
     reasons = []
+    # SAID BEFORE THE RUN, NOT AFTER IT. A saturated workload does not make a comparison
+    # invalid -- "it did no harm" is a real claim -- but it makes one half of the possible
+    # answers unreachable, and an operator deciding whether to spend twenty minutes should
+    # know that the run cannot come back saying the candidate helped.
+    if improvement_detectable is False:
+        reasons.append(
+            "the goal set is saturated: nearly every goal already finishes in one turn and "
+            "reaches DONE, and neither can improve past that. This comparison can only detect "
+            "harm. Run it deliberately for that, or pick goals with room before spending the "
+            "time -- but pick them BEFORE seeing a result, or the workload is being chosen to "
+            "fit the answer.")
     if not observable_recorded:
         reasons.append(
             "turns are read from `worker_done` rows, and those are written only while the "
@@ -354,3 +366,66 @@ def classes_disagree(control_by_class, candidate_by_class, floor=None) -> dict:
                        % (floor, ", ".join("%s %+.2f" % (k, v) for k, v in per.items()
                                            if v is not None))}
     return {"disagree": False, "per_class": per, "why": ""}
+
+
+# ------------------------------------------------------------------------------------------
+# Headroom
+# ------------------------------------------------------------------------------------------
+
+#: What the observables can even express, measured over every goal this campaign has run.
+#:
+#: THE WORKLOAD IS SATURATED AND NO CANDIDATE CAN BE SHOWN TO HELP ON IT.
+#:
+#: Across 111 recorded goals, 96.4% finished in ONE turn and 98.2% reached DONE. Turns cannot
+#: go below one and completion cannot go above all, so on this goal set the only direction any
+#: instrument here can detect is DOWNWARD. A comparison can establish that a candidate did no
+#: harm; it cannot establish that it helped, however long it runs and however well calibrated
+#: the floor is.
+#:
+#: That is not a defect in the instruments. It is a property of the goals, and it explains a
+#: result that looked like three separate disappointments: transport measured 245 MB against a
+#: 300 MB floor, planner measured exactly 0.00, and a memory comparison would join them. Two of
+#: those were about the effect being small. This one is about the ruler having no room left.
+#:
+#: WHAT WOULD CHANGE IT. Goals that routinely take three or four turns, where a harness that
+#: primes better or plans better has something to save. Choosing them AFTER seeing a result
+#: would be picking the workload to fit the answer, so the honest order is: pick the goals for
+#: headroom first, re-measure the null spread on them, and only then run a treatment.
+HEADROOM_OBSERVED = {"goals": 111, "one_turn_fraction": 0.964, "done_fraction": 0.982}
+
+
+def headroom(path, goals=None) -> dict:
+    """How much room the observables have left, from the log. Never raises.
+
+    Reported so a comparison can say, before it spends twenty minutes, that the only finding
+    available to it is a negative one.
+    """
+    import json as _json
+    one_turn = total = done = 0
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    row = _json.loads(line)
+                except Exception:
+                    continue
+                if row.get("event") != "worker_done":
+                    continue
+                total += 1
+                if int(row.get("turns", 0) or 0) <= 1:
+                    one_turn += 1
+                if str(row.get("outcome", "")).upper() == "DONE":
+                    done += 1
+    except Exception:
+        pass
+    if not total:
+        return {"goals": 0, "one_turn_fraction": None, "done_fraction": None,
+                "improvement_detectable": None, "why": "no rows to judge headroom from"}
+    otf, df = one_turn / total, done / total
+    tight = otf >= 0.9 and df >= 0.9
+    return {"goals": total, "one_turn_fraction": round(otf, 3), "done_fraction": round(df, 3),
+            "improvement_detectable": not tight,
+            "why": ("%.0f%% of goals already finish in one turn and %.0f%% already reach DONE. "
+                    "Turns cannot go below one and completion cannot exceed all, so a "
+                    "comparison on this set can only detect harm." % (otf * 100, df * 100))
+            if tight else ""}
