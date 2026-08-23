@@ -208,6 +208,19 @@ class SelfImproveDashboardWindow : Window
         if (k == "trend_sec")     return ja ? "Pass@1 推移" : "Pass@1 trend";
         if (k == "archive_sec")   return ja ? "ゲノム" : "Genomes";
         if (k == "pending_sec")   return ja ? "判断待ち" : "Awaiting a decision";
+        if (k == "ev_rebless")    return ja ? "再署名" : "Re-signed";
+        if (k == "ev_mismatch")   return ja ? "無承認の変更を検知" : "Unapproved change detected";
+        if (k == "ev_revoke")     return ja ? "承認を取り消し" : "Approval withdrawn";
+        if (k == "ev_apply")      return ja ? "ゲノム適用" : "Genome applied";
+        if (k == "ev_revert")     return ja ? "ゲノム撤回" : "Genome reverted";
+        if (k == "ev_branch_new") return ja ? "枝を命名" : "Branch named";
+        if (k == "ev_branch_del") return ja ? "枝を削除" : "Branch deleted";
+        if (k == "ev_unresolved") return ja ? "未解決" : "unresolved";
+        if (k == "ev_closed_by")  return ja ? "検知 {0} → {1}後に再署名" : "detected {0}, re-signed {1} later";
+        if (k == "ev_testrecords") return ja
+            ? "テスト実行が本番台帳に書いたレコード {0} 件（一時ディレクトリのみを触るもの）"
+            : "{0} records written into the live ledger by test runs (they touch only temp dirs)";
+        if (k == "ev_by")         return ja ? "実行" : "by";
         if (k == "pending_exp")   return ja
             ? "恒久委任の外にある変更の提案。委任は「何を進化させてよいか」を定義するファイル自体には及ばないので、ここに溜まる。実行するには、あなたの指示をそのまま authorization に入れる。"
             : "Proposed changes outside the standing delegation. It does not extend to the files that define what may be evolved, so those queue here; running one takes your own words as its authorization.";
@@ -1010,38 +1023,72 @@ class SelfImproveDashboardWindow : Window
         //    record were typographically the same thing, and the record's actual content was
         //    the faintest part of it. Now each record is a rail-marked block: what happened
         //    and when on the first line, WHY in body text on the second, where underneath.
+        // WHICH MISMATCH DID A RE-SIGNING CLOSE. Chronologically the drift is detected first
+        // and the operator re-signs after, so the pair is (mismatch, the rebless that follows
+        // it). Read off the screen instead -- where the list runs newest first -- the pair
+        // looks reversed, and collapsing "the mismatch after a rebless" would hide the ones
+        // nothing has answered yet. Those are the entire reason this ledger exists.
+        //
+        // Only collapsed when both name the same files. A mismatch that detected something
+        // other than what was then approved is the anomaly a reader should see first.
+        var closedBy = new Dictionary<int, int>();
+        if (linksOk)
+        {
+            for (int i = 0; i + 1 < rows.Count; i++)
+            {
+                object a, b;
+                rows[i].TryGetValue("event", out a);
+                rows[i + 1].TryGetValue("event", out b);
+                if (Convert.ToString(a) != "baseline_mismatch") continue;
+                if (Convert.ToString(b) != "rebless") continue;
+                if (!SameTargets(rows[i], rows[i + 1])) continue;
+                closedBy[i] = i + 1;
+            }
+        }
+
+        int testRecords = 0;
+        if (linksOk) foreach (var r0 in rows) if (IsTestRecord(r0)) testRecords++;
+
         int shown = 0;
         for (int i = rows.Count - 1; i >= 0 && shown < 8; i--)
         {
             object ev; rows[i].TryGetValue("event", out ev);
             string kind = Convert.ToString(ev);
             if (kind == "genesis") continue;
-            object actor, reason, changed, auth, ts;
+            if (closedBy.ContainsKey(i)) continue;          // shown on the re-signing that closed it
+            if (linksOk && IsTestRecord(rows[i])) continue; // counted once, below
+
+            object actor, reason, auth, ts;
             rows[i].TryGetValue("actor_claimed", out actor);
             rows[i].TryGetValue("reason", out reason);
-            rows[i].TryGetValue("changed", out changed);
             rows[i].TryGetValue("authorization", out auth);
             rows[i].TryGetValue("ts", out ts);
-            var files = changed as Dictionary<string, object>;
-            string scope = files == null || files.Count == 0
-                ? "" : string.Join(", ", new List<string>(files.Keys).ToArray());
+            var paths = ChangedPaths(rows[i]);
+
+            // Any mismatch reaching this point was not collapsed, so nothing closed it --
+            // EXCEPT when the chain check failed, where no pairing was computed at all. Calling
+            // all 24 of them unresolved there would be a false alarm produced by the very
+            // condition that already tells the reader not to trust this section.
+            bool unresolved = linksOk && kind == "baseline_mismatch";
 
             var body = new StackPanel();
 
-            // line 1 -- what, by whom, when
+            // line 1 -- the headline, computed: what happened, to what, when
             var g = new Grid();
-            var c0 = new ColumnDefinition(); c0.Width = GridLength.Auto;
-            var c1 = new ColumnDefinition(); c1.Width = new GridLength(1, GridUnitType.Star);
-            var c2 = new ColumnDefinition(); c2.Width = GridLength.Auto;
-            g.ColumnDefinitions.Add(c0); g.ColumnDefinitions.Add(c1); g.ColumnDefinitions.Add(c2);
-            var kindTb = new TextBlock();
-            kindTb.Text = kind; kindTb.Foreground = KindBrush(kind);
-            kindTb.FontFamily = new FontFamily(Theme.CodeFont);
-            kindTb.FontSize = Theme.FsMeta; kindTb.FontWeight = FontWeights.SemiBold;
-            Grid.SetColumn(kindTb, 0); g.Children.Add(kindTb);
-            var actorTb = ClipLine(Convert.ToString(actor), Muted, Theme.FsMeta, false);
-            actorTb.Margin = new Thickness(12, 0, 12, 0);
-            Grid.SetColumn(actorTb, 1); g.Children.Add(actorTb);
+            var c0 = new ColumnDefinition(); c0.Width = new GridLength(1, GridUnitType.Star);
+            var c1 = new ColumnDefinition(); c1.Width = GridLength.Auto;
+            g.ColumnDefinitions.Add(c0); g.ColumnDefinitions.Add(c1);
+
+            string title = EventVerb(kind);
+            string targets = BaseNames(paths);
+            if (targets.Length > 0) title = title + ": " + targets;
+            if (unresolved) title = title + "  \u2014  " + T("ev_unresolved");
+
+            var titleTb = ClipLine(title, unresolved ? KindBrush("baseline_mismatch") : Fg,
+                                   13.0, false);
+            titleTb.FontWeight = FontWeights.SemiBold;
+            Grid.SetColumn(titleTb, 0); g.Children.Add(titleTb);
+
             if (ts != null)
             {
                 var when = new TextBlock();
@@ -1049,35 +1096,61 @@ class SelfImproveDashboardWindow : Window
                 when.Foreground = Theme.Br(Theme.Faint(_dark));
                 when.FontSize = 11;
                 when.VerticalAlignment = VerticalAlignment.Center;
+                when.Margin = new Thickness(12, 0, 0, 0);
                 when.ToolTip = new DateTime(1970, 1, 1).AddSeconds(Convert.ToDouble(ts))
                                    .ToLocalTime().ToString("yyyy-MM-dd HH:mm");
-                Grid.SetColumn(when, 2); g.Children.Add(when);
+                Grid.SetColumn(when, 1); g.Children.Add(when);
             }
             body.Children.Add(g);
 
-            // line 2 -- WHY. Body colour: the reason is the record, not a footnote to it.
+            // The mismatch this re-signing answered, folded in. The gap between detection and
+            // approval is information the two separate rows did not carry.
+            int mism = -1;
+            foreach (var kv in closedBy) if (kv.Value == i) { mism = kv.Key; break; }
+            if (mism >= 0)
+            {
+                object mts; rows[mism].TryGetValue("ts", out mts);
+                string det = "?", gap = "";
+                try
+                {
+                    double mv = Convert.ToDouble(mts);
+                    det = new DateTime(1970, 1, 1).AddSeconds(mv).ToLocalTime().ToString("HH:mm");
+                    gap = GapText(mv, Convert.ToDouble(ts));
+                }
+                catch (Exception) { }
+                var closed = new TextBlock();
+                closed.Text = string.Format(T("ev_closed_by"), det, gap);
+                closed.Foreground = Theme.Br(Theme.Faint(_dark));
+                closed.FontSize = 11;
+                closed.Margin = new Thickness(0, 3, 0, 0);
+                body.Children.Add(closed);
+            }
+
+            // line 2 -- WHY, in the words the record actually holds. Nothing here is generated.
             var reasonTb = ClipLine(Convert.ToString(reason), Fg, Theme.FsMeta, false);
             reasonTb.Margin = new Thickness(0, 4, 0, 0);
             body.Children.Add(reasonTb);
 
-            // line 3 -- where
+            // line 3 -- where, in full, and who claimed to act. The actor used to be the
+            // headline; it takes two values across the whole ledger.
             TextBlock scopeTb = null;
-            if (scope.Length > 0)
+            if (paths.Count > 0)
             {
-                scopeTb = ClipLine(scope, Theme.Br(Theme.Faint(_dark)), Theme.FsLog, true);
+                string tail = string.Join(", ", paths.ToArray());
+                string who = Convert.ToString(actor);
+                if (who.Length > 0) tail = tail + "    " + T("ev_by") + " " + who;
+                scopeTb = ClipLine(tail, Theme.Br(Theme.Faint(_dark)), Theme.FsLog, true);
                 scopeTb.Margin = new Thickness(0, 3, 0, 0);
                 body.Children.Add(scopeTb);
             }
 
-            // line 4 -- the words somebody outside this system used to permit the act. Given
-            //           the quote treatment so its provenance is legible from the shape.
+            // line 4 -- the operator's own words. Verbatim, and kept in the quote form this
+            // file already reserves for verbatim material.
             if (auth != null && Convert.ToString(auth) != "self-initiated")
             {
                 var q = new Border();
                 q.Background = QuoteBg;
-                q.BorderBrush = new SolidColorBrush(Mix(Theme.Col(Theme.Faint(_dark)), CardColor(), 0.6));
-                q.BorderThickness = new Thickness(2, 0, 0, 0);
-                q.CornerRadius = new CornerRadius(0, Theme.RadSmall, Theme.RadSmall, 0);
+                q.CornerRadius = new CornerRadius(Theme.RadSmall);
                 q.Padding = new Thickness(8, 4, 8, 4);
                 q.Margin = new Thickness(0, 6, 0, 0);
                 q.HorizontalAlignment = HorizontalAlignment.Left;
@@ -1094,18 +1167,25 @@ class SelfImproveDashboardWindow : Window
             rec.BorderBrush = new SolidColorBrush(Mix(Theme.Col(Theme.Faint(_dark)), CardColor(), 0.22));
             rec.Padding = new Thickness(0, 0, 0, 12);
             rec.Margin  = new Thickness(0, 12, 0, 0);
-            rec.Background = Brushes.Transparent;   // the whole block is the hit target, not the text
+            rec.Background = Brushes.Transparent;
             rec.Cursor = System.Windows.Input.Cursors.Hand;
             rec.Child = body;
-            var rTb = reasonTb; var sTb = scopeTb; var aTb = actorTb;
+            var rTb = reasonTb; var sTb = scopeTb; var tTb = titleTb;
             rec.MouseLeftButtonUp += delegate
             {
                 bool open = rTb.TextWrapping == TextWrapping.NoWrap;
-                SetClip(rTb, open); SetClip(sTb, open); SetClip(aTb, open);
+                SetClip(rTb, open); SetClip(sTb, open); SetClip(tTb, open);
             };
             detail.Children.Add(rec);
             shown++;
         }
+
+        // Counted, never deleted: they are real rows in an append-only file. What they are not
+        // is events in this repository's life, and 20 of 78 of them crowded out the ones that
+        // were. Closing the route that writes them belongs upstream, not here.
+        if (testRecords > 0)
+            detail.Children.Add(MuteRow(string.Format(T("ev_testrecords"), testRecords)));
+
         if (shown == 0) detail.Children.Add(MuteRow(T("auth_none")));
 
         // -- the way back. One step, repeatable. Jumping to an arbitrary earlier point would
@@ -2037,6 +2117,98 @@ class SelfImproveDashboardWindow : Window
         if (sec < 3600) return ((int)(sec / 60)).ToString() + (ja ? "分前" : " min ago");
         if (sec < 86400) return ((int)(sec / 3600)).ToString() + (ja ? "時間前" : " hr ago");
         return ((int)(sec / 86400)).ToString() + (ja ? "日前" : " d ago");
+    }
+
+    // THE HEADLINE IS DERIVED, NOT TYPED. The first line used to be the actor -- a module
+    // path like "relay.selfimprove.frozen CLI", which takes two values across the whole ledger
+    // and tells a reader nothing -- and the line that actually read as the title was the raw
+    // --reason string the agent had typed. A record whose headline is its own input text
+    // cannot be scanned.
+    //
+    // Every part of this is computable from the record, so none of it is generated: the event
+    // maps to a fixed verb, the target is the basenames of `changed`. Substituting a language
+    // model for a lookup table is the same design fault this system has committed before.
+    string EventVerb(string kind)
+    {
+        if (kind == "rebless")           return T("ev_rebless");
+        if (kind == "baseline_mismatch") return T("ev_mismatch");
+        if (kind == "rebless_revoke")    return T("ev_revoke");
+        if (kind == "genome_apply")      return T("ev_apply");
+        if (kind == "genome_revert")     return T("ev_revert");
+        if (kind == "branch_create")     return T("ev_branch_new");
+        if (kind == "branch_delete")     return T("ev_branch_del");
+        return kind;
+    }
+
+    // "UNPINNED:" marks a file that was not yet in the baseline when the drift was detected.
+    // It is a state marker on the same path, so a mismatch and the re-signing that closed it
+    // disagree on the string while naming the same file. Compared raw, 2 of 21 pairs looked
+    // like "detected something other than what was approved" -- which is a real anomaly and
+    // must never be hidden, so the comparison has to be able to tell the two cases apart.
+    static string StripPin(string path)
+    {
+        return path != null && path.StartsWith("UNPINNED:") ? path.Substring(9) : path;
+    }
+
+    static List<string> ChangedPaths(Dictionary<string, object> row)
+    {
+        var out_ = new List<string>();
+        object changed; row.TryGetValue("changed", out changed);
+        var files = changed as Dictionary<string, object>;
+        if (files != null) foreach (var k in files.Keys) out_.Add(StripPin(k));
+        out_.Sort();
+        return out_;
+    }
+
+    static string BaseNames(List<string> paths)
+    {
+        var seen = new List<string>();
+        foreach (var p in paths)
+        {
+            string b = p;
+            int i = b.LastIndexOfAny(new char[] { '/', '\\' });
+            if (i >= 0) b = b.Substring(i + 1);
+            if (b.Length > 0 && !seen.Contains(b)) seen.Add(b);
+        }
+        return string.Join(", ", seen.ToArray());
+    }
+
+    // A record written by a test run: everything it touched is under a temp directory. 20 of
+    // the 78 records in the live ledger are these -- test genome applies and reverts that were
+    // written to the operator's real ledger rather than a redirected one. They are real rows
+    // and stay in the file; they are simply not events in this repository's life.
+    static bool IsTestRecord(Dictionary<string, object> row)
+    {
+        var paths = new List<string>();
+        object changed; row.TryGetValue("changed", out changed);
+        var files = changed as Dictionary<string, object>;
+        if (files == null || files.Count == 0) return false;
+        foreach (var k in files.Keys)
+        {
+            string p = StripPin(k);
+            bool temp = p.IndexOf("Temp", StringComparison.OrdinalIgnoreCase) >= 0
+                     || p.IndexOf("tmp", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (!temp) return false;
+        }
+        return true;
+    }
+
+    static bool SameTargets(Dictionary<string, object> a, Dictionary<string, object> b)
+    {
+        var pa = ChangedPaths(a); var pb = ChangedPaths(b);
+        if (pa.Count != pb.Count) return false;
+        for (int i = 0; i < pa.Count; i++) if (pa[i] != pb[i]) return false;
+        return true;
+    }
+
+    string GapText(double a, double b)
+    {
+        double sec = Math.Abs(b - a);
+        bool ja = _lang == 0;
+        if (sec < 90) return ja ? "すぐ" : "moments";
+        if (sec < 3600) return ((int)(sec / 60)).ToString() + (ja ? "分" : " min");
+        if (sec < 86400) return ((int)(sec / 3600)).ToString() + (ja ? "時間" : " hr");
+        return ((int)(sec / 86400)).ToString() + (ja ? "日" : " d");
     }
 
     // The colour a record spends, spent on the event NAME rather than on a strip beside it.

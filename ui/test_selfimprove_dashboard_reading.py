@@ -120,7 +120,9 @@ def test_a_record_shows_when_it_happened():
 def test_the_four_parts_of_a_record_are_no_longer_one_concatenated_string():
     body = _fn("    UIElement BuildAuthority()", "\n    void RevokeLastRebless")
     assert 'line.Text = kind + "  " + Convert.ToString(actor) + scope;' not in body
-    assert "kindTb.FontFamily = new FontFamily(Theme.CodeFont);" in body
+    assert "titleTb.FontWeight = FontWeights.SemiBold;" in body   # headline
+    assert "var reasonTb = ClipLine(" in body                     # why
+    assert "scopeTb = ClipLine(tail," in body                     # where, and by whom
 
 
 def test_the_reason_is_body_text_not_a_footnote():
@@ -139,7 +141,7 @@ def test_long_lines_clip_rather_than_wrap_and_keep_their_full_text():
 def test_a_record_can_be_opened_in_place():
     body = _fn("    UIElement BuildAuthority()", "\n    void RevokeLastRebless")
     assert "rec.MouseLeftButtonUp" in body
-    assert "SetClip(rTb, open); SetClip(sTb, open); SetClip(aTb, open);" in body
+    assert "SetClip(rTb, open); SetClip(sTb, open); SetClip(tTb, open);" in body
 
 
 def test_no_content_block_wears_a_coloured_left_rail():
@@ -162,7 +164,8 @@ def test_the_severity_is_carried_by_the_event_name():
     assert '"baseline_mismatch"' in body and '"revoke"' in body
     assert "return Fg;" in body, "a routine re-signing must stay neutral"
     body2 = _fn("    UIElement BuildAuthority()", END_OF_AUTHORITY)
-    assert "kindTb.Foreground = KindBrush(kind);" in body2
+    # The headline carries it now, and only for the state that is actually abnormal.
+    assert 'unresolved ? KindBrush("baseline_mismatch") : Fg' in body2
 
 
 def test_records_are_separated_by_a_rule_not_by_a_strip():
@@ -239,3 +242,109 @@ def test_the_section_does_not_claim_to_enforce_anything():
     src = src[:src.index("if (k == \"pending_copy\")")]
     for word in ("強制", "enforce", "blocks", "prevents"):
         assert word not in src, word
+
+
+# ── the ledger reads as a list of events, not as a list of my own input ─────────────
+
+def _authority():
+    return _fn("    UIElement BuildAuthority()", END_OF_AUTHORITY)
+
+
+def test_the_headline_is_computed_from_the_record_not_typed_into_it():
+    """The first line used to be the actor -- a module path taking two values across the whole
+    ledger -- and the line that actually read as the title was the raw --reason the agent had
+    typed. A record whose headline is its own input text cannot be scanned."""
+    body = _authority()
+    assert "string title = EventVerb(kind);" in body
+    assert "string targets = BaseNames(paths);" in body
+
+
+def test_the_actor_is_no_longer_the_headline():
+    body = _authority()
+    i_title = body.index("titleTb.FontWeight = FontWeights.SemiBold;")
+    i_actor = body.index('string who = Convert.ToString(actor);')
+    assert i_title < i_actor, "the actor must sit below the headline, not be it"
+
+
+def test_the_verb_comes_from_a_lookup_and_not_from_a_model():
+    """Every part of a headline is computable from the record. Substituting a language model
+    for a lookup table is the design fault this system has committed before."""
+    body = _fn("    string EventVerb(string kind)")
+    for kind in ("rebless", "baseline_mismatch", "rebless_revoke",
+                 "genome_apply", "genome_revert"):
+        assert '"' + kind + '"' in body, kind
+
+
+def test_the_pairing_runs_forwards_in_time():
+    """Chronologically the drift is detected first and the operator re-signs after. Read off
+    the screen -- newest first -- the pair looks reversed, and collapsing "the mismatch after a
+    rebless" hides the ones nothing has answered yet."""
+    body = _authority()
+    seg = body[body.index("var closedBy = new Dictionary<int, int>();"):]
+    seg = seg[:seg.index("int testRecords")]
+    assert 'rows[i].TryGetValue("event", out a);' in seg
+    assert 'rows[i + 1].TryGetValue("event", out b);' in seg
+    assert 'Convert.ToString(a) != "baseline_mismatch"' in seg
+    assert 'Convert.ToString(b) != "rebless"' in seg
+
+
+def test_a_pair_is_only_collapsed_when_it_names_the_same_files():
+    """A mismatch that detected something other than what was then approved is the anomaly a
+    reader should see first."""
+    body = _authority()
+    assert "if (!SameTargets(rows[i], rows[i + 1])) continue;" in body
+
+
+def test_the_unpinned_marker_does_not_look_like_a_different_file():
+    """It is a state marker on the same path. Compared raw, 2 of 21 pairs looked like
+    detected-is-not-approved, which is a real anomaly and must stay distinguishable."""
+    body = _fn("    static string StripPin(string path)")
+    assert '"UNPINNED:"' in body
+
+
+def test_a_broken_chain_stops_the_collapsing_entirely():
+    """No formatting on top of a ledger that failed its own integrity check."""
+    body = _authority()
+    assert "if (linksOk)\n        {" in body
+    assert "if (linksOk && IsTestRecord(rows[i])) continue;" in body
+
+
+def test_a_broken_chain_does_not_call_every_mismatch_unresolved():
+    """No pairing is computed there, so the unresolved label would fire on all of them -- a
+    false alarm produced by the condition that already warns the reader."""
+    body = _authority()
+    assert 'bool unresolved = linksOk && kind == "baseline_mismatch";' in body
+
+
+def test_an_unresolved_mismatch_is_never_collapsed_and_says_so():
+    body = _authority()
+    assert 'T("ev_unresolved")' in body
+    assert 'KindBrush("baseline_mismatch")' in body
+
+
+def test_test_written_records_are_counted_not_deleted():
+    """They are real rows in an append-only file. What they are not is events in this
+    repository's life, and 20 of 78 crowded out the ones that were."""
+    body = _authority()
+    assert 'string.Format(T("ev_testrecords"), testRecords)' in body
+    ident = _fn("    static bool IsTestRecord(Dictionary<string, object> row)")
+    assert '"Temp"' in ident and '"tmp"' in ident
+
+
+def test_the_count_is_exact_rather_than_approximate():
+    body = _authority()
+    assert "if (linksOk) foreach (var r0 in rows) if (IsTestRecord(r0)) testRecords++;" in body
+
+
+def test_the_reason_shown_is_still_the_recorded_one():
+    """Nothing on this screen is generated yet, and when something is, it must not replace
+    the record."""
+    body = _authority()
+    assert "ClipLine(Convert.ToString(reason), Fg, Theme.FsMeta, false)" in body
+
+
+def test_the_quote_form_stays_reserved_for_verbatim_material():
+    body = _authority()
+    seg = body[body.index('if (auth != null'):]
+    assert "Convert.ToString(auth)" in seg
+    assert "qt.Text" in seg and "u201c" in seg.replace(chr(92), "")  # the quote glyphs, however escaped
