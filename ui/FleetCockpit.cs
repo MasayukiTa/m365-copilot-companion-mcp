@@ -6315,23 +6315,28 @@ class CockpitWindow : Window
     // (BuildSettingsPanel builds it inline and assigns _maxMinus/_maxPlus/_maxValue).
     TextBlock _maxValue;
 
-    // Toggle label/colour: ON => accent border + accent soft bg (clearly colored),
-    // OFF => muted neutral. Task 2: ON state must be visually distinct with color.
+    // Autoscale toggle chip -- the SAME success/neutral treatment as PaintAutoRetryBtn and
+    // PaintAutoArchiveBtn, which is the settings panel's rule for a status toggle.
+    //
+    // This one used the accent (orange) while the other two ONs beside it were green, so three
+    // chips that mean the same thing -- this option is on -- read as three different kinds of
+    // thing, and the odd one read as a warning. Accent fill is reserved for the primary Start
+    // action; PaintAutoRetryBtn already said so and this chip was the exception to it.
     void PaintAutoToggle()
     {
         if (_autoToggle == null) return;
         _autoToggle.Content = T("autoscale") + ": " + (_autoscale ? "ON" : "OFF");
         if (_autoscale)
         {
-            _autoToggle.Foreground = Theme.Br(Theme.Accent(_dark));
-            _autoToggle.BorderBrush = Theme.Br(Theme.Accent(_dark));
-            _autoToggle.Background = Theme.Br(Theme.AccentSoft(_dark));
+            _autoToggle.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+            _autoToggle.Foreground = Theme.Br(Theme.Success(_dark));
+            _autoToggle.BorderBrush = Theme.Br(Theme.Success(_dark));
         }
         else
         {
+            _autoToggle.Background = BtnBg;
             _autoToggle.Foreground = Muted;
             _autoToggle.BorderBrush = Border;
-            _autoToggle.Background = Brushes.Transparent;
         }
     }
 

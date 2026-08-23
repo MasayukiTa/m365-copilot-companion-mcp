@@ -268,3 +268,20 @@ def test_the_subprocess_timeout_actually_bounds_the_call():
     assert "p.Kill()" in body, "時間切れの子を放置している"
     # 時間切れは空文字で返す -- 途中まで読めた出力を完全な応答として描かせない。
     assert 'return "";' in body
+
+
+# ---- 設定パネルの3つのトグルが同じ意味に見えること ------------------------------------------------
+
+def test_the_three_status_toggles_share_one_on_treatment():
+    """「RAM自動調整: ON」だけがアクセント(オレンジ)で、隣の2つの ON は緑だった。
+    同じ意味のチップが3種類の見え方をし、浮いた1つは警告に読める。
+    アクセント塗りは主要アクションの開始ボタン専用で、その規約は
+    PaintAutoRetryBtn のコメントに既に書かれていた。"""
+    for fn, end in (("void PaintAutoToggle()", "\n    void "),
+                    ("void PaintAutoRetryBtn()", "\n    void "),
+                    ("void PaintAutoArchiveBtn()", "\n    void ")):
+        body = _no_comments(_body(fn, end))
+        assert "Theme.Success(_dark)" in body, fn
+        assert "Theme.SurfaceSubtle(_dark)" in body, fn
+        assert "Theme.Accent(" not in body, fn + " がアクセント塗りに戻っている"
+        assert "Theme.AccentSoft(" not in body, fn
