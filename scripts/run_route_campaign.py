@@ -180,7 +180,14 @@ def main():
     )
     goals, goals_name, arm_reset = active_goals()
     print("[campaign] goals: %s (%d)" % (goals_name, len(goals)), flush=True)
-    evaluate = S.route_evaluator_for(goals, agent_url=agent_url, max_concurrent=2,
+    # CONCURRENCY IS PART OF THE MEASUREMENT, NOT A THROUGHPUT KNOB.
+    #
+    # The dependent variable is how much memory a run of these goals costs, and that depends on
+    # how many workers are alive at once. Changing it changes what the number means, so it is
+    # recorded with the result and `run_archive` refuses to put two different settings in one
+    # column -- the same rule the goal set and the sampler already live under.
+    max_conc = int(os.environ.get("MCP_FLEET_MAX_CONCURRENT", "2"))
+    evaluate = S.route_evaluator_for(goals, agent_url=agent_url, max_concurrent=max_conc,
                                      candidate_first=candidate_first,
                                      warmup="--warmup" in sys.argv,
                                      null_arm="--null" in sys.argv,
@@ -195,6 +202,8 @@ def main():
     out = evaluate(candidate, exp)
     out["wall_s"] = round(time.time() - t0, 1)
     out["version"] = version
+    out["max_concurrent"] = max_conc
+    out["sidepage_reserve"] = os.environ.get("SWE_SIDEPAGE_RESERVE", "1")
     out["goals"] = goals_name
     infra = out.get("infra") or {}
     if infra.get("aborted"):

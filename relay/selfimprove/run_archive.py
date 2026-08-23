@@ -80,24 +80,32 @@ def load(results_dir: str = None) -> list:
             "control_peak_mb": (rec.get("control") or {}).get("peak_mb"),
             "candidate_peak_mb": (rec.get("candidate") or {}).get("peak_mb"),
             "memory_gain_mb": rec.get("memory_gain_mb"),
+            # Absent in runs recorded before the knob was written down; those all ran at 2/"1".
+            "max_concurrent": rec.get("max_concurrent", 2),
+            "sidepage_reserve": str(rec.get("sidepage_reserve", "1")),
             "current_instrument": ts >= INSTRUMENT_EPOCH,
         })
     out.sort(key=lambda r: r["ts"])
     return out
 
 
-def comparable(runs, *, goals: str, version: str = "v1", null: bool = None) -> list:
+def comparable(runs, *, goals: str, version: str = "v1", null: bool = None,
+               max_concurrent: int = 2, sidepage_reserve: str = "1") -> list:
     """The runs that can be put in one column together.
 
     Filters on the instrument AND on the goal set AND on the version of that goal set AND on
     the candidate version. A difference measured on one goal set is not evidence about another
-    -- the two sets here have different spreads -- v1 and v2 are different candidates, and a
-    goal set keeps its name across the fixes that change what it measures.
+    -- the two sets here have different spreads -- v1 and v2 are different candidates, a goal
+    set keeps its name across the fixes that change what it measures, and HOW MANY WORKERS RUN
+    AT ONCE changes how much memory a run costs, so a faster setting is a different measurement
+    rather than the same one obtained sooner.
     """
     since = WORKLOAD_EPOCH.get(goals, 0)
     sel = [r for r in runs
            if r["current_instrument"] and r["goals"] == goals and r["version"] == version
-           and r["ts"] >= since]
+           and r["ts"] >= since
+           and r["max_concurrent"] == max_concurrent
+           and r["sidepage_reserve"] == str(sidepage_reserve)]
     if null is not None:
         sel = [r for r in sel if r["null"] is bool(null)]
     return sel
