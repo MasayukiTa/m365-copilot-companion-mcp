@@ -5683,7 +5683,8 @@ class CockpitWindow : Window
         allow.Content = L("許可", "Allow");
         allow.FontSize = 11.5; allow.FontWeight = FontWeights.SemiBold; allow.Cursor = Cursors.Hand;
         allow.BorderThickness = new Thickness(0); allow.Padding = new Thickness(10, 3, 10, 3);
-        allow.Template = FlatButtonTemplate(); allow.Background = Theme.Br(Theme.Accent(_dark)); allow.Foreground = White;
+        // Filled green, matching what green means everywhere else in this list: allowed.
+        allow.Template = FlatButtonTemplate(); allow.Background = Theme.Br(Theme.Success(_dark)); allow.Foreground = White;
         string capturedIp = ip;
         allow.Click += delegate { RunClientAdmin("grant", capturedIp); };
         DockPanel.SetDock(allow, Dock.Right); row.Children.Add(allow);
@@ -5711,12 +5712,23 @@ class CockpitWindow : Window
 
         var row = new DockPanel(); row.Margin = new Thickness(0, 3, 0, 3); row.LastChildFill = false;
 
+        // COLOUR CARRIES THE ROW'S STATE, NOT THE BUTTON'S SEVERITY.
+        //
+        // Every row used to show 取り消し in red whatever its state, and 期限切れ in red as well,
+        // so a list of ordinary allowed clients read as a list of problems and the one state
+        // that IS a problem -- a connection being refused right now -- had no colour of its own.
+        // Green means this client is allowed, grey means it lapsed, red is kept for the refused
+        // card above the list.
+        //
+        // 拒否, not 取り消し: the button denies the client. "取り消し" reads as undoing your own
+        // last action, which is not what it does.
         var revoke = new Button();
-        revoke.Content = L("取り消し", "Revoke");
+        revoke.Content = L("拒否", "Deny");
         revoke.FontSize = 11; revoke.Cursor = Cursors.Hand; revoke.BorderThickness = new Thickness(1);
         revoke.Padding = new Thickness(8, 3, 8, 3); revoke.Template = FlatButtonTemplate();
-        revoke.Background = Brushes.Transparent; revoke.Foreground = Theme.Br(Theme.Danger(_dark));
-        revoke.BorderBrush = Theme.Br(Theme.Danger(_dark));
+        revoke.Background = Brushes.Transparent; revoke.Foreground = Muted;
+        revoke.BorderBrush = Border;
+        revoke.ToolTip = L("この接続元を拒否します。", "Deny this client.");
         string capturedIp1 = ip;
         revoke.Click += delegate { RunClientAdmin("revoke", capturedIp1); };
         DockPanel.SetDock(revoke, Dock.Right); row.Children.Add(revoke);
@@ -5725,9 +5737,13 @@ class CockpitWindow : Window
         allow.Content = L("許可", "Allow");
         allow.FontSize = 11; allow.Cursor = Cursors.Hand; allow.BorderThickness = new Thickness(1);
         allow.Padding = new Thickness(8, 3, 8, 3); allow.Template = FlatButtonTemplate();
-        allow.Background = BtnBg; allow.Foreground = Fg; allow.BorderBrush = Border;
+        allow.Background = BtnBg;
+        allow.Foreground = expired ? Muted : Theme.Br(Theme.Success(_dark));
+        allow.BorderBrush = expired ? Border : Theme.Br(Theme.Success(_dark));
         allow.Margin = new Thickness(0, 0, 6, 0);
-        allow.ToolTip = L("延長（同じTTLで再付与）", "Extend (re-grant with the same TTL rule)");
+        allow.ToolTip = expired
+            ? L("再付与します。", "Grant again.")
+            : L("延長（同じTTLで再付与）", "Extend (re-grant with the same TTL rule)");
         string capturedIp2 = ip;
         allow.Click += delegate { RunClientAdmin("grant", capturedIp2); };
         DockPanel.SetDock(allow, Dock.Right); row.Children.Add(allow);
@@ -5737,8 +5753,10 @@ class CockpitWindow : Window
         statusTb.Margin = new Thickness(0, 0, 8, 0);
         if (expired)
         {
+            // Grey, not red. A grant that ran out is not a fault, and painting it the same as a
+            // live refusal left the one row that needs attention indistinguishable from the rest.
             statusTb.Text = L("期限切れ", "Expired");
-            statusTb.Foreground = Theme.Br(Theme.Danger(_dark));
+            statusTb.Foreground = Muted;
         }
         else
         {
@@ -5748,7 +5766,9 @@ class CockpitWindow : Window
         }
         DockPanel.SetDock(statusTb, Dock.Right); row.Children.Add(statusTb);
 
-        var ipTb = new TextBlock(); ipTb.Text = ip; ipTb.Foreground = Fg; ipTb.FontSize = 12;
+        var ipTb = new TextBlock(); ipTb.Text = ip;
+        ipTb.Foreground = expired ? Muted : Fg;      // a lapsed row recedes as a whole
+        ipTb.FontSize = 12;
         ipTb.VerticalAlignment = VerticalAlignment.Center; ipTb.TextTrimming = TextTrimming.CharacterEllipsis;
         ipTb.ToolTip = ip;
         DockPanel.SetDock(ipTb, Dock.Left); row.Children.Add(ipTb);

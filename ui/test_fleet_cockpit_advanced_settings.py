@@ -185,7 +185,8 @@ def test_each_client_row_has_allow_and_revoke():
     client_row_body = _body("UIElement BuildClientRow(Dictionary<string, object> g)", "\n    UIElement BuildConnectedClientsControls()")
     assert 'RunClientAdmin("revoke", capturedIp1)' in client_row_body
     assert 'RunClientAdmin("grant", capturedIp2)' in client_row_body
-    assert 'L("取り消し", "Revoke")' in client_row_body
+    # 拒否: このボタンは接続元を拒否する。「取り消し」は自分の直前の操作を戻す語に読める。
+    assert 'L("拒否", "Deny")' in client_row_body
     assert 'L("許可", "Allow")' in client_row_body
 
 
@@ -210,7 +211,7 @@ def test_new_advanced_settings_strings_are_bilingual_via_L():
         ("(接続履歴なし)", "(no clients yet)"),
         ("直近で拒否された接続", "Most recently refused"),
         ("許可", "Allow"),
-        ("取り消し", "Revoke"),
+        ("拒否", "Deny"),
         ("期限切れ", "Expired"),
     ]
     for ja, en in expected_pairs:
@@ -285,3 +286,37 @@ def test_the_three_status_toggles_share_one_on_treatment():
         assert "Theme.SurfaceSubtle(_dark)" in body, fn
         assert "Theme.Accent(" not in body, fn + " がアクセント塗りに戻っている"
         assert "Theme.AccentSoft(" not in body, fn
+
+
+# ---- 行の色が状態を表すこと -----------------------------------------------------------------------
+
+def test_colour_says_what_state_the_row_is_in():
+    """緑=許可中 / 灰=期限切れ / 赤=いま拒否されている。
+
+    直す前は、どの行でも 取り消し が赤で 期限切れ も赤だった。ふつうに許可されている
+    クライアントの一覧が問題の一覧に見え、本当に問題である『いま拒否されている接続』
+    だけが自分の色を持っていなかった。
+    """
+    body = _no_comments(
+        _body("UIElement BuildClientRow(Dictionary<string, object> g)",
+              "\n    UIElement BuildConnectedClientsControls()"))
+    # 許可: 期限内なら緑、切れていれば淡色
+    assert "allow.Foreground = expired ? Muted : Theme.Br(Theme.Success(_dark));" in body
+    assert "allow.BorderBrush = expired ? Border : Theme.Br(Theme.Success(_dark));" in body
+    # 拒否: どの行でも淡色。押せることは色ではなく枠と手のカーソルで示す。
+    assert "revoke.Foreground = Muted;" in body
+    assert "revoke.BorderBrush = Border;" in body
+    assert "Theme.Danger(" not in body, "行の中に赤が戻っている"
+    # 期限切れ行は IP ごと引っ込む
+    assert "ipTb.Foreground = expired ? Muted : Fg;" in body
+
+
+def test_red_is_kept_for_the_connection_being_refused_now():
+    """赤を全部消してしまうと、唯一手を打つべき行の目印まで消える。"""
+    body = _no_comments(_body("UIElement BuildPendingClientRow(string ip)",
+                              "\n    UIElement BuildConnectedClientsControls()"))
+    assert "card.BorderBrush = Theme.Br(Theme.Danger(_dark));" in body
+    assert "badge.Foreground = Theme.Br(Theme.Danger(_dark));" in body
+    # そのカードの主要ボタンは「許可」なので、一覧と同じ意味の緑にする
+    assert "allow.Background = Theme.Br(Theme.Success(_dark));" in body
+    assert "Theme.Accent(" not in body
