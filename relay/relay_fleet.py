@@ -695,13 +695,39 @@ def avail_phys_mb() -> float:
         return 4096.0
 
 
-def ram_room_for_tab(floor_mb=2000.0) -> bool:
+#: HOW MUCH PHYSICAL RAM MUST STAY FREE FOR THE OPERATOR, IN MB. ONE NUMBER, READ BY EVERY GATE.
+#:
+#: THE THREE GATES BELOW USED TO CARRY THREE DIFFERENT LITERALS -- 2048 when sizing concurrency,
+#: 1400 when autoscaling, 2000 before opening a side page -- and none of them read the floor the
+#: operator had configured, which is 512 (recorded as an operator instruction and encoded in both
+#: evaluators' MIN_FREE_MB). The effect was silent: on a box with 2454 MB free, the 2048 literal
+#: made `auto_concurrency` return 1 where the configured floor gives 2, so a fleet left on its
+#: automatic setting ran everything one goal at a time and nothing said why.
+#:
+#: RAISING THIS IS THE SAFE DIRECTION AND IT IS ONE EDIT. The literals were high because RAM
+#: exhaustion once wedged the Edge badly enough that the watchdog hard-reset it; 512 is more
+#: permissive than what the fleet has been doing, so a box that starts thrashing should have this
+#: raised rather than the gates re-forked.
+FLEET_RAM_FLOOR_MB = float(os.environ.get("MCP_FLEET_RAM_FLOOR_MB", "512"))
+
+#: What ONE Copilot tab is budgeted to cost. Separate from the floor because they answer
+#: different questions: the floor is what must remain, this is what the next tab will take.
+FLEET_PER_TAB_MB = float(os.environ.get("MCP_FLEET_PER_TAB_MB", "700"))
+
+
+def ram_room_for_tab(floor_mb=None) -> bool:
     """True iff there is enough free physical RAM to open ANOTHER browser tab without crowding
     the machine. Used to RAM-gate the SUB-AGENT side-pages (research / refuter) -- the fleet's
     worker-tab autoscale doesn't count those, so on a low-RAM box even a single task's ultra
     pipeline (main + research + refuter tabs) could overload the Edge until the sweep wedged and
     the watchdog hard-reset it. Each side-page opens lazily once this returns True, so the live
-    tab count tracks free RAM at ALL granularities, not just at worker admission."""
+    tab count tracks free RAM at ALL granularities, not just at worker admission.
+
+    The default is DERIVED, not a fourth literal: room for the floor that must remain AND for
+    the tab about to be opened. The 2000 that used to sit here was neither of those.
+    """
+    if floor_mb is None:
+        floor_mb = FLEET_RAM_FLOOR_MB + FLEET_PER_TAB_MB
     return avail_phys_mb() >= floor_mb
 
 
@@ -756,13 +782,15 @@ def _socket_route():
     return _SOCKET_ROUTE
 
 
-def auto_concurrency(n_goals, per_tab_mb=700, headroom_mb=2048, hard_cap=100):
+def auto_concurrency(n_goals, per_tab_mb=None, headroom_mb=None, hard_cap=100):
     """How many heavy M365 tabs we can afford open at once, given free RAM right now.
     Keep `headroom_mb` for the user's other work; budget `per_tab_mb` per Copilot tab.
     `hard_cap` is a high upper RAIL (100), NOT a hardware bound: the RAM term (free//per_tab)
     is the real limiter, so a 16 GB box self-limits to ~3 while a big-RAM machine scales up.
     A modest run is still wise for M365 Copilot per-user fair-use, but that's a policy choice
     the operator makes via settings, not a hardcoded ceiling baked in here."""
+    per_tab_mb = FLEET_PER_TAB_MB if per_tab_mb is None else per_tab_mb
+    headroom_mb = FLEET_RAM_FLOOR_MB if headroom_mb is None else headroom_mb
     fit = int((avail_phys_mb() - headroom_mb) / per_tab_mb)
     return max(1, min(n_goals, fit, hard_cap))
 
@@ -878,7 +906,7 @@ def disk_admission_ok(floor_gb=None, eval_gb=None, free_gb=None, building=0, res
 
 
 def ram_target_cap(open_now, current_cap, ceiling,
-                   per_tab_mb=700, headroom_mb=1400, floor=1, up_margin_mb=0):
+                   per_tab_mb=None, headroom_mb=None, floor=1, up_margin_mb=0):
     """RAM-aware live concurrency target (autoscale). Recomputed each loop: given how many
     tabs are open right now (their RAM is already reflected in the free-RAM reading) and how
     much headroom we want to keep for the user, how many tabs can we SUSTAIN?
@@ -896,6 +924,8 @@ def ram_target_cap(open_now, current_cap, ceiling,
     level a small RAM jitter no longer pushes it back up -- it HOLDS. The DOWN side is unchanged
     (drains immediately on a real deficit), so the dead-band only damps needless growth.
     Clamped to [floor, ceiling] (ceiling = the user's configured maximum)."""
+    per_tab_mb = FLEET_PER_TAB_MB if per_tab_mb is None else per_tab_mb
+    headroom_mb = FLEET_RAM_FLOOR_MB if headroom_mb is None else headroom_mb
     avail = avail_phys_mb()
     # FLOOR division (not int(): truncates toward zero) so a RAM *deficit* yields a negative
     # term and the target actually drops below open_now -> drains. e.g. (-400)//700 == -1.
@@ -3237,7 +3267,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     mc_box=None, add_box=None, refuter=False, max_refute=None,
                     plan_mode=False, review_lenses=None, max_transient=None, max_research=3,
                     autoscale=False, autoscale_max=None, asc_box=None,
-                    autoscale_per_tab_mb=700, autoscale_headroom_mb=1400,
+                    autoscale_per_tab_mb=None, autoscale_headroom_mb=None,
                     autoscale_up_margin_mb=0,
                     disk_floor_gb=None, eval_disk_gb=None, disk_box=None,
                     ram_box=None,
@@ -3297,7 +3327,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     # the cockpit can change it mid-run via ram_box; otherwise the launch headroom applies. The
     # autoscale (ram_target_cap) keeps this much RAM free, so a higher floor shrinks concurrency.
     if ram_box is None:
-        ram_box = [autoscale_headroom_mb]
+        ram_box = [FLEET_RAM_FLOOR_MB if autoscale_headroom_mb is None
+                   else autoscale_headroom_mb]
     # pause/stop control (1-element lists read EACH loop, set by the cockpit via commands.json):
     # pause_box[0] True  -> freeze the fleet in place (no new turns / no new tabs / no liveness
     #                       probe) so a deliberate network switch doesn't trip FleetContextLost.

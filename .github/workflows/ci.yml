@@ -263,7 +263,9 @@ jobs:
             ui/test_fleet_cockpit_authority_window.py \
             ui/test_selfimprove_dashboard_reading.py \
             relay/selfimprove/test_archive_publish_guard.py \
-            relay/selfimprove/test_run_archive.py
+            relay/selfimprove/test_run_archive.py \
+            relay/test_fleet_ram_floor.py \
+            relay/selfimprove/test_pending.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py
