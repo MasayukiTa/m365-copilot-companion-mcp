@@ -292,6 +292,23 @@ def _branch_section():
     return out
 
 
+def _pending_section() -> list:
+    """Proposals that fell outside the standing delegation and are still undecided.
+
+    Put on this screen because the alternative is remembering. A refusal used to end with the
+    agent reporting it and the turn closing, and two proposals were nearly lost in a day that
+    way. Read-only and defensive like every other section.
+    """
+    try:
+        from relay.selfimprove import pending as _P
+        return [{"id": i.get("id"), "ts": i.get("ts"),
+                 "files": i.get("files") or [], "reason": i.get("reason") or "",
+                 "command": i.get("command") or ""}
+                for i in _P.items()]
+    except Exception:
+        return []
+
+
 def dashboard_state(*, archive_path=None, burned_path=None, grade_results_path=None,
                     reports_glob=None) -> dict:
     """Aggregate the self-improvement ledgers into one JSON-safe ``dashboard_state`` dict.
@@ -306,7 +323,8 @@ def dashboard_state(*, archive_path=None, burned_path=None, grade_results_path=N
       grade_results_path  .fleet/swe/grade_results.jsonl
       reports_glob        .fleet/swe/selfimprove_report_*.json
 
-    Top-level sections: summary, ab_history, pass1_trend, burned_ledger, archive.
+    Top-level sections: summary, pending_decisions, ab_history, pass1_trend,
+    burned_ledger, archive.
     """
     archive_path = _DEFAULT_ARCHIVE if archive_path is None else archive_path
     burned_path = _DEFAULT_BURNED if burned_path is None else burned_path
@@ -357,6 +375,7 @@ def dashboard_state(*, archive_path=None, burned_path=None, grade_results_path=N
 
     return {
         "summary": summary,
+        "pending_decisions": _pending_section(),
         "usage": usage,
         "branches": _branch_section(),
         "ab_history": ab_history,
@@ -382,6 +401,7 @@ def write_json(path=None) -> str:
     except Exception:
         state = {"summary": {}, "ab_history": [], "pass1_trend": [],
                  "burned_ledger": {"total": 0, "by_reason": {}, "recent": []},
+                 "pending_decisions": [],
                  "archive": {"count": 0, "records": 0, "genomes": [], "qd_cells": 0}}
     try:
         parent = os.path.dirname(out_path)
@@ -556,7 +576,8 @@ def main(argv=None) -> int:
         if want_json:
             print(json.dumps({"summary": {}, "ab_history": [], "pass1_trend": [],
                               "burned_ledger": {"total": 0, "by_reason": {}, "recent": []},
-                              "archive": {"count": 0, "records": 0, "genomes": [], "qd_cells": 0}}, indent=2))
+                              "pending_decisions": [],
+                 "archive": {"count": 0, "records": 0, "genomes": [], "qd_cells": 0}}, indent=2))
         else:
             print("SELF-IMPROVEMENT SCORECARD\n  no data yet")
         return 0

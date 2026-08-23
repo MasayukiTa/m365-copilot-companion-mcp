@@ -207,6 +207,12 @@ class SelfImproveDashboardWindow : Window
         if (k == "burned_sec")    return ja ? "Burned 台帳" : "Burned ledger";
         if (k == "trend_sec")     return ja ? "Pass@1 推移" : "Pass@1 trend";
         if (k == "archive_sec")   return ja ? "ゲノム" : "Genomes";
+        if (k == "pending_sec")   return ja ? "判断待ち" : "Awaiting a decision";
+        if (k == "pending_exp")   return ja
+            ? "恒久委任の外にある変更の提案。委任は「何を進化させてよいか」を定義するファイル自体には及ばないので、ここに溜まる。実行するには、あなたの指示をそのまま authorization に入れる。"
+            : "Proposed changes outside the standing delegation. It does not extend to the files that define what may be evolved, so those queue here; running one takes your own words as its authorization.";
+        if (k == "pending_copy")  return ja ? "コマンドをコピー" : "Copy command";
+        if (k == "pending_copied") return ja ? "コピーしました" : "Copied";
         if (k == "auth_detail")   return ja ? "記録と取り消し" : "Records and undo";
 
         // section explanations (one-liner below the label)
@@ -763,6 +769,8 @@ class SelfImproveDashboardWindow : Window
         // hunting, which is why they collapse to one line rather than moving out of sight,
         // and why they expand themselves when a check fails.
         _body.Children.Clear();
+        var pending = BuildPending(state);
+        if (pending != null) _body.Children.Add(pending);
         _body.Children.Add(BuildArchive(state));
         _body.Children.Add(BuildScorecard(state));
         _body.Children.Add(BuildAbHistory(state));
@@ -1629,6 +1637,99 @@ class SelfImproveDashboardWindow : Window
             catch (Exception) { }
         }
         return best == double.MinValue ? "?" : best.ToString("0.###");
+    }
+
+    // AWAITING A DECISION. Shown first, and only when there is something -- an empty call to
+    // action is noise, and a queue nobody sees is the reminder it was built to replace.
+    //
+    // This screen makes no claim to enforce anything. The queue runs in the same privilege
+    // domain as the agent that fills it; what it buys is that a refused proposal survives the
+    // turn and can be found without anyone remembering it exists.
+    UIElement BuildPending(Dictionary<string, object> state)
+    {
+        object[] rows = Arr(state, "pending_decisions");
+        if (rows == null || rows.Length == 0) return null;
+
+        var card = SectionCard("pending_sec", "pending_exp");
+        var col  = (StackPanel)card.Child;
+
+        var head = new WrapPanel(); head.Margin = new Thickness(0, 10, 0, 0);
+        head.Children.Add(Pill(rows.Length.ToString() + (_lang == 0 ? " 件" : " open"), "warn"));
+        col.Children.Add(head);
+
+        double now = (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds;
+        foreach (var o in rows)
+        {
+            var r = o as Dictionary<string, object>;
+            if (r == null) continue;
+
+            var body = new StackPanel();
+
+            var g = new Grid();
+            var ca = new ColumnDefinition(); ca.Width = new GridLength(1, GridUnitType.Star);
+            var cb = new ColumnDefinition(); cb.Width = GridLength.Auto;
+            g.ColumnDefinitions.Add(ca); g.ColumnDefinitions.Add(cb);
+
+            object files; r.TryGetValue("files", out files);
+            var flist = new List<string>();
+            var farr = files as object[];
+            if (farr != null) foreach (var f in farr) flist.Add(Convert.ToString(f));
+            var filesTb = ClipLine(string.Join(", ", flist.ToArray()), Fg, Theme.FsMeta, true);
+            filesTb.FontWeight = FontWeights.SemiBold;
+            Grid.SetColumn(filesTb, 0); g.Children.Add(filesTb);
+
+            object ts; r.TryGetValue("ts", out ts);
+            if (ts != null)
+            {
+                var when = new TextBlock();
+                when.Text = AgoText(Convert.ToDouble(ts), now);
+                when.Foreground = Theme.Br(Theme.Faint(_dark));
+                when.FontSize = 11;
+                when.VerticalAlignment = VerticalAlignment.Center;
+                when.Margin = new Thickness(12, 0, 0, 0);
+                Grid.SetColumn(when, 1); g.Children.Add(when);
+            }
+            body.Children.Add(g);
+
+            var reason = new TextBlock();
+            reason.Text = S(r, "reason");
+            reason.Foreground = Fg; reason.FontSize = Theme.FsMeta;
+            reason.TextWrapping = TextWrapping.Wrap;
+            reason.Margin = new Thickness(0, 4, 0, 0);
+            body.Children.Add(reason);
+
+            string cmd = S(r, "command");
+            if (cmd.Length > 0)
+            {
+                var cmdTb = ClipLine(cmd, Theme.Br(Theme.Faint(_dark)), Theme.FsLog, true);
+                cmdTb.Margin = new Thickness(0, 6, 0, 0);
+                body.Children.Add(cmdTb);
+
+                // The command is the point of the entry, and a command you cannot take with
+                // you is a picture of a command.
+                var copy = new Button();
+                copy.Content = T("pending_copy");
+                copy.Padding = new Thickness(12, 4, 12, 4);
+                copy.Margin  = new Thickness(0, 8, 0, 0);
+                copy.HorizontalAlignment = HorizontalAlignment.Left;
+                var theCmd = cmd; var theBtn = copy;
+                copy.Click += delegate
+                {
+                    try { Clipboard.SetText(theCmd); theBtn.Content = T("pending_copied"); }
+                    catch (Exception) { }
+                };
+                body.Children.Add(copy);
+            }
+
+            var rec = new Border();
+            rec.BorderThickness = new Thickness(0, 0, 0, 1);
+            rec.BorderBrush = new SolidColorBrush(Mix(Theme.Col(Theme.Faint(_dark)), CardColor(), 0.22));
+            rec.Padding = new Thickness(0, 0, 0, 12);
+            rec.Margin  = new Thickness(0, 12, 0, 0);
+            rec.Child = body;
+            col.Children.Add(rec);
+        }
+        return card;
     }
 
     UIElement BuildArchive(Dictionary<string, object> state)

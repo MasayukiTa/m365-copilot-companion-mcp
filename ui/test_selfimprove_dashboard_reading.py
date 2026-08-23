@@ -200,3 +200,42 @@ def test_best_pass_is_computed_from_the_genomes_and_survives_a_missing_field():
     body = _fn("    string BestPass(Dictionary<string, object> arc)")
     assert 'return "?"' in body
     assert "catch (Exception) { }" in body
+
+
+# ── awaiting a decision ─────────────────────────────────────────────────────────────
+
+def test_the_pending_section_is_absent_when_nothing_is_pending():
+    """An empty call to action is noise, and it would sit above everything else."""
+    body = _fn("    UIElement BuildPending(Dictionary<string, object> state)")
+    assert "if (rows == null || rows.Length == 0) return null;" in body
+    order = _fn("    void Render(Dictionary<string, object> state)")
+    assert "if (pending != null) _body.Children.Add(pending);" in order
+
+
+def test_pending_decisions_lead_when_there_are_any():
+    order = _fn("    void Render(Dictionary<string, object> state)")
+    i_pending = order.index("BuildPending(state)")
+    i_archive = order.index("_body.Children.Add(BuildArchive")
+    assert i_pending < i_archive
+
+
+def test_an_entry_carries_the_command_and_a_way_to_take_it():
+    """The command is the point of the entry; a command you cannot copy is a picture of one."""
+    body = _fn("    UIElement BuildPending(Dictionary<string, object> state)")
+    assert 'S(r, "command")' in body
+    assert "Clipboard.SetText(theCmd)" in body
+
+
+def test_the_pending_entries_wear_no_rail_either():
+    body = _fn("    UIElement BuildPending(Dictionary<string, object> state)")
+    assert "rec.BorderThickness = new Thickness(0, 0, 0, 1);" in body
+    assert "RailW" not in body
+
+
+def test_the_section_does_not_claim_to_enforce_anything():
+    """It runs in the same privilege domain as the agent that fills it. Saying otherwise on
+    the screen would be the most consequential kind of wrong."""
+    src = SRC[SRC.index('if (k == "pending_exp")'):]
+    src = src[:src.index("if (k == \"pending_copy\")")]
+    for word in ("強制", "enforce", "blocks", "prevents"):
+        assert word not in src, word
