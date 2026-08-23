@@ -6,8 +6,21 @@ Run: pytest -q ui/test_fleet_cockpit_advanced_settings.py
 """
 from pathlib import Path
 
+NEWLINE = chr(10)
+
 
 SOURCE = Path(__file__).with_name("FleetCockpit.cs").read_text(encoding="utf-8")
+
+
+def _no_comments(text: str) -> str:
+    """`//` 行を落とした本文。禁止したい呼び出しを説明するコメント自体に検査が当たり、
+    守りたい不変条件が『通らない検査』として消される -- 今日それを3回やった。"""
+    out = []
+    for line in text.splitlines():
+        if line.strip().startswith("//"):
+            continue
+        out.append(line.split("//")[0] if "//" in line else line)
+    return NEWLINE.join(out)
 
 
 def _body(start_marker: str, end_marker: str) -> str:
@@ -149,7 +162,9 @@ def test_refused_client_is_surfaced_at_top_with_an_allow_button_no_typing_requir
     pending_body = _body("UIElement BuildPendingClientRow(string ip)", "\n    UIElement BuildClientRow(")
     assert 'L("直近で拒否された接続", "Most recently refused")' in pending_body
     assert 'L("許可", "Allow")' in pending_body
-    assert "GrantClientIp(capturedIp)" in pending_body
+    # UI スレッドを止めないよう RunClientAdmin 経由になった。押して効くことが要点で、
+    # 呼ぶ関数名そのものではない。
+    assert 'RunClientAdmin("grant", capturedIp)' in pending_body
 
 
 def test_pending_row_only_shown_when_the_refusal_is_not_already_covered_by_a_live_grant():
@@ -168,8 +183,8 @@ def test_expired_grants_are_shown_plainly_never_hidden():
 
 def test_each_client_row_has_allow_and_revoke():
     client_row_body = _body("UIElement BuildClientRow(Dictionary<string, object> g)", "\n    UIElement BuildConnectedClientsControls()")
-    assert "RevokeClientIp(capturedIp1)" in client_row_body
-    assert "GrantClientIp(capturedIp2)" in client_row_body
+    assert 'RunClientAdmin("revoke", capturedIp1)' in client_row_body
+    assert 'RunClientAdmin("grant", capturedIp2)' in client_row_body
     assert 'L("取り消し", "Revoke")' in client_row_body
     assert 'L("許可", "Allow")' in client_row_body
 
@@ -211,3 +226,45 @@ def test_cockpit_window_has_its_own_L_helper():
     assert approval_prompt_start < cockpit_window_start
     cockpit_body = SOURCE[cockpit_window_start:]
     assert 'string L(string ja, string en) { return _lang == 0 ? ja : en; }' in cockpit_body
+
+
+# ---- 開いても固まらないこと -------------------------------------------------------------------
+
+def test_the_client_list_is_not_read_on_the_ui_thread():
+    """詳細設定を開くと `python -m tools.security list` と `python -m tools.lock_state show`
+    が走る。この端末での実測は2秒と4秒で、どちらもパッケージの import が理由。
+    これをディスパッチャ上で回すと窓ごと止まり、パネルは閉じられず、
+    閉じられない WPF ポップアップは他のどのウィンドウより上に描かれ続ける。
+    報告された「固まる/他の設定が押せない/常時前面」は、この1本のスレッドの話。
+    """
+    body = _body("void RefreshClientRows()", "void RenderClientRows(")
+    assert "ListUnlockGrants()" in body and "new Thread(" in body
+    assert "Dispatcher.BeginInvoke" in body
+    # 取得結果を受け取って描くだけの関数は、自分では取りに行かないこと。
+    render = _body("void RenderClientRows(", "\n    UIElement BuildPendingClientRow")
+    assert "ListUnlockGrants()" not in render
+    assert "ReadRefusedClient()" not in render
+
+
+def test_grant_and_revoke_do_not_block_the_ui_thread_either():
+    """一覧の構築だけ直しても、許可ボタンから同じ関数に入れば同じ止まり方をする。"""
+    for line in ('allow.Click += delegate { RunClientAdmin("grant", capturedIp); };',
+                 'revoke.Click += delegate { RunClientAdmin("revoke", capturedIp1); };',
+                 'allow.Click += delegate { RunClientAdmin("grant", capturedIp2); };'):
+        assert line in SOURCE, line
+    assert "GrantClientIp(capturedIp);" not in SOURCE
+    assert "RevokeClientIp(capturedIp1);" not in SOURCE
+
+
+def test_the_subprocess_timeout_actually_bounds_the_call():
+    """`ReadToEnd()` には時間制限が無いので、その後ろの `WaitForExit(timeoutMs)` は
+    子が終わらない限り到達しない。タイムアウト引数が飾りになっていた。
+    加えて stdout を読み切ってから stderr を読む順序は、子が stderr の
+    パイプを埋めた時点で相互待ちになる。python はここで毎回 stderr に書く。"""
+    body = _no_comments(
+        _body("string RunPyModule(", "List<Dictionary<string, object>> ListUnlockGrants()"))
+    assert "ReadToEnd()" not in body, "同期読みが戻っている"
+    assert "BeginOutputReadLine()" in body and "BeginErrorReadLine()" in body
+    assert "p.Kill()" in body, "時間切れの子を放置している"
+    # 時間切れは空文字で返す -- 途中まで読めた出力を完全な応答として描かせない。
+    assert 'return "";' in body

@@ -5490,14 +5490,33 @@ class CockpitWindow : Window
             psi.RedirectStandardOutput = true;
             psi.RedirectStandardError = true;
             try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
-            string stdoutText = "";
+            // BOTH STREAMS AT ONCE, AND A TIMEOUT THAT ACTUALLY BOUNDS THE CALL.
+            //
+            // This used to ReadToEnd() stdout, then ReadToEnd() stderr, then WaitForExit(timeout).
+            // Two faults. The reads had no timeout, so WaitForExit -- the only bounded step --
+            // was unreachable whenever the child did not finish, and the timeout argument was
+            // decorative. And draining stdout to completion before touching stderr deadlocks if
+            // the child fills the stderr pipe: the child blocks writing, so it never closes
+            // stdout, so the reader never returns. Python writes to stderr here on every call
+            // (import-time deprecation warnings), so the buffer was never empty.
+            var sb = new StringBuilder();
             using (var p = System.Diagnostics.Process.Start(psi))
             {
-                try { stdoutText = p.StandardOutput.ReadToEnd(); } catch (Exception) { }
-                try { p.StandardError.ReadToEnd(); } catch (Exception) { }
-                try { p.WaitForExit(timeoutMs); } catch (Exception) { }
+                p.OutputDataReceived += delegate (object _s, System.Diagnostics.DataReceivedEventArgs e)
+                { if (e.Data != null) lock (sb) sb.AppendLine(e.Data); };
+                p.ErrorDataReceived += delegate (object _s, System.Diagnostics.DataReceivedEventArgs e) { };
+                try { p.BeginOutputReadLine(); p.BeginErrorReadLine(); } catch (Exception) { }
+                bool exited = false;
+                try { exited = p.WaitForExit(timeoutMs); } catch (Exception) { }
+                if (!exited)
+                {
+                    // A child that outlived its budget is not going to be waited on further --
+                    // the caller has a UI to keep responsive.
+                    try { p.Kill(); } catch (Exception) { }
+                    return "";
+                }
             }
-            return stdoutText;
+            lock (sb) return sb.ToString();
         }
         catch (Exception) { return ""; }
     }
@@ -5546,13 +5565,68 @@ class CockpitWindow : Window
         RunPyModule("tools.security", "revoke \"" + ip.Replace("\"", "") + "\"", 15000);
     }
 
+    // Grant and revoke shell out too, so a click on 許可 froze the window for as long as the
+    // subprocess took -- the same fault as building the list, reached from a different button.
+    // The refresh that follows is queued from the same background thread, so the list is only
+    // re-read once the write has actually landed.
+    void RunClientAdmin(string verb, string ip)
+    {
+        var th = new Thread(new ThreadStart(delegate
+        {
+            try
+            {
+                if (verb == "grant") GrantClientIp(ip);
+                else RevokeClientIp(ip);
+            }
+            catch (Exception) { }
+            if (Dispatcher.HasShutdownStarted) return;
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                try { RefreshClientRows(); } catch (Exception) { }
+            }));
+        }));
+        th.IsBackground = true;
+        th.Start();
+    }
+
+    // TWO PYTHON SUBPROCESSES, SO NOT ON THE UI THREAD.
+    //
+    // Opening 詳細設定 built this list inline, and building it shells out to
+    // `python -m tools.security list` and `python -m tools.lock_state show` -- measured at 2 and
+    // 4 seconds on this machine because each one imports the package. That ran on the dispatcher,
+    // so the whole window stopped: the panel could not be dismissed, no other setting could be
+    // clicked, and a WPF popup that cannot be dismissed keeps painting above every other window.
+    // All three of those are one frozen thread, not three faults.
     void RefreshClientRows()
     {
         if (_clientRowsPanel == null) return;
         _clientRowsPanel.Children.Clear();
+        var loading = new TextBlock();
+        loading.Text = L("読み込み中…", "Loading…");
+        loading.Foreground = Muted; loading.FontSize = 11; loading.Margin = new Thickness(0, 2, 0, 2);
+        _clientRowsPanel.Children.Add(loading);
 
-        var grants = ListUnlockGrants();
-        var refused = ReadRefusedClient();
+        var th = new Thread(new ThreadStart(delegate
+        {
+            List<Dictionary<string, object>> g2;
+            Dictionary<string, object> r2;
+            try { g2 = ListUnlockGrants(); } catch (Exception) { g2 = new List<Dictionary<string, object>>(); }
+            try { r2 = ReadRefusedClient(); } catch (Exception) { r2 = new Dictionary<string, object>(); }
+            if (Dispatcher.HasShutdownStarted) return;
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                try { RenderClientRows(g2, r2); } catch (Exception) { }
+            }));
+        }));
+        th.IsBackground = true;
+        th.Start();
+    }
+
+    void RenderClientRows(List<Dictionary<string, object>> grants, Dictionary<string, object> refused)
+    {
+        // The panel may have been closed and rebuilt while the subprocesses ran.
+        if (_clientRowsPanel == null) return;
+        _clientRowsPanel.Children.Clear();
         string refusedIp = "";
         object rv;
         if (refused.TryGetValue("client_ip", out rv) && rv != null) refusedIp = rv.ToString();
@@ -5611,7 +5685,7 @@ class CockpitWindow : Window
         allow.BorderThickness = new Thickness(0); allow.Padding = new Thickness(10, 3, 10, 3);
         allow.Template = FlatButtonTemplate(); allow.Background = Theme.Br(Theme.Accent(_dark)); allow.Foreground = White;
         string capturedIp = ip;
-        allow.Click += delegate { GrantClientIp(capturedIp); RefreshClientRows(); };
+        allow.Click += delegate { RunClientAdmin("grant", capturedIp); };
         DockPanel.SetDock(allow, Dock.Right); row.Children.Add(allow);
 
         var ipTb = new TextBlock(); ipTb.Text = ip; ipTb.Foreground = Fg; ipTb.FontSize = 12;
@@ -5644,7 +5718,7 @@ class CockpitWindow : Window
         revoke.Background = Brushes.Transparent; revoke.Foreground = Theme.Br(Theme.Danger(_dark));
         revoke.BorderBrush = Theme.Br(Theme.Danger(_dark));
         string capturedIp1 = ip;
-        revoke.Click += delegate { RevokeClientIp(capturedIp1); RefreshClientRows(); };
+        revoke.Click += delegate { RunClientAdmin("revoke", capturedIp1); };
         DockPanel.SetDock(revoke, Dock.Right); row.Children.Add(revoke);
 
         var allow = new Button();
@@ -5655,7 +5729,7 @@ class CockpitWindow : Window
         allow.Margin = new Thickness(0, 0, 6, 0);
         allow.ToolTip = L("延長（同じTTLで再付与）", "Extend (re-grant with the same TTL rule)");
         string capturedIp2 = ip;
-        allow.Click += delegate { GrantClientIp(capturedIp2); RefreshClientRows(); };
+        allow.Click += delegate { RunClientAdmin("grant", capturedIp2); };
         DockPanel.SetDock(allow, Dock.Right); row.Children.Add(allow);
 
         var statusTb = new TextBlock();
