@@ -246,3 +246,34 @@ def test_a_launcher_that_refuses_stops_the_run_instead_of_measuring():
     assert calls == [1]
     assert "refused" in out, "拒否を測定結果として通している"
     assert "REFUSING" in out["refused"], "何を拒否したのかが結果に残っていない"
+
+
+def test_two_treatments_cannot_end_the_series():
+    """正規分位点を使っていたせいで、系列が4走行目で止まり CONFIRMED-NULL を印字した。
+
+    treatment 2本 (133.9, 208.3) の標準誤差は 37.2。1.96 倍なら半幅 72.9、上端 244.0 で
+    300MB の床を下回り、これは事前登録上「候補は勝てない」の signature。だが自由度1の
+    正しい乗数は 12.71 で、半幅 472.7、上端 643.8 -- 何も示されていなかった。
+
+    正規分位点は「ばらつきが既知」を仮定する。それを、今まさにそのばらつきを推定するのに
+    使った2点に当てるのは、近似ですらなく6倍外れており、しかも外れ方が
+    「自信を捏造する」向き。"""
+    import scripts.run_transport_series as ts
+
+    m, half = ts.mean_ci([133.9, 208.3])
+    assert round(m, 1) == 171.1
+    assert half > 400, "2点の区間が狭すぎる -- 正規分位点に戻っている"
+
+    out = ts.verdict([-127.1, -36.5], [133.9, 208.3])
+    assert out["state"] != "CONFIRMED-NULL", "2本で結論を出している"
+    assert out["state"] == "collecting"
+
+
+def test_the_interval_widens_as_the_sample_shrinks():
+    """乗数が標本数に応じて動くこと。固定値に戻れば、少数走行での停止がまた起きる。"""
+    import scripts.run_transport_series as ts
+
+    assert ts.t95(1) > ts.t95(4) > ts.t95(10) >= 1.96
+    wide = ts.mean_ci([100.0, 200.0])[1]
+    narrow = ts.mean_ci([100.0, 200.0] * 6)[1]
+    assert wide > narrow * 4, "標本を増やしても区間が縮んでいない"

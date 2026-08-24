@@ -197,14 +197,48 @@ def classify(rec) -> str:
     return ""
 
 
-def mean_ci(values, z=1.96):
-    """(mean, half-width) of the 95% interval, or (None, None) when n < 2."""
+#: Two-sided 95% Student-t quantiles by degrees of freedom. A NORMAL QUANTILE WAS USED HERE AND
+#: IT ENDED THE SERIES ON ITS FOURTH RUN. With two treatments at 133.9 and 208.3 the standard
+#: error is 37.2, so 1.96 gave a half-width of 72.9 and an upper end of 244.0 -- under the 300 MB
+#: floor, which is the pre-registered signature of "the candidate cannot win", and the series
+#: stopped and printed CONFIRMED-NULL. The interval was fiction: with one degree of freedom the
+#: multiplier is 12.71, the half-width is 472.7, and the upper end is 643.8. Nothing had been
+#: shown at all.
+#:
+#: A normal quantile assumes the spread is known rather than estimated from the same two points
+#: it is describing. At n=2 that assumption is not approximately true, it is off by a factor of
+#: six, and it fails in the direction that manufactures confidence.
+#:
+#: This also removes the need for a minimum-run guard on the stopping rule. An honest interval
+#: is too wide to clear the floor early, so the arithmetic refuses on its own and no magic
+#: number has to be chosen and defended.
+_T95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306,
+        9: 2.262, 10: 2.228, 11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145, 15: 2.131,
+        16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093, 20: 2.086, 25: 2.060, 30: 2.042}
+
+
+def t95(df):
+    """The two-sided 95% t multiplier for df, falling back to the normal limit for large df."""
+    if df in _T95:
+        return _T95[df]
+    if df < 1:
+        return None
+    known = [k for k in sorted(_T95) if k <= df]
+    return _T95[known[-1]] if df < 30 else 1.96
+
+
+def mean_ci(values):
+    """(mean, half-width) of the 95% interval, or (None, None) when n < 2.
+
+    The multiplier is Student's t on n-1 degrees of freedom, because the spread is estimated
+    from these same values and not known in advance.
+    """
     n = len(values)
     if n < 2:
         return (values[0] if n else None), None
     m = sum(values) / n
     var = sum((v - m) ** 2 for v in values) / (n - 1)
-    return m, z * math.sqrt(var / n)
+    return m, t95(n - 1) * math.sqrt(var / n)
 
 
 def verdict(nulls, treatments):
