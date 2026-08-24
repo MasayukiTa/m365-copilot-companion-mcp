@@ -183,7 +183,9 @@ def test_the_fleet_asks_the_policy_before_it_asks_for_a_socket():
     from relay import relay_fleet as RF
     src = inspect.getsource(RF.RelayWorker)
     assert "transport_policy import" in src, "フリートが方策を読んでいない"
-    assert src.index("transport_policy import") < src.index("driver_for(self.name)"), (
+    # 呼び出しの綴りではなく順序を見る。以前は "driver_for(self.name)" を丸ごとアンカーに
+    # していたため、引数が1つ増えただけでこの不変条件の検査が消えた。
+    assert src.index("transport_policy import") < src.index("driver_for("), (
         "経路に頼んだ後で方策を聞いている")
     assert "components.transport" in FLEET_FIELDS
 

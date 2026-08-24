@@ -201,7 +201,8 @@ def _worker(**kw):
 def test_a_worker_takes_a_socket_when_one_is_offered_and_opens_no_tab(monkeypatch):
     drv = _FakeDrv()
     monkeypatch.setattr(rf, "_socket_route",
-                        lambda: type("R", (), {"driver_for": lambda self, n: drv})())
+                        lambda: type("R", (), {
+                            "driver_for": lambda self, n, **kw: drv})())
     monkeypatch.setattr(rf, "_open_fresh",
                         lambda *a: pytest.fail("a socket worker must not open a tab"))
     w = _worker()
@@ -210,10 +211,15 @@ def test_a_worker_takes_a_socket_when_one_is_offered_and_opens_no_tab(monkeypatc
     assert w.status == "ready"
 
 
-def test_a_resuming_worker_is_never_given_a_socket(monkeypatch):
-    """resume は『あの URL をもう一度開く』という意味で、socket に開く URL は無い。"""
+def test_a_url_resume_is_never_given_a_socket(monkeypatch):
+    """resume が URL なら『あのページをもう一度開く』という意味で、socket に開く URL は無い。
+
+    以前この検査は「resume なら常に」だった。会話IDでの resume は実測(2026-08-24、対照群つき)
+    で成立し、しかもタブを開かないほうが速く安いので、区別すべきは resume かどうかではなく
+    「渡されたのがページか会話か」になった。URL 側の不変条件はそのまま残す。
+    """
     monkeypatch.setattr(rf, "_socket_route",
-                        lambda: pytest.fail("resume must not even ask for a socket"))
+                        lambda: pytest.fail("a url resume must not even ask for a socket"))
     monkeypatch.setattr(rf, "_open_fresh", lambda *a: object())
     monkeypatch.setattr(rf, "CopilotWebDriver", lambda page: _FakeDrv())
     w = _worker()
@@ -893,3 +899,45 @@ def test_all_three_copies_of_the_prefix_agree():
     bridge = _io.open("bridge/copilot_bridge.py", encoding="utf-8").read()
     assert rf.NO_CONTEXT_REFUSAL in src
     assert ('NO_CONTEXT_REFUSAL = "%s"' % rf.NO_CONTEXT_REFUSAL) in bridge
+
+
+def test_a_conversation_id_resume_takes_the_socket(monkeypatch):
+    """The other half of the rule above. Continuing a conversation needs its id and nothing
+    else -- measured with a control arm, at one hour, across a fresh token -- so a follow-up
+    that names one has no reason to pay for a tab."""
+    seen = {}
+    drv = _FakeDrv()
+
+    def _route():
+        def driver_for(self, n, **kw):
+            seen.update(kw)
+            return drv
+        return type("R", (), {"driver_for": driver_for})()
+
+    monkeypatch.setattr(rf, "_socket_route", _route)
+    monkeypatch.setattr(rf, "_open_fresh",
+                        lambda *a: pytest.fail("a conversation-id resume must not open a tab"))
+    w = _worker()
+    w.resume_conv = "4fe936fd-d902-497d-bc89-a2ad4ceb699c"
+    assert w.attach(object(), "agent-url") is True
+    assert w.socket is True
+    assert seen.get("conversation_id") == "4fe936fd-d902-497d-bc89-a2ad4ceb699c"
+
+
+def test_a_fresh_worker_asks_for_no_conversation(monkeypatch):
+    """Starting one stays the default: resuming the wrong conversation looks exactly like
+    resuming the right one."""
+    seen = {}
+    drv = _FakeDrv()
+
+    def _route():
+        def driver_for(self, n, **kw):
+            seen.update(kw)
+            return drv
+        return type("R", (), {"driver_for": driver_for})()
+
+    monkeypatch.setattr(rf, "_socket_route", _route)
+    monkeypatch.setattr(rf, "_open_fresh", lambda *a: pytest.fail("no tab expected"))
+    w = _worker()
+    assert w.attach(object(), "agent-url") is True
+    assert seen.get("conversation_id") == ""

@@ -399,6 +399,29 @@ def _unlock_password():
     return unlock_password_local()
 
 
+#: A BARE conversation GUID, as opposed to a URL to open in a tab. Both can arrive as
+#: `resume_conv`; only one of them can be continued over a socket.
+#:
+#: Named apart from _CONV_GUID_RE below, which pulls a guid OUT of a URL. The first version of
+#: this reused that name and was silently overwritten by it, so every id classified as a URL
+#: and every resume fell back to a tab -- working, slower, and with no symptom.
+_BARE_CONV_GUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _conversation_id_or_empty(resume_conv) -> str:
+    """The conversation id in `resume_conv`, or "" when it is a URL (or nothing).
+
+    Deliberately strict. A URL also contains a guid, and pulling one out of it would make a
+    tab resume silently become a socket resume -- which loses the page the caller asked for
+    and looks identical when it works.
+    """
+    text = str(resume_conv or "").strip()
+    if text.startswith("sess:"):
+        text = text[5:].strip()
+    return text if _BARE_CONV_GUID_RE.match(text) else ""
+
+
 def _initial_job_with_unlock(goal: str, plan_mode: bool = False):
     """Build the first worker turn with a proactive unlock when local credentials exist.
 
@@ -1469,8 +1492,19 @@ class RelayWorker:
             want_socket = choose(self.goal, kind=getattr(self, "task_kind", "") or "") == SOCKET
         except Exception:
             pass                      # a policy that cannot answer must not cost a goal
-        if not self.resume_conv and want_socket:
-            drv = _socket_route().driver_for(self.name)
+        # A RESUME TARGET IS EITHER A PAGE OR A CONVERSATION. The tab path needs a URL to
+        # open; the socket path needs the conversation id, and nothing else -- measured with a
+        # control arm, at one hour and across a fresh token. Until now `resume_conv` could only
+        # be a URL, so every context-carrying follow-up forced a tab, and since the id was
+        # never recorded there was nothing to put here anyway.
+        #
+        # The unlock is unaffected by which branch is taken: self.job was already built through
+        # _initial_job_with_unlock above, on the resume path as well as the fresh one. That is
+        # the single generation point this repository has been moving towards, and a resume
+        # that quietly bypassed it is exactly the fault just fixed in the bridge.
+        resume_id = _conversation_id_or_empty(self.resume_conv)
+        if want_socket and (not self.resume_conv or resume_id):
+            drv = _socket_route().driver_for(self.name, conversation_id=resume_id)
             if drv is not None:
                 self.page, self.drv, self.socket = None, drv, True
                 self.status = "ready"

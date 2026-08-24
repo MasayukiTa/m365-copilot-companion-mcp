@@ -133,3 +133,72 @@ def test_the_route_does_not_invent_a_conversation_to_continue():
     src = inspect.getsource(SR.SocketRoute.driver_for)
     assert "self.last_conversation" not in src
     assert "or self._last" not in src
+
+
+# ── a follow-up can be pointed at the conversation it should continue ───────────────
+
+def test_a_bare_id_is_a_socket_resume_and_a_url_is_not():
+    """Both arrive as resume_conv. A URL also contains a guid, and pulling one out of it
+    would make a tab resume silently become a socket resume -- losing the page the caller
+    asked for, and looking identical when it works."""
+    import relay.relay_fleet as RF
+    f = RF._conversation_id_or_empty
+    guid = "4fe936fd-d902-497d-bc89-a2ad4ceb699c"
+    assert f(guid) == guid
+    assert f("sess:" + guid) == guid
+    assert f("https://example/chat/" + guid) == ""
+    assert f("") == "" and f(None) == ""
+
+
+def test_the_bare_pattern_does_not_shadow_the_url_one():
+    """The first version reused _CONV_GUID_RE, which extracts a guid FROM a url and is defined
+    later in the file. It overwrote this one, so every id classified as a url and every resume
+    fell back to a tab: working, slower, and with no symptom at all."""
+    import relay.relay_fleet as RF
+    assert RF._BARE_CONV_GUID_RE.pattern.startswith("^")
+    assert "conversation|chat" not in RF._BARE_CONV_GUID_RE.pattern
+    assert "conversation|chat" in RF._CONV_GUID_RE.pattern
+
+
+def test_a_socket_resume_still_goes_through_the_unlock_generation_point():
+    """A resume that bypassed it is exactly the fault just fixed in the bridge."""
+    import inspect
+
+    import relay.relay_fleet as RF
+    src = inspect.getsource(RF)
+    i = src.index("initial_body, preflight_unlock = _initial_job_with_unlock(")
+    tail = src[i:i + 700]
+    assert "self.job = (initial_body if self.resume_conv" in tail, \
+        "the resume path must be built by the same call"
+
+
+def test_the_route_can_name_the_conversation_a_goal_ran_in(tmp_path, monkeypatch):
+    import json
+
+    import relay.socket_route as SR
+    log = tmp_path / "socket_route.jsonl"
+    rows = [
+        {"event": "worker_done", "goal": "tidy the docs", "conv_client": "old-one"},
+        {"event": "worker_done", "goal": "something else", "conv_client": "wrong"},
+        {"event": "worker_done", "goal": "tidy the docs", "conv_client": "newest"},
+    ]
+    log.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    route = SR.SocketRoute(capture_fn=lambda *a, **k: None,
+                           connect_fn=lambda *a, **k: None, log_path=str(log))
+    assert route.conversation_for_goal("tidy the docs") == "newest"
+    assert route.conversation_for_goal("never ran") == ""
+    assert route.conversation_for_goal("") == ""
+
+
+def test_a_missing_or_torn_log_answers_empty_rather_than_raising(tmp_path):
+    import relay.socket_route as SR
+    route = SR.SocketRoute(capture_fn=lambda *a, **k: None,
+                           connect_fn=lambda *a, **k: None,
+                           log_path=str(tmp_path / "nope.jsonl"))
+    assert route.conversation_for_goal("anything") == ""
+
+    torn = tmp_path / "torn.jsonl"
+    torn.write_text('{"event": "worker_done", "goal": "g", "conv_cli', encoding="utf-8")
+    route2 = SR.SocketRoute(capture_fn=lambda *a, **k: None,
+                            connect_fn=lambda *a, **k: None, log_path=str(torn))
+    assert route2.conversation_for_goal("g") == ""

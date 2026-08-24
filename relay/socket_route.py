@@ -135,6 +135,47 @@ class SocketRoute:
 
     # ---- the durable record ------------------------------------------------------------------
 
+    def conversation_for_goal(self, goal: str) -> str:
+        """The conversation id of the most recent socket worker that ran `goal`, or "".
+
+        Reads the same append-only log `record` writes, which is the only place this was ever
+        kept. Exists so a follow-up can carry prior context: the server holds the history
+        keyed by this id -- measured, with a control -- so handing it back is the whole of
+        what a resume needs.
+
+        Matched on the goal text because that is what identifies a worker here: it is the
+        transcript key and the replay envelope already. Newest wins, so re-running a goal
+        points a later follow-up at the later conversation.
+        """
+        want = (goal or "").strip()[:600]
+        if not want:
+            return ""
+        found = ""
+        try:
+            with open(self.log_path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue          # several processes append; a torn tail is normal
+                    if not isinstance(rec, dict):
+                        continue
+                    if rec.get("event") != "worker_done":
+                        continue
+                    if (rec.get("goal") or "").strip() != want:
+                        continue
+                    cid = str(rec.get("conv_client") or "").strip()
+                    if cid:
+                        found = cid
+        except FileNotFoundError:
+            return ""
+        except Exception:
+            return ""
+        return found
+
     def record(self, event: str, **fields) -> None:
         """Append one line about a routing decision. Best effort; never raises, never blocks.
 
