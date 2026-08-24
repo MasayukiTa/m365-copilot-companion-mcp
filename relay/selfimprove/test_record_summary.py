@@ -217,3 +217,42 @@ def test_the_module_states_that_the_record_is_never_rewritten():
     import io as _io
     src = _io.open(RS.__file__, encoding="utf-8").read()
     assert "THE RECORD IS NEVER REWRITTEN" in src
+
+
+# ── a diagnostic must not be able to destroy the work ───────────────────────────────
+
+def test_a_log_that_throws_does_not_kill_the_backfill():
+    """Measured: a model reply carried an em dash, the console was cp932, print raised
+    UnicodeEncodeError, and the whole run died after generating most of the records and
+    before anything was saved. It exited 0 because it sat behind a pipe."""
+    def hostile(_m):
+        raise UnicodeEncodeError("cp932", "x", 0, 1, "illegal multibyte sequence")
+
+    rep = RS.backfill([_rec("a", LONG_EN), _rec("b", LONG_JA)],
+                      lambda p: '{"ja": "あ", "en": "b"}', log=hostile)
+    assert rep["generated"] == 2
+
+
+def test_each_summary_is_saved_as_it_is_generated():
+    """Saving only at the end meant one exception discarded every summary before it."""
+    seen = []
+
+    def ask(prompt):
+        seen.append(RS.load())
+        return '{"ja": "あ", "en": "b"}'
+
+    RS.backfill([_rec("a", LONG_EN), _rec("b", LONG_JA)], ask)
+    assert seen[1], "the first summary must already be on disk when the second call is made"
+
+
+def test_a_crash_part_way_keeps_what_was_already_generated():
+    calls = {"n": 0}
+
+    def ask(prompt):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("browser died")
+        return '{"ja": "あ", "en": "b"}'
+
+    RS.backfill([_rec("a", LONG_EN), _rec("b", LONG_JA)], ask)
+    assert RS.summary_for(_rec("a", LONG_EN), "ja") == "あ"

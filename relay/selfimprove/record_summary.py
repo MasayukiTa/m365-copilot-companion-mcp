@@ -33,6 +33,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sys
 import time
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -213,7 +214,19 @@ def backfill(records, ask, *, limit: int = 0, model: str = "", log=None) -> dict
     only real check on an extractive summary is a person reading both. At this scale -- 27
     records and a few a week -- reading all of them is a realistic ask.
     """
-    log = log or (lambda m: None)
+    # A LOG MUST NOT BE ABLE TO KILL THE WORK IT DESCRIBES. Measured: a model reply carried an
+    # em dash, the console was cp932, print raised UnicodeEncodeError, and the whole backfill
+    # died -- after generating most of the records and before anything was saved. The run
+    # exited 0 because it was behind a pipe, so it looked like a success that had produced
+    # nothing.
+    _log = log or (lambda m: None)
+
+    def log(m):
+        try:
+            _log(m)
+        except Exception:
+            pass
+
     cache = load()
     todo = missing(records, cache)
     if limit and limit > 0:
@@ -235,12 +248,17 @@ def backfill(records, ask, *, limit: int = 0, model: str = "", log=None) -> dict
         pair["model"] = model
         pair["ts"] = time.time()
         cache[k] = pair
+        # SAVED AS IT GOES. Saving only at the end meant one exception anywhere in the loop
+        # discarded every summary generated before it -- 28 model calls thrown away by a
+        # print. At this scale the write is nothing; losing the run is not.
+        try:
+            save(cache)
+        except Exception:
+            pass
         done += 1
         first = " ".join(str(r.get("reason") or "").split())[:110]
         log("%s\n    source : %s\n    ja     : %s\n    en     : %s"
             % (k[:12], first, pair["ja"], pair["en"]))
-    if done:
-        save(cache)
     return {"generated": done, "failed": failed, "remaining": len(missing(records, cache))}
 
 
@@ -364,9 +382,21 @@ def _cli(argv=None) -> int:
                                     " ".join(str(r.get("reason") or "").split())[:80]))
         return 0
 
+    def emit(m):
+        """The console here is cp932 and a model reply may hold anything. Printable-or-not is
+        a property of the terminal, never a reason to lose a record."""
+        try:
+            sys.stdout.write(str(m) + "\n")
+        except Exception:
+            enc = getattr(sys.stdout, "encoding", "") or "ascii"
+            sys.stdout.write(str(m).encode(enc, "replace").decode(enc, "replace") + "\n")
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+
     ask = _copilot_asker(args.cdp, agent_url=args.agent_url)
-    report = backfill(records, ask, limit=args.limit, model="copilot",
-                      log=lambda m: print(m, flush=True))
+    report = backfill(records, ask, limit=args.limit, model="copilot", log=emit)
     print(json.dumps(report, ensure_ascii=False))
     return 0
 
