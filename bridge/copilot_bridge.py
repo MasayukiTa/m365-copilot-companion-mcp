@@ -2943,14 +2943,46 @@ class Handler(BaseHTTPRequestHandler):
                 depth = len((S.load(sid) or {}).get("pending") or [])
             except Exception:
                 depth = -1
+
+            # AN IDLE SEND STARTS A TURN. Queuing was always correct; waiting to be noticed
+            # was not. With no run in progress nothing drains this queue, so a message sat
+            # here until a person happened to start something -- one has been in this store
+            # since 07-07, in a session still marked active.
+            #
+            # Bounded on purpose, and worth stating plainly because it changes what this
+            # program does while a person is looking at it: a turn can now begin at the moment
+            # the operator sends, on the page they may be using. It does not begin at any other
+            # moment. /send is the only endpoint this runs from, its only caller is a human
+            # typing at the REPL, and there is no loop -- one drain pass, then idle again. That
+            # is deliberately not a background drainer: a daemon that dies leaves exactly
+            # today's silence while the interface reports itself healthy.
+            promoted = False
+            if not consumer_running:
+                def _promote():
+                    # Re-checked here, not above: between the test and this thread starting,
+                    # a /goal or /stream may have taken the page. Losing the race means the
+                    # message stays queued, which is the old behaviour and is safe.
+                    if not PAGE_LOCK.acquire(blocking=False):
+                        return
+                    try:
+                        run_on_page_thread(self._drain_pending_queue, sid)
+                    except Exception:
+                        logger.warning("promoted /send failed for sid=%s", sid, exc_info=True)
+                    finally:
+                        PAGE_LOCK.release()
+
+                threading.Thread(target=_promote, name="send-promote", daemon=True).start()
+                promoted = True
+
             self._json({
                 "ok": True, "queued": True, "sid": sid,
                 "consumer_running": consumer_running,
+                "promoted": promoted,
                 "queue_depth": depth,
                 "note": ("a run is in progress; this will be injected at its next turn boundary"
                          if consumer_running else
-                         "NOTHING IS RUNNING -- nobody will pick this up until a /stream turn "
-                         "or a /goal run starts. It stays queued until then."),
+                         "nothing was running, so a turn was started for this. If another "
+                         "request claimed the page first it stays queued instead."),
             })
             return
         if parsed.path == "/history":      # scrape ALL turns of a conversation in order

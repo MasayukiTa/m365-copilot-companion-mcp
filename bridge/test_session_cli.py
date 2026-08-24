@@ -528,7 +528,12 @@ def test_run_goal_keyboard_line_sends_steering():
     client = FakeClient(sessions=[_mk_session("s7")], goal_lines=GOAL_LINES)
     out = _run_goal(client, kbd_items=["also check the tests"])
     assert client.send_calls == [("s7", "also check the tests")]
-    assert "[queued for next turn]" in out
+    # The REPL used to announce "[queued for next turn]" whatever happened. In the case that
+    # mattered -- nothing running, so no next turn -- it was the wrong guess. It now reports
+    # what the endpoint said; the fake returns a bare {"ok": True}, i.e. neither promoted nor
+    # consumed, which is exactly the case that used to be described wrongly.
+    assert "[queued" in out
+    assert "next turn" not in out or "boundary" in out
 
 
 def test_run_goal_blank_keyboard_lines_not_sent():

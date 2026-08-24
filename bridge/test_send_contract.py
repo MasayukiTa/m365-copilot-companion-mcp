@@ -29,11 +29,47 @@ def test_the_reply_says_whether_anyone_is_coming_for_it():
     assert "PAGE_LOCK.locked()" in body
 
 
-def test_the_idle_case_says_so_in_words_and_not_only_in_a_flag():
+def test_the_idle_case_says_what_happened_and_not_only_a_flag():
     """A boolean nobody renders is the same silence in a different shape."""
     body = _send_branch()
-    assert "NOTHING IS RUNNING" in body
-    assert "stays queued until then" in body
+    assert "a turn was started for this" in body
+    assert "it stays queued instead" in body
+
+
+def test_an_idle_send_starts_a_turn():
+    """Queuing was always correct; waiting to be noticed was not. Approved by the operator
+    after being told what it changes: a turn can begin at the moment they send, on a page
+    they may be using."""
+    body = _send_branch()
+    assert "if not consumer_running:" in body
+    assert "run_on_page_thread(self._drain_pending_queue, sid)" in body
+    assert '"promoted": promoted' in body
+
+
+def test_the_promotion_is_bounded_to_the_moment_of_sending():
+    """Not a background drainer: a daemon that dies leaves exactly today's silence while the
+    interface reports itself healthy."""
+    body = _send_branch()
+    assert "while True" not in body
+    assert "schedule" not in body.lower()
+    assert "_drain_pending_queue" in body
+    assert body.count("threading.Thread") == 1
+
+
+def test_losing_the_race_for_the_page_leaves_it_queued():
+    """Between the test above and the thread starting, a /goal or /stream may take the page.
+    That is the old behaviour and it is safe; taking the page from them is not."""
+    body = _send_branch()
+    assert "if not PAGE_LOCK.acquire(blocking=False):" in body
+    assert "PAGE_LOCK.release()" in body
+
+
+def test_a_promoted_turn_that_throws_does_not_take_the_lock_with_it():
+    body = _send_branch()
+    i = body.index("run_on_page_thread(self._drain_pending_queue, sid)")
+    tail = body[i:i + 400]
+    assert "except Exception:" in tail
+    assert "finally:" in tail
 
 
 def test_the_reply_carries_the_queue_depth():
@@ -47,18 +83,23 @@ def test_it_still_queues_and_still_returns_immediately():
     stays answerable while a run holds the lock."""
     body = _send_branch()
     assert "_queue_input_locked(sid, msg)" in body
-    # The comments discuss both of these by name; the CODE must contain neither.
-    code = chr(10).join(l.split("#")[0] for l in body.splitlines())
-    assert "run_on_page_thread" not in code
-    assert "PAGE_LOCK.acquire" not in code
+    # The reply is sent before any turn begins: the promotion runs on its own thread, so this
+    # endpoint stays answerable while a run holds the page, which is why it exists.
+    # rfind: the FIRST self._json in this branch is the empty-message error, not the reply.
+    i_reply = body.rfind("self._json({")
+    i_thread = body.index("threading.Thread(target=_promote")
+    assert i_thread < i_reply, "the thread is started first, but it must not block the reply"
+    # `def _promote():` contains the same characters, so the check is on statements.
+    assert not [l for l in body.splitlines() if l.strip() == "_promote()"],         "started on a thread, never called inline"
 
 
-def test_it_reports_rather_than_acts():
-    """Promoting an idle /send into a turn means touching the page while a person may be using
-    it -- a separate decision with its own risks, not a detail of this one."""
+def test_it_reuses_the_existing_drain_rather_than_a_new_turn_path():
+    """_drain_pending_queue already sends with no SSE consumer and persists the exchange the
+    same way a normal turn does. A second way to run a turn is a second way to be wrong."""
     body = _send_branch()
-    for started in ("_run_one_turn", "_stream_text", "_run_work_phase"):
-        assert started not in body, started
+    assert "_drain_pending_queue" in body
+    for invented in ("_run_one_turn", "_stream_text", "_run_work_phase"):
+        assert invented not in body, invented
 
 
 def test_a_failure_to_count_does_not_fail_the_send():
