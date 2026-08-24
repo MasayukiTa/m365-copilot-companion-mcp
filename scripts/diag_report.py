@@ -58,7 +58,8 @@ def analyse(events_path):
     base = events_path[: -len("_events.json")]
     trace = read_trace(base + "_ws.csv")
     at = {e["event"]: e["ts"] for e in ev["events"]}
-    out = {"transport": ev["transport"], "samples": len(trace),
+    out = {"transport": ev["transport"], "concurrency": ev.get("concurrency", "3"),
+           "samples": len(trace),
            "warmup": ev.get("warmup"), "gain_mb": ev.get("memory_gain_mb")}
     if not trace or "run_start" not in at:
         out["why"] = "no usable trace"
@@ -107,7 +108,11 @@ def analyse(events_path):
     # THE OTHER SIDE OF THE BOUNDARY. Tabs work lands in the browser tree; socket work also
     # lands in the process holding the websocket, which no browser sampler can see. Without
     # this an arm can look cheap merely by moving its cost across the line being measured.
-    client = os.path.join(REPO, ".fleet", "witness", "client_n23.csv")
+    # This run's own client trace when it has one; the shared night-long file only for the
+    # first runs, which predate per-run sampling.
+    client = base + "_client.csv"
+    if not os.path.exists(client):
+        client = os.path.join(REPO, ".fleet", "witness", "client_n23.csv")
     if os.path.exists(client):
         rows = [(float(r["ts"]), float(r["total_mb"]))
                 for r in csv.DictReader(io.open(client, encoding="utf-8"))
