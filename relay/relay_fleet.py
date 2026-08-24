@@ -836,7 +836,12 @@ _SOCKET_ROUTE_LOCK = threading.Lock()
 
 
 def _socket_route():
-    """The fleet's socket route, built once. Off unless MCP_FLEET_SOCKET says otherwise.
+    """The fleet's socket route, built once. ON unless MCP_FLEET_SOCKET says otherwise.
+
+    THE DEFAULT IS ON, AND THIS LINE SAID THE OPPOSITE. socket_route.ENABLED is True when the
+    variable is unset -- measured in a fresh process: unset and "1" give True, "0" gives False.
+    A reader asked to say what a websocket-enabled .env looks like would have answered from
+    this sentence and got it backwards: the answer is that the key is ABSENT.
 
     A worker asks this for a driver; if it gets None it opens a tab, which is what every
     worker did before this existed. Nothing here can fail a goal -- see relay/socket_route.py.

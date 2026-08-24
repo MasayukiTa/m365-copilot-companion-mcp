@@ -1011,3 +1011,15 @@ def test_a_socket_resume_leaves_a_reopenable_url_behind(monkeypatch):
     # Named exactly. "" also passes a not-a-guid check, and "" means "a fresh independent
     # chat" -- which is the silent context loss this change exists to stop.
     assert w._agent_url == "https://agent.example/chat"
+
+
+def test_the_documented_default_matches_the_measured_one():
+    """「MCP_FLEET_SOCKET が言わない限り OFF」と書かれていたが、実際の既定は ON。
+    env の状態を人に説明するとき、最初に読まれるのがこの1行だった。"""
+    import inspect
+    from relay import relay_fleet as RF
+    from relay import socket_route as SR
+    doc = inspect.getsource(RF._socket_route)
+    first = doc.split('"""')[1].splitlines()[0]
+    assert "ON unless" in first, first
+    assert SR.ENABLED is True, "この環境で既定が ON でないなら、上の1行も直すこと"
