@@ -74,20 +74,27 @@ def test_the_floor_is_taken_from_the_frozen_judge_not_restated(monkeypatch):
 
 # ---- 走行前検査 ---------------------------------------------------------------------------
 
+#: テストは実機の刻印に依存しない。着弾状態は必ず明示的に渡す。
+NEVER = float("inf")
+
+
 def test_a_run_is_refused_when_nothing_says_the_connector_works():
-    assert S.preflight({"tool_age_s": None}) != ""
-    assert S.preflight({"tool_age_s": S.PROBE_STALE_S + 1}) != ""
-    assert S.preflight({"tool_age_s": 60, "tool_ok": False, "tool_inbound": False}) != ""
+    assert S.preflight({"tool_age_s": None}, inbound_age=NEVER) != ""
+    assert S.preflight({"tool_age_s": S.PROBE_STALE_S + 1}, inbound_age=NEVER) != ""
+    assert S.preflight({"tool_age_s": 60, "tool_ok": False, "tool_inbound": False},
+                       inbound_age=NEVER) != ""
 
 
 def test_a_recent_healthy_probe_lets_the_run_proceed():
-    assert S.preflight({"tool_age_s": 60, "tool_ok": True, "tool_inbound": True}) == ""
+    assert S.preflight({"tool_age_s": 60, "tool_ok": True, "tool_inbound": True},
+                       inbound_age=NEVER) == ""
 
 
 def test_a_failed_probe_that_DID_reach_the_server_is_not_a_connector_problem():
     """応答が使えなかっただけで呼び出しは届いている。輸送の測定は続けてよい。
     ここを塞ぐと、モデルの気まぐれで一晩が止まる。"""
-    assert S.preflight({"tool_age_s": 60, "tool_ok": False, "tool_inbound": True}) == ""
+    assert S.preflight({"tool_age_s": 60, "tool_ok": False, "tool_inbound": True},
+                       inbound_age=NEVER) == ""
 
 
 # ---- 隔離 ---------------------------------------------------------------------------------
@@ -141,3 +148,22 @@ def test_a_null_as_large_as_the_treatment_mean_blocks_confirmation():
     """完全分離が条件。処置平均に届く帰無が1本でもあれば、それは分離ではない。"""
     v = S.verdict([10, 20, 15, 505, 12, 18, 22, 14], [500, 520, 480, 510])
     assert v["state"] != "CONFIRMED"
+
+
+def test_a_fresh_arrival_outranks_a_stale_failing_verdict():
+    """記録された判定は最後の『定期』プローブのもので、最大1周期ぶん古い。
+    着弾刻印は、どのターンが出した呼び出しであれ「サーバに届いた」を言う。
+    復旧直後は刻印が新しく判定はまだ障害を語るので、そこで拒否すると
+    もう存在しない問題の記録で系列を止めることになる。
+
+    緩めているのではない。門が拒むのは経路が『未検証』のときで、
+    窓の内側の着弾はまさにその検証そのもの。"""
+    stale_bad = {"tool_age_s": 60, "tool_ok": False, "tool_inbound": False}
+    assert S.preflight(stale_bad, inbound_age=NEVER) != ""
+    assert S.preflight(stale_bad, inbound_age=120.0) == ""
+
+
+def test_an_old_arrival_does_not_rescue_a_bad_verdict():
+    """刻印が窓の外なら、それは証拠として古い。"""
+    stale_bad = {"tool_age_s": 60, "tool_ok": False, "tool_inbound": False}
+    assert S.preflight(stale_bad, inbound_age=S.PROBE_STALE_S + 1) != ""

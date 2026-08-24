@@ -69,6 +69,15 @@ import sys
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# RUN AS A SCRIPT, NOT ONLY AS A MODULE. `python scripts/run_transport_series.py` puts scripts/
+# on sys.path and NOT the repo root, so `from tools import tool_probe` inside the preflight
+# raised ModuleNotFoundError -- and the preflight, correctly, refused the run rather than
+# measuring. It then re-queued the cell and would have refused every ten minutes for the rest
+# of the night. Failing closed is right; failing closed on an import error of our own making
+# would have burnt the series.
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
 RESULT = os.path.join(REPO, "docs", "research", "results", "route_campaign.json")
 
 #: Frozen for the series. Changing any of these starts a different series.
@@ -110,7 +119,7 @@ def argv_for(kind: str, order: str) -> list:
     return args
 
 
-def preflight(summary=None) -> str:
+def preflight(summary=None, inbound_age=None) -> str:
     """Empty string if the next run may proceed, else the reason it may not.
 
     REFUSING IS NOT A MEASUREMENT, and that is the point: the probe stamp is the one signal
@@ -124,9 +133,32 @@ def preflight(summary=None) -> str:
             summary = tool_probe.get_summary()
         except Exception as exc:
             return "probe summary unreadable: %s" % type(exc).__name__
+    # A FRESH ARRIVAL OUTRANKS A STALE VERDICT, because it is the more direct evidence.
+    #
+    # The recorded verdict belongs to the last SCHEDULED probe and can be up to a cadence old.
+    # The stamp says a probe's own tool call reached this server, which is the thing the gate
+    # is actually asking about, and it is written by whichever turn made the call. After a
+    # recovery the stamp is current while the verdict still describes the outage -- refusing
+    # then would hold the series behind a record of a problem that no longer exists.
+    #
+    # This is not a loosening. The gate refuses when the connector path is UNVERIFIED, and an
+    # arrival inside the window is exactly the verification it wants.
+    # None means "look it up"; a caller that knows there has been no arrival passes inf. Two
+    # meanings on one parameter is how the first version of this let a test read the live
+    # machine's stamp and pass for the wrong reason.
+    if inbound_age is None:
+        try:
+            from tools import tool_probe
+            stamp = tool_probe.last_inbound_ts()
+        except Exception:
+            stamp = 0.0
+        inbound_age = (time.time() - stamp) if stamp else None
+    if inbound_age is not None and inbound_age <= PROBE_STALE_S:
+        return ""
+
     age = summary.get("tool_age_s")
     if age is None:
-        return "no probe has ever been recorded"
+        return "no probe has ever been recorded and nothing has reached this server"
     if float(age) > PROBE_STALE_S:
         return "the last probe is %.0f minutes old" % (float(age) / 60.0)
     if summary.get("tool_ok") is False and summary.get("tool_inbound") is False:
@@ -215,10 +247,22 @@ def run_one(kind: str, order: str, log_dir: str) -> dict:
 
 def main(argv=None) -> int:                                     # pragma: no cover
     argv = sys.argv[1:] if argv is None else argv
-    phase = PHASE_A if "--phase-a" in argv else (PHASE_A + PHASE_B)
+    # Phase A and Phase B are separable so a night can be resumed, and because Phase A's
+    # measured spread is what sizes Phase B. Adding this flag is not an instrument change:
+    # it selects which cells run, and every cell's flags are unchanged.
+    if "--phase-a" in argv:
+        phase = PHASE_A
+    elif "--phase-b" in argv:
+        phase = PHASE_B
+    else:
+        phase = PHASE_A + PHASE_B
+    prior_nulls = [float(x) for x in (os.environ.get("SERIES_PRIOR_NULLS") or "").split(",")
+                   if x.strip()]
     log_dir = os.environ.get("SERIES_LOG_DIR") or os.path.join(REPO, ".fleet", "series")
     os.makedirs(log_dir, exist_ok=True)
-    nulls, txs, refused = [], [], []
+    # Phase B's verdict must read against ALL the nulls, Phase A's included -- otherwise the
+    # eight runs that established the spread are thrown away at the moment they are needed.
+    nulls, txs, refused = list(prior_nulls), [], []
     queue = list(phase)
     attempts = 0
     while queue and attempts < len(phase) * 2:
