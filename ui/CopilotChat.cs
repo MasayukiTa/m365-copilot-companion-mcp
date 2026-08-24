@@ -144,7 +144,7 @@ class ChatWindow : Window
         if (k == "open_cockpit") return ja ? "並列実行を開く" : "Open parallel execution";
         if (k == "loadingconv") return ja ? "会話を読み込み中…" : "Loading conversation…";
         if (k == "fleetview") return ja ? "並列タスクの会話" : "Parallel task";
-        if (k == "fleetview_note") return ja ? "▼ 並列タスクの会話を表示中。ここに入力すると、この会話に割り込めます。" : "▼ Viewing a parallel-task conversation. Type here to steer it.";
+        if (k == "fleetview_note") return ja ? "並列タスクの会話を表示中。ここに入力すると、この会話に割り込めます。" : "Viewing a parallel-task conversation. Type here to steer it.";
         if (k == "del_head") return ja ? "を削除 — 方法を選んでください" : " — choose how to delete";
         if (k == "m1t") return ja ? "このアプリからのみ削除" : "Delete from this app only";
         if (k == "m1s") return ja ? "Copilot 側の会話は残す（最も安全）" : "Keeps the Copilot conversation (safest)";
@@ -191,7 +191,7 @@ class ChatWindow : Window
         if (k == "send_unknown_conv") return ja ? "この会話の送信先を特定できません。会話を開き直してください。" : "Can't identify where to send this — please reopen the conversation.";
         if (k == "send_offline") return ja ? "ブリッジに接続できません。送信していません。" : "Can't reach the bridge. Nothing was sent.";
         if (k == "retry_start_stack") return ja ? "スタックを起動して再試行" : "Start the stack and retry";
-        if (k == "reload_transcript") return ja ? "🔄 再読み込み" : "🔄 Reload";
+        if (k == "reload_transcript") return ja ? "再読み込み" : "Reload";
         // ── sidebar section / action labels ──────────────────────────────────────
         if (k == "sec_pinned")   return ja ? "ピン留め"   : "Pinned";
         if (k == "sec_today")    return ja ? "最近"        : "Recent";
@@ -295,7 +295,12 @@ class ChatWindow : Window
         // Far-left: sidebar toggle button (hamburger). Always visible even when sidebar is collapsed.
         _sideToggleBtn = new Button
         {
-            Content = "☰",   // ☰ trigram for heaven (hamburger glyph)
+            // THE ICON, NOT A CHARACTER THAT LOOKS LIKE ONE. This was U+2630, the I Ching trigram
+            // for heaven, borrowed because it has three horizontal lines. Its weight, size and
+            // vertical placement come from whichever font on the machine happens to contain it,
+            // so it never matched the drawn icons three inches below it in the same window. This
+            // app already ships a glyph subset and a renderer for it; the button now uses them.
+            Content = MakeIcon("menu", 18),
             FontSize = 14,
             Width = 36, Height = 36,
             Cursor = Cursors.Hand,
@@ -313,7 +318,9 @@ class ChatWindow : Window
         var headLeft = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(4, 0, 0, 0), MaxWidth = 420 };
         // The dot itself is small; wrap it in a slightly larger transparent hit target so it is easy
         // to click. The click opens the Fleet Cockpit health view (single dot + click-through design).
-        _statusDot = new Border { Width = 9, Height = 9, CornerRadius = new CornerRadius(5), VerticalAlignment = VerticalAlignment.Center };
+        // A circle, so the radius is half the width and follows it if the width ever changes.
+        // Geometry, not style: deliberately not a token.
+        _statusDot = new Border { Width = 9, Height = 9, CornerRadius = new CornerRadius(9 / 2.0), VerticalAlignment = VerticalAlignment.Center };
         SetRef(_statusDot, BackgroundProperty, "Faint");
         var dotHit = new Border
         {
@@ -338,7 +345,9 @@ class ChatWindow : Window
         var headRight = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Right };
         DockPanel.SetDock(headRight, Dock.Right);
         // Settings button (opens cockpit)
-        var settingsBtn = Btn("⚙", "PanelAlt", "Muted", true);
+        var settingsBtn = Btn("", "PanelAlt", "Muted", true);
+        // U+2699 GEAR was standing in for the settings icon that this app already carries.
+        settingsBtn.Content = MakeIcon("settings", 18);
         settingsBtn.Padding = new Thickness(10, 3, 10, 3); settingsBtn.FontSize = 13;
         settingsBtn.ToolTip = _lang == 0 ? "Fleet / コックピットを開く" : "Open Fleet / Cockpit";
         settingsBtn.Click += delegate { OpenCockpit(); };
@@ -349,7 +358,7 @@ class ChatWindow : Window
         _fleetChip = new Border
         {
             Child = _fleetChipLabel, BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(6), Padding = new Thickness(10, 3, 10, 3),
+            CornerRadius = new CornerRadius(Theme.RadSmall), Padding = new Thickness(10, 3, 10, 3),
             Margin = new Thickness(0, 0, 8, 0), Cursor = Cursors.Hand,
             Visibility = Visibility.Collapsed
         };
@@ -424,7 +433,7 @@ class ChatWindow : Window
         inputOverlay.Children.Add(_inputHint);
         BuildCmdPopup();
         // Footer row: left = "/" affordance, right = Send button.
-        _send = Btn(T("send"), "Accent", "AccentFg", false);
+        _send = Btn(T("send"), "AccentFill", "AccentFg", false);
         _send.Height = 32; _send.Padding = new Thickness(14, 0, 14, 0);
         _send.FontWeight = FontWeights.SemiBold;
         _send.Click += delegate
@@ -484,7 +493,7 @@ class ChatWindow : Window
         _composerBorder = new Border
         {
             Child = composerInner,
-            CornerRadius = new CornerRadius(12),
+            CornerRadius = new CornerRadius(Theme.RadBubble),
             // Constant 1px at rest (Border token) — gives a stable boundary (fixes the weak
             // light-theme edge) and, crucially, a constant footprint. The 1px rest/1px focus/
             // 2px steer progression only ever changes thickness by 1 (steer), which SetComposerRing
@@ -524,7 +533,7 @@ class ChatWindow : Window
         _banner = new Border
         {
             Visibility = Visibility.Collapsed, VerticalAlignment = VerticalAlignment.Top,
-            Margin = new Thickness(24, 12, 24, 0), CornerRadius = new CornerRadius(12),
+            Margin = new Thickness(24, 12, 24, 0), CornerRadius = new CornerRadius(Theme.RadBubble),
             BorderThickness = new Thickness(1), Padding = new Thickness(16, 13, 16, 15),
             MaxWidth = 560, HorizontalAlignment = HorizontalAlignment.Center
         };
@@ -808,7 +817,9 @@ class ChatWindow : Window
             {
                 var sm = ReadTranscript(sf);
                 if (sm.Count == 0) continue;
-                string kind = sf.Contains("__sub_research_") ? "🔎 research" : "🧪 sub-agent";
+                // The magnifier and the test tube were doing the work of a word, in a face this UI does
+        // not control and at a size it cannot set. The words are shorter to read anyway.
+        string kind = sf.Contains("__sub_research_") ? "research" : "sub-agent";
                 msgs.Add(new Msg("A", "──────── " + kind + (_lang == 0 ? "（サブエージェント）" : " (sub-agent)") + " ────────"));
                 msgs.AddRange(sm);
             }
@@ -1361,7 +1372,7 @@ class ChatWindow : Window
         _fleetStrip = new Border
         {
             Child = _fleetStripBody,
-            CornerRadius = new CornerRadius(8),
+            CornerRadius = new CornerRadius(Theme.RadCard),
             BorderThickness = new Thickness(1),
             Padding = new Thickness(10, 4, 10, 4),
             Margin = new Thickness(0, 0, 0, 6),
@@ -1575,7 +1586,7 @@ class ChatWindow : Window
             var dot = new Border
             {
                 Width = 8, Height = 8,
-                CornerRadius = new CornerRadius(4),
+                CornerRadius = new CornerRadius(Theme.RadChip),
                 Margin = new Thickness(0, 0, 5, 0),
                 VerticalAlignment = VerticalAlignment.Center
             };
@@ -1854,7 +1865,7 @@ class ChatWindow : Window
         };
         SetRef(head, TextBlock.ForegroundProperty, "Fg");
         _bannerBody.Children.Add(head);
-        var open = Btn(buttonLabel, "Accent", "AccentFg", false);
+        var open = Btn(buttonLabel, "AccentFill", "AccentFg", false);
         open.Height = 30; open.Padding = new Thickness(14, 0, 14, 0); open.FontWeight = FontWeights.SemiBold;
         open.HorizontalAlignment = HorizontalAlignment.Left;
         open.Click += delegate { onClick(); };
@@ -2028,7 +2039,7 @@ class ChatWindow : Window
         _cmdList = new ListBox { MaxHeight = 240, BorderThickness = new Thickness(0) };
         SetRef(_cmdList, BackgroundProperty, "Panel");
         _cmdList.PreviewMouseLeftButtonUp += delegate { AcceptCommand(); };
-        var border = new Border { Child = _cmdList, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(4) };
+        var border = new Border { Child = _cmdList, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(Theme.RadCard), Padding = new Thickness(4) };
         SetRef(border, BackgroundProperty, "Panel"); SetRef(border, Border.BorderBrushProperty, "Accent");
         _cmdPopup = new Popup { PlacementTarget = _input, Placement = PlacementMode.Top, StaysOpen = false, Width = 560 };
         _cmdPopup.Child = border;
@@ -2219,6 +2230,8 @@ class ChatWindow : Window
         Set("Accent", Theme.Accent(_dark));
         Set("AccentSoft", Theme.AccentSoft(_dark));
         Set("AccentFg", Theme.AccentFg(_dark));
+        // The fill beneath it. "Accent" stays the bright mark used for borders and focus.
+        Set("AccentFill", Theme.AccentFill(_dark));
         Set("Success", Theme.Success(_dark));   // status dot: idle & bridge reachable
         Set("Warning", Theme.Warning(_dark));   // status dot: sign-in / canned refusal
         Set("Danger", Theme.Danger(_dark));     // status dot: bridge unreachable / stream error
@@ -2373,15 +2386,11 @@ class ChatWindow : Window
     UIElement MakeSectionHeader(string label, string key, int count)
     {
         bool collapsed = _sectionCollapsed.ContainsKey(key) && _sectionCollapsed[key];
-        string chevron = collapsed ? "▸" : "▾";
-
-        var chevronBlock = new TextBlock
-        {
-            Text = chevron, FontSize = 10,
-            VerticalAlignment = VerticalAlignment.Center,
-            Margin = new Thickness(0, 0, 5, 0)
-        };
-        SetRef(chevronBlock, TextBlock.ForegroundProperty, "Faint");
+        // The subset's own chevrons. This was U+25B8 / U+25BE in whatever font had them, next to
+        // a column of drawn icons it could never match in weight or baseline.
+        var chevronBlock = (FrameworkElement)MakeIcon(collapsed ? "chevron_right" : "expand_more", 10);
+        chevronBlock.VerticalAlignment = VerticalAlignment.Center;
+        chevronBlock.Margin = new Thickness(0, 0, 5, 0);
 
         string displayLabel = _lang == 0 ? label : label.ToUpperInvariant();
         var labelBlock = new TextBlock
@@ -2879,7 +2888,7 @@ class ChatWindow : Window
         SetRef(tb, TextBlock.ForegroundProperty, "Fg");
         var chip = new Border
         {
-            Child = tb, CornerRadius = new CornerRadius(6), BorderThickness = new Thickness(1),
+            Child = tb, CornerRadius = new CornerRadius(Theme.RadSmall), BorderThickness = new Thickness(1),
             Padding = new Thickness(14, 9, 14, 9), Margin = new Thickness(0, 4, 0, 4),
             Cursor = Cursors.Hand, HorizontalAlignment = HorizontalAlignment.Stretch
         };
@@ -2970,8 +2979,8 @@ class ChatWindow : Window
             var note = new TextBlock
             {
                 Text = _lang == 0
-                    ? "この会話の本文はここからは取得できません。\n並列タスクの全文は、コックピットの該当カード（▶ 開く）から開くと表示されます。"
-                    : "This conversation's body isn't fetchable here.\nOpen it from its cockpit card (▶ Open) to see the full transcript.",
+                    ? "この会話の本文はここからは取得できません。\n並列タスクの全文は、コックピットの該当カード（開く）から開くと表示されます。"
+                    : "This conversation's body isn't fetchable here.\nOpen it from its cockpit card (Open) to see the full transcript.",
                 FontSize = 12.5, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(2, 2, 2, 10)
             };
             SetRef(note, TextBlock.ForegroundProperty, "Muted");
@@ -3130,7 +3139,7 @@ class ChatWindow : Window
         SetRef(closeBtn, BackgroundProperty, "PanelAlt"); SetRef(closeBtn, ForegroundProperty, "Fg"); SetRef(closeBtn, Control.BorderBrushProperty, "Border");
         closeBtn.Click += delegate { win.Close(); };
         var delBtn = new Button { Content = T("del_selected"), Cursor = Cursors.Hand, FontSize = 12.5, Padding = new Thickness(16, 6, 16, 7), BorderThickness = new Thickness(0), FontWeight = FontWeights.SemiBold };
-        SetRef(delBtn, BackgroundProperty, "Accent"); SetRef(delBtn, ForegroundProperty, "AccentFg");
+        SetRef(delBtn, BackgroundProperty, "AccentFill"); SetRef(delBtn, ForegroundProperty, "AccentFg");
         DockPanel.SetDock(closeBtn, Dock.Right);
         DockPanel.SetDock(delBtn, Dock.Right);
         footer.Children.Add(closeBtn);
@@ -3147,7 +3156,7 @@ class ChatWindow : Window
         var listScroll = new ScrollViewer { Content = listPanel, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
         SetRef(listScroll, Control.BorderBrushProperty, "Border");
         listScroll.BorderThickness = new Thickness(1);
-        var listBorder = new Border { Child = listScroll, CornerRadius = new CornerRadius(8) };
+        var listBorder = new Border { Child = listScroll, CornerRadius = new CornerRadius(Theme.RadCard) };
         SetRef(listBorder, Border.BorderBrushProperty, "Border"); listBorder.BorderThickness = new Thickness(1);
         dock.Children.Add(listBorder);
 
@@ -3578,7 +3587,7 @@ class ChatWindow : Window
             TextWrapping = TextWrapping.Wrap, IsTabStop = false, FontFamily = new FontFamily("Segoe UI Variable, Segoe UI"), FontSize = 14
         };
         SetRef(tb, ForegroundProperty, "Fg");
-        var bubble = new Border { Child = tb, CornerRadius = new CornerRadius(14), Padding = new Thickness(14, 11, 14, 11), Margin = new Thickness(40, 6, 0, 24), HorizontalAlignment = HorizontalAlignment.Right, MaxWidth = 560 };
+        var bubble = new Border { Child = tb, CornerRadius = new CornerRadius(Theme.RadBubble), Padding = new Thickness(14, 11, 14, 11), Margin = new Thickness(40, 6, 0, 24), HorizontalAlignment = HorizontalAlignment.Right, MaxWidth = 560 };
         SetRef(bubble, BackgroundProperty, "UserBg");
         _messages.Children.Add(bubble);
         StickToEnd();
@@ -3769,7 +3778,7 @@ class ChatWindow : Window
         var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(2, 4, 0, 4) };
         for (int i = 0; i < 3; i++)
         {
-            var dot = new Border { Width = 7, Height = 7, CornerRadius = new CornerRadius(4), Margin = new Thickness(0, 0, 5, 0), VerticalAlignment = VerticalAlignment.Center };
+            var dot = new Border { Width = 7, Height = 7, CornerRadius = new CornerRadius(7 / 2.0), Margin = new Thickness(0, 0, 5, 0), VerticalAlignment = VerticalAlignment.Center };
             SetRef(dot, BackgroundProperty, "Muted");
             var tt = new TranslateTransform();
             dot.RenderTransform = tt;
@@ -3898,7 +3907,7 @@ class ChatWindow : Window
         _pendingOuter = outer;
         _pendingContent.Children.Add(MakeTyping());   // <- the sibling app waiting indicator, shown immediately
         _pendingText = null; _started = false;
-        _generating = true; _send.Content = "■ " + T("stop"); _send.IsEnabled = true;   // distinct from Send; _send now acts as Stop (also Esc)
+        _generating = true; _send.Content = T("stop"); _send.IsEnabled = true;   // distinct from Send; _send now acts as Stop (also Esc)
         PaintSend();   // stay accent while generating
         SetDot("busy");
         new Thread((ThreadStart)delegate { Stream(text, target); }) { IsBackground = true }.Start();
@@ -3964,12 +3973,12 @@ class ChatWindow : Window
 
     UIElement BuildRouterBar()
     {
-        _routerBar = new Border { Visibility = Visibility.Collapsed, CornerRadius = new CornerRadius(10), BorderThickness = new Thickness(1), Padding = new Thickness(12, 8, 10, 8), Margin = new Thickness(0, 0, 0, 8) };
+        _routerBar = new Border { Visibility = Visibility.Collapsed, CornerRadius = new CornerRadius(Theme.RadPopover), BorderThickness = new Thickness(1), Padding = new Thickness(12, 8, 10, 8), Margin = new Thickness(0, 0, 0, 8) };
         SetRef(_routerBar, BackgroundProperty, "Panel"); SetRef(_routerBar, Border.BorderBrushProperty, "Accent");
         var dp = new DockPanel();
         var btns = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
         DockPanel.SetDock(btns, Dock.Right);
-        _routerResearch = Btn("", "Accent", "AccentFg", false);
+        _routerResearch = Btn("", "AccentFill", "AccentFg", false);
         _routerResearch.Padding = new Thickness(12, 3, 12, 3); _routerResearch.FontSize = 12; _routerResearch.FontWeight = FontWeights.SemiBold;
         _routerResearch.Click += delegate { var t = _routerText; HideRouter(); _input.Clear(); SendText("/research " + t); };
         _routerNormal = Btn("", "Panel", "Muted", true);
@@ -4051,7 +4060,7 @@ class ChatWindow : Window
 
     Border AddChip(string name, bool pending)
     {
-        var b = new Border { CornerRadius = new CornerRadius(7), Padding = new Thickness(8, 3, 8, 3), Margin = new Thickness(6, 0, 0, 0), BorderThickness = new Thickness(1) };
+        var b = new Border { CornerRadius = new CornerRadius(Theme.RadSmall), Padding = new Thickness(8, 3, 8, 3), Margin = new Thickness(6, 0, 0, 0), BorderThickness = new Thickness(1) };
         SetRef(b, BackgroundProperty, "Panel"); SetRef(b, Border.BorderBrushProperty, "Border");
         var t = new TextBlock { Text = (pending ? "… " : "") + name, FontSize = 12 };
         SetRef(t, TextBlock.ForegroundProperty, "Fg");

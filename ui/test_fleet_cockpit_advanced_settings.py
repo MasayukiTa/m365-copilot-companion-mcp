@@ -318,5 +318,8 @@ def test_red_is_kept_for_the_connection_being_refused_now():
     assert "card.BorderBrush = Theme.Br(Theme.Danger(_dark));" in body
     assert "badge.Foreground = Theme.Br(Theme.Danger(_dark));" in body
     # そのカードの主要ボタンは「許可」なので、一覧と同じ意味の緑にする
-    assert "allow.Background = Theme.Br(Theme.Success(_dark));" in body
+    # SuccessFill, not Success: this is a filled button carrying a white label, and in the dark
+    # theme the two cannot be the same value -- the bright green a MARK needs scores 2.28
+    # under white text. Same role, same green family, different job.
+    assert "allow.Background = Theme.Br(Theme.SuccessFill(_dark));" in body
     assert "Theme.Accent(" not in body

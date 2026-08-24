@@ -558,7 +558,9 @@ class SelfImproveDashboardWindow : Window
         return b;
     }
 
-    // FIX 1b: Refresh button using Unicode ⟳ (no refresh/sync glyph in the 8-glyph set)
+    // The subset HAS a refresh glyph now -- the note that used to sit here said it did not, and
+    // that absence is the whole reason a Unicode character was used. Adding the glyph was cheaper
+    // than the inconsistency it bought.
     Button RefreshButton()
     {
         var b = new Button();
@@ -567,12 +569,7 @@ class SelfImproveDashboardWindow : Window
         b.BorderThickness = new Thickness(1);
         b.Margin = new Thickness(2, 0, 2, 0);
         b.Padding = new Thickness(5, 3, 5, 3);
-        var t = new TextBlock();
-        t.Text = "⟳";   // ⟳  CLOCKWISE GAPPED CIRCLE ARROW
-        t.FontSize = 16;
-        t.VerticalAlignment = VerticalAlignment.Center;
-        t.HorizontalAlignment = HorizontalAlignment.Center;
-        b.Content = t;
+        b.Content = MakeIcon("refresh", 16, Fg);
         b.Tag = "_refresh";
         b.MouseEnter += delegate(object s, MouseEventArgs e)
         {
@@ -615,8 +612,9 @@ class SelfImproveDashboardWindow : Window
         if (_refreshBtn != null)
         {
             _refreshBtn.ToolTip = _lang == 0 ? "更新" : "Refresh";
-            var tb = _refreshBtn.Content as TextBlock;
-            if (tb != null) tb.Foreground = Fg;
+            // Rebuilt rather than re-tinted: the content is drawn geometry now, and the old code
+            // cast it to TextBlock -- which would simply return null and silently skip the repaint.
+            _refreshBtn.Content = MakeIcon("refresh", 16, Fg);
         }
         // There were two vertical dividers between the icon buttons, and a repaint for them
         // here. Nothing ever called the builder and nothing ever assigned the fields, so the
@@ -771,7 +769,7 @@ class SelfImproveDashboardWindow : Window
         // a calm, centred placeholder card
         var card = new Border();
         card.BorderThickness = new Thickness(1);
-        card.CornerRadius    = new CornerRadius(10);
+        card.CornerRadius    = new CornerRadius(Theme.RadPopover);
         card.Padding         = new Thickness(32, 28, 32, 28);
         card.Margin          = new Thickness(0, 24, 0, 0);
         card.BorderBrush     = Border;
@@ -1538,7 +1536,7 @@ class SelfImproveDashboardWindow : Window
 
                 var quote = new Border();
                 quote.Background      = QuoteBg;
-                quote.CornerRadius    = new CornerRadius(6);
+                quote.CornerRadius    = new CornerRadius(Theme.RadSmall);
                 // The tinted ground already says "this is quoted material"; the bar only made
                 // it a sticky note.
                 quote.Padding         = new Thickness(9, 5, 9, 5);
@@ -1568,7 +1566,7 @@ class SelfImproveDashboardWindow : Window
         // scorecard uses a subtle tinted border to convey the latest verdict at a glance
         var card = new Border();
         card.BorderThickness = new Thickness(1.4);
-        card.CornerRadius    = new CornerRadius(10);
+        card.CornerRadius    = new CornerRadius(Theme.RadPopover);
         card.Padding         = new Thickness(18, 14, 16, 16);
         card.Margin          = new Thickness(0, 8, 0, 8);
         card.BorderBrush     = new SolidColorBrush(Mix(sc, BgColor(), 0.45));
@@ -2407,7 +2405,7 @@ class SelfImproveDashboardWindow : Window
     {
         var card = new Border();
         card.BorderThickness = new Thickness(1);
-        card.CornerRadius    = new CornerRadius(10);
+        card.CornerRadius    = new CornerRadius(Theme.RadPopover);
         card.Padding         = new Thickness(18, 14, 16, 16);
         card.Margin          = new Thickness(0, 0, 0, 12);
         card.BorderBrush     = Border;
@@ -2533,7 +2531,7 @@ class SelfImproveDashboardWindow : Window
 
         // bar: a two-star Grid inside a pill-shaped track
         var track = new Border();
-        track.Height = 8; track.CornerRadius = new CornerRadius(4);   // = height/2. 999 renders as a lens, not a bar.
+        track.Height = 8; track.CornerRadius = new CornerRadius(Theme.RadChip);   // = height/2. 999 renders as a lens, not a bar.
         track.Background = QuoteBg;
         track.VerticalAlignment = VerticalAlignment.Center;
         track.Margin = new Thickness(0, 0, 10, 0);
@@ -2545,7 +2543,7 @@ class SelfImproveDashboardWindow : Window
         // vocabulary orange means "the primary thing to press" -- a bar wearing it out-shouts the
         // buttons beside it while claiming nothing. Strong neutral against the subtle track is
         // legible without making that claim.
-        fill.Height = 8; fill.CornerRadius = new CornerRadius(4);
+        fill.Height = 8; fill.CornerRadius = new CornerRadius(Theme.RadChip);
         fill.Background = Theme.Br(Theme.Secondary(_dark));
         Grid.SetColumn(fill, 0); bargrid.Children.Add(fill);
         track.Child = bargrid;
