@@ -230,6 +230,42 @@ class SelfImproveDashboardWindow : Window
             ? "恒久委任の外にある変更の提案。委任は「何を進化させてよいか」を定義するファイル自体には及ばないので、ここに溜まる。実行するには、あなたの指示をそのまま authorization に入れる。"
             : "Proposed changes outside the standing delegation. It does not extend to the files that define what may be evolved, so those queue here; running one takes your own words as its authorization.";
         if (k == "pending_copy")  return ja ? "コマンドをコピー" : "Copy command";
+        if (k == "pd_approve")    return ja ? "承認する" : "Approve";
+        if (k == "pd_a1")         return ja
+            ? "承認する。この提案のまま実施してよい。"
+            : "Approved. Carry it out as proposed.";
+        if (k == "pd_a2")         return ja
+            ? "承認する。実施したら結果を報告すること。"
+            : "Approved. Report back once it is done.";
+        if (k == "pd_r1")         return ja
+            ? "却下する。この変更は不要。"
+            : "Rejected. This change is not wanted.";
+        if (k == "pd_r2")         return ja
+            ? "却下する。今はやらない（後で見直す）。"
+            : "Rejected for now; revisit later.";
+        if (k == "pd_own")        return ja ? "自分で書く" : "Write my own";
+        if (k == "pd_recorded")   return ja
+            ? "選んだ文がそのまま台帳に記録されます。"
+            : "The phrase you pick is what goes into the ledger, word for word.";
+        if (k == "pd_reject")     return ja ? "却下する" : "Reject";
+        if (k == "pd_approved")   return ja ? "承認済み" : "approved";
+        if (k == "pd_waiting")    return ja ? "エージェントの実行待ち" : "waiting on the agent";
+        if (k == "pd_ask_t")      return ja ? "この提案を承認する" : "Approve this proposal";
+        if (k == "pd_ask")        return ja
+            ? "承認の理由を、あなたの言葉で書いてください。ここに書いた文はそのまま台帳に記録され、"
+              + "この変更の根拠になります。要約も言い換えもされません。"
+            : "Say why, in your own words. What you write is recorded verbatim in the ledger as "
+              + "the authorisation for this change -- not summarised, not paraphrased.";
+        if (k == "pd_ask_reject") return ja
+            ? "却下の理由（任意）。書いておくと、同じ提案が次に出たときに読めます。"
+            : "Why not (optional). Writing it means the next time this comes up, it can be read.";
+        if (k == "pd_reject_t")   return ja ? "この提案を却下する" : "Reject this proposal";
+        if (k == "pd_need_words") return ja
+            ? "空のままでは承認できません。あとから誰も引用できない承認は、承認ではありません。"
+            : "An empty authorisation is refused: an approval nobody can quote afterwards is not one.";
+        if (k == "pd_failed")     return ja ? "記録できませんでした" : "Could not record it";
+        if (k == "pd_ok")         return ja ? "OK" : "OK";
+        if (k == "pd_cancel")     return ja ? "やめる" : "Cancel";
         if (k == "pending_copied") return ja ? "コピーしました" : "Copied";
         if (k == "auth_detail")   return ja ? "記録と取り消し" : "Records and undo";
 
@@ -1785,6 +1821,139 @@ class SelfImproveDashboardWindow : Window
         return best == double.MinValue ? "?" : best.ToString("0.###");
     }
 
+    // THE OPERATOR'S OWN WORDS, TYPED BY THE OPERATOR. The ledger's contract is that an
+    // authorisation is verbatim; a button that recorded "approved from the dashboard" would be
+    // this window putting words in their mouth, which is the one thing the quote form exists to
+    // prevent. MessageBox cannot take text, so this is the smallest window that can.
+    // A CHOICE, NOT A COMPOSITION EXERCISE. The first version demanded typed words every
+    // time, on the reasoning that an authorisation must be verbatim. The contract is narrower
+    // than that: what it forbids is this window inventing a decision. A phrase the operator
+    // picked is theirs -- it is shown, word for word, before the click -- and the record says
+    // whether it was picked or written, so a reader knows the granularity rather than guessing.
+    //
+    // Typing stays, as one of the options, because "yes, but" is a real answer and a fixed
+    // list cannot hold it. Demanding it for every routine yes is friction, and a decision
+    // surface with friction is one that gets abandoned.
+    //
+    // Returns the chosen text and sets `kind`, or null if the operator closed it.
+    string AskForDecision(string title, string[] choices, out string kind)
+    {
+        kind = "";
+        var w = new Window();
+        w.Title = title;
+        w.Owner = this;
+        w.WindowStartupLocation = WindowStartupLocation.CenterOwner;
+        w.SizeToContent = SizeToContent.Height;
+        w.Width = 580;
+        w.ResizeMode = ResizeMode.NoResize;
+        w.Background = Bg;
+
+        var col = new StackPanel();
+        col.Margin = new Thickness(20, 18, 20, 16);
+
+        var note = new TextBlock();
+        note.Text = T("pd_recorded");
+        note.Foreground = Muted; note.FontSize = Theme.FsMeta;
+        note.TextWrapping = TextWrapping.Wrap;
+        col.Children.Add(note);
+
+        var picked = new string[2];       // [0] text, [1] kind
+
+        foreach (string choice in choices)
+        {
+            var b = new Button();
+            b.Content = choice;
+            b.HorizontalContentAlignment = HorizontalAlignment.Left;
+            b.Padding = new Thickness(12, 8, 12, 8);
+            b.Margin = new Thickness(0, 10, 0, 0);
+            string theChoice = choice;
+            b.Click += delegate
+            {
+                picked[0] = theChoice; picked[1] = "preset"; w.Close();
+            };
+            col.Children.Add(b);
+        }
+
+        var own = new TextBox();
+        own.AcceptsReturn = true;
+        own.TextWrapping = TextWrapping.Wrap;
+        own.MinHeight = 56;
+        own.Margin = new Thickness(0, 14, 0, 0);
+        own.FontSize = Theme.FsMeta;
+        col.Children.Add(own);
+
+        var row = new StackPanel();
+        row.Orientation = Orientation.Horizontal;
+        row.HorizontalAlignment = HorizontalAlignment.Right;
+        row.Margin = new Thickness(0, 10, 0, 0);
+        var cancel = new Button();
+        cancel.Content = T("pd_cancel");
+        cancel.Padding = new Thickness(14, 5, 14, 5);
+        cancel.Margin = new Thickness(0, 0, 8, 0);
+        var ok = new Button();
+        ok.Content = T("pd_own");
+        ok.Padding = new Thickness(18, 5, 18, 5);
+        row.Children.Add(cancel); row.Children.Add(ok);
+        col.Children.Add(row);
+
+        ok.Click += delegate
+        {
+            if (own.Text.Trim().Length == 0)
+            {
+                MessageBox.Show(w, T("pd_need_words"), title,
+                                MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+            picked[0] = own.Text.Trim(); picked[1] = "typed"; w.Close();
+        };
+        cancel.Click += delegate { picked[0] = null; w.Close(); };
+
+        w.Content = col;
+        w.ShowDialog();
+        kind = picked[1] ?? "";
+        return picked[0];
+    }
+
+    // Recording a decision goes through the same module the queue is written by, so there is
+    // one implementation of the on-disk shape. Waited for and reported: a decision that failed
+    // to record silently is worse than no button, because the operator believes they answered.
+    bool RecordDecision(string pid, string verb, string words, string kind)
+    {
+        try
+        {
+            string root   = RepoRoot();
+            string venvPy = Path.Combine(root, ".venv", "Scripts", "python.exe");
+            var psi = new ProcessStartInfo();
+            psi.FileName  = File.Exists(venvPy) ? venvPy : "python";
+            psi.Arguments = "-m relay.selfimprove.pending " + verb + " " + pid
+                          + " --authorization \"" + (words ?? "").Replace("\"", "'") + "\""
+                          + " --kind " + (string.IsNullOrEmpty(kind) ? "typed" : kind);
+            psi.WorkingDirectory       = root;
+            psi.UseShellExecute        = false;
+            psi.CreateNoWindow         = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError  = true;
+            var proc = new Process(); proc.StartInfo = psi; proc.Start();
+            string so = proc.StandardOutput.ReadToEnd();
+            string se = proc.StandardError.ReadToEnd();
+            proc.WaitForExit(30000);
+            if (proc.ExitCode != 0)
+            {
+                MessageBox.Show(this, T("pd_failed") + " (exit " + proc.ExitCode + ")\n\n"
+                                + so + "\n" + se, T("pending_sec"),
+                                MessageBoxButton.OK, MessageBoxImage.Error);
+                return false;
+            }
+            return true;
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, T("pd_failed") + "\n\n" + ex.Message, T("pending_sec"),
+                            MessageBoxButton.OK, MessageBoxImage.Error);
+            return false;
+        }
+    }
+
     // AWAITING A DECISION. Shown first, and only when there is something -- an empty call to
     // action is noise, and a queue nobody sees is the reminder it was built to replace.
     //
@@ -1820,7 +1989,11 @@ class SelfImproveDashboardWindow : Window
             var flist = new List<string>();
             var farr = files as object[];
             if (farr != null) foreach (var f in farr) flist.Add(Convert.ToString(f));
-            var filesTb = ClipLine(string.Join(", ", flist.ToArray()), Fg, Theme.FsMeta, true);
+            string st = S(r, "status");
+            string head0 = string.Join(", ", flist.ToArray());
+            if (st == "approved") head0 = head0 + "   —   " + T("pd_approved")
+                                        + " · " + T("pd_waiting");
+            var filesTb = ClipLine(head0, Fg, Theme.FsMeta, true);
             filesTb.FontWeight = FontWeights.SemiBold;
             Grid.SetColumn(filesTb, 0); g.Children.Add(filesTb);
 
@@ -1844,28 +2017,114 @@ class SelfImproveDashboardWindow : Window
             reason.Margin = new Thickness(0, 4, 0, 0);
             body.Children.Add(reason);
 
+            string detail = S(r, "detail");
+            if (detail.Length > 0)
+            {
+                var det = new TextBlock();
+                det.Text = detail;
+                det.Foreground = Muted; det.FontSize = Theme.FsMeta;
+                det.TextWrapping = TextWrapping.Wrap;
+                det.Margin = new Thickness(0, 6, 0, 0);
+                body.Children.Add(det);
+            }
+
             string cmd = S(r, "command");
+            string status = S(r, "status");
+            string words = S(r, "authorization");
+            string pid = S(r, "id");
+
             if (cmd.Length > 0)
             {
-                var cmdTb = ClipLine(cmd, Theme.Br(Theme.Faint(_dark)), Theme.FsLog, true);
-                cmdTb.Margin = new Thickness(0, 6, 0, 0);
+                // Once approved the placeholder is gone: the command carries the operator's
+                // own words, so it can be run as it stands.
+                string filled = words.Length > 0
+                    ? cmd.Replace("<\u3042\u306a\u305f\u306e\u8a00\u8449>", words)
+                         .Replace("<your words>", words)
+                    : cmd;
+                var cmdTb = ClipLine(filled, Theme.Br(Theme.Faint(_dark)), Theme.FsLog, true);
+                cmdTb.Margin = new Thickness(0, 8, 0, 0);
                 body.Children.Add(cmdTb);
+            }
 
-                // The command is the point of the entry, and a command you cannot take with
-                // you is a picture of a command.
+            if (status == "approved")
+            {
+                // The answer, kept in the form this file reserves for verbatim material, and
+                // the entry stays on screen until the work is done. Removing it at the moment
+                // of approval is what made approving feel identical to being ignored.
+                var q = new Border();
+                q.Background = QuoteBg;
+                q.CornerRadius = new CornerRadius(Theme.RadSmall);
+                q.Padding = new Thickness(8, 4, 8, 4);
+                q.Margin = new Thickness(0, 8, 0, 0);
+                q.HorizontalAlignment = HorizontalAlignment.Left;
+                var qt = new TextBlock();
+                qt.Text = "\u201c" + words + "\u201d";
+                qt.Foreground = Muted; qt.FontSize = Theme.FsMeta;
+                qt.TextWrapping = TextWrapping.Wrap; qt.MaxWidth = 620;
+                q.Child = qt;
+                body.Children.Add(q);
+            }
+
+            // -- the controls. A card that only offers "copy" states that a decision is
+            //    waiting without offering anywhere to make it, which is the same shape as the
+            //    notification that opened a text file of commands to paste.
+            var actions = new StackPanel();
+            actions.Orientation = Orientation.Horizontal;
+            actions.Margin = new Thickness(0, 10, 0, 0);
+
+            if (status != "approved")
+            {
+                var yes = new Button();
+                yes.Content = T("pd_approve");
+                yes.Padding = new Thickness(16, 5, 16, 5);
+                yes.Margin  = new Thickness(0, 0, 8, 0);
+                string theId = pid;
+                yes.Click += delegate
+                {
+                    string kind;
+                    string said = AskForDecision(T("pd_ask_t"),
+                                                 new string[] { T("pd_a1"), T("pd_a2") },
+                                                 out kind);
+                    if (said == null) return;                    // closed, nothing recorded
+                    if (RecordDecision(theId, "--approve", said, kind)) ForceRender();
+                };
+                actions.Children.Add(yes);
+
+                var no = new Button();
+                no.Content = T("pd_reject");
+                no.Padding = new Thickness(16, 5, 16, 5);
+                no.Margin  = new Thickness(0, 0, 8, 0);
+                string theId2 = pid;
+                no.Click += delegate
+                {
+                    string kind;
+                    string said = AskForDecision(T("pd_reject_t"),
+                                                 new string[] { T("pd_r1"), T("pd_r2") },
+                                                 out kind);
+                    if (said == null) return;
+                    if (RecordDecision(theId2, "--drop", said, kind)) ForceRender();
+                };
+                actions.Children.Add(no);
+            }
+
+            if (cmd.Length > 0)
+            {
                 var copy = new Button();
                 copy.Content = T("pending_copy");
-                copy.Padding = new Thickness(12, 4, 12, 4);
-                copy.Margin  = new Thickness(0, 8, 0, 0);
-                copy.HorizontalAlignment = HorizontalAlignment.Left;
-                var theCmd = cmd; var theBtn = copy;
+                copy.Padding = new Thickness(12, 5, 12, 5);
+                string theCmd = words.Length > 0
+                    ? cmd.Replace("<\u3042\u306a\u305f\u306e\u8a00\u8449>", words)
+                         .Replace("<your words>", words)
+                    : cmd;
+                var theBtn = copy;
                 copy.Click += delegate
                 {
                     try { Clipboard.SetText(theCmd); theBtn.Content = T("pending_copied"); }
                     catch (Exception) { }
                 };
-                body.Children.Add(copy);
+                actions.Children.Add(copy);
             }
+            body.Children.Add(actions);
 
             var rec = new Border();
             rec.BorderThickness = new Thickness(0, 0, 0, 1);

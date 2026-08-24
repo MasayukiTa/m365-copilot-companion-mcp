@@ -303,6 +303,12 @@ def _pending_section() -> list:
         from relay.selfimprove import pending as _P
         return [{"id": i.get("id"), "ts": i.get("ts"),
                  "files": i.get("files") or [], "reason": i.get("reason") or "",
+                 # The card has to be a decision surface, not a notice: what changes, what
+                 # agreeing means, and -- once answered -- the words that answered it.
+                 "detail": i.get("detail") or "",
+                 "status": i.get("status") or "open",
+                 "authorization": i.get("authorization") or "",
+                 "authorization_kind": i.get("authorization_kind") or "",
                  "command": i.get("command") or ""}
                 for i in _P.items()]
     except Exception:

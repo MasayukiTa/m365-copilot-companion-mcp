@@ -138,3 +138,54 @@ def test_the_queue_is_not_published():
     import subprocess
     r = subprocess.run(["git", "check-ignore", "-q", REAL_QUEUE])
     assert r.returncode == 0, REAL_QUEUE
+
+
+# ── approving is an answer, and an answer has to stay visible ───────────────────────
+
+def test_approving_keeps_the_entry_on_the_list():
+    """Dropping it at the moment of approval is what made approving feel identical to being
+    ignored: the entry vanishes, which is what a lost decision also looks like."""
+    pid = P.add(FILES, REASON)
+    P.resolve(pid, authorization="やっていい", status=P.APPROVED)
+    live = P.items()
+    assert [i["id"] for i in live] == [pid]
+    assert live[0]["status"] == P.APPROVED
+    assert live[0]["authorization"] == "やっていい"
+
+
+def test_marking_it_done_takes_it_off():
+    pid = P.add(FILES, REASON)
+    P.resolve(pid, authorization="やっていい", status=P.APPROVED)
+    P.resolve(pid, authorization="実施した", status=P.DONE)
+    assert P.items() == []
+
+
+def test_rejecting_takes_it_off_and_keeps_the_reason():
+    pid = P.add(FILES, REASON)
+    P.resolve(pid, authorization="これは要らない", status=P.DROPPED)
+    assert P.items() == []
+    kept = P.items(include_resolved=True)[0]
+    assert kept["status"] == P.DROPPED and kept["authorization"] == "これは要らない"
+
+
+def test_the_detail_a_decider_needs_is_carried():
+    """A one-line reason and a command to copy says something is waiting without saying what
+    agreeing to it would mean."""
+    pid = P.add(FILES, REASON, detail="変えるところ: ...\n断った場合: ...")
+    assert "断った場合" in P.items()[0]["detail"]
+    assert pid
+
+
+def test_the_cli_refuses_an_empty_approval(capsys):
+    """An approval nobody can quote afterwards is not one."""
+    pid = P.add(FILES, REASON)
+    rc = P._cli(["--approve", pid, "--authorization", "   "])
+    assert rc == 2
+    assert P.items()[0]["status"] == P.OPEN
+
+
+def test_the_cli_records_an_approval_with_words(capsys):
+    pid = P.add(FILES, REASON)
+    rc = P._cli(["--approve", pid, "--authorization", "承認する"])
+    assert rc == 0
+    assert P.items()[0]["status"] == P.APPROVED

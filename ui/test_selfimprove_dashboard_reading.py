@@ -424,3 +424,95 @@ def test_the_churn_window_matches_the_rate_window():
     body = _authority()
     assert "if (age <= 7 * 86400) last7++" in body
     assert "if (now - Convert.ToDouble(t1) > 7 * 86400) continue;" in body
+
+
+# ── a card you can decide from ──────────────────────────────────────────────────────
+
+def _pending():
+    return _fn("    UIElement BuildPending(Dictionary<string, object> state)")
+
+
+def test_a_pending_card_offers_somewhere_to_decide():
+    """"Copy command" alone states that a decision is waiting without offering anywhere to
+    make it -- the same shape as the notification that opened a text file of commands."""
+    body = _pending()
+    assert 'yes.Content = T("pd_approve");' in body
+    assert 'no.Content = T("pd_reject");' in body
+
+
+def test_a_card_carries_the_argument_not_just_a_headline():
+    body = _pending()
+    assert 'string detail = S(r, "detail");' in body
+
+
+def test_an_approval_is_a_phrase_the_operator_picked_or_wrote():
+    """A button recording "approved from the dashboard" would be this window putting words in
+    their mouth. A phrase they PICKED is theirs -- it is shown verbatim before the click --
+    and demanding typed prose for every routine yes is friction that gets a decision surface
+    abandoned."""
+    body = _pending()
+    assert 'AskForDecision(T("pd_ask_t")' in body
+    assert 'T("pd_a1"), T("pd_a2")' in body
+    assert 'RecordDecision(theId, "--approve", said, kind)' in body
+
+
+def test_the_record_says_whether_it_was_picked_or_written():
+    """A preset says "yes"; typed words can say "yes, but". A reader should not have to guess
+    which they are looking at."""
+    dlg = _fn("    string AskForDecision(string title, string[] choices, out string kind)")
+    assert 'picked[1] = "preset"' in dlg
+    assert 'picked[1] = "typed"' in dlg
+    py = (UI.parent / "relay" / "selfimprove" / "pending.py").read_text(encoding="utf-8")
+    assert '"authorization_kind"' in py
+
+
+def test_the_phrase_is_shown_before_it_is_recorded():
+    """Nothing may be recorded that the operator did not see, word for word."""
+    dlg = _fn("    string AskForDecision(string title, string[] choices, out string kind)")
+    assert 'note.Text = T("pd_recorded");' in dlg
+    assert "b.Content = choice;" in dlg
+
+
+def test_typing_stays_available_and_cannot_be_empty():
+    dlg = _fn("    string AskForDecision(string title, string[] choices, out string kind)")
+    assert "own.Text.Trim().Length == 0" in dlg
+    py = (UI.parent / "relay" / "selfimprove" / "pending.py").read_text(encoding="utf-8")
+    assert "REFUSED: --approve needs --authorization" in py
+
+
+def test_cancelling_records_nothing():
+    body = _pending()
+    assert "if (said == null) return;" in body
+    dlg = _fn("    string AskForDecision(string title, string[] choices, out string kind)")
+    assert "cancel.Click += delegate { picked[0] = null; w.Close(); };" in dlg
+
+
+def test_an_approved_item_stays_on_screen_with_the_words_that_approved_it():
+    """Removing it at the moment of approval is what made approving feel identical to being
+    ignored: the entry vanishes, which is what a lost decision also looks like."""
+    body = _pending()
+    assert 'if (status == "approved")' in body
+    assert "qt.Text" in body and "+ words +" in body
+    assert 'T("pd_approved")' in body
+    py = (UI.parent / "relay" / "selfimprove" / "pending.py").read_text(encoding="utf-8")
+    assert "LIVE = (OPEN, APPROVED)" in py
+
+
+def test_an_approved_command_no_longer_carries_the_placeholder():
+    """It can be run as it stands once the words exist."""
+    body = _pending()
+    assert "cmd.Replace(" in body and "u8a00" in body.replace(chr(92), "")
+    assert '.Replace("<your words>", words)' in body
+
+
+def test_a_failed_recording_is_shown_rather_than_swallowed():
+    """A decision that failed to record silently is worse than no button: the operator
+    believes they answered."""
+    body = _fn("    bool RecordDecision(string pid, string verb, string words, string kind)")
+    assert "proc.ExitCode != 0" in body
+    assert 'T("pd_failed")' in body
+
+
+def test_the_decision_goes_through_the_module_that_owns_the_format():
+    body = _fn("    bool RecordDecision(string pid, string verb, string words, string kind)")
+    assert '"-m relay.selfimprove.pending "' in body
