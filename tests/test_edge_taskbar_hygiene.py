@@ -142,3 +142,48 @@ def test_the_port_map_knows_the_evaluation_browser():
     from relay.edge_recover import _profile_for_port
     assert _profile_for_port(9224) == "copilot-eval-edge"
     assert _profile_for_port(9223) == "copilot-bridge-edge"
+
+
+# ---- 5回目: 印を付ける側が、正しい手順を持つ側を無効化していた --------------------------------
+
+def _files_that_mark_windows():
+    """WS_EX_TOOLWINDOW(0x80) を立てているファイルを、名前で覚えずに探す。
+
+    ここが要点。これまで4回とも「新しく Edge の窓に触る場所が増えたのに、
+    列挙している側を掃いていない」だった。覚えていたファイルを検査する限り、
+    5回目は次に増えた場所で起きる。"""
+    out = []
+    for path in list(ROOT.glob("scripts/**/*.ps1")) + list(ROOT.glob("relay/**/*.py")) + \
+            list(ROOT.glob("scripts/**/*.py")):
+        if "test" in path.name:
+            continue
+        try:
+            src = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if "SetWindowLong" in src and "0x80" in src:
+            out.append(path)
+    return out
+
+
+def test_anything_that_marks_a_window_uses_the_hide_bracket():
+    """シェルは『窓が表示された瞬間』にタスクバーボタンを出すか決める。
+    可視のままスタイルを変えても Explorer は評価し直さないので、最初の表示で
+    作られたボタンは残り続ける。正しい手順は 隠す → スタイル変更 → 表示。
+
+    自作の起動器はこれを持たず（最小化→変更→最小化）、しかも 0x80 を立てたことで
+    edge_keeper と rehide の `if (($ex -band 0x80) -eq 0)` を素通りさせ、
+    正しい手順を持つ2つを両方とも無効化していた。動いていたのに何もしなかった。"""
+    for path in _files_that_mark_windows():
+        src = path.read_text(encoding="utf-8", errors="ignore")
+        assert re.search(r"ShowWindow\([^)]*,\s*0\s*\)", src) or "SW_HIDE" in src, (
+            "%s は 0x80 を立てるが、隠す手順を持たない" % path.name)
+
+
+def test_the_eval_launcher_does_not_mark_windows_at_all():
+    """窓を作らせなければ、隠す競争に負けようがない。
+    正規の起動器は既定で --headless=new -- 窓なし・タスクバーなし。"""
+    src = (ROOT / "scripts" / "start_eval_edge.ps1").read_text(encoding="utf-8")
+    assert "SetWindowLong" not in src, "また自前で印を付けている"
+    assert "start_companion_edge.ps1" in src, "正規の起動器に委ねていない"
+    assert "-Foreground" not in src.replace("-Foreground: ", ""), "headless を外している"
