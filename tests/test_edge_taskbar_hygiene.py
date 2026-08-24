@@ -204,11 +204,27 @@ def test_the_eval_launcher_proves_nothing_is_showing_before_it_succeeds():
     起動そのものを失敗させる -- 誰かの前に窓が居座ったまま走る測定に、
     データとしての価値は無い。"""
     src = (ROOT / "scripts" / "start_eval_edge.ps1").read_text(encoding="utf-8")
-    assert "Get-VisibleEvalWindows" in src
+    shared = ROOT / "scripts" / "win" / "eval_windows.ps1"
+
+    # 判定は1箇所にだけ在ること。起動器と実行中の監視が別々の定義を持てば、
+    # やがて片方が「隠れている」と言い続ける -- 誰かの前に窓が在るのに。
+    assert shared.is_file(), "共有の判定スクリプトが無い"
+    pred = shared.read_text(encoding="utf-8")
+    assert "function Get-VisibleEvalWindows" in pred
+    assert "function Get-VisibleEvalWindows" not in src, "起動器が判定を複製している"
+    assert "eval_windows.ps1" in src, "起動器が共有の判定を読み込んでいない"
+
+    # 画面内か、タスクバーに出るか、どちらでも該当させること
+    assert "onScreen" in pred and "inTaskbar" in pred
+
+    # 監視は読むだけ -- 起動も停止もしないこと。
+    # 走行中の可視性を「確認」するはずの命令が起動器を呼ぶ形で書かれており、
+    # 走れば監視対象の測定そのものを殺していた。
+    for banned in ("Stop-Process", "Start-Process", "taskkill", "start_companion_edge"):
+        assert banned not in pred, "監視が %s を持っている" % banned
+
+    # 起動器: 成功の出口より前に検査があり、該当したら失敗すること
     assert "REFUSING" in src, "見えていても成功で返している"
-    # 画面内か、タスクバーに出るか、どちらでも失敗させること
-    assert "onScreen" in src and "inTaskbar" in src
-    # 成功の出口より前に検査があること
     i = src.index("Get-VisibleEvalWindows -Marker")
     j = src.index("no visible window")
     assert i < j, "成功を返してから検査している"

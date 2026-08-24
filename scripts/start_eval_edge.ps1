@@ -64,48 +64,9 @@ $code = $LASTEXITCODE
 # when it is off-screen AND out of the taskbar, and the one legitimate exception is a sign-in
 # surface, which is the single case where a human must see it. Anything else fails the launch,
 # because a measurement that runs while a window sits in front of somebody is not worth its data.
-function Get-VisibleEvalWindows {
-    param([string]$Marker)
-    Add-Type @"
-using System; using System.Runtime.InteropServices; using System.Text;
-public class EvalWin {
-  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-  [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr h);
-  [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int i);
-  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p, IntPtr l);
-  [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr h, out int pid);
-  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
-  public struct RECT { public int L,T,R,B; }
-  public delegate bool EnumProc(IntPtr h, IntPtr l);
-  public static System.Collections.Generic.List<IntPtr> All = new System.Collections.Generic.List<IntPtr>();
-  public static bool Cb(IntPtr h, IntPtr l) { All.Add(h); return true; }
-}
-"@ -ErrorAction SilentlyContinue
-    $pids = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue |
-              Where-Object { $_.CommandLine -like "*$Marker*" } | ForEach-Object { [int]$_.ProcessId })
-    [EvalWin]::All.Clear()
-    [void][EvalWin]::EnumWindows([EvalWin+EnumProc]{ param($h,$l) [EvalWin]::Cb($h,$l) }, [IntPtr]::Zero)
-    $bad = @()
-    foreach ($h in [EvalWin]::All) {
-        $p = 0; [void][EvalWin]::GetWindowThreadProcessId($h, [ref]$p)
-        if ($pids -notcontains $p) { continue }
-        if ([EvalWin]::GetParent($h) -ne [IntPtr]::Zero) { continue }
-        if (-not [EvalWin]::IsWindowVisible($h)) { continue }
-        $r = New-Object EvalWin+RECT
-        [void][EvalWin]::GetWindowRect($h, [ref]$r)
-        $ex = [EvalWin]::GetWindowLong($h, -20)
-        $onScreen = ($r.L -gt -30000)
-        $inTaskbar = (($ex -band 0x80) -eq 0)
-        if ($onScreen -or $inTaskbar) {
-            $sb = New-Object System.Text.StringBuilder 100
-            [void][EvalWin]::GetWindowText($h, $sb, 100)
-            $bad += ("hwnd=" + $h + " onScreen=" + $onScreen + " inTaskbar=" + $inTaskbar +
-                     " title=" + $sb.ToString())
-        }
-    }
-    return $bad
-}
+# The visibility predicate lives in one place so the launcher and the run-time monitor cannot
+# disagree about what "hidden" means. See scripts/win/eval_windows.ps1.
+. (Join-Path $PSScriptRoot "win\eval_windows.ps1")
 
 try {
     $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/json/version" -TimeoutSec 5 -UseBasicParsing
