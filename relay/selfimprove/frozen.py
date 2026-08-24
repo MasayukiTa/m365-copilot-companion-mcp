@@ -551,6 +551,33 @@ def _undo_hint() -> str:
             " which is the point)")
 
 
+def _resolve_pending_for(excluded, args) -> None:
+    """Close the approved proposal this re-signing carried out. Never raises.
+
+    Matched on the same (files, reason) pair pending itself keys by, because any other key
+    would either fail to close the right card or close an unrelated one -- and closing the
+    wrong one is worse, since the operator would believe a decision had been acted on.
+
+    THE MATCH DEPENDS ON THE REASON BEING THE SAME TEXT. An agent that rewords its reason
+    between the refusal and the re-signing gets no match and the card stays open, which is the
+    safe direction: a stale "waiting" is a visible nuisance, a wrongly-closed card is a lie.
+    Only an APPROVED item is closed -- an open one has not been decided, and closing that would
+    be this process answering on the operator's behalf.
+    """
+    try:
+        from relay.selfimprove import pending
+
+        reason = str(getattr(args, "reason", "") or "").strip()
+        if not reason or not excluded:
+            return
+        pid = pending._key(list(excluded), reason)
+        if pending.status_of(pid) == pending.APPROVED:
+            pending.resolve(pid, authorization="carried out: the re-signing succeeded",
+                            status=pending.DONE, kind="system")
+    except Exception:
+        pass
+
+
 def _queue_refused(excluded, args) -> None:
     """Put a refused proposal somewhere it will still be there tomorrow. Never raises.
 
@@ -663,6 +690,11 @@ def _main(argv: list[str] | None = None) -> int:
             return 2
         _record_rebless(args, before, data)
         print("snapshot written: %s" % args.baseline)
+        # An approved proposal stays on the dashboard as "waiting on the agent" until somebody
+        # says the work is done, and nobody was saying it. The card sat there after the change
+        # had shipped -- the same mismatch as "I approved it and the screen did not move",
+        # one transition further along.
+        _resolve_pending_for(excluded, args)
         # The next move, where the person reading this already is. Until now the undo existed
         # only as a button on a dashboard, so anybody working from the CLI could re-sign and
         # have no idea the act was reversible.
