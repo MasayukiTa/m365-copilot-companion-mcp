@@ -26,14 +26,19 @@ def _arm(done, peak_mb, goals=4):
 
 # ---- 契約: 3値がコントローラで3値のまま出ること ------------------------------------------------
 
-def _edge_mb_source() -> str:
-    """`_edge_mb` の本文。固定文字数で切り出すと、注記を1つ足しただけで
-    対象行が窓の外に出て、検査が静かに通らなくなる（実際そうなった）。"""
+def _inner_source(name: str) -> str:
+    """`route_evaluator_for` の中の入れ子関数の本文。固定文字数で切り出すと、
+    注記を1つ足しただけで対象行が窓の外に出て、検査が静かに通らなくなる
+    -- 同じ直しを2回している。"""
     import ast
     src = inspect.getsource(S.route_evaluator_for)
     fn = next(n for n in ast.walk(ast.parse(src.lstrip()))
-              if isinstance(n, ast.FunctionDef) and n.name == "_edge_mb")
+              if isinstance(n, ast.FunctionDef) and n.name == name)
     return ast.unparse(fn)
+
+
+def _edge_mb_source() -> str:
+    return _inner_source("_edge_mb")
 
 
 def test_a_memory_win_reaches_the_controller_as_keep():
@@ -281,11 +286,16 @@ def test_the_renderer_count_is_reported_because_the_mechanism_beats_the_statisti
 
 def test_a_warmup_pass_is_available_and_its_numbers_are_discarded():
     """セッション最初の腕はレンダラー生成・認証・セッション確立の代金を払う。"""
-    src = inspect.getsource(S.route_evaluator_for)
-    i = src.index("def _warmup")
-    body = src[i:i + 900]
+    body = _inner_source("_warmup")
     assert "goals[:1]" in body
-    assert '_floor["min_free_mb"] = None' in body, "捨て走行の圧が本測定の床判定に残る"
+    # ast.unparse は引用符を正規化するので、引用符ごと照合しない。
+    assert "_floor[" in body and "min_free_mb" in body, \
+        "捨て走行の圧が本測定の床判定に残る"
+    # 温めは常にタブで行う。Edge のレンダラープールを温めるのはタブだけなので、
+    # 経路に追随させると比較する2群で条件が変わる。
+    assert "socket_on=False" in body
+    src = inspect.getsource(S.route_evaluator_for)
+    assert src.count("_warmup()") >= 4, "腕ごとに呼ばれていない"
 
 
 def test_growth_inside_existing_processes_is_counted():

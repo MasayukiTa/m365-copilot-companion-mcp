@@ -1026,30 +1026,49 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
             return out
 
         def _warmup():
-            """One pass whose numbers are thrown away.
+            """One pass whose numbers are thrown away, run BEFORE EVERY ARM, ALWAYS OVER TABS.
 
             The first arm of a session pays for renderer creation, authentication and the
             Copilot session handshake, and that cost lands entirely on whichever arm went
             first. It does not remove the other order effects -- a shared browser and a
             shared machine still put another session's tab on whichever arm is running --
             but it removes the one that is certain to be there.
+
+            ONCE PER RUN, ON THE CONTROL'S TRANSPORT, WAS NOT THE SAME CONDITION IN BOTH
+            COLUMNS. Edge keeps a warm renderer pool and reuses it, so warming it is something
+            only a TAB pass does. The warm-up followed `control_socket`, so a socket-vs-socket
+            null warmed nothing while a tabs-vs-socket treatment warmed the pool -- the two
+            groups being compared differed in whether renderer creation had already been paid
+            for, and no null flavour could price that difference. It would have arrived as a
+            clean p on the wrong mechanism.
+
+            So: always a tab pass, and before EACH arm rather than once, so neither arm
+            inherits pool state from the other and the baseline each arm is measured against
+            is taken with the pool already warm. Costs about a minute per arm and removes a
+            confound that the whole series would otherwise carry.
             """
             _begin_attribution()
             RV.measure_arm(
                 lambda g, s, smp: _run(g, s, smp, manifest=control_manifest),
-                goals=goals[:1], socket_on=bool(control_socket), peak_sampler=_edge_mb)
+                goals=goals[:1], socket_on=False, peak_sampler=_edge_mb)
             _floor["min_free_mb"] = None
 
         evidence_path = log_path or CAMPAIGN_SOCKET_LOG
         evidence_before = _evidence_lines(evidence_path)
         try:
-            if warmup:
-                _warmup()
             if candidate_first:
+                if warmup:
+                    _warmup()
                 candidate = _candidate()
+                if warmup:
+                    _warmup()
                 control = _control()
             else:
+                if warmup:
+                    _warmup()
                 control = _control()
+                if warmup:
+                    _warmup()
                 candidate = _candidate()
         finally:
             _activate(None)

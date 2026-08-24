@@ -48,8 +48,14 @@ SAMPLER_ISOLATION_EPOCH = 1787283181
 #: still measuring that population, so the stamp moves again rather than letting four nulls
 #: measured on the whole machine pool with runs measured on the fleet's own browser.
 #:
+#: THE FIFTH CHANGE, found while planning the series rather than after it. The discarded
+#: warm-up pass followed the CONTROL's transport, so a socket-vs-socket null warmed nothing
+#: while a tabs-vs-socket treatment warmed Edge's renderer pool -- the two columns being
+#: compared differed in whether renderer creation had already been paid for, and no null
+#: flavour could price that difference. It is now a tab pass before EVERY arm.
+#:
 #: This is the epoch a run has to clear to be comparable with anything measured today.
-INSTRUMENT_EPOCH = 1787532566
+INSTRUMENT_EPOCH = 1787539414
 
 #: THE WORKLOAD IS PART OF THE INSTRUMENT TOO, AND ITS NAME DOES NOT CHANGE WHEN IT DOES.
 #:
