@@ -65,7 +65,24 @@ def analyse(events_path):
         out["why"] = "no usable trace"
         return out
 
+    # THE FRESH WINDOW CAN COME UP EMPTY, and when it does the run is not free -- it is
+    # unreadable, which is a different thing. The witness needs a moment to import psutil and
+    # walk the process table before its first sample lands, and on a slow start that first
+    # sample arrives after `settled_fresh` was stamped. One run in four hit it.
+    #
+    # So fall back to the earliest samples the trace actually has before the work begins, and
+    # leave fresh_mb as None when there are none at all. Reporting 0.0 here would say the
+    # browser started from nothing and hand back a cost equal to the whole peak.
     fresh = window(trace, at["browser_rebuilt"], at.get("settled_fresh", at["run_start"]))
+    if not fresh:
+        # A fresh browser only grows once work starts, so the LOWEST point before the peak is
+        # its starting level. Taking the first few samples by time instead would reach past
+        # run_start into the arm's own growth and read the fresh browser as hundreds of MB
+        # heavier than it was.
+        peak_ts = max(trace, key=lambda x: x[1])[0]
+        pre = [v for ts, v in trace if ts < peak_ts]
+        fresh = [min(pre)] if pre else []
+        out["fresh_from_fallback"] = bool(fresh)
     out["fresh_mb"] = round(st.median(fresh), 1) if fresh else None
 
     # The two arms split the run. Their own reported wall times say where.

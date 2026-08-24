@@ -69,3 +69,30 @@ def test_a_gap_in_the_trace_is_skipped_not_read_as_zero(tmp_path):
 
 def test_window_is_inclusive_of_its_bounds():
     assert window([(1.0, 10.0), (2.0, 20.0), (3.0, 30.0)], 1.0, 2.0) == [10.0, 20.0]
+
+
+def test_an_unreadable_fresh_baseline_is_not_reported_as_zero(tmp_path):
+    """新品ブラウザの値が取れなかった走行は『費用0から始まった』ではなく『読めなかった』。
+
+    目撃者は psutil の import とプロセス表の走査を終えるまで最初の標本を出さない。
+    起動が遅いと、その1点目が settled_fresh の後に落ちる -- 4走行中1本で実際に起きた。
+    0 として扱えば、その走行の費用はピークそのものになり、他の走行より数百MB高く出る。"""
+    ev = {"transport": "socket", "arm_order": "control,candidate",
+          "control": {"wall_s": 10.0}, "candidate": {"wall_s": 10.0},
+          "events": [{"event": "browser_rebuilt", "ts": 0.0},
+                     {"event": "settled_fresh", "ts": 5.0},
+                     {"event": "run_start", "ts": 5.0},
+                     {"event": "run_end", "ts": 45.0}]}
+    # 0-5秒に標本が無い(目撃者の起動が遅れた)
+    samples = [(8.0, 800.0), (11.0, 802.0), (20.0, 1300.0), (40.0, 1200.0)]
+    out = analyse(_write(tmp_path, "g", ev, samples))
+    # ピーク前の最小値。時刻で先頭を切ると run_start をまたいでアームの成長を拾う。
+    assert out["fresh_mb"] == 800.0, "ピーク前の最小値へ退避できていない"
+    assert out.get("fresh_from_fallback") is True, "退避したことが記録されていない"
+    assert out["cold_cost_mb"] == 500.0
+
+    # 退避先も無いなら None。0 にしないこと。
+    ev2 = dict(ev)
+    out2 = analyse(_write(tmp_path, "h", ev2, [(100.0, 1300.0)]))
+    assert out2["fresh_mb"] is None
+    assert "cold_cost_mb" not in out2, "読めない走行に費用を付けている"
