@@ -143,6 +143,8 @@ def load(results_dir: str = None) -> list:
             "memory_population": str((rec.get("control") or {}).get("memory_population")
                                      or "all-edge-unscoped"),
             "sidepage_reserve": str(rec.get("sidepage_reserve", "1")),
+            # Absent before the flag was recorded; every run measured up to that point used it.
+            "warmup": bool(rec.get("warmup", True)),
             "current_instrument": ts >= INSTRUMENT_EPOCH,
         })
     out.sort(key=lambda r: r["ts"])
@@ -152,7 +154,7 @@ def load(results_dir: str = None) -> list:
 def comparable(runs, *, goals: str, version: str = "v1", null: bool = None,
                max_concurrent: int = 2, sidepage_reserve: str = "1",
                memory_population: str = "fleet-edge-tree",
-               cdp_url: str = "http://127.0.0.1:9222") -> list:
+               cdp_url: str = "http://127.0.0.1:9222", warmup: bool = True) -> list:
     """The runs that can be put in one column together.
 
     Filters on the instrument AND on the goal set AND on the version of that goal set AND on
@@ -169,12 +171,21 @@ def comparable(runs, *, goals: str, version: str = "v1", null: bool = None,
     That last one is why recording it was not enough. The sampler falls back to summing every
     Edge on the machine when it cannot resolve the CDP port owner, and it says so in the
     result -- but a field nobody filters on is a field that lets the two sit in one column.
+
+    WHETHER THE ARMS WERE WARMED is the newest axis and was added before it was needed rather
+    than after. The warm-up drives the tabs route before every arm, so the baseline already
+    holds a renderer that the tabs arm reuses free and the socket arm lets decay; two reviewers
+    read that bias in opposite directions, and the diagnostic that settles it runs without the
+    warm-up. Those runs land in this same archive. Without this filter they would pool with the
+    series exactly as four windowed nulls pooled with a headless one earlier the same night --
+    the same defect, caught the second time before it cost anything rather than after.
     """
     since = WORKLOAD_EPOCH.get(goals, 0)
     sel = [r for r in runs
            if r["current_instrument"] and r["goals"] == goals and r["version"] == version
            and r["ts"] >= since
            and r["max_concurrent"] == max_concurrent
+           and r["warmup"] == warmup
            and r["sidepage_reserve"] == str(sidepage_reserve)
            and r["memory_population"] == str(memory_population)
            and r["cdp_url"] == str(cdp_url)]

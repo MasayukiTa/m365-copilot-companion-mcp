@@ -236,6 +236,14 @@ def main():
     out["max_concurrent"] = max_conc
     out["cdp_url"] = cdp_url
     out["sidepage_reserve"] = os.environ.get("SWE_SIDEPAGE_RESERVE", "1")
+    # WHETHER THE ARMS WERE WARMED IS PART OF WHAT WAS MEASURED, not a detail of how it ran.
+    # The warm-up drives the TABS route before every arm, so the baseline each arm is measured
+    # against already contains a renderer the tabs arm will reuse for free and the socket arm
+    # will let decay. Two reviewers disagreed about which way that biases the comparison, and
+    # the diagnostic that settles it runs WITHOUT the warm-up -- a different instrument
+    # producing numbers that must never share a column with these. Recording it is what lets
+    # the archive refuse the pooling; a field nobody writes is a field nobody can filter on.
+    out["warmup"] = "--warmup" in sys.argv
     out["goals"] = goals_name
     infra = out.get("infra") or {}
     if infra.get("aborted"):

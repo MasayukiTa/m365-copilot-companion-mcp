@@ -171,3 +171,38 @@ def test_a_change_to_the_browser_being_measured_moves_the_epoch():
     LAST_WINDOWED_RUN = 1787565886
     assert RA.INSTRUMENT_EPOCH > LAST_WINDOWED_RUN, (
         "世代が窓あり時代を含んでいる -- 別のブラウザの測定を混ぜることになる")
+
+
+def test_unwarmed_runs_cannot_share_a_column_with_warmed_ones():
+    """warm-up の有無は「どう走らせたか」ではなく「何を測ったか」の一部。
+
+    warm-up は毎アーム前に tabs 経路を走らせるので、各アームの基準線には既に
+    レンダラが1個入っている -- tabs アームはそれを無料で再利用し、socket アームは
+    減衰させる。二人のレビュアーがこのバイアスの向きを正反対に読み、決着させる診断は
+    warm-up 無しで走る。その結果は同じアーカイブに落ちる。
+
+    同じ晩に、窓ありの走行4本が headless の1本と同じ籠に入っていた。同じ性質の欠陥を、
+    今度は起きた後ではなく起きる前に塞ぐ。"""
+    warmed = {"warmup": True, "current_instrument": True, "goals": "saturated-v1",
+              "version": "v1", "ts": 10 ** 12, "max_concurrent": 3, "sidepage_reserve": "1",
+              "memory_population": "fleet-edge-tree", "cdp_url": "http://127.0.0.1:9224",
+              "null": True, "memory_gain_mb": 10.0}
+    cold = dict(warmed, warmup=False, memory_gain_mb=999.0)
+
+    kw = dict(goals="saturated-v1", max_concurrent=3, cdp_url="http://127.0.0.1:9224")
+    got = RA.comparable([warmed, cold], **kw)                    # 既定は warmup=True
+    assert [r["memory_gain_mb"] for r in got] == [10.0], "warm-up 無しが混ざっている"
+
+    got = RA.comparable([warmed, cold], warmup=False, **kw)
+    assert [r["memory_gain_mb"] for r in got] == [999.0]
+
+
+def test_a_run_recorded_before_the_flag_existed_counts_as_warmed():
+    """記録が始まる前の走行は全て --warmup 付きで走っていた。
+    既定を False にすると、系列全体が診断側に落ちて静かに消える。"""
+    assert RA.comparable(
+        [{"current_instrument": True, "goals": "saturated-v1", "version": "v1",
+          "ts": 10 ** 12, "max_concurrent": 3, "sidepage_reserve": "1",
+          "memory_population": "fleet-edge-tree", "cdp_url": "http://127.0.0.1:9224",
+          "null": True, "memory_gain_mb": 1.0, "warmup": True}],
+        goals="saturated-v1", max_concurrent=3, cdp_url="http://127.0.0.1:9224")
