@@ -129,7 +129,9 @@ def test_the_reason_is_body_text_not_a_footnote():
     """It was muted underneath the run-on line -- the record's actual content rendered as
     the faintest thing in it."""
     body = _fn("    UIElement BuildAuthority()", "\n    void RevokeLastRebless")
-    assert "var reasonTb = ClipLine(Convert.ToString(reason), Fg," in body
+    # Fg when it is the only text on the line; Muted once a summary sits above it, because
+    # the recorded words then play the supporting part rather than the leading one.
+    assert "var reasonTb = ClipLine(Convert.ToString(reason), sum.Length > 0 ? Muted : Fg," in body
 
 
 def test_long_lines_clip_rather_than_wrap_and_keep_their_full_text():
@@ -340,7 +342,8 @@ def test_the_reason_shown_is_still_the_recorded_one():
     """Nothing on this screen is generated yet, and when something is, it must not replace
     the record."""
     body = _authority()
-    assert "ClipLine(Convert.ToString(reason), Fg, Theme.FsMeta, false)" in body
+    assert "ClipLine(Convert.ToString(reason)," in body
+    assert "reasonTb.Visibility = Visibility.Collapsed;" in body   # collapsed, never dropped
 
 
 def test_the_quote_form_stays_reserved_for_verbatim_material():
@@ -348,3 +351,76 @@ def test_the_quote_form_stays_reserved_for_verbatim_material():
     seg = body[body.index('if (auth != null'):]
     assert "Convert.ToString(auth)" in seg
     assert "qt.Text" in seg and "u201c" in seg.replace(chr(92), "")  # the quote glyphs, however escaped
+
+
+# ── the derived summary, and the boundary around it ─────────────────────────────────
+
+def test_the_summary_follows_the_interface_language():
+    """The complaint that started this: toggling to English left those lines in Japanese,
+    because a record's reason is not interface text."""
+    body = _fn("    string SummaryFor(Dictionary<string, object> row, Dictionary<string, object> cache)")
+    assert 'entry.TryGetValue(_lang == 0 ? "ja" : "en", out v);' in body
+
+
+def test_a_summary_is_looked_up_by_the_records_own_hash():
+    """Any other key would let a summary attach to a different record."""
+    body = _fn("    string SummaryFor(Dictionary<string, object> row, Dictionary<string, object> cache)")
+    assert 'row.TryGetValue("hash", out h);' in body
+    assert 'if (key.Length == 0) return "";' in body
+
+
+def test_a_missing_cache_falls_back_to_the_recorded_words():
+    body = _fn("    Dictionary<string, object> LoadSummaries()")
+    assert "if (!File.Exists(p)) return null;" in body
+    assert "catch (Exception) { return null; }" in body
+    rec = _authority()
+    assert 'string sum = SummaryFor(rows[i], summaries);' in rec
+    assert 'sum.Length > 0 ? Muted : Fg' in rec
+
+
+def test_the_recorded_words_are_collapsed_and_never_removed():
+    """A summary is only trustworthy if the original is one click away rather than gone."""
+    rec = _authority()
+    assert "reasonTb.Visibility = Visibility.Collapsed;" in rec
+    assert "rTb.Visibility = Visibility.Visible;" in rec
+
+
+def test_a_summary_says_that_it_is_one():
+    rec = _authority()
+    assert 'tag.Text = T("ev_summary");' in rec
+    assert 'sumRow.ToolTip = T("ev_summary_tip");' in rec
+
+
+def test_the_tip_says_it_is_not_the_record():
+    src = SRC[SRC.index('if (k == "ev_summary_tip")'):]
+    src = src[:src.index("if (k == \"ev_by\")")] if 'if (k == "ev_by")' in src else src[:400]
+    assert "台帳の記録ではない" in src
+    assert "not the ledger's record" in src
+
+
+def test_the_summary_is_not_the_loudest_thing_on_the_row():
+    """The deterministic headline is the bold one. Making the least reliable element the most
+    prominent inverts the visual grammar."""
+    rec = _authority()
+    i_head = rec.index("titleTb.FontWeight = FontWeights.SemiBold;")
+    seg = rec[rec.index("var sumTb = new TextBlock();"):]
+    seg = seg[:seg.index("sumRow.Children.Add(sumTb);")]
+    assert "FontWeight" not in seg
+    assert i_head < rec.index("var sumTb = new TextBlock();")
+
+
+def test_the_rate_says_which_files_are_absorbing_it():
+    """A count says the ledger is growing; it does not say what to do. Repeated re-signings of
+    one file are the actual signal -- either the workflow keeps touching something that should
+    not be frozen, or one change is being approved in pieces."""
+    body = _authority()
+    assert "var churn = new Dictionary<string, int>();" in body
+    assert 'T("ev_churn")' in body
+    assert 'Convert.ToString(e1) != "rebless"' in body
+
+
+def test_the_churn_window_matches_the_rate_window():
+    """Two windows over the same rows would disagree in public."""
+    body = _authority()
+    assert "if (age <= 7 * 86400) last7++" in body
+    assert "if (now - Convert.ToDouble(t1) > 7 * 86400) continue;" in body

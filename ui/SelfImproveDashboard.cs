@@ -221,6 +221,11 @@ class SelfImproveDashboardWindow : Window
             ? "テスト実行が本番台帳に書いたレコード {0} 件（一時ディレクトリのみを触るもの）"
             : "{0} records written into the live ledger by test runs (they touch only temp dirs)";
         if (k == "ev_by")         return ja ? "実行" : "by";
+        if (k == "ev_summary")    return ja ? "要約" : "summary";
+        if (k == "ev_churn")      return ja ? "再署名が集中しているファイル" : "Files re-signed most";
+        if (k == "ev_summary_tip") return ja
+            ? "モデルによる要約。台帳の記録ではない — 記録された原文はクリックで表示。"
+            : "A model's summary, not the ledger's record -- click to show the recorded text.";
         if (k == "pending_exp")   return ja
             ? "恒久委任の外にある変更の提案。委任は「何を進化させてよいか」を定義するファイル自体には及ばないので、ここに溜まる。実行するには、あなたの指示をそのまま authorization に入れる。"
             : "Proposed changes outside the standing delegation. It does not extend to the files that define what may be evolved, so those queue here; running one takes your own words as its authorization.";
@@ -1013,6 +1018,37 @@ class SelfImproveDashboardWindow : Window
         col.Children.Add(toggle);
         col.Children.Add(detail);
 
+        // WHICH FILES ARE ABSORBING THE RATE. A count alone says the ledger is growing; it
+        // does not say what to do about it. Repeated re-signings of one file are the actual
+        // signal -- either the workflow keeps touching something that should not be frozen,
+        // or one change is being approved in pieces -- and that is the question a reader has
+        // once they see 27 in a week. Computed here from the same rows as the count above.
+        var churn = new Dictionary<string, int>();
+        foreach (var r1 in rows)
+        {
+            object e1, t1;
+            r1.TryGetValue("event", out e1); r1.TryGetValue("ts", out t1);
+            if (Convert.ToString(e1) != "rebless" || t1 == null) continue;
+            try { if (now - Convert.ToDouble(t1) > 7 * 86400) continue; }
+            catch (Exception) { continue; }
+            foreach (var f in ChangedPaths(r1))
+            {
+                string b = f;
+                int sl = b.LastIndexOfAny(new char[] { '/', '\\' });
+                if (sl >= 0) b = b.Substring(sl + 1);
+                churn[b] = (churn.ContainsKey(b) ? churn[b] : 0) + 1;
+            }
+        }
+        if (churn.Count > 0)
+        {
+            var names = new List<string>(churn.Keys);
+            names.Sort(delegate (string x, string y) { return churn[y].CompareTo(churn[x]); });
+            var bits = new List<string>();
+            for (int n = 0; n < names.Count && n < 5; n++)
+                bits.Add(names[n] + " \u00d7" + churn[names[n]]);
+            col.Children.Add(MuteRow(T("ev_churn") + ": " + string.Join("  \u00b7  ", bits.ToArray())));
+        }
+
         if (!intact && differing.Count > 0)
             detail.Children.Add(MuteRow(string.Join(", ", differing.ToArray())));
         detail.Children.Add(MuteRow(T("auth_verified_here")));
@@ -1046,6 +1082,7 @@ class SelfImproveDashboardWindow : Window
             }
         }
 
+        var summaries = LoadSummaries();
         int testRecords = 0;
         if (linksOk) foreach (var r0 in rows) if (IsTestRecord(r0)) testRecords++;
 
@@ -1126,9 +1163,36 @@ class SelfImproveDashboardWindow : Window
                 body.Children.Add(closed);
             }
 
-            // line 2 -- WHY, in the words the record actually holds. Nothing here is generated.
-            var reasonTb = ClipLine(Convert.ToString(reason), Fg, Theme.FsMeta, false);
-            reasonTb.Margin = new Thickness(0, 4, 0, 0);
+            // line 2 -- WHY. The summary when there is one, and the recorded words underneath
+            // it, collapsed: showing both at once restores exactly the length this section was
+            // just cut down from, and the summary is only trustworthy if the original is one
+            // click away rather than gone.
+            string sum = SummaryFor(rows[i], summaries);
+            var reasonTb = ClipLine(Convert.ToString(reason), sum.Length > 0 ? Muted : Fg,
+                                    Theme.FsMeta, false);
+            reasonTb.Margin = new Thickness(0, sum.Length > 0 ? 3 : 4, 0, 0);
+
+            if (sum.Length > 0)
+            {
+                var sumRow = new StackPanel();
+                sumRow.Orientation = Orientation.Horizontal;
+                sumRow.Margin = new Thickness(0, 4, 0, 0);
+                var tag = new TextBlock();
+                tag.Text = T("ev_summary");
+                tag.Foreground = Theme.Br(Theme.Faint(_dark));
+                tag.FontSize = 10.5;
+                tag.VerticalAlignment = VerticalAlignment.Center;
+                tag.Margin = new Thickness(0, 0, 8, 0);
+                sumRow.Children.Add(tag);
+                var sumTb = new TextBlock();
+                sumTb.Text = sum;
+                sumTb.Foreground = Fg; sumTb.FontSize = Theme.FsMeta;
+                sumTb.TextWrapping = TextWrapping.Wrap;
+                sumRow.Children.Add(sumTb);
+                sumRow.ToolTip = T("ev_summary_tip");
+                body.Children.Add(sumRow);
+                reasonTb.Visibility = Visibility.Collapsed;   // one click away, never gone
+            }
             body.Children.Add(reasonTb);
 
             // line 3 -- where, in full, and who claimed to act. The actor used to be the
@@ -1173,7 +1237,9 @@ class SelfImproveDashboardWindow : Window
             var rTb = reasonTb; var sTb = scopeTb; var tTb = titleTb;
             rec.MouseLeftButtonUp += delegate
             {
-                bool open = rTb.TextWrapping == TextWrapping.NoWrap;
+                bool open = rTb.Visibility != Visibility.Visible
+                         || rTb.TextWrapping == TextWrapping.NoWrap;
+                rTb.Visibility = Visibility.Visible;
                 SetClip(rTb, open); SetClip(sTb, open); SetClip(tTb, open);
             };
             detail.Children.Add(rec);
@@ -2117,6 +2183,43 @@ class SelfImproveDashboardWindow : Window
         if (sec < 3600) return ((int)(sec / 60)).ToString() + (ja ? "分前" : " min ago");
         if (sec < 86400) return ((int)(sec / 3600)).ToString() + (ja ? "時間前" : " hr ago");
         return ((int)(sec / 86400)).ToString() + (ja ? "日前" : " d ago");
+    }
+
+    // A DERIVED SUMMARY, NOT THE RECORD. The reason a record carries is prose the agent typed
+    // in whichever language it was working in, so toggling this window to English left those
+    // lines in Japanese -- they are not interface text. Shortening and translating one needs a
+    // model, and that is the only thing on this screen a model does.
+    //
+    // Read from a cache keyed by the record's own hash, so a summary cannot attach to a
+    // different record and an edited record simply misses. Missing means the raw reason, which
+    // is exactly what this window showed before summaries existed: every failure lands there.
+    Dictionary<string, object> LoadSummaries()
+    {
+        try
+        {
+            string p = Path.Combine(RepoRoot(), ".fleet", "selfimprove", "record_summaries.json");
+            if (!File.Exists(p)) return null;
+            return _js.DeserializeObject(File.ReadAllText(p, Encoding.UTF8))
+                   as Dictionary<string, object>;
+        }
+        catch (Exception) { return null; }
+    }
+
+    string SummaryFor(Dictionary<string, object> row, Dictionary<string, object> cache)
+    {
+        try
+        {
+            if (cache == null || row == null) return "";
+            object h; row.TryGetValue("hash", out h);
+            string key = Convert.ToString(h);
+            if (key.Length == 0) return "";
+            object e; cache.TryGetValue(key, out e);
+            var entry = e as Dictionary<string, object>;
+            if (entry == null) return "";
+            object v; entry.TryGetValue(_lang == 0 ? "ja" : "en", out v);
+            return Convert.ToString(v);
+        }
+        catch (Exception) { return ""; }
     }
 
     // THE HEADLINE IS DERIVED, NOT TYPED. The first line used to be the actor -- a module
