@@ -130,6 +130,10 @@ def missing(records, cache: dict = None) -> list:
 #: unless it is steered to punctuation.
 _BREAKS = "\u3002\u3001\uff0e\uff0c.,;: "
 
+#: Appended when a summary had to be cut, so the cut is visible rather than reading as a
+#: sentence that broke. It is also the only evidence left that the model overran.
+TRUNCATED = "\u2026"
+
 
 def _clean(text: str, limit: int) -> str:
     """Collapse whitespace; if it is over, cut at a break and SAY that it was cut.
@@ -146,7 +150,7 @@ def _clean(text: str, limit: int) -> str:
     cut = max(head.rfind(ch) for ch in _BREAKS)
     if cut >= limit // 2:
         head = head[:cut + 1]
-    return head.rstrip() + "\u2026"
+    return head.rstrip() + TRUNCATED
 
 
 def parse_reply(text: str) -> dict:
@@ -192,15 +196,54 @@ def build_prompt(record: dict) -> str:
     reason = str((record or {}).get("reason") or "").strip()
     event = str((record or {}).get("event") or "")
     files = sorted((record or {}).get("changed") or {})
+    # COMPRESS, DO NOT COPY THE OPENING. The first version asked for "a one-line summary" and
+    # got the record's first sentences back, so 27 of 28 hit the length cap and were shown
+    # truncated -- an honest truncation of something that had not been summarised. The rule
+    # the model was missing is that the whole record has to fit, not its beginning, and an
+    # example is worth more here than another adjective.
     return (
-        "次の記録を1行で要約してください。\n"
+        "次の記録を1文に圧縮してください。要約であって、冒頭の抜き書きではありません。\n"
+        "- 記録**全体**の要点を1文にする。先頭の文をそのまま写さない。\n"
         "- 記録に書かれていないことを足さない。評価や推測を書かない。\n"
-        "- 事実の圧縮と翻訳だけを行う。\n"
-        "- ja は全角%d字以内、en は%d文字以内。\n"
-        "- 出力は JSON 1個だけ: {\"ja\": \"...\", \"en\": \"...\"}\n\n"
+        "- ja は全角%d字以内、en は%d文字以内。必ず収める。途中で切れる長さで返さない。\n"
+        "- 出力は JSON 1個だけ: {\"ja\": \"...\", \"en\": \"...\"}\n"
+        "\n"
+        "例:\n"
+        "  記録本文: route_evaluator.preflight now also refuses below the fleet's disk floor,\n"
+        "  reading relay_fleet.DEFAULT_DISK_FLOOR_GB rather than choosing its own value. Two\n"
+        "  readers of one drive can disagree, and the whole point of a floor is one answer.\n"
+        "  出力: {\"ja\": \"preflight のディスク下限を艦隊と同じ定数に統一\","
+        " \"en\": \"preflight now shares the fleet's disk floor constant\"}\n"
+        "\n"
         "イベント: %s\n対象ファイル: %s\n記録本文:\n%s\n"
         % (MAX_JA, MAX_EN, event, ", ".join(files) or "(なし)", reason)
     )
+
+
+def _fits(pair: dict) -> bool:
+    """Whether a reply came back inside the limits it was given.
+
+    Asked of the truncation mark, not of the length: parse_reply has already trimmed by the
+    time anyone can look, so a length test would call every reply a fit. The mark is the only
+    remaining evidence that the model overran.
+    """
+    if not pair:
+        return False
+    return not (str(pair.get("ja") or "").endswith(TRUNCATED)
+                or str(pair.get("en") or "").endswith(TRUNCATED))
+
+
+def tighten_prompt(record: dict) -> str:
+    """A second, blunter ask for a record whose first answer overflowed.
+
+    One retry, not a loop: the cost of another turn is small, the cost of never converging is
+    a backfill that never ends. A second overflow is stored truncated, with the ellipsis
+    saying so.
+    """
+    return (build_prompt(record)
+            + "\n直前の回答は長すぎました。今度は必ず ja %d字以内・en %d字以内に収めてください。\n"
+              "細部を落として構いません。何をどう変えたか、それだけを1文で。\n"
+            % (MAX_JA, MAX_EN))
 
 
 def backfill(records, ask, *, limit: int = 0, model: str = "", log=None) -> dict:
@@ -241,6 +284,15 @@ def backfill(records, ask, *, limit: int = 0, model: str = "", log=None) -> dict
             log("FAILED %s: %s" % (k[:12], exc))
             continue
         pair = parse_reply(reply)
+        if pair and not _fits(pair):
+            # Asked once more before settling for a truncated line: a summary shown with an
+            # ellipsis is a summary the model did not actually produce.
+            try:
+                second = parse_reply(ask(tighten_prompt(r)))
+                if _fits(second):
+                    pair = second
+            except Exception as exc:
+                log("RETRY FAILED %s: %s" % (k[:12], exc))
         if not pair:
             failed += 1
             log("UNUSABLE REPLY %s: %r" % (k[:12], str(reply)[:120]))

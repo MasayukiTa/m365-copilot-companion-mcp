@@ -256,3 +256,53 @@ def test_a_crash_part_way_keeps_what_was_already_generated():
 
     RS.backfill([_rec("a", LONG_EN), _rec("b", LONG_JA)], ask)
     assert RS.summary_for(_rec("a", LONG_EN), "ja") == "あ"
+
+
+# ── a summary that had to be cut is not a summary the model produced ────────────────
+
+def test_a_fit_is_judged_by_the_truncation_mark_not_the_length():
+    """parse_reply has already trimmed by the time anyone can look, so a length test would
+    call every reply a fit."""
+    assert RS._fits({"ja": "短い", "en": "short"}) is True
+    assert RS._fits(RS.parse_reply(json.dumps({"ja": "あ" * 300, "en": "b" * 400}))) is False
+    assert RS._fits({}) is False
+
+
+def test_an_overrunning_reply_is_asked_once_more_before_being_accepted():
+    """The first prompt asked for "a one-line summary" and got the record's opening back:
+    27 of 28 hit the cap and were shown truncated -- an honest truncation of something that
+    had not been summarised."""
+    asked = []
+
+    def ask(prompt):
+        asked.append(prompt)
+        if len(asked) == 1:
+            return json.dumps({"ja": "あ" * 300, "en": "b" * 400})
+        return json.dumps({"ja": "短い要約", "en": "short summary"})
+
+    RS.backfill([_rec("a", LONG_EN)], ask)
+    assert len(asked) == 2
+    assert "長すぎました" in asked[1]
+    assert RS.summary_for(_rec("a", LONG_EN), "ja") == "短い要約"
+
+
+def test_the_retry_happens_once_and_the_result_is_kept_either_way():
+    """One retry, not a loop: another turn is cheap, never converging is a backfill that
+    never ends. A second overflow is stored truncated, with the ellipsis saying so."""
+    calls = []
+
+    def ask(prompt):
+        calls.append(prompt)
+        return json.dumps({"ja": "あ" * 300, "en": "b" * 400})
+
+    rep = RS.backfill([_rec("a", LONG_EN)], ask)
+    assert len(calls) == 2
+    assert rep["generated"] == 1
+    assert RS.summary_for(_rec("a", LONG_EN), "ja").endswith(RS.TRUNCATED)
+
+
+def test_the_prompt_tells_the_model_not_to_copy_the_opening():
+    p = RS.build_prompt(_rec("a", LONG_EN))
+    assert "冒頭の抜き書きではありません" in p
+    assert "先頭の文をそのまま写さない" in p
+    assert "例:" in p          # an example is worth more than another adjective
