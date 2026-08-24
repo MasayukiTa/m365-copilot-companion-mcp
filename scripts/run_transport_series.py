@@ -235,6 +235,35 @@ def verdict(nulls, treatments):
     return out
 
 
+def rebuild_browser() -> str:
+    """Rebuild the evaluation browser. Returns "" on success, else why not.
+
+    BEFORE EVERY RUN, NOT ONCE AT THE START. Closing a Copilot tab does not give the memory
+    back: three open-four-close cycles on this profile left +422, +305 and +160 MB behind and
+    the settled baseline climbed 523 -> 863 -> 1084 MB. Across twenty runs that both exhausts
+    the machine and moves the baseline each arm is measured against, so every run starts from a
+    browser in the same state.
+
+    Between RUNS, not between arms. Rebuilding mid-run would hand the second arm a cold renderer
+    pool while the first had a warm one, which is the asymmetry the per-arm warm-up exists to
+    remove.
+    """
+    script = os.path.join(REPO, "scripts", "start_eval_edge.ps1")
+    if not os.path.isfile(script):
+        return "start_eval_edge.ps1 is missing"
+    port = CONFIG["cdp_url"].rsplit(":", 1)[-1].split("/")[0]
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script,
+             "-Port", str(port)],
+            cwd=REPO, capture_output=True, text=True, timeout=120)
+    except Exception as exc:
+        return "rebuild raised %s" % type(exc).__name__
+    if proc.returncode != 0:
+        return "rebuild exited %d: %s" % (proc.returncode, (proc.stdout or "").strip()[-120:])
+    return ""
+
+
 def run_one(kind: str, order: str, log_dir: str) -> dict:
     """One campaign. Returns the recorded result, or a dict naming why there is none."""
     env = dict(os.environ)
@@ -242,6 +271,10 @@ def run_one(kind: str, order: str, log_dir: str) -> dict:
     env["MCP_FLEET_CDP_URL"] = CONFIG["cdp_url"]
     env.setdefault("SWE_DISK_FLOOR_GB", "3")
     env["PYTHONIOENCODING"] = "utf-8"
+    # A rebuild that fails is not a reason to measure against a browser in an unknown state.
+    why = rebuild_browser()
+    if why:
+        return {"refused": "browser rebuild: %s" % why}
     log = os.path.join(log_dir, "series_%s_%s_%d.log" % (kind, order, int(time.time())))
     with open(log, "w", encoding="utf-8") as fh:
         proc = subprocess.run(

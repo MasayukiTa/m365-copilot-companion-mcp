@@ -189,3 +189,30 @@ def test_the_series_hands_that_browser_to_the_campaign():
     import inspect
     src = inspect.getsource(S.run_one)
     assert 'env["MCP_FLEET_CDP_URL"] = CONFIG["cdp_url"]' in src
+
+
+def test_every_run_starts_from_a_rebuilt_browser():
+    """タブを閉じてもメモリは戻らない。3回の開閉で +422/+305/+160MB が残り、
+    落ち着いた基準は 523→863→1084MB と上がった。20走行ぶんそれをやれば、
+    端末が尽きるうえに、各腕が比べられる基準そのものが毎回変わる。"""
+    import inspect
+    src = inspect.getsource(S.run_one)
+    assert "rebuild_browser()" in src
+    i, j = src.index("rebuild_browser()"), src.index("subprocess.run")
+    assert i < j, "測定を始めてから建て直している"
+
+
+def test_a_failed_rebuild_refuses_rather_than_measures():
+    """状態の分からないブラウザで測るくらいなら、測らないほうがよい。"""
+    import inspect
+    src = inspect.getsource(S.run_one)
+    assert '"refused": "browser rebuild:' in src
+
+
+def test_the_rebuild_is_between_runs_not_between_arms():
+    """腕の間で建て直すと、第2腕だけレンダラープールが冷える。
+    それは腕ごとの温めが取り除いた非対称そのもの。"""
+    import inspect
+    assert "rebuild_browser" not in inspect.getsource(S.argv_for)
+    doc = inspect.getdoc(S.rebuild_browser) or ""
+    assert "not between arms" in doc.lower() or "not between arms" in doc
