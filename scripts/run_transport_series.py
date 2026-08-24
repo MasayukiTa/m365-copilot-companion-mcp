@@ -94,6 +94,12 @@ def floor_mb() -> float:
 PHASE_A = [("sock", "ctrl"), ("tabs", "ctrl"), ("sock", "cand"), ("tabs", "cand"),
            ("sock", "ctrl"), ("tabs", "ctrl"), ("sock", "cand"), ("tabs", "cand")]
 
+#: FOUR NULLS BEFORE THE SERIES, NOT INSTEAD OF IT. Generation 6 changed the statistic, so the
+#: old nulls calibrate nothing; this block asks only whether the change did what it claims
+#: before another twenty runs are spent on the assumption that it did. One of each flavour in
+#: each order, and the per-arm peak attribution is on, so a spike here names a process.
+DIAGNOSTIC = [("sock", "ctrl"), ("tabs", "ctrl"), ("sock", "cand"), ("tabs", "cand")]
+
 PHASE_B = [("tx", "ctrl"), ("sock", "ctrl"), ("tx", "cand"), ("tabs", "cand"),
            ("tx", "ctrl"), ("sock", "cand"), ("tx", "cand"), ("tabs", "ctrl"),
            ("tx", "ctrl"), ("tx", "cand"), ("tx", "ctrl"), ("tx", "cand")]
@@ -250,7 +256,9 @@ def main(argv=None) -> int:                                     # pragma: no cov
     # Phase A and Phase B are separable so a night can be resumed, and because Phase A's
     # measured spread is what sizes Phase B. Adding this flag is not an instrument change:
     # it selects which cells run, and every cell's flags are unchanged.
-    if "--phase-a" in argv:
+    if "--diagnostic" in argv:
+        phase = DIAGNOSTIC
+    elif "--phase-a" in argv:
         phase = PHASE_A
     elif "--phase-b" in argv:
         phase = PHASE_B
