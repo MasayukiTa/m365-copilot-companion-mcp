@@ -7,10 +7,12 @@ import pytest
 from relay.selfimprove import run_archive as RA
 
 
-def _write(d, exp, *, null, gain, goals=None, control=200.0, candidate=150.0):
+def _write(d, exp, *, null, gain, goals=None, control=200.0, candidate=150.0,
+           population="fleet-edge-tree"):
     rec = {"ledger_experiment_id": exp, "null_run": null, "memory_gain_mb": gain,
            "arm_order": "control,candidate",
-           "control": {"peak_mb": control}, "candidate": {"peak_mb": candidate}}
+           "control": {"peak_mb": control, "memory_population": population},
+           "candidate": {"peak_mb": candidate, "memory_population": population}}
     if goals is not None:
         rec["goals"] = goals
     with open(os.path.join(d, "route_campaign_%s.json" % exp), "w", encoding="utf-8") as fh:
@@ -134,3 +136,22 @@ def test_an_empty_column_reports_nothing_and_says_why():
     """空を p=1 と返すと『差が無い』に化ける。測っていないことは差が無いことではない。"""
     s = RA.separation([], [76.7])
     assert s["p"] is None and s["why"]
+
+
+def test_a_run_that_counted_every_browser_is_not_the_same_measurement(tmp_path, monkeypatch):
+    """サンプラは CDP ポートの持ち主を解決できないと全 Edge 合計に戻り、
+    そのことを結果に書く。書くだけでは足りない -- 誰もそれで絞らないなら、
+    同じ列に並んでしまう。実測でその母集団の 59% は無関係だった。"""
+    d = str(tmp_path)
+    monkeypatch.setattr(RA, "WORKLOAD_EPOCH", {})
+    t = RA.INSTRUMENT_EPOCH + 3000
+    _write(d, "route-transport-v1-NULL-ctrlfirst-%d" % t, null=True, gain=10.0,
+           population="fleet-edge-tree")
+    _write(d, "route-transport-v1-NULL-ctrlfirst-%d" % (t + 5), null=True, gain=960.0,
+           population="all-edge-unscoped")
+    runs = RA.load(d)
+    scoped = RA.comparable(runs, goals="saturated-v1", null=True)
+    assert [r["memory_gain_mb"] for r in scoped] == [10.0]
+    unscoped = RA.comparable(runs, goals="saturated-v1", null=True,
+                             memory_population="all-edge-unscoped")
+    assert [r["memory_gain_mb"] for r in unscoped] == [960.0]

@@ -99,6 +99,9 @@ def load(results_dir: str = None) -> list:
             "memory_gain_mb": rec.get("memory_gain_mb"),
             # Absent in runs recorded before the knob was written down; those all ran at 2/"1".
             "max_concurrent": rec.get("max_concurrent", 2),
+            # Absent before the sampler was scoped; those runs measured every Edge on the box.
+            "memory_population": str((rec.get("control") or {}).get("memory_population")
+                                     or "all-edge-unscoped"),
             "sidepage_reserve": str(rec.get("sidepage_reserve", "1")),
             "current_instrument": ts >= INSTRUMENT_EPOCH,
         })
@@ -107,22 +110,28 @@ def load(results_dir: str = None) -> list:
 
 
 def comparable(runs, *, goals: str, version: str = "v1", null: bool = None,
-               max_concurrent: int = 2, sidepage_reserve: str = "1") -> list:
+               max_concurrent: int = 2, sidepage_reserve: str = "1",
+               memory_population: str = "fleet-edge-tree") -> list:
     """The runs that can be put in one column together.
 
     Filters on the instrument AND on the goal set AND on the version of that goal set AND on
     the candidate version. A difference measured on one goal set is not evidence about another
     -- the two sets here have different spreads -- v1 and v2 are different candidates, a goal
-    set keeps its name across the fixes that change what it measures, and HOW MANY WORKERS RUN
-    AT ONCE changes how much memory a run costs, so a faster setting is a different measurement
-    rather than the same one obtained sooner.
+    set keeps its name across the fixes that change what it measures, HOW MANY WORKERS RUN AT
+    ONCE changes how much memory a run costs, and WHICH BROWSERS WERE COUNTED changes what the
+    number is about at all.
+
+    That last one is why recording it was not enough. The sampler falls back to summing every
+    Edge on the machine when it cannot resolve the CDP port owner, and it says so in the
+    result -- but a field nobody filters on is a field that lets the two sit in one column.
     """
     since = WORKLOAD_EPOCH.get(goals, 0)
     sel = [r for r in runs
            if r["current_instrument"] and r["goals"] == goals and r["version"] == version
            and r["ts"] >= since
            and r["max_concurrent"] == max_concurrent
-           and r["sidepage_reserve"] == str(sidepage_reserve)]
+           and r["sidepage_reserve"] == str(sidepage_reserve)
+           and r["memory_population"] == str(memory_population)]
     if null is not None:
         sel = [r for r in sel if r["null"] is bool(null)]
     return sel
