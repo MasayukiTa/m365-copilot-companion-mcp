@@ -42,8 +42,14 @@ SAMPLER_ISOLATION_EPOCH = 1787283181
 #: thing on both sides of the fix while the quantity underneath it changed. Filtering on the
 #: recorded value alone would silently average the two.
 #:
+#: THE FOURTH CHANGE. The sampler summed every msedge.exe on the machine -- 45 processes and
+#: 6,181 MB here, of which the fleet's Edge was 1,559 and 59% belonged to neither it nor the
+#: bridge. Runs taken between the admission fix and this one cleared the previous stamp while
+#: still measuring that population, so the stamp moves again rather than letting four nulls
+#: measured on the whole machine pool with runs measured on the fleet's own browser.
+#:
 #: This is the epoch a run has to clear to be comparable with anything measured today.
-INSTRUMENT_EPOCH = 1787530083
+INSTRUMENT_EPOCH = 1787532566
 
 #: THE WORKLOAD IS PART OF THE INSTRUMENT TOO, AND ITS NAME DOES NOT CHANGE WHEN IT DOES.
 #:
