@@ -99,9 +99,13 @@ def test_a_failed_probe_that_DID_reach_the_server_is_not_a_connector_problem():
 
 # ---- 隔離 ---------------------------------------------------------------------------------
 
-def _rec(pop="fleet-edge-tree", gain=10.0, mc="3", aborted=False):
+CONFIG_CDP = S.CONFIG["cdp_url"]
+
+
+def _rec(pop="fleet-edge-tree", gain=10.0, mc="3", aborted=False, cdp=None):
     return {"control": {"memory_population": pop}, "memory_gain_mb": gain,
-            "max_concurrent": int(mc), "infra": {"aborted": aborted}}
+            "max_concurrent": int(mc), "infra": {"aborted": aborted},
+            "cdp_url": CONFIG_CDP if cdp is None else cdp}
 
 
 def test_an_unscoped_run_is_quarantined_not_averaged():
@@ -167,3 +171,21 @@ def test_an_old_arrival_does_not_rescue_a_bad_verdict():
     """刻印が窓の外なら、それは証拠として古い。"""
     stale_bad = {"tool_age_s": 60, "tool_ok": False, "tool_inbound": False}
     assert S.preflight(stale_bad, inbound_age=S.PROBE_STALE_S + 1) != ""
+
+
+def test_a_run_in_another_browser_is_quarantined():
+    """フリートの Edge には、どの腕のものでもない常駐 Copilot ページがある。
+    6腕を通じてその最大変動源は 24〜239MB 揺れ、一方で腕が自分で作るプロセスは
+    18〜20MB で一定だった。1つのプロセスの commit を2人の住人で割る統計量は
+    存在しないので、系列は同居人のいないブラウザを駆動する。
+
+    どちらの走行も同じ `population` 文字列を持つので、母集団の検査では捕まらない。"""
+    assert S.classify(_rec(cdp="http://127.0.0.1:9222")) != ""
+    assert S.classify(_rec()) == ""
+
+
+def test_the_series_hands_that_browser_to_the_campaign():
+    """設定に書いてあっても、子プロセスに渡していなければ既定のブラウザで走る。"""
+    import inspect
+    src = inspect.getsource(S.run_one)
+    assert 'env["MCP_FLEET_CDP_URL"] = CONFIG["cdp_url"]' in src

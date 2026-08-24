@@ -81,7 +81,12 @@ if REPO not in sys.path:
 RESULT = os.path.join(REPO, "docs", "research", "results", "route_campaign.json")
 
 #: Frozen for the series. Changing any of these starts a different series.
-CONFIG = {"max_concurrent": "3", "goals": "saturated-v1", "population": "fleet-edge-tree"}
+CONFIG = {"max_concurrent": "3", "goals": "saturated-v1", "population": "fleet-edge-tree",
+          # THE EVALUATION BROWSER, NOT THE FLEET'S. The fleet's Edge holds a resident Copilot
+          # page owned by no arm: across six arms its top mover swung 24 to 239 MB while each
+          # arm's own new process stayed at 18-20. No statistic can split one process's commit
+          # between two tenants, so the series drives a browser that has no co-tenant.
+          "cdp_url": os.environ.get("SERIES_CDP_URL", "http://127.0.0.1:9224")}
 
 #: The decision threshold, taken from the frozen judge rather than restated here.
 def floor_mb() -> float:
@@ -187,6 +192,8 @@ def classify(rec) -> str:
         return "no memory_gain_mb"
     if str(rec.get("max_concurrent")) != CONFIG["max_concurrent"]:
         return "max_concurrent was %r" % (rec.get("max_concurrent"),)
+    if str(rec.get("cdp_url") or "") != CONFIG["cdp_url"]:
+        return "cdp_url was %r" % (rec.get("cdp_url"),)
     return ""
 
 
@@ -232,6 +239,7 @@ def run_one(kind: str, order: str, log_dir: str) -> dict:
     """One campaign. Returns the recorded result, or a dict naming why there is none."""
     env = dict(os.environ)
     env["MCP_FLEET_MAX_CONCURRENT"] = CONFIG["max_concurrent"]
+    env["MCP_FLEET_CDP_URL"] = CONFIG["cdp_url"]
     env.setdefault("SWE_DISK_FLOOR_GB", "3")
     env["PYTHONIOENCODING"] = "utf-8"
     log = os.path.join(log_dir, "series_%s_%s_%d.log" % (kind, order, int(time.time())))

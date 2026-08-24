@@ -205,7 +205,15 @@ def main():
     # recorded with the result and `run_archive` refuses to put two different settings in one
     # column -- the same rule the goal set and the sampler already live under.
     max_conc = int(os.environ.get("MCP_FLEET_MAX_CONCURRENT", "2"))
+    # WHICH BROWSER IS PART OF THE MEASUREMENT, NOT A CONNECTION DETAIL.
+    #
+    # The fleet's own Edge holds a resident Copilot page that belongs to no arm; its top mover
+    # swung 24 to 239 MB across arms while each arm's own new process stayed at 18-20. A
+    # dedicated evaluation browser has no such co-tenant. Runs from the two are different
+    # measurements, so the URL is recorded and `run_archive` keys columns on it.
+    cdp_url = os.environ.get("MCP_FLEET_CDP_URL", "http://127.0.0.1:9222")
     evaluate = S.route_evaluator_for(goals, agent_url=agent_url, max_concurrent=max_conc,
+                                     cdp_url=cdp_url,
                                      candidate_first=candidate_first,
                                      warmup="--warmup" in sys.argv,
                                      null_arm="--null" in sys.argv,
@@ -226,6 +234,7 @@ def main():
     # fleet or the sampler is not one series, and without this nothing would say so.
     out["revision"] = _code_revision()
     out["max_concurrent"] = max_conc
+    out["cdp_url"] = cdp_url
     out["sidepage_reserve"] = os.environ.get("SWE_SIDEPAGE_RESERVE", "1")
     out["goals"] = goals_name
     infra = out.get("infra") or {}
