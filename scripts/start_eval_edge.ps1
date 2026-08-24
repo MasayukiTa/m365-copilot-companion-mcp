@@ -94,7 +94,14 @@ $flags = @(
     "--disable-sync",
     "--disable-component-update",
     "--disable-features=Translate,MediaRouter,OptimizationHints",
-    "--process-per-site"
+    "--process-per-site",
+    # A BLANK PAGE, BECAUSE THE PROFILE'S START PAGE IS NOT PART OF THE EXPERIMENT.
+    #
+    # Launched with no URL, Edge opened this profile's configured start page -- an
+    # intranet portal, 273 MB of it, on every rebuild. Nobody asked for it here, it sat in
+    # the baseline every arm was measured against, and it kept working while the arms ran.
+    # The browser measured 402.5 MB "fresh" and that page was almost all of it.
+    "about:blank"
 )
 
 Start-Process -FilePath $edge -ArgumentList $flags -WindowStyle Minimized | Out-Null
