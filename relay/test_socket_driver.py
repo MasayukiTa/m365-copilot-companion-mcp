@@ -21,7 +21,11 @@ class _FakeConv:
         self.asked = []
         self.closed = False
 
-    def ask(self, text, *, connect, on_text=None, catalogue=None, protocol="", run_tool=None):
+    # **kw で受ける。本物の Conversation.ask に引数が増えるたびに
+    # 偽物が TypeError を出し、ドライバがそれを『経路の失敗』として記録するので、
+    # 症状が実装の欠陥そっくりに見える（実際そうなった）。
+    def ask(self, text, *, connect, on_text=None, catalogue=None, protocol="",
+            run_tool=None, **kw):
         self.asked.append(text)
         for d in self.deltas:
             if on_text:
@@ -200,3 +204,37 @@ def test_a_completed_turn_with_no_text_falls_back_instead_of_counting():
     assert _settle(drv)
     assert drv._answers().count() == 0
     assert "no text" in drv.failed
+
+
+def test_an_empty_turn_names_the_frames_that_did_arrive():
+    """空の回答は、いまは「空だった」しか言わない。バックエンドは tool 認可と確認を
+    独自のメッセージ種別で送ってくるので、同意カードを載せて本文が無い完了ターンと、
+    ただ何も言わなかったモデルとが、記録上で区別できなかった。
+
+    どの種別が失効時に出るかは、同意を意図的に切る試験をするまで分からない。
+    だから断定せず、来た種別をそのまま残す。"""
+    class _Conv:
+        def ask(self, text, *, connect, on_text=None, on_progress=None, **kw):
+            if on_progress:
+                on_progress({"type": "InternalSearchQuery", "origin": ""})
+                on_progress({"type": "Progress", "origin": "ChainOfThoughtSummary"})
+            return ""      # 完了したが本文なし
+
+    d = SD.CopilotSocketDriver(_Conv(), connect=lambda *a, **k: None)
+    d.send("hi")
+    d._thread.join(timeout=5)
+    assert d.failed
+    assert "InternalSearchQuery" in d.failed
+    assert "Progress/ChainOfThoughtSummary" in d.failed
+
+
+def test_an_empty_turn_with_nothing_else_says_that_too():
+    """種別も来なかったのなら、それも所見。空欄と区別する。"""
+    class _Conv:
+        def ask(self, text, *, connect, on_text=None, on_progress=None, **kw):
+            return ""
+
+    d = SD.CopilotSocketDriver(_Conv(), connect=lambda *a, **k: None)
+    d.send("hi")
+    d._thread.join(timeout=5)
+    assert "no non-chat frames either" in d.failed
