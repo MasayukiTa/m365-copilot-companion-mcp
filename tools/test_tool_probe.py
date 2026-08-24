@@ -130,7 +130,7 @@ def test_get_summary_missing_file_returns_null_shape(monkeypatch, tmp_path):
     monkeypatch.setattr(tool_probe, "_PROBE_FILE", tmp_path / "does_not_exist.json")
     summary = tool_probe.get_summary(now=1000.0)
     assert summary == {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None,
-                       "tool_alive": None}
+                       "tool_alive": None, "tool_inbound": None}
 
 
 def test_get_summary_corrupt_json_returns_null_shape(monkeypatch, tmp_path):
@@ -139,7 +139,7 @@ def test_get_summary_corrupt_json_returns_null_shape(monkeypatch, tmp_path):
     monkeypatch.setattr(tool_probe, "_PROBE_FILE", probe_file)
     summary = tool_probe.get_summary(now=1000.0)
     assert summary == {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None,
-                       "tool_alive": None}
+                       "tool_alive": None, "tool_inbound": None}
 
 
 def test_get_summary_missing_ts_key_returns_null_shape(monkeypatch, tmp_path):
@@ -148,7 +148,7 @@ def test_get_summary_missing_ts_key_returns_null_shape(monkeypatch, tmp_path):
     monkeypatch.setattr(tool_probe, "_PROBE_FILE", probe_file)
     summary = tool_probe.get_summary(now=1000.0)
     assert summary == {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None,
-                       "tool_alive": None}
+                       "tool_alive": None, "tool_inbound": None}
 
 
 def test_get_summary_non_numeric_ts_returns_null_shape(monkeypatch, tmp_path):
@@ -158,7 +158,7 @@ def test_get_summary_non_numeric_ts_returns_null_shape(monkeypatch, tmp_path):
     monkeypatch.setattr(tool_probe, "_PROBE_FILE", probe_file)
     summary = tool_probe.get_summary(now=1000.0)
     assert summary == {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None,
-                       "tool_alive": None}
+                       "tool_alive": None, "tool_inbound": None}
 
 
 # ===========================================================================
@@ -223,7 +223,7 @@ def test_get_summary_never_raises_on_unreadable_path(monkeypatch):
     monkeypatch.setattr(tool_probe, "_PROBE_FILE", Path("\x00bad\x00path\x00tool_probe.json"))
     summary = tool_probe.get_summary()  # must not raise
     assert summary == {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None,
-                       "tool_alive": None}
+                       "tool_alive": None, "tool_inbound": None}
 
 
 # --- probe instruction must never repeat byte-for-byte ------------------------

@@ -93,6 +93,8 @@ def test_bounded_retries_then_terminal_marker(monkeypatch):
     monkeypatch.setattr(B, "CONSENT_SURFACE_RETRY_MAX", 3)
     _patch_surface(monkeypatch, [False, False, False])
     recorded = []
+    # **kw で受ける。呼び出し側に引数が1つ増えるたびに壊れるスタブにしない
+    # （既定値つきの追加は本番の呼び出しには後方互換で、壊れるのはここだけだった）。
     monkeypatch.setattr(B.tool_probe, "record_probe",
                          lambda ok, kind, detail="", ts=None, alive=None: recorded.append((ok, kind, detail)))
 
@@ -177,8 +179,10 @@ def test_probe_answer_no_recovery_needed(monkeypatch):
     _patch_probe_plumbing(monkeypatch, [(True, "found file: probe_TESTTOKEN.txt", False)])
     surface_calls = _patch_surface(monkeypatch, [])
     recorded = []
+    # **kw で受ける。呼び出し側に引数が1つ増えるたびに壊れるスタブにしない
+    # （既定値つきの追加は本番の呼び出しには後方互換で、壊れるのはここだけだった）。
     monkeypatch.setattr(B.tool_probe, "record_probe",
-                         lambda ok, kind, detail="", ts=None, alive=None: recorded.append((ok, kind)))
+                         lambda ok, kind, **kw: recorded.append((ok, kind)))
 
     B._run_tool_probe()
 
@@ -200,8 +204,10 @@ def test_probe_consent_card_auto_consent_succeeds(monkeypatch):
     )
     surface_calls = _patch_surface(monkeypatch, [])
     recorded = []
+    # **kw で受ける。呼び出し側に引数が1つ増えるたびに壊れるスタブにしない
+    # （既定値つきの追加は本番の呼び出しには後方互換で、壊れるのはここだけだった）。
     monkeypatch.setattr(B.tool_probe, "record_probe",
-                         lambda ok, kind, detail="", ts=None, alive=None: recorded.append((ok, kind)))
+                         lambda ok, kind, **kw: recorded.append((ok, kind)))
 
     B._run_tool_probe()
 
@@ -221,8 +227,10 @@ def test_probe_consent_card_auto_consent_fails_falls_to_surface(monkeypatch):
     )
     surface_calls = _patch_surface(monkeypatch, [True])
     recorded = []
+    # **kw で受ける。呼び出し側に引数が1つ増えるたびに壊れるスタブにしない
+    # （既定値つきの追加は本番の呼び出しには後方互換で、壊れるのはここだけだった）。
     monkeypatch.setattr(B.tool_probe, "record_probe",
-                         lambda ok, kind, detail="", ts=None, alive=None: recorded.append((ok, kind)))
+                         lambda ok, kind, **kw: recorded.append((ok, kind)))
 
     B._run_tool_probe()
 
@@ -236,8 +244,10 @@ def test_probe_timeout_skips_consent_recovery(monkeypatch):
     _patch_probe_plumbing(monkeypatch, [(True, "", True)])
     surface_calls = _patch_surface(monkeypatch, [])
     recorded = []
+    # **kw で受ける。呼び出し側に引数が1つ増えるたびに壊れるスタブにしない
+    # （既定値つきの追加は本番の呼び出しには後方互換で、壊れるのはここだけだった）。
     monkeypatch.setattr(B.tool_probe, "record_probe",
-                         lambda ok, kind, detail="", ts=None, alive=None: recorded.append((ok, kind)))
+                         lambda ok, kind, **kw: recorded.append((ok, kind)))
 
     B._run_tool_probe()
 
@@ -251,6 +261,8 @@ def test_probe_startup_is_transitional_and_retries_quickly(monkeypatch):
     monkeypatch.setattr(B, "_LAST_USER_TURN_TS", 0.0)
     monkeypatch.setattr(B, "MCP_TOOL_PROBE_SEC", 600.0)
     recorded = []
+    # **kw で受ける。呼び出し側に引数が1つ増えるたびに壊れるスタブにしない
+    # （既定値つきの追加は本番の呼び出しには後方互換で、壊れるのはここだけだった）。
     monkeypatch.setattr(B.tool_probe, "record_probe",
                         lambda ok, kind, detail="", ts=None, alive=None: recorded.append((ok, kind, detail)))
 
@@ -265,8 +277,10 @@ def test_probe_records_checking_before_the_real_turn(monkeypatch):
     _patch_probe_plumbing(monkeypatch, [(True, "found file: probe_TESTTOKEN.txt", False)])
     _patch_surface(monkeypatch, [])
     recorded = []
+    # **kw で受ける。呼び出し側に引数が1つ増えるたびに壊れるスタブにしない
+    # （既定値つきの追加は本番の呼び出しには後方互換で、壊れるのはここだけだった）。
     monkeypatch.setattr(B.tool_probe, "record_probe",
-                        lambda ok, kind, detail="", ts=None, alive=None: recorded.append((ok, kind)))
+                        lambda ok, kind, **kw: recorded.append((ok, kind)))
 
     B._run_tool_probe()
 
