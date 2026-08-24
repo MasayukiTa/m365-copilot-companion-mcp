@@ -104,4 +104,41 @@ def test_the_per_tab_budget_is_the_fresh_tab_cost_and_says_so():
     assert RF.FLEET_PER_TAB_MB == 400.0
     src = inspect.getsource(RF)
     head = src[:src.index("FLEET_PER_TAB_MB = float(")]
-    assert "1,340.9" in head[-1200:] or "1340.9" in head[-1200:], "根拠が隣に書かれていない"
+    # 固定幅で切り出すと、注記が伸びただけで落ちる -- 実際そうなった。
+    # 見るべきは「この定数の説明の中に根拠が在るか」であって、末尾何文字かではない。
+    note = head[head.rindex("#: What ONE Copilot tab is budgeted to cost"):]
+    assert "1,340.9" in note or "1340.9" in note, "根拠が隣に書かれていない"
+
+
+def test_the_per_tab_budget_is_recorded_as_measured_not_inherited():
+    """400 は長らく『運用者から。この箱では未測定』だった。測ったので、根拠を隣に置く。
+
+    3回の冷えた走行(新品の headless、warm-up 無し、goal 4本、同時3)で、tabs アーム全体が
+    新品ブラウザ比 564.1MB、sd 27.2。--process-per-site が同一サイトのページを1レンダラに
+    まとめるので、タブは各自プロセスを買わない -- 同時1タブあたり約190MB。400 はその約2倍を
+    請求しており、開くか否かを決める門としては安全側。だから数字は動かさない。
+
+    このテストは 400 を守るためではなく、根拠がコードの隣から消えないためにある。"""
+    from relay import relay_fleet as RF
+
+    assert hasattr(RF, "FLEET_MEASURED_TABS_ARM_MB")
+    assert hasattr(RF, "FLEET_MEASURED_SOCKET_ARM_MB")
+    # 実測が予算を上回るなら、予算はもう安全側ではない
+    per_concurrent = RF.FLEET_MEASURED_TABS_ARM_MB / 3.0
+    assert per_concurrent < RF.FLEET_PER_TAB_MB, (
+        "実測のタブ単価 %.1fMB が予算 %.1fMB を超えている -- 予算はもう保守的ではない"
+        % (per_concurrent, RF.FLEET_PER_TAB_MB))
+
+
+def test_a_socket_worker_weighs_no_tab_and_that_is_documented_as_a_tab_claim():
+    """socket ワーカーはタブを開かないので tab_weight 0 は正しい。
+    しかし『メモリも 0』ではない -- 実測でブラウザ側 428.8MB。
+    その区別がコードから消えると、socket 中心のフリートで予算が意味を失う。"""
+    import inspect
+
+    from relay import relay_fleet as RF
+
+    src = inspect.getsource(RF.RelayWorker.tab_weight)
+    assert "428.8" in src or "FLEET_MEASURED_SOCKET_ARM_MB" in src, (
+        "socket が無料ではないことが、判定の隣に書かれていない")
+    assert RF.FLEET_MEASURED_SOCKET_ARM_MB < RF.FLEET_MEASURED_TABS_ARM_MB

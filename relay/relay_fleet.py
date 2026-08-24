@@ -783,6 +783,23 @@ FLEET_RAM_FLOOR_MB = float(os.environ.get("MCP_FLEET_RAM_FLOOR_MB", "512"))
 #: the right question here -- and the growth afterwards is a different problem, handled where
 #: it belongs by bounding conversation length rather than by inflating this number until no
 #: second tab ever fits. The 700 this replaces was inherited and never measured on this box.
+#:
+#: NOW MEASURED ON THIS BOX, and 400 survives as the conservative choice. Three cold runs
+#: (fresh headless browser, no warm-up, four goals, three workers at once) put a whole tabs arm
+#: at 564.1 MB over the fresh browser, sd 27.2 -- so roughly 190 MB per concurrent tab, because
+#: --process-per-site consolidates same-site pages into one renderer and the tabs do not each
+#: pay for a process. Budgeting 400 charges about twice what a tab actually takes, which is the
+#: safe direction for a gate deciding whether to open one, so the number does not move.
+#:
+#: The same three runs put the browser's own idle floor at 757.8 to 874.3 MB before any work,
+#: which is worth holding next to this: most of what the browser costs is not tabs.
+FLEET_MEASURED_TABS_ARM_MB = 564.1
+
+#: What the same work costs over the SOCKET route, measured the same way in the same sitting:
+#: 428.8 MB over the fresh browser, sd 7.3, plus 258.2 MB in the fleet's own process holding
+#: the websocket. A socket worker is cheaper than a tabs worker but it is NOT free, and
+#: `Worker.tab_weight` charges it zero. See the note there.
+FLEET_MEASURED_SOCKET_ARM_MB = 428.8
 FLEET_PER_TAB_MB = float(os.environ.get("MCP_FLEET_PER_TAB_MB", "400"))
 
 
@@ -2188,6 +2205,19 @@ class RelayWorker:
         # admitted worker drops to weight 1 once attached, the next one is still charged 2, and
         # 1 + 2 exceeds 2. Measured 2026-08-24: four goals started 43, 39 and 56 seconds apart
         # over sockets, each waiting for the previous one's reply, with the cap set to 2.
+        # ZERO IS A CLAIM ABOUT TAB COUNT, NOT ABOUT MEMORY, and the two have now been measured
+        # apart. A socket worker opens no tab, so reserving no tab-slot is right. But three cold
+        # runs in one sitting put a socket arm at 428.8 MB of browser growth against a tabs
+        # arm's 564.1 -- 76%, not nothing -- with another 258.2 MB in this process holding the
+        # websocket, which no browser-side gate can see at all.
+        #
+        # So on a RAM-tight box the tab-slot budget stops bounding memory the moment the fleet
+        # is mostly on sockets: every socket worker weighs nothing and admission keeps saying
+        # yes. Nothing here changes today, because n=3 on one workload is not the evidence to
+        # re-tune a live admission gate with, and the tab-slot reservation still does the job it
+        # was added for. What it needs is a memory-side reservation for socket workers, sized
+        # from a replication -- not a fudge to this number, which would re-serialise the fleet
+        # for a reason that has nothing to do with tabs.
         main = 0 if (self.socket if assume_socket is None else assume_socket) else 1
         if os.environ.get("SWE_SIDEPAGE_RESERVE", "1") == "0":
             return main
