@@ -534,6 +534,29 @@ CAMPAIGN_SOCKET_LOG = os.path.join(
     "docs", "research", "results", "route_campaign_socket.jsonl")
 
 
+def _cdp_owner_pid(cdp_url):
+    """The pid listening on the CDP port, or None if it cannot be resolved.
+
+    Returned rather than raised, and the caller records which population it ended up with: a
+    resolver that fails quietly would put the old, unscoped measurement back without saying so.
+    """
+    try:
+        import psutil
+    except Exception:
+        return None
+    try:
+        port = int(str(cdp_url).rsplit(":", 1)[-1].split("/")[0])
+    except Exception:
+        return None
+    try:
+        for conn in psutil.net_connections(kind="tcp"):
+            if conn.status == "LISTEN" and conn.laddr and conn.laddr.port == port:
+                return conn.pid
+    except Exception:
+        return None
+    return None
+
+
 def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222",
                         max_concurrent=2, log_path=None, candidate_first=False,
                         warmup=False, null_arm=False,
@@ -591,7 +614,8 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
     _extras = {}
 
     #: The processes that already existed when this arm started. Set per arm, never shared.
-    _attr = {"baseline_pids": None, "peak_new_pids": 0}
+    _attr = {"baseline_pids": None, "peak_new_pids": 0,
+             "root_pid": None, "population": None}
 
     def _begin_attribution():
         """Forget the previous arm's baseline. Called before each arm, not inside the sampler.
@@ -644,13 +668,40 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
         except Exception:
             pass
 
+        # THE POPULATION IS THE FLEET'S OWN BROWSER, NOT EVERY EDGE ON THE MACHINE.
+        #
+        # This summed every process named msedge.exe. Measured 2026-08-24 on this box: 45 such
+        # processes holding 6,181 MB, of which the fleet's Edge (:9222) was 1,559 and the
+        # bridge's (:9223) was 1,002 -- FIFTY-NINE PERCENT belonged to neither and moved for
+        # reasons that had nothing to do with any arm. A socket arm that opens no tab was
+        # reported at 1,070 MB, and two identical arms came back 707 MB apart. That is not the
+        # route; it is the operator's own browsing landing on whichever arm was running.
+        #
+        # The fleet's browser is the process listening on the CDP port we are driving, plus its
+        # children. Resolving that costs a connection-table scan, so the root is cached; the
+        # TREE is re-walked every sample because Edge spawns and kills renderers constantly.
+        if _attr["root_pid"] is None or not psutil.pid_exists(_attr["root_pid"]):
+            _attr["root_pid"] = _cdp_owner_pid(cdp_url)
+            # SAY WHICH POPULATION WAS USED, in the result. If the owner cannot be resolved this
+            # falls back to every Edge -- which is the old, wrong measurement -- and a reader who
+            # is not told cannot know which of the two produced the number.
+            _attr["population"] = ("fleet-edge-tree" if _attr["root_pid"] is not None
+                                   else "all-edge-unscoped")
         current = {}
-        for proc in psutil.process_iter(["pid", "name", "memory_info"]):
+        if _attr["root_pid"] is not None:
             try:
-                if (proc.info.get("name") or "").lower() != "msedge.exe":
+                root = psutil.Process(_attr["root_pid"])
+                procs = [root] + root.children(recursive=True)
+            except Exception:
+                procs = []
+        else:
+            procs = psutil.process_iter(["pid", "name", "memory_info"])
+        for proc in procs:
+            try:
+                if (proc.name() or "").lower() != "msedge.exe":
                     continue
-                mi = proc.info["memory_info"]
-                current[proc.info["pid"]] = float(getattr(mi, "private", mi.rss))
+                mi = proc.memory_info()
+                current[proc.pid] = float(getattr(mi, "private", mi.rss))
             except Exception:
                 continue
 
@@ -945,6 +996,7 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
                 lambda g, s, smp: _run(g, s, smp, manifest=control_manifest),
                 goals=goals, socket_on=bool(control_socket), peak_sampler=_edge_mb)
             out["new_renderers"] = _attr["peak_new_pids"]
+            out["memory_population"] = _attr["population"]
             out.update(_extras)
             return out
 
@@ -968,6 +1020,7 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
                 socket_on=bool(control_socket) if null_arm else True,
                 peak_sampler=_edge_mb)
             out["new_renderers"] = _attr["peak_new_pids"]
+            out["memory_population"] = _attr["population"]
             out.update(_extras)
             out["is_null"] = bool(null_arm)
             return out

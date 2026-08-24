@@ -265,7 +265,9 @@ jobs:
             relay/selfimprove/test_archive_publish_guard.py \
             relay/selfimprove/test_run_archive.py \
             relay/test_fleet_ram_floor.py \
-            relay/selfimprove/test_pending.py
+            relay/selfimprove/test_pending.py \
+            relay/selfimprove/test_memory_population.py \
+            relay/selfimprove/test_record_summary.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py
