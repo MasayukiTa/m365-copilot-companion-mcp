@@ -270,7 +270,10 @@ jobs:
             relay/selfimprove/test_record_summary.py \
             tools/test_tool_probe_inbound.py \
             bridge/test_recycle_measurement.py \
-            relay/selfimprove/test_frozen_queue_refused.py
+            relay/selfimprove/test_frozen_queue_refused.py \
+            relay/test_signin_residue_reaper.py \
+            relay/test_socket_conversation_identity.py \
+            bridge/test_send_contract.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py

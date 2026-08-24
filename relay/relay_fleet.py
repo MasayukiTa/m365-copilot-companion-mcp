@@ -556,6 +556,20 @@ def on_agent_surface(url):
     return False
 
 
+#: Hosts that only ever appear as part of an auth bounce. Being ON one is not enough to close
+#: the tab -- see the reaper, which asks the page whether it wants a human first.
+SIGNIN_HOST_MARKERS = ("login.microsoftonline.com", "login.live.com", "login.windows.net")
+
+
+def _on_signin_host(url):
+    """True if this URL belongs to an auth host. Never raises."""
+    try:
+        u = (url or "").lower()
+    except Exception:
+        return False
+    return any(m in u for m in SIGNIN_HOST_MARKERS)
+
+
 def _reap_orphan_redirect_tabs(context, workers):
     """Close stray SSO-redirect / landing tabs that are NOT owned by any worker (a failed goto or
     an auth bounce leaves one behind). Never touches a worker's live page or a real conversation
@@ -571,6 +585,33 @@ def _reap_orphan_redirect_tabs(context, workers):
             except Exception:
                 continue
             if looks_like_redirect_landing(u) and not on_agent_surface(u):
+                try:
+                    pg.close()
+                except Exception:
+                    pass
+                continue
+            # SIGN-IN HOSTS TOO, BUT ONLY WHEN THE PAGE IS NOT ASKING FOR A SIGN-IN.
+            #
+            # This reaper existed, ran every 30 sweeps, and could not match the residue that
+            # actually accumulates here: `looks_like_redirect_landing` keys off the CsrToSSR
+            # query markers, so login.microsoftonline.com/savedusers and login.live.com/Me.srf
+            # -- four such tabs were sitting in the fleet Edge when this was written -- were
+            # never candidates. A reaper that cannot see the thing it was written for is not a
+            # smaller version of the fix; it is the absence of one.
+            #
+            # THE URL IS NOT THE TEST, THE PAGE STATE IS. relay/edge_auth exists because a
+            # redirect param says nothing about whether anyone is signed in, and closing a tab
+            # that IS showing an interactive sign-in would take away the one surface a human
+            # needs. So a sign-in host is only closed when the classifier says it is not
+            # asking for one.
+            if _on_signin_host(u):
+                try:
+                    from relay import edge_auth as _ea
+                    cls = _ea.classify_page(_ea.probe_page_state(pg))
+                except Exception:
+                    continue                      # cannot tell -> leave it alone
+                if cls == "needs_signin":
+                    continue                      # a human still needs this page
                 try:
                     pg.close()
                 except Exception:
