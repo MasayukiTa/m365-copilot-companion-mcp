@@ -92,3 +92,16 @@ def test_admission_asks_for_the_route_it_will_take():
     tree = ast.parse(src.lstrip())
     assert any(isinstance(n, ast.FunctionDef) and n.name == "_socket_open_now"
                for n in ast.walk(tree)), "判定関数が無い"
+
+
+def test_the_per_tab_budget_is_the_fresh_tab_cost_and_says_so():
+    """400 は運用者の実測で、しかも『開いた直後の』値であることが要点。
+    長く開いたままのタブは 1,000MB を超え、1,340.9MB まで測られている。
+    アドミッションが決めているのは『開くかどうか』なので、新規の値が正しい問い。
+    伸びるほうは会話長を縛る側の問題で、この数字を膨らませて2枚目が入らなくする
+    のは筋が違う。置き換えた 700 は継承した値で、この端末で測ったものではなかった。"""
+    import inspect
+    assert RF.FLEET_PER_TAB_MB == 400.0
+    src = inspect.getsource(RF)
+    head = src[:src.index("FLEET_PER_TAB_MB = float(")]
+    assert "1,340.9" in head[-1200:] or "1340.9" in head[-1200:], "根拠が隣に書かれていない"

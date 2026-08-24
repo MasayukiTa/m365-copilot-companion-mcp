@@ -26,6 +26,16 @@ def _arm(done, peak_mb, goals=4):
 
 # ---- 契約: 3値がコントローラで3値のまま出ること ------------------------------------------------
 
+def _edge_mb_source() -> str:
+    """`_edge_mb` の本文。固定文字数で切り出すと、注記を1つ足しただけで
+    対象行が窓の外に出て、検査が静かに通らなくなる（実際そうなった）。"""
+    import ast
+    src = inspect.getsource(S.route_evaluator_for)
+    fn = next(n for n in ast.walk(ast.parse(src.lstrip()))
+              if isinstance(n, ast.FunctionDef) and n.name == "_edge_mb")
+    return ast.unparse(fn)
+
+
 def test_a_memory_win_reaches_the_controller_as_keep():
     out = D.decide(gate=_gate_from(_arm(4, 1653.0), _arm(4, 205.0)), frozen_ok=True)
     assert out["state"] == D.KEEP, out
@@ -241,12 +251,12 @@ def test_the_measured_quantity_is_attributable_to_the_arm():
     """合計RSSのピークは腕に帰属できない。別セッションがタブを開けば
     その上昇は丸ごと走行中の腕に計上され、OS のトリミングで RSS は
     需要ではなくシステム全体の圧を測り、第2腕は先行腕の高水位標に潰される。
-    腕の開始時に存在しなかったプロセスだけが、その腕のもの。"""
+    帰属できるのはプロセスごとの増分。新規プロセスだけを数える規則は、Edge が
+    レンダラーを再利用するせいでタブ4枚を18MBと採点した（別テスト参照）。"""
     src = inspect.getsource(S.route_evaluator_for)
     assert "baseline_pids" in src
     assert "private" in src, "commit ではなく RSS を読んでいる"
-    i = src.index("def _edge_mb")
-    body = src[i:i + 3600]
+    body = _edge_mb_source()
     assert "base.get(pid, 0.0)" in body, "既存プロセスの増分を見ていない"
 
 
@@ -283,18 +293,14 @@ def test_growth_inside_existing_processes_is_counted():
     タブ4枚を開いた腕が新規1プロセス18MBという値を返した。Edge は
     レンダラープールを再利用するので、タブのコストは既存プロセスの
     増分として乗る -- 新規プロセス規則はそれをゼロと採点する。"""
-    src = inspect.getsource(S.route_evaluator_for)
-    i = src.index("def _edge_mb")
-    body = src[i:i + 3600]
+    body = _edge_mb_source()
     assert "grew = value - base.get(pid, 0.0)" in body
 
 
 def test_a_shrinking_process_does_not_pay_the_arm_a_credit():
     """腕が触れていないレンダラーが OS にトリミングされただけで
     『この腕はメモリを減らした』ことにされる。"""
-    src = inspect.getsource(S.route_evaluator_for)
-    i = src.index("def _edge_mb")
-    body = src[i:i + 3600]
+    body = _edge_mb_source()
     assert "if grew > 0:" in body
 
 

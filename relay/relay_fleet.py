@@ -711,8 +711,15 @@ def avail_phys_mb() -> float:
 FLEET_RAM_FLOOR_MB = float(os.environ.get("MCP_FLEET_RAM_FLOOR_MB", "512"))
 
 #: What ONE Copilot tab is budgeted to cost. Separate from the floor because they answer
-#: different questions: the floor is what must remain, this is what the next tab will take.
-FLEET_PER_TAB_MB = float(os.environ.get("MCP_FLEET_PER_TAB_MB", "700"))
+#: different questions: the floor is what must remain, this is what the NEXT tab will take.
+#:
+#: 400, FROM THE OPERATOR, AND IT IS THE FRESH-TAB NUMBER ON PURPOSE. A newly opened Copilot
+#: tab costs about this much; one kept open for a long conversation passes 1,000 MB and has
+#: been measured at 1,340.9. Admission is deciding whether to OPEN one, so the fresh cost is
+#: the right question here -- and the growth afterwards is a different problem, handled where
+#: it belongs by bounding conversation length rather than by inflating this number until no
+#: second tab ever fits. The 700 this replaces was inherited and never measured on this box.
+FLEET_PER_TAB_MB = float(os.environ.get("MCP_FLEET_PER_TAB_MB", "400"))
 
 
 def ram_room_for_tab(floor_mb=None) -> bool:
