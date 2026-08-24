@@ -65,3 +65,30 @@ def test_no_gate_carries_its_own_ram_number_as_a_default():
                 assert isinstance(default, ast.Constant) and default.value is None, \
                     "%s の %s に数字が戻っている" % (fn, arg)
     assert checked >= 5, checked
+
+
+# ---- 待機中のワーカーを「これからなるもの」として量ること ------------------------------------------
+
+def test_a_pending_worker_is_weighed_as_the_route_it_will_take():
+    """`self.socket` は attach() の中で立つが、アドミッションは attach の前に量る。
+    そのため socket を取る予定でタブを1枚も持たないワーカーが、タブとして課金されていた。
+    予算2ではこれで両経路とも厳密に1本ずつになる: 入った1本は attach 後に重み1へ下がるが、
+    次の待機ワーカーは2で課金され 1+2 が 2 を超える。
+    2026-08-24 実測: 上限2の socket 走行で、4ゴールが 43/39/56 秒ずつずれて開始していた。
+    """
+    w = RF.RelayWorker("goal", "w0")
+    assert w.socket is False
+    assert w.tab_weight() == 2                      # 現状のまま量ると「タブ」
+    assert w.tab_weight(assume_socket=True) == 1    # これからなるもので量ると枠1つ
+    assert w.tab_weight(assume_socket=False) == 2
+
+
+def test_admission_asks_for_the_route_it_will_take():
+    """引数を足しただけで呼び出し側が渡していなければ、直っていない。"""
+    import ast
+    import inspect
+    src = inspect.getsource(RF.run_relay_fleet)
+    assert "tab_weight(assume_socket=_socket_open_now())" in src
+    tree = ast.parse(src.lstrip())
+    assert any(isinstance(n, ast.FunctionDef) and n.name == "_socket_open_now"
+               for n in ast.walk(tree)), "判定関数が無い"

@@ -23,7 +23,7 @@ def archive(tmp_path):
     # 飽和集合にも世代がある(短縮パス修正)。計器の時刻だけを基準にすると、
     # 作業負荷の世代で落ちたのをテストの不具合と読み違える。
     base = max(RA.INSTRUMENT_EPOCH, RA.WORKLOAD_EPOCH.get("saturated-v1", 0))
-    before = RA.INSTRUMENT_EPOCH - 100
+    before = RA.SAMPLER_EPOCH - 100
     after = base + 100
     _write(d, "route-transport-v1-NULL-ctrlfirst-%d" % before, null=True, gain=-179.8)
     _write(d, "route-transport-v1-NULL-ctrlfirst-%d" % after, null=True, gain=50.8)
@@ -41,26 +41,35 @@ def test_a_run_from_before_the_instrument_change_is_not_older_data_but_other_dat
     assert [r["memory_gain_mb"] for r in nulls] == [50.8]
 
 
-def test_a_superseded_goal_set_keeps_its_name(tmp_path):
+def test_a_superseded_goal_set_keeps_its_name(tmp_path, monkeypatch):
     """欠陥のあった `multiturn` の走行と、直した後の走行は同じ `goals` 文字列を持つ。
-    名前だけで絞ると、壊れたゴールを測った数値が黙って平均に入る。"""
+    名前だけで絞ると、壊れたゴールを測った数値が黙って平均に入る。
+
+    世代は計測器のほうより必ず後ろに置く。そうしないと、作業負荷の世代を試したつもりで
+    計測器の世代に弾かれ、通る理由が入れ替わったことに気づけない。"""
     d = str(tmp_path)
-    epoch = RA.WORKLOAD_EPOCH["multiturn"]
+    epoch = RA.INSTRUMENT_EPOCH + 1000
+    monkeypatch.setattr(RA, "WORKLOAD_EPOCH", {"multiturn": epoch})
     _write(d, "route-transport-v1-NULL-ctrlfirst-%d" % (epoch - 100),
            null=True, gain=132.7, goals="multiturn")
     _write(d, "route-transport-v1-NULL-ctrlfirst-%d" % (epoch + 100),
            null=True, gain=-5.3, goals="multiturn")
     runs = RA.load(d)
     assert len(runs) == 2
+    assert all(r["current_instrument"] for r in runs), "計測器の世代で弾かれている"
     kept = RA.comparable(runs, goals="multiturn", null=True)
     assert [r["memory_gain_mb"] for r in kept] == [-5.3]
 
 
-def test_two_goal_sets_are_never_put_in_one_column(archive):
+def test_two_goal_sets_are_never_put_in_one_column(tmp_path, monkeypatch):
     """片方の集合で測った差は、もう片方についての証拠ではない。広がりが違う。"""
-    _write(archive, "route-transport-v1-NULL-ctrlfirst-%d"
-           % (max(RA.WORKLOAD_EPOCH.values()) + 5), null=True, gain=196.8, goals="multiturn")
-    runs = RA.load(archive)
+    d = str(tmp_path)
+    after = RA.INSTRUMENT_EPOCH + 2000
+    monkeypatch.setattr(RA, "WORKLOAD_EPOCH", {})
+    _write(d, "route-transport-v1-NULL-ctrlfirst-%d" % after, null=True, gain=50.8)
+    _write(d, "route-transport-v1-NULL-ctrlfirst-%d" % (after + 5),
+           null=True, gain=196.8, goals="multiturn")
+    runs = RA.load(d)
     sat = RA.comparable(runs, goals="saturated-v1", null=True)
     mt = RA.comparable(runs, goals="multiturn", null=True)
     assert [r["memory_gain_mb"] for r in sat] == [50.8]
@@ -84,8 +93,11 @@ def test_it_does_not_issue_a_verdict():
     assert not hasattr(RA, "decide")
 
 
-def test_the_later_of_the_two_changes_is_the_one_a_run_has_to_clear():
-    assert RA.INSTRUMENT_EPOCH > RA.SAMPLER_EPOCH
+def test_each_change_that_altered_the_quantity_pushes_the_epoch_forward():
+    """3つ目の変更(アドミッションの重み付け)は、記録された `max_concurrent` が
+    両側で同じ値のまま中身だけ変わったもの。記録項目では捕まえられないので、
+    世代で切るしかない。"""
+    assert RA.INSTRUMENT_EPOCH > RA.SAMPLER_ISOLATION_EPOCH > RA.SAMPLER_EPOCH
 
 
 # ---- 分離の度合い -------------------------------------------------------------------------------

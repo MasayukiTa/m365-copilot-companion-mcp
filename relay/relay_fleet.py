@@ -2000,7 +2000,7 @@ class RelayWorker:
             n += 1
         return n
 
-    def tab_weight(self):
+    def tab_weight(self, assume_socket=None):
         """PEAK tabs this worker may hold: 1 main + 1 if it can delegate research + 1 if it runs a
         refuter. Admission RESERVES this many tab-slots, so N lean workers can't all be admitted at
         1 tab each and THEN fan out together to 3 tabs each (the balloon that crashed the Edge). For
@@ -2014,7 +2014,15 @@ class RelayWorker:
         ram_room_for_tab() clears the ~2 GB floor (refuter.py / agent_profiles.py). So relaxing
         this risks at worst a transient STALL (a worker waits in 'refuting'/'researching' for RAM),
         never the balloon crash the peak-reservation was added to prevent."""
-        main = 0 if getattr(self, "socket", False) else 1        # a socket reserves no tab slot; it is not a tab
+        # `assume_socket` EXISTS BECAUSE THIS IS ASKED BEFORE THE ANSWER IS KNOWN.
+        #
+        # `self.socket` is set inside attach(), and admission weighs a PENDING worker before
+        # attach runs -- so a worker about to take a socket and hold no tab at all was billed as
+        # a tab. With a budget of 2 that made the fleet strictly serial on BOTH routes: the
+        # admitted worker drops to weight 1 once attached, the next one is still charged 2, and
+        # 1 + 2 exceeds 2. Measured 2026-08-24: four goals started 43, 39 and 56 seconds apart
+        # over sockets, each waiting for the previous one's reply, with the cap set to 2.
+        main = 0 if (self.socket if assume_socket is None else assume_socket) else 1
         if os.environ.get("SWE_SIDEPAGE_RESERVE", "1") == "0":
             return main
         return main + (1 if self.max_research > 0 else 0) + (1 if self.refuter else 0)
@@ -3386,6 +3394,13 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # the cockpit display -- "maxtabs" means TABS, so an auto worker fanned out to 3 shows as 3.
         return sum(w.tab_load() for w in workers)
 
+    def _socket_open_now():
+        """Whether a worker admitted right now would take a socket rather than a tab."""
+        try:
+            return bool(_socket_route().open())
+        except Exception:
+            return False
+
     def _projected_peak():
         # WORST-CASE tabs if every active worker fans out fully (sum of tab_weight). Admission
         # reserves against THIS so N lean workers can't be admitted at 1 tab each and then balloon
@@ -3506,8 +3521,14 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # ram_room gate defers its side-pages if RAM is genuinely tight, rather than deadlocking.
         # Sub-agent tabs don't run evals, so the DISK gate below still counts main tabs only
         # (_active_open). With no side-pages tab_weight==1, reducing EXACTLY to the old worker cap.
+        # Weigh the pending worker as what it is ABOUT to become, not as what it is now: with the
+        # route open it will take a socket and hold no tab. If the capture then fails it opens a
+        # tab after all and the fleet is one tab over budget for the rest of this sweep -- the
+        # next iteration reads the real weight, so it cannot compound.
         while pending and (_active_open() == 0
-                           or _projected_peak() + pending[0].tab_weight() <= max(1, mc_box[0])):
+                           or _projected_peak()
+                              + pending[0].tab_weight(assume_socket=_socket_open_now())
+                              <= max(1, mc_box[0])):
             # reserve disk for THIS eval plus every already-open eval still in flight, so we never
             # admit N tabs that look fine individually but crash C: once their builds run at once.
             # PER-REPO mode sizes the reserve by each instance's actual build weight (matplotlib 7GB

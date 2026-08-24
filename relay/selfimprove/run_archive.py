@@ -30,9 +30,20 @@ import os
 #: When the sampler began measuring the quantity the arm caused. Commit 1759570.
 SAMPLER_EPOCH = 1787277967
 
-#: When the arms became independent units. Commit 477705a. This is the later of the two, so it
-#: is the one a run has to clear to be comparable with anything measured today.
-INSTRUMENT_EPOCH = 1787283181
+#: When the arms became independent units. Commit 477705a.
+SAMPLER_ISOLATION_EPOCH = 1787283181
+
+#: THE THIRD CHANGE, AND THE ONE THE RECORDED FIELDS COULD NOT HAVE CAUGHT.
+#:
+#: Admission weighed a PENDING worker by `self.socket`, which attach() sets and admission reads
+#: before attach runs -- so a worker about to take a socket and hold no tab was billed as a tab.
+#: At a cap of 2 that made the fleet strictly serial on both routes. Every run before this stamp
+#: recorded `max_concurrent: 2` and actually ran ONE worker at a time, so the field says the same
+#: thing on both sides of the fix while the quantity underneath it changed. Filtering on the
+#: recorded value alone would silently average the two.
+#:
+#: This is the epoch a run has to clear to be comparable with anything measured today.
+INSTRUMENT_EPOCH = 1787530083
 
 #: THE WORKLOAD IS PART OF THE INSTRUMENT TOO, AND ITS NAME DOES NOT CHANGE WHEN IT DOES.
 #:
