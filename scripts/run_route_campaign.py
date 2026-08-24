@@ -87,6 +87,24 @@ GOALS = [
 #: worthless: every calibration measured so far was measured ON it, and a floor derived from
 #: one workload says nothing about another. Deleting it would leave those numbers describing a
 #: goal set nobody could look at.
+def _code_revision():
+    """HEAD's short hash plus a dirty marker, or "" if git cannot answer. Never raises."""
+    import subprocess
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        rev = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=root,
+                             capture_output=True, text=True, timeout=15)
+        if rev.returncode != 0:
+            return ""
+        head = (rev.stdout or "").strip()
+        st = subprocess.run(["git", "status", "--porcelain"], cwd=root,
+                            capture_output=True, text=True, timeout=20)
+        dirty = bool((st.stdout or "").strip()) if st.returncode == 0 else True
+        return head + ("+dirty" if dirty else "")
+    except Exception:
+        return ""
+
+
 def active_goals(argv=None):
     """(goals, name, arm_reset). `arm_reset` runs between arms, or None if the set needs none.
 
@@ -202,6 +220,11 @@ def main():
     out = evaluate(candidate, exp)
     out["wall_s"] = round(time.time() - t0, 1)
     out["version"] = version
+    # THE CANDIDATE'S PROGRAM CAN CHANGE UNDER A MULTI-NIGHT SERIES. Another session edits this
+    # tree while runs happen, so a socket arm on one night is not necessarily the socket arm of
+    # the next. The revision is recorded per run: a series that spans a change to the route, the
+    # fleet or the sampler is not one series, and without this nothing would say so.
+    out["revision"] = _code_revision()
     out["max_concurrent"] = max_conc
     out["sidepage_reserve"] = os.environ.get("SWE_SIDEPAGE_RESERVE", "1")
     out["goals"] = goals_name

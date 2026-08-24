@@ -106,6 +106,7 @@ def load(results_dir: str = None) -> list:
             # Absent in runs recorded before the knob was written down; those all ran at 2/"1".
             "max_concurrent": rec.get("max_concurrent", 2),
             # Absent before the sampler was scoped; those runs measured every Edge on the box.
+            "revision": str(rec.get("revision") or ""),
             "memory_population": str((rec.get("control") or {}).get("memory_population")
                                      or "all-edge-unscoped"),
             "sidepage_reserve": str(rec.get("sidepage_reserve", "1")),
@@ -197,6 +198,22 @@ def separation(null_gains, treatment_gains) -> dict:
             "min_p": round(1.0 / math.comb(len(pool), n), 4),
             "n_null": len(a), "n_treatment": len(b),
             "observed": round(observed, 1)}
+
+
+def revisions(runs) -> list:
+    """The distinct code revisions a column spans, newest last.
+
+    NOT a filter. A series that spans a change to the route, the fleet or the sampler is not
+    one series, but which changes matter is a judgement -- a docstring edit is not a new
+    instrument and an admission rule is. So this reports the span and a human decides, rather
+    than silently splitting columns on every commit.
+    """
+    out = []
+    for r in runs:
+        rev = r.get("revision") or ""
+        if rev and rev not in out:
+            out.append(rev)
+    return out
 
 
 def report(results_dir: str = None) -> str:
