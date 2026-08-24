@@ -1467,11 +1467,30 @@ class RelayWorker:
             # THE POSITIVE EXAMPLES TOO. A record of only the failures teaches a classifier
             # that everything fails; the goals that went the whole way over a socket are half
             # the training set and they are only knowable here, at the end.
+            # WHICH CONVERSATION THIS WAS. Recorded here because this is the only moment the
+            # worker still holds the driver, and because a follow-up instruction after a fleet
+            # run had nothing to reattach to: the socket route left no identity at all, so
+            # every later question started a conversation that had never heard the first one.
+            # The server keeps the history keyed by this id -- turn two arrives on a different
+            # socket and still continues -- so the key is the whole of what was missing.
+            #
+            # Recording only. Nothing reads it yet: whether the client-proposed id or the one
+            # the backend answers with is the one to reuse is a question this data is meant to
+            # settle, and reusing one before that is answered is how "it worked, but it was a
+            # different conversation" gets shipped.
+            ids = {}
+            try:
+                if getattr(self, "socket", False) and self.drv is not None:
+                    ids = self.drv.conversation_ids() or {}
+            except Exception:
+                ids = {}
             _socket_route().record(
                 "worker_done", worker=self.name, goal=(self.goal or "")[:600],
                 route=("socket" if getattr(self, "socket", False) else "tab"),
                 fell_back=bool(getattr(self, "_socket_fell_back", False)),
                 turns=self.turn, outcome=self.outcome, status=self.status,
+                conv_client=ids.get("client", ""), conv_server=ids.get("server", ""),
+                conv_session=ids.get("session", ""),
                 reason=(self.reason or "")[:200])
         except Exception:
             pass

@@ -117,8 +117,26 @@ class CopilotSocketDriver:
             with self._lock:
                 self._partial = sofar
 
+        # WHAT ELSE ARRIVED, so an empty answer can say what it was instead of only that it
+        # was empty. The backend delivers tool authorisation and confirmation as their own
+        # message types; this reader keeps them out of the prose, which is right, but dropping
+        # them entirely left the one case that matters -- a completed turn carrying a consent
+        # card and no text -- indistinguishable from a model that simply said nothing.
+        seen_types = []
+
+        def on_progress(item):
+            try:
+                mt = str((item or {}).get("type") or "")
+                origin = str((item or {}).get("origin") or "")
+                tag = mt + (("/" + origin) if origin else "")
+                if tag and tag not in seen_types:
+                    seen_types.append(tag)
+            except Exception:
+                pass
+
         try:
             answer = self.conv.ask(text, connect=self._connect, on_text=on_text,
+                                   on_progress=on_progress,
                                    catalogue=self._catalogue, protocol=self._protocol,
                                    run_tool=self._run_tool)
         except Exception as exc:
@@ -133,7 +151,12 @@ class CopilotSocketDriver:
             # deliberately does not treat as prose -- so a consent card arrives here as an
             # empty answer. A tab can show that card and be clicked; a socket cannot. Falling
             # back is therefore the correct move, not an error to swallow.
-            self.failed = "the turn completed but carried no text (a card the tab can show?)"
+            # Name the message types that DID arrive. Until the consent path is exercised
+            # deliberately, nobody knows which of these a lapse produces -- so the honest move
+            # is to record what was there and let the first real occurrence say.
+            self.failed = ("the turn completed but carried no text (a card the tab can show?)"
+                           + ((" -- frames: " + ", ".join(seen_types[:6])) if seen_types
+                              else " -- no non-chat frames either"))
             return
         with self._lock:
             self._last = clean
@@ -173,6 +196,32 @@ class CopilotSocketDriver:
     def _accept_new_reply(self, text: str) -> None:
         self._last_returned_reply = text
         self._accepted_at = self._answers_done
+
+    def conversation_ids(self) -> dict:
+        """Which conversation this driver has been talking to. Never raises.
+
+        NOT PERSISTENCE -- just the ability to be asked. A socket worker used to end without
+        leaving any trace of which conversation it had held, so a follow-up instruction could
+        only start a new one: 531 of the 542 sessions on this machine carry no way back to the
+        conversation they were about. The server keeps the history; what was being thrown away
+        was the key to it.
+
+        Both ids are exposed because it is not yet established that they agree. The client
+        proposes one in the URL and the backend answers with one in the frames, and
+        conversation_id_of already suspects they can differ -- "a backend that did not create
+        the conversation will not continue it". Recording both is how that gets answered from
+        operational data instead of from a guess.
+        """
+        try:
+            c = self.conv
+            return {
+                "client": str(getattr(c, "conversation_id", "") or ""),
+                "server": str(getattr(c, "server_conversation_id", "") or ""),
+                "session": str(getattr(c, "session_id", "") or ""),
+                "turns": int(getattr(c, "turns", 0) or 0),
+            }
+        except Exception:
+            return {}
 
     def conversation_title(self) -> str:
         """No tab, so no title strip to scrape. The caller falls back to the goal text."""

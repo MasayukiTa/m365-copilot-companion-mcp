@@ -2905,7 +2905,32 @@ class Handler(BaseHTTPRequestHandler):
                 _queue_input_locked(sid, msg)
             except Exception as e:
                 self._json({"ok": False, "error": str(e)}); return
-            self._json({"ok": True, "queued": True, "sid": sid})
+            # SAY WHETHER ANYONE IS COMING FOR IT. "ok: true, queued: true" is the truth about
+            # this endpoint and a lie about the operator's message: the queue is drained only
+            # by a running /goal loop at its next turn boundary, or by a /stream turn right
+            # after it finishes. With neither running, a message sits here indefinitely -- one
+            # of them has been sitting in this store since 07-07, in a session still marked
+            # active, which is what "I typed into main and nothing happened" looks like from
+            # the inside.
+            #
+            # PAGE_LOCK is the honest signal: every path that drains this queue holds it for
+            # the duration, and nothing else does. Reported rather than acted on -- promoting
+            # an idle /send into a turn means touching the page while a person may be using
+            # it, which is a separate decision with its own risks.
+            consumer_running = PAGE_LOCK.locked()
+            try:
+                depth = len((S.load(sid) or {}).get("pending") or [])
+            except Exception:
+                depth = -1
+            self._json({
+                "ok": True, "queued": True, "sid": sid,
+                "consumer_running": consumer_running,
+                "queue_depth": depth,
+                "note": ("a run is in progress; this will be injected at its next turn boundary"
+                         if consumer_running else
+                         "NOTHING IS RUNNING -- nobody will pick this up until a /stream turn "
+                         "or a /goal run starts. It stays queued until then."),
+            })
             return
         if parsed.path == "/history":      # scrape ALL turns of a conversation in order
             if not PAGE_LOCK.acquire(blocking=False):
