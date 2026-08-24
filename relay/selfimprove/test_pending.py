@@ -205,3 +205,42 @@ def test_the_repo_wide_fixture_keeps_tests_out_of_the_live_queue():
 def test_this_suite_is_not_writing_to_the_real_queue():
     """Belt and braces: the fixture above redirects it, and this asserts the redirection took."""
     assert "live_records" in P.QUEUE_PATH or "Temp" in P.QUEUE_PATH or "tmp" in P.QUEUE_PATH.lower()
+
+
+def test_a_refused_proposal_comes_back_after_it_was_dropped():
+    """"Not now, revisit later" is an answer about today. The first version skipped whenever a
+    queued row existed at all, so refuse -> drop -> refused again a week later vanished in
+    silence: the exact failure this queue exists to end, rebuilt inside it."""
+    pid = P.add(FILES, REASON)
+    P.resolve(pid, authorization="今はやらない（後で見直す）", status=P.DROPPED)
+    assert P.items() == []
+    again = P.add(FILES, REASON)
+    assert again == pid
+    assert [i["id"] for i in P.items()] == [pid]
+    assert P.items()[0]["status"] == P.OPEN
+
+
+def test_it_comes_back_after_it_was_done_too():
+    """A change that was made and then reverted upstream can be proposed again."""
+    pid = P.add(FILES, REASON)
+    P.resolve(pid, authorization="やった", status=P.DONE)
+    P.add(FILES, REASON)
+    assert P.items()[0]["status"] == P.OPEN
+
+
+def test_reviving_it_does_not_duplicate_it(queue):
+    pid = P.add(FILES, REASON)
+    P.resolve(pid, status=P.DROPPED, authorization="いらない")
+    P.add(FILES, REASON)
+    P.add(FILES, REASON)          # a retry of the revived one is not a new decision
+    assert len(P.items()) == 1
+    lines = [l for l in queue.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(lines) == 3, "queued, resolved, queued -- and no more"
+
+
+def test_status_of_agrees_with_items_about_which_ask_is_latest():
+    pid = P.add(FILES, REASON)
+    P.resolve(pid, status=P.DROPPED, authorization="x")
+    assert P.status_of(pid) == P.DROPPED
+    P.add(FILES, REASON)
+    assert P.status_of(pid) == P.OPEN

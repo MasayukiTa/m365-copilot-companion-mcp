@@ -450,12 +450,12 @@ def run_goal(client, text: str, kbd_q, out=None, stop_grace: float = 60.0,
                     # the case that mattered -- nothing running, so no next turn -- it was the
                     # wrong one. The endpoint reports whether anything is coming for it.
                     res = client.send(sid, k)
-                    if res.get("promoted"):
-                        out.write("[sent -- a turn was started for it]\n")
-                    elif res.get("consumer_running"):
-                        out.write("[queued -- injected at the next turn boundary]\n")
-                    else:
+                    if not res.get("promotion_attempted"):
                         out.write("[queued -- nothing is running to pick it up]\n")
+                    elif res.get("page_busy"):
+                        out.write("[queued -- will run as soon as the page is free]\n")
+                    else:
+                        out.write("[queued -- running it now]\n")
                 except Exception as e:
                     out.write(f"[send failed: {e}]\n")
                 out.flush()

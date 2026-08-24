@@ -941,3 +941,73 @@ def test_a_fresh_worker_asks_for_no_conversation(monkeypatch):
     w = _worker()
     assert w.attach(object(), "agent-url") is True
     assert seen.get("conversation_id") == ""
+
+
+def test_a_conversation_id_resume_with_no_socket_opens_the_agent_not_the_guid(monkeypatch):
+    """`open_url` is resume_conv, so a conversation-id resume that could not get a socket
+    would have handed a bare guid to goto(), failed all three attempts and lost the goal --
+    and _agent_url kept the same value, so a mid-run fallback would open the same nonsense."""
+    opened = {}
+
+    monkeypatch.setattr(rf, "_socket_route",
+                        lambda: type("R", (), {"driver_for": lambda self, n, **kw: None})())
+
+    def _fresh(ctx, url):
+        opened["url"] = url
+        return object()
+
+    monkeypatch.setattr(rf, "_open_fresh", _fresh)
+    w = _worker()
+    w.resume_conv = "4fe936fd-d902-497d-bc89-a2ad4ceb699c"
+    w.attach(object(), "https://agent.example/chat")
+    assert opened["url"] == "https://agent.example/chat"
+    assert w.socket is False
+
+
+def test_a_url_resume_still_opens_that_url(monkeypatch):
+    """The fix above must not turn a working tab resume into a fresh conversation."""
+    opened = {}
+    monkeypatch.setattr(rf, "_open_fresh",
+                        lambda ctx, url: opened.setdefault("url", url) or object())
+    w = _worker()
+    w.resume_conv = "https://example/chat/4fe936fd-d902-497d-bc89-a2ad4ceb699c"
+    w.attach(object(), "https://agent.example/chat")
+    assert opened["url"] == "https://example/chat/4fe936fd-d902-497d-bc89-a2ad4ceb699c"
+
+
+def test_the_lost_context_is_announced(monkeypatch, capsys):
+    """A follow-up that quietly became a fresh conversation answers plausibly and wrongly."""
+    monkeypatch.setattr(rf, "_socket_route",
+                        lambda: type("R", (), {"driver_for": lambda self, n, **kw: None})())
+    monkeypatch.setattr(rf, "_open_fresh", lambda ctx, url: object())
+    w = _worker()
+    w.resume_conv = "4fe936fd-d902-497d-bc89-a2ad4ceb699c"
+    w.attach(object(), "https://agent.example/chat")
+    assert "will NOT see the earlier conversation" in capsys.readouterr().out
+
+
+def test_a_mid_run_fallback_never_reopens_a_bare_conversation_id(monkeypatch):
+    """_agent_url used to be assigned before the transport was decided, so a conversation-id
+    resume left a bare guid in it -- and _fall_back_to_tab reopens exactly that."""
+    monkeypatch.setattr(rf, "_socket_route",
+                        lambda: type("R", (), {"driver_for": lambda self, n, **kw: None})())
+    monkeypatch.setattr(rf, "_open_fresh", lambda ctx, url: object())
+    w = _worker()
+    w.resume_conv = "4fe936fd-d902-497d-bc89-a2ad4ceb699c"
+    w.attach(object(), "https://agent.example/chat")
+    assert w._agent_url == "https://agent.example/chat"
+
+
+def test_a_socket_resume_leaves_a_reopenable_url_behind(monkeypatch):
+    """The socket worker may still fall back mid-run; what it falls back TO has to be a page."""
+    drv = _FakeDrv()
+    monkeypatch.setattr(rf, "_socket_route",
+                        lambda: type("R", (), {"driver_for": lambda self, n, **kw: drv})())
+    monkeypatch.setattr(rf, "_open_fresh", lambda ctx, url: pytest.fail("no tab expected"))
+    w = _worker()
+    w.resume_conv = "4fe936fd-d902-497d-bc89-a2ad4ceb699c"
+    w.attach(object(), "https://agent.example/chat")
+    assert w.socket is True
+    # Named exactly. "" also passes a not-a-guid check, and "" means "a fresh independent
+    # chat" -- which is the silent context loss this change exists to stop.
+    assert w._agent_url == "https://agent.example/chat"

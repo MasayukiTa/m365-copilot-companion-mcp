@@ -352,6 +352,13 @@ class SocketRoute:
             # constructor so that "start a conversation" stays the default and continuing one
             # is something a caller has to ask for by name.
             conv.conversation_id = str(conversation_id)
+            # AND THE FRAME MUST NOT CLAIM OTHERWISE. `started` defaults to turns == 0, so a
+            # rehydrated conversation announced isStartOfSession on the very turn that was
+            # continuing an existing one. Measured harmless today, and the docstring above
+            # said the frame would stay truthful anyway -- it was not. A protocol that
+            # refuses frames whose fields disagree is one bad assumption away from refusing
+            # this, and the assumption costs nothing to remove.
+            conv.turns = max(1, int(getattr(conv, "turns", 0) or 0))
         return CopilotSocketDriver(conv, connect=self._connect_fn)
 
 

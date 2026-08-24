@@ -100,8 +100,13 @@ def add(files, reason: str, *, diff: str = "", command: str = "", detail: str = 
     """
     try:
         pid = _key(files, reason)
-        if any(r.get("id") == pid and r.get("event") == "queued" for r in _rows()):
-            return pid                      # already standing; retrying is not a new decision
+        # ALREADY STANDING, not ever seen. The first version skipped whenever a queued row
+        # existed at all, so a proposal that had been answered could never come back: refuse
+        # it, drop it as "not now", have it refused again a week later, and it vanished in
+        # silence -- which is the exact failure this queue was built to end. "Not now" is an
+        # answer about today, and one of the two rejection phrases says so in as many words.
+        if status_of(pid) in LIVE:
+            return pid                      # retrying is not a new decision
         _append({
             "event": "queued",
             "id": pid,
@@ -129,8 +134,8 @@ def status_of(pid: str) -> str:
     for r in _rows():
         if r.get("id") != pid:
             continue
-        if r.get("event") == "queued" and not state:
-            state = OPEN
+        if r.get("event") == "queued":
+            state = OPEN                    # a fresh ask, whatever was decided before it
         elif r.get("event") == "resolved":
             state = r.get("status") or DONE
     return state
@@ -147,9 +152,13 @@ def items(include_resolved: bool = False) -> list:
     order = []
     for r in _rows():
         pid = r.get("id")
-        if r.get("event") == "queued" and pid not in queued:
+        if r.get("event") == "queued":
+            # A LATER ASK REVIVES IT. Replayed in file order, so a queued row that comes
+            # after a resolution puts the proposal back on the list rather than being
+            # discarded as a duplicate of something already decided.
+            if pid not in queued:
+                order.append(pid)
             queued[pid] = dict(r, status=OPEN)
-            order.append(pid)
         elif r.get("event") == "resolved" and pid in queued:
             queued[pid]["status"] = r.get("status") or DONE
             queued[pid]["resolved_ts"] = r.get("ts")

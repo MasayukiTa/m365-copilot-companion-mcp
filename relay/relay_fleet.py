@@ -1332,6 +1332,38 @@ class RelayWorker:
         self.max_redirect_renavs = 3        # cap re-navs PER TURN so we never loop forever
         self._redirect_renavs = 0           # re-navs spent on the CURRENT turn
         self.name = name
+
+        # AND THE ENTRY POINT, which is what was missing.
+        #
+        # Placed AFTER self.name, not beside the resume_conv it feeds. The first version
+        # sat with the other goal fields and named the worker in its own warning, and
+        # self.name is assigned further down -- so the only path that printed anything
+        # raised AttributeError instead. That path is the one where a follow-up finds
+        # nothing to continue, which is exactly when a person needs to be told. The identity was being recorded and
+        # the socket could be told to continue a conversation, but nothing put anything into
+        # resume_conv -- so end to end, a follow-up still started a conversation that had never
+        # heard the first one. That is the same "capability with no caller" this repository
+        # keeps producing, and building the parts without the entry is how it happens.
+        #
+        # `follow_up_to` names the EARLIER GOAL by its text, which is already this system's
+        # identifier for a worker: the transcript key and the replay envelope. Resolved once,
+        # here, so a goal file can say "continue what that one was doing".
+        #
+        # Deliberately explicit rather than "the same goal text resumes itself". Re-running a
+        # goal is a fresh attempt, and silently continuing the old conversation would carry an
+        # earlier run's mistakes into it while looking like a clean start.
+        if not self.resume_conv and isinstance(goal, dict) and goal.get("follow_up_to"):
+            try:
+                found = _socket_route().conversation_for_goal(str(goal["follow_up_to"]))
+            except Exception:
+                found = ""
+            if found:
+                self.resume_conv = found
+            else:
+                # Said out loud. A follow-up that silently became a fresh conversation is
+                # exactly the failure being fixed, and it answers plausibly either way.
+                print("[fleet] %s: follow_up_to had no recorded conversation; starting a "
+                      "fresh one" % self.name, flush=True)
         self.conv_url = ""         # filled once the conversation gets its /conversation/<id>
         self.conv_title = ""       # Copilot's auto-generated chat title (best-effort scrape)
         self.steer_msgs = []       # user steering messages to inject on the next turn(s)
@@ -1476,11 +1508,14 @@ class RelayWorker:
         instead of a fresh agent chat; re-navs then return to that conversation too."""
         self._context = context
         open_url = self.resume_conv or agent_url
-        self._agent_url = open_url
         # A SOCKET IF ONE IS ON OFFER, A TAB OTHERWISE. Nothing downstream branches on this:
-        # the socket driver answers to the same names, so the turn loop cannot tell. A worker
-        # RESUMING a named conversation is never offered one -- resume means "reopen that URL",
-        # and a socket has no URL to reopen.
+        # the socket driver answers to the same names, so the turn loop cannot tell.
+        #
+        # A resume target is either a page or a conversation. A URL means "reopen that page"
+        # and takes the tab; a bare conversation id means "continue that conversation", which
+        # is a socket and has no page to reopen. _agent_url is set further down, AFTER that is
+        # decided -- it used to be assigned here, so a conversation-id resume left a bare guid
+        # in it and a mid-run fallback to a tab would have tried to open it as a URL.
         # WHICH TRANSPORT THIS GOAL SHOULD USE, asked before one is requested. Until now the
         # answer was "a socket whenever the route offers one", which sends Work IQ goals over
         # a transport that cannot reach Work IQ and relies on the fallback to notice -- and
@@ -1503,12 +1538,34 @@ class RelayWorker:
         # the single generation point this repository has been moving towards, and a resume
         # that quietly bypassed it is exactly the fault just fixed in the bridge.
         resume_id = _conversation_id_or_empty(self.resume_conv)
+        # WHAT A LATER FALLBACK SHOULD REOPEN, decided before either branch is taken. A socket
+        # worker can still fall back mid-run, and it returns below without touching this -- so
+        # a socket resume left _agent_url at "", which means "a fresh independent chat". The
+        # fallback would then silently drop the very context the follow-up was for.
+        self._agent_url = agent_url if resume_id else open_url
         if want_socket and (not self.resume_conv or resume_id):
             drv = _socket_route().driver_for(self.name, conversation_id=resume_id)
             if drv is not None:
                 self.page, self.drv, self.socket = None, drv, True
                 self.status = "ready"
                 return True
+
+        # A CONVERSATION ID IS NOT A URL, and everything below opens one. `open_url` is
+        # resume_conv, so a conversation-id resume that could not get a socket -- policy chose
+        # a tab, the route is closed, the token expired -- would hand a bare guid to goto(),
+        # fail all three attempts and lose the goal. The same value is kept as _agent_url, so
+        # a mid-run fallback would have opened the same nonsense.
+        #
+        # The route's standing invariant is that losing it costs speed, never capability. So
+        # the tab opens the agent surface instead. What that DOES cost is the context the
+        # follow-up existed for, and that is said out loud rather than discovered later in an
+        # answer that reads as though the earlier conversation never happened.
+        if resume_id:
+            print("[fleet] %s: no socket for a conversation-id resume; opening a fresh tab "
+                  "instead -- this follow-up will NOT see the earlier conversation"
+                  % self.name, flush=True)
+            open_url = agent_url
+
         try:
             self.page = _open_fresh(context, open_url)
             self.drv = CopilotWebDriver(self.page)
@@ -1560,7 +1617,10 @@ class RelayWorker:
             except Exception:
                 ids = {}
             _socket_route().record(
-                "worker_done", worker=self.name, goal=(self.goal or "")[:600],
+                # strip()[:600] on BOTH sides. conversation_for_goal strips before comparing,
+                # so a goal with leading whitespace was recorded under a key its own lookup
+                # could never produce.
+                "worker_done", worker=self.name, goal=(self.goal or "").strip()[:600],
                 route=("socket" if getattr(self, "socket", False) else "tab"),
                 fell_back=bool(getattr(self, "_socket_fell_back", False)),
                 turns=self.turn, outcome=self.outcome, status=self.status,

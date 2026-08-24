@@ -621,6 +621,12 @@ def _consent_surface_attempt(detail: str = "") -> bool:
 # guarantees that by construction -- only one fn runs on the page thread at a time). /goal,
 # /stream, /new, /resume, /switch, /history try-acquire it (non-blocking) and return
 # {"ok":false,"error":"busy"} immediately if another PAGE-touching request already holds it.
+#: How long a promoted /send waits for the page before leaving the message queued. Long
+#: enough to outlast the idle tool probe (30-180s), which is the thing most likely to be
+#: holding the page at the moment somebody types; short enough that a hung run does not leave
+#: a thread waiting on it for the rest of the day.
+SEND_PROMOTION_WAIT_S = 300.0
+
 PAGE_LOCK = threading.Lock()
 # Guards S.queue_input/S.pop_input call sites in THIS process (session_store.py itself is
 # untouched/unlocked -- its atomic os.replace() writes are safe across processes, but within one
@@ -1340,6 +1346,11 @@ def _current_row_guid():
 # worse than no resume, so no "most recent entry" or stale-marker fallback is allowed.
 
 # All GUID-shaped sidebar row ids currently in the DOM (any state, not just aria-current).
+# RETURNS BOTH COUNTS, because the difference between them is the whole point. The first
+# version returned only the matching ids, so "the page has no conversations yet" and "nothing
+# on this page has an id at all" arrived here identically -- and the blindness warning added
+# to tell them apart was reading the already-filtered list. A signed-in page with no
+# conversations would have reported the markup as broken.
 _ALL_ROW_GUIDS_JS = r"""
 () => {
   var out = [];
@@ -1350,7 +1361,7 @@ _ALL_ROW_GUIDS_JS = r"""
       out.push(id);
     }
   }
-  return out;
+  return {elementsWithId: rows.length, guids: out};
 }
 """
 
@@ -1360,10 +1371,13 @@ def _known_conv_guids():
     the SPA's localStorage history cache. Used for the capture baseline and for detecting a
     newly appeared conversation. Never raises; partial results on error."""
     guids = set()
-    rows = 0
+    #: -1 = the page could not be asked at all, which is a different thing again from a page
+    #: that answered "no elements carry an id".
+    elements_with_id = -1
     try:
-        for g in (PAGE.evaluate(_ALL_ROW_GUIDS_JS) or []):
-            rows += 1
+        res = PAGE.evaluate(_ALL_ROW_GUIDS_JS) or {}
+        elements_with_id = int(res.get("elementsWithId") or 0)
+        for g in (res.get("guids") or []):
             if BARE_GUID_RE.match(g or ""):
                 guids.add(g)
     except Exception:
@@ -1374,11 +1388,19 @@ def _known_conv_guids():
     # page read as an ordinary quiet result. Zero rows is not a quiet result: the sidebar of a
     # signed-in session always has some. Measured: 542 sessions, 11 with a conversation
     # reference, none since 07-08.
-    if rows == 0:
-        logger.warning("conversation capture is BLIND: no element on the page has a "
-                       "guid-shaped id. The sidebar markup has changed and _ALL_ROW_GUIDS_JS "
-                       "no longer matches it -- every session captured from now on will have "
-                       "an empty conv_url and cannot be resumed.")
+    if elements_with_id == 0:
+        # No element on the page carries an id at all. A rendered, signed-in page always has
+        # some, so this is the scraper looking at something it does not recognise.
+        logger.warning("conversation capture is BLIND: nothing on the page carries an id. "
+                       "The markup this reads has changed -- every session captured from now "
+                       "on will have an empty conv_url and cannot be resumed.")
+    elif elements_with_id > 0 and not guids:
+        # Ids exist and none is a conversation guid. Either the row ids stopped being guids --
+        # which is exactly the July regression -- or the account genuinely has no conversations
+        # yet. This cannot tell those apart on its own, and says so rather than picking one.
+        logger.info("conversation capture found %d elements with an id and no conversation "
+                    "guid among them: either this account has no conversations yet, or the "
+                    "row ids have stopped being guids.", elements_with_id)
     try:
         for it in (PAGE.evaluate(_INSIGHTS_JS) or []):
             g = (it.get("conversationId") or "").strip()
@@ -2938,6 +2960,14 @@ class Handler(BaseHTTPRequestHandler):
             # the duration, and nothing else does. Reported rather than acted on -- promoting
             # an idle /send into a turn means touching the page while a person may be using
             # it, which is a separate decision with its own risks.
+            # THE LOCK IS NOT THE CONSUMER. Every path that drains this queue holds
+            # PAGE_LOCK, but so do the idle tool probe and /history, and neither drains
+            # anything. The probe runs for 30-180 seconds and only when the machine is idle --
+            # which is precisely when a promoted send is needed -- so reading the lock here
+            # answered "a run is in progress, it will be injected at its next turn boundary"
+            # about a probe that will never look at the queue, and the message went back to
+            # sitting there in silence. That is the failure this endpoint was just fixed for,
+            # rebuilt out of a different wrong signal.
             consumer_running = PAGE_LOCK.locked()
             try:
                 depth = len((S.load(sid) or {}).get("pending") or [])
@@ -2956,33 +2986,39 @@ class Handler(BaseHTTPRequestHandler):
             # typing at the REPL, and there is no loop -- one drain pass, then idle again. That
             # is deliberately not a background drainer: a daemon that dies leaves exactly
             # today's silence while the interface reports itself healthy.
-            promoted = False
-            if not consumer_running:
-                def _promote():
-                    # Re-checked here, not above: between the test and this thread starting,
-                    # a /goal or /stream may have taken the page. Losing the race means the
-                    # message stays queued, which is the old behaviour and is safe.
-                    if not PAGE_LOCK.acquire(blocking=False):
-                        return
-                    try:
-                        run_on_page_thread(self._drain_pending_queue, sid)
-                    except Exception:
-                        logger.warning("promoted /send failed for sid=%s", sid, exc_info=True)
-                    finally:
-                        PAGE_LOCK.release()
+            # So the promotion is attempted WHATEVER holds the lock, and waits for it rather
+            # than giving up the instant it is busy. Giving up instantly was the same bug in
+            # its other direction: a probe holding the page for two minutes meant the send was
+            # dropped on the floor with "promoted: true" already reported.
+            def _promote():
+                # Bounded. If the page is still busy after this, the message stays queued and
+                # the reply above already said that could happen -- better than a thread that
+                # waits forever for a run that has hung.
+                if not PAGE_LOCK.acquire(timeout=SEND_PROMOTION_WAIT_S):
+                    logger.info("promoted /send gave up waiting for the page (sid=%s); the "
+                                "message stays queued", sid)
+                    return
+                try:
+                    run_on_page_thread(self._drain_pending_queue, sid)
+                except Exception:
+                    logger.warning("promoted /send failed for sid=%s", sid, exc_info=True)
+                finally:
+                    PAGE_LOCK.release()
 
-                threading.Thread(target=_promote, name="send-promote", daemon=True).start()
-                promoted = True
+            threading.Thread(target=_promote, name="send-promote", daemon=True).start()
 
             self._json({
                 "ok": True, "queued": True, "sid": sid,
-                "consumer_running": consumer_running,
-                "promoted": promoted,
+                # Renamed from "promoted", which claimed an outcome this reply cannot know:
+                # the turn begins on another thread, after this response has been written.
+                "promotion_attempted": True,
+                "page_busy": consumer_running,
                 "queue_depth": depth,
-                "note": ("a run is in progress; this will be injected at its next turn boundary"
+                "note": ("queued, and a turn will be run for it as soon as the page is free "
+                         "(something is using it right now). If it is still busy in %d seconds "
+                         "this stays queued." % int(SEND_PROMOTION_WAIT_S)
                          if consumer_running else
-                         "nothing was running, so a turn was started for this. If another "
-                         "request claimed the page first it stays queued instead."),
+                         "queued, and a turn is being run for it now."),
             })
             return
         if parsed.path == "/history":      # scrape ALL turns of a conversation in order

@@ -23,27 +23,36 @@ def _send_branch() -> str:
     return body[:body.index('if parsed.path == "/history":')]
 
 
-def test_the_reply_says_whether_anyone_is_coming_for_it():
+def test_the_reply_says_whether_the_page_is_busy_not_who_holds_it():
+    """The lock is not the consumer. The idle tool probe and /history hold it too and neither
+    drains anything -- and the probe runs only when the machine is idle, which is exactly when
+    a promoted send is needed. Reading the lock as "a run is in progress" answered about a
+    probe that would never look at the queue."""
     body = _send_branch()
-    assert '"consumer_running": consumer_running' in body
+    assert '"page_busy": consumer_running' in body
     assert "PAGE_LOCK.locked()" in body
+    assert "THE LOCK IS NOT THE CONSUMER" in body
 
 
-def test_the_idle_case_says_what_happened_and_not_only_a_flag():
-    """A boolean nobody renders is the same silence in a different shape."""
+def test_the_reply_does_not_claim_an_outcome_it_cannot_know():
+    """The turn begins on another thread, after this response has been written. "promoted:
+    true" asserted that it had started, and the send was sometimes dropped on the floor."""
     body = _send_branch()
-    assert "a turn was started for this" in body
-    assert "it stays queued instead" in body
+    assert '"promotion_attempted": True' in body
+    # The comment explains what the key used to be called; the CODE must not use it.
+    code = chr(10).join(l.split("#")[0] for l in body.splitlines())
+    assert '"promoted"' not in code
+    assert "a turn is being run for it now" in body
 
 
-def test_an_idle_send_starts_a_turn():
-    """Queuing was always correct; waiting to be noticed was not. Approved by the operator
-    after being told what it changes: a turn can begin at the moment they send, on a page
-    they may be using."""
+def test_a_send_always_attempts_a_turn():
+    """Queuing was always correct; waiting to be noticed was not. Attempted whatever holds the
+    lock: giving up when it was busy was the same bug facing the other way, since the thing
+    most likely to be holding it is a probe that will never drain the queue."""
     body = _send_branch()
-    assert "if not consumer_running:" in body
+    assert "if not consumer_running:" not in body
     assert "run_on_page_thread(self._drain_pending_queue, sid)" in body
-    assert '"promoted": promoted' in body
+    assert "threading.Thread(target=_promote" in body
 
 
 def test_the_promotion_is_bounded_to_the_moment_of_sending():
@@ -56,12 +65,25 @@ def test_the_promotion_is_bounded_to_the_moment_of_sending():
     assert body.count("threading.Thread") == 1
 
 
-def test_losing_the_race_for_the_page_leaves_it_queued():
-    """Between the test above and the thread starting, a /goal or /stream may take the page.
-    That is the old behaviour and it is safe; taking the page from them is not."""
+def test_it_waits_for_the_page_rather_than_giving_up_instantly():
+    """A probe holds the page for up to three minutes. Giving up the moment it is busy meant
+    the message was dropped while the reply had already reported it started."""
     body = _send_branch()
-    assert "if not PAGE_LOCK.acquire(blocking=False):" in body
+    assert "PAGE_LOCK.acquire(timeout=SEND_PROMOTION_WAIT_S)" in body
     assert "PAGE_LOCK.release()" in body
+
+
+def test_the_wait_is_bounded_and_says_what_it_costs():
+    """A thread waiting forever on a hung run is its own outage."""
+    body = _send_branch()
+    assert "the message stays queued" in body
+    assert "SEND_PROMOTION_WAIT_S" in SOURCE.split("PAGE_LOCK = threading.Lock()")[0]
+
+
+def test_giving_up_is_recorded_rather_than_silent():
+    body = _send_branch()
+    i = body.index("PAGE_LOCK.acquire(timeout=SEND_PROMOTION_WAIT_S)")
+    assert "logger.info" in body[i:i + 400]
 
 
 def test_a_promoted_turn_that_throws_does_not_take_the_lock_with_it():

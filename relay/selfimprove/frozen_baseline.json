@@ -18,7 +18,7 @@
     "relay/selfimprove/manifest.py": "d6e16e6a1dc46f5994037c3c40623796ab6ef4ddf0d58afd52359696c3c1ac46",
     "relay/selfimprove/route_evaluator.py": "1ae754aeeb1ae50e9f1293f4fe6b45fcb18da966de30753f111f7a686d711b10",
     "relay/selfimprove/routing.py": "481015067ae0d4f23208a9859fff5dfb6164e38cb6462028c91be9bd6af1be5d",
-    "relay/socket_route.py": "917878c995cf320b672d3897b2b05bbdd55fad74e26ec27611a1df74200cfa0a",
+    "relay/socket_route.py": "c6835b06906b5c4ef299e598639e6ac5b79c0d6bbd3287f87ce608acb1a84bec",
     "tools/_untrusted.py": "2fe9c6b36a0188775db7de2b55649df3b6d923b97b104701d81e43a1065b59df",
     "tools/folder_policy.py": "d7b4dc0adcd82e8745bba4be1d2f6feea87f3c373d4bb0cac23121e14ebd2717",
     "tools/security.py": "3296cc20d2f810baa01eee793bd9651e65bcd5b60b727bb28cd5d6702175b213"

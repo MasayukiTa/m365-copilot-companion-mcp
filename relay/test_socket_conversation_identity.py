@@ -202,3 +202,96 @@ def test_a_missing_or_torn_log_answers_empty_rather_than_raising(tmp_path):
     route2 = SR.SocketRoute(capture_fn=lambda *a, **k: None,
                             connect_fn=lambda *a, **k: None, log_path=str(torn))
     assert route2.conversation_for_goal("g") == ""
+
+
+# ── the entry point, which is what makes the chain a chain ──────────────────────────
+
+def _worker_with(goal, monkeypatch, found=""):
+    import relay.relay_fleet as RF
+    monkeypatch.setattr(RF, "_socket_route",
+                        lambda: type("R", (), {
+                            "conversation_for_goal": lambda self, g: found})())
+    return RF.RelayWorker(goal, "w1")
+
+
+def test_a_follow_up_resolves_to_the_earlier_conversation(monkeypatch):
+    """The identity was recorded and the socket could be told to continue one, but nothing put
+    anything into resume_conv -- so end to end a follow-up still started a conversation that
+    had never heard the first one."""
+    w = _worker_with({"text": "and now summarise it",
+                      "follow_up_to": "tidy the docs"}, monkeypatch, found="conv-abc")
+    assert w.resume_conv == "conv-abc"
+
+
+def test_an_explicit_resume_conv_wins_over_the_lookup(monkeypatch):
+    w = _worker_with({"text": "x", "follow_up_to": "tidy the docs",
+                      "resume_conv": "given-directly"}, monkeypatch, found="conv-abc")
+    assert w.resume_conv == "given-directly"
+
+
+def test_a_follow_up_with_nothing_recorded_says_so(monkeypatch, capsys):
+    """A follow-up that silently became a fresh conversation is the failure being fixed, and
+    it answers plausibly either way."""
+    w = _worker_with({"text": "x", "follow_up_to": "never ran"}, monkeypatch, found="")
+    assert w.resume_conv is None
+    assert "fresh one" in capsys.readouterr().out
+
+
+def test_re_running_the_same_goal_does_not_resume_itself(monkeypatch):
+    """Re-running a goal is a fresh attempt. Silently continuing the old conversation would
+    carry an earlier run's mistakes into it while looking like a clean start."""
+    w = _worker_with({"text": "tidy the docs"}, monkeypatch, found="conv-abc")
+    assert w.resume_conv is None
+
+
+def test_a_plain_string_goal_still_works(monkeypatch):
+    w = _worker_with("tidy the docs", monkeypatch, found="conv-abc")
+    assert w.resume_conv is None
+
+
+def test_a_lookup_that_raises_does_not_cost_the_goal(monkeypatch):
+    import relay.relay_fleet as RF
+
+    def boom():
+        return type("R", (), {"conversation_for_goal": lambda self, g: (_ for _ in ()).throw(
+            OSError("log unreadable"))})()
+
+    monkeypatch.setattr(RF, "_socket_route", boom)
+    w = RF.RelayWorker({"text": "x", "follow_up_to": "y"}, "w1")
+    assert w.resume_conv is None
+
+
+def test_a_resumed_conversation_does_not_announce_a_new_session():
+    """`started` defaults to turns == 0, so a rehydrated conversation announced
+    isStartOfSession on the very turn that was continuing an existing one. Measured harmless
+    today, and the docstring claimed the frame stayed truthful anyway -- it did not. A
+    protocol that refuses frames whose fields disagree is one assumption away from refusing
+    this, and the assumption costs nothing to drop."""
+    import inspect
+
+    import relay.socket_route as SR
+    src = inspect.getsource(SR.SocketRoute.driver_for)
+    i = src.index("conv.conversation_id = str(conversation_id)")
+    assert "conv.turns = max(1," in src[i:i + 700]
+
+
+def test_a_fresh_conversation_still_starts_at_turn_zero():
+    import inspect
+
+    import relay.socket_route as SR
+    src = inspect.getsource(SR.SocketRoute.driver_for)
+    i = src.index("if conversation_id:")
+    assert "conv.turns" not in src[:i], "only a resume touches the turn count"
+
+
+def test_the_writer_and_the_reader_key_a_goal_the_same_way():
+    """conversation_for_goal strips before comparing, so a goal with leading whitespace was
+    recorded under a key its own lookup could never produce."""
+    from pathlib import Path
+
+    import relay.socket_route as SR
+    fleet = (Path(SR.__file__).parent / "relay_fleet.py").read_text(encoding="utf-8")
+    assert 'goal=(self.goal or "").strip()[:600]' in fleet
+    import inspect
+    lookup = inspect.getsource(SR.SocketRoute.conversation_for_goal)
+    assert 'want = (goal or "").strip()[:600]' in lookup

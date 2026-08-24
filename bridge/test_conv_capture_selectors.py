@@ -50,23 +50,45 @@ def test_the_href_is_not_read_as_a_conversation_id():
         assert ".href" not in _js(name), name
 
 
+def _known_body():
+    body = SOURCE[SOURCE.index("def _known_conv_guids"):]
+    return body[:body.index("\ndef ")]
+
+
 def test_a_blind_scraper_says_so_instead_of_looking_quiet():
     """"No new conversation appeared" and "I cannot see any conversation at all" both ended as
     an empty capture and the same mild log line, so a scraper that had stopped matching the
     page read as an ordinary quiet result -- for six weeks."""
-    body = SOURCE[SOURCE.index("def _known_conv_guids"):]
-    body = body[:body.index("\ndef ")]
-    assert "if rows == 0:" in body
+    body = _known_body()
+    assert "if elements_with_id == 0:" in body
     assert "BLIND" in body
     assert "cannot be resumed" in body
 
 
-def test_the_warning_counts_rows_and_not_matches():
-    """Counting only guid-shaped matches would report blindness whenever a signed-in session
-    simply had no conversations yet."""
-    body = SOURCE[SOURCE.index("def _known_conv_guids"):]
-    body = body[:body.index("\ndef ")]
-    assert "rows += 1" in body
-    i = body.index("rows += 1")
-    j = body.index("if BARE_GUID_RE.match")
-    assert i < j, "the row must be counted before it is filtered"
+def test_the_count_is_of_elements_and_not_of_matches():
+    """The first attempt at this counted the list the JS returns -- which the JS has ALREADY
+    filtered to guid-shaped ids. So a signed-in page with no conversations yet would have been
+    reported as broken markup: the warning added to catch six weeks of blindness would have
+    fired on the one case its own commit message promised to exclude."""
+    js = _js("_ALL_ROW_GUIDS_JS")
+    assert "elementsWithId: rows.length" in js, "the raw count has to come from the page"
+    assert "guids: out" in js
+    body = _known_body()
+    assert 'res.get("elementsWithId")' in body
+    assert 'res.get("guids")' in body
+
+
+def test_ids_present_but_no_guid_among_them_is_not_called_blindness():
+    """It is either an account with no conversations or row ids that stopped being guids, and
+    this cannot tell them apart. Saying so beats picking one."""
+    body = _known_body()
+    assert "elif elements_with_id > 0 and not guids:" in body
+    assert "logger.info" in body
+    assert "no conversations yet" in body
+
+
+def test_a_page_that_cannot_be_asked_is_a_third_case():
+    """evaluate() raising is not the same as the page answering zero, and reporting it as
+    changed markup would name the wrong cause."""
+    body = _known_body()
+    assert "elements_with_id = -1" in body
