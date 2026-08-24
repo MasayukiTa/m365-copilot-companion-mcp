@@ -15,8 +15,13 @@
 // dislike the look -- a coloured bar down the left edge of a block reads as a sticky note.
 // Corrected here rather than only at the call site, because a stale recommendation in the
 // single source of truth is followed again by whoever reads it next. Put the status colour on
-// the text it describes, or in a small chip. RailW survives for the cockpit's run rows, where
-// it is a gutter marking rows in a dense list rather than a decoration on a block.
+// the text it describes, or in a small chip.
+//
+// This paragraph once ended with a carve-out: the cockpit's run rows could keep their rail,
+// "a gutter marking rows in a dense list rather than a decoration on a block". That sentence
+// was mine, not the operator's, and it had exactly the shape of the stale recommendation it
+// was written to replace -- normative text in the single source of truth that the next reader
+// takes for settled policy. The rail is gone and so is the width token; there is no exception.
 //
 // IMPORTANT: this is compiled by legacy csc (Framework64 v4.0.30319, C# 5). NO expression-
 // bodied members, NO string interpolation, NO null-conditional. Classic method bodies only.
@@ -25,6 +30,7 @@ using System.Windows.Media;
 
 static class Theme
 {
+
     // ── primitives ────────────────────────────────────────────────────────────────
     public static Color Col(string hex) { return (Color)ColorConverter.ConvertFromString(hex); }
     public static SolidColorBrush Br(string hex) { return new SolidColorBrush(Col(hex)); }
@@ -48,7 +54,7 @@ static class Theme
     public static string Accent(bool d)        { return d ? "#F97316" : "#D9480F"; }  // primary action ONLY
     public static string AccentSoft(bool d)    { return d ? "#3A2416" : "#FFF1E8"; }  // primary hover / subtle badge
     public static string AccentFg(bool d)      { return "#FFFFFF"; }                  // text on accent fill
-    public static string Success(bool d)       { return d ? "#22C55E" : "#16A34A"; }  // done chip / left rail
+    public static string Success(bool d)       { return d ? "#22C55E" : "#16A34A"; }  // done chip
     public static string Warning(bool d)       { return d ? "#F59E0B" : "#B45309"; }  // needs-attention
     public static string Danger(bool d)        { return d ? "#EF4444" : "#B91C1C"; }  // error
     public static string Info(bool d)          { return d ? "#60A5FA" : "#2563EB"; }  // running / reviewing
@@ -82,7 +88,6 @@ static class Theme
     public const double RadCard     = 8;  // cards
     public const double RadComposer = 10; // composer
     public const double RadPopover  = 10; // modal / popover
-    public const double RailW       = 3;  // card left status rail width
 
     // ── status model ──────────────────────────────────────────────────────────────
     // Canonical status keys (see DeriveStatus in the cockpit) -> visual treatment.

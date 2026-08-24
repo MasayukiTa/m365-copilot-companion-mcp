@@ -2826,7 +2826,13 @@ class CockpitWindow : Window
                 wrap.Margin = new Thickness(10, 10, 8, 0);
                 var pastTag = new TextBlock();
                 pastTag.Text = jaP ? "過去のタスク" : "Past task";
-                pastTag.Foreground = Theme.Br(Theme.Accent(_dark));
+                // NOT Accent. Theme.cs reserves that colour for a primary action -- "primary
+                // action ONLY" is written beside its definition -- and this is a static eyebrow
+                // above a read-only summary. Painting a label in the click-me colour spends the
+                // one colour the eye is trained to look for on something that cannot be clicked,
+                // and it is the only warm thing on that panel, so it takes the attention first.
+                // The emphasis it needs is weight, which it already has.
+                pastTag.Foreground = Theme.Br(Theme.Muted(_dark));
                 pastTag.FontSize = 10; pastTag.FontWeight = FontWeights.SemiBold;
                 pastTag.Margin = new Thickness(0, 0, 0, 2);
                 wrap.Children.Add(pastTag);
@@ -9336,20 +9342,17 @@ class CockpitWindow : Window
         // INFRA_STUCK is carved out of the red attention lane (handled by its own infra branch).
         bool isAttention = !closed && !isInfra && IsAttentionStatus(status);
 
-        string railKind = closed ? "neutral" : (isInfra ? "warning" : Theme.StatusRail(status));
-        Brush statusBrush = Theme.Br(Theme.RailColor(railKind, _dark));
-        // Chip color is computed SEPARATELY from the left rail. A completed worker that has been
-        // released (closed) keeps status=="done"/outcome=="DONE", but `railKind` above forces neutral
-        // (grey) for the rail. The chip, however, must match the History row's done chip
-        // (Theme.StatusRail("done")=="success", green) so "完了" is the same green in both places.
-        // We therefore base chipKind on the status (with an explicit DONE override), not on `closed`.
+        // The chip carries the status. There used to be a 3px coloured rail down the left edge of
+        // every row as well, and removing it cost nothing measurable: the chip sits at a nearly
+        // constant x a few pixels in, so scanning the column for "which row needs me" reads the
+        // chip, not the rail thirty pixels to its left. The rail restated what the chip already
+        // said, in the one shape the operator has objected to for months.
         bool isDone = status == "done" || string.Equals(S(w, "outcome"), "DONE", StringComparison.OrdinalIgnoreCase);
         string chipKind = isDone ? "success" : (isInfra ? "warning" : Theme.StatusRail(status));
 
         // Pass A2-1 TASK 1: demote the collapsed row to a LEDGER ROW.
         // - No rounded corners, no card background fill, no full border.
         // - Flat row on the app surface: bottom divider only (Theme.Border).
-        // - 3px left status rail preserved at full row height.
         // - Tighter vertical padding so rows are denser (~64-76px collapsed).
         var card = new Border();
         card.Tag = name;                // lets a chevron toggle find & replace just this card
@@ -9362,15 +9365,12 @@ class CockpitWindow : Window
         card.Margin = new Thickness(0, 0, 0, 0);
 
         var shell = new Grid();
-        shell.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });   // rail
         shell.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        // Rail spans full row height (no vertical margin) — the Margin(0,2,0,2) is gone.
-        var rail = new Border { Width = Theme.RailW, Background = statusBrush };
-        Grid.SetColumn(rail, 0); shell.Children.Add(rail);
 
-        // Tighter padding: 10px horizontal, 7px vertical top/bottom.
-        var col = new StackPanel { Margin = new Thickness(10, 7, 12, 7) };
-        Grid.SetColumn(col, 1); shell.Children.Add(col);
+        // 12px on the left where the rail's 3px plus the old 10px inset used to sit, so the text
+        // column does not move now that the rail is gone.
+        var col = new StackPanel { Margin = new Thickness(12, 7, 12, 7) };
+        Grid.SetColumn(col, 0); shell.Children.Add(col);
 
         // ── line 1: [chevron] [chip] [title* ........] [Open] [primary action | kebab⋮] ──
         // Fixed right-action width (~112px) so long titles never collide with actions.

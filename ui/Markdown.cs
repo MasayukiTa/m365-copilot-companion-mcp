@@ -271,12 +271,19 @@ public static class Md
         return panel;
     }
 
-    // Build a blockquote: an accent left border with indented Muted text.
+    // Build a blockquote: a quiet left border with indented Muted text.
+    //
+    // NOT Accent, and 1px rather than 3. A grey left border is the blockquote convention and
+    // reads as typography; three pixels of the primary-action orange reads as a status rail on
+    // a block, which is the shape the operator has objected to for months. Nothing rendered it
+    // -- Md.Render still has no callers -- and that is exactly why it was worth fixing: dormant
+    // code looks blessed, and whoever wires this up later would have shipped the violation
+    // believing it had been reviewed.
     private static UIElement BuildBlockquote(string text)
     {
         var border = new Border();
-        border.BorderThickness = new Thickness(3, 0, 0, 0);
-        border.SetResourceReference(Border.BorderBrushProperty, KeyAccent);
+        border.BorderThickness = new Thickness(1, 0, 0, 0);
+        border.SetResourceReference(Border.BorderBrushProperty, KeyBorder);
         border.Padding = new Thickness(10, 2, 0, 2);
         border.Margin = new Thickness(0, 4, 0, 4);
 

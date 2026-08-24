@@ -78,7 +78,6 @@ class SelfImproveDashboardWindow : Window
     ContentControl _iconHost;
     TextBlock _header, _sub, _freshnessLine;
     Button _themeBtn, _langBtn, _refreshBtn;
-    Border _divider1, _divider2;   // vertical dividers between icon buttons
     StackPanel _body;
     ScrollViewer _sv;
     Border _headBar;
@@ -588,18 +587,6 @@ class SelfImproveDashboardWindow : Window
         return b;
     }
 
-    // FIX 2a: thin vertical divider between icon buttons
-    Border MakeVDivider()
-    {
-        var d = new Border();
-        d.Width = 1;
-        d.Height = 17;
-        d.VerticalAlignment = VerticalAlignment.Center;
-        d.Margin = new Thickness(6, 0, 6, 0);
-        d.Background = Muted;   // visible divider (user: make the line darker, not the faint Border)
-        return d;
-    }
-
     void PaintChrome()
     {
         Background = Bg;
@@ -631,9 +618,11 @@ class SelfImproveDashboardWindow : Window
             var tb = _refreshBtn.Content as TextBlock;
             if (tb != null) tb.Foreground = Fg;
         }
-        // repaint dividers with current border brush
-        if (_divider1 != null) _divider1.Background = Muted;
-        if (_divider2 != null) _divider2.Background = Muted;
+        // There were two vertical dividers between the icon buttons, and a repaint for them
+        // here. Nothing ever called the builder and nothing ever assigned the fields, so the
+        // toolbar has never had a divider and this branch could not run -- csc has been saying
+        // so, unheard, because the build check was compiling a source list that left this file
+        // out. Removed rather than wired up: the toolbar reads fine without them.
 
         // FIX 1c: freshness line is updated on each tick; just set colour here
         if (_freshnessLine != null) _freshnessLine.Foreground = Muted;
@@ -2440,7 +2429,11 @@ class SelfImproveDashboardWindow : Window
     {
         var t = new TextBlock();
         t.Text = text.ToUpper();
-        t.Foreground  = Accent;
+        // Muted, not Accent, for the same reason the past-task eyebrow changed: Theme.cs reserves
+        // that colour for a primary action and says ONLY. A rule with a silent exception at one
+        // call site is read as a loose rule by the next person, who adds the second exception.
+        // The caps and the weight stay -- the offence was the hue, not the device.
+        t.Foreground  = Muted;
         t.FontSize    = 11;
         t.FontWeight  = FontWeights.SemiBold;
         t.Margin      = new Thickness(0, 0, 0, 0);
@@ -2548,7 +2541,12 @@ class SelfImproveDashboardWindow : Window
         bargrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(frac,       GridUnitType.Star) });
         bargrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.0 - frac, GridUnitType.Star) });
         var fill = new Border();
-        fill.Height = 8; fill.CornerRadius = new CornerRadius(4); fill.Background = Accent;
+        // Graphite rather than the action hue. A meter is a passive quantity, and in this app's
+        // vocabulary orange means "the primary thing to press" -- a bar wearing it out-shouts the
+        // buttons beside it while claiming nothing. Strong neutral against the subtle track is
+        // legible without making that claim.
+        fill.Height = 8; fill.CornerRadius = new CornerRadius(4);
+        fill.Background = Theme.Br(Theme.Secondary(_dark));
         Grid.SetColumn(fill, 0); bargrid.Children.Add(fill);
         track.Child = bargrid;
         Grid.SetColumn(track, 1); grid.Children.Add(track);
