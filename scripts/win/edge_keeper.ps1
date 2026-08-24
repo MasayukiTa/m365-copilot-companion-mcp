@@ -92,6 +92,7 @@ while ($true) {
     # WS_VISIBLE and show it minimized -- which is exactly how a taskbar button appears
     # on a companion Edge that is supposed to have no window at all. A window that is not
     # visible needs no minimizing; touching it is what reveals it.
+    if ($null -eq $script:HandledWindows) { $script:HandledWindows = @{} }
     foreach ($h in [K]::FindAll($pids)) {
         if ($h -eq [IntPtr]::Zero) { continue }
         if ([K]::IsWindowVisible($h) -and -not [K]::IsIconic($h)) {
@@ -114,11 +115,25 @@ while ($true) {
         # why SW_HIDE (0) appears here. It is never the FINAL state -- leaving it hidden
         # makes Edge discard the tab's renderer and the next CDP call dies with
         # TargetClosedError. Same sequence, same reasoning as _REHIDE_PS.
+        # THE BIT IS NOT PROOF OF ABSENCE FROM THE TASKBAR. The shell decides membership at
+        # FIRST SHOW and does not re-read the style afterwards, so a window can carry
+        # WS_EX_TOOLWINDOW and still own a button minted before the bit went on -- which is
+        # exactly what a window marked by something else, or by an earlier keeper that died
+        # between the two calls, looks like. Skipping on the bit alone then leaves the button
+        # the operator is complaining about sitting there, while the log says the window is
+        # already handled.
+        #
+        # So the hide/mark/re-show sequence runs UNCONDITIONALLY the first time this keeper
+        # sees a handle. Hiding and re-showing is what makes the shell re-evaluate membership;
+        # the bit alone never does. After that first pass the handle is known to have been
+        # shown while marked, and the cheap bit test is enough to keep the loop quiet.
         $ex = [K]::GetWindowLong($h, -20)
-        if (($ex -band 0x80) -eq 0) {
+        $key = [string]$h
+        if (-not $script:HandledWindows.ContainsKey($key) -or ($ex -band 0x80) -eq 0) {
             [K]::ShowWindow($h, 0) | Out-Null
             [K]::SetWindowLong($h, -20, ($ex -bor 0x80) -band (-bnot 0x40000)) | Out-Null
             [K]::ShowWindow($h, 6) | Out-Null
+            $script:HandledWindows[$key] = $true
         }
     }
 }

@@ -230,3 +230,25 @@ def test_the_eval_launcher_proves_nothing_is_showing_before_it_succeeds():
     assert i < j, "成功を返してから検査している"
     # サインインは人が見る場面なので、この検査が握りつぶさないこと
     assert "-Foreground" in src
+
+
+def test_the_keeper_does_not_trust_the_toolwindow_bit_on_a_window_it_has_not_seen():
+    """ビットは「タスクバーに居ない」ことの証明にならない。
+
+    シェルはタスクバー所属を『最初に表示された瞬間』に決め、その後スタイルを読み直さない。
+    つまり WS_EX_TOOLWINDOW が立っていても、それが立つ前に作られたボタンは残っている --
+    他の何かが立てた窓、あるいは2つの呼び出しの間で死んだ前任の keeper が残した窓が、
+    ちょうどそう見える。ビットだけで飛ばすと、運用者が文句を言っているボタンをそのまま
+    残したまま、ログ上は『対応済み』になる。
+
+    だから keeper がその handle を初めて見た時は、隠して→印を付けて→出し直す手順を
+    無条件で通す。所属を再評価させるのは表示し直す行為であって、ビットではない。"""
+    src = (ROOT / "scripts" / "win" / "edge_keeper.ps1").read_text(encoding="utf-8")
+    assert "HandledWindows" in src, "見た handle を覚えていない"
+    # 初見なら、ビットが立っていても手順を通すこと
+    i = src.index("$key = [string]$h")
+    guard = src[i:i + 460]
+    assert "-not $script:HandledWindows.ContainsKey($key)" in guard
+    assert "-or" in guard, "初見でもビットが立っていれば飛ばしている"
+    # 手順そのものは残っていること
+    assert "ShowWindow($h, 0)" in guard and "ShowWindow($h, 6)" in guard
