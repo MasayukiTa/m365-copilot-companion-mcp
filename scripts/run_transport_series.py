@@ -105,8 +105,20 @@ PHASE_A = [("sock", "ctrl"), ("tabs", "ctrl"), ("sock", "cand"), ("tabs", "cand"
 #: each order, and the per-arm peak attribution is on, so a spike here names a process.
 DIAGNOSTIC = [("sock", "ctrl"), ("tabs", "ctrl"), ("sock", "cand"), ("tabs", "cand")]
 
-PHASE_B = [("tx", "ctrl"), ("sock", "ctrl"), ("tx", "cand"), ("tabs", "cand"),
-           ("tx", "ctrl"), ("sock", "cand"), ("tx", "cand"), ("tabs", "ctrl"),
+#: BALANCED AT EVERY STOPPING POINT, not merely at the end. The previous order put the four
+#: null cells at positions 2, 4, 6 and 8, which balances only if all twelve run. The series
+#: stopped at cell five both times it was started, so the nulls that ever ran were sock/ctrl and
+#: tabs/cand -- socket always measured control-first, tabs always candidate-first. Their mean
+#: came out at -132.8 against Phase A's +44.9, and that 178 MB gap reads exactly like the
+#: instrument drifting overnight. It was not. It was a confounded subset of a schedule that had
+#: been cut short, and taking it for drift would have moved the treatment estimate from 149 MB
+#: to 282 MB -- from comfortably under the 300 MB floor to sitting on it.
+#:
+#: A rule that may stop early and a design that balances only when complete cannot both be had.
+#: So each transport's two orders are now adjacent: whenever the series stops after an even
+#: number of null cells, the nulls it has are order-balanced.
+PHASE_B = [("tx", "ctrl"), ("sock", "ctrl"), ("sock", "cand"), ("tx", "cand"),
+           ("tabs", "cand"), ("tabs", "ctrl"), ("tx", "ctrl"), ("tx", "cand"),
            ("tx", "ctrl"), ("tx", "cand"), ("tx", "ctrl"), ("tx", "cand")]
 
 #: How long to wait before retrying a cell the preflight refused. One probe interval: retrying

@@ -277,3 +277,36 @@ def test_the_interval_widens_as_the_sample_shrinks():
     wide = ts.mean_ci([100.0, 200.0])[1]
     narrow = ts.mean_ci([100.0, 200.0] * 6)[1]
     assert wide > narrow * 4, "標本を増やしても区間が縮んでいない"
+
+
+def test_the_nulls_stay_order_balanced_at_every_stopping_point():
+    """早期停止を許すなら、どこで止まっても釣り合っていなければならない。
+
+    旧い並びは null を 2,4,6,8 番目に置いており、12本全部走った時にだけ釣り合う。
+    実際には2回とも5本目で停止し、走った null は sock/ctrl と tabs/cand だけ --
+    socket は必ず control 先行、tabs は必ず candidate 先行。その平均 -132.8 は
+    Phase A の +44.9 と 178MB 違い、計器が夜のうちにドリフトしたようにしか見えない。
+    ドリフトではなく、途中で切られた日程表の交絡した部分集合だった。そう読んでいれば
+    treatment の推定は 149MB から 282MB に動き、床の下から床の上へ移っていた。"""
+    import scripts.run_transport_series as ts
+    from collections import Counter
+
+    nulls = [c for c in ts.PHASE_B if c[0] != "tx"]
+    assert len(nulls) == 4
+    # 全体として各経路が両方の順序を1回ずつ持つこと
+    assert Counter(nulls) == Counter([("sock", "ctrl"), ("sock", "cand"),
+                                      ("tabs", "cand"), ("tabs", "ctrl")])
+
+    # そして、null が偶数本走った時点ではどこでも釣り合っていること
+    seen = []
+    for cell in ts.PHASE_B:
+        if cell[0] == "tx":
+            continue
+        seen.append(cell)
+        if len(seen) % 2:
+            continue
+        kinds = Counter(k for k, _ in seen)
+        for kind, n in kinds.items():
+            orders = Counter(o for k, o in seen if k == kind)
+            assert orders.get("ctrl", 0) == orders.get("cand", 0), (
+                "null %d本の時点で %s が順序に偏っている: %s" % (len(seen), kind, dict(orders)))
