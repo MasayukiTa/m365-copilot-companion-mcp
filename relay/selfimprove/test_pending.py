@@ -244,3 +244,56 @@ def test_status_of_agrees_with_items_about_which_ask_is_latest():
     assert P.status_of(pid) == P.DROPPED
     P.add(FILES, REASON)
     assert P.status_of(pid) == P.OPEN
+
+
+# ── verbatim means verbatim, including the characters a command line cannot carry ───
+
+def test_the_words_can_be_read_from_stdin(monkeypatch, queue):
+    """The dashboard substituted an apostrophe for every double quote to survive argv, so a
+    decision containing one was recorded as something the operator had not written -- while
+    the dialog promised nothing would be summarised or reworded."""
+    import io as _io
+    pid = P.add(FILES, REASON)
+    words = '承認する。"この差分のまま"でよい。\n改行も。\ も。'
+
+    class _Stdin:
+        buffer = _io.BytesIO(words.encode("utf-8"))
+
+    monkeypatch.setattr(P.sys, "stdin", _Stdin())
+    assert P._cli(["--approve", pid, "--authorization", "-", "--kind", "typed"]) == 0
+    got = [i for i in P.items(include_resolved=True) if i["id"] == pid][0]
+    assert got["authorization"] == words
+
+
+def test_stdin_is_decoded_as_utf8_and_not_as_the_console_encoding(monkeypatch):
+    """sys.stdin.read() uses the locale encoding, which on this machine is cp932 -- reading it
+    that way would corrupt exactly the text this path exists to carry unaltered."""
+    import inspect
+    src = inspect.getsource(P._cli)
+    assert 'sys.stdin.buffer.read().decode("utf-8"' in src
+    # The comment names the wrong way by name; the CODE must not use it.
+    code = chr(10).join(l.split("#")[0] for l in src.splitlines())
+    assert "sys.stdin.read()" not in code
+
+
+def test_the_dashboard_no_longer_rewrites_quotes():
+    from pathlib import Path
+    ui = (Path(P.__file__).parent.parent.parent / "ui" / "SelfImproveDashboard.cs")
+    src = ui.read_text(encoding="utf-8")
+    body = src[src.index("bool RecordDecision"):]
+    body = body[:body.index("\n    // ")]
+    assert '--authorization -' in body
+    assert 'Replace("\\"", "\'")' not in body
+    assert "UTF8Encoding(false).GetBytes" in body
+
+
+def test_an_empty_stdin_authorisation_is_still_refused(monkeypatch):
+    import io as _io
+    pid = P.add(FILES, REASON)
+
+    class _Stdin:
+        buffer = _io.BytesIO(b"   ")
+
+    monkeypatch.setattr(P.sys, "stdin", _Stdin())
+    assert P._cli(["--approve", pid, "--authorization", "-"]) == 2
+    assert P.items()[0]["status"] == P.OPEN

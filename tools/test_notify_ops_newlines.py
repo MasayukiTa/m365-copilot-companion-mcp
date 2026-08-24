@@ -118,6 +118,7 @@ def test_a_host_without_the_built_ui_gets_nothing_and_no_exception(monkeypatch, 
 
 def test_a_built_ui_is_launched_with_the_authority_switch(monkeypatch, tmp_path):
     from pathlib import Path
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)   # see _fake_cockpit
     exe = tmp_path / "FleetCockpit.exe"
     exe.write_text("", encoding="utf-8")
     seen = {}
@@ -163,6 +164,10 @@ _REAL_GUARD = N._dashboard_already_up
 
 
 def _fake_cockpit(tmp_path, monkeypatch):
+    # open_authority_dashboard は notify_desktop と同じく PYTEST_CURRENT_TEST で不活性化する
+    # ようになった(操作者の実デスクトップに窓を出さないため)。この一連のテストはその関数
+    # 自体を試すので、tools/test_approval_policy.py と同じ作法で環境変数を外す。
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     exe = tmp_path / "FleetCockpit.exe"
     exe.write_text("", encoding="utf-8")
     from tools import notify_ops as N

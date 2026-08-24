@@ -92,3 +92,31 @@ def test_the_cooldown_is_process_local_and_the_file_says_so():
     body = src[src.index("def _dashboard_already_up"):]
     body = body[:body.index("\ndef ")]
     assert "mutex" in body.lower()
+
+
+def test_opening_the_dashboard_is_inert_under_pytest(monkeypatch):
+    """notify_desktop has been inert by construction since it was written; this one launches a
+    window on the operator's real desktop and had no such guard. Both are reached from
+    pending._notify, so the layer stopped half way across a single call -- today only two test
+    files' local fixtures keep it quiet, which is the fail-open shape of a hand-written
+    allowlist."""
+    called = []
+    monkeypatch.setattr(N.subprocess, "Popen", lambda *a, **k: called.append(a))
+    assert N.open_authority_dashboard() == ""
+    assert called == []
+
+
+def test_the_guard_is_the_same_one_notify_desktop_uses():
+    """Two spellings of "are we under test" is two things to keep in step."""
+    import io
+    src = io.open(N.__file__, encoding="utf-8").read()
+    assert src.count('os.environ.get("PYTEST_CURRENT_TEST")') >= 2
+
+
+def test_the_summary_cache_is_redirected_for_the_whole_session():
+    """A test that regenerated it would replace summaries that cost real model calls, and the
+    damage would look like nothing at all: the screen just falls back to raw reasons."""
+    from pathlib import Path
+    src = (Path(N.__file__).parent.parent / "conftest.py").read_text(encoding="utf-8")
+    assert "record_summary" in src
+    assert '"CACHE_PATH"' in src

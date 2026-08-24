@@ -306,3 +306,53 @@ def test_the_prompt_tells_the_model_not_to_copy_the_opening():
     assert "冒頭の抜き書きではありません" in p
     assert "先頭の文をそのまま写さない" in p
     assert "例:" in p          # an example is worth more than another adjective
+
+
+# ── the log must not kill the run, at EVERY layer ───────────────────────────────────
+
+def test_the_socket_route_gets_the_safe_printer_too():
+    """The cp932 fix reached `backfill` and stopped there. The route is handed a printer as
+    well, and its failure notes carry model and exception text -- so the same class was still
+    live one call away."""
+    import inspect
+    src = inspect.getsource(RS._copilot_asker)
+    assert "log=safe_print" in src
+    assert "print(m, flush=True)" not in src
+
+
+def test_the_safe_printer_survives_a_console_that_cannot_hold_the_text(monkeypatch):
+    written = []
+
+    class Narrow:
+        encoding = "cp932"
+
+        def write(self, text):
+            text.encode("cp932")          # raises on an em dash, like the real console
+            written.append(text)
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(RS.sys, "stdout", Narrow())
+    RS.safe_print("an em dash — here")      # must not raise
+    assert written and "here" in written[-1]
+
+
+def test_one_printer_rather_than_two_spellings_of_the_rule():
+    import inspect
+    src = inspect.getsource(RS)
+    assert src.count("def safe_print") == 1
+    assert "log=safe_print" in src
+
+
+def test_a_save_that_never_lands_is_reported(monkeypatch):
+    """"generated: 28" while nothing reached the disk is the same self-report-versus-reality
+    gap this module was already bitten by."""
+    monkeypatch.setattr(RS, "save", lambda cache: (_ for _ in ()).throw(OSError("read only")))
+    rep = RS.backfill([_rec("a", LONG_EN)], lambda p: '{"ja": "あ", "en": "b"}')
+    assert rep.get("unsaved") == 1
+
+
+def test_a_normal_run_does_not_carry_the_unsaved_key():
+    rep = RS.backfill([_rec("a", LONG_EN)], lambda p: '{"ja": "あ", "en": "b"}')
+    assert "unsaved" not in rep

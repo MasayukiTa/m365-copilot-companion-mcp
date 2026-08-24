@@ -67,6 +67,16 @@ def _no_writes_to_the_live_records(tmp_path_factory, monkeypatch):
     except Exception:
         pass
 
+    # Derived rather than a record, but still the operator's file: a test that regenerated it
+    # would replace summaries that cost real model calls, and the failure would look like
+    # nothing at all -- the screen simply falls back to raw reasons.
+    try:
+        import relay.selfimprove.record_summary as record_summary
+        monkeypatch.setattr(record_summary, "CACHE_PATH",
+                            str(base / "record_summaries.json"), raising=False)
+    except Exception:
+        pass
+
     yield base
 
 

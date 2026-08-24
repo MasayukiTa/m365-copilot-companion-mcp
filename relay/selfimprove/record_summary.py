@@ -52,6 +52,30 @@ MAX_EN = 130
 LANGS = ("ja", "en")
 
 
+def safe_print(message) -> None:
+    """Write a line that may contain anything, to a console that may accept little.
+
+    A model reply carried an em dash, the console was cp932, print raised UnicodeEncodeError,
+    and a backfill died after generating most of its records and before saving any. That was
+    fixed inside `backfill`, and the fix reached one layer: the socket route is handed a
+    printer too, and its failure notes carry model and exception text. Whether a character is
+    printable is a property of the terminal and never a reason to lose work, so the rule lives
+    in one function that every printer here goes through.
+    """
+    try:
+        sys.stdout.write(str(message) + "\n")
+    except Exception:
+        try:
+            enc = getattr(sys.stdout, "encoding", "") or "ascii"
+            sys.stdout.write(str(message).encode(enc, "replace").decode(enc, "replace") + "\n")
+        except Exception:
+            return
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
 def load() -> dict:
     try:
         with io.open(CACHE_PATH, encoding="utf-8") as fh:
@@ -274,7 +298,7 @@ def backfill(records, ask, *, limit: int = 0, model: str = "", log=None) -> dict
     todo = missing(records, cache)
     if limit and limit > 0:
         todo = todo[:limit]
-    done, failed = 0, 0
+    done, failed, unsaved = 0, 0, 0
     for r in todo:
         k = key_of(r)
         try:
@@ -306,12 +330,19 @@ def backfill(records, ask, *, limit: int = 0, model: str = "", log=None) -> dict
         try:
             save(cache)
         except Exception:
-            pass
+            # Counted, not swallowed. Reporting "generated: 28" while nothing reached the disk
+            # is the same self-report-versus-reality gap this module was already bitten by.
+            unsaved += 1
+            log("COULD NOT SAVE %s" % k[:12])
         done += 1
         first = " ".join(str(r.get("reason") or "").split())[:110]
         log("%s\n    source : %s\n    ja     : %s\n    en     : %s"
             % (k[:12], first, pair["ja"], pair["en"]))
-    return {"generated": done, "failed": failed, "remaining": len(missing(records, cache))}
+    report = {"generated": done, "failed": failed,
+              "remaining": len(missing(records, cache))}
+    if unsaved:
+        report["unsaved"] = unsaved
+    return report
 
 
 # ── the ledger, read here so the CLI does not need the dashboard ────────────────────
@@ -361,7 +392,7 @@ def _copilot_asker(cdp_url: str, timeout_s: float = 180.0, agent_url: str = ""):
     context = browser.contexts[0]
 
     route = SocketRoute(capture_fn=capture_via_tab, connect_fn=websocket_connect,
-                        log=lambda m: print(m, flush=True))
+                        log=safe_print)
     # AN AGENT SURFACE, NOT THE DEFAULT CHAT. capture refuses a request that names no agent --
     # a socket built from one would reach the default Copilot instead, which is a different
     # assistant answering as if it were this one. The fleet's own agent is the right surface
@@ -434,21 +465,8 @@ def _cli(argv=None) -> int:
                                     " ".join(str(r.get("reason") or "").split())[:80]))
         return 0
 
-    def emit(m):
-        """The console here is cp932 and a model reply may hold anything. Printable-or-not is
-        a property of the terminal, never a reason to lose a record."""
-        try:
-            sys.stdout.write(str(m) + "\n")
-        except Exception:
-            enc = getattr(sys.stdout, "encoding", "") or "ascii"
-            sys.stdout.write(str(m).encode(enc, "replace").decode(enc, "replace") + "\n")
-        try:
-            sys.stdout.flush()
-        except Exception:
-            pass
-
     ask = _copilot_asker(args.cdp, agent_url=args.agent_url)
-    report = backfill(records, ask, limit=args.limit, model="copilot", log=emit)
+    report = backfill(records, ask, limit=args.limit, model="copilot", log=safe_print)
     print(json.dumps(report, ensure_ascii=False))
     return 0
 

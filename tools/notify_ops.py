@@ -132,6 +132,13 @@ def open_authority_dashboard() -> str:
     normal state on a machine where the UI was never compiled -- the caller keeps its written
     briefing as the fallback for exactly that.
     """
+    # THE SAME GUARD AS notify_desktop, and it was missing here. That function is inert under
+    # pytest by construction -- checked once, so no test file has to remember -- while this one
+    # launches a window on the operator's actual desktop. Both are reached from pending._notify,
+    # so the layer stopped half way across a single call: today only the local fixtures in two
+    # test files keep it quiet, which is the fail-open shape of a hand-written allowlist.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return ""
     try:
         cockpit = COCKPIT
         if not cockpit.is_file():

@@ -27,6 +27,7 @@ import hashlib
 import io
 import json
 import os
+import sys
 import time
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -233,10 +234,26 @@ def _cli(argv=None) -> int:
     ap.add_argument("--drop", metavar="ID", default="",
                     help="mark a queued decision as not going to happen")
     ap.add_argument("--authorization", default="",
-                    help="the operator's decision, quoted verbatim")
+                    help="the operator's decision, quoted verbatim. \"-\" reads it from "
+                         "stdin, which is how the dashboard passes it: a command line cannot "
+                         "carry every character a person might type")
     ap.add_argument("--kind", default="",
                     help="how it was given: preset (a phrase they chose) or typed")
     args = ap.parse_args(argv)
+
+    # VERBATIM MEANS VERBATIM. The dashboard used to substitute an apostrophe for every double
+    # quote before putting the text on a command line, so a decision containing one was
+    # recorded as something the operator had not written -- while the dialog promised, in as
+    # many words, that nothing would be summarised or reworded. Reading it from stdin removes
+    # the quoting problem rather than escaping around it.
+    if str(args.authorization) == "-":
+        try:
+            # The raw buffer, decoded as UTF-8. sys.stdin.read() uses the locale encoding,
+            # which on this machine is cp932 -- so reading it that way would corrupt exactly
+            # the text this path exists to carry through unaltered.
+            args.authorization = sys.stdin.buffer.read().decode("utf-8", "replace")
+        except Exception:
+            args.authorization = ""
 
     if args.approve or args.resolve or args.drop:
         pid = args.approve or args.resolve or args.drop

@@ -1991,15 +1991,30 @@ class SelfImproveDashboardWindow : Window
             string venvPy = Path.Combine(root, ".venv", "Scripts", "python.exe");
             var psi = new ProcessStartInfo();
             psi.FileName  = File.Exists(venvPy) ? venvPy : "python";
+            // THE WORDS GO DOWN STDIN, NOT INTO ARGV. This replaced every double quote with
+            // an apostrophe to survive the command line, so an authorisation containing one
+            // was recorded as something the operator had not written -- while the dialog above
+            // promises that nothing is summarised or reworded. A multi-line answer, or one
+            // ending in a backslash, broke the quoting outright. Escaping harder would have
+            // been another rule to get right; not quoting at all is one fewer.
             psi.Arguments = "-m relay.selfimprove.pending " + verb + " " + pid
-                          + " --authorization \"" + (words ?? "").Replace("\"", "'") + "\""
+                          + " --authorization -"
                           + " --kind " + (string.IsNullOrEmpty(kind) ? "typed" : kind);
+            psi.RedirectStandardInput = true;
             psi.WorkingDirectory       = root;
             psi.UseShellExecute        = false;
             psi.CreateNoWindow         = true;
             psi.RedirectStandardOutput = true;
             psi.RedirectStandardError  = true;
             var proc = new Process(); proc.StartInfo = psi; proc.Start();
+            // BYTES, NOT THE STREAM'S DEFAULT ENCODING. This console is cp932; a
+            // StreamWriter using it would mangle the operator's own words on the way to a
+            // record whose whole promise is that they are unaltered. (StandardInputEncoding
+            // does not exist on this framework, so the encoding is applied here instead.)
+            var wordBytes = new UTF8Encoding(false).GetBytes(words ?? "");
+            proc.StandardInput.BaseStream.Write(wordBytes, 0, wordBytes.Length);
+            proc.StandardInput.BaseStream.Flush();
+            proc.StandardInput.Close();          // the child reads to EOF
             string so = proc.StandardOutput.ReadToEnd();
             string se = proc.StandardError.ReadToEnd();
             proc.WaitForExit(30000);
