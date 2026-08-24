@@ -108,3 +108,37 @@ def test_the_bridge_rehides_at_startup():
     """
     src = _src(BRIDGE)
     assert "startup rehide raised" in src
+
+
+# ---- 4回目: 評価用 Edge(:9224) が監視の既定から漏れていた ----------------------------------
+
+def test_every_managed_profile_is_watched_by_the_keeper():
+    """プロファイルが増えるたびに、それを列挙している箇所を掃き漏らしてきた。
+
+    4回目は :9224 の評価用 Edge。keeper の既定マーカーに名前が無いので、
+    測定系列が開いた窓が運用者の前面に出たまま、誰も片付けなかった。
+    症状はこのループが存在する理由そのもの。
+
+    一覧を1箇所にしただけでは再発する。keeper が実際にその全部を見ていることを
+    ここで固定して初めて、追加が監視に届く。"""
+    import sys
+    sys.path.insert(0, str(ROOT))
+    from relay.edge_recover import MANAGED_EDGE_PROFILES, keeper_profile_marker
+
+    keeper = (ROOT / "scripts" / "win" / "edge_keeper.ps1").read_text(encoding="utf-8")
+    default = re.search(r"\$ProfileMarker\s*=\s*'([^']+)'", keeper).group(1)
+    for profile in set(MANAGED_EDGE_PROFILES.values()):
+        assert profile in default, "keeper が %s を見ていない" % profile
+    # 逆向きも: keeper が知っていて登録に無い名前があれば、正本が2つになる
+    for name in default.split("|"):
+        assert name in set(MANAGED_EDGE_PROFILES.values()), "登録に無い名前: %s" % name
+    assert keeper_profile_marker().split("|"), keeper_profile_marker()
+
+
+def test_the_port_map_knows_the_evaluation_browser():
+    """:9224 を既定へ落とすと、rehide が別の Edge を最小化しにいく。"""
+    import sys
+    sys.path.insert(0, str(ROOT))
+    from relay.edge_recover import _profile_for_port
+    assert _profile_for_port(9224) == "copilot-eval-edge"
+    assert _profile_for_port(9223) == "copilot-bridge-edge"

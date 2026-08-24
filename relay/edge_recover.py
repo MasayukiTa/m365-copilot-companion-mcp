@@ -77,16 +77,41 @@ def hard_reset(port=9222, wait=True):
         return False
 
 
+#: EVERY EDGE THIS PROJECT DRIVES, IN ONE PLACE. Port -> user-data-dir profile.
+#:
+#: THE SAME OMISSION HAS NOW HAPPENED FOUR TIMES, each time a profile was added and the places
+#: that enumerate profiles were not swept. tests/test_edge_taskbar_hygiene.py opens by counting
+#: the first three: rehide() hardcoded to the companion profile so a surfaced bridge could never
+#: be put back, the virtual-desktop mover hardcoded the same way, and minimising alone still
+#: leaving a taskbar button. The fourth was the evaluation Edge on :9224, which the keeper's
+#: default marker did not name -- so the window a measurement series opens sat in front of the
+#: operator with nothing watching it.
+#:
+#: A list is not a fix by itself. What makes it one is that the keeper's marker is BUILT from
+#: this, so adding a profile here reaches the watcher without anyone having to remember.
+MANAGED_EDGE_PROFILES = {
+    9222: "copilot-companion-edge",   # the fleet
+    9223: "copilot-bridge-edge",      # the interactive bridge
+    9224: "copilot-eval-edge",        # the measurement series' own browser
+}
+
+
+def keeper_profile_marker():
+    """The regex the minimise keeper matches command lines against: every managed profile."""
+    return "|".join(sorted(set(MANAGED_EDGE_PROFILES.values())))
+
+
 def _profile_for_port(port):
     """Map a CDP port to the Edge user-data-dir profile the launcher uses.
-      :9223 -> copilot-bridge-edge (the interactive bridge)
-      anything else -> the companion/fleet default (env MCP_EDGE_PROFILE or
-                        'copilot-companion-edge').
-    This mirrors scripts/start_companion_edge.ps1's -Profile default so we read the
-    right PER-PROFILE mode file (.fleet\\edge_mode_<profile>)."""
+
+    An unknown port falls back to the companion/fleet default (env MCP_EDGE_PROFILE, else
+    'copilot-companion-edge'), mirroring start_companion_edge.ps1's -Profile default so the
+    right per-profile mode file is read.
+    """
     try:
-        if int(port) == 9223:
-            return "copilot-bridge-edge"
+        known = MANAGED_EDGE_PROFILES.get(int(port))
+        if known:
+            return known
     except Exception:
         pass
     return os.environ.get("MCP_EDGE_PROFILE") or "copilot-companion-edge"

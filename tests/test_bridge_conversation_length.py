@@ -214,13 +214,20 @@ def test_the_challenge_rotation_is_not_simplified_away():
 
 # ---- 何を測っているかを偽らないこと -----------------------------------------------------------
 
-def test_the_memory_figure_is_labelled_as_the_whole_browser_where_it_is_logged():
-    """タブ単位の内訳は CDP から取れない。全 Edge プロセスの合計を『タブの値』として
-    出すと、次に読む人がそれを引用する。docstring だけでなくログ本文に断りが要る。"""
+def test_the_memory_figure_is_labelled_with_the_population_it_covers():
+    """タブ単位の内訳は CDP から取れないので、この数字はブラウザ単位の粗い値。
+    それを『タブの値』として出すと、次に読む人がそのまま引用する。
+    docstring だけでなくログ本文に断りが要る。
+
+    断り文は「全 Edge プロセス」だった。2026-08-24 に母集団をこのブリッジ自身の
+    ブラウザへ絞ったので、その断りは嘘になった -- 端末上の msedge は45プロセス
+    6,181MB あり、このブリッジのブラウザは 1,002MB で、59% はどちらでもなかった。
+    守るべき不変条件は「どの母集団かを必ず書く」ことで、変わったのは母集団のほう。"""
     src = _source()
     body = src[src.index("def _report_recycle_memory_effect("):]
-    body = body[:body.index("\ndef ", 10)]
-    assert "all Edge processes" in body, "ログ行に断りが無い"
+    body = body[:body.index(chr(10) + "def ", 10)]
+    assert "all Edge processes" not in body, "絞ったのに古い断りが残っている"
+    assert "this bridge" in body, "どのブラウザの値か書いていない"
     assert "coarse" in body
 
 

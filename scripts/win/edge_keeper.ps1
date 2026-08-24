@@ -14,8 +14,12 @@
 # bridge Edge (copilot-bridge-edge, :9223). Hardcoding the companion profile left the
 # bridge window entirely unwatched, so a bridge window that popped back up stayed up --
 # the loop that is supposed to keep these windows out of the way simply never saw it.
+# The eval Edge (:9224, copilot-eval-edge) was the FOURTH profile added without sweeping the
+# places that enumerate profiles, and the symptom was the one this loop exists to prevent: a
+# window sitting in front of the operator with nothing watching it. The list now lives in
+# relay/edge_recover.py's MANAGED_EDGE_PROFILES; keep this default in step with it.
 param([int]$Port = 9222,
-      [string]$ProfileMarker = 'copilot-companion-edge|copilot-bridge-edge')
+      [string]$ProfileMarker = 'copilot-companion-edge|copilot-bridge-edge|copilot-eval-edge')
 
 $ErrorActionPreference = "SilentlyContinue"
 
