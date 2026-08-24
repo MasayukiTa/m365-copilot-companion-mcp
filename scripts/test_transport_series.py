@@ -3,6 +3,7 @@
 このファイルが存在する理由: 同じ仮説について1日で3つの判定が出た（p=0.0143 → 0.0238 → 0.21）。
 毎回、計器が正直になるたびに小さくなった。どれ1つ事前に宣言されていなかった。
 """
+import tempfile
 import ast
 import inspect
 import collections
@@ -216,3 +217,32 @@ def test_the_rebuild_is_between_runs_not_between_arms():
     assert "rebuild_browser" not in inspect.getsource(S.argv_for)
     doc = inspect.getdoc(S.rebuild_browser) or ""
     assert "not between arms" in doc.lower() or "not between arms" in doc
+
+
+def test_a_launcher_that_refuses_stops_the_run_instead_of_measuring():
+    """起動器が「見えうる窓がある」で拒否コードを返したら、走行は始まってはいけない。
+
+    運用者から「タブを見せるな、次は無い」と言われている。起動器に検査を足しても、
+    呼ぶ側がその戻り値を無視すれば意味が無い -- 実際、無視して進む実装は
+    「窓が前に出たまま20分測る」形になる。だから拒否は測定不能として扱う。"""
+    import scripts.run_transport_series as ts
+
+    calls = []
+
+    def fake_rebuild():
+        calls.append(1)
+        return "rebuild exited 2: REFUSING: this profile has a window the operator could see"
+
+    def exploded(*a, **k):                              # 走ったら失敗
+        raise AssertionError("拒否されたのにキャンペーンを起動した")
+
+    old_rebuild, old_run = ts.rebuild_browser, ts.subprocess.run
+    ts.rebuild_browser, ts.subprocess.run = fake_rebuild, exploded
+    try:
+        out = ts.run_one("sock", "ctrl", tempfile.mkdtemp())
+    finally:
+        ts.rebuild_browser, ts.subprocess.run = old_rebuild, old_run
+
+    assert calls == [1]
+    assert "refused" in out, "拒否を測定結果として通している"
+    assert "REFUSING" in out["refused"], "何を拒否したのかが結果に残っていない"

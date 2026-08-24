@@ -186,7 +186,13 @@ def test_the_eval_launcher_does_not_mark_windows_at_all():
     src = (ROOT / "scripts" / "start_eval_edge.ps1").read_text(encoding="utf-8")
     assert "SetWindowLong" not in src, "また自前で印を付けている"
     assert "start_companion_edge.ps1" in src, "正規の起動器に委ねていない"
-    assert "-Foreground" not in src.replace("-Foreground: ", ""), "headless を外している"
+    # 文字列としての -Foreground は禁じない -- 拒否メッセージが
+    # 「サインインしたいなら -Foreground で」と案内するのは正しい。
+    # 見るべきは起動器を「どう呼んでいるか」の一行だけ。
+    call = [ln for ln in src.splitlines() if "start_companion_edge.ps1" in ln]
+    assert call, "起動器を呼ぶ行が無い"
+    for ln in call:
+        assert "-Foreground" not in ln, "起動器を前面モードで呼んでいる: %s" % ln.strip()
 
 
 def test_the_eval_launcher_proves_nothing_is_showing_before_it_succeeds():
