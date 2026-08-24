@@ -88,3 +88,48 @@ def test_nothing_reuses_the_recorded_ids_yet():
         assert "conv_server" not in src or name == "relay/relay_fleet.py"
     fleet = (root / "relay" / "relay_fleet.py").read_text(encoding="utf-8")
     assert fleet.count("conv_server") == 1, "recorded once, read nowhere"
+
+
+# ── continuing one, on the strength of a measurement ────────────────────────────────
+
+def test_a_driver_can_be_asked_to_continue_a_conversation():
+    """MEASURED 2026-08-24: a passphrase planted in one process came back verbatim in a second
+    process holding only this id -- across a fresh token, a fresh session id, and either value
+    of isStartOfSession. The control arm, an unused id, said it did not know."""
+    import inspect
+
+    import relay.socket_route as SR
+    sig = inspect.signature(SR.SocketRoute.driver_for)
+    assert "conversation_id" in sig.parameters
+    assert sig.parameters["conversation_id"].default == ""
+
+
+def test_starting_a_conversation_stays_the_default():
+    """Continuing one is something a caller asks for by name."""
+    import inspect
+
+    import relay.socket_route as SR
+    src = inspect.getsource(SR.SocketRoute.driver_for)
+    assert "if conversation_id:" in src
+    assert "conv.conversation_id = str(conversation_id)" in src
+
+
+def test_the_measurement_is_recorded_where_the_behaviour_is():
+    """So the next reader does not have to re-derive whether this works, or assume it does."""
+    import inspect
+
+    import relay.socket_route as SR
+    doc = inspect.getdoc(SR.SocketRoute.driver_for) or ""
+    assert "MEASURED" in doc
+    assert "control" in doc
+
+
+def test_the_route_does_not_invent_a_conversation_to_continue():
+    """An empty id must start a fresh one rather than reach for a remembered default: resuming
+    the wrong conversation looks exactly like resuming the right one."""
+    import inspect
+
+    import relay.socket_route as SR
+    src = inspect.getsource(SR.SocketRoute.driver_for)
+    assert "self.last_conversation" not in src
+    assert "or self._last" not in src

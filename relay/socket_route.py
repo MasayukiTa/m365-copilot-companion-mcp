@@ -263,8 +263,20 @@ class SocketRoute:
         return True
 
     def driver_for(self, name: str, agent_url=None, model: str = "",
-                   turn_timeout_s: float = 600.0, frame_timeout_s: float = 90.0):
+                   turn_timeout_s: float = 600.0, frame_timeout_s: float = 90.0,
+                   conversation_id: str = ""):
         """A socket driver for one worker or side agent, or None to open a tab instead.
+
+        `conversation_id` continues an earlier conversation instead of starting one. MEASURED,
+        not assumed, on 2026-08-24: a passphrase planted in one process was recovered verbatim
+        from a second process that had only this id -- across a fresh token, a fresh session
+        id, and either value of isStartOfSession. The control arm, an unused id, answered
+        "I do not know", so the experiment could fail and did not.
+
+        Two things that measurement settled and that would otherwise have been guessed. The
+        backend accepted the id the client proposed and answered with the same one, so there
+        is no second identity to reconcile. And the session id carries nothing: it may be
+        fresh every time, which is what the one-key-per-connection rule already required.
 
         `agent_url` selects WHICH agent -- omitted means the first one captured, which is the
         fleet's implementation agent. `model` names the deep-research model when the template
@@ -294,6 +306,11 @@ class SocketRoute:
         conv = Conversation(supply, template=template,
                             turn_timeout_s=float(turn_timeout_s),
                             frame_timeout_s=float(frame_timeout_s))
+        if conversation_id:
+            # The one field that carries the history. Set here rather than in Conversation's
+            # constructor so that "start a conversation" stays the default and continuing one
+            # is something a caller has to ask for by name.
+            conv.conversation_id = str(conversation_id)
         return CopilotSocketDriver(conv, connect=self._connect_fn)
 
 
