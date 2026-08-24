@@ -190,7 +190,15 @@ def _refuse_if_unpublishable(path, genome, slice_ids):
     Any other path -- the runtime archive under .fleet, a temp file in a test -- is
     unrestricted. The restriction is a property of the destination, not of the data.
     """
-    if os.path.abspath(path) != os.path.abspath(_DEFAULT_ARCHIVE):
+    # normcase, because this is Windows and the guard is a permission decision. abspath alone
+    # calls RELAY\... and relay\... different files while the filesystem calls them the same
+    # one, so a caller that differed only in case wrote straight past a refusal. A permission
+    # check that fails open on spelling is the shape this repository has been bitten by twice
+    # today already.
+    def _same(a, b):
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+    if not _same(path, _DEFAULT_ARCHIVE):
         return
     bad = [str(s) for s in (slice_ids or []) if not PUBLIC_BENCH_ID.match(str(s))]
     if bad:

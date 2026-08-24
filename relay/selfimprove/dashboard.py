@@ -196,8 +196,13 @@ def _archive_sections(archive_path):
         if isinstance(e, dict):
             measured[e.get("id")] = measured.get(e.get("id"), 0) + 1
 
+    # DEDUPE OVER EVERYTHING, THEN CAP. The cap used to be applied first, while latest_at is
+    # computed over every row -- so a genome whose latest measurement sat past the 50th row
+    # matched nothing in the slice and vanished from the list entirely, while still being
+    # counted. The list would have been quietly short, which is the hardest kind of wrong to
+    # notice on a screen whose job is to say what has been adopted.
     genomes = []
-    for i, e in enumerate(entries[:50]):
+    for i, e in enumerate(entries):
         if not isinstance(e, dict):
             continue
         if latest_at.get(e.get("id")) != i:
@@ -210,6 +215,12 @@ def _archive_sections(archive_path):
             "descriptors": e.get("descriptors"),
             "measurements": measured.get(e.get("id"), 1),
         })
+
+    # CAPPED AT THE END, AND FROM THE RECENT END. Capping the scan instead dropped any genome
+    # whose latest measurement sat past the 50th row -- it matched nothing inside the slice and
+    # vanished while still being counted. Capping from the front would drop the newest, which
+    # is the half a reader is looking for on a screen about what this loop has just adopted.
+    genomes = genomes[-50:]
 
     try:
         qd_cells = len(arc.qd_map())
@@ -310,7 +321,12 @@ def _pending_section() -> list:
                  "authorization": i.get("authorization") or "",
                  "authorization_kind": i.get("authorization_kind") or "",
                  "command": i.get("command") or ""}
-                for i in _P.items()]
+                # OPEN ONLY, because that is what this key's name says. items() returns
+                # open AND approved -- both are "still waiting on somebody" from the queue's
+                # point of view -- and the dashboard's awaiting section reads open alone. Two
+                # readers of one queue disagreeing about what "pending" means is how the next
+                # consumer gets a count that does not match the screen.
+                for i in _P.items() if (i.get("status") or "open") == "open"]
     except Exception:
         return []
 

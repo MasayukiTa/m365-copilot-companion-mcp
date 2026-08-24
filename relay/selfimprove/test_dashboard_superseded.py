@@ -100,3 +100,17 @@ def test_a_note_is_optional(tmp_path):
     trend, _ = _archive_sections(_archive(tmp_path, THE_LIVE_CASE))
     assert all("note" in t for t in trend)
     assert all(t["note"] is None for t in trend)
+
+
+def test_a_genome_whose_latest_measurement_is_past_the_cap_still_appears(tmp_path):
+    """The cap used to be applied before the dedupe, while latest_at is computed over every
+    row -- so a genome measured again past the 50th row matched nothing in the slice and
+    vanished from the list while still being counted."""
+    rows = [_entry("early", 0.1)]
+    rows += [_entry("filler%d" % i, 0.2) for i in range(60)]
+    rows += [_entry("early", 0.9)]          # the same genome, re-measured, past the cap
+    trend, arc = _archive_sections(_archive(tmp_path, rows))
+    ids = [g["id"] for g in arc["genomes"]]
+    assert "early" in ids
+    assert next(g for g in arc["genomes"] if g["id"] == "early")["pass_at_1"] == 0.9
+    assert len(arc["genomes"]) <= 50

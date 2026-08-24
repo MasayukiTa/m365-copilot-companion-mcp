@@ -275,3 +275,46 @@ def test_the_goals_never_hand_over_an_8_3_short_path(tmp_path):
     # 書いてしまうので、検査は使い捨てのフォルダで行う。
     for g in W.goals(str(tmp_path / "wl")):
         assert "~" not in g["text"], g["text"][:80]
+
+
+def test_no_tracked_file_carries_a_banned_identifier():
+    """The guard above reads ONE module, and this repository is public.
+
+    A rule enforced on one file is a rule about that file. The words that may not appear must
+    not appear anywhere that gets pushed -- and the last time this was checked by hand it found
+    the guard itself holding all nine of them in plaintext. Sweeping every tracked file is the
+    difference between a guard and an example of one.
+    """
+    import re
+    import subprocess
+    from pathlib import Path
+
+    root = Path(__file__).parent.parent
+    out = subprocess.run(["git", "ls-files"], cwd=str(root),
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if out.returncode != 0:
+        import pytest
+        pytest.skip("not a git checkout")
+
+    patterns = [(w, re.compile(_word_pattern(w), re.IGNORECASE)) for w in _banned_ascii()]
+    terms = list(_banned_terms())
+    hits = []
+    for rel in out.stdout.splitlines():
+        rel = rel.strip()
+        if not rel:
+            continue
+        p = root / rel
+        try:
+            if not p.is_file() or p.stat().st_size > 2_000_000:
+                continue
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        low = text.lower()
+        for word, pat in patterns:
+            if pat.search(low):
+                hits.append("%s: %s" % (rel, word))
+        for term in terms:
+            if term in low:
+                hits.append("%s: %s" % (rel, term))
+    assert not hits, "banned identifiers in tracked files: %s" % hits[:10]

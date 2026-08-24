@@ -236,6 +236,11 @@ def classify_probe_reply(reply_text: str, agent_loaded: bool) -> Tuple[bool, str
 # Dedicated directory reset before every challenge -- deliberately NOT a user-meaningful folder
 # (like Desktop): resetting it means deleting everything inside, and this way that can never
 # touch a file the user cares about.
+#: How much of a tool call's arguments the arrival check reads. A probe names its directory
+#: in its own short argument list; a real write can be megabytes, and scanning all of it on
+#: every call is an observer charging the thing it observes.
+_INBOUND_SCAN_CHARS = 4096
+
 _CHALLENGE_DIR = Path(__file__).resolve().parent.parent / ".fleet" / "probe_challenge"
 
 _CHALLENGE_INSTRUCTION_VARIANTS = (
@@ -284,10 +289,22 @@ def note_inbound(tool_name: str, arguments: Optional[dict] = None,
 
     Called on the gateway's dispatch path, so it does the cheap test first and writes nothing
     unless the call is actually ours. Never raises: this must not be able to fail a tool call.
+
+    WHAT IT CAN STILL MISTAKE. The marker is a directory name, so a call that merely MENTIONS
+    that name -- a search for it, a listing of the parent -- stamps an arrival that no probe
+    made. The stamp is only read inside a probe window, which bounds the damage to "a probe
+    that was about to be reported as blocked is reported as fine", and that is a health signal
+    saying the comfortable thing. Narrowing it needs a marker the agent cannot be asked to type
+    by accident; recording the limit here until then.
     """
     try:
+        # BOUNDED. This runs on every tool call, and str(arguments) on a write is the whole
+        # payload -- stringified once and lowercased again, megabytes at a time, to look for a
+        # short marker. A probe's own call carries its path near the front; nothing else needs
+        # to be read to recognise one.
         target = str(_CHALLENGE_DIR).lower()
-        hay = str(path if path is not None else (arguments or {})).lower()
+        raw = path if path is not None else (arguments or {})
+        hay = str(raw)[:_INBOUND_SCAN_CHARS].lower()
         if target not in hay and "probe_challenge" not in hay:
             return False
         stamp = {"ts": float(ts if ts is not None else time.time()),

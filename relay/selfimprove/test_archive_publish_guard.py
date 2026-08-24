@@ -93,3 +93,26 @@ def test_the_live_archive_still_satisfies_its_own_rule():
             e = json.loads(line)
             cards = (e.get("genome") or {}).get("cards") or {}
             assert not [k for k, v in cards.items() if isinstance(v, str)]
+
+
+def test_a_differently_cased_path_is_the_same_file(tmp_path, monkeypatch):
+    """abspath alone calls RELAY\... and relay\... different files while the filesystem
+    calls them the same one, so a caller differing only in case wrote straight past the
+    refusal. A permission check that fails open on spelling."""
+    import os
+
+    import relay.selfimprove.archive as A
+    fake = tmp_path / "entries.jsonl"
+    monkeypatch.setattr(A, "_DEFAULT_ARCHIVE", str(fake))
+    shouty = str(fake).replace(str(tmp_path.name), str(tmp_path.name).upper()) \
+        if os.name == "nt" else str(fake).upper()
+    with pytest.raises(NotPublishable):
+        Archive(shouty).add(GENOME, slice_ids=["episode_business"], pass_at_1=0.5)
+
+
+def test_a_genuinely_different_path_is_still_unrestricted(tmp_path, monkeypatch):
+    import relay.selfimprove.archive as A
+    monkeypatch.setattr(A, "_DEFAULT_ARCHIVE", str(tmp_path / "entries.jsonl"))
+    other = Archive(str(tmp_path / "runtime.jsonl"))
+    other.add(GENOME, slice_ids=["episode_business"], pass_at_1=0.5)
+    assert len(other.all()) == 1

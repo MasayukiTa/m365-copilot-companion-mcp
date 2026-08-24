@@ -59,16 +59,23 @@ def test_the_only_other_direct_sender_is_the_uncontaminated_critic():
     """The critic must NOT get session bookkeeping or an unlock: it judges text against a
     rubric, uses no tools, and seeing the working conversation would defeat its purpose. Every
     other direct call would be a turn that quietly lacks the password."""
-    lines = [(i, l) for i, l in enumerate(SOURCE.splitlines())
-             if "self._send_and_stream_once(" in l]
-    turn_body = _fn("_run_one_turn")
+    # BY POSITION, NOT BY SPELLING. The first version excluded any line whose TEXT also
+    # appeared inside _run_one_turn, so a future direct call written with the same wording
+    # would have been waved through the gate it exists to guard.
+    turn_start = SOURCE.index("    def _run_one_turn(")
+    turn_end = SOURCE.index("\n    def ", turn_start)
+    critic_start = SOURCE.index("    def _critic_verdict(") if "_critic_verdict(" in SOURCE \
+        else SOURCE.index("Uses _send_and_stream_once(..., stream_out=False) directly")
+    critic_end = SOURCE.index("\n    def ", critic_start)
+
     outside = []
-    for i, l in lines:
-        if l.strip() in [x.strip() for x in turn_body.splitlines()]:
-            continue
-        outside.append((i + 1, l.strip()[:60]))
-    # the rubric prompt and its JSON-only retry, and nothing else
-    assert len(outside) == 2, outside
+    idx = SOURCE.find("self._send_and_stream_once(")
+    while idx != -1:
+        if not (turn_start <= idx < turn_end) and not (critic_start <= idx < critic_end):
+            line = SOURCE.count("\n", 0, idx) + 1
+            outside.append(line)
+        idx = SOURCE.find("self._send_and_stream_once(", idx + 1)
+    assert outside == [], "a turn is being sent outside _run_one_turn: lines %s" % outside
 
 
 def test_the_critic_says_why_it_bypasses():

@@ -240,7 +240,12 @@ def record_classification(branch: str, *, resp_len: int, since: float,
 def locked_since(since: float, now: Optional[float] = None) -> bool:
     """True iff a refusal was recorded at or after `since`.
 
-    This is the form callers should use. `locked_recently` answers "was anything
+    NOT THE FORM A CALLER DECIDING SHOULD USE ANY MORE -- see `matching_records`. This reads
+    the one-deep slot, so it answers "was something refused since then" and cannot say whether
+    the refusal was about the caller asking. Kept for the CLI and for diagnostics, where naming
+    the last refusal is exactly the question.
+
+    `locked_recently` answers "was anything
     refused lately", which is too broad to judge one turn by: a refusal from an
     unrelated earlier call would mark every reply for the next few minutes as
     locked. Pass the moment the turn was sent and only its own refusal counts.

@@ -201,11 +201,17 @@ def parse_reply(text: str) -> dict:
         obj = json.loads(s[i:j + 1])
         if not isinstance(obj, dict):
             return {}
-        ja = _clean(obj.get("ja"), MAX_JA)
-        en = _clean(obj.get("en"), MAX_EN)
+        raw_ja = " ".join(str(obj.get("ja") or "").split())
+        raw_en = " ".join(str(obj.get("en") or "").split())
+        ja = _clean(raw_ja, MAX_JA)
+        en = _clean(raw_en, MAX_EN)
         if not ja or not en:
             return {}
-        return {"ja": ja, "en": en}
+        # RECORDED, NOT INFERRED. Whether this was cut is known here and nowhere else: reading
+        # it back off the ellipsis mistakes a model that chose to end a sentence that way for
+        # one that overran, and spends a retry proving it.
+        trimmed = len(raw_ja) > MAX_JA or len(raw_en) > MAX_EN
+        return {"ja": ja, "en": en, "trimmed": trimmed}
     except Exception:
         return {}
 
@@ -247,14 +253,14 @@ def build_prompt(record: dict) -> str:
 def _fits(pair: dict) -> bool:
     """Whether a reply came back inside the limits it was given.
 
-    Asked of the truncation mark, not of the length: parse_reply has already trimmed by the
-    time anyone can look, so a length test would call every reply a fit. The mark is the only
-    remaining evidence that the model overran.
+    Read from the flag parse_reply sets, because it is the only place the answer is knowable:
+    by the time anyone else looks the text has already been trimmed, so a length test calls
+    every reply a fit, and reading the ellipsis back off the end mistakes a model that chose
+    to finish a sentence that way for one that overran.
     """
     if not pair:
         return False
-    return not (str(pair.get("ja") or "").endswith(TRUNCATED)
-                or str(pair.get("en") or "").endswith(TRUNCATED))
+    return not bool(pair.get("trimmed"))
 
 
 def tighten_prompt(record: dict) -> str:

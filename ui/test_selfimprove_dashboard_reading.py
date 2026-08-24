@@ -285,8 +285,9 @@ def test_the_pairing_runs_forwards_in_time():
     seg = body[body.index("var closedBy = new Dictionary<int, int>();"):]
     seg = seg[:seg.index("int testRecords")]
     assert 'rows[i].TryGetValue("event", out a);' in seg
-    assert 'rows[i + 1].TryGetValue("event", out b);' in seg
     assert 'Convert.ToString(a) != "baseline_mismatch"' in seg
+    # Forwards: the search for the closing re-signing starts AFTER the mismatch.
+    assert "for (int j = i + 1; j < rows.Count; j++)" in seg
     assert 'Convert.ToString(b) != "rebless"' in seg
 
 
@@ -294,7 +295,7 @@ def test_a_pair_is_only_collapsed_when_it_names_the_same_files():
     """A mismatch that detected something other than what was then approved is the anomaly a
     reader should see first."""
     body = _authority()
-    assert "if (!SameTargets(rows[i], rows[i + 1])) continue;" in body
+    assert "if (SameTargets(rows[i], rows[j])) closedBy[i] = j;" in body
 
 
 def test_the_unpinned_marker_does_not_look_like_a_different_file():
@@ -330,7 +331,10 @@ def test_test_written_records_are_counted_not_deleted():
     body = _authority()
     assert 'string.Format(T("ev_testrecords"), testRecords)' in body
     ident = _fn("    static bool IsTestRecord(Dictionary<string, object> row)")
-    assert '"Temp"' in ident and '"tmp"' in ident
+    # Absolute, not "contains tmp": a repository file whose path merely contains it would
+    # otherwise be folded out of sight, which is the failure this section spent the morning
+    # fixing, applied to a real record.
+    assert "p[1] == ':'" in ident
 
 
 def test_the_count_is_exact_rather_than_approximate():
@@ -489,13 +493,23 @@ def test_cancelling_records_nothing():
 
 def test_an_approved_item_stays_on_screen_with_the_words_that_approved_it():
     """Removing it at the moment of approval is what made approving feel identical to being
-    ignored: the entry vanishes, which is what a lost decision also looks like."""
-    body = _pending()
-    assert 'if (status == "approved")' in body
-    assert "qt.Text" in body and "+ words +" in body
-    assert 'T("pd_approved")' in body
+    ignored: the entry vanishes, which is what a lost decision also looks like.
+
+    Checked against BuildDecisions, where that now happens. This used to read BuildPending,
+    which stopped showing answered items when the history section was added -- so the branch
+    it asserted could no longer run, and the test went on passing on unreachable code."""
+    hist = _fn("    UIElement BuildDecisions()")
+    assert 'T("pd_approved")' in hist
+    assert "qt.Text" in hist and "+ words +" in hist
     py = (UI.parent / "relay" / "selfimprove" / "pending.py").read_text(encoding="utf-8")
     assert "LIVE = (OPEN, APPROVED)" in py
+
+
+def test_the_awaiting_section_has_no_branch_for_an_answered_item():
+    """It reads unanswered items only, so any such branch is unreachable -- and unreachable
+    code with a test pointed at it is worse than none: it reports a property nothing has."""
+    body = _pending()
+    assert '"approved"' not in body
 
 
 def test_an_approved_command_no_longer_carries_the_placeholder():
@@ -588,6 +602,41 @@ def test_the_count_chip_counts_only_what_is_unanswered():
     assert 'Pill(rows.Count.ToString()' in body
 
 
-def test_an_answered_card_offers_no_second_approval():
+def test_the_controls_are_offered_because_the_item_is_unanswered():
+    """The guard that used to sit here tested a status this section can no longer see."""
     body = _pending()
-    assert 'if (status != "approved")' in body
+    assert 'yes.Content = T("pd_approve");' in body
+    assert 'no.Content = T("pd_reject");' in body
+    assert "ReadPendingQueue(true)" in body
+
+
+def test_a_mismatch_is_paired_with_the_next_re_signing_not_the_next_row():
+    """Anything landing in between -- a genome apply, another detection -- pushed the pair
+    apart, and the mismatch was then drawn in red as unresolved. That is the one state on this
+    screen that must never be claimed wrongly, and one of the live ledger's 24 says it today."""
+    body = _authority()
+    seg = body[body.index("var closedBy = new Dictionary<int, int>();"):]
+    seg = seg[:seg.index("int testRecords")]
+    assert "for (int j = i + 1; j < rows.Count; j++)" in seg
+    assert 'if (Convert.ToString(b) != "rebless") continue;' in seg
+
+
+def test_the_search_stops_at_the_first_re_signing():
+    """Scanning further would let a much later, unrelated re-signing swallow a mismatch nobody
+    ever answered."""
+    body = _authority()
+    seg = body[body.index("for (int j = i + 1; j < rows.Count; j++)"):]
+    seg = seg[:seg.index("int testRecords")]
+    assert "break;" in seg
+    i_assign = seg.index("closedBy[i] = j;")
+    i_break = seg.index("break;", i_assign - 200)
+    assert i_break > i_assign or "break;" in seg[i_assign:i_assign + 80]
+
+
+def test_a_test_record_is_one_written_outside_the_repository():
+    """Matching the substring "tmp" would fold a real record about a repository file whose path
+    merely contains it, and folding a real act out of sight is what this section spent the
+    morning fixing."""
+    body = _fn("    static bool IsTestRecord(Dictionary<string, object> row)")
+    assert "p[1] == ':'" in body
+    assert 'p.IndexOf("tmp"' not in body

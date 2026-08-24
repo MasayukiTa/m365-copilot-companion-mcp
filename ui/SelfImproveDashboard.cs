@@ -1118,13 +1118,25 @@ class SelfImproveDashboardWindow : Window
         {
             for (int i = 0; i + 1 < rows.Count; i++)
             {
-                object a, b;
+                object a;
                 rows[i].TryGetValue("event", out a);
-                rows[i + 1].TryGetValue("event", out b);
                 if (Convert.ToString(a) != "baseline_mismatch") continue;
-                if (Convert.ToString(b) != "rebless") continue;
-                if (!SameTargets(rows[i], rows[i + 1])) continue;
-                closedBy[i] = i + 1;
+                // THE NEXT RE-SIGNING, not the next ROW. Anything at all landing in between --
+                // a genome apply, another detection -- pushed the pair apart and the mismatch
+                // was then drawn in red as unresolved, which is the one state on this screen
+                // that must never be claimed wrongly. One of the live ledger's 24 says exactly
+                // that today.
+                //
+                // Still only the FIRST subsequent re-signing, and still only when the targets
+                // agree. Scanning further would let a much later, unrelated re-signing swallow
+                // a mismatch nobody ever answered.
+                for (int j = i + 1; j < rows.Count; j++)
+                {
+                    object b; rows[j].TryGetValue("event", out b);
+                    if (Convert.ToString(b) != "rebless") continue;
+                    if (SameTargets(rows[i], rows[j])) closedBy[i] = j;
+                    break;
+                }
             }
         }
 
@@ -2076,11 +2088,11 @@ class SelfImproveDashboardWindow : Window
             var flist2 = files as System.Collections.ArrayList;
             if (flist.Count == 0 && flist2 != null)
                 foreach (var f in flist2) flist.Add(Convert.ToString(f));
-            string st = S(r, "status");
-            string head0 = string.Join(", ", flist.ToArray());
-            if (st == "approved") head0 = head0 + "   —   " + T("pd_approved")
-                                        + " · " + T("pd_waiting");
-            var filesTb = ClipLine(head0, Fg, Theme.FsMeta, true);
+            // No approved decoration here any more: this section reads unanswered items
+            // only, so that branch could not fire -- and a test was anchored on it,
+            // passing on code nothing could reach. Answered ones live in BuildDecisions.
+            var filesTb = ClipLine(string.Join(", ", flist.ToArray()), Fg,
+                                   Theme.FsMeta, true);
             filesTb.FontWeight = FontWeights.SemiBold;
             Grid.SetColumn(filesTb, 0); g.Children.Add(filesTb);
 
@@ -2133,25 +2145,6 @@ class SelfImproveDashboardWindow : Window
                 body.Children.Add(cmdTb);
             }
 
-            if (status == "approved")
-            {
-                // The answer, kept in the form this file reserves for verbatim material, and
-                // the entry stays on screen until the work is done. Removing it at the moment
-                // of approval is what made approving feel identical to being ignored.
-                var q = new Border();
-                q.Background = QuoteBg;
-                q.CornerRadius = new CornerRadius(Theme.RadSmall);
-                q.Padding = new Thickness(8, 4, 8, 4);
-                q.Margin = new Thickness(0, 8, 0, 0);
-                q.HorizontalAlignment = HorizontalAlignment.Left;
-                var qt = new TextBlock();
-                qt.Text = "\u201c" + words + "\u201d";
-                qt.Foreground = Muted; qt.FontSize = Theme.FsMeta;
-                qt.TextWrapping = TextWrapping.Wrap; qt.MaxWidth = 620;
-                q.Child = qt;
-                body.Children.Add(q);
-            }
-
             // -- the controls. A card that only offers "copy" states that a decision is
             //    waiting without offering anywhere to make it, which is the same shape as the
             //    notification that opened a text file of commands to paste.
@@ -2159,7 +2152,6 @@ class SelfImproveDashboardWindow : Window
             actions.Orientation = Orientation.Horizontal;
             actions.Margin = new Thickness(0, 10, 0, 0);
 
-            if (status != "approved")
             {
                 var yes = new Button();
                 yes.Content = T("pd_approve");
@@ -2724,10 +2716,15 @@ class SelfImproveDashboardWindow : Window
         if (files == null || files.Count == 0) return false;
         foreach (var k in files.Keys)
         {
+            // ABSOLUTE MEANS ELSEWHERE. Matching the substring "tmp" would fold a real record
+            // about a repository file whose path merely contains it -- and folding a real act
+            // out of sight is the failure this section spent the morning fixing. Every path a
+            // genuine record names is repository-relative; every one a test run wrote is an
+            // absolute path into a temp directory.
             string p = StripPin(k);
-            bool temp = p.IndexOf("Temp", StringComparison.OrdinalIgnoreCase) >= 0
-                     || p.IndexOf("tmp", StringComparison.OrdinalIgnoreCase) >= 0;
-            if (!temp) return false;
+            bool absolute = (p.Length > 1 && p[1] == ':')
+                         || p.StartsWith("\\") || p.StartsWith("/");
+            if (!absolute) return false;
         }
         return true;
     }

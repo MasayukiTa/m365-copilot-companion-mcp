@@ -99,12 +99,14 @@ def test_a_record_without_a_reason_is_not_queued():
 
 def test_a_well_formed_reply_is_accepted():
     got = RS.parse_reply('{"ja": "拒否文を実行可能な文面に修正", "en": "reword the refusal"}')
-    assert got == {"ja": "拒否文を実行可能な文面に修正", "en": "reword the refusal"}
+    assert got["ja"] == "拒否文を実行可能な文面に修正"
+    assert got["en"] == "reword the refusal"
+    assert got["trimmed"] is False
 
 
 def test_a_fenced_reply_is_accepted():
     got = RS.parse_reply('ここです:\n```json\n{"ja": "あ", "en": "b"}\n```\n以上')
-    assert got == {"ja": "あ", "en": "b"}
+    assert got["ja"] == "あ" and got["en"] == "b"
 
 
 def test_a_reply_that_did_not_answer_is_refused_rather_than_massaged():
@@ -137,7 +139,8 @@ def test_a_trim_prefers_a_sentence_break():
 
 def test_a_summary_that_fits_is_left_exactly_as_written():
     got = RS.parse_reply(json.dumps({"ja": "短い要約", "en": "short summary"}))
-    assert got == {"ja": "短い要約", "en": "short summary"}
+    assert got["ja"] == "短い要約" and got["en"] == "short summary"
+    assert got["trimmed"] is False
 
 
 # ── generating ──────────────────────────────────────────────────────────────────────
@@ -356,3 +359,17 @@ def test_a_save_that_never_lands_is_reported(monkeypatch):
 def test_a_normal_run_does_not_carry_the_unsaved_key():
     rep = RS.backfill([_rec("a", LONG_EN)], lambda p: '{"ja": "あ", "en": "b"}')
     assert "unsaved" not in rep
+
+
+def test_a_model_that_ends_with_an_ellipsis_is_not_called_truncated():
+    """Reading the mark back off the end mistakes a model that chose to finish a sentence that
+    way for one that overran, and spends a retry proving it."""
+    got = RS.parse_reply(json.dumps({"ja": "続きは記録に…", "en": "the rest is in the record…"}))
+    assert got["trimmed"] is False
+    assert RS._fits(got) is True
+
+
+def test_an_actual_overrun_is_still_caught():
+    got = RS.parse_reply(json.dumps({"ja": "あ" * 300, "en": "b" * 400}))
+    assert got["trimmed"] is True
+    assert RS._fits(got) is False
