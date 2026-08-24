@@ -274,7 +274,8 @@ jobs:
             relay/test_signin_residue_reaper.py \
             relay/test_socket_conversation_identity.py \
             bridge/test_send_contract.py \
-            scripts/test_transport_series.py
+            scripts/test_transport_series.py \
+            tests/test_process_lookup_does_not_match_itself.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py
