@@ -189,3 +189,19 @@ def test_the_cli_records_an_approval_with_words(capsys):
     rc = P._cli(["--approve", pid, "--authorization", "承認する"])
     assert rc == 0
     assert P.items()[0]["status"] == P.APPROVED
+
+
+def test_the_repo_wide_fixture_keeps_tests_out_of_the_live_queue():
+    """The fourth live-record leak here, and the layer that exists to make the next one inert
+    by construction. Wiring frozen.py's refusal to this queue gave a test that runs the real
+    CLI a route into the operator's real decisions -- a proposal about manifest.py, reason
+    "routine", appeared among them within minutes."""
+    from pathlib import Path
+    src = (Path(__file__).parent.parent.parent / "conftest.py").read_text(encoding="utf-8")
+    assert "relay.selfimprove.pending" in src
+    assert '"QUEUE_PATH"' in src
+
+
+def test_this_suite_is_not_writing_to_the_real_queue():
+    """Belt and braces: the fixture above redirects it, and this asserts the redirection took."""
+    assert "live_records" in P.QUEUE_PATH or "Temp" in P.QUEUE_PATH or "tmp" in P.QUEUE_PATH.lower()

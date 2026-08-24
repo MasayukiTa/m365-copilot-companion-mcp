@@ -544,6 +544,37 @@ def _record_rebless(args, before, after) -> None:
 
 
 
+def _undo_hint() -> str:
+    """How to withdraw the last re-signing, in one line. Never raises."""
+    return ("  undo: python -m relay.selfimprove.frozen --revoke"
+            "   (withdraws the APPROVAL, not the code -- the frozen check fails afterwards,"
+            " which is the point)")
+
+
+def _queue_refused(excluded, args) -> None:
+    """Put a refused proposal somewhere it will still be there tomorrow. Never raises.
+
+    Only the reason the caller gave is queued. This function does not compose an argument for
+    the change on the caller's behalf: an entry that read like a case made by the thing asking
+    for permission is worse than no entry, and the operator has to be able to tell a proposal
+    from an advocate.
+    """
+    try:
+        from relay.selfimprove import pending
+
+        reason = str(getattr(args, "reason", "") or "").strip()
+        if not reason:
+            return
+        pending.add(
+            list(excluded), reason,
+            command=("python -m relay.selfimprove.frozen --snapshot --force "
+                     "--reason \"%s\" --authorization \"<your words>\""
+                     % reason.replace('"', "'")),
+        )
+    except Exception:
+        pass
+
+
 def _main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="relay.selfimprove.frozen",
                                  description="Frozen-constitution checksum guard.")
@@ -613,6 +644,17 @@ def _main(argv: list[str] | None = None) -> int:
                   "not cover -- these files define what may be evolved, what the delegation "
                   "excludes, and how a re-signing is withdrawn. Pass --authorization with the "
                   "operator's decision about THIS change." % ", ".join(excluded))
+            # QUEUED, NOT DROPPED. The refusal is right; what followed it was not. The agent
+            # reported it, the turn ended, and unless the operator happened to remember, the
+            # proposal was gone -- two were nearly lost in a single day that way. Queuing turns
+            # "stopped" into "waiting on somebody", which is the only part of this that can be
+            # bought: the queue runs in the same privilege domain as everything else here and
+            # adds no enforcement whatever.
+            #
+            # Best effort by construction. A queue that failed would otherwise turn a clean
+            # refusal into a traceback, and the refusal is the part that matters.
+            _queue_refused(excluded, args)
+            print(_undo_hint())
             return 2
         try:
             data = snapshot_baseline(args.repo, args.baseline, force=args.force)
@@ -621,6 +663,10 @@ def _main(argv: list[str] | None = None) -> int:
             return 2
         _record_rebless(args, before, data)
         print("snapshot written: %s" % args.baseline)
+        # The next move, where the person reading this already is. Until now the undo existed
+        # only as a button on a dashboard, so anybody working from the CLI could re-sign and
+        # have no idea the act was reversible.
+        print(_undo_hint())
         for rel, h in sorted(data["checksums"].items()):
             print("  %s  %s" % (h[:16] if h != MISSING else MISSING.ljust(16), rel))
         return 0

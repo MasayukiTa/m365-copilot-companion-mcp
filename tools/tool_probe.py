@@ -265,6 +265,56 @@ FALLBACK_CHALLENGE_INSTRUCTION = (
 )
 
 
+#: Where an inbound sighting is stamped. Its own file, not tool_probe.json: this is written
+#: from the SERVER process on the tool-call hot path, while tool_probe.json is written by the
+#: bridge, and two processes rewriting one file would race on the atomic replace.
+_INBOUND_PATH = Path(__file__).resolve().parent.parent / ".fleet" / "probe_inbound.json"
+
+
+def note_inbound(tool_name: str, arguments: Optional[dict] = None,
+                 ts: Optional[float] = None, path: Optional[str] = None) -> bool:
+    """Stamp the moment a probe's OWN tool call arrived at this server. Returns whether it did.
+
+    THE FAILURE THIS ANSWERS WAS INVISIBLE BECAUSE IT DIED UPSTREAM OF US. When the connector's
+    consent lapses, the call never reaches this process, so no counter here ever moves and every
+    dot stays green. The success, though, is entirely visible here: the probe asks the agent to
+    list ONE directory whose name only this server knows. So the arrival is the signal, and its
+    ABSENCE during a probe window is the alarm -- and it says the same thing whether the turn
+    went over a page or a socket, which reply-text parsing cannot.
+
+    Called on the gateway's dispatch path, so it does the cheap test first and writes nothing
+    unless the call is actually ours. Never raises: this must not be able to fail a tool call.
+    """
+    try:
+        target = str(_CHALLENGE_DIR).lower()
+        hay = str(path if path is not None else (arguments or {})).lower()
+        if target not in hay and "probe_challenge" not in hay:
+            return False
+        stamp = {"ts": float(ts if ts is not None else time.time()),
+                 "tool": str(tool_name or "")[:64]}
+        _INBOUND_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = str(_INBOUND_PATH) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(stamp, fh, ensure_ascii=False)
+        os.replace(tmp, str(_INBOUND_PATH))
+        return True
+    except Exception:
+        return False
+
+
+def last_inbound_ts() -> float:
+    """When a probe's tool call last reached this server, or 0.0 if never. Never raises.
+
+    0.0 rather than None so a caller comparing against a window start cannot accidentally
+    treat "never seen" as "seen just now" through a None comparison.
+    """
+    try:
+        with open(str(_INBOUND_PATH), encoding="utf-8") as fh:
+            return float((json.load(fh) or {}).get("ts") or 0.0)
+    except Exception:
+        return 0.0
+
+
 def new_probe_challenge(base_dir: Optional[str] = None) -> Tuple[str, str]:
     """Create ONE fresh, unguessable probe challenge and return (instruction_text,
     expected_token).
@@ -345,7 +395,7 @@ def verify_probe_reply(reply_text: Optional[str], expected_token: str,
 
 
 def record_probe(ok: bool, kind: str, detail: str = "", ts: Optional[float] = None,
-                 alive: Optional[bool] = None) -> None:
+                 alive: Optional[bool] = None, inbound: Optional[bool] = None) -> None:
     """Record the outcome of one tool-call self-probe and best-effort persist it to
     .fleet/tool_probe.json (atomic tmp+os.replace, utf-8, ensure_ascii=False -- same pattern
     as tools/auth_stats.write_snapshot). Never raises.
@@ -364,6 +414,13 @@ def record_probe(ok: bool, kind: str, detail: str = "", ts: Optional[float] = No
         payload = {"ts": now, "ok": bool(ok), "kind": kind, "detail": detail or ""}
         if alive is not None:
             payload["alive"] = bool(alive)
+        # WHETHER THE PROBE'S OWN TOOL CALL REACHED THIS SERVER, stamped by the gateway. Kept
+        # separate from `alive`: text can come back from a model that never called anything,
+        # and a call can arrive from a turn whose reply is then unusable. The pair is what
+        # separates a connector-path failure from a reply failure, and it reads the same over
+        # a page or a socket -- which no amount of reply parsing does.
+        if inbound is not None:
+            payload["inbound"] = bool(inbound)
         with _LOCK:
             _PROBE_FILE.parent.mkdir(parents=True, exist_ok=True)
             tmp = str(_PROBE_FILE) + ".tmp"
@@ -504,6 +561,8 @@ def get_summary(now: Optional[float] = None) -> dict:
     "tool_age_s": float|None, "tool_alive": bool|None} -- the shape /health's
     payload.update(...) mirrors from tools.auth_stats.get_summary().
 
+    tool_inbound is whether the probe's own tool call reached this server (the gateway stamps
+    it); with tool_alive it separates a connector-path failure from a reply failure.
     tool_alive is whether text came back on that turn, recorded by the caller that still had
     the reply. Records written before this field existed simply lack it, so it reads as None
     ("no evidence") rather than as a negative.
@@ -513,7 +572,7 @@ def get_summary(now: Optional[float] = None) -> dict:
     is a caller-supplied reference time for computing tool_age_s, defaulting to
     time.time() -- deterministic for tests, real wallclock in production (e.g. /health)."""
     empty = {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None,
-             "tool_alive": None}
+             "tool_alive": None, "tool_inbound": None}
     try:
         with open(_PROBE_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
@@ -527,6 +586,7 @@ def get_summary(now: Optional[float] = None) -> dict:
             "tool_ts": ts,
             "tool_age_s": max(0.0, ref - ts),
             "tool_alive": raw.get("alive"),
+            "tool_inbound": raw.get("inbound"),
         }
     except Exception:
         return dict(empty)

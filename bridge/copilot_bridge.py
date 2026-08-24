@@ -4589,6 +4589,11 @@ def _run_tool_probe():
             # docstring) -- the token has to travel with this specific turn, so it is captured
             # here and threaded through to the verify_probe_reply() call(s) below rather than
             # looked up from any shared/global state.
+            # WHEN THE WINDOW OPENED, so an arrival can be told from a leftover. The gateway
+            # stamps .fleet/probe_inbound.json when the probe's own list_directory reaches the
+            # server; comparing against the stamp from BEFORE this challenge was issued is what
+            # makes the absence of an arrival mean something.
+            _inbound_before = tool_probe.last_inbound_ts()
             instruction, expected_token = _next_tool_probe_challenge()
             agent_loaded, reply, timed_out = _run_bounded_page_probe_call(
                 lambda: _do_tool_probe_turn(instruction)
@@ -4650,8 +4655,15 @@ def _run_tool_probe():
         # `alive` has to be decided here, where the reply still exists: "error" is
         # verify_probe_reply's catch-all and covers both "answered, but not with our
         # challenge" and "came back empty", so the kind alone cannot tell them apart.
+        # DID THE CALL REACH US AT ALL? Independent of the reply text and identical over a page
+        # or a socket. A probe that fails WITH an arrival is a model/reply problem; one that
+        # fails WITHOUT is the connector path, which is the incident this probe was built for.
+        try:
+            _inbound = tool_probe.last_inbound_ts() > _inbound_before
+        except Exception:
+            _inbound = None
         tool_probe.record_probe(ok, kind, detail=(reply or "")[:200],
-                                alive=bool((reply or "").strip()))
+                                alive=bool((reply or "").strip()), inbound=_inbound)
         # Additive: preserve the FULL reply (record_probe's `detail` above stays truncated to
         # 200 chars unchanged, per tool_probe.journal_probe_failure's contract) so a failed
         # probe's evidence -- e.g. a reply carrying a STALE token from a previous challenge --

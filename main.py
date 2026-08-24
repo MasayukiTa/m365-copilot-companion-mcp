@@ -499,6 +499,22 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
             _tok_handle = _sec.set_presented_token(str(_token))
         except Exception:
             _sec = None
+        # THE PROBE'S OWN CALL ARRIVING HERE IS THE SIGNAL, AND ITS ABSENCE IS THE ALARM.
+        #
+        # The incident the self-probe exists for -- a lapsed connector consent -- kills the call
+        # INSIDE the Copilot web UI, upstream of this process, so nothing here ever moves and
+        # every health dot stays green. The success is fully visible here though: the probe asks
+        # the agent to list one directory whose name only this server knows. Stamping the arrival
+        # gives the bridge a signal that does not depend on parsing reply text, and that reads
+        # the same whether the turn went over a page or a socket.
+        #
+        # On the hot path, so the cheap test comes first and nothing is written unless the call
+        # is ours; it can never raise, because a tool call must not fail over bookkeeping.
+        try:
+            from tools import tool_probe as _probe
+            _probe.note_inbound(name, _args)
+        except Exception:
+            pass
         try:
             _out = fn(**_args)
             if _trace is not None:

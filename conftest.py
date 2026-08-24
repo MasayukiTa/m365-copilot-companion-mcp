@@ -53,6 +53,20 @@ def _no_writes_to_the_live_records(tmp_path_factory, monkeypatch):
                             raising=False)
     except Exception:
         pass
+
+    # THE NEXT ONE, CAUGHT BY THE LAYER THAT EXISTS FOR IT. Wiring frozen.py's refusal to the
+    # pending queue gave a test that runs the real CLI a route into the operator's live queue:
+    # a proposal about manifest.py, reason "routine", appeared among the real decisions within
+    # minutes. That is the fourth time a test has written to a live record here, which is the
+    # whole reason this fixture exists -- so the entry goes in here rather than in the one
+    # test that happened to trip it.
+    try:
+        import relay.selfimprove.pending as pending
+        monkeypatch.setattr(pending, "QUEUE_PATH", str(base / "pending_decisions.jsonl"),
+                            raising=False)
+    except Exception:
+        pass
+
     yield base
 
 
