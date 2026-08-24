@@ -4126,14 +4126,25 @@ class Handler(BaseHTTPRequestHandler):
         rest of the queue or crash the server loop."""
         for item in drain_pending_once(sid):
             try:
-                _prepare_capture_baseline(sid)
-                final = self._send_and_stream_once(item, stream_out=False)
-                if final is not None and _looks_like_consent(final):
-                    if _bridge_auto_consent():
-                        try:
-                            final = self._send_and_stream_once(item, stream_out=False)
-                        except Exception:
-                            final = None
+                # ONE PLACE THAT SENDS A TURN. This called _send_and_stream_once directly,
+                # which meant every queued input -- steering during a /goal run, and now every
+                # promoted idle /send -- went out past the unlock machinery: both the proactive
+                # preflight and the reactive retry live in _run_one_turn and nowhere else. So
+                # an instruction typed into main while nothing was running reached an agent
+                # that had never been given the password, which is the "unlock is not read on
+                # a follow-up" the operator reported.
+                #
+                # It also duplicated a weaker version of the consent handling that helper
+                # already owns, and skipped the turn-timestamp the tool probe reads. A second
+                # way to send a turn is a second set of things to remember, and this one had
+                # already forgotten three.
+                final = self._run_one_turn(sid, item, stream_out=False)
+                if isinstance(final, dict):
+                    # {"consent_failed": True}: a card that could not be auto-approved. Nothing
+                    # to persist, and the next queued item may still be fine.
+                    logger.warning("drain_pending_queue: consent not auto-approved for sid=%s",
+                                   sid)
+                    continue
                 if final:
                     _persist_exchange(sid, item, final)
             except Exception:
