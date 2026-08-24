@@ -212,7 +212,7 @@ def test_best_pass_is_computed_from_the_genomes_and_survives_a_missing_field():
 def test_the_pending_section_is_absent_when_nothing_is_pending():
     """An empty call to action is noise, and it would sit above everything else."""
     body = _fn("    UIElement BuildPending(Dictionary<string, object> state)")
-    assert "if (rows == null || rows.Length == 0) return null;" in body
+    assert "if (rows == null || rows.Count == 0) return null;" in body
     order = _fn("    void Render(Dictionary<string, object> state)")
     assert "if (pending != null) _body.Children.Add(pending);" in order
 
@@ -516,3 +516,78 @@ def test_a_failed_recording_is_shown_rather_than_swallowed():
 def test_the_decision_goes_through_the_module_that_owns_the_format():
     body = _fn("    bool RecordDecision(string pid, string verb, string words, string kind)")
     assert '"-m relay.selfimprove.pending "' in body
+
+
+# ── the queue itself, not a snapshot of it ──────────────────────────────────────────
+
+def test_the_pending_cards_read_the_queue_and_not_a_regenerated_file():
+    """Approving worked -- the queue recorded the chosen phrase correctly -- and the card did
+    not move, because the window re-rendered .fleet/selfimprove_dashboard.json, which only a
+    separate `dashboard --write` refreshes. A real approval with a screen saying otherwise is
+    worse than a button that does nothing: there is nothing to retry and nothing looks wrong."""
+    body = _pending()
+    assert "var rows = ReadPendingQueue(true);" in body   # unanswered only
+    assert 'Arr(state, "pending_decisions")' not in body
+    rq = _fn("    List<Dictionary<string, object>> ReadPendingQueue(bool wantOpen)")
+    assert '"pending_decisions.jsonl"' in rq
+
+
+def test_the_queue_reader_replays_resolutions_over_the_queued_rows():
+    rq = _fn("    List<Dictionary<string, object>> ReadPendingQueue(bool wantOpen)")
+    assert 'if (ev == "queued")' in rq
+    assert 'else if (ev == "resolved" && byId.ContainsKey(id))' in rq
+    assert 'byId[id]["authorization"] = S(row, "authorization");' in rq
+
+
+def test_a_torn_line_in_the_queue_does_not_hide_the_rest():
+    rq = _fn("    List<Dictionary<string, object>> ReadPendingQueue(bool wantOpen)")
+    assert "catch (Exception) { continue; }" in rq
+
+
+def test_an_answered_proposal_leaves_the_awaiting_section_entirely():
+    """It stayed there so that approving did not look like being ignored, which put decided
+    items under a heading that says they are still waiting -- the heading and its contents
+    contradicting each other."""
+    rq = _fn("    List<Dictionary<string, object>> ReadPendingQueue(bool wantOpen)")
+    assert 'if (wantOpen == (st == "open")) open_.Add(byId[id]);' in rq
+    hist = _fn("    UIElement BuildDecisions()")
+    assert "ReadPendingQueue(false)" in hist
+
+
+def test_the_history_reads_newest_first():
+    rq = _fn("    List<Dictionary<string, object>> ReadPendingQueue(bool wantOpen)")
+    assert "if (!wantOpen) open_.Reverse();" in rq
+
+
+def test_an_approved_proposal_stays_visible_until_it_is_carried_out():
+    """An approval that vanishes the moment it is given is indistinguishable from one that
+    was lost."""
+    hist = _fn("    UIElement BuildDecisions()")
+    assert 'status == "approved" ? mark + " \\u00b7 " + T("pd_waiting") : mark' in hist
+    py = (UI.parent / "relay" / "selfimprove" / "pending.py").read_text(encoding="utf-8")
+    assert "LIVE = (OPEN, APPROVED)" in py
+
+
+def test_a_rejected_proposal_keeps_its_reason():
+    """So the next time the same thing comes up, the earlier decision can be read."""
+    hist = _fn("    UIElement BuildDecisions()")
+    assert 'T("dh_dropped")' in hist
+    assert "words.Length > 0" in hist
+
+
+def test_the_history_is_absent_when_nothing_has_been_decided():
+    hist = _fn("    UIElement BuildDecisions()")
+    assert "if (rows == null || rows.Count == 0) return null;" in hist
+    order = _fn("    void Render(Dictionary<string, object> state)")
+    assert "if (decided != null) _body.Children.Add(decided);" in order
+
+
+def test_the_count_chip_counts_only_what_is_unanswered():
+    """The section holds only unanswered items now, so its own count is the count."""
+    body = _pending()
+    assert 'Pill(rows.Count.ToString()' in body
+
+
+def test_an_answered_card_offers_no_second_approval():
+    body = _pending()
+    assert 'if (status != "approved")' in body

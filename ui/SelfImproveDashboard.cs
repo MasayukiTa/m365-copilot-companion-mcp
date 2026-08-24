@@ -244,6 +244,14 @@ class SelfImproveDashboardWindow : Window
             ? "却下する。今はやらない（後で見直す）。"
             : "Rejected for now; revisit later.";
         if (k == "pd_own")        return ja ? "自分で書く" : "Write my own";
+        if (k == "pd_all_answered") return ja ? "すべて回答済み" : "all answered";
+        if (k == "dh_sec")        return ja ? "判断の履歴" : "Decisions made";
+        if (k == "dh_exp")        return ja
+            ? "答えの済んだ提案。承認したものは実施されるまでここに残り、却下したものは理由とともに残る — 同じ提案が次に出たとき、既に判断したことが読める。"
+            : "Proposals that have been answered. An approved one stays here until it is carried out; a rejected one stays with its reason, so the next time it comes up the earlier decision can be read.";
+        if (k == "dh_done")       return ja ? "実施済み" : "done";
+        if (k == "dh_dropped")    return ja ? "却下" : "rejected";
+        if (k == "dh_none")       return ja ? "まだありません" : "none yet";
         if (k == "pd_recorded")   return ja
             ? "選んだ文がそのまま台帳に記録されます。"
             : "The phrase you pick is what goes into the ledger, word for word.";
@@ -831,6 +839,8 @@ class SelfImproveDashboardWindow : Window
         _body.Children.Add(BuildPassTrend(state));
         _body.Children.Add(BuildUsage(state));
         _body.Children.Add(BuildBurnedLedger(state));
+        var decided = BuildDecisions();
+        if (decided != null) _body.Children.Add(decided);
         _body.Children.Add(BuildAuthority());
     }
 
@@ -1825,6 +1835,62 @@ class SelfImproveDashboardWindow : Window
     // authorisation is verbatim; a button that recorded "approved from the dashboard" would be
     // this window putting words in their mouth, which is the one thing the quote form exists to
     // prevent. MessageBox cannot take text, so this is the smallest window that can.
+    // THE QUEUE ITSELF, NOT A SNAPSHOT OF IT. These entries used to come from
+    // .fleet/selfimprove_dashboard.json, which only a separate `dashboard --write` refreshes.
+    // So approving worked -- the queue recorded the operator's chosen phrase correctly -- and
+    // the card did not move, because the window re-rendered the same stale file. The approval
+    // was real and the screen said otherwise, which is worse than the button not working:
+    // there is nothing to retry and nothing that looks wrong.
+    //
+    // Read straight from the append-only jsonl, replaying rows the way the module does. Same
+    // reasoning as the frozen-set check above: this window computes what it shows rather than
+    // believing a file some other process is responsible for keeping current.
+    List<Dictionary<string, object>> ReadPendingQueue(bool wantOpen)
+    {
+        var open_ = new List<Dictionary<string, object>>();
+        try
+        {
+            string p = Path.Combine(RepoRoot(), ".fleet", "selfimprove",
+                                    "pending_decisions.jsonl");
+            if (!File.Exists(p)) return open_;
+
+            var byId = new Dictionary<string, Dictionary<string, object>>();
+            var order = new List<string>();
+            foreach (string line in File.ReadAllLines(p, Encoding.UTF8))
+            {
+                string t = line.Trim();
+                if (t.Length == 0) continue;
+                Dictionary<string, object> row;
+                try { row = (Dictionary<string, object>)_js.DeserializeObject(t); }
+                catch (Exception) { continue; }   // several processes append; a torn tail is normal
+                if (row == null) continue;
+                string id = S(row, "id");
+                if (id.Length == 0) continue;
+                string ev = S(row, "event");
+                if (ev == "queued")
+                {
+                    if (byId.ContainsKey(id)) continue;
+                    row["status"] = "open";
+                    byId[id] = row; order.Add(id);
+                }
+                else if (ev == "resolved" && byId.ContainsKey(id))
+                {
+                    byId[id]["status"] = S(row, "status").Length > 0 ? S(row, "status") : "done";
+                    byId[id]["authorization"] = S(row, "authorization");
+                    byId[id]["authorization_kind"] = S(row, "authorization_kind");
+                }
+            }
+            foreach (string id in order)
+            {
+                string st = S(byId[id], "status");
+                if (wantOpen == (st == "open")) open_.Add(byId[id]);
+            }
+            if (!wantOpen) open_.Reverse();      // history reads newest first
+        }
+        catch (Exception) { }
+        return open_;
+    }
+
     // A CHOICE, NOT A COMPOSITION EXERCISE. The first version demanded typed words every
     // time, on the reasoning that an authorisation must be verbatim. The contract is narrower
     // than that: what it forbids is this window inventing a decision. A phrase the operator
@@ -1962,20 +2028,23 @@ class SelfImproveDashboardWindow : Window
     // turn and can be found without anyone remembering it exists.
     UIElement BuildPending(Dictionary<string, object> state)
     {
-        object[] rows = Arr(state, "pending_decisions");
-        if (rows == null || rows.Length == 0) return null;
+        // UNANSWERED ONLY. Answered proposals used to stay here so that approving did not look
+        // like being ignored, which put decided items under a heading that says they are still
+        // waiting -- the heading and its contents contradicting each other. They belong in a
+        // history, which is what BuildDecisions below is.
+        var rows = ReadPendingQueue(true);
+        if (rows == null || rows.Count == 0) return null;
 
         var card = SectionCard("pending_sec", "pending_exp");
         var col  = (StackPanel)card.Child;
 
         var head = new WrapPanel(); head.Margin = new Thickness(0, 10, 0, 0);
-        head.Children.Add(Pill(rows.Length.ToString() + (_lang == 0 ? " 件" : " open"), "warn"));
+        head.Children.Add(Pill(rows.Count.ToString() + (_lang == 0 ? " 件" : " open"), "warn"));
         col.Children.Add(head);
 
         double now = (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds;
-        foreach (var o in rows)
+        foreach (var r in rows)
         {
-            var r = o as Dictionary<string, object>;
             if (r == null) continue;
 
             var body = new StackPanel();
@@ -1989,6 +2058,9 @@ class SelfImproveDashboardWindow : Window
             var flist = new List<string>();
             var farr = files as object[];
             if (farr != null) foreach (var f in farr) flist.Add(Convert.ToString(f));
+            var flist2 = files as System.Collections.ArrayList;
+            if (flist.Count == 0 && flist2 != null)
+                foreach (var f in flist2) flist.Add(Convert.ToString(f));
             string st = S(r, "status");
             string head0 = string.Join(", ", flist.ToArray());
             if (st == "approved") head0 = head0 + "   —   " + T("pd_approved")
@@ -2133,6 +2205,96 @@ class SelfImproveDashboardWindow : Window
             rec.Margin  = new Thickness(0, 12, 0, 0);
             rec.Child = body;
             col.Children.Add(rec);
+        }
+        return card;
+    }
+
+    // WHAT WAS ASKED AND ANSWERED. Separate from the queue above because a heading that says
+    // "awaiting a decision" must not hold decided items, and separate from the authority
+    // ledger because that records acts, while these record answers -- including the answers
+    // that stopped an act from happening.
+    //
+    // An approved entry stays here until the work is done, so an approval is visibly
+    // outstanding rather than disappearing the moment it is given.
+    UIElement BuildDecisions()
+    {
+        var rows = ReadPendingQueue(false);
+        if (rows == null || rows.Count == 0) return null;
+
+        var card = SectionCard("dh_sec", "dh_exp");
+        var col  = (StackPanel)card.Child;
+        double now = (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds;
+
+        int shown = 0;
+        foreach (var r in rows)
+        {
+            if (r == null || shown >= 8) break;
+            string status = S(r, "status");
+            string words  = S(r, "authorization");
+
+            var body = new StackPanel();
+
+            var g = new Grid();
+            var c0 = new ColumnDefinition(); c0.Width = new GridLength(1, GridUnitType.Star);
+            var c1 = new ColumnDefinition(); c1.Width = GridLength.Auto;
+            g.ColumnDefinitions.Add(c0); g.ColumnDefinitions.Add(c1);
+
+            string mark = status == "approved" ? T("pd_approved")
+                        : (status == "dropped" ? T("dh_dropped") : T("dh_done"));
+            string title = S(r, "reason");
+            var titleTb = ClipLine(title, Fg, 13.0, false);
+            titleTb.FontWeight = FontWeights.SemiBold;
+            Grid.SetColumn(titleTb, 0); g.Children.Add(titleTb);
+
+            var st = new TextBlock();
+            st.Text = status == "approved" ? mark + " \u00b7 " + T("pd_waiting") : mark;
+            st.Foreground = status == "dropped" ? Muted : Theme.Br(Theme.Faint(_dark));
+            st.FontSize = 11;
+            st.VerticalAlignment = VerticalAlignment.Center;
+            st.Margin = new Thickness(12, 0, 0, 0);
+            Grid.SetColumn(st, 1); g.Children.Add(st);
+            body.Children.Add(g);
+
+            object files; r.TryGetValue("files", out files);
+            var flist = new List<string>();
+            var farr = files as object[];
+            if (farr != null) foreach (var f in farr) flist.Add(Convert.ToString(f));
+            var alist = files as System.Collections.ArrayList;
+            if (flist.Count == 0 && alist != null)
+                foreach (var f in alist) flist.Add(Convert.ToString(f));
+            if (flist.Count > 0)
+            {
+                var fTb = ClipLine(string.Join(", ", flist.ToArray()),
+                                   Theme.Br(Theme.Faint(_dark)), Theme.FsLog, true);
+                fTb.Margin = new Thickness(0, 3, 0, 0);
+                body.Children.Add(fTb);
+            }
+
+            if (words.Length > 0)
+            {
+                // The operator's own phrase, in the form this file reserves for verbatim text.
+                var q = new Border();
+                q.Background = QuoteBg;
+                q.CornerRadius = new CornerRadius(Theme.RadSmall);
+                q.Padding = new Thickness(8, 4, 8, 4);
+                q.Margin = new Thickness(0, 6, 0, 0);
+                q.HorizontalAlignment = HorizontalAlignment.Left;
+                var qt = new TextBlock();
+                qt.Text = "\u201c" + words + "\u201d";
+                qt.Foreground = Muted; qt.FontSize = Theme.FsMeta;
+                qt.TextWrapping = TextWrapping.Wrap; qt.MaxWidth = 620;
+                q.Child = qt;
+                body.Children.Add(q);
+            }
+
+            var rec = new Border();
+            rec.BorderThickness = new Thickness(0, 0, 0, 1);
+            rec.BorderBrush = new SolidColorBrush(Mix(Theme.Col(Theme.Faint(_dark)), CardColor(), 0.22));
+            rec.Padding = new Thickness(0, 0, 0, 10);
+            rec.Margin  = new Thickness(0, 12, 0, 0);
+            rec.Child = body;
+            col.Children.Add(rec);
+            shown++;
         }
         return card;
     }
