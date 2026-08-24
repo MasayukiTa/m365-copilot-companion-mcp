@@ -4243,25 +4243,54 @@ def _send_counted(msg):
 
 
 def _edge_working_set_mb():
-    """Total working set across Edge, in MB, or None. COARSE, AND LABELLED AS SUCH.
+    """Working set of THIS bridge's Edge, in MB, or None. Coarse per tab, but not machine-wide.
 
     Per-tab attribution would need the renderer pid behind this specific page, which the CDP
-    target does not hand over. The only question this has to answer is whether navigating away
-    released the document, and a 1.3 GB conversation sits far above the noise of ordinary tab
-    churn -- so the total settles that, and is not a figure to quote per tab.
+    target does not hand over. The question this answers is whether navigating away released
+    the document, and a 1.3 GB conversation sits far above ordinary tab churn -- so a
+    browser-level total settles it, and it is not a figure to quote per tab.
+
+    IT USED TO SUM EVERY EDGE ON THE MACHINE, and that is not a smaller version of this
+    measurement, it is a different one. Measured 2026-08-24: 45 msedge.exe processes holding
+    6,181 MB here, of which this bridge's browser was 1,002 and the fleet's was 1,559 -- 59%
+    belonged to neither and moved for reasons no recycle caused. The same defect in the
+    fleet's evaluator made a socket arm that opens no tab report 1,070 MB and put two
+    identical arms 707 MB apart. Scoped to the process listening on our own CDP port, plus its
+    children.
     """
     try:
         import psutil
     except Exception:
         return None
+    root = _bridge_edge_root_pid()
+    try:
+        if root is not None:
+            procs = [psutil.Process(root)] + psutil.Process(root).children(recursive=True)
+        else:
+            procs = list(psutil.process_iter(["name", "memory_info"]))
+    except Exception:
+        return None
     total = 0
-    for proc in psutil.process_iter(["name", "memory_info"]):
+    for proc in procs:
         try:
-            if (proc.info.get("name") or "").lower() == "msedge.exe":
-                total += proc.info["memory_info"].rss
+            if (proc.name() or "").lower() == "msedge.exe":
+                total += proc.memory_info().rss
         except Exception:
             continue
     return round(total / (1024.0 * 1024.0), 1) if total else None
+
+
+def _bridge_edge_root_pid():
+    """The pid listening on this bridge's CDP port, or None. Never raises."""
+    try:
+        import psutil
+        port = int(os.environ.get("MCP_BRIDGE_CDP_PORT", "9223"))
+        for conn in psutil.net_connections(kind="tcp"):
+            if conn.status == "LISTEN" and conn.laddr and conn.laddr.port == port:
+                return conn.pid
+    except Exception:
+        return None
+    return None
 
 
 def _recycle_long_conversation():
@@ -4330,6 +4359,26 @@ def _recycle_long_conversation():
     return True
 
 
+#: One line per recycle: what the browser held before and a probe interval after. Under
+#: .fleet/, which is gitignored.
+RECYCLE_SAMPLES_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".fleet", "recycle_samples.jsonl")
+
+
+def _append_recycle_sample(before, after):
+    """Append one before/after row. Best effort; never raises, never blocks the probe."""
+    try:
+        os.makedirs(os.path.dirname(RECYCLE_SAMPLES_PATH), exist_ok=True)
+        row = {"ts": time.time(), "before_mb": before, "after_mb": after,
+               "turns": _CONVERSATION_TURNS,
+               "freed_mb": (round(before - after, 1)
+                            if (before is not None and after is not None) else None)}
+        with open(RECYCLE_SAMPLES_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + chr(10))
+    except Exception:
+        pass
+
+
 def _report_recycle_memory_effect():
     """Log the before/after once, a full probe interval after the recycle that armed it."""
     global _RECYCLE_PENDING_BEFORE_MB, _RECYCLE_MEMORY_MEASURED
@@ -4338,10 +4387,18 @@ def _report_recycle_memory_effect():
         return
     _RECYCLE_MEMORY_MEASURED = True
     after = _edge_working_set_mb()
-    logger.info("conversation recycle: Edge working set %.0f -> %s MB one probe interval "
-                "later (all Edge processes, coarse -- it answers only whether navigating "
-                "away eventually released the document, not any per-tab figure)",
+    logger.info("conversation recycle: this bridge's Edge working set %.0f -> %s MB one probe "
+                "interval later (browser-level, coarse -- it answers whether navigating away "
+                "released the document, not any per-tab figure)",
                 before, ("%.0f" % after) if after is not None else "?")
+    # PERSIST IT. Choosing the conversation-turn cap is a memory-versus-context trade, and
+    # until now the only evidence for it was a log line that scrolled away. One row per
+    # recycle, appended, so the cap can be set from what a recycle actually recovers here
+    # rather than from a number somebody liked.
+    try:
+        _append_recycle_sample(before, after)
+    except Exception:
+        pass
 
 
 def _open_fresh_conversation(title=""):
