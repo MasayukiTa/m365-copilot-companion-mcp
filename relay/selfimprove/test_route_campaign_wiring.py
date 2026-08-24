@@ -334,12 +334,39 @@ def test_the_baseline_waits_for_the_browser_to_settle_not_for_a_guessed_duration
     ピークから、0 に刈られた socket 腕を引くことになる。帰無は静かで処置は
     大差という、今日3回出た『綺麗だが間違った答え』の完成形だった。
 
-    待ち時間は測って決める。3標本連続で変動が閾値未満になるまで。"""
-    body = _edge_mb_source()
+    そして3標本連続では足りなかった。0.5秒×3回で幅25MB未満は「毎秒16.7MB未満」で、
+    捕まえたい漏れは毎秒3.2MB。実測で中央値1.1秒、24腕とも2.6秒を超えず通過していた。
+    落ち着きは、遅い漏れが見える長さの窓で測る。"""
+    from relay.selfimprove import scheduler as S
+
+    # 判定は _edge_mb の中ではなく settle_baseline に在る。ループを閉じ込めたままだと
+    # テストが再実装を検査することになり、それは本体と食い違ったまま緑であり続ける。
+    body = inspect.getsource(S.settle_baseline)
     assert "SETTLE_TOLERANCE_MB" in body, "落ち着きを測っていない"
     assert "SETTLE_MAX_S" in body, "打ち切りが無い"
-    assert "max(tail) - min(tail)" in body
+    assert "SETTLE_WINDOW_S" in body, "窓が無い -- 3標本では遅い漏れを見抜けない"
+    # _edge_mb 側は、その判定を使っていること
+    assert "settle_baseline" in _edge_mb_source()
+    assert "max(span) - min(span)" in body, "窓全体の幅で見ていない"
     assert "probes[len(probes) // 2]" not in body, "固定回数の中央値に戻っている"
+
+    # そして本当に見抜けること。文字列ではなく挙動で確かめる --
+    # 前の版は自分のコメントで『静止を待つ』と書きながら待っていなかった。
+    class _C:
+        def __init__(self):
+            self.t = 0.0
+
+        def time(self):
+            return self.t
+
+        def sleep(self, dt):
+            self.t += dt
+
+    MB = 1024.0 * 1024.0
+    c = _C()
+    _lvl, _w, settled = S.settle_baseline(
+        lambda: (1231.0 - 3.2 * c.t) * MB, sleep=c.sleep, now=c.time)
+    assert not settled, "毎秒3.2MB 漏れているブラウザを整定と判定している"
 
 
 def test_whether_it_settled_is_recorded():

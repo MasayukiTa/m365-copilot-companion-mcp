@@ -310,3 +310,26 @@ def test_the_nulls_stay_order_balanced_at_every_stopping_point():
             orders = Counter(o for k, o in seen if k == kind)
             assert orders.get("ctrl", 0) == orders.get("cand", 0), (
                 "null %d本の時点で %s が順序に偏っている: %s" % (len(seen), kind, dict(orders)))
+
+
+def test_an_arm_that_never_settled_is_quarantined():
+    """整定しなかったアームは測定ではない。
+
+    旧いゲートは漏れている最中のブラウザを 1.1 秒で『静止』と判定し、settled=True を
+    記録していた。誰もその欄で絞っていなかったので、その失敗は一晩見えないままだった。
+    新しいゲートは諦めたときに settled=False を残す -- 残すだけでは同じことになるので、
+    ここで実際に弾く。"""
+    import scripts.run_transport_series as ts
+
+    good = {"goals": "saturated-v1", "max_concurrent": 3,
+            "cdp_url": ts.CONFIG["cdp_url"], "memory_gain_mb": 12.0,
+            "control": {"memory_population": ts.CONFIG["population"], "settled": True},
+            "candidate": {"memory_population": ts.CONFIG["population"], "settled": True}}
+    assert ts.classify(good) == "", ts.classify(good)
+
+    for arm in ("control", "candidate"):
+        bad = {k: (dict(v) if isinstance(v, dict) else v) for k, v in good.items()}
+        bad[arm] = dict(bad[arm], settled=False, settle_s=120.0)
+        why = ts.classify(bad)
+        assert why, "%s が整定しなかった走行を通している" % arm
+        assert arm in why and "settle" in why, why

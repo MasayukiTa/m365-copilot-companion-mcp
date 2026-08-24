@@ -536,9 +536,34 @@ CAMPAIGN_SOCKET_LOG = os.path.join(
 
 #: How still the browser must be before a baseline is taken, and how long to wait for it.
 #: A guessed 1.6 s left every arm measuring the warm-up tab's teardown instead of its own work.
-SETTLE_TOLERANCE_MB = 25.0
+#: HOW FLAT THE BROWSER HAS TO BE, AND OVER HOW LONG, BEFORE ITS LEVEL IS CALLED A BASELINE.
+#:
+#: THE OLD TEST COULD NOT SEE A DRAIN. It asked for three readings 0.5 s apart to fall within
+#: 25 MB of each other, which is "moving slower than 16.7 MB per second" -- and the thing it
+#: needed to catch moves at about 3.2 MB per second. Measured: a browser left completely alone
+#: after a tabs run shed 190 MB over its first sixty seconds, and the settle test passed it in
+#: a median of 1.1 seconds across 24 arms, never once waiting longer than 2.6.
+#:
+#: What that did to the experiment: every arm took its baseline about a second into a minute-
+#: long drain, then ran for 105 to 236 seconds while the floor fell out from under it. A socket
+#: arm, which does not keep the renderer alive, spent its length below its own baseline -- the
+#: measured end drifts of -32 to -216 MB are that, and an arm that only falls reports a peak of
+#: 0.0 because the frozen judge starts its peak at the start value and only raises it. A tabs
+#: arm replenishes what it sheds, so it does not. The comparison was therefore paid a bonus in
+#: the candidate's favour, sized by however much the browser happened to be draining.
+#:
+#: The fix is to ask the question over a long enough span to see a slow leak: the whole spread
+#: across SETTLE_WINDOW_S must stay inside SETTLE_TOLERANCE_MB, which is 1.2 MB per second here
+#: and rejects the 3.2 MB/s drain with room to spare. SETTLE_MAX_S has to exceed the drain it
+#: is waiting out, and the drain plateaus around sixty seconds, so thirty was never going to be
+#: enough however the test was written.
+#:
+#: AN ARM THAT NEVER SETTLES IS NOT A MEASUREMENT. `settled` already records it; the series
+#: quarantines those runs rather than averaging them in.
+SETTLE_TOLERANCE_MB = 12.0
 SETTLE_STEP_S = 0.5
-SETTLE_MAX_S = 30.0
+SETTLE_WINDOW_S = 10.0
+SETTLE_MAX_S = 120.0
 
 
 def _cdp_owner_pid(cdp_url):
@@ -562,6 +587,45 @@ def _cdp_owner_pid(cdp_url):
     except Exception:
         return None
     return None
+
+
+def settle_baseline(sample, *, first=None, sleep=time.sleep, now=time.time):
+    """Wait until the browser stops moving, then return (level_bytes, seconds_waited, settled).
+
+    `sample()` returns the tree's total in bytes, or None when it cannot be read.
+
+    FLATNESS IS A STATEMENT ABOUT A SPAN OF TIME, and three adjacent samples cannot make it.
+    The previous test asked for three readings half a second apart to agree within 25 MB, which
+    is "moving slower than 16.7 MB a second" -- while the thing it had to catch moves at about
+    3.2. It passed a draining browser in a median of 1.1 seconds across 24 arms and never once
+    waited past 2.6, so every arm took its baseline one second into a minute-long decline and
+    then ran for two to four minutes with the floor falling out from under it.
+
+    Lives out here, rather than inside the evaluator's closure, so its tests drive THIS code.
+    A test that reimplements the loop it is checking passes happily while the two drift apart,
+    and drifting apart is exactly how the last version of this came to claim in its own comment
+    that it waited for the browser to settle.
+    """
+    t0 = now()
+    deadline = t0 + SETTLE_MAX_S
+    tol = SETTLE_TOLERANCE_MB * 1024.0 * 1024.0
+    probes = [(t0, first if first is not None else (sample() or 0.0))]
+    while now() < deadline:
+        sleep(SETTLE_STEP_S)
+        value = sample()
+        if value is None:
+            continue
+        probes.append((now(), value))
+        span = [v for ts, v in probes if ts >= now() - SETTLE_WINDOW_S]
+        if (probes[-1][0] - probes[0][0] >= SETTLE_WINDOW_S
+                and len(span) >= 3 and (max(span) - min(span)) < tol):
+            break
+    settled = now() < deadline
+    # The median of the settled WINDOW, not of three adjacent samples. If it timed out still
+    # moving, three samples describe the last instant rather than the level, and the level is
+    # what the arm gets measured against.
+    recent = sorted(v for ts, v in probes if ts >= probes[-1][0] - SETTLE_WINDOW_S)
+    return recent[len(recent) // 2], round(now() - t0, 1), settled
 
 
 def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222",
@@ -771,21 +835,14 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
             # near zero, opening a tab makes it positive, and there is no downward drift for
             # the caller's max to clip away. "Settled" is measured, not assumed -- three
             # consecutive readings within SETTLE_TOLERANCE_MB of each other.
-            probes = [now_total]
-            deadline = time.time() + SETTLE_MAX_S
-            while time.time() < deadline:
-                time.sleep(SETTLE_STEP_S)
+            def _sample():
                 snap = _snapshot_tree()
-                if not snap:
-                    continue
-                probes.append(sum(snap.values()))
-                tail = probes[-3:]
-                if len(tail) == 3 and (max(tail) - min(tail)) < SETTLE_TOLERANCE_MB * 1024.0 * 1024.0:
-                    break
-            _attr["settle_s"] = round(time.time() - (deadline - SETTLE_MAX_S), 1)
-            _attr["settled"] = time.time() < deadline
-            tail = sorted(probes[-3:])
-            _attr["baseline_total"] = tail[len(tail) // 2]
+                return sum(snap.values()) if snap else None
+
+            level, waited, ok = settle_baseline(_sample, first=now_total)
+            _attr["settle_s"] = waited
+            _attr["settled"] = ok
+            _attr["baseline_total"] = level
             _attr["baseline_pids"] = dict(_snapshot_tree() or current)
             return 0.0
 

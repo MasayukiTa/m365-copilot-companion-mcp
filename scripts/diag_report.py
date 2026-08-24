@@ -87,6 +87,36 @@ def analyse(events_path):
     if out["cold_peak_mb"] and out["warm_peak_mb"]:
         out["what_the_warmup_hides_mb"] = round(out["cold_peak_mb"] - out["warm_peak_mb"], 1)
 
+    # COLD MINUS WARM CONFLATES TWO OPPOSITE THINGS and cannot be read on its own. Arm 2's peak
+    # is quoted over the ORIGINAL fresh baseline, but arm 2 begins on top of whatever arm 1 left
+    # undecayed. So a figure near zero can be a real reuse discount cancelling residue inflation
+    # rather than neither being present. Measuring arm 2's rise over its OWN starting point --
+    # which is the series estimator, applied inside the diagnostic -- separates them.
+    at_split = [v for ts, v in trace if abs(ts - split) <= 8.0]
+    if at_split and warm:
+        out["warm_start_mb"] = round(st.median(at_split), 1)
+        out["warm_rise_over_own_start_mb"] = round(max(warm) - out["warm_start_mb"], 1)
+    if cold and out["fresh_mb"]:
+        out["cold_rise_over_own_start_mb"] = round(max(cold) - out["fresh_mb"], 1)
+
+    # A cheap arm that quietly did less work is the oldest false economy there is.
+    out["done"] = {"first": first.get("done"), "second": second.get("done"),
+                   "goals": first.get("goals")}
+    out["wall_s"] = {"first": first.get("wall_s"), "second": second.get("wall_s")}
+
+    # THE OTHER SIDE OF THE BOUNDARY. Tabs work lands in the browser tree; socket work also
+    # lands in the process holding the websocket, which no browser sampler can see. Without
+    # this an arm can look cheap merely by moving its cost across the line being measured.
+    client = os.path.join(REPO, ".fleet", "witness", "client_n23.csv")
+    if os.path.exists(client):
+        rows = [(float(r["ts"]), float(r["total_mb"]))
+                for r in csv.DictReader(io.open(client, encoding="utf-8"))
+                if r.get("total_mb")]
+        during = [v for ts, v in rows if t_run0 <= ts <= t_run1]
+        if during:
+            out["client_peak_mb"] = round(max(during), 1)
+            out["client_median_mb"] = round(st.median(during), 1)
+
     if "idle_start" in at and "idle_end" in at:
         idle = [(ts, v) for ts, v in trace if at["idle_start"] <= ts <= at["idle_end"]]
         if len(idle) >= 3:

@@ -206,6 +206,15 @@ def classify(rec) -> str:
         return "max_concurrent was %r" % (rec.get("max_concurrent"),)
     if str(rec.get("cdp_url") or "") != CONFIG["cdp_url"]:
         return "cdp_url was %r" % (rec.get("cdp_url"),)
+    # AN ARM THAT NEVER SETTLED IS NOT A MEASUREMENT. The gate now waits up to two minutes for
+    # the browser to stop moving; when it gives up, the baseline it hands back is a level the
+    # browser was still leaving, and every figure derived from it describes the drain rather
+    # than the arm. Averaging those in is how the old gate's failure stayed invisible for a
+    # night -- it recorded settled=True and nobody filtered on it.
+    for arm in ("control", "candidate"):
+        a = rec.get(arm) or {}
+        if a.get("settled") is False:
+            return "%s arm never settled (waited %ss)" % (arm, a.get("settle_s"))
     return ""
 
 

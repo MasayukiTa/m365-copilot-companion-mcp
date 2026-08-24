@@ -84,9 +84,32 @@ SAMPLER_ISOLATION_EPOCH = 1787283181
 #: them leaves a single headless null. The reason to drop them is that they measured a different
 #: browser, not that they were inconvenient.
 #:
+#: THE NINTH, and it explains the eighth night's results rather than adding to them. The settle
+#: gate could not see a slow drain. It asked three readings half a second apart to agree within
+#: 25 MB -- "moving slower than 16.7 MB a second" -- against something that moves at about 3.2.
+#: Measured directly: a browser left completely alone after a tabs run shed 190 MB over its
+#: first sixty seconds, and across 24 arms the gate passed in a median of 1.1 seconds, never
+#: once waiting past 2.6.
+#:
+#: So every arm took its baseline one second into a minute-long decline and then ran for 105 to
+#: 236 seconds while the floor fell away. A socket arm does not keep the renderer alive, so it
+#: spent its length below its own baseline -- the recorded end drifts of -32 to -216 MB are
+#: that -- and the frozen judge, which starts its peak at the arm's start and only raises it,
+#: reports 0.0 for an arm that only falls. A tabs arm replenishes what it sheds and does not
+#: fall. The comparison was paying the candidate a bonus the size of whatever the browser
+#: happened to be draining, which is why the treatments came back uniformly positive.
+#:
+#: The gate now measures flatness across a ten-second span and waits up to two minutes. That is
+#: a change to how every number is produced, so nothing measured before it may share a column
+#: with anything measured after -- including the eight Phase A nulls and the five Phase B
+#: treatments, whose figures stand only as a record of what the old instrument said.
+#:
+#: The cold diagnostic runs are untouched by this: they carry warmup=False, are filtered out on
+#: that axis anyway, and took no warm-up residue into any arm, which is why they were the only
+#: measurement left standing when this was found.
+#:
 #: This is the epoch a run has to clear to be comparable with anything measured today.
-#: 1787567132 -- the commit that made the evaluation browser headless.
-INSTRUMENT_EPOCH = 1787567132
+INSTRUMENT_EPOCH = 1787611466
 
 #: THE WORKLOAD IS PART OF THE INSTRUMENT TOO, AND ITS NAME DOES NOT CHANGE WHEN IT DOES.
 #:

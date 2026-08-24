@@ -192,8 +192,12 @@ def test_raise_to_has_no_production_caller():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     hits = []
     for base, dirs, files in os.walk(root):
+        # `.claude` を除くのは体裁のためではない。並行セッションはこの下の worktree に
+        # リポジトリ全体を複製するので、走査が「別セッションの作業中コピー」を本番コードと
+        # して数え、こちらが何も触っていないのに落ちる。実際そうなった。
         dirs[:] = [d for d in dirs
-                   if d not in (".git", ".venv", "node_modules", "__pycache__", ".fleet")]
+                   if d not in (".git", ".venv", "node_modules", "__pycache__",
+                                ".fleet", ".claude")]
         for name in files:
             if not name.endswith(".py") or name.startswith("test_"):
                 continue
