@@ -270,3 +270,60 @@ def test_cli_grant_invalid_ip_exits_nonzero_with_error_json(capsys, monkeypatch)
     assert exc.value.code == 1
     out = json.loads(capsys.readouterr().out)
     assert "error" in out
+
+
+# ── 発行しすぎたときの、宣言されていない取り消し ──────────────────────────────
+
+def test_granting_again_past_the_cap_silently_retires_the_oldest_token(monkeypatch):
+    """同じ相手に何度も発行すると、古いトークンは黙って捨てられる。
+
+    これは事実上の取り消しでありながら、どこにもそう書かれていない。捨てられた側は
+    「許可されているはず」の顔をしたまま拒否されるし、逆にもし捨てられていなければ、
+    運用者が把握していない鍵が無期限に生き残ることになる。どちらであるかは
+    推測ではなくテストで固定しておくべき性質。
+
+    ここでは前者(捨てられる)であることを確かめる。上限を超えて発行し直したら、
+    最初のトークンはもう通らない。"""
+    # トークンの照合はこの旗が立っている時だけ行われる。立てずに書くと、
+    # 「どのトークンでも通る」状態を「捨てられていない」と読み違える。
+    monkeypatch.setenv("MCP_REQUIRE_UNLOCK_TOKEN", "1")
+    ip = "198.51.100.77"
+    cap = sec._MAX_TOKENS_PER_IDENTITY
+    first = sec.grant_ip(ip)["unlock_token"]
+    for _ in range(cap):
+        newest = sec.grant_ip(ip)["unlock_token"]
+
+    req = _make_req(peer_host="127.0.0.1", xff=ip)
+    try:
+        sec.set_presented_token(first)
+        with patch("tools.security.get_http_request", return_value=req):
+            assert sec.require_unlocked() is not None, (
+                "上限を超えても最初のトークンが通っている -- "
+                "運用者が知らない鍵が生き続けることになる")
+        sec.set_presented_token(newest)
+        with patch("tools.security.get_http_request", return_value=req):
+            assert sec.require_unlocked() is None, "最新のトークンまで巻き添えで無効化している"
+    finally:
+        sec.clear_presented_token()
+        sec.revoke_ip(ip)
+
+
+def test_revocation_needs_no_restart_and_survives_no_cache(monkeypatch):
+    """取り消しは即時に効くこと。
+
+    状態はファイルから毎回読み直される設計だが、どこかが判定を握った瞬間に
+    取り消しは再起動まで効かなくなる。「効いているはず」を仕様として固定する。"""
+    monkeypatch.setenv("MCP_REQUIRE_UNLOCK_TOKEN", "1")
+    ip = "198.51.100.78"
+    granted = sec.grant_ip(ip)
+    req = _make_req(peer_host="127.0.0.1", xff=ip)
+    try:
+        sec.set_presented_token(granted["unlock_token"])
+        with patch("tools.security.get_http_request", return_value=req):
+            assert sec.require_unlocked() is None
+            # 同じプロセス・同じ contextvar・同じ patch のまま取り消す
+            sec.revoke_ip(ip)
+            assert sec.require_unlocked() is not None, (
+                "取り消し後も同じ呼び出しが通る -- どこかが判定を握っている")
+    finally:
+        sec.clear_presented_token()
