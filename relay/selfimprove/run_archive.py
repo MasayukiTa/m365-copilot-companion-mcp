@@ -62,8 +62,16 @@ SAMPLER_ISOLATION_EPOCH = 1787283181
 #: 82.1 MB under the old statistic and 6.1 under a signed tree delta. The nine nulls measured
 #: before this are void for setting any threshold.
 #:
+#: THE SEVENTH, and the diagnostic block that preceded the series caught it. The signed delta
+#: fixed the tabs case outright -- tabs nulls came back +4.5 and -0.8 where generation 5 gave
+#: +112 and -40 -- but socket arms open no tab, so the warm-up tab's teardown ran on unopposed
+#: and every socket arm spent its whole length below its own baseline. The frozen judge starts
+#: its peak at zero and only raises it, so those arms reported 0.0, and in a TREATMENT that
+#: subtracts a clipped zero from a tabs arm's honest peak: socket wins by construction. The
+#: baseline now waits for the browser to settle instead of for a guessed 1.6 seconds.
+#:
 #: This is the epoch a run has to clear to be comparable with anything measured today.
-INSTRUMENT_EPOCH = 1787546492
+INSTRUMENT_EPOCH = 1787549030
 
 #: THE WORKLOAD IS PART OF THE INSTRUMENT TOO, AND ITS NAME DOES NOT CHANGE WHEN IT DOES.
 #:

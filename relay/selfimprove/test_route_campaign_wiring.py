@@ -323,11 +323,39 @@ def test_the_floors_own_justification_is_recorded_as_void():
     assert "trim" in body.lower()
 
 
-def test_a_single_sample_baseline_is_not_used():
-    """基準が1標本だと、その瞬間に低かったプロセスの復帰が腕の増分になる。
-    温めのタブが解体中に基準を取ると、その戻りが走行の残り全部に乗る。"""
+def test_the_baseline_waits_for_the_browser_to_settle_not_for_a_guessed_duration():
+    """基準が1標本だと、その瞬間の過渡状態が走行の残り全部に乗る。
+    固定 1.6 秒でも足りなかった -- 2026-08-24 の実測で、socket 腕は2本とも
+    終了時が −210 / −267MB。温めタブの解体が腕の開始後も続いており、
+    膨らんだ値を基準にしていた。socket 腕はタブを開かないので減る一方になり、
+    全区間が負 -> 凍結された measure_arm がピークを 0 に刈る。
+
+    そしてこの刈り取りは処置走行で socket を必ず勝たせる: タブ腕の素直な
+    ピークから、0 に刈られた socket 腕を引くことになる。帰無は静かで処置は
+    大差という、今日3回出た『綺麗だが間違った答え』の完成形だった。
+
+    待ち時間は測って決める。3標本連続で変動が閾値未満になるまで。"""
     body = _edge_mb_source()
-    assert "probes" in body and "probes[len(probes) // 2]" in body
+    assert "SETTLE_TOLERANCE_MB" in body, "落ち着きを測っていない"
+    assert "SETTLE_MAX_S" in body, "打ち切りが無い"
+    assert "max(tail) - min(tail)" in body
+    assert "probes[len(probes) // 2]" not in body, "固定回数の中央値に戻っている"
+
+
+def test_whether_it_settled_is_recorded():
+    """打ち切りで抜けた走行は、落ち着いた走行と同じ意味を持たない。
+    記録が無ければ、後から区別できない。"""
+    src = inspect.getsource(S.route_evaluator_for)
+    assert 'out["settled"]' in src and 'out["settle_s"]' in src
+
+
+def test_the_tabs_case_was_already_working_before_this_change():
+    """直す前にタブ帰無は +4.5 と −0.8 を出していた（世代5では +112.0 や −40.0）。
+    符号付き差分は効いていた。壊れていたのは socket 腕だけで、
+    原因は統計量ではなく基準を取る時点だった -- 両者を混ぜて『全部直した』と
+    言わないために、ここに残す。"""
+    body = _edge_mb_source()
+    assert "now_total" in body and "baseline_total" in body
 
 
 def test_the_peak_is_taken_from_a_smoothed_signal():

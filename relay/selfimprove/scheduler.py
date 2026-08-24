@@ -534,6 +534,13 @@ CAMPAIGN_SOCKET_LOG = os.path.join(
     "docs", "research", "results", "route_campaign_socket.jsonl")
 
 
+#: How still the browser must be before a baseline is taken, and how long to wait for it.
+#: A guessed 1.6 s left every arm measuring the warm-up tab's teardown instead of its own work.
+SETTLE_TOLERANCE_MB = 25.0
+SETTLE_STEP_S = 0.5
+SETTLE_MAX_S = 30.0
+
+
 def _cdp_owner_pid(cdp_url):
     """The pid listening on the CDP port, or None if it cannot be resolved.
 
@@ -617,7 +624,8 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
     _attr = {"baseline_pids": None, "peak_new_pids": 0,
              "root_pid": None, "population": None,
              "baseline_total": None, "window": [], "peak_seen": float("-inf"),
-             "last_mb": None, "peak_detail": None}
+             "last_mb": None, "peak_detail": None,
+             "settle_s": None, "settled": None}
 
     def _begin_attribution():
         """Forget the previous arm's baseline. Called before each arm, not inside the sampler.
@@ -633,6 +641,8 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
         _attr["peak_seen"] = float("-inf")
         _attr["last_mb"] = None
         _attr["peak_detail"] = None
+        _attr["settle_s"] = None
+        _attr["settled"] = None
 
     def _snapshot_tree():
         """{pid: commit} for the msedge processes of the browser we are driving. Never raises."""
@@ -748,18 +758,35 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
         now_total = sum(current.values())
 
         if _attr["baseline_total"] is None:
-            # A BASELINE OF ONE SAMPLE INHERITS WHATEVER THAT INSTANT HELD. A warm-up tab still
-            # tearing down reads low, and its return to normal is then charged to the arm for
-            # the rest of the run. Take a few and use the middle one.
+            # WAIT UNTIL THE BROWSER STOPS MOVING, RATHER THAN FOR A GUESSED DURATION.
+            #
+            # A fixed 1.6 s was not enough. Measured 2026-08-24, first arm under the signed
+            # statistic: both arms ended 222 and 267 MB BELOW their baseline, because the
+            # warm-up tab was still tearing down when the baseline was taken. Every arm then
+            # spent its whole length falling, and since `measure_arm` starts its peak at zero
+            # and only raises it, an arm that freed 267 MB reported 0.0 -- the comparison was
+            # between clipped numbers that described neither arm.
+            #
+            # A settled baseline fixes both symptoms with one change: at rest the delta sits
+            # near zero, opening a tab makes it positive, and there is no downward drift for
+            # the caller's max to clip away. "Settled" is measured, not assumed -- three
+            # consecutive readings within SETTLE_TOLERANCE_MB of each other.
             probes = [now_total]
-            for _ in range(4):
-                time.sleep(0.4)
+            deadline = time.time() + SETTLE_MAX_S
+            while time.time() < deadline:
+                time.sleep(SETTLE_STEP_S)
                 snap = _snapshot_tree()
-                if snap:
-                    probes.append(sum(snap.values()))
-            probes.sort()
-            _attr["baseline_total"] = probes[len(probes) // 2]
-            _attr["baseline_pids"] = dict(current)
+                if not snap:
+                    continue
+                probes.append(sum(snap.values()))
+                tail = probes[-3:]
+                if len(tail) == 3 and (max(tail) - min(tail)) < SETTLE_TOLERANCE_MB * 1024.0 * 1024.0:
+                    break
+            _attr["settle_s"] = round(time.time() - (deadline - SETTLE_MAX_S), 1)
+            _attr["settled"] = time.time() < deadline
+            tail = sorted(probes[-3:])
+            _attr["baseline_total"] = tail[len(tail) // 2]
+            _attr["baseline_pids"] = dict(_snapshot_tree() or current)
             return 0.0
 
         base = _attr["baseline_pids"] or {}
@@ -1066,6 +1093,8 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
             # a transient coincidence only in the peak. The pair is diagnostic for free.
             out["end_mb"] = _attr["last_mb"]
             out["peak_detail"] = _attr["peak_detail"]
+            out["settle_s"] = _attr.get("settle_s")
+            out["settled"] = _attr.get("settled")
             out.update(_extras)
             return out
 
@@ -1094,6 +1123,8 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
             # a transient coincidence only in the peak. The pair is diagnostic for free.
             out["end_mb"] = _attr["last_mb"]
             out["peak_detail"] = _attr["peak_detail"]
+            out["settle_s"] = _attr.get("settle_s")
+            out["settled"] = _attr.get("settled")
             out.update(_extras)
             out["is_null"] = bool(null_arm)
             return out
