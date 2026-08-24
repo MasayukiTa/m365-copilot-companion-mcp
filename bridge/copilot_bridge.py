@@ -1297,9 +1297,17 @@ _INSIGHTS_JS = r"""
 # chat" also use aria-current but their id is not a GUID, so filtering to GUID-shaped ids
 # isolates the conversation row). This is the direct DOM signal for "which conversation is
 # the main pane actually showing".
+# TAG-AGNOSTIC ON PURPOSE. These were written against `button[id]`, and the sidebar rows are
+# `<a id>` now -- measured on the live page: 36 buttons carry an id and NONE of them is a guid,
+# while 19 elements whose id is a bare guid are all anchors. The tag was never the thing being
+# identified; the guid-shaped id is. Pinning the tag is what made this fail, so it is not
+# pinned again.
+#
+# NOT the href, which also carries guids: 24 of them, 5 unique, and they are agent TitleIds
+# rather than conversations. Reading those would have stored confident nonsense.
 _CURRENT_ROW_JS = r"""
 () => {
-  var rows = document.querySelectorAll('button[id][aria-current="page"]');
+  var rows = document.querySelectorAll('[aria-current="page"]');
   for (var i = 0; i < rows.length; i++) {
     var id = rows[i].id || '';
     if (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(id)) {
@@ -1335,7 +1343,7 @@ def _current_row_guid():
 _ALL_ROW_GUIDS_JS = r"""
 () => {
   var out = [];
-  var rows = document.querySelectorAll('button[id]');
+  var rows = document.querySelectorAll('[id]');
   for (var i = 0; i < rows.length; i++) {
     var id = rows[i].id || '';
     if (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(id)) {
@@ -1352,12 +1360,25 @@ def _known_conv_guids():
     the SPA's localStorage history cache. Used for the capture baseline and for detecting a
     newly appeared conversation. Never raises; partial results on error."""
     guids = set()
+    rows = 0
     try:
         for g in (PAGE.evaluate(_ALL_ROW_GUIDS_JS) or []):
+            rows += 1
             if BARE_GUID_RE.match(g or ""):
                 guids.add(g)
     except Exception:
         pass
+    # BLIND IS NOT AMBIGUOUS, and telling them apart is why this went unnoticed for six weeks.
+    # "No new conversation appeared" and "I cannot see any conversation at all" both ended as
+    # an empty capture and the same mild log line, so a scraper that had stopped matching the
+    # page read as an ordinary quiet result. Zero rows is not a quiet result: the sidebar of a
+    # signed-in session always has some. Measured: 542 sessions, 11 with a conversation
+    # reference, none since 07-08.
+    if rows == 0:
+        logger.warning("conversation capture is BLIND: no element on the page has a "
+                       "guid-shaped id. The sidebar markup has changed and _ALL_ROW_GUIDS_JS "
+                       "no longer matches it -- every session captured from now on will have "
+                       "an empty conv_url and cannot be resumed.")
     try:
         for it in (PAGE.evaluate(_INSIGHTS_JS) or []):
             g = (it.get("conversationId") or "").strip()
