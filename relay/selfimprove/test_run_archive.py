@@ -155,3 +155,19 @@ def test_a_run_that_counted_every_browser_is_not_the_same_measurement(tmp_path, 
     unscoped = RA.comparable(runs, goals="saturated-v1", null=True,
                              memory_population="all-edge-unscoped")
     assert [r["memory_gain_mb"] for r in unscoped] == [960.0]
+
+
+def test_a_change_to_the_browser_being_measured_moves_the_epoch():
+    """ブラウザの起動形態を変えたのに世代を上げなかった -- 8番目の欠陥。
+
+    評価用ブラウザは窓付きで起動し、イントラのポータル(273MB)を開始ページにしていた。
+    headless 化でその両方が消えたが、これはサンプラの測定対象そのものの変更であり、
+    再スコープと同じ種類の変更。なのに世代は据え置かれ、窓あり4本と headless 1本が
+    「同じ計器」として同じ籠に入っていた。
+
+    このテストは番号を丸暗記させるためではなく、世代が「窓あり時代の最後の走行」より
+    後を指していることを見るためのもの。前に戻せば、混ぜてはいけないものが再び混ざる。"""
+    # 窓あり時代の最後の走行 (19:04)。これが現行計器に含まれてはいけない。
+    LAST_WINDOWED_RUN = 1787565886
+    assert RA.INSTRUMENT_EPOCH > LAST_WINDOWED_RUN, (
+        "世代が窓あり時代を含んでいる -- 別のブラウザの測定を混ぜることになる")

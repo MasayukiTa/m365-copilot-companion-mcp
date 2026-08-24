@@ -70,8 +70,23 @@ SAMPLER_ISOLATION_EPOCH = 1787283181
 #: subtracts a clipped zero from a tabs arm's honest peak: socket wins by construction. The
 #: baseline now waits for the browser to settle instead of for a guessed 1.6 seconds.
 #:
+#: THE EIGHTH, and this one nobody caught -- it was found by reading the archive, after five
+#: nulls had already been pooled. The evaluation browser was launched with a window and opened
+#: an intranet portal as its start page: a 273 MB page and a compositor surface, both inside the
+#: process tree the sampler measures. Switching it to --headless=new with no start page removed
+#: both. That is a change to the POPULATION, as surely as rescoping the sampler was, and it went
+#: in without touching this number -- so four windowed nulls and one headless null sat in the
+#: same basket claiming to be the same instrument. The four measured before the cutover are void.
+#:
+#: Worth recording plainly, because the epoch mechanism is only as good as the honesty of the
+#: person moving it: discarding them costs data and buys nothing. Their spread was the widest in
+#: the archive (-272.4, -140.8, +34.4, +11.7 on runs where the true answer is zero), and dropping
+#: them leaves a single headless null. The reason to drop them is that they measured a different
+#: browser, not that they were inconvenient.
+#:
 #: This is the epoch a run has to clear to be comparable with anything measured today.
-INSTRUMENT_EPOCH = 1787549030
+#: 1787567132 -- the commit that made the evaluation browser headless.
+INSTRUMENT_EPOCH = 1787567132
 
 #: THE WORKLOAD IS PART OF THE INSTRUMENT TOO, AND ITS NAME DOES NOT CHANGE WHEN IT DOES.
 #:
