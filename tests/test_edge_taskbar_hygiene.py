@@ -187,3 +187,24 @@ def test_the_eval_launcher_does_not_mark_windows_at_all():
     assert "SetWindowLong" not in src, "また自前で印を付けている"
     assert "start_companion_edge.ps1" in src, "正規の起動器に委ねていない"
     assert "-Foreground" not in src.replace("-Foreground: ", ""), "headless を外している"
+
+
+def test_the_eval_launcher_proves_nothing_is_showing_before_it_succeeds():
+    """3回続けて「直った」と思い、3回とも運用者に見つけられた。
+    次は無い、という指示を受けたので、祈りではなく機構にする。
+
+    このプロファイルの窓が許されるのは「画面外」かつ「タスクバー外」のときだけ。
+    唯一の例外はサインイン面で、そこは人が見る必要がある場面。それ以外は
+    起動そのものを失敗させる -- 誰かの前に窓が居座ったまま走る測定に、
+    データとしての価値は無い。"""
+    src = (ROOT / "scripts" / "start_eval_edge.ps1").read_text(encoding="utf-8")
+    assert "Get-VisibleEvalWindows" in src
+    assert "REFUSING" in src, "見えていても成功で返している"
+    # 画面内か、タスクバーに出るか、どちらでも失敗させること
+    assert "onScreen" in src and "inTaskbar" in src
+    # 成功の出口より前に検査があること
+    i = src.index("Get-VisibleEvalWindows -Marker")
+    j = src.index("no visible window")
+    assert i < j, "成功を返してから検査している"
+    # サインインは人が見る場面なので、この検査が握りつぶさないこと
+    assert "-Foreground" in src
