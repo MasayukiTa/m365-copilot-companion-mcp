@@ -54,8 +54,16 @@ SAMPLER_ISOLATION_EPOCH = 1787283181
 #: compared differed in whether renderer creation had already been paid for, and no null
 #: flavour could price that difference. It is now a tab pass before EVERY arm.
 #:
+#: THE SIXTH CHANGE, and the one a pre-registered stopping rule caught rather than a reader.
+#: Phase A's eight nulls put two identical arms 421 MB apart against a 300 MB floor, and the
+#: cause was the STATISTIC, not the population: summing max(0, growth) per process turns
+#: ordinary renderer churn into growth, because the process that exits is floored to zero while
+#: its replacement is charged in full. Demonstrated with no arm running -- two idle minutes gave
+#: 82.1 MB under the old statistic and 6.1 under a signed tree delta. The nine nulls measured
+#: before this are void for setting any threshold.
+#:
 #: This is the epoch a run has to clear to be comparable with anything measured today.
-INSTRUMENT_EPOCH = 1787539414
+INSTRUMENT_EPOCH = 1787546492
 
 #: THE WORKLOAD IS PART OF THE INSTRUMENT TOO, AND ITS NAME DOES NOT CHANGE WHEN IT DOES.
 #:

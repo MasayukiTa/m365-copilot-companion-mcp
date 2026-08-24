@@ -34,8 +34,9 @@ def test_the_sampler_walks_the_cdp_owner_tree_and_says_which_population_it_used(
     """絞れなかったときは黙って旧来の全 Edge 合計に戻る。それを記録しなければ、
     読む側はどちらの数字を見ているのか判別できない。"""
     src = inspect.getsource(S.route_evaluator_for)
+    # 木の取得は _snapshot_tree に切り出した。基準取りでも同じ走査を使うため。
     fn = next(n for n in ast.walk(ast.parse(src.lstrip()))
-              if isinstance(n, ast.FunctionDef) and n.name == "_edge_mb")
+              if isinstance(n, ast.FunctionDef) and n.name == "_snapshot_tree")
     body = ast.unparse(fn) if hasattr(ast, "unparse") else src
     assert "_cdp_owner_pid" in body
     assert "children(recursive=True)" in body
@@ -48,7 +49,7 @@ def test_the_tree_is_rewalked_every_sample_not_cached():
     """Edge はレンダラを常に作っては捨てる。根だけ覚え、木は毎回歩き直す。"""
     src = inspect.getsource(S.route_evaluator_for)
     fn = next(n for n in ast.walk(ast.parse(src.lstrip()))
-              if isinstance(n, ast.FunctionDef) and n.name == "_edge_mb")
+              if isinstance(n, ast.FunctionDef) and n.name == "_snapshot_tree")
     body = ast.unparse(fn) if hasattr(ast, "unparse") else src
     # 根はキャッシュ、木は毎サンプル
     assert "pid_exists" in body

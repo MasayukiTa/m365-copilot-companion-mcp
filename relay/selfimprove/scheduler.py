@@ -615,7 +615,9 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
 
     #: The processes that already existed when this arm started. Set per arm, never shared.
     _attr = {"baseline_pids": None, "peak_new_pids": 0,
-             "root_pid": None, "population": None}
+             "root_pid": None, "population": None,
+             "baseline_total": None, "window": [], "peak_seen": float("-inf"),
+             "last_mb": None, "peak_detail": None}
 
     def _begin_attribution():
         """Forget the previous arm's baseline. Called before each arm, not inside the sampler.
@@ -626,6 +628,40 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
         """
         _attr["baseline_pids"] = None
         _attr["peak_new_pids"] = 0
+        _attr["baseline_total"] = None
+        _attr["window"] = []
+        _attr["peak_seen"] = float("-inf")
+        _attr["last_mb"] = None
+        _attr["peak_detail"] = None
+
+    def _snapshot_tree():
+        """{pid: commit} for the msedge processes of the browser we are driving. Never raises."""
+        try:
+            import psutil
+        except Exception:
+            return {}
+        if _attr["root_pid"] is None or not psutil.pid_exists(_attr["root_pid"]):
+            _attr["root_pid"] = _cdp_owner_pid(cdp_url)
+            _attr["population"] = ("fleet-edge-tree" if _attr["root_pid"] is not None
+                                   else "all-edge-unscoped")
+        if _attr["root_pid"] is not None:
+            try:
+                root = psutil.Process(_attr["root_pid"])
+                procs = [root] + root.children(recursive=True)
+            except Exception:
+                procs = []
+        else:
+            procs = list(psutil.process_iter(["pid", "name", "memory_info"]))
+        out = {}
+        for proc in procs:
+            try:
+                if (proc.name() or "").lower() != "msedge.exe":
+                    continue
+                mi = proc.memory_info()
+                out[proc.pid] = float(getattr(mi, "private", mi.rss))
+            except Exception:
+                continue
+        return out
 
     def _edge_mb():
         """Commit charge of msedge processes THIS ARM CREATED. Not total Edge memory.
@@ -687,42 +723,71 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
             # is not told cannot know which of the two produced the number.
             _attr["population"] = ("fleet-edge-tree" if _attr["root_pid"] is not None
                                    else "all-edge-unscoped")
-        current = {}
-        if _attr["root_pid"] is not None:
-            try:
-                root = psutil.Process(_attr["root_pid"])
-                procs = [root] + root.children(recursive=True)
-            except Exception:
-                procs = []
-        else:
-            procs = psutil.process_iter(["pid", "name", "memory_info"])
-        for proc in procs:
-            try:
-                if (proc.name() or "").lower() != "msedge.exe":
-                    continue
-                mi = proc.memory_info()
-                current[proc.pid] = float(getattr(mi, "private", mi.rss))
-            except Exception:
-                continue
+        current = _snapshot_tree()
 
-        if _attr["baseline_pids"] is None:
-            # The whole map, not just the key set: a process that already existed can still
-            # GROW because of this arm, and on a warm browser that is where the cost lands.
+        # SIGNED, AT THE LEVEL OF THE WHOLE TREE. NOT A SUM OF PER-PROCESS RISES.
+        #
+        # The old statistic summed max(0, commit_now - commit_at_baseline) per process. Edge
+        # spawns and kills renderers constantly -- this function re-walks the tree every sample
+        # for exactly that reason -- and the rectified form turns ordinary churn into growth:
+        # the renderer that EXITS is floored to zero, while its replacement is a new pid with an
+        # implicit baseline of zero, so its entire steady-state commit is charged to the arm.
+        # Net memory unchanged, measured growth several hundred megabytes.
+        #
+        # MEASURED WITH NO ARM RUNNING AT ALL, 2026-08-24: two minutes against an idle fleet
+        # browser produced 82.1 MB under the old statistic while the signed delta ended at 6.1,
+        # with three new processes appearing in the window. Scaled to a six-minute arm that is
+        # a couple of hundred megabytes of pure artifact -- the same size as the nulls it was
+        # producing (arm peaks of 77 to 630 MB, and one identical-arm pair 421 MB apart).
+        #
+        # AND THE ARGUMENT FOR FLOORING WAS ALREADY VOID. It was written against the OS trimming
+        # a working set, but this sampler deliberately reads COMMIT, which trimming does not
+        # move -- the docstring above says so. Commit falls when a process frees or exits, which
+        # is precisely the case the floor was suppressing.
+        totals = sorted(current.values())
+        now_total = sum(current.values())
+
+        if _attr["baseline_total"] is None:
+            # A BASELINE OF ONE SAMPLE INHERITS WHATEVER THAT INSTANT HELD. A warm-up tab still
+            # tearing down reads low, and its return to normal is then charged to the arm for
+            # the rest of the run. Take a few and use the middle one.
+            probes = [now_total]
+            for _ in range(4):
+                time.sleep(0.4)
+                snap = _snapshot_tree()
+                if snap:
+                    probes.append(sum(snap.values()))
+            probes.sort()
+            _attr["baseline_total"] = probes[len(probes) // 2]
             _attr["baseline_pids"] = dict(current)
             return 0.0
-        base = _attr["baseline_pids"]
+
+        base = _attr["baseline_pids"] or {}
         new_pids = [pid for pid in current if pid not in base]
         if len(new_pids) > _attr["peak_new_pids"]:
             _attr["peak_new_pids"] = len(new_pids)
-        # Per-process GROWTH since the arm began, summed. Processes that shrank contribute
-        # zero rather than a negative: a renderer the arm never touched, trimmed by the OS
-        # while the arm ran, would otherwise pay the arm a credit it did not earn.
-        total = 0.0
-        for pid, value in current.items():
-            grew = value - base.get(pid, 0.0)
-            if grew > 0:
-                total += grew
-        return total / (1024.0 * 1024.0)
+
+        # A ROLLING MEDIAN, so a single jittery sample cannot set the arm's peak. The caller
+        # takes the MAXIMUM across samples, which on a raw signal reports the largest transient
+        # rather than the level the arm sustained.
+        window = _attr["window"]
+        window.append(now_total)
+        if len(window) > 5:
+            del window[0]
+        smoothed = sorted(window)[len(window) // 2]
+
+        value = (smoothed - _attr["baseline_total"]) / (1024.0 * 1024.0)
+        _attr["last_mb"] = value
+        if value > _attr["peak_seen"]:
+            _attr["peak_seen"] = value
+            # WHO GREW, at the moment the arm looked worst. Without this a spike is a mystery
+            # twice: once when it happens and again when the next one does.
+            movers = sorted(((v - base.get(p, 0.0)) / (1024.0 * 1024.0), p, p not in base)
+                            for p, v in current.items())
+            _attr["peak_detail"] = [
+                {"pid": p, "delta_mb": round(d, 1), "new": bool(isnew)}
+                for d, p, isnew in movers[-3:][::-1]]
+        return value
 
     def _fresh_route(enabled):
         """Build the route this arm will use and install it as the fleet's singleton."""
@@ -997,6 +1062,10 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
                 goals=goals, socket_on=bool(control_socket), peak_sampler=_edge_mb)
             out["new_renderers"] = _attr["peak_new_pids"]
             out["memory_population"] = _attr["population"]
+            # The END of the arm beside its PEAK: a sustained cost shows in both,
+            # a transient coincidence only in the peak. The pair is diagnostic for free.
+            out["end_mb"] = _attr["last_mb"]
+            out["peak_detail"] = _attr["peak_detail"]
             out.update(_extras)
             return out
 
@@ -1021,6 +1090,10 @@ def route_evaluator_for(goals, *, agent_url=None, cdp_url="http://127.0.0.1:9222
                 peak_sampler=_edge_mb)
             out["new_renderers"] = _attr["peak_new_pids"]
             out["memory_population"] = _attr["population"]
+            # The END of the arm beside its PEAK: a sustained cost shows in both,
+            # a transient coincidence only in the peak. The pair is diagnostic for free.
+            out["end_mb"] = _attr["last_mb"]
+            out["peak_detail"] = _attr["peak_detail"]
             out.update(_extras)
             out["is_null"] = bool(null_arm)
             return out

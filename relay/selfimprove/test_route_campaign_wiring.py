@@ -259,10 +259,9 @@ def test_the_measured_quantity_is_attributable_to_the_arm():
     帰属できるのはプロセスごとの増分。新規プロセスだけを数える規則は、Edge が
     レンダラーを再利用するせいでタブ4枚を18MBと採点した（別テスト参照）。"""
     src = inspect.getsource(S.route_evaluator_for)
-    assert "baseline_pids" in src
     assert "private" in src, "commit ではなく RSS を読んでいる"
     body = _edge_mb_source()
-    assert "base.get(pid, 0.0)" in body, "既存プロセスの増分を見ていない"
+    assert "baseline_total" in body, "木全体の基準を持っていない"
 
 
 def test_the_baseline_is_reset_before_the_arm_not_inside_the_sampler():
@@ -298,20 +297,44 @@ def test_a_warmup_pass_is_available_and_its_numbers_are_discarded():
     assert src.count("_warmup()") >= 4, "腕ごとに呼ばれていない"
 
 
-def test_growth_inside_existing_processes_is_counted():
-    """最初の版は『腕が新たに生んだプロセス』だけを数え、警告走行の後に
-    タブ4枚を開いた腕が新規1プロセス18MBという値を返した。Edge は
-    レンダラープールを再利用するので、タブのコストは既存プロセスの
-    増分として乗る -- 新規プロセス規則はそれをゼロと採点する。"""
+def test_the_sum_is_signed_at_the_level_of_the_whole_tree():
+    """プロセス単位の増分を足し上げる形（減った分は0に潰す）は 2026-08-24 に外した。
+
+    それが正しく見えた理由も残す: 最初の版は『腕が新たに生んだプロセス』だけを数え、
+    タブ4枚を開いた腕が新規1プロセス18MBを返した。Edge はレンダラープールを再利用
+    するので、既存プロセスの増分を見る必要は本当にあった。誤りは「増分を見る」ことでは
+    なく「減少を0に潰す」ことだった。
+
+    潰すと churn が増分に化ける。腕の途中でレンダラーが入れ替わると、消えた側は0に
+    潰され、代わりの pid は基準ゼロ扱いなので定常値まるごとが腕の増分になる。実メモリ
+    不変で数百MB。腕を1本も走らせずに実証済み: アイドルのブラウザ2分で旧統計量が
+    82.1MB を出し、符号付き差分は 6.1MB で終わった（新規プロセス3個）。"""
     body = _edge_mb_source()
-    assert "grew = value - base.get(pid, 0.0)" in body
+    assert "grew" not in body, "プロセス単位の片側加算が戻っている"
+    assert "now_total" in body and "baseline_total" in body
 
 
-def test_a_shrinking_process_does_not_pay_the_arm_a_credit():
-    """腕が触れていないレンダラーが OS にトリミングされただけで
-    『この腕はメモリを減らした』ことにされる。"""
+def test_the_floors_own_justification_is_recorded_as_void():
+    """床の根拠は『OS のトリミングがこの腕に credit を払う』だった。
+    しかしこのサンプラは commit を読む -- トリミングでは動かない量。
+    床は、読む量を選んだ時点で消えていた脅威から守っていた。"""
     body = _edge_mb_source()
-    assert "if grew > 0:" in body
+    assert "COMMIT" in body or "commit" in body
+    assert "trim" in body.lower()
+
+
+def test_a_single_sample_baseline_is_not_used():
+    """基準が1標本だと、その瞬間に低かったプロセスの復帰が腕の増分になる。
+    温めのタブが解体中に基準を取ると、その戻りが走行の残り全部に乗る。"""
+    body = _edge_mb_source()
+    assert "probes" in body and "probes[len(probes) // 2]" in body
+
+
+def test_the_peak_is_taken_from_a_smoothed_signal():
+    """呼び出し側は標本の最大を取る。生の信号だと、腕が支えた水準ではなく
+    最大の一過性を報告することになる。"""
+    body = _edge_mb_source()
+    assert "window" in body and "smoothed" in body
 
 
 # ---- 閾値をノイズから較正するための帰無走行 ------------------------------------------------------
