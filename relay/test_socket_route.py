@@ -1569,3 +1569,106 @@ def test_the_sweep_is_what_honours_the_wait():
     assert "sleep" not in src, "掃引スレッドを寝かせている"
     poll = inspect.getsource(rf.RelayWorker.poll)
     assert "_cooldown_until" in poll
+
+
+# ---- 障害経路を、一連の流れとして回す ----------------------------------------------------------
+#
+# 個別の関数を直接呼ぶ試験は全部緑だったが、今夜の重大欠陥は全部「関数どうしの間」にあった。
+# ここでは poll() を実際に何度も回して、切断が続いたときに何が起きるかを通しで見る。
+
+def _failing_worker(monkeypatch, route, reason=DROPPED):
+    """毎ターン同じ理由で落ちるソケットを持ったワーカー。"""
+    monkeypatch.setattr(rf, "_socket_route", lambda: route)
+    w = _worker()
+    w.socket, w.status = True, "waiting"
+
+    def fresh():
+        d = _FakeDrv()
+        d.failed = reason
+        return d
+
+    route.driver_for = lambda n, **kw: fresh()
+    w.drv = fresh()
+    return w
+
+
+def test_a_run_of_drops_backs_off_and_then_closes_the_route(monkeypatch):
+    """切断が続いた時の全体像: 待ち時間が伸び、投票は合流され、最後に経路が閉じてタブへ。"""
+    r = _route()
+    w = _failing_worker(monkeypatch, r)
+    monkeypatch.setattr(rf, "_LAST_ROUTE_FAULT", [0.0])
+    tab = _FakeDrv()
+    monkeypatch.setattr(rf, "_open_fresh", lambda *a: object())
+    monkeypatch.setattr(rf, "CopilotWebDriver", lambda page: tab)
+    w._context, w._agent_url = object(), "u"
+
+    now = [1000.0]
+    monkeypatch.setattr(rf.time, "time", lambda: now[0])
+    waits, votes_at = [], []
+    prev_votes = 0
+    prev_reconnects = 0
+    for _ in range(60):
+        w.poll()
+        # 再接続の待ちだけを数える。`_cooldown_until` が増えたことを見ていて、
+        # タブ退避側が自前で置く短いクールダウンまで拾い、伸びていないと言い出した。
+        got = getattr(w, "_socket_reconnects_total", 0)
+        if got > prev_reconnects:
+            waits.append(round(w._cooldown_until - now[0], 2))
+            prev_reconnects = got
+        if r.fallbacks > prev_votes:
+            votes_at.append(now[0] - 1000.0)
+            prev_votes = r.fallbacks
+        now[0] += 45.0                      # 掃引の間隔。窓(60s)より短く取る
+        if w.socket is False:
+            break
+
+    assert waits == sorted(waits), "待ち時間が伸びていない: %s" % waits
+    assert all(b - a >= rf.SOCKET_INCIDENT_WINDOW_S - 0.01
+               for a, b in zip(votes_at, votes_at[1:])), "同一窓で二重投票している: %s" % votes_at
+    assert w.socket is False and w.drv is tab, "最後までタブに降りていない"
+    assert not r.open() and "consecutive" in r.closed_reason
+
+
+def test_the_goal_is_not_lost_when_the_route_dies(monkeypatch):
+    """経路が死んでもゴールは進む -- それがこの退避路の唯一の存在理由。"""
+    r = _route()
+    w = _failing_worker(monkeypatch, r)
+    monkeypatch.setattr(rf, "_LAST_ROUTE_FAULT", [0.0])
+    monkeypatch.setattr(rf, "_open_fresh", lambda *a: object())
+    monkeypatch.setattr(rf, "CopilotWebDriver", lambda page: _FakeDrv())
+    w._context, w._agent_url = object(), "u"
+    w.job = "the very same turn"
+
+    now = [1000.0]
+    monkeypatch.setattr(rf.time, "time", lambda: now[0])
+    for _ in range(60):
+        w.poll()
+        now[0] += 45.0
+        if w.socket is False:
+            break
+    assert w.job == "the very same turn"
+    assert w.status == "ready", "再送できる状態になっていない"
+    assert w.outcome is None, "経路の故障をゴールの失敗にしている"
+
+
+def test_reconnects_are_bounded_even_while_the_route_stays_open(monkeypatch):
+    """兄弟の成功が経路を開いたままにするので、遮断器はこのワーカーを止めない。
+    止めるのはゴール単位の総数のほう。"""
+    r = _route()
+    w = _failing_worker(monkeypatch, r)
+    monkeypatch.setattr(rf, "_LAST_ROUTE_FAULT", [0.0])
+    monkeypatch.setattr(rf, "_open_fresh", lambda *a: object())
+    monkeypatch.setattr(rf, "CopilotWebDriver", lambda page: _FakeDrv())
+    w._context, w._agent_url = object(), "u"
+
+    now = [1000.0]
+    monkeypatch.setattr(rf.time, "time", lambda: now[0])
+    for _ in range(80):
+        r.note_success()                    # 隣のワーカーが成功し続けている
+        w.poll()
+        now[0] += 45.0
+        if w.socket is False:
+            break
+    assert r.open(), "前提: 経路は開いたまま"
+    assert w.socket is False, "経路が開いている限り無限に張り直している"
+    assert w._socket_reconnects_total <= rf.SOCKET_RECONNECTS_PER_GOAL
