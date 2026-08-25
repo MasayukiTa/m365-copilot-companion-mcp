@@ -283,3 +283,34 @@ def test_the_fleet_path_does_not_pay_for_the_bridge_migration(box):
     import inspect
     src = inspect.getsource(ss.record_fleet_turn)
     assert "_db(import_files=False)" in src, "fleet の書き込みが移行スキャンを走らせている"
+
+
+def test_an_interrupted_write_does_not_let_the_next_turn_overwrite_history(box):
+    """ターン番号をセッション行のカウンタから作ると、中断のあと履歴を上書きする。
+
+    カウンタはターン行とは別の文で、あとから書かれる。その2文の間でプロセスが死ねば
+    -- watchdog のリセット、スリープ、窓を閉じる、fleet では日常的に起きる --
+    カウンタはテーブルより1つ遅れる。次の追記が同じ番号を再利用し、
+    INSERT OR REPLACE が本物のターンを黙って潰す。
+
+    履歴が失われるのを直すための保存層が、中断1回につき1ターンずつ消していた。
+    kill を挟む stress で、1回目は通り2回目で落ちて見つかった -- 噛むかどうかは
+    kill がどこに落ちるかで決まる。ここでは同じ状態を決定的に作る。"""
+    sess = ss.new_session(title="x")
+    sid = sess["sid"]
+    ss.append_turn(sid, "user", "first")
+    ss.append_turn(sid, "assistant", "second")
+    assert len(ss.all_turns(sid)) == 2
+
+    # 中断でカウンタだけが取り残された状態
+    conn = sqlite3.connect(ss._db_path())
+    try:
+        conn.execute("UPDATE sessions SET turns = 1 WHERE sid = ?", (sid,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    ss.append_turn(sid, "user", "third")
+    texts = [t["text"] for t in ss.all_turns(sid)]
+    assert texts == ["first", "second", "third"], (
+        "中断後の追記が既存ターンを上書きした: %s" % texts)

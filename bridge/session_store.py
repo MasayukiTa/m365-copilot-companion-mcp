@@ -363,10 +363,23 @@ def append_turn(sid, role, text):
         row = conn.execute("SELECT * FROM sessions WHERE sid = ?", (sid,)).fetchone()
         sess = _row_to_session(row) if row else None
         title = sess.get("title", "") if sess else ""
-        turn_num = (sess.get("turns", 0) if sess else 0) + 1
+        # THE TURNS TABLE DECIDES THE NEXT NUMBER, NOT THE SESSION'S COUNTER.
+        #
+        # The counter is written after the turn row, in a separate statement. Kill the process
+        # between the two -- a watchdog reset, a sleeping machine, a closed window, all of
+        # which happen to the fleet routinely -- and the counter is one behind what the table
+        # holds. The next append then reuses that number, and INSERT OR REPLACE silently
+        # overwrites a real turn with a new one. A store built because history was being lost
+        # would have been deleting it, once per interrupted write.
+        #
+        # Found by killing a writer mid-turn under stress; it passed the first run and failed
+        # the second, because whether it bites depends on where the kill lands.
+        row_max = conn.execute(
+            "SELECT COALESCE(MAX(turn), 0) FROM turns WHERE sid = ?", (sid,)).fetchone()[0]
+        turn_num = max(int(sess.get("turns", 0) if sess else 0), int(row_max or 0)) + 1
         now = time.time()
         conn.execute(
-            "INSERT OR REPLACE INTO turns (sid, turn, role, text, ts) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO turns (sid, turn, role, text, ts) VALUES (?, ?, ?, ?, ?)",
             (sid, turn_num, role, text, now))
         base = sess or {"sid": sid, "title": "", "conv_url": "", "created_ts": now,
                         "status": "active", "transcript": _transcript_ref(sid), "pending": []}
