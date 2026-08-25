@@ -78,9 +78,13 @@ def test_a_pending_worker_is_weighed_as_the_route_it_will_take():
     """
     w = RF.RelayWorker("goal", "w0")
     assert w.socket is False
-    assert w.tab_weight() == 2                      # 現状のまま量ると「タブ」
-    assert w.tab_weight(assume_socket=True) == 1    # これからなるもので量ると枠1つ
-    assert w.tab_weight(assume_socket=False) == 2
+    # 絶対値ではなく関係で見る。この試験の主旨は「これからなる経路で量れること」で、
+    # 1枠あたりの内訳(side-page を予約するかどうか)は別の判断であり、そちらが変わる
+    # たびにこの試験が落ちるのは、測っている対象を取り違えている。
+    tabs = w.tab_weight(assume_socket=False)
+    sock = w.tab_weight(assume_socket=True)
+    assert w.tab_weight() == tabs, "既定は現状(socket=False)のまま量ること"
+    assert sock == tabs - 1, "socket は本体タブの分だけ軽いこと"
 
 
 def test_admission_asks_for_the_route_it_will_take():
@@ -142,3 +146,55 @@ def test_a_socket_worker_weighs_no_tab_and_that_is_documented_as_a_tab_claim():
     assert "428.8" in src or "FLEET_MEASURED_SOCKET_ARM_MB" in src, (
         "socket が無料ではないことが、判定の隣に書かれていない")
     assert RF.FLEET_MEASURED_SOCKET_ARM_MB < RF.FLEET_MEASURED_TABS_ARM_MB
+
+
+def test_side_pages_are_not_reserved_at_admission(monkeypatch):
+    """使うとも限らないものを全ワーカーに前払いさせ、フリートを直列化していた。
+
+    運用者の実走行で観測(2026-08-25): 5ゴール中2本だけ入り、3本が16分 pending。
+    空きRAM 3106MB で ram_target_cap の予算は 2〜3、一方 既定の auto effort では
+    1ワーカーが socket で2枠・タブで3枠を請求していた。予算2に単価2なら1人しか入らない。
+
+    side-page は必要になって初めて開かれ、開く時点で ram_room_for_tab を通り、
+    research は socket で走ればページすら要らない。使う場所で守られている資源を
+    受け入れ時にもう一度請求するのは二重計上。"""
+    from relay import relay_fleet as RF
+
+    monkeypatch.delenv("SWE_SIDEPAGE_RESERVE", raising=False)
+
+    class W:
+        socket = None
+        max_research = 3
+        refuter = True
+
+    assert RF.RelayWorker.tab_weight(W, assume_socket=False) == 1, "タブ以外も予約している"
+    assert RF.RelayWorker.tab_weight(W, assume_socket=True) == 0, "socket が枠を取っている"
+
+
+def test_the_old_reservation_is_still_reachable(monkeypatch):
+    """遅延オープンの門が足りない箱のための逃げ道は残す。"""
+    from relay import relay_fleet as RF
+
+    monkeypatch.setenv("SWE_SIDEPAGE_RESERVE", "1")
+
+    class W:
+        socket = None
+        max_research = 3
+        refuter = True
+
+    assert RF.RelayWorker.tab_weight(W, assume_socket=False) == 3
+
+
+def test_a_worker_without_side_work_never_paid_for_it(monkeypatch):
+    """refuter も research も無いワーカーは、どちらの設定でも1枠。
+    ここが変わっていたら、直したつもりで別のものを壊している。"""
+    from relay import relay_fleet as RF
+
+    class W:
+        socket = None
+        max_research = 0
+        refuter = False
+
+    for value in ("0", "1"):
+        monkeypatch.setenv("SWE_SIDEPAGE_RESERVE", value)
+        assert RF.RelayWorker.tab_weight(W, assume_socket=False) == 1

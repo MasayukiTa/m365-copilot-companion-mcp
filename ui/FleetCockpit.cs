@@ -2954,10 +2954,10 @@ class CockpitWindow : Window
         int primaryPhaseCount = 0;
         if (spineWorkers != null && spineWorkers.Count > 0)
         {
-            Dictionary<string, object> primaryW = spineWorkers[0];
+            Dictionary<string, object> primaryW = SpineFocusWorker(spineWorkers);
             if (primaryW != null)
             {
-                primaryStatus = S(primaryW, "status");
+                primaryStatus = S(primaryW, "name") + ":" + S(primaryW, "status");
                 object pe;
                 if (primaryW.TryGetValue("phase_events", out pe) && pe is object[]) primaryPhaseCount = ((object[])pe).Length;
             }
@@ -2980,6 +2980,28 @@ class CockpitWindow : Window
         _spinePanel.BorderBrush = Theme.Br(Theme.Border(_dark));
         _spinePanel.Background = Theme.Br(Theme.Bg(_dark));
         _spinePanel.Child = BuildSpineContent(root, overallPhase, runEnded, spineWorkers);
+    }
+
+    // THE TIMELINE FOLLOWED workers[0] AND NOTHING ELSE. Open a running worker while the first
+    // one has finished and the left panel keeps showing the finished one's phases -- reported
+    // as "the timeline for the thing I am looking at is not shown", and that is exactly what it
+    // did: five goals, w0 done at 17:50, and expanding w1 (still running) left the spine ending
+    // at 完了 17:50.
+    //
+    // Expanding a card is how the operator says which one they are inspecting; the not-running
+    // branch already honours it for past tasks. This makes the live branch honour it too, and
+    // falls back to the first worker when nothing is expanded.
+    Dictionary<string, object> SpineFocusWorker(List<Dictionary<string, object>> workers)
+    {
+        if (workers == null || workers.Count == 0) return null;
+        if (_expanded != null && _expanded.Count > 0)
+            foreach (var w in workers)
+            {
+                if (w == null) continue;
+                string nm = S(w, "name");
+                if (!string.IsNullOrEmpty(nm) && _expanded.Contains(nm)) return w;
+            }
+        return workers[0];
     }
 
     // Build the spine panel content: section header + vertical [COMPUTED] execution timeline.
@@ -3010,7 +3032,7 @@ class CockpitWindow : Window
         var realPhaseEvents = new List<Tuple<string, string, string>>();  // label, timeStr, colorHex
         if (workers != null && workers.Count > 0)
         {
-            Dictionary<string, object> primaryWorker = workers[0];
+            Dictionary<string, object> primaryWorker = SpineFocusWorker(workers);
             object peRaw;
             if (primaryWorker.TryGetValue("phase_events", out peRaw) && peRaw is object[])
             {

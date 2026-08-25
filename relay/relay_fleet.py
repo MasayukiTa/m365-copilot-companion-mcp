@@ -2280,7 +2280,28 @@ class RelayWorker:
         # from a replication -- not a fudge to this number, which would re-serialise the fleet
         # for a reason that has nothing to do with tabs.
         main = 0 if (self.socket if assume_socket is None else assume_socket) else 1
-        if os.environ.get("SWE_SIDEPAGE_RESERVE", "1") == "0":
+        # RESERVING THE SIDE PAGES UP FRONT WAS DOUBLE-COUNTING, AND IT SERIALISED THE FLEET.
+        #
+        # Measured on the operator's own run, 2026-08-25: five goals, two admitted, three left
+        # pending for sixteen minutes. Free RAM was 3106 MB, so ram_target_cap gave a budget of
+        # 2 rising to 3 -- while every worker under the default `auto` effort billed 2 slots on
+        # a socket and 3 on tabs, because a research page and a refuter page were reserved for
+        # work that had not been asked for and might never happen. A budget of 2 and a price of
+        # 2 admits exactly one.
+        #
+        # The reservation was added against a real balloon: lean workers admitted at one tab
+        # each, then all fanning out to three at once. That cannot happen any more, and not
+        # because of this line. A side page is opened lazily and only if it is actually needed,
+        # its open is deferred until ram_room_for_tab() clears (agent_profiles.py:605,
+        # refuter.py:341), and research often runs over a socket and opens no page at all. The
+        # resource is governed where it is spent; charging for it again at admission means
+        # every worker pays for capacity it may never use, out of a budget sized for tabs that
+        # do exist.
+        #
+        # SWE_SIDEPAGE_RESERVE=1 restores the old behaviour for a box where the lazy gate is
+        # somehow not enough. Worst case without it is a transient stall -- a worker waiting in
+        # 'researching' for RAM -- which is what the gate is for.
+        if os.environ.get("SWE_SIDEPAGE_RESERVE", "0") == "0":
             return main
         return main + (1 if self.max_research > 0 else 0) + (1 if self.refuter else 0)
 

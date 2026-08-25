@@ -90,3 +90,30 @@ def test_the_auto_retry_note_sits_with_its_own_fields():
     above = SRC[max(0, i - 900):i]
     assert "DEFAULT ON SINCE" in above, "自動再試行の説明が離れている"
     assert "_retDays" not in above, "保持フィールドが説明文の間に割り込んでいる"
+
+
+# ── 実行タイムライン ────────────────────────────────────────────────────────
+
+def test_the_timeline_follows_the_worker_being_inspected():
+    """タイムラインは workers[0] だけを描いていた。
+
+    5ゴールの走行で w0 が 17:50 に完了した後、実行中の w1 を開いても、左の
+    「実行タイムライン」は完了した w0 の遷移(〜完了17:50)を出し続けた。
+    「今見ている、進行しているものの実行タイムラインが表示されていない」の正体。
+
+    カードを展開することが「これを見ている」という意思表示で、走行していない側の
+    分岐は既に過去タスクでそれを尊重している。走行中も同じにする。"""
+    assert "SpineFocusWorker" in SRC, "選択中のワーカーを選ぶ経路が無い"
+    assert "primaryWorker = SpineFocusWorker(workers)" in SRC, "描画が workers[0] のまま"
+    i = SRC.index("Dictionary<string, object> SpineFocusWorker")
+    body = SRC[i:i + 700]
+    assert "_expanded.Contains(nm)" in body, "展開状態を見ていない"
+    assert "return workers[0]" in body, "何も展開されていないときの既定が無い"
+
+
+def test_changing_the_selection_repaints_the_timeline():
+    """署名に載せなければ、選択を変えても『変化なし』と判断されて描き直されない。"""
+    i = SRC.index("string spineSig = ")
+    sig = SRC[max(0, i - 700):i + 400]
+    assert "SpineFocusWorker(spineWorkers)" in sig, "署名が workers[0] を見ている"
+    assert 'S(primaryW, "name")' in sig, "署名にワーカー名が入っていない"
