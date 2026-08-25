@@ -321,3 +321,53 @@ def test_the_transport_decision_is_announced_where_it_can_be_seen():
     assert "logger.info" not in code, "届かない経路に出力している"
     assert "SOCKET" in code and "PAGE" in code
     assert code.count("print(") >= 2
+
+
+# ---- 常駐ページの解放 --------------------------------------------------------------------------
+
+def test_releasing_the_startup_page_clears_the_driver_with_it():
+    """PAGE だけ、あるいは DRIVER だけ残すと、ensure_page_alive が直すために
+    存在している壊れた状態を、わざわざ作って置いていくことになる。"""
+    import inspect
+
+    src = inspect.getsource(B._page_main)
+    # 固定文字数で切らない。コメントを1行足しただけで窓から本体がはみ出し、
+    # 検査が「無い」と言い出す（実際そうなった）。区切りは構造で取る。
+    i = src.index("BRIDGE_RELEASE_STARTUP_PAGE")
+    tail = src[i:src.index("PAGE_EXECUTOR.run_forever()", i)]
+    assert "PAGE.close()" in tail
+    assert "PAGE, DRIVER = None, None" in tail
+    # 空ページを先に開くこと。最後のタブを閉じると Edge ごと終了し、
+    # ブリッジはトークン捕捉にも再オープンにも要る context を失って自分も落ちた（実測）。
+    assert tail.index("ctx.new_page()") < tail.index("PAGE.close()")
+    # 既存の空ページを使い回すこと。毎回開くと再起動のたびに about:blank が増える
+    # （2回目で2枚あった -- 漏れを塞ぐ修正が別の漏れを作っていた）。
+    assert "about:blank" in tail and "ctx.pages" in tail
+
+
+def test_the_release_requires_both_a_socket_and_a_known_agent_url():
+    """ソケットが使えない、または起点URLが分からない状態でページを手放すと、
+    次のターンが開くべき場所を知らないまま丸腰になる。"""
+    import inspect
+
+    src = inspect.getsource(B._page_main)
+    i = src.index("BRIDGE_RELEASE_STARTUP_PAGE")
+    line = src[i:src.index(":", i)]
+    assert "BRIDGE_SOCKET" in line and "AGENT_URL" in line
+
+
+def test_the_release_is_off_until_a_person_has_used_it():
+    import inspect
+
+    src = inspect.getsource(B)
+    i = src.index("BRIDGE_RELEASE_STARTUP_PAGE = ")
+    assert 'os.environ.get("MCP_BRIDGE_RELEASE_PAGE", "0")' in src[i:i + 200]
+
+
+def test_startup_still_runs_everything_before_releasing():
+    """サインイン検出・同意・自動再開はページを要る。解放はそれらの後でなければならない。"""
+    import inspect
+
+    src = inspect.getsource(B._page_main)
+    assert src.index("_find_or_open_agent") < src.index("BRIDGE_RELEASE_STARTUP_PAGE")
+    assert src.index("should_autoresume") < src.index("BRIDGE_RELEASE_STARTUP_PAGE")

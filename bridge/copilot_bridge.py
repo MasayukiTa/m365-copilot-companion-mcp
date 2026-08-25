@@ -1187,6 +1187,22 @@ BRIDGE_SOCKET = (os.environ.get("MCP_BRIDGE_SOCKET", "1").strip().lower()
                  not in ("0", "false", "no", "off"))
 
 
+#: Whether to release the startup page once startup is DONE, instead of holding it for the
+#: life of the process. The page's remaining users are four DOM endpoints -- /new, /switch,
+#: /history, /agent_conversations -- and /upload, all of which reopen it on demand through
+#: ensure_page_alive; the conversation itself no longer needs it once the turn runs on a
+#: socket. Measured cost of holding it: this bridge's Edge sat at roughly 1 GB with a single
+#: page open and nobody typing.
+#:
+#: EVERYTHING ABOUT STARTUP STILL RUNS. Sign-in detection, the consent click-through and
+#: auto-resume all happen exactly as before, against a real page -- only the holding-on
+#: afterwards stops. Off by default until it has been exercised by a person for a while: the
+#: bridge is an interactive chat, and the failure this could introduce is one a person would
+#: meet in the middle of a conversation rather than in a test.
+BRIDGE_RELEASE_STARTUP_PAGE = (os.environ.get("MCP_BRIDGE_RELEASE_PAGE", "0").strip().lower()
+                               not in ("0", "false", "no", "off", ""))
+
+
 def _bridge_socket_driver():
     """A socket driver for the conversation this bridge is currently on, or None.
 
@@ -3117,6 +3133,13 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/new":          # start a fresh Copilot conversation
             if not PAGE_LOCK.acquire(blocking=False):
                 self._json({"ok": False, "error": "busy"}); return
+            # A PAGE MAY NOT EXIST. Once the conversation runs on a socket the bridge can
+            # be holding no agent page at all, and these five endpoints are the only things
+            # left that genuinely need the DOM -- so each one asks for it rather than
+            # assuming startup left one behind. Measured: /history answered
+            # "AttributeError: 'NoneType' object has no attribute 'wait_for_timeout'".
+            if not run_on_page_thread(ensure_page_alive):
+                self._json({"ok": False, "error": "no agent page"}); PAGE_LOCK.release(); return
             try:
                 run_on_page_thread(self._do_new, parsed)
             finally:
@@ -3133,6 +3156,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/switch":       # continue a saved conversation
             if not PAGE_LOCK.acquire(blocking=False):
                 self._json({"ok": False, "error": "busy"}); return
+            # A page may not exist -- see /new for why these five ask for one.
+            if not run_on_page_thread(ensure_page_alive):
+                self._json({"ok": False, "error": "no agent page"}); PAGE_LOCK.release(); return
             try:
                 run_on_page_thread(self._do_switch, parsed)
             finally:
@@ -3266,6 +3292,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/history":      # scrape ALL turns of a conversation in order
             if not PAGE_LOCK.acquire(blocking=False):
                 self._json({"ok": False, "error": "busy"}); return
+            # A page may not exist -- see /new for why these five ask for one.
+            if not run_on_page_thread(ensure_page_alive):
+                self._json({"ok": False, "error": "no agent page"}); PAGE_LOCK.release(); return
             try:
                 run_on_page_thread(self._do_history, parsed)
             finally:
@@ -3310,6 +3339,9 @@ class Handler(BaseHTTPRequestHandler):
             # orphans not in the local registry. Deletes nothing. Scope = current agent.
             if not PAGE_LOCK.acquire(blocking=False):
                 self._json({"ok": False, "error": "busy"}); return
+            # A page may not exist -- see /new for why these five ask for one.
+            if not run_on_page_thread(ensure_page_alive):
+                self._json({"ok": False, "error": "no agent page"}); PAGE_LOCK.release(); return
             try:
                 run_on_page_thread(self._do_agent_conversations)
             finally:
@@ -3318,6 +3350,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/upload":       # attach a local file/image to the composer
             if not PAGE_LOCK.acquire(blocking=False):
                 self._json({"ok": False, "error": "busy"}); return
+            # A page may not exist -- see /new for why these five ask for one.
+            if not run_on_page_thread(ensure_page_alive):
+                self._json({"ok": False, "error": "no agent page"}); PAGE_LOCK.release(); return
             try:
                 run_on_page_thread(self._do_upload, parsed)
             finally:
@@ -5432,6 +5467,34 @@ def _page_main(cdp, fresh):
             _record_capture_baseline()
 
         print("copilot bridge: driving %s" % PAGE.url[-40:], flush=True)
+        if BRIDGE_RELEASE_STARTUP_PAGE and BRIDGE_SOCKET and AGENT_URL:
+            # Startup is finished and it needed a page; nothing after this does, until an
+            # endpoint asks for the DOM.
+            #
+            # A KEEP-ALIVE PAGE FIRST, and the first attempt did not have one. Edge exits when
+            # its LAST page closes: closing the agent page took the whole browser down,
+            # CDP :9223 went unreachable, and the bridge lost the context it needs both to
+            # capture a token and to reopen a page later -- it exited too. about:blank costs a
+            # few MB against the Copilot SPA's several hundred, and holds the browser open.
+            #
+            # Cleared together: a PAGE without its DRIVER, or a DRIVER pointing at a closed
+            # PAGE, is the state ensure_page_alive exists to repair, and leaving it
+            # deliberately would be leaving a trap. If anything here fails the resident page
+            # simply stays -- the saving is not worth risking the browser for.
+            try:
+                # REUSE A BLANK ONE IF THIS EDGE ALREADY HAS ONE. Every restart released a
+                # page and opened a keep-alive, so restarts accumulated about:blank tabs --
+                # two after the second run. A leak introduced by the fix for a leak.
+                if not any((pg.url or "") in ("about:blank", "")
+                           for pg in ctx.pages if pg is not PAGE):
+                    ctx.new_page()
+                PAGE.close()
+                PAGE, DRIVER = None, None
+                print("bridge: startup page released (a blank page holds the browser open); "
+                      "the DOM endpoints reopen one on demand", flush=True)
+            except Exception as exc:
+                print("bridge: keeping the resident page (%s: %s)"
+                      % (type(exc).__name__, str(exc)[:120]), flush=True)
         # Service PAGE_EXECUTOR's work queue forever ON THIS THREAD -- every later
         # run_on_page_thread(...) call from any HTTP request thread executes here, inside the
         # SAME `with sync_playwright()` context that created PAGE/DRIVER above. This call
