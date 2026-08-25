@@ -134,3 +134,66 @@ def test_the_turn_loop_reads_only_through_these_three(monkeypatch):
     assert "_text(LOADING)" not in src and "_text(LASTMSG)" not in src
     for name in ("_answer_partial()", "_answer_settled()", "_answer_clean()"):
         assert name in src, name
+
+
+# ---- 経路の選択: 会話はソケット、ページは DOM 専用 -----------------------------------------
+
+def test_a_live_socket_is_reused_rather_than_rebuilt(monkeypatch):
+    built = []
+    monkeypatch.setattr(B, "DRIVER", _SocketDrv(last="x"))
+    monkeypatch.setattr(B, "_bridge_socket_driver", lambda: built.append(1) or _SocketDrv())
+    assert B.ensure_driver() is not None
+    assert built == [], "生きているソケットを毎ターン作り直している"
+
+
+def test_a_failed_socket_is_replaced_not_kept(monkeypatch):
+    dead = _SocketDrv()
+    dead.failed = "ConnectionClosedError"
+    fresh = _SocketDrv(last="y")
+    monkeypatch.setattr(B, "DRIVER", dead)
+    monkeypatch.setattr(B, "_bridge_socket_driver", lambda: fresh)
+    assert B.ensure_driver() is fresh
+
+
+def test_without_a_socket_it_falls_back_to_the_page(monkeypatch):
+    page = _PageDrv()
+    monkeypatch.setattr(B, "DRIVER", None)
+    monkeypatch.setattr(B, "_bridge_socket_driver", lambda: None)
+
+    def _ensure():
+        B.DRIVER = page
+        return True
+
+    monkeypatch.setattr(B, "ensure_page_alive", _ensure)
+    monkeypatch.setattr(B, "run_on_page_thread", lambda fn, *a, **kw: fn(*a, **kw))
+    assert B.ensure_driver() is page
+
+
+def test_reopening_the_page_does_not_steal_a_socket_conversation(monkeypatch):
+    """4つの DOM 用エンドポイントがページを必要としただけで、
+    走っている会話が黙って DOM に落ちてはいけない。"""
+    sock = _SocketDrv(last="生きている")
+    monkeypatch.setattr(B, "DRIVER", sock)
+    monkeypatch.setattr(B, "PAGE", None)
+    monkeypatch.setattr(B, "CTX", object())
+    monkeypatch.setattr(B, "_find_or_open_agent", lambda ctx: object())
+    monkeypatch.setattr(B, "CopilotWebDriver",
+                        lambda page: pytest.fail("ソケット会話を DOM ドライバで上書きした"))
+    assert B.ensure_page_alive() is True
+    assert B.DRIVER is sock
+
+
+def test_the_send_path_is_what_chooses_the_transport():
+    """起動時に選ぶと、経路がその一瞬にできたことにプロセス全体が縛られる。"""
+    import inspect
+
+    src = inspect.getsource(B._send_counted)
+    assert "ensure_driver()" in src
+
+
+def test_the_switch_is_on_by_default_and_can_be_turned_off():
+    import inspect
+
+    src = inspect.getsource(B)
+    i = src.index("BRIDGE_SOCKET = ")
+    assert 'os.environ.get("MCP_BRIDGE_SOCKET", "1")' in src[i:i + 200]

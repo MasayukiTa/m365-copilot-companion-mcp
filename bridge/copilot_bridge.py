@@ -1159,6 +1159,78 @@ def _looks_redirected(landed_url, target_url=""):
     return False
 
 
+
+#: Whether this bridge may carry its conversation over a socket instead of its resident page.
+#: On by default: a switch nobody turns on is a feature that was written and never run, and
+#: this repository has that failure recorded more than once. Turning it OFF restores exactly
+#: today's behaviour, because every path below falls back to the page when the socket cannot
+#: be had -- the worst case of this flag being wrong is the state the bridge is in without it.
+BRIDGE_SOCKET = (os.environ.get("MCP_BRIDGE_SOCKET", "1").strip().lower()
+                 not in ("0", "false", "no", "off"))
+
+
+def _bridge_socket_driver():
+    """A socket driver for the conversation this bridge is currently on, or None.
+
+    THE CAPTURE RUNS ON THE PAGE THREAD. It opens a tab, reads the token off the socket the
+    client itself opens, and closes the tab -- all Playwright sync calls, which belong to the
+    one thread that owns them. Getting this wrong does not fail loudly; it raises "Cannot
+    switch to a different thread" from inside a capture and the route quietly counts a failure.
+
+    The conversation id is passed when the session has one, so a bridge that reconnects
+    continues the chat the user is looking at rather than silently starting a new one.
+    """
+    if not BRIDGE_SOCKET or CTX is None:
+        return None
+    try:
+        from relay.relay_fleet import _socket_route
+    except Exception:
+        return None
+    route = _socket_route()
+    if not route.open():
+        return None
+    url = AGENT_URL or ""
+    if not url:
+        return None
+    try:
+        if route.needs_refresh(url) and not run_on_page_thread(route.refresh, CTX, url):
+            return None
+        conv_id = ""
+        try:
+            sess = S.get(ACTIVE_SID) if ACTIVE_SID else None
+            conv_id = _conv_guid((sess or {}).get("conv_url") or "") or ""
+        except Exception:
+            conv_id = ""
+        return route.driver_for("bridge", agent_url=url, conversation_id=conv_id,
+                                turn_timeout_s=BRIDGE_TURN_TIMEOUT_S)
+    except Exception:
+        logger.warning("socket driver unavailable; staying on the page", exc_info=True)
+        return None
+
+
+#: How long one bridge turn may run on a socket. Longer than the fleet's because a person is
+#: waiting on the other end of exactly one conversation and would rather wait than be told the
+#: turn was abandoned; the outer streaming loop already bounds itself at 600 s.
+BRIDGE_TURN_TIMEOUT_S = float(os.environ.get("MCP_BRIDGE_SOCKET_TURN_S", "900"))
+
+
+def ensure_driver():
+    """The driver for the CONVERSATION: a socket when one can be had, else the page.
+
+    Separate from ensure_page_alive, which is about the DOM surface four endpoints still need.
+    Conflating them is what kept the two lifetimes tied together and the tab resident.
+    """
+    global DRIVER
+    if DRIVER is not None and not (_on_socket() and getattr(DRIVER, "failed", "")):
+        return DRIVER
+    drv = _bridge_socket_driver()
+    if drv is not None:
+        DRIVER = drv
+        logger.info("bridge conversation is on a socket (no tab needed for turns)")
+        return DRIVER
+    return DRIVER if run_on_page_thread(ensure_page_alive) else None
+
+
 def ensure_page_alive():
     """Reopen the agent page if it has closed. Returns True if a page is usable afterwards.
 
@@ -1181,7 +1253,11 @@ def ensure_page_alive():
         return False
     try:
         PAGE = _find_or_open_agent(CTX)
-        DRIVER = CopilotWebDriver(PAGE)
+        # ONLY IF THE CONVERSATION IS ON THE PAGE. This used to reassign DRIVER
+        # unconditionally, which would silently drop a live socket conversation back onto the
+        # DOM the moment any endpoint needed a page for its own reasons.
+        if not _on_socket():
+            DRIVER = CopilotWebDriver(PAGE)
         logger.info("agent page had closed -- reopened it")
         return True
     except Exception:
@@ -4536,6 +4612,10 @@ def _send_counted(msg):
     one line all of them pass through.
     """
     global _CONVERSATION_TURNS
+    # THE ONE PLACE A TURN STARTS, so it is the one place that has to decide what carries it.
+    # Picking the transport at startup instead would bind the whole process to whatever the
+    # route could do in its first second.
+    ensure_driver()
     _CONVERSATION_TURNS += 1
     DRIVER.send(msg)
 
