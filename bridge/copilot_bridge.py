@@ -490,6 +490,12 @@ PROMPT_TEMPLATES = {
 }
 
 PAGE = None      # set at startup
+#: The browser context PAGE was opened in. Kept because without it the page can never be
+#: reopened: `_find_or_open_agent(ctx)` ran once at startup with `ctx` as a local, so when the
+#: page closed -- a conversation recycle, an Edge restart, a crashed renderer -- the bridge had
+#: no way back and stayed broken until someone restarted it. The delete log records it plainly:
+#: 12 of 14 delete attempts failed, and the largest group, 5 of them, is TargetClosedError.
+CTX = None
 DRIVER = None
 AGENT_URL = ""   # bare agent URL (a fresh chat); set at startup
 
@@ -1153,6 +1159,36 @@ def _looks_redirected(landed_url, target_url=""):
     return False
 
 
+def ensure_page_alive():
+    """Reopen the agent page if it has closed. Returns True if a page is usable afterwards.
+
+    THERE WAS NO WAY BACK. `_find_or_open_agent` ran once at startup, with the browser context
+    as a local variable, so nothing could reopen the page later. A closed page -- from a
+    conversation recycle, an Edge restart, a renderer crash -- left the bridge answering every
+    request with TargetClosedError until a human restarted it.
+
+    Must run on the page-owner thread, like every other page call; the callers below already do.
+    A page that is merely slow is left alone: only `is_closed()` counts as dead, because
+    reopening a live page would throw away the conversation it is holding.
+    """
+    global PAGE, DRIVER
+    try:
+        if PAGE is not None and not PAGE.is_closed():
+            return True
+    except Exception:
+        pass                      # asking a dead handle is itself a failure -> treat as closed
+    if CTX is None:
+        return False
+    try:
+        PAGE = _find_or_open_agent(CTX)
+        DRIVER = CopilotWebDriver(PAGE)
+        logger.info("agent page had closed -- reopened it")
+        return True
+    except Exception:
+        logger.warning("agent page had closed and could not be reopened", exc_info=True)
+        return False
+
+
 def _goto_settled(url, timeout=25000, tries=3, compose_wait=40):
     """PAGE.goto(url) that recovers from SSO-redirect landings. Returns True once the page is on
     the requested surface (off any redirect/login wall); re-navigates up to `tries` times,
@@ -1160,6 +1196,9 @@ def _goto_settled(url, timeout=25000, tries=3, compose_wait=40):
     how many seconds to wait for the composer each attempt -- keep it SHORT for interactive reads
     (/history) so an unreachable conversation fails fast instead of hanging the single-threaded
     bridge for minutes."""
+    # A closed page fails every attempt below identically, so retrying three times against a
+    # dead handle just spends the timeout three times and reports "unreachable".
+    ensure_page_alive()
     surfaced = False
     force_timer = None
     for _ in range(max(1, tries)):
@@ -5119,11 +5158,12 @@ def _page_main(cdp, fresh):
     Every later PAGE/DRIVER call (from any HTTP request thread) is routed here via
     run_on_page_thread -- see PageExecutor's docstring for why page creation and every later
     page call must share this one thread (Playwright sync-API thread affinity)."""
-    global PAGE, DRIVER, AGENT_URL, ACTIVE_SID, _CONVERSATION_TURNS
+    global PAGE, DRIVER, CTX, AGENT_URL, ACTIVE_SID, _CONVERSATION_TURNS
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         br = p.chromium.connect_over_cdp(cdp)
         ctx = br.contexts[0] if br.contexts else br.new_context()
+        CTX = ctx
         PAGE = _find_or_open_agent(ctx)
         DRIVER = CopilotWebDriver(PAGE)
         # bare agent URL (a fresh chat) for /new; strip any /conversation/<id> suffix
