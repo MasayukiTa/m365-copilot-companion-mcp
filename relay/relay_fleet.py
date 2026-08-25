@@ -864,28 +864,6 @@ FLEET_MEASURED_SOCKET_ARM_MB = 428.8
 FLEET_PER_TAB_MB = float(os.environ.get("MCP_FLEET_PER_TAB_MB", "400"))
 
 
-def ram_room_for_worker(floor_mb=None) -> bool:
-    """True iff there is room in free RAM for ONE more worker, whichever transport it takes.
-
-    The tab budget cannot bound a socket worker, because a socket worker holds no tab -- and it
-    is not free either: 428.8 MB of browser growth plus 258.2 MB in the fleet's own process,
-    measured 2026-08-25. Without a second gate the admission test reduces to `0 <= budget` and
-    every pending goal is admitted at once.
-
-    That gate is MEASURED, not counted. A fixed worker cap was the first attempt and it was the
-    wrong shape: it re-imposes by hand the number the autoscale exists to derive, and it would
-    pin a machine with gigabytes free to whatever was typed in a settings file. This asks the
-    machine instead, and the fleet grows and drains with it.
-
-    Sized like ram_room_for_tab: the floor that must remain for the operator, plus the cost of
-    the worker about to start. A socket worker costs less than a tab, so charging it a tab is
-    the conservative direction and keeps one number instead of two.
-    """
-    if floor_mb is None:
-        floor_mb = FLEET_RAM_FLOOR_MB + FLEET_PER_TAB_MB
-    return avail_phys_mb() >= floor_mb
-
-
 def ram_room_for_tab(floor_mb=None) -> bool:
     """True iff there is enough free physical RAM to open ANOTHER browser tab without crowding
     the machine. Used to RAM-gate the SUB-AGENT side-pages (research / refuter) -- the fleet's
@@ -3889,17 +3867,29 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # free: measured 2026-08-25 at 428.8 MB of browser growth plus 258.2 MB in this
         # process. Sixteen at once is about 11 GB.
         #
-        # SO THE SECOND GATE IS MEMORY, NOT A COUNT. A fixed worker cap was tried here first and
-        # was wrong: it re-imposed by hand the limit the autoscale exists to compute, and it
-        # would hold the fleet at three workers on a machine with gigabytes to spare.
-        # `ram_room_for_worker()` asks the only question that matters -- is there room for one
-        # more right now -- and answers it from the free-RAM reading, so the fleet grows and
-        # drains with the machine instead of with a number somebody typed.
+        # NO SECOND GATE, BECAUSE THE COST IT WOULD CHARGE DOES NOT EXIST. Two were tried here
+        # and both were withdrawn: a fixed worker cap, and then a per-worker RAM projection of
+        # the form `active + (avail - floor) // per_worker`. Both assume a socket worker has a
+        # marginal price. Measured across nineteen cold runs on 2026-08-25 it does not:
+        #
+        #     one worker at a time    browser 478.9 MB   fleet process 244.0 MB
+        #     three at a time         browser 467.9 MB   fleet process 237.7 MB
+        #
+        # Tripling the workers did not raise either number -- the fleet-process figure barely
+        # moves at all, which is what a fixed residency looks like. What tracks the cost is how
+        # long an arm runs, not how many run: the one-at-a-time arms lasted ~190 s against ~110 s
+        # for three, and paid about the same. So "428.8 MB per socket worker", quoted earlier in
+        # this file's history, was an ARM total read as a per-worker price. There is no per-worker
+        # price to reserve.
+        #
+        # Tabs are different -- a tab is a real allocation -- and they are already governed:
+        # tab_weight charges 1 for a tab and 0 for a socket, ram_room_for_tab gates each lazy
+        # side-page at the moment it opens, and the autoscale sets mc_box from free RAM. Adding a
+        # count-based gate on top of those charges sockets for something they do not use.
         while pending and (_active_open() == 0
-                           or (ram_room_for_worker()
-                               and _projected_peak()
-                               + pending[0].tab_weight(assume_socket=_socket_open_now())
-                               <= max(1, mc_box[0]))):
+                           or _projected_peak()
+                              + pending[0].tab_weight(assume_socket=_socket_open_now())
+                              <= max(1, mc_box[0])):
             # reserve disk for THIS eval plus every already-open eval still in flight, so we never
             # admit N tabs that look fine individually but crash C: once their builds run at once.
             # PER-REPO mode sizes the reserve by each instance's actual build weight (matplotlib 7GB
