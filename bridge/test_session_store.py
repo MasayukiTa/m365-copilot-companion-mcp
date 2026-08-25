@@ -33,10 +33,13 @@ def test_create_load_roundtrip():
 
 
 def _set_last_active(sid, ts):
-    """Directly stamp last_active_ts on disk, bypassing touch()'s auto-now behavior."""
-    sess = ss.load(sid)
-    sess["last_active_ts"] = ts
-    ss._atomic_write_json(ss._sess_path(sid), sess)
+    """Place a session at a chosen point in the ordering, through the store's own API.
+
+    This used to write the session file directly, behind the store's back. That stopped
+    working when the store moved to SQLite -- and it should never have been necessary:
+    needing to bypass the API to arrange a test is the API missing something.
+    """
+    ss.touch(sid, last_active_ts=ts)
 
 
 def test_list_ordering():
