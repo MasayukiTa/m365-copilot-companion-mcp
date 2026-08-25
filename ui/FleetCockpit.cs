@@ -826,6 +826,13 @@ class CockpitWindow : Window
     // (e.g. the tool-denial ones) can NEVER loop forever. Counted by goal TEXT, so a re-queued
     // copy (which gets a new worker name) shares the original goal's budget. Manual retry is
     // unaffected -- this only governs the automatic re-queue.
+    // Conversation retention. BOTH DEFAULT TO ZERO, WHICH MEANS KEEP EVERYTHING. This store
+    // exists because history was disappearing; a retention policy that starts deleting the day
+    // it ships is that same loss arriving on a schedule. The operator opts in.
+    int _retDays = 0;          // settings.txt session_retention_days= ; 0 = keep forever
+    int _retMb = 0;            // settings.txt session_max_mb=        ; 0 = no size cap
+    TextBlock _retDaysValue, _retMbValue, _retNote;
+
     bool _autoRetry = false;
     int _autoRetryMax = 1;
     Dictionary<string, int> _autoRetryCount = new Dictionary<string, int>();
@@ -1064,6 +1071,16 @@ class CockpitWindow : Window
         if (k == "settings") return ja ? "設定" : "Settings";
         if (k == "set_tabs_section") return ja ? "並列タブ" : "Parallel tabs";
         if (k == "set_retry_section") return ja ? "自動再試行" : "Auto-retry";
+        if (k == "set_retention_section") return ja ? "会話の保持" : "Conversation retention";
+        if (k == "ret_days") return ja ? "保持日数" : "Keep for (days)";
+        if (k == "ret_keep") return ja ? "消さない" : "keep all";
+        if (k == "ret_mb") return ja ? "上限サイズ (MB)" : "Size cap (MB)";
+        if (k == "ret_off") return ja
+            ? "0 = 消さない（既定）。会話はローカルの SQLite に残り、タブを作り直しても失われません。"
+            : "0 = keep everything (default). Conversations live in local SQLite and survive a fresh tab.";
+        if (k == "ret_whole") return ja
+            ? "削除は会話単位です。途中だけ消えた会話は、完全な顔をして中身が抜けているため作りません。"
+            : "Whole conversations only -- a half-kept one reads as complete and is not.";
         if (k == "set_capacity_section") return ja ? "容量ガード" : "Capacity guard";
         if (k == "disk_floor") return ja ? "実行下限ディスク (GB)" : "Disk floor (GB)";
         if (k == "disk_floor_hint") return ja ? "空きディスクがこの値を下回るとタブ開放を待機します。" : "Pauses opening tabs when free disk drops below this.";
@@ -1178,6 +1195,10 @@ class CockpitWindow : Window
                 else if (ln.StartsWith("autoretry_max=") && int.TryParse(ln.Substring(14).Trim(), out v)) _autoRetryMax = Math.Max(1, Math.Min(3, v));
                 else if (ln.StartsWith("autoretry=")) _autoRetry = ln.Substring(10).Trim() == "1";
                 else if (ln.StartsWith("autoarchive=")) _autoArchive = ln.Substring(12).Trim() == "1";
+                else if (ln.StartsWith("session_retention_days=") && int.TryParse(ln.Substring(23).Trim(), out v))
+                    _retDays = Math.Max(0, Math.Min(3650, v));
+                else if (ln.StartsWith("session_max_mb=") && int.TryParse(ln.Substring(15).Trim(), out v))
+                    _retMb = Math.Max(0, Math.Min(100000, v));
                 else if (ln.StartsWith("disk_floor_gb="))
                 {
                     double df;
@@ -5095,6 +5116,53 @@ class CockpitWindow : Window
         _advancedPopup.IsOpen = true;
     }
 
+    void SetRetDays(int v)
+    {
+        _retDays = Math.Max(0, Math.Min(3650, v));
+        SaveKey("session_retention_days", _retDays.ToString());
+        if (_retDaysValue != null) _retDaysValue.Text = _retDays == 0 ? T("ret_keep") : _retDays.ToString();
+        PaintRetentionNote();
+    }
+
+    void SetRetMb(int v)
+    {
+        // Steps of 100 MB below 1 GB and 500 above it: the numbers that matter here are
+        // "a few hundred" and "a couple of gigabytes", and single-MB precision would mean
+        // holding the button down for a minute to reach either.
+        _retMb = Math.Max(0, Math.Min(100000, v));
+        SaveKey("session_max_mb", _retMb.ToString());
+        if (_retMbValue != null) _retMbValue.Text = _retMb == 0 ? T("ret_keep") : _retMb.ToString();
+        PaintRetentionNote();
+    }
+
+    int RetMbStep() { return _retMb >= 1000 ? 500 : 100; }
+
+    void PaintRetentionNote()
+    {
+        if (_retNote == null) return;
+        bool ja = _lang == 0;
+        if (_retDays == 0 && _retMb == 0)
+        {
+            _retNote.Text = T("ret_off");
+            _retNote.Foreground = Muted;
+            return;
+        }
+        // SAY WHAT WILL BE DELETED, IN WORDS, BEFORE IT IS. A retention setting whose effect
+        // the operator has to infer from two numbers is one they will set once and regret.
+        string what;
+        if (_retDays > 0 && _retMb > 0)
+            what = ja ? string.Format("{0}日より古い会話と、{1}MB を超えた分の古い会話を、起動時に削除します。", _retDays, _retMb)
+                      : string.Format("At startup, deletes conversations older than {0} days, and the oldest ones above {1} MB.", _retDays, _retMb);
+        else if (_retDays > 0)
+            what = ja ? string.Format("{0}日より古い会話を起動時に削除します。", _retDays)
+                      : string.Format("At startup, deletes conversations older than {0} days.", _retDays);
+        else
+            what = ja ? string.Format("{0}MB を超えた分の古い会話を起動時に削除します。", _retMb)
+                      : string.Format("At startup, deletes the oldest conversations above {0} MB.", _retMb);
+        _retNote.Text = what + " " + T("ret_whole");
+        _retNote.Foreground = Theme.Br(Theme.Warning(_dark));
+    }
+
     UIElement BuildSettingsPanel()
     {
         var card = new Border();
@@ -5125,6 +5193,24 @@ class CockpitWindow : Window
         _autoValue = new TextBlock(); _autoValue.Text = _autoMax.ToString();
         _autoMinus = ceilMinus; _autoPlus = ceilPlus;   // keep refs so UpdateAutoEnabled can grey them
         col.Children.Add(SettingsStepperRow(T("max_tabs2"), _autoValue, ceilMinus, ceilPlus));
+
+        // ── Conversation retention: days + size cap, both defaulting to "keep everything" ──
+        col.Children.Add(SectionHeader(T("set_retention_section")));
+        var retDMinus = MiniButton("−"); retDMinus.Click += delegate { SetRetDays(_retDays - (_retDays > 30 ? 30 : 7)); };
+        var retDPlus = MiniButton("+"); retDPlus.Click += delegate { SetRetDays(_retDays + (_retDays >= 30 ? 30 : 7)); };
+        _retDaysValue = new TextBlock(); _retDaysValue.Text = _retDays == 0 ? T("ret_keep") : _retDays.ToString();
+        col.Children.Add(SettingsStepperRow(T("ret_days"), _retDaysValue, retDMinus, retDPlus));
+
+        var retMMinus = MiniButton("−"); retMMinus.Click += delegate { SetRetMb(_retMb - RetMbStep()); };
+        var retMPlus = MiniButton("+"); retMPlus.Click += delegate { SetRetMb(_retMb + RetMbStep()); };
+        _retMbValue = new TextBlock(); _retMbValue.Text = _retMb == 0 ? T("ret_keep") : _retMb.ToString();
+        col.Children.Add(SettingsStepperRow(T("ret_mb"), _retMbValue, retMMinus, retMPlus));
+
+        _retNote = new TextBlock();
+        _retNote.FontSize = 11; _retNote.TextWrapping = TextWrapping.Wrap;
+        _retNote.Margin = new Thickness(0, 2, 0, 2); _retNote.MaxWidth = 300;
+        PaintRetentionNote();
+        col.Children.Add(_retNote);
 
         // ── Auto-retry: on/off toggle + cap ──
         col.Children.Add(SectionHeader(T("set_retry_section")));
