@@ -1,4 +1,4 @@
-"""grep のフォールバックが、サーバのメモリを1回の呼び出しで持っていかないこと。
+"""検索系ツールが、1回の呼び出しでサーバのメモリを持っていかないこと（grep / find_files）。
 
 2026-08-25 実測。`rg` が PATH に無いのでフォールバックが常用経路になっており、そこが
 `read_text().splitlines()` -- ファイル全文の str と、その上に全行の list -- を作っていた。
@@ -11,7 +11,7 @@ import pathlib
 
 import pytest
 
-from tools import coding_ops
+from tools import coding_ops, search_ops
 
 
 @pytest.fixture(autouse=True)
@@ -88,3 +88,64 @@ def test_the_cap_is_configurable_without_editing_source():
 
     src = inspect.getsource(coding_ops)
     assert "MCP_GREP_MAX_FILE_MB" in src
+
+
+# ---- find_files も同じ欠陥を持っていた -------------------------------------------------------
+#
+# grep を直した直後の py-spy ダンプで、3スレッドが find_files の内包表記の中にいた。
+# 木全体のマッチを一旦すべてリストに積み、stat() でソートしてから max_results に切っていたので、
+# 呼び出し側の上限はピークを何も縛っていなかった。最初のダンプにも写っていたのに拾わなかった。
+
+
+def test_find_files_holds_only_the_answer_not_the_whole_tree(monkeypatch, tmp_path):
+    import pathlib as _pl
+
+    monkeypatch.setattr(search_ops, "_validate_path", lambda p: _pl.Path(p))
+    for i in range(50):
+        (tmp_path / ("hit_%02d.txt" % i)).write_text("x", encoding="utf-8")
+
+    held = []
+    real_push = search_ops.heapq.heappush
+
+    def spy(heap, item):
+        real_push(heap, item)
+        held.append(len(heap))
+
+    monkeypatch.setattr(search_ops.heapq, "heappush", spy)
+    out = search_ops.find_files("hit_", str(tmp_path), max_results=5)
+    assert max(held) <= 5, "上限を超えて保持している: %d" % max(held)
+    assert "truncated at 5" in out
+
+
+def test_find_files_still_returns_the_newest_across_the_whole_tree(monkeypatch, tmp_path):
+    """上位N件だけ保持しても、答えは木全体の最新N件でなければならない。"""
+    import os
+    import pathlib as _pl
+
+    monkeypatch.setattr(search_ops, "_validate_path", lambda p: _pl.Path(p))
+    for i in range(10):
+        f = tmp_path / ("hit_%02d.txt" % i)
+        f.write_text("x", encoding="utf-8")
+        os.utime(f, (1_700_000_000 + i, 1_700_000_000 + i))
+    out = search_ops.find_files("hit_", str(tmp_path), max_results=3)
+    lines = [ln for ln in out.splitlines() if ln.startswith(str(tmp_path))]
+    assert [_pl.Path(ln).name for ln in lines] == ["hit_09.txt", "hit_08.txt", "hit_07.txt"]
+
+
+def test_find_files_says_nothing_when_nothing_matches(monkeypatch, tmp_path):
+    import pathlib as _pl
+
+    monkeypatch.setattr(search_ops, "_validate_path", lambda p: _pl.Path(p))
+    (tmp_path / "other.txt").write_text("x", encoding="utf-8")
+    assert search_ops.find_files("hit_", str(tmp_path)) == "(no matches)"
+
+
+def test_find_files_skips_a_directory_named_like_the_needle(monkeypatch, tmp_path):
+    """S_ISREG に置き換えたので、ディレクトリを取りこぼさず弾けていること。"""
+    import pathlib as _pl
+
+    monkeypatch.setattr(search_ops, "_validate_path", lambda p: _pl.Path(p))
+    (tmp_path / "hit_dir").mkdir()
+    (tmp_path / "hit_file.txt").write_text("x", encoding="utf-8")
+    out = search_ops.find_files("hit_", str(tmp_path))
+    assert "hit_file.txt" in out and "hit_dir" not in out

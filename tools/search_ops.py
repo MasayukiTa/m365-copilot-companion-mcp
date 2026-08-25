@@ -1,4 +1,6 @@
 import fnmatch
+import heapq
+import stat
 from pathlib import Path
 from typing import Optional
 
@@ -146,18 +148,41 @@ def find_files(
         base = _validate_path(path)
         if not base.is_dir():
             return f"[find_files error: not a directory: {base}]"
+        # ONLY THE ANSWER IS HELD, NOT THE SEARCH. This used to build a list of every matching
+        # path in the tree, stat() each one to sort by mtime, and only then cut it down to
+        # max_results -- so the peak was set by how many files matched, and the caller's cap
+        # bounded nothing at all. Under this repository (its own .venv and .git included) with
+        # several fleet workers calling at once, that was the second half of the MCP server's
+        # climb; py-spy found three threads inside this comprehension at the same moment.
+        #
+        # The contract is unchanged -- still the newest max_results matches across the WHOLE
+        # tree -- because a bounded heap keeps the largest N of a stream. Memory is now fixed
+        # by the cap the caller already passes.
         needle = name_contains.lower()
-        matches = [
-            p
-            for p in base.rglob("*")
-            if p.is_file() and needle in p.name.lower()
-        ]
-        matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        if not matches:
+        best: list[tuple[float, int, str]] = []
+        seen = 0
+        truncated = False
+        for p in base.rglob("*"):
+            if needle not in p.name.lower():
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            # `stat()` once, and read is-it-a-file off the same result. The old code paid a
+            # separate is_file() syscall per candidate and then stat()'d the survivors again.
+            seen += 1
+            item = (st.st_mtime, seen, str(p))
+            if len(best) < max_results:
+                heapq.heappush(best, item)
+            else:
+                heapq.heappushpop(best, item)
+                truncated = True
+        if not best:
             return "(no matches)"
-        truncated = len(matches) > max_results
-        matches = matches[:max_results]
-        out = [str(m) for m in matches]
+        out = [t[2] for t in sorted(best, reverse=True)]
         if truncated:
             out.append(f"... truncated at {max_results} entries")
         return "\n".join(out)
