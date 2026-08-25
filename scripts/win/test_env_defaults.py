@@ -4,11 +4,18 @@
 なので、ここで実際にファイルを往復させないと意味が無い。
 """
 import json
+import os
 import pathlib
 import subprocess
 import tempfile
 
 import pytest
+
+# POWERSHELL IS THE SUBJECT HERE, NOT AN INCIDENTAL DEPENDENCY. The Linux job cannot run it, so
+# the file is listed in CI and skipped there rather than left out of the manifest: an excluded
+# file is one nobody notices has stopped being run, and this logic is only ever wrong on
+# somebody else's machine.
+pytestmark = pytest.mark.skipif(os.name != "nt", reason="drives PowerShell; Windows job runs it")
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 PS = ROOT / "scripts" / "win" / "env_defaults.ps1"

@@ -132,6 +132,20 @@ jobs:
             bridge/test_review_command_p2c.py \
             bridge/test_session_cli.py \
             bridge/test_session_store.py \
+            bridge/test_session_store_sqlite.py \
+            bridge/test_conv_capture_selectors.py \
+            bridge/test_one_turn_gate.py \
+            relay/selfimprove/test_settle_gate.py \
+            relay/test_canned_nonanswer_cause.py \
+            scripts/test_diag_report.py \
+            scripts/test_diag_warmup_bias.py \
+            scripts/test_recycle_report.py \
+            scripts/win/test_env_defaults.py \
+            scripts/win/test_watch_client_ws.py \
+            scripts/win/test_watch_tree_ws.py \
+            ui/test_no_coloured_left_rails.py \
+            ui/test_no_emoji_in_chrome.py \
+            ui/test_spacing_scale.py \
             bridge/test_skills_bridge.py \
             ui/test_copilot_chat_p2c.py \
             bridge/test_bridge_unlock.py \
