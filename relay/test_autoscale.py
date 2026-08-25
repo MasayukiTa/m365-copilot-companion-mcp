@@ -33,14 +33,26 @@ def main():
     check("ramp_up_to_ceiling", cap(3, 3, 4) == 4)
     check("never_exceed_ceiling", cap(4, 4, 4) == 4)
 
+    # THE NUMBERS COME FROM THE CODE, NOT FROM THIS FILE. These three checks were written
+    # against a floor of 1400 and a per-tab budget of 700, spelled out in the arithmetic. When
+    # the three gates that each carried their own literal were unified onto FLEET_RAM_FLOOR_MB
+    # and FLEET_PER_TAB_MB, this suite started disagreeing with the code it tests -- and stayed
+    # broken unnoticed, because the manifest audit failed earlier in the job and CI never
+    # reached the script-style suites.
+    #
+    # Deriving the RAM figures keeps the check about the BEHAVIOUR -- hold when there is room
+    # for none, drain by one per missing tab's worth -- instead of about two numbers that
+    # production is free to change.
+    floor, per_tab = rf.FLEET_RAM_FLOOR_MB, rf.FLEET_PER_TAB_MB
+
     # 2. steady state: enough RAM to hold current, not enough to add -> stays put
-    with_ram(1700)            # (1700-1400)//700 = 0 -> raw == open_now
+    with_ram(floor + per_tab - 1)          # (ram - floor)//per_tab == 0 -> raw == open_now
     check("hold_when_tight", cap(3, 3, 4) == 3)
 
     # 3. RAM deficit -> target drops below open_now (soft drain target)
-    with_ram(1000)            # (1000-1400)//700 = -1 -> raw = open_now-1
+    with_ram(floor - 1)                    # -> raw = open_now - 1
     check("drain_small_deficit", cap(3, 3, 4) == 2)
-    with_ram(300)             # (300-1400)//700 = -2 -> raw = open_now-2
+    with_ram(floor - per_tab - 1)          # -> raw = open_now - 2
     check("drain_larger_deficit", cap(3, 3, 4) == 1)
 
     # 4. floor is respected (never below 1)
