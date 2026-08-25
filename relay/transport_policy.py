@@ -225,26 +225,45 @@ NOT_DELIVERED = (
 #: DELIBERATELY BROAD, because the cost is asymmetric. A false positive stops a re-send that
 #: would have been harmless and asks a person; a false negative repeats an act nobody can
 #: take back. Japanese and English, because the goals here are written in both.
+#: Words that mean the goal ASKS THE MODEL TO DO SOMETHING TO THE WORLD, not to read it.
+#:
+#: MEASURED AGAINST THE REAL GOALS, after the first version was written from imagination and
+#: got it almost exactly backwards. Bare `送信` fired on 53 of 193 real goals; 50 of those were
+#: `送信者` -- the SENDER of a mail being read -- and 3 were `送信済み`, mail already sent. Two
+#: were the verb. A 96%% false-positive rate on the population it exists to judge, and each one
+#: would have stopped a harmless reconnect on a read-only search. The same shape was in
+#: `登録した`, `登録され`, `投稿され`: nouns and past forms describe what is there to be read.
+#:
+#: So the Japanese patterns require a VERB form -- して / しろ / せよ / します / する -- which is
+#: how a Japanese instruction asks for the act rather than naming it. English keeps word
+#: boundaries, where the same ambiguity does not arise in these words.
+#:
+#:
+#: `しています` and `送っている` are DESCRIPTIONS, not requests -- "I create the Week00-23
+#: material", "they sent congratulations, so the announcement was mid-April". Both appear in
+#: real goals as evidence being reported, and both were read as instructions to act. The
+#: request forms are して / してください / しろ / せよ; `して(?!い)` keeps them and drops the rest.
+#: Still deliberately broad within that: a false positive stops a re-send and asks a person, a
+#: false negative repeats something nobody can take back.
 ACTING = (
-    r"送信",
-    r"送って",
-    r"送付",
-    r"メールを送",
-    r"返信",
+    r"送信(?:して(?!い)|しろ|せよ|してください)",
+    r"送付(?:して(?!い)|しろ|せよ|してください)",
+    r"返信(?:して(?!い)|しろ|せよ|してください)",
+    r"削除(?:して(?!い)|しろ|せよ|してください)",
+    r"移動(?:して(?!い)|しろ|せよ|してください)",
+    r"登録(?:して(?!い)|しろ|せよ|してください)",
+    r"予約(?:して(?!い)|しろ|せよ|してください)",
+    r"招待(?:して(?!い)|しろ|せよ|してください)",
+    r"投稿(?:して(?!い)|しろ|せよ|してください)",
+    r"アップロード(?:して(?!い)|しろ|せよ|してください)",
+    r"保存(?:して(?!い)|しろ|せよ|してください)",
+    r"追記(?:して(?!い)|しろ|せよ|してください)",
+    r"作成(?:して(?!い)|しろ|せよ|してください)",
+    r"書き込み(?:して(?!い)|しろ|せよ|してください)",
+    r"送って(?!い)",
+    r"作って(?!い)",
+    r"消して(?!い)",
     r"下書きを作",
-    r"作成して",
-    r"作って",
-    r"書き込",
-    r"追記",
-    r"保存して",
-    r"アップロード",
-    r"削除",
-    r"消して",
-    r"移動して",
-    r"登録",
-    r"予約",
-    r"招待",
-    r"投稿",
     r"\bsend\b",
     r"\bemail\b",
     r"\breply\b",
