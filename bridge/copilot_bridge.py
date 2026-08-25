@@ -3359,6 +3359,12 @@ class Handler(BaseHTTPRequestHandler):
                 "socket_enabled": BRIDGE_SOCKET,
                 "release_startup_page": BRIDGE_RELEASE_STARTUP_PAGE,
                 "has_resident_page": PAGE is not None,
+                # IS ANYTHING IN FLIGHT RIGHT NOW. Anyone deciding whether to restart this
+                # process needs to know before they decide, not after -- a bridge killed
+                # mid-turn loses the answer the person is waiting for, and on a goal that
+                # acts, the act may already have happened.
+                "turn_running": bool(_on_socket() and getattr(DRIVER, "_is_generating", bool)()),
+                "busy": PAGE_LOCK.locked(),
                 "conversation": sessref_guid(socket_conv_ref()) or "",
                 "active_sid": ACTIVE_SID or "",
                 "turn_budget_s": BRIDGE_TURN_TIMEOUT_S,

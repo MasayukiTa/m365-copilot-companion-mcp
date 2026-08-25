@@ -6,10 +6,17 @@ sources, none of them the process itself, and every one of them a way to describ
 else's bridge. Three verification rounds were run against the wrong bridge in one night
 because a losing launch and a silent success look identical from outside.
 
-Each line below is a question with a PASS/FAIL, and the evidence beside it. Read-only: it
-starts nothing, stops nothing, and writes nothing.
+Each line below is a question with a PASS/FAIL, and the evidence beside it. Reporting is
+read-only: it starts nothing, stops nothing, and writes nothing.
 
-    python scripts/win/verify_stack.py
+`--fix` acts on one verdict only -- a process older than the source it runs. It stops that
+process and lets its own launcher bring it back, which is what start_all does and what the
+supervisors exist for. It touches nothing else, and it refuses while work is in flight: a
+bridge killed mid-turn loses the answer somebody is waiting for, and a fleet run loses the
+tool calls its workers have already made.
+
+    python scripts/win/verify_stack.py            # report
+    python scripts/win/verify_stack.py --fix      # report, then restart what is stale
 """
 from __future__ import annotations
 
@@ -125,9 +132,58 @@ def say(state, question, evidence):
     print("  [%s] %-46s %s" % (state, question, evidence))
 
 
+def fleet_runs_active():
+    """PIDs of live fleet runs. Their workers are mid-turn and mid-tool-call."""
+    script = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+              "Where-Object { $_.CommandLine -match 'fleet_runner' } | "
+              "ForEach-Object { $_.ProcessId }")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                             capture_output=True, text=True, timeout=25).stdout
+        return [int(x) for x in out.split() if x.strip().isdigit()]
+    except Exception:
+        return []
+
+
+def stop_and_wait(match, label, timeout_s=120):
+    """Stop the matching processes and wait for a launcher to put one back.
+
+    Stopping rather than starting, because each of these has a supervisor whose job is to
+    notice and replace it -- and because launching one from here would mean reproducing the
+    environment its own launcher sets, which is how two subtly different bridges come to
+    exist on one machine.
+    """
+    kill = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+            "Where-Object { $_.CommandLine -match '%s' } | "
+            "Sort-Object ParentProcessId | Select-Object -First 1 | "
+            "ForEach-Object { taskkill /PID $_.ProcessId /T /F }" % match)
+    count = ("(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+             "Where-Object { $_.CommandLine -match '%s' } | Measure-Object).Count" % match)
+    print("     stopping %s and waiting for its launcher..." % label)
+    subprocess.run(["powershell", "-NoProfile", "-Command", kill],
+                   capture_output=True, text=True, timeout=60)
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        time.sleep(3)
+        try:
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", count],
+                                 capture_output=True, text=True, timeout=25).stdout.strip()
+            if out.isdigit() and int(out) > 0:
+                print("     %s is back" % label)
+                return True
+        except Exception:
+            pass
+    print("     %s did NOT come back within %ds -- start it by hand or click start_all"
+          % (label, timeout_s))
+    return False
+
+
 def main():
+    fix = "--fix" in sys.argv[1:]
+    force = "--force" in sys.argv[1:]
     newest, where = newest_source_mtime()
     st = bridge_status()
+    stale = []
     print("stack verification -- %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
 
     print("the bridge")
@@ -135,6 +191,8 @@ def main():
         say(BAD, "is it answering?", st["error"])
     else:
         fresh = st.get("started", 0) >= newest
+        if not fresh:
+            stale.append(("bridge", "copilot_bridge"))
         say(OK if fresh else BAD, "running tonight's code?",
             "started %s, newest source %s (%s)"
             % (time.strftime("%H:%M:%S", time.localtime(st.get("started", 0))),
@@ -163,6 +221,8 @@ def main():
     if not started:
         say(BAD, "is it running?", "no main.py process found")
     else:
+        if started < newest:
+            stale.append(("MCP server", "main\.py"))
         say(OK if started >= newest else BAD, "running tonight's code?",
             "started %s, newest source %s"
             % (time.strftime("%H:%M:%S", time.localtime(started)),
@@ -179,9 +239,36 @@ def main():
         ("socket=%d tab=%d  (%s .. %s)" % (socket, tab, first_at[-8:], last_at[-8:]))
         if total else "(no finished workers recorded)")
 
-    print("\nA FAIL on \"running tonight's code\" means the process predates the edit: click "
-          "start_all again,\nor stop that process and let its launcher bring it back.")
-    return 0
+    if not fix:
+        if stale:
+            print("\n%d process(es) are older than the source they run: %s"
+                  % (len(stale), ", ".join(n for n, _ in stale)))
+            print("Click start_all again, or re-run this with --fix.")
+        else:
+            print("\nEverything running matches the source on disk.")
+        return 0
+
+    print("\n--fix")
+    if not stale:
+        print("     nothing to do; everything running matches the source on disk.")
+        return 0
+    runs = fleet_runs_active()
+    if runs and not force:
+        print("     REFUSING: %d fleet run(s) are live (%s). Their workers are mid-turn and "
+              "mid-tool-call;\n     restarting the MCP server would break calls they have "
+              "already made. Wait for them, or pass --force."
+              % (len(runs), ",".join(str(x) for x in runs)))
+        return 1
+    if (st.get("turn_running") or st.get("busy")) and not force:
+        print("     REFUSING: the bridge is mid-turn. Somebody is waiting for that answer, "
+              "and on a\n     goal that acts the act may already have happened. Wait, or "
+              "pass --force.")
+        return 1
+    ok = True
+    for label, match in stale:
+        ok = stop_and_wait(match, label) and ok
+    print("\n     re-run this to confirm what came back.")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
