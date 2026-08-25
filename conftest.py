@@ -215,3 +215,29 @@ def _dotenv_is_neutralised():
     assert dotenv.load_dotenv is _no_dotenv, (
         "load_dotenv was not neutralised; a test run can read the operator's .env")
     yield
+
+# ── the session store must never be the operator's during a test run ────────────
+#
+# `_Transcript` writes every fleet turn to the local database, and dozens of existing fleet
+# tests construct one. They pass a temporary directory for the JSONL file, which looked like
+# enough -- but the database path comes from the store, not from that argument, so a full run
+# put 138 rows into the real store under keys like `wdead`, `wconsent` and `w_stale`, sitting
+# beside genuine conversations.
+#
+# Session-scoped and autouse, set through the environment rather than by patching an
+# attribute, because the writers are not all in this process: fleet workers and the stress
+# harness spawn their own, and each imports its own copy of the module.
+
+@pytest.fixture(autouse=True, scope="session")
+def _isolate_session_store(tmp_path_factory):
+    import os
+
+    previous = os.environ.get("MCP_SESSION_STORE_DIR")
+    os.environ["MCP_SESSION_STORE_DIR"] = str(tmp_path_factory.mktemp("session_store"))
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("MCP_SESSION_STORE_DIR", None)
+        else:
+            os.environ["MCP_SESSION_STORE_DIR"] = previous

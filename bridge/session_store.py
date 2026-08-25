@@ -57,9 +57,19 @@ SID_RE = re.compile(r"^s\d{10}[0-9a-f]{4}$")
 _IMPORTED = set()
 
 
+#: Overrides where the store lives. The test suite points this at a throwaway directory.
+#:
+#: An environment variable rather than a monkeypatch, because the writers are not all in
+#: this process: the fleet spawns workers, the stress harness spawns processes, and each one
+#: imports its own copy of this module. A patched attribute does not cross that boundary --
+#: and when it did not, a test run wrote 138 rows into the operator's real store under keys
+#: like `wdead` and `wconsent`, mixed in with genuine conversations.
+STORE_DIR_ENV = "MCP_SESSION_STORE_DIR"
+
+
 def _base_dir():
-    """Indirection point so tests can monkeypatch the storage location."""
-    return SESS_DIR
+    """Where the store lives. Overridable by env, and monkeypatchable for tests."""
+    return os.environ.get(STORE_DIR_ENV) or SESS_DIR
 
 
 def _ensure_dir():

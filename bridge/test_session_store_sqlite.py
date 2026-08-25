@@ -314,3 +314,25 @@ def test_an_interrupted_write_does_not_let_the_next_turn_overwrite_history(box):
     texts = [t["text"] for t in ss.all_turns(sid)]
     assert texts == ["first", "second", "third"], (
         "中断後の追記が既存ターンを上書きした: %s" % texts)
+
+
+def test_the_store_location_can_be_moved_by_environment(monkeypatch, tmp_path):
+    """環境変数で差し替えられること。属性の monkeypatch では足りない。
+
+    書き手はこのプロセスだけではない -- fleet はワーカーを、stress はプロセスを生む。
+    それぞれが自分の import を持つので、差し替えた属性は境界を越えない。越えなかった
+    結果、試験1回で本番の保存層に 138 行が入り、`wdead` や `wconsent` といったキーが
+    本物の会話の隣に並んだ。conftest はこの変数でスイート全体を逃がしている。"""
+    monkeypatch.setenv(ss.STORE_DIR_ENV, str(tmp_path))
+    assert ss._base_dir() == str(tmp_path)
+    monkeypatch.delenv(ss.STORE_DIR_ENV)
+    assert ss._base_dir() == ss.SESS_DIR, "変数が無いときに既定へ戻っていない"
+
+
+def test_the_suite_is_not_writing_into_the_operators_store():
+    """conftest の隔離が外れたら、次の全体試験が本番の会話に混ざる。
+
+    fixture 無しで直接見る -- この試験が守りたいのは『既定の状態で走ったとき』だから。"""
+    assert os.environ.get(ss.STORE_DIR_ENV), (
+        "session store が隔離されていない -- 試験が運用者の保存層へ書く")
+    assert ss._base_dir() != ss.SESS_DIR
