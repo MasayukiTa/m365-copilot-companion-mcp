@@ -1087,6 +1087,18 @@ SOCKET_RECONNECTS_PER_GOAL = int(os.environ.get("MCP_FLEET_SOCKET_RECONNECT_MAX"
 SOCKET_RECONNECTS_IF_DELIVERED = int(
     os.environ.get("MCP_FLEET_SOCKET_RECONNECT_DELIVERED_MAX", "1"))
 
+#: Seconds to wait before the Nth reconnect: 2, 4, 8, ... bounded.
+#:
+#: A reconnect used to be free and immediate, which is fine against a blip and wrong against
+#: an endpoint that refuses instantly. One worker whose own conversation the backend has
+#: stopped accepting -- while its siblings keep succeeding, so the route never closes -- would
+#: rebuild, re-send, fail, rebuild, several times a second, burning the goal's turn budget and
+#: writing a socket_retry line each time. The route is not broken; this worker's place in it
+#: is. Waiting costs nothing when the fault is transient and everything to a hot loop.
+SOCKET_RECONNECT_BACKOFF_S = float(os.environ.get("MCP_FLEET_SOCKET_BACKOFF_S", "2"))
+SOCKET_RECONNECT_BACKOFF_MAX_S = float(
+    os.environ.get("MCP_FLEET_SOCKET_BACKOFF_MAX_S", "30"))
+
 # How early the token is refreshed. IT MUST EXCEED THE LONGEST TURN, and socket_route's own
 # default of 600 s did not -- it EQUALLED it. A worker asks driver_for for no turn timeout, so
 # it gets that module's 600 s default, and the token is only consulted when the socket opens: a
@@ -3567,8 +3579,15 @@ class RelayWorker:
         self.status = "ready"
         self._last_text, self._stable_since = None, None
         self._count_before = 0
-        print("[relay_fleet] %s: socket dropped, reconnecting (%d/%d): %s"
-              % (self.name, self._socket_retries, DEFAULT_SOCKET_RETRIES, reason[:100]))
+        # THE SWEEP HOLDS THIS WORKER BACK, not the thread. `_cooldown_until` is the loop's
+        # existing way of saying "not yet" without blocking anyone else, which is the only
+        # kind of waiting a single-threaded sweep can afford.
+        wait = min(SOCKET_RECONNECT_BACKOFF_S * (2 ** (self._socket_reconnects_total - 1)),
+                   SOCKET_RECONNECT_BACKOFF_MAX_S)
+        self._cooldown_until = time.time() + wait
+        print("[relay_fleet] %s: socket dropped, reconnecting in %.0fs (%d/%d, %d total): %s"
+              % (self.name, wait, self._socket_retries, DEFAULT_SOCKET_RETRIES,
+                 self._socket_reconnects_total, reason[:100]))
         return True
 
     def _fall_back_to_tab(self):

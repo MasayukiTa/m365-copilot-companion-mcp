@@ -1321,6 +1321,50 @@ def release_socket_driver(why=""):
     return True
 
 
+
+def borrow_page():
+    """Make a page available for one request. Returns (ok, we_opened_it).
+
+    The five DOM endpoints are the only things left that need a page once the conversation
+    runs on a socket, and each of them needs it for the length of one request. Before this,
+    the first /history of the session reopened the agent page and the bridge then held it for
+    the rest of its life -- the released startup page came back and stayed, which is most of
+    the memory the release was for (measured: 503 MB rose to 1134 MB and stopped there).
+    """
+    had = False
+    try:
+        had = PAGE is not None and not PAGE.is_closed()
+    except Exception:
+        had = False
+    ok = ensure_page_alive()
+    return ok, bool(ok and not had)
+
+
+def return_page(we_opened_it):
+    """Close a page that was opened only to serve one request. Returns True if it closed.
+
+    NEVER WHEN THE PAGE IS THE CONVERSATION. If this bridge is not on a socket then DRIVER is
+    that page's driver and closing it would end the chat the user is having -- the saving is
+    not remotely worth that, so the transport check is the first thing here and not the last.
+    """
+    global PAGE, DRIVER
+    if not (we_opened_it and BRIDGE_RELEASE_STARTUP_PAGE):
+        return False
+    if not _on_socket():
+        return False
+    try:
+        if PAGE is None or PAGE.is_closed():
+            return False
+        ctx = PAGE.context
+        if not any((pg.url or "") in ("about:blank", "") for pg in ctx.pages if pg is not PAGE):
+            ctx.new_page()          # Edge exits with its last page; see _page_main
+        PAGE.close()
+    except Exception:
+        return False
+    PAGE = None
+    return True
+
+
 def ensure_driver():
     """The driver for the CONVERSATION: a socket when one can be had, else the page.
 
@@ -3223,11 +3267,15 @@ class Handler(BaseHTTPRequestHandler):
             # left that genuinely need the DOM -- so each one asks for it rather than
             # assuming startup left one behind. Measured: /history answered
             # "AttributeError: 'NoneType' object has no attribute 'wait_for_timeout'".
-            if not run_on_page_thread(ensure_page_alive):
+            _ok, _mine = run_on_page_thread(borrow_page)
+            if not _ok:
                 self._json({"ok": False, "error": "no agent page"}); PAGE_LOCK.release(); return
             try:
                 run_on_page_thread(self._do_new, parsed)
             finally:
+                # Give the page back if this request is what opened it. Inside the finally so
+                # a raising handler cannot leave a page resident that nothing will use again.
+                run_on_page_thread(return_page, _mine)
                 PAGE_LOCK.release()
             return
         if parsed.path == "/conv":         # current conversation URL (for saving)
@@ -3242,11 +3290,15 @@ class Handler(BaseHTTPRequestHandler):
             if not PAGE_LOCK.acquire(blocking=False):
                 self._json({"ok": False, "error": "busy"}); return
             # A page may not exist -- see /new for why these five ask for one.
-            if not run_on_page_thread(ensure_page_alive):
+            _ok, _mine = run_on_page_thread(borrow_page)
+            if not _ok:
                 self._json({"ok": False, "error": "no agent page"}); PAGE_LOCK.release(); return
             try:
                 run_on_page_thread(self._do_switch, parsed)
             finally:
+                # Give the page back if this request is what opened it. Inside the finally so
+                # a raising handler cannot leave a page resident that nothing will use again.
+                run_on_page_thread(return_page, _mine)
                 PAGE_LOCK.release()
             return
         if parsed.path == "/sessions":     # list known sessions (newest-first, capped)
@@ -3378,11 +3430,15 @@ class Handler(BaseHTTPRequestHandler):
             if not PAGE_LOCK.acquire(blocking=False):
                 self._json({"ok": False, "error": "busy"}); return
             # A page may not exist -- see /new for why these five ask for one.
-            if not run_on_page_thread(ensure_page_alive):
+            _ok, _mine = run_on_page_thread(borrow_page)
+            if not _ok:
                 self._json({"ok": False, "error": "no agent page"}); PAGE_LOCK.release(); return
             try:
                 run_on_page_thread(self._do_history, parsed)
             finally:
+                # Give the page back if this request is what opened it. Inside the finally so
+                # a raising handler cannot leave a page resident that nothing will use again.
+                run_on_page_thread(return_page, _mine)
                 PAGE_LOCK.release()
             return
         if parsed.path == "/delete":       # best-effort: delete the Copilot conversation
@@ -3425,22 +3481,30 @@ class Handler(BaseHTTPRequestHandler):
             if not PAGE_LOCK.acquire(blocking=False):
                 self._json({"ok": False, "error": "busy"}); return
             # A page may not exist -- see /new for why these five ask for one.
-            if not run_on_page_thread(ensure_page_alive):
+            _ok, _mine = run_on_page_thread(borrow_page)
+            if not _ok:
                 self._json({"ok": False, "error": "no agent page"}); PAGE_LOCK.release(); return
             try:
                 run_on_page_thread(self._do_agent_conversations)
             finally:
+                # Give the page back if this request is what opened it. Inside the finally so
+                # a raising handler cannot leave a page resident that nothing will use again.
+                run_on_page_thread(return_page, _mine)
                 PAGE_LOCK.release()
             return
         if parsed.path == "/upload":       # attach a local file/image to the composer
             if not PAGE_LOCK.acquire(blocking=False):
                 self._json({"ok": False, "error": "busy"}); return
             # A page may not exist -- see /new for why these five ask for one.
-            if not run_on_page_thread(ensure_page_alive):
+            _ok, _mine = run_on_page_thread(borrow_page)
+            if not _ok:
                 self._json({"ok": False, "error": "no agent page"}); PAGE_LOCK.release(); return
             try:
                 run_on_page_thread(self._do_upload, parsed)
             finally:
+                # Give the page back if this request is what opened it. Inside the finally so
+                # a raising handler cannot leave a page resident that nothing will use again.
+                run_on_page_thread(return_page, _mine)
                 PAGE_LOCK.release()
             return
         self.send_response(404)

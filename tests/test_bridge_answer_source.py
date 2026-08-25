@@ -458,3 +458,102 @@ def test_switching_conversations_releases_the_socket():
 
     src = inspect.getsource(B.Handler._do_switch)
     assert "release_socket_driver" in src
+
+
+# ---- 借りたページは返す ------------------------------------------------------------------------
+#
+# 解放したはずの常駐ページは、最初の /history で戻ってきて、そのまま居座っていた
+# （実測 503MB → 1134MB）。DOM が要るのは1リクエストの間だけ。
+
+class _Pg:
+    def __init__(self, url="https://m365.cloud.microsoft/chat/agent/T_x", closed=False):
+        self.url, self._closed = url, closed
+        self.context = None
+
+    def is_closed(self):
+        return self._closed
+
+    def close(self):
+        self._closed = True
+
+
+class _Ctx:
+    def __init__(self, pages):
+        self.pages = list(pages)
+        self.opened = 0
+
+    def new_page(self):
+        self.opened += 1
+        pg = _Pg(url="about:blank")
+        self.pages.append(pg)
+        return pg
+
+
+def _borrowable(monkeypatch, *, on_socket=True, existing=None, release=True):
+    monkeypatch.setattr(B, "BRIDGE_RELEASE_STARTUP_PAGE", release)
+    monkeypatch.setattr(B, "DRIVER", _SocketDrv(last="x") if on_socket else _PageDrv())
+    monkeypatch.setattr(B, "CTX", object())
+    monkeypatch.setattr(B, "PAGE", existing)
+
+    def _ensure():
+        if B.PAGE is None:
+            pg = _Pg()
+            pg.context = _Ctx([pg])
+            B.PAGE = pg
+        return True
+
+    monkeypatch.setattr(B, "ensure_page_alive", _ensure)
+
+
+def test_a_page_opened_for_one_request_is_given_back(monkeypatch):
+    _borrowable(monkeypatch, existing=None)
+    ok, mine = B.borrow_page()
+    assert ok and mine is True
+    page = B.PAGE
+    assert B.return_page(mine) is True
+    assert page.is_closed() and B.PAGE is None
+
+
+def test_a_page_that_was_already_there_is_left_alone(monkeypatch):
+    """自分が開けていないページを閉じるのは、他の誰かの足を払うこと。"""
+    existing = _Pg()
+    existing.context = _Ctx([existing])
+    _borrowable(monkeypatch, existing=existing)
+    ok, mine = B.borrow_page()
+    assert ok and mine is False
+    assert B.return_page(mine) is False
+    assert not existing.is_closed() and B.PAGE is existing
+
+
+def test_the_page_is_never_closed_when_it_IS_the_conversation(monkeypatch):
+    """ソケットに乗っていなければ DRIVER はそのページのドライバで、
+    閉じることは利用者の会話を終わらせること。節約とは釣り合わない。"""
+    _borrowable(monkeypatch, on_socket=False, existing=None)
+    ok, mine = B.borrow_page()
+    assert ok and mine is True
+    page = B.PAGE
+    assert B.return_page(mine) is False
+    assert not page.is_closed()
+
+
+def test_nothing_is_returned_when_the_release_is_off(monkeypatch):
+    _borrowable(monkeypatch, existing=None, release=False)
+    ok, mine = B.borrow_page()
+    assert B.return_page(mine) is False
+
+
+def test_a_blank_page_is_left_holding_the_browser(monkeypatch):
+    """最後のタブを閉じると Edge が終了する -- 起動時解放で一度踏んでいる。"""
+    _borrowable(monkeypatch, existing=None)
+    ok, mine = B.borrow_page()
+    ctx = B.PAGE.context
+    B.return_page(mine)
+    assert ctx.opened == 1, "空ページを残さずに最後のタブを閉じている"
+
+
+def test_every_borrowing_endpoint_gives_the_page_back():
+    """1箇所でも返し忘れると、そこを一度通っただけで常駐が復活する。"""
+    import inspect
+
+    src = inspect.getsource(B.Handler.do_GET)
+    assert src.count("borrow_page") == src.count("return_page") == 5

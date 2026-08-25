@@ -1524,3 +1524,48 @@ def test_a_later_turn_is_judged_on_its_own_evidence(monkeypatch):
     w._retry_socket(DROPPED)
     w.turn += 1                                   # 次のターンへ進んだ
     assert w._retry_socket(DROPPED) is True
+
+
+# ---- 再接続は無料でも即時でもない --------------------------------------------------------------
+#
+# 自分の会話だけをバックエンドに拒まれたワーカーは、兄弟が成功し続ける限り経路が閉じないので、
+# 「作り直す・再送する・失敗する」を毎秒何度も回せる。経路は壊れていない -- この一人の
+# 居場所が壊れている。瞬断なら待っても何も失わず、ホットループなら全部失う。
+
+def test_each_reconnect_waits_longer_than_the_last(monkeypatch):
+    _retry_route(monkeypatch, drv=_FakeDrv())
+    w = _worker()
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+    waits = []
+    now = [1000.0]
+    monkeypatch.setattr(rf.time, "time", lambda: now[0])
+    for _ in range(4):
+        assert w._retry_socket(DROPPED) is True
+        waits.append(round(w._cooldown_until - now[0], 3))
+    assert waits == sorted(waits) and waits[0] < waits[-1], waits
+    assert waits[0] == rf.SOCKET_RECONNECT_BACKOFF_S
+
+
+def test_the_wait_is_capped(monkeypatch):
+    """指数のまま伸ばすと、直った後も何分も戻ってこない。"""
+    _retry_route(monkeypatch, drv=_FakeDrv())
+    monkeypatch.setattr(rf, "SOCKET_RECONNECTS_PER_GOAL", 40)
+    w = _worker()
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+    now = [1000.0]
+    monkeypatch.setattr(rf.time, "time", lambda: now[0])
+    for _ in range(20):
+        w._retry_socket(DROPPED)
+    assert w._cooldown_until - now[0] <= rf.SOCKET_RECONNECT_BACKOFF_MAX_S
+
+
+def test_the_sweep_is_what_honours_the_wait():
+    """スレッドを止めると単一スレッドの掃引が全員分止まる。
+    待つのは『このワーカーだけ次の掃引まで進まない』形でなければならない。"""
+    import inspect
+
+    src = inspect.getsource(rf.RelayWorker._retry_socket)
+    assert "_cooldown_until" in src
+    assert "sleep" not in src, "掃引スレッドを寝かせている"
+    poll = inspect.getsource(rf.RelayWorker.poll)
+    assert "_cooldown_until" in poll
