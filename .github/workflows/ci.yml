@@ -146,6 +146,7 @@ jobs:
             ui/test_no_coloured_left_rails.py \
             ui/test_no_emoji_in_chrome.py \
             ui/test_spacing_scale.py \
+            ui/test_retention_settings.py \
             bridge/test_skills_bridge.py \
             ui/test_copilot_chat_p2c.py \
             bridge/test_bridge_unlock.py \
