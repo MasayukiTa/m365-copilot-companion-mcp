@@ -37,7 +37,7 @@ def _run(args: list[str], cwd: Optional[Path], timeout: int) -> str:
     return output or "(no output)"
 
 
-def _note(skipped_big: int, partial_files: int) -> str:
+def _note(skipped_big: int, partial_files: int, skipped_dirs=None) -> str:
     """What the search did not cover, appended to whatever it did find.
 
     Built here because there are TWO returns -- the normal one and the early one that fires
@@ -46,8 +46,8 @@ def _note(skipped_big: int, partial_files: int) -> str:
     when the reader had most reason to trust the result.
     """
     parts = []
-    if pruned_note():
-        parts.append(pruned_note())
+    if pruned_note(skipped_dirs):
+        parts.append(pruned_note(skipped_dirs))
     if skipped_big:
         parts.append("%d file(s) larger than %d MB were not searched"
                      % (skipped_big, _GREP_MAX_FILE_BYTES // (1024 * 1024)))
@@ -94,7 +94,8 @@ def grep(
         # under the fleet's own recycle floor and a run hard-reset the shared browser out from
         # under its sibling. py-spy on the live process is what named this line.
         matches: list[str] = []
-        files = [target] if target.is_file() else iter_files(target)
+        skipped: set = set()
+        files = [target] if target.is_file() else iter_files(target, skipped)
         needle = pattern if case_sensitive else pattern.lower()
         skipped_big = 0
         partial_files = 0
@@ -116,7 +117,7 @@ def grep(
                                 matches.append(f"{file_path}:{line_no}:{line}")
                                 if len(matches) >= max_matches:
                                     return ("\n".join(matches)
-                                            + _note(skipped_big, partial_files))
+                                            + _note(skipped_big, partial_files, skipped))
                     except UnicodeDecodeError:
                         # STOPPED PART-WAY, AND SAYS SO. Reading the file whole used to mean
                         # that a single bad byte contributed nothing from that file at all;
@@ -127,8 +128,8 @@ def grep(
                         partial_files += 1
             except OSError:
                 continue
-        return ("\n".join(matches) + _note(skipped_big, partial_files)) if matches \
-            else ("(no matches)" + _note(skipped_big, partial_files))
+        return ("\n".join(matches) + _note(skipped_big, partial_files, skipped)) if matches \
+            else ("(no matches)" + _note(skipped_big, partial_files, skipped))
     except Exception as e:
         return f"[grep error: {type(e).__name__}: {e}]"
 

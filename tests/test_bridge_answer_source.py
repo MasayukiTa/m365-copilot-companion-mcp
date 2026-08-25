@@ -596,9 +596,44 @@ def test_a_blank_page_is_left_holding_the_browser(monkeypatch):
     assert ctx.opened == 1, "空ページを残さずに最後のタブを閉じている"
 
 
-def test_every_borrowing_endpoint_gives_the_page_back():
-    """1箇所でも返し忘れると、そこを一度通っただけで常駐が復活する。"""
+def test_every_borrowing_endpoint_gives_the_page_back_except_upload():
+    """1箇所でも返し忘れると、そこを一度通っただけで常駐が復活する。
+
+    /upload だけは例外で、それは意図。添付チップは composer に residing していて
+    後の送信を待っているので、そのページを閉じると成果物ごと消える。
+    """
     import inspect
 
     src = inspect.getsource(B.Handler.do_GET)
-    assert src.count("borrow_page") == src.count("return_page") == 5
+    assert src.count("borrow_page") == 5
+    assert src.count("return_page") == 4
+
+
+def test_an_attachment_forces_the_turn_onto_the_page():
+    """添付はページの composer にある。ソケットで送ると、ファイルは黙って届かない。"""
+    import inspect
+
+    assert "release_socket_driver" in inspect.getsource(B.Handler._do_upload)
+    assert "_UPLOAD_PENDING" in inspect.getsource(B._bridge_socket_driver)
+    assert "_UPLOAD_PENDING = False" in inspect.getsource(B._send_counted)
+
+
+def test_resume_and_adopt_release_the_socket_too():
+    """二つの docstring が『/resume は解放する』と書いていたが、していなかった。"""
+    import inspect
+
+    assert "release_socket_driver" in inspect.getsource(B.Handler._do_resume)
+    assert "release_socket_driver" in inspect.getsource(B.Handler._do_adopt)
+
+
+def test_the_identity_net_understands_a_url_reference(monkeypatch):
+    """保存された参照は `sess:<guid>` か本物の会話URLのどちらか。前者しか読まないと、
+    URL 形式のセッションは全部『食い違いなし』になり、古いソケットが残る。"""
+    drv = _SocketDrv(last="a")
+    drv.conv_id = "44444444-4444-4444-4444-444444444444"
+    monkeypatch.setattr(B, "DRIVER", drv)
+    monkeypatch.setattr(B, "ACTIVE_SID", "sid1")
+    url = ("https://m365.cloud.microsoft/chat/agent/T_x/conversation/"
+           "55555555-5555-5555-5555-555555555555")
+    monkeypatch.setattr(B.S, "load", lambda sid: {"conv_url": url})
+    assert B.socket_is_on_the_active_conversation() is False

@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from .file_ops import _validate_path
-from .walk import iter_files, pruned_note
+from .walk import PRUNED_DIRS, is_pruned, iter_files, pruned_note
 
 
 def glob(
@@ -43,12 +43,39 @@ def glob(
             return f"[glob error: {what}: {base}]"
 
         patterns = _expand_braces(pattern)
+        # PRUNED LIKE THE OTHER TWO. glob was left walking everything when grep and
+        # find_files stopped, which is worse than either state on its own: the same question
+        # asked three ways gave two answers that skip the vendored tree and one that does not,
+        # with nothing saying so.
+        #
+        # Only recursive patterns take the pruned walk. `**` is what makes a glob descend, so
+        # it is also what makes it expensive, and confining the change there leaves every
+        # non-recursive pattern matching exactly as pathlib matched it before.
         seen: set[Path] = set()
+        gskipped: set = set()
         for pat in patterns:
+            if "**" in pat:
+                tail = pat.replace("\\", "/").split("**/", 1)[-1]
+                for match in iter_files(base, gskipped):
+                    try:
+                        rel = match.relative_to(base).as_posix()
+                    except ValueError:
+                        continue
+                    if not (fnmatch.fnmatch(rel, tail) or fnmatch.fnmatch(match.name, tail)):
+                        continue
+                    if not include_hidden and _is_hidden(match, base):
+                        continue
+                    seen.add(match)
+                continue
             for match in base.glob(pat):
                 if not match.is_file():
                     continue
                 if not include_hidden and _is_hidden(match, base):
+                    continue
+                if is_pruned(match, base):
+                    gskipped.update(
+                        part for part in match.relative_to(base).parts[:-1]
+                        if part in PRUNED_DIRS)
                     continue
                 seen.add(match)
 
@@ -66,7 +93,11 @@ def glob(
         head = f"{len(results)} matches under {base}" + (
             f" (truncated at {max_results}; more exist)" if truncated else ""
         )
-        return "\n".join([head] + [str(p) for p in results])
+        # ON ITS OWN LINE. The first line is the count, and callers read it as such -- three
+        # tests pin that exact string. A disclosure that has to be appended somewhere does not
+        # get to be appended to a line that already means something else.
+        tail = ["[" + pruned_note(gskipped) + "]"] if pruned_note(gskipped) else []
+        return "\n".join([head] + [str(p) for p in results] + tail)
     except Exception as e:
         return f"[glob error: {type(e).__name__}: {e}]"
 
@@ -163,7 +194,8 @@ def find_files(
         best: list[tuple[float, int, str]] = []
         seen = 0
         truncated = False
-        for p in iter_files(base):
+        skipped: set = set()
+        for p in iter_files(base, skipped):
             if needle not in p.name.lower():
                 continue
             try:
@@ -190,8 +222,8 @@ def find_files(
         out = [t[2] for t in sorted(best, reverse=True)]
         if truncated:
             out.append(f"... truncated at {max_results} entries")
-        if pruned_note():
-            out.append("[" + pruned_note() + "]")
+        if pruned_note(skipped):
+            out.append("[" + pruned_note(skipped) + "]")
         return "\n".join(out)
     except Exception as e:
         return f"[find_files error: {type(e).__name__}: {e}]"

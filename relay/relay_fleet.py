@@ -1700,6 +1700,16 @@ class RelayWorker:
         self.drv = None
         self.conv_url = ""
         self.conv_title = ""
+        # THE TRANSPORT GOES WITH THE DRIVER. This block cleared the driver and rebuilt a TAB
+        # one, but left self.socket True -- so poll() kept taking the socket branch and
+        # _report_socket_turns voted note_success() for every answer the TAB produced. The
+        # circuit breaker was being told a dead route was healthy, by a worker that was not on
+        # it; consecutive failures reset on fabricated evidence, and a genuinely failing route
+        # could be held open indefinitely. The tab-weight accounting undercounted too: a
+        # socket worker is charged no tab, and this one had a real one.
+        self.socket = False
+        self._landed_pending = False
+        self._socket_reconnects_total = 0
 
         self.fresh_replay_count += 1
         self.status = "fresh_replay"

@@ -1203,6 +1203,10 @@ BRIDGE_RELEASE_STARTUP_PAGE = (os.environ.get("MCP_BRIDGE_RELEASE_PAGE", "0").st
                                not in ("0", "false", "no", "off", ""))
 
 
+#: True once a file has been attached and not yet sent. Cleared by the send that carries it.
+_UPLOAD_PENDING = False
+
+
 def _bridge_socket_driver():
     """A socket driver for the conversation this bridge is currently on, or None.
 
@@ -1215,6 +1219,9 @@ def _bridge_socket_driver():
     continues the chat the user is looking at rather than silently starting a new one.
     """
     if not BRIDGE_SOCKET or CTX is None:
+        return None
+    if _UPLOAD_PENDING:
+        # transport_policy.needs_tab, expressed where the bridge can act on it.
         return None
     try:
         from relay.relay_fleet import _socket_route
@@ -1291,7 +1298,12 @@ def socket_is_on_the_active_conversation():
     if not have:
         return True                      # the socket has not bound a conversation yet
     try:
-        want = sessref_guid((S.load(ACTIVE_SID) or {}).get("conv_url") or "")
+        ref = (S.load(ACTIVE_SID) or {}).get("conv_url") or ""
+        # BOTH SHAPES. A stored reference is either `sess:<guid>` or a real conversation URL,
+        # and reading only the first made every URL-form session answer "nothing to disagree
+        # with" -- so a /resume or /adopt onto a URL kept the old socket and delivered the
+        # next message to the conversation the user had just left.
+        want = sessref_guid(ref) or _conv_guid(ref)
     except Exception:
         return True
     if not want:
@@ -3530,9 +3542,12 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 run_on_page_thread(self._do_upload, parsed)
             finally:
-                # Give the page back if this request is what opened it. Inside the finally so
-                # a raising handler cannot leave a page resident that nothing will use again.
-                run_on_page_thread(return_page, _mine)
+                # THE PAGE IS NOT GIVEN BACK HERE, and the borrow above exists only to make
+                # sure there is one. /upload's entire product is an attachment chip sitting in
+                # the composer waiting for a later send; closing the page it lives in destroys
+                # it and turns the endpoint into a no-op that reports success. `_mine` is
+                # deliberately unused -- a page opened for an upload belongs to the upload
+                # until something sends it.
                 PAGE_LOCK.release()
             return
         self.send_response(404)
@@ -3566,6 +3581,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": ok, "url": PAGE.url})
 
     def _do_adopt(self, parsed):
+        release_socket_driver("/adopt")
         """GET /adopt?url=<urlencoded>&title=<t> -- adopt an EXTERNAL conversation
         (typically a fleet one, from .fleet/conversations.json) into a brand-new
         interactive session. Navigates via the existing _goto_settled machinery (the
@@ -3611,6 +3627,9 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True, "sid": sid, "ref_kind": ref_kind})
 
     def _do_resume(self, parsed):
+        # Same reason as /switch: the socket is keyed to a conversation and this moves us to
+        # a different one. Two docstrings already claimed /resume released it; it did not.
+        release_socket_driver("/resume")
         global ACTIVE_SID
         sid = (urllib.parse.parse_qs(parsed.query).get("sid") or [""])[0]
         if not sid:
@@ -3724,6 +3743,14 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True, "count": len(convs), "conversations": convs})
 
     def _do_upload(self, parsed):
+        # AN ATTACHMENT PINS THE CONVERSATION TO THE PAGE. The chip lives in the composer, so
+        # the turn that sends it has to be sent from there -- and nothing here consulted the
+        # transport, so with the bridge on a socket the file silently never reached the model
+        # while the endpoint reported success. `needs_tab(upload_path)` has said this since
+        # the fleet's policy was written; the bridge simply never asked.
+        global _UPLOAD_PENDING
+        _UPLOAD_PENDING = True
+        release_socket_driver("a file was attached; the turn must be sent from the page")
         path = (urllib.parse.parse_qs(parsed.query).get("path") or [""])[0]
         try:
             if not path or not os.path.isfile(path):
@@ -4866,11 +4893,12 @@ def _send_counted(msg):
     again after resolving a consent card. Every one of those appends to the DOM. This is the
     one line all of them pass through.
     """
-    global _CONVERSATION_TURNS
+    global _CONVERSATION_TURNS, _UPLOAD_PENDING
     # THE ONE PLACE A TURN STARTS, so it is the one place that has to decide what carries it.
     # Picking the transport at startup instead would bind the whole process to whatever the
     # route could do in its first second.
     ensure_driver()
+    _UPLOAD_PENDING = False        # whatever was attached goes out with this turn
     _CONVERSATION_TURNS += 1
     DRIVER.send(msg)
 

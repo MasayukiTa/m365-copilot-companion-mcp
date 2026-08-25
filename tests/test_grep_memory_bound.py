@@ -225,9 +225,28 @@ def test_the_caller_can_ask_for_everything(tmp_path, monkeypatch):
 def test_pruning_is_disclosed_because_it_changes_what_can_be_found(monkeypatch, tmp_path):
     """『(no matches)』を信じる読み手には、どこを見ていないかが要る。"""
     monkeypatch.delenv("MCP_SEARCH_INCLUDE_ALL", raising=False)
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / ".venv" / "hit.txt").write_text("needle", encoding="utf-8")
     (tmp_path / "a.txt").write_text("nothing here", encoding="utf-8")
     out = coding_ops.grep("needle", str(tmp_path))
-    assert "not searched" in out and "MCP_SEARCH_INCLUDE_ALL" in out
+    assert ".venv" in out and "MCP_SEARCH_INCLUDE_ALL" in out
+
+
+def test_nothing_is_claimed_about_a_tree_with_nothing_to_prune(monkeypatch, tmp_path):
+    """設定だけを見て毎回同じ注記を出していた -- 単一ファイルの検索にも、
+    剪定対象が1つも無い木にも。常に出る開示は読まれなくなる。"""
+    monkeypatch.delenv("MCP_SEARCH_INCLUDE_ALL", raising=False)
+    (tmp_path / "a.txt").write_text("needle", encoding="utf-8")
+    out = coding_ops.grep("needle", str(tmp_path))
+    assert "not searched" not in out, out
+
+
+def test_a_single_file_search_claims_nothing_either(monkeypatch, tmp_path):
+    monkeypatch.delenv("MCP_SEARCH_INCLUDE_ALL", raising=False)
+    f = tmp_path / "a.txt"
+    f.write_text("needle", encoding="utf-8")
+    out = coding_ops.grep("needle", str(f))
+    assert "not searched" not in out, out
 
 
 def test_find_files_discloses_it_too(monkeypatch, tmp_path):
@@ -235,9 +254,11 @@ def test_find_files_discloses_it_too(monkeypatch, tmp_path):
 
     monkeypatch.delenv("MCP_SEARCH_INCLUDE_ALL", raising=False)
     monkeypatch.setattr(search_ops, "_validate_path", lambda p: _pl.Path(p))
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "hit_x.txt").write_text("x", encoding="utf-8")
     (tmp_path / "hit_a.txt").write_text("x", encoding="utf-8")
     out = search_ops.find_files("hit_", str(tmp_path))
-    assert "MCP_SEARCH_INCLUDE_ALL" in out
+    assert "node_modules" in out and "MCP_SEARCH_INCLUDE_ALL" in out
 
 
 def test_a_walk_is_a_generator_not_a_list():

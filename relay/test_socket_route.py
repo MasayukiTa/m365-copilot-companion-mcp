@@ -1754,3 +1754,17 @@ def test_the_refusal_is_recorded(tmp_path, monkeypatch):
     w._retry_socket(DROPPED)
     row = next(x for x in _lines(tmp_path) if x["event"] == "resend_refused")
     assert row["goal"].startswith("メールを送信")
+
+
+def test_a_fresh_replay_stops_calling_itself_a_socket_worker():
+    """このブロックはドライバをタブ用に作り直すのに self.socket を True のまま残していた。
+    以後 poll() は socket 分岐を通り、**タブが出した回答が経路の成功として投票され**、
+    死んだ経路が健康だと遮断器に教え続ける。タブ枠の会計も0のままになる。"""
+    import inspect
+
+    src = inspect.getsource(rf.RelayWorker)
+    i = src.index("self.fresh_replay_count += 1")
+    head = src[max(0, i - 900):i]
+    code = "\n".join(l for l in head.splitlines() if not l.strip().startswith("#"))
+    assert "self.socket = False" in code, "タブに戻したのに socket を名乗り続けている"
+    assert "self._landed_pending = False" in code
