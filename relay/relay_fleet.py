@@ -194,6 +194,40 @@ CANNED_NONANSWER_MARKERS = (
     "I couldn't respond to that",
     "I can't respond to that",
 )
+
+#: Set once any worker in this process has been answered by the CUSTOM agent -- reached DONE, or
+#: named one of its tools. The fleet runs one process per run, so process scope is run scope.
+#:
+#: THE CANNED NON-ANSWER HAS MORE THAN ONE CAUSE, AND THE DETECTOR KNEW ONE. It was written for
+#: the headless window wedge above, and it blamed that wedge for every canned reply it ever saw.
+#: Measured 2026-08-25: four goals, twice. The same goal drew the canned reply both times while
+#: its neighbours in the same run answered correctly and one of them called CloseIntentTool --
+#: so the custom agent had resolved and the MCP connector was there. The reply was Copilot
+#: declining that particular prompt, and it was reported as INFRA_STUCK with a diagnosis telling
+#: the operator to relaunch Edge headed. Two runs out of eight goals, sent chasing a browser.
+#:
+#: So the wedge is only blamed while it is still possible. Once the connector has demonstrably
+#: answered, a canned reply is about the prompt, and re-navigating or relaunching the browser
+#: cannot help.
+#: PROOF IS A TOOL CALL ARRIVING, NOT A REPLY LOOKING RIGHT. Default Copilot answers "Tokyo" to
+#: "what is the capital of Japan" perfectly well, so a plausible reply proves nothing about which
+#: agent produced it. What only the custom agent can do is reach the MCP connector -- and when it
+#: does, the call lands on this machine's own server, which stamps it. So the question "did the
+#: ?titleId= agent resolve" is answered by "has a tool call reached us since this run began",
+#: which is a mechanism, not a guess about wording.
+_PROCESS_START = time.time()
+
+
+def connector_proven():
+    """True once a tool call has reached this machine's MCP server during this run."""
+    try:
+        from tools import tool_probe
+        return float(tool_probe.last_inbound_ts() or 0.0) > _PROCESS_START
+    except Exception:
+        # Unknowable is not the same as proven. Saying False keeps the old diagnosis, which is
+        # the conservative direction: it tells the operator to check the browser, which wastes
+        # time, rather than telling them a broken connector is fine, which loses the run.
+        return False
 # How long (wall clock) to keep riding out a login-wall canned-non-answer streak before giving up
 # as INFRA_STUCK (sign-in required). Mirrors the AGENT_ERR_WINDOW_S style of bounded-but-generous
 # infra windows. Env-tunable.
@@ -2741,11 +2775,22 @@ class RelayWorker:
                                        "-ExecutionPolicy Bypass -File scripts\\start_companion_edge.ps1 "
                                        "-Foreground` を実行してから再投入してください。")
                     return
-                # nothing left to try: infra-classified STUCK (re-queueable, NOT a coding miss)
-                self.status, self.outcome = "stuck", "INFRA_STUCK"
-                self.reason = ("⚠ 定型の無回答が継続。headless の ?titleId= 解決失敗で既定Copilot"
-                               "(MCPコネクタ無し)にフォールバックしている疑い。再ナビ/ヘッドフル復旧でも"
-                               "解消せず。**タスク失敗でなくインフラ(接続/エージェント未確立)**=再投入対象。")
+                # nothing left to try. WHICH KIND OF STUCK depends on whether the custom agent
+                # has been seen answering in this run: if it has, the browser is fine and the
+                # canned reply is about this prompt, so telling the operator to relaunch Edge
+                # sends them after a fault that is not there.
+                self.status = "stuck"
+                if connector_proven():
+                    self.outcome = "REFUSED"
+                    self.reason = ("⚠ 定型の無回答が継続。ただし本走行の別ワーカーにはカスタム"
+                                   "エージェントが応答しており、MCPコネクタは生きている。"
+                                   "→ 接続の問題ではなく**この指示に対する拒否**。"
+                                   "再ナビもヘッドフル復旧も効かない。指示の言い換えが要る。")
+                else:
+                    self.outcome = "INFRA_STUCK"
+                    self.reason = ("⚠ 定型の無回答が継続。headless の ?titleId= 解決失敗で既定Copilot"
+                                   "(MCPコネクタ無し)にフォールバックしている疑い。再ナビ/ヘッドフル復旧でも"
+                                   "解消せず。**タスク失敗でなくインフラ(接続/エージェント未確立)**=再投入対象。")
                 return
             except Exception:
                 # NEVER raise out of _decide: on any unexpected error, fall through to the normal
