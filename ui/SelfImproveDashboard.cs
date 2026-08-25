@@ -439,7 +439,7 @@ class SelfImproveDashboardWindow : Window
 
         // ---- header bar ----
         _headBar = new Border();
-        _headBar.Padding = new Thickness(26, 18, 18, 14);
+        _headBar.Padding = new Thickness(24, 16, 16, 16);
         DockPanel.SetDock(_headBar, Dock.Top);
 
         var headGrid = new Grid();
@@ -479,7 +479,7 @@ class SelfImproveDashboardWindow : Window
         titleRow.Margin = new Thickness(0, 0, 12, 0);
         _iconHost = new ContentControl();
         _iconHost.VerticalAlignment = VerticalAlignment.Center;
-        _iconHost.Margin = new Thickness(0, 0, 10, 0);
+        _iconHost.Margin = new Thickness(0, 0, 12, 0);
         DockPanel.SetDock(_iconHost, Dock.Left);
         titleRow.Children.Add(_iconHost);
         _header = new TextBlock();
@@ -784,7 +784,7 @@ class SelfImproveDashboardWindow : Window
         var iconWrap = new ContentControl();
         iconWrap.Content = MakeIcon("auto_awesome", 36, Muted);
         iconWrap.HorizontalAlignment = HorizontalAlignment.Center;
-        iconWrap.Margin = new Thickness(0, 0, 0, 14);
+        iconWrap.Margin = new Thickness(0, 0, 0, 16);
         col.Children.Add(iconWrap);
 
         var heading = new TextBlock();
@@ -999,7 +999,7 @@ class SelfImproveDashboardWindow : Window
         //    holding collapses into one muted line. Nothing is hidden by this -- every count
         //    and every verdict is still on screen, at the weight the news deserves.
         var okBits = new List<string>();
-        var head = new WrapPanel(); head.Margin = new Thickness(0, 10, 0, 0);
+        var head = new WrapPanel(); head.Margin = new Thickness(0, 12, 0, 0);
 
         if (intact) okBits.Add(T("auth_intact") + ": " + T("auth_ok") + " (" + nChecked + ")");
         else head.Children.Add(Pill(T("auth_intact") + ": " + T("auth_broken")
@@ -1305,7 +1305,7 @@ class SelfImproveDashboardWindow : Window
         var btn = new Button();
         btn.Content = T("auth_revoke");
         btn.Padding = new Thickness(16, 6, 16, 6);
-        btn.Margin  = new Thickness(0, 14, 0, 0);
+        btn.Margin  = new Thickness(0, 16, 0, 0);
         btn.HorizontalAlignment = HorizontalAlignment.Left;
         btn.Click += delegate { RevokeLastRebless(); };
         detail.Children.Add(btn);
@@ -1390,7 +1390,7 @@ class SelfImproveDashboardWindow : Window
         }
 
         // metrics row
-        var grid = new Grid(); grid.Margin = new Thickness(0, 10, 0, 0);
+        var grid = new Grid(); grid.Margin = new Thickness(0, 12, 0, 0);
         for (int i = 0; i < 4; i++)
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         var goodBrush = new SolidColorBrush(StatusColorFor("good", _dark));
@@ -1412,7 +1412,7 @@ class SelfImproveDashboardWindow : Window
             mixLine.Text = string.Join("    ·    ", parts.ToArray());
             mixLine.Foreground = Muted;
             mixLine.FontSize = 12;
-            mixLine.Margin = new Thickness(0, 10, 0, 0);
+            mixLine.Margin = new Thickness(0, 12, 0, 0);
             mixLine.TextWrapping = TextWrapping.Wrap;
             col.Children.Add(mixLine);
         }
@@ -1539,7 +1539,7 @@ class SelfImproveDashboardWindow : Window
                 quote.CornerRadius    = new CornerRadius(Theme.RadSmall);
                 // The tinted ground already says "this is quoted material"; the bar only made
                 // it a sticky note.
-                quote.Padding         = new Thickness(9, 5, 9, 5);
+                quote.Padding         = new Thickness(8, 5, 8, 5);
                 quote.Margin          = new Thickness(0, 3, 0, 0);
 
                 var qt = new TextBlock();
@@ -1565,9 +1565,9 @@ class SelfImproveDashboardWindow : Window
 
         // scorecard uses a subtle tinted border to convey the latest verdict at a glance
         var card = new Border();
-        card.BorderThickness = new Thickness(1.4);
+        card.BorderThickness = new Thickness(2);
         card.CornerRadius    = new CornerRadius(Theme.RadPopover);
-        card.Padding         = new Thickness(18, 14, 16, 16);
+        card.Padding         = new Thickness(16, 16, 16, 16);
         card.Margin          = new Thickness(0, 8, 0, 8);
         card.BorderBrush     = new SolidColorBrush(Mix(sc, BgColor(), 0.45));
         card.Background      = new SolidColorBrush(Mix(sc, CardColor(), 0.07));
@@ -1586,7 +1586,7 @@ class SelfImproveDashboardWindow : Window
         {
             string vtext = string.IsNullOrEmpty(S(ab, "verdict")) ? "?" : S(ab, "verdict");
             var chip = Pill(vtext, vk);
-            chip.Margin = new Thickness(10, 0, 0, 0);
+            chip.Margin = new Thickness(12, 0, 0, 0);
             DockPanel.SetDock(chip, Dock.Left);
             topRow.Children.Add(chip);
         }
@@ -1708,7 +1708,7 @@ class SelfImproveDashboardWindow : Window
 
         // total count as a prominent metric
         var totalRow = new StackPanel(); totalRow.Orientation = Orientation.Horizontal;
-        totalRow.Margin = new Thickness(0, 8, 0, 10);
+        totalRow.Margin = new Thickness(0, 8, 0, 12);
         var tLabel = new TextBlock();
         tLabel.Text = T("burned_total") + ": ";
         tLabel.Foreground = Muted; tLabel.FontSize = 13;
@@ -1914,7 +1914,7 @@ class SelfImproveDashboardWindow : Window
         w.Background = Bg;
 
         var col = new StackPanel();
-        col.Margin = new Thickness(20, 18, 20, 16);
+        col.Margin = new Thickness(20, 16, 20, 16);
 
         var note = new TextBlock();
         note.Text = T("pd_recorded");
@@ -1930,7 +1930,7 @@ class SelfImproveDashboardWindow : Window
             b.Content = choice;
             b.HorizontalContentAlignment = HorizontalAlignment.Left;
             b.Padding = new Thickness(12, 8, 12, 8);
-            b.Margin = new Thickness(0, 10, 0, 0);
+            b.Margin = new Thickness(0, 12, 0, 0);
             string theChoice = choice;
             b.Click += delegate
             {
@@ -1943,21 +1943,21 @@ class SelfImproveDashboardWindow : Window
         own.AcceptsReturn = true;
         own.TextWrapping = TextWrapping.Wrap;
         own.MinHeight = 56;
-        own.Margin = new Thickness(0, 14, 0, 0);
+        own.Margin = new Thickness(0, 16, 0, 0);
         own.FontSize = Theme.FsMeta;
         col.Children.Add(own);
 
         var row = new StackPanel();
         row.Orientation = Orientation.Horizontal;
         row.HorizontalAlignment = HorizontalAlignment.Right;
-        row.Margin = new Thickness(0, 10, 0, 0);
+        row.Margin = new Thickness(0, 12, 0, 0);
         var cancel = new Button();
         cancel.Content = T("pd_cancel");
-        cancel.Padding = new Thickness(14, 5, 14, 5);
+        cancel.Padding = new Thickness(16, 5, 16, 5);
         cancel.Margin = new Thickness(0, 0, 8, 0);
         var ok = new Button();
         ok.Content = T("pd_own");
-        ok.Padding = new Thickness(18, 5, 18, 5);
+        ok.Padding = new Thickness(16, 5, 16, 5);
         row.Children.Add(cancel); row.Children.Add(ok);
         col.Children.Add(row);
 
@@ -2052,7 +2052,7 @@ class SelfImproveDashboardWindow : Window
         var card = SectionCard("pending_sec", "pending_exp");
         var col  = (StackPanel)card.Child;
 
-        var head = new WrapPanel(); head.Margin = new Thickness(0, 10, 0, 0);
+        var head = new WrapPanel(); head.Margin = new Thickness(0, 12, 0, 0);
         head.Children.Add(Pill(rows.Count.ToString() + (_lang == 0 ? " 件" : " open"), "warn"));
         col.Children.Add(head);
 
@@ -2137,7 +2137,7 @@ class SelfImproveDashboardWindow : Window
             //    notification that opened a text file of commands to paste.
             var actions = new StackPanel();
             actions.Orientation = Orientation.Horizontal;
-            actions.Margin = new Thickness(0, 10, 0, 0);
+            actions.Margin = new Thickness(0, 12, 0, 0);
 
             {
                 var yes = new Button();
@@ -2284,7 +2284,7 @@ class SelfImproveDashboardWindow : Window
             var rec = new Border();
             rec.BorderThickness = new Thickness(0, 0, 0, 1);
             rec.BorderBrush = new SolidColorBrush(Mix(Theme.Col(Theme.Faint(_dark)), CardColor(), 0.22));
-            rec.Padding = new Thickness(0, 0, 0, 10);
+            rec.Padding = new Thickness(0, 0, 0, 12);
             rec.Margin  = new Thickness(0, 12, 0, 0);
             rec.Child = body;
             col.Children.Add(rec);
@@ -2300,7 +2300,7 @@ class SelfImproveDashboardWindow : Window
         var arc  = Obj(state, "archive");
         var sum  = Obj(state, "summary");
 
-        var grid = new Grid(); grid.Margin = new Thickness(0, 10, 0, 0);
+        var grid = new Grid(); grid.Margin = new Thickness(0, 12, 0, 0);
         for (int c = 0; c < 3; c++)
         {
             var cd = new ColumnDefinition(); cd.Width = new GridLength(1, GridUnitType.Star);
@@ -2318,7 +2318,7 @@ class SelfImproveDashboardWindow : Window
         object[] gs = arc != null ? Arr(arc, "genomes") : null;
         if (gs == null || gs.Length == 0) { col.Children.Add(MuteRow(T("none"))); return card; }
 
-        var table = new Grid(); table.Margin = new Thickness(0, 14, 0, 0);
+        var table = new Grid(); table.Margin = new Thickness(0, 16, 0, 0);
         double[] w = { 1.1, 0.7, 1.0, 2.0, 1.0 };
         for (int c = 0; c < w.Length; c++)
         {
@@ -2406,7 +2406,7 @@ class SelfImproveDashboardWindow : Window
         var card = new Border();
         card.BorderThickness = new Thickness(1);
         card.CornerRadius    = new CornerRadius(Theme.RadPopover);
-        card.Padding         = new Thickness(18, 14, 16, 16);
+        card.Padding         = new Thickness(16, 16, 16, 16);
         card.Margin          = new Thickness(0, 0, 0, 12);
         card.BorderBrush     = Border;
         card.Background      = CardBg;
@@ -2534,7 +2534,7 @@ class SelfImproveDashboardWindow : Window
         track.Height = 8; track.CornerRadius = new CornerRadius(Theme.RadChip);   // = height/2. 999 renders as a lens, not a bar.
         track.Background = QuoteBg;
         track.VerticalAlignment = VerticalAlignment.Center;
-        track.Margin = new Thickness(0, 0, 10, 0);
+        track.Margin = new Thickness(0, 0, 12, 0);
         var bargrid = new Grid();
         bargrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(frac,       GridUnitType.Star) });
         bargrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.0 - frac, GridUnitType.Star) });

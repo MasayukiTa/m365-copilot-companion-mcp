@@ -241,7 +241,7 @@ public static class Md
         tb.FontWeight = FontWeights.Bold;
         tb.FontSize = size;
         tb.TextWrapping = TextWrapping.Wrap;
-        tb.Margin = new Thickness(0, 10, 0, 4);
+        tb.Margin = new Thickness(0, 12, 0, 4);
         tb.SetResourceReference(TextBlock.ForegroundProperty, KeyFg);
         AppendInlines(tb.Inlines, text);
         return tb;
@@ -284,7 +284,7 @@ public static class Md
         var border = new Border();
         border.BorderThickness = new Thickness(1, 0, 0, 0);
         border.SetResourceReference(Border.BorderBrushProperty, KeyBorder);
-        border.Padding = new Thickness(10, 2, 0, 2);
+        border.Padding = new Thickness(12, 2, 0, 2);
         border.Margin = new Thickness(0, 4, 0, 4);
 
         var tb = new TextBlock();
@@ -305,7 +305,7 @@ public static class Md
         border.SetResourceReference(Border.BorderBrushProperty, KeyBorder);
         border.BorderThickness = new Thickness(1);
         border.CornerRadius = new CornerRadius(Theme.RadCard);
-        border.Padding = new Thickness(10);
+        border.Padding = new Thickness(12);
         border.Margin = new Thickness(0, 6, 0, 6);
 
         var stack = new StackPanel();

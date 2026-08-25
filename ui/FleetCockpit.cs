@@ -362,12 +362,12 @@ class ApprovalPromptWindow : Window
             Background = SurfaceSubtle, Foreground = Fg, BorderBrush = Line, BorderThickness = new Thickness(1), Cursor = Cursors.Hand };
         later.Template = FlatButtonTemplate();
         later.Click += delegate { Close(); }; DockPanel.SetDock(later, Dock.Right); actions.Children.Add(later);
-        _deny = new Button { Content = L("拒否", "Deny"), Padding = new Thickness(18, 7, 18, 7),
+        _deny = new Button { Content = L("拒否", "Deny"), Padding = new Thickness(16, 7, 16, 7),
             Margin = new Thickness(0, 0, 8, 0), Background = Brushes.Transparent,
             Foreground = Danger, BorderBrush = Danger, BorderThickness = new Thickness(1), Cursor = Cursors.Hand };
         _deny.Template = FlatButtonTemplate();
         _deny.Click += delegate { Answer("denied"); }; DockPanel.SetDock(_deny, Dock.Right); actions.Children.Add(_deny);
-        _approve = new Button { Content = L("承認", "Approve"), Padding = new Thickness(22, 8, 22, 8),
+        _approve = new Button { Content = L("承認", "Approve"), Padding = new Thickness(24, 8, 24, 8),
             Margin = new Thickness(0, 0, 8, 0), Background = AccentFill, Foreground = AccentFg,
             BorderThickness = new Thickness(0), FontWeight = FontWeights.SemiBold, Cursor = Cursors.Hand };
         _approve.Template = FlatButtonTemplate();
@@ -381,7 +381,7 @@ class ApprovalPromptWindow : Window
         // stripe; the card already carries the warning colour, which is what marks it.
         var decisionCard = new Border { Background = Surface, BorderBrush = Warning,
             BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(Theme.RadCard),
-            Padding = new Thickness(14, 12, 14, 12) };
+            Padding = new Thickness(16, 12, 16, 12) };
         var decisionCol = new StackPanel();
         _kind = new TextBlock { Foreground = Muted, FontSize = Theme.FsMeta, FontWeight = FontWeights.SemiBold };
         decisionCol.Children.Add(_kind);
@@ -410,7 +410,7 @@ class ApprovalPromptWindow : Window
         decisionCard.Child = decisionCol; body.Children.Add(decisionCard);
 
         var policyBox = new Border { Background = SurfaceSubtle, BorderBrush = Line, BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(Theme.RadCard), Padding = new Thickness(14, 12, 14, 12), Margin = new Thickness(0, Theme.SectionGap, 0, 0) };
+            CornerRadius = new CornerRadius(Theme.RadCard), Padding = new Thickness(16, 12, 16, 12), Margin = new Thickness(0, Theme.SectionGap, 0, 0) };
         var policyCol = new StackPanel();
         policyCol.Children.Add(new TextBlock { Text = L("今後の操作承認", "Approval policy"), Foreground = Fg,
             FontSize = Theme.FsSection, FontWeight = FontWeights.SemiBold });
@@ -683,6 +683,7 @@ class CockpitWindow : Window
     string _archivedRunStarted = "";   // `started` of the run already auto-archived (fire once/run)
     // P2 history search: live case-insensitive substring filter over title+result, debounced.
     TextBox _histSearchBox;
+    TextBlock _histHint;   // placeholder drawn behind an empty filter box (WPF has none of its own)
     string _histQuery = "";
     DispatcherTimer _histSearchTimer;
     long _settingsMtime = 0;
@@ -1291,7 +1292,7 @@ class CockpitWindow : Window
     {
         var root = new DockPanel();
         _headBar = new Border();
-        _headBar.Padding = new Thickness(26, 20, 18, 8);
+        _headBar.Padding = new Thickness(24, 20, 16, 8);
         DockPanel.SetDock(_headBar, Dock.Top);
 
         // Header = a 2-column Grid, NOT a DockPanel. The old DockPanel let the (un-clipped)
@@ -1325,7 +1326,7 @@ class CockpitWindow : Window
         _workerChip = new TextBlock();
         _workerChip.FontSize = 12; _workerChip.VerticalAlignment = VerticalAlignment.Center;
         _workerChip.Margin = new Thickness(0, 0, 12, 0);
-        _workerChip.Padding = new Thickness(10, 3, 10, 3);
+        _workerChip.Padding = new Thickness(12, 3, 12, 3);
         UpdateWorkerChip(0, 0, false);   // initial paint
         _workerChipBorder = new Border();
         _workerChipBorder.Child = _workerChip;
@@ -1383,14 +1384,14 @@ class CockpitWindow : Window
         // Feature 2: _sub itself is no longer shown -- UpdateHeader still builds its sentence (kept
         // as a plain-text fallback / ToolTip source) but the VISIBLE row 1 content is now _subChips,
         // a WrapPanel of discrete Pill() chips occupying the identical grid cell.
-        _sub = new TextBlock(); _sub.FontSize = 13; _sub.Margin = new Thickness(0, 4, 18, 0);
+        _sub = new TextBlock(); _sub.FontSize = 13; _sub.Margin = new Thickness(0, 4, 16, 0);
         _sub.TextWrapping = TextWrapping.Wrap;
         Grid.SetColumn(_sub, 0); Grid.SetColumnSpan(_sub, 2); Grid.SetRow(_sub, 1);
         _sub.Visibility = Visibility.Collapsed;
         headRow.Children.Add(_sub);
 
         _subChips = new WrapPanel();
-        _subChips.Margin = new Thickness(0, 4, 18, 0);
+        _subChips.Margin = new Thickness(0, 4, 16, 0);
         Grid.SetColumn(_subChips, 0); Grid.SetColumnSpan(_subChips, 2); Grid.SetRow(_subChips, 1);
         headRow.Children.Add(_subChips);
 
@@ -1411,7 +1412,7 @@ class CockpitWindow : Window
         _list = new ListBox();
         _list.BorderThickness = new Thickness(0);
         _list.Background = Brushes.Transparent;
-        _list.Padding = new Thickness(18, 6, 18, 4);   // was bottom 24 — left a gap between the last row and the composer
+        _list.Padding = new Thickness(16, 6, 16, 4);   // was bottom 24 — left a gap between the last row and the composer
         ScrollViewer.SetVerticalScrollBarVisibility(_list, ScrollBarVisibility.Auto);
         ScrollViewer.SetHorizontalScrollBarVisibility(_list, ScrollBarVisibility.Disabled);
         // Pixel scroll (not item scroll) so the list can SIZE TO CONTENT inside an Auto row and
@@ -1470,7 +1471,7 @@ class CockpitWindow : Window
         // and the cards below it.
         col1.Children.Add(BuildGateBanner());
         _pinnedToolbarHost = new Border();
-        _pinnedToolbarHost.Padding = new Thickness(18, 6, 18, 0);
+        _pinnedToolbarHost.Padding = new Thickness(16, 6, 16, 0);
         _pinnedToolbarHost.Visibility = Visibility.Collapsed;   // shown once there is a run/history to filter
         DockPanel.SetDock(_pinnedToolbarHost, Dock.Top);
         col1.Children.Add(_pinnedToolbarHost);
@@ -1504,8 +1505,8 @@ class CockpitWindow : Window
         _scaleToast = new Border();
         _scaleToast.HorizontalAlignment = HorizontalAlignment.Center;
         _scaleToast.VerticalAlignment = VerticalAlignment.Top;
-        _scaleToast.Margin = new Thickness(0, 18, 0, 0);
-        _scaleToast.Padding = new Thickness(14, 7, 14, 7);
+        _scaleToast.Margin = new Thickness(0, 16, 0, 0);
+        _scaleToast.Padding = new Thickness(16, 7, 16, 7);
         _scaleToast.CornerRadius = new CornerRadius(Theme.RadCard);
         _scaleToast.Background = Theme.Br(Theme.Surface(_dark));
         _scaleToast.BorderBrush = Border;
@@ -1823,8 +1824,8 @@ class CockpitWindow : Window
         _fixBtn = new Button();
         _fixBtn.Content = BuildFixPillContent(false);
         _fixBtn.FontSize = 11; _fixBtn.FontWeight = FontWeights.SemiBold;
-        _fixBtn.Padding = new Thickness(8, 1, 9, 1);
-        _fixBtn.Margin = new Thickness(10, 0, 0, 0);      // gap after エージェント dot
+        _fixBtn.Padding = new Thickness(8, 1, 8, 1);
+        _fixBtn.Margin = new Thickness(12, 0, 0, 0);      // gap after エージェント dot
         _fixBtn.Cursor = Cursors.Hand;
         _fixBtn.BorderThickness = new Thickness(1);
         _fixBtn.Template = FlatButtonTemplate();          // rounded (CornerRadius 4) pill chrome
@@ -2843,7 +2844,7 @@ class CockpitWindow : Window
                 pastList.Add(focusEntry);
                 bool jaP = _lang == 0;
                 var wrap = new StackPanel();
-                wrap.Margin = new Thickness(10, 10, 8, 0);
+                wrap.Margin = new Thickness(12, 12, 8, 0);
                 var pastTag = new TextBlock();
                 pastTag.Text = jaP ? "過去のタスク" : "Past task";
                 // NOT Accent. Theme.cs reserves that colour for a primary action -- "primary
@@ -2964,7 +2965,7 @@ class CockpitWindow : Window
         bool ja = _lang == 0;
 
         var outer = new StackPanel();
-        outer.Margin = new Thickness(10, 12, 8, 12);
+        outer.Margin = new Thickness(12, 12, 8, 12);
 
         // ── Section label ──────────────────────────────────────────────────────────
         var sectionLbl = new TextBlock();
@@ -3043,7 +3044,9 @@ class CockpitWindow : Window
         var subLbl = new TextBlock();
         subLbl.Text = usingRealEvents
             ? (ja ? "(フェーズ遷移)" : "(phase transitions)")
-            : (ja ? "(会話ターンから)" : "(from turns)");
+            // "from turns" did not say that these times are INFERRED. That was the whole content
+            // of the [COMPUTED] tag underneath, so it moves up here where it is read first.
+            : (ja ? "(会話ターンから推定)" : "(estimated from turns)");
         subLbl.Foreground = Theme.Br(Theme.Faint(_dark));
         subLbl.FontSize = 9.5;
         subLbl.Margin = new Thickness(0, 0, 0, 8);
@@ -3061,27 +3064,39 @@ class CockpitWindow : Window
                 var row = new Grid();
                 row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(18) });
                 row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-                var lineAndDot = new StackPanel();
+                // A DOCKPANEL, NOT A STACKPANEL. Measured on screen: an 8px hole in every
+                // connector, at every step, in both of this widget's two implementations. The
+                // rail was drawn as a fixed 8px above the dot and a fixed 8px below it -- 24px
+                // of column against a row whose height is set by the label and its timestamp,
+                // about 32px. It could never reach, and a wrapped label opens the gap further.
+                // Docking the head to the top and letting the tail take the remaining height
+                // makes the rail follow the row instead of guessing at it.
+                var lineAndDot = new DockPanel();
                 lineAndDot.HorizontalAlignment = HorizontalAlignment.Center;
-                if (i > 0)
                 {
                     var connector = new Border();
                     connector.Width = 1.5; connector.Height = 8;
-                    connector.Background = Theme.Br(Theme.Border(_dark));
+                    // Transparent rather than absent on the first row: the head still has to
+                    // occupy its 8px so every dot lands at the same height down the column.
+                    connector.Background = i > 0 ? Theme.Br(Theme.Border(_dark)) : Brushes.Transparent;
                     connector.HorizontalAlignment = HorizontalAlignment.Center;
+                    DockPanel.SetDock(connector, Dock.Top);
                     lineAndDot.Children.Add(connector);
                 }
                 var dot = new System.Windows.Shapes.Ellipse();
                 dot.Width = 8; dot.Height = 8;
                 dot.Fill = Theme.Br(evColor);
                 dot.HorizontalAlignment = HorizontalAlignment.Center;
-                dot.Margin = new Thickness(0, i == 0 ? 4 : 0, 0, 0);
+                DockPanel.SetDock(dot, Dock.Top);
                 lineAndDot.Children.Add(dot);
-                if (!isLast)
                 {
+                    // The last child of a DockPanel fills what is left, so this is the piece that
+                    // reaches the next dot however tall the row turns out to be. Added even on the
+                    // last row -- invisible there -- because if it were absent the dot would
+                    // become the filling child and stretch.
                     var tail = new Border();
-                    tail.Width = 1.5; tail.Height = 8;
-                    tail.Background = Theme.Br(Theme.Border(_dark));
+                    tail.Width = 1.5;
+                    tail.Background = isLast ? Brushes.Transparent : Theme.Br(Theme.Border(_dark));
                     tail.HorizontalAlignment = HorizontalAlignment.Center;
                     lineAndDot.Children.Add(tail);
                 }
@@ -3108,12 +3123,12 @@ class CockpitWindow : Window
                 row.Children.Add(labelBlock);
                 outer.Children.Add(row);
             }
-            var realTag = new TextBlock();
-            realTag.Text = "[REAL]";
-            realTag.Foreground = Theme.Br(Theme.Faint(_dark));
-            realTag.FontSize = 9;
-            realTag.Margin = new Thickness(0, 8, 0, 0);
-            outer.Children.Add(realTag);
+            // [REAL] used to be printed here. It is a tag from this project's own spec, where
+            // every displayed field is marked [REAL] / [COMPUTED] / [FUTURE] so nobody ships a
+            // fabricated number -- a good rule that had leaked into the product as jargon. The
+            // distinction it carried is already stated in words at the top of this panel:
+            // "(phase transitions)" against "(estimated from turns)". Saying it twice, once in
+            // brackets, is not more honest.
             return outer;
         }
 
@@ -3250,15 +3265,16 @@ class CockpitWindow : Window
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }); // label col
 
             // Vertical connector: a thin line above the dot (hidden for first item).
-            var lineAndDot = new StackPanel();
+            // Same rail, same hole, second copy. See the note in the phase-events branch.
+            var lineAndDot = new DockPanel();
             lineAndDot.HorizontalAlignment = HorizontalAlignment.Center;
-            if (i > 0)
             {
                 var connector = new Border();
                 connector.Width = 1.5;
                 connector.Height = 8;
-                connector.Background = Theme.Br(Theme.Border(_dark));
+                connector.Background = i > 0 ? Theme.Br(Theme.Border(_dark)) : Brushes.Transparent;
                 connector.HorizontalAlignment = HorizontalAlignment.Center;
+                DockPanel.SetDock(connector, Dock.Top);
                 lineAndDot.Children.Add(connector);
             }
 
@@ -3269,6 +3285,7 @@ class CockpitWindow : Window
             dot.Fill = Theme.Br(evColor);
             dot.HorizontalAlignment = HorizontalAlignment.Center;
             dot.Margin = new Thickness(0, i == 0 ? 4 : 0, 0, 0);
+            DockPanel.SetDock(dot, Dock.Top);
             lineAndDot.Children.Add(dot);
 
             // Tail connector below dot (hidden for last item)
@@ -3276,8 +3293,7 @@ class CockpitWindow : Window
             {
                 var tail = new Border();
                 tail.Width = 1.5;
-                tail.Height = 8;
-                tail.Background = Theme.Br(Theme.Border(_dark));
+                tail.Background = isLast ? Brushes.Transparent : Theme.Br(Theme.Border(_dark));
                 tail.HorizontalAlignment = HorizontalAlignment.Center;
                 lineAndDot.Children.Add(tail);
             }
@@ -3314,12 +3330,7 @@ class CockpitWindow : Window
         }
 
         // ── [COMPUTED] footer tag ─────────────────────────────────────────────────
-        var tag = new TextBlock();
-        tag.Text = "[COMPUTED]";
-        tag.Foreground = Theme.Br(Theme.Faint(_dark));
-        tag.FontSize = 9;
-        tag.Margin = new Thickness(0, 8, 0, 0);
-        outer.Children.Add(tag);
+        // The [COMPUTED] tag stood here; the subtitle now carries the same warning in words.
 
         return outer;
     }
@@ -4176,7 +4187,7 @@ class CockpitWindow : Window
             border.Child = sv;
             border.BorderThickness = new Thickness(1);
             border.CornerRadius = new CornerRadius(Theme.RadCard);
-            border.Padding = new Thickness(12, 10, 12, 10);
+            border.Padding = new Thickness(12, 12, 12, 12);
             border.Background = BtnBg;
             border.BorderBrush = Accent;
 
@@ -4277,11 +4288,11 @@ class CockpitWindow : Window
         var ok = new Button();
         ok.Content = _lang == 0 ? "生成" : "Generate"; ok.IsDefault = true;
         ok.Background = AccentFill; ok.Foreground = AccentFg; ok.BorderThickness = new Thickness(0);
-        ok.Padding = new Thickness(14, 4, 14, 4); ok.Cursor = Cursors.Hand; ok.FontWeight = FontWeights.SemiBold;
+        ok.Padding = new Thickness(16, 4, 16, 4); ok.Cursor = Cursors.Hand; ok.FontWeight = FontWeights.SemiBold;
         ok.Click += delegate { box[0] = tb.Text; w.DialogResult = true; };
         var cancel = new Button();
         cancel.Content = _lang == 0 ? "取消" : "Cancel"; cancel.IsCancel = true;
-        cancel.Margin = new Thickness(8, 0, 0, 0); cancel.Padding = new Thickness(14, 4, 14, 4);
+        cancel.Margin = new Thickness(8, 0, 0, 0); cancel.Padding = new Thickness(16, 4, 16, 4);
         cancel.Cursor = Cursors.Hand; cancel.Background = BtnBg; cancel.Foreground = Fg;
         cancel.BorderBrush = Border; cancel.BorderThickness = new Thickness(1);
         btns.Children.Add(ok); btns.Children.Add(cancel);
@@ -4317,11 +4328,11 @@ class CockpitWindow : Window
         var ok = new Button();
         ok.Content = _lang == 0 ? "続ける" : "Continue"; ok.IsDefault = true;
         ok.Background = AccentFill; ok.Foreground = AccentFg; ok.BorderThickness = new Thickness(0);
-        ok.Padding = new Thickness(14, 4, 14, 4); ok.Cursor = Cursors.Hand; ok.FontWeight = FontWeights.SemiBold;
+        ok.Padding = new Thickness(16, 4, 16, 4); ok.Cursor = Cursors.Hand; ok.FontWeight = FontWeights.SemiBold;
         ok.Click += delegate { box[0] = tb.Text; w.DialogResult = true; };
         var cancel = new Button();
         cancel.Content = _lang == 0 ? "取消" : "Cancel"; cancel.IsCancel = true;
-        cancel.Margin = new Thickness(8, 0, 0, 0); cancel.Padding = new Thickness(14, 4, 14, 4);
+        cancel.Margin = new Thickness(8, 0, 0, 0); cancel.Padding = new Thickness(16, 4, 16, 4);
         cancel.Cursor = Cursors.Hand; cancel.Background = BtnBg; cancel.Foreground = Fg;
         cancel.BorderBrush = Border; cancel.BorderThickness = new Thickness(1);
         btns.Children.Add(ok); btns.Children.Add(cancel);
@@ -4430,7 +4441,7 @@ class CockpitWindow : Window
             var sep = new Border();
             sep.Height = 1;
             sep.Background = Theme.Br(Theme.Border(_dark));
-            sep.Margin = new Thickness(0, 14, 0, 14);
+            sep.Margin = new Thickness(0, 16, 0, 16);
             return sep;
         };
 
@@ -4441,7 +4452,7 @@ class CockpitWindow : Window
         directiveBorder.BorderThickness = new Thickness(1);
         directiveBorder.CornerRadius = new CornerRadius(Theme.RadSmall);
         directiveBorder.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
-        directiveBorder.Padding = new Thickness(10, 8, 10, 8);
+        directiveBorder.Padding = new Thickness(12, 8, 12, 8);
         directiveBorder.Margin = new Thickness(0, 0, 0, 0);
         var directiveTb = new TextBlock();
         directiveTb.Text = instruction;
@@ -4666,7 +4677,7 @@ class CockpitWindow : Window
         footerBand.BorderBrush = Theme.Br(Theme.Border(_dark));
         footerBand.BorderThickness = new Thickness(0, 1, 0, 0);
         footerBand.Background = Theme.Br(Theme.Bg(_dark));
-        footerBand.Padding = new Thickness(24, 14, 24, 14);
+        footerBand.Padding = new Thickness(24, 16, 24, 16);
 
         var footerRow = new StackPanel();
         footerRow.Orientation = Orientation.Horizontal;
@@ -4685,7 +4696,7 @@ class CockpitWindow : Window
         cancelBtn.BorderBrush = Theme.Br(Theme.Border(_dark));
         cancelBtn.BorderThickness = new Thickness(1);
         cancelBtn.Cursor = Cursors.Hand;
-        cancelBtn.Margin = new Thickness(0, 0, 10, 0);
+        cancelBtn.Margin = new Thickness(0, 0, 12, 0);
         cancelBtn.Click += delegate { w.DialogResult = false; };
         footerRow.Children.Add(cancelBtn);
 
@@ -4786,7 +4797,7 @@ class CockpitWindow : Window
         _autoToggle = new Button();
         _autoToggle.ToolTip = _lang == 0 ? "RAM空きに応じて並列タブ数を自動調整 (ON/OFF)" : "Auto-adjust parallel tabs to free RAM (ON/OFF)";
         _autoToggle.Cursor = Cursors.Hand; _autoToggle.BorderThickness = new Thickness(1);
-        _autoToggle.Padding = new Thickness(10, 3, 10, 3); _autoToggle.FontSize = 12;
+        _autoToggle.Padding = new Thickness(12, 3, 12, 3); _autoToggle.FontSize = 12;
         _autoToggle.FontWeight = FontWeights.SemiBold;
         _autoToggle.Margin = new Thickness(0);
         _autoToggle.VerticalAlignment = VerticalAlignment.Center;
@@ -4869,8 +4880,12 @@ class CockpitWindow : Window
     UIElement OverflowControl()
     {
         _overflowBtn = new Button();
-        _overflowBtn.Width = 36; _overflowBtn.Height = 30; _overflowBtn.Cursor = Cursors.Hand;
+        // Built by hand rather than through IconButton, so it did not inherit the height token or
+        // the rounded template and stayed square while the five beside it were fixed. Hand-built
+        // twins are how one member of a set escapes every change made to the set.
+        _overflowBtn.Width = 36; _overflowBtn.Height = HeaderCtrlH; _overflowBtn.Cursor = Cursors.Hand;
         _overflowBtn.BorderThickness = new Thickness(1); _overflowBtn.Margin = new Thickness(4, 0, 0, 0);
+        _overflowBtn.Template = FlatButtonTemplate();
         _overflowBtn.ToolTip = _lang == 0 ? "その他のメニュー" : "More options";
         System.Windows.Automation.AutomationProperties.SetName(_overflowBtn, _lang == 0 ? "その他のメニュー" : "More options");
         // Draw three dots as text (no glyph needed; plain text at this size is crisp)
@@ -4935,7 +4950,7 @@ class CockpitWindow : Window
         b.Cursor = Cursors.Hand;
         b.Background = Brushes.Transparent;
         b.BorderThickness = new Thickness(0);
-        b.Padding = new Thickness(10, 9, 16, 9);
+        b.Padding = new Thickness(12, 8, 16, 8);
         b.HorizontalContentAlignment = HorizontalAlignment.Left;
         b.Template = FlatButtonTemplate(true);   // left-align so the two rows' icons line up
 
@@ -4973,7 +4988,7 @@ class CockpitWindow : Window
         DockPanel.SetDock(stp, Dock.Right);
         stp.Children.Add(minus);
         valueBlock.Foreground = Fg; valueBlock.FontSize = 13; valueBlock.FontWeight = FontWeights.SemiBold;
-        valueBlock.Margin = new Thickness(10, 0, 10, 0); valueBlock.MinWidth = 28;
+        valueBlock.Margin = new Thickness(12, 0, 12, 0); valueBlock.MinWidth = 28;
         valueBlock.TextAlignment = TextAlignment.Center; valueBlock.VerticalAlignment = VerticalAlignment.Center;
         stp.Children.Add(valueBlock);
         stp.Children.Add(plus);
@@ -4985,7 +5000,7 @@ class CockpitWindow : Window
     TextBlock SectionHeader(string text)
     {
         var t = new TextBlock(); t.Text = text; t.Foreground = Muted; t.FontSize = 11;
-        t.FontWeight = FontWeights.SemiBold; t.Margin = new Thickness(0, 10, 0, 2);
+        t.FontWeight = FontWeights.SemiBold; t.Margin = new Thickness(0, 12, 0, 2);
         return t;
     }
 
@@ -5044,7 +5059,7 @@ class CockpitWindow : Window
 
         var card = new System.Windows.Controls.Border();
         card.Background = CardBg; card.BorderBrush = Border; card.BorderThickness = new Thickness(1);
-        card.CornerRadius = new CornerRadius(Theme.RadPopover); card.Padding = new Thickness(16, 12, 16, 14);
+        card.CornerRadius = new CornerRadius(Theme.RadPopover); card.Padding = new Thickness(16, 12, 16, 16);
         card.Margin = new Thickness(8, 6, 8, 6); card.MinWidth = 340; card.MaxWidth = 420;
         card.Effect = new System.Windows.Media.Effects.DropShadowEffect
         { BlurRadius = 16, ShadowDepth = 2, Opacity = 0.28, Color = C("#000000") };
@@ -5084,7 +5099,7 @@ class CockpitWindow : Window
     {
         var card = new Border();
         card.Background = CardBg; card.BorderBrush = Border; card.BorderThickness = new Thickness(1);
-        card.CornerRadius = new CornerRadius(Theme.RadPopover); card.Padding = new Thickness(16, 12, 16, 14);
+        card.CornerRadius = new CornerRadius(Theme.RadPopover); card.Padding = new Thickness(16, 12, 16, 16);
         card.Margin = new Thickness(0, 6, 8, 6); card.MinWidth = 280;
         // soft shadow so the floating panel reads as elevated
         card.Effect = new System.Windows.Media.Effects.DropShadowEffect
@@ -5115,7 +5130,7 @@ class CockpitWindow : Window
         col.Children.Add(SectionHeader(T("set_retry_section")));
         _autoRetryBtn = new Button();
         _autoRetryBtn.BorderThickness = new Thickness(1); _autoRetryBtn.Cursor = Cursors.Hand;
-        _autoRetryBtn.Padding = new Thickness(10, 4, 10, 4); _autoRetryBtn.FontSize = 12;
+        _autoRetryBtn.Padding = new Thickness(12, 4, 12, 4); _autoRetryBtn.FontSize = 12;
         _autoRetryBtn.FontWeight = FontWeights.SemiBold; _autoRetryBtn.HorizontalAlignment = HorizontalAlignment.Left;
         _autoRetryBtn.Margin = new Thickness(0, 2, 0, 4);
         _autoRetryBtn.Template = FlatButtonTemplate();
@@ -5134,7 +5149,7 @@ class CockpitWindow : Window
         col.Children.Add(SectionHeader(T("set_archive_section")));
         _autoArchiveBtn = new Button();
         _autoArchiveBtn.BorderThickness = new Thickness(1); _autoArchiveBtn.Cursor = Cursors.Hand;
-        _autoArchiveBtn.Padding = new Thickness(10, 4, 10, 4); _autoArchiveBtn.FontSize = 12;
+        _autoArchiveBtn.Padding = new Thickness(12, 4, 12, 4); _autoArchiveBtn.FontSize = 12;
         _autoArchiveBtn.FontWeight = FontWeights.SemiBold; _autoArchiveBtn.HorizontalAlignment = HorizontalAlignment.Left;
         _autoArchiveBtn.Margin = new Thickness(0, 2, 0, 4);
         _autoArchiveBtn.Template = FlatButtonTemplate();
@@ -5170,7 +5185,7 @@ class CockpitWindow : Window
         _reconnectChatBtn.Content = T("reconnect_chat");
         _reconnectChatBtn.FontSize = 12; _reconnectChatBtn.FontWeight = FontWeights.SemiBold;
         _reconnectChatBtn.Cursor = Cursors.Hand; _reconnectChatBtn.BorderThickness = new Thickness(1);
-        _reconnectChatBtn.Padding = new Thickness(10, 4, 10, 4);
+        _reconnectChatBtn.Padding = new Thickness(12, 4, 12, 4);
         _reconnectChatBtn.HorizontalAlignment = HorizontalAlignment.Left;
         _reconnectChatBtn.Margin = new Thickness(0, 2, 0, 4);
         _reconnectChatBtn.Template = FlatButtonTemplate();
@@ -5449,7 +5464,7 @@ class CockpitWindow : Window
         _accessFullBtn.Content = L("フルアクセス", "Full access");
         _accessFullBtn.FontSize = 12; _accessFullBtn.FontWeight = FontWeights.SemiBold;
         _accessFullBtn.Cursor = Cursors.Hand; _accessFullBtn.BorderThickness = new Thickness(1);
-        _accessFullBtn.Padding = new Thickness(10, 4, 10, 4); _accessFullBtn.Template = FlatButtonTemplate();
+        _accessFullBtn.Padding = new Thickness(12, 4, 12, 4); _accessFullBtn.Template = FlatButtonTemplate();
         _accessFullBtn.ToolTip = L("すべてのフォルダを操作できます（既定）。", "Can operate on any folder (default).");
         _accessFullBtn.Click += delegate { SetAccessScope(false); };
         choiceRow.Children.Add(_accessFullBtn);
@@ -5458,7 +5473,7 @@ class CockpitWindow : Window
         _accessRestrictedBtn.Content = L("指定フォルダのみ", "Selected folders only");
         _accessRestrictedBtn.FontSize = 12; _accessRestrictedBtn.FontWeight = FontWeights.SemiBold;
         _accessRestrictedBtn.Cursor = Cursors.Hand; _accessRestrictedBtn.BorderThickness = new Thickness(1);
-        _accessRestrictedBtn.Padding = new Thickness(10, 4, 10, 4); _accessRestrictedBtn.Template = FlatButtonTemplate();
+        _accessRestrictedBtn.Padding = new Thickness(12, 4, 12, 4); _accessRestrictedBtn.Template = FlatButtonTemplate();
         _accessRestrictedBtn.Margin = new Thickness(6, 0, 0, 0);
         _accessRestrictedBtn.ToolTip = L("下のリストのフォルダだけに操作を限定します。", "Limits operations to the folders listed below.");
         _accessRestrictedBtn.Click += delegate { SetAccessScope(true); };
@@ -5485,8 +5500,8 @@ class CockpitWindow : Window
         var addBtn = new Button();
         addBtn.Content = L("＋ フォルダを追加", "+ Add folder");
         addBtn.FontSize = 12; addBtn.Cursor = Cursors.Hand; addBtn.BorderThickness = new Thickness(1);
-        addBtn.Padding = new Thickness(10, 4, 10, 4); addBtn.HorizontalAlignment = HorizontalAlignment.Left;
-        addBtn.Margin = new Thickness(0, 4, 0, 10); addBtn.Template = FlatButtonTemplate();
+        addBtn.Padding = new Thickness(12, 4, 12, 4); addBtn.HorizontalAlignment = HorizontalAlignment.Left;
+        addBtn.Margin = new Thickness(0, 4, 0, 12); addBtn.Template = FlatButtonTemplate();
         addBtn.Background = BtnBg; addBtn.Foreground = Fg; addBtn.BorderBrush = Border;
         addBtn.Click += delegate { AddAccessFolder(); };
         wrap.Children.Add(addBtn);
@@ -5708,7 +5723,7 @@ class CockpitWindow : Window
         var allow = new Button();
         allow.Content = L("許可", "Allow");
         allow.FontSize = 11.5; allow.FontWeight = FontWeights.SemiBold; allow.Cursor = Cursors.Hand;
-        allow.BorderThickness = new Thickness(0); allow.Padding = new Thickness(10, 3, 10, 3);
+        allow.BorderThickness = new Thickness(0); allow.Padding = new Thickness(12, 3, 12, 3);
         // Filled green, matching what green means everywhere else in this list: allowed.
         allow.Template = FlatButtonTemplate(); allow.Background = Theme.Br(Theme.SuccessFill(_dark)); allow.Foreground = AccentFg;
         string capturedIp = ip;
@@ -5807,7 +5822,7 @@ class CockpitWindow : Window
         var wrap = new StackPanel();
         var subHead = new TextBlock(); subHead.Text = L("接続クライアント", "Connected clients");
         subHead.Foreground = Fg; subHead.FontSize = 12.5; subHead.FontWeight = FontWeights.SemiBold;
-        subHead.Margin = new Thickness(0, 10, 0, 4);
+        subHead.Margin = new Thickness(0, 12, 0, 4);
         wrap.Children.Add(subHead);
 
         var hint = new TextBlock();
@@ -6116,7 +6131,7 @@ class CockpitWindow : Window
         _approvalCenterBtn = new Button();
         _approvalCenterBtn.Cursor = Cursors.Hand;
         _approvalCenterBtn.BorderThickness = new Thickness(1);
-        _approvalCenterBtn.Padding = new Thickness(10, 3, 8, 3);
+        _approvalCenterBtn.Padding = new Thickness(12, 3, 8, 3);
         _approvalCenterBtn.Margin = new Thickness(0, 0, 12, 0);
         _approvalCenterBtn.VerticalAlignment = VerticalAlignment.Center;
         _approvalCenterBtn.Template = FlatButtonTemplate();
@@ -6207,7 +6222,7 @@ class CockpitWindow : Window
         _pauseBtn.ToolTip = _lang == 0 ? "新規ターン/タブを止めて凍結（再開で続行・状態は保持）" : "Freeze: no new turns/tabs (resume continues; state kept)";
         System.Windows.Automation.AutomationProperties.SetName(_pauseBtn, _lang == 0 ? "一時停止" : "Pause");
         _pauseBtn.Cursor = Cursors.Hand; _pauseBtn.BorderThickness = new Thickness(1);
-        _pauseBtn.Width = 32; _pauseBtn.Height = 32; _pauseBtn.Padding = new Thickness(0);
+        _pauseBtn.Width = 36; _pauseBtn.Height = HeaderCtrlH; _pauseBtn.Padding = new Thickness(0);
         _pauseBtn.Margin = new Thickness(0, 0, 8, 0);
         _pauseBtn.VerticalAlignment = VerticalAlignment.Center;
         // FlatButtonTemplate makes Background=BtnBg actually render (the default Aero template
@@ -6241,7 +6256,7 @@ class CockpitWindow : Window
         _stopBtn.ToolTip = _lang == 0 ? "全ワーカーを停止して走行を終了" : "Cancel every worker and end the run";
         System.Windows.Automation.AutomationProperties.SetName(_stopBtn, _lang == 0 ? "停止" : "Stop");
         _stopBtn.Cursor = Cursors.Hand; _stopBtn.BorderThickness = new Thickness(1);
-        _stopBtn.Width = 32; _stopBtn.Height = 32; _stopBtn.Padding = new Thickness(0);
+        _stopBtn.Width = 36; _stopBtn.Height = HeaderCtrlH; _stopBtn.Padding = new Thickness(0);
         _stopBtn.VerticalAlignment = VerticalAlignment.Center;
         // Same fix: FlatButtonTemplate so Background is honoured and the icon fill contrasts correctly.
         _stopBtn.Template = FlatButtonTemplate();
@@ -6498,8 +6513,8 @@ class CockpitWindow : Window
         _mtBanner.Visibility = Visibility.Collapsed;
         _mtBanner.CornerRadius = new CornerRadius(Theme.RadPopover);
         _mtBanner.BorderThickness = new Thickness(1);
-        _mtBanner.Padding = new Thickness(14, 9, 12, 9);
-        _mtBanner.Margin = new Thickness(26, 0, 18, 6);
+        _mtBanner.Padding = new Thickness(16, 8, 12, 8);
+        _mtBanner.Margin = new Thickness(24, 0, 16, 6);
         DockPanel.SetDock(_mtBanner, Dock.Top);
         var dp = new DockPanel();
         var btns = new StackPanel(); btns.Orientation = Orientation.Horizontal;
@@ -6561,8 +6576,8 @@ class CockpitWindow : Window
         _capBanner.Visibility = Visibility.Collapsed;
         _capBanner.CornerRadius = new CornerRadius(Theme.RadPopover);
         _capBanner.BorderThickness = new Thickness(1);
-        _capBanner.Padding = new Thickness(14, 9, 12, 9);
-        _capBanner.Margin = new Thickness(26, 0, 18, 6);
+        _capBanner.Padding = new Thickness(16, 8, 12, 8);
+        _capBanner.Margin = new Thickness(24, 0, 16, 6);
         DockPanel.SetDock(_capBanner, Dock.Top);
         var dp = new DockPanel();
         var btns = new StackPanel(); btns.Orientation = Orientation.Horizontal;
@@ -6830,10 +6845,10 @@ class CockpitWindow : Window
         // Uniform, not a thicker left edge: a one-sided stripe reads as sticky-note
         // decoration. The banner's border colour already carries the urgency.
         _gateBanner.BorderThickness = new Thickness(1);
-        _gateBanner.Padding = new Thickness(14, 10, 12, 10);
+        _gateBanner.Padding = new Thickness(16, 12, 12, 12);
         // 18px left gutter: the same one _pinnedToolbarHost and the card list use, so inside the
         // run column the banner shares its left edge with the cards it is about.
-        _gateBanner.Margin = new Thickness(18, 6, 18, 6);
+        _gateBanner.Margin = new Thickness(16, 6, 16, 6);
         DockPanel.SetDock(_gateBanner, Dock.Top);
         _gateCardsPanel = new StackPanel();
         // The banner is DOCKED, so it sits outside the card list's ScrollViewer -- the only
@@ -6916,7 +6931,7 @@ class CockpitWindow : Window
             gCard.BorderThickness = new Thickness(1);
             gCard.CornerRadius = new CornerRadius(Theme.RadSmall);
             gCard.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
-            gCard.Padding = new Thickness(10, 8, 10, 8);
+            gCard.Padding = new Thickness(12, 8, 12, 8);
             gCard.Margin = new Thickness(0, 0, 0, gi < showCount - 1 ? 8 : 0);
 
             var gInner = new StackPanel();
@@ -6951,7 +6966,7 @@ class CockpitWindow : Window
             var approveBtn = new Button();
             approveBtn.Cursor = Cursors.Hand;
             approveBtn.BorderThickness = new Thickness(0);
-            approveBtn.Padding = new Thickness(14, 4, 14, 4);
+            approveBtn.Padding = new Thickness(16, 4, 16, 4);
             approveBtn.FontWeight = FontWeights.SemiBold;
             approveBtn.FontSize = 12;
             approveBtn.Background = Theme.Br(Theme.AccentFill(_dark));
@@ -6978,7 +6993,7 @@ class CockpitWindow : Window
             var denyBtn = new Button();
             denyBtn.Cursor = Cursors.Hand;
             denyBtn.BorderThickness = new Thickness(1);
-            denyBtn.Padding = new Thickness(14, 4, 14, 4);
+            denyBtn.Padding = new Thickness(16, 4, 16, 4);
             denyBtn.FontSize = 12;
             denyBtn.Margin = new Thickness(8, 0, 0, 0);
             denyBtn.Background = Brushes.Transparent;
@@ -7052,7 +7067,7 @@ class CockpitWindow : Window
         var head = new Border();
         head.Background = CardBg; head.BorderBrush = Border;
         head.BorderThickness = new Thickness(0, 0, 0, 1);
-        head.Padding = new Thickness(24, 18, 24, 16);
+        head.Padding = new Thickness(24, 16, 24, 16);
         DockPanel.SetDock(head, Dock.Top);
         var headGrid = new Grid();
         headGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -7072,7 +7087,7 @@ class CockpitWindow : Window
         _approvalCenterSummary.Foreground = Theme.Br(Theme.Warning(_dark));
         _approvalCenterSummary.FontWeight = FontWeights.SemiBold;
         _approvalCenterSummary.VerticalAlignment = VerticalAlignment.Center;
-        _approvalCenterSummary.Margin = new Thickness(18, 0, 0, 0);
+        _approvalCenterSummary.Margin = new Thickness(16, 0, 0, 0);
         Grid.SetColumn(_approvalCenterSummary, 1); headGrid.Children.Add(_approvalCenterSummary);
         head.Child = headGrid; root.Children.Add(head);
 
@@ -7083,13 +7098,13 @@ class CockpitWindow : Window
         var pendingTitle = new TextBlock();
         pendingTitle.Text = _lang == 0 ? "判断が必要" : "Needs your decision";
         pendingTitle.Foreground = Fg; pendingTitle.FontSize = 14; pendingTitle.FontWeight = FontWeights.SemiBold;
-        pendingTitle.Margin = new Thickness(0, 0, 0, 10); body.Children.Add(pendingTitle);
+        pendingTitle.Margin = new Thickness(0, 0, 0, 12); body.Children.Add(pendingTitle);
         _approvalPendingHost = new StackPanel(); body.Children.Add(_approvalPendingHost);
 
         var recentTitle = new TextBlock();
         recentTitle.Text = _lang == 0 ? "最近の判断" : "Recent decisions";
         recentTitle.Foreground = Fg; recentTitle.FontSize = 14; recentTitle.FontWeight = FontWeights.SemiBold;
-        recentTitle.Margin = new Thickness(0, 24, 0, 10); body.Children.Add(recentTitle);
+        recentTitle.Margin = new Thickness(0, 24, 0, 12); body.Children.Add(recentTitle);
         _approvalRecentHost = new StackPanel(); body.Children.Add(_approvalRecentHost);
         scroll.Content = body; root.Children.Add(scroll);
         w.Content = root;
@@ -7102,7 +7117,7 @@ class CockpitWindow : Window
     {
         var box = new Border(); box.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
         box.BorderBrush = Border; box.BorderThickness = new Thickness(1);
-        box.CornerRadius = new CornerRadius(Theme.RadCard); box.Padding = new Thickness(14, 12, 14, 12);
+        box.CornerRadius = new CornerRadius(Theme.RadCard); box.Padding = new Thickness(16, 12, 16, 12);
         box.Margin = new Thickness(0, 0, 0, 20);
         var col = new StackPanel();
         var title = new TextBlock(); title.Text = _lang == 0 ? "操作承認ポリシー" : "Operation approval policy";
@@ -7116,7 +7131,7 @@ class CockpitWindow : Window
         col.Children.Add(note);
 
         var selector = new ComboBox(); selector.MinWidth = 230; selector.HorizontalAlignment = HorizontalAlignment.Left;
-        selector.Margin = new Thickness(0, 10, 0, 0); selector.Background = CardBg; selector.Foreground = Fg;
+        selector.Margin = new Thickness(0, 12, 0, 0); selector.Background = CardBg; selector.Foreground = Fg;
         var labels = _lang == 0
             ? new string[] { "確認（推奨）", "自動", "バイパス" }
             : new string[] { "Confirm (recommended)", "Auto", "Bypass" };
@@ -7205,7 +7220,7 @@ class CockpitWindow : Window
         {
             var empty = new Border(); empty.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
             empty.BorderBrush = Border; empty.BorderThickness = new Thickness(1);
-            empty.CornerRadius = new CornerRadius(Theme.RadCard); empty.Padding = new Thickness(16, 18, 16, 18);
+            empty.CornerRadius = new CornerRadius(Theme.RadCard); empty.Padding = new Thickness(16, 16, 16, 16);
             var text = new TextBlock();
             text.Text = _lang == 0 ? "未処理の承認はありません。" : "No approvals are waiting.";
             text.Foreground = Muted; text.FontSize = 13; empty.Child = text;
@@ -7231,8 +7246,8 @@ class CockpitWindow : Window
         // Actionable cards are marked by border COLOUR, not by a fatter left edge --
         // a one-sided stripe reads as sticky-note decoration.
         card.BorderThickness = new Thickness(1);
-        card.CornerRadius = new CornerRadius(Theme.RadCard); card.Padding = new Thickness(14, 12, 14, 12);
-        card.Margin = new Thickness(0, 0, 0, 10);
+        card.CornerRadius = new CornerRadius(Theme.RadCard); card.Padding = new Thickness(16, 12, 16, 12);
+        card.Margin = new Thickness(0, 0, 0, 12);
         var col = new StackPanel();
 
         var meta = new DockPanel(); meta.LastChildFill = true;
@@ -7262,7 +7277,7 @@ class CockpitWindow : Window
             details.IsExpanded = actionable && (GateNeedsSecondConfirmation(gate) || GateKind(gate) == "Skill");
             var detailText = new TextBlock(); detailText.Text = context; detailText.Foreground = Muted;
             detailText.FontFamily = new FontFamily("Cascadia Mono, Consolas"); detailText.FontSize = 11;
-            detailText.TextWrapping = TextWrapping.Wrap; detailText.Margin = new Thickness(10, 6, 0, 0);
+            detailText.TextWrapping = TextWrapping.Wrap; detailText.Margin = new Thickness(12, 6, 0, 0);
             details.Content = detailText; col.Children.Add(details);
         }
 
@@ -7270,7 +7285,7 @@ class CockpitWindow : Window
         {
             var row = new StackPanel(); row.Orientation = Orientation.Horizontal; row.Margin = new Thickness(0, 12, 0, 0);
             var approve = new Button(); approve.Content = _lang == 0 ? "承認" : "Approve";
-            approve.Cursor = Cursors.Hand; approve.Padding = new Thickness(18, 6, 18, 6);
+            approve.Cursor = Cursors.Hand; approve.Padding = new Thickness(16, 6, 16, 6);
             approve.BorderThickness = new Thickness(0); approve.Background = AccentFill; approve.Foreground = AccentFg;
             approve.FontWeight = FontWeights.SemiBold; approve.IsEnabled = !expired;
             System.Windows.Automation.AutomationProperties.SetName(approve, _lang == 0 ? "この操作を承認" : "Approve this operation");
@@ -7289,7 +7304,7 @@ class CockpitWindow : Window
             row.Children.Add(approve);
 
             var deny = new Button(); deny.Content = _lang == 0 ? "拒否" : "Deny";
-            deny.Cursor = Cursors.Hand; deny.Padding = new Thickness(18, 6, 18, 6);
+            deny.Cursor = Cursors.Hand; deny.Padding = new Thickness(16, 6, 16, 6);
             deny.Margin = new Thickness(8, 0, 0, 0); deny.Background = Brushes.Transparent;
             deny.Foreground = Theme.Br(Theme.Danger(_dark)); deny.BorderBrush = Theme.Br(Theme.Danger(_dark));
             deny.BorderThickness = new Thickness(1);
@@ -7406,10 +7421,22 @@ class CockpitWindow : Window
     {
         return IconButton(glyph, size, "");
     }
+    //: One height for every control in the header strip. Measured on screen before this
+    //: existed: the icon buttons were 30 tall, pause and stop 26, the dropdowns 22 and the
+    //: approval chip 20 -- four heights in one 400px row, each vertically centred, so no two
+    //: of them shared a top or a bottom edge with anything.
+    internal const double HeaderCtrlH = 30;
+
     Button IconButton(string glyph, double size, string autoName)
     {
-        var b = new Button(); b.Width = 36; b.Height = 30; b.Cursor = Cursors.Hand;
+        var b = new Button(); b.Width = 36; b.Height = HeaderCtrlH; b.Cursor = Cursors.Hand;
         b.BorderThickness = new Thickness(1); b.Margin = new Thickness(4, 0, 0, 0);
+        // THE SAME BOX AS THE ONES BESIDE THEM. These four ran on the stock Aero template, which
+        // draws square corners, while pause and stop next door use FlatButtonTemplate and are
+        // rounded to RadSmall -- six buttons in one strip, two different shapes, and once their
+        // heights were made to match the difference was all that was left to notice.
+        b.Template = FlatButtonTemplate();
+        b.Background = BtnBg; b.BorderBrush = Border;
         b.Content = MakeIcon(glyph, size, Fg); b.Tag = glyph;
         if (!string.IsNullOrEmpty(autoName))
             System.Windows.Automation.AutomationProperties.SetName(b, autoName);
@@ -7971,11 +7998,22 @@ class CockpitWindow : Window
                 else if (staleAge2 > STALE_SOFT)
                     _subChips.Children.Add(ChipMargin(Pill(T("stale_wait"), "warning")));
             }
-            if (!string.IsNullOrEmpty(freshness))
-                _subChips.Children.Add(ChipMargin(Pill(freshness.TrimStart(' ', '·'), "neutral")));
-            _subChips.Children.Add(ChipMargin(Pill(T("elapsed") + " " + Fmt(elapsed), "neutral")));
-            if (!string.IsNullOrEmpty(eta))
-                _subChips.Children.Add(ChipMargin(Pill(eta.Trim(), "neutral")));
+            // NOT CHIPS. A chip in this app means a state something is IN -- running, done,
+            // needs attention -- and these three are clocks. Drawn in the same outlined pill as
+            // the counts they were indistinguishable from them, so "0 needs attention" and
+            // "elapsed 8m16s" arrived with equal weight and the row read as six alarms. They are
+            // background facts; background facts are text.
+            var meta = new List<string>();
+            if (!string.IsNullOrEmpty(freshness)) meta.Add(freshness.TrimStart(' ', '·'));
+            meta.Add(T("elapsed") + " " + Fmt(elapsed));
+            if (!string.IsNullOrEmpty(eta)) meta.Add(eta.Trim());
+            var metaTb = new TextBlock();
+            metaTb.Text = string.Join("  ·  ", meta.ToArray());
+            metaTb.Foreground = Theme.Br(Theme.Faint(_dark));
+            metaTb.FontSize = 11;
+            metaTb.VerticalAlignment = VerticalAlignment.Center;
+            metaTb.Margin = new Thickness(4, 0, 0, 0);
+            _subChips.Children.Add(metaTb);
             _subChips.ToolTip = _sub.Text;   // same fallback sentence, shown on hover over the chip row
         }
     }
@@ -8301,7 +8339,7 @@ class CockpitWindow : Window
     {
         return new TextBlock {
             Text = label, Foreground = Muted, FontSize = 11.5, FontWeight = FontWeights.SemiBold,
-            Margin = new Thickness(12, 10, 8, 2) };
+            Margin = new Thickness(12, 12, 8, 2) };
     }
 
     // Build one row model and freeze its render signature (so SetRows can diff old-vs-new rows
@@ -8525,7 +8563,7 @@ class CockpitWindow : Window
                               : "Run several tasks in parallel, then monitor progress here.",
             Foreground = Muted, FontSize = 12.5, TextWrapping = TextWrapping.Wrap,
             TextAlignment = TextAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center,
-            Margin = new Thickness(0, 0, 0, 18) });
+            Margin = new Thickness(0, 0, 0, 16) });
 
         string[] suggestions = _lang == 0
             ? new string[] { "失敗テストを修正", "UIの問題をレビュー", "READMEを更新", "フォルダのタスクを実行" }
@@ -8564,7 +8602,7 @@ class CockpitWindow : Window
         var row = new Border {
             BorderThickness = new Thickness(1), BorderBrush = Border, Background = BtnBg,
             CornerRadius = new CornerRadius(Theme.RadCard),
-            Padding = new Thickness(14, 8, 14, 8), Margin = new Thickness(8, 8, 8, 4) };
+            Padding = new Thickness(16, 8, 16, 8), Margin = new Thickness(8, 8, 8, 4) };
         var dp = new DockPanel { LastChildFill = true };
 
         // This banner is advisory, not a blocking error. Let the user dismiss this exact stale
@@ -8651,7 +8689,7 @@ class CockpitWindow : Window
         string metaLine = _directiveBandMeta;
 
         var outer = new Border();
-        outer.Margin = new Thickness(18, 0, 18, 0);
+        outer.Margin = new Thickness(16, 0, 16, 0);
         outer.Padding = new Thickness(0, 8, 0, 0);
         outer.BorderThickness = new Thickness(0, 0, 0, 1);
         outer.BorderBrush = Theme.Br(Theme.Border(_dark));
@@ -8780,7 +8818,7 @@ class CockpitWindow : Window
             retryAll.BorderThickness = new Thickness(1); retryAll.BorderBrush = Theme.Br(Theme.BorderStrong(_dark));
             retryAll.Padding = new Thickness(12, 4, 12, 4); retryAll.Cursor = Cursors.Hand;
             retryAll.FontSize = 12; retryAll.FontWeight = FontWeights.SemiBold;
-            retryAll.Margin = new Thickness(10, 0, 0, 0);
+            retryAll.Margin = new Thickness(12, 0, 0, 0);
             retryAll.VerticalAlignment = VerticalAlignment.Center;
             List<Dictionary<string, object>> shownCap = shown;
             retryAll.Click += delegate
@@ -8833,14 +8871,14 @@ class CockpitWindow : Window
             summary.Foreground = Theme.Br(Theme.Danger(_dark)); summary.FontSize = 12;
             summary.FontWeight = FontWeights.SemiBold;
             summary.VerticalAlignment = VerticalAlignment.Center;
-            summary.Margin = new Thickness(14, 0, 0, 0);
+            summary.Margin = new Thickness(16, 0, 0, 0);
             left.Children.Add(summary);
         }
 
         _toolbarNote = new TextBlock();
         _toolbarNote.Foreground = Muted; _toolbarNote.FontSize = 11.5;
         _toolbarNote.VerticalAlignment = VerticalAlignment.Center;
-        _toolbarNote.Margin = new Thickness(14, 0, 0, 0);
+        _toolbarNote.Margin = new Thickness(16, 0, 0, 0);
         left.Children.Add(_toolbarNote);
 
         dp.Children.Add(left);
@@ -8914,7 +8952,7 @@ class CockpitWindow : Window
     {
         var b = new Button();
         b.Content = label; b.Cursor = Cursors.Hand; b.FontSize = 12;
-        b.Padding = new Thickness(10, 5, 10, 5);
+        b.Padding = new Thickness(12, 5, 12, 5);
         b.BorderThickness = new Thickness(0);   // no individual border -- container holds the border
         bool active = _cardFilter == val;
         CornerRadius cr = new CornerRadius(
@@ -9060,12 +9098,12 @@ class CockpitWindow : Window
     UIElement HistoryHeader()
     {
         var head = new DockPanel();
-        head.Margin = new Thickness(8, 18, 8, 4);
+        head.Margin = new Thickness(8, 16, 8, 4);
         var clear = new Button();
         clear.Content = T("clear_history") + " (" + _history.Count + ")";
         clear.Cursor = Cursors.Hand; clear.BorderThickness = new Thickness(1);
         clear.Background = BtnBg; clear.Foreground = Fg; clear.BorderBrush = Border;
-        clear.Padding = new Thickness(10, 2, 10, 2); clear.FontSize = 12;
+        clear.Padding = new Thickness(12, 2, 12, 2); clear.FontSize = 12;
         clear.Click += delegate { ClearHistory(); };
         DockPanel.SetDock(clear, Dock.Right);
         head.Children.Add(clear);
@@ -9082,7 +9120,9 @@ class CockpitWindow : Window
             _histSearchBox.VerticalContentAlignment = VerticalAlignment.Center;
             _histSearchBox.BorderThickness = new Thickness(1);
             _histSearchBox.ToolTip = T("hist_search");
-            _histSearchBox.TextChanged += delegate { OnHistSearchChanged(); };
+            _histSearchBox.TextChanged += delegate { OnHistSearchChanged(); PaintHistHint(); };
+            _histSearchBox.GotKeyboardFocus += delegate { PaintHistHint(); };
+            _histSearchBox.LostKeyboardFocus += delegate { PaintHistHint(); };
         }
         _histSearchBox.Background = BtnBg; _histSearchBox.Foreground = Fg; _histSearchBox.BorderBrush = Border;
         // The box is cached so focus and caret survive a re-filter, but the wrapper around it is
@@ -9091,17 +9131,66 @@ class CockpitWindow : Window
         // to a second Border throws InvalidOperationException. That escapes through a binding
         // converter, where nothing catches it, and WPF aborts the process -- the cockpit was
         // dying mid-run. Disconnect from the previous wrapper first.
-        var prevWrap = LogicalTreeHelper.GetParent(_histSearchBox) as Decorator;
-        if (prevWrap != null) prevWrap.Child = null;
-        var searchWrap = new Border { Child = _histSearchBox, Margin = new Thickness(8, 0, 8, 0) };
+        // BOTH KINDS OF PARENT. The box used to sit directly in a Border, so a Decorator cast
+        // found it; it now sits in a Grid alongside its placeholder, and a Decorator cast returns
+        // null for a Panel -- which would put the crash this guard exists to prevent straight
+        // back. Detaching from whichever it is keeps the guard honest as the tree changes.
+        var prevDec = LogicalTreeHelper.GetParent(_histSearchBox) as Decorator;
+        if (prevDec != null) prevDec.Child = null;
+        var prevPanel = LogicalTreeHelper.GetParent(_histSearchBox) as Panel;
+        if (prevPanel != null) prevPanel.Children.Remove(_histSearchBox);
+        // A TEXTBOX WITH NOTHING IN IT IS NOT A CONTROL, IT IS A RECTANGLE. This one had a
+        // tooltip and nothing else -- no label, no placeholder, no icon -- so on the screen it
+        // read as a box that had failed to draw. WPF has no placeholder, so the standard shape
+        // is a hint drawn behind the text and hidden the moment there is any.
+        if (_histHint == null)
+        {
+            _histHint = new TextBlock();
+            _histHint.FontSize = 12;
+            _histHint.IsHitTestVisible = false;
+            _histHint.VerticalAlignment = VerticalAlignment.Center;
+            _histHint.Margin = new Thickness(8, 0, 0, 0);
+        }
+        _histHint.Text = _lang == 0 ? "絞り込み" : "Filter";
+        _histHint.Foreground = Theme.Br(Theme.Faint(_dark));
+        var hintHost = LogicalTreeHelper.GetParent(_histHint) as Panel;
+        if (hintHost != null) hintHost.Children.Remove(_histHint);
+
+        var searchStack = new Grid();
+        searchStack.Children.Add(_histSearchBox);
+        searchStack.Children.Add(_histHint);
+        var searchWrap = new Border { Child = searchStack, Margin = new Thickness(8, 0, 8, 0) };
         DockPanel.SetDock(searchWrap, Dock.Right);
         head.Children.Add(searchWrap);
+        PaintHistHint();
 
+        // A HEADING AND ITS HELP TEXT, NOT ONE SENTENCE IN ONE WEIGHT. What this section IS and
+        // how it BEHAVES were set in the same 12.5px muted grey, so the eye had to read the whole
+        // line to find the one word that names the section.
         var ht = new TextBlock();
-        ht.Text = (_lang == 0 ? "履歴 — クリアするまで蓄積（クリックで会話を表示）" : "History — stacks until cleared (click to open)");
-        ht.Foreground = Muted; ht.FontSize = 12.5; ht.VerticalAlignment = VerticalAlignment.Center;
+        ht.VerticalAlignment = VerticalAlignment.Center;
+        var htName = new System.Windows.Documents.Run(_lang == 0 ? "履歴" : "History");
+        htName.FontWeight = FontWeights.SemiBold;
+        htName.Foreground = Fg;
+        ht.Inlines.Add(htName);
+        var htNote = new System.Windows.Documents.Run(_lang == 0
+            ? "  クリアするまで蓄積、クリックで会話を表示"
+            : "  stacks until cleared, click to open");
+        htNote.Foreground = Theme.Br(Theme.Faint(_dark));
+        ht.Inlines.Add(htNote);
+        ht.FontSize = 12.5;
         head.Children.Add(ht);
         return head;
+    }
+
+    // Show the hint only while the box is genuinely empty. Not tied to focus alone: a focused
+    // empty box still needs to say what it filters, and a box with text in it must not have a
+    // second string underneath.
+    void PaintHistHint()
+    {
+        if (_histHint == null) return;
+        bool empty = _histSearchBox == null || string.IsNullOrEmpty(_histSearchBox.Text);
+        _histHint.Visibility = empty ? Visibility.Visible : Visibility.Collapsed;
     }
 
     // Debounced history-search handler: stash the query, then (re)arm a ~300ms one-shot timer that
@@ -9134,7 +9223,7 @@ class CockpitWindow : Window
         all.Content = T("all_to_history");
         all.Cursor = Cursors.Hand; all.BorderThickness = new Thickness(1);
         all.Background = BtnBg; all.Foreground = Fg; all.BorderBrush = Border;
-        all.Padding = new Thickness(10, 2, 10, 2); all.FontSize = 12;
+        all.Padding = new Thickness(12, 2, 12, 2); all.FontSize = 12;
         all.ToolTip = _lang == 0 ? "完了をすべて履歴へ移動" : "Move all completed to history";
         all.Click += delegate { ArchiveAllTerminal(); };
         DockPanel.SetDock(all, Dock.Right);
@@ -9162,7 +9251,7 @@ class CockpitWindow : Window
         row.BorderThickness = new Thickness(1);
         row.BorderBrush = Border; row.Background = CardBg;
         row.CornerRadius = new CornerRadius(Theme.RadCard);
-        row.Padding = new Thickness(14, 8, 14, 8); row.Margin = new Thickness(8, 3, 8, 3);
+        row.Padding = new Thickness(16, 8, 16, 8); row.Margin = new Thickness(8, 3, 8, 3);
 
         var col = new StackPanel();
         var dp = new DockPanel();
@@ -9219,7 +9308,7 @@ class CockpitWindow : Window
             contBtn.Content = _lang == 0 ? "続ける" : "Continue";
             contBtn.Cursor = Cursors.Hand;
             contBtn.FontSize = 12;
-            contBtn.Padding = new Thickness(10, 3, 10, 3);
+            contBtn.Padding = new Thickness(12, 3, 12, 3);
             contBtn.Margin = new Thickness(0, 6, 0, 0);
             contBtn.HorizontalAlignment = HorizontalAlignment.Right;
             contBtn.BorderThickness = new Thickness(1);
@@ -9297,7 +9386,7 @@ class CockpitWindow : Window
         b.Content = label;
         b.Cursor = Cursors.Hand;
         b.FontSize = 12;
-        b.Padding = new Thickness(10, 3, 10, 3);
+        b.Padding = new Thickness(12, 3, 12, 3);
         b.Margin = new Thickness(0, 0, 6, 0);
         b.BorderThickness = new Thickness(1);
         b.Background = Brushes.Transparent;
@@ -9812,7 +9901,7 @@ class CockpitWindow : Window
         string[] labels = _lang == 0 ? new string[] { "概要", "会話", "レビュー", "ログ" }
                                       : new string[] { "Overview", "Conversation", "Review", "Logs" };
 
-        var strip = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 10) };
+        var strip = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 12) };
         var txts = new TextBlock[4];
         var unders = new Border[4];
         for (int i = 0; i < 4; i++)
@@ -9857,7 +9946,7 @@ class CockpitWindow : Window
     TextBlock SectLabel(string s)
     {
         return new TextBlock { Text = s, Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 11.5,
-                               FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 10, 0, 4) };
+                               FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 12, 0, 4) };
     }
 
     // ── P1 ARTIFACT LINKS ───────────────────────────────────────────────────────
@@ -10297,7 +10386,7 @@ class CockpitWindow : Window
         sb.Append("  turn=").Append(S(w, "turn")).Append("  verify_attempts=").Append(S(w, "verify_attempts"));
         sb.Append("  verified=").Append(S(w, "verified")).Append('\n');
         if (!string.IsNullOrEmpty(reason)) sb.Append("\nreason:\n").Append(reason).Append('\n');
-        var box = new Border { Background = QuoteBg, CornerRadius = new CornerRadius(Theme.RadCard), Padding = new Thickness(12, 10, 12, 10) };
+        var box = new Border { Background = QuoteBg, CornerRadius = new CornerRadius(Theme.RadCard), Padding = new Thickness(12, 12, 12, 12) };
         var t = RoText(sb.ToString(), Muted, 12);
         t.FontFamily = new FontFamily(Theme.CodeFont);
         t.MaxHeight = 220;
@@ -10332,7 +10421,7 @@ class CockpitWindow : Window
         {
             bool user = t.Item1 == "U";
             var b = new Border { Background = QuoteBg, CornerRadius = new CornerRadius(Theme.RadSmall),
-                                 Padding = new Thickness(10, 7, 10, 7), Margin = new Thickness(0, 0, 0, 5) };
+                                 Padding = new Thickness(12, 7, 12, 7), Margin = new Thickness(0, 0, 0, 5) };
             var sp = new StackPanel();
             var who = new TextBlock { Text = user ? (_lang == 0 ? "指示 / あなた" : "Instruction / You") : (_lang == 0 ? "エージェント" : "Agent"), FontSize = 11,
                                       FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 3) };
@@ -10489,7 +10578,7 @@ class CockpitWindow : Window
     UIElement SteerRow(string name)
     {
         var outer = new StackPanel();
-        outer.Margin = new Thickness(0, 10, 0, 0);
+        outer.Margin = new Thickness(0, 12, 0, 0);
         // clicks inside this row must not bubble to the card's open-conversation handler
         outer.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; };
 
@@ -10499,7 +10588,7 @@ class CockpitWindow : Window
         composerBorder.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
         composerBorder.BorderBrush = Border;
         composerBorder.BorderThickness = new Thickness(1);
-        composerBorder.Padding = new Thickness(10, 8, 10, 8);
+        composerBorder.Padding = new Thickness(12, 8, 12, 8);
 
         var dp = new DockPanel();
 
@@ -10582,7 +10671,7 @@ class CockpitWindow : Window
     UIElement ContinueRow(string name, string goal, string conv)
     {
         var outer = new StackPanel();
-        outer.Margin = new Thickness(0, 10, 0, 0);
+        outer.Margin = new Thickness(0, 12, 0, 0);
         outer.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; };
 
         var composerBorder = new Border();
@@ -10590,7 +10679,7 @@ class CockpitWindow : Window
         composerBorder.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
         composerBorder.BorderBrush = Border;
         composerBorder.BorderThickness = new Thickness(1);
-        composerBorder.Padding = new Thickness(10, 8, 10, 8);
+        composerBorder.Padding = new Thickness(12, 8, 12, 8);
 
         var dp = new DockPanel();
 
@@ -10686,7 +10775,7 @@ class CockpitWindow : Window
     UIElement RetryRow(Dictionary<string, object> w)
     {
         var dp = new DockPanel();
-        dp.Margin = new Thickness(0, 10, 0, 0);
+        dp.Margin = new Thickness(0, 12, 0, 0);
         dp.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; };
         var note = new TextBlock();
         note.FontSize = 11.5; note.Foreground = Muted;

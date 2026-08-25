@@ -130,11 +130,17 @@ def test_cached_history_search_box_is_detached_before_re_parenting():
     because the call sits inside a binding converter nothing catches it -- WPF
     aborted the process and the cockpit died mid-run (three times in one session).
     """
+    # BOTH parent kinds. The box moved from a bare Border into a Grid (it shares a cell with its
+    # placeholder now), and a Decorator cast returns null for a Panel -- so checking only the
+    # Decorator path would have gone on passing while the crash came back.
     assert "LogicalTreeHelper.GetParent(_histSearchBox) as Decorator" in SOURCE
-    assert "if (prevWrap != null) prevWrap.Child = null;" in SOURCE
+    assert "LogicalTreeHelper.GetParent(_histSearchBox) as Panel" in SOURCE
+    assert "prevDec.Child = null;" in SOURCE
+    assert "prevPanel.Children.Remove(_histSearchBox);" in SOURCE
     # The detach must come before the new wrapper is built, not after.
-    detach = SOURCE.index("prevWrap.Child = null;")
-    rewrap = SOURCE.index("new Border { Child = _histSearchBox")
+    detach = max(SOURCE.index("prevDec.Child = null;"),
+                 SOURCE.index("prevPanel.Children.Remove(_histSearchBox);"))
+    rewrap = SOURCE.index("searchStack.Children.Add(_histSearchBox);")
     assert detach < rewrap
 
 
@@ -158,6 +164,10 @@ def test_gate_banner_lives_in_the_run_column_not_across_the_window():
     frame instead of lining up with the cards it refers to."""
     assert "col1.Children.Add(BuildGateBanner());" in SOURCE
     assert "root.Children.Add(BuildGateBanner());" not in SOURCE
-    # ...on the same 18px gutter the toolbar host and the card list use.
-    assert "_gateBanner.Margin = new Thickness(18, 6, 18, 6);" in SOURCE
-    assert "_pinnedToolbarHost.Padding = new Thickness(18, 6, 18, 0);" in SOURCE
+    # ...on the SAME gutter the card list uses -- compared against each other rather than against
+    # a number typed here, because the number is what went stale when the spacing scale landed
+    # while the property the test exists to protect (they line up) was never in danger.
+    import re as _re
+    gutter = _re.search(r"_list\.Padding = new Thickness\((\d+),", SOURCE).group(1)
+    assert ("_gateBanner.Margin = new Thickness(%s, 6, %s, 6);" % (gutter, gutter)) in SOURCE
+    assert ("_pinnedToolbarHost.Padding = new Thickness(%s, 6, %s, 0);" % (gutter, gutter)) in SOURCE

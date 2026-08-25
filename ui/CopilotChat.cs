@@ -247,7 +247,7 @@ class ChatWindow : Window
         side.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         SetRef(side, BackgroundProperty, "PanelAlt");
 
-        var headerStack = new StackPanel { Margin = new Thickness(12, 14, 12, 8) };
+        var headerStack = new StackPanel { Margin = new Thickness(12, 16, 12, 8) };
         _newBtn = Btn(T("newchat_btn"), "PanelAlt", "Muted", true);
         _newBtn.Height = 40; _newBtn.Margin = new Thickness(0, 0, 0, 6); _newBtn.FontWeight = FontWeights.Normal;
         _newBtn.Click += delegate { NewChat(); };
@@ -269,7 +269,7 @@ class ChatWindow : Window
         //                self-improve glyph — avoid collision)
         //   • language = translate
         //   • theme    = light_mode/dark_mode, swapped by state (shows the mode you'd switch TO)
-        var bottom = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(8, 8, 8, 10) };
+        var bottom = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(8, 8, 8, 12) };
         _cockpitBtn = IconButton("grid_view", 18, T("tip_cockpit"));
         _cockpitBtn.Click += delegate { OpenCockpit(); };
         _langBtn = IconButton("translate", 18, T("tip_lang"));
@@ -325,7 +325,7 @@ class ChatWindow : Window
         var dotHit = new Border
         {
             Child = _statusDot, Background = Brushes.Transparent,
-            Padding = new Thickness(0, 3, 9, 3), Margin = new Thickness(0, 1, 0, 0),
+            Padding = new Thickness(0, 3, 8, 3), Margin = new Thickness(0, 1, 0, 0),
             Cursor = Cursors.Hand, VerticalAlignment = VerticalAlignment.Center,
             ToolTip = T("dot_click_tip")
         };
@@ -348,7 +348,7 @@ class ChatWindow : Window
         var settingsBtn = Btn("", "PanelAlt", "Muted", true);
         // U+2699 GEAR was standing in for the settings icon that this app already carries.
         settingsBtn.Content = MakeIcon("settings", 18);
-        settingsBtn.Padding = new Thickness(10, 3, 10, 3); settingsBtn.FontSize = 13;
+        settingsBtn.Padding = new Thickness(12, 3, 12, 3); settingsBtn.FontSize = 13;
         settingsBtn.ToolTip = _lang == 0 ? "Fleet / コックピットを開く" : "Open Fleet / Cockpit";
         settingsBtn.Click += delegate { OpenCockpit(); };
         headRight.Children.Add(settingsBtn);
@@ -358,7 +358,7 @@ class ChatWindow : Window
         _fleetChip = new Border
         {
             Child = _fleetChipLabel, BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(Theme.RadSmall), Padding = new Thickness(10, 3, 10, 3),
+            CornerRadius = new CornerRadius(Theme.RadSmall), Padding = new Thickness(12, 3, 12, 3),
             Margin = new Thickness(0, 0, 8, 0), Cursor = Cursors.Hand,
             Visibility = Visibility.Collapsed
         };
@@ -434,7 +434,7 @@ class ChatWindow : Window
         BuildCmdPopup();
         // Footer row: left = "/" affordance, right = Send button.
         _send = Btn(T("send"), "AccentFill", "AccentFg", false);
-        _send.Height = 32; _send.Padding = new Thickness(14, 0, 14, 0);
+        _send.Height = 32; _send.Padding = new Thickness(16, 0, 16, 0);
         _send.FontWeight = FontWeights.SemiBold;
         _send.Click += delegate
         {
@@ -500,7 +500,7 @@ class ChatWindow : Window
             // compensates with a matching -1 padding so ActualHeight never moves.
             BorderThickness = new Thickness(1),
             Padding = new Thickness(12, 6, 12, 6),
-            Margin = new Thickness(0, 10, 0, 16),
+            Margin = new Thickness(0, 12, 0, 16),
             HorizontalAlignment = HorizontalAlignment.Stretch,
             Effect = new System.Windows.Media.Effects.DropShadowEffect
             {
@@ -534,7 +534,7 @@ class ChatWindow : Window
         {
             Visibility = Visibility.Collapsed, VerticalAlignment = VerticalAlignment.Top,
             Margin = new Thickness(24, 12, 24, 0), CornerRadius = new CornerRadius(Theme.RadBubble),
-            BorderThickness = new Thickness(1), Padding = new Thickness(16, 13, 16, 15),
+            BorderThickness = new Thickness(1), Padding = new Thickness(16, 12, 16, 16),
             MaxWidth = 560, HorizontalAlignment = HorizontalAlignment.Center
         };
         SetRef(_banner, BackgroundProperty, "Panel"); SetRef(_banner, Border.BorderBrushProperty, "Accent");
@@ -1186,7 +1186,7 @@ class ChatWindow : Window
             _conv = c;
             if (historyScraped) _pageConv = c;   // bridge page was navigated here by /history; else leave _pageConv as-is
             _messages.Children.Clear();
-            var note = new TextBlock { Text = T("fleetview_note"), TextWrapping = TextWrapping.Wrap, FontSize = 12.5, Margin = new Thickness(2, 2, 2, 10) };
+            var note = new TextBlock { Text = T("fleetview_note"), TextWrapping = TextWrapping.Wrap, FontSize = 12.5, Margin = new Thickness(2, 2, 2, 12) };
             SetRef(note, TextBlock.ForegroundProperty, "Muted");
             _messages.Children.Add(note);
             if (wkr != null) { string t = FleetTitle(wkr); if (!string.IsNullOrEmpty(t)) c.Title = t; }
@@ -1274,7 +1274,7 @@ class ChatWindow : Window
         var w = ReadFleetWorker(_activeFleetUrl);
         if (w == null) return;
         _messages.Children.Clear();
-        var note = new TextBlock { Text = T("fleetview_note"), TextWrapping = TextWrapping.Wrap, FontSize = 12.5, Margin = new Thickness(2, 2, 2, 10) };
+        var note = new TextBlock { Text = T("fleetview_note"), TextWrapping = TextWrapping.Wrap, FontSize = 12.5, Margin = new Thickness(2, 2, 2, 12) };
         SetRef(note, TextBlock.ForegroundProperty, "Muted");
         _messages.Children.Add(note);
         // If this worker has a persisted transcript, re-render the WHOLE conversation from disk
@@ -1374,7 +1374,7 @@ class ChatWindow : Window
             Child = _fleetStripBody,
             CornerRadius = new CornerRadius(Theme.RadCard),
             BorderThickness = new Thickness(1),
-            Padding = new Thickness(10, 4, 10, 4),
+            Padding = new Thickness(12, 4, 12, 4),
             Margin = new Thickness(0, 0, 0, 6),
             Visibility = Visibility.Collapsed
         };
@@ -1861,12 +1861,12 @@ class ChatWindow : Window
         var head = new TextBlock
         {
             Text = message, FontWeight = FontWeights.SemiBold, FontSize = 13,
-            TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 10)
+            TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 12)
         };
         SetRef(head, TextBlock.ForegroundProperty, "Fg");
         _bannerBody.Children.Add(head);
         var open = Btn(buttonLabel, "AccentFill", "AccentFg", false);
-        open.Height = 30; open.Padding = new Thickness(14, 0, 14, 0); open.FontWeight = FontWeights.SemiBold;
+        open.Height = 30; open.Padding = new Thickness(16, 0, 16, 0); open.FontWeight = FontWeights.SemiBold;
         open.HorizontalAlignment = HorizontalAlignment.Left;
         open.Click += delegate { onClick(); };
         _bannerBody.Children.Add(open);
@@ -1895,7 +1895,7 @@ class ChatWindow : Window
         {
             SetRef(_composerBorder, Border.BorderBrushProperty, "Accent");
             _composerBorder.BorderThickness = new Thickness(2);
-            _composerBorder.Padding = new Thickness(11, 5, 11, 5);
+            _composerBorder.Padding = new Thickness(12, 5, 12, 5);
         }
         else if (state == "focus")
         {
@@ -2373,7 +2373,7 @@ class ChatWindow : Window
         var btn = new Button
         {
             Content = tb, HorizontalContentAlignment = HorizontalAlignment.Left,
-            Padding = new Thickness(15, 5, 6, 6), Margin = new Thickness(0, 2, 0, 2),
+            Padding = new Thickness(16, 5, 6, 6), Margin = new Thickness(0, 2, 0, 2),
             BorderThickness = new Thickness(0), Background = Brushes.Transparent, Cursor = Cursors.Hand
         };
         string key = collapseKey;
@@ -2508,7 +2508,7 @@ class ChatWindow : Window
             Content = contentRow,
             HorizontalContentAlignment = HorizontalAlignment.Left,
             // No left rail anymore -> uniform left padding so active/inactive titles align identically.
-            Padding = new Thickness(9, 0, 9, 0), BorderThickness = new Thickness(0),
+            Padding = new Thickness(8, 0, 8, 0), BorderThickness = new Thickness(0),
             Cursor = Cursors.Hand, Background = Brushes.Transparent, ToolTip = titleText
         };
         // Active row: full Fg; archived non-active: Faint (de-emphasized); others: Muted.
@@ -2757,9 +2757,9 @@ class ChatWindow : Window
             _scaleToast = new Border
             {
                 Child = _scaleToastText, CornerRadius = new CornerRadius(Theme.RadCard),
-                Padding = new Thickness(14, 7, 14, 7), BorderThickness = new Thickness(1),
+                Padding = new Thickness(16, 7, 16, 7), BorderThickness = new Thickness(1),
                 HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Top,
-                Margin = new Thickness(0, 14, 0, 0), IsHitTestVisible = false,
+                Margin = new Thickness(0, 16, 0, 0), IsHitTestVisible = false,
                 Visibility = Visibility.Collapsed
             };
             SetRef(_scaleToast, BackgroundProperty, "Panel");
@@ -2889,7 +2889,7 @@ class ChatWindow : Window
         var chip = new Border
         {
             Child = tb, CornerRadius = new CornerRadius(Theme.RadSmall), BorderThickness = new Thickness(1),
-            Padding = new Thickness(14, 9, 14, 9), Margin = new Thickness(0, 4, 0, 4),
+            Padding = new Thickness(16, 8, 16, 8), Margin = new Thickness(0, 4, 0, 4),
             Cursor = Cursors.Hand, HorizontalAlignment = HorizontalAlignment.Stretch
         };
         SetRef(chip, BackgroundProperty, "PanelAlt");   // SurfaceSubtle
@@ -2963,7 +2963,7 @@ class ChatWindow : Window
         // a registry/fleet conversation we haven't loaded yet -> pull it via /history
         if (c.Messages.Count == 0 && !string.IsNullOrEmpty(c.ConvUrl))
         {
-            var note = new TextBlock { Text = T("loadingconv"), FontSize = 12.5, Margin = new Thickness(2, 2, 2, 10) };
+            var note = new TextBlock { Text = T("loadingconv"), FontSize = 12.5, Margin = new Thickness(2, 2, 2, 12) };
             SetRef(note, TextBlock.ForegroundProperty, "Muted");
             _messages.Children.Add(note);
             RefreshConvList();
@@ -2981,7 +2981,7 @@ class ChatWindow : Window
                 Text = _lang == 0
                     ? "この会話の本文はここからは取得できません。\n並列タスクの全文は、コックピットの該当カード（開く）から開くと表示されます。"
                     : "This conversation's body isn't fetchable here.\nOpen it from its cockpit card (Open) to see the full transcript.",
-                FontSize = 12.5, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(2, 2, 2, 10)
+                FontSize = 12.5, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(2, 2, 2, 12)
             };
             SetRef(note, TextBlock.ForegroundProperty, "Muted");
             _messages.Children.Add(note);
@@ -3097,7 +3097,7 @@ class ChatWindow : Window
         win.Resources = this.Resources;
         SetRef(win, BackgroundProperty, "Bg");
 
-        var dock = new DockPanel { Margin = new Thickness(16, 14, 16, 14) };
+        var dock = new DockPanel { Margin = new Thickness(16, 16, 16, 16) };
 
         // FILTER ROW (top)
         var filterRow = new StackPanel { Margin = new Thickness(0, 0, 0, 8) };
@@ -3125,12 +3125,12 @@ class ChatWindow : Window
         dock.Children.Add(filterRow);
 
         // FOOTER (bottom) -- built before the list so its labels can be referenced
-        var footer = new DockPanel { Margin = new Thickness(0, 10, 0, 0) };
+        var footer = new DockPanel { Margin = new Thickness(0, 12, 0, 0) };
         var selAll = new Button { Content = T("select_all"), Cursor = Cursors.Hand, FontSize = 12, Padding = new Thickness(12, 5, 12, 6), Margin = new Thickness(0, 0, 6, 0), BorderThickness = new Thickness(1) };
         SetRef(selAll, BackgroundProperty, "PanelAlt"); SetRef(selAll, ForegroundProperty, "Fg"); SetRef(selAll, Control.BorderBrushProperty, "Border");
-        var clrAll = new Button { Content = T("clear_all"), Cursor = Cursors.Hand, FontSize = 12, Padding = new Thickness(12, 5, 12, 6), Margin = new Thickness(0, 0, 10, 0), BorderThickness = new Thickness(1) };
+        var clrAll = new Button { Content = T("clear_all"), Cursor = Cursors.Hand, FontSize = 12, Padding = new Thickness(12, 5, 12, 6), Margin = new Thickness(0, 0, 12, 0), BorderThickness = new Thickness(1) };
         SetRef(clrAll, BackgroundProperty, "PanelAlt"); SetRef(clrAll, ForegroundProperty, "Fg"); SetRef(clrAll, Control.BorderBrushProperty, "Border");
-        var fetchBtn = new Button { Content = T("fetch_copilot"), Cursor = Cursors.Hand, FontSize = 12, Padding = new Thickness(12, 5, 12, 6), Margin = new Thickness(0, 0, 10, 0), BorderThickness = new Thickness(1) };
+        var fetchBtn = new Button { Content = T("fetch_copilot"), Cursor = Cursors.Hand, FontSize = 12, Padding = new Thickness(12, 5, 12, 6), Margin = new Thickness(0, 0, 12, 0), BorderThickness = new Thickness(1) };
         SetRef(fetchBtn, BackgroundProperty, "PanelAlt"); SetRef(fetchBtn, ForegroundProperty, "Fg"); SetRef(fetchBtn, Control.BorderBrushProperty, "Border");
         if (localOnly) fetchBtn.IsEnabled = false;   // a run is live -> don't touch the page
         var countLbl = new TextBlock { Text = "", FontSize = 12.5, VerticalAlignment = VerticalAlignment.Center };
@@ -3472,13 +3472,13 @@ class ChatWindow : Window
         _bannerBody.Children.Clear();
         var raw = c.Untitled() ? T("newchat") : c.Title;
         var title = raw.Length > 24 ? raw.Substring(0, 24) + "…" : raw;
-        var head = new TextBlock { Text = (_lang == 0 ? "「" + title + "」" : "\"" + title + "\"") + T("del_head"), FontWeight = FontWeights.SemiBold, FontSize = 13.5, Margin = new Thickness(0, 0, 0, 10), TextWrapping = TextWrapping.Wrap };
+        var head = new TextBlock { Text = (_lang == 0 ? "「" + title + "」" : "\"" + title + "\"") + T("del_head"), FontWeight = FontWeights.SemiBold, FontSize = 13.5, Margin = new Thickness(0, 0, 0, 12), TextWrapping = TextWrapping.Wrap };
         SetRef(head, TextBlock.ForegroundProperty, "Fg");
         _bannerBody.Children.Add(head);
         _bannerBody.Children.Add(ModeButton(c, 1, T("m1t"), T("m1s")));
         _bannerBody.Children.Add(ModeButton(c, 2, T("m2t"), T("m2s")));
         _bannerBody.Children.Add(ModeButton(c, 3, T("m3t"), T("m3s")));
-        var foot = new DockPanel { Margin = new Thickness(0, 10, 0, 0) };
+        var foot = new DockPanel { Margin = new Thickness(0, 12, 0, 0) };
         var note = new TextBlock { Text = T("del_note"), FontSize = 11.5, VerticalAlignment = VerticalAlignment.Center, TextWrapping = TextWrapping.Wrap };
         SetRef(note, TextBlock.ForegroundProperty, "Muted");
         var cancel = new Button { Content = T("cancel"), BorderThickness = new Thickness(1), Cursor = Cursors.Hand, FontSize = 12.5, Padding = new Thickness(16, 5, 16, 6), FontWeight = FontWeights.SemiBold };
@@ -3498,7 +3498,7 @@ class ChatWindow : Window
         var s = new TextBlock { Text = sub, FontSize = 11.5, Margin = new Thickness(0, 2, 0, 0), TextWrapping = TextWrapping.Wrap };
         SetRef(s, TextBlock.ForegroundProperty, "Muted");
         sp.Children.Add(t); sp.Children.Add(s);
-        var b = new Button { Content = sp, HorizontalContentAlignment = HorizontalAlignment.Left, Margin = new Thickness(0, 3, 0, 3), Padding = new Thickness(11, 8, 11, 9), BorderThickness = new Thickness(1), Cursor = Cursors.Hand };
+        var b = new Button { Content = sp, HorizontalContentAlignment = HorizontalAlignment.Left, Margin = new Thickness(0, 3, 0, 3), Padding = new Thickness(12, 8, 12, 8), BorderThickness = new Thickness(1), Cursor = Cursors.Hand };
         SetRef(b, BackgroundProperty, "PanelAlt");
         SetRef(b, Control.BorderBrushProperty, _deleteMode == mode ? "Accent" : "Border");
         var cc = c;
@@ -3545,7 +3545,7 @@ class ChatWindow : Window
         {
             Orientation = Orientation.Horizontal,
             HorizontalAlignment = HorizontalAlignment.Center,
-            Margin = new Thickness(0, 10, 0, 4)
+            Margin = new Thickness(0, 12, 0, 4)
         };
         var tb = new TextBlock
         {
@@ -3558,7 +3558,7 @@ class ChatWindow : Window
         var undo = new Button
         {
             Content = (_lang == 0 ? "元に戻す" : "Undo"),
-            FontSize = 12, Cursor = Cursors.Hand, Margin = new Thickness(10, 0, 0, 0),
+            FontSize = 12, Cursor = Cursors.Hand, Margin = new Thickness(12, 0, 0, 0),
             Padding = new Thickness(8, 1, 8, 1), BorderThickness = new Thickness(1),
             Background = Brushes.Transparent
         };
@@ -3571,7 +3571,7 @@ class ChatWindow : Window
 
     void Toast(string text)
     {
-        var tb = new TextBlock { Text = text, FontSize = 12, TextAlignment = TextAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 10, 0, 4), TextWrapping = TextWrapping.Wrap };
+        var tb = new TextBlock { Text = text, FontSize = 12, TextAlignment = TextAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 12, 0, 4), TextWrapping = TextWrapping.Wrap };
         SetRef(tb, TextBlock.ForegroundProperty, "Muted");
         _messages.Children.Add(tb);
         StickToEnd();
@@ -3587,7 +3587,7 @@ class ChatWindow : Window
             TextWrapping = TextWrapping.Wrap, IsTabStop = false, FontFamily = new FontFamily("Segoe UI Variable, Segoe UI"), FontSize = 14
         };
         SetRef(tb, ForegroundProperty, "Fg");
-        var bubble = new Border { Child = tb, CornerRadius = new CornerRadius(Theme.RadBubble), Padding = new Thickness(14, 11, 14, 11), Margin = new Thickness(40, 6, 0, 24), HorizontalAlignment = HorizontalAlignment.Right, MaxWidth = 560 };
+        var bubble = new Border { Child = tb, CornerRadius = new CornerRadius(Theme.RadBubble), Padding = new Thickness(16, 12, 16, 12), Margin = new Thickness(40, 6, 0, 24), HorizontalAlignment = HorizontalAlignment.Right, MaxWidth = 560 };
         SetRef(bubble, BackgroundProperty, "UserBg");
         _messages.Children.Add(bubble);
         StickToEnd();
@@ -3727,7 +3727,7 @@ class ChatWindow : Window
                 para.LineHeight = 22;
                 para.LineStackingStrategy = LineStackingStrategy.BlockLineHeight;
                 // Paragraph bottom margin: small on last to avoid excess trailing space.
-                para.Margin = isLast ? new Thickness(0, 0, 0, 2) : new Thickness(0, 0, 0, 10);
+                para.Margin = isLast ? new Thickness(0, 0, 0, 2) : new Thickness(0, 0, 0, 12);
 
                 // Within a block, split on "\n" for soft line breaks.
                 string[] segments = paragraphBlocks[pi].Split('\n');
@@ -3973,7 +3973,7 @@ class ChatWindow : Window
 
     UIElement BuildRouterBar()
     {
-        _routerBar = new Border { Visibility = Visibility.Collapsed, CornerRadius = new CornerRadius(Theme.RadPopover), BorderThickness = new Thickness(1), Padding = new Thickness(12, 8, 10, 8), Margin = new Thickness(0, 0, 0, 8) };
+        _routerBar = new Border { Visibility = Visibility.Collapsed, CornerRadius = new CornerRadius(Theme.RadPopover), BorderThickness = new Thickness(1), Padding = new Thickness(12, 8, 12, 8), Margin = new Thickness(0, 0, 0, 8) };
         SetRef(_routerBar, BackgroundProperty, "Panel"); SetRef(_routerBar, Border.BorderBrushProperty, "Accent");
         var dp = new DockPanel();
         var btns = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
