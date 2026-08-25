@@ -336,3 +336,74 @@ def test_the_suite_is_not_writing_into_the_operators_store():
     assert os.environ.get(ss.STORE_DIR_ENV), (
         "session store が隔離されていない -- 試験が運用者の保存層へ書く")
     assert ss._base_dir() != ss.SESS_DIR
+
+
+# ── 保持設定 ────────────────────────────────────────────────────────────────
+
+def test_a_settings_file_without_the_keys_deletes_nothing(box, monkeypatch, tmp_path):
+    """これらの鍵が生まれる前に書かれた settings.txt には、当然どちらも無い。
+    欠落を『0日』と読めば、新規インストールの初回起動で全履歴が消える。
+    履歴消失を止めるための機能が、履歴を消す側になってはいけない。"""
+    monkeypatch.setattr(ss, "_settings_path", lambda: str(tmp_path / "settings.txt"))
+    (tmp_path / "settings.txt").write_text("maxtabs=3\nzoom=1.0\n", encoding="utf-8")
+    assert ss.read_retention() == (None, None)
+
+    sess = ss.new_session(title="x")
+    ss.append_turn(sess["sid"], "user", "keep")
+    ss.touch(sess["sid"], last_active_ts=1000.0)
+    assert ss.apply_retention() is None
+    assert len(ss.all_turns(sess["sid"])) == 1
+
+
+def test_zero_means_off_not_immediately(box, monkeypatch, tmp_path):
+    """0 は『0日保持』ではなく『無効』。ここを取り違えると一撃で全部消える。"""
+    monkeypatch.setattr(ss, "_settings_path", lambda: str(tmp_path / "settings.txt"))
+    (tmp_path / "settings.txt").write_text(
+        "session_retention_days=0\nsession_max_mb=0\n", encoding="utf-8")
+    assert ss.read_retention() == (None, None)
+
+
+def test_a_configured_age_is_applied(box, monkeypatch, tmp_path):
+    monkeypatch.setattr(ss, "_settings_path", lambda: str(tmp_path / "settings.txt"))
+    (tmp_path / "settings.txt").write_text("session_retention_days=30\n", encoding="utf-8")
+    assert ss.read_retention() == (30.0, None)
+
+    old = ss.new_session(title="old")
+    ss.append_turn(old["sid"], "user", "ancient")
+    ss.touch(old["sid"], last_active_ts=1000.0)
+    fresh = ss.new_session(title="fresh")
+    ss.append_turn(fresh["sid"], "user", "recent")
+
+    out = ss.apply_retention()
+    assert out and out["removed_sessions"] == 1
+    assert ss.load(old["sid"]) is None and ss.load(fresh["sid"]) is not None
+
+
+def test_a_garbled_value_is_ignored_rather_than_guessed(box, monkeypatch, tmp_path):
+    """人が編集するファイル。数字でない行を 0 や 1 と読むより、無視するほうが安全。"""
+    monkeypatch.setattr(ss, "_settings_path", lambda: str(tmp_path / "settings.txt"))
+    (tmp_path / "settings.txt").write_text(
+        "session_retention_days=thirty\nsession_max_mb=\n", encoding="utf-8")
+    assert ss.read_retention() == (None, None)
+
+
+def test_a_missing_settings_file_is_not_an_error(box, monkeypatch, tmp_path):
+    monkeypatch.setattr(ss, "_settings_path", lambda: str(tmp_path / "nope.txt"))
+    assert ss.read_retention() == (None, None)
+    assert ss.apply_retention() is None
+
+
+def test_the_bridge_prunes_at_startup_not_on_a_timer():
+    """走行中に発火する剪定は、いま書いている会話を消しうる。
+    起動時に1回だけにする。今消すのと1時間後に消すのの差は、その危険に見合わない。"""
+    import pathlib as _pl
+    src = (_pl.Path(__file__).resolve().parents[1] / "bridge" / "copilot_bridge.py"
+           ).read_text(encoding="utf-8", errors="replace")
+    assert "S.apply_retention()" in src, "起動時に保持を適用していない"
+    i = src.index("S.apply_retention()")
+    # 実際の呼び出しを見る。最初の出現はコメント("mirrors the old srv.serve_forever()")で、
+    # そちらを取ると本物より手前に見えて判定が逆になる。
+    j = src.rindex("    srv.serve_forever()")
+    assert i < j, "サーバ開始後に剪定している"
+    # 失敗しても起動を止めないこと
+    assert "leaving the store alone" in src

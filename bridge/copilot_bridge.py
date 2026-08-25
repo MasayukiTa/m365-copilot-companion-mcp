@@ -5180,6 +5180,20 @@ def main():
     # still not thread-safe -- PageExecutor (module-level PAGE_EXECUTOR) is the single
     # serialization point ensuring only the page-owner thread ever touches PAGE/DRIVER; see
     # its docstring near the top of this file.
+    # RETENTION RUNS ONCE, HERE, AND NOT ON A TIMER. A pass that can fire mid-turn is a pass
+    # that can delete the conversation being written to, and the difference between pruning
+    # now and pruning in an hour is not worth that. Nothing happens unless the operator has
+    # set a limit; the default keeps everything, because this store exists precisely because
+    # history was being lost.
+    try:
+        _pruned = S.apply_retention()
+        if _pruned:
+            logger.info("session retention: removed %d session(s), store now %.1f MB",
+                        _pruned["removed_sessions"], _pruned["mb_after"])
+    except Exception:
+        logger.warning("session retention pass failed; leaving the store alone",
+                       exc_info=True)
+
     srv = _SingleBindHTTPServer(("127.0.0.1", port), Handler)
     print("copilot bridge: http://127.0.0.1:%d" % port, flush=True)
     srv.serve_forever()

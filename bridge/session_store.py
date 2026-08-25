@@ -648,6 +648,62 @@ def prune(max_age_days=None, max_mb=None, now=None):
             "still_over": bool(max_mb and after["mb"] > float(max_mb))}
 
 
+#: The shared settings file the cockpit writes and the fleet reads. Retention lives here rather
+#: than in .env because it is a preference the operator changes from a dialog, not a deployment
+#: setting -- and because .env is rewritten by the release updater while this is not.
+SETTINGS_KEYS = ("session_retention_days", "session_max_mb")
+
+
+def _settings_path():
+    return os.path.join(os.environ.get("APPDATA", ""), "copilot-bridge", "settings.txt")
+
+
+def read_retention():
+    """(days, max_mb) from settings.txt. Either may be None, which means "keep everything".
+
+    ABSENT AND ZERO BOTH MEAN OFF, and they have to, because a settings file written before
+    these keys existed has neither -- and a fresh install that read a missing key as "0 days"
+    would delete the operator's history on first run. The feature that exists to stop history
+    disappearing must not be the thing that deletes it.
+    """
+    days = mb = None
+    try:
+        with open(_settings_path(), "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if "=" not in line or line.strip().startswith("#"):
+                    continue
+                key, _, value = line.partition("=")
+                key, value = key.strip(), value.strip()
+                if key not in SETTINGS_KEYS or not value:
+                    continue
+                try:
+                    number = float(value)
+                except ValueError:
+                    continue
+                if number <= 0:
+                    continue
+                if key == "session_retention_days":
+                    days = number
+                else:
+                    mb = number
+    except OSError:
+        pass
+    return days, mb
+
+
+def apply_retention(now=None):
+    """Prune according to settings.txt. Returns the prune report, or None when nothing is set.
+
+    Called once at bridge start rather than on a timer. A retention pass that can fire in the
+    middle of a turn is a retention pass that can delete the conversation being written to,
+    and the difference between running it now and running it in an hour is not worth that.
+    """
+    days, mb = read_retention()
+    if not days and not mb:
+        return None
+    return prune(max_age_days=days, max_mb=mb, now=now)
+
+
 def compact():
     """Rewrite the database so deleted space returns to the filesystem. Slow; not per-turn.
 
