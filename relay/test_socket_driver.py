@@ -238,3 +238,72 @@ def test_an_empty_turn_with_nothing_else_says_that_too():
     d.send("hi")
     d._thread.join(timeout=5)
     assert "no non-chat frames either" in d.failed
+
+
+
+# ---- wait_for_idle: ブリッジがタブを手放すために唯一足りなかったもの ---------------------------
+
+def test_wait_for_idle_returns_true_when_nothing_is_running():
+    """ターンを一度も送っていないドライバは idle。join() ではここが特別扱いになる。"""
+    assert _drv().wait_for_idle(timeout_s=0.1) is True
+
+
+def test_wait_for_idle_blocks_until_the_turn_finishes():
+    d = _drv(answer="答え", delay=0.4)
+    d.send("q")
+    assert d.wait_for_idle(timeout_s=0.05) is False, "走行中に idle と答えている"
+    assert d.wait_for_idle(timeout_s=5) is True
+    assert d.read_last_response() == "答え"
+
+
+def test_a_timeout_is_not_reported_as_a_failure():
+    """False は『まだ走っている』であって『壊れた』ではない。壊れたかは failed が答える。"""
+    d = _drv(delay=0.4)
+    d.send("q")
+    assert d.wait_for_idle(timeout_s=0.05) is False
+    assert not d.failed
+    assert _settle(d)
+
+
+def test_the_bridge_needs_exactly_these_four_calls():
+    """ブリッジが DRIVER に呼ぶのは send / _is_generating / read_last_response /
+    wait_for_idle の4つだけ。1つでも欠けると常駐ページを手放せない。"""
+    for name in ("send", "_is_generating", "read_last_response", "wait_for_idle"):
+        assert callable(getattr(SD.CopilotSocketDriver, name, None)), name
+
+
+# ---- partial と settled: ブリッジの LOADING / LASTMSG に対応する2状態 --------------------------
+
+def test_partial_grows_while_settled_stays_empty():
+    """ブリッジの終了判定は『LASTMSG が埋まる』ことに依る。走行中に settled が
+    答えを返してしまうと、末尾を切り落として完了扱いにする。"""
+    d = _drv(answer="最終形", delay=0.25, deltas=("途", "途中"))
+    d.send("q")
+    seen_partial = ""
+    while d._is_generating():
+        seen_partial = seen_partial or d.partial_text()
+        assert d.settled_text() == "", "走行中に settled が答えを返している"
+        time.sleep(0.02)
+    assert seen_partial, "partial が一度も見えていない"
+    assert d.settled_text() == "最終形"
+
+
+def test_partial_is_empty_before_the_first_token():
+    assert _drv().partial_text() == ""
+
+
+def test_settled_is_empty_before_any_turn():
+    assert _drv().settled_text() == ""
+
+
+def test_the_citation_plumbing_is_stripped_from_the_partial_too():
+    """DOM は引用をリンクに解決して見せる。ソケットは生で渡すので、
+    片方だけ整形すると利用者の画面に機械が漏れる。"""
+    d = _drv(answer="本文", delay=0.2, deltas=("本文【1-a1b2】",))
+    d.send("q")
+    got = ""
+    while d._is_generating():
+        got = got or d.partial_text()
+        time.sleep(0.02)
+    _settle(d)
+    assert "【1-a1b2】" not in got, got

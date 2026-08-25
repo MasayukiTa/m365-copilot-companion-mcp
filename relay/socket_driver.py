@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 
 from relay.chathub import ChatHubError
 from relay.copilot_autopilot_relay import GenerationInProgress
@@ -94,6 +95,29 @@ class CopilotSocketDriver:
     def _is_generating(self) -> bool:
         t = self._thread
         return bool(t and t.is_alive())
+
+    def wait_for_idle(self, timeout_s=180.0, poll_s=0.25) -> bool:
+        """Block until the running turn finishes. True if it finished, False on timeout.
+
+        THE ONE METHOD THE BRIDGE NEEDED AND THIS CLASS DID NOT HAVE. The bridge drives its
+        conversation through exactly four calls -- send, _is_generating, read_last_response and
+        this -- so the whole distance between its resident tab and a socket was one wrapper
+        around the generation flag that `send` already maintains.
+
+        Deliberately not `self._thread.join(timeout)`: a caller that asks "is it idle" must get
+        the same answer whether a turn is running, already finished, or was never started, and
+        join() on a thread that is None would have to be special-cased at every call site.
+
+        A False here is a TIMEOUT, not a failure: the turn is still running and the caller
+        decides whether to keep waiting. Whether the turn FAILED is `failed`, which is a
+        separate question and is why this does not raise.
+        """
+        deadline = time.time() + float(timeout_s)
+        while self._is_generating():
+            if time.time() >= deadline:
+                return False
+            time.sleep(poll_s)
+        return True
 
     def send(self, text, gen_wait_s=None, **_kw):
         """Start a turn. Returns as soon as it is running, exactly as the tab driver does.
@@ -171,6 +195,31 @@ class CopilotSocketDriver:
 
     def read_last_reply_clean(self) -> str:
         return self.read_last_response()
+
+    # ---- the two states the bridge's DOM reads distinguish -----------------------------------
+    #
+    # The bridge does not read its answer through the driver at all: it scrapes
+    # `loading-message` for the growing text and `lastChatMessage`, which populates only when
+    # the turn is DONE, for the settled one. Its whole finish condition is built on the
+    # difference. `read_last_response` deliberately blurs the two -- it is the fleet's
+    # question, "what is the best text you have" -- so a socket could not answer the bridge's
+    # question through it. These two can, and they read the same state the class already keeps.
+
+    def partial_text(self) -> str:
+        """What has arrived so far, growing. "" before the first token."""
+        with self._lock:
+            return normalize_answer(self._partial) if self._partial else ""
+
+    def settled_text(self) -> str:
+        """The completed answer, or "" while a turn is still running.
+
+        EMPTY IS A REAL ANSWER HERE, and it is the one that makes the bridge's loop work: it
+        means "not finished yet", exactly as an unpopulated lastChatMessage does.
+        """
+        if self._is_generating():
+            return ""
+        with self._lock:
+            return self._last or ""
 
     def _is_stale_repeat(self, text: str) -> bool:
         """Whether the loop is asking about a turn it has ALREADY taken.
