@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from .file_ops import _validate_path
+from .walk import iter_files, pruned_note
 
 
 def glob(
@@ -162,7 +163,7 @@ def find_files(
         best: list[tuple[float, int, str]] = []
         seen = 0
         truncated = False
-        for p in base.rglob("*"):
+        for p in iter_files(base):
             if needle not in p.name.lower():
                 continue
             try:
@@ -189,6 +190,8 @@ def find_files(
         out = [t[2] for t in sorted(best, reverse=True)]
         if truncated:
             out.append(f"... truncated at {max_results} entries")
+        if pruned_note():
+            out.append("[" + pruned_note() + "]")
         return "\n".join(out)
     except Exception as e:
         return f"[find_files error: {type(e).__name__}: {e}]"

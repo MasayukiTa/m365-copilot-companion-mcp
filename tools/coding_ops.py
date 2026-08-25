@@ -8,6 +8,7 @@ from typing import Optional
 
 from .file_ops import _validate_path
 from .security import require_unlocked
+from .walk import iter_files, pruned_note
 
 #: Largest file the pure-Python grep fallback will open. Not a policy about what is worth
 #: searching -- a bound on what one tool call can cost the server, which is shared and
@@ -45,6 +46,8 @@ def _note(skipped_big: int, partial_files: int) -> str:
     when the reader had most reason to trust the result.
     """
     parts = []
+    if pruned_note():
+        parts.append(pruned_note())
     if skipped_big:
         parts.append("%d file(s) larger than %d MB were not searched"
                      % (skipped_big, _GREP_MAX_FILE_BYTES // (1024 * 1024)))
@@ -91,8 +94,7 @@ def grep(
         # under the fleet's own recycle floor and a run hard-reset the shared browser out from
         # under its sibling. py-spy on the live process is what named this line.
         matches: list[str] = []
-        files = ([target] if target.is_file()
-                 else (p for p in target.rglob("*") if p.is_file()))
+        files = [target] if target.is_file() else iter_files(target)
         needle = pattern if case_sensitive else pattern.lower()
         skipped_big = 0
         partial_files = 0

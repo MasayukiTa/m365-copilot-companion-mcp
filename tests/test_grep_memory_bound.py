@@ -72,7 +72,9 @@ def test_a_small_file_is_still_searched_alongside_a_skipped_one(monkeypatch, tmp
 def test_max_matches_still_stops_early(monkeypatch, tmp_path):
     (tmp_path / "a.txt").write_text("hit\n" * 50, encoding="utf-8")
     out = coding_ops.grep("hit", str(tmp_path), max_matches=3)
-    assert len([ln for ln in out.splitlines() if ln.strip()]) == 3
+    # 一致行だけ数える。全非空行を数えていて、開示の1行が足された途端に落ちた
+    # -- 検査していたのは上限であって、出力の行数ではない。
+    assert len([ln for ln in out.splitlines() if ln.startswith(str(tmp_path))]) == 3
 
 
 def test_a_binary_file_does_not_take_the_search_down(monkeypatch, tmp_path):
@@ -188,3 +190,58 @@ def test_find_files_keeps_the_first_of_equal_timestamps(monkeypatch, tmp_path):
     kept = [_pl.Path(l).name for l in out.splitlines() if l.startswith(str(tmp_path))]
     walked = [p.name for p in sorted(tmp_path.rglob("*")) if p.name.startswith("hit_")]
     assert set(kept) == set(walked[:2]), "同時刻のタイで後勝ちになっている: %s" % kept
+
+
+# ---- 歩く範囲そのものを削る --------------------------------------------------------------------
+#
+# 2026-08-26 実測。保持量を縛る修正を2つ入れた後でも +260 MB/分 -- 元の 263 MB/分と同じだった。
+# 1回の検索が 76,129 ファイルを歩いており、うち 61,757 が .venv、2,651 が .git。
+# **何を保持するか**を縛っても、**何に触るか**は何も変わっていなかった。
+# 剪定後: 9,946 ファイル、11.33秒 → 0.20秒。
+
+from tools import walk as walk_mod
+
+
+def test_the_vendored_world_is_not_walked(tmp_path):
+    (tmp_path / ".venv" / "lib").mkdir(parents=True)
+    (tmp_path / ".venv" / "lib" / "hit.txt").write_text("needle", encoding="utf-8")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "hit.txt").write_text("needle", encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "hit.txt").write_text("needle", encoding="utf-8")
+    found = {p.name + "|" + p.parent.name for p in walk_mod.iter_files(tmp_path)}
+    assert "hit.txt|src" in found
+    assert not any(f.endswith("|lib") or f.endswith("|.git") for f in found), found
+
+
+def test_the_caller_can_ask_for_everything(tmp_path, monkeypatch):
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / ".venv" / "hit.txt").write_text("x", encoding="utf-8")
+    monkeypatch.setenv("MCP_SEARCH_INCLUDE_ALL", "1")
+    assert any(p.parent.name == ".venv" for p in walk_mod.iter_files(tmp_path))
+    assert walk_mod.pruned_note() == ""
+
+
+def test_pruning_is_disclosed_because_it_changes_what_can_be_found(monkeypatch, tmp_path):
+    """『(no matches)』を信じる読み手には、どこを見ていないかが要る。"""
+    monkeypatch.delenv("MCP_SEARCH_INCLUDE_ALL", raising=False)
+    (tmp_path / "a.txt").write_text("nothing here", encoding="utf-8")
+    out = coding_ops.grep("needle", str(tmp_path))
+    assert "not searched" in out and "MCP_SEARCH_INCLUDE_ALL" in out
+
+
+def test_find_files_discloses_it_too(monkeypatch, tmp_path):
+    import pathlib as _pl
+
+    monkeypatch.delenv("MCP_SEARCH_INCLUDE_ALL", raising=False)
+    monkeypatch.setattr(search_ops, "_validate_path", lambda p: _pl.Path(p))
+    (tmp_path / "hit_a.txt").write_text("x", encoding="utf-8")
+    out = search_ops.find_files("hit_", str(tmp_path))
+    assert "MCP_SEARCH_INCLUDE_ALL" in out
+
+
+def test_a_walk_is_a_generator_not_a_list():
+    """一覧を作った瞬間に、削ったはずの山が戻ってくる。"""
+    import inspect
+
+    assert inspect.isgeneratorfunction(walk_mod.iter_files)
