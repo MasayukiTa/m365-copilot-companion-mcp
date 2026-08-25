@@ -864,6 +864,28 @@ FLEET_MEASURED_SOCKET_ARM_MB = 428.8
 FLEET_PER_TAB_MB = float(os.environ.get("MCP_FLEET_PER_TAB_MB", "400"))
 
 
+def ram_room_for_worker(floor_mb=None) -> bool:
+    """True iff there is room in free RAM for ONE more worker, whichever transport it takes.
+
+    The tab budget cannot bound a socket worker, because a socket worker holds no tab -- and it
+    is not free either: 428.8 MB of browser growth plus 258.2 MB in the fleet's own process,
+    measured 2026-08-25. Without a second gate the admission test reduces to `0 <= budget` and
+    every pending goal is admitted at once.
+
+    That gate is MEASURED, not counted. A fixed worker cap was the first attempt and it was the
+    wrong shape: it re-imposes by hand the number the autoscale exists to derive, and it would
+    pin a machine with gigabytes free to whatever was typed in a settings file. This asks the
+    machine instead, and the fleet grows and drains with it.
+
+    Sized like ram_room_for_tab: the floor that must remain for the operator, plus the cost of
+    the worker about to start. A socket worker costs less than a tab, so charging it a tab is
+    the conservative direction and keeps one number instead of two.
+    """
+    if floor_mb is None:
+        floor_mb = FLEET_RAM_FLOOR_MB + FLEET_PER_TAB_MB
+    return avail_phys_mb() >= floor_mb
+
+
 def ram_room_for_tab(floor_mb=None) -> bool:
     """True iff there is enough free physical RAM to open ANOTHER browser tab without crowding
     the machine. Used to RAM-gate the SUB-AGENT side-pages (research / refuter) -- the fleet's
@@ -1599,11 +1621,18 @@ class RelayWorker:
         # is a socket and has no page to reopen. _agent_url is set further down, AFTER that is
         # decided -- it used to be assigned here, so a conversation-id resume left a bare guid
         # in it and a mid-run fallback to a tab would have tried to open it as a URL.
-        # WHICH TRANSPORT THIS GOAL SHOULD USE, asked before one is requested. Until now the
-        # answer was "a socket whenever the route offers one", which sends Work IQ goals over
-        # a transport that cannot reach Work IQ and relies on the fallback to notice -- and
-        # the fallback does not always notice, because an answer formed without that context
-        # can still look like an answer. transport_policy holds the fixed predicate.
+        # WHICH TRANSPORT THIS GOAL SHOULD USE, asked before one is requested, rather than
+        # "a socket whenever the route offers one". transport_policy holds the predicate.
+        #
+        # THIS COMMENT USED TO SAY THE SOCKET CANNOT REACH WORK IQ. It was written when that
+        # was believed, and the belief was measured and refuted on 2026-08-21 -- the refutation
+        # is recorded in transport_policy.py, and socket_route.py logs 20+ turns across eight
+        # request classes with zero fallbacks, Work IQ included: inbox, calendar read, calendar
+        # WRITE and SharePoint, checked against ground truth rather than against how convincing
+        # the answer read. The stale line stayed here and was quoted back as fact within minutes
+        # of being read, by someone who then measured the opposite and did not notice the
+        # contradiction. A comment that outlives its premise is worse than no comment: it is
+        # evidence, and it is wrong.
         want_socket = True
         try:
             from relay.transport_policy import SOCKET, choose
@@ -3854,10 +3883,23 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # route open it will take a socket and hold no tab. If the capture then fails it opens a
         # tab after all and the fleet is one tab over budget for the rest of this sweep -- the
         # next iteration reads the real weight, so it cannot compound.
+        # THE TAB BUDGET CANNOT BOUND A ROUTE THAT HOLDS NO TAB. `_projected_peak()` sums
+        # tab_weight, and a socket worker's is zero, so on a socket-first fleet the tab test is
+        # `0 + 0 <= budget` -- true for every pending worker, forever. A socket worker is not
+        # free: measured 2026-08-25 at 428.8 MB of browser growth plus 258.2 MB in this
+        # process. Sixteen at once is about 11 GB.
+        #
+        # SO THE SECOND GATE IS MEMORY, NOT A COUNT. A fixed worker cap was tried here first and
+        # was wrong: it re-imposed by hand the limit the autoscale exists to compute, and it
+        # would hold the fleet at three workers on a machine with gigabytes to spare.
+        # `ram_room_for_worker()` asks the only question that matters -- is there room for one
+        # more right now -- and answers it from the free-RAM reading, so the fleet grows and
+        # drains with the machine instead of with a number somebody typed.
         while pending and (_active_open() == 0
-                           or _projected_peak()
-                              + pending[0].tab_weight(assume_socket=_socket_open_now())
-                              <= max(1, mc_box[0])):
+                           or (ram_room_for_worker()
+                               and _projected_peak()
+                               + pending[0].tab_weight(assume_socket=_socket_open_now())
+                               <= max(1, mc_box[0]))):
             # reserve disk for THIS eval plus every already-open eval still in flight, so we never
             # admit N tabs that look fine individually but crash C: once their builds run at once.
             # PER-REPO mode sizes the reserve by each instance's actual build weight (matplotlib 7GB

@@ -82,3 +82,22 @@ def test_a_missing_settings_module_does_not_break_the_run():
     block = src[i - 60:i + 320]
     assert "except Exception:" in block
     assert "_retry_on, _retry_cap" in block
+
+
+def test_no_comment_still_claims_the_socket_cannot_reach_work_iq():
+    """その前提は 2026-08-21 に測定され、偽と判明している。
+
+    否定の記録は transport_policy.py にあり、socket_route.py には 20+ ターン・
+    8リクエスト種別・fallback ゼロ・Work IQ 含む(受信箱/予定表の読み書き/SharePoint、
+    ground truth に対して検証)が残っている。
+
+    それでも attach() には古い主張が残り、読んだ人間が数分後にそれを事実として述べ、
+    自分で反対の測定をしながら矛盾に気づかなかった。前提より長生きしたコメントは、
+    無いより悪い -- 証拠として扱われ、しかも間違っている。"""
+    import inspect
+
+    src = inspect.getsource(RF.RelayWorker.attach)
+    assert "cannot reach Work IQ" not in src, "否定済みの主張がまだ書かれている"
+    policy = (__import__("pathlib").Path(RF.__file__).parent / "transport_policy.py"
+              ).read_text(encoding="utf-8", errors="replace")
+    assert "IS FALSE" in policy, "否定の記録側が消えている"

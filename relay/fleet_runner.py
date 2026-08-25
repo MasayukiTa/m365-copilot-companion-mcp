@@ -144,6 +144,12 @@ STATUS_PILL = {
 
 DEFAULT_MAX_CONCURRENT = 3
 
+#: The autoscale ceiling used when the operator has never set one. MUST MATCH the cockpit's
+#: `_autoMax` default (ui/FleetCockpit.cs), which is 100 and documented there as "high by
+#: design": under autoscale the ceiling exists to get out of ram_target_cap's way, not to cap
+#: anything itself. When the two disagreed the screen showed 100 and the fleet ran 3.
+AUTOSCALE_CEILING_DEFAULT = 100
+
 
 def _settings_path():
     return os.path.join(os.environ.get("APPDATA", ""), "copilot-bridge", "settings.txt")
@@ -1229,7 +1235,20 @@ def main():
     elif set_ceiling > 0:
         asc_ceiling = set_ceiling
     else:
-        asc_ceiling = max(asc_default, settings_maxtabs())
+        # THE COCKPIT SHOWS 100 AND THE FLEET USED 3. `autoscale_max` is written only when the
+        # operator touches the stepper, so on a machine where they never did, the key is absent
+        # -- and settings.txt on this box has neither autoscale_max nor maxtabs. The cockpit
+        # then displays its own in-memory default of 100, labelled "high by design", while this
+        # line quietly substituted maxtabs (itself defaulted to 3). The screen said one number
+        # and the fleet ran another, which is how "RAM is free and it still runs three at a
+        # time" looks from outside.
+        #
+        # With autoscale on, a high ceiling is the point: it hands the decision to
+        # ram_target_cap instead of to a number nobody chose. So the fallback is the ceiling the
+        # cockpit shows. With autoscale OFF the ceiling is not consulted, and maxtabs remains
+        # the fixed cap exactly as before.
+        asc_ceiling = AUTOSCALE_CEILING_DEFAULT if autoscale else max(asc_default,
+                                                                      settings_maxtabs())
     asc_ceiling = max(1, min(asc_ceiling, len(goals)))
     asc_default = max(1, min(asc_default, asc_ceiling))      # default never exceeds the ceiling
     autoscale_max = asc_ceiling
