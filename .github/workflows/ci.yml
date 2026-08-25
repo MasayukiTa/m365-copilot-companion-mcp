@@ -137,6 +137,7 @@ jobs:
             bridge/test_one_turn_gate.py \
             relay/selfimprove/test_settle_gate.py \
             relay/test_canned_nonanswer_cause.py \
+            relay/test_fleet_self_retry.py \
             scripts/test_diag_report.py \
             scripts/test_diag_warmup_bias.py \
             scripts/test_recycle_report.py \
