@@ -49,15 +49,43 @@ static class Theme
     public static string Border(bool d)        { return d ? "#2E2E2E" : "#D8D6CF"; }  // 1px borders
     public static string BorderStrong(bool d)  { return d ? "#3A3A3A" : "#D4D4D0"; }  // active / hover border
     public static string Text(bool d)          { return d ? "#F4F4F5" : "#18181B"; }  // body
-    public static string Muted(bool d)         { return d ? "#A1A1AA" : "#71717A"; }  // secondary text
-    public static string Faint(bool d)         { return d ? "#71717A" : "#A1A1AA"; }  // meta text
-    public static string Accent(bool d)        { return d ? "#F97316" : "#D9480F"; }  // primary action ONLY
+    // LIGHT DARKENED 71717A -> 5F5F66. On the app background the old value scored 4.47 and on a
+    // selected row 4.39 -- under the 4.5 that normal-size text needs, at 26 call sites.
+    public static string Muted(bool d)         { return d ? "#A1A1AA" : "#5F5F66"; }  // secondary text
+    // LIGHT DARKENED A1A1AA -> 6B6B73. The old value scored 2.33-2.56 -- not merely under the
+    // 4.5 for normal text but under the 3.0 floor for large text, on every surface, at 47 call
+    // sites. This is the timestamp and elapsed-time row: the text the operator reads to find out
+    // whether the thing in front of them is still alive.
+    public static string Faint(bool d)         { return d ? "#71717A" : "#6B6B73"; }  // meta text
+    // LIGHT DARKENED D9480F -> C4400D. White on the old fill scored 4.30, so the label on the
+    // one button that matters most was under the line; as text on the background it scored 3.98.
+    // Both clear 4.5 now (5.14 and 4.66) and the hue is unchanged to the eye.
+    public static string Accent(bool d)        { return d ? "#F97316" : "#C4400D"; }  // primary action ONLY
     public static string AccentSoft(bool d)    { return d ? "#3A2416" : "#FFF1E8"; }  // primary hover / subtle badge
-    public static string AccentFg(bool d)      { return "#FFFFFF"; }                  // text on accent fill
-    public static string Success(bool d)       { return d ? "#22C55E" : "#16A34A"; }  // done chip
+    // WHITE, IN BOTH THEMES -- the operator looked at near-black on orange and judged it harder to
+    // read, and a contrast ratio is a floor for legibility, not a ranking of it. The number still
+    // has to be met, so the FILL moved instead: see AccentFill / SuccessFill below.
+    public static string AccentFg(bool d)      { return "#FFFFFF"; }                  // text on a saturated fill
+    // LIGHT DARKENED 16A34A -> 15803D. On a selected row the old green scored 2.99 -- the "done"
+    // chip, the most-read state in the list, below even the large-text floor.
+    public static string Success(bool d)       { return d ? "#22C55E" : "#15803D"; }  // done chip
     public static string Warning(bool d)       { return d ? "#F59E0B" : "#B45309"; }  // needs-attention
     public static string Danger(bool d)        { return d ? "#EF4444" : "#B91C1C"; }  // error
     public static string Info(bool d)          { return d ? "#60A5FA" : "#2563EB"; }  // running / reviewing
+
+    // ── fills that carry white text ──────────────────────────────────────────────
+    // A FILL IS NOT A MARK, AND THE DARK THEME IS WHERE THAT STOPS BEING PEDANTRY. Accent and
+    // Success above are drawn ON the dark ground, so they are bright: 6.74 and 8.29 there, which
+    // is what a status mark needs. Fill a button with those same brights and put a white label on
+    // it and you get 2.80 and 2.28 -- the two worst pairs in this palette, on the largest controls
+    // on the screen. Both roles were sharing one number, and only one of them could win.
+    //
+    // Light needs no split: #C4400D and #15803D already carry white (5.14, 5.02) and already read
+    // as text on a pale ground (4.66, 4.83). Only the dark theme's brights had to darken, and only
+    // where they are a fill -- the tab underline, the click flash and the composer's focus ring
+    // keep the bright Accent, because nothing sits on top of them.
+    public static string AccentFill(bool d)    { return d ? "#C2410C" : "#C4400D"; }  // white label: 5.18 / 5.14
+    public static string SuccessFill(bool d)   { return d ? "#15803D" : "#15803D"; }  // white label: 5.02
     public static string Secondary(bool d)    { return d ? "#A1A1AA" : "#3F3F46"; }  // secondary text (Ledger: Graphite)
 
     // Translucent hover/press overlays (white on dark, black on light).
@@ -84,10 +112,20 @@ static class Theme
     public const double ComposerMinH  = 56;
     public const double CardGap       = 8;
     public const double SectionGap    = 16;
+    // THE VALUES THAT ARE ACTUALLY DRAWN. 62 of the 74 corner radii in this UI were literals --
+    // 4, 8, 10, 6, and then 12, 9, 7, 5, 14, 1 -- while these tokens sat here being read as a
+    // system by anyone who opened this file. A design system nothing obeys is decoration, and it
+    // is the same failure as a comment nobody follows: it describes an intention, not the product.
+    // RadChip and RadBubble were added because those sizes were in real use and had no name; the
+    // strays snapped to the nearest token (9->8, 7->6, 14->12), a change of at most two pixels.
+    // Radii that are geometry rather than style -- half of a dot's width, half of an underline's
+    // height -- stay computed at their call site and are deliberately not tokens.
+    public const double RadChip     = 4;  // chips, pills, tags
     public const double RadSmall    = 6;  // small controls
     public const double RadCard     = 8;  // cards
     public const double RadComposer = 10; // composer
     public const double RadPopover  = 10; // modal / popover
+    public const double RadBubble   = 12; // chat bubbles, large panels
 
     // ── status model ──────────────────────────────────────────────────────────────
     // Canonical status keys (see DeriveStatus in the cockpit) -> visual treatment.

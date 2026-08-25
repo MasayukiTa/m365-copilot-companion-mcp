@@ -304,7 +304,7 @@ public static class Md
         border.SetResourceReference(Border.BackgroundProperty, KeyCodeBg);
         border.SetResourceReference(Border.BorderBrushProperty, KeyBorder);
         border.BorderThickness = new Thickness(1);
-        border.CornerRadius = new CornerRadius(8);
+        border.CornerRadius = new CornerRadius(Theme.RadCard);
         border.Padding = new Thickness(10);
         border.Margin = new Thickness(0, 6, 0, 6);
 

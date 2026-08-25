@@ -163,7 +163,12 @@ class ApprovalPromptWindow : Window
     bool _dark = true;
     int _lang = 0;
     long _settingsStamp = -1;
-    Brush Bg, Surface, SurfaceSubtle, Line, Fg, Muted, Accent, AccentFg, Danger, Warning;
+    // AccentFg is the foreground for text on ANY saturated fill, not only the accent one: white
+    // reads on both fills in the light theme (5.14 on the orange, 5.02 on the green) and on
+    // neither in the dark theme (2.80 and 2.28), so the choice is a property of the theme, not of
+    // the hue. Nine buttons here used a literal white brush and could not follow it -- including
+    // the one that starts a run, the largest control on the screen.
+    Brush Bg, Surface, SurfaceSubtle, Line, Fg, Muted, Accent, AccentFg, AccentFill, Danger, Warning;
 
     static double NowUnix()
     { return (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds; }
@@ -314,6 +319,7 @@ class ApprovalPromptWindow : Window
         SurfaceSubtle = Theme.Br(Theme.SurfaceSubtle(_dark)); Line = Theme.Br(Theme.Border(_dark));
         Fg = Theme.Br(Theme.Text(_dark)); Muted = Theme.Br(Theme.Muted(_dark));
         Accent = Theme.Br(Theme.Accent(_dark)); AccentFg = Theme.Br(Theme.AccentFg(_dark));
+        AccentFill = Theme.Br(Theme.AccentFill(_dark));
         Danger = Theme.Br(Theme.Danger(_dark)); Warning = Theme.Br(Theme.Warning(_dark));
     }
 
@@ -362,7 +368,7 @@ class ApprovalPromptWindow : Window
         _deny.Template = FlatButtonTemplate();
         _deny.Click += delegate { Answer("denied"); }; DockPanel.SetDock(_deny, Dock.Right); actions.Children.Add(_deny);
         _approve = new Button { Content = L("承認", "Approve"), Padding = new Thickness(22, 8, 22, 8),
-            Margin = new Thickness(0, 0, 8, 0), Background = Accent, Foreground = AccentFg,
+            Margin = new Thickness(0, 0, 8, 0), Background = AccentFill, Foreground = AccentFg,
             BorderThickness = new Thickness(0), FontWeight = FontWeights.SemiBold, Cursor = Cursors.Hand };
         _approve.Template = FlatButtonTemplate();
         _approve.Click += delegate { Answer("approved"); }; DockPanel.SetDock(_approve, Dock.Right); actions.Children.Add(_approve);
@@ -638,6 +644,14 @@ class CockpitWindow : Window
     // theme-dependent brushes
     Brush Bg, CardBg, Border, Fg, Muted, QuoteBg, BtnBg;
     Brush Accent;   // primary-action color; theme-dependent (spec), set in ApplyThemeBrushes
+    // Foreground for text sitting ON a saturated fill. It has to be theme-dependent for the same
+    // reason the fill is: white reads on the light theme's orange and green (5.14 / 5.02) and on
+    // neither of the dark theme's (2.80 / 2.28). This window had `White` instead, hard-coded, on
+    // nine buttons -- including the one that starts a run.
+    Brush AccentFg;
+    // The fill under that white text. Separate from Accent because in the dark theme they must
+    // differ; assigned in the same place so they cannot drift apart.
+    Brush AccentFill, SuccessFill;
     static readonly Brush White = new SolidColorBrush(C("#ffffff"));
 
     bool _dark = true;
@@ -833,7 +847,7 @@ class CockpitWindow : Window
     readonly object _healthLock = new object();
     const int HEALTH_DOT_COUNT = 6;
     Border[] _healthDot;           // the 6 colored dots (re-tinted by ApplyHealthToUi)
-    TextBlock[] _healthSpin;       // rotating in-progress marks, shown instead of a stale color
+    FrameworkElement[] _healthSpin;  // rotating in-progress marks, shown instead of a stale color
     TextBlock[] _healthLbl;        // the 6 labels (re-textable on language toggle)
     Border[] _healthDotWrap;       // per-dot wrapper (tooltip host)
     Button _fixBtn;                // the 「直す」/Fix button (shown only when a dot is red/yellow)
@@ -983,7 +997,7 @@ class CockpitWindow : Window
         if (k == "steer_dead") return ja ? "走行が停止中のため割り込めません（再開後にどうぞ）" : "No run live — can't steer (resume the fleet first)";
         // Feature 1: collapsed-card steer affordance (placeholder watermark + send ack toast).
         if (k == "steer_collapsed_placeholder") return ja ? "割り込み指示…" : "Steer…";
-        if (k == "steer_collapsed_ack") return ja ? "↳ 送信" : "↳ Sent";
+        if (k == "steer_collapsed_ack") return ja ? "送信" : "Sent";
         // ── P0 Health strip (infra state) + Fix button + INFRA_STUCK / agent badge ──────
         if (k == "hs_server") return ja ? "サーバ" : "Server";
         if (k == "hs_tunnel") return ja ? "トンネル" : "Tunnel";
@@ -1243,6 +1257,9 @@ class CockpitWindow : Window
         QuoteBg = Theme.Br(Theme.SurfaceSubtle(_dark));
         BtnBg = Theme.Br(Theme.SurfaceSubtle(_dark));
         Accent = Theme.Br(Theme.Accent(_dark));
+        AccentFg = Theme.Br(Theme.AccentFg(_dark));
+        AccentFill = Theme.Br(Theme.AccentFill(_dark));
+        SuccessFill = Theme.Br(Theme.SuccessFill(_dark));
     }
 
     Color BgColor() { return Theme.Col(Theme.Bg(_dark)); }
@@ -1489,7 +1506,7 @@ class CockpitWindow : Window
         _scaleToast.VerticalAlignment = VerticalAlignment.Top;
         _scaleToast.Margin = new Thickness(0, 18, 0, 0);
         _scaleToast.Padding = new Thickness(14, 7, 14, 7);
-        _scaleToast.CornerRadius = new CornerRadius(8);
+        _scaleToast.CornerRadius = new CornerRadius(Theme.RadCard);
         _scaleToast.Background = Theme.Br(Theme.Surface(_dark));
         _scaleToast.BorderBrush = Border;
         _scaleToast.BorderThickness = new Thickness(1);
@@ -1760,7 +1777,7 @@ class CockpitWindow : Window
     UIElement BuildHealthStrip()
     {
         _healthDot = new Border[HEALTH_DOT_COUNT];
-        _healthSpin = new TextBlock[HEALTH_DOT_COUNT];
+        _healthSpin = new FrameworkElement[HEALTH_DOT_COUNT];
         _healthLbl = new TextBlock[HEALTH_DOT_COUNT];
         _healthDotWrap = new Border[HEALTH_DOT_COUNT];
 
@@ -1783,7 +1800,7 @@ class CockpitWindow : Window
             var dr = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
             var mark = new Grid { Width = 10, Height = 10, VerticalAlignment = VerticalAlignment.Center,
                                   Margin = new Thickness(0, 0, 4, 0) };
-            var dot = new Border { Width = 8, Height = 8, CornerRadius = new CornerRadius(4),
+            var dot = new Border { Width = 8, Height = 8, CornerRadius = new CornerRadius(8 / 2.0),
                                    HorizontalAlignment = HorizontalAlignment.Center,
                                    VerticalAlignment = VerticalAlignment.Center };
             var spin = BuildSpinner(10);
@@ -1832,15 +1849,12 @@ class CockpitWindow : Window
     // The inline Fix pill's content: a small Material Symbol (settings/cog — the closest repair glyph
     // in the subset) at 14px + the localized "Fix" label, tinted with the Warning token to match the
     // pill's outline. Rebuilt on theme/lang flips via RebuildChrome (whole chrome is reconstructed).
-    TextBlock BuildSpinner(double size)
+    FrameworkElement BuildSpinner(double size)
     {
-        var spin = new TextBlock { Text = "⟳", FontFamily = new FontFamily("Segoe UI Symbol"),
-                                   FontSize = size, FontWeight = FontWeights.SemiBold,
-                                   HorizontalAlignment = HorizontalAlignment.Center,
-                                   VerticalAlignment = VerticalAlignment.Center,
-                                   TextAlignment = TextAlignment.Center,
-                                   RenderTransformOrigin = new Point(0.5, 0.5),
-                                   Foreground = Theme.Br(Theme.Warning(_dark)) };
+        var spin = (FrameworkElement)MakeIcon("refresh", size, Theme.Br(Theme.Warning(_dark)));
+        spin.HorizontalAlignment = HorizontalAlignment.Center;
+        spin.VerticalAlignment = VerticalAlignment.Center;
+        spin.RenderTransformOrigin = new Point(0.5, 0.5);
         var rotate = new RotateTransform(0);
         spin.RenderTransform = rotate;
         var animation = new DoubleAnimation(0, 360, new Duration(TimeSpan.FromMilliseconds(850)));
@@ -1875,9 +1889,15 @@ class CockpitWindow : Window
             _fixBtn.BorderBrush = Theme.Br(Theme.Warning(_dark));
             _fixBtn.Content = BuildFixPillContent(_fixRunning);
         }
+        // The spinner is drawn geometry now, so its colour is a Fill, not a Foreground. Cast
+        // narrowly and skip anything that is not a Shape rather than assuming: this loop runs on
+        // every theme flip and must not be able to throw.
         if (_healthSpin != null)
             for (int i = 0; i < _healthSpin.Length; i++)
-                if (_healthSpin[i] != null) _healthSpin[i].Foreground = Theme.Br(Theme.Warning(_dark));
+            {
+                var sh = _healthSpin[i] as System.Windows.Shapes.Shape;
+                if (sh != null) sh.Fill = Theme.Br(Theme.Warning(_dark));
+            }
         if (_fixNote != null) _fixNote.Foreground = Muted;
     }
 
@@ -3652,8 +3672,8 @@ class CockpitWindow : Window
             {
                 _startBtn.Content = ja ? "送信" : "Send";
                 // Use accent color for primary action; same as the idle Start button.
-                _startBtn.Background = Accent;
-                _startBtn.Foreground = White;
+                _startBtn.Background = AccentFill;
+                _startBtn.Foreground = AccentFg;
             }
             if (_folderBtn != null)
             {
@@ -3671,8 +3691,8 @@ class CockpitWindow : Window
             if (_startBtn != null)
             {
                 _startBtn.Content = T("start");
-                _startBtn.Background = Accent;
-                _startBtn.Foreground = White;
+                _startBtn.Background = AccentFill;
+                _startBtn.Foreground = AccentFg;
             }
             if (_folderBtn != null)
             {
@@ -3948,7 +3968,7 @@ class CockpitWindow : Window
         _gcmdList = new ListBox { MaxHeight = 220, BorderThickness = new Thickness(0) };
         _gcmdList.Background = BtnBg;
         _gcmdList.PreviewMouseLeftButtonUp += delegate { AcceptGoalCommand(); };
-        var border = new Border { Child = _gcmdList, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(4) };
+        var border = new Border { Child = _gcmdList, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(Theme.RadCard), Padding = new Thickness(4) };
         border.Background = BtnBg; border.BorderBrush = Accent;
         _gcmdPopup = new Popup { PlacementTarget = _goalInput, Placement = PlacementMode.Top, StaysOpen = false, Width = 520 };
         _gcmdPopup.Child = border;
@@ -4155,7 +4175,7 @@ class CockpitWindow : Window
             var border = new Border();
             border.Child = sv;
             border.BorderThickness = new Thickness(1);
-            border.CornerRadius = new CornerRadius(8);
+            border.CornerRadius = new CornerRadius(Theme.RadCard);
             border.Padding = new Thickness(12, 10, 12, 10);
             border.Background = BtnBg;
             border.BorderBrush = Accent;
@@ -4256,7 +4276,7 @@ class CockpitWindow : Window
         string[] box = new string[1];
         var ok = new Button();
         ok.Content = _lang == 0 ? "生成" : "Generate"; ok.IsDefault = true;
-        ok.Background = Accent; ok.Foreground = White; ok.BorderThickness = new Thickness(0);
+        ok.Background = AccentFill; ok.Foreground = AccentFg; ok.BorderThickness = new Thickness(0);
         ok.Padding = new Thickness(14, 4, 14, 4); ok.Cursor = Cursors.Hand; ok.FontWeight = FontWeights.SemiBold;
         ok.Click += delegate { box[0] = tb.Text; w.DialogResult = true; };
         var cancel = new Button();
@@ -4296,7 +4316,7 @@ class CockpitWindow : Window
         string[] box = new string[1];
         var ok = new Button();
         ok.Content = _lang == 0 ? "続ける" : "Continue"; ok.IsDefault = true;
-        ok.Background = Accent; ok.Foreground = White; ok.BorderThickness = new Thickness(0);
+        ok.Background = AccentFill; ok.Foreground = AccentFg; ok.BorderThickness = new Thickness(0);
         ok.Padding = new Thickness(14, 4, 14, 4); ok.Cursor = Cursors.Hand; ok.FontWeight = FontWeights.SemiBold;
         ok.Click += delegate { box[0] = tb.Text; w.DialogResult = true; };
         var cancel = new Button();
@@ -4419,7 +4439,7 @@ class CockpitWindow : Window
         var directiveBorder = new Border();
         directiveBorder.BorderBrush = Theme.Br(Theme.Border(_dark));
         directiveBorder.BorderThickness = new Thickness(1);
-        directiveBorder.CornerRadius = new CornerRadius(6);
+        directiveBorder.CornerRadius = new CornerRadius(Theme.RadSmall);
         directiveBorder.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
         directiveBorder.Padding = new Thickness(10, 8, 10, 8);
         directiveBorder.Margin = new Thickness(0, 0, 0, 0);
@@ -4674,7 +4694,7 @@ class CockpitWindow : Window
         delegateBtn.IsDefault = true;
         delegateBtn.Height = Theme.BtnH;
         delegateBtn.Padding = new Thickness(20, 0, 20, 0);
-        delegateBtn.Background = Theme.Br(Theme.Accent(_dark));
+        delegateBtn.Background = Theme.Br(Theme.AccentFill(_dark));
         delegateBtn.Foreground = new SolidColorBrush(C("#FFFFFF"));
         delegateBtn.BorderThickness = new Thickness(0);
         delegateBtn.FontWeight = FontWeights.SemiBold;
@@ -4882,7 +4902,7 @@ class CockpitWindow : Window
         card.Background = Theme.Br(Theme.Surface(_dark));
         card.BorderBrush = Theme.Br(Theme.Border(_dark));
         card.BorderThickness = new Thickness(1);
-        card.CornerRadius = new CornerRadius(8);
+        card.CornerRadius = new CornerRadius(Theme.RadCard);
         card.Padding = new Thickness(4, 4, 4, 4);
         card.Margin = new Thickness(0, 4, 8, 4);
         card.MinWidth = 200;
@@ -5024,7 +5044,7 @@ class CockpitWindow : Window
 
         var card = new System.Windows.Controls.Border();
         card.Background = CardBg; card.BorderBrush = Border; card.BorderThickness = new Thickness(1);
-        card.CornerRadius = new CornerRadius(10); card.Padding = new Thickness(16, 12, 16, 14);
+        card.CornerRadius = new CornerRadius(Theme.RadPopover); card.Padding = new Thickness(16, 12, 16, 14);
         card.Margin = new Thickness(8, 6, 8, 6); card.MinWidth = 340; card.MaxWidth = 420;
         card.Effect = new System.Windows.Media.Effects.DropShadowEffect
         { BlurRadius = 16, ShadowDepth = 2, Opacity = 0.28, Color = C("#000000") };
@@ -5064,7 +5084,7 @@ class CockpitWindow : Window
     {
         var card = new Border();
         card.Background = CardBg; card.BorderBrush = Border; card.BorderThickness = new Thickness(1);
-        card.CornerRadius = new CornerRadius(10); card.Padding = new Thickness(16, 12, 16, 14);
+        card.CornerRadius = new CornerRadius(Theme.RadPopover); card.Padding = new Thickness(16, 12, 16, 14);
         card.Margin = new Thickness(0, 6, 8, 6); card.MinWidth = 280;
         // soft shadow so the floating panel reads as elevated
         card.Effect = new System.Windows.Media.Effects.DropShadowEffect
@@ -5318,14 +5338,14 @@ class CockpitWindow : Window
         if (_accessFullBtn != null)
         {
             bool sel = !restricted;
-            _accessFullBtn.Background = sel ? Theme.Br(Theme.Accent(_dark)) : BtnBg;
+            _accessFullBtn.Background = sel ? Theme.Br(Theme.AccentFill(_dark)) : BtnBg;
             _accessFullBtn.Foreground = sel ? White : Muted;
             _accessFullBtn.BorderBrush = sel ? Theme.Br(Theme.Accent(_dark)) : Border;
         }
         if (_accessRestrictedBtn != null)
         {
             bool sel = restricted;
-            _accessRestrictedBtn.Background = sel ? Theme.Br(Theme.Accent(_dark)) : BtnBg;
+            _accessRestrictedBtn.Background = sel ? Theme.Br(Theme.AccentFill(_dark)) : BtnBg;
             _accessRestrictedBtn.Foreground = sel ? White : Muted;
             _accessRestrictedBtn.BorderBrush = sel ? Theme.Br(Theme.Accent(_dark)) : Border;
         }
@@ -5674,7 +5694,7 @@ class CockpitWindow : Window
         card.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
         card.BorderBrush = Theme.Br(Theme.Danger(_dark));
         card.BorderThickness = new Thickness(1);
-        card.CornerRadius = new CornerRadius(6);
+        card.CornerRadius = new CornerRadius(Theme.RadSmall);
         card.Padding = new Thickness(8, 6, 8, 6);
         card.Margin = new Thickness(0, 0, 0, 6);
 
@@ -5690,7 +5710,7 @@ class CockpitWindow : Window
         allow.FontSize = 11.5; allow.FontWeight = FontWeights.SemiBold; allow.Cursor = Cursors.Hand;
         allow.BorderThickness = new Thickness(0); allow.Padding = new Thickness(10, 3, 10, 3);
         // Filled green, matching what green means everywhere else in this list: allowed.
-        allow.Template = FlatButtonTemplate(); allow.Background = Theme.Br(Theme.Success(_dark)); allow.Foreground = White;
+        allow.Template = FlatButtonTemplate(); allow.Background = Theme.Br(Theme.SuccessFill(_dark)); allow.Foreground = AccentFg;
         string capturedIp = ip;
         allow.Click += delegate { RunClientAdmin("grant", capturedIp); };
         DockPanel.SetDock(allow, Dock.Right); row.Children.Add(allow);
@@ -5908,7 +5928,7 @@ class CockpitWindow : Window
         border.SetValue(System.Windows.Controls.Border.BackgroundProperty, BtnBg);
         border.SetValue(System.Windows.Controls.Border.BorderBrushProperty, Border);
         border.SetValue(System.Windows.Controls.Border.BorderThicknessProperty, new Thickness(1));
-        border.SetValue(System.Windows.Controls.Border.CornerRadiusProperty, new CornerRadius(4));
+        border.SetValue(System.Windows.Controls.Border.CornerRadiusProperty, new CornerRadius(Theme.RadChip));
 
         var grid = new FrameworkElementFactory(typeof(Grid));
         var c0 = new FrameworkElementFactory(typeof(ColumnDefinition));
@@ -5967,7 +5987,7 @@ class CockpitWindow : Window
         popBd.SetValue(System.Windows.Controls.Border.BackgroundProperty, CardBg);
         popBd.SetValue(System.Windows.Controls.Border.BorderBrushProperty, Border);
         popBd.SetValue(System.Windows.Controls.Border.BorderThicknessProperty, new Thickness(1));
-        popBd.SetValue(System.Windows.Controls.Border.CornerRadiusProperty, new CornerRadius(4));
+        popBd.SetValue(System.Windows.Controls.Border.CornerRadiusProperty, new CornerRadius(Theme.RadChip));
         popBd.SetValue(System.Windows.Controls.Border.MarginProperty, new Thickness(0, 2, 0, 0));
         popBd.SetValue(FrameworkElement.MinWidthProperty, 78.0);
         var sv = new FrameworkElementFactory(typeof(ScrollViewer));
@@ -6003,7 +6023,9 @@ class CockpitWindow : Window
         // hover + selected -> an accent-tinted fill (matches the cockpit's hover idiom), still readable.
         var hover = new Trigger { Property = ComboBoxItem.IsHighlightedProperty, Value = true };
         hover.Setters.Add(new Setter(Control.BackgroundProperty,
-            new SolidColorBrush(Mix(C("#ea580c"), CardColor(), 0.22)), "Bd"));
+            // WAS #ea580c -- the accent from two revisions ago, frozen here because it was typed
+            // instead of referenced. The palette moved twice and this hover did not follow.
+            new SolidColorBrush(Mix(C(Theme.Accent(_dark)), CardColor(), 0.22)), "Bd"));
         hover.Setters.Add(new Setter(Control.ForegroundProperty, Fg));
         it.Triggers.Add(hover);
         st.Setters.Add(new Setter(Control.TemplateProperty, it));
@@ -6107,7 +6129,7 @@ class CockpitWindow : Window
         row.Children.Add(_approvalCenterLabel);
 
         _approvalCenterBadge = new Border();
-        _approvalCenterBadge.CornerRadius = new CornerRadius(8);
+        _approvalCenterBadge.CornerRadius = new CornerRadius(Theme.RadCard);
         _approvalCenterBadge.MinWidth = 18; _approvalCenterBadge.Height = 18;
         _approvalCenterBadge.Margin = new Thickness(7, 0, 0, 0);
         _approvalCenterBadge.Padding = new Thickness(4, 0, 4, 0);
@@ -6474,7 +6496,7 @@ class CockpitWindow : Window
     {
         _mtBanner = new Border();
         _mtBanner.Visibility = Visibility.Collapsed;
-        _mtBanner.CornerRadius = new CornerRadius(10);
+        _mtBanner.CornerRadius = new CornerRadius(Theme.RadPopover);
         _mtBanner.BorderThickness = new Thickness(1);
         _mtBanner.Padding = new Thickness(14, 9, 12, 9);
         _mtBanner.Margin = new Thickness(26, 0, 18, 6);
@@ -6537,7 +6559,7 @@ class CockpitWindow : Window
     {
         _capBanner = new Border();
         _capBanner.Visibility = Visibility.Collapsed;
-        _capBanner.CornerRadius = new CornerRadius(10);
+        _capBanner.CornerRadius = new CornerRadius(Theme.RadPopover);
         _capBanner.BorderThickness = new Thickness(1);
         _capBanner.Padding = new Thickness(14, 9, 12, 9);
         _capBanner.Margin = new Thickness(26, 0, 18, 6);
@@ -6804,7 +6826,7 @@ class CockpitWindow : Window
     {
         _gateBanner = new Border();
         _gateBanner.Visibility = Visibility.Collapsed;
-        _gateBanner.CornerRadius = new CornerRadius(10);
+        _gateBanner.CornerRadius = new CornerRadius(Theme.RadPopover);
         // Uniform, not a thicker left edge: a one-sided stripe reads as sticky-note
         // decoration. The banner's border colour already carries the urgency.
         _gateBanner.BorderThickness = new Thickness(1);
@@ -6892,7 +6914,7 @@ class CockpitWindow : Window
             var gCard = new Border();
             gCard.BorderBrush = Theme.Br(Theme.Warning(_dark));
             gCard.BorderThickness = new Thickness(1);
-            gCard.CornerRadius = new CornerRadius(6);
+            gCard.CornerRadius = new CornerRadius(Theme.RadSmall);
             gCard.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
             gCard.Padding = new Thickness(10, 8, 10, 8);
             gCard.Margin = new Thickness(0, 0, 0, gi < showCount - 1 ? 8 : 0);
@@ -6932,8 +6954,8 @@ class CockpitWindow : Window
             approveBtn.Padding = new Thickness(14, 4, 14, 4);
             approveBtn.FontWeight = FontWeights.SemiBold;
             approveBtn.FontSize = 12;
-            approveBtn.Background = Theme.Br(Theme.Accent(_dark));
-            approveBtn.Foreground = White;
+            approveBtn.Background = Theme.Br(Theme.AccentFill(_dark));
+            approveBtn.Foreground = AccentFg;
             bool reviewFirst = GateNeedsSecondConfirmation(g2) || GateKind(g2) == "Skill";
             approveBtn.Content = reviewFirst
                 ? (ja3 ? "詳細を確認" : "Review details")
@@ -7080,7 +7102,7 @@ class CockpitWindow : Window
     {
         var box = new Border(); box.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
         box.BorderBrush = Border; box.BorderThickness = new Thickness(1);
-        box.CornerRadius = new CornerRadius(8); box.Padding = new Thickness(14, 12, 14, 12);
+        box.CornerRadius = new CornerRadius(Theme.RadCard); box.Padding = new Thickness(14, 12, 14, 12);
         box.Margin = new Thickness(0, 0, 0, 20);
         var col = new StackPanel();
         var title = new TextBlock(); title.Text = _lang == 0 ? "操作承認ポリシー" : "Operation approval policy";
@@ -7183,7 +7205,7 @@ class CockpitWindow : Window
         {
             var empty = new Border(); empty.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
             empty.BorderBrush = Border; empty.BorderThickness = new Thickness(1);
-            empty.CornerRadius = new CornerRadius(8); empty.Padding = new Thickness(16, 18, 16, 18);
+            empty.CornerRadius = new CornerRadius(Theme.RadCard); empty.Padding = new Thickness(16, 18, 16, 18);
             var text = new TextBlock();
             text.Text = _lang == 0 ? "未処理の承認はありません。" : "No approvals are waiting.";
             text.Foreground = Muted; text.FontSize = 13; empty.Child = text;
@@ -7209,14 +7231,14 @@ class CockpitWindow : Window
         // Actionable cards are marked by border COLOUR, not by a fatter left edge --
         // a one-sided stripe reads as sticky-note decoration.
         card.BorderThickness = new Thickness(1);
-        card.CornerRadius = new CornerRadius(8); card.Padding = new Thickness(14, 12, 14, 12);
+        card.CornerRadius = new CornerRadius(Theme.RadCard); card.Padding = new Thickness(14, 12, 14, 12);
         card.Margin = new Thickness(0, 0, 0, 10);
         var col = new StackPanel();
 
         var meta = new DockPanel(); meta.LastChildFill = true;
         var chip = new Border(); chip.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
         chip.BorderBrush = actionable ? Theme.Br(Theme.Warning(_dark)) : Border;
-        chip.BorderThickness = new Thickness(1); chip.CornerRadius = new CornerRadius(8);
+        chip.BorderThickness = new Thickness(1); chip.CornerRadius = new CornerRadius(Theme.RadCard);
         chip.Padding = new Thickness(7, 2, 7, 2); chip.Margin = new Thickness(0, 0, 8, 0);
         var chipText = new TextBlock(); chipText.Text = GateKind(gate); chipText.FontSize = 10;
         chipText.FontWeight = FontWeights.SemiBold; chipText.Foreground = actionable ? Theme.Br(Theme.Warning(_dark)) : Muted;
@@ -7249,7 +7271,7 @@ class CockpitWindow : Window
             var row = new StackPanel(); row.Orientation = Orientation.Horizontal; row.Margin = new Thickness(0, 12, 0, 0);
             var approve = new Button(); approve.Content = _lang == 0 ? "承認" : "Approve";
             approve.Cursor = Cursors.Hand; approve.Padding = new Thickness(18, 6, 18, 6);
-            approve.BorderThickness = new Thickness(0); approve.Background = Accent; approve.Foreground = White;
+            approve.BorderThickness = new Thickness(0); approve.Background = AccentFill; approve.Foreground = AccentFg;
             approve.FontWeight = FontWeights.SemiBold; approve.IsEnabled = !expired;
             System.Windows.Automation.AutomationProperties.SetName(approve, _lang == 0 ? "この操作を承認" : "Approve this operation");
             Dictionary<string, object> captured = gate;
@@ -7372,7 +7394,7 @@ class CockpitWindow : Window
         bd.SetValue(System.Windows.Controls.Border.BackgroundProperty, new TemplateBindingExtension(Control.BackgroundProperty));
         bd.SetValue(System.Windows.Controls.Border.BorderBrushProperty, new TemplateBindingExtension(Control.BorderBrushProperty));
         bd.SetValue(System.Windows.Controls.Border.BorderThicknessProperty, new TemplateBindingExtension(Control.BorderThicknessProperty));
-        bd.SetValue(System.Windows.Controls.Border.CornerRadiusProperty, new CornerRadius(4));
+        bd.SetValue(System.Windows.Controls.Border.CornerRadiusProperty, new CornerRadius(Theme.RadChip));
         var cp = new FrameworkElementFactory(typeof(ContentPresenter));
         cp.SetValue(ContentPresenter.HorizontalAlignmentProperty, leftAlign ? HorizontalAlignment.Left : HorizontalAlignment.Center);
         cp.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
@@ -7476,7 +7498,7 @@ class CockpitWindow : Window
         }
         if (_composerWatermark != null) _composerWatermark.Foreground = Muted;
         if (_composerHint != null) _composerHint.Foreground = Muted;
-        if (_startBtn != null) { _startBtn.Background = Accent; _startBtn.Foreground = White; }
+        if (_startBtn != null) { _startBtn.Background = AccentFill; _startBtn.Foreground = AccentFg; }
         if (_folderBtn != null) { _folderBtn.Background = Brushes.Transparent; _folderBtn.Foreground = Fg; _folderBtn.BorderBrush = Theme.Br(Theme.BorderStrong(_dark)); }
         if (_startNote != null) _startNote.Foreground = Muted;
         // Banners: a quiet surface card with a 3px warning LEFT rail (spec), not an orange fill.
@@ -8729,7 +8751,7 @@ class CockpitWindow : Window
 
         var bar = new Border();
         bar.BorderThickness = new Thickness(1); bar.BorderBrush = Border;
-        bar.Background = CardBg; bar.CornerRadius = new CornerRadius(10);
+        bar.Background = CardBg; bar.CornerRadius = new CornerRadius(Theme.RadPopover);
         bar.Padding = new Thickness(12, 8, 12, 8); bar.Margin = new Thickness(8, 2, 8, 8);
         // clicks inside the toolbar must not bubble (it isn't a card, but stay safe)
         bar.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; };
@@ -8781,7 +8803,7 @@ class CockpitWindow : Window
         seg.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
         seg.BorderBrush = Theme.Br(Theme.Border(_dark));
         seg.BorderThickness = new Thickness(1);
-        seg.CornerRadius = new CornerRadius(6);
+        seg.CornerRadius = new CornerRadius(Theme.RadSmall);
         seg.VerticalAlignment = VerticalAlignment.Center;
         var segRow = new StackPanel(); segRow.Orientation = Orientation.Horizontal;
 
@@ -9139,7 +9161,7 @@ class CockpitWindow : Window
         var row = new Border();
         row.BorderThickness = new Thickness(1);
         row.BorderBrush = Border; row.Background = CardBg;
-        row.CornerRadius = new CornerRadius(9);
+        row.CornerRadius = new CornerRadius(Theme.RadCard);
         row.Padding = new Thickness(14, 8, 14, 8); row.Margin = new Thickness(8, 3, 8, 3);
 
         var col = new StackPanel();
@@ -9672,7 +9694,7 @@ class CockpitWindow : Window
                 meta.Append(name.ToUpper());
                 if (turn > 0) meta.Append(" · ").Append(T("turn")).Append(' ').Append(turn);
                 if (reviews > 0) meta.Append(" · ").Append(_lang == 0 ? ("確認 " + reviews + " 回") : ("reviewed " + reviews));
-                if (verifiedOk) meta.Append(" · ").Append(_lang == 0 ? "✓ 検証OK" : "✓ verified");
+                if (verifiedOk) meta.Append(" · ").Append(_lang == 0 ? "検証OK" : "verified");
                 var ml = new TextBlock
                 {
                     Text = meta.ToString(), Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 12,
@@ -9714,7 +9736,7 @@ class CockpitWindow : Window
                     else                            tintHex = _dark ? "#2a1a1a" : "#f5e8e8";  // low / unknown
 
                     var confChip = new Border();
-                    confChip.CornerRadius = new CornerRadius(4);
+                    confChip.CornerRadius = new CornerRadius(Theme.RadChip);
                     confChip.Background = Theme.Br(tintHex);
                     confChip.Padding = new Thickness(6, 1, 6, 1);
                     confChip.Margin = new Thickness(24, 3, 0, 0);
@@ -9798,7 +9820,8 @@ class CockpitWindow : Window
             int idx = i;
             var tcol = new StackPanel();
             var tt = new TextBlock { Text = labels[i], FontSize = 12.5, Margin = new Thickness(0, 0, 0, 4) };
-            var un = new Border { Height = 2, CornerRadius = new CornerRadius(1) };
+            // Half the height: a fully rounded cap on the underline. Geometry, not style.
+        var un = new Border { Height = 2, CornerRadius = new CornerRadius(2 / 2.0) };
             tcol.Children.Add(tt); tcol.Children.Add(un);
             txts[i] = tt; unders[i] = un;
             var box = new Border { Child = tcol, Cursor = Cursors.Hand, Background = Brushes.Transparent, Margin = new Thickness(0, 0, 16, 0) };
@@ -10001,7 +10024,7 @@ class CockpitWindow : Window
             string full = files[i];
             var chip = new Border {
                 BorderThickness = new Thickness(1), BorderBrush = Border, Background = BtnBg,
-                CornerRadius = new CornerRadius(6), Padding = new Thickness(8, 2, 8, 2),
+                CornerRadius = new CornerRadius(Theme.RadSmall), Padding = new Thickness(8, 2, 8, 2),
                 Margin = new Thickness(0, 0, 6, 4), Cursor = Cursors.Hand };
             var tb = new TextBlock {
                 Text = Path.GetFileName(full), Foreground = Theme.Br(Theme.Info(_dark)),
@@ -10274,7 +10297,7 @@ class CockpitWindow : Window
         sb.Append("  turn=").Append(S(w, "turn")).Append("  verify_attempts=").Append(S(w, "verify_attempts"));
         sb.Append("  verified=").Append(S(w, "verified")).Append('\n');
         if (!string.IsNullOrEmpty(reason)) sb.Append("\nreason:\n").Append(reason).Append('\n');
-        var box = new Border { Background = QuoteBg, CornerRadius = new CornerRadius(8), Padding = new Thickness(12, 10, 12, 10) };
+        var box = new Border { Background = QuoteBg, CornerRadius = new CornerRadius(Theme.RadCard), Padding = new Thickness(12, 10, 12, 10) };
         var t = RoText(sb.ToString(), Muted, 12);
         t.FontFamily = new FontFamily(Theme.CodeFont);
         t.MaxHeight = 220;
@@ -10308,10 +10331,10 @@ class CockpitWindow : Window
         foreach (var t in turns)
         {
             bool user = t.Item1 == "U";
-            var b = new Border { Background = QuoteBg, CornerRadius = new CornerRadius(6),
+            var b = new Border { Background = QuoteBg, CornerRadius = new CornerRadius(Theme.RadSmall),
                                  Padding = new Thickness(10, 7, 10, 7), Margin = new Thickness(0, 0, 0, 5) };
             var sp = new StackPanel();
-            var who = new TextBlock { Text = user ? (_lang == 0 ? "▶ 指示 / あなた" : "▶ Instruction / You") : (_lang == 0 ? "● エージェント" : "● Agent"), FontSize = 11,
+            var who = new TextBlock { Text = user ? (_lang == 0 ? "指示 / あなた" : "Instruction / You") : (_lang == 0 ? "エージェント" : "Agent"), FontSize = 11,
                                       FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 3) };
             who.Foreground = user ? Accent : Muted;
             sp.Children.Add(who);
@@ -10383,7 +10406,9 @@ class CockpitWindow : Window
         outer.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; };
 
         var send = new Button();
-        send.Content = "↳";   // "↳" -- icon-only so the row stays one line
+        // Icon-only so the row stays one line. Was U+21B3, which is a typographic arrow and
+        // not a control: nothing set its weight or its size but the fallback font.
+        send.Content = MakeIcon("subdirectory_arrow_left", 14, Muted);
         send.ToolTip = _lang == 0 ? "送信" : "Send";
         send.Background = Brushes.Transparent; send.Foreground = Muted;
         send.BorderThickness = new Thickness(0); send.Cursor = Cursors.Hand; send.FontSize = 13;
@@ -10470,7 +10495,7 @@ class CockpitWindow : Window
 
         // mini-composer wrapper border (matches bottom composer look, smaller)
         var composerBorder = new Border();
-        composerBorder.CornerRadius = new CornerRadius(8);
+        composerBorder.CornerRadius = new CornerRadius(Theme.RadCard);
         composerBorder.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
         composerBorder.BorderBrush = Border;
         composerBorder.BorderThickness = new Thickness(1);
@@ -10561,7 +10586,7 @@ class CockpitWindow : Window
         outer.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; };
 
         var composerBorder = new Border();
-        composerBorder.CornerRadius = new CornerRadius(8);
+        composerBorder.CornerRadius = new CornerRadius(Theme.RadCard);
         composerBorder.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
         composerBorder.BorderBrush = Border;
         composerBorder.BorderThickness = new Thickness(1);
@@ -10670,7 +10695,7 @@ class CockpitWindow : Window
         dp.Children.Add(note);
         var btn = new Button();
         btn.Content = T("retry");
-        btn.Background = Accent; btn.Foreground = White; btn.BorderThickness = new Thickness(0);
+        btn.Background = AccentFill; btn.Foreground = AccentFg; btn.BorderThickness = new Thickness(0);
         btn.Padding = new Thickness(12, 4, 12, 4); btn.Cursor = Cursors.Hand; btn.FontSize = 12;
         btn.FontWeight = FontWeights.SemiBold;
         DockPanel.SetDock(btn, Dock.Right);
@@ -10825,7 +10850,7 @@ class CockpitWindow : Window
         var b = new Border();
         b.Background = Brushes.Transparent;
         b.BorderBrush = color; b.BorderThickness = new Thickness(1);
-        b.CornerRadius = new CornerRadius(4);
+        b.CornerRadius = new CornerRadius(Theme.RadChip);
         b.Padding = new Thickness(5, 0, 5, 0);
         b.Margin = new Thickness(0, 0, 5, 0);
         b.VerticalAlignment = VerticalAlignment.Center;
@@ -10850,7 +10875,7 @@ class CockpitWindow : Window
         // Tight rounded-rect tag (not a CornerRadius=999 stadium oval). The oval shape left
         // empty space inside the frame on each side of a short label like "完了", which read as a
         // floating "枠"/gap between the chip and the goal text. A small radius hugs the label.
-        b.CornerRadius = new CornerRadius(4);
+        b.CornerRadius = new CornerRadius(Theme.RadChip);
         b.Padding = new Thickness(6, 1, 6, 1);
         b.VerticalAlignment = VerticalAlignment.Center;
         var t = new TextBlock();

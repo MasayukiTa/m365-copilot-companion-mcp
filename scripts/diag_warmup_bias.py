@@ -75,6 +75,11 @@ def main(argv=None):
     ap.add_argument("--idle-s", type=float, default=0.0,
                     help="seconds to sit still after the run, measuring passive decay")
     ap.add_argument("--tag", default="")
+    # A LUMP COST CANNOT SIZE A PER-WORKER RESERVATION. Everything measured so far ran three
+    # workers at once, so it prices a whole arm and says nothing about what admitting one more
+    # worker costs -- which is the only question an admission gate asks. Varying this and
+    # reading the slope is what separates the two.
+    ap.add_argument("--concurrency", default="3")
     a = ap.parse_args(argv)
 
     os.makedirs(OUT, exist_ok=True)
@@ -92,6 +97,14 @@ def main(argv=None):
          "--port", CDP.rsplit(":", 1)[-1].split("/")[0],
          "--out", base + "_ws.csv", "--interval", "3"],
         cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # THE OTHER SIDE OF THE BOUNDARY, PER RUN. The browser sampler stops at the CDP owner's
+    # tree, and socket work also lands in the process holding the websocket. Started here rather
+    # than shared across a night so each run owns its own trace: a shared file has to be carved
+    # back up by timestamp afterwards, and mis-carving it is how two runs end up in one column.
+    client = subprocess.Popen(
+        [sys.executable, "-u", os.path.join(REPO, "scripts", "win", "watch_client_ws.py"),
+         "--pattern", "run_route_campaign", "--out", base + "_client.csv", "--interval", "3"],
+        cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         time.sleep(12)                       # a settled reading of the fresh browser
         _stamp(events, "settled_fresh")
@@ -99,7 +112,7 @@ def main(argv=None):
         # NO --warmup. That is the whole point: arm one meets a cold browser.
         args = ["--null"] + (["--socket-both"] if a.transport == "socket" else [])
         env = dict(os.environ)
-        env["MCP_FLEET_MAX_CONCURRENT"] = "3"
+        env["MCP_FLEET_MAX_CONCURRENT"] = a.concurrency
         env["MCP_FLEET_CDP_URL"] = CDP
         env["PYTHONIOENCODING"] = "utf-8"
         env.setdefault("SWE_DISK_FLOOR_GB", "3")
@@ -119,11 +132,12 @@ def main(argv=None):
             time.sleep(a.idle_s)
             _stamp(events, "idle_end")
     finally:
-        witness.terminate()
-        try:
-            witness.wait(timeout=10)
-        except Exception:
-            witness.kill()
+        for proc in (witness, client):
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                proc.kill()
 
     try:
         with open(os.path.join(REPO, "docs", "research", "results",
@@ -133,6 +147,7 @@ def main(argv=None):
         rec = {}
     with open(base + "_events.json", "w", encoding="utf-8") as fh:
         json.dump({"transport": a.transport, "cdp_url": CDP, "idle_s": a.idle_s,
+                   "concurrency": a.concurrency,
                    "events": events, "warmup": rec.get("warmup"),
                    "control": rec.get("control"), "candidate": rec.get("candidate"),
                    "memory_gain_mb": rec.get("memory_gain_mb")}, fh, indent=1)

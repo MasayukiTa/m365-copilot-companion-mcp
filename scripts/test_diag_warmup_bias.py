@@ -45,3 +45,17 @@ def test_it_records_when_each_thing_happened():
 def test_it_measures_absolute_working_set_not_a_delta():
     """争点は全て『基準線に何が入っているか』。その基準線からの差では、基準線を語れない。"""
     assert "watch_tree_ws.py" in SRC
+
+
+def test_the_concurrency_is_settable_and_recorded():
+    """塊としての費用では、ワーカー1人あたりの予約を決められない。
+
+    これまでの測定は全て同時3で走っており、アーム全体の値しか出ない。受け入れ制御が
+    訊いているのは『もう1人入れたらいくらか』だけなので、同時実行数を振って傾きを取る。
+    そして振った値が結果に残らなければ、後から傾きを引けない -- 今夜すでに、記録されて
+    いない条件が別々の走行を1つの籠に入れる事故を2回起こしている。"""
+    assert '"--concurrency"' in SRC, "同時実行数を振れない"
+    assert 'env["MCP_FLEET_MAX_CONCURRENT"] = a.concurrency' in SRC, "振った値が渡っていない"
+    assert '"concurrency": a.concurrency' in SRC, "振った値が結果に残らない"
+    # 3 決め打ちが残っていないこと
+    assert 'MCP_FLEET_MAX_CONCURRENT"] = "3"' not in SRC
