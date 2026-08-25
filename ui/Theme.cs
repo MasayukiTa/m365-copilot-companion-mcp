@@ -120,6 +120,26 @@ static class Theme
     // strays snapped to the nearest token (9->8, 7->6, 14->12), a change of at most two pixels.
     // Radii that are geometry rather than style -- half of a dot's width, half of an underline's
     // height -- stay computed at their call site and are deliberately not tokens.
+    // ── spacing ───────────────────────────────────────────────────────────────────
+    // A SCALE, MEASURED INTO EXISTENCE RATHER THAN ASSUMED. Before this there were 2,266 spacing
+    // numbers across 28 distinct values, with essentially every integer from 1 to 16 in use --
+    // the same shape as the radii, thirty times bigger. Structural space now steps in fours.
+    //
+    // Below the scale sits a documented exception: 1, 2, 3, 5, 6 and 7 remain in wide use and are
+    // NOT errors. That range is where you stop laying out and start adjusting for the eye -- the
+    // pixel that centres an icon against a cap height, the two that keep a dense row off its
+    // divider -- and rounding those to four would damage the rows rather than tidy them.
+    //
+    // ui/test_spacing_scale.py holds the set of values actually in use and fails when a NEW one
+    // appears. It can shrink, never grow: the problem was not any single number, it was that
+    // nothing stopped the next one.
+    public const double Sp1 = 4;
+    public const double Sp2 = 8;
+    public const double Sp3 = 12;
+    public const double Sp4 = 16;
+    public const double Sp5 = 24;
+    public const double Sp6 = 32;
+
     public const double RadChip     = 4;  // chips, pills, tags
     public const double RadSmall    = 6;  // small controls
     public const double RadCard     = 8;  // cards
