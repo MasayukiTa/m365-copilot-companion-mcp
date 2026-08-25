@@ -9,6 +9,13 @@ from typing import Optional
 from .file_ops import _validate_path
 from .security import require_unlocked
 
+#: Largest file the pure-Python grep fallback will open. Not a policy about what is worth
+#: searching -- a bound on what one tool call can cost the server, which is shared and
+#: long-lived. Files above it are reported, never silently dropped. Raise it with
+#: MCP_GREP_MAX_FILE_MB when a genuinely large file has to be searched; installing ripgrep
+#: removes the fallback (and this bound) altogether.
+_GREP_MAX_FILE_BYTES = int(float(os.environ.get("MCP_GREP_MAX_FILE_MB", "8")) * 1024 * 1024)
+
 
 def _run(args: list[str], cwd: Optional[Path], timeout: int) -> str:
     result = subprocess.run(
@@ -56,22 +63,44 @@ def grep(
             args.extend(["--max-count", str(max_matches), pattern, str(target)])
             return _run(args, None, 30)
 
+        # STREAMED, AND BOUNDED BY FILE SIZE. This fallback used to do
+        # `read_text().splitlines()`, which holds the WHOLE file as one str and then a list of
+        # every line on top of it -- roughly five times the file on disk, per file, per thread.
+        #
+        # Measured 2026-08-25: `rg` is not on PATH on this machine, so every call lands here;
+        # the repository carries a 48 MB faulthandler.log plus ~40 MB of other large files; and
+        # the fleet calls this tool from several AnyIO worker threads at once. The MCP server
+        # grew from 222 MB to 2.4 GB in five minutes, then to over 5 GB, until free RAM fell
+        # under the fleet's own recycle floor and a run hard-reset the shared browser out from
+        # under its sibling. py-spy on the live process is what named this line.
         matches: list[str] = []
-        files = [target] if target.is_file() else [p for p in target.rglob("*") if p.is_file()]
+        files = ([target] if target.is_file()
+                 else (p for p in target.rglob("*") if p.is_file()))
         needle = pattern if case_sensitive else pattern.lower()
+        skipped_big = 0
         for file_path in files:
             if glob and not file_path.match(glob):
                 continue
             try:
-                for line_no, line in enumerate(file_path.read_text(encoding="utf-8").splitlines(), 1):
-                    hay = line if case_sensitive else line.lower()
-                    if needle in hay:
-                        matches.append(f"{file_path}:{line_no}:{line}")
-                        if len(matches) >= max_matches:
-                            return "\n".join(matches)
-            except UnicodeDecodeError:
+                if file_path.stat().st_size > _GREP_MAX_FILE_BYTES:
+                    # NAMED, NOT DROPPED. A search that silently skipped the biggest files
+                    # would read as "no matches" -- the one answer a grep must never fake.
+                    skipped_big += 1
+                    continue
+                with open(file_path, encoding="utf-8", errors="strict") as fh:
+                    for line_no, line in enumerate(fh, 1):
+                        line = line.rstrip("\n").rstrip("\r")
+                        hay = line if case_sensitive else line.lower()
+                        if needle in hay:
+                            matches.append(f"{file_path}:{line_no}:{line}")
+                            if len(matches) >= max_matches:
+                                return "\n".join(matches)
+            except (UnicodeDecodeError, OSError):
                 continue
-        return "\n".join(matches) if matches else "(no matches)"
+        note = ("" if not skipped_big else
+                "\n[%d file(s) larger than %d MB were not searched]"
+                % (skipped_big, _GREP_MAX_FILE_BYTES // (1024 * 1024)))
+        return ("\n".join(matches) + note) if matches else ("(no matches)" + note)
     except Exception as e:
         return f"[grep error: {type(e).__name__}: {e}]"
 
