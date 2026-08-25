@@ -23,29 +23,34 @@ def test_a_plausible_reply_is_not_proof(monkeypatch):
     assert "last_inbound_ts" in src, "証拠が文字列照合に戻っている"
 
 
+def _probe(monkeypatch, value):
+    """実物の tool_probe に差し替えを当てる。
+
+    sys.modules["tools.tool_probe"] を置き換えても `from tools import tool_probe` は
+    パッケージ属性を見るので効かない -- 最初にそう書き、2つのテストがどちらも実機の
+    タイムスタンプを読んでいた。片方はたまたま通っていただけで、今夜2度目の
+    「実機を読んで別の理由で緑になる」だった。"""
+    from tools import tool_probe
+    if isinstance(value, Exception):
+        def boom():
+            raise value
+        monkeypatch.setattr(tool_probe, "last_inbound_ts", boom)
+    else:
+        monkeypatch.setattr(tool_probe, "last_inbound_ts", lambda: value)
+
+
 def test_an_arriving_tool_call_is_proof(monkeypatch):
     """カスタムエージェントにしかできないのは MCP コネクタに届くこと。
     届けば、この機械自身のサーバが刻む。"""
     monkeypatch.setattr(F, "_PROCESS_START", 1000.0)
-
-    class _Probe:
-        @staticmethod
-        def last_inbound_ts():
-            return 2000.0
-
-    monkeypatch.setitem(__import__("sys").modules, "tools.tool_probe", _Probe)
+    _probe(monkeypatch, 2000.0)
     assert F.connector_proven() is True
 
 
 def test_no_tool_call_since_the_run_began_is_not_proof(monkeypatch):
+    """走行より前の呼び出しは、この走行のコネクタについて何も言わない。"""
     monkeypatch.setattr(F, "_PROCESS_START", 3000.0)
-
-    class _Probe:
-        @staticmethod
-        def last_inbound_ts():
-            return 2000.0          # 走行より前の呼び出し
-
-    monkeypatch.setitem(__import__("sys").modules, "tools.tool_probe", _Probe)
+    _probe(monkeypatch, 2000.0)
     assert F.connector_proven() is False
 
 
@@ -53,12 +58,8 @@ def test_unknowable_is_not_proven(monkeypatch):
     """判定できないときは従来の診断を残す。保守的な向きはこちら --
     ブラウザを見に行かせて時間を無駄にするほうが、壊れたコネクタを『問題なし』と
     言って走行を失うよりまし。"""
-    class _Broken:
-        @staticmethod
-        def last_inbound_ts():
-            raise RuntimeError("probe unavailable")
-
-    monkeypatch.setitem(__import__("sys").modules, "tools.tool_probe", _Broken)
+    monkeypatch.setattr(F, "_PROCESS_START", 1000.0)
+    _probe(monkeypatch, RuntimeError("probe unavailable"))
     assert F.connector_proven() is False
 
 
