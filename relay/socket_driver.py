@@ -22,6 +22,7 @@ and the answer grows under a lock. The loop polls exactly as it does against a t
 """
 from __future__ import annotations
 
+import os
 import re
 import threading
 import time
@@ -177,6 +178,19 @@ class CopilotSocketDriver:
                 pass
 
         try:
+            # A DELIBERATE WAY TO FAIL, because the failure path is the one that matters and
+            # nothing could reach it on purpose. Every socket fault seen so far arrived by
+            # luck, hours apart, in the middle of real work -- a poor way to find out whether
+            # the bridge notices a dead turn or waits ten minutes and hands back a fragment.
+            # Off unless the variable is set; its value is how many more turns to fail, so a
+            # verification can watch the recovery as well as the failure.
+            _forced = os.environ.get("MCP_SOCKET_FORCE_FAIL", "").strip()
+            if _forced:
+                left = int(_forced)
+                if left > 0:
+                    os.environ["MCP_SOCKET_FORCE_FAIL"] = str(left - 1)
+                    raise ChatHubError(
+                        "forced failure (MCP_SOCKET_FORCE_FAIL), %d left" % (left - 1))
             answer = self.conv.ask(text, connect=self._connect, on_text=on_text,
                                    on_progress=on_progress,
                                    catalogue=self._catalogue, protocol=self._protocol,
