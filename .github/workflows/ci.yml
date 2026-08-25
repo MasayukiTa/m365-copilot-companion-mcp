@@ -134,6 +134,7 @@ jobs:
             bridge/test_session_store.py \
             bridge/test_session_store_sqlite.py \
             bridge/test_delete_conversation.py \
+            bridge/test_page_revival.py \
             bridge/test_conv_capture_selectors.py \
             bridge/test_one_turn_gate.py \
             relay/selfimprove/test_settle_gate.py \
