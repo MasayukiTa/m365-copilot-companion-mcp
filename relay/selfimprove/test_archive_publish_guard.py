@@ -104,6 +104,17 @@ def test_a_differently_cased_path_is_the_same_file(tmp_path, monkeypatch):
     import relay.selfimprove.archive as A
     fake = tmp_path / "entries.jsonl"
     monkeypatch.setattr(A, "_DEFAULT_ARCHIVE", str(fake))
+
+    # THE GUARD IS ABOUT CASE-INSENSITIVE FILESYSTEMS, so on a case-SENSITIVE one there is
+    # nothing for it to catch: the uppercased path really is a different file, and refusing it
+    # would be the bug. Asserting the refusal anyway made this fail on Linux with a
+    # PermissionError from writing /HOME/RUNNER/... -- invisible for as long as the manifest
+    # audit stopped the job before pytest ran.
+    probe = tmp_path / "CaseProbe"
+    probe.write_text("x", encoding="utf-8")
+    if not (tmp_path / "caseprobe").exists():
+        pytest.skip("case-sensitive filesystem; this guard has nothing to catch here")
+
     shouty = str(fake).replace(str(tmp_path.name), str(tmp_path.name).upper()) \
         if os.name == "nt" else str(fake).upper()
     with pytest.raises(NotPublishable):

@@ -39,12 +39,20 @@ def test_never_seen_reads_as_zero_not_none(inbound):
     assert TP.last_inbound_ts() == 0.0
 
 
-def test_it_cannot_fail_a_tool_call(inbound, monkeypatch):
+def test_it_cannot_fail_a_tool_call(inbound, monkeypatch, tmp_path):
     """ホットパス上にある。記録の失敗で tool 呼び出しを落としてはいけない。"""
-    monkeypatch.setattr(TP, "_INBOUND_PATH", tmp := TP.Path("Z:/nonexistent/x.json"))
+    # A DRIVE LETTER IS NOT UNWRITABLE EVERYWHERE. "Z:/nonexistent/x.json" is a nonexistent
+    # drive on Windows and a perfectly ordinary relative directory named "Z:" on Linux, so the
+    # write succeeded there and this returned True. The failure was invisible for as long as
+    # the manifest audit stopped the job before pytest ran.
+    #
+    # A file used as a directory fails on both: ENOTDIR on Linux, and the same refusal from
+    # Windows.
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(TP, "_INBOUND_PATH", TP.Path(str(blocker / "x.json")))
     assert TP.note_inbound("list_directory", {"path": str(TP._CHALLENGE_DIR)}) is False
     assert TP.last_inbound_ts() == 0.0
-    assert tmp  # 参照して未使用警告を避ける
 
 
 def test_the_gateway_stamps_before_it_dispatches():
