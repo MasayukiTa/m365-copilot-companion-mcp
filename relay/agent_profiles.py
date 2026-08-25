@@ -746,8 +746,8 @@ class ResearchSession:
             if self._socket_retry(reason):
                 return None
             try:
-                from relay.relay_fleet import _socket_route
-                _socket_route().note_failure("research: %s" % reason)
+                from relay.relay_fleet import _socket_route, report_route_fault
+                report_route_fault("research: %s" % reason)
                 _socket_route().record("fallback", worker="research",
                                        goal=(self.query or "")[:600], reason=reason[:300])
             except Exception:

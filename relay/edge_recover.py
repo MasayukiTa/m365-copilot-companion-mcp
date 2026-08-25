@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import time
 
@@ -94,6 +95,52 @@ MANAGED_EDGE_PROFILES = {
     9223: "copilot-bridge-edge",      # the interactive bridge
     9224: "copilot-eval-edge",        # the measurement series' own browser
 }
+
+
+
+def _cdp_port_of(cmdline, default=9222):
+    """The CDP port a fleet run is pointed at, from its command line."""
+    m = re.search(r"--cdp-url\s+\S*?:(\d+)", cmdline or "")
+    return int(m.group(1)) if m else default
+
+
+def other_fleet_runs(port=9222, exclude_pid=None):
+    """PIDs of OTHER fleet runs driving the same companion Edge. [] if none or unknown.
+
+    WHY THIS EXISTS. This Edge profile is shared and there is no way to give each run its
+    own, so a reset is not a local act: on 2026-08-25 four runs shared :9222, one of them
+    started, found free RAM under its recycle floor and hard-reset the browser -- and the
+    run beside it lost its live context mid-turn and had to resume its goals. Three runs
+    logged six of those recoveries between them that evening.
+
+    Unknown counts as "no siblings", deliberately. psutil may be missing and enumeration can
+    fail, and the alternative -- refusing to recover a wedged browser because we could not
+    prove we were alone -- turns a diagnostic gap into an outage.
+    """
+    try:
+        import psutil
+    except Exception:
+        return []
+    me = os.getpid() if exclude_pid is None else exclude_pid
+    found = []
+    try:
+        for p in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                if "python" not in (p.info.get("name") or "").lower():
+                    continue
+                cmd = " ".join(p.info.get("cmdline") or [])
+                if "relay.fleet_runner" not in cmd and "fleet_runner.py" not in cmd:
+                    continue
+                if p.info["pid"] in (me, os.getppid()):
+                    continue
+                if _cdp_port_of(cmd) != int(port):
+                    continue
+                found.append(p.info["pid"])
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return found
 
 
 def keeper_profile_marker():

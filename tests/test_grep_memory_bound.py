@@ -80,7 +80,10 @@ def test_a_binary_file_does_not_take_the_search_down(monkeypatch, tmp_path):
     (tmp_path / "a.txt").write_text("needle\n", encoding="utf-8")
     out = coding_ops.grep("needle", str(tmp_path))
     assert "a.txt" in out
-    assert "error" not in out.lower()
+    assert not out.startswith("[grep error:"), out
+    # 途中で読めなくなったファイルがあったことは**述べる**。以前この検査は
+    # "error" が本文に出ないことを見ていて、開示そのものを禁じてしまっていた。
+    assert "decoding error" in out
 
 
 def test_the_cap_is_configurable_without_editing_source():
@@ -149,3 +152,39 @@ def test_find_files_skips_a_directory_named_like_the_needle(monkeypatch, tmp_pat
     (tmp_path / "hit_file.txt").write_text("x", encoding="utf-8")
     out = search_ops.find_files("hit_", str(tmp_path))
     assert "hit_file.txt" in out and "hit_dir" not in out
+
+
+def test_the_skip_note_survives_the_early_return(monkeypatch, tmp_path):
+    """max_matches に達した時の早期 return がお知らせを落としていた。
+    そこは「他にも一致がある」場面そのもので、読み手が最も結果を信じたい瞬間。"""
+    import pathlib as _pl
+
+    monkeypatch.setattr(coding_ops, "_validate_path", lambda p: _pl.Path(p))
+    monkeypatch.setattr(coding_ops.shutil, "which", lambda name: None)
+    monkeypatch.setattr(coding_ops, "_GREP_MAX_FILE_BYTES", 100)
+    (tmp_path / "huge.log").write_text("needle\n" * 2000, encoding="utf-8")
+    # 70 バイト -- 上限(100)の下。ここを 350 バイトにしていて両方飛ばされ、
+    # 「お知らせは出たが一致が0件」という、検査したいのと別の状態を見ていた。
+    (tmp_path / "small.txt").write_text("needle\n" * 10, encoding="utf-8")
+    out = coding_ops.grep("needle", str(tmp_path), max_matches=3)
+    assert "not searched" in out, "早期 return でお知らせが消えている"
+    assert len([l for l in out.splitlines() if l.startswith(str(tmp_path))]) == 3
+
+
+def test_find_files_keeps_the_first_of_equal_timestamps(monkeypatch, tmp_path):
+    """同一秒のファイルだらけのディレクトリ（展開したアーカイブ、生成物）で効く。
+    ヒープは最大N件を残すので、素の連番だと『最後に見た方が勝つ』になり、
+    以前の安定ソートと逆になっていた。"""
+    import os
+    import pathlib as _pl
+
+    monkeypatch.setattr(search_ops, "_validate_path", lambda p: _pl.Path(p))
+    names = ["hit_a.txt", "hit_b.txt", "hit_c.txt"]
+    for n in names:
+        f = tmp_path / n
+        f.write_text("x", encoding="utf-8")
+        os.utime(f, (1_700_000_000, 1_700_000_000))       # 全部同じ mtime
+    out = search_ops.find_files("hit_", str(tmp_path), max_results=2)
+    kept = [_pl.Path(l).name for l in out.splitlines() if l.startswith(str(tmp_path))]
+    walked = [p.name for p in sorted(tmp_path.rglob("*")) if p.name.startswith("hit_")]
+    assert set(kept) == set(walked[:2]), "同時刻のタイで後勝ちになっている: %s" % kept

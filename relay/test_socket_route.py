@@ -623,7 +623,9 @@ def test_every_edge_hard_reset_in_the_runner_forgets_the_route():
     assert "reset_socket_route" in src, "runner が経路を捨てていない"
     # 素の import 名を残したまま使うと、この包み込みを迂回できてしまう
     assert "hard_reset as _edge_hard_reset" in src
-    body = src[src.index("def hard_reset(port):"):]
+    # 署名でアンカーしない。`discretionary` を足した時にここが ValueError で落ちた
+    # -- 検査したいのは引数の形ではなく「素の hard_reset を呼んでいないこと」。
+    body = src[src.index("def hard_reset(port"):]
     assert "_edge_hard_reset(port)" in body and "reset_socket_route()" in body
 
 
@@ -1344,3 +1346,181 @@ def test_the_documented_default_matches_the_measured_one():
     first = doc.split('"""')[1].splitlines()[0]
     assert "ON unless" in first, first
     assert SR.ENABLED is True, "この環境で既定が ON でないなら、上の1行も直すこと"
+
+
+def test_a_route_built_with_no_log_path_cannot_reach_the_operators_record():
+    """conftest のリポジトリ全体ガードが実際に効いていること。
+
+    2026-08-21 に 13件の route_closed が本番の学習データに混ざった -- 理由は
+    「FakeContext に ne 属性が無い」、エージェントURLは http://agent。閉じていない経路が
+    13回閉じた記録になっていた。ガードはその後に入ったので、ここで固定しておく。
+    log_path を渡し忘れた将来のテストが、また同じ行を書けてしまわないように。
+    """
+    r = SocketRoute(enabled=True, connect_fn=object())
+    assert r.log_path != REAL_DEFAULT_LOG
+    assert ".fleet" not in r.log_path.replace("\\", "/") or "live_records" in r.log_path
+
+
+# ---- 事象の合流: 並列下の「連続」を数え直す --------------------------------------------------
+
+def test_workers_failing_from_one_incident_vote_once(monkeypatch):
+    """2026-08-25 の実測そのまま: w3 18:43:24 / w5 18:43:48 / w9 18:43:56。
+    3ワーカー、32秒、1つの事象。それが31ターン運んだ経路を閉じた。"""
+    r = _route()
+    monkeypatch.setattr(rf, "_socket_route", lambda: r)
+    monkeypatch.setattr(rf, "_LAST_ROUTE_FAULT", [0.0])
+    clock = {"t": 1000.0}
+    for offset in (0.0, 24.0, 32.0):
+        clock["t"] = 1000.0 + offset
+        rf.report_route_fault("w: dropped", now=lambda: clock["t"])
+    assert r.consecutive == 1, "同一事象を %d 票として数えている" % r.consecutive
+    assert r.open(), "瞬断1回で経路が閉じている"
+
+
+def test_incidents_far_enough_apart_still_close_the_route(monkeypatch):
+    """合流は遮断器を無効にするものではない。本当に塞がれたら閉じること。"""
+    r = _route()
+    monkeypatch.setattr(rf, "_socket_route", lambda: r)
+    monkeypatch.setattr(rf, "_LAST_ROUTE_FAULT", [0.0])
+    clock = {"t": 1000.0}
+    for i in range(3):
+        clock["t"] = 1000.0 + i * (rf.SOCKET_INCIDENT_WINDOW_S + 1)
+        rf.report_route_fault("w: dropped", now=lambda: clock["t"])
+    assert not r.open()
+    assert "3 consecutive" in r.closed_reason
+
+
+def test_a_suppressed_vote_is_not_a_suppressed_fallback(monkeypatch):
+    """合流されるのは遮断器への1票だけ。ワーカーは退避するし、記録も残る。"""
+    r = _route()
+    monkeypatch.setattr(rf, "_socket_route", lambda: r)
+    monkeypatch.setattr(rf, "_LAST_ROUTE_FAULT", [0.0])
+    clock = {"t": 500.0}
+    assert rf.report_route_fault("first", now=lambda: clock["t"]) is True
+    clock["t"] += 1.0
+    assert rf.report_route_fault("second", now=lambda: clock["t"]) is False
+
+
+def test_the_window_lives_where_the_parallelism_is():
+    """socket_route は凍結で、しかもここが正しい置き場所 --
+    ワーカーを並列に走らせるモジュールが、並列であることを知っている唯一の側。"""
+    import inspect
+
+    import relay.socket_route as SR
+
+    assert not hasattr(SR, "SOCKET_INCIDENT_WINDOW_S")
+    assert "note_failure" in inspect.getsource(rf.report_route_fault)
+
+
+# ---- 再送は「まだ届いていない」時だけ安い --------------------------------------------------
+#
+# 外部レビューの最重要指摘。`deadline exceeded` は「サーバに届いて実行中」を意味するのに、
+# それを route 障害として同じ本文を再送していた。しかも予算を使い切るとカウンタが 0 に戻るので
+# 上限が無い -- 「メールを送る」ゴールなら、20分ごとに送信が繰り返されうる。
+# duplicate_risk() は同じ夜にタブ退避側へ入っていたのに、この経路は参照も記録もしていなかった。
+
+DELIVERED_REASON = "ChatHubError: turn deadline exceeded before a completion frame"
+
+
+def test_a_turn_that_may_have_landed_is_resent_at_most_once(monkeypatch):
+    """『届いた』と分類される理由。ここは理由文字列で判る数少ない場合。"""
+    from relay.transport_policy import delivery_status
+    assert delivery_status(DELIVERED_REASON) in ("delivered", "unknown")
+
+    _retry_route(monkeypatch, drv=_FakeDrv())
+    monkeypatch.setattr(rf, "_open_fresh", lambda *a: object())
+    monkeypatch.setattr(rf, "CopilotWebDriver", lambda page: _FakeDrv())
+    w = _worker()
+    w._context, w._agent_url = object(), "u"
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+
+    w.drv.answers = 0
+    w.drv._partial_text = "途中まで届いていた"      # このターンはモデルに届いている
+    w.drv.partial_text = lambda: w.drv._partial_text
+    assert w._retry_socket(DELIVERED_REASON) is True
+    assert w._socket_reconnects_total == 1
+    w.drv.partial_text = lambda: "また届いた"
+    assert w._retry_socket(DELIVERED_REASON) is False, "届いたターンを繰り返し再送している"
+
+
+def test_a_turn_that_never_landed_gets_the_full_budget(monkeypatch):
+    _retry_route(monkeypatch, drv=_FakeDrv())
+    w = _worker()
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+    for i in range(rf.SOCKET_RECONNECTS_PER_GOAL):
+        assert w._retry_socket(DROPPED) is True, "attempt %d" % (i + 1)
+    assert w._retry_socket(DROPPED) is False, "無制限に再接続している"
+
+
+def test_the_total_is_never_reset_by_spending_a_budget(monkeypatch):
+    """予算ごとのカウンタは 0 に戻る（それが投票の単位）。ゴール単位の総数は戻らない。"""
+    _retry_route(monkeypatch, drv=_FakeDrv())
+    w = _worker()
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+    w._retry_socket(DROPPED)
+    w._socket_retries = 0                      # 予算を使い切って報告した直後の状態
+    w._retry_socket(DROPPED)
+    assert w._socket_reconnects_total == 2
+
+
+def test_the_record_says_whether_the_resend_could_repeat_an_act(monkeypatch, tmp_path):
+    r = _route_logging(tmp_path)
+    r.open = lambda: True
+    r.driver_for = lambda n, **kw: _FakeDrv()
+    monkeypatch.setattr(rf, "_socket_route", lambda: r)
+    w = rf.RelayWorker("メールを送って", "w0")
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+    w.drv.partial_text = lambda: "半分だけ返ってきた"
+    w._retry_socket(DELIVERED_REASON)
+    row = next(x for x in _lines(tmp_path) if x["event"] == "socket_retry")
+    assert row["landed"] is True and row["saw_output"] is True
+    assert row["delivery"] in ("delivered", "unknown")
+    assert row["cap"] == rf.SOCKET_RECONNECTS_IF_DELIVERED
+
+
+def test_output_already_received_is_what_marks_a_turn_as_landed(monkeypatch):
+    """理由文字列はほぼ全部 unknown を返す。トークンを受け取っていたかどうかが、
+    こちらの手元にある唯一の確かな証拠。"""
+    _retry_route(monkeypatch, drv=_FakeDrv())
+    quiet = _worker()
+    quiet.socket, quiet.drv, quiet.status = True, _FakeDrv(), "waiting"
+    assert quiet._retry_socket(DROPPED) is True
+    assert quiet._retry_socket(DROPPED) is True, "何も受信していないのに上限1にしている"
+
+    spoke = _worker()
+    spoke.socket, spoke.drv, spoke.status = True, _FakeDrv(), "waiting"
+    spoke.drv.partial_text = lambda: "モデルは既に喋っていた"
+    assert spoke._retry_socket(DROPPED) is True
+    spoke.drv.partial_text = lambda: "また喋っている"
+    assert spoke._retry_socket(DROPPED) is False
+
+
+def test_a_completed_answer_also_counts_as_landed(monkeypatch):
+    """partial が無くても、完了回答が1つでもあればそのターンは届いている。"""
+    _retry_route(monkeypatch, drv=_FakeDrv())
+    w = _worker()
+    w.socket, w.drv, w.status = True, _FakeDrv(answers=1), "waiting"
+    assert w._retry_socket(DROPPED) is True
+    assert w._retry_socket(DROPPED) is False
+
+
+def test_what_was_learned_about_a_turn_outlives_the_connection(monkeypatch):
+    """再接続すると新しいドライバは何も見ていない。そこで判定し直すと、
+    モデルに届いたと分かっているターンが『届いていない』に戻り、
+    1回だったはずの上限が満額に化ける -- 1ターンが7回送られうる。"""
+    _retry_route(monkeypatch, drv=_FakeDrv())
+    w = _worker()
+    w.socket, w.drv, w.status = True, _FakeDrv(answers=1), "waiting"
+    assert w._retry_socket(DROPPED) is True
+    assert w.drv._answers().count() == 0, "前提: 新しい接続は何も受信していない"
+    assert w._retry_socket(DROPPED) is False, "着地の事実が接続と一緒に失われている"
+
+
+def test_a_later_turn_is_judged_on_its_own_evidence(monkeypatch):
+    """粘るのは『そのターンについて』であって、ワーカーに焼き付けるものではない。"""
+    _retry_route(monkeypatch, drv=_FakeDrv())
+    w = _worker()
+    w.socket, w.drv, w.status = True, _FakeDrv(answers=1), "waiting"
+    w._retry_socket(DROPPED)
+    w.turn += 1                                   # 次のターンへ進んだ
+    assert w._retry_socket(DROPPED) is True

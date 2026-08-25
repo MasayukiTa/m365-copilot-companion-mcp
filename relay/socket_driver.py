@@ -76,6 +76,11 @@ class CopilotSocketDriver:
         self._answers_done = 0
         self._partial = ""
         self._last = ""
+        #: Which turn we are on, and whether THIS one has produced an answer. Without the
+        #: second flag "not generating and _last is non-empty" cannot tell a finished turn
+        #: from a dead one standing in front of an older answer.
+        self._turn_seq = 0
+        self._turn_answered = False
         #: Why the socket route stopped working, or "". The caller falls back on this, and it
         #: is a string rather than a flag so the reason survives into a log.
         self.failed = ""
@@ -137,6 +142,14 @@ class CopilotSocketDriver:
             raise ChatHubError("this socket route already failed: %s" % self.failed)
         with self._lock:
             self._partial = ""
+            # THE PREVIOUS ANSWER IS RETIRED HERE, not left lying around. It used to survive
+            # into the next turn: `send` cleared only the partial, so between this call and
+            # the first token, "what is the answer" returned the LAST turn's answer -- and if
+            # the new turn then failed, `settled_text` kept returning it, which is a complete,
+            # stable, wrong reply to a question that was never answered.
+            self._last = ""
+            self._turn_seq += 1
+            self._turn_answered = False
         self._thread = threading.Thread(target=self._run_turn, args=(text,),
                                         name="socket-turn", daemon=True)
         self._thread.start()
@@ -191,6 +204,7 @@ class CopilotSocketDriver:
             self._last = clean
             self._partial = ""
             self._answers_done += 1
+            self._turn_answered = True
 
     def read_last_response(self) -> str:
         """The answer, or as much of it as has arrived. Never blocks."""
@@ -224,7 +238,10 @@ class CopilotSocketDriver:
         if self._is_generating():
             return ""
         with self._lock:
-            return self._last or ""
+            # ONLY FOR THE TURN THE CALLER IS WAITING ON. A turn whose thread died without an
+            # answer is not generating any more either, and answering it with whatever text
+            # is in hand is how a failure becomes a confident wrong reply.
+            return (self._last or "") if self._turn_answered else ""
 
     def _is_stale_repeat(self, text: str) -> bool:
         """Whether the loop is asking about a turn it has ALREADY taken.

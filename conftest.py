@@ -241,3 +241,21 @@ def _isolate_session_store(tmp_path_factory):
             os.environ.pop("MCP_SESSION_STORE_DIR", None)
         else:
             os.environ["MCP_SESSION_STORE_DIR"] = previous
+
+
+@pytest.fixture(autouse=True)
+def _fresh_route_incident_clock():
+    """Reset the process-global incident clock between tests.
+
+    relay_fleet coalesces transport faults that arrive within one window into a single vote
+    for the route's circuit breaker -- correct in production, where the process is one run.
+    In a test session the process spans every test, so one test's fault silently suppressed
+    the next test's, and the failure surfaced in an unrelated test that had merely asked the
+    route to be told about a failure and found it had not been.
+    """
+    try:
+        import relay.relay_fleet as rf
+        rf._LAST_ROUTE_FAULT[0] = 0.0
+    except Exception:
+        pass
+    yield

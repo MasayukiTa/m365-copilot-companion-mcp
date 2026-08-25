@@ -174,7 +174,11 @@ def find_files(
             # `stat()` once, and read is-it-a-file off the same result. The old code paid a
             # separate is_file() syscall per candidate and then stat()'d the survivors again.
             seen += 1
-            item = (st.st_mtime, seen, str(p))
+            # -seen SO EQUAL MTIMES KEEP THE ONE FOUND FIRST. The heap keeps the LARGEST N, so
+            # a plain counter made the tie-break "last walked wins" -- the reverse of the old
+            # stable sort, and visible in any directory of same-second files (an extracted
+            # archive, a generated tree).
+            item = (st.st_mtime, -seen, str(p))
             if len(best) < max_results:
                 heapq.heappush(best, item)
             else:

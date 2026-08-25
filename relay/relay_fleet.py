@@ -962,6 +962,46 @@ def reset_socket_route():
         _SOCKET_ROUTE = None
 
 
+
+#: Transport faults closer together than this are ONE incident, reported to the route once.
+#:
+#: The route's circuit breaker counts "consecutive failures", and under concurrency that is not
+#: a count of consecutive events at all: N workers sharing one backend turn a single upstream
+#: hiccup into N failures with no success in between, so at concurrency 3 a single blip reaches
+#: max_consecutive by itself. Measured 2026-08-25: w3 at 18:43:24, w5 at 18:43:48 and w9 at
+#: 18:43:56 -- three workers, thirty-two seconds, one event -- closed the route for a run that
+#: had already carried 31 turns over it.
+#:
+#: A minute rather than the observed thirty-two seconds, because the spread is set by when each
+#: worker's turn happens to notice, not by the incident, and a fourth worker would have widened
+#: it. What the breaker then measures is three incidents at least a minute apart, which is a
+#: fair description of a route that is actually blocked.
+#:
+#: HERE AND NOT IN socket_route, which is frozen -- and which is also the right place for it:
+#: the module that runs workers in parallel is the one that knows they are parallel. The route
+#: keeps counting exactly what it always counted.
+SOCKET_INCIDENT_WINDOW_S = float(os.environ.get("MCP_FLEET_SOCKET_INCIDENT_S", "60"))
+
+_LAST_ROUTE_FAULT = [0.0]
+_ROUTE_FAULT_LOCK = threading.Lock()
+
+
+def report_route_fault(reason, now=None):
+    """Report a transport fault to the route ONCE per incident. True if it was reported.
+
+    A False is not a swallowed failure: the worker still falls back, the fallback is still
+    recorded with its goal and reason, and the classifier still gets its training row. The only
+    thing suppressed is a second vote, from the same event, in the breaker's tally.
+    """
+    t = (now or time.time)()
+    with _ROUTE_FAULT_LOCK:
+        if t - _LAST_ROUTE_FAULT[0] < SOCKET_INCIDENT_WINDOW_S:
+            return False
+        _LAST_ROUTE_FAULT[0] = t
+    _socket_route().note_failure(reason)
+    return True
+
+
 def socket_fault_is_transport(reason):
     """Whether a failure is a dropped CONNECTION rather than a job that needs a tab.
 
@@ -1027,6 +1067,25 @@ DEFAULT_EVAL_DISK_GB = float(os.environ.get("SWE_EVAL_DISK_GB", "0"))
 # What the tab bought, measured on those three workers: w5 DONE, w3 STUCK, w9 never finished.
 # One in three, against 1.77 GB of resident browser that then held the autoscale down to 3.
 DEFAULT_SOCKET_RETRIES = int(os.environ.get("MCP_FLEET_SOCKET_RETRIES", "2"))
+
+#: Reconnects one worker may spend on one GOAL, across every retry budget it is granted.
+#:
+#: THE PER-BUDGET COUNTER IS NOT A LIMIT. It is reset to zero each time the budget is spent
+#: and reported, so on a route that stays open -- and siblings' successes keep it open -- a
+#: worker could reconnect and re-send without bound. For a goal that only reads, that is
+#: wasted turns. For a goal that SENDS MAIL, every re-send of a turn the server already
+#: received is a second mail. This one is never reset, so it bounds the goal.
+SOCKET_RECONNECTS_PER_GOAL = int(os.environ.get("MCP_FLEET_SOCKET_RECONNECT_MAX", "6"))
+
+#: Reconnects allowed when the turn may ALREADY HAVE BEEN DELIVERED.
+#:
+#: `deadline exceeded` does not mean the turn was lost -- it means it reached the server and
+#: was still running when our clock ran out. Re-sending it asks for the act a second time.
+#: transport_policy.duplicate_risk() has answered this question since the tab fallback
+#: adopted it; the reconnect path was re-sending without ever asking. One attempt, because a
+#: dropped answer to a delivered turn is worth one more try and not a loop.
+SOCKET_RECONNECTS_IF_DELIVERED = int(
+    os.environ.get("MCP_FLEET_SOCKET_RECONNECT_DELIVERED_MAX", "1"))
 
 # How early the token is refreshed. IT MUST EXCEED THE LONGEST TURN, and socket_route's own
 # default of 600 s did not -- it EQUALLED it. A worker asks driver_for for no turn timeout, so
@@ -3440,6 +3499,40 @@ class RelayWorker:
         closed -- and the caller then does what it did before: opens a tab.
         """
         route = _socket_route()
+        # WOULD RE-SENDING REPEAT SOMETHING THAT ALREADY HAPPENED? The tab fallback has asked
+        # this since the night it was written; this path did not ask at all.
+        try:
+            from relay.transport_policy import delivery_status
+            delivery = delivery_status(reason)
+        except Exception:
+            delivery = "unknown"
+        # THE DRIVER'S OWN EVIDENCE, not a guess from the reason string. `duplicate_risk`
+        # answers "unknown" for almost every transport fault -- correctly, it cannot know --
+        # and treating unknown as delivered caps every reconnect at one, which is the old
+        # first-failure-opens-a-tab behaviour wearing a new name. But a driver that RECEIVED
+        # TOKENS for this turn is proof the turn reached the model, and re-sending it then
+        # asks for the act a second time. A driver that received nothing at all is the case
+        # worth another connection.
+        saw_output = False
+        try:
+            saw_output = bool((self.drv.partial_text() if hasattr(self.drv, "partial_text")
+                               else "") or self.drv._answers().count() > 0)
+        except Exception:
+            saw_output = False
+        # STICKY, AND KEYED TO THE TURN. Re-deriving this from the driver each time was worse
+        # than not asking: after a reconnect the FRESH driver has seen nothing, so a turn
+        # known to have reached the model was judged unlanded on its second fault and handed
+        # the full budget -- up to seven sends of one delivered turn. What was learned about
+        # THIS turn has to outlive the connection that learned it.
+        if saw_output:
+            self._landed_turn = self.turn
+        landed = (delivery == "delivered") or saw_output             or getattr(self, "_landed_turn", None) == self.turn
+        spent = getattr(self, "_socket_reconnects_total", 0)
+        cap = SOCKET_RECONNECTS_IF_DELIVERED if landed else SOCKET_RECONNECTS_PER_GOAL
+        if spent >= cap:
+            print("[relay_fleet] %s: not reconnecting (%d spent, cap %d, delivery=%s, "
+                  "saw_output=%s)" % (self.name, spent, cap, delivery, saw_output), flush=True)
+            return False
         try:
             ids = self.drv.conversation_ids() or {}
         except Exception:
@@ -3455,12 +3548,18 @@ class RelayWorker:
             self.socket, self.drv = False, None
             return False
         self._socket_retries = getattr(self, "_socket_retries", 0) + 1
+        self._socket_reconnects_total = spent + 1
         # TOKEN LIFE AT THE MOMENT OF THE FAULT. Recorded because the leading explanation for
         # the 2026-08-25 drops -- a turn outliving the token it connected with -- could not be
         # confirmed or refuted from the log: nothing wrote down how much of the token was left.
         route.record("socket_retry", worker=self.name, goal=(self.goal or "")[:600],
-                     attempt=self._socket_retries, turn=self.turn,
-                     resumed=bool(conv_id),
+                     attempt=self._socket_retries,
+                     reconnects_spent=self._socket_reconnects_total, cap=cap,
+                     turn=self.turn, resumed=bool(conv_id),
+                     # WHETHER THIS RE-SEND COULD REPEAT AN ACT. Recorded here for the same
+                     # reason the fallback records it: a duplicate has to be something the
+                     # log can show, not something nobody thought to look for.
+                     delivery=delivery, saw_output=saw_output, landed=landed,
                      token_seconds_left=int(route.token_life()),
                      reason=reason[:300])
         self.drv, self.socket = drv, True
@@ -3495,7 +3594,7 @@ class RelayWorker:
         """
         reason = getattr(self.drv, "failed", "") or "unknown"
         route = _socket_route()
-        route.note_failure("%s: %s" % (self.name, reason))
+        report_route_fault("%s: %s" % (self.name, reason))
         self._socket_fell_back = True
         # RECORDED IMMEDIATELY, not at the end: a run that dies mid-goal still leaves the
         # evidence behind, and this line is the only place the pairing of a goal with the
@@ -3568,7 +3667,7 @@ class RelayWorker:
                 if self._socket_route_fault(failed):
                     route = _socket_route()
                     if getattr(self, "_socket_retries", 0) >= DEFAULT_SOCKET_RETRIES:
-                        route.note_failure("%s: %s" % (self.name, failed))
+                        report_route_fault("%s: %s" % (self.name, failed))
                         self._socket_retries = 0
                     if route.open() and self._retry_socket(failed):
                         return False

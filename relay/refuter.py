@@ -499,8 +499,8 @@ class RefuterSession:
             if self._socket_retry(reason):
                 return None
             try:
-                from relay.relay_fleet import _socket_route
-                _socket_route().note_failure("refuter: %s" % reason)
+                from relay.relay_fleet import _socket_route, report_route_fault
+                report_route_fault("refuter: %s" % reason)
                 _socket_route().record("fallback", worker="refuter",
                                        goal=(self.goal or "")[:600], reason=reason[:300])
             except Exception:

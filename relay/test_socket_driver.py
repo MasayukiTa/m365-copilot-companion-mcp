@@ -307,3 +307,42 @@ def test_the_citation_plumbing_is_stripped_from_the_partial_too():
         time.sleep(0.02)
     _settle(d)
     assert "【1-a1b2】" not in got, got
+
+
+# ---- 前のターンの回答を、次のターンの答えとして出さないこと ------------------------------------
+#
+# 外部レビューの指摘。`send` は `_partial` しか消しておらず、`_last` は残っていた。
+# ブリッジのループは「生成中でない」＋「settled が非空」＋「1.2秒安定」で完了と見なすので、
+# 2ターン目が失敗するとスレッドが死に、生成中でなくなり、settled が**前回の回答**を返し、
+# ループはそれを新しい質問への答えとして確定した。完全で、安定していて、間違っている。
+
+def test_a_new_turn_does_not_show_the_previous_answer():
+    d = _drv(answer="最初の答え")
+    d.send("q1"); assert _settle(d)
+    assert d.settled_text() == "最初の答え"
+
+    d.conv.answer = "二番目の答え"
+    d.conv.delay = 0.4
+    d.send("q2")
+    assert d.partial_text() == "", "前ターンの本文が partial として出ている"
+    assert d.settled_text() == "", "走行中に前ターンの答えを settled として出している"
+    assert _settle(d)
+    assert d.settled_text() == "二番目の答え"
+
+
+def test_a_failed_turn_does_not_inherit_the_previous_answer():
+    """これが一番危ない形: 失敗したターンが、前回の答えを『完成した答え』として差し出す。"""
+    d = _drv(answer="最初の答え")
+    d.send("q1"); assert _settle(d)
+
+    d.conv.error = RuntimeError("socket died")
+    d.send("q2"); assert _settle(d)
+    assert d.failed, "失敗が記録されていない"
+    assert d.settled_text() == "", "死んだターンが前回の答えを返している"
+    assert d.read_last_response() == ""
+
+
+def test_the_first_failed_turn_has_nothing_to_offer_either():
+    d = _drv(error=RuntimeError("boom"))
+    d.send("q"); assert _settle(d)
+    assert d.settled_text() == "" and d.partial_text() == ""

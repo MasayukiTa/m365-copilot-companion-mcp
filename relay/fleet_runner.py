@@ -1458,21 +1458,55 @@ def main():
     from playwright.sync_api import sync_playwright
     from relay.relay_fleet import FleetContextLost, reset_socket_route
     from relay.edge_recover import cdp_alive, companion_edge_mb, hard_reset as _edge_hard_reset
-    from relay.edge_recover import should_recycle
+    from relay.edge_recover import other_fleet_runs, should_recycle
 
-    def hard_reset(port):
+    #: How many times a discretionary reset defers to a sibling before taking it anyway.
+    EDGE_SUPPRESS_MAX = int(os.environ.get("MCP_FLEET_EDGE_SUPPRESS_MAX", "3"))
+    _suppressed = [0]
+
+    def hard_reset(port, discretionary=False):
         """Reset the Edge AND forget the socket route that was bound to it.
+
+        `discretionary` marks the resets taken against a browser that is still WORKING -- the
+        stall watchdog and the pre-run memory recycle. Those are the ones that hurt a sibling:
+        this Edge profile is shared and cannot be split, so resetting it pulls the context out
+        from under every other run pointed at the same port. Six recoveries across three runs
+        on 2026-08-25 came from exactly that. A reset of a browser that is already unreachable
+        is not discretionary and is never suppressed -- there is nothing left to protect.
 
         Every caller below wants both, and none of them said so. The route captures its token
         through a page in this browser, so a reset leaves it holding credentials for a context
         that no longer exists; it then fails the next capture three times and closes itself for
         the rest of the run. Measured 2026-08-25 20:07 -- see reset_socket_route.
         """
+        if discretionary:
+            others = other_fleet_runs(port)
+            if others:
+                _suppressed[0] += 1
+                if _suppressed[0] < EDGE_SUPPRESS_MAX:
+                    print("[recycle] %d other fleet run(s) are on this Edge (%s) -- not "
+                          "resetting it (%d/%d); the memory stays until they finish"
+                          % (len(others), ",".join(str(x) for x in others),
+                             _suppressed[0], EDGE_SUPPRESS_MAX), flush=True)
+                    return False
+                # ESCALATION, BECAUSE POLITENESS DEADLOCKS. Two runs on one wedged Edge both
+                # decide it is wedged, both see each other, and both stand aside -- forever,
+                # symmetrically. cdp_alive stays true for a browser that is wedged but still
+                # listening, so nothing else fires either. After this many refusals the
+                # sibling is plainly not making progress, and a browser both runs are stuck
+                # against is not being protected by leaving it alone. Two resets racing is
+                # survivable -- each run recovers through its context-lost path; a deadlock
+                # is not.
+                print("[recycle] suppressed %d times with %d sibling(s) still here -- "
+                      "resetting anyway; a shared wedge is not worth protecting"
+                      % (_suppressed[0], len(others)), flush=True)
+        _suppressed[0] = 0
         _edge_hard_reset(port)
         try:
             reset_socket_route()
         except Exception:
             pass
+        return True
 
     try:
         port = int(args.cdp_url.rsplit(":", 1)[-1].split("/")[0])
@@ -1512,7 +1546,7 @@ def main():
                 if should:
                     print("\n[watchdog] fleet stalled %ds -> hard-resetting the Edge (%s)"
                           % (args.stall_s, why))
-                    hard_reset(port)
+                    hard_reset(port, discretionary=True)
                     last_change = time.time()
                 # else: eval in flight -> wait. Re-checked every 5s; last_change is left intact
                 # so the failsafe ceiling keeps counting from the original freeze.
@@ -1531,7 +1565,7 @@ def main():
             recycle, why = should_recycle(emb, avail_phys_mb())
             if recycle:
                 print("[recycle] %s -> hard-resetting the companion Edge for a clean start" % why)
-                hard_reset(port)
+                hard_reset(port, discretionary=True)
         except Exception:
             pass
 
@@ -1591,7 +1625,11 @@ def main():
                   % (type(e).__name__, attempt, args.max_recover))
             if args.no_auto_recover or attempt > args.max_recover:
                 break
-            hard_reset(port)
+            # ONLY IF THE BROWSER IS ACTUALLY GONE. A context can be lost because a SIBLING
+            # run reset this shared Edge, and resetting it again from here is how one reset
+            # becomes a round of them.
+            if not cdp_alive(args.cdp_url):
+                hard_reset(port)
 
     stop_wd.set()
 

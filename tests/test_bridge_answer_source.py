@@ -16,19 +16,33 @@ from bridge import copilot_bridge as B
 
 
 class _SocketDrv:
+    """本物と同じ契約。以前このスタブは欠陥の側を写していた --
+    `read_last_response` が前ターンの本文に落ちる形で、それをアクセサが使っていたので、
+    テストは緑のままバグを固定していた。今は「そのターンが答えたか」を持つ。"""
+
     IS_SOCKET = True
 
-    def __init__(self, partial="", last="", generating=False):
+    def __init__(self, partial="", last="", generating=False, answered=None):
         self._partial, self._last, self._gen = partial, last, generating
+        self._answered = bool(last) if answered is None else answered
+        self.failed = ""
 
     def partial_text(self):
         return self._partial
 
     def settled_text(self):
-        return "" if self._gen else self._last
+        if self._gen or not self._answered:
+            return ""
+        return self._last
 
     def read_last_response(self):
-        return self._partial or self._last
+        return self._partial or (self._last if self._answered else "")
+
+    def conversation_ids(self):
+        return {"server": getattr(self, "conv_id", ""), "client": "", "session": "", "turns": 1}
+
+    def close(self):
+        self.closed = True
 
 
 class _PageDrv:
@@ -371,3 +385,76 @@ def test_startup_still_runs_everything_before_releasing():
     src = inspect.getsource(B._page_main)
     assert src.index("_find_or_open_agent") < src.index("BRIDGE_RELEASE_STARTUP_PAGE")
     assert src.index("should_autoresume") < src.index("BRIDGE_RELEASE_STARTUP_PAGE")
+
+
+# ---- 外部レビューで出た重大欠陥を、実挙動で縛る ------------------------------------------------
+
+def test_partial_never_reaches_back_to_the_previous_answer(monkeypatch):
+    """`partial_text() or read_last_response()` と書いていた。2ターン目の最初のポーリングで
+    前回の回答が今回の delta として利用者に流れ、本物の partial が来た瞬間に継ぎ接ぎになる。"""
+    monkeypatch.setattr(B, "DRIVER", _SocketDrv(partial="", last="前回の答え", answered=True))
+    assert B._answer_partial() == ""
+
+
+def test_a_dead_socket_does_not_block_the_way_back_to_the_page(monkeypatch):
+    """経路が閉じた状態こそタブが要る場面なのに、そこでブリッジが固まっていた。"""
+    dead = _SocketDrv(last="x")
+    dead.failed = "ChatHubError: this socket route already failed"
+    page = _PageDrv()
+    monkeypatch.setattr(B, "DRIVER", dead)
+    monkeypatch.setattr(B, "_bridge_socket_driver", lambda: None)
+    monkeypatch.setattr(B, "run_on_page_thread", lambda fn, *a, **kw: fn(*a, **kw))
+
+    def _ensure():
+        B.DRIVER = page
+        return True
+
+    monkeypatch.setattr(B, "ensure_page_alive", _ensure)
+    got = B.ensure_driver()
+    assert got is page, "死んだソケットを返し続けている"
+    assert not getattr(got, "failed", "")
+
+
+def test_a_socket_turn_records_which_conversation_it_was_in(monkeypatch):
+    """DOM差分はソケットのターンを見られない。会話IDはドライバが知っている。"""
+    drv = _SocketDrv(last="a")
+    drv.conv_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    monkeypatch.setattr(B, "DRIVER", drv)
+    ref = B.socket_conv_ref()
+    assert B.sessref_guid(ref) == drv.conv_id
+
+
+def test_a_socket_on_another_conversation_is_released(monkeypatch):
+    drv = _SocketDrv(last="a")
+    drv.conv_id = "11111111-1111-1111-1111-111111111111"
+    monkeypatch.setattr(B, "DRIVER", drv)
+    monkeypatch.setattr(B, "ACTIVE_SID", "sid1")
+    monkeypatch.setattr(B.S, "load",
+                        lambda sid: {"conv_url": B.make_sessref("22222222-2222-2222-2222-222222222222")})
+    assert B.socket_is_on_the_active_conversation() is False
+    assert B.release_socket_driver("test") is True
+    assert B.DRIVER is None
+
+
+def test_a_socket_on_the_same_conversation_is_kept(monkeypatch):
+    drv = _SocketDrv(last="a")
+    drv.conv_id = "33333333-3333-3333-3333-333333333333"
+    monkeypatch.setattr(B, "DRIVER", drv)
+    monkeypatch.setattr(B, "ACTIVE_SID", "sid1")
+    monkeypatch.setattr(B.S, "load", lambda sid: {"conv_url": B.make_sessref(drv.conv_id)})
+    assert B.socket_is_on_the_active_conversation() is True
+
+
+def test_opening_a_fresh_conversation_releases_the_socket():
+    """画面は新しいチャット、送信先は前の会話 -- 無言の誤配送。"""
+    import inspect
+
+    src = inspect.getsource(B._open_fresh_conversation)
+    assert "release_socket_driver" in src
+
+
+def test_switching_conversations_releases_the_socket():
+    import inspect
+
+    src = inspect.getsource(B.Handler._do_switch)
+    assert "release_socket_driver" in src

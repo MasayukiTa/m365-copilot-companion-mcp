@@ -1243,10 +1243,82 @@ def _bridge_socket_driver():
         return None
 
 
-#: How long one bridge turn may run on a socket. Longer than the fleet's because a person is
-#: waiting on the other end of exactly one conversation and would rather wait than be told the
-#: turn was abandoned; the outer streaming loop already bounds itself at 600 s.
-BRIDGE_TURN_TIMEOUT_S = float(os.environ.get("MCP_BRIDGE_SOCKET_TURN_S", "900"))
+#: How long one bridge turn may run, on either transport. ONE NUMBER, because two drifted.
+#:
+#: The socket driver's deadline was set to 900 s while the streaming loop bounded itself at a
+#: hard-coded 600. A turn that ran between the two ended like this: the loop gave up and
+#: returned a truncated answer, the turn kept running server-side, and the user's NEXT message
+#: hit GenerationInProgress -- which the socket driver raises immediately, with no wait, so it
+#: reached them as a bridge error for a turn they never saw fail.
+#:
+#: The loop reads this too, so the two cannot drift again.
+BRIDGE_TURN_TIMEOUT_S = float(os.environ.get("MCP_BRIDGE_SOCKET_TURN_S", "600"))
+
+
+def socket_conv_ref():
+    """The conversation the live socket is in, as a persistable reference, or "".
+
+    THE DOM CAPTURE CANNOT SEE A SOCKET TURN. conv_url is captured by diffing the
+    conversation rail before and after a send, and a socket turn moves nothing on screen -- so
+    a session whose first turn ran on a socket kept conv_url="" forever ("conversation capture
+    ambiguous ... conv_url left empty", observed live). That session could not be resumed, did
+    not appear in the fleet's conversation list, and -- worst -- when its socket later failed,
+    the replacement was built with no conversation id at all: a brand-new chat, mid-
+    conversation, with nothing to tell the user their context had gone.
+
+    The socket knows exactly which conversation it is in. It was simply never asked.
+    """
+    if not _on_socket():
+        return ""
+    try:
+        ids = DRIVER.conversation_ids() or {}
+    except Exception:
+        return ""
+    guid = (ids.get("server") or ids.get("client") or "").strip()
+    return make_sessref(guid) if guid else ""
+
+
+def socket_is_on_the_active_conversation():
+    """False when the live socket is bound to a DIFFERENT conversation than the active session.
+
+    The safety net behind release_socket_driver: /new, /switch and /resume release the socket
+    explicitly, and this catches any path that forgets to. Both are wanted -- the release is
+    immediate and says why, this is the invariant.
+    """
+    if not _on_socket():
+        return True
+    have = sessref_guid(socket_conv_ref())
+    if not have:
+        return True                      # the socket has not bound a conversation yet
+    try:
+        want = sessref_guid((S.load(ACTIVE_SID) or {}).get("conv_url") or "")
+    except Exception:
+        return True
+    if not want:
+        return True                      # the session has none recorded; nothing to disagree with
+    return have == want
+
+
+def release_socket_driver(why=""):
+    """Drop the socket so the next turn builds one for the CONVERSATION we are now on.
+
+    The socket is keyed to a conversation id, and /new, /switch and /resume move the bridge to
+    a different conversation by touching PAGE and ACTIVE_SID only. Nothing told the driver, and
+    ensure_driver keeps any live socket unconditionally -- so after /new the screen showed a
+    fresh chat while the next message was appended to the OLD conversation, server-side, with
+    nothing on screen to say so. Silent wrong-conversation delivery is worse than a slow turn.
+    """
+    global DRIVER
+    if not _on_socket():
+        return False
+    try:
+        DRIVER.close()
+    except Exception:
+        pass
+    DRIVER = None
+    print("bridge: released the socket (%s); the next turn will re-key it"
+          % (why or "conversation changed"), flush=True)
+    return True
 
 
 def ensure_driver():
@@ -1261,9 +1333,18 @@ def ensure_driver():
     # never once attempted and the bridge behaved exactly as before while reporting that a
     # socket path existed. Driven for three minutes before that showed up, because nothing
     # about it looks wrong from outside.
+    if _on_socket() and not socket_is_on_the_active_conversation():
+        release_socket_driver("the active conversation changed under it")
     if _on_socket() and not getattr(DRIVER, "failed", ""):
         return DRIVER
     drv = _bridge_socket_driver()
+    if drv is None and _on_socket():
+        # THE CORPSE HAS TO GO, or it blocks the way back. The page branch below is guarded on
+        # `not _on_socket()`, and a failed socket driver still answers True to that -- so the
+        # bridge returned the dead driver, every later turn raised "this socket route already
+        # failed", and only a restart cleared it. Route-closed is exactly the state the tab
+        # exists for; it was the state that wedged this.
+        release_socket_driver("the socket failed and no new one could be built")
     if drv is not None:
         DRIVER = drv
         # print, NOT logger.info. This module calls logging.getLogger(__name__) and configures
@@ -1741,7 +1822,8 @@ def _persist_exchange(sid, user_msg, final_text):
                         "(sid=%s); keeping stored conv_url", cur[:5], expected[:5], sid)
             S.touch(sid, status="active")
         else:
-            ref = _capture_changed_conv_ref()
+            # The socket answers this directly; the DOM diff cannot see its turn at all.
+            ref = socket_conv_ref() or _capture_changed_conv_ref()
             fields = {"status": "active"}
             if ref:
                 fields["conv_url"] = ref
@@ -2365,7 +2447,10 @@ def _answer_clean() -> str:
 def _answer_partial() -> str:
     """What to stream to the user right now."""
     if _on_socket():
-        return DRIVER.partial_text() or DRIVER.read_last_response() or ""
+        # NO FALLING BACK TO "the best text you have". That reads the PREVIOUS turn's answer
+        # before the current one has produced a token, and the loop streams it to the user as
+        # this turn's reply. Empty is the truthful answer to "what has arrived so far".
+        return DRIVER.partial_text() or ""
     _pc = _clean_answer_text()
     return _pc if _pc else _text(LOADING)
 
@@ -3375,6 +3460,9 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": ok, "url": PAGE.url, "sid": ACTIVE_SID})
 
     def _do_switch(self, parsed):
+        # THE SOCKET IS KEYED TO A CONVERSATION. Switching moves PAGE and ACTIVE_SID and told
+        # the driver nothing, so the next message went to the conversation we just left.
+        release_socket_driver("/switch")
         url = (urllib.parse.parse_qs(parsed.query).get("url") or [""])[0]
         ok = False
         try:
@@ -3983,7 +4071,7 @@ class Handler(BaseHTTPRequestHandler):
         _send_counted(msg)
         sent = 0
         t0 = time.time()
-        while time.time() - t0 < 600:
+        while time.time() - t0 < BRIDGE_TURN_TIMEOUT_S:
             # PARTIAL comes from the CLEAN body (markdown-reply) so loading
             # placeholders / citations can never be the prefix. When the clean
             # body doesn't exist yet, fall back to LOADING -- which the guard
@@ -4004,7 +4092,7 @@ class Handler(BaseHTTPRequestHandler):
             # and only finish once it has been STABLE for ~1.2s.
             if final and not _is_proc(final):
                 stable_text, stable_since = final, time.time()
-                while time.time() - t0 < 600:
+                while time.time() - t0 < BRIDGE_TURN_TIMEOUT_S:
                     if stream_out and len(final) > sent:
                         self._sse({"delta": final[sent:]})
                         sent = len(final)
@@ -4857,9 +4945,15 @@ def _report_recycle_memory_effect():
 def _open_fresh_conversation(title=""):
     """Point the page at a brand-new chat on the same agent. Runs on the page thread.
 
+    RELEASES THE SOCKET FIRST. Everything that starts a new conversation comes through here,
+    which is why the release belongs here rather than in each caller: a socket left bound to
+    the previous conversation would take the next message straight back to it, while the
+    screen showed an empty chat.
+
     Split out of the /new handler so the turn loop can reuse it. The handler used to own
     this logic AND the HTTP reply, so nothing else could start a new conversation.
     """
+    release_socket_driver("a fresh conversation was opened")
     global ACTIVE_SID
     ok = False
     if AGENT_URL:

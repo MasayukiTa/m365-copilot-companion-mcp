@@ -36,6 +36,23 @@ def _run(args: list[str], cwd: Optional[Path], timeout: int) -> str:
     return output or "(no output)"
 
 
+def _note(skipped_big: int, partial_files: int) -> str:
+    """What the search did not cover, appended to whatever it did find.
+
+    Built here because there are TWO returns -- the normal one and the early one that fires
+    when max_matches is reached -- and only the normal one carried it. The early return is
+    exactly the case where matches exist elsewhere, so the disclosure went missing precisely
+    when the reader had most reason to trust the result.
+    """
+    parts = []
+    if skipped_big:
+        parts.append("%d file(s) larger than %d MB were not searched"
+                     % (skipped_big, _GREP_MAX_FILE_BYTES // (1024 * 1024)))
+    if partial_files:
+        parts.append("%d file(s) were searched only up to a decoding error" % partial_files)
+    return ("\n[" + "; ".join(parts) + "]") if parts else ""
+
+
 def grep(
     pattern: str,
     path: str = ".",
@@ -78,6 +95,7 @@ def grep(
                  else (p for p in target.rglob("*") if p.is_file()))
         needle = pattern if case_sensitive else pattern.lower()
         skipped_big = 0
+        partial_files = 0
         for file_path in files:
             if glob and not file_path.match(glob):
                 continue
@@ -88,19 +106,27 @@ def grep(
                     skipped_big += 1
                     continue
                 with open(file_path, encoding="utf-8", errors="strict") as fh:
-                    for line_no, line in enumerate(fh, 1):
-                        line = line.rstrip("\n").rstrip("\r")
-                        hay = line if case_sensitive else line.lower()
-                        if needle in hay:
-                            matches.append(f"{file_path}:{line_no}:{line}")
-                            if len(matches) >= max_matches:
-                                return "\n".join(matches)
-            except (UnicodeDecodeError, OSError):
+                    try:
+                        for line_no, line in enumerate(fh, 1):
+                            line = line.rstrip("\n").rstrip("\r")
+                            hay = line if case_sensitive else line.lower()
+                            if needle in hay:
+                                matches.append(f"{file_path}:{line_no}:{line}")
+                                if len(matches) >= max_matches:
+                                    return ("\n".join(matches)
+                                            + _note(skipped_big, partial_files))
+                    except UnicodeDecodeError:
+                        # STOPPED PART-WAY, AND SAYS SO. Reading the file whole used to mean
+                        # that a single bad byte contributed nothing from that file at all;
+                        # streaming means the lines before it were already searched. Neither
+                        # is wrong, but "searched half of it" must not read as "searched it"
+                        # -- a torn-tailed jsonl log is normal here, and those are exactly the
+                        # files somebody greps when something has gone wrong.
+                        partial_files += 1
+            except OSError:
                 continue
-        note = ("" if not skipped_big else
-                "\n[%d file(s) larger than %d MB were not searched]"
-                % (skipped_big, _GREP_MAX_FILE_BYTES // (1024 * 1024)))
-        return ("\n".join(matches) + note) if matches else ("(no matches)" + note)
+        return ("\n".join(matches) + _note(skipped_big, partial_files)) if matches \
+            else ("(no matches)" + _note(skipped_big, partial_files))
     except Exception as e:
         return f"[grep error: {type(e).__name__}: {e}]"
 
