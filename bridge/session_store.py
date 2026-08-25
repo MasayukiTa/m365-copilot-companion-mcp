@@ -539,6 +539,67 @@ def fleet_turns(key=None, limit=200):
              "extra": json.loads(r["extra"] or "{}")} for r in rows]
 
 
+def delete_session(sid):
+    """Remove one session entirely: its row, its turns, and both files. Returns True if it existed.
+
+    THERE WAS NO WAY TO DELETE ONE. Only `prune` existed, which takes whole age or size bands,
+    so "delete this conversation" had nowhere to go -- and the bridge's /delete endpoint removed
+    the conversation from Copilot's own rail while leaving every local trace of it in place.
+    The row stayed in the store, the row stayed in .fleet/conversations.json, the fleet cockpit
+    went on listing it, and clicking it there re-registered the session and brought it back into
+    the chat. Deleted from one of the three places it lives, and resurrected by the other two.
+    """
+    if not _valid_sid(sid):
+        return False
+    conn = _db()
+    try:
+        row = conn.execute("SELECT sid FROM sessions WHERE sid = ?", (sid,)).fetchone()
+        existed = row is not None
+        conn.execute("DELETE FROM turns WHERE sid = ?", (sid,))
+        conn.execute("DELETE FROM sessions WHERE sid = ?", (sid,))
+        if existed:
+            list(conn.execute("PRAGMA incremental_vacuum"))
+    finally:
+        conn.close()
+    # The exports go with the rows they mirror; a transcript left behind is a conversation the
+    # cockpit can still open after the store has forgotten it.
+    for path in (_transcript_path(sid), _sess_path(sid)):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return existed
+
+
+def find_by_conv_url(url):
+    """The sid whose conversation URL matches, or None.
+
+    Matched on the conversation GUID rather than the whole string: the same conversation is
+    reached by more than one URL shape (with and without the agent prefix, with and without a
+    query), and a delete that misses because of a trailing parameter leaves the zombie behind.
+    """
+    if not url:
+        return None
+    guid = _conv_guid(url)
+    for sess in list_sessions():
+        stored = sess.get("conv_url") or ""
+        if not stored:
+            continue
+        if stored == url or (guid and _conv_guid(stored) == guid):
+            return sess["sid"]
+    return None
+
+
+def _conv_guid(url):
+    """The conversation GUID inside a Copilot URL, or "" -- the stable part of the address."""
+    m = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                  r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", url or "")
+    if m:
+        return m.group(1).lower()
+    m = re.search(r"/conversation/([^/?#]+)", url or "")
+    return (m.group(1) or "").lower() if m else ""
+
+
 def store_stats():
     """What the store costs and how far back it goes. Read-only.
 

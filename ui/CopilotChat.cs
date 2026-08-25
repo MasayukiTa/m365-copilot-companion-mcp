@@ -3015,6 +3015,28 @@ class ChatWindow : Window
         if (_undoTimer != null) { _undoTimer.Stop(); _undoTimer = null; }
         if (c == null) return;
         try { var p = Path_(c.Id); if (File.Exists(p)) File.Delete(p); } catch { }
+
+        // A CONVERSATION LIVES IN FOUR PLACES AND THIS CLEARED ONE. Deleting the app's own
+        // file left the row in the bridge's session store and the row in the fleet's
+        // conversation list, so the cockpit kept listing it and opening it there brought the
+        // whole conversation back into this app. Reported as: deleted from the main view, still
+        // in the fleet, resurrected on click.
+        //
+        // Done here rather than in DeleteLocal so Undo still works: nothing is forgotten until
+        // the undo window closes. Fire-and-forget on a background thread -- a registry that
+        // cannot be reached must not hold up the UI, and the delete has already happened.
+        var url = c.ConvUrl ?? "";
+        var cid = c.Id ?? "";
+        if (!string.IsNullOrEmpty(url) || !string.IsNullOrEmpty(cid))
+            new Thread((ThreadStart)delegate
+            {
+                try
+                {
+                    HttpGet("/forget?url=" + Uri.EscapeDataString(url)
+                            + "&sid=" + Uri.EscapeDataString(cid));
+                }
+                catch { }
+            }) { IsBackground = true }.Start();
     }
 
     void UndoPendingDelete()

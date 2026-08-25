@@ -249,6 +249,47 @@ def register_bridge_session_in_fleet_convs(sid, title, conv_url, transcript_rel)
         logger.warning("register_bridge_session_in_fleet_convs failed for sid=%s", sid, exc_info=True)
 
 
+def unregister_bridge_session_from_fleet_convs(sid="", conv_url=""):
+    """Drop this conversation's row from .fleet/conversations.json. Returns rows removed.
+
+    THE ROW IS WHY DELETED CONVERSATIONS CAME BACK. /delete removed the conversation from
+    Copilot's rail and touched nothing local, so the cockpit went on listing this row, and
+    opening it there re-registered the session and returned it to the chat. Deleted in one of
+    the three places it lives and resurrected by the other two.
+
+    Matched on sid OR on the conversation GUID, because the row's `url` and the store's
+    `conv_url` are not always spelled the same -- one may carry the agent prefix or a query the
+    other does not, and a delete that misses on punctuation leaves exactly the zombie this is
+    here to remove.
+
+    Exception-guarded end to end: failing to tidy a registry must never break a delete the user
+    asked for.
+    """
+    try:
+        from bridge.session_store import _conv_guid
+        guid = _conv_guid(conv_url)
+        existing = _read_fleet_conversations_raw()
+        kept, dropped = [], 0
+        for row in existing:
+            if not isinstance(row, dict):
+                kept.append(row)
+                continue
+            if sid and str(row.get("name") or "") == sid:
+                dropped += 1
+                continue
+            if guid and _conv_guid(str(row.get("url") or "")) == guid:
+                dropped += 1
+                continue
+            kept.append(row)
+        if dropped:
+            _write_fleet_conversations_atomic(kept)
+        return dropped
+    except Exception:
+        logger.warning("could not unregister %s from the fleet conversation list",
+                       sid or conv_url, exc_info=True)
+        return 0
+
+
 def _load_fleet_sessions_view():
     """Read .fleet/conversations.json and map entries whose source != "chat" (i.e. genuine
     fleet-registered conversations, not our own chat rows already covered by S.list_sessions())
@@ -3037,6 +3078,32 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 PAGE_LOCK.release()
             return
+        if parsed.path == "/forget":
+            # LOCAL-ONLY FORGET. Removes this conversation from the session store and from the
+            # fleet's conversation list, and touches Copilot not at all.
+            #
+            # It exists because /delete was reachable only from delete mode 3. The default is
+            # mode 1, "delete from this app only", which removed the chat app's own file and
+            # nothing else -- so the store row and the fleet row survived, the cockpit went on
+            # listing the conversation, and opening it there brought it back. The mode whose
+            # whole promise is "this is the safest one" was the one that left the zombie.
+            #
+            # No page work, so no PAGE_LOCK: forgetting a conversation must not wait on, or be
+            # refused by, a turn that happens to be in flight.
+            q = urllib.parse.parse_qs(parsed.query)
+            url = (q.get("url") or [""])[0]
+            sid = (q.get("sid") or [""])[0]
+            try:
+                if not sid:
+                    sid = S.find_by_conv_url(url) or ""
+                removed = S.delete_session(sid) if sid else False
+            except Exception as e:
+                logger.warning("forget: store removal failed for %s", url, exc_info=True)
+                removed = False
+            dropped = unregister_bridge_session_from_fleet_convs(sid=sid, conv_url=url)
+            self._json({"ok": True, "sid": sid, "removed_local": removed,
+                        "unregistered": dropped})
+            return
         if parsed.path == "/agent_conversations":
             # READ-ONLY: scrape the agent's own conversation rail (guid + title). Lists
             # orphans not in the local registry. Deletes nothing. Scope = current agent.
@@ -3202,8 +3269,29 @@ class Handler(BaseHTTPRequestHandler):
             ok, reason = _try_delete_conversation(url, title)
         except Exception as e:
             ok, reason = False, str(e)
+
+        # A CONVERSATION LIVES IN THREE PLACES AND THIS USED TO CLEAR ONE. Removing it from
+        # Copilot's rail left the row in the local store and the row in the fleet's
+        # conversation list, so the cockpit kept listing it and opening it there brought the
+        # whole thing back into the chat.
+        #
+        # The local copies go even when the remote delete failed. The user asked for this
+        # conversation to be gone; leaving it listed so it can resurrect is the bug being
+        # fixed, and a conversation still present on Copilot's own rail is visible to them
+        # there and already handled -- /agent_conversations exists to list exactly those.
+        sid = ""
+        removed_local = False
+        try:
+            sid = S.find_by_conv_url(url) or ""
+            if sid:
+                removed_local = S.delete_session(sid)
+        except Exception:
+            logger.warning("could not remove %s from the session store", url, exc_info=True)
+        dropped = unregister_bridge_session_from_fleet_convs(sid=sid, conv_url=url)
+
         # expose the reason under BOTH keys so the UI can surface it (it was dropped before)
-        self._json({"ok": ok, "error": reason, "reason": reason, "guid": _conv_guid(url)})
+        self._json({"ok": ok, "error": reason, "reason": reason, "guid": _conv_guid(url),
+                    "removed_local": removed_local, "unregistered": dropped, "sid": sid})
 
     def _do_agent_conversations(self):
         try:
