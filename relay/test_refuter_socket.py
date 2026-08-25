@@ -96,16 +96,39 @@ def test_a_route_that_offers_nothing_falls_through_to_a_page(monkeypatch):
 
 
 def test_a_dead_socket_becomes_a_page_review_and_is_recorded(monkeypatch):
+    """予算を使い切ったあとは、これまでどおりpage に退避して記録も残る。
+
+    経路の故障はレビューの故障ではない、という元の不変条件はここで守られる。
+    変わったのは、そこに至る前に接続を張り直すようになったことだけ。
+    """
+    from relay.relay_fleet import DEFAULT_SOCKET_RETRIES
+
+    drv = _FakeDrv()
+    route = _Route(driver=drv)
+    s = _session(route, monkeypatch)
+    s._try_socket()
+    s._socket_retries = DEFAULT_SOCKET_RETRIES          # 張り直しは使い切った
+    drv.failed = "ChatHubError: the socket went silent"
+    assert s.poll() is None
+    assert s.socket is False and s.drv is None
+    assert s._pending_open is True
+    assert route.failures and "went silent" in route.failures[0]
+    assert any(e == "fallback" for e, _ in route.records)
+
+
+def test_a_dropped_connection_reconnects_before_it_gives_up_the_socket(monkeypatch):
+    """伝送の故障で即pageに退避していた。ワーカー側だけ直して
+    ここを掃引し忘れたため、2026-08-25 20:28 に refuter だけが同じ切断で
+    ページを開いていた -- 隣のワーカーは同じ切断を張り直しで越えていた。"""
     drv = _FakeDrv()
     route = _Route(driver=drv)
     s = _session(route, monkeypatch)
     s._try_socket()
     drv.failed = "ChatHubError: the socket went silent"
     assert s.poll() is None
-    assert s.socket is False and s.drv is None and s._pending_open is True
-    assert route.failures and "went silent" in route.failures[0]
-    assert any(e == "fallback" for e, _ in route.records)
-
+    assert route.failures == [], "張り直しを経路の故障として数えている"
+    assert s._socket_tried is False, "次の poll で socket を取り直せない"
+    assert s._socket_retries == 1
 
 def test_the_socket_is_tried_exactly_once_when_it_is_not_available(monkeypatch):
     """捕獲は実タブ1枚と実ターン1回。毎 poll 試すと、避けようとしたタブより高くつく。"""

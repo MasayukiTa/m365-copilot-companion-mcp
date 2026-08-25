@@ -962,6 +962,31 @@ def reset_socket_route():
         _SOCKET_ROUTE = None
 
 
+def socket_fault_is_transport(reason):
+    """Whether a failure is a dropped CONNECTION rather than a job that needs a tab.
+
+    The classifier that answers this already existed and was already being consulted --
+    `classify_fallback` returns 'route' for a transport fault and 'task' for a card, a consent
+    prompt or an attachment. Every fallback on 2026-08-25 carried cause='route', which is to
+    say the code knew the connection had dropped and opened a tab anyway. Only 'task' is a
+    reason a tab can fix; 'route' is a reason to reconnect.
+
+    'unknown' is not retried. An unread reason must not be silently treated as transient: that
+    is how a classifier gets quietly exonerated instead of extended.
+
+    MODULE LEVEL BECAUSE THERE ARE THREE CALLERS, NOT ONE. The worker was fixed first and the
+    refuter and the Researcher were left with the old behaviour, which is how a fixed fault
+    comes back wearing a different name: at 20:28 the refuter took a ConnectionClosedError
+    straight to a side page while the workers beside it were reconnecting through the same
+    drop. One predicate, so a fourth caller inherits the answer instead of re-deciding it.
+    """
+    try:
+        from relay.transport_policy import classify_fallback
+        return classify_fallback(reason) == "route"
+    except Exception:
+        return False
+
+
 def auto_concurrency(n_goals, per_tab_mb=None, headroom_mb=None, hard_cap=100):
     """How many heavy M365 tabs we can afford open at once, given free RAM right now.
     Keep `headroom_mb` for the user's other work; budget `per_tab_mb` per Copilot tab.
@@ -1014,7 +1039,20 @@ DEFAULT_SOCKET_RETRIES = int(os.environ.get("MCP_FLEET_SOCKET_RETRIES", "2"))
 # SET FROM HERE BECAUSE socket_route.py IS FROZEN. The fleet is what knows how long its turns
 # may run, so the fleet is the honest owner of the margin that has to cover them. The module
 # keeps its own default for callers that build a route without one.
-SOCKET_REFRESH_MARGIN_S = float(os.environ.get("MCP_FLEET_SOCKET_MARGIN_S", "1200"))
+SOCKET_REFRESH_MARGIN_S = float(os.environ.get("MCP_FLEET_SOCKET_MARGIN_S", "1500"))
+
+# How long one worker turn may run on a socket. The worker passed nothing, so it took
+# socket_route's 600 s default, and that default is why the hardest goals never finished:
+# every reconnect recorded on the run of 2026-08-25 20:12 said "turn deadline exceeded before
+# a completion frame", with 3705, 3530, 2477 and 3103 seconds of token still left. The turns
+# were not being killed by an expiring credential -- they were being killed by this clock, and
+# a Work IQ search over four months of mail genuinely takes longer than ten minutes.
+#
+# Raised to 20 minutes rather than removed: an unbounded turn cannot be told from a hang, and
+# the margin above must always cover it (pinned by a test). Together they refresh a 58-minute
+# token about twice an hour, which is the other cost being traded here -- each refresh opens a
+# capture tab for ~40 seconds.
+SOCKET_TURN_TIMEOUT_S = float(os.environ.get("MCP_FLEET_SOCKET_TURN_S", "1200"))
 
 
 def free_disk_gb(path=None):
@@ -1687,7 +1725,8 @@ class RelayWorker:
         # fallback would then silently drop the very context the follow-up was for.
         self._agent_url = agent_url if resume_id else open_url
         if want_socket and (not self.resume_conv or resume_id):
-            drv = _socket_route().driver_for(self.name, conversation_id=resume_id)
+            drv = _socket_route().driver_for(self.name, conversation_id=resume_id,
+                                             turn_timeout_s=SOCKET_TURN_TIMEOUT_S)
             if drv is not None:
                 self.page, self.drv, self.socket = None, drv, True
                 self.status = "ready"
@@ -2547,7 +2586,8 @@ class RelayWorker:
                 # `driver_for` makes when it is given no conversation id, and it makes one
                 # without opening anything -- cheaper and more certain than a tab reload.
                 try:
-                    drv = _socket_route().driver_for(self.name)
+                    drv = _socket_route().driver_for(
+                        self.name, turn_timeout_s=SOCKET_TURN_TIMEOUT_S)
                     if drv is not None:
                         try:
                             self.drv.close()
@@ -3381,22 +3421,8 @@ class RelayWorker:
             route.note_success()
 
     def _socket_route_fault(self, reason):
-        """Whether this failure is a dropped CONNECTION rather than a job that needs a tab.
-
-        The classifier that answers this already existed and was already being consulted --
-        `classify_fallback` returns 'route' for a transport fault and 'task' for a card, a
-        consent prompt or an attachment. Every fallback on 2026-08-25 carried cause='route',
-        which is to say the code knew the connection had dropped and opened a tab anyway.
-        Only 'task' is a reason a tab can actually fix; 'route' is a reason to reconnect.
-
-        'unknown' is not retried. An unread reason must not be silently treated as transient:
-        that is how a classifier gets quietly exonerated instead of extended.
-        """
-        try:
-            from relay.transport_policy import classify_fallback
-            return classify_fallback(reason) == "route"
-        except Exception:
-            return False
+        """See socket_fault_is_transport. A method so the worker reads as one object."""
+        return socket_fault_is_transport(reason)
 
     def _retry_socket(self, reason):
         """Rebuild the connection and re-send the same turn. NOT a fallback -- no tab is opened.
@@ -3423,7 +3449,8 @@ class RelayWorker:
             self.drv.close()
         except Exception:
             pass
-        drv = route.driver_for(self.name, conversation_id=conv_id)
+        drv = route.driver_for(self.name, conversation_id=conv_id,
+                               turn_timeout_s=SOCKET_TURN_TIMEOUT_S)
         if drv is None:
             self.socket, self.drv = False, None
             return False

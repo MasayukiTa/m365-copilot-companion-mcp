@@ -614,6 +614,38 @@ class ResearchSession:
         from relay.refuter import _socket_share as share
         return share(budget_s)
 
+    def _socket_retry(self, reason):
+        """Reconnect after a transport fault instead of dropping to a side page.
+
+        Bounded by the same budget a worker uses, and reported with the token life at the
+        moment of the fault so the next argument about WHY a socket died is settled from a
+        record rather than from a hypothesis. Returns True when the caller should simply wait
+        for the lazy-open path to take a socket again.
+        """
+        from relay.relay_fleet import (DEFAULT_SOCKET_RETRIES, _socket_route,
+                                       socket_fault_is_transport)
+        if not socket_fault_is_transport(reason):
+            return False
+        tries = getattr(self, "_socket_retries", 0)
+        route = _socket_route()
+        if tries >= DEFAULT_SOCKET_RETRIES or not route.open():
+            return False
+        self._socket_retries = tries + 1
+        try:
+            route.record("socket_retry", worker="research", attempt=self._socket_retries,
+                         token_seconds_left=int(route.token_life()), reason=reason[:300])
+        except Exception:
+            pass
+        try:
+            self.drv.close()
+        except Exception:
+            pass
+        self.socket, self.drv = False, None
+        self._socket_tried = False
+        self._pending_open = True
+        self._t_send = time.time()
+        return True
+
     def _try_socket(self) -> bool:
         """Run this deep-dive over a socket if one can be had. Never raises, never blocks long.
 
@@ -709,6 +741,10 @@ class ResearchSession:
             # THE ROUTE FAILING IS NOT THE DEEP-DIVE FAILING. Drop to a tab and let the
             # RAM-gated open below do exactly what it did before sockets existed.
             reason = getattr(self.drv, "failed", "") or "unknown"
+            # RECONNECT FIRST, exactly as a worker does -- see refuter.py for why all three
+            # call sites had to change together rather than one at a time.
+            if self._socket_retry(reason):
+                return None
             try:
                 from relay.relay_fleet import _socket_route
                 _socket_route().note_failure("research: %s" % reason)

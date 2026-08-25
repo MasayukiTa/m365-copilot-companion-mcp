@@ -380,6 +380,40 @@ class RefuterSession:
             else:
                 self._finish(("UNCLEAR", HARNESS_REASON_PREFIX + "opening the side page failed: %s: %s" % (type(exc).__name__, str(exc)[:160].replace(chr(10), " | "))))
 
+    def _socket_retry(self, reason):
+        """Reconnect after a transport fault instead of dropping to a side page.
+
+        Bounded by the same budget a worker uses, and reported with the token life at the
+        moment of the fault so the next argument about WHY a socket died is settled from a
+        record rather than from a hypothesis. Returns True when the caller should simply wait
+        for the lazy-open path to take a socket again.
+        """
+        import time
+
+        from relay.relay_fleet import (DEFAULT_SOCKET_RETRIES, _socket_route,
+                                       socket_fault_is_transport)
+        if not socket_fault_is_transport(reason):
+            return False
+        tries = getattr(self, "_socket_retries", 0)
+        route = _socket_route()
+        if tries >= DEFAULT_SOCKET_RETRIES or not route.open():
+            return False
+        self._socket_retries = tries + 1
+        try:
+            route.record("socket_retry", worker="refuter", attempt=self._socket_retries,
+                         token_seconds_left=int(route.token_life()), reason=reason[:300])
+        except Exception:
+            pass
+        try:
+            self.drv.close()
+        except Exception:
+            pass
+        self.socket, self.drv = False, None
+        self._socket_tried = False
+        self._pending_open = True
+        self._t_send = time.time()
+        return True
+
     def _try_socket(self) -> bool:
         """Review over a socket if one can be had. Never raises; falls through to a tab.
 
@@ -456,6 +490,14 @@ class RefuterSession:
             # THE ROUTE FAILING IS NOT THE REVIEW FAILING. Drop to a side page and let the
             # RAM-gated open below do what it did before sockets existed.
             reason = getattr(self.drv, "failed", "") or "unknown"
+            # RECONNECT FIRST, exactly as a worker does. A side page is the answer to a card,
+            # not to a dropped connection -- and this branch was left behind when the worker's
+            # was fixed, so at 20:28 on 2026-08-25 the refuter opened a page over a
+            # ConnectionClosedError while the workers beside it reconnected through the same
+            # drop. `_socket_tried` is cleared so the lazy-open path below takes the socket
+            # again instead of the page it would otherwise reach for.
+            if self._socket_retry(reason):
+                return None
             try:
                 from relay.relay_fleet import _socket_route
                 _socket_route().note_failure("refuter: %s" % reason)

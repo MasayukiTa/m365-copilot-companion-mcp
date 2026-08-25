@@ -489,10 +489,36 @@ def test_the_refresh_margin_exceeds_the_longest_turn_a_worker_can_take():
     """
     import inspect
 
-    longest = inspect.signature(SocketRoute.driver_for).parameters["turn_timeout_s"].default
+    module_default = inspect.signature(
+        SocketRoute.driver_for).parameters["turn_timeout_s"].default
+    longest = max(rf.SOCKET_TURN_TIMEOUT_S, module_default)
     assert rf.SOCKET_REFRESH_MARGIN_S > longest, (
         "更新猶予 %.0fs が最長ターン %.0fs を上回っていない"
         % (rf.SOCKET_REFRESH_MARGIN_S, longest))
+
+
+def test_a_worker_turn_is_given_more_than_the_modules_ten_minute_default():
+    """2026-08-25 20:12 の走行では、再接続の理由が4回とも
+    「turn deadline exceeded」で、トークンは 3705/3530/2477/3103 秒残っていた。
+    落としていたのは資格情報ではなくこの時計だった。"""
+    import inspect
+
+    module_default = inspect.signature(
+        SocketRoute.driver_for).parameters["turn_timeout_s"].default
+    assert rf.SOCKET_TURN_TIMEOUT_S > module_default
+
+
+def test_every_worker_socket_is_opened_with_that_deadline():
+    """1箇所でも渡し忘れると、その経路だけ 600 秒に戻って同じ所で落ちる。"""
+    import inspect
+
+    import re
+
+    src = inspect.getsource(rf)
+    sites = re.findall(r"driver_for\(\s*self\.name[^)]*\)", src, re.S)
+    assert len(sites) >= 3, "driver_for(self.name...) の呼び出しを見失っている"
+    for site in sites:
+        assert "SOCKET_TURN_TIMEOUT_S" in site, "期限を渡していない呼び出し: %s" % site[:80]
 
 
 def test_the_fleet_actually_hands_its_margin_to_the_route(monkeypatch):
