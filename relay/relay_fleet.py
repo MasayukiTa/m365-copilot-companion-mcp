@@ -687,6 +687,12 @@ class _Transcript:
         self.key = key
         self.path = os.path.join(directory, key + ".jsonl") if directory else None
         self._guid_logged = False
+        self._name = name or ""
+        self._goal = goal or ""
+        # RECORDED EVEN WHEN THERE IS NO FILE TO WRITE. A run whose transcripts directory
+        # could not be created still happened, and a database that silently holds nothing
+        # for it is worse than one that says the conversation started.
+        self._to_db({"meta": True, "key": key, "name": name, "goal": goal, "ts": time.time()})
         if not self.path:
             return
         try:
@@ -700,7 +706,28 @@ class _Transcript:
         except Exception:
             self.path = None
 
+    def _to_db(self, obj):
+        """Mirror one transcript line into the local database. Never raises.
+
+        THE FLEET DID NOT WRITE TO A DATABASE AT ALL until now. `session_store` was the
+        bridge's, and a fleet conversation existed solely as a JSONL file under the state
+        directory -- so "the chat is in local SQL" was true of one of the two things in this
+        system that hold conversations, and the busier one was not it.
+
+        Guarded to the same standard as the file append beside it: the fleet must never
+        stall on a logging hiccup, and a database is one more thing that can be locked or
+        mid-checkpoint exactly when a turn lands. The import sits inside the guard so a
+        bridge package that is somehow unavailable cannot take the fleet down with it.
+        """
+        try:
+            from bridge.session_store import record_fleet_turn
+            record_fleet_turn(self.key, obj, name=getattr(self, "_name", ""),
+                              goal=getattr(self, "_goal", ""))
+        except Exception:
+            pass
+
     def _append(self, obj):
+        self._to_db(obj)
         if not self.path:
             return
         try:

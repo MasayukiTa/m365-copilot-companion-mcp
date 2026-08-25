@@ -106,6 +106,10 @@ def _db_path():
 def _connect():
     conn = sqlite3.connect(_db_path(), timeout=10.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
+    # BEFORE ANY OTHER PRAGMA THAT WRITES. auto_vacuum is fixed at the first write to a new
+    # database and can only be changed afterwards by a full VACUUM. Setting journal_mode
+    # first was enough to lock it at NONE, so pruning freed rows and returned no disk.
+    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
     # WAL so a reader (the cockpit, a CLI) never blocks the bridge mid-turn.
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -136,16 +140,36 @@ def _initialize(conn):
             FOREIGN KEY (sid) REFERENCES sessions(sid) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS sessions_active_idx ON sessions(last_active_ts DESC);
+        CREATE TABLE IF NOT EXISTS fleet_turns (
+            id    INTEGER PRIMARY KEY AUTOINCREMENT,
+            key   TEXT NOT NULL,
+            name  TEXT NOT NULL DEFAULT '',
+            goal  TEXT NOT NULL DEFAULT '',
+            turn  INTEGER,
+            role  TEXT NOT NULL,
+            text  TEXT NOT NULL DEFAULT '',
+            extra TEXT NOT NULL DEFAULT '{}',
+            ts    REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS fleet_turns_key_idx ON fleet_turns(key, id);
+        CREATE INDEX IF NOT EXISTS fleet_turns_ts_idx ON fleet_turns(ts DESC);
         """
     )
 
 
-def _db():
-    """A connection to an initialized, imported store."""
+def _db(import_files=True):
+    """A connection to an initialized store.
+
+    `import_files=False` skips the one-off migration of the bridge's old per-session files.
+    The fleet writes through here on its hot path and has no business paying for it: the
+    scan took 11.8 seconds against the real directory, and a fleet turn is not the place to
+    spend that. Nothing the fleet writes lives in those files anyway.
+    """
     _ensure_dir()
     conn = _connect()
     _initialize(conn)
-    _import_files_once(conn)
+    if import_files:
+        _import_files_once(conn)
     return conn
 
 
@@ -435,6 +459,186 @@ def search_turns(sid=None, needle="", limit=50):
 def _like_escape(s):
     """A search for "100%" must not match everything."""
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def record_fleet_turn(key, obj, name="", goal=""):
+    """Persist one line of a fleet worker's transcript. Never raises.
+
+    THE FLEET DID NOT WRITE HERE AT ALL until now: `session_store` was the bridge's, and a
+    fleet run's conversation only ever reached `.fleet/transcripts/<key>.jsonl`. So "the
+    chat is in a local database" was true of one of the two things that hold conversations.
+
+    Exception-safe to the same standard as the file append it sits beside -- the fleet must
+    never stall on a logging hiccup, and a database is one more thing that can be locked,
+    full, or mid-checkpoint when a turn happens to land.
+    """
+    try:
+        if not isinstance(obj, dict):
+            return False
+        role = obj.get("role")
+        if not role:
+            # meta and guid lines carry no turn; keep them, labelled, so a reader can tell a
+            # conversation that was started and produced nothing from one never started.
+            role = "meta" if obj.get("meta") else ("guid" if obj.get("guid") else "note")
+        extra = {k: v for k, v in obj.items()
+                 if k not in ("turn", "role", "text", "ts")}
+        conn = _db(import_files=False)
+        try:
+            conn.execute(
+                "INSERT INTO fleet_turns (key, name, goal, turn, role, text, extra, ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(key), str(name or ""), str(goal or ""),
+                 obj.get("turn"), str(role), str(obj.get("text") or ""),
+                 json.dumps(extra, ensure_ascii=False, default=str),
+                 float(obj.get("ts") or time.time())))
+        finally:
+            conn.close()
+        return True
+    except Exception:
+        return False
+
+
+def fleet_turns(key=None, limit=200):
+    """Recorded fleet transcript lines, newest-first, optionally for one worker key."""
+    conn = _db(import_files=False)
+    try:
+        if key:
+            rows = conn.execute(
+                "SELECT * FROM fleet_turns WHERE key = ? ORDER BY id DESC LIMIT ?",
+                (str(key), int(limit))).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM fleet_turns ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+    finally:
+        conn.close()
+    return [{"key": r["key"], "name": r["name"], "goal": r["goal"], "turn": r["turn"],
+             "role": r["role"], "text": r["text"], "ts": r["ts"],
+             "extra": json.loads(r["extra"] or "{}")} for r in rows]
+
+
+def store_stats():
+    """What the store costs and how far back it goes. Read-only.
+
+    Sizing, measured on the real directory at migration: 544 sessions and 1128 turns came to
+    1.2 MB including the write-ahead log, against 367 KB of actual message text. About a
+    megabyte per thousand turns at that mix -- but those turns average 333 bytes, which is
+    short for a Copilot answer, so a working store will grow faster than that per turn.
+    """
+    # OPEN FIRST, MEASURE SECOND. The first call to this on a new machine used to report
+    # 0.00 MB, because the size was read before `_db()` had created and populated the file.
+    conn = _db()
+    try:
+        path = _db_path()
+        total = 0
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                total += os.path.getsize(path + suffix)
+            except OSError:
+                pass
+        sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        row = conn.execute(
+            "SELECT COUNT(*), MIN(ts), MAX(ts), COALESCE(SUM(LENGTH(text)), 0) "
+            "FROM turns").fetchone()
+    finally:
+        conn.close()
+    turns, oldest, newest, text_bytes = row[0], row[1], row[2], row[3]
+    return {"bytes": total, "mb": round(total / (1024.0 * 1024.0), 2),
+            "sessions": sessions, "turns": turns,
+            "text_bytes": text_bytes,
+            "oldest_ts": oldest, "newest_ts": newest,
+            "oldest_age_days": (round((time.time() - oldest) / 86400.0, 1)
+                                if oldest else None)}
+
+
+def prune(max_age_days=None, max_mb=None, now=None):
+    """Delete old sessions, oldest first, and hand the pages back. Returns what it did.
+
+    NEITHER LIMIT IS ON BY DEFAULT, and that is deliberate. This store exists because
+    conversations were losing their history; a retention policy that starts deleting the
+    moment it ships would be that same loss arriving on a schedule. The operator turns it on.
+
+    Whole sessions go, never a slice of one. Half a conversation is worse than none of it:
+    it reads as complete and is not, and anything re-supplying context after a recycle would
+    quietly feed the model a version of events with the middle removed.
+    """
+    now = time.time() if now is None else now
+    removed, freed_before = [], store_stats()["bytes"]
+    conn = _db()
+    try:
+        if max_age_days:
+            cutoff = now - float(max_age_days) * 86400.0
+            rows = conn.execute(
+                "SELECT sid FROM sessions WHERE last_active_ts < ?", (cutoff,)).fetchall()
+            removed.extend(r["sid"] for r in rows)
+
+        if max_mb:
+            # Size is a property of the FILE, and a delete does not shrink it until the pages
+            # come back, so this cannot be checked by re-measuring after each removal. Charge
+            # each session its share of the stored text instead and stop when the estimate is
+            # under the limit -- then verify at the end, and say so if it is still over.
+            budget = float(max_mb) * 1024.0 * 1024.0
+            per = conn.execute(
+                "SELECT s.sid AS sid, s.last_active_ts AS ts, "
+                "       COALESCE(SUM(LENGTH(t.text)), 0) AS w "
+                "FROM sessions s LEFT JOIN turns t ON t.sid = s.sid "
+                "GROUP BY s.sid ORDER BY s.last_active_ts ASC").fetchall()
+            total = float(freed_before)
+            scale = (total / max(sum(r["w"] for r in per), 1)) if per else 1.0
+            for r in per:
+                if total <= budget:
+                    break
+                if r["sid"] in removed:
+                    continue
+                removed.append(r["sid"])
+                total -= r["w"] * scale
+
+        for sid in removed:
+            conn.execute("DELETE FROM turns WHERE sid = ?", (sid,))
+            conn.execute("DELETE FROM sessions WHERE sid = ?", (sid,))
+        if removed:
+            # THE ROWS MUST BE CONSUMED OR THE PRAGMA STOPS AFTER ONE PAGE. Python's sqlite3
+            # returns a cursor and runs the statement lazily, so `execute` alone reclaimed a
+            # single 4 KB page out of 291 free ones: deleting 539 sessions took a 1.18 MB
+            # store to 1.17 MB and looked like incremental vacuum simply not working.
+            # Consuming the result frees the lot -- the same delete then goes to 36 KB.
+            list(conn.execute("PRAGMA incremental_vacuum"))
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+    finally:
+        conn.close()
+
+    # The transcript exports go with the rows they mirror. Leaving them behind would put the
+    # cockpit in front of conversations the store no longer has.
+    for sid in removed:
+        try:
+            os.remove(_transcript_path(sid))
+        except OSError:
+            pass
+        try:
+            os.remove(_sess_path(sid))
+        except OSError:
+            pass
+
+    after = store_stats()
+    return {"removed_sessions": len(removed), "sids": removed,
+            "bytes_before": freed_before, "bytes_after": after["bytes"],
+            "mb_after": after["mb"],
+            "still_over": bool(max_mb and after["mb"] > float(max_mb))}
+
+
+def compact():
+    """Rewrite the database so deleted space returns to the filesystem. Slow; not per-turn.
+
+    `prune` already hands pages back incrementally, which is enough for routine use. This is
+    for the case that predates incremental mode -- a store created before auto_vacuum was set
+    keeps its holes until something rewrites it whole.
+    """
+    conn = _connect()
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        conn.execute("VACUUM")
+    finally:
+        conn.close()
+    return store_stats()
 
 
 def queue_input(sid, text):
