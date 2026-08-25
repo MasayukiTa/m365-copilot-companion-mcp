@@ -937,6 +937,31 @@ def _socket_route():
     return _SOCKET_ROUTE
 
 
+def reset_socket_route():
+    """Discard the route so the next caller builds a fresh one. Call after an Edge hard reset.
+
+    A closed route never reopens, and that rule is right for what it was written for: a backend
+    that has started refusing should not be asked again and again at the price of a failed turn
+    each time. A hard reset of OUR OWN Edge is not that. It is us destroying the context the
+    token capture needs, and the route then records three TargetClosedErrors and shuts itself
+    for good.
+
+    Measured 2026-08-25 20:07. The watchdog reset the Edge after a 150 s stall; capture failed
+    three times with "BrowserContext.new_page: Target page, context or browser has been
+    closed"; the route closed; every recover attempt afterwards was doomed because the thing
+    they were recovering could no longer mint a token. A run that had already carried 64 turns
+    over the socket ended there. The remedy was written for tabs, where resetting the browser
+    costs a reload -- it is fatal to a transport that needs a live context to authenticate.
+
+    A new browser is a new route. Nothing is preserved: not the token, which belongs to the
+    context that just died, and not the failure counters, which describe a browser that no
+    longer exists.
+    """
+    global _SOCKET_ROUTE
+    with _SOCKET_ROUTE_LOCK:
+        _SOCKET_ROUTE = None
+
+
 def auto_concurrency(n_goals, per_tab_mb=None, headroom_mb=None, hard_cap=100):
     """How many heavy M365 tabs we can afford open at once, given free RAM right now.
     Keep `headroom_mb` for the user's other work; budget `per_tab_mb` per Copilot tab.
@@ -2510,19 +2535,49 @@ class RelayWorker:
                                f"max_recycles={self._max_recycles}")
                 return
             landed = False
-            try:
-                self.page.goto(self._agent_url, wait_until="domcontentloaded", timeout=45000)
-                for _ in range(30):
-                    self.page.wait_for_timeout(1000)
-                    if self.page.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+            if getattr(self, "socket", False):
+                # A SOCKET WORKER HAS NO PAGE, and this block used to reload one regardless.
+                # `self.page` is None, `.goto` raised AttributeError, the bare except below
+                # turned it into landed=False, and the worker went STUCK with "fresh
+                # conversation did not render" -- a phrase about a DOM, reported for a
+                # transport that has none. Measured on the run of 2026-08-25 19:47: the same
+                # goal hit it twice, once on its retry, and never reached a turn.
+                #
+                # Nothing needed inventing to fix it. A fresh conversation is precisely what
+                # `driver_for` makes when it is given no conversation id, and it makes one
+                # without opening anything -- cheaper and more certain than a tab reload.
+                try:
+                    drv = _socket_route().driver_for(self.name)
+                    if drv is not None:
+                        try:
+                            self.drv.close()
+                        except Exception:
+                            pass
+                        self.drv = drv
+                        self._socket_turns_seen = 0
                         landed = True
-                        break
-            except Exception:
-                landed = False
+                except Exception:
+                    landed = False
+            else:
+                try:
+                    self.page.goto(self._agent_url, wait_until="domcontentloaded",
+                                   timeout=45000)
+                    for _ in range(30):
+                        self.page.wait_for_timeout(1000)
+                        if self.page.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+                            landed = True
+                            break
+                except Exception:
+                    landed = False
             if not landed:
                 # could not get a fresh composer -> fall through to normal transient handling
                 self.status, self.outcome = "stuck", "STUCK"
-                self.reason = "token-limit recycle: fresh conversation did not render"
+                # NAMED FOR THE TRANSPORT THAT FAILED. "did not render" describes a DOM, and
+                # reporting it for a socket sent the reader looking for a page that was never
+                # supposed to exist.
+                self.reason = ("token-limit recycle: the route would not open a fresh "
+                               "conversation" if getattr(self, "socket", False) else
+                               "token-limit recycle: fresh conversation did not render")
                 return
             self.job = (conversation_start_label(self.name + "-recycle%d" % self._recycles)
                         + PROTOCOL + RECYCLE_PREFIX + self.goal)  # re-anchor in the fresh chat

@@ -1456,8 +1456,23 @@ def main():
         _print_table(workers, len(goals))
 
     from playwright.sync_api import sync_playwright
-    from relay.relay_fleet import FleetContextLost
-    from relay.edge_recover import cdp_alive, companion_edge_mb, hard_reset, should_recycle
+    from relay.relay_fleet import FleetContextLost, reset_socket_route
+    from relay.edge_recover import cdp_alive, companion_edge_mb, hard_reset as _edge_hard_reset
+    from relay.edge_recover import should_recycle
+
+    def hard_reset(port):
+        """Reset the Edge AND forget the socket route that was bound to it.
+
+        Every caller below wants both, and none of them said so. The route captures its token
+        through a page in this browser, so a reset leaves it holding credentials for a context
+        that no longer exists; it then fails the next capture three times and closes itself for
+        the rest of the run. Measured 2026-08-25 20:07 -- see reset_socket_route.
+        """
+        _edge_hard_reset(port)
+        try:
+            reset_socket_route()
+        except Exception:
+            pass
 
     try:
         port = int(args.cdp_url.rsplit(":", 1)[-1].split("/")[0])

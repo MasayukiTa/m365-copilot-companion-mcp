@@ -336,7 +336,10 @@ def _retry_route(monkeypatch, *, drv, noted=None, records=None, is_open=True):
             return is_open
 
         def driver_for(self, n, **kw):
+            # `_called` so a test that checks an argument was NOT passed cannot pass
+            # vacuously by never reaching the call at all.
             asked.update(kw)
+            asked["_called"] = True
             return drv
 
         def note_failure(self, why):
@@ -502,6 +505,100 @@ def test_the_fleet_actually_hands_its_margin_to_the_route(monkeypatch):
                         lambda **kw: seen.update(kw) or object())
     rf._socket_route()
     assert seen.get("refresh_margin_s") == rf.SOCKET_REFRESH_MARGIN_S
+
+
+# ---- 会話リサイクルは socket にも要る ---------------------------------------------------------
+#
+# 2026-08-25 19:47、実走行で発見。トークン上限に達した socket ワーカーが
+# `self.page.goto(...)` に入り、page は None なので AttributeError、それを裸の except が
+# landed=False に変え、「fresh conversation did not render」で STUCK。DOM の話を、DOM を
+# 持たない経路について報告していた。同じゴールが再試行でも同じ所で落ちた。
+
+EXHAUSTED = "OpenAIModelTokenLimit: the conversation has exceeded the token limit"
+
+
+def test_a_socket_worker_recycles_into_a_fresh_conversation_without_a_page(monkeypatch):
+    fresh = _FakeDrv()
+    _retry_route(monkeypatch, drv=fresh)
+    w = _worker()
+    w.socket, w.drv, w.page = True, _FakeDrv(answers=3), None
+    w._socket_turns_seen = 3
+    w._decide(EXHAUSTED)
+    assert w.outcome != "STUCK", "socket ワーカーがリサイクルできずに STUCK になっている"
+    assert w.drv is fresh
+    assert w._socket_turns_seen == 0
+
+
+def test_the_recycle_asks_for_a_conversation_id_free_driver(monkeypatch):
+    """会話IDを渡してしまうと、作り直したい当の会話に戻ってしまう。"""
+    asked = _retry_route(monkeypatch, drv=_FakeDrv())
+    w = _worker()
+    w.socket, w.drv, w.page = True, _FakeDrv(), None
+    w._decide(EXHAUSTED)
+    assert asked.get("_called"), "リサイクル分岐に入っていない（検査が空振りしている）"
+    assert not asked.get("conversation_id"), "リサイクルが同じ会話を継続しようとしている"
+
+
+def test_a_socket_recycle_that_fails_says_so_in_the_transport_it_failed_in(monkeypatch):
+    _retry_route(monkeypatch, drv=None)
+    w = _worker()
+    w.socket, w.drv, w.page = True, _FakeDrv(), None
+    w._decide(EXHAUSTED)
+    assert w.outcome == "STUCK"
+    assert "render" not in w.reason, "DOM の無い経路に DOM の理由を付けている"
+
+
+def test_a_tab_worker_still_reloads_its_page(monkeypatch):
+    """socket 側を足したせいでタブ側の道を壊していないこと。"""
+    seen = {}
+
+    class _Page:
+        def goto(self, url, **kw):
+            seen["url"] = url
+
+        def wait_for_timeout(self, ms):
+            pass
+
+        def locator(self, sel):
+            return type("L", (), {"count": lambda s: 1})()
+
+    w = _worker()
+    w.socket, w.page, w.drv = False, _Page(), _FakeDrv()
+    w._agent_url = "https://agent.example/chat"
+    w._decide(EXHAUSTED)
+    assert seen.get("url") == "https://agent.example/chat"
+    assert w.outcome != "STUCK"
+
+
+
+# ---- ブラウザを作り直したら、経路も作り直す -----------------------------------------------------
+#
+# 2026-08-25 20:07 実測。watchdog が 150 秒の停滞で Edge を hard-reset し、その直後から
+# capture が TargetClosedError で3回失敗して経路が恒久遮断。以後の recover は、復旧させたい
+# 当のものがトークンを作れないので全部無駄撃ちになり、64ターンをソケットで運んだ走行が終了した。
+# 「一度閉じた経路は開かない」はバックエンドが拒み始めた場合の規則であって、
+# 自分のブラウザを自分で消した場合には当てはまらない。
+
+def test_resetting_the_edge_discards_the_route_bound_to_it(monkeypatch):
+    first = rf._socket_route()
+    assert rf._socket_route() is first, "毎回作り直していては singleton の意味がない"
+    rf.reset_socket_route()
+    assert rf._SOCKET_ROUTE is None
+    assert rf._socket_route() is not first, "古いブラウザのトークンを持った経路が残っている"
+
+
+def test_every_edge_hard_reset_in_the_runner_forgets_the_route():
+    """呼び出し側が1箇所でも素の hard_reset を呼べば、そこだけ同じ壊れ方をする。"""
+    import inspect
+
+    from relay import fleet_runner as FR
+
+    src = inspect.getsource(FR)
+    assert "reset_socket_route" in src, "runner が経路を捨てていない"
+    # 素の import 名を残したまま使うと、この包み込みを迂回できてしまう
+    assert "hard_reset as _edge_hard_reset" in src
+    body = src[src.index("def hard_reset(port):"):]
+    assert "_edge_hard_reset(port)" in body and "reset_socket_route()" in body
 
 
 # ---- 二つの会計 -------------------------------------------------------------------------------
