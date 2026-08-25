@@ -59,6 +59,11 @@ class _Answers:
 class CopilotSocketDriver:
     """Drives one Copilot conversation over a WebSocket. No tab, no DOM, no renderer."""
 
+    #: Declared rather than sniffed. Callers that must branch on transport -- the bridge reads
+    #: its answer from the DOM and cannot do that here -- get a name they can grep for, instead
+    #: of a hasattr() on a method that someone later adds to the tab driver for another reason.
+    IS_SOCKET = True
+
     def __init__(self, conversation, connect, *, catalogue=None, protocol="", run_tool=None):
         self.conv = conversation
         self._connect = connect

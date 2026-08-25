@@ -81,6 +81,7 @@ jobs:
             tests/test_listing_counts.py \
             tests/test_child_output_decoding.py \
             tests/test_grep_memory_bound.py \
+            tests/test_bridge_answer_source.py \
             tests/test_skill_approval_flow.py \
             tests/test_bridge_recycle.py \
             tests/test_bridge_conversation_length.py \

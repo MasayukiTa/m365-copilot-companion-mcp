@@ -2204,6 +2204,52 @@ def _bridge_auto_consent() -> bool:
         return False
 
 
+
+# ---- WHERE THE ANSWER IS READ FROM -------------------------------------------------------------
+#
+# The bridge is the last resident tab in the system, and the reason is here rather than in the
+# driver: the turn loop never asked DRIVER for its answer. It scraped the page -- the clean
+# markdown body, `loading-message` for the growing text, `lastChatMessage` for the finished one
+# -- so "use a socket instead" was never one substitution, it was four reads with no socket
+# equivalent. These three give each read a name, and a socket driver answers all three.
+#
+# THE DOM PATH IS UNCHANGED, deliberately and checkably: each branch below is the exact
+# expression that stood at its call site. A test pins that, because the failure mode of a
+# refactor like this is a silently different fallback order in the transport nobody switched.
+
+
+def _on_socket() -> bool:
+    """Whether this conversation is being carried by a socket rather than the page."""
+    return bool(getattr(DRIVER, "IS_SOCKET", False))
+
+
+def _answer_clean() -> str:
+    """The best text available now -- growing mid-turn, final after. No fallback."""
+    if _on_socket():
+        return DRIVER.read_last_response() or ""
+    return _clean_answer_text() or ""
+
+
+def _answer_partial() -> str:
+    """What to stream to the user right now."""
+    if _on_socket():
+        return DRIVER.partial_text() or DRIVER.read_last_response() or ""
+    _pc = _clean_answer_text()
+    return _pc if _pc else _text(LOADING)
+
+
+def _answer_settled() -> str:
+    """Non-empty only once the turn has produced an answer to settle on.
+
+    On the page that is `lastChatMessage`, which populates when the turn is done; on a socket
+    it is settled_text(), which is empty while the turn runs. Same meaning, same emptiness.
+    """
+    if _on_socket():
+        return DRIVER.settled_text() or ""
+    _cleaned = _clean_answer_text()
+    return _cleaned if _cleaned else _text(LASTMSG)
+
+
 def _is_proc(t: str) -> bool:
     t = (t or "").strip()
     return (not t) or (any(m in t for m in PROCESSING_MARKERS) and len(t) < 40)
@@ -3791,8 +3837,8 @@ class Handler(BaseHTTPRequestHandler):
             # placeholders / citations can never be the prefix. When the clean
             # body doesn't exist yet, fall back to LOADING -- which the guard
             # below filters if it's a status/placeholder line.
-            _pc = _clean_answer_text(); partial = _pc if _pc else _text(LOADING)
-            _cleaned = _clean_answer_text(); final = _cleaned if _cleaned else _text(LASTMSG)
+            partial = _answer_partial()
+            final = _answer_settled()
             # Records WHAT the outer loop is actually reading. The inner settle loop was
             # never entered across a full 600s run, which means this condition never held --
             # so the failure is in the READ, not in the settle arithmetic. Same 20s
@@ -3840,17 +3886,17 @@ class Handler(BaseHTTPRequestHandler):
                     # roughly every 4s while the Stop button stays absent). LASTMSG stays the
                     # fallback for ENTERING this loop; once inside, stable_text is the better
                     # answer to an unreadable poll -- same treatment a placeholder already got.
-                    _cleaned2 = _clean_answer_text()
+                    _cleaned2 = _answer_clean()
                     final = _cleaned2 if _cleaned2 else stable_text
                     if _is_proc(final):
                         final = stable_text
                 # authoritative final: the CLEAN body, regardless of any streaming artifacts
                 # (placeholder->answer cursor corruption, leaked loading lines).
-                return _clean_answer_text() or final
+                return _answer_clean() or final
             time.sleep(0.3)
             self._ping()                     # detect Esc/Stop disconnect promptly
         # outer-loop timeout end: same authoritative-final read
-        return _clean_answer_text()
+        return _answer_clean()
 
     def _consent_last_resort_surface(self) -> bool:
         """LAST RESORT for MCP connection-consent, fired only after every automatic tier
