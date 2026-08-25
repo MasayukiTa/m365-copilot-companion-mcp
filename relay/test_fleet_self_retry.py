@@ -26,12 +26,26 @@ def test_the_cap_can_never_be_unbounded():
     assert "max(0" in src
 
 
-def test_only_no_answer_outcomes_are_retried():
-    """DONE や、課題そのものが誤っている結末を再投入しても、同じ答えが返るだけ。"""
+def test_the_outcome_the_fleet_actually_emits_is_retried():
+    """最初の版は、実際には出ない outcome を並べていた。
+
+    結末を設定している分岐を読んで決め、フリートが実際に何を出すかを数えなかった。
+    記録された履歴の分布は DONE 4 / MAXTURNS 4 / STUCK 2 で、ここで実際に起きる唯一の
+    失敗である STUCK が抜けていた。実走行で w1 が STUCK のまま止まり、理由は
+    「token-limit recycle: fresh conversation did not render」 -- まさにこの機構が
+    対象とすべき一過性で、再投入されないままだった。"""
+    assert "STUCK" in FR.RETRYABLE_OUTCOMES, "実際に出る結末が対象外"
     assert "INFRA_STUCK" in FR.RETRYABLE_OUTCOMES
     assert "REFUSED" in FR.RETRYABLE_OUTCOMES
-    for bad in ("DONE", "CANCELLED", "MAXTURNS", "ERROR"):
+
+
+def test_repetition_is_not_recovery():
+    """MAXTURNS はターン予算を使い切ったということ。同じ予算で同じ課題を回せば同じ結末。
+    CANCELLED は人が止めたもの。どちらも再投入は回復ではなく繰り返し。"""
+    for bad in ("DONE", "MAXTURNS", "CANCELLED"):
         assert bad not in FR.RETRYABLE_OUTCOMES, "%s を再投入対象にしている" % bad
+        assert bad in FR.NON_RETRYABLE_OUTCOMES
+    assert not (FR.RETRYABLE_OUTCOMES & FR.NON_RETRYABLE_OUTCOMES), "両方に入っている結末がある"
 
 
 def test_each_worker_is_considered_once():

@@ -162,15 +162,29 @@ def _settings_int(key, default):
     return default
 
 
-#: Outcomes worth another attempt. Both are classifications of "the run did not get an answer",
-#: not "the task is wrong": INFRA_STUCK means the connection or agent never established, and
-#: REFUSED means the custom agent answered but Copilot declined this particular prompt.
+#: Outcomes worth another attempt: the run did not get an answer, as opposed to the task being
+#: wrong. INFRA_STUCK means the connection or agent never established, REFUSED means the agent
+#: answered but Copilot declined this prompt, and STUCK is the one the fleet actually emits --
+#: "token-limit recycle: fresh conversation did not render" and its kin.
+#:
+#: THE FIRST VERSION OF THIS LIST NAMED OUTCOMES THAT DO NOT OCCUR. It was written by reading
+#: the branches that set an outcome, not by counting what the fleet emits. Against the recorded
+#: history the distribution is DONE 4, MAXTURNS 4, STUCK 2 -- and STUCK, the only failure that
+#: actually happens here, was the one left out. A live run had w1 sitting at STUCK with a
+#: token-limit recycle behind it, which is exactly the transient this exists for, and it would
+#: never have been re-queued.
 #:
 #: Measured 2026-08-25 across 28 goals in six runs: 25% came back with Copilot's canned "I
 #: couldn't respond to that". The failure moved to a different goal every run, was unaffected
 #: by concurrency (25% at one worker, 25% at two), and the two goals that failed one run both
 #: passed when re-queued unchanged. That is transient, and a bounded retry is what it needs.
-RETRYABLE_OUTCOMES = frozenset({"INFRA_STUCK", "REFUSED"})
+RETRYABLE_OUTCOMES = frozenset({"STUCK", "INFRA_STUCK", "REFUSED"})
+
+#: NOT retried, and the distinction is the point. MAXTURNS means the worker ran its whole turn
+#: budget and still had not finished: running it again spends the same budget on the same task
+#: and ends the same way. CANCELLED was a human saying stop. Re-queueing either is not recovery,
+#: it is repetition.
+NON_RETRYABLE_OUTCOMES = frozenset({"DONE", "MAXTURNS", "CANCELLED"})
 
 
 def settings_autoretry():
