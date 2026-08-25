@@ -41,6 +41,10 @@ from socketserver import ThreadingMixIn
 
 logger = logging.getLogger(__name__)
 
+#: When this process started, so a caller can tell a fresh bridge from a stale one without
+#: guessing from a log line or a process table.
+_PROCESS_STARTED = time.time()
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
@@ -3332,6 +3336,37 @@ class Handler(BaseHTTPRequestHandler):
                 # a raising handler cannot leave a page resident that nothing will use again.
                 run_on_page_thread(return_page, _mine)
                 PAGE_LOCK.release()
+            return
+        if parsed.path == "/status":
+            # WHAT IS ACTUALLY TRUE RIGHT NOW, in one read-only answer.
+            #
+            # "Did my restart pick up the change?" and "is this really on a websocket?" were
+            # being answered by reading logs, counting browser tabs through CDP and comparing
+            # file timestamps by hand -- three sources, none of them the process itself, and
+            # every one of them a way to end up describing somebody else's bridge. This asks
+            # the running process. It takes no lock and touches no page, so it answers even
+            # while a turn is in flight, which is exactly when the question gets asked.
+            import platform
+
+            store = {}
+            try:
+                store = S.store_stats() or {}
+            except Exception as exc:
+                store = {"error": "%s: %s" % (type(exc).__name__, str(exc)[:80])}
+            self._json({
+                "ok": True,
+                "transport": "socket" if _on_socket() else ("page" if DRIVER else "none"),
+                "socket_enabled": BRIDGE_SOCKET,
+                "release_startup_page": BRIDGE_RELEASE_STARTUP_PAGE,
+                "has_resident_page": PAGE is not None,
+                "conversation": sessref_guid(socket_conv_ref()) or "",
+                "active_sid": ACTIVE_SID or "",
+                "turn_budget_s": BRIDGE_TURN_TIMEOUT_S,
+                "store": store,
+                "pid": os.getpid(),
+                "started": _PROCESS_STARTED,
+                "python": platform.python_version(),
+            })
             return
         if parsed.path == "/conv":         # current conversation URL (for saving)
             if not PAGE_LOCK.acquire(blocking=False):
