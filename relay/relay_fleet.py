@@ -932,6 +932,7 @@ def _socket_route():
                                                 websocket_connect)
                 _SOCKET_ROUTE = SocketRoute(capture_fn=capture_via_tab,
                                             connect_fn=websocket_connect,
+                                            refresh_margin_s=SOCKET_REFRESH_MARGIN_S,
                                             log=lambda m: print(m, flush=True))
     return _SOCKET_ROUTE
 
@@ -962,6 +963,33 @@ DEFAULT_DISK_FLOOR_GB = float(os.environ.get("SWE_DISK_FLOOR_GB", "6"))
 # cleanup reclaims it (image layers etc.). Used to look ahead so we never open a tab that would
 # itself push C: under the floor. Env-tunable; conservative default. 0 disables look-ahead.
 DEFAULT_EVAL_DISK_GB = float(os.environ.get("SWE_EVAL_DISK_GB", "0"))
+
+# How many times a worker REBUILDS ITS SOCKET before it gives up and opens a tab.
+#
+# It used to be zero, and that is why this constant exists. On the first `failed` flag the
+# worker opened a tab -- including when the reason was `ConnectionClosedError`, which is one
+# connection dropping and says nothing about whether the work can be done over a socket. The
+# run of 2026-08-25 is the record: 31 turns had already completed over the route, w9 had done
+# 5 turns of the very goal it then fell back on, and no attempt to reconnect was ever made by
+# any run, because no code path existed that could make one. "The socket could not do it" was
+# therefore never measured -- it was assumed by the shape of the control flow.
+#
+# What the tab bought, measured on those three workers: w5 DONE, w3 STUCK, w9 never finished.
+# One in three, against 1.77 GB of resident browser that then held the autoscale down to 3.
+DEFAULT_SOCKET_RETRIES = int(os.environ.get("MCP_FLEET_SOCKET_RETRIES", "2"))
+
+# How early the token is refreshed. IT MUST EXCEED THE LONGEST TURN, and socket_route's own
+# default of 600 s did not -- it EQUALLED it. A worker asks driver_for for no turn timeout, so
+# it gets that module's 600 s default, and the token is only consulted when the socket opens: a
+# turn could start with 601 seconds of token left, legitimately run its full 600, and be killed
+# by the server one second from the end. The arm that recorded no fallbacks had a median turn
+# count of 1 and a median goal of 64 characters, so it never went near this; the Work IQ
+# searches that run minutes hit it on the first real run.
+#
+# SET FROM HERE BECAUSE socket_route.py IS FROZEN. The fleet is what knows how long its turns
+# may run, so the fleet is the honest owner of the margin that has to cover them. The module
+# keeps its own default for callers that build a route without one.
+SOCKET_REFRESH_MARGIN_S = float(os.environ.get("MCP_FLEET_SOCKET_MARGIN_S", "1200"))
 
 
 def free_disk_gb(path=None):
@@ -3297,6 +3325,71 @@ class RelayWorker:
         for _ in range(done - seen):
             route.note_success()
 
+    def _socket_route_fault(self, reason):
+        """Whether this failure is a dropped CONNECTION rather than a job that needs a tab.
+
+        The classifier that answers this already existed and was already being consulted --
+        `classify_fallback` returns 'route' for a transport fault and 'task' for a card, a
+        consent prompt or an attachment. Every fallback on 2026-08-25 carried cause='route',
+        which is to say the code knew the connection had dropped and opened a tab anyway.
+        Only 'task' is a reason a tab can actually fix; 'route' is a reason to reconnect.
+
+        'unknown' is not retried. An unread reason must not be silently treated as transient:
+        that is how a classifier gets quietly exonerated instead of extended.
+        """
+        try:
+            from relay.transport_policy import classify_fallback
+            return classify_fallback(reason) == "route"
+        except Exception:
+            return False
+
+    def _retry_socket(self, reason):
+        """Rebuild the connection and re-send the same turn. NOT a fallback -- no tab is opened.
+
+        The conversation survives the socket: `driver_for(conversation_id=...)` continues the
+        same conversation, which was measured across a fresh token and a separate process on
+        2026-08-24. So a reconnect costs one re-sent turn, not the context.
+
+        `_socket_turns_seen` is reset because it is compared against the DRIVER's completed
+        answer count, and the new driver starts that count at zero. Left at its old value, the
+        comparison `done <= seen` would swallow every success until the new connection had
+        overtaken the old one's total, and the route would look dead while it worked.
+
+        Returns False when no driver can be built -- an expired token, or a route already
+        closed -- and the caller then does what it did before: opens a tab.
+        """
+        route = _socket_route()
+        try:
+            ids = self.drv.conversation_ids() or {}
+        except Exception:
+            ids = {}
+        conv_id = ids.get("server") or ids.get("client") or ""
+        try:
+            self.drv.close()
+        except Exception:
+            pass
+        drv = route.driver_for(self.name, conversation_id=conv_id)
+        if drv is None:
+            self.socket, self.drv = False, None
+            return False
+        self._socket_retries = getattr(self, "_socket_retries", 0) + 1
+        # TOKEN LIFE AT THE MOMENT OF THE FAULT. Recorded because the leading explanation for
+        # the 2026-08-25 drops -- a turn outliving the token it connected with -- could not be
+        # confirmed or refuted from the log: nothing wrote down how much of the token was left.
+        route.record("socket_retry", worker=self.name, goal=(self.goal or "")[:600],
+                     attempt=self._socket_retries, turn=self.turn,
+                     resumed=bool(conv_id),
+                     token_seconds_left=int(route.token_life()),
+                     reason=reason[:300])
+        self.drv, self.socket = drv, True
+        self._socket_turns_seen = 0
+        self.status = "ready"
+        self._last_text, self._stable_since = None, None
+        self._count_before = 0
+        print("[relay_fleet] %s: socket dropped, reconnecting (%d/%d): %s"
+              % (self.name, self._socket_retries, DEFAULT_SOCKET_RETRIES, reason[:100]))
+        return True
+
     def _fall_back_to_tab(self):
         """The socket stopped working for this worker. Open a tab and re-send the same turn.
 
@@ -3337,6 +3430,11 @@ class RelayWorker:
                      # about them had to be answered by re-reading prose after the fact.
                      cause=cause, delivery=delivery,
                      duplicate_risk=delivery in ("delivered", "unknown"),
+                     # HOW MANY RECONNECTS THIS COST, and how much token was left when the
+                     # last one failed. Without the second field the 2026-08-25 drops could
+                     # not be attributed to token expiry or cleared of it.
+                     socket_retries=getattr(self, "_socket_retries", 0),
+                     token_seconds_left=int(route.token_life()),
                      reason=reason[:300])
         try:
             self.drv.close()
@@ -3372,7 +3470,26 @@ class RelayWorker:
         # worker that never runs __init__, and a hard attribute read here would make a socket
         # feature break a test about text stability.
         if getattr(self, "socket", False):
-            if getattr(self.drv, "failed", ""):
+            failed = getattr(self.drv, "failed", "")
+            if failed:
+                # PINNED TO THE SOCKET WHILE THE ROUTE IS OPEN. A tab is the answer to a card,
+                # not to a closed connection, and this branch used to make no distinction: the
+                # first dropped connection opened one.
+                #
+                # The only two things that send an ordinary worker to a tab are now the two
+                # that were ever demonstrated to need one -- an upload, decided before the
+                # turn by transport_policy.needs_tab, and a card the socket cannot show. A
+                # transport fault is neither, so it is reconnected instead, indefinitely,
+                # until the ROUTE says it is shut. That escalation is what keeps this bounded:
+                # each exhausted retry budget reports one failure to the route, and the
+                # route's own guards close it when the blockage is real rather than a blip.
+                if self._socket_route_fault(failed):
+                    route = _socket_route()
+                    if getattr(self, "_socket_retries", 0) >= DEFAULT_SOCKET_RETRIES:
+                        route.note_failure("%s: %s" % (self.name, failed))
+                        self._socket_retries = 0
+                    if route.open() and self._retry_socket(failed):
+                        return False
                 if not self._fall_back_to_tab():
                     return True
             else:

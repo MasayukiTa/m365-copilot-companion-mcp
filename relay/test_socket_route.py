@@ -241,8 +241,9 @@ def test_a_failed_socket_turn_reopens_as_a_tab_and_resends_the_same_job(monkeypa
     noted = []
     monkeypatch.setattr(rf, "_socket_route",
                         lambda: type("R", (), {
-                            "driver_for": lambda self, n: None,
+                            "driver_for": lambda self, n, **kw: None,
                             "note_failure": lambda self, why: noted.append(why),
+                            "token_life": lambda self, agent_url=None: 1800.0,
                             "record": lambda self, event, **f: None})())
     tab = _FakeDrv()
     monkeypatch.setattr(rf, "_open_fresh", lambda *a: object())
@@ -304,6 +305,203 @@ def test_a_tab_worker_is_unaffected_by_any_of_this(monkeypatch):
     monkeypatch.setattr(w, "_fall_back_to_tab",
                         lambda: pytest.fail("a tab worker must never take the socket path"))
     w.poll()
+
+
+# ---- 落ちた接続は、張り直す（タブに退避しない） ----------------------------------------------
+#
+# 2026-08-25 の実走行が出発点。31ターンがソケットで完了したあとに接続が3回切れ、そのたびに
+# タブが開き、経路ごと遮断された。切断の理由は `ConnectionClosedError` -- 接続1本の故障で
+# あって、その仕事がソケットで**できない**証拠ではない。にもかかわらず再接続を試みる経路が
+# コードに存在しなかったので、「ソケットでは無理だった」はどの走行でも一度も測られていない。
+# タブが買えたものは w5 DONE / w3 STUCK / w9 未完了 -- 3分の1、代償は常駐1.77GB。
+
+DROPPED = "ConnectionClosedError: no close frame received or sent"
+
+
+class _IdDrv(_FakeDrv):
+    def __init__(self, answers=0, server="conv-42"):
+        super().__init__(answers=answers)
+        self._server = server
+
+    def conversation_ids(self):
+        return {"client": "", "server": self._server, "session": "s", "turns": 5}
+
+
+def _retry_route(monkeypatch, *, drv, noted=None, records=None, is_open=True):
+    """再接続を1本渡す経路の代役。`is_open` が False なら『経路は塞がれた』状態。"""
+    asked = {}
+
+    class _R:
+        def open(self):
+            return is_open
+
+        def driver_for(self, n, **kw):
+            asked.update(kw)
+            return drv
+
+        def note_failure(self, why):
+            (noted if noted is not None else []).append(why)
+
+        def record(self, event, **f):
+            (records if records is not None else []).append(dict(f, event=event))
+
+        def token_life(self, agent_url=None):
+            return 1800.0
+
+    monkeypatch.setattr(rf, "_socket_route", lambda: _R())
+    return asked
+
+
+def test_a_dropped_connection_is_reconnected_and_no_tab_is_opened(monkeypatch):
+    """これが本命。伝送故障でタブを開くのは、カードへの答えを接続断に出しているのと同じ。"""
+    fresh = _FakeDrv()
+    _retry_route(monkeypatch, drv=fresh)
+    monkeypatch.setattr(rf, "_open_fresh",
+                        lambda *a: pytest.fail("接続断でタブを開いてはいけない"))
+    w = _worker()
+    w.socket, w.drv = True, _FakeDrv()
+    w.drv.failed = DROPPED
+    w.job, w.status = "the very same turn", "waiting"
+
+    w.poll()
+
+    assert w.socket is True and w.drv is fresh
+    assert w.status == "ready"                    # 'ready' が self.job を再送する状態
+    assert w.job == "the very same turn"
+    assert w._socket_fell_back is not True
+
+
+def test_a_reconnect_is_not_counted_as_a_route_failure(monkeypatch):
+    """経路を閉じたのはこの数え方。張り直しは経路の故障ではないので数えない。"""
+    noted = []
+    _retry_route(monkeypatch, drv=_FakeDrv(), noted=noted)
+    monkeypatch.setattr(rf, "_open_fresh", lambda *a: pytest.fail("タブ不要"))
+    w = _worker()
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+    w.drv.failed = DROPPED
+    w.poll()
+    assert noted == [], "再接続を経路の失敗として数えると、瞬断3回で経路が死ぬ"
+
+
+def test_the_reconnect_continues_the_same_conversation(monkeypatch):
+    """会話は接続より長生きする。新しい接続で新しい会話を始めたら、文脈を捨てたことになる。"""
+    asked = _retry_route(monkeypatch, drv=_FakeDrv())
+    monkeypatch.setattr(rf, "_open_fresh", lambda *a: pytest.fail("タブ不要"))
+    w = _worker()
+    w.socket, w.drv, w.status = True, _IdDrv(), "waiting"
+    w.drv.failed = DROPPED
+    w.poll()
+    assert asked.get("conversation_id") == "conv-42"
+
+
+def test_the_answer_counter_is_reset_so_later_successes_are_still_counted(monkeypatch):
+    """新しいドライバの回答数は0から。古い値を残すと、追い越すまで成功が1件も数えられない。"""
+    _retry_route(monkeypatch, drv=_FakeDrv())
+    monkeypatch.setattr(rf, "_open_fresh", lambda *a: pytest.fail("タブ不要"))
+    w = _worker()
+    w.socket, w.drv, w.status = True, _FakeDrv(answers=5), "waiting"
+    w._socket_turns_seen = 5
+    w.drv.failed = DROPPED
+    w.poll()
+    assert w._socket_turns_seen == 0
+
+
+def test_a_card_still_opens_a_tab_because_a_socket_cannot_show_one(monkeypatch):
+    """全部を張り直しにすると、タブでしか解けない用件が永久に解けなくなる。"""
+    _retry_route(monkeypatch, drv=_FakeDrv())
+    tab = _FakeDrv()
+    monkeypatch.setattr(rf, "_open_fresh", lambda *a: object())
+    monkeypatch.setattr(rf, "CopilotWebDriver", lambda page: tab)
+    w = _worker()
+    w._context, w._agent_url = object(), "agent-url"
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+    w.drv.failed = "the turn completed but carried no text (a card the tab can show?)"
+    w.poll()
+    assert w.socket is False and w.drv is tab
+
+
+def test_an_unread_reason_is_not_assumed_transient(monkeypatch):
+    """分類できない理由を再接続に回すと、分類機を静かに免罪して一覧が育たなくなる。"""
+    _retry_route(monkeypatch, drv=_FakeDrv())
+    monkeypatch.setattr(rf, "_open_fresh", lambda *a: object())
+    monkeypatch.setattr(rf, "CopilotWebDriver", lambda page: _FakeDrv())
+    w = _worker()
+    w._context, w._agent_url = object(), "u"
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+    w.drv.failed = "ChatHubError: the backend declined the request: InvalidRequest"
+    w.poll()
+    assert w.socket is False, "unknown は route 扱いにしない"
+
+
+def test_an_exhausted_retry_budget_reports_to_the_route_and_keeps_the_socket(monkeypatch):
+    """経路が開いている限りソケットに留まる。ただし黙って粘るのではなく、
+    使い切った予算を1件の失敗として経路に報告する -- それが遮断の判断材料になる。"""
+    noted = []
+    _retry_route(monkeypatch, drv=_FakeDrv(), noted=noted, is_open=True)
+    monkeypatch.setattr(rf, "_open_fresh", lambda *a: pytest.fail("経路が開いていればタブは開かない"))
+    w = _worker()
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+    w._socket_retries = rf.DEFAULT_SOCKET_RETRIES
+    w.drv.failed = DROPPED
+    w.poll()
+    assert len(noted) == 1
+    assert w.socket is True and w._socket_retries == 1
+
+
+def test_a_closed_route_is_what_sends_the_worker_to_a_tab(monkeypatch):
+    """タブに退避する条件はただ一つ、経路そのものが塞がれたこと。
+    本当に塞がれた時に仕事が止まっては、退避路の意味がない。"""
+    _retry_route(monkeypatch, drv=_FakeDrv(), is_open=False)
+    tab = _FakeDrv()
+    monkeypatch.setattr(rf, "_open_fresh", lambda *a: object())
+    monkeypatch.setattr(rf, "CopilotWebDriver", lambda page: tab)
+    w = _worker()
+    w._context, w._agent_url = object(), "u"
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+    w._socket_retries = rf.DEFAULT_SOCKET_RETRIES
+    w.drv.failed = DROPPED
+    w.poll()
+    assert w.socket is False and w.drv is tab
+
+
+def test_a_route_that_hands_out_no_driver_falls_back_rather_than_hanging(monkeypatch):
+    """トークン失効・経路遮断なら driver_for は None を返す。そこで止まったら仕事が消える。"""
+    _retry_route(monkeypatch, drv=None)
+    tab = _FakeDrv()
+    monkeypatch.setattr(rf, "_open_fresh", lambda *a: object())
+    monkeypatch.setattr(rf, "CopilotWebDriver", lambda page: tab)
+    w = _worker()
+    w._context, w._agent_url = object(), "u"
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+    w.drv.failed = DROPPED
+    w.poll()
+    assert w.socket is False and w.drv is tab
+
+
+def test_the_refresh_margin_exceeds_the_longest_turn_a_worker_can_take():
+    """更新猶予と最長ターンが同値だった。残り601秒で始めて600秒走れば、終わる直前に失効する。
+
+    ワーカーは turn_timeout_s を渡さないので driver_for の既定がそのまま最長ターンになる。
+    ヘッダは接続時に一度しか読まないため、走行中のターンは新トークンの恩恵を受けない。
+    """
+    import inspect
+
+    longest = inspect.signature(SocketRoute.driver_for).parameters["turn_timeout_s"].default
+    assert rf.SOCKET_REFRESH_MARGIN_S > longest, (
+        "更新猶予 %.0fs が最長ターン %.0fs を上回っていない"
+        % (rf.SOCKET_REFRESH_MARGIN_S, longest))
+
+
+def test_the_fleet_actually_hands_its_margin_to_the_route(monkeypatch):
+    """定数を置いただけで経路に渡していなければ、猶予は 600 のままになる。"""
+    import relay.socket_route as SR
+
+    seen = {}
+    monkeypatch.setattr(rf, "_SOCKET_ROUTE", None)
+    monkeypatch.setattr(SR, "SocketRoute",
+                        lambda **kw: seen.update(kw) or object())
+    rf._socket_route()
+    assert seen.get("refresh_margin_s") == rf.SOCKET_REFRESH_MARGIN_S
 
 
 # ---- 二つの会計 -------------------------------------------------------------------------------
