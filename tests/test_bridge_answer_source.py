@@ -197,3 +197,127 @@ def test_the_switch_is_on_by_default_and_can_be_turned_off():
     src = inspect.getsource(B)
     i = src.index("BRIDGE_SOCKET = ")
     assert 'os.environ.get("MCP_BRIDGE_SOCKET", "1")' in src[i:i + 200]
+
+
+# ---- ページ所有スレッドからの再投入は自分待ちになる -------------------------------------------
+
+def test_run_on_page_thread_calls_straight_through_on_that_thread(monkeypatch):
+    """submit() は実行されるまで呼び出し側を止める。実行役自身が呼べば自分を待つ。
+    実際にブリッジを動かした一発目がこれで、全 /stream が
+    {"ok": false, "error": "busy"} を返した -- 何が起きたかを一言も言わない理由で。"""
+    import threading
+
+    class _Exec:
+        def __init__(self):
+            self._thread = threading.current_thread()
+
+        def submit(self, fn, *a, **kw):
+            raise AssertionError("ページスレッドから再投入している（自分待ち）")
+
+    monkeypatch.setattr(B, "PAGE_EXECUTOR", _Exec())
+    assert B.on_page_thread() is True
+    assert B.run_on_page_thread(lambda x: x + 1, 41) == 42
+
+
+def test_another_thread_still_goes_through_the_queue(monkeypatch):
+    import threading
+
+    class _Exec:
+        def __init__(self):
+            self._thread = threading.Thread(target=lambda: None)
+            self.calls = []
+
+        def submit(self, fn, *a, **kw):
+            self.calls.append(fn)
+            return fn(*a, **kw)
+
+    ex = _Exec()
+    monkeypatch.setattr(B, "PAGE_EXECUTOR", ex)
+    assert B.on_page_thread() is False
+    assert B.run_on_page_thread(lambda x: x + 1, 41) == 42
+    assert len(ex.calls) == 1, "ページスレッド以外がキューを迂回している"
+
+
+def test_an_existing_page_driver_does_not_stop_the_socket_being_tried(monkeypatch):
+    """起動時にページドライバが作られているので、「ドライバはあるか」だけを見ると
+    ソケットは一度も試されない。実際にそう書いてしまい、3分間ページで走ってから気づいた。"""
+    page, sock = _PageDrv(), _SocketDrv(last="z")
+    monkeypatch.setattr(B, "DRIVER", page)
+    monkeypatch.setattr(B, "_bridge_socket_driver", lambda: sock)
+    assert B.ensure_driver() is sock, "ページドライバがあるとソケットを試さない"
+
+
+def test_the_page_driver_is_kept_when_no_socket_can_be_had(monkeypatch):
+    page = _PageDrv()
+    monkeypatch.setattr(B, "DRIVER", page)
+    monkeypatch.setattr(B, "_bridge_socket_driver", lambda: None)
+    monkeypatch.setattr(B, "ensure_page_alive",
+                        lambda: pytest.fail("生きているページドライバを作り直している"))
+    assert B.ensure_driver() is page
+
+
+# ---- ループを実際に回す ------------------------------------------------------------------------
+#
+# アクセサ単体の試験は全部緑のまま、ループ本体は `NameError: _cleaned` で落ちていた
+# -- 置換で消した変数を後段の診断行がまだ参照していた。利用者には
+# 「[bridge error: NameError...]」とだけ出た。単体で固めても、通して回さなければ意味がない。
+
+def _handler():
+    h = B.Handler.__new__(B.Handler)
+    h.sent = []
+    h._sse = lambda payload, event=None: h.sent.append((event, payload))
+    h._ping = lambda: None
+    return h
+
+
+def test_the_streaming_loop_runs_end_to_end_on_a_socket(monkeypatch):
+    drv = _SocketDrv(last="2")
+    monkeypatch.setattr(B, "DRIVER", drv)
+    monkeypatch.setattr(B, "ensure_driver", lambda: drv)
+    monkeypatch.setattr(drv, "send", lambda msg, **kw: None, raising=False)
+    monkeypatch.setattr(drv, "_is_generating", lambda: False, raising=False)
+    monkeypatch.setattr(B.time, "sleep", lambda s: None)
+
+    out = _handler()._send_and_stream_once("1+1 は？")
+    assert out == "2", out
+
+
+def test_the_loop_streams_what_it_reads(monkeypatch):
+    drv = _SocketDrv(last="答え")
+    monkeypatch.setattr(B, "DRIVER", drv)
+    monkeypatch.setattr(B, "ensure_driver", lambda: drv)
+    monkeypatch.setattr(drv, "send", lambda msg, **kw: None, raising=False)
+    monkeypatch.setattr(drv, "_is_generating", lambda: False, raising=False)
+    monkeypatch.setattr(B.time, "sleep", lambda s: None)
+
+    h = _handler()
+    h._send_and_stream_once("q")
+    deltas = "".join((p or {}).get("delta", "") for _e, p in h.sent)
+    assert "答え" in deltas, h.sent
+
+
+def test_the_loop_runs_end_to_end_on_the_page_too(monkeypatch, dom):
+    """ソケット側だけ通して満足すると、切り替えていない側が壊れたまま出ていく。"""
+    dom["clean"], dom["lastmsg"] = "本文", "本文"
+    drv = _PageDrv()
+    drv._is_generating = lambda: False
+    monkeypatch.setattr(B, "DRIVER", drv)
+    monkeypatch.setattr(B, "ensure_driver", lambda: drv)
+    monkeypatch.setattr(B, "_send_counted", lambda msg: None)
+    monkeypatch.setattr(B.time, "sleep", lambda s: None)
+
+    assert _handler()._send_and_stream_once("q") == "本文"
+
+
+def test_the_transport_decision_is_announced_where_it_can_be_seen():
+    """このモジュールは logging を設定しない。root にハンドラが無いので INFO は捨てられる。
+    経路が切り替わったかを logger.info で報せていて、実機確認が丸一往復むだになった。"""
+    import inspect
+
+    src = inspect.getsource(B.ensure_driver)
+    # コメントを除いて見る。以前この検査を素の部分一致で書き、説明コメントの中の
+    # 文字列に反応して落ちた（同じ罠をこのリポジトリで既に踏んでいる）。
+    code = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("#"))
+    assert "logger.info" not in code, "届かない経路に出力している"
+    assert "SOCKET" in code and "PAGE" in code
+    assert code.count("print(") >= 2

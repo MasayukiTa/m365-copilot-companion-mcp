@@ -785,9 +785,27 @@ class PageExecutor:
 PAGE_EXECUTOR = PageExecutor()
 
 
+def on_page_thread() -> bool:
+    """Whether the caller is ALREADY the page-owner thread.
+
+    submit() blocks the caller until the executor runs the job, so a submit made from the
+    executor's own thread waits for a runner that is the waiter. Measured the first time the
+    bridge was actually driven after the socket path went in: a turn asked for a token
+    capture through run_on_page_thread from inside the send path, which the executor was
+    already running, and every /stream request answered {"ok": false, "error": "busy"}.
+    """
+    return threading.current_thread() is getattr(PAGE_EXECUTOR, "_thread", None)
+
+
 def run_on_page_thread(fn, *args, **kwargs):
     """Thin wrapper so call sites read as an ordinary function call. See PageExecutor's
-    docstring for why this indirection exists (Playwright sync-API thread affinity)."""
+    docstring for why this indirection exists (Playwright sync-API thread affinity).
+
+    Calling straight through when we ARE that thread is not an optimisation -- submitting
+    would deadlock against ourselves, and the queue's own busy guard turns that deadlock into
+    a request that fails for a reason naming nothing that went wrong."""
+    if on_page_thread():
+        return fn(*args, **kwargs)
     return PAGE_EXECUTOR.submit(fn, *args, **kwargs)
 
 # ── session lifecycle (durable, resumable) ──────────────────────────────────────────────────
@@ -1203,8 +1221,9 @@ def _bridge_socket_driver():
             conv_id = ""
         return route.driver_for("bridge", agent_url=url, conversation_id=conv_id,
                                 turn_timeout_s=BRIDGE_TURN_TIMEOUT_S)
-    except Exception:
-        logger.warning("socket driver unavailable; staying on the page", exc_info=True)
+    except Exception as exc:
+        print("bridge: socket driver unavailable (%s: %s); staying on the page"
+              % (type(exc).__name__, str(exc)[:160]), flush=True)
         return None
 
 
@@ -1221,12 +1240,25 @@ def ensure_driver():
     Conflating them is what kept the two lifetimes tied together and the tab resident.
     """
     global DRIVER
-    if DRIVER is not None and not (_on_socket() and getattr(DRIVER, "failed", "")):
+    # A LIVE SOCKET IS KEPT; ANYTHING ELSE IS RECONSIDERED. The first version asked only
+    # "is there a driver", and startup had already built a page one -- so the socket was
+    # never once attempted and the bridge behaved exactly as before while reporting that a
+    # socket path existed. Driven for three minutes before that showed up, because nothing
+    # about it looks wrong from outside.
+    if _on_socket() and not getattr(DRIVER, "failed", ""):
         return DRIVER
     drv = _bridge_socket_driver()
     if drv is not None:
         DRIVER = drv
-        logger.info("bridge conversation is on a socket (no tab needed for turns)")
+        # print, NOT logger.info. This module calls logging.getLogger(__name__) and configures
+        # nothing, so the root logger has no handler and INFO is discarded before it reaches
+        # anything -- the first attempt to confirm this change was live announced itself into
+        # a channel that does not exist. Every other operational line here is a print for the
+        # same reason.
+        print("bridge: conversation is on a SOCKET (no tab needed for turns)", flush=True)
+        return DRIVER
+    if DRIVER is not None and not _on_socket():
+        print("bridge: conversation stays on the PAGE (no socket available)", flush=True)
         return DRIVER
     return DRIVER if run_on_page_thread(ensure_page_alive) else None
 
@@ -2151,11 +2183,19 @@ _SETTLE_RESET_TRACE_MAX_BYTES = 2_000_000
 
 
 def _outer_read_trace(t0, cleaned, final, partial):
-    """One line per outer-loop poll, once the turn is already slow. Never raises."""
+    """One line per outer-loop poll, once the turn is already slow. Never raises.
+
+    `cleaned` may be a CALLABLE, and the loop passes one. The clean-body read is a round trip
+    into the page, and this trace writes nothing at all until a turn is already slow -- so
+    taking the value eagerly would put a diagnostic's cost on every healthy turn, several
+    times a second, to be discarded on the next line.
+    """
     try:
         age = time.time() - t0
         if age < _SETTLE_RESET_TRACE_AFTER_S:
             return
+        if callable(cleaned):
+            cleaned = cleaned()
         path = os.path.join(".fleet", "outer_read.jsonl")
         try:
             if os.path.getsize(path) > _SETTLE_RESET_TRACE_MAX_BYTES:
@@ -3919,7 +3959,7 @@ class Handler(BaseHTTPRequestHandler):
             # never entered across a full 600s run, which means this condition never held --
             # so the failure is in the READ, not in the settle arithmetic. Same 20s
             # threshold: a healthy turn enters the inner loop at once and writes nothing.
-            _outer_read_trace(t0, _cleaned, final, partial)
+            _outer_read_trace(t0, _answer_clean, final, partial)
             # stream growing partial (skip "処理中" AND search-status lines)
             if stream_out and not _is_proc(partial) and not _is_search_status(partial) and len(partial) > sent:
                 self._sse({"delta": partial[sent:]})
