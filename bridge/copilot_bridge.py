@@ -1438,6 +1438,15 @@ def ensure_page_alive():
     global PAGE, DRIVER
     try:
         if PAGE is not None and not PAGE.is_closed():
+            # A LIVE PAGE IS NOT ENOUGH; THE CALLER CAME HERE FOR A DRIVER. This early return
+            # left DRIVER exactly as it found it, and after a dead socket is released that is
+            # None -- so ensure_driver returned None and the next turn raised AttributeError
+            # on NoneType, on every turn until a restart. The wedge this was supposed to end
+            # simply changed which exception it announced itself with, and only in the DEFAULT
+            # configuration, where the startup page is never released and this branch is the
+            # one that runs.
+            if DRIVER is None:
+                DRIVER = CopilotWebDriver(PAGE)
             return True
     except Exception:
         pass                      # asking a dead handle is itself a failure -> treat as closed

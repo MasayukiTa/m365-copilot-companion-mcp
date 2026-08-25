@@ -214,6 +214,67 @@ NOT_DELIVERED = (
 )
 
 
+#: Words that mean the goal ASKS THE MODEL TO DO SOMETHING TO THE WORLD, not to read it.
+#:
+#: The distinction the reconnect budget needed and never consulted. Re-sending a turn whose
+#: delivery is uncertain costs a wasted turn when the goal only reads, and a second mail when
+#: it sends one -- and the code that decided whether to re-send had the goal text in hand the
+#: whole time. It is written in this module because it is the same kind of judgement as
+#: `needs_tab`: a property of the request, fixed, and read by more than one caller.
+#:
+#: DELIBERATELY BROAD, because the cost is asymmetric. A false positive stops a re-send that
+#: would have been harmless and asks a person; a false negative repeats an act nobody can
+#: take back. Japanese and English, because the goals here are written in both.
+ACTING = (
+    r"送信",
+    r"送って",
+    r"送付",
+    r"メールを送",
+    r"返信",
+    r"下書きを作",
+    r"作成して",
+    r"作って",
+    r"書き込",
+    r"追記",
+    r"保存して",
+    r"アップロード",
+    r"削除",
+    r"消して",
+    r"移動して",
+    r"登録",
+    r"予約",
+    r"招待",
+    r"投稿",
+    r"\bsend\b",
+    r"\bemail\b",
+    r"\breply\b",
+    r"\bpost\b",
+    r"\bcreate\b",
+    r"\bdelete\b",
+    r"\bremove\b",
+    r"\bupload\b",
+    r"\bcommit\b",
+    r"\bpush\b",
+    r"\bwrite\b",
+    r"\bschedule\b",
+    r"\binvite\b",
+)
+
+
+def goal_may_act(goal: str) -> bool:
+    """Whether re-sending this goal's turn could repeat something done to the world.
+
+    Reading is idempotent; sending is not. Nothing consulted this at re-send time -- the
+    reconnect path and the tab fallback both re-sent the turn verbatim, and the only guard
+    was a count of how many times they had done it.
+    """
+    text = (goal or "")
+    for pattern in ACTING:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+    return False
+
+
 def delivery_status(reason: str) -> str:
     """'delivered', 'not_delivered' or 'unknown' for the turn that was being sent.
 

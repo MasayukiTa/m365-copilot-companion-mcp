@@ -345,6 +345,9 @@ def _retry_route(monkeypatch, *, drv, noted=None, records=None, is_open=True):
         def note_failure(self, why):
             (noted if noted is not None else []).append(why)
 
+        def note_success(self):
+            pass
+
         def record(self, event, **f):
             (records if records is not None else []).append(dict(f, event=event))
 
@@ -1468,7 +1471,7 @@ def test_the_record_says_whether_the_resend_could_repeat_an_act(monkeypatch, tmp
     r.open = lambda: True
     r.driver_for = lambda n, **kw: _FakeDrv()
     monkeypatch.setattr(rf, "_socket_route", lambda: r)
-    w = rf.RelayWorker("メールを送って", "w0")
+    w = rf.RelayWorker("docs を一覧して要約して", "w0")      # 読むだけのゴール
     w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
     w.drv.partial_text = lambda: "半分だけ返ってきた"
     w._retry_socket(DELIVERED_REASON)
@@ -1496,24 +1499,52 @@ def test_output_already_received_is_what_marks_a_turn_as_landed(monkeypatch):
 
 
 def test_a_completed_answer_also_counts_as_landed(monkeypatch):
-    """partial が無くても、完了回答が1つでもあればそのターンは届いている。"""
+    """partial が無くても、**このターンが**答え終えていれば届いている。
+
+    以前ここは `_answers().count() > 0` を根拠にしていたが、あの数はドライバ構築以来の
+    累計で、ターンごとに戻らない -- 1ターン目が完了した後の障害は、1バイトも来ていなくても
+    全部「届いた」と判定されていた。"""
     _retry_route(monkeypatch, drv=_FakeDrv())
     w = _worker()
-    w.socket, w.drv, w.status = True, _FakeDrv(answers=1), "waiting"
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+    w.drv._turn_answered = True
     assert w._retry_socket(DROPPED) is True
     assert w._retry_socket(DROPPED) is False
 
 
-def test_what_was_learned_about_a_turn_outlives_the_connection(monkeypatch):
-    """再接続すると新しいドライバは何も見ていない。そこで判定し直すと、
-    モデルに届いたと分かっているターンが『届いていない』に戻り、
-    1回だったはずの上限が満額に化ける -- 1ターンが7回送られうる。"""
+def test_a_cumulative_answer_count_is_not_evidence_about_this_turn(monkeypatch):
+    """3ターン answer した接続で、4ターン目が1バイトも来ずに切れた場合。"""
     _retry_route(monkeypatch, drv=_FakeDrv())
     w = _worker()
-    w.socket, w.drv, w.status = True, _FakeDrv(answers=1), "waiting"
+    w.socket, w.drv, w.status = True, _FakeDrv(answers=3), "waiting"   # 累計3、今回は無音
+    w.drv._turn_answered = False
+    for i in range(rf.SOCKET_RECONNECTS_PER_GOAL):
+        assert w._retry_socket(DROPPED) is True, "累計を今回の証拠として使っている (%d)" % i
+
+
+def test_what_was_learned_outlives_both_the_connection_and_the_turn_number(monkeypatch):
+    """再接続後は新しいドライバが何も見ていないうえ、`_begin_send` が送信のたびに
+    self.turn を増やすので、ターン番号に紐づけた事実は再送されたコピーに届かない。
+    残すべきは「まだ届け終えていないものが、既に届いているかもしれない」という問い。"""
+    _retry_route(monkeypatch, drv=_FakeDrv())
+    w = _worker()
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+    w.drv._turn_answered = True
     assert w._retry_socket(DROPPED) is True
-    assert w.drv._answers().count() == 0, "前提: 新しい接続は何も受信していない"
-    assert w._retry_socket(DROPPED) is False, "着地の事実が接続と一緒に失われている"
+    assert not getattr(w.drv, "_turn_answered", False), "前提: 新しい接続は何も見ていない"
+    w.turn += 1                                   # 再送は次のターン番号になる
+    assert w._retry_socket(DROPPED) is False, "着地の事実が再送で失われている"
+
+
+def test_a_completed_answer_clears_the_question(monkeypatch):
+    """答えが返ったなら、届いたかどうかを問うていた対象は届いて答え終えている。"""
+    _retry_route(monkeypatch, drv=_FakeDrv())
+    w = _worker()
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+    w._landed_pending = True
+    w.drv.answers = 1
+    w._report_socket_turns()
+    assert w._landed_pending is False
 
 
 def test_a_later_turn_is_judged_on_its_own_evidence(monkeypatch):
@@ -1672,3 +1703,54 @@ def test_reconnects_are_bounded_even_while_the_route_stays_open(monkeypatch):
     assert r.open(), "前提: 経路は開いたまま"
     assert w.socket is False, "経路が開いている限り無限に張り直している"
     assert w._socket_reconnects_total <= rf.SOCKET_RECONNECTS_PER_GOAL
+
+
+# ---- 世界に作用するゴールは、届いたかもしれないターンを二度送らない --------------------------
+#
+# 上限は「何回繰り返すか」を縛るだけで、「繰り返してよいか」は何も言わない。しかも再接続を
+# 1回に絞っても、断られた先の `_fall_back_to_tab` が同じターンをタブで再送していたので、
+# 二重送信は防がれておらず、経路が変わっていただけだった。
+
+def test_an_acting_goal_is_not_resent_when_the_turn_may_have_landed(monkeypatch):
+    _retry_route(monkeypatch, drv=_FakeDrv())
+    w = rf.RelayWorker("渡部さんにメールを送信してください", "w0")
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+    w.drv._turn_answered = True
+    assert w._retry_socket(DROPPED) is False
+    assert w.outcome == "STUCK"
+    assert "may already have been delivered" in w.reason
+    assert "performs an action" in w.reason
+
+
+def test_a_reading_goal_is_resent_normally(monkeypatch):
+    """慎重さを全部のゴールに広げると、読むだけの仕事まで止まる。"""
+    _retry_route(monkeypatch, drv=_FakeDrv())
+    w = rf.RelayWorker("2026年1月の受信メールを一覧してください", "w0")
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+    w.drv._turn_answered = True
+    assert w._retry_socket(DROPPED) is True
+
+
+def test_the_tab_fallback_refuses_it_too(monkeypatch):
+    """再接続だけ縛ってタブ側を放置すると、二重送信は場所を変えただけになる。"""
+    _retry_route(monkeypatch, drv=_FakeDrv())
+    monkeypatch.setattr(rf, "_open_fresh", lambda *a: pytest.fail("タブで再送しようとした"))
+    w = rf.RelayWorker("この内容でメールを送信して", "w0")
+    w._context, w._agent_url = object(), "u"
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+    w._landed_pending = True
+    w.drv.failed = DROPPED
+    assert w._fall_back_to_tab() is False
+    assert w.outcome == "STUCK"
+
+
+def test_the_refusal_is_recorded(tmp_path, monkeypatch):
+    """黙って止まると『なぜ動かないのか』にしかならない。"""
+    r = _route_logging(tmp_path)
+    monkeypatch.setattr(rf, "_socket_route", lambda: r)
+    w = rf.RelayWorker("メールを送信して", "w0")
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+    w.drv._turn_answered = True
+    w._retry_socket(DROPPED)
+    row = next(x for x in _lines(tmp_path) if x["event"] == "resend_refused")
+    assert row["goal"].startswith("メールを送信")

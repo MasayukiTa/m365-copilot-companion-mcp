@@ -3487,9 +3487,36 @@ class RelayWorker:
         if done <= seen:
             return
         self._socket_turns_seen = done
+        # AN ANSWER ARRIVED, so whatever we were unsure about delivering has been delivered
+        # and answered. The next fault starts its own question.
+        self._landed_pending = False
         route = _socket_route()
         for _ in range(done - seen):
             route.note_success()
+
+    def _goal_may_act(self):
+        """Whether this goal asks the model to do something to the world. Cached per worker."""
+        cached = getattr(self, "_acting_goal", None)
+        if cached is None:
+            try:
+                from relay.transport_policy import goal_may_act
+                cached = self._acting_goal = bool(goal_may_act(self.goal or ""))
+            except Exception:
+                cached = self._acting_goal = True      # unknown goes to the careful side
+        return cached
+
+    def _refuse_resend(self, reason, delivery):
+        """End the worker rather than repeat an act it cannot verify. Never silent."""
+        self.status, self.outcome = "stuck", "STUCK"
+        self.reason = ("not re-sent: the turn may already have been delivered and this goal "
+                       "performs an action (delivery=%s, %s)" % (delivery, reason[:120]))
+        try:
+            _socket_route().record(
+                "resend_refused", worker=self.name, goal=(self.goal or "")[:600],
+                turn=self.turn, delivery=delivery, reason=reason[:300])
+        except Exception:
+            pass
+        print("[relay_fleet] %s: %s" % (self.name, self.reason), flush=True)
 
     def _socket_route_fault(self, reason):
         """See socket_fault_is_transport. A method so the worker reads as one object."""
@@ -3525,10 +3552,19 @@ class RelayWorker:
         # TOKENS for this turn is proof the turn reached the model, and re-sending it then
         # asks for the act a second time. A driver that received nothing at all is the case
         # worth another connection.
+        # PER TURN, NOT PER DRIVER. This read `_answers().count() > 0`, and that counter is
+        # cumulative since the driver was built and deliberately never cleared per turn -- so
+        # once a goal had completed a single answer, EVERY later fault was judged delivered,
+        # even one where the connection died before a byte arrived. The six-reconnect budget
+        # collapsed to one, which is the behaviour this was written to avoid.
+        #
+        # `partial_text` is cleared by send() and left standing by a failed turn, which makes
+        # it exactly the evidence wanted: tokens that arrived for THIS attempt.
         saw_output = False
         try:
-            saw_output = bool((self.drv.partial_text() if hasattr(self.drv, "partial_text")
-                               else "") or self.drv._answers().count() > 0)
+            saw_output = bool(
+                (self.drv.partial_text() if hasattr(self.drv, "partial_text") else "")
+                or getattr(self.drv, "_turn_answered", False))
         except Exception:
             saw_output = False
         # STICKY, AND KEYED TO THE TURN. Re-deriving this from the driver each time was worse
@@ -3536,9 +3572,30 @@ class RelayWorker:
         # known to have reached the model was judged unlanded on its second fault and handed
         # the full budget -- up to seven sends of one delivered turn. What was learned about
         # THIS turn has to outlive the connection that learned it.
+        # KEPT UNTIL AN ATTEMPT SUCCEEDS, not until the turn number changes. `_begin_send`
+        # increments self.turn on every send INCLUDING the re-send, so keying this to the turn
+        # meant the re-sent copy was a different turn and arrived judged unlanded -- the seven
+        # sends of one delivered turn this was written to prevent. What persists is the
+        # question "may the thing we are still trying to deliver already have been delivered",
+        # and that stays true until something is actually delivered. _report_socket_turns
+        # clears it when an answer completes.
         if saw_output:
-            self._landed_turn = self.turn
-        landed = (delivery == "delivered") or saw_output             or getattr(self, "_landed_turn", None) == self.turn
+            self._landed_pending = True
+        landed = (delivery == "delivered") or getattr(self, "_landed_pending", False)
+
+        # WHAT THE GOAL ASKS FOR, which nothing here was reading. A count bounds how many
+        # times a turn is repeated; it says nothing about whether repeating it is safe. For a
+        # goal that only reads, a re-send of a turn that may already have run costs one turn.
+        # For a goal that sends mail, it is a second mail -- and capping the RECONNECT at one
+        # did not even prevent that, because the fallback below re-sends on a tab instead.
+        #
+        # So an acting goal whose turn may already have landed is not re-sent at all, on
+        # either transport. The worker ends and says why. A person who can check whether the
+        # mail went can re-queue it; nothing here can check, and guessing repeats the act.
+        if landed and self._goal_may_act():
+            self._refuse_resend(reason, delivery)
+            return False
+
         spent = getattr(self, "_socket_reconnects_total", 0)
         cap = SOCKET_RECONNECTS_IF_DELIVERED if landed else SOCKET_RECONNECTS_PER_GOAL
         if spent >= cap:
@@ -3615,6 +3672,16 @@ class RelayWorker:
         route = _socket_route()
         report_route_fault("%s: %s" % (self.name, reason))
         self._socket_fell_back = True
+        # THE TAB RE-SENDS TOO. Capping reconnects while leaving this path free to repeat the
+        # same turn moved the duplicate rather than preventing it.
+        try:
+            from relay.transport_policy import delivery_status
+            _delivery = delivery_status(reason)
+        except Exception:
+            _delivery = "unknown"
+        if (_delivery == "delivered" or getattr(self, "_landed_pending", False))                 and self._goal_may_act():
+            self._refuse_resend(reason, _delivery)
+            return False
         # RECORDED IMMEDIATELY, not at the end: a run that dies mid-goal still leaves the
         # evidence behind, and this line is the only place the pairing of a goal with the
         # reason it needed a tab exists at all.
