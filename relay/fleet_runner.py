@@ -1464,7 +1464,7 @@ def main():
     EDGE_SUPPRESS_MAX = int(os.environ.get("MCP_FLEET_EDGE_SUPPRESS_MAX", "3"))
     _suppressed = [0]
 
-    def hard_reset(port, discretionary=False):
+    def hard_reset(port, discretionary=False, escalate=False):
         """Reset the Edge AND forget the socket route that was bound to it.
 
         `discretionary` marks the resets taken against a browser that is still WORKING -- the
@@ -1481,7 +1481,21 @@ def main():
         """
         if discretionary:
             others = other_fleet_runs(port)
+            if not others:
+                _suppressed[0] = 0       # the reason to hold back is gone; so is the tally
             if others:
+                # ESCALATION IS FOR A WEDGE, NOT FOR MEMORY. Its whole justification is "the
+                # sibling is plainly not making progress either", which is true of a stall
+                # watchdog and false of a pre-run memory recycle -- a sibling can be working
+                # perfectly well while this run merely wants a leaner browser. One counter
+                # served both, so three quiet memory refusals could end in yanking a shared
+                # Edge out from under a productive sibling: the exact harm this exists to
+                # prevent, produced by the mechanism meant to prevent it.
+                if not escalate:
+                    print("[recycle] %d other fleet run(s) are on this Edge (%s) -- not "
+                          "resetting it for memory; a working sibling is not an emergency"
+                          % (len(others), ",".join(str(x) for x in others)), flush=True)
+                    return False
                 _suppressed[0] += 1
                 if _suppressed[0] < EDGE_SUPPRESS_MAX:
                     print("[recycle] %d other fleet run(s) are on this Edge (%s) -- not "
@@ -1546,7 +1560,7 @@ def main():
                 if should:
                     print("\n[watchdog] fleet stalled %ds -> hard-resetting the Edge (%s)"
                           % (args.stall_s, why))
-                    hard_reset(port, discretionary=True)
+                    hard_reset(port, discretionary=True, escalate=True)
                     last_change = time.time()
                 # else: eval in flight -> wait. Re-checked every 5s; last_change is left intact
                 # so the failsafe ceiling keeps counting from the original freeze.

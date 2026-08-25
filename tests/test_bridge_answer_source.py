@@ -637,3 +637,65 @@ def test_the_identity_net_understands_a_url_reference(monkeypatch):
            "55555555-5555-5555-5555-555555555555")
     monkeypatch.setattr(B.S, "load", lambda sid: {"conv_url": url})
     assert B.socket_is_on_the_active_conversation() is False
+
+
+# ---- 死んだターンを待ち続けない ----------------------------------------------------------------
+#
+# ソケットのターンが1秒目に死んでも settled_text は正しく空のままなので、ループは予算を
+# まるごと回し、最後に read_last_response() -- **失敗したターンの断片** -- を確定回答として
+# 返し、理由は捨て、台帳にはそれが assistant の返答として書かれていた。
+# 10分待たせた末の、自信に満ちた誤答。
+
+def test_a_dead_socket_turn_is_noticed_at_once(monkeypatch):
+    drv = _SocketDrv(partial="途中まで", generating=False, answered=False)
+    drv.failed = "ChatHubError: the backend declined the request"
+    monkeypatch.setattr(B, "DRIVER", drv)
+    monkeypatch.setattr(B, "ensure_driver", lambda: drv)
+    monkeypatch.setattr(B, "_send_counted", lambda msg: None)
+    monkeypatch.setattr(B.time, "sleep", lambda s: None)
+
+    h = _handler()
+    with pytest.raises(RuntimeError) as ei:
+        h._send_and_stream_once("q")
+    assert "declined the request" in str(ei.value), str(ei.value)
+
+
+def test_the_failed_turns_fragment_is_never_the_answer(monkeypatch):
+    """断片を返すくらいなら、失敗したと言うほうがよい。"""
+    drv = _SocketDrv(partial="途中で切れた断片", generating=False, answered=False)
+    drv.failed = "ConnectionClosedError"
+    monkeypatch.setattr(B, "DRIVER", drv)
+    monkeypatch.setattr(B, "ensure_driver", lambda: drv)
+    monkeypatch.setattr(B, "_send_counted", lambda msg: None)
+    monkeypatch.setattr(B.time, "sleep", lambda s: None)
+    try:
+        out = _handler()._send_and_stream_once("q")
+    except RuntimeError:
+        out = None
+    assert out is None or "断片" not in out
+
+
+def test_a_healthy_socket_turn_is_not_disturbed(monkeypatch):
+    drv = _SocketDrv(last="42", answered=True)
+    monkeypatch.setattr(B, "DRIVER", drv)
+    monkeypatch.setattr(B, "ensure_driver", lambda: drv)
+    monkeypatch.setattr(B, "_send_counted", lambda msg: None)
+    monkeypatch.setattr(B.time, "sleep", lambda s: None)
+    assert _handler()._send_and_stream_once("q") == "42"
+
+
+def test_a_tab_turn_has_no_failed_state_to_read(monkeypatch, dom):
+    """タブ側の失敗は例外で出る。ここで "" を返すのは嘘ではない。"""
+    monkeypatch.setattr(B, "DRIVER", _PageDrv())
+    assert B._turn_failed() == ""
+
+
+def test_halting_a_socket_turn_drops_the_driver_not_a_button():
+    """ソケットに停止ボタンは無い。押しに行くページも無い。"""
+    import inspect
+
+    src = inspect.getsource(B.Handler._stream_text)
+    i = src.index("except Exception as e:")
+    seg = src[i:i + 900]
+    assert "release_socket_driver" in seg
+    assert seg.index("_on_socket()") < seg.index("stop_button")

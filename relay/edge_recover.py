@@ -129,7 +129,12 @@ def other_fleet_runs(port=9222, exclude_pid=None):
                 if "python" not in (p.info.get("name") or "").lower():
                     continue
                 cmd = " ".join(p.info.get("cmdline") or [])
-                if "relay.fleet_runner" not in cmd and "fleet_runner.py" not in cmd:
+                # ANY WAY OF DRIVING A FLEET, not just the module's own entry point. A
+                # bench harness that imports run_relay_fleet drives the same shared browser
+                # and was invisible here -- so it got its Edge reset out from under it with
+                # no suppression at all, which is the one case this function exists to stop.
+                if not any(m in cmd for m in ("relay.fleet_runner", "fleet_runner.py",
+                                              "run_relay_fleet", "relay_fleet")):
                     continue
                 if p.info["pid"] in (me, os.getppid()):
                     continue
@@ -467,11 +472,21 @@ def companion_edge_mb(profile_marker="copilot-companion-edge"):
     return total / (1024.0 * 1024.0)
 
 
-def should_recycle(edge_mb, free_mb, edge_cap_mb=1500.0, free_floor_mb=1000.0):
+#: Thresholds for the pre-run recycle. Constants until now, which meant the recycle path
+#: could not be exercised deliberately -- so the sibling-suppression and escalation logic
+#: built on top of it had unit tests and no live firing at all. A knob that only a test uses
+#: is still worth having when the alternative is a path nobody can reach on purpose.
+RECYCLE_EDGE_CAP_MB = float(os.environ.get("MCP_EDGE_RECYCLE_CAP_MB", "1500"))
+RECYCLE_FREE_FLOOR_MB = float(os.environ.get("MCP_EDGE_RECYCLE_FLOOR_MB", "1000"))
+
+
+def should_recycle(edge_mb, free_mb, edge_cap_mb=None, free_floor_mb=None):
     """Decide whether to hard-reset the companion Edge BEFORE a run, to keep it lean.
     Returns (recycle: bool, reason: str). Recycle when the dedicated Edge has bloated past
     `edge_cap_mb`, or free RAM has dropped below `free_floor_mb` (the heavy M365 SPA is
     unreliable under pressure -- a fresh profile state stabilizes it)."""
+    edge_cap_mb = RECYCLE_EDGE_CAP_MB if edge_cap_mb is None else edge_cap_mb
+    free_floor_mb = RECYCLE_FREE_FLOOR_MB if free_floor_mb is None else free_floor_mb
     if edge_mb and edge_mb > edge_cap_mb:
         return (True, "companion Edge at %d MB (> %d cap)" % (round(edge_mb), round(edge_cap_mb)))
     if free_mb and free_mb < free_floor_mb:

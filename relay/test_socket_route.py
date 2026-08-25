@@ -1375,7 +1375,8 @@ def test_workers_failing_from_one_incident_vote_once(monkeypatch):
     clock = {"t": 1000.0}
     for offset in (0.0, 24.0, 32.0):
         clock["t"] = 1000.0 + offset
-        rf.report_route_fault("w: dropped", now=lambda: clock["t"])
+        # 伝送の理由でなければ合流しない（同意カードは独立事象）。ここは切断の話。
+        rf.report_route_fault("w: " + DROPPED, now=lambda: clock["t"])
     assert r.consecutive == 1, "同一事象を %d 票として数えている" % r.consecutive
     assert r.open(), "瞬断1回で経路が閉じている"
 
@@ -1388,7 +1389,7 @@ def test_incidents_far_enough_apart_still_close_the_route(monkeypatch):
     clock = {"t": 1000.0}
     for i in range(3):
         clock["t"] = 1000.0 + i * (rf.SOCKET_INCIDENT_WINDOW_S + 1)
-        rf.report_route_fault("w: dropped", now=lambda: clock["t"])
+        rf.report_route_fault("w: " + DROPPED, now=lambda: clock["t"])
     assert not r.open()
     assert "3 consecutive" in r.closed_reason
 
@@ -1399,9 +1400,9 @@ def test_a_suppressed_vote_is_not_a_suppressed_fallback(monkeypatch):
     monkeypatch.setattr(rf, "_socket_route", lambda: r)
     monkeypatch.setattr(rf, "_LAST_ROUTE_FAULT", [0.0])
     clock = {"t": 500.0}
-    assert rf.report_route_fault("first", now=lambda: clock["t"]) is True
+    assert rf.report_route_fault("first " + DROPPED, now=lambda: clock["t"]) is True
     clock["t"] += 1.0
-    assert rf.report_route_fault("second", now=lambda: clock["t"]) is False
+    assert rf.report_route_fault("second " + DROPPED, now=lambda: clock["t"]) is False
 
 
 def test_the_window_lives_where_the_parallelism_is():
@@ -1768,3 +1769,48 @@ def test_a_fresh_replay_stops_calling_itself_a_socket_worker():
     code = "\n".join(l for l in head.splitlines() if not l.strip().startswith("#"))
     assert "self.socket = False" in code, "タブに戻したのに socket を名乗り続けている"
     assert "self._landed_pending = False" in code
+
+
+# ---- 合流は伝送の事象にだけ ---------------------------------------------------------------------
+#
+# 窓が作られた元の事象は「上流の1回のしゃっくりを N ワーカーが同時に見る」。同意カードで
+# 5ワーカーが止まったのは、5つのゴール・5つの会話で起きた**独立な5件**であって、1票に
+# 潰すと MAX_FALLBACKS の意味が「10回の退避」から「10分間の不調」に変わる。
+# あの上限は1回あたりの代償（失敗ターン + タブを開く）で値付けされている。
+
+CARD = "the turn completed but carried no text (a card the tab can show?)"
+
+
+def test_task_caused_failures_are_counted_one_by_one(monkeypatch):
+    r = _route(max_fallbacks=99)
+    monkeypatch.setattr(rf, "_socket_route", lambda: r)
+    monkeypatch.setattr(rf, "_LAST_ROUTE_FAULT", [0.0])
+    now = [1000.0]
+    for _ in range(5):
+        assert rf.report_route_fault(CARD, now=lambda: now[0]) is True
+        now[0] += 1.0
+    assert r.fallbacks == 5, "独立な5件を合流させている: %d" % r.fallbacks
+
+
+def test_transport_faults_are_still_coalesced(monkeypatch):
+    r = _route()
+    monkeypatch.setattr(rf, "_socket_route", lambda: r)
+    monkeypatch.setattr(rf, "_LAST_ROUTE_FAULT", [0.0])
+    now = [1000.0]
+    for _ in range(5):
+        rf.report_route_fault("w: " + DROPPED, now=lambda: now[0])
+        now[0] += 1.0
+    assert r.fallbacks == 1
+
+
+def test_the_incident_clock_goes_with_the_route(monkeypatch):
+    """新しい経路が、死んだ経路の窓の中で最初の失敗を飲まれて 1票分損をしていた。
+
+    `_SOCKET_ROUTE` は monkeypatch で退避する。素で reset_socket_route() を呼ぶと
+    シングルトンを消したまま後続のテストに漏れ、単体では通るのに全体では別のテストが
+    落ちる -- このリポジトリで何度も出ている順序依存そのものになる。
+    """
+    monkeypatch.setattr(rf, "_SOCKET_ROUTE", rf._SOCKET_ROUTE, raising=False)
+    monkeypatch.setattr(rf, "_LAST_ROUTE_FAULT", [12345.0])
+    rf.reset_socket_route()
+    assert rf._LAST_ROUTE_FAULT[0] == 0.0

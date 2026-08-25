@@ -2539,6 +2539,21 @@ def _answer_partial() -> str:
     return _pc if _pc else _text(LOADING)
 
 
+def _turn_failed() -> str:
+    """Why the turn being waited on died, or "". Only a socket can answer.
+
+    THE LOOP NEVER ASKED. A socket turn that dies in its first second -- an expired token, a
+    ChatHubError, a completed turn carrying only a consent card -- leaves settled_text
+    correctly empty forever, so the loop spun its whole budget and then returned
+    read_last_response(): the FAILED turn's partial fragment, presented as the settled answer,
+    with the reason discarded and the fragment written to the ledger as the assistant's reply.
+    Ten minutes of waiting followed by a confident wrong answer.
+
+    The tab driver has no equivalent state -- its failures raise -- so "" there is honest.
+    """
+    return str(getattr(DRIVER, "failed", "") or "") if _on_socket() else ""
+
+
 def _answer_settled() -> str:
     """Non-empty only once the turn has produced an answer to settle on.
 
@@ -4195,6 +4210,12 @@ class Handler(BaseHTTPRequestHandler):
             # placeholders / citations can never be the prefix. When the clean
             # body doesn't exist yet, fall back to LOADING -- which the guard
             # below filters if it's a status/placeholder line.
+            # ASKED FIRST, because every other read below is meaningless once the turn is
+            # dead: the partial stops growing, the settled text stays empty, and the loop has
+            # nothing left to do but wait out a clock.
+            failed = _turn_failed()
+            if failed:
+                raise RuntimeError("socket turn failed: %s" % failed[:200])
             partial = _answer_partial()
             final = _answer_settled()
             # Records WHAT the outer loop is actually reading. The inner settle loop was
@@ -4419,7 +4440,13 @@ class Handler(BaseHTTPRequestHandler):
             # Copilot's OWN stop button so the SERVER-SIDE generation actually halts. Before this,
             # Esc only closed our local stream while Copilot kept generating.
             try:
-                PAGE.locator(COPILOT_SELECTORS["stop_button"]).first.click(timeout=3000)
+                if _on_socket():
+                    # No stop button to click, and no page to click it on -- the generation
+                    # lives on a socket. Dropping the driver is what halts it, and it also
+                    # stops the next turn inheriting a connection that is already failed.
+                    release_socket_driver("the turn failed or the client hung up")
+                else:
+                    PAGE.locator(COPILOT_SELECTORS["stop_button"]).first.click(timeout=3000)
             except Exception:
                 pass
             try:

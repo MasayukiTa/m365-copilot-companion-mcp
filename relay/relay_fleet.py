@@ -960,6 +960,11 @@ def reset_socket_route():
     global _SOCKET_ROUTE
     with _SOCKET_ROUTE_LOCK:
         _SOCKET_ROUTE = None
+    # THE CLOCK BELONGS TO THE ROUTE THAT IS GONE. It survived the reset, so a fresh route's
+    # first genuine failure could land inside the dead one's window and be swallowed -- the
+    # new route starting life one vote short for no reason anybody could see.
+    with _ROUTE_FAULT_LOCK:
+        _LAST_ROUTE_FAULT[0] = 0.0
 
 
 
@@ -987,13 +992,28 @@ _ROUTE_FAULT_LOCK = threading.Lock()
 
 
 def report_route_fault(reason, now=None):
-    """Report a transport fault to the route ONCE per incident. True if it was reported.
+    """Report a fault to the route, coalescing TRANSPORT faults within one incident window.
 
     A False is not a swallowed failure: the worker still falls back, the fallback is still
     recorded with its goal and reason, and the classifier still gets its training row. The only
     thing suppressed is a second vote, from the same event, in the breaker's tally.
+
+    COALESCING IS FOR TRANSPORT FAULTS ONLY. The incident it was built from is one upstream
+    hiccup seen by N workers at once; a consent card that stops five workers is five separate
+    events, on five goals, in five conversations, and folding them into one vote makes
+    MAX_FALLBACKS -- "the route is not reliable enough to be worth the failed turn plus the tab
+    open" -- mean "ten minutes of trouble" instead of "ten fallbacks". It was priced per
+    fallback, so it has to be counted per fallback.
     """
     t = (now or time.time)()
+    try:
+        from relay.transport_policy import classify_fallback
+        transport = classify_fallback(reason) == "route"
+    except Exception:
+        transport = False
+    if not transport:
+        _socket_route().note_failure(reason)
+        return True
     with _ROUTE_FAULT_LOCK:
         if t - _LAST_ROUTE_FAULT[0] < SOCKET_INCIDENT_WINDOW_S:
             return False

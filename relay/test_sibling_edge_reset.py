@@ -132,11 +132,10 @@ def test_deferring_forever_is_not_an_option():
     デッドロックは誰も回復できない。"""
     src = _runner_source()
     i = src.index("other_fleet_runs(port)")
-    seg = src[i:i + 1600]
+    seg = src[i:i + 2200]
     assert "EDGE_SUPPRESS_MAX" in seg
     assert "resetting anyway" in seg
-    # 譲った回数が上限未満のときだけ return False であること
-    assert seg.index("_suppressed[0] < EDGE_SUPPRESS_MAX") < seg.index("return False")
+    assert "_suppressed[0] < EDGE_SUPPRESS_MAX" in seg
 
 
 def test_the_deferral_counter_resets_when_a_reset_actually_happens():
@@ -149,3 +148,55 @@ def test_the_deferral_counter_resets_when_a_reset_actually_happens():
 def test_the_ceiling_is_tunable_without_editing_source():
     src = _runner_source()
     assert 'os.environ.get("MCP_FLEET_EDGE_SUPPRESS_MAX"' in src
+
+
+def test_memory_pressure_never_escalates_over_a_working_sibling():
+    """escalation の根拠は「相手も進んでいない」で、それは停滞 watchdog の話。
+    起動時のメモリリサイクルには当てはまらない -- 相手は普通に働いていることがある。
+    ひとつのカウンタで両方を数えていたので、静かな3回の見送りの果てに、
+    元気な兄弟から共有Edgeを引き抜くところだった。"""
+    src = _runner_source()
+    i = src.index("other_fleet_runs(port)")
+    seg = src[i:i + 2200]
+    assert "if not escalate:" in seg
+    assert seg.index("if not escalate:") < seg.index("_suppressed[0] += 1")
+    assert "a working sibling is not an emergency" in seg
+
+
+def test_the_watchdog_is_the_one_allowed_to_escalate():
+    src = _runner_source()
+    i = src.index("[watchdog] fleet stalled")
+    assert "escalate=True" in src[i:i + 400]
+
+
+def test_the_memory_recycle_is_not():
+    src = _runner_source()
+    i = src.index("hard-resetting the companion Edge for a clean start")
+    seg = src[i:i + 300]
+    assert "discretionary=True" in seg and "escalate=True" not in seg
+
+
+def test_the_tally_forgets_once_the_siblings_are_gone():
+    """減衰しないカウンタは、何時間も前の見送りを今の判断に持ち込む。"""
+    src = _runner_source()
+    i = src.index("other_fleet_runs(port)")
+    seg = src[i:i + 600]
+    assert "if not others:" in seg and "_suppressed[0] = 0" in seg
+
+
+def test_the_recycle_thresholds_can_be_reached_on_purpose():
+    """定数のままだと、この経路とその上に乗る抑止/escalation を実機で一度も踏めない。"""
+    import inspect
+
+    src = inspect.getsource(ER)
+    assert "MCP_EDGE_RECYCLE_CAP_MB" in src and "MCP_EDGE_RECYCLE_FLOOR_MB" in src
+
+
+def test_a_fleet_driven_some_other_way_is_still_a_sibling(monkeypatch):
+    """run_relay_fleet を import して回すベンチも同じ共有ブラウザを使う。
+    見えていなかったので、抑止なしで足元のEdgeをリセットされていた
+    -- この関数が止めるために存在する、まさにその場合。"""
+    procs = [{"pid": 444, "name": "python.exe",
+              "cmdline": ["python", "-m", "bench.review_run", "--use", "run_relay_fleet"]}]
+    _install(monkeypatch, procs)
+    assert ER.other_fleet_runs(9222) == [444]
