@@ -1323,34 +1323,48 @@ def release_socket_driver(why=""):
 
 
 def borrow_page():
-    """Make a page available for one request. Returns (ok, we_opened_it).
+    """Make a page available for one request. Returns (ok, borrowed).
+
+    `borrowed` records what this call CREATED, so the same call can undo exactly that and
+    nothing else: (page_opened, driver_created).
+
+    The driver half is not incidental. ensure_page_alive binds DRIVER to the page it opens
+    whenever the bridge is not on a socket -- which, right after the startup release, it is
+    not, because DRIVER is None. So borrowing a page made the bridge look like a bridge whose
+    conversation lives on that page, and the return then refused on exactly the guard meant to
+    protect a real one. Measured at a live bridge: "page kept (the conversation is running on
+    it)", about a conversation that borrow_page had invented one line earlier.
 
     The five DOM endpoints are the only things left that need a page once the conversation
-    runs on a socket, and each of them needs it for the length of one request. Before this,
-    the first /history of the session reopened the agent page and the bridge then held it for
-    the rest of its life -- the released startup page came back and stayed, which is most of
-    the memory the release was for (measured: 503 MB rose to 1134 MB and stopped there).
+    runs on a socket, and each needs it for the length of one request.
     """
-    had = False
+    had_page = False
     try:
-        had = PAGE is not None and not PAGE.is_closed()
+        had_page = PAGE is not None and not PAGE.is_closed()
     except Exception:
-        had = False
+        had_page = False
+    had_driver = DRIVER is not None
     ok = ensure_page_alive()
-    return ok, bool(ok and not had)
+    return ok, (bool(ok and not had_page), bool(ok and not had_driver))
 
 
-def return_page(we_opened_it):
-    """Close a page that was opened only to serve one request. Returns True if it closed.
+def return_page(borrowed):
+    """Undo what borrow_page created for one request. Returns True if a page was closed.
 
-    NEVER WHEN THE PAGE IS THE CONVERSATION. If this bridge is not on a socket then DRIVER is
-    that page's driver and closing it would end the chat the user is having -- the saving is
-    not remotely worth that, so the transport check is the first thing here and not the last.
+    NEVER WHEN THE PAGE IS SOMEBODY'S CONVERSATION. If a driver existed BEFORE the borrow and
+    it is not a socket, then that driver is this page's and closing it would end the chat the
+    user is having. That check reads the state as it was before the borrow, which is the only
+    state that can answer the question.
     """
     global PAGE, DRIVER
-    if not (we_opened_it and BRIDGE_RELEASE_STARTUP_PAGE):
+    opened_page, created_driver = (borrowed if isinstance(borrowed, tuple)
+                                   else (bool(borrowed), False))
+    if not (opened_page and BRIDGE_RELEASE_STARTUP_PAGE):
+        if BRIDGE_RELEASE_STARTUP_PAGE:
+            print("bridge: page kept (this request did not open it)", flush=True)
         return False
-    if not _on_socket():
+    if not created_driver and DRIVER is not None and not _on_socket():
+        print("bridge: page kept (a conversation was already running on it)", flush=True)
         return False
     try:
         if PAGE is None or PAGE.is_closed():
@@ -1359,9 +1373,14 @@ def return_page(we_opened_it):
         if not any((pg.url or "") in ("about:blank", "") for pg in ctx.pages if pg is not PAGE):
             ctx.new_page()          # Edge exits with its last page; see _page_main
         PAGE.close()
-    except Exception:
+    except Exception as exc:
+        print("bridge: could not give the page back (%s: %s)"
+              % (type(exc).__name__, str(exc)[:120]), flush=True)
         return False
     PAGE = None
+    if created_driver:
+        DRIVER = None               # the borrow invented it; it goes back with the page
+    print("bridge: gave back the page opened for this request", flush=True)
     return True
 
 

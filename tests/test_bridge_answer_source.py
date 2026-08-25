@@ -507,11 +507,45 @@ def _borrowable(monkeypatch, *, on_socket=True, existing=None, release=True):
 
 def test_a_page_opened_for_one_request_is_given_back(monkeypatch):
     _borrowable(monkeypatch, existing=None)
-    ok, mine = B.borrow_page()
-    assert ok and mine is True
+    monkeypatch.setattr(B, "DRIVER", _SocketDrv(last="x"))
+    ok, borrowed = B.borrow_page()
+    assert ok and borrowed[0] is True
     page = B.PAGE
-    assert B.return_page(mine) is True
+    assert B.return_page(borrowed) is True
     assert page.is_closed() and B.PAGE is None
+
+
+def test_a_driver_the_borrow_invented_goes_back_with_the_page(monkeypatch):
+    """ensure_page_alive はページを開くと同時に会話ドライバも作る。起動時解放の直後は
+    DRIVER が None なので、借りた瞬間に『会話がページに乗っている』状態が出来上がり、
+    返却が自分で作った状態に断られていた（実測: page kept (the conversation is running on it)）。"""
+    _borrowable(monkeypatch, existing=None)
+    monkeypatch.setattr(B, "DRIVER", None)
+
+    def _ensure_binding():
+        if B.PAGE is None:
+            pg = _Pg()
+            pg.context = _Ctx([pg])
+            B.PAGE = pg
+        B.DRIVER = _PageDrv()          # 本物と同じ副作用
+        return True
+
+    monkeypatch.setattr(B, "ensure_page_alive", _ensure_binding)
+    ok, borrowed = B.borrow_page()
+    assert borrowed == (True, True)
+    page = B.PAGE
+    assert B.return_page(borrowed) is True
+    assert page.is_closed() and B.PAGE is None and B.DRIVER is None
+
+
+def test_a_conversation_that_predates_the_borrow_is_protected(monkeypatch):
+    """借用より前から居たページ会話は、借用の後始末で終わらせてはいけない。"""
+    _borrowable(monkeypatch, on_socket=False, existing=None)   # DRIVER はページ用で既に存在
+    ok, borrowed = B.borrow_page()
+    page = B.PAGE
+    assert borrowed[1] is False, "既にあったドライバを『作った』と数えている"
+    assert B.return_page(borrowed) is False
+    assert not page.is_closed()
 
 
 def test_a_page_that_was_already_there_is_left_alone(monkeypatch):
@@ -519,35 +553,46 @@ def test_a_page_that_was_already_there_is_left_alone(monkeypatch):
     existing = _Pg()
     existing.context = _Ctx([existing])
     _borrowable(monkeypatch, existing=existing)
-    ok, mine = B.borrow_page()
-    assert ok and mine is False
-    assert B.return_page(mine) is False
+    ok, borrowed = B.borrow_page()
+    assert ok and borrowed[0] is False
+    assert B.return_page(borrowed) is False
     assert not existing.is_closed() and B.PAGE is existing
+
+
+def test_no_driver_at_all_is_not_a_conversation_to_protect(monkeypatch):
+    """起動時解放の直後は DRIVER が None。そこを『ページが会話』と読んで
+    返却を拒み、最初の /history でページが戻ってきて居座った（実測）。"""
+    _borrowable(monkeypatch, existing=None)
+    monkeypatch.setattr(B, "DRIVER", None)
+    ok, borrowed = B.borrow_page()
+    page = B.PAGE
+    assert B.return_page(borrowed) is True
+    assert page.is_closed() and B.PAGE is None
 
 
 def test_the_page_is_never_closed_when_it_IS_the_conversation(monkeypatch):
     """ソケットに乗っていなければ DRIVER はそのページのドライバで、
     閉じることは利用者の会話を終わらせること。節約とは釣り合わない。"""
     _borrowable(monkeypatch, on_socket=False, existing=None)
-    ok, mine = B.borrow_page()
-    assert ok and mine is True
+    ok, borrowed = B.borrow_page()
     page = B.PAGE
-    assert B.return_page(mine) is False
+    assert B.return_page(borrowed) is False
     assert not page.is_closed()
 
 
 def test_nothing_is_returned_when_the_release_is_off(monkeypatch):
     _borrowable(monkeypatch, existing=None, release=False)
-    ok, mine = B.borrow_page()
-    assert B.return_page(mine) is False
+    ok, borrowed = B.borrow_page()
+    assert B.return_page(borrowed) is False
 
 
 def test_a_blank_page_is_left_holding_the_browser(monkeypatch):
     """最後のタブを閉じると Edge が終了する -- 起動時解放で一度踏んでいる。"""
     _borrowable(monkeypatch, existing=None)
-    ok, mine = B.borrow_page()
+    monkeypatch.setattr(B, "DRIVER", _SocketDrv(last="x"))
+    ok, borrowed = B.borrow_page()
     ctx = B.PAGE.context
-    B.return_page(mine)
+    B.return_page(borrowed)
     assert ctx.opened == 1, "空ページを残さずに最後のタブを閉じている"
 
 
