@@ -61,3 +61,32 @@ def test_the_steps_are_usable():
     assert "RetMbStep" in SRC
     i = SRC.index("int RetMbStep()")
     assert "500" in SRC[i:i + 120] and "100" in SRC[i:i + 120]
+
+
+# ── 自動再試行 ──────────────────────────────────────────────────────────────
+
+def test_auto_retry_is_on_by_default_with_a_cap():
+    """28ゴール6走行で 25% が Copilot の定型拒否だった。毎回落ちる先が入れ替わり、
+    同時実行数にも依らず(1でも2でも25%)、落ちたゴールは再投入すると通った。
+    つまり一過性で、上限付き再試行がまさにその対処。25%が独立なら2回で6%。
+
+    上限が消えたら、決定的に失敗する課題が無限に回る。ON と上限は必ず対で見る。"""
+    assert re.search(r"bool _autoRetry = true;", SRC), "自動再試行が既定 OFF に戻っている"
+    m = re.search(r"int _autoRetryMax = (\d+);", SRC)
+    assert m, "上限が無い"
+    assert 1 <= int(m.group(1)) <= 3, "上限が範囲外(無限ループの危険)"
+
+
+def test_the_retry_budget_is_counted_by_goal_text():
+    """再投入されたゴールは新しいワーカー名を得る。名前で数えると予算が毎回リセットされ、
+    上限があっても実質無限になる。"""
+    assert "_autoRetryCount[goal]" in SRC
+
+
+def test_the_auto_retry_note_sits_with_its_own_fields():
+    """保持設定のコメントを自動再試行の説明と _autoRetry の間に挟んでしまい、
+    あの説明が保持フィールドを説明しているように読めていた。"""
+    i = SRC.index("bool _autoRetry = true;")
+    above = SRC[max(0, i - 900):i]
+    assert "DEFAULT ON SINCE" in above, "自動再試行の説明が離れている"
+    assert "_retDays" not in above, "保持フィールドが説明文の間に割り込んでいる"

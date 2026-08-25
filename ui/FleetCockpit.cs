@@ -821,21 +821,26 @@ class CockpitWindow : Window
     // 4-tab view filter: 0=All, 1=Active (non-terminal non-pending), 2=Needs input (awaiting), 3=Done.
     int _cardFilter = 0;
 
-    // Opt-in, CAPPED auto-retry (default OFF). When on, a newly-stopped non-DONE goal is
-    // re-queued at most _autoRetryMax times -- bounded so a deterministically-failing task
-    // (e.g. the tool-denial ones) can NEVER loop forever. Counted by goal TEXT, so a re-queued
-    // copy (which gets a new worker name) shares the original goal's budget. Manual retry is
-    // unaffected -- this only governs the automatic re-queue.
+    // DEFAULT ON SINCE 2026-08-25, and the number that changed it: across 28 goals in six
+    // runs, 25% came back with Copilot's canned "I couldn't respond to that". Not the same
+    // goal twice -- the failure moved every run, was unaffected by concurrency (25% at one
+    // worker, 25% at two), and the two goals that failed one run both passed when re-queued
+    // unchanged. That is a transient, and a transient is exactly what a bounded retry is for:
+    // at 25% independent, two attempts leave 6% and three leave 1.6%.
+    //
+    // Still capped, so a deterministically-failing task (the tool-denial ones) can never loop.
+    // Counted by goal TEXT, so a re-queued copy -- which gets a new worker name -- shares the
+    // original's budget. Manual retry is unaffected; this governs only the automatic re-queue.
+    bool _autoRetry = true;
+    int _autoRetryMax = 2;
+    Dictionary<string, int> _autoRetryCount = new Dictionary<string, int>();
+
     // Conversation retention. BOTH DEFAULT TO ZERO, WHICH MEANS KEEP EVERYTHING. This store
     // exists because history was disappearing; a retention policy that starts deleting the day
     // it ships is that same loss arriving on a schedule. The operator opts in.
     int _retDays = 0;          // settings.txt session_retention_days= ; 0 = keep forever
     int _retMb = 0;            // settings.txt session_max_mb=        ; 0 = no size cap
     TextBlock _retDaysValue, _retMbValue, _retNote;
-
-    bool _autoRetry = false;
-    int _autoRetryMax = 1;
-    Dictionary<string, int> _autoRetryCount = new Dictionary<string, int>();
 
     // ── P0 HEALTH STRIP ─────────────────────────────────────────────────────────────
     // Six infra dots (Server/Tunnel/Edge/Sign-in/Agent/Tool) in the header, always visible,
