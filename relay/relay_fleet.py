@@ -3696,6 +3696,24 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                                  {"text": w.goal, "checks": w.checks, "cwd": w.cwd})
                 for w in workers if w.outcome not in FINISHED_OUTCOMES]
 
+    # BOUNDED SELF-RETRY. A stuck goal used to be re-queued only by the cockpit's tick, which
+    # watches .fleet/status.json -- so a run started from the command line, from a scheduled
+    # task, or against another state directory got no retry at all. "The run finishes with
+    # nothing refused" must not depend on whether a window is open.
+    #
+    # Counted by goal TEXT, like the cockpit's, so a re-queued copy shares the original's
+    # budget instead of resetting it with its new worker name. `_retry_seen` keeps each worker
+    # considered once: the sweep runs several times a second and a terminal worker stays
+    # terminal, so without it one failure would re-queue on every pass and never stop.
+    try:
+        from relay.fleet_runner import RETRYABLE_OUTCOMES, settings_autoretry
+        _retry_on, _retry_cap = settings_autoretry()
+    except Exception:
+        _retry_on, _retry_cap, RETRYABLE_OUTCOMES = False, 0, frozenset()
+    _retry_seen, _retry_used = set(), {}
+    if add_box is None:
+        _retry_on = False        # nowhere to put a re-queued goal
+
     _reap_counter = 0
     while any(w.status not in TERMINAL for w in workers) or (add_box and len(add_box) > 0):
         # --- stop / pause control (cockpit -> commands.json -> *_box, read every loop) ---
@@ -3734,6 +3752,28 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         _reap_counter += 1
         if _reap_counter % 30 == 0:
             _reap_orphan_redirect_tabs(context, workers)
+
+        # A goal that just went terminal without an answer gets one more attempt, up to the
+        # cap. Queued through the same add_box the cockpit uses, so both paths land in one
+        # place and the tab budget still applies.
+        if _retry_on:
+            for _w in workers:
+                if id(_w) in _retry_seen or _w.status not in TERMINAL:
+                    continue
+                _retry_seen.add(id(_w))
+                if getattr(_w, "outcome", None) not in RETRYABLE_OUTCOMES:
+                    continue
+                _g = getattr(_w, "goal", "") or ""
+                if not _g or _retry_used.get(_g, 0) >= _retry_cap:
+                    continue
+                _retry_used[_g] = _retry_used.get(_g, 0) + 1
+                add_box.append({"text": _g, "checks": getattr(_w, "checks", None),
+                                "cwd": getattr(_w, "cwd", None), "priority": True})
+                try:
+                    print("[fleet] %s %s -> re-queued (%d/%d)"
+                          % (_w.name, _w.outcome, _retry_used[_g], _retry_cap), flush=True)
+                except Exception:
+                    pass
 
         # goals added mid-run (e.g. from the native chat while at capacity) join the
         # queue here -- priority items jump to the front, but still wait for a free slot

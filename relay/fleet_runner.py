@@ -162,6 +162,34 @@ def _settings_int(key, default):
     return default
 
 
+#: Outcomes worth another attempt. Both are classifications of "the run did not get an answer",
+#: not "the task is wrong": INFRA_STUCK means the connection or agent never established, and
+#: REFUSED means the custom agent answered but Copilot declined this particular prompt.
+#:
+#: Measured 2026-08-25 across 28 goals in six runs: 25% came back with Copilot's canned "I
+#: couldn't respond to that". The failure moved to a different goal every run, was unaffected
+#: by concurrency (25% at one worker, 25% at two), and the two goals that failed one run both
+#: passed when re-queued unchanged. That is transient, and a bounded retry is what it needs.
+RETRYABLE_OUTCOMES = frozenset({"INFRA_STUCK", "REFUSED"})
+
+
+def settings_autoretry():
+    """(enabled, cap) for re-queueing a stuck goal, from the same keys the cockpit writes.
+
+    THE FLEET RETRIES ITSELF NOW, not only when a cockpit is watching. The re-queue used to
+    live entirely in the cockpit's tick, which reads .fleet/status.json and injects add_goal --
+    so a run started from the command line, from a scheduled task, or against any other state
+    directory got no retry at all. "The run finishes with nothing refused" cannot depend on
+    whether a window happens to be open.
+
+    Same settings keys as the cockpit, deliberately: two retry policies that can disagree is
+    worse than either one alone.
+    """
+    on = _settings_int("autoretry", 1) == 1
+    cap = max(0, min(3, _settings_int("autoretry_max", 2)))
+    return (on and cap > 0), cap
+
+
 def settings_maxtabs(default=DEFAULT_MAX_CONCURRENT):
     """The user's chosen concurrency from settings.txt (`maxtabs=N`). Under autoscale this is
     the DEFAULT/start cap; with autoscale off it's the fixed cap. Falls back to `default`."""
