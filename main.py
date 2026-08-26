@@ -685,6 +685,25 @@ def _install_faulthandler() -> None:
         dump_dir = Path(__file__).resolve().parent / ".fleet"
         dump_dir.mkdir(parents=True, exist_ok=True)
         dump_path = dump_dir / "faulthandler.log"
+
+        # ROTATE. Every thread's stack, every five minutes, appended for ever: the file was
+        # found at 51.8 MB, and it had no end. On a machine whose disk floor is measured in
+        # single-digit gigabytes -- and which spent today deferring fleet admission because
+        # the disk was tight -- a forensic log with no bound is a slow leak that eventually
+        # costs the thing it exists to diagnose.
+        #
+        # One generation is kept. The value of these dumps is the recent ones: a wedge is
+        # diagnosed from the last few heartbeats, not from a fortnight of healthy ones.
+        try:
+            cap = int(os.environ.get("MCP_FAULTHANDLER_MAX_BYTES", str(8 * 1024 * 1024)))
+            if dump_path.exists() and dump_path.stat().st_size > cap:
+                previous = dump_path.with_suffix(".log.1")
+                if previous.exists():
+                    previous.unlink()
+                dump_path.rename(previous)
+        except Exception:
+            pass
+
         # Keep a handle open for the lifetime of the process (faulthandler writes to it).
         _fh = open(dump_path, "a", encoding="utf-8", buffering=1)
         faulthandler.enable(file=_fh)
