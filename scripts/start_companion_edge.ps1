@@ -24,7 +24,20 @@ param(
     # its OWN CDP port, so it can run concurrently with the fleet's :9222 Edge -- Edge locks
     # a profile to a single process, so concurrent use REQUIRES distinct profiles + ports.
     [string]$Profile = $(if ($env:MCP_EDGE_PROFILE) { $env:MCP_EDGE_PROFILE } else { "copilot-companion-edge" }),
-    [string]$Url = "https://m365.cloud.microsoft/chat",
+    # about:blank, NOT the Copilot chat page.
+    #
+    # This defaulted to https://m365.cloud.microsoft/chat, from when a tab WAS the transport.
+    # It is not any more: the fleet's workers run on sockets, the token capture opens its own
+    # tab and closes it in a finally, and _open_fresh always calls context.new_page() -- so
+    # nothing ever reused this page. Its only remaining job was keeping the browser process
+    # alive, because Edge exits with its last tab, and it was doing that as a full Copilot SPA:
+    # 686 MB on the companion profile and 313 MB on the eval one, both idle, measured
+    # 2026-08-26. A blank page holds the browser open for a few MB.
+    #
+    # Still a parameter: pass -Url https://m365.cloud.microsoft/chat to bring the surface up
+    # for a manual sign-in. Routine startup does not need it -- _open_fresh already surfaces
+    # the Edge itself when it meets a login page.
+    [string]$Url = "about:blank",
     # Recovery: kill the companion Edge and WIPE its session-restore state before
     # launching, so wedged tabs are NOT restored. Use this when the dedicated Edge has
     # stopped responding (CDP dead) and the fleet's attach() stalls. For a still-

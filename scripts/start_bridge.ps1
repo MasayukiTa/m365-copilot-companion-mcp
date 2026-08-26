@@ -91,6 +91,46 @@ function Test-Cdp {
     catch { return $false }
 }
 
+# True when a browser process for THIS profile is running WITHOUT --headless -- i.e. it owns a
+# real window that can be raised.
+#
+# WHY THIS EXISTS. A headed bridge Edge is not merely untidy, it is user-visible: every time the
+# socket route re-keys it opens a tab to capture a token (the token is good for well under an
+# hour, so this recurs all day), and creating a tab in a headed browser brings that window to the
+# foreground for as long as the tab lives. From the desk it reads as a Copilot window flashing up
+# over whatever the user is doing, every few dozen minutes, unprompted. One sign-in on 2026-08-26
+# at 01:33 left this Edge headed for ten hours and did exactly that.
+#
+# --type= excludes renderer/GPU children: only the browser process carries the real command line.
+function Edge-IsHeaded {
+    try {
+        $procs = Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction Stop |
+            Where-Object { $_.CommandLine -and
+                           $_.CommandLine -match [regex]::Escape($Profile) -and
+                           $_.CommandLine -notmatch '--type=' -and
+                           $_.CommandLine -notmatch '--headless' }
+        return ([bool]$procs)
+    } catch { return $false }
+}
+
+# Put a headed Edge back into the background once the sign-in it was opened for is finished.
+# Bounded, because "wait until the wall is gone" with no deadline is "stay headed forever" when
+# nobody is at the desk -- and staying headed forever is the failure this whole helper exists to
+# end. When the grace period runs out we go headless ANYWAY: an unattended sign-in wall is not a
+# reason to keep flashing a window at an empty chair, and the next loop re-surfaces it if the
+# bridge hits the wall again.
+function Demote-ToHeadless([int]$GraceMinutes = 15) {
+    if (-not (Edge-IsHeaded)) { return }
+    $deadline = (Get-Date).AddMinutes($GraceMinutes)
+    while ((Get-Date) -lt $deadline -and (Needs-SignIn)) { Start-Sleep -Seconds 5 }
+    if (Needs-SignIn) {
+        Write-Host "Sign-in still not completed after $GraceMinutes min -- returning the Edge to headless anyway."
+    } else {
+        Write-Host "Sign-in complete -- returning the bridge Edge to headless (no window)."
+    }
+    Ensure-Edge -Hard | Out-Null
+}
+
 # True ONLY when the bridge Edge is parked on a REAL interactive sign-in page. The CsrToSSR
 # redirect (".../chat/?redirfrom=CsrToSSR&auth=2") auto-resolves for an authenticated profile and
 # is NOT a sign-in wall, so it is deliberately excluded -- this is the only condition under which a
@@ -152,17 +192,29 @@ if (-not $Keepalive) {
 # Keepalive supervisor: keep the bridge (and its Edge) up across crashes / terminal closes. The
 # bridge runs headless; the ONLY time a window appears is right after the bridge exits having hit a
 # genuine sign-in wall -- then we relaunch the Edge VISIBLE so the user can sign in once, after
-# which it returns to headless on the next loop.
+# which it is put back to headless.
+#
+# That last clause used to read "returns to headless on the next loop", and it was not true: the
+# next pass only rebuilds the Edge when Test-Cdp FAILS, and a perfectly healthy headed Edge
+# answers CDP. Nothing ever took the window away again. Worse, the loop body blocks on the bridge
+# itself, so "the next loop" could be hours away -- the headed Edge from 2026-08-26 01:33 was
+# still headed at 11:00, flashing a window up on every token re-key for ten hours. The demotion
+# is now explicit and immediate (Demote-ToHeadless, right after the sign-in), with the top of the
+# loop kept as a net for a headed Edge this supervisor did not start.
 Write-Host "Keepalive mode: supervising the bridge (headless). Ctrl-C to stop."
 while ($true) {
     if (-not (Test-Cdp)) {
         Write-Host "CDP :$CdpPort not answering -- re-bringing up the bridge Edge (headless)..."
+        Ensure-Edge -Hard | Out-Null
+    } elseif ((Edge-IsHeaded) -and -not (Needs-SignIn)) {
+        Write-Host "bridge Edge has a window but no sign-in wall is up -- returning it to headless..."
         Ensure-Edge -Hard | Out-Null
     }
     & $py $bridge @bridgeArgs
     if (Needs-SignIn) {
         Write-Host "Sign-in required -> opening a visible window. Sign in to M365; it continues automatically."
         Ensure-Edge -Hard -Visible | Out-Null
+        Demote-ToHeadless
     }
     Start-Sleep -Seconds 3
 }
