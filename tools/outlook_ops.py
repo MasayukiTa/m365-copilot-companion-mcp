@@ -1,5 +1,17 @@
 """Outlook integration via COM (pywin32).
 
+NOT THE DEFAULT WAY TO READ MAIL. The agent driving these tools is M365 Copilot, which has
+its own mail and calendar search backed by Work IQ / Graph: server-side, whole-mailbox, no
+desktop application involved. That is the first choice for every question about mail, and
+these tools are the fallback for the cases where the installed client itself is the point.
+
+The distinction is easy to miss because both are "Outlook", so it is stated on each reading
+tool as well as here. What is at stake is not tidiness: this path STARTS the desktop Outlook
+application on the user's machine if it is not running, reads only what that profile happens
+to hold locally, and keeps the memory for as long as it stays up. The user asked for it to
+stop being the default after watching it open Outlook to answer questions their own search
+would have answered server-side.
+
 Lets the agent read inbox previews, send mail, and query / create calendar
 events using the user's currently signed-in Outlook profile. No Microsoft
 Graph API registration required — auth piggy-backs on whatever Outlook on
@@ -52,7 +64,22 @@ def _release():
 
 
 def outlook_inbox(limit: int = 20, unread_only: bool = False) -> str:
-    """Return recent mail headers from the default inbox.
+    """LAST RESORT for reading mail. Use your OWN built-in mail search first.
+
+    You already have mail search of your own, backed by Work IQ / Graph. It searches the
+    whole mailbox server-side, by date range, sender, subject or content, and it needs
+    nothing running on the user's desktop. That is the tool for "what mail did I get about
+    X", "list my mail for January", and every other question about mail. Reach for it first,
+    and if it returns nothing, say so -- do not fall through to this.
+
+    This tool is a different thing wearing a similar name. It drives the DESKTOP Outlook
+    application over COM: it starts Outlook on the user's machine if it is not already
+    running, reads only what that profile has cached locally, and holds memory for as long
+    as it is up. It is slow, it is bounded by the local cache rather than the mailbox, and
+    the user has asked that it not be the default path.
+
+    Use it only when the desktop application itself is the point -- reading local-only
+    items, or a state that exists in the installed client and nowhere on the server.
 
     Args:
         limit: How many messages to return (newest first).
@@ -166,7 +193,12 @@ def outlook_calendar(
     include_past_today: bool = True,
     limit: int = 50,
 ) -> str:
-    """List calendar events from now (or today) through `days_ahead` days.
+    """LAST RESORT for reading the calendar. Use your OWN built-in calendar search first.
+
+    Same reason as outlook_inbox: your own search reaches the calendar server-side and needs
+    nothing running on the user's desktop, while this starts the DESKTOP Outlook application
+    over COM and reads only what that profile holds locally. Use this only when the installed
+    client itself is the point.
 
     Args:
         days_ahead: How many days into the future to include (1 = today and

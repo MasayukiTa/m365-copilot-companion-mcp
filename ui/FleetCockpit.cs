@@ -670,6 +670,11 @@ class CockpitWindow : Window
                                // The free RAM the autoscale keeps for the user (RAM analog of the disk
                                // floor). Persisted via SaveKey AND pushed live via {"set_ram_floor_mb":N}.
     string _effort = "auto";   // effort mode min|max|ultra|auto -> settings.txt effort= (NEW)
+    // Split a goal into independent sub-goals, run them in parallel, and merge the answers.
+    // For work whose SIZE is the problem: a goal that cannot fit in one conversation fails at
+    // the conversation, not at the work. Off by default -- a goal that fits should not pay for
+    // a split turn and a merge turn. Toggled with /fanout on|off, like /effort and /approval.
+    bool _fanout = false;      // -> settings.txt fanout=
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
     bool _paused = false;      // local fleet pause/resume toggle state (NEW)
     // FIX B: optimistic "stopping" state set the instant Stop is clicked (dims non-terminal cards +
@@ -1247,6 +1252,11 @@ class CockpitWindow : Window
                 {
                     string ap = ln.Substring(9).Trim();
                     if (ap == "run" || ap == "plan" || ap == "auto") _approval = ap;
+                }
+                else if (ln.StartsWith("fanout="))
+                {
+                    string fx = ln.Substring(7).Trim().ToLower();
+                    _fanout = (fx == "on" || fx == "1" || fx == "true");
                 }
             }
             _settingsMtime = File.GetLastWriteTimeUtc(SettingsFile).Ticks;
@@ -3512,6 +3522,14 @@ class CockpitWindow : Window
         // A2-2: when a run is active, the button sends a steer instead of starting a fleet.
         _startBtn.Click += delegate
         {
+            // A SETTING IS NEVER A MESSAGE. While a run is live this button steers the running
+            // worker, and the steer is simply whatever the composer holds -- so `/fanout on`,
+            // `/effort max` and `/approval plan` were being sent to Copilot as instructions
+            // instead of changing anything here. Nothing failed visibly: the composer cleared,
+            // the note read like a steer had gone out, and the setting was silently unchanged.
+            // Found by typing `/fanout on` into the real window; settings.txt had no fanout key
+            // afterwards, and the running worker had been handed the text.
+            if (HandleSlashSetting()) return;
             if (_composerRunActive) TrySendSteer();
             else StartFleet();
         };
@@ -3586,6 +3604,64 @@ class CockpitWindow : Window
     }
 
 
+    // A slash SETTING typed into the composer: apply it, clear the box, and report it.
+    // Returns true when the text was a setting and has been dealt with.
+    //
+    // Shared by the send button and StartFleet so there is one place that decides what a
+    // slash command means. There used to be only the StartFleet copy, which sat behind two
+    // earlier returns -- the "a run is already going" refusal, and the button's own
+    // start-vs-steer branch -- so during a run these were handed to Copilot as instructions
+    // and never applied. A setting must never become a message.
+    bool HandleSlashSetting()
+    {
+        if (_goalInput == null) return false;
+        string g0 = (_goalInput.Text ?? "").Trim();
+        if (!g0.StartsWith("/")) return false;
+        if (g0.IndexOf('\n') >= 0) return false;      // several lines is several goals, not a command
+
+        bool handled = false;
+        if (g0.StartsWith("/effort ", StringComparison.OrdinalIgnoreCase))
+        {
+            string v = g0.Substring(8).Trim().ToLower();
+            if (v == "min" || v == "max" || v == "ultra" || v == "auto")
+            {
+                _effort = v; SaveKey("effort", _effort); PaintEffort();
+                if (_startNote != null)
+                    _startNote.Text = (_lang == 0 ? "推論モード→ " : "Effort set to ") + _effort;
+                handled = true;
+            }
+        }
+        else if (g0.StartsWith("/approval ", StringComparison.OrdinalIgnoreCase))
+        {
+            string v = g0.Substring(10).Trim().ToLower();
+            if (v == "run" || v == "plan" || v == "auto")
+            {
+                _approval = v; SaveKey("approval", _approval); PaintApproval();
+                if (_startNote != null)
+                    _startNote.Text = (_lang == 0 ? "実行方式→ " : "Approval mode set to ") + _approval;
+                handled = true;
+            }
+        }
+        else if (g0.StartsWith("/fanout", StringComparison.OrdinalIgnoreCase))
+        {
+            string v = g0.Length > 7 ? g0.Substring(7).Trim().ToLower() : "";
+            if (v == "on" || v == "off")
+            {
+                _fanout = (v == "on");
+                SaveKey("fanout", _fanout ? "on" : "off");
+                if (_startNote != null)
+                    _startNote.Text = _lang == 0
+                        ? (_fanout ? "分割実行 ON — 長い依頼を独立したサブタスクに分けて並列実行し、結果を統合します。"
+                                   : "分割実行 OFF — 依頼は 1 つの会話で実行します。")
+                        : (_fanout ? "Fan-out ON — long goals are split, run in parallel and merged."
+                                   : "Fan-out OFF — a goal runs in one conversation.");
+                handled = true;
+            }
+        }
+        if (handled) _goalInput.Text = "";
+        return handled;
+    }
+
     void StartFleet()
     {
         try
@@ -3616,25 +3692,9 @@ class CockpitWindow : Window
                 _startNote.Text = _lang == 0 ? "コマンド一覧を表示しました。" : "Command help shown.";
                 return;
             }
-            // /effort <value> and /approval <value>: apply and clear (don't submit as a goal)
-            if (goals.Count == 1)
-            {
-                string g0 = goals[0];
-                bool handled = false;
-                if (g0.StartsWith("/effort ", StringComparison.OrdinalIgnoreCase))
-                {
-                    string v = g0.Substring(8).Trim().ToLower();
-                    if (v == "min" || v == "max" || v == "ultra" || v == "auto")
-                    { _effort = v; SaveKey("effort", _effort); PaintEffort(); _goalInput.Text = ""; _startNote.Text = (_lang == 0 ? "推論モード→ " : "Effort set to ") + _effort; handled = true; }
-                }
-                else if (g0.StartsWith("/approval ", StringComparison.OrdinalIgnoreCase))
-                {
-                    string v = g0.Substring(10).Trim().ToLower();
-                    if (v == "run" || v == "plan" || v == "auto")
-                    { _approval = v; SaveKey("approval", _approval); PaintApproval(); _goalInput.Text = ""; _startNote.Text = (_lang == 0 ? "実行方式→ " : "Run mode set to ") + _approval; handled = true; }
-                }
-                if (handled) return;
-            }
+            // Slash settings are handled by the shared HandleSlashSetting(), which the
+            // send button also calls BEFORE deciding start-vs-steer -- see there for why.
+            if (HandleSlashSetting()) return;
 
             bool planMode = _approval == "plan" || _approval == "auto";
             SpawnFleet(goals, "goals_input.txt", planMode);
@@ -3809,6 +3869,7 @@ class CockpitWindow : Window
         psi.Arguments = "-m relay.fleet_runner --goals-file \"" + goalsFile + "\""
                         + " --state-dir \"" + stateDir + "\" --effort " + _effort;
         if (planMode) psi.Arguments += " --plan";
+        if (_fanout) psi.Arguments += " --fanout";
         psi.WorkingDirectory = repo;
         psi.UseShellExecute = false;
         psi.CreateNoWindow = true;
@@ -4007,6 +4068,7 @@ class CockpitWindow : Window
         new[]{"/research","<問い> を Claude で深掘り調査する"},
         new[]{"/effort","推論モードを設定: min|max|ultra|auto"},
         new[]{"/approval","実行方式を設定: run|plan|auto（互換コマンド）"},
+        new[]{"/fanout","分割実行: on|off（長い依頼を分けて並列実行し統合）"},
     };
     static readonly string[][] _goalCommandsEn = {
         new[]{"/help","Show the command list"},
@@ -4019,6 +4081,7 @@ class CockpitWindow : Window
         new[]{"/research","deep-research <question> with Claude"},
         new[]{"/effort","set reasoning mode: min|max|ultra|auto"},
         new[]{"/approval","set approval mode: run|plan|auto"},
+        new[]{"/fanout","split a long goal, run the parts in parallel, merge: on|off"},
     };
     // Localized at access time so the slash palette (and the template it inserts) follows the UI language.
     string[][] _goalCommands { get { return _lang == 0 ? _goalCommandsJa : _goalCommandsEn; } }
