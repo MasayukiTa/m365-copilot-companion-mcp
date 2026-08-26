@@ -98,12 +98,20 @@ def skill_match(text: str) -> str:
                          if review.get("token") else "")
             except Exception:
                 asked = ""
+            # SAY WHICH KIND OF APPROVAL IS MISSING. `changed` means a human DID approve this
+            # Skill and then its text moved, so the approval -- which is of a hash -- lapsed:
+            # that is re-approval, and it tells the reader the procedure is one they trusted
+            # before rather than something that arrived unvetted. `untrusted` has never been
+            # approved at all. Flattening the two would lose the only part a person needs to
+            # decide quickly.
+            state = ("has changed since it was approved and is waiting for human "
+                     "re-approval" if near["trust"] == "changed"
+                     else "has never been approved by a human")
             return ("(no confident Skill match among TRUSTED Skills. "
-                    "/%s looks like the right procedure but is %s -- a human has not "
-                    "approved this version of it, so it cannot be matched or loaded. %s"
-                    "Ask the user to approve it, or proceed without it -- do NOT invent "
-                    "your own procedure and present it as theirs.)"
-                    % (near["name"], near["trust"], asked))
+                    "/%s looks like the right procedure but it %s, so it cannot be matched "
+                    "or loaded. %sAsk the user to approve it, or proceed without it -- do not "
+                    "invent your own procedure and present it as theirs.)"
+                    % (near["name"], state, asked))
         try:
             waiting = [row["name"] for row in store.list_metadata(model_safe=True)
                        if row.get("trust") != "trusted"]

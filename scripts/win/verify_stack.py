@@ -128,6 +128,37 @@ def fleet_transport(limit=60):
     return socket, tab, first_at, last_at
 
 
+def _active_marker():
+    """The active-run marker and whether its coordinator is still alive, or None.
+
+    Read-only, like everything else here. `alive` is decided from the process table rather
+    than from the marker's own claim -- the marker is written once at run start and says
+    nothing about whether that process survived, which is the entire point of checking.
+    """
+    path = os.path.join(REPO, ".fleet", "fleet_run_active.json")
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not data.get("pid"):
+        return None
+    pid = data.get("pid")
+    script = ("@(Get-CimInstance Win32_Process -Filter \"ProcessId=%s\").Count" % pid)
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                             capture_output=True, text=True, timeout=25).stdout.strip()
+        alive = out.isdigit() and int(out) > 0
+    except Exception:
+        alive = True            # cannot tell -> never accuse a run of being dead
+    argv = data.get("argv") or []
+    goals = ""
+    for i, a in enumerate(argv):
+        if a == "--goals-file" and i + 1 < len(argv):
+            goals = argv[i + 1]
+    return {"pid": pid, "alive": alive, "goals": goals}
+
+
 def say(state, question, evidence):
     print("  [%s] %-46s %s" % (state, question, evidence))
 
@@ -238,6 +269,27 @@ def main():
     say(OK if total and not tab else MEH, "last 60 workers carried on sockets?",
         ("socket=%d tab=%d  (%s .. %s)" % (socket, tab, first_at[-8:], last_at[-8:]))
         if total else "(no finished workers recorded)")
+
+    # A RUN THAT WAS INTERRUPTED AND THAT NOTHING WILL RESUME. fleet_run_active.json holds
+    # the coordinator's pid and is cleared on clean completion, so a marker whose pid is dead
+    # means a run stopped mid-flight. should_auto_resume() decides whether such a run should
+    # be relaunched and its docstring says scripts/supervisor.ps1 mirrors the rule -- that
+    # script supervises the MCP server and the dev tunnel and never mentions the marker, so
+    # nothing anywhere resumes one. Resuming work unprompted is a behaviour change rather
+    # than a repair, so this reports the state instead of acting on it: the goals are
+    # recoverable, and a run that quietly stopped hours ago should not be something you find
+    # out about by noticing the answer never came.
+    marker = _active_marker()
+    if marker is None:
+        say(OK, "no interrupted fleet run left behind?", "no active-run marker")
+    elif marker.get("alive"):
+        say(MEH, "no interrupted fleet run left behind?",
+            "a run is live (pid %s)" % marker.get("pid"))
+    else:
+        say(BAD, "no interrupted fleet run left behind?",
+            "pid %s is dead and nothing resumes it -- `python -m relay.fleet_reaper --reap` "
+            "clears the stale sidecars; the goals are in %s"
+            % (marker.get("pid"), marker.get("goals") or "the run's goals file"))
 
     if not fix:
         if stale:
