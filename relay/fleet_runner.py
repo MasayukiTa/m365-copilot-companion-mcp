@@ -558,7 +558,7 @@ def _clean_final_text(text, max_len=600):
 
 
 def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False,
-              ram_floor_mb=0.0, directive="", run_label="", goal_count=0):
+              ram_floor_mb=0.0, directive="", run_label="", goal_count=0, queued=0):
     from relay.relay_fleet import free_disk_gb
     total = len(workers)        # dynamic: goals can be added mid-run (native chat queue)
     done = sum(1 for w in workers if w.status in TERMINAL)
@@ -573,7 +573,16 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         "updated": time.time(),
         "total": total,
         "done_count": done,
-        "running": done < total,
+        "queued": int(queued or 0),
+        # RUNNING MEANS THERE IS WORK, NOT THAT A WORKER EXISTS YET. `queued` counts goals
+        # accepted but not yet turned into workers, and without it a fan-out run declares
+        # itself finished the instant it splits: the parent goes terminal at turn 1 and its
+        # children are still in the queue, so done==total and running goes False -- for the
+        # whole hour the children then take. The watchdog reads this flag and skips a run
+        # that is not running, so the wedge detector switched itself off at the exact moment
+        # the run started doing its real work. A capture that blocked the main loop for ten
+        # minutes on 2026-08-26 went unnoticed for precisely that reason.
+        "running": (done < total) or int(queued or 0) > 0,
         "paused": bool(paused),        # fleet frozen by the cockpit (pause toggle)
         "max_concurrent": max_concurrent,
         "open_tabs": open_tabs,
@@ -1456,7 +1465,11 @@ def main():
             _write_atomic(status_path, _snapshot(workers, started, len(goals), mc_box[0],
                                                  disk_floor_gb=disk_box[0], paused=pause_box[0],
                                                  ram_floor_mb=ram_box[0], directive=directive,
-                                                 run_label=run_label, goal_count=goal_count))
+                                                 run_label=run_label, goal_count=goal_count,
+                                                 # goals accepted but not yet workers --
+                                                 # a split's children live here until the
+                                                 # next sweep admits them.
+                                                 queued=len(add_box or [])))
         except Exception:
             pass
         _print_table(workers, len(goals))
@@ -1671,7 +1684,13 @@ def main():
         if o == "UNRESOLVED_REFUSAL": return "unresolved_refusal"
         if o == "CANCELLED": return "cancelled"
         if o == "MAXTURNS": return "maxturns"
-        if o in ("STUCK", "VERIFY_FAILED"): return "stuck"
+        # INFRA_STUCK and REFUSED are in RETRYABLE_OUTCOMES above -- this very file already
+        # knows they are "no answer yet", not "the task was wrong". They were still falling
+        # through to "error" here, so the same file distinguished them for the retry and
+        # flattened them for the reader. INFRA_STUCK exists precisely so a connection that
+        # never established is not scored as a failed task; reporting it as an error is the
+        # misreport it was created to prevent.
+        if o in ("STUCK", "VERIFY_FAILED", "INFRA_STUCK", "REFUSED"): return "stuck"
         # A goal that SPLIT did its job and handed the work to its children. Everything not
         # named here falls through to "error", so the parent of a perfectly healthy fan-out
         # was reported as a failure -- on a run whose nine subtasks all completed.
