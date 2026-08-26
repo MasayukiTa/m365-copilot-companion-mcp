@@ -147,6 +147,35 @@ def child_goals(parent_goal, steps, *, parent_task_id="", campaign_id="", depth=
     return out
 
 
+def collapse_retries(records):
+    """One record per slice of the split, keeping the attempt that actually worked.
+
+    A subtask that fails transiently is re-queued, so a family can end up holding two
+    records for the same slice: the attempt that went STUCK and the retry that finished it.
+    Reporting both would tell the merge that range both failed and succeeded, and the merge
+    is required to name failures -- so it would mark a range 未取得 that is sitting in front
+    of it, completed, in the very next record.
+
+    A DONE beats anything else for the same slice. Records with no slice number are left
+    alone: there is nothing to collapse them against.
+    """
+    best: dict[Any, dict] = {}
+    loose = []
+    for rec in records:
+        key = rec.get("subtask_index")
+        if key is None:
+            loose.append(rec)
+            continue
+        current = best.get(key)
+        if current is None:
+            best[key] = rec
+            continue
+        if (current.get("outcome") or "").upper() != "DONE" and \
+                (rec.get("outcome") or "").upper() == "DONE":
+            best[key] = rec
+    return sorted(best.values(), key=lambda r: r.get("subtask_index")) + loose
+
+
 def ready_to_aggregate(records):
     """Have all of a campaign's sub-tasks finished?
 

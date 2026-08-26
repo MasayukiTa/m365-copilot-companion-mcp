@@ -205,3 +205,34 @@ def test_the_merge_joins_the_campaign_it_merges():
     g = fo.aggregation_goal("元の目標", [_r(1, "DONE", "a")])
     assert g["campaign_id"] == kids[0]["campaign_id"]
     assert g["task_id"].endswith("-merge")
+
+
+# ---- a slice that was retried ---------------------------------------------------------------
+
+def test_a_retried_slice_reports_the_attempt_that_worked():
+    """The failed attempt and its retry are two records for one range. Reporting both would
+    tell the merge that range failed -- and the merge is required to name failures, so it
+    would mark 未取得 a range sitting completed in the next record."""
+    recs = [_r(1, "DONE", "1月は120件"),
+            _r(2, "STUCK", ""),
+            _r(2, "DONE", "2月は98件")]
+    out = fo.collapse_retries(recs)
+    assert [r["subtask_index"] for r in out] == [1, 2]
+    assert out[1]["outcome"] == "DONE"
+    assert out[1]["result"] == "2月は98件"
+
+
+def test_a_slice_that_never_succeeded_stays_failed():
+    out = fo.collapse_retries([_r(1, "DONE", "a"), _r(2, "STUCK", ""), _r(2, "STUCK", "")])
+    assert out[1]["outcome"] == "STUCK"
+    assert "未取得" in fo.aggregation_prompt("g", out)
+
+
+def test_records_without_a_slice_number_are_left_alone():
+    recs = [{"outcome": "DONE", "result": "x"}, _r(1, "DONE", "a")]
+    assert len(fo.collapse_retries(recs)) == 2
+
+
+def test_collapsing_keeps_the_slices_in_order():
+    out = fo.collapse_retries([_r(3, "DONE", "c"), _r(1, "DONE", "a"), _r(2, "DONE", "b")])
+    assert [r["subtask_index"] for r in out] == [1, 2, 3]

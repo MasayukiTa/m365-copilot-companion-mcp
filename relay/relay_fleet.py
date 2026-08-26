@@ -4189,7 +4189,13 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             # Every child ADMITTED must be finished, and all of them must have been admitted:
             # a family half of which is still queued is not a finished campaign, and merging
             # it would report a sweep that never ran as though it had.
-            if len(_recs) < _camp.get("n", 0) or not fanout_mod.ready_to_aggregate(_recs):
+            if not fanout_mod.ready_to_aggregate(_recs):
+                continue
+            # Collapse a slice's failed attempt into the retry that finished it, THEN check
+            # the family is complete -- a retry adds a record without adding a slice, so
+            # counting raw records would let a family of eight look like nine.
+            _recs = fanout_mod.collapse_retries(_recs)
+            if len(_recs) < _camp.get("n", 0):
                 continue
             _camp["merged"] = True
             add_box.append(fanout_mod.aggregation_goal(_camp["goal"], _recs,
@@ -4342,8 +4348,18 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 if not _g or _retry_used.get(_g, 0) >= _retry_cap:
                     continue
                 _retry_used[_g] = _retry_used.get(_g, 0) + 1
-                add_box.append({"text": _g, "checks": getattr(_w, "checks", None),
-                                "cwd": getattr(_w, "cwd", None), "priority": True})
+                # RE-QUEUE THE SAME TASK, not a new one that happens to share its text.
+                # Rebuilding the item from text alone dropped everything else the goal
+                # carried -- its campaign, its role, its depth, which slice of a split it
+                # owned. A retried subtask came back as an unrelated top-level goal, so its
+                # family stopped counting it: the original was terminal-STUCK, the campaign
+                # read as finished, and the merge could report that range as 未取得 while the
+                # retry was still working on it. Start from the goal record and override only
+                # what a retry actually changes.
+                _retry_item = dict(getattr(_w, "goal_record", None) or {})
+                _retry_item.update({"text": _g, "checks": getattr(_w, "checks", None),
+                                    "cwd": getattr(_w, "cwd", None), "priority": True})
+                add_box.append(_retry_item)
                 try:
                     print("[fleet] %s %s -> re-queued (%d/%d)"
                           % (_w.name, _w.outcome, _retry_used[_g], _retry_cap), flush=True)
