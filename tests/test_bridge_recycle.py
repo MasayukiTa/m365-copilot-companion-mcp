@@ -30,6 +30,30 @@ def test_exhaustion_is_detected_in_the_forms_copilot_actually_returns():
     assert conversation_exhausted("maximum context length exceeded")
 
 
+def test_the_ContextTokenLimitExceeded_code_counts_too():
+    """The same condition under a code this detector did not know.
+
+    A worker hit it on 2026-08-26 and was not recycled: the reply read as prose that merely
+    lacked a DONE, so it was nudged to continue -- into a conversation with no room for the
+    nudge -- six times, and was then recorded as `no DONE after 6 continue nudges`. That
+    reads as an agent that would not finish. It was a full conversation, and ten turns of
+    real findings were discarded with it.
+
+    Verbatim, because the whole failure was a form nobody had matched against.
+    """
+    assert conversation_exhausted(
+        "エラーが発生しました。\n"
+        "エラー コード: ContextTokenLimitExceeded\n"
+        "会話 ID: d25424be-891c-43a5-a84f-52304378bbc5\n"
+        "時間 (UTC): 2026-08-26T03:30:14.146Z。")
+
+
+def test_the_new_code_does_not_widen_the_net():
+    """Matching a code must not start catching answers that merely discuss limits."""
+    assert not conversation_exhausted("context について説明します")
+    assert not conversation_exhausted("上限は特にありません")
+
+
 def test_a_normal_answer_that_mentions_tokens_is_not_exhaustion():
     # 「トークン」と書いてあるだけで会話を捨てると、普通の回答で復帰が暴発する
     assert not conversation_exhausted("トークンとは単語の断片のことです")

@@ -624,6 +624,14 @@ def conversation_exhausted(resp: str) -> bool:
         return True
     if "maximum context length" in low or "context length exceeded" in low:
         return True
+    # ContextTokenLimitExceeded -- the SAME condition under a different error code, and the
+    # one this function did not know. A worker that hit it on 2026-08-26 was not recycled:
+    # the reply read as prose without a DONE, so it was nudged to continue into a
+    # conversation with no room, six times, and was then filed as `no DONE after 6 continue
+    # nudges` -- an agent that would not finish, rather than a conversation that was full.
+    # Ten turns of real findings went with it.
+    if "contexttokenlimitexceeded" in low:
+        return True
     return False
 
 
