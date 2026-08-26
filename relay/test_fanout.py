@@ -157,8 +157,24 @@ def test_a_huge_child_report_is_truncated_so_the_merge_turn_still_fits():
 
 def test_the_merge_asks_for_a_report_not_a_pile_of_reports():
     p = fo.aggregation_prompt("元の目標", [_r(1, "DONE", "a"), _r(2, "DONE", "b")])
-    assert "そのまま並べる" in p
-    assert p.rstrip().endswith("DONE と書いてください。") or "DONE と書いてください" in p
+    assert "そのまま並べ" in p
+    assert "DONE と書いてください" in p
+
+
+def test_the_merge_is_not_asked_to_reemit_everything():
+    """The merge must not inherit the disease fan-out cures. Asked for "the final answer",
+    an agent holding eight reports of hundreds of rows tries to write them all out again --
+    the size problem, arriving at the last step. The first live merge ran fourteen turns and
+    went STUCK having produced nothing."""
+    p = fo.aggregation_prompt("元の目標", [_r(1, "DONE", "a"), _r(2, "DONE", "b")])
+    assert "全件を1つの応答に書き出そうとしないでください" in p
+    assert "ファイル" in p, "an oversized table needs somewhere to go other than the reply"
+
+
+def test_the_merge_is_asked_for_coverage_and_gaps():
+    p = fo.aggregation_prompt("元の目標", [_r(1, "DONE", "a"), _r(2, "DONE", "b")])
+    assert "取得件数" in p
+    assert "未取得" in p
 
 
 # ---- the instruction the agent is given ---------------------------------------------------

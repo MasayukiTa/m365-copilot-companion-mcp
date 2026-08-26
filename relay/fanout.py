@@ -243,9 +243,24 @@ def aggregation_prompt(parent_goal, results, limit_each=1200):
     else:
         parts.append("\n全サブタスクが完了しています。")
 
-    parts.append("統合した最終回答を書き、最後の行に DONE と書いてください。"
-                 "サブタスクの報告をそのまま並べるのではなく、"
-                 "目標が求めている形式に統合してください。")
+    # THE MERGE MUST NOT INHERIT THE DISEASE IT CURES. Asked for "the final answer", an
+    # agent holding eight reports of several hundred rows each tries to re-emit all of them
+    # in one response -- which is the size problem fan-out exists to avoid, arriving at the
+    # last step. The first live merge ran fourteen turns and went STUCK without producing
+    # anything. So what is asked for here is bounded by construction: an account of what was
+    # collected and where it is, with the rows themselves only inlined when they are few.
+    parts.append(
+        "\n【統合のしかた — 分量に注意】\n"
+        "サブタスクの報告をそのまま並べ直さないでください。また、"
+        "全件を1つの応答に書き出そうとしないでください（それができない分量だから分割しています）。\n"
+        "次を書いてください:\n"
+        "  1. 担当範囲ごとの取得件数と、その範囲が完了したか（根拠となる終端確認も）\n"
+        "  2. 取得できなかった範囲を「未取得」として明示（無ければ「欠落なし」）\n"
+        "  3. 各サブタスクが成果物をファイルに保存している場合は、そのパスを一覧する\n"
+        "  4. 目標が明示的に求めている要点（特に必須項目として名指しされたもの）への回答\n"
+        "全件の表が必要で、かつ1応答に収まらない場合は、"
+        "1つのファイルに統合して保存し、そのパスと総件数を報告してください。\n"
+        "最後の行に DONE と書いてください。")
     return "\n".join(parts)
 
 

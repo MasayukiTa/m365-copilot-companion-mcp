@@ -4572,6 +4572,32 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
 
     _refresh_selfimprove_dashboard()
 
+    # THE ANSWER TO A SPLIT GOAL IS THE MERGED ONE. A parent that split ends at turn 1 with
+    # nothing but a list of subtasks, and the caller keys results by GOAL TEXT -- so the
+    # goal the user actually submitted came back carrying the parent's split proposal, or
+    # a retry's partial answer, while the merge that combined all eight reports sat in the
+    # returned list under a goal text nobody looks up. A run that did the whole job reported
+    # as though it had not.
+    #
+    # Only the text moves. The parent keeps its own outcome and turn count, because
+    # pretending the parent did the work would hide where it was really done.
+    for _w in workers:
+        if (_w.outcome or "") != "FANOUT":
+            continue
+        _cid = fanout_mod.campaign_id_for(_w.goal)
+        _agg = next((x for x in workers
+                     if getattr(getattr(x, "task_envelope", None), "role", "") == "aggregator"
+                     and getattr(getattr(x, "task_envelope", None), "campaign_id", "") == _cid),
+                    None)
+        if _agg is None:
+            continue
+        _merged = (getattr(_agg, "display_result", "") or getattr(_agg, "last_response", ""))
+        if _merged:
+            _w.last_response = _merged
+            _w.display_result = _merged
+            _w.reason = ("%s / 統合結果を掲載 (統合ワーカー %s: %s)"
+                         % (_w.reason, _agg.name, _agg.outcome or _agg.status))
+
     notify("並列自律フリート 完了",
            "%d ゴール: %s" % (len(workers), ", ".join(w.outcome or "?" for w in workers)))
     return [{"name": w.name, "goal": w.goal, "outcome": w.outcome,

@@ -247,3 +247,89 @@ def test_a_socket_turn_reports_the_deadline_that_applies_to_it():
     window = src[max(0, i - 700):i + 200]
     assert "SOCKET_TURN_TIMEOUT_S if getattr(self, \"socket\", False)" in window, \
         "the reported bound must be the socket's own deadline when on a socket"
+
+
+# ---- the answer that reaches the caller ----------------------------------------------------
+
+class _EndWorker:
+    """A worker as run_fleet holds it at the end of a run."""
+
+    def __init__(self, goal, outcome, role="", campaign="", result="", name="w0"):
+        self.goal = goal
+        self.outcome = outcome
+        self.status = "done"
+        self.name = name
+        self.reason = "r"
+        self.last_response = result
+        self.display_result = result
+        self.task_envelope = type("E", (), {"role": role, "campaign_id": campaign,
+                                            "task_id": "", "parent_task_id": None,
+                                            "depth": 0})()
+
+
+def _publish(workers):
+    """The publishing step run_fleet performs before it returns."""
+    for _w in workers:
+        if (_w.outcome or "") != "FANOUT":
+            continue
+        cid = fo.campaign_id_for(_w.goal)
+        agg = next((x for x in workers
+                    if getattr(getattr(x, "task_envelope", None), "role", "") == "aggregator"
+                    and getattr(getattr(x, "task_envelope", None), "campaign_id", "") == cid),
+                   None)
+        if agg is None:
+            continue
+        merged = agg.display_result or agg.last_response
+        if merged:
+            _w.last_response = merged
+            _w.display_result = merged
+            _w.reason = "%s / 統合結果を掲載 (統合ワーカー %s: %s)" % (
+                _w.reason, agg.name, agg.outcome or agg.status)
+    return workers
+
+
+def test_the_submitted_goal_comes_back_with_the_merged_answer():
+    """The caller keys results by goal TEXT, so the goal the user submitted was coming back
+    carrying the parent's split proposal while the merge sat under a text nobody looks up."""
+    goal = "1〜3月のメールを一覧化する"
+    cid = fo.campaign_id_for(goal)
+    parent = _EndWorker(goal, "FANOUT", result="分割案: 1. …")
+    agg = _EndWorker("merge prompt", "DONE", role="aggregator", campaign=cid,
+                     result="統合済み一覧: 全318件", name="w9")
+    _publish([parent, agg])
+    assert "統合済み一覧: 全318件" in parent.display_result
+    assert "統合ワーカー w9" in parent.reason
+
+
+def test_the_parent_keeps_its_own_outcome():
+    """Only the text moves. Claiming the parent did the work hides where it was done."""
+    goal = "g"
+    parent = _EndWorker(goal, "FANOUT", result="split")
+    agg = _EndWorker("m", "DONE", role="aggregator", campaign=fo.campaign_id_for(goal),
+                     result="merged")
+    _publish([parent, agg])
+    assert parent.outcome == "FANOUT"
+
+
+def test_a_campaign_with_no_merge_is_left_honest():
+    """No merge means no merged answer; inventing one would report work never done."""
+    parent = _EndWorker("g", "FANOUT", result="split proposal")
+    _publish([parent])
+    assert parent.display_result == "split proposal"
+
+
+def test_an_empty_merge_does_not_blank_the_parent():
+    goal = "g"
+    parent = _EndWorker(goal, "FANOUT", result="split proposal")
+    agg = _EndWorker("m", "STUCK", role="aggregator", campaign=fo.campaign_id_for(goal),
+                     result="")
+    _publish([parent, agg])
+    assert parent.display_result == "split proposal"
+
+
+def test_another_campaigns_merge_is_not_borrowed():
+    parent = _EndWorker("goal A", "FANOUT", result="split A")
+    agg = _EndWorker("m", "DONE", role="aggregator",
+                     campaign=fo.campaign_id_for("goal B"), result="merged B")
+    _publish([parent, agg])
+    assert parent.display_result == "split A"
