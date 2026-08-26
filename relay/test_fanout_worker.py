@@ -233,3 +233,17 @@ def test_the_loop_condition_asks_for_pending_merges():
     condition = head[:head.index("):") + 2]
     assert "_queue_ready_merges() > 0" in condition, \
         "the sweep loop must ask whether a merge is owed before it ends"
+
+
+# ---- what a slow turn reports -----------------------------------------------------------
+
+def test_a_socket_turn_reports_the_deadline_that_applies_to_it():
+    """_defer_generation deliberately skips the tab-era budget for a socket turn, which has
+    its own turn_timeout_s -- but the line printed the skipped number anyway, so a healthy
+    turn read as 'wait 594s/360s': correct behaviour, reported as a breach."""
+    import re
+    src = open(rf.__file__.replace(".pyc", ".py"), encoding="utf-8").read()
+    i = src.index('previous turn still generating -> wait %ds/%ds')
+    window = src[max(0, i - 700):i + 200]
+    assert "SOCKET_TURN_TIMEOUT_S if getattr(self, \"socket\", False)" in window, \
+        "the reported bound must be the socket's own deadline when on a socket"

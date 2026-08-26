@@ -2078,8 +2078,15 @@ class RelayWorker:
             # a turn that LITERALLY never stops generating.
             if self._defer_generation():
                 elapsed = max(0.0, time.time() - self.first_defer_ts)
+                # REPORT THE DEADLINE THAT ACTUALLY APPLIES. A socket turn is bounded by its
+                # own turn_timeout_s and _defer_generation deliberately skips this tab-era
+                # budget for it -- but the line still printed the skipped number, so a
+                # healthy socket turn read as "wait 594s/360s", 234 seconds past a limit
+                # nothing was going to enforce. Correct behaviour, reported as a breach.
+                _bound = (SOCKET_TURN_TIMEOUT_S if getattr(self, "socket", False)
+                          else self.max_gen_wait_s)
                 self.reason = "previous turn still generating -> wait %ds/%ds (no budget)" % (
-                    int(elapsed), int(self.max_gen_wait_s))
+                    int(elapsed), int(_bound))
                 return
             if self._salvage_via_checks():
                 return
