@@ -1738,8 +1738,15 @@ def main():
         }
 
     elapsed = round(time.time() - started, 1)
-    done_count = sum(1 for r in results if r["outcome"] == "DONE")
-    final = {"started": started, "updated": time.time(), "total": len(goals),
+    # ONE DEFINITION OF DONE. This counted outcome == "DONE" directly while the rest of
+    # the file asked _ostatus, so a fan-out that split, ran nine subtasks, merged them
+    # and wrote its answer to disk was reported as 0 done of 1: FANOUT is not the string
+    # "DONE", and the second definition had never heard of it.
+    done_count = sum(1 for r in results if _ostatus(r["outcome"]) == "done")
+    # And the total is the work that RAN, which is what status.json said all through the
+    # run (len(workers)). Reporting len(goals) at the end shrank a seventeen-worker
+    # campaign back to the one goal it started as, at the moment somebody reads it.
+    final = {"started": started, "updated": time.time(), "total": len(results),
              "done_count": done_count, "running": False, "elapsed_s": elapsed,
              "directive": directive,
              # FIX 3 (P2): also carry run_label / goal_count into the final snapshot.

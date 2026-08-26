@@ -136,3 +136,24 @@ def test_a_finished_run_with_an_empty_queue_is_not_running():
 def test_a_live_worker_still_counts_as_running():
     snap = _snapshot()
     assert snap([_W("waiting"), _W("done")], 0.0, 2, queued=0)["running"] is True
+
+
+# ---- the final snapshot has to agree with the run it summarises -----------------------------
+
+def _final_src():
+    src = open(RUNNER, encoding="utf-8").read()
+    i = src.index("    done_count = sum(1 for r in results")
+    return src[i:i + 900]
+
+
+def test_done_is_counted_the_same_way_everywhere():
+    """It counted outcome == "DONE" directly while the rest of the file asked _ostatus, so a
+    fan-out that split, ran nine subtasks, merged them and wrote its answer to disk was
+    reported as 0 done of 1."""
+    assert '_ostatus(r["outcome"]) == "done"' in _final_src()
+
+
+def test_the_final_total_is_the_work_that_ran():
+    """status.json says len(workers) all through the run; reporting len(goals) at the end
+    shrank a seventeen-worker campaign back to the one goal it started as."""
+    assert '"total": len(results)' in _final_src()

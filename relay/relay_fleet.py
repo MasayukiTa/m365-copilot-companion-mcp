@@ -4557,6 +4557,36 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         if not w.closed:
             w.close()
 
+    # LEAVE NO COPILOT PAGE BEHIND. Every worker closes its own, and the token capture closes
+    # its tab in a finally -- and a run still ended with a bare /chat page sitting in the
+    # browser. Measured 2026-08-27: it was there for the nine and a half hours after the run
+    # finished, in 2219 of 4149 monitoring samples, and the profile holding it stood at 757 MB
+    # against 278 MB for the one that held only a blank page.
+    #
+    # Rather than find every path that can leave one, the invariant is asserted here, where
+    # the run is over and no worker owns anything: nothing on this context should still be on
+    # Copilot. A blank page is opened FIRST when it would otherwise be the last one -- Edge
+    # exits with its final page, and taking the browser down as a tidiness measure would end
+    # the next run's SSO with it.
+    try:
+        stale = [p for p in context.pages if "m365.cloud.microsoft" in (p.url or "")]
+        if stale:
+            if len(stale) >= len(context.pages):
+                try:
+                    context.new_page().goto("about:blank", timeout=10000)
+                except Exception:
+                    stale = []          # no keep-alive -> do not risk closing the browser
+            for p in stale:
+                try:
+                    p.close()
+                except Exception:
+                    pass
+            if stale:
+                print("[fleet] closed %d idle Copilot page(s) left over at run end"
+                      % len(stale), flush=True)
+    except Exception:
+        pass
+
     # Record what this run actually DID, per theme, so the next run on the same theme
     # starts primed instead of rediscovering. Until now only relay/code_task.py recorded
     # anything, so 2636 fleet transcripts had produced exactly one memory entry -- the
