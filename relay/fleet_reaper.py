@@ -227,3 +227,61 @@ def reap_stale_run(fleet_dir: str = ".fleet", *, alive: Optional[Callable[[int],
         }
     except Exception:
         return None
+
+
+def main(argv=None) -> int:                                      # pragma: no cover
+    """Command line for the reap above, because there was no way to run it.
+
+    The module was complete and covered by tests, and nothing in the repository referenced
+    it: no entry point, no scheduler, no caller. A phantom run could be finalised only by a
+    person who happened to know the function existed and opened a Python prompt to call it.
+    That is the same shape as the browser nobody collected and the approval nobody requested
+    -- the capability was built and the trigger was never attached.
+
+    Safe to run at any time and from anywhere: reap_stale_run refuses to touch a run whose
+    pid is alive, never relaunches anything, and never raises.
+
+        python -m relay.fleet_reaper                 # report what it would find
+        python -m relay.fleet_reaper --reap          # finalize a dead run's sidecars
+    """
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Finalize the sidecar files a dead fleet "
+                                             "coordinator left behind.")
+    ap.add_argument("--fleet-dir", default=".fleet", help="state directory to examine")
+    ap.add_argument("--reap", action="store_true",
+                    help="actually finalize (default: report only)")
+    ap.add_argument("--stale-after-s", type=float, default=600.0,
+                    help="with no usable marker pid, treat a status file untouched for this "
+                         "long as dead")
+    args = ap.parse_args(argv)
+
+    marker = _read_json(os.path.join(args.fleet_dir, ACTIVE_MARKER))
+    if isinstance(marker, dict) and marker.get("pid"):
+        pid = marker["pid"]
+        alive = _pid_alive_psutil(int(pid)) if str(pid).isdigit() else True
+        print("%s: marker pid=%s %s" % (args.fleet_dir, pid,
+                                        "ALIVE -- nothing to reap" if alive else "DEAD"))
+        if alive:
+            return 0
+    else:
+        print("%s: no active-run marker" % args.fleet_dir)
+
+    if not args.reap:
+        print("run again with --reap to finalize the stale sidecars.")
+        return 0
+
+    result = reap_stale_run(args.fleet_dir, stale_after_s=args.stale_after_s)
+    if not result:
+        print("nothing to reap.")
+        return 0
+    print("reaped pid=%s: %d worker(s) closed, %d history entr(ies) terminated"
+          % (result.get("pid"), result.get("workers_closed") or 0,
+             result.get("history_terminated") or 0))
+    return 0
+
+
+if __name__ == "__main__":                                       # pragma: no cover
+    import sys as _sys
+
+    _sys.exit(main())

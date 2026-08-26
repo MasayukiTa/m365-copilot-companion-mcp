@@ -780,6 +780,20 @@ function Invoke-Startup {
         } catch { Write-Host "      (orphan sweep skipped: $($_.Exception.Message))" }
     }
 
+    # 1c) And the sidecar files a fleet coordinator that died mid-run left behind. Until now
+    # relay/fleet_reaper.py had no entry point and nothing in the repository referenced it,
+    # so a phantom run kept claiming to be live: the cockpit showed workers "running" for
+    # ever, and Stop/Pause wrote to a commands file nothing was left alive to read.
+    #
+    # It refuses to touch a run whose pid is alive, never relaunches anything and never
+    # raises, so it is safe here -- including when the user clicks start_all while a real
+    # run is going.
+    if (Test-Path $py) {
+        try {
+            & $py -m relay.fleet_reaper --reap 2>&1 | ForEach-Object { Write-Host "      $_" }
+        } catch { Write-Host "      (phantom-run sweep skipped: $($_.Exception.Message))" }
+    }
+
     # 2) Companion Edge :9222 (the fleet / agent Edge). Idempotent; skip if the port answers.
     Set-SplashStatus $script:splash "Starting the agent browser..."
     if (Port-Up 9222) {
