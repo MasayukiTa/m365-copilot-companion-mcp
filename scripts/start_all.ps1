@@ -759,6 +759,27 @@ function Invoke-Startup {
         }
     }
 
+    # 1b) Collect browsers left behind by a previous session, BEFORE starting anything.
+    #
+    # The measurement series launches its own Edge on :9224 and, until 2026-08-26, had no
+    # teardown of any kind -- so an interrupted or finished series left a browser running
+    # with a Copilot tab and nobody responsible for it. One was found idling at 331 MB hours
+    # afterwards. The series now tears down after itself, but a teardown only runs when the
+    # script survives to run it; a Ctrl-C is covered, a hard kill or a lost power cable is
+    # not. This sweep is the part that does not depend on anyone exiting cleanly.
+    #
+    # Safe to run first: the reaper stops a managed browser only when the process that owns
+    # it is not running, so a fleet run or bridge that is already up is left strictly alone.
+    # Report-and-stop rather than silence, because reclaiming a browser somebody is watching
+    # in Task Manager should be explainable afterwards.
+    $reaper = Join-Path $root "scripts\win\reap_orphan_edge.py"
+    $py = Join-Path $root ".venv\Scripts\python.exe"
+    if ((Test-Path $reaper) -and (Test-Path $py)) {
+        try {
+            & $py $reaper --stop 2>&1 | ForEach-Object { Write-Host "      $_" }
+        } catch { Write-Host "      (orphan sweep skipped: $($_.Exception.Message))" }
+    }
+
     # 2) Companion Edge :9222 (the fleet / agent Edge). Idempotent; skip if the port answers.
     Set-SplashStatus $script:splash "Starting the agent browser..."
     if (Port-Up 9222) {

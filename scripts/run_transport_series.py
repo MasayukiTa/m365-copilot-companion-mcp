@@ -402,5 +402,34 @@ def main(argv=None) -> int:                                     # pragma: no cov
     return 0
 
 
+def stop_browser() -> str:                                      # pragma: no cover
+    """Stop the browser this series started.
+
+    There was no teardown here at all. rebuild_browser() launched a dedicated Edge for every
+    run and nothing ever put it back down, so when the series ended -- or was interrupted --
+    the browser was orphaned: no keepalive supervises :9224 and, until the reaper existed,
+    nothing collected it. One was found on 2026-08-26 idling at 331 MB with a Copilot chat
+    tab, hours after the run that started it had finished.
+
+    Delegated to the reaper rather than reimplemented, so the profile this stops and the
+    profile the reaper recognises as the series' own cannot drift apart.
+    """
+    sys.path.insert(0, os.path.join(REPO, "scripts", "win"))
+    try:
+        import reap_orphan_edge
+        n = reap_orphan_edge.stop_profile("copilot-eval-edge")
+        return "stopped %d Edge process(es)" % n if n else "nothing to stop"
+    except Exception as exc:
+        return "could not stop the browser: %s" % type(exc).__name__
+
+
 if __name__ == "__main__":                                      # pragma: no cover
-    sys.exit(main())
+    # finally, not a line at the end of main(): a series is routinely stopped with Ctrl-C
+    # partway through, and that is exactly the exit that used to leave the browser behind.
+    # It still does not cover a hard kill or a power loss -- which is why the reaper checks
+    # ownership from outside instead of trusting anyone to run their own teardown.
+    try:
+        rc = main()
+    finally:
+        print("[series] teardown: %s" % stop_browser(), flush=True)
+    sys.exit(rc)
