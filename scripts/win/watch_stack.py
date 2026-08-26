@@ -44,6 +44,12 @@ ROUTE_LOG = os.path.join(REPO, ".fleet", "socket_route.jsonl")
 #: browser shows up as an unnamed profile instead of being silently folded into a known one.
 PORTS = {9222: "companion", 9223: "bridge", 9224: "eval"}
 
+#: The profiles this stack owns. Everything else on the machine -- above all the user's own
+#: Edge, which routinely holds several GB of their real browsing -- is somebody else's and is
+#: neither measured against these ceilings nor ever touched. The first run of the guard
+#: charged the user's personal browser to the stack and reported a breach for it.
+MANAGED_PROFILES = ("copilot-companion-edge", "copilot-bridge-edge", "copilot-eval-edge")
+
 _PS_PROCS = r"""
 Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe' OR Name='msedge.exe'" |
   Select-Object ProcessId, Name, WorkingSetSize, CommandLine | ConvertTo-Json -Compress -Depth 3
@@ -88,10 +94,22 @@ def _profile_of(cmdline: str) -> str:
 
 def cdp_pages(port: int):
     """Page count straight from the browser. None when it cannot be reached."""
+    urls = cdp_page_urls(port)
+    return None if urls is None else len(urls)
+
+
+def cdp_page_urls(port: int):
+    """The URLs of the open pages, or None when the browser cannot be reached.
+
+    The count alone cannot tell an `about:blank` keep-alive -- a few MB, holding the browser
+    open because Edge exits with its last page -- from a Copilot chat page nobody is reading,
+    which measured 135 MB while idle. A guard that watches the number would have called both
+    of those "1 page" and reported nothing wrong.
+    """
     try:
         with urllib.request.urlopen("http://127.0.0.1:%d/json/list" % port, timeout=4) as fh:
             targets = json.load(fh)
-        return sum(1 for t in targets if t.get("type") == "page")
+        return [t.get("url", "") for t in targets if t.get("type") == "page"]
     except Exception:
         return None
 
@@ -156,6 +174,30 @@ def route_events(since_iso: str) -> dict:
     return counts
 
 
+def headed_profiles(procs) -> list:
+    """Managed profiles whose BROWSER process is running without --headless.
+
+    Not a cosmetic detail. A headed browser owns a real window, and the socket route opens a
+    tab every time it re-keys its token -- which is often, because the tokens observed on
+    2026-08-26 lived 16 to 67 minutes. Creating a tab in a headed browser raises that window,
+    so from the desk it reads as a Copilot window flashing over whatever the user is doing,
+    every few dozen minutes, unprompted. One sign-in left a browser headed for ten hours
+    doing exactly that, and no instrument here noticed, because none of them looked.
+
+    --type= excludes renderer and GPU children: only the browser process carries the flags.
+    """
+    out = []
+    for p in procs:
+        cmd = p.get("CommandLine") or ""
+        if (p.get("Name") or "") != "msedge.exe" or "--type=" in cmd:
+            continue
+        prof = _profile_of(cmd)
+        if prof not in MANAGED_PROFILES or "--headless" in cmd:
+            continue
+        out.append(prof)
+    return sorted(set(out))
+
+
 def sample(since_iso: str) -> dict:
     procs = processes()
     mcp = sum((p.get("WorkingSetSize") or 0) for p in procs
@@ -168,13 +210,58 @@ def sample(since_iso: str) -> dict:
         edge[prof] = edge.get(prof, 0) + (p.get("WorkingSetSize") or 0)
     return {
         "t": time.strftime("%H:%M:%S"),
+        "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "free_mb": round(_free_mb()),
         "mcp_mb": round(mcp / 1048576.0),
         "edge_mb": {k: round(v / 1048576.0) for k, v in sorted(edge.items())},
         "pages": {name: cdp_pages(port) for port, name in PORTS.items()},
+        "page_urls": {name: cdp_page_urls(port) for port, name in PORTS.items()},
+        "headed": headed_profiles(procs),
         "runs": fleet_runs(procs),
         "route": route_events(since_iso),
     }
+
+
+#: What the stack is supposed to look like. Each is a thing that was believed to be true
+#: while it was not, and that no instrument was checking.
+MCP_MB_CEILING = int(os.environ.get("STACK_GUARD_MCP_MB", "3000"))
+EDGE_MB_CEILING = int(os.environ.get("STACK_GUARD_EDGE_MB", "2500"))
+FREE_MB_FLOOR = int(os.environ.get("STACK_GUARD_FREE_MB", "1200"))
+
+
+def violations(s: dict) -> list:
+    """What is wrong with this sample. Empty means the invariants held.
+
+    Separated from rendering on purpose. A watcher that only draws a screen is read while
+    somebody is watching it and proves nothing about the hours nobody was -- which is how a
+    browser sat headed for ten hours, and how a Copilot page nobody was reading held 135 MB
+    through an afternoon of measurements that never mentioned it.
+    """
+    out = []
+    for prof in s.get("headed") or []:
+        out.append(("HEADED", "%s owns a real window -- a tab opened in it will surface"
+                    % prof))
+
+    idle = not s.get("runs")
+    for name, pages in (s.get("page_urls") or {}).items():
+        if pages is None:                      # browser down; not a violation
+            continue
+        copilot = [u for u in pages if "m365.cloud.microsoft" in u]
+        if copilot and idle:
+            out.append(("IDLE_PAGE", "%s holds %d Copilot page(s) with no run in flight: %s"
+                        % (name, len(copilot), copilot[0][:70])))
+
+    if s["mcp_mb"] > MCP_MB_CEILING:
+        out.append(("MCP_MEM", "MCP server at %d MB (ceiling %d)"
+                    % (s["mcp_mb"], MCP_MB_CEILING)))
+    total_edge = sum(v for k, v in (s.get("edge_mb") or {}).items()
+                     if k in MANAGED_PROFILES)
+    if total_edge > EDGE_MB_CEILING:
+        out.append(("EDGE_MEM", "managed Edge total %d MB (ceiling %d)"
+                    % (total_edge, EDGE_MB_CEILING)))
+    if s["free_mb"] < FREE_MB_FLOOR:
+        out.append(("FREE_RAM", "free RAM %d MB (floor %d)" % (s["free_mb"], FREE_MB_FLOOR)))
+    return out
 
 
 def render(s: dict, first: dict, elapsed_min: float) -> str:
@@ -205,17 +292,143 @@ def render(s: dict, first: dict, elapsed_min: float) -> str:
     return "\n".join(lines)
 
 
+def guard(log_path: str, interval: float, since: str) -> int:
+    """Sample forever, record everything, and say something only when an invariant breaks.
+
+    Two files, because they answer different questions. The .jsonl is the record -- every
+    sample, so a number can be checked afterwards against the window it was measured over
+    rather than against a memory of it. The .violations.log is the alarm: short, timestamped,
+    and empty when nothing is wrong, so that its being empty is itself evidence.
+
+    A breach is reported when it STARTS and when it ENDS, not on every sample. A guard that
+    prints the same line every twenty seconds for an hour is one nobody reads to the bottom
+    of, and the line that mattered is the first one.
+    """
+    samples = open(log_path if log_path.endswith(".jsonl") else log_path + ".jsonl",
+                   "a", encoding="utf-8")
+    base = log_path[:-6] if log_path.endswith(".jsonl") else log_path
+    alarms = open(base + ".violations.log", "a", encoding="utf-8")
+
+    def say(line):
+        stamped = "%s %s" % (time.strftime("%Y-%m-%dT%H:%M:%S"), line)
+        print(stamped, flush=True)
+        alarms.write(stamped + "\n")
+        alarms.flush()
+
+    say("guard start (interval %.0fs, pid %d)" % (interval, os.getpid()))
+    open_breaches = {}
+    try:
+        while True:
+            s = sample(since)
+            vs = dict(violations(s))
+            samples.write(json.dumps(s, ensure_ascii=False) + "\n")
+            samples.flush()
+            for kind, detail in vs.items():
+                if kind not in open_breaches:
+                    say("BREACH %-10s %s" % (kind, detail))
+                open_breaches[kind] = detail
+            for kind in [k for k in open_breaches if k not in vs]:
+                say("CLEARED %-9s (was: %s)" % (kind, open_breaches.pop(kind)))
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        say("guard stopped")
+    finally:
+        samples.close()
+        alarms.close()
+    return 0
+
+
+def summarize(log_path: str) -> int:
+    """Read a guard log back: what it cost, and what broke, over the window it covers.
+
+    Reports the WINDOW alongside every number. A peak means nothing without the span it was
+    a peak over -- comparing a peak across 22 minutes with one across 10 is how a 41%
+    improvement was once reported as seventeen-fold.
+    """
+    path = log_path if log_path.endswith(".jsonl") else log_path + ".jsonl"
+    rows = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    try:
+                        rows.append(json.loads(line))
+                    except ValueError:
+                        pass
+    except OSError as exc:
+        print("cannot read %s: %s" % (path, exc))
+        return 1
+    if not rows:
+        print("%s holds no samples." % path)
+        return 1
+
+    span_min = max(len(rows) - 1, 1) * 0.0
+    first, last = rows[0], rows[-1]
+    try:
+        t0 = time.mktime(time.strptime(first.get("iso", ""), "%Y-%m-%dT%H:%M:%S"))
+        t1 = time.mktime(time.strptime(last.get("iso", ""), "%Y-%m-%dT%H:%M:%S"))
+        span_min = max((t1 - t0) / 60.0, 0.001)
+    except (ValueError, TypeError):
+        span_min = 0.0
+
+    print("%d samples over %.1f min  (%s .. %s)"
+          % (len(rows), span_min, first.get("iso", "?"), last.get("iso", "?")))
+    mcp = [r.get("mcp_mb", 0) for r in rows]
+    edge = [sum(v for k, v in (r.get("edge_mb") or {}).items() if k in MANAGED_PROFILES)
+            for r in rows]
+    free = [r.get("free_mb", 0) for r in rows]
+    print("  MCP server   first %5d  peak %5d  last %5d MB%s"
+          % (mcp[0], max(mcp), mcp[-1],
+             ("   (%+.1f MB/min)" % ((mcp[-1] - mcp[0]) / span_min)) if span_min else ""))
+    print("  managed Edge first %5d  peak %5d  last %5d MB" % (edge[0], max(edge), edge[-1]))
+    print("  free RAM     first %5d  low  %5d  last %5d MB" % (free[0], min(free), free[-1]))
+
+    headed = [r for r in rows if r.get("headed")]
+    print("  samples with a browser WINDOW: %d of %d%s"
+          % (len(headed), len(rows),
+             ("   -> %s" % sorted({p for r in headed for p in r["headed"]})) if headed else ""))
+    idle_pages = sum(1 for r in rows if not r.get("runs") and any(
+        any("m365.cloud.microsoft" in u for u in (pg or []))
+        for pg in (r.get("page_urls") or {}).values()))
+    print("  samples with an idle Copilot page: %d of %d" % (idle_pages, len(rows)))
+
+    breaches = os.path.splitext(path)[0]
+    breaches = (breaches[:-6] if breaches.endswith(".jsonl") else breaches) + ".violations.log"
+    if os.path.exists(breaches):
+        lines = [l.rstrip() for l in open(breaches, encoding="utf-8") if "BREACH" in l]
+        print("  breaches recorded: %d" % len(lines))
+        for l in lines[-12:]:
+            print("    %s" % l)
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--interval", type=float, default=20.0, help="seconds between samples")
     ap.add_argument("--once", action="store_true", help="one sample as JSON, then exit")
     ap.add_argument("--csv", help="also append a flat row per sample to this file")
+    ap.add_argument("--guard", metavar="LOG",
+                    help="run unattended: append every sample to LOG.jsonl and every "
+                         "invariant breach to LOG.violations.log. Prints only breaches, so "
+                         "silence means the stack held.")
+    ap.add_argument("--summary", metavar="LOG",
+                    help="read back a --guard log: peaks, rates, and every breach, with "
+                         "the window they were measured over")
     args = ap.parse_args(argv)
+
+    if args.summary:
+        return summarize(args.summary)
 
     since = time.strftime("%Y-%m-%dT%H:%M:%S")
     if args.once:
-        print(json.dumps(sample(since), ensure_ascii=False, indent=1))
+        s = sample(since)
+        s["violations"] = [{"kind": k, "detail": d} for k, d in violations(s)]
+        print(json.dumps(s, ensure_ascii=False, indent=1))
         return 0
+
+    if args.guard:
+        return guard(args.guard, args.interval, since)
 
     started = time.time()
     first = None
