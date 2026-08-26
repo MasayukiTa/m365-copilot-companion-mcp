@@ -4164,6 +4164,42 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             pass
         print("[fanout] %s -> %d subtask(s)" % (cid, len(kids)), flush=True)
 
+    def _queue_ready_merges():
+        """Queue the merge for every family whose children have all finished. Count queued.
+
+        Called from inside the sweep AND once the sweep loop has drained, and the second
+        call is the one that matters. The check used to run only at the top of the loop
+        body, and the last child finishes further down the SAME body -- so the pass that
+        would have seen a finished family was the pass the loop then exited on. The merge
+        was never queued once: a real run on 2026-08-26 split into nine subtasks, ran all
+        nine, and ended without ever writing the answer they were collected for.
+        """
+        queued = 0
+        for _cid, _camp in campaigns.items():
+            if _camp.get("merged"):
+                continue
+            _kids = [w for w in workers
+                     if getattr(getattr(w, "task_envelope", None), "campaign_id", "") == _cid
+                     and getattr(getattr(w, "task_envelope", None), "role", "") == "subtask"]
+            _recs = [{"finished": w.status in TERMINAL,
+                      "outcome": w.outcome,
+                      "subtask_index": getattr(w, "subtask_index", "?"),
+                      "result": (getattr(w, "display_result", "") or w.last_response or "")}
+                     for w in _kids]
+            # Every child ADMITTED must be finished, and all of them must have been admitted:
+            # a family half of which is still queued is not a finished campaign, and merging
+            # it would report a sweep that never ran as though it had.
+            if len(_recs) < _camp.get("n", 0) or not fanout_mod.ready_to_aggregate(_recs):
+                continue
+            _camp["merged"] = True
+            add_box.append(fanout_mod.aggregation_goal(_camp["goal"], _recs,
+                                                       campaign_id=_cid))
+            queued += 1
+            print("[fanout] %s: %d/%d subtask(s) done -> merging"
+                  % (_cid, sum(1 for r in _recs if (r["outcome"] or "").upper() == "DONE"),
+                     len(_recs)), flush=True)
+        return queued
+
     workers = [RelayWorker(g, "w%d" % i, max_turns=effective_max_turns,
                            refuter=refuter, max_refute=max_refute, plan_mode=plan_mode,
                            review_lenses=review_lenses, max_transient=max_transient,
@@ -4218,6 +4254,11 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # fresh Edge context still gets another shot at it.
         FINISHED_OUTCOMES = (
             "DONE", "CANCELLED", "STUCK", "CONTENT_REFUSED", "UNRESOLVED_REFUSAL",
+            # A goal that SPLIT is finished as a goal: its work now belongs to the children
+            # it spawned and to the merge that follows them. Resuming it would put the same
+            # question to the agent again and produce a second family doing identical work,
+            # while the first family's answers were still being collected.
+            "FANOUT",
         )
         return [freeze_goal_dict(getattr(w, "goal_record", None) or
                                  {"text": w.goal, "checks": w.checks, "cwd": w.cwd})
@@ -4242,7 +4283,14 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         _retry_on = False        # nowhere to put a re-queued goal
 
     _reap_counter = 0
-    while any(w.status not in TERMINAL for w in workers) or (add_box and len(add_box) > 0):
+    while (any(w.status not in TERMINAL for w in workers)
+           or (add_box and len(add_box) > 0)
+           # A FAMILY THAT FINISHED ON THE LAST PASS. The merge is decided at the top
+           # of the body, and the last child finishes further down the same body, so
+           # the pass that would notice is the pass the loop exits on. Asking here, in
+           # the condition itself, is what keeps the run alive for the merge: it queues
+           # the goal and returns a count, and a non-zero count means there is work.
+           or _queue_ready_merges() > 0):
         # --- stop / pause control (cockpit -> commands.json -> *_box, read every loop) ---
         if stop_box[0]:
             # graceful abort: cancel every still-running worker, then fall through to the
@@ -4302,36 +4350,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 except Exception:
                     pass
 
-        # FAN-OUT MERGE. A family whose every child has finished gets one more goal: read
-        # the children's reports and write the answer the parent was asked for.
-        #
-        # Queued through add_box like everything else, and BEFORE the drain below so the
-        # merge is admitted in this same sweep rather than waiting for the next one. It has
-        # to be queued from inside the loop, too: once the last child goes terminal the
-        # loop's own condition is one empty add_box away from ending the run, and a merge
-        # decided after that would never be admitted at all.
-        for _cid, _camp in campaigns.items():
-            if _camp.get("merged"):
-                continue
-            _kids = [w for w in workers
-                     if getattr(getattr(w, "task_envelope", None), "campaign_id", "") == _cid
-                     and getattr(getattr(w, "task_envelope", None), "role", "") == "subtask"]
-            _recs = [{"finished": w.status in TERMINAL,
-                      "outcome": w.outcome,
-                      "subtask_index": getattr(w, "subtask_index", "?"),
-                      "result": (getattr(w, "display_result", "") or w.last_response or "")}
-                     for w in _kids]
-            # Every child ADMITTED must be finished, and all of them must have been admitted:
-            # a family half of which is still queued is not a finished campaign, and merging
-            # it would report a sweep that never ran as though it had.
-            if len(_recs) < _camp.get("n", 0) or not fanout_mod.ready_to_aggregate(_recs):
-                continue
-            _camp["merged"] = True
-            add_box.append(fanout_mod.aggregation_goal(_camp["goal"], _recs,
-                                                       campaign_id=_cid))
-            print("[fanout] %s: %d/%d subtask(s) done -> merging"
-                  % (_cid, sum(1 for r in _recs if (r["outcome"] or "").upper() == "DONE"),
-                     len(_recs)), flush=True)
+        _queue_ready_merges()
 
         # goals added mid-run (e.g. from the native chat while at capacity) join the
         # queue here -- priority items jump to the front, but still wait for a free slot
@@ -4347,7 +4366,17 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                                   max_research=max_research,
                                   contract_budget=_contract_budget,
                                   resilience_profile=resilience_profile,
-                                  max_fresh_replays=max_fresh_replays)
+                                  max_fresh_replays=max_fresh_replays,
+                                  # A GOAL ADDED MID-RUN LEAVES A RECORD LIKE ANY OTHER.
+                                  # These two were missing, so every worker queued after the
+                                  # run began wrote no transcript at all. It went unnoticed
+                                  # while mid-run goals were rare, and stopped being rare the
+                                  # moment fan-out started adding them: a run that split into
+                                  # nine subtasks and ran all nine left ONE transcript on
+                                  # disk, the parent's. The children's answers existed only
+                                  # in memory and in a status file that the next attempt
+                                  # overwrote -- work done, and no way to read it back.
+                                  transcript_dir=transcript_dir, run_id=run_id)
                 workers.append(nw)
                 if item.get("priority"):
                     pending.insert(0, nw)

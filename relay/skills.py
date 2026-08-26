@@ -737,6 +737,56 @@ class SkillStore:
             return None
         return {"score": round(best_score, 3), **best.public_metadata()}
 
+    def match_unapproved(self, text: str) -> dict[str, Any] | None:
+        """The best Skill that WOULD have matched, had a human approved it.
+
+        WHY THIS EXISTS. Approval is requested from exactly one place in the whole system --
+        a command inside the chat CLI's REPL -- so nothing an agent does can ever ask for it.
+        Six Skills sat unreadable for weeks as a result: two of them had been approved on
+        2026-08-06 and fell back to `changed` the moment a character of their text moved,
+        which is correct (the approval is of a hash) and terminal (nothing re-requests it).
+        The Approval Centre showed nothing to approve, truthfully: no request had been made.
+
+        Matching untrusted metadata is safe. Names and descriptions are read, the body is
+        not, and nothing here decides to trust anything -- it only reports that a decision is
+        waiting to be made by a person. The threshold is deliberately looser than match():
+        this asks "is this worth putting in front of the user", not "may this be loaded".
+        """
+        query = _match_tokens(text)
+        if len(query) < 2:
+            return None
+        best_score, best = 0.0, None
+        for skill in self.discover():
+            if skill.trust == "trusted":
+                continue
+            if skill.metadata.get("disable-model-invocation") is True:
+                continue
+            haystack = skill.description + " " + str(skill.metadata.get("when_to_use") or "")
+            terms = _match_tokens(haystack)
+            if not terms:
+                continue
+            score = len(query & terms) / max(1, min(len(query), len(terms)))
+            if skill.name in text.lower():
+                score += 0.6
+            if score > best_score:
+                best_score, best = score, skill
+        # A LOWER BAR THAN match(), on purpose, and lower again than it first looked right.
+        # Japanese matches on character bigrams, so a short question against a long
+        # description scores low by construction: "2026年1月のメールを検索して一覧にしたい"
+        # overlaps /mail-lookup on メー・ール・検索 and scores 0.19. At 0.35 the very case
+        # this exists for never fired. Nothing is granted by clearing this bar -- a question
+        # is written for a person -- and requests are de-duplicated by digest, so the worst
+        # case is one pending question per Skill that exists, which is exactly the list the
+        # user was asking to see.
+        if best is None or best_score < 0.25:
+            return None
+        return {"score": round(best_score, 3), "name": best.name, "trust": best.trust}
+
+    def unapproved(self) -> list[dict[str, Any]]:
+        """Every Skill a person has not (or no longer has) approved, newest question first."""
+        return [{"name": s.name, "trust": s.trust, "scope": s.scope}
+                for s in self.discover() if s.trust != "trusted"]
+
 
 def format_skill_list(skills: Iterable[dict[str, Any]]) -> str:
     rows = list(skills)

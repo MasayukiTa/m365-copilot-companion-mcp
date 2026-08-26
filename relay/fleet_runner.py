@@ -1672,6 +1672,10 @@ def main():
         if o == "CANCELLED": return "cancelled"
         if o == "MAXTURNS": return "maxturns"
         if o in ("STUCK", "VERIFY_FAILED"): return "stuck"
+        # A goal that SPLIT did its job and handed the work to its children. Everything not
+        # named here falls through to "error", so the parent of a perfectly healthy fan-out
+        # was reported as a failure -- on a run whose nine subtasks all completed.
+        if o == "FANOUT": return "done"
         return "error"
 
     def _final_worker_entry(r, max_turns):

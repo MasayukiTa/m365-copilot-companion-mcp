@@ -125,3 +125,111 @@ def test_with_no_spawner_the_worker_does_the_job_itself():
     w._decide(SPLIT_REPLY)
     assert w.status not in rf.TERMINAL
     assert w.fanout is False
+
+
+# ---- when the merge gets queued -----------------------------------------------------------
+#
+# The bug these pin cost a whole real run. The split fired, nine subtasks ran, every one of
+# them finished -- and the run ended without ever writing the answer they were collected for.
+# The merge was decided at the TOP of the sweep body, and the last child finishes further
+# down the SAME body, so the pass that would have noticed was the pass the loop exited on.
+# There was no pass in which "the family is finished" could be observed.
+
+class _FakeWorker:
+    """Only what the merge check reads off a worker."""
+
+    def __init__(self, cid, index, status, outcome="DONE", result="ok"):
+        self.task_envelope = type("E", (), {"campaign_id": cid, "role": "subtask"})()
+        self.subtask_index = index
+        self.status = status
+        self.outcome = outcome
+        self.display_result = result
+        self.last_response = result
+
+
+def _merge_state(children, n=3):
+    """Reproduce the loop's decision with the same inputs run_fleet gives it."""
+    cid = "c-test"
+    campaigns = {cid: {"goal": "元の目標", "n": n, "merged": False}}
+    add_box = []
+    workers = children
+
+    def queue_ready():
+        queued = 0
+        for _cid, _camp in campaigns.items():
+            if _camp.get("merged"):
+                continue
+            kids = [w for w in workers
+                    if getattr(getattr(w, "task_envelope", None), "campaign_id", "") == _cid
+                    and getattr(getattr(w, "task_envelope", None), "role", "") == "subtask"]
+            recs = [{"finished": w.status in rf.TERMINAL, "outcome": w.outcome,
+                     "subtask_index": w.subtask_index,
+                     "result": w.display_result} for w in kids]
+            if len(recs) < _camp.get("n", 0) or not fo.ready_to_aggregate(recs):
+                continue
+            _camp["merged"] = True
+            add_box.append(fo.aggregation_goal(_camp["goal"], recs, campaign_id=_cid))
+            queued += 1
+        return queued
+
+    return queue_ready, add_box
+
+
+def test_a_family_still_working_is_not_merged():
+    kids = [_FakeWorker("c-test", 1, "done"), _FakeWorker("c-test", 2, "waiting"),
+            _FakeWorker("c-test", 3, "done")]
+    queue_ready, add_box = _merge_state(kids)
+    assert queue_ready() == 0
+    assert add_box == []
+
+
+def test_the_merge_is_queued_the_moment_the_last_child_finishes():
+    kids = [_FakeWorker("c-test", 1, "done"), _FakeWorker("c-test", 2, "waiting"),
+            _FakeWorker("c-test", 3, "done")]
+    queue_ready, add_box = _merge_state(kids)
+    assert queue_ready() == 0
+    kids[1].status = "done"                     # the last child finishes
+    assert queue_ready() == 1, "the pass after the last child finishes must queue the merge"
+    assert len(add_box) == 1
+    assert add_box[0]["role"] == "aggregator"
+
+
+def test_the_merge_is_queued_exactly_once():
+    """The loop condition calls this on every pass; a second merge would double the work."""
+    kids = [_FakeWorker("c-test", i, "done") for i in (1, 2, 3)]
+    queue_ready, add_box = _merge_state(kids)
+    assert queue_ready() == 1
+    assert queue_ready() == 0
+    assert len(add_box) == 1
+
+
+def test_a_family_whose_children_were_never_all_admitted_is_not_merged():
+    """Merging a family half of which never ran would report a sweep that did not happen."""
+    kids = [_FakeWorker("c-test", 1, "done"), _FakeWorker("c-test", 2, "done")]
+    queue_ready, add_box = _merge_state(kids, n=3)   # three were spawned, two exist
+    assert queue_ready() == 0
+
+
+def test_a_failed_child_still_lets_the_family_merge_and_is_named():
+    """A stuck subtask must not strand the whole campaign -- but must not be hidden either."""
+    kids = [_FakeWorker("c-test", 1, "done"),
+            _FakeWorker("c-test", 2, "stuck", outcome="STUCK", result=""),
+            _FakeWorker("c-test", 3, "done")]
+    queue_ready, add_box = _merge_state(kids)
+    assert queue_ready() == 1
+    assert "未取得" in add_box[0]["text"]
+
+
+def test_the_loop_condition_asks_for_pending_merges():
+    """Structural: the run must not be able to end with a merge owed.
+
+    Checked against the source because the defect was one of PLACEMENT -- the code was
+    correct and ran where it could never observe the state it was looking for.
+    """
+    import os
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "relay", "relay_fleet.py"), encoding="utf-8").read()
+    head = src[src.index("    _reap_counter = 0"):]
+    condition = head[:head.index("):") + 2]
+    assert "_queue_ready_merges() > 0" in condition, \
+        "the sweep loop must ask whether a merge is owed before it ends"

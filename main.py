@@ -139,7 +139,8 @@ from tools.local_loop_ops import (
     heartbeat,
     read_job_context,
 )
-from tools.skill_ops import skill_list, skill_load, skill_match, skill_read_resource
+from tools.skill_ops import (skill_list, skill_load, skill_match, skill_read_resource,
+                             skill_request_approval)
 from tools.pdf_ops import pdf_info, read_pdf
 from tools.pptx_ops import (
     create_pptx,
@@ -379,7 +380,7 @@ TOOLS = (
     gate_ask, gate_poll, gate_list,
     stop_request, stop_check, stop_clear,
     # Model-facing Skill operations are read-only and accept only exact trusted digests.
-    skill_list, skill_match, skill_load, skill_read_resource,
+    skill_list, skill_match, skill_load, skill_read_resource, skill_request_approval,
     # orchestration: response-content-independent LOCAL_LOOP control plane
     *EXECUTION_PROFILE_TOOLS,
     # orchestration: verification-loop helpers (operator C)
