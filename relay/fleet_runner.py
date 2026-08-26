@@ -1049,6 +1049,12 @@ def main():
                     help="per-goal retries for TRANSIENT failures (send/timeout/likely-"
                          "transient STUCK) before giving up, with backoff (default 10, "
                          "like Claude Code retrying a failed network request)")
+    ap.add_argument("--fanout", action="store_true",
+                    help="split each goal into independent sub-goals, run them in parallel, "
+                         "and merge the answers. For work whose SIZE is the problem: a goal "
+                         "that cannot fit in one conversation fails at the conversation, not "
+                         "at the work. Off by default -- a goal that fits should not pay for "
+                         "a split turn and a merge turn.")
     ap.add_argument("--refuter", action="store_true",
                     help="operator B: after a candidate DONE, an INDEPENDENT reviewer "
                          "(non-blocking side chat) tries to refute it before accepting. "
@@ -1619,7 +1625,8 @@ def main():
                                        transcript_dir=transcripts_dir,
                                        run_id="r%x_a%d" % (int(started), attempt),
                                        resilience_profile=args.resilience_profile,
-                                       max_fresh_replays=max(0, args.max_fresh_replays))
+                                       max_fresh_replays=max(0, args.max_fresh_replays),
+                                       fanout=args.fanout)
             for r in res:
                 results_by_goal[r["goal"]] = r
             pending = []                                   # finished cleanly

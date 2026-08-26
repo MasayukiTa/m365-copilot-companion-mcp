@@ -42,6 +42,7 @@ from .copilot_autopilot_relay import (
     conversation_start_label,
 )
 from relay import settle as _settle
+from relay import fanout as fanout_mod
 from .planner import PLAN_PROMPT, extract_plan, opening_turn, plan_ready
 from .review_resilience import (
     freeze_goal_dict, looks_like_policy_refusal, same_task_envelope,
@@ -1456,7 +1457,8 @@ class RelayWorker:
                  refuter=False, max_refute=2, plan_mode=False, review_lenses=None,
                  max_transient=10, transcript_dir=None, run_id="", busy_writer=None,
                  max_research=3, contract_budget=None, max_continue=6,
-                 resilience_profile="off", max_fresh_replays=0):
+                 resilience_profile="off", max_fresh_replays=0,
+                 fanout=False, spawn_fn=None):
         self.page = None
         self.drv = None
         #: True while this worker is talking over a socket instead of holding a tab. It still
@@ -1472,6 +1474,9 @@ class RelayWorker:
         #: goal actually need" -- the one question the classifier will be built to predict.
         self._socket_fell_back = False
         self.goal_record = freeze_goal_dict(goal) if isinstance(goal, dict) else {"text": str(goal)}
+        #: Which slice of a split this worker owns, so the merge can label its report. Read
+        #: from the goal because that is where child_goals put it; absent for ordinary goals.
+        self.subtask_index = goal.get("subtask_index") if isinstance(goal, dict) else None
         text, checks, cwd = goal_fields(goal)
         self.goal = text
         self.checks = checks
@@ -1666,6 +1671,18 @@ class RelayWorker:
             self._unlock_attempts = 1
         self.job = (initial_body if self.resume_conv
                     else conversation_start_label(self.name) + initial_body)
+        # FAN-OUT. Only a top-level goal may split: a child that splits again is how one
+        # runaway goal becomes an unbounded number of conversations, and the depth on the
+        # envelope is what makes that structural rather than a promise.
+        self._spawn_fn = spawn_fn
+        self.fanout = bool(fanout) and int(getattr(self.task_envelope, "depth", 0) or 0) == 0
+        self._fanout_done = False
+        if self.fanout:
+            # Turn 1 asks for the split instead of the work. The goal still travels in full,
+            # because the split has to be made against the real instructions -- an agent
+            # asked to divide a goal it cannot see divides something else.
+            self.job = (conversation_start_label(self.name) + PROTOCOL + self.goal
+                        + "\n\n" + fanout_mod.SPLIT_JOB)
         self.turn = 0
         self._turn_sent_at = 0.0
         self.no_progress = 0
@@ -3271,6 +3288,47 @@ class RelayWorker:
 
         # plan phase (plan_mode): capture the proposed plan and PAUSE for approval; a steer
         # (approve as-is, or an edit) resumes into execution. Don't run DONE/CONTINUE yet.
+        # FAN-OUT: turn 1 asked for a split, and this is the answer to it.
+        #
+        # Placed ahead of the plan and DONE branches because a split reply is neither: it
+        # ends in SUBTASKS_READY and describes work rather than reporting it, and letting the
+        # DONE branch see it first would accept a list of intentions as a finished task.
+        if self.fanout and not self._fanout_done:
+            if fanout_mod.fanout_ready(resp):
+                self._fanout_done = True
+                steps = fanout_mod.subtasks_from(resp)
+                kids = (fanout_mod.child_goals(
+                    self.goal, steps,
+                    parent_task_id=getattr(self.task_envelope, "task_id", "") or "",
+                    checks=getattr(self, "checks", None) or None,
+                    cwd=getattr(self, "cwd", None)) if steps else [])
+                if kids and self._spawn_fn:
+                    self._spawn_fn(self.goal, kids)
+                    # SPLITTING ENDS THIS WORKER. A parent parked until its children finish
+                    # holds an admission slot the whole time, and with a concurrency cap
+                    # below the number of children that is a deadlock -- the parent waits
+                    # for children that cannot be admitted because the parent is waiting.
+                    # The merge arrives later as its own goal, when there is something to
+                    # merge.
+                    self.status, self.outcome = "done", "FANOUT"
+                    self.reason = ("%d 個のサブタスクに分割して並列実行（完了後に統合）"
+                                   % len(kids))
+                    return
+                # An unusable split -- one item, forty, or prose with no list. Do the work
+                # here instead of splitting: refusing to proceed would strand a goal on the
+                # grounds that the agent divided it badly, which is not the goal's fault.
+                self.fanout = False
+                self.job = self._task_anchor(
+                    "分割は行いません。上記の目標をこの会話で直接実行してください。"
+                    "完了したら DONE、無理なら FAIL と理由を書いてください。")
+                self.status = "ready"
+                self.reason = "分割案が使えなかったため単独実行に切り替え"
+                return
+            # Still writing the split. Ask for the marker rather than for the work: without
+            # it there is nothing to tell a finished list from a half-written one.
+            self.job = self._task_anchor(fanout_mod.SPLIT_JOB)
+            self.status = "ready"
+            return
         if self.plan_mode and not self._plan_approved:
             if plan_ready(resp):
                 self.plan_steps = extract_plan(resp)
@@ -3991,7 +4049,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     ram_box=None,
                     transcript_dir=None, run_id="", busy_writer=None,
                      pause_box=None, stop_box=None, resilience_profile="off",
-                     max_fresh_replays=0):
+                     max_fresh_replays=0, fanout=False):
     """Drive len(goals) autonomous relays in parallel to completion, but never with
     more than `max_concurrent` tabs open at once (defaults to what free RAM allows).
     A goal's tab is opened only when a slot frees and CLOSED the moment it finishes.
@@ -4080,6 +4138,32 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     if max_refute is None:
         max_refute = _genome_default("max_refute", 2)
 
+    # FAN-OUT bookkeeping. campaigns[cid] remembers the parent goal a family was split from,
+    # which is the one thing the merge needs that the children do not carry themselves.
+    campaigns = {}
+
+    def _spawn_children(parent_goal, kids):
+        """Queue a split parent's children and remember the family."""
+        cid = kids[0].get("campaign_id") or fanout_mod.campaign_id_for(parent_goal)
+        campaigns[cid] = {"goal": parent_goal, "n": len(kids), "merged": False}
+        add_box.extend(kids)
+        # WRITTEN DOWN, NOT ONLY QUEUED. add_box lives in memory: if the run dies here the
+        # children vanish while the parent is already recorded finished, so the work would
+        # be lost without a trace of what it was. One line per child, beside the run state.
+        try:
+            if transcript_dir:
+                with open(os.path.join(os.path.dirname(transcript_dir), "campaigns.jsonl"),
+                          "a", encoding="utf-8") as fh:
+                    for k in kids:
+                        fh.write(json.dumps(
+                            {"campaign_id": cid, "task_id": k.get("task_id"),
+                             "subtask_index": k.get("subtask_index"),
+                             "text": (k.get("text") or "")[:4000]},
+                            ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+        print("[fanout] %s -> %d subtask(s)" % (cid, len(kids)), flush=True)
+
     workers = [RelayWorker(g, "w%d" % i, max_turns=effective_max_turns,
                            refuter=refuter, max_refute=max_refute, plan_mode=plan_mode,
                            review_lenses=review_lenses, max_transient=max_transient,
@@ -4087,7 +4171,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                             busy_writer=busy_writer, max_research=max_research,
                             contract_budget=_contract_budget,
                             resilience_profile=resilience_profile,
-                            max_fresh_replays=max_fresh_replays)
+                            max_fresh_replays=max_fresh_replays,
+                            fanout=fanout, spawn_fn=_spawn_children)
                for i, g in enumerate(goals)]
     pending = list(workers)            # FIFO queue of not-yet-attached workers
 
@@ -4216,6 +4301,37 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                           % (_w.name, _w.outcome, _retry_used[_g], _retry_cap), flush=True)
                 except Exception:
                     pass
+
+        # FAN-OUT MERGE. A family whose every child has finished gets one more goal: read
+        # the children's reports and write the answer the parent was asked for.
+        #
+        # Queued through add_box like everything else, and BEFORE the drain below so the
+        # merge is admitted in this same sweep rather than waiting for the next one. It has
+        # to be queued from inside the loop, too: once the last child goes terminal the
+        # loop's own condition is one empty add_box away from ending the run, and a merge
+        # decided after that would never be admitted at all.
+        for _cid, _camp in campaigns.items():
+            if _camp.get("merged"):
+                continue
+            _kids = [w for w in workers
+                     if getattr(getattr(w, "task_envelope", None), "campaign_id", "") == _cid
+                     and getattr(getattr(w, "task_envelope", None), "role", "") == "subtask"]
+            _recs = [{"finished": w.status in TERMINAL,
+                      "outcome": w.outcome,
+                      "subtask_index": getattr(w, "subtask_index", "?"),
+                      "result": (getattr(w, "display_result", "") or w.last_response or "")}
+                     for w in _kids]
+            # Every child ADMITTED must be finished, and all of them must have been admitted:
+            # a family half of which is still queued is not a finished campaign, and merging
+            # it would report a sweep that never ran as though it had.
+            if len(_recs) < _camp.get("n", 0) or not fanout_mod.ready_to_aggregate(_recs):
+                continue
+            _camp["merged"] = True
+            add_box.append(fanout_mod.aggregation_goal(_camp["goal"], _recs,
+                                                       campaign_id=_cid))
+            print("[fanout] %s: %d/%d subtask(s) done -> merging"
+                  % (_cid, sum(1 for r in _recs if (r["outcome"] or "").upper() == "DONE"),
+                     len(_recs)), flush=True)
 
         # goals added mid-run (e.g. from the native chat while at capacity) join the
         # queue here -- priority items jump to the front, but still wait for a free slot
