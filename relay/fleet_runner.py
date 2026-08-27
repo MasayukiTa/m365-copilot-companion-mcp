@@ -183,7 +183,46 @@ def report_unused_steers(workers, reported=None, log=None):
             continue
     return named
 
-def deliver_steers(items, workers, log=None):
+#: How a late steer is put to the worker that already answered. It is a follow-up, not a
+#: fresh task, and saying so is what stops the model re-doing the whole goal: the
+#: conversation it is resumed into already holds the work.
+FOLLOW_UP_PROMPT = ("【ユーザーからの追加指示】%s\n"
+                    "直前までの作業内容を踏まえ、この追加指示に対してだけ答えてください。"
+                    "最初からやり直す必要はありません。"
+                    "完了なら DONE、無理なら FAIL と理由を書いてください。")
+
+def _follow_up(worker, text, enqueue, say):
+    """Queue the message as a new goal continuing `worker`'s conversation. True if queued.
+
+    The conversation is addressed by the FINISHED WORKER'S GOAL TEXT, because that is what
+    identifies a conversation in socket_route's record -- `conversation_for_goal` matches on
+    it. Handing back the goal is therefore the whole of what a resume needs.
+
+    A worker with no goal text cannot be followed up, and that is said rather than guessed:
+    a follow-up that silently became a fresh conversation is the failure this exists to
+    avoid, and it answers plausibly either way.
+    """
+    if enqueue is None:
+        return False
+    goal = (getattr(worker, "goal", "") or "").strip()
+    if not goal:
+        say("[steer] cannot follow up %s: no goal text to identify its conversation"
+            % worker.name)
+        return False
+    try:
+        enqueue({"text": FOLLOW_UP_PROMPT % text,
+                 "follow_up_to": goal,
+                 "priority": True,
+                 "cwd": getattr(worker, "cwd", "") or ""})
+    except Exception as exc:
+        say("[steer] could not queue a follow-up for %s: %s: %s"
+            % (worker.name, type(exc).__name__, str(exc)[:90]))
+        return False
+    say("[steer] %s had already finished, so the message goes to a NEW worker continuing "
+        "the SAME conversation" % worker.name)
+    return True
+
+def deliver_steers(items, workers, log=None, enqueue=None):
     """Hand each steering message to the worker(s) it is for, and NAME EVERY REJECTION.
 
     AN EMPTY WORKER NAME MEANS EVERY LIVE WORKER, and it did not. The cockpit picks the
@@ -200,6 +239,28 @@ def deliver_steers(items, workers, log=None):
     IT TAKES EFFECT ON THE WORKER'S NEXT TURN, not mid-turn. A turn already in flight is a
     request the model is answering; there is nowhere to insert anything until it replies.
     That is worth saying out loud, because 'interrupt' suggests otherwise.
+
+    A STEER FOR A WORKER THAT HAS FINISHED IS NOT LATE, IT IS A FOLLOW-UP. Dropping it was
+    the honest thing to do while there was nowhere to put it, and there is somewhere: a
+    goal carrying `follow_up_to` resolves, in RelayWorker.__init__, to the conversation the
+    named goal ran in, and attach() opens that conversation rather than a fresh one. So the
+    message becomes a NEW worker continuing the SAME conversation -- no state machine runs
+    backwards, no finished worker is revived, and the context the steer was about is still
+    there.
+
+    (Reviving the finished worker instead was tried and withdrawn. The sweep releases a
+    worker's transport the instant it is terminal, so a revived one sent into a driver that
+    was gone: AttributeError, retried 74 times against a budget of 10, on a live run. The
+    reason no place in poll() or the sweep worked is that neither owns what a revival needs
+    -- transport, a turn, a budget, and the run's accounting. Admission owns all four, and
+    admission is reached by being a goal.)
+
+    ADDRESSED STEERS ONLY. A broadcast that arrives after one worker of eight has finished
+    was heard by the other seven; saying it again to the dead one is not a thing anybody
+    wants. Those stay reported rather than resurrected.
+
+    `enqueue(goal_dict)` is how a goal is added mid-run. Without it the terminal branch
+    reports as before, so a caller that cannot enqueue loses nothing it had.
 
     Returns the number of workers that were given the message.
     """
@@ -229,6 +290,8 @@ def deliver_steers(items, workers, log=None):
                     say("[steer] DROPPED for %r: no such worker in this run (have %s)"
                         % (name, ",".join(sorted(by_name))[:120]))
                 elif w.status in TERMINAL:
+                    if _follow_up(w, text, enqueue, say):
+                        continue
                     say("[steer] DROPPED for %s: already %s" % (name, w.status))
                 else:
                     w.steer(text)
@@ -1622,7 +1685,7 @@ def main():
                     pass
             # steering: {"steer": {"worker":"w0","text":"..."}} or a list of such
             if cmd.get("steer") is not None:
-                deliver_steers(cmd["steer"], workers)
+                deliver_steers(cmd["steer"], workers, enqueue=add_box.append)
             # native chat / cockpit queued a new goal into the running fleet
             add = cmd.get("add_goal")
             if add is not None:
