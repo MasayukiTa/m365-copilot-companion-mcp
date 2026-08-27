@@ -2265,9 +2265,18 @@ class CockpitWindow : Window
             string path = Path.Combine(RepoRoot(), ".fleet", "socket_route.jsonl");
             if (!File.Exists(path)) return false;
             string stamp = RunStartedLocal().ToString("yyyy-MM-ddTHH:mm:ss");
+            // THE LAST ROUTE EVENT DECIDES, NOT THE FIRST CLOSE. A closed route can now be
+            // reopened mid-run (relay/route_reopen.py), and this used to answer "closed" if
+            // it found any close at all since the run began -- so a route that came back
+            // after a passing fault stayed amber, and the dot described a state the fleet
+            // had already left. Both events carry the same timestamp key, so the scan just
+            // keeps the newest one it sees.
+            bool closed = false;
             foreach (string line in File.ReadLines(path))
             {
-                if (line.IndexOf("route_closed", StringComparison.Ordinal) < 0) continue;
+                bool isClose = line.IndexOf("route_closed", StringComparison.Ordinal) >= 0;
+                bool isOpen = line.IndexOf("route_reopened", StringComparison.Ordinal) >= 0;
+                if (!isClose && !isOpen) continue;
                 // The record is written by json.dumps, which puts a space after the colon:
                 //   {"ts": 1787270671.84, "at": "2026-08-21T09:04:31", "event": "route_closed"}
                 // Matching without the space finds nothing, and finding nothing here means the
@@ -2279,8 +2288,9 @@ class CockpitWindow : Window
                 int from = i + AtKey.Length;
                 if (from + 19 > line.Length) continue;
                 string at = line.Substring(from, 19);
-                if (string.CompareOrdinal(at, stamp) >= 0) return true;
+                if (string.CompareOrdinal(at, stamp) >= 0) closed = isClose;
             }
+            return closed;
         }
         catch (Exception) { }
         return false;
