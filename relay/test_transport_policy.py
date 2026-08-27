@@ -235,3 +235,46 @@ def test_a_card_is_still_about_the_goal():
     assert classify_fallback("the turn completed but carried no text "
                              "(a card the tab can show?)") == "task"
     assert classify_fallback("添付が必要です") == "task"
+
+
+# ---- the two reasons that were never read ---------------------------------------------------
+#
+# Both classified as `unknown`, which was correct until somebody read them, and between them
+# they were the two commonest fallback reasons on record -- 19 and 11 occurrences. `unknown`
+# is never retried, so every one of them opened a tab instead of reconnecting. On 2026-08-27 a
+# corporate proxy refused the websocket upgrade for about a minute, three of those in a row
+# closed the route permanently, and the remaining forty minutes of an hour-long run ran on
+# tabs at roughly 900 MB of browser instead of 390.
+
+def test_a_proxy_refusing_the_upgrade_is_transport():
+    """It could not open the socket at all. That is transport by construction."""
+    assert classify_fallback(
+        "ChatHubError: could not open the socket: InvalidProxyStatus: "
+        "proxy rejected connection: HTTP 502") == "route"
+
+
+def test_any_failure_to_open_the_socket_is_transport():
+    """The route raises this whenever the connection cannot be established, whatever refused
+    it -- so the class is covered rather than the one proxy that happened to appear first."""
+    assert classify_fallback("ChatHubError: could not open the socket: timed out") == "route"
+
+
+def test_the_backend_declining_a_request_is_transport():
+    """A tab is a different client talking to the SAME backend, so it fixes nothing. Measured:
+    of four such fallbacks on record, three were followed by a worker completing over the
+    socket -- the tab was not what recovered them."""
+    assert classify_fallback(
+        "ChatHubError: the backend declined the request: InternalError") == "route"
+
+
+def test_a_card_still_needs_a_tab():
+    """The extension must not swallow the reasons a tab genuinely fixes."""
+    assert classify_fallback("consent card shown") == "task"
+    assert classify_fallback("the reply carried no text") == "task"
+    assert classify_fallback("添付が必要です") == "task"
+
+
+def test_an_unread_reason_is_still_unknown():
+    """Widening the route list must not turn the classifier into a catch-all: an unread reason
+    has to keep accumulating visibly so it can be read and added deliberately."""
+    assert classify_fallback("something nobody has seen before") == "unknown"

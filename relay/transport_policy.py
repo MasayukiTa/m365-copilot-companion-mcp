@@ -92,6 +92,24 @@ ROUTE_CAUSED = (
     # (reviewing an invoice script) made it slow. Left in the ROUTE list so a classifier is
     # never taught "invoice reviews need tabs" from a clock.
     r"deadline exceeded", r"went silent",
+    # ADDED FROM A REAL RUN, 2026-08-27. Both of these classified as `unknown`, which was
+    # correct until somebody read them, and between them they were the two commonest fallback
+    # reasons on record -- 19 and 11 occurrences. Because `unknown` is never retried, every
+    # one of them opened a tab instead of reconnecting.
+    #
+    # "could not open the socket" is raised by the route itself when the connection cannot be
+    # established at all, so it is transport by construction. The instance that prompted this:
+    # InvalidProxyStatus: proxy rejected connection: HTTP 502 -- an upstream corporate proxy
+    # refusing the websocket upgrade for about a minute. Three of those in a row closed the
+    # route permanently and the remaining forty minutes of an hour-long run went on tabs, at
+    # roughly 900 MB of browser instead of 390.
+    #
+    # "the backend declined the request" is the server refusing a request on an open socket.
+    # Read as route-caused because a tab is a different client talking to the same backend and
+    # fixes nothing -- and measured: of four such fallbacks on record, three were followed by
+    # a worker completing over the SOCKET, so the tab was not what recovered them.
+    r"could not open the socket", r"invalidproxystatus", r"proxy rejected",
+    r"backend declined the request",
 )
 
 #: A fallback reason matching one of THESE is about the goal: the socket could carry the
