@@ -104,9 +104,17 @@ def main(argv=None):
             peak = max(peak, mb)
         if pages:
             page_seen += 1
-        now = tier_counts(newest_log())
-        mins = (time.time() - started) / 60.0
-        new_caps = (now.get("captures") or 0) - (base.get("captures") or 0)
+        # THE BASELINE BELONGS TO A LOG, NOT TO A CLOCK. A new run writes a new file, and
+        # subtracting the old file's count from the new file's gave -1 captures at -1.09 a
+        # minute. A monitor that prints a negative rate is one people learn to skip.
+        current = newest_log()
+        if current != path:
+            path, base = current, {"captures": 0}
+            started = time.time()
+            say("new run: %s" % os.path.basename(current or "-"))
+        now = tier_counts(path)
+        mins = max((time.time() - started) / 60.0, 1e-9)
+        new_caps = max((now.get("captures") or 0) - (base.get("captures") or 0), 0)
         say("rss=%-7s peak=%-7s copilot_pages=%-4s captures=+%-3d (%.2f/min) "
             "tiers 1/2/3 = %s/%s/%s  token_min=%s"
             % (mb, peak, pages, new_caps, new_caps / mins if mins else 0,

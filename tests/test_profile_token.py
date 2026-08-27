@@ -385,3 +385,101 @@ def test_the_spin_is_explained_once_not_every_time(tmp_path, monkeypatch, capsys
                                log=said.append)
     tier1 = [m for m in said if "tier 1" in m]
     assert len(tier1) == 1, "said %d times" % len(tier1)
+"""The refresh margin has to be satisfiable by the tokens the tenant actually issues.
+
+A margin longer than the token makes `needs_refresh` true the instant the capture meant to
+satisfy it finishes, and the route captures again, and again -- 3.8 times a minute on the run
+that exposed it, each holding a page for thirty-five seconds. Capturing faster cannot lengthen
+a token, so the loop buys nothing at all.
+"""
+import os
+
+from relay import profile_token as PT
+
+
+def _observed_tokens_minutes():
+    """The first capture of each recorded run, which is what a token looks like asked fresh.
+
+    ONE PER RUN, because a short token gets re-captured every few seconds by the very spin
+    being measured: counting all 137 captures says 74.5% are under 25 minutes, and counting one
+    per run says 3.8%. The defect inflates the statistic that would justify it.
+    """
+    import glob
+    import re
+
+    firsts = []
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for path in glob.glob(os.path.join(root, ".fleet", "coordinator_*.log")):
+        try:
+            text = open(path, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        found = re.findall(r"captured: ([0-9]+) min", text)
+        if found:
+            firsts.append(int(found[0]))
+    return sorted(firsts)
+
+
+def test_the_margin_still_covers_the_longest_turn_a_worker_can_take():
+    """THE MARGIN WAS LOWERED TO 600 AND PUT BACK, and this is why.
+
+    The tenant issues tokens with a median of 52 minutes and a minimum of 14, so the margin
+    is sometimes unsatisfiable and the route spins. Shrinking it to 600 looked like the fix
+    and was not: a turn may run SOCKET_TURN_TIMEOUT_S (1200 s) and the header is read once,
+    at connect, so a margin of 600 lets a turn start with 601 seconds of token and expire
+    with the answer half-written. relay/test_socket_route.py has asserted against exactly
+    that since a run where it happened, and it caught this change.
+
+    The spin's answer is the memo below, not a shorter margin: it covers the 3.8% of runs
+    where the margin cannot be met without breaking the 96% where it can."""
+    import inspect
+
+    from relay import relay_fleet
+    from relay.socket_route import SocketRoute
+
+    longest = max(relay_fleet.SOCKET_TURN_TIMEOUT_S,
+                  inspect.signature(SocketRoute.driver_for)
+                  .parameters["turn_timeout_s"].default)
+    assert relay_fleet.SOCKET_REFRESH_MARGIN_S > longest
+
+
+def test_the_token_distribution_is_recorded_beside_the_margin():
+    """A margin defended by measurement is only defensible while the measurement is next to
+    it -- including the population note, because counting all 137 captures says 74.5% of
+    tokens are short and counting one per run says 3.8%. The spin inflates the statistic
+    that would justify shrinking the margin."""
+    import inspect
+
+    from relay import relay_fleet
+    src = inspect.getsource(relay_fleet)
+    i = src.index("SOCKET_REFRESH_MARGIN_S = float(")
+    note = src[max(0, i - 2000):i]
+    for fact in ("median of 52 minutes", "3.8%", "74.5%"):
+        assert fact in note, "the note beside the margin does not carry %r" % fact
+
+def test_a_short_token_no_longer_loops_even_if_the_margin_is_unsatisfiable(tmp_path,
+                                                                          monkeypatch):
+    """THE BACKSTOP, WHICH THE MARGIN CHANGE DOES NOT REPLACE. A tenant can shorten token
+    lifetimes tomorrow; the memo means the route is served rather than spun whatever it does."""
+    import json
+    import time
+
+    # THE FILE'S OWN FAKE, not a fresh one. The first version of this test defined a
+    # template with an EMPTY frame, so the reconstructed RequestTemplate had no gpt_id, so
+    # load_template correctly refused it and the whole test measured tier 3 while claiming
+    # to measure tier 1.
+
+    import base64
+    body = base64.urlsafe_b64encode(
+        json.dumps({"aud": PT.AUDIENCE, "exp": int(time.time() + 3600)}).encode()
+    ).decode().rstrip("=")
+    token = "h." + body + ".s"
+
+    PT.forget_memo()
+    PT.save_template(_Template(), "agent-1", str(tmp_path))
+    calls = []
+    monkeypatch.setattr(PT, "token_via_light_page",
+                        lambda ctx, url, **kw: calls.append(1) or token)
+    for _ in range(20):
+        PT.capture_via_profile(object(), "agent-1", directory=str(tmp_path))
+    assert len(calls) == 1, "twenty asks opened %d pages" % len(calls)
