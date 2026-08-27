@@ -163,8 +163,12 @@ def test_the_runner_calls_it_rather_than_reimplementing_it():
     from relay import fleet_runner
     src = executable_source(fleet_runner.deliver_steers)
     assert "TERMINAL" in src
-    text = open(fleet_runner.__file__, encoding="utf-8").read()
-    assert "deliver_steers(cmd[\"steer\"], workers)" in text
+    # THE CALL, not a mention of the name. Read as executable code so a line in a comment
+    # cannot satisfy it -- the sibling test that checked a call by substring matched the
+    # function's own DEFINITION and passed after the call was deleted.
+    from _srcprobe import executable_source_of_file
+    code = executable_source_of_file(fleet_runner.__file__)
+    assert "deliver_steers(" in code and "enqueue=add_box.append" in code
 
 
 def test_the_cockpit_no_longer_claims_success_unconditionally():
