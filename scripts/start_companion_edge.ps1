@@ -303,6 +303,20 @@ $arguments += @(
     "--disable-component-update",
     "--disable-features=Translate,MediaRouter,OptimizationHints",
     "--process-per-site",
+    # THE GPU PROCESS IS THE LARGEST SINGLE ITEM AND NOTHING HERE IS LOOKED AT. Measured
+    # on a throwaway profile, an idle browser costs 226 MB of private working set with
+    # it and 170 without -- 56 MB, a quarter of the whole browser. On the live companion
+    # the same process was holding 50.6 MB against the bridge's 4.3, because GPU memory
+    # is driven by what has been RENDERED and the companion is the one that renders
+    # Copilot pages. It does not give that back when the page closes.
+    #
+    # Rendering still happens; it falls to software. Nobody watches this browser, and the
+    # capture needs the composer to exist, not to be fast -- but "the composer still
+    # renders" is a claim about a real page, so it is verified rather than assumed.
+    #
+    # NOT the spare renderer, which measured 2.8 MB. Turning it off would trade a
+    # measurable latency for a rounding error.
+    "--disable-gpu",
     $Url
 )
 

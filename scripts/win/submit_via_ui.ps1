@@ -5,16 +5,23 @@
 # those two has bitten here: the back end was correct while the surface was full of errors, and
 # "the tests pass" was true of a path nobody uses.
 #
-# ONE GOAL PER CALL, DELIBERATELY. The cockpit splits its input on newlines, so a multi-line
-# paste becomes several goals. That happened: five goals appeared where one was meant, and the
-# run had to be stopped and resubmitted. If several goals are wanted, call this several times.
+# ONE LINE PER GOAL, WHICH IS THE COCKPIT'S OWN RULE. It splits its input on newlines, and its
+# footer says so. That once turned one intended goal into five, because the goal had newlines
+# in it; the same rule is how several goals are started together, which is the only way to
+# start several -- see below.
+#
+# CTRL+ENTER STEERS WHILE A RUN IS ACTIVE (FleetCockpit.cs:3488), it does not add a goal. So a
+# second submission during a run does not do what it looks like it does, and this refuses
+# rather than quietly steering something the caller did not mean to touch.
 #
 #   powershell -NoProfile -File scripts/win/submit_via_ui.ps1 -Goal "..." [-Command "/fanout on"]
 #   powershell -NoProfile -File scripts/win/submit_via_ui.ps1 -ReadOnly
 
 [CmdletBinding()]
 param(
-    [string]$Goal = "",
+    [string[]]$Goal = @(),
+    [string]$GoalFile = "",
+    [switch]$Steer,
     [string]$Command = "",
     [switch]$ReadOnly,
     [int]$TimeoutSeconds = 30
@@ -81,6 +88,32 @@ for ($i = 0; $i -lt $edits.Count; $i++) {
         ($val -replace "`r?`n", " ").Substring(0, [Math]::Min(60, $val.Length)))
 }
 
+# ONE GOAL PER LINE OF A FILE, WHICH IS THE ONLY RELIABLE WAY TO PASS SEVERAL.
+#
+# `powershell -File script.ps1 -Goal "a","b"` does NOT build an array: -File passes
+# arguments as literal strings without evaluating them, so that arrives as the single
+# string "a,b". It did: four questions went in as one goal of 289 characters joined by
+# commas, the script reported success, the cockpit accepted it and the fleet fanned the
+# nonsense out into six subtasks. Nothing detected it, because everything worked.
+if ($GoalFile) {
+    if (-not (Test-Path $GoalFile)) { throw "no such goal file: $GoalFile" }
+    $Goal = @(Get-Content -LiteralPath $GoalFile -Encoding UTF8 |
+              Where-Object { $_.Trim().Length -gt 0 -and -not $_.TrimStart().StartsWith("#") })
+}
+
+# SAY WHAT IS ABOUT TO GO IN, PER GOAL. A count and a prefix each is enough to see a
+# mangled argument before it becomes a run: one goal where four were meant is obvious on
+# this line and invisible everywhere else.
+if ($Goal.Count -gt 0) {
+    Write-Output ("about to submit {0} goal(s):" -f $Goal.Count)
+    for ($i = 0; $i -lt $Goal.Count; $i++) {
+        $g = $Goal[$i]
+        Write-Output ("  [{0}] {1} chars: {2}" -f $i, $g.Length,
+                      $g.Substring(0, [Math]::Min(56, $g.Length)))
+    }
+}
+
+# READONLY IS A DRY RUN, not just a field dump: it prints exactly what would go in.
 if ($ReadOnly) { exit 0 }
 
 # WHICH BOX IS THE GOAL BOX. The cockpit gives neither field a name or an automation id, so
@@ -134,8 +167,30 @@ function Submit([string]$text) {
     Write-Output ("submitted: {0}" -f ($text.Substring(0, [Math]::Min(70, $text.Length))))
 }
 
+# IS A RUN ALREADY GOING? The cockpit does not say so through automation, so ask the record
+# the fleet keeps. Getting this wrong steers a running goal with the text of a new one.
+$running = $false
+try {
+    $statusPath = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) ".fleet/status.json"
+    if (Test-Path $statusPath) {
+        $st = Get-Content $statusPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $running = [bool]$st.running
+    }
+} catch { }
+Write-Output ("run in flight: {0}" -f $running)
+
 if ($Command) { Submit $Command }
-if ($Goal) {
-    if ($Goal -match "`n") { throw "the cockpit splits on newlines; submit one goal per call" }
-    Submit $Goal
+
+if ($Goal.Count -gt 0) {
+    if ($running -and -not $Steer) {
+        throw ("a run is in flight, and Ctrl+Enter steers rather than starts while one is. " +
+               "Wait for it, or pass -Steer if steering is what was meant.")
+    }
+    if ($Steer -and $Goal.Count -gt 1) { throw "steer one message at a time" }
+    foreach ($g in $Goal) {
+        if ($g -match "`n") { throw "a goal may not contain a newline; the cockpit splits on them" }
+    }
+    # SEVERAL GOALS GO IN TOGETHER, one per line, and start as one fleet. Submitting them one
+    # at a time cannot work: the first starts a run, and every later one steers it.
+    Submit ($Goal -join "`n")
 }
