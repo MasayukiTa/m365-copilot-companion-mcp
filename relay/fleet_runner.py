@@ -144,6 +144,113 @@ STATUS_PILL = {
     "unresolved_refusal": ("未解決拒否", "bad"),
 }
 
+def report_unused_steers(workers, reported=None, log=None):
+    """Name every steering message a worker took to its grave.
+
+    A STEER TAKES EFFECT ON THE NEXT TURN, and a worker that finishes on the turn it was
+    sent never has one. Measured: a message was delivered to w2 while it was refuting, w2
+    completed at turn 1, and the message was simply never used -- correctly queued,
+    correctly reported as queued, and silently discarded when the worker went terminal.
+
+    That silence is the defect, not the timing. 'Interrupt' promises mid-turn and cannot
+    deliver it: a turn in flight is a request the model is already answering, and there is
+    nowhere to insert anything until it replies. What can be delivered is the truth about
+    what happened to the message.
+
+    `reported` is a set the caller keeps, so each worker is named once rather than on every
+    sweep -- a line per sweep at one-second polling is a log nobody reads, which is how the
+    original delivery bug survived.
+    """
+    say = log or (lambda m: print(m, flush=True))
+    seen = reported if reported is not None else set()
+    named = 0
+    for w in workers or []:
+        try:
+            pending = list(getattr(w, "steer_msgs", None) or [])
+            # NOT FROM done, WHICH IS STILL DEFERRABLE. The first version reported a
+            # message as never used the moment its worker went DONE, in the window before
+            # the sweep revived it -- announcing a loss that had not happened. Only a
+            # worker the deferral will not touch has genuinely lost the message.
+            if (not pending or w.status not in TERMINAL or w.name in seen
+                    or w.status == "done"):
+                continue
+            seen.add(w.name)
+            named += 1
+            say("[steer] NEVER USED by %s: it finished (%s) before another turn began. "
+                "%d message(s), first: %s"
+                % (w.name, w.status, len(pending), str(pending[0])[:80]))
+        except Exception:
+            continue
+    return named
+
+def deliver_steers(items, workers, log=None):
+    """Hand each steering message to the worker(s) it is for, and NAME EVERY REJECTION.
+
+    AN EMPTY WORKER NAME MEANS EVERY LIVE WORKER, and it did not. The cockpit picks the
+    first non-terminal worker it knows about and, finding none, sends "" -- its own comment
+    says "relay broadcasts to all workers". Nothing broadcast: `by_name.get("")` is None,
+    so the steer was dropped, and the cockpit said "queued for the next turn" regardless.
+    Measured on a thirteen-worker run: the command file was consumed and not one of sixteen
+    transcripts carried the message.
+
+    A STEER THAT GOES NOWHERE IS WORSE THAN AN ERROR, because the person believes they
+    redirected the work and then watches it continue in the old direction. Every path here
+    either delivers or says why it did not.
+
+    IT TAKES EFFECT ON THE WORKER'S NEXT TURN, not mid-turn. A turn already in flight is a
+    request the model is answering; there is nowhere to insert anything until it replies.
+    That is worth saying out loud, because 'interrupt' suggests otherwise.
+
+    Returns the number of workers that were given the message.
+    """
+    say = log or (lambda m: print(m, flush=True))
+    by_name = {w.name: w for w in workers}
+    delivered = 0
+    for it in (items if isinstance(items, list) else [items]):
+        try:
+            # A DICT OR A STRING, AND NOTHING ELSE. str(None) is "None", which is not
+            # empty, so a malformed entry became a real message BROADCAST to every live
+            # worker -- caught by the test for "one bad item does not stop the others",
+            # which found it doing rather more than not stopping them.
+            if isinstance(it, dict):
+                name = (it.get("worker") or "").strip()
+                text = it.get("text") or ""
+            elif isinstance(it, str):
+                name, text = "", it
+            else:
+                say("[steer] DROPPED: not a message (%s)" % type(it).__name__)
+                continue
+            if not text.strip():
+                say("[steer] refused: empty text")
+                continue
+            if name:
+                w = by_name.get(name)
+                if w is None:
+                    say("[steer] DROPPED for %r: no such worker in this run (have %s)"
+                        % (name, ",".join(sorted(by_name))[:120]))
+                elif w.status in TERMINAL:
+                    say("[steer] DROPPED for %s: already %s" % (name, w.status))
+                else:
+                    w.steer(text)
+                    delivered += 1
+                    say("[steer] queued for %s (%s) -- takes effect on its next turn"
+                        % (name, w.status))
+                continue
+            live = [w for w in workers
+                    if w.status not in TERMINAL and w.status != "pending"]
+            if not live:
+                say("[steer] DROPPED: no live worker to steer (%d workers, all terminal "
+                    "or pending)" % len(workers))
+                continue
+            for w in live:
+                w.steer(text)
+            delivered += len(live)
+            say("[steer] queued for all %d live workers (%s) -- takes effect on each "
+                "one's next turn" % (len(live), ",".join(w.name for w in live)[:120]))
+        except Exception as exc:
+            say("[steer] DROPPED: %s: %s" % (type(exc).__name__, str(exc)[:120]))
+    return delivered
+
 def report_status(o):
     """The reported status for an outcome, from the closed set in relay/outcomes.py.
 
@@ -1514,16 +1621,8 @@ def main():
                 except Exception:
                     pass
             # steering: {"steer": {"worker":"w0","text":"..."}} or a list of such
-            steer = cmd.get("steer")
-            if steer is not None:
-                items = steer if isinstance(steer, list) else [steer]
-                for it in items:
-                    try:
-                        w = by_name.get(it.get("worker"))
-                        if w is not None and w.status not in TERMINAL:
-                            w.steer(it.get("text", ""))
-                    except Exception:
-                        pass
+            if cmd.get("steer") is not None:
+                deliver_steers(cmd["steer"], workers)
             # native chat / cockpit queued a new goal into the running fleet
             add = cmd.get("add_goal")
             if add is not None:
@@ -1587,8 +1686,11 @@ def main():
         except Exception:
             pass
 
+    _steer_reported = set()
+
     def on_tick(workers):
         _drain_commands(workers)
+        report_unused_steers(workers, _steer_reported)
         _register_convs(workers)
         # RUN-RESUME: refresh the completion map so a crash after this sweep can resume
         # only the still-unfinished goals. Cheap (in-memory scan + one atomic write).

@@ -3900,8 +3900,22 @@ class CockpitWindow : Window
 
         RequestSteer(targetWorker, steerText);
         if (_goalInput != null) _goalInput.Text = "";
+        // SAY WHICH WORKER, AND SAY IT TAKES A TURN. This used to read "queued for the
+        // next turn" whatever happened -- including when no live worker was found and an
+        // EMPTY name went out, which the relay then dropped because nothing there
+        // broadcast. The person believed they had redirected the work and watched it
+        // continue in the old direction. The relay broadcasts now, and the note says
+        // which case this was so a surprise is visible rather than inferred.
         if (_startNote != null)
-            _startNote.Text = _lang == 0 ? "次のターンに送信しました" : "Queued for the next turn";
+        {
+            bool ja = _lang == 0;
+            if (!string.IsNullOrEmpty(targetWorker))
+                _startNote.Text = ja ? (targetWorker + " の次のターンに送ります")
+                                     : ("Queued for " + targetWorker + "'s next turn");
+            else
+                _startNote.Text = ja ? "実行中の全ワーカーの次のターンに送ります"
+                                     : "Queued for every live worker's next turn";
+        }
     }
 
     // A2-2: Paint the composer into either "idle/add-goals" or "active-run/steer" mode.
