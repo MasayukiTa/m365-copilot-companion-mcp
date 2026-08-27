@@ -242,6 +242,9 @@ jobs:
             relay/test_fanout.py \
             tests/test_ownership.py \
             tests/test_watchdog_arming.py \
+            tests/test_outcome_enum_closed.py \
+            tests/test_control_markers.py \
+            tests/test_integration_evidence.py \
             tests/test_launch_gate.py \
             relay/test_fanout_worker.py \
             tests/test_stack_guard.py \

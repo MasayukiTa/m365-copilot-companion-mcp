@@ -4309,14 +4309,11 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # own network/tunnel/tool path looked unhealthy (see the INFRA_STUCK branches in _decide),
         # NOT that the goal/agent is broken -- that's transient infra, re-queueable by design, so a
         # fresh Edge context still gets another shot at it.
-        FINISHED_OUTCOMES = (
-            "DONE", "CANCELLED", "STUCK", "CONTENT_REFUSED", "UNRESOLVED_REFUSAL",
-            # A goal that SPLIT is finished as a goal: its work now belongs to the children
-            # it spawned and to the merge that follows them. Resuming it would put the same
-            # question to the agent again and produce a second family doing identical work,
-            # while the first family's answers were still being collected.
-            "FANOUT",
-        )
+        # THE SAME SET, NOW NAMED ONCE, in relay/outcomes.py. It was a literal tuple
+        # here and a separate chain of `if` in fleet_runner's _ostatus, and FANOUT had to
+        # be added to each of them on its own -- after each had misreported a healthy
+        # fan-out in its own way.
+        from relay.outcomes import FINISHED as FINISHED_OUTCOMES
         return [freeze_goal_dict(getattr(w, "goal_record", None) or
                                  {"text": w.goal, "checks": w.checks, "cwd": w.cwd})
                 for w in workers if w.outcome not in FINISHED_OUTCOMES]

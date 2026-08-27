@@ -36,6 +36,8 @@ import argparse
 import json
 import os
 import sys
+
+from relay import outcomes as _outcomes
 import time
 
 # allow running both as `python -m relay.fleet_runner` and `python relay/fleet_runner.py`
@@ -142,6 +144,29 @@ STATUS_PILL = {
     "unresolved_refusal": ("未解決拒否", "bad"),
 }
 
+def report_status(o):
+    """The reported status for an outcome, from the closed set in relay/outcomes.py.
+
+    THIS USED TO BE A CHAIN OF `if` ENDING IN `return "error"`, and that last line
+    misreported healthy work twice -- INFRA_STUCK and REFUSED, which this same file
+    already listed as retryable a thousand lines above, and FANOUT, so a run whose nine
+    subtasks all completed and merged reported 0 done of 1. A catch-all cannot tell "a
+    value that means failure" from "a value nobody has added yet", so every new outcome
+    was born an error, silently.
+
+    The set is closed now and an exhaustiveness test walks the AST for every literal
+    assigned to `.outcome`, so an unlisted value fails CI on the commit that introduces
+    it. If one reaches here anyway it is ANNOUNCED rather than flattened quietly: the run
+    keeps its report -- eighty goals' results live only in this process -- but nobody has
+    to read a total to discover the gap.
+    """
+    try:
+        return _outcomes.status_of(o)
+    except _outcomes.UnknownOutcome:
+        print("!! UNKNOWN OUTCOME %r -- relay/outcomes.py does not list it; reporting as "
+              "error. Add it there with the status it should mean." % (o,), flush=True)
+        return "error"
+
 DEFAULT_MAX_CONCURRENT = 3
 
 #: The autoscale ceiling used when the operator has never set one. MUST MATCH the cockpit's
@@ -184,13 +209,16 @@ def _settings_int(key, default):
 #: couldn't respond to that". The failure moved to a different goal every run, was unaffected
 #: by concurrency (25% at one worker, 25% at two), and the two goals that failed one run both
 #: passed when re-queued unchanged. That is transient, and a bounded retry is what it needs.
-RETRYABLE_OUTCOMES = frozenset({"STUCK", "INFRA_STUCK", "REFUSED"})
+RETRYABLE_OUTCOMES = _outcomes.RETRYABLE
 
 #: NOT retried, and the distinction is the point. MAXTURNS means the worker ran its whole turn
 #: budget and still had not finished: running it again spends the same budget on the same task
 #: and ends the same way. CANCELLED was a human saying stop. Re-queueing either is not recovery,
 #: it is repetition.
-NON_RETRYABLE_OUTCOMES = frozenset({"DONE", "MAXTURNS", "CANCELLED"})
+#: Now the exact complement, checked at import. It used to name three outcomes out of
+#: eleven, so the other five were non-retryable only by omission -- which is the same
+#: answer as "nobody considered them".
+NON_RETRYABLE_OUTCOMES = _outcomes.NON_RETRYABLE
 
 
 def settings_autoretry():
@@ -1844,24 +1872,6 @@ def main():
 
     # final snapshot + summary -- reflect the REAL outcome of each goal, not a blanket
     # "done" (which made failed/stuck goals show as green 完了).
-    def _ostatus(o):
-        if o == "DONE": return "done"
-        if o == "CONTENT_REFUSED": return "content_refused"
-        if o == "UNRESOLVED_REFUSAL": return "unresolved_refusal"
-        if o == "CANCELLED": return "cancelled"
-        if o == "MAXTURNS": return "maxturns"
-        # INFRA_STUCK and REFUSED are in RETRYABLE_OUTCOMES above -- this very file already
-        # knows they are "no answer yet", not "the task was wrong". They were still falling
-        # through to "error" here, so the same file distinguished them for the retry and
-        # flattened them for the reader. INFRA_STUCK exists precisely so a connection that
-        # never established is not scored as a failed task; reporting it as an error is the
-        # misreport it was created to prevent.
-        if o in ("STUCK", "VERIFY_FAILED", "INFRA_STUCK", "REFUSED"): return "stuck"
-        # A goal that SPLIT did its job and handed the work to its children. Everything not
-        # named here falls through to "error", so the parent of a perfectly healthy fan-out
-        # was reported as a failure -- on a run whose nine subtasks all completed.
-        if o == "FANOUT": return "done"
-        return "error"
 
     def _final_worker_entry(r, max_turns):
         # FIX 2 (P0): recover the cleaned final assistant text and write it to BOTH
@@ -1871,7 +1881,7 @@ def main():
         cleaned = _clean_final_text(raw_last)
         return {
             "name": r["name"], "goal": r["goal"],
-            "status": _ostatus(r["outcome"]),
+            "status": report_status(r["outcome"]),
             "outcome": r["outcome"], "turn": r["turns"],
             "max_turns": max_turns, "reason": r["reason"],
             "verified": r.get("verified"),
@@ -1905,10 +1915,10 @@ def main():
 
     elapsed = round(time.time() - started, 1)
     # ONE DEFINITION OF DONE. This counted outcome == "DONE" directly while the rest of
-    # the file asked _ostatus, so a fan-out that split, ran nine subtasks, merged them
+    # the file asked report_status, so a fan-out that split, ran nine subtasks, merged them
     # and wrote its answer to disk was reported as 0 done of 1: FANOUT is not the string
     # "DONE", and the second definition had never heard of it.
-    done_count = sum(1 for r in results if _ostatus(r["outcome"]) == "done")
+    done_count = sum(1 for r in results if report_status(r["outcome"]) == "done")
     # And the total is the work that RAN, which is what status.json said all through the
     # run (len(workers)). Reporting len(goals) at the end shrank a seventeen-worker
     # campaign back to the one goal it started as, at the moment somebody reads it.

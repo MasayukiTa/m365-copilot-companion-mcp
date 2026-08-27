@@ -924,22 +924,35 @@ def _is_processing(text: str) -> bool:
 # streams the reply token-by-token; if a chunk lands and the next is >dwell_s away -- a tool
 # call, a model "thinking" gap, a network stall -- the partial text looks deceptively stable
 # and gets captured mid-word with no marker, e.g. transcript turn5 "...隠し", 102 chars).
-_END_MARKERS = ("DONE", "CONTINUE", "STUCK", "FAIL", "RESEARCH", "ANALYZE", "PLAN_READY")
+from relay.control_markers import (
+    KINDS as _END_MARKERS,
+    has_marker as _has_marker,
+    parse as parse_control_marker,
+    split as split_control_marker,
+)
 
 
 def has_end_marker(text: str) -> bool:
-    """True iff the LAST non-empty line of `text` carries a protocol end-of-turn marker
-    (DONE / CONTINUE / STUCK / FAIL / RESEARCH / ANALYZE / PLAN_READY), in EN or with the
-    JP full-width colon. Used by completion detection to distinguish a genuinely finished
-    turn from a partial capture of a still-streaming reply (a stable-but-marker-less tail is
-    treated as 'maybe still generating' and given extra settle time)."""
-    if not text:
-        return False
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-    if not lines:
-        return False
-    last = lines[-1].upper().replace("：", ":")
-    return any(m in last for m in _END_MARKERS)
+    """True iff the LAST non-empty line of `text` IS a protocol end-of-turn marker.
+
+    IS, not CONTAINS. This was `"DONE" in last.upper()` -- a substring test, which read
+    "Error: Error executing tool: Failed to get AI insights" as a FAIL marker because FAIL
+    sits inside "Failed". Measured across the 1,015 stored assistant replies, anchoring the
+    grammar changes the answer for exactly that one reply and no other: 813 markers, of which
+    591 are bare, 214 carry an argument, and the pattern that made anchoring look risky --
+    prose ending in a marker, such as a sentence closing with DONE -- occurs zero times.
+
+    The grammar also models what the old tuple did not: FAIL takes an argument in practice,
+    and the separator is a colon, a full-width colon or an em dash depending on the keyboard.
+    Seven of the eight replies the old code could only see as "prose that contains FAIL" were
+    argument-bearing FAIL markers.
+
+    Used by completion detection to tell a genuinely finished turn from a partial capture of
+    a still-streaming reply: Copilot streams token by token, and a chunk that lands with the
+    next one more than dwell_s away looks deceptively stable, so a stable-but-markerless tail
+    is given extra settle time.
+    """
+    return _has_marker(text)
 
 
 # ── settle-detection tuning (env-overridable) ───────────────────────────────────────
