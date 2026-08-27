@@ -241,6 +241,7 @@ jobs:
             relay/test_socket_route.py \
             relay/test_fanout.py \
             tests/test_ownership.py \
+            tests/test_watchdog_arming.py \
             tests/test_launch_gate.py \
             relay/test_fanout_worker.py \
             tests/test_stack_guard.py \

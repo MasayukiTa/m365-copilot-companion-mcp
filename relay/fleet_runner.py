@@ -1656,6 +1656,20 @@ def main():
     # raises FleetContextLost and we reconnect + resume below.
     import threading
     stop_wd = threading.Event()
+    # ARMED EXACTLY WHILE THE SWEEP IS RUNNING. The watchdog used to decide whether a run was
+    # live by reading `running` out of the status file THIS PROCESS had just written -- a
+    # progress figure, not a liveness one. A fan-out parent going terminal at turn 1 made it
+    # false for the hour its children took, and the wedge detector switched itself off at the
+    # moment the run began its real work; a capture then blocked the main loop for ten minutes
+    # and nothing noticed. `running` is fixed, but the shape of the mistake remains: a
+    # narrower window still exists between the last child finishing and the merge being
+    # queued.
+    #
+    # The sweep loop's own execution is the fact being asked about, and it is available
+    # in-process. Not `stop_wd` alone: that is cleared only after the final cleanup, and a
+    # cleanup slower than stall_s would be hard-reset by the very watchdog that is supposed
+    # to be finished with it.
+    sweep_active = threading.Event()
 
     def _watchdog():
         last_seen, last_change = None, time.time()
@@ -1663,9 +1677,11 @@ def main():
             stop_wd.wait(5)
             if stop_wd.is_set() or args.stall_s <= 0:
                 continue
+            if not sweep_active.is_set():
+                last_change = time.time(); continue
             try:
                 d = json.load(open(status_path, encoding="utf-8"))
-                if not d.get("running") or d.get("idle"):
+                if d.get("idle"):
                     last_change = time.time(); continue
                 u = d.get("updated")
                 if u != last_seen:
@@ -1756,6 +1772,7 @@ def main():
                 if _blockers:
                     print("[gate] --force: starting despite %d unmet precondition(s); "
                           "this run's measurements carry them." % len(_blockers), flush=True)
+                sweep_active.set()
                 res = run_relay_fleet(context, pending, args.agent_url,
                                       max_turns=args.max_turns, poll_s=args.poll_s,
                                       notify=default_notify, on_tick=on_tick,
@@ -1783,10 +1800,16 @@ def main():
                                        resilience_profile=args.resilience_profile,
                                        max_fresh_replays=max(0, args.max_fresh_replays),
                                        fanout=args.fanout)
+                # DISARM AS SOON AS THE SWEEP RETURNS. What follows -- result mapping, memory
+                # recording, notifications, tab teardown -- can outlast stall_s, and a
+                # watchdog still armed would hard-reset the browser out from under the very
+                # cleanup that is finishing the run.
+                sweep_active.clear()
             for r in res:
                 results_by_goal[r["goal"]] = r
             pending = []                                   # finished cleanly
         except FleetContextLost as e:
+            sweep_active.clear()
             attempt += 1
             pending = e.unfinished
             print("\n[recover] Edge context lost; resuming %d goal(s) (attempt %d/%d)"
