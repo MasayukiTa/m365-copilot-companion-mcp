@@ -54,3 +54,71 @@ def test_the_cleanup_can_never_break_the_run():
 def test_it_says_what_it_closed():
     """Reclaiming something a person may be watching in Task Manager has to be explainable."""
     assert "closed %d idle Copilot page(s)" in _cleanup_src()
+
+
+# ---- and start clean too -------------------------------------------------------------------
+
+def _runner_src():
+    src = open(os.path.join(ROOT, "relay", "fleet_runner.py"), encoding="utf-8").read()
+    i = src.index("def _close_idle_copilot_pages")
+    return src[i:i + 1400]
+
+
+class _Page:
+    def __init__(self, url):
+        self.url = url
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+    def goto(self, url, timeout=None):
+        self.url = url
+
+
+class _Ctx:
+    def __init__(self, urls):
+        self.pages = [_Page(u) for u in urls]
+
+    def new_page(self):
+        p = _Page("about:blank")
+        self.pages.append(p)
+        return p
+
+
+def _closer():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "fleet_runner_close", os.path.join(ROOT, "relay", "fleet_runner.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod._close_idle_copilot_pages
+
+
+def test_a_page_left_by_an_earlier_run_is_closed_before_this_one_starts():
+    """The end-of-run cleanup stops a run LEAVING one. It does nothing about one already
+    there -- and that gap cost a measurement: a page sat open for nine and a half hours,
+    runs were launched on top of it, and every memory figure in that window carried it.
+    Stratified afterwards: 341 MB median without a Copilot page, 697 MB with one."""
+    ctx = _Ctx(["https://m365.cloud.microsoft/chat", "about:blank"])
+    assert _closer()(ctx) == 1
+    assert ctx.pages[0].closed is True
+    assert ctx.pages[1].closed is False, "the blank keep-alive must survive"
+
+
+def test_a_clean_browser_is_left_alone():
+    ctx = _Ctx(["about:blank"])
+    assert _closer()(ctx) == 0
+    assert ctx.pages[0].closed is False
+
+
+def test_the_browser_is_never_left_with_no_pages():
+    """Edge exits with its final page, and that would end the next run's SSO."""
+    ctx = _Ctx(["https://m365.cloud.microsoft/chat"])
+    assert _closer()(ctx) == 1
+    assert any(p.url == "about:blank" and not p.closed for p in ctx.pages)
+
+
+def test_a_launch_reports_what_it_reclaimed():
+    src = open(os.path.join(ROOT, "relay", "fleet_runner.py"), encoding="utf-8").read()
+    assert "closed %d Copilot page(s) left by an earlier run" in src

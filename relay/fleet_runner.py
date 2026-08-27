@@ -557,6 +557,35 @@ def _clean_final_text(text, max_len=600):
     return t[:max_len]
 
 
+def _close_idle_copilot_pages(context) -> int:
+    """Close Copilot pages nobody owns yet, and say how many. Never raises.
+
+    Shares its reasoning with the end-of-run cleanup in relay_fleet: a blank page is opened
+    first when the stale ones are all that is left, because Edge exits with its final page and
+    taking the browser down would end the next run's SSO with it. If that replacement cannot
+    be made, nothing is closed -- an untidy browser is better than no browser.
+    """
+    try:
+        stale = [p for p in context.pages if "m365.cloud.microsoft" in (p.url or "")]
+        if not stale:
+            return 0
+        if len(stale) >= len(context.pages):
+            try:
+                context.new_page().goto("about:blank", timeout=10000)
+            except Exception:
+                return 0
+        closed = 0
+        for p in stale:
+            try:
+                p.close()
+                closed += 1
+            except Exception:
+                pass
+        return closed
+    except Exception:
+        return 0
+
+
 def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False,
               ram_floor_mb=0.0, directive="", run_label="", goal_count=0, queued=0):
     from relay.relay_fleet import free_disk_gb
@@ -1613,6 +1642,21 @@ def main():
             with sync_playwright() as p:
                 browser = p.chromium.connect_over_cdp(args.cdp_url, timeout=20000)
                 context = browser.contexts[0] if browser.contexts else browser.new_context()
+                # START CLEAN, NOT JUST FINISH CLEAN. run_relay_fleet closes any Copilot page
+                # left over when it ENDS, which stops a run leaving one behind -- and does
+                # nothing about one that is already there when it begins.
+                #
+                # That gap cost a measurement. A page left by an earlier run sat open for nine
+                # and a half hours; runs were launched on top of it; and every memory figure
+                # taken in that window carried it. Stratified afterwards: 341 MB median with
+                # no Copilot page open, 697 MB with one. 61.6% of nearly five thousand samples
+                # had one. A monitor caught it and was not read before launching -- so the
+                # check belongs where a launch happens, not in whoever remembers to look.
+                _closed = _close_idle_copilot_pages(context)
+                if _closed:
+                    print("       start: closed %d Copilot page(s) left by an earlier run "
+                          "(they cost ~350 MB each and would have sat in this run's "
+                          "measurements)" % _closed, flush=True)
                 res = run_relay_fleet(context, pending, args.agent_url,
                                       max_turns=args.max_turns, poll_s=args.poll_s,
                                       notify=default_notify, on_tick=on_tick,
