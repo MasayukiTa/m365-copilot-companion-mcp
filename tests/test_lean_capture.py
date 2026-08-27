@@ -256,3 +256,16 @@ def test_the_interception_is_not_driven_through_the_sync_playwright_api_from_a_c
     code = executable_source(L)
     assert "Fetch.enable" not in code and "Fetch.requestPaused" not in code
     assert "new_cdp_session" not in code
+
+
+def test_the_measured_verdict_is_written_down_beside_the_code():
+    """The trial said no: four paired captures gave 614.8 MB median rise for an ordinary
+    capture and 610.7 for a lean one, ranges overlapping. A result that lives only in a
+    terminal is one the next person re-derives, or worse, assumes went the other way."""
+    from _srcprobe import executable_source          # noqa: F401  (import guard only)
+    import inspect
+
+    doc = inspect.getdoc(L) or ""
+    assert "NOT ADOPTED" in doc
+    assert "614.8" in doc and "610.7" in doc, "the numbers behind the verdict are missing"
+    assert "0 blocked of each" in doc, "what would change the answer is not recorded"
