@@ -57,6 +57,12 @@ class _Answers:
         return self._n
 
 
+#: When a forced-failure WINDOW ends. None until the first forced turn opens it. Module
+#: state, not environment state: os.environ is inherited by children, and a window is one
+#: process's outage, not the machine's.
+_FORCED_UNTIL = None
+
+
 class CopilotSocketDriver:
     """Drives one Copilot conversation over a WebSocket. No tab, no DOM, no renderer."""
 
@@ -186,11 +192,46 @@ class CopilotSocketDriver:
             # verification can watch the recovery as well as the failure.
             _forced = os.environ.get("MCP_SOCKET_FORCE_FAIL", "").strip()
             if _forced:
-                left = int(_forced)
-                if left > 0:
-                    os.environ["MCP_SOCKET_FORCE_FAIL"] = str(left - 1)
-                    raise ChatHubError(
-                        "forced failure (MCP_SOCKET_FORCE_FAIL), %d left" % (left - 1))
+                # COUNT, OPTIONALLY FOLLOWED BY THE REASON TO FAIL WITH.
+                #
+                # The reason is not decoration: transport_policy classifies it, and the
+                # classification decides whether the fault is coalesced into one incident
+                # or votes separately against the breaker. So a forced failure carrying
+                # only the words "forced failure" exercises the `unknown` path and cannot
+                # test the transport path at all -- which is where the route actually
+                # closed, on 2026-08-27 at 12:03, over an upstream proxy's HTTP 502.
+                #
+                # Split on the FIRST colon only: the reasons worth reproducing are full of
+                # them ("could not open the socket: InvalidProxyStatus: proxy rejected
+                # connection: HTTP 502").
+                #
+                # A COUNT ("3") OR A WINDOW ("45s"), AND THE WINDOW IS USUALLY THE HONEST
+                # ONE. A count cannot reliably close the route, because closing takes three
+                # CONSECUTIVE fallbacks and eight workers turn in parallel: a success from
+                # any of them resets the counter between forced faults. Measured 2026-08-28
+                # -- three forced faults across eight workers produced one fallback, then a
+                # success, then nothing. The count was spent; the route never closed.
+                #
+                # A window fails EVERY attempt while it is open, which is what an upstream
+                # proxy refusing upgrades actually does, and what it did on 2026-08-27 for
+                # about a minute. No success can interleave, so the close is deterministic --
+                # and when the window ends the transport is genuinely healthy again, which
+                # is the state a reopen has to be tested against.
+                _n, _, _why = _forced.partition(":")
+                _why = _why.strip() or "forced failure (MCP_SOCKET_FORCE_FAIL)"
+                if _n.endswith("s"):
+                    global _FORCED_UNTIL
+                    if _FORCED_UNTIL is None:
+                        _FORCED_UNTIL = time.time() + float(_n[:-1])
+                        print("[socket_driver] forcing every socket turn to fail for %ss"
+                              % _n[:-1], flush=True)
+                    if time.time() < _FORCED_UNTIL:
+                        raise ChatHubError(_why)
+                else:
+                    left = int(_n)
+                    if left > 0:
+                        os.environ["MCP_SOCKET_FORCE_FAIL"] = "%d:%s" % (left - 1, _why)
+                        raise ChatHubError(_why)
             answer = self.conv.ask(text, connect=self._connect, on_text=on_text,
                                    on_progress=on_progress,
                                    catalogue=self._catalogue, protocol=self._protocol,

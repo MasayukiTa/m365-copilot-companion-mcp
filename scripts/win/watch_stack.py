@@ -406,6 +406,17 @@ def summarize(log_path: str) -> int:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--interval", type=float, default=20.0, help="seconds between samples")
+    # A MEASUREMENT ENDS. Three sampling runs started on 2026-08-25 and 2026-08-26 for
+    # one-off comparisons were still sampling two and a half days later, each appending to
+    # its own CSV, because the loop below had no exit but Ctrl-C and nobody was at the
+    # keyboard. Eight processes, three files still growing, and the question they were
+    # launched to answer had been answered on the day.
+    #
+    # Two hours is longer than any comparison run here has needed and short enough that a
+    # forgotten one is gone by morning. --minutes 0 is unbounded, for somebody who means it.
+    ap.add_argument("--minutes", type=float, default=120.0,
+                    help="stop after this long (0 = run until stopped). A --guard is "
+                         "unbounded by default: it is meant to stand.")
     ap.add_argument("--once", action="store_true", help="one sample as JSON, then exit")
     ap.add_argument("--csv", help="also append a flat row per sample to this file")
     ap.add_argument("--guard", metavar="LOG",
@@ -428,6 +439,8 @@ def main(argv=None) -> int:
         return 0
 
     if args.guard:
+        # A GUARD IS MEANT TO STAND, so it is not bounded unless somebody asks. The bound
+        # exists for the sampling mode, which is launched to answer one question.
         return guard(args.guard, args.interval, since)
 
     started = time.time()
@@ -439,9 +452,11 @@ def main(argv=None) -> int:
         if new:
             csv.write("time,free_mb,mcp_mb,companion_mb,companion_pages,runs,"
                       "reconnect,fallback,closed,done_on_tab\n")
-    print("watching every %.0fs -- Ctrl-C to stop" % args.interval)
+    deadline = (started + args.minutes * 60) if args.minutes > 0 else None
+    print("watching every %.0fs%s" % (args.interval,
+          " for %.0f min" % args.minutes if deadline else " until stopped"))
     try:
-        while True:
+        while deadline is None or time.time() < deadline:
             s = sample(since)
             first = first or s
             print(render(s, first, max((time.time() - started) / 60.0, 0.001)), flush=True)
@@ -456,6 +471,9 @@ def main(argv=None) -> int:
             time.sleep(args.interval)
     except KeyboardInterrupt:
         print("stopped")
+    else:
+        if deadline is not None:
+            print("stopped: the %.0f minute window ended" % args.minutes)
     finally:
         if csv:
             csv.close()
