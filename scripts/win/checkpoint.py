@@ -77,9 +77,15 @@ def unowned(copilot_targets):
 
 
 def edge_state():
-    """Per managed profile: (browser processes, headed?, total MB)."""
+    """Per managed profile: {"mb": resident private MB, "headed": owns a window}.
+
+    THE MEMORY FIGURE IS PRIVATE WORKING SET, not the sum of WorkingSetSize this used to
+    report. That counter includes SHARED pages and a Chromium browser is fifteen processes
+    sharing one binary, so every figure this line printed on 2026-08-27 was 2.4 to 2.9 times
+    too large -- 295 MB where the machine, and Task Manager, said 122.
+    """
     raw = _ps("Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
-              "Select-Object CommandLine, WorkingSetSize | ConvertTo-Json -Compress -Depth 3")
+              "Select-Object CommandLine | ConvertTo-Json -Compress -Depth 3")
     try:
         data = json.loads(raw) if raw.strip() else []
     except ValueError:
@@ -92,11 +98,16 @@ def edge_state():
         for prof in MANAGED:
             if prof in cmd:
                 rec = out.setdefault(prof, {"mb": 0, "headed": False})
-                rec["mb"] += (p.get("WorkingSetSize") or 0) / 1048576.0
                 if "--type=" not in cmd and "--headless" not in cmd:
                     rec["headed"] = True
+    try:
+        sys.path.insert(0, os.path.join(REPO, "scripts", "win"))
+        from edge_memory import private_mb
+        for prof in list(out):
+            out[prof]["mb"] = private_mb(prof) or 0
+    except Exception:
+        pass
     return out
-
 
 def route_since(iso):
     """Counts since `iso`, plus whether the route was ever closed in that window.
@@ -164,12 +175,18 @@ def verdicts_now():
     # 2. No Copilot page is open that nobody owns.
     d = run_state()
     running = bool(d.get("running"))
-    stray, orphans, asked_ledger = {}, {}, True
+    stray, orphans, blanks, asked_ledger = {}, {}, {}, True
     for port, name in ((9222, "companion"), (9223, "bridge"), (9224, "eval")):
         got = targets(port)
         if got is None:
             continue
         mine = [t for t in got if "m365.cloud.microsoft" in (t.get("url") or "")]
+        # COUNT EVERY PAGE, not only the Copilot ones. The invariant above asks about
+        # unowned Copilot pages, and a page that is not on that origin was invisible to
+        # it entirely -- so a leak of about:blank tabs, which every capture and every
+        # probe creates before it navigates, could accumulate unseen. One per browser is
+        # structural: closing the last page closes the browser.
+        blanks[name] = len(got)
         if mine:
             stray[name] = mine
         loose = unowned(mine)
@@ -190,6 +207,11 @@ def verdicts_now():
         verdicts.append(("no idle Copilot page", running or not stray,
                          "copilot pages: %s (ledger unreadable; run in flight: %s)"
                          % ({k: len(v) for k, v in stray.items()} or "none", running)))
+
+    # 2b. No browser is holding more pages than it needs.
+    extra = {k: v for k, v in blanks.items() if v > 1}
+    verdicts.append(("one page per browser", not extra,
+                     "pages per browser: %s" % (blanks or "none")))
 
     # 3. Every tab that carried work today was a fallback.
     done, tab, fell, faults, closed = route_since(today)

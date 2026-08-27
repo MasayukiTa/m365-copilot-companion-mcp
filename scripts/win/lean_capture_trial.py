@@ -44,21 +44,19 @@ _PS_PROCESSES = (
 
 
 def edge_rss_mb(profile="copilot-companion-edge"):
-    """Total working set of the managed browser, in MB. The number that decides this."""
+    """Resident PRIVATE memory of the managed browser, in MB.
+
+    NOT the sum of WorkingSetSize, which is what this was and which over-reported by 2.4 to
+    2.9 times: that counter includes SHARED pages, and a Chromium browser is fifteen
+    processes sharing one binary. The corrected figure matches what Task Manager shows for
+    the same browser -- 122 MB where this used to say 295.
+    """
     try:
-        raw = subprocess.run(["powershell", "-NoProfile", "-Command", _PS_PROCESSES],
-                             capture_output=True, text=True, timeout=60).stdout
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from edge_memory import private_mb
+        return private_mb(profile)
     except Exception:
         return None
-    try:
-        data = json.loads(raw) if (raw or "").strip() else []
-    except ValueError:
-        return None
-    if isinstance(data, dict):
-        data = [data]
-    total = sum((p.get("WorkingSetSize") or 0) for p in data
-                if profile in (p.get("CommandLine") or ""))
-    return round(total / 1048576.0, 1)
 
 
 def _targets(cdp_url):
