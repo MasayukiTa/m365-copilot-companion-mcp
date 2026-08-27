@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -91,13 +92,33 @@ def normalized(template):
         "timestamp", "chatSessionId", "sessionId", "X-ClientRequestId", "text",
     }
 
+    # SCRUBBED BY SHAPE, NOT ONLY BY NAME, and the first trial is why. Two ORDINARY captures
+    # produced two "different" templates, and the whole difference was clientCorrelationId
+    # and clientInfo.clientSessionId -- per-turn identifiers nobody had put on the list. The
+    # check then reported that blocking resources changed the request, which was false and
+    # was the harness's own fault. Naming every id a client might mint is the same losing
+    # game as naming every character that may precede a marker: a value SHAPED like a fresh
+    # identifier is one, whatever its field happens to be called.
+    ident = re.compile(r"^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+                       r"|[0-9a-f]{32})$", re.IGNORECASE)
+
     def scrub(obj):
         if isinstance(obj, dict):
             return {k: scrub(v) for k, v in sorted(obj.items()) if k not in volatile}
         if isinstance(obj, list):
             return [scrub(v) for v in obj]
-        if isinstance(obj, str) and len(obj) > 200:
-            return "<%d chars>" % len(obj)
+        if isinstance(obj, str):
+            if ident.match(obj):
+                return "<identifier>"
+            if len(obj) > 200:
+                # A LONG FIELD IS NOT AN OPAQUE ONE, and `variants` is the reason this
+                # exists. It is the flag list that selects the responding model -- 68 of them
+                # on 2026-08-20 -- and collapsing it to "<2766 chars>" made two captures
+                # differ on a LENGTH while saying nothing about which flags. Comma-separated
+                # lists are compared as sets, because order is not the request.
+                if "," in obj:
+                    return sorted({p.strip() for p in obj.split(",") if p.strip()})
+                return "<%d chars>" % len(obj)
         return obj
 
     return json.dumps({"query": scrub(template.query), "frame": scrub(template.frame)},
@@ -178,7 +199,13 @@ def one_capture(context, agent_url, lean, cdp_url=DEFAULT_CDP, probe=False):
                     "template": normalized(template),
                     "token_len": len(token)})
         if probe:
-            rec["probe"] = grounding_probe(token, template)
+            # NOT RUN HERE. websocket_connect drives asyncio, and inside
+            # sync_playwright's context that is a second event loop on a thread
+            # already running one: the first trial recorded "Cannot run the event
+            # loop while another loop is running" for every probe, so all four came
+            # back inconclusive and nobody would have known which arm reached the
+            # tenant. The material is kept and the question asked afterwards.
+            rec["_probe_material"] = (token, template)
     except Exception as exc:
         rec.update({"ok": False, "seconds": round(time.time() - t0, 1),
                     "error": "%s: %s" % (type(exc).__name__, str(exc)[:200])})
@@ -217,6 +244,41 @@ def summarise(records):
     return out
 
 
+def _flatten(obj, prefix=""):
+    """Every leaf of a normalized template, as {dotted.path: comparable value}."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _flatten(v, prefix + "." + str(k))
+    elif isinstance(obj, list):
+        yield prefix, json.dumps(obj, ensure_ascii=False, sort_keys=True)
+    else:
+        yield prefix, obj
+
+
+def _field_ranges(full_templates, lean_templates):
+    """(fields that vary among ordinary captures, fields where lean shows something new).
+
+    Two separate questions that the old set comparison ran together. A field varying between
+    two ORDINARY captures says something about the capture; a field where the lean arm shows a
+    value no ordinary capture produced is the only thing that says something about blocking.
+    """
+    def rows(templates):
+        out = {}
+        for text in templates:
+            for field, value in _flatten(json.loads(text)):
+                out.setdefault(field, set()).add(value if isinstance(value, str) else repr(value))
+        return out
+
+    fulls, leans = rows(full_templates), rows(lean_templates)
+    varying = {f: sorted(v) for f, v in fulls.items() if len(v) > 1}
+    novel = {}
+    for field, values in leans.items():
+        unseen = values - fulls.get(field, set())
+        if unseen:
+            novel[field] = sorted(unseen)
+    return varying, novel
+
+
 def report(summary):
     """Print the verdict. Returns the exit code."""
     print()
@@ -234,11 +296,27 @@ def report(summary):
     if not lean_t or not full_t:
         print("!! one arm produced no successful capture; nothing is comparable yet.")
         return 1
-    if set(full_t) != set(lean_t):
-        print("!! THE TEMPLATES DIFFER. A lean capture describes a different request, which")
-        print("   means a different product answering. Do not adopt.")
-        for t in list(set(lean_t) - set(full_t))[:1]:
-            print("   lean-only: %s" % t[:400])
+
+    # SET EQUALITY IS THE WRONG QUESTION, and asking it produced two false verdicts before
+    # anybody checked what actually differed. An ordinary capture is not deterministic: across
+    # three of them `connectedFederatedConnections` came back as ["dummyId"] on some and as a
+    # real connector on others, because the page had not finished attaching them. Requiring
+    # the two arms to produce IDENTICAL SETS makes any such variation read as "blocking
+    # resources changed the request", which is a claim about lean built from evidence that has
+    # nothing to do with it.
+    #
+    # The question is whether the lean arm shows a value the full arm never shows. Compared
+    # field by field, because a whole-template mismatch cannot say which field moved.
+    varying, novel = _field_ranges(full_t, lean_t)
+    if varying:
+        print("fields that vary between ORDINARY captures (not attributable to blocking):")
+        for field, values in sorted(varying.items()):
+            print("   %s: %s" % (field, " | ".join(str(v)[:40] for v in values)))
+    if novel:
+        print("!! THE LEAN ARM SHOWS VALUES THE ORDINARY ONE NEVER DID. A capture describing a")
+        print("   different request means a different product answering. Do not adopt.")
+        for field, values in sorted(novel.items()):
+            print("   %s: lean-only %s" % (field, " | ".join(str(v)[:60] for v in values)))
         return 1
     for arm in ("full", "lean"):
         probes = [r["probe"] for r in summary.get("_records", []) if r["arm"] == arm and r.get("probe")]
@@ -259,6 +337,26 @@ def report(summary):
     return 0
 
 
+def _agent_url_from_env_file():
+    """The agent URL the fleet itself uses, from the shared .env.
+
+    The trial has to talk to THE SAME SURFACE the fleet does, or it measures a capture of
+    something else. Asking the operator to paste a URL invites exactly that mismatch.
+    """
+    candidates = [os.path.join(os.environ.get("APPDATA", ""), "copilot-bridge", ".env"),
+                  os.path.join(REPO, ".env")]
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            for line in open(path, encoding="utf-8-sig", errors="replace"):
+                if line.startswith("MCP_FLEET_AGENT_URL="):
+                    return line.split("=", 1)[1].strip()
+        except OSError:
+            continue
+    return ""
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--iterations", type=int, default=6, help="captures PER ARM")
@@ -270,8 +368,10 @@ def main(argv=None):
                          "can answer. Records properties of the reply, never its text.")
     args = ap.parse_args(sys.argv[1:] if argv is None else argv)
 
-    if not args.agent_url:
-        print("!! no agent URL. Pass --agent-url or set MCP_FLEET_AGENT_URL.")
+    agent_url = args.agent_url or _agent_url_from_env_file()
+    if not agent_url:
+        print("!! no agent URL. Pass --agent-url, set MCP_FLEET_AGENT_URL, or configure it")
+        print("   in the shared .env the fleet reads.")
         return 2
 
     from playwright.sync_api import sync_playwright
@@ -282,13 +382,24 @@ def main(argv=None):
         context = browser.contexts[0]
         for n in range(args.iterations):
             for lean in (False, True):                     # paired, alternating
-                rec = one_capture(context, args.agent_url, lean, args.cdp, args.probe)
+                rec = one_capture(context, agent_url, lean, args.cdp, args.probe)
                 records.append(rec)
                 print("  %-4s #%d  %-4s %5.1fs  rss %s -> %s  pages %s -> %s  residue %s  %s"
                       % (rec["arm"], n + 1, "ok" if rec.get("ok") else "FAIL", rec["seconds"],
                          rec["rss_before"], rec["rss_after"], rec["pages_before"],
                          rec["pages_after"], rec["copilot_pages_left"],
                          rec.get("error", "")[:70]), flush=True)
+
+    # OUTSIDE the playwright block, deliberately -- see the note where the material
+    # is kept.
+    for rec in records:
+        material = rec.pop("_probe_material", None)
+        if material is not None:
+            rec["probe"] = grounding_probe(*material)
+            print("  probe %-4s completed=%s refused=%s chars=%s %s"
+                  % (rec["arm"], rec["probe"]["completed"],
+                     rec["probe"]["refused_access"], rec["probe"]["chars"],
+                     rec["probe"]["error"][:60]), flush=True)
 
     summary = summarise(records)
     summary["_records"] = records

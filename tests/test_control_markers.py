@@ -77,25 +77,16 @@ def test_terminal_kinds_are_named_once():
 
 
 def test_the_relay_uses_this_boundary_rather_than_its_own_substring_test():
-    import ast
-    import os
-    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "relay", "copilot_autopilot_relay.py"), encoding="utf-8").read()
-    tree = ast.parse(src)
-    fn = next(n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef) and n.name == "has_end_marker")
-    # EXCLUDING THE DOCSTRING, which quotes the old rule verbatim in order to explain why it
-    # was replaced. Scanning raw source made this test fail on the very comment describing
-    # the fix -- the third time a source-scanning test in this repository has caught its own
-    # prose. What is being asked about is executable code.
-    body = ast.Module(body=[n for n in fn.body
-                            if not (isinstance(n, ast.Expr)
-                                    and isinstance(n.value, ast.Constant)
-                                    and isinstance(n.value.value, str))],
-                      type_ignores=[])
-    code = ast.dump(body)
-    assert "in last" not in ast.unparse(body), "the substring test is back"
-    assert "_has_marker" in code
+    from _srcprobe import executable_source
+
+    from relay.copilot_autopilot_relay import has_end_marker
+
+    # THE DOCSTRING QUOTES THE OLD RULE in order to explain why it was replaced, so a raw
+    # text scan fails on the very comment describing the fix. _srcprobe exists because this
+    # is the fourth test in the repository to have made that mistake.
+    body = executable_source(has_end_marker)
+    assert "in last" not in body, "the substring test is back"
+    assert "_has_marker" in body
 
 
 def test_it_agrees_with_the_old_rule_everywhere_except_that_one_shape():
