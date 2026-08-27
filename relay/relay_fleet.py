@@ -929,14 +929,12 @@ def _socket_route():
     if _SOCKET_ROUTE is None:
         with _SOCKET_ROUTE_LOCK:
             if _SOCKET_ROUTE is None:
-                from relay.lean_capture import capture_fn as _choose_capture
+                from relay.profile_token import capture_fn as _choose_capture
                 from relay.socket_route import SocketRoute, websocket_connect
                 # WHICH capture, chosen here rather than in socket_route, because
-                # that module is frozen and this is a policy about cost. The lean
-                # one blocks images, fonts, media and stylesheets on the capture
-                # page; it is off unless MCP_CAPTURE_LEAN says otherwise, and it
-                # raises exactly what the ordinary one raises, so the breaker
-                # behind it sees no difference.
+                # that module is frozen and this is a policy about cost. Every
+                # option raises exactly what the ordinary one raises, so the
+                # breaker behind it sees no difference between them.
                 _SOCKET_ROUTE = SocketRoute(capture_fn=_choose_capture(),
                                             connect_fn=websocket_connect,
                                             refresh_margin_s=SOCKET_REFRESH_MARGIN_S,
@@ -998,6 +996,46 @@ _LAST_ROUTE_FAULT = [0.0]
 _ROUTE_FAULT_LOCK = threading.Lock()
 
 
+#: Reasons that implicate the request SHAPE rather than the connection or the goal.
+#:
+#: A cached template is reused until something says it is wrong, and this is that something.
+#: InvalidRequest is the backend refusing the request it was sent -- not a dropped socket,
+#: not a consent card, but the shape itself. transport_policy deliberately leaves it
+#: unclassified for route-versus-task, because nothing has been measured about which of
+#: those it is; that is a different question from whether the template should be trusted
+#: again, and this answers only the second.
+TEMPLATE_SUSPECT = ("invalidrequest", "invalid request", "badrequest")
+
+
+def _forget_cached_templates(reason):
+    """Drop every cached request template when the backend refuses a request's shape.
+
+    EVERY ONE, not the offending agent's, because this function is not told which agent was
+    talking. Re-deriving costs one full capture per surface and happens once; guessing wrong
+    and keeping a stale template costs a wrong request on every turn until somebody notices.
+    """
+    low = (reason or "").lower()
+    if not any(m in low for m in TEMPLATE_SUSPECT):
+        return False
+    try:
+        import glob
+
+        from relay import profile_token
+        gone = 0
+        for path in glob.glob(os.path.join(profile_token.TEMPLATE_DIR, "template_*.json")):
+            try:
+                os.remove(path)
+                gone += 1
+            except OSError:
+                pass
+        if gone:
+            print("[socket_route] backend refused a request shape; discarded %d cached "
+                  "template(s) so the next capture re-derives them" % gone, flush=True)
+        return bool(gone)
+    except Exception:
+        return False
+
+
 def report_route_fault(reason, now=None):
     """Report a fault to the route, coalescing TRANSPORT faults within one incident window.
 
@@ -1013,6 +1051,7 @@ def report_route_fault(reason, now=None):
     fallback, so it has to be counted per fallback.
     """
     t = (now or time.time)()
+    _forget_cached_templates(reason)
     try:
         from relay.transport_policy import classify_fallback
         transport = classify_fallback(reason) == "route"
