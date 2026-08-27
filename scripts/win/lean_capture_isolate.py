@@ -10,8 +10,12 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, r"C:\Users\M118A8586\resonac-mcp")
+# THE REPO ROOT IS COMPUTED, NEVER TYPED. A second insert here hardcoded one developer's
+# home directory -- which on this machine carries both an employee id and an employer name
+# -- into a file tracked in a PUBLIC repository. It was redundant with the computed root, so
+# it bought nothing whatsoever. CI caught it. It should never have been written.
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
 
 SETS = [
     "",                                  # control: no blocking at all
@@ -26,7 +30,7 @@ SETS = [
 
 def agent_url():
     for path in (os.path.join(os.environ.get("APPDATA", ""), "copilot-bridge", ".env"),
-                 r"C:\Users\M118A8586\resonac-mcp\.env"):
+                 os.path.join(REPO, ".env")):
         if os.path.isfile(path):
             for line in open(path, encoding="utf-8-sig", errors="replace"):
                 if line.startswith("MCP_FLEET_AGENT_URL="):

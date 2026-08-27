@@ -290,7 +290,7 @@ def unregister_bridge_session_from_fleet_convs(sid="", conv_url=""):
         return dropped
     except Exception:
         logger.warning("could not unregister %s from the fleet conversation list",
-                       sid or conv_url, exc_info=True)
+                       logsafe(sid or conv_url), exc_info=True)
         return 0
 
 
@@ -1882,8 +1882,10 @@ _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 def logsafe(value, limit=200):
     """A request-supplied value, made safe to put in a log line.
 
-    LOG INJECTION, reported by code scanning as py/log-injection at two sites and present at
-    more. `sid` and `url` arrive from a query string, so a value carrying CR or LF writes what
+    LOG INJECTION, reported by code scanning as py/log-injection. The scanner names one
+    site at a time; the rest were found by sweeping every logger call in this file for a
+    request-derived argument, because a fix applied only where the alert pointed leaves
+    the same defect at every site the scanner has not reached yet. `sid` and `url` arrive from a query string, so a value carrying CR or LF writes what
     looks like additional log entries -- a reader, or anything parsing the log, is then reading
     lines an outsider composed. Control characters go, the value is bounded, and it is quoted
     so an empty or space-padded value is still visible as a value.
@@ -1940,7 +1942,8 @@ def _persist_exchange(sid, user_msg, final_text):
                 if cur and cur != expected:
                     logger.warning(
                         "pane guid %s.. does not match session conv_url guid %s.. "
-                        "(sid=%s); keeping stored conv_url", cur[:5], expected[:5], sid)
+                        "(sid=%s); keeping stored conv_url",
+                        logsafe(cur[:5]), logsafe(expected[:5]), logsafe(sid))
             S.touch(sid, status="active")
         else:
             # The socket answers this directly; the DOM diff cannot see its turn at all.
@@ -1951,7 +1954,7 @@ def _persist_exchange(sid, user_msg, final_text):
             else:
                 logger.warning(
                     "conversation capture ambiguous for sid=%s; conv_url left empty "
-                    "(no changed/new guid vs baseline)", sid)
+                    "(no changed/new guid vs baseline)", logsafe(sid))
             new_sess = S.touch(sid, **fields)
             if ref:
                 # This session just gained a non-empty conv_url for the first time --
@@ -3530,7 +3533,7 @@ class Handler(BaseHTTPRequestHandler):
                 # waits forever for a run that has hung.
                 if not PAGE_LOCK.acquire(timeout=SEND_PROMOTION_WAIT_S):
                     logger.info("promoted /send gave up waiting for the page (sid=%s); the "
-                                "message stays queued", sid)
+                                "message stays queued", logsafe(sid))
                     return
                 try:
                     run_on_page_thread(self._drain_pending_queue, sid)
