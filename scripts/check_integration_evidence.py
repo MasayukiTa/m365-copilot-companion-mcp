@@ -174,8 +174,12 @@ def references(name: str, defining_path: str):
                 text = open(full, encoding="utf-8", errors="replace").read()
             except OSError:
                 continue
-            leaf = os.path.basename(defining_path)
-            if leaf in text or defining_path.replace(chr(92), "/") in text.replace(chr(92), "/"):
+            # AS A PATH COMPONENT, not as a substring. `lean_capture.py` matches inside
+            # `test_lean_capture.py`, so registering a TEST in the CI workflow read as
+            # registering the module it tests.
+            leaf = re.escape(os.path.basename(defining_path))
+            boundary = "(^|[/" + re.escape(chr(92)) + chr(92) + "s\"'])"
+            if re.search(boundary + leaf, text, re.M):
                 found.append((path, "registered"))
     return found
 

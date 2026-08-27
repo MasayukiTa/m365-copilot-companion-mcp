@@ -929,9 +929,15 @@ def _socket_route():
     if _SOCKET_ROUTE is None:
         with _SOCKET_ROUTE_LOCK:
             if _SOCKET_ROUTE is None:
-                from relay.socket_route import (SocketRoute, capture_via_tab,
-                                                websocket_connect)
-                _SOCKET_ROUTE = SocketRoute(capture_fn=capture_via_tab,
+                from relay.lean_capture import capture_fn as _choose_capture
+                from relay.socket_route import SocketRoute, websocket_connect
+                # WHICH capture, chosen here rather than in socket_route, because
+                # that module is frozen and this is a policy about cost. The lean
+                # one blocks images, fonts, media and stylesheets on the capture
+                # page; it is off unless MCP_CAPTURE_LEAN says otherwise, and it
+                # raises exactly what the ordinary one raises, so the breaker
+                # behind it sees no difference.
+                _SOCKET_ROUTE = SocketRoute(capture_fn=_choose_capture(),
                                             connect_fn=websocket_connect,
                                             refresh_margin_s=SOCKET_REFRESH_MARGIN_S,
                                             log=lambda m: print(m, flush=True))
@@ -1319,6 +1325,15 @@ def _claim_page(page, note=""):
         return ""
 
 
+def _maybe_lean(page):
+    """Install capture-page resource blocking if this thread is opening one."""
+    try:
+        from relay.lean_capture import maybe_install
+        return maybe_install(page)
+    except Exception:
+        return None                # an ordinary page is the correct fallback
+
+
 def _open_fresh(context, url):
     """Open a NEW tab on a fresh chat of the agent. Tolerant of slow navigation
     (a busy Edge can miss the 30s domcontentloaded) -- we proceed and wait for the
@@ -1329,6 +1344,10 @@ def _open_fresh(context, url):
     # Claimed the moment it exists, before any navigation can fail: an unclaimed page
     # is one a concurrently starting run is entitled to close.
     _claim_page(pg, note="open_fresh")
+    # NO-OP UNLESS THIS THREAD ASKED FOR A LEAN PAGE. It has to be here rather than
+    # in the caller: interception must be installed before the navigation below, and
+    # the capture reaches this function through a frozen signature it cannot extend.
+    _maybe_lean(pg)
     surfaced = False
     force_timer = None
     # Up to 3 navigation attempts: a failed goto leaves the tab on about:blank, and

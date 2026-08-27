@@ -118,3 +118,18 @@ def test_ci_actually_runs_it():
     """A check that is not invoked is the very thing it was built to detect."""
     ci = open(os.path.join(ROOT, ".github", "workflows", "ci.yml"), encoding="utf-8").read()
     assert "scripts/check_integration_evidence.py" in ci
+
+
+def test_a_registration_matches_a_path_component_not_a_substring(tmp_path, monkeypatch):
+    """`lean_capture.py` sits inside `test_lean_capture.py`, so registering a TEST in the CI
+    workflow read as registering the module it tests. Weak evidence that passes is worse than
+    none: it makes the check report OK for exactly the case it exists to catch."""
+    hits = dict(chk.references("install", "relay/lean_capture.py"))
+    for path, how in hits.items():
+        if how == "registered":
+            text = open(os.path.join(ROOT, path), encoding="utf-8", errors="replace").read()
+            sep = chr(92) + "lean_capture.py"
+            assert any(line.strip().endswith("lean_capture.py")
+                       or "/lean_capture.py" in line or sep in line
+                       for line in text.splitlines()), \
+                "%s counted as a registration without naming the module" % path
