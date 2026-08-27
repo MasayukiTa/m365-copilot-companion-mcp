@@ -30,6 +30,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The integration-evidence check asks what THIS commit added, so it
+          # needs the commit before it. A shallow clone makes the check pass
+          # vacuously, which is a green tick that means nothing.
+          fetch-depth: 2
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v7
@@ -44,6 +49,11 @@ jobs:
 
       - name: Audit hermetic test manifest
         run: python scripts/check_ci_test_manifest.py
+
+      # A unit test proves a function works; it does not prove anything calls it.
+      # Three capabilities in one day were green and wired to nothing.
+      - name: Integration evidence for new definitions
+        run: python scripts/check_integration_evidence.py
 
       # The rule is absolute and has been broken twice; the last time it was a GENERATED
       # file that reintroduced it, which no review reads. Enforced rather than remembered.

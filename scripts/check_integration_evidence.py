@@ -195,6 +195,14 @@ def main(argv=None):
     ap.add_argument("--base", default=os.environ.get("INTEGRATION_BASE", "HEAD~1"))
     args = ap.parse_args(argv)
 
+    # A SHALLOW CLONE HAS NO HEAD~1, and a check that silently reports "no new definitions"
+    # on every CI run is worse than no check: it is a green tick that means nothing. Say so.
+    if not _git("rev-parse", "--verify", "--quiet", args.base + "^{commit}").strip():
+        print("integration evidence: SKIPPED -- cannot resolve base %r." % args.base)
+        print("  On CI this means the checkout is shallower than the range being asked "
+              "about (fetch-depth).")
+        return 0
+
     exceptions = load_exceptions()
     added = added_definitions(args.base)
     if not added:

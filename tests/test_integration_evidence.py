@@ -96,3 +96,25 @@ def test_an_excused_definition_passes(monkeypatch):
     monkeypatch.setattr(chk, "load_exceptions",
                         lambda: {"a_capability_nobody_wired_up_zzz": "a reason long enough to read"})
     assert chk.main(["--base", "HEAD~1"]) == 0
+
+
+def test_an_unresolvable_base_is_announced_not_passed_over_in_silence(capsys):
+    """A shallow clone has no HEAD~1. Reporting "no new definitions" then would make the check
+    a green tick that means nothing on every CI run -- the exact failure mode it exists to
+    prevent, wearing the check's own name."""
+    assert chk.main(["--base", "nonexistent-ref-zzz"]) == 0
+    out = capsys.readouterr().out
+    assert "SKIPPED" in out and "fetch-depth" in out
+
+
+def test_ci_checks_out_deep_enough_to_have_a_base(capsys):
+    """The check reads HEAD~1, and actions/checkout defaults to a depth of one."""
+    ci = open(os.path.join(ROOT, ".github", "workflows", "ci.yml"), encoding="utf-8").read()
+    i = ci.index("actions/checkout@")
+    assert "fetch-depth: 2" in ci[i:i + 400], "the check would skip on every run"
+
+
+def test_ci_actually_runs_it():
+    """A check that is not invoked is the very thing it was built to detect."""
+    ci = open(os.path.join(ROOT, ".github", "workflows", "ci.yml"), encoding="utf-8").read()
+    assert "scripts/check_integration_evidence.py" in ci
