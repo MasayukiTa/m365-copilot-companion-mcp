@@ -3958,7 +3958,26 @@ class RelayWorker:
         return True
 
     def poll(self):
-        """Advance one non-blocking step. Returns True when terminal."""
+        """Advance one non-blocking step. Returns True when terminal.
+
+        A PENDING STEER DEFERS COMPLETION BY ONE TURN, and without that the word
+        'interrupt' was not true of this at all. A steering message becomes the next
+        turn's job, so a worker that finishes on the turn it arrives never uses it:
+        measured on a live run, a message was broadcast to eight workers and five of them
+        went DONE before another turn began. Correctly queued, correctly reported as
+        queued, and never spoken.
+
+        The idiom already existed one branch away: a worker paused at 'awaiting' treats a
+        steer as the resume signal. This is the same rule applied at the other end -- the
+        person asked for something after the work was under way, and answering them is one
+        more turn rather than none.
+
+        ONLY FROM done. A cancelled worker was stopped ON PURPOSE and must not be revived
+        by a message that was already in flight. MAXTURNS means the budget is spent, and
+        an extra turn is exactly what the budget forbids. STUCK is left alone because a
+        steer that could unstick it is a guess, and reviving a worker into the same wall
+        costs a turn to learn nothing.
+        """
         if self.status in TERMINAL:
             return True
         # getattr, like the rest of this loop: the settle tests drive poll() on a stand-in
@@ -4683,6 +4702,20 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     raise FleetContextLost(_unfinished())
 
         for w in workers:
+            # NO, A PENDING STEER MAY NOT REVIVE A FINISHED WORKER FROM HERE. It was tried,
+            # on the reasoning that a steering message becomes the NEXT turn's job and a
+            # worker that finishes on the turn it arrives never speaks it -- measured, five
+            # workers out of eight. Putting the check inside poll() read correctly and never
+            # ran, because the line below skips a terminal worker before poll() is called.
+            # Moving it here made it run, and it broke the run: the sweep releases the tab
+            # the instant a worker is terminal, so the revived worker's next send reached
+            # `self.drv._answers()` on a driver that was gone, became an AttributeError, and
+            # retried 74 times against a budget of 10.
+            #
+            # Reviving a torn-down worker needs RE-ATTACHMENT, which is real work and not a
+            # status flip. Until that exists, a steer that arrives too late is reported as
+            # never used (fleet_runner.report_unused_steers) rather than acted on -- the
+            # honest half of the feature, which is that the message is not silently lost.
             if w.status in TERMINAL or w.status == PENDING:
                 continue
             try:
