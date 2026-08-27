@@ -780,6 +780,23 @@ function Invoke-Startup {
         } catch { Write-Host "      (orphan sweep skipped: $($_.Exception.Message))" }
     }
 
+    # 1b-2) A fleet run whose coordinator died mid-flight gets continued, BEFORE the reaper
+    # below runs. Order matters and is not incidental: the reaper clears the active-run
+    # marker, which is the same file this reads to know there is anything to resume. A
+    # resumed run writes a fresh marker with a live pid, so the reaper then leaves it alone.
+    #
+    # Everything this needs already existed -- the marker carries a precomputed resume argv,
+    # should_auto_resume() states the rule -- and nothing called it, so an interrupted run
+    # simply stayed interrupted and the way anyone found out was that the answer never came.
+    if (Test-Path $py) {
+        $resumer = Join-Path $root "scripts\win\resume_interrupted_fleet.py"
+        if (Test-Path $resumer) {
+            try {
+                & $py $resumer --resume 2>&1 | ForEach-Object { Write-Host "      $_" }
+            } catch { Write-Host "      (resume check skipped: $($_.Exception.Message))" }
+        }
+    }
+
     # 1c) And the sidecar files a fleet coordinator that died mid-run left behind. Until now
     # relay/fleet_reaper.py had no entry point and nothing in the repository referenced it,
     # so a phantom run kept claiming to be live: the cockpit showed workers "running" for

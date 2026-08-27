@@ -19,6 +19,7 @@ fallback is a working path, not a degraded one.
 from __future__ import annotations
 
 import json
+import os
 
 from relay.chathub import RS, ChatHubError, RequestTemplate, expires_in
 
@@ -45,7 +46,22 @@ def _frames(payloads):
     return out
 
 
-def capture(page, *, prompt: str = "ping", timeout_s: float = 180.0, attempts: int = 3):
+#: How long ONE capture attempt may take, and how many attempts there may be.
+#:
+#: These were 180s x 3, which is 540 seconds -- and a capture runs SYNCHRONOUSLY on the
+#: fleet's main loop, so that is nine minutes in which no worker is polled, no status is
+#: written, and (because the run can look finished at that instant) the watchdog does not
+#: fire either. One was caught with py-spy on 2026-08-27 doing exactly that.
+#:
+#: The new numbers are measured rather than felt. Across 200 captures in the recorded logs
+#: the turn's idle wait was: min 8s, median 8s, p90 9s, max 16s. 60 seconds is nearly four
+#: times the worst ever seen, and two attempts keep the single-point-of-failure retry that
+#: the comment below exists for -- at a worst case of two minutes rather than nine.
+CAPTURE_TIMEOUT_S = float(os.environ.get("MCP_CAPTURE_TIMEOUT_S", "60"))
+CAPTURE_ATTEMPTS = int(os.environ.get("MCP_CAPTURE_ATTEMPTS", "2"))
+
+
+def capture(page, *, prompt: str = "ping", timeout_s: float = None, attempts: int = None):
     """One real turn on `page`, watched. Returns (token, RequestTemplate).
 
     The turn is a real one and costs what a turn costs; it is run about once per token
@@ -58,6 +74,8 @@ def capture(page, *, prompt: str = "ping", timeout_s: float = 180.0, attempts: i
     the whole fleet on tabs for want of one send. One flaky turn should cost a retry, not the
     route.
     """
+    timeout_s = CAPTURE_TIMEOUT_S if timeout_s is None else float(timeout_s)
+    attempts = CAPTURE_ATTEMPTS if attempts is None else int(attempts)
     last = None
     for attempt in range(max(1, int(attempts))):
         try:
