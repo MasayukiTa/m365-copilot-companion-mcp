@@ -557,6 +557,38 @@ def _clean_final_text(text, max_len=600):
     return t[:max_len]
 
 
+#: Invariants that STOP a launch. Deliberately a short, named list rather than "everything the
+#: checkpoint reports": the checkpoint also reports things that are worth a human's eye but not
+#: worth refusing over -- memory near a ceiling, a route already closed -- and a gate that
+#: refuses on those is a gate that gets bypassed by habit and then deleted.
+#:
+#: These two are the ones that make a run's results untrue rather than merely worse:
+#:   a Copilot page nobody owns -> the browser carries ~350-560 MB into every measurement
+#:   a browser with a window     -> a token capture will raise it onto the user's screen
+BLOCKING_INVARIANTS = ("no idle Copilot page", "no browser window")
+
+
+def _launch_blockers():
+    """The unmet preconditions that should stop a launch, as (name, detail). Never raises.
+
+    A gate that crashes is worse than no gate: it turns "the stack is dirty" into "no run can
+    start for a reason nobody can see". Any failure to ASK is treated as nothing to report.
+    """
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "checkpoint", os.path.join(_repo_root(), "scripts", "win", "checkpoint.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        verdicts, _extras = mod.verdicts_now()
+        return [(name, detail) for name, ok, detail in verdicts
+                if not ok and name in BLOCKING_INVARIANTS]
+    except Exception as exc:
+        print("[gate] could not evaluate preconditions (%s); starting anyway"
+              % type(exc).__name__, flush=True)
+        return []
+
+
 def _close_idle_copilot_pages(context) -> int:
     """Close Copilot pages nobody owns yet, and say how many. Never raises.
 
@@ -1020,6 +1052,8 @@ def main():
                                             or os.environ.get("MCP_IMPL_AGENT_URL", "")))
     ap.add_argument("-g", "--goal", action="append", help="a goal (repeatable)")
     ap.add_argument("--goals-file", help="file with one goal per line (# comments ok)")
+    ap.add_argument("--force", action="store_true",
+                    help="start even when the launch gate's preconditions are unmet; the run still happens and its measurements carry whatever was wrong")
     ap.add_argument("--resume", action="store_true",
                     help="relaunch the UNFINISHED portion of the last run. Loads the "
                          "durable goals ledger (.fleet/last_run_goals.json) written at the "
@@ -1657,6 +1691,30 @@ def main():
                     print("       start: closed %d Copilot page(s) left by an earlier run "
                           "(they cost ~350 MB each and would have sat in this run's "
                           "measurements)" % _closed, flush=True)
+
+                # THE GATE. Asked AFTER the cleanup above, so it judges what could not be
+                # fixed rather than what merely needed tidying, and BEFORE any worker starts,
+                # so a contaminated run never begins.
+                #
+                # It refuses rather than warns. A warning is what already existed -- the
+                # monitor wrote a breach at 22:40 and runs were launched on top of it for the
+                # next nine and a half hours, which is not a detection failure but an
+                # obligation failure.
+                #
+                # --force exists because a gate with no way past it is a gate somebody
+                # eventually deletes.
+                _blockers = _launch_blockers()
+                if _blockers and not getattr(args, "force", False):
+                    print("\n[gate] REFUSING TO START -- the stack is not in a state where "
+                          "this run's results would mean anything:", flush=True)
+                    for _name, _detail in _blockers:
+                        print("       %-24s %s" % (_name, _detail), flush=True)
+                    print("       Fix it, or pass --force to run anyway (and know that the "
+                          "measurements carry it).", flush=True)
+                    return 2
+                if _blockers:
+                    print("[gate] --force: starting despite %d unmet precondition(s); "
+                          "this run's measurements carry them." % len(_blockers), flush=True)
                 res = run_relay_fleet(context, pending, args.agent_url,
                                       max_turns=args.max_turns, poll_s=args.poll_s,
                                       notify=default_notify, on_tick=on_tick,
