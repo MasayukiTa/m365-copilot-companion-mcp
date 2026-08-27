@@ -589,6 +589,39 @@ def _launch_blockers():
         return []
 
 
+def _pid_alive(pid: int) -> bool:
+    """Is that process running? psutil is already a dependency and is cross-platform."""
+    try:
+        import psutil
+        return bool(psutil.pid_exists(int(pid)))
+    except Exception:
+        return True          # cannot tell -> never treat somebody else's page as residue
+
+
+def _unclaimed_pages(pages):
+    """Of these Copilot pages, the ones no LIVING run has claimed.
+
+    Reconciliation, not a guess: relay.ownership holds what each run says it owns, with a
+    lease and a pid, and returns only the claims that survive both. A page whose owner died
+    without releasing is residue; a page a live run is working in is not.
+    """
+    try:
+        from relay import ownership
+        from relay.relay_fleet import _page_target_id
+        observed = {}
+        by_id = {}
+        for pg in pages:
+            tid = _page_target_id(pg)
+            if not tid:
+                continue                     # cannot identify it -> do not touch it
+            observed[("page", tid)] = pg.url
+            by_id[("page", tid)] = pg
+        result = ownership.reconcile(observed, _pid_alive)
+        return [by_id[k] for k in result["orphaned"] if k in by_id]
+    except Exception:
+        return []                            # unsure -> close nothing
+
+
 def _close_idle_copilot_pages(context) -> int:
     """Close Copilot pages nobody owns yet, and say how many. Never raises.
 
@@ -598,7 +631,15 @@ def _close_idle_copilot_pages(context) -> int:
     be made, nothing is closed -- an untidy browser is better than no browser.
     """
     try:
-        stale = [p for p in context.pages if "m365.cloud.microsoft" in (p.url or "")]
+        candidates = [p for p in context.pages if "m365.cloud.microsoft" in (p.url or "")]
+        if not candidates:
+            return 0
+        # OWNERSHIP, NOT PRESENCE. This used to close every Copilot page on the context while
+        # its docstring claimed they were unowned. Concurrent runs are ordinary here, so the
+        # second run to start would close the first one's working page -- and the first would
+        # see a TargetClosedError it could not explain. Only a page no LIVING run claims is
+        # residue.
+        stale = _unclaimed_pages(candidates)
         if not stale:
             return 0
         if len(stale) >= len(context.pages):

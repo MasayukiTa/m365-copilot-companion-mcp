@@ -109,7 +109,12 @@ ROUTE_CAUSED = (
     # fixes nothing -- and measured: of four such fallbacks on record, three were followed by
     # a worker completing over the SOCKET, so the tab was not what recovered them.
     r"could not open the socket", r"invalidproxystatus", r"proxy rejected",
-    r"backend declined the request",
+    # NARROWED after an existing test caught the first version swallowing more than the
+    # evidence covered. "the backend declined the request" also carries InvalidRequest, which
+    # names a malformed request rather than a connection, and about which nothing has been
+    # measured -- so it stays unread, which is the whole point of leaving `unknown` alone.
+    # Only the decline that WAS measured is listed.
+    r"backend declined the request:\s*internalerror",
 )
 
 #: A fallback reason matching one of THESE is about the goal: the socket could carry the

@@ -95,13 +95,22 @@ def _closer():
     return mod._close_idle_copilot_pages
 
 
-def test_a_page_left_by_an_earlier_run_is_closed_before_this_one_starts():
+def test_a_page_left_by_an_earlier_run_is_closed_before_this_one_starts(monkeypatch):
     """The end-of-run cleanup stops a run LEAVING one. It does nothing about one already
     there -- and that gap cost a measurement: a page sat open for nine and a half hours,
     runs were launched on top of it, and every memory figure in that window carried it.
-    Stratified afterwards: 341 MB median without a Copilot page, 697 MB with one."""
+    Stratified afterwards: 341 MB median without a Copilot page, 697 MB with one.
+
+    The unclaimed-set is stubbed because the real one asks the browser for target ids, and
+    what this test is about is what happens to a page once it IS judged unowned."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "fleet_runner_close", os.path.join(ROOT, "relay", "fleet_runner.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
     ctx = _Ctx(["https://m365.cloud.microsoft/chat", "about:blank"])
-    assert _closer()(ctx) == 1
+    monkeypatch.setattr(mod, "_unclaimed_pages", lambda pages: list(pages))
+    assert mod._close_idle_copilot_pages(ctx) == 1
     assert ctx.pages[0].closed is True
     assert ctx.pages[1].closed is False, "the blank keep-alive must survive"
 
@@ -112,13 +121,58 @@ def test_a_clean_browser_is_left_alone():
     assert ctx.pages[0].closed is False
 
 
-def test_the_browser_is_never_left_with_no_pages():
+def test_the_browser_is_never_left_with_no_pages(monkeypatch):
     """Edge exits with its final page, and that would end the next run's SSO."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "fleet_runner_close2", os.path.join(ROOT, "relay", "fleet_runner.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
     ctx = _Ctx(["https://m365.cloud.microsoft/chat"])
-    assert _closer()(ctx) == 1
+    monkeypatch.setattr(mod, "_unclaimed_pages", lambda pages: list(pages))
+    assert mod._close_idle_copilot_pages(ctx) == 1
     assert any(p.url == "about:blank" and not p.closed for p in ctx.pages)
 
 
 def test_a_launch_reports_what_it_reclaimed():
     src = open(os.path.join(ROOT, "relay", "fleet_runner.py"), encoding="utf-8").read()
     assert "closed %d Copilot page(s) left by an earlier run" in src
+
+
+# ---- ownership, not presence -----------------------------------------------------------------
+
+def test_the_cleanup_asks_who_owns_a_page_rather_than_that_it_exists():
+    """It used to close every Copilot page on the context while claiming they were unowned."""
+    src = open(os.path.join(ROOT, "relay", "fleet_runner.py"), encoding="utf-8").read()
+    i = src.index("def _close_idle_copilot_pages")
+    body = src[i:i + 1800]
+    assert "_unclaimed_pages(" in body, "the cleanup must reconcile, not sweep"
+
+
+def test_a_page_that_cannot_be_identified_is_never_closed():
+    """No target id means no way to know whose it is, and closing somebody else's working
+    page is worse than leaving a stray one."""
+    src = open(os.path.join(ROOT, "relay", "fleet_runner.py"), encoding="utf-8").read()
+    i = src.index("def _unclaimed_pages")
+    body = src[i:i + 1200]
+    assert "continue" in body and "cannot identify" in body
+
+
+def test_being_unsure_closes_nothing():
+    src = open(os.path.join(ROOT, "relay", "fleet_runner.py"), encoding="utf-8").read()
+    i = src.index("def _unclaimed_pages")
+    body = src[i:i + 1400]
+    assert "return []" in body.split("except Exception:")[-1]
+
+
+def test_a_claimed_page_survives_the_cleanup(monkeypatch):
+    """The new contract, stated positively: a page a live run owns is not touched."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "fleet_runner_close3", os.path.join(ROOT, "relay", "fleet_runner.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ctx = _Ctx(["https://m365.cloud.microsoft/chat", "about:blank"])
+    monkeypatch.setattr(mod, "_unclaimed_pages", lambda pages: [])
+    assert mod._close_idle_copilot_pages(ctx) == 0
+    assert all(not p.closed for p in ctx.pages)

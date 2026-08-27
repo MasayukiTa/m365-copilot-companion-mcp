@@ -259,12 +259,21 @@ def test_any_failure_to_open_the_socket_is_transport():
     assert classify_fallback("ChatHubError: could not open the socket: timed out") == "route"
 
 
-def test_the_backend_declining_a_request_is_transport():
+def test_the_backend_declining_with_an_internal_error_is_transport():
     """A tab is a different client talking to the SAME backend, so it fixes nothing. Measured:
     of four such fallbacks on record, three were followed by a worker completing over the
     socket -- the tab was not what recovered them."""
     assert classify_fallback(
         "ChatHubError: the backend declined the request: InternalError") == "route"
+
+
+def test_a_decline_that_was_never_measured_stays_unread():
+    """The first version of the pattern above matched "backend declined the request" whole,
+    which also swallows InvalidRequest -- a malformed request, not a connection, and one
+    about which nothing has been measured. An existing test caught it. The list is extended
+    from what has actually been read, never by prefix."""
+    assert classify_fallback(
+        "ChatHubError: the backend declined the request: InvalidRequest") == "unknown"
 
 
 def test_a_card_still_needs_a_tab():

@@ -129,3 +129,36 @@ def test_a_corrupt_line_does_not_lose_the_rest(ledger):
         fh.write("{not json\n")
     own.claim("page", "p2", run_id="r1", pid=os.getpid())
     assert len(own.read_claims(ledger)) == 2
+
+
+# ---- the concurrent run this protects --------------------------------------------------------
+
+def test_a_second_run_must_not_close_the_first_runs_working_page(ledger):
+    """The bug this exists for. `_close_idle_copilot_pages` closed EVERY Copilot page on the
+    context while its docstring said "nobody owns yet" and nothing checked. Concurrent runs
+    are ordinary here, so the second run to start would close the first one's working page,
+    and the first would see a TargetClosedError it could not explain."""
+    own.claim("page", "target-A", run_id="run-1", pid=os.getpid())      # run 1 is working
+    observed = {("page", "target-A"): "chat", ("page", "target-B"): "chat"}
+    result = own.reconcile(observed, ALIVE, path=ledger)
+    assert list(result["orphaned"]) == [("page", "target-B")]
+    assert ("page", "target-A") in result["claimed"]
+
+
+def test_a_page_whose_run_was_killed_is_reclaimed(ledger):
+    """The other direction: ownership must not become a way to leak for ever."""
+    own.claim("page", "target-A", run_id="run-1", pid=999999)
+    result = own.reconcile({("page", "target-A"): "chat"}, DEAD, path=ledger)
+    assert list(result["orphaned"]) == [("page", "target-A")]
+
+
+def test_a_long_run_that_renews_keeps_its_pages(ledger):
+    """A run outliving the lease must say so, or a starting run reconciles its live working
+    pages as residue."""
+    own.claim("page", "target-A", run_id="run-1", pid=os.getpid())
+    late = time.time() + own.LEASE_S * 3
+    assert own.reconcile({("page", "target-A"): "chat"}, ALIVE,
+                         path=ledger, now=late)["orphaned"]
+    own.renew("page", "target-A", run_id="run-1")
+    assert not own.reconcile({("page", "target-A"): "chat"}, ALIVE,
+                             path=ledger, now=time.time() + 1)["orphaned"]

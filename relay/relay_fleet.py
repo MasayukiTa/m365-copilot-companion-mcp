@@ -1278,6 +1278,47 @@ def ram_target_cap(open_now, current_cap, ceiling,
     return target
 
 
+def _page_target_id(page):
+    """The browser's own id for this page, or "". Costs one CDP round trip.
+
+    The browser's id, not ours: a run reconciling at startup sees pages through CDP as
+    target ids, so a claim keyed on anything else could not be matched against what exists.
+    """
+    try:
+        sess = page.context.new_cdp_session(page)
+        try:
+            info = sess.send("Target.getTargetInfo") or {}
+            return (info.get("targetInfo") or {}).get("targetId") or ""
+        finally:
+            try:
+                sess.detach()
+            except Exception:
+                pass
+    except Exception:
+        return ""
+
+
+def _claim_page(page, note=""):
+    """Record that THIS process owns this page, so another run does not close it.
+
+    The start-of-run cleanup closed every Copilot page on the context. Its docstring said
+    "nobody owns yet" and nothing checked: concurrent runs are normal here, so the second run
+    to start would close the first one's working page. The claim is what makes that sentence
+    true.
+
+    Never raises and never blocks a page from being used -- an unrecorded page is a page that
+    a later reconcile may close, which is a cost, not a crash.
+    """
+    try:
+        from relay import ownership
+        tid = _page_target_id(page)
+        if tid:
+            ownership.claim("page", tid, run_id=str(os.getpid()), note=note)
+        return tid
+    except Exception:
+        return ""
+
+
 def _open_fresh(context, url):
     """Open a NEW tab on a fresh chat of the agent. Tolerant of slow navigation
     (a busy Edge can miss the 30s domcontentloaded) -- we proceed and wait for the
@@ -1285,6 +1326,9 @@ def _open_fresh(context, url):
     surfaced once so the user can authenticate."""
     from .edge_recover import surface, looks_like_login, touch_pause, rehide
     pg = context.new_page()
+    # Claimed the moment it exists, before any navigation can fail: an unclaimed page
+    # is one a concurrently starting run is entitled to close.
+    _claim_page(pg, note="open_fresh")
     surfaced = False
     force_timer = None
     # Up to 3 navigation attempts: a failed goto leaves the tab on about:blank, and
@@ -4372,6 +4416,25 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                           % (_w.name, _w.outcome, _retry_used[_g], _retry_cap), flush=True)
                 except Exception:
                     pass
+
+        # RENEW WHAT THIS RUN HOLDS. A claim expires so that a run killed without
+        # releasing cannot lock the machine for ever -- which means a run that lives longer
+        # than the lease has to say so, or another run starting up would reconcile its live
+        # working pages as residue and close them. Cheap: one append per sweep, and only for
+        # pages that exist.
+        if _reap_counter % 20 == 0:
+            try:
+                from relay import ownership as _own
+                for _w in workers:
+                    _pg = getattr(_w, "page", None)
+                    if _pg is None:
+                        continue
+                    _tid = getattr(_w, "_page_target_id_cache", "") or _page_target_id(_pg)
+                    if _tid:
+                        _w._page_target_id_cache = _tid
+                        _own.renew("page", _tid, run_id=str(os.getpid()))
+            except Exception:
+                pass
 
         _queue_ready_merges()
 
