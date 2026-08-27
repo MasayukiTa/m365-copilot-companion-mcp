@@ -213,6 +213,24 @@ def verdicts_now():
     verdicts.append(("one page per browser", not extra,
                      "pages per browser: %s" % (blanks or "none")))
 
+    # 2c. The last run kept the promise the code makes about how often it captures.
+    #
+    # THE ONLY INVARIANT HERE THAT IS NOT ABOUT THIS INSTANT, and it is here because the
+    # defect it catches is not visible in one either: the route captured 3.8 times a
+    # minute for weeks, and every single capture was correct. There was nothing to see in
+    # any event, only in how many of them there were.
+    #
+    # It reads the PREVIOUS run, since a launch gate runs before there is a current one --
+    # which is the intended meaning, do not stack a run on evidence the last one
+    # misbehaved. See capture_budget.acknowledge for how a red clears.
+    try:
+        sys.path.insert(0, os.path.join(REPO, "scripts", "win"))
+        from capture_budget import verdict as _budget
+        ok, why = _budget()
+    except Exception as exc:
+        ok, why = True, "budget unreadable (%s)" % str(exc)[:60]
+    verdicts.append(("capture budget kept", ok, why))
+
     # 3. Every tab that carried work today was a fallback.
     done, tab, fell, faults, closed = route_since(today)
     # Once the route is closed there is no socket to prefer, so a tab is the only path left

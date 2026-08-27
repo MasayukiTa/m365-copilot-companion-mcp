@@ -929,13 +929,24 @@ def _socket_route():
     if _SOCKET_ROUTE is None:
         with _SOCKET_ROUTE_LOCK:
             if _SOCKET_ROUTE is None:
+                from relay.capture_floor import floored
                 from relay.profile_token import capture_fn as _choose_capture
                 from relay.socket_route import SocketRoute, websocket_connect
                 # WHICH capture, chosen here rather than in socket_route, because
                 # that module is frozen and this is a policy about cost. Every
                 # option raises exactly what the ordinary one raises, so the
                 # breaker behind it sees no difference between them.
-                _SOCKET_ROUTE = SocketRoute(capture_fn=_choose_capture(),
+                #
+                # AND WRAPPED IN A FLOOR, whichever one it is. The route decides it
+                # needs a refresh by comparing the token against a margin, and when
+                # the margin is longer than the token -- which this tenant produces
+                # about one run in twenty-six -- that is true again the instant the
+                # capture finishes, so it captures again, measured at 3.8 a minute.
+                # The floor belongs BETWEEN the loop and the capture: one capture_fn
+                # already refused to open a page it had just opened, and that left
+                # every other implementation unprotected, including the ordinary tab
+                # capture the route gets when the light path is switched off.
+                _SOCKET_ROUTE = SocketRoute(capture_fn=floored(_choose_capture()),
                                             connect_fn=websocket_connect,
                                             refresh_margin_s=SOCKET_REFRESH_MARGIN_S,
                                             log=lambda m: print(m, flush=True))
