@@ -49,9 +49,17 @@ from .review_resilience import (
     task_envelope_from_goal,
 )
 
+# A STATUS BELONGS HERE ONLY IF SOMETHING SETS IT. `unresolved_refusal` was in this tuple,
+# in the label map below, in the cockpit's pill table and in the outcome enum -- five places
+# for a value that no branch in the repository ever assigned. It was found by closing the
+# outcome set and asking which members had producers.
+#
+# The cost of a phantom is not nothing: it reads as a state the system can reach, so anybody
+# reasoning about refusals had a case to consider that cannot occur, and anybody adding a
+# real one would have found the name taken.
 TERMINAL = (
     "done", "stuck", "maxturns", "error", "cancelled",
-    "content_refused", "unresolved_refusal",
+    "content_refused",
 )
 # non-terminal but not yet occupying a tab; counts as "still running" for the loop.
 PENDING = "pending"
@@ -194,6 +202,16 @@ CANNED_NONANSWER_MARKERS = (
     "それに応答できませんでした",
     "I couldn't respond to that",
     "I can't respond to that",
+    # ADDED FROM A REAL RUN, 2026-08-27. A worker sat on turn 6 of a thousand having
+    # received this at turn 4, and nothing here recognised it, so it kept spending turns
+    # against an agent that had stopped answering the question. Copilot returns it when it
+    # reads a request as asking to escalate to a person, which the goal never did.
+    #
+    # MEASURED BEFORE ADDING, because a marker that fires on a real answer costs more than
+    # one that misses: 6 occurrences in 6,585 assistant replies on record, every one of them
+    # 89 to 103 characters long and consisting of nothing but this message. There is no
+    # reply where it appears as part of an answer.
+    "担当者へのエスカレーションが構成されていません",
 )
 
 #: Set once any worker in this process has been answered by the CUSTOM agent -- reached DONE, or
@@ -953,6 +971,24 @@ def _socket_route():
     return _SOCKET_ROUTE
 
 
+_REOPEN_POLICY = None
+
+
+def _reopen_policy():
+    """The run's reopen policy, built once. Backoff is stateful, so it must outlive a pass.
+
+    NOT RESET WHEN THE ROUTE IS. A fresh route starts with no closed_reason, so the policy
+    sees an open route and clears itself on the next pass anyway -- and keeping the object
+    means a route that closes, reopens and closes again is still counted by one thing, which
+    is what makes "reopened N times this run" a number worth reading.
+    """
+    global _REOPEN_POLICY
+    if _REOPEN_POLICY is None:
+        from relay.route_reopen import ReopenPolicy
+        _REOPEN_POLICY = ReopenPolicy(log=lambda m: print(m, flush=True))
+    return _REOPEN_POLICY
+
+
 def reset_socket_route():
     """Discard the route so the next caller builds a fresh one. Call after an Edge hard reset.
 
@@ -1542,7 +1578,6 @@ _PHASE_LABELS = {
     "cancelled":   "Stopped",
     "fresh_replay": "Fresh replay",
     "content_refused": "Content refused",
-    "unresolved_refusal": "Unresolved refusal",
 }
 
 
@@ -4700,6 +4735,23 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     context.cookies()
                 except Exception:
                     raise FleetContextLost(_unfinished())
+
+        # IS THE ROUTE STILL RIGHT TO BE SHUT? Asked here, on every sweep, and NOT at
+        # admission -- which is where it was first put, and which was wrong for a reason the
+        # first live attempt showed plainly: eight goals were all admitted within the opening
+        # seconds, so by the time a reopen could have been earned there was no admission left
+        # to act on. A run's time is spent in this loop, and the drivers minted from it --
+        # every research and refuter side agent -- ask the route for a socket one at a time,
+        # for as long as the run lasts.
+        #
+        # See relay/route_reopen.py for what may be reopened and on what evidence. Nothing
+        # here can block: any handshake runs on its own thread, which it must, because this
+        # one is inside sync_playwright() and websocket_connect starts an event loop.
+        try:
+            if _reopen_policy().consider(_socket_route()):
+                reset_socket_route()
+        except Exception:
+            pass
 
         for w in workers:
             # NO, A PENDING STEER MAY NOT REVIVE A FINISHED WORKER FROM HERE. It was tried,

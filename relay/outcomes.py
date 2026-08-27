@@ -40,7 +40,6 @@ STATUS_OF = {
     "MAXTURNS": "maxturns",
     "CANCELLED": "cancelled",
     "CONTENT_REFUSED": "content_refused",
-    "UNRESOLVED_REFUSAL": "unresolved_refusal",
     "STUCK": "stuck",
     #: The connection or agent never established. Reporting this as an error is the misreport
     #: the outcome was created to prevent.
@@ -56,21 +55,21 @@ STATUS_OF = {
 OUTCOMES = frozenset(STATUS_OF)
 
 #: Declared but never produced, with the reason, so the exhaustiveness test can tell "not
-#: emitted yet" from "the enum is stale". UNRESOLVED_REFUSAL has no producer anywhere in the
-#: relay package -- only the STATUS of that name is plumbed, through five call sites and the
-#: cockpit's pill table. It is kept because removing it would change the UI's vocabulary for
-#: a status that is still reachable through other paths, and dropping the outcome silently
-#: would leave those five sites reading a name nothing defines.
-NOT_PRODUCED = {
-    "UNRESOLVED_REFUSAL": "no branch sets it; the status of the same name is still plumbed",
-}
+#: emitted yet" from "the enum is stale".
+#:
+#: EMPTY, AND THAT IS THE POINT. It held UNRESOLVED_REFUSAL, which was the first thing
+#: closing this set found: an outcome, a status, a pill and a terminal-state entry -- five
+#: places -- for a value no branch anywhere assigned. Keeping it was justified at the time by
+#: not wanting to change the UI's vocabulary; that was the wrong way round, because the
+#: vocabulary described a state the system cannot reach. All five are gone.
+NOT_PRODUCED = {}
 
 #: Worth another attempt: the run did not get an answer, as opposed to the task being wrong.
 RETRYABLE = frozenset({"STUCK", "INFRA_STUCK", "REFUSED"})
 
 #: NOT retried, and the distinction is the point. MAXTURNS means the worker spent its whole
 #: turn budget: running it again spends the same budget the same way. CANCELLED was a human
-#: saying stop. CONTENT_REFUSED and UNRESOLVED_REFUSAL are judgements about the request, and
+#: saying stop. CONTENT_REFUSED is a judgement about the request, and
 #: repeating a request unchanged does not change a judgement of it. VERIFY_FAILED produced an
 #: answer that failed its acceptance check -- a retry is the caller's decision, not the
 #: loop's. ERROR is an exception whose cause is not known to be transient.
@@ -81,7 +80,7 @@ NON_RETRYABLE = frozenset(OUTCOMES - RETRYABLE)
 #: rather than that the goal is broken, so a fresh browser context deserves another shot at it.
 #: ERROR and VERIFY_FAILED are likewise re-runnable after a recovery.
 FINISHED = frozenset({
-    "DONE", "FANOUT", "MAXTURNS", "CANCELLED", "CONTENT_REFUSED", "UNRESOLVED_REFUSAL",
+    "DONE", "FANOUT", "MAXTURNS", "CANCELLED", "CONTENT_REFUSED",
     "STUCK",
 })
 

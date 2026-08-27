@@ -43,18 +43,33 @@ import time
 # allow running both as `python -m relay.fleet_runner` and `python relay/fleet_runner.py`
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# BEFORE THE IMPORTS BELOW, AND THAT ORDER IS THE WHOLE POINT. This call used to sit under
+# them, and a module-level `X = os.environ.get("MCP_...")` runs at import -- so every such
+# constant in relay_fleet and everything it pulls in was evaluated against the process
+# environment with .env not yet loaded. The key was read; the file had simply not been.
+#
+# MEASURED 2026-08-28 rather than reasoned about: with MCP_FLEET_SOCKET_RETRIES=0 in .env,
+# relay_fleet.DEFAULT_SOCKET_RETRIES imported through this module read 2. Call-time reads
+# were unaffected -- MCP_SOCKET_FORCE_FAIL in the same file took effect in the same run --
+# which is why this hid for so long: the settings that appeared to work and the settings
+# that silently did nothing were separated by nothing a reader of .env could see.
+#
+# Nothing in the current .env was affected: of its 26 keys, exactly one is read at module
+# level and differs from its default, and that one was a temporary test line. The cost was
+# entirely in front of us -- the next person to set one of those keys and watch it do
+# nothing.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 from relay.relay_fleet import (  # noqa: E402
     EVAL_STALL_CEILING_S, TERMINAL, VERIFY_STATUSES, auto_concurrency, avail_phys_mb,
     goal_fields, run_relay_fleet,
 )
 from relay.copilot_autopilot_relay import default_notify  # noqa: E402
 from relay.refuter import PANEL_LENSES  # noqa: E402
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
 
 
 # ── COORDINATOR OUTPUT CAPTURE (TEE) ────────────────────────────────────────────
@@ -141,7 +156,6 @@ STATUS_PILL = {
     "cancelled": ("停止",   "muted"),    # user released it from the cockpit
     "fresh_replay": ("新規会話", "good"),
     "content_refused": ("内容拒否", "bad"),
-    "unresolved_refusal": ("未解決拒否", "bad"),
 }
 
 def report_unused_steers(workers, reported=None, log=None):

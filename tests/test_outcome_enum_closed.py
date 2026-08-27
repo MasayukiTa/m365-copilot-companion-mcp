@@ -65,9 +65,13 @@ def test_every_outcome_the_code_assigns_is_a_member():
 
 def test_every_member_is_produced_or_declared_unproduced():
     """The reverse direction: a member nothing emits is either dead or a plumbing gap, and
-    both are worth knowing. UNRESOLVED_REFUSAL is the live example -- five call sites and the
-    cockpit's pill table plumb the STATUS of that name, and no branch anywhere sets the
-    outcome."""
+    both are worth knowing.
+
+    UNRESOLVED_REFUSAL was the first thing this found -- an outcome, a status, a pill and a
+    terminal-state entry, five places, for a value no branch anywhere assigned. It was kept for
+    a while on the grounds that removing it would change the UI's vocabulary, which was the
+    wrong way round: the vocabulary described a state the system cannot reach. All five are
+    gone, and NOT_PRODUCED is empty, which is what this asserts against."""
     assigned = set(_assigned_outcomes())
     never = outcomes.OUTCOMES - assigned - set(outcomes.NOT_PRODUCED)
     assert not never, (

@@ -2319,8 +2319,13 @@ class CockpitWindow : Window
         if (d == null || !d.TryGetValue(key, out v) || v == null) return "";
         return Convert.ToString(v);
     }
+    // A COPY OF relay/relay_fleet.py's CANNED_NONANSWER_MARKERS, and copies drift. The
+    // escalation line was in a real run for hours before either list had it; a test now
+    // fails if the two stop agreeing, because a cockpit that cannot recognise what the
+    // relay treats as a non-answer shows a worker as healthy while the relay re-queues it.
     static readonly string[] _cannedNonAnswer = {
         "それに応答できませんでした", "I couldn't respond to that", "I can't respond to that",
+        "担当者へのエスカレーションが構成されていません",
     };
     static bool LooksLikeCannedNonAnswer(string s)
     {
