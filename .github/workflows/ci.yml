@@ -239,6 +239,17 @@ jobs:
             relay/test_transport_policy.py \
             relay/test_socket_driver.py \
             relay/test_socket_route.py \
+            relay/test_fanout.py \
+            relay/test_fanout_worker.py \
+            tests/test_stack_guard.py \
+            tests/test_reap_orphan_edge.py \
+            tests/test_fleet_reaper_entry.py \
+            tests/test_outcome_reporting.py \
+            tests/test_run_end_pages.py \
+            tests/test_faulthandler_rotation.py \
+            tests/test_verify_stack_interrupted.py \
+            tests/test_resume_interrupted.py \
+            tests/test_skill_match_japanese.py \
             relay/test_chathub_capture.py \
             relay/selfimprove/test_guards.py \
             relay/selfimprove/test_harness_feedback.py \

@@ -41,11 +41,22 @@ def test_a_live_run_is_reported_alive(tmp_path, monkeypatch):
 
 
 def test_a_dead_run_is_reported_dead_with_its_goals(tmp_path, monkeypatch):
+    """The liveness probe is stubbed rather than aimed at a pid nobody is using.
+
+    It shells out to PowerShell, which does not exist on the Linux runner CI uses -- and the
+    probe treats a failure to ask as "alive", correctly, so on CI this test would have been
+    asserting the opposite of what it reads. Local-green-CI-red, from a test that looked
+    perfectly ordinary."""
     monkeypatch.setattr(vs, "REPO", str(tmp_path))
     d = os.path.join(tmp_path, ".fleet")
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "fleet_run_active.json"), "w", encoding="utf-8") as fh:
         json.dump({"pid": 999999, "argv": ["--goals-file", "C:/x/goals.jsonl"]}, fh)
+
+    class _Dead:
+        stdout = "0"
+
+    monkeypatch.setattr(vs.subprocess, "run", lambda *a, **k: _Dead())
     m = vs._active_marker()
     assert m["alive"] is False
     assert m["goals"] == "C:/x/goals.jsonl"
