@@ -1043,7 +1043,15 @@ class CockpitWindow : Window
         if (k == "hs_agent_ok") return ja ? "専用エージェントに接続中" : "Bound to the configured agent";
         if (k == "hs_agent_warn") return ja ? "既定Copilotに落ちている可能性（エージェント未検出）" : "Possible default-Copilot fallback (agent tab not found)";
         if (k == "hs_agent_bad") return ja ? "実行中ですがM365チャットタブを検出できません" : "Run is active but no M365 chat tab is available";
-        if (k == "hs_agent_gray") return ja ? "Edge 停止中のため判定不可" : "Edge down — cannot tell";
+        // hs_agent_gray no longer means "Edge is down": under the socket route the agent dot
+        // is grey when no run is in flight, which is the ordinary idle state.
+        if (k == "hs_agent_gray") return ja ? "走行なし" : "No run in flight";
+        if (k == "hs_agent_canned") return ja ? "（直近の返答が定型の無回答）" : " (the last reply was the canned non-answer)";
+        if (k == "hs_agent_tabs") return ja ? "ソケット経路が閉鎖 — 全ワーカーがタブ（動作するがコスト大）" : "Socket route closed — every worker on a tab (works, costs several times more)";
+        if (k == "hs_signin_gray") return ja ? "捕捉の記録なし（走行なし）" : "No capture on record (no run)";
+        if (k == "hs_signin_unknown_live") return ja ? "走行中だが捕捉の記録がない" : "A run is live and no capture is on record";
+        if (k == "hs_signin_failed_other") return ja ? "直近の捕捉が失敗（サインイン以外の理由）" : "The last capture failed for a reason other than sign-in";
+        if (k == "hs_signin_stale") return ja ? "トークンが期限切れ（走行中）" : "The token has expired while a run is live";
         if (k == "hs_fixing") return ja ? "修復中… " : "Fixing… ";
         if (k == "hs_fix_signin") return ja ? "サインイン用に Edge を開いています…" : "Opening Edge for sign-in…";
         if (k == "hs_fix_signin_toast") return ja ? "開いたEdgeでサインインしてください。完了すると自動で緑になります。" : "Sign in on the Edge that opened; it turns green automatically when done.";
@@ -2093,55 +2101,224 @@ class CockpitWindow : Window
         //    on edgeOk) because it reflects a completely separate Edge profile/CDP port (:9223).
         PollToolProbeOnce(now);
 
-        // 3+4) Sign-in + Agent both derive from the tab list (:9222/json). If Edge is down,
-        //      sign-in is unknown (gray) and agent is gray.
-        if (!edgeOk)
+        // 3+4) Sign-in and Agent USED to derive from the tab list at :9222/json, because
+        //      when this was written every worker drove a tab. Work runs over a websocket
+        //      now and a page is opened only to read a token -- roughly once per token
+        //      lifetime, for four seconds, and not at all in between. So the tab list is
+        //      empty during normal operation, and both dots were reading the emptiness:
+        //
+        //        sign-in  needsSignin = onLoginWall && !hasUsableM365Chat. With no tabs at
+        //                 all that is false, so the dot was GREEN -- green because nothing
+        //                 was there, not because sign-in worked, and equally green with an
+        //                 EXPIRED sign-in. Health reported from an absence fails open.
+        //
+        //        agent    RunIsLive() && !hasUsableM365Chat -> RED. During a socket run
+        //                 there is never a chat tab, so this was a guaranteed false red for
+        //                 the whole run.
+        //
+        //      THE RULE THAT REPLACES THEM, applied to both: grey means there is no
+        //      evidence and none is expected; green means fresh POSITIVE evidence; evidence
+        //      that is expected and missing is neither -- amber, then red.
+        //
+        //      The evidence is .fleet/capture_status.json, written by relay/capture_floor.py
+        //      at the one seam every capture passes through. It carries the token's expiry
+        //      and audience, the agent the template names, and whether the capture worked.
+        //      Never the token: an expiry and an audience grant nothing on their own.
+        UpdateCaptureDots(now);
+    }
+
+    // Sign-in and Agent, from what the last capture established rather than from tabs.
+    //
+    //   sign-in   grey    no capture on record and no run wanting one
+    //             green   the last capture worked and its token still has life
+    //             amber   the last capture failed for a reason a person cannot fix, or the
+    //                     token has expired while a run is live
+    //             red     the last capture failed because sign-in is needed
+    //
+    //   agent     grey    no run
+    //             green   run live, the route is open and the template names an agent
+    //             amber   run live and the route is CLOSED -- every worker is on a tab,
+    //                     which works and costs several times more. Not an error, and not
+    //                     invisible either: amber is exactly 'working, worth knowing'.
+    //             red     run live and no agent was ever established
+    void UpdateCaptureDots(DateTime now)
+    {
+        Dictionary<string, object> cap = ReadCaptureStatus();
+        bool live = RunIsLive();
+
+        if (cap == null)
         {
-            SetDot(3, HealthState.Gray, T("hs_edge_detail_bad"), now);
-            SetDot(4, HealthState.Gray, T("hs_agent_gray"), now);
+            // NO RECORD. Grey while idle -- a system that has not captured yet is not
+            // unhealthy. Amber during a run, because then the evidence IS expected.
+            SetDot(3, live ? HealthState.Yellow : HealthState.Gray,
+                   T(live ? "hs_signin_unknown_live" : "hs_signin_gray"), now);
+            SetDot(4, live ? HealthState.Red : HealthState.Gray,
+                   T(live ? "hs_agent_bad" : "hs_agent_gray"), now);
             return;
         }
-        string tabsJson = HttpGetBody("http://127.0.0.1:9222/json", 3500);
-        List<string> urls = ExtractTabUrls(tabsJson);
 
-        // 3) Sign-in: a stale login tab must not override a live M365 chat tab. Edge can retain
-        //    an old login.microsoftonline.com page after authentication while the custom-agent
-        //    conversation is already working in another tab. Red only when a login wall exists
-        //    AND there is no usable signed-in M365 chat tab.
-        bool onLoginWall = false;
-        bool hasUsableM365Chat = false;
-        foreach (string u in urls) if (LooksLikeLoginWall(u)) { onLoginWall = true; break; }
-        foreach (string u in urls)
-            if (LooksLikeUsableM365Chat(u)) { hasUsableM365Chat = true; break; }
-        bool needsSignin = onLoginWall && !hasUsableM365Chat;
-        SetDot(3, needsSignin ? HealthState.Red : HealthState.Green,
-               T(needsSignin ? "hs_signin_bad" : "hs_signin_ok"), now);
+        bool ok = TruthyField(cap, "ok");
+        double expiresAt = NumberField(cap, "expires_at");
+        string kind = StringField(cap, "kind");
+        string gptId = StringField(cap, "gpt_id");
+        double nowEpoch = (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
+        double lifeLeft = expiresAt - nowEpoch;
 
-        // 4) Agent: the tab URL is NOT a reliable signal -- the M365 SPA keeps the loaded
-        //    custom agent while the URL normalizes to '/chat/?redirfrom=CsrToSSR' (verified:
-        //    a working agent that returned real tool results showed exactly that URL). So we
-        //    judge from the GROUND TRUTH instead: the newest transcript's last assistant turn.
-        //    The custom agent prefixes its replies with its display name; a default-Copilot
-        //    fallback returns the canned non-answer. While a run is live, a usable M365 chat tab
-        //    is enough to show GREEN immediately (including before the first assistant reply),
-        //    YELLOW is the canned default-Copilot fallback, and RED means the run is active but
-        //    no usable chat tab exists. GRAY is reserved for idle / not currently running.
-        if (!RunIsLive())
-            SetDot(4, HealthState.Gray, T("hs_agent_gray"), now);
-        else if (!hasUsableM365Chat)
-            SetDot(4, HealthState.Red, T("hs_agent_bad"), now);
+        // SIGN-IN. A live token is positive evidence. An expired one is NOT automatically
+        // red: the next capture may well succeed, and a dot that stays red for hours after a
+        // finished run is a dot people stop reading. Expiry only matters while a run wants
+        // a token.
+        if (!ok && string.Equals(kind, "signin", StringComparison.OrdinalIgnoreCase))
+            SetDot(3, HealthState.Red, T("hs_signin_bad"), now);
+        else if (!ok)
+            SetDot(3, HealthState.Yellow, T("hs_signin_failed_other"), now);
+        else if (lifeLeft > 0)
+            SetDot(3, HealthState.Green, T("hs_signin_ok"), now);
+        else if (live)
+            SetDot(3, HealthState.Yellow, T("hs_signin_stale"), now);
         else
+            SetDot(3, HealthState.Gray, T("hs_signin_gray"), now);
+
+        // AGENT. The template naming an agent is a STRONGER guarantee than the tab sniffing
+        // it replaces: a capture whose request names no agent raises NotAnAgentSurface and
+        // produces no template at all, so a silent bind to the default Copilot -- no
+        // connectors, no tenant grounding, and a fluent answer -- cannot happen unnoticed.
+        if (!live)
+            SetDot(4, HealthState.Gray, T("hs_agent_gray"), now);
+        else if (RouteIsClosed())
         {
-            string lastAssistant = NewestAssistantText();
-            if (lastAssistant == null)
-                SetDot(4, HealthState.Green, T("hs_agent_ok"), now);          // run live, first reply pending
-            else if (LooksLikeCannedNonAnswer(lastAssistant))
-                SetDot(4, HealthState.Yellow, T("hs_agent_warn"), now);        // default-Copilot fallback
-            else
-                SetDot(4, HealthState.Green, T("hs_agent_ok"), now);           // agent answering
+            // THE CANNED-ANSWER SNIFF SURVIVES HERE AND NOWHERE ELSE. It used to decide the
+            // dot's colour, which made a judgement about ONE TURN'S QUALITY into a statement
+            // about infrastructure. It still means something while workers are on tabs, so it
+            // is demoted to a note on the amber rather than deleted.
+            string tail = NewestAssistantText();
+            string note = T("hs_agent_tabs");
+            if (tail != null && LooksLikeCannedNonAnswer(tail)) note += T("hs_agent_canned");
+            SetDot(4, HealthState.Yellow, note, now);
+        }
+        else if (FleetAgentIsBound())
+            SetDot(4, HealthState.Green, T("hs_agent_ok"), now);
+        else if (!string.IsNullOrEmpty(gptId))
+            SetDot(4, HealthState.Green, T("hs_agent_ok"), now);
+        else
+            SetDot(4, HealthState.Red, T("hs_agent_bad"), now);
+    }
+
+    // Is the FLEET'S OWN surface bound to an agent?
+    //
+    // NOT capture_status.json's gpt_id, which is the LAST capture on ANY surface. The route
+    // also captures for side agents -- a researcher or an analyst, on conversation-specific
+    // URLs -- and one of those was observed writing an empty gpt_id, which would have turned
+    // this dot red while the fleet's own agent was working perfectly. The last event about
+    // somebody else is not evidence about you.
+    //
+    // The per-surface fact is already on disk: relay/profile_token.py caches one request
+    // template per agent surface, named by a hash of its URL, and refuses to return one that
+    // names no agent. Its existence IS the binding.
+    bool FleetAgentIsBound()
+    {
+        try
+        {
+            string url = EnvValue("MCP_FLEET_AGENT_URL");
+            if (string.IsNullOrEmpty(url)) url = EnvValue("MCP_IMPL_AGENT_URL");
+            if (string.IsNullOrEmpty(url)) return false;
+            string path = Path.Combine(RepoRoot(), ".fleet", "templates",
+                                       "template_" + Sha256Prefix(url) + ".json");
+            if (!File.Exists(path)) return false;
+            return File.ReadAllText(path).IndexOf("gptId", StringComparison.Ordinal) >= 0;
+        }
+        catch (Exception) { return false; }
+    }
+
+    // The same 16 hex characters relay/profile_token.py names its cache files with. If these
+    // two ever disagree the lookup finds nothing and the dot reports "not bound" for ever --
+    // a silent zero -- so the algorithm is stated in both places rather than assumed.
+    static string Sha256Prefix(string s)
+    {
+        using (var sha = System.Security.Cryptography.SHA256.Create())
+        {
+            byte[] hash = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(s ?? ""));
+            var sb = new StringBuilder();
+            for (int i = 0; i < 8; i++) sb.Append(hash[i].ToString("x2"));
+            return sb.ToString();
         }
     }
 
+    Dictionary<string, object> ReadCaptureStatus()
+    {
+        try
+        {
+            string path = Path.Combine(RepoRoot(), ".fleet", "capture_status.json");
+            if (!File.Exists(path)) return null;
+            return _js.DeserializeObject(File.ReadAllText(path)) as Dictionary<string, object>;
+        }
+        catch (Exception) { return null; }
+    }
+
+    // Has the route's one-way breaker tripped DURING THIS RUN? Read from the route's own
+    // append-only record. Scanned from the run's start, because a close is per-run: the route
+    // is rebuilt with each coordinator, and a close from yesterday says nothing about now.
+    bool RouteIsClosed()
+    {
+        try
+        {
+            string path = Path.Combine(RepoRoot(), ".fleet", "socket_route.jsonl");
+            if (!File.Exists(path)) return false;
+            string stamp = RunStartedLocal().ToString("yyyy-MM-ddTHH:mm:ss");
+            foreach (string line in File.ReadLines(path))
+            {
+                if (line.IndexOf("route_closed", StringComparison.Ordinal) < 0) continue;
+                // The record is written by json.dumps, which puts a space after the colon:
+                //   {"ts": 1787270671.84, "at": "2026-08-21T09:04:31", "event": "route_closed"}
+                // Matching without the space finds nothing, and finding nothing here means the
+                // dot reports an open route for ever -- a silent zero, which is how a check
+                // fails open. The marker is taken from a real line rather than composed.
+                const string AtKey = "\"at\": \"";
+                int i = line.IndexOf(AtKey, StringComparison.Ordinal);
+                if (i < 0) continue;
+                int from = i + AtKey.Length;
+                if (from + 19 > line.Length) continue;
+                string at = line.Substring(from, 19);
+                if (string.CompareOrdinal(at, stamp) >= 0) return true;
+            }
+        }
+        catch (Exception) { }
+        return false;
+    }
+
+    DateTime RunStartedLocal()
+    {
+        try
+        {
+            double started = NumberField(ReadStatus(), "started");
+            if (started > 0)
+                return new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(started).ToLocalTime();
+        }
+        catch (Exception) { }
+        return DateTime.Now.AddHours(-24);
+    }
+
+    static bool TruthyField(Dictionary<string, object> d, string key)
+    {
+        object v;
+        if (d == null || !d.TryGetValue(key, out v) || v == null) return false;
+        if (v is bool) return (bool)v;
+        return string.Equals(Convert.ToString(v), "True", StringComparison.OrdinalIgnoreCase);
+    }
+
+    static double NumberField(Dictionary<string, object> d, string key)
+    {
+        object v;
+        if (d == null || !d.TryGetValue(key, out v) || v == null) return 0;
+        try { return Convert.ToDouble(v); } catch (Exception) { return 0; }
+    }
+
+    static string StringField(Dictionary<string, object> d, string key)
+    {
+        object v;
+        if (d == null || !d.TryGetValue(key, out v) || v == null) return "";
+        return Convert.ToString(v);
+    }
     static readonly string[] _cannedNonAnswer = {
         "それに応答できませんでした", "I couldn't respond to that", "I can't respond to that",
     };
@@ -2301,61 +2478,13 @@ class CockpitWindow : Window
         return sb.ToString();
     }
 
-    // login-wall regex from doctor.ps1 (just-fixed): login.microsoftonline / login.live.com /
-    // /adfs/ / adfs. / /oauth2/authorize / /signin / login_hint= . Implemented as substring checks.
-    static bool LooksLikeLoginWall(string url)
-    {
-        if (string.IsNullOrEmpty(url)) return false;
-        string u = url.ToLowerInvariant();
-        return u.Contains("login.microsoftonline") || u.Contains("login.live.com")
-            || u.Contains("/adfs/") || u.Contains("adfs.")
-            || u.Contains("/oauth2/authorize") || u.Contains("/signin")
-            || u.Contains("login_hint=");
-    }
+    // THE LOGIN-WALL PREDICATE IS GONE WITH THE TAB LIST IT READ. It answered "is one of the
+    // open tabs a sign-in page", and under the socket route there are no tabs to ask about --
+    // the health strip judges sign-in from what the last capture established instead. The
+    // failure mode it leaves behind is worth naming: a predicate over an empty list returns
+    // false, so the dot went green because nothing was there rather than because sign-in
+    // worked. See UpdateCaptureDots.
 
-    static bool LooksLikeUsableM365Chat(string url)
-    {
-        if (string.IsNullOrEmpty(url) || LooksLikeLoginWall(url)) return false;
-        string u = url.ToLowerInvariant();
-        return (u.StartsWith("https://m365.cloud.microsoft/")
-                || u.StartsWith("https://www.microsoft365.com/"))
-            && u.Contains("/chat");
-    }
-
-    // Pull every "url":"..." value out of the raw :9222/json tab-list body. Uses the shared
-    // JavaScriptSerializer when the body parses as an array; falls back to a cheap scan otherwise.
-    List<string> ExtractTabUrls(string json)
-    {
-        var urls = new List<string>();
-        if (string.IsNullOrEmpty(json)) return urls;
-        try
-        {
-            object parsed = _js.DeserializeObject(json);
-            if (parsed is object[])
-            {
-                foreach (object o in (object[])parsed)
-                {
-                    var d = o as Dictionary<string, object>;
-                    if (d != null && d.ContainsKey("url") && d["url"] != null) urls.Add(d["url"].ToString());
-                }
-                return urls;
-            }
-        }
-        catch (Exception) { }
-        // Fallback: substring scan for "url":"..."
-        int idx = 0;
-        while (true)
-        {
-            int k = json.IndexOf("\"url\"", idx, StringComparison.OrdinalIgnoreCase);
-            if (k < 0) break;
-            int c = json.IndexOf(':', k); if (c < 0) break;
-            int q1 = json.IndexOf('"', c + 1); if (q1 < 0) break;
-            int q2 = json.IndexOf('"', q1 + 1); if (q2 < 0) break;
-            urls.Add(json.Substring(q1 + 1, q2 - q1 - 1));
-            idx = q2 + 1;
-        }
-        return urls;
-    }
 
     // ── .env reader (utf-8, tolerate BOM) ───────────────────────────────────────────
     // The .env lives at the REPO ROOT (one level up from ...\ui), same file doctor.ps1 reads.
@@ -3460,6 +3589,13 @@ class CockpitWindow : Window
         // ── textarea + watermark overlay (a Grid so they stack in the same cell) ──
         var taGrid = new Grid();
         _goalInput = new TextBox();
+        // AN AUTOMATION ID, so a test can address this box by name instead of guessing.
+        // Without one the only way to tell the composer from the history search box was
+        // their WIDTH -- 1008 pixels against 160 -- which holds while a run is idle and
+        // breaks the moment a run adds steer boxes to the worker cards. A guess that
+        // works most of the time is the worst kind: it typed a goal into the right box
+        // for a week and would have typed one into the search box eventually.
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_goalInput, "goalInput");
         _goalInput.AcceptsReturn = true; _goalInput.TextWrapping = TextWrapping.Wrap;
         _goalInput.MinHeight = 30; _goalInput.MaxHeight = 180;   // compact: ~30 (was 38), max 180 internal scroll
         _goalInput.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
@@ -9290,6 +9426,7 @@ class CockpitWindow : Window
         if (_histSearchBox == null)
         {
             _histSearchBox = new TextBox();
+            System.Windows.Automation.AutomationProperties.SetAutomationId(_histSearchBox, "histSearch");
             _histSearchBox.Text = _histQuery ?? "";
             _histSearchBox.Width = 160; _histSearchBox.FontSize = 12;
             _histSearchBox.Padding = new Thickness(6, 2, 6, 2);

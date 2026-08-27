@@ -116,31 +116,39 @@ if ($Goal.Count -gt 0) {
 # READONLY IS A DRY RUN, not just a field dump: it prints exactly what would go in.
 if ($ReadOnly) { exit 0 }
 
-# WHICH BOX IS THE GOAL BOX. The cockpit gives neither field a name or an automation id, so
-# there is nothing to match on but shape -- and the two shapes are not close: the goal
-# composer spans the window, the history search box is 160 pixels wide. Picking the widest
-# is therefore reliable HERE, and the check below makes it fail loudly rather than quietly
-# if that ever stops being true. A silently-wrong pick would type a goal into the search box
-# and report success.
-$best = $null; $bestW = 0; $secondW = 0
-for ($i = 0; $i -lt $edits.Count; $i++) {
-    $e = $edits.Item($i)
-    if (-not $e.Current.IsEnabled) { continue }
-    $vp = $null
-    if (-not $e.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) { continue }
-    if ($vp.Current.IsReadOnly) { continue }
-    $w = $e.Current.BoundingRectangle.Width
-    Write-Output ('  candidate [{0}] width={1:N0} height={2:N0}' -f $i, $w, $e.Current.BoundingRectangle.Height)
-    if ($w -gt $bestW) { $secondW = $bestW; $best = $e; $bestW = $w }
-    elseif ($w -gt $secondW) { $secondW = $w }
+# WHICH BOX IS THE GOAL BOX. By AutomationId, which the cockpit now sets. Before it did,
+# the only distinguishing property was WIDTH -- 1008 pixels against the history search
+# box's 160 -- and that holds while a run is idle and breaks the moment a run adds steer
+# boxes to the worker cards. The width guard refused rather than guessing, which is right,
+# and also meant no steer could be sent during a run at all. An id is the fix the guard's
+# own message asked for.
+$idCond = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'goalInput')
+$target = $win.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $idCond)
+if ($target) {
+    Write-Output 'goal box: found by AutomationId'
+} else {
+    # FALLBACK for a cockpit built before the id existed. Same guard as before: refuse
+    # rather than guess when the widths do not separate cleanly.
+    $best = $null; $bestW = 0; $secondW = 0
+    for ($i = 0; $i -lt $edits.Count; $i++) {
+        $e = $edits.Item($i)
+        if (-not $e.Current.IsEnabled) { continue }
+        $vp = $null
+        if (-not $e.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) { continue }
+        if ($vp.Current.IsReadOnly) { continue }
+        $w = $e.Current.BoundingRectangle.Width
+        if ($w -gt $bestW) { $secondW = $bestW; $best = $e; $bestW = $w }
+        elseif ($w -gt $secondW) { $secondW = $w }
+    }
+    if (-not $best) { throw 'no writable text field found in the cockpit' }
+    if ($secondW -gt 0 -and $bestW -lt ($secondW * 2)) {
+        throw ('cannot tell the goal box from the other field: widths {0:N0} and {1:N0}. ' +
+               'Rebuild the cockpit so the box carries its AutomationId.' -f $bestW, $secondW)
+    }
+    $target = $best
+    Write-Output ('goal box: by width {0:N0} (next widest {1:N0}) -- no AutomationId' -f $bestW, $secondW)
 }
-if (-not $best) { throw 'no writable text field found in the cockpit' }
-if ($secondW -gt 0 -and $bestW -lt ($secondW * 2)) {
-    throw ('cannot tell the goal box from the other field: widths {0:N0} and {1:N0}. ' +
-           'Give the boxes AutomationIds rather than letting this guess.' -f $bestW, $secondW)
-}
-$target = $best
-Write-Output ('goal box: width {0:N0} (next widest {1:N0})' -f $bestW, $secondW)
 
 function Submit([string]$text) {
     # CTRL+ENTER, NOT ENTER. The composer sets AcceptsReturn, so a plain Enter inserts a

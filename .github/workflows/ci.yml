@@ -257,6 +257,9 @@ jobs:
             tests/test_integration_evidence.py \
             tests/test_lean_capture.py \
             tests/test_profile_token.py \
+            tests/test_capture_floor.py \
+            tests/test_capture_budget.py \
+            tests/test_capture_status.py \
             tests/test_launch_gate.py \
             relay/test_fanout_worker.py \
             tests/test_stack_guard.py \
