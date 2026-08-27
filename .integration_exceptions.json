@@ -1,0 +1,5 @@
+{
+  "_why": "A public definition listed here is allowed to have nothing referencing it. The value is the reason. See scripts/check_integration_evidence.py.",
+  "_note": "The three capabilities that motivated the check -- the approval gate that never ran, the reaper nothing invoked, the resume decision nobody consulted -- are NOT listed, because they have since been wired up and because the check reads one commit's diff rather than the whole repository. Past cases never reach it.",
+  "_precision": "A whole-repository dead-code audit was tried and produced 43 findings of which 1 was real. This file exists so the diff-scoped version stays at a precision people will read, not so anything inconvenient can be silenced: every entry needs a reason a reader can check."
+}
