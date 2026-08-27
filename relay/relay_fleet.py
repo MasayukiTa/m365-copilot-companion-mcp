@@ -4748,7 +4748,20 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # here can block: any handshake runs on its own thread, which it must, because this
         # one is inside sync_playwright() and websocket_connect starts an event loop.
         try:
-            if _reopen_policy().consider(_socket_route()):
+            _route_now = _socket_route()
+            if _reopen_policy().consider(_route_now):
+                # RECORDED BEFORE THE RESET, on the route that is about to be discarded --
+                # it is the object that owns the log. Without this line the ledger holds a
+                # close and no matching open, so anything reading it -- the cockpit's route
+                # dot among them -- reports a route that came back as still shut for the
+                # rest of the run.
+                try:
+                    _pol = _reopen_policy()
+                    _route_now.record("route_reopened",
+                                      probes=_pol.probes, reopens=_pol.reopens,
+                                      closed_reason=str(_route_now.closed_reason)[:300])
+                except Exception:
+                    pass
                 reset_socket_route()
         except Exception:
             pass
