@@ -1176,6 +1176,26 @@ SOCKET_RECONNECT_BACKOFF_MAX_S = float(
 # SET FROM HERE BECAUSE socket_route.py IS FROZEN. The fleet is what knows how long its turns
 # may run, so the fleet is the honest owner of the margin that has to cover them. The module
 # keeps its own default for callers that build a route without one.
+#
+# IT WAS LOWERED TO 600 AND PUT BACK, AND THE REASON IS WORTH KEEPING. The margin can be
+# unsatisfiable: the tenant issues tokens with a median of 52 minutes but a minimum of 14,
+# and when one lands under 25 minutes `needs_refresh` is true the instant the capture meant
+# to satisfy it finishes -- the route then captures again, and again, measured at 3.8 times
+# a minute. Shrinking the margin looked like the fix.
+#
+# It is not, because a turn may run SOCKET_TURN_TIMEOUT_S and the header is read once, at
+# connect. A margin of 600 lets a turn start with 601 seconds of token and run 1200, so it
+# expires with the answer half-written -- which relay/test_socket_route.py has asserted
+# against since a run where exactly that happened.
+#
+# The spin is real and the answer to it is elsewhere: relay/profile_token.py serves the
+# token already in hand when the route asks again immediately, so an unsatisfiable margin
+# costs one page every two minutes instead of one every fifteen seconds. That covers the
+# 3.8% of runs where the margin cannot be met WITHOUT breaking the 96% where it can.
+#
+# Sampled per run rather than per capture, because a short token is re-captured every few
+# seconds by the spin itself: all 137 captures say 74.5% are under 25 minutes, and one
+# sample per run says 3.8%. The defect inflates the statistic that would justify it.
 SOCKET_REFRESH_MARGIN_S = float(os.environ.get("MCP_FLEET_SOCKET_MARGIN_S", "1500"))
 
 # How long one worker turn may run on a socket. The worker passed nothing, so it took
