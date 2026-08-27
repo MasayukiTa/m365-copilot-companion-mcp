@@ -79,6 +79,50 @@ def route_events(offset):
     return out, offset
 
 
+def run_started_iso():
+    """When the run in flight began, as an ISO string, or None."""
+    try:
+        with open(os.path.join(REPO, ".fleet", "status.json"), encoding="utf-8") as fh:
+            d = json.load(fh)
+        if not d.get("running") or not d.get("started"):
+            return None
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(float(d["started"])))
+    except Exception:
+        return None
+
+
+def route_faulted_since(iso):
+    """Has the route faulted at any point since `iso`?
+
+    Asked of the LOG, covering the whole run, rather than of a counter this process has been
+    keeping. A monitor restarted at 12:31 saw none of the faults from 12:08 and reported the
+    fallback they caused as the one thing that must never happen -- twice, once for the worker
+    and once for the page it was holding. What is true about the run does not depend on when
+    anybody started watching it.
+    """
+    if not iso:
+        return False
+    try:
+        with open(ROUTE_LOG, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                if (o.get("at") or "") < iso:
+                    continue
+                if o.get("event") in ("fallback", "socket_retry", "route_closed"):
+                    return True
+                if o.get("event") == "worker_done" and o.get("fell_back"):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", default=os.path.join(REPO, ".fleet", "tab_audit.log"))
@@ -95,6 +139,7 @@ def main(argv=None):
 
     say("start", "grace=%.0fs interval=%.1fs" % (CAPTURE_GRACE_S, args.interval))
     faults = 0                    # route faults seen this session; a tab is legitimate after one
+    route_shut = False            # once shut, a tab is the only path a worker has
     seen = {}                       # (profile, page id) -> first time seen
     reported = set()
     _, offset = route_events(0)     # start from the end: only this run's events
@@ -130,7 +175,7 @@ def main(argv=None):
                     if not running:
                         say("RESIDUE", "%s page open %.0fs with NO run in flight %s"
                             % (profile, age, url[:70]))
-                    elif faults:
+                    elif faults or route_faulted_since(run_started_iso()):
                         say("fallback tab", "%s page open %.0fs (route faults: %d) -- a "
                             "fallback worker holding its tab" % (profile, age, faults))
                     else:
@@ -156,6 +201,8 @@ def main(argv=None):
             kind = ev.get("event")
             if kind in ("fallback", "socket_retry", "route_closed"):
                 faults += 1
+                if kind == "route_closed":
+                    route_shut = True
                 say(kind, str(ev.get("reason") or ev.get("detail") or "")[:110])
             elif kind == "worker_done" and ev.get("route") == "tab":
                 # JUDGE FROM THE RECORD, NOT FROM WHAT THIS PROCESS HAPPENED TO WITNESS.
@@ -167,7 +214,11 @@ def main(argv=None):
                 # The worker writes `fell_back` on the event itself. That is authoritative
                 # and does not depend on when anybody started watching. The session counter
                 # stays as context, never as the verdict.
-                legitimate = bool(ev.get("fell_back"))
+                # A worker admitted AFTER the route closed never "fell back" -- it was born
+                # on a tab, because there was no socket to leave. `fell_back` alone reads that
+                # as the forbidden case. Once the route is shut, a tab is the only path there
+                # is, and every worker after that point is legitimately on one.
+                legitimate = bool(ev.get("fell_back")) or route_shut
                 say("tab work" if legitimate else "TAB WORK",
                     "%s carried on a tab (fell_back=%s, faults seen this session: %d) %s"
                     % (ev.get("worker") or "?", legitimate, faults,

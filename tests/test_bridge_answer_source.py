@@ -370,12 +370,15 @@ def test_the_release_requires_both_a_socket_and_a_known_agent_url():
     assert "BRIDGE_SOCKET" in line and "AGENT_URL" in line
 
 
-def test_the_release_is_off_until_a_person_has_used_it():
+def test_the_release_is_on_by_default_and_can_be_turned_off():
+    """既定OFFのまま置いた結果が、タスクマネージャに 427MB の遊休 Copilot タブだった。
+    経路は実機で確認済み（借用と返却、故障と復帰まで）なので、既定を保つ理由がない。"""
     import inspect
 
     src = inspect.getsource(B)
     i = src.index("BRIDGE_RELEASE_STARTUP_PAGE = ")
-    assert 'os.environ.get("MCP_BRIDGE_RELEASE_PAGE", "0")' in src[i:i + 200]
+    assert 'os.environ.get("MCP_BRIDGE_RELEASE_PAGE", "1")' in src[i:i + 200]
+    assert '"off"' in src[i:i + 260]
 
 
 def test_startup_still_runs_everything_before_releasing():
@@ -699,3 +702,45 @@ def test_halting_a_socket_turn_drops_the_driver_not_a_button():
     seg = src[i:i + 900]
     assert "release_socket_driver" in seg
     assert seg.index("_on_socket()") < seg.index("stop_button")
+
+
+# ---- ログ行を要求元に書かせない ------------------------------------------------------------
+#
+# code scanning が py/log-injection を medium 2件で報告していた
+# (bridge/copilot_bridge.py:289 と :3140)。`sid` と `url` はクエリ文字列から来るので、
+# 改行を含む値は**追加のログ行に見えるもの**を書き、読む人や解析する何かが
+# 外部の書いた行を読むことになる。
+
+def test_a_newline_cannot_forge_a_log_entry():
+    out = B.logsafe("evil\n2026-08-26 WARNING forged entry")
+    assert "\n" not in out and "\r" not in out
+    assert "forged entry" in out            # 消すのではなく、1行に畳む
+
+
+def test_every_control_character_goes():
+    raw = "a\x00b\x1fc\x7fd\re\nf\tg"
+    out = B.logsafe(raw)
+    assert not any(ch in out for ch in "\x00\x1f\x7f\r\n\t")
+    assert "a" in out and "g" in out
+
+
+def test_the_value_is_bounded():
+    assert len(B.logsafe("x" * 5000)) < 260
+
+
+def test_an_empty_value_is_still_visible_as_a_value():
+    """裸で書くと、空文字と『値が無い』が区別できない。"""
+    assert B.logsafe("") == "''"
+    assert B.logsafe(None) == "''"
+    assert B.logsafe("  ") == "'  '"
+
+
+def test_the_two_reported_sites_are_covered():
+    """報告された2件だけ直すと、同じ形の残りが次のスキャンで出てくる。"""
+    import inspect
+    import re as _re
+
+    src = inspect.getsource(B)
+    risky = _re.findall(r"logger\.(?:warning|info|error|debug)\([^\n]*?%s[^\n]*?,\s*"
+                        r"(sid|url|conv_url)\s*[,)]", src)
+    assert not risky, "request-derived values still logged raw: %s" % risky

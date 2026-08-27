@@ -250,7 +250,7 @@ def register_bridge_session_in_fleet_convs(sid, title, conv_url, transcript_rel)
         merged = merge_fleet_conversations(existing, [entry])
         _write_fleet_conversations_atomic(merged)
     except Exception:
-        logger.warning("register_bridge_session_in_fleet_convs failed for sid=%s", sid, exc_info=True)
+        logger.warning("register_bridge_session_in_fleet_convs failed for sid=%s", logsafe(sid), exc_info=True)
 
 
 def unregister_bridge_session_from_fleet_convs(sid="", conv_url=""):
@@ -1200,11 +1200,19 @@ BRIDGE_SOCKET = (os.environ.get("MCP_BRIDGE_SOCKET", "1").strip().lower()
 #:
 #: EVERYTHING ABOUT STARTUP STILL RUNS. Sign-in detection, the consent click-through and
 #: auto-resume all happen exactly as before, against a real page -- only the holding-on
-#: afterwards stops. Off by default until it has been exercised by a person for a while: the
-#: bridge is an interactive chat, and the failure this could introduce is one a person would
-#: meet in the middle of a conversation rather than in a test.
-BRIDGE_RELEASE_STARTUP_PAGE = (os.environ.get("MCP_BRIDGE_RELEASE_PAGE", "0").strip().lower()
-                               not in ("0", "false", "no", "off", ""))
+#: afterwards stops.
+#:
+#: ON BY DEFAULT AS OF 2026-08-26, having been measured rather than assumed: the bridge Edge
+#: goes from 1230 MB to 503 MB, /history borrows a page and gives it back, two turns in a row
+#: answer correctly with no Copilot page open at any point, and a forced socket failure is
+#: reported and recovered from. It was left off pending "a day of interactive use", and what
+#: that produced was 427 MB of idle Copilot tab sitting in Task Manager with a verified fix
+#: switched off beside it. A default that costs half a gigabyte needs a reason better than
+#: caution about a path already exercised.
+#:
+#: MCP_BRIDGE_RELEASE_PAGE=0 restores the resident page.
+BRIDGE_RELEASE_STARTUP_PAGE = (os.environ.get("MCP_BRIDGE_RELEASE_PAGE", "1").strip().lower()
+                               not in ("0", "false", "no", "off"))
 
 
 #: True once a file has been attached and not yet sent. Cleared by the send that carries it.
@@ -1862,7 +1870,32 @@ def _prepare_capture_baseline(sid):
         if not (sess.get("conv_url") or ""):
             _record_capture_baseline()
     except Exception:
-        logger.warning("prepare_capture_baseline failed for sid=%s", sid, exc_info=True)
+        logger.warning("prepare_capture_baseline failed for sid=%s", logsafe(sid), exc_info=True)
+
+
+
+#: Everything a log line must not carry from a request: CR and LF above all, since those are
+#: what turn one value into what looks like several entries.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def logsafe(value, limit=200):
+    """A request-supplied value, made safe to put in a log line.
+
+    LOG INJECTION, reported by code scanning as py/log-injection at two sites and present at
+    more. `sid` and `url` arrive from a query string, so a value carrying CR or LF writes what
+    looks like additional log entries -- a reader, or anything parsing the log, is then reading
+    lines an outsider composed. Control characters go, the value is bounded, and it is quoted
+    so an empty or space-padded value is still visible as a value.
+
+    Applied unconditionally rather than behind a debug flag: an alert closes on what the code
+    always does, and a sanitiser that only runs sometimes is not a sanitiser.
+    """
+    text = "" if value is None else str(value)
+    text = _CONTROL_CHARS.sub(" ", text)
+    if len(text) > limit:
+        text = text[:limit] + "..."
+    return repr(text)
 
 
 def _redact_unlock_password(text):
@@ -1928,7 +1961,7 @@ def _persist_exchange(sid, user_msg, final_text):
                 register_bridge_session_in_fleet_convs(
                     sid, new_sess.get("title") or "", ref, new_sess.get("transcript") or "")
     except Exception:
-        logger.warning("session persistence failed for sid=%s", sid, exc_info=True)
+        logger.warning("session persistence failed for sid=%s", logsafe(sid), exc_info=True)
 
 
 def _verify_pane_on_guid(guid, cur_wait=10, turns_wait=20):
@@ -3502,7 +3535,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     run_on_page_thread(self._drain_pending_queue, sid)
                 except Exception:
-                    logger.warning("promoted /send failed for sid=%s", sid, exc_info=True)
+                    logger.warning("promoted /send failed for sid=%s", logsafe(sid), exc_info=True)
                 finally:
                     PAGE_LOCK.release()
 
@@ -3565,7 +3598,7 @@ class Handler(BaseHTTPRequestHandler):
                     sid = S.find_by_conv_url(url) or ""
                 removed = S.delete_session(sid) if sid else False
             except Exception as e:
-                logger.warning("forget: store removal failed for %s", url, exc_info=True)
+                logger.warning("forget: store removal failed for %s", logsafe(url), exc_info=True)
                 removed = False
             dropped = unregister_bridge_session_from_fleet_convs(sid=sid, conv_url=url)
             self._json({"ok": True, "sid": sid, "removed_local": removed,
@@ -3777,7 +3810,7 @@ class Handler(BaseHTTPRequestHandler):
             if sid:
                 removed_local = S.delete_session(sid)
         except Exception:
-            logger.warning("could not remove %s from the session store", url, exc_info=True)
+            logger.warning("could not remove %s from the session store", logsafe(url), exc_info=True)
         dropped = unregister_bridge_session_from_fleet_convs(sid=sid, conv_url=url)
 
         # expose the reason under BOTH keys so the UI can surface it (it was dropped before)
@@ -4659,7 +4692,7 @@ class Handler(BaseHTTPRequestHandler):
             if not sid:
                 ACTIVE_SID = S.new_session()["sid"]
                 sid = ACTIVE_SID
-                logger.info("no active session -- created %s for /goal", sid)
+                logger.info("no active session -- created %s for /goal", logsafe(sid))
             first_msg = wrap_goal_text(goal_text)
 
         # SSE headers -- same shape as /stream (this endpoint IS an SSE stream; only the
@@ -4722,9 +4755,9 @@ class Handler(BaseHTTPRequestHandler):
                         ok_r, reason_r = _resume_to_ref(working_ref)
                         if not ok_r:
                             logger.warning("post-verify reattach failed for sid=%s: %s",
-                                           sid, reason_r)
+                                           logsafe(sid), reason_r)
                     except Exception:
-                        logger.warning("post-verify reattach raised for sid=%s", sid,
+                        logger.warning("post-verify reattach raised for sid=%s", logsafe(sid),
                                        exc_info=True)
                     outcome = "done_verified"
                     break
@@ -4739,9 +4772,9 @@ class Handler(BaseHTTPRequestHandler):
                     ok_r, reason_r = _resume_to_ref(working_ref)
                     if not ok_r:
                         logger.warning("reattach-to-working failed for sid=%s: %s",
-                                       sid, reason_r)
+                                       logsafe(sid), reason_r)
                 except Exception:
-                    logger.warning("reattach-to-working raised for sid=%s", sid, exc_info=True)
+                    logger.warning("reattach-to-working raised for sid=%s", logsafe(sid), exc_info=True)
                 msg = build_continuation_message(failed_ac, reasons)
             self._sse({"goal_done": True, "outcome": outcome, "turns": turn})
             self._sse({}, "done")
@@ -4778,12 +4811,12 @@ class Handler(BaseHTTPRequestHandler):
                     # {"consent_failed": True}: a card that could not be auto-approved. Nothing
                     # to persist, and the next queued item may still be fine.
                     logger.warning("drain_pending_queue: consent not auto-approved for sid=%s",
-                                   sid)
+                                   logsafe(sid))
                     continue
                 if final:
                     _persist_exchange(sid, item, final)
             except Exception:
-                logger.warning("drain_pending_queue: queued send failed for sid=%s", sid, exc_info=True)
+                logger.warning("drain_pending_queue: queued send failed for sid=%s", logsafe(sid), exc_info=True)
 
 
 def _agent_tab_matches(pg, base_url):
