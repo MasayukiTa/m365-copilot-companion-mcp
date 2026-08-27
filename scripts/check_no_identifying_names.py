@@ -141,6 +141,11 @@ def tracked_files(repo="."):
     return files
 
 
+#: Most hits listed from a single file. A file with more is already a decision to make in
+#: one go, and the report should stay readable.
+MAX_HITS_PER_FILE = 20
+
+
 def offences(repo=".", names=None):
     """[(path, what, line_number, line)] for every tracked text file that identifies someone."""
     names = configured_names() if names is None else names
@@ -156,9 +161,29 @@ def offences(repo=".", names=None):
             if pattern is not None and pattern.search(rel):
                 found.append((rel, what, 0, rel))
                 break
+        # EVERY OCCURRENCE IN THE FILE, NOT THE FIRST. This used to stop at the first hit per
+        # file, on the reasoning that one report is enough to act on. It is not, and the way
+        # it fails is worse than a longer report:
+        #
+        # 2026-08-28, scripts/win/lean_capture_isolate.py carried the same home directory on
+        # two lines. CI printed "IDENTIFYING CONTENT IN TRACKED FILES (1)" and named line 14.
+        # A reader -- this one -- fixed line 14 and would have pushed it as done. The count is
+        # what does the damage: (1) reads as ONE PROBLEM, so the report actively argues that
+        # the file is clean once the named line is gone.
+        #
+        # It would have been caught on the next CI run, so nothing escaped. But a leak check
+        # that understates a leak spends its credibility to save a few lines of output.
+        #
+        # Bounded per file so one generated file cannot become the whole log.
+        hits_here = 0
         try:
             with open(os.path.join(repo, rel), encoding="utf-8", errors="replace") as fh:
                 for n, line in enumerate(fh, 1):
+                    if hits_here >= MAX_HITS_PER_FILE:
+                        found.append((rel, "and more, not listed", 0,
+                                      "stopped after %d hits in this file"
+                                      % MAX_HITS_PER_FILE))
+                        break
                     for what, pattern in (("employee-id shape", ID_SHAPE),
                                           ("home directory path", HOME_SHAPE),
                                           ("configured name", name_re)):
@@ -171,10 +196,8 @@ def offences(repo=".", names=None):
                                 and m.group(1).lower() in NON_IDENTIFYING_USERS):
                             continue
                         found.append((rel, what, n, line.strip()[:120]))
-                        break
-                    else:
-                        continue
-                    break              # one report per file is enough to act on
+                        hits_here += 1
+                        break          # one label per LINE; the next line is still checked
         except OSError as exc:
             # NOT SKIPPED SILENTLY. A file the check could not read is a file it cannot
             # vouch for, and the whole point of this script is that "we did not look" must
