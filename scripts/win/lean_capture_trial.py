@@ -218,14 +218,32 @@ class _PeakSampler(threading.Thread):
         return self.samples
 
 
-def one_capture(context, agent_url, lean, cdp_url=DEFAULT_CDP, probe=False):
-    """Run one capture on one arm. Returns a record; never raises."""
+def _token_life_min(token):
+    """Minutes of life left on a captured token, or None if it cannot be read."""
+    try:
+        from relay.profile_token import token_life_s
+        return token_life_s(token) / 60.0
+    except Exception:
+        return 0.0
+
+
+def arm_fn(arm):
+    """The capture each arm runs. NAMED HERE so the trial and the fleet cannot drift:
+    every arm is a real capture_fn, called exactly as the route calls it."""
     from relay.lean_capture import capture_via_lean_tab
+    from relay.profile_token import capture_via_profile
     from relay.socket_route import capture_via_tab
 
-    fn = capture_via_lean_tab if lean else capture_via_tab
+    return {"full": capture_via_tab,
+            "lean": capture_via_lean_tab,
+            "light": capture_via_profile}[arm]
+
+
+def one_capture(context, agent_url, arm, cdp_url=DEFAULT_CDP, probe=False):
+    """Run one capture on one arm. Returns a record; never raises."""
+    fn = arm_fn(arm)
     baseline = edge_rss_mb()
-    rec = {"arm": "lean" if lean else "full", "started": time.strftime("%H:%M:%S"),
+    rec = {"arm": arm, "started": time.strftime("%H:%M:%S"),
            "rss_before": baseline, "pages_before": page_count(cdp_url)}
     sampler = _PeakSampler()
     sampler.start()
@@ -236,7 +254,13 @@ def one_capture(context, agent_url, lean, cdp_url=DEFAULT_CDP, probe=False):
                     "gpt_id": template.gpt_id,
                     "variants": len(template.frame.get("variants") or []),
                     "template": normalized(template),
-                    "token_len": len(token)})
+                    "token_len": len(token),
+                    # HOW LONG THE TOKEN LASTS is half the cost. A cheap capture that
+                    # returns a token with ten minutes on it is not cheaper than an
+                    # expensive one that returns fifty: the route refreshes on a margin,
+                    # so a short token means more captures, and the comparison has to be
+                    # cost per MINUTE OF ROUTE, not cost per capture.
+                    "token_life_min": round(_token_life_min(token))})
         if probe:
             # NOT RUN HERE. websocket_connect drives asyncio, and inside
             # sync_playwright's context that is a second event loop on a thread
@@ -270,19 +294,22 @@ def _median(xs):
 
 def summarise(records):
     out = {}
-    for arm in ("full", "lean"):
+    for arm in sorted({r["arm"] for r in records}):
         rows = [r for r in records if r["arm"] == arm]
         ok = [r for r in rows if r.get("ok")]
         secs = sorted(r["seconds"] for r in ok)
         deltas = [r["rss_after"] - r["rss_before"] for r in ok
                   if r.get("rss_after") is not None and r.get("rss_before") is not None]
         rises = [r["rss_rise"] for r in ok if r.get("rss_rise") is not None]
+        lives = [r["token_life_min"] for r in ok if r.get("token_life_min") is not None]
         out[arm] = {
             "attempts": len(rows), "succeeded": len(ok),
             "seconds_median": _median(secs), "seconds_max": secs[-1] if secs else None,
             "rss_delta_median": _median(deltas),
             "rss_rise_median": _median(rises),
             "rss_rises": sorted(rises),
+            "token_life_median": _median(lives),
+            "token_lives": sorted(lives),
             "residue": sum(r.get("copilot_pages_left") or 0 for r in rows),
             "pages_leaked": sum(1 for r in rows
                                 if r.get("pages_after") is not None
@@ -372,66 +399,90 @@ def report(summary):
     # was open, sampled every second, and the individual rises are printed because a median of
     # three hides everything worth knowing.
     print("%-6s %-9s %-10s %-11s %-22s %-9s %s"
-          % ("arm", "ok/att", "median s", "rss rise", "each rise", "residue", "leaked"))
-    for arm in ("full", "lean"):
+          % ("arm", "ok/att", "median s", "rss rise", "token min", "residue", "leaked"))
+    for arm in sorted(a for a in summary if not a.startswith("_")):
         s = summary[arm]
         print("%-6s %-9s %-10s %-11s %-22s %-9s %s"
               % (arm, "%d/%d" % (s["succeeded"], s["attempts"]), s["seconds_median"],
-                 s["rss_rise_median"], s["rss_rises"], s["residue"], s["pages_leaked"]))
+                 s["rss_rise_median"], s["token_lives"], s["residue"], s["pages_leaked"]))
 
-    full_t, lean_t = summary["full"]["templates"], summary["lean"]["templates"]
+    # FULL IS THE BASELINE, and every other arm is judged against it. There is no
+    # symmetric comparison to make: "full" is the capture that has been carrying the fleet
+    # for weeks, so the question about any cheaper arm is whether it produces something the
+    # baseline never produced -- not whether the two agree with each other.
+    baseline = summary.get("full") or {}
+    full_t = baseline.get("templates") or []
+    others = [a for a in sorted(summary) if not a.startswith("_") and a != "full"]
     print()
-    print("distinct normalized templates: full=%d lean=%d" % (len(full_t), len(lean_t)))
-    if not lean_t or not full_t:
-        print("!! one arm produced no successful capture; nothing is comparable yet.")
+    print("distinct normalized templates: %s"
+          % {a: len(summary[a]["templates"]) for a in ["full"] + others if a in summary})
+    if not full_t:
+        print("!! the baseline arm produced no successful capture; nothing is comparable.")
         return 1
 
-    # SET EQUALITY IS THE WRONG QUESTION, and asking it produced two false verdicts before
-    # anybody checked what actually differed. An ordinary capture is not deterministic: across
-    # three of them `connectedFederatedConnections` came back as ["dummyId"] on some and as a
-    # real connector on others, because the page had not finished attaching them. Requiring
-    # the two arms to produce IDENTICAL SETS makes any such variation read as "blocking
-    # resources changed the request", which is a claim about lean built from evidence that has
-    # nothing to do with it.
-    #
-    # The question is whether the lean arm shows a value the full arm never shows. Compared
-    # field by field, because a whole-template mismatch cannot say which field moved.
-    varying, novel = _field_ranges(full_t, lean_t)
-    if varying:
-        print("fields that vary between ORDINARY captures (not attributable to blocking):")
-        for field, values in sorted(varying.items()):
-            print("   %s: %s" % (field, " | ".join(str(v)[:40] for v in values)))
-    if novel:
-        print("!! THE LEAN ARM SHOWS VALUES THE ORDINARY ONE NEVER DID. A capture describing a")
-        print("   different request means a different product answering. Do not adopt.")
-        for field, values in sorted(novel.items()):
-            # THE DIFFERENCE, NOT THE VALUE. Printing the whole value truncated made a
-            # 79-flag `variants` list look as though it differed in its FIRST entry --
-            # Agt_bizchat_enableGpt5ForHelix, the one that selects the responding model,
-            # present in both arms all along. The single actual difference was one incidental
-            # flag on one capture. A report that misleads the reader about which field moved
-            # is worse than no report.
-            print("   %s:" % field)
-            for detail in _explain(field, values, summary["full"]["templates"]):
-                print("      %s" % detail)
-        return 1
-    for arm in ("full", "lean"):
-        probes = [r["probe"] for r in summary.get("_records", []) if r["arm"] == arm and r.get("probe")]
-        if probes:
-            refused = sum(1 for p in probes if p.get("refused_access"))
-            done = sum(1 for p in probes if p.get("completed"))
-            print("grounding probe %-5s completed %d/%d, refused access %d"
-                  % (arm, done, len(probes), refused))
-            if refused or done < len(probes):
-                print("!! the %s arm reached something that cannot see the tenant. Do not adopt."
-                      % arm)
-                return 1
+    bad = 0
+    for arm in others:
+        s_arm = summary[arm]
+        arm_t = s_arm.get("templates") or []
+        if not arm_t:
+            print("!! %s produced no successful capture." % arm)
+            bad += 1
+            continue
+        # SET EQUALITY IS THE WRONG QUESTION, and asking it produced two false verdicts
+        # before anybody checked what actually differed. An ordinary capture is not
+        # deterministic: connectedFederatedConnections came back as ["dummyId"] on some and
+        # as a real connector on others, because the page had not finished attaching them.
+        # Requiring identical SETS makes any such variation read as "the cheaper arm changed
+        # the request", which is a claim built from evidence that has nothing to do with it.
+        varying, novel = _field_ranges(full_t, arm_t)
+        if varying:
+            print("fields that vary between BASELINE captures (not attributable to %s):" % arm)
+            for field, values in sorted(varying.items()):
+                print("   %s: %s" % (field, " | ".join(str(v)[:40] for v in values)))
+        if novel:
+            print("!! %s SHOWS VALUES THE BASELINE NEVER DID. A capture describing a" % arm)
+            print("   different request means a different product answering. Do not adopt.")
+            for field, values in sorted(novel.items()):
+                # THE DIFFERENCE, NOT THE VALUE. Printing the whole value truncated made a
+                # 79-flag variants list look as though it differed in its FIRST entry --
+                # the flag that selects the responding model, present in both arms all
+                # along. The real difference was one incidental flag on one capture. A
+                # report that misleads about which field moved is worse than no report.
+                print("   %s:" % field)
+                for detail in _explain(field, values, full_t):
+                    print("      %s" % detail)
+            bad += 1
+        else:
+            print("%s: request identical to the baseline." % arm)
+        if s_arm.get("residue") or s_arm.get("pages_leaked"):
+            print("!! %s left pages behind. Do not adopt." % arm)
+            bad += 1
 
-    if summary["lean"]["residue"] or summary["lean"]["pages_leaked"]:
-        print("!! the lean arm left pages behind. Do not adopt.")
-        return 1
-    print("   identical across arms.")
-    return 0
+    for arm in sorted(a for a in summary if not a.startswith("_")):
+        probes = [r["probe"] for r in summary.get("_records", [])
+                  if r["arm"] == arm and r.get("probe")]
+        if not probes:
+            continue
+        # A PROBE THAT COULD NOT RUN IS NOT A PROBE THAT FAILED. The first version counted
+        # any incomplete probe against the arm, and duly reported that the BASELINE -- the
+        # capture that has been carrying the fleet for weeks -- reached something that could
+        # not see the tenant, on the strength of one "could not open the socket: TimeoutError".
+        # That is a transport fault. It says nothing about grounding, and treating "could not
+        # measure" as "measured bad" is how a check earns the right to be ignored.
+        refused = sum(1 for pr in probes if pr.get("refused_access"))
+        done = sum(1 for pr in probes if pr.get("completed"))
+        errored = [pr.get("error") for pr in probes if not pr.get("completed")]
+        print("grounding probe %-6s answered %d/%d, refused access %d%s"
+              % (arm, done, len(probes), refused,
+                 ("  (%d could not run: %s)" % (len(errored), str(errored[0])[:60]))
+                 if errored else ""))
+        if refused:
+            print("!! %s reached something that cannot see the tenant. Do not adopt." % arm)
+            bad += 1
+        elif done == 0:
+            print("!! no probe on %s ever answered; grounding is unmeasured." % arm)
+            bad += 1
+    return 1 if bad else 0
 
 
 def _agent_url_from_env_file():
@@ -457,6 +508,8 @@ def _agent_url_from_env_file():
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--iterations", type=int, default=6, help="captures PER ARM")
+    ap.add_argument("--arms", default="full,light",
+                    help="comma-separated: full (a turn), light (no turn), lean")
     ap.add_argument("--cdp", default=DEFAULT_CDP)
     ap.add_argument("--agent-url", default=os.environ.get("MCP_FLEET_AGENT_URL", ""))
     ap.add_argument("--out", default=os.path.join(REPO, ".fleet", "lean_capture_trial.json"))
@@ -477,9 +530,10 @@ def main(argv=None):
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(args.cdp, timeout=30000)
         context = browser.contexts[0]
+        arms = [a.strip() for a in args.arms.split(",") if a.strip()]
         for n in range(args.iterations):
-            for lean in (False, True):                     # paired, alternating
-                rec = one_capture(context, agent_url, lean, args.cdp, args.probe)
+            for arm in arms:                               # paired, alternating
+                rec = one_capture(context, agent_url, arm, args.cdp, args.probe)
                 records.append(rec)
                 print("  %-4s #%d  %-4s %5.1fs  rss %s -> %s  pages %s -> %s  residue %s  %s"
                       % (rec["arm"], n + 1, "ok" if rec.get("ok") else "FAIL", rec["seconds"],
