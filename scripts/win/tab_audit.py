@@ -94,10 +94,10 @@ def main(argv=None):
         log.write(line + "\n")
 
     say("start", "grace=%.0fs interval=%.1fs" % (CAPTURE_GRACE_S, args.interval))
+    faults = 0                    # route faults seen this session; a tab is legitimate after one
     seen = {}                       # (profile, page id) -> first time seen
     reported = set()
     _, offset = route_events(0)     # start from the end: only this run's events
-    faults = 0
     deadline = time.time() + args.minutes * 60
 
     while time.time() < deadline:
@@ -117,8 +117,26 @@ def main(argv=None):
                 age = now - first
                 if age > CAPTURE_GRACE_S and key not in reported:
                     reported.add(key)
-                    say("RESIDUE", "%s page open %.0fs (run in flight: %s) %s"
-                        % (profile, age, running, url[:70]))
+                    # A LONG-LIVED PAGE IS NOT AUTOMATICALLY RESIDUE. A worker that fell back
+                    # holds a tab for as long as its turn takes -- 272 seconds in the mixed
+                    # test that found this -- and calling that a leak is a false alarm about
+                    # the fallback doing exactly what it exists to do. The three cases differ:
+                    #
+                    #   no run in flight        -> residue. This is the one that cost nine and
+                    #                              a half hours and 411 MB.
+                    #   run, route has faulted  -> a fallback worker at work. Expected.
+                    #   run, no fault at all    -> a tab while the socket was available, which
+                    #                              is the thing that must never happen.
+                    if not running:
+                        say("RESIDUE", "%s page open %.0fs with NO run in flight %s"
+                            % (profile, age, url[:70]))
+                    elif faults:
+                        say("fallback tab", "%s page open %.0fs (route faults: %d) -- a "
+                            "fallback worker holding its tab" % (profile, age, faults))
+                    else:
+                        say("TAB WORK", "%s page open %.0fs during a run with NO route fault "
+                            "-- a tab while the socket was available %s"
+                            % (profile, age, url[:70]))
             for key in [k for k in seen if k[0] == profile and k[1] not in live]:
                 age = now - seen.pop(key)
                 # ALWAYS report the close, including for a page already flagged as residue.
@@ -140,11 +158,19 @@ def main(argv=None):
                 faults += 1
                 say(kind, str(ev.get("reason") or ev.get("detail") or "")[:110])
             elif kind == "worker_done" and ev.get("route") == "tab":
-                # A tab that carried a worker. Legitimate only if the route had faulted --
-                # otherwise the socket was available and a tab was used anyway.
-                say("TAB WORK" if faults == 0 else "tab work",
-                    "%s carried on a tab (route faults so far this run: %d) %s"
-                    % (ev.get("worker") or "?", faults,
+                # JUDGE FROM THE RECORD, NOT FROM WHAT THIS PROCESS HAPPENED TO WITNESS.
+                # The first version asked its own session counter -- "have I seen a route
+                # fault since I started?" -- and restarting the monitor at 12:11 made it
+                # answer no for a worker whose faults occurred at 12:08. It reported a
+                # perfectly ordinary fallback as the one thing that must never happen.
+                #
+                # The worker writes `fell_back` on the event itself. That is authoritative
+                # and does not depend on when anybody started watching. The session counter
+                # stays as context, never as the verdict.
+                legitimate = bool(ev.get("fell_back"))
+                say("tab work" if legitimate else "TAB WORK",
+                    "%s carried on a tab (fell_back=%s, faults seen this session: %d) %s"
+                    % (ev.get("worker") or "?", legitimate, faults,
                        str(ev.get("reason") or "")[:70]))
     say("stop", "audit window ended")
     return 0
