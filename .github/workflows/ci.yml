@@ -260,6 +260,10 @@ jobs:
             tests/test_capture_floor.py \
             tests/test_capture_budget.py \
             tests/test_capture_status.py \
+            relay/test_route_reopen.py \
+            relay/test_dotenv_before_imports.py \
+            tests/test_route_dot_follows_reopen.py \
+            tests/test_identity_guard_reports_every_hit.py \
             tests/test_steer_delivery.py \
             tests/test_steer_followup.py \
             tests/test_launch_gate.py \
