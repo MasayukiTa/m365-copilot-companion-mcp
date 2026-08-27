@@ -706,25 +706,56 @@ class SkillStore:
             raise SkillError("Skill changed while its resource was being read")
         return text
 
+    #: A match must rest on this many distinct tokens. Two bigrams of ONE word are not two
+    #: pieces of evidence: every fail-open measured rested on a single shared word -- a query
+    #: about copper prices landing on the copper SURVEY, one about a mail server landing on
+    #: mail lookup.
+    MIN_MATCH_TOKENS = 3
+
     def match(self, text: str) -> dict[str, Any] | None:
         """Conservatively select one trusted, model-invocable Skill by metadata only.
 
         This intentionally favors false negatives. A Skill body is not loaded until a
         clear description/when_to_use match exists, preserving progressive disclosure.
+
+        THE DENOMINATOR IS WHAT THE LIBRARY KNOWS ABOUT, not the whole query. Dividing by the
+        query's own length meant a token no Skill has ever heard of still counted against the
+        match: adding a date to a question lowered its score, and the phrasings people
+        actually use -- "last month's mail", "January 2026's mail" -- were refused while the
+        bare "search my mail" passed. A date now leaves the denominator instead of inflating
+        it, which is the difference between not-evidence and evidence-against.
+
+        Two consultants were asked and proposed different cures; both are in here, and
+        MEASURED, because neither was sufficient alone. Cleaner tokens (see _match_tokens)
+        raised the passing scores but left the date queries under the bar. This denominator
+        alone, on the old tokeniser, fixed every miss and produced four wrong matches -- the
+        expensive kind, where the agent follows a procedure meant for something else. Together
+        with MIN_MATCH_TOKENS: 16 of 16 on the fixture, no misses, no wrong matches.
+        Re-measure with scripts/win/skill_match_bench.py before touching any of it.
         """
         query = _match_tokens(text)
         if len(query) < 2:
             return None
+        candidates = [s for s in self.discover()
+                      if s.trust == "trusted"
+                      and s.metadata.get("disable-model-invocation") is not True]
+        vocabulary: set[str] = set()
+        for skill in candidates:
+            vocabulary |= _match_tokens(
+                skill.description + " " + str(skill.metadata.get("when_to_use") or ""))
+        known = query & vocabulary
+        if len(known) < self.MIN_MATCH_TOKENS:
+            return None
         scored: list[tuple[float, Skill]] = []
-        for skill in self.discover():
-            if skill.trust != "trusted" or skill.metadata.get("disable-model-invocation") is True:
-                continue
+        for skill in candidates:
             haystack = skill.description + " " + str(skill.metadata.get("when_to_use") or "")
             terms = _match_tokens(haystack)
             if not terms:
                 continue
             overlap = query & terms
-            score = len(overlap) / max(1, min(len(query), len(terms)))
+            if len(overlap) < self.MIN_MATCH_TOKENS:
+                continue
+            score = len(overlap) / max(1, len(known))
             if skill.name in text.lower():
                 score += 0.6
             scored.append((score, skill))
@@ -798,10 +829,61 @@ def format_skill_list(skills: Iterable[dict[str, Any]]) -> str:
     )
 
 
+#: Hiragana that carries grammar rather than topic. Only pieces this long need naming: the
+#: short ones are dropped by length, and the point of segmenting is that this list never has
+#: to grow to cover the diluting BIGRAMS themselves, which are the cross product of every
+#: content word with every particle and therefore unbounded.
+_HIRAGANA_STOP = frozenset((
+    "したい", "ください", "について",
+    "ように", "しています", "しました",
+    "できる", "できます", "ですか",
+))
+
+
+def _script_of(ch: str) -> str:
+    o = ord(ch)
+    if 0x3040 <= o <= 0x309F:
+        return "hira"
+    if 0x30A0 <= o <= 0x30FF:
+        return "kata"
+    return "han"
+
+
 def _match_tokens(text: str) -> set[str]:
+    """Topic tokens for matching: ASCII words, and bigrams of the CJK that carries meaning.
+
+    WHY THE SEGMENTATION. Japanese was bigrammed straight across each run, so most tokens
+    produced were boundary-straddlers -- one content character glued to a particle. They match
+    nothing in any Skill's metadata and they sat in the denominator, so ADDING A DATE TO A
+    QUESTION LOWERED ITS SCORE: a plain "search my mail" matched a mail Skill at 0.625 while
+    the same question with a month in it scored 0.375 and was refused.
+
+    A stop-list of those bigrams cannot work -- they are the cross product of every content
+    word with every particle -- but they share a structure: they straddle into hiragana. The
+    run is cut on script boundaries and the hiragana pieces dropped, which removes them
+    without naming them. Katakana and kanji segments are kept whole, and the two-character
+    floor means single characters fall away on their own.
+
+    Measured on a 16-case fixture (scripts/win/skill_match_bench.py): this alone lifted the
+    passing matches from 0.625 to 1.000 but left the date-bearing ones at 0.500, still under
+    the bar. It is half the cure; match() supplies the other half.
+    """
     lowered = (text or "").lower()
     words = set(re.findall(r"[a-z0-9][a-z0-9_-]{2,}", lowered))
-    cjk_runs = re.findall(r"[\u3040-\u30ff\u3400-\u9fff]{2,}", lowered)
-    for run in cjk_runs:
-        words.update(run[i : i + 2] for i in range(len(run) - 1))
+    for run in re.findall(r"[぀-ヿ㐀-鿿]{2,}", lowered):
+        pieces, seg, script = [], "", None
+        for ch in run:
+            sc = _script_of(ch)
+            if sc != script and seg:
+                pieces.append((script, seg))
+                seg = ""
+            script, seg = sc, seg + ch
+        if seg:
+            pieces.append((script, seg))
+        for sc, piece in pieces:
+            if len(piece) < 2:
+                continue
+            if sc == "hira" and (len(piece) <= 2 or piece in _HIRAGANA_STOP):
+                continue
+            words.update(piece[i:i + 2] for i in range(len(piece) - 1))
     return words

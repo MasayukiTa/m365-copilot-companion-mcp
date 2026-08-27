@@ -11,17 +11,36 @@ from relay.chathub import ChatHubError
 
 
 def test_a_flaky_attempt_costs_a_retry_not_the_route(monkeypatch):
+    """One bad send must not put the whole fleet on tabs -- it happened on the first attempt
+    of a real run and did exactly that.
+
+    Written against ONE retry rather than two. The attempt budget was cut from 3 to 2 when the
+    per-attempt timeout was measured: a capture runs synchronously on the fleet's main loop,
+    and 180s x 3 meant nine minutes in which no worker was polled. The observed capture takes
+    8-16 seconds, so the budget is now 60s x 2. What this test protects is unchanged -- a
+    flaky send costs a retry, not the route -- and the number it protects it with is the one
+    the code actually uses."""
     calls = []
 
     def once(page, *, prompt, timeout_s):
         calls.append(1)
-        if len(calls) < 3:
+        if len(calls) < 2:
             raise RuntimeError("send failed: composer cleared without a conversation")
         return ("tok", "tpl")
 
     monkeypatch.setattr(CC, "_capture_once", once)
     assert CC.capture(object()) == ("tok", "tpl")
-    assert len(calls) == 3
+    assert len(calls) == 2
+
+
+def test_the_capture_budget_cannot_freeze_the_fleet_for_minutes(monkeypatch):
+    """The bound is the point, not the individual numbers: this runs on the main loop, so the
+    worst case IS a fleet-wide freeze. py-spy caught a nine-minute one."""
+    assert CC.CAPTURE_TIMEOUT_S * CC.CAPTURE_ATTEMPTS <= 180, (
+        "worst-case main-loop freeze is %.0fs"
+        % (CC.CAPTURE_TIMEOUT_S * CC.CAPTURE_ATTEMPTS))
+    assert CC.CAPTURE_TIMEOUT_S >= 30, "must stay well clear of the 16s worst case observed"
+    assert CC.CAPTURE_ATTEMPTS >= 2, "one flaky send would otherwise cost the route"
 
 
 def test_a_capture_that_never_works_gives_up_and_says_how_often_it_tried(monkeypatch):
