@@ -34,9 +34,32 @@ running it. page.route() is the sync api's own answer to this question, it hands
 route object with abort() and continue_(), and it knows each request's resource type without
 being told.
 
-EXPERIMENTAL, AND OFF UNTIL MEASURED. MCP_CAPTURE_LEAN=1 turns it on. The first live trial
-measured NO saving at all -- 108.8 MB against 109.0 -- but on a browser busy with a fleet run,
-at n=2, through the broken interception above. That number is not yet evidence either way.
+MEASURED, AND NOT ADOPTED. MCP_CAPTURE_LEAN=1 turns it on, and it stays off.
+
+Four paired captures on a quiet browser, the arms alternating, RSS sampled every second
+THROUGHOUT each capture rather than read once before and once after -- because the before/after
+difference is two numbers that each moved for their own reasons, and it gave +27.3 MB against
++3.1 on one run and -1.6 against +2.7 on the next. How far the browser rises while the page is
+open is what the page costs:
+
+    ordinary   rises 602.9  609.0  614.8  624.7 MB     median 614.8
+    lean       rises 575.3  608.6  610.7  611.8 MB     median 610.7
+
+Four megabytes apart on six hundred, with the ranges overlapping. Blocking images saves
+NOTHING measurable, because what a Copilot page costs is not its images -- it is the script,
+the DOM and the renderer, none of which may be touched without changing what is captured.
+
+Everything else came out clean, which is why the mechanism is kept rather than deleted: 8
+captures in 8, the same duration to within half a second, no page or handler left behind, both
+arms grounded in the tenant on every probe, and equivalent request templates. The one flag
+that appeared in a lean capture and no ordinary one -- feature.EnableExplicitWarmup, once out
+of four -- is a client warm-up toggle, not a model selector, and the variants list was already
+unstable across lean captures. It is unexplained rather than exonerated, and it does not need explaining
+while the flag is off.
+
+WHAT WOULD CHANGE THE ANSWER. A surface that actually serves fonts and media (this one served
+neither: 0 blocked of each), or a measurement of the renderer process alone rather than the
+whole browser. Neither is worth doing on the strength of a 4 MB difference.
 """
 from __future__ import annotations
 

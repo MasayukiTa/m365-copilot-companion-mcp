@@ -29,6 +29,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -182,14 +183,52 @@ def grounding_probe(token, template):
     return out
 
 
+class _PeakSampler(threading.Thread):
+    """Browser RSS sampled THROUGHOUT the capture, not before and after it.
+
+    THE DELTA ACROSS A CAPTURE CANNOT DECIDE THIS, and two runs proved it: three pairs gave
+    +27.3 MB for an ordinary capture against +3.1 for a lean one, and the next three gave -1.6
+    against +2.7. A working set read once at the start and once at the end is a difference of
+    two numbers each of which moved for reasons that have nothing to do with the page -- a
+    garbage collection between them can make a capture look free, or free up more than the
+    page ever cost.
+
+    What the page costs is how far the browser rises WHILE it is open. That is a peak, and a
+    peak has to be sampled.
+    """
+
+    def __init__(self, interval=1.0):
+        super().__init__(daemon=True)
+        self.interval = interval
+        self.samples = []
+        # NOT self._stop: threading.Thread already has one, and shadowing it with an
+        # Event made join() call an Event and raise "object is not callable".
+        self._halt = threading.Event()
+
+    def run(self):
+        while not self._halt.is_set():
+            mb = edge_rss_mb()
+            if mb is not None:
+                self.samples.append(mb)
+            self._halt.wait(self.interval)
+
+    def stop(self):
+        self._halt.set()
+        self.join(timeout=10)
+        return self.samples
+
+
 def one_capture(context, agent_url, lean, cdp_url=DEFAULT_CDP, probe=False):
     """Run one capture on one arm. Returns a record; never raises."""
     from relay.lean_capture import capture_via_lean_tab
     from relay.socket_route import capture_via_tab
 
     fn = capture_via_lean_tab if lean else capture_via_tab
+    baseline = edge_rss_mb()
     rec = {"arm": "lean" if lean else "full", "started": time.strftime("%H:%M:%S"),
-           "rss_before": edge_rss_mb(), "pages_before": page_count(cdp_url)}
+           "rss_before": baseline, "pages_before": page_count(cdp_url)}
+    sampler = _PeakSampler()
+    sampler.start()
     t0 = time.time()
     try:
         token, template = fn(context, agent_url)
@@ -209,6 +248,13 @@ def one_capture(context, agent_url, lean, cdp_url=DEFAULT_CDP, probe=False):
     except Exception as exc:
         rec.update({"ok": False, "seconds": round(time.time() - t0, 1),
                     "error": "%s: %s" % (type(exc).__name__, str(exc)[:200])})
+    samples = sampler.stop()
+    # HOW FAR THE BROWSER ROSE WHILE THE PAGE WAS OPEN, above where it started. This is what
+    # the page costs; see _PeakSampler for why the before/after difference cannot say.
+    if samples and baseline is not None:
+        rec["rss_peak"] = max(samples)
+        rec["rss_rise"] = round(max(samples) - baseline, 1)
+        rec["rss_samples"] = len(samples)
     # Settle before reading RSS: the page has just closed and its renderer exits behind it.
     time.sleep(3)
     rec["rss_after"] = edge_rss_mb()
@@ -230,10 +276,13 @@ def summarise(records):
         secs = sorted(r["seconds"] for r in ok)
         deltas = [r["rss_after"] - r["rss_before"] for r in ok
                   if r.get("rss_after") is not None and r.get("rss_before") is not None]
+        rises = [r["rss_rise"] for r in ok if r.get("rss_rise") is not None]
         out[arm] = {
             "attempts": len(rows), "succeeded": len(ok),
             "seconds_median": _median(secs), "seconds_max": secs[-1] if secs else None,
             "rss_delta_median": _median(deltas),
+            "rss_rise_median": _median(rises),
+            "rss_rises": sorted(rises),
             "residue": sum(r.get("copilot_pages_left") or 0 for r in rows),
             "pages_leaked": sum(1 for r in rows
                                 if r.get("pages_after") is not None
@@ -279,16 +328,56 @@ def _field_ranges(full_templates, lean_templates):
     return varying, novel
 
 
+def _explain(field, lean_values, full_templates):
+    """What actually differs about `field`, as lines a reader can act on.
+
+    For a list-valued field it is the membership difference and nothing else; for anything
+    else, the values themselves. Printing a truncated whole value said "these two 79-item
+    lists differ" and left the reader to guess where.
+    """
+    seen = set()
+    for text in full_templates:
+        for name, value in _flatten(json.loads(text)):
+            if name == field:
+                seen.add(value if isinstance(value, str) else repr(value))
+    out = []
+    for value in lean_values:
+        try:
+            lean_list, full_lists = set(json.loads(value)), [set(json.loads(v)) for v in seen]
+        except Exception:
+            out.append("lean: %s   (ordinary: %s)"
+                       % (str(value)[:70], " | ".join(str(v)[:40] for v in sorted(seen))))
+            continue
+        every = set.intersection(*full_lists) if full_lists else set()
+        any_ = set.union(*full_lists) if full_lists else set()
+        added, missing = sorted(lean_list - any_), sorted(every - lean_list)
+        out.append("%d entries; ordinary captures had %d-%d"
+                   % (len(lean_list), min(len(s) for s in full_lists) if full_lists else 0,
+                      max(len(s) for s in full_lists) if full_lists else 0))
+        if added:
+            out.append("only in a lean capture: %s" % ", ".join(added))
+        if missing:
+            out.append("MISSING from a lean capture: %s" % ", ".join(missing))
+        if not added and not missing:
+            out.append("same membership; the difference is ordering only")
+    return out
+
+
 def report(summary):
     """Print the verdict. Returns the exit code."""
     print()
-    print("%-6s %-9s %-10s %-9s %-11s %-9s %s"
-          % ("arm", "ok/att", "median s", "max s", "rss delta", "residue", "leaked"))
+    # RISE, not delta. The delta across a capture is a difference of two numbers each of which
+    # moved for its own reasons: two runs of three pairs gave +27.3 MB against +3.1, then -1.6
+    # against +2.7. The rise is how far the browser went above where it started WHILE the page
+    # was open, sampled every second, and the individual rises are printed because a median of
+    # three hides everything worth knowing.
+    print("%-6s %-9s %-10s %-11s %-22s %-9s %s"
+          % ("arm", "ok/att", "median s", "rss rise", "each rise", "residue", "leaked"))
     for arm in ("full", "lean"):
         s = summary[arm]
-        print("%-6s %-9s %-10s %-9s %-11s %-9s %s"
+        print("%-6s %-9s %-10s %-11s %-22s %-9s %s"
               % (arm, "%d/%d" % (s["succeeded"], s["attempts"]), s["seconds_median"],
-                 s["seconds_max"], s["rss_delta_median"], s["residue"], s["pages_leaked"]))
+                 s["rss_rise_median"], s["rss_rises"], s["residue"], s["pages_leaked"]))
 
     full_t, lean_t = summary["full"]["templates"], summary["lean"]["templates"]
     print()
@@ -316,7 +405,15 @@ def report(summary):
         print("!! THE LEAN ARM SHOWS VALUES THE ORDINARY ONE NEVER DID. A capture describing a")
         print("   different request means a different product answering. Do not adopt.")
         for field, values in sorted(novel.items()):
-            print("   %s: lean-only %s" % (field, " | ".join(str(v)[:60] for v in values)))
+            # THE DIFFERENCE, NOT THE VALUE. Printing the whole value truncated made a
+            # 79-flag `variants` list look as though it differed in its FIRST entry --
+            # Agt_bizchat_enableGpt5ForHelix, the one that selects the responding model,
+            # present in both arms all along. The single actual difference was one incidental
+            # flag on one capture. A report that misleads the reader about which field moved
+            # is worse than no report.
+            print("   %s:" % field)
+            for detail in _explain(field, values, summary["full"]["templates"]):
+                print("      %s" % detail)
         return 1
     for arm in ("full", "lean"):
         probes = [r["probe"] for r in summary.get("_records", []) if r["arm"] == arm and r.get("probe")]
