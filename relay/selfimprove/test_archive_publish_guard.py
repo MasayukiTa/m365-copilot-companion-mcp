@@ -96,7 +96,7 @@ def test_the_live_archive_still_satisfies_its_own_rule():
 
 
 def test_a_differently_cased_path_is_the_same_file(tmp_path, monkeypatch):
-    """abspath alone calls RELAY\... and relay\... different files while the filesystem
+    r"""abspath alone calls RELAY\... and relay\... different files while the filesystem
     calls them the same one, so a caller differing only in case wrote straight past the
     refusal. A permission check that fails open on spelling."""
     import os

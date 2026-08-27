@@ -125,7 +125,7 @@ def test_a_real_looking_account_name_is_not_on_the_placeholder_list():
 # ---- the shape itself, which was wrong ------------------------------------------------------
 
 def test_the_shape_matches_an_id_with_letters_among_the_digits():
-    """最初の形は `[A-Z]\d{6,}` -- 英字1文字のあと数字が6桁以上。
+    r"""最初の形は `[A-Z]\d{6,}` -- 英字1文字のあと数字が6桁以上。
     実IDは英字と数字が交互で、捕まえるために書いた検査が捕まえられなかった。
     リポジトリを通し続け、漏洩を拾ったのは偶然ホームパスの規則の方だった。"""
     assert C.ID_SHAPE.search(SYNTHETIC_ID)

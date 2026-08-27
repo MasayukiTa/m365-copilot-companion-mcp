@@ -91,7 +91,7 @@ def test_no_click_target_leaves_the_toast_alone(monkeypatch):
 
 def test_nothing_from_the_body_can_reach_the_shell(monkeypatch):
     """base64 にする副産物として、本文はもうシェルの文法に触れない。"""
-    script = _script(monkeypatch, title="t", body="'; Remove-Item -Recurse C:\ ; '")
+    script = _script(monkeypatch, title="t", body="'; Remove-Item -Recurse C:\\ ; '")
     assert "Remove-Item" not in script
 
 

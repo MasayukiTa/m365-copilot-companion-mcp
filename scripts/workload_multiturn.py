@@ -270,7 +270,7 @@ def goals(workdir: str = WORKDIR) -> list:
               "cmd": ("python -c \"import re;"
                       "ls=[l.strip() for l in open(r'%s',encoding='utf-8') if l.strip()];"
                       "assert ls,'empty';"
-                      "dated=[l for l in ls if re.match(r'^\d{4}-\d{2}-\d{2} ',l)];"
+                      r"dated=[l for l in ls if re.match(r'^\d{4}-\d{2}-\d{2} ',l)];"
                       "assert len(dated)==3 or len(ls)==1,(len(dated),len(ls))\"" % agenda_txt)}]},
     ]
 

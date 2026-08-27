@@ -254,7 +254,7 @@ def test_the_words_can_be_read_from_stdin(monkeypatch, queue):
     the dialog promised nothing would be summarised or reworded."""
     import io as _io
     pid = P.add(FILES, REASON)
-    words = '承認する。"この差分のまま"でよい。\n改行も。\ も。'
+    words = '承認する。"この差分のまま"でよい。\n改行も。\\ も。'
 
     class _Stdin:
         buffer = _io.BytesIO(words.encode("utf-8"))

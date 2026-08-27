@@ -253,7 +253,7 @@ def main():
         say(BAD, "is it running?", "no main.py process found")
     else:
         if started < newest:
-            stale.append(("MCP server", "main\.py"))
+            stale.append(("MCP server", r"main\.py"))
         say(OK if started >= newest else BAD, "running tonight's code?",
             "started %s, newest source %s"
             % (time.strftime("%H:%M:%S", time.localtime(started)),
