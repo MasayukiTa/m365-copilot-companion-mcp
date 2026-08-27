@@ -24,16 +24,53 @@ costs a real turn -- so the handler cannot raise, an error budget disables inter
 entirely rather than letting requests pile up behind a broken handler, and installation
 failure means no interception at all rather than a half-installed one.
 
-EXPERIMENTAL, AND OFF UNTIL MEASURED. MCP_CAPTURE_LEAN=1 turns it on.
+HOW IT INTERCEPTS, AND WHY NOT THE OBVIOUS WAY. The first version drove CDP directly --
+Fetch.enable, then Fetch.failRequest or Fetch.continueRequest from the Fetch.requestPaused
+handler. It half worked and was much worse: one capture in two failed, and the successful one
+took 90 seconds against 34 for an ordinary page. The handler was raising CancelledError,
+because Playwright's SYNCHRONOUS api cannot be called re-entrantly from inside one of its own
+event callbacks -- every send() from the handler was a nested call into the event loop already
+running it. page.route() is the sync api's own answer to this question, it hands the handler a
+route object with abort() and continue_(), and it knows each request's resource type without
+being told.
+
+EXPERIMENTAL, AND OFF UNTIL MEASURED. MCP_CAPTURE_LEAN=1 turns it on. The first live trial
+measured NO saving at all -- 108.8 MB against 109.0 -- but on a browser busy with a fleet run,
+at n=2, through the broken interception above. That number is not yet evidence either way.
 """
 from __future__ import annotations
 
 import os
 import threading
 
-#: The resource types that carry bytes and take part in no protocol. CDP spells them exactly
-#: like this; a misspelt type silently matches nothing, which is why they are listed once.
-BLOCKED_TYPES = ("Image", "Font", "Media", "Stylesheet")
+#: The resource types that carry bytes and take part in no protocol. Playwright spells them
+#: lower case; CDP spells them capitalised, and the first version used the CDP spelling with
+#: page.route, where a misspelt type silently matches nothing.
+#: STYLESHEET IS NOT IN THE SET, AND THAT WAS MEASURED. The first live trial blocked all four
+#: and the composer never rendered at all -- three captures in three, then two in two, each
+#: after the opener had spent its full 75 seconds waiting for a page that was never going to
+#: finish. scripts/win/lean_capture_isolate.py answers which of the four does that without
+#: spending a Copilot turn, by opening the page under each candidate set and looking for the
+#: composer:
+#:
+#:     (no blocking)                 composer=True    4.2s
+#:     image                         composer=True    9.3s   blocked 23
+#:     font                          composer=True    7.5s   blocked  0
+#:     media                         composer=True    7.5s   blocked  0
+#:     stylesheet                    composer=False  42.9s   blocked 47
+#:     image,font,media              composer=True    6.3s   blocked 18
+#:     image,font,media,stylesheet   composer=False  42.6s   blocked 71
+#:
+#: So the app waits for its CSS, and blocking it does not make a lighter page -- it makes a
+#: page that never finishes. Font and media are kept although they blocked NOTHING on this
+#: surface: they cost nothing to leave in, and another agent surface may serve them.
+#:
+#: OVERRIDABLE because the set has already had to be narrowed once by measurement, and the
+#: next surface may narrow it again.
+BLOCKED_TYPES = tuple(
+    t.strip().lower() for t in
+    os.environ.get("MCP_CAPTURE_LEAN_TYPES", "image,font,media").split(",")
+    if t.strip())
 
 #: How many handler errors are tolerated before interception is torn down. A handler that has
 #: started failing must not be allowed to hold requests: the page would hang until the capture
@@ -42,45 +79,55 @@ ERROR_BUDGET = 5
 
 
 def enabled() -> bool:
-    return os.environ.get("MCP_CAPTURE_LEAN", "0").strip().lower() not in ("0", "false", "no", "off", "")
+    return os.environ.get("MCP_CAPTURE_LEAN", "0").strip().lower() not in (
+        "0", "false", "no", "off", "")
 
 
 _LEAN = threading.local()
 
 
 class _Interception:
-    """One page's interception, with the teardown that must happen on every exit path."""
+    """One page's route handler, with the teardown that must happen on every exit path."""
 
-    def __init__(self, cdp, page):
-        self.cdp, self.page = cdp, page
+    def __init__(self, page):
+        self.page = page
         self.blocked = 0
         self.allowed = 0
         self.errors = 0
         self.torn_down = False
 
-    def _on_paused(self, event):
-        # NEVER RAISES. An exception here leaves the request paused for ever and the page
-        # waiting on it; the capture then burns its whole timeout and a real turn with it.
-        rid = event.get("requestId")
-        if not rid:
-            return
+    def handle(self, route):
+        """NEVER RAISES. An exception here leaves the request unanswered and the page waiting
+        on it; the capture then burns its whole timeout and a real turn with it."""
         try:
-            if (event.get("resourceType") or "") in BLOCKED_TYPES:
-                self.cdp.send("Fetch.failRequest",
-                              {"requestId": rid, "errorReason": "BlockedByClient"})
+            kind = (route.request.resource_type or "").lower()
+        except Exception:
+            kind = ""
+        try:
+            if kind in BLOCKED_TYPES and not self.torn_down:
+                route.abort()
                 self.blocked += 1
             else:
-                self.cdp.send("Fetch.continueRequest", {"requestId": rid})
+                # FALLBACK, NOT CONTINUE. continue_() RE-ISSUES the request from Playwright,
+                # which rewrites it and changes its timing; fallback() hands it back to the
+                # browser to perform as it normally would. With continue_() on every request
+                # the composer never rendered at all -- three captures in three failed with
+                # "conversation tab/composer is closed", each after the opener had spent its
+                # full 75 seconds waiting for a page that was never going to finish.
+                route.fallback()
                 self.allowed += 1
         except Exception:
             self.errors += 1
             try:
-                self.cdp.send("Fetch.continueRequest", {"requestId": rid})
+                route.fallback()
             except Exception:
-                pass
+                try:
+                    route.continue_()
+                except Exception:
+                    pass
             if self.errors >= ERROR_BUDGET:
-                # Stop interfering rather than keep failing. Fetch.disable releases everything
-                # still paused, so the page finishes loading as an ordinary one.
+                # Stop interfering rather than keep failing. Unrouting releases the page to
+                # load as an ordinary one.
                 self.teardown()
 
     def teardown(self):
@@ -89,11 +136,7 @@ class _Interception:
             return
         self.torn_down = True
         try:
-            self.cdp.send("Fetch.disable")
-        except Exception:
-            pass
-        try:
-            self.cdp.detach()
+            self.page.unroute("**/*", self.handle)
         except Exception:
             pass
 
@@ -109,10 +152,8 @@ def install(page):
     which is exactly what every capture did before this module existed.
     """
     try:
-        cdp = page.context.new_cdp_session(page)
-        interception = _Interception(cdp, page)
-        cdp.on("Fetch.requestPaused", interception._on_paused)
-        cdp.send("Fetch.enable", {"patterns": [{"urlPattern": "*"}]})
+        interception = _Interception(page)
+        page.route("**/*", interception.handle)
         return interception
     except Exception:
         return None

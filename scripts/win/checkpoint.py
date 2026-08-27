@@ -35,11 +35,45 @@ def _ps(script, timeout=40):
 
 
 def pages(port):
+    """Open page URLs, or None if the port is not answering."""
+    got = targets(port)
+    return None if got is None else [t.get("url", "") for t in got]
+
+
+def targets(port):
+    """Open page targets, ids included, or None. The id is how a claim is matched."""
     try:
         with urllib.request.urlopen("http://127.0.0.1:%d/json/list" % port, timeout=3) as fh:
-            return [t.get("url", "") for t in json.load(fh) if t.get("type") == "page"]
+            return [t for t in json.load(fh) if t.get("type") == "page"]
     except Exception:
         return None
+
+
+def _pid_alive(pid):
+    if not pid:
+        return False
+    out = _ps("if (Get-Process -Id %d -ErrorAction SilentlyContinue) { 'yes' }" % int(pid), 20)
+    return "yes" in (out or "")
+
+
+def unowned(copilot_targets):
+    """Which of these Copilot pages no live claim covers.
+
+    THE LEDGER, NOT "IS A RUN IN FLIGHT". This check used to excuse every Copilot page for as
+    long as `.fleet/status.json` said a run was going, and condemn every one otherwise -- so a
+    capture-page measurement, which is not a fleet run, tripped the invariant simply by doing
+    its job, and a page left by a crashed run was invisible for as long as any other run
+    happened to be up. Ownership is the question, and relay/ownership.py already answers it:
+    a claim stands only while its lease holds AND its process is alive, so nothing here is
+    believed on its own.
+    """
+    try:
+        sys.path.insert(0, REPO)
+        from relay import ownership
+    except Exception:
+        return None                      # cannot tell; the caller falls back
+    observed = {("page", t.get("id")): t.get("url", "") for t in copilot_targets}
+    return ownership.reconcile(observed, _pid_alive)["orphaned"]
 
 
 def edge_state():
@@ -127,20 +161,35 @@ def verdicts_now():
     verdicts.append(("no browser window", not headed,
                      "headed: %s" % (", ".join(headed) if headed else "none")))
 
-    # 2. No Copilot page is open that nobody is using.
+    # 2. No Copilot page is open that nobody owns.
     d = run_state()
     running = bool(d.get("running"))
-    open_pages = {}
+    stray, orphans, asked_ledger = {}, {}, True
     for port, name in ((9222, "companion"), (9223, "bridge"), (9224, "eval")):
-        urls = pages(port)
-        if urls is None:
+        got = targets(port)
+        if got is None:
             continue
-        open_pages[name] = [u for u in urls if "m365.cloud.microsoft" in u]
-    stray = {k: v for k, v in open_pages.items() if v}
-    # During a run a capture page is expected and lives ~30-45s; idle, none should exist.
-    verdicts.append(("no idle Copilot page", running or not stray,
-                     "copilot pages: %s (run in flight: %s)"
-                     % ({k: len(v) for k, v in stray.items()} or "none", running)))
+        mine = [t for t in got if "m365.cloud.microsoft" in (t.get("url") or "")]
+        if mine:
+            stray[name] = mine
+        loose = unowned(mine)
+        if loose is None:
+            asked_ledger = False
+        elif loose:
+            orphans[name] = loose
+    if asked_ledger:
+        # Every page here is claimed by a process that is alive and has renewed its lease,
+        # whether that process is a fleet run, a measurement, or the bridge.
+        detail = ("copilot pages: %s, of which unowned: %s"
+                  % ({k: len(v) for k, v in stray.items()} or "none",
+                     {k: len(v) for k, v in orphans.items()} or "none"))
+        verdicts.append(("no unowned Copilot page", not orphans, detail))
+    else:
+        # The ledger could not be read. Fall back to the old, cruder question rather than
+        # reporting a clean result nobody measured.
+        verdicts.append(("no idle Copilot page", running or not stray,
+                         "copilot pages: %s (ledger unreadable; run in flight: %s)"
+                         % ({k: len(v) for k, v in stray.items()} or "none", running)))
 
     # 3. Every tab that carried work today was a fallback.
     done, tab, fell, faults, closed = route_since(today)
