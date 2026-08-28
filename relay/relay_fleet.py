@@ -5025,6 +5025,28 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             _w.display_result = _merged
             _w.reason = ("%s / 統合結果を掲載 (統合ワーカー %s: %s)"
                          % (_w.reason, _agg.name, _agg.outcome or _agg.status))
+        else:
+            # EVERY MERGE FAILED, AND THAT USED TO BE SILENT.
+            #
+            # The parent ended at turn one holding nothing but its own split proposal. With no
+            # merge text the branch above simply did not run, so the parent was DELIVERED
+            # carrying that proposal -- a list of subtasks -- as though it were the answer. A
+            # reader sees a plausible plan and no indication that the work behind it never
+            # came back.
+            #
+            # The children's own results are not substituted here on purpose: combining them
+            # is the merge's job, and doing it badly at delivery time would produce a worse
+            # answer wearing the same confidence. What is owed is the truth that the answer is
+            # missing, and where its pieces are.
+            _outcomes = ", ".join("%s:%s" % (x.name, x.outcome or x.status) for x in _aggs)
+            _w.outcome = "VERIFY_FAILED"
+            _w.status = "stuck"
+            _w.reason = ("%s / 統合が完了しなかったため、この結果は分割案のままです"
+                         "(統合ワーカー %s)。子タスクの結果は個別に残っています。"
+                         % (_w.reason, _outcomes))[:300]
+            print("[fanout] %s: every merge attempt failed (%s) -- parent marked "
+                  "VERIFY_FAILED rather than delivered with its split proposal"
+                  % (_cid, _outcomes), flush=True)
 
     notify("並列自律フリート 完了",
            "%d ゴール: %s" % (len(workers), ", ".join(w.outcome or "?" for w in workers)))
