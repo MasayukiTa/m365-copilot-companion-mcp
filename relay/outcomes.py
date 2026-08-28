@@ -109,8 +109,96 @@ def is_retryable(outcome) -> bool:
     return outcome in RETRYABLE
 
 
+#: Whether an outcome counts toward a measured pass rate, and on which side.
+#:
+#: WHY A THIRD VALUE. Scoring code kept asking one question -- "is this DONE?" -- and every
+#: outcome that was neither a pass nor a failure of the system under test got silently filed
+#: as a failure. Two of those are not failures at all:
+#:
+#:   * CANCELLED is a human saying stop. The agent did not fail; it was not allowed to
+#:     finish. Counting it as a failure measures the operator, not the agent.
+#:   * INFRA_STUCK is the outcome invented precisely to mean "our path looked unhealthy" --
+#:     the connection or agent never established. There was no attempt to grade.
+#:
+#: And one is neither, for a different reason:
+#:
+#:   * FANOUT is done AS A GOAL, but its answer is delivered by the merge that follows its
+#:     family. Scoring the parent counts one goal twice: once here, once at the aggregator
+#:     that actually produced the answer. Scoring it as a failure is worse still.
+#:
+#: Everything else stays a failure ON PURPOSE. REFUSED and MAXTURNS are the signals a retry
+#: floor and an effort router exist to act on; moving them out of the denominator would
+#: delete the very quantity those mechanisms are measured against.
+SCORING = {
+    "DONE": "pass",
+    "FANOUT": "excluded",
+    "MAXTURNS": "fail",
+    "CANCELLED": "excluded",
+    "CONTENT_REFUSED": "fail",
+    "STUCK": "fail",
+    "INFRA_STUCK": "excluded",
+    "REFUSED": "fail",
+    "VERIFY_FAILED": "fail",
+    "ERROR": "fail",
+}
+
+#: Excluded from the denominator. Read from SCORING rather than hand-listed: a second copy of
+#: this set is a second thing to forget, and the omissions this module exists to prevent were
+#: all omissions from a hand-kept list.
+EXCLUDED_FROM_DENOMINATOR = frozenset(k for k, v in SCORING.items() if v == "excluded")
+
+
+def scoring_of(outcome) -> str:
+    """'pass' | 'fail' | 'excluded' for `outcome`. Raises rather than guessing.
+
+    FAIL-CLOSED BY CONSTRUCTION. The raise is not defensive politeness: an unlisted outcome
+    must not be able to fall into 'excluded', because that is the direction that quietly
+    RAISES a reported pass rate. A new outcome fails here on the commit that introduces it,
+    which is the moment somebody knows which side it belongs on.
+    """
+    try:
+        return SCORING[outcome]
+    except (KeyError, TypeError):
+        raise UnknownOutcome(
+            "outcome %r is not in the closed set; add it to SCORING in relay/outcomes.py "
+            "with the side it scores on, rather than letting it default" % (outcome,))
+
+
+def tally(outcomes):
+    """Count a run's outcomes into the two rates that must always be reported together.
+
+    TWO QUESTIONS, NEVER ONE NUMBER -- the same discipline the companion benchmark already
+    holds. Every exclusion added to a suite RAISES `conditional`, because excluding leaves the
+    denominator; three rounds of honest exclusions in the same direction look exactly like
+    three rounds of improvement, and nothing in a single number tells them apart.
+
+    `conditional` asks what fraction of GRADABLE attempts passed. `end_to_end` asks what
+    fraction of everything the caller asked for came back with an answer -- an unhealthy
+    environment cannot flatter itself there. `excluded_rate` is the health of the measurement
+    itself: a run that excluded most of its work is not a run with a high score, it is a run
+    that did not measure anything.
+    """
+    counts = {"pass": 0, "fail": 0, "excluded": 0}
+    for o in outcomes:
+        counts[scoring_of(o)] += 1
+    total = sum(counts.values())
+    gradable = counts["pass"] + counts["fail"]
+    return {
+        "passed": counts["pass"],
+        "failed": counts["fail"],
+        "excluded": counts["excluded"],
+        "gradable": gradable,
+        "total": total,
+        "conditional": (counts["pass"] / gradable) if gradable else None,
+        "end_to_end": (counts["pass"] / total) if total else None,
+        "excluded_rate": (counts["excluded"] / total) if total else None,
+    }
+
+
 # The invariants this module exists to hold, checked at import so a bad edit cannot ship.
 assert set(STATUS_OF) == OUTCOMES
 assert RETRYABLE | NON_RETRYABLE == OUTCOMES and not (RETRYABLE & NON_RETRYABLE)
 assert FINISHED <= OUTCOMES
 assert set(NOT_PRODUCED) <= OUTCOMES
+assert set(SCORING) == OUTCOMES
+assert set(SCORING.values()) <= {"pass", "fail", "excluded"}

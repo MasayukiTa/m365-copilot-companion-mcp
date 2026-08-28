@@ -40,6 +40,10 @@ from relay.selfimprove import dashboard                             # noqa: E402
 SLICE_LABEL = "SWE-bench Pro 50 (multi-language)"
 
 
+from bench import swe_run_facts
+from relay.outcomes import scoring_of
+
+
 def _wilson(k, n, z=1.96):
     """95% Wilson interval for a binomial pass rate -- honest small-N error bars for the trend point."""
     if n == 0:
@@ -93,6 +97,11 @@ def main(argv=None):
                     help="why this measurement was taken -- required in spirit when re-measuring "
                          "a genome already in the archive, because the identical id already says "
                          "WHICH row is replaced and only the reason is missing")
+    ap.add_argument("--history", default=os.path.join(REPO, ".fleet", "history.json"),
+                    help="the fleet ledger this run wrote; supplies each instance's outcome "
+                         "and turn count")
+    ap.add_argument("--wtmap", default=os.path.join(REPO, ".fleet", "swe", "pro_wt_map.json"),
+                    help="instance_id -> worktree path, the key the ledger joins on")
     ap.add_argument("--commit", action="store_true", help="actually write (default: dry-run)")
     args = ap.parse_args(argv)
 
@@ -101,15 +110,43 @@ def main(argv=None):
         print("ERROR: no instance_ids in preds %s" % args.preds)
         return 2
     resolved = _load_resolved(args.grade, ids)
-    n = len(ids)
-    k = len(resolved)
+
+    # WHAT THE FLEET RECORDED ABOUT THIS RUN, joined onto the graded slice.
+    #
+    # `pro_capture.py` writes a prediction row for every worktree that still exists, whatever
+    # the worker's outcome was. A goal a human STOPPED and a goal whose connection never
+    # established both arrive here as an empty patch, grade as unresolved, and used to enter
+    # the denominator as failures -- measuring the operator and the environment rather than
+    # the agent. The outcome was recorded all along, in the fleet's own ledger; nothing read it.
+    facts = swe_run_facts.load(args.wtmap, args.history)
+    join = swe_run_facts.join_report(ids, facts)
+
+    # FAIL-CLOSED. An instance the ledger does not cover STAYS IN THE DENOMINATOR. Excluding
+    # what we could not verify is the direction that flatters the score, and it is the
+    # direction an unread ledger would take every instance in.
+    excluded = [i for i in ids
+                if i in facts and scoring_of(facts[i]["outcome"]) == "excluded"]
+    graded_ids = [i for i in ids if i not in set(excluded)]
+
+    n_all = len(ids)
+    n = len(graded_ids)
+    k = len([i for i in resolved if i in set(graded_ids)])
+    if not n:
+        print("ERROR: every instance was excluded -- there is nothing to score")
+        return 2
     pass_at_1 = round(k / n, 4)
     ci = _wilson(k, n)
+    # TWO RATES, NEVER ONE. Excluding work RAISES pass@1 because excluding leaves the
+    # denominator; `end_to_end` is the one an unhealthy run cannot flatter.
+    end_to_end = round(k / n_all, 4)
 
     # Per-instance records for behaviour descriptors: diff_size from the captured patch, miss_class
     # = "none" when resolved (a real solve), "other" otherwise (we don't claim a finer class here).
-    recs = [{"diff_size": patch_len.get(i, 0), "turns": 0,
-             "miss_class": "none" if i in resolved else "other"} for i in ids]
+    # `turns` was a hardcoded 0 -- a field that is always zero is worse than a missing one,
+    # because every turn-based descriptor computed from it was a statement about nothing.
+    recs = [{"diff_size": patch_len.get(i, 0),
+             "turns": (facts.get(i) or {}).get("turns", 0),
+             "miss_class": "none" if i in resolved else "other"} for i in graded_ids]
     desc = descriptors(recs)
 
     # The genome is exactly what the run used -- no invented knobs. The card under measurement is the
@@ -128,7 +165,21 @@ def main(argv=None):
 
     print("=== Pro 50 record (%s) ===" % ("COMMIT" if args.commit else "DRY-RUN"))
     print("  graded      : %d / %d resolved" % (k, n))
-    print("  pass@1      : %.4f  (95%% CI %s)" % (pass_at_1, ci))
+    print("  pass@1      : %.4f  (95%% CI %s)   [conditional on a gradable attempt]" % (pass_at_1, ci))
+    print("  end-to-end  : %.4f  (%d of %d asked for)" % (end_to_end, k, n_all))
+    print("  ledger      : %d/%d instances joined (coverage %s)"
+          % (join["joined"], join["graded"],
+             "n/a" if join["coverage"] is None else "%.0f%%" % (100 * join["coverage"])))
+    if excluded:
+        print("  excluded    : %d (%s)"
+              % (len(excluded),
+                 ", ".join("%s=%s" % (i, facts[i]["outcome"]) for i in excluded[:6])
+                 + (" ..." if len(excluded) > 6 else "")))
+    if join["coverage"] is not None and join["coverage"] < 1.0:
+        # NOT a warning to be scrolled past: every unjoined instance is one this run could not
+        # tell apart from a real failure, so the number below is a floor on the true rate.
+        print("  NOTE        : %d instance(s) had no ledger row and were scored as attempted"
+              % len(join["missing"]))
     print("  descriptors : %s" % desc)
     print("  genome.knobs: %s" % genome["knobs"])
     print("  burn reason : %s" % reason)
@@ -139,7 +190,7 @@ def main(argv=None):
         return 0
 
     arc = Archive()
-    eid = arc.add(genome, slice_ids=ids, pass_at_1=pass_at_1, ci=ci,
+    eid = arc.add(genome, slice_ids=graded_ids, pass_at_1=pass_at_1, ci=ci,
                   gate_verdict="measured", descriptors=desc, note=args.note)
     burned = BurnedRegistry()
     n_new = burned.add(ids, reason)

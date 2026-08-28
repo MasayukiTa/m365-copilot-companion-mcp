@@ -1755,6 +1755,10 @@ class RelayWorker:
         self.review_lenses = list(review_lenses) if review_lenses else []
         self._panel_queue = []
         self._panel_results = []
+        #: The panel's per-lens verdicts and the veto counterfactual, filled once the
+        #: panel completes. None (not {}) until then, so "ran no panel" stays
+        #: distinguishable from "ran a panel that found nothing".
+        self.panel_record = None
         # OPT-IN adaptive refuter (MCP_ADAPTIVE_REFUTER=1): set only when the adaptive hook
         # fires; None/unset means the fixed-panel path runs unchanged (back-compat).
         self._adaptive_features = None
@@ -3657,6 +3661,34 @@ class RelayWorker:
             self._context, self._agent_url or "", self.goal,
             self.last_response, lens=lens).start()
 
+    def _append_panel_ledger(self, record):
+        """One line per completed panel, beside the run state.
+
+        NOT THE UI'S COPY. `.fleet/history.json` is written by the cockpit from the status
+        snapshot, so anything that reaches an analysis only through that file is hostage to a
+        second program choosing to carry the field. This ledger is written by the fleet
+        itself, which is the process that actually knows the verdicts.
+
+        Best-effort by construction: a measurement side-channel must never be able to fail the
+        run it is measuring. A lost line costs one sample; a raised exception here would cost
+        the work.
+        """
+        try:
+            tx = getattr(self, "transcript", "") or ""
+            if not tx:
+                return
+            state_dir = os.path.dirname(os.path.dirname(tx))
+            if not os.path.isdir(state_dir):
+                return
+            row = dict(record or {})
+            row.update({"kind": "panel", "worker": self.name, "goal": self.goal,
+                        "cwd": getattr(self, "cwd", "") or "",
+                        "refute_count": self.refute_count, "ts": time.time()})
+            with open(os.path.join(state_dir, "panels.jsonl"), "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
     def _poll_refute(self):
         """Drive the non-blocking refuter / review panel. REFUTED -> feed the reason back
         and keep working; UPHELD/UNCLEAR -> accept. A panel runs one independent reviewer
@@ -3681,7 +3713,14 @@ class RelayWorker:
             if self._panel_queue:                  # consult the remaining lenses first
                 self._start_next_lens()
                 return False
-            from .refuter import aggregate_panel    # all in -> majority vote
+            from .refuter import aggregate_panel, panel_shadow    # all in -> majority vote
+            # RECORD THE WHOLE PANEL, not just what it decided. Once the majority has spoken,
+            # which lens dissented is gone -- and that is the one fact needed to answer
+            # whether a veto aggregator would block work that was fine. Recorded here, the
+            # answer becomes countable from runs that already happened. Nothing downstream
+            # reads `veto_shadow` to make a decision; it is measurement, not policy.
+            self.panel_record = panel_shadow(self._panel_results)
+            self._append_panel_ledger(self.panel_record)
             kind, reason = aggregate_panel(self._panel_results)
         else:
             self._refuter_session = None
@@ -4971,6 +5010,10 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
              # through, in order. Carried into the final snapshot so the UI can show the
              # complete phase spine even after the run finishes.
              "phase_events": list(getattr(w, "phase_events", [])),
+             # the panel's PER-LENS verdicts plus what a veto aggregator would have decided.
+             # Absent for workers that ran no panel; never synthesised, because an invented
+             # empty panel is indistinguishable from three reviewers who said nothing.
+             "panel": getattr(w, "panel_record", None),
              # FIX 2 (P0): carry the worker's final assistant text so fleet_runner can
              # populate display_result and keep `last` non-blank in the final snapshot.
              "last_response": getattr(w, "last_response", "") or "",
