@@ -296,6 +296,21 @@ def _load_discipline():
 
 OUTPUT_DISCIPLINE = _load_discipline()
 
+#: The sentence under A/B test, isolated so an arm can be built by REMOVING it rather than by
+#: maintaining a second copy of the whole prompt -- two prompts that are meant to differ in one
+#: sentence drift apart the moment either is edited, and then the experiment is measuring the
+#: drift. Empty only when MCP_NO_SKILL_SENTENCE is set, which nothing in production sets: the
+#: default below is byte-for-byte what shipped.
+#:
+#: WHY IT IS BEING TESTED AGAIN. The first test could not discriminate: all three arms returned
+#: the same answer and the true answer was reachable without consulting any skill, so it
+#: measured nothing about whether the sentence works. A probe has to be a task whose CORRECT
+#: procedure is non-obvious and whose following is visible in the answer.
+SKILL_SENTENCE = ("" if os.environ.get("MCP_NO_SKILL_SENTENCE") else
+                  "承認済みの手順(スキル)がある作業は、それに従うこと。作業に入る前に call_tool で "
+                  "skill_match を呼び、確度の高い一致があれば skill_load して**その手順どおりに**進める"
+                  "(自分で別の手順を作らない)。一致が無ければ通常どおり進めてよい。")
+
 PROTOCOL = (
     # ゲートウェイの説明を先頭に置く。規律文が先だと、ツールを探す前に
     # 「無いので不可」と切り上げる側に効いてしまう（実測でその挙動が出た）。
@@ -321,9 +336,7 @@ PROTOCOL = (
     # lesson was written into a channel this reader does not receive.
     #
     # One sentence, ~90 characters, inside the 1,500-character budget for this prompt.
-    "承認済みの手順(スキル)がある作業は、それに従うこと。作業に入る前に call_tool で "
-    "skill_match を呼び、確度の高い一致があれば skill_load して**その手順どおりに**進める"
-    "(自分で別の手順を作らない)。一致が無ければ通常どおり進めてよい。"
+    + SKILL_SENTENCE
     + OUTPUT_DISCIPLINE + " "
     "ツールを使い自律的に進める。重い作業は小さく分割し1ターンに1〜数ステップ。"
     "ツールは call_tool ゲートウェイ経由: まず call_tool(name='') で一覧(名前+要約)を見て"
