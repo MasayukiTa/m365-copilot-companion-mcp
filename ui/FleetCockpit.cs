@@ -686,6 +686,7 @@ class CockpitWindow : Window
                                 // as the RUN reaches its finished state -> settings.txt autoarchive=
     Button _autoArchiveBtn;     // gear-popup toggle for _autoArchive
     string _archivedRunStarted = "";   // `started` of the run already auto-archived (fire once/run)
+    string _tailArchivedRunStarted = "";  // `started` of the run whose FINAL sweep was archived
     // P2 history search: live case-insensitive substring filter over title+result, debounced.
     TextBox _histSearchBox;
     TextBlock _histHint;   // placeholder drawn behind an empty filter box (WPF has none of its own)
@@ -8052,7 +8053,24 @@ class CockpitWindow : Window
         }
         // only archive while the run is LIVE -- otherwise the finished run's final
         // snapshot would re-add cleared tasks every tick (Clear would never stick).
+        //
+        // AND ONCE MORE WHEN IT STOPS, WHICH IS THE WHOLE BUG. `running` is false as soon as
+        // every worker is terminal, so the sweep in which the LAST worker finishes is the
+        // sweep that fails this test -- that worker was never terminal on a tick where this
+        // line ran, and it never reaches History.
+        //
+        // MEASURED 2026-08-28 over the eight most recent runs: seven lost at least one
+        // worker, the missing one was the highest-numbered in five, and a ONE-GOAL run
+        // archived nothing at all -- 0 of 1, because its only worker finished on the sweep
+        // that flipped running to false.
+        //
+        // Fired once per run, keyed on `started`, so the objection above still holds: a
+        // finished run cannot re-add cleared cards every tick, because it archives on one
+        // tick only. Independent of the auto-archive setting and of which cards are on
+        // screen -- MaybeAutoArchive walks _toolbarShown, so with a tab filter active it
+        // archives only what the filter left visible, and this walks the snapshot.
         if (runningNow) ArchiveTerminal(root);
+        else ArchiveRunTailOnce(root);
         // opt-in auto-retry runs every tick (before the sig short-circuit) so it catches a
         // stopped goal even when nothing else changed. Bounded by _autoRetryMax per goal text.
         if (runningNow && _autoRetry) AutoRetryScan(root);
@@ -11213,9 +11231,13 @@ class CockpitWindow : Window
 
     static bool IsTerminalWorker(Dictionary<string, object> w)
     {
+        // MUST MATCH relay/relay_fleet.py TERMINAL. A status missing here does more than skip
+        // one card: MaybeAutoArchive returns early the moment any worker looks unfinished, so
+        // one unrecognised status costs the whole run its auto-archive.
         string status = S(w, "status");
         return status == "done" || status == "stuck" || status == "maxturns"
-               || status == "error" || status == "cancelled";
+               || status == "error" || status == "cancelled"
+               || status == "content_refused";
     }
 
     // Severity rank for the "unfinished only" sort: failures first, then max-turns, then
@@ -11807,6 +11829,23 @@ class CockpitWindow : Window
         catch (Exception) { }
         ForceRender();
     }
+    // The finished run's last archive pass. See the call site for why it exists and why it
+    // may run only once. ArchiveTerminal is already idempotent through _archivedKeys; the
+    // once-per-run key is what keeps a CLEARED history clear, because clearing empties
+    // _archivedKeys and a per-tick pass would refill it from the frozen snapshot.
+    void ArchiveRunTailOnce(Dictionary<string, object> root)
+    {
+        if (root == null) return;
+        string started = S(root, "started");
+        if (string.IsNullOrEmpty(started)) return;
+        if (_tailArchivedRunStarted == started) return;
+        object wo;
+        if (!root.TryGetValue("workers", out wo) || !(wo is object[])) return;
+        if (((object[])wo).Length == 0) return;
+        _tailArchivedRunStarted = started;
+        ArchiveTerminal(root);
+    }
+
     void ArchiveTerminal(Dictionary<string, object> root)
     {
         object wo;
@@ -11817,8 +11856,14 @@ class CockpitWindow : Window
         {
             var w = (Dictionary<string, object>)o;
             string status = S(w, "status");
+            // MUST MATCH relay/relay_fleet.py's TERMINAL. `content_refused` was missing from
+            // both terminal tests in this file while Python has set it since it was added, so
+            // a worker that ended that way was never archived -- and worse, IsTerminalWorker
+            // returning false for it stops MaybeAutoArchive for the WHOLE run, so one refused
+            // goal could cost every other card in that run its history entry.
             bool terminal = status == "done" || status == "stuck" || status == "maxturns"
-                            || status == "error" || status == "cancelled";
+                            || status == "error" || status == "cancelled"
+                            || status == "content_refused";
             if (!terminal) continue;
             string conv = S(w, "conv_url");
             // STABLE key per run+worker (conv_url is absent in the final snapshot, so
