@@ -120,18 +120,24 @@ def is_retryable(outcome) -> bool:
 #:   * INFRA_STUCK is the outcome invented precisely to mean "our path looked unhealthy" --
 #:     the connection or agent never established. There was no attempt to grade.
 #:
-#: And one is neither, for a different reason:
-#:
-#:   * FANOUT is done AS A GOAL, but its answer is delivered by the merge that follows its
-#:     family. Scoring the parent counts one goal twice: once here, once at the aggregator
-#:     that actually produced the answer. Scoring it as a failure is worse still.
+#: FANOUT WAS ALSO EXCLUDED HERE, AND THAT WAS WRONG. The argument was that a fan-out parent
+#: is done AS A GOAL while its answer comes from the merge, so scoring the parent counts one
+#: goal twice. That is true where the denominator is worker rows. It is false where the
+#: denominator is BENCHMARK INSTANCES: there is one prediction per instance, so excluding a
+#: fan-out parent does not prevent a double count -- it deletes the instance from the
+#: benchmark. A parent that split and whose family merged has an answer, and that answer is
+#: what the instance's patch contains; if no merge result exists, the instance failed to
+#: deliver, which is a failure and not an exclusion. Reported by an external review, verified
+#: against the scoring path.
 #:
 #: Everything else stays a failure ON PURPOSE. REFUSED and MAXTURNS are the signals a retry
 #: floor and an effort router exist to act on; moving them out of the denominator would
 #: delete the very quantity those mechanisms are measured against.
 SCORING = {
     "DONE": "pass",
-    "FANOUT": "excluded",
+    # A goal that split still owes an answer; see the note above on why this is not an
+    # exclusion. It is scored on whether the family delivered one.
+    "FANOUT": "fail",
     "MAXTURNS": "fail",
     "CANCELLED": "excluded",
     "CONTENT_REFUSED": "fail",

@@ -142,7 +142,22 @@ def main():
     with open(a.out, "w", encoding="utf-8", newline="\n") as f:
         for g in goals:
             f.write(json.dumps(g, ensure_ascii=False) + "\n")
-    json.dump(wtmap, open(os.path.join(SW, "pro_wt_map.json"), "w", encoding="utf-8"),
+    # MERGED, NOT OVERWRITTEN. This file is written once per BATCH and was replaced each
+    # time, so by the end of a seven-batch run it named only the seventh batch -- and the
+    # ledger join that reads it could therefore cover at most the last batch while the
+    # recorder reported the whole 50 as measured. Earlier batches' exclusions and turn counts
+    # were silently unavailable.
+    _wt_path = os.path.join(SW, "pro_wt_map.json")
+    try:
+        with open(_wt_path, encoding="utf-8") as _fh:
+            _prev = json.load(_fh)
+        if isinstance(_prev, dict):
+            _merged = dict(_prev)
+            _merged.update(wtmap)      # this batch's entries win for ids it re-staged
+            wtmap = _merged
+    except (OSError, ValueError):
+        pass
+    json.dump(wtmap, open(_wt_path, "w", encoding="utf-8"),
               ensure_ascii=False, indent=1)
     print("wrote %s with %d goals (+ pro_wt_map.json)" % (a.out, len(goals)))
 

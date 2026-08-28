@@ -250,7 +250,7 @@ class Archive:
 
     def add(self, genome: dict, *, slice_ids, pass_at_1, ci=None, gate_verdict=None,
             descriptors=None, ts=None, note=None, resolved_ids=None,
-            replicate=None) -> str:
+            replicate=None, measurement=None) -> str:
         """Append a validated genome and return its id.
 
         Entry = {"id", "genome", "parent_id", "slice_ids", "pass_at_1", "ci", "gate_verdict",
@@ -290,6 +290,14 @@ class Archive:
         None (the default) keeps the old meaning exactly: a correction, superseding. An
         integer marks an independent repeat, which supersedes nothing and is what pass^k
         counts.
+
+        `measurement` carries the qualifications the headline rate depends on -- the
+        end-to-end rate, what was excluded and why, and how much of the ledger the run could
+        actually join. Those were printed to a console and thrown away, so `pass_at_1` arrived
+        here as a bare number with its conditions stripped: it is the rate CONDITIONAL on a
+        gradable attempt, and exclusions raise it. A reader of the archive could not tell a
+        run that excluded nothing from one that excluded half its slice, and a drift in what
+        gets excluded reads as capability improving.
         """
         eid = genome_id(genome)
         entry = {
@@ -305,7 +313,10 @@ class Archive:
             # None = a correction of the row it shares an id with (the historical meaning);
             # an integer = an independent repeat, which supersedes nothing.
             "replicate": (int(replicate) if replicate is not None else None),
+            # The rate is CONDITIONAL on a gradable attempt. The name is kept for the rows
+            # already written under it; `measurement` carries what qualifies it.
             "pass_at_1": pass_at_1,
+            "measurement": measurement,
             "ci": ci,
             "gate_verdict": gate_verdict,
             "descriptors": descriptors,

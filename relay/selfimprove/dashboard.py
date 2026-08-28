@@ -419,8 +419,11 @@ def dashboard_state(*, archive_path=None, burned_path=None, grade_results_path=N
         # "pass^k 1.00" from a single run would invent the finding the metric was added to
         # check, which is the failure mode a second headline metric brings with it.
         "pass_hat_k_measured": reliability["measured"],
-        "pass_hat_k": (min(r["pass_hat_k"] for r in reliability["slices"])
-                       if reliability["slices"] else None),
+        # NO SINGLE HEADLINE NUMBER. A minimum across scaffolds, slices and different k is not
+        # a quantity -- it changes when an unrelated scaffold is measured, and pass^3 and
+        # pass^2 are not comparable in the first place (pass^k falls as k rises by
+        # construction). The summary carries the count; the rows carry the numbers.
+        "pass_hat_k_rows": len(reliability["slices"]),
         "latest_ab": latest_ab,
         "burned_total": burned_ledger["total"],
         "archive_count": archive_section["count"],
@@ -556,13 +559,23 @@ def render_text(state) -> str:
     # different 40% each run read the same as one that solves the same 40% every run.
     rel = state.get("reliability") or {}
     if rel.get("measured"):
-        worst = min(r["pass_hat_k"] for r in rel["slices"])
-        k = max(r["k"] for r in rel["slices"])
-        flaky = max(r["flaky"] for r in rel["slices"])
-        lines.append("        pass^%-2d: %.3f   [reliability: solved in EVERY one of %d runs]"
-                     % (k, worst, k))
-        lines.append("        flaky  : %.3f   [solved at least once but not every time]"
-                     % flaky)
+        # ONE ROW PER MEASURED SCAFFOLD, never an aggregate across them.
+        #
+        # This took min(pass_hat_k), max(k) and max(flaky) as three separate aggregates over
+        # possibly three different rows and printed them as one measurement -- so a k=2 figure
+        # could be labelled pass^3, which is not an imprecise number but a false one. And a
+        # minimum across different n, k and scaffolds is not an estimand at all: it is the
+        # worst thing observed anywhere, which moves when an unrelated scaffold is measured.
+        for r in sorted(rel["slices"], key=lambda x: x["pass_hat_k"]):
+            ci = r.get("ci_instances")
+            lines.append("        pass^%-2d: %.3f %s  n=%-3d %s"
+                         % (r["k"], r["pass_hat_k"],
+                            ("[%.3f, %.3f]" % (ci[0], ci[1])) if ci else "            ",
+                            r["n"], (r.get("genome_id") or "?")[:12]))
+            lines.append("                 flaky %.3f  [solved at least once, not every time]"
+                         % r["flaky"])
+        lines.append("                 (pass^k is over INSTANCES; k runs give almost no "
+                     "information about run-to-run variance)")
     else:
         # NOT 1.000, and not pass@1 raised to a power. Deriving pass^k from a rate assumes
         # instances are independent and equally hard, and the falseness of that assumption is

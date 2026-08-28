@@ -144,3 +144,47 @@ def test_the_goal_key_still_works_for_records_without_a_cwd():
     """history.json rows are thinner. Dropping the fallback would silently cover nothing."""
     facts = facts_from_history(WT, [_row(r"C:\wt\pro_3", "STUCK", 6)])
     assert facts["proj__proj-3"]["outcome"] == "STUCK"
+
+
+# ---- the join defects an external review found -------------------------------------------
+
+WT2 = {"proj__proj-1": r"C:\wt\p1", "proj__proj-10": r"C:\wt\p10"}
+
+
+def test_a_path_does_not_match_a_longer_path_it_prefixes():
+    """`...\p1` inside text naming `...\p10` matched, and the first map entry in dictionary
+    order won. One instance's outcome was attributable to another."""
+    facts = facts_from_history(WT2, [{"goal": r"work at C:\wt\p10 now",
+                                      "outcome": "DONE", "turn": 1}])
+    assert list(facts) == ["proj__proj-10"]
+
+
+def test_a_goal_naming_two_instances_joins_to_neither():
+    """A staged goal quotes an issue body, which can name anything. Refusing costs one
+    unjoined row -- which stays in the denominator; guessing costs a wrong attribution."""
+    facts = facts_from_history(WT2, [{"goal": r"see C:\wt\p1 and C:\wt\p10",
+                                      "outcome": "DONE", "turn": 1}])
+    assert facts == {}
+
+
+def test_two_instances_mapped_to_one_path_join_to_neither():
+    """Letting the later map entry own every worker that ran there is a silent mis-attribution
+    with no symptom."""
+    facts = facts_from_history({"a": r"C:\w", "b": r"C:\w"},
+                               [{"cwd": r"C:\w", "goal": "x", "outcome": "DONE", "turn": 1}])
+    assert facts == {}
+
+
+def test_an_unambiguous_mention_still_joins():
+    """The guards must not close the door on the case they exist to protect."""
+    facts = facts_from_history(WT2, [{"goal": r"work at C:\wt\p1 now",
+                                      "outcome": "DONE", "turn": 1}])
+    assert list(facts) == ["proj__proj-1"]
+
+
+def test_a_path_at_the_very_end_of_the_text_matches():
+    """The boundary test must accept end-of-string, or a goal ending in its own path joins to
+    nothing."""
+    facts = facts_from_history(WT2, [{"goal": r"checked out at C:\wt\p1",
+                                      "outcome": "DONE", "turn": 1}])
+    assert list(facts) == ["proj__proj-1"]

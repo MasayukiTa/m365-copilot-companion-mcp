@@ -21,6 +21,20 @@ from __future__ import annotations
 import math
 
 
+def wilson(k, n, z=1.96):
+    """The interval, because a pass^k over two runs of fifty is a very wide number.
+
+    Printed without one it reads as a measurement; the whole risk with a second headline
+    metric is that it gets compared peak-to-peak the way the first one was.
+    """
+    if not n:
+        return None
+    p = k / n
+    d = 1 + z * z / n
+    c = p + z * z / (2 * n)
+    m = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return [round((c - m) / d, 4), round((c + m) / d, 4)]
+
 def live(entries):
     """Entries with corrections dropped and replicates kept.
 
@@ -49,15 +63,19 @@ def _resolved_sets(entries):
     an old row would otherwise contribute k attempts in which nothing was solved, and pass^k
     would fall for every slice that happens to have history.
     """
-    by_slice = {}
+    by_key = {}
     for e in live(entries):
         ids = e.get("slice_ids")
         res = e.get("resolved_ids")
         if not ids or res is None:
             continue
-        key = tuple(sorted(ids))
-        by_slice.setdefault(key, []).append(set(res))
-    return by_slice
+        # SCOPED TO THE SCAFFOLD, not only to the slice. Grouping by slice alone intersected
+        # DIFFERENT genomes measured on the same slice as though they were repeated attempts
+        # of one -- so the reported figure was not a reliability of anything, and k was just
+        # "how many archive rows mention this slice". A reliability figure that is not scoped
+        # to what produced it is a number about nothing.
+        by_key.setdefault((e.get("id"), tuple(sorted(ids))), []).append(set(res))
+    return by_key
 
 
 def pass_hat_k(entries):
@@ -69,7 +87,8 @@ def pass_hat_k(entries):
     reliability number invites exactly the reading it cannot support.
     """
     out = []
-    for key, runs in sorted(_resolved_sets(entries).items()):
+    for (gid, key), runs in sorted(_resolved_sets(entries).items(),
+                                   key=lambda kv: (str(kv[0][0]), kv[0][1])):
         n = len(key)
         k = len(runs)
         if not n:
@@ -80,10 +99,21 @@ def pass_hat_k(entries):
             always &= r
             ever |= r
         out.append({
+            "genome_id": gid,
             "n": n,
             "k": k,
             "enough": k >= 2,
             "pass_hat_k": len(always) / n,
+            # THE INTERVAL TRAVELS WITH THE NUMBER. Wilson existed in this module and was
+            # attached to nothing, so the headline was rendered bare -- and a bare rate is
+            # what invites the peak-to-peak comparison a rate in this repository has already
+            # suffered once. At 20/50 the interval spans 0.28-0.54; printing 0.40 alone
+            # states a precision the sample does not have.
+            #
+            # It is an interval over INSTANCES, not over runs: with k=2 or 3 there is almost
+            # no information about run-to-run variance, and this number does not pretend to
+            # carry any.
+            "ci_instances": wilson(len(always), n),
             "pass_any": len(ever) / n,
             "per_run_pass_at_1": [len(r & set(key)) / n for r in runs],
             # The gap between "solved every time" and "solved at least once" IS the
@@ -111,14 +141,17 @@ def spread(entries):
         if not ids or p is None:
             continue
         try:
-            by_slice.setdefault(tuple(sorted(ids)), []).append(float(p))
+            # Same scoping as pass^k: two genomes measured on one slice are not two
+            # measurements of one thing, and their difference is not a spread.
+            by_slice.setdefault((e.get("id"), tuple(sorted(ids))), []).append(float(p))
         except (TypeError, ValueError):
             continue
 
     out = []
-    for key, rates in sorted(by_slice.items()):
+    for (gid, key), rates in sorted(by_slice.items(), key=lambda kv: (str(kv[0][0]), kv[0][1])):
         k = len(rates)
         out.append({
+            "genome_id": gid,
             "n": len(key),
             "k": k,
             "rates": sorted(rates),
@@ -128,19 +161,6 @@ def spread(entries):
     return out
 
 
-def wilson(k, n, z=1.96):
-    """The interval, because a pass^k over two runs of fifty is a very wide number.
-
-    Printed without one it reads as a measurement; the whole risk with a second headline
-    metric is that it gets compared peak-to-peak the way the first one was.
-    """
-    if not n:
-        return None
-    p = k / n
-    d = 1 + z * z / n
-    c = p + z * z / (2 * n)
-    m = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
-    return [round((c - m) / d, 4), round((c + m) / d, 4)]
 
 
 def summary(entries):
