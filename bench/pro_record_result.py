@@ -116,11 +116,6 @@ def main(argv=None):
                     default=os.path.join(REPO, ".fleet", "swe", "pro_run_config.json"),
                     help="what the run wrote about which arm it was (effort, harness id, "
                          "resolved parameters)")
-    ap.add_argument("--replicate", type=int, default=None,
-                    help="mark this as the Nth INDEPENDENT repeat of the same scaffold "
-                         "(2, 3, ...). Omit for a correction of an earlier measurement, "
-                         "which is what an unmarked row has always meant: it supersedes. "
-                         "A repeat supersedes nothing and is what pass^k counts.")
     ap.add_argument("--commit", action="store_true", help="actually write (default: dry-run)")
     args = ap.parse_args(argv)
 
@@ -143,8 +138,12 @@ def main(argv=None):
     # FAIL-CLOSED. An instance the ledger does not cover STAYS IN THE DENOMINATOR. Excluding
     # what we could not verify is the direction that flatters the score, and it is the
     # direction an unread ledger would take every instance in.
+    # THE TURN COUNT DECIDES, not the outcome alone. A goal stopped before its first turn was
+    # never attempted; one stopped after several turns was attempted and then given up on, and
+    # excluding those is how a habit of stopping doomed runs raises the reported rate.
     excluded = [i for i in ids
-                if i in facts and scoring_of(facts[i]["outcome"]) == "excluded"]
+                if i in facts
+                and scoring_of(facts[i]["outcome"], facts[i].get("turns")) == "excluded"]
     graded_ids = [i for i in ids if i not in set(excluded)]
 
     n_all = len(ids)
@@ -220,10 +219,14 @@ def main(argv=None):
               "be compared against a labelled one")
     print("  genome.knobs: %s" % genome["knobs"])
     print("  burn reason : %s" % reason)
+    # NOT A CHOICE ANYONE MAKES. Two rows from one run are one measurement graded twice (the
+    # later corrects the earlier); rows from different runs are different measurements. The id
+    # comes from the run itself, so there is nothing to declare and nothing to get wrong.
     print("  row kind    : %s"
-          % ("replicate #%d (supersedes nothing; counts toward pass^k)" % args.replicate
-             if args.replicate is not None
-             else "correction (supersedes any earlier row for this scaffold)"))
+          % ("a measurement of run %s -- another run of this scaffold counts toward pass^k"
+             % run_cfg["run_id"] if run_cfg.get("run_id")
+             else "UNIDENTIFIED RUN -- supersedes any earlier row for this scaffold, so a "
+                  "genuine repeat recorded this way would overwrite rather than accumulate"))
     if args.note:
         print("  note        : %s" % args.note)
     if not args.commit:
@@ -237,10 +240,7 @@ def main(argv=None):
                   # may be the same twenty twice or two disjoint twenties, and those are
                   # opposite findings about the same number. A rate cannot be un-summed later.
                   resolved_ids=sorted(set(resolved) & set(graded_ids)),
-                  # Says whether this row corrects the previous measurement of this scaffold
-                  # or repeats it. Without it the archive assumed "correction", so k could
-                  # never reach 2 and pass^k was not computable from any number of runs.
-                  replicate=args.replicate,
+                  run_id=run_cfg.get("run_id"),
                   # THE QUALIFICATIONS TRAVEL WITH THE NUMBER. These were printed and
                   # discarded, so the archive held a conditional rate presented as a plain
                   # one -- and a run that excluded half its slice was indistinguishable from

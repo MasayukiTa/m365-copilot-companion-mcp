@@ -175,9 +175,10 @@ def _archive_sections(archive_path):
     # Nothing is dropped. The superseded row stays in the trend, flagged, so the record of
     # having measured it twice survives; what changes is that it stops being counted as a
     # separate genome and stops being drawn as a rise.
-    # A REPLICATE IS NOT A CORRECTION. Rows marked as independent repeats of the same
-    # scaffold key on (id, replicate), so a second honest measurement no longer reads as
-    # "the first grade was wrong". Unmarked rows keep the original meaning exactly.
+    # A REPEAT IS NOT A CORRECTION. Rows key on (id, run_id): two gradings of one run are
+    # one measurement, the later correcting the earlier, while two runs of one scaffold are
+    # two measurements. The run id is minted at launch, not declared by anyone, so neither
+    # meaning depends on somebody remembering to say which this is.
     # TWO QUESTIONS, TWO MAPS -- they were one map, and giving it the second meaning silently
     # emptied the genome list, because that loop asks the FIRST question and looked the key up
     # by id alone.
@@ -191,7 +192,7 @@ def _archive_sections(archive_path):
     latest_at = {}
     for i, e in enumerate(entries):
         if isinstance(e, dict):
-            latest_measurement[(e.get("id"), e.get("replicate"))] = i
+            latest_measurement[(e.get("id"), e.get("run_id"))] = i
             latest_at[e.get("id")] = i
 
     for i, e in enumerate(entries):
@@ -201,8 +202,8 @@ def _archive_sections(archive_path):
             "ts": e.get("ts"),
             "pass_at_1": _to_float(e.get("pass_at_1")),
             "ci": e.get("ci"),
-            "superseded": latest_measurement.get((e.get("id"), e.get("replicate"))) != i,
-            "replicate": e.get("replicate"),
+            "superseded": latest_measurement.get((e.get("id"), e.get("run_id"))) != i,
+            "run_id": e.get("run_id"),
             "note": e.get("note"),
         })
 

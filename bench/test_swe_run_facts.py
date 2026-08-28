@@ -64,16 +64,27 @@ def test_an_instance_with_no_history_row_is_absent_rather_than_invented():
     assert "proj__proj-2" not in facts and "proj__proj-3" not in facts
 
 
-def test_a_human_stop_survives_the_join_and_leaves_the_denominator():
-    """End to end with the scoring side: the outcome that reaches the scorecard is the one the
-    fleet recorded, and it is not counted against the agent."""
-    facts = facts_from_history(WT, [_row(r"C:\wt\pro_2", "CANCELLED", 2)])
-    assert scoring_of(facts["proj__proj-2"]["outcome"]) == "excluded"
+def test_a_stop_before_any_work_survives_the_join_and_leaves_the_denominator():
+    """End to end with the scoring side: the outcome AND the turn count both reach the
+    scorecard, because the outcome alone cannot say whether anything was attempted."""
+    facts = facts_from_history(WT, [_row(r"C:\wt\pro_2", "CANCELLED", 0)])
+    f = facts["proj__proj-2"]
+    assert scoring_of(f["outcome"], f["turns"]) == "excluded"
 
 
-def test_a_path_that_never_established_also_leaves_the_denominator():
+def test_a_stop_after_work_survives_the_join_and_STAYS_in_the_denominator():
+    """The turn count is what the join exists to carry. Losing it here would restore the
+    gameable version of this rule with no visible symptom."""
+    facts = facts_from_history(WT, [_row(r"C:\wt\pro_2", "CANCELLED", 11)])
+    f = facts["proj__proj-2"]
+    assert f["turns"] == 11
+    assert scoring_of(f["outcome"], f["turns"]) == "fail"
+
+
+def test_a_path_that_never_established_follows_the_same_rule():
     facts = facts_from_history(WT, [_row(r"C:\wt\pro_2", "INFRA_STUCK", 0)])
-    assert scoring_of(facts["proj__proj-2"]["outcome"]) == "excluded"
+    f = facts["proj__proj-2"]
+    assert scoring_of(f["outcome"], f["turns"]) == "excluded"
 
 
 def test_coverage_is_reported_so_an_unread_ledger_cannot_pass_as_a_clean_run():

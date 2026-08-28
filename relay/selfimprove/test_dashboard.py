@@ -353,9 +353,10 @@ def test_a_measured_reliability_reports_k_so_the_number_can_be_read():
     assert "0.360" in text          # the flakiness is shown, not only the floor
 
 
-def test_a_replicate_does_not_supersede_the_row_it_repeats():
-    """Two honest runs of one scaffold share an id. Read as a correction, k could never
-    reach 2 and no reliability figure was computable from any number of runs."""
+def test_a_row_from_another_run_does_not_supersede_the_one_before_it():
+    """Two honest runs of one scaffold share a genome id. Read as a correction, k could never
+    reach 2 and no reliability figure was computable from any number of runs. The run id is
+    minted at launch, so this distinction never depends on anyone declaring it."""
     from relay.selfimprove.dashboard import dashboard_state
     import json
     import tempfile
@@ -363,9 +364,9 @@ def test_a_replicate_does_not_supersede_the_row_it_repeats():
     d = tempfile.mkdtemp()
     p = os.path.join(d, "archive.jsonl")
     rows = [{"id": "g", "genome": {}, "slice_ids": ["a"], "pass_at_1": 0.3,
-             "replicate": None, "ts": 1},
+             "run_id": "run-one", "ts": 1},
             {"id": "g", "genome": {}, "slice_ids": ["a"], "pass_at_1": 0.5,
-             "replicate": 2, "ts": 2}]
+             "run_id": "run-two", "ts": 2}]
     with open(p, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
