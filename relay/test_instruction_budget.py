@@ -79,3 +79,44 @@ def test_the_gateway_sentence_comes_before_the_discipline():
 
     assert PROTOCOL.index("call_tool") < PROTOCOL.index(OUTPUT_DISCIPLINE[:20]), (
         "規律文がゲートウェイの説明より前に来ている")
+
+
+def test_the_skill_sentence_can_be_removed_to_build_an_ab_arm():
+    """An arm built by REMOVING one sentence, not by maintaining a second copy of the prompt.
+    Two prompts meant to differ in one sentence drift apart the moment either is edited, and
+    then the experiment measures the drift.
+
+    NO importlib.reload HERE. Reloading this module swaps the object while relay_fleet still
+    holds the names it imported at import time, so the two disagree for the rest of the
+    session -- which is exactly what happened when this test was first written, and it took
+    an unrelated test down with it. The construction is checked by reading it instead.
+    """
+    import inspect
+
+    import relay.copilot_autopilot_relay as R
+    src = inspect.getsource(R)
+    # The sentence is chosen by an environment variable and nothing else.
+    assert "MCP_NO_SKILL_SENTENCE" in src
+    # PROTOCOL is built from it rather than repeating it, so the two cannot drift.
+    assert "+ SKILL_SENTENCE" in src
+    assert R.SKILL_SENTENCE and R.SKILL_SENTENCE in R.PROTOCOL
+
+
+def test_removing_the_sentence_changes_nothing_else():
+    """The arm must differ in that sentence and in nothing else, or it is measuring something
+    nobody chose."""
+    import relay.copilot_autopilot_relay as R
+    arm_b = R.PROTOCOL.replace(R.SKILL_SENTENCE, "")
+    assert len(R.PROTOCOL) - len(arm_b) == len(R.SKILL_SENTENCE)
+    assert "skill_match" not in arm_b
+
+
+def test_production_carries_the_sentence_by_default():
+    """Nothing in production sets the variable, and the default must stay byte-for-byte what
+    shipped -- an experiment that changes the default is not an experiment."""
+    import os
+
+    import relay.copilot_autopilot_relay as R
+    assert not os.environ.get("MCP_NO_SKILL_SENTENCE")
+    assert R.SKILL_SENTENCE
+    assert "skill_match" in R.PROTOCOL
