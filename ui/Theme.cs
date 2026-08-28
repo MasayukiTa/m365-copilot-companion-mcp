@@ -191,6 +191,22 @@ static class Theme
         return "neutral";
     }
 
+    // A very muted BACKGROUND wash for the same severity kinds. Separate from KindColor
+    // because that one is an accent meant for text and borders -- putting it behind a chip
+    // would be the saturated block this file forbids.
+    //
+    // These six values lived at a call site in the cockpit, written as literals, and were the
+    // only colours in the UI outside this file. That is the drift this file was created to
+    // end: the palette had been duplicated once already. Moved verbatim, so nothing looks
+    // different -- the point is that there is one place to change them.
+    public static string KindTint(string kind, bool dark)
+    {
+        if (kind == "success") return dark ? "#1a2a1a" : "#e8f5e8";
+        if (kind == "warning") return dark ? "#2a2a1a" : "#f5f5e8";
+        if (kind == "danger")  return dark ? "#2a1a1a" : "#f5e8e8";
+        return dark ? "#1f1f22" : "#f4f4f5";   // neutral / info
+    }
+
     // Resolve a severity kind to its accent color for the given mode.
     public static string KindColor(string kind, bool dark)
     {

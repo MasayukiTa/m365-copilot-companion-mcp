@@ -817,6 +817,10 @@ def run_on_page_thread(fn, *args, **kwargs):
 # concurrency -- see session_store.py's docstring: M365 Copilot keeps conversation context
 # server-side, so a "session" here is just a local label + conv_url + transcript around
 # whichever ONE Copilot conversation this bridge currently drives).
+#: How many rows /sessions returns. Named rather than written twice inline, and reported
+#: in the payload so a caller can tell a full list from a cut one.
+SESSION_LIST_CAP = int(os.environ.get("MCP_BRIDGE_SESSION_LIST_CAP", "50"))
+
 ACTIVE_SID = None
 # Change-based capture baseline: {"cur": <aria-current guid or "">, "known": set(<guids>)}
 # snapshotted BEFORE a conversation-creating send (see _record_capture_baseline). None until
@@ -1961,14 +1965,36 @@ def _persist_exchange(sid, user_msg, final_text):
         existing = sess.get("conv_url") or ""
         if existing:
             expected = sessref_guid(existing)
-            if expected:
-                cur = _current_row_guid()
-                if cur and cur != expected:
-                    logger.warning(
-                        "pane guid %s.. does not match session conv_url guid %s.. "
-                        "(sid=%s); keeping stored conv_url",
-                        logsafe(cur[:5]), logsafe(expected[:5]), logsafe(sid))
-            S.touch(sid, status="active")
+            # THE SOCKET IS NOT A GUESS ABOUT WHERE THE TURN WENT -- it is the id the driver
+            # just used to send it. The rule this branch enforces, never overwrite a stored
+            # conv_url, was written against GUESSES, and its reason says so: a wrong resume
+            # is worse than no resume. That reason does not reach a measurement.
+            #
+            # Without this the stored reference goes stale and stays stale. The conversation
+            # can move underneath a session -- a socket driver rebuilt mid-run continues a
+            # different chat -- and the only check for it compares the PANE's guid, which is
+            # empty whenever the page has been released, and releasing it is the default.
+            # So the mismatch was undetectable in exactly the configuration that ships, and
+            # a later /resume would open a conversation holding none of the turns recorded
+            # against that session.
+            #
+            # The DOM comparison below stays, warn-only, for the tab path where there is no
+            # socket to ask.
+            live = socket_conv_ref() or ""
+            live_guid = sessref_guid(live)
+            if live_guid and expected and live_guid != expected:
+                logger.warning("the socket answered in %s.. while this session stored %s..; the stored reference is being corrected to where the turn went (sid=%s)",
+                               logsafe(live_guid[:5]), logsafe(expected[:5]), logsafe(sid))
+                S.touch(sid, conv_url=live, status="active")
+            else:
+                if expected and not live_guid:
+                    cur = _current_row_guid()
+                    if cur and cur != expected:
+                        logger.warning(
+                            "pane guid %s.. does not match session conv_url guid %s.. "
+                            "(sid=%s); keeping stored conv_url",
+                            logsafe(cur[:5]), logsafe(expected[:5]), logsafe(sid))
+                S.touch(sid, status="active")
         else:
             # The socket answers this directly; the DOM diff cannot see its turn at all.
             ref = socket_conv_ref() or _capture_changed_conv_ref()
@@ -2017,7 +2043,7 @@ def _verify_pane_on_guid(guid, cur_wait=10, turns_wait=20):
 
 def _resume_to_ref(ref, settle=20):
     """Reattach PAGE to the conversation named by `ref` (a "sess:<guid>" reference from
-    S.load()/S.latest_active()). Loads AGENT_URL first (so the sidebar with history rows
+    S.load()/S.latest_attached()). Loads AGENT_URL first (so the sidebar with history rows
     renders), then clicks the sidebar row whose id == guid -- the same click mechanism
     confirmed live to switch the main pane without changing page.url. Returns (ok, reason);
     never raises.
@@ -3461,16 +3487,33 @@ class Handler(BaseHTTPRequestHandler):
             qs = urllib.parse.parse_qs(parsed.query)
             want_all = (qs.get("all") or [""])[0] in ("1", "true", "True")
             try:
-                sessions = S.list_sessions()[:50]
+                all_chat = S.list_sessions()
+                sessions = all_chat[:SESSION_LIST_CAP]
                 for s in sessions:
                     s.setdefault("source", "chat")
+                    # WHICH ONE TYPING CONTINUES. Nothing in this payload said, so every
+                    # reader had to guess, and the two obvious guesses -- the first row, the
+                    # newest timestamp -- are chosen by a different rule than ACTIVE_SID is.
+                    # The CLI banner guessed the first row and told the operator that typing
+                    # would continue it, which was true only when the rules happened to
+                    # agree.
+                    s["active"] = bool(ACTIVE_SID) and s.get("sid") == ACTIVE_SID
+                total = len(all_chat)
                 if want_all:
-                    sessions = sessions + _load_fleet_sessions_view()
+                    fleet = _load_fleet_sessions_view()
+                    total += len(fleet)
+                    sessions = sessions + fleet
                     sessions.sort(key=lambda s: s.get("last_active_ts", 0), reverse=True)
-                    sessions = sessions[:50]
+                    sessions = sessions[:SESSION_LIST_CAP]
             except Exception as e:
                 self._json({"ok": False, "error": str(e)}); return
-            self._json({"sessions": sessions})
+            # A TRUNCATED LIST THAT DOES NOT SAY SO READS AS A COMPLETE ONE. The cap is
+            # applied twice here -- once to the chat rows, again after the fleet rows are
+            # merged in -- so a busy day of chatting quietly pushes older fleet
+            # conversations out of a list that looks exhaustive. The rows that fit are
+            # unchanged; what is new is that the caller can tell there are more.
+            self._json({"sessions": sessions, "total": total,
+                        "truncated": total > len(sessions), "cap": SESSION_LIST_CAP})
             return
         if parsed.path == "/adopt":        # adopt an external (typically fleet) conversation
             if not PAGE_LOCK.acquire(blocking=False):
@@ -5823,9 +5866,9 @@ def _page_main(cdp, fresh):
         # session is still lazily created on first /stream, same as before this change).
         latest = None
         try:
-            latest = S.latest_active()
+            latest = S.latest_attached()
         except Exception:
-            logger.warning("startup auto-resume: S.latest_active() failed", exc_info=True)
+            logger.warning("startup auto-resume: S.latest_attached() failed", exc_info=True)
         do_resume, why = should_autoresume(latest, fresh_flag=fresh)
         if do_resume:
             try:

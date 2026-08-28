@@ -527,7 +527,15 @@ def test_run_goal_renders_turns_steering_and_summary():
 def test_run_goal_keyboard_line_sends_steering():
     client = FakeClient(sessions=[_mk_session("s7")], goal_lines=GOAL_LINES)
     out = _run_goal(client, kbd_items=["also check the tests"])
-    assert client.send_calls == [("s7", "also check the tests")]
+    # NO sid FROM THE CLIENT, AND THAT IS THE FIX. This asserted ("s7", ...) -- the client
+    # picked list_sessions()[0] and named it. The server's /goal loop uses ACTIVE_SID,
+    # chosen by a different rule (newest session WITH a conversation, moved again by a
+    # mid-run recycle), so the two disagreed whenever the newest session was not the
+    # attached one, and the steer went to the wrong place.
+    #
+    # /send resolves an empty sid to ACTIVE_SID, so sending nothing is not a fallback: it is
+    # the server answering its own question. One rule, in the only place that can know it.
+    assert client.send_calls == [("", "also check the tests")]
     # The REPL used to announce "[queued for next turn]" whatever happened. In the case that
     # mattered -- nothing running, so no next turn -- it was the wrong guess. It now reports
     # what the endpoint said; the fake returns a bare {"ok": True}, i.e. neither promoted nor

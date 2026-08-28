@@ -993,7 +993,6 @@ class CockpitWindow : Window
         if (k == "flt_needs") return ja ? "承認待ち" : "Needs input";
         if (k == "flt_done") return ja ? "完了" : "Done";
         // legacy key kept for safety (no longer rendered)
-        if (k == "flt_unfinished") return ja ? "未完了のみ" : "Unfinished only";
         // Feature C: retry
         if (k == "retry") return ja ? "再試行" : "Retry";
         if (k == "retry_all") return ja ? "停止を一括再試行" : "Retry all stopped";
@@ -4994,7 +4993,7 @@ class CockpitWindow : Window
         delegateBtn.Height = Theme.BtnH;
         delegateBtn.Padding = new Thickness(20, 0, 20, 0);
         delegateBtn.Background = Theme.Br(Theme.AccentFill(_dark));
-        delegateBtn.Foreground = new SolidColorBrush(C("#FFFFFF"));
+        delegateBtn.Foreground = new SolidColorBrush(C(Theme.AccentFg(_dark)));
         delegateBtn.BorderThickness = new Thickness(0);
         delegateBtn.FontWeight = FontWeights.SemiBold;
         delegateBtn.Cursor = Cursors.Hand;
@@ -7171,7 +7170,9 @@ class CockpitWindow : Window
 
     // First two lines of a gate context, ellipsised. Keeps the banner card a fixed, predictable
     // height so the Approve/Deny row below it stays on screen no matter how long the context is.
-    static string GateContextPreview(string context)
+    // lang is passed in because this is static: the counter below is user-visible text
+    // and was pinned to Japanese, so it needs to know the mode like every other label.
+    static string GateContextPreview(string context, int lang)
     {
         if (string.IsNullOrEmpty(context)) return "";
         string[] lines = context.Replace("\r\n", "\n").Split('\n');
@@ -7185,7 +7186,9 @@ class CockpitWindow : Window
         string text = string.Join("\n", kept.ToArray());
         int shown = kept.Count, total = 0;
         foreach (string line in lines) if (line.Trim().Length > 0) total++;
-        if (total > shown) text += "\n... (+" + (total - shown) + " 行)";
+        // 助数詞が日本語固定だった。英語表示でも「行)」が出ていた。
+        if (total > shown)
+            text += "\n... (+" + (total - shown) + (lang == 0 ? " 行)" : " more)");
         return text;
     }
 
@@ -7302,7 +7305,7 @@ class CockpitWindow : Window
                 // Preview only. A Skill gate's context is a multi-line file/hash manifest; printed
                 // in full it pushed the Approve/Deny row below the fold. The complete text is one
                 // click away in the Approval Center, which scrolls.
-                ctxTb.Text = GateContextPreview(context2);
+                ctxTb.Text = GateContextPreview(context2, _lang);
                 ctxTb.ToolTip = context2;
                 ctxTb.FontSize = 11;
                 ctxTb.Foreground = Theme.Br(Theme.Muted(_dark));
@@ -8143,7 +8146,24 @@ class CockpitWindow : Window
             var w = o as Dictionary<string, object>;
             if (w == null) continue;
             if (!IsTerminalWorker(w)) continue;
-            if (S(w, "outcome") == "DONE") continue;
+            // THE SAME CLOSED SET PYTHON USES, not the one outcome that came to mind.
+            //
+            // This skipped only DONE, so every other outcome was retryable here -- including
+            // FANOUT, which relay/outcomes.py classifies as done and explicitly NOT
+            // retryable. relay/fleet_runner.py says why that matters in as many words: two
+            // retry policies that can disagree is worse than either one alone.
+            //
+            // What the disagreement cost, measured 2026-08-28 over 100 coordinator logs: a
+            // fan-out parent ends terminal with outcome FANOUT, so this re-queued it. The
+            // duplicate carries the SAME GOAL TEXT and a higher worker index, and the fleet
+            // keys delivered results by goal text -- so the duplicate overwrote the parent
+            // that the merged answer had just been written onto. Of 24 runs that split, 22
+            // delivered a duplicate instead of the merge. One run split 8 goals into 63
+            // workers, merged all 8, and delivered none of them.
+            //
+            // So the fan-out was not broken. It ran, it split, it merged, and then this
+            // line threw the answer away.
+            if (!IsRetryableOutcome(S(w, "outcome"))) continue;
             string goal = S(w, "goal");
             if (string.IsNullOrEmpty(goal)) continue;
             int n = 0;
@@ -9170,14 +9190,14 @@ class CockpitWindow : Window
         var rightCl = new StackPanel(); rightCl.Orientation = Orientation.Horizontal;
         rightCl.VerticalAlignment = VerticalAlignment.Center;
 
-        // Only surface the bulk-retry button when there is at least one retry target
-        // in `shown` (terminal AND outcome != DONE). Mirror RetryAllShown's selection
-        // so the button never appears for an all-DONE run (nothing to retry).
+        // Only surface the bulk-retry button when there is at least one retry target in
+        // `shown`. Mirrors RetryAllShown's selection, which is now the same closed set Python
+        // uses -- see AutoRetryScan for what "anything but DONE" cost the fan-out.
         int retryTargets = 0;
         foreach (Dictionary<string, object> rw in shown)
         {
             if (!IsTerminalWorker(rw)) continue;
-            if (S(rw, "outcome") == "DONE") continue;
+            if (!IsRetryableOutcome(S(rw, "outcome"))) continue;
             retryTargets++;
         }
         if (retryTargets > 0)
@@ -9372,12 +9392,6 @@ class CockpitWindow : Window
         return b;
     }
 
-    // Legacy FilterButton kept as private dead code to avoid breaking references elsewhere.
-    // All callers now use SegFilterButton.
-    Button FilterButton(string label, int val, bool isNeeds, int needsCount)
-    {
-        return SegFilterButton(label, val, isNeeds, needsCount, false, false);
-    }
 
     // "⋮" kebab button for card secondary actions. A null label inserts a visual separator.
     // Uses a WPF ContextMenu
@@ -10189,11 +10203,13 @@ class CockpitWindow : Window
                     string confLabel = _lang == 0
                         ? ("自己申告: " + selfConf)
                         : ("self-reported: " + selfConf);
-                    // Subtle background tint by level (very muted — not a trust signal).
-                    string tintHex;
-                    if (selfConf == "high")        tintHex = _dark ? "#1a2a1a" : "#e8f5e8";
-                    else if (selfConf == "medium")  tintHex = _dark ? "#2a2a1a" : "#f5f5e8";
-                    else                            tintHex = _dark ? "#2a1a1a" : "#f5e8e8";  // low / unknown
+                    // Subtle background tint by level (very muted -- not a trust signal).
+                    // The six hex values used to be written here. They were the only colours in
+                    // the UI outside Theme.cs, which is the file that exists because the palette
+                    // had already drifted once from being duplicated at call sites.
+                    string tintKind = selfConf == "high" ? "success"
+                                    : (selfConf == "medium" ? "warning" : "danger");
+                    string tintHex = Theme.KindTint(tintKind, _dark);
 
                     var confChip = new Border();
                     confChip.CornerRadius = new CornerRadius(Theme.RadChip);
@@ -11222,7 +11238,10 @@ class CockpitWindow : Window
         foreach (Dictionary<string, object> w in shown)
         {
             if (!IsTerminalWorker(w)) continue;
-            if (S(w, "outcome") == "DONE") continue;
+            // Same closed set as AutoRetryScan and as relay/outcomes.py. "Retry all" used to
+            // mean "everything that is not DONE", which swept up fan-out parents and threw
+            // away the merged answers they carried.
+            if (!IsRetryableOutcome(S(w, "outcome"))) continue;
             adds.Add(RetryEntry(w));
             string g = S(w, "goal");
             if (!string.IsNullOrEmpty(g)) goalTexts.Add(g);
@@ -11238,6 +11257,19 @@ class CockpitWindow : Window
         {
             try { SpawnFleet(goalTexts, "retry_input.txt"); _lastSig = ""; } catch (Exception) { }
         }
+    }
+
+    // MIRRORS relay/outcomes.py RETRYABLE. A copy, and copies drift -- so a test fails if
+    // this stops matching the Python set. An outcome missing from here is not retried, which
+    // is the safe direction; an outcome wrongly added here re-runs finished work.
+    static readonly string[] _retryableOutcomes = { "STUCK", "INFRA_STUCK", "REFUSED" };
+
+    static bool IsRetryableOutcome(string outcome)
+    {
+        if (string.IsNullOrEmpty(outcome)) return false;
+        foreach (string r in _retryableOutcomes)
+            if (outcome == r) return true;
+        return false;
     }
 
     static bool IsTerminalWorker(Dictionary<string, object> w)

@@ -137,7 +137,7 @@ def test_invalid_sid_rejected_before_file_access(temp_sess_dir):
     assert not os.path.exists(os.path.join(temp_sess_dir, "..", "outside.json"))
 
 
-def test_latest_active_skips_empty_conv_url():
+def test_latest_attached_skips_empty_conv_url():
     s1 = ss.new_session(title="no-url")
     _set_last_active(s1["sid"], 300.0)  # newest but no conv_url
 
@@ -145,13 +145,13 @@ def test_latest_active_skips_empty_conv_url():
     ss.touch(s2["sid"], conv_url="https://example.com/conv/2")
     _set_last_active(s2["sid"], 100.0)
 
-    latest = ss.latest_active()
+    latest = ss.latest_attached()
     assert latest is not None
     assert latest["sid"] == s2["sid"]
 
     # If nothing has a conv_url at all, expect None.
     ss.touch(s2["sid"], conv_url="")
-    assert ss.latest_active() is None
+    assert ss.latest_attached() is None
 
 
 def test_corrupt_json_tolerance_in_list_sessions(temp_sess_dir):

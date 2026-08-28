@@ -271,6 +271,9 @@ jobs:
             bridge/test_turn_goes_to_its_own_session.py \
             ui/test_slash_setting_on_every_path.py \
             ui/test_sessref_conversation_is_reachable.py \
+            bridge/test_one_rule_for_the_active_session.py \
+            bridge/test_conv_url_follows_the_turn.py \
+            tests/test_retry_sets_agree.py \
             tests/test_identity_guard_reports_every_hit.py \
             tests/test_steer_delivery.py \
             tests/test_steer_followup.py \
