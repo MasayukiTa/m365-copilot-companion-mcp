@@ -1248,12 +1248,36 @@ def _bridge_socket_driver():
     try:
         if route.needs_refresh(url) and not run_on_page_thread(route.refresh, CTX, url):
             return None
+        # S.load, NOT S.get -- session_store has never had a `get`. This read was written
+        # as S.get, so it raised AttributeError on EVERY call, the bare except below turned
+        # that into an empty conversation id, and socket_route reads an empty id as `start a
+        # new conversation`. So every rebuild of the bridge's socket driver silently began a
+        # fresh Copilot chat -- which is the docstring above's promise inverted, and it is
+        # why so little history accumulates on the Copilot side.
+        #
+        # Verified rather than reasoned about: session_store exposes load() and no get(),
+        # hasattr(S, 'get') is False, and the same file already calls S.load at seven other
+        # sites.
+        #
+        # AND THE CATCH NOW SAYS SOMETHING. `except Exception: conv_id = ""` is what let a
+        # missing attribute look exactly like a session with no conversation for however
+        # long this has been here. Continuing without an id is still right -- a bridge that
+        # refuses to talk because a lookup failed is worse -- but it must not be silent.
         conv_id = ""
         try:
-            sess = S.get(ACTIVE_SID) if ACTIVE_SID else None
-            conv_id = _conv_guid((sess or {}).get("conv_url") or "") or ""
-        except Exception:
+            sess = S.load(ACTIVE_SID) if ACTIVE_SID else None
+            # BOTH STORED SHAPES, because the socket writes the one _conv_guid cannot read.
+            # A conv_url captured from the page is "...\/conversation\/<guid>", which
+            # _conv_guid matches. A conversation captured over the SOCKET is stored as
+            # "sess:<guid>" (socket_conv_ref always returns that shape), and _conv_guid
+            # returns "" for it -- so fixing S.load alone would still have handed the driver
+            # an empty id in exactly the case that is now the common one.
+            _ref = (sess or {}).get("conv_url") or ""
+            conv_id = sessref_guid(_ref) or _conv_guid(_ref) or ""
+        except Exception as exc:
             conv_id = ""
+            logger.warning("could not read the active session for sid=%s (%s); the socket will START A NEW conversation instead of continuing one",
+                           logsafe(ACTIVE_SID), type(exc).__name__)
         return route.driver_for("bridge", agent_url=url, conversation_id=conv_id,
                                 turn_timeout_s=BRIDGE_TURN_TIMEOUT_S)
     except Exception as exc:
