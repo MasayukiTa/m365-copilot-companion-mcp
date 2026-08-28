@@ -116,16 +116,32 @@ def classify_conv_ref(ref):
 
 
 def should_autoresume(sess, fresh_flag=False):
-    """Pure decision function for startup auto-resume: given a session dict (or None) and
-    the --fresh CLI flag, decide whether main() should attempt to reattach. No browser
-    access -- fully unit-testable. Returns (should, reason)."""
+    """Pure decision function for startup auto-resume: given the MOST RECENT session (dict or
+    None) and the --fresh CLI flag, decide whether main() should attempt to reattach. No
+    browser access -- fully unit-testable. Returns (should, reason).
+
+    `sess` IS THE NEWEST SESSION, NOT THE NEWEST RESUMABLE ONE, and the difference is the
+    whole point. This used to be handed `latest_attached()`, which skips rows with no
+    conversation -- so when the last thing that happened had no conversation attached, startup
+    reached PAST it into an older row. Measured 2026-08-28: the newest session was 8.4 hours
+    old and the newest attached one 54.4 hours old, so a restart silently reopened a two-day-
+    old conversation and presented it as resuming. That is neither "the latest" nor "the
+    previous one"; it is a third answer nobody asked for, and a message written as a
+    continuation lands in a context two days away from the one the writer had in mind.
+
+    So the rule is: resume only what we actually just left. If the newest session has no
+    conversation, we start fresh and say so, rather than searching backwards for something
+    that happens to be resumable. Older conversations are not lost by this -- they remain
+    listed and openable, and opening one resumes it (see /sessions and /resume).
+    """
     if fresh_flag:
         return False, "fresh flag set"
     if not sess:
         return False, "no prior session"
     ref = sess.get("conv_url") or ""
     if classify_conv_ref(ref) == "empty":
-        return False, "session has no conv_url"
+        return False, ("the most recent session has no conversation attached; starting fresh "
+                       "rather than reopening an older one")
     return True, "resumable session found"
 
 
@@ -3488,9 +3504,28 @@ class Handler(BaseHTTPRequestHandler):
             want_all = (qs.get("all") or [""])[0] in ("1", "true", "True")
             try:
                 all_chat = S.list_sessions()
-                sessions = all_chat[:SESSION_LIST_CAP]
+                # OPENABLE ROWS FIRST, then the rest.
+                #
+                # 96.6% of this table is sessions that never attached to a conversation --
+                # every /send, /stream and /goal that arrives with no active session mints
+                # one, and most never reach a conversation. Measured 2026-08-28: 558 rows, 19
+                # with a conversation. Cut newest-first at the cap, only EIGHT of those 19
+                # survived: eleven past chats existed, were resumable, and could not be
+                # reached through the list that exists to reach them. Raising the cap did not
+                # help, because the empties are the newest rows.
+                #
+                # Ordering within each group is unchanged (newest first), so this does not
+                # reorder anything a reader was relying on -- it stops the openable rows from
+                # being crowded out by rows that cannot be opened at all.
+                openable = [x for x in all_chat if (x.get("conv_url") or "")]
+                empty = [x for x in all_chat if not (x.get("conv_url") or "")]
+                sessions = (openable + empty)[:SESSION_LIST_CAP]
                 for s in sessions:
                     s.setdefault("source", "chat")
+                    # SAYS WHETHER OPENING IT WOULD DO ANYTHING. A row with no conversation
+                    # cannot be resumed, and a list that does not say so invites a click that
+                    # silently does nothing.
+                    s["resumable"] = bool(s.get("conv_url"))
                     # WHICH ONE TYPING CONTINUES. Nothing in this payload said, so every
                     # reader had to guess, and the two obvious guesses -- the first row, the
                     # newest timestamp -- are chosen by a different rule than ACTIVE_SID is.
@@ -5866,9 +5901,10 @@ def _page_main(cdp, fresh):
         # session is still lazily created on first /stream, same as before this change).
         latest = None
         try:
-            latest = S.latest_attached()
+            # THE NEWEST SESSION, not the newest resumable one -- see should_autoresume.
+            latest = S.latest_session()
         except Exception:
-            logger.warning("startup auto-resume: S.latest_attached() failed", exc_info=True)
+            logger.warning("startup auto-resume: S.latest_session() failed", exc_info=True)
         do_resume, why = should_autoresume(latest, fresh_flag=fresh)
         if do_resume:
             try:
