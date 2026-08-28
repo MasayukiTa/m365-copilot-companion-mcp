@@ -1738,6 +1738,17 @@ class CockpitWindow : Window
     // Forcing SW_SHOW + a full redraw once, right after the HWND exists, discards the
     // inherited state and makes the window paint normally. Cheap, idempotent, and a no-op
     // when the app was launched normally (already visible).
+    // AND IT DOES NOT ALWAYS WORK -- measured 2026-08-28, recorded here so the next person
+    // does not spend the afternoon re-discovering it. OnSourceInitialized fires when the HWND
+    // exists, BEFORE WPF applies the show-state, so an inherited hidden state overwrites this
+    // call: the process then runs with a fully built window ("Fleet Cockpit", style 0x6CF0000,
+    // 367 MB resident, responding) that WS_VISIBLE was never set on. Moving the call to
+    // OnContentRendered does not help either, because a window that never becomes visible
+    // never renders its content, so that override does not fire at all.
+    //
+    // The rescue therefore has to come from OUTSIDE the process, and it does: CopilotChat's
+    // OpenCockpit finds this window by style rather than by MainWindowHandle (which is 0 for
+    // an invisible window) and issues the SW_SHOW itself.
     void ForceVisibleOnce()
     {
         try
