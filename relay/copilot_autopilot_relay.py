@@ -303,6 +303,27 @@ PROTOCOL = (
     "read_file / list_directory / run_python といった名前は、あなた自身のツール一覧には"
     "出てこない。一覧に無いことを理由に「この環境には存在しない」と結論してはならない。"
     "必ず call_tool(name='') で実際の一覧を確認してから可否を述べること。 "
+    # POSITION, MEASURED. The same sentence sat after the output discipline and the worker
+    # ignored it: arm A prompt 1,665 chars without it, arm B 1,801 chars WITH it, and
+    # neither called skill_match on a goal that exactly matches a skill. The server rule it
+    # mirrors records the same finding about itself -- placed at the end it was not read, so
+    # it was lifted to directly after the catalogue instruction. Same lift here.
+    # THE ONLY CHANNEL THAT REACHES A WORKER. The MCP server's instructions carry a rule
+    # -- call skill_match before doing domain work -- and a fleet worker never sees them.
+    # Measured 2026-08-28 by asking three workers directly, with two control goals to catch
+    # invention: the worker answered NO, said what it HAD received was written in Japanese
+    # (these prompts are; the server's instructions are English), correctly denied a RULE
+    # that does not exist, and said it did not know how many rules there were.
+    #
+    # skill_match is in the catalogue, so it is visible. Visible was already proven not to
+    # be enough -- the server rule exists because an agent that could see it did not call
+    # it and invented a plausible answer to a subtly different question instead. That
+    # lesson was written into a channel this reader does not receive.
+    #
+    # One sentence, ~90 characters, inside the 1,500-character budget for this prompt.
+    "承認済みの手順(スキル)がある作業は、それに従うこと。作業に入る前に call_tool で "
+    "skill_match を呼び、確度の高い一致があれば skill_load して**その手順どおりに**進める"
+    "(自分で別の手順を作らない)。一致が無ければ通常どおり進めてよい。"
     + OUTPUT_DISCIPLINE + " "
     "ツールを使い自律的に進める。重い作業は小さく分割し1ターンに1〜数ステップ。"
     "ツールは call_tool ゲートウェイ経由: まず call_tool(name='') で一覧(名前+要約)を見て"

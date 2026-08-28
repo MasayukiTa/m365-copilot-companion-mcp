@@ -43,6 +43,7 @@ from .copilot_autopilot_relay import (
 )
 from relay import settle as _settle
 from relay import fanout as fanout_mod
+from relay import effort as effort_mod
 from .planner import PLAN_PROMPT, extract_plan, opening_turn, plan_ready
 from .review_resilience import (
     freeze_goal_dict, looks_like_policy_refusal, same_task_envelope,
@@ -4417,16 +4418,46 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                      len(_recs)), flush=True)
         return queued
 
-    workers = [RelayWorker(g, "w%d" % i, max_turns=effective_max_turns,
-                           refuter=refuter, max_refute=max_refute, plan_mode=plan_mode,
-                           review_lenses=review_lenses, max_transient=max_transient,
+    # EFFORT IS THE RUN'S UNLESS A GOAL NAMED ITS OWN. --effort was read once and every
+    # worker got the same four knobs, so a run of twenty goals where one is hard paid the
+    # hard one's price twenty times, or paid the cheap price on the one that needed more.
+    # This file already records the cost of uniformity -- a uniform ultra was observed
+    # producing 44-47 line diffs where the gold fix was 2-7 lines -- and the answer at the
+    # time was a fourth uniform mode. A fourth mode is still uniform.
+    #
+    # Nothing changes for a goal that says nothing, which is every goal written so far:
+    # relay/effort.py returns the run's defaults untouched. The lens-selection rule is
+    # untouched too -- effort says how hard, task type says which lens, and those stay
+    # orthogonal (relay/refuter.py).
+    #
+    # AND ONE PLACE BUILDS A WORKER. There were two, and they had already drifted: the
+    # mid-run one passed neither fanout nor spawn_fn, so a goal re-queued after the run
+    # began could not split -- it re-ran the whole thing in a single conversation, which
+    # is the exact shape fan-out exists to prevent. Splitting again is still gated by
+    # depth (a child carries depth>0 and cannot split), so what this restores is the
+    # ability of a RETRIED top-level goal to split, and nothing more.
+    _run_effort = {"refuter": refuter, "max_refute": max_refute,
+                   "max_research": max_research, "review_lenses": review_lenses}
+
+    def _worker_for(index, goal_item):
+        knobs = effort_mod.resolve(goal_item, _run_effort,
+                                   log=lambda m: print(m, flush=True))
+        if knobs != _run_effort:
+            print("[effort] w%d: %s" % (index, effort_mod.describe(knobs)), flush=True)
+        return RelayWorker(goal_item, "w%d" % index, max_turns=effective_max_turns,
+                           refuter=knobs["refuter"], max_refute=knobs["max_refute"],
+                           plan_mode=plan_mode,
+                           review_lenses=knobs["review_lenses"],
+                           max_transient=max_transient,
                            transcript_dir=transcript_dir, run_id=run_id,
-                            busy_writer=busy_writer, max_research=max_research,
-                            contract_budget=_contract_budget,
-                            resilience_profile=resilience_profile,
-                            max_fresh_replays=max_fresh_replays,
-                            fanout=fanout, spawn_fn=_spawn_children)
-               for i, g in enumerate(goals)]
+                           busy_writer=busy_writer,
+                           max_research=knobs["max_research"],
+                           contract_budget=_contract_budget,
+                           resilience_profile=resilience_profile,
+                           max_fresh_replays=max_fresh_replays,
+                           fanout=fanout, spawn_fn=_spawn_children)
+
+    workers = [_worker_for(i, g) for i, g in enumerate(goals)]
     pending = list(workers)            # FIFO queue of not-yet-attached workers
 
     def _active_open():
@@ -4622,24 +4653,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             while add_box:
                 item = add_box.pop(0)
                 # item may carry checks/cwd too; goal_fields reads them (priority ignored)
-                nw = RelayWorker(item, "w%d" % len(workers), max_turns=effective_max_turns,
-                                 refuter=refuter, max_refute=max_refute,
-                                 plan_mode=plan_mode, review_lenses=review_lenses,
-                                 max_transient=max_transient, busy_writer=busy_writer,
-                                  max_research=max_research,
-                                  contract_budget=_contract_budget,
-                                  resilience_profile=resilience_profile,
-                                  max_fresh_replays=max_fresh_replays,
-                                  # A GOAL ADDED MID-RUN LEAVES A RECORD LIKE ANY OTHER.
-                                  # These two were missing, so every worker queued after the
-                                  # run began wrote no transcript at all. It went unnoticed
-                                  # while mid-run goals were rare, and stopped being rare the
-                                  # moment fan-out started adding them: a run that split into
-                                  # nine subtasks and ran all nine left ONE transcript on
-                                  # disk, the parent's. The children's answers existed only
-                                  # in memory and in a status file that the next attempt
-                                  # overwrote -- work done, and no way to read it back.
-                                  transcript_dir=transcript_dir, run_id=run_id)
+                nw = _worker_for(len(workers), item)
                 workers.append(nw)
                 if item.get("priority"):
                     pending.insert(0, nw)
