@@ -24,6 +24,8 @@ inherit, how many children are too many, and what the parent is asked at the end
 """
 from __future__ import annotations
 
+import json
+
 import hashlib
 import re
 
@@ -186,6 +188,51 @@ def ready_to_aggregate(records):
     return bool(records) and all(r.get("finished") for r in records)
 
 
+def campaigns_from_ledger(lines):
+    """Rebuild {campaign_id: {goal, n, cwd}} from the campaigns ledger.
+
+    THE LEDGER HAD NO READER. relay_fleet wrote one line per child so that a run dying
+    mid-split would leave a trace of work already queued -- and nothing anywhere opened the
+    file. Measured 2026-08-28: one writer, zero readers, in the whole repository.
+
+    That matters most in the case the file was written for. On FleetContextLost the fleet
+    re-enters run_relay_fleet with a fresh process, so the in-memory `campaigns` dict is
+    empty and `_unfinished()` returns only goals -- never families. A campaign split before
+    the crash is never merged again: its children may all finish, and the answer they were
+    collected for is never assembled.
+
+    The header lines this reads did not exist either; the child lines carry a campaign id
+    and a slice number but not the parent goal, which is the one thing a merge needs. So
+    both halves were missing, and one without the other is still unreadable.
+
+    Tolerant by construction: a truncated final line (the run died mid-write, which is the
+    scenario) must not lose the families above it.
+    """
+    out = {}
+    for line in lines or []:
+        line = (line or "").strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue                 # a half-written line, most likely the last one
+        cid = rec.get("campaign_id")
+        if not cid:
+            continue
+        if rec.get("kind") == "campaign":
+            out[cid] = {"goal": rec.get("goal") or "",
+                        "n": int(rec.get("n") or 0),
+                        "cwd": rec.get("cwd"),
+                        "children": out.get(cid, {}).get("children", [])}
+            continue
+        entry = out.setdefault(cid, {"goal": "", "n": 0, "cwd": None, "children": []})
+        entry["children"].append(rec)
+    # A FAMILY WITHOUT ITS HEADER CANNOT BE MERGED, and saying so is better than returning
+    # a campaign whose parent goal is the empty string -- which would merge into nothing.
+    return {cid: fam for cid, fam in out.items() if fam.get("goal")}
+
+
 def missing_slices(records):
     """The subtask numbers that did not finish DONE. [] when the sweep was complete.
 
@@ -312,6 +359,6 @@ def aggregation_prompt(parent_goal, results, limit_each=1200):
 __all__ = ["SUBTASKS_READY", "SPLIT_JOB", "MAX_CHILDREN", "MIN_CHILDREN", "MAX_DEPTH",
            "fanout_ready", "subtasks_from", "child_goals", "aggregation_prompt",
            "campaign_id_for",
-    "missing_slices", "merge_acceptance_checks",
+    "missing_slices", "merge_acceptance_checks", "campaigns_from_ledger",
     "collapse_retries", "ready_to_aggregate", "aggregation_goal",
 ]

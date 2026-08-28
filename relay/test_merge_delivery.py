@@ -212,3 +212,46 @@ def test_the_campaign_remembers_the_working_directory():
     code = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
     assert '"cwd": (kids[0] or {}).get("cwd")' in code, (
         "campaign が cwd を覚えていない -- aggregation_goal に渡す値が常に None になる")
+
+
+# ---- 成功した家族の統合を、もう再試行しない -----------------------------------------------
+
+def test_a_merged_campaign_stops_retrying_its_failed_merges():
+    """統合が DONE で終わった家族では、失敗した統合を再投入しないこと。
+
+    統合の失敗は他と同じく retryable なので、1つの家族が3〜4本の統合を走らせることがあった。
+    しかも成功より前に queue された分は、答えが出た**後も**走り切る。
+    実測: w13 STUCK → w17 DONE → w18 STUCK → w16 STUCK(全て答えが存在した後)。
+
+    子の再試行は止めない。子を諦めると、統合はそれを「未取得」と書くことになり、
+    もう一度スライスを試すより悪い。
+    """
+    import io
+    import os
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with io.open(os.path.join(root, "relay", "relay_fleet.py"), encoding="utf-8") as fh:
+        src = fh.read()
+    code = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
+    i = code.index("RETRYABLE_OUTCOMES:")
+    blk = code[i:i + 900]
+    assert 'role", "") == "aggregator"' in blk, "統合かどうかを見ていない"
+    assert '(x.outcome or "") == "DONE"' in blk, "家族に成功した統合があるかを見ていない"
+    assert "already merged" in src, "止めた理由を記録していない"
+
+
+def test_a_failed_child_is_still_retried():
+    """子の再試行まで巻き込んで止めていないこと。"""
+    import io
+    import os
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with io.open(os.path.join(root, "relay", "relay_fleet.py"), encoding="utf-8") as fh:
+        code = "\n".join(l for l in fh.read().splitlines()
+                         if not l.strip().startswith("#"))
+    i = code.index("RETRYABLE_OUTCOMES:")
+    blk = code[i:i + 900]
+    # aggregator ガードは role 判定の内側にあること(外に出ると全ワーカーに効く)
+    guard = blk.index('role", "") == "aggregator"')
+    done = blk.index('(x.outcome or "") == "DONE"')
+    assert guard < done, "統合以外にも DONE 判定が効いている"

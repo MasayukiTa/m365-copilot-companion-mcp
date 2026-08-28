@@ -61,10 +61,17 @@ def test_each_worker_is_considered_once():
 
 def test_the_budget_is_keyed_by_goal_text_not_worker_name():
     """再投入されたゴールは新しいワーカー名を得る。名前で数えると予算が毎回リセットされる。"""
+    # 文字数窓と「最初の print まで」で見ていた。統合の再試行を止めるガードが print を1本
+    # 手前に足した瞬間、区切り位置が動いて落ちた —— 予算の数え方は何も変わっていないのに。
+    #
+    # 見たいのは「予算のキーがゴール文であること」なので、キーそのものを見る。
     src = inspect.getsource(RF.run_relay_fleet)
     i = src.index("if _retry_on:")
-    block = src[i:i + 900]
-    assert "_retry_used.get(_g" in block and "_w.name" not in block.split("print(")[0]
+    block = src[i:i + 2600]
+    assert "_retry_used.get(_g" in block, "予算をゴール文で引いていない"
+    assert "_retry_used[_g] = _retry_used.get(_g, 0) + 1" in block, (
+        "予算をゴール文で数えていない —— ワーカー名で数えると再投入のたびにリセットされる")
+    assert "_retry_used[_w.name" not in block, "予算をワーカー名で数えている"
 
 
 def test_it_does_nothing_when_there_is_nowhere_to_queue():
