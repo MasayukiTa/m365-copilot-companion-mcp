@@ -93,3 +93,30 @@ def test_an_empty_answer_scores_zero_rather_than_raising():
     taking the run down."""
     assert grade("")["score"] == 0
     assert grade(None)["score"] == 0
+
+
+def test_the_score_is_procedure_performance_and_says_so():
+    """MEASURED, AND IT COST THE EXPERIMENT ITS MEANING. Thirty live runs scored 0.30/0.40/0.60
+    out of 3 and were reported as "no arm follows the procedure". Twenty-five of the thirty had
+    reached the CORRECT answer; the task simply did not need the procedure, so the run that
+    produced the most checkable answer of all -- a weekday breakdown of every event, proving
+    the zero -- scored nothing.
+
+    The module has to carry that warning where a reader of the scores will meet it."""
+    import re
+
+    import bench.skill_probe as sp
+    # WHITESPACE-NORMALISED, because the phrase wraps across a line in the source and the
+    # first version of this test asserted the unwrapped string against the wrapped text.
+    doc = re.sub(r"\s+", " ", sp.__doc__ or "")
+    assert "not a measure of accuracy" in doc
+    assert "WORSE ANSWER" in doc
+
+
+def test_a_correct_answer_that_skips_an_unnecessary_procedure_scores_zero():
+    """Pinned as a FACT ABOUT THE GRADER, not as desired behaviour: this is exactly what it
+    does, and the number must never be quoted as accuracy."""
+    from bench.skill_probe import grade
+    proven_zero = ("対象期間の全109件を曜日別に分解しました。"
+                   "月20 / 火19 / 水22 / 木25 / 金23 / 土0 / 日0。土日の予定は0件です。")
+    assert grade(proven_zero)["score"] == 0
