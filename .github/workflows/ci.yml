@@ -277,6 +277,8 @@ jobs:
             tests/test_idle_edge_release.py \
             relay/test_merge_delivery.py \
             relay/test_campaign_ledger.py \
+            relay/test_effort_per_goal.py \
+            relay/test_instruction_budget.py \
             tests/test_identity_guard_reports_every_hit.py \
             tests/test_steer_delivery.py \
             tests/test_steer_followup.py \
