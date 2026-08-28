@@ -98,3 +98,66 @@ def test_the_rail_width_token_is_gone():
     for path in SOURCES:
         body = _strip_comments(path.read_text(encoding="utf-8", errors="replace"))
         assert "RailW" not in body, "%s still references the rail width token" % path.name
+
+
+# ---- the prose in the source of truth ------------------------------------------------------
+
+#: Phrases that TEACH the removed design. Prose, not code -- and prose is the actual recurrence
+#: vector here, twice now.
+_RAIL_PROSE = (
+    "rail color + chip",
+    "rail colour + chip",
+    "thin left rail",
+    "left rail +",
+    "Rail kinds:",
+)
+
+
+def test_the_source_of_truth_does_not_still_teach_the_rail():
+    """Theme.cs's PROSE must not describe a rail as the thing that carries meaning.
+
+    THE GUARD ABOVE CANNOT SEE THIS, BY CONSTRUCTION. It strips comments before matching,
+    which is right for asserting about code -- a comment explaining why something was removed
+    must not read as the thing being present. But the way this design keeps coming back is
+    not code. It is a sentence in the single source of truth that the next reader takes for
+    settled policy, and Theme.cs's own header says exactly that.
+
+    Measured 2026-08-28: the header declared "there is no exception" and, a hundred and thirty
+    lines below it, the status model still read "the rail color + chip carry the meaning" with
+    _rail / StatusRail / RailColor around it. Both removals -- from the record blocks, then
+    from the cockpit rows -- had edited the header and left this. The guard was green
+    throughout, because it was looking at the half where the problem was not.
+
+    So this one reads the comments on purpose, and only in Theme.cs: normative prose belongs
+    to the source of truth, and a call site describing its own local decision is not policy.
+    """
+    theme = (UI / "Theme.cs").read_text(encoding="utf-8")
+    # The paragraph recording that the rail was removed necessarily names it. Exclude the
+    # history, judge the guidance: a line is guidance if it is not part of that account.
+    offending = []
+    for n, line in enumerate(theme.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped.startswith("//"):
+            continue
+        for phrase in _RAIL_PROSE:
+            if phrase.lower() in stripped.lower():
+                offending.append((n, stripped[:100]))
+                break
+    assert not offending, (
+        "Theme.cs still teaches the rail in prose: %r -- the header says a stale "
+        "recommendation in the source of truth gets followed by whoever reads it next, and "
+        "this is that sentence" % (offending,))
+
+
+def test_the_status_model_is_not_named_after_the_removed_design():
+    """A stale NAME is followed the same way a stale sentence is.
+
+    StatusRail/RailColor/_rail survived both removals while every caller used them for a pill,
+    a chip, or a text colour. A reader adding a status reads the name before the paragraph.
+    """
+    theme = (UI / "Theme.cs").read_text(encoding="utf-8")
+    code = re.sub(r"//[^\n]*", "", theme)
+    for gone in ("_rail", "StatusRail", "RailColor"):
+        assert gone not in code, (
+            "%s is back in Theme.cs's code -- name the severity kind, not the removed rail"
+            % gone)

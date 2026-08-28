@@ -3225,8 +3225,8 @@ class CockpitWindow : Window
                             localLabel = (knownKey == peEvent && !string.IsNullOrEmpty(peFallbackLabel))
                                 ? peFallbackLabel : knownKey;
                         }
-                        string railKind = Theme.StatusRail(peEvent);
-                        string colorHex = Theme.RailColor(railKind, _dark);
+                        string kind = Theme.StatusKind(peEvent);
+                        string colorHex = Theme.KindColor(kind, _dark);
                         string timeStr = "";
                         if (peTs > 0)
                         {
@@ -9634,7 +9634,7 @@ class CockpitWindow : Window
             dp.Children.Add(chev);
         }
         string hcanon = status == "ready" ? "waiting" : status;
-        var pill = Pill(Theme.StatusLabel(hcanon, _lang), Theme.StatusRail(hcanon));
+        var pill = Pill(Theme.StatusLabel(hcanon, _lang), Theme.StatusKind(hcanon));
         pill.Margin = new Thickness(0, 0, 5, 0);
         DockPanel.SetDock(pill, Dock.Left);
         dp.Children.Add(pill);
@@ -9830,7 +9830,7 @@ class CockpitWindow : Window
         // chip, not the rail thirty pixels to its left. The rail restated what the chip already
         // said, in the one shape the operator has objected to for months.
         bool isDone = status == "done" || string.Equals(S(w, "outcome"), "DONE", StringComparison.OrdinalIgnoreCase);
-        string chipKind = isDone ? "success" : (isInfra ? "warning" : Theme.StatusRail(status));
+        string chipKind = isDone ? "success" : (isInfra ? "warning" : Theme.StatusKind(status));
 
         // Pass A2-1 TASK 1: demote the collapsed row to a LEDGER ROW.
         // - No rounded corners, no card background fill, no full border.
@@ -11273,7 +11273,7 @@ class CockpitWindow : Window
     }
 
     // Status chip (spec): a small OUTLINED pill -- colored border + colored text on a transparent
-    // fill, never a saturated block. `railKind` is one of neutral/info/success/warning/danger.
+    // fill, never a saturated block. The kind is one of neutral/info/success/warning/danger.
     // P0 AGENT BADGE (feature 4): show which agent a worker's conversation is bound to, read
     // from its conv_url in status.json.
     //   • conv_url carries "/agent/<id>" AND <id> matches the configured agent -> subtle Muted
@@ -11330,9 +11330,9 @@ class CockpitWindow : Window
         return b;
     }
 
-    Border Pill(string text, string railKind)
+    Border Pill(string text, string kind)
     {
-        var color = Theme.Br(Theme.RailColor(railKind, _dark));
+        var color = Theme.Br(Theme.KindColor(kind, _dark));
         var b = new Border();
         b.Background = Brushes.Transparent;
         b.BorderBrush = color; b.BorderThickness = new Thickness(1);

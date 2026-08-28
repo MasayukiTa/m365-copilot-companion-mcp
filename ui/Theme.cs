@@ -148,10 +148,26 @@ static class Theme
     public const double RadBubble   = 12; // chat bubbles, large panels
 
     // ── status model ──────────────────────────────────────────────────────────────
-    // Canonical status keys (see DeriveStatus in the cockpit) -> visual treatment.
-    // Rail kinds: "neutral" | "info" | "success" | "warning" | "danger".
-    // No status fills the whole card; the rail color + chip carry the meaning.
-    static readonly Dictionary<string, string> _rail = new Dictionary<string, string>
+    // Canonical status keys (see DeriveStatus in the cockpit) -> a SEVERITY KIND, which
+    // becomes a colour for a chip, a pill, or the text it describes.
+    // Kinds: "neutral" | "info" | "success" | "warning" | "danger".
+    //
+    // UNTIL 2026-08-28 THIS PARAGRAPH NAMED THE REMOVED DESIGN AS THE THING THAT CARRIES
+    // MEANING -- the exact sentence is not reproduced here, because a guard now reads this
+    // file's prose and cannot tell a quotation from a recommendation, and neither can a
+    // reader in a hurry. The type was called _rail, with StatusRail/RailColor around it.
+    // The removed bars themselves
+    // were removed twice -- from the record blocks, then from the cockpit rows, each time
+    // because the operator has said repeatedly that a coloured bar down the left edge reads
+    // as a sticky note. The header of this file says so, says there is no exception, and
+    // says in as many words that a stale recommendation left in the single source of truth
+    // gets followed again by whoever reads it next.
+    //
+    // It was left here anyway, a hundred and thirty lines below that warning, still
+    // teaching the removed design and still naming it. Every caller uses these for a pill,
+    // a chip, or a text colour -- there is no rail left to colour. The prose and the names
+    // now say what the thing is.
+    static readonly Dictionary<string, string> _kind = new Dictionary<string, string>
     {
         { "pending",     "neutral" },
         { "ready",       "info"    },
@@ -168,26 +184,26 @@ static class Theme
         { "freed",       "neutral" },
     };
 
-    public static string StatusRail(string canonical)
+    public static string StatusKind(string canonical)
     {
         string v;
-        if (canonical != null && _rail.TryGetValue(canonical, out v)) return v;
+        if (canonical != null && _kind.TryGetValue(canonical, out v)) return v;
         return "neutral";
     }
 
-    // Resolve a rail/chip kind to its accent color for the given mode.
-    public static string RailColor(string railKind, bool dark)
+    // Resolve a severity kind to its accent color for the given mode.
+    public static string KindColor(string kind, bool dark)
     {
-        if (railKind == "info") return Info(dark);
-        if (railKind == "success") return Success(dark);
-        if (railKind == "warning") return Warning(dark);
-        if (railKind == "danger") return Danger(dark);
+        if (kind == "info") return Info(dark);
+        if (kind == "success") return Success(dark);
+        if (kind == "warning") return Warning(dark);
+        if (kind == "danger") return Danger(dark);
         return Muted(dark); // neutral
     }
 
     public static string StatusColor(string canonical, bool dark)
     {
-        return RailColor(StatusRail(canonical), dark);
+        return KindColor(StatusKind(canonical), dark);
     }
 
     // Display label. lang: 0 = Japanese, 1 = English. Called during render (not cached),
