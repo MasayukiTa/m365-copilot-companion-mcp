@@ -269,6 +269,28 @@ def select_best(candidates: Iterable[dict], *, weights: dict | None = None) -> d
     if not cands:
         return {"winner": None, "ranking": [], "rationale": "no candidates"}
 
+    # THIS SELECTOR ONLY WORKS ON DIFFS, AND IT FAILS SILENTLY ON ANYTHING ELSE.
+    #
+    # Every signal here is read from a unified diff. `_normalize_diff` keeps only lines
+    # beginning with + or -, so prose normalises to the empty string: every candidate is then
+    # "empty", every empty is its own singleton by design (agreeing on "no change" is not
+    # convergence), and the self-consistency signal -- the one thing best-of-N uniquely buys --
+    # is gone. What survives is minimality, so the shortest answer wins.
+    #
+    # MEASURED, on three text answers where two were identical and one disagreed: the selector
+    # returned the ODD ONE OUT, because it was the shortest. Two candidates agreeing was
+    # invisible to it. A mechanism whose whole purpose is to prefer the answer several attempts
+    # converged on had inverted itself, and returned a confident rationale while doing it.
+    #
+    # So it refuses. An exception is recoverable; a plausible wrong winner is not, and the
+    # caller cannot tell the difference from the return value.
+    if len(cands) > 1 and all(_is_empty(c.get("diff", "")) for c in cands):
+        raise ValueError(
+            "best-of-N received %d candidates and none of them contains diff content. This "
+            "selector reads every signal from a unified diff; on prose it loses consensus "
+            "entirely and ranks by length alone, which picks the shortest answer rather than "
+            "the agreed one. Use a selector built for the answer shape you have." % len(cands))
+
     csizes = consensus(cands)
     scored = []
     for c in cands:

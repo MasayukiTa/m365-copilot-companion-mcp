@@ -153,3 +153,49 @@ if __name__ == "__main__":
     test_empty_selection()
     test_ranking_shape()
     print("ALL BESTOFN TESTS PASSED")
+
+
+# ---- what this selector cannot judge -----------------------------------------------------
+
+def test_prose_candidates_are_refused_rather_than_ranked_by_length():
+    """THE MEASURED INVERSION. Every signal here is read from a unified diff, and
+    `_normalize_diff` keeps only +/- lines -- so prose normalises to empty, every candidate
+    becomes its own singleton, and the self-consistency signal that best-of-N uniquely buys
+    disappears. Minimality is all that survives, so the SHORTEST answer wins.
+
+    Measured on three text answers where two were identical and one disagreed: the selector
+    returned the odd one out because it was shortest. Two candidates agreeing was invisible to
+    it, and it returned a confident rationale while doing it."""
+    import pytest
+
+    from relay.bestofn import select_best
+    texts = ["土日の予定は6件です。", "土日の予定は3件でした。", "土日の予定は6件です。"]
+    cands = [{"idx": i, "diff": t, "diff_size": len(t)} for i, t in enumerate(texts)]
+    with pytest.raises(ValueError) as exc:
+        select_best(cands)
+    assert "diff content" in str(exc.value)
+
+
+def test_a_single_candidate_is_still_selected_even_if_empty():
+    """N=1 has no consensus to lose, and an empty patch is a legitimate outcome to report --
+    refusing it would break the ordinary path that selects one capture."""
+    from relay.bestofn import select_best
+    r = select_best([{"idx": 0, "diff": "", "diff_size": 0}])
+    assert r["winner"] is not None
+
+
+def test_real_diffs_are_unaffected():
+    """The guard must not close the door on the case the selector exists for."""
+    from relay.bestofn import select_best
+    d = ["--- a\n+++ b\n+one", "--- a\n+++ b\n+two"]
+    r = select_best([{"idx": i, "diff": x, "diff_size": len(x)} for i, x in enumerate(d)])
+    assert r["winner"]["idx"] in (0, 1)
+
+
+def test_a_mix_of_prose_and_diff_is_not_refused():
+    """The refusal is for a set the selector can say nothing about. If ANY candidate carries
+    diff content, consensus and minimality are meaningful again for that one."""
+    from relay.bestofn import select_best
+    cands = [{"idx": 0, "diff": "ただの文章です", "diff_size": 7},
+             {"idx": 1, "diff": "--- a\n+++ b\n+real", "diff_size": 17}]
+    assert select_best(cands)["winner"]["idx"] == 1
