@@ -171,6 +171,71 @@ def aggregate_panel(results, min_refute=None):
     return ("UPHELD", "")
 
 
+#: Lenses whose objection cannot be outvoted, under the aggregation this module does NOT yet
+#: apply. See `aggregate_panel_veto`.
+VETO_LENSES = ("security",)
+
+
+def aggregate_panel_veto(results, veto_lenses=VETO_LENSES):
+    """What a panel would decide if some lenses could not be outvoted.
+
+    NOT WIRED INTO ACCEPTANCE. This function exists to be COUNTED, not obeyed: it is how the
+    cost of changing the aggregator gets measured before the aggregator is changed. Nothing in
+    the pipeline calls it.
+
+    THE ARGUMENT IT ENCODES. `aggregate_panel` takes a strict majority, and the docstring's
+    justification -- one over-eager reviewer must not block -- is sound for REDUNDANT
+    reviewers who all look at the same thing. This panel is not that. The lenses are chosen to
+    look at DIFFERENT things, so `correctness` and `edge` cannot corroborate what `security`
+    found: they did not examine it. Two reviewers not objecting is not two reviewers agreeing
+    it is safe; it is two reviewers who were asked another question. Under majority, a lone
+    security finding is voted down 2-1 by reviewers with nothing to say about it.
+
+    A VETO, NOT A HEAVIER VOTE. Weighting a lens introduces a number nobody can derive -- and
+    a weight that wins a 3-lens panel can still lose a 5-lens one, so the same defect reappears
+    the moment the panel grows. A veto has one failure mode and it is legible: whatever the
+    veto lens refuses, stops.
+    """
+    n = len(results)
+    if n == 0:
+        return ("UNCLEAR", "harness: the panel produced no verdicts to aggregate")
+    veto = set(veto_lenses or ())
+    blocking = [(l, r) for (l, k, r) in results if k == "REFUTED" and l in veto]
+    if blocking:
+        return ("REFUTED", " / ".join("[%s] %s" % (l, r) for (l, r) in blocking))
+    # Everything else keeps the current rule, so the two aggregators differ in exactly one way.
+    return aggregate_panel([(l, k, r) for (l, k, r) in results if l not in veto]
+                           or list(results))
+
+
+def panel_shadow(results):
+    """Everything a later decision about the aggregator will need, recorded now.
+
+    WHY RECORD THE COUNTERFACTUAL RATHER THAN THE VERDICT ALONE. The question that has to be
+    answered before a veto can ship is "how often would it have blocked work that was fine",
+    and that question is unanswerable from a record that kept only the aggregate: once the
+    majority has spoken, which lens dissented is gone. Keeping the per-lens verdicts makes the
+    veto's cost countable from runs that have ALREADY HAPPENED -- no second fleet, no A/B, no
+    change to what the pipeline does today.
+
+    `would_flip` is the whole measurement in one field: the runs where the two aggregators
+    disagree are exactly the runs the decision rests on.
+    """
+    results = list(results or [])
+    majority = aggregate_panel(results)
+    veto = aggregate_panel_veto(results)
+    return {
+        "lenses": [{"lens": l, "kind": k, "reason": r} for (l, k, r) in results],
+        "aggregate": {"kind": majority[0], "reason": majority[1]},
+        "veto_shadow": {"kind": veto[0], "reason": veto[1]},
+        "would_flip": majority[0] != veto[0],
+        # Which lenses could not be conducted, so a policy is never credited with a clean
+        # result from a reviewer that was never asked.
+        "harness_faults": [l for (l, k, r) in results
+                           if k == "UNCLEAR" and unclear_is_harness_fault(r)],
+    }
+
+
 #: A reason that starts with this prefix means the review could not be CONDUCTED -- no page,
 #: no context, an exception -- as opposed to a reviewer that looked and could not decide. The
 #: fleet ignores the distinction and is right to: UNCLEAR means "do not block" either way.
