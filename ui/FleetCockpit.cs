@@ -3638,6 +3638,17 @@ class CockpitWindow : Window
             {
                 e.Handled = true;
                 // A2-2: Ctrl+Enter steers when a run is active; starts fleet otherwise.
+                //
+                // AND A SLASH SETTING IS A SETTING HERE TOO. The send button below already
+                // calls HandleSlashSetting first, with a note saying the bug was found by
+                // typing a slash setting into the real window and finding settings.txt unchanged
+                // while the running worker had been handed the text. That fix went to the
+                // button and stopped there -- this path, which is the one every keyboard user
+                // and scripts/win/submit_via_ui.ps1 take, kept the original behaviour.
+                //
+                // The same fault reached by two callers is one fault; fixing the caller you
+                // happened to be looking at leaves it live everywhere else.
+                if (HandleSlashSetting()) return;
                 if (_composerRunActive) TrySendSteer();
                 else StartFleet();
             }
