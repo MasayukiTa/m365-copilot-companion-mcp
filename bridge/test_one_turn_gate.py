@@ -46,8 +46,14 @@ def test_the_consent_sentinel_is_handled_rather_than_persisted():
     would write the sentinel into the transcript as if it were an answer."""
     body = _fn("_drain_pending_queue")
     assert "isinstance(final, dict)" in body
-    i = body.index("isinstance(final, dict)")
-    assert "continue" in body[i:i + 400]
+    # 文字数窓(i:i+400)で見ていたが、sentinel の種類が増えた瞬間に continue が窓から
+    # はみ出して落ちた。窓は「近くにある」ことしか言えず、コードが育つたびに剥がれる。
+    # ここで言いたいのは「**この分岐の中で** continue する(= 永続化しない)」なので、
+    # 分岐そのものを切り出して見る。
+    blk = body[body.index("isinstance(final, dict)"):]
+    blk = blk[:blk.index("if final:")]
+    assert "continue" in blk, "sentinel を continue で捨てていない -- 記録に書かれてしまう"
+    assert "_persist_exchange" not in blk, "sentinel を永続化している"
 
 
 def test_one_bad_item_does_not_abandon_the_queue():
