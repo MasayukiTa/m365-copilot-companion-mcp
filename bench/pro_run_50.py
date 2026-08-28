@@ -36,7 +36,8 @@ def status():
 
 
 def main():
-    rows = sorted(json.load(open(os.path.join(SW, "pro_slice50_full.json"), encoding="utf-8")),
+    rows = sorted(json.load(open(os.environ.get("SWE_SLICE_FILE")
+                                 or os.path.join(SW, "pro_slice50_full.json"), encoding="utf-8")),
                   key=lambda r: r["instance_id"])
     ids = [r["instance_id"] for r in rows]
     open(LOG, "w").close()

@@ -14,7 +14,12 @@ import argparse, json, os, subprocess, shutil
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SW = os.path.join(REPO, ".fleet", "swe")
 WORK = os.path.join(SW, "work")
-FULL = json.load(open(os.path.join(SW, "pro_slice50_full.json"), encoding="utf-8"))
+#: WHICH SLICE. Overridable because the original 50 are all BURNED -- every one of them was
+#: used in a measured run on 2026-06-24, and re-measuring on burned instances produces a score
+#: that has already seen its own answers. The fresh draw lives beside it under its own name so
+#: the two cannot be confused by anyone reading a path.
+SLICE_FILE = os.environ.get("SWE_SLICE_FILE") or os.path.join(SW, "pro_slice50_full.json")
+FULL = json.load(open(SLICE_FILE, encoding="utf-8"))
 BY_ID = {r["instance_id"]: r for r in FULL}
 TESTHINT = {"python": "pytest -x", "go": "go test ./...", "js": "npm test", "ts": "npm test"}
 
