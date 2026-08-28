@@ -103,12 +103,35 @@ def compare(by_arm: dict) -> dict:
             "graded": graded,
         }
     means = [v["mean_score"] for v in out.values()]
+
+    # SEPARATION HAS TO CLEAR THE NOISE, and the first version of this did not ask it to.
+    # `(max - min) > 0` calls any difference a separation, so three arms whose within-arm
+    # scores ranged 0..2 were reported as separated on a gap of 0.33 -- and that was reported
+    # upward as a finding before anyone looked at the spread. The threshold now is the widest
+    # within-arm spread: a gap between arms means nothing until it exceeds the gap the SAME
+    # arm produces against itself.
+    #
+    # This is a floor, not a test. With three runs per arm it is very easy to clear by luck
+    # and very easy to miss a real effect; `underpowered` says so rather than leaving a reader
+    # to infer it from n.
+    spreads = [max(g["score"] for g in v["graded"]) - min(g["score"] for g in v["graded"])
+               for v in out.values() if v["graded"]]
+    within = max(spreads) if spreads else 0
+    gap = (max(means) - min(means)) if means else 0
+    separated = bool(means) and gap > within
+    smallest_n = min((v["n"] for v in out.values()), default=0)
+
     return {
         "arms": out,
-        "separated": bool(means) and (max(means) - min(means)) > 0,
+        "gap": round(gap, 3),
+        "widest_within_arm_spread": within,
+        "separated": separated,
+        "underpowered": smallest_n < 10,
         # Stated so a reader cannot mistake a null for a negative: no separation means the
-        # probe did not discriminate, NOT that the sentence does nothing.
-        "note": ("the arms did not separate: this probe could not discriminate, which is not "
-                 "evidence that the sentence has no effect"
-                 if means and (max(means) - min(means)) == 0 else ""),
+        # probe did not discriminate at this sample size, NOT that the sentence does nothing.
+        "note": ("" if separated else
+                 "the arms did not separate: the gap between arms (%.2f) does not exceed the "
+                 "spread WITHIN an arm (%d), so this says the probe could not discriminate at "
+                 "n=%d -- it is not evidence that the sentence has no effect"
+                 % (gap, within, smallest_n)),
     }

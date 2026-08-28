@@ -67,10 +67,25 @@ def test_arms_that_do_not_separate_are_reported_as_a_null_not_a_negative():
     assert "not evidence that the sentence has no effect" in c["note"]
 
 
-def test_arms_that_separate_are_reported_as_separated():
-    c = compare({"A": [FOLLOWED], "B": [IGNORED]})
+def test_arms_that_separate_cleanly_are_reported_as_separated():
+    c = compare({"A": [FOLLOWED, FOLLOWED], "B": [IGNORED, IGNORED]})
     assert c["separated"] is True and c["note"] == ""
     assert c["arms"]["A"]["mean_score"] > c["arms"]["B"]["mean_score"]
+
+
+def test_a_gap_smaller_than_an_arms_own_spread_is_not_a_separation():
+    """MEASURED, NOT HYPOTHETICAL. Three runs per arm produced arm means of 0.67, 1.00 and
+    1.00 while one arm's own scores ranged 0..2 -- and the first version of this comparator
+    called that separated, because it asked only whether the gap was non-zero. It was reported
+    upward as a finding before anyone looked at the spread."""
+    noisy = compare({"A": [FOLLOWED, IGNORED], "B": [IGNORED, IGNORED]})
+    assert noisy["widest_within_arm_spread"] >= noisy["gap"]
+    assert noisy["separated"] is False
+
+
+def test_a_small_sample_says_so_rather_than_leaving_it_to_be_inferred():
+    c = compare({"A": [FOLLOWED], "B": [IGNORED]})
+    assert c["underpowered"] is True
 
 
 def test_an_empty_answer_scores_zero_rather_than_raising():
