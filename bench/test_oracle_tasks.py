@@ -15,8 +15,38 @@ def test_every_task_passes_on_the_truth_and_fails_on_a_wrong_number():
     """The minimum an oracle must do. One that cannot fail is not an oracle."""
     t = truths()
     for task in tasks():
-        assert task.grade("答えは %d です\nDONE" % t[task.tid])["passed"] is True, task.tid
-        assert task.grade("答えは 99999 です\nDONE")["passed"] is False, task.tid
+        assert task.grade("ANSWER: %d\nDONE" % t[task.tid])["passed"] is True, task.tid
+        assert task.grade("ANSWER: 99999\nDONE")["passed"] is False, task.tid
+
+
+def test_the_real_answer_that_the_first_grader_marked_wrong():
+    """THE INSTRUMENT FAILURE THIS FILE EXISTS TO PREVENT, pinned as the exact text.
+
+    The first grader looked for a number near a total-word and took the last match. Against
+    this real answer it matched the 135 in 計135 and reported "claimed 135, truth 53" -- so a
+    CORRECT answer was graded wrong three runs running, and written up as "the worker skips
+    the exclusion condition in the question". Re-checked by hand afterwards: ALL EIGHTEEN runs
+    of the suite had answered correctly. The workers were right, the grader was wrong, and the
+    grader's verdict had already been reported as a finding about capability."""
+    from bench.oracle_suite_repo import _claim
+    real = ("**53個** です。\n\n"
+            "relay 直下の .py は計135個、test_ 除外後は **53個** 。\n\nANSWER: 53\nDONE")
+    assert _claim(real) == 53
+
+
+def test_an_answer_without_the_fixed_line_is_unparseable_not_wrong():
+    """A missing format is a fact about the answer's shape, not evidence about capability, and
+    collapsing the two turns a formatting slip into a failure rate."""
+    r = tasks()[0].grade("53個です。DONE")
+    assert r["passed"] is False and "unparseable" in r["detail"]
+
+
+def test_both_arms_carry_the_format_requirement():
+    """It belongs to the QUESTION, not the contract card -- otherwise the control arm is
+    unparseable by construction and the card would appear to cause correctness."""
+    task = tasks()[0]
+    assert "ANSWER:" in task.full_goal(with_contract=False)
+    assert "ANSWER:" in task.full_goal(with_contract=True)
 
 
 def test_an_answer_with_no_number_fails_rather_than_passing_vacuously():

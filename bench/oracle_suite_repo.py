@@ -25,11 +25,36 @@ from bench.oracle_tasks import Task, contract_card
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _num(answer):
-    """Every integer the answer states, in order. The oracle asks whether the RIGHT one is
-    present rather than parsing a sentence, because a wrong parse would fail a correct worker
-    and that failure would look like a capability finding."""
-    return [int(x) for x in re.findall(r"\d+", answer or "")]
+#: The one line an answer must contain for the oracle to read it. Stated in the QUESTION, not
+#: in the contract card, so both arms carry it and the arms still differ by the card alone.
+ANSWER_LINE = "ANSWER: <整数>"
+ANSWER_RE = re.compile(r"^\s*ANSWER\s*[:：]\s*(-?\d+)\s*$", re.MULTILINE)
+
+
+def _claim(answer):
+    """The integer the answer OFFERS as its result, or None.
+
+    PARSING PROSE FOR THE CLAIM WAS THE THIRD INSTRUMENT FAILURE IN THIS PROJECT, and the
+    worst, because it inverted a result rather than losing one. The first version looked for a
+    number near a total-word and took the last such match. Against the real answer
+
+        「**53個** です。relay 直下の .py ファイルは計135個で、うち test_ で始まるものが
+         82個、始まらないものが **53個** です」
+
+    it matched 計135 and reported "claimed 135, truth 53" -- so a CORRECT answer was graded
+    wrong, three runs in a row, and written up as "the worker skips the exclusion condition in
+    the question". The workers had done exactly what was asked.
+
+    A grader that reads prose is guessing, and its guesses fail silently in whichever
+    direction the sentence happens to run. So the answer states its result in one fixed line
+    and the oracle reads only that. If the line is absent the task is not graded as wrong --
+    it is unparseable, which is a different fact and is returned as one.
+    """
+    m = ANSWER_RE.findall(answer or "")
+    if not m:
+        return None
+    # The LAST such line: a worker that corrects itself puts the correction after.
+    return int(m[-1])
 
 
 def _truth_py_nontest():
@@ -49,20 +74,11 @@ def _truth_excludable():
 
 
 def _exact_int(truth):
-    """Pass only when the answer states the right integer.
-
-    A LOOSE MATCH IS THE FAILURE MODE HERE: an answer listing many numbers would pass a
-    "contains" test by accident, so the check is that the truth appears AND no other integer is
-    offered as the total. Answers state the total last in practice, so the last integer is the
-    claim; when there is only one integer, that is the claim too.
-    """
+    """Pass only when the ANSWER line states the right integer."""
     def check(answer):
-        nums = _num(answer)
-        if not nums:
-            return False, "no integer in the answer"
-        # The claim is the integer nearest a total-word, else the last one stated.
-        m = re.findall(r"(?:合計|全部で|計|は)\s*(\d+)\s*(?:個|件|本|つ|ファイル)?", answer or "")
-        claim = int(m[-1]) if m else nums[-1]
+        claim = _claim(answer)
+        if claim is None:
+            return False, "no ANSWER line (unparseable, not necessarily wrong)"
         return claim == truth, "claimed %d, truth %d" % (claim, truth)
     return check
 
@@ -78,7 +94,9 @@ def tasks():
             "count_nontest_py",
             "リポジトリ %s の relay フォルダ直下にある .py ファイルのうち、"
             "ファイル名が test_ で始まらないものが何個あるか数えてください。"
-            "サブフォルダは含めません。最後の行に DONE と書いてください。" % repo,
+            "サブフォルダは含めません。"
+            "答えは必ず `ANSWER: <整数>` の1行で書いてください(その行だけを採点します)。"
+            "最後の行に DONE と書いてください。" % repo,
             contract_card(
                 "個数(整数1つ)",
                 "relay 直下のみ・サブフォルダ除外・test_ で始まる名前は除外",
@@ -88,7 +106,9 @@ def tasks():
         Task(
             "count_outcomes",
             "リポジトリ %s の relay/outcomes.py にある STATUS_OF の要素数(結末の種類の数)を"
-            "答えてください。最後の行に DONE と書いてください。" % repo,
+            "答えてください。"
+            "答えは必ず `ANSWER: <整数>` の1行で書いてください(その行だけを採点します)。"
+            "最後の行に DONE と書いてください。" % repo,
             contract_card(
                 "要素数(整数1つ)",
                 "STATUS_OF の要素のみ・他の集合(RETRYABLE 等)は数えない",
@@ -98,7 +118,9 @@ def tasks():
         Task(
             "count_excludable",
             "リポジトリ %s の relay/outcomes.py で、EXCLUDED_WITHOUT_WORK に入っている"
-            "結末はいくつありますか。最後の行に DONE と書いてください。" % repo,
+            "結末はいくつありますか。"
+            "答えは必ず `ANSWER: <整数>` の1行で書いてください(その行だけを採点します)。"
+            "最後の行に DONE と書いてください。" % repo,
             contract_card(
                 "個数(整数1つ)",
                 "EXCLUDED_WITHOUT_WORK の要素のみ",
