@@ -4267,15 +4267,46 @@ def _genome_default(name, fallback):
     try:
         from relay.selfimprove import runtime_config as _rc
         return {"max_transient": _rc.max_retries,
-                "max_refute": _rc.max_refute_passes}[name]()
+                "max_refute": _rc.max_refute_passes,
+                "max_research": _rc.max_research,
+                "review_lens_count": _rc.review_lens_count}[name]()
     except Exception:
         return fallback
+
+
+def _resolve_review_lenses(review_lenses):
+    """The panel a run gets: the caller's list, or the one the active harness asks for.
+
+    THE SEAM THAT MAKES `ultra` EXPRESSIBLE TO A HARNESS. None has always meant "no panel"; it
+    now means "ask the harness", and the base manifest answers 0 -- so a run that does not ask
+    for a panel still does not get one, byte for byte. A harness that sets review_lens_count
+    gets a panel WITHOUT any caller passing lenses, which is the only way the benchmark child
+    (which passes none, on purpose, so the manifest supplies the budgets under test) can run
+    one at all.
+
+    A FUNCTION RATHER THAN FOUR LINES INSIDE THE RUNNER, because a resolution rule buried in a
+    thousand-line function is a rule that can only be tested by starting a browser -- and the
+    parameter block's own standard is that a knob must be shown to CHANGE something.
+    """
+    if review_lenses is not None:
+        return review_lenses
+    n = _genome_default("review_lens_count", 0)
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        # None, not []. An empty list happens to be falsy everywhere it is read, so the two
+        # would behave alike today and diverge the first time somebody writes `is not None`.
+        return None
+    from .refuter import PANEL_LENSES
+    return list(PANEL_LENSES[:n])
 
 
 def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     notify=default_notify, on_tick=None, max_concurrent=None,
                     mc_box=None, add_box=None, refuter=False, max_refute=None,
-                    plan_mode=False, review_lenses=None, max_transient=None, max_research=3,
+                    plan_mode=False, review_lenses=None, max_transient=None, max_research=None,
                     autoscale=False, autoscale_max=None, asc_box=None,
                     autoscale_per_tab_mb=None, autoscale_headroom_mb=None,
                     autoscale_up_margin_mb=0,
@@ -4371,6 +4402,11 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         max_transient = _genome_default("max_transient", 10)
     if max_refute is None:
         max_refute = _genome_default("max_refute", 2)
+    if max_research is None:
+        # Was a literal 3 in the signature. Same value, now taken from the harness, so an A/B
+        # over research depth is two different programs rather than two runs of one.
+        max_research = _genome_default("max_research", 3)
+    review_lenses = _resolve_review_lenses(review_lenses)
 
     # FAN-OUT bookkeeping. campaigns[cid] remembers the parent goal a family was split from,
     # which is the one thing the merge needs that the children do not carry themselves.

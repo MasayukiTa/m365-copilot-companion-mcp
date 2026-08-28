@@ -347,6 +347,10 @@ def test_every_genome_parameter_has_a_production_reader(monkeypatch):
         "max_retries": (RC.max_retries, lambda: F._genome_default("max_transient", 10)),
         "max_refute_passes": (RC.max_refute_passes,
                               lambda: F._genome_default("max_refute", 2)),
+        "max_research": (RC.max_research,
+                         lambda: F._genome_default("max_research", 3)),
+        "review_lens_count": (RC.review_lens_count,
+                              lambda: F._genome_default("review_lens_count", 0)),
     }
     assert set(M.DEFAULT_PARAMETERS) == set(READERS), (
         "パラメータを足すなら本番の読み手も同時に足すこと: %s"

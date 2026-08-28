@@ -136,8 +136,10 @@ DEFAULT_COMPONENTS = {
 #: to prefer. A range is the cheapest way to keep "the experiment ran" true.
 PARAMETER_TYPES = {
     "max_refute_passes": (0, 10),
+    "max_research": (0, 20),
     "max_retries": (0, 50),
     "memory_max_items": (0, 100),
+    "review_lens_count": (0, 3),
 }
 
 # Every parameter here MUST have a production reader. An independent review found three of
@@ -164,6 +166,24 @@ DEFAULT_PARAMETERS = {
     # unreviewed change to the product.
     "max_retries": 10,
     "memory_max_items": 5,        # -> project_memory: how much history is primed into a goal
+    # -> relay_fleet: how many on-demand research side-pages a worker may open.
+    # 3, because that is what run_relay_fleet's signature said before this line existed.
+    "max_research": 3,
+    # -> relay_fleet: how many of PANEL_LENSES review a candidate. 0 = no panel.
+    #
+    # 0, AND THE ZERO IS THE WHOLE POINT. A panel is what `ultra` means, and `ultra` is not
+    # what a run does unless it is asked for. Any other value here would turn every
+    # production run into a three-reviewer run on the commit that added the knob -- the
+    # exact failure the max_retries comment above records, in the expensive direction.
+    #
+    # WHY THIS EXISTS AT ALL. The benchmark harness could not express `ultra`: the child it
+    # spawns passes `refuter` and deliberately leaves the rest unset so the manifest supplies
+    # them, and the manifest had no lens knob. So `auto` and `ultra` resolved to the same
+    # program, ran as the same program, and were recorded under the SAME harness_id -- which
+    # means no comparison between them has ever been made through this scorecard, whatever
+    # anyone remembers concluding. A knob here is what makes the two arms different programs
+    # and, because the id is a hash of this dict, different harnesses on the record.
+    "review_lens_count": 0,
 }
 
 

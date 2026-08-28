@@ -14,6 +14,10 @@ STATUS = os.path.join(REPO, ".fleet", "status.json")
 LOG = os.path.join(SW, "pro_run_50.log")
 PREDS = os.path.join(SW, "pro_preds_50.json")
 BATCH = 8
+#: Which effort arm this run is. Named once, used both on the fleet's command line and in the
+#: run config the recorder reads, so the two cannot disagree about what ran.
+EFFORT = os.environ.get("SWE_EFFORT", "auto")
+RUN_CONFIG = os.path.join(SW, "pro_run_config.json")
 PER_BATCH_TIMEOUT = 3600  # 60 min/batch safety net
 
 
@@ -38,6 +42,30 @@ def main():
     open(LOG, "w").close()
     if not os.path.exists(PREDS):
         json.dump([], open(PREDS, "w"))
+    # WRITE DOWN WHICH ARM THIS IS, at launch, in the run's own directory.
+    #
+    # The effort was a literal on the command line below and the harness was whatever manifest
+    # happened to be active, so a finished run left nothing saying which of the two it had
+    # been. The record step then hardcoded "auto" -- a constant standing in for a fact -- and
+    # every result in the archive claimed the same arm whatever had run. A remembered
+    # conclusion about which effort scored higher could not be checked against anything.
+    #
+    # The recorder reads this rather than being told again, because a second place to state
+    # the arm is a second place for it to be wrong.
+    try:
+        from relay.selfimprove import manifest as _M
+        from relay.selfimprove import runtime_config as _RC
+        _active = _RC.active_manifest(refresh=True)
+        json.dump({"effort": EFFORT,
+                   "harness_id": _M.harness_id(_active),
+                   "parameters": dict(_active.get("parameters") or {})},
+                  open(RUN_CONFIG, "w", encoding="utf-8"), ensure_ascii=False)
+        log("arm: effort=%s harness=%s" % (EFFORT, _M.harness_id(_active)[:16]))
+    except Exception as exc:
+        # Never fatal: this run must still happen. But say so, because a missing arm record
+        # is the state the recorder has to refuse to guess its way out of.
+        log("WARNING: could not write the run config (%s) -- the recorder will have no arm"
+            % exc)
     log("START Pro 50-run: %d instances, batch=%d, strengthened goals" % (len(ids), BATCH))
     bgoals = os.path.join(SW, "pro_batch_goals.jsonl")
 
@@ -65,7 +93,7 @@ def main():
         env = dict(os.environ, PYTHONIOENCODING="utf-8", SWE_SIDEPAGE_RESERVE="0")
         flog = open(os.path.join(SW, "pro_fleet_batch.log"), "w", encoding="utf-8")
         subprocess.Popen([PY, "-m", "relay.fleet_runner", "--goals-file", bgoals,
-                          "--state-dir", os.path.join(REPO, ".fleet"), "--effort", "auto"],
+                          "--state-dir", os.path.join(REPO, ".fleet"), "--effort", EFFORT],
                          cwd=REPO, env=env, stdout=flog, stderr=subprocess.STDOUT,
                          creationflags=0x08000000)  # CREATE_NO_WINDOW
 
