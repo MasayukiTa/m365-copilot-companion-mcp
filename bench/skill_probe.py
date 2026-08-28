@@ -27,6 +27,23 @@ probe lacked.
 WHAT THIS DOES NOT MEASURE. Whether the counts are correct. A disciplined worker can still be
 wrong, and a lucky one can be right; those are different questions and mixing them is how the
 first experiment lost its own conclusion.
+
+AND THAT SEPARATION COST THE EXPERIMENT ITS MEANING -- READ THIS BEFORE USING THESE SCORES.
+Measured 2026-08-28 over 30 live runs of one goal: the scores came out 0.30 / 0.40 / 0.60 out
+of 3, which was reported as "no arm follows the procedure most of the time". Then the answers
+were read. TWENTY-FIVE of the thirty reached the correct conclusion, and the true answer was
+zero -- one worker proved it by breaking all 109 events down by weekday (Mon 20, Tue 19,
+Wed 22, Thu 25, Fri 23, Sat 0, Sun 0).
+
+The procedure this file scores -- split the period into dated ranges, cite hasMoreResults --
+exists for periods too large to fetch at once. 109 events fit in one call. The discipline was
+UNNECESSARY FOR THIS TASK, so the worker that produced the most checkable answer in the whole
+run scored zero, and the score was reported as a failure rate.
+
+So these numbers are a measure of PROCEDURE PERFORMANCE on a task that did not need the
+procedure. They are not a measure of accuracy and must never be quoted as one. A probe like
+this is only meaningful on a task where skipping the procedure actually produces a WORSE
+ANSWER; on anything smaller it rewards theatre.
 """
 from __future__ import annotations
 
