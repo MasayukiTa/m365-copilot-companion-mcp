@@ -3906,6 +3906,26 @@ class ChatWindow : Window
                 try { HttpGet("/switch?url=" + Uri.EscapeDataString(target.ConvUrl), 15000); _pageConv = target; }
                 catch { AddAssistant(T("send_wrong_page")); return; }
             }
+            else if (target.Source == "chat" && !string.IsNullOrEmpty(target.Name))
+            {
+                // A CONVERSATION WITH NO URL IS NOT AUTOMATICALLY UNREACHABLE. One captured
+                // over the socket is stored as "sess:<guid>", which is not something you
+                // can navigate to, so it registers with url="" and /switch has nothing to
+                // take. It does carry its sid, right here in Name, and /resume takes a sid
+                // and knows both stored shapes -- clicking the sidebar row for a sessref,
+                // navigating for a real URL.
+                //
+                // Without this, every conversation the socket captured fell through to the
+                // refusal below: visible in the list, impossible to continue. And the socket
+                // is now the ordinary path, so that was most of them.
+                //
+                // Gated on Source, because Name means two different things: the sid for a
+                // chat row, and the worker name (w0, w1) for a fleet row. Resuming a fleet
+                // row by "w0" would ask the store for a session that does not exist.
+                try { HttpGet("/resume?sid=" + Uri.EscapeDataString(target.Name), 20000);
+                      _pageConv = target; }
+                catch { AddAssistant(T("send_wrong_page")); return; }
+            }
             else if (target.Messages.Count == 0)
             {
                 try { HttpGet("/new", 15000); _pageConv = target; }
