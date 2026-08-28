@@ -186,8 +186,44 @@ def ready_to_aggregate(records):
     return bool(records) and all(r.get("finished") for r in records)
 
 
+def missing_slices(records):
+    """The subtask numbers that did not finish DONE. [] when the sweep was complete.
+
+    The merge prompt already asks for these to be named. Nothing checked that they were.
+    Measured over the runs on record: two campaigns reached the merge with gaps (8/9 and
+    4/8), and in the one whose transcripts survive, both merges that finished DONE wrote
+    that nothing was missing. The prompt asked; the answer did not comply; no one looked.
+
+    This is the counterpart of subtasks_from, which refuses a split proposal it cannot
+    parse. The split has had that check since it was written. The merge has not.
+    """
+    out = []
+    for rec in records or []:
+        if (rec.get("outcome") or "").upper() == "DONE":
+            continue
+        idx = rec.get("subtask_index")
+        if idx is not None:
+            out.append(idx)
+    return sorted(out)
+
+
+def merge_acceptance_checks(records):
+    """Acceptance checks for the merge goal: every unfinished slice must be named.
+
+    A whole-answer check, not a per-slice one, because the merge is asked for an account
+    and the account has to mention the gaps by number. When the sweep was complete there
+    is nothing to check -- an empty list, not a check that passes trivially, so a reader
+    can tell the difference between 'checked and clean' and 'nothing to check'.
+    """
+    gaps = missing_slices(records)
+    if not gaps:
+        return []
+    return ["未取得または未完了のサブタスク %s について、回答本文でその番号に触れていること"
+            % ", ".join(str(g) for g in gaps)]
+
+
 def aggregation_goal(parent_goal, records, *, campaign_id="", parent_task_id="",
-                     limit_each=1200):
+                     limit_each=1200, cwd=None):
     """The goal item that merges a finished campaign.
 
     A goal rather than a turn on the parent, because a parent parked waiting for its own
@@ -198,7 +234,7 @@ def aggregation_goal(parent_goal, records, *, campaign_id="", parent_task_id="",
     to merge.
     """
     cid = campaign_id or campaign_id_for(parent_goal)
-    return {
+    item = {
         "text": aggregation_prompt(parent_goal, records, limit_each=limit_each),
         "campaign_id": cid,
         "task_id": "%s-merge" % cid,
@@ -207,6 +243,15 @@ def aggregation_goal(parent_goal, records, *, campaign_id="", parent_task_id="",
         "depth": MAX_DEPTH,          # never splits again
         "priority": True,            # the campaign is finished; do not queue behind new work
     }
+    # THE SAME WORKING DIRECTORY THE CHILDREN HAD. child_goals passes cwd down; this did
+    # not, and the merge is asked to write a combined file and report its path -- from
+    # whatever directory it happened to start in.
+    if cwd:
+        item["cwd"] = cwd
+    checks = merge_acceptance_checks(records)
+    if checks:
+        item["checks"] = checks
+    return item
 
 
 def aggregation_prompt(parent_goal, results, limit_each=1200):
@@ -266,4 +311,7 @@ def aggregation_prompt(parent_goal, results, limit_each=1200):
 
 __all__ = ["SUBTASKS_READY", "SPLIT_JOB", "MAX_CHILDREN", "MIN_CHILDREN", "MAX_DEPTH",
            "fanout_ready", "subtasks_from", "child_goals", "aggregation_prompt",
-           "campaign_id_for"]
+           "campaign_id_for",
+    "missing_slices", "merge_acceptance_checks",
+    "collapse_retries", "ready_to_aggregate", "aggregation_goal",
+]
