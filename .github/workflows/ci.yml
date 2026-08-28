@@ -276,6 +276,7 @@ jobs:
             tests/test_retry_sets_agree.py \
             tests/test_idle_edge_release.py \
             relay/test_merge_delivery.py \
+            relay/test_campaign_ledger.py \
             tests/test_identity_guard_reports_every_hit.py \
             tests/test_steer_delivery.py \
             tests/test_steer_followup.py \

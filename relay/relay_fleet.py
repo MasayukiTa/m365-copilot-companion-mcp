@@ -4353,6 +4353,14 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             if transcript_dir:
                 with open(os.path.join(os.path.dirname(transcript_dir), "campaigns.jsonl"),
                           "a", encoding="utf-8") as fh:
+                    # THE FAMILY'S OWN LINE FIRST. The child lines carry a campaign id and a
+                    # slice number, which says what was queued but not what it was queued
+                    # FOR -- and the merge needs the parent goal. Without this the file
+                    # cannot rebuild the thing it exists to preserve.
+                    fh.write(json.dumps(
+                        {"kind": "campaign", "campaign_id": cid, "goal": parent_goal,
+                         "n": len(kids), "cwd": (kids[0] or {}).get("cwd")},
+                        ensure_ascii=False) + "\n")
                     for k in kids:
                         fh.write(json.dumps(
                             {"campaign_id": cid, "task_id": k.get("task_id"),
@@ -4544,6 +4552,26 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 _retry_seen.add(id(_w))
                 if getattr(_w, "outcome", None) not in RETRYABLE_OUTCOMES:
                     continue
+                # A CAMPAIGN THAT HAS ALREADY BEEN MERGED NEEDS NO MORE MERGES. A merge that
+                # goes STUCK is retryable like anything else, so a family could end up
+                # running three or four of them -- and the ones queued before the successful
+                # attempt kept going after it. Measured: one campaign ran w13 STUCK, w17
+                # DONE, then w18 and w16 both STUCK, all after the answer existed.
+                #
+                # Only aggregators are checked. A failed CHILD still deserves its retry: the
+                # merge covering for it would have to name it as missing, which is worse
+                # than trying the slice again.
+                if getattr(getattr(_w, "task_envelope", None), "role", "") == "aggregator":
+                    _mcid = getattr(getattr(_w, "task_envelope", None), "campaign_id", "")
+                    if any(getattr(getattr(x, "task_envelope", None), "role", "")
+                           == "aggregator"
+                           and getattr(getattr(x, "task_envelope", None), "campaign_id", "")
+                           == _mcid
+                           and (x.outcome or "") == "DONE"
+                           for x in workers):
+                        print("[fanout] %s already merged; not retrying %s"
+                              % (_mcid, _w.name), flush=True)
+                        continue
                 _g = getattr(_w, "goal", "") or ""
                 if not _g or _retry_used.get(_g, 0) >= _retry_cap:
                     continue
