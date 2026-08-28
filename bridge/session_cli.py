@@ -412,13 +412,19 @@ def run_goal(client, text: str, kbd_q, out=None, stop_grace: float = 60.0,
     interleaved in the stream and rendered as render-only events.
     """
     out = out or sys.stdout
+    # WHICH SESSION A STEER BELONGS TO IS THE SERVER'S QUESTION, AND IT IS ALREADY ANSWERED
+    # THERE. This used to guess: list_sessions()[0], the newest by last_active_ts across
+    # every session including ones with no conversation attached. The server's /goal loop
+    # uses ACTIVE_SID, chosen by a different rule -- the startup resume picks the newest
+    # session that HAS a conversation, and a mid-run conversation recycle moves it again
+    # with no client involvement. Two rules for one thing, and they disagree whenever the
+    # newest session is not the attached one.
+    #
+    # /send resolves an empty sid to ACTIVE_SID itself, so sending nothing is not a
+    # fallback -- it is the whole answer, and it cannot drift from the server's own notion
+    # because it IS the server's own notion. The guess is gone rather than reconciled: a
+    # second rule that agrees today is a second rule that can stop agreeing.
     sid = ""
-    try:
-        sessions = client.list_sessions()
-        if sessions:
-            sid = sessions[0].get("sid", "")
-    except Exception:
-        pass
     sse_q: queue.Queue = queue.Queue()
 
     def _pump():
@@ -728,8 +734,25 @@ def _print_banner_and_maybe_resume(client: BridgeClient, auto_continue: bool) ->
     if auto_continue:
         _do_resume(client, latest.get("sid", ""), sessions)
         return
-    print(f"latest session: {session_label(latest)} ({format_relative_time(latest.get('last_active_ts', 0))})")
-    print("Type /resume to switch, or just start typing to continue where you left off.")
+
+    # THE BANNER NAMED THE WRONG SESSION. It printed sessions[0] -- the newest by
+    # last_active_ts, including sessions with no conversation attached -- and then said
+    # that typing would continue it. Typing goes to /stream, which uses the bridge's
+    # ACTIVE_SID: chosen at startup from the newest session that HAS a conversation, and
+    # moved again, with no client involvement, whenever a long conversation is recycled.
+    # The two agree often enough that the line reads true, and when they disagree the
+    # operator is told their next message continues something it will not.
+    #
+    # /sessions now marks the active row, so the banner can name it instead of inferring
+    # it. When nothing is marked -- an older bridge, or no session attached yet -- say
+    # what is actually known rather than filling the gap with the first row.
+    active = next((s for s in sessions if s.get("active")), None)
+    if active is not None:
+        print(f"continuing: {session_label(active)} ({format_relative_time(active.get('last_active_ts', 0))})")
+        print("Type /resume to switch to a different one.")
+    else:
+        print(f"latest session: {session_label(latest)} ({format_relative_time(latest.get('last_active_ts', 0))})")
+        print("The bridge has not said which session is active; typing continues whichever conversation it is on. Use /resume to choose one.")
 
 
 def main(argv=None) -> int:

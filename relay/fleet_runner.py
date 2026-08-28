@@ -1272,7 +1272,16 @@ def _watchdog_should_reset(status, stalled_s, now=None):
     return (True, "stalled %ds with no eval in flight -> wedged" % stalled_s)
 
 
-def _print_table(workers, total):
+def _print_table(workers, total=None):
+    # THE DENOMINATOR IS THE WORKERS, NOT THE GOALS THE RUN STARTED WITH. It was len(goals),
+    # while the numerator counts terminal workers -- and a fan-out parent is terminal the
+    # moment it has proposed its split. So a run that split 4 goals into 44 workers printed
+    # [fleet 4/4] while 36 subtasks and 4 merges had not begun. Measured 2026-08-28.
+    #
+    # Counting workers makes the denominator grow as subtasks appear, which is the honest
+    # shape: the line says how much of the work that EXISTS is finished, and the work that
+    # exists is not known until the split happens.
+    total = len(workers) if total is None else total
     done = sum(1 for w in workers if w.status in TERMINAL)
     def _turn_str(w):
         # max_turns=0 means unlimited; show "t10/∞" to avoid "t10/0" confusion.
@@ -1783,7 +1792,7 @@ def main():
                                                  queued=len(add_box or [])))
         except Exception:
             pass
-        _print_table(workers, len(goals))
+        _print_table(workers)
 
     from playwright.sync_api import sync_playwright
     from relay.relay_fleet import FleetContextLost, reset_socket_route
@@ -2012,8 +2021,29 @@ def main():
                 # watchdog still armed would hard-reset the browser out from under the very
                 # cleanup that is finishing the run.
                 sweep_active.clear()
+            # KEYED ON GOAL TEXT, SO TWO WORKERS CAN CLAIM THE SAME SLOT -- and the last one
+            # written wins. That is fine when they are the same work retried, and wrong in
+            # exactly one case: a fan-out parent carries the MERGED answer of everything its
+            # children did (relay_fleet back-fills it), while the other claimant is a single
+            # conversation that re-ran the whole goal alone.
+            #
+            # Measured 2026-08-28 over 100 coordinator logs: 22 of 24 runs that split
+            # delivered the duplicate rather than the merge. The duplicate's source was the
+            # cockpit re-queueing FANOUT, which is fixed on that side now -- but the
+            # collision is not unique to it. A resumed leg or a goal submitted twice
+            # produces the same two claimants, and the rule here should not depend on
+            # nobody ever creating one.
+            #
+            # So the merge wins its own slot. Not by worker order, which is what let a
+            # higher index take it, but by which result is the aggregate of the others.
             for r in res:
-                results_by_goal[r["goal"]] = r
+                _goal = r["goal"]
+                _prior = results_by_goal.get(_goal)
+                if _prior is not None and (_prior.get("outcome") or "") == "FANOUT" \
+                        and (r.get("outcome") or "") != "FANOUT":
+                    print("[fanout] keeping the merged answer for a goal a second worker also claimed (%s vs %s)" % (_prior.get("name"), r.get("name")), flush=True)
+                    continue
+                results_by_goal[_goal] = r
             pending = []                                   # finished cleanly
         except FleetContextLost as e:
             sweep_active.clear()

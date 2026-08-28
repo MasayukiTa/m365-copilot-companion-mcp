@@ -105,8 +105,10 @@ def test_gate_banner_shows_a_context_preview_not_the_whole_manifest():
     """A Skill gate's context is a multi-line file/hash manifest. Printed in full it
     pushed the Approve/Deny row below the fold; the complete text stays available
     in the Approval Center (which scrolls) and as a tooltip."""
-    assert "static string GateContextPreview(string context)" in SOURCE
-    assert "ctxTb.Text = GateContextPreview(context2);" in SOURCE
+    assert "static string GateContextPreview(" in SOURCE
+    # 引数は増える(lang を渡すようになった)。ここで見たいのは「プレビューを通していること」
+    # であって呼び出しの字面ではないので、名前と代入先で見る。
+    assert "ctxTb.Text = GateContextPreview(context2" in SOURCE
     assert "ctxTb.ToolTip = context2;" in SOURCE
     assert "if (kept.Count == 2) break;" in SOURCE
 

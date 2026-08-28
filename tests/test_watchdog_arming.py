@@ -49,10 +49,17 @@ def test_it_disarms_before_the_teardown():
     """Result mapping, memory recording, notifications and tab teardown can outlast stall_s.
     A watchdog still armed would hard-reset the browser out from under the cleanup that is
     finishing the run."""
+    # ORDER, NOT PROXIMITY. This read a 400-character window after the disarm and looked for
+    # the result loop in it. A comment added above that loop pushed it out of the window and
+    # the test failed while the order it cares about was unchanged -- the third character-
+    # window test to break that way in this repository.
+    #
+    # What it means to assert is that the disarm happens BEFORE the results are consumed.
+    # That is an ordering, and an ordering is comparable positions, not a distance.
     src = open(SRC, encoding="utf-8").read()
     clear = src.index("sweep_active.clear()")
-    after = src[clear:clear + 400]
-    assert "for r in res:" in after, "the disarm must come before the results are consumed"
+    consume = src.index("for r in res:")
+    assert clear < consume, "the disarm must come before the results are consumed"
 
 
 def test_stop_wd_alone_is_not_used_as_liveness():

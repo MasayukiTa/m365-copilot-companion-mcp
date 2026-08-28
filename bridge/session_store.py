@@ -156,6 +156,11 @@ def _initialize(conn):
             conv_url       TEXT NOT NULL DEFAULT '',
             created_ts     REAL NOT NULL,
             last_active_ts REAL NOT NULL,
+            -- WRITTEN, NEVER READ. Every touch() sets this to 'active' and nothing in the
+            -- repository consults it -- not the selector below (which filters on conv_url),
+            -- not the bridge, not the UI. It is kept because dropping a column in SQLite
+            -- means rebuilding the table, and the risk of that outweighs a spare column;
+            -- but nothing new should be built on it. The state that IS read is `mode`.
             status         TEXT NOT NULL DEFAULT 'active',
             turns          INTEGER NOT NULL DEFAULT 0,
             transcript     TEXT NOT NULL DEFAULT '',
@@ -858,8 +863,21 @@ def pop_input(sid):
     return first
 
 
-def latest_active():
-    """Most recent session (by last_active_ts) that has a non-empty conv_url."""
+def latest_attached():
+    """Most recent session (by last_active_ts) that has a conversation attached.
+
+    NAMED FOR ITS CONDITION, WHICH IS conv_url <> '' AND NOT status. It was latest_active,
+    which is the third thing in this program called active and the second that does not
+    mean what the others do:
+
+      - the `status` column, written as 'active' by every touch() and read by nothing
+      - ACTIVE_SID in the bridge, the session a turn actually goes to
+      - this, which asked only whether a conversation was attached
+
+    A reader reasoning from the name would have expected the status column to matter here.
+    It never did, and a filter that is named but not applied is worse than one that is
+    absent, because it gets relied on.
+    """
     conn = _db()
     try:
         row = conn.execute(
