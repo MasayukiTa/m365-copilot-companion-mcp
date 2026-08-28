@@ -199,3 +199,61 @@ def test_a_path_at_the_very_end_of_the_text_matches():
     facts = facts_from_history(WT2, [{"goal": r"checked out at C:\wt\p1",
                                       "outcome": "DONE", "turn": 1}])
     assert list(facts) == ["proj__proj-1"]
+
+
+# ---- run scoping, and the ranking that decides the denominator ----------------------------
+
+def test_an_earlier_runs_result_does_not_leak_into_this_one():
+    """The ledger is global and worktree paths get reused. Unscoped, a previous run's DONE
+    made an instance immortally solved and its turns became part of this run's cost."""
+    rows = [_row(r"C:\wt\pro_1", "DONE", 9), _row(r"C:\wt\pro_1", "STUCK", 4)]
+    rows[0]["ts"], rows[1]["ts"] = 100, 900
+    f = facts_from_history(WT, rows, since=500)["proj__proj-1"]
+    assert f["outcome"] == "STUCK" and f["turns"] == 4 and f["attempts"] == 1
+
+
+def test_an_undateable_row_is_dropped_while_scoping_is_active():
+    """Keeping it is the unsafe direction: an undateable row is exactly what an older ledger
+    format produces, and letting it in defeats the scoping."""
+    rows = [_row(r"C:\wt\pro_1", "DONE", 9)]          # no ts
+    assert facts_from_history(WT, rows, since=500) == {}
+
+
+def test_without_a_start_time_nothing_is_dropped():
+    """Callers that cannot supply one must keep working -- the recorder reports the gap rather
+    than silently scoping to an invented time."""
+    rows = [_row(r"C:\wt\pro_1", "DONE", 9)]
+    assert facts_from_history(WT, rows)["proj__proj-1"]["outcome"] == "DONE"
+
+
+def test_a_scored_attempt_outranks_an_excludable_one_in_both_orders():
+    """"DONE wins, otherwise the last word stands" left every non-DONE pair to ledger order --
+    and since an excludable outcome can leave the denominator while a failure cannot, write
+    order was silently deciding the size of the denominator."""
+    a = facts_from_history(WT, [_row(r"C:\wt\pro_1", "STUCK", 3),
+                                _row(r"C:\wt\pro_1", "CANCELLED", 1)])
+    b = facts_from_history(WT, [_row(r"C:\wt\pro_1", "CANCELLED", 1),
+                                _row(r"C:\wt\pro_1", "STUCK", 3)])
+    assert a["proj__proj-1"]["outcome"] == "STUCK"
+    assert b["proj__proj-1"]["outcome"] == "STUCK"
+
+
+def test_done_still_outranks_everything():
+    for other in ("STUCK", "CANCELLED", "FANOUT", "ERROR", "MAXTURNS"):
+        f = facts_from_history(WT, [_row(r"C:\wt\pro_1", "DONE", 2),
+                                    _row(r"C:\wt\pro_1", other, 2)])
+        assert f["proj__proj-1"]["outcome"] == "DONE", other
+
+
+def test_two_excludable_attempts_stay_excludable():
+    """Ranking must not invent a scored attempt where there was none."""
+    f = facts_from_history(WT, [_row(r"C:\wt\pro_1", "CANCELLED", 0),
+                                _row(r"C:\wt\pro_1", "INFRA_STUCK", 0)])
+    assert f["proj__proj-1"]["outcome"] in ("CANCELLED", "INFRA_STUCK")
+    assert scoring_of(f["proj__proj-1"]["outcome"], f["proj__proj-1"]["turns"]) == "excluded"
+
+
+def test_turns_are_still_summed_over_the_attempts_that_survive_scoping():
+    rows = [_row(r"C:\wt\pro_1", "STUCK", 4), _row(r"C:\wt\pro_1", "DONE", 3)]
+    rows[0]["ts"], rows[1]["ts"] = 600, 700
+    assert facts_from_history(WT, rows, since=500)["proj__proj-1"]["turns"] == 7

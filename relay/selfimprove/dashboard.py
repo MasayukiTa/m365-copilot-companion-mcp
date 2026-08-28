@@ -203,6 +203,7 @@ def _archive_sections(archive_path):
             "pass_at_1": _to_float(e.get("pass_at_1")),
             "ci": e.get("ci"),
             "superseded": latest_measurement.get((e.get("id"), e.get("run_id"))) != i,
+            "measurement": e.get("measurement"),
             "run_id": e.get("run_id"),
             "note": e.get("note"),
         })
@@ -378,6 +379,11 @@ def dashboard_state(*, archive_path=None, burned_path=None, grade_results_path=N
     grade_recs = _read_jsonl(grade_results_path)
 
     latest_pass = pass1_trend[-1]["pass_at_1"] if pass1_trend else None
+    # None when the row predates `measurement` -- an old row genuinely does not carry an
+    # end-to-end rate, and inventing one from the conditional rate would assume nothing was
+    # ever excluded, which is the assumption this pair exists to stop making.
+    latest_e2e = ((pass1_trend[-1].get("measurement") or {}).get("end_to_end")
+                  if pass1_trend else None)
     latest_ab = None
     if ab_history:
         last = ab_history[-1]
@@ -415,6 +421,16 @@ def dashboard_state(*, archive_path=None, burned_path=None, grade_results_path=N
                        "why_not": "the reliability section could not be computed"}
 
     summary = {
+        # THE HEADLINE IS THE RATE THAT EXCLUDING CANNOT RAISE.
+        #
+        # `pass_at_1` in the archive is CONDITIONAL on a gradable attempt: whatever leaves the
+        # denominator raises it, so a run that excluded half its slice outscores one that
+        # excluded nothing, and a drift in what gets excluded reads as capability improving.
+        # End-to-end asks what fraction of everything the caller asked for came back with an
+        # answer, and no exclusion can move it. The conditional rate stays beside it, because
+        # neither answers the other's question -- one is the agent's capability on work it was
+        # allowed to attempt, the other is the system's.
+        "latest_end_to_end": latest_e2e,
         "latest_pass_at_1": latest_pass,
         # None, NOT a number, until a slice has actually been measured twice. Rendering
         # "pass^k 1.00" from a single run would invent the finding the metric was added to
@@ -551,8 +567,12 @@ def render_text(state) -> str:
 
     lines = ["SELF-IMPROVEMENT SCORECARD", "=" * 26]
 
+    # END-TO-END FIRST, because it is the one no exclusion can raise.
+    e2e = summary.get("latest_end_to_end")
     lp = summary.get("latest_pass_at_1")
-    lines.append("latest pass@1 : %s   [capability: fraction of ATTEMPTS that pass]"
+    lines.append("latest        : %s   [end-to-end: of everything ASKED FOR, what came back]"
+                 % ("not recorded" if e2e is None else ("%.3f" % e2e)))
+    lines.append("        pass@1: %s   [conditional on a gradable attempt -- excluding RAISES this]"
                  % ("n/a" if lp is None else ("%.3f" % lp)))
 
     # BOTH NUMBERS, ALWAYS -- including when the second one does not exist yet, because the

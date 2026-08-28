@@ -66,18 +66,70 @@ def _load_run_config(path):
 
 
 def _load_preds(path):
-    """Return the ordered list of instance_ids in the preds file (+ patch length per id for diff_size)."""
-    ids, patch_len = [], {}
+    """Instance ids in the preds file (+ patch length per id), and what is wrong with them.
+
+    THE DENOMINATOR WAS WHATEVER HAPPENED TO BE IN THIS FILE. Nothing checked that the ids
+    were unique or that they were the slice anyone meant to measure, so a partial file scored
+    as a complete run -- a five-instance file with four solves is "pass@1 = 0.80" and reads
+    like a triumph. Duplicates were worse than merely wrong: an id appearing twice counted
+    twice in the denominator while `resolved` is a set and counted once, so the same file
+    could not even score itself consistently.
+
+    Returns (ids, patch_len, problems) with ids DEDUPED in first-seen order. `problems` is a
+    list of strings; the caller refuses to commit while it is non-empty.
+    """
+    ids, patch_len, problems = [], {}, []
+    seen, dupes = set(), []
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
     rows = data if isinstance(data, list) else data.get("predictions", [])
+    blank = 0
     for r in rows:
         iid = r.get("instance_id")
         if not iid:
+            blank += 1
             continue
+        if iid in seen:
+            dupes.append(iid)
+            continue
+        seen.add(iid)
         ids.append(iid)
         patch_len[iid] = len(r.get("patch") or r.get("model_patch") or "")
-    return ids, patch_len
+    if blank:
+        problems.append("%d prediction row(s) carry no instance_id" % blank)
+    if dupes:
+        problems.append("%d duplicate instance_id(s), e.g. %s"
+                        % (len(dupes), ", ".join(sorted(set(dupes))[:3])))
+    return ids, patch_len, problems
+
+
+def _slice_problems(ids, expected_path):
+    """How the graded slice differs from the canonical one, if the canonical one is readable.
+
+    The grade file documents a `total` this program ignored, and no step asserted that the
+    fifty instances of the named slice were all present. A run that staged badly, timed out
+    halfway, or was pointed at a hand-edited file produced a smaller denominator and a higher
+    rate, and the archive recorded it under the same slice label as a complete run.
+    """
+    try:
+        with open(expected_path, encoding="utf-8") as f:
+            rows = json.load(f)
+        expected = {r["instance_id"] for r in rows if isinstance(r, dict) and r.get("instance_id")}
+    except (OSError, ValueError, KeyError, TypeError):
+        # NOT a problem to block on: the canonical file is not always beside the recorder, and
+        # refusing to record because it is missing would be a new way to lose a real result.
+        return [], None
+    got = set(ids)
+    missing, extra = expected - got, got - expected
+    problems = []
+    if missing:
+        problems.append("%d of the slice's %d instances are absent from the predictions "
+                        "(e.g. %s)" % (len(missing), len(expected),
+                                       ", ".join(sorted(missing)[:3])))
+    if extra:
+        problems.append("%d prediction(s) are not part of this slice (e.g. %s)"
+                        % (len(extra), ", ".join(sorted(extra)[:3])))
+    return problems, len(expected)
 
 
 def _load_resolved(path, all_ids):
@@ -116,13 +168,23 @@ def main(argv=None):
                     default=os.path.join(REPO, ".fleet", "swe", "pro_run_config.json"),
                     help="what the run wrote about which arm it was (effort, harness id, "
                          "resolved parameters)")
+    ap.add_argument("--slice-file",
+                    default=os.path.join(REPO, ".fleet", "swe", "pro_slice50_full.json"),
+                    help="the canonical slice this measurement claims to be of; the "
+                         "predictions are checked against it")
+    ap.add_argument("--force", action="store_true",
+                    help="record even though the slice does not check out. The reason must be "
+                         "in --note, because the archive will carry this row as though it "
+                         "measured the named slice.")
     ap.add_argument("--commit", action="store_true", help="actually write (default: dry-run)")
     args = ap.parse_args(argv)
 
-    ids, patch_len = _load_preds(args.preds)
+    ids, patch_len, problems = _load_preds(args.preds)
     if not ids:
         print("ERROR: no instance_ids in preds %s" % args.preds)
         return 2
+    slice_problems, slice_size = _slice_problems(ids, args.slice_file)
+    problems += slice_problems
     resolved = _load_resolved(args.grade, ids)
 
     # WHAT THE FLEET RECORDED ABOUT THIS RUN, joined onto the graded slice.
@@ -132,8 +194,17 @@ def main(argv=None):
     # established both arrive here as an empty patch, grade as unresolved, and used to enter
     # the denominator as failures -- measuring the operator and the environment rather than
     # the agent. The outcome was recorded all along, in the fleet's own ledger; nothing read it.
-    facts = swe_run_facts.load(args.wtmap, args.history)
+    # READ FIRST, because the ledger join below is scoped by the run's start time.
+    run_cfg = _load_run_config(args.run_config)
+    # SCOPED TO THIS RUN. The ledger is global and the worktree map is not: without a start
+    # time, a path reused by an earlier run contributes that run's DONE (making the instance
+    # immortally solved) and its turn count (making this run's cost the path's lifetime cost).
+    since = run_cfg.get("started")
+    facts = swe_run_facts.load(args.wtmap, args.history, since=since)
     join = swe_run_facts.join_report(ids, facts)
+    if since is None and join["joined"]:
+        problems.append("the run start time is unknown, so the ledger was joined UNSCOPED -- "
+                        "outcomes and turn counts here may belong to an earlier run")
 
     # FAIL-CLOSED. An instance the ledger does not cover STAYS IN THE DENOMINATOR. Excluding
     # what we could not verify is the direction that flatters the score, and it is the
@@ -174,7 +245,6 @@ def main(argv=None):
     # had run -- and since the panel and research budgets were not manifest parameters either,
     # two efforts also hashed to the SAME harness_id. A remembered conclusion about which
     # effort scored higher could not be checked against anything in the archive.
-    run_cfg = _load_run_config(args.run_config)
     genome = {
         "knobs": {
             "SWE_SIDEPAGE_RESERVE": "0",
@@ -229,6 +299,35 @@ def main(argv=None):
                   "genuine repeat recorded this way would overwrite rather than accumulate"))
     if args.note:
         print("  note        : %s" % args.note)
+    # THE CHECKS REFUSE, THEY DO NOT ADVISE.
+    #
+    # Every safeguard in this program used to be a printed line, and a printed line is not a
+    # safeguard: the archive is read later by a dashboard and by an evolution loop, neither of
+    # which saw the console. A slice that does not check out, or a ledger that could not be
+    # read at all, produces a row that claims to measure something it did not.
+    # NOT A REFUSAL, deliberately. A run with no ledger still measures pass@1 honestly: with
+    # no outcomes, nothing is excluded and every instance stays in the denominator, which is
+    # the conservative direction. What it loses is turns, and what was actually wrong before
+    # was that the loss left no trace -- coverage was printed to a console and not archived.
+    # It is archived now (measurement.ledger_coverage), so a reader can see that a row's turn
+    # counts are zeroes rather than measurements. Blocking here would only stop real results
+    # from being recorded.
+    if problems:
+        print()
+        for prob in problems:
+            print("  PROBLEM     : %s" % prob)
+        if not args.force:
+            print("  REFUSED     : not recording a measurement of %r that does not check out."
+                  % SLICE_LABEL)
+            print("                Fix the run, or pass --force WITH --note saying why this "
+                  "row is still worth keeping.")
+            return 2
+        if not args.note:
+            print("  REFUSED     : --force needs --note. A row recorded over a failed check "
+                  "with no reason is indistinguishable from one that passed.")
+            return 2
+        print("  FORCED      : recording anyway -- %s" % args.note)
+
     if not args.commit:
         print("  (dry-run: nothing written; re-run with --commit)")
         return 0
@@ -254,6 +353,12 @@ def main(argv=None):
                       "excluded_rate": round(len(excluded) / n_all, 4) if n_all else None,
                       "ledger_coverage": join["coverage"],
                       "ledger_missing": len(join["missing"]),
+                      "slice_size": slice_size,
+                      # Empty on a clean run. Non-empty means somebody passed --force, and the
+                      # row must carry that fact rather than leaving it in a console nobody
+                      # kept.
+                      "problems": problems,
+                      "forced": bool(problems),
                   })
     burned = BurnedRegistry()
     n_new = burned.add(ids, reason)
