@@ -175,9 +175,23 @@ def _archive_sections(archive_path):
     # Nothing is dropped. The superseded row stays in the trend, flagged, so the record of
     # having measured it twice survives; what changes is that it stops being counted as a
     # separate genome and stops being drawn as a rise.
+    # A REPLICATE IS NOT A CORRECTION. Rows marked as independent repeats of the same
+    # scaffold key on (id, replicate), so a second honest measurement no longer reads as
+    # "the first grade was wrong". Unmarked rows keep the original meaning exactly.
+    # TWO QUESTIONS, TWO MAPS -- they were one map, and giving it the second meaning silently
+    # emptied the genome list, because that loop asks the FIRST question and looked the key up
+    # by id alone.
+    #
+    #   latest_measurement: "is this row corrected by a later one?"  -> (id, replicate)
+    #   latest_by_id:       "which row represents this genome?"      -> id
+    #
+    # A replicate is not a correction, so it must not supersede in the first sense; it is
+    # still the same genome, so it must collapse in the second.
+    latest_measurement = {}
     latest_at = {}
     for i, e in enumerate(entries):
         if isinstance(e, dict):
+            latest_measurement[(e.get("id"), e.get("replicate"))] = i
             latest_at[e.get("id")] = i
 
     for i, e in enumerate(entries):
@@ -187,7 +201,8 @@ def _archive_sections(archive_path):
             "ts": e.get("ts"),
             "pass_at_1": _to_float(e.get("pass_at_1")),
             "ci": e.get("ci"),
-            "superseded": latest_at.get(e.get("id")) != i,
+            "superseded": latest_measurement.get((e.get("id"), e.get("replicate"))) != i,
+            "replicate": e.get("replicate"),
             "note": e.get("note"),
         })
 
@@ -382,8 +397,30 @@ def dashboard_state(*, archive_path=None, burned_path=None, grade_results_path=N
         usage = {"n_tasks": 0, "completion_rate": None, "status_mix": {}, "trend": [],
                  "persona_leak_rate": None, "quality_scored": 0, "persona_flagged": []}
 
+    # RELIABILITY BESIDE CAPABILITY. pass@1 asks what fraction of attempts succeed; pass^k
+    # asks what fraction of instances succeed EVERY time. A scaffold that solves a different
+    # 40% each run and one that solves the same 40% every run report the same pass@1 and are
+    # opposite findings -- and which one is in front of you decides whether a retry helps.
+    #
+    # Neither replaces the other. pass^k falls as k rises by construction, so alone it makes a
+    # scaffold that attempts hard problems look worse than one that refuses them.
+    #
+    # Defensive like the usage block: a reliability failure must not take the dashboard down.
+    try:
+        from relay.selfimprove import reliability as _rel
+        reliability = _rel.summary(_read_jsonl(archive_path))
+    except Exception:
+        reliability = {"measured": False, "slices": [], "spread": [],
+                       "why_not": "the reliability section could not be computed"}
+
     summary = {
         "latest_pass_at_1": latest_pass,
+        # None, NOT a number, until a slice has actually been measured twice. Rendering
+        # "pass^k 1.00" from a single run would invent the finding the metric was added to
+        # check, which is the failure mode a second headline metric brings with it.
+        "pass_hat_k_measured": reliability["measured"],
+        "pass_hat_k": (min(r["pass_hat_k"] for r in reliability["slices"])
+                       if reliability["slices"] else None),
         "latest_ab": latest_ab,
         "burned_total": burned_ledger["total"],
         "archive_count": archive_section["count"],
@@ -399,6 +436,9 @@ def dashboard_state(*, archive_path=None, burned_path=None, grade_results_path=N
         "summary": summary,
         "pending_decisions": _pending_section(),
         "usage": usage,
+        # The whole section, not just the headline: a reader deciding whether to trust the
+        # number needs k, n and the per-run rates it was computed from.
+        "reliability": reliability,
         "branches": _branch_section(),
         "ab_history": ab_history,
         "pass1_trend": pass1_trend,
@@ -508,7 +548,31 @@ def render_text(state) -> str:
     lines = ["SELF-IMPROVEMENT SCORECARD", "=" * 26]
 
     lp = summary.get("latest_pass_at_1")
-    lines.append("latest pass@1 : %s" % ("n/a" if lp is None else ("%.3f" % lp)))
+    lines.append("latest pass@1 : %s   [capability: fraction of ATTEMPTS that pass]"
+                 % ("n/a" if lp is None else ("%.3f" % lp)))
+
+    # BOTH NUMBERS, ALWAYS -- including when the second one does not exist yet, because the
+    # absence is itself the finding. pass@1 printed alone is what let a scaffold that solves a
+    # different 40% each run read the same as one that solves the same 40% every run.
+    rel = state.get("reliability") or {}
+    if rel.get("measured"):
+        worst = min(r["pass_hat_k"] for r in rel["slices"])
+        k = max(r["k"] for r in rel["slices"])
+        flaky = max(r["flaky"] for r in rel["slices"])
+        lines.append("        pass^%-2d: %.3f   [reliability: solved in EVERY one of %d runs]"
+                     % (k, worst, k))
+        lines.append("        flaky  : %.3f   [solved at least once but not every time]"
+                     % flaky)
+    else:
+        # NOT 1.000, and not pass@1 raised to a power. Deriving pass^k from a rate assumes
+        # instances are independent and equally hard, and the falseness of that assumption is
+        # the entire reason to want pass^k.
+        lines.append("        pass^k : not measured   [%s]"
+                     % (rel.get("why_not") or "no repeated runs"))
+    for sp in (rel.get("spread") or []):
+        lines.append("        spread : %.3f over %d runs of one slice (n=%d) -- %s"
+                     % (sp["spread"], sp["k"], sp["n"],
+                        ", ".join("%.2f" % r for r in sp["rates"])))
 
     latest_ab = summary.get("latest_ab")
     if latest_ab:

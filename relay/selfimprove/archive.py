@@ -249,7 +249,8 @@ class Archive:
                         pass
 
     def add(self, genome: dict, *, slice_ids, pass_at_1, ci=None, gate_verdict=None,
-            descriptors=None, ts=None, note=None) -> str:
+            descriptors=None, ts=None, note=None, resolved_ids=None,
+            replicate=None) -> str:
         """Append a validated genome and return its id.
 
         Entry = {"id", "genome", "parent_id", "slice_ids", "pass_at_1", "ci", "gate_verdict",
@@ -265,6 +266,30 @@ class Archive:
 
         Not written into `descriptors`: those are behavioural coordinates and the QD map is
         built from them, so prose there would invent cells.
+
+        `resolved_ids` is WHICH instances passed, not how many. The archive kept only the
+        aggregate, and an aggregate cannot answer the question the aggregate raises: two rows
+        on the same slice at 0.40 may be the same twenty instances twice or two disjoint
+        twenties, and those are opposite findings -- one scaffold is consistent, the other
+        solves at random. Every reliability measure, pass^k included, needs the per-instance
+        answers; none of them can be recovered from a rate afterwards. Optional, because rows
+        written before this existed genuinely do not have it and must not be given one.
+
+        `replicate` says THIS ROW IS ANOTHER MEASUREMENT OF THE SAME SCAFFOLD, and it exists
+        because the id could not carry that meaning. The id is a hash of knobs and cards, so
+        an honest re-run of one configuration produces a second row with the SAME id -- which
+        the supersede rule then reads as "the earlier grade was wrong and this replaces it".
+        That rule is right and was written for a real accident: a corrupted grade of 0.34 was
+        re-run at 0.50, and the trend drew a measurement error as a 16-point improvement.
+
+        But one shape was carrying two meanings. A correction REPLACES; a replicate
+        ACCUMULATES. Nothing in the row said which, so the archive had to assume, and it
+        assumed correction -- with the consequence that k could never reach 2 and no
+        reliability measure was computable from this archive at all.
+
+        None (the default) keeps the old meaning exactly: a correction, superseding. An
+        integer marks an independent repeat, which supersedes nothing and is what pass^k
+        counts.
         """
         eid = genome_id(genome)
         entry = {
@@ -273,6 +298,13 @@ class Archive:
             "genome": genome,
             "parent_id": genome.get("parent_id"),
             "slice_ids": list(slice_ids),
+            # WHICH ones passed. None means "this row predates the field", which is not the
+            # same as "none passed" and must never be read as an empty set.
+            "resolved_ids": (sorted(set(resolved_ids) & set(slice_ids))
+                             if resolved_ids is not None else None),
+            # None = a correction of the row it shares an id with (the historical meaning);
+            # an integer = an independent repeat, which supersedes nothing.
+            "replicate": (int(replicate) if replicate is not None else None),
             "pass_at_1": pass_at_1,
             "ci": ci,
             "gate_verdict": gate_verdict,

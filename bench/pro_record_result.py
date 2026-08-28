@@ -116,6 +116,11 @@ def main(argv=None):
                     default=os.path.join(REPO, ".fleet", "swe", "pro_run_config.json"),
                     help="what the run wrote about which arm it was (effort, harness id, "
                          "resolved parameters)")
+    ap.add_argument("--replicate", type=int, default=None,
+                    help="mark this as the Nth INDEPENDENT repeat of the same scaffold "
+                         "(2, 3, ...). Omit for a correction of an earlier measurement, "
+                         "which is what an unmarked row has always meant: it supersedes. "
+                         "A repeat supersedes nothing and is what pass^k counts.")
     ap.add_argument("--commit", action="store_true", help="actually write (default: dry-run)")
     args = ap.parse_args(argv)
 
@@ -215,6 +220,10 @@ def main(argv=None):
               "be compared against a labelled one")
     print("  genome.knobs: %s" % genome["knobs"])
     print("  burn reason : %s" % reason)
+    print("  row kind    : %s"
+          % ("replicate #%d (supersedes nothing; counts toward pass^k)" % args.replicate
+             if args.replicate is not None
+             else "correction (supersedes any earlier row for this scaffold)"))
     if args.note:
         print("  note        : %s" % args.note)
     if not args.commit:
@@ -223,7 +232,15 @@ def main(argv=None):
 
     arc = Archive()
     eid = arc.add(genome, slice_ids=graded_ids, pass_at_1=pass_at_1, ci=ci,
-                  gate_verdict="measured", descriptors=desc, note=args.note)
+                  gate_verdict="measured", descriptors=desc, note=args.note,
+                  # WHICH instances passed, not only how many. Two rows on one slice at 0.40
+                  # may be the same twenty twice or two disjoint twenties, and those are
+                  # opposite findings about the same number. A rate cannot be un-summed later.
+                  resolved_ids=sorted(set(resolved) & set(graded_ids)),
+                  # Says whether this row corrects the previous measurement of this scaffold
+                  # or repeats it. Without it the archive assumed "correction", so k could
+                  # never reach 2 and pass^k was not computable from any number of runs.
+                  replicate=args.replicate)
     burned = BurnedRegistry()
     n_new = burned.add(ids, reason)
     out = dashboard.write_json()

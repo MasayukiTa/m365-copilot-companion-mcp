@@ -83,7 +83,7 @@ def test_aggregates_correctly():
                                grade_results_path=grade, reports_glob=reports_glob)
 
         # top-level shape (now includes the general-user `usage` lens)
-        assert set(st.keys()) == {"summary", "pending_decisions", "usage", "ab_history", "pass1_trend",
+        assert set(st.keys()) == {"summary", "pending_decisions", "usage", "reliability", "ab_history", "pass1_trend",
                                   "burned_ledger", "archive", "branches"}
 
         # summary
@@ -224,7 +224,7 @@ def test_write_json_writes_valid_feed():
         assert os.path.isfile(out)
         with open(out, encoding="utf-8") as f:
             obj = json.load(f)                                       # must be valid JSON
-        assert set(obj.keys()) == {"summary", "pending_decisions", "usage", "ab_history", "pass1_trend",
+        assert set(obj.keys()) == {"summary", "pending_decisions", "usage", "reliability", "ab_history", "pass1_trend",
                                    "burned_ledger", "archive", "branches"}
         # pretty-printed (indent=2) -> multi-line with leading spaces, not a single dense line
         raw = open(out, encoding="utf-8").read()
@@ -316,3 +316,58 @@ def test_an_unknown_read_history_is_not_treated_as_never_read():
     got = render_text({"summary": {"pools": ["sealed"],
                                    "latest_ab": {"net_pp": 6.2, "keep": True}}})
     assert "claimable     : NO" in got and "no reading history" in got
+
+
+# ---- pass^k beside pass@1 -----------------------------------------------------------------
+
+def test_the_scorecard_shows_both_metrics_and_names_what_each_asks():
+    """pass@1 alone let a scaffold that solves a different 40% each run read the same as one
+    that solves the same 40% every run."""
+    from relay.selfimprove.dashboard import dashboard_state, render_text
+    text = render_text(dashboard_state())
+    assert "pass@1" in text and "pass^" in text
+    assert "capability" in text and ("reliability" in text or "not measured" in text)
+
+
+def test_an_unmeasured_reliability_says_so_rather_than_printing_a_number():
+    """1.000 from a single run would invent the finding the metric was added to check."""
+    from relay.selfimprove.dashboard import render_text
+    state = {"summary": {"latest_pass_at_1": 0.5},
+             "reliability": {"measured": False, "slices": [], "spread": [],
+                             "why_not": "no repeated runs"}}
+    text = render_text(state)
+    assert "not measured" in text
+    assert "pass^k : 1.000" not in text
+
+
+def test_a_measured_reliability_reports_k_so_the_number_can_be_read():
+    """pass^k without k is not interpretable: it falls as k rises by construction."""
+    from relay.selfimprove.dashboard import render_text
+    state = {"summary": {"latest_pass_at_1": 0.5},
+             "reliability": {"measured": True, "spread": [],
+                             "slices": [{"n": 50, "k": 3, "enough": True,
+                                         "pass_hat_k": 0.24, "pass_any": 0.60,
+                                         "flaky": 0.36, "per_run_pass_at_1": [.4, .5, .4]}]}}
+    text = render_text(state)
+    assert "pass^3" in text and "0.240" in text
+    assert "0.360" in text          # the flakiness is shown, not only the floor
+
+
+def test_a_replicate_does_not_supersede_the_row_it_repeats():
+    """Two honest runs of one scaffold share an id. Read as a correction, k could never
+    reach 2 and no reliability figure was computable from any number of runs."""
+    from relay.selfimprove.dashboard import dashboard_state
+    import json
+    import tempfile
+    import os
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "archive.jsonl")
+    rows = [{"id": "g", "genome": {}, "slice_ids": ["a"], "pass_at_1": 0.3,
+             "replicate": None, "ts": 1},
+            {"id": "g", "genome": {}, "slice_ids": ["a"], "pass_at_1": 0.5,
+             "replicate": 2, "ts": 2}]
+    with open(p, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+    st = dashboard_state(archive_path=p)
+    assert [t["superseded"] for t in st["pass1_trend"]] == [False, False]
