@@ -1596,7 +1596,8 @@ class ChatWindow : Window
             // "フリート" prefix
             var fleetLabel = new TextBlock
             {
-                Text = "フリート",
+                // 言語トグルで切り替わっていなかった。英語表示でも日本語のまま出ていた。
+                Text = (_lang == 0 ? "フリート" : "Fleet"),
                 FontSize = 11,
                 FontWeight = FontWeights.SemiBold,
                 VerticalAlignment = VerticalAlignment.Center
@@ -2145,6 +2146,69 @@ class ChatWindow : Window
     [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int nCmdShow);
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     static extern bool RedrawWindow(IntPtr h, IntPtr lprc, IntPtr hrgn, uint flags);
+    // Finding a process's window WITHOUT MainWindowHandle. That property returns 0 for a
+    // process whose windows are all invisible -- which is a real state here, not a corner
+    // case: a cockpit started beneath an SW_HIDE parent inherits the hidden show-state (the
+    // same inheritance this file already documents for its own window), so it exists, owns
+    // six windows, and reports no main window at all. Reading MainWindowHandle alone, the
+    // launcher could neither focus it nor decide it was absent.
+    delegate bool EnumWindowsProc(IntPtr h, IntPtr param);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    static extern bool EnumWindows(EnumWindowsProc cb, IntPtr param);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    static extern bool IsWindowVisible(IntPtr h);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    static extern IntPtr GetWindow(IntPtr h, uint cmd);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    static extern int GetWindowLong(IntPtr h, int index);
+
+    // The VISIBLE top-level window belonging to `pid`, or IntPtr.Zero.
+    //
+    // VISIBLE IS THE FILTER, and it has to be. A WPF process owns several top-level windows
+    // that are not the app -- measured here: HwndWrapper helpers with no title, plus
+    // MediaContextNotificationWindow, SystemResourceNotifyWindow and CiceroUIWndFrame, which
+    // DO have titles. So "has a caption" does not separate them, and returning any top-level
+    // window would let this button report success while raising an invisible helper -- worse
+    // than the bug it replaces, because it would also suppress the launch fallback.
+    //
+    // A MINIMISED window still satisfies IsWindowVisible (WS_VISIBLE stays set while
+    // iconic), so the case this whole fix exists for is inside this filter, not outside it.
+    static IntPtr TopLevelWindowOf(int pid)
+    {
+        IntPtr found = IntPtr.Zero;
+        try
+        {
+            EnumWindows(delegate(IntPtr h, IntPtr _)
+            {
+                if (found != IntPtr.Zero) return false;
+                uint owner;
+                GetWindowThreadProcessId(h, out owner);
+                if (owner != (uint)pid) return true;
+                const uint GW_OWNER = 4;
+                if (GetWindow(h, GW_OWNER) != IntPtr.Zero) return true;   // a dialog, not the app
+                // VISIBLE, OR AT LEAST A WINDOW A PERSON COULD USE.
+                //
+                // Requiring visibility alone leaves the one state this button most needs to
+                // rescue: a cockpit started beneath a hidden parent builds its window and
+                // never sets WS_VISIBLE, so it is running, responding, and unreachable.
+                // Style separates it from the WPF helpers that a title does not -- measured,
+                // the app window carries caption+sysmenu+thickframe (0x6CF0000) while
+                // MediaContextNotificationWindow and friends are bare popups (0x8C000000).
+                const int GWL_STYLE = -16;
+                const int WS_CAPTION = 0x00C00000, WS_SYSMENU = 0x00080000,
+                          WS_THICKFRAME = 0x00040000;
+                int style = GetWindowLong(h, GWL_STYLE);
+                bool usable = (style & WS_CAPTION) == WS_CAPTION
+                              && (style & WS_SYSMENU) != 0 && (style & WS_THICKFRAME) != 0;
+                if (IsWindowVisible(h) || usable) found = h;
+                return true;
+            }, IntPtr.Zero);
+        }
+        catch { }
+        return found;
+    }
 
     // The daily launcher is windowless: start_all_hidden.vbs -> start_all.ps1 (-WindowStyle
     // Hidden = SW_HIDE) -> this app. A child of an SW_HIDE parent INHERITS that show-state
@@ -2172,18 +2236,101 @@ class ChatWindow : Window
     // everything and restart just to reach it.
     void OpenCockpit()
     {
-        try
+        // THREE WAYS THIS DID NOTHING AT ALL, all of them silent.
+        //
+        //  1. SetForegroundWindow does NOT un-minimise a window. A cockpit the user had
+        //     minimised stayed minimised and the click appeared to do nothing -- the single
+        //     most reachable state, since minimising it is how you get back to this window.
+        //     ShowWindow was already imported and used elsewhere in this file; it was simply
+        //     never called here.
+        //  2. A process whose window does not exist YET (still starting) has
+        //     MainWindowHandle == 0, and the old code returned on that: no focus, no launch,
+        //     no message. Clicking again did nothing either, because the process was found
+        //     again. A HUNG cockpit had the same shape and killed the button permanently.
+        //  3. SetForegroundWindow can be refused by the foreground lock and returns false;
+        //     the result was discarded, so a refusal was indistinguishable from success.
+        //
+        // And it ran on the UI thread: enumerating every process (291 on this machine, 38 ms
+        // idle and worse while a fleet is running) and then touching MainWindowHandle, which
+        // enumerates windows again -- against an 800 ms timer already doing file I/O. The
+        // lookup now happens off the UI thread and only the window poke comes back to it.
+        string exe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "FleetCockpit.exe");
+        System.Threading.ThreadPool.QueueUserWorkItem(delegate
         {
-            var existing = System.Diagnostics.Process.GetProcessesByName("FleetCockpit");
-            if (existing.Length > 0)
+            IntPtr target = IntPtr.Zero;
+            bool starting = false;
+            try
             {
-                try { if (existing[0].MainWindowHandle != IntPtr.Zero) SetForegroundWindow(existing[0].MainWindowHandle); } catch { }
-                return;
+                foreach (var pr in System.Diagnostics.Process.GetProcessesByName("FleetCockpit"))
+                {
+                    using (pr)
+                    {
+                        if (target != IntPtr.Zero) continue;
+                        IntPtr h = IntPtr.Zero;
+                        try { h = pr.MainWindowHandle; } catch { }
+                        // Fall back to enumeration: MainWindowHandle is 0 for a process whose
+                        // windows are merely INVISIBLE, and that process is exactly the one
+                        // this button needs to rescue.
+                        if (h == IntPtr.Zero) { try { h = TopLevelWindowOf(pr.Id); } catch { } }
+                        if (h != IntPtr.Zero)
+                        {
+                            // FOCUS IT EVEN IF IT IS NOT RESPONDING. A hung cockpit still has
+                            // a window, and showing the user a frozen window they can close is
+                            // strictly better than a button that does nothing and says nothing.
+                            target = h;
+                            continue;
+                        }
+                        // No window. Either it is starting, or it is a broken process that
+                        // will never have one -- and the old code could not tell them apart,
+                        // so ONE such process disabled this button for the rest of the
+                        // session. Age decides: a young process is starting and deserves a
+                        // moment; an old one with no window is not going to grow one.
+                        // NO VISIBLE WINDOW. Either it is still starting, or it is a
+                        // process that will never show one -- a cockpit launched beneath an
+                        // SW_HIDE parent inherits the hidden show-state and owns only
+                        // invisible windows. The old code could not tell those apart from a
+                        // healthy cockpit, so ONE of them disabled this button for the rest
+                        // of the session. Age decides: a young process is starting and gets a
+                        // moment; an old one with nothing visible is not going to grow a
+                        // window, and a second cockpit beats a dead button.
+                        try
+                        {
+                            starting = starting ||
+                                (DateTime.Now - pr.StartTime).TotalSeconds < 20;
+                        }
+                        catch { }
+                    }
+                }
             }
-            string exe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "FleetCockpit.exe");
-            if (File.Exists(exe)) System.Diagnostics.Process.Start(exe);
-        }
-        catch { }
+            catch { }
+
+            Dispatcher.BeginInvoke((Action)delegate
+            {
+                if (target != IntPtr.Zero)
+                {
+                    const int SW_RESTORE = 9;
+                    try
+                    {
+                        // RESTORE, THEN RAISE. SetForegroundWindow does not un-minimise, so on
+                        // a minimised cockpit the old call raised nothing and the click looked
+                        // like it had done nothing at all -- and minimising the cockpit is how
+                        // you get back to this window, so it was the reachable state.
+                        // SW_RESTORE is a no-op when the window is not iconic.
+                        const int SW_SHOW = 5;
+                        if (!IsWindowVisible(target)) ShowWindow(target, SW_SHOW);
+                        ShowWindow(target, SW_RESTORE);
+                        SetForegroundWindow(target);
+                    }
+                    catch { }
+                    return;
+                }
+                // Nothing focusable. If something is mid-start, say so rather than launching a
+                // second cockpit on top of it; otherwise start one.
+                if (starting) return;
+                try { if (File.Exists(exe)) System.Diagnostics.Process.Start(exe); }
+                catch { }
+            });
+        });
     }
 
     // Replace the default WPF button chrome (which forces an unreadable light-blue
