@@ -109,74 +109,94 @@ def is_retryable(outcome) -> bool:
     return outcome in RETRYABLE
 
 
-#: Whether an outcome counts toward a measured pass rate, and on which side.
+#: Whether an outcome counts toward a measured pass rate, and on which side, WHEN NOTHING IS
+#: KNOWN ABOUT WHAT THE WORKER DID. Total over OUTCOMES; `scoring_of` refines it with evidence.
 #:
 #: WHY A THIRD VALUE. Scoring code kept asking one question -- "is this DONE?" -- and every
 #: outcome that was neither a pass nor a failure of the system under test got silently filed
-#: as a failure. Two of those are not failures at all:
+#: as a failure. A run a human stopped is not a failure of the agent; it was not allowed to
+#: finish, and counting it measures the operator.
 #:
-#:   * CANCELLED is a human saying stop. The agent did not fail; it was not allowed to
-#:     finish. Counting it as a failure measures the operator, not the agent.
-#:   * INFRA_STUCK is the outcome invented precisely to mean "our path looked unhealthy" --
-#:     the connection or agent never established. There was no attempt to grade.
+#: WHY THAT IS NOT THE WHOLE ANSWER. Excluding every stopped run is directly gameable, and not
+#: only in theory: people stop the runs that look bad. Whatever is excluded leaves the
+#: denominator, so a habit of stopping doomed runs raises the reported rate without the agent
+#: solving anything more.
 #:
-#: FANOUT WAS ALSO EXCLUDED HERE, AND THAT WAS WRONG. The argument was that a fan-out parent
-#: is done AS A GOAL while its answer comes from the merge, so scoring the parent counts one
-#: goal twice. That is true where the denominator is worker rows. It is false where the
-#: denominator is BENCHMARK INSTANCES: there is one prediction per instance, so excluding a
-#: fan-out parent does not prevent a double count -- it deletes the instance from the
-#: benchmark. A parent that split and whose family merged has an answer, and that answer is
-#: what the instance's patch contains; if no merge result exists, the instance failed to
-#: deliver, which is a failure and not an exclusion. Reported by an external review, verified
-#: against the scoring path.
+#: So exclusion is not a property of the outcome alone. It requires EVIDENCE THAT NO WORK
+#: HAPPENED. A goal stopped before its first turn was mistyped, misfired, or abandoned at the
+#: gate -- nothing was attempted and there is nothing to grade. A goal stopped after several
+#: turns was attempted; the operator watched it and gave up on it, and that judgement is
+#: information about the run, not a reason to delete it from the measurement.
 #:
-#: Everything else stays a failure ON PURPOSE. REFUSED and MAXTURNS are the signals a retry
-#: floor and an effort router exist to act on; moving them out of the denominator would
-#: delete the very quantity those mechanisms are measured against.
+#: The line is drawn at the FIRST TURN rather than at a stopwatch on purpose. Turn count is
+#: already recorded for every worker, it is the currency this environment is billed in, and it
+#: does not stretch with machine load the way a wall-clock threshold does -- under a heavy
+#: fleet, thirty seconds is easily consumed by a mistyped goal that never ran at all.
 SCORING = {
     "DONE": "pass",
-    # A goal that split still owes an answer; see the note above on why this is not an
-    # exclusion. It is scored on whether the family delivered one.
+    # A goal that split still owes an answer -- its family's merge is where that answer comes
+    # from. Excluding it does not prevent a double count where the denominator is benchmark
+    # instances (one prediction per instance); it deletes the instance.
     "FANOUT": "fail",
     "MAXTURNS": "fail",
-    "CANCELLED": "excluded",
+    # Both of the outcomes below are excluded ONLY on evidence of no work; see
+    # EXCLUDED_WITHOUT_WORK. Listed here as failures because that is the side to land on when
+    # the turn count is unknown -- the unknown must not fall toward the answer that flatters.
+    "CANCELLED": "fail",
     "CONTENT_REFUSED": "fail",
     "STUCK": "fail",
-    "INFRA_STUCK": "excluded",
+    "INFRA_STUCK": "fail",
     "REFUSED": "fail",
     "VERIFY_FAILED": "fail",
     "ERROR": "fail",
 }
 
-#: Excluded from the denominator. Read from SCORING rather than hand-listed: a second copy of
-#: this set is a second thing to forget, and the omissions this module exists to prevent were
-#: all omissions from a hand-kept list.
-EXCLUDED_FROM_DENOMINATOR = frozenset(k for k, v in SCORING.items() if v == "excluded")
+#: Outcomes that leave the denominator WHEN THE WORKER TOOK NO TURNS, and only then.
+#:
+#: CANCELLED is a human saying stop. INFRA_STUCK is the outcome invented to mean "our path
+#: looked unhealthy" -- the connection or agent never established. Neither describes an agent
+#: that tried and failed. But neither guarantees an agent that did not try, either: a run
+#: stopped at turn nine was tried, and an INFRA_STUCK after nine turns is a connection that
+#: died mid-work, not one that never opened. The turn count is what separates them, and it is
+#: the only part of this that cannot be argued with after the fact.
+EXCLUDED_WITHOUT_WORK = frozenset({"CANCELLED", "INFRA_STUCK"})
 
 
-def scoring_of(outcome) -> str:
-    """'pass' | 'fail' | 'excluded' for `outcome`. Raises rather than guessing.
+def scoring_of(outcome, turns=None) -> str:
+    """'pass' | 'fail' | 'excluded' for `outcome`, given what the worker actually did.
 
-    FAIL-CLOSED BY CONSTRUCTION. The raise is not defensive politeness: an unlisted outcome
-    must not be able to fall into 'excluded', because that is the direction that quietly
-    RAISES a reported pass rate. A new outcome fails here on the commit that introduces it,
-    which is the moment somebody knows which side it belongs on.
+    `turns` is how many turns the worker took. None means "not recorded", and that resolves to
+    the scored side, never to 'excluded': an unknown must not fall toward the answer that
+    raises the rate, because unknowns are exactly what a broken ledger produces in bulk.
+
+    FAIL-CLOSED BY CONSTRUCTION. The raise below is not defensive politeness: an unlisted
+    outcome must not be able to reach 'excluded'. A new outcome fails here on the commit that
+    introduces it, which is the moment somebody knows which side it belongs on.
     """
     try:
-        return SCORING[outcome]
+        side = SCORING[outcome]
     except (KeyError, TypeError):
         raise UnknownOutcome(
             "outcome %r is not in the closed set; add it to SCORING in relay/outcomes.py "
             "with the side it scores on, rather than letting it default" % (outcome,))
+    if outcome in EXCLUDED_WITHOUT_WORK and turns is not None:
+        try:
+            if int(turns) <= 0:
+                return "excluded"
+        except (TypeError, ValueError):
+            return side
+    return side
 
 
-def tally(outcomes):
-    """Count a run's outcomes into the two rates that must always be reported together.
+def tally(rows):
+    """Count a run's outcomes into the rates that must always be reported together.
 
-    TWO QUESTIONS, NEVER ONE NUMBER -- the same discipline the companion benchmark already
-    holds. Every exclusion added to a suite RAISES `conditional`, because excluding leaves the
-    denominator; three rounds of honest exclusions in the same direction look exactly like
-    three rounds of improvement, and nothing in a single number tells them apart.
+    `rows` may be outcome strings, or (outcome, turns) pairs. A bare string means the turn
+    count was not recorded, which scores rather than excludes -- see `scoring_of`.
+
+    TWO QUESTIONS, NEVER ONE NUMBER. Every exclusion added to a suite RAISES `conditional`,
+    because excluding leaves the denominator; several rounds of honest exclusions look exactly
+    like several rounds of improvement, and nothing in a single number tells them apart.
 
     `conditional` asks what fraction of GRADABLE attempts passed. `end_to_end` asks what
     fraction of everything the caller asked for came back with an answer -- an unhealthy
@@ -185,8 +205,12 @@ def tally(outcomes):
     that did not measure anything.
     """
     counts = {"pass": 0, "fail": 0, "excluded": 0}
-    for o in outcomes:
-        counts[scoring_of(o)] += 1
+    for row in rows:
+        if isinstance(row, (tuple, list)):
+            outcome, turns = (list(row) + [None])[:2]
+        else:
+            outcome, turns = row, None
+        counts[scoring_of(outcome, turns)] += 1
     total = sum(counts.values())
     gradable = counts["pass"] + counts["fail"]
     return {
@@ -208,3 +232,4 @@ assert FINISHED <= OUTCOMES
 assert set(NOT_PRODUCED) <= OUTCOMES
 assert set(SCORING) == OUTCOMES
 assert set(SCORING.values()) <= {"pass", "fail", "excluded"}
+assert EXCLUDED_WITHOUT_WORK <= OUTCOMES

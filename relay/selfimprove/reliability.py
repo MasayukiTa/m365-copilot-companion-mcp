@@ -36,13 +36,19 @@ def wilson(k, n, z=1.96):
     return [round((c - m) / d, 4), round((c + m) / d, 4)]
 
 def live(entries):
-    """Entries with corrections dropped and replicates kept.
+    """Entries with corrections dropped and genuine repeats kept.
 
-    THE SAME RULE THE TREND USES, and for the same reason. Two rows sharing an id and a
-    replicate marker are one measurement made twice, the second replacing a grade known to be
-    wrong; counting both would report a grading-host artifact as instability. Two rows sharing
-    an id with DIFFERENT replicate markers are two independent measurements of one scaffold,
-    which is exactly what a reliability figure is made of.
+    THE SAME RULE THE TREND USES, and for the same reason. Two rows sharing an id and a RUN
+    are one measurement graded twice, the second replacing a grade known to be wrong; counting
+    both would report a grading-host artifact as instability. Two rows sharing an id across
+    DIFFERENT runs are two independent measurements of one scaffold, which is exactly what a
+    reliability figure is made of.
+
+    The run id is minted when a run starts, not declared afterwards. Asking an operator to
+    mark which kind of row this is fails in both directions and leaves no symptom in either:
+    forget it on a real repeat and the earlier row is overwritten, hiding instability that
+    happened; add it to a correction and the corrupt grade stays beside the fixed one,
+    manufacturing instability that did not.
 
     Getting this backwards is not a rounding error in either direction: read corrections as
     repeats and a broken grader looks like a flaky scaffold; read repeats as corrections and
@@ -51,9 +57,9 @@ def live(entries):
     latest = {}
     for i, e in enumerate(entries or []):
         if isinstance(e, dict):
-            latest[(e.get("id"), e.get("replicate"))] = i
+            latest[(e.get("id"), e.get("run_id"))] = i
     return [e for i, e in enumerate(entries or [])
-            if isinstance(e, dict) and latest.get((e.get("id"), e.get("replicate"))) == i]
+            if isinstance(e, dict) and latest.get((e.get("id"), e.get("run_id"))) == i]
 
 
 def _resolved_sets(entries):

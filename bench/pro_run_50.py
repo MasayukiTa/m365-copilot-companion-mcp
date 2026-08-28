@@ -5,7 +5,7 @@ capture git diffs + DELETE the worktrees -> next batch. The dev box has ~8GB fre
 shallow worktrees ever exist at once. Progress -> .fleet/swe/pro_run_50.log; predictions
 accumulate in .fleet/swe/pro_preds_50.json (fed to the the eval host Pro grader afterwards).
 """
-import json, os, subprocess, time
+import json, os, subprocess, time, uuid
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SW = os.path.join(REPO, ".fleet", "swe")
@@ -81,11 +81,29 @@ def main():
         from relay.selfimprove import manifest as _M
         from relay.selfimprove import runtime_config as _RC
         _active = _RC.active_manifest(refresh=True)
+        # A RUN ID, GENERATED HERE, NEVER DECLARED BY ANYONE.
+        #
+        # The archive needed to tell a CORRECTION of a measurement from a genuine REPEAT of
+        # it, and the first attempt asked an operator to say which by passing a flag. That is
+        # a self-report, and a self-report nobody verifies is worse than no field at all: on a
+        # real repeat, forgetting it overwrites the earlier row and hides actual instability;
+        # on a correction, adding it keeps the corrupt grade beside the fixed one and
+        # manufactures instability that never happened. Both directions corrupt pass^k, and
+        # neither leaves a symptom.
+        #
+        # An id minted at launch answers the same question without asking anybody: two rows
+        # from ONE run are the same measurement (so the later corrects the earlier), and rows
+        # from DIFFERENT runs are different measurements. Nothing to remember, nothing to get
+        # wrong.
+        _run_id = uuid.uuid4().hex[:12]
         json.dump({"effort": EFFORT,
+                   "run_id": _run_id,
+                   "started": time.time(),
                    "harness_id": _M.harness_id(_active),
                    "parameters": dict(_active.get("parameters") or {})},
                   open(RUN_CONFIG, "w", encoding="utf-8"), ensure_ascii=False)
-        log("arm: effort=%s harness=%s" % (EFFORT, _M.harness_id(_active)[:16]))
+        log("arm: effort=%s harness=%s run=%s"
+            % (EFFORT, _M.harness_id(_active)[:16], _run_id))
     except Exception as exc:
         # Never fatal: this run must still happen. But say so, because a missing arm record
         # is the state the recorder has to refuse to guess its way out of.

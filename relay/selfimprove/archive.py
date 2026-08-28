@@ -250,7 +250,7 @@ class Archive:
 
     def add(self, genome: dict, *, slice_ids, pass_at_1, ci=None, gate_verdict=None,
             descriptors=None, ts=None, note=None, resolved_ids=None,
-            replicate=None, measurement=None) -> str:
+            run_id=None, measurement=None) -> str:
         """Append a validated genome and return its id.
 
         Entry = {"id", "genome", "parent_id", "slice_ids", "pass_at_1", "ci", "gate_verdict",
@@ -275,21 +275,28 @@ class Archive:
         answers; none of them can be recovered from a rate afterwards. Optional, because rows
         written before this existed genuinely do not have it and must not be given one.
 
-        `replicate` says THIS ROW IS ANOTHER MEASUREMENT OF THE SAME SCAFFOLD, and it exists
-        because the id could not carry that meaning. The id is a hash of knobs and cards, so
-        an honest re-run of one configuration produces a second row with the SAME id -- which
-        the supersede rule then reads as "the earlier grade was wrong and this replaces it".
-        That rule is right and was written for a real accident: a corrupted grade of 0.34 was
-        re-run at 0.50, and the trend drew a measurement error as a 16-point improvement.
+        `run_id` identifies the RUN this measurement came from, and it is what lets the
+        archive tell a correction from a repeat without asking anybody.
 
-        But one shape was carrying two meanings. A correction REPLACES; a replicate
-        ACCUMULATES. Nothing in the row said which, so the archive had to assume, and it
-        assumed correction -- with the consequence that k could never reach 2 and no
-        reliability measure was computable from this archive at all.
+        The problem it solves: a genome id is a hash of knobs and cards, so an honest re-run
+        of one configuration writes a second row with the SAME id -- which the supersede rule
+        reads as "the earlier grade was wrong and this replaces it". That rule is right and
+        was written for a real accident: a corrupted grade of 0.34 was re-run at 0.50, and the
+        trend drew a measurement error as a 16-point improvement. But one shape was carrying
+        two meanings, and nothing in the row said which.
 
-        None (the default) keeps the old meaning exactly: a correction, superseding. An
-        integer marks an independent repeat, which supersedes nothing and is what pass^k
-        counts.
+        The first attempt at fixing that asked an operator to declare it with a flag. A
+        self-report nobody verifies is worse than no field at all: forget it on a real repeat
+        and the earlier row is overwritten, hiding instability that happened; add it to a
+        correction and the corrupt grade is kept beside the fixed one, manufacturing
+        instability that did not. Both corrupt pass^k and neither leaves a symptom.
+
+        A run id is not a declaration. It is minted when a run starts, so two rows carrying it
+        are two gradings of ONE run -- a correction, superseding -- and rows carrying
+        different ids are different runs, which is what a repeat is. Nobody has to remember
+        anything, and nobody can be wrong about it.
+
+        None means the row predates this, and keeps the historical behaviour: superseding.
 
         `measurement` carries the qualifications the headline rate depends on -- the
         end-to-end rate, what was excluded and why, and how much of the ledger the run could
@@ -310,9 +317,9 @@ class Archive:
             # same as "none passed" and must never be read as an empty set.
             "resolved_ids": (sorted(set(resolved_ids) & set(slice_ids))
                              if resolved_ids is not None else None),
-            # None = a correction of the row it shares an id with (the historical meaning);
-            # an integer = an independent repeat, which supersedes nothing.
-            "replicate": (int(replicate) if replicate is not None else None),
+            # Which RUN produced this measurement. Same genome + same run = a
+            # correction; same genome + different run = an independent repeat.
+            "run_id": (str(run_id) if run_id else None),
             # The rate is CONDITIONAL on a gradable attempt. The name is kept for the rows
             # already written under it; `measurement` carries what qualifies it.
             "pass_at_1": pass_at_1,

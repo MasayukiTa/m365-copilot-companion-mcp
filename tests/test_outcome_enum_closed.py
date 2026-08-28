@@ -147,27 +147,46 @@ def test_an_unlisted_outcome_raises_rather_than_being_excluded():
         scoring_of("AN_OUTCOME_NOBODY_HAS_CLASSIFIED")
 
 
-def test_a_human_stop_is_not_scored_as_a_failure():
-    """CANCELLED is a human saying stop. Counting it against the agent measures the operator."""
+def test_a_human_stop_before_any_work_is_not_scored_as_a_failure():
+    """A goal stopped at turn zero was mistyped, misfired, or abandoned at the gate. Nothing
+    was attempted, so there is nothing to grade."""
     from relay.outcomes import scoring_of
-    assert scoring_of("CANCELLED") == "excluded"
+    assert scoring_of("CANCELLED", 0) == "excluded"
 
 
-def test_a_path_that_never_established_is_not_scored_as_a_failure():
-    """INFRA_STUCK exists precisely to mean 'our path looked unhealthy'. There was no attempt
-    to grade -- this is the misreport the outcome was invented to prevent, in the scoring
-    dimension rather than the reporting one."""
+def test_a_human_stop_after_work_IS_scored_as_a_failure():
+    """THE PROPERTY THAT KEEPS THIS FROM BEING GAMEABLE. People stop the runs that look bad,
+    and whatever is excluded leaves the denominator -- so excluding every stopped run raises
+    the reported rate for a habit rather than for a capability."""
     from relay.outcomes import scoring_of
-    assert scoring_of("INFRA_STUCK") == "excluded"
+    assert scoring_of("CANCELLED", 1) == "fail"
+    assert scoring_of("CANCELLED", 11) == "fail"
+
+
+def test_an_unrecorded_turn_count_scores_rather_than_excludes():
+    """The unknown must not fall toward the answer that flatters. A broken ledger produces
+    unknowns in bulk, and that must not read as a clean run."""
+    from relay.outcomes import scoring_of
+    assert scoring_of("CANCELLED") == "fail"
+    assert scoring_of("CANCELLED", None) == "fail"
+    assert scoring_of("CANCELLED", "not a number") == "fail"
+
+
+def test_a_path_that_never_established_follows_the_same_rule():
+    """INFRA_STUCK after nine turns is a connection that died MID-WORK, not one that never
+    opened -- and that classification is exactly where a hard-task timeout could be quietly
+    absorbed to escape the denominator."""
+    from relay.outcomes import scoring_of
+    assert scoring_of("INFRA_STUCK", 0) == "excluded"
+    assert scoring_of("INFRA_STUCK", 9) == "fail"
 
 
 def test_a_fanout_parent_still_owes_an_answer():
-    """This was excluded on a double-count argument that holds only where the denominator is
+    """Excluded once on a double-count argument that holds only where the denominator is
     worker rows. Where it is benchmark instances -- one prediction per instance -- excluding a
-    fan-out parent does not prevent a double count, it deletes the instance. A family that
-    merged has an answer; a family that did not has failed to deliver."""
+    fan-out parent does not prevent a double count, it deletes the instance."""
     from relay.outcomes import scoring_of
-    assert scoring_of("FANOUT") == "fail"
+    assert scoring_of("FANOUT", 1) == "fail"
 
 
 def test_the_signals_a_retry_floor_measures_stay_in_the_denominator():
@@ -180,18 +199,20 @@ def test_the_signals_a_retry_floor_measures_stay_in_the_denominator():
         assert scoring_of(outcome) == "fail", outcome
 
 
-def test_the_excluded_set_is_read_from_the_mapping_not_hand_kept():
-    """A second copy of the list is a second thing to forget. Every omission this module was
-    written to prevent was an omission from a hand-kept set."""
-    from relay.outcomes import SCORING, EXCLUDED_FROM_DENOMINATOR
-    assert EXCLUDED_FROM_DENOMINATOR == {k for k, v in SCORING.items() if v == "excluded"}
+def test_nothing_is_excluded_on_the_strength_of_its_outcome_alone():
+    """Exclusion is a claim about what HAPPENED, not about how a run was labelled. Every
+    outcome scores until a turn count says no work was done."""
+    from relay.outcomes import SCORING, EXCLUDED_WITHOUT_WORK, OUTCOMES
+    assert "excluded" not in set(SCORING.values())
+    assert EXCLUDED_WITHOUT_WORK <= OUTCOMES
 
 
 def test_tally_reports_both_rates_and_the_health_of_the_measurement():
     """TWO QUESTIONS, NEVER ONE NUMBER. `conditional` rises when work is excluded; `end_to_end`
     cannot. Reporting only the first makes an unhealthy environment look like progress."""
     from relay.outcomes import tally
-    t = tally(["DONE", "DONE", "STUCK", "CANCELLED", "INFRA_STUCK", "FANOUT"])
+    t = tally([("DONE", 2), ("DONE", 4), ("STUCK", 3), ("CANCELLED", 0),
+               ("INFRA_STUCK", 0), ("FANOUT", 1)])
     assert t["gradable"] == 4 and t["total"] == 6
     assert t["conditional"] == pytest.approx(2 / 4)
     assert t["end_to_end"] == pytest.approx(2 / 6)
@@ -202,10 +223,17 @@ def test_excluding_work_raises_the_conditional_rate_but_not_end_to_end():
     """The specific confusion the two rates exist to separate, stated as an executable fact:
     swapping a failure for an exclusion improves `conditional` while `end_to_end` holds."""
     from relay.outcomes import tally
-    before = tally(["DONE", "STUCK"])
-    after = tally(["DONE", "CANCELLED"])
+    before = tally([("DONE", 1), ("STUCK", 3)])
+    after = tally([("DONE", 1), ("CANCELLED", 0)])
     assert after["conditional"] > before["conditional"]
     assert after["end_to_end"] == before["end_to_end"]
+
+
+def test_tally_accepts_bare_outcomes_and_treats_them_as_unknown_work():
+    """Older callers pass outcome strings. They must keep working, and must land on the scored
+    side rather than the excluded one."""
+    from relay.outcomes import tally
+    assert tally(["CANCELLED", "CANCELLED"])["excluded"] == 0
 
 
 def test_an_empty_run_reports_no_rate_rather_than_a_perfect_one():
