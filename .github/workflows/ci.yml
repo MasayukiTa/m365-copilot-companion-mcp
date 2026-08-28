@@ -269,6 +269,7 @@ jobs:
             bridge/test_session_fields_persist.py \
             bridge/test_switch_moves_the_session.py \
             bridge/test_turn_goes_to_its_own_session.py \
+            ui/test_slash_setting_on_every_path.py \
             tests/test_identity_guard_reports_every_hit.py \
             tests/test_steer_delivery.py \
             tests/test_steer_followup.py \
