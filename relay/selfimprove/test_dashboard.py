@@ -202,7 +202,11 @@ def test_all_sections_degrade_to_empty():
     # render_text must still produce a clean ASCII scorecard, not crash
     text = D.render_text(st)
     assert text.isascii() and "no data" not in text.lower()  # empty state still renders a scorecard
-    assert "latest pass@1 : n/a" in text
+    # END-TO-END IS THE HEADLINE. An empty archive has no end-to-end rate, and "not recorded"
+    # is the honest word: deriving one from the conditional rate would assume nothing was ever
+    # excluded, which is the assumption the pair exists to stop making.
+    assert "latest        : not recorded" in text
+    assert "pass@1: n/a" in text
     assert "persona leak  : " in text                        # quality headline line present and ASCII
     print("ok test_all_sections_degrade_to_empty")
 
@@ -325,8 +329,11 @@ def test_the_scorecard_shows_both_metrics_and_names_what_each_asks():
     that solves the same 40% every run."""
     from relay.selfimprove.dashboard import dashboard_state, render_text
     text = render_text(dashboard_state())
-    assert "pass@1" in text and "pass^" in text
-    assert "capability" in text and ("reliability" in text or "not measured" in text)
+    assert "pass@1" in text and "pass^" in text and "end-to-end" in text
+    # The two rates must be LABELLED with what separates them, because the whole hazard is
+    # that they look interchangeable: excluding work raises one and cannot raise the other.
+    assert "excluding RAISES this" in text
+    assert "reliability" in text or "not measured" in text
 
 
 def test_an_unmeasured_reliability_says_so_rather_than_printing_a_number():

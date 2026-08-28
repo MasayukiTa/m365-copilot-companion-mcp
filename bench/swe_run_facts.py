@@ -70,12 +70,20 @@ def _mentions_path(text: str, path: str) -> bool:
         start = i + 1
 
 
-def facts_from_history(wt_map, history_rows):
+def facts_from_history(wt_map, history_rows, since=None):
     """instance_id -> {outcome, turns, attempts} for every instance the ledger knows about.
 
     `outcome` is the BEST outcome across attempts, under the same rule the fleet already uses
     to collapse retries: a DONE anywhere in the family is the answer, and a later failure does
     not retract an earlier success.
+
+    `since` is the epoch time this run started. Rows older than it are DROPPED, and rows with
+    no timestamp are dropped too while scoping is active -- keeping an undateable row is the
+    unsafe direction, because the whole point is to stop an older run's data entering this
+    one. Without it the ledger is global: a stale DONE from a previous run made an instance
+    immortally solved, and turn counts accumulated over the lifetime of the worktree path
+    rather than over this measurement. Passing None keeps the old, unscoped behaviour, which
+    the recorder reports as a problem rather than performing silently.
 
     `turns` is the SUM across attempts, and the asymmetry with `outcome` is deliberate. The
     two fields answer different questions: "did this instance get solved" is about the best
@@ -101,6 +109,13 @@ def facts_from_history(wt_map, history_rows):
 
     facts = {}
     for row in history_rows or []:
+        if since is not None:
+            ts = row.get("ts")
+            try:
+                if ts is None or float(ts) < float(since):
+                    continue
+            except (TypeError, ValueError):
+                continue
         # `cwd` FIRST when the record carries it. The fleet's final snapshot writes the
         # worker's working directory precisely so an orchestrator can map workers back to
         # instances, which makes it an exact key rather than a substring guess. The thinner
@@ -136,10 +151,49 @@ def facts_from_history(wt_map, history_rows):
         except (TypeError, ValueError):
             pass
         outcome = row.get("outcome")
-        # DONE wins and is never retracted; otherwise the most recent word stands.
-        if f["outcome"] != "DONE" and outcome:
-            f["outcome"] = outcome
+        if outcome:
+            f["outcome"] = _better_outcome(f["outcome"], outcome)
     return facts
+
+
+#: Rank of an outcome when several attempts disagree. Higher wins.
+#:
+#: "DONE wins, otherwise the last word stands" was not a ranking at all -- it left every
+#: non-DONE pair undefined, so which of a CANCELLED and a STUCK survived depended on the order
+#: the ledger happened to be written in. That matters because the two score differently: an
+#: excludable outcome can leave the denominator and a failure cannot, so ledger order was
+#: silently deciding the size of the denominator.
+#:
+#: The order below is not a judgement about severity. It is fail-closed: an attempt that
+#: produced a SCORED outcome outranks one that could be excluded, so an instance leaves the
+#: denominator only when NO attempt on it was scoreable. Everything else keeps the most
+#: recent word, which is what the old rule did for the one case it covered.
+_OUTCOME_RANK = {
+    "CANCELLED": 0,       # excludable -- lowest, so any real attempt outranks it
+    "INFRA_STUCK": 0,
+    "ERROR": 1,
+    "ContentRefusedPlaceholder": 1,
+    "CONTENT_REFUSED": 1,
+    "REFUSED": 1,
+    "STUCK": 1,
+    "MAXTURNS": 1,
+    "VERIFY_FAILED": 1,
+    "FANOUT": 2,          # the family owes an answer; more informative than a bare failure
+    "DONE": 3,            # never retracted by a later failure
+}
+
+
+def _better_outcome(current, candidate):
+    """The outcome that should represent an instance, given two attempts' worth of evidence."""
+    if not current:
+        return candidate
+    a = _OUTCOME_RANK.get(current, 1)
+    b = _OUTCOME_RANK.get(candidate, 1)
+    if b > a:
+        return candidate
+    if b < a:
+        return current
+    return candidate      # same rank: the most recent word stands
 
 
 def join_report(graded_ids, facts):
@@ -158,7 +212,7 @@ def join_report(graded_ids, facts):
     }
 
 
-def load(wtmap_path, history_path):
+def load(wtmap_path, history_path, since=None):
     """Read both ledgers from disk. Missing files yield empty facts, never an exception --
     an old run has no ledger to read, and that must degrade to 'no facts', which `join_report`
     then reports as zero coverage rather than as a healthy run."""
@@ -176,4 +230,4 @@ def load(wtmap_path, history_path):
     if not isinstance(hist, list):
         hist = hist.get("runs") if isinstance(hist, dict) else []
         hist = hist or []
-    return facts_from_history(wt, hist)
+    return facts_from_history(wt, hist, since=since)
