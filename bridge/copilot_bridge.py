@@ -3685,6 +3685,16 @@ class Handler(BaseHTTPRequestHandler):
     def _do_switch(self, parsed):
         # THE SOCKET IS KEYED TO A CONVERSATION. Switching moves PAGE and ACTIVE_SID and told
         # the driver nothing, so the next message went to the conversation we just left.
+        #
+        # EXCEPT IT DID NOT MOVE ACTIVE_SID. That sentence described /new and /resume, which
+        # both assign it; this handler never did. And this is the UI's main path -- the
+        # cockpit chat calls /switch when you click a conversation and again before sending
+        # into one; it never calls /resume. So opening conversation B and typing left the
+        # page on B while ACTIVE_SID still said A, and the turn was recorded against A's
+        # transcript. The one check that would have noticed -- comparing the pane's guid to
+        # the stored one in _persist_exchange -- is silent whenever the page has been
+        # released, which is the default.
+        global ACTIVE_SID
         release_socket_driver("/switch")
         url = (urllib.parse.parse_qs(parsed.query).get("url") or [""])[0]
         ok = False
@@ -3694,7 +3704,34 @@ class Handler(BaseHTTPRequestHandler):
                 ok = _goto_settled(url)     # recover from SSO-redirect landings
         except Exception as e:
             self._json({"ok": False, "error": str(e)}); return
-        self._json({"ok": ok, "url": PAGE.url})
+
+        # THE SESSION FOLLOWS THE PAGE, and only when the page actually moved: pointing
+        # ACTIVE_SID at a conversation we failed to open would put turns somewhere the user
+        # is not looking, which is the same defect facing the other way.
+        #
+        # find_by_conv_url matches on the conversation guid, so it finds a row whether the
+        # stored reference is a page URL or the socket's "sess:<guid>" form.
+        moved_to = ""
+        if ok and url:
+            try:
+                found = S.find_by_conv_url(url)
+                if found:
+                    moved_to = found
+                    if found != ACTIVE_SID:
+                        logger.info("switch: active session %s -> %s",
+                                    logsafe(ACTIVE_SID), logsafe(found))
+                    ACTIVE_SID = found
+                    S.touch(found, status="active")
+                else:
+                    # NO ROW FOR THIS CONVERSATION. Adopting it here would mint sessions from
+                    # any URL a caller passes; /adopt exists for that and says so. What must
+                    # not happen is carrying on in silence, because then the next turn lands
+                    # in whatever session was active before and nothing says otherwise.
+                    logger.warning("switch: no session row for the conversation just opened; ACTIVE_SID stays %s, so turns will be recorded against it -- use /adopt to bind this conversation to a session",
+                                   logsafe(ACTIVE_SID))
+            except Exception as exc:
+                logger.warning("switch: could not resolve a session for the new conversation (%s); ACTIVE_SID left at %s", type(exc).__name__, logsafe(ACTIVE_SID))
+        self._json({"ok": ok, "url": PAGE.url, "sid": moved_to or (ACTIVE_SID or "")})
 
     def _do_adopt(self, parsed):
         release_socket_driver("/adopt")
@@ -4433,6 +4470,26 @@ class Handler(BaseHTTPRequestHandler):
         was split out of _stream_text -- callers own the Esc/Stop-button + error-SSE handling.
         """
         global _LAST_USER_TURN_TS, _BRIDGE_UNLOCK_ATTEMPTS, _BRIDGE_UNLOCK_PREFLIGHT_DONE
+
+        # THE TURN GOES WHERE IT WAS ADDRESSED, OR IT DOES NOT GO. `sid` names the session
+        # this message belongs to; the send below goes to whatever conversation the driver
+        # is currently on, which is ACTIVE_SID's. Nothing checked that those agreed.
+        #
+        # Reachable, not theoretical: /send takes `sid` straight from the query string and
+        # queues under it, and session_cli's goal loop passes list_sessions()[0], which is
+        # chosen by a different rule than ACTIVE_SID. When they differ the message is spoken
+        # into one conversation and written into another's transcript -- so the record says
+        # a thing was asked where it was not, and the person reading either one is misled.
+        #
+        # Refusing is right here because sending is the irreversible half. The caller
+        # re-queues, and the message waits for the session it was addressed to. This is the
+        # only place that sends a turn (see _drain_pending_queue's note), so one check
+        # covers every path.
+        if sid and ACTIVE_SID and sid != ACTIVE_SID:
+            logger.warning("refusing to send a turn queued for sid=%s while sid=%s is active -- it would go to a different conversation than the one it is recorded against",
+                           logsafe(sid), logsafe(ACTIVE_SID))
+            return {"wrong_session": True, "queued_for": sid, "active": ACTIVE_SID}
+
         _LAST_USER_TURN_TS = time.time()   # see its module-level docstring: the tool probe reads this
         _turn_sent_at = _LAST_USER_TURN_TS  # boundary for the lock check at the end of this turn
         turn_payload = msg
@@ -4819,7 +4876,12 @@ class Handler(BaseHTTPRequestHandler):
         S.append_turn/S.touch, same as a normal turn, so /history and the session transcript
         stay complete. Exception-guarded per item -- one bad queued input must not abandon the
         rest of the queue or crash the server loop."""
-        for item in drain_pending_once(sid):
+        # POPPED UP FRONT, ALL OF THEM. drain_pending_once empties the queue and hands back a
+        # list, so anything not delivered has to be put back explicitly -- breaking out of the
+        # loop drops every item after the current one. That is how the first version of the
+        # wrong-session guard below lost messages, and the test caught it.
+        queued = drain_pending_once(sid)
+        for index, item in enumerate(queued):
             try:
                 # ONE PLACE THAT SENDS A TURN. This called _send_and_stream_once directly,
                 # which meant every queued input -- steering during a /goal run, and now every
@@ -4835,6 +4897,16 @@ class Handler(BaseHTTPRequestHandler):
                 # already forgotten three.
                 final = self._run_one_turn(sid, item, stream_out=False)
                 if isinstance(final, dict):
+                    if final.get("wrong_session"):
+                        # NOT DELIVERED, so it must not be lost either. Put it back and stop
+                        # draining this session: every remaining item is addressed to the
+                        # same place and would be refused for the same reason, and popping
+                        # them one at a time only to re-queue them churns the store.
+                        for missed in queued[index:]:
+                            _queue_input_locked(sid, missed)
+                        logger.warning("drain_pending_queue: sid=%s is not the active session; "
+                                       "%d message(s) stay queued", logsafe(sid), len(queued) - index)
+                        break
                     # {"consent_failed": True}: a card that could not be auto-approved. Nothing
                     # to persist, and the next queued item may still be fine.
                     logger.warning("drain_pending_queue: consent not auto-approved for sid=%s",

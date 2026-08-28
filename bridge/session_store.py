@@ -126,6 +126,27 @@ def _connect():
     return conn
 
 
+#: Columns added after the table was first shipped. CREATE TABLE IF NOT EXISTS does not
+#: alter an existing table, so a database made before these existed keeps its old shape
+#: and every write of them fails -- which is the same silent loss, one layer down.
+_ADDED_SESSION_COLUMNS = (
+    ("mode", "TEXT NOT NULL DEFAULT ''"),
+    ("goal", "TEXT NOT NULL DEFAULT ''"),
+    ("source", "TEXT NOT NULL DEFAULT ''"),
+)
+
+
+def _migrate(conn):
+    """Add columns an older database is missing. Idempotent, and never destructive."""
+    have = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+    for name, decl in _ADDED_SESSION_COLUMNS:
+        if name in have:
+            continue
+        # ALTER TABLE ADD COLUMN only appends, so existing rows keep every value they had
+        # and take the default for the new one. No data is rewritten.
+        conn.execute("ALTER TABLE sessions ADD COLUMN %s %s" % (name, decl))
+
+
 def _initialize(conn):
     conn.executescript(
         """
@@ -138,7 +159,17 @@ def _initialize(conn):
             status         TEXT NOT NULL DEFAULT 'active',
             turns          INTEGER NOT NULL DEFAULT 0,
             transcript     TEXT NOT NULL DEFAULT '',
-            pending_json   TEXT NOT NULL DEFAULT '[]'
+            pending_json   TEXT NOT NULL DEFAULT '[]',
+            -- WHAT THE SESSION IS DOING, and what it was asked to do. touch() has been
+            -- called with mode= and goal= since /goal was written; there were no columns
+            -- to put them in, so _write_session dropped them and every reader got None.
+            -- Three consequences, all silent: resume_eligibility could never see
+            -- mode=="interrupted", so /goal?resume=1 was unreachable code; the startup
+            -- crash check compared mode against "working" and never matched; and the
+            -- touch(mode="interrupted") meant to mark a crashed goal was never reached.
+            mode           TEXT NOT NULL DEFAULT '',
+            goal           TEXT NOT NULL DEFAULT '',
+            source         TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS turns (
             sid   TEXT NOT NULL,
@@ -165,6 +196,7 @@ def _initialize(conn):
         CREATE INDEX IF NOT EXISTS fleet_turns_ts_idx ON fleet_turns(ts DESC);
         """
     )
+    _migrate(conn)
 
 
 def _db(import_files=True):
@@ -267,26 +299,40 @@ def _row_to_session(row):
         "turns": row["turns"],
         "transcript": row["transcript"],
         "pending": json.loads(row["pending_json"] or "[]"),
+        "mode": _col(row, "mode"),
+        "goal": _col(row, "goal"),
+        "source": _col(row, "source"),
     }
+
+
+def _col(row, name, default=""):
+    """A column that may predate this build. Missing means an unmigrated row, not a value."""
+    try:
+        value = row[name]
+    except (IndexError, KeyError):
+        return default
+    return default if value is None else value
 
 
 def _write_session(conn, sess):
     conn.execute(
         """INSERT INTO sessions
                (sid, title, conv_url, created_ts, last_active_ts, status, turns,
-                transcript, pending_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                transcript, pending_json, mode, goal, source)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(sid) DO UPDATE SET
                title=excluded.title, conv_url=excluded.conv_url,
                created_ts=excluded.created_ts, last_active_ts=excluded.last_active_ts,
                status=excluded.status, turns=excluded.turns,
-               transcript=excluded.transcript, pending_json=excluded.pending_json""",
+               transcript=excluded.transcript, pending_json=excluded.pending_json,
+               mode=excluded.mode, goal=excluded.goal, source=excluded.source""",
         (sess["sid"], sess.get("title", ""), sess.get("conv_url", ""),
          float(sess.get("created_ts") or time.time()),
          float(sess.get("last_active_ts") or time.time()),
          sess.get("status", "active"), int(sess.get("turns") or 0),
          sess.get("transcript", "") or _transcript_ref(sess["sid"]),
-         json.dumps(list(sess.get("pending") or []), ensure_ascii=False)))
+         json.dumps(list(sess.get("pending") or []), ensure_ascii=False),
+         sess.get("mode") or "", sess.get("goal") or "", sess.get("source") or ""))
 
 
 def new_session(title=""):
@@ -303,6 +349,12 @@ def new_session(title=""):
         "turns": 0,
         "transcript": _transcript_ref(sid),
         "pending": [],
+        # THE SAME KEYS load() RETURNS. A fresh session and a loaded one must be the same
+        # shape -- bridge/test_session_store.py compares them directly, and it caught this
+        # the moment the three new columns were added on one side only.
+        "mode": "",
+        "goal": "",
+        "source": "",
     }
     conn = _db()
     try:
