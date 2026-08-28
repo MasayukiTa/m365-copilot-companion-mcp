@@ -252,3 +252,55 @@ def test_records_without_a_slice_number_are_left_alone():
 def test_collapsing_keeps_the_slices_in_order():
     out = fo.collapse_retries([_r(3, "DONE", "c"), _r(1, "DONE", "a"), _r(2, "DONE", "b")])
     assert [r["subtask_index"] for r in out] == [1, 2, 3]
+
+
+# ---- a candidate is not a retry ----------------------------------------------------------
+
+def _cand(idx, outcome, cand=None, result=""):
+    rec = {"subtask_index": idx, "outcome": outcome, "result": result, "finished": True}
+    if cand is not None:
+        rec["candidate_index"] = cand
+    return rec
+
+
+def test_best_of_n_candidates_all_survive_the_collapse():
+    """THE MEASURED DEFECT. best-of-N runs one goal N times on purpose, so N workers carry the
+    same slice number -- and this function read that as a family retried N-1 times. Three DONE
+    records went in and one came out, the first. The candidates never reached the selector,
+    which is the entire mechanism, and nothing in the output said any had been dropped."""
+    out = fo.collapse_retries([_cand(1, "DONE", 1, "a"), _cand(1, "DONE", 2, "b"),
+                               _cand(1, "DONE", 3, "c")])
+    assert len(out) == 3
+    assert sorted(r["result"] for r in out) == ["a", "b", "c"]
+
+
+def test_a_retry_of_one_candidate_still_collapses():
+    """The rule was never wrong -- the relationships are different. A retry REPLACES the
+    attempt before it; a candidate SITS BESIDE it."""
+    out = fo.collapse_retries([_cand(1, "STUCK", 2), _cand(1, "DONE", 2, "won"),
+                               _cand(1, "DONE", 1, "other")])
+    assert len(out) == 2
+    assert {r.get("candidate_index") for r in out} == {1, 2}
+    assert [r["result"] for r in out if r["candidate_index"] == 2] == ["won"]
+
+
+def test_records_without_a_candidate_number_behave_exactly_as_before():
+    """Every record written before this existed has no candidate number, and their collapsing
+    must not change by a single case."""
+    out = fo.collapse_retries([_cand(1, "STUCK"), _cand(1, "DONE", result="fixed")])
+    assert len(out) == 1 and out[0]["result"] == "fixed"
+
+
+def test_candidates_and_plain_slices_coexist():
+    out = fo.collapse_retries([_cand(1, "DONE", 1), _cand(1, "DONE", 2), _cand(2, "DONE")])
+    assert len(out) == 3
+    assert [r["subtask_index"] for r in out] == [1, 1, 2]
+
+
+def test_the_order_is_stable_across_slices_and_candidates():
+    """A family has to read the same way every time, or a merge prompt built from it changes
+    for reasons that have nothing to do with the work."""
+    out = fo.collapse_retries([_cand(2, "DONE", 2), _cand(1, "DONE", 2),
+                               _cand(2, "DONE", 1), _cand(1, "DONE", 1)])
+    assert [(r["subtask_index"], r["candidate_index"]) for r in out] == [
+        (1, 1), (1, 2), (2, 1), (2, 2)]

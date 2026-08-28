@@ -160,14 +160,27 @@ def collapse_retries(records):
 
     A DONE beats anything else for the same slice. Records with no slice number are left
     alone: there is nothing to collapse them against.
+
+    A CANDIDATE IS NOT A RETRY, and the key says so. best-of-N runs the SAME goal text N times
+    on purpose and keeps every answer for a selector to choose between -- but N such workers
+    carry the same slice number, so this function saw a family that had been retried N-1 times
+    and collapsed it to one. Measured before the fix: three DONE records on one slice went in
+    and one came out, the first. The candidates never reached the selector, which is the whole
+    mechanism, and nothing in the output said any had been dropped.
+    The rule is not wrong; the two relationships are simply different. A retry REPLACES the
+    attempt before it and a candidate SITS BESIDE it, so they cannot share a key. Adding
+    `candidate_index` to the key keeps retries of one candidate collapsing exactly as before
+    -- absent means None, which is what every existing record has -- while different
+    candidates never collapse into each other.
     """
     best: dict[Any, dict] = {}
     loose = []
     for rec in records:
-        key = rec.get("subtask_index")
-        if key is None:
+        idx = rec.get("subtask_index")
+        if idx is None:
             loose.append(rec)
             continue
+        key = (idx, rec.get("candidate_index"))
         current = best.get(key)
         if current is None:
             best[key] = rec
@@ -175,7 +188,11 @@ def collapse_retries(records):
         if (current.get("outcome") or "").upper() != "DONE" and \
                 (rec.get("outcome") or "").upper() == "DONE":
             best[key] = rec
-    return sorted(best.values(), key=lambda r: r.get("subtask_index")) + loose
+    # Ordered by slice, then by candidate, so a family reads in a stable order whether or not
+    # candidates are in play. `or 0` because the ordinary record has no candidate number.
+    return sorted(best.values(),
+                  key=lambda r: (r.get("subtask_index"),
+                                 r.get("candidate_index") or 0)) + loose
 
 
 def ready_to_aggregate(records):
