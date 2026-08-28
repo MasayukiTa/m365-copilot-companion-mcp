@@ -292,7 +292,94 @@ def render(s: dict, first: dict, elapsed_min: float) -> str:
     return "\n".join(lines)
 
 
-def guard(log_path: str, interval: float, since: str) -> int:
+def _release_idle_fleet_edge(say):
+    """Close the fleet browser when nothing is using it. Off unless --release-idle-edge.
+
+    OFF BY DEFAULT, AND THAT IS THE DESIGN, not caution about an unfinished feature. This
+    kills a browser other processes may be about to use, and the decision rests on reading
+    a status file and a process list correctly. relay/idle_edge.py refuses on every kind of
+    doubt -- but a guard that quietly starts closing browsers because it was left running
+    is a surprise nobody asked for. Somebody turns this on.
+
+    Measured 2026-08-28: the fleet Edge held 273 MB for one about:blank with no run in
+    flight. The bridge's is NOT touched -- see relay/idle_edge.py for why that one stays.
+    """
+    try:
+        from relay.idle_edge import FLEET_CDP_PORT, may_release
+    except Exception as exc:
+        say("idle-release unavailable (%s)" % type(exc).__name__)
+        return
+    try:
+        status = None
+        path = os.path.join(".fleet", "status.json")
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as fh:
+                status = json.load(fh)
+        pages = _page_count(FLEET_CDP_PORT)
+        ok, why = may_release(status, pages=pages)
+        if not ok:
+            return                      # quiet: the common case is 'a run is in flight'
+        say("releasing the idle fleet browser on :%d (%s)" % (FLEET_CDP_PORT, why))
+        _kill_edge_on(FLEET_CDP_PORT, say)
+    except Exception as exc:
+        say("idle-release skipped: %s: %s" % (type(exc).__name__, str(exc)[:120]))
+
+
+def _page_count(port):
+    """Open pages on that CDP port, or None when it cannot be asked."""
+    try:
+        import urllib.request
+        with urllib.request.urlopen("http://127.0.0.1:%d/json/list" % port,
+                                    timeout=3) as fh:
+            return len([t for t in json.load(fh) if t.get("type") == "page"])
+    except Exception:
+        return None
+
+
+def _kill_edge_on(port, say):
+    """End the browser holding that CDP port, and nothing else.
+
+    Not edge_recover.hard_reset: that one relaunches, which is right for recovery and
+    exactly wrong here -- the point is to stop paying for a browser nobody is using.
+
+    The process tree is identified from the port on its own command line, so a browser
+    started for another purpose cannot be caught by a name match.
+    """
+    try:
+        import psutil
+    except Exception:
+        say("psutil missing; not releasing anything")
+        return
+    roots = []
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            if "msedge" not in (proc.info.get("name") or "").lower():
+                continue
+            cmd = " ".join(proc.info.get("cmdline") or [])
+            if "--remote-debugging-port=%d" % port not in cmd:
+                continue
+            if "--type=" in cmd:
+                continue                # a child; killing the root takes the tree
+            roots.append(psutil.Process(proc.info["pid"]))
+        except Exception:
+            continue
+    if not roots:
+        say("no browser found on :%d" % port)
+        return
+    for root in roots:
+        try:
+            kids = root.children(recursive=True)
+        except Exception:
+            kids = []
+        for proc in kids + [root]:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+    say("released %d browser tree(s) on :%d" % (len(roots), port))
+
+
+def guard(log_path: str, interval: float, since: str, release_idle_edge: bool = False) -> int:
     """Sample forever, record everything, and say something only when an invariant breaks.
 
     Two files, because they answer different questions. The .jsonl is the record -- every
@@ -329,6 +416,8 @@ def guard(log_path: str, interval: float, since: str) -> int:
                 open_breaches[kind] = detail
             for kind in [k for k in open_breaches if k not in vs]:
                 say("CLEARED %-9s (was: %s)" % (kind, open_breaches.pop(kind)))
+            if release_idle_edge:
+                _release_idle_fleet_edge(say)
             time.sleep(interval)
     except KeyboardInterrupt:
         say("guard stopped")
@@ -414,6 +503,10 @@ def main(argv=None) -> int:
     #
     # Two hours is longer than any comparison run here has needed and short enough that a
     # forgotten one is gone by morning. --minutes 0 is unbounded, for somebody who means it.
+    ap.add_argument("--release-idle-edge", action="store_true",
+                    help="close the fleet browser (:9222 only) when no run is using it. "
+                         "Off by default: it ends a process other runs may be about to "
+                         "use, and the bridge browser is never touched.")
     ap.add_argument("--minutes", type=float, default=120.0,
                     help="stop after this long (0 = run until stopped). A --guard is "
                          "unbounded by default: it is meant to stand.")
@@ -441,7 +534,7 @@ def main(argv=None) -> int:
     if args.guard:
         # A GUARD IS MEANT TO STAND, so it is not bounded unless somebody asks. The bound
         # exists for the sampling mode, which is launched to answer one question.
-        return guard(args.guard, args.interval, since)
+        return guard(args.guard, args.interval, since, args.release_idle_edge)
 
     started = time.time()
     first = None
