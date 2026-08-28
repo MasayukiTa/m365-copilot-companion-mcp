@@ -265,6 +265,7 @@ jobs:
             tests/test_route_dot_follows_reopen.py \
             tests/test_history_keeps_the_last_worker.py \
             bridge/test_bridge_conversation_continuity.py \
+            tests/test_checkpoint_port_probe.py \
             tests/test_identity_guard_reports_every_hit.py \
             tests/test_steer_delivery.py \
             tests/test_steer_followup.py \

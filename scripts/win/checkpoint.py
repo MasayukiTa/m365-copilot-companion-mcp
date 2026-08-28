@@ -40,8 +40,54 @@ def pages(port):
     return None if got is None else [t.get("url", "") for t in got]
 
 
+def _listening(port, timeout_s=0.5):
+    """Is anything bound to that port on loopback? A bounded wait, not a definitive answer.
+
+    THE FIRST VERSION OF THIS SAID A CLOSED LOOPBACK PORT IS REFUSED IMMEDIATELY. Measured
+    on this machine, it is not: connect_ex to 127.0.0.1:9224 with nothing bound returns
+    WSAECONNREFUSED after 2.02 s. With a shorter timeout it returns WSAEWOULDBLOCK at exactly
+    the timeout -- so a short probe does not get a fast NO, it gives up early and calls that
+    a no. That is a different thing and the comment has to say so.
+
+    Giving up early is still the right trade here, and the reason is the asymmetry: a live
+    CDP port on loopback accepts in about 1 ms (measured, 9222). Half a second is a 500x
+    margin over that. And being wrong costs nothing new -- the caller returns None, which is
+    exactly what it returned before when its own HTTP call timed out. The same answer,
+    reached sooner.
+    """
+    import socket
+
+    # THE CONSTRUCTION IS INSIDE THE try, not above it. It was above, and a failure to even
+    # MAKE a socket escaped instead of taking the "cannot tell" branch below -- which is the
+    # same mistake this function exists to avoid, one level up: not being able to ask must
+    # never come out looking like having asked and been told no.
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout_s)
+        return sock.connect_ex(("127.0.0.1", int(port))) == 0
+    except Exception:
+        return True          # cannot tell -> ask properly rather than declare it absent
+    finally:
+        try:
+            if sock is not None:
+                sock.close()
+        except Exception:
+            pass
+
+
 def targets(port):
     """Open page targets, ids included, or None. The id is how a claim is matched."""
+    # ASK WHETHER ANYONE IS THERE BEFORE ASKING WHAT THEY HAVE. urlopen against a port with
+    # nothing bound waits out its full timeout -- measured 2.03 s for port 9224, the eval
+    # Edge, which is not running for most launches. The launch gate calls this once per port,
+    # so that wait is paid on EVERY launch, and it is the largest single item in the delay
+    # between submitting a goal and the first turn going out.
+    #
+    # None still means the same thing to every caller -- the port is not answering -- so no
+    # reader has to learn a new value. Only the time taken to say it changes.
+    if not _listening(port):
+        return None
     try:
         with urllib.request.urlopen("http://127.0.0.1:%d/json/list" % port, timeout=3) as fh:
             return [t for t in json.load(fh) if t.get("type") == "page"]
