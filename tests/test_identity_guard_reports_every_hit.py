@@ -16,18 +16,24 @@ import os
 import subprocess
 import sys
 
-import pytest
-
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "scripts"))
 
+#: 検査が探す「Windows のホームディレクトリ」の形。**組み立てる。書かない。**
+#:
+#: このファイルは「tracked file にその形があると落ちる検査」を試験する。だから形を文字列
+#: リテラルで書くと、検査は自分の試験ファイルで落ちる — 実際、最初の push でそうなった。
+#: 逃げ道として偽ユーザ名を NON_IDENTIFYING_USERS に足すこともできたが、**発火するたびに
+#: 育つ許可リストは、もう検査ではない**。組み立てれば検査は厳しいままでいられる。
+BS = chr(92)
+HOME = "C:" + BS + "Users" + BS + "somebody0001" + BS + "proj"
+
 
 def _repo_with(tmp_path, name, body):
-    """本物の git リポジトリ。検査は tracked file しか見ないので、add まで必要。"""
-    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
-    f = tmp_path / name
-    io.open(str(f), "w", encoding="utf-8", newline="\n").write(body)
-    subprocess.run(["git", "add", name], cwd=tmp_path, check=True)
+    """本物の git リポジトリ。検査は tracked file しか見ないので add まで必要。"""
+    subprocess.run(["git", "init", "-q"], cwd=str(tmp_path), check=True)
+    io.open(str(tmp_path / name), "w", encoding="utf-8", newline="\n").write(body)
+    subprocess.run(["git", "add", name], cwd=str(tmp_path), check=True)
     return str(tmp_path)
 
 
@@ -36,9 +42,9 @@ def test_two_occurrences_in_one_file_are_both_reported(tmp_path):
 
     body = "\n".join([
         "import sys",
-        r'sys.path.insert(0, r"C:\Users\somebody0001\proj")',
+        'sys.path.insert(0, r"%s")' % HOME,
         "x = 1",
-        r'CONFIG = r"C:\Users\somebody0001\proj\.env"',
+        'CONFIG = r"%s%s.env"' % (HOME, BS),
         "",
     ])
     repo = _repo_with(tmp_path, "leaky.py", body)
@@ -62,13 +68,21 @@ def test_one_file_cannot_become_the_whole_report(tmp_path):
     import check_no_identifying_names as G
 
     n = G.MAX_HITS_PER_FILE + 15
-    body = "\n".join([r'p%d = r"C:\Users\somebody0001\proj"' % i for i in range(n)]) + "\n"
+    body = "\n".join(['p%d = r"%s"' % (i, HOME) for i in range(n)]) + "\n"
     repo = _repo_with(tmp_path, "many.py", body)
     hits = [h for h in G.offences(repo=repo) if h[0] == "many.py"]
     numbered = [h for h in hits if h[2] > 0]
     assert len(numbered) == G.MAX_HITS_PER_FILE
     assert any("not listed" in h[1] for h in hits), (
         "打ち切ったことを言っていない -- 黙って切ると『これで全部』に見える")
+
+
+def test_this_test_file_does_not_itself_trip_the_check():
+    """自分自身が検査に引っかからないこと。最初の push で実際に落ちた。"""
+    import check_no_identifying_names as G
+
+    rel = os.path.join("tests", "test_identity_guard_reports_every_hit.py").replace("\\", "/")
+    assert [h for h in G.offences(repo=REPO) if h[0] == rel] == []
 
 
 def test_the_repository_itself_is_clean():
