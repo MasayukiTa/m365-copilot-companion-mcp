@@ -69,3 +69,18 @@ def test_a_missing_ledger_reports_nothing_rather_than_raising(tmp_path):
 def test_goals_attempted_once_are_excluded_from_the_retry_population():
     rows = _g("solo", ["DONE"]) + _g("retried", ["STUCK", "DONE"])
     assert set(group_attempts(rows)) == {"retried"}
+
+
+def test_the_curve_says_it_counts_completion_not_correctness(tmp_path):
+    """REPORTED AS AN ACCURACY FLOOR AND IT IS NOT ONE. DONE is the worker saying it finished;
+    nothing external checked the answer, so a mechanism asked to beat 0.931 is being asked to
+    beat a claim rather than a result. This project already holds that a self-report nobody
+    verifies is worth less than no field at all -- the rule had simply never been applied to
+    the loop's own number."""
+    import json
+    p = tmp_path / "h.json"
+    p.write_text(json.dumps(_g("a", ["STUCK", "DONE"])), encoding="utf-8")
+    r = report(str(p))
+    assert "NOT external correctness" in r["measures"]
+    assert "not an accuracy floor" in r["not_an_accuracy_floor"].lower() or \
+           "An oracle is required" in r["not_an_accuracy_floor"]

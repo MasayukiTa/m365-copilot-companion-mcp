@@ -50,6 +50,22 @@ def group_attempts(rows, min_attempts=2):
 
 
 def _succeeded(rec):
+    """DONE, WHICH IS NOT THE SAME AS CORRECT -- and this file was read as though it were.
+
+    DONE is the fleet's terminal state for a worker that reported finishing. Nothing external
+    checked the answer. The curve below is therefore a curve of COMPLETION, and the figure
+    "k=2 reaches 0.931" was reported as a floor of accuracy that a panel or best-of-N would
+    have to beat. It is not: a worker can report DONE on a wrong answer, and on this evidence
+    we cannot tell how often it does.
+
+    The distinction is the same one this project already holds elsewhere -- a self-report
+    nobody verifies is worth less than no field at all -- applied to the loop's own number.
+
+    To turn this into an accuracy floor, the same goals need an ORACLE: the answer re-derived
+    from the source, an independent recomputation, a read-after-write, an executed test. Until
+    then every rate here reads "the worker said it was done", and the mechanisms it is meant
+    to benchmark are being asked to beat a claim rather than a result.
+    """
     return (rec.get("outcome") or "").upper() == "DONE"
 
 
@@ -104,6 +120,8 @@ def report(path, max_k=5, min_attempts=2):
     grouped = group_attempts(rows, min_attempts)
     curve = floor_curve(grouped, max_k)
     return {
+        # NAMED FOR WHAT IT COUNTS. It was "curve" and was read as accuracy.
+        "measures": "completion (outcome == DONE), NOT external correctness",
         "ledger_rows": len(rows),
         "goals_retried": len(grouped),
         "per_attempt": per_attempt_rate(grouped),
@@ -120,6 +138,10 @@ def report(path, max_k=5, min_attempts=2):
         # same goals against themselves with one more attempt, inside a population already
         # conditioned the same way for every k.
         "k1_is_selection_biased": True,
+        "not_an_accuracy_floor": (
+            "DONE is the worker reporting that it finished; nothing external checked the "
+            "answer. A mechanism asked to beat these rates is being asked to beat a claim, "
+            "not a result. An oracle is required before any of this is an accuracy floor."),
         "read_this_first": (
             "k=1 here is not the general single-attempt rate: this population is goals that "
             "were retried, and a goal is retried because its first attempt failed. Compare "
