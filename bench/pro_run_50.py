@@ -40,8 +40,33 @@ def main():
                   key=lambda r: r["instance_id"])
     ids = [r["instance_id"] for r in rows]
     open(LOG, "w").close()
-    if not os.path.exists(PREDS):
-        json.dump([], open(PREDS, "w"))
+    # A FRESH ACCUMULATOR, EVERY RUN. This kept whatever was already on disk and the capture
+    # step replaces only instances whose worktree still exists -- so a staging failure, a
+    # timeout or a skipped batch left the PREVIOUS run's patch in the file, and the grader
+    # then returned a real grade for a run that never happened. That is the shortest path
+    # from this harness to a benchmark number nobody ran, and it needed no bad intent: an
+    # interrupted run followed by a shorter one produces it.
+    #
+    # The old file is kept beside the new one rather than deleted, because a partial run is
+    # evidence about the harness and deleting it destroys the only record of what happened.
+    if os.path.exists(PREDS):
+        keep = PREDS + ".prev"
+        try:
+            os.replace(PREDS, keep)
+            log("previous predictions moved to %s (NOT reused)" % os.path.basename(keep))
+        except OSError as exc:
+            log("WARNING: could not set the previous predictions aside (%s)" % exc)
+    json.dump([], open(PREDS, "w"))
+    # AND THE WORKTREE MAP WITH IT. The map accumulates ACROSS BATCHES (it is written once per
+    # batch and the join needs all of them), which means it must be cleared once per RUN --
+    # otherwise it accumulates across runs too, and the ledger join starts attributing an
+    # older run's outcomes and turn counts to this one.
+    _wt = os.path.join(SW, "pro_wt_map.json")
+    if os.path.exists(_wt):
+        try:
+            os.replace(_wt, _wt + ".prev")
+        except OSError:
+            pass
     # WRITE DOWN WHICH ARM THIS IS, at launch, in the run's own directory.
     #
     # The effort was a literal on the command line below and the harness was whatever manifest

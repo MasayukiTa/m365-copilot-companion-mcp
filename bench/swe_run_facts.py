@@ -44,6 +44,32 @@ def _norm(p: str) -> str:
     return os.path.normcase((p or "").replace("\\", "/").rstrip("/"))
 
 
+#: What may follow a path for it to count as named rather than as a prefix of a
+#: longer one. Built from code points: the set contains both quote characters and a
+#: backslash, and spelling it as a literal is how the previous attempt broke.
+_BOUNDARY = frozenset(chr(c) for c in (47, 92, 32, 9, 13, 10, 34, 39, 44, 59, 58,
+                                       41, 93, 125))
+
+
+def _mentions_path(text: str, path: str) -> bool:
+    """True when `text` names `path` as a path, not merely as a prefix of a longer one.
+
+    `.../p1` must not match text about `.../p10`. The character after the match has to be a
+    separator or the end of the string.
+    """
+    if not path:
+        return False
+    start = 0
+    while True:
+        i = text.find(path, start)
+        if i < 0:
+            return False
+        end = i + len(path)
+        if end >= len(text) or text[end] in _BOUNDARY:
+            return True
+        start = i + 1
+
+
 def facts_from_history(wt_map, history_rows):
     """instance_id -> {outcome, turns, attempts} for every instance the ledger knows about.
 
@@ -59,10 +85,19 @@ def facts_from_history(wt_map, history_rows):
     only the accuracy was carried forward.
     """
     by_path = {}
+    collided = set()
     for inst, path in (wt_map or {}).items():
         n = _norm(path)
-        if n:
-            by_path[n] = inst
+        if not n:
+            continue
+        if n in by_path and by_path[n] != inst:
+            # TWO INSTANCES ON ONE PATH. Silently letting the later entry own every worker
+            # that ran there would attribute one instance's outcome to another. Neither can
+            # be trusted, so neither is joined.
+            collided.add(n)
+        by_path[n] = inst
+    for n in collided:
+        by_path.pop(n, None)
 
     facts = {}
     for row in history_rows or []:
@@ -77,7 +112,21 @@ def facts_from_history(wt_map, history_rows):
             goal = _norm(row.get("goal") or "")
             if not goal:
                 continue
-            inst = next((i for p, i in by_path.items() if p in goal), None)
+            # PATH BOUNDARIES, AND NO GUESSING BETWEEN CANDIDATES.
+            #
+            # A bare substring test matched `.../p1` inside text naming `.../p10`, and took
+            # the first entry that hit -- so a prefix collision picked an instance by
+            # dictionary order. It also matched a path merely MENTIONED in the goal, and a
+            # staged goal quotes an issue body that can name anything.
+            #
+            # A path only matches when what follows it in the text is a separator or nothing,
+            # and an ambiguous goal (two different instances' paths present) joins to NEITHER.
+            # The cost of refusing is one unjoined row, which stays in the denominator; the
+            # cost of guessing is an outcome attributed to the wrong instance.
+            hits = {i for p, i in by_path.items() if _mentions_path(goal, p)}
+            if len(hits) != 1:
+                continue
+            inst = hits.pop()
         if inst is None:
             continue
         f = facts.setdefault(inst, {"outcome": None, "turns": 0, "attempts": 0})

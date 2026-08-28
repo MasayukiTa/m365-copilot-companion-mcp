@@ -240,7 +240,21 @@ def main(argv=None):
                   # Says whether this row corrects the previous measurement of this scaffold
                   # or repeats it. Without it the archive assumed "correction", so k could
                   # never reach 2 and pass^k was not computable from any number of runs.
-                  replicate=args.replicate)
+                  replicate=args.replicate,
+                  # THE QUALIFICATIONS TRAVEL WITH THE NUMBER. These were printed and
+                  # discarded, so the archive held a conditional rate presented as a plain
+                  # one -- and a run that excluded half its slice was indistinguishable from
+                  # one that excluded nothing. Excluding raises `pass_at_1`; only
+                  # `end_to_end` cannot be raised that way.
+                  measurement={
+                      "end_to_end": end_to_end,
+                      "asked_for": n_all,
+                      "gradable": n,
+                      "excluded": {i: facts[i]["outcome"] for i in excluded},
+                      "excluded_rate": round(len(excluded) / n_all, 4) if n_all else None,
+                      "ledger_coverage": join["coverage"],
+                      "ledger_missing": len(join["missing"]),
+                  })
     burned = BurnedRegistry()
     n_new = burned.add(ids, reason)
     out = dashboard.write_json()

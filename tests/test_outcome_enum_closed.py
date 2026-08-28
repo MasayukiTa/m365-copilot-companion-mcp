@@ -161,12 +161,13 @@ def test_a_path_that_never_established_is_not_scored_as_a_failure():
     assert scoring_of("INFRA_STUCK") == "excluded"
 
 
-def test_a_fanout_parent_is_not_counted_twice():
-    """FANOUT is done AS A GOAL, but the answer arrives from the merge that follows its family.
-    Scoring the parent as a pass counts one goal in two places; scoring it as a failure is
-    worse. It is not a gradable attempt."""
+def test_a_fanout_parent_still_owes_an_answer():
+    """This was excluded on a double-count argument that holds only where the denominator is
+    worker rows. Where it is benchmark instances -- one prediction per instance -- excluding a
+    fan-out parent does not prevent a double count, it deletes the instance. A family that
+    merged has an answer; a family that did not has failed to deliver."""
     from relay.outcomes import scoring_of
-    assert scoring_of("FANOUT") == "excluded"
+    assert scoring_of("FANOUT") == "fail"
 
 
 def test_the_signals_a_retry_floor_measures_stay_in_the_denominator():
@@ -191,10 +192,10 @@ def test_tally_reports_both_rates_and_the_health_of_the_measurement():
     cannot. Reporting only the first makes an unhealthy environment look like progress."""
     from relay.outcomes import tally
     t = tally(["DONE", "DONE", "STUCK", "CANCELLED", "INFRA_STUCK", "FANOUT"])
-    assert t["gradable"] == 3 and t["total"] == 6
-    assert t["conditional"] == pytest.approx(2 / 3)
+    assert t["gradable"] == 4 and t["total"] == 6
+    assert t["conditional"] == pytest.approx(2 / 4)
     assert t["end_to_end"] == pytest.approx(2 / 6)
-    assert t["excluded_rate"] == pytest.approx(0.5)
+    assert t["excluded_rate"] == pytest.approx(2 / 6)
 
 
 def test_excluding_work_raises_the_conditional_rate_but_not_end_to_end():
