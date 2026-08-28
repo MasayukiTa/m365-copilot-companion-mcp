@@ -4339,7 +4339,12 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     def _spawn_children(parent_goal, kids):
         """Queue a split parent's children and remember the family."""
         cid = kids[0].get("campaign_id") or fanout_mod.campaign_id_for(parent_goal)
-        campaigns[cid] = {"goal": parent_goal, "n": len(kids), "merged": False}
+        # THE CHILDREN ALREADY CARRY THE PARENT'S cwd (child_goals puts it there), so the
+        # merge takes it from them rather than from a second field that could drift. Without
+        # it the merge starts wherever the fleet happens to be, while being asked to write a
+        # combined file and report its path.
+        campaigns[cid] = {"goal": parent_goal, "n": len(kids), "merged": False,
+                          "cwd": (kids[0] or {}).get("cwd")}
         add_box.extend(kids)
         # WRITTEN DOWN, NOT ONLY QUEUED. add_box lives in memory: if the run dies here the
         # children vanish while the parent is already recorded finished, so the work would
@@ -4392,8 +4397,12 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             if len(_recs) < _camp.get("n", 0):
                 continue
             _camp["merged"] = True
+            # THE PARENT'S WORKING DIRECTORY GOES WITH IT. The children get it from
+            # child_goals; the merge was starting wherever the fleet happened to be, while
+            # being asked to write a combined file and report its path.
             add_box.append(fanout_mod.aggregation_goal(_camp["goal"], _recs,
-                                                       campaign_id=_cid))
+                                                       campaign_id=_cid,
+                                                       cwd=_camp.get("cwd")))
             queued += 1
             print("[fanout] %s: %d/%d subtask(s) done -> merging"
                   % (_cid, sum(1 for r in _recs if (r["outcome"] or "").upper() == "DONE"),
@@ -4862,13 +4871,38 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         if (_w.outcome or "") != "FANOUT":
             continue
         _cid = fanout_mod.campaign_id_for(_w.goal)
-        _agg = next((x for x in workers
-                     if getattr(getattr(x, "task_envelope", None), "role", "") == "aggregator"
-                     and getattr(getattr(x, "task_envelope", None), "campaign_id", "") == _cid),
-                    None)
-        if _agg is None:
+        # THE MERGE THAT WORKED, NOT THE FIRST ONE CREATED. This took the first aggregator
+        # in worker order and stopped. A campaign can hold several: a merge that goes STUCK
+        # is re-queued, so the family ends with a failed attempt and a successful one -- and
+        # the failed attempt has the lower worker number, because it ran first.
+        #
+        # Both multi-merge campaigns on record went that way. In one, w13 went STUCK at nine
+        # turns and w17 finished in four; in the other, w23 went STUCK at fourteen turns and
+        # w28 finished in five. In both, this line picked the STUCK one -- and then, because
+        # a STUCK merge produces no text, the `if _merged` below skipped the back-fill
+        # entirely. The successful merge was sitting in the same list, never looked at, and
+        # the parent was delivered with nothing.
+        #
+        # Prefer DONE; fall back to the last attempt, which is the one that ran with the
+        # most recent input. Text still decides whether anything is written, so a family
+        # where every attempt failed behaves exactly as before.
+        _aggs = [x for x in workers
+                 if getattr(getattr(x, "task_envelope", None), "role", "") == "aggregator"
+                 and getattr(getattr(x, "task_envelope", None), "campaign_id", "") == _cid]
+        if not _aggs:
             continue
+        _agg = next((x for x in _aggs if (x.outcome or "") == "DONE"), _aggs[-1])
         _merged = (getattr(_agg, "display_result", "") or getattr(_agg, "last_response", ""))
+        if not _merged and len(_aggs) > 1:
+            # The chosen one said nothing; another attempt may have. Say so, because a
+            # silent fallback here is how the first version of this hid its own mistake.
+            for _alt in reversed(_aggs):
+                _text = (getattr(_alt, "display_result", "") or getattr(_alt, "last_response", ""))
+                if _text:
+                    print("[fanout] %s produced no text; using %s's merge instead"
+                          % (_agg.name, _alt.name), flush=True)
+                    _agg, _merged = _alt, _text
+                    break
         if _merged:
             _w.last_response = _merged
             _w.display_result = _merged
