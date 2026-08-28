@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any
 from pathlib import Path
 
@@ -63,13 +64,56 @@ def _invalid_hint(reason: str) -> str:
     return "SKILL.md を修正してから再度 skill_list を実行してください。"
 
 
+#: Where a skill consultation is recorded, so that "did the worker use the skill" can be
+#: ANSWERED rather than asked.
+#:
+#: WHY THIS EXISTS. An experiment on whether a sentence in the worker prompt causes skills to
+#: be consulted had no way to observe the thing it was measuring. Transcripts hold the user
+#: and assistant text and nothing else -- no tool calls -- so the only available signal was the
+#: shape of the final answer, which varied 0..2 within a single arm and drowned the effect. The
+#: obvious alternative, asking the worker whether it consulted a skill, is a self-report, and a
+#: self-report nobody can verify is worth less than no field at all.
+#:
+#: This is the objective version: the function that would have been called records that it was.
+#: One line per consultation, best-effort, never able to fail the call it observes.
+_SKILL_USE_LOG = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".fleet", "skill_use.jsonl")
+
+
+def _record_skill_use(kind, query, matched):
+    """Append one consultation record. Never raises, never blocks, never returns anything.
+
+    The QUERY IS NOT STORED, only its length and a short hash. A goal can carry business
+    content, and a measurement side-channel is the last place it should be duplicated -- the
+    hash is enough to group the runs of one probe together, which is all the analysis needs.
+    """
+    try:
+        import hashlib
+        os.makedirs(os.path.dirname(_SKILL_USE_LOG), exist_ok=True)
+        q = str(query or "")
+        row = {
+            "ts": time.time(),
+            "kind": kind,
+            "query_hash": hashlib.sha256(q.encode("utf-8")).hexdigest()[:12],
+            "query_len": len(q),
+            "matched": matched or "",
+        }
+        with open(_SKILL_USE_LOG, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def skill_match(text: str) -> str:
     """Find a confidently matching trusted Skill using metadata only; does not load it."""
     try:
         store = _store()
         result = store.match(text)
         if result:
+            _record_skill_use("match", text,
+                              (result or {}).get("name") if isinstance(result, dict) else "")
             return json.dumps(result, ensure_ascii=False, indent=2)
+        _record_skill_use("match", text, "")
         # 一致なしとだけ返していたとき、呼び出し側は「そんな手順は無い」と読み、
         # 自分でやり方を考え始めた。実際には手順はあって、束を1文字直したせいで
         # 再承認待ちになっていただけだった。照合は信頼済みしか見ないので、
@@ -182,7 +226,13 @@ def skill_request_approval(name: str = "") -> str:
 def skill_load(name: str, arguments: str = "") -> str:
     """Load and render one trusted Skill. Untrusted or changed bundles are refused."""
     try:
-        return _store().render(name, arguments)
+        rendered = _store().render(name, arguments)
+        # LOADING IS THE STRONGER SIGNAL. Matching says the worker looked; loading says it
+        # took the procedure. Both are recorded because the difference between them is a
+        # finding in its own right -- a worker that matches and then does not load has
+        # decided against the approved procedure, which is not the same as never asking.
+        _record_skill_use("load", name, name)
+        return rendered
     except SkillError as exc:
         return f"[skill_load refused: {exc}]"
     except Exception as exc:
