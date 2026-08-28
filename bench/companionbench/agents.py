@@ -93,6 +93,14 @@ def attest_in_process(manifest):
         "effective": {
             "memory_version": RC.component("memory"),
             "memory_max_items": RC.memory_max_items(),
+            # THE EFFORT KNOBS, because the record could not tell two efforts apart. The
+            # `agent` block held `refuter: True/False` and nothing else, and both `auto` and
+            # `ultra` set refuter -- so the two arms were indistinguishable in every result
+            # file. Read back through the runtime accessors like the rest of this block: the
+            # question is what the CODE resolved, not what a caller intended.
+            "max_refute_passes": RC.max_refute_passes(),
+            "max_research": RC.max_research(),
+            "review_lens_count": RC.review_lens_count(),
         },
     }
 

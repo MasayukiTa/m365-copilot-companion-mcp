@@ -55,6 +55,16 @@ def _wilson(k, n, z=1.96):
     return [round(max(0.0, centre - half), 4), round(min(1.0, centre + half), 4)]
 
 
+def _load_run_config(path):
+    """What the run recorded about which arm it was. Missing reads as empty, never as a guess."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def _load_preds(path):
     """Return the ordered list of instance_ids in the preds file (+ patch length per id for diff_size)."""
     ids, patch_len = [], {}
@@ -102,6 +112,10 @@ def main(argv=None):
                          "and turn count")
     ap.add_argument("--wtmap", default=os.path.join(REPO, ".fleet", "swe", "pro_wt_map.json"),
                     help="instance_id -> worktree path, the key the ledger joins on")
+    ap.add_argument("--run-config",
+                    default=os.path.join(REPO, ".fleet", "swe", "pro_run_config.json"),
+                    help="what the run wrote about which arm it was (effort, harness id, "
+                         "resolved parameters)")
     ap.add_argument("--commit", action="store_true", help="actually write (default: dry-run)")
     args = ap.parse_args(argv)
 
@@ -151,10 +165,22 @@ def main(argv=None):
 
     # The genome is exactly what the run used -- no invented knobs. The card under measurement is the
     # interface-first public-contract strengthening in bench/pro_stage_goals.py.
+    # THE ARM THIS RUN ACTUALLY WAS, read from what the run wrote rather than restated here.
+    # `effort` was the literal "auto", so every archived result claimed the same arm whatever
+    # had run -- and since the panel and research budgets were not manifest parameters either,
+    # two efforts also hashed to the SAME harness_id. A remembered conclusion about which
+    # effort scored higher could not be checked against anything in the archive.
+    run_cfg = _load_run_config(args.run_config)
     genome = {
         "knobs": {
             "SWE_SIDEPAGE_RESERVE": "0",
-            "effort": "auto",
+            # UNKNOWN, not "auto". A run whose arm was not recorded must read as unknown: a
+            # guess here is how an unlabelled row joins the arm it did not belong to.
+            "effort": run_cfg.get("effort") or "unknown",
+            "harness_id": run_cfg.get("harness_id") or "",
+            # The resolved knobs, so a reader can see what the effort MEANT for this run
+            # without having to find the manifest it was taken from.
+            "parameters": run_cfg.get("parameters") or {},
             "batch": 8,
             "autoscale_per_tab_mb": args.per_tab_mb,
         },
@@ -181,6 +207,12 @@ def main(argv=None):
         print("  NOTE        : %d instance(s) had no ledger row and were scored as attempted"
               % len(join["missing"]))
     print("  descriptors : %s" % desc)
+    print("  arm         : effort=%s  harness=%s"
+          % (genome["knobs"]["effort"], (genome["knobs"]["harness_id"] or "?")[:16]))
+    if not run_cfg:
+        # LOUD, because an unknown arm is the state in which two efforts get archived as one.
+        print("  WARNING     : no run config -- this result records an UNKNOWN arm and cannot "
+              "be compared against a labelled one")
     print("  genome.knobs: %s" % genome["knobs"])
     print("  burn reason : %s" % reason)
     if args.note:

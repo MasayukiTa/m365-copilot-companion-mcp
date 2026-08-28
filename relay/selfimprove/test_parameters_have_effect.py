@@ -17,7 +17,8 @@ from relay.selfimprove import manifest as M
 
 def test_every_evolvable_parameter_is_named_in_an_effect_test():
     """パラメータを増やして効果テストを書き忘れると、また不活性な座標が生える。"""
-    covered = {"max_retries", "max_refute_passes", "memory_max_items"}
+    covered = {"max_retries", "max_refute_passes", "memory_max_items",
+               "max_research", "review_lens_count"}
     assert set(M.DEFAULT_PARAMETERS) == covered, (
         "manifest のパラメータ集合が変わった。増えたものには、値を変えると観測可能な "
         "何かが変わることを示すテストを、下に書くこと")
@@ -123,3 +124,81 @@ def _appears_in_a_comparison(path, name, source=None):
             if got == name:
                 return True
     return False
+
+
+# ---- review_lens_count: `ultra` を harness に表現させる座標 -------------------------------------
+
+def _with_parameters(monkeypatch, **params):
+    """指定パラメータだけ差し替えた manifest を active にする。"""
+    import json
+    import os
+    import tempfile
+
+    from relay.selfimprove import runtime_config as RC
+
+    man = M.base_manifest()
+    man["parameters"].update(params)
+    d = tempfile.mkdtemp(prefix="peff_")
+    path = os.path.join(d, "manifest.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(man, fh)
+    monkeypatch.setenv(RC.OVERRIDE_ENV, path)
+    RC.active_manifest(refresh=True)
+    return path
+
+
+def test_review_lens_count_decides_whether_a_run_gets_a_panel_at_all(monkeypatch):
+    """0 でパネル無し、3 で3枚。呼び手は同じ（何も渡していない）。
+
+    これが効かなければ、ベンチの子は refuter しか渡さない設計なので `ultra` を要求しても
+    `auto` が走り、両者は同じ harness_id で記録される -- 比較そのものが成立しない。
+    """
+    from relay.relay_fleet import _resolve_review_lenses
+
+    _with_parameters(monkeypatch, review_lens_count=0)
+    assert _resolve_review_lenses(None) is None
+
+    _with_parameters(monkeypatch, review_lens_count=3)
+    assert _resolve_review_lenses(None) == ["correctness", "edge", "security"]
+
+
+def test_review_lens_count_is_a_ladder_each_step_adding_one_reviewer(monkeypatch):
+    """段ごとに1枚増えること。増えないなら「2枚と3枚」は別のパネルの比較になる。"""
+    from relay.relay_fleet import _resolve_review_lenses
+
+    seen = []
+    for n in (1, 2, 3):
+        _with_parameters(monkeypatch, review_lens_count=n)
+        seen.append(_resolve_review_lenses(None))
+    assert [len(x) for x in seen] == [1, 2, 3]
+    for lo, hi in zip(seen, seen[1:]):
+        assert lo == hi[:len(lo)]
+
+
+def test_an_explicit_lens_list_still_wins_over_the_harness(monkeypatch):
+    """明示引数を渡した呼び手はそれを意図している -- 既存契約を壊さないこと。"""
+    from relay.relay_fleet import _resolve_review_lenses
+
+    _with_parameters(monkeypatch, review_lens_count=3)
+    assert _resolve_review_lenses(["edge"]) == ["edge"]
+
+
+# ---- max_research: 側ページ予算 ----------------------------------------------------------------
+
+def test_max_research_reaches_the_fleet_from_the_active_genome(monkeypatch):
+    """署名の直書き 3 では、genome を変えても調査予算は動かなかった。"""
+    import relay.relay_fleet as F
+
+    _with_parameters(monkeypatch, max_research=0)
+    assert F._genome_default("max_research", -1) == 0
+
+    _with_parameters(monkeypatch, max_research=9)
+    assert F._genome_default("max_research", -1) == 9
+
+
+def test_the_research_budget_is_no_longer_a_literal_in_the_signature():
+    """直書きされた既定値は、読み手があっても不活性な座標を作る。"""
+    import inspect
+
+    import relay.relay_fleet as F
+    assert inspect.signature(F.run_relay_fleet).parameters["max_research"].default is None

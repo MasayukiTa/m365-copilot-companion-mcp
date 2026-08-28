@@ -288,6 +288,37 @@ def max_retries() -> int:
         return 10
 
 
+def max_research() -> int:
+    """How many on-demand research side-pages a worker may open.
+
+    The other half of what `max` and `ultra` mean, and the half that costs RAM rather than
+    turns: every side-page is a browser tab under the admission floor. Both directions are
+    visible in the benchmark -- too few and the agent guesses at APIs it could have read, too
+    many and the run stalls waiting for room it did not need.
+    """
+    try:
+        return max(0, int(parameter("max_research", 3)))
+    except (TypeError, ValueError):
+        return 3
+
+
+def review_lens_count() -> int:
+    """How many of PANEL_LENSES review a candidate answer. 0 means no panel.
+
+    THE KNOB THAT MAKES `ultra` EXPRESSIBLE. Everything else separating `ultra` from `auto`
+    was already a manifest parameter or a call argument; the panel was neither, so a harness
+    asked for one resolved to the other and the two were recorded under the same harness_id.
+
+    The count takes lenses from the front of PANEL_LENSES, so the ladder is a real ladder:
+    each step is a superset of the one below it, and a comparison between two counts is a
+    comparison of one added reviewer rather than of two different panels.
+    """
+    try:
+        return max(0, min(3, int(parameter("review_lens_count", 0))))
+    except (TypeError, ValueError):
+        return 0
+
+
 def max_refute_passes() -> int:
     """How many refuter passes a candidate answer gets before it is accepted.
 
