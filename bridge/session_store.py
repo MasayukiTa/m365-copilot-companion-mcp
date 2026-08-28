@@ -863,6 +863,28 @@ def pop_input(sid):
     return first
 
 
+def latest_session():
+    """The most recent session by last_active_ts, ATTACHED OR NOT.
+
+    `latest_attached()` skips rows with no conversation, and that skip is what made startup
+    reach past the newest sessions into an older one. Measured 2026-08-28: 558 sessions, 19
+    with a conversation attached, the newest row 8.4 hours old and the newest ATTACHED row
+    54.4 hours old -- so a restart reopened a two-day-old conversation and called it resuming.
+    Neither "the latest" nor "the previous one", which is exactly the ambiguity this was
+    reported as.
+
+    A policy that wants "resume only if the thing we just left is resumable" needs to see the
+    thing we just left, whether or not it is resumable. That is this.
+    """
+    conn = _db()
+    try:
+        row = conn.execute(
+            "SELECT * FROM sessions ORDER BY last_active_ts DESC LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    return _row_to_session(row) if row else None
+
+
 def latest_attached():
     """Most recent session (by last_active_ts) that has a conversation attached.
 
