@@ -224,7 +224,26 @@ function Submit([string]$text) {
     # the script reported "submitted". FleetCockpit.cs:3485 is the authority.
     if (-not (Set-Text $target $text)) { throw "the field refused a value" }
     Start-Sleep -Milliseconds 250
-    $target.SetFocus()
+
+    # THE KEYSTROKE GOES WHEREVER KEYBOARD FOCUS IS, so the window has to be in front
+    # before the composer can hold focus at all. UIA's SetFocus throws outright on an
+    # element in a background or minimized window -- measured 2026-08-30 06:52, where the
+    # composer was found, filled, and then
+    #     "0" の引数を指定して "SetFocus" を呼び出し中に例外が発生
+    # ended the batch. Bring the window forward first, and treat a still-failing SetFocus
+    # as non-fatal: a foreground window with one text box already routes the keys.
+    $cp = Get-Process -Name FleetCockpit -EA SilentlyContinue | Select-Object -First 1
+    if ($cp -and $cp.MainWindowHandle -ne [IntPtr]::Zero) {
+        [Win32.Wnd]::ShowWindow($cp.MainWindowHandle, 9) | Out-Null       # SW_RESTORE
+        [Win32.Wnd]::SetForegroundWindow($cp.MainWindowHandle) | Out-Null
+        Start-Sleep -Milliseconds 500
+    }
+    $focused = $false
+    for ($f = 1; $f -le 3 -and -not $focused; $f++) {
+        try { $target.SetFocus(); $focused = $true }
+        catch { Start-Sleep -Milliseconds 400 }
+    }
+    if (-not $focused) { Write-Output "note: SetFocus refused; relying on the foreground window" }
     Start-Sleep -Milliseconds 200
     Send-CtrlEnter
     Start-Sleep -Milliseconds 900
