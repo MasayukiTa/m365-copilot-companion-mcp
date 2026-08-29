@@ -112,6 +112,7 @@ Set-Content -Path $idsFile -Value ($ids -join "`n") -Encoding ascii   # ascii: u
 # is the counter-example: batches 3-5 sat in the completed range having answered nothing.
 $pending = @(& $py bench/ui_missing_ids.py $idsFile $Preds | Where-Object { $_.Trim() })
 Say ("pending at start: {0} of {1} uncovered" -f $pending.Count, $ids.Count)
+$submitFails = 0
 
 for ($round = 1; $round -le $MaxRounds; $round++) {
     if ($pending.Count -eq 0) { break }
@@ -148,8 +149,22 @@ for ($round = 1; $round -le $MaxRounds; $round++) {
         }
         if (-not $submitted) {
             Say "submit gave up after 3 attempts; NOT waiting and NOT capturing this batch"
+            # AND STOP DRIVING, because the next batch will fail the same way.
+            #
+            # Measured 2026-08-29: with the cockpit unreachable, this loop ran three rounds
+            # of two batches in four minutes, failed all six, and exited "incomplete" --
+            # then the supervisor started another driver to do it again, eight times over.
+            # Repairing the cockpit is the supervisor's job and it cannot do it while a
+            # driver is churning, so hand control back after the second failure in a row.
+            $submitFails++
+            if ($submitFails -ge 2) {
+                Say "two batches in a row could not be submitted; exiting so the cockpit can be repaired"
+                Say "UI_RUN_BLOCKED"
+                exit 3
+            }
             continue
         }
+        $submitFails = 0
 
         $t0 = Get-Date
         $sawRunning = $false
