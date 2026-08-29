@@ -21,6 +21,20 @@
 #      operates inside one container per instance, the work root lives in the Linux
 #      filesystem and NOT under /mnt/c, and no container gets the docker socket. A container
 #      escape must land on an idle box, not on the operator's files.
+# WSL IS THIS MACHINE'S ACCIDENT, NOT A REQUIREMENT OF THIS DESIGN.
+#
+# Nothing executable below mentions WSL: it is bash and docker, and it runs on any Linux
+# host. The eval box here happens to reach Linux through WSL because that is how this
+# particular owner's test machine is set up -- most machines have no WSL at all and are not
+# expected to. The dependency is exactly ONE LINE, and it is not in this file: the forced
+# command in the server's authorized_keys. On this box that line reads
+#     command="C:\Windows\System32\wsl.exe -d Ubuntu -e /opt/swe-broker/broker.sh"
+# and on a native Linux host it reads
+#     command="/opt/swe-broker/broker.sh"
+# Keep it that way. A design that assumes WSL cannot be moved to the machine that eventually
+# runs it, and the comments in this file mentioning /mnt/c describe what THIS host exposes,
+# not something the broker needs.
+
 set -u
 umask 077
 
