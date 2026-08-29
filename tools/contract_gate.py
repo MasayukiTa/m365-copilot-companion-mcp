@@ -67,21 +67,77 @@ _CONTRACT_FILE = _FLEET_DIR / "active_contract.json"
 # Contract loading
 # ---------------------------------------------------------------------------
 
-def load_contract() -> Optional[dict]:
-    """Read .fleet/active_contract.json.  Returns dict or None (missing/bad JSON/inactive)."""
+# HAS THIS PROCESS EVER SEEN AN ACTIVE CONTRACT, AND WAS IT RETIRED PROPERLY.
+#
+# The policy file lives under .fleet, which every worker can write, and `load_contract`
+# answered "missing" and "corrupt" with the same value the caller uses for "no contract is
+# active" -- so deleting or truncating one file turned the gate off silently. That is the
+# same fail-open shape this repository has already been bitten by once, and it is recorded
+# as a rule: unknown must fall to the dangerous side.
+#
+# A worker can write files. It cannot write this process's memory. So the server remembers
+# that it saw a contract, and a contract that then VANISHES is treated as tampering rather
+# than as an absence -- unless it was retired through deactivate_contract(), which is the
+# legitimate way for it to go away.
+_SEEN = {"active_contract": False, "retired_via_api": False}
+
+
+def contract_state() -> tuple:
+    """('active' | 'inactive' | 'absent' | 'unreadable', dict | None).
+
+    Separated from load_contract because the caller must be able to tell "there is no
+    policy" from "the policy could not be read". Those were the same value, and the second
+    one is an attack.
+    """
     try:
         if not _CONTRACT_FILE.is_file():
-            return None
-        data = json.loads(_CONTRACT_FILE.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return None
-        return data
+            return ("absent", None)
+        raw = _CONTRACT_FILE.read_text(encoding="utf-8")
     except Exception:
-        return None
+        return ("unreadable", None)
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return ("unreadable", None)
+    if not isinstance(data, dict):
+        return ("unreadable", None)
+    if data.get("active"):
+        _SEEN["active_contract"] = True
+        return ("active", data)
+    return ("inactive", data)
+
+
+def policy_state_is_suspect() -> Optional[str]:
+    """Reason the policy state cannot be trusted right now, or None.
+
+    Two cases, and only two: the file is present and unreadable, or it is gone after this
+    process had seen an active one and nothing retired it.
+    """
+    state, _ = contract_state()
+    if state == "unreadable":
+        return "the contract file exists and could not be read as a policy object"
+    if state == "absent" and _SEEN["active_contract"] and not _SEEN["retired_via_api"]:
+        return "an active contract was in force and its file has since disappeared"
+    return None
+
+
+def load_contract() -> Optional[dict]:
+    """Read .fleet/active_contract.json.  Returns dict or None (missing/bad JSON/inactive).
+
+    Kept for callers that only want the object. Anything making a SECURITY decision must use
+    contract_state() or policy_state_is_suspect() instead -- None here still cannot tell an
+    absent policy from an unreadable one.
+    """
+    _state, data = contract_state()
+    return data
 
 
 def deactivate_contract() -> None:
-    """Set active=false in the contract file (called by fleet_runner on exit)."""
+    """Set active=false in the contract file (called by fleet_runner on exit).
+
+    Also records that the contract went away legitimately, so its later absence is not read
+    as tampering."""
+    _SEEN["retired_via_api"] = True
     try:
         if not _CONTRACT_FILE.is_file():
             return
@@ -348,6 +404,26 @@ def check_op(op_class: str, detail: str = "") -> Optional[str]:
                            OR returns None if the gate was already answered "approved"
       * neither          -> returns None (not listed = not gated)
     """
+    # ── POLICY STATE MUST BE READABLE BEFORE IT CAN BE INERT ────────────────
+    #
+    # `check_op` is only reached for operations already detected as dangerous, so gating all
+    # of them when the policy cannot be trusted is the correct fallback: the alternative is
+    # what used to happen, which is that a deleted file waved them through.
+    suspect = policy_state_is_suspect()
+    if suspect:
+        token = _stable_token(op_class, detail)
+        existing = _find_existing_gate(token)
+        if existing and existing.get("answer") == "approved":
+            return None
+        if not existing:
+            _create_gate(token,
+                         "契約状態が信用できないため、この操作の承認を求めます: %s" % suspect,
+                         "op_class=%s detail=%s" % (op_class, detail[:400]))
+        return ("[契約状態が不正 / policy state untrusted] %s。"
+                "危険と判定された操作は、状態が回復するか人が承認するまで実行されません。"
+                " / The policy state could not be trusted, so this operation was NOT executed."
+                % suspect)
+
     # ── INERT guard: no contract or not active ──────────────────────────────
     contract = load_contract()
     if contract is None or not contract.get("active"):
