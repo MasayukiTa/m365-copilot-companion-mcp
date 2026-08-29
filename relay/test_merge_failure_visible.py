@@ -100,3 +100,57 @@ def test_both_missing_answer_paths_use_the_same_outcome():
     answer is missing. Two outcomes would split one condition across two vocabularies."""
     body = _delivery_source()
     assert body.count('_w.outcome = "VERIFY_FAILED"') == 2
+
+
+# ---------------------------------------------------------------------------
+# THE THIRD WAY A FAN-IN LOSES WORK, and the one that hides best.
+#
+# The two cases above are families that came back with nothing, and both are now marked. A
+# merge that RAN, produced text, and was delivered still reads as the whole job -- while some
+# children went STUCK or were cancelled and were never in its input. The aggregator cannot
+# report what it was not given, so nothing anywhere said the answer covered part of the work.
+# ---------------------------------------------------------------------------
+
+def test_a_delivered_merge_names_children_that_did_not_finish():
+    """The success branch must look at the children, not only at the aggregator."""
+    body = _delivery_source()
+    ok = body[body.index("if _merged:"):body.index("else:", body.index("if _merged:"))]
+    assert "_lost" in ok, "the delivered-merge branch never inspects the children"
+    assert '(x.outcome or "") != "DONE"' in ok
+
+
+def test_a_complete_family_is_not_annotated():
+    """Every child DONE must read exactly as it did before: the note is guarded on _lost."""
+    body = _delivery_source()
+    ok = body[body.index("if _merged:"):body.index("else:", body.index("if _merged:"))]
+    assert "if _lost:" in ok
+
+
+def test_the_partial_merge_keeps_its_outcome():
+    """Unlike the two missing-answer branches, there IS an answer here.
+
+    Marking it VERIFY_FAILED would be as wrong as calling it complete -- the merge ran and its
+    text is real. What is owed is the scope it was built from, so the degradation is in the
+    reason, never in the outcome."""
+    body = _delivery_source()
+    ok = body[body.index("if _merged:"):body.index("else:", body.index("if _merged:"))]
+    assert "VERIFY_FAILED" not in ok
+    assert "outcome =" not in ok
+
+
+def test_the_child_predicate_is_written_once():
+    """It was spelled out in two branches before, and a third caller now needs it.
+
+    The same predicate in several places is the shape that drifts: one copy gains a condition
+    and the others quietly answer a different question."""
+    body = _delivery_source()
+    assert body.count("_kids = [x for x in workers") == 1
+
+
+def test_the_count_reported_is_of_children_not_of_aggregators():
+    """`len(_kids)` is the denominator; using the aggregator list would report the merge
+    attempts as though they were the work."""
+    body = _delivery_source()
+    ok = body[body.index("if _merged:"):body.index("else:", body.index("if _merged:"))]
+    assert "len(_kids)" in ok
+    assert "len(_aggs)" not in ok

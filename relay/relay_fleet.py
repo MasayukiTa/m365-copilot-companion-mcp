@@ -5006,6 +5006,12 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         _aggs = [x for x in workers
                  if getattr(getattr(x, "task_envelope", None), "role", "") == "aggregator"
                  and getattr(getattr(x, "task_envelope", None), "campaign_id", "") == _cid]
+        # The children of this campaign, needed by two branches below. It was written out
+        # twice before; the same predicate in two places is the shape that drifts.
+        _kids = [x for x in workers
+                 if getattr(getattr(x, "task_envelope", None), "campaign_id", "") == _cid
+                 and getattr(getattr(x, "task_envelope", None), "role", "") != "aggregator"
+                 and x is not _w]
         if not _aggs:
             # THE MERGE WAS NEVER CREATED, AND THAT IS ALSO A MISSING ANSWER.
             #
@@ -5019,10 +5025,6 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             # Silence here is worse than in the failure case, because there is not even an
             # aggregator to name: a reader sees a plan, no merge, and no indication that one
             # was ever owed.
-            _kids = [x for x in workers
-                     if getattr(getattr(x, "task_envelope", None), "campaign_id", "") == _cid
-                     and getattr(getattr(x, "task_envelope", None), "role", "") != "aggregator"
-                     and x is not _w]
             if _kids:
                 _w.outcome = "VERIFY_FAILED"
                 _w.status = "stuck"
@@ -5050,6 +5052,29 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             _w.display_result = _merged
             _w.reason = ("%s / 統合結果を掲載 (統合ワーカー %s: %s)"
                          % (_w.reason, _agg.name, _agg.outcome or _agg.status))
+            # A MERGE OVER AN INCOMPLETE SET IS STILL AN ANSWER, AND STILL PARTIAL.
+            #
+            # The two branches below cover a family that came back with nothing. This is the
+            # third way the same thing goes wrong and the one that hides best: the merge ran,
+            # produced text, and was delivered reading as the whole job -- while some children
+            # had gone STUCK or been cancelled and were never in the input. The aggregator
+            # cannot report what it was not given, so nothing anywhere said the answer covered
+            # part of the work.
+            #
+            # The outcome is NOT downgraded here, and that is deliberate: unlike the branches
+            # below there IS an answer, and calling it a failure would be as wrong as calling
+            # it complete. What is owed is the scope of what it was built from.
+            _lost = [x for x in _kids if (x.outcome or "") != "DONE"]
+            if _lost:
+                _w.reason = ("%s / ただし子 %d/%d 件は完了しておらず統合に入っていません (%s)"
+                             % (_w.reason, len(_lost), len(_kids),
+                                ", ".join("%s:%s" % (x.name, x.outcome or x.status)
+                                          for x in _lost[:6])))[:300]
+                print("[fanout] %s: merge delivered over %d of %d children -- %d did not "
+                      "finish (%s)"
+                      % (_cid, len(_kids) - len(_lost), len(_kids), len(_lost),
+                         ", ".join("%s:%s" % (x.name, x.outcome or x.status) for x in _lost)),
+                      flush=True)
         else:
             # EVERY MERGE FAILED, AND THAT USED TO BE SILENT.
             #
