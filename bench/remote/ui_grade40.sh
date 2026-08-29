@@ -10,8 +10,9 @@
 #
 # So: measure first, pull once, keep. Measured 2026-08-30 with `docker manifest inspect`,
 # without pulling anything: 40 instances, 52 GB compressed, mean 1.3 GB. Uncompressed that
-# is roughly 105-130 GB against 190 GB free inside the WSL disk, which was capped at 230 GB
-# so it can never eat the host's C: below ~80 GB.
+# is roughly 105-130 GB against 190 GB free on the eval host's docker filesystem,
+# which on this particular box is a WSL virtual disk capped at 230 GB so it cannot eat the
+# Windows volume below ~80 GB. Nothing here depends on that; it is one host's arrangement.
 #
 # If it does not fit, this STOPS and says so. It does not free space by deleting what it
 # just downloaded.
@@ -29,7 +30,7 @@ mkdir -p "$OUT"
 freeG(){ df -BG / | awk 'NR==2{gsub(/G/,"",$4);print $4}'; }
 say(){ echo "[$(date +%H:%M:%S)] $*"; }
 
-say "START ui40  free=$(freeG)G inside the WSL disk  floor=${FLOOR_GB}G"
+say "START ui40  free=$(freeG)G on the docker filesystem  floor=${FLOOR_GB}G"
 
 for t in $(seq 1 20); do docker info >/dev/null 2>&1 && break; sleep 3; done
 docker info >/dev/null 2>&1 || { say "dockerd unreachable"; exit 1; }
