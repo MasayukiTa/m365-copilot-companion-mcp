@@ -297,3 +297,56 @@ def test_the_second_reviews_false_positives_are_gone(cmd):
     「読まずに承認する」訓練になる -- 守る以上に失う。`iex` は引用符の中の言及にも
     一致していた。ゲートが自分自身についての文章に反応する状態だった。"""
     assert not CG.destructive_shell(cmd), cmd
+
+
+# ---- installing software changes the machine, and that was not gated at all --------------
+
+def test_installing_software_is_gated():
+    """A worker ran `winget install --id GoLang.Go --accept-package-agreements` on a corporate
+    laptop on 2026-08-30 and nothing asked.
+
+    It went through as ordinary work because every pattern in the list answered the question
+    "does this destroy something", and an install destroys nothing. It changes the computer,
+    and --accept-package-agreements accepts licence terms on the operator's behalf."""
+    for cmd in [
+        "winget install --id GoLang.Go -e --accept-source-agreements --accept-package-agreements",
+        "choco install golang -y",
+        "scoop install go",
+        "msiexec /i go1.27.0.windows-amd64.msi /passive /norestart",
+        "Install-Module -Name Pester -Force",
+        "Install-Package Newtonsoft.Json",
+        "Add-AppxPackage .\thing.appx",
+        "Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0",
+        "dism /online /add-capability /capabilityname:Tools.Foo",
+    ]:
+        assert CG.destructive_shell(cmd), "not gated: %s" % cmd
+
+
+def test_project_dependency_installs_are_not_gated():
+    """THE LINE IS THE MACHINE, NOT THE PACKAGE MANAGER.
+
+    This module's own docstring promises not to fire on `npm install`, and it must not: a gate
+    that fires on nearly every build is one people learn to approve unread, which costs more
+    than it protects. Populating a project directory is ordinary work; changing the computer
+    is not."""
+    for cmd in [
+        "npm install", "npm install --save-dev jest", "npm ci",
+        "yarn install", "pnpm install",
+        "pip install -r requirements.txt", "pip install pytest",
+        "go mod download", "go build ./...", "go test ./...",
+        "cargo build", "bundle install",
+    ]:
+        assert not CG.destructive_shell(cmd), "falsely gated: %s" % cmd
+
+
+def test_no_pattern_carries_a_literal_control_character():
+    """A word boundary written as an escaped `\b` inside a NON-raw string becomes the
+    backspace character, and the pattern then silently matches nothing.
+
+    That happened while adding the block above: seven install forms all reported clean because
+    every `\b` had become 0x08. The patterns compiled, the list was the right length, and the
+    gate was simply blind."""
+    for pat in CG._DESTRUCTIVE_PATTERNS:
+        for ch in pat.pattern:
+            assert ord(ch) >= 32 or ch in "\t", (
+                "control char %r in %r -- an escape was interpreted, not written" % (ch, pat.pattern))
