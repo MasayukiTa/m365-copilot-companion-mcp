@@ -5007,6 +5007,31 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                  if getattr(getattr(x, "task_envelope", None), "role", "") == "aggregator"
                  and getattr(getattr(x, "task_envelope", None), "campaign_id", "") == _cid]
         if not _aggs:
+            # THE MERGE WAS NEVER CREATED, AND THAT IS ALSO A MISSING ANSWER.
+            #
+            # The branch below handles a merge that ran and failed. This is the other way a
+            # family ends with nothing: the children finished but the sweep that queues the
+            # merge never got there -- a graceful stop cancels every running worker and
+            # breaks out of the loop, so a campaign that became ready in the same pass is
+            # simply dropped. `continue` then left the parent exactly as it was, holding its
+            # split proposal, and that proposal was delivered as the answer.
+            #
+            # Silence here is worse than in the failure case, because there is not even an
+            # aggregator to name: a reader sees a plan, no merge, and no indication that one
+            # was ever owed.
+            _kids = [x for x in workers
+                     if getattr(getattr(x, "task_envelope", None), "campaign_id", "") == _cid
+                     and getattr(getattr(x, "task_envelope", None), "role", "") != "aggregator"
+                     and x is not _w]
+            if _kids:
+                _w.outcome = "VERIFY_FAILED"
+                _w.status = "stuck"
+                _w.reason = ("%s / 統合が作られないまま終了したため、この結果は分割案のままです"
+                             "(子 %d 件は個別に残っています)。"
+                             % (_w.reason, len(_kids)))[:300]
+                print("[fanout] %s: no merge was ever queued for %d finished child(ren) -- "
+                      "parent marked VERIFY_FAILED rather than delivered with its split "
+                      "proposal" % (_cid, len(_kids)), flush=True)
             continue
         _agg = next((x for x in _aggs if (x.outcome or "") == "DONE"), _aggs[-1])
         _merged = (getattr(_agg, "display_result", "") or getattr(_agg, "last_response", ""))
