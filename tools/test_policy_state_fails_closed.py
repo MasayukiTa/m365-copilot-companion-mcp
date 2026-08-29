@@ -17,8 +17,22 @@ from tools import contract_gate as CG
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
+    """Isolate BOTH pieces of state the gate touches, not just the one under test.
+
+    The first version of this fixture redirected the contract file and stopped there. But
+    check_op's fail-closed path also CREATES AN APPROVAL GATE, and _create_gate resolves its
+    directory from tools.file_ops.ALLOWED_BASE -- which was still the real one. So running
+    this file posted two live approval requests into the operator's queue, one of them
+    reading `detail=rm -rf /`, and a human had to come and deal with them. Measured
+    2026-08-30 07:36:07.
+
+    A test that exercises a side effect must own every destination that side effect writes
+    to. Redirecting the input and leaving the output pointed at production is not isolation.
+    """
+    import tools.file_ops as FO
     monkeypatch.setattr(CG, "_CONTRACT_FILE", tmp_path / "active_contract.json")
     monkeypatch.setattr(CG, "_SEEN", {"active_contract": False, "retired_via_api": False})
+    monkeypatch.setattr(FO, "ALLOWED_BASE", tmp_path / "base")
     yield
 
 
@@ -86,3 +100,20 @@ def test_load_contract_still_answers_the_old_question():
     CG._CONTRACT_FILE.unlink()
     CG._SEEN["retired_via_api"] = True
     assert CG.load_contract() is None
+
+
+def test_the_fail_closed_path_writes_its_gate_inside_the_test_directory(tmp_path):
+    """The fixture's isolation is itself asserted, because it silently failed once.
+
+    Without this, the only signal that the gate directory was still the real one was a human
+    finding `rm -rf /` waiting for approval.
+    """
+    import tools.file_ops as FO
+    _write("{ not json")
+    assert CG.check_op("shell_destructive", "rm -rf /") is not None
+    gate_dir = FO.ALLOWED_BASE / ".companion_gates"
+    assert gate_dir.is_dir(), "the gate was not written where the fixture pointed"
+    written = list(gate_dir.glob("*.json"))
+    assert written, "the fail-closed path did not create a gate at all"
+    for g in written:
+        assert str(g).startswith(str(FO.ALLOWED_BASE)), "a gate escaped the test directory: %s" % g
