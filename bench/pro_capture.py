@@ -71,7 +71,26 @@ def main():
         captured += 1
         print("%-58s patch=%d bytes" % (inst[:58], len(d)))
         if not a.keep:
-            shutil.rmtree(p, ignore_errors=True)
+            # `git worktree remove` FIRST, rmtree only as a fallback.
+            #
+            # rmtree(ignore_errors=True) cannot delete the locked `.git` entry on Windows, so
+            # it leaves a husk -- a directory that still resolves to the MAIN repository, which
+            # is how this step came to be capable of submitting the harness's own diff as a
+            # prediction. It also leaves the checkout's bulk behind often enough to matter:
+            # measured mid-run, 1,110 MB of worktrees with free disk at 3.1 GB against a 3.0 GB
+            # admission floor, which is the state that had every worker sitting at turn zero.
+            #
+            # git removes its own worktree properly, administrative files included, and
+            # --force is right here because the checkout has just been read and is finished
+            # with.
+            done = subprocess.run(["git", "-C", REPO, "worktree", "remove", "--force", p],
+                                  capture_output=True, text=True, encoding="utf-8",
+                                  errors="replace")
+            if done.returncode != 0:
+                shutil.rmtree(p, ignore_errors=True)
+                if os.path.isdir(p):
+                    print("WARNING: could not remove worktree %s (%s)"
+                          % (p, (done.stderr or "").strip()[:80]))
 
     with open(a.preds, "w", encoding="utf-8") as f:
         json.dump(preds, f, ensure_ascii=False)
