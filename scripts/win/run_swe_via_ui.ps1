@@ -123,6 +123,13 @@ for ($round = 1; $round -le $MaxRounds; $round++) {
     Say ("=== round {0}/{1}: {2} instances, {3} batches ===" -f $round, $MaxRounds, $pending.Count, $batches)
 
     for ($b = 0; $b -lt $batches; $b++) {
+        # Checked HERE, between batches, so a freeze never interrupts work already in flight:
+        # the batch that is running finishes and is captured, and the next one does not start.
+        if (Test-Path ".fleet/swe/FREEZE_LOCAL") {
+            Say "FREEZE_LOCAL present; not starting another batch on this machine"
+            Say "UI_RUN_FROZEN"
+            exit 0
+        }
         $slice = @($pending[($b * $BatchSize)..([math]::Min(($b + 1) * $BatchSize, $pending.Count) - 1)])
         Say ("--- r{0} batch {1}/{2}: {3} instances ---" -f $round, ($b + 1), $batches, $slice.Count)
 

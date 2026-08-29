@@ -85,6 +85,22 @@ if (-not (Test-Path $idsFile)) {
     Set-Content -Path $idsFile -Value $ids -Encoding ascii
 }
 
+# A FREEZE MARKER OUTRANKS EVERYTHING BELOW.
+#
+# A security review on 2026-08-30 concluded that no NEW batch may start locally: workers run
+# as this user with no enforced boundary, and one had already installed software on the
+# machine and downgraded the harness's own dependencies. Finishing the batch already in
+# flight is fine; beginning another is not.
+#
+# It is a marker and not a flag on the command line because the thing that starts this
+# supervisor is sometimes an automated monitor, and a monitor that restarts it must restart
+# it into the frozen state too. Killing the process only wins the race until the next restart.
+$freeze = ".fleet/swe/FREEZE_LOCAL"
+if (Test-Path $freeze) {
+    Say ("frozen by {0}; not supervising and not launching anything" -f $freeze)
+    Say ((Get-Content $freeze -Raw -EA SilentlyContinue) -replace "`r?`n", " ")
+    exit 0
+}
 Say "supervisor up (no relaunch ceiling; remedies escalate)"
 $lastLeft = -1
 $barren = 0        # consecutive relaunches that moved coverage by nothing
