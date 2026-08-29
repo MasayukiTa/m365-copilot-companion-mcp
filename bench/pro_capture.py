@@ -11,6 +11,9 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SW = os.path.join(REPO, ".fleet", "swe")
 WTMAP = os.path.join(SW, "pro_wt_map.json")
 
+# Kept in step with bench/ui_missing_ids.py, which treats anything larger as uncovered.
+MAX_PATCH_BYTES = 1_000_000
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -67,6 +70,15 @@ def main():
                 d += add
         if inst in have:
             preds = [x for x in preds if x["instance_id"] != inst]  # replace
+        # AN OVERSIZE DIFF IS NOT A FIX, AND IT COSTS THE DISK THE RUN NEEDS.
+        #
+        # Measured 2026-08-29: one instance captured 105,722,582 bytes -- a worker had
+        # regenerated vendored and built files, so `git diff HEAD` returned most of a
+        # checkout. It made the predictions file 115 MB on a box that had 2.7 GB free, and
+        # no grader can score it. Record the fact and the size; do not store the bytes.
+        if len(d) > MAX_PATCH_BYTES:
+            skipped.append((inst, "diff of %d bytes exceeds %d; not a fix" % (len(d), MAX_PATCH_BYTES)))
+            d = ""
         preds.append({"instance_id": inst, "patch": d, "prefix": a.prefix})
         captured += 1
         print("%-58s patch=%d bytes" % (inst[:58], len(d)))
