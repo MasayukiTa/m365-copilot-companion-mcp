@@ -22,7 +22,11 @@ def main():
     wt = json.load(open(WTMAP, encoding="utf-8"))
     preds = []
     if os.path.exists(a.preds):
-        preds = json.load(open(a.preds, encoding="utf-8"))
+        # utf-8-sig, NOT utf-8. PowerShell 5.1's `Set-Content -Encoding utf8` writes a BOM,
+        # and this file is created by the run driver, so a plain utf-8 read raises
+        # "Unexpected UTF-8 BOM" and takes the capture step down with it -- which is how a
+        # run went idle at 14:15 and sat there. Write without a BOM, read tolerating one.
+        preds = json.load(open(a.preds, encoding="utf-8-sig"))
     have = {p["instance_id"] for p in preds}
 
     captured, skipped = 0, []
