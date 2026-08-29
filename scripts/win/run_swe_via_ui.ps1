@@ -20,7 +20,11 @@ param(
     [int]$BatchSize = 8,
     [int]$PerBatchTimeoutSec = 3600,
     [string]$Preds = ".fleet/swe/ui_preds.json",
-    [string]$Log = ".fleet/swe/ui_run.log"
+    [string]$Log = ".fleet/swe/ui_run.log",
+    # RESUME, because a run that died at batch 1's capture should not re-solve batch 1. The
+    # accumulator is only cleared when starting from the beginning; resuming keeps what is
+    # already captured, which is the point of resuming.
+    [int]$StartBatch = 1
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,11 +42,21 @@ function Say([string]$m) {
 
 # A FRESH ACCUMULATOR. Keeping the old one lets an interrupted run's patches be graded as this
 # run's, which is the shortest path from this harness to a number nobody produced.
-if (Test-Path $Preds) { Move-Item -LiteralPath $Preds -Destination "$Preds.prev" -Force }
-"[]" | Set-Content -LiteralPath $Preds -Encoding utf8
-if (Test-Path ".fleet/swe/pro_wt_map.json") { Remove-Item ".fleet/swe/pro_wt_map.json" -Force }
-if (Test-Path ".fleet/swe/work") { Remove-Item ".fleet/swe/work" -Recurse -Force -ErrorAction SilentlyContinue }
-Remove-Item $Log -Force -ErrorAction SilentlyContinue
+if ($StartBatch -le 1 -and (Test-Path $Preds)) {
+    Move-Item -LiteralPath $Preds -Destination "$Preds.prev" -Force
+}
+# NO BOM. PowerShell 5.1's `-Encoding utf8` writes one, and the Python that reads this file
+# next raises "Unexpected UTF-8 BOM" -- which stopped a run dead at its first capture. This
+# repository already holds that rule for .env files; it is the same trap in a new file.
+if ($StartBatch -le 1) {
+    [System.IO.File]::WriteAllText((Join-Path (Get-Location) $Preds), "[]",
+                                   (New-Object System.Text.UTF8Encoding($false)))
+}
+if ($StartBatch -le 1) {
+    if (Test-Path ".fleet/swe/pro_wt_map.json") { Remove-Item ".fleet/swe/pro_wt_map.json" -Force }
+    if (Test-Path ".fleet/swe/work") { Remove-Item ".fleet/swe/work" -Recurse -Force -ErrorAction SilentlyContinue }
+    Remove-Item $Log -Force -ErrorAction SilentlyContinue
+}
 
 # FAN-OUT MUST BE OFF, AND THE SCRIPT MAKES SURE RATHER THAN ASSUMING.
 #
@@ -71,7 +85,7 @@ $ids = @($ids -split "`n" | Where-Object { $_.Trim() })
 Say ("START ui-run: {0} instances, batch={1}, slice={2}" -f $ids.Count, $BatchSize, $SliceFile)
 
 $batches = [math]::Ceiling($ids.Count / $BatchSize)
-for ($b = 0; $b -lt $batches; $b++) {
+for ($b = ($StartBatch - 1); $b -lt $batches; $b++) {
     $slice = $ids[($b * $BatchSize)..([math]::Min(($b + 1) * $BatchSize, $ids.Count) - 1)]
     Say ("=== batch {0}/{1}: {2} instances ===" -f ($b + 1), $batches, $slice.Count)
 
@@ -105,8 +119,16 @@ for ($b = 0; $b -lt $batches; $b++) {
     }
     if (-not $sawRunning) { Say "WARNING: the fleet never reported running for this batch" }
 
-    & $py bench/pro_capture.py --preds $Preds 2>&1 |
-        Select-Object -Last 2 | ForEach-Object { Say ("capture: " + $_) }
+    # CAPTURE MUST NOT END THE RUN. With ErrorActionPreference=Stop, a non-zero exit from
+    # this step threw and the driver died silently at batch 1 -- the log's last line was
+    # "batch fleet went idle" and nothing followed for forty minutes. A failed capture costs
+    # one batch; a dead driver costs the rest of the slice.
+    try {
+        & $py bench/pro_capture.py --preds $Preds 2>&1 |
+            Select-Object -Last 2 | ForEach-Object { Say ("capture: " + $_) }
+    } catch {
+        Say ("capture FAILED for this batch: " + $_.Exception.Message)
+    }
 }
 
 $total = & $py -c "import json,io,sys; print(len(json.load(io.open(sys.argv[1],encoding='utf-8'))))" $Preds
