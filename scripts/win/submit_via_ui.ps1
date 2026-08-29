@@ -30,25 +30,70 @@ param(
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
 
+if (-not ('Win32.Wnd' -as [type])) {
+    Add-Type -Namespace Win32 -Name Wnd -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool SetForegroundWindow(System.IntPtr hWnd);
+'@ -PassThru | Out-Null
+}
+if (-not ('Win32.KeyInput' -as [type])) {
+    Add-Type -Namespace Win32 -Name KeyInput -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, System.UIntPtr dwExtraInfo);
+'@ -PassThru | Out-Null
+}
 function Get-Cockpit {
+    # PICK THE WINDOW THAT HAS THE COMPOSER, NOT A WINDOW THAT BELONGS TO THE PROCESS.
+    #
+    # This used to match on ClassName "HwndWrapper[FleetCockpit.exe;;" -- but the real class
+    # name ends with a per-process guid, and PropertyCondition compares for equality, not by
+    # prefix. So the first condition never matched anything and every call fell through to
+    # the fallback, which returns the first TOP-LEVEL WINDOW OF THE PROCESS. In WPF a popup,
+    # a tooltip and a ComboBox dropdown are each a top-level window, so that fallback can
+    # hand back a window with no controls in it at all.
+    #
+    # Measured 2026-08-29/30: from 23:03 to 23:58 every submit died with "no writable text
+    # field found in the cockpit" while the cockpit was running, responding, on screen, and
+    # holding an enabled non-readonly goalInput 864 pixels wide. Twenty-four attempts across
+    # eight driver launches failed against a window that was never the one being looked for,
+    # and the run sat unfinished for six and three quarter hours.
+    #
+    # The composer is what the caller needs, so the composer is the criterion.
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $idCond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'goalInput')
+    $restored = $false
     while ((Get-Date) -lt $deadline) {
-        $root = [System.Windows.Automation.AutomationElement]::RootElement
-        $cond = New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::ClassNameProperty, "HwndWrapper[FleetCockpit.exe;;")
-        $win = $root.FindFirst([System.Windows.Automation.TreeScope]::Children, $cond)
-        if ($win) { return $win }
-        # The class name carries a per-process guid, so fall back to matching by process id.
         $proc = Get-Process -Name FleetCockpit -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($proc) {
+            $root = [System.Windows.Automation.AutomationElement]::RootElement
             $byPid = New-Object System.Windows.Automation.PropertyCondition(
                 [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $proc.Id)
-            $win = $root.FindFirst([System.Windows.Automation.TreeScope]::Children, $byPid)
-            if ($win) { return $win }
+            $wins = $root.FindAll([System.Windows.Automation.TreeScope]::Children, $byPid)
+            for ($i = 0; $i -lt $wins.Count; $i++) {
+                $w = $wins.Item($i)
+                if ($w.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $idCond)) {
+                    if ($i -gt 0) { Write-Output ("cockpit: composer was in window {0} of {1}" -f ($i + 1), $wins.Count) }
+                    return $w
+                }
+            }
+            # NO WINDOW HAS THE COMPOSER. A minimized WPF window drops its content out of the
+            # automation tree, so restore once before concluding anything, rather than
+            # retrying a search that cannot succeed.
+            if (-not $restored -and $proc.MainWindowHandle -ne [IntPtr]::Zero) {
+                $restored = $true
+                Write-Output "cockpit: no window exposes goalInput; restoring the main window"
+                [Win32.Wnd]::ShowWindow($proc.MainWindowHandle, 9) | Out-Null      # SW_RESTORE
+                [Win32.Wnd]::SetForegroundWindow($proc.MainWindowHandle) | Out-Null
+                Start-Sleep -Milliseconds 900
+                continue
+            }
         }
         Start-Sleep -Milliseconds 400
     }
-    throw "the cockpit window was not found; is FleetCockpit running?"
+    throw "no cockpit window exposes the goal composer; is FleetCockpit running and not minimized?"
 }
 
 function Get-Edits($window) {
@@ -162,12 +207,6 @@ if ($target) {
 #
 # keybd_event goes through SendInput, which has no hook and no timeout, so a busy machine
 # delays the keystroke instead of failing it. Same keys, same window, no journal.
-if (-not ('Win32.KeyInput' -as [type])) {
-    Add-Type -Namespace Win32 -Name KeyInput -MemberDefinition @'
-[System.Runtime.InteropServices.DllImport("user32.dll")]
-public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, System.UIntPtr dwExtraInfo);
-'@ -PassThru | Out-Null
-}
 function Send-CtrlEnter {
     $VK_CONTROL = 0x11; $VK_RETURN = 0x0D; $KEYEVENTF_KEYUP = 0x0002
     [Win32.KeyInput]::keybd_event($VK_CONTROL, 0, 0, [System.UIntPtr]::Zero)
