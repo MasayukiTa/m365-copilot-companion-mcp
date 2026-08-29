@@ -24,7 +24,11 @@ param(
     # RESUME, because a run that died at batch 1's capture should not re-solve batch 1. The
     # accumulator is only cleared when starting from the beginning; resuming keeps what is
     # already captured, which is the point of resuming.
-    [int]$StartBatch = 1
+    [int]$StartBatch = 1,
+    # HOW MANY TIMES AN UNCOVERED INSTANCE IS RE-WORKED. One pass through the batches is
+    # not a run: a batch can fail to submit, or submit and never start, and one pass leaves
+    # those instances silently unanswered.
+    [int]$MaxRounds = 3
 )
 
 $ErrorActionPreference = "Stop"
@@ -84,53 +88,101 @@ $ids = & $py -c "import json,io,sys; r=json.load(io.open(sys.argv[1],encoding='u
 $ids = @($ids -split "`n" | Where-Object { $_.Trim() })
 Say ("START ui-run: {0} instances, batch={1}, slice={2}" -f $ids.Count, $BatchSize, $SliceFile)
 
-$batches = [math]::Ceiling($ids.Count / $BatchSize)
-for ($b = ($StartBatch - 1); $b -lt $batches; $b++) {
-    $slice = $ids[($b * $BatchSize)..([math]::Min(($b + 1) * $BatchSize, $ids.Count) - 1)]
-    Say ("=== batch {0}/{1}: {2} instances ===" -f ($b + 1), $batches, $slice.Count)
+# WHY THIS LOOPS OVER ROUNDS AND NOT JUST OVER BATCHES.
+#
+# The previous shape was one pass of five batches, and it caught a failed submit, logged it,
+# and carried on into the wait and the capture. Measured, 2026-08-29: batches 3, 4 and 5 all
+# threw out of SendKeys, so nothing was ever submitted for them; the driver then waited the
+# full per-batch hour three times over for a fleet that had never started, captured empty
+# diffs from worktrees nobody had touched, and finished with
+#     DONE ui-run: 40 predictions
+# for a slice in which 22 instances had never been sent anywhere. Three hours of the wall
+# clock went into those waits and the run's own report concealed it.
+#
+# Two rules come out of that, and they are the whole of this rewrite:
+#   1. A batch that was never submitted is not waited for and is not captured. Capturing it
+#      is what turned "no work was done" into a row in the predictions file.
+#   2. The run's finish condition is coverage, not row count. It re-works whatever is still
+#      uncovered until it is covered or the rounds run out, and it says so either way.
+$idsFile = ".fleet/swe/ui_all_ids.txt"
+Set-Content -Path $idsFile -Value ($ids -join "`n") -Encoding ascii   # ascii: utf8 here means BOM
 
-    $env:SWE_SLICE_FILE = $SliceFile
-    $goalsFile = ".fleet/swe/ui_batch.jsonl"
-    & $py bench/pro_stage_goals.py --ids ($slice -join ",") --out $goalsFile 2>&1 |
-        Select-Object -Last 1 | ForEach-Object { Say ("stage: " + $_) }
+# WHAT IS PENDING IS WHAT IS UNCOVERED, NOT WHAT COMES AFTER SOME BATCH NUMBER.
+# Resuming by batch index assumes every earlier batch succeeded, and the run this replaces
+# is the counter-example: batches 3-5 sat in the completed range having answered nothing.
+$pending = @(& $py bench/ui_missing_ids.py $idsFile $Preds | Where-Object { $_.Trim() })
+Say ("pending at start: {0} of {1} uncovered" -f $pending.Count, $ids.Count)
 
-    $uiFile = ".fleet/swe/ui_batch_lines.txt"
-    $n = & $py -c "import sys; sys.path.insert(0,'.'); from bench.ui_goal_lines import write_ui_file; print(write_ui_file(sys.argv[1], sys.argv[2]))" $goalsFile $uiFile
-    Say ("ui lines: {0}" -f $n)
+for ($round = 1; $round -le $MaxRounds; $round++) {
+    if ($pending.Count -eq 0) { break }
+    $batches = [math]::Ceiling($pending.Count / $BatchSize)
+    Say ("=== round {0}/{1}: {2} instances, {3} batches ===" -f $round, $MaxRounds, $pending.Count, $batches)
 
-    # SUBMIT THROUGH THE COCKPIT.
-    try {
-        & powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\win\submit_via_ui.ps1 -GoalFile $uiFile 2>&1 |
-            Select-Object -Last 3 | ForEach-Object { Say ("submit: " + $_) }
-    } catch {
-        Say ("submit FAILED: " + $_.Exception.Message)
+    for ($b = 0; $b -lt $batches; $b++) {
+        $slice = @($pending[($b * $BatchSize)..([math]::Min(($b + 1) * $BatchSize, $pending.Count) - 1)])
+        Say ("--- r{0} batch {1}/{2}: {3} instances ---" -f $round, ($b + 1), $batches, $slice.Count)
+
+        $env:SWE_SLICE_FILE = $SliceFile
+        $goalsFile = ".fleet/swe/ui_batch.jsonl"
+        & $py bench/pro_stage_goals.py --ids ($slice -join ",") --out $goalsFile 2>&1 |
+            Select-Object -Last 1 | ForEach-Object { Say ("stage: " + $_) }
+
+        $uiFile = ".fleet/swe/ui_batch_lines.txt"
+        $n = & $py -c "import sys; sys.path.insert(0,'.'); from bench.ui_goal_lines import write_ui_file; print(write_ui_file(sys.argv[1], sys.argv[2]))" $goalsFile $uiFile
+        Say ("ui lines: {0}" -f $n)
+
+        # SUBMIT, WITH RETRIES, AND THE OUTCOME DECIDES WHETHER THE REST OF THE BATCH RUNS.
+        # SendKeys' journal hook fails when the foreground application is not pumping
+        # messages, which is a transient condition and worth another attempt -- but a batch
+        # that never got submitted must not fall through to the wait.
+        $submitted = $false
+        for ($try = 1; $try -le 3 -and -not $submitted; $try++) {
+            try {
+                & powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\win\submit_via_ui.ps1 -GoalFile $uiFile 2>&1 |
+                    Select-Object -Last 3 | ForEach-Object { Say ("submit: " + $_) }
+                $submitted = $true
+            } catch {
+                Say ("submit attempt {0}/3 FAILED: {1}" -f $try, $_.Exception.Message)
+                Start-Sleep -Seconds 20
+            }
+        }
+        if (-not $submitted) {
+            Say "submit gave up after 3 attempts; NOT waiting and NOT capturing this batch"
+            continue
+        }
+
+        $t0 = Get-Date
+        $sawRunning = $false
+        while (((Get-Date) - $t0).TotalSeconds -lt $PerBatchTimeoutSec) {
+            Start-Sleep -Seconds 15
+            $running = & $py -c "import json,io,os; p='.fleet/status.json'; d=json.load(io.open(p,encoding='utf-8')) if os.path.exists(p) else {}; print('1' if d.get('running') else '0')"
+            if ($running -eq "1") { $sawRunning = $true }
+            elseif ($sawRunning) { Say "batch fleet went idle"; break }
+        }
+        if (-not $sawRunning) {
+            # The submit reported success and the fleet still never ran. Capturing here is
+            # what manufactured empty predictions and let the run call them answers.
+            Say "the fleet never reported running; NOT capturing this batch"
+            continue
+        }
+
+        try {
+            & $py bench/pro_capture.py --preds $Preds 2>&1 |
+                Select-Object -Last 2 | ForEach-Object { Say ("capture: " + $_) }
+        } catch {
+            Say ("capture FAILED for this batch: " + $_.Exception.Message)
+        }
     }
 
-    # WAIT FOR IDLE. status.json's `running` is the cockpit's own view of the fleet, which is
-    # the thing that was actually started -- polling the process list would answer a different
-    # question and answer it wrong when several runs exist.
-    $t0 = Get-Date
-    $sawRunning = $false
-    while (((Get-Date) - $t0).TotalSeconds -lt $PerBatchTimeoutSec) {
-        Start-Sleep -Seconds 15
-        $running = & $py -c "import json,io,os; p='.fleet/status.json'; d=json.load(io.open(p,encoding='utf-8')) if os.path.exists(p) else {}; print('1' if d.get('running') else '0')"
-        if ($running -eq "1") { $sawRunning = $true }
-        elseif ($sawRunning) { Say "batch fleet went idle"; break }
-    }
-    if (-not $sawRunning) { Say "WARNING: the fleet never reported running for this batch" }
-
-    # CAPTURE MUST NOT END THE RUN. With ErrorActionPreference=Stop, a non-zero exit from
-    # this step threw and the driver died silently at batch 1 -- the log's last line was
-    # "batch fleet went idle" and nothing followed for forty minutes. A failed capture costs
-    # one batch; a dead driver costs the rest of the slice.
-    try {
-        & $py bench/pro_capture.py --preds $Preds 2>&1 |
-            Select-Object -Last 2 | ForEach-Object { Say ("capture: " + $_) }
-    } catch {
-        Say ("capture FAILED for this batch: " + $_.Exception.Message)
-    }
+    $pending = @(& $py bench/ui_missing_ids.py $idsFile $Preds | Where-Object { $_.Trim() })
+    Say ("round {0} end: {1} still uncovered" -f $round, $pending.Count)
 }
 
-$total = & $py -c "import json,io,sys; print(len(json.load(io.open(sys.argv[1],encoding='utf-8'))))" $Preds
-Say ("DONE ui-run: {0} predictions -> {1}" -f $total, $Preds)
-Say "UI_RUN_COMPLETE"
+$covered = $ids.Count - $pending.Count
+Say ("ui-run finished: {0}/{1} instances have a usable patch" -f $covered, $ids.Count)
+if ($pending.Count -gt 0) {
+    Say ("STILL UNCOVERED ({0}): {1}" -f $pending.Count, (($pending | Select-Object -First 12) -join " "))
+    Say "UI_RUN_INCOMPLETE"
+} else {
+    Say "UI_RUN_COMPLETE"
+}
