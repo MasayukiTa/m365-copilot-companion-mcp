@@ -25,12 +25,42 @@ def main():
         preds = json.load(open(a.preds, encoding="utf-8"))
     have = {p["instance_id"] for p in preds}
 
-    captured = 0
+    captured, skipped = 0, []
     for inst, p in sorted(wt.items()):
         if not os.path.isdir(p):
             continue
-        d = subprocess.run(["git", "-C", p, "diff"], capture_output=True, text=True,
+        # THE DIRECTORY EXISTING IS NOT THE WORKTREE EXISTING.
+        #
+        # These are git worktrees, and the cleanup below is rmtree(ignore_errors=True): on
+        # Windows it removes the checked-out files and fails silently on the locked `.git`
+        # entry, leaving a directory containing nothing but a pointer into the main
+        # repository. `git -C <that>` then resolves to THE HARNESS'S OWN REPOSITORY and
+        # `git diff` returns whatever is uncommitted in it -- so this loop would write the
+        # harness's working tree into a prediction file as that instance's patch, and a
+        # grader would score it. Measured: every surviving worktree reported HEAD as this
+        # repository's latest commit and a dirty count of 36, which is the checkout I was
+        # editing, not the instance.
+        top = subprocess.run(["git", "-C", p, "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, encoding="utf-8",
+                             errors="replace").stdout.strip()
+        if os.path.normcase(os.path.abspath(top or "")) != os.path.normcase(os.path.abspath(p)):
+            skipped.append((inst, "not a worktree root (resolves to %s)" % (top or "?")))
+            continue
+        # `git diff` alone shows UNSTAGED changes to TRACKED files. A worker that staged its
+        # edit, or added a new file, produces nothing under it -- and nothing is exactly what
+        # a wrong answer looks like, so the two were indistinguishable. HEAD covers staged and
+        # unstaged; untracked files are added separately below.
+        d = subprocess.run(["git", "-C", p, "diff", "HEAD"], capture_output=True, text=True,
                            encoding="utf-8", errors="replace").stdout
+        extra = subprocess.run(["git", "-C", p, "ls-files", "--others", "--exclude-standard"],
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace").stdout.split()
+        for rel in extra:
+            add = subprocess.run(["git", "-C", p, "diff", "--no-index", "/dev/null", rel],
+                                 capture_output=True, text=True, encoding="utf-8",
+                                 errors="replace").stdout
+            if add:
+                d += add
         if inst in have:
             preds = [x for x in preds if x["instance_id"] != inst]  # replace
         preds.append({"instance_id": inst, "patch": d, "prefix": a.prefix})
@@ -41,8 +71,13 @@ def main():
 
     with open(a.preds, "w", encoding="utf-8") as f:
         json.dump(preds, f, ensure_ascii=False)
-    print("captured %d (total preds now %d) -> %s%s"
-          % (captured, len(preds), a.preds, "" if a.keep else "  [worktrees deleted]"))
+    for inst, why in skipped:
+        # LOUD. A skipped instance is one this run did not measure, and silence here is how a
+        # husk's parent-repository diff would have been mistaken for an answer.
+        print("SKIPPED %-58s %s" % (inst[:58], why))
+    print("captured %d, skipped %d (total preds now %d) -> %s%s"
+          % (captured, len(skipped), len(preds), a.preds,
+             "" if a.keep else "  [worktrees deleted]"))
 
 
 if __name__ == "__main__":
