@@ -69,6 +69,36 @@ def _pip_version() -> str:
         return "(unavailable)"
 
 
+# The harness's own environment, resolved once. A worker's checkout may hold a venv of its
+# own; that is where its dependencies belong.
+_HARNESS_PREFIX = os.path.normcase(os.path.abspath(sys.prefix))
+
+
+def _project_interpreter() -> Optional[str]:
+    """The interpreter to install into, or None when only the harness's own is available.
+
+    Looks for a virtual environment in the current working directory -- which for a fleet
+    worker is its checkout -- and returns its interpreter. Returns None rather than falling
+    back to `sys.executable`, because falling back is what put an open-source project's
+    requirements into the server's environment.
+    """
+    here = os.path.abspath(os.getcwd())
+    for name in (".venv", "venv", "env"):
+        for rel in (os.path.join("Scripts", "python.exe"), os.path.join("bin", "python")):
+            cand = os.path.join(here, name, rel)
+            if os.path.isfile(cand):
+                if os.path.normcase(os.path.abspath(os.path.dirname(os.path.dirname(cand))))                         != _HARNESS_PREFIX:
+                    return cand
+    # An explicitly activated environment that is not the harness's is fine too.
+    ve = os.environ.get("VIRTUAL_ENV")
+    if ve and os.path.normcase(os.path.abspath(ve)) != _HARNESS_PREFIX:
+        for rel in (os.path.join("Scripts", "python.exe"), os.path.join("bin", "python")):
+            cand = os.path.join(ve, rel)
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
 def pip_install(
     packages: list[str],
     extra_flags: Optional[list[str]] = None,
@@ -103,7 +133,27 @@ def pip_install(
                 if f not in ALLOWED_PIP_FLAGS:
                     return f"[pip_install error: flag {f!r} not in allowlist {sorted(ALLOWED_PIP_FLAGS)}]"
                 flags.append(f)
-        cmd = [sys.executable, "-m", "pip", "install", *_trusted_host_args(), *flags, *cleaned]
+        # THE INTERPRETER IS THE HARNESS'S OWN, AND THAT IS THE WHOLE PROBLEM.
+        #
+        # `sys.executable` here is the venv that runs the MCP server, the tool gateway and
+        # the approval gate. On 2026-08-30 07:02 a fleet worker solving an open-source
+        # instance installed THAT PROJECT'S requirements through this function: pydantic went
+        # 2.13 -> 2.1.0, httpx 0.28.1 -> 0.24.1, and the harness -- which declares
+        # httpx>=0.28.1 -- stopped importing. Every test collection died and the server would
+        # not have restarted. Nothing was bypassed; this function did exactly what its
+        # docstring said, into the wrong environment.
+        #
+        # An external review put it plainly: a project venv is not a security boundary, and
+        # this is not the fix for the general problem -- confinement is. It is the fix for
+        # THIS: a worker that means to populate its checkout must not be able to reach the
+        # harness by accident, through a tool that was offered to it for that purpose.
+        target = _project_interpreter()
+        if target is None:
+            return ("[pip_install refused: this would install into the harness's own "
+                    "environment (%s), which runs the server and the approval gate. "
+                    "Create a virtual environment inside the checkout you are working on "
+                    "and install into that instead.]" % sys.prefix)
+        cmd = [target, "-m", "pip", "install", *_trusted_host_args(), *flags, *cleaned]
         r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                            timeout=timeout)
         head = f"$ {' '.join(cmd[3:])}\n"
