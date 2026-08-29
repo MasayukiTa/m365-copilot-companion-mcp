@@ -160,6 +160,26 @@ _DESTRUCTIVE_PATTERNS = [
                re.IGNORECASE),
     re.compile(r"\bRemove-(?:ADUser|LocalUser|Mailbox|AzResource)\b", re.IGNORECASE),
 
+    # ── INSTALLING SOFTWARE ON THE MACHINE ────────────────────────────────────────────
+    # Nothing here was gated, and on 2026-08-30 07:08 a benchmark worker ran
+    #     winget install --id GoLang.Go -e --accept-source-agreements --accept-package-agreements
+    # on a corporate laptop, which pulled an MSI and put Go 1.27.0 into C:\Program Files.
+    # It went through as ordinary work because every pattern above asks "does this destroy
+    # something", and installing destroys nothing. It changes the machine, silently, and
+    # --accept-package-agreements accepts licence terms on the operator's behalf.
+    #
+    # THE LINE IS THE MACHINE, NOT THE PACKAGE MANAGER. `npm install` and `pip install`
+    # populate a project and are ordinary work that this file's own docstring promises not to
+    # gate -- gating them would fire on nearly every build and teach people to approve
+    # unread. What is gated is the managers whose job is to change the computer.
+    re.compile(r"\b(?:winget|choco|chocolatey|scoop)\s+(?:install|upgrade|add)\b", re.IGNORECASE),
+    re.compile(r"\bmsiexec\b(?=.*/(?:i|package|update)\b)", re.IGNORECASE),
+    re.compile(r"\b[^\s\"']+\.msi\b", re.IGNORECASE),
+    re.compile(r"\bInstall-(?:Module|Package|Script)\b", re.IGNORECASE),
+    re.compile(r"\bAdd-AppxPackage\b", re.IGNORECASE),
+    re.compile(r"\b(?:Add-WindowsCapability|Enable-WindowsOptionalFeature)\b", re.IGNORECASE),
+    re.compile(r"\bdism\b(?=.*/(?:add-package|add-capability|enable-feature))", re.IGNORECASE),
+
     # ── EXFILTRATION, which is destruction of a different kind ────────────────────────
     # A request that puts an environment variable into an outbound call is not a deletion, so
     # it fell outside every pattern above -- and it is the shape that turns a one-time

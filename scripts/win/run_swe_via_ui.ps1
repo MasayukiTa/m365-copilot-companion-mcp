@@ -28,7 +28,10 @@ param(
     # HOW MANY TIMES AN UNCOVERED INSTANCE IS RE-WORKED. One pass through the batches is
     # not a run: a batch can fail to submit, or submit and never start, and one pass leaves
     # those instances silently unanswered.
-    [int]$MaxRounds = 3
+    [int]$MaxRounds = 3,
+    # Below this, the Go module cache is cleared between batches. It is the largest
+    # regenerable thing a run leaves behind on a box with single-digit GB free.
+    [double]$GoCacheFloorGb = 4.0
 )
 
 $ErrorActionPreference = "Stop"
@@ -186,6 +189,30 @@ for ($round = 1; $round -le $MaxRounds; $round++) {
                 Select-Object -Last 2 | ForEach-Object { Say ("capture: " + $_) }
         } catch {
             Say ("capture FAILED for this batch: " + $_.Exception.Message)
+        }
+
+        # THE GO MODULE CACHE IS THE BIGGEST THING THIS RUN CREATES, AND IT IS REGENERABLE.
+        #
+        # Deleting a Go toolchain cache by hand to make room, mid-run, did not work: a worker
+        # that needs Go and cannot find it installs Go -- measured 2026-08-30 07:08, a worker
+        # ran `winget install --id GoLang.Go --accept-package-agreements` on this machine --
+        # and then refills the module cache anyway. 4.2 GB freed came back as 2.9 GB in
+        # ~\go plus a system-wide install. Freeing it by hand moves the problem; freeing it
+        # BETWEEN BATCHES, when no worker is building, actually holds.
+        #
+        # `go clean -modcache` and not a tree walk: module cache entries are read-only and
+        # rmtree leaves most of them behind.
+        $freeGb = [math]::Round((Get-PSDrive C).Free / 1GB, 2)
+        if ($freeGb -lt $GoCacheFloorGb) {
+            $goExe = "C:\Program Files\Goin\go.exe"
+            if (Test-Path $goExe) {
+                Say ("free disk {0} GB below {1}; clearing the Go module cache between batches" -f $freeGb, $GoCacheFloorGb)
+                & $goExe clean -modcache 2>&1 | Select-Object -Last 1 | ForEach-Object { Say ("go clean: " + $_) }
+                & $goExe clean -cache 2>&1 | Select-Object -Last 1 | ForEach-Object { Say ("go clean: " + $_) }
+                Say ("free disk now {0} GB" -f [math]::Round((Get-PSDrive C).Free / 1GB, 2))
+            } else {
+                Say ("free disk {0} GB below {1} and no go.exe to clean with" -f $freeGb, $GoCacheFloorGb)
+            }
         }
     }
 
