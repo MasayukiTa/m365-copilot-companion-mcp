@@ -44,6 +44,28 @@ if (Test-Path ".fleet/swe/pro_wt_map.json") { Remove-Item ".fleet/swe/pro_wt_map
 if (Test-Path ".fleet/swe/work") { Remove-Item ".fleet/swe/work" -Recurse -Force -ErrorAction SilentlyContinue }
 Remove-Item $Log -Force -ErrorAction SilentlyContinue
 
+# FAN-OUT MUST BE OFF, AND THE SCRIPT MAKES SURE RATHER THAN ASSUMING.
+#
+# The cockpit keeps `fanout` in its settings file, so a run inherits whatever the last person
+# left it as. Measured: it was on, and eight SWE instances became FORTY-EIGHT workers -- each
+# instance split into subtasks that then edit THE SAME worktree, which is the one arrangement
+# the split job explicitly forbids. Every parent ended FANOUT, so the capture step would have
+# read whatever several children had done to one checkout and called it that instance's patch.
+#
+# A SWE instance is one bug fix. It is not a divisible campaign, and no setting a person left
+# behind should be able to make it into one.
+$settings = Join-Path $env:APPDATA "copilot-bridge\settings.txt"
+if (Test-Path $settings) {
+    $body = Get-Content -LiteralPath $settings -Encoding UTF8
+    if ($body -match '^fanout=on') {
+        Say "fanout was ON in the cockpit settings -- turning it off for this run"
+        ($body -replace '^fanout=on', 'fanout=off') |
+            Set-Content -LiteralPath $settings -Encoding UTF8
+    }
+} else {
+    Say "WARNING: cockpit settings not found; cannot confirm fanout is off"
+}
+
 $ids = & $py -c "import json,io,sys; r=json.load(io.open(sys.argv[1],encoding='utf-8')); print('\n'.join(sorted(x['instance_id'] for x in r)))" $SliceFile
 $ids = @($ids -split "`n" | Where-Object { $_.Trim() })
 Say ("START ui-run: {0} instances, batch={1}, slice={2}" -f $ids.Count, $BatchSize, $SliceFile)

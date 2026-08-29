@@ -55,6 +55,25 @@ def _wilson(k, n, z=1.96):
     return [round(max(0.0, centre - half), 4), round(min(1.0, centre + half), 4)]
 
 
+def _read_id_list(path):
+    """Instance ids a run recorded as spoiled, one per line. Missing reads as none.
+
+    Kept as a FILE THE RUN WRITES rather than a flag someone remembers to pass: the run knows
+    which batch it spoiled at the moment it spoiled it, and a person recalling it hours later
+    at grading time does not.
+    """
+    out = set()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    out.add(line)
+    except OSError:
+        return set()
+    return out
+
+
 def _load_run_config(path):
     """What the run recorded about which arm it was. Missing reads as empty, never as a guess."""
     try:
@@ -172,6 +191,11 @@ def main(argv=None):
                     default=os.path.join(REPO, ".fleet", "swe", "pro_slice50_full.json"),
                     help="the canonical slice this measurement claims to be of; the "
                          "predictions are checked against it")
+    ap.add_argument("--exclude-file",
+                    default=os.path.join(REPO, ".fleet", "swe",
+                                         "ui_batch1_contaminated.txt"),
+                    help="instance ids the run recorded as spoiled, one per line; excluded "
+                         "from the slice before anything is scored")
     ap.add_argument("--force", action="store_true",
                     help="record even though the slice does not check out. The reason must be "
                          "in --note, because the archive will carry this row as though it "
@@ -185,6 +209,24 @@ def main(argv=None):
         return 2
     slice_problems, slice_size = _slice_problems(ids, args.slice_file)
     problems += slice_problems
+
+    # INSTANCES A RUN KNOWS IT SPOILED, NAMED BY THE RUN ITSELF.
+    #
+    # A batch went out with the cockpit's fan-out toggle left on, so eight SWE instances were
+    # split into subtasks whose children then edited THE SAME worktree -- and the capture step
+    # reads one diff per worktree, so what came back was several children's edits to one
+    # checkout presented as that instance's patch. The run is not worthless: the other batches
+    # were clean. What it must not do is score the spoiled eight as though they were measured.
+    spoiled = _read_id_list(args.exclude_file)
+    if spoiled:
+        hit = [i for i in ids if i in spoiled]
+        if hit:
+            print("  spoiled     : %d instance(s) excluded by %s"
+                  % (len(hit), os.path.basename(args.exclude_file)))
+            ids = [i for i in ids if i not in spoiled]
+            if not ids:
+                print("ERROR: every instance was excluded as spoiled")
+                return 2
     resolved = _load_resolved(args.grade, ids)
 
     # WHAT THE FLEET RECORDED ABOUT THIS RUN, joined onto the graded slice.

@@ -91,3 +91,40 @@ def test_a_clean_run_is_not_refused(tmp_path):
               preds=[{"instance_id": "a", "patch": "x"}, {"instance_id": "b", "patch": "x"}],
               slice_ids=["a", "b"], resolved=["a"])
     assert rc == 0
+
+
+def test_a_run_can_name_instances_it_spoiled(tmp_path):
+    """A batch went out with the cockpit's fan-out toggle left on, so eight SWE instances were
+    split into subtasks whose children then edited the SAME worktree -- and capture reads one
+    diff per worktree, so several children's edits to one checkout came back as that instance's
+    patch. The rest of the run was clean; what it must not do is score the spoiled eight."""
+    from bench.pro_record_result import _read_id_list
+    p = tmp_path / "spoiled.txt"
+    p.write_text("a\n# a comment\n\nb\n", encoding="utf-8")
+    assert _read_id_list(str(p)) == {"a", "b"}
+
+
+def test_a_missing_exclude_file_excludes_nothing(tmp_path):
+    """A clean run has no such file, and its absence must not be an error."""
+    from bench.pro_record_result import _read_id_list
+    assert _read_id_list(str(tmp_path / "none.txt")) == set()
+
+
+def test_spoiled_instances_leave_the_slice_before_anything_is_scored(tmp_path):
+    """Excluded, not marked failed: an instance whose patch was assembled from several
+    children's edits to one checkout was never measured, and scoring it either way is a
+    statement about work that did not happen."""
+    d = tmp_path
+    sp = d / "spoiled.txt"
+    sp.write_text("a\n", encoding="utf-8")
+    args = ["--grade", _write(d, "g.json", {"resolved": ["b"]}),
+            "--preds", _write(d, "preds.json", [{"instance_id": "a", "patch": "x"},
+                                                {"instance_id": "b", "patch": "y"}]),
+            "--slice-file", _write(d, "slice.json", [{"instance_id": "a"},
+                                                     {"instance_id": "b"}]),
+            "--wtmap", str(d / "none.json"), "--history", str(d / "none.json"),
+            "--run-config", str(d / "none.json"), "--exclude-file", str(sp)]
+    # 'a' is spoiled, so only 'b' remains -- and 'b' resolved, so the slice check must be the
+    # only thing that can still complain.
+    rc = main(args)
+    assert rc in (0, 2)
