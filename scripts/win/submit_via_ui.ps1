@@ -150,6 +150,34 @@ if ($target) {
     Write-Output ('goal box: by width {0:N0} (next widest {1:N0}) -- no AutomationId' -f $bestW, $secondW)
 }
 
+# CTRL+ENTER WITHOUT SendKeys.
+#
+# SendKeys.SendWait drives a journal hook by default, and a journal hook needs the system to
+# service it within a timeout. Under load it does not: on 2026-08-29, with eight workers and
+# seventeen orphaned test processes on the box, three consecutive batches died here with
+#   "1" の引数を指定して "SendWait" を呼び出し中に例外が発生
+# and none of them was ever submitted. The driver above logged it and waited an hour for each
+# of the runs that had therefore never started -- three hours, and a report claiming forty
+# predictions for a slice where twenty-two instances had been sent nowhere.
+#
+# keybd_event goes through SendInput, which has no hook and no timeout, so a busy machine
+# delays the keystroke instead of failing it. Same keys, same window, no journal.
+if (-not ('Win32.KeyInput' -as [type])) {
+    Add-Type -Namespace Win32 -Name KeyInput -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, System.UIntPtr dwExtraInfo);
+'@ -PassThru | Out-Null
+}
+function Send-CtrlEnter {
+    $VK_CONTROL = 0x11; $VK_RETURN = 0x0D; $KEYEVENTF_KEYUP = 0x0002
+    [Win32.KeyInput]::keybd_event($VK_CONTROL, 0, 0, [System.UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 40
+    [Win32.KeyInput]::keybd_event($VK_RETURN, 0, 0, [System.UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 40
+    [Win32.KeyInput]::keybd_event($VK_RETURN, 0, $KEYEVENTF_KEYUP, [System.UIntPtr]::Zero)
+    [Win32.KeyInput]::keybd_event($VK_CONTROL, 0, $KEYEVENTF_KEYUP, [System.UIntPtr]::Zero)
+}
+
 function Submit([string]$text) {
     # CTRL+ENTER, NOT ENTER. The composer sets AcceptsReturn, so a plain Enter inserts a
     # newline and nothing is submitted -- which is exactly what happened the first time
@@ -159,7 +187,7 @@ function Submit([string]$text) {
     Start-Sleep -Milliseconds 250
     $target.SetFocus()
     Start-Sleep -Milliseconds 200
-    [System.Windows.Forms.SendKeys]::SendWait("^{ENTER}")
+    Send-CtrlEnter
     Start-Sleep -Milliseconds 900
     # AND VERIFY, because a submit that silently did nothing is the failure mode this
     # whole script exists to catch. An emptied box is the cockpit acknowledging it.
