@@ -13,9 +13,14 @@ import relay.relay_fleet as RF
 
 
 def _delivery_source():
+    """The delivery block, bounded by what FOLLOWS it rather than by a character count.
+
+    A fixed window silently truncated the moment the block grew, and three tests then failed
+    for a reason that had nothing to do with the code they were about."""
     src = inspect.getsource(RF.run_relay_fleet)
     i = src.index("_aggs = [x for x in workers")
-    return src[i:i + 3000]
+    j = src.index('notify("', i)
+    return src[i:j]
 
 
 def test_a_family_whose_merges_all_failed_does_not_deliver_the_split_proposal():
@@ -66,3 +71,32 @@ def test_the_module_still_parses_and_the_branch_is_reachable():
         start = body.rfind("\n", 0, pos) + 1
         return pos - start
     assert indent_of(i_if) == indent_of(i_else)
+
+
+def test_a_family_whose_merge_was_never_queued_is_also_marked():
+    """THE OTHER WAY A FAMILY ENDS WITH NOTHING. The branch above handles a merge that ran and
+    failed. This is the case where none was ever created: a graceful stop cancels every running
+    worker and breaks out of the loop, so a campaign that became ready in the same pass is
+    dropped. `continue` then left the parent holding its split proposal, and that proposal was
+    delivered as the answer -- with not even an aggregator to name."""
+    body = _delivery_source()
+    head = body[:body.index("_agg = next(")]
+    assert "if not _aggs:" in head
+    assert "VERIFY_FAILED" in head
+    assert "no merge was ever queued" in head
+
+
+def test_a_parent_with_no_children_at_all_is_left_alone():
+    """A goal that never split has no family and owes no merge. Marking it would turn every
+    ordinary goal into a failure."""
+    body = _delivery_source()
+    head = body[:body.index("_agg = next(")]
+    # The marking is guarded on there being children.
+    assert "if _kids:" in head
+
+
+def test_both_missing_answer_paths_use_the_same_outcome():
+    """A merge that failed and a merge that never existed are the same fact for a reader: the
+    answer is missing. Two outcomes would split one condition across two vocabularies."""
+    body = _delivery_source()
+    assert body.count('_w.outcome = "VERIFY_FAILED"') == 2
