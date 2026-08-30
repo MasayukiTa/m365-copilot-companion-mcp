@@ -472,43 +472,6 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
         # Default is shadow -- it records what it WOULD refuse and blocks nothing --
         # because switching a gate from permissive to closed without measuring first is the
         # mistake this file has already been corrected for once.
-        # ROUTE IT TO THE CONTAINER BEFORE RUNNING IT HERE.
-        #
-        # This is the point the containment work has been building toward: the broker, its
-        # client and the allowlist all existed and nothing used them, so the worktrees stayed
-        # on this machine and a worker still wrote wherever the operator could.
-        #
-        # NotRoutable is not a fallback signal by itself -- when routing is OFF it means
-        # "carry on as before", and that is the only case that continues. When routing is ON
-        # and a call cannot be placed in a container, it is refused: running it here instead
-        # would leave the run looking identical and unconfined.
-        #
-        # AND ONLY FOR THE FLEET'S OWN CALLS. Routing was read on every call this gateway
-        # serves, so switching it on would have refused the operator's tool calls too -- each
-        # names a path no container owns. The first fix gated it on "is an autonomy contract
-        # armed", which is a DIFFERENT mechanism: that file is written by an operator, not by
-        # a bench run, so during the first real routed run the predicate read False, every
-        # worker executed here, and it did so in the address directories staging had left
-        # empty. The switch was on, it was reported on, and nothing was contained.
-        #
-        # The predicate that actually separates the two populations is whether the path
-        # belongs to a staged instance. NotAFleetPath means "not ours" and carries on
-        # unchanged; NotRoutable means "ours, and it could not be placed", which is refused.
-        try:
-            from relay import broker_client as _bc
-            from relay import fleet_tool_router as _router
-            if _bc.enabled():
-                try:
-                    return _router.route(name, _args)
-                except _router.NotAFleetPath:
-                    pass
-                except _router.NotRoutable as _nr:
-                    return ("[call_tool refused] %s\n"
-                            "Fleet execution is routed to the eval host, and this call "
-                            "could not be placed in a container. It was not run here."
-                            % _nr)
-        except ImportError:
-            pass
         try:
             from relay.fleet_toolset import check as _fleet_check
             _ok, _note = _fleet_check(name)
@@ -571,6 +534,49 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
             from tools import tool_probe as _probe
             _probe.note_inbound(name, _args)
         except Exception:
+            pass
+        # PLACED AFTER `_args` EXISTS. It was written above the argument parsing and read
+        # `_args` sixty-five lines before that name is bound, so EVERY call through this
+        # gateway raised UnboundLocalError the moment routing shipped. Nothing routed,
+        # nothing ran locally, and the fleet's workers reported STUCK -- which reads like
+        # models failing at the task. The tests all passed: they assert on this file's
+        # SOURCE, and source assertions cannot catch a name that is not bound yet.
+        # ROUTE IT TO THE CONTAINER BEFORE RUNNING IT HERE.
+        #
+        # This is the point the containment work has been building toward: the broker, its
+        # client and the allowlist all existed and nothing used them, so the worktrees stayed
+        # on this machine and a worker still wrote wherever the operator could.
+        #
+        # NotRoutable is not a fallback signal by itself -- when routing is OFF it means
+        # "carry on as before", and that is the only case that continues. When routing is ON
+        # and a call cannot be placed in a container, it is refused: running it here instead
+        # would leave the run looking identical and unconfined.
+        #
+        # AND ONLY FOR THE FLEET'S OWN CALLS. Routing was read on every call this gateway
+        # serves, so switching it on would have refused the operator's tool calls too -- each
+        # names a path no container owns. The first fix gated it on "is an autonomy contract
+        # armed", which is a DIFFERENT mechanism: that file is written by an operator, not by
+        # a bench run, so during the first real routed run the predicate read False, every
+        # worker executed here, and it did so in the address directories staging had left
+        # empty. The switch was on, it was reported on, and nothing was contained.
+        #
+        # The predicate that actually separates the two populations is whether the path
+        # belongs to a staged instance. NotAFleetPath means "not ours" and carries on
+        # unchanged; NotRoutable means "ours, and it could not be placed", which is refused.
+        try:
+            from relay import broker_client as _bc
+            from relay import fleet_tool_router as _router
+            if _bc.enabled():
+                try:
+                    return _router.route(name, _args)
+                except _router.NotAFleetPath:
+                    pass
+                except _router.NotRoutable as _nr:
+                    return ("[call_tool refused] %s\n"
+                            "Fleet execution is routed to the eval host, and this call "
+                            "could not be placed in a container. It was not run here."
+                            % _nr)
+        except ImportError:
             pass
         try:
             _out = fn(**_args)
