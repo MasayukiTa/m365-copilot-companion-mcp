@@ -94,7 +94,10 @@ def test_an_allowed_but_unrouted_tool_is_refused_while_routing_is_on(wt, monkeyp
     # through, which is the distinction this module now draws; naming a tmp dir tested the
     # pass-through, not the refusal.
     with pytest.raises(R.NotRoutable) as e:
-        R.route("git_diff", {"path": os.path.join(R.STAGING_ROOT, "p00")})
+            # process_kill, not git_diff: every one of the fleet's sixteen tools now has a
+            # container equivalent, so "allowed but unroutable" must be named by a tool
+            # from outside that set.
+        R.route("process_kill", {"path": os.path.join(R.STAGING_ROOT, "p00")})
     assert "no container equivalent" in str(e.value)
 
 
