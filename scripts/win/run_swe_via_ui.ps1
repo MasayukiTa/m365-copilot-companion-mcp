@@ -1,4 +1,4 @@
-# Drive a whole SWE-bench slice through the COCKPIT, start to finish, without stopping.
+﻿# Drive a whole SWE-bench slice through the COCKPIT, start to finish, without stopping.
 #
 # WHY THROUGH THE UI. A run driven straight into the fleet proves the fleet works; it does not
 # prove the cockpit hands it the same thing, and the gap between those two has bitten here --
@@ -146,14 +146,31 @@ for ($round = 1; $round -le $MaxRounds; $round++) {
         # SendKeys' journal hook fails when the foreground application is not pumping
         # messages, which is a transient condition and worth another attempt -- but a batch
         # that never got submitted must not fall through to the wait.
+        # SUCCESS IS THE EXIT CODE AND THE MARKER, NOT THE ABSENCE OF STDERR.
+        #
+        # This read `... 2>&1 | Select-Object -Last 3` under $ErrorActionPreference = "Stop".
+        # In PowerShell 5.1, merging a native command's stderr into the pipeline wraps each
+        # line in an ErrorRecord, which that preference turns into a TERMINATING error -- so
+        # the moment submit_via_ui.ps1 wrote its diagnostics to stderr (they were moved there
+        # deliberately, because on stdout they became the function's return value), every
+        # SUCCESSFUL submit threw. Measured: three attempts, three "FAILED", and the reported
+        # reason was the progress line "invoking button" -- the last thing the child printed
+        # before succeeding. The batch was submitted and the driver gave up on it.
         $submitted = $false
         for ($try = 1; $try -le 3 -and -not $submitted; $try++) {
-            try {
-                & powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\win\submit_via_ui.ps1 -GoalFile $uiFile 2>&1 |
-                    Select-Object -Last 3 | ForEach-Object { Say ("submit: " + $_) }
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            $out = & powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\win\submit_via_ui.ps1 -GoalFile $uiFile 2>&1 | Out-String
+            $rc = $LASTEXITCODE
+            $ErrorActionPreference = $prevEap
+            foreach ($l in (($out -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -Last 3)) {
+                Say ("submit: " + $l)
+            }
+            if ($rc -eq 0 -and $out -match "submitted:") {
                 $submitted = $true
-            } catch {
-                Say ("submit attempt {0}/3 FAILED: {1}" -f $try, $_.Exception.Message)
+            } else {
+                Say ("submit attempt {0}/3 FAILED (exit {1}, marker {2})" -f $try, $rc,
+                     $(if ($out -match "submitted:") { "present" } else { "absent" }))
                 Start-Sleep -Seconds 20
             }
         }
