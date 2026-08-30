@@ -203,8 +203,19 @@ SHADOW_LOG = ".fleet/toolset_shadow.jsonl"
 
 
 def mode():
-    m = (_os.environ.get(MODE_ENV) or "shadow").strip().lower()
-    return m if m in ("off", "shadow", "enforce") else "shadow"
+    """off / shadow / enforce. The DEFAULT IS ENFORCE, and the shadow window is why.
+
+    It defaulted to shadow while nobody knew what enforcing would refuse. That window has now
+    run: 09:01 to 11:11 on 2026-08-30, across a graded 40-instance run and a three-arm A/B,
+    producing FOUR entries -- all of them process_kill. Nothing a worker legitimately needs
+    appeared. No read_file, no write_file, no shell_exec.
+
+    A gate that has been measured and left permissive is not caution, it is a gate that does
+    nothing. The env var still moves it back for a run that needs to, and the reason for doing
+    so should be written down somewhere at the time.
+    """
+    m = (_os.environ.get(MODE_ENV) or "enforce").strip().lower()
+    return m if m in ("off", "shadow", "enforce") else "enforce"
 
 
 def _fleet_run_active():

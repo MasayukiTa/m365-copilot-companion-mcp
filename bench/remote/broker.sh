@@ -96,10 +96,29 @@ case "$VERB" in
     # uid inside it. What that buys: an escape lands on an idle box rather than on the
     # operator's files. What it does not buy: protection from a kernel-level escape, which
     # would hold uid 0 on the host, because there is no user-namespace remapping here.
-    if ! docker run -d --name "$CNAME"         --entrypoint sleep         --memory "$MEM_LIMIT" --cpus "$CPU_LIMIT" --pids-limit "$PIDS_LIMIT"         --security-opt no-new-privileges         --cap-drop ALL         --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER         --cap-add SETUID --cap-add SETGID --cap-add FSETID         -v "$WORK_ROOT/$INSTANCE:/work" -w /work         "$IMAGE" infinity >/dev/null 2>>"$LOG"; then
+    # NETWORK IS AN EXPLICIT CHOICE, NOT A DEFAULT NOBODY MADE.
+    #
+    # A container that can reach the whole internet can fetch arbitrary code and send
+    # anything out, and these run third-party build systems -- an install step IS arbitrary
+    # code execution. Blocking egress outright breaks the dependency fetch every one of
+    # these instances needs, so the honest arrangement is two modes with the decision
+    # recorded per instance, rather than one default nobody chose:
+    #
+    #   bridge  (default) dependencies can be fetched; egress is NOT restricted
+    #   none              no network at all -- correct for evaluation, where nothing should
+    #                     be downloaded and anything reaching out is a finding
+    #
+    # This is not an allowlist. A real one needs a proxy or host firewall rules, and saying
+    # so is better than shipping the bridge default and calling it controlled.
+    NET="${SWE_NET:-bridge}"
+    case "$NET" in
+      bridge|none) ;;
+      *) fail "network mode must be bridge or none" ;;
+    esac
+    if ! docker run -d --name "$CNAME" --network "$NET"         --entrypoint sleep         --memory "$MEM_LIMIT" --cpus "$CPU_LIMIT" --pids-limit "$PIDS_LIMIT"         --security-opt no-new-privileges         --cap-drop ALL         --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER         --cap-add SETUID --cap-add SETGID --cap-add FSETID         -v "$WORK_ROOT/$INSTANCE:/work" -w /work         "$IMAGE" infinity >/dev/null 2>>"$LOG"; then
       fail "container did not start"
     fi
-    printf '{"ok":true,"container":"%s"}\n' "$CNAME"; log "create $INSTANCE $IMAGE"; exit 0 ;;
+    printf '{"ok":true,"container":"%s","network":"%s"}\n' "$CNAME" "$NET"; log "create $INSTANCE $IMAGE net=$NET"; exit 0 ;;
 
   exec)
     docker inspect -f '{{.State.Running}}' "$CNAME" 2>/dev/null | grep -q true || fail "no running container for that instance"

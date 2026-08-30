@@ -78,8 +78,18 @@ def ping() -> dict:
     return call({"verb": "ping"}, timeout=60)
 
 
-def create(instance: str, image: str) -> dict:
-    return call({"verb": "create", "instance": instance, "image": image}, timeout=1800)
+def create(instance: str, image: str, network: str = "bridge") -> dict:
+    """Start the instance's container.
+
+    `network` is stated rather than defaulted silently. "bridge" lets the build fetch its
+    dependencies -- which it must, and which also means egress is not restricted. "none"
+    gives no network at all and is the right choice for evaluation, where nothing should be
+    downloaded and anything reaching out is a finding rather than a normal step.
+    """
+    if network not in ("bridge", "none"):
+        raise BrokerError("network must be bridge or none, not %r" % network)
+    return call({"verb": "create", "instance": instance, "image": image,
+                 "network": network}, timeout=1800)
 
 
 def destroy(instance: str) -> dict:

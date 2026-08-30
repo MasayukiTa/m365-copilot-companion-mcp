@@ -101,18 +101,34 @@ def test_every_catalogue_tool_has_been_decided_about():
 
 # ---- enforcement: shadow by default, and the gateway actually consults it -----------------
 
-def test_the_default_mode_blocks_nothing():
-    """Switching a gate from permissive to closed without measuring first is the mistake this
-    repository has already been corrected for. Shadow records; it does not refuse."""
+def test_the_default_is_enforce_now_that_the_shadow_window_has_run():
+    """It defaulted to shadow while nobody knew what enforcing would refuse.
+
+    The window ran 09:01-11:11 on 2026-08-30 across a graded 40-instance run and a three-arm
+    A/B: four entries, all process_kill, and nothing a worker legitimately needs. A gate that
+    has been measured and left permissive is not caution -- it is a gate that does nothing."""
     import relay.fleet_toolset as FT
-    assert FT.mode() in ("off", "shadow", "enforce")
     old = os.environ.pop(FT.MODE_ENV, None)
     try:
-        assert FT.mode() == "shadow"
-        ok, _note = FT.check("process_kill")
-        assert ok, "shadow mode must not block"
+        assert FT.mode() == "enforce"
     finally:
         if old is not None:
+            os.environ[FT.MODE_ENV] = old
+
+
+def test_shadow_is_still_reachable_for_a_run_that_needs_it():
+    """The promotion must not remove the ability to measure again."""
+    import relay.fleet_toolset as FT
+    old = os.environ.get(FT.MODE_ENV)
+    try:
+        os.environ[FT.MODE_ENV] = "shadow"
+        assert FT.mode() == "shadow"
+        ok, _ = FT.check("process_kill")
+        assert ok, "shadow must still only record"
+    finally:
+        if old is None:
+            os.environ.pop(FT.MODE_ENV, None)
+        else:
             os.environ[FT.MODE_ENV] = old
 
 
