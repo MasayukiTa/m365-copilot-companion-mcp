@@ -130,6 +130,22 @@ def main():
                 d = ""
             _emit(preds, have, inst, d, a.prefix)
             captured += 1
+            # RELEASE THE CONTAINER once its patch is safely recorded. Forty instances over
+            # five batches leave forty containers and forty work directories on a volume with
+            # 25 GB free, and the images they are built from are the 183 GB that must not be
+            # re-pulled. --keep holds them, for looking at a run that went wrong.
+            if not a.keep:
+                try:
+                    from bench.routing_switch import broker as _b
+                except ImportError:
+                    from routing_switch import broker as _b
+                try:
+                    _bc2 = _b("pro_capture cleanup")
+                    if _bc2 is not None:
+                        _bc2.destroy(inst)
+                except Exception as exc:
+                    print("WARNING: could not release container for %s: %s"
+                          % (inst[:50], str(exc)[:100]))
             continue
 
         top = subprocess.run(["git", "-C", p, "rev-parse", "--show-toplevel"],
