@@ -1,4 +1,4 @@
-# Put a goal into the cockpit the way a person does, and read back what the cockpit shows.
+﻿# Put a goal into the cockpit the way a person does, and read back what the cockpit shows.
 #
 # WHY THROUGH THE UI AND NOT THROUGH THE API. A run driven straight into the fleet proves the
 # fleet works. It does not prove the cockpit hands it the same thing -- and the gap between
@@ -238,20 +238,43 @@ function Submit([string]$text) {
     #     "0" の引数を指定して "SetFocus" を呼び出し中に例外が発生
     # ended the batch. Bring the window forward first, and treat a still-failing SetFocus
     # as non-fatal: a foreground window with one text box already routes the keys.
-    $cp = Get-Process -Name FleetCockpit -EA SilentlyContinue | Select-Object -First 1
-    if ($cp -and $cp.MainWindowHandle -ne [IntPtr]::Zero) {
-        [Win32.Wnd]::ShowWindow($cp.MainWindowHandle, 9) | Out-Null       # SW_RESTORE
-        [Win32.Wnd]::SetForegroundWindow($cp.MainWindowHandle) | Out-Null
-        Start-Sleep -Milliseconds 500
+    # INVOKE THE BUTTON, DO NOT SEND A KEYSTROKE.
+    #
+    # keybd_event goes wherever keyboard focus is, so it needs a foreground window -- and
+    # measured 2026-08-30 there was none: GetForegroundWindow() returned 0, the cockpit
+    # exposed two top-level windows of which the FIRST was a leftover WPF Popup (class
+    # 'Popup') that had taken over MainWindowHandle, and Set-Text's value sat in the composer
+    # while the script reported that nothing was submitted. Foregrounding the right window
+    # does not fix it either: SetForegroundWindow is refused to a process that is not already
+    # in front, which is the normal state for an unattended run.
+    #
+    # The button does the same thing Ctrl+Enter does -- FleetCockpit.cs gives _startBtn and
+    # the composer's Return handler the same body -- and InvokePattern needs no focus, no
+    # foreground window and no keyboard at all.
+    $startBtn = $null
+    $bc = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Button)
+    $btns = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $bc)
+    # BY NAME, in both languages the cockpit ships. The name comes from T("start"), so these
+    # two strings are the whole set -- matching on width instead would pick a different
+    # button the moment the layout changes.
+    $wanted = @("並列実行を開始", "Start parallel run", "送信", "Send")
+    for ($i = 0; $i -lt $btns.Count -and -not $startBtn; $i++) {
+        $b = $btns.Item($i)
+        if ($wanted -contains $b.Current.Name -and $b.Current.IsEnabled) { $startBtn = $b }
     }
-    $focused = $false
-    for ($f = 1; $f -le 3 -and -not $focused; $f++) {
-        try { $target.SetFocus(); $focused = $true }
-        catch { Start-Sleep -Milliseconds 400 }
+    if (-not $startBtn) {
+        throw ("no start button found in the cockpit (looked for: " + ($wanted -join ", ") +
+               "). Ctrl+Enter cannot be used instead: an unattended run has no foreground window.")
     }
-    if (-not $focused) { Write-Output "note: SetFocus refused; relying on the foreground window" }
-    Start-Sleep -Milliseconds 200
-    Send-CtrlEnter
+    $ip = $null
+    if (-not $startBtn.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$ip)) {
+        throw "the start button does not support Invoke"
+    }
+    [Console]::Error.WriteLine(("submit: invoking button '{0}'" -f $startBtn.Current.Name))
+    $ip.Invoke()
+
     Start-Sleep -Milliseconds 900
     # AND VERIFY, because a submit that silently did nothing is the failure mode this
     # whole script exists to catch. An emptied box is the cockpit acknowledging it.
