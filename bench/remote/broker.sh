@@ -83,6 +83,12 @@ case "$VERB" in
     # dies with 126 "cannot execute binary file". Measured on the first probe: created, and
     # gone before the next call could reach it.
     #
+    # /work IS SCRATCH; THE CHECKOUT IS AT /app. Measured in the Step 3 pilot: these images
+    # carry the instance's repository at /app, and /work is the per-instance writable mount
+    # that maps back to $WORK_ROOT on the host. Tools that edit the repository must target
+    # /app -- pointing them at /work would run cleanly and edit nothing, which is the
+    # hardest kind of broken to notice.
+    #
     # ROOT INSIDE THE CONTAINER, and that is a deliberate trade. uid 1000 does not exist in
     # these images and their build and test scripts assume root; forcing a non-existent user
     # breaks the very thing this is here to run. The boundary is the container -- no docker
