@@ -122,7 +122,7 @@ case "$VERB" in
     # the near side sees "no running container for that instance" -- which reads like a bug
     # in the request rather than a daemon that went away. The container's filesystem layer
     # survives the restart, so a worker's edits to /app are not lost with it.
-    NET="${SWE_NET:-bridge}"
+    NET="${SWE_NET:-none}"
     case "$NET" in
       bridge|none) ;;
       *) fail "network mode must be bridge or none" ;;

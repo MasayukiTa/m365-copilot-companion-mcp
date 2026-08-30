@@ -52,7 +52,15 @@ def main():
         # The network is a choice the caller states, from a set of two. Anything else is
         # refused rather than passed to docker, which would accept a named network the
         # caller invented and attach the container to it.
-        net = req.get("network") or "bridge"
+        # DEFAULTS TO none, WHICH IS THE RESTRICTIVE SIDE.
+        #
+        # It defaulted to "bridge", so a caller that simply omitted the field got a container
+        # with unrestricted egress. That is the wrong way round twice over: a permission
+        # nobody asked for should not be granted, and egress here is not only a containment
+        # question -- these repositories are public and the commit that fixes each instance is
+        # upstream, so a solver that can reach the network can fetch the answer and the score
+        # goes UP. "bridge" has to be asked for.
+        net = req.get("network") or "none"
         if net not in ("bridge", "none"):
             die("network must be bridge or none")
         out["SWE_NET"] = net
