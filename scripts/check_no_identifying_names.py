@@ -118,8 +118,33 @@ TEXT_SUFFIXES = (".py", ".md", ".txt", ".json", ".yml", ".yaml", ".ps1", ".sh", 
                  ".bat", ".vbs", ".cfg", ".ini", ".toml", ".html", ".css", ".js", ".jsonl")
 
 
-def configured_names():
+def configured_names(repo="."):
+    """The names to look for, from the environment or from .env.
+
+    THE ENVIRONMENT ALONE WAS NOT ENOUGH. Nobody exports this before running the check by
+    hand, so every local run took the "not set" branch, ran the shaped checks only, and
+    printed "nothing identifying in N tracked files" -- a pass. Twenty-five occurrences of an
+    eval host's ssh alias accumulated across five scripts under exactly that reading, in a
+    public repository, and were found only when someone thought to set the variable.
+
+    .env is gitignored, so it can hold the names without putting them in the repository, and
+    it is already where this project keeps values of that kind. The environment still wins,
+    so CI's secret is unaffected.
+    """
     raw = os.environ.get(NAMES_ENV, "")
+    if not raw.strip():
+        try:
+            with open(os.path.join(repo, ".env"), encoding="utf-8-sig") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("#") or "=" not in line:
+                        continue
+                    k, _, v = line.partition("=")
+                    if k.strip() == NAMES_ENV:
+                        raw = v.strip().strip('"')
+                        break
+        except OSError:
+            pass
     return [n.strip() for n in raw.split(",") if n.strip()]
 
 
@@ -148,7 +173,11 @@ MAX_HITS_PER_FILE = 20
 
 def offences(repo=".", names=None):
     """[(path, what, line_number, line)] for every tracked text file that identifies someone."""
-    names = configured_names() if names is None else names
+    # THE REPO UNDER CHECK, not the current directory. The .env fallback read whichever
+    # directory the process happened to start in, so checking a temp repository picked up
+    # this one's names -- which is both the wrong answer and a test that passes for the
+    # wrong reason.
+    names = configured_names(repo) if names is None else names
     name_re = (re.compile("|".join(re.escape(n) for n in names), re.I)) if names else None
     found = []
     for rel in tracked_files(repo):
@@ -211,7 +240,7 @@ def main(argv=None) -> int:
     args = [a for a in argv if not a.startswith("--")]
     strict = "--require-names" in argv
     repo = args[0] if args else "."
-    names = configured_names()
+    names = configured_names(repo)
 
     try:
         found = offences(repo)
