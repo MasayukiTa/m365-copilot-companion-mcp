@@ -273,6 +273,31 @@ def route(name, args):
     # was never reached, so the lockout the previous fix was written to prevent was still
     # there by another door.
     a = dict(args or {})
+
+    # AN EXECUTION CALL WITH NO PATH MUST NOT FALL BACK TO THE SERVER'S OWN DIRECTORY.
+    #
+    # shell_exec and run_python carry a command, not a path, so `where` fell through to
+    # os.getcwd() -- the MCP server's repository root. That is not under the staging root, so
+    # the call read as "not the fleet's" and PASSED THROUGH: every pathless command a worker
+    # ran executed on the operator's machine, in the harness checkout, where the instance's
+    # files do not exist.
+    #
+    # It is worse than a refusal because it succeeds. A worker asked to reproduce a bug got
+    # real output from the wrong repository, concluded -- correctly, from what it could see --
+    # that "run_python runs on the Windows host and cannot see this repository", and shipped
+    # its fix unverified. Measured: the same forty instances scored 28/40 before routing and
+    # 3/40 after, with 25 lost and none gained, while 38 of the 40 patches still touched the
+    # same files. The task arrived; the verification did not.
+    #
+    # Refusing names the fix in the message. Passing through leaves nothing to notice.
+    if name in ("shell_exec", "run_python") and not (a.get("working_dir") or a.get("path")):
+        if _worktrees():
+            raise NotRoutable(
+                "%s was called without working_dir while fleet execution is routed to "
+                "containers. Pass working_dir set to the repository path named in the goal, "
+                "so the command runs in the instance's checkout instead of on this machine."
+                % name)
+
     where = a.get("working_dir") or a.get("path") or os.getcwd()
     inst = instance_for(where)
     if not inst and not is_fleet_path(where):
