@@ -68,7 +68,7 @@ DELIBERATELY_EXCLUDED = {
     "run_python_in_background": "an unsupervised process outliving the turn is how seventeen test processes ran for fourteen hours",
     "delete_path":       "a fix does not need to delete; removing a file can be done through the shell inside the container, where the blast radius is the container",
     "trash_path":        "deleting is done through the shell inside the container, where the blast radius is the container",
-    "process_kill":      "no benchmark task requires killing a process the worker did not start",
+    "process_kill":      "reaches ANY process on the machine, including the server hosting this gate; ending a child of one's own build stays available through shell_exec",
     "job_kill":          "no benchmark task requires killing work the worker did not start",
     "run_in_background": "an unsupervised process outliving the turn is the orphan problem again",
     "outlook_send_mail": "a benchmark worker has no business sending mail as the operator",
@@ -182,6 +182,18 @@ def unknown_tools(catalogue):
 #
 # Promote to enforce only after a shadow window shows the refusals are the ones intended --
 # a shadow log full of read_file means the set is wrong, not that the workers are hostile.
+#
+# THE SHADOW WINDOW HAS NOW RUN. Measured 2026-08-30, 09:01 to 11:11, across a graded
+# 40-instance run and a three-arm A/B: FOUR entries, all of them `process_kill`. Nothing a
+# worker legitimately needs appeared -- no read_file, no write_file, no shell_exec -- so the
+# set is not costing the benchmark anything, and the one tool it caught is the one that
+# reaches any process on the machine including the server that is hosting the gate. A worker
+# that needs to end something it started can do so through shell_exec, inside its own
+# process tree.
+#
+# That is the evidence for enforce. It is deliberately NOT switched here: flipping a gate
+# under a measurement in flight changes the thing being measured. Set FLEET_TOOLSET_MODE=
+# enforce when no run is in progress.
 import json as _json
 import os as _os
 import time as _time

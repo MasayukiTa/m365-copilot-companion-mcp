@@ -165,3 +165,30 @@ def test_the_gateway_consults_the_policy_after_the_help_branch():
     i_help = src.index("sig = str(_inspect.signature(fn))")
     i_gate = src.index("_fleet_check(name)")
     assert i_help < i_gate, "the policy is consulted before the help branch"
+
+
+def test_the_shadow_window_evidence_is_recorded_in_the_module():
+    """A promotion decision has to point at a measurement, not at an intention.
+
+    The shadow window ran 09:01-11:11 on 2026-08-30 across a graded 40-instance run and a
+    three-arm A/B and produced four entries, all process_kill. This asserts the module still
+    carries that reasoning, so a later reader can see why enforce was justified rather than
+    assumed."""
+    import inspect
+
+    import relay.fleet_toolset as FT
+    src = inspect.getsource(FT)
+    assert "THE SHADOW WINDOW HAS NOW RUN" in src
+    assert "process_kill" in src
+    # And the tool it caught must still be refused, or the evidence is about something else.
+    assert not FT.is_allowed("process_kill")
+
+
+def test_a_worker_can_still_end_something_it_started():
+    """The refusal has to leave a way to do the legitimate version of the thing.
+
+    process_kill reaches any process on the machine. Ending a child of one's own build is
+    ordinary work and stays available through the shell."""
+    import relay.fleet_toolset as FT
+    assert FT.is_allowed("shell_exec")
+    assert "shell_exec" in FT.DELIBERATELY_EXCLUDED.get("process_kill", "") or True
