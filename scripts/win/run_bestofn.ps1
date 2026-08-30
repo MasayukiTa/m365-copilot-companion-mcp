@@ -42,7 +42,12 @@ if (Test-Path $settings) {
 
 # INSTANCES AFTER THE ONES THE A/B USED. Reusing them would measure the selector on problems
 # whose answers are already in this run's history.
-$ids = & $py -c "import json,io,sys; r=json.load(io.open(sys.argv[1],encoding='utf-8')); s=sorted(x['instance_id'] for x in r); print('\n'.join(s[int(sys.argv[2]):int(sys.argv[2])+int(sys.argv[3])]))" $SliceFile $Skip $Instances
+if ($IdsFile -and (Test-Path $IdsFile)) {
+    $ids = Get-Content $IdsFile | Where-Object { $_.Trim() }
+    Say ("instances taken from {0}" -f $IdsFile)
+} else {
+    $ids = & $py -c "import json,io,sys; r=json.load(io.open(sys.argv[1],encoding='utf-8')); s=sorted(x['instance_id'] for x in r); print('\n'.join(s[int(sys.argv[2]):int(sys.argv[2])+int(sys.argv[3])]))" $SliceFile $Skip $Instances
+}
 $ids = @($ids -split "`n" | Where-Object { $_.Trim() })
 Say ("best-of-N start: {0} instances x {1} samples at effort={2}" -f $ids.Count, $N, $Effort)
 Set-Content -Path "$OutDir/bon_ids.txt" -Value ($ids -join "`n") -Encoding ascii
