@@ -108,3 +108,32 @@ def test_there_is_no_local_execution_path_in_the_module():
     src = inspect.getsource(R)
     for bad in ("subprocess", "os.system", "popen", "shell=True"):
         assert bad not in src.lower(), "a local execution path appeared: %s" % bad
+
+
+def test_the_gateway_routes_before_it_runs_anything_locally():
+    """Asserted against main.py's source, because booting an MCP server to check an ordering
+    is a worse test than reading the order.
+
+    The refusal must come from the router branch and not from a later one: a call that reaches
+    the local dispatcher has already escaped the boundary."""
+    import io
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = io.open(os.path.join(root, "main.py"), encoding="utf-8").read()
+    assert "from relay import fleet_tool_router as _router" in src
+    i_route = src.index("_router.route(name, _args)")
+    i_local = src.index("_out = fn(**_args)")
+    assert i_route < i_local, "the local dispatch happens before routing is considered"
+
+
+def test_routing_off_is_the_only_case_that_continues_to_local():
+    """When routing is ON, NotRoutable must refuse. Treating it as a generic fallback signal
+    would turn every unroutable call into a local one -- the exact hole this closes."""
+    import io
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = io.open(os.path.join(root, "main.py"), encoding="utf-8").read()
+    block = src[src.index("from relay import broker_client as _bc"):]
+    block = block[:block.index("from relay.fleet_toolset import check")]
+    assert "if _bc.enabled():" in block, "routing must be gated on being enabled"
+    assert "return (" in block and "was not run here" in block

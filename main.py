@@ -472,6 +472,29 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
         # Default is shadow -- it records what it WOULD refuse and blocks nothing --
         # because switching a gate from permissive to closed without measuring first is the
         # mistake this file has already been corrected for once.
+        # ROUTE IT TO THE CONTAINER BEFORE RUNNING IT HERE.
+        #
+        # This is the point the containment work has been building toward: the broker, its
+        # client and the allowlist all existed and nothing used them, so the worktrees stayed
+        # on this machine and a worker still wrote wherever the operator could.
+        #
+        # NotRoutable is not a fallback signal by itself -- when routing is OFF it means
+        # "carry on as before", and that is the only case that continues. When routing is ON
+        # and a call cannot be placed in a container, it is refused: running it here instead
+        # would leave the run looking identical and unconfined.
+        try:
+            from relay import broker_client as _bc
+            from relay import fleet_tool_router as _router
+            if _bc.enabled():
+                try:
+                    return _router.route(name, _args)
+                except _router.NotRoutable as _nr:
+                    return ("[call_tool refused] %s\n"
+                            "Fleet execution is routed to the eval host, and this call "
+                            "could not be placed in a container. It was not run here."
+                            % _nr)
+        except ImportError:
+            pass
         try:
             from relay.fleet_toolset import check as _fleet_check
             _ok, _note = _fleet_check(name)
