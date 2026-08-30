@@ -231,8 +231,37 @@ if __name__ == "__main__":
 # Acting on the classification
 # --------------------------------------------------------------------------- #
 
+def _port_of(cdp_url: str, default: int = 9222) -> int:
+    """The port in a CDP url. The fleet is on 9222 and the bridge on 9223; surfacing the wrong
+    one yanks a browser the operator was not looking for."""
+    try:
+        import urllib.parse as _p
+        return int(_p.urlsplit(cdp_url).port or default)
+    except Exception:
+        return default
+
+
+def _navigate(cdp_url: str, agent_url: str) -> bool:
+    """Open the agent in the browser at `cdp_url`. /json/new is a PUT on newer builds and a
+    GET on older ones, so try both before reporting failure."""
+    import urllib.parse as _parse
+    import urllib.request as _req
+    url = _parse.urljoin(cdp_url, "/json/new?") + agent_url
+    try:
+        _req.urlopen(url, timeout=20).read()
+        return True
+    except Exception:
+        pass
+    try:
+        _req.urlopen(_req.Request(url, method="PUT"), timeout=20).read()
+        return True
+    except Exception:
+        return False
+
+
 def ensure_ready(agent_url: str, cdp_url: str = "http://127.0.0.1:9222",
-                 attempts: int = 3, settle_s: float = 8.0) -> str:
+                 attempts: int = 3, settle_s: float = 8.0,
+                 surface_on_signin: bool = True) -> str:
     """Make the companion Edge ready, and return the final classification.
 
     NOTHING ACTED ON `recommended_action` UNTIL THIS EXISTED. classify_live and
@@ -253,7 +282,7 @@ def ensure_ready(agent_url: str, cdp_url: str = "http://127.0.0.1:9222",
     import urllib.request as _req
 
     last = "unknown"
-    for _ in range(max(1, attempts)):
+    for _attempt in range(max(1, attempts)):
         try:
             rows = classify_live(cdp_url)
         except Exception:
@@ -263,19 +292,32 @@ def ensure_ready(agent_url: str, cdp_url: str = "http://127.0.0.1:9222",
             return "ready"
         last = next((r.get("cls") for r in rows), "unknown") or "unknown"
         if last == "needs_signin":
+            # NOT ON THE FIRST SIGHTING. needs_signin also shows up mid-redirect, and a window
+            # that jumps forward for something that would have cleared itself is one people
+            # learn to dismiss. Retry like any other state; only the LAST attempt is treated
+            # as a genuine failure.
+            if _attempt < max(1, attempts) - 1:
+                _navigate(cdp_url, agent_url)
+                _time.sleep(settle_s)
+                continue
+            # THE LAST RESORT, AFTER THE AUTOMATIC PATH HAS GENUINELY FAILED.
+            #
+            # bridge/copilot_bridge.py has this chain -- bounded retries, a latch that only
+            # sets on a truthful success, a paired rehide so the window cannot stay foreground
+            # -- and it is pointed at the BRIDGE's browser on :9223. Its own comment says so:
+            # "fleet's :9222 -- omitting port would surface the wrong browser." The fleet's
+            # browser had the primitives and nothing driving them, so when it needed a human
+            # nobody was told: no retry, no window, just a coloured dot on a panel.
+            if surface_on_signin:
+                try:
+                    from relay.edge_recover import surface
+                    surface(port=_port_of(cdp_url), open_url=agent_url)
+                except Exception:
+                    pass
             return "needs_signin"          # the one state a person must resolve
 
-        try:
-            _req.urlopen(
-                _parse.urljoin(cdp_url, "/json/new?") + agent_url, timeout=20).read()
-        except Exception:
-            # /json/new is a PUT on newer builds and a GET on older ones; try the other.
-            try:
-                r = _req.Request(_parse.urljoin(cdp_url, "/json/new?") + agent_url,
-                                 method="PUT")
-                _req.urlopen(r, timeout=20).read()
-            except Exception:
-                return last
+        if not _navigate(cdp_url, agent_url):
+            return last
         _time.sleep(settle_s)
 
     try:

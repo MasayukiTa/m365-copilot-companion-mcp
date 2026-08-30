@@ -193,3 +193,48 @@ def test_ensure_ready_survives_a_dead_browser(monkeypatch):
     import urllib.request as _req
     monkeypatch.setattr(_req, "urlopen", lambda *a, **k: (_ for _ in ()).throw(OSError("no")))
     assert E.ensure_ready("https://example/agent", attempts=2, settle_s=0) == "unknown"
+
+
+def test_the_window_is_surfaced_only_after_the_automatic_path_has_failed(monkeypatch):
+    """The fallback is a last resort, and it was never reachable for the fleet's browser.
+
+    bridge/copilot_bridge.py has this chain -- bounded retries, a success-only latch, a paired
+    rehide -- pointed at the bridge's Edge on :9223; its own comment notes that the fleet is on
+    :9222. So the fleet's browser had the primitives and nothing driving them: when it needed a
+    human, there was no retry, no window, and no message. Only a coloured dot.
+
+    Surfacing on the FIRST transient needs_signin would be its own failure: a window that jumps
+    forward for something that would have cleared itself is one people learn to dismiss.
+    """
+    calls = []
+    monkeypatch.setattr(E, "classify_live", lambda cdp_url="x": [{"cls": "needs_signin"}])
+
+    import sys
+    import types
+    fake = types.ModuleType("relay.edge_recover")
+    fake.surface = lambda port=None, open_url="": calls.append(port)
+    monkeypatch.setitem(sys.modules, "relay.edge_recover", fake)
+
+    assert E.ensure_ready("https://example/agent", attempts=3, settle_s=0) == "needs_signin"
+    assert calls == [9222], (
+        "expected exactly one surface, on the last attempt, for the FLEET's browser: %r" % calls)
+
+
+def test_the_fallback_can_be_switched_off(monkeypatch):
+    """A health probe that merely reports should not yank a window forward."""
+    monkeypatch.setattr(E, "classify_live", lambda cdp_url="x": [{"cls": "needs_signin"}])
+    import sys
+    import types
+    fake = types.ModuleType("relay.edge_recover")
+    calls = []
+    fake.surface = lambda port=None, open_url="": calls.append(port)
+    monkeypatch.setitem(sys.modules, "relay.edge_recover", fake)
+    E.ensure_ready("https://example/agent", attempts=2, settle_s=0, surface_on_signin=False)
+    assert calls == []
+
+
+def test_the_port_comes_from_the_cdp_url_not_a_default():
+    """Surfacing the wrong browser is the failure the bridge's comment warns about."""
+    assert E._port_of("http://127.0.0.1:9222") == 9222
+    assert E._port_of("http://127.0.0.1:9223") == 9223
+    assert E._port_of("nonsense") == 9222
