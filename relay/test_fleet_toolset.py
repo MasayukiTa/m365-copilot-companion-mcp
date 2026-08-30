@@ -97,3 +97,71 @@ def test_every_catalogue_tool_has_been_decided_about():
     assert not missing, (
         "%d tools in the catalogue are neither allowed nor explicitly refused:\n  %s"
         % (len(missing), ", ".join(missing)))
+
+
+# ---- enforcement: shadow by default, and the gateway actually consults it -----------------
+
+def test_the_default_mode_blocks_nothing():
+    """Switching a gate from permissive to closed without measuring first is the mistake this
+    repository has already been corrected for. Shadow records; it does not refuse."""
+    import relay.fleet_toolset as FT
+    assert FT.mode() in ("off", "shadow", "enforce")
+    old = os.environ.pop(FT.MODE_ENV, None)
+    try:
+        assert FT.mode() == "shadow"
+        ok, _note = FT.check("process_kill")
+        assert ok, "shadow mode must not block"
+    finally:
+        if old is not None:
+            os.environ[FT.MODE_ENV] = old
+
+
+def test_enforce_refuses_only_while_a_fleet_run_is_active(monkeypatch):
+    """The gateway cannot tell a worker from the operator -- authentication carries an API key
+    and no user identity. The only signal is WHEN, so the restriction is scoped to a run."""
+    import relay.fleet_toolset as FT
+    monkeypatch.setenv(FT.MODE_ENV, "enforce")
+    monkeypatch.setattr(FT, "_fleet_run_active", lambda: False)
+    ok, _ = FT.check("process_kill")
+    assert ok, "outside a run the operator's own tools must keep working"
+    monkeypatch.setattr(FT, "_fleet_run_active", lambda: True)
+    ok, note = FT.check("process_kill")
+    assert not ok and "outside the fleet's allowed set" in note
+
+
+def test_an_allowed_tool_is_never_refused(monkeypatch):
+    import relay.fleet_toolset as FT
+    monkeypatch.setenv(FT.MODE_ENV, "enforce")
+    monkeypatch.setattr(FT, "_fleet_run_active", lambda: True)
+    for name in ("read_file", "write_file", "shell_exec", "git_diff"):
+        ok, _ = FT.check(name)
+        assert ok, "%s is in the allowed set and must pass" % name
+
+
+def test_the_policy_can_never_crash_the_gateway(monkeypatch):
+    """A tool call must not fail over bookkeeping. If the policy raises, the call proceeds."""
+    import relay.fleet_toolset as FT
+    def boom():
+        raise RuntimeError("policy is broken")
+    monkeypatch.setattr(FT, "_fleet_run_active", boom)
+    monkeypatch.setenv(FT.MODE_ENV, "enforce")
+    ok, _ = FT.check("process_kill")
+    assert ok
+
+
+def test_the_gateway_consults_the_policy_after_the_help_branch():
+    """Asserted against the SOURCE FILE, not by importing main.
+
+    Importing it needs MCP_API_KEY in the environment, which is a fact about deployment and
+    not about this ordering. Anchored on executable lines rather than on comment text, because
+    a comment can be moved without moving the code it describes.
+
+    Order matters: reading a tool's signature is not running it, and a gate that refuses to
+    describe a tool teaches nothing except that the tool exists.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = io.open(os.path.join(root, "main.py"), encoding="utf-8").read()
+    assert "from relay.fleet_toolset import check as _fleet_check" in src
+    i_help = src.index("sig = str(_inspect.signature(fn))")
+    i_gate = src.index("_fleet_check(name)")
+    assert i_help < i_gate, "the policy is consulted before the help branch"

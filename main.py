@@ -462,6 +462,25 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
             except Exception:
                 sig = "(...)"
             return "%s%s\n%s" % (name, sig, (getattr(fn, "__doc__", "") or "").strip())
+        # THE FLEET'S TOOL SET, CONSULTED AT THE ONE POINT EVERY TOOL PASSES THROUGH.
+        #
+        # 167 tools reach a worker here, and the containment plan that moved only the ones
+        # with "exec" in the name would have left process_kill, outlook_send_mail, screenshot
+        # and clipboard_set among them. relay/fleet_toolset.py is the list; this is where it
+        # is read, and AFTER the help branch: reading a tool's signature is not running it,
+        # and a policy that refuses to describe a tool teaches nothing except that it exists.
+        # Default is shadow -- it records what it WOULD refuse and blocks nothing --
+        # because switching a gate from permissive to closed without measuring first is the
+        # mistake this file has already been corrected for once.
+        try:
+            from relay.fleet_toolset import check as _fleet_check
+            _ok, _note = _fleet_check(name)
+            if not _ok:
+                return ("[call_tool refused] %s\n"
+                        "This run is a fleet run, and the tool is not "
+                        "in the set a worker may reach." % _note)
+        except Exception:
+            pass
         # EVIDENCE TRACE. Off unless a runner asked for one, and a no-op in ordinary
         # operation. This is the only point that sees every dispatched call with its real
         # name and arguments -- recording at the adapter would name `call_tool` and nothing
