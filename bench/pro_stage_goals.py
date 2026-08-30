@@ -59,22 +59,15 @@ def stage(inst):
     # be cloned here -- the switch was on, the operator was told it was on, and the work
     # happened locally anyway. Put the repository on the path, and if routing was ASKED for
     # and cannot be reached, stop instead of falling back to the behaviour being replaced.
-    import sys as _sys
-    if REPO not in _sys.path:
-        _sys.path.insert(0, REPO)
-    # ASKED-FOR covers BOTH switches. Reading only the environment variable would have left
-    # the marker-file route with exactly the silent fallback this check was added to close.
-    _asked = ((os.environ.get("SWE_BROKER") or "").strip().lower() in ("1", "on", "true", "yes")
-              or os.path.isfile(os.path.join(REPO, ".fleet", "BROKER_ON")))
+    # BOTH IMPORT FORMS, because this file is run as `python bench/<script>.py` (sys.path[0]
+    # is bench/, so `bench.` does not resolve) and imported as `bench.<script>` from the
+    # tests. Getting this wrong is the same fail-open one level up.
     try:
-        from relay import broker_client as _bc
-        _routed = _bc.enabled()
-    except ImportError as _exc:
-        if _asked:
-            raise SystemExit("SWE_BROKER is set but relay.broker_client could not be "
-                             "imported (%s). Refusing to stage locally instead: that is the "
-                             "silent fallback this check exists to prevent." % _exc)
-        _routed = False
+        from bench.routing_switch import broker as _broker
+    except ImportError:
+        from routing_switch import broker as _broker
+    _bc = _broker("pro_stage_goals")
+    _routed = _bc is not None
     if _routed:
         os.makedirs(wt, exist_ok=True)
         marker = (
