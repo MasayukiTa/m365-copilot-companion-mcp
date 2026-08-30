@@ -281,11 +281,25 @@ def render_text(report: dict) -> str:
 # --------------------------------------------------------------------------------------------------
 
 def _main() -> int:
+    """A path on the command line is USED, not ignored.
+
+    It was accepted and dropped: `calibration_report()` was called with no argument, so
+    passing a freshly graded slice printed "no grade history yet" and looked like an empty
+    result rather than an unread one. Measured 2026-08-30 with 40 graded instances in hand.
+    """
+    import sys
+    path = sys.argv[1] if len(sys.argv) > 1 else None
     try:
-        report = calibration_report()
-    except Exception:
-        print("no grade history yet")
-        return 0
+        report = calibration_report(path)
+    except Exception as exc:
+        print("could not read a grade ledger from %r: %s: %s"
+              % (path, type(exc).__name__, exc))
+        return 1
+    if not report.get("n_records_read"):
+        print("no records in %r -- the ledger is JSON LINES of "
+              "{instance_id, verdict}; a grader's {id: bool} map must be converted first "
+              "(bench/eval_to_ledger.py)." % (path,))
+        return 1
     print(render_text(report))
     return 0
 
