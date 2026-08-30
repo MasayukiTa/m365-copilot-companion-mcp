@@ -110,12 +110,24 @@ case "$VERB" in
     #
     # This is not an allowlist. A real one needs a proxy or host firewall rules, and saying
     # so is better than shipping the bridge default and calling it controlled.
+    # --restart unless-stopped, BECAUSE THE DAEMON DOES NOT STAY UP.
+    #
+    # dockerd here runs inside WSL, and WSL terminates the distribution when the last process
+    # in it exits -- which systemd sees as "Stopping docker.service". Measured 2026-08-31: 21
+    # daemon starts in one day, and every container the broker had created was gone with
+    # `Exited (255)` and no logs, while the one container that predated the broker survived
+    # each cycle. Its only difference was a restart policy.
+    #
+    # Without this, a routed run loses every container the moment anything touches WSL, and
+    # the near side sees "no running container for that instance" -- which reads like a bug
+    # in the request rather than a daemon that went away. The container's filesystem layer
+    # survives the restart, so a worker's edits to /app are not lost with it.
     NET="${SWE_NET:-bridge}"
     case "$NET" in
       bridge|none) ;;
       *) fail "network mode must be bridge or none" ;;
     esac
-    if ! docker run -d --name "$CNAME" --network "$NET"         --entrypoint sleep         --memory "$MEM_LIMIT" --cpus "$CPU_LIMIT" --pids-limit "$PIDS_LIMIT"         --security-opt no-new-privileges         --cap-drop ALL         --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER         --cap-add SETUID --cap-add SETGID --cap-add FSETID         -v "$WORK_ROOT/$INSTANCE:/work" -w /work         "$IMAGE" infinity >/dev/null 2>>"$LOG"; then
+    if ! docker run -d --name "$CNAME" --network "$NET"         --restart unless-stopped         --entrypoint sleep         --memory "$MEM_LIMIT" --cpus "$CPU_LIMIT" --pids-limit "$PIDS_LIMIT"         --security-opt no-new-privileges         --cap-drop ALL         --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER         --cap-add SETUID --cap-add SETGID --cap-add FSETID         -v "$WORK_ROOT/$INSTANCE:/work" -w /work         "$IMAGE" infinity >/dev/null 2>>"$LOG"; then
       fail "container did not start"
     fi
     printf '{"ok":true,"container":"%s","network":"%s"}\n' "$CNAME" "$NET"; log "create $INSTANCE $IMAGE net=$NET"; exit 0 ;;
