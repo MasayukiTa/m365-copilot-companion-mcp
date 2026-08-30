@@ -44,11 +44,10 @@ def test_the_decision_explains_itself():
 
 # ---- past chats stay reachable ------------------------------------------------------------
 
-def _order(rows, cap):
-    """The ordering the /sessions handler applies."""
-    openable = [x for x in rows if (x.get("conv_url") or "")]
-    empty = [x for x in rows if not (x.get("conv_url") or "")]
-    return (openable + empty)[:cap]
+# THE REAL FUNCTION, NOT A COPY OF IT. This file used to re-implement the handler's three
+# lines, so the handler could have changed and every test below would have kept passing
+# against a description of what it used to do.
+from bridge.copilot_bridge import order_sessions_for_listing as _order
 
 
 def test_openable_sessions_are_not_crowded_out_by_empty_ones():
@@ -83,3 +82,21 @@ def test_every_openable_session_fits_when_there_are_fewer_than_the_cap():
     rows += [{"sid": "c%d" % i, "conv_url": "sess:%d" % i} for i in range(19)]
     win = _order(rows, 50)
     assert sum(1 for r in win if r["conv_url"]) == 19
+
+
+def test_the_handler_calls_the_function_this_file_tests():
+    """THE PROPERTY THAT MAKES THE TESTS ABOVE MEAN ANYTHING. They used to exercise a copy of
+    the handler's logic living in this file, which passes just as happily when the handler
+    stops doing it. This asserts the handler actually delegates."""
+    import inspect
+
+    import bridge.copilot_bridge as B
+    src = inspect.getsource(B)
+    i = src.index('if parsed.path == "/sessions":')
+    # BOUNDED BY THE NEXT ROUTE, not by a character count. A fixed window sat 15 lines short
+    # of the delegation and failed for a reason that had nothing to do with the handler.
+    j = src.index('if parsed.path == "/', i + 10)
+    block = src[i:j]
+    assert "order_sessions_for_listing(" in block
+    # And the old inline copy is gone, so there is nothing left to drift.
+    assert "openable = [x for x in all_chat" not in block
