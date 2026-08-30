@@ -149,3 +149,30 @@ def test_a_guid_fragment_is_not_an_employee_id():
 def test_a_git_sha_and_a_standard_name_are_not_ids():
     for token in ("a1872637", "5c76f59", "SHA256", "ISO8601", "M365", "HTTP200"):
         assert not C.ID_SHAPE.search("see %s" % token), token
+
+
+def test_names_come_from_dotenv_when_the_environment_is_silent(tmp_path, monkeypatch):
+    """A check that passes when its input is missing is a check that will be run that way.
+
+    Nobody exports IDENTITY_NAMES before running this by hand, so every local run took the
+    "not set" branch, ran the shaped checks alone, and printed "nothing identifying" -- a pass.
+    Twenty-five occurrences of an eval host's ssh alias accumulated in a PUBLIC repository
+    under exactly that reading. .env is gitignored, so it can carry the names without putting
+    them in the repository.
+    """
+    monkeypatch.delenv(C.NAMES_ENV, raising=False)
+    (tmp_path / ".env").write_text("SOMETHING=else\n%s=alpha,beta\n" % C.NAMES_ENV,
+                                   encoding="utf-8")
+    assert C.configured_names(str(tmp_path)) == ["alpha", "beta"]
+
+
+def test_the_environment_still_wins_over_dotenv(tmp_path, monkeypatch):
+    """CI passes a secret; a stale .env must not override it."""
+    monkeypatch.setenv(C.NAMES_ENV, "fromenv")
+    (tmp_path / ".env").write_text("%s=fromfile\n" % C.NAMES_ENV, encoding="utf-8")
+    assert C.configured_names(str(tmp_path)) == ["fromenv"]
+
+
+def test_a_missing_dotenv_is_not_an_error(tmp_path, monkeypatch):
+    monkeypatch.delenv(C.NAMES_ENV, raising=False)
+    assert C.configured_names(str(tmp_path)) == []
