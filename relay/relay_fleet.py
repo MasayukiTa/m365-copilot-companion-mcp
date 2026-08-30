@@ -3673,6 +3673,39 @@ class RelayWorker:
         run it is measuring. A lost line costs one sample; a raised exception here would cost
         the work.
         """
+        # THE SAME EVENT, ALSO AS A STAIRCASE RECORD.
+        #
+        # This ledger says what the panel decided; it does not say whether the decision
+        # differed from what would have happened without it. That difference is the only thing
+        # that separates "the refuter ran 155 times" from "the refuter improved 155 outcomes",
+        # and it is the distinction the whole accuracy stack was accepted without.
+        try:
+            from relay import mechanism_telemetry as _mt
+            _lenses = [e.get("lens") for e in (record.get("lenses") or [])
+                       if isinstance(e, dict)]
+            _agg = record.get("aggregate")
+            _veto = record.get("veto_shadow")
+            _mt.record("panel" if len(_lenses) > 1 else "refuter",
+                       instance=str(getattr(self, "cwd", "") or "")[-8:],
+                       goal_hash=str(getattr(self, "goal_hash", "") or "")[:24],
+                       turn=getattr(self, "turn", None),
+                       configured=True, eligible=True, triggered=True, executed=True,
+                       changed_decision=bool(record.get("refute_count")),
+                       before=None, after=(_agg or {}).get("kind") if isinstance(_agg, dict) else _agg,
+                       self_report_outcome=str(getattr(self, "outcome", "") or ""),
+                       extra={"lenses": _lenses})
+            if len(_lenses) > 1:
+                _mt.record("veto",
+                           goal_hash=str(getattr(self, "goal_hash", "") or "")[:24],
+                           turn=getattr(self, "turn", None),
+                           configured=("security" in _lenses), eligible=("security" in _lenses),
+                           triggered=("security" in _lenses),
+                           executed=("security" in _lenses),
+                           changed_decision=bool(record.get("would_flip")),
+                           before=(_agg or {}).get("kind") if isinstance(_agg, dict) else _agg,
+                           after=(_veto or {}).get("kind") if isinstance(_veto, dict) else _veto)
+        except Exception:
+            pass
         try:
             tx = getattr(self, "transcript", "") or ""
             if not tx:
@@ -4407,6 +4440,34 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # over research depth is two different programs rather than two runs of one.
         max_research = _genome_default("max_research", 3)
     review_lenses = _resolve_review_lenses(review_lenses)
+
+    # WHAT WAS SWITCHED ON, RECORDED AT THE START, ONCE.
+    #
+    # Measuring mechanism usage after the fact could not tell "never configured" from "on and
+    # nothing happened", and that ambiguity is what let a stack of accuracy machinery go
+    # unexamined: the multi-lens panel ran on 4.3% of panels and the security lens seven times
+    # ever, and neither number said whether the knob was off or the situation never arose.
+    #
+    # A read of the resolved config, so it cannot change behaviour, and wrapped so telemetry
+    # can never fail a run.
+    try:
+        from relay import mechanism_telemetry as _mt
+        _run_id = "%s" % int(time.time())
+        _mt.record("panel", run_id=_run_id, configured=bool(review_lenses),
+                   config_source="resolved", config_value=list(review_lenses or []))
+        _mt.record("veto", run_id=_run_id,
+                   configured=bool(review_lenses) and any(
+                       l in (review_lenses or []) for l in ("security",)),
+                   config_source="derived from the panel",
+                   config_value=list(review_lenses or []))
+        _mt.record("refuter", run_id=_run_id, configured=bool(refuter),
+                   config_source="run", config_value=bool(refuter))
+        _mt.record("fanout", run_id=_run_id, configured=bool(fanout),
+                   config_source="run", config_value=bool(fanout))
+        _mt.record("effort", run_id=_run_id, configured=True, config_source="run",
+                   config_value={"max_refute": max_refute, "max_research": max_research})
+    except Exception:
+        pass
 
     # FAN-OUT bookkeeping. campaigns[cid] remembers the parent goal a family was split from,
     # which is the one thing the merge needs that the children do not carry themselves.
