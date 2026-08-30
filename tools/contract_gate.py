@@ -404,33 +404,22 @@ def check_op(op_class: str, detail: str = "") -> Optional[str]:
                            OR returns None if the gate was already answered "approved"
       * neither          -> returns None (not listed = not gated)
     """
-    # AN AUDIT SIGNAL ONCE THE BOUNDARY IS REAL, AND A GATE UNTIL THEN.
+    # THE DEMOTION WAS REMOVED, AND THE REASON IS STRUCTURAL RATHER THAN CAUTIOUS.
     #
-    # The plan called for demoting these regexes to a warning, and the reason to wait was
-    # concrete: a denylist over command text is the wrong shape for containment, but it is the
-    # only control there is while a worker can still execute on this machine. Removing it
-    # before its replacement is switched on would open a gap rather than close one.
+    # The plan was to demote these regexes to an audit signal once execution moved into a
+    # container, on the argument that holding a command for approval when it cannot run here
+    # anyway turns an approval queue into noise. That argument is right, and it is already
+    # satisfied without any code: a call that IS routed returns from the gateway before local
+    # dispatch, so it never reaches this function at all.
     #
-    # So the demotion is CONDITIONAL on the replacement being live. When fleet execution is
-    # routed to a container on another host, a worker cannot run the matched command here at
-    # all, and holding it for human approval asks a person to approve something that was never
-    # going to happen -- which is how approval queues become noise people click through.
-    # The match is still recorded; it stops being a question.
-    try:
-        from relay import broker_client as _bc
-        if _bc.enabled():
-            try:
-                with open(os.path.join(_FLEET_DIR, "gate_audit.jsonl"), "a",
-                          encoding="utf-8") as _fh:
-                    _fh.write(json.dumps({"t": time.time(), "op_class": op_class,
-                                          "detail": detail[:400], "mode": "audit",
-                                          "why": "execution is routed to a container"},
-                                         ensure_ascii=False) + "\n")
-            except Exception:
-                pass
-            return None
-    except Exception:
-        pass
+    # What the demotion actually did was check whether the SWITCH was on, and demote on that.
+    # But the switch being on does not mean this call was routed -- an operator's call, or any
+    # call naming a path no container owns, passes through and executes here. So the condition
+    # fired precisely for the commands that were still going to run on this machine, which is
+    # the opposite of what it was for.
+    #
+    # Reaching this function is itself the evidence that the command is about to run locally.
+    # There is nothing left to demote.
 
     # ── POLICY STATE MUST BE READABLE BEFORE IT CAN BE INERT ────────────────
     #
