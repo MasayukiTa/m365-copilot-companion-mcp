@@ -1475,13 +1475,54 @@ def main():
         args.max_research = max(args.max_research, 3)
         if _coding:
             os.environ["SWE_STRONG_SELFTEST"] = "1"     # red->green self-test is a coding discipline
-    if args.panel and args._lenses is None:             # explicit --panel still forces the 3 lenses
+    if args.panel:
+        # EXPLICIT BEATS DERIVED, AND USED NOT TO.
+        #
+        # This read `if args.panel and args._lenses is None`, so --panel was silently ignored
+        # whenever the effort level had already chosen a lens -- which `auto`, the default,
+        # always does. Asking for the panel on a default run produced a single reviewer and
+        # said nothing about it. That is part of why the multi-lens panel shows up in 4.3% of
+        # ledger records: not "nobody wanted it", but "asking did not work".
+        if args._lenses and list(args._lenses) != list(PANEL_LENSES):
+            print("[effort] --panel overrides the effort's lens %s" % (args._lenses,))
         args._lenses = list(PANEL_LENSES)
         args.refuter = True
     print("[effort] %s  (refuter=%s lenses=%s refute<=%d research<=%d)"
           % (_eff, args.refuter, args._lenses, args.max_refute, args.max_research))
 
     goals = _read_goals(args)
+
+    # THE LENS IS CHOSEN BEFORE THE GOALS ARE READ, AND THE GOALS ARE THE EVIDENCE.
+    #
+    # `auto` picks rootcause_code only when SWE_MINIMALITY or MCP_TASK_DOMAIN says the task is
+    # coding. The CLI SWE path sets that; the UI-driven path never has -- so every UI SWE run
+    # was reviewed with the domain-agnostic lens. Measured: 155 of 155 ledger records carry
+    # `rootcause`, none carry `rootcause_code`.
+    #
+    # That is not a small difference. fleet_runner's own comment says a non-coding task must
+    # never be reviewed with code criteria; the inverse costs the code criteria that exist for
+    # this exact workload -- reproduce-the-bug, producer/consumer consistency, hunk discipline.
+    # The refuter ran, and asked the wrong questions.
+    #
+    # Corrected from the goals themselves, which is the only evidence available this late, and
+    # said out loud because a silent swap is how the original mistake stayed invisible.
+    try:
+        if args._lenses == ["rootcause"] and goals:
+            _texts = [(g.get("text") if isinstance(g, dict) else str(g)) or "" for g in goals]
+            _coding_goals = sum(1 for t in _texts
+                                if "fixing a real bug in the open-source project" in t
+                                or "Fix ONLY the source" in t)
+            if _coding_goals and _coding_goals == len(_texts):
+                args._lenses = ["rootcause_code"]
+                os.environ.setdefault("SWE_STRONG_SELFTEST", "1")
+                print("[effort] every goal is a coding task; lens corrected "
+                      "rootcause -> rootcause_code (%d goals)" % _coding_goals)
+            elif _coding_goals:
+                print("[effort] %d of %d goals look like coding tasks; lens left as %s "
+                      "because a mixed run must not be reviewed with code criteria"
+                      % (_coding_goals, len(_texts), args._lenses))
+    except Exception as _e:
+        print("[effort] lens correction skipped: %s" % type(_e).__name__)
     # RUN-RESUME: prepend the unfinished portion of the last run (from the durable
     # ledger) when --resume is passed. --resume + -g/--goals-file = resume set PLUS the
     # new goals; --resume alone with an empty/all-done ledger prints a summary and exits 0.

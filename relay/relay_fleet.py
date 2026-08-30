@@ -4453,13 +4453,23 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     try:
         from relay import mechanism_telemetry as _mt
         _run_id = "%s" % int(time.time())
-        _mt.record("panel", run_id=_run_id, configured=bool(review_lenses),
-                   config_source="resolved", config_value=list(review_lenses or []))
-        _mt.record("veto", run_id=_run_id,
-                   configured=bool(review_lenses) and any(
-                       l in (review_lenses or []) for l in ("security",)),
-                   config_source="derived from the panel",
-                   config_value=list(review_lenses or []))
+        # A PANEL IS MORE THAN ONE LENS. Recording `configured` as "any lenses at all" made a
+        # single-reviewer run look like a configured panel -- caught by reading this
+        # instrument's own first output, where review_lenses came back as ["rootcause"]
+        # rather than the None that resolving it in isolation returns. The caller supplies
+        # one lens explicitly; that is the ordinary reviewer, not the panel, and the ledger
+        # agrees: 155 single-lens records against 7 multi-lens ones.
+        _lenses_now = list(review_lenses or [])
+        _mt.record("panel", run_id=_run_id, configured=len(_lenses_now) > 1,
+                   config_source="resolved", config_value=_lenses_now,
+                   ineligible_reason=("" if len(_lenses_now) > 1 else
+                                      "only %d lens configured; a panel needs more than one"
+                                      % len(_lenses_now)))
+        _mt.record("veto", run_id=_run_id, configured=("security" in _lenses_now),
+                   config_source="derived from the panel", config_value=_lenses_now,
+                   ineligible_reason=("" if "security" in _lenses_now else
+                                      "the security lens is not in the panel, so a veto "
+                                      "cannot be exercised whatever it would decide"))
         _mt.record("refuter", run_id=_run_id, configured=bool(refuter),
                    config_source="run", config_value=bool(refuter))
         _mt.record("fanout", run_id=_run_id, configured=bool(fanout),
