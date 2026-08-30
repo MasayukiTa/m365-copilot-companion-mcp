@@ -4727,7 +4727,59 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 if id(_w) in _retry_seen or _w.status not in TERMINAL:
                     continue
                 _retry_seen.add(id(_w))
-                if getattr(_w, "outcome", None) not in RETRYABLE_OUTCOMES:
+                _oc = getattr(_w, "outcome", None)
+                # THE TRIGGER READS THE SELF-REPORT, AND THAT IS THE FINDING.
+                #
+                # DONE is in NON_RETRYABLE, so a worker that says it finished is never tried
+                # again -- and the grader says such a claim is right 71.8% of the time. The
+                # population that most needs another attempt is precisely the one this branch
+                # skips. Recorded rather than argued: the funnel now shows retry stopping at
+                # "did not trigger" with the reason attached, on every goal it declines.
+                try:
+                    from relay import mechanism_telemetry as _mt
+                    _mt.record("retry",
+                               goal_hash=str(getattr(_w, "goal_hash", "") or "")[:24],
+                               turn=getattr(_w, "turn", None),
+                               configured=True, config_source="run",
+                               eligible=True,
+                               triggered=(_oc in RETRYABLE_OUTCOMES),
+                               not_triggered_reason=(
+                                   "" if _oc in RETRYABLE_OUTCOMES else
+                                   "outcome %s is not retryable; the trigger reads the "
+                                   "worker's own report" % _oc),
+                               self_report_outcome=str(_oc or ""))
+                except Exception:
+                    pass
+                # AN UNVERIFIED "DONE" MAY BE RETRIED, WHEN ASKED FOR EXPLICITLY.
+                #
+                # `verified` is None when no gate ever ran on this worker's answer, which is
+                # the state a plain DONE arrives in. Measured with a grader: a forced second
+                # attempt on such a goal rescued one instance and broke none, and the rescued
+                # one had reported DONE and been wrong.
+                #
+                # OFF BY DEFAULT, because the evidence is one rescue over five considered
+                # instances and the cost is roughly a second attempt on every goal that says
+                # it finished. This is the shape a measurement needs to grow, not a default
+                # to adopt on n=5 -- the same discipline that keeps the panel and fan-out
+                # frozen until they beat a graded floor.
+                _unverified_done = (
+                    _oc == "DONE"
+                    and getattr(_w, "verified", None) is None
+                    and (os.environ.get("MCP_RETRY_UNVERIFIED_DONE") or "").strip().lower()
+                    in ("1", "on", "true", "yes"))
+                if _unverified_done:
+                    try:
+                        from relay import mechanism_telemetry as _mt
+                        _mt.record("retry",
+                                   goal_hash=str(getattr(_w, "goal_hash", "") or "")[:24],
+                                   turn=getattr(_w, "turn", None),
+                                   configured=True, config_source="MCP_RETRY_UNVERIFIED_DONE",
+                                   eligible=True, triggered=True,
+                                   self_report_outcome="DONE",
+                                   extra={"reason": "DONE with no verification gate"})
+                    except Exception:
+                        pass
+                elif _oc not in RETRYABLE_OUTCOMES:
                     continue
                 # A CAMPAIGN THAT HAS ALREADY BEEN MERGED NEEDS NO MORE MERGES. A merge that
                 # goes STUCK is retryable like anything else, so a family could end up
