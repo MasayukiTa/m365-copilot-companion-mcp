@@ -110,3 +110,24 @@ def test_an_invented_network_is_refused_before_it_reaches_docker(monkeypatch):
     """docker would happily attach the container to a named network the caller made up."""
     with pytest.raises(BC.BrokerError):
         BC.create("i1", "jefzda/sweap-images:x", network="host")
+
+
+def test_a_marker_file_can_switch_routing_without_a_restart(tmp_path, monkeypatch):
+    """The MCP server reads its environment once at start. Requiring a restart to move
+    execution off this machine means the switch is only usable when nothing is running --
+    which is exactly the moment nobody reaches for it."""
+    monkeypatch.delenv("SWE_BROKER", raising=False)
+    marker = tmp_path / "BROKER_ON"
+    monkeypatch.setattr(BC, "MARKER", str(marker))
+    assert BC.enabled() is False
+    marker.write_text("on", encoding="utf-8")
+    assert BC.enabled() is True
+    marker.unlink()
+    assert BC.enabled() is False
+
+
+def test_a_missing_marker_directory_is_not_an_error(monkeypatch):
+    """A switch that raises when its file is absent would fail every call it is asked about."""
+    monkeypatch.delenv("SWE_BROKER", raising=False)
+    monkeypatch.setattr(BC, "MARKER", "Z:\nope\BROKER_ON")
+    assert BC.enabled() is False

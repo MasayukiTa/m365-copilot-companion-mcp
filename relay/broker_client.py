@@ -29,8 +29,22 @@ BROKER_HOST = os.environ.get("SWE_BROKER_HOST", "swe-broker")
 
 #: Off by default. Step 2 is a change to where every fleet tool lands, and it is switched on
 #: deliberately rather than by importing this module.
+#: A marker file as well as the environment variable, because the MCP server is long-running
+#: and reads its environment once at start. Requiring a restart to move execution off this
+#: machine means the switch is only usable at a moment when nothing is running -- which is
+#: exactly the moment nobody thinks to use it. The file can be created and removed while the
+#: server is up, and `enabled()` is consulted per call.
+MARKER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                      ".fleet", "BROKER_ON")
+
+
 def enabled() -> bool:
-    return (os.environ.get("SWE_BROKER") or "").strip().lower() in ("1", "on", "true", "yes")
+    if (os.environ.get("SWE_BROKER") or "").strip().lower() in ("1", "on", "true", "yes"):
+        return True
+    try:
+        return os.path.isfile(MARKER)
+    except Exception:
+        return False
 
 
 class BrokerError(RuntimeError):

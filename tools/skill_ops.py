@@ -81,6 +81,32 @@ _SKILL_USE_LOG = os.path.join(
 
 
 def _record_skill_use(kind, query, matched):
+    # ALSO AS A STAIRCASE, so the skill rule shows up in the mechanism funnel beside the
+    # others. Measured before this existed: 3 matches in 27 consultations against a store of
+    # six trusted skills -- and the raw rate could not say whether that was the rule failing,
+    # the store being thin, or nobody consulting at all. Recording `eligible` (there are
+    # skills to match against) apart from `triggered` (one matched) separates the first two.
+    try:
+        from relay import mechanism_telemetry as _mt
+        _n = 0
+        try:
+            _n = len(_store().list_metadata() or [])
+        except Exception:
+            _n = 0
+        _mt.record("skill", configured=True, config_source="server rule",
+                   config_value={"trusted_skills": _n},
+                   eligible=(_n > 0),
+                   ineligible_reason=("" if _n else "the store holds no skills to match"),
+                   triggered=bool(matched),
+                   not_triggered_reason=("" if matched else "no confident trusted match"),
+                   executed=bool(matched), changed_decision=bool(matched),
+                   extra={"matched": matched or ""})
+    except Exception:
+        pass
+    return _record_skill_use_inner(kind, query, matched)
+
+
+def _record_skill_use_inner(kind, query, matched):
     """Append one consultation record. Never raises, never blocks, never returns anything.
 
     The QUERY IS NOT STORED, only its length and a short hash. A goal can carry business
