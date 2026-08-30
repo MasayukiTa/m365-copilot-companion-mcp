@@ -92,3 +92,21 @@ def test_a_non_json_answer_is_a_refusal(monkeypatch):
     with pytest.raises(BC.BrokerError) as e:
         BC.ping()
     assert "not JSON" in str(e.value)
+
+
+def test_the_network_is_stated_not_defaulted_silently(monkeypatch):
+    """A container that can reach the internet can fetch arbitrary code and send anything out,
+    and these run third-party build systems. The choice is per-instance and explicit."""
+    seen = {}
+    def fake_run(argv, **kw):
+        seen["input"] = kw.get("input")
+        return _Proc(out=json.dumps({"ok": True, "container": "c", "network": "none"}))
+    monkeypatch.setattr(BC.subprocess, "run", fake_run)
+    BC.create("i1", "jefzda/sweap-images:x", network="none")
+    assert json.loads(seen["input"])["network"] == "none"
+
+
+def test_an_invented_network_is_refused_before_it_reaches_docker(monkeypatch):
+    """docker would happily attach the container to a named network the caller made up."""
+    with pytest.raises(BC.BrokerError):
+        BC.create("i1", "jefzda/sweap-images:x", network="host")

@@ -49,6 +49,13 @@ def main():
         if not isinstance(img, str) or not IMAGE.match(img):
             die("image not on the allowed repository")
         out["IMAGE"] = img
+        # The network is a choice the caller states, from a set of two. Anything else is
+        # refused rather than passed to docker, which would accept a named network the
+        # caller invented and attach the container to it.
+        net = req.get("network") or "bridge"
+        if net not in ("bridge", "none"):
+            die("network must be bridge or none")
+        out["SWE_NET"] = net
 
     if verb == "exec":
         try:
