@@ -4817,6 +4817,24 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 _retry_item.update({"text": _g, "checks": getattr(_w, "checks", None),
                                     "cwd": getattr(_w, "cwd", None), "priority": True})
                 add_box.append(_retry_item)
+                # THE STEP THAT WAS MISSING. `triggered` was recorded above and nothing ever
+                # recorded `executed`, so the funnel read "retry: 23 triggered, 0 executed --
+                # did not execute" while the log beside it said "-> re-queued (1/2)" twenty
+                # three times. An instrument built to tell "never fired" from "fired and
+                # changed nothing" had a rung of its own ladder unset.
+                try:
+                    from relay import mechanism_telemetry as _mt
+                    _mt.record("retry",
+                               goal_hash=str(getattr(_w, "goal_hash", "") or "")[:24],
+                               turn=getattr(_w, "turn", None),
+                               configured=True, config_source="run",
+                               eligible=True, triggered=True, executed=True,
+                               self_report_outcome=str(_w.outcome or ""),
+                               before=("attempt %d" % (_retry_used[_g] - 1)),
+                               after=("attempt %d" % _retry_used[_g]),
+                               extra={"cap": _retry_cap})
+                except Exception:
+                    pass
                 try:
                     print("[fleet] %s %s -> re-queued (%d/%d)"
                           % (_w.name, _w.outcome, _retry_used[_g], _retry_cap), flush=True)
