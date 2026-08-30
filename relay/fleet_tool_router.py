@@ -40,6 +40,37 @@ class NotRoutable(Exception):
     """The call cannot be sent to a container, and must not be run here instead."""
 
 
+class NotAFleetPath(NotRoutable):
+    """This call is not the fleet's -- it names somewhere no run has staged.
+
+    SEPARATE FROM NotRoutable ON PURPOSE. Routing was first gated on "is an autonomy contract
+    armed", which is a DIFFERENT mechanism: the contract file is written by an operator, not
+    by a bench run, so during a real routed run the predicate read False and every worker
+    quietly executed on this machine -- in the address directories staging had left empty,
+    because staging had correctly stopped cloning. The switch was on, the operator was told it
+    was on, and nothing was contained.
+
+    The predicate that actually separates the two populations is whether the path belongs to a
+    staged instance. An operator's call names somewhere else and carries on unchanged; a call
+    under the staging root that cannot be placed is refused, never run here.
+    """
+
+
+#: Where staging puts worktrees. A path under this root is the fleet's by construction, so a
+#: call naming one that cannot be placed in a container is a failure, not a call to pass
+#: through.
+STAGING_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            ".fleet", "swe", "work")
+
+
+def is_fleet_path(path):
+    if not path:
+        return False
+    root = os.path.normcase(os.path.abspath(STAGING_ROOT))
+    p = os.path.normcase(os.path.abspath(path))
+    return p == root or p.startswith(root + os.sep)
+
+
 def _worktrees():
     try:
         m = json.load(io.open(WT_MAP, encoding="utf-8-sig"))
@@ -96,6 +127,9 @@ def route(name, args):
     where = a.get("working_dir") or a.get("path") or os.getcwd()
     inst = instance_for(where)
     if not inst:
+        if not is_fleet_path(where):
+            raise NotAFleetPath("%s is not under the staging root; this is not a fleet call"
+                                % where)
         raise NotRoutable("no instance owns %s; a call that cannot be placed in a container "
                           "must not run outside one" % where)
 

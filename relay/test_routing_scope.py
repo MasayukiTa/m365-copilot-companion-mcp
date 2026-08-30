@@ -1,29 +1,40 @@
-"""Routing must contain the FLEET, not the operator.
+"""Routing must contain the FLEET, without refusing the operator -- and the predicate that
+separates them has to be one that is actually true during a run.
 
-`main.call_tool` consulted `broker_client.enabled()` on every call it served. Switching
-routing on to move fleet worktrees off this machine would therefore have refused the
-operator's own calls as well -- every one of them names a path no container owns, so every
-one hits NotRoutable, which routing-on turns into a refusal. A containment measure that has
-to be switched off to get ordinary work done is one that will be found switched off.
+Two wrong predicates were shipped before this file said so:
+
+  1. `broker_client.enabled()` alone, read on every call the gateway serves. An operator's
+     call names a path no container owns, and routing-on turns "cannot be placed" into a
+     refusal, so switching routing on would have refused ordinary work.
+  2. `_fleet_run_active()`, which reads .fleet/active_contract.json. That file is written by
+     an operator arming an autonomy contract, NOT by a bench run, so during the first real
+     routed run it read False: every worker executed on this machine, in the address
+     directories staging had just stopped filling. The switch was on and nothing was
+     contained.
+
+What actually separates the populations is whether the path belongs to a staged instance.
 """
 import io
 import os
 import re
 
+import pytest
+
+from relay import fleet_tool_router as R
+
 MAIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py")
 
 
 def _code():
-    """Source with comments and docstrings removed.
+    """Source with comments and docstrings stripped.
 
-    Asserting against raw source matches the prose that explains the rule as readily as the
-    rule, so a file that only TALKS about a guard passes. That has produced both false greens
-    and false reds here before.
+    Asserting against raw source matches the prose explaining a rule as readily as the rule,
+    so a file that only TALKS about a guard passes. That has produced both false greens and
+    false reds in this repository before.
     """
-    src = io.open(MAIN, encoding="utf-8").read()
     import ast
-    tree = ast.parse(src)
-    for node in ast.walk(tree):
+    src = io.open(MAIN, encoding="utf-8").read()
+    for node in ast.walk(ast.parse(src)):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
             d = ast.get_docstring(node)
             if d:
@@ -31,23 +42,45 @@ def _code():
     return "\n".join(re.sub(r"#.*$", "", ln) for ln in src.splitlines())
 
 
-def test_routing_is_gated_on_an_active_fleet_run():
+def test_a_call_outside_the_staging_root_is_not_the_fleets(tmp_path):
+    assert R.is_fleet_path(str(tmp_path)) is False
+
+
+def test_a_call_under_the_staging_root_is_the_fleets():
+    assert R.is_fleet_path(os.path.join(R.STAGING_ROOT, "p99", "src")) is True
+    assert R.is_fleet_path(R.STAGING_ROOT) is True
+
+
+def test_an_unstaged_fleet_path_is_refused_not_passed_through(monkeypatch):
+    """Under the staging root but owned by no instance: that is a placement failure, and
+    running it here would leave the run looking identical and unconfined."""
+    monkeypatch.setattr(R, "_worktrees", lambda: {})
+    with pytest.raises(R.NotRoutable) as exc:
+        R.route("shell_exec", {"working_dir": os.path.join(R.STAGING_ROOT, "p99"),
+                               "command": "echo hi"})
+    assert not isinstance(exc.value, R.NotAFleetPath)
+
+
+def test_an_ordinary_path_raises_the_pass_through_signal(monkeypatch, tmp_path):
+    monkeypatch.setattr(R, "_worktrees", lambda: {})
+    with pytest.raises(R.NotAFleetPath):
+        R.route("shell_exec", {"working_dir": str(tmp_path), "command": "echo hi"})
+
+
+def test_the_gateway_passes_through_only_the_not_ours_signal():
     code = _code()
-    m = re.search(r"if\s+_bc\.enabled\(\)([^\n:]*):", code)
-    assert m, "the routing switch is not read where it was"
-    assert "_fleet_active()" in m.group(1), (
-        "routing is read on every call, not only during a fleet run: %r" % m.group(1))
+    assert "except _router.NotAFleetPath:" in code, (
+        "the gateway must distinguish 'not the fleet's call' from 'could not be placed'")
+    # NotAFleetPath subclasses NotRoutable, so the pass-through handler must come FIRST or it
+    # never runs and every operator call is refused.
+    assert code.index("except _router.NotAFleetPath:") < code.index("except _router.NotRoutable"), (
+        "NotAFleetPath subclasses NotRoutable; ordered the other way the refusal catches "
+        "everything and the operator is locked out")
 
 
-def test_the_predicate_comes_from_the_gate_that_fails_closed():
+def test_the_gateway_does_not_gate_on_the_autonomy_contract():
     code = _code()
-    assert "from relay.fleet_toolset import _fleet_run_active" in code, (
-        "the run predicate must be the one that reads contract_state, which treats a missing "
-        "or corrupt policy file as tampering rather than as 'no run in flight'")
-
-
-def test_an_unroutable_call_is_still_refused_not_run_here():
-    code = _code()
-    assert "NotRoutable" in code and "call_tool refused" in code, (
-        "with routing on, a call that cannot be placed in a container must be refused; "
-        "running it locally would leave the run looking identical and unconfined")
+    assert "_fleet_run_active" not in code, (
+        "the autonomy contract is a different mechanism, written by an operator rather than "
+        "by a run; gating routing on it made routing read False during the run it was meant "
+        "to contain")

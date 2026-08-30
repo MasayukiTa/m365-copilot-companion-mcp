@@ -11,6 +11,7 @@ identical and unconfined, and the operator has no way to tell the two apart.
 import io
 import json
 
+import os
 import pytest
 
 from relay import fleet_tool_router as R
@@ -58,11 +59,14 @@ def test_a_path_outside_the_instance_is_refused(wt, tmp_path):
         R.to_container_path(str(tmp_path / "other" / "y.py"), "inst-a")
 
 
-def test_routing_off_refuses_rather_than_running_here(wt, monkeypatch):
+def test_routing_off_refuses_rather_than_running_here(wt, monkeypatch, tmp_path):
     """THE PROPERTY. Off means the caller falls back by its own choice; this function never
     does it silently."""
     from relay import broker_client as bc
     monkeypatch.delenv("SWE_BROKER", raising=False)
+    # AND THE MARKER. Deleting only the environment variable left routing ON here,
+    # because the repository has a real .fleet/BROKER_ON while a run is in flight.
+    monkeypatch.setattr(bc, "MARKER", str(tmp_path / "BROKER_ON"))
     with pytest.raises(R.NotRoutable) as e:
         R.route("shell_exec", {"command": "ls"})
     assert "routing is off" in str(e.value)
@@ -72,8 +76,12 @@ def test_an_unplaceable_call_is_refused_not_run(wt, monkeypatch, tmp_path):
     """No instance owns the path, so there is no container to run in -- and running it on the
     operator's machine instead is exactly what this exists to prevent."""
     monkeypatch.setenv("SWE_BROKER", "on")
+    # UNDER THE STAGING ROOT. Outside it the call is not the fleet's at all and passes
+    # through, which is the distinction this module now draws; naming a tmp dir tested the
+    # pass-through, not the refusal.
     with pytest.raises(R.NotRoutable) as e:
-        R.route("shell_exec", {"command": "ls", "working_dir": str(tmp_path / "nowhere")})
+        R.route("shell_exec", {"command": "ls",
+                               "working_dir": os.path.join(R.STAGING_ROOT, "p_unstaged")})
     assert "must not run outside one" in str(e.value)
 
 
@@ -82,6 +90,9 @@ def test_an_allowed_but_unrouted_tool_is_refused_while_routing_is_on(wt, monkeyp
     Allowed-but-unroutable must refuse, not run locally: keeping the two lists separate is
     what makes that distinction expressible at all."""
     monkeypatch.setenv("SWE_BROKER", "on")
+    # UNDER THE STAGING ROOT. Outside it the call is not the fleet's at all and passes
+    # through, which is the distinction this module now draws; naming a tmp dir tested the
+    # pass-through, not the refusal.
     with pytest.raises(R.NotRoutable) as e:
         R.route("git_diff", {})
     assert "no container equivalent" in str(e.value)
