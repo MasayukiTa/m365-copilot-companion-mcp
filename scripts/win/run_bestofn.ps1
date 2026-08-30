@@ -17,6 +17,18 @@ param(
     [string]$Effort = "auto",
     [string]$OutDir = ".fleet/swe/bon",
     [int]$PerBatchTimeoutSec = 3600
+    ,
+    # AN EXPLICIT ID LIST BEATS AN OFFSET WHEN THE POPULATION MATTERS.
+    #
+    # The first run took the next six by slice position and drew six ansible instances
+    # that every sample solved: three samples, six patches each, all byte-different and
+    # all CORRECT. The selector again had nothing to choose between -- not because the
+    # candidates matched but because none of them was wrong.
+    #
+    # Byte-difference is not the condition best-of-N exploits; difference in CORRECTNESS
+    # is. So the caller must be able to name the instances rather than take whatever the
+    # slice order gives.
+    [string]$IdsFile = ""
 )
 $ErrorActionPreference = "Continue"
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
