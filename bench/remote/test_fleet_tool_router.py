@@ -14,7 +14,7 @@ import json
 import os
 import pytest
 
-from relay import fleet_tool_router as R
+from bench.remote import fleet_tool_router as R
 
 
 @pytest.fixture
@@ -62,7 +62,7 @@ def test_a_path_outside_the_instance_is_refused(wt, tmp_path):
 def test_routing_off_refuses_rather_than_running_here(wt, monkeypatch, tmp_path):
     """THE PROPERTY. Off means the caller falls back by its own choice; this function never
     does it silently."""
-    from relay import broker_client as bc
+    from bench.remote import broker_client as bc
     monkeypatch.delenv("SWE_BROKER", raising=False)
     # AND THE MARKER. Deleting only the environment variable left routing ON here,
     # because the repository has a real .fleet/BROKER_ON while a run is in flight.
@@ -107,7 +107,7 @@ def test_the_command_enters_the_checkout_before_running(wt, monkeypatch):
     a, _ = wt
     seen = {}
     monkeypatch.setenv("SWE_BROKER", "on")
-    from relay import broker_client as bc
+    from bench.remote import broker_client as bc
     monkeypatch.setattr(bc, "exec_", lambda inst, cmd, timeout=600: seen.update(
         {"inst": inst, "cmd": cmd}) or {"rc": 0, "output": "ok"})
     R.route("shell_exec", {"command": "make test", "working_dir": str(a)})
@@ -124,39 +124,21 @@ def test_there_is_no_local_execution_path_in_the_module():
         assert bad not in src.lower(), "a local execution path appeared: %s" % bad
 
 
-def test_the_gateway_routes_before_it_runs_anything_locally():
-    """Asserted against main.py's source, because booting an MCP server to check an ordering
-    is a worse test than reading the order.
+def test_the_router_is_no_longer_wired_into_the_shipped_server():
+    """The two tests removed from here asserted on main.py's source.
 
-    The refusal must come from the router branch and not from a later one: a call that reaches
-    the local dispatcher has already escaped the boundary."""
-    import io
-    import os
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    src = io.open(os.path.join(root, "main.py"), encoding="utf-8").read()
-    assert "from relay import fleet_tool_router as _router" in src
-    i_route = src.index("_router.route(name, _args)")
-    i_local = src.index("_out = fn(**_args)")
-    assert i_route < i_local, "the local dispatch happens before routing is considered"
-
-
-def test_routing_off_is_the_only_case_that_continues_to_local():
-    """When routing is ON, NotRoutable must refuse. Treating it as a generic fallback signal
-    would turn every unroutable call into a local one -- the exact hole this closes."""
-    import io
-    import os
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    src = io.open(os.path.join(root, "main.py"), encoding="utf-8").read()
-    # Bounded by the routing block's OWN end, not by whatever happened to follow it. It was
-    # sliced up to the toolset-gate import, and moving the routing block below the argument
-    # parsing put that import above it -- the slice then raised ValueError, which is a test
-    # failing on a reordering rather than on the property it names.
-    block = src[src.index("from relay import broker_client as _bc"):]
-    block = block[:block.index("except ImportError:")]
-    # Matched as a CONDITION, not as a literal line: the gate later grew a second term
-    # (only while a fleet run is in flight), and an equality check on the old text failed
-    # while the property it was written to protect was still held.
-    import re as _re
-    cond = _re.search(r"if\s+_bc\.enabled\(\)(.*?):", block)
-    assert cond, "routing must be gated on being enabled"
-    assert "return (" in block and "was not run here" in block
+    They described a routing hook in the general dispatch path. That hook is gone: relocating
+    a worker's writes to a container on someone else's SSH host closed nothing for anyone
+    without a second machine, and it put ssh and docker assumptions into the shipped server.
+    This module is benchmark infrastructure now, and this test states the boundary so the
+    hook is not quietly reintroduced.
+    """
+    import io as _io
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    src = _io.open(_os.path.join(root, "main.py"), encoding="utf-8").read()
+    for forbidden in ("from relay import broker_client",
+                      "from bench.remote import broker_client",
+                      "fleet_tool_router"):
+        assert forbidden not in src.replace("# ", ""), (
+            "%r is back in the shipped dispatch path" % forbidden)

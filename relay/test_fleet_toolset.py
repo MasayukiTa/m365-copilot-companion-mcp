@@ -165,23 +165,6 @@ def test_the_policy_can_never_crash_the_gateway(monkeypatch):
     assert ok
 
 
-def test_the_gateway_consults_the_policy_after_the_help_branch():
-    """Asserted against the SOURCE FILE, not by importing main.
-
-    Importing it needs MCP_API_KEY in the environment, which is a fact about deployment and
-    not about this ordering. Anchored on executable lines rather than on comment text, because
-    a comment can be moved without moving the code it describes.
-
-    Order matters: reading a tool's signature is not running it, and a gate that refuses to
-    describe a tool teaches nothing except that the tool exists.
-    """
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    src = io.open(os.path.join(root, "main.py"), encoding="utf-8").read()
-    assert "from relay.fleet_toolset import check as _fleet_check" in src
-    i_help = src.index("sig = str(_inspect.signature(fn))")
-    i_gate = src.index("_fleet_check(name)")
-    assert i_help < i_gate, "the policy is consulted before the help branch"
-
 
 def test_the_shadow_window_evidence_is_recorded_in_the_module():
     """A promotion decision has to point at a measurement, not at an intention.
@@ -208,3 +191,19 @@ def test_a_worker_can_still_end_something_it_started():
     import relay.fleet_toolset as FT
     assert FT.is_allowed("shell_exec")
     assert "shell_exec" in FT.DELIBERATELY_EXCLUDED.get("process_kill", "") or True
+
+
+def test_the_policy_is_no_longer_consulted_by_the_shipped_gateway():
+    """This replaces a test that asserted the opposite.
+
+    Which sixteen tools a benchmark worker may reach is a fact about that benchmark, not about
+    this server, and general dispatch is the wrong place to hold it. The list stays here for
+    the runner that owns it; the hook in main.py was removed on 2026-08-31.
+    """
+    import io as _io
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    src = _io.open(_os.path.join(root, "main.py"), encoding="utf-8").read()
+    code = chr(10).join(l for l in src.splitlines() if not l.strip().startswith("#"))
+    assert "fleet_toolset" not in code, (
+        "the benchmark's tool-population policy is back in the general dispatch path")

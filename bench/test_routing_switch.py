@@ -3,7 +3,7 @@
 Both pro_stage_goals.py and pro_capture.py carried:
 
     try:
-        from relay import broker_client as bc
+        from bench.remote import broker_client as bc
     except ImportError:
         routed = False
 
@@ -65,7 +65,7 @@ def test_the_marker_file_is_enough(tmp_path):
 
 
 def test_relay_is_importable_from_the_bench_directory():
-    """THE ONE THAT WOULD HAVE CAUGHT IT. `from relay import broker_client` raises here unless
+    """THE ONE THAT WOULD HAVE CAUGHT IT. `from bench.remote import broker_client` raises here unless
     the helper puts the repository on the path first."""
     out = _run("import routing_switch; print(routing_switch.broker() is not None)", cwd=BENCH,
                env={"SWE_BROKER": "on"})

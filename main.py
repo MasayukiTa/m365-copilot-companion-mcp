@@ -462,25 +462,11 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
             except Exception:
                 sig = "(...)"
             return "%s%s\n%s" % (name, sig, (getattr(fn, "__doc__", "") or "").strip())
-        # THE FLEET'S TOOL SET, CONSULTED AT THE ONE POINT EVERY TOOL PASSES THROUGH.
+        # REMOVED: the benchmark's tool-population policy, consulted here.
         #
-        # 167 tools reach a worker here, and the containment plan that moved only the ones
-        # with "exec" in the name would have left process_kill, outlook_send_mail, screenshot
-        # and clipboard_set among them. relay/fleet_toolset.py is the list; this is where it
-        # is read, and AFTER the help branch: reading a tool's signature is not running it,
-        # and a policy that refuses to describe a tool teaches nothing except that it exists.
-        # Default is shadow -- it records what it WOULD refuse and blocks nothing --
-        # because switching a gate from permissive to closed without measuring first is the
-        # mistake this file has already been corrected for once.
-        try:
-            from relay.fleet_toolset import check as _fleet_check
-            _ok, _note = _fleet_check(name)
-            if not _ok:
-                return ("[call_tool refused] %s\n"
-                        "This run is a fleet run, and the tool is not "
-                        "in the set a worker may reach." % _note)
-        except Exception:
-            pass
+        # Which sixteen tools a benchmark worker may reach is a fact about that benchmark,
+        # not about this server, and general dispatch is the wrong place to hold it. The
+        # list is still in relay/fleet_toolset.py for the runner that owns it.
         # EVIDENCE TRACE. Off unless a runner asked for one, and a no-op in ordinary
         # operation. This is the only point that sees every dispatched call with its real
         # name and arguments -- recording at the adapter would name `call_tool` and nothing
@@ -541,43 +527,15 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
         # nothing ran locally, and the fleet's workers reported STUCK -- which reads like
         # models failing at the task. The tests all passed: they assert on this file's
         # SOURCE, and source assertions cannot catch a name that is not bound yet.
-        # ROUTE IT TO THE CONTAINER BEFORE RUNNING IT HERE.
+        # REMOVED: routing every tool call to a container on a remote SSH host.
         #
-        # This is the point the containment work has been building toward: the broker, its
-        # client and the allowlist all existed and nothing used them, so the worktrees stayed
-        # on this machine and a worker still wrote wherever the operator could.
-        #
-        # NotRoutable is not a fallback signal by itself -- when routing is OFF it means
-        # "carry on as before", and that is the only case that continues. When routing is ON
-        # and a call cannot be placed in a container, it is refused: running it here instead
-        # would leave the run looking identical and unconfined.
-        #
-        # AND ONLY FOR THE FLEET'S OWN CALLS. Routing was read on every call this gateway
-        # serves, so switching it on would have refused the operator's tool calls too -- each
-        # names a path no container owns. The first fix gated it on "is an autonomy contract
-        # armed", which is a DIFFERENT mechanism: that file is written by an operator, not by
-        # a bench run, so during the first real routed run the predicate read False, every
-        # worker executed here, and it did so in the address directories staging had left
-        # empty. The switch was on, it was reported on, and nothing was contained.
-        #
-        # The predicate that actually separates the two populations is whether the path
-        # belongs to a staged instance. NotAFleetPath means "not ours" and carries on
-        # unchanged; NotRoutable means "ours, and it could not be placed", which is refused.
-        try:
-            from relay import broker_client as _bc
-            from relay import fleet_tool_router as _router
-            if _bc.enabled():
-                try:
-                    return _router.route(name, _args)
-                except _router.NotAFleetPath:
-                    pass
-                except _router.NotRoutable as _nr:
-                    return ("[call_tool refused] %s\n"
-                            "Fleet execution is routed to the eval host, and this call "
-                            "could not be placed in a container. It was not run here."
-                            % _nr)
-        except ImportError:
-            pass
+        # It was written to close three findings whose common cause was 'the worker can
+        # write where the harness lives'. Relocating the writes is not a fix: it closes
+        # nothing for anyone without a second machine, and this repository is not for one
+        # machine. It also put ssh and docker assumptions into the shipped dispatch path,
+        # and cost 2.5-25 seconds per call, which is not a slow benchmark but a broken one.
+        # The broker now lives under bench/remote/ where the benchmark's own infrastructure
+        # belongs. See docs/EXECUTION_MODES.md for what actually contains a worker here.
         try:
             _out = fn(**_args)
             if _trace is not None:

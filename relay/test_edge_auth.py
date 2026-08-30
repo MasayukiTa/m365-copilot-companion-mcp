@@ -133,3 +133,63 @@ if __name__ == "__main__":
     test_url_helpers_case_insensitive()
     test_defensive_against_empty_and_missing()
     print("ALL EDGE AUTH TESTS PASSED")
+
+
+# THE STUBS BELOW MUST USE THE KEY classify_live ACTUALLY RETURNS ("cls", not "class").
+# They were first written with "class", the code read "class", and all four tests passed --
+# while the live browser, which was ready, came back "unknown". A stub that agrees with the
+# code instead of with the thing it stands in for tests nothing.
+
+
+def test_ensure_ready_returns_ready_without_navigating_when_a_tab_is_already_ready(monkeypatch):
+    """The classifier said "renavigate" and nothing in the system ever did it.
+
+    classify_live and recommended_action were called only by the CLI, by a health reader and
+    by tests, so the product computed the right action, showed a red dot, and waited for a
+    person. Measured 2026-08-31: the companion Edge sat on about:blank, the doctor called it
+    "sign-in needed", and a benchmark run started against it -- every worker got the default
+    assistant with no tools and wrote patches from memory. The page needed one navigation.
+    """
+    monkeypatch.setattr(E, "classify_live", lambda cdp_url="x": [{"cls": "ready"}])
+    called = []
+    assert E.ensure_ready("https://example/agent") == "ready"
+    assert not called
+
+
+def test_ensure_ready_hands_back_needs_signin_without_looping(monkeypatch):
+    """The one state a person must resolve. Navigating past it would loop forever."""
+    monkeypatch.setattr(E, "classify_live", lambda cdp_url="x": [{"cls": "needs_signin"}])
+    assert E.ensure_ready("https://example/agent") == "needs_signin"
+
+
+def test_ensure_ready_navigates_when_the_page_is_blank(monkeypatch):
+    """about:blank classifies as `loading` -> `renavigate`, which is this function's job."""
+    seen = {"n": 0, "urls": []}
+
+    def _classify(cdp_url="x"):
+        seen["n"] += 1
+        return [{"cls": "ready"}] if seen["n"] > 1 else [{"class": "loading"}]
+
+    def _urlopen(url, timeout=None):
+        seen["urls"].append(url if isinstance(url, str) else url.full_url)
+
+        class _R:
+            def read(self_inner):
+                return b""
+        return _R()
+
+    monkeypatch.setattr(E, "classify_live", _classify)
+    import urllib.request as _req
+    monkeypatch.setattr(_req, "urlopen", _urlopen)
+    assert E.ensure_ready("https://example/agent", settle_s=0) == "ready"
+    assert any("https://example/agent" in u for u in seen["urls"]), seen["urls"]
+
+
+def test_ensure_ready_survives_a_dead_browser(monkeypatch):
+    """A recovery that raises when the thing it recovers is absent is not a recovery."""
+    def _boom(cdp_url="x"):
+        raise OSError("no CDP")
+    monkeypatch.setattr(E, "classify_live", _boom)
+    import urllib.request as _req
+    monkeypatch.setattr(_req, "urlopen", lambda *a, **k: (_ for _ in ()).throw(OSError("no")))
+    assert E.ensure_ready("https://example/agent", attempts=2, settle_s=0) == "unknown"

@@ -225,3 +225,63 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(_main())
+
+
+# --------------------------------------------------------------------------- #
+# Acting on the classification
+# --------------------------------------------------------------------------- #
+
+def ensure_ready(agent_url: str, cdp_url: str = "http://127.0.0.1:9222",
+                 attempts: int = 3, settle_s: float = 8.0) -> str:
+    """Make the companion Edge ready, and return the final classification.
+
+    NOTHING ACTED ON `recommended_action` UNTIL THIS EXISTED. classify_live and
+    recommended_action were called only by the CLI, by a health reader, and by tests -- so the
+    system computed "renavigate", displayed a red dot, and waited for a person.
+
+    Measured 2026-08-31: the companion Edge sat on about:blank; the doctor reported "M365
+    sign-in needed" and I asked the owner to sign in by hand. The page did not need a sign-in.
+    It needed one navigation, which took eight seconds. Meanwhile a benchmark run started
+    against a blank page: every worker got the default assistant with no tools, reported
+    STUCK, and wrote patches from memory.
+
+    Only `needs_signin` requires a human. Everything else is this function's job.
+    """
+    import json as _json
+    import time as _time
+    import urllib.parse as _parse
+    import urllib.request as _req
+
+    last = "unknown"
+    for _ in range(max(1, attempts)):
+        try:
+            rows = classify_live(cdp_url)
+        except Exception:
+            rows = []
+        # A single ready tab is enough: the others are blanks the browser keeps around.
+        if any(r.get("cls") == "ready" for r in rows):
+            return "ready"
+        last = next((r.get("cls") for r in rows), "unknown") or "unknown"
+        if last == "needs_signin":
+            return "needs_signin"          # the one state a person must resolve
+
+        try:
+            _req.urlopen(
+                _parse.urljoin(cdp_url, "/json/new?") + agent_url, timeout=20).read()
+        except Exception:
+            # /json/new is a PUT on newer builds and a GET on older ones; try the other.
+            try:
+                r = _req.Request(_parse.urljoin(cdp_url, "/json/new?") + agent_url,
+                                 method="PUT")
+                _req.urlopen(r, timeout=20).read()
+            except Exception:
+                return last
+        _time.sleep(settle_s)
+
+    try:
+        rows = classify_live(cdp_url)
+        if any(r.get("cls") == "ready" for r in rows):
+            return "ready"
+        return next((r.get("cls") for r in rows), last) or last
+    except Exception:
+        return last

@@ -15,7 +15,7 @@ WHERE the call went rather than about whether it returned something plausible.
 """
 import pytest
 
-from relay import fleet_tool_router as R
+from bench.remote import fleet_tool_router as R
 
 
 class FakeBroker:
@@ -54,11 +54,11 @@ def wired(monkeypatch, tmp_path):
     monkeypatch.setattr(R, "STAGING_ROOT", str(tmp_path / "work"))
     fake = FakeBroker()
     # PATCH THE REAL MODULE'S ATTRIBUTES, not sys.modules. `route()` does
-    # `from relay import broker_client as bc`, which reads the attribute already bound on the
+    # `from bench.remote import broker_client as bc`, which reads the attribute already bound on the
     # `relay` package -- so replacing the sys.modules entry is invisible to it, and these
     # tests quietly talked to the LIVE broker instead (they passed alone, because nothing had
     # imported the package yet, and failed in a full run).
-    from relay import broker_client as real
+    from bench.remote import broker_client as real
     monkeypatch.setattr(real, "enabled", fake.enabled)
     monkeypatch.setattr(real, "exec_", fake.exec_)
     monkeypatch.setattr(real, "get", fake.get)

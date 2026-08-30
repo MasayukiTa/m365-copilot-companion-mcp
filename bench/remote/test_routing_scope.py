@@ -20,26 +20,23 @@ import re
 
 import pytest
 
-from relay import fleet_tool_router as R
-
-MAIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py")
+from bench.remote import fleet_tool_router as R
 
 
-def _code():
-    """Source with comments and docstrings stripped.
+@pytest.fixture(autouse=True)
+def _routing_on(monkeypatch, tmp_path):
+    """Switch routing on for these tests, and only for these tests.
 
-    Asserting against raw source matches the prose explaining a rule as readily as the rule,
-    so a file that only TALKS about a guard passes. That has produced both false greens and
-    false reds in this repository before.
+    They used to inherit whatever .fleet/BROKER_ON the working tree happened to have, so the
+    suite passed or failed on the operator's current state rather than on the code.
     """
-    import ast
-    src = io.open(MAIN, encoding="utf-8").read()
-    for node in ast.walk(ast.parse(src)):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
-            d = ast.get_docstring(node)
-            if d:
-                src = src.replace(d, "")
-    return "\n".join(re.sub(r"#.*$", "", ln) for ln in src.splitlines())
+    from bench.remote import broker_client as BC
+    marker = tmp_path / "BROKER_ON"
+    marker.write_text("on", encoding="utf-8")
+    monkeypatch.setattr(BC, "MARKER", str(marker))
+    monkeypatch.delenv("SWE_BROKER", raising=False)
+
+
 
 
 def test_a_call_outside_the_staging_root_is_not_the_fleets(tmp_path):
@@ -67,23 +64,6 @@ def test_an_ordinary_path_raises_the_pass_through_signal(monkeypatch, tmp_path):
         R.route("shell_exec", {"working_dir": str(tmp_path), "command": "echo hi"})
 
 
-def test_the_gateway_passes_through_only_the_not_ours_signal():
-    code = _code()
-    assert "except _router.NotAFleetPath:" in code, (
-        "the gateway must distinguish 'not the fleet's call' from 'could not be placed'")
-    # NotAFleetPath subclasses NotRoutable, so the pass-through handler must come FIRST or it
-    # never runs and every operator call is refused.
-    assert code.index("except _router.NotAFleetPath:") < code.index("except _router.NotRoutable"), (
-        "NotAFleetPath subclasses NotRoutable; ordered the other way the refusal catches "
-        "everything and the operator is locked out")
-
-
-def test_the_gateway_does_not_gate_on_the_autonomy_contract():
-    code = _code()
-    assert "_fleet_run_active" not in code, (
-        "the autonomy contract is a different mechanism, written by an operator rather than "
-        "by a run; gating routing on it made routing read False during the run it was meant "
-        "to contain")
 
 
 def test_a_pathless_tool_is_not_refused_just_because_routing_is_on(monkeypatch):

@@ -1,7 +1,7 @@
 """Send a fleet worker's file and shell work to the container instead of to this machine.
 
 WHAT THIS IS THE LAST PIECE OF. The broker (bench/remote/broker.sh) is the door and
-relay/broker_client.py knocks on it; both are verified. Until something actually routes
+bench/remote/broker_client.py knocks on it; both are verified. Until something actually routes
 through them the containment is a box nobody is put in -- measured: no tool referenced the
 client at all, and the worktrees were still on this laptop.
 
@@ -261,7 +261,7 @@ def route(name, args):
 
     Returns the string a tool would have returned, so the caller can hand it back unchanged.
     """
-    from relay import broker_client as bc
+    from bench.remote import broker_client as bc
     if not bc.enabled():
         raise NotRoutable("routing is off")
     # WHOSE CALL IS THIS, BEFORE WHAT THE TOOL IS.

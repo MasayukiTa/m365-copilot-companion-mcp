@@ -88,7 +88,7 @@ def stage(inst):
         marker = (
             "This directory is an ADDRESS, not a checkout.",
             "The work for " + inst + " happens at /app inside its container; tools that",
-            "name a path under here are translated by relay/fleet_tool_router.py.",
+            "name a path under here are translated by bench/remote/fleet_tool_router.py.",
             "Reading this directory for the instance's source will find nothing, and",
             "that is not a sign the run failed.",
         )

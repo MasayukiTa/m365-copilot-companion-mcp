@@ -3,11 +3,11 @@
 Both `pro_stage_goals.py` and `pro_capture.py` had the same three lines:
 
     try:
-        from relay import broker_client as bc
+        from relay import broker_client as bc        # where it lived at the time
     except ImportError:
         routed = False
 
-Run as `python bench/<script>.py`, sys.path[0] is bench/ and `import relay` always raises, so
+Run as `python bench/<script>.py`, sys.path[0] is bench/ and that import always raises, so
 both scripts read "routing is off" every single time -- while the switch was on and the
 operator had been told it was on. Staging produced four local clones and four lines saying
 "ok"; capture read the empty local directories and reported four skips reading "not a worktree
@@ -49,11 +49,12 @@ def broker(context=""):
         sys.path.insert(0, REPO)
     asked = routing_requested()
     try:
-        from relay import broker_client as bc
+        from bench.remote import broker_client as bc
     except ImportError as exc:
         if asked:
             raise RuntimeError(
-                "routing was asked for but relay.broker_client could not be imported (%s)%s; "
+                "routing was asked for but bench.remote.broker_client could not be imported "
+                "(%s)%s; "
                 "refusing to fall back to this machine, which is the behaviour routing "
                 "replaces" % (exc, (" [%s]" % context) if context else ""))
         return None

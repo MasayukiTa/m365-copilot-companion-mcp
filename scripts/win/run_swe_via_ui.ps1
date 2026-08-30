@@ -133,6 +133,25 @@ for ($round = 1; $round -le $MaxRounds; $round++) {
         $slice = @($pending[($b * $BatchSize)..([math]::Min(($b + 1) * $BatchSize, $pending.Count) - 1)])
         Say ("--- r{0} batch {1}/{2}: {3} instances ---" -f $round, ($b + 1), $batches, $slice.Count)
 
+        # THE AGENT PAGE MUST BE READY BEFORE ANYTHING IS SUBMITTED.
+        #
+        # Twice tonight a run was started against a companion Edge sitting on about:blank.
+        # Every worker got the default assistant with no tools, reported STUCK, and wrote
+        # patches from memory -- and nothing in the run's own logs said why. The classifier
+        # had the answer the whole time ("renavigate"); nothing acted on it.
+        #
+        # needs_signin is the only outcome that needs a person. Everything else this heals.
+        $agentUrl = ((Get-Content .env | Where-Object { $_ -match '^MCP_FLEET_AGENT_URL=' }) -replace '^MCP_FLEET_AGENT_URL=','').Trim()
+        if ($agentUrl) {
+            $cls = & $py -c "import sys;from relay import edge_auth;print(edge_auth.ensure_ready(sys.argv[1]))" $agentUrl
+            Say ("agent page: {0}" -f $cls)
+            if ($cls -eq "needs_signin") {
+                Say "the agent page needs a human sign-in; not submitting a batch that cannot call tools"
+                Say "UI_RUN_BLOCKED"
+                exit 4
+            }
+        }
+
         # A RUN ALREADY IN FLIGHT IS NOT A BROKEN COCKPIT.
         #
         # submit_via_ui.ps1 refuses while a run is live, because Ctrl+Enter steers rather than
