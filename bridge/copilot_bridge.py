@@ -837,6 +837,27 @@ def run_on_page_thread(fn, *args, **kwargs):
 #: in the payload so a caller can tell a full list from a cut one.
 SESSION_LIST_CAP = int(os.environ.get("MCP_BRIDGE_SESSION_LIST_CAP", "50"))
 
+def order_sessions_for_listing(rows, cap):
+    """Openable sessions first, then the rest, cut at `cap`.
+
+    A MODULE-LEVEL FUNCTION SO THE TEST CAN CALL THE REAL ONE. This lived inline in the
+    /sessions handler and its test re-implemented the same three lines -- so the handler could
+    have changed and the test would have kept passing against a copy of what it used to do.
+
+    WHY THE ORDER. 96.6% of the session table cannot be opened at all: every /send, /stream
+    and /goal arriving with no active session mints a row, and most never attach a
+    conversation. Those rows are also the NEWEST, so a plain newest-first cut at the cap left
+    only eight of the nineteen past chats reachable -- eleven existed, were resumable, and
+    could not be found through the list that exists to find them. Raising the cap did not
+    help, because the empties are what is new.
+
+    Ordering WITHIN each group is untouched, so nothing a reader relied on is reordered.
+    """
+    openable = [x for x in (rows or []) if (x.get("conv_url") or "")]
+    empty = [x for x in (rows or []) if not (x.get("conv_url") or "")]
+    return (openable + empty)[:cap]
+
+
 ACTIVE_SID = None
 # Change-based capture baseline: {"cur": <aria-current guid or "">, "known": set(<guids>)}
 # snapshotted BEFORE a conversation-creating send (see _record_capture_baseline). None until
@@ -3517,9 +3538,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Ordering within each group is unchanged (newest first), so this does not
                 # reorder anything a reader was relying on -- it stops the openable rows from
                 # being crowded out by rows that cannot be opened at all.
-                openable = [x for x in all_chat if (x.get("conv_url") or "")]
-                empty = [x for x in all_chat if not (x.get("conv_url") or "")]
-                sessions = (openable + empty)[:SESSION_LIST_CAP]
+                sessions = order_sessions_for_listing(all_chat, SESSION_LIST_CAP)
                 for s in sessions:
                     s.setdefault("source", "chat")
                     # SAYS WHETHER OPENING IT WOULD DO ANYTHING. A row with no conversation
