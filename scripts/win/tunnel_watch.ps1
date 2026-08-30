@@ -1,4 +1,4 @@
-# Keep trying the eval host until it answers, then grade -- do not conclude it is down.
+﻿# Keep trying the eval host until it answers, then grade -- do not conclude it is down.
 #
 # TWO TIMEOUTS ARE NOT A DIAGNOSIS. A "banner exchange" timeout means the tunnel edge accepted
 # the connection and no SSH greeting came back, which is consistent with a sleeping machine, a
@@ -13,6 +13,10 @@ param(
     [int]$MaxHours = 24,
     [string]$Log = ".fleet/swe/tunnel_watch.log"
 )
+
+# The eval host's ssh alias is not written in this repository; it comes from the
+# environment or from .env. See scripts/win/eval_host.ps1.
+. "$PSScriptRoot\eval_host.ps1"
 $ErrorActionPreference = "Continue"
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $repo
@@ -28,7 +32,7 @@ $deadline = (Get-Date).AddHours($MaxHours)
 $attempt = 0
 while ((Get-Date) -lt $deadline) {
     $attempt++
-    $r = & ssh -o BatchMode=yes -o ConnectTimeout=25 EVAL_HOST "echo up" 2>&1
+    $r = & ssh -o BatchMode=yes -o ConnectTimeout=25 $EvalHost "echo up" 2>&1
     if ($r -match "up") {
         Say ("reachable on attempt {0}" -f $attempt)
         break
@@ -39,7 +43,7 @@ while ((Get-Date) -lt $deadline) {
     Start-Sleep -Seconds $EverySec
 }
 
-$r = & ssh -o BatchMode=yes -o ConnectTimeout=25 EVAL_HOST "echo up" 2>&1
+$r = & ssh -o BatchMode=yes -o ConnectTimeout=25 $EvalHost "echo up" 2>&1
 if ($r -notmatch "up") { Say "gave up after the window; the experiment is still staged and nothing was lost"; exit 1 }
 
 Say "grading the retry experiment"
