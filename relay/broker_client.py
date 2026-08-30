@@ -92,7 +92,7 @@ def ping() -> dict:
     return call({"verb": "ping"}, timeout=60)
 
 
-def create(instance: str, image: str, network: str = "bridge") -> dict:
+def create(instance: str, image: str, network: str = "none") -> dict:
     """Start the instance's container.
 
     `network` is stated rather than defaulted silently. "bridge" lets the build fetch its
