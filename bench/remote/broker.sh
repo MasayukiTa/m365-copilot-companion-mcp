@@ -127,7 +127,22 @@ case "$VERB" in
       bridge|none) ;;
       *) fail "network mode must be bridge or none" ;;
     esac
-    if ! docker run -d --name "$CNAME" --network "$NET"         --restart unless-stopped         --entrypoint sleep         --memory "$MEM_LIMIT" --cpus "$CPU_LIMIT" --pids-limit "$PIDS_LIMIT"         --security-opt no-new-privileges         --cap-drop ALL         --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER         --cap-add SETUID --cap-add SETGID --cap-add FSETID         -v "$WORK_ROOT/$INSTANCE:/work" -w /work         "$IMAGE" infinity >/dev/null 2>>"$LOG"; then
+    if ! docker run -d \
+         --name "$CNAME" \
+         --network "$NET" \
+         --restart unless-stopped \
+         --entrypoint sleep \
+         --memory "$MEM_LIMIT" \
+         --cpus "$CPU_LIMIT" \
+         --pids-limit "$PIDS_LIMIT" \
+         --security-opt no-new-privileges \
+         --cap-drop ALL \
+         --cap-add CHOWN \
+         --cap-add DAC_OVERRIDE \
+         --cap-add FOWNER \
+         --cap-add SETUID \
+         --cap-add SETGID \
+         --cap-add FSETID -v "$WORK_ROOT/$INSTANCE:/work" -w /work "$IMAGE" infinity >/dev/null 2>>"$LOG"; then
       fail "container did not start"
     fi
     printf '{"ok":true,"container":"%s","network":"%s"}\n' "$CNAME" "$NET"; log "create $INSTANCE $IMAGE net=$NET"; exit 0 ;;
