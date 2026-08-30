@@ -95,3 +95,32 @@ def test_skipped_instances_are_announced():
     src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "pro_capture.py"), encoding="utf-8").read()
     assert "SKIPPED" in src and "skipped %d" in src
+
+
+def test_an_instance_already_captured_is_not_walked_again(tmp_path, monkeypatch):
+    """The skip list is where a real failure is seen.
+
+    pro_wt_map.json accumulates across batches, so every later batch re-walked every earlier
+    instance -- whose container capture had destroyed on purpose after recording its patch.
+    Each failed with "no running container" and was reported as a SKIP: batch 2 read
+    "captured 8, skipped 8", and by batch 5 there would have been 32 such lines with any real
+    failure among them.
+    """
+    import io as _io
+    import re as _re
+    import ast as _ast
+    src = _io.open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "bench", "pro_capture.py"), encoding="utf-8").read()
+    for node in _ast.walk(_ast.parse(src)):
+        if isinstance(node, (_ast.FunctionDef, _ast.Module)):
+            d = _ast.get_docstring(node)
+            if d:
+                src = src.replace(d, "")
+    code = "\n".join(_re.sub(r"#.*$", "", ln) for ln in src.splitlines())
+    assert "already = {" in code, "nothing computes the set of instances already captured"
+    assert "if inst in already:" in code, "the loop does not skip them"
+    # and it must be keyed on a NON-EMPTY patch: an instance recorded with an empty patch is
+    # one nobody worked, and it deserves another attempt rather than being treated as done.
+    m = _re.search(r"already = \{[^}]*\}", code, _re.S)
+    assert "strip()" in m.group(0), (
+        "an empty patch must not count as captured; that is an instance nobody worked")

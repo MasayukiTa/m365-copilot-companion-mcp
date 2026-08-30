@@ -100,7 +100,20 @@ def main():
     have = {p["instance_id"] for p in preds}
 
     captured, skipped = 0, []
+    # ALREADY CAPTURED, AND ITS CONTAINER RELEASED ON PURPOSE.
+    #
+    # pro_wt_map.json accumulates across batches, so every later batch re-walks every earlier
+    # instance -- whose container this script destroyed after recording its patch. Each one
+    # then failed with "no running container" and was reported as a SKIP. Measured on batch 2:
+    # captured 8, skipped 8, and by batch 5 there would have been 32 such lines.
+    #
+    # The skip list is where a real failure is seen. Filling it with instances that succeeded
+    # is how a real one stops being noticed.
+    already = {p_["instance_id"] for p_ in preds if (p_.get("patch") or "").strip()}
+
     for inst, p in sorted(wt.items()):
+        if inst in already:
+            continue
         if not os.path.isdir(p):
             continue
         # THE DIRECTORY EXISTING IS NOT THE WORKTREE EXISTING.
