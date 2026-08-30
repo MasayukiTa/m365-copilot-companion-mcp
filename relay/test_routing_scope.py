@@ -106,3 +106,25 @@ def test_a_non_routable_tool_IS_refused_when_it_names_the_fleets_tree(monkeypatc
         R.route("process_kill", {"path": os.path.join(R.STAGING_ROOT, "p00")})
     assert not isinstance(exc.value, R.NotAFleetPath)
     assert "no container equivalent" in str(exc.value)
+
+
+def test_a_path_from_another_slice_does_not_resolve_to_some_other_instance(monkeypatch):
+    """THE WORST FAILURE MODE THIS MODULE CAN HAVE.
+
+    Worktree directories were numbered by position in the slice file, so p01 named one
+    instance under a four-instance smoke slice and a different one under the fresh forty. When
+    the next run restaged while the previous run's workers were still going, a worker solving
+    an ansible instance in p01 had its reads routed into a NodeBB container; it reported that
+    the file "does not exist in the container" and declared the task impossible.
+
+    Addressing the wrong repository is worse than any refusal, because the worker's answer is
+    about a codebase nobody asked it to look at.
+    """
+    monkeypatch.setattr(R, "_worktrees",
+                        lambda: {"instB": os.path.normcase(
+                            os.path.join(R.STAGING_ROOT, "p01_bbbbbb"))})
+    stale = os.path.join(R.STAGING_ROOT, "p01_aaaaaa")
+    with pytest.raises(R.NotRoutable) as exc:
+        R.route("read_file", {"path": os.path.join(stale, "x.py")})
+    assert not isinstance(exc.value, R.NotAFleetPath)
+    assert "no instance owns" in str(exc.value)
