@@ -135,5 +135,10 @@ def test_routing_off_is_the_only_case_that_continues_to_local():
     src = io.open(os.path.join(root, "main.py"), encoding="utf-8").read()
     block = src[src.index("from relay import broker_client as _bc"):]
     block = block[:block.index("from relay.fleet_toolset import check")]
-    assert "if _bc.enabled():" in block, "routing must be gated on being enabled"
+    # Matched as a CONDITION, not as a literal line: the gate later grew a second term
+    # (only while a fleet run is in flight), and an equality check on the old text failed
+    # while the property it was written to protect was still held.
+    import re as _re
+    cond = _re.search(r"if\s+_bc\.enabled\(\)(.*?):", block)
+    assert cond, "routing must be gated on being enabled"
     assert "return (" in block and "was not run here" in block

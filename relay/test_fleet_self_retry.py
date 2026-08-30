@@ -65,9 +65,21 @@ def test_the_budget_is_keyed_by_goal_text_not_worker_name():
     # 手前に足した瞬間、区切り位置が動いて落ちた —— 予算の数え方は何も変わっていないのに。
     #
     # 見たいのは「予算のキーがゴール文であること」なので、キーそのものを見る。
+    # THE BLOCK, NOT A CHARACTER WINDOW. This read src[i:i+2600], so adding lines to the
+    # retry branch -- instrumentation, in this case, which changed no behaviour -- pushed
+    # the keying past the window and the test failed while the property it names still
+    # held. A fixed byte count is not a scope.
     src = inspect.getsource(RF.run_relay_fleet)
-    i = src.index("if _retry_on:")
-    block = src[i:i + 2600]
+    lines = src.splitlines()
+    start = next(k for k, l in enumerate(lines) if l.strip() == "if _retry_on:")
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = len(lines)
+    for k in range(start + 1, len(lines)):
+        l = lines[k]
+        if l.strip() and (len(l) - len(l.lstrip())) <= indent:
+            end = k
+            break
+    block = chr(10).join(lines[start:end])
     assert "_retry_used.get(_g" in block, "予算をゴール文で引いていない"
     assert "_retry_used[_g] = _retry_used.get(_g, 0) + 1" in block, (
         "予算をゴール文で数えていない —— ワーカー名で数えると再投入のたびにリセットされる")
