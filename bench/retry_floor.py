@@ -20,6 +20,7 @@ next to the rate so the same mistake cannot hide again.
 from __future__ import annotations
 
 import json
+import os
 from collections import defaultdict
 
 
@@ -69,6 +70,102 @@ def _succeeded(rec):
     return (rec.get("outcome") or "").upper() == "DONE"
 
 
+# ---------------------------------------------------------------------------------------
+# THE ORACLE THE FILE HAS BEEN ASKING FOR SINCE IT WAS WRITTEN
+#
+# _succeeded() above is the fleet saying it finished. A graded slice is the first external
+# check this project has had, and two independent reviews of the mechanism-usage data reached
+# the same verdict: everything in this system was accepted against that self-report, whose
+# measured precision is 71.8% -- 28 right, 11 wrong out of 39 DONE claims.
+#
+# So the curve is computed TWICE and both are reported. The gap between them is not noise;
+# it is the false-DONE tax, and it is the number that says how much of the loop's own
+# reasoning was built on a claim rather than a result.
+#
+# An attempt whose instance is not in the graded slice is UNKNOWN, not failed. Counting it as
+# failed would let the size of the grading effort move the floor, which is the population trap
+# this file already carries a warning about.
+_UNKNOWN = object()
+
+
+def _graded(rec, verdicts, wt_map):
+    """True / False / _UNKNOWN for one attempt, from the grader rather than the worker.
+
+    Joined on the checkout the goal names, because goals do not carry the instance id -- a
+    join on the id matched nothing at all the first time it was tried, and 40 instances came
+    back as "nobody ever claimed anything".
+    """
+    if not verdicts or not wt_map:
+        return _UNKNOWN
+    goal = (rec.get("goal") or "").replace("/", "\\").lower()
+    hits = [inst for inst, path in wt_map.items()
+            if str(path).replace("/", "\\").lower() in goal]
+    if len(hits) != 1:
+        return _UNKNOWN
+    if hits[0] not in verdicts:
+        return _UNKNOWN
+    return bool(verdicts[hits[0]])
+
+
+def graded_curve(attempts_by_goal, verdicts, wt_map, max_k=5):
+    """The same shape as floor_curve, but over correctness -- OR a refusal, and usually that.
+
+    THE REFUSAL IS THE POINT. One patch is captured per instance, so every attempt of a goal
+    joins to the SAME verdict. A curve computed over that is flat by construction: measured on
+    the first graded slice, k=1 and k=2 both came out at 0.755 with an identical numerator and
+    denominator, which looks like "retry adds nothing" and actually means "the question was
+    never asked".
+
+    An external review named this before it was run: with only the final artifact graded, you
+    cannot tell whether the second attempt rescued a failure, preserved a success, or replaced
+    a success with a failure. Reporting a number here would answer a different question in the
+    shape of this one -- the exact error that made `outcome == DONE` acceptable for two years.
+
+    So: if every attempt of every goal resolves to one verdict, this returns why it cannot
+    answer rather than a curve. Grading per-attempt snapshots is what unlocks it.
+    """
+    # Does any goal have attempts that could be told apart at all?
+    distinguishable = 0
+    for rs in attempts_by_goal.values():
+        seen = {id(_graded(r, verdicts, wt_map)) if _graded(r, verdicts, wt_map) is _UNKNOWN
+                else _graded(r, verdicts, wt_map) for r in rs}
+        if len({v for v in seen if v is not _UNKNOWN}) > 1:
+            distinguishable += 1
+    if distinguishable == 0:
+        return {
+            "refused": True,
+            "reason": ("one patch is captured per instance, so every attempt of a goal joins "
+                       "to the same verdict. A per-k curve over that is flat by construction "
+                       "and would read as 'retry adds nothing'."),
+            "what_would_unlock_it": ("capture and grade a patch per ATTEMPT, then compute "
+                                     "rescue P(G2=1,G1=0) and regression P(G2=0,G1=1)"),
+            "goals_with_distinguishable_attempts": 0,
+        }
+    curve = []
+    for k in range(1, max_k + 1):
+        eligible = [rs for rs in attempts_by_goal.values() if len(rs) >= k]
+        if not eligible:
+            continue
+        known, solved = 0, 0
+        for rs in eligible:
+            vals = [_graded(r, verdicts, wt_map) for r in rs[:k]]
+            if all(v is _UNKNOWN for v in vals):
+                continue
+            known += 1
+            if any(v is True for v in vals):
+                solved += 1
+        curve.append({
+            "k": k,
+            "goals_with_k_attempts": len(eligible),
+            # STATED, NOT HIDDEN: how many of those could be graded at all.
+            "gradable": known,
+            "ungradable": len(eligible) - known,
+            "solved_within_k": solved,
+            "rate": (solved / known) if known else None,
+        })
+    return curve
+
+
 def floor_curve(attempts_by_goal, max_k=5):
     """P(at least one success within k attempts), for each k, over a HONEST denominator.
 
@@ -115,11 +212,33 @@ def per_attempt_rate(attempts_by_goal):
     return {"attempts": total, "succeeded": done, "rate": done / total}
 
 
-def report(path, max_k=5, min_attempts=2):
+def report(path, max_k=5, min_attempts=2, eval_path=None, slice_path=None):
     rows = load_history(path)
     grouped = group_attempts(rows, min_attempts)
     curve = floor_curve(grouped, max_k)
+
+    # THE SECOND FLOOR, when a grader is available. Not a replacement for the first: the two
+    # are reported side by side and their gap is the false-DONE tax.
+    graded, verdicts, wt_map = None, None, None
+    if eval_path and slice_path and os.path.exists(eval_path) and os.path.exists(slice_path):
+        verdicts = {k: bool(v) for k, v in
+                    json.load(open(eval_path, encoding="utf-8-sig")).items()}
+        ids = sorted(r["instance_id"] for r in
+                     json.load(open(slice_path, encoding="utf-8-sig")))
+        root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            ".fleet", "swe", "work")
+        wt_map = {inst: os.path.join(root, "p%02d" % i) for i, inst in enumerate(ids)}
+        graded = graded_curve(grouped, verdicts, wt_map, max_k)
+
     return {
+        "graded_curve": graded,
+        "graded_note": (
+            "correctness from the grader, not the worker's DONE. None when no graded slice "
+            "was supplied. Compare k-for-k against `curve`: the gap is how much of the "
+            "completion floor was a claim rather than a result."
+            if graded is None else
+            "the floor a mechanism actually has to beat. `curve` is the same measurement "
+            "against self-reported DONE and is kept only so the two can be compared."),
         # NAMED FOR WHAT IT COUNTS. It was "curve" and was read as accuracy.
         "measures": "completion (outcome == DONE), NOT external correctness",
         "ledger_rows": len(rows),
@@ -138,6 +257,19 @@ def report(path, max_k=5, min_attempts=2):
         # same goals against themselves with one more attempt, inside a population already
         # conditioned the same way for every k.
         "k1_is_selection_biased": True,
+        # AND THE BIAS RUNS THE OTHER WAY FROM THE ONE ASSUMED HERE.
+        #
+        # Both reviews of this data made the same correction: the retried group is the one
+        # whose first attempt was DETECTED as failed, which is the disadvantaged population --
+        # and it still reaches the higher rate. The selection understates retry rather than
+        # inflating it.
+        #
+        # The sharper reading is about the group that is NOT retried. A goal stops at one
+        # attempt when the worker said DONE and nothing checked, so the single-attempt bucket
+        # is where false-DONE settles: measured precision of DONE is 71.8%, and the
+        # single-attempt graded rate is 42.9%. Retry works, and its trigger is wired to the
+        # self-report, so it never fires on the population that most needs it.
+        "the_unretried_group_is_where_false_done_settles": True,
         "not_an_accuracy_floor": (
             "DONE is the worker reporting that it finished; nothing external checked the "
             "answer. A mechanism asked to beat these rates is being asked to beat a claim, "
