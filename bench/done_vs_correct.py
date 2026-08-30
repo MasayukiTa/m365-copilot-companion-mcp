@@ -46,35 +46,59 @@ def load_ledger(path):
     return rows if isinstance(rows, list) else []
 
 
-def _instance_of(goal, instance_ids):
-    """Which instance a ledger row belongs to, or None.
+def worktree_map_for(slice_path):
+    """instance_id -> worktree path, reconstructed from the slice.
 
-    Joined on the instance id appearing in the goal text. A goal that matches two instances
-    joins to NEITHER -- an ambiguous join is worse than a missing one, because it silently
-    attributes one worker's attempts to another instance.
+    THE GOALS DO NOT NAME THE INSTANCE. They name the checkout:
+
+        The repository is checked out locally at:
+          ...\.fleet\swe\work\p03
+
+    The first version of this file joined on the instance id appearing in the goal text and
+    matched nothing -- 40 instances, 0 attempts found, every one filed as "never said DONE",
+    which reads exactly like a fleet that never claimed anything. The id is not in the text.
+
+    pro_stage_goals assigns pNN by position in the SORTED slice, so the mapping is
+    reproducible from the slice file alone. That matters because pro_wt_map.json is rewritten
+    by every batch and no longer describes the run being graded.
     """
-    if not goal:
-        return None
-    hits = [i for i in instance_ids if i in goal]
-    return hits[0] if len(hits) == 1 else None
+    import os
+    rows = json.load(io.open(slice_path, encoding="utf-8-sig"))
+    ids = sorted(r["instance_id"] for r in rows)
+    root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        ".fleet", "swe", "work")
+    return {inst: os.path.join(root, "p%02d" % i) for i, inst in enumerate(ids)}
 
 
-def attempts_by_instance(rows, instance_ids):
+def attempts_by_instance(rows, wt_map):
+    """instance_id -> its ledger rows, joined on the worktree path the goal names.
+
+    Reuses swe_run_facts._mentions_path rather than restating it: `.../p1` must not match a
+    goal about `.../p10`, and the same predicate written twice is the shape that drifts.
+    """
+    import os as _os
+    import sys as _sys
+    _root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _root not in _sys.path:
+        _sys.path.insert(0, _root)
+    from bench.swe_run_facts import _mentions_path, _norm
     out = defaultdict(list)
     for r in rows or []:
         if not isinstance(r, dict):
             continue
-        inst = _instance_of(r.get("goal") or "", instance_ids)
-        if inst:
-            out[inst].append(r)
+        goal = _norm(r.get("goal") or "")
+        hits = [inst for inst, path in wt_map.items() if _mentions_path(goal, _norm(path))]
+        # An ambiguous goal joins to NEITHER: silently lending one worker's attempts to
+        # another instance produces a number that looks complete and is wrong.
+        if len(hits) == 1:
+            out[hits[0]].append(r)
     return out
 
 
-def report(eval_path, ledger_path):
+def report(eval_path, ledger_path, slice_path):
     verdicts = load_eval(eval_path)
-    ids = list(verdicts)
     rows = load_ledger(ledger_path)
-    att = attempts_by_instance(rows, ids)
+    att = attempts_by_instance(rows, worktree_map_for(slice_path))
 
     resolved = sum(1 for v in verdicts.values() if v)
     n = len(verdicts)
@@ -129,8 +153,10 @@ def _main():
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ap.add_argument("--eval", required=True, help="eval_results.json from the grader")
     ap.add_argument("--ledger", default=os.path.join(here, ".fleet", "history.json"))
+    ap.add_argument("--slice", default=os.path.join(here, ".fleet", "swe", "pro_slice40_fresh.json"),
+                    help="the slice the run used; the pNN mapping is derived from it")
     a = ap.parse_args()
-    out = report(a.eval, a.ledger)
+    out = report(a.eval, a.ledger, a.slice)
     print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0
 

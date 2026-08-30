@@ -44,6 +44,6 @@ Say "--- calibration report (resolved rate per task class) ---"
 & $py -m relay.selfimprove.calibration $local 2>&1 | ForEach-Object { Say $_ }
 
 Say "--- how often DONE was right ---"
-& $py bench/done_vs_correct.py --eval $local 2>&1 | ForEach-Object { Say $_ }
+& $py bench/done_vs_correct.py --eval $local --slice ".fleet/swe/pro_slice40_fresh.json" 2>&1 | ForEach-Object { Say $_ }
 
 Say "analysis complete"
