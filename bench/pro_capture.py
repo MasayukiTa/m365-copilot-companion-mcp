@@ -22,12 +22,25 @@ MAX_PATCH_BYTES = 1_000_000
 #: return an empty patch -- and an empty patch is exactly what a model that solved nothing
 #: produces. A routed run would have scored zero and read as a modelling result.
 def _routed_diff(inst):
-    """Unified diff of the container's checkout, or None if routing is not carrying this run."""
+    """Unified diff of the container's checkout, or None if routing is not carrying this run.
+
+    THE IMPORT IS NOT ALLOWED TO FAIL QUIETLY -- the same fail-open that was closed in
+    pro_stage_goals.py and left open here. Run as `python bench/pro_capture.py`, sys.path[0]
+    is bench/ and `import relay` raises ImportError; caught and turned into "routing is off",
+    capture fell back to reading the LOCAL directory, which under routing holds a note instead
+    of a checkout. Measured 2026-08-31: a worker had edited seven files inside its container
+    and this function reported nothing, so the run recorded 0 predictions and 4 skips with the
+    reason "not a worktree root" -- which reads as a staging problem and is not one.
+    """
+    # BOTH IMPORT FORMS, because this file is run as `python bench/<script>.py` (sys.path[0]
+    # is bench/, so `bench.` does not resolve) and imported as `bench.<script>` from the
+    # tests. Getting this wrong is the same fail-open one level up.
     try:
-        from relay import broker_client as bc
+        from bench.routing_switch import broker as _broker
     except ImportError:
-        return None
-    if not bc.enabled():
+        from routing_switch import broker as _broker
+    bc = _broker("pro_capture")
+    if bc is None:
         return None
     # Same two sources as the local path: tracked changes (staged or not) via `diff HEAD`,
     # then each untracked file. `diff --no-index` exits 1 when the files differ, which is the
