@@ -58,7 +58,15 @@ for p in sorted(glob.glob(os.path.join(d, 'preds_*.json'))):
 print('prepared %d sample(s), %d instances' % (n, len(ids)))
 "@ 2>&1 | ForEach-Object { Say $_ }
 
-& ssh -o BatchMode=yes EVAL_HOST "powershell -NoProfile -Command `"New-Item -ItemType Directory -Force C:\swe-grade\bonhard | Out-Null`"" 2>&1 | Out-Null
+# THE REMOTE COMMAND IS BUILT AS A STRING, NOT NESTED IN QUOTES.
+#
+# The first version wrote the PowerShell inline with backtick-escaped quotes and the
+# far side received it broken: cmd tried to run Out-Null as a program, the directory
+# was never created, and the grader then failed with 'no such file' AFTER the chain
+# had already logged that it launched. Nested quoting through ssh, cmd and PowerShell
+# is three escaping rules deep; a variable holding the whole command is one.
+$mkdirCmd = 'powershell -NoProfile -Command New-Item -ItemType Directory -Force C:\swe-gradeonhard'
+& ssh -o BatchMode=yes EVAL_HOST $mkdirCmd 2>&1 | ForEach-Object { Say ('remote: ' + $_) }
 & scp -o BatchMode=yes "$Dir/bon_raw.jsonl" "EVAL_HOST:C:/swe-grade/bonhard/" 2>&1 | Out-Null
 Get-ChildItem "$Dir/grade_preds_*.json" | ForEach-Object {
     & scp -o BatchMode=yes $_.FullName "EVAL_HOST:C:/swe-grade/bonhard/" 2>&1 | Out-Null
@@ -66,7 +74,11 @@ Get-ChildItem "$Dir/grade_preds_*.json" | ForEach-Object {
 & $py -c "import io; s=io.open('bench/remote/bon_grade.sh',encoding='utf-8').read().replace('/mnt/c/swe-grade/bon','/mnt/c/swe-grade/bonhard'); io.open('.fleet/swe/bonhard_grade.sh','w',encoding='utf-8',newline='\n').write(s)"
 & scp -o BatchMode=yes ".fleet/swe/bonhard_grade.sh" "EVAL_HOST:C:/swe-grade/bonhard/bon_grade.sh" 2>&1 | Out-Null
 Say "launching the grader on the eval host"
-& ssh -o BatchMode=yes EVAL_HOST "powershell -NoProfile -Command `"schtasks /Delete /TN BonHardGrade /F 2>`$null | Out-Null; schtasks /Create /TN BonHardGrade /TR ('\`"C:\Windows\System32\wsl.exe\`" -d Ubuntu -e /bin/bash /mnt/c/swe-grade/bonhard/bon_grade.sh') /SC ONCE /ST 23:56 /RL HIGHEST /F | Out-Null; schtasks /Run /TN BonHardGrade`"" 2>&1 | ForEach-Object { Say ("remote: " + $_) }
+$tr = '"C:\Windows\System32\wsl.exe" -d Ubuntu -e /bin/bash /mnt/c/swe-grade/bonhard/bon_grade.sh'
+$mk = 'schtasks /Create /TN BonHardGrade /TR "' + $tr.Replace('"','\"') + '" /SC ONCE /ST 23:56 /RL HIGHEST /F'
+& ssh -o BatchMode=yes EVAL_HOST 'schtasks /Delete /TN BonHardGrade /F' 2>&1 | Out-Null
+& ssh -o BatchMode=yes EVAL_HOST $mk 2>&1 | ForEach-Object { Say ('remote: ' + $_) }
+& ssh -o BatchMode=yes EVAL_HOST 'schtasks /Run /TN BonHardGrade' 2>&1 | ForEach-Object { Say ('remote: ' + $_) }
 
 Say "waiting for the verdicts"
 $deadline2 = (Get-Date).AddHours(2)
