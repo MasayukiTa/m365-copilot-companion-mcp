@@ -17,7 +17,12 @@ class _Proc:
         self.stdout, self.stderr, self.returncode = out, err, rc
 
 
-def test_it_is_off_unless_switched_on(monkeypatch):
+def test_it_is_off_unless_switched_on(monkeypatch, tmp_path):
+    # THE MARKER FILE TOO. Isolating only the environment variable left this test reading the
+    # repository's real .fleet/BROKER_ON, so its result depended on whether routing happened
+    # to be switched on -- a suite that passes or fails on the operator's current state is
+    # not measuring the code.
+    monkeypatch.setattr(BC, "MARKER", str(tmp_path / "BROKER_ON"))
     """Step 2 changes where every fleet tool lands. That is a decision, not an import."""
     monkeypatch.delenv("SWE_BROKER", raising=False)
     assert BC.enabled() is False

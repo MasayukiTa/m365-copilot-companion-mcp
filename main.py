@@ -483,19 +483,25 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
         # and a call cannot be placed in a container, it is refused: running it here instead
         # would leave the run looking identical and unconfined.
         #
-        # AND ONLY WHILE A FLEET RUN IS IN FLIGHT. Routing was written to contain the fleet,
-        # but it was read on every call this gateway serves, so switching it on would have
-        # refused the operator's own tool calls too -- every one of them names a path no
-        # container owns. A containment measure that has to be switched off to get ordinary
-        # work done is a containment measure that will be found switched off. The predicate
-        # is the same one the toolset gate uses, and it fails closed the same way.
+        # AND ONLY FOR THE FLEET'S OWN CALLS. Routing was read on every call this gateway
+        # serves, so switching it on would have refused the operator's tool calls too -- each
+        # names a path no container owns. The first fix gated it on "is an autonomy contract
+        # armed", which is a DIFFERENT mechanism: that file is written by an operator, not by
+        # a bench run, so during the first real routed run the predicate read False, every
+        # worker executed here, and it did so in the address directories staging had left
+        # empty. The switch was on, it was reported on, and nothing was contained.
+        #
+        # The predicate that actually separates the two populations is whether the path
+        # belongs to a staged instance. NotAFleetPath means "not ours" and carries on
+        # unchanged; NotRoutable means "ours, and it could not be placed", which is refused.
         try:
             from relay import broker_client as _bc
             from relay import fleet_tool_router as _router
-            from relay.fleet_toolset import _fleet_run_active as _fleet_active
-            if _bc.enabled() and _fleet_active():
+            if _bc.enabled():
                 try:
                     return _router.route(name, _args)
+                except _router.NotAFleetPath:
+                    pass
                 except _router.NotRoutable as _nr:
                     return ("[call_tool refused] %s\n"
                             "Fleet execution is routed to the eval host, and this call "
