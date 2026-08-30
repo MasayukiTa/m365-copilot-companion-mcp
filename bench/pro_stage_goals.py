@@ -62,7 +62,10 @@ def stage(inst):
     import sys as _sys
     if REPO not in _sys.path:
         _sys.path.insert(0, REPO)
-    _asked = (os.environ.get("SWE_BROKER") or "").strip().lower() in ("1", "on", "true", "yes")
+    # ASKED-FOR covers BOTH switches. Reading only the environment variable would have left
+    # the marker-file route with exactly the silent fallback this check was added to close.
+    _asked = ((os.environ.get("SWE_BROKER") or "").strip().lower() in ("1", "on", "true", "yes")
+              or os.path.isfile(os.path.join(REPO, ".fleet", "BROKER_ON")))
     try:
         from relay import broker_client as _bc
         _routed = _bc.enabled()
