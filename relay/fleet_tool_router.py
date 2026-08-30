@@ -119,17 +119,27 @@ def route(name, args):
     from relay import broker_client as bc
     if not bc.enabled():
         raise NotRoutable("routing is off")
-    if name not in ROUTABLE:
-        raise NotRoutable("%s has no container equivalent yet; refusing rather than "
-                          "running it on the operator's machine" % name)
-
+    # WHOSE CALL IS THIS, BEFORE WHAT THE TOOL IS.
+    #
+    # The ROUTABLE check came first, so with routing switched on this function refused every
+    # one of the ~150 tools outside that list -- for the operator as much as for the fleet.
+    # Measured: `stop_check` came back "has no container equivalent yet", and stop_check does
+    # not touch the filesystem at all. The path predicate that separates the two populations
+    # was never reached, so the lockout the previous fix was written to prevent was still
+    # there by another door.
     a = dict(args or {})
     where = a.get("working_dir") or a.get("path") or os.getcwd()
     inst = instance_for(where)
+    if not inst and not is_fleet_path(where):
+        raise NotAFleetPath("%s is not under the staging root; this is not a fleet call"
+                            % where)
+
+    # From here the call names the fleet's own tree, so a tool with no container equivalent is
+    # a refusal rather than a pass-through: running it here is the thing being prevented.
+    if name not in ROUTABLE:
+        raise NotRoutable("%s has no container equivalent yet; refusing rather than "
+                          "running it on the operator's machine" % name)
     if not inst:
-        if not is_fleet_path(where):
-            raise NotAFleetPath("%s is not under the staging root; this is not a fleet call"
-                                % where)
         raise NotRoutable("no instance owns %s; a call that cannot be placed in a container "
                           "must not run outside one" % where)
 
