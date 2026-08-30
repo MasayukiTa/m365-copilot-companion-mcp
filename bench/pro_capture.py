@@ -15,6 +15,60 @@ WTMAP = os.path.join(SW, "pro_wt_map.json")
 MAX_PATCH_BYTES = 1_000_000
 
 
+#: THE DIFF MUST COME FROM WHEREVER THE WORK HAPPENED.
+#:
+#: This module reads the LOCAL worktree. Under routing the worker edits /app inside the
+#: instance's container and the local directory is only an address, so every capture would
+#: return an empty patch -- and an empty patch is exactly what a model that solved nothing
+#: produces. A routed run would have scored zero and read as a modelling result.
+def _routed_diff(inst):
+    """Unified diff of the container's checkout, or None if routing is not carrying this run."""
+    try:
+        from relay import broker_client as bc
+    except ImportError:
+        return None
+    if not bc.enabled():
+        return None
+    # Same two sources as the local path: tracked changes (staged or not) via `diff HEAD`,
+    # then each untracked file. `diff --no-index` exits 1 when the files differ, which is the
+    # normal case here, so the exit status of the whole script must not be taken from it.
+    cmd = ("cd /app && git diff HEAD; "
+           "git ls-files --others --exclude-standard | while IFS= read -r f; do "
+           "git diff --no-index /dev/null \"$f\" || true; done")
+    try:
+        res = bc.exec_(inst, cmd, timeout=180)
+    except Exception as exc:
+        # NOT an empty patch. Returning "" here would be indistinguishable from a worker that
+        # changed nothing, which is the confusion this whole function exists to prevent.
+        raise RuntimeError("routed capture failed for %s: %s" % (inst, exc))
+    return res.get("output") or ""
+
+
+def _emit(preds, have, inst, d, prefix):
+    """Record one captured patch: replace any earlier entry, snapshot it, append it.
+
+    Factored out so the routed path records EXACTLY what the local path records. Written
+    twice, these drift, and the drift shows up as a scoring difference between two runs that
+    were supposed to differ only in where the work happened.
+    """
+    if inst in have:
+        preds[:] = [x for x in preds if x["instance_id"] != inst]
+    try:
+        snap_dir = os.path.join(SW, "attempts")
+        os.makedirs(snap_dir, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        with open(os.path.join(snap_dir, "%s__%s.json" % (inst[:80], stamp)),
+                  "w", encoding="utf-8") as fh:
+            json.dump({"instance_id": inst, "patch": d, "captured_at": time.time(),
+                       "patch_sha256_16": hashlib.sha256(d.encode("utf-8")).hexdigest()[:16]},
+                      fh, ensure_ascii=False)
+    except Exception:
+        # A snapshot that cannot be written must not cost the capture it is observing.
+        pass
+    preds.append({"instance_id": inst, "patch": d, "prefix": prefix})
+    print("%-58s patch=%d bytes" % (inst[:58], len(d)))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--preds", default=os.path.join(SW, "pro_preds_50.json"))
@@ -47,6 +101,24 @@ def main():
         # grader would score it. Measured: every surviving worktree reported HEAD as this
         # repository's latest commit and a dirty count of 36, which is the checkout I was
         # editing, not the instance.
+        # ROUTED FIRST: the checks below are about the local git worktree, and under routing
+        # there is no local worktree to be right or wrong about.
+        _rd = None
+        try:
+            _rd = _routed_diff(inst)
+        except RuntimeError as exc:
+            skipped.append((inst, str(exc)))
+            continue
+        if _rd is not None:
+            d = _rd
+            if len(d) > MAX_PATCH_BYTES:
+                skipped.append((inst, "diff of %d bytes exceeds %d; not a fix"
+                                % (len(d), MAX_PATCH_BYTES)))
+                d = ""
+            _emit(preds, have, inst, d, a.prefix)
+            captured += 1
+            continue
+
         top = subprocess.run(["git", "-C", p, "rev-parse", "--show-toplevel"],
                              capture_output=True, text=True, encoding="utf-8",
                              errors="replace").stdout.strip()
@@ -68,8 +140,6 @@ def main():
                                  errors="replace").stdout
             if add:
                 d += add
-        if inst in have:
-            preds = [x for x in preds if x["instance_id"] != inst]  # replace
         # AN OVERSIZE DIFF IS NOT A FIX, AND IT COSTS THE DISK THE RUN NEEDS.
         #
         # Measured 2026-08-29: one instance captured 105,722,582 bytes -- a worker had
@@ -79,31 +149,8 @@ def main():
         if len(d) > MAX_PATCH_BYTES:
             skipped.append((inst, "diff of %d bytes exceeds %d; not a fix" % (len(d), MAX_PATCH_BYTES)))
             d = ""
-        # A SNAPSHOT PER CAPTURE, so attempts can be told apart later.
-        #
-        # Only the final patch per instance was ever kept, and that is why the graded retry
-        # floor had to refuse: every attempt of a goal joined to the SAME verdict, so k=1 and
-        # k=2 came out identical and the question "did the second attempt rescue, preserve, or
-        # break it" could not be asked at all. Two independent reviews named that as the
-        # blocker on measuring the only mechanism with a signal.
-        #
-        # Cheap to keep -- these are kilobytes -- and impossible to reconstruct afterwards,
-        # because the worktree is deleted a few lines below.
-        try:
-            snap_dir = os.path.join(SW, "attempts")
-            os.makedirs(snap_dir, exist_ok=True)
-            stamp = time.strftime("%Y%m%d_%H%M%S")
-            with open(os.path.join(snap_dir, "%s__%s.json" % (inst[:80], stamp)),
-                      "w", encoding="utf-8") as fh:
-                json.dump({"instance_id": inst, "patch": d, "captured_at": time.time(),
-                           "patch_sha256_16": hashlib.sha256(d.encode("utf-8")).hexdigest()[:16]},
-                          fh, ensure_ascii=False)
-        except Exception:
-            # A snapshot that cannot be written must not cost the capture it is observing.
-            pass
-        preds.append({"instance_id": inst, "patch": d, "prefix": a.prefix})
+        _emit(preds, have, inst, d, a.prefix)
         captured += 1
-        print("%-58s patch=%d bytes" % (inst[:58], len(d)))
         if not a.keep:
             # `git worktree remove` FIRST, rmtree only as a fallback.
             #

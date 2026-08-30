@@ -42,6 +42,63 @@ def stage(inst):
     wt = wt_for(inst)
     url = "https://github.com/%s.git" % r["repo"]
     sha = r["base_commit"]
+
+    # UNDER ROUTING THE LOCAL CLONE IS PURE COST.
+    #
+    # The container carries the instance's checkout at /app already -- that is what the image
+    # IS -- so cloning the same repository onto this machine buys nothing and spends the disk
+    # the run keeps running out of. What the local path is still needed for is ADDRESSING:
+    # fleet_tool_router.instance_for() maps a working directory to the container that owns it,
+    # so the directory has to exist and has to be in the map. It just does not have to have
+    # a repository in it.
+    # THE IMPORT IS NOT ALLOWED TO FAIL QUIETLY.
+    #
+    # Run as `python bench/pro_stage_goals.py`, sys.path[0] is bench/ and `import relay`
+    # raises ImportError. Caught and turned into "routing is off", that produced four local
+    # clones and four lines reading "ok" on a run whose whole point was that nothing should
+    # be cloned here -- the switch was on, the operator was told it was on, and the work
+    # happened locally anyway. Put the repository on the path, and if routing was ASKED for
+    # and cannot be reached, stop instead of falling back to the behaviour being replaced.
+    import sys as _sys
+    if REPO not in _sys.path:
+        _sys.path.insert(0, REPO)
+    _asked = (os.environ.get("SWE_BROKER") or "").strip().lower() in ("1", "on", "true", "yes")
+    try:
+        from relay import broker_client as _bc
+        _routed = _bc.enabled()
+    except ImportError as _exc:
+        if _asked:
+            raise SystemExit("SWE_BROKER is set but relay.broker_client could not be "
+                             "imported (%s). Refusing to stage locally instead: that is the "
+                             "silent fallback this check exists to prevent." % _exc)
+        _routed = False
+    if _routed:
+        os.makedirs(wt, exist_ok=True)
+        marker = (
+            "This directory is an ADDRESS, not a checkout.",
+            "The work for " + inst + " happens at /app inside its container; tools that",
+            "name a path under here are translated by relay/fleet_tool_router.py.",
+            "Reading this directory for the instance's source will find nothing, and",
+            "that is not a sign the run failed.",
+        )
+        with open(os.path.join(wt, "ROUTED_TO_CONTAINER.txt"), "w", encoding="utf-8") as fh:
+            fh.write(chr(10).join(marker) + chr(10))
+        # AND THE CONTAINER ITSELF, here, because an address with nothing behind it fails at
+        # the worker's first tool call rather than at staging, where the failure is legible.
+        #
+        # NETWORK DEFAULTS TO none, and not only for containment: these repositories are
+        # public and the commit that fixes each instance is upstream, so a solver with egress
+        # can fetch the answer. That is contamination, and it would raise the score. The
+        # images are pre-built with their dependencies, so none is also usually sufficient;
+        # SWE_NET=bridge is there for an instance that genuinely cannot build without it, and
+        # a run that uses it should say so.
+        net = os.environ.get("SWE_NET", "none")
+        try:
+            _bc.create(inst, "jefzda/sweap-images:" + r["dockerhub_tag"], network=net)
+        except Exception as exc:
+            return wt, "CONTAINER_FAIL: %s" % (str(exc)[:160],)
+        return wt, "routed(net=%s)" % net
+
     if os.path.isfile(os.path.join(wt, ".git", "HEAD")):
         cur = run(["git", "rev-parse", "HEAD"], cwd=wt).stdout.strip()
         if cur == sha:
@@ -139,9 +196,12 @@ def main():
     goals, wtmap = [], {}
     for inst in ids:
         wt, st = stage(inst)
+        # "routed" IS a successful staging. It was not in this tuple, so a routed batch
+        # would have produced zero goals while every line printed "routed" -- a run that
+        # looks staged and submits nothing.
         mb = dirsize_mb(wt) if st in ("ok", "exists@base") else 0
         print("%-56s %-7s %5dMB  %s" % (inst[:56], BY_ID[inst]["repo_language"], mb, st))
-        if st in ("ok", "exists@base"):
+        if st in ("ok", "exists@base") or st.startswith("routed"):
             goals.append(goal(inst, wt))
             wtmap[inst] = wt
     with open(a.out, "w", encoding="utf-8", newline="\n") as f:

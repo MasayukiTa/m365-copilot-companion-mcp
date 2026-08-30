@@ -482,10 +482,18 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
         # "carry on as before", and that is the only case that continues. When routing is ON
         # and a call cannot be placed in a container, it is refused: running it here instead
         # would leave the run looking identical and unconfined.
+        #
+        # AND ONLY WHILE A FLEET RUN IS IN FLIGHT. Routing was written to contain the fleet,
+        # but it was read on every call this gateway serves, so switching it on would have
+        # refused the operator's own tool calls too -- every one of them names a path no
+        # container owns. A containment measure that has to be switched off to get ordinary
+        # work done is a containment measure that will be found switched off. The predicate
+        # is the same one the toolset gate uses, and it fails closed the same way.
         try:
             from relay import broker_client as _bc
             from relay import fleet_tool_router as _router
-            if _bc.enabled():
+            from relay.fleet_toolset import _fleet_run_active as _fleet_active
+            if _bc.enabled() and _fleet_active():
                 try:
                     return _router.route(name, _args)
                 except _router.NotRoutable as _nr:
