@@ -535,7 +535,7 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
         # machine. It also put ssh and docker assumptions into the shipped dispatch path,
         # and cost 2.5-25 seconds per call, which is not a slow benchmark but a broken one.
         # The broker now lives under bench/remote/ where the benchmark's own infrastructure
-        # belongs. See docs/EXECUTION_MODES.md for what actually contains a worker here.
+        # belongs. See docs/SECURITY.md for what actually contains a worker here.
         try:
             _out = fn(**_args)
             if _trace is not None:
