@@ -67,7 +67,15 @@ if [ "$(freeG)" -lt "$FLOOR_GB" ]; then
   exit 2
 fi
 
-say "evaluating"
+# cd HERE, AND NOT ONLY IN A COMMENT. The eval entry point is a path relative to the harness
+# repository, and this script is launched from a scheduled task whose working directory is
+# C:\Windows\system32. It failed with
+#     can't open file '/mnt/c/Windows/system32/swe_bench_pro_eval.py'
+# after thirteen minutes of pulling forty-four images -- the expensive half had already
+# succeeded and the cheap half could not find its own program. The rewrite that dropped the
+# cd inherited everything else from the script it replaced.
+cd "$REPO" || { say "cannot enter $REPO"; exit 1; }
+say "evaluating (cwd=$(pwd))"
 timeout 30000 "$PY" swe_bench_pro_eval.py --use_local_docker --num_workers 2 \
   --raw_sample_path "$OUT/raw_graded.jsonl" --patch_path "$OUT/preds_graded.json" \
   --scripts_dir run_scripts --dockerhub_username jefzda --output_dir "$OUT" 2>&1 | tail -3

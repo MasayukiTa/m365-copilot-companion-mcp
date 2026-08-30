@@ -75,7 +75,13 @@ function Get-Cockpit {
             for ($i = 0; $i -lt $wins.Count; $i++) {
                 $w = $wins.Item($i)
                 if ($w.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $idCond)) {
-                    if ($i -gt 0) { Write-Output ("cockpit: composer was in window {0} of {1}" -f ($i + 1), $wins.Count) }
+                    # STDERR, NOT THE OUTPUT STREAM. A PowerShell function returns everything
+                    # written to output, so `Write-Output` here made the caller's $win a
+                    # String and the next line died with
+                    #     [System.String] does not contain a method named 'FindAll'
+                    # -- a diagnostic message becoming the return value. The caller captures
+                    # stderr with 2>&1, so the message still reaches the log.
+                    if ($i -gt 0) { [Console]::Error.WriteLine(("cockpit: composer was in window {0} of {1}" -f ($i + 1), $wins.Count)) }
                     return $w
                 }
             }
@@ -84,7 +90,7 @@ function Get-Cockpit {
             # retrying a search that cannot succeed.
             if (-not $restored -and $proc.MainWindowHandle -ne [IntPtr]::Zero) {
                 $restored = $true
-                Write-Output "cockpit: no window exposes goalInput; restoring the main window"
+                [Console]::Error.WriteLine("cockpit: no window exposes goalInput; restoring the main window")
                 [Win32.Wnd]::ShowWindow($proc.MainWindowHandle, 9) | Out-Null      # SW_RESTORE
                 [Win32.Wnd]::SetForegroundWindow($proc.MainWindowHandle) | Out-Null
                 Start-Sleep -Milliseconds 900
