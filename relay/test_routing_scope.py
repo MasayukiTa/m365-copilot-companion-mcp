@@ -84,3 +84,25 @@ def test_the_gateway_does_not_gate_on_the_autonomy_contract():
         "the autonomy contract is a different mechanism, written by an operator rather than "
         "by a run; gating routing on it made routing read False during the run it was meant "
         "to contain")
+
+
+def test_a_pathless_tool_is_not_refused_just_because_routing_is_on(monkeypatch):
+    """THE LOCKOUT BY ANOTHER DOOR.
+
+    The ROUTABLE check ran before the path check, so with routing switched on every one of the
+    ~150 tools outside that list was refused -- for the operator as much as for the fleet.
+    Measured against the live server: `stop_check` came back "has no container equivalent
+    yet", and stop_check does not touch the filesystem at all.
+    """
+    monkeypatch.setattr(R, "_worktrees", lambda: {})
+    with pytest.raises(R.NotAFleetPath):
+        R.route("stop_check", {})
+
+
+def test_a_non_routable_tool_IS_refused_when_it_names_the_fleets_tree(monkeypatch):
+    """The refusal must survive the reordering for the case it was written for."""
+    monkeypatch.setattr(R, "_worktrees", lambda: {})
+    with pytest.raises(R.NotRoutable) as exc:
+        R.route("process_kill", {"path": os.path.join(R.STAGING_ROOT, "p00")})
+    assert not isinstance(exc.value, R.NotAFleetPath)
+    assert "no container equivalent" in str(exc.value)

@@ -94,7 +94,7 @@ def test_an_allowed_but_unrouted_tool_is_refused_while_routing_is_on(wt, monkeyp
     # through, which is the distinction this module now draws; naming a tmp dir tested the
     # pass-through, not the refusal.
     with pytest.raises(R.NotRoutable) as e:
-        R.route("git_diff", {})
+        R.route("git_diff", {"path": os.path.join(R.STAGING_ROOT, "p00")})
     assert "no container equivalent" in str(e.value)
 
 
@@ -144,8 +144,12 @@ def test_routing_off_is_the_only_case_that_continues_to_local():
     import os
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     src = io.open(os.path.join(root, "main.py"), encoding="utf-8").read()
+    # Bounded by the routing block's OWN end, not by whatever happened to follow it. It was
+    # sliced up to the toolset-gate import, and moving the routing block below the argument
+    # parsing put that import above it -- the slice then raised ValueError, which is a test
+    # failing on a reordering rather than on the property it names.
     block = src[src.index("from relay import broker_client as _bc"):]
-    block = block[:block.index("from relay.fleet_toolset import check")]
+    block = block[:block.index("except ImportError:")]
     # Matched as a CONDITION, not as a literal line: the gate later grew a second term
     # (only while a fleet run is in flight), and an equality check on the old text failed
     # while the property it was written to protect was still held.
