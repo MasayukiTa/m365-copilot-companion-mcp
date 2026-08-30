@@ -128,3 +128,36 @@ def test_a_path_from_another_slice_does_not_resolve_to_some_other_instance(monke
         R.route("read_file", {"path": os.path.join(stale, "x.py")})
     assert not isinstance(exc.value, R.NotAFleetPath)
     assert "no instance owns" in str(exc.value)
+
+
+def test_a_pathless_execution_call_is_refused_not_run_on_this_machine(monkeypatch):
+    """THE ONE THAT COST A BENCHMARK RUN.
+
+    shell_exec and run_python carry a command, not a path, so the working directory fell
+    through to the MCP server's own cwd -- not under the staging root, therefore "not the
+    fleet's", therefore passed through. Every pathless command a worker ran executed on the
+    operator's machine, in the harness checkout, where the instance's files do not exist.
+
+    Worse than a refusal because it succeeds: a worker asked to reproduce a bug got real
+    output from the wrong repository, concluded from what it could see that its execution tool
+    "cannot see this repository", and shipped unverified. The same forty instances scored
+    28/40 before routing and 3/40 after -- 25 lost, none gained -- while 38 of 40 patches
+    still touched the same files. The task arrived; the verification did not.
+    """
+    monkeypatch.setattr(R, "_worktrees",
+                        lambda: {"i1": os.path.normcase(os.path.join(R.STAGING_ROOT, "p00_a"))})
+    for tool, args in (("shell_exec", {"command": "pytest -x"}),
+                       ("run_python", {"code": "print(1)"})):
+        with pytest.raises(R.NotRoutable) as exc:
+            R.route(tool, args)
+        assert not isinstance(exc.value, R.NotAFleetPath), (
+            "%s passed through as 'not the fleet's call' and would have run here" % tool)
+        assert "working_dir" in str(exc.value), "the refusal must name the fix"
+
+
+def test_a_pathless_call_still_passes_through_when_nothing_is_staged(monkeypatch):
+    """With no staged instances there is no fleet run, and the operator's own shell_exec must
+    keep working -- refusing it would make routing something to switch off."""
+    monkeypatch.setattr(R, "_worktrees", lambda: {})
+    with pytest.raises(R.NotAFleetPath):
+        R.route("shell_exec", {"command": "echo hi"})
