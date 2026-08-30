@@ -404,6 +404,34 @@ def check_op(op_class: str, detail: str = "") -> Optional[str]:
                            OR returns None if the gate was already answered "approved"
       * neither          -> returns None (not listed = not gated)
     """
+    # AN AUDIT SIGNAL ONCE THE BOUNDARY IS REAL, AND A GATE UNTIL THEN.
+    #
+    # The plan called for demoting these regexes to a warning, and the reason to wait was
+    # concrete: a denylist over command text is the wrong shape for containment, but it is the
+    # only control there is while a worker can still execute on this machine. Removing it
+    # before its replacement is switched on would open a gap rather than close one.
+    #
+    # So the demotion is CONDITIONAL on the replacement being live. When fleet execution is
+    # routed to a container on another host, a worker cannot run the matched command here at
+    # all, and holding it for human approval asks a person to approve something that was never
+    # going to happen -- which is how approval queues become noise people click through.
+    # The match is still recorded; it stops being a question.
+    try:
+        from relay import broker_client as _bc
+        if _bc.enabled():
+            try:
+                with open(os.path.join(_FLEET_DIR, "gate_audit.jsonl"), "a",
+                          encoding="utf-8") as _fh:
+                    _fh.write(json.dumps({"t": time.time(), "op_class": op_class,
+                                          "detail": detail[:400], "mode": "audit",
+                                          "why": "execution is routed to a container"},
+                                         ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+            return None
+    except Exception:
+        pass
+
     # ── POLICY STATE MUST BE READABLE BEFORE IT CAN BE INERT ────────────────
     #
     # `check_op` is only reached for operations already detected as dangerous, so gating all
