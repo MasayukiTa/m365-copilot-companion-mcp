@@ -5,7 +5,7 @@ never stage all 50 at once). After a fleet batch finishes:
 
   python bench/pro_capture.py --preds .fleet/swe/pro_preds_50.json [--keep]   # --keep = don't delete
 """
-import argparse, json, os, shutil, subprocess
+import argparse, hashlib, json, os, shutil, subprocess, time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SW = os.path.join(REPO, ".fleet", "swe")
@@ -79,6 +79,28 @@ def main():
         if len(d) > MAX_PATCH_BYTES:
             skipped.append((inst, "diff of %d bytes exceeds %d; not a fix" % (len(d), MAX_PATCH_BYTES)))
             d = ""
+        # A SNAPSHOT PER CAPTURE, so attempts can be told apart later.
+        #
+        # Only the final patch per instance was ever kept, and that is why the graded retry
+        # floor had to refuse: every attempt of a goal joined to the SAME verdict, so k=1 and
+        # k=2 came out identical and the question "did the second attempt rescue, preserve, or
+        # break it" could not be asked at all. Two independent reviews named that as the
+        # blocker on measuring the only mechanism with a signal.
+        #
+        # Cheap to keep -- these are kilobytes -- and impossible to reconstruct afterwards,
+        # because the worktree is deleted a few lines below.
+        try:
+            snap_dir = os.path.join(SW, "attempts")
+            os.makedirs(snap_dir, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            with open(os.path.join(snap_dir, "%s__%s.json" % (inst[:80], stamp)),
+                      "w", encoding="utf-8") as fh:
+                json.dump({"instance_id": inst, "patch": d, "captured_at": time.time(),
+                           "patch_sha256_16": hashlib.sha256(d.encode("utf-8")).hexdigest()[:16]},
+                          fh, ensure_ascii=False)
+        except Exception:
+            # A snapshot that cannot be written must not cost the capture it is observing.
+            pass
         preds.append({"instance_id": inst, "patch": d, "prefix": a.prefix})
         captured += 1
         print("%-58s patch=%d bytes" % (inst[:58], len(d)))
