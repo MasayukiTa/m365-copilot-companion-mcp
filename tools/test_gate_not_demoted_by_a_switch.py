@@ -38,7 +38,7 @@ def _armed(tmp_path, monkeypatch):
 
 def test_the_gate_still_fires_while_routing_is_switched_on(tmp_path, monkeypatch):
     _armed(tmp_path, monkeypatch)
-    from relay import broker_client as BC
+    from bench.remote import broker_client as BC
     marker = tmp_path / "BROKER_ON"
     marker.write_text("on", encoding="utf-8")
     monkeypatch.setattr(BC, "MARKER", str(marker))
@@ -53,7 +53,7 @@ def test_the_gate_still_fires_while_routing_is_switched_on(tmp_path, monkeypatch
 
 def test_the_gate_fires_with_routing_off_too(tmp_path, monkeypatch):
     _armed(tmp_path, monkeypatch)
-    from relay import broker_client as BC
+    from bench.remote import broker_client as BC
     monkeypatch.setattr(BC, "MARKER", str(tmp_path / "absent"))
     monkeypatch.delenv("SWE_BROKER", raising=False)
     assert CG.check_op("shell_destructive", "rm -rf /var/data") is not None

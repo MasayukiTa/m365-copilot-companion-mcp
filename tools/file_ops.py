@@ -116,11 +116,39 @@ _SECURITY_STATE_NAMES = frozenset({
     ".unlock_state.json",
     "unlock_token_gap.json",
     "lock_state.json",
+    # THE CREDENTIALS FILE ITSELF. This list already refused the table of authorised
+    # identities while leaving the API key readable in plain text one directory up, so a
+    # caller could simply read the key and then be the operator.
+    #
+    # WHAT THIS DOES AND DOES NOT DO. It closes the FILE TOOLS as a path to the key. It does
+    # not close the hole: run_python and shell_exec run same-user code in a subprocess --
+    # tools/code_exec.py says "NOT a sandbox" in its own docstring -- and `open('.env')`
+    # inside that subprocess never reaches this function. So this is defence in depth, and
+    # calling it a closure would be the same error as the plan that recorded three holes as
+    # shut because execution had been moved to another machine.
+    #
+    # It is still worth having: it removes the cheapest route, it makes the intent explicit
+    # at the one place every reader resolves through, and any future scheme that signs
+    # approvals or authenticates a channel is worthless while the key is one read_file away.
+    #
+    # An approval a same-user process cannot forge needs a boundary this process does not
+    # have. The honest posture is to say so rather than to record it as handled.
+    #
+    # `.env.example` is deliberately NOT here: it is a template with no values, and refusing
+    # it would only teach people that the rule is noise.
+    ".env",
+    ".env.local",
+    ".env.production",
 })
 
 #: Directories that exist to hold observability output. The trace log records tool arguments,
 #: which is exactly where credentials would be if a redaction rule were ever missed.
-_SECURITY_STATE_DIRS = ("companion_runs", ".companion_runs")
+#: `.companion_gates` holds the human approvals the contract gate waits on. A worker that can
+#: write there approves its own destructive operation, which is the forgery the security
+#: review named. Refusing it here removes the file tools as a way to do that -- it does NOT
+#: make the approval unforgeable, because shell_exec and run_python write files without
+#: passing through this function. Narrowed, not closed.
+_SECURITY_STATE_DIRS = ("companion_runs", ".companion_runs", ".companion_gates")
 
 
 def _refuse_security_state(resolved: Path, requested: str) -> None:
@@ -131,7 +159,13 @@ def _refuse_security_state(resolved: Path, requested: str) -> None:
             "which identities may use mutating tools; handing it to a caller publishes the "
             "list of identities to impersonate." % resolved.name)
     parts = {q.lower() for q in resolved.parts}
-    if parts & {d.lower() for d in _SECURITY_STATE_DIRS}:
+    hit = parts & {d.lower() for d in _SECURITY_STATE_DIRS}
+    if hit:
+        if ".companion_gates" in hit:
+            raise PermissionError(
+                "Refusing to touch the approval queue (%s). These files record a human's "
+                "answer to a gated operation; a caller that can write one approves its own."
+                % requested)
         raise PermissionError(
             "Refusing to touch the tool-call trace (%s). It records tool arguments, which is "
             "where a credential ends up if any redaction rule is ever missed." % requested)

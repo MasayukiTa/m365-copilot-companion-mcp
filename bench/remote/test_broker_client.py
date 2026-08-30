@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from relay import broker_client as BC
+from bench.remote import broker_client as BC
 
 
 class _Proc:

@@ -51,7 +51,10 @@ def test_an_actual_tool_call_reaches_the_tool(gateway):
     assert isinstance(out, str)
     assert "UnboundLocalError" not in out
     assert "outside the allowed base" not in out
-    assert "fleet_tool_router.py" in out
+    # A file that is actually in relay/. This named fleet_tool_router.py, which moved
+    # to bench/remote/ when routing left the shipped server -- the test then failed on
+    # a relocation rather than on the property it exists to check.
+    assert "relay_fleet.py" in out
 
 
 def test_an_unknown_tool_is_reported_not_raised(gateway):

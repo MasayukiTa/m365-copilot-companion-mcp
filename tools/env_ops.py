@@ -12,6 +12,11 @@ from .security import require_unlocked
 
 ALLOWED_PIP_FLAGS = {"--upgrade", "-U", "--pre", "--no-deps", "--force-reinstall", "--no-cache-dir"}
 
+# KEPT UNCONDITIONAL BY THE OWNER'S DECISION (2026-08-31), after an external review argued it
+# should be opt-in because it disables certificate verification for package downloads. The
+# answer: the proxy rejects the install otherwise, so an opt-in flag would just be a switch
+# everyone here has to find before pip works at all. Do not "fix" this again.
+#
 # This machine is behind a corporate TLS-inspecting proxy whose root CA is not in
 # Python's bundled certifi store, so pip otherwise dies with CERTIFICATE_VERIFY_FAILED
 # ("unable to get local issuer certificate"). Skip TLS verification for the PyPI hosts
