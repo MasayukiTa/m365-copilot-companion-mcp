@@ -139,8 +139,8 @@ for ($round = 1; $round -le $MaxRounds; $round++) {
             Select-Object -Last 1 | ForEach-Object { Say ("stage: " + $_) }
 
         $uiFile = ".fleet/swe/ui_batch_lines.txt"
-        $n = & $py -c "import sys; sys.path.insert(0,'.'); from bench.ui_goal_lines import write_ui_file; print(write_ui_file(sys.argv[1], sys.argv[2]))" $goalsFile $uiFile
-        Say ("ui lines: {0}" -f $n)
+        $lineCount = & $py -c "import sys; sys.path.insert(0,'.'); from bench.ui_goal_lines import write_ui_file; print(write_ui_file(sys.argv[1], sys.argv[2]))" $goalsFile $uiFile
+        Say ("ui lines: {0}" -f $lineCount)
 
         # SUBMIT, WITH RETRIES, AND THE OUTCOME DECIDES WHETHER THE REST OF THE BATCH RUNS.
         # SendKeys' journal hook fails when the foreground application is not pumping

@@ -57,8 +57,11 @@ for ($k = 1; $k -le $N; $k++) {
     $env:SWE_SLICE_FILE = $SliceFile
     & $py bench/pro_stage_goals.py --ids ($ids -join ",") --out "$OutDir/goals_$k.jsonl" 2>&1 |
         Select-Object -Last 1 | ForEach-Object { Say ("stage: " + $_) }
-    $n = & $py -c "import sys; sys.path.insert(0,'.'); from bench.ui_goal_lines import write_ui_file; print(write_ui_file(sys.argv[1], sys.argv[2]))" "$OutDir/goals_$k.jsonl" "$OutDir/lines_$k.txt"
-    Say ("ui lines: {0}" -f $n)
+    # $lineCount, NOT $n. POWERSHELL VARIABLE NAMES ARE CASE-INSENSITIVE, so `$n` IS `$N` --
+    # the sample count. Assigning the UI line count to it silently changed the loop bound from
+    # three to six mid-run, and the log said "sample 1/3" then "sample 2/6".
+    $lineCount = & $py -c "import sys; sys.path.insert(0,'.'); from bench.ui_goal_lines import write_ui_file; print(write_ui_file(sys.argv[1], sys.argv[2]))" "$OutDir/goals_$k.jsonl" "$OutDir/lines_$k.txt"
+    Say ("ui lines: {0}" -f $lineCount)
 
     $submitted = $false
     for ($try = 1; $try -le 3 -and -not $submitted; $try++) {

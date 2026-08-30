@@ -71,8 +71,8 @@ foreach ($arm in $Arms) {
     $env:SWE_SLICE_FILE = $SliceFile
     & $py bench/pro_stage_goals.py --ids ($ids -join ",") --out "$OutDir/goals_$arm.jsonl" 2>&1 |
         Select-Object -Last 1 | ForEach-Object { Say ("stage: " + $_) }
-    $n = & $py -c "import sys; sys.path.insert(0,'.'); from bench.ui_goal_lines import write_ui_file; print(write_ui_file(sys.argv[1], sys.argv[2]))" "$OutDir/goals_$arm.jsonl" "$OutDir/lines_$arm.txt"
-    Say ("ui lines: {0}" -f $n)
+    $lineCount = & $py -c "import sys; sys.path.insert(0,'.'); from bench.ui_goal_lines import write_ui_file; print(write_ui_file(sys.argv[1], sys.argv[2]))" "$OutDir/goals_$arm.jsonl" "$OutDir/lines_$arm.txt"
+    Say ("ui lines: {0}" -f $lineCount)
 
     $submitted = $false
     for ($try = 1; $try -le 3 -and -not $submitted; $try++) {
