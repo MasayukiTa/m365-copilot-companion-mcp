@@ -122,6 +122,34 @@ def decide(pred_records, *, weights=None) -> dict:
     recs = list(pred_records)
     cands = candidates_from_preds(recs)
 
+    # THE STAIRCASE, so best-of-N appears in the mechanism funnel with the rest.
+    #
+    # It read as "never configured" for as long as the funnel existed, because nothing
+    # reported here -- and the number that matters is not how often the selector RAN but how
+    # often it was asked a real question. Three populations were tried before one produced
+    # candidates that differed in CORRECTNESS: the effort arms agreed outright, an easy set
+    # had every sample right, and only a hard set gave a single disagreeing instance. So
+    # `eligible` is "more than one distinct candidate", which is the condition without which
+    # any accuracy computed here measures the population instead of the selector.
+    try:
+        from relay import mechanism_telemetry as _mt
+        _distinct = len({(c or {}).get("diff") for c in cands})
+        _mt.record("bestofn", configured=True, config_source="caller",
+                   config_value={"candidates": len(cands)},
+                   eligible=(_distinct > 1),
+                   ineligible_reason=("" if _distinct > 1 else
+                                      "%d candidate(s), %d distinct: nothing to choose between"
+                                      % (len(cands), _distinct)),
+                   triggered=(_distinct > 1), executed=(_distinct > 1),
+                   extra={"distinct_candidates": _distinct})
+    except Exception:
+        pass
+    _tel_ctx = {"distinct": None}
+    try:
+        _tel_ctx["distinct"] = len({(c or {}).get("diff") for c in cands})
+    except Exception:
+        pass
+
     # No real candidates at all -> maximally humble, escalate.
     if not cands:
         return {
@@ -162,6 +190,24 @@ def decide(pred_records, *, weights=None) -> dict:
             "instance_id": _winner_instance_id(recs, winner_idx),
             "diff": winner_diff,
         }
+
+    # WHETHER IT ACTUALLY CHOSE. A selector handed candidates it cannot tell apart still
+    # returns a winner, and counting that as a decision is how "the selector ran N times"
+    # becomes "the selector helped N times". A changed decision here means it picked
+    # something other than the first candidate, which is the only case where selecting was
+    # not the same as taking whatever came first.
+    try:
+        from relay import mechanism_telemetry as _mt
+        _d = _tel_ctx.get("distinct")
+        if _d and _d > 1:
+            _mt.record("bestofn", configured=True, config_source="caller",
+                       eligible=True, triggered=True, executed=True,
+                       changed_decision=(winner_idx not in (None, 0)),
+                       before="candidate 0", after=("candidate %s" % winner_idx),
+                       extra={"abstain": bool(conf.get("abstain")),
+                              "confidence": conf.get("confidence")})
+    except Exception:
+        pass
 
     return {
         "winner": winner_obj,
