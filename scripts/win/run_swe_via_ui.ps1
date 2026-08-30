@@ -198,6 +198,17 @@ for ($round = 1; $round -le $MaxRounds; $round++) {
             Say ("capture FAILED for this batch: " + $_.Exception.Message)
         }
 
+        # REAP WHAT THE FINISHED WORKERS LEFT RUNNING.
+        #
+        # Seventeen npx processes survived their runs by up to fourteen hours on 2026-08-30.
+        # They held 672 MB, and worse they held the worktree files open: `git worktree remove`
+        # failed, the capture left husks that resolve to the harness's own repository, and the
+        # free-disk figure this driver admits work against was wrong by six checkouts.
+        #
+        # Between batches, when nothing of ours should still be building.
+        & $py -c "import sys; sys.path.insert(0,'.'); from relay.orphan_reaper import reap; import json; r=reap(min_age_s=1800, dry_run=False); print('reaped %d orphan(s) from %s' % (len(r['killed']), r['work_root']))" 2>&1 |
+            ForEach-Object { Say ("reaper: " + $_) }
+
         # THE GO MODULE CACHE IS THE BIGGEST THING THIS RUN CREATES, AND IT IS REGENERABLE.
         #
         # Deleting a Go toolchain cache by hand to make room, mid-run, did not work: a worker
