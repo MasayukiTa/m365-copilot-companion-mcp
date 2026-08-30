@@ -99,6 +99,22 @@ for ($k = 1; $k -le $N; $k++) {
     if (-not $sawRunning) { Say ("sample {0} never started; not capturing" -f $k); continue }
 
     & $py bench/pro_capture.py --preds $preds 2>&1 | Select-Object -Last 2 | ForEach-Object { Say ("capture: " + $_) }
+
+    # BETWEEN SAMPLES, WHEN NOTHING IS BUILDING. The Go module cache reaches ~2.9 GB on a box
+    # with single-digit GB free, and the hard population here includes Go projects. Clearing
+    # it while a build is running turns a disk problem into a spurious FAILED instance, which
+    # would then be indistinguishable from the model getting it wrong -- so it happens here,
+    # after the capture and before the next sample starts.
+    $freeGb = [math]::Round((Get-PSDrive C).Free / 1GB, 2)
+    if ($freeGb -lt 4.0) {
+        $goExe = "C:\Program Files\Goin\go.exe"
+        if (Test-Path $goExe) {
+            Say ("free {0} GB; clearing the Go caches between samples" -f $freeGb)
+            & $goExe clean -modcache 2>&1 | Select-Object -Last 1 | ForEach-Object { Say ("go clean: " + $_) }
+            & $goExe clean -cache 2>&1 | Select-Object -Last 1 | ForEach-Object { Say ("go clean: " + $_) }
+            Say ("free now {0} GB" -f [math]::Round((Get-PSDrive C).Free / 1GB, 2))
+        }
+    }
     & $py -c "import json,io,sys,time; p=sys.argv[1]; k=sys.argv[2]; rows=json.load(io.open(p,encoding='utf-8-sig')); io.open(p,'w',encoding='utf-8',newline='\n').write(json.dumps({'sample':int(k),'effort':sys.argv[3],'ts':time.time(),'predictions':rows},ensure_ascii=False))" $preds $k $Effort
     Say ("sample {0} recorded to {1}" -f $k, $preds)
 }
