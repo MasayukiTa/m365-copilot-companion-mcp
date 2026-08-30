@@ -133,6 +133,24 @@ for ($round = 1; $round -le $MaxRounds; $round++) {
         $slice = @($pending[($b * $BatchSize)..([math]::Min(($b + 1) * $BatchSize, $pending.Count) - 1)])
         Say ("--- r{0} batch {1}/{2}: {3} instances ---" -f $round, ($b + 1), $batches, $slice.Count)
 
+        # A RUN ALREADY IN FLIGHT IS NOT A BROKEN COCKPIT.
+        #
+        # submit_via_ui.ps1 refuses while a run is live, because Ctrl+Enter steers rather than
+        # starts. The driver read that refusal as a submit failure, gave up after three
+        # attempts, and after two batches exited UI_RUN_BLOCKED "so the cockpit can be
+        # repaired" -- with nothing wrong with the cockpit. Measured: a previous run's fleet
+        # outlived its own driver by forty minutes, and the next run declined to start for
+        # the whole of it and then quit. Waiting is the entire fix, and a bounded wait cannot
+        # become the hang it replaces.
+        $idleBy = (Get-Date).AddMinutes(90)
+        while ((Get-Date) -lt $idleBy) {
+            $live = & $py -c "import json,io,os; p='.fleet/status.json'; d=json.load(io.open(p,encoding='utf-8-sig')) if os.path.exists(p) else {}; print('1' if d.get('running') else '0')"
+            if ($live -ne "1") { break }
+            Say "a run is still in flight; waiting before submitting"
+            Start-Sleep -Seconds 60
+        }
+
+
         $env:SWE_SLICE_FILE = $SliceFile
         $goalsFile = ".fleet/swe/ui_batch.jsonl"
         & $py bench/pro_stage_goals.py --ids ($slice -join ",") --out $goalsFile 2>&1 |
@@ -156,23 +174,6 @@ for ($round = 1; $round -le $MaxRounds; $round++) {
         # SUCCESSFUL submit threw. Measured: three attempts, three "FAILED", and the reported
         # reason was the progress line "invoking button" -- the last thing the child printed
         # before succeeding. The batch was submitted and the driver gave up on it.
-        # A RUN ALREADY IN FLIGHT IS NOT A BROKEN COCKPIT.
-        #
-        # submit_via_ui.ps1 refuses while a run is live, because Ctrl+Enter steers rather than
-        # starts. The driver read that refusal as a submit failure, gave up after three
-        # attempts, and after two batches exited UI_RUN_BLOCKED "so the cockpit can be
-        # repaired" -- with nothing wrong with the cockpit. Measured: a previous run's fleet
-        # outlived its own driver by forty minutes, and the next run declined to start for
-        # the whole of it and then quit. Waiting is the entire fix, and a bounded wait cannot
-        # become the hang it replaces.
-        $idleBy = (Get-Date).AddMinutes(90)
-        while ((Get-Date) -lt $idleBy) {
-            $live = & $py -c "import json,io,os; p='.fleet/status.json'; d=json.load(io.open(p,encoding='utf-8-sig')) if os.path.exists(p) else {}; print('1' if d.get('running') else '0')"
-            if ($live -ne "1") { break }
-            Say "a run is still in flight; waiting before submitting"
-            Start-Sleep -Seconds 60
-        }
-
         $submitted = $false
         for ($try = 1; $try -le 3 -and -not $submitted; $try++) {
             $prevEap = $ErrorActionPreference

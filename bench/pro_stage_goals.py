@@ -33,8 +33,23 @@ IDX = {inst: i for i, inst in enumerate(sorted(BY_ID))}  # short, stable worktre
 
 
 def wt_for(inst):
-    # SHORT path (p00..p49) so deep repos (ansible) don't blow the Windows 260-char limit
-    return os.path.join(WORK, "p%02d" % IDX[inst])
+    # SHORT path (p00..p49) so deep repos (ansible) don't blow the Windows 260-char limit,
+    # PLUS six hex of the instance id, because the number alone means different things in
+    # different slices.
+    #
+    # IDX is the instance's position in the slice file, so p01 was one instance under a
+    # four-instance smoke slice and a different one under the fresh forty. Measured
+    # 2026-08-31: a worker solving an ansible instance in p01 had its file reads routed into a
+    # NodeBB container after the next run restaged, and reported in its own words that
+    # respawn.py "does not exist in the container" before declaring the task impossible.
+    # Nothing said a path had been reassigned under it.
+    #
+    # With the id in the name, a path from another slice simply does not appear in the current
+    # map, and instance_for returns None -- which the router turns into a refusal. Refusing is
+    # recoverable; silently addressing the wrong repository is not.
+    import hashlib as _h
+    tag = _h.sha256(inst.encode("utf-8")).hexdigest()[:6]
+    return os.path.join(WORK, "p%02d_%s" % (IDX[inst], tag))
 
 
 def stage(inst):
