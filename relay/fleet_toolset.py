@@ -162,3 +162,73 @@ def unknown_tools(catalogue):
     """
     known = set(FLEET_TOOLS) | set(DELIBERATELY_EXCLUDED)
     return sorted(set(catalogue) - known)
+
+
+# ---------------------------------------------------------------------------------------
+# ENFORCEMENT, AND WHY IT STARTS IN SHADOW
+#
+# The gateway cannot tell a fleet worker from the operator. Authentication carries an API key
+# and no user identity -- that was established separately and is structural, not an oversight.
+# So the only signal available is WHEN: an unattended fleet run is in flight.
+#
+# That is coarse. It would also restrict the operator if they used the gateway during a run.
+# Which is exactly why this does not begin by refusing anything: the last time a gate was
+# switched from permissive to closed without measuring first, the review that caught it said
+# to shadow for an hour and confirm zero. Same discipline here.
+#
+#   off      the policy is not consulted at all
+#   shadow   every call that WOULD be refused is recorded; nothing is blocked   <- default
+#   enforce  calls outside the allowed set are refused while a run is active
+#
+# Promote to enforce only after a shadow window shows the refusals are the ones intended --
+# a shadow log full of read_file means the set is wrong, not that the workers are hostile.
+import json as _json
+import os as _os
+import time as _time
+
+MODE_ENV = "FLEET_TOOLSET_MODE"
+SHADOW_LOG = ".fleet/toolset_shadow.jsonl"
+
+
+def mode():
+    m = (_os.environ.get(MODE_ENV) or "shadow").strip().lower()
+    return m if m in ("off", "shadow", "enforce") else "shadow"
+
+
+def _fleet_run_active():
+    """Is an unattended fleet run in flight right now.
+
+    Read through contract_state so that a policy file which is missing or corrupt is not
+    silently read as 'no run' -- that fail-open is the one this repository just closed.
+    """
+    try:
+        from tools.contract_gate import contract_state
+        state, _ = contract_state()
+        return state == "active"
+    except Exception:
+        return False
+
+
+def check(name):
+    """(allowed, note). Never raises: a policy that can crash the gateway is worse than none."""
+    try:
+        m = mode()
+        if m == "off" or is_allowed(name):
+            return True, ""
+        if not _fleet_run_active():
+            return True, ""
+        note = ("tool %r is outside the fleet's allowed set (%d tools); "
+                "reason it is not there: %s"
+                % (name, len(FLEET_TOOLS),
+                   DELIBERATELY_EXCLUDED.get(name, "never decided about")))
+        try:
+            with open(SHADOW_LOG, "a", encoding="utf-8") as f:
+                f.write(_json.dumps({"t": _time.time(), "tool": name, "mode": m,
+                                     "would_refuse": True}) + "\n")
+        except Exception:
+            pass
+        if m == "shadow":
+            return True, note
+        return False, note
+    except Exception:
+        return True, ""
