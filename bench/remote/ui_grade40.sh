@@ -16,11 +16,15 @@
 #
 # If it does not fit, this STOPS and says so. It does not free space by deleting what it
 # just downloaded.
-exec > /mnt/c/swe-grade/ui_20260829/grade.out 2>&1
 set -u
 REPO=/mnt/c/swe-grade/pro_repo
 PY=/root/swe-venv/bin/python
-BASE=/mnt/c/swe-grade/ui_20260829
+# BASE FROM THE ENVIRONMENT. It was written into the file with a run's date in it, so grading
+# a second run meant editing the script -- and an edited script is a different script from the
+# one whose result is being reported.
+BASE=${SWE_GRADE_BASE:-/mnt/c/swe-grade/ui_20260829}
+mkdir -p "$BASE"
+exec > "$BASE/grade.out" 2>&1
 RAW=$BASE/ui_raw_40.jsonl
 PREDS=$BASE/ui_preds.json
 OUT=$BASE/out
@@ -56,15 +60,36 @@ PYEOF
 # PULL EVERYTHING FIRST, then evaluate. Pulling as you go is what makes the working set
 # unbounded; pulling first makes the footprint knowable before any grading starts, and the
 # floor check below can refuse while refusing is still cheap.
-say "pulling images (once, and they are kept)"
+# PULL ONLY WHAT IS ABSENT. Every image already on disk is one that costs nothing to reuse
+# and must not be re-fetched: re-pulling what is already here is the write-delete-write churn
+# this drive is not to be used for.
+IMG_BEFORE=$(docker images -q | sort -u | wc -l)
+say "pulling images (only the ones not already here, and they are kept)"
 "$PY" -c "import json;[print('jefzda/sweap-images:'+json.loads(l)['dockerhub_tag']) for l in open('$OUT/raw_graded.jsonl')]" \
   | xargs -P3 -I{} bash -c 'for t in 1 2 3; do timeout 900 docker pull "{}" >/dev/null 2>&1 && exit 0; sleep 15; done; echo "PULL FAILED {}"'
-say "images on disk: $(docker images -q | sort -u | wc -l)  free=$(freeG)G"
+IMG_AFTER=$(docker images -q | sort -u | wc -l)
+say "images on disk: $IMG_AFTER  free=$(freeG)G"
 
-if [ "$(freeG)" -lt "$FLOOR_GB" ]; then
-  say "STOPPING: free space $(freeG)G is below the ${FLOOR_GB}G floor."
+# WHAT THE FLOOR IS FOR, MEASURED RATHER THAN ASSUMED.
+#
+# The floor exists so this script never frees space by deleting what it downloaded. It was
+# checked unconditionally AFTER the pull, so on a box sitting at exactly the floor -- which is
+# where this one sits, because the 183 GB of images ARE the benchmark corpus -- grading was
+# refused even when nothing had been downloaded and nothing was going to be. That is not a
+# safety property; it is "never grade again".
+#
+# So the question is whether THIS RUN made the situation worse. If it pulled nothing, the box
+# was already at this level before the script started, and grading writes logs, not images.
+PULLED=$(( IMG_AFTER - IMG_BEFORE ))
+say "images before=$IMG_BEFORE after=$IMG_AFTER pulled=$PULLED free=$(freeG)G floor=${FLOOR_GB}G"
+if [ "$(freeG)" -lt "$FLOOR_GB" ] && [ "$PULLED" -gt 0 ]; then
+  say "STOPPING: free space $(freeG)G is below the ${FLOOR_GB}G floor after pulling $PULLED image(s)."
   say "Not deleting anything to make room -- that is the churn this script exists to avoid."
   exit 2
+fi
+if [ "$(freeG)" -lt "$FLOOR_GB" ]; then
+  say "NOTE: free space $(freeG)G is under the ${FLOOR_GB}G floor, but this run pulled nothing;"
+  say "the box was already here. Grading writes logs, not images. Continuing."
 fi
 
 # cd HERE, AND NOT ONLY IN A COMMENT. The eval entry point is a path relative to the harness
