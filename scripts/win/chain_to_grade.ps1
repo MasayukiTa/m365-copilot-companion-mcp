@@ -63,8 +63,21 @@ $rawLocal = ".fleet/swe/ui_raw_40.jsonl"
 & scp -o BatchMode=yes "bench/remote/ui_grade40.sh" "$($EvalHost):$dest/" 2>&1 | ForEach-Object { Say ("scp: " + $_) }
 
 Say "starting grading on the eval host, detached"
-$wsl = "C:\Windows\System32\wsl.exe -d Ubuntu -e bash -c "
-$inner = "chmod +x /mnt/c/swe-grade/$Base/ui_grade40.sh; SWE_GRADE_BASE=/mnt/c/swe-grade/$Base setsid nohup bash /mnt/c/swe-grade/$Base/ui_grade40.sh >/dev/null 2>&1 </dev/null & echo launched"
-$remote = $wsl + [char]34 + $inner + [char]34
-& ssh -o BatchMode=yes $EvalHost $remote 2>&1 | ForEach-Object { Say ("remote: " + $_) }
+# THE LAUNCH GOES OVER STDIN, not on the command line.
+#
+# `ssh <host> wsl.exe -d Ubuntu -e bash -c "..."` passes through cmd on the far
+# side, which eats the inner quotes: the pipe and everything after it were then
+# interpreted by cmd, which answered that `head` is not a recognised command. The
+# grader "launched" and never ran -- no grade.out, no error anywhere, and the chain
+# reported success. Feeding the script on stdin has no command line to be eaten.
+$launch = @"
+B=/mnt/c/swe-grade/$Base
+chmod +x "`$B/ui_grade40.sh"
+# ui_preds.json is the name the grader reads; the uploaded file keeps its own name too.
+cp "`$B/$(Split-Path -Leaf $Preds)" "`$B/ui_preds.json"
+SWE_GRADE_BASE="`$B" setsid nohup bash "`$B/ui_grade40.sh" >/dev/null 2>&1 </dev/null &
+sleep 5
+echo launched; head -3 "`$B/grade.out" 2>/dev/null
+"@
+$launch | & ssh -o BatchMode=yes $EvalHost "wsl -d Ubuntu -- bash -s" 2>&1 | ForEach-Object { Say ("remote: " + $_) }
 Say "chain done. grading output: $dest/grade.out on the eval host"
