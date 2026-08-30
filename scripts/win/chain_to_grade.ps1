@@ -13,6 +13,14 @@ param(
     [string]$Preds = ".fleet/swe/ui_preds.json",
     [string]$Ids   = ".fleet/swe/ui_all_ids.txt",
     [string]$Log   = ".fleet/swe/chain.log",
+    # WHERE ON THE EVAL HOST. It was written into every path below with a run date
+    # in it, so a second run meant editing the script -- and an edited script is a
+    # different script from the one whose result is being reported.
+    [string]$Base  = "ui_20260829",
+    # The slice the predictions were made against. The grader needs it to know which
+    # instances exist at all; without it it reads whatever raw file an earlier run
+    # left in that directory and scores these patches against another instance list.
+    [string]$Slice = ".fleet/swe/pro_slice40_fresh.json",
     [int]$CheckSec = 30,
     [int]$MaxWaitMin = 360
 )
@@ -45,10 +53,18 @@ while ((Get-Date) -lt $deadline) {
 if ($left -ne 0) { Say ("GIVING UP: still {0} uncovered after {1} minutes" -f $left, $MaxWaitMin); exit 1 }
 
 Say "shipping predictions and the grading script"
-& scp -o BatchMode=yes $Preds "$($EvalHost):C:/swe-grade/ui_20260829/" 2>&1 | ForEach-Object { Say ("scp: " + $_) }
-& scp -o BatchMode=yes "bench/remote/ui_grade40.sh" "$($EvalHost):C:/swe-grade/ui_20260829/" 2>&1 | ForEach-Object { Say ("scp: " + $_) }
+$dest = "C:/swe-grade/$Base"
+$bs = $Base -replace "/", "\"
+& ssh -o BatchMode=yes $EvalHost ("if not exist ""C:\swe-grade\$bs"" mkdir ""C:\swe-grade\$bs""") 2>&1 | ForEach-Object { Say ("remote: " + $_) }
+$rawLocal = ".fleet/swe/ui_raw_40.jsonl"
+& $py bench/slice_to_raw_jsonl.py $Slice $rawLocal | ForEach-Object { Say ("raw: " + $_) }
+& scp -o BatchMode=yes $Preds "$($EvalHost):$dest/" 2>&1 | ForEach-Object { Say ("scp: " + $_) }
+& scp -o BatchMode=yes $rawLocal "$($EvalHost):$dest/" 2>&1 | ForEach-Object { Say ("scp: " + $_) }
+& scp -o BatchMode=yes "bench/remote/ui_grade40.sh" "$($EvalHost):$dest/" 2>&1 | ForEach-Object { Say ("scp: " + $_) }
 
 Say "starting grading on the eval host, detached"
-$remote = 'C:\Windows\System32\wsl.exe -d Ubuntu -e bash -c "chmod +x /mnt/c/swe-grade/ui_20260829/ui_grade40.sh; setsid nohup bash /mnt/c/swe-grade/ui_20260829/ui_grade40.sh >/dev/null 2>&1 </dev/null & echo launched"'
+$wsl = "C:\Windows\System32\wsl.exe -d Ubuntu -e bash -c "
+$inner = "chmod +x /mnt/c/swe-grade/$Base/ui_grade40.sh; SWE_GRADE_BASE=/mnt/c/swe-grade/$Base setsid nohup bash /mnt/c/swe-grade/$Base/ui_grade40.sh >/dev/null 2>&1 </dev/null & echo launched"
+$remote = $wsl + [char]34 + $inner + [char]34
 & ssh -o BatchMode=yes $EvalHost $remote 2>&1 | ForEach-Object { Say ("remote: " + $_) }
-Say "chain done. grading output: C:/swe-grade/ui_20260829/grade.out on the eval host"
+Say "chain done. grading output: $dest/grade.out on the eval host"
