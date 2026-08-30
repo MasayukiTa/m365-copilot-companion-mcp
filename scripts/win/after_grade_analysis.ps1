@@ -1,4 +1,4 @@
-# Wait for the grader's verdict file, fetch it, and produce the analysis that needed an oracle.
+﻿# Wait for the grader's verdict file, fetch it, and produce the analysis that needed an oracle.
 #
 # WHY IT IS A SEPARATE PROCESS. The grading takes hours on the eval host; the analysis takes
 # seconds here. Chaining them means the moment the verdicts exist, the three things that have
@@ -14,6 +14,10 @@ param(
     [int]$CheckSec = 120,
     [int]$MaxHours = 8
 )
+
+# The eval host's ssh alias is not written in this repository; it comes from the
+# environment or from .env. See scripts/win/eval_host.ps1.
+. "$PSScriptRoot\eval_host.ps1"
 $ErrorActionPreference = "Continue"
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $repo
@@ -31,13 +35,13 @@ Say "waiting for the grader's verdicts"
 $deadline = (Get-Date).AddHours($MaxHours)
 $got = $false
 while ((Get-Date) -lt $deadline) {
-    $probe = & ssh -o BatchMode=yes EVAL_HOST "if exist `"C:\swe-grade\ui_20260829\out\eval_results.json`" (echo READY) else (echo waiting)" 2>&1
+    $probe = & ssh -o BatchMode=yes $EvalHost "if exist `"C:\swe-grade\ui_20260829\out\eval_results.json`" (echo READY) else (echo waiting)" 2>&1
     if ($probe -match "READY") { $got = $true; Say "verdict file exists"; break }
     Start-Sleep -Seconds $CheckSec
 }
 if (-not $got) { Say "GIVING UP: no verdict file after $MaxHours hours"; exit 1 }
 
-& scp -o BatchMode=yes ("EVAL_HOST:" + $remoteOut) $local 2>&1 | ForEach-Object { Say ("scp: " + $_) }
+& scp -o BatchMode=yes ("$($EvalHost):" + $remoteOut) $local 2>&1 | ForEach-Object { Say ("scp: " + $_) }
 if (-not (Test-Path $local)) { Say "the verdict file did not arrive"; exit 1 }
 
 Say "--- calibration report (resolved rate per task class) ---"

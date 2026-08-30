@@ -1,4 +1,4 @@
-# Wait for full coverage, then ship the predictions and start grading on the eval host.
+﻿# Wait for full coverage, then ship the predictions and start grading on the eval host.
 #
 # WHY THIS IS A WINDOWS PROCESS AND NOT A BACKGROUNDED SHELL JOB. The first version was
 # `nohup bash chain.sh &` launched from a tool call; the wrapper exited and took the child
@@ -16,6 +16,10 @@ param(
     [int]$CheckSec = 30,
     [int]$MaxWaitMin = 360
 )
+
+# The eval host's ssh alias is not written in this repository; it comes from the
+# environment or from .env. See scripts/win/eval_host.ps1.
+. "$PSScriptRoot\eval_host.ps1"
 $ErrorActionPreference = "Continue"
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $repo
@@ -41,10 +45,10 @@ while ((Get-Date) -lt $deadline) {
 if ($left -ne 0) { Say ("GIVING UP: still {0} uncovered after {1} minutes" -f $left, $MaxWaitMin); exit 1 }
 
 Say "shipping predictions and the grading script"
-& scp -o BatchMode=yes $Preds "EVAL_HOST:C:/swe-grade/ui_20260829/" 2>&1 | ForEach-Object { Say ("scp: " + $_) }
-& scp -o BatchMode=yes "bench/remote/ui_grade40.sh" "EVAL_HOST:C:/swe-grade/ui_20260829/" 2>&1 | ForEach-Object { Say ("scp: " + $_) }
+& scp -o BatchMode=yes $Preds "$($EvalHost):C:/swe-grade/ui_20260829/" 2>&1 | ForEach-Object { Say ("scp: " + $_) }
+& scp -o BatchMode=yes "bench/remote/ui_grade40.sh" "$($EvalHost):C:/swe-grade/ui_20260829/" 2>&1 | ForEach-Object { Say ("scp: " + $_) }
 
 Say "starting grading on the eval host, detached"
 $remote = 'C:\Windows\System32\wsl.exe -d Ubuntu -e bash -c "chmod +x /mnt/c/swe-grade/ui_20260829/ui_grade40.sh; setsid nohup bash /mnt/c/swe-grade/ui_20260829/ui_grade40.sh >/dev/null 2>&1 </dev/null & echo launched"'
-& ssh -o BatchMode=yes EVAL_HOST $remote 2>&1 | ForEach-Object { Say ("remote: " + $_) }
+& ssh -o BatchMode=yes $EvalHost $remote 2>&1 | ForEach-Object { Say ("remote: " + $_) }
 Say "chain done. grading output: C:/swe-grade/ui_20260829/grade.out on the eval host"

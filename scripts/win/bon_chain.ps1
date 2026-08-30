@@ -1,4 +1,4 @@
-# Wait for the best-of-N samples, grade them, and run the selector -- without a person in the
+﻿# Wait for the best-of-N samples, grade them, and run the selector -- without a person in the
 # loop. The measurement is only finished when the selector has been given candidates that
 # differ in CORRECTNESS, and none of the three attempts so far produced that: the effort arms
 # agreed outright, and the easy population had every sample correct.
@@ -10,6 +10,10 @@ param(
     [int]$CheckSec = 60,
     [int]$MaxHours = 6
 )
+
+# The eval host's ssh alias is not written in this repository; it comes from the
+# environment or from .env. See scripts/win/eval_host.ps1.
+. "$PSScriptRoot\eval_host.ps1"
 $ErrorActionPreference = "Continue"
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $repo
@@ -66,30 +70,30 @@ print('prepared %d sample(s), %d instances' % (n, len(ids)))
 # had already logged that it launched. Nested quoting through ssh, cmd and PowerShell
 # is three escaping rules deep; a variable holding the whole command is one.
 $mkdirCmd = 'powershell -NoProfile -Command New-Item -ItemType Directory -Force C:\swe-gradeonhard'
-& ssh -o BatchMode=yes EVAL_HOST $mkdirCmd 2>&1 | ForEach-Object { Say ('remote: ' + $_) }
-& scp -o BatchMode=yes "$Dir/bon_raw.jsonl" "EVAL_HOST:C:/swe-grade/bonhard/" 2>&1 | Out-Null
+& ssh -o BatchMode=yes $EvalHost $mkdirCmd 2>&1 | ForEach-Object { Say ('remote: ' + $_) }
+& scp -o BatchMode=yes "$Dir/bon_raw.jsonl" "$($EvalHost):C:/swe-grade/bonhard/" 2>&1 | Out-Null
 Get-ChildItem "$Dir/grade_preds_*.json" | ForEach-Object {
-    & scp -o BatchMode=yes $_.FullName "EVAL_HOST:C:/swe-grade/bonhard/" 2>&1 | Out-Null
+    & scp -o BatchMode=yes $_.FullName "$($EvalHost):C:/swe-grade/bonhard/" 2>&1 | Out-Null
 }
 & $py -c "import io; s=io.open('bench/remote/bon_grade.sh',encoding='utf-8').read().replace('/mnt/c/swe-grade/bon','/mnt/c/swe-grade/bonhard'); io.open('.fleet/swe/bonhard_grade.sh','w',encoding='utf-8',newline='\n').write(s)"
-& scp -o BatchMode=yes ".fleet/swe/bonhard_grade.sh" "EVAL_HOST:C:/swe-grade/bonhard/bon_grade.sh" 2>&1 | Out-Null
+& scp -o BatchMode=yes ".fleet/swe/bonhard_grade.sh" "$($EvalHost):C:/swe-grade/bonhard/bon_grade.sh" 2>&1 | Out-Null
 Say "launching the grader on the eval host"
 $tr = '"C:\Windows\System32\wsl.exe" -d Ubuntu -e /bin/bash /mnt/c/swe-grade/bonhard/bon_grade.sh'
 $mk = 'schtasks /Create /TN BonHardGrade /TR "' + $tr.Replace('"','\"') + '" /SC ONCE /ST 23:56 /RL HIGHEST /F'
-& ssh -o BatchMode=yes EVAL_HOST 'schtasks /Delete /TN BonHardGrade /F' 2>&1 | Out-Null
-& ssh -o BatchMode=yes EVAL_HOST $mk 2>&1 | ForEach-Object { Say ('remote: ' + $_) }
-& ssh -o BatchMode=yes EVAL_HOST 'schtasks /Run /TN BonHardGrade' 2>&1 | ForEach-Object { Say ('remote: ' + $_) }
+& ssh -o BatchMode=yes $EvalHost 'schtasks /Delete /TN BonHardGrade /F' 2>&1 | Out-Null
+& ssh -o BatchMode=yes $EvalHost $mk 2>&1 | ForEach-Object { Say ('remote: ' + $_) }
+& ssh -o BatchMode=yes $EvalHost 'schtasks /Run /TN BonHardGrade' 2>&1 | ForEach-Object { Say ('remote: ' + $_) }
 
 Say "waiting for the verdicts"
 $deadline2 = (Get-Date).AddHours(2)
 while ((Get-Date) -lt $deadline2) {
-    $probe = & ssh -o BatchMode=yes EVAL_HOST "if exist `"C:\swe-grade\bonhard\bon_grade.out`" (findstr /C:`"DONE_BON_GRADE`" `"C:\swe-grade\bonhard\bon_grade.out`") else (echo waiting)" 2>&1
+    $probe = & ssh -o BatchMode=yes $EvalHost "if exist `"C:\swe-grade\bonhard\bon_grade.out`" (findstr /C:`"DONE_BON_GRADE`" `"C:\swe-grade\bonhard\bon_grade.out`") else (echo waiting)" 2>&1
     if ($probe -match "DONE_BON_GRADE") { Say "grading finished"; break }
     Start-Sleep -Seconds 60
 }
 Get-ChildItem "$Dir/grade_preds_*.json" | ForEach-Object {
     $k = $_.BaseName -replace 'grade_preds_', ''
-    & scp -o BatchMode=yes ("EVAL_HOST:C:/swe-grade/bonhard/out_$k/eval_results.json") "$Dir/verdict_$k.json" 2>&1 | Out-Null
+    & scp -o BatchMode=yes ("$($EvalHost):C:/swe-grade/bonhard/out_$k/eval_results.json") "$Dir/verdict_$k.json" 2>&1 | Out-Null
 }
 Say "verdicts fetched; running the selector"
 & $py bench/bestofn_on_samples.py --dir $Dir 2>&1 | ForEach-Object { Say $_ }
