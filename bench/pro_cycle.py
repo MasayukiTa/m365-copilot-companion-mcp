@@ -46,6 +46,7 @@ LOG = os.path.join(SW, "pro_cycle.log")
 PREDS = os.path.join(SW, "pro_cycle_preds.json")
 RESULTS = os.path.join(SW, "pro_cycle_results.json")
 GOALS = os.path.join(SW, "pro_cycle_goals.jsonl")
+STATUS = os.path.join(REPO, ".fleet", "status.json")
 
 #: Stop before the run's own floor does. fleet_runner refuses to start under 3.0 GB, so a cycle
 #: that keeps going until it hits that leaves the operator with a benchmark that cannot resume
@@ -239,6 +240,13 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
         # because capture was downstream of a clean finish.
         run([PY, os.path.join("bench", "pro_capture.py"), "--preds", PREDS], 900, "capture")
 
+        # SHADOW. The records are compared against what each worker claimed, and the verdict is
+        # written down beside the reported outcome. Nothing is gated on it: switching a gate
+        # from permissive to closed without measuring first is a mistake this repository has
+        # already been corrected for, and the number this produces is exactly what says whether
+        # gating would help.
+        _shadow_assess(group)
+
         graded_before = len(graded_ids())
         run([PY, os.path.join("bench", "swe_grade_batch.py"),
              "--instances"] + group, BATCH_TIMEOUT_S, "grade")
@@ -280,6 +288,65 @@ def _write_contracts(group):
     except Exception as exc:
         log("  contract step failed (%s: %s) -- the batch still runs, but nothing in it can "
             "be promoted past a self-report" % (type(exc).__name__, str(exc)[:120]))
+
+
+SHADOW = os.path.join(SW, "pro_cycle_shadow.jsonl")
+
+
+def _shadow_assess(group):
+    """Compare each worker's DONE against the ledger, and write the verdict down. Never raises.
+
+    Reads three things that now exist: the claim (the run's own outcome), the contract written
+    at admission, and the tool events. Until today only the first existed, which is why the
+    refuter judged hearsay and precision sat at 0.718.
+    """
+    try:
+        import json as _json
+        from relay import acceptance_contract as AC
+        from relay import evidence_manifest as EM
+        from tools import tool_ledger as TL
+
+        # WHICH WORKER WAS THIS INSTANCE. Matched on the worktree path, which the goal text
+        # carries verbatim -- not guessed from ordering, which changes between runs and has
+        # already caused one instance's reads to be attributed to another.
+        from bench import pro_stage_goals as G
+        status = _load(STATUS, {})
+        claim_by_inst = {}
+        for w in status.get("workers") or []:
+            goal = str(w.get("goal") or "")
+            for inst in group:
+                wt = G.wt_for(inst).replace("\\", "/")
+                if wt and (wt in goal.replace("\\", "/")):
+                    claim_by_inst[inst] = str(w.get("outcome") or "")
+
+        rows, verdicts = [], []
+        for inst in group:
+            events = TL.for_task(inst)
+            contract = AC.load(inst)
+            # NO CLAIM FOUND IS NOT A CLAIM OF SUCCESS. If the run recorded nothing for this
+            # instance, there is nothing to check and the verdict says so, rather than
+            # inventing a DONE from the presence of tool calls.
+            claimed = claim_by_inst.get(inst, "") == "DONE"
+            v = EM.assess(claimed, contract, events)
+            verdicts.append(v)
+            rows.append({"ts": time.time(), "instance": inst, "claimed_done": bool(claimed),
+                         "verdict": v.get("verdict"), "reasons": v.get("reasons"),
+                         "evidence": v.get("evidence")})
+        with open(SHADOW, "a", encoding="utf-8") as fh:
+            for r in rows:
+                fh.write(_json.dumps(r, ensure_ascii=False) + "\n")
+        s = EM.summarise(verdicts)
+        log("  shadow: supported=%d contradicted=%d unverifiable=%d (share=%s)"
+            % (s[EM.SUPPORTED], s[EM.CONTRADICTED], s[EM.UNVERIFIABLE],
+               ("%.2f" % s["supported_share"]) if s["supported_share"] is not None else "n/a"))
+        if s[EM.CONTRADICTED]:
+            for r in rows:
+                if r["verdict"] == EM.CONTRADICTED:
+                    log("    CONTRADICTED %s: %s" % (r["instance"][:40],
+                                                     "; ".join(r["reasons"])[:120]))
+    except Exception as exc:
+        log("  shadow assessment failed (%s: %s) -- grading is unaffected"
+            % (type(exc).__name__, str(exc)[:120]))
 
 
 def _discard():
