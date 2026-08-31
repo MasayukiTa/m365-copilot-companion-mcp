@@ -268,3 +268,57 @@ def test_redoing_captured_work_has_to_be_asked_for():
     src = inspect.getsource(C.cycle)
     assert "redo_captured" in src
     assert "if redo_captured else captured_ids()" in src.replace("\n", " ").replace("  ", " ")
+
+
+# -- the worktree map, which grew without bound --------------------------------------------
+
+def _merge(prev, batch, isdir):
+    """The merge rule as pro_stage_goals applies it, exercised directly.
+
+    Extracted rather than reimplemented in the assertions: the rule is three lines and the
+    interesting part is which entries survive, which is what these tests are about.
+    """
+    merged = {k: v for k, v in prev.items() if k in batch or isdir(str(v))}
+    merged.update(batch)
+    return merged
+
+
+def test_a_discarded_worktree_is_dropped_from_the_map():
+    """Measured: 15 entries of which 11 pointed at directories that were gone. Every later
+    capture re-walked them and every ledger lookup for them returned nothing. A worktree that
+    has been discarded cannot be diffed or attributed to, and dropping it loses nothing
+    recoverable -- the directory is what the patch would have been read from."""
+    prev = {"old1": "/gone/a", "old2": "/gone/b", "kept": "/here/c"}
+    out = _merge(prev, {}, isdir=lambda p: p == "/here/c")
+    assert set(out) == {"kept"}
+
+
+def test_earlier_batches_that_still_exist_are_kept():
+    """THE REASON THE MAP MERGES AT ALL. A map holding only the last batch made every earlier
+    batch's evidence unreachable, so the recorder reported fifty measured while the join could
+    cover four."""
+    prev = {"batch1": "/here/a", "batch2": "/here/b"}
+    out = _merge(prev, {"batch3": "/here/c"}, isdir=lambda p: True)
+    assert set(out) == {"batch1", "batch2", "batch3"}
+
+
+def test_this_batchs_entries_survive_even_before_their_directories_exist():
+    """They are about to be created. Testing existence on them would delete the map entries
+    for the batch that is starting."""
+    out = _merge({}, {"new": "/not/yet"}, isdir=lambda p: False)
+    assert out == {"new": "/not/yet"}
+
+
+def test_a_re_staged_instance_takes_the_new_path():
+    out = _merge({"x": "/old/path"}, {"x": "/new/path"}, isdir=lambda p: True)
+    assert out == {"x": "/new/path"}
+
+
+def test_the_pruning_rule_is_the_one_in_the_stager():
+    """SOURCE-LEVEL, stated as such: the stager clones repositories, so the rule above is
+    exercised as a copy. This catches the copy and the original drifting apart."""
+    import io
+    import os
+    src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "pro_stage_goals.py"), encoding="utf-8").read()
+    assert "if k in wtmap or os.path.isdir(str(v))" in src

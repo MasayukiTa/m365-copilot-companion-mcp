@@ -231,7 +231,18 @@ def main():
         with open(_wt_path, encoding="utf-8") as _fh:
             _prev = json.load(_fh)
         if isinstance(_prev, dict):
-            _merged = dict(_prev)
+            # MERGE, BUT DROP WHAT NO LONGER EXISTS. Keeping every entry forever was the point
+            # of merging -- a map holding only the last batch made earlier batches' evidence
+            # unreachable -- but a worktree that has been discarded cannot be diffed or
+            # attributed to, and its entry is pure noise. Measured: 15 entries of which 11
+            # pointed at directories that were gone, so every later capture re-walked them and
+            # every ledger lookup for them returned nothing.
+            #
+            # Dropping these loses nothing recoverable: the directory is what the patch would
+            # have been read from. THIS BATCH'S entries are never dropped, because they are
+            # about to be created and may not exist yet at this moment.
+            _merged = {k: v for k, v in _prev.items()
+                       if k in wtmap or os.path.isdir(str(v))}
             _merged.update(wtmap)      # this batch's entries win for ids it re-staged
             wtmap = _merged
     except (OSError, ValueError):
