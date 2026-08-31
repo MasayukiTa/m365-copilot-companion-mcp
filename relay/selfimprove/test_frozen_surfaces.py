@@ -153,3 +153,54 @@ def test_an_ordinary_proposal_is_not_marked_actionable():
     pending.add(["some/file.py"], "an ordinary proposal", command="do the thing by hand")
     rows = [r for r in pending.items() if "ordinary" in (r.get("reason") or "")]
     assert rows and not rows[0].get("action")
+
+
+# --- the card has to explain itself ---------------------------------------------------------
+
+def test_the_card_says_what_the_frozen_set_is():
+    """THE OPERATOR'S OBJECTION, WHICH IS A SAFETY ONE: "frozenの件、これ何がしたいものなのか
+    見てもわからない。… でないと99%のユーザはまあいいやでrm-rfなどを通す." A decision surface
+    that names a path and a command, and assumes the reader knows the codebase, is one people
+    click through."""
+    F.queue_mismatch(["tools/security.py"])
+    d = pending.items()[0]["detail"]
+    assert "凍結セット" in d and "書き換えてはいけない" in d
+
+
+def test_it_says_what_the_changed_file_governs():
+    """A path is not information. What the file DECIDES is."""
+    F.queue_mismatch(["tools/security.py"])
+    d = pending.items()[0]["detail"]
+    assert "unlock" in d and "権限" in d
+
+
+def test_it_says_what_each_button_does():
+    """Approve and reject must both be described, and the approve text must say the reader is
+    signing off on content they may not have read."""
+    F.queue_mismatch(["docs/SECURITY.md"])
+    d = pending.items()[0]["detail"]
+    assert "承認する" in d and "却下する" in d
+    assert "確認していないなら、押さないでください" in d
+    assert "台帳" in d
+
+
+def test_it_shows_the_actual_change():
+    """Without the diff the reader is agreeing to a filename."""
+    F.queue_mismatch(["relay/selfimprove/frozen.py"])
+    d = pending.items()[0]["detail"]
+    assert "差分" in d or "git checkout" in d
+
+
+def test_every_frozen_file_has_a_role_written_down():
+    """A path with no explanation is the case this whole change is about, and the manifest grows
+    -- so a new entry with no role fails here rather than reaching a card as a bare filename."""
+    missing = [f for f in F.FROZEN_MANIFEST if f not in F.FILE_ROLE]
+    assert not missing, "no role text for: %s" % missing
+
+
+def test_the_explanation_survives_a_repo_without_git(monkeypatch):
+    """The diff is best effort. Losing it must not lose the explanation."""
+    monkeypatch.setattr(F, "_diff_stat", lambda *a, **k: "")
+    F.queue_mismatch(["docs/SECURITY.md"])
+    d = pending.items()[0]["detail"]
+    assert "凍結セット" in d and "承認する" in d

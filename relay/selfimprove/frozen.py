@@ -602,6 +602,133 @@ def _queue_refused(excluded, args) -> None:
         pass
 
 
+#: What each frozen file GOVERNS, in one line. A card that names a path tells a reader nothing
+#: unless they already know the codebase -- and a decision surface that assumes that is one
+#: people click through. The operator said it plainly: without this, 99% approve and something
+#: like an rm -rf goes past.
+FILE_ROLE = {
+    "docs/SECURITY.md":
+        "このツールが主張している"
+        "セキュリティモデル。"
+        "何を守り、何を守らないと"
+        "認めているか",
+    "relay/selfimprove/guards.py":
+        "強制ガード。結果を有意と"
+        "認める有意性ゲートと、"
+        "ベンチ問題の使い回しを"
+        "止める burned 台帳",
+    "relay/selfimprove/frozen.py":
+        "このガード自身。"
+        "判定器が無傷かを決める"
+        "コード",
+    "relay/selfimprove/manifest.py":
+        "何を進化させてよいかの"
+        "定義。自分で許可範囲を"
+        "広げられるなら許可範囲は"
+        "無いに等しい",
+    "relay/selfimprove/decision.py":
+        "ゲートを「任意」に戻せる"
+        "場所",
+    "relay/selfimprove/routing.py":
+        "作業をどこで走らせてよいか",
+    "relay/selfimprove/harness_tree.py":
+        "クラス決定後に実際に"
+        "マニフェストを渡す側",
+    "relay/selfimprove/route_evaluator.py":
+        "ルーティング判断の採点",
+    "relay/selfimprove/authority_ledger.py":
+        "誰が何を承認したかの"
+        "追記専用台帳",
+    "relay/socket_route.py":
+        "フリートが話す経路",
+    "tools/security.py":
+        "unlock ゲート。全ての書込・"
+        "実行ツールの手前にある"
+        "権限チェック",
+    "tools/_untrusted.py":
+        "外部の内容はデータであり"
+        "命令ではない、という規則",
+    "tools/folder_policy.py":
+        "そもそもどのフォルダに"
+        "触ってよいか",
+    "bench/swe_grade_swebench.py":
+        "採点器。ベンチの正誤を"
+        "決めるもの",
+    "bench/evalhost_batch_grade.py":
+        "一括採点器",
+    "bench/companionbench/episode.py":
+        "エピソードの定義。"
+        "問題をやさしくできる場所",
+    "bench/companionbench/pools.py":
+        "問題プール。静かに"
+        "差し替えられる場所",
+    "bench/companionbench/runner.py":
+        "採点を実行する本体",
+    "bench/companionbench/episodes/core.py":
+        "基本エピソード群",
+    "bench/companionbench/episodes/office.py":
+        "事務系エピソード群",
+    "bench/companionbench/episodes/runtime.py":
+        "実行環境系エピソード群",
+    "bench/companionbench/episodes/sealed.py":
+        "封印された holdout エピソード。"
+        "見えた時点で価値が消える",
+}
+
+
+def _explain(files, repo: str) -> str:
+    """The argument a decider needs in front of them: what these files are, what changed, and
+    what each answer does. Never raises -- an explanation that fails must not block the queue."""
+    lines = []
+    lines.append("これは何か: 凍結セット(constitution)は、このエージェントが"
+                 "「自分では書き換えてはいけない」と決めているファイル群です。"
+                 "成功の判定基準・強制ガード・権限ゲートなど、"
+                 "評価を甘くしようと思えば甘くできる場所が入っています。")
+    lines.append("")
+    lines.append("なぜ止まったか: 下記のファイルがベースラインと一致しなくなりました。"
+                 "自己改善ループは、判定器が無傷だと確認できない限り走りません"
+                 "(INFRA_ABORT)。改ざんかもしれず、正当な変更かもしれず、"
+                 "その区別は人にしかつきません。")
+    lines.append("")
+    for rel in files:
+        role = FILE_ROLE.get(rel, "")
+        lines.append("  %s" % rel)
+        if role:
+            lines.append("      統べているもの: %s" % role)
+    lines.append("")
+    stat = _diff_stat(files, repo)
+    if stat:
+        lines.append("実際の差分:")
+        for ln in stat.splitlines()[:12]:
+            lines.append("  " + ln)
+        lines.append("")
+    lines.append("「承認する」を押すと: 上のファイルの"
+                 "**現在の内容をそのまま正**として署名し直します。"
+                 "あなたの言葉がそのまま台帳に記録され、ループが再び走れるようになります。"
+                 "変更内容を確認していないなら、押さないでください。")
+    lines.append("「却下する」を押すと: 何も署名されません。"
+                 "ループは止まったままで、ファイルを元に戻す(git checkout)まで再開しません。")
+    return "\n".join(lines)
+
+
+def _diff_stat(files, repo: str) -> str:
+    """`git diff` for exactly these files. Best effort: no git, no diff, no problem."""
+    try:
+        import subprocess
+        out = subprocess.run(["git", "diff", "--stat", "HEAD", "--"] + list(files),
+                             cwd=repo, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=20)
+        text = (out.stdout or "").strip()
+        if not text:
+            out = subprocess.run(["git", "diff", "--stat", "--"] + list(files),
+                                 cwd=repo, capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", timeout=20)
+            text = (out.stdout or "").strip()
+        return text
+    except Exception:
+        return ""
+
+
 def queue_mismatch(changed, repo: str = REPO, baseline: str = DEFAULT_BASELINE) -> str:
     """Put a frozen-set mismatch on the approvals queue. Returns the id, or "". Never raises.
 
@@ -638,9 +765,9 @@ def queue_mismatch(changed, repo: str = REPO, baseline: str = DEFAULT_BASELINE) 
             command=("python -m relay.selfimprove.frozen --snapshot --force "
                      "--reason \"<why this change is correct>\" "
                      "--authorization \"<your words, verbatim>\""),
-            detail=("Reverting instead: git checkout -- %s\n"
-                    "Checking first:    python -m relay.selfimprove.frozen --verify"
-                    % " ".join(files)),
+            detail=_explain(files, repo) + (
+                "\n\n元に戻す: git checkout -- %s"
+                "\n先に確認: python -m relay.selfimprove.frozen --verify" % " ".join(files)),
             # THE SCREEN MAY CARRY THIS ONE OUT. Approving a Skill is the act; approving this
             # used to leave a card reading "waiting on the agent" and a command to go and find,
             # which is the gap the operator described -- the queue said something needed
