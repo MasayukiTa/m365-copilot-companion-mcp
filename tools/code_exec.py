@@ -153,18 +153,57 @@ def _judged(kind, text, working_dir):
         judge = _judge_backend()
         verdict = _cj.judge_command(req, judge)
         blocks = _cj.outcome_blocks_execution(verdict, human_available=False)
-        _record_judgement(kind, text, req, verdict, m, blocks)
+        approved = None
+        if m == "enforce" and blocks:
+            # THE PERSON MAY OVERRULE EITHER LAYER, and this is the only place they can.
+            # "引っかかったものでも問題なしとユーザが明示的に承認したら当然実行OK。それは
+            # ユーザの責任" -- so an explicit approval releases a BLOCK_AND_RETRY as well as a
+            # REQUIRE_HUMAN. What it does not do is release a deterministic rule: that ran
+            # before this function was called, and is not reconsidered here.
+            #
+            # ONLY IN ENFORCE. Shadow exists to measure without changing behaviour, and a
+            # prompt on every unrecognised command is a change in behaviour -- and the fastest
+            # way to have the layer switched off before it has been measured once.
+            #
+            # None (nobody could be asked) is a decline, never a pass.
+            approved = _ask_operator(text, verdict)
+            if approved:
+                blocks = False
+        _record_judgement(kind, text, req, verdict, m, blocks, human=approved)
         if m == "enforce" and blocks:
             return ("[refused by review] %s\n"
                     "The pending command was assessed before running and was not allowed: %s\n"
                     "Choose a narrower action, or ask the operator to approve this one."
                     % (verdict.get("decision"), verdict.get("reason") or "no reason given"))
         return None
-    except Exception:
-        # A judgement layer that can break execution is worse than none. In shadow this must
-        # never cost a command; in enforce, a crash here is not an allow -- but neither is it a
-        # reason to take the machine down, so the deterministic layers above stand.
-        return None
+    except Exception as exc:
+        # FAILURE IS NOT PERMISSION, INCLUDING MY OWN FAILURE. This handler used to return None
+        # for everything, and its comment claimed "a crash here is not an allow" while doing
+        # exactly that. It was not a hypothetical: adding the `human` argument to
+        # _record_judgement broke a test stub, every call raised TypeError, this line swallowed
+        # it, and four tests reported an empty log rather than a signature error. In shadow
+        # that costs nothing. In enforce it would have been an unjudged command running because
+        # the judging code had a bug -- which is the precise failure the whole layer exists to
+        # prevent, one level down.
+        #
+        # Shadow still never costs a command: measuring must not change behaviour, and an
+        # exception in a layer that is only observing is a defect to fix, not a refusal to
+        # issue.
+        try:
+            enforcing = _mode_is_enforce()
+        except Exception:
+            enforcing = False
+        if not enforcing:
+            return None
+        return ("[refused by review] internal error\n"
+                "The pre-execution review could not complete (%s: %s), and an unassessed "
+                "command is not permitted while review is enforced."
+                % (type(exc).__name__, str(exc)[:200]))
+
+
+def _mode_is_enforce():
+    from . import command_triage as _tri
+    return _tri.mode() == "enforce"
 
 
 def _ALLOWED_BASE_FOR_JUDGE():
@@ -191,6 +230,29 @@ def _deterministic_flags(text):
         return []
 
 
+def _ask_operator(text, verdict):
+    """Put the blocked command to the person at the client. True only on explicit approval.
+
+    Returns None when nobody could be asked -- no request context, a client without
+    elicitation, a timeout. The caller treats None exactly as a decline: an unattended run
+    that reads "could not ask" as "go ahead" has inverted the point of asking.
+    """
+    try:
+        from . import judge_backend as _jb
+        question = (
+            "この操作を実行してよいか確認してください。事前レビューで止まりました。\n"
+            "  コマンド: %s\n"
+            "  判定: %s\n"
+            "  理由: %s\n"
+            "承認した場合、この実行の責任は承認者にあります。"
+            % ((text or "")[:300],
+               verdict.get("decision"),
+               (verdict.get("reason") or "理由なし")[:300]))
+        return _jb.ask_human(question)
+    except Exception:
+        return None
+
+
 def _judge_backend():
     """The callable that asks a model, or None when none is configured.
 
@@ -205,7 +267,7 @@ def _judge_backend():
         return None
 
 
-def _record_judgement(kind, text, req, verdict, mode_name, blocks):
+def _record_judgement(kind, text, req, verdict, mode_name, blocks, human=None):
     """One line per judged command, including allows.
 
     Raw command text is recorded because a verdict cannot be reviewed without knowing what was
@@ -234,6 +296,11 @@ def _record_judgement(kind, text, req, verdict, mode_name, blocks):
             "reason": (verdict.get("reason") or "")[:300],
             "source": verdict.get("source"),
             "would_block": bool(blocks),
+            # THREE STATES, NOT TWO. null = nobody was asked (shadow, or the command was
+            # allowed outright); true = a person explicitly approved and owns the decision;
+            # false = asked and declined, OR nobody could be reached. A boolean alone could
+            # not tell "approved" from "never asked", which is the distinction the audit needs.
+            "human_approved": human,
             "schema": _json.dumps(None) and 1,
         }
         with open(path, "a", encoding="utf-8") as fh:
