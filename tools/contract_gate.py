@@ -353,6 +353,29 @@ _DESTRUCTIVE_PATTERNS = [
     # ordinary text should not trip it.
     re.compile(r"(?:^|[;|&{(]\s*)\s*(?:iex|Invoke-Expression)\b", re.IGNORECASE),
     re.compile(r"\|\s*(?:iex|Invoke-Expression)\b", re.IGNORECASE),
+
+    # THE SAME ARGUMENT, IN THE OTHER LANGUAGES, and it was missing until a real command
+    # turned up in this repository's own root:
+    #
+    #     node -e "eval(Buffer.from('<5.7 KB of base64>','base64').toString())"
+    #
+    # written by a benchmark worker on 2026-08-31 09:47 (cmd.txt). Decoded it was harmless --
+    # an in-memory NodeBB stub for reproducing a bug, exactly the reproduce-first behaviour the
+    # harness asks for, base64'd to get past Windows shell quoting. The net did not fire, and
+    # `-EncodedCommand` two lines up exists because a base64 payload "has declined to be
+    # judged". That reasoning is about the shape, not about PowerShell, so leaving JS and
+    # Python out was an inconsistency rather than a decision.
+    #
+    # THE COST IS REAL AND ACCEPTED: our own workers build reproductions this way, so this
+    # fires on ordinary benchmark work. It costs a judging call and a log line, not a block --
+    # and a decode-then-execute that nobody can read is the one shape where asking is cheaper
+    # than being wrong. Matched on decode INSIDE an execute, so a plain
+    # Buffer.from(...).toString() that only prints does not trip it.
+    re.compile(r"\b(?:eval|Function)\s*\(\s*(?:new\s+)?(?:Buffer\.from|atob)\s*\(",
+               re.IGNORECASE),
+    re.compile(r"\bnew\s+Function\s*\(\s*(?:Buffer\.from|atob)\s*\(", re.IGNORECASE),
+    re.compile(r"\b(?:eval|exec)\s*\(\s*(?:base64|codecs|bytes)\b[^)]*decode", re.IGNORECASE),
+    re.compile(r"\b(?:eval|exec)\s*\(\s*\w+\.decode\s*\(", re.IGNORECASE),
 ]
 
 
