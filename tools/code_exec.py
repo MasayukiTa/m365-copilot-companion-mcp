@@ -348,19 +348,76 @@ def shell_exec(
     if _j is not None:
         return _j
     try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            timeout=timeout,
-            cwd=_working_dir(working_dir),
-            env=sanitized_child_env(),
-        )
-        return _format_output(result, "shell_exec")
-    except subprocess.TimeoutExpired:
-        return f"[timeout: exceeded {timeout} seconds]"
+        return _run_with_tree_timeout(command, timeout, _working_dir(working_dir))
     except Exception as e:
         return f"[shell_exec error: {type(e).__name__}: {e}]"
+
+
+def _run_with_tree_timeout(command, timeout, cwd):
+    """Run a shell command; on timeout kill the WHOLE process tree, not just the shell.
+
+    THE LEAK THIS CLOSES, COUNTED. `subprocess.run(..., shell=True, timeout=N)` kills its
+    direct child, which on Windows is cmd.exe. A command like `npx eslint ...` has cmd.exe
+    spawn node, so the timeout killed the shell and left node running -- forever, because npx
+    prompts before installing a package it does not have and a tool call has no stdin to answer
+    with.
+
+    Measured 2026-08-31: 44 node processes on this machine, 40 of them hung `npx eslint` and
+    `npx tsc` from benchmark instances, the oldest 33 hours old. They held 164 MB of RSS and,
+    through their npx cache handles, nearly a gigabyte of disk -- killing them took C: from
+    2.10 GB free to 3.03 GB. relay/orphan_reaper.py cannot reap these: it attributes a process
+    by its ancestry, and the ancestor it would attribute through is the cmd.exe the timeout
+    already killed.
+
+    So the fix belongs here, at the moment the timeout fires and the parent is still known.
+    taskkill /T walks the tree from a live pid; nothing else on Windows reliably does.
+    """
+    proc = subprocess.Popen(
+        command,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        # NO INHERITED STDIN. A prompt the caller cannot answer is what turned a slow command
+        # into a permanent one; with stdin closed, npx and its kind fail fast instead of
+        # waiting for an answer that can never come.
+        stdin=subprocess.DEVNULL,
+        cwd=cwd,
+        env=sanitized_child_env(),
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        try:
+            out, err = proc.communicate(timeout=5)
+        except Exception:
+            out, err = b"", b""
+        tail = _decode(err or b"").strip()[-400:]
+        return ("[timeout: exceeded %s seconds; the command and every process it started were "
+                "killed]%s" % (timeout, ("\n[stderr]\n" + tail) if tail else ""))
+
+    class _R(object):
+        pass
+    result = _R()
+    result.stdout, result.stderr, result.returncode = out, err, proc.returncode
+    return _format_output(result, "shell_exec")
+
+
+def _kill_tree(proc):
+    """Kill a process and everything it started. Best effort, never raises."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True, timeout=15)
+        else:
+            import signal
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
 
 
 #: This tool runs caller-supplied code, so the evidence trace cannot see what it did:
