@@ -1038,6 +1038,7 @@ class CockpitWindow : Window
         if (k == "hs_tun_detail_none") return ja ? "MCP_TUNNEL_URL が .env に未設定です" : "MCP_TUNNEL_URL is not set in .env";
         if (k == "hs_fix_edge_navigate") return ja ? "エージェントのページを開いています..." : "opening the agent page...";
         if (k == "hs_fix_edge_still") return ja ? "ページを開いても準備完了になりません" : "navigated, but the page is still not ready";
+        if (k == "hs_tool_detail_never") return ja ? "自己診断がまだ一度も結果を書いていない（ブリッジ未起動か診断側の不具合）" : "the self-probe has never written a result (bridge not started, or the probe is broken)";
         if (k == "hs_edge_detail_blank") return ja ? "ブラウザは動作中だがエージェントのページが開かれていない" : "browser up, but no agent page open";
         if (k == "hs_edge_detail_ok") return ja ? "コンパニオン Edge が稼働中 (:9222)" : "Companion Edge running (:9222)";
         if (k == "hs_edge_detail_bad") return ja ? "コンパニオン Edge に接続できません (:9222)" : "Companion Edge not reachable (:9222)";
@@ -2087,7 +2088,11 @@ class CockpitWindow : Window
         // 1) Tunnel: read MCP_TUNNEL_URL from ..\.env; GET <url>/health == 200. Gray if none.
         string tunnel = EnvValue("MCP_TUNNEL_URL");
         if (string.IsNullOrEmpty(tunnel))
-            SetDot(1, HealthState.Gray, T("hs_tun_detail_none"), now);
+            // AMBER, NOT GRAY. Gray reads as "no evidence expected" and shows no Fix button,
+            // but an unset MCP_TUNNEL_URL is not an absence of evidence -- it means the agent
+            // cannot reach this server at all. Being told nothing is wrong while the whole
+            // remote path is unusable is the failure this file keeps finding.
+            SetDot(1, HealthState.Yellow, T("hs_tun_detail_none"), now);
         else
         {
             // MCP_TUNNEL_URL points at the /mcp path (e.g. https://host.devtunnels.ms/mcp);
@@ -2177,6 +2182,25 @@ class CockpitWindow : Window
     // fleet_run_active.json is written by the runner at launch and carries its pid. A live pid
     // there means a run exists whatever the snapshot says. Anything unreadable counts as live:
     // an unknown state must never authorise restarting the browser.
+    // True when the run marker names a pid that no longer exists -- i.e. there is definitely
+    // no run, independent of whatever status.json says or fails to say.
+    bool MarkerPidIsDead()
+    {
+        try
+        {
+            string marker = Path.Combine(Path.GetDirectoryName(ResolvePath(null)),
+                                         "fleet_run_active.json");
+            if (!File.Exists(marker)) return true;
+            var m = _js.DeserializeObject(File.ReadAllText(marker, Encoding.UTF8))
+                    as Dictionary<string, object>;
+            object pidObj;
+            if (m == null || !m.TryGetValue("pid", out pidObj) || pidObj == null) return true;
+            try { System.Diagnostics.Process.GetProcessById(Convert.ToInt32(pidObj)); return false; }
+            catch (ArgumentException) { return true; }
+        }
+        catch (Exception) { return false; }   // cannot tell -> assume a run exists
+    }
+
     bool FleetRunIsLive()
     {
         try
@@ -2206,11 +2230,15 @@ class CockpitWindow : Window
             if (!File.Exists(p)) return false;      // never started here
             var root = _js.DeserializeObject(File.ReadAllText(p, Encoding.UTF8))
                        as Dictionary<string, object>;
-            if (root == null) return true;
-            if (!root.ContainsKey("running")) return true;
+            if (root == null) return !MarkerPidIsDead();
+            if (!root.ContainsKey("running")) return !MarkerPidIsDead();
             return Convert.ToBoolean(root["running"]);
         }
-        catch (Exception) { return true; }
+        // UNREADABLE IS NOT "LIVE FOR EVER". Failing safe here is right, but a corrupt file
+        // that nobody notices would otherwise disable automatic repair permanently -- the
+        // guard would outlive the run it was guarding. When the runner's own pid marker says
+        // no process exists, there is no run to protect, whatever the snapshot says.
+        catch (Exception) { return !MarkerPidIsDead(); }
     }
 
     // ── automatic repair, before anyone is asked to click ───────────────────────────────────
@@ -2593,7 +2621,18 @@ class CockpitWindow : Window
     void PollToolProbeOnce(DateTime now)
     {
         string path = Path.Combine(RepoRoot(), ".fleet", "tool_probe.json");
-        if (!File.Exists(path)) { SetDot(5, HealthState.Gray, T("hs_tool_detail_none"), now); return; }
+        if (!File.Exists(path))
+        {
+            // GRAY ONLY WHEN THE PROBE IS ACTUALLY SWITCHED OFF. "probe disabled", "the bridge
+            // never started" and "the probe writer is broken" all produced the same grey dot,
+            // and grey means "no evidence expected" -- so two of those three were reported as
+            // nothing to see. The setting is readable, so the three can be told apart.
+            string probeSec = EnvValue("MCP_TOOL_PROBE_SEC");
+            bool disabled = probeSec == "0";
+            SetDot(5, disabled ? HealthState.Gray : HealthState.Yellow,
+                   T(disabled ? "hs_tool_detail_none" : "hs_tool_detail_never"), now);
+            return;
+        }
         try
         {
             var o = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
