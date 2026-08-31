@@ -2214,18 +2214,31 @@ class CockpitWindow : Window
     // made automatic agent repair unreachable by construction.
     //
     // The question is not "is something running" but "does this repair touch what is running".
+    // The highest-priority fault THAT CAN BE ACTED ON RIGHT NOW.
+    //
+    // Returning the highest-priority fault outright was wrong, and it showed up the first time
+    // the incident reproduced: a live run made the agent dot red, agent repair touches the
+    // fleet's Edge so it stood down, and the tool dot -- red, repairable, and pointed at a
+    // DIFFERENT browser (:9223) -- was never reached. The chat side stayed broken because the
+    // fleet side was busy. A fault that cannot be repaired now must not shadow one that can.
     int AutoFixTargetDot()
     {
+        bool runLive = FleetRunIsLive();
+        int[] priority = { 3, 2, 4, 0, 1, 5 };   // sign-in, edge, agent, server, tunnel, tool
         lock (_healthLock)
         {
-            if (_health[3].State == HealthState.Red) return 3;    // sign-in (RunFix: red only)
-            if (_health[2].State == HealthState.Red) return 2;    // edge
-            if (_health[4].State == HealthState.Red
-             || _health[4].State == HealthState.Yellow) return 4; // agent
-            if (_health[0].State == HealthState.Red
-             || _health[1].State == HealthState.Red) return 0;    // server / tunnel
-            if (_health[5].State == HealthState.Red
-             || _health[5].State == HealthState.Yellow) return 5; // tool (bridge :9223)
+            foreach (int dot in priority)
+            {
+                HealthState st = _health[dot].State;
+                bool bad = (st == HealthState.Red)
+                        || (st == HealthState.Yellow && (dot == 4 || dot == 5));
+                if (!bad) continue;
+                // RunFix has a sign-in branch for RED only; a yellow sign-in would burn the
+                // whole budget doing nothing, so it is not a target.
+                if (dot == 3 && st != HealthState.Red) continue;
+                if (RepairTouchesFleetEdge(dot) && runLive) continue;   // try the next one
+                return dot;
+            }
         }
         return -1;
     }
@@ -2241,8 +2254,38 @@ class CockpitWindow : Window
     // ran on the poll thread, and a run can start in the gap between that check and this call.
     void RunFixAuto(int dot)
     {
-        if (RepairTouchesFleetEdge(dot) && FleetRunIsLive()) return;
+        if (RepairTouchesFleetEdge(dot) && FleetRunIsLive())
+        {
+            AutoFixRecord(dot, "skipped: a run started between the poll and this call");
+            return;
+        }
+        AutoFixRecord(dot, "running");
         RunFix();
+    }
+
+    // A DURABLE TRACE, because RunFix only ever wrote to a label in this window.
+    //
+    // An automatic repair that leaves no record cannot be audited: if it fires at three in the
+    // morning and makes things worse, there is nothing to look at, and "did it even run?" is
+    // unanswerable. I could not answer that question about its first real firing, which is how
+    // this line came to exist.
+    void AutoFixRecord(int dot, string what)
+    {
+        try
+        {
+            string[] names = { "server", "tunnel", "edge", "signin", "agent", "tool" };
+            string name = (dot >= 0 && dot < names.Length) ? names[dot] : ("dot" + dot);
+            string detail;
+            lock (_healthLock) { detail = _health[dot >= 0 ? dot : 0].Detail ?? ""; }
+            string line = "{\"ts\":" + DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+                        + ",\"dot\":\"" + name + "\""
+                        + ",\"attempt\":" + _autoFixAttempts
+                        + ",\"what\":\"" + what.Replace("\"", "'") + "\""
+                        + ",\"detail\":\"" + detail.Replace("\\", "/").Replace("\"", "'") + "\"}";
+            string path = Path.Combine(Path.GetDirectoryName(ResolvePath(null)), "autofix.jsonl");
+            File.AppendAllText(path, line + Environment.NewLine, Encoding.UTF8);
+        }
+        catch (Exception) { }   // a trace that can break the repair is worse than no trace
     }
 
     void MaybeAutoFix()
@@ -2272,8 +2315,6 @@ class CockpitWindow : Window
             _autoFixAttempts = 0;
             _autoFixBadPolls = 0;
         }
-
-        if (RepairTouchesFleetEdge(dot) && FleetRunIsLive()) { _autoFixBadPolls = 0; return; }
 
         _autoFixBadPolls++;
         if (_autoFixBadPolls < AUTOFIX_CONSECUTIVE_POLLS) return;

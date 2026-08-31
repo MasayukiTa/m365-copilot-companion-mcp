@@ -79,3 +79,20 @@ def test_the_borrow_runs_on_the_page_thread_and_cannot_hang():
         "the borrow either runs on the wrong thread or can hang the probe timer")
     assert "borrow_page()" not in src, (
         "borrow_page is still called directly from the timer thread")
+
+
+def test_the_borrow_and_the_return_both_sit_inside_the_page_lock():
+    """A real turn must not be able to inherit the probe's page and then lose it.
+
+    The borrow used to happen before PAGE_LOCK.acquire and the return after PAGE_LOCK.release,
+    leaving a gap at each end. A user turn takes that lock, so it could begin in either gap,
+    inherit the page and driver the probe had just created, and then have the probe's finally
+    close the page out from under the conversation.
+    """
+    src = _probe_source()
+    acq = src.index("PAGE_LOCK.acquire")
+    rel = src.rindex("PAGE_LOCK.release")
+    borrow = src.index("borrow_page")
+    ret = src.index("return_page")
+    assert acq < borrow, "the page is borrowed before the lock is held"
+    assert ret < rel, "the page is returned after the lock is released"
