@@ -94,6 +94,89 @@ ADMIN_BLOCK_MARKERS = (
 )
 AGENT_DEAD_MARKERS = TRANSIENT_ERROR_MARKERS + ADMIN_BLOCK_MARKERS
 
+# THE SERVER SAYING "SLOWER", WHICH NOTHING HERE COULD HEAR.
+#
+# `GenAIToolPlannerRateLimitReached` matched NONE of the six marker families in this file --
+# not TRANSIENT (which knows "予期しないエラー", and this text says only "エラーが発生しました"),
+# not ADMIN_BLOCK, not TOOL_UNREACHABLE, not CONSENT, not CANNED_NONANSWER. Measured across the
+# stored transcripts on 2026-08-31: 110 workers received it, and 77 of those received it on
+# EVERY turn they ever had. One run: 67 of 144 workers.
+#
+# Unrecognised, it fell through to the generic no-marker handling, whose answer to a throttle
+# is the worst available one. From r6a926255_a0_w11, five turns in seventy-five seconds --
+# 05:13:05, 05:13:20, 05:13:48, 05:14:00, 05:14:20 -- and three of those five re-sent the FULL
+# 9,092-character goal. Told to slow down, the fleet replied by sending more, faster.
+#
+# It is also not what the other families mean. The agent is not dead, the tools are not
+# unreachable, nothing needs an administrator, and the task did not fail: a quota refilled in
+# minutes. Treating it as any of those mislabels an infrastructure pause as a coding miss --
+# which is how a benchmark score quietly absorbs someone else's rate limiter.
+THROTTLE_MARKERS = (
+    "ratelimitreached", "ratelimitexceeded", "rate limit", "rate-limited",
+    "too many requests", "throttled", "requests per minute",
+    "レート制限", "要求が多すぎ",
+)
+
+# How long to keep riding out a throttle before calling it infrastructure. Same 30 minutes as
+# the network window: a per-minute quota refills in well under that, and a throttle that
+# genuinely persists for half an hour is a capacity problem, not a blip.
+THROTTLE_WINDOW_S = float(os.environ.get("MCP_THROTTLE_WINDOW_S", "1800"))
+
+# THE BACKOFF IS THE WHOLE FIX. transient_backoff caps near 8 seconds, which is right for a
+# dropped connection and exactly wrong here -- 8 seconds into a per-minute quota is another
+# rejection. Start at 30s and double to five minutes.
+THROTTLE_BACKOFF_BASE_S = float(os.environ.get("MCP_THROTTLE_BACKOFF_S", "30"))
+THROTTLE_BACKOFF_MAX_S = float(os.environ.get("MCP_THROTTLE_BACKOFF_MAX_S", "300"))
+
+
+def throttled_reply(resp: str) -> bool:
+    """True when the far side said the request rate is too high, in any of its spellings."""
+    if not resp:
+        return False
+    low = resp.lower()
+    return any(m in low for m in THROTTLE_MARKERS)
+
+
+#: Volatile fields that make two IDENTICAL replies look different. A GUID, an ISO timestamp,
+#: an epoch, a request id -- every canned error page carries at least one.
+_VOLATILE_IN_REPLY = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"          # guid
+    r"|\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}:\d{2}(?:\.\d+)?z?"                    # iso timestamp
+    r"|\d{2}:\d{2}:\d{2}(?:\.\d+)?"                                           # bare clock time
+    r"|\b1[6-9]\d{8}(?:\.\d+)?\b",                                            # epoch seconds
+    re.IGNORECASE)
+
+
+def _norm_for_progress(resp: str) -> str:
+    """The comparison key behind no_progress: is this reply the SAME as the last one?
+
+    THE VOLATILE FIELDS WERE DEFEATING IT. The key was the first 300 characters of the reply,
+    and a canned error page spends its first 130 on a conversation GUID and a UTC timestamp
+    that change every time. So five byte-for-byte identical rate-limit errors compared as five
+    DIFFERENT replies, no_progress stayed at zero, and NET_RETRY_NOPROGRESS_MAX -- the
+    dead-endpoint early exit whose entire job is to stop hammering something that cannot
+    change -- never fired once in 110 such transcripts.
+
+    A defect of this shape is invisible from the code: the comparison is correct, the constant
+    is sensible, and the test that a repeated reply counts as no progress passes, because a
+    test writes the same string twice and real replies never are.
+    """
+    return " ".join(_VOLATILE_IN_REPLY.sub("", (resp or "").lower()).split())[:300]
+
+
+def throttle_backoff(attempt: int) -> float:
+    """30s, 60s, 120s, 240s, 300s ... with -25% jitter so a fleet does not resynchronise.
+
+    THE JITTER IS NOT DECORATION. Every worker in a fleet is throttled by the same quota at the
+    same moment, so a fixed delay would send them all back in at the same moment too -- which
+    is the burst that caused the throttle. Measured: workers 0-7 replied in the first twelve
+    seconds of a run and all succeeded; twenty more replied at minute 1.0 and every one of them
+    was rate-limited.
+    """
+    import random
+    delay = min(THROTTLE_BACKOFF_BASE_S * (2 ** max(0, attempt - 1)), THROTTLE_BACKOFF_MAX_S)
+    return delay * (1.0 - 0.25 * random.random())
+
 # NETWORK-OUTAGE RESILIENCE (2026-06-17). A flaky corporate network / devtunnel can drop the path
 # to the MCP backend for seconds-to-minutes. The retry budgets must be WALL-CLOCK windows, not tiny
 # counts: a 10-count transient retry exhausted in ~55s and a 3-strike dead-agent detector STUCK in
@@ -1741,6 +1824,8 @@ class RelayWorker:
         # fleet-wide headed relaunch). See _decide's canned-non-answer handler.
         self._canned_streak = 0         # consecutive canned "couldn't respond" replies
         self._canned_ts = 0.0           # wall-clock start of the current canned-non-answer streak
+        self._throttle_ts = 0.0         # wall-clock start of the current upstream-throttle streak
+        self._throttle_streak = 0       # consecutive throttled replies, drives the backoff
         self._signin_surfaced = False   # surfaced the Edge once for interactive sign-in
         self._signin_surfaced_ok = False  # TRUTHFUL result of that surface() call (see edge_recover.surface)
         self._headed_recovery_done = False  # forced a HEADED companion relaunch once (last resort)
@@ -2937,6 +3022,40 @@ class RelayWorker:
         # pattern, bail FAST after a few, and go STUCK so the goal can be re-submitted on a healthy
         # agent rather than wasting the whole turn budget on a dead endpoint.
         _low = resp.lower()
+        # THROTTLED. Checked FIRST, because every branch below it answers by sending something
+        # -- a nudge, a re-anchor, a full goal re-send -- and sending something is the one
+        # response a rate limiter cannot be given. See THROTTLE_MARKERS for the measurement:
+        # unrecognised, this produced five requests in seventy-five seconds, three of them
+        # carrying the entire goal.
+        #
+        # It does not touch the turn budget, the transient budget, or no_progress. Nothing
+        # happened this turn: the far side declined to run it. Counting a declined request as a
+        # spent turn is how an infrastructure pause becomes a reported failure.
+        if throttled_reply(resp):
+            try:
+                now = time.time()
+                if self._throttle_ts <= 0.0:
+                    self._throttle_ts = now
+                self._throttle_streak += 1
+                waited = now - self._throttle_ts
+                if waited > THROTTLE_WINDOW_S:
+                    self.status, self.outcome = "stuck", "INFRA_STUCK"
+                    self.reason = (
+                        "⚠ 上流のレート制限が%d分継続(%d回)。エージェントもツール経路も生きており、"
+                        "**タスク失敗ではない**=再投入対象。同時実行数を下げるか時間を空けて再開。"
+                        % (int(waited / 60), self._throttle_streak))
+                    return
+                delay = throttle_backoff(self._throttle_streak)
+                self._cooldown_until = now + delay
+                self.status = "ready"
+                # The SAME job again, not a re-anchor and not the goal: the previous send never
+                # reached the model, so there is nothing to re-anchor to and nothing was lost.
+                self.reason = ("上流レート制限 (%d回目) -> %.0f秒待って同じ要求を再送。"
+                               "ターンは消費しない" % (self._throttle_streak, delay))
+                return
+            except Exception:
+                # Never raise out of _decide; fall through to the existing handling.
+                pass
         # CONNECTION-CONSENT -- NOT a credential/sign-in event, but the regulation is NOT
         # "never surface" either: consent must be resolved FULLY AUTOMATICALLY, and surfacing
         # the Edge is the LAST RESORT that fires ONLY once every automatic tier has genuinely
@@ -3339,7 +3458,7 @@ class RelayWorker:
                 self.recovery_result = "needs_decomposition"
                 self.reason = "identical task refused in two independent conversations"
                 return
-        norm = " ".join(resp.lower().split())[:300]
+        norm = _norm_for_progress(resp)
         self.no_progress = self.no_progress + 1 if norm and norm == self.last_norm else 0
         self.last_norm = norm
         up = resp.upper()
@@ -3408,6 +3527,8 @@ class RelayWorker:
         self.transient = 0   # a real (non-stuck) response -> the transient issue cleared
         self.first_transient_ts = 0.0   # reset the outage window on a healthy reply
         self._toolerr_ts = 0.0          # tool path is back -> clear the tool-unreachable window
+        self._throttle_ts = 0.0         # the quota refilled -> clear the throttle window
+        self._throttle_streak = 0
         # deep-research delegation: the agent wrote `RESEARCH: <query>` asking for an external
         # deep-dive. Spawn the Researcher sub-agent (side page), feed its report back as the next
         # turn, and continue. Capped per worker (max_research); past the cap, tell it to proceed.
