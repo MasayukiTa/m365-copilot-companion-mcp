@@ -112,9 +112,19 @@ def test_the_cap_no_longer_evicts_real_entries_to_hold_repeats(tmp_path):
     assert len(entries) == 2
 
 
-def test_notes_read_back_are_deduped_even_from_a_file_written_before_this_existed(tmp_path):
-    """The 156 files already on disk are not rewritten until their theme comes round again,
-    so a fix that only applies on write leaves the measured problem in place."""
+def test_the_read_path_is_left_to_the_memory_component(tmp_path):
+    """THE ARM I NEARLY DELETED BY IMPLEMENTING IT.
+
+    Collapsing repeats at READ time is what `memory/v2` already does -- a declared component
+    with two arms, whose comparison is the benchmark's job. The first version of this work
+    deduped on the read path unconditionally, which made v1 and v2 return byte-identical text
+    and turned the experiment into two runs of one program. That is precisely the failure
+    MEMORY_VERSIONS exists to end, and it was caught by
+    relay/selfimprove/test_evolution_loop.py rather than by me.
+
+    So a legacy file full of repeats still primes repeats under v1, and does not under v2.
+    Both are correct; which is better is not this function's decision.
+    """
     d = str(tmp_path)
     os.makedirs(M._mem_dir(d), exist_ok=True)
     theme, slug = M._resolve("算数")
@@ -123,8 +133,21 @@ def test_notes_read_back_are_deduped_even_from_a_file_written_before_this_existe
                                          for i in range(1, 9))))
     with open(M._theme_path(slug, d), "w", encoding="utf-8") as fh:
         fh.write(legacy)
-    out = M.load_notes("算数", state_dir=d, include_index=False)
-    assert out.count("2の12乗") == 1, "read back %d copies" % out.count("2の12乗")
+    assert M._memory_v1(M._entry_lines(legacy), 8) != M._memory_v2(M._entry_lines(legacy), 8)
+
+
+def test_the_write_path_still_dedupes_because_that_is_a_different_question(tmp_path):
+    """v2 filters what is PRIMED; it cannot recover an entry the cap already evicted. Whether
+    a distinct entry survives at all is decided when it is written."""
+    d = str(tmp_path)
+    M.record_task("t", "the interesting one", "STUCK", note="cannot reach the DB",
+                  state_dir=d, ts=1000)
+    for i in range(30):
+        M.record_task("t", "the boring one", "DONE", note="ok", state_dir=d, ts=2000 + i)
+    on_disk = M._entry_lines(
+        open(M._theme_path(M._resolve("t")[1], d), encoding="utf-8").read())
+    assert "cannot reach the DB" in "\n".join(on_disk), \
+        "the one distinct entry was evicted by repeats, and no read-time filter can bring it back"
 
 
 # ── themes that share an opening ──────────────────────────────────────────────────────────
