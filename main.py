@@ -26,6 +26,7 @@ from tools.coding_ops import (
     python_check,
     replace_in_file,
 )
+from tools.auto_ops import edit_and_verify, loop_trajectory, restore_point, roll_back
 from tools.data_ops import read_excel, read_json, summarize_table, write_excel, write_json
 from tools.diagram_ops import render_diagram, render_mermaid_png
 from tools.env_ops import env_info, pip_install, which
@@ -301,6 +302,10 @@ TOOLS = (
     read_excel, write_excel, summarize_table, read_json, write_json,
     # text search / editing
     grep, replace_in_file, multi_edit, diff_files, python_check,
+    # a change that spans files, applied and undone as ONE thing. multi_edit is atomic within
+    # one file and nothing sat above it, so a failing test left a tree half-edited across a
+    # boundary no tool could see.
+    edit_and_verify, loop_trajectory, restore_point, roll_back,
     # git (read)
     git_status, git_diff, git_log, git_branch, git_blame,
     # git (write)
