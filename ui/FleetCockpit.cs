@@ -2136,6 +2136,81 @@ class CockpitWindow : Window
         //      and audience, the agent the template names, and whether the capture worked.
         //      Never the token: an expiry and an audience grant nothing on their own.
         UpdateCaptureDots(now);
+        MaybeAutoFix();
+    }
+
+    // Is a fleet run in flight, as the runner itself reports it. Read defensively: an
+    // unreadable or absent status file means "do not know", and "do not know" must not be
+    // treated as "safe to restart the browser".
+    bool FleetRunIsLive()
+    {
+        try
+        {
+            string p = ResolvePath(null);
+            if (!File.Exists(p)) return false;
+            var root = _js.DeserializeObject(File.ReadAllText(p, Encoding.UTF8))
+                       as Dictionary<string, object>;
+            if (root == null) return true;
+            if (!root.ContainsKey("running")) return true;
+            return Convert.ToBoolean(root["running"]);
+        }
+        catch (Exception) { return true; }
+    }
+
+    // ── automatic repair, before anyone is asked to click ───────────────────────────────────
+    //
+    // RunFix knows how to repair every state these dots report, and it was reachable ONLY from
+    // the button. So a broken agent path stayed broken for as long as nobody happened to be
+    // looking at this window. On 2026-08-31 that was hours: the fleet's Edge sat on
+    // about:blank, every worker fell back to the assistant with no tools, and two benchmark
+    // runs produced patches written from memory.
+    //
+    // The manual button remains, and it is the point: the automatic path tries first, a
+    // bounded number of times, and hands over to the human only when it has genuinely failed.
+    const int AUTOFIX_CONSECUTIVE_POLLS = 2;   // ~30s of a steady fault, not one flap
+    const int AUTOFIX_MAX_ATTEMPTS      = 3;   // then it is the human's turn
+    int _autoFixBadPolls = 0;
+    int _autoFixAttempts = 0;
+
+    void MaybeAutoFix()
+    {
+        HealthState worst = HealthState.Green;
+        lock (_healthLock)
+        {
+            for (int i = 0; i < HEALTH_DOT_COUNT; i++)
+            {
+                HealthState st = _health[i].State;
+                if (st == HealthState.Red) { worst = HealthState.Red; break; }
+                if (st == HealthState.Yellow) worst = HealthState.Yellow;
+            }
+        }
+
+        if (worst != HealthState.Red && worst != HealthState.Yellow)
+        {
+            _autoFixBadPolls = 0;
+            _autoFixAttempts = 0;
+            return;
+        }
+
+        // NOT WHILE A RUN IS LIVE. The repair tiers relaunch the companion Edge -- Priority 1
+        // brings it up HEADED for a sign-in, Priority 2 hard-resets it -- and that Edge is
+        // what a running fleet is driving. A person pressing the button is choosing that; a
+        // timer is not.
+        if (FleetRunIsLive()) { _autoFixBadPolls = 0; return; }
+
+        _autoFixBadPolls++;
+        if (_autoFixBadPolls < AUTOFIX_CONSECUTIVE_POLLS) return;
+        if (_autoFixAttempts >= AUTOFIX_MAX_ATTEMPTS) return;   // the button is the way on
+        if (_fixRunning) return;
+
+        _autoFixAttempts++;
+        _autoFixBadPolls = 0;
+        try
+        {
+            if (!Dispatcher.HasShutdownStarted)
+                Dispatcher.BeginInvoke(new Action(delegate { RunFix(); }));
+        }
+        catch (Exception) { }
     }
 
     // Sign-in and Agent, from what the last capture established rather than from tabs.
