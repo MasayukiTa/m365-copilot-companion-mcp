@@ -33,7 +33,14 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 #: Directories whose contents the server actually imports. Not the whole repo: a benchmark log
 #: or a test file being newer than the process says nothing about the server's behaviour, and a
 #: check that cries stale for those gets ignored, which is worse than not having it.
-WATCHED = ("tools", "relay", "bench")
+#:
+#: VERIFIED RATHER THAN ASSUMED. The first version listed bench/ as well, and immediately
+#: reported four bench files as making the server stale -- which is exactly the crying-wolf this
+#: comment warns against, in the same file. main.py's own import graph names two local
+#: packages, tools and relay, and bench is not one of them: those are standalone scripts the
+#: server never loads. The list is checked against that graph by a test, so adding an import
+#: cannot silently take a directory out of scope.
+WATCHED = ("tools", "relay")
 
 #: Files that are not imported by the running server even though they sit in a watched
 #: directory. A test file changing cannot change what the server does.

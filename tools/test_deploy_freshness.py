@@ -118,3 +118,31 @@ def test_it_answers_about_this_machine_without_raising():
     r = F.check()
     assert r["fresh"] in (True, False, None)
     assert isinstance(r["stale_files"], list)
+
+
+def test_the_watched_directories_are_the_ones_the_server_imports():
+    """CHECKED AGAINST THE IMPORT GRAPH, not against memory. The first version of WATCHED
+    included bench/, and the check immediately reported four bench scripts as making the
+    server stale -- the exact crying-wolf the module warns about, in the module that warns
+    about it. bench/ files are standalone scripts main.py never loads.
+
+    This also fails the other way: if the server starts importing a package that is not
+    watched, a change there would go unnoticed, which is the original defect returning."""
+    import ast
+    import io as _io
+    import os as _os
+    repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    tree = ast.parse(_io.open(_os.path.join(repo, "main.py"), encoding="utf-8").read())
+    tops = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom) and n.module:
+            tops.add(n.module.split(".")[0])
+        elif isinstance(n, ast.Import):
+            for al in n.names:
+                tops.add(al.name.split(".")[0])
+    # A DIRECTORY IN THE REPO IS ENOUGH. Requiring __init__.py here was wrong and the test
+    # said so: relay is a namespace package without one, so the filter dropped it and the
+    # assertion accused WATCHED of listing a directory the server does import.
+    local = {t for t in tops if _os.path.isdir(_os.path.join(repo, t))}
+    assert local == set(F.WATCHED), (
+        "WATCHED is %s but main.py imports %s" % (sorted(F.WATCHED), sorted(local)))
