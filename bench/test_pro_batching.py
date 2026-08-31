@@ -135,3 +135,87 @@ def test_the_fleet_is_told_the_batch_size_not_a_constant():
                   encoding="utf-8").read()
     assert '"--max-concurrent", str(len(group))' in src, \
         "the fleet's width no longer follows the batch it was given"
+
+
+# -- discarding a batch, which was failing silently ---------------------------------------
+
+def test_a_worktree_with_read_only_files_is_actually_deleted(tmp_path, monkeypatch):
+    """THE DEFECT THIS REPLACES. Windows marks the files under .git read-only and rmtree
+    cannot unlink those. With ignore_errors=True each batch left 4-8 MB behind and said
+    nothing; eight batches in, eight directories were still there and the log had never
+    mentioned it once. A cleanup whose failure mode is silence is not a cleanup."""
+    import os
+    import stat
+    work = tmp_path / "work" / "p00_abc" / ".git" / "objects"
+    work.mkdir(parents=True)
+    f = work / "pack"
+    f.write_bytes(b"x" * 100)
+    os.chmod(str(f), stat.S_IREAD)
+    monkeypatch.setattr(C, "SW", str(tmp_path))
+    logged = []
+    monkeypatch.setattr(C, "log", logged.append)
+
+    C._discard()
+
+    assert not (tmp_path / "work" / "p00_abc").exists()
+    assert not any("could not delete" in str(m) for m in logged)
+
+
+def test_what_survives_deletion_is_reported(tmp_path, monkeypatch):
+    """A directory a live process still holds cannot be removed, and that is exactly the case
+    worth naming -- it means a worker outlived its batch."""
+    import os
+    work = tmp_path / "work" / "p01_held"
+    work.mkdir(parents=True)
+    (work / "f").write_bytes(b"x")
+    monkeypatch.setattr(C, "SW", str(tmp_path))
+    monkeypatch.setattr(C.shutil, "rmtree", lambda *a, **k: None)
+    logged = []
+    monkeypatch.setattr(C, "log", logged.append)
+
+    C._discard()
+
+    assert any("could not delete 1 worktree dir(s)" in str(m) and "p01_held" in str(m)
+               for m in logged)
+
+
+# -- making room instead of moving the line ------------------------------------------------
+
+def test_a_tight_disk_reclaims_before_it_gives_up(monkeypatch):
+    """The standing rule is to free space, not to lower the floor. The cycle must therefore
+    read the floor again AFTER reclaiming, and only stop if it is still short."""
+    seen = {"trimmed": 0}
+
+    def fake_trim():
+        seen["trimmed"] += 1
+        return 609.0, ["copilot-eval-edge: freed 609 MB"]
+
+    import relay.edge_recover as E
+    monkeypatch.setattr(E, "trim_profile_caches", fake_trim)
+    monkeypatch.setattr(C, "free_gb", lambda *a: 3.9)
+    monkeypatch.setattr(C, "log", lambda *a: None)
+
+    assert C._reclaim(3.0) == 3.9
+    assert seen["trimmed"] == 1
+
+
+def test_a_failing_reclaim_does_not_kill_the_run(monkeypatch):
+    """A benchmark must not die trying to make room for itself."""
+    import relay.edge_recover as E
+    monkeypatch.setattr(E, "trim_profile_caches",
+                        lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(C, "log", lambda *a: None)
+    assert C._reclaim(3.0) == 3.0
+
+
+def test_the_floor_itself_is_never_relaxed_to_get_a_batch_through():
+    """SOURCE-LEVEL, stated as such. Lowering the floor is the one remedy this repository
+    has a standing rule against, and it would look exactly like a small edit here."""
+    import io
+    import os
+    src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pro_cycle.py"),
+                  encoding="utf-8").read()
+    body = src[src.index("for n, group in enumerate(batches"):]
+    body = body[:body.index("log(\"-\" * 72)")]
+    assert "DISK_FLOOR_GB =" not in body, "the floor is being reassigned to fit a batch"
+    assert body.count("_reclaim(") == 1
