@@ -517,3 +517,22 @@ def test_an_unreachable_toolchain_is_reported_not_omitted(monkeypatch):
     out = dict(C._clear_toolchain_caches())
     assert out["go module cache"] is None
     assert out["npm cache"] is None
+
+
+def test_a_refused_oversize_patch_is_not_retried_forever(tmp_path, monkeypatch):
+    """A blanked patch looks identical to "produced nothing", but the worker produced far too
+    much rather than nothing, and repeating it does not help: 3,054,501 bytes on the first
+    attempt and 74,850,968 on the second, each costing a full batch slot on the quota that is
+    the binding constraint here. Retrying it is now a deliberate act."""
+    import json
+    p = tmp_path / "preds.json"
+    p.write_text(json.dumps([
+        {"instance_id": "produced-nothing", "patch": ""},
+        {"instance_id": "produced-too-much", "patch": "", "refused": "oversize: 74850968 bytes"},
+        {"instance_id": "fine", "patch": "diff --git a/x b/x\n"},
+    ]), encoding="utf-8")
+    monkeypatch.setattr(C, "PREDS", str(p))
+    got = C.captured_ids()
+    assert "fine" in got
+    assert "produced-too-much" in got, "an oversize refusal is still retried every run"
+    assert "produced-nothing" not in got, "a genuine no-op must still be retried"
