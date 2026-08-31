@@ -3026,10 +3026,21 @@ class CockpitWindow : Window
         psi.RedirectStandardError = true;
         using (var p = System.Diagnostics.Process.Start(psi))
         {
-            // Drain streams so the child can't block on a full pipe; bounded wait.
-            try { p.StandardOutput.ReadToEnd(); } catch (Exception) { }
-            try { p.StandardError.ReadToEnd(); } catch (Exception) { }
-            try { p.WaitForExit(120000); } catch (Exception) { }
+            // BOTH STREAMS AT ONCE, AND A TIMEOUT THAT ACTUALLY BOUNDS THE CALL.
+            //
+            // Draining stdout to completion before touching stderr deadlocks if the child
+            // fills the stderr pipe: it blocks writing, so it never closes stdout, so the
+            // reader never returns -- and WaitForExit, the only bounded step, is never
+            // reached. Python writes to stderr here on every call (import-time deprecation
+            // warnings), so that buffer is never empty. This pattern was fixed once in
+            // RunPyModule and left in place at three other call sites; a wedge here leaves
+            // _fixRunning true for ever, which disables the automatic repair AND the button.
+            p.OutputDataReceived += delegate (object _s, System.Diagnostics.DataReceivedEventArgs e) { };
+            p.ErrorDataReceived += delegate (object _s, System.Diagnostics.DataReceivedEventArgs e) { };
+            try { p.BeginOutputReadLine(); p.BeginErrorReadLine(); } catch (Exception) { }
+            bool exited = false;
+            try { exited = p.WaitForExit(120000); } catch (Exception) { }
+            if (!exited) { try { p.Kill(); } catch (Exception) { } }
         }
     }
 
@@ -3071,11 +3082,26 @@ class CockpitWindow : Window
         psi.RedirectStandardError = true;
         try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
         stdoutText = "";
+        var sbOut = new StringBuilder();
         using (var p = System.Diagnostics.Process.Start(psi))
         {
-            try { stdoutText = p.StandardOutput.ReadToEnd(); } catch (Exception) { }
-            try { p.StandardError.ReadToEnd(); } catch (Exception) { }
-            try { if (!p.WaitForExit(600000)) return -1; } catch (Exception) { return -1; }
+            // BOTH STREAMS AT ONCE, AND A TIMEOUT THAT ACTUALLY BOUNDS THE CALL.
+            //
+            // Draining stdout to completion before touching stderr deadlocks if the child
+            // fills the stderr pipe: it blocks writing, so it never closes stdout, so the
+            // reader never returns -- and WaitForExit, the only bounded step, is never
+            // reached. Python writes to stderr here on every call (import-time deprecation
+            // warnings), so that buffer is never empty. This pattern was fixed once in
+            // RunPyModule and left in place at three other call sites; a wedge here leaves
+            // _fixRunning true for ever, which disables the automatic repair AND the button.
+            p.OutputDataReceived += delegate (object _s, System.Diagnostics.DataReceivedEventArgs e)
+            { if (e.Data != null) lock (sbOut) sbOut.AppendLine(e.Data); };
+            p.ErrorDataReceived += delegate (object _s, System.Diagnostics.DataReceivedEventArgs e) { };
+            try { p.BeginOutputReadLine(); p.BeginErrorReadLine(); } catch (Exception) { }
+            bool exited = false;
+            try { exited = p.WaitForExit(600000); } catch (Exception) { }
+            lock (sbOut) stdoutText = sbOut.ToString();
+            if (!exited) { try { p.Kill(); } catch (Exception) { } return -1; }
             try { return p.ExitCode; } catch (Exception) { return -1; }
         }
     }
@@ -3109,11 +3135,26 @@ class CockpitWindow : Window
         psi.RedirectStandardOutput = true;
         psi.RedirectStandardError = true;
         string stdoutText = "";
+        var sbOut3 = new StringBuilder();
         using (var p = System.Diagnostics.Process.Start(psi))
         {
-            try { stdoutText = p.StandardOutput.ReadToEnd(); } catch (Exception) { }
-            try { p.StandardError.ReadToEnd(); } catch (Exception) { }
-            try { p.WaitForExit(180000); } catch (Exception) { }
+            // BOTH STREAMS AT ONCE, AND A TIMEOUT THAT ACTUALLY BOUNDS THE CALL.
+            //
+            // Draining stdout to completion before touching stderr deadlocks if the child
+            // fills the stderr pipe: it blocks writing, so it never closes stdout, so the
+            // reader never returns -- and WaitForExit, the only bounded step, is never
+            // reached. Python writes to stderr here on every call (import-time deprecation
+            // warnings), so that buffer is never empty. This pattern was fixed once in
+            // RunPyModule and left in place at three other call sites; a wedge here leaves
+            // _fixRunning true for ever, which disables the automatic repair AND the button.
+            p.OutputDataReceived += delegate (object _s, System.Diagnostics.DataReceivedEventArgs e)
+            { if (e.Data != null) lock (sbOut3) sbOut3.AppendLine(e.Data); };
+            p.ErrorDataReceived += delegate (object _s, System.Diagnostics.DataReceivedEventArgs e) { };
+            try { p.BeginOutputReadLine(); p.BeginErrorReadLine(); } catch (Exception) { }
+            bool exited = false;
+            try { exited = p.WaitForExit(180000); } catch (Exception) { }
+            lock (sbOut3) stdoutText = sbOut3.ToString();
+            if (!exited) { try { p.Kill(); } catch (Exception) { } }
         }
         return stdoutText;
     }
