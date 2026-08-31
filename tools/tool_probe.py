@@ -411,6 +411,35 @@ def verify_probe_reply(reply_text: Optional[str], expected_token: str,
     return False, "error"
 
 
+#: Kinds that mean "a probe is running", not "a probe finished". They are recorded as a flag
+#: beside the last verdict; see record_probe.
+_TRANSITIONAL = ("starting", "checking")
+
+
+def _record_probe_started(kind: str, detail: str = "", ts: Optional[float] = None) -> None:
+    """Mark a probe as in flight WITHOUT discarding the last result. Never raises."""
+    try:
+        now = time.time() if ts is None else ts
+        with _LOCK:
+            try:
+                with open(str(_PROBE_FILE), encoding="utf-8") as fh:
+                    payload = json.load(fh)
+                if not isinstance(payload, dict):
+                    payload = {}
+            except Exception:
+                payload = {}
+            payload["probing_since"] = now
+            payload["probing_kind"] = kind
+            payload["probing_detail"] = detail or ""
+            _PROBE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = str(_PROBE_FILE) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, str(_PROBE_FILE))
+    except Exception:
+        pass
+
+
 def record_probe(ok: bool, kind: str, detail: str = "", ts: Optional[float] = None,
                  alive: Optional[bool] = None, inbound: Optional[bool] = None) -> None:
     """Record the outcome of one tool-call self-probe and best-effort persist it to
@@ -426,6 +455,19 @@ def record_probe(ok: bool, kind: str, detail: str = "", ts: Optional[float] = No
     back empty", and those two must not be read the same way. Inferring liveness from `kind`
     alone got exactly that wrong. None means the caller had no reply to judge (the transitional
     "starting"/"checking" records), and readers must treat it as no evidence."""
+    if kind in _TRANSITIONAL:
+        # A PROBE STARTING IS NOT A PROBE RESULT, and writing it as one destroyed the last
+        # one. `record_probe(False, "checking", ...)` replaced the whole file, so for the
+        # 30-180s of a real round trip there was no recorded verdict at all -- the health dot
+        # left green every cycle and came back, on a schedule, with nothing wrong. That is
+        # worse than a missing signal: a dot that changes every ten minutes for no reason is a
+        # dot people stop reading, and it was reported as a fault by the operator, correctly.
+        #
+        # The transitional state is now a FLAG BESIDE the last verdict rather than a
+        # replacement for it. Readers keep showing what was last actually measured and may
+        # note that a probe is in flight.
+        _record_probe_started(kind, detail, ts)
+        return
     try:
         now = time.time() if ts is None else ts
         payload = {"ts": now, "ok": bool(ok), "kind": kind, "detail": detail or ""}

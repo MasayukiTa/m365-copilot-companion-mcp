@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -118,6 +119,10 @@ def test_locally_created_skill_is_trusted_exact_digest(tmp_path, monkeypatch):
 
 
 def test_discovers_native_and_claude_compatible_roots(tmp_path, monkeypatch):
+    # OPTS IN, because the personal scope is no longer served by default -- see
+    # test_the_personal_library_is_not_served_by_default. What this test still checks is that
+    # all four roots work and carry the right scope WHEN they are served.
+    monkeypatch.setenv("MCP_SKILLS_INCLUDE_PERSONAL", "1")
     store = _store(tmp_path, monkeypatch)
     project = tmp_path / "project"
     home = tmp_path / "home"
@@ -141,6 +146,9 @@ def test_discovers_native_and_claude_compatible_roots(tmp_path, monkeypatch):
 
 
 def test_native_and_personal_roots_win_same_name_collisions(tmp_path, monkeypatch):
+    # Same opt-in as above: precedence among the four roots is unchanged, but the personal
+    # pair only exists when the operator asks for it.
+    monkeypatch.setenv("MCP_SKILLS_INCLUDE_PERSONAL", "1")
     store = _store(tmp_path, monkeypatch)
     project = tmp_path / "project"
     home = tmp_path / "home"
@@ -179,3 +187,49 @@ def test_invalid_name_is_rejected(tmp_path):
     folder = _write_skill(tmp_path, name="Bad_Name")
     with pytest.raises(SkillError, match="lowercase"):
         load_bundle(folder)
+
+
+# --- the personal scope, which this server should not be serving ---------------------------
+
+def test_the_personal_library_is_not_served_by_default(monkeypatch, tmp_path):
+    """MEASURED LEAK. ~/.claude/skills is the library of whatever assistant the OPERATOR runs
+    on this machine, and this server hands Skills to agents that have nothing to do with it.
+
+    On 2026-08-31, a real SWE-bench goal --
+
+        skill_match("You are fixing a real bug in ... **ansible/ansible** ...")
+            -> delegation-commander   score 1.0    (personal scope)
+
+    -- returned a Claude Code playbook telling the worker to dispatch the work to subagents it
+    does not have. It won at 1.0 ahead of every project Skill because personal roots come last
+    and last wins, and the trust check could not catch it: that library is legitimately trusted
+    where it lives.
+    """
+    monkeypatch.delenv("MCP_SKILLS_INCLUDE_PERSONAL", raising=False)
+    scopes = {scope for scope, _root in SkillStore(str(tmp_path)).roots()}
+    assert scopes == {"project"}, "a personal root is being served: %s" % scopes
+
+
+def test_nothing_discovered_by_default_comes_from_the_personal_scope(monkeypatch):
+    """The roots test above is about configuration; this is about what actually comes back."""
+    monkeypatch.delenv("MCP_SKILLS_INCLUDE_PERSONAL", raising=False)
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for skill in SkillStore(repo).discover():
+        assert skill.scope != "personal", "%s came from the personal library" % skill.name
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES", "on"])
+def test_an_operator_can_opt_the_personal_library_back_in(monkeypatch, tmp_path, value):
+    """A decision with a name, rather than an accident of path layout."""
+    monkeypatch.setenv("MCP_SKILLS_INCLUDE_PERSONAL", value)
+    scopes = {scope for scope, _root in SkillStore(str(tmp_path)).roots()}
+    assert "personal" in scopes
+
+
+@pytest.mark.parametrize("value", ["", "0", "no", "off", "maybe"])
+def test_anything_that_is_not_an_opt_in_leaves_it_off(monkeypatch, tmp_path, value):
+    """Unrecognised must read as off. The failure direction is asymmetric: off costs a Skill
+    the operator has to opt into, on serves another product's playbooks to fleet workers."""
+    monkeypatch.setenv("MCP_SKILLS_INCLUDE_PERSONAL", value)
+    scopes = {scope for scope, _root in SkillStore(str(tmp_path)).roots()}
+    assert scopes == {"project"}

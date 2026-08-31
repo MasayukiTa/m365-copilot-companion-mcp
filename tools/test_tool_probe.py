@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from tools import tool_probe
 
 
@@ -91,7 +93,11 @@ def test_classify_consent_marker_precedes_ok_token_check():
 def test_record_then_get_summary_roundtrip_for_every_kind(monkeypatch, tmp_path):
     probe_file = tmp_path / "tool_probe.json"
     monkeypatch.setattr(tool_probe, "_PROBE_FILE", probe_file)
+    # TRANSITIONAL KINDS ARE NOT VERDICTS, and this loop used to insist they were. See
+    # test_a_probe_in_flight_does_not_erase_the_last_verdict below for what they do instead.
     for kind in tool_probe.PROBE_KINDS:
+        if kind in tool_probe._TRANSITIONAL:
+            continue
         ok = (kind == "answer")
         tool_probe.record_probe(ok, kind, detail="d-%s" % kind, ts=1000.0)
         summary = tool_probe.get_summary(now=1005.0)
@@ -99,6 +105,60 @@ def test_record_then_get_summary_roundtrip_for_every_kind(monkeypatch, tmp_path)
         assert summary["tool_kind"] == kind
         assert summary["tool_ts"] == 1000.0
         assert summary["tool_age_s"] == 5.0
+
+
+@pytest.mark.parametrize("kind", ["checking", "starting"])
+def test_a_probe_in_flight_does_not_erase_the_last_verdict(monkeypatch, tmp_path, kind):
+    """THE FLICKER, AND WHY IT WAS A FAULT.
+
+    `record_probe(False, "checking", ...)` replaced the whole record, so for the 30-180s of a
+    real round trip there was NO measured result on disk. The cockpit's tool dot therefore
+    left green every probe cycle and came back -- on a schedule, with nothing wrong. The
+    operator saw it and said a dot that changes periodically is not "no fault"; that is right,
+    and it is worse than a missing signal, because a dot that moves for no reason is one people
+    stop reading.
+
+    The in-flight state is now a flag beside the last verdict.
+    """
+    probe_file = tmp_path / "tool_probe.json"
+    monkeypatch.setattr(tool_probe, "_PROBE_FILE", probe_file)
+
+    tool_probe.record_probe(True, "answer", detail="the real result", ts=1000.0,
+                            alive=True, inbound=True)
+    tool_probe.record_probe(False, kind, detail="in progress", ts=1100.0)
+
+    summary = tool_probe.get_summary(now=1150.0)
+    assert summary["tool_ok"] is True, "the in-flight record erased the verdict"
+    assert summary["tool_kind"] == "answer"
+    assert summary["tool_ts"] == 1000.0
+
+    import json
+    raw = json.loads(probe_file.read_text(encoding="utf-8"))
+    assert raw["probing_since"] == 1100.0, "the in-flight state was not recorded at all"
+    assert raw["probing_kind"] == kind
+    assert raw["detail"] == "the real result", "the verdict's own fields were overwritten"
+
+
+def test_an_in_flight_flag_with_no_prior_result_is_still_safe(monkeypatch, tmp_path):
+    """The first probe of a fresh install has nothing to preserve. It must not invent one."""
+    probe_file = tmp_path / "tool_probe.json"
+    monkeypatch.setattr(tool_probe, "_PROBE_FILE", probe_file)
+    tool_probe.record_probe(False, "checking", detail="first ever", ts=1000.0)
+    summary = tool_probe.get_summary(now=1005.0)
+    assert summary["tool_ts"] is None, "an in-flight marker was read as a result"
+    assert summary["tool_ok"] in (None, False)
+
+
+def test_the_next_real_result_still_lands(monkeypatch, tmp_path):
+    """The flag must not make the record write-once."""
+    probe_file = tmp_path / "tool_probe.json"
+    monkeypatch.setattr(tool_probe, "_PROBE_FILE", probe_file)
+    tool_probe.record_probe(True, "answer", detail="old", ts=1000.0)
+    tool_probe.record_probe(False, "checking", ts=1100.0)
+    tool_probe.record_probe(False, "timeout", detail="new", ts=1200.0)
+    summary = tool_probe.get_summary(now=1250.0)
+    assert summary["tool_kind"] == "timeout"
+    assert summary["tool_ts"] == 1200.0
 
 
 def test_record_probe_writes_expected_json_shape(monkeypatch, tmp_path):
