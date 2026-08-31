@@ -32,8 +32,29 @@ WHAT THE SERVER ACTUALLY HAS is the MCP client that called it. `sampling` asks t
 run one completion; `elicit` asks the human at that client a question. Both are in the protocol
 and in the installed fastmcp (2.14.7, verified), both need no install, no sandbox, no
 administrator, and no second machine -- which are the constraints this deployment is under.
-Whether a given client implements them is a property of that client and is not knowable from
-here, so an unsupported client must read as "no judge" and never as "allowed".
+
+AND THIS DEPLOYMENT'S CLIENT DECLARES NEITHER. Measured 2026-08-31 from inside a real request,
+during a live job that went agent -> tool -> answer and returned a correct result:
+
+    backend            sampling      configured     true
+    in_request         true          loop           true
+    client_sampling    FALSE
+    client_elicitation FALSE
+
+So on this deployment the sampling backend cannot ask anything and the elicitation channel
+cannot reach anybody. Every non-exempt command records REQUIRE_HUMAN / unavailable, which
+shadow logs harmlessly -- and which `enforce` would turn into a refusal of every command that
+is not provably read-only. That would disable shell execution, which is the product's whole
+point. So MCP_JUDGE_MODE MUST NOT be set to enforce on this deployment until a transport
+exists, and the layer's honesty is what makes that visible rather than a surprise in
+production.
+
+THE PATH THAT REMAINS UNBUILT: bridge/copilot_bridge.py runs in its own process on this
+machine, already holds a Copilot route, and already answers HTTP on MCP_BRIDGE_PORT. A `bridge`
+backend would ask it for one judging turn. What has to be settled first is conversation
+separation -- the bridge drives one long-lived conversation, so a judging turn would inherit
+whatever it has been doing, and "a fresh call with no inherited context" is the property that
+makes the judge worth having. Recorded here rather than half-built.
 """
 from __future__ import annotations
 
