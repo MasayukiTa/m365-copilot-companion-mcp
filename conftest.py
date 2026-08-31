@@ -17,6 +17,107 @@ fixture's stub is just a (harmless) no-op capture, not the real emitter.
 import pytest
 
 
+#: Shared operational state that a test must never write to, as DATA rather than as a series
+#: of try-blocks: {"module path": {"CONSTANT": "filename under the tmp base"}}.
+#:
+#: WHY IT IS A LIST AT ALL, AND WHY THAT IS THE PROBLEM. Five times a new shared file appeared,
+#: a test filled it, and an entry was added here afterwards -- the routing record, the refusal
+#: log, the pending queue, the summary cache, and then capture_status.json, which reached a
+#: screen: a stub context's AttributeError was written into the file the cockpit's sign-in dot
+#: reads, and the operator saw the dot move while nothing was wrong.
+#:
+#: A hand-maintained allowlist fails open by construction. test_live_record_isolation.py walks
+#: relay/, tools/ and bridge/ for module-level constants that build a path under .fleet and
+#: requires every one to appear either here or in DELIBERATELY_NOT_REDIRECTED. A new one fails
+#: that test until somebody decides which it is -- so the silence becomes a decision.
+#: Modules that are expensive to import (the bridge takes ~4s) and are therefore patched only
+#: when a test has already imported them. A test that never imports one cannot write through it.
+ONLY_IF_ALREADY_IMPORTED = frozenset({"bridge.copilot_bridge", "bridge.session_store"})
+
+LIVE_RECORD_REDIRECTS = {
+    "tools.lock_state": {"_LOG_FILE": "lock_refusals.jsonl",
+                         "_STATE_FILE": "lock_state.json"},
+    "relay.socket_route": {"DEFAULT_LOG": "socket_route.jsonl"},
+    "relay.selfimprove.pending": {"QUEUE_PATH": "pending_decisions.jsonl"},
+    "relay.selfimprove.record_summary": {"CACHE_PATH": "record_summaries.json"},
+    "relay.capture_status": {"STATUS_PATH": "capture_status.json"},
+    "relay.selfimprove.ledger": {"DEFAULT_PATH": "hypotheses.jsonl"},
+    "relay.selfimprove.compare": {"QUEUE_PATH": "compare_queue.jsonl",
+                                  "RESULTS_PATH": "compare_results.jsonl"},
+    "relay.selfimprove.runtime_config": {"ACTIVE_PATH": "active_manifest.json"},
+    "relay.settle_replay": {"DEFAULT_TRACE": "settle_trace.jsonl"},
+    "relay.task_router": {"APPROVED_JOBS_FILE": "approved_jobs.json",
+                          "TASKS": "tasks.jsonl"},
+    "tools.auth_stats": {"_STATS_FILE": "auth_stats.json"},
+    "tools.skill_ops": {"_SKILL_USE_LOG": "skill_use.jsonl"},
+    "relay.mechanism_telemetry": {"LOG": "mechanisms.jsonl"},
+    "relay.ownership": {"LEDGER": "ownership.jsonl"},
+    "relay.edge_reconnect": {"CONN_URL_CACHE": "conn_manager_url.txt"},
+    "relay.selfimprove.branches": {"DEFAULT_PATH": "branches.jsonl"},
+    "relay.copilot_autopilot_relay": {"_SEND_STAGE_PATH": "send_stage.jsonl",
+                                      "_SETTLE_TRACE_PATH": "settle_trace_car.jsonl"},
+    # A DIRECTORY OF CAPTURED TOKENS AND REQUEST TEMPLATES. Not a log -- the one place in this
+    # list where a stray test write would touch live credentials material.
+    "relay.profile_token": {"TEMPLATE_DIR": "templates"},
+    "bridge.copilot_bridge": {"DELETE_LOG": "delete_log.jsonl",
+                              "FLEET_CONVS_PATH": "fleet_convs.json",
+                              "RECYCLE_SAMPLES_PATH": "recycle_samples.jsonl",
+                              "_SETTLE_RESET_TRACE_PATH": "settle_reset_trace.jsonl"},
+    "bridge.session_store": {"SESS_DIR": "sessions"},
+    "tools.tool_probe": {"_PROBE_FILE": "tool_probe.json",
+                         "PROBE_FAILURE_JOURNAL": "tool_probe_failures.jsonl",
+                         "_INBOUND_PATH": "probe_inbound.json"},
+}
+
+#: Constants that build a .fleet path but are NOT redirected, each with the reason. Being on
+#: this list is a claim that a test writing there is harmless -- so it is short, and each line
+#: has to be defensible.
+DELIBERATELY_NOT_REDIRECTED = {
+    ("tools.contract_gate", "_FLEET_DIR"):
+        "a directory, not a record; the gate's own files are redirected by the tests that "
+        "write them and the contract file is already per-test",
+    ("tools.folder_policy", "POLICY_FILE"):
+        "read by the policy gate and written only by the operator's console; a test that "
+        "wrote it would be testing the console, which none do",
+    ("relay.selfimprove.loop", "SWEDIR"):
+        "a benchmark working directory, not an operator record",
+    ("relay.selfimprove.quality_loop", "SWEDIR"):
+        "a benchmark working directory, not an operator record",
+    ("relay.selfimprove.l2_cron", "DEFAULT_LOCK"):
+        "a lock file whose whole purpose is to be taken and released; tests that exercise it "
+        "pass their own path",
+    ("relay.selfimprove.dashboard", "_DEFAULT_GRADE"):
+        "an input the dashboard READS; nothing writes it",
+    ("relay.selfimprove.dashboard", "_DEFAULT_JSON_OUT"):
+        "derived output, regenerated on demand from inputs that are themselves redirected",
+    ("relay.selfimprove.dashboard", "_DEFAULT_REPORTS_GLOB"):
+        "a glob of inputs the dashboard READS; nothing writes it",
+    ("relay.selfimprove.usage", "_DEFAULT_HISTORY"):
+        "an input read from the fleet's own history; nothing here writes it",
+    ("relay.selfimprove.usage", "_DEFAULT_STATUS"):
+        "an input read from the fleet's own status; nothing here writes it",
+    # AN IDENTIFIER, NOT A WRITE TARGET -- and redirecting it broke the thing it names.
+    # note_inbound recognises a probe's own tool call by looking for this directory's NAME in
+    # the call's arguments, so moving it changes what the matcher matches on: the redirect made
+    # test_the_probes_own_call_is_stamped fail, which is the check saying the classification
+    # was wrong rather than the code. Callers that write challenges pass their own base_dir.
+    ("tools.tool_probe", "_CHALLENGE_DIR"):
+        "a directory NAME used as the marker note_inbound matches on; redirecting it changes "
+        "the identifier, and writers take an explicit base_dir",
+    ("relay.selfimprove.calibration", "_DEFAULT_GRADE_PATH"):
+        "a grading result the calibration READS; nothing here writes it",
+    # NOT PATHS AT ALL. These name .fleet inside an EXCLUSION set -- the directories a walker
+    # must skip -- so they are the opposite of a write target. They match the detector because
+    # it looks for the string, which is the right side to err on.
+    ("relay.folder_coder", "SKIP_DIRS"):
+        "an exclusion set naming .fleet as a directory to skip, not a path into it",
+    ("relay.project_introspect", "_SKIP"):
+        "an exclusion set naming .fleet as a directory to skip, not a path into it",
+    ("relay.repo_map", "_SKIP"):
+        "an exclusion set naming .fleet as a directory to skip, not a path into it",
+}
+
+
 @pytest.fixture(autouse=True)
 def _no_writes_to_the_live_records(tmp_path_factory, monkeypatch):
     """Autouse for every test in the repo: point the shared operational records at tmp.
@@ -36,68 +137,33 @@ def _no_writes_to_the_live_records(tmp_path_factory, monkeypatch):
     two tests in a row would otherwise see each other's lines.
     """
     base = tmp_path_factory.mktemp("live_records")
-    try:
-        from pathlib import Path
-
-        import tools.lock_state as lock_state
-        monkeypatch.setattr(lock_state, "_LOG_FILE", Path(str(base / "lock_refusals.jsonl")),
-                            raising=False)
-        monkeypatch.setattr(lock_state, "_STATE_FILE", Path(str(base / "lock_state.json")),
-                            raising=False)
-    except Exception:
-        pass
-
-    try:
-        import relay.socket_route as socket_route
-        monkeypatch.setattr(socket_route, "DEFAULT_LOG", str(base / "socket_route.jsonl"),
-                            raising=False)
-    except Exception:
-        pass
-
-    # THE NEXT ONE, CAUGHT BY THE LAYER THAT EXISTS FOR IT. Wiring frozen.py's refusal to the
-    # pending queue gave a test that runs the real CLI a route into the operator's live queue:
-    # a proposal about manifest.py, reason "routine", appeared among the real decisions within
-    # minutes. That is the fourth time a test has written to a live record here, which is the
-    # whole reason this fixture exists -- so the entry goes in here rather than in the one
-    # test that happened to trip it.
-    try:
-        import relay.selfimprove.pending as pending
-        monkeypatch.setattr(pending, "QUEUE_PATH", str(base / "pending_decisions.jsonl"),
-                            raising=False)
-    except Exception:
-        pass
-
-    # THE FIFTH, AND THIS ONE REACHED A SCREEN. relay/capture_status.py records whether the
-    # last token capture succeeded, and the cockpit's sign-in dot reads nothing else. A test
-    # driving capture_floor with a stub context called record_failure, which wrote
-    #
-    #     {"ok": false, "kind": "other",
-    #      "reason": "AttributeError: 'FakeContext' object has no attribute 'new_page'"}
-    #
-    # into the operator's live file. The sign-in dot left green while nothing was wrong with
-    # sign-in, and the operator saw it and asked. A false alarm from a test run is worse than
-    # a missing signal: it spends the trust the dot exists to earn.
-    #
-    # THE LIST IS THE PROBLEM AND THIS ENTRY DOES NOT FIX IT. Each of the five was added after
-    # it happened, and 39 places in relay/ and tools/ name .fleet. A hand-maintained
-    # allowlist fails open by construction -- see test_live_record_isolation.py, which turns
-    # the silence into a decision.
-    try:
-        import relay.capture_status as capture_status
-        monkeypatch.setattr(capture_status, "STATUS_PATH",
-                            str(base / "capture_status.json"), raising=False)
-    except Exception:
-        pass
-
-    # Derived rather than a record, but still the operator's file: a test that regenerated it
-    # would replace summaries that cost real model calls, and the failure would look like
-    # nothing at all -- the screen simply falls back to raw reasons.
-    try:
-        import relay.selfimprove.record_summary as record_summary
-        monkeypatch.setattr(record_summary, "CACHE_PATH",
-                            str(base / "record_summaries.json"), raising=False)
-    except Exception:
-        pass
+    # DATA, NOT A SERIES OF TRY-BLOCKS. Each entry used to be its own hand-written block added
+    # after the file it protects had already been written to by a test. The table above is the
+    # same information in a form another test can check for completeness.
+    import importlib
+    import sys as _sys
+    for module_path, consts in LIVE_RECORD_REDIRECTS.items():
+        try:
+            if module_path in ONLY_IF_ALREADY_IMPORTED and module_path not in _sys.modules:
+                # Importing it here would cost every run, including a single-test one, and
+                # this fixture is autouse. A test that never touches the module cannot write
+                # through it either, so there is nothing to protect until it is imported.
+                continue
+            mod = importlib.import_module(module_path)
+        except Exception:
+            continue
+        for const, filename in consts.items():
+            try:
+                current = getattr(mod, const, None)
+                target = base / filename
+                # Match the type the module already uses: a module that stores a Path and
+                # receives a str breaks on `.parent`, and one that stores a str and receives a
+                # Path breaks on concatenation. Neither failure would look like this fixture.
+                from pathlib import Path as _P
+                value = _P(str(target)) if isinstance(current, _P) else str(target)
+                monkeypatch.setattr(mod, const, value, raising=False)
+            except Exception:
+                pass
 
     yield base
 

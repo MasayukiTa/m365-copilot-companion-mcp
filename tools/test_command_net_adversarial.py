@@ -51,6 +51,14 @@ CASES = [
     ("ps",      r"rm -r -fo .", True),
     ("ps",      r"gci . -r | ri -fo", True),
     ("ps",      r"powershell -enc cm0gLXJmIC8=", True),          # 12 chars: `rm -rf /`
+    # DECODE-THEN-EXECUTE, in the languages the -enc argument had been left out of. The first
+    # of these is the real command a benchmark worker wrote into this repository's root on
+    # 2026-08-31 (cmd.txt): 5.7 KB of base64 that decoded to a harmless NodeBB test stub. It
+    # was harmless and it was unreadable, and the net had no way to know which.
+    ("ps",      "node -e \"eval(Buffer.from('aGk=','base64').toString())\"", True),
+    ("ps",      "node -e \"eval(atob('aGk='))\"", True),
+    ("ps",      "node -e \"new Function(Buffer.from(x,'base64').toString())()\"", True),
+    ("ps",      "python -c \"exec(base64.b64decode(s))\"", True),
     ("ps",      r"& ('Remove-'+'Item') -Recurse -Force .", True),
     ("ps",      r"sc.exe delete WinDefend", True),
     # composition that hides the effect behind a harmless first word
@@ -112,6 +120,9 @@ CASES = [
     ("benign",  r"docker run -e DATABASE_URL=postgres://x app", False),
     ("benign",  "python -c \"import os; print(os.environ.get('PATH'))\"", False),
     ("benign",  "node -e \"console.log(process.version)\"", False),
+    # Decoding and PRINTING is not executing, and the pattern must not confuse the two.
+    ("benign",  "node -e \"console.log(Buffer.from(x,'base64').toString())\"", False),
+    ("benign",  "python -c \"import base64; print(base64.b64decode(s))\"", False),
     # A sentence ABOUT the gate is not a use of it -- an earlier version fired on this, and a
     # gate that trips on a message about itself is training for approving unread.
     ("benign",  r"Write-Output 'iex is disabled by policy'", False),
