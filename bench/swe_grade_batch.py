@@ -153,9 +153,15 @@ def main():
                 inflight[runid] = (inst, time.time() + a.max_wait_min * 60)
                 log("  launched %s (runid=%s) [%d in flight]" % (inst, runid, len(inflight)))
             else:
+                # NAME THE CAUSE, DO NOT DESCRIBE THE SYMPTOM. "launch failed" was reported
+                # for an entire night's grades and read as the eval host being down. The host
+                # had never been addressed: ssh was being run with an empty hostname because
+                # no host was configured. A message that points at the transport when the
+                # problem is configuration sends every reader to the wrong machine.
+                _why = R.configured() or "launch/scp failed"
                 append_result(a.results, {"instance_id": inst, "verdict": "EVALERR",
-                                          "note": "launch/scp failed", "ts": int(time.time())})
-                log("  %s -> EVALERR (launch failed)" % inst)
+                                          "note": _why, "ts": int(time.time())})
+                log("  %s -> EVALERR (%s)" % (inst, _why))
         # poll in-flight
         time.sleep(a.poll_s)
         for runid in list(inflight):

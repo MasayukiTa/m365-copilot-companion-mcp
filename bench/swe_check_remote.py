@@ -31,9 +31,39 @@ import time
 # THE HOST COMES FROM THE ENVIRONMENT, WITH NO DEFAULT. It used to default to the machine's
 # actual name, which put an operator's hostname in a public repository -- and a wrong default
 # here fails obscurely anyway, because ssh resolves it and reports a name nobody recognises.
-SSH_HOST = os.environ.get("EVAL_SSH_HOST", "").strip()
+#
+# THREE FAIL-OPEN LAYERS SAT HERE, AND TOGETHER THEY COST A WHOLE BENCHMARK RUN. Every grade
+# for an entire night returned "EVALERR (launch failed)", which reads as the eval host being
+# down, and was reported that way repeatedly. The host was never contacted at all:
+#
+#   1. .env was never loaded by this module, so a value written there could not arrive;
+#   2. the name here and the name in .env were different, so even a loaded .env missed;
+#   3. the guard that would have said so is behind `__name__ == "__main__"`, and the batch
+#      grader IMPORTS this module. The one path anybody uses skipped the check, built
+#      `ssh` with an empty host, and failed with a message about the wrong thing.
+#
+# A guard that only runs on the path nobody takes is not a guard.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv()
+except Exception:
+    pass
+
+SSH_HOST = (os.environ.get("EVAL_SSH_HOST", "")
+            or os.environ.get("SWE_EVAL_HOST", "")).strip()
+
+
+def configured() -> str:
+    """'' when the eval host is set, otherwise why it is not. Callers check this instead of
+    discovering an empty hostname several layers down as a transport failure."""
+    if SSH_HOST:
+        return ""
+    return ("no eval host is configured: set EVAL_SSH_HOST (or SWE_EVAL_HOST) in .env or the "
+            "environment. Nothing was sent anywhere; this is not the host being unreachable.")
+
+
 if not SSH_HOST and __name__ == "__main__":
-    raise SystemExit("set EVAL_SSH_HOST to the eval host this script should reach over ssh")
+    raise SystemExit(configured())
 DISTRO = os.environ.get("EVAL_HOST_WSL_DISTRO", "Ubuntu")
 REMOTE_DIR = "C:/wsl-setup"                       # Windows-side staging on the eval host
 REMOTE_DIFFS_WIN = REMOTE_DIR + "/diffs"
@@ -50,6 +80,11 @@ _SSH_BASE = ["ssh", "-o", "ConnectTimeout=30", "-o", "BatchMode=yes",
 def _ssh_ps(ps_script, timeout=60, tries=3):
     """Run a PowerShell snippet on the eval host via -EncodedCommand. Returns stdout (NULs
     stripped). Retries on the flaky tunnel; returns '' if every attempt is empty."""
+    if not SSH_HOST:
+        # FAIL CLOSED HERE TOO, not only at __main__. Running `ssh` with an empty host argument
+        # is what produced a night of "launch failed" verdicts about a host that was never
+        # addressed.
+        return ""
     full = "$ProgressPreference='SilentlyContinue';" + ps_script
     b64 = base64.b64encode(full.encode("utf-16-le")).decode()
     for _ in range(tries):
@@ -75,6 +110,8 @@ def _wsl_token(bashcmd, timeout=50):
 
 
 def _scp(local_path, remote_win_path):
+    if not SSH_HOST:
+        return False        # no host: nothing was sent anywhere. See configured().
     try:
         r = subprocess.run(["scp", "-o", "ConnectTimeout=30", "-o", "BatchMode=yes",
                             local_path, "%s:%s" % (SSH_HOST, remote_win_path)],
@@ -87,6 +124,8 @@ def _scp(local_path, remote_win_path):
 def _scp_from(remote_win_path, local_path):
     """Pull a file the eval host->here. scp is reliable where grep-over-SSH silently drops output,
     so the verdict is read back as a file rather than parsed from a remote grep."""
+    if not SSH_HOST:
+        return False        # no host: nothing was fetched from anywhere. See configured().
     try:
         r = subprocess.run(["scp", "-o", "ConnectTimeout=30", "-o", "BatchMode=yes",
                             "%s:%s" % (SSH_HOST, remote_win_path), local_path],
