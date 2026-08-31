@@ -168,7 +168,16 @@ class EvolutionController:
         try:
             if self.baseline_path:
                 return F.frozen_intact(baseline_path=self.baseline_path)
-            return F.frozen_intact()
+            ok, changed = F.frozen_intact()
+            if not ok:
+                # SOMEWHERE THE OPERATOR WILL SEE IT. This abort stops the loop entirely, and
+                # until now it said so only inside a decision object nobody was watching -- the
+                # loop was dead for a day after docs/SECURITY.md was edited and nothing
+                # surfaced it. Queuing puts it beside the other approvals. Only for the REAL
+                # baseline: a run with its own baseline_path is a test, and a test must not
+                # post to the operator's queue.
+                F.queue_mismatch(changed)
+            return ok, changed
         except Exception as exc:
             # Unable to check is not the same as intact, and must not be treated as it.
             return False, ["frozen check failed: %s" % exc]

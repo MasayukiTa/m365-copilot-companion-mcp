@@ -602,6 +602,50 @@ def _queue_refused(excluded, args) -> None:
         pass
 
 
+def queue_mismatch(changed, repo: str = REPO, baseline: str = DEFAULT_BASELINE) -> str:
+    """Put a frozen-set mismatch on the approvals queue. Returns the id, or "". Never raises.
+
+    WHY THIS EXISTS: THE STATE HAD NOWHERE TO BE SEEN. A changed frozen file stops the
+    self-improvement loop dead -- INFRA_ABORT, "the judge was not intact" -- and until now that
+    fact appeared in exactly three places, none of which anybody looks at: three failing tests,
+    a decision object inside a run nobody was watching, and `--verify` if you already knew to
+    run it. Skill approvals surface on the dashboard; this, which is strictly more serious,
+    surfaced nowhere. The operator asked where it was, which is the whole evidence needed.
+
+    Measured 2026-08-31: docs/SECURITY.md was edited in the morning and the loop was dead for
+    the rest of the day. Nothing said so. It was found while investigating three test failures
+    that looked like a broken record-writer.
+
+    `_queue_refused` below already queues one narrow case -- a re-signing that reaches files the
+    standing delegation excludes. That is the rarer event. The common one, an ordinary frozen
+    file legitimately changed, had no path to the queue at all.
+
+    The entry carries the command with the authorization left blank, because the operator's own
+    words are the thing being recorded, and a queue that pre-fills them is recording itself.
+    """
+    try:
+        from relay.selfimprove import pending
+
+        files = sorted(str(c) for c in (changed or []))
+        if not files:
+            return ""
+        reason = ("the frozen set no longer matches its baseline (%s). The self-improvement "
+                  "loop refuses to run until this is resolved: either the change is correct "
+                  "and the constitution should be re-signed, or it is not and the file should "
+                  "be reverted." % ", ".join(files))
+        return pending.add(
+            files, reason,
+            command=("python -m relay.selfimprove.frozen --snapshot --force "
+                     "--reason \"<why this change is correct>\" "
+                     "--authorization \"<your words, verbatim>\""),
+            detail=("Reverting instead: git checkout -- %s\n"
+                    "Checking first:    python -m relay.selfimprove.frozen --verify"
+                    % " ".join(files)),
+        )
+    except Exception:
+        return ""
+
+
 def _main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="relay.selfimprove.frozen",
                                  description="Frozen-constitution checksum guard.")
@@ -710,6 +754,12 @@ def _main(argv: list[str] | None = None) -> int:
     print("frozen set CHANGED -- ABORT")
     for rel in changed:
         print("  changed: %s" % rel)
+    # ON THE QUEUE, NOT ONLY ON THIS SCREEN. Whoever ran --verify already knows; the point is
+    # the operator who did not, and who has no reason to run a command they have never heard
+    # of. See queue_mismatch.
+    pid = queue_mismatch(changed, args.repo, args.baseline)
+    if pid:
+        print("queued for a decision (id %s) -- it will appear with the other approvals" % pid)
     return 1
 
 
