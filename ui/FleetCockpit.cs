@@ -12377,10 +12377,37 @@ class CockpitWindow : Window
             e["transcript"] = S(w, "transcript"); e["name"] = S(w, "name");
             e["turn"] = I(w, "turn"); e["seq"] = _history.Count;
             e["ts"] = NowUnix();   // P2: archived-at timestamp -> date-group subheaders in History
+            CarryTimeline(e, w, started);
             _history.Add(e);
             added = true;
         }
         if (added) SaveHistory();
+    }
+
+    // THE EXECUTION TIMELINE'S ONLY REAL SOURCE, and it was being dropped on the floor.
+    //
+    // The timeline panel has two modes: real phase transitions from `phase_events`, and a
+    // two-point estimate derived from conversation turns, labelled "(会話ターンから推定)". The
+    // real mode has never once fired for a past task -- measured on the live archive: 150 rows,
+    // ZERO with phase_events. The fleet records them per worker, and both archive builders here
+    // copied goal/status/outcome/transcript/turn and simply did not copy this one, so every
+    // history row fell back to the estimate and showed 投入 and 終了 and nothing between.
+    //
+    // ONE HELPER, CALLED FROM BOTH. The two builders had already drifted into the identical
+    // omission; adding the line twice would set them up to drift again the next time a field
+    // is added.
+    void CarryTimeline(Dictionary<string, object> e, Dictionary<string, object> w, string started)
+    {
+        object pe;
+        if (w.TryGetValue("phase_events", out pe) && pe != null) e["phase_events"] = pe;
+        // The run's start, so the timeline has an anchor even when a worker's own first event
+        // is missing. Kept separate from "ts", which is when the row was ARCHIVED -- those are
+        // different moments and conflating them is what made an end time wrong before.
+        if (!string.IsNullOrEmpty(started)) e["run_started"] = started;
+        object st;
+        if (w.TryGetValue("started_ts", out st) && st != null) e["started_ts"] = st;
+        object en;
+        if (w.TryGetValue("ended_ts", out en) && en != null) e["ended_ts"] = en;
     }
 
     // Client-side archive of ONE worker into the persisted history + hide its card. Unlike the
@@ -12403,6 +12430,7 @@ class CockpitWindow : Window
             e["transcript"] = S(w, "transcript"); e["name"] = S(w, "name");
             e["turn"] = I(w, "turn"); e["seq"] = _history.Count;
             e["ts"] = NowUnix();   // P2: archived-at timestamp -> date-group subheaders in History
+            CarryTimeline(e, w, started);
             _history.Add(e);
         }
         _hiddenKeys.Add(WorkerKey(started, w));
