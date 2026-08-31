@@ -641,6 +641,15 @@ def queue_mismatch(changed, repo: str = REPO, baseline: str = DEFAULT_BASELINE) 
             detail=("Reverting instead: git checkout -- %s\n"
                     "Checking first:    python -m relay.selfimprove.frozen --verify"
                     % " ".join(files)),
+            # THE SCREEN MAY CARRY THIS ONE OUT. Approving a Skill is the act; approving this
+            # used to leave a card reading "waiting on the agent" and a command to go and find,
+            # which is the gap the operator described -- the queue said something needed
+            # deciding and then handed the work back. With an action set, the dashboard runs
+            # the re-signing itself and passes the words they typed as the authorization, so
+            # the ledger quotes the person who actually decided rather than a second,
+            # unrecorded invocation. Every refusal inside this module still applies: the
+            # dashboard runs the same CLI, including the standing-delegation exclusion.
+            action="frozen_resign",
         )
     except Exception:
         return ""

@@ -127,3 +127,29 @@ def test_a_test_run_with_its_own_baseline_does_not_post_to_the_operators_queue(m
                               baseline_path=str(tmp_path / "baseline.json"))
     ctl._frozen()
     assert not called, "a test-owned baseline still posted to the operator's queue"
+
+
+# --- the contract with the screen ---------------------------------------------------------
+
+def test_the_row_tells_the_screen_it_can_be_carried_out():
+    """`action` is what turns "approve" from a note into the act. Without it the card is the
+    one the operator described: it says a decision is waiting and hands the work back."""
+    F.queue_mismatch(["docs/SECURITY.md"])
+    assert pending.items()[0].get("action") == "frozen_resign"
+
+
+def test_the_command_still_identifies_the_row_for_older_entries():
+    """SelfImproveDashboard recognises a re-signing by `action`, and falls back to this
+    substring so a row queued before the field existed is still operable. The operator has one
+    of those on screen right now; if recognition depended only on the new field, that card
+    would stay as inert as it was -- which is the complaint, not the fix."""
+    F.queue_mismatch(["docs/SECURITY.md"])
+    assert "frozen --snapshot --force" in pending.items()[0].get("command", "")
+
+
+def test_an_ordinary_proposal_is_not_marked_actionable():
+    """Only proposals this screen can actually perform may claim to be performable. Everything
+    else keeps the old meaning of approval, which is right for work only a person can do."""
+    pending.add(["some/file.py"], "an ordinary proposal", command="do the thing by hand")
+    rows = [r for r in pending.items() if "ordinary" in (r.get("reason") or "")]
+    assert rows and not rows[0].get("action")

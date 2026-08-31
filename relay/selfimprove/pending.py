@@ -92,12 +92,19 @@ def _append(rec: dict) -> None:
 
 
 def add(files, reason: str, *, diff: str = "", command: str = "", detail: str = "",
-        ts=None, notify: bool = True) -> str:
+        action: str = "", ts=None, notify: bool = True) -> str:
     """Queue a proposal that needs a decision. Returns its id. Never raises.
 
     `command` is what the operator would run to accept it, with the authorization left for
     them to fill in. A queue entry that does not say how to act on it is a reminder, and
     reminders are what this replaces.
+
+    `action` names a proposal the DASHBOARD CAN CARRY OUT once it is approved, rather than one
+    the operator must then go and perform. The distinction is what the operator noticed:
+    approving a Skill IS the act, while approving one of these left a card reading "waiting on
+    the agent" and a command to find and run somewhere else. Empty keeps the old behaviour --
+    approval records a decision and nothing more, which is right for a proposal only a person
+    can carry out.
     """
     try:
         pid = _key(files, reason)
@@ -121,6 +128,8 @@ def add(files, reason: str, *, diff: str = "", command: str = "", detail: str = 
             "detail": (detail or "").strip(),
             "diff": diff or "",
             "command": command or "",
+            # What the screen may DO on approval. See the docstring.
+            "action": (action or "").strip(),
         })
         if notify:
             _notify(pid, files, reason)
