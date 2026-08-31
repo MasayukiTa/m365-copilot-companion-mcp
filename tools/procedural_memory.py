@@ -246,6 +246,54 @@ def _score(entry: dict, tokens: list[str]) -> int:
     return sum(1 for t in tokens if t and t in haystack)
 
 
+def _query_tokens(query: str) -> list:
+    """Search tokens for a query that may be an unsegmented Japanese question.
+
+    `query.split()` WAS THE WHOLE BUG. Japanese does not put spaces between words, so a real
+    question arrived as ONE token and matched nothing. Measured 2026-08-31 against a store
+    holding 41 KB of imported DB survey notes:
+
+        "材料 トレース PAP"                        -> 10 matches
+        "PAPを追うときどのテーブルを見ればいい"        -> 0
+        "ワニスの配合材料はどこ"                     -> 0
+        "材料の保証期限を調べたい"                    -> 0
+        ... 8 of 8 realistic paraphrases -> 0
+
+    The knowledge was there and unreachable by the way anybody actually asks. Only a caller
+    who already knew to type space-separated keywords could reach it, and a memory you have to
+    know the answer to query is not a memory.
+
+    The splitter is NOT new: tools/data_discovery.extract_keywords already segments on
+    particles (は/が/を/に/で/の/と/へ/から/まで/より) and was written for exactly this. Two
+    tokenisers would drift apart, so this uses that one and falls back to whitespace only if
+    it cannot be imported.
+    """
+    try:
+        from tools.data_discovery import extract_keywords
+        tokens = [t.lower() for t in extract_keywords(query, max_keywords=12) if t.strip()]
+    except Exception:
+        tokens = []
+    # Whitespace tokens are kept as well: a caller who types "材料 トレース PAP" should not
+    # lose the behaviour that already worked, and an ASCII query needs no segmentation.
+    for t in (query or "").split():
+        t = t.strip().lower()
+        if t and t not in tokens:
+            tokens.append(t)
+    # AND THE CONTENT RUNS INSIDE A TOKEN THE PARTICLE LIST COULD NOT CUT. The list handles
+    # particles, not negation: "使ってはいけない古いビュー" splits at は and leaves
+    # "いけない古いビュー" glued, so "ビュー" -- which the store does hold -- never matched.
+    # Adding the kanji/katakana runs from each token widens recall without touching the shared
+    # splitter that find_db_objects depends on. Scoring already rewards the number of matched
+    # tokens, so a broad run cannot outrank a specific one.
+    import re as _re
+    for t in list(tokens):
+        for run in _re.findall(r"[゠-ヿ]{2,}|[一-鿿]{2,}", t):
+            run = run.lower()
+            if run and run != t and run not in tokens:
+                tokens.append(run)
+    return tokens
+
+
 def procedural_memory_search(query: str, limit: int = 10) -> str:
     """Search saved procedures by keyword/substring over intent, tags, snippet, context.
 
@@ -260,7 +308,7 @@ def procedural_memory_search(query: str, limit: int = 10) -> str:
     try:
         if not query or not isinstance(query, str):
             return "(no matches: empty query)"
-        tokens = [t.lower() for t in query.split() if t.strip()]
+        tokens = _query_tokens(query)
         if not tokens:
             return "(no matches: empty query)"
         state = _load()
