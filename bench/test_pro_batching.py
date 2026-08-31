@@ -419,3 +419,54 @@ def test_the_check_runs_after_staging_not_before():
     src = inspect.getsource(C.cycle)
     assert src.index("_write_contracts(group)") < src.index("_fleet_can_admit()")
     assert src.index("_fleet_can_admit()") < src.index('"--max-concurrent"')
+
+
+# -- the units, which did not agree across a module boundary -------------------------------
+
+def test_free_space_is_read_in_the_same_unit_the_fleet_uses():
+    """THE DEFECT THAT STAGED TWO UNRUNNABLE BATCHES TONIGHT. This module divided by 1e9 and
+    the fleet's predicate divides by 1024**3, so the same disk read 3.10 here and 2.89 there --
+    a 7% gap, always optimistic. The cycle believed it was above the fleet's 3.0 floor while the
+    fleet correctly refused to admit anyone, and the batch sat until it was killed.
+
+    Both numbers were called "GB" and neither said which one."""
+    import shutil
+    from relay.relay_fleet import free_disk_gb
+    assert abs(C.free_gb() - free_disk_gb()) < 0.01, (
+        "pro_cycle reads %.3f, the fleet reads %.3f -- different units again"
+        % (C.free_gb(), free_disk_gb()))
+    decimal = shutil.disk_usage("C:/").free / 1e9
+    assert C.free_gb() < decimal, "still reading decimal GB, not GiB"
+
+
+def test_the_fleet_floor_is_read_from_the_fleet_not_restated():
+    """A second copy of a number that already exists goes stale, and this one is compared
+    against a reading taken here, so a mismatch would be silent."""
+    import inspect
+    src = inspect.getsource(C._fleet_floor_gib)
+    assert "settings_disk_floor" in src
+
+
+def test_concurrency_reserves_the_fleets_floor_not_this_cycles():
+    """The fleet is what refuses to open a tab, so its floor is the one that decides whether a
+    batch can run at all. Reserving only this cycle's floor is how a batch gets staged that the
+    fleet will not touch."""
+    import inspect
+    src = inspect.getsource(C.concurrency_for)
+    assert "FLEET_FLOOR_GIB" in src
+    assert "1024.0" in src, "still computing headroom in decimal MB"
+
+
+def test_a_disk_just_above_the_fleet_floor_yields_one_at_a_time():
+    """Directly above the floor there is room for one and nothing else."""
+    assert C.concurrency_for(["go"], C.FLEET_FLOOR_GIB + 0.2) == 1
+    assert C.concurrency_for(["python"], C.FLEET_FLOOR_GIB + 0.2) == 1
+
+
+def test_heavy_languages_go_serial_at_the_disk_this_machine_actually_has():
+    """Measured on this machine: ~4.2 GiB free after a clean discard. Two teleport worktrees
+    did not fit, twice."""
+    free = 4.24
+    assert C.concurrency_for(["go"], free) == 1
+    assert C.concurrency_for(["js"], free) == 1
+    assert C.concurrency_for(["python"], free) >= 3
