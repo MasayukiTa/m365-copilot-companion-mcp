@@ -9608,7 +9608,12 @@ class CockpitWindow : Window
                 string st = S(w, "status");
                 if (oc == "DONE") { doneN++; cntDone++; }
                 else if (oc == "MAXTURNS") maxN++;
-                else if (oc == "STUCK" || oc == "ERROR" || oc == "CANCELLED") badN++;
+                // A CONTRADICTED claim counts with the failures, never with the completions.
+                // Leaving it out of both tallies would be worse than either: the totals would
+                // stop adding up to the number of workers, and a card would vanish from the
+                // counts while still sitting on screen.
+                else if (oc == "STUCK" || oc == "ERROR" || oc == "CANCELLED"
+                         || oc == "EVIDENCE_CONTRADICTED") badN++;
                 if (st == "awaiting") cntNeeds++;
                 if (!IsTerminalWorker(w) && st != "pending") cntActive++;
             }
@@ -11142,6 +11147,7 @@ class CockpitWindow : Window
                 case "STUCK":     outcomeEv = ja ? "停滞" : "Stuck"; break;
                 case "ERROR":     outcomeEv = ja ? "エラー" : "Error"; break;
                 case "CANCELLED": outcomeEv = ja ? "停止" : "Cancelled"; break;
+                case "EVIDENCE_CONTRADICTED": outcomeEv = ja ? "記録と矛盾" : "Contradicted"; break;
                 default:          outcomeEv = string.IsNullOrEmpty(outcome) ? (ja ? "終了" : "Ended") : outcome; break;
             }
             evs.Add(outcomeEv);
@@ -11243,6 +11249,11 @@ class CockpitWindow : Window
             case "STUCK": return ja ? "停滞して終了" : "Stuck";
             case "ERROR": return ja ? "エラーで終了" : "Error";
             case "CANCELLED": return ja ? "停止されました" : "Cancelled";
+            // The worker said it was finished; the recorded tool calls say otherwise -- the
+            // acceptance command was never run, or nothing was written. NOT an error and NOT a
+            // completion: a claim that could not be believed. DONE is a self-report measured at
+            // 0.718 precision, and this is what checking it looks like on the card.
+            case "EVIDENCE_CONTRADICTED": return ja ? "記録と矛盾" : "Contradicted by record";
             default: return string.IsNullOrEmpty(outcome) ? "" : outcome;
         }
     }
