@@ -151,6 +151,155 @@ def _entry_lines(text):
     return [ln for ln in body.splitlines() if ln.startswith("- [")]
 
 
+#: The timestamp comment, which is the only part of two otherwise identical entries that
+#: differs. NOT ANCHORED TO END OF LINE: the first version was, and the repeat marker this
+#: function appends then sat after it, so a collapsed line's timestamp stopped being stripped
+#: and the line stopped matching its own successors. Eight identical records collapsed
+#: pairwise to four instead of to one -- a dedupe that half worked, which is the shape that
+#: gets believed.
+_ENTRY_TS = re.compile(r"\s*<!--\s*\d{4}-\d{2}-\d{2}[^>]*-->")
+
+#: A repeat marker, so collapsing does not throw away the fact that the work recurred.
+_REPEAT = re.compile(r"\s*<!--\s*x(\d+)\s*-->")
+
+
+def _entry_key(line):
+    """What makes two entries THE SAME entry: everything except when it happened."""
+    return " ".join(_REPEAT.sub("", _ENTRY_TS.sub("", line or "")).split())
+
+
+def _repeat_count(line):
+    m = _REPEAT.search(line or "")
+    return int(m.group(1)) if m else 1
+
+
+def dedupe_entries(entries):
+    """Collapse entries that record the same thing, keeping the newest and counting the rest.
+
+    WHY THIS IS NOT HOUSEKEEPING. Measured 2026-08-31, in a store of 156 theme files: one
+    file held EIGHT lines, all of them
+
+        - [DONE] 2の12乗はいくつか、数字だけ答えて — refuter#1: UPHELD
+
+    differing only in their timestamp comment. The theme's entries are primed into every
+    later goal on that theme, and the index of all themes is primed into every goal at all --
+    measured at 4,047 characters against a 1,401-character protocol. Nearly three times the
+    instructions, carrying one fact stated eight times.
+
+    Same shape as the volatile-field defect in relay/relay_fleet.py's no-progress key, and
+    the same fix: compare on what identifies the entry, not on the bytes. A per-line
+    timestamp is exactly the field that makes "the same thing again" look new.
+
+    THE COUNT IS KEPT. "This happened eight times" is information -- it is the repetition
+    that was not. Collapsing to one line with x8 says both in one line's worth of budget.
+    """
+    out, seen = [], {}
+    for line in entries or []:
+        key = _entry_key(line)
+        if not key:
+            continue
+        if key in seen:
+            seen[key][0] += _repeat_count(line)
+            continue
+        seen[key] = [_repeat_count(line), len(out)]
+        out.append(line)
+    for key, (count, idx) in seen.items():
+        if count > 1:
+            base = _REPEAT.sub("", out[idx])
+            out[idx] = base + "  <!-- x%d -->" % count
+    return out
+
+
+def _tokens(text):
+    """Words worth matching on, in a store that holds both Japanese and English themes.
+
+    Latin runs of 3+ characters, plus CJK bigrams -- Japanese does not space its words, so
+    whitespace splitting produces one enormous token per phrase and matches nothing.
+    """
+    low = (text or "").lower()
+    out = set(re.findall(r"[a-z0-9_./-]{3,}", low))
+    cjk = re.findall(r"[぀-ヿ一-鿿]{2,}", low)
+    for run in cjk:
+        out.update(run[i:i + 2] for i in range(len(run) - 1))
+    return out
+
+
+def rank_index_lines(lines, theme="", goal=""):
+    """Order the index by how likely each theme is to be worth opening for THIS work.
+
+    WHY NOT RECENCY. The index is primed into EVERY goal -- measured 2026-08-31 at 4,047
+    characters against a 1,401-character protocol, so nearly three times the instructions.
+    What it contained was 40 of the store's 156 themes in date order, and because a theme is
+    keyed on the goal's opening words, most of them were one-shot questions: "2の12乗はいくつか",
+    "625の平方根はいくつか". A worker fixing a bug in ansible was handed those and nothing about
+    ansible.
+
+    Recency answers "what happened lately", which is not the question the index exists for.
+    Its stated purpose is that a worker DISCOVERS a neighbouring theme, and neighbouring means
+    related to the work in hand.
+
+    Ties keep the file's existing order, which is recency -- so with nothing to go on the
+    behaviour is what it was, and this can only reorder, never invent or drop. The cap is
+    applied by the caller, unchanged.
+    """
+    try:
+        want = _tokens(theme) | _tokens(goal)
+        if not want:
+            return list(lines)
+        scored = []
+        for i, ln in enumerate(lines):
+            title = ln.split("](", 1)[0][3:] if "](" in ln else ln
+            overlap = len(want & _tokens(title))
+            scored.append((-overlap, i, ln))
+        scored.sort()
+        return [ln for _s, _i, ln in scored]
+    except Exception:
+        return list(lines)
+
+
+#: How many UNRELATED themes to keep, always. The index's stated job is DISCOVERY, and a
+#: filter that shows only what already looks related can never surface anything new -- so a
+#: short recency tail stays whatever happens. Five lines is about 340 characters; forty was
+#: 2,718.
+_INDEX_RECENT_TAIL = 5
+
+
+def prune_index_lines(lines, theme="", goal=""):
+    """Drop index entries that share nothing with the work in hand -- when any of them do.
+
+    MEASURED against the live store, for a worker fixing a bug in ansible: ONE of the forty
+    index lines shared a single token with its goal. The other thirty-nine were one-shot
+    questions the theme key had turned into themes -- "2の12乗はいくつか", "625の平方根はいくつか" --
+    and all of them were primed into that worker's first turn, 2,718 characters of them.
+
+    EVERY related theme is kept; the unrelated ones are cut to a short recency tail. The rule
+    is uniform on purpose. The first version kept everything when NOTHING matched -- meant as
+    caution, and it left the measured case untouched: load_notes filters the CURRENT theme's
+    own line out of the index before this is called, so the one line that matched was already
+    gone, `related` was empty, and all thirty-nine unrelated lines came back. A conservative
+    branch that exempts exactly the case being fixed is not caution.
+
+    The tail is what keeps discovery possible: the index exists so a worker finds a
+    NEIGHBOURING theme, and a filter showing only what already looks related can never surface
+    anything it did not know to look for.
+
+    Token overlap is a weak signal and will sometimes drop a theme that mattered. Weighed
+    against thirty-nine arithmetic questions crowding a bug fix, that is the better error, and
+    the theme file itself is still on disk for a worker that goes looking.
+    """
+    try:
+        want = _tokens(theme) | _tokens(goal)
+        if not want:
+            return list(lines)
+        related, rest = [], []
+        for ln in lines:
+            title = ln.split("](", 1)[0][3:] if "](" in ln else ln
+            (related if (want & _tokens(title)) else rest).append(ln)
+        return related + rest[:_INDEX_RECENT_TAIL]
+    except Exception:
+        return list(lines)
+
+
 def entry_authority(line):
     """The authority recorded on a memory line, or EXTERNAL_UNTRUSTED if there is none.
 
@@ -213,7 +362,10 @@ def record_task(theme, goal, outcome, note="", state_dir=None, ts=None, folder="
         )
         path = _theme_path(slug, state_dir)
         old = _entry_lines(_read(path))
-        entries = ([line] + old)[:_MAX_PER_THEME]          # newest first
+        # DEDUPED BEFORE THE CAP, not after. Twenty slots filled with one fact repeated is a
+        # theme that remembers nothing while looking full -- and the cap would then evict the
+        # genuinely different entries first, because they are the older ones.
+        entries = dedupe_entries([line] + old)[:_MAX_PER_THEME]      # newest first
         text = (
             "---\n"
             "theme: %s\n"
@@ -320,8 +472,11 @@ def load_notes(theme, max_items=None, state_dir=None, goal="", include_index=Tru
         if max_items is None:
             max_items = _default_max_items()
         theme, slug = _resolve(theme, goal)
-        entries = _select_entries(_entry_lines(_read(_theme_path(slug, state_dir))),
-                                  max_items)
+        # ALSO ON THE READ PATH, because the 156 theme files already on disk were written
+        # before dedupe_entries existed and are not rewritten until their theme comes round
+        # again. A fix that only applies to new entries leaves the measured problem in place.
+        entries = _select_entries(
+            dedupe_entries(_entry_lines(_read(_theme_path(slug, state_dir)))), max_items)
         index = _read(_index_path(state_dir)).strip() if include_index else ""
         blocks = []
         if entries:
@@ -330,9 +485,11 @@ def load_notes(theme, max_items=None, state_dir=None, goal="", include_index=Tru
         if index:
             other = [ln for ln in index.splitlines()
                      if ln.startswith("- [") and ("(%s.md)" % slug) not in ln]
+            other = prune_index_lines(rank_index_lines(other, theme, goal),
+                                      theme, goal)[:_INDEX_MAX_THEMES]
             if other:
                 blocks.append("記憶している他のテーマ（必要なら .fleet/memory/ を読む）:\n"
-                              + "\n".join(other[:_INDEX_MAX_THEMES]))
+                              + "\n".join(other))
         return "\n\n".join(blocks)
     except Exception:
         return ""
