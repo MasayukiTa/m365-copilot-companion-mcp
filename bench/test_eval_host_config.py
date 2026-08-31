@@ -110,3 +110,37 @@ def test_dotenv_is_loaded_so_a_configured_value_can_arrive():
     src = io.open(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
                                 "swe_check_remote.py"), encoding="utf-8").read()
     assert "load_dotenv" in src[:src.index("SSH_HOST =")]
+
+
+# -- a failed attempt is not a result ------------------------------------------------------
+
+def test_evalerr_does_not_count_as_graded(tmp_path):
+    """EVALERR means the evaluation could not be RUN -- unreachable host, container that would
+    not start -- and it says nothing about the patch. Counting it as already-graded makes the
+    failure permanent: the instance is skipped forever and can never be scored once the cause
+    is gone.
+
+    Measured: 36 EVALERR rows were written while the eval host was unreachable because of a
+    stale lock file on THIS machine. With the transport fixed, the grader reported "40 preds,
+    37 already graded, 3 to grade" and would have left 36 patches unscored for good."""
+    import json
+    from bench import swe_grade_batch as B
+    p = tmp_path / "results.json"
+    p.write_text("\n".join([
+        json.dumps({"instance_id": "a", "verdict": "RESOLVED"}),
+        json.dumps({"instance_id": "b", "verdict": "not"}),
+        json.dumps({"instance_id": "c", "verdict": "EVALERR", "note": "launch/scp failed"}),
+    ]), encoding="utf-8")
+    done = B.load_results(str(p))
+    assert set(done) == {"a", "b"}, "EVALERR was counted as a grade"
+
+
+def test_real_verdicts_are_still_remembered(tmp_path):
+    """The other half of the rule: a genuine verdict must NOT be re-measured. Re-running an
+    instance that already has a score is how a benchmark number drifts upward without anybody
+    deciding to cheat."""
+    import json
+    from bench import swe_grade_batch as B
+    p = tmp_path / "results.json"
+    p.write_text(json.dumps({"instance_id": "a", "verdict": "RESOLVED"}), encoding="utf-8")
+    assert "a" in B.load_results(str(p))

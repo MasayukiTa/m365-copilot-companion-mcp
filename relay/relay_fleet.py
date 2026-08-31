@@ -2768,7 +2768,7 @@ class RelayWorker:
         if not passed:
             return False
         self.verified = True
-        self.status, self.outcome = "done", "DONE"
+        self._settle_done()
         self.reason = "checks already pass at exhaustion -> salvaged DONE (%s)" % (
             (detail or "")[:160])
         return True
@@ -3840,7 +3840,7 @@ class RelayWorker:
                            not_triggered_reason=_sk, executed=False, changed_decision=False)
             except Exception:
                 pass
-            self.status, self.outcome = "done", "DONE"
+            self._settle_done()
             return
         if (self.refuter and self._context is not None
                 and self.refute_count < self.max_refute):
@@ -3891,7 +3891,65 @@ class RelayWorker:
             self.recovery_cause = "session_state"
             self.recovery_result = "recovered"
             self.recovery_state = "recovered"
-        self.status, self.outcome = "done", "DONE"
+        self._settle_done()
+
+    #: Check a DONE claim against the recorded tool calls before reporting it.
+    #:
+    #: WHY THIS IS ON BY DEFAULT. `outcome == DONE` is a self-report, measured at precision
+    #: 0.718 -- 11 of 39 claims wrong on a 40-instance slice. The whole verification pipeline
+    #: was built for this and then wired ONLY into bench/pro_cycle.py, so ordinary fleet runs
+    #: still reported an unchecked self-report. That is the gap this closes.
+    VERIFY_CLAIM_AGAINST_LEDGER = (os.environ.get("MCP_VERIFY_CLAIM", "1").strip().lower()
+                                   not in ("", "0", "no", "off", "false"))
+
+    def _settle_done(self):
+        """THE ONLY PLACE THIS WORKER BECOMES DONE.
+
+        There were four separate sites assigning ("done", "DONE"). Adding the check at one of
+        them would have left three routes around it -- which is exactly how a gate comes to
+        protect nothing, and this repository has watched that happen with an MFA gate that sat
+        on one branch while every other path walked past.
+        """
+        self.status = "done"
+        self.outcome = self._claim_verdict()
+
+    def _claim_verdict(self):
+        """"DONE", or a weaker outcome when the RECORD contradicts the claim. Never raises.
+
+        CONSERVATIVE BY CONSTRUCTION. Only a positive contradiction changes anything: no
+        ledger data, no acceptance checks, or any other verdict all leave "DONE" exactly as
+        before. An absence of evidence is not evidence, and a worker must not be demoted
+        because nothing happened to be recording.
+        """
+        if not self.VERIFY_CLAIM_AGAINST_LEDGER:
+            return "DONE"
+        try:
+            checks = normalize_checks(getattr(self, "checks", None))
+            if not checks:
+                return "DONE"
+            # The worker's spec calls it `cmd` (or `argv`); the contract calls it `command`.
+            # Translated here rather than assumed -- both shapes were read before writing this.
+            rows = []
+            for c in checks:
+                cmd = c.get("cmd") or " ".join(c.get("argv") or [])
+                if cmd:
+                    rows.append({"id": c.get("id") or "check", "command": cmd})
+            if not rows:
+                return "DONE"
+            root = (getattr(self, "cwd", "") or "").strip()
+            if not root:
+                return "DONE"
+            from tools import tool_ledger as _tl
+            from relay import evidence_manifest as _em
+            events = _tl.for_task("", root=root)
+            if not events:
+                return "DONE"
+            verdict = _em.assess(True, {"checks": rows}, events).get("verdict")
+            if verdict == _em.CONTRADICTED:
+                return "EVIDENCE_CONTRADICTED"
+        except Exception:
+            pass
+        return "DONE"
 
     def _start_next_lens(self):
         from .refuter import RefuterSession
@@ -4008,7 +4066,7 @@ class RelayWorker:
             self.recovery_cause = "session_state"
             self.recovery_result = "recovered"
             self.recovery_state = "recovered"
-        self.status, self.outcome = "done", "DONE"
+        self._settle_done()
         return True
 
     def _poll_verify(self):
