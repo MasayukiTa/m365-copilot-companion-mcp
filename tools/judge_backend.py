@@ -127,6 +127,14 @@ def sampling_judge(request_json: str) -> str:
     ctx = _context()
     if ctx is None:
         raise JudgeTransportError("no MCP request context: nothing to ask")
+    if not sampling_supported():
+        # ASKED BEFORE TRYING. A client that never declared sampling will not answer, and
+        # finding that out by waiting for the timeout costs every judged command the full
+        # timeout and reports it as a transport fault rather than as a missing capability --
+        # two different problems with two different fixes.
+        raise JudgeTransportError(
+            "the connected client did not declare the sampling capability, so there is no "
+            "model to ask from inside this server")
 
     async def _ask():
         # THE INSTRUCTIONS AND THE PAYLOAD TRAVEL IN DIFFERENT FIELDS. The request is a JSON
@@ -173,10 +181,77 @@ def _text_of(result) -> str:
 # change in behaviour -- an interruption on every unrecognised command would be the fastest
 # possible way to make people turn the layer off before it has been measured once.
 
+def _client_supports(**kw) -> bool:
+    """Did the CLIENT declare this capability when it connected?
+
+    ASKED, NOT ASSUMED. The MCP handshake carries the client's capabilities, so whether there
+    is a judge or a person to ask is knowable at connect time rather than discoverable one
+    failed command at a time. Every uncertainty resolves to False: no context, no session, an
+    older library without the check, an exception -- because this answer feeds
+    `human_available`, where True means "REQUIRE_HUMAN does not block".
+
+    A hand-written allowlist that resolves the unknown case to "supported" is the fail-open
+    this repository has already recorded once, and it would be worse here than anywhere else:
+    it would turn "ask a person" into "carry on" on precisely the deployments with no person.
+    """
+    ctx = _context()
+    if ctx is None:
+        return False
+    try:
+        from mcp.types import ClientCapabilities
+        session = getattr(ctx, "session", None)
+        if session is None:
+            return False
+        return bool(session.check_client_capability(ClientCapabilities(**kw)))
+    except Exception:
+        return False
+
+
+def sampling_supported() -> bool:
+    """Whether the calling client can run a completion for us."""
+    try:
+        from mcp.types import SamplingCapability
+        return _client_supports(sampling=SamplingCapability())
+    except Exception:
+        return False
+
+
+def elicitation_supported() -> bool:
+    """Whether the calling client can put a question to its user."""
+    try:
+        from mcp.types import ElicitationCapability
+        return _client_supports(elicitation=ElicitationCapability())
+    except Exception:
+        return False
+
+
 def human_available() -> bool:
-    """Whether there is anyone to ask. False outside a request, or on a client without
-    elicitation -- and False is a refusal, not a pass."""
-    return _context() is not None
+    """Whether there is anyone to ask.
+
+    THE DECLARED CAPABILITY, NOT THE PRESENCE OF A REQUEST. The first version returned True
+    whenever a context existed, which is not the same question: a client can call a tool and
+    have no way to show its user anything. Wired into
+    command_judge.outcome_blocks_execution, that overstatement turns REQUIRE_HUMAN from a
+    refusal into an allow on exactly the clients where nobody can be asked.
+    """
+    return elicitation_supported()
+
+
+def availability() -> dict:
+    """What this layer can actually reach right now, for the audit line and the log.
+
+    A BOOLEAN CANNOT HOLD THE STATES THAT MATTER: never configured, configured but the client
+    cannot do it, and configured and reachable. The first two are both "no judge" in effect
+    and need completely different fixes, and a log that flattens them tells nobody which.
+    """
+    name = (os.environ.get(BACKEND_ENV) or "none").strip().lower()
+    return {
+        "backend": name,
+        "configured": name not in ("", "none", "off"),
+        "in_request": _context() is not None,
+        "client_sampling": sampling_supported(),
+        "client_elicitation": elicitation_supported(),
+    }
 
 
 def ask_human(question: str) -> Optional[bool]:

@@ -253,6 +253,15 @@ def _ask_operator(text, verdict):
         return None
 
 
+def _judge_availability():
+    """What the judging layer could reach for this call. Never raises: it annotates a log."""
+    try:
+        from . import judge_backend as _jb
+        return _jb.availability()
+    except Exception as exc:
+        return {"error": "%s: %s" % (type(exc).__name__, str(exc)[:80])}
+
+
 def _judge_backend():
     """The callable that asks a model, or None when none is configured.
 
@@ -301,6 +310,12 @@ def _record_judgement(kind, text, req, verdict, mode_name, blocks, human=None):
             # false = asked and declined, OR nobody could be reached. A boolean alone could
             # not tell "approved" from "never asked", which is the distinction the audit needs.
             "human_approved": human,
+            # WHY THERE WAS NO JUDGE, when there was none. "source": "no_judge" says the
+            # verdict was unassessed; it does not say whether nobody configured a backend,
+            # or one is configured and the client cannot run it. Both read as "no judge" in
+            # the outcome and need completely different fixes, and a shadow log that cannot
+            # tell them apart cannot be used to decide whether enforcement is ready.
+            "reach": _judge_availability(),
             "schema": _json.dumps(None) and 1,
         }
         with open(path, "a", encoding="utf-8") as fh:

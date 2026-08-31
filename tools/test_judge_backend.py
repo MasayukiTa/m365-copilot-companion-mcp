@@ -87,6 +87,88 @@ def test_no_human_reachable_is_not_an_approval():
     assert B.ask_human("may I?") is None
 
 
+# ── what the client declared ──────────────────────────────────────────────────────────────
+
+def test_the_capability_types_this_module_names_are_real():
+    """Same guard as the API-name tests above, for the same reason: a wrong name here is
+    caught by an `except Exception` and reads as "the client cannot do it"."""
+    from mcp.types import ClientCapabilities, ElicitationCapability, SamplingCapability
+    assert ClientCapabilities(sampling=SamplingCapability()).sampling is not None
+    assert ClientCapabilities(elicitation=ElicitationCapability()).elicitation is not None
+
+
+def test_the_session_check_exists():
+    from mcp.server.session import ServerSession
+    assert hasattr(ServerSession, "check_client_capability")
+
+
+@pytest.mark.parametrize("fn", [B.sampling_supported, B.elicitation_supported])
+def test_outside_a_request_nothing_is_supported(fn):
+    assert fn() is False
+
+
+def test_a_session_that_says_no_is_believed(monkeypatch):
+    class _S:
+        def check_client_capability(self, _c):
+            return False
+    monkeypatch.setattr(B, "_context", lambda: type("C", (), {"session": _S()})())
+    assert B.sampling_supported() is False
+    assert B.human_available() is False
+
+
+def test_a_session_that_says_yes_is_believed(monkeypatch):
+    class _S:
+        def check_client_capability(self, _c):
+            return True
+    monkeypatch.setattr(B, "_context", lambda: type("C", (), {"session": _S()})())
+    assert B.sampling_supported() is True
+    assert B.human_available() is True
+
+
+def test_a_session_that_raises_is_not_taken_as_yes(monkeypatch):
+    """FAIL CLOSED. human_available() feeds outcome_blocks_execution, where True means
+    REQUIRE_HUMAN stops blocking -- so an unknown answer read as "yes" turns "ask a person"
+    into "carry on" on exactly the deployments with no person."""
+    class _S:
+        def check_client_capability(self, _c):
+            raise RuntimeError("older client")
+    monkeypatch.setattr(B, "_context", lambda: type("C", (), {"session": _S()})())
+    assert B.sampling_supported() is False
+    assert B.elicitation_supported() is False
+    assert B.human_available() is False
+
+
+def test_human_available_is_about_the_capability_not_about_being_in_a_request(monkeypatch):
+    """The first version returned True whenever a context existed. A client can call a tool
+    and have no way to show its user anything; those are different questions."""
+    monkeypatch.setattr(B, "_context", lambda: type("C", (), {"session": None})())
+    assert B._context() is not None
+    assert B.human_available() is False
+
+
+def test_sampling_refuses_immediately_when_the_client_never_declared_it(monkeypatch):
+    """Otherwise every judged command pays the full timeout to learn something the handshake
+    already said."""
+    monkeypatch.setattr(B, "_context", lambda: type("C", (), {"session": None})())
+    monkeypatch.setattr(B, "sampling_supported", lambda: False)
+    with pytest.raises(B.JudgeTransportError) as exc:
+        B.sampling_judge("{}")
+    assert "sampling" in str(exc.value)
+
+
+def test_availability_separates_never_configured_from_cannot_run(monkeypatch):
+    monkeypatch.delenv(B.BACKEND_ENV, raising=False)
+    a = B.availability()
+    assert a["configured"] is False and a["backend"] == "none"
+
+    monkeypatch.setenv(B.BACKEND_ENV, "sampling")
+    b = B.availability()
+    assert b["configured"] is True
+    assert b["client_sampling"] is False, "no request context -> the client can do nothing"
+    # The two states must be distinguishable, which is the whole point of the field.
+    assert a != b
+
+
 # ── reading the client's answer ───────────────────────────────────────────────────────────
 
 class _Text:
