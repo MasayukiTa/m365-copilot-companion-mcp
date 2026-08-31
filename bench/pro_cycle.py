@@ -60,8 +60,18 @@ BATCH_TIMEOUT_S = float(os.environ.get("SWE_CYCLE_BATCH_TIMEOUT_S", "3600"))
 
 
 def log(msg):
-    line = time.strftime("%H:%M:%S ") + msg
-    print(line, flush=True)
+    """Never raises. A LOGGING CALL TOOK THE WHOLE CYCLE DOWN once already: this console is
+    cp932, a grader printed a replacement character, and print() died with UnicodeEncodeError
+    eight minutes into a forty-instance run. A line of output is not worth a run."""
+    line = time.strftime("%H:%M:%S ") + str(msg)
+    try:
+        print(line, flush=True)
+    except Exception:
+        try:
+            enc = (getattr(sys.stdout, "encoding", None) or "utf-8")
+            print(line.encode(enc, "replace").decode(enc, "replace"), flush=True)
+        except Exception:
+            pass
     try:
         os.makedirs(os.path.dirname(LOG), exist_ok=True)
         with open(LOG, "a", encoding="utf-8") as fh:
@@ -254,8 +264,18 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
         _shadow_verify(group)
 
         graded_before = len(graded_ids())
-        run([PY, os.path.join("bench", "swe_grade_batch.py"),
-             "--instances"] + group, BATCH_TIMEOUT_S, "grade")
+        # THE TWO HALVES SPEAK DIFFERENT SHAPES, and I wired them together without reading
+        # either. pro_capture.py writes ONE json file holding a list of {instance_id, patch};
+        # swe_grade_batch.py reads a DIRECTORY of <instance_id>.json each holding
+        # [{"model_patch": ...}]. The first run died on that. Converting here keeps both
+        # scripts untouched -- they each have other callers.
+        preds_dir = _explode_preds()
+        if preds_dir:
+            run([PY, os.path.join("bench", "swe_grade_batch.py"),
+                 "--preds-dir", preds_dir, "--results", RESULTS,
+                 "--instances"] + group, BATCH_TIMEOUT_S, "grade")
+        else:
+            log("  no patch captured for this batch -- nothing to grade")
         gained = len(graded_ids()) - graded_before
         log("  graded this batch: %d of %d" % (gained, len(group)))
 
@@ -397,6 +417,36 @@ def _shadow_verify(group):
     except Exception as exc:
         log("  shadow verification failed (%s: %s) -- grading is unaffected"
             % (type(exc).__name__, str(exc)[:120]))
+
+
+def _explode_preds():
+    """Turn the single preds file into the per-instance directory the grader expects.
+
+    Returns the directory, or "" when there is nothing to grade. Never raises: a conversion
+    failure must leave the cycle running, because the capture it depends on has already
+    happened and the patches are on disk either way.
+    """
+    try:
+        rows = _load(PREDS, [])
+        if isinstance(rows, dict):
+            rows = list(rows.values())
+        out = os.path.join(SW, "pro_cycle_preds_dir")
+        os.makedirs(out, exist_ok=True)
+        n = 0
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            inst = row.get("instance_id")
+            patch = row.get("patch") or row.get("model_patch") or ""
+            if not inst:
+                continue
+            with open(os.path.join(out, "%s.json" % inst), "w", encoding="utf-8") as fh:
+                json.dump([{"instance_id": inst, "model_patch": patch}], fh, ensure_ascii=False)
+            n += 1
+        return out if n else ""
+    except Exception as exc:
+        log("  could not prepare predictions for grading (%s)" % type(exc).__name__)
+        return ""
 
 
 def _discard():
