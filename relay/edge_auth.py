@@ -204,6 +204,17 @@ def classify_live(cdp_url: str = "http://127.0.0.1:9222") -> list[dict]:
 # CLI -- human diagnostic. Guarded so import/connection failures print cleanly.
 # --------------------------------------------------------------------------- #
 
+def _main_ensure(agent_url: str, cdp_url: str = "http://127.0.0.1:9222") -> int:
+    """`python -m relay.edge_auth --ensure <agent_url> [cdp_url]` -- repair, then say what it is.
+
+    Exists so a caller that is not Python (the WPF cockpit's repair tier) can run the recovery
+    without the caller inventing its own way to execute an inline snippet.
+    """
+    cls = ensure_ready(agent_url, cdp_url=cdp_url)
+    print(cls)
+    return 0 if cls == "ready" else 1
+
+
 def _main(cdp_url: str = "http://127.0.0.1:9222") -> int:
     try:
         rows = classify_live(cdp_url)
@@ -219,12 +230,6 @@ def _main(cdp_url: str = "http://127.0.0.1:9222") -> int:
     for r in rows:
         print("[%-12s] %-14s %s" % (r["cls"], r["action"], r["url"]))
     return 0
-
-
-if __name__ == "__main__":
-    import sys
-
-    sys.exit(_main())
 
 
 # --------------------------------------------------------------------------- #
@@ -317,9 +322,14 @@ def _wait_until_ready(cdp_url: str, budget_s: float, step_s: float = 2.0) -> boo
 def _navigate(cdp_url: str, agent_url: str) -> bool:
     """Open the agent in the browser at `cdp_url`. /json/new is a PUT on newer builds and a
     GET on older ones, so try both before reporting failure."""
-    import urllib.parse as _parse
     import urllib.request as _req
-    url = _parse.urljoin(cdp_url, "/json/new?") + agent_url
+    # PLAIN CONCATENATION, NOT urljoin. urljoin(cdp, "/json/new?") DROPS THE TRAILING "?", so
+    # the result was ".../json/new" + the agent url, giving ".../json/newhttps://..." -- a 404
+    # on every call, GET and PUT alike. _navigate therefore returned False every time it was
+    # ever called, which is why ensure_ready never repaired anything and each recovery had to
+    # be done by hand. The tests did not catch it because they stubbed urlopen and never looked
+    # at the url it was given: a stub agreeing with the code again.
+    url = cdp_url.rstrip("/") + "/json/new?" + agent_url
     try:
         _req.urlopen(url, timeout=20).read()
         return True
@@ -404,3 +414,13 @@ def ensure_ready(agent_url: str, cdp_url: str = "http://127.0.0.1:9222",
         return next((r.get("cls") for r in rows), last) or last
     except Exception:
         return last
+
+
+# THE GUARD LIVES AT THE END. It sat in the middle of the file, above ensure_ready's
+# definition, so running the module executed it before that name existed.
+if __name__ == "__main__":
+    import sys as _sys
+    if len(_sys.argv) > 2 and _sys.argv[1] == "--ensure":
+        raise SystemExit(_main_ensure(*_sys.argv[2:4]))
+    import sys
+    sys.exit(_main())

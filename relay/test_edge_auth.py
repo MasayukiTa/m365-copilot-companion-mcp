@@ -307,3 +307,31 @@ def test_every_surface_schedules_a_return_to_background(monkeypatch):
     assert _REAL_SURFACE_WITH_WAY_BACK("http://127.0.0.1:9222", "https://x", 5.0) is True
     assert started.get("started") is True, "nothing was scheduled to put the window back"
     assert started["delay"] == 5.0
+
+
+def test_the_navigation_url_actually_has_its_query_separator():
+    """THE BUG EVERY OTHER TEST HERE MISSED.
+
+    _navigate built the url with urljoin(cdp, "/json/new?"), and urljoin DROPS the trailing
+    "?". The result was ".../json/new" + the agent url -- ".../json/newhttps://..." -- a 404 on
+    every call, GET and PUT alike. So _navigate returned False every time it was ever called,
+    ensure_ready never repaired anything, and each recovery had to be done by hand.
+
+    The other tests stubbed urlopen and asserted that it was CALLED. None looked at what it was
+    called with. A stub that agrees with the code tests the stub.
+    """
+    seen = []
+
+    def _urlopen(req, timeout=None):
+        seen.append(req if isinstance(req, str) else req.full_url)
+        raise OSError("stop here; the url is what matters")
+
+    import urllib.request as _req
+    import pytest as _pytest
+    with _pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_req, "urlopen", _urlopen)
+        _REAL_NAVIGATE("http://127.0.0.1:9222", "https://example.test/chat/?titleId=T_x")
+    assert seen, "urlopen was never called"
+    for url in seen:
+        assert "/json/new?" in url, "the query separator is missing: %r" % url
+        assert url.endswith("https://example.test/chat/?titleId=T_x"), url
