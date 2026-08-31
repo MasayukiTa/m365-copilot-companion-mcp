@@ -265,6 +265,75 @@ _DESTRUCTIVE_PATTERNS = [
     re.compile(r"\b(?:Invoke-WebRequest|Invoke-RestMethod|iwr|irm|curl|wget|"
                r"Start-BitsTransfer|Net\.WebClient)\b(?=.*\$env:)", re.IGNORECASE),
 
+    # ── WHAT THE ADVERSARIAL PASS OF 2026-08-31 PROVED WAS MISSING ────────────────────
+    # Fifty hostile commands through the net: twenty caught, thirty not, zero false alarms on
+    # ten ordinary controls. A net that is precise and half-blind is a net that will be
+    # trusted at exactly the wrong moment.
+    #
+    # Only the misses whose effect is NOT a judgement call are added here. `npm publish` and a
+    # branch delete are the SAME DESTRUCTION under a different verb, and a denylist that knows
+    # `rm -rf` but not `find -delete` knows a spelling, not a class. The rest of the thirty --
+    # ambiguous scope, a plausible-looking path, an install from somewhere unusual -- stay with
+    # the judge, which is what it is for. Adding them here as guesses would produce the alarms
+    # that teach people to approve unread.
+    re.compile(r"\bfind\b[^|]*\s-delete\b", re.IGNORECASE),
+    re.compile(r"\brobocopy\b(?=.*\s/(?:MIR|PURGE)\b)", re.IGNORECASE),
+    re.compile(r"\btruncate\b\s+-s\s*0\b", re.IGNORECASE),
+    re.compile(r"\bsc(?:\.exe)?\s+delete\b", re.IGNORECASE),
+    re.compile(r"\bgit\s+push\b(?=.*(?:--delete\b|\s-d\b|\s:\w))", re.IGNORECASE),
+    re.compile(r"\b(?:npm|yarn|pnpm|poetry)\s+publish\b|\btwine\s+upload\b", re.IGNORECASE),
+    # `ri` with a flag and no path. The alias pattern above requires a path character, so
+    # `gci . -r | ri -fo` -- delete everything the pipeline hands you -- did not match it.
+    re.compile(r"\bri\b\s+[-$]", re.IGNORECASE),
+    # Deleting a local branch discards commits that may exist nowhere else.
+    re.compile(r"\bgit\s+branch\b[^|]*\s-D\b"),
+    # Installing from somewhere that is not the configured index. `pip install pkg` and
+    # `npm install` stay ordinary work -- what is gated is redirecting where the code comes
+    # from. tools/env_ops.py's pip_install passes only --trusted-host, so the supported path
+    # cannot trip this.
+    re.compile(r"\bpip3?\s+install\b[^|]*--(?:extra-)?index-url\b", re.IGNORECASE),
+    re.compile(r"\b(?:npm|pnpm|yarn)\s+(?:install|add|i)\b[^|]*\shttps?://", re.IGNORECASE),
+    # DOWNLOAD, THEN RUN IT. The pipe-into-an-interpreter patterns cover the one-liner form;
+    # this covers the two-step form, which is the same act with a semicolon in it.
+    re.compile(r"\b(?:curl|wget|iwr|Invoke-WebRequest|Invoke-RestMethod|irm)\b[\s\S]*?"
+               r"(?:;|&&)\s*[.\\/]*[\w.-]+\.(?:exe|ps1|bat|cmd|sh|msi|jar)\b", re.IGNORECASE),
+    # A REMOTE ADDED AND PUSHED TO IN ONE BREATH. Adding a remote alone is ordinary; adding
+    # one and pushing the repository to it in the same command is the workspace leaving.
+    re.compile(r"\bgit\s+remote\s+add\b[\s\S]*\bgit\s+push\b", re.IGNORECASE),
+
+    # PERSISTENCE. It survives the session, and every pattern above asks only whether
+    # something is destroyed now.
+    re.compile(r"\bschtasks\b(?=.*/create\b)", re.IGNORECASE),
+    re.compile(r"\breg(?:\.exe)?\s+add\b(?=.*\\Run\b)", re.IGNORECASE),
+    re.compile(r"\bNew-ItemProperty\b(?=.*\bRun\b)", re.IGNORECASE),
+    re.compile(r"\bRegister-ScheduledTask\b", re.IGNORECASE),
+
+    # READING A CREDENTIAL, which travels as far as the transcript does. tools/file_ops.py
+    # refuses `.env` and `.companion_gates` outright, so a shell that will `type` them is that
+    # refusal with a way around it. Kept in step with tools/command_triage.py's
+    # _SENSITIVE_TARGET, which stops the same paths being exempted from judgement.
+    re.compile(r"\.ssh[/\\]|\bid_(?:rsa|dsa|ecdsa|ed25519)\b", re.IGNORECASE),
+    re.compile(r"\.git-credentials\b|\.companion_gates\b|\.npmrc\b|\.pypirc\b|\.netrc\b",
+               re.IGNORECASE),
+    # `.env` -- with a lookahead, because a bare `\.env` also matches `os.environ`, which
+    # appears in ordinary Python constantly and would make this the alarm people mute.
+    re.compile(r"\.env(?:\.[A-Za-z0-9_-]+)?(?=$|[\s\"'/\\])", re.IGNORECASE),
+    re.compile(r"\bcmdkey\b\s*/list", re.IGNORECASE),
+    re.compile(r"\bGet-Content\b(?=.*\bCredentials\b)", re.IGNORECASE),
+
+    # SENDING THE WORKSPACE SOMEWHERE. The $env: pairing further up catches a variable placed
+    # in an outbound request; these catch the file and the directory.
+    re.compile(r"\b(?:scp|rsync|sftp)\b[^|]*\s[\w.-]+@[\w.-]+:", re.IGNORECASE),
+    re.compile(r"\bcurl\b[^|]*\s(?:-T\b|--upload-file\b|-d\s*@|--data-binary\s*@|-F\s*\w+=@)",
+               re.IGNORECASE),
+
+    # A SHORT base64 payload. The existing -EncodedCommand pattern needs sixteen characters,
+    # and `powershell -enc cm0gLXJmIC8=` -- twelve characters, decoding to `rm -rf /` -- went
+    # straight through it. Anchored to powershell/pwsh so it cannot fire on `docker run -e
+    # SOMEVAR=1`, which is why the general pattern's threshold stays where it is.
+    re.compile(r"\b(?:powershell|pwsh)(?:\.exe)?\b[^|]*\s-e\w*\s+[A-Za-z0-9+/=]{8,}",
+               re.IGNORECASE),
+
     # ── THE TWO THAT MAKE REGEX INSUFFICIENT, matched anyway ──────────────────────────
     # `-EncodedCommand` takes base64 and `iex` takes a string, so either one can carry
     # anything past every pattern in this file. They cannot be matched THROUGH; they can only
@@ -298,7 +367,34 @@ def destructive_shell(cmd_text: str) -> bool:
     for pat in _DESTRUCTIVE_PATTERNS:
         if pat.search(cmd_text):
             return True
+    if _INLINE_INTERPRETER.search(cmd_text):
+        # THE HOLE BETWEEN THE TWO GATES. run_python() screens its source with
+        # destructive_python(); shell_exec() screens its command with the patterns above. A
+        # command that IS an interpreter carrying source -- `python -c "shutil.rmtree(...)"`,
+        # `node -e "fs.rmSync(...)"` -- is checked by neither: the shell patterns cannot read
+        # code and the Python screen never sees it. Measured 2026-08-31: three such commands
+        # went through untouched. Run the source screen over the command text, plus the
+        # equivalents in the other languages this machine can run.
+        if destructive_python(cmd_text):
+            return True
+        for pat in _INLINE_DESTRUCTIVE:
+            if pat.search(cmd_text):
+                return True
     return False
+
+
+#: An interpreter invoked with inline source rather than a file.
+_INLINE_INTERPRETER = re.compile(
+    r"\b(?:python[23]?|py|node|nodejs|perl|ruby|php)(?:\.exe)?\b[^|]*?\s-(?:c|e|r)\b",
+    re.IGNORECASE)
+
+#: Destroying a file in the languages destructive_python() does not speak.
+_INLINE_DESTRUCTIVE = [
+    re.compile(r"\b(?:rmSync|unlinkSync|rmdirSync|writeFileSync|truncateSync)\s*\("),
+    re.compile(r"\bfs\.(?:rm|unlink|rmdir|writeFile)\b"),
+    re.compile(r"\bunlink\b\s*(?:\(|glob\b|['\"$@])"),          # perl
+    re.compile(r"\b(?:File|FileUtils|Dir)\.(?:delete|unlink|rm|rm_rf|rmdir)\b"),  # ruby
+]
 
 
 # ---------------------------------------------------------------------------
