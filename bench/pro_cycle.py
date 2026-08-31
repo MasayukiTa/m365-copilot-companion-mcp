@@ -360,6 +360,31 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
         # leak it: those are graded offline and this process never sees them.
         _write_contracts(group)
 
+        # CAN THE FLEET ACTUALLY OPEN A WORKER? Asked AFTER staging, because staging is what
+        # spends the disk.
+        #
+        # MEASURED, 2026-09-01. This cycle's floor is checked before a batch is staged. Staging
+        # two js worktrees then took free space from 4.51 GB to 2.91 GB -- under the FLEET's own
+        # 3.0 GB admission floor, which is a different and lower number. So the fleet started,
+        # correctly refused to admit either worker, and sat in the queue. Both workers read
+        # `turn=0 pending` for half an hour and the batch was on course to burn its full
+        # one-hour timeout having run nothing. Nothing in any log said "disk"; the gate is
+        # silent because deferring admission is its normal behaviour.
+        #
+        # The gap between the two floors is exactly where a doomed batch lives. Freeing 0.75 GB
+        # released both workers within two minutes, which is the confirmation as well as the
+        # remedy.
+        if not _fleet_can_admit():
+            log("  staged, but %.2f GB free is under the fleet's own admission floor -- it "
+                "would open no worker at all" % free_gb())
+            _reclaim(free_gb())
+            if not _fleet_can_admit():
+                log("STOP before running batch %d: still under the fleet's admission floor "
+                    "after reclaiming. Discarding this batch's worktrees rather than starting "
+                    "a fleet that cannot admit; re-run when there is room." % n)
+                _discard()
+                break
+
         # ONE WORKER PER INSTANCE IN THE BATCH, and no more. The batch was already sized
         # against the disk; letting the fleet open more tabs than there are instances would
         # spend RAM and admission slots on nothing, and every extra concurrent worker makes
@@ -598,6 +623,25 @@ def _explode_preds():
     except Exception as exc:
         log("  could not prepare predictions for grading (%s)" % type(exc).__name__)
         return ""
+
+
+def _fleet_can_admit():
+    """Whether the fleet would admit at least one worker right now. True if it cannot be asked.
+
+    ASKING THE FLEET'S OWN PREDICATE, not a copy of it. A second implementation of an admission
+    rule drifts from the first, and the failure it produces -- a fleet that runs but admits
+    nobody -- is silent by construction, because deferring admission is what the gate is meant
+    to do.
+
+    Defaults to True when the predicate cannot be imported: this is a pre-flight convenience,
+    and it must never be the thing that stops a run on its own.
+    """
+    try:
+        from relay.fleet_runner import settings_disk_floor
+        from relay.relay_fleet import disk_admission_ok
+        return bool(disk_admission_ok(floor_gb=settings_disk_floor()))
+    except Exception:
+        return True
 
 
 def _reclaim(have):

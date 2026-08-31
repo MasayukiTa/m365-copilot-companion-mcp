@@ -372,3 +372,50 @@ def test_clearing_the_caches_never_raises(monkeypatch):
     monkeypatch.setattr(C.subprocess, "run",
                         lambda *a, **k: (_ for _ in ()).throw(OSError("no go")))
     assert isinstance(C._clear_toolchain_caches(), list)
+
+
+# -- the gap between two floors, where a doomed batch lives --------------------------------
+
+def test_a_batch_is_not_started_when_the_fleet_could_not_admit_anyone(monkeypatch):
+    """MEASURED. This cycle's floor is checked BEFORE staging; staging is what spends the disk.
+    Two js worktrees took free space from 4.51 GB to 2.91 GB -- under the FLEET's own 3.0 GB
+    admission floor, a different and lower number. The fleet started, correctly refused to admit
+    either worker, and sat there: both read `turn=0 pending` for half an hour, on course to burn
+    a full one-hour timeout having run nothing.
+
+    Nothing in any log said "disk". The gate is silent because deferring admission is its normal
+    behaviour, which is what makes this worth a pre-flight question."""
+    import relay.relay_fleet as RF
+    import relay.fleet_runner as FR
+    monkeypatch.setattr(FR, "settings_disk_floor", lambda *a, **k: 3.0)
+    monkeypatch.setattr(RF, "disk_admission_ok", lambda **k: False)
+    assert C._fleet_can_admit() is False
+    monkeypatch.setattr(RF, "disk_admission_ok", lambda **k: True)
+    assert C._fleet_can_admit() is True
+
+
+def test_it_asks_the_fleets_own_predicate_rather_than_copying_it():
+    """A second implementation of an admission rule drifts from the first, and the failure it
+    produces -- a fleet that runs but admits nobody -- is silent by construction."""
+    import inspect
+    src = inspect.getsource(C._fleet_can_admit)
+    assert "from relay.relay_fleet import disk_admission_ok" in src
+    assert "settings_disk_floor" in src
+
+
+def test_an_unaskable_predicate_does_not_stop_the_run(monkeypatch):
+    """This is a pre-flight convenience. It must never become the thing that halts a benchmark
+    on its own -- that would be a new failure introduced by a guard against an old one."""
+    import relay.relay_fleet as RF
+    monkeypatch.setattr(RF, "disk_admission_ok",
+                        lambda **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert C._fleet_can_admit() is True
+
+
+def test_the_check_runs_after_staging_not_before():
+    """SOURCE-LEVEL, stated as such. Asking before staging answers the wrong question: the
+    disk it is protecting has not been spent yet at that point."""
+    import inspect
+    src = inspect.getsource(C.cycle)
+    assert src.index("_write_contracts(group)") < src.index("_fleet_can_admit()")
+    assert src.index("_fleet_can_admit()") < src.index('"--max-concurrent"')
