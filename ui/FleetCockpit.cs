@@ -1036,6 +1036,9 @@ class CockpitWindow : Window
         if (k == "hs_tun_detail_ok") return ja ? "トンネル経由でサーバに到達できます" : "Server reachable through the tunnel";
         if (k == "hs_tun_detail_bad") return ja ? "トンネルからサーバに到達できません" : "Server not reachable through the tunnel";
         if (k == "hs_tun_detail_none") return ja ? "MCP_TUNNEL_URL が .env に未設定です" : "MCP_TUNNEL_URL is not set in .env";
+        if (k == "hs_fix_edge_navigate") return ja ? "エージェントのページを開いています..." : "opening the agent page...";
+        if (k == "hs_fix_edge_still") return ja ? "ページを開いても準備完了になりません" : "navigated, but the page is still not ready";
+        if (k == "hs_edge_detail_blank") return ja ? "ブラウザは動作中だがエージェントのページが開かれていない" : "browser up, but no agent page open";
         if (k == "hs_edge_detail_ok") return ja ? "コンパニオン Edge が稼働中 (:9222)" : "Companion Edge running (:9222)";
         if (k == "hs_edge_detail_bad") return ja ? "コンパニオン Edge に接続できません (:9222)" : "Companion Edge not reachable (:9222)";
         if (k == "hs_signin_ok") return ja ? "M365 にサインイン済み（ログイン画面なし）" : "Signed in to M365 (no login wall)";
@@ -2101,11 +2104,34 @@ class CockpitWindow : Window
                    T(tunOk ? "hs_tun_detail_ok" : "hs_tun_detail_bad"), now);
         }
 
-        // 2) Edge: GET http://127.0.0.1:9222/json/version succeeds
+        // 2) Edge: CDP answers, AND a tab is actually on the agent.
+        //
+        // This tested /json/version alone, which only says a browser process is listening. On
+        // 2026-08-31 the fleet's Edge sat on about:blank for hours -- every worker fell back to
+        // the assistant with no tools and wrote patches from memory -- and this dot was GREEN
+        // throughout, because a browser was indeed listening. A dot that is green during the
+        // incident it exists to surface is not a signal.
+        //
+        // /json/list over plain HTTP, not Playwright: connect_over_cdp on a 15-second poll is
+        // heavy and was measured interfering with the bridge's own page. The page's URL is
+        // enough to tell "on the agent" from "blank".
         string edgeVersion = HttpGetBody("http://127.0.0.1:9222/json/version", 3500);
         bool edgeOk = edgeVersion != null;
-        SetDot(2, edgeOk ? HealthState.Green : HealthState.Red,
-               T(edgeOk ? "hs_edge_detail_ok" : "hs_edge_detail_bad"), now);
+        if (!edgeOk)
+        {
+            SetDot(2, HealthState.Red, T("hs_edge_detail_bad"), now);
+        }
+        else
+        {
+            string tabs = HttpGetBody("http://127.0.0.1:9222/json/list", 3500);
+            bool onAgent = tabs != null && tabs.IndexOf("m365.cloud.microsoft", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (onAgent)
+                SetDot(2, HealthState.Green, T("hs_edge_detail_ok"), now);
+            else
+                // Amber, not red: the browser is up and one navigation away from usable, which
+                // is exactly what the automatic repair is for.
+                SetDot(2, HealthState.Yellow, T("hs_edge_detail_blank"), now);
+        }
 
         // 5) Tool: independent of the fleet Edge (:9222) probed above -- this reads the BRIDGE's
         //    own idle self-probe result (.fleet/tool_probe.json). Runs unconditionally (not gated
@@ -2231,7 +2257,7 @@ class CockpitWindow : Window
             {
                 HealthState st = _health[dot].State;
                 bool bad = (st == HealthState.Red)
-                        || (st == HealthState.Yellow && (dot == 4 || dot == 5));
+                        || (st == HealthState.Yellow && (dot == 2 || dot == 4 || dot == 5));
                 if (!bad) continue;
                 // RunFix has a sign-in branch for RED only; a yellow sign-in would burn the
                 // whole budget doing nothing, so it is not a target.
@@ -2853,6 +2879,35 @@ class CockpitWindow : Window
                 finally { done(); }
             })) { IsBackground = true };
             t.Start();
+            return;
+        }
+
+        // Priority 1b: Edge YELLOW (browser up, no agent page) -> navigate. Do NOT relaunch.
+        //
+        // This is the incident state, and the repair for it is one navigation. Measured by
+        // hand on 2026-08-31: eight seconds. A hard reset would also work and would throw away
+        // a browser that is fine, taking the session and any warm state with it -- the heavier
+        // remedy is for an Edge that does not answer at all, which is Priority 2 below.
+        if (edge == HealthState.Yellow)
+        {
+            note(T("hs_fix_edge_navigate"));
+            var tnav = new Thread(new ThreadStart(delegate
+            {
+                try
+                {
+                    string agentUrl = EnvValue("MCP_FLEET_AGENT_URL");
+                    if (string.IsNullOrEmpty(agentUrl)) agentUrl = EnvValue("MCP_IMPL_AGENT_URL");
+                    if (string.IsNullOrEmpty(agentUrl)) { note(T("hs_fix_err")); return; }
+                    // relay.edge_auth --ensure <url> exists so this caller does not have to
+                    // invent its own way to run an inline snippet.
+                    string outp = RunPyModule("relay.edge_auth",
+                                              "--ensure \"" + agentUrl + "\"", 180000);
+                    note((outp ?? "").Trim() == "ready" ? T("hs_fix_done") : T("hs_fix_edge_still"));
+                }
+                catch (Exception ex) { note(T("hs_fix_err") + ": " + ex.Message); }
+                finally { done(); }
+            })) { IsBackground = true };
+            tnav.Start();
             return;
         }
 
