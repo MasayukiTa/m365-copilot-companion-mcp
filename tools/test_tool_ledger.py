@@ -148,3 +148,54 @@ def test_the_gateway_records_every_dispatched_call():
     assert body.index("record_call") < body.index("_out = fn(**_args)"), \
         "the call is recorded AFTER the tool runs; an orphan would then be invisible"
     assert body.count("record_outcome") >= 2, "an error path does not record its outcome"
+
+
+# ── attribution, which the first real batch proved was missing ────────────────────────────
+
+def test_calls_are_found_by_where_they_operated(ledger):
+    """THE `task` FIELD IS USUALLY EMPTY. The gateway records task=_args.get("_task") and
+    nothing passes _task -- a fleet worker is a Copilot agent calling a tool; it does not know
+    which benchmark instance it is. Measured on the first real batch: every call landed with an
+    empty task, for_task returned nothing, and the whole assessment came back UNVERIFIABLE.
+
+    What every call DOES carry is the path it worked on, and the benchmark already maps an
+    instance to its worktree."""
+    root = "C:/w/.fleet/swe/work/p01_abc"
+    a = L.record_call("write_file", {"path": root + "/src/user.js"})
+    L.record_outcome(a, ok=True, result="written")
+    b = L.record_call("shell_exec", {"command": "npm test", "working_dir": root})
+    L.record_outcome(b, ok=True, result="pass")
+    L.record_call("read_file", {"path": "C:/w/.fleet/swe/work/p99_other/x.js"})
+
+    got = L.for_task("", root=root)
+    assert [g["call"]["tool"] for g in got] == ["write_file", "shell_exec"]
+    assert got[0]["outcome"]["ok"] is True
+
+
+def test_another_instances_work_is_not_attributed_here(ledger):
+    """Two worktrees under the same parent. Matching loosely would credit one instance with
+    another's work, which is worse than no attribution."""
+    L.record_call("write_file", {"path": "C:/w/work/p02_xyz/a.js"})
+    assert L.for_task("", root="C:/w/work/p01_abc") == []
+
+
+def test_backslashes_and_case_do_not_defeat_it(ledger):
+    """Windows hands the same directory back in several spellings, and a path comparison that
+    only works for one of them works by luck."""
+    cid = L.record_call("write_file", {"path": r"C:\W\Work\P01_ABC\src\a.js"})
+    L.record_outcome(cid, ok=True, result="ok")
+    assert len(L.for_task("", root="c:/w/work/p01_abc")) == 1
+
+
+def test_an_explicit_task_still_wins(ledger):
+    """Where a producer does set it, the field is authoritative -- path matching is the
+    fallback for the callers that cannot."""
+    cid = L.record_call("write_file", {"path": "/elsewhere/a.py"}, task="job-7")
+    L.record_outcome(cid, ok=True, result="ok")
+    assert len(L.for_task("job-7")) == 1
+
+
+def test_no_root_and_no_task_returns_everything_rather_than_guessing(ledger):
+    L.record_call("read_file", {"path": "a"})
+    L.record_call("read_file", {"path": "b"})
+    assert len(L.for_task("")) == 2

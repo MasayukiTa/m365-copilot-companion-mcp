@@ -175,16 +175,46 @@ def orphans(rows=None):
             if r.get("event") == "call" and r.get("id") not in seen_outcome]
 
 
-def for_task(task: str, rows=None):
+def for_task(task: str, rows=None, root: str = ""):
     """Every call made under one task, with its outcome attached where there is one.
 
     This is what a verifier reads instead of the worker's account of itself.
+
+    ATTRIBUTION BY PATH, BECAUSE THE `task` FIELD IS USUALLY EMPTY. The gateway records
+    `task=_args.get("_task")` and nothing passes `_task` -- a fleet worker is a Copilot agent
+    calling a tool; it does not know which benchmark instance it is. Measured on the first real
+    batch: every call landed with an empty task, so this returned nothing and the whole
+    assessment came back UNVERIFIABLE. Wiring a field no producer sets is the same mistake as
+    inventing an API name.
+
+    What IS present in every call is the path being worked on, and the benchmark already maps
+    an instance to its worktree. So `root` matches a call by where it operated, which is a fact
+    the record actually contains.
     """
     rows = read() if rows is None else rows
     outcomes = {r.get("id"): r for r in rows if r.get("event") == "outcome"}
+    needle = (root or "").replace("\\", "/").rstrip("/").lower()
+    unfiltered = not task and not needle
     out = []
     for r in rows:
-        if r.get("event") != "call" or (task and r.get("task") != task):
+        if r.get("event") != "call":
             continue
-        out.append({"call": r, "outcome": outcomes.get(r.get("id"))})
+        # NO FILTER MEANS EVERYTHING; A FILTER THAT MATCHES NOTHING MEANS NOTHING. The two must
+        # not be confused: silently returning every call to a caller who asked about one task
+        # would attribute other instances' work to it, and that is worse than no attribution.
+        if unfiltered or (task and r.get("task") == task) or (needle and _touches(r, needle)):
+            out.append({"call": r, "outcome": outcomes.get(r.get("id"))})
     return out
+
+
+def _touches(call: dict, needle: str) -> bool:
+    """Whether a recorded call operated inside `needle`. Reads the bounded argument text that
+    is already stored, so nothing extra has to be recorded for this to work."""
+    args = (call or {}).get("args") or {}
+    if not isinstance(args, dict):
+        return False
+    for value in args.values():
+        text = value.get("text") if isinstance(value, dict) else value
+        if isinstance(text, str) and needle in text.replace("\\", "/").lower():
+            return True
+    return False
