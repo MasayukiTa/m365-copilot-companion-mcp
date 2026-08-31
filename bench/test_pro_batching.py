@@ -84,13 +84,21 @@ def test_every_instance_appears_exactly_once(monkeypatch):
 
 
 def test_cheap_languages_go_first(monkeypatch):
-    """Order matters when a run is cut short -- and this one has been, twice. Front-loading
-    the cheap instances means an interrupted run still graded most of the slice."""
+    """Order matters when a run is cut short -- and this one has been, three times now.
+    Front-loading the cheap instances means an interrupted run still captured most of the
+    slice.
+
+    ASSERTED AGAINST THE TABLE, not against a fixed order. The first version of this test
+    hardcoded go ahead of js, which was true only while go was mis-costed at 200 MB; when the
+    real figure turned out to be ~670 MB the test failed for being right about the old number.
+    A test that pins a measurement it does not own goes stale the moment the measurement is
+    corrected."""
     lang = {"n1": "js", "p1": "python", "g1": "go"}
     monkeypatch.setattr(C, "lang_of", lambda i: lang[i])
     order = [i for group in C.batches(list(lang), 1) for i in group]
-    assert order.index("p1") < order.index("n1")
-    assert order.index("g1") < order.index("n1")
+    cost = [C.LANG_DISK_MB[lang[i]] for i in order]
+    assert cost == sorted(cost), "batches are not ordered cheapest-first: %s" % list(zip(order, cost))
+    assert order[0] == "p1", "python is the cheapest and must run first"
 
 
 def test_an_explicit_size_overrides_the_disk_calculation(monkeypatch):
@@ -322,3 +330,45 @@ def test_the_pruning_rule_is_the_one_in_the_stager():
     src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "pro_stage_goals.py"), encoding="utf-8").read()
     assert "if k in wtmap or os.path.isdir(str(v))" in src
+
+
+# -- the cost that lives outside the worktree ----------------------------------------------
+
+def test_go_is_costed_by_its_module_cache_not_its_checkout():
+    """THE MEASUREMENT THAT WAS WRONG. go was costed at 200 MB, which is what a go WORKTREE
+    weighs. The cost that matters is the module cache `go test ./...` fills in ~/go/pkg/mod,
+    outside the worktree, where the per-batch discard cannot see it. Three go instances put
+    2.01 GB there in ninety minutes and drove the run into the disk floor."""
+    assert C.LANG_DISK_MB["go"] >= 600, "go is costed as if only its checkout mattered"
+
+
+def test_go_now_runs_narrower_than_python_at_the_same_disk():
+    assert C.concurrency_for(["go"], 4.7) < C.concurrency_for(["python"], 4.7)
+
+
+def test_toolchain_caches_are_cleared_only_when_still_short(monkeypatch):
+    """They cost a re-download to rebuild, so clearing them between every batch would trade
+    the disk problem for a network one. As a last resort before STOPPING, it is plainly worth
+    it -- it recovered 2.05 GB and let a stalled run continue."""
+    called = []
+    monkeypatch.setattr(C, "_clear_toolchain_caches",
+                        lambda: called.append(1) or [("go module cache", 2051.0)])
+    import relay.edge_recover as E
+    monkeypatch.setattr(E, "trim_profile_caches", lambda: (0.0, []))
+    monkeypatch.setattr(C, "log", lambda *a: None)
+
+    monkeypatch.setattr(C, "free_gb", lambda *a: C.DISK_FLOOR_GB + 1.0)
+    C._reclaim(2.0)
+    assert called == [], "cleared the toolchain caches while there was room"
+
+    monkeypatch.setattr(C, "free_gb", lambda *a: C.DISK_FLOOR_GB - 0.5)
+    C._reclaim(2.0)
+    assert called == [1], "did not clear them even though the run was about to stop"
+
+
+def test_clearing_the_caches_never_raises(monkeypatch):
+    """A benchmark must not die trying to make room for itself, and these shell out to
+    toolchains that may not be installed."""
+    monkeypatch.setattr(C.subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("no go")))
+    assert isinstance(C._clear_toolchain_caches(), list)

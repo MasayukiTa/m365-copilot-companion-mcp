@@ -192,7 +192,43 @@ def check_slice_is_fresh(ids, allow_burned=False):
 #: that matters arrives later -- a NodeBB worktree reached 564 MB after npm install, an
 #: ansible one stayed small. Disk is the binding constraint on this machine, so this table is
 #: what decides how many can run at once.
-LANG_DISK_MB = {"js": 560, "ts": 560, "python": 120, "go": 200}
+#: go was 200 here and that was WRONG, measured the wrong thing. 200 MB is what a go worktree
+#: weighs; the cost that matters is the module cache, which `go test ./...` fills OUTSIDE the
+#: worktree in ~/go/pkg/mod, where the per-batch discard cannot see it. Three go instances put
+#: 2.01 GB there in ninety minutes and drove the run into the disk floor. ~670 MB each,
+#: rounded up because instances from different repositories share almost nothing.
+LANG_DISK_MB = {"js": 560, "ts": 560, "python": 120, "go": 700}
+
+#: Caches that language toolchains fill OUTSIDE the worktree, so per-batch discard never sees
+#: them and they grow across the whole run. Cleared only as a last resort -- see _reclaim.
+def _clear_toolchain_caches():
+    """Empty the module/package caches that live outside the worktrees. Returns [(name, mb)].
+
+    ONLY CALLED WHEN THE RUN IS ABOUT TO STOP for lack of disk, because everything here is
+    re-downloaded afterwards: clearing it between every batch would trade the disk problem for
+    a network one. As a last resort before stopping it is plainly worth it -- it recovered
+    2.05 GB and let a stalled run continue.
+    """
+    import shutil as _sh
+    freed = []
+    go = _sh.which("go") or r"C:\Program Files\Goin\go.exe"
+    if os.path.exists(go):
+        before = free_gb()
+        try:
+            subprocess.run([go, "clean", "-modcache"], capture_output=True, timeout=900)
+            freed.append(("go module cache", (free_gb() - before) * 1000))
+        except Exception:
+            pass
+    npm = _sh.which("npm")
+    if npm:
+        before = free_gb()
+        try:
+            subprocess.run([npm, "cache", "clean", "--force"], capture_output=True,
+                           timeout=900, shell=True)
+            freed.append(("npm cache", (free_gb() - before) * 1000))
+        except Exception:
+            pass
+    return freed
 DEFAULT_DISK_MB = 300
 
 
@@ -565,6 +601,11 @@ def _reclaim(have):
         return have
     for note in notes:
         log("  reclaim: %s" % note)
+    if free_gb() < DISK_FLOOR_GB:
+        # STILL SHORT. The toolchain caches are the last thing to give back, because they cost
+        # a re-download to rebuild -- but a stopped run costs more.
+        for name, mb in _clear_toolchain_caches():
+            log("  reclaim: %s freed %.0f MB" % (name, mb))
     now = free_gb()
     log("  reclaimed %.0f MB: %.2f -> %.2f GB free" % (freed, have, now))
     return now
