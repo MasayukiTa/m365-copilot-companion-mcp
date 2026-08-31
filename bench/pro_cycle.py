@@ -501,8 +501,18 @@ def _shadow_verify(group):
                     "reasons": v.get("reasons"),
                     "tree_stable": bool(v.get("tree_before")) and
                                    v.get("tree_before") == v.get("tree_after"),
+                    # THE EVIDENCE, NOT JUST THE VERDICT. This record used to carry id, ok and
+                    # duration and nothing else, so "project_tests failed in 3.4s" was the
+                    # entire account -- and the reason it failed (the project's dependencies
+                    # were not installed, so collection died and no test ran) was invisible for
+                    # a whole run. A record that states a failure without what it saw cannot be
+                    # checked, which is the same defect this pipeline exists to fix in workers.
                     "checks": [{"id": c.get("id"), "ok": c.get("ok"),
-                                "duration_s": c.get("duration_s")} for c in v.get("checks") or []],
+                                "duration_s": c.get("duration_s"),
+                                "unavailable": bool(c.get("unavailable")),
+                                "why_unavailable": c.get("why_unavailable", ""),
+                                "output_tail": (c.get("output") or "")[-600:]}
+                               for c in v.get("checks") or []],
                 }, ensure_ascii=False) + "\n")
         log("  verify(shadow): " + ", ".join("%s=%d" % kv for kv in sorted(counts.items())))
     except Exception as exc:
