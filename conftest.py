@@ -41,6 +41,9 @@ LIVE_RECORD_REDIRECTS = {
     "relay.selfimprove.pending": {"QUEUE_PATH": "pending_decisions.jsonl"},
     "relay.selfimprove.record_summary": {"CACHE_PATH": "record_summaries.json"},
     "relay.capture_status": {"STATUS_PATH": "capture_status.json"},
+    # Written on the hot path of EVERY tool call, so a test that reaches the gateway fills the
+    # operator's evidence ledger with calls that were never made in earnest.
+    "tools.tool_ledger": {"LEDGER_PATH": "tool_events.jsonl"},
     "relay.selfimprove.ledger": {"DEFAULT_PATH": "hypotheses.jsonl"},
     "relay.selfimprove.compare": {"QUEUE_PATH": "compare_queue.jsonl",
                                   "RESULTS_PATH": "compare_results.jsonl"},
