@@ -238,3 +238,60 @@ def test_an_unavailable_check_cannot_promote():
                                     "output": "1 error during collection", "duration_s": 3.5})
     assert v["state"] == SV.VERIFY_UNAVAILABLE
     assert SV.promote(True, v) != SV.DONE
+
+
+# ── where the ledger settles what the runner could not ────────────────────────────────────
+
+UNAVAIL = {"state": SV.VERIFY_UNAVAILABLE}
+CONTRA = {"verdict": "CONTRADICTED", "reasons": ["claimed DONE with no successful write"]}
+
+
+def test_evidence_settles_a_claim_when_nothing_could_be_run():
+    """THE GAP THIS CLOSES. In a staged worktree the acceptance command cannot run at all, so
+    the ledger is the only signal there is -- and it was being collected and discarded. One log
+    line said CONTRADICTED and the next said CANDIDATE_DONE, about the same task."""
+    assert SV.promote(True, UNAVAIL, CONTRA) == SV.EVIDENCE_CONTRADICTED
+
+
+def test_it_is_still_not_a_failure_because_nothing_was_executed():
+    """Weaker than VERIFY_FAILED on purpose. No command ran, so no command failed."""
+    assert SV.EVIDENCE_CONTRADICTED != SV.VERIFY_FAILED
+    assert SV.EVIDENCE_CONTRADICTED != SV.DONE
+
+
+def test_a_passing_independent_run_outranks_the_ledger():
+    """If the contract's own commands passed against the finished tree, the work is done
+    whatever the ledger looks like. Execution beats bookkeeping."""
+    assert SV.promote(True, {"state": SV.DONE}, CONTRA) == SV.DONE
+
+
+def test_a_failing_independent_run_stands_on_its_own():
+    assert SV.promote(True, {"state": SV.VERIFY_FAILED}, CONTRA) == SV.VERIFY_FAILED
+
+
+def test_supporting_evidence_never_promotes_anything():
+    """Tool calls show what was ATTEMPTED, not that it was right. Treating them as proof would
+    rebuild the self-report this whole pipeline exists to stop believing."""
+    supported = {"verdict": "SUPPORTED", "reasons": ["ran the acceptance command"]}
+    assert SV.promote(True, UNAVAIL, supported) == SV.CANDIDATE_DONE
+
+
+def test_unverifiable_evidence_changes_nothing():
+    assert SV.promote(True, UNAVAIL, {"verdict": "UNVERIFIABLE"}) == SV.CANDIDATE_DONE
+    assert SV.promote(True, UNAVAIL, None) == SV.CANDIDATE_DONE
+    assert SV.promote(True, UNAVAIL, {}) == SV.CANDIDATE_DONE
+
+
+def test_no_claim_means_no_state_whatever_the_evidence_says():
+    """Nothing to contradict. A worker that never claimed DONE is not being judged."""
+    assert SV.promote(False, UNAVAIL, CONTRA) == ""
+
+
+def test_the_cycle_passes_the_evidence_in():
+    """SOURCE-LEVEL, stated as such: the cycle stages repositories and runs a fleet. This
+    catches the wiring being dropped, which is how the signal came to be discarded before."""
+    import io
+    import os as _os
+    repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    src = io.open(_os.path.join(repo, "bench", "pro_cycle.py"), encoding="utf-8").read()
+    assert "SV.promote(inst in claimed, v, _EVIDENCE_BY_INSTANCE.get(inst))" in src

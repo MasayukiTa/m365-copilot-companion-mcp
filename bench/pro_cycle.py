@@ -485,6 +485,15 @@ def _shadow_assess(group):
             rows.append({"ts": time.time(), "instance": inst, "claimed_done": bool(claimed),
                          "verdict": v.get("verdict"), "reasons": v.get("reasons"),
                          "evidence": v.get("evidence")})
+        # HANDED TO THE VERIFIER, not just written down. The two assessments were being made
+        # independently and reported side by side, so one log line said CONTRADICTED and the
+        # next said CANDIDATE_DONE about the same task. Where the acceptance command cannot be
+        # run at all -- the normal case in a staged worktree with no dependencies installed --
+        # the ledger is the only signal there is, and it was being discarded.
+        _EVIDENCE_BY_INSTANCE.clear()
+        for r in rows:
+            _EVIDENCE_BY_INSTANCE[r["instance"]] = {"verdict": r["verdict"],
+                                                    "reasons": r.get("reasons")}
         with open(SHADOW, "a", encoding="utf-8") as fh:
             for r in rows:
                 fh.write(_json.dumps(r, ensure_ascii=False) + "\n")
@@ -503,6 +512,10 @@ def _shadow_assess(group):
 
 
 VERIFY = os.path.join(SW, "pro_cycle_verify.jsonl")
+
+#: The evidence assessment for the batch being processed, so the verifier can consult it
+#: where it could not run anything itself. Refilled per batch; never read across batches.
+_EVIDENCE_BY_INSTANCE = {}
 
 
 def _shadow_verify(group):
@@ -529,11 +542,12 @@ def _shadow_verify(group):
                 contract = AC.load(inst)
                 cwd = G.wt_for(inst)
                 v = SV.verify(contract, cwd=cwd)
-                state = SV.promote(inst in claimed, v) or "NO_CLAIM"
+                state = SV.promote(inst in claimed, v, _EVIDENCE_BY_INSTANCE.get(inst)) or "NO_CLAIM"
                 counts[state] = counts.get(state, 0) + 1
                 fh.write(_json.dumps({
                     "ts": time.time(), "instance": inst, "claimed_done": inst in claimed,
                     "state": state, "verify_state": v.get("state"),
+                    "evidence_verdict": (_EVIDENCE_BY_INSTANCE.get(inst) or {}).get("verdict"),
                     "reasons": v.get("reasons"),
                     "tree_stable": bool(v.get("tree_before")) and
                                    v.get("tree_before") == v.get("tree_after"),
