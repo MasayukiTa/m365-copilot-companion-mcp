@@ -2199,34 +2199,81 @@ class CockpitWindow : Window
     // bounded number of times, and hands over to the human only when it has genuinely failed.
     const int AUTOFIX_CONSECUTIVE_POLLS = 2;   // ~30s of a steady fault, not one flap
     const int AUTOFIX_MAX_ATTEMPTS      = 3;   // then it is the human's turn
+    const int AUTOFIX_GREEN_POLLS_TO_RESET = 3; // one green poll is a flap, not a recovery
     int _autoFixBadPolls = 0;
+    int _autoFixGreenPolls = 0;
+    string _autoFixFault = "";
     int _autoFixAttempts = 0;
+
+    // Which dot a repair would target, and whether that repair touches the FLEET's Edge.
+    //
+    // The first version stood down for ANY live run, which silenced two things it should not
+    // have. The tool dot's repair targets the interactive bridge on :9223 -- a different
+    // browser -- so a long fleet run could leave the chat side broken indefinitely. And the
+    // agent dot is only ever red or yellow WHILE a run is live, so gating on "a run is live"
+    // made automatic agent repair unreachable by construction.
+    //
+    // The question is not "is something running" but "does this repair touch what is running".
+    int AutoFixTargetDot()
+    {
+        lock (_healthLock)
+        {
+            if (_health[3].State == HealthState.Red) return 3;    // sign-in (RunFix: red only)
+            if (_health[2].State == HealthState.Red) return 2;    // edge
+            if (_health[4].State == HealthState.Red
+             || _health[4].State == HealthState.Yellow) return 4; // agent
+            if (_health[0].State == HealthState.Red
+             || _health[1].State == HealthState.Red) return 0;    // server / tunnel
+            if (_health[5].State == HealthState.Red
+             || _health[5].State == HealthState.Yellow) return 5; // tool (bridge :9223)
+        }
+        return -1;
+    }
+
+    static bool RepairTouchesFleetEdge(int dot)
+    {
+        // sign-in and edge relaunch :9222; agent reconnects it. tool targets :9223, and
+        // server/tunnel restart the backend -- neither is the fleet's browser.
+        return dot == 3 || dot == 2 || dot == 4;
+    }
+
+    // Re-checks the live-run guard on the UI thread immediately before acting: MaybeAutoFix
+    // ran on the poll thread, and a run can start in the gap between that check and this call.
+    void RunFixAuto(int dot)
+    {
+        if (RepairTouchesFleetEdge(dot) && FleetRunIsLive()) return;
+        RunFix();
+    }
 
     void MaybeAutoFix()
     {
-        HealthState worst = HealthState.Green;
-        lock (_healthLock)
+        int dot = AutoFixTargetDot();
+        if (dot < 0)
         {
-            for (int i = 0; i < HEALTH_DOT_COUNT; i++)
+            // Count green polls rather than resetting on the first: a fault that flaps green
+            // for one tick would otherwise get an unlimited budget and restart for ever.
+            _autoFixGreenPolls++;
+            if (_autoFixGreenPolls >= AUTOFIX_GREEN_POLLS_TO_RESET)
             {
-                HealthState st = _health[i].State;
-                if (st == HealthState.Red) { worst = HealthState.Red; break; }
-                if (st == HealthState.Yellow) worst = HealthState.Yellow;
+                _autoFixBadPolls = 0;
+                _autoFixAttempts = 0;
+                _autoFixFault = "";
             }
-        }
-
-        if (worst != HealthState.Red && worst != HealthState.Yellow)
-        {
-            _autoFixBadPolls = 0;
-            _autoFixAttempts = 0;
             return;
         }
+        _autoFixGreenPolls = 0;
 
-        // NOT WHILE A RUN IS LIVE. The repair tiers relaunch the companion Edge -- Priority 1
-        // brings it up HEADED for a sign-in, Priority 2 hard-resets it -- and that Edge is
-        // what a running fleet is driving. A person pressing the button is choosing that; a
-        // timer is not.
-        if (FleetRunIsLive()) { _autoFixBadPolls = 0; return; }
+        // A DIFFERENT FAULT GETS ITS OWN BUDGET. One persistent high-priority failure used to
+        // consume all three attempts and leave every later fault unrepaired.
+        string fault = "dot" + dot;
+        if (fault != _autoFixFault)
+        {
+            _autoFixFault = fault;
+            _autoFixAttempts = 0;
+            _autoFixBadPolls = 0;
+        }
+
+        if (RepairTouchesFleetEdge(dot) && FleetRunIsLive()) { _autoFixBadPolls = 0; return; }
 
         _autoFixBadPolls++;
         if (_autoFixBadPolls < AUTOFIX_CONSECUTIVE_POLLS) return;
@@ -2237,8 +2284,9 @@ class CockpitWindow : Window
         _autoFixBadPolls = 0;
         try
         {
+            int d = dot;
             if (!Dispatcher.HasShutdownStarted)
-                Dispatcher.BeginInvoke(new Action(delegate { RunFix(); }));
+                Dispatcher.BeginInvoke(new Action(delegate { RunFixAuto(d); }));
         }
         catch (Exception) { }
     }
