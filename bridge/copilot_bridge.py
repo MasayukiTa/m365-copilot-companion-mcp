@@ -5584,6 +5584,8 @@ def _run_tool_probe():
     _page_main has nothing to click without one. Every PAGE-touching step below still runs on
     the page-owner thread (run_on_page_thread) and inside the SAME PAGE_LOCK this function
     already holds, so recovery can never race a real user turn."""
+    _probe_borrowed = None       # bound before the try: the finally below reads it on every
+                                 # path, including one that throws before the borrow.
     try:
         if MCP_TOOL_PROBE_SEC <= 0:
             return  # opt-out
@@ -5592,12 +5594,36 @@ def _run_tool_probe():
             logger.debug("tool probe: skipped (user turn %.0fs ago)", since_user)
             return max(5.0, TOOL_PROBE_MIN_IDLE_SEC - since_user)
         if PAGE is None:
-            # Startup not finished yet (or _page_main never got there) -- report this directly
-            # instead of calling run_on_page_thread, which would block this timer thread
-            # forever if the page-owner thread never reaches PAGE_EXECUTOR.run_forever().
-            tool_probe.record_probe(False, "starting", detail="PAGE not initialized; retrying")
-            logger.info("tool probe: starting (PAGE not initialized); short retry armed")
-            return 15.0
+            # BORROW ONE, THE WAY EVERY OTHER PAGE CONSUMER DOES.
+            #
+            # This used to report "PAGE not initialized; retrying" and give up. Under the
+            # default MCP_BRIDGE_RELEASE_PAGE=1 -- chosen deliberately, a resident page costs
+            # about half a gigabyte -- PAGE is None WHENEVER THE BRIDGE IS IDLE. And this
+            # probe only runs when the bridge is idle (TOOL_PROBE_MIN_IDLE_SEC). So the one
+            # instrument that watches the tool path could never succeed: it looked for a page
+            # at precisely the moment the design guarantees there is none.
+            #
+            # The consequence was not a red dot on a panel. It was that on 2026-08-31 the tool
+            # path was genuinely down for hours, every fleet worker reported having no tools,
+            # two benchmark runs produced patches written from memory, and the health signal
+            # said "starting" throughout -- indistinguishable from what it says when everything
+            # is fine.
+            # ON THE PAGE-OWNER THREAD, AND BOUNDED.
+            #
+            # borrow_page reaches Playwright, which has thread affinity, so calling it from
+            # this timer thread is not allowed. The original comment here explains why it did
+            # not simply submit: an unbounded submit blocks this thread forever if the owner
+            # never services its queue. submit_bounded exists for exactly that -- it fails
+            # closed instead of hanging, which is the whole reason the guard was there.
+            try:
+                _ok_borrow, _probe_borrowed = PAGE_EXECUTOR.submit_bounded(30.0, borrow_page)
+            except Exception:
+                _ok_borrow, _probe_borrowed = False, None
+            if not _ok_borrow or PAGE is None:
+                tool_probe.record_probe(False, "starting",
+                                        detail="no page available to probe with; retrying")
+                logger.info("tool probe: could not borrow a page; short retry armed")
+                return 15.0
         if not PAGE_LOCK.acquire(blocking=False):
             logger.debug("tool probe: skipped (page busy)")
             return 15.0
@@ -5730,6 +5756,21 @@ def _run_tool_probe():
         except Exception:
             pass
         return 30.0
+    finally:
+        # GIVE BACK EXACTLY WHAT WAS BORROWED, on every path out.
+        #
+        # The borrow above exists because PAGE is None whenever the bridge is idle, which is
+        # the only time this probe runs. Not returning it would leak a Copilot tab per probe
+        # cycle -- and a resident tab is the half-gigabyte that MCP_BRIDGE_RELEASE_PAGE=1 was
+        # made the default to avoid. A health check that costs more than the thing it watches
+        # gets switched off.
+        try:
+            if _probe_borrowed:
+                # Bounded for the same reason as the borrow: a page-owner thread that has
+                # stopped servicing its queue must not turn cleanup into a hang.
+                PAGE_EXECUTOR.submit_bounded(30.0, return_page, _probe_borrowed)
+        except Exception:
+            logger.warning("tool probe: could not return the borrowed page", exc_info=True)
 
 
 # BUG 1 fix: how long to wait before the FIRST probe after startup (short), vs. the normal idle
