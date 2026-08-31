@@ -137,12 +137,17 @@ def main():
             continue
         if _rd is not None:
             d = _rd
-            if len(d) > MAX_PATCH_BYTES:
+            _over = len(d) > MAX_PATCH_BYTES
+            if _over:
                 skipped.append((inst, "diff of %d bytes exceeds %d; not a fix"
                                 % (len(d), MAX_PATCH_BYTES)))
                 d = ""
             _emit(preds, have, inst, d, a.prefix)
-            captured += 1
+            # NOT BOTH. An oversize diff was being counted as captured AND listed as skipped,
+            # so a one-instance batch reported "captured 1, skipped 1". A count that adds up to
+            # more than the work done is the kind of number that hides a real one.
+            if not _over:
+                captured += 1
             # RELEASE THE CONTAINER once its patch is safely recorded. Forty instances over
             # five batches leave forty containers and forty work directories on a volume with
             # 25 GB free, and the images they are built from are the 183 GB that must not be
@@ -188,11 +193,15 @@ def main():
         # regenerated vendored and built files, so `git diff HEAD` returned most of a
         # checkout. It made the predictions file 115 MB on a box that had 2.7 GB free, and
         # no grader can score it. Record the fact and the size; do not store the bytes.
-        if len(d) > MAX_PATCH_BYTES:
+        over = len(d) > MAX_PATCH_BYTES
+        if over:
             skipped.append((inst, "diff of %d bytes exceeds %d; not a fix" % (len(d), MAX_PATCH_BYTES)))
             d = ""
         _emit(preds, have, inst, d, a.prefix)
-        captured += 1
+        # NOT BOTH -- see the routed branch above. Measured: batch 1 of the final run reported
+        # "captured 1, skipped 1" for a batch containing exactly one instance.
+        if not over:
+            captured += 1
         if not a.keep:
             # `git worktree remove` FIRST, rmtree only as a fallback.
             #
