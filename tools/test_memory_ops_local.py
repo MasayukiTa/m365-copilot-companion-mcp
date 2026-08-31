@@ -79,8 +79,32 @@ def test_neither_local_variant_is_exposed_as_a_tool():
     """緩い方が道具として外に出ていたら、ゲートを外したのと同じ。"""
     import io
     src = io.open("main.py", encoding="utf-8").read()
-    for name in ("memory_save_local", "runlog_append_local"):
+    for name in ("memory_save_local", "runlog_append_local", "multi_edit_local"):
         assert name not in src, "main.py が %s を公開している" % name
+
+
+def test_the_edit_local_variant_writes_what_the_gated_one_would(tmp_path):
+    """三つ目の _local。ゲート版と同じ結果を書くこと。
+
+    三度目なので、症状も同じだった。tools/auto/autoloop.py の複数ファイル編集セルが
+    ゲート版 multi_edit を in-process で呼び、全ての編集が
+    "[locked: no HTTP request context]" を返していた。返り値は文字列なので、
+    見なければ書けたことになる -- 一度も触っていない木を revert して、
+    やったと報告するところだった。
+    """
+    from tools.coding_ops import multi_edit_local
+    p = tmp_path / "x.py"
+    p.write_text("N = 1\n", encoding="utf-8")
+    out = multi_edit_local(str(p), [{"old": "N = 1", "new": "N = 2"}])
+    assert not out.startswith("[locked")
+    assert p.read_text(encoding="utf-8") == "N = 2\n"
+
+
+def test_the_gated_edit_still_has_its_gate():
+    """分割で緩めていないこと。外向きの入口は今もゲートを通る。"""
+    import inspect
+    from tools import coding_ops
+    assert "require_unlocked" in inspect.getsource(coding_ops.multi_edit)
 
 
 def test_the_tool_catalogue_is_built_from_an_explicit_list_not_by_introspection():
