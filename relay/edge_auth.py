@@ -284,7 +284,11 @@ def _surface_with_a_way_back(cdp_url: str, agent_url: str,
             subprocess.run(
                 ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
                  _os.path.join(repo, "scripts", "start_companion_edge.ps1"),
-                 "-Port", str(port), "-Headless"],
+                 # -HardReset IS THE POINT. Without it start_companion_edge.ps1 sees :9222 already
+                 # listening and merely parks the existing HEADED instance -- measured: the
+                 # process stayed headed and the taskbar entry remained. Only a hard reset
+                 # replaces it with a headless one.
+                 "-Port", str(port), "-HardReset", "-Headless"],
                 capture_output=True, timeout=180)
         except Exception:
             pass
@@ -293,6 +297,21 @@ def _surface_with_a_way_back(cdp_url: str, agent_url: str,
     t.daemon = True          # never hold up process exit
     t.start()
     return ok
+
+
+
+def _wait_until_ready(cdp_url: str, budget_s: float, step_s: float = 2.0) -> bool:
+    """True as soon as a tab classifies ready, or False when the budget runs out."""
+    import time as _t
+    end = _t.time() + max(0.0, budget_s)
+    while _t.time() < end:
+        _t.sleep(step_s)
+        try:
+            if any(r.get("cls") == "ready" for r in classify_live(cdp_url)):
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def _navigate(cdp_url: str, agent_url: str) -> bool:
@@ -353,7 +372,8 @@ def ensure_ready(agent_url: str, cdp_url: str = "http://127.0.0.1:9222",
             # as a genuine failure.
             if _attempt < max(1, attempts) - 1:
                 _navigate(cdp_url, agent_url)
-                _time.sleep(settle_s)
+                if _wait_until_ready(cdp_url, max(settle_s, 1.0) * 4):
+                    return "ready"
                 continue
             # THE LAST RESORT, AFTER THE AUTOMATIC PATH HAS GENUINELY FAILED.
             #
@@ -369,7 +389,13 @@ def ensure_ready(agent_url: str, cdp_url: str = "http://127.0.0.1:9222",
 
         if not _navigate(cdp_url, agent_url):
             return last
-        _time.sleep(settle_s)
+        # POLL, DO NOT GUESS. A single fixed sleep asks once, at a moment chosen in advance.
+        # Measured: the agent SPA needed longer than the eight seconds this waited, so
+        # ensure_ready opened a tab, looked too early, opened another, and reported "loading"
+        # for a browser that reached "ready" seconds later -- while a hand navigation with a
+        # ten-second wait worked every time.
+        if _wait_until_ready(cdp_url, max(settle_s, 1.0) * 4):
+            return "ready"
 
     try:
         rows = classify_live(cdp_url)

@@ -133,25 +133,6 @@ for ($round = 1; $round -le $MaxRounds; $round++) {
         $slice = @($pending[($b * $BatchSize)..([math]::Min(($b + 1) * $BatchSize, $pending.Count) - 1)])
         Say ("--- r{0} batch {1}/{2}: {3} instances ---" -f $round, ($b + 1), $batches, $slice.Count)
 
-        # THE AGENT PAGE MUST BE READY BEFORE ANYTHING IS SUBMITTED.
-        #
-        # Twice tonight a run was started against a companion Edge sitting on about:blank.
-        # Every worker got the default assistant with no tools, reported STUCK, and wrote
-        # patches from memory -- and nothing in the run's own logs said why. The classifier
-        # had the answer the whole time ("renavigate"); nothing acted on it.
-        #
-        # needs_signin is the only outcome that needs a person. Everything else this heals.
-        $agentUrl = ((Get-Content .env | Where-Object { $_ -match '^MCP_FLEET_AGENT_URL=' }) -replace '^MCP_FLEET_AGENT_URL=','').Trim()
-        if ($agentUrl) {
-            $cls = & $py -c "import sys;from relay import edge_auth;print(edge_auth.ensure_ready(sys.argv[1]))" $agentUrl
-            Say ("agent page: {0}" -f $cls)
-            if ($cls -eq "needs_signin") {
-                Say "the agent page needs a human sign-in; not submitting a batch that cannot call tools"
-                Say "UI_RUN_BLOCKED"
-                exit 4
-            }
-        }
-
         # A RUN ALREADY IN FLIGHT IS NOT A BROKEN COCKPIT.
         #
         # submit_via_ui.ps1 refuses while a run is live, because Ctrl+Enter steers rather than
@@ -169,6 +150,32 @@ for ($round = 1; $round -le $MaxRounds; $round++) {
             Start-Sleep -Seconds 60
         }
 
+
+        # THE AGENT PAGE MUST BE READY BEFORE ANYTHING IS SUBMITTED -- AND AFTER THE WAIT.
+        #
+        # This sat above the "is a run still in flight" wait, so it navigated and could surface
+        # :9222 while ANOTHER run still owned that browser. Repairing one run by disturbing
+        # another is not a repair. It belongs here, once this run is the only one.
+        #
+        # AND ANYTHING THAT IS NOT READY STOPS THE BATCH. The first version blocked only on
+        # needs_signin, so "loading", "redirect" and "unknown" all fell through to submission --
+        # which is exactly the state that produced two runs of workers with no tools writing
+        # patches from memory. There is no reading of "not ready" that makes submitting safe.
+        $agentUrl = ((Get-Content .env | Where-Object { $_ -match '^MCP_FLEET_AGENT_URL=' }) -replace '^MCP_FLEET_AGENT_URL=','').Trim()
+        if ($agentUrl) {
+            $cls = & $py -c "import sys;from relay import edge_auth;print(edge_auth.ensure_ready(sys.argv[1]))" $agentUrl
+            Say ("agent page: {0}" -f $cls)
+            if ($cls -ne "ready") {
+                if ($cls -eq "needs_signin") {
+                    Say "the agent page needs a human sign-in; the window has been surfaced"
+                } else {
+                    Say ("the agent page is '{0}', not ready" -f $cls)
+                }
+                Say "not submitting a batch that cannot call tools"
+                Say "UI_RUN_BLOCKED"
+                exit 4
+            }
+        }
 
         $env:SWE_SLICE_FILE = $SliceFile
         $goalsFile = ".fleet/swe/ui_batch.jsonl"
