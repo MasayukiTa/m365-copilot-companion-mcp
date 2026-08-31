@@ -86,6 +86,9 @@ def run_python(
         _g = _cg.check_op("shell_destructive", _gate_detail(code))
         if _g is not None:
             return _g
+    _j = _judged("python", code, working_dir)
+    if _j is not None:
+        return _j
     tmp_path: Optional[str] = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -115,6 +118,130 @@ def run_python(
                 pass
 
 
+def _judged(kind, text, working_dir):
+    """Contextual judgement, ahead of running anything. Returns a refusal string or None.
+
+    ORDER, AND WHY. The deterministic checks above run first and this cannot overrule them --
+    a model may not waive a rule the machine is sure about. What it adds is the part a pattern
+    list structurally cannot see: whether the effect is what the user actually asked for, at
+    the blast radius they asked for, on the directory they meant.
+
+    Judging only what the regex flags would leave exactly those out. So everything that is not
+    provably read-only is judged, and the read-only exemption is what keeps the latency
+    survivable -- see tools/command_triage.py.
+
+    SHADOW BY DEFAULT. The verdict is recorded and nothing is blocked until MCP_JUDGE_MODE is
+    set to enforce. Switching a gate from permissive to closed without measuring first is a
+    mistake this repository has been corrected for once already.
+    """
+    try:
+        from . import command_triage as _tri
+        m = _tri.mode()
+        if m == "off":
+            return None
+        exempt, why = _tri.is_read_only(text) if kind == "shell" else (False, "python source")
+        if exempt:
+            return None
+
+        from . import command_judge as _cj
+        req = _cj.build_request(
+            command=text,
+            cwd=_working_dir(working_dir) or "",
+            workspace_root=str(_ALLOWED_BASE_FOR_JUDGE()),
+            deterministic_flags=_deterministic_flags(text),
+        )
+        judge = _judge_backend()
+        verdict = _cj.judge_command(req, judge)
+        blocks = _cj.outcome_blocks_execution(verdict, human_available=False)
+        _record_judgement(kind, text, req, verdict, m, blocks)
+        if m == "enforce" and blocks:
+            return ("[refused by review] %s\n"
+                    "The pending command was assessed before running and was not allowed: %s\n"
+                    "Choose a narrower action, or ask the operator to approve this one."
+                    % (verdict.get("decision"), verdict.get("reason") or "no reason given"))
+        return None
+    except Exception:
+        # A judgement layer that can break execution is worse than none. In shadow this must
+        # never cost a command; in enforce, a crash here is not an allow -- but neither is it a
+        # reason to take the machine down, so the deterministic layers above stand.
+        return None
+
+
+def _ALLOWED_BASE_FOR_JUDGE():
+    try:
+        from .file_ops import ALLOWED_BASE
+        return ALLOWED_BASE
+    except Exception:
+        return ""
+
+
+def _deterministic_flags(text):
+    try:
+        from . import contract_gate as _cg
+        flags = []
+        if _cg.destructive_shell(text):
+            flags.append("destructive_shell")
+        try:
+            if _cg.destructive_python(text):
+                flags.append("destructive_python")
+        except Exception:
+            pass
+        return flags
+    except Exception:
+        return []
+
+
+def _judge_backend():
+    """The callable that asks a model, or None when none is configured.
+
+    Kept behind a lookup so this module never imports a transport, and so a deployment with no
+    judge available is a first-class state rather than an import error. With no backend the
+    verdict is REQUIRE_HUMAN -- which in shadow is recorded and in enforce is a refusal.
+    """
+    try:
+        from . import judge_backend as _jb
+        return _jb.get()
+    except Exception:
+        return None
+
+
+def _record_judgement(kind, text, req, verdict, mode_name, blocks):
+    """One line per judged command, including allows.
+
+    Raw command text is recorded because a verdict cannot be reviewed without knowing what was
+    judged -- and it is truncated, because a command line can carry a token. Output is never
+    recorded here.
+    """
+    try:
+        import hashlib
+        import json as _json
+        import os as _os
+        import time as _time
+        repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        path = _os.path.join(repo, ".fleet", "judge.jsonl")
+        _os.makedirs(_os.path.dirname(path), exist_ok=True)
+        row = {
+            "ts": _time.time(),
+            "mode": mode_name,
+            "kind": kind,
+            "cmd_sha16": hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16],
+            "cmd": (text or "")[:400],
+            "cwd": req.get("cwd"),
+            "inside_workspace": req.get("inside_workspace"),
+            "flags": req.get("deterministic_flags"),
+            "decision": verdict.get("decision"),
+            "categories": verdict.get("categories"),
+            "reason": (verdict.get("reason") or "")[:300],
+            "source": verdict.get("source"),
+            "would_block": bool(blocks),
+            "schema": _json.dumps(None) and 1,
+        }
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def shell_exec(
     command: str,
     timeout: int = 30,
@@ -135,6 +262,9 @@ def shell_exec(
         _g = _cg.check_op("shell_destructive", _gate_detail(command))
         if _g is not None:
             return _g
+    _j = _judged("shell", command, working_dir)
+    if _j is not None:
+        return _j
     try:
         result = subprocess.run(
             command,
