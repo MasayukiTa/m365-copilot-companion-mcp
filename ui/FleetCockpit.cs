@@ -2058,7 +2058,11 @@ class CockpitWindow : Window
                             Dispatcher.BeginInvoke(new Action(delegate { if (_fixNote != null) _fixNote.Text = T("hs_fix_stack"); }));
                     }
                     catch (Exception) { }
-                    RunStartAll();
+// THE SAME GUARD AS EVERY OTHER AUTOMATIC ACTION. This ran RunStartAll on the
+                    // first sweep regardless of whether a fleet run was in flight, so a cockpit
+                    // opened during a run could restart the stack underneath it.
+                    if (FleetRunIsLive()) { /* leave it to the person */ }
+                    else RunStartAll();
                 }
             }
 
@@ -2342,8 +2346,33 @@ class CockpitWindow : Window
         catch (Exception) { }   // a trace that can break the repair is worse than no trace
     }
 
+    // ONE COCKPIT REPAIRS. Nothing stops a second one being opened, and each process has its
+    // own _fixRunning and its own attempt budget -- so two of them would restart the same
+    // browser twice, each believing it was the only one. The mutex is held for the process's
+    // life; whichever cockpit gets it does the repairs and the others only display.
+    static Mutex _autoFixMutex;
+    static bool _autoFixIsMine;
+    static bool _autoFixMutexChecked;
+
+    static bool ThisCockpitOwnsAutoFix()
+    {
+        if (!_autoFixMutexChecked)
+        {
+            _autoFixMutexChecked = true;
+            try
+            {
+                bool createdNew;
+                _autoFixMutex = new Mutex(true, @"Local\M365CompanionAutoFix", out createdNew);
+                _autoFixIsMine = createdNew;
+            }
+            catch (Exception) { _autoFixIsMine = false; }
+        }
+        return _autoFixIsMine;
+    }
+
     void MaybeAutoFix()
     {
+        if (!ThisCockpitOwnsAutoFix()) return;
         int dot = AutoFixTargetDot();
         if (dot < 0)
         {
