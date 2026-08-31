@@ -2453,7 +2453,18 @@ class CockpitWindow : Window
         bool ok = TruthyField(cap, "ok");
         double expiresAt = NumberField(cap, "expires_at");
         string kind = StringField(cap, "kind");
-        double capTs = NumberField(cap, "ts");
+        // THE FIELD IS `at`. relay/capture_status.py's FIELDS tuple is ("ok", "at",
+        // "expires_at", ...) and there has never been a "ts" in it -- so capTs was 0 on every
+        // read, capFresh below was false on every read, and the RED branch that needs it has
+        // never once been taken. The sign-in dot was structurally incapable of turning red:
+        // a capture that failed for a sign-in reason five seconds ago showed the same amber
+        // as one that failed last week, which is precisely the distinction the comment below
+        // spends a paragraph arguing for.
+        //
+        // `ts` is still read as a fallback so a file written by any other producer, or an
+        // older one, keeps working.
+        double capTs = NumberField(cap, "at");
+        if (capTs <= 0) capTs = NumberField(cap, "ts");
         string gptId = StringField(cap, "gpt_id");
         double nowEpoch = (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
         double lifeLeft = expiresAt - nowEpoch;
@@ -2684,10 +2695,31 @@ class CockpitWindow : Window
             string kind = (o != null && o.ContainsKey("kind")) ? Convert.ToString(o["kind"]) : "";
             double ageMin = ts > 0 ? (NowUnix() - ts) / 60.0 : double.MaxValue;
             string ageTxt = ts > 0 ? AgeMinutesText(ageMin) : T("hs_never");
+            // A PROBE IN FLIGHT NO LONGER REPLACES THE VERDICT. tools/tool_probe.py used to
+            // write kind="checking" over the whole record, so for the 30-180s of a real round
+            // trip there was no measured result at all and this dot changed colour every
+            // cycle, on a schedule, with nothing wrong. A dot that does that is one people
+            // stop reading -- it was reported as a fault, correctly. The transitional state is
+            // now a flag beside the last verdict, and the colour keeps reporting what was last
+            // actually measured.
+            double probingAgeMin = double.MaxValue;
+            if (o != null && o.ContainsKey("probing_since"))
+            {
+                double ps = Convert.ToDouble(o["probing_since"]);
+                if (ps > 0) probingAgeMin = (NowUnix() - ps) / 60.0;
+            }
+            // Only while it is plausibly still running. A probe that started an hour ago and
+            // never recorded a result is not "in progress", it is a prober that died.
+            bool probing = probingAgeMin < 20.0;
             if (ageMin >= 20.0)
                 SetDot(5, HealthState.Red, ageTxt + " " + T("hs_tool_detail_stale"), now);
             else if (kind == "checking" || kind == "starting")
+                // A record written by an older prober, which still overwrote the verdict.
                 SetDot(5, HealthState.Checking, ageTxt + " " + T("hs_tool_detail_checking"), now);
+            else if (ok && probing)
+                SetDot(5, HealthState.Green,
+                       ageTxt + " " + T("hs_tool_detail_ok") + " / " + T("hs_tool_detail_checking"),
+                       now);
             else if (ok)
                 SetDot(5, HealthState.Green, ageTxt + " " + T("hs_tool_detail_ok"), now);
             else if (kind == "consent_card" || kind == "canned_fallback")

@@ -268,13 +268,40 @@ class SkillStore:
         # installing Claude. `.claude/skills/` remains a compatibility source so an
         # existing Claude Skill library works unchanged. Later entries win on a
         # same-name collision; native folders therefore override compatibility ones.
-        return [
+        #
+        # THE PERSONAL SCOPE IS OFF BY DEFAULT, and this is a correction, not a default.
+        #
+        # `~/.claude/skills` is the library of whatever assistant the OPERATOR runs on this
+        # machine. It is not this server's, and this server hands its Skills to agents that
+        # have nothing in common with that assistant. Measured 2026-08-31, on a real
+        # SWE-bench goal:
+        #
+        #     skill_match("You are fixing a real bug in ... **ansible/ansible** ...")
+        #         -> delegation-commander   score 1.0    (personal, ~/.claude/skills)
+        #
+        # delegation-commander is a Claude Code playbook whose description says to use it for
+        # ALL coding tasks. Handed to a fleet worker it prescribes dispatching the work to
+        # subagents that worker does not have -- and it won at 1.0, ahead of every project
+        # Skill, because personal entries come last and last wins. Every fleet worker
+        # following the server's own "call skill_match before domain work" rule on an English
+        # coding goal was being given it.
+        #
+        # This is a leak in the direction that matters: the personal library is TRUSTED there
+        # (its owner approved it for a different product), so the trust check cannot catch it.
+        # An operator who does want one library for both sets MCP_SKILLS_INCLUDE_PERSONAL=1,
+        # which is a decision with a name rather than an accident of path layout.
+        roots = [
             ("project", self.project_root / ".claude" / "skills"),
             ("project", self.project_root / "skills"),
-            ("personal", Path.home() / ".claude" / "skills"),
-            # Personal Skills have the final say on a same-name collision.
-            ("personal", Path.home() / "skills"),
         ]
+        if (os.environ.get("MCP_SKILLS_INCLUDE_PERSONAL") or "").strip().lower() in (
+                "1", "true", "yes", "on"):
+            roots += [
+                ("personal", Path.home() / ".claude" / "skills"),
+                # Personal Skills have the final say on a same-name collision.
+                ("personal", Path.home() / "skills"),
+            ]
+        return roots
 
     def _state_for(self, skill: Skill) -> tuple[str, str]:
         key = self._key(skill.path)

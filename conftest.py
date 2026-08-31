@@ -67,6 +67,28 @@ def _no_writes_to_the_live_records(tmp_path_factory, monkeypatch):
     except Exception:
         pass
 
+    # THE FIFTH, AND THIS ONE REACHED A SCREEN. relay/capture_status.py records whether the
+    # last token capture succeeded, and the cockpit's sign-in dot reads nothing else. A test
+    # driving capture_floor with a stub context called record_failure, which wrote
+    #
+    #     {"ok": false, "kind": "other",
+    #      "reason": "AttributeError: 'FakeContext' object has no attribute 'new_page'"}
+    #
+    # into the operator's live file. The sign-in dot left green while nothing was wrong with
+    # sign-in, and the operator saw it and asked. A false alarm from a test run is worse than
+    # a missing signal: it spends the trust the dot exists to earn.
+    #
+    # THE LIST IS THE PROBLEM AND THIS ENTRY DOES NOT FIX IT. Each of the five was added after
+    # it happened, and 39 places in relay/ and tools/ name .fleet. A hand-maintained
+    # allowlist fails open by construction -- see test_live_record_isolation.py, which turns
+    # the silence into a decision.
+    try:
+        import relay.capture_status as capture_status
+        monkeypatch.setattr(capture_status, "STATUS_PATH",
+                            str(base / "capture_status.json"), raising=False)
+    except Exception:
+        pass
+
     # Derived rather than a record, but still the operator's file: a test that regenerated it
     # would replace summaries that cost real model calls, and the failure would look like
     # nothing at all -- the screen simply falls back to raw reasons.
