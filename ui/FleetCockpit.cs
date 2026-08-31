@@ -3416,15 +3416,33 @@ class CockpitWindow : Window
         // fully idle). A RUNNING fleet always owns the spine (the live run is never hidden), so this
         // past-task focus is suppressed while running. (user choice: 走行中は現在優先)
         bool spineRunning = root != null && (!root.ContainsKey("running") || Convert.ToBoolean(root["running"]));
-        if (!spineRunning && root != null && _history != null && _expanded != null && _expanded.Count > 0)
+        if (!spineRunning && root != null && _history != null && _history.Count > 0)
         {
+            // WHICH TASK THE TIMELINE IS ABOUT. Expanded wins; with nothing expanded it follows
+            // the row at the TOP of the list, which is the one the eye is on. Before this, an
+            // un-expanded list left the panel on the live-run spine, so every finished task
+            // appeared to share the newest run's clock -- the operator saw one timeline and
+            // reasonably read it as belonging to whatever they were looking at.
             Dictionary<string, object> focusEntry = null;
-            for (int hi = _history.Count - 1; hi >= 0; hi--)
+            if (_expanded != null && _expanded.Count > 0)
             {
-                var he = _history[hi] as Dictionary<string, object>;
-                if (he == null) continue;
-                string hk = S(he, "key");
-                if (!string.IsNullOrEmpty(hk) && _expanded.Contains(hk)) { focusEntry = he; break; }
+                for (int hi = _history.Count - 1; hi >= 0; hi--)
+                {
+                    var he = _history[hi] as Dictionary<string, object>;
+                    if (he == null) continue;
+                    string hk = S(he, "key");
+                    if (!string.IsNullOrEmpty(hk) && _expanded.Contains(hk)) { focusEntry = he; break; }
+                }
+            }
+            if (focusEntry == null)
+            {
+                // The newest entry is the one rendered first. Same ordering the list uses, so
+                // the panel and the top row cannot disagree about which task they mean.
+                for (int hi = _history.Count - 1; hi >= 0; hi--)
+                {
+                    var he = _history[hi] as Dictionary<string, object>;
+                    if (he != null) { focusEntry = he; break; }
+                }
             }
             if (focusEntry != null)
             {
