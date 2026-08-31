@@ -38,6 +38,19 @@ def log(msg):
 
 
 def load_results(path):
+    """Instances that have a REAL verdict. EVALERR is not one.
+
+    EVALERR means the evaluation could not be run -- the host was unreachable, the container
+    would not start -- and it says nothing about the patch. Counting it as "already graded"
+    makes the failure permanent: the instance is skipped forever and can never be scored, even
+    once the cause is gone.
+
+    Measured tonight: the eval host was unreachable for one run because of a stale lock file on
+    THIS machine. 36 EVALERR rows were written. When the transport was fixed, the grader
+    reported "40 preds, 37 already graded, 3 to grade" and would have left 36 patches unscored
+    for good. A failed attempt recorded as a result is the same defect this repository keeps
+    finding elsewhere, in the one file whose whole job is to hold results.
+    """
     out = {}
     if os.path.isfile(path):
         for line in open(path, encoding="utf-8"):
@@ -46,6 +59,8 @@ def load_results(path):
                 continue
             try:
                 d = json.loads(line)
+                if str(d.get("verdict") or "").upper() == "EVALERR":
+                    continue
                 out[d["instance_id"]] = d
             except Exception:
                 pass
