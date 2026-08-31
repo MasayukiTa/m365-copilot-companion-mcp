@@ -247,6 +247,12 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
         # gating would help.
         _shadow_assess(group)
 
+        # STEP 4, ALSO SHADOW. Step 3 reads what the worker happened to run; this runs the
+        # contract's own commands here, after the worker stopped, against a tree it hashed
+        # before and after. It is the only place DONE is produced -- and while it is in shadow
+        # it produces it into a file, not into the run's outcome.
+        _shadow_verify(group)
+
         graded_before = len(graded_ids())
         run([PY, os.path.join("bench", "swe_grade_batch.py"),
              "--instances"] + group, BATCH_TIMEOUT_S, "grade")
@@ -346,6 +352,50 @@ def _shadow_assess(group):
                                                      "; ".join(r["reasons"])[:120]))
     except Exception as exc:
         log("  shadow assessment failed (%s: %s) -- grading is unaffected"
+            % (type(exc).__name__, str(exc)[:120]))
+
+
+VERIFY = os.path.join(SW, "pro_cycle_verify.jsonl")
+
+
+def _shadow_verify(group):
+    """Run each instance's acceptance commands ourselves and record what they said."""
+    try:
+        import json as _json
+        from relay import acceptance_contract as AC
+        from relay import supervisor_verify as SV
+        from bench import pro_stage_goals as G
+
+        status = _load(STATUS, {})
+        claimed = set()
+        for w in status.get("workers") or []:
+            goal = str(w.get("goal") or "").replace("\\", "/")
+            if (w.get("outcome") or "") != "DONE":
+                continue
+            for inst in group:
+                if G.wt_for(inst).replace("\\", "/") in goal:
+                    claimed.add(inst)
+
+        counts = {}
+        with open(VERIFY, "a", encoding="utf-8") as fh:
+            for inst in group:
+                contract = AC.load(inst)
+                cwd = G.wt_for(inst)
+                v = SV.verify(contract, cwd=cwd)
+                state = SV.promote(inst in claimed, v) or "NO_CLAIM"
+                counts[state] = counts.get(state, 0) + 1
+                fh.write(_json.dumps({
+                    "ts": time.time(), "instance": inst, "claimed_done": inst in claimed,
+                    "state": state, "verify_state": v.get("state"),
+                    "reasons": v.get("reasons"),
+                    "tree_stable": bool(v.get("tree_before")) and
+                                   v.get("tree_before") == v.get("tree_after"),
+                    "checks": [{"id": c.get("id"), "ok": c.get("ok"),
+                                "duration_s": c.get("duration_s")} for c in v.get("checks") or []],
+                }, ensure_ascii=False) + "\n")
+        log("  verify(shadow): " + ", ".join("%s=%d" % kv for kv in sorted(counts.items())))
+    except Exception as exc:
+        log("  shadow verification failed (%s: %s) -- grading is unaffected"
             % (type(exc).__name__, str(exc)[:120]))
 
 
