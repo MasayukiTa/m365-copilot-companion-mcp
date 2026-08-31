@@ -55,6 +55,52 @@ _READ_ONLY_PAIRS = frozenset([
 #: A command containing one of these is never exempt, whatever it starts with.
 _COMPOSITION = re.compile(r"[|;&><`$]|\|\||&&|\$\(|\bstart\b", re.IGNORECASE)
 
+#: READING IS NOT AUTOMATICALLY HARMLESS, and this list is the correction of a defect measured
+#: in this file's own first version. An adversarial pass on 2026-08-31 put fifty commands
+#: through the layer; exactly three reached execution having never been judged at all, and all
+#: three were the same shape:
+#:
+#:     cat ~/.ssh/id_rsa      -> exempt ("cat reads a file")
+#:     type .env              -> exempt ("type reads a file")
+#:     cat .git-credentials   -> exempt ("cat reads a file")
+#:
+#: Every other miss in that run was a miss by the DETERMINISTIC net, which is the expected and
+#: intended division of labour -- the judge exists for those. These three were different in
+#: kind: the exemption above removed them from judgement entirely, so no layer of the design
+#: could see them. A silent bypass is the only failure this file can produce, and it produced
+#: it on the class that matters most.
+#:
+#: The reasoning error was treating "does not write" as "has no effect". Reading a private key
+#: copies it into the transcript, and from there it travels wherever the transcript travels.
+#: tools/file_ops.py already refuses `.env` and `.companion_gates` outright; a shell that will
+#: cat them is that refusal with a way around it.
+#:
+#: Deliberately tight. A path that merely LOOKS security-adjacent (`relay/profile_token.py`)
+#: costs one judging call if it lands here, which is the cheap direction -- but a list wide
+#: enough to catch every such name would make ordinary source reading slow, and slow is how a
+#: layer gets switched off.
+_SENSITIVE_TARGET = re.compile(
+    r"(?:^|[\s\"'=])~?[^\s\"']*(?:"
+    r"\.ssh[/\\]"
+    r"|id_(?:rsa|dsa|ecdsa|ed25519)"
+    r"|\.git-credentials"
+    r"|\.companion_gates"
+    r"|\.npmrc|\.pypirc|\.netrc"
+    r"|\.aws[/\\]|\.kube[/\\]|\.docker[/\\]config"
+    r"|\.(?:pem|pfx|p12|jks|keystore)\b"
+    r"|(?:^|[/\\.])(?:credentials?|secrets?)\b"
+    # `.env` and its variants, ending at a word boundary rather than at end-of-string: the
+    # first version anchored with `$` and therefore did not match `type .env`, which is the
+    # exact command the guard was written for. Measured -- it was still exempt after the fix
+    # that was supposed to cover it.
+    r"|\.env(?:\.[A-Za-z0-9_-]+)?(?=$|[\s\"'])"
+    r")", re.IGNORECASE)
+
+
+def reads_something_sensitive(command: str) -> bool:
+    """True when the command names a credential-shaped path. Never exempt those from judgement."""
+    return bool(_SENSITIVE_TARGET.search(command or ""))
+
 
 def is_read_only(command: str) -> Tuple[bool, str]:
     """(exempt, why). Conservative: anything not understood is NOT exempt.
@@ -67,6 +113,10 @@ def is_read_only(command: str) -> Tuple[bool, str]:
         return False, "empty"
     if _COMPOSITION.search(command):
         return False, "composed: a pipe, chain, redirect or substitution can change the effect"
+    if reads_something_sensitive(command):
+        # Checked BEFORE the head lookup, so it applies to every exempt reader at once rather
+        # than to whichever ones someone remembered. See _SENSITIVE_TARGET.
+        return False, "names a credential-shaped path: reading it is an effect"
     try:
         parts: List[str] = shlex.split(command, posix=False)
     except ValueError:
