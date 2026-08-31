@@ -276,7 +276,10 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
                  "--instances"] + group, BATCH_TIMEOUT_S, "grade")
         else:
             log("  no patch captured for this batch -- nothing to grade")
-        gained = len(graded_ids()) - graded_before
+        # COUNTED AGAINST THIS BATCH, not against the whole ledger. The first version
+        # subtracted two totals and printed "graded 4 of 1", which is not a number.
+        after = graded_ids()
+        gained = len([i for i in group if i in after])
         log("  graded this batch: %d of %d" % (gained, len(group)))
 
         _discard()
@@ -347,7 +350,7 @@ def _shadow_assess(group):
 
         rows, verdicts = [], []
         for inst in group:
-            events = TL.for_task(inst)
+            events = TL.for_task(inst, root=G.wt_for(inst))
             contract = AC.load(inst)
             # NO CLAIM FOUND IS NOT A CLAIM OF SUCCESS. If the run recorded nothing for this
             # instance, there is nothing to check and the verdict says so, rather than
