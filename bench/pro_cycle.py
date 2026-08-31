@@ -235,23 +235,35 @@ def _clear_toolchain_caches():
     """
     import shutil as _sh
     freed = []
-    go = _sh.which("go") or r"C:\Program Files\Goin\go.exe"
-    if os.path.exists(go):
+    for name, exe, argv, fallbacks in (
+        # FORWARD SLASHES, DELIBERATELY. The first version of this fallback used backslashes,
+        # and the file ended up holding a literal control byte where the "b" of "bin" belonged,
+        # so the path did not exist. `go` is also not on this process's PATH, so the lookup
+        # found nothing either way -- and the go module cache, 1.46 GB and the biggest sink
+        # here, was never cleared. The run stopped for lack of disk while the thing holding the
+        # disk sat untouched, and the log said nothing was wrong.
+        ("go module cache", "go", ["clean", "-modcache"],
+         ("C:/Program Files/Go/bin/go.exe",)),
+        ("npm cache", "npm", ["cache", "clean", "--force"], ()),
+    ):
+        path = _sh.which(exe) or next((q for q in fallbacks if os.path.exists(q)), "")
+        if not path:
+            freed.append((name, None))      # not reachable here; SAY so rather than omit it
+            continue
         before = free_gb()
         try:
-            subprocess.run([go, "clean", "-modcache"], capture_output=True, timeout=900)
-            freed.append(("go module cache", (free_gb() - before) * 1000))
+            subprocess.run([path] + argv, capture_output=True, timeout=900,
+                           shell=path.lower().endswith((".cmd", ".bat")))
         except Exception:
-            pass
-    npm = _sh.which("npm")
-    if npm:
-        before = free_gb()
-        try:
-            subprocess.run([npm, "cache", "clean", "--force"], capture_output=True,
-                           timeout=900, shell=True)
-            freed.append(("npm cache", (free_gb() - before) * 1000))
-        except Exception:
-            pass
+            freed.append((name, None))
+            continue
+        # A DELTA CAN BE NEGATIVE, AND THAT IS NOT AN AMOUNT FREED. Other processes write to
+        # this disk while the cache is being emptied -- the live run's own worktrees above all.
+        # The first version subtracted the two readings and logged "npm cache freed -151 MB",
+        # a number that is not merely wrong but backwards. Below zero, the honest statement is
+        # that nothing was recovered.
+        delta = (free_gb() - before) * 1024.0
+        freed.append((name, delta if delta > 0 else 0.0))
     return freed
 DEFAULT_DISK_MB = 300
 
@@ -690,9 +702,18 @@ def _reclaim(have):
         # STILL SHORT. The toolchain caches are the last thing to give back, because they cost
         # a re-download to rebuild -- but a stopped run costs more.
         for name, mb in _clear_toolchain_caches():
-            log("  reclaim: %s freed %.0f MB" % (name, mb))
+            if mb is None:
+                # NOT SILENCE. "the go toolchain was not reachable" is the difference between
+                # a cache that was empty and a cache that was never touched, and the second
+                # one is why a run stopped with 1.46 GB sitting in it.
+                log("  reclaim: %s -- not reachable from here, nothing cleared" % name)
+            else:
+                log("  reclaim: %s freed %.0f MB" % (name, mb))
     now = free_gb()
-    log("  reclaimed %.0f MB: %.2f -> %.2f GiB free" % (freed, have, now))
+    # Report the MOVEMENT, not a computed total. The two disagreed last time -- "reclaimed
+    # 0 MB: 2.87 -> 2.71" -- because the sum of what was freed and the change in free space
+    # are different quantities whenever anything else is writing.
+    log("  after reclaim: %.2f -> %.2f GiB free" % (have, now))
     return now
 
 
