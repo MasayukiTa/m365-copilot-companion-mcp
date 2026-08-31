@@ -69,10 +69,28 @@ def slugify(theme):
     """
     s = " ".join(str(theme or "").split()).lower()
     s = re.sub(r"[^\w]+", "-", s, flags=re.UNICODE).strip("-")
-    s = s[:_SLUG_MAX].strip("-")
     if not s:
-        s = "theme-%08x" % (abs(hash(str(theme or ""))) & 0xFFFFFFFF)
-    return s
+        return "theme-%08x" % (abs(hash(str(theme or ""))) & 0xFFFFFFFF)
+    if len(s) <= _SLUG_MAX:
+        return s
+    # TRUNCATION MERGES THEMES THAT SHARE AN OPENING, and this store had a live case of it.
+    # Every SWE-bench goal begins "You are fixing a real bug in the open-source project
+    # **<repo>...", and the repo name falls past character 48 -- so ansible and NodeBB
+    # produced DIFFERENT theme titles and the SAME slug, and shared one file. A NodeBB worker
+    # was primed with ansible history and the other way round; the ansible theme file on disk
+    # holds NodeBB entries, which is how this was noticed.
+    #
+    # The repository has already paid for this exact mistake once, one directory over:
+    # bench/pro_stage_goals.py's wt_for() carries six hex of the instance id for the same
+    # reason, after a worker's file reads were routed into the wrong container.
+    #
+    # Six hex of the FULL theme, appended after truncation. Themes at or under the cap are
+    # untouched, so the ordinary case keeps its readable filename and existing files keep
+    # working. The long themes get new files; the old merged one is left on disk rather than
+    # deleted -- it is the user's data, and nothing needs it gone to be correct.
+    import hashlib
+    tag = hashlib.sha256(s.encode("utf-8")).hexdigest()[:6]
+    return s[:_SLUG_MAX - 7].strip("-") + "-" + tag
 
 
 def theme_from_goal(goal, folder=""):

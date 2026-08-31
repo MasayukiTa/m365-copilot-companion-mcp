@@ -127,6 +127,47 @@ def test_notes_read_back_are_deduped_even_from_a_file_written_before_this_existe
     assert out.count("2の12乗") == 1, "read back %d copies" % out.count("2の12乗")
 
 
+# ── themes that share an opening ──────────────────────────────────────────────────────────
+
+SWE = ("You are fixing a real bug in the open-source project **%s** (language: %s).\n"
+       "The repository is checked out locally at:\n  C:/x/%s")
+
+
+def test_two_repositories_do_not_share_one_memory_file():
+    """MEASURED ON THE LIVE STORE. Every SWE-bench goal opens with the same sentence and the
+    repository name falls past the 48-character slug cap, so ansible and NodeBB produced
+    different theme TITLES and the same slug -- one file, holding both. A NodeBB worker was
+    primed with ansible history and the other way round; the ansible theme file on disk
+    contains NodeBB entries, which is how this was found.
+    """
+    a = SWE % ("ansible/ansible", "python", "p05")
+    b = SWE % ("NodeBB/NodeBB", "js", "p01")
+    ta, tb = M.theme_from_goal(a), M.theme_from_goal(b)
+    assert ta != tb, "the titles were already distinct; only the slug collapsed"
+    assert M._resolve(ta, a)[1] != M._resolve(tb, b)[1]
+
+
+def test_a_short_theme_keeps_its_readable_filename():
+    """Themes at or under the cap are untouched, so the ordinary case stays legible and every
+    existing file keeps working."""
+    assert M.slugify("ansible の executor") == "ansible-の-executor"
+
+
+def test_slugs_stay_within_the_cap():
+    long = "x" * 300
+    assert len(M.slugify(long)) <= M._SLUG_MAX
+
+
+def test_the_same_theme_always_gets_the_same_slug():
+    long = SWE % ("ansible/ansible", "python", "p05")
+    assert M.slugify(long) == M.slugify(long)
+
+
+def test_themes_differing_only_past_the_cap_still_differ():
+    base = "a" * 60
+    assert M.slugify(base + "one") != M.slugify(base + "two")
+
+
 # ── the index, which is primed into EVERY goal ────────────────────────────────────────────
 
 def idx(*titles):
