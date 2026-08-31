@@ -271,3 +271,102 @@ def _read_runlog(run_id, root=None):
     except OSError:
         return []
     return rows
+
+
+# ── the restore point ─────────────────────────────────────────────────────────────────────
+#
+# edit_and_verify makes ONE change undoable. A session is many of them, and a sequence that
+# each verified can still end up somewhere nobody wanted. The plan calls for a fixed guard
+# before any of it starts; this is that guard, and it FAILS CLOSED -- if the tree cannot be
+# put back, editing does not begin.
+#
+# TWO THINGS IT DELIBERATELY DOES NOT DO.
+#
+# It does not create a branch per run. Branch and worktree sprawl is a standing problem in this
+# repository, and a recorded commit is a restore point without leaving anything behind.
+#
+# It does not delete untracked files, ever. `git clean` would make rollback "complete", and it
+# is also how someone's unsaved work disappears. Untracked files are REPORTED and left where
+# they are; a rollback that says what it did not undo is honest, one that quietly removes
+# things is not.
+
+
+def _git(args, repo):
+    try:
+        out = subprocess.run(["git"] + args, cwd=repo, capture_output=True, text=True,
+                             timeout=120)
+        return out.returncode, (out.stdout or "") + (out.stderr or "")
+    except Exception as exc:
+        return 1, str(exc)
+
+
+def restore_point(repo=".", snapshot_path=""):
+    """Establish a way back before any editing starts. Returns a dict; ok=False means do not
+    start.
+
+    A DIRTY GIT TREE IS REFUSED. Rolling back would discard whatever was already uncommitted,
+    which is someone else's work, not this session's. Commit or stash it first -- the guard
+    will not make that choice on anyone's behalf.
+    """
+    repo = os.path.abspath(repo)
+    point = {"ok": False, "kind": "", "repo": repo, "head": "", "snapshot": "", "why": ""}
+
+    code, head = _git(["rev-parse", "HEAD"], repo)
+    if code == 0:
+        code, status = _git(["status", "--porcelain"], repo)
+        if code != 0:
+            point["why"] = "git status failed: %s" % status.strip()[:200]
+            return point
+        dirty = [l for l in status.splitlines() if l.strip() and not l.startswith("??")]
+        if dirty:
+            point["why"] = ("the tree has %d uncommitted change(s); commit or stash them first "
+                            "-- a rollback here would discard work this session did not do"
+                            % len(dirty))
+            return point
+        point.update(ok=True, kind="git", head=head.strip())
+        return point
+
+    if not snapshot_path:
+        point["why"] = ("not a git repository and no snapshot_path was given; there would be "
+                        "no way back")
+        return point
+    from tools.archive_ops import zip_create
+    out = zip_create(snapshot_path, [repo])
+    if out.startswith("["):
+        point["why"] = "snapshot failed: %s" % out[:200]
+        return point
+    point.update(ok=True, kind="zip", snapshot=snapshot_path)
+    return point
+
+
+def roll_back(point):
+    """Return the tree to `point`. Returns a dict with what was undone and what was NOT.
+
+    `untracked` is the honest part: files that appeared since the restore point are listed and
+    LEFT ALONE. Deleting them would make the rollback look complete and is how unsaved work
+    disappears.
+    """
+    out = {"ok": False, "kind": point.get("kind", ""), "untracked": [], "why": ""}
+    if not point.get("ok"):
+        out["why"] = "there is no restore point to go back to"
+        return out
+
+    if point["kind"] == "git":
+        repo = point["repo"]
+        code, msg = _git(["checkout", "--", "."], repo)
+        if code != 0:
+            out["why"] = msg.strip()[:300]
+            return out
+        _c, status = _git(["status", "--porcelain"], repo)
+        out["untracked"] = [l[3:] for l in status.splitlines() if l.startswith("??")]
+        _c, head = _git(["rev-parse", "HEAD"], repo)
+        out["ok"] = head.strip() == point["head"]
+        if not out["ok"]:
+            out["why"] = ("HEAD moved to %s since the restore point at %s -- something "
+                          "committed during the session, and discarding that is not this "
+                          "function's decision" % (head.strip()[:12], point["head"][:12]))
+        return out
+
+    out["why"] = ("the snapshot at %s has to be restored deliberately; unzipping over a live "
+                  "tree is not something this does on its own" % point.get("snapshot"))
+    return out
