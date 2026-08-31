@@ -124,3 +124,52 @@ def test_an_instance_already_captured_is_not_walked_again(tmp_path, monkeypatch)
     m = _re.search(r"already = \{[^}]*\}", code, _re.S)
     assert "strip()" in m.group(0), (
         "an empty patch must not count as captured; that is an instance nobody worked")
+
+
+# ── the counters, which added up to more work than was done ───────────────────────────────
+#
+# MEASURED. Batch 1 of the final run contained exactly ONE instance and reported
+# "captured 1, skipped 1". The instance produced a 3,054,501-byte diff -- a worker had
+# regenerated something wholesale rather than fixing a bug -- so the size guard correctly
+# refused it, blanked the patch, recorded the skip, AND still incremented `captured`.
+#
+# A total that exceeds the work done is not cosmetic. The skip list is where a real failure is
+# seen, and a captured count that includes the skips is how "we got 40" comes to be believed
+# about a run that got fewer.
+
+import io as _io
+import re as _re
+
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_SRC = _io.open(os.path.join(_REPO, "bench", "pro_capture.py"), encoding="utf-8").read()
+
+def test_an_oversize_diff_is_not_counted_as_captured():
+    """SOURCE-LEVEL, and stated as such: this script drives git worktrees and containers. What
+    is asserted is that the increment is guarded, in BOTH branches -- the routed one and the
+    local one -- because the bug existed in both and fixing one would leave the other."""
+    guarded = _re.findall(r"if not (?:_over|over):\s*\n\s*captured \+= 1", _SRC)
+    assert len(guarded) == 2, (
+        "expected the captured counter to be guarded in both the routed and local branches, "
+        "found %d" % len(guarded))
+
+
+def test_no_unguarded_increment_remains():
+    """The whole defect was an unconditional `captured += 1` sitting after a skip was recorded.
+    If one comes back, this fails."""
+    for m in _re.finditer(r"captured \+= 1", _SRC):
+        before = _SRC[:m.start()].rstrip().splitlines()[-1].strip()
+        assert before.startswith("if not "), (
+            "an unguarded `captured += 1` follows %r" % before[:60])
+
+
+def test_the_skip_is_still_recorded_loudly():
+    """Not counting it as captured must not turn into not mentioning it. A skipped instance is
+    one this run did not measure, and silence there is how a real failure stops being noticed."""
+    assert 'skipped.append((inst, "diff of %d bytes exceeds %d; not a fix"' in _SRC
+    assert _SRC.count("not a fix") >= 2, "the size guard no longer reports in both branches"
+
+
+def test_the_size_ceiling_is_still_enforced():
+    """One instance once captured 105,722,582 bytes and made the predictions file 115 MB on a
+    box with 2.7 GB free. The ceiling is the reason that cannot happen again."""
+    assert "MAX_PATCH_BYTES = 1_000_000" in _SRC
