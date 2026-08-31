@@ -336,7 +336,7 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
     if limit:
         todo = todo[:limit]
     log("=" * 72)
-    log("cycle start: %d instance(s) to do, batch=%s, free=%.2f GB, floor=%.2f GB"
+    log("cycle start: %d instance(s) to do, batch=%s, free=%.2f GiB, floor=%.2f GiB"
         % (len(todo), batch_size or "by language", free_gb(), DISK_FLOOR_GB))
     held = len(captured_ids())
     if held and not redo_captured:
@@ -357,12 +357,12 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
             # relaxing it once.
             have = _reclaim(have)
         if have < DISK_FLOOR_GB:
-            log("STOP before batch %d: %.2f GB free is under the %.2f GB floor. "
+            log("STOP before batch %d: %.2f GiB free is under the %.2f GiB floor. "
                 "Everything graded so far is recorded; re-run to continue."
                 % (n, have, DISK_FLOOR_GB))
             break
         log("-" * 72)
-        log("batch %d: %d x %s  (free %.2f GB)  %s"
+        log("batch %d: %d x %s  (free %.2f GiB)  %s"
             % (n, len(group), lang_of(group[0]) or "?", have,
                ", ".join(x[:36] for x in group)))
         if dry_run:
@@ -402,7 +402,7 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
         # released both workers within two minutes, which is the confirmation as well as the
         # remedy.
         if not _fleet_can_admit():
-            log("  staged, but %.2f GB free is under the fleet's own admission floor -- it "
+            log("  staged, but %.2f GiB free is under the fleet's own admission floor -- it "
                 "would open no worker at all" % free_gb())
             _reclaim(free_gb())
             if not _fleet_can_admit():
@@ -460,9 +460,9 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
 
         _discard()
         done += len(group)
-        log("  after batch %d: free %.2f GB, %d worktree dir(s) left" % (n, free_gb(), worktrees_present()[0]))
+        log("  after batch %d: free %.2f GiB, %d worktree dir(s) left" % (n, free_gb(), worktrees_present()[0]))
 
-    log("cycle end: %d instance(s) attempted, %d graded in total, free %.2f GB"
+    log("cycle end: %d instance(s) attempted, %d graded in total, free %.2f GiB"
         % (done, len(graded_ids()), free_gb()))
     return 0
 
@@ -692,7 +692,7 @@ def _reclaim(have):
         for name, mb in _clear_toolchain_caches():
             log("  reclaim: %s freed %.0f MB" % (name, mb))
     now = free_gb()
-    log("  reclaimed %.0f MB: %.2f -> %.2f GB free" % (freed, have, now))
+    log("  reclaimed %.0f MB: %.2f -> %.2f GiB free" % (freed, have, now))
     return now
 
 
