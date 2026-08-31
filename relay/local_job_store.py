@@ -3,6 +3,24 @@
 The database is local to one PC and requires no service or administrator rights.
 Every state transition that can race uses ``BEGIN IMMEDIATE`` and every lease is
 fenced, so an expired browser turn cannot commit after a replacement claimed it.
+
+SIZE, MEASURED 2026-09-01, because a wrong number about it was in circulation. An earlier
+note said the store held 38.7 MB and repeated each goal about fifteen times, which would
+have justified a schema change. It does not:
+
+    file on disk            29.2 MB     (7119 pages, 2 free -- VACUUM would reclaim nothing)
+    jobs.job_json            6.9 MB / 451 rows
+    turns.instruction        4.9 MB / 1329 rows
+    turns.commit_json        7.9 MB / 1300 rows
+    events.payload_json      5.0 MB / 8100 rows
+    unique instruction text  1.0 MB
+    repeated copies of it    1.9 MB     -- 6.5% of the file
+
+The repetition is real but small and bounded: an instruction appears a median of THREE
+times, not fifteen -- once in ``task.instruction`` and once per ``turn_plan`` entry that
+restates it. Deduplicating 1.9 MB would mean migrating the only semantic result channel
+this system has, which is a poor trade at this size. Re-measure before revisiting; do not
+act on the fifteen-times figure.
 """
 
 from __future__ import annotations

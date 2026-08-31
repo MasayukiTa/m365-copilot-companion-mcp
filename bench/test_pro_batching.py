@@ -219,3 +219,52 @@ def test_the_floor_itself_is_never_relaxed_to_get_a_batch_through():
     body = body[:body.index("log(\"-\" * 72)")]
     assert "DISK_FLOOR_GB =" not in body, "the floor is being reassigned to fit a batch"
     assert body.count("_reclaim(") == 1
+
+
+# -- not redoing work whose result is already on disk --------------------------------------
+
+def test_an_instance_with_a_captured_patch_is_not_run_again(tmp_path, monkeypatch):
+    """GRADING IS A SEPARATE, OFFLINE STEP and it can be down for reasons that have nothing to
+    do with the work. The eval host's docker was down for a whole run, so every batch returned
+    EVALERR, the graded set stayed empty, and a restart re-ran instances whose patch was
+    already on disk -- about eighty minutes of the tenant quota that is the binding constraint
+    here, spent reproducing a file that already existed."""
+    import json
+    p = tmp_path / "preds.json"
+    p.write_text(json.dumps([
+        {"instance_id": "a", "patch": "diff --git a/x b/x\n"},
+        {"instance_id": "b", "model_patch": "diff --git a/y b/y\n"},
+    ]), encoding="utf-8")
+    monkeypatch.setattr(C, "PREDS", str(p))
+    assert C.captured_ids() == {"a", "b"}
+
+
+def test_an_empty_patch_does_not_count_as_captured(tmp_path, monkeypatch):
+    """An instance that ran and produced nothing is a result worth retrying, not one worth
+    keeping. Counting it would quietly retire the failures."""
+    import json
+    p = tmp_path / "preds.json"
+    p.write_text(json.dumps([{"instance_id": "a", "patch": ""},
+                             {"instance_id": "b", "patch": "   \n"},
+                             {"instance_id": "c", "patch": "diff --git a/z b/z\n"}]),
+                 encoding="utf-8")
+    monkeypatch.setattr(C, "PREDS", str(p))
+    assert C.captured_ids() == {"c"}
+
+
+def test_a_missing_or_broken_preds_file_means_nothing_is_captured(tmp_path, monkeypatch):
+    monkeypatch.setattr(C, "PREDS", str(tmp_path / "absent.json"))
+    assert C.captured_ids() == set()
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(C, "PREDS", str(bad))
+    assert C.captured_ids() == set()
+
+
+def test_redoing_captured_work_has_to_be_asked_for():
+    """SOURCE-LEVEL, stated as such: cycle() runs a fleet. Skipping is the default and
+    re-running is the deliberate act, not the other way round."""
+    import inspect
+    src = inspect.getsource(C.cycle)
+    assert "redo_captured" in src
+    assert "if redo_captured else captured_ids()" in src.replace("\n", " ").replace("  ", " ")
