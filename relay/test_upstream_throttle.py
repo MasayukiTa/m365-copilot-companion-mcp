@@ -158,6 +158,93 @@ def test_the_stripping_does_not_eat_ordinary_prose():
     assert "retry loop" in n and "client.py" in n
 
 
+# ── admission pacing: why the throttle happened in the first place ────────────────────────
+
+@pytest.fixture(autouse=True)
+def _clean_pacing():
+    RF._reset_admission_pacing()
+    yield
+    RF._reset_admission_pacing()
+
+
+def test_the_first_admission_is_never_delayed():
+    """A run must not pay the ramp before it has admitted anyone."""
+    assert RF.admission_is_due(now=1000.0)
+
+
+def test_a_second_admission_in_the_same_instant_is_deferred():
+    """THE BURST, in one assertion. Admission drains `pending` inside a single sweep and a
+    socket worker weighs zero, so before this the whole batch went in at once."""
+    RF.note_admitted(now=1000.0)
+    assert not RF.admission_is_due(now=1000.0)
+    assert not RF.admission_is_due(now=1000.0 + RF.ADMIT_MIN_INTERVAL_S / 2)
+    assert RF.admission_is_due(now=1000.0 + RF.ADMIT_MIN_INTERVAL_S + 0.01)
+
+
+def test_the_spacing_matches_what_survived():
+    """Measured: the eight workers that arrived about a second and a half apart all got
+    through; twenty arriving in the same second did not."""
+    assert 1.0 <= RF.ADMIT_MIN_INTERVAL_S <= 3.0
+
+
+def test_a_throttle_anywhere_slows_admission_everywhere():
+    """The quota is shared, so one worker's refusal is evidence about all of them."""
+    base = RF.admit_interval_now(now=2000.0)
+    RF.note_upstream_throttle(now=2000.0)
+    assert RF.admit_interval_now(now=2001.0) > base
+
+
+def test_the_widened_interval_relaxes_once_the_throttle_is_stale():
+    RF.note_upstream_throttle(now=3000.0)
+    widened = RF.admit_interval_now(now=3001.0)
+    later = RF.admit_interval_now(now=3000.0 + RF.ADMIT_THROTTLE_MEMORY_S + 1)
+    assert later < widened
+    assert later == RF.ADMIT_MIN_INTERVAL_S
+
+
+def test_pacing_can_be_switched_off_entirely(monkeypatch):
+    monkeypatch.setattr(RF, "ADMIT_MIN_INTERVAL_S", 0.0)
+    RF.note_admitted(now=4000.0)
+    assert RF.admission_is_due(now=4000.0)
+
+
+def test_the_guard_covers_both_admission_paths():
+    """THE FAILURE CLASS, NOT THE CALLER. This loop pops from `pending` in two places --
+    `pending.pop(pick)` in the per-repo disk branch and `pending.pop(0)` in the flat one. The
+    first version of the guard sat beside the second, which would have paced every kind of run
+    except the benchmark runs that produced the measurement.
+
+    Asserted structurally: the guard must appear BEFORE the first pop in the loop body, so no
+    later-added pop can slip past it.
+    """
+    import inspect
+    import io as _io
+    import tokenize
+
+    # COMMENTS OFF FIRST. The comment above the guard NAMES both `pending.pop(0)` and
+    # `pending.pop(pick)` -- so a raw scan finds its own explanation, decides a pop precedes
+    # the guard, and fails. Writing a source assertion against text that includes the note
+    # explaining it is a trap this repository has recorded, and this test walked into it.
+    src = inspect.getsource(RF.run_relay_fleet)
+    code_lines = []
+    for tok in tokenize.generate_tokens(_io.StringIO(src).readline):
+        if tok.type == tokenize.COMMENT:
+            continue
+        code_lines.append((tok.start[0], tok.string))
+    code = "\n".join("%d:%s" % (ln, s) for ln, s in code_lines)
+
+    guard_lines = [ln for ln, s in code_lines if s == "admission_is_due"]
+    pop_lines = [ln for i, (ln, s) in enumerate(code_lines)
+                 if s == "pop" and i and code_lines[i - 1][1] == "."
+                 and i > 1 and code_lines[i - 2][1] == "pending"]
+    assert pop_lines, "the admission loop no longer pops from pending; re-check this guard"
+    assert guard_lines, "the spacing guard is gone from run_relay_fleet"
+    assert min(guard_lines) < min(pop_lines), (
+        "an admission path can be reached without the spacing guard: guard at %s, pops at %s"
+        % (guard_lines, pop_lines))
+    assert code  # keep the joined form referenced for debugging output
+
+
 # ── what the transcripts actually contained ───────────────────────────────────────────────
 
 def test_the_recorded_transcript_still_shows_the_pattern_this_fixes():

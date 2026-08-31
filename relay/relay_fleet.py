@@ -137,6 +137,70 @@ def throttled_reply(resp: str) -> bool:
     return any(m in low for m in THROTTLE_MARKERS)
 
 
+# ── THE FLEET THROTTLING ITSELF ───────────────────────────────────────────────────────────
+#
+# The backoff above is what to do once refused. This is why the refusal happened.
+#
+# Admission drains `pending` inside one sweep for as long as capacity allows, and a socket
+# worker weighs zero, so a large batch is admitted essentially at once -- each admitted worker
+# sending its first turn immediately. Ordering one run's 144 workers by their first reply:
+#
+#     first 8 replied within 12 seconds          all succeeded
+#     20+ replied at minute 1.0                  every one rate-limited
+#     median minute, clean first reply 2.9  /  throttled first reply 1.1
+#
+# The eight that arrived roughly a second and a half apart all got through. That is the number
+# below. It is spacing, not a concurrency cap: every worker still runs, and after the opening
+# ramp the fleet is at full width. For 144 workers the ramp costs a few minutes, against 77
+# workers that produced nothing at all.
+ADMIT_MIN_INTERVAL_S = float(os.environ.get("MCP_ADMIT_INTERVAL_S", "1.5"))
+
+# Seen a throttle recently -> widen the spacing. The quota is shared by every worker, so one
+# worker's refusal is evidence about all of them, and admitting at the ordinary rate into a
+# quota that is already empty just spends more workers' first turns on it.
+ADMIT_THROTTLED_FACTOR = float(os.environ.get("MCP_ADMIT_THROTTLED_FACTOR", "4"))
+ADMIT_THROTTLE_MEMORY_S = float(os.environ.get("MCP_ADMIT_THROTTLE_MEMORY_S", "120"))
+
+_LAST_ADMIT_TS = 0.0
+_LAST_THROTTLE_TS = 0.0
+
+
+def note_upstream_throttle(now=None):
+    """Record that the upstream refused someone, so admission slows for everyone."""
+    global _LAST_THROTTLE_TS
+    _LAST_THROTTLE_TS = time.time() if now is None else now
+
+
+def admit_interval_now(now=None):
+    """The spacing to use for the next admission, widened while a throttle is fresh."""
+    now = time.time() if now is None else now
+    if _LAST_THROTTLE_TS > 0.0 and (now - _LAST_THROTTLE_TS) <= ADMIT_THROTTLE_MEMORY_S:
+        return ADMIT_MIN_INTERVAL_S * ADMIT_THROTTLED_FACTOR
+    return ADMIT_MIN_INTERVAL_S
+
+
+def admission_is_due(now=None):
+    """False while the previous admission is still too recent. Never blocks -- the caller
+    stops draining and the next sweep (poll_s, ~1s) asks again."""
+    now = time.time() if now is None else now
+    if ADMIT_MIN_INTERVAL_S <= 0:
+        return True
+    return (now - _LAST_ADMIT_TS) >= admit_interval_now(now)
+
+
+def note_admitted(now=None):
+    global _LAST_ADMIT_TS
+    _LAST_ADMIT_TS = time.time() if now is None else now
+
+
+def _reset_admission_pacing():
+    """Test seam. Module state is per-process and a run is one process; two tests sharing it
+    would otherwise pass or fail depending on their order."""
+    global _LAST_ADMIT_TS, _LAST_THROTTLE_TS
+    _LAST_ADMIT_TS = 0.0
+    _LAST_THROTTLE_TS = 0.0
+
+
 #: Volatile fields that make two IDENTICAL replies look different. A GUID, an ISO timestamp,
 #: an epoch, a request id -- every canned error page carries at least one.
 _VOLATILE_IN_REPLY = re.compile(
@@ -3034,6 +3098,9 @@ class RelayWorker:
         if throttled_reply(resp):
             try:
                 now = time.time()
+                # ONE WORKER'S REFUSAL IS EVIDENCE ABOUT ALL OF THEM: the quota is shared, so
+                # this also widens the interval at which further workers are admitted.
+                note_upstream_throttle(now)
                 if self._throttle_ts <= 0.0:
                     self._throttle_ts = now
                 self._throttle_streak += 1
@@ -5063,6 +5130,17 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                            or _projected_peak()
                               + pending[0].tab_weight(assume_socket=_socket_open_now())
                               <= max(1, mc_box[0])):
+            # SPACING, AND IT SITS HERE BECAUSE THERE ARE TWO WAYS OUT OF THIS LOOP.
+            # The first version of this guard was placed next to `pending.pop(0)` in the flat
+            # branch, and the per-repo branch a few lines above pops with `pending.pop(pick)`
+            # -- so the spacing would have covered every kind of run EXCEPT the benchmark runs
+            # that produced the measurement. Guarding one caller of a failure class and calling
+            # it fixed is a mistake this repository has already paid for.
+            #
+            # Costs at most one interval of delay before a disk/RAM deferral is logged, which
+            # is the right trade for covering both paths with one line.
+            if not admission_is_due():
+                break
             # reserve disk for THIS eval plus every already-open eval still in flight, so we never
             # admit N tabs that look fine individually but crash C: once their builds run at once.
             # PER-REPO mode sizes the reserve by each instance's actual build weight (matplotlib 7GB
@@ -5112,6 +5190,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     route.refresh(context, agent_url)
             except Exception:
                 pass
+            note_admitted()
             ok = w.attach(context, agent_url)
             if not ok:
                 # attach failed. If the WHOLE Edge/context died mid-open (e.g. the
