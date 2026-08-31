@@ -139,14 +139,24 @@ def captured_ids():
 
     An empty patch does NOT count. That is an instance that ran and produced nothing, which is
     a result worth retrying, not a result worth keeping.
+
+    A REFUSED patch is different, and does count as attempted. The capture blanks a diff that
+    is too large to be a fix, so the row looks identical to "produced nothing" -- but the
+    worker produced far too much rather than nothing, and repeating it does not help. Measured
+    on one instance: 3,054,501 bytes on the first attempt and 74,850,968 on the second, each
+    costing a full batch slot on a quota that is the binding constraint here. Retrying it is
+    now a deliberate act (--redo-captured) rather than something that happens every run
+    forever.
     """
     out = set()
     for row in _load(PREDS, []) or []:
         if not isinstance(row, dict):
             continue
         inst = row.get("instance_id")
+        if not inst:
+            continue
         patch = (row.get("patch") or row.get("model_patch") or "").strip()
-        if inst and patch:
+        if patch or row.get("refused"):
             out.add(inst)
     return out
 
