@@ -3787,10 +3787,61 @@ class RelayWorker:
             return
         self._active_check = Check(self._pending_checks[0], cwd=self.cwd).start()
 
+    #: Skip the refuter when the machine checks already settled it. OFF by default: while the
+    #: shadow numbers are being collected, "we stopped asking" and "there was nothing to ask
+    #: about" are indistinguishable in a pass rate, and this must be measured before it saves
+    #: anything.
+    SKIP_REFUTER_WHEN_SETTLED = (
+        os.environ.get("MCP_REFUTER_SKIP_WHEN_SETTLED", "0").strip().lower()
+        in ("1", "true", "yes", "on"))
+
+    def _deterministically_settled(self) -> bool:
+        """True when this candidate had real acceptance checks and every one of them passed.
+
+        NOT true when there were no checks. A task with no mechanical oracle is exactly the
+        case the refuter is for, and treating "nothing to run" as "nothing to worry about" is
+        the failure the whole verification pipeline exists to stop.
+        """
+        if not self.SKIP_REFUTER_WHEN_SETTLED:
+            return False
+        try:
+            # `verified` is set True only by _advance_check draining every pending check, and
+            # is set False when there were none -- which is exactly the distinction needed
+            # here, so this uses the existing flag rather than a second one that could
+            # disagree with it.
+            return bool(getattr(self, "checks", None)) and bool(getattr(self, "verified", False))
+        except Exception:
+            return False
+
     def _candidate_done(self):
         """Machine checks passed (or none) -> a CANDIDATE done. If the refuter is enabled
         and within budget, open an independent reviewer (non-blocking) before accepting;
         otherwise finish now."""
+        # THE REFUTER GOES BEHIND THE DETERMINISTIC CHECKS, NOT BESIDE THEM.
+        #
+        # It costs a model turn on the same tenant quota the work uses, and that quota is the
+        # binding constraint here: 217 of 237 turns refused in one measured run, refusals
+        # concentrated where the fleet is densest. Spending one on a claim the records already
+        # settle is spending the scarce thing on a question that was free to answer.
+        #
+        # So when this candidate's own acceptance checks ran and passed, there is no semantic
+        # residue for a reviewer to find and the turn is skipped. What the refuter is FOR is
+        # the part machines cannot reach: a patch that passes and misses the point, a
+        # requirement misread, a fix that is narrower than the issue. Opt-in while the shadow
+        # numbers are still being collected, because "we stopped asking" and "there was nothing
+        # to ask about" look identical in a pass rate.
+        if self._deterministically_settled():
+            _sk = "deterministic checks passed; no refuter turn spent"
+            self.reason = (self.reason or "") + (" | " if self.reason else "") + _sk
+            try:
+                from relay import mechanism_telemetry as _mt
+                _mt.record("refuter", configured=True, config_source="skip-when-settled",
+                           eligible=True, triggered=False,
+                           not_triggered_reason=_sk, executed=False, changed_decision=False)
+            except Exception:
+                pass
+            self.status, self.outcome = "done", "DONE"
+            return
         if (self.refuter and self._context is not None
                 and self.refute_count < self.max_refute):
             self.refute_count += 1
