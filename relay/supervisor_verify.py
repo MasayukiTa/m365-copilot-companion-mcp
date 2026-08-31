@@ -39,6 +39,10 @@ DONE = "DONE"
 VERIFY_FAILED = "VERIFY_FAILED"
 #: Could not be established either way. NOT a promotion.
 VERIFY_UNAVAILABLE = "VERIFY_UNAVAILABLE"
+#: The independent run could not be made, AND the recorded evidence contradicts the claim.
+#: Weaker than VERIFY_FAILED -- nothing was executed -- but strictly stronger than "unverified",
+#: because the ledger is positive information against the claim rather than an absence of it.
+EVIDENCE_CONTRADICTED = "EVIDENCE_CONTRADICTED"
 
 #: Anything larger is not source and is not worth hashing on every verification.
 _MAX_HASH_BYTES = 2_000_000
@@ -223,11 +227,27 @@ def verify(contract: dict, cwd: str = "", timeout_s: float = None, runner=None) 
         return result
 
 
-def promote(claimed_done: bool, verification: dict) -> str:
+def promote(claimed_done: bool, verification: dict, evidence: dict = None) -> str:
     """The final state for one task. The ONLY place DONE is produced.
 
     A claim is a candidate. It becomes DONE when, and only when, an independent run of the
     contract's own commands passed against the tree the work left behind.
+
+    `evidence` is the tool-ledger assessment, and it is consulted ONLY where the independent
+    run could not be made. That is not a rare corner here -- a staged benchmark worktree has no
+    dependencies installed, so the acceptance command cannot run at all, and the ledger is then
+    the only signal there is. It was being collected and thrown away: the shadow assessment said
+    CONTRADICTED while the state said CANDIDATE_DONE, in the same log, about the same task.
+
+    THE ORDER OF AUTHORITY, and why. A passing independent run outranks the ledger: if the
+    contract's own commands passed against the finished tree, the work is done whatever the
+    ledger looks like. A failing run likewise stands on its own. Only when nothing could be run
+    does "the record contradicts the claim" become the strongest thing known -- and it still
+    does not promote anything, it only refuses to call a contradicted claim a plain candidate.
+
+    Evidence that SUPPORTS a claim never promotes it. Tool calls show what was attempted, not
+    that it was right, and treating them as proof would rebuild the self-report this whole
+    pipeline exists to stop believing.
     """
     if not claimed_done:
         return ""
@@ -236,4 +256,6 @@ def promote(claimed_done: bool, verification: dict) -> str:
         return DONE
     if state == VERIFY_FAILED:
         return VERIFY_FAILED
+    if (evidence or {}).get("verdict") == "CONTRADICTED":
+        return EVIDENCE_CONTRADICTED
     return CANDIDATE_DONE
