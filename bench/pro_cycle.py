@@ -49,11 +49,24 @@ RESULTS = os.path.join(SW, "pro_cycle_results.json")
 GOALS = os.path.join(SW, "pro_cycle_goals.jsonl")
 STATUS = os.path.join(REPO, ".fleet", "status.json")
 
-#: Stop before the run's own floor does. fleet_runner refuses to start under 3.0 GB, so a cycle
+#: Stop before the run's own floor does. fleet_runner refuses to start under 3.0 GiB, so a cycle
 #: that keeps going until it hits that leaves the operator with a benchmark that cannot resume
 #: and a disk they have to clear by hand. Stopping a batch early is recoverable; stopping
 #: mid-batch with worktrees still on disk is what happened last time.
 DISK_FLOOR_GB = float(os.environ.get("SWE_CYCLE_FLOOR_GB", "3.4"))
+
+#: The FLEET's own admission floor, in the same GiB units it uses. Read from the fleet rather
+#: than restated, because a second copy of a number that already exists is a copy that goes
+#: stale -- and this one is compared against a reading taken here, so a mismatch is silent.
+def _fleet_floor_gib():
+    try:
+        from relay.fleet_runner import settings_disk_floor
+        return float(settings_disk_floor())
+    except Exception:
+        return 3.0
+
+
+FLEET_FLOOR_GIB = _fleet_floor_gib()
 
 #: A batch that has not finished in this long is not going to. The point of small batches is
 #: that giving up on one is cheap.
@@ -82,7 +95,18 @@ def log(msg):
 
 
 def free_gb(path=None):
-    return shutil.disk_usage(path or os.path.splitdrive(REPO)[0] + os.sep).free / 1e9
+    """Free space in GiB (1024**3), MATCHING relay.relay_fleet.free_disk_gb.
+
+    THE UNITS HAVE TO AGREE OR THE TWO FLOORS DO NOT MEAN THE SAME THING. This divided by 1e9
+    while the fleet's predicate divides by 1024**3, so the same disk read as 3.10 here and 2.89
+    there -- a 7% gap, always in the optimistic direction. The cycle therefore believed it was
+    above the fleet's 3.0 floor while the fleet correctly refused to admit anyone, and a batch
+    was staged that could never run. It happened twice tonight before the cause was found.
+
+    Both numbers were called "GB" and neither said which one. Same word, different quantity,
+    compared across a module boundary.
+    """
+    return shutil.disk_usage(path or os.path.splitdrive(REPO)[0] + os.sep).free / (1024.0 ** 3)
 
 
 def _load(path, default):
@@ -249,7 +273,10 @@ def concurrency_for(langs, free):
     thing this repository has a standing rule against.
     """
     cost = max([LANG_DISK_MB.get(l, DEFAULT_DISK_MB) for l in langs] or [DEFAULT_DISK_MB])
-    headroom_mb = max(0.0, (free - 3.05) * 1000.0)
+    # GiB throughout, and the reserve is the FLEET's floor plus a little, not this cycle's --
+    # the fleet is what refuses to open a tab, so it is the number that decides whether a batch
+    # can run at all. 1024 not 1000, for the same reason the reading above changed.
+    headroom_mb = max(0.0, (free - (FLEET_FLOOR_GIB + 0.15)) * 1024.0)
     return max(1, min(4, int(headroom_mb // cost)))
 
 
