@@ -187,3 +187,54 @@ def test_an_unstartable_check_leaves_the_claim_a_candidate(tree):
                   runner=runner([{"ok": False, "unavailable": True}]))
     assert SV.promote(True, v) == SV.CANDIDATE_DONE
     assert v["state"] == SV.VERIFY_UNAVAILABLE
+
+
+# ── collection never completed, so nothing was exercised ──────────────────────────────────
+
+def test_a_collection_error_is_unavailable_not_a_failure():
+    """MEASURED ON THE BENCHMARK. `pytest -x` in a staged worktree died in 3.5 seconds with
+    "ModuleNotFoundError: No module named 'web'" out of the project's own conftest, because the
+    repository's dependencies are not installed in the worktree. Every instance was recorded
+    VERIFY_FAILED -- a verdict about code that had never been exercised.
+
+    A collection error can also be the patch's own fault, and nothing in the output
+    distinguishes the two. UNAVAILABLE neither credits nor condemns it, which is the honest
+    answer when the evidence cannot tell them apart."""
+    out = ("openlibrary/conftest.py:5: in <module>\n    import web\n"
+           "E   ModuleNotFoundError: No module named 'web'\n"
+           "!!!! Interrupted: 1 error during collection !!!!\n")
+    assert SV.not_actually_run(out) is True
+
+
+def test_a_conftest_import_error_is_unavailable():
+    assert SV.not_actually_run("ImportError while loading conftest '/x/conftest.py'.") is True
+
+
+def test_a_suite_that_ran_nothing_is_not_a_pass_and_not_a_defect():
+    assert SV.not_actually_run("collected 0 items\n\n= no tests ran in 0.31s =") is True
+
+
+def test_a_real_test_failure_is_still_a_failure():
+    """THE LINE THAT MUST NOT MOVE. Widening the unavailable markers until genuine failures
+    fall through turns the whole verifier into a machine that never says no."""
+    assert SV.not_actually_run("2 failed, 118 passed in 41.2s") is False
+    assert SV.not_actually_run(
+        "E   AssertionError: assert 3 == 4\n1 failed, 9 passed in 2.1s") is False
+
+
+def test_an_import_error_inside_a_test_is_still_a_failure():
+    """An ImportError raised while a test RUNS is a result about the patch. Only a failure
+    during collection means nothing ran."""
+    assert SV.not_actually_run(
+        "test_x.py::test_thing FAILED\nE   ImportError: cannot import name 'foo'\n"
+        "1 failed, 3 passed in 1.4s") is False
+
+
+def test_an_unavailable_check_cannot_promote():
+    """The taxonomy, end to end: a check that could not run must not become DONE."""
+    contract = {"checks": [{"id": "project_tests", "command": "pytest -x"}], "cwd": "."}
+    v = SV.verify(contract, cwd=".",
+                  runner=lambda c: {"command": c, "ok": False, "unavailable": True,
+                                    "output": "1 error during collection", "duration_s": 3.5})
+    assert v["state"] == SV.VERIFY_UNAVAILABLE
+    assert SV.promote(True, v) != SV.DONE

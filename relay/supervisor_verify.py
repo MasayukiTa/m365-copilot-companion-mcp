@@ -103,6 +103,24 @@ _NOT_RUN_MARKERS = (
     "error: file not found",
     "指定されたファイルが見つかりません",
     "認識されていません",
+
+    # COLLECTION NEVER COMPLETED, so no test in the suite was executed. Measured on this
+    # benchmark: `pytest -x` in a staged worktree died in 3.5 seconds with
+    # "ModuleNotFoundError: No module named 'web'" from the project's own conftest, because the
+    # repository's dependencies are not installed in the worktree. Every instance was being
+    # recorded VERIFY_FAILED -- a verdict about code that had never been exercised.
+    #
+    # THE HONEST VERDICT HERE IS "DO NOT KNOW", AND THAT IS WHY THIS IS SAFE. A collection
+    # error can also be the patch's own fault, and nothing in the output distinguishes the two
+    # cases. Routing both to UNAVAILABLE neither credits nor condemns the patch, which is
+    # exactly right when the evidence cannot tell them apart. Calling it a failure asserts
+    # something the run did not establish.
+    "error during collection",
+    "errors during collection",
+    "importerror while loading conftest",
+
+    # The command ran and exercised nothing. Not a pass, and not evidence of a defect either.
+    "no tests ran",
 )
 
 
