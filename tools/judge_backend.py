@@ -153,22 +153,22 @@ def install(mcp) -> bool:
 def on_the_event_loop_thread() -> bool:
     """True when this synchronous code is running ON the loop, not beside it.
 
-    MEASURED, NOT ASSUMED, and it is the opposite of what I assumed. fastmcp's FunctionTool.run
-    calls a sync tool DIRECTLY -- `type_adapter.validate_python(arguments)`, then `if
-    inspect.isawaitable(result)`, which a sync function's result never is. There is no
-    to_thread and no executor anywhere in the package. A probe printed
-    `thread=MainThread` from inside a running tool.
+    FALSE FOR THIS SERVER'S TOOLS, and the check is here because I first concluded otherwise.
 
-    Two consequences, and the second is not about this layer at all:
+    fastmcp's FunctionTool.run does call a sync function directly, on the loop thread -- there
+    is no to_thread and no executor in the package. From that I concluded a sync tool can never
+    make an outbound MCP request, and committed it. It was wrong: main.py registers
+    `register(tool)`, and tools/registry.py's register() already wraps every tool in
+    `anyio.to_thread.run_sync`, precisely so a slow tool cannot freeze the loop. Under that
+    wrapper the tool runs in an anyio worker thread and the round trip works -- measured,
+    `thread=AnyIO worker thread`, verdict returned.
 
-      * A sync tool CANNOT make an outbound MCP request. Scheduling one on the loop and then
-        blocking for the answer deadlocks -- the loop cannot run the coroutine because this
-        function is what it is running. Measured as a 20-second timeout per command, from a
-        `try` that turned it into REQUIRE_HUMAN.
-      * Every sync tool blocks the server's whole event loop for its entire duration.
-        shell_exec's default timeout is 30 seconds, so one slow command stalls every other
-        request on that server. That is a pre-existing property of this server, not something
-        this layer introduced, and it is worth its own fix.
+    What was actually wrong was my test: it registered a bare `mcp.tool()(fn)`, a shape the
+    deployment does not have, and so measured a configuration that does not exist.
+
+    The check stays because the failure it names is real when it happens -- a tool registered
+    without register(), which is exactly what that test did -- and because the alternative is
+    a twenty-second deadlock reported as a timeout.
     """
     import asyncio
     try:
@@ -181,20 +181,30 @@ def on_the_event_loop_thread() -> bool:
 def _run_async(coro_fn, *args, **kwargs):
     """Run one coroutine from synchronous code, or say plainly that it cannot be done here.
 
-    `anyio.from_thread.run` needs an EventLoopToken unless it is called from a thread anyio
-    itself started; `asyncio.run_coroutine_threadsafe` needs a loop running on ANOTHER thread.
-    Neither holds for a fastmcp sync tool, which runs on the loop thread itself -- so the
-    honest answer is a refusal, immediately, rather than a deadlock that expires as a timeout.
+    THE NORMAL PATH IS THE FIRST ONE. tools/registry.py's register() runs every tool through
+    `anyio.to_thread.run_sync`, so a registered tool is in an anyio worker thread and
+    `anyio.from_thread.run` has its token. That is measured, in
+    tools/test_judge_live_roundtrip.py, through the same registration main.py uses.
 
-    A 20-second timeout in front of every judged command would not have been a subtle defect;
-    it would have made the layer unusable while looking configured. Failing in milliseconds
-    with a reason is the difference between a bug report and a mystery.
+    The refusal below is for a tool registered WITHOUT that wrapper, which runs on the loop
+    thread. There, scheduling a coroutine and blocking for it deadlocks -- the loop cannot run
+    what it is currently inside -- and the deadlock expires as a timeout, twenty seconds per
+    judged command, reported as a transport fault. Failing in milliseconds with a reason is the
+    difference between a bug report and a mystery.
     """
     if on_the_event_loop_thread():
         raise JudgeTransportError(
             "this tool runs on the server's event loop, so it cannot make an outbound MCP "
             "request; the judged tool has to be async for sampling or elicitation to reach "
             "the client")
+    import anyio.from_thread
+    try:
+        return anyio.from_thread.run(lambda: coro_fn(*args, **kwargs))
+    except Exception as exc:
+        # Only an anyio-worker-thread problem falls through to the loop route; a failure from
+        # the coroutine itself must not be retried, or one judging call becomes two.
+        if type(exc).__name__ not in ("MissingTokenError", "NoEventLoopError", "RuntimeError"):
+            raise
     import asyncio
     loop = _LOOP
     if loop is not None and loop.is_running():
@@ -202,8 +212,7 @@ def _run_async(coro_fn, *args, **kwargs):
         # Bounded independently of the inner timeout, so a loop that stops answering cannot
         # park a tool call forever.
         return fut.result(timeout=timeout_s() + 5.0)
-    import anyio.from_thread
-    return anyio.from_thread.run(lambda: coro_fn(*args, **kwargs))
+    raise JudgeTransportError("no way back to the event loop from this thread")
 
 
 async def sampling_judge_async(request_json: str) -> str:

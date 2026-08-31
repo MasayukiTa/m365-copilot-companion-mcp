@@ -637,6 +637,19 @@ try:
 except Exception:
     _TOOL_ANNOTATIONS = {}
 
+# The pre-execution review (tools/command_judge.py) asks the CLIENT for a judgement, and a
+# synchronous tool needs a way back to the event loop to do it. register() below puts every
+# tool in an anyio worker thread, which is the route that normally carries it; this middleware
+# records the loop as well, so a tool that somehow runs elsewhere still has one. Best effort:
+# a server that could not install it still works, and availability() reports "loop": false so
+# a judge that cannot be reached says why instead of timing out.
+try:
+    from tools import judge_backend as _judge_backend
+
+    _judge_backend.install(mcp)
+except Exception:
+    pass
+
 for tool in TOOLS:
     _name = getattr(tool, "__name__", "")
     _ann = _TOOL_ANNOTATIONS.get(_name)
