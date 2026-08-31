@@ -107,6 +107,45 @@ def test_a_different_conversation_id_also_does_not_make_it_a_new_reply():
     assert a == b
 
 
+def test_the_infra_classification_that_existed_was_unreachable_and_now_is_not():
+    """THE STRONGEST STATEMENT AVAILABLE ABOUT THIS DEFECT, and it is not about the new code.
+
+    relay_fleet.py already carried the right answer for this exact shape: at
+    `no_progress >= max_no_progress`, a reply under 160 characters that repeats and never
+    produced work is classified INFRA_STUCK -- "an INFRA block, NOT a coding miss", in its own
+    comment, written so the orchestrator re-attempts rather than scoring a miss.
+
+    The rate-limit reply is 133 characters and repeats verbatim. That branch should have fired
+    on every one of the 110 workers. It fired on none, because no_progress compared the raw
+    first 300 characters and the reply's GUID and timestamp change every time.
+
+    So the harness did not lack the classification. One line disabled it. Replaying the real
+    transcript through the old key and the new one is the whole proof.
+    """
+    import json
+    import os
+    p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     ".fleet", "transcripts", "r6a926255_a0_w11.jsonl")
+    if not os.path.isfile(p):
+        pytest.skip("transcript not present in this checkout")
+    replies = [json.loads(l)["text"] for l in open(p, encoding="utf-8")
+               if json.loads(l).get("role") == "assistant"]
+    assert len(replies) >= 4 and all(len(r.strip()) < 160 for r in replies)
+
+    def run(key):
+        n, last, peak = 0, None, 0
+        for r in replies:
+            k = key(r)
+            n = n + 1 if k and k == last else 0
+            last, peak = k, max(peak, n)
+        return peak
+
+    shipped = run(lambda s: " ".join(s.lower().split())[:300])
+    fixed = run(RF._norm_for_progress)
+    assert shipped == 0, "the shipped key was supposed to be defeated by the volatile fields"
+    assert fixed >= 3, "the fixed key must reach max_no_progress (default 3); got %d" % fixed
+
+
 def test_genuinely_different_replies_still_differ():
     """The normalisation must not flatten everything into one key -- that would make every
     reply look like no progress and terminate healthy workers."""
