@@ -10,6 +10,7 @@
 このモジュールが存在する理由そのもの。
 """
 import json
+import os
 
 import pytest
 
@@ -36,7 +37,37 @@ def _result():
     }
 
 
+def _isolated_baseline(tmp_path):
+    """A throwaway frozen baseline for this test only.
+
+    WITHOUT IT THESE TESTS MEASURE THE REPOSITORY, NOT THE WIRING. They ran against the real
+    relay/selfimprove/frozen_baseline.json, so any legitimate edit to a constitution file
+    aborts run_candidate at the frozen gate -- INFRA_ABORT, before a single record is written
+    -- and three tests then failed with FileNotFoundError on records.jsonl.
+
+    That is exactly what happened on 2026-08-31: docs/SECURITY.md was corrected, the frozen
+    set stopped matching, and these three reported "the records are missing" when the true
+    statement was "the loop refused to run, correctly". A test that fails for a reason it does
+    not name sends whoever reads it to the wrong file; I spent a first pass looking for a
+    wiring defect that does not exist.
+
+    The frozen gate is not being bypassed -- it gets its own test below, which asserts that a
+    changed frozen set aborts BEFORE anything is recorded. This baseline is written into
+    tmp_path and never touches the repository's own, which only the operator may re-sign.
+    """
+    from relay.selfimprove import frozen as F
+    path = str(tmp_path / "frozen_baseline.json")
+    F.snapshot_baseline(baseline_path=path)
+    return path
+
+
 def _controller(tmp_path, **kw):
+    # NOT setdefault: its second argument is evaluated whether or not the key is present, so
+    # a caller passing its own baseline_path still triggered a second snapshot into the same
+    # path -- and snapshot_baseline refuses to overwrite, by design. The refusal was correct;
+    # the call should not have happened.
+    if "baseline_path" not in kw:
+        kw["baseline_path"] = _isolated_baseline(tmp_path)
     return EvolutionController(
         ledger=HypothesisLedger(str(tmp_path / "h.jsonl")), **kw)
 
@@ -91,6 +122,37 @@ def test_infra_failure_is_not_recorded_as_a_functional_failure(tmp_path):
     e3 = next(r for r in rows if r["episode_id"] == "candidate:e3")
     assert e3["outcome"]["infra_failure"] is True
     assert e3["outcome"]["functional_success"] is False
+
+
+# ---- 凍結ゲートは記録より先に効く ----------------------------------------------------------------
+
+def test_a_changed_frozen_set_aborts_before_anything_is_recorded(tmp_path):
+    """記録は「走った」ことの証拠であり、走ってはいけない走行の証拠を残してはならない。
+
+    凍結セットが変わっている＝判定器が無傷でない、という状態では run_candidate は
+    INFRA_ABORT で止まる。その時 records は1行も書かれない、というのがここで固定したい性質。
+    上の各テストが自前のベースラインを持つのは、この性質を消したからではなく、
+    配線の試験と憲法の状態を分けるため。両方が要る。
+    """
+    from relay.selfimprove import frozen as F
+    path = tmp_path / "records.jsonl"
+    baseline = _isolated_baseline(tmp_path)
+
+    # 凍結対象の1つを、このテストの中だけで書き換える。
+    target = os.path.join(F.REPO, F.FROZEN_MANIFEST[0])
+    original = open(target, "rb").read()
+    try:
+        with open(target, "ab") as fh:
+            fh.write(b"\n# touched by a test\n")
+        assert F.frozen_intact(baseline_path=baseline)[0] is False, "改変が検出されていない"
+        out = _run(_controller(tmp_path, records_path=str(path), baseline_path=baseline))
+    finally:
+        with open(target, "wb") as fh:
+            fh.write(original)
+
+    assert out["decision"]["state"] == "INFRA_ABORT"
+    assert not path.exists(), "止まるべき走行がエピソード記録を残した"
+    assert F.frozen_intact(baseline_path=baseline)[0] is True, "後始末が効いていない"
 
 
 # ---- 供給できないものは供給しない -----------------------------------------------------------------

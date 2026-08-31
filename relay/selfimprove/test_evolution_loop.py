@@ -421,10 +421,30 @@ def test_the_memory_component_version_changes_what_is_primed(monkeypatch):
     """v1 は直近N件そのまま、v2 は重複を畳んでからN件。実際に違う出力になること。"""
     from relay import project_memory as PM
 
+    # THE FILE IS BUILT HERE, NOT THROUGH record_task. The subject of this test is the
+    # COMPONENT -- what each version primes from a given theme file -- and record_task now
+    # collapses repeats as it writes, so driving the setup through it produced a file with one
+    # entry and both arms returned the same thing. That looked like the arms being identical,
+    # which is what this test exists to catch, and it would have been the wrong diagnosis.
+    #
+    # Write-time dedupe and v2 answer the same question at different moments: the write path
+    # decides what SURVIVES the per-theme cap (v2 cannot recover an evicted entry), v2 decides
+    # what is PRIMED from whatever survived. A store still holds repeats whenever they were
+    # written before that policy, so the distinction the arms measure is real -- it just must
+    # not be set up through the writer.
     state = tempfile.mkdtemp(prefix="pmc_")
-    for i in range(6):
-        PM.record_task("テーマ", "同じ作業", "DONE", state_dir=state, ts=100 + i)
-    PM.record_task("テーマ", "別の作業", "DONE", state_dir=state, ts=200)
+    os.makedirs(PM._mem_dir(state), exist_ok=True)
+    _theme, _slug = PM._resolve("テーマ")
+    _dupe = ("- [DONE] 同じ作業 — (記録なし)"
+             "  <!-- authority=EXTERNAL_UNTRUSTED -->  <!-- 2026-08-28 0%d:00 -->")
+    _lines = ["- [DONE] 別の作業 — (記録なし)"
+              "  <!-- authority=EXTERNAL_UNTRUSTED -->  <!-- 2026-08-28 09:00 -->"]
+    _lines += [_dupe % i for i in range(1, 7)]
+    _body = "\n".join(_lines)
+    _text = ("---\ntheme: %s\nupdated: x\nentries: %d\n---\n\n# %s\n\n%s\n"
+             % (_theme, len(_lines), _theme, _body))
+    with open(PM._theme_path(_slug, state), "w", encoding="utf-8", newline="\n") as _fh:
+        _fh.write(_text)
 
     def _notes(version):
         tmp = tempfile.mkdtemp(prefix="pmc_%s_" % version.replace("/", "_"))

@@ -446,10 +446,22 @@ def _memory_v2(entries, max_items):
     A loop that repeats a task writes the same line many times, and v1 then spends the whole
     budget re-telling the agent one fact. Whether that is an improvement is a question for
     the benchmark, which is the point of having two.
+
+    THE KEY USED TO INCLUDE THE TIMESTAMP, so this arm did not do the thing it is named for.
+    It was `"".join(alnum(line))[:80]`, and the entries this store writes end in a comment
+    like `<!-- 2026-08-28 08:49 -->` whose digits survive that filter. Measured 2026-08-31 on
+    the store's real lines: eight identical records, eight distinct keys, nothing collapsed.
+    The 80-character truncation hid it only for goals long enough to fill the budget before
+    reaching the timestamp -- so the arm worked on long goals and silently did nothing on
+    short ones, which is worse than not working at all, because the A/B still reported a
+    difference sometimes.
+
+    Same volatile-field defect as relay_fleet.py's no-progress key, found the same day. It
+    now shares the one identity function, `_entry_key`.
     """
     seen, out = set(), []
     for line in entries:
-        key = "".join(ch for ch in line.lower() if ch.isalnum())[:80]
+        key = _entry_key(line)
         if key in seen:
             continue
         seen.add(key)
@@ -490,11 +502,20 @@ def load_notes(theme, max_items=None, state_dir=None, goal="", include_index=Tru
         if max_items is None:
             max_items = _default_max_items()
         theme, slug = _resolve(theme, goal)
-        # ALSO ON THE READ PATH, because the 156 theme files already on disk were written
-        # before dedupe_entries existed and are not rewritten until their theme comes round
-        # again. A fix that only applies to new entries leaves the measured problem in place.
-        entries = _select_entries(
-            dedupe_entries(_entry_lines(_read(_theme_path(slug, state_dir)))), max_items)
+        # NO DEDUPE HERE, DELIBERATELY, and the first version of this line had one.
+        #
+        # Collapsing repeats at READ time is what `memory/v2` already does -- it is a declared
+        # component with two arms, and which one primes better is a question the benchmark is
+        # supposed to answer. Doing it unconditionally here made v1 and v2 return byte-identical
+        # text, so the experiment measured nothing: exactly the failure MEMORY_VERSIONS was
+        # introduced to end, where a manifest named a component whose arms ran the same code.
+        # A test caught it, which is the only reason it is not still true.
+        #
+        # The write path still dedupes, and that is a different question. v2 filters what is
+        # PRIMED; it cannot recover an entry the cap already evicted. Twenty slots holding one
+        # fact discard the distinct entries first, because the cap keeps the newest -- so
+        # whether a distinct entry SURVIVES is decided when it is written, not when it is read.
+        entries = _select_entries(_entry_lines(_read(_theme_path(slug, state_dir))), max_items)
         index = _read(_index_path(state_dir)).strip() if include_index else ""
         blocks = []
         if entries:
