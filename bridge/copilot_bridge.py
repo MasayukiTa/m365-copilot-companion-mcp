@@ -5593,41 +5593,30 @@ def _run_tool_probe():
         if since_user < TOOL_PROBE_MIN_IDLE_SEC:
             logger.debug("tool probe: skipped (user turn %.0fs ago)", since_user)
             return max(5.0, TOOL_PROBE_MIN_IDLE_SEC - since_user)
-        if PAGE is None:
-            # BORROW ONE, THE WAY EVERY OTHER PAGE CONSUMER DOES.
-            #
-            # This used to report "PAGE not initialized; retrying" and give up. Under the
-            # default MCP_BRIDGE_RELEASE_PAGE=1 -- chosen deliberately, a resident page costs
-            # about half a gigabyte -- PAGE is None WHENEVER THE BRIDGE IS IDLE. And this
-            # probe only runs when the bridge is idle (TOOL_PROBE_MIN_IDLE_SEC). So the one
-            # instrument that watches the tool path could never succeed: it looked for a page
-            # at precisely the moment the design guarantees there is none.
-            #
-            # The consequence was not a red dot on a panel. It was that on 2026-08-31 the tool
-            # path was genuinely down for hours, every fleet worker reported having no tools,
-            # two benchmark runs produced patches written from memory, and the health signal
-            # said "starting" throughout -- indistinguishable from what it says when everything
-            # is fine.
-            # ON THE PAGE-OWNER THREAD, AND BOUNDED.
-            #
-            # borrow_page reaches Playwright, which has thread affinity, so calling it from
-            # this timer thread is not allowed. The original comment here explains why it did
-            # not simply submit: an unbounded submit blocks this thread forever if the owner
-            # never services its queue. submit_bounded exists for exactly that -- it fails
-            # closed instead of hanging, which is the whole reason the guard was there.
-            try:
-                _ok_borrow, _probe_borrowed = PAGE_EXECUTOR.submit_bounded(30.0, borrow_page)
-            except Exception:
-                _ok_borrow, _probe_borrowed = False, None
-            if not _ok_borrow or PAGE is None:
-                tool_probe.record_probe(False, "starting",
-                                        detail="no page available to probe with; retrying")
-                logger.info("tool probe: could not borrow a page; short retry armed")
-                return 15.0
         if not PAGE_LOCK.acquire(blocking=False):
             logger.debug("tool probe: skipped (page busy)")
             return 15.0
         try:
+            # BORROW INSIDE THE LOCK, AND GIVE IT BACK BEFORE RELEASING.
+            #
+            # The borrow used to happen before this acquire and the return after the release,
+            # leaving a gap at each end. A real user turn takes PAGE_LOCK, so it could begin in
+            # either gap, inherit the page and driver this probe had just created, and then
+            # have the probe's finally close the page out from under the conversation.
+            #
+            # Under the default MCP_BRIDGE_RELEASE_PAGE=1 -- a resident tab costs about half a
+            # gigabyte -- PAGE is None whenever the bridge is idle, and idle is the only time
+            # this probe runs. Borrowing is not an edge case here; it is every cycle.
+            if PAGE is None:
+                try:
+                    _ok_borrow, _probe_borrowed = PAGE_EXECUTOR.submit_bounded(30.0, borrow_page)
+                except Exception:
+                    _ok_borrow, _probe_borrowed = False, None
+                if not _ok_borrow or PAGE is None:
+                    tool_probe.record_probe(False, "starting",
+                                            detail="no page available to probe with; retrying")
+                    logger.info("tool probe: could not borrow a page; short retry armed")
+                    return 15.0
             # Persist an explicit transitional state BEFORE the potentially long M365 turn.
             # FleetCockpit renders this as a spinner, so a 30-180s real tool round-trip never
             # looks like an inert stale-red indicator.
@@ -5688,7 +5677,17 @@ def _run_tool_probe():
                     else:
                         logger.warning("tool probe: auto-consent failed for a consent card")
         finally:
-            PAGE_LOCK.release()
+            # RETURNED INSIDE THE LOCK, so no turn can be holding the page we are about to
+            # close. Cleared afterwards, so the outer net below only fires for a borrow that
+            # never reached this point.
+            try:
+                if _probe_borrowed:
+                    PAGE_EXECUTOR.submit_bounded(30.0, return_page, _probe_borrowed)
+            except Exception:
+                logger.warning("tool probe: could not return the borrowed page", exc_info=True)
+            finally:
+                _probe_borrowed = None
+                PAGE_LOCK.release()
         if kind == "consent_card":
             # auto-consent could not resolve it (failed outright, or the re-probe above still
             # saw a card) -- fall through to the bounded/retryable last-resort surface(), the
