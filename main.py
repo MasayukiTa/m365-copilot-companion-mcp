@@ -536,15 +536,46 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
         # and cost 2.5-25 seconds per call, which is not a slow benchmark but a broken one.
         # The broker now lives under bench/remote/ where the benchmark's own infrastructure
         # belongs. See docs/SECURITY.md for what actually contains a worker here.
+        # THE TOOL LEDGER, WRITTEN AROUND THE CALL RATHER THAN AFTER IT.
+        #
+        # Measured: the session store holds 122 MB and 15,605 turns and records NOT ONE tool
+        # call -- only what the two sides wrote about the work. So the refuter that exists to
+        # catch a wrong DONE reads the worker's own account of what it did, and DONE precision
+        # is 0.718. Every "did it actually do that" was unanswerable.
+        #
+        # The CALL record goes down before fn runs, so a call that never returns leaves an
+        # orphan -- which is a finding, not a gap. A ledger written only on completion records
+        # exactly the runs that did not need recording.
+        _cid = ""
+        _t0 = time.time()
+        try:
+            from tools import tool_ledger as _ledger
+            _cid = _ledger.record_call(name, _args, task=_args.get("_task", ""),
+                                       worker=_args.get("_worker", ""))
+        except Exception:
+            _ledger = None
         try:
             _out = fn(**_args)
             if _trace is not None:
                 _trace.record(name, _args, True, _out, fn)
+            if _ledger is not None and _cid:
+                try:
+                    _ledger.record_outcome(_cid, ok=True, result=_out,
+                                           duration_s=time.time() - _t0)
+                except Exception:
+                    pass
             return _out
         except Exception as _e:
             if _trace is not None:
                 _trace.record(name, _args, False,
                               "%s: %s" % (type(_e).__name__, _e), fn)
+            if _ledger is not None and _cid:
+                try:
+                    _ledger.record_outcome(_cid, ok=False,
+                                           error="%s: %s" % (type(_e).__name__, _e),
+                                           duration_s=time.time() - _t0)
+                except Exception:
+                    pass
             return "[call_tool %s error: %s: %s]" % (name, type(_e).__name__, _e)
         finally:
             # SCOPED TO THIS CALL. A token left behind would authorise the next one, which is
