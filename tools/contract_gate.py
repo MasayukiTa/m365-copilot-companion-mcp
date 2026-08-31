@@ -234,6 +234,24 @@ _DESTRUCTIVE_PATTERNS = [
     re.compile(r"\bInstall-(?:Module|Package|Script)\b", re.IGNORECASE),
     re.compile(r"\bAdd-AppxPackage\b", re.IGNORECASE),
     re.compile(r"\b(?:Add-WindowsCapability|Enable-WindowsOptionalFeature)\b", re.IGNORECASE),
+
+    # -- FETCHING A SCRIPT AND RUNNING IT ---------------------------------------------
+    # The PowerShell spelling of this was already covered further down by the pattern that
+    # matches Invoke-Expression on a downloaded string. The shell spelling was not.
+    # `curl -sL https://... | bash` is not "populating a project" -- the line drawn two
+    # comments above -- it is running code from the internet that nobody has read, and this
+    # machine has Git Bash, so it runs. Measured 2026-08-31: `iwr ... | iex` was caught and
+    # `curl ... | bash` passed. Half a class is not a class.
+    #
+    # The pipe has to reach an INTERPRETER. `curl ... | jq` and `curl ... -o file` are
+    # ordinary and must not fire, or the gate becomes noise people approve unread -- which is
+    # the reason npm and pip are deliberately left alone.
+    re.compile(r"\b(?:curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(?:ba|z|k|da)?sh\b", re.IGNORECASE),
+    re.compile(r"\b(?:curl|wget)\b[^|]*\|\s*(?:python[23]?|perl|ruby|node)\b", re.IGNORECASE),
+    # DownloadString inside a quoted -Command never reaches a pipeline pattern, because there
+    # is no literal pipe outside the string.
+    re.compile(r"\bDownloadString\s*\(", re.IGNORECASE),
+    re.compile(r"\bDownloadFile\s*\(", re.IGNORECASE),
     re.compile(r"\bdism\b(?=.*/(?:add-package|add-capability|enable-feature))", re.IGNORECASE),
 
     # ── EXFILTRATION, which is destruction of a different kind ────────────────────────
