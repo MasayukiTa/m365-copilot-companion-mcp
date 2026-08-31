@@ -104,16 +104,152 @@ def _context():
         return None
 
 
-def _run_async(coro_fn, *args, **kwargs):
-    """Run one coroutine from this synchronous tool.
+#: The event loop serving MCP requests, captured on the async side. See _run_async.
+_LOOP = None
 
-    shell_exec is sync and fastmcp runs sync tools on a worker thread, so the host event loop
-    is running on another thread and cannot simply be awaited. anyio's thread portal is the
-    supported bridge back into it. If there is no portal -- the tool was called directly rather
-    than through a request -- this raises, and the caller turns that into REQUIRE_HUMAN.
+
+def remember_event_loop(loop=None) -> bool:
+    """Record the loop that serves requests. Called from the async side, once per call is fine.
+
+    THE SYNC TOOL CANNOT FIND THIS FOR ITSELF, which is the whole reason it is here.
     """
+    global _LOOP
+    if loop is None:
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+    _LOOP = loop
+    return True
+
+
+def loop_available() -> bool:
+    return _LOOP is not None and _LOOP.is_running()
+
+
+def install(mcp) -> bool:
+    """Teach a FastMCP server to hand this module its event loop.
+
+    Must be called on any server whose tools will judge, INCLUDING IN TESTS -- a test server
+    that skips it is not testing the deployment. `availability()` reports whether it happened,
+    so a deployment that forgets shows up in the judge log rather than silently having no
+    judge.
+    """
+    try:
+        from fastmcp.server.middleware import Middleware
+
+        class _CaptureLoop(Middleware):
+            async def on_call_tool(self, context, call_next):
+                remember_event_loop()
+                return await call_next(context)
+
+        mcp.add_middleware(_CaptureLoop())
+        return True
+    except Exception:
+        return False
+
+
+def on_the_event_loop_thread() -> bool:
+    """True when this synchronous code is running ON the loop, not beside it.
+
+    MEASURED, NOT ASSUMED, and it is the opposite of what I assumed. fastmcp's FunctionTool.run
+    calls a sync tool DIRECTLY -- `type_adapter.validate_python(arguments)`, then `if
+    inspect.isawaitable(result)`, which a sync function's result never is. There is no
+    to_thread and no executor anywhere in the package. A probe printed
+    `thread=MainThread` from inside a running tool.
+
+    Two consequences, and the second is not about this layer at all:
+
+      * A sync tool CANNOT make an outbound MCP request. Scheduling one on the loop and then
+        blocking for the answer deadlocks -- the loop cannot run the coroutine because this
+        function is what it is running. Measured as a 20-second timeout per command, from a
+        `try` that turned it into REQUIRE_HUMAN.
+      * Every sync tool blocks the server's whole event loop for its entire duration.
+        shell_exec's default timeout is 30 seconds, so one slow command stalls every other
+        request on that server. That is a pre-existing property of this server, not something
+        this layer introduced, and it is worth its own fix.
+    """
+    import asyncio
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
+def _run_async(coro_fn, *args, **kwargs):
+    """Run one coroutine from synchronous code, or say plainly that it cannot be done here.
+
+    `anyio.from_thread.run` needs an EventLoopToken unless it is called from a thread anyio
+    itself started; `asyncio.run_coroutine_threadsafe` needs a loop running on ANOTHER thread.
+    Neither holds for a fastmcp sync tool, which runs on the loop thread itself -- so the
+    honest answer is a refusal, immediately, rather than a deadlock that expires as a timeout.
+
+    A 20-second timeout in front of every judged command would not have been a subtle defect;
+    it would have made the layer unusable while looking configured. Failing in milliseconds
+    with a reason is the difference between a bug report and a mystery.
+    """
+    if on_the_event_loop_thread():
+        raise JudgeTransportError(
+            "this tool runs on the server's event loop, so it cannot make an outbound MCP "
+            "request; the judged tool has to be async for sampling or elicitation to reach "
+            "the client")
+    import asyncio
+    loop = _LOOP
+    if loop is not None and loop.is_running():
+        fut = asyncio.run_coroutine_threadsafe(coro_fn(*args, **kwargs), loop)
+        # Bounded independently of the inner timeout, so a loop that stops answering cannot
+        # park a tool call forever.
+        return fut.result(timeout=timeout_s() + 5.0)
     import anyio.from_thread
     return anyio.from_thread.run(lambda: coro_fn(*args, **kwargs))
+
+
+async def sampling_judge_async(request_json: str) -> str:
+    """The same question, asked from the async side, where it actually works.
+
+    This is the judge a tool gets once it is `async def`. Nothing about the policy differs --
+    the request is still built by command_judge, the rules still travel in system_prompt, no
+    tools are offered. The only difference is that there is a running loop to await on.
+    """
+    from tools.command_judge import SYSTEM_PROMPT
+    import anyio
+
+    ctx = _context()
+    if ctx is None:
+        raise JudgeTransportError("no MCP request context: nothing to ask")
+    if not sampling_supported():
+        raise JudgeTransportError(
+            "the connected client did not declare the sampling capability, so there is no "
+            "model to ask from inside this server")
+    try:
+        with anyio.fail_after(timeout_s()):
+            result = await ctx.sample(request_json, system_prompt=SYSTEM_PROMPT,
+                                      max_tokens=300, temperature=0.0)
+    except Exception as exc:
+        raise JudgeTransportError("%s: %s" % (type(exc).__name__, str(exc)[:160]))
+    return _text_of(result)
+
+
+async def ask_human_async(question: str) -> Optional[bool]:
+    """The approval question, from the async side. Same three-valued answer as ask_human."""
+    import anyio
+
+    ctx = _context()
+    if ctx is None:
+        return None
+    try:
+        with anyio.fail_after(timeout_s()):
+            result = await ctx.elicit(question, response_type=None)
+    except Exception:
+        return None
+    name = type(result).__name__
+    if name.startswith("Accepted"):
+        return True
+    if name.startswith("Declined") or name.startswith("Cancelled"):
+        return False
+    return None
 
 
 def sampling_judge(request_json: str) -> str:
@@ -251,6 +387,9 @@ def availability() -> dict:
         "in_request": _context() is not None,
         "client_sampling": sampling_supported(),
         "client_elicitation": elicitation_supported(),
+        # False here means install() was never called on this server, and NOTHING can be
+        # asked however capable the client is. Silent otherwise.
+        "loop": loop_available(),
     }
 
 
