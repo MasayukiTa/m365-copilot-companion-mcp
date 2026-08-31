@@ -248,3 +248,91 @@ def test_an_in_process_edit_actually_reaches_the_disk(tmp_path, monkeypatch):
                           verify=None, repo=str(tmp_path))
     assert r["ok"] is True
     assert (tmp_path / "x.py").read_text(encoding="utf-8") == "N = 2\n"
+
+
+# -- the restore point -------------------------------------------------------------------
+
+def git(tmp, *args):
+    import subprocess
+    return subprocess.run(["git"] + list(args), cwd=str(tmp), capture_output=True, text=True)
+
+
+@pytest.fixture
+def repo(tmp_path):
+    git(tmp_path, "init", "-q")
+    git(tmp_path, "config", "user.email", "t@example.invalid")
+    git(tmp_path, "config", "user.name", "t")
+    (tmp_path / "a.py").write_text("N = 1\n", encoding="utf-8")
+    git(tmp_path, "add", "a.py")
+    git(tmp_path, "commit", "-qm", "base")
+    return tmp_path
+
+
+def test_a_clean_repo_gives_a_restore_point(repo):
+    p = A.restore_point(str(repo))
+    assert p["ok"] is True and p["kind"] == "git" and len(p["head"]) >= 7
+
+
+def test_a_dirty_tree_is_refused_rather_than_rolled_over(repo):
+    """FAIL CLOSED, and for a specific reason: rolling back would discard whatever was already
+    uncommitted, which is someone else's work, not this session's. The guard does not make
+    that choice on anyone's behalf."""
+    (repo / "a.py").write_text("N = 999\n", encoding="utf-8")
+    p = A.restore_point(str(repo))
+    assert p["ok"] is False
+    assert "uncommitted" in p["why"]
+
+
+def test_untracked_files_alone_do_not_block(repo):
+    """An untracked file is not work this session would destroy by rolling back tracked
+    changes, so it is not a reason to refuse to start."""
+    (repo / "scratch.txt").write_text("notes", encoding="utf-8")
+    assert A.restore_point(str(repo))["ok"] is True
+
+
+def test_a_non_git_directory_without_a_snapshot_is_refused(tmp_path):
+    """No way back means do not start. This is the whole point of the guard."""
+    p = A.restore_point(str(tmp_path))
+    assert p["ok"] is False and "no way back" in p["why"]
+
+
+def test_rolling_back_undoes_the_edits(repo):
+    p = A.restore_point(str(repo))
+    A.edit_and_verify([{"path": "a.py", "old": "N = 1", "new": "N = 2"}],
+                      verify=None, repo=str(repo))
+    assert (repo / "a.py").read_text(encoding="utf-8") == "N = 2\n"
+    r = A.roll_back(p)
+    assert r["ok"] is True
+    assert (repo / "a.py").read_text(encoding="utf-8") == "N = 1\n"
+
+
+def test_untracked_files_are_reported_and_left_alone(repo):
+    """`git clean` would make the rollback look complete. It is also how unsaved work
+    disappears. Listing what was NOT undone is the honest version."""
+    p = A.restore_point(str(repo))
+    (repo / "new_thing.txt").write_text("someone's work", encoding="utf-8")
+    r = A.roll_back(p)
+    assert "new_thing.txt" in r["untracked"]
+    assert (repo / "new_thing.txt").exists()
+
+
+def test_a_commit_made_during_the_session_stops_the_rollback(repo):
+    """Discarding a commit is not this function's decision to make silently."""
+    p = A.restore_point(str(repo))
+    (repo / "a.py").write_text("N = 3\n", encoding="utf-8")
+    git(repo, "add", "a.py")
+    git(repo, "commit", "-qm", "during")
+    r = A.roll_back(p)
+    assert r["ok"] is False and "HEAD moved" in r["why"]
+
+
+def test_rolling_back_without_a_point_is_refused(repo):
+    assert A.roll_back({"ok": False})["ok"] is False
+
+
+def test_the_guard_creates_no_branches(repo):
+    """Branch and worktree sprawl is a standing problem here. A recorded commit is a restore
+    point that leaves nothing behind."""
+    before = git(repo, "branch", "--list").stdout
+    A.restore_point(str(repo))
+    assert git(repo, "branch", "--list").stdout == before
