@@ -470,3 +470,50 @@ def test_heavy_languages_go_serial_at_the_disk_this_machine_actually_has():
     assert C.concurrency_for(["go"], free) == 1
     assert C.concurrency_for(["js"], free) == 1
     assert C.concurrency_for(["python"], free) >= 3
+
+
+# -- the reclaim that did not reclaim ------------------------------------------------------
+
+def test_the_go_toolchain_is_actually_found():
+    """THE DEFECT THAT MADE THE RECLAIM A NO-OP. The fallback path was written with
+    backslashes and the file ended up holding a control byte where the "b" of "bin" belonged,
+    so it named a path that does not exist. `go` is not on this process's PATH either, so the
+    lookup found nothing by both routes -- and 1.46 GB of module cache went uncleared while the
+    run stopped for lack of disk. Fixing it recovered 2,636 MB on the first real call."""
+    import os
+    import shutil as sh
+    assert sh.which("go") or os.path.exists("C:/Program Files/Go/bin/go.exe"), \
+        "neither PATH nor the fallback locates go; the reclaim would silently do nothing"
+
+
+def test_the_source_holds_no_control_bytes():
+    """A heredoc turned "\bin" into a backspace character once. It is invisible in a diff, it
+    breaks a path silently, and the whole repository was checked: this was the only one."""
+    import io
+    import os
+    src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pro_cycle.py"),
+                  encoding="utf-8", newline="").read()
+    bad = [hex(ord(c)) for c in src if ord(c) < 32 and c not in "\n\r\t"]
+    assert not bad, "control bytes in the source: %s" % bad[:5]
+
+
+def test_a_negative_delta_is_never_reported_as_freed(monkeypatch):
+    """Other processes write to this disk while a cache is being emptied -- the live run's own
+    worktrees above all. The first version subtracted the two readings and logged "npm cache
+    freed -151 MB", which is not merely wrong but backwards."""
+    seq = iter([10.0, 9.0, 9.0, 9.0])          # free space FALLS across the clear
+    monkeypatch.setattr(C, "free_gb", lambda *a: next(seq))
+    monkeypatch.setattr(C.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(C.shutil, "which", lambda exe: "C:/fake/%s.exe" % exe)
+    for _name, mb in C._clear_toolchain_caches():
+        assert mb is None or mb >= 0, "reported a negative amount freed"
+
+
+def test_an_unreachable_toolchain_is_reported_not_omitted(monkeypatch):
+    """"the go toolchain was not reachable" is the difference between a cache that was empty
+    and one that was never touched -- and the second is why a run stopped with 1.46 GB in it."""
+    monkeypatch.setattr(C.shutil, "which", lambda exe: None)
+    monkeypatch.setattr(C.os.path, "exists", lambda p: False)
+    out = dict(C._clear_toolchain_caches())
+    assert out["go module cache"] is None
+    assert out["npm cache"] is None
