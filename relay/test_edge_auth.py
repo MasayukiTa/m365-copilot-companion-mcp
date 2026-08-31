@@ -5,6 +5,7 @@ relay/selfimprove/test_guards.py style. Run from repo root:
     .venv\\Scripts\\python.exe -m relay.test_edge_auth
 """
 
+import pytest
 from relay import edge_auth as E
 
 
@@ -135,6 +136,25 @@ if __name__ == "__main__":
     print("ALL EDGE AUTH TESTS PASSED")
 
 
+#: Captured before the guard below replaces it, so the two tests that exercise the navigation
+#: helper itself can still reach the real function.
+_REAL_NAVIGATE = E._navigate
+
+
+@pytest.fixture(autouse=True)
+def _never_touch_a_real_browser(monkeypatch):
+    """No test here may navigate the operator's Edge.
+
+    One did. It stubbed classify_live and edge_recover but not _navigate, so the retry branch
+    drove the real CDP endpoint on :9222 and left the companion Edge sitting on
+    https://example/agent -- the agent page gone, the fleet's browser broken, discovered only
+    because the next live check said "loading". Same shape as a fixture here that once posted
+    `rm -rf /` into the real approval queue: the stub covered the part being tested and left a
+    live side door open.
+    """
+    monkeypatch.setattr(E, "_navigate", lambda cdp_url, agent_url: True)
+
+
 # THE STUBS BELOW MUST USE THE KEY classify_live ACTUALLY RETURNS ("cls", not "class").
 # They were first written with "class", the code read "class", and all four tests passed --
 # while the live browser, which was ready, came back "unknown". A stub that agrees with the
@@ -161,28 +181,6 @@ def test_ensure_ready_hands_back_needs_signin_without_looping(monkeypatch):
     monkeypatch.setattr(E, "classify_live", lambda cdp_url="x": [{"cls": "needs_signin"}])
     assert E.ensure_ready("https://example/agent") == "needs_signin"
 
-
-def test_ensure_ready_navigates_when_the_page_is_blank(monkeypatch):
-    """about:blank classifies as `loading` -> `renavigate`, which is this function's job."""
-    seen = {"n": 0, "urls": []}
-
-    def _classify(cdp_url="x"):
-        seen["n"] += 1
-        return [{"cls": "ready"}] if seen["n"] > 1 else [{"class": "loading"}]
-
-    def _urlopen(url, timeout=None):
-        seen["urls"].append(url if isinstance(url, str) else url.full_url)
-
-        class _R:
-            def read(self_inner):
-                return b""
-        return _R()
-
-    monkeypatch.setattr(E, "classify_live", _classify)
-    import urllib.request as _req
-    monkeypatch.setattr(_req, "urlopen", _urlopen)
-    assert E.ensure_ready("https://example/agent", settle_s=0) == "ready"
-    assert any("https://example/agent" in u for u in seen["urls"]), seen["urls"]
 
 
 def test_ensure_ready_survives_a_dead_browser(monkeypatch):
@@ -238,3 +236,40 @@ def test_the_port_comes_from_the_cdp_url_not_a_default():
     assert E._port_of("http://127.0.0.1:9222") == 9222
     assert E._port_of("http://127.0.0.1:9223") == 9223
     assert E._port_of("nonsense") == 9222
+
+
+def test_navigate_tries_both_verbs_because_builds_differ(monkeypatch):
+    """/json/new is a GET on some Edge builds and a PUT on others.
+
+    Measured on this machine: GET answered 405 Method Not Allowed and PUT opened the page --
+    and the opposite had worked an hour earlier. A helper that knows only one verb reports
+    "could not navigate" on a browser that would have navigated.
+
+    _navigate is exercised directly here. Reaching it through ensure_ready would run against
+    the autouse guard's stub, which is what the previous version of this test did.
+    """
+    seen = []
+
+    def _urlopen(req, timeout=None):
+        url = req if isinstance(req, str) else req.full_url
+        method = "GET" if isinstance(req, str) else req.get_method()
+        seen.append(method)
+        if method == "GET":
+            raise OSError("405 Method Not Allowed")
+
+        class _R:
+            def read(self_inner):
+                return b""
+        return _R()
+
+    import urllib.request as _req
+    monkeypatch.setattr(_req, "urlopen", _urlopen)
+    assert _REAL_NAVIGATE("http://127.0.0.1:9222", "https://example/agent") is True
+    assert seen == ["GET", "PUT"], seen
+
+
+def test_navigate_reports_failure_when_neither_verb_works(monkeypatch):
+    import urllib.request as _req
+    monkeypatch.setattr(_req, "urlopen",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("no browser")))
+    assert _REAL_NAVIGATE("http://127.0.0.1:9222", "https://example/agent") is False
