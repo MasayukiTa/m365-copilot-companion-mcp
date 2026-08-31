@@ -1797,10 +1797,27 @@ def main():
             for w in workers:
                 u = getattr(w, "conv_url", "")
                 if u and u not in urls:
-                    # prefer Copilot's auto-generated chat title for the registry entry;
-                    # fall back to the goal text when it hasn't been captured yet.
-                    title = (getattr(w, "conv_title", "") or w.goal or "")[:60]
+                    # THE GOAL, NOT COPILOT'S TITLE. This line preferred `conv_title` and fell
+                    # back to the goal, and Copilot names a conversation from the opening of the
+                    # first message it receives -- which is PROTOCOL, ~1,400 characters shared by
+                    # every task. Measured across 424 stored conversations: 174 named after a
+                    # prompt preamble, 48 "Microsoft Copilot", 39 after the output-discipline
+                    # block. 213 of 424 identical to rows they have nothing to do with, and the
+                    # goal that would have identified each one was sitting right here.
+                    #
+                    # Copilot's own title is kept beside it rather than discarded: it is the
+                    # source record, and a derived value should never overwrite one.
+                    _copilot = (getattr(w, "conv_title", "") or "")[:120]
+                    try:
+                        from relay import conv_title as _ct
+                        title = _ct.make_title(w.goal or "", existing=_copilot, key=u,
+                                               when=time.time())
+                        _tsrc = _ct.SOURCE
+                    except Exception:
+                        title = (w.goal or _copilot or "")[:60]
+                        _tsrc = "fallback"
                     existing.append({"url": u, "title": title, "source": "fleet",
+                                     "title_source": _tsrc, "copilot_title": _copilot,
                                      # carry the disk transcript path + worker name so the chat
                                      # opens this conversation straight from the .jsonl -- no live
                                      # re-scrape (which fails for any conv whose agent the bridge
