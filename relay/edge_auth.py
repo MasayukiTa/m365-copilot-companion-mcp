@@ -241,6 +241,60 @@ def _port_of(cdp_url: str, default: int = 9222) -> int:
         return default
 
 
+
+#: How long a surfaced window may stay up before it is put back on its own.
+DEFAULT_REHIDE_AFTER_S = 900.0
+
+
+def _surface_with_a_way_back(cdp_url: str, agent_url: str,
+                             rehide_after_s: float = DEFAULT_REHIDE_AFTER_S) -> bool:
+    """Bring the browser forward for a human, and guarantee it goes back down.
+
+    EVERY surface() NEEDS A PAIRED REHIDE. bridge/copilot_bridge.py learned this the hard way
+    and says so: "this surface() had no paired rehide() at all -- fire-and-forget, so the
+    window stayed foreground until the process died." The first version of this function
+    reproduced that exactly, and the owner found the fleet's Edge sitting on the taskbar.
+
+    The timer is the safety net, not the plan: whoever resolves the sign-in should call
+    rehide() themselves. It exists because "the caller will remember" is what produced the bug.
+
+    Measured while fixing it: rehide() MINIMISES the window; the process stays headed, so the
+    taskbar entry remains. Returning to true background is a relaunch
+    (scripts/start_companion_edge.ps1 -Headless), which is why that is what the timer does.
+    """
+    import subprocess
+    import threading
+
+    port = _port_of(cdp_url)
+    try:
+        from relay.edge_recover import surface
+        ok = bool(surface(port=port, open_url=agent_url))
+    except Exception:
+        return False
+
+    def _back_to_background():
+        try:
+            from relay.edge_recover import rehide
+            rehide(port=port)
+        except Exception:
+            pass
+        try:
+            import os as _os
+            repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+            subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                 _os.path.join(repo, "scripts", "start_companion_edge.ps1"),
+                 "-Port", str(port), "-Headless"],
+                capture_output=True, timeout=180)
+        except Exception:
+            pass
+
+    t = threading.Timer(max(0.0, rehide_after_s), _back_to_background)
+    t.daemon = True          # never hold up process exit
+    t.start()
+    return ok
+
+
 def _navigate(cdp_url: str, agent_url: str) -> bool:
     """Open the agent in the browser at `cdp_url`. /json/new is a PUT on newer builds and a
     GET on older ones, so try both before reporting failure."""
@@ -261,7 +315,8 @@ def _navigate(cdp_url: str, agent_url: str) -> bool:
 
 def ensure_ready(agent_url: str, cdp_url: str = "http://127.0.0.1:9222",
                  attempts: int = 3, settle_s: float = 8.0,
-                 surface_on_signin: bool = True) -> str:
+                 surface_on_signin: bool = True,
+                 rehide_after_s: float = DEFAULT_REHIDE_AFTER_S) -> str:
     """Make the companion Edge ready, and return the final classification.
 
     NOTHING ACTED ON `recommended_action` UNTIL THIS EXISTED. classify_live and
@@ -309,11 +364,7 @@ def ensure_ready(agent_url: str, cdp_url: str = "http://127.0.0.1:9222",
             # browser had the primitives and nothing driving them, so when it needed a human
             # nobody was told: no retry, no window, just a coloured dot on a panel.
             if surface_on_signin:
-                try:
-                    from relay.edge_recover import surface
-                    surface(port=_port_of(cdp_url), open_url=agent_url)
-                except Exception:
-                    pass
+                _surface_with_a_way_back(cdp_url, agent_url, rehide_after_s)
             return "needs_signin"          # the one state a person must resolve
 
         if not _navigate(cdp_url, agent_url):
