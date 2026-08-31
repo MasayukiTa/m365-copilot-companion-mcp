@@ -32,6 +32,7 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -256,6 +257,13 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
     done = 0
     for n, group in enumerate(batches(todo, batch_size), start=1):
         have = free_gb()
+        if have < DISK_FLOOR_GB:
+            # FREE SPACE BEFORE GIVING UP, NEVER LOWER THE FLOOR. The idle Edge profiles this
+            # project drives accumulate regenerable cache -- 609 MB in one measured run, which
+            # is more than two batches' worth. Reclaiming it is the sanctioned move; moving the
+            # line is the forbidden one, and it is why this reads the floor twice instead of
+            # relaxing it once.
+            have = _reclaim(have)
         if have < DISK_FLOOR_GB:
             log("STOP before batch %d: %.2f GB free is under the %.2f GB floor. "
                 "Everything graded so far is recorded; re-run to continue."
@@ -503,6 +511,26 @@ def _explode_preds():
         return ""
 
 
+def _reclaim(have):
+    """Give back what can be regenerated, and say what it came to. Returns the new free GB.
+
+    Only the caches of the project's OWN Edge profiles, and only ones no browser is using --
+    the guards live in edge_recover.trim_profile_caches, which refuses anything else including
+    the user's own browser. Never raises: a benchmark must not die trying to make room.
+    """
+    try:
+        from relay.edge_recover import trim_profile_caches
+        freed, notes = trim_profile_caches()
+    except Exception as exc:
+        log("  could not reclaim disk (%s)" % type(exc).__name__)
+        return have
+    for note in notes:
+        log("  reclaim: %s" % note)
+    now = free_gb()
+    log("  reclaimed %.0f MB: %.2f -> %.2f GB free" % (freed, have, now))
+    return now
+
+
 def _discard():
     """Delete the batch's worktrees. THE POINT OF THE WHOLE SHAPE: one batch on disk at a time.
 
@@ -513,13 +541,30 @@ def _discard():
     work = os.path.join(SW, "work")
     if not os.path.isdir(work):
         return
+    left = []
     for name in os.listdir(work):
         path = os.path.join(work, name)
-        try:
-            if os.path.isdir(path):
-                shutil.rmtree(path, ignore_errors=True)
-        except OSError:
-            pass
+        if not os.path.isdir(path):
+            continue
+        # ignore_errors=True WAS HIDING A REAL FAILURE. Windows marks the files under .git
+        # read-only, and rmtree cannot unlink those; with errors ignored, each batch left 4-8 MB
+        # behind and reported nothing. Eight batches in, eight directories were still there and
+        # the log had never once mentioned it. Clear the bit and retry, then SAY what survived.
+        shutil.rmtree(path, onerror=_force_writable)
+        if os.path.isdir(path):
+            left.append(name)
+    if left:
+        log("  could not delete %d worktree dir(s): %s" % (len(left), ", ".join(sorted(left))))
+
+
+def _force_writable(func, path, _exc):
+    """rmtree's onerror: drop the read-only bit and retry once. A file still held open by a
+    process survives this, which is the case worth reporting rather than ignoring."""
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except OSError:
+        pass
 
 
 def main(argv=None):

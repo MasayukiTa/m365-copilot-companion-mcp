@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
 import sys
 import time
 
@@ -470,6 +471,110 @@ def companion_edge_mb(profile_marker="copilot-companion-edge"):
         except Exception:
             continue
     return total / (1024.0 * 1024.0)
+
+
+#: The subdirectory names inside an Edge profile that hold regenerable bytes. NOTHING ELSE IS
+#: EVER TOUCHED. In particular Cookies, "Login Data", "Local Storage" and the token cache stay,
+#: because clearing them signs the profile out, and a signed-out profile surfaces a login tab in
+#: front of the operator -- the one thing the browser side of this project is not allowed to do.
+_CACHE_DIR_NAMES = ("cache", "code cache", "gpucache", "dawncache", "shadercache",
+                    "service worker", "cachestorage")
+
+
+def _is_cache_dir(path):
+    """Whether this directory is one of the regenerable caches, by its OWN name.
+
+    By its own name, not by a substring of the full path: a profile living under a directory
+    that happens to contain "cache" would otherwise match wholesale, and the deletion would
+    take the cookies with it.
+    """
+    return os.path.basename(path).strip().lower() in _CACHE_DIR_NAMES
+
+
+def profile_dir(marker, base=None):
+    return os.path.join(base or os.environ.get("LOCALAPPDATA", ""), marker)
+
+
+def profile_is_running(marker):
+    """Whether an Edge is currently using this profile. Fail CLOSED -- if psutil is missing or
+    the scan raises, this says True, so an unreadable state stops the trim rather than licensing
+    it. Deleting files under a live browser is both corruption and touching a process this
+    project did not start."""
+    try:
+        import psutil
+    except Exception:
+        return True
+    try:
+        for p in psutil.process_iter(["name", "cmdline"]):
+            try:
+                if "msedge" not in (p.info.get("name") or "").lower():
+                    continue
+                if marker in " ".join(p.info.get("cmdline") or []):
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return True
+    return False
+
+
+def trim_profile_caches(markers=None, base=None, dry_run=False):
+    """Delete the regenerable caches of MANAGED, NOT-RUNNING Edge profiles. Returns
+    (freed_mb, [notes]).
+
+    WHY THIS EXISTS. Disk is the binding constraint on this machine -- it has stopped a
+    benchmark mid-run. Measured during one long run: the three profiles this project drives held
+    2.17 GB, of which 1.76 GB was cache. The user's OWN Edge held another 2.94 GB and is not in
+    scope here and never will be; it is theirs.
+
+    THREE GUARDS, and the reason for each:
+      - only the profiles in MANAGED_EDGE_PROFILES, so the user's browser cannot be reached even
+        by passing a marker in;
+      - only profiles with no live Edge, checked fail-closed;
+      - only cache-shaped directories, so the sign-in survives.
+    """
+    managed = set(MANAGED_EDGE_PROFILES.values())
+    wanted = [m for m in (markers or sorted(managed))]
+    freed, notes = 0, []
+    for marker in wanted:
+        if marker not in managed:
+            # NOT AN ERROR TO IGNORE QUIETLY. An unmanaged marker reaching here is a caller
+            # trying to clear a profile this function has no business touching, and the note
+            # is how that becomes visible instead of being silently skipped.
+            notes.append("%s: refused, not a managed profile" % marker)
+            continue
+        root = profile_dir(marker, base)
+        if not os.path.isdir(root):
+            notes.append("%s: absent" % marker)
+            continue
+        if profile_is_running(marker):
+            notes.append("%s: in use, left alone" % marker)
+            continue
+        got = 0
+        for parent, dirs, _files in os.walk(root):
+            for d in list(dirs):
+                full = os.path.join(parent, d)
+                if not _is_cache_dir(full):
+                    continue
+                dirs.remove(d)
+                got += _dir_bytes(full)
+                if not dry_run:
+                    shutil.rmtree(full, ignore_errors=True)
+        freed += got
+        notes.append("%s: %s %.0f MB" % (marker, "would free" if dry_run else "freed",
+                                         got / 1e6))
+    return freed / 1e6, notes
+
+
+def _dir_bytes(path):
+    total = 0
+    for parent, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(parent, f))
+            except OSError:
+                pass
+    return total
 
 
 #: Thresholds for the pre-run recycle. Constants until now, which meant the recycle path
