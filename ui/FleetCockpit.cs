@@ -3824,7 +3824,13 @@ class CockpitWindow : Window
         events.Add(new Tuple<string, string, string>(qLabel, qTime, graphite));
 
         // Marker 2: Started (first turn in transcript)
-        if (firstTurnTs > 0)
+        //
+        // ONLY WHEN IT SAYS SOMETHING THE PREVIOUS MARKER DID NOT. The meta line and the first
+        // user turn are written within the same second, so at HH:mm resolution 投入 and 開始
+        // carried the identical clock time on every task measured -- two rows, one fact. A
+        // timeline whose steps repeat each other reads as a template rather than as this
+        // task's history, which is how the wrong 終了 above stayed invisible.
+        if (firstTurnTs > 0 && (metaTs <= 0 || (firstTurnTs - metaTs) >= 60.0))
         {
             string sLabel = ja ? "開始" : "Started";
             string sTime = fmtHM(firstTurnTs);
@@ -3861,8 +3867,21 @@ class CockpitWindow : Window
         }
         else
         {
-            // Marker 3 (ended): use root["updated"] as the best proxy for end time.
-            double endedTs = root != null ? Dbl(root, "updated") : 0;
+            // Marker 3 (ended). root["updated"] is the RUN's clock, and for a past task that is
+            // the wrong one: RefreshSpine focuses a single history entry, and every one of them
+            // was then shown ending at the same minute the run did. Measured on the last eight
+            // entries of .fleet/history.json -- true ends 10:53, 10:53, 10:56, 10:57, 10:57,
+            // 10:59, 11:01, 11:05, all displayed as 11:05. Seven of eight wrong, and wrong in
+            // the way that hides it: identical, so it reads as a rendering of the run rather
+            // than as a mistake about the task.
+            //
+            // The focused entry carries its own finish time. Use it whenever exactly one task
+            // is in view; a live run's spine covers many workers, and there the run's clock is
+            // the right one.
+            double endedTs = 0;
+            if (workers != null && workers.Count == 1)
+                endedTs = Dbl(workers[0], "ts");
+            if (endedTs <= 0 && root != null) endedTs = Dbl(root, "updated");
             string eLabel = ja ? "終了" : "Ended";
             string eTime = fmtHM(endedTs);
             string eColor = (overallPhase == "attn") ? danger : ended;
