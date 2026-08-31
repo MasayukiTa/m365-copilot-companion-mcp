@@ -1039,6 +1039,7 @@ class CockpitWindow : Window
         if (k == "hs_fix_edge_navigate") return ja ? "エージェントのページを開いています..." : "opening the agent page...";
         if (k == "hs_fix_edge_still") return ja ? "ページを開いても準備完了になりません" : "navigated, but the page is still not ready";
         if (k == "hs_tool_detail_never") return ja ? "自己診断がまだ一度も結果を書いていない（ブリッジ未起動か診断側の不具合）" : "the self-probe has never written a result (bridge not started, or the probe is broken)";
+        if (k == "hs_signin_old") return ja ? "サインイン失敗の記録が古く、現在の状態を表していない可能性" : "the sign-in failure on record is old and may not describe the present";
         if (k == "hs_edge_detail_blank") return ja ? "ブラウザは動作中だがエージェントのページが開かれていない" : "browser up, but no agent page open";
         if (k == "hs_edge_detail_ok") return ja ? "コンパニオン Edge が稼働中 (:9222)" : "Companion Edge running (:9222)";
         if (k == "hs_edge_detail_bad") return ja ? "コンパニオン Edge に接続できません (:9222)" : "Companion Edge not reachable (:9222)";
@@ -2245,6 +2246,10 @@ class CockpitWindow : Window
         catch (Exception) { return !MarkerPidIsDead(); }
     }
 
+    //: How old a capture may be and still describe the present. Beyond this a sign-in
+    //: failure is history, not a fault to act on.
+    const double SIGNIN_EVIDENCE_MAX_AGE_S = 1800.0;
+
     // ── automatic repair, before anyone is asked to click ───────────────────────────────────
     //
     // RunFix knows how to repair every state these dots report, and it was reachable ONLY from
@@ -2448,6 +2453,7 @@ class CockpitWindow : Window
         bool ok = TruthyField(cap, "ok");
         double expiresAt = NumberField(cap, "expires_at");
         string kind = StringField(cap, "kind");
+        double capTs = NumberField(cap, "ts");
         string gptId = StringField(cap, "gpt_id");
         double nowEpoch = (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
         double lifeLeft = expiresAt - nowEpoch;
@@ -2456,8 +2462,16 @@ class CockpitWindow : Window
         // red: the next capture may well succeed, and a dot that stays red for hours after a
         // finished run is a dot people stop reading. Expiry only matters while a run wants
         // a token.
-        if (!ok && string.Equals(kind, "signin", StringComparison.OrdinalIgnoreCase))
+        // AND IT HAS TO BE RECENT. capture_status.json keeps the last capture whether it was a
+        // minute or a day ago, so an old sign-in failure stayed red indefinitely -- driving a
+        // repair that relaunches the browser HEADED, for a refusal that may long since have
+        // resolved. Evidence about the past is not evidence about now.
+        double capAgeS = (capTs > 0) ? (nowEpoch - capTs) : -1;
+        bool capFresh = capAgeS >= 0 && capAgeS <= SIGNIN_EVIDENCE_MAX_AGE_S;
+        if (!ok && string.Equals(kind, "signin", StringComparison.OrdinalIgnoreCase) && capFresh)
             SetDot(3, HealthState.Red, T("hs_signin_bad"), now);
+        else if (!ok && string.Equals(kind, "signin", StringComparison.OrdinalIgnoreCase))
+            SetDot(3, HealthState.Yellow, T("hs_signin_old"), now);
         else if (!ok)
             SetDot(3, HealthState.Yellow, T("hs_signin_failed_other"), now);
         else if (lifeLeft > 0)
