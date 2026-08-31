@@ -2139,15 +2139,45 @@ class CockpitWindow : Window
         MaybeAutoFix();
     }
 
-    // Is a fleet run in flight, as the runner itself reports it. Read defensively: an
-    // unreadable or absent status file means "do not know", and "do not know" must not be
-    // treated as "safe to restart the browser".
+    // Is a fleet run in flight.
+    //
+    // TWO SOURCES, BECAUSE status.json ALONE HAS A STARTUP GAP. The runner writes it
+    // atomically, so once created it never vanishes -- absent therefore means "no run has ever
+    // started here", and that is safe to repair in. But between a run launching and its first
+    // snapshot, status.json still holds the PREVIOUS run's final state, with running=false. An
+    // automatic Edge restart in that window would take the browser away from a run that had
+    // just started, and status.json would have said it was fine to.
+    //
+    // fleet_run_active.json is written by the runner at launch and carries its pid. A live pid
+    // there means a run exists whatever the snapshot says. Anything unreadable counts as live:
+    // an unknown state must never authorise restarting the browser.
     bool FleetRunIsLive()
     {
         try
         {
+            string marker = Path.Combine(Path.GetDirectoryName(ResolvePath(null)),
+                                         "fleet_run_active.json");
+            if (File.Exists(marker))
+            {
+                var m = _js.DeserializeObject(File.ReadAllText(marker, Encoding.UTF8))
+                        as Dictionary<string, object>;
+                if (m == null) return true;
+                object pidObj;
+                if (m.TryGetValue("pid", out pidObj) && pidObj != null)
+                {
+                    int pid = Convert.ToInt32(pidObj);
+                    try { System.Diagnostics.Process.GetProcessById(pid); return true; }
+                    catch (ArgumentException) { /* the pid is gone: fall through to status */ }
+                    catch (Exception) { return true; }
+                }
+            }
+        }
+        catch (Exception) { return true; }
+
+        try
+        {
             string p = ResolvePath(null);
-            if (!File.Exists(p)) return false;
+            if (!File.Exists(p)) return false;      // never started here
             var root = _js.DeserializeObject(File.ReadAllText(p, Encoding.UTF8))
                        as Dictionary<string, object>;
             if (root == null) return true;
