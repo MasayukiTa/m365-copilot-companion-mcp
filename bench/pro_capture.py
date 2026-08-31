@@ -57,7 +57,7 @@ def _routed_diff(inst):
     return res.get("output") or ""
 
 
-def _emit(preds, have, inst, d, prefix):
+def _emit(preds, have, inst, d, prefix, refused=""):
     """Record one captured patch: replace any earlier entry, snapshot it, append it.
 
     Factored out so the routed path records EXACTLY what the local path records. Written
@@ -78,8 +78,18 @@ def _emit(preds, have, inst, d, prefix):
     except Exception:
         # A snapshot that cannot be written must not cost the capture it is observing.
         pass
-    preds.append({"instance_id": inst, "patch": d, "prefix": prefix})
-    print("%-58s patch=%d bytes" % (inst[:58], len(d)))
+    row = {"instance_id": inst, "patch": d, "prefix": prefix}
+    if refused:
+        # WHY THE PATCH IS EMPTY, IN THE DATA AND NOT ONLY IN THE LOG. An empty patch reads as
+        # "the worker produced nothing", and an oversize one is the opposite: it produced far
+        # too much. One instance here returned 3,054,501 bytes on its first attempt and
+        # 74,850,968 on its second -- a worker regenerating the tree instead of fixing the bug.
+        # Both were correctly refused and both left a row indistinguishable from a no-op, so
+        # the instance is retried on every future run and the record cannot say why.
+        row["refused"] = refused
+    preds.append(row)
+    print("%-58s patch=%d bytes%s"
+          % (inst[:58], len(d), ("  [%s]" % refused) if refused else ""))
 
 
 def main():
@@ -137,12 +147,14 @@ def main():
             continue
         if _rd is not None:
             d = _rd
-            _over = len(d) > MAX_PATCH_BYTES
+            _raw = len(d)
+            _over = _raw > MAX_PATCH_BYTES
             if _over:
                 skipped.append((inst, "diff of %d bytes exceeds %d; not a fix"
                                 % (len(d), MAX_PATCH_BYTES)))
                 d = ""
-            _emit(preds, have, inst, d, a.prefix)
+            _emit(preds, have, inst, d, a.prefix,
+                  refused=("oversize: %d bytes" % _raw) if _over else "")
             # NOT BOTH. An oversize diff was being counted as captured AND listed as skipped,
             # so a one-instance batch reported "captured 1, skipped 1". A count that adds up to
             # more than the work done is the kind of number that hides a real one.
@@ -193,11 +205,13 @@ def main():
         # regenerated vendored and built files, so `git diff HEAD` returned most of a
         # checkout. It made the predictions file 115 MB on a box that had 2.7 GB free, and
         # no grader can score it. Record the fact and the size; do not store the bytes.
-        over = len(d) > MAX_PATCH_BYTES
+        raw = len(d)
+        over = raw > MAX_PATCH_BYTES
         if over:
             skipped.append((inst, "diff of %d bytes exceeds %d; not a fix" % (len(d), MAX_PATCH_BYTES)))
             d = ""
-        _emit(preds, have, inst, d, a.prefix)
+        _emit(preds, have, inst, d, a.prefix,
+              refused=("oversize: %d bytes" % raw) if over else "")
         # NOT BOTH -- see the routed branch above. Measured: batch 1 of the final run reported
         # "captured 1, skipped 1" for a batch containing exactly one instance.
         if not over:
