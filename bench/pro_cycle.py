@@ -163,9 +163,53 @@ def check_slice_is_fresh(ids, allow_burned=False):
     return fresh
 
 
+#: What one instance of each language costs on disk once its dependencies are installed.
+#: MEASURED, not guessed: a staged checkout is 19-22 MB whatever the language, and the cost
+#: that matters arrives later -- a NodeBB worktree reached 564 MB after npm install, an
+#: ansible one stayed small. Disk is the binding constraint on this machine, so this table is
+#: what decides how many can run at once.
+LANG_DISK_MB = {"js": 560, "ts": 560, "python": 120, "go": 200}
+DEFAULT_DISK_MB = 300
+
+
+def lang_of(inst):
+    try:
+        from bench import pro_stage_goals as G
+        return (G.BY_ID.get(inst) or {}).get("repo_language") or ""
+    except Exception:
+        return ""
+
+
+def concurrency_for(langs, free):
+    """How many of these may run together without crossing the fleet's own 3.0 GB floor.
+
+    The fleet refuses to START under 3.0 GB, so the question is not "does it fit" but "does
+    what remains still admit a run". One at a time is the floor of this function, because a
+    batch of zero makes no progress and lowering the disk floor to force one through is the
+    thing this repository has a standing rule against.
+    """
+    cost = max([LANG_DISK_MB.get(l, DEFAULT_DISK_MB) for l in langs] or [DEFAULT_DISK_MB])
+    headroom_mb = max(0.0, (free - 3.05) * 1000.0)
+    return max(1, min(4, int(headroom_mb // cost)))
+
+
 def batches(ids, size):
-    for i in range(0, len(ids), size):
-        yield ids[i:i + size]
+    """Group by language, heaviest last, so cheap instances can run several at a time.
+
+    THE SLICE IS NOT UNIFORM. Of the fresh forty: 16 python, 11 go, 11 js, 2 ts. Only the
+    js/ts ones carry a node_modules, so batching in slice order forced every instance down to
+    the pace the heaviest one sets. Grouping by language lets the 27 cheap ones run in
+    parallel and keeps the expensive ones serial, with no extra disk.
+    """
+    by_lang = {}
+    for i in ids:
+        by_lang.setdefault(lang_of(i), []).append(i)
+    order = sorted(by_lang, key=lambda l: LANG_DISK_MB.get(l, DEFAULT_DISK_MB))
+    for lang in order:
+        group = by_lang[lang]
+        width = size if size else concurrency_for([lang], free_gb())
+        for i in range(0, len(group), width):
+            yield group[i:i + width]
 
 
 def run(cmd, timeout, label):
@@ -218,7 +262,9 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
                 % (n, have, DISK_FLOOR_GB))
             break
         log("-" * 72)
-        log("batch %d: %s  (free %.2f GB)" % (n, ", ".join(x[:40] for x in group), have))
+        log("batch %d: %d x %s  (free %.2f GB)  %s"
+            % (n, len(group), lang_of(group[0]) or "?", have,
+               ", ".join(x[:36] for x in group)))
         if dry_run:
             done += len(group)
             continue
@@ -241,8 +287,13 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
         # leak it: those are graded offline and this process never sees them.
         _write_contracts(group)
 
+        # ONE WORKER PER INSTANCE IN THE BATCH, and no more. The batch was already sized
+        # against the disk; letting the fleet open more tabs than there are instances would
+        # spend RAM and admission slots on nothing, and every extra concurrent worker makes
+        # the shared tool-planner limiter more likely to refuse -- measured, median 35
+        # concurrent replies at a refusal against 5 at a recovery.
         run([PY, "-m", "relay.fleet_runner", "--goals-file", GOALS,
-             "--effort", effort, "--max-concurrent", str(min(4, batch_size))],
+             "--effort", effort, "--max-concurrent", str(len(group))],
             BATCH_TIMEOUT_S, "fleet")
 
         # CAPTURE BEFORE ANYTHING ELSE, and unconditionally. A fleet that timed out still has
@@ -473,8 +524,10 @@ def _discard():
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="bench.pro_cycle", description=__doc__.splitlines()[0])
-    ap.add_argument("--batch", type=int, default=4,
-                    help="instances per cycle (default 4: one round is short enough to watch)")
+    ap.add_argument("--batch", type=int, default=0,
+                    help="instances per batch; 0 (default) sizes each batch from the language's "
+                         "measured disk cost and the free space, so cheap instances run "
+                         "several at a time and heavy ones stay serial")
     ap.add_argument("--limit", type=int, default=0, help="stop after this many instances")
     ap.add_argument("--effort", default=os.environ.get("SWE_EFFORT", "auto"))
     ap.add_argument("--dry-run", action="store_true",
