@@ -104,6 +104,29 @@ def graded_ids():
     return set()
 
 
+def captured_ids():
+    """Instances whose PATCH is already on disk. The expensive half is finished for these.
+
+    GRADING IS A SEPARATE, OFFLINE STEP, and it can be unavailable for reasons that have
+    nothing to do with the work: the eval host's docker was down for this entire run, so every
+    batch returned EVALERR and graded_ids() stayed empty. A restart then re-ran instances whose
+    patch was already captured -- eight of them, about eighty minutes of the tenant quota that
+    is the binding constraint here, thrown away to reproduce a file that already existed.
+
+    An empty patch does NOT count. That is an instance that ran and produced nothing, which is
+    a result worth retrying, not a result worth keeping.
+    """
+    out = set()
+    for row in _load(PREDS, []) or []:
+        if not isinstance(row, dict):
+            continue
+        inst = row.get("instance_id")
+        patch = (row.get("patch") or row.get("model_patch") or "").strip()
+        if inst and patch:
+            out.add(inst)
+    return out
+
+
 def slice_ids():
     from bench import pro_stage_goals as G
     return sorted(G.BY_ID)
@@ -242,14 +265,20 @@ def worktrees_present():
     return len(os.listdir(work)), total / 1e6
 
 
-def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=False):
+def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=False,
+          redo_captured=False):
     todo = check_slice_is_fresh(slice_ids(), allow_burned)
-    todo = [i for i in todo if i not in graded_ids()]
+    done_already = graded_ids() | (set() if redo_captured else captured_ids())
+    todo = [i for i in todo if i not in done_already]
     if limit:
         todo = todo[:limit]
     log("=" * 72)
-    log("cycle start: %d instance(s) to do, batch=%d, free=%.2f GB, floor=%.2f GB"
-        % (len(todo), batch_size, free_gb(), DISK_FLOOR_GB))
+    log("cycle start: %d instance(s) to do, batch=%s, free=%.2f GB, floor=%.2f GB"
+        % (len(todo), batch_size or "by language", free_gb(), DISK_FLOOR_GB))
+    held = len(captured_ids())
+    if held and not redo_captured:
+        log("%d instance(s) already have a captured patch and are skipped; grade them with "
+            "bench.swe_grade_batch rather than re-running them" % held)
     if not todo:
         log("nothing ungraded in the slice -- done")
         return 0
@@ -580,9 +609,13 @@ def main(argv=None):
     ap.add_argument("--allow-burned", action="store_true",
                     help="re-measure instances that have already been used; the result is not "
                          "a fresh number and the log says so")
+    ap.add_argument("--redo-captured", action="store_true",
+                    help="re-run instances whose patch is already captured; the default skips "
+                         "them, because grading being down is not a reason to redo the work")
     a = ap.parse_args(argv)
     os.makedirs(SW, exist_ok=True)
-    return cycle(a.batch, a.limit or None, a.dry_run, a.effort, a.allow_burned)
+    return cycle(a.batch, a.limit or None, a.dry_run, a.effort, a.allow_burned,
+                 a.redo_captured)
 
 
 if __name__ == "__main__":
