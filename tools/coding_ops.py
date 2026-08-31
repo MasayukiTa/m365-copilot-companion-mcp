@@ -264,6 +264,30 @@ def multi_edit(
     locked = require_unlocked()
     if locked:
         return locked
+    return multi_edit_local(path, edits, encoding)
+
+
+def multi_edit_local(
+    path: str,
+    edits: list[dict],
+    encoding: str = "utf-8",
+) -> str:
+    """Apply the edits without the unlock gate. FOR IN-PROCESS CALLERS ONLY; not a tool.
+
+    Same reasoning as memory_save_local and runlog_append_local, and the same measured
+    symptom. The gate asks "has the REMOTE caller proved possession of the password for its
+    IP". A caller inside this process has no remote identity for that question to be about,
+    so every in-process call is refused -- and the refusal is a returned STRING, so a caller
+    that does not inspect it carries on believing the file was written.
+
+    That is not hypothetical here: the cross-file edit cell in tools/auto/autoloop.py called
+    multi_edit in-process and every single edit came back
+    "[locked: no HTTP request context]". The cell would have shipped reverting a tree it had
+    never changed, and reporting that it had.
+
+    Split out rather than reimplemented, so the matching rules -- expected_replacements, the
+    all-or-nothing abort, "no net changes" -- cannot drift between the two callers.
+    """
     try:
         p = _validate_path(path)
         original = p.read_text(encoding=encoding)
