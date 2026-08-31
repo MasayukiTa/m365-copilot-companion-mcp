@@ -274,6 +274,13 @@ class SelfImproveDashboardWindow : Window
         if (k == "pd_ok")         return ja ? "OK" : "OK";
         if (k == "pd_cancel")     return ja ? "やめる" : "Cancel";
         if (k == "pending_copied") return ja ? "コピーしました" : "Copied";
+        // The two outcomes of an approval that DOES something, rather than only records it.
+        if (k == "pd_resign_done")   return ja
+            ? "再署名しました。凍結セットは新しい内容で承認され、自己改善ループは再び走れます。"
+            : "Re-signed. The frozen set is approved as it now stands and the loop can run again.";
+        if (k == "pd_resign_failed") return ja
+            ? "承認は記録しましたが、再署名は実行されませんでした。理由は下記のとおりです。"
+            : "The approval was recorded, but the re-signing did not run. The reason follows.";
         if (k == "auth_detail")   return ja ? "記録と取り消し" : "Records and undo";
 
         // section explanations (one-liner below the label)
@@ -1982,6 +1989,62 @@ class SelfImproveDashboardWindow : Window
     // Recording a decision goes through the same module the queue is written by, so there is
     // one implementation of the on-disk shape. Waited for and reported: a decision that failed
     // to record silently is worse than no button, because the operator believes they answered.
+    // Carry out an approved re-signing, with the operator's own words as the authorization.
+    //
+    // WHY THE WORDS ARE PASSED STRAIGHT THROUGH: frozen.py requires the instruction that
+    // specified this act, quoted verbatim, and this is the only moment the system holds it.
+    // Re-typing it into a terminal later produces a ledger entry quoting a reconstruction.
+    //
+    // NOTHING IS RELAXED HERE. It runs the same CLI, so a re-signing that reaches files the
+    // standing delegation excludes is refused exactly as it is from a shell -- and the refusal
+    // is shown rather than swallowed, because an approval that silently did nothing is the
+    // failure this whole change is about.
+    void CarryOutFrozenResign(string pid, string words)
+    {
+        try
+        {
+            string root   = RepoRoot();
+            string venvPy = Path.Combine(root, ".venv", "Scripts", "python.exe");
+            var psi = new ProcessStartInfo();
+            psi.FileName  = File.Exists(venvPy) ? venvPy : "python";
+            // --authorization - reads the words from stdin, for the same reason RecordDecision
+            // does: quoting them into argv mangled quotes and broke on newlines, and these are
+            // the words a ledger promises are unaltered.
+            psi.Arguments = "-m relay.selfimprove.frozen --snapshot --force"
+                          + " --reason \"approved on the dashboard (decision " + pid + ")\""
+                          + " --authorization -";
+            psi.RedirectStandardInput  = true;
+            psi.WorkingDirectory       = root;
+            psi.UseShellExecute        = false;
+            psi.CreateNoWindow         = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError  = true;
+            var proc = new Process(); proc.StartInfo = psi; proc.Start();
+            var wordBytes = new UTF8Encoding(false).GetBytes(words ?? "");
+            proc.StandardInput.BaseStream.Write(wordBytes, 0, wordBytes.Length);
+            proc.StandardInput.BaseStream.Flush();
+            proc.StandardInput.Close();
+            string so = proc.StandardOutput.ReadToEnd();
+            string se = proc.StandardError.ReadToEnd();
+            proc.WaitForExit(60000);
+            if (proc.ExitCode != 0)
+            {
+                MessageBox.Show(this, T("pd_resign_failed") + "\n\n" + so + "\n" + se,
+                                T("pending_sec"), MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+            else
+            {
+                MessageBox.Show(this, T("pd_resign_done") + "\n\n" + so.Trim(),
+                                T("pending_sec"), MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, T("pd_resign_failed") + "\n\n" + ex.Message,
+                            T("pending_sec"), MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
     bool RecordDecision(string pid, string verb, string words, string kind)
     {
         try
@@ -2145,6 +2208,15 @@ class SelfImproveDashboardWindow : Window
                 yes.Padding = new Thickness(16, 5, 16, 5);
                 yes.Margin  = new Thickness(0, 0, 8, 0);
                 string theId = pid;
+                // ROWS QUEUED BEFORE THE FIELD EXISTED STILL WORK. The operator already has one
+                // sitting on this screen; if recognition depended solely on a field added
+                // afterwards, that card would stay exactly as inert as it was before this
+                // change -- which is the complaint, not the fix. The command is what the row
+                // has always carried, so it is the second way in.
+                string theAction = S(r, "action");
+                if (theAction.Length == 0 && S(r, "command").IndexOf(
+                        "frozen --snapshot --force", StringComparison.OrdinalIgnoreCase) >= 0)
+                    theAction = "frozen_resign";
                 yes.Click += delegate
                 {
                     string kind;
@@ -2152,7 +2224,16 @@ class SelfImproveDashboardWindow : Window
                                                  new string[] { T("pd_a1"), T("pd_a2") },
                                                  out kind);
                     if (said == null) return;                    // closed, nothing recorded
-                    if (RecordDecision(theId, "--approve", said, kind)) ForceRender();
+                    if (!RecordDecision(theId, "--approve", said, kind)) return;
+                    // AND THEN DO IT, when the proposal is one this screen can carry out.
+                    // Approving a Skill IS the act; approving this used to leave a card
+                    // reading "waiting on the agent" and a command to go and run elsewhere.
+                    // The operator said as much: the signing flows are not operable the way
+                    // the Skill approvals are. The words they just typed are the
+                    // authorization, so the ledger quotes the person who decided rather than
+                    // a second invocation nobody recorded.
+                    if (theAction == "frozen_resign") CarryOutFrozenResign(theId, said);
+                    ForceRender();
                 };
                 actions.Children.Add(yes);
 
