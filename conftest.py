@@ -44,6 +44,9 @@ LIVE_RECORD_REDIRECTS = {
     # Written on the hot path of EVERY tool call, so a test that reaches the gateway fills the
     # operator's evidence ledger with calls that were never made in earnest.
     "tools.tool_ledger": {"LEDGER_PATH": "tool_events.jsonl"},
+    # Written at admission for every benchmark task; a test that admits a task would otherwise
+    # add terms to the operator's real contract file, which is append-only and first-wins.
+    "relay.acceptance_contract": {"CONTRACT_PATH": "acceptance_contracts.jsonl"},
     "relay.selfimprove.ledger": {"DEFAULT_PATH": "hypotheses.jsonl"},
     "relay.selfimprove.compare": {"QUEUE_PATH": "compare_queue.jsonl",
                                   "RESULTS_PATH": "compare_results.jsonl"},

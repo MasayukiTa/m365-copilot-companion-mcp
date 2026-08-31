@@ -219,6 +219,17 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
             _discard()
             continue
 
+        # THE TERMS, RECORDED BEFORE THE WORKER'S FIRST TURN, BY THE CONTROLLER.
+        #
+        # Until now the only thing between a worker and a DONE was its own judgement that it
+        # had finished -- measured at 0.718 precision, 11 of 39 claims wrong. A worker that
+        # picks its own acceptance test after the fact picks one it passes.
+        #
+        # The command written here is the repository's OWN test command, which the goal text
+        # already tells the worker to run. It is not the hidden acceptance test and cannot
+        # leak it: those are graded offline and this process never sees them.
+        _write_contracts(group)
+
         run([PY, "-m", "relay.fleet_runner", "--goals-file", GOALS,
              "--effort", effort, "--max-concurrent", str(min(4, batch_size))],
             BATCH_TIMEOUT_S, "fleet")
@@ -241,6 +252,34 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
     log("cycle end: %d instance(s) attempted, %d graded in total, free %.2f GB"
         % (done, len(graded_ids()), free_gb()))
     return 0
+
+
+def _write_contracts(group):
+    """One acceptance contract per instance, at admission. Never raises.
+
+    A missing contract is REPORTED rather than swallowed: "nobody wrote a check" and "this task
+    has no mechanical oracle" look identical at the end of a run, and only one of them is a
+    problem. Saying it here, at admission, is the whole point of writing them first.
+    """
+    try:
+        from relay import acceptance_contract as AC
+        from bench import pro_stage_goals as G
+        wrote = 0
+        for inst in group:
+            row = G.BY_ID.get(inst) or {}
+            hint = G.TESTHINT.get(row.get("repo_language") or "")
+            checks = [{"id": "project_tests", "command": hint}] if hint else []
+            AC.ensure(inst, goal=(row.get("problem_statement") or ""), checks=checks,
+                      cwd=G.wt_for(inst))
+            wrote += 1
+        missing = AC.missing_contract_tasks(group)
+        log("  contracts: %d written, %d missing" % (wrote, len(missing)))
+        if missing:
+            log("  NO CONTRACT for: %s -- these cannot be verified mechanically and must not "
+                "be counted as verified" % ", ".join(m[:40] for m in missing))
+    except Exception as exc:
+        log("  contract step failed (%s: %s) -- the batch still runs, but nothing in it can "
+            "be promoted past a self-report" % (type(exc).__name__, str(exc)[:120]))
 
 
 def _discard():
