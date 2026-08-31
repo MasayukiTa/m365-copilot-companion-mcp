@@ -139,6 +139,7 @@ if __name__ == "__main__":
 #: Captured before the guard below replaces it, so the two tests that exercise the navigation
 #: helper itself can still reach the real function.
 _REAL_NAVIGATE = E._navigate
+_REAL_SURFACE_WITH_WAY_BACK = E._surface_with_a_way_back
 
 
 @pytest.fixture(autouse=True)
@@ -153,6 +154,10 @@ def _never_touch_a_real_browser(monkeypatch):
     live side door open.
     """
     monkeypatch.setattr(E, "_navigate", lambda cdp_url, agent_url: True)
+    # And no test may leave a window up: surfacing is replaced wholesale unless a test
+    # deliberately exercises it.
+    monkeypatch.setattr(E, "_surface_with_a_way_back",
+                        lambda cdp_url, agent_url, rehide_after_s=0: True)
 
 
 # THE STUBS BELOW MUST USE THE KEY classify_live ACTUALLY RETURNS ("cls", not "class").
@@ -206,27 +211,21 @@ def test_the_window_is_surfaced_only_after_the_automatic_path_has_failed(monkeyp
     """
     calls = []
     monkeypatch.setattr(E, "classify_live", lambda cdp_url="x": [{"cls": "needs_signin"}])
-
-    import sys
-    import types
-    fake = types.ModuleType("relay.edge_recover")
-    fake.surface = lambda port=None, open_url="": calls.append(port)
-    monkeypatch.setitem(sys.modules, "relay.edge_recover", fake)
+    monkeypatch.setattr(E, "_surface_with_a_way_back",
+                        lambda cdp_url, agent_url, rehide_after_s=0: calls.append(cdp_url))
 
     assert E.ensure_ready("https://example/agent", attempts=3, settle_s=0) == "needs_signin"
-    assert calls == [9222], (
-        "expected exactly one surface, on the last attempt, for the FLEET's browser: %r" % calls)
+    assert len(calls) == 1, (
+        "expected exactly one surface, on the last attempt: %r" % calls)
+    assert "9222" in calls[0], "surfaced the wrong browser: %r" % calls
 
 
 def test_the_fallback_can_be_switched_off(monkeypatch):
     """A health probe that merely reports should not yank a window forward."""
     monkeypatch.setattr(E, "classify_live", lambda cdp_url="x": [{"cls": "needs_signin"}])
-    import sys
-    import types
-    fake = types.ModuleType("relay.edge_recover")
     calls = []
-    fake.surface = lambda port=None, open_url="": calls.append(port)
-    monkeypatch.setitem(sys.modules, "relay.edge_recover", fake)
+    monkeypatch.setattr(E, "_surface_with_a_way_back",
+                        lambda cdp_url, agent_url, rehide_after_s=0: calls.append(cdp_url))
     E.ensure_ready("https://example/agent", attempts=2, settle_s=0, surface_on_signin=False)
     assert calls == []
 
@@ -273,3 +272,38 @@ def test_navigate_reports_failure_when_neither_verb_works(monkeypatch):
     monkeypatch.setattr(_req, "urlopen",
                         lambda *a, **k: (_ for _ in ()).throw(OSError("no browser")))
     assert _REAL_NAVIGATE("http://127.0.0.1:9222", "https://example/agent") is False
+
+
+def test_every_surface_schedules_a_return_to_background(monkeypatch):
+    """A surfaced window that nobody puts back stays on the taskbar until the process dies.
+
+    bridge/copilot_bridge.py records that exact bug against its own earlier code, and the
+    first version of the fleet's fallback reproduced it: the owner found the fleet's Edge
+    sitting in the taskbar. rehide() alone is not enough either -- measured, it minimises the
+    window while the process stays headed, so the taskbar entry remains. Returning to true
+    background is a relaunch in headless mode.
+    """
+    started = {}
+
+    # PATCH THE REAL MODULE'S ATTRIBUTES. `from relay.edge_recover import surface` reads the
+    # attribute already bound on the `relay` package, so swapping the sys.modules entry is
+    # invisible -- and the real surface() then brought the operator's browser forward. Same
+    # mistake as the router tests, one module along.
+    import relay.edge_recover as _rec
+    monkeypatch.setattr(_rec, "surface", lambda port=None, open_url="": True)
+    monkeypatch.setattr(_rec, "rehide", lambda port=None: started.setdefault("rehide", port))
+
+    class _Timer:
+        def __init__(self, delay, fn):
+            started["delay"] = delay
+            started["fn"] = fn
+            self.daemon = False
+
+        def start(self):
+            started["started"] = True
+
+    import threading
+    monkeypatch.setattr(threading, "Timer", _Timer)
+    assert _REAL_SURFACE_WITH_WAY_BACK("http://127.0.0.1:9222", "https://x", 5.0) is True
+    assert started.get("started") is True, "nothing was scheduled to put the window back"
+    assert started["delay"] == 5.0
