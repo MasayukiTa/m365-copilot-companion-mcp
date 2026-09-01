@@ -855,6 +855,16 @@ class CockpitWindow : Window
     // keep feeding a queue that is being refused. relay_fleet.rate_ceiling() reads the same
     // key, so the gauge and the gate can never disagree about where the line is.
     int _rateCeiling = 100;    // settings.txt rate_ceiling_rpm= ; 0 = no ceiling
+    TextBlock _rateCeilingValue;
+
+    // Working-directory retention. SEPARATE FROM THE CONVERSATION RETENTION ABOVE, and with a
+    // different default on purpose: that store is history someone may want years later, this
+    // one is logs of runs that have finished. These were environment variables only, which made
+    // "the retention period is settable" half true -- and the half that was not was the half
+    // writing 26 MB a day.
+    int _fleetLogDays = 14;    // settings.txt fleet_log_days=
+    int _fleetStoreDays = 30;  // settings.txt fleet_store_days=   (run transcripts)
+    TextBlock _fleetLogDaysValue, _fleetStoreDaysValue;
 
     // ── P0 HEALTH STRIP ─────────────────────────────────────────────────────────────
     // Six infra dots (Server/Tunnel/Edge/Sign-in/Agent/Tool) in the header, always visible,
@@ -1103,6 +1113,17 @@ class CockpitWindow : Window
         if (k == "set_tabs_section") return ja ? "並列タブ" : "Parallel tabs";
         if (k == "set_retry_section") return ja ? "自動再試行" : "Auto-retry";
         if (k == "set_retention_section") return ja ? "会話の保持" : "Conversation retention";
+        if (k == "set_rate_section") return ja ? "レート上限" : "Rate ceiling";
+        if (k == "rate_rpm") return ja ? "毎分の上限" : "Per minute";
+        if (k == "rate_note") return ja
+            ? "直近１分がこの本数に達している間は新しい投入を止め、下がったら再開します。上のバーもこの数字を分母に描きます。既定100はMicrosoftの公開値(環境あたり毎分)。拒否が出るのに余裕があるように見えるなら、ここを下げてください。0で無効。"
+            : "While the last minute is at this number, nothing new is admitted; it resumes when it drops. The bar above is drawn against it too. The default 100 is Microsoft's published per-environment figure. If refusals arrive while the bar still shows headroom, lower this. 0 disables it.";
+        if (k == "set_fleetret_section") return ja ? "作業ディレクトリの保持" : "Working directory retention";
+        if (k == "fleet_log_days") return ja ? "ログ(日)" : "Logs (days)";
+        if (k == "fleet_store_days") return ja ? "実行記録(日)" : "Run records (days)";
+        if (k == "fleet_ret_note") return ja
+            ? "終わった走行のログの保持期間。会話の保持とは別物で、消えるのはログだけです。これより新しいものは圧縮して残します(93〜99%小さくなるので、期間を縮めるより先に効きます)。"
+            : "How long finished runs' logs are kept. Separate from conversation retention -- only logs are removed. Anything newer is compressed rather than deleted (93-99% smaller, which does more than shortening this ever will).";
         if (k == "ret_days") return ja ? "保持日数" : "Keep for (days)";
         if (k == "ret_keep") return ja ? "消さない" : "keep all";
         if (k == "ret_mb") return ja ? "上限サイズ (MB)" : "Size cap (MB)";
@@ -1232,6 +1253,10 @@ class CockpitWindow : Window
                     _retMb = Math.Max(0, Math.Min(100000, v));
                 else if (ln.StartsWith("rate_ceiling_rpm=") && int.TryParse(ln.Substring(17).Trim(), out v))
                     _rateCeiling = Math.Max(0, Math.Min(10000, v));
+                else if (ln.StartsWith("fleet_log_days=") && int.TryParse(ln.Substring(15).Trim(), out v))
+                    _fleetLogDays = Math.Max(1, Math.Min(3650, v));
+                else if (ln.StartsWith("fleet_store_days=") && int.TryParse(ln.Substring(17).Trim(), out v))
+                    _fleetStoreDays = Math.Max(1, Math.Min(3650, v));
                 else if (ln.StartsWith("disk_floor_gb="))
                 {
                     double df;
@@ -5865,6 +5890,35 @@ class CockpitWindow : Window
 
     int RetMbStep() { return _retMb >= 1000 ? 500 : 100; }
 
+    //: Coarse near the top, fine near the bottom. The interesting settings are "a bit under the
+    //: published 100" and "quite low because we are being refused", and a flat step of 1 would
+    //: mean holding the button down to reach either.
+    int RateStep() { return _rateCeiling > 100 ? 25 : (_rateCeiling > 20 ? 10 : 5); }
+
+    void SetRateCeiling(int v)
+    {
+        // 0 means no ceiling and it is REACHABLE: stepping down past the last notch lands on it
+        // rather than clamping above it, so turning this off never requires editing a file.
+        _rateCeiling = Math.Max(0, Math.Min(10000, v));
+        SaveKey("rate_ceiling_rpm", _rateCeiling.ToString());
+        if (_rateCeilingValue != null)
+            _rateCeilingValue.Text = _rateCeiling == 0 ? T("ret_keep") : _rateCeiling.ToString();
+    }
+
+    void SetFleetLogDays(int v)
+    {
+        _fleetLogDays = Math.Max(1, Math.Min(3650, v));
+        SaveKey("fleet_log_days", _fleetLogDays.ToString());
+        if (_fleetLogDaysValue != null) _fleetLogDaysValue.Text = _fleetLogDays.ToString();
+    }
+
+    void SetFleetStoreDays(int v)
+    {
+        _fleetStoreDays = Math.Max(1, Math.Min(3650, v));
+        SaveKey("fleet_store_days", _fleetStoreDays.ToString());
+        if (_fleetStoreDaysValue != null) _fleetStoreDaysValue.Text = _fleetStoreDays.ToString();
+    }
+
     void PaintRetentionNote()
     {
         if (_retNote == null) return;
@@ -5939,6 +5993,37 @@ class CockpitWindow : Window
         _retNote.Margin = new Thickness(0, 2, 0, 2); _retNote.MaxWidth = 300;
         PaintRetentionNote();
         col.Children.Add(_retNote);
+
+        // -- Rate ceiling: the line admission holds at, and the strip's denominator --
+        col.Children.Add(SectionHeader(T("set_rate_section")));
+        var rcMinus = MiniButton("−"); rcMinus.Click += delegate { SetRateCeiling(_rateCeiling - RateStep()); };
+        var rcPlus = MiniButton("+"); rcPlus.Click += delegate { SetRateCeiling(_rateCeiling + RateStep()); };
+        _rateCeilingValue = new TextBlock();
+        _rateCeilingValue.Text = _rateCeiling == 0 ? T("ret_keep") : _rateCeiling.ToString();
+        col.Children.Add(SettingsStepperRow(T("rate_rpm"), _rateCeilingValue, rcMinus, rcPlus));
+        var rcNote = new TextBlock();
+        rcNote.FontSize = 11; rcNote.TextWrapping = TextWrapping.Wrap;
+        rcNote.Margin = new Thickness(0, 2, 0, 2); rcNote.MaxWidth = 300;
+        rcNote.Text = T("rate_note");
+        col.Children.Add(rcNote);
+
+        // -- Working directory: how long finished runs' logs are kept --
+        col.Children.Add(SectionHeader(T("set_fleetret_section")));
+        var flMinus = MiniButton("−"); flMinus.Click += delegate { SetFleetLogDays(_fleetLogDays - 7); };
+        var flPlus = MiniButton("+"); flPlus.Click += delegate { SetFleetLogDays(_fleetLogDays + 7); };
+        _fleetLogDaysValue = new TextBlock(); _fleetLogDaysValue.Text = _fleetLogDays.ToString();
+        col.Children.Add(SettingsStepperRow(T("fleet_log_days"), _fleetLogDaysValue, flMinus, flPlus));
+
+        var fsMinus = MiniButton("−"); fsMinus.Click += delegate { SetFleetStoreDays(_fleetStoreDays - 7); };
+        var fsPlus = MiniButton("+"); fsPlus.Click += delegate { SetFleetStoreDays(_fleetStoreDays + 7); };
+        _fleetStoreDaysValue = new TextBlock(); _fleetStoreDaysValue.Text = _fleetStoreDays.ToString();
+        col.Children.Add(SettingsStepperRow(T("fleet_store_days"), _fleetStoreDaysValue, fsMinus, fsPlus));
+
+        var flNote = new TextBlock();
+        flNote.FontSize = 11; flNote.TextWrapping = TextWrapping.Wrap;
+        flNote.Margin = new Thickness(0, 2, 0, 2); flNote.MaxWidth = 300;
+        flNote.Text = T("fleet_ret_note");
+        col.Children.Add(flNote);
 
         // ── Auto-retry: on/off toggle + cap ──
         col.Children.Add(SectionHeader(T("set_retry_section")));
@@ -9057,7 +9142,7 @@ class CockpitWindow : Window
         var row = new StackPanel();
         row.Orientation = Orientation.Horizontal;
         row.VerticalAlignment = VerticalAlignment.Center;
-        row.Margin = new Thickness(18, 0, 0, 0);
+        row.Margin = new Thickness(20, 0, 0, 0);
 
         var lbl = new TextBlock();
         lbl.Text = ja ? "レート" : "rate";
