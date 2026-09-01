@@ -176,21 +176,42 @@ if not defined SKIP56 (
 
 echo.
 echo ===========================================================================
+echo  Convenience setup  (asked BEFORE anything is created)
+echo ===========================================================================
+echo   These two change your machine outside this folder, so they are asked
+echo   first and your answer is recorded. Say no and nothing is created.
+echo.
+set "PROV_SHORTCUT=no"
+set "PROV_AUTOSTART=no"
+set /p MKLNK="   Create a one-click 'M365 Companion' launcher on your Desktop? [Y/n] "
+if /i not "!MKLNK!"=="n" set "PROV_SHORTCUT=yes"
+set /p MKAUTO="   Start the background supervisor automatically when you log on? [y/N] "
+if /i "!MKAUTO!"=="y" set "PROV_AUTOSTART=yes"
+
+REM RECORD THE DECISION, NOT THE ACT. start_all.ps1 provisioned both whenever this marker was
+REM ABSENT, so the absence of a decision was read as consent -- and the question below used to
+REM be asked AFTER the shortcut had already been created, which made answering "n" do nothing.
+REM Logon autostart was never asked about at all.
+if not exist ".setup" mkdir ".setup"
+> ".setup\convenience_provisioned" echo shortcut=!PROV_SHORTCUT!
+>> ".setup\convenience_provisioned" echo autostart=!PROV_AUTOSTART!
+if /i "!PROV_SHORTCUT!"=="yes" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\make_desktop_shortcut.ps1"
+) else (
+    echo   Desktop launcher skipped. Create it later with scripts\make_desktop_shortcut.ps1
+)
+if /i "!PROV_AUTOSTART!"=="yes" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\register-supervisor.ps1"
+) else (
+    echo   Logon autostart skipped. Register it later with scripts\register-supervisor.ps1
+)
+
+echo.
+echo ===========================================================================
 echo  STEP 7/7  Launch the whole stack  (server + tunnel + Edge + bridge + UI)
 echo ===========================================================================
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start_all.ps1"
-
-echo.
-echo ===========================================================================
-echo  Desktop launcher  (optional, recommended)
-echo ===========================================================================
-set /p MKLNK="   Create a one-click 'M365 Companion' launcher on your Desktop? [Y/n] "
-if /i "!MKLNK!"=="n" (
-    echo   Skipped. You can create it later by running scripts\make_desktop_shortcut.ps1
-) else (
-    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\make_desktop_shortcut.ps1"
-)
 
 echo.
 echo ===========================================================================

@@ -138,3 +138,59 @@ def test_the_server_kill_is_scoped_to_this_checkout():
             window = src[m.start():m.start() + 200]
             assert "$root*" in window or "$Root*" in window, (
                 "%s kills main.py processes without scoping them to the repo" % name)
+
+
+# -- consent for changes outside this folder ---------------------------------------------------
+
+STARTALL = io.open(os.path.join(REPO, "scripts", "start_all.ps1"), encoding="utf-8").read()
+QS = io.open(os.path.join(REPO, "quickstart.bat"), encoding="ascii").read()
+
+
+def test_a_missing_decision_is_not_consent():
+    """It used to provision whenever the marker was ABSENT, so a machine that had never been
+    asked got a Desktop shortcut and a logon autostart entry anyway. Both change the machine
+    outside this folder and both outlive the repo."""
+    i = STARTALL.index("function Ensure-ConvenienceProvisioning")
+    body = STARTALL[i:i + 2600]
+    assert "no consent on record" in body
+    assert "if (-not (Test-Path $markerPath))" in body
+
+
+def test_each_action_is_gated_on_its_own_answer():
+    """One question cannot stand in for two: a launcher on the desktop and a program that
+    starts itself at logon are different commitments."""
+    i = STARTALL.index("function Ensure-ConvenienceProvisioning")
+    body = STARTALL[i:i + 3600]
+    assert "$wantShortcut -and (Test-Path $shortcutScript)" in body
+    assert "$wantAutostart -and (Test-Path $autostartScript)" in body
+
+
+def test_the_recorded_answer_is_not_overwritten():
+    """The file is the record of what the person chose. Stamping it with "provisioned" would
+    erase the answer and leave nothing to honour next time."""
+    i = STARTALL.index("function Ensure-ConvenienceProvisioning")
+    body = STARTALL[i:i + 4200]
+    assert '"provisioned" | Out-File' not in body
+
+
+def test_the_question_comes_before_anything_is_created():
+    """THE DEFECT. The prompt sat AFTER start_all had already made the shortcut, so answering
+    "n" changed nothing -- the person was asked for permission for something already done."""
+    assert QS.index("Create a one-click") < QS.index("start_all.ps1")
+
+
+def test_autostart_is_asked_about_at_all():
+    """It was never mentioned. A program that launches itself at every logon is the larger of
+    the two commitments and was the one nobody was told about."""
+    assert "automatically when you log on" in QS
+    assert "register-supervisor.ps1" in QS
+
+
+def test_autostart_defaults_to_no_and_the_launcher_to_yes():
+    """Defaults carry the weight here, because most people press Enter. A desktop icon is
+    trivially reversible; something that runs at every logon is not, so it has to be asked for
+    rather than merely not-refused."""
+    i = QS.index("automatically when you log on")
+    assert "[y/N]" in QS[i:i + 120]
+    j = QS.index("Create a one-click")
+    assert "[Y/n]" in QS[j:j + 160]
