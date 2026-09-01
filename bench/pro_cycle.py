@@ -117,15 +117,63 @@ def _load(path, default):
         return default
 
 
+#: Verdicts that mean the evaluation could not be RUN. They say nothing about the patch, so
+#: they must never retire an instance -- see test_evalerr_does_not_count_as_graded.
+_NOT_A_GRADE = {"EVALERR", ""}
+
+
 def graded_ids():
     """Instances already counted. THE RESULTS FILE IS THE LEDGER -- see the module note on why
-    re-measuring silently is worse than stopping."""
-    data = _load(RESULTS, {})
+    re-measuring silently is worse than stopping.
+
+    IT IS JSONL, AND THIS READ IT AS JSON, so it has never once worked. swe_grade_batch appends
+    one object per line; json.load raises on line 2; _load catches ValueError and hands back an
+    empty dict. Measured: four graded rows on disk and graded_ids() returning zero. The whole
+    "do not re-measure what is already scored" protection -- the one the module docstring calls
+    out as how a benchmark number drifts upward without anybody deciding to cheat -- was a
+    no-op the entire time, and it failed in the direction that looks like nothing is wrong.
+
+    Both shapes are accepted now, because the file's format is not this function's decision to
+    make and a reader that only understands the format it happens to see is how this started.
+    """
+    ids = set()
+    try:
+        with open(RESULTS, encoding="utf-8-sig") as fh:
+            text = fh.read()
+    except OSError:
+        return ids
+
+    def keep(row):
+        if not isinstance(row, dict):
+            return
+        inst = row.get("instance_id")
+        verdict = str(row.get("verdict") or "").upper()
+        if inst and verdict not in _NOT_A_GRADE:
+            ids.add(inst)
+
+    try:
+        data = json.loads(text)
+    except ValueError:
+        for line in text.splitlines():          # JSONL: the shape actually written
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                keep(json.loads(line))
+            except ValueError:
+                continue
+        return ids
     if isinstance(data, dict):
-        return set(data.keys())
+        # {instance_id: verdict} or {instance_id: {...}}
+        for inst, val in data.items():
+            v = val.get("verdict") if isinstance(val, dict) else val
+            if str(v or "").upper() not in _NOT_A_GRADE:
+                ids.add(inst)
+        return ids
     if isinstance(data, list):
-        return {r.get("instance_id") for r in data if isinstance(r, dict)}
-    return set()
+        for row in data:
+            keep(row)
+    return ids
 
 
 def captured_ids():
