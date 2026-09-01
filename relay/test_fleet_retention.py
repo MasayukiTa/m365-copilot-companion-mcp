@@ -261,3 +261,100 @@ def test_the_budget_check_still_reads_a_compressed_log(tmp_path):
     got = cb.read_log(newest, elapsed_s=600)
     assert got and got["captures"] == 5, got
     assert got["socket_workers"] == 5
+
+
+# ----------------------------------------------------- the conversation registry (third place)
+
+
+def _store(tmp_path, sessions):
+    """A sessions.sqlite3 with the given (sid, conv_url) rows."""
+    import sqlite3
+    d = tmp_path / "sessions"
+    d.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(str(d / "sessions.sqlite3"))
+    c.execute("CREATE TABLE sessions (sid TEXT PRIMARY KEY, conv_url TEXT)")
+    c.executemany("INSERT INTO sessions VALUES (?,?)", sessions)
+    c.commit(); c.close()
+
+
+def _registry(tmp_path, rows):
+    io.open(str(tmp_path / "conversations.json"), "w", encoding="utf-8").write(
+        json.dumps(rows, ensure_ascii=False))
+
+
+def _read_registry(tmp_path):
+    return json.load(io.open(str(tmp_path / "conversations.json"), encoding="utf-8"))
+
+
+def test_a_chat_row_linked_by_sid_survives(tmp_path):
+    # This is how the operator's OWN conversations link: name = sid, and url is empty.
+    now = time.time()
+    _store(tmp_path, [("s0826024402e89a", "")])
+    _registry(tmp_path, [{"name": "s0826024402e89a", "title": "mine", "url": "", "ts": 0}])
+    freed, dropped = R.conversations(str(tmp_path), now=now)
+    assert dropped == [], dropped
+    assert len(_read_registry(tmp_path)) == 1
+
+
+def test_an_empty_url_does_not_match_an_empty_conv_url(tmp_path):
+    # THE BUG THIS WAS WRITTEN FOR. Matching on url alone looked like it worked: an empty
+    # registry url compared equal to the hundreds of sessions whose conv_url is also empty, so
+    # rows counted as linked that were linked to nothing -- and the real linkage (the sid) was
+    # never checked at all.
+    now = time.time()
+    _store(tmp_path, [("s_live", "")])
+    _registry(tmp_path, [{"name": "s_gone", "title": "orphan", "url": "", "ts": 0}])
+    freed, dropped = R.conversations(str(tmp_path), now=now)
+    assert dropped == ["orphan"], dropped
+    assert _read_registry(tmp_path) == []
+
+
+def test_a_fleet_row_with_no_session_is_dropped(tmp_path):
+    now = time.time()
+    _store(tmp_path, [("s_live", "")])
+    _registry(tmp_path, [{"url": "https://m365.cloud.microsoft/chat/agent/T_x/conversation/abc",
+                          "title": "worker w3", "source": "fleet", "ts": 0}])
+    _freed, dropped = R.conversations(str(tmp_path), now=now)
+    assert dropped == ["worker w3"]
+
+
+def test_a_row_is_matched_on_the_conversation_guid(tmp_path):
+    # The registry's url and the store's conv_url are not always spelled the same, and a match
+    # that misses on punctuation deletes a row that IS linked.
+    now = time.time()
+    _store(tmp_path, [("s1", "https://m365.cloud.microsoft/chat/conversation/abc-123?x=1")])
+    _registry(tmp_path, [{"url": "https://m365.cloud.microsoft/chat/agent/T_q/conversation/abc-123?x=1",
+                          "title": "same conversation", "ts": 0}])
+    _freed, dropped = R.conversations(str(tmp_path), now=now)
+    assert dropped == [], dropped
+
+
+def test_a_live_runs_rows_are_not_yanked_from_under_it(tmp_path):
+    # A fleet registers its conversations AS IT GOES. Unregistering one mid-run would remove a
+    # conversation the run is still using.
+    now = time.time()
+    _store(tmp_path, [("s1", "")])
+    _registry(tmp_path, [{"url": "https://x/conversation/new", "title": "running now",
+                          "source": "fleet", "ts": now - 600}])
+    _freed, dropped = R.conversations(str(tmp_path), now=now, keep_hours=24)
+    assert dropped == [], dropped
+
+
+def test_an_unreadable_store_changes_nothing(tmp_path):
+    # Every row looks unlinked when the table cannot be read. Acting on that would empty the
+    # registry on exactly the failure it should be most cautious about.
+    now = time.time()
+    _registry(tmp_path, [{"url": "https://x/conversation/a", "title": "keep me", "ts": 0}])
+    freed, dropped = R.conversations(str(tmp_path), now=now)
+    assert dropped == [] and freed == 0
+    assert len(_read_registry(tmp_path)) == 1
+
+
+def test_the_surviving_registry_is_still_valid_json(tmp_path):
+    now = time.time()
+    _store(tmp_path, [("keep", "")])
+    _registry(tmp_path, [{"name": "keep", "title": "a", "url": "", "ts": 0},
+                         {"url": "https://x/conversation/b", "title": "b", "ts": 0}])
+    R.conversations(str(tmp_path), now=now)
+    got = _read_registry(tmp_path)
+    assert isinstance(got, list) and len(got) == 1 and got[0]["name"] == "keep"

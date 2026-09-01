@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import glob
 import io
+import json
 import os
 import re
 import time
@@ -348,6 +349,111 @@ def cap_jsonl(fleet_dir, dry_run=False, max_mb=None):
     return freed, trimmed
 
 
+#: Registry entries younger than this are kept even when nothing links them: a fleet run
+#: registers its conversations as it goes, and yanking a row from under a LIVE run would
+#: unregister a conversation the run is still using.
+CONV_KEEP_HOURS = float(os.environ.get("MCP_FLEET_CONV_HOURS", "24"))
+
+
+def _linked_sessions(fleet_dir):
+    """(sids, conv_urls) of every session that still has a row, or None if the store cannot
+    be read -- and the caller then does nothing at all, because an unreadable session table
+    would make EVERY registry row look unlinked and delete the lot.
+
+    BOTH KEYS, because the registry rows do not all carry the same one. A chat row links by
+    `name` = sid and its `url` is EMPTY; a fleet row carries an M365 url and no name. Matching
+    on url alone looked like it worked and did not: an empty registry url compared equal to the
+    539 sessions whose conv_url is also empty, so 14 rows counted as linked that were linked to
+    nothing. Empties are dropped from both sets for that reason.
+    """
+    import sqlite3
+    db = os.path.join(fleet_dir, "sessions", "sessions.sqlite3")
+    if not os.path.isfile(db):
+        return None
+    try:
+        conn = sqlite3.connect(db)
+        try:
+            rows = conn.execute("SELECT sid, conv_url FROM sessions").fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    sids = {(r[0] or "").strip() for r in rows if (r[0] or "").strip()}
+    urls = {(r[1] or "").strip() for r in rows if (r[1] or "").strip()}
+    return sids, urls
+
+
+def _guid(url):
+    u = (url or "").strip()
+    return u.rsplit("/conversation/", 1)[-1] if "/conversation/" in u else ""
+
+
+def conversations(fleet_dir, now=None, dry_run=False, keep_hours=None):
+    """Drop registry rows that no longer point at anything readable.
+
+    WHY THIS EXISTS. .fleet/conversations.json is the THIRD place a conversation lives, beside
+    the sessions table and the transcript file, and it is the one nothing was tidying. Measured
+    on the live registry: 425 rows, of which 411 matched no session row -- 409 fleet worker
+    conversations and 2 chats. The cockpit lists these, and opening one re-registers the session
+    and brings it back into the chat, which is why deleted conversations reappeared. Deleting is
+    already a hard DELETE of the row, its turns and both files; it was never a soft flag.
+
+    They are also not a route to the stored history: fleet_turns is keyed by run and worker
+    ("r6a8cfa11_w0"), and NONE of the 409 conversation GUIDs appear as a key. There is no join
+    from a registry row to the data, so a row with no session behind it cannot reach anything
+    locally. (The M365 URL may still open server-side; what is gone is any local record.)
+    """
+    now = time.time() if now is None else now
+    keep_hours = CONV_KEEP_HOURS if keep_hours is None else keep_hours
+    path = os.path.join(fleet_dir, "conversations.json")
+    if not os.path.isfile(path):
+        return 0, []
+    got = _linked_sessions(fleet_dir)
+    if got is None:
+        # FAIL CLOSED. Every row looks unlinked when the table cannot be read, and acting on
+        # that would empty the registry on exactly the failure it should be cautious about.
+        return 0, []
+    sids, linked = got
+    guids = {_guid(u) for u in linked if _guid(u)}
+    try:
+        rows = json.load(io.open(path, encoding="utf-8-sig"))
+    except Exception:
+        return 0, []
+    if not isinstance(rows, list):
+        return 0, []
+    before = _size(path)
+    kept, dropped = [], []
+    for r in rows:
+        if not isinstance(r, dict):
+            kept.append(r)
+            continue
+        url = (r.get("url") or "").strip()
+        name = str(r.get("name") or "").strip()
+        # sid FIRST, because that is how a chat row links and those are the operator's own
+        # conversations. Then the whole url, then the GUID: the registry's url and the store's
+        # conv_url are not always spelled the same (agent prefix, query string), and a match
+        # that misses on punctuation deletes a row that IS linked.
+        if name and name in sids:
+            kept.append(r)
+            continue
+        if url and (url in linked or (_guid(url) and _guid(url) in guids)):
+            kept.append(r)
+            continue
+        try:
+            age_h = (now - float(r.get("ts") or 0)) / 3600.0
+        except (TypeError, ValueError):
+            age_h = 1e9
+        if age_h <= keep_hours:
+            kept.append(r)
+            continue
+        dropped.append(r.get("title") or url[:60])
+    if dropped and not dry_run:
+        tmp = path + ".tmp"
+        with io.open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(kept, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    return max(0, before - (_size(path) if not dry_run else 0)), dropped
+
 def apply(fleet_dir=None, now=None, dry_run=False):
     """Run every rule. Returns a report; never raises."""
     fleet_dir = fleet_dir or os.path.join(
@@ -368,9 +474,10 @@ def apply(fleet_dir=None, now=None, dry_run=False):
                      ("rotations", rotations),
                      ("scratch", scratch),
                      ("stores", stores),
+                     ("conversations", conversations),
                      ("cap_jsonl", cap_jsonl)):
         try:
-            if fn in (coordinator_logs, scratch, stores, compress):
+            if fn in (coordinator_logs, scratch, stores, compress, conversations):
                 freed, items = fn(fleet_dir, now=now, dry_run=dry_run)
             else:
                 freed, items = fn(fleet_dir, dry_run=dry_run)
@@ -400,3 +507,4 @@ if __name__ == "__main__":
         else:
             print("  %-20s %6.1f MB  %d item(s)" % (name, r["freed_mb"], r["count"]))
     print("  %-20s %6.1f MB total" % ("", rep["freed_mb"]))
+
