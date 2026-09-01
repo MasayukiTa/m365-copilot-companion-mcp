@@ -39,15 +39,6 @@ if not "%BOOT_RC%"=="0" (
     exit /b %BOOT_RC%
 )
 
-REM --- Pick the interpreter the bootstrap produced --------------------------
-set "PYEXE=.venv\Scripts\python.exe"
-if not exist "%PYEXE%" (
-    where py >nul 2>nul && set "PYEXE=py -3"
-)
-if not exist ".venv\Scripts\python.exe" (
-    where python >nul 2>nul && set "PYEXE=python"
-)
-
 echo.
 echo ===========================================================================
 echo  STEP 2/7  Your secrets - copy these into your MCP client

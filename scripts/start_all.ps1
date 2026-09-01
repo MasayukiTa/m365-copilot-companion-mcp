@@ -1,4 +1,4 @@
-# start_all.ps1 -- idempotent DAILY startup for the whole stack.
+﻿# start_all.ps1 -- idempotent DAILY startup for the whole stack.
 # Called by start_all.bat (double-click). Brings up, in order and ONLY IF NOT ALREADY RUNNING:
 #   1. supervisor.ps1  (MCP server + devtunnel host)   -- mutex-guarded; the live tunnel is NEVER
 #      killed, so re-running while a tunnel/supervisor is already up is a no-op.
@@ -902,8 +902,15 @@ function Invoke-Startup {
         Write-Host "[3/4] bridge :8765: already serving (no keepalive supervisor, but up)"
     } else {
         Write-Host "[3/4] bridge: starting (headless keepalive)"
+        # ITS ERROR MESSAGE IS THE MOST USEFUL ONE IN THE WHOLE STARTUP and it was going
+        # nowhere. The bridge exits with "No agent page. Set MCP_IMPL_AGENT_URL..." -- exactly
+        # what the person needs -- into a hidden window that discards it. Redirected to a file
+        # instead of un-hiding the window: this is a long-lived keepalive, and giving it a
+        # console would leave a window that has to stay open for the app to work.
+        $bridgeLog = Join-Path $script:diagDir "bridge.log"
         Start-Process powershell -WindowStyle Hidden -ArgumentList @(
-            "-NoProfile","-ExecutionPolicy","Bypass","-File","$scriptDir\start_bridge.ps1","-Keepalive")
+            "-NoProfile","-ExecutionPolicy","Bypass","-File","$scriptDir\start_bridge.ps1","-Keepalive") `
+            -RedirectStandardOutput $bridgeLog -RedirectStandardError "$bridgeLog.err"
     }
 
     # 4) WPF apps. Launch only if not already running; build them first if the exe is missing.
@@ -994,6 +1001,27 @@ function Invoke-Startup {
 # directly so it is NEVER blocked.
 $script:splash = $null
 $script:startupFailures = @()
+
+# ONE PLACE, INSIDE THE REPO. Diagnostics were scattered across %TEMP% and hidden windows, so
+# the answer existed and could not be found. Everything that a hidden process would otherwise
+# swallow is written here, next to the thing it is about.
+$script:diagDir = Join-Path $root ".setup\logs"
+try { if (-not (Test-Path $script:diagDir)) { New-Item -ItemType Directory -Force $script:diagDir | Out-Null } } catch { }
+
+function Hide-Secrets([string]$text) {
+    # CENTRAL REDACTION. A log that is finally visible is also a log that can be pasted into a
+    # chat window, and this stack handles a Bearer token, an unlock password and a tunnel URL
+    # that is effectively a capability. Redacted once, here, rather than remembered at each
+    # site that writes.
+    if (-not $text) { return $text }
+    $t = $text
+    $t = [regex]::Replace($t, '(?i)(bearer\s+)[A-Za-z0-9._\-]{8,}', '$1<redacted>')
+    $t = [regex]::Replace($t, '(?i)(MCP_API_KEY\s*=\s*)\S+', '$1<redacted>')
+    $t = [regex]::Replace($t, '(?i)(MCP_UNLOCK_PASSWORD[A-Z_]*\s*=\s*)\S+', '$1<redacted>')
+    $t = [regex]::Replace($t, '(?i)(password|passwd|secret|token)(["'':\s=]+)\S+', '$1$2<redacted>')
+    $t = [regex]::Replace($t, 'https://[A-Za-z0-9\-]+\.devtunnels\.ms\S*', 'https://<tunnel>.devtunnels.ms/...')
+    return $t
+}
 $ranViaSplash = $false
 try {
     if (-not $NoSplash) { $script:splash = Start-Splash }
@@ -1029,7 +1057,13 @@ if ($script:startupFailures.Count -gt 0) {
     Write-Host "=========================================================" -ForegroundColor Yellow
     Write-Host " Startup finished with $($script:startupFailures.Count) problem(s)" -ForegroundColor Yellow
     Write-Host "=========================================================" -ForegroundColor Yellow
-    foreach ($f in $script:startupFailures) { Write-Host "  - $f" -ForegroundColor Yellow }
+    foreach ($f in $script:startupFailures) { Write-Host ("  - " + (Hide-Secrets $f)) -ForegroundColor Yellow }
     Write-Host "  Run doctor.bat for the specific fix for each line." -ForegroundColor Yellow
     Write-Host ""
 }
+
+# WHERE TO LOOK, PRINTED EVERY TIME. Named whether or not anything failed, because the case
+# that needs it most -- "the chat window does not respond" -- produces no error here at all:
+# the bridge failed silently in a hidden process, and until now its message went nowhere.
+Write-Host ("  Logs: " + $script:diagDir) -ForegroundColor DarkGray
+Write-Host ("        supervisor: " + (Join-Path $env:TEMP 'm365-companion-supervisor.log')) -ForegroundColor DarkGray
