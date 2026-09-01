@@ -544,11 +544,39 @@ function Ensure-ConvenienceProvisioning {
     try {
         $setupDir = Join-Path $root ".setup"
         $markerPath = Join-Path $setupDir "convenience_provisioned"
-        if (Test-Path $markerPath) {
-            # Already provisioned once -- never touch it again, even if the user removed
-            # the icon or the autostart shortcut since.
+        # THE MARKER RECORDS A DECISION, NOT AN ACT -- and its ABSENCE is not consent.
+        #
+        # This used to provision both whenever the marker was missing, so a machine that had
+        # never been asked got a Desktop shortcut and a logon autostart entry anyway. Worse,
+        # quickstart.bat asked "Create a launcher? [Y/n]" AFTERWARDS, so the question was put
+        # to someone whose answer could no longer matter: saying no changed nothing, and the
+        # autostart registration was never mentioned at all. Both are changes OUTSIDE this
+        # folder, and both persist after the repo is deleted.
+        #
+        # quickstart.bat now asks first and writes the answers here as
+        #   shortcut=yes|no
+        #   autostart=yes|no
+        # With no file there is no decision, and with no decision nothing is created.
+        if (-not (Test-Path $markerPath)) {
+            Write-Host "[provision] no consent on record -- creating nothing."
+            Write-Host "[provision] run quickstart.bat to be asked, or scripts\make_desktop_shortcut.ps1"
+            Write-Host "[provision] and scriptsegister-supervisor.ps1 to do either by hand."
             return
         }
+
+        $decision = @{}
+        foreach ($line in (Get-Content $markerPath -ErrorAction SilentlyContinue)) {
+            if ($line -match '^\s*([A-Za-z_]+)\s*=\s*(\S+)\s*$') { $decision[$matches[1]] = $matches[2] }
+        }
+        # An older marker holds the single word "provisioned": that machine was already
+        # provisioned under the previous behaviour, so re-doing it would fight the user. Treat
+        # it as "both already handled, touch nothing" rather than re-asking or re-creating.
+        if ($decision.Count -eq 0) { return }
+
+        $wantShortcut  = ($decision['shortcut']  -eq 'yes')
+        $wantAutostart = ($decision['autostart'] -eq 'yes')
+        if (-not $wantShortcut -and -not $wantAutostart) { return }
+
         if (-not (Test-Path $setupDir)) {
             New-Item -ItemType Directory -Path $setupDir -Force | Out-Null
         }
@@ -556,7 +584,7 @@ function Ensure-ConvenienceProvisioning {
         # a) Desktop shortcut. make_desktop_shortcut.ps1 is idempotent (overwrites), so running
         #    it here is harmless even on a machine where it was already created by hand/quickstart.
         $shortcutScript = Join-Path $scriptDir "make_desktop_shortcut.ps1"
-        if (Test-Path $shortcutScript) {
+        if ($wantShortcut -and (Test-Path $shortcutScript)) {
             try {
                 Start-Process powershell -WindowStyle Hidden -Wait -ArgumentList @(
                     "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $shortcutScript
@@ -570,7 +598,7 @@ function Ensure-ConvenienceProvisioning {
         # b) Logon autostart. register-supervisor.ps1 is idempotent (re-creates the same Startup-
         #    folder shortcut), so running it here is harmless even on an already-registered machine.
         $autostartScript = Join-Path $scriptDir "register-supervisor.ps1"
-        if (Test-Path $autostartScript) {
+        if ($wantAutostart -and (Test-Path $autostartScript)) {
             try {
                 Start-Process powershell -WindowStyle Hidden -Wait -ArgumentList @(
                     "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $autostartScript
@@ -584,9 +612,8 @@ function Ensure-ConvenienceProvisioning {
         # Write the marker AFTER attempting both, regardless of whether either one succeeded --
         # this is a single best-effort attempt, not a retry-every-startup nag. No personal path or
         # username is recorded, just a generic tag.
-        try {
-            "provisioned" | Out-File -FilePath $markerPath -Encoding ascii -Force
-        } catch { }
+        # NOT overwritten here any more: this file is the record of what the person chose,
+        # and stamping it with "provisioned" would erase that answer.
     } catch {
         # Convenience provisioning is best-effort only; it must never affect startup.
     }
