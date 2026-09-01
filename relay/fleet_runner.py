@@ -1449,6 +1449,25 @@ def main():
     # here (right after argparse) so it covers argparse-error exits too, regardless of
     # which launcher started this process. Best-effort -- never crashes on failure.
     _setup_coordinator_log(args.state_dir)
+
+    # RETENTION RUNS ONCE, HERE, AND NOT ON A TIMER -- the same reasoning as the session
+    # store's pass: a sweep that can fire mid-run is a sweep that can delete the transcript
+    # being written to. Placed AFTER the coordinator log is opened so this run's own log is
+    # already among the newest and can never be a candidate.
+    #
+    # Nothing here bounded .fleet before, and the shape of what it holds is the point: of
+    # 255 MB outside the session database, 185 MB was written in the last SEVEN DAYS. Age
+    # rules reach the tail of that, not the bulk -- roughly 47 MB. The rest is write rate,
+    # about 26 MB a day, which retention cannot fix and this comment should not pretend it
+    # does.
+    try:
+        from relay import fleet_retention
+        _ret = fleet_retention.apply(fleet_dir=args.state_dir)
+        if _ret.get("freed_bytes"):
+            print("fleet retention: freed %.1f MB" % _ret["freed_mb"], flush=True)
+    except Exception as _exc:                     # never let housekeeping stop a run
+        print("fleet retention skipped: %s" % _exc, flush=True)
+
     # let the KeyboardInterrupt handler at the bottom of this file clear the ACTIVE
     # marker even though it runs outside main()'s local scope.
     global _ACTIVE_STATE_DIR
