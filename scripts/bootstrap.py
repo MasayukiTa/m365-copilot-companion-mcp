@@ -37,6 +37,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Repo root = parent of this scripts/ dir. Everything is resolved against it so
@@ -159,8 +160,43 @@ def is_done(state: dict, name: str) -> bool:
 # --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
+#: Everything printed also lands here, so a console window that vanishes does not take the
+#: evidence with it.
+#:
+#: WHY. An operator on a fresh machine reported "the command prompt fell over and re-running
+#: still dies partway", and there was nothing to read: the window was gone. Every exit path in
+#: quickstart.bat and setup.bat pauses, so a clean failure holds the window -- which means what
+#: they saw was an ABNORMAL termination, and that is precisely the case where the on-screen
+#: output is the only record and is lost. A transcript costs nothing and is the difference
+#: between diagnosing this and guessing at it, which is what happened for two rounds.
+TRANSCRIPT = ROOT / ".setup" / "bootstrap.log"
+
+
+def _transcribe(msg: str) -> None:
+    """Append one line to the transcript. NEVER raises: a logging call has taken a run down in
+    this project before, and a transcript that can kill the thing it is recording is worse than
+    no transcript."""
+    try:
+        TRANSCRIPT.parent.mkdir(parents=True, exist_ok=True)
+        with open(TRANSCRIPT, "a", encoding="utf-8") as fh:
+            fh.write("%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg) + chr(10))
+    except Exception:
+        pass
+
+
 def log(msg: str) -> None:
-    print(msg, flush=True)
+    # The console first: encode-safe, because this console is cp932 and a print() that raises
+    # UnicodeEncodeError has ended a long run here before. The transcript is written whatever
+    # the console can display, so a character the console cannot show is still recorded.
+    try:
+        print(msg, flush=True)
+    except Exception:
+        try:
+            enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(msg.encode(enc, "replace").decode(enc, "replace"), flush=True)
+        except Exception:
+            pass
+    _transcribe(msg)
 
 
 def _call_step(fn, state: dict, state_file: Path) -> None:
@@ -1082,4 +1118,24 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    # SAY WHERE THE RECORD IS, FIRST. An operator whose window vanished has nothing to read
+    # and nothing to send; the path has to be on screen before anything can go wrong, not
+    # printed at the end where a crash never reaches it.
+    log("Transcript: %s" % TRANSCRIPT)
+
+    # AN UNHANDLED TRACEBACK IS THE CASE THIS IS FOR. ActionNeeded and StepError already go
+    # through log() and therefore into the transcript; a crash does not, and a crash is exactly
+    # what leaves an operator saying "it fell over" with no evidence. Record it, then re-raise
+    # so the exit code and the console output are unchanged.
+    def _record_crash(exc_type, exc, tb):
+        import traceback
+        try:
+            _transcribe("UNHANDLED %s: %s" % (exc_type.__name__, exc))
+            for line in traceback.format_exception(exc_type, exc, tb):
+                _transcribe(line.rstrip())
+        except Exception:
+            pass
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = _record_crash
     sys.exit(main())

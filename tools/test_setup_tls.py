@@ -184,3 +184,56 @@ def test_removing_a_venv_survives_read_only_files():
     i = src.index('shutil.rmtree(ROOT / ".venv"')
     assert "onerror=" in src[i:i + 120]
     assert "S_IWRITE" in src
+
+
+# -- the window that vanishes ------------------------------------------------------------------
+
+def _boot():
+    return io.open(os.path.join(REPO, "scripts", "bootstrap.py"), encoding="utf-8").read()
+
+
+def test_everything_printed_is_also_written_to_a_transcript():
+    """An operator on a fresh machine reported "the command prompt fell over and re-running
+    still dies partway", and there was nothing to read -- the window was gone. Every exit path
+    in quickstart.bat and setup.bat pauses, so a clean failure HOLDS the window; what they saw
+    was an abnormal termination, which is exactly the case where the on-screen output is the
+    only record and is lost. Two rounds were then spent guessing."""
+    src = _boot()
+    i = src.index("def log(msg: str)")
+    assert "_transcribe(msg)" in src[i:i + 900]
+    assert "TRANSCRIPT" in src
+
+
+def test_an_unhandled_crash_reaches_the_transcript():
+    """ActionNeeded and StepError already go through log(). A crash does not -- and a crash is
+    precisely what leaves someone saying "it fell over" with no evidence."""
+    src = _boot()
+    assert "sys.excepthook" in src
+    assert "UNHANDLED" in src
+    assert "format_exception" in src
+
+
+def test_the_transcript_path_is_announced_before_anything_can_fail():
+    """Printed at the end, a crash never reaches it."""
+    src = _boot()
+    i = src.index('if __name__ == "__main__"')
+    tail = src[i:]
+    assert tail.index("Transcript:") < tail.index("sys.exit(main())")
+
+
+def test_the_transcript_cannot_kill_the_run_it_records():
+    """A logging call has taken a run down in this project before -- a cp932 console and a
+    print() that raised UnicodeEncodeError, eight minutes into a forty-instance benchmark."""
+    src = _boot()
+    i = src.index("def _transcribe")
+    body = src[i:i + 700]
+    assert "except Exception:" in body and "pass" in body
+
+
+def test_the_console_write_is_encode_safe():
+    """The transcript is written whatever the console can display, so a character the console
+    cannot show is still recorded rather than ending the run."""
+    src = _boot()
+    i = src.index("def log(msg: str)")
+    body = src[i:i + 900]
+    assert "replace" in body and "sys.stdout" in body
