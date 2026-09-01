@@ -114,7 +114,13 @@ NON_IDENTIFYING_USERS = {"public", "default", "defaultuser", "example", "test", 
                          # contain a home-shaped path to assert anything. Naming it here
                          # beats exempting the file, which would stop checking a real
                          # file for real identifiers.
-                         "someone", "somebody", "anyone",
+                         # ONLY "someone". "somebody" and "anyone" were added with it on
+                         # the assumption that a placeholder list wants every synonym --
+                         # and "somebody" is the identifying example in this checker's
+                         # OWN test, so listing it made the check stop finding the thing
+                         # the test proves it finds. Add a name here when a real file
+                         # needs it, not in anticipation.
+                         "someone",
                          "<user>", "<home>", "<you>", "<name>",
                          "...", "\\...", "x", "me"}
 
