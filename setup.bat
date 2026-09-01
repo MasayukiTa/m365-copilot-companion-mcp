@@ -38,7 +38,10 @@ REM without the bundle -- the same 'guard on one path only' shape this whole fix
 for /f "usebackq delims=" %%B in (`powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\ca_bundle.ps1" 2^>nul`) do set "CABUNDLE=%%B"
 if defined CABUNDLE (
     echo Using this machine's trusted roots: !CABUNDLE!
+    REM Both spellings: newer uv deprecates UV_NATIVE_TLS in favour of UV_SYSTEM_CERTS, and
+    REM older uv does not know the new one. Setting both keeps either version working.
     set "UV_NATIVE_TLS=1"
+    set "UV_SYSTEM_CERTS=1"
     if not defined SSL_CERT_FILE set "SSL_CERT_FILE=!CABUNDLE!"
     if not defined REQUESTS_CA_BUNDLE set "REQUESTS_CA_BUNDLE=!CABUNDLE!"
     if not defined CURL_CA_BUNDLE set "CURL_CA_BUNDLE=!CABUNDLE!"
@@ -46,6 +49,7 @@ if defined CABUNDLE (
 ) else (
     echo Could not export the machine's root certificates; continuing with uv's own.
     set "UV_NATIVE_TLS=1"
+    set "UV_SYSTEM_CERTS=1"
 )
 
 
@@ -117,7 +121,11 @@ REM "uv venv" -- which failed for the same reason -- and the operator was shown 
 REM message about the second failure and none about the first.
 if errorlevel 1 goto :uv_failed
 if not exist ".venv\Scripts\python.exe" (
-    "!UVEXE!" venv .venv
+    REM --seed installs pip into the venv. Without it uv creates a perfectly good venv
+    REM with NO pip, and the bootstrap's health probe reads that as "broken" and tries to
+    REM delete it -- which is how a fresh machine ended up being told to remove .venv by
+    REM hand, for a venv that was working.
+    "!UVEXE!" venv --seed .venv
 )
 if exist ".venv\Scripts\python.exe" (
     set "PYEXE=.venv\Scripts\python.exe"

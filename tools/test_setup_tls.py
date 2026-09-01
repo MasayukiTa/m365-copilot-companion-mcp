@@ -147,3 +147,40 @@ def test_the_certificates_are_set_up_for_every_route_not_just_uv():
 
 def test_it_still_runs_before_uv():
     assert BAT.index("ca_bundle.ps1") < BAT.index('"!UVEXE!" python install')
+
+
+# -- the failure that surfaced once TLS was fixed --------------------------------------------
+
+def test_the_venv_is_created_with_pip():
+    """`uv venv` does NOT seed pip. Without --seed it produces a perfectly good venv with no
+    pip, the bootstrap's health probe reads that as "broken", tries to DELETE it, fails with
+    WinError 5, and tells the operator to remove .venv by hand -- for a venv that was
+    working."""
+    assert "venv --seed .venv" in BAT
+
+
+def test_both_spellings_of_the_system_certs_flag_are_set():
+    """Newer uv deprecates UV_NATIVE_TLS in favour of UV_SYSTEM_CERTS and warns about it;
+    older uv does not know the new name. Setting both keeps either version working."""
+    assert BAT.count("UV_SYSTEM_CERTS=1") >= 2
+    assert BAT.count("UV_NATIVE_TLS=1") >= 2
+
+
+def test_a_pip_less_venv_is_repaired_rather_than_destroyed():
+    """Destroying a working venv over a missing package is disproportionate, and it is what
+    ended the run on a fresh machine. Healthy means the interpreter RUNS."""
+    src = io.open(os.path.join(REPO, "scripts", "bootstrap.py"), encoding="utf-8").read()
+    assert "_seed_pip" in src and "ensurepip" in src
+    i = src.index("def _venv_is_healthy")
+    body = src[i:i + 1400]
+    assert "_venv_runs()" in body, "health is no longer decided by whether the interpreter runs"
+    assert "_seed_pip()" in body, "a pip-less venv is no longer repaired"
+
+
+def test_removing_a_venv_survives_read_only_files():
+    """The delete failed with WinError 5. Windows marks files read-only and rmtree cannot
+    unlink those -- the same defect already fixed once in the benchmark's worktree cleanup."""
+    src = io.open(os.path.join(REPO, "scripts", "bootstrap.py"), encoding="utf-8").read()
+    i = src.index('shutil.rmtree(ROOT / ".venv"')
+    assert "onerror=" in src[i:i + 120]
+    assert "S_IWRITE" in src
