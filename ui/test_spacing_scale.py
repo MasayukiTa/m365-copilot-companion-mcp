@@ -29,7 +29,11 @@ SOURCES = sorted(UI.glob("*.cs"))
 OPTICAL_MAX = 7
 
 #: Every spacing value in use, as measured. May shrink. Adding to it is a decision, not a fix.
-IN_USE = {0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 28, 32, 36, 40, 80}
+#: 0.6 is the gap between the rate sparkline's bars. Sixty minutes are drawn in a header
+#: strip at 1.6px per bar, so the gap is genuinely sub-pixel: at 1 the hour would be 24px
+#: wider and stop fitting beside the chips. Added deliberately, per the note above, rather
+#: than rounded away -- this is optical, not layout.
+IN_USE = {0, 0.6, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 28, 32, 36, 40, 80}
 
 THICKNESS = re.compile(r"new Thickness\(([^)]*)\)")
 NUMBER = re.compile(r"\d+(\.\d+)?$")
