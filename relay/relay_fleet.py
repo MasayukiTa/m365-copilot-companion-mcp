@@ -2446,6 +2446,17 @@ class RelayWorker:
         # When this turn went out. The lock fallback below compares the server's refusal
         # record against it, so only a refusal caused BY THIS TURN counts.
         self._turn_sent_at = time.time()
+        # THE QUOTA IS SPENT HERE, and this is the only place it is spent. Microsoft's
+        # generative-orchestration limit counts MESSAGES, not the MCP tool calls our gateway
+        # sees -- a turn may make none of those, or several, so the tool ledger was never the
+        # right meter. Recorded at the send, not at admission: a worker editing files for ten
+        # minutes holds a slot and spends nothing.
+        try:
+            from relay import quota_meter as _qm
+            _qm.record_turn(worker=getattr(self, "name", ""), conv=getattr(self, "conv_url", ""),
+                            ts=self._turn_sent_at)
+        except Exception:
+            pass
         # a send actually went through -> reset BOTH the generation-wait count and the
         # wall-clock streak stamp so the next slow turn gets a fresh full patience budget.
         self.gen_waits = 0
@@ -3101,6 +3112,17 @@ class RelayWorker:
                 # ONE WORKER'S REFUSAL IS EVIDENCE ABOUT ALL OF THEM: the quota is shared, so
                 # this also widens the interval at which further workers are admitted.
                 note_upstream_throttle(now)
+                # RECORDED AS ITS OWN CLASS. A rate refusal is a capacity signal; a transport
+                # drop and a content refusal are not, and a controller that cannot tell them
+                # apart learns to back off from labels that have nothing to do with load. This
+                # is also the number that tells the gauge its reference line is the wrong one:
+                # refusals arriving while headroom looks comfortable mean the binding limit is
+                # not the published one.
+                try:
+                    from relay import quota_meter as _qm
+                    _qm.record_refusal("rate", worker=getattr(self, "name", ""), ts=now)
+                except Exception:
+                    pass
                 if self._throttle_ts <= 0.0:
                     self._throttle_ts = now
                 self._throttle_streak += 1

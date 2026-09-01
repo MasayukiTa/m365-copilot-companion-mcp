@@ -8856,8 +8856,168 @@ class CockpitWindow : Window
             metaTb.VerticalAlignment = VerticalAlignment.Center;
             metaTb.Margin = new Thickness(4, 0, 0, 0);
             _subChips.Children.Add(metaTb);
+            // THE THIRD GATE, ON THE ROW WHERE THE OTHER FACTS ALREADY LIVE. Disk and RAM have
+            // had gauges for months. The limit that actually stopped a run -- 217 turns refused
+            // out of 237 -- had none, so a fleet grinding to a halt looked like a fleet being
+            // slow and the stop had no explanation anyone could point at.
+            var rate = BuildRateStrip(root, ja2);
+            if (rate != null) _subChips.Children.Add(rate);
             _subChips.ToolTip = _sub.Text;   // same fallback sentence, shown on hover over the chip row
         }
+    }
+
+
+    // ── The Copilot rate-limit strip ──────────────────────────────────────────────────────
+    //
+    // WHY IT EXISTS. A dense run had 217 of its 237 turns refused and nothing on this screen
+    // said so. Disk and RAM gates have been drawn for months; the quota that actually stopped
+    // the run was invisible, so "the fleet is slow" and "the fleet is being refused" looked
+    // identical to whoever was watching. This sits on the header row beside the counts and the
+    // clocks, because that is where someone already looks to ask how the run is going.
+    //
+    // WHAT IT DRAWS, AND THE UNIT MATTERS. Turns per minute -- generative messages, which is
+    // what Microsoft publishes a limit for. NOT the MCP tool calls our own gateway sees: a turn
+    // may make none of those or several, and measuring the number we happened to have is how
+    // the first headroom estimate came out wrong by an unknown factor.
+    //
+    // THE LINE IS A REFERENCE, NOT A PROMISE. 100/minute is the documented Microsoft 365
+    // Copilot row, scoped per Dataverse environment, and Microsoft says downstream services may
+    // impose lower ones. Refusals are therefore shown BESIDE the bar and never derived from it:
+    // refusals arriving while the bar looks comfortable mean the line is the wrong line, which
+    // is a finding rather than a contradiction the panel should hide.
+    UIElement BuildRateStrip(Dictionary<string, object> root, bool ja)
+    {
+        if (root == null) return null;
+        object qRaw;
+        if (!root.TryGetValue("quota", out qRaw)) return null;
+        var q = qRaw as Dictionary<string, object>;
+        if (q == null) return null;
+
+        int rpm = I(q, "rpm");
+        int rph = I(q, "rph");
+        int refusals = I(q, "refusals_5m");
+        double limitRpm = 100.0, pct = 0.0;
+        try { limitRpm = Convert.ToDouble(q["limit_rpm"]); } catch { }
+        try { pct = Convert.ToDouble(q["pct_rpm"]); } catch { }
+        bool measured = false;
+        object mRaw;
+        if (q.TryGetValue("measured", out mRaw) && mRaw != null)
+        { try { measured = Convert.ToBoolean(mRaw); } catch { } }
+
+        var row = new StackPanel();
+        row.Orientation = Orientation.Horizontal;
+        row.VerticalAlignment = VerticalAlignment.Center;
+        row.Margin = new Thickness(18, 0, 0, 0);
+
+        var lbl = new TextBlock();
+        lbl.Text = ja ? "レート" : "rate";
+        lbl.Foreground = Theme.Br(Theme.Faint(_dark));
+        lbl.FontSize = 11;
+        lbl.VerticalAlignment = VerticalAlignment.Center;
+        lbl.Margin = new Thickness(0, 0, 6, 0);
+        row.Children.Add(lbl);
+
+        // The reading. "--" when nothing has been measured: an empty meter and a quiet one look
+        // identical as a number, and only one of them means there is headroom.
+        var val = new TextBlock();
+        val.FontSize = 11.5;
+        val.FontWeight = FontWeights.SemiBold;
+        val.Foreground = Theme.Br(Theme.Text(_dark));
+        val.VerticalAlignment = VerticalAlignment.Center;
+        val.Text = measured ? (rpm + "/" + ((int)limitRpm)) : "--";
+        row.Children.Add(val);
+
+        var per = new TextBlock();
+        per.Text = ja ? " /分" : " /min";
+        per.Foreground = Theme.Br(Theme.Faint(_dark));
+        per.FontSize = 10;
+        per.VerticalAlignment = VerticalAlignment.Center;
+        per.Margin = new Thickness(0, 0, 8, 0);
+        row.Children.Add(per);
+
+        // A short bar so the proportion reads without arithmetic.
+        var track = new Border();
+        track.Width = 54; track.Height = 5;
+        track.CornerRadius = new CornerRadius(2.5);
+        track.Background = Theme.Br(Theme.Border(_dark));
+        track.VerticalAlignment = VerticalAlignment.Center;
+        track.Margin = new Thickness(0, 0, 8, 0);
+        var holder = new Grid();
+        holder.HorizontalAlignment = HorizontalAlignment.Left;
+        var fill = new Border();
+        fill.Height = 5;
+        fill.CornerRadius = new CornerRadius(2.5);
+        fill.HorizontalAlignment = HorizontalAlignment.Left;
+        fill.Background = new SolidColorBrush(
+            pct >= 85 ? Color.FromRgb(0xD9, 0x4A, 0x38)
+          : pct >= 60 ? Color.FromRgb(0xE0, 0x9B, 0x2D)
+                      : Color.FromRgb(0x3F, 0xA5, 0x6B));
+        fill.Width = measured ? Math.Max(1.5, Math.Min(54.0, 54.0 * pct / 100.0)) : 0.0;
+        holder.Children.Add(fill);
+        track.Child = holder;
+        row.Children.Add(track);
+
+        // THE LAST HOUR, so a BURST is visible. A single number cannot show one, and a burst is
+        // exactly what trips a per-minute limit while the hourly total still looks fine.
+        object sRaw;
+        if (q.TryGetValue("series_rpm", out sRaw) && sRaw is object[])
+        {
+            object[] series = (object[])sRaw;
+            int peak = 1;
+            for (int i = 0; i < series.Length; i++)
+            {
+                int v = 0;
+                try { v = Convert.ToInt32(series[i]); } catch { }
+                if (v > peak) peak = v;
+            }
+            double scale = Math.Max((double)peak, limitRpm);
+            var spark = new StackPanel();
+            spark.Orientation = Orientation.Horizontal;
+            spark.Height = 14;
+            spark.VerticalAlignment = VerticalAlignment.Center;
+            spark.Margin = new Thickness(0, 0, 8, 0);
+            for (int i = 0; i < series.Length; i++)
+            {
+                int v = 0;
+                try { v = Convert.ToInt32(series[i]); } catch { }
+                var bar = new Border();
+                bar.Width = 1.6;
+                bar.Margin = new Thickness(0, 0, 0.6, 0);
+                bar.VerticalAlignment = VerticalAlignment.Bottom;
+                bar.Height = (v <= 0) ? 1.0 : Math.Max(1.5, 14.0 * v / scale);
+                bar.Background = (v >= limitRpm)
+                    ? new SolidColorBrush(Color.FromRgb(0xD9, 0x4A, 0x38))
+                    : Theme.Br(Theme.Border(_dark));
+                spark.Children.Add(bar);
+            }
+            row.Children.Add(spark);
+        }
+
+        // REFUSALS, BESIDE THE BAR AND NEVER DERIVED FROM IT. This is the line that explains a
+        // stop: if it is non-zero the fleet is being refused, whatever the bar says.
+        if (refusals > 0)
+        {
+            var warn = new TextBlock();
+            warn.Text = ja ? ("拒否 " + refusals + " /5分") : (refusals + " refused /5m");
+            warn.Foreground = new SolidColorBrush(Color.FromRgb(0xD9, 0x4A, 0x38));
+            warn.FontSize = 11;
+            warn.FontWeight = FontWeights.SemiBold;
+            warn.VerticalAlignment = VerticalAlignment.Center;
+            row.Children.Add(warn);
+        }
+
+        string tip = measured
+            ? (ja
+               ? ("生成メッセージ " + rpm + " /分（公開上限 " + ((int)limitRpm) + "）、直近1時間 " + rph + " 件。\n"
+                  + "上限は Dataverse 環境単位の公開値で、下位サービスがより低い制限を課すことがあります。\n"
+                  + "余裕があるのに拒否が出ている場合、効いている制限は公開値ではありません。")
+               : ("generative messages " + rpm + "/min (published limit " + ((int)limitRpm) + "), "
+                  + rph + " in the last hour.\nThe limit is the published per-Dataverse-environment "
+                  + "figure; downstream services may impose lower ones.\nRefusals with headroom to "
+                  + "spare mean the binding limit is not the published one."))
+            : (ja ? "まだ1ターンも計測していません。" : "no turns measured yet.");
+        row.ToolTip = tip;
+        return row;
     }
 
     // Roll seconds up through y/d/h/m/s so a long run reads "1h39m27s" / "1d1h1m1s" instead of
