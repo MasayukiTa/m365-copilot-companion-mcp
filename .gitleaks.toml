@@ -1,0 +1,37 @@
+# Gitleaks configuration.
+#
+# The history scan added alongside the tree scan immediately found something, which is the
+# point of adding it -- but what it found is two constants that are hashes BY DESIGN.
+#
+# scripts/bootstrap.py and scripts/setup_devtunnel.ps1 carry a blocklist of tunnel names that
+# would leak an identifying token into the global devtunnels.ms namespace. The blocklist is
+# stored as SHA-256 of the lowercased value, deliberately, so that the file guarding against
+# the leak cannot itself contain the thing being leaked. gitleaks' generic-api-key rule sees a
+# 64-character hex literal and cannot tell a published digest from a key.
+#
+# The working tree already marks these with an inline `# gitleaks:allow`. History cannot be
+# annotated after the fact -- the older commits were written before the comment existed -- so
+# the two VALUES are allowlisted here by exact match.
+#
+# Exact literals, not a pattern. An allowlist for `TOKEN_SHA256\s*=\s*"[a-f0-9]{64}"` would
+# excuse any future 64-hex constant assigned to a similarly-named variable, which is precisely
+# the shape a real key would take. These two strings are public digests and nothing else is
+# covered.
+
+title = "m365-copilot-companion-mcp"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = """
+SHA-256 digests of the identifying-tunnel-name blocklist. Public by construction: the plaintext
+is intentionally absent from the repository and only its hash is stored, so these values are the
+mechanism that PREVENTS a leak rather than an instance of one. Mirrored in bootstrap.py and
+setup_devtunnel.ps1, which are kept in sync.
+"""
+regexTarget = "match"
+regexes = [
+  '''2a0341296bb96dc7d205036f9f693427809772f6136a46f58b04a1c492de9e04''',
+  '''5ba174b8e87faf4e8106e36a7cf5a901bbec3435d01fbd56914c2b0346858261''',
+]

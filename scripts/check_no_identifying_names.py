@@ -108,6 +108,13 @@ HOME_SHAPE = re.compile(r"[A-Za-z]:[\\/]{1,2}Users[\\/]{1,2}([A-Za-z0-9_.~<>-]+)
 #: account is called.
 NON_IDENTIFYING_USERS = {"public", "default", "defaultuser", "example", "test", "testuser",
                          "user", "username", "name", "hostedtoolcache",
+                         # "someone" is the same kind of placeholder as "user" and
+                         # "example", and its absence failed this check on a test whose
+                         # whole subject is redacting home paths -- that test HAS to
+                         # contain a home-shaped path to assert anything. Naming it here
+                         # beats exempting the file, which would stop checking a real
+                         # file for real identifiers.
+                         "someone", "somebody", "anyone",
                          "<user>", "<home>", "<you>", "<name>",
                          "...", "\\...", "x", "me"}
 
