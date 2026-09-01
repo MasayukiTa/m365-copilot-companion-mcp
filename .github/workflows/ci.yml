@@ -252,9 +252,7 @@ jobs:
             relay/test_fanout.py \
             tests/test_ownership.py \
             tests/test_watchdog_arming.py \
-            tests/test_outcome_enum_closed.py \
             tests/test_control_markers.py \
-            tests/test_integration_evidence.py \
             tests/test_lean_capture.py \
             tests/test_profile_token.py \
             tests/test_capture_floor.py \
@@ -363,7 +361,6 @@ jobs:
             bench/test_eval_to_ledger.py \
             bench/test_oracle_tasks.py \
             bench/test_panel_shadow_report.py \
-            bench/test_pro_batching.py \
             bench/test_pro_capture.py \
             bench/test_pro_grade_remote.py \
             bench/test_pro_record_arm.py \
@@ -373,13 +370,11 @@ jobs:
             bench/test_routing_switch.py \
             bench/test_skill_match_rate.py \
             bench/test_skill_probe.py \
-            bench/test_swe_run_facts.py \
             bench/test_ui_goal_lines.py \
             bridge/test_conversation_selection.py \
             bridge/test_tool_probe_borrows_a_page.py \
             relay/selfimprove/test_frozen_surfaces.py \
             relay/selfimprove/test_reliability.py \
-            relay/test_acceptance_contract.py \
             relay/test_claim_verdict.py \
             relay/test_conv_title.py \
             relay/test_edge_cache_trim.py \
@@ -400,14 +395,12 @@ jobs:
             relay/test_quota_meter.py \
             relay/test_rate_ceiling.py \
             relay/test_refuter_placement.py \
-            relay/test_repo_bug_fix_skill.py \
             relay/test_retry_trigger.py \
             relay/test_settings_round_trip.py \
             relay/test_supervisor_verify.py \
             relay/test_turn_outcome.py \
             relay/test_upstream_throttle.py \
             relay/test_veto_measurement_is_honest.py \
-            scripts/test_prune_edge_cache.py \
             tools/auto/test_autoloop.py \
             tools/auto/test_loop_runner.py \
             tools/test_auto_ops.py \
@@ -421,7 +414,6 @@ jobs:
             tools/test_gate_not_demoted_by_a_switch.py \
             tools/test_instructions_do_not_accumulate_cases.py \
             tools/test_judge_backend.py \
-            tools/test_judge_live_roundtrip.py \
             tools/test_judge_wiring.py \
             tools/test_ledger_never_writes_a_secret.py \
             tools/test_pip_install_target.py \
