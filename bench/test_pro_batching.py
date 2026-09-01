@@ -536,3 +536,62 @@ def test_a_refused_oversize_patch_is_not_retried_forever(tmp_path, monkeypatch):
     assert "fine" in got
     assert "produced-too-much" in got, "an oversize refusal is still retried every run"
     assert "produced-nothing" not in got, "a genuine no-op must still be retried"
+
+
+# -- the graded ledger, which was never actually read ---------------------------------------
+
+def _results(tmp_path, monkeypatch, text):
+    p = tmp_path / "results.json"
+    p.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(C, "RESULTS", str(p))
+    return p
+
+
+def test_the_results_ledger_is_jsonl_and_is_read_as_such(tmp_path, monkeypatch):
+    """THE DEFECT. swe_grade_batch appends one object per line; this read the file with
+    json.load, which raises on line 2; _load caught ValueError and returned an empty dict.
+    Measured: four graded rows on disk and graded_ids() returning zero. The "do not re-measure
+    what is already scored" protection -- the one the module docstring names as how a benchmark
+    number drifts upward without anybody deciding to cheat -- was a no-op the whole time, and
+    it failed in the direction that looks like nothing is wrong."""
+    import json
+    _results(tmp_path, monkeypatch, "\n".join([
+        json.dumps({"instance_id": "a", "verdict": "RESOLVED"}),
+        json.dumps({"instance_id": "b", "verdict": "not"}),
+    ]))
+    assert C.graded_ids() == {"a", "b"}
+
+
+def test_an_evalerr_row_does_not_retire_an_instance(tmp_path, monkeypatch):
+    """EVALERR means the evaluation could not be RUN. Counting it would make the failure
+    permanent: the instance is skipped forever and can never be scored once the cause is gone."""
+    import json
+    _results(tmp_path, monkeypatch, "\n".join([
+        json.dumps({"instance_id": "a", "verdict": "RESOLVED"}),
+        json.dumps({"instance_id": "b", "verdict": "EVALERR", "note": "launch failed"}),
+    ]))
+    assert C.graded_ids() == {"a"}
+
+
+def test_a_torn_line_does_not_lose_the_rest_of_the_ledger(tmp_path, monkeypatch):
+    import json
+    _results(tmp_path, monkeypatch,
+             json.dumps({"instance_id": "a", "verdict": "RESOLVED"}) + "\n"
+             + '{"instance_id": "trunc\n'
+             + json.dumps({"instance_id": "c", "verdict": "not"}) + "\n")
+    assert C.graded_ids() == {"a", "c"}
+
+
+def test_the_other_shapes_are_still_accepted(tmp_path, monkeypatch):
+    """The file's format is not this function's decision to make, and a reader that only
+    understands the shape it happens to see is how this started."""
+    import json
+    _results(tmp_path, monkeypatch, json.dumps({"a": "RESOLVED", "b": "EVALERR"}))
+    assert C.graded_ids() == {"a"}
+    _results(tmp_path, monkeypatch, json.dumps([{"instance_id": "x", "verdict": "not"}]))
+    assert C.graded_ids() == {"x"}
+
+
+def test_a_missing_ledger_means_nothing_is_graded(tmp_path, monkeypatch):
+    monkeypatch.setattr(C, "RESULTS", str(tmp_path / "absent.json"))
+    assert C.graded_ids() == set()
