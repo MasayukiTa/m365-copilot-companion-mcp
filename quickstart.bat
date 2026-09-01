@@ -54,7 +54,7 @@ echo  STEP 2/7  Your secrets - copy these into your MCP client
 echo ===========================================================================
 if exist ".env" (
     for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
-        if /i "%%A"=="MCP_API_KEY" echo   Bearer token  (MCP_API_KEY)        : %%B
+        if /i "%%A"=="MCP_API_KEY" echo   Bearer token  ^(MCP_API_KEY^)        : %%B
         if /i "%%A"=="MCP_UNLOCK_PASSWORD" echo   Unlock password ^(MCP_UNLOCK_PASSWORD^): %%B
         if /i "%%A"=="MCP_UNLOCK_PASSWORD_PROTECTED" echo   Unlock password                  : ^<protected in .env; shown by setup when generated^>
     )
@@ -146,12 +146,12 @@ if not errorlevel 1 (
 if not defined SKIP56 (
     echo.
     echo ===========================================================================
-    echo  STEP 5/7  Copilot Studio  (the ONLY manual, by-hand step)
+    echo  STEP 5/7  Copilot Studio  ^(the ONLY manual, by-hand step^)
     echo ===========================================================================
     echo   Add an MCP connector in Copilot Studio, then create your companion agent.
-    echo   The 3 EXACT values to paste are printed below (full guide: README STEP 4):
+    echo   The 3 EXACT values to paste are printed below ^(full guide: README STEP 4^):
     echo.
-    echo   Opening Copilot Studio (https://copilotstudio.microsoft.com/) in your browser...
+    echo   Opening Copilot Studio ^(https://copilotstudio.microsoft.com/^) in your browser...
     start "" "https://copilotstudio.microsoft.com/"
     echo.
     powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\copilot_studio_values.ps1"
@@ -163,15 +163,15 @@ if not defined SKIP56 (
 
     echo.
     echo ===========================================================================
-    echo  STEP 6/7  Paste your agent URLs  (a dialog window opens)
+    echo  STEP 6/7  Paste your agent URLs  ^(a dialog window opens^)
     echo ===========================================================================
-    echo   Paste the agent URL(s) into the dialog and click Save. Leave blank any
+    echo   Paste the agent URL^(s^) into the dialog and click Save. Leave blank any
     echo   you do not have yet -- you can re-run configure_env.bat later to add them.
     echo.
     powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\configure_env.ps1"
 ) else (
     echo.
-    echo   Skipping STEP 5/6 (agent already configured). Jumping to STEP 7 launch.
+    echo   Skipping STEP 5/6 ^(agent already configured^). Jumping to STEP 7 launch.
 )
 
 echo.
