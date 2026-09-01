@@ -34,6 +34,7 @@ import platform
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -203,22 +204,63 @@ def find_executable(*names: str) -> str | None:
 # --------------------------------------------------------------------------- #
 # STEP: ensure_venv
 # --------------------------------------------------------------------------- #
-def _venv_is_healthy() -> bool:
-    """Probe the venv with a REAL command instead of trusting that python.exe
-    merely exists on disk. A venv whose python cannot even run 'pip --version'
-    (half-created, wrong Python moved/deleted, corrupt) would otherwise pass a
-    bare file-existence check and then 'install_deps' silently no-ops against
-    it. Returns True only if the probe command exits 0 within a short timeout."""
+def _venv_runs() -> bool:
+    """Can this venv's python execute at all? The question that decides whether it is BROKEN."""
     if not VENV_PYTHON.exists():
         return False
     try:
-        res = subprocess.run(
-            [str(VENV_PYTHON), "-m", "pip", "--version"],
-            capture_output=True, text=True, timeout=60,
-        )
+        res = subprocess.run([str(VENV_PYTHON), "-c", "import sys"],
+                             capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return False
     return res.returncode == 0
+
+
+def _venv_has_pip() -> bool:
+    if not VENV_PYTHON.exists():
+        return False
+    try:
+        res = subprocess.run([str(VENV_PYTHON), "-m", "pip", "--version"],
+                             capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return res.returncode == 0
+
+
+def _seed_pip() -> bool:
+    """Install pip into a venv that runs but has none. Returns whether it worked.
+
+    A VENV WITHOUT PIP IS NOT A BROKEN VENV. `uv venv` does not seed pip by default, so a venv
+    created by the uv bootstrap path is perfectly good and simply has no pip yet -- and the old
+    probe called that "broken" and tried to DELETE it. On a fresh machine that ended the run:
+    the delete failed with WinError 5 and the operator was told to remove .venv by hand, for a
+    venv that was working fine. Destroying something over a missing package is
+    disproportionate; installing the package is the proportionate answer.
+    """
+    try:
+        rc = subprocess.call([str(VENV_PYTHON), "-m", "ensurepip", "--upgrade"])
+        if rc == 0 and _venv_has_pip():
+            return True
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return False
+
+
+def _venv_is_healthy() -> bool:
+    """Probe the venv with a REAL command instead of trusting that python.exe merely exists on
+    disk. A venv whose python cannot run at all (half-created, wrong Python moved or deleted,
+    corrupt) would otherwise pass a bare file-existence check and then "install_deps" silently
+    no-ops against it.
+
+    HEALTHY MEANS THE INTERPRETER RUNS. Missing pip is repaired, not treated as corruption --
+    see _seed_pip for what that mistake cost on a fresh machine.
+    """
+    if not _venv_runs():
+        return False
+    if _venv_has_pip():
+        return True
+    log("    .venv has no pip (uv creates it that way); seeding with ensurepip")
+    return _seed_pip()
 
 
 def step_ensure_venv(state: dict | None = None, state_file: Path = STATE_FILE) -> None:
@@ -241,13 +283,21 @@ def step_ensure_venv(state: dict | None = None, state_file: Path = STATE_FILE) -
                 log("    (cleared install_deps checkpoint so dependencies reinstall)")
                 save_state(state, state_file)
         # Remove the broken tree so 'python -m venv' can rebuild cleanly.
-        try:
-            shutil.rmtree(ROOT / ".venv")
-        except OSError as e:
+        # Windows marks some files read-only and rmtree cannot unlink those, so a plain call
+        # fails with WinError 5 and the run ends. Clear the bit and retry before giving up.
+        def _force(func, path, _exc):
+            try:
+                os.chmod(path, stat.S_IWRITE)
+                func(path)
+            except OSError:
+                pass
+
+        shutil.rmtree(ROOT / ".venv", onerror=_force)
+        if (ROOT / ".venv").exists():
             raise ActionNeeded(
-                "The existing .venv is broken and could not be removed "
-                "automatically (%s). Delete the .venv folder in the repo root by "
-                "hand, then re-run quickstart.bat (or setup.bat)." % e
+                "The existing .venv could not be removed automatically. Delete the .venv "
+                "folder in the repo root by hand, then re-run quickstart.bat (or setup.bat). "
+                "If a file is locked, close any editor or terminal that is using it first."
             )
 
     # setup.bat normally creates the venv (via uv or python -m venv) before we
