@@ -141,13 +141,33 @@ if (-not (Get-Command devtunnel -ErrorAction SilentlyContinue)) {
         # Download to a temporary payload file; we validate the bytes before trusting it as the exe.
         # Some corporate networks do TLS interception which breaks certificate trust; on such an error
         # we retry once through the system default proxy with the user's default credentials.
+        # PowerShell 5.1 does not necessarily negotiate TLS 1.2 by default, and the download
+        # host requires it. Stated here rather than inherited from whatever the default is.
+        try {
+            [Net.ServicePointManager]::SecurityProtocol =
+                [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        } catch { }
+
+        # setup.bat already exported this machine's trusted roots for exactly this network.
+        # Using them here too means one export serves every fetch in the bootstrap instead of
+        # each script discovering the problem separately.
+        $caBundle = Join-Path (Split-Path -Parent $PSScriptRoot) ".setup\ca-bundle.pem"
+        if ((Test-Path $caBundle) -and -not $env:SSL_CERT_FILE) {
+            $env:SSL_CERT_FILE = $caBundle
+            $env:REQUESTS_CA_BUNDLE = $caBundle
+        }
+
         $downloaded = $false
         try {
             Invoke-WebRequest -UseBasicParsing -Uri $dlUri -OutFile $payload -TimeoutSec 120
             $downloaded = $true
         } catch {
             $msg = "$($_.Exception.Message) $($_.Exception.InnerException.Message)"
-            if ($msg -match 'certificate|trust relationship|SSL|TLS') {
+            # 407 IS THE COMMON CORPORATE FAILURE AND WAS NOT IN THIS LIST. The retry existed
+            # only for certificate errors, so proxy authentication -- the case the retry is
+            # actually for, since it sends default credentials -- fell straight through to
+            # exit 1. Retrying is cheap; not retrying cost the whole install.
+            if ($msg -match 'certificate|trust relationship|SSL|TLS|407|proxy|Proxy Authentication|Unauthorized|Forbidden') {
                 Write-Host "      first download attempt hit a certificate/TLS error -> retrying via the system proxy..."
                 try {
                     $proxyUri = [System.Net.WebRequest]::DefaultWebProxy.GetProxy([Uri]$dlUri)
@@ -199,6 +219,31 @@ if (-not (Get-Command devtunnel -ErrorAction SilentlyContinue)) {
                 if ($found) { Copy-Item -LiteralPath $found.FullName -Destination $exe -Force }
             }
         } else {
+            # IT MUST LOOK LIKE A WINDOWS EXECUTABLE. This branch used to rename WHATEVER had
+            # been downloaded to devtunnel.exe -- so a proxy block page, served as HTTP 200 with
+            # text/html, became the binary and was then added to the user's PATH for good. A
+            # PE image starts with "MZ"; an HTML page does not.
+            $looksExe = $false
+            try {
+                $fs2 = [System.IO.File]::OpenRead($payload)
+                try {
+                    $mz = New-Object byte[] 2
+                    $m = $fs2.Read($mz, 0, 2)
+                    if ($m -eq 2 -and $mz[0] -eq 0x4D -and $mz[1] -eq 0x5A) { $looksExe = $true }
+                } finally { $fs2.Close() }
+            } catch { }
+            if (-not $looksExe) {
+                $head = ""
+                try { $head = (Get-Content -LiteralPath $payload -TotalCount 1 -ErrorAction SilentlyContinue) } catch { }
+                Remove-Item -LiteralPath $payload -Force -ErrorAction SilentlyContinue
+                Write-Host "      ERROR: what was downloaded is not a Windows program."
+                Write-Host "      This is almost always a proxy sign-in or block page returned instead of the file."
+                Write-Host "      First line of it: $head"
+                Write-Host "      Nothing was installed and your PATH was not changed."
+                Write-Host "      Ask IT (or use another PC) to download devtunnel for Windows x64, save it as"
+                Write-Host "      %LOCALAPPDATA%\devtunnel\devtunnel.exe, then run quickstart.bat again."
+                exit 1
+            }
             if (Test-Path $exe) { Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue }
             Rename-Item -LiteralPath $payload -NewName "devtunnel.exe" -Force
         }
@@ -210,23 +255,37 @@ if (-not (Get-Command devtunnel -ErrorAction SilentlyContinue)) {
             exit 1
         }
 
-        $env:Path = "$dir;$env:Path"
-        $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-        if ($userPath -notlike "*$dir*") { [Environment]::SetEnvironmentVariable("Path", "$dir;$userPath", "User") }
-        Write-Host "      installed devtunnel.exe -> $dir  (added to your PATH; new terminals pick it up)"
-
-        # Verify the binary actually runs before we go anywhere near sign-in.
+        # PROVE IT RUNS, THEN PERSIST. The order was the other way round: PATH was extended
+        # permanently and only afterwards was the binary tried. When the check failed the bogus
+        # file stayed on disk and the PATH entry stayed with it, so the next run saw
+        # "already installed", skipped the download, and burned two minutes waiting for a
+        # sign-in that could not happen. Nothing outside this folder changes until it works.
         $verOk = $false
         try {
             $ver = (& $exe --version 2>&1 | Out-String).Trim()
             if ($LASTEXITCODE -eq 0 -and $ver) { $verOk = $true }
         } catch { $verOk = $false }
         if (-not $verOk) {
-            Write-Host "      ERROR: the downloaded devtunnel.exe did not run ('$exe --version' failed)."
-            Write-Host "      Delete %LOCALAPPDATA%\devtunnel\devtunnel.exe and run quickstart.bat again; if it still fails,"
-            Write-Host "      ask IT (or use another PC) to download devtunnel for Windows x64 to that same path."
+            # LEAVE NOTHING BEHIND. A file that does not run must not be there to be mistaken
+            # for an installation on the next attempt.
+            Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
+            Write-Host "      ERROR: the downloaded devtunnel.exe did not run."
+            Write-Host "      It has been removed and your PATH was not changed, so the next run will retry cleanly."
+            Write-Host "      Ask IT (or use another PC) to download devtunnel for Windows x64, save it as"
+            Write-Host "      %LOCALAPPDATA%\devtunnel\devtunnel.exe, then run quickstart.bat again."
             exit 1
         }
+
+        $env:Path = "$dir;$env:Path"
+        $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+        # Split on ';' rather than a substring test: "*$dir*" also matches a DIFFERENT directory
+        # that merely contains this path as a prefix, and a duplicated entry is never removed.
+        $already = $false
+        foreach ($seg in ($userPath -split ';')) {
+            if ($seg.TrimEnd('\') -ieq $dir.TrimEnd('\')) { $already = $true }
+        }
+        if (-not $already) { [Environment]::SetEnvironmentVariable("Path", "$dir;$userPath", "User") }
+        Write-Host "      installed devtunnel.exe -> $dir  (added to your PATH; new terminals pick it up)"
     }
 } else {
     Write-Host "[1/4] devtunnel CLI: already installed"

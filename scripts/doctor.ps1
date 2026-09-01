@@ -99,6 +99,18 @@ function Check([string]$id, [string]$name, [scriptblock]$test, [string]$fix, [sw
     if ($pass) {
         Write-Host ("  [ OK ] " + $name) -ForegroundColor Green
         $script:ok++
+    } elseif ($Info.IsPresent) {
+        # Informational only: neither a pass nor a problem. It was counted as a failure.
+        Write-Host ("  [INFO] " + $name) -ForegroundColor DarkGray
+    } elseif ($Optional.IsPresent) {
+        # OPTIONAL MEANS OPTIONAL. This counted into $script:bad exactly like a required check,
+        # so the exit code -- which is the number of failures -- was inflated by things the
+        # caller was explicitly told not to require, and the summary went red for them. A code
+        # that cannot tell "a required thing is broken" from "an optional thing is absent"
+        # cannot be acted on, which is why nobody acted on it.
+        Write-Host ("  [WARN] " + $name + " (optional)") -ForegroundColor Yellow
+        Write-Host ("         fix: " + $fix) -ForegroundColor DarkYellow
+        $script:warn++
     } else {
         Write-Host ("  [FAIL] " + $name) -ForegroundColor Red
         Write-Host ("         fix: " + $fix) -ForegroundColor Yellow

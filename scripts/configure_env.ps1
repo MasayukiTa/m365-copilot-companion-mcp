@@ -16,6 +16,16 @@ param(
     [string]$Reason  = ""    # optional banner explaining why this dialog popped
 )
 $ErrorActionPreference = "Stop"
+# WITH Stop AND NO HANDLER, ANY failure kills this instantly and silently -- Add-Type is blocked
+# by AppLocker on some managed machines, and the caller ignored the exit code, so the dialog
+# flashed and setup carried on with nothing saved. trap turns that into a message and a code
+# that says what happened.
+trap {
+    Write-Host ""
+    Write-Host "configure_env.ps1 could not run: $($_.Exception.Message)"
+    Write-Host "Edit .env by hand and set the agent URL, then start again."
+    exit 4
+}
 # This script lives in <repo>\scripts, so $PSScriptRoot is the scripts dir. The .env it
 # edits is at the REPO ROOT (one level up).
 $root = Split-Path -Parent $PSScriptRoot
@@ -128,12 +138,27 @@ $form.Add_Shown({
 $form.TopMost = $true
 
 $result = $form.ShowDialog()
-if ($result -ne "OK") { Write-Host "cancelled - .env not changed"; exit 0 }
+if ($result -ne "OK") {
+    # EXIT 2, NOT 0. Cancel and success used the same code, so a caller could not tell "the
+    # person decided not to" from "it worked" -- and the caller then carried on as though the
+    # value had been set.
+    Write-Host "cancelled - .env not changed"
+    exit 2
+}
 
 # --- write the values back, preserving everything else -------------------------------------
+$blank = @()
 foreach ($f in $fields) {
     $val = $boxes[$f.Key].Text.Trim()
-    if (-not $val) { continue }
+    if (-not $val) {
+        # EMPTY MEANS "LEAVE WHAT IS ALREADY THERE", NOT "CLEAR IT" -- clearing would erase a
+        # working configuration on any save that touched one field. But it was also SILENT, and
+        # that silence is the start of the whole chain: the dialog reported success, nothing was
+        # written, start_all re-opened the same dialog, and the run hung behind the splash.
+        # Record it and say so afterwards.
+        $blank += $f.Key
+        continue
+    }
     $line = "$($f.Key)=$val"
     if ($lines | Where-Object { $_ -match "^\s*$([regex]::Escape($f.Key))\s*=" }) {
         $lines = $lines | ForEach-Object { if ($_ -match "^\s*$([regex]::Escape($f.Key))\s*=") { $line } else { $_ } }
@@ -148,4 +173,15 @@ foreach ($f in $fields) {
 $text = ($lines -join "`r`n") + "`r`n"
 [System.IO.File]::WriteAllText($EnvPath, $text, (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "Saved agent URLs to $EnvPath"
-[System.Windows.Forms.MessageBox]::Show(".env に保存しました。", "完了", "OK", "Information") | Out-Null
+# NO MODAL BOX. It had to be clicked before setup could continue, which is a second thing to
+# answer for an action that already succeeded; the console line above is the confirmation.
+if ($blank.Count -gt 0) {
+    Write-Host ""
+    Write-Host "NOT SET (left as they were): $($blank -join ', ')"
+    Write-Host "A field left blank is not written. If one of these is the value you were asked"
+    Write-Host "for, run scripts\configure_env.ps1 again and fill it in -- otherwise the next"
+    Write-Host "startup will ask for it once more."
+    # A DISTINCT CODE. The caller can tell "saved everything" from "saved, but the field you
+    # were asked for is still empty", which is exactly the state that used to loop.
+    exit 3
+}
