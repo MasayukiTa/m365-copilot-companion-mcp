@@ -721,8 +721,13 @@ function Invoke-Startup {
     if (Server-Is-Outdated $root) {
         Write-Host "[1/4] MCP server: code is newer than the running process -- restarting"
         try {
+            # SCOPED TO THIS CHECKOUT. Matching 'main.py' alone kills ANY process whose
+            # command line contains it -- another clone of this repo on the same machine, an
+            # unrelated project's main.py, an editor running one under a debugger. supervisor.ps1
+            # already gets this right with the same idiom; this copy did not, so one file in the
+            # repository was correct and the other was not.
             Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-                Where-Object { $_.CommandLine -and ($_.CommandLine -match 'main\.py') } |
+                Where-Object { $_.CommandLine -and ($_.CommandLine -match 'main\.py') -and ($_.CommandLine -like "*$root*") } |
                 ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
         } catch { }
         Start-Sleep -Seconds 2
