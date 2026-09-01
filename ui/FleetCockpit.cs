@@ -8927,6 +8927,65 @@ class CockpitWindow : Window
     // stops there, but because that is the last point at which the number still means anything.
     static double RateSeverity(double pct) { return PiecewiseSeverity(pct, 50.0, 75.0, 100.0); }
 
+    // The turn meter, read straight off disk so the gauge does not depend on a fleet running.
+    // JSONL, one record per turn or refusal; bucketed here into the same shape fleet_runner
+    // publishes so the strip has one code path whichever source it came from. Never throws --
+    // a gauge that can take down the header is worse than no gauge.
+    Dictionary<string, object> ReadQuotaMeter()
+    {
+        try
+        {
+            // Derived from the status path we already hold. The first version named a
+            // _fleetDir field that does not exist -- the third invented identifier tonight,
+            // and the third caught by the compiler rather than by review.
+            string path = Path.Combine(Path.GetDirectoryName(_statusPath), "quota_meter.jsonl");
+            if (!File.Exists(path)) return null;
+            double now = NowUnix();
+            var minutes = new int[60];
+            int rpm = 0, rph = 0, refusals = 0;
+            bool any = false;
+            foreach (string line in File.ReadAllLines(path, Encoding.UTF8))
+            {
+                string t = line.Trim();
+                if (t.Length == 0) continue;
+                Dictionary<string, object> row = null;
+                try { row = _js.DeserializeObject(t) as Dictionary<string, object>; } catch { }
+                if (row == null) continue;
+                double ts = 0;
+                object tsRaw;
+                if (row.TryGetValue("ts", out tsRaw) && tsRaw != null)
+                { try { ts = Convert.ToDouble(tsRaw); } catch { } }
+                double age = now - ts;
+                if (age < 0 || age >= 3600) continue;
+                string ev = S(row, "event");
+                if (ev == "turn")
+                {
+                    any = true; rph++;
+                    if (age < 60) rpm++;
+                    int idx = 59 - (int)(age / 60.0);
+                    if (idx >= 0 && idx < 60) minutes[idx]++;
+                }
+                else if (ev == "refusal" && age < 300)
+                {
+                    any = true; refusals++;
+                }
+            }
+            if (!any) return null;
+            double limitRpm = 100.0;
+            var series = new object[60];
+            for (int i = 0; i < 60; i++) series[i] = minutes[i];
+            var q = new Dictionary<string, object>();
+            q["rpm"] = rpm; q["rph"] = rph;
+            q["limit_rpm"] = limitRpm;
+            q["pct_rpm"] = 100.0 * rpm / limitRpm;
+            q["refusals_5m"] = refusals;
+            q["series_rpm"] = series;
+            q["measured"] = true;
+            return q;
+        }
+        catch { return null; }
+    }
+
     // ── The Copilot rate-limit strip ──────────────────────────────────────────────────────
     //
     // WHY IT EXISTS. A dense run had 217 of its 237 turns refused and nothing on this screen
@@ -8947,10 +9006,20 @@ class CockpitWindow : Window
     // is a finding rather than a contradiction the panel should hide.
     UIElement BuildRateStrip(Dictionary<string, object> root, bool ja)
     {
-        if (root == null) return null;
-        object qRaw;
-        if (!root.TryGetValue("quota", out qRaw)) return null;
-        var q = qRaw as Dictionary<string, object>;
+        // READ THE METER DIRECTLY, and fall back to whatever the run put in status.json.
+        //
+        // The first version only read status.json's "quota", which meant the gauge appeared
+        // solely while a fleet was running and writing that file -- and vanished the moment it
+        // was most wanted. The rate limit is a property of the TENANT, not of one run: "am I
+        // still being refused, or has it recovered" is a question asked with nothing running.
+        // It also meant a status.json written before this key existed showed no gauge at all,
+        // which is exactly what happened on the first build.
+        var q = ReadQuotaMeter();
+        if (q == null && root != null)
+        {
+            object qRaw;
+            if (root.TryGetValue("quota", out qRaw)) q = qRaw as Dictionary<string, object>;
+        }
         if (q == null) return null;
 
         int rpm = I(q, "rpm");
