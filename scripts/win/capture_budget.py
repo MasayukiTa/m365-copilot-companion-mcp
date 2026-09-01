@@ -66,8 +66,13 @@ _WORKER_DONE = re.compile(r"worker_done")
 
 
 def newest_log(directory=None):
-    logs = glob.glob(os.path.join(directory or os.path.join(REPO, ".fleet"),
-                                  "coordinator_*.log"))
+    # BOTH FORMS. Finished coordinator logs are gzipped in place (they compress by 99%), so a
+    # glob for "*.log" alone would stop finding anything the moment the newest few rolled over
+    # -- this function would return None and the budget check would read a run as having made
+    # no captures at all, which is indistinguishable from a run that made none.
+    base = directory or os.path.join(REPO, ".fleet")
+    logs = (glob.glob(os.path.join(base, "coordinator_*.log"))
+            + glob.glob(os.path.join(base, "coordinator_*.log.gz")))
     return max(logs, key=os.path.getmtime) if logs else None
 
 
@@ -94,8 +99,12 @@ def read_log(path, elapsed_s=None):
     if not path or not os.path.isfile(path):
         return None
     try:
-        text = open(path, encoding="utf-8", errors="replace").read()
-    except OSError:
+        if path.endswith(".gz"):
+            import gzip
+            text = gzip.open(path, "rt", encoding="utf-8", errors="replace").read()
+        else:
+            text = open(path, encoding="utf-8", errors="replace").read()
+    except (OSError, IOError):
         return None
     found = _CAPTURE.findall(text)
     elapsed = (float(elapsed_s) if elapsed_s is not None

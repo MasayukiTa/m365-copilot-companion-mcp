@@ -29,7 +29,8 @@ from bench.oracle_suite_repo import tasks, truths        # noqa: E402
 
 
 def _final_answer(state_dir):
-    tx = sorted(glob.glob(os.path.join(state_dir, "transcripts", "*.jsonl")))
+    tx = sorted(glob.glob(os.path.join(state_dir, "transcripts", "*.jsonl"))
+              + glob.glob(os.path.join(state_dir, "transcripts", "*.jsonl.gz")))
     if not tx:
         return ""
     rows = [json.loads(l) for l in io.open(tx[-1], encoding="utf-8") if l.strip()]

@@ -181,3 +181,83 @@ def test_a_dry_run_removes_nothing(tmp_path):
 def test_a_missing_directory_is_not_an_error(tmp_path):
     rep = R.apply(fleet_dir=str(tmp_path / "nope"))
     assert rep["freed_mb"] == 0
+
+
+# --------------------------------------------------------------------------- compression
+
+
+def test_a_finished_log_is_compressed_not_deleted(tmp_path):
+    now = time.time()
+    p = str(tmp_path / "coordinator_old.log")
+    with io.open(p, "w", encoding="utf-8") as fh:
+        fh.write("captured: 3 min of token, agent A\n" * 20000)
+    t = now - 3 * 86400
+    os.utime(p, (t, t))
+    before = os.path.getsize(p)
+    saved, done = R.compress(str(tmp_path), now=now, keep_plain=0)
+    assert not os.path.exists(p), "the original was left beside the archive"
+    gz = p + ".gz"
+    assert os.path.exists(gz)
+    assert os.path.getsize(gz) < before / 5, "no meaningful compression"
+    assert saved > 0
+    import gzip
+    assert gzip.open(gz, "rt", encoding="utf-8").read().count("captured:") == 20000
+
+
+def test_the_newest_logs_are_never_compressed(tmp_path):
+    # capture_budget.newest_log() reads the newest, and a live run is still appending to it.
+    now = time.time()
+    for i in range(5):
+        p = str(tmp_path / ("coordinator_%d.log" % i))
+        _touch(p, size=5000, age_days=10 + i, now=now)
+    R.compress(str(tmp_path), now=now, keep_plain=3)
+    plain = sorted(n for n in os.listdir(tmp_path) if n.endswith(".log"))
+    assert len(plain) == 3, plain
+
+
+def test_a_recent_log_is_never_compressed(tmp_path):
+    now = time.time()
+    p = _touch(str(tmp_path / "coordinator_live.log"), size=5000, age_days=0.01, now=now)
+    R.compress(str(tmp_path), now=now, keep_plain=0, after_hours=6)
+    assert os.path.exists(p), "a log written minutes ago was compressed"
+
+
+def test_compression_keeps_the_original_mtime(tmp_path):
+    # Every age rule here, and newest_log(), decide by mtime. A rewrite stamped "now" would
+    # make the whole history look freshly written and exempt itself from every later rule.
+    now = time.time()
+    p = _touch(str(tmp_path / "coordinator_z.log"), size=5000, age_days=40, now=now)
+    want = os.path.getmtime(p)
+    R.compress(str(tmp_path), now=now, keep_plain=0)
+    assert abs(os.path.getmtime(p + ".gz") - want) < 2
+
+
+def test_a_compressed_log_is_still_reachable_by_the_retention(tmp_path):
+    # Compression must not disable the deletion running beside it.
+    now = time.time()
+    for i in range(30):
+        _touch(str(tmp_path / ("coordinator_%02d.log.gz" % i)), size=1000,
+               age_days=100, now=now)
+    freed, removed = R.coordinator_logs(str(tmp_path), now=now, keep_min=20)
+    assert len(removed) == 10, removed
+
+
+def test_the_budget_check_still_reads_a_compressed_log(tmp_path):
+    # The reader, not the writer. This is the pair that breaks silently: newest_log() returning
+    # None reads exactly like a run that captured nothing.
+    import importlib, sys
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                    "scripts", "win"))
+    cb = importlib.import_module("capture_budget")
+    now = time.time()
+    p = str(tmp_path / "coordinator_run.log")
+    with io.open(p, "w", encoding="utf-8") as fh:
+        fh.write("captured: 3 min of token, agent AGENT_X\nworker_done\n" * 5)
+    t = now - 3 * 86400
+    os.utime(p, (t, t))
+    R.compress(str(tmp_path), now=now, keep_plain=0)
+    newest = cb.newest_log(str(tmp_path))
+    assert newest and newest.endswith(".gz"), newest
+    got = cb.read_log(newest, elapsed_s=600)
+    assert got and got["captures"] == 5, got
+    assert got["socket_workers"] == 5
