@@ -78,10 +78,16 @@ def _bounded(value):
             "truncated": full > MAX_INLINE}
 
 
-def redact_args(arguments) -> dict:
+def redact_args(arguments, _depth=0) -> dict:
     """Arguments with secret VALUES removed and the rest bounded.
 
     The NAMES stay. "there was a password argument" is evidence; the password is not.
+
+    RECURSES, because this checked only the TOP level and every gated call arrives wrapped. A
+    call through the gateway is logged as {"name": "unlock", "arguments": {...}}: the real
+    arguments sit one level down, "arguments" is not a secret name, and the password inside it
+    was written out verbatim. That was not a missing entry in SECRET_ARGS -- it was every gated
+    tool bypassing this function. Found as a live plaintext MCP_UNLOCK_PASSWORD in the ledger.
     """
     if not isinstance(arguments, dict):
         return {"_": _bounded(arguments)}
@@ -89,6 +95,8 @@ def redact_args(arguments) -> dict:
     for key, value in arguments.items():
         if str(key).strip().lower() in SECRET_ARGS:
             out[key] = {"redacted": True, "sha16": _digest(str(value))}
+        elif isinstance(value, dict) and _depth < 4:
+            out[key] = redact_args(value, _depth + 1)
         else:
             out[key] = _bounded(value)
     return out
@@ -98,10 +106,23 @@ def _append(row: dict) -> None:
     """Best effort, never raises. A ledger that can fail a tool call is worse than no ledger."""
     try:
         path = _repo_path()
+        line = json.dumps(row, ensure_ascii=False)
+        # THE SINGLE EXIT. redact_args above keeps the row readable, but it can only
+        # catch NAMES it knows, and the value can arrive anywhere: nested inside a
+        # gateway wrapper, spliced into a shell command, or quoted back in a tool's own
+        # result. This matches the values we actually HOLD, at the one point where bytes
+        # leave the process, so a secret has to pass here whichever field carried it.
+        # Regexes for token SHAPES are not a substitute -- they miss the passwords that
+        # do not look like tokens, which is exactly what leaked.
+        try:
+            from tools.secret_store import redact_secrets
+            line = redact_secrets(line)
+        except Exception:
+            pass
         with _LOCK:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                fh.write(line + "\n")
     except Exception:
         pass
 
