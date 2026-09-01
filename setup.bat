@@ -23,6 +23,32 @@ cd /d "%~dp0"
 
 set "PYEXE="
 
+REM --- Corporate TLS interception (ALL routes) -----------------------------------------
+REM uv is a Rust binary carrying its OWN root certificates; it does not read the
+REM Windows certificate store. Behind a TLS-intercepting proxy every uv download
+REM then fails with "invalid peer certificate: UnknownIssuer" -- while PowerShell
+REM on the same network succeeds, which is why uv installs and then cannot fetch
+REM a Python. Export the roots this machine already trusts and point uv at them.
+REM Verification stays ON: the corporate CA is a real trust anchor here, the only
+REM problem was that some tools could not see it.
+REM These are scoped by the setlocal above, so nothing leaks machine-wide.
+REM DONE FOR EVERY ROUTE, not just the uv one. A machine that already has Python skips
+REM the uv branch entirely, and anything bootstrap.py fetches over TLS would then run
+REM without the bundle -- the same 'guard on one path only' shape this whole fix is about.
+for /f "usebackq delims=" %%B in (`powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\ca_bundle.ps1" 2^>nul`) do set "CABUNDLE=%%B"
+if defined CABUNDLE (
+    echo Using this machine's trusted roots: !CABUNDLE!
+    set "UV_NATIVE_TLS=1"
+    if not defined SSL_CERT_FILE set "SSL_CERT_FILE=!CABUNDLE!"
+    if not defined REQUESTS_CA_BUNDLE set "REQUESTS_CA_BUNDLE=!CABUNDLE!"
+    if not defined CURL_CA_BUNDLE set "CURL_CA_BUNDLE=!CABUNDLE!"
+    if not defined NODE_EXTRA_CA_CERTS set "NODE_EXTRA_CA_CERTS=!CABUNDLE!"
+) else (
+    echo Could not export the machine's root certificates; continuing with uv's own.
+    set "UV_NATIVE_TLS=1"
+)
+
+
 REM --- 1. Prefer the project venv if it already exists ---------------------
 if exist ".venv\Scripts\python.exe" (
     set "PYEXE=.venv\Scripts\python.exe"
@@ -86,6 +112,10 @@ if not exist "!UVEXE!" (
 REM uv provides a managed CPython without admin; create / reuse the venv.
 echo Using uv at "!UVEXE!" to provision Python and .venv (no admin) ...
 "!UVEXE!" python install 3.12
+REM CHECK THE EXIT CODE. This was unchecked, so a failed download fell through to
+REM "uv venv" -- which failed for the same reason -- and the operator was shown one
+REM message about the second failure and none about the first.
+if errorlevel 1 goto :uv_failed
 if not exist ".venv\Scripts\python.exe" (
     "!UVEXE!" venv .venv
 )
@@ -93,10 +123,26 @@ if exist ".venv\Scripts\python.exe" (
     set "PYEXE=.venv\Scripts\python.exe"
     goto :have_python
 )
+
+:uv_failed
 echo.
-echo ACTION NEEDED: 'uv' was installed but creating .venv failed.
-echo   Run manually, then re-run setup.bat:
-echo       "!UVEXE!" venv .venv
+echo ACTION NEEDED: 'uv' could not provision a Python.
+echo.
+echo   If the error above says "invalid peer certificate: UnknownIssuer", this
+echo   network inspects TLS and uv cannot see this machine's root certificates.
+echo   Setup already tried to export them automatically. If it still fails:
+echo.
+echo   Option A: run setup.bat again -- the export is refreshed each run.
+echo   Option B: if your IT gave you the proxy's certificate, save it as
+echo       .setup\ca-extra.pem  (a .cer file works too) and re-run setup.bat.
+echo       It is appended to the exported bundle. Use this when the certificate
+echo       is not installed in this machine's Windows store.
+echo   Option C: install Python yourself (no admin), then re-run setup.bat:
+echo       https://www.python.org/downloads/windows/
+echo       python-3.12.x-amd64.exe /passive InstallAllUsers=0 PrependPath=1
+echo.
+echo   Running "!UVEXE!" venv .venv by hand will NOT help: it has to download a
+echo   Python over the same connection and fails the same way.
 echo.
 set "RC=1" & goto :done
 
