@@ -122,3 +122,19 @@ def test_redirection_characters_are_caught_too():
 def test_comments_are_not_scanned():
     src = "if 1==1 (\n    REM this mentions (parens) in prose\n)\n"
     assert offending_lines(src) == []
+
+
+# -- process kills, which must never reach beyond this checkout --------------------------------
+
+def test_the_server_kill_is_scoped_to_this_checkout():
+    """Matching 'main.py' alone kills ANY process whose command line contains it: another clone
+    of this repo on the same machine, an unrelated project's main.py, an editor running one
+    under a debugger. supervisor.ps1 already scoped it with the same idiom and start_all.ps1 did
+    not -- one file in the repository correct and the other not, which is how a rule that is
+    written down still gets broken."""
+    for name in ("scripts/start_all.ps1", "scripts/supervisor.ps1"):
+        src = io.open(os.path.join(REPO, name), encoding="utf-8").read()
+        for m in re.finditer(r"CommandLine -match 'main\\.py'", src):
+            window = src[m.start():m.start() + 200]
+            assert "$root*" in window or "$Root*" in window, (
+                "%s kills main.py processes without scoping them to the repo" % name)
