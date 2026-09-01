@@ -119,3 +119,42 @@ def roll_back(point: dict) -> str:
         return json.dumps(A.roll_back(point), ensure_ascii=False, indent=1)
     except Exception as exc:
         return "[roll_back error: %s: %s]" % (type(exc).__name__, exc)
+
+
+def loop_until_verified(edits_per_round: list, verify_command: str = "", repo: str = ".",
+                        run_id: str = "", max_iter: int = 5, quality_threshold: int = 0,
+                        patience: int = 2) -> str:
+    """Apply successive edit sets until the verification passes, or a stated condition stops it.
+
+    `edits_per_round` is the ordered list of candidate edit sets -- one per round. The loop
+    decides whether to keep going; it does NOT invent the fix.
+
+    EVERY EXIT IS NAMED, and running out of iterations is not success:
+        converged / threshold / max_iter / no_progress / stopped / stuck
+    max_iter has no unlimited setting: the upstream is metered at 100 generative messages a
+    minute and a runaway loop spends that on nothing.
+    """
+    locked = require_unlocked()
+    if locked:
+        return locked
+    if not isinstance(edits_per_round, list) or not edits_per_round:
+        return "[loop_until_verified: `edits_per_round` must be a non-empty list of edit sets]"
+    if verify_command:
+        refusal = _screen(verify_command, repo)
+        if refusal is not None:
+            return refusal
+    from tools.auto import loop_runner as R
+    rounds = list(edits_per_round)
+
+    def candidate(state):
+        i = state["iteration"] - 1
+        return rounds[i] if i < len(rounds) else None
+
+    try:
+        out = R.run(candidate, verify=verify_command or None, repo=repo, run_id=run_id,
+                    max_iter=int(max_iter), quality_threshold=int(quality_threshold),
+                    patience=int(patience))
+    except Exception as exc:
+        return "[loop_until_verified error: %s: %s]" % (type(exc).__name__, exc)
+    out["summary"] = R.describe(out)
+    return json.dumps(out, ensure_ascii=False, indent=1, default=str)

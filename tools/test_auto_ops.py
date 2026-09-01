@@ -122,3 +122,53 @@ def test_a_failing_verification_reverts_through_this_door_too(tree):
                                        repo=str(tree)))
     assert out["ok"] is False and out["reverted"] is True
     assert (tree / "a.py").read_text(encoding="utf-8") == "N = 1\n"
+
+
+# -- the loop, which was reported as done and did not exist ---------------------------------
+
+def test_the_loop_is_gated_and_screens_its_verification_command(monkeypatch, tree):
+    """Same door, same gates. A loop that runs an arbitrary command N times without the
+    screening would be a worse bypass than the single-shot cell, not a better one."""
+    monkeypatch.setattr(O, "require_unlocked", lambda: "[locked: no]")
+    assert O.loop_until_verified([EDITS]) == "[locked: no]"
+
+
+def test_the_loops_verification_command_goes_through_the_same_net(monkeypatch, tree):
+    from tools import contract_gate as CG
+    monkeypatch.setattr(CG, "destructive_shell", lambda c: True)
+    monkeypatch.setattr(CG, "check_op", lambda op, detail: "[refused: %s]" % op)
+    out = O.loop_until_verified([EDITS], verify_command="rm -rf /", repo=str(tree))
+    assert out.startswith("[refused: shell_destructive]")
+
+
+def test_running_out_of_iterations_is_reported_as_not_converged(tree):
+    """THE DISTINCTION THE CELL COULD NOT MAKE, because the cell has no notion of iterations.
+    Exhausting the budget and passing are different facts.
+
+    Two rounds are supplied for a budget of two: with only one candidate the loop would run out
+    of CANDIDATES first, which is a different outcome and is tested below."""
+    rounds = [EDITS, [{"path": "a.py", "old": "N = 1", "new": "N = 3"}]]
+    out = json.loads(O.loop_until_verified(
+        rounds, verify_command="python -c \"raise SystemExit(1)\"", repo=str(tree), max_iter=2))
+    assert out["converged"] is False
+    assert out["stop"] == "max_iter"
+    assert "did NOT converge" in out["summary"]
+
+
+def test_running_out_of_candidates_is_a_different_outcome(tree):
+    """`stuck` and `max_iter` are not the same fact: one means we had nothing left to try, the
+    other means we were still trying when the budget ran out."""
+    out = json.loads(O.loop_until_verified(
+        [EDITS], verify_command="python -c \"raise SystemExit(1)\"", repo=str(tree), max_iter=4))
+    assert out["stop"] == "stuck"
+    assert out["converged"] is False
+
+
+def test_a_passing_round_converges_and_says_so(tree):
+    out = json.loads(O.loop_until_verified(
+        [EDITS], verify_command="python -c \"\"", repo=str(tree), max_iter=3))
+    assert out["converged"] is True and out["stop"] == "converged"
+
+
+def test_an_empty_round_list_is_refused_with_a_reason(tree):
+    assert "non-empty list" in O.loop_until_verified([], repo=str(tree))
