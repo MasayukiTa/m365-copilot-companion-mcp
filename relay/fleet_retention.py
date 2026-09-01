@@ -97,7 +97,11 @@ def coordinator_logs(fleet_dir, now=None, dry_run=False,
     now = time.time() if now is None else now
     keep_days = COORDINATOR_KEEP_DAYS if keep_days is None else keep_days
     keep_min = COORDINATOR_KEEP_MIN if keep_min is None else keep_min
-    paths = sorted(glob.glob(os.path.join(fleet_dir, "coordinator_*.log")),
+    # BOTH FORMS. Once compression became the default, matching only "*.log" meant every
+    # gzipped log fell outside this rule and was kept forever -- the compression would have
+    # quietly disabled the retention that runs beside it.
+    paths = sorted(glob.glob(os.path.join(fleet_dir, "coordinator_*.log"))
+                   + glob.glob(os.path.join(fleet_dir, "coordinator_*.log.gz")),
                    key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
                    reverse=True)
     # The newest `keep_min` are kept whatever their age -- that is the floor, not the policy.
@@ -198,6 +202,98 @@ def stores(fleet_dir, now=None, dry_run=False, keep_days=None, names=None):
     return freed, removed
 
 
+#: Finished logs are gzipped rather than deleted. THIS IS THE RULE THAT MATTERS, and the
+#: measurement is why: sampled on the live directory, coordinator logs compress by 99% (31.0 MB
+#: -> 0.2 MB) and run transcripts by 93%. They are enormously repetitive text.
+#:
+#: That changes the whole shape of the problem. Age-based deletion reached 47 MB of 255 because
+#: 185 MB of it was written in the last week -- retention cannot touch recent evidence without
+#: destroying it. Compression reaches ALL of it and destroys none: the same 26 MB a day becomes
+#: about 2, and every line is still there to read.
+COMPRESS_AFTER_HOURS = float(os.environ.get("MCP_FLEET_COMPRESS_HOURS", "6"))
+
+#: The newest coordinator logs stay uncompressed. capture_budget.newest_log() takes max(mtime)
+#: over `coordinator_*.log` and reads it; compressing the file a live run is still appending to
+#: would corrupt it, and compressing the one the budget check reads would silently make that
+#: check see nothing.
+COMPRESS_KEEP_PLAIN = int(os.environ.get("MCP_FLEET_COMPRESS_KEEP_PLAIN", "3"))
+
+
+def open_maybe_gz(path, mode="rt", encoding="utf-8", errors="replace"):
+    """Open `path`, or its .gz sibling if that is what exists. Readers call this instead of
+    open() so compression is invisible to them -- a reader that has to know is a reader that
+    will one day be added without knowing."""
+    import gzip as _gzip
+    if not os.path.exists(path) and os.path.exists(path + ".gz"):
+        path = path + ".gz"
+    if path.endswith(".gz"):
+        return _gzip.open(path, mode, encoding=encoding, errors=errors)
+    return io.open(path, mode, encoding=encoding, errors=errors)
+
+
+def compress(fleet_dir, now=None, dry_run=False, after_hours=None, keep_plain=None):
+    """Gzip finished logs in place. Returns (bytes_saved, [names]).
+
+    Never touches a file that is still being written: `after_hours` keeps anything recent, and
+    the newest `keep_plain` coordinator logs stay plain whatever their age.
+    """
+    import gzip as _gzip
+    now = time.time() if now is None else now
+    after_hours = COMPRESS_AFTER_HOURS if after_hours is None else after_hours
+    keep_plain = COMPRESS_KEEP_PLAIN if keep_plain is None else keep_plain
+    cutoff_days = after_hours / 24.0
+
+    targets = sorted(glob.glob(os.path.join(fleet_dir, "coordinator_*.log")),
+                     key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
+                     reverse=True)[keep_plain:]
+    for name in STORE_DIRS:
+        targets += glob.glob(os.path.join(fleet_dir, name, "*.jsonl"))
+        targets += glob.glob(os.path.join(fleet_dir, name, "*", "*.jsonl"))
+
+    saved, done = 0, []
+    for p in targets:
+        if p.endswith(".gz") or not os.path.isfile(p):
+            continue
+        if _age_days(p, now) <= cutoff_days:
+            continue
+        before = _size(p)
+        if not before:
+            continue
+        if dry_run:
+            saved += int(before * 0.95)     # measured 93-99%; deliberately the low end
+            done.append(os.path.relpath(p, fleet_dir))
+            continue
+        gz = p + ".gz"
+        try:
+            with io.open(p, "rb") as src, _gzip.open(gz, "wb", compresslevel=6) as dst:
+                while True:
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+            # WRITE FULLY, THEN REMOVE. The original is deleted only once the compressed file
+            # exists and is non-empty -- a crash between the two must leave the log readable,
+            # not leave a truncated .gz where the evidence used to be.
+            if _size(gz) <= 0:
+                raise IOError("empty archive")
+            # Keep the original mtime: every age rule here, and newest_log() in capture_budget,
+            # decide by mtime. A rewrite that stamps "now" would make the whole history look
+            # freshly written and quietly exempt itself from every rule that follows.
+            st = os.stat(p)
+            os.utime(gz, (st.st_atime, st.st_mtime))
+            os.remove(p)
+            saved += before - _size(gz)
+            done.append(os.path.relpath(gz, fleet_dir))
+        except (OSError, IOError):
+            try:
+                if os.path.exists(gz) and os.path.exists(p):
+                    os.remove(gz)
+            except OSError:
+                pass
+            continue
+    return saved, done
+
+
 def cap_jsonl(fleet_dir, dry_run=False, max_mb=None):
     """Hold each append-only ledger under a ceiling, KEEPING THE TAIL.
 
@@ -251,13 +347,17 @@ def apply(fleet_dir=None, now=None, dry_run=False):
            "freed_mb": 0.0, "freed_bytes": 0, "rules": {}}
     if not os.path.isdir(fleet_dir):
         return rep
-    for name, fn in (("coordinator_logs", coordinator_logs),
+    # COMPRESSION FIRST, DELETION SECOND. It is the rule that reaches the bulk -- the recent
+    # 185 MB that age rules must not touch -- and running it first means the deletions that
+    # follow are working on files already a fiftieth of their size.
+    for name, fn in (("compress", compress),
+                     ("coordinator_logs", coordinator_logs),
                      ("rotations", rotations),
                      ("scratch", scratch),
                      ("stores", stores),
                      ("cap_jsonl", cap_jsonl)):
         try:
-            if fn in (coordinator_logs, scratch, stores):
+            if fn in (coordinator_logs, scratch, stores, compress):
                 freed, items = fn(fleet_dir, now=now, dry_run=dry_run)
             else:
                 freed, items = fn(fleet_dir, dry_run=dry_run)

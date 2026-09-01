@@ -9,6 +9,7 @@ test_output tail, and the agent's transcript tail -- into one .md per instance u
   python bench/swe_miss_bundle.py <grade_runid>
 """
 import glob
+import gzip
 import json
 import os
 import re
@@ -63,11 +64,17 @@ rowmap = {r["instance_id"]: r for _, r in df.iterrows()}
 
 
 def _tx_tail(inst, n=10):
-    fs = sorted(glob.glob(os.path.join(REPO, ".fleet", "transcripts", "*.jsonl")),
+    # Finished transcripts are gzipped in place (93% smaller), so both forms are listed and
+    # opened. Matching only "*.jsonl" would make this quietly find nothing for any run older
+    # than a few hours and report "(transcript not found)" for evidence that is still there.
+    base = os.path.join(REPO, ".fleet", "transcripts")
+    fs = sorted(glob.glob(os.path.join(base, "*.jsonl"))
+                + glob.glob(os.path.join(base, "*.jsonl.gz")),
                 key=os.path.getmtime, reverse=True)
     for f in fs:
         try:
-            rows = [json.loads(l) for l in open(f, encoding="utf-8") if l.strip()]
+            opener = gzip.open if f.endswith(".gz") else open
+            rows = [json.loads(l) for l in opener(f, "rt", encoding="utf-8") if l.strip()]
         except Exception:
             continue
         if any(inst in json.dumps(e, ensure_ascii=False) for e in rows[:2]):
