@@ -8867,6 +8867,66 @@ class CockpitWindow : Window
     }
 
 
+
+    // ── Graduated severity colour ─────────────────────────────────────────────────────────
+    //
+    // WHY A GRADIENT AND NOT THREE BUCKETS. The first version of the rate strip used discrete
+    // zones -- green under 60%, amber to 85%, red above -- which tells you WHICH BUCKET you are
+    // in and not HOW CLOSE you are. 61% and 84% drew the same colour, so the whole span where
+    // an operator could still act looked identical.
+    //
+    // The four anchors are the Atlassian Statuspage / status.claude.com uptime-bar ramp, taken
+    // from that bar's own SVG rather than invented:
+    //     green #76AD2A -> yellow #FAA72A -> orange #E86235 -> red #E04343
+    // Interpolating a continuous severity across them means "degraded but nearly critical"
+    // has its own colour, which is exactly the state worth seeing early.
+    static readonly double[] _SEV_STOPS = { 0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0 };
+    static readonly byte[][] _SEV_RGB = {
+        new byte[] { 0x76, 0xAD, 0x2A },
+        new byte[] { 0xFA, 0xA7, 0x2A },
+        new byte[] { 0xE8, 0x62, 0x35 },
+        new byte[] { 0xE0, 0x43, 0x43 },
+    };
+
+    // severity [0,1] -> colour, linearly interpolated between the anchors.
+    static Color SeverityColor(double sev)
+    {
+        if (sev <= 0.0) return Color.FromRgb(_SEV_RGB[0][0], _SEV_RGB[0][1], _SEV_RGB[0][2]);
+        if (sev >= 1.0) return Color.FromRgb(_SEV_RGB[3][0], _SEV_RGB[3][1], _SEV_RGB[3][2]);
+        for (int i = 0; i < _SEV_STOPS.Length - 1; i++)
+        {
+            double s0 = _SEV_STOPS[i], s1 = _SEV_STOPS[i + 1];
+            if (sev <= s1)
+            {
+                double t = (s1 > s0) ? (sev - s0) / (s1 - s0) : 0.0;
+                byte[] c0 = _SEV_RGB[i], c1 = _SEV_RGB[i + 1];
+                return Color.FromRgb(
+                    (byte)Math.Round(c0[0] + (c1[0] - c0[0]) * t),
+                    (byte)Math.Round(c0[1] + (c1[1] - c0[1]) * t),
+                    (byte)Math.Round(c0[2] + (c1[2] - c0[2]) * t));
+            }
+        }
+        return Color.FromRgb(_SEV_RGB[3][0], _SEV_RGB[3][1], _SEV_RGB[3][2]);
+    }
+
+    // A raw metric -> severity, piecewise linear through the same three thresholds the sibling
+    // status page uses: at or below `green` it is 0; `deg` lands on the yellow anchor; `crit`
+    // and beyond is 1. The deg..crit leg ramps continuously so approaching the ceiling darkens
+    // steadily instead of flipping at a boundary.
+    static double PiecewiseSeverity(double x, double green, double deg, double crit)
+    {
+        const double Y = 1.0 / 3.0;
+        if (x <= green) return 0.0;
+        if (x <= deg) return (deg > green) ? Y * (x - green) / (deg - green) : Y;
+        if (x <= crit) return (crit > deg) ? Y + (1.0 - Y) * (x - deg) / (crit - deg) : 1.0;
+        return 1.0;
+    }
+
+    // The rate gauge's own mapping. Half the published ceiling is unambiguously fine; from
+    // there it ramps, and 100% of the published figure is full red -- not because the run
+    // stops there, but because that is the last point at which the number still means anything.
+    static double RateSeverity(double pct) { return PiecewiseSeverity(pct, 50.0, 75.0, 100.0); }
+
     // ── The Copilot rate-limit strip ──────────────────────────────────────────────────────
     //
     // WHY IT EXISTS. A dense run had 217 of its 237 turns refused and nothing on this screen
@@ -8948,10 +9008,7 @@ class CockpitWindow : Window
         fill.Height = 5;
         fill.CornerRadius = new CornerRadius(2.5);
         fill.HorizontalAlignment = HorizontalAlignment.Left;
-        fill.Background = new SolidColorBrush(
-            pct >= 85 ? Color.FromRgb(0xD9, 0x4A, 0x38)
-          : pct >= 60 ? Color.FromRgb(0xE0, 0x9B, 0x2D)
-                      : Color.FromRgb(0x3F, 0xA5, 0x6B));
+        fill.Background = new SolidColorBrush(SeverityColor(RateSeverity(pct)));
         fill.Width = measured ? Math.Max(1.5, Math.Min(54.0, 54.0 * pct / 100.0)) : 0.0;
         holder.Children.Add(fill);
         track.Child = holder;
@@ -8985,9 +9042,12 @@ class CockpitWindow : Window
                 bar.Margin = new Thickness(0, 0, 0.6, 0);
                 bar.VerticalAlignment = VerticalAlignment.Bottom;
                 bar.Height = (v <= 0) ? 1.0 : Math.Max(1.5, 14.0 * v / scale);
-                bar.Background = (v >= limitRpm)
-                    ? new SolidColorBrush(Color.FromRgb(0xD9, 0x4A, 0x38))
-                    : Theme.Br(Theme.Border(_dark));
+                // EACH MINUTE KEEPS ITS OWN COLOUR. A burst twenty minutes ago stays red in
+                // the history even though the current reading is green -- which is the whole
+                // reason to draw an hour instead of a number.
+                bar.Background = (v <= 0)
+                    ? Theme.Br(Theme.Border(_dark))
+                    : new SolidColorBrush(SeverityColor(RateSeverity(100.0 * v / Math.Max(1.0, limitRpm))));
                 spark.Children.Add(bar);
             }
             row.Children.Add(spark);
@@ -8999,7 +9059,7 @@ class CockpitWindow : Window
         {
             var warn = new TextBlock();
             warn.Text = ja ? ("拒否 " + refusals + " /5分") : (refusals + " refused /5m");
-            warn.Foreground = new SolidColorBrush(Color.FromRgb(0xD9, 0x4A, 0x38));
+            warn.Foreground = new SolidColorBrush(SeverityColor(1.0));
             warn.FontSize = 11;
             warn.FontWeight = FontWeights.SemiBold;
             warn.VerticalAlignment = VerticalAlignment.Center;
