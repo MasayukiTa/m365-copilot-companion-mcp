@@ -468,6 +468,20 @@ def _settings_float(key, default):
     return default
 
 
+def _quota_snapshot():
+    """The Copilot generative-message meter, for the cockpit's rate gauge. Never raises.
+
+    Returns {} when the meter cannot be read, and the panel then says it has measured nothing
+    rather than drawing a comfortable-looking zero -- an empty gauge and a quiet one look
+    identical, and only one of them means there is headroom.
+    """
+    try:
+        from relay.quota_meter import snapshot
+        return snapshot()
+    except Exception:
+        return {}
+
+
 def settings_disk_floor(default=None):
     """The user's reserved C: free-space floor in GB (`disk_floor_gb=N` in settings.txt).
     This is the 'always keep N GB free on C:' admission reserve -- a new eval-bearing tab is
@@ -906,6 +920,14 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         "free_disk_gb": round(free_disk_gb(), 1),
         # RAM admission reserve (free RAM kept for the user) so the cockpit can show the RAM gate.
         "ram_floor_mb": round(ram_floor_mb),
+        # THE THIRD GATE, and the one that was invisible. Disk and RAM have been on this panel
+        # for months; the quota that actually stopped a run -- 217 turns refused out of 237 --
+        # had no gauge at all, so a fleet grinding to a halt looked like a fleet being slow.
+        # Turns per minute against Microsoft's published generative-orchestration limit, with
+        # the refusals shown beside it: the published figure is scoped per Dataverse
+        # environment and downstream services may impose lower ones, so refusals arriving under
+        # the line mean the line is the wrong line, not that the gauge is broken.
+        "quota": _quota_snapshot(),
         # Fleet-level directive (Bucket B): the single authoritative goal text when this run
         # was started from exactly one goal; "" when there are multiple independent goals (the
         # UI already handles multi-goal honestly and should NOT fabricate a summary). Only
