@@ -848,6 +848,14 @@ class CockpitWindow : Window
     int _retMb = 0;            // settings.txt session_max_mb=        ; 0 = no size cap
     TextBlock _retDaysValue, _retMbValue, _retNote;
 
+    // THE DENOMINATOR OF THE RATE STRIP, AND THE LINE ADMISSION HOLDS AT. Microsoft documents
+    // 100 generative messages per minute per Dataverse environment, which is the default and
+    // not the law -- refusals arriving while the strip still shows headroom mean the binding
+    // limit is not the published one, and then the useful move is to lower this rather than
+    // keep feeding a queue that is being refused. relay_fleet.rate_ceiling() reads the same
+    // key, so the gauge and the gate can never disagree about where the line is.
+    int _rateCeiling = 100;    // settings.txt rate_ceiling_rpm= ; 0 = no ceiling
+
     // ── P0 HEALTH STRIP ─────────────────────────────────────────────────────────────
     // Six infra dots (Server/Tunnel/Edge/Sign-in/Agent/Tool) in the header, always visible,
     // polled every ~15s on a background thread and marshaled to the UI via Dispatcher.
@@ -1222,6 +1230,8 @@ class CockpitWindow : Window
                     _retDays = Math.Max(0, Math.Min(3650, v));
                 else if (ln.StartsWith("session_max_mb=") && int.TryParse(ln.Substring(15).Trim(), out v))
                     _retMb = Math.Max(0, Math.Min(100000, v));
+                else if (ln.StartsWith("rate_ceiling_rpm=") && int.TryParse(ln.Substring(17).Trim(), out v))
+                    _rateCeiling = Math.Max(0, Math.Min(10000, v));
                 else if (ln.StartsWith("disk_floor_gb="))
                 {
                     double df;
@@ -8971,7 +8981,11 @@ class CockpitWindow : Window
                 }
             }
             if (!any) return null;
-            double limitRpm = 100.0;
+            // The USER's ceiling, not the published one. A strip drawn against 100 while
+            // admission holds at 40 would show comfortable headroom at the exact moment the
+            // fleet stopped admitting -- the gauge would be explaining the opposite of what
+            // was happening.
+            double limitRpm = _rateCeiling > 0 ? (double)_rateCeiling : 100.0;
             var series = new object[60];
             for (int i = 0; i < 60; i++) series[i] = minutes[i];
             var q = new Dictionary<string, object>();
@@ -9025,9 +9039,16 @@ class CockpitWindow : Window
         int rpm = I(q, "rpm");
         int rph = I(q, "rph");
         int refusals = I(q, "refusals_5m");
-        double limitRpm = 100.0, pct = 0.0;
+        double limitRpm = _rateCeiling > 0 ? (double)_rateCeiling : 100.0;
+        double pct = 0.0;
         try { limitRpm = Convert.ToDouble(q["limit_rpm"]); } catch { }
-        try { pct = Convert.ToDouble(q["pct_rpm"]); } catch { }
+        // The setting wins over whatever the writer stamped: fleet_runner records limit_rpm
+        // from the module default, and the operator may have set a lower line since.
+        if (_rateCeiling > 0) limitRpm = _rateCeiling;
+        pct = 100.0 * rpm / Math.Max(1.0, limitRpm);
+        // pct is derived from the ceiling above, NOT read back from the file: the writer
+        // computed its percentage against the default limit and using it here would draw the
+        // bar against one line while the number beside it counts against another.
         bool measured = false;
         object mRaw;
         if (q.TryGetValue("measured", out mRaw) && mRaw != null)

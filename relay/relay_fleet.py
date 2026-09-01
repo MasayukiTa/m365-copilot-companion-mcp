@@ -179,10 +179,86 @@ def admit_interval_now(now=None):
     return ADMIT_MIN_INTERVAL_S
 
 
+#: The user's own ceiling on generative messages per minute. Microsoft's documented figure is
+#: 100 RPM per Dataverse environment, which is the DEFAULT here and not the law: the point of
+#: making it settable is that the binding limit is not always the published one. Measured
+#: refusals arriving while headroom still looks comfortable are exactly that case, and the
+#: answer is to lower this number rather than to keep feeding a queue that is being refused.
+def rate_ceiling(default=None):
+    """`rate_ceiling_rpm=N` from the cockpit's settings.txt. 0 disables the gate."""
+    if default is None:
+        try:
+            from relay.quota_meter import LIMIT_RPM
+            default = LIMIT_RPM
+        except Exception:
+            default = 100.0
+    try:
+        from relay.fleet_runner import _settings_float
+        return _settings_float("rate_ceiling_rpm", default)
+    except Exception:
+        return default
+
+
+#: A short cache because admission asks about once a second and the meter is a file read over
+#: the last hour of turns. Recomputing that per sweep would make the gate the expensive part of
+#: the loop it is protecting.
+_RATE_CACHE = [0.0, None]          # [computed_at, snapshot]
+_RATE_CACHE_TTL_S = 2.0
+
+
+def current_rpm(now=None):
+    """Turns sent in the last minute, or None when the meter cannot be read.
+
+    None, NOT zero. An unreadable meter and a quiet minute look identical as a number, and
+    only one of them means there is room -- so the caller can tell them apart and this gate
+    fails OPEN on the unreadable case rather than stalling a fleet on a missing file.
+    """
+    now = time.time() if now is None else now
+    if _RATE_CACHE[1] is not None and (now - _RATE_CACHE[0]) < _RATE_CACHE_TTL_S:
+        snap = _RATE_CACHE[1]
+    else:
+        try:
+            from relay.quota_meter import snapshot
+            snap = snapshot(now=now)
+        except Exception:
+            return None
+        _RATE_CACHE[0], _RATE_CACHE[1] = now, snap
+    if not snap or not snap.get("measured", True):
+        return None
+    return float(snap.get("rpm") or 0.0)
+
+
+def rate_headroom_ok(now=None):
+    """(ok, why). False while the last minute is at or over the user's ceiling.
+
+    WHY WAITING IS THE RIGHT MOVE AND NOT SLOWING DOWN. At the ceiling, admitting another
+    worker does not get more work through -- it gets the same work refused, and a refusal
+    costs a turn on the way in as well as a retry on the way out. So the fleet holds at the
+    line and admits again the moment the trailing minute drops below it, which is what the
+    caller's ~1s sweep already provides for free.
+    """
+    ceiling = rate_ceiling()
+    if not ceiling or ceiling <= 0:
+        return True, ""
+    rpm = current_rpm(now)
+    if rpm is None:
+        return True, ""
+    if rpm >= ceiling:
+        return False, "rate %d/%d per minute -- holding until it drops" % (
+            round(rpm), round(ceiling))
+    return True, ""
+
+
 def admission_is_due(now=None):
     """False while the previous admission is still too recent. Never blocks -- the caller
     stops draining and the next sweep (poll_s, ~1s) asks again."""
     now = time.time() if now is None else now
+    # The ceiling is checked BEFORE the spacing: spacing asks "has enough time passed since the
+    # last admission", which is a question about this process, and the ceiling is a question
+    # about the shared upstream that every run on this tenant is drawing from.
+    ok, _why = rate_headroom_ok(now)
+    if not ok:
+        return False
     if ADMIT_MIN_INTERVAL_S <= 0:
         return True
     return (now - _LAST_ADMIT_TS) >= admit_interval_now(now)
@@ -199,6 +275,9 @@ def _reset_admission_pacing():
     global _LAST_ADMIT_TS, _LAST_THROTTLE_TS
     _LAST_ADMIT_TS = 0.0
     _LAST_THROTTLE_TS = 0.0
+    # The rate cache is per-process module state exactly like the two above, and leaving it
+    # behind would let one test's ceiling decision silently answer the next test's question.
+    _RATE_CACHE[0], _RATE_CACHE[1] = 0.0, None
 
 
 #: Volatile fields that make two IDENTICAL replies look different. A GUID, an ISO timestamp,
