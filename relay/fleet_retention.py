@@ -67,6 +67,19 @@ JSONL_MAX_MB = float(os.environ.get("MCP_FLEET_JSONL_MAX_MB", "64"))
 _ROTATION = re.compile(r"^(.*\.(?:log|jsonl))\.(\d+)$")
 
 
+def _setting(key, default):
+    """A number from the cockpit's settings.txt, falling back to the env var and then the
+    default. Wired so these knobs live where the CONVERSATION retention already lives: that one
+    is settable in the cockpit and this one was environment-only, which meant "the retention
+    period is configurable" was half true and the half that was not was the half writing 26 MB
+    a day."""
+    try:
+        from relay.fleet_runner import _settings_float
+        return _settings_float(key, default)
+    except Exception:
+        return default
+
+
 def _age_days(path, now):
     try:
         return (now - os.path.getmtime(path)) / 86400.0
@@ -95,7 +108,7 @@ def coordinator_logs(fleet_dir, now=None, dry_run=False,
                      keep_days=None, keep_min=None):
     """Remove coordinator logs for runs that finished, keeping the recent ones."""
     now = time.time() if now is None else now
-    keep_days = COORDINATOR_KEEP_DAYS if keep_days is None else keep_days
+    keep_days = _setting("fleet_log_days", COORDINATOR_KEEP_DAYS) if keep_days is None else keep_days
     keep_min = COORDINATOR_KEEP_MIN if keep_min is None else keep_min
     # BOTH FORMS. Once compression became the default, matching only "*.log" meant every
     # gzipped log fell outside this rule and was kept forever -- the compression would have
@@ -143,7 +156,7 @@ def scratch(fleet_dir, now=None, dry_run=False, keep_days=None):
     structured stores (sessions, transcripts, guard), and a name-prefix rule has no business
     reaching into them."""
     now = time.time() if now is None else now
-    keep_days = SCRATCH_KEEP_DAYS if keep_days is None else keep_days
+    keep_days = _setting("fleet_scratch_days", SCRATCH_KEEP_DAYS) if keep_days is None else keep_days
     freed, removed = 0, []
     try:
         names = os.listdir(fleet_dir)
@@ -182,7 +195,7 @@ def stores(fleet_dir, now=None, dry_run=False, keep_days=None, names=None):
     is how they come to disagree about what is still live.
     """
     now = time.time() if now is None else now
-    keep_days = STORE_KEEP_DAYS if keep_days is None else keep_days
+    keep_days = _setting("fleet_store_days", STORE_KEEP_DAYS) if keep_days is None else keep_days
     freed, removed = 0, []
     for name in (names or STORE_DIRS):
         root = os.path.join(fleet_dir, name)
@@ -239,7 +252,7 @@ def compress(fleet_dir, now=None, dry_run=False, after_hours=None, keep_plain=No
     """
     import gzip as _gzip
     now = time.time() if now is None else now
-    after_hours = COMPRESS_AFTER_HOURS if after_hours is None else after_hours
+    after_hours = _setting("fleet_compress_hours", COMPRESS_AFTER_HOURS) if after_hours is None else after_hours
     keep_plain = COMPRESS_KEEP_PLAIN if keep_plain is None else keep_plain
     cutoff_days = after_hours / 24.0
 
