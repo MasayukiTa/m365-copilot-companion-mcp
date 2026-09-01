@@ -351,7 +351,86 @@ jobs:
             relay/test_socket_conversation_identity.py \
             bridge/test_send_contract.py \
             scripts/test_transport_series.py \
-            tests/test_process_lookup_does_not_match_itself.py
+            tests/test_process_lookup_does_not_match_itself.py \
+            bench/remote/test_broker_client.py \
+            bench/remote/test_broker_parse.py \
+            bench/remote/test_fleet_tool_router.py \
+            bench/remote/test_router_targets_the_checkout.py \
+            bench/remote/test_routing_scope.py \
+            bench/test_attempt_snapshots.py \
+            bench/test_done_vs_correct.py \
+            bench/test_eval_host_config.py \
+            bench/test_eval_to_ledger.py \
+            bench/test_oracle_tasks.py \
+            bench/test_panel_shadow_report.py \
+            bench/test_pro_batching.py \
+            bench/test_pro_capture.py \
+            bench/test_pro_grade_remote.py \
+            bench/test_pro_record_arm.py \
+            bench/test_pro_record_denominator.py \
+            bench/test_retry_floor.py \
+            bench/test_retry_floor_graded.py \
+            bench/test_routing_switch.py \
+            bench/test_skill_match_rate.py \
+            bench/test_skill_probe.py \
+            bench/test_swe_run_facts.py \
+            bench/test_ui_goal_lines.py \
+            bridge/test_conversation_selection.py \
+            bridge/test_tool_probe_borrows_a_page.py \
+            relay/selfimprove/test_frozen_surfaces.py \
+            relay/selfimprove/test_reliability.py \
+            relay/test_acceptance_contract.py \
+            relay/test_claim_verdict.py \
+            relay/test_conv_title.py \
+            relay/test_edge_cache_trim.py \
+            relay/test_edge_disk_cap.py \
+            relay/test_effort_expressible.py \
+            relay/test_evidence_manifest.py \
+            relay/test_fleet_retention.py \
+            relay/test_fleet_toolset.py \
+            relay/test_gateway_executes.py \
+            relay/test_lens_selection.py \
+            relay/test_live_record_isolation.py \
+            relay/test_mechanism_telemetry.py \
+            relay/test_memory_dedupe.py \
+            relay/test_merge_failure_visible.py \
+            relay/test_orphan_reaper.py \
+            relay/test_panel_shadow.py \
+            relay/test_past_task_timeline.py \
+            relay/test_quota_meter.py \
+            relay/test_rate_ceiling.py \
+            relay/test_refuter_placement.py \
+            relay/test_repo_bug_fix_skill.py \
+            relay/test_retry_trigger.py \
+            relay/test_settings_round_trip.py \
+            relay/test_supervisor_verify.py \
+            relay/test_turn_outcome.py \
+            relay/test_upstream_throttle.py \
+            relay/test_veto_measurement_is_honest.py \
+            scripts/test_prune_edge_cache.py \
+            tools/auto/test_autoloop.py \
+            tools/auto/test_loop_runner.py \
+            tools/test_auto_ops.py \
+            tools/test_batch_syntax.py \
+            tools/test_command_judge.py \
+            tools/test_command_net_adversarial.py \
+            tools/test_command_triage.py \
+            tools/test_deploy_freshness.py \
+            tools/test_fetch_and_run_is_gated.py \
+            tools/test_gate_is_not_demoted.py \
+            tools/test_gate_not_demoted_by_a_switch.py \
+            tools/test_instructions_do_not_accumulate_cases.py \
+            tools/test_judge_backend.py \
+            tools/test_judge_live_roundtrip.py \
+            tools/test_judge_wiring.py \
+            tools/test_ledger_never_writes_a_secret.py \
+            tools/test_pip_install_target.py \
+            tools/test_policy_state_fails_closed.py \
+            tools/test_procedural_memory_japanese.py \
+            tools/test_secrets_are_not_readable.py \
+            tools/test_setup_tls.py \
+            tools/test_shell_timeout_tree.py \
+            tools/test_tool_ledger.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py
