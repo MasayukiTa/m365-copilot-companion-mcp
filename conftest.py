@@ -57,6 +57,11 @@ LIVE_RECORD_REDIRECTS = {
     "tools.auth_stats": {"_STATS_FILE": "auth_stats.json"},
     "tools.skill_ops": {"_SKILL_USE_LOG": "skill_use.jsonl"},
     "relay.mechanism_telemetry": {"LOG": "mechanisms.jsonl"},
+    # THE GAUGE READS THIS FILE DIRECTLY. Every turn the fleet sends is appended here, and the
+    # cockpit's rate strip renders whatever it finds -- so a test that records a turn does not
+    # just dirty a log, it puts invented traffic on the operator's headroom display and moves
+    # the colour toward red for a burst that never happened.
+    "relay.quota_meter": {"METER_PATH": "quota_meter.jsonl"},
     "relay.ownership": {"LEDGER": "ownership.jsonl"},
     "relay.edge_reconnect": {"CONN_URL_CACHE": "conn_manager_url.txt"},
     "relay.selfimprove.branches": {"DEFAULT_PATH": "branches.jsonl"},

@@ -70,8 +70,36 @@ public class K {
 }
 "@
 
+# DISK, NOT JUST WINDOWS. This is the only loop that already watches all three managed
+# profiles, so it is where the cache ceiling gets checked. Nothing checked it before: the value
+# that reads like a disk cap (edge_recover.RECYCLE_EDGE_CAP_MB, 1500) is compared against RAM,
+# and the trim that does delete cache is fail-closed on "is this profile running" -- which the
+# fleet Edge and the bridge Edge always are. A cap that never fired and a trim that always
+# declined let 1.45 GB accumulate across two browsers holding one chat origin.
+#
+# Every five minutes, not every two seconds: the check walks the cache directories, and the
+# thing it is guarding against takes hours to happen.
+$capEvery = 300
+$lastCap = (Get-Date).AddSeconds(-$capEvery)
+
 while ($true) {
     Start-Sleep -Seconds 2
+
+    if ((New-TimeSpan -Start $lastCap -End (Get-Date)).TotalSeconds -ge $capEvery) {
+        $lastCap = Get-Date
+        # Out-of-process on purpose: the ceiling, the worker count it is derived from, and the
+        # rule about never deleting under a running browser all live in one Python module with
+        # tests. A PowerShell re-implementation here would be a second copy of the directory
+        # list, which is exactly how GrShaderCache came to be missed on one side only.
+        $py = Join-Path $repoRoot ".venv\Scripts\python.exe"
+        if (-not (Test-Path $py)) { $py = "python" }
+        # -m resolves against the CURRENT directory, and this loop is started from wherever the
+        # launcher happened to be. Without the push it silently fails to import relay every
+        # time -- the loop keeps running, the windows keep being minimized, and the cap that
+        # was added is never once applied.
+        Push-Location $repoRoot
+        try { & $py -m relay.edge_disk_cap 2>&1 | Out-Null } catch { } finally { Pop-Location }
+    }
 
     # back off while sign-in is being surfaced
     if (Test-Path $pauseFile) {
