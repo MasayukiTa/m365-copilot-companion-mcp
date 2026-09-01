@@ -251,6 +251,33 @@ if ($listening) {
     }
 }
 
+# ---------------------------------------------------------------------------------------
+# THE ONE MOMENT THIS PROFILE IS NOT LOCKED. Everything above either exited or established
+# that no Edge holds this profile, so this is the only point in the profile's life where its
+# cache can simply be deleted. It matters because the live-browser route cannot finish the
+# job: clearing the bridge's cache over CDP took it from 646 MB to 358 MB and no further --
+# the remainder is files the running process still holds open. Measured, not assumed.
+#
+# What accumulated without this: 1.45 GB across two profiles, 1.07 GB of it cache, for two
+# browsers that between them keep one chat origin open. Nothing in the project capped it --
+# should_recycle() reads like a disk cap and is fed RAM.
+# The ceiling is the fleet's own size: 2 MB per worker, floored at one worker. A worker is one
+# conversation against one origin, so its working set is small and repeats.
+$capMB = 2
+try {
+    $statusPath = Join-Path (Split-Path $PSScriptRoot -Parent) ".fleet\status.json"
+    if (Test-Path $statusPath) {
+        $w = (Get-Content $statusPath -Raw | ConvertFrom-Json).workers
+        if ($w -and $w.Count -gt 0) { $capMB = 2 * $w.Count }
+    }
+} catch { }
+# In its own file so it can be run against a directory with no browser in the picture -- see
+# the header there, and scripts\test_prune_edge_cache.py.
+try {
+    & (Join-Path $PSScriptRoot "win\prune_edge_cache.ps1") -ProfileDir $dataDir -CapMB $capMB |
+        ForEach-Object { Write-Host ("  " + $_) }
+} catch { Write-Host "  (cache prune skipped: $_)" }
+
 # Locate msedge.exe (standard install paths, then PATH).
 $edge = $null
 $candidates = @(
@@ -303,6 +330,28 @@ $arguments += @(
     "--disable-component-update",
     "--disable-features=Translate,MediaRouter,OptimizationHints",
     "--process-per-site",
+    # BOUND THE CACHE AT LAUNCH, then let relay\edge_disk_cap.py hold the real number. Left
+    # to itself Chromium sizes the cache from free disk space, which on a roomy machine means
+    # hundreds of megabytes for a profile that re-fetches the same handful of assets.
+    #
+    # This flag is worth exactly what it was measured to be worth, and no more. Two throwaway
+    # profiles, same pages, same loads, one carrying --disk-cache-size=2MB:
+    #
+    #     arm       Cache      Code Cache
+    #     capped    27.64 MB    1.64 MB
+    #     control   33.85 MB   21.13 MB
+    #
+    # It governs the code cache almost exactly (1.64 against a 2 MB request, 13x under the
+    # control) and does NOT govern the HTTP cache (27.64 against that same request). The
+    # expectation was the reverse, so the flag alone would have been called done while the
+    # bigger half stayed uncapped. The prune above and the periodic cap are what make the
+    # number true; this just stops a session from running away between them.
+    "--disk-cache-size=$($capMB * 1048576)",
+    # GrShaderCache held 12 MB in EVERY managed profile and no cache-clearing route reaches
+    # it -- CDP's Network.clearBrowserCache does not, and it outlived every trim because the
+    # existing name list spelled it "shadercache". Nothing here renders anything anyone looks
+    # at (--disable-gpu is already set below), so there is no shader worth keeping.
+    "--disable-gpu-shader-disk-cache",
     # THE GPU PROCESS IS THE LARGEST SINGLE ITEM AND NOTHING HERE IS LOOKED AT. Measured
     # on a throwaway profile, an idle browser costs 226 MB of private working set with
     # it and 170 without -- 56 MB, a quarter of the whole browser. On the live companion

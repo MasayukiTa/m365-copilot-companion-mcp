@@ -477,8 +477,14 @@ def companion_edge_mb(profile_marker="copilot-companion-edge"):
 #: EVER TOUCHED. In particular Cookies, "Login Data", "Local Storage" and the token cache stay,
 #: because clearing them signs the profile out, and a signed-out profile surfaces a login tab in
 #: front of the operator -- the one thing the browser side of this project is not allowed to do.
+# "shadercache" was here and "grshadercache" was not, so the 12 MB Edge actually writes to
+# GrShaderCache in EVERY managed profile was walked straight past on every trim -- the eval
+# profile was asked to trim, reported success, and freed exactly zero bytes because every byte
+# it held was in directories missing from this tuple. The crx caches are downloaded extension
+# payloads, re-fetched on demand.
 _CACHE_DIR_NAMES = ("cache", "code cache", "gpucache", "dawncache", "shadercache",
-                    "service worker", "cachestorage")
+                    "grshadercache", "service worker", "cachestorage",
+                    "extensions_crx_cache", "component_crx_cache")
 
 
 def _is_cache_dir(path):

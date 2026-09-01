@@ -180,10 +180,22 @@ def test_real_browser_over_the_captured_html():
     sync_playwright = _playwright()
     html = "<body>" + "".join(b["outerHTML"] for b in DOM["blocks"]) + "</body>"
     with sync_playwright() as p:
-        try:
-            browser = p.chromium.launch()
-        except Exception as exc:
-            pytest.skip("no chromium binary: %r" % (exc,))
+        # THE INSTALLED EDGE, NOT A SECOND BROWSER ON DISK. A bare .launch() wants
+        # playwright's own bundled Chromium, and that bundle is 655 MB in %LOCALAPPDATA%
+        # \ms-playwright -- downloaded for this one test, because every other call site in
+        # the repository (17 of 18) uses connect_over_cdp against the Edge that is already
+        # running. Edge is what production drives, so channel="msedge" is also the more
+        # faithful surface to read these selectors through; the bundle is the fallback,
+        # not the default.
+        browser = None
+        for kwargs in ({"channel": "msedge"}, {}):
+            try:
+                browser = p.chromium.launch(**kwargs)
+                break
+            except Exception as exc:
+                last = exc
+        if browser is None:
+            pytest.skip("no chromium binary: %r" % (last,))
         page = browser.new_page()
         page.set_content(html)
 
