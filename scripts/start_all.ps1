@@ -158,7 +158,13 @@ function Start-Splash {
         $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
         $f.ClientSize = New-Object System.Drawing.Size(440, 140)
         $f.TopMost = $true
-        $f.ControlBox = $false
+        # AN ESCAPE ROUTE, ALWAYS. This was ControlBox=$false, so the splash could not be
+        # closed -- and the config dialog that start_all re-opens can appear BEHIND it. The
+        # combination produced an application that looked hung and could not be dismissed
+        # except through the task manager. A progress window is not worth trapping someone
+        # in, and if closing it early were harmful the answer would be to not need the
+        # window, not to remove its close button.
+        $f.ControlBox = $true
         $f.MaximizeBox = $false
         $f.MinimizeBox = $false
         $title = New-Object System.Windows.Forms.Label
@@ -508,10 +514,33 @@ function Invoke-FirstTimeSetupGate {
     # fresh (normal) show-state, breaking the hidden-parent inheritance, so the setup dialog can
     # actually be seen even though start_all itself is running invisibly. -Wait blocks this
     # (interactive, first-run-only) setup step before any service starts, mirroring quickstart.bat.
+    # BOUNDED, AND IT UNWINDS THE WHOLE TREE. -Wait with no timeout is what made this
+    # unrecoverable: a dialog that never gets answered -- because it is behind the splash, or
+    # because the person walked away -- blocked startup for ever. Killing only the parent
+    # would leave the dialog orphaned on screen, so the wait cancels the process tree.
+    $cfgTimeoutSec = 300
     try {
-        Start-Process powershell -ArgumentList @(
+        $p = Start-Process powershell -ArgumentList @(
             "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $cfgScript
-        ) -WorkingDirectory $root -Wait
+        ) -WorkingDirectory $root -PassThru
+        if (-not $p.WaitForExit($cfgTimeoutSec * 1000)) {
+            Write-Host "[setup] the configuration dialog was not answered within $cfgTimeoutSec seconds -- continuing without it."
+            Write-Host "[setup] run scripts\configure_env.ps1 yourself when ready, then start again."
+            try {
+                & taskkill.exe /PID $p.Id /T /F 2>&1 | Out-Null
+            } catch { }
+        } else {
+            # READ WHAT IT SAID. The exit code used to be discarded, so cancelled, crashed and
+            # saved-but-blank were indistinguishable -- and all three led straight back to the
+            # same prompt on the next startup, with nothing said about which had happened.
+            switch ($p.ExitCode) {
+                0 { }
+                2 { Write-Host "[setup] setup was cancelled -- the agent URL is still unset." }
+                3 { Write-Host "[setup] the dialog was saved with the agent URL left blank -- it is still unset." }
+                4 { Write-Host "[setup] the setup dialog could not run on this machine. Edit .env by hand and set MCP_IMPL_AGENT_URL." }
+                default { Write-Host "[setup] configure_env.ps1 exited with code $($p.ExitCode)." }
+            }
+        }
     } catch {
         Write-Host "[setup] configure_env.ps1 failed to launch: $_"
     }
@@ -964,6 +993,7 @@ function Invoke-Startup {
 # so the window stays visible the whole time. If the splash can't be built/shown, run startup
 # directly so it is NEVER blocked.
 $script:splash = $null
+$script:startupFailures = @()
 $ranViaSplash = $false
 try {
     if (-not $NoSplash) { $script:splash = Start-Splash }
@@ -973,7 +1003,10 @@ try {
         $timer.Interval = 80
         $timer.Add_Tick({
             $timer.Stop()
-            try { Invoke-Startup } catch { }
+            # THE EXCEPTION USED TO VANISH HERE. `catch { }` on the entire startup meant a
+            # failure anywhere in it left no trace at all: no message, no code, nothing to
+            # read. The splash closed and everything looked finished.
+            try { Invoke-Startup } catch { $script:startupFailures += "startup: $($_.Exception.Message)" }
             try { $script:splash.Form.Close() } catch { }
         })
         $timer.Start()
@@ -982,4 +1015,21 @@ try {
         $ranViaSplash = $true
     }
 } catch { $ranViaSplash = $false }
-if (-not $ranViaSplash) { $script:splash = $null; Invoke-Startup }
+if (-not $ranViaSplash) {
+    $script:splash = $null
+    try { Invoke-Startup } catch { $script:startupFailures += "startup: $($_.Exception.Message)" }
+}
+
+# WHAT WENT WRONG, SAID OUT LOUD AT THE END. This script returns 0 whatever happens, so a
+# caller checking its exit code learns nothing -- the missing thing was never the code, it was
+# any statement of the failure. Printed last so it is the final thing on screen rather than
+# something that scrolled past during a two-minute startup.
+if ($script:startupFailures.Count -gt 0) {
+    Write-Host ""
+    Write-Host "=========================================================" -ForegroundColor Yellow
+    Write-Host " Startup finished with $($script:startupFailures.Count) problem(s)" -ForegroundColor Yellow
+    Write-Host "=========================================================" -ForegroundColor Yellow
+    foreach ($f in $script:startupFailures) { Write-Host "  - $f" -ForegroundColor Yellow }
+    Write-Host "  Run doctor.bat for the specific fix for each line." -ForegroundColor Yellow
+    Write-Host ""
+}

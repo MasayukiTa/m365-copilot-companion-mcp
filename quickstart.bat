@@ -218,8 +218,23 @@ echo ===========================================================================
 echo  Health check  (is every link green?)
 echo ===========================================================================
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\doctor.ps1"
+REM READ THE RESULT. doctor exits with the number of FAILED checks and this was thrown away,
+REM so "SETUP COMPLETE" printed over a screen of red. Two other steps in this file already
+REM check exit codes, so ignoring it here was an inconsistency, not a convention. Optional
+REM checks no longer count toward that number, so a non-zero value now means something a
+REM person has to act on.
+set "DOCTOR_BAD=%ERRORLEVEL%"
 
 echo.
+if not "!DOCTOR_BAD!"=="0" (
+    echo ===========================================================================
+    echo  SETUP INCOMPLETE - !DOCTOR_BAD! check^(s^) failed
+    echo ===========================================================================
+    echo   The lines marked FAIL above each printed their own fix. Work through
+    echo   those, then run  doctor.bat  again to re-check.
+    echo   Anything marked WARN is optional and does not block you.
+    goto :after_banner
+)
 echo ===========================================================================
 echo  SETUP COMPLETE
 echo ===========================================================================
@@ -229,6 +244,7 @@ echo   Two windows opened: CopilotChat (talk to it) and FleetCockpit (watch runs
 echo   Optional Deep Review: MCP_REVIEW_P2C=1 ^(deep^) or 2 ^(full validation^), plus MCP_EXECUTION_PROFILES=1
 echo   in .env, then re-run start_all.bat. It uses headless LOCAL_LOOP by default.
 echo   Any RED above?  doctor printed the exact fix for each line.
+:after_banner
 echo.
 pause
 endlocal
