@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Keeps the MCP server and the Dev Tunnel host alive.
 

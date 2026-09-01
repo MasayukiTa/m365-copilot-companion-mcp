@@ -17,9 +17,13 @@ if (Test-Path $p) {
     }
 }
 
+# A PLACEHOLDER IN A COPY-ME LIST IS WORSE THAN AN ERROR. This block exists so someone can
+# paste three values into Copilot Studio, and this line used to hand them
+# "<Dev Tunnel not up yet ...>" formatted exactly like the two real values beside it. It gets
+# pasted. The value is either real or it is refused by name.
 $turl = $envv['MCP_TUNNEL_URL']
+$serverUrl = $null
 if ($turl) { $serverUrl = ($turl.TrimEnd('/')) + '/mcp' }
-else { $serverUrl = '<Dev Tunnel not up yet -- run start_all.bat (or setup_devtunnel.ps1), then re-run this>' }
 
 if ($envv['MCP_API_KEY']) { $bearer = 'Bearer ' + $envv['MCP_API_KEY'] }
 else { $bearer = '<no Bearer yet -- run quickstart.bat first>' }
@@ -28,7 +32,14 @@ Write-Host ""
 Write-Host "Copilot Studio  ->  your agent  ->  Tools -> Add a tool -> New tool -> Model Context Protocol" -ForegroundColor Cyan
 Write-Host "Auth = API key,  Type = Header.  Paste these 3 values (everything else: defaults):" -ForegroundColor Cyan
 Write-Host "==================================================================================="
-Write-Host "  1) Server URL     :  " -NoNewline; Write-Host $serverUrl -ForegroundColor Green
+if ($serverUrl) {
+    Write-Host "  1) Server URL     :  " -NoNewline; Write-Host $serverUrl -ForegroundColor Green
+} else {
+    Write-Host "  1) Server URL     :  NOT AVAILABLE YET" -ForegroundColor Yellow
+    Write-Host "                       The Dev Tunnel is not up, so there is no URL to copy." -ForegroundColor Yellow
+    Write-Host "                       Run start_all.bat, then run this again. Do not paste" -ForegroundColor Yellow
+    Write-Host "                       anything here until it shows an https address." -ForegroundColor Yellow
+}
 Write-Host "  2) Header name    :  " -NoNewline; Write-Host "Authorization" -ForegroundColor Green
 Write-Host "  3) API key value  :  " -NoNewline; Write-Host $bearer -ForegroundColor Green -NoNewline; Write-Host "   (paste the WHOLE line incl. the word Bearer)"
 Write-Host "==================================================================================="
