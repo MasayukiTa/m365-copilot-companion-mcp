@@ -614,6 +614,7 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
                 "Everything graded so far is recorded; re-run to continue."
                 % (n, have, DISK_FLOOR_GB))
             break
+        _before_free = have
         log("-" * 72)
         log("batch %d: %d x %s  (free %.2f GiB)  %s"
             % (n, len(group), lang_of(group[0]) or "?", have,
@@ -725,6 +726,7 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
         _shadow_verify(group)
 
         graded_before = len(graded_ids())
+
         # THE PRO GRADER, NOT THE LITE ONE. swe_grade_batch.py drives grade.py on the eval
         # host, which passes --dataset_name princeton-nlp/SWE-bench_Lite. Pro instances are not
         # in Lite, so the harness found nothing, wrote no report, and every verdict came back
@@ -748,7 +750,18 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
 
         _discard()
         done += len(group)
-        log("  after batch %d: free %.2f GiB, %d worktree dir(s) left" % (n, free_gb(), worktrees_present()[0]))
+        # "0 worktree dir(s) left" IS NOT "the space came back". Measured across three go
+        # batches: 8.22 -> 6.67 -> 6.20 GiB with every worktree deleted each time. The cost that
+        # persists lives outside the worktree -- 1,045 MB in the Go module cache and 899 MB in
+        # go-build after three batches -- and reporting only the worktrees says the cleanup
+        # worked while the disk is being consumed by something the cleanup does not touch.
+        # The sizing itself is safe either way: it reads free space at each batch start, so it
+        # narrows on its own. It is the report that was wrong.
+        _after = free_gb()
+        _kept = _before_free - _after
+        log("  after batch %d: free %.2f GiB, %d worktree dir(s) left" % (n, _after, worktrees_present()[0]))
+        if _kept > 0.2:
+            log("    %.2f GiB did not come back with the worktrees (caches outside them)" % _kept)
 
     log("cycle end: %d instance(s) attempted, %d graded in total, free %.2f GiB"
         % (done, len(graded_ids()), free_gb()))
