@@ -30,6 +30,7 @@ first is a mistake this repository has already been corrected for.
 from __future__ import annotations
 
 import fnmatch
+import re
 
 #: A claim can be checked, and the check passed.
 SUPPORTED = "SUPPORTED"
@@ -67,6 +68,53 @@ def _command_of(call: dict) -> str:
         if isinstance(val, str) and val.strip():
             return val
     return ""
+
+
+def _segments(command: str):
+    """The commands inside one recorded call.
+
+    A worker almost never writes the acceptance command as the whole of a line. It chains a `cd`,
+    prefixes a `set VAR=value`, or shells out from run_python with an argv list. Each of those
+    put the head of the line somewhere other than the binary, and the check read the line as one
+    string -- so a real test run was recorded as no test run at all. Measured: pytest ran 21
+    times across instances whose contract names pytest, and one was recognised.
+
+    Yields the whole line first, then each piece, so a plain command costs nothing extra.
+    """
+    text = (command or "").strip()
+    if not text:
+        return
+    yield text
+
+    # SHELL CHAINS. `cd /d <path> && pytest ...`, `a; b`, `x || y`. Splitting on the operators is
+    # enough: each piece is then an ordinary command line and gets the ordinary check.
+    parts = re.split(r"&&|\|\||;|(?<![|>])\|(?!\|)", text)
+    if len(parts) > 1:
+        for p in parts:
+            p = p.strip()
+            if p:
+                yield p
+
+    # WINDOWS ENV PREFIX. `set FOO=bar&& cmd` survives the split above only when the shell used
+    # `&&`; `set FOO=bar & cmd` and the no-space form do not, so strip a leading set explicitly.
+    m = re.match(r"(?i)^\s*set\s+[^=\s]+=[^&]*&+\s*(.+)$", text)
+    if m:
+        yield m.group(1).strip()
+
+    # ARGV LISTS INSIDE run_python. subprocess.run(["python","-m","pytest","tests/x","-q"]) is a
+    # command; the recorded "command" is the surrounding Python source, whose head is `import`.
+    for lst in re.findall(r"\[([^\[\]]*?)\]", text):
+        items = re.findall(r"['\"]([^'\"]+)['\"]", lst)
+        if len(items) >= 2:
+            yield " ".join(items)
+
+
+def matches_check(command: str, check_command: str) -> bool:
+    """True when any command inside this call is the acceptance command."""
+    for seg in _segments(command):
+        if _matches_check(seg, check_command):
+            return True
+    return False
 
 
 def _matches_check(command: str, check_command: str) -> bool:
@@ -199,7 +247,7 @@ def _assess(claim_done, contract, events):
     for check in checks:
         want = check.get("command") or ""
         for e in runs:
-            if not _matches_check(_command_of(e["call"]), want):
+            if not matches_check(_command_of(e["call"]), want):
                 continue
             matched.append(e)
             if e["call"].get("ts", 0) >= last_write_ts:
