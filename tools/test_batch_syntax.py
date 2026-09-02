@@ -194,3 +194,44 @@ def test_autostart_defaults_to_no_and_the_launcher_to_yes():
     assert "[y/N]" in QS[i:i + 120]
     j = QS.index("Create a one-click")
     assert "[Y/n]" in QS[j:j + 160]
+
+
+def test_quickstart_no_longer_tells_the_reader_to_run_other_commands():
+    """quickstart.bat is the ONLY install method, so delegating is a defect.
+
+    It used to end with "run doctor.bat again" and the doctor's own fix lines sent people to
+    start_companion_edge.ps1 and to a log file. That is homework, not an install procedure --
+    and it is why a fresh machine finished red while every individual piece worked.
+    """
+    src = QS
+    assert "run  doctor.bat  again" not in src, "still sends the reader to another command"
+    assert "run quickstart.bat again" in src, "does not say how to resume"
+
+
+def test_quickstart_signs_in_rather_than_asking_the_reader_to():
+    src = QS
+    assert "ensure_m365_signin.ps1" in src, "sign-in is still left to the operator"
+
+
+def test_quickstart_prints_the_server_error_itself():
+    # Naming .setup\logs\server.err.log is the same delegation one layer down. If the only
+    # install method cannot say why the server died, nobody can.
+    src = QS
+    assert "server.err.log" in src
+    assert "Get-Content -Tail" in src, "the log is named but never shown"
+
+
+def test_the_error_block_uses_no_bare_parentheses():
+    """THE BUG THAT REAL EXECUTION CAUGHT AND THE LINT DID NOT.
+
+    The first version used `for %%A in (...) do if %%~zA GTR 0 (...)` to test the log's size.
+    Inside the enclosing if-block those parentheses had to be escaped, which broke `for` itself:
+    cmd reported an invalid use of (...) and the block aborted. The heuristic lint above passed
+    it. It is now one quoted powershell call -- parentheses inside a quoted argument are not
+    parsed by cmd at all, so the hazard is removed rather than escaped around.
+    """
+    src = QS
+    i = src.index("SHOW THE SERVER")
+    block = src[i:src.index("goto :after_banner", i)]
+    assert "for %%A" not in block, "the parenthesised for-loop is back"
+    assert "^(" not in block, "escaped parentheses are back in this block"
