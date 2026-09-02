@@ -136,3 +136,47 @@ def test_the_mapping_shape_still_works(_files):
     io.open(str(_files / "results.json"), "w", encoding="utf-8").write(
         json.dumps({"a1": True, "a2": False}))
     assert C.graded_ids() == {"a1", "a2"}
+
+
+def test_the_cycle40_condition_no_longer_retires_everything(_files):
+    """The regression, reproduced as a condition rather than as a story.
+
+    cycle40 ran while the eval host's docker was down, so the results ledger stayed empty and
+    39 of 40 instances had a patch on disk from their first attempt. Measured against the real
+    gate under exactly that state: the old rule left ONE instance to run and retired the other
+    39 unmeasured, holding whatever they had produced. This asserts the shape of that, so the
+    next person who unions "a file exists" into the skip set has to argue with a number.
+    """
+    ids = ["i%02d" % n for n in range(40)]
+    # grading unavailable -> results file absent -> graded_ids() empty
+    _preds(_files, [{"instance_id": i, "patch": "diff --git a/x b/x"} for i in ids[:39]])
+
+    old_gate = C.graded_ids() | C.captured_ids()
+    assert len([i for i in ids if i not in old_gate]) == 1, (
+        "the old gate is not being reproduced; this test no longer measures the regression")
+
+    new_gate = C.graded_ids() | C.refused_ids() | C.exhausted_ids()
+    assert len([i for i in ids if i not in new_gate]) == 40, (
+        "an ungraded patch is being treated as a finished instance again")
+
+
+def test_the_cap_still_ends_it(_files):
+    # The other half: retrying must not become endless. Two attempts and the same condition
+    # stops the run rather than spending the quota for ever.
+    ids = ["i%02d" % n for n in range(40)]
+    _preds(_files, [{"instance_id": i, "patch": "diff"} for i in ids])
+    C.note_attempts(ids)
+    C.note_attempts(ids)
+    left = [i for i in ids if i not in (C.graded_ids() | C.refused_ids() | C.exhausted_ids())]
+    assert left == [], "the attempt cap did not stop the retries: %d left" % len(left)
+
+
+def test_a_graded_instance_is_untouched_by_the_widening(_files):
+    # Widening the retry must not have widened re-measurement. A graded instance stays graded
+    # whatever its verdict, which is the rule that keeps the number honest.
+    ids = ["g1", "g2", "u1"]
+    io.open(str(_files / "results.json"), "w", encoding="utf-8").write(
+        json.dumps({"g1": True, "g2": False}))
+    _preds(_files, [{"instance_id": i, "patch": "diff"} for i in ids])
+    gate = C.graded_ids() | C.refused_ids() | C.exhausted_ids()
+    assert [i for i in ids if i not in gate] == ["u1"]
