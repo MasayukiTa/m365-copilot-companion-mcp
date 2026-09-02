@@ -98,8 +98,32 @@ def _matches_check(command: str, check_command: str) -> bool:
     if fnmatch.fnmatch(cmd, want + "*"):
         return True
     # The named binary with its flags in some other order; a worker reordering flags is not
-    # evading anything.
-    return all(part in parts for part in want.split()[1:])
+    # evading anything. A PACKAGE SELECTOR is matched by kind rather than by text: `go test
+    # ./...` names its target in the tail, so narrowing it replaces that token instead of
+    # appending one, and requiring the literal `./...` rejected every narrowed run. Seven
+    # instances read as "never run" that way in one night, across three languages -- and the
+    # docstring above says narrowing is ordinary and correct. What is NOT accepted is dropping
+    # the target: a selector must still be answered by a selector.
+    for part in want.split()[1:]:
+        if part in parts:
+            continue
+        if _is_selector(part) and any(_is_selector(p) for p in parts):
+            continue
+        return False
+    return True
+
+
+def _is_selector(token: str) -> bool:
+    """A package or path target, as opposed to a flag or a subcommand.
+
+    Only these are matched by kind. Anything else in the acceptance command -- `test`, `-x`,
+    `--count=1` -- still has to be there literally, which is what keeps `go build ./...` from
+    satisfying a contract that asked for `go test ./...`.
+    """
+    t = (token or "").strip()
+    if not t or t.startswith("-"):
+        return False
+    return t.startswith("./") or t.startswith("../") or t == "..." or "/..." in t
 
 
 def _basename(token: str) -> str:
