@@ -40,6 +40,9 @@ EXCLUDED = {
         "reads a gitignored .fleet artifact that is absent in a fresh checkout",
     "scripts/test_prune_edge_cache.py":
         "Edge profile layout under a Windows LOCALAPPDATA tree; run by windows-install-smoke",
+    "tools/test_instructions_do_not_accumulate_cases.py":
+        "asserts that skills/ is non-empty, but skills/ is gitignored on purpose "
+        "(data, never code), so a fresh checkout has none by design",
     "tests/test_integration_evidence.py":
         "same source-walk, same separator assumption",
     "tests/test_outcome_enum_closed.py":
