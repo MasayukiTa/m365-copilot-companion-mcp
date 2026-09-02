@@ -99,18 +99,39 @@ def launch_grade(inst, diff, runid):
 
 
 def poll_verdict(runid):
-    """scp the verdict file back; return 'RESOLVED'/'not'/'' (not done yet)."""
+    """scp the verdict file back; return (verdict, why).
+
+    verdict is 'RESOLVED' / 'not' / 'EVALERR' / '' (not finished yet). `why` carries the far
+    side's own words for anything that is not a clean answer -- EVALERR without a cause is the
+    one verdict that cannot be acted on, and thirty of them were recorded with an empty note
+    because this threw the rest of the file away after reading one line out of it.
+    """
     remote_verdict = "%s/verdicts/%s.verdict" % (R.REMOTE_DIR, runid)
     lv = os.path.join(TMP, runid + ".verdict")
     if R._scp_from(remote_verdict, lv):
         try:
             content = open(lv, encoding="utf-8", errors="replace").read()
-        except Exception:
-            content = ""
+        except Exception as exc:
+            return "EVALERR", "verdict file unreadable: %s" % exc
         if "RUNNER_DONE" in content:
             m = re.search(r"VERDICT=([A-Za-z]+)", content)
-            return m.group(1) or "EVALERR"
-    return ""
+            if not m:
+                # WAS A CRASH. re.search returns None here and `m.group(1)` raised
+                # AttributeError inside the poll loop, so one malformed verdict file took down
+                # the grading of every instance still in flight rather than just its own.
+                return "EVALERR", ("finished but wrote no VERDICT= line; file said: "
+                                   + _tail_reason(content))
+            v = m.group(1) or "EVALERR"
+            return v, ("" if v.upper() not in ("EVALERR",) else _tail_reason(content))
+    return "", ""
+
+
+def _tail_reason(content, limit=300):
+    """The informative end of a verdict file, for the note. Blank lines and the marker itself
+    carry nothing, so they are dropped rather than filling the field with padding."""
+    lines = [ln.strip() for ln in (content or "").splitlines() if ln.strip()]
+    lines = [ln for ln in lines if not ln.startswith("RUNNER_DONE")]
+    return (" | ".join(lines[-4:]))[:limit] or "(the verdict file was empty)"
 
 
 def main():
@@ -181,11 +202,16 @@ def main():
         time.sleep(a.poll_s)
         for runid in list(inflight):
             inst, deadline = inflight[runid]
-            v = poll_verdict(runid)
+            v, why = poll_verdict(runid)
             if v:
-                append_result(a.results, {"instance_id": inst, "verdict": v, "runid": runid,
-                                          "ts": int(time.time())})
-                log("  VERDICT %s -> %s" % (inst, v))
+                row = {"instance_id": inst, "verdict": v, "runid": runid,
+                       "ts": int(time.time())}
+                # ONLY WHEN THERE IS SOMETHING TO SAY. A note on a clean RESOLVED is noise; a
+                # missing note on an EVALERR is the whole problem.
+                if why:
+                    row["note"] = why
+                append_result(a.results, row)
+                log("  VERDICT %s -> %s%s" % (inst, v, (" (%s)" % why) if why else ""))
                 del inflight[runid]
             elif time.time() > deadline:
                 append_result(a.results, {"instance_id": inst, "verdict": "EVALERR",
