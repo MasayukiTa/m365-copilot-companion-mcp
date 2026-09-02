@@ -48,6 +48,32 @@ REMOTE_WSL = "/mnt/c/swe-grade"
 VENV_PY = "/root/swe-venv/bin/python"
 
 
+def log(msg):
+    """Print so it can actually be READ while this runs.
+
+    Nineteen bare print() calls meant a block-buffered stdout: launched into a log file, as it
+    normally is, this produced an EMPTY file for tens of minutes and there was no way to tell a
+    working run from a hung one. Encode-safe for the same reason pro_cycle's is -- this console
+    is cp932 and a replacement character in a grader's output has taken a long run down before,
+    and a line of output is not worth a run.
+    """
+    try:
+        print(msg, flush=True)
+    except Exception:
+        try:
+            enc = (getattr(sys.stdout, "encoding", None) or "utf-8")
+            print(str(msg).encode(enc, "replace").decode(enc, "replace"), flush=True)
+        except Exception:
+            # LAST RESORT ONLY. A bare pass here hid a RecursionError for three checks when the
+            # body of this function accidentally called itself: every message vanished and the
+            # run looked silent rather than broken. If even the encode-safe print fails there is
+            # nowhere left to write, but it must not look like success.
+            try:
+                sys.__stderr__.write("log() failed" + chr(10))
+            except Exception:
+                pass
+
+
 def ssh_host() -> str:
     try:
         from dotenv import load_dotenv
@@ -244,13 +270,13 @@ def main(argv=None):
 
     host = ssh_host()
     if not host:
-        print("no eval host configured: set EVAL_SSH_HOST (or SWE_EVAL_HOST)")
+        log("no eval host configured: set EVAL_SSH_HOST (or SWE_EVAL_HOST)")
         return 2
 
     with open(a.preds, encoding="utf-8-sig") as fh:
         preds = json.load(fh)
     rows = gradeable(preds)
-    print("%d of %d predictions are gradeable (empty patches dropped)" % (len(rows), len(preds)))
+    log("%d of %d predictions are gradeable (empty patches dropped)" % (len(rows), len(preds)))
     if not rows:
         return 1
 
@@ -264,9 +290,9 @@ def main(argv=None):
 
     script = grade_script(raw_wsl, preds_wsl, out_wsl, out_log, workers=a.workers)
     if a.dry_run:
-        print("would stage %d predictions to %s" % (len(rows), preds_win))
-        print("--- script ---")
-        print(script)
+        log("would stage %d predictions to %s" % (len(rows), preds_win))
+        log("--- script ---")
+        log(script)
         return 0
 
     local_preds = os.path.join(SW, "pro_preds_%s.json" % a.tag)
@@ -278,17 +304,17 @@ def main(argv=None):
 
     locks = clear_stale_locks()
     if locks:
-        print("cleared %d stale cloudflared lock(s) before connecting" % locks)
+        log("cleared %d stale cloudflared lock(s) before connecting" % locks)
 
-    print("staging predictions and script...")
+    log("staging predictions and script...")
     if not scp_to(host, local_preds, preds_win):
-        print("could not send the predictions")
+        log("could not send the predictions")
         return 2
     if not scp_to(host, local_sh, sh_win):
-        print("could not send the grade script")
+        log("could not send the grade script")
         return 2
 
-    print("building the raw dataset rows for these instances on the host...")
+    log("building the raw dataset rows for these instances on the host...")
     build = ("wsl.exe -d Ubuntu -u root -- %s -c \"import json;"
              "ids={p['instance_id'] for p in json.load(open('%s'))};"
              "from datasets import load_dataset;"
@@ -297,25 +323,25 @@ def main(argv=None):
              "open('%s','w').write(chr(10).join(json.dumps(r,ensure_ascii=False) for r in rows));"
              "print('RAWROWS',len(rows))\"" % (VENV_PY, preds_wsl, raw_wsl))
     code, out = ssh(host, build, timeout=1800)
-    print(out.strip()[-400:])
+    log(out.strip()[-400:])
     if "RAWROWS" not in out:
-        print("the dataset rows could not be built; not starting a grade that cannot score")
+        log("the dataset rows could not be built; not starting a grade that cannot score")
         return 2
 
-    print("running the grade in ONE held session (the WSL VM tears down between commands)...")
+    log("running the grade in ONE held session (the WSL VM tears down between commands)...")
     run = 'wsl.exe -d Ubuntu -u root -- bash %s' % sh_wsl
     code, out = ssh(host, run, timeout=30000)
-    print(out.strip()[-600:])
+    log(out.strip()[-600:])
 
     local_results = os.path.join(SW, "pro_eval_results_%s.json" % a.tag)
     if not scp_from(host, "%s/pro_out_%s/eval_results.json" % (REMOTE_WIN, a.tag), local_results):
-        print("the grade produced no eval_results.json to collect")
+        log("the grade produced no eval_results.json to collect")
         return 2
     with open(local_results, encoding="utf-8") as fh:
         results = json.load(fh)
     added = ingest(results, a.results)
     resolved = sum(1 for v in results.values() if v)
-    print("graded %d instance(s): RESOLVED %d/%d = %.1f%%  (%d new rows in the ledger)"
+    log("graded %d instance(s): RESOLVED %d/%d = %.1f%%  (%d new rows in the ledger)"
           % (len(results), resolved, len(results),
              100.0 * resolved / max(1, len(results)), added))
     return 0
