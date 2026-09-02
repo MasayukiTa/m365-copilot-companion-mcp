@@ -160,14 +160,29 @@ def graded_ids():
     try:
         data = json.loads(text)
     except ValueError:
+        # LAST ROW WINS, SO A VERDICT CAN BE CORRECTED. This used to add and never remove, and
+        # a false measurement was therefore permanent. It stopped being hypothetical when the
+        # eval host's root filesystem came up read-only: docker could not pull, the harness
+        # returned None, and fourteen instances were recorded as not-resolved in 87 seconds.
+        # Appending EVALERR rows to retract them changed nothing -- the count went 62 -> 77 and
+        # stayed. An append-only log of statements about the same subject means the latest one.
+        #
+        # This can take an instance OUT of the graded set, and that is the correct direction to
+        # fail in: re-measuring costs a run, while keeping a verdict the grader never produced
+        # corrupts the number this whole exercise exists to produce.
+        latest = {}
         for line in text.splitlines():          # JSONL: the shape actually written
             line = line.strip()
             if not line:
                 continue
             try:
-                keep(json.loads(line))
+                row = json.loads(line)
             except ValueError:
                 continue
+            if isinstance(row, dict) and row.get("instance_id"):
+                latest[row["instance_id"]] = row
+        for row in latest.values():
+            keep(row)
         return ids
     if isinstance(data, dict) and "instance_id" in data:
         # ONE JSONL ROW IS ALSO VALID JSON. A results file holding exactly one graded row --

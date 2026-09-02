@@ -751,3 +751,37 @@ def test_the_cycle_never_sends_anyone_to_the_lite_grader():
     for line in said:
         assert "swe_grade_batch" not in line, line
         assert "pro_grade_remote" in line, line
+
+
+# -- correcting a verdict --------------------------------------------------------------------
+
+def test_a_later_row_corrects_an_earlier_one(tmp_path, monkeypatch):
+    """A measurement that turns out to be false has to be retractable.
+
+    The eval host's root filesystem came up read-only, docker could not pull, the harness
+    returned None for fourteen instances and the wrapper recorded each as not-resolved -- all
+    fourteen in 87 seconds. Appending EVALERR rows to retract them did nothing: graded_ids()
+    added an instance the moment any row graded it and no later row could take it back, so the
+    count went 62 -> 77 and stayed. An append-only log of statements about the same subject
+    means the latest one.
+    """
+    results = tmp_path / "r.json"
+    results.write_text(
+        json.dumps({"instance_id": "a", "verdict": "not"}) + "\n"
+        + json.dumps({"instance_id": "b", "verdict": "RESOLVED"}) + "\n"
+        + json.dumps({"instance_id": "a", "verdict": "EVALERR"}) + "\n",
+        encoding="utf-8")
+    monkeypatch.setattr(C, "RESULTS", str(results))
+    assert C.graded_ids() == {"b"}
+
+
+def test_a_later_real_verdict_replaces_an_earlier_error(tmp_path, monkeypatch):
+    """The correction runs both ways: an instance that errored and was then graded for real is
+    graded. Otherwise a single bad session would retire an instance from the ledger."""
+    results = tmp_path / "r.json"
+    results.write_text(
+        json.dumps({"instance_id": "a", "verdict": "EVALERR"}) + "\n"
+        + json.dumps({"instance_id": "a", "verdict": "RESOLVED"}) + "\n",
+        encoding="utf-8")
+    monkeypatch.setattr(C, "RESULTS", str(results))
+    assert C.graded_ids() == {"a"}
