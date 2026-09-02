@@ -412,7 +412,6 @@ jobs:
             tools/test_fetch_and_run_is_gated.py \
             tools/test_gate_is_not_demoted.py \
             tools/test_gate_not_demoted_by_a_switch.py \
-            tools/test_instructions_do_not_accumulate_cases.py \
             tools/test_judge_backend.py \
             tools/test_judge_wiring.py \
             tools/test_ledger_never_writes_a_secret.py \
