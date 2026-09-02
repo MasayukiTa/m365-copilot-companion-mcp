@@ -12,6 +12,7 @@ floor exists because this machine has run out of disk mid-benchmark before, and 
 rule is to free space, not to move the line. So concurrency here is derived FROM the floor: what
 is left after reserving it, divided by what one instance of this language costs.
 """
+import io
 import json
 import os
 
@@ -706,3 +707,47 @@ def test_an_unreadable_slice_does_not_break_the_finish_line(tmp_path, monkeypatc
             for p, n in C.remaining_elsewhere(str(tmp_path / "pro_slice_mine.json"))] == [
         ("pro_slice_good.json", 1)
     ]
+
+
+def _cycle_fn():
+    import ast
+    src = io.open(os.path.join(os.path.dirname(__file__), "pro_cycle.py"),
+                  encoding="utf-8").read()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.FunctionDef) and node.name == "cycle":
+            return node
+    raise AssertionError("cycle() not found")
+
+
+def test_every_exit_reports_what_is_left():
+    """The report has to be on the SILENT exit too, and that is the one it was missing.
+
+    "nothing ungraded in the slice -- done" is what a finished slice prints, and it returned
+    without a word about the other slice file. That is the ending the ninety-minute stall was
+    standing on: the run was correct, complete, and quiet.
+    """
+    import ast
+    fn = _cycle_fn()
+    exits = [n for n in ast.walk(fn) if isinstance(n, ast.Return)]
+    reports = [n for n in ast.walk(fn)
+               if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "report_what_is_left"]
+    assert len(reports) >= 2, (
+        "report_what_is_left must be called at both endings; found %d call(s) for %d return(s)"
+        % (len(reports), len(exits))
+    )
+
+
+def test_the_cycle_never_sends_anyone_to_the_lite_grader():
+    """The advice line said "grade them with bench.swe_grade_batch". That is the Lite grader,
+    and every verdict it returns for a Pro instance is EVALERR -- so following the advice
+    reproduces the bug the run had just hit."""
+    import ast
+    src = io.open(os.path.join(os.path.dirname(__file__), "pro_cycle.py"),
+                  encoding="utf-8").read()
+    said = [n.value for n in ast.walk(ast.parse(src))
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+            and "grade them with" in n.value]
+    assert said, "the advice line disappeared; this test is now measuring nothing"
+    for line in said:
+        assert "swe_grade_batch" not in line, line
+        assert "pro_grade_remote" in line, line
