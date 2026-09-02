@@ -129,6 +129,9 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=9222)
     ap.add_argument("--timeout", type=float, default=600.0,
                     help="how long to wait for the person to finish (default 10 minutes)")
+    ap.add_argument("--check-only", action="store_true",
+                    help="report and exit; never surface the window. For the health check, so "
+                         "there is ONE definition of 'signed in' rather than two that drift.")
     a = ap.parse_args(argv)
 
     ready, why = state(a.port)
@@ -140,6 +143,12 @@ def main(argv=None):
     if ready:
         print("  [ OK ] M365 already signed in on the companion Edge (%s)" % why)
         return 0
+    if a.check_only:
+        # The health check asks a question; it does not take the window. 2 = could not tell,
+        # which the caller must not report as "not signed in" -- that sends somebody to do
+        # something they cannot do.
+        print("  sign-in needed (%s)" % why if ready is False else "  cannot tell (%s)" % why)
+        return 1 if ready is False else 2
     if ready is None:
         # NOT a sign-in failure. Saying "sign in" when the browser is not running sends the
         # person to do something they cannot do.
