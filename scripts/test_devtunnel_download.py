@@ -141,3 +141,53 @@ def test_the_manual_way_out_names_the_url():
     src = _src()
     i = src.index("MANUAL WAY OUT")
     assert "$dlUri" in src[i:i + 800]
+
+
+# ------------------------------------------------- M365 sign-in must not steal the window
+
+
+def _signin_src():
+    return io.open(os.path.join(ROOT, "scripts", "ensure_m365_signin.py"), encoding="utf-8").read()
+
+
+def test_a_missing_tab_is_not_evidence_of_being_signed_out():
+    # THE BUG THIS CAUSED. The first version read "no m365 tab" as "not signed in" and surfaced
+    # the browser. The fleet is websocket-driven and opens NO tabs, so on a signed-in machine
+    # that fired every time -- it yanked the window to the front during a benchmark run.
+    src = _signin_src()
+    assert "opens no tabs" in src, "the stale tab-based assumption is not documented as wrong"
+    assert "def probe(" in src, "nothing probes; the decision is still made from the tab list"
+
+
+def test_the_probe_does_not_focus_the_window():
+    # /json/new opens a tab without raising the window; surface() raises it. Probing must use
+    # the first and never the second.
+    src = _signin_src()
+    i = src.index("def probe(")
+    body = src[i:i + 1200]
+    assert "open_background" in body
+    assert "surface(" not in body, "the probe surfaces the window; probing must be invisible"
+
+
+def test_surfacing_requires_a_real_login_wall():
+    # The only path to taking the window is ready is False, which state()/probe() return only
+    # when a login URL was actually seen.
+    src = _signin_src()
+    i = src.index("edge_recover.surface(")
+    before = src[:i]
+    assert "if ready:" in before and "if ready is None:" in before, (
+        "surface() is reachable without first ruling out 'signed in' and 'cannot tell'")
+
+
+def test_the_probe_cleans_up_after_itself():
+    src = _signin_src()
+    assert "close_tab" in src and "finally:" in src, (
+        "the probe tab is not closed; a health check must leave no trace in the browser")
+
+
+def test_cannot_tell_is_a_third_answer():
+    # "Not signed in" and "cannot tell" must not collapse: telling somebody to sign in when the
+    # browser is not running sends them to do something they cannot do.
+    src = _signin_src()
+    assert "ready=None" in src or "ready is None" in src
+    assert "THIRD answer" in src or "third answer" in src.lower()
