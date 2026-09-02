@@ -206,6 +206,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start_all.ps1"
 
 echo.
 echo ===========================================================================
+echo  Sign in to M365 on the companion browser
+echo ===========================================================================
+echo   Checking in the background. The browser window is only brought forward if
+echo   you actually need to sign in - it will not interrupt you otherwise.
+echo.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\ensure_m365_signin.ps1"
+
+echo.
+echo ===========================================================================
 echo  Health check  (is every link green?)
 echo ===========================================================================
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\doctor.ps1"
@@ -221,9 +230,17 @@ if not "!DOCTOR_BAD!"=="0" (
     echo ===========================================================================
     echo  SETUP INCOMPLETE - !DOCTOR_BAD! check^(s^) failed
     echo ===========================================================================
-    echo   The lines marked FAIL above each printed their own fix. Work through
-    echo   those, then run  doctor.bat  again to re-check.
+    echo   The lines marked FAIL above each printed their own fix.
     echo   Anything marked WARN is optional and does not block you.
+    echo.
+    REM SHOW THE SERVER'S OWN ERROR HERE. Naming a log file is the same delegation one layer
+    REM down, and this is the only install method there is - if quickstart cannot say why the
+    REM server died, nobody can. The supervisor relaunches it on a loop, so re-running
+    REM start_all.bat would change nothing either.
+    powershell -NoProfile -Command "$p = '%~dp0.setup\logs\server.err.log'; if ((Test-Path $p) -and (Get-Item $p).Length -gt 0) { Write-Host '   ---------------------------------------------------------------'; Write-Host '   The MCP server tried to start and stopped. It reported:'; Write-Host '   ---------------------------------------------------------------'; Get-Content -Tail 25 $p; Write-Host '   ---------------------------------------------------------------' }"
+    echo.
+    echo   Fix what is shown above, then run quickstart.bat again.
+    echo   It resumes from where it stopped - nothing is repeated unnecessarily.
     goto :after_banner
 )
 echo ===========================================================================
