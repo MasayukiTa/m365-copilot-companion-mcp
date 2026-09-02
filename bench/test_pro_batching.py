@@ -12,6 +12,9 @@ floor exists because this machine has run out of disk mid-benchmark before, and 
 rule is to free space, not to move the line. So concurrency here is derived FROM the floor: what
 is left after reserving it, divided by what one instance of this language costs.
 """
+import json
+import os
+
 import pytest
 
 from bench import pro_cycle as C
@@ -638,3 +641,68 @@ def test_the_other_shapes_are_still_accepted(tmp_path, monkeypatch):
 def test_a_missing_ledger_means_nothing_is_graded(tmp_path, monkeypatch):
     monkeypatch.setattr(C, "RESULTS", str(tmp_path / "absent.json"))
     assert C.graded_ids() == set()
+
+
+# -- what is left when this slice is done ----------------------------------------------------
+
+def _slice(tmp_path, name, ids):
+    p = tmp_path / name
+    p.write_text(json.dumps(list(ids)), encoding="utf-8")
+    return str(p)
+
+
+def test_a_finished_slice_names_the_slice_that_is_not_finished(tmp_path, monkeypatch):
+    """The stall this closes. The fresh draw was split into a go file and a non-go file, each
+    launched by hand; the non-go one printed "cycle end" and the pipeline sat idle for ninety
+    minutes with fifteen instances never started. Nothing was broken -- the report was scoped to
+    one file and the work was not."""
+    monkeypatch.setattr(C, "SW", str(tmp_path))
+    monkeypatch.setattr(C, "graded_ids", lambda: {"done1"})
+    monkeypatch.setattr(C, "refused_ids", lambda: set())
+    monkeypatch.setattr(C, "exhausted_ids", lambda: set())
+    monkeypatch.setattr(C, "burned_ids", lambda: set())
+    mine = _slice(tmp_path, "pro_slice_mine.json", ["done1"])
+    _slice(tmp_path, "pro_slice_other.json", ["done1", "left1", "left2"])
+
+    assert [(os.path.basename(p), n) for p, n in C.remaining_elsewhere(mine)] == [
+        ("pro_slice_other.json", 2)
+    ]
+
+
+def test_a_burned_slice_is_not_offered_as_work(tmp_path, monkeypatch):
+    """The bug this function shipped with.
+
+    pro_slice50_full.json holds fifty instances, every one of them burned. The first version
+    counted them as unfinished and printed the command to run them, which is a prompt to
+    re-measure a slice that has already seen its own answers. Burned is not merely done; running
+    it is the one thing a benchmark must never do quietly.
+    """
+    monkeypatch.setattr(C, "SW", str(tmp_path))
+    monkeypatch.setattr(C, "graded_ids", lambda: set())
+    monkeypatch.setattr(C, "refused_ids", lambda: set())
+    monkeypatch.setattr(C, "exhausted_ids", lambda: set())
+    monkeypatch.setattr(C, "burned_ids", lambda: {"b1", "b2"})
+    mine = _slice(tmp_path, "pro_slice_mine.json", ["x"])
+    _slice(tmp_path, "pro_slice_burned.json", ["b1", "b2"])
+    _slice(tmp_path, "pro_slice_live.json", ["b1", "fresh1"])
+
+    assert [(os.path.basename(p), n) for p, n in C.remaining_elsewhere(mine)] == [
+        ("pro_slice_live.json", 1)
+    ]
+
+
+def test_an_unreadable_slice_does_not_break_the_finish_line(tmp_path, monkeypatch):
+    """This runs after the work is done. A cycle that completed fifteen instances must not end
+    in a traceback over a malformed file it was never using."""
+    monkeypatch.setattr(C, "SW", str(tmp_path))
+    monkeypatch.setattr(C, "graded_ids", lambda: set())
+    monkeypatch.setattr(C, "refused_ids", lambda: set())
+    monkeypatch.setattr(C, "exhausted_ids", lambda: set())
+    monkeypatch.setattr(C, "burned_ids", lambda: set())
+    (tmp_path / "pro_slice_bad.json").write_text("{not json", encoding="utf-8")
+    _slice(tmp_path, "pro_slice_good.json", ["one"])
+
+    assert [(os.path.basename(p), n)
+            for p, n in C.remaining_elsewhere(str(tmp_path / "pro_slice_mine.json"))] == [
+        ("pro_slice_good.json", 1)
+    ]
