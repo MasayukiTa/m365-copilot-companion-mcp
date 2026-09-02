@@ -371,7 +371,16 @@ def check_slice_is_fresh(ids, allow_burned=False):
 #: worktree in ~/go/pkg/mod, where the per-batch discard cannot see it. Three go instances put
 #: 2.01 GB there in ninety minutes and drove the run into the disk floor. ~670 MB each,
 #: rounded up because instances from different repositories share almost nothing.
-LANG_DISK_MB = {"js": 560, "ts": 560, "python": 120, "go": 700}
+#
+#: MEASURED 2026-09-02, worst observed, not typical -- this number exists to hold a
+#: floor, so the pessimistic reading is the correct one. Free space at batch start
+#: against the low point during it:
+#:     openlibrary (python) 4x  8.19 -> 0.62 GiB   ~1900 MB each  (was 120)
+#:     vuls        (go)     2x  4.08 -> 1.36 GiB   ~1360 MB each  (was 700)
+#:     element-web (js)     2x  8.20 -> 5.96 GiB   ~1150 MB each  (was 560)
+#: The python entry is the one that mattered: at 120 MB this admits four of anything,
+#: and openlibrary alone took a machine from 8 GiB to 620 MB free.
+LANG_DISK_MB = {"js": 1150, "ts": 1150, "python": 1900, "go": 1400}
 
 #: Caches that language toolchains fill OUTSIDE the worktree, so per-batch discard never sees
 #: them and they grow across the whole run. Cleared only as a last resort -- see _reclaim.
@@ -415,7 +424,12 @@ def _clear_toolchain_caches():
         delta = (free_gb() - before) * 1024.0
         freed.append((name, delta if delta > 0 else 0.0))
     return freed
-DEFAULT_DISK_MB = 300
+#: ABOVE EVERY MEASURED ENTRY, deliberately. A language absent from the table is one
+#: nobody has measured, and the safe guess for an unknown cost is the expensive one.
+#: At 300 this was cheaper than every real entry once those were corrected, so an
+#: unmeasured language would have been given the WIDEST batches of anything -- the
+#: exact fail-open the unknown-language test exists to prevent.
+DEFAULT_DISK_MB = 2000
 
 
 def lang_of(inst):
@@ -622,7 +636,11 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
         # Not retried and not repaired here. The condition the gate names does not fix itself
         # between batches, and a driver that restarts the thing it is measuring is how a run
         # comes to measure something other than what it reports.
-        if not fleet_ok and "REFUSING TO START" in (fleet_tail or ""):
+        # THE MESSAGE, NOT THE EXIT CODE. Measured: a gate refusal returns 0. Requiring
+        # `not fleet_ok` meant this branch could never run, so the guard was added, tested,
+        # committed and never once reached -- the cycle went on capturing empty patches
+        # exactly as before. A refusal is identified by what it SAYS.
+        if "REFUSING TO START" in (fleet_tail or ""):
             # NOTHING RAN, SO NOTHING IS OWED. The attempt was counted before the batch on the
             # assumption that it would start; a refusal is the one case where it did not.
             refund_attempts(group)

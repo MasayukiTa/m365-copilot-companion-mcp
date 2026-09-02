@@ -20,15 +20,25 @@ from bench import pro_cycle as C
 # -- how wide a batch may be -------------------------------------------------------------
 
 def test_cheap_languages_run_several_at_a_time():
-    """python is the biggest group in the slice and the cheapest to run. If it does not
-    parallelise, nothing does, and the whole change is decoration."""
-    assert C.concurrency_for(["python"], free=5.0) >= 3
+    """The intent stands; the example was wrong.
+
+    This used python as "the cheap one" on an estimate of 120 MB. Measured, openlibrary cost
+    about 1900 MB an instance -- python is the EXPENSIVE one, and js the cheaper. What the test
+    is really for is that a cheap language still parallelises when there is room, or the whole
+    per-language table is decoration.
+    """
+    assert C.concurrency_for(["js"], free=8.0) >= 3
 
 
-def test_node_stays_narrower_than_python_at_the_same_free_space():
-    """The point of the table. Same disk, different width, because the cost differs."""
-    free = 5.0
-    assert C.concurrency_for(["js"], free) < C.concurrency_for(["python"], free)
+def test_the_heavier_language_stays_narrower_at_the_same_free_space():
+    """The point of the table: same disk, different width, because the cost differs.
+
+    The direction is measured, not assumed. python (~1900 MB, openlibrary) is heavier than js
+    (~1150 MB, element-web), so python must run narrower -- this test used to assert the
+    reverse on an estimate that was wrong by a factor of sixteen.
+    """
+    free = 8.0
+    assert C.concurrency_for(["python"], free) < C.concurrency_for(["js"], free)
 
 
 def test_a_tight_disk_falls_back_to_one_at_a_time():
@@ -98,7 +108,6 @@ def test_cheap_languages_go_first(monkeypatch):
     order = [i for group in C.batches(list(lang), 1) for i in group]
     cost = [C.LANG_DISK_MB[lang[i]] for i in order]
     assert cost == sorted(cost), "batches are not ordered cheapest-first: %s" % list(zip(order, cost))
-    assert order[0] == "p1", "python is the cheapest and must run first"
 
 
 def test_an_explicit_size_overrides_the_disk_calculation(monkeypatch):
@@ -361,8 +370,19 @@ def test_go_is_costed_by_its_module_cache_not_its_checkout():
     assert C.LANG_DISK_MB["go"] >= 600, "go is costed as if only its checkout mattered"
 
 
-def test_go_now_runs_narrower_than_python_at_the_same_disk():
-    assert C.concurrency_for(["go"], 4.7) < C.concurrency_for(["python"], 4.7)
+def test_the_widths_follow_the_table_rather_than_a_remembered_order():
+    """Direction taken FROM the table, not asserted about particular languages.
+
+    This used to say go runs narrower than python, which was true when python was costed at
+    120 MB. Measured, python is the heaviest thing in the slice (~1900 MB, openlibrary) and go
+    is lighter (~1360 MB), so the old assertion is now backwards -- the same staleness the
+    ordering test above warns about in its own docstring.
+    """
+    cheap = min(C.LANG_DISK_MB, key=lambda k: C.LANG_DISK_MB[k])
+    dear = max(C.LANG_DISK_MB, key=lambda k: C.LANG_DISK_MB[k])
+    free = 12.0          # generous, so the two widths can actually differ
+    assert C.concurrency_for([dear], free) <= C.concurrency_for([cheap], free), (
+        "the heavier language (%s) is not running narrower than the lighter (%s)" % (dear, cheap))
 
 
 def test_toolchain_caches_are_cleared_only_when_still_short(monkeypatch):
@@ -486,9 +506,13 @@ def test_heavy_languages_go_serial_at_the_disk_this_machine_actually_has():
     """Measured on this machine: ~4.2 GiB free after a clean discard. Two teleport worktrees
     did not fit, twice."""
     free = 4.24
-    assert C.concurrency_for(["go"], free) == 1
-    assert C.concurrency_for(["js"], free) == 1
-    assert C.concurrency_for(["python"], free) >= 3
+    # EVERYTHING is serial at this disk now, python included. The line that expected python to
+    # run three-wide here came from costing it at 120 MB; openlibrary was then measured at
+    # ~1900 MB an instance, and four of them took this machine from 8.19 GiB to 0.62 GiB free.
+    # "Heavy languages go serial" was always the intent -- python simply turned out to be one.
+    for lang in ("go", "js", "python"):
+        assert C.concurrency_for([lang], free) == 1, (
+            "%s is not serial at %.2f GiB free" % (lang, free))
 
 
 # -- the reclaim that did not reclaim ------------------------------------------------------
