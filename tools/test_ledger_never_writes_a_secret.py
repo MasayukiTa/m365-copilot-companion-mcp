@@ -155,3 +155,53 @@ def test_redaction_is_only_ever_applied_on_a_write_path(_held):
         "redact_secrets is called somewhere new: %s. If that site is a WRITE, add it to the "
         "list above. If it is a SEND, it will stop unlock working -- the real password has to "
         "reach the other side." % new)
+
+
+# ------------------------------------------------------------------ fanout / multi-agent
+
+
+def test_a_fanout_workers_call_is_redacted_too(_held):
+    # Fanout agents are separate Copilot conversations, but their tool calls come back through
+    # the SAME server process, which is where the ledger is written. Redaction is a property of
+    # the write point, not of the caller -- so it cannot hold for a direct call and lapse for a
+    # worker's.
+    TL.record_call("call_tool", {"name": "unlock", "arguments": {"password": SECRET}},
+                   task="swe-p03", worker="w7")
+    written = _written(_held)
+    assert SECRET not in written
+    assert "w7" in written, "the worker attribution was lost with the secret"
+
+
+def test_every_worker_is_covered_not_just_a_named_one(_held):
+    for w in ("", "w0", "w13", "refuter", "research"):
+        TL.record_call("call_tool", {"name": "unlock", "arguments": {"password": SECRET}},
+                       worker=w)
+    assert SECRET not in _written(_held)
+
+
+def test_the_ledger_has_exactly_one_writer(_held):
+    # THE REASON FANOUT IS COVERED AT ALL. The redaction matches values read from the
+    # environment, and this project strips credentials from child processes
+    # (_subproc.sanitized_child_env), so a child that wrote the ledger could not redact -- it
+    # would not hold the value to match. That is safe only while the single writer is the
+    # server process. If a second writer appears in a child, this fails and says why.
+    import pathlib
+    import re
+    root = pathlib.Path(__file__).resolve().parent.parent
+    allowed = {"main.py", "tools/tool_ledger.py"}
+    writers = set()
+    for path in root.rglob("*.py"):
+        rel = path.relative_to(root).as_posix()
+        if "/worktrees/" in rel or rel.startswith(".") or "test_" in rel:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if re.search(r"\b(?:_ledger|tool_ledger|TL)\.record_(?:call|outcome)\s*\(", text):
+            writers.add(rel)
+    new = sorted(writers - allowed)
+    assert not new, (
+        "a new ledger writer appeared: %s. If it runs in a CHILD process it cannot redact -- "
+        "sanitized_child_env strips the credentials, so the child does not hold the value to "
+        "match and the write would be in clear text." % new)
