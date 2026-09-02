@@ -29,6 +29,7 @@ a benchmark number drift upward without anybody deciding to cheat.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import shutil
@@ -304,6 +305,50 @@ def exhausted_ids(cap=None):
     """Instances that have had their attempts."""
     cap = MAX_ATTEMPTS if cap is None else cap
     return {i for i, n in attempt_counts().items() if int(n or 0) >= cap}
+
+
+def remaining_elsewhere(current=None):
+    """Slice files other than this run's that still hold instances nobody has finished.
+
+    Returns [(path, count)], worst first. A slice counts an instance as unfinished when it has
+    no grade, was not refused, and has attempts left -- the same three sets the run itself uses
+    to decide what to do, so this cannot drift into disagreeing with it.
+
+    Never raises. An unreadable slice file is reported as unreadable by being skipped, and a
+    cycle must not fail at the finish line over a file it was not even using.
+    """
+    # BURNED IS DONE, AND MORE THAN DONE. The first version of this pointed at
+    # pro_slice50_full.json and called its fifty instances "still to do" -- every one of them
+    # has been measured before, so following that advice re-measures a slice that has already
+    # seen its own answers. A prompt to do that is worse than saying nothing: the run itself
+    # refuses burned instances (check_slice_is_fresh), so this would have sent somebody to
+    # start a cycle that could only stop and complain.
+    done = graded_ids() | refused_ids() | exhausted_ids() | burned_ids()
+    cur = os.path.abspath(current or os.environ.get("SWE_SLICE_FILE", "") or "")
+    out = []
+    for path in sorted(glob.glob(os.path.join(SW, "pro_slice*.json"))):
+        if os.path.abspath(path) == cur:
+            continue
+        ids = set()
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                data = json.load(fh)
+        except Exception:
+            continue
+        rows = data if isinstance(data, list) else (data.get("instances") or [])
+        for row in rows:
+            if isinstance(row, str):
+                ids.add(row)
+            elif isinstance(row, dict):
+                for key in ("instance_id", "id"):
+                    if row.get(key):
+                        ids.add(row[key])
+                        break
+        left = ids - done
+        if left:
+            out.append((path, len(left)))
+    out.sort(key=lambda t: -t[1])
+    return out
 
 
 def slice_ids():
@@ -707,6 +752,24 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
 
     log("cycle end: %d instance(s) attempted, %d graded in total, free %.2f GiB"
         % (done, len(graded_ids()), free_gb()))
+
+    # FINISHING THIS FILE IS NOT FINISHING. The fresh draw was split into a go slice and a
+    # non-go slice, each launched by hand; the non-go one printed the line above and the
+    # pipeline sat idle for ninety minutes with fifteen instances never started. The report
+    # was scoped to one file and the work was not.
+    for path, left in remaining_elsewhere():
+        log("STILL TO DO: %d instance(s) in %s" % (left, os.path.basename(path)))
+        log("    set SWE_SLICE_FILE=%s && python -m bench.pro_cycle"
+            % os.path.relpath(path, REPO).replace(chr(92), "/"))
+
+    # THE OTHER PLACE FINISHED WORK GOES UNNOTICED. A captured patch that nobody scored is a
+    # completed instance sitting at zero. Twelve had accumulated when this was written.
+    unscored = sorted(captured_ids() - graded_ids() - refused_ids())
+    if unscored:
+        log("UNSCORED: %d captured patch(es) have no grade; score them with"
+            % len(unscored))
+        log("    python -m bench.pro_grade_remote --instances " + " ".join(unscored[:3])
+            + (" ..." if len(unscored) > 3 else ""))
     return 0
 
 
