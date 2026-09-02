@@ -224,3 +224,36 @@ def test_the_unattempted_instances_stay_retryable():
     block = src[i:i + 1400]
     assert "attempt counts are unchanged" in block or "not attempted" in block, (
         "the operator is not told whether the remaining instances are lost or retryable")
+
+
+def test_a_gate_refused_batch_does_not_spend_an_attempt(_files):
+    """MEASURED CONSEQUENCE. After one run 40 instances carried an attempt, 14 of them at the
+    cap of 2, and 23 had spent one while producing no patch -- because the count is taken
+    before the batch and the gate then refused to start it. Fourteen instances were one line
+    from being skipped for ever as "spent" without ever having run.
+    """
+    group = ["a", "b"]
+    C.note_attempts(group)
+    assert C.attempt_counts() == {"a": 1, "b": 1}
+    C.refund_attempts(group)
+    assert C.attempt_counts() == {}, "the refund did not give the attempts back"
+
+
+def test_a_refund_never_goes_negative(_files):
+    C.refund_attempts(["never_seen"])
+    assert C.attempt_counts().get("never_seen", 0) == 0
+
+
+def test_a_refund_only_gives_back_one(_files):
+    # Two real attempts followed by one refused batch must leave one real attempt standing.
+    C.note_attempts(["x"]); C.note_attempts(["x"]); C.note_attempts(["x"])
+    C.refund_attempts(["x"])
+    assert C.attempt_counts()["x"] == 2
+
+
+def test_the_refund_is_wired_to_the_gate_branch():
+    import inspect
+    src = inspect.getsource(C.cycle)
+    i = src.index("REFUSING TO START")
+    assert "refund_attempts" in src[i:i + 900], (
+        "the gate branch stops the cycle but still charges the batch for a run that never began")
