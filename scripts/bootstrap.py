@@ -184,18 +184,9 @@ def _transcribe(msg: str) -> None:
         pass
 
 
-def log(msg: str, transcribe: bool = True) -> None:
-    """Print, and by default also record.
-
-    `transcribe=False` is for the handful of lines that must appear ON SCREEN and must not be
-    kept: the freshly generated Bearer token and unlock password. The operator needs to read
-    them once to paste them into Copilot Studio; .setup/bootstrap.log is the file they are
-    asked to send when setup fails, which makes it the worst place in this project to leave a
-    credential sitting.
-    """
-    # The console first: encode-safe, because this console is cp932 and a print() that raises
-    # UnicodeEncodeError has ended a long run here before. The transcript is written whatever
-    # the console can display, so a character the console cannot show is still recorded.
+def _print_safe(msg: str) -> None:
+    """Console write, encode-safe. This console is cp932 and a print() that raises
+    UnicodeEncodeError has ended a long run here before."""
     try:
         print(msg, flush=True)
     except Exception:
@@ -204,8 +195,29 @@ def log(msg: str, transcribe: bool = True) -> None:
             print(msg.encode(enc, "replace").decode(enc, "replace"), flush=True)
         except Exception:
             pass
-    if transcribe:
-        _transcribe(msg)
+
+
+def show_only(msg: str) -> None:
+    """Print a line and DO NOT record it. Used for the freshly generated credentials.
+
+    A SEPARATE FUNCTION, NOT A FLAG ON log(). The first version of this passed
+    transcribe=False, which behaves correctly and leaves the data flow from the credential to
+    the file write sitting in the source -- so the clear-text-storage finding stayed open, and
+    a later edit flipping a default would silently restore the leak. There is no path from
+    here to _transcribe, which is a property of the shape rather than of an argument.
+
+    The print itself stays and cannot go: a fresh .env stores only the protected form of the
+    unlock password, so this is the one occasion the operator can read the real value.
+    """
+    _print_safe(msg)
+
+
+def log(msg: str) -> None:
+    # The console first: encode-safe, because this console is cp932 and a print() that raises
+    # UnicodeEncodeError has ended a long run here before. The transcript is written whatever
+    # the console can display, so a character the console cannot show is still recorded.
+    _print_safe(msg)
+    _transcribe(msg)
 
 
 def _call_step(fn, state: dict, state_file: Path) -> None:
@@ -487,8 +499,8 @@ def step_gen_env() -> None:
     # Copilot Studio; they must not reach .setup/bootstrap.log, which is the file an operator
     # is asked to send when setup fails. A note goes to the transcript in their place, because
     # "the credentials were shown here" is worth recording and the values are not.
-    log("    Your Bearer token (MCP_API_KEY): " + api_key, transcribe=False)
-    log("    Your unlock password:           " + unlock_code, transcribe=False)
+    show_only("    Your Bearer token (MCP_API_KEY): " + api_key)
+    show_only("    Your unlock password:           " + unlock_code)
     _transcribe("    (Bearer token and unlock password were shown on screen; "
                 "not recorded here. Re-read them with scripts/copilot_studio_values.ps1)")
     log("    Keep these secret. Optional MCP_*_AGENT_URL vars stay commented in .env.")

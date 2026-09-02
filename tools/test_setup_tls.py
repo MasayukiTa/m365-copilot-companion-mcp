@@ -234,6 +234,11 @@ def test_the_console_write_is_encode_safe():
     """The transcript is written whatever the console can display, so a character the console
     cannot show is still recorded rather than ending the run."""
     src = _boot()
-    i = src.index("def log(msg: str)")
-    body = src[i:i + 900]
+    # The encode-safe write moved into _print_safe when the credential lines needed a printer
+    # that does NOT reach the transcript. Same property, one function along -- and log() still
+    # has to go through it, or the safety would be there and unused.
+    i = src.index("def _print_safe(msg: str)")
+    body = src[i:i + 700]
     assert "replace" in body and "sys.stdout" in body
+    j = src.index("def log(msg: str)")
+    assert "_print_safe(msg)" in src[j:j + 700], "log() no longer uses the encode-safe write"
