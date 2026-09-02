@@ -50,32 +50,6 @@ def tabs(port: int):
         return None
 
 
-def open_background(port: int, url: str):
-    """Open a tab WITHOUT focusing the window. Returns its target id, or "".
-
-    /json/new does not raise the window; surface() does. Probing must never steal focus -- the
-    operator may be working, and on a busy machine this runs while a fleet is mid-task.
-    """
-    req = urllib.request.Request(
-        "http://127.0.0.1:%d/json/new?%s" % (port, urllib.parse.quote(url, safe=":/?=&")),
-        method="PUT")
-    try:
-        with urllib.request.urlopen(req, timeout=8) as r:
-            return (json.loads(r.read().decode("utf-8", "replace")) or {}).get("id") or ""
-    except Exception:
-        return ""
-
-
-def close_tab(port: int, target_id: str):
-    """Leave no trace in a browser we only came to inspect."""
-    if not target_id:
-        return
-    try:
-        urllib.request.urlopen("http://127.0.0.1:%d/json/close/%s" % (port, target_id), timeout=5)
-    except Exception:
-        pass
-
-
 def state(port: int):
     """(ready, reason).
 
@@ -97,33 +71,6 @@ def state(port: int):
     return None, "no M365 page open, so nothing to judge from (the fleet opens no tabs)"
 
 
-def probe(port: int, settle_s: float = 12.0):
-    """Load the chat page in the BACKGROUND and see where it lands.
-
-    This is what actually answers the question when there are no tabs: a signed-out profile is
-    redirected to a login wall, a signed-in one is not.
-    """
-    tid = open_background(port, SIGNED_IN_URL)
-    if not tid:
-        return None, "could not open a probe page"
-    try:
-        deadline = time.time() + settle_s
-        seen = ""
-        while time.time() < deadline:
-            for x in (tabs(port) or []):
-                if x.get("id") == tid:
-                    seen = x.get("url") or ""
-                    break
-            if LOGIN_RE.search(seen):
-                return False, "the chat page redirected to a sign-in wall"
-            if re.search(r"m365|copilot", seen, re.I) and "about:blank" not in seen:
-                return True, "the chat page loaded without a sign-in wall"
-            time.sleep(1.0)
-        return None, "the probe page did not settle in %ds" % int(settle_s)
-    finally:
-        close_tab(port, tid)
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", type=int, default=9222)
@@ -134,12 +81,11 @@ def main(argv=None):
                          "there is ONE definition of 'signed in' rather than two that drift.")
     a = ap.parse_args(argv)
 
+    # READ THE TABS THAT EXIST; DO NOT MAKE ONE. A previous version opened a page through
+    # /json/new to settle the tab-less case and left about:blank tabs behind in a browser the
+    # fleet keeps at zero tabs -- the close was best-effort in a finally and does not survive an
+    # interruption or a 404. "Nothing to judge from" is a real answer and is reported as one.
     ready, why = state(a.port)
-    if ready is None and "not answering" not in why:
-        # No tabs to judge from. Ask the browser rather than assuming, and do it in the
-        # background: assuming here is what stole the window last time.
-        print("  checking whether sign-in is needed (in the background)...")
-        ready, why = probe(a.port)
     if ready:
         print("  [ OK ] M365 already signed in on the companion Edge (%s)" % why)
         return 0
