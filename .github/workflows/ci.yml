@@ -424,6 +424,7 @@ jobs:
             tools/test_tool_ledger.py \
             bench/test_attempt_budget.py \
             scripts/test_bootstrap_transcript.py \
+            scripts/test_devtunnel_download.py \
             tests/test_ledger_attribution_reaches_the_ledger.py
 
       - name: Run script-style tracer tests

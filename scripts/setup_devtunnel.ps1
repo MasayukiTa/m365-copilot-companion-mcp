@@ -1,4 +1,4 @@
-# setup_devtunnel.ps1 -- robust, idempotent Dev Tunnel setup for the MCP server's PUBLIC URL.
+﻿# setup_devtunnel.ps1 -- robust, idempotent Dev Tunnel setup for the MCP server's PUBLIC URL.
 #
 # Fixes the three first-run defects seen on a fresh PC:
 #   1. winget did not install devtunnel  -> falls back to the official DIRECT DOWNLOAD (no winget).
@@ -158,6 +158,37 @@ if (-not (Get-Command devtunnel -ErrorAction SilentlyContinue)) {
         }
 
         $downloaded = $false
+
+        # SAY WHAT IS HAPPENING. Between "DIRECT DOWNLOAD" and success this printed nothing, so a
+        # slow download and a dead one looked identical and the step was reported as "stuck".
+        Write-Host "      downloading devtunnel (about 23 MB) from $dlUri"
+        Write-Host "      if this takes more than ~3 minutes it will stop and tell you what to do."
+        $swDl = [System.Diagnostics.Stopwatch]::StartNew()
+
+        # curl.exe FIRST. It ships with Windows 10 1803+ and, unlike Invoke-WebRequest, --max-time
+        # is a REAL total cap: IWR's -TimeoutSec is per-read, so a slow-but-alive connection never
+        # trips it and the step hangs for ever. curl also follows the aka.ms redirect, uses the
+        # system proxy, and prints its own progress.
+        $curl = Join-Path $env:SystemRoot "System32\curl.exe"
+        if (Test-Path $curl) {
+            try {
+                & $curl -L --fail --show-error --connect-timeout 20 --max-time 180 `
+                        --retry 2 --retry-delay 3 -o $payload $dlUri
+                if ($LASTEXITCODE -eq 0 -and (Test-Path $payload) -and (Get-Item $payload).Length -gt 0) {
+                    $downloaded = $true
+                    Write-Host ("      downloaded {0:N1} MB in {1:N0}s (curl)" -f `
+                                ((Get-Item $payload).Length/1MB), $swDl.Elapsed.TotalSeconds)
+                }
+            } catch { $downloaded = $false }
+        }
+
+        # THE PROGRESS BAR IS THE SLOWDOWN. PowerShell 5.1 renders one per chunk for -OutFile,
+        # which is the documented 10-50x penalty on Invoke-WebRequest and the reason this looked
+        # frozen. Restored afterwards so the rest of the script is unaffected.
+        $prevProgress = $ProgressPreference
+        $ProgressPreference = 'SilentlyContinue'
+        try {
+        if (-not $downloaded) {
         try {
             Invoke-WebRequest -UseBasicParsing -Uri $dlUri -OutFile $payload -TimeoutSec 120
             $downloaded = $true
@@ -181,6 +212,12 @@ if (-not (Get-Command devtunnel -ErrorAction SilentlyContinue)) {
                     $downloaded = $false
                 }
             }
+        }
+        }
+        } finally { $ProgressPreference = $prevProgress }
+        if ($downloaded -and (Test-Path $payload)) {
+            Write-Host ("      downloaded {0:N1} MB in {1:N0}s" -f `
+                        ((Get-Item $payload).Length/1MB), $swDl.Elapsed.TotalSeconds)
         }
         if (-not $downloaded) {
             Write-Host "      ERROR: could not download devtunnel."
