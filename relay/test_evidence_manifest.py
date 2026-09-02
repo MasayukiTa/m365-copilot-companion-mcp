@@ -215,3 +215,42 @@ def test_a_flag_is_never_treated_as_a_target():
     assert EM._is_selector("./...")
     assert EM._is_selector("./internal/config/...")
     assert not EM._is_selector("test")
+
+
+# -- the command is rarely the whole line ----------------------------------------------------
+
+def test_the_command_inside_a_shell_chain_counts():
+    """Taken from the ledger. The head of the line is `cd`, so the binary check failed and a
+    real test run was recorded as no test run at all."""
+    assert EM.matches_check(
+        r"cd /d C:\x\p04_f7b17e && .venv\Scripts\python.exe -m pytest test/units/a.py -x",
+        "pytest -x")
+
+
+def test_a_windows_env_prefix_does_not_hide_the_command():
+    """Also from the ledger. `set FOO=bar&& cmd` -- the existing skip only understood the
+    `FOO=bar cmd` form."""
+    assert EM.matches_check("set PYTHONPATH=C:/x/lib&& python -m pytest test/units/a.py -x",
+                            "pytest -x")
+
+
+def test_an_argv_list_inside_run_python_counts():
+    """A worker shelling out from run_python. The recorded command is Python source whose head
+    is `import`; the command it runs is in the list."""
+    assert EM.matches_check(
+        'import subprocess; r=subprocess.run(["python","-m","pytest","tests/a.py","-x"])',
+        "pytest -x")
+
+
+def test_building_then_testing_counts_as_testing():
+    """`go build ./... && go test ./models/...` -- the test is the second half."""
+    assert EM.matches_check("go build ./... && go test ./models/...", "go test ./...")
+
+
+def test_reading_the_pieces_does_not_accept_the_wrong_command():
+    """The loosening is fidelity, not permission. Splitting a line must not make a line that
+    never ran the acceptance command look as though it did."""
+    assert not EM.matches_check(r"cd /d C:\x && go build ./...", "go test ./...")
+    assert not EM.matches_check("echo pytest -x", "pytest -x")
+    assert not EM.matches_check("pytest --collect-only -x", "pytest -x")
+    assert not EM.matches_check("npm run lint && npm run build", "npm test")
