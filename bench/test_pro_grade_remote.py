@@ -8,12 +8,90 @@ EVALERR. That looks exactly like a broken eval host, and it was reported as one.
 pipeline was on the host the whole time; what was missing was any way to run it that did not
 have a smoke run's filenames baked in.
 """
+import io
 import json
 import os
 
 import pytest
 
 from bench import pro_grade_remote as G
+
+
+# -- who the cycle actually calls ------------------------------------------------------------
+
+def _script_args_in_calls(path):
+    """Every string constant that pro_cycle passes to a call, comments and docstrings excluded.
+
+    Read as text this file is useless for the question: pro_cycle explains this whole incident in
+    its comments, so "swe_grade_batch" appears there several times on purpose. A substring search
+    matches the explanation and reports the bug as fixed while the call is still wrong. Parsing
+    Call nodes asks what the code DOES.
+    """
+    import ast
+    tree = ast.parse(io.open(path, encoding="utf-8").read())
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for arg in list(node.args) + [k.value for k in node.keywords]:
+            for sub in ast.walk(arg):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                    out.append(sub.value)
+    return out
+
+
+def test_the_cycle_grades_with_the_pro_grader_not_the_lite_one():
+    """The defect this whole module was written about, wired the wrong way for the entire time
+    the module existed.
+
+    grade.py on the eval host passes --dataset_name princeton-nlp/SWE-bench_Lite. Pro instances
+    are not in Lite, so the harness finds nothing, writes no report, and the runner's fallback
+    writes VERDICT=EVALERR. Measured on the run that exposed it: 4 instances, 4 patches, 4
+    EVALERR, 0 graded -- and twice before that it was reported as the eval host being down.
+    """
+    consts = _script_args_in_calls(os.path.join(os.path.dirname(__file__), "pro_cycle.py"))
+    assert "pro_grade_remote.py" in consts, (
+        "the cycle must grade through pro_grade_remote, which builds the "
+        "ScaleAI/SWE-bench_Pro rows before scoring"
+    )
+    assert "swe_grade_batch.py" not in consts, (
+        "swe_grade_batch drives the Lite grader; every Pro verdict it returns is EVALERR"
+    )
+
+
+def test_the_grader_can_be_asked_for_one_batch(tmp_path, capsys, monkeypatch):
+    """The cycle grades a batch at a time. Without a filter the preds file -- which accumulates
+    every capture ever made, eighty rows when this was written -- would be re-scored after each
+    batch to learn about three instances."""
+    monkeypatch.setenv("SWE_EVAL_HOST", "someho.st")
+    preds = tmp_path / "preds.json"
+    preds.write_text(json.dumps([
+        {"instance_id": "keep_me", "patch": "diff --git a/x b/x\n"},
+        {"instance_id": "other", "patch": "diff --git a/y b/y\n"},
+    ]), encoding="utf-8")
+    rc = G.main(["--preds", str(preds), "--results", str(tmp_path / "r.json"),
+                 "--dry-run", "--instances", "keep_me"])
+    assert rc == 0
+    assert "would stage 1 predictions" in capsys.readouterr().out
+
+
+def test_no_filter_still_grades_everything():
+    """The filter is opt-in. pro_grade_remote has other callers that grade the whole ledger, and
+    a filter that defaulted to empty would silently grade nothing for them."""
+    import ast
+    src = io.open(os.path.join(os.path.dirname(__file__), "pro_grade_remote.py"),
+                  encoding="utf-8").read()
+    tree = ast.parse(src)
+    default = None
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and getattr(node.func, "attr", "") == "add_argument"
+                and node.args and getattr(node.args[0], "value", "") == "--instances"):
+            for k in node.keywords:
+                if k.arg == "default":
+                    default = k.value
+    assert default is not None, "--instances must declare its default explicitly"
+    assert ast.literal_eval(default) is None
 
 
 # -- what gets sent ------------------------------------------------------------------------

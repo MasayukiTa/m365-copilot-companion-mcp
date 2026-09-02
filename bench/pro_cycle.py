@@ -71,6 +71,11 @@ FLEET_FLOOR_GIB = _fleet_floor_gib()
 #: A batch that has not finished in this long is not going to. The point of small batches is
 #: that giving up on one is cheap.
 BATCH_TIMEOUT_S = float(os.environ.get("SWE_CYCLE_BATCH_TIMEOUT_S", "3600"))
+#: GRADING IS NOT THE SAME ANIMAL AS THE RUN. The Pro grade pulls or builds an image per
+#: instance and gives each test run up to 1800s of its own, so a three-instance batch can
+#: outlast the hour that bounds the fleet. Sharing one constant meant a batch that graded
+#: fine was killed for taking longer than the work that produced it.
+GRADE_TIMEOUT_S = float(os.environ.get("SWE_CYCLE_GRADE_TIMEOUT_S", "10800"))
 
 
 def log(msg):
@@ -675,16 +680,19 @@ def cycle(batch_size, limit=None, dry_run=False, effort="auto", allow_burned=Fal
         _shadow_verify(group)
 
         graded_before = len(graded_ids())
-        # THE TWO HALVES SPEAK DIFFERENT SHAPES, and I wired them together without reading
-        # either. pro_capture.py writes ONE json file holding a list of {instance_id, patch};
-        # swe_grade_batch.py reads a DIRECTORY of <instance_id>.json each holding
-        # [{"model_patch": ...}]. The first run died on that. Converting here keeps both
-        # scripts untouched -- they each have other callers.
-        preds_dir = _explode_preds()
-        if preds_dir:
-            run([PY, os.path.join("bench", "swe_grade_batch.py"),
-                 "--preds-dir", preds_dir, "--results", RESULTS,
-                 "--instances"] + group, BATCH_TIMEOUT_S, "grade")
+        # THE PRO GRADER, NOT THE LITE ONE. swe_grade_batch.py drives grade.py on the eval
+        # host, which passes --dataset_name princeton-nlp/SWE-bench_Lite. Pro instances are not
+        # in Lite, so the harness found nothing, wrote no report, and every verdict came back
+        # EVALERR -- 4 for 4 on the run that exposed it, and reported as a dead eval host twice
+        # before that. pro_grade_remote builds the ScaleAI/SWE-bench_Pro rows first and holds
+        # ONE ssh session for the whole grade, because the WSL VM tears down between commands
+        # and takes dockerd and /tmp with it. It reads the preds file directly, so the
+        # per-instance directory conversion _explode_preds did is no longer needed here.
+        if captured_ids() & set(group):
+            run([PY, os.path.join("bench", "pro_grade_remote.py"),
+                 "--preds", PREDS, "--results", RESULTS,
+                 "--tag", "cycle_b%d" % n,
+                 "--instances"] + group, GRADE_TIMEOUT_S, "grade")
         else:
             log("  no patch captured for this batch -- nothing to grade")
         # COUNTED AGAINST THIS BATCH, not against the whole ledger. The first version

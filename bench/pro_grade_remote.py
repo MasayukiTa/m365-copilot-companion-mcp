@@ -265,6 +265,9 @@ def main(argv=None):
     ap.add_argument("--results", default=os.path.join(SW, "pro_cycle_results.json"))
     ap.add_argument("--tag", default="cycle40", help="names the remote files for this run")
     ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--instances", nargs="*", default=None,
+                    help="grade only these instance ids from --preds; the cycle passes "
+                         "one batch at a time so a batch is scored while the next runs")
     ap.add_argument("--dry-run", action="store_true", help="stage nothing; print what would run")
     a = ap.parse_args(argv)
 
@@ -276,6 +279,12 @@ def main(argv=None):
     with open(a.preds, encoding="utf-8-sig") as fh:
         preds = json.load(fh)
     rows = gradeable(preds)
+    if a.instances:
+        # A BATCH, NOT THE LEDGER. The preds file accumulates every capture ever made;
+        # grading all of it after each batch would re-score eighty instances to learn
+        # about three. The caller names the three.
+        want = set(a.instances)
+        rows = [r for r in rows if r.get("instance_id") in want]
     log("%d of %d predictions are gradeable (empty patches dropped)" % (len(rows), len(preds)))
     if not rows:
         return 1
