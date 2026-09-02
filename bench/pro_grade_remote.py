@@ -29,6 +29,19 @@ TWO SAFETY RULES ARE COMPILED IN HERE, not left to memory:
 ONE HELD SESSION. The WSL VM tears down when a `wsl -d ... --exec` command returns, taking
 dockerd and /tmp with it. The grade therefore runs inside a single foreground ssh session held
 open for its whole duration, which is what the earlier launcher did and why.
+
+WHICH MEANS: WHILE A GRADE RUNS, NOTHING ELSE MAY START A WSL SESSION ON THAT HOST. Not a
+status check, not a `df`, not a one-line `tail`. Each `wsl.exe -d Ubuntu -- ...` is a session,
+and its exit can take the VM down with the running grade inside it. Measured: a 14-instance
+grade died 20 seconds after two progress checks were issued against it, leaving
+`client_loop: send disconnect` and no eval_results.json, and the whole run had to be repeated.
+
+To watch a grade, read its log FROM THE WINDOWS SIDE, which starts no VM:
+
+    ssh(host, "Get-Content 'C:/swe-grade/pro_grade_<tag>.out' -Tail 5")
+
+The log lives on /mnt/c, so the same file is visible either way; only one of the two ways is
+safe while the grade is in flight.
 """
 from __future__ import annotations
 
